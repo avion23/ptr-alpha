@@ -3,8 +3,8 @@ import tempfile
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from sources import Config
-from pipeline import run_analysis_pipeline
+from analyzer.sources import Config
+from analyzer.pipeline import run_analysis_pipeline
 
 class TestIntegration(unittest.TestCase):
 
@@ -35,7 +35,7 @@ class TestIntegration(unittest.TestCase):
         transactions = self.create_mock_data()
 
         # Mock the sources functions
-        import sources
+        from analyzer import sources
         original_load_cached_data = sources.load_cached_data
         original_fetch_prices = sources.fetch_prices
 
@@ -75,7 +75,7 @@ class TestIntegration(unittest.TestCase):
     def test_member_specific_analysis(self):
         transactions = self.create_mock_data()
 
-        import sources
+        from analyzer import sources
         original_load_cached_data = sources.load_cached_data
         original_fetch_prices = sources.fetch_prices
 

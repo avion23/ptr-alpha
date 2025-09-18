@@ -2,11 +2,11 @@ import unittest
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from analysis import (
+from analyzer.analysis import (
     calculate_signal_potential, rank_members, get_horizon_performance,
     get_top_signals, get_member_signals, get_analysis_table
 )
-from exceptions import AnalysisError
+from analyzer.exceptions import AnalysisError
 
 class TestAnalysis(unittest.TestCase):
 

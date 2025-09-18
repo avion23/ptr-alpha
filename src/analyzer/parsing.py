@@ -1,6 +1,6 @@
 import pandas as pd
 import re
-from exceptions import ParsingError
+from .exceptions import ParsingError
 
 def clean_text(text):
     if text is None:

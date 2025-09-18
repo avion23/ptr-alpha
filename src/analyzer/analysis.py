@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-from exceptions import AnalysisError
+from .exceptions import AnalysisError
 
 def calculate_signal_potential(transactions_df, prices_df, horizons=[30, 60, 90, 180]):
     if transactions_df.empty:

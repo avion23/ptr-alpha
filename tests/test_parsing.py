@@ -1,10 +1,10 @@
 import unittest
 import pandas as pd
-from parsing import (
+from analyzer.parsing import (
     clean_text, extract_ticker_from_name, parse_pdf_table,
     normalize_quiver_data, normalize_house_metadata, consolidate_transactions
 )
-from exceptions import ParsingError
+from analyzer.exceptions import ParsingError
 
 class TestParsing(unittest.TestCase):
 

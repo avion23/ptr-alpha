@@ -3,9 +3,9 @@
 import argparse
 import sys
 import logging
-from sources import Config
-from pipeline import run_fetch_pipeline, run_parse_pipeline, run_analysis_pipeline
-from exceptions import DataSourceError, AnalysisError, ParsingError, ConfigurationError
+from analyzer.sources import Config
+from analyzer.pipeline import run_fetch_pipeline, run_parse_pipeline, run_analysis_pipeline
+from analyzer.exceptions import DataSourceError, AnalysisError, ParsingError, ConfigurationError
 
 def setup_logging(verbose):
     level = logging.DEBUG if verbose else logging.INFO

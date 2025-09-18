@@ -1,8 +1,8 @@
 from datetime import timedelta
 import logging
-from exceptions import DataSourceError, AnalysisError
-import sources
-import analysis
+from analyzer.exceptions import DataSourceError, AnalysisError
+from analyzer import sources
+from analyzer import analysis
 
 logger = logging.getLogger(__name__)
 

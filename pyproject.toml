@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insider-trading"
+version = "0.1.0"
+description = "Congressional insider trading analysis tool"
+dependencies = [
+    "pandas",
+    "numpy",
+    "requests",
+    "yfinance",
+    "investpy",
+    "pdfplumber",
+]
+
+[project.scripts]
+insider-trading = "analyzer.cli:main"

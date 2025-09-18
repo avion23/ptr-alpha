@@ -29,7 +29,7 @@ def run_analysis_pipeline(source, year, horizons, threshold, member_filter, top_
         trades = sources.load_data(source, year, config)
         logger.info(f"Loaded {len(trades)} transactions from {source} for {year}")
 
-        if trades.empty:
+        if len(trades) == 0:
             raise DataSourceError("No trading data found")
 
         start_date = trades['disclosure_date'].min() - timedelta(days=30)

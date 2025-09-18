@@ -192,7 +192,7 @@ def load_cached_data(year, config):
         raise DataSourceError(f"Failed to load cached data for {year}: {e}")
 
 def fetch_prices(tickers, start, end, config):
-    if not tickers:
+    if len(tickers) == 0:
         raise DataSourceError("No tickers provided for price fetching")
 
     all_tickers = sorted(list(set(tickers) | {"SPY"}))

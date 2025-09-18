@@ -30,7 +30,7 @@ class TestAnalysis(unittest.TestCase):
         signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [30, 90])
 
         self.assertFalse(signals.empty)
-        self.assertEqual(len(signals), 8)  # 4 transactions * 2 horizons
+        self.assertEqual(len(signals), 8)
 
         expected_cols = ['member', 'ticker', 'disclosure_date', 'signal_type', 'horizon_days', 'entry_price', 'peak_potential_pct']
         self.assertEqual(list(signals.columns), expected_cols)

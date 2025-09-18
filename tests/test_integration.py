@@ -15,7 +15,6 @@ class TestIntegration(unittest.TestCase):
     def create_mock_data(self):
         np.random.seed(42)
 
-        # Create mock transactions
         transactions = pd.DataFrame({
             'member': ['Alice Smith', 'Bob Jones', 'Charlie Brown'] * 10,
             'ticker': np.random.choice(['AAPL', 'GOOGL', 'MSFT', 'TSLA'], 30),
@@ -24,7 +23,6 @@ class TestIntegration(unittest.TestCase):
             'transaction_type': np.random.choice(['Purchase', 'Sale'], 30, p=[0.7, 0.3])
         })
 
-        # Save mock transactions
         transactions_file = Path(self.temp_dir) / "2024" / "transactions.csv"
         transactions_file.parent.mkdir(exist_ok=True)
         transactions.to_csv(transactions_file, index=False)
@@ -34,7 +32,6 @@ class TestIntegration(unittest.TestCase):
     def test_end_to_end_house_analysis(self):
         transactions = self.create_mock_data()
 
-        # Mock the sources functions
         from analyzer import sources
         original_load_cached_data = sources.load_cached_data
         original_fetch_prices = sources.fetch_prices
@@ -43,7 +40,6 @@ class TestIntegration(unittest.TestCase):
             return transactions
 
         def mock_fetch_prices(tickers, start_date, end_date, config):
-            # Create mock price data for the tickers
             dates = pd.date_range(start_date, end_date, freq='D')
             price_data = {}
             for ticker in tickers:

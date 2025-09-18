@@ -12,7 +12,7 @@ import pathlib
 import sys
 import logging
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def fetch_quiver_data():
@@ -79,7 +79,7 @@ def clean_pdf_text(text):
 def parse_ptr_pdf(pdf_path):
     transactions = []
     try:
-        logger.debug(f"Parsing PDF: {pdf_path}")
+        pass
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 for table in page.extract_tables():
@@ -126,7 +126,7 @@ def parse_ptr_pdf(pdf_path):
 
         valid_transactions = [tx for tx in transactions if tx['ticker'] != 'UNKNOWN']
         if valid_transactions:
-            logger.debug(f"Extracted {len(valid_transactions)} transactions from {pdf_path}")
+            pass
         return valid_transactions
     except Exception as e:
         logger.warning(f"Failed to parse PDF {pdf_path}: {e}")

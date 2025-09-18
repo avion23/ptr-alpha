@@ -8,7 +8,7 @@ from datetime import timedelta
 from data_acquisition import fetch_quiver_data, fetch_and_cache_pdfs, parse_cached_pdfs, load_cached_data, fetch_prices, load_data
 from signal_evaluation import calculate_signal_potential, rank_members, get_top_signals, get_member_signals
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def run_fetch(year):

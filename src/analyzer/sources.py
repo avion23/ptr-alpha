@@ -1,6 +1,5 @@
 import requests
 import pandas as pd
-import yfinance as yf
 import investpy
 import zipfile
 import pdfplumber
@@ -10,7 +9,7 @@ import logging
 from io import BytesIO
 from multiprocessing import Pool, cpu_count
 from analyzer.exceptions import DataSourceError, ParsingError
-from analyzer.parsing import parse_pdf_table, normalize_quiver_data, normalize_house_metadata, consolidate_transactions
+from analyzer.parsing import parse_pdf_table, normalize_house_metadata, consolidate_transactions
 
 logger = logging.getLogger(__name__)
 
@@ -19,46 +18,18 @@ class Config:
         self.data_dir = pathlib.Path(data_dir)
         self.cache_enabled = cache_enabled
         self.parallel_workers = parallel_workers or max(1, cpu_count() - 1)
-        self.quiver_url = "https://api.quiverquant.com/beta/bulk/congresstrading/2022,2023,2024"
         self.house_metadata_url_template = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.ZIP"
         self.house_pdf_url_template = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
 
-def fetch_quiver_data(config):
-    cache_path = config.data_dir / "quiver_transactions.csv"
-
-    if config.cache_enabled and cache_path.exists():
-        logger.info(f"Loading cached Quiver data from {cache_path}")
-        try:
-            return pd.read_csv(cache_path, parse_dates=['transaction_date', 'disclosure_date'])
-        except Exception as e:
-            logger.warning(f"Failed to load cached data: {e}")
-
-    try:
-        logger.info("Fetching Quiver Quantitative data")
-        response = requests.get(config.quiver_url, timeout=30)
-        if response.status_code != 200:
-            raise DataSourceError(f"Quiver API returned status {response.status_code}")
-
-        data = response.json()
-        result = normalize_quiver_data(data)
-
-        if config.cache_enabled:
-            os.makedirs(config.data_dir, exist_ok=True)
-            result.to_csv(cache_path, index=False)
-            logger.info(f"Cached {len(result)} Quiver transactions to {cache_path}")
-
-        return result
-    except requests.RequestException as e:
-        raise DataSourceError(f"Failed to fetch Quiver data: {e}")
 
 def fetch_house_metadata(year, config):
     year_dir = config.data_dir / str(year)
-    metadata_path = year_dir / "metadata.csv"
+    metadata_path = year_dir / "metadata.parquet"
 
     if config.cache_enabled and metadata_path.exists():
         logger.info(f"Loading cached metadata for {year}")
         try:
-            return pd.read_csv(metadata_path)
+            return pd.read_parquet(metadata_path)
         except Exception as e:
             logger.warning(f"Failed to load cached metadata: {e}")
 
@@ -81,7 +52,7 @@ def fetch_house_metadata(year, config):
 
         if config.cache_enabled:
             os.makedirs(year_dir, exist_ok=True)
-            df.to_csv(metadata_path, index=False)
+            df.to_parquet(metadata_path, index=False)
             logger.info(f"Cached metadata for {year}: {len(df)} records")
 
         return df
@@ -144,7 +115,8 @@ def parse_cached_pdfs(year, config):
     metadata = fetch_house_metadata(year, config)
     ptrs = metadata[metadata['FilingType'] == 'P']
     pdf_dir = config.data_dir / str(year) / "pdfs"
-    output_csv = config.data_dir / str(year) / "transactions.csv"
+    output_file = config.data_dir / str(year) / "transactions.parquet"
+    legacy_csv = config.data_dir / str(year) / "transactions.csv"
 
     if not pdf_dir.exists():
         raise DataSourceError(f"PDF directory not found: {pdf_dir}")
@@ -175,48 +147,51 @@ def parse_cached_pdfs(year, config):
     if df.empty:
         raise ParsingError("No transactions found after parsing all PDFs")
 
-    os.makedirs(output_csv.parent, exist_ok=True)
-    df.to_csv(output_csv, index=False)
-    logger.info(f"Saved {len(df)} transactions to {output_csv}")
+    os.makedirs(output_file.parent, exist_ok=True)
+    df.to_parquet(output_file, index=False)
+
+    if legacy_csv.exists():
+        legacy_csv.unlink()
+        logger.info(f"Deleted legacy CSV file")
+
+    logger.info(f"Saved {len(df)} transactions to {output_file}")
 
 def load_cached_data(year, config):
+    transactions_parquet = config.data_dir / str(year) / "transactions.parquet"
     transactions_csv = config.data_dir / str(year) / "transactions.csv"
-    if not transactions_csv.exists():
-        raise DataSourceError(f"No cached data found for {year}")
 
-    try:
-        df = pd.read_csv(transactions_csv, parse_dates=['transaction_date', 'disclosure_date'])
-        logger.info(f"Loaded {len(df)} cached transactions for {year}")
-        return df
-    except Exception as e:
-        raise DataSourceError(f"Failed to load cached data for {year}: {e}")
+    if transactions_parquet.exists():
+        try:
+            df = pd.read_parquet(transactions_parquet)
+            logger.info(f"Loaded {len(df)} cached transactions for {year}")
+            return df
+        except Exception as e:
+            raise DataSourceError(f"Corrupted Parquet cache for {year}: {e}. Run 'insider-trading parse --year {year}' to rebuild.")
+
+    if transactions_csv.exists():
+        logger.warning(f"Found legacy CSV data for {year}. Converting to Parquet format...")
+        try:
+            df = pd.read_csv(transactions_csv, parse_dates=['transaction_date', 'disclosure_date'])
+            df.to_parquet(transactions_parquet, index=False)
+            transactions_csv.unlink()
+            logger.info(f"Converted {len(df)} transactions to Parquet and deleted legacy CSV")
+            return df
+        except Exception as e:
+            raise DataSourceError(f"Failed to convert legacy CSV data for {year}: {e}")
+
+    raise DataSourceError(f"No cached data found for {year}. Run 'insider-trading parse --year {year}' first.")
 
 def fetch_prices(tickers, start, end, config):
     if len(tickers) == 0:
         raise DataSourceError("No tickers provided for price fetching")
 
     all_tickers = sorted(list(set(tickers) | {"SPY"}))
-    logger.info(f"Fetching price data for {len(all_tickers)} tickers")
-
-    try:
-        data = yf.download(all_tickers, start=start, end=end, progress=False, auto_adjust=True)
-        if not data.empty:
-            if len(all_tickers) == 1:
-                if 'Close' in data:
-                    return pd.DataFrame({all_tickers[0]: data['Close']})
-                else:
-                    raise DataSourceError(f"No Close prices found for {all_tickers[0]}")
-            if 'Close' in data.columns:
-                prices = data['Close'].dropna(axis=1, how='all')
-                if prices.empty:
-                    raise DataSourceError("All price data is NaN after cleaning")
-                return prices
-    except Exception as e:
-        logger.warning(f"yfinance failed: {e}, falling back to investpy")
+    logger.info(f"Fetching price data for {len(all_tickers)} tickers using investpy")
 
     start_str, end_str = start.strftime('%d/%m/%Y'), end.strftime('%d/%m/%Y')
     ETF_MAP = {'SPY': 'SPDR S&P 500'}
     price_series = []
+    failed_tickers = []
 
     for ticker in all_tickers:
         try:
@@ -230,17 +205,24 @@ def fetch_prices(tickers, start, end, config):
             df = fetcher(**params)
             if not df.empty:
                 price_series.append(df['Close'].rename(ticker))
-        except Exception:
-            continue
+                logger.debug(f"Successfully fetched price data for {ticker}")
+            else:
+                failed_tickers.append(ticker)
+        except Exception as e:
+            logger.warning(f"Failed to fetch price data for {ticker}: {e}")
+            failed_tickers.append(ticker)
 
     if not price_series:
-        raise DataSourceError("No price data could be fetched from any source")
+        raise DataSourceError("No price data could be fetched from investpy. Data source may be blocked or down.")
 
+    success_rate = len(price_series) / len(all_tickers)
+    if success_rate < 0.9:
+        raise DataSourceError(f"Price fetch failure rate too high: {(1-success_rate)*100:.1f}% failed ({len(failed_tickers)}/{len(all_tickers)}). Analysis would be unreliable.")
+
+    logger.info(f"Successfully fetched prices for {len(price_series)}/{len(all_tickers)} tickers ({success_rate*100:.1f}% success)")
     return pd.concat(price_series, axis=1).dropna(axis=1, how='all')
 
 def load_data(source, year, config):
-    if source == 'quiver':
-        return fetch_quiver_data(config)
     return load_cached_data(year, config)
 
 def save_results(table, output_format, member_filter, show_signals, config):

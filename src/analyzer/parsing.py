@@ -68,35 +68,6 @@ def parse_pdf_table(table):
 
     return transactions
 
-def normalize_quiver_data(raw_data):
-    if not raw_data:
-        raise ParsingError("Empty Quiver API response")
-
-    df = pd.DataFrame(raw_data)
-    if df.empty:
-        raise ParsingError("Empty Quiver dataframe")
-
-    required_cols = {'Representative', 'TransactionDate', 'ReportDate', 'Ticker', 'Transaction'}
-    missing_cols = required_cols - set(df.columns)
-    if missing_cols:
-        raise ParsingError(f"Missing columns in Quiver data: {missing_cols}")
-
-    df['ReportDate'] = pd.to_datetime(df['ReportDate'], errors='coerce')
-    df['TransactionDate'] = pd.to_datetime(df['TransactionDate'], errors='coerce')
-
-    result = df.rename(columns={
-        'Representative': 'member',
-        'TransactionDate': 'transaction_date',
-        'ReportDate': 'disclosure_date',
-        'Ticker': 'ticker',
-        'Transaction': 'transaction_type'
-    })[['member', 'transaction_date', 'disclosure_date', 'ticker', 'transaction_type']]
-
-    result = result.dropna(subset=['transaction_date', 'disclosure_date'])
-    if result.empty:
-        raise ParsingError("No valid transactions after date parsing")
-
-    return result
 
 def normalize_house_metadata(content):
     if not content:

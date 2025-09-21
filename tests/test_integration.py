@@ -23,21 +23,17 @@ class TestIntegration(unittest.TestCase):
             'transaction_type': np.random.choice(['Purchase', 'Sale'], 30, p=[0.7, 0.3])
         })
 
-        transactions_file = Path(self.temp_dir) / "2024" / "transactions.csv"
+        transactions_file = Path(self.temp_dir) / "2024" / "transactions.parquet"
         transactions_file.parent.mkdir(exist_ok=True)
-        transactions.to_csv(transactions_file, index=False)
+        transactions.to_parquet(transactions_file, index=False)
 
         return transactions
 
     def test_end_to_end_house_analysis(self):
-        transactions = self.create_mock_data()
+        self.create_mock_data()
 
         from analyzer import sources
-        original_load_cached_data = sources.load_cached_data
         original_fetch_prices = sources.fetch_prices
-
-        def mock_load_cached_data(year, config):
-            return transactions
 
         def mock_fetch_prices(tickers, start_date, end_date, config):
             dates = pd.date_range(start_date, end_date, freq='D')
@@ -46,7 +42,6 @@ class TestIntegration(unittest.TestCase):
                 price_data[ticker] = [100.0 + np.random.normal(0, 5) for _ in range(len(dates))]
             return pd.DataFrame(price_data, index=dates)
 
-        sources.load_cached_data = mock_load_cached_data
         sources.fetch_prices = mock_fetch_prices
 
         try:
@@ -65,18 +60,13 @@ class TestIntegration(unittest.TestCase):
             self.assertTrue(result, "Analysis pipeline should succeed")
 
         finally:
-            sources.load_cached_data = original_load_cached_data
             sources.fetch_prices = original_fetch_prices
 
     def test_member_specific_analysis(self):
-        transactions = self.create_mock_data()
+        self.create_mock_data()
 
         from analyzer import sources
-        original_load_cached_data = sources.load_cached_data
         original_fetch_prices = sources.fetch_prices
-
-        def mock_load_cached_data(year, config):
-            return transactions
 
         def mock_fetch_prices(tickers, start_date, end_date, config):
             dates = pd.date_range(start_date, end_date, freq='D')
@@ -85,7 +75,6 @@ class TestIntegration(unittest.TestCase):
                 price_data[ticker] = [100.0 + np.random.normal(0, 5) for _ in range(len(dates))]
             return pd.DataFrame(price_data, index=dates)
 
-        sources.load_cached_data = mock_load_cached_data
         sources.fetch_prices = mock_fetch_prices
 
         try:
@@ -104,7 +93,6 @@ class TestIntegration(unittest.TestCase):
             self.assertTrue(result, "Member analysis pipeline should succeed")
 
         finally:
-            sources.load_cached_data = original_load_cached_data
             sources.fetch_prices = original_fetch_prices
 
 if __name__ == '__main__':

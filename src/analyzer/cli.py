@@ -57,7 +57,7 @@ def parse_args():
         epilog="Examples:\n"
                "  %(prog)s fetch --year 2024\n"
                "  %(prog)s parse --year 2024\n"
-               "  %(prog)s rank-members --source quiver\n"
+               "  %(prog)s rank-members --source house\n"
                "  %(prog)s show-signals --top-n 20\n"
                "  %(prog)s show-member-signals --member 'Nancy Pelosi'"
     )
@@ -75,14 +75,14 @@ def parse_args():
     parse_parser = subparsers.add_parser('parse', help='Parse cached PDFs to CSV')
 
     rank_parser = subparsers.add_parser('rank-members', help='Rank congressional members by trading performance')
-    rank_parser.add_argument('--source', choices=['quiver', 'house'], default='quiver', help='Data source')
+    rank_parser.add_argument('--source', choices=['house'], default='house', help='Data source')
     rank_parser.add_argument('--horizons', nargs='+', type=int, default=[90], help='Time horizons in days')
     rank_parser.add_argument('--threshold', type=float, default=5.0, help='Hit rate threshold percentage')
     rank_parser.add_argument('--output', choices=['console', 'csv'], default='console', help='Output format')
     rank_parser.add_argument('--top-n', type=int, default=20, help='Number of top members to show')
 
     signals_parser = subparsers.add_parser('show-signals', help='Show top trading signals')
-    signals_parser.add_argument('--source', choices=['quiver', 'house'], default='quiver', help='Data source')
+    signals_parser.add_argument('--source', choices=['house'], default='house', help='Data source')
     signals_parser.add_argument('--horizons', nargs='+', type=int, default=[90], help='Time horizons in days')
     signals_parser.add_argument('--threshold', type=float, default=5.0, help='Hit rate threshold percentage')
     signals_parser.add_argument('--output', choices=['console', 'csv'], default='console', help='Output format')
@@ -90,7 +90,7 @@ def parse_args():
 
     member_parser = subparsers.add_parser('show-member-signals', help='Show signals for a specific member')
     member_parser.add_argument('--member', required=True, help='Member name to analyze')
-    member_parser.add_argument('--source', choices=['quiver', 'house'], default='quiver', help='Data source')
+    member_parser.add_argument('--source', choices=['house'], default='house', help='Data source')
     member_parser.add_argument('--horizons', nargs='+', type=int, default=[90], help='Time horizons in days')
     member_parser.add_argument('--threshold', type=float, default=5.0, help='Hit rate threshold percentage')
     member_parser.add_argument('--output', choices=['console', 'csv'], default='console', help='Output format')

@@ -10,9 +10,9 @@ dependencies = [
     "pandas",
     "numpy",
     "requests",
-    "yfinance",
     "investpy",
     "pdfplumber",
+    "pyarrow",
 ]
 
 [project.scripts]

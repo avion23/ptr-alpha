@@ -1,11 +1,12 @@
 import requests
 import pandas as pd
-import investpy
+import yfinance as yf
 import zipfile
 import pdfplumber
 import os
 import pathlib
 import logging
+import time
 from io import BytesIO
 from multiprocessing import Pool, cpu_count
 from analyzer.exceptions import DataSourceError, ParsingError
@@ -30,8 +31,11 @@ def fetch_house_metadata(year, config):
         logger.info(f"Loading cached metadata for {year}")
         try:
             return pd.read_parquet(metadata_path)
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             logger.warning(f"Failed to load cached metadata: {e}")
+        except Exception as e:
+            logger.exception(f"Unexpected error loading cached metadata: {e}")
+            raise
 
     metadata_url = config.house_metadata_url_template.format(year=year)
     try:
@@ -72,7 +76,7 @@ def _download_pdf_worker(args):
             return f"downloaded:{doc_id}"
         else:
             return f"failed:{doc_id}:{response.status_code}"
-    except Exception as e:
+    except (requests.RequestException, OSError) as e:
         return f"error:{doc_id}:{e}"
 
 def fetch_and_cache_pdfs(year, config):
@@ -107,7 +111,7 @@ def _parse_pdf_worker(pdf_path):
                 for table in page.extract_tables():
                     transactions.extend(parse_pdf_table(table))
         return pdf_path, transactions
-    except Exception as e:
+    except (OSError, ParsingError) as e:
         logger.warning(f"Failed to parse PDF {pdf_path}: {e}")
         return pdf_path, []
 
@@ -165,8 +169,11 @@ def load_cached_data(year, config):
             df = pd.read_parquet(transactions_parquet)
             logger.info(f"Loaded {len(df)} cached transactions for {year}")
             return df
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             raise DataSourceError(f"Corrupted Parquet cache for {year}: {e}. Run 'insider-trading parse --year {year}' to rebuild.")
+        except Exception as e:
+            logger.exception(f"Unexpected error loading Parquet cache: {e}")
+            raise
 
     if transactions_csv.exists():
         logger.warning(f"Found legacy CSV data for {year}. Converting to Parquet format...")
@@ -176,8 +183,11 @@ def load_cached_data(year, config):
             transactions_csv.unlink()
             logger.info(f"Converted {len(df)} transactions to Parquet and deleted legacy CSV")
             return df
-        except Exception as e:
+        except (OSError, pd.errors.ParserError) as e:
             raise DataSourceError(f"Failed to convert legacy CSV data for {year}: {e}")
+        except Exception as e:
+            logger.exception(f"Unexpected error converting legacy CSV: {e}")
+            raise
 
     raise DataSourceError(f"No cached data found for {year}. Run 'insider-trading parse --year {year}' first.")
 
@@ -186,41 +196,28 @@ def fetch_prices(tickers, start, end, config):
         raise DataSourceError("No tickers provided for price fetching")
 
     all_tickers = sorted(list(set(tickers) | {"SPY"}))
-    logger.info(f"Fetching price data for {len(all_tickers)} tickers using investpy")
+    logger.info(f"Fetching price data for {len(all_tickers)} tickers using yfinance")
 
-    start_str, end_str = start.strftime('%d/%m/%Y'), end.strftime('%d/%m/%Y')
-    ETF_MAP = {'SPY': 'SPDR S&P 500'}
-    price_series = []
-    failed_tickers = []
+    data = yf.download(all_tickers, start=start, end=end, progress=False, threads=True, auto_adjust=True)
 
-    for ticker in all_tickers:
-        try:
-            fetcher = investpy.get_etf_historical_data if ticker in ETF_MAP else investpy.get_stock_historical_data
-            params = {
-                'country': 'united states',
-                'from_date': start_str,
-                'to_date': end_str,
-                ('etf' if ticker in ETF_MAP else 'stock'): ETF_MAP.get(ticker, ticker)
-            }
-            df = fetcher(**params)
-            if not df.empty:
-                price_series.append(df['Close'].rename(ticker))
-                logger.debug(f"Successfully fetched price data for {ticker}")
-            else:
-                failed_tickers.append(ticker)
-        except Exception as e:
-            logger.warning(f"Failed to fetch price data for {ticker}: {e}")
-            failed_tickers.append(ticker)
+    if data.empty:
+        raise DataSourceError("No price data could be fetched from yfinance. Data source may be blocked or down.")
 
-    if not price_series:
-        raise DataSourceError("No price data could be fetched from investpy. Data source may be blocked or down.")
+    prices = data['Close'] if len(all_tickers) > 1 else data['Close'].to_frame(all_tickers[0])
+    prices = prices.dropna(axis=1, how='all')
 
-    success_rate = len(price_series) / len(all_tickers)
+    failed_tickers = sorted(set(all_tickers) - set(prices.columns))
+    success_count = len(prices.columns)
+    success_rate = success_count / len(all_tickers)
+
     if success_rate < 0.9:
         raise DataSourceError(f"Price fetch failure rate too high: {(1-success_rate)*100:.1f}% failed ({len(failed_tickers)}/{len(all_tickers)}). Analysis would be unreliable.")
 
-    logger.info(f"Successfully fetched prices for {len(price_series)}/{len(all_tickers)} tickers ({success_rate*100:.1f}% success)")
-    return pd.concat(price_series, axis=1).dropna(axis=1, how='all')
+    if failed_tickers:
+        logger.warning(f"Failed to fetch price data for {len(failed_tickers)} tickers: {', '.join(failed_tickers[:10])}{'...' if len(failed_tickers) > 10 else ''}")
+
+    logger.info(f"Successfully fetched prices for {success_count}/{len(all_tickers)} tickers ({success_rate*100:.1f}% success)")
+    return prices
 
 def load_data(source, year, config):
     return load_cached_data(year, config)

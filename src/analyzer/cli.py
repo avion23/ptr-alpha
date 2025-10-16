@@ -4,7 +4,7 @@ import argparse
 import sys
 import logging
 from analyzer.sources import Config
-from analyzer.pipeline import run_fetch_pipeline, run_parse_pipeline, run_analysis_pipeline
+from analyzer.pipeline import run_fetch_pipeline, run_parse_pipeline, run_analysis_pipeline, run_ticker_analysis, run_recent_ticker_scoring
 from analyzer.exceptions import DataSourceError, AnalysisError, ParsingError, ConfigurationError
 
 def setup_logging(verbose):
@@ -15,14 +15,11 @@ def setup_logging(verbose):
     )
 
 def create_config(args):
-    try:
-        return Config(
-            data_dir=args.data_dir,
-            cache_enabled=not args.no_cache,
-            parallel_workers=args.workers
-        )
-    except Exception as e:
-        raise ConfigurationError(f"Failed to create configuration: {e}")
+    return Config(
+        data_dir=args.data_dir,
+        cache_enabled=not args.no_cache,
+        parallel_workers=args.workers
+    )
 
 def handle_command(args):
     config = create_config(args)
@@ -46,8 +43,17 @@ def handle_command(args):
             args.source, args.year, args.horizons, args.threshold,
             args.member, args.top_n, False, args.output, config
         ) else 1
+    elif args.command == 'analyze-ticker':
+        return 0 if run_ticker_analysis(
+            args.ticker, args.source, args.year, args.horizon, args.threshold, config
+        ) else 1
+    elif args.command == 'score-recent-tickers':
+        return 0 if run_recent_ticker_scoring(
+            args.source, args.year, args.horizons, args.threshold,
+            args.days_back, args.min_buyers, args.top_n, config
+        ) else 1
     else:
-        print("Use 'fetch', 'parse', 'rank-members', 'show-signals', or 'show-member-signals'", file=sys.stderr)
+        print("Use 'fetch', 'parse', 'rank-members', 'show-signals', 'show-member-signals', 'analyze-ticker', or 'score-recent-tickers'", file=sys.stderr)
         return 1
 
 def parse_args():
@@ -59,10 +65,12 @@ def parse_args():
                "  %(prog)s parse --year 2024\n"
                "  %(prog)s rank-members --source house\n"
                "  %(prog)s show-signals --top-n 20\n"
-               "  %(prog)s show-member-signals --member 'Nancy Pelosi'"
+               "  %(prog)s show-member-signals --member 'Nancy Pelosi'\n"
+               "  %(prog)s analyze-ticker NVDA\n"
+               "  %(prog)s score-recent-tickers --days-back 28 --min-buyers 2"
     )
 
-    parser.add_argument('--year', type=int, default=2024, help='Year to process (default: 2024)')
+    parser.add_argument('--year', type=int, default=2025, help='Year to process (default: 2025)')
     parser.add_argument('--data-dir', default='data', help='Data directory (default: data)')
     parser.add_argument('--no-cache', action='store_true', help='Disable caching')
     parser.add_argument('--workers', type=int, help='Number of parallel workers (default: auto)')
@@ -96,6 +104,20 @@ def parse_args():
     member_parser.add_argument('--output', choices=['console', 'csv'], default='console', help='Output format')
     member_parser.add_argument('--top-n', type=int, default=10, help='Number of top signals to show')
 
+    ticker_parser = subparsers.add_parser('analyze-ticker', help='Show all buyers of a ticker with rankings and signal score')
+    ticker_parser.add_argument('ticker', help='Ticker symbol to analyze')
+    ticker_parser.add_argument('--source', choices=['house'], default='house', help='Data source')
+    ticker_parser.add_argument('--horizon', type=int, default=90, help='Time horizon in days')
+    ticker_parser.add_argument('--threshold', type=float, default=5.0, help='Hit rate threshold percentage')
+
+    recent_parser = subparsers.add_parser('score-recent-tickers', help='Score multi-buyer tickers from recent period')
+    recent_parser.add_argument('--source', choices=['house'], default='house', help='Data source')
+    recent_parser.add_argument('--horizons', nargs='+', type=int, default=[90], help='Time horizons in days')
+    recent_parser.add_argument('--threshold', type=float, default=5.0, help='Hit rate threshold percentage')
+    recent_parser.add_argument('--days-back', type=int, default=28, help='How many days back to analyze')
+    recent_parser.add_argument('--min-buyers', type=int, default=2, help='Minimum number of buyers required')
+    recent_parser.add_argument('--top-n', type=int, default=15, help='Number of top signals to show')
+
     return parser.parse_args()
 
 def main():
@@ -109,17 +131,16 @@ def main():
 
         return handle_command(args)
 
-    except (DataSourceError, AnalysisError, ParsingError) as e:
+    except (DataSourceError, AnalysisError, ParsingError, ConfigurationError) as e:
         print(f"Error: {e}", file=sys.stderr)
-        return 1
-    except ConfigurationError as e:
-        print(f"Configuration Error: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\nOperation cancelled by user", file=sys.stderr)
         return 130
     except Exception as e:
+        import traceback
         print(f"Unexpected error: {e}", file=sys.stderr)
+        traceback.print_exc()
         return 1
 
 if __name__ == '__main__':

@@ -22,49 +22,32 @@ def parse_pdf_table(table):
     if not table or len(table) < 2:
         return []
 
-    header = [clean_text(h).lower() for h in table[0]]
-    header_str = ' '.join(header)
-    if not ('asset' in header_str and ('transaction' in header_str or 'type' in header_str)):
-        return []
-
-    col_map = {}
-    for i, h in enumerate(header):
-        if 'asset' in h and 'transaction' not in h:
-            col_map['asset'] = i
-        elif ('transaction' in h and 'type' in h) or (h == 'type' and 'transaction' not in h):
-            col_map['transaction_type'] = i
-        elif 'date' in h and 'notification' not in h and 'transaction' in h:
-            col_map['date'] = i
-
-    if 'asset' not in col_map:
-        return []
-
     transactions = []
     for row in table[1:]:
-        if all(c is None or str(c).strip() == '' for c in row):
+        if not row or row[0] is None:
             continue
 
-        asset_name = clean_text(row[col_map['asset']])
-        if not asset_name:
+        row_string = row[0].replace('\n', ' ') if isinstance(row[0], str) else str(row[0])
+
+        ticker_match = re.search(r'\(([A-Z]{1,5})\)', row_string)
+        if not ticker_match:
+            continue
+        ticker = ticker_match.group(1)
+
+        tx_type_match = re.search(r'\s+([PS])\s+', row_string)
+        if not tx_type_match:
+            continue
+        transaction_type = 'Purchase' if tx_type_match.group(1).upper() == 'P' else 'Sale'
+
+        date_match = re.search(r'(\d{2}/\d{2}/\d{4})', row_string)
+        if not date_match:
             continue
 
-        ticker = extract_ticker_from_name(asset_name)
-        if not ticker:
-            continue
-
-        raw_tx_type = clean_text(row[col_map.get('transaction_type', 0)])
-        tx_type = 'Other'
-        if raw_tx_type.lower().startswith('p'):
-            tx_type = 'Purchase'
-        elif raw_tx_type.lower().startswith('s'):
-            tx_type = 'Sale'
-
-        if tx_type in ['Purchase', 'Sale']:
-            transactions.append({
-                'ticker': ticker,
-                'transaction_type': tx_type,
-                'transaction_date': clean_text(row[col_map.get('date', 0)]),
-            })
+        transactions.append({
+            'ticker': ticker,
+            'transaction_type': transaction_type,
+            'transaction_date': date_match.group(1),
+        })
 
     return transactions
 

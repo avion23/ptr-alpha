@@ -30,29 +30,18 @@ def calculate_signal_potential(transactions_df, prices_df, horizons=[30, 60, 90,
     signals = signals.assign(horizon_days=[horizons] * len(signals)).explode('horizon_days').reset_index(drop=True)
     signals['horizon_days'] = signals['horizon_days'].astype('int32')
     signals['window_end'] = signals['disclosure_date'] + pd.to_timedelta(signals['horizon_days'], unit='D')
-    signals['signal_idx'] = signals.index
 
-    merged = pd.merge(
-        signals,
-        prices_long,
-        on='ticker',
-        suffixes=('', '_price')
-    )
+    prices_by_ticker = {ticker: df.set_index('date')['price'] for ticker, df in prices_long.groupby('ticker')}
 
-    in_window = merged[
-        (merged['date'] >= merged['disclosure_date']) &
-        (merged['date'] <= merged['window_end'])
-    ]
+    def get_window_extrema(row):
+        ticker_prices = prices_by_ticker.get(row['ticker'])
+        if ticker_prices is None or ticker_prices.empty:
+            return pd.Series({'peak_price': np.nan, 'trough_price': np.nan})
+        window_prices = ticker_prices[(ticker_prices.index >= row['disclosure_date']) & (ticker_prices.index <= row['window_end'])]
+        return pd.Series({'peak_price': np.nan, 'trough_price': np.nan}) if len(window_prices) == 0 else pd.Series({'peak_price': window_prices.max(), 'trough_price': window_prices.min()})
 
-    if in_window.empty:
-        raise AnalysisError("No price data found within signal windows")
-
-    extrema = in_window.groupby('signal_idx').agg(
-        peak_price=('price', 'max'),
-        trough_price=('price', 'min')
-    )
-
-    final = pd.merge(signals, extrema, left_on='signal_idx', right_index=True).dropna(subset=['peak_price', 'trough_price'])
+    extrema = signals.apply(get_window_extrema, axis=1)
+    final = pd.concat([signals, extrema], axis=1).dropna(subset=['peak_price', 'trough_price'])
 
     if final.empty:
         raise AnalysisError("No valid signals calculated after price analysis")
@@ -160,3 +149,88 @@ def get_analysis_table(signals_df, member_filter, show_signals, horizon, top_n, 
     if show_signals:
         return get_top_signals(signals_df, horizon, top_n)
     return rank_members(signals_df, horizon, threshold)
+
+def score_ticker_by_buyers(ticker, transactions_df, signals_df, horizon=90, threshold=5.0, member_rankings=None):
+    if signals_df.empty:
+        raise AnalysisError("Empty signal dataframe")
+    if transactions_df.empty:
+        raise AnalysisError("Empty transactions dataframe")
+
+    if member_rankings is None:
+        member_rankings = rank_members(signals_df, horizon, threshold)
+
+    ticker_trades = transactions_df[
+        (transactions_df['ticker'] == ticker) &
+        (transactions_df['transaction_type'] == 'Purchase')
+    ]
+
+    if ticker_trades.empty:
+        return pd.DataFrame({
+            'ticker': [ticker],
+            'num_buyers': [0],
+            'signal_score': [0.0]
+        })
+
+    buyers = ticker_trades['member'].unique()
+    buyer_stats = member_rankings[member_rankings['member'].isin(buyers)].sort_values('avg_peak_return_pct', ascending=False)
+
+    if buyer_stats.empty:
+        return pd.DataFrame({
+            'ticker': [ticker],
+            'num_buyers': [len(buyers)],
+            'buyers': [', '.join(buyers[:3])],
+            'signal_score': [0.0]
+        })
+
+    avg_rank = buyer_stats['avg_peak_return_pct'].mean()
+    max_rank = buyer_stats['avg_peak_return_pct'].max()
+    total_trades = buyer_stats['purchase_trades'].sum()
+    signal_score = len(buyers) * avg_rank
+
+    top_buyers = buyer_stats['member'].head(3).tolist()
+    buyer_label = f"Top {len(top_buyers)} of {len(buyers)}" if len(buyers) > 3 else f"{len(buyers)}"
+
+    return pd.DataFrame({
+        'ticker': [ticker],
+        'num_buyers': [len(buyers)],
+        'buyer_label': [buyer_label],
+        'buyers': [', '.join(top_buyers)],
+        'avg_buyer_performance': [round(avg_rank, 2)],
+        'best_buyer_performance': [round(max_rank, 2)],
+        'total_buyer_trades': [int(total_trades)],
+        'signal_score': [round(signal_score, 2)]
+    })
+
+def get_ticker_buyers_with_rankings(ticker, transactions_df, signals_df, horizon=90, threshold=5.0):
+    if signals_df.empty:
+        raise AnalysisError("Empty signal dataframe")
+    if transactions_df.empty:
+        raise AnalysisError("Empty transactions dataframe")
+
+    member_rankings = rank_members(signals_df, horizon, threshold)
+
+    ticker_trades = transactions_df[
+        (transactions_df['ticker'] == ticker) &
+        (transactions_df['transaction_type'] == 'Purchase')
+    ]
+
+    if ticker_trades.empty:
+        raise AnalysisError(f"No purchases found for {ticker}")
+
+    buyers_with_dates = ticker_trades.groupby('member').agg({
+        'transaction_date': list,
+        'disclosure_date': list
+    }).reset_index()
+
+    result = pd.merge(
+        buyers_with_dates,
+        member_rankings[['member', 'avg_peak_return_pct', 'hit_rate_pct', 'purchase_trades']],
+        on='member',
+        how='left'
+    )
+
+    result = result.sort_values('avg_peak_return_pct', ascending=False, na_position='last')
+    result['num_purchases'] = result['transaction_date'].apply(len)
+
+    return result[['member', 'num_purchases', 'transaction_date', 'disclosure_date',
+                   'avg_peak_return_pct', 'hit_rate_pct', 'purchase_trades']]

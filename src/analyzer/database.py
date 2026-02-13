@@ -6,6 +6,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+
 class Database:
     def __init__(self, db_path):
         self.db_path = pathlib.Path(db_path)
@@ -40,9 +41,15 @@ class Database:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_ticker ON transactions(ticker)")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_member ON transactions(member)")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_ticker ON transactions(ticker)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tx_member ON transactions(member)"
+        )
 
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS prices (
@@ -52,7 +59,9 @@ class Database:
                 PRIMARY KEY (ticker, date)
             )
         """)
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_ticker ON prices(ticker)")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prices_ticker ON prices(ticker)"
+        )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date)")
 
         self.conn.execute("""
@@ -80,24 +89,41 @@ class Database:
         """)
 
     def get_metadata(self, year):
-        result = self.conn.execute("""
+        result = self.conn.execute(
+            """
             SELECT doc_id AS "DocID", first_name AS "First", last_name AS "Last",
                    filing_date AS "FilingDate", filing_type AS "FilingType"
             FROM metadata
             WHERE EXTRACT(YEAR FROM filing_date) = ?
-        """, [year]).fetchdf()
+        """,
+            [year],
+        ).fetchdf()
         return result
 
     def metadata_exists(self, year):
-        count = self.conn.execute("""
+        count = self.conn.execute(
+            """
             SELECT COUNT(*) FROM metadata
             WHERE EXTRACT(YEAR FROM filing_date) = ?
-        """, [year]).fetchone()[0]
+        """,
+            [year],
+        ).fetchone()[0]
         return count > 0
+
+    def clear_metadata(self, year):
+        """Clear all metadata for a year to force refresh."""
+        self.conn.execute(
+            """
+            DELETE FROM metadata
+            WHERE EXTRACT(YEAR FROM filing_date) = ?
+        """,
+            [year],
+        )
+        logger.info(f"Cleared metadata for year {year}")
 
     def upsert_transactions(self, df):
         df = df.copy()
-        df['created_at'] = datetime.now()
+        df["created_at"] = datetime.now()
 
         self.conn.execute("CREATE TEMP TABLE staging_transactions AS SELECT * FROM df")
         self.conn.execute("""
@@ -109,19 +135,25 @@ class Database:
         self.conn.execute("DROP TABLE staging_transactions")
 
     def get_transactions(self, year):
-        result = self.conn.execute("""
+        result = self.conn.execute(
+            """
             SELECT member, ticker, transaction_date, disclosure_date, transaction_type
             FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
             ORDER BY disclosure_date DESC
-        """, [year]).fetchdf()
+        """,
+            [year],
+        ).fetchdf()
         return result
 
     def transactions_exist(self, year):
-        count = self.conn.execute("""
+        count = self.conn.execute(
+            """
             SELECT COUNT(*) FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
-        """, [year]).fetchone()[0]
+        """,
+            [year],
+        ).fetchone()[0]
         return count > 0
 
     def upsert_prices(self, df):
@@ -130,9 +162,11 @@ class Database:
 
         df_reset = df.reset_index()
         index_col_name = df_reset.columns[0]
-        prices_long = df_reset.melt(id_vars=[index_col_name], var_name='ticker', value_name='close')
-        prices_long = prices_long.rename(columns={index_col_name: 'date'})
-        prices_long = prices_long.dropna(subset=['close'])
+        prices_long = df_reset.melt(
+            id_vars=[index_col_name], var_name="ticker", value_name="close"
+        )
+        prices_long = prices_long.rename(columns={index_col_name: "date"})
+        prices_long = prices_long.dropna(subset=["close"])
 
         self.conn.execute("""
             INSERT INTO prices (ticker, date, close)
@@ -146,37 +180,43 @@ class Database:
         if not tickers:
             return pd.DataFrame()
 
-        result = self.conn.execute("""
+        result = self.conn.execute(
+            """
             SELECT date, ticker, close
             FROM prices
             WHERE ticker IN (SELECT UNNEST(?))
               AND date BETWEEN ? AND ?
             ORDER BY date
-        """, [tickers, start_date, end_date]).fetchdf()
+        """,
+            [tickers, start_date, end_date],
+        ).fetchdf()
 
         if result.empty:
             return pd.DataFrame()
 
-        pivot = result.pivot(index='date', columns='ticker', values='close')
+        pivot = result.pivot(index="date", columns="ticker", values="close")
         return pivot
 
     def get_missing_price_data(self, tickers, start_date, end_date):
-        all_dates = pd.date_range(start_date, end_date, freq='D')
-        existing = self.conn.execute("""
+        all_dates = pd.date_range(start_date, end_date, freq="D")
+        existing = self.conn.execute(
+            """
             SELECT DISTINCT ticker, date
             FROM prices
             WHERE ticker IN (SELECT UNNEST(?))
               AND date BETWEEN ? AND ?
-        """, [tickers, start_date, end_date]).fetchdf()
+        """,
+            [tickers, start_date, end_date],
+        ).fetchdf()
 
         if existing.empty:
             return tickers, all_dates
 
-        existing_tickers = set(existing['ticker'].unique())
+        existing_tickers = set(existing["ticker"].unique())
         missing_tickers = [t for t in tickers if t not in existing_tickers]
 
         if not missing_tickers:
-            existing_dates = set(existing['date'].unique())
+            existing_dates = set(existing["date"].unique())
             missing_dates = [d for d in all_dates if d not in existing_dates]
             return [], missing_dates
 

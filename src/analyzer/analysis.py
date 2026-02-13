@@ -30,18 +30,19 @@ def calculate_signal_potential(transactions_df, prices_df, horizons=[30, 60, 90,
     signals = signals.assign(horizon_days=[horizons] * len(signals)).explode('horizon_days').reset_index(drop=True)
     signals['horizon_days'] = signals['horizon_days'].astype('int32')
     signals['window_end'] = signals['disclosure_date'] + pd.to_timedelta(signals['horizon_days'], unit='D')
+    signals['signal_id'] = range(len(signals))
+    signals = signals.drop(columns=['date'], errors='ignore')
 
-    prices_by_ticker = {ticker: df.set_index('date')['price'] for ticker, df in prices_long.groupby('ticker')}
+    merged = pd.merge(signals, prices_long, on='ticker')
+    window_mask = (merged['date'] >= merged['disclosure_date']) & (merged['date'] <= merged['window_end'])
+    windowed = merged[window_mask]
 
-    def get_window_extrema(row):
-        ticker_prices = prices_by_ticker.get(row['ticker'])
-        if ticker_prices is None or ticker_prices.empty:
-            return pd.Series({'peak_price': np.nan, 'trough_price': np.nan})
-        window_prices = ticker_prices[(ticker_prices.index >= row['disclosure_date']) & (ticker_prices.index <= row['window_end'])]
-        return pd.Series({'peak_price': np.nan, 'trough_price': np.nan}) if len(window_prices) == 0 else pd.Series({'peak_price': window_prices.max(), 'trough_price': window_prices.min()})
+    extrema = windowed.groupby('signal_id', as_index=False).agg(
+        peak_price=('price', 'max'),
+        trough_price=('price', 'min')
+    )
 
-    extrema = signals.apply(get_window_extrema, axis=1)
-    final = pd.concat([signals, extrema], axis=1).dropna(subset=['peak_price', 'trough_price'])
+    final = pd.merge(signals, extrema, on='signal_id', how='inner').drop(columns='signal_id')
 
     if final.empty:
         raise AnalysisError("No valid signals calculated after price analysis")

@@ -10,9 +10,15 @@ dependencies = [
     "pandas",
     "numpy",
     "requests",
-    "investpy",
-    "pdfplumber",
+    "requests-cache",
+    "yfinance",
+    "camelot-py[cv]",
     "pyarrow",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "typer>=0.9",
+    "aiohttp>=3.9",
+    "duckdb>=0.9",
 ]
 
 [project.scripts]

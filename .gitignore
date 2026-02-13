@@ -49,3 +49,11 @@ Thumbs.db
 member_rankings.csv
 top_signals.csv
 recent_*.csv
+
+# Cache files
+http_cache.sqlite
+*.sqlite
+*.db
+
+# User configuration
+config.toml

@@ -17,7 +17,7 @@ Track which congressional members consistently outperform the market and create 
 
 ```
 src/analyzer/
-├── sources.py      # Data acquisition (House PTRs, investpy prices)
+├── sources.py      # Data acquisition (House PTRs, yfinance prices)
 ├── parsing.py      # PDF extraction and ticker identification
 ├── analysis.py     # Signal calculation and member ranking
 ├── pipeline.py     # End-to-end processing orchestration
@@ -25,10 +25,10 @@ src/analyzer/
 
 data/
 ├── {year}/
-│   ├── transactions.csv    # Parsed congressional trades
-│   ├── metadata.csv        # Member information
-│   └── pdfs/              # Raw disclosure files
-└── top_signals.csv         # Best trading opportunities
+│   ├── transactions.parquet    # Parsed congressional trades
+│   ├── metadata.parquet        # Member information
+│   └── pdfs/                   # Raw disclosure files
+└── top_signals.csv             # Best trading opportunities
 ```
 
 ### Core Pipeline

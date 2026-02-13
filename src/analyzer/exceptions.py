@@ -1,11 +1,14 @@
-class DataSourceError(Exception):
+class AnalyzerError(Exception):
     pass
 
-class ParsingError(Exception):
+class DataSourceError(AnalyzerError):
     pass
 
-class AnalysisError(Exception):
+class ParsingError(AnalyzerError):
     pass
 
-class ConfigurationError(Exception):
+class AnalysisError(AnalyzerError):
+    pass
+
+class ConfigurationError(AnalyzerError):
     pass

@@ -1,6 +1,9 @@
+import logging
 import pandas as pd
 import re
 from .exceptions import ParsingError
+
+logger = logging.getLogger(__name__)
 
 def clean_text(text):
     if text is None:
@@ -11,10 +14,10 @@ def extract_ticker_from_name(asset_name):
     if not asset_name:
         return None
 
-    match = re.search(r'\(([A-Z][A-Z.\-]{0,9})\)', asset_name)
+    match = re.search(r'\(([A-Z][A-Z.\-]{1,5})\)', asset_name)
     if match:
         ticker = match.group(1).strip()
-        if 1 <= len(ticker) <= 10:
+        if 1 <= len(ticker) <= 5:
             return ticker
     return None
 
@@ -27,29 +30,25 @@ def _extract_ticker(asset_cell):
 def _extract_transaction_type(tx_type_cell):
     if not tx_type_cell:
         return None
-    tx_type_match = re.search(r'\b([PS])\b', tx_type_cell, re.IGNORECASE)
-    if not tx_type_match:
-        return None
-
-    match tx_type_match.group(1).upper():
-        case 'P':
-            return 'Purchase'
-        case 'S':
-            return 'Sale'
-        case _:
-            return None
+    tx_type_lower = tx_type_cell.lower()
+    if 'purchase' in tx_type_lower:
+        return 'Purchase'
+    elif 'sale' in tx_type_lower:
+        return 'Sale'
+    return None
 
 def _extract_date(date_cell):
     if not date_cell:
         return None
-    date_match = re.search(r'(\d{2}/\d{2}/\d{4})', date_cell)
+    # Support both MM/DD/YYYY and YYYY-MM-DD formats
+    date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', date_cell)
     return date_match.group(1) if date_match else None
 
 def _process_row(row):
     try:
-        asset_cell = f"{row[0]} {row[1]}"
-        tx_type_cell = str(row[2])
-        date_cell = str(row[3])
+        asset_cell = str(row[0])
+        tx_type_cell = str(row[1])
+        date_cell = str(row[2])
 
         ticker = _extract_ticker(asset_cell)
         tx_type = _extract_transaction_type(tx_type_cell)
@@ -136,3 +135,64 @@ def consolidate_transactions(pdf_transactions, member_metadata):
     df['disclosure_date'] = pd.to_datetime(df['disclosure_date'], errors='coerce')
 
     return df.dropna(subset=['transaction_date'])
+
+
+def _parse_ocr_text_to_rows(text):
+    rows = []
+    lines = text.strip().split('\n')
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Look for ticker pattern
+        ticker_match = re.search(r'\(([A-Z][A-Z0-9.\-]{1,5})\)', line)
+        if not ticker_match:
+            continue
+
+        asset_name = line[:ticker_match.end()].strip()
+        rest = line[ticker_match.end():].strip()
+
+        # Handle single-letter transaction codes: P=Purchase, S=Sale, PP=Purchase
+        tx_type = None
+        rest_clean = re.sub(r'\s+', ' ', rest)
+        if re.match(r'^P\s', rest_clean) or rest_clean.startswith('PP '):
+            tx_type = 'Purchase'
+        elif re.match(r'^S\s', rest_clean) or rest_clean.startswith('S '):
+            tx_type = 'Sale'
+
+        # Look for date in rest
+        date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', rest)
+        date_str = date_match.group(1) if date_match else None
+
+        if tx_type and date_str:
+            rows.append([asset_name, tx_type, date_str])
+
+    return rows
+
+
+def extract_tables_with_ocr(pdf_path):
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+    except ImportError as e:
+        logger.warning(f"OCR dependencies not available: {e}")
+        return []
+
+    try:
+        images = convert_from_path(str(pdf_path), dpi=300)
+    except Exception as e:
+        logger.warning(f"Failed to convert PDF to images for OCR {pdf_path}: {e}")
+        return []
+
+    all_rows = []
+    for image in images:
+        text = pytesseract.image_to_string(image)
+        all_rows.extend(_parse_ocr_text_to_rows(text))
+
+    if not all_rows:
+        return []
+
+    table = [['Asset Name', 'Transaction Type', 'Transaction Date']] + all_rows
+    return [table]

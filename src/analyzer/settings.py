@@ -1,6 +1,6 @@
 from multiprocessing import cpu_count
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource, PydanticBaseSettingsSource
+from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
 
 class DataSettings(BaseSettings):
     data_dir: str = "data"

@@ -82,7 +82,7 @@ def run_ticker_analysis(ticker, transaction_source, price_source, year, horizon,
 
     print(f"\n=== Buyers of {ticker} ===")
     print(buyers.to_string(index=False))
-    print(f"\n=== Signal Score ===")
+    print("\n=== Signal Score ===")
     print(score.to_string(index=False))
     return True
 

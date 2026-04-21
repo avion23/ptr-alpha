@@ -1,6 +1,5 @@
 import requests
 import requests_cache
-import pandas as pd
 import yfinance as yf
 import zipfile
 import camelot
@@ -17,10 +16,10 @@ from analyzer.parsing import (
     parse_pdf_table,
     normalize_house_metadata,
     consolidate_transactions,
+    extract_tables_with_ocr,
 )
 from analyzer.models import DownloadResult, DownloadStatus
 from analyzer.interfaces import TransactionSource, PriceSource
-from analyzer.settings import Settings
 from analyzer.database import Database
 
 logger = logging.getLogger(__name__)
@@ -38,6 +37,10 @@ def _parse_pdf_worker(pdf_path):
             tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="stream")
             for table in tables:
                 transactions.extend(parse_pdf_table(table.data))
+        if not transactions:
+            ocr_tables = extract_tables_with_ocr(pdf_path)
+            for table in ocr_tables:
+                transactions.extend(parse_pdf_table(table))
         return pdf_path, transactions
     except (OSError, ParsingError) as e:
         logger.warning(f"Failed to parse PDF {pdf_path}: {e}")

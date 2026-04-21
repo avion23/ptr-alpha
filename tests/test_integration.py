@@ -3,97 +3,87 @@ import tempfile
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from analyzer.sources import Config
-from analyzer.pipeline import run_analysis_pipeline
+from analyzer.settings import Settings, DataSettings
+from analyzer.pipeline import run_analysis_pipeline, AnalysisParams
+from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
+from analyzer.database import Database
+
 
 class TestIntegration(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        self.config = Config(data_dir=self.temp_dir, cache_enabled=False)
+        self.settings = Settings(data=DataSettings(data_dir=self.temp_dir, cache_enabled=False))
 
-    def create_mock_data(self):
+    def _insert_mock_transactions(self):
         np.random.seed(42)
-
+        db = Database(Path(self.temp_dir) / "congress.duckdb")
         transactions = pd.DataFrame({
+            'doc_id': [f'DOC-{i:04d}' for i in range(30)],
             'member': ['Alice Smith', 'Bob Jones', 'Charlie Brown'] * 10,
             'ticker': np.random.choice(['AAPL', 'GOOGL', 'MSFT', 'TSLA'], 30),
             'disclosure_date': pd.date_range('2024-01-01', periods=30, freq='D'),
             'transaction_date': pd.date_range('2023-12-25', periods=30, freq='D'),
             'transaction_type': np.random.choice(['Purchase', 'Sale'], 30, p=[0.7, 0.3])
         })
-
-        transactions_file = Path(self.temp_dir) / "2024" / "transactions.parquet"
-        transactions_file.parent.mkdir(exist_ok=True)
-        transactions.to_parquet(transactions_file, index=False)
-
+        db.upsert_transactions(transactions)
+        db.close()
         return transactions
 
-    def test_end_to_end_house_analysis(self):
-        self.create_mock_data()
+    def _create_mock_price_source(self):
+        np.random.seed(99)
+        price_source = YFinancePriceSource(self.settings)
 
-        from analyzer import sources
-        original_fetch_prices = sources.fetch_prices
-
-        def mock_fetch_prices(tickers, start_date, end_date, config):
-            dates = pd.date_range(start_date, end_date, freq='D')
+        def mock_get_prices(tickers, start, end):
+            dates = pd.date_range(start, end, freq='D')
             price_data = {}
             for ticker in tickers:
-                price_data[ticker] = [100.0 + np.random.normal(0, 5) for _ in range(len(dates))]
+                base_price = 100.0 + hash(ticker) % 50
+                price_data[ticker] = base_price + np.cumsum(np.random.normal(0.1, 2, len(dates)))
             return pd.DataFrame(price_data, index=dates)
 
-        sources.fetch_prices = mock_fetch_prices
+        price_source.get_prices = mock_get_prices
+        return price_source
 
-        try:
-            result = run_analysis_pipeline(
-                source='house',
-                year=2024,
-                horizons=[90],
-                threshold=5.0,
-                member_filter=None,
-                top_n=10,
-                show_signals=False,
-                output_format='console',
-                config=self.config
-            )
+    def test_end_to_end_house_analysis(self):
+        self._insert_mock_transactions()
+        transaction_source = HouseTransactionSource(self.settings)
+        price_source = self._create_mock_price_source()
 
-            self.assertTrue(result, "Analysis pipeline should succeed")
+        params = AnalysisParams(
+            source='house',
+            year=2024,
+            horizons=[90],
+            threshold=5.0,
+            top_n=10,
+        )
 
-        finally:
-            sources.fetch_prices = original_fetch_prices
+        result = run_analysis_pipeline(
+            params, transaction_source, price_source, Path(self.temp_dir), 'console'
+        )
+
+        self.assertTrue(result, "Analysis pipeline should succeed")
 
     def test_member_specific_analysis(self):
-        self.create_mock_data()
+        self._insert_mock_transactions()
+        transaction_source = HouseTransactionSource(self.settings)
+        price_source = self._create_mock_price_source()
 
-        from analyzer import sources
-        original_fetch_prices = sources.fetch_prices
+        params = AnalysisParams(
+            source='house',
+            year=2024,
+            horizons=[30, 90],
+            threshold=5.0,
+            member_filter='Alice Smith',
+            top_n=5,
+        )
 
-        def mock_fetch_prices(tickers, start_date, end_date, config):
-            dates = pd.date_range(start_date, end_date, freq='D')
-            price_data = {}
-            for ticker in tickers:
-                price_data[ticker] = [100.0 + np.random.normal(0, 5) for _ in range(len(dates))]
-            return pd.DataFrame(price_data, index=dates)
+        result = run_analysis_pipeline(
+            params, transaction_source, price_source, Path(self.temp_dir), 'console'
+        )
 
-        sources.fetch_prices = mock_fetch_prices
+        self.assertTrue(result, "Member analysis pipeline should succeed")
 
-        try:
-            result = run_analysis_pipeline(
-                source='house',
-                year=2024,
-                horizons=[30, 90],
-                threshold=5.0,
-                member_filter='Alice Smith',
-                top_n=5,
-                show_signals=False,
-                output_format='console',
-                config=self.config
-            )
-
-            self.assertTrue(result, "Member analysis pipeline should succeed")
-
-        finally:
-            sources.fetch_prices = original_fetch_prices
 
 if __name__ == '__main__':
     unittest.main()

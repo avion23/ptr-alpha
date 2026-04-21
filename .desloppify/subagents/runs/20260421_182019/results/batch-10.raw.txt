@@ -1,0 +1,173 @@
+{
+  "batch": "test_strategy",
+  "batch_index": 10,
+  "assessments": {"test_strategy": 42.5},
+  "dimension_notes": {
+    "test_strategy": {
+      "evidence": [
+        "4 test files (481 LOC) covering 2 of 10 production modules directly (parsing.py, analysis.py), with 1 integration test that exercises database + pipeline indirectly",
+        "score_ticker_by_buyers (50 LOC) and get_ticker_buyers_with_rankings (32 LOC) in analysis.py are completely untested — not imported in any test",
+        "database.py (232 LOC, 15 methods) has zero direct unit tests — only exercised indirectly via integration test's _insert_mock_transactions helper",
+        "datasources.py (300 LOC) — HouseTransactionSource and YFinancePriceSource classes have no unit tests; integration test mocks the price source entirely",
+        "pipeline.py — run_ticker_analysis, run_recent_ticker_scoring, _save_results are completely untested; only run_analysis_pipeline has indirect coverage",
+        "parsing.py OCR path (_parse_ocr_text_to_rows, extract_tables_with_ocr) has zero test coverage",
+        "0% snapshot tests — all tests use explicit assertions",
+        "Integration test provides genuine cross-module verification (database → transaction source → analysis pipeline)",
+        "test_analysis.py line 36 asserts exact column list order, creating coupling to implementation detail",
+        "test_performance.py timing assertions (assertLess elapsed_time < 5.0s/15.0s) are machine-dependent fragility"
+      ],
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor",
+      "confidence": "high"
+    }
+  },
+  "dimension_judgment": {
+    "test_strategy": {
+      "dimension_character": "The test suite covers parsing and core analysis functions reasonably well with explicit assertions and good error-path testing, but leaves significant gaps in the data layer (database.py, datasources.py), orchestration (pipeline.py), and two analysis functions (score_ticker_by_buyers, get_ticker_buyers_with_rankings). There are no snapshot tests and the integration test provides real cross-module value. The main weakness is breadth: over 600 LOC of business-critical code across database, datasources, and pipeline has only indirect coverage through a single integration test.",
+      "score_rationale": "Scored 42.5: roughly 40% of production LOC has meaningful direct test coverage (parsing + analysis), the integration test adds cross-module verification, and there are zero snapshot tests — all positive signals. However, the database layer (232 LOC), datasource classes (300 LOC), pipeline orchestration (135 LOC), and two analysis functions (82 LOC) are untested or only indirectly tested, representing critical paths for a data pipeline tool. This is a moderate-small codebase where the testing gap is proportionally significant."
+    }
+  },
+  "issues": [
+    {
+      "dimension": "test_strategy",
+      "identifier": "untested_analysis_functions",
+      "summary": "score_ticker_by_buyers and get_ticker_buyers_with_rankings have zero test coverage",
+      "related_files": ["src/analyzer/analysis.py", "tests/test_analysis.py"],
+      "evidence": [
+        "test_analysis.py imports 6 functions from analysis.py but omits score_ticker_by_buyers (line 153) and get_ticker_buyers_with_rankings (line 204)",
+        "Both functions contain non-trivial logic: conditional DataFrame construction, member ranking merges, signal score calculation"
+      ],
+      "suggestion": "Add unit tests for score_ticker_by_buyers covering: empty signals, no buyers for ticker, buyers not in rankings, normal case with ranked buyers. Add tests for get_ticker_buyers_with_rankings covering: empty transactions, valid ticker with buyers.",
+      "confidence": "high",
+      "impact_scope": "local",
+      "fix_scope": "single_edit"
+    },
+    {
+      "dimension": "test_strategy",
+      "identifier": "untested_database_layer",
+      "summary": "database.py (232 LOC, 15 methods) has no direct unit tests",
+      "related_files": ["src/analyzer/database.py"],
+      "evidence": [
+        "Database class has 15 methods including upsert_metadata, get_metadata, upsert_transactions, get_transactions, upsert_prices, get_prices, get_missing_price_data, transactions_exist, metadata_exists, clear_metadata",
+        "Only exercised indirectly via test_integration.py's _insert_mock_transactions which calls db.upsert_transactions then db.close — no reads, no metadata operations, no price operations tested"
+      ],
+      "suggestion": "Add a test_database.py with tests for: upsert/get metadata round-trip, upsert/get transactions with year filtering, upsert/get prices with pivot, get_missing_price_data gap detection, transactions_exist/metadata_exists booleans. Use tempfile for db_path.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor"
+    },
+    {
+      "dimension": "test_strategy",
+      "identifier": "untested_datasource_classes",
+      "summary": "HouseTransactionSource and YFinancePriceSource classes have no unit tests",
+      "related_files": ["src/analyzer/datasources.py"],
+      "evidence": [
+        "HouseTransactionSource has 7 methods (get_transactions, fetch_metadata, fetch_and_cache_pdfs, parse_cached_pdfs, _download_pdf_async, _fetch_and_cache_pdfs_async)",
+        "YFinancePriceSource has 1 method (get_prices, 76 LOC) with complex caching/fallback/success-rate logic",
+        "Integration test mocks YFinancePriceSource.get_prices entirely (line 45: price_source.get_prices = mock_get_prices), bypassing all real logic"
+      ],
+      "suggestion": "Add unit tests for YFinancePriceSource.get_prices with mocked yf.download and Database: test fully-cached path, partial-cache fetch, empty-ticker error, failure-rate threshold. For HouseTransactionSource, test get_transactions with cached data and missing-data error.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor"
+    },
+    {
+      "dimension": "test_strategy",
+      "identifier": "untested_pipeline_functions",
+      "summary": "4 of 6 pipeline functions are completely untested",
+      "related_files": ["src/analyzer/pipeline.py"],
+      "evidence": [
+        "pipeline.py exports run_fetch_pipeline, run_parse_pipeline, run_analysis_pipeline, run_ticker_analysis, run_recent_ticker_scoring",
+        "Only run_analysis_pipeline is tested via integration. run_fetch_pipeline, run_parse_pipeline, run_ticker_analysis, run_recent_ticker_scoring, and _save_results have zero coverage",
+        "run_recent_ticker_scoring (27 LOC) contains non-trivial filtering logic (cutoff date, multi-buyer grouping) that could silently break"
+      ],
+      "suggestion": "Add tests for _save_results (CSV output path, console print fallback) and run_recent_ticker_scoring with mocked _prepare_analysis_data. run_fetch_pipeline and run_parse_pipeline can be tested with mocked transaction_source.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor"
+    },
+    {
+      "dimension": "test_strategy",
+      "identifier": "untested_ocr_parsing_path",
+      "summary": "OCR-based PDF parsing functions have zero test coverage",
+      "related_files": ["src/analyzer/parsing.py"],
+      "evidence": [
+        "_parse_ocr_text_to_rows (lines 140-172) contains regex-based line parsing for ticker extraction, transaction code mapping (P=Purchase, S=Sale), and date extraction",
+        "extract_tables_with_ocr (lines 175-198) wraps pdf2image and pytesseract with error handling",
+        "Neither function is imported or tested in test_parsing.py"
+      ],
+      "suggestion": "Add unit tests for _parse_ocr_text_to_rows with sample OCR text strings: valid rows with tickers, single-letter transaction codes (P, S, PP), missing dates, no ticker patterns. Mock pdf2image/pytesseract for extract_tables_with_ocr.",
+      "confidence": "medium",
+      "impact_scope": "local",
+      "fix_scope": "single_edit"
+    },
+    {
+      "dimension": "test_strategy",
+      "identifier": "column_order_test_coupling",
+      "summary": "test asserts exact column list order creating implementation coupling",
+      "related_files": ["tests/test_analysis.py"],
+      "evidence": [
+        "Line 36: self.assertEqual(list(signals.columns), expected_cols) checks exact column ordering",
+        "Line 97: self.assertEqual(list(top_signals.columns), expected_cols) same pattern",
+        "Line 115: self.assertEqual(list(member_signals.columns), expected_cols) same pattern",
+        "Line 154: self.assertEqual(list(perf.columns), expected_cols) same pattern",
+        "Any column reordering in the production code (e.g. DataFrame.assign column order) would break these tests despite being a no-op change"
+      ],
+      "suggestion": "Replace exact column order assertions with set-based checks: self.assertTrue(set(signals.columns) >= set(expected_cols)). This tests that required columns exist without coupling to ordering.",
+      "confidence": "medium",
+      "impact_scope": "local",
+      "fix_scope": "single_edit"
+    },
+    {
+      "dimension": "test_strategy",
+      "identifier": "timing_assertion_fragility",
+      "summary": "Performance tests use machine-dependent timing assertions",
+      "related_files": ["tests/test_performance.py"],
+      "evidence": [
+        "Line 43: self.assertLess(elapsed_time, 5.0, ...) for 'small' dataset (1000 transactions)",
+        "Line 58: self.assertLess(elapsed_time, 15.0, ...) for 'medium' dataset (5000 transactions)",
+        "These thresholds depend on machine hardware and load; CI runners or low-spec machines could cause spurious failures"
+      ],
+      "suggestion": "Either increase thresholds generously (2-3x) to reduce flakiness, or convert to warnings (assertWarnIf) instead of hard failures, or remove timing assertions entirely and rely on correctness tests only.",
+      "confidence": "medium",
+      "impact_scope": "local",
+      "fix_scope": "single_edit"
+    }
+  ],
+  "retrospective": {
+    "root_causes": [
+      "Testing focused on pure-function modules (analysis, parsing) while avoiding I/O-heavy modules (database, datasources, pipeline) that require mocking infrastructure",
+      "No conftest.py or shared fixtures, suggesting tests were added ad-hoc rather than with a systematic coverage plan"
+    ],
+    "likely_symptoms": [
+      "untested_database_layer",
+      "untested_datasource_classes",
+      "untested_pipeline_functions"
+    ],
+    "possible_false_positives": []
+  },
+  "context_updates": {
+    "test_strategy": {
+      "add": [
+        {
+          "header": "No snapshot tests",
+          "description": "0% snapshot usage across all test files. All assertions are explicit value checks, which is the ideal pattern for this kind of data transformation codebase.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Integration test covers database + pipeline + analysis",
+          "description": "test_integration.py provides genuine cross-module verification using real Database with tempdir and a mock price source, exercising the full analysis pipeline end-to-end.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Untested I/O modules require mocking infrastructure",
+          "description": "database.py, datasources.py, and pipeline.py are untested as units because they depend on DuckDB filesystem I/O, network calls (yfinance, House Clerk), and async operations — testing them requires shared fixtures or conftest.py which doesn't exist.",
+          "settled": false,
+          "positive": false
+        }
+      ]
+    }
+  }
+}

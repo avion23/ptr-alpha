@@ -4,7 +4,9 @@ import pandas as pd
 import os
 from functools import wraps
 from dataclasses import dataclass
+from typing import Optional
 from analyzer.exceptions import AnalyzerError, DataSourceError
+from analyzer.models import TransactionType
 from analyzer import analysis
 
 logger = logging.getLogger(__name__)
@@ -13,10 +15,10 @@ logger = logging.getLogger(__name__)
 class AnalysisParams:
     source: str
     year: int
-    horizons: list
+    horizons: list[int]
     threshold: float
-    member_filter: str = None
-    top_n: int = None
+    member_filter: Optional[str] = None
+    top_n: Optional[int] = None
     show_signals: bool = False
     output_format: str = 'console'
 
@@ -28,9 +30,6 @@ def pipeline_step(func):
         except AnalyzerError as e:
             logger.error(f"{func.__name__} failed: {e}")
             return False
-        except Exception as e:
-            logger.exception(f"Unexpected error in {func.__name__}: {e}")
-            raise
     return wrapper
 
 def _prepare_analysis_data(transaction_source, price_source, year, horizons):
@@ -70,8 +69,8 @@ def run_analysis_pipeline(params, transaction_source, price_source, data_dir, ou
     table = analysis.get_analysis_table(signals, params.member_filter, params.show_signals, params.horizons[0], params.top_n, params.threshold)
     logger.info(f"Generated analysis table with {len(table)} rows")
 
-    result = _save_results(table, output_format, params.member_filter, params.show_signals, data_dir)
-    return bool(result)
+    _save_results(table, output_format, params.member_filter, params.show_signals, data_dir)
+    return True
 
 @pipeline_step
 def run_ticker_analysis(ticker, transaction_source, price_source, year, horizon, threshold):
@@ -97,7 +96,7 @@ def run_recent_ticker_scoring(transaction_source, price_source, year, horizons, 
     recent_trades = trades[trades['disclosure_date'] > cutoff_date]
     logger.info(f"Analyzing {len(recent_trades)} transactions from last {days_back} days")
 
-    recent_purchases = recent_trades[recent_trades['transaction_type'] == 'Purchase']
+    recent_purchases = recent_trades[recent_trades['transaction_type'] == TransactionType.PURCHASE.value]
     ticker_buyer_counts = recent_purchases.groupby('ticker')['member'].nunique()
     multi_buyer_tickers = ticker_buyer_counts[ticker_buyer_counts >= min_buyers].index.tolist()
 
@@ -129,7 +128,5 @@ def _save_results(table, output_format, member_filter, show_signals, data_dir):
         os.makedirs(data_dir, exist_ok=True)
         table.to_csv(filepath, index=False)
         logger.info(f"Results saved to {filepath}")
-        return True
     else:
         print(table.to_string(index=False))
-        return True

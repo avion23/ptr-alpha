@@ -32,7 +32,7 @@ class Filing(BaseModel):
     first_name: str = Field(alias="First")
     last_name: str = Field(alias="Last")
     filing_date: datetime = Field(alias="FilingDate")
-    filing_type: str = Field(alias="FilingType")
+    filing_type: FilingType = Field(alias="FilingType")
 
 class Signal(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)

@@ -22,7 +22,7 @@ app = typer.Typer(help="Congressional insider trading analyzer", no_args_is_help
 
 @dataclass
 class AppContext:
-    settings: object
+    settings: Settings
     transaction_source: HouseTransactionSource
     price_source: YFinancePriceSource
 

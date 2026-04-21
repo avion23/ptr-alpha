@@ -1,0 +1,147 @@
+{
+  "batch": "error_consistency",
+  "batch_index": 4,
+  "assessments": {"error_consistency": 72.0},
+  "dimension_notes": {
+    "error_consistency": {
+      "evidence": [
+        "exceptions.py defines a clean 5-class hierarchy (AnalyzerError base + 4 domain subclasses), but ConfigurationError is never imported or raised anywhere — dead code suggesting an incomplete strategy",
+        "analysis.py raises AnalysisError consistently across all 8 functions — the most consistent module",
+        "datasources.py mostly raises DataSourceError/ParsingError but _parse_pdf_worker (line 45-47) silently catches OSError and ParsingError, returning empty list — per-PDF failure details lost to log-only output",
+        "datasources.py _download_pdf_async returns DownloadResult with error status codes instead of raising — appropriate async boundary pattern, not a defect",
+        "parsing.py has mixed strategies: _process_row returns None on IndexError (row-level filter), normalize_house_metadata raises ParsingError for validation, extract_tables_with_ocr catches broad Exception and returns [] — three different error handling approaches in one 198-line file",
+        "pipeline.py pipeline_step decorator catches AnalyzerError (logs + returns False) then catches Exception (logs.exception + re-raises) — re-raised exceptions get logged again by cli.py, causing double-logging of the same error",
+        "database.py has zero try/except blocks across 232 LOC and 15 methods — all duckdb library exceptions (IOException, ParserException, CatalogException) propagate as raw implementation errors without domain wrapping",
+        "cli.py uses traceback.print_exc() for unexpected exceptions (line 227) instead of logger.exception(), bypassing the structured logging setup used everywhere else"
+      ],
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor",
+      "confidence": "high"
+    }
+  },
+  "dimension_judgment": {
+    "error_consistency": {
+      "dimension_character": "The codebase establishes a well-structured custom exception hierarchy and uses domain-specific exceptions consistently within analysis.py and most of datasources.py, but the error strategy frays at the database boundary where zero wrapping occurs, and parsing.py mixes three distinct approaches (raise, return None, return empty container) without clear rules. The pipeline decorator introduces a double-logging problem by logging then re-raising unexpected exceptions that get logged again at the CLI boundary.",
+      "score_rationale": "The exception hierarchy is designed and mostly followed, keeping the score out of the 50s, but the database module leaking raw duckdb exceptions across the core data layer and multiple silent-swallowing catch blocks in parsing/datasources prevent a higher score. A codebase of this size should have either full domain wrapping at the database boundary or a documented reason for letting library exceptions through."
+    }
+  },
+  "issues": [
+    {
+      "dimension": "error_consistency",
+      "identifier": "db-raw-exceptions",
+      "summary": "Database module leaks raw duckdb exceptions without domain wrapping",
+      "related_files": ["src/analyzer/database.py"],
+      "evidence": [
+        "database.py has 0 try/except blocks across 232 LOC and 15 methods including upsert_metadata, upsert_transactions, upsert_prices — all duckdb.IOException, ParserException, and CatalogException propagate as raw library exceptions",
+        "The module imports AnalyzerError-related exceptions from analyzer.exceptions nowhere despite being the core I/O layer where errors are most likely"
+      ],
+      "suggestion": "Wrap database operations in try/except blocks catching duckdb exceptions and re-raising as DataSourceError with context about which operation failed and what query was being executed. At minimum, __init__ (line 14: duckdb.connect) and the write operations (upsert_*) should be wrapped since they perform I/O that can fail.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor"
+    },
+    {
+      "dimension": "error_consistency",
+      "identifier": "parsing-silent-swallow-broad",
+      "summary": "extract_tables_with_ocr catches broad Exception and silently returns empty list",
+      "related_files": ["src/analyzer/parsing.py"],
+      "evidence": [
+        "Line 185: except Exception as e: catches all PDF conversion failures including unexpected ones like MemoryError, returns []",
+        "The caller _parse_pdf_worker (datasources.py:41) treats the empty list the same as 'no tables found' — cannot distinguish conversion failure from empty PDF"
+      ],
+      "suggestion": "Either narrow the except to specific exceptions (OSError, ValueError from pdf2image) and raise ParsingError for unexpected failures, or return a result object that distinguishes 'no tables' from 'conversion error' so the caller can report accurately.",
+      "confidence": "high",
+      "impact_scope": "local",
+      "fix_scope": "single_edit"
+    },
+    {
+      "dimension": "error_consistency",
+      "identifier": "parse-worker-silent-failures",
+      "summary": "_parse_pdf_worker silently swallows parsing errors losing per-PDF failure context",
+      "related_files": ["src/analyzer/datasources.py"],
+      "evidence": [
+        "Lines 45-47: except (OSError, ParsingError) as e: logger.warning(...); return pdf_path, []",
+        "The parallel worker returns (pdf_path, []) for both 'PDF has no parseable tables' and 'PDF file is corrupted/unreadable' — the caller parse_cached_pdfs aggregates results but cannot report which PDFs failed or why",
+        "Failed PDFs are silently excluded from the consolidated transaction set with only a log line"
+      ],
+      "suggestion": "Return a DownloadResult-like status object or include error information in the worker result tuple so parse_cached_pdfs can report which PDFs failed and include failure details in the final summary log.",
+      "confidence": "medium",
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor"
+    },
+    {
+      "dimension": "error_consistency",
+      "identifier": "pipeline-double-log",
+      "summary": "pipeline_step decorator double-logs unexpected exceptions before re-raising",
+      "related_files": ["src/analyzer/pipeline.py", "src/analyzer/cli.py"],
+      "evidence": [
+        "pipeline.py line 31-33: except Exception as e: logger.exception(...); raise — logs the full traceback via logger.exception",
+        "cli.py line 223-228: except Exception as e: traceback.print_exc() — prints the full traceback again to stderr",
+        "Same unexpected error appears twice in output: once from the decorator's logger.exception and once from cli.py's traceback.print_exc()"
+      ],
+      "suggestion": "Either remove the logger.exception from the pipeline decorator and let the CLI boundary be the sole error reporter, or change the pipeline decorator to not re-raise after logging (matching its AnalyzerError handling pattern of returning False), or add an error marker attribute to the re-raised exception so the CLI knows not to log it again.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "single_edit"
+    },
+    {
+      "dimension": "error_consistency",
+      "identifier": "parsing-mixed-strategies",
+      "summary": "parsing.py uses three different error strategies without consistent rules",
+      "related_files": ["src/analyzer/parsing.py"],
+      "evidence": [
+        "_process_row (line 64): returns None on IndexError — treats bad rows as filterable, not erroneous",
+        "normalize_house_metadata (lines 76, 80, 91, 96, 102): raises ParsingError for validation failures — treats bad input as exceptional",
+        "extract_tables_with_ocr (lines 179, 185): catches exceptions and returns [] — treats failures as silently recoverable",
+        "All three patterns exist within the same 198-line file that defines the parsing domain"
+      ],
+      "suggestion": "Document the convention: row-level parsing failures return None (filter pattern), file-level structural issues raise ParsingError (exceptional), and OCR fallback failures return empty with logging (degraded mode). Then enforce it — extract_tables_with_ocr should narrow its broad except to match the documented convention rather than swallowing all exceptions.",
+      "confidence": "medium",
+      "impact_scope": "local",
+      "fix_scope": "single_edit"
+    }
+  ],
+  "retrospective": {
+    "root_causes": [
+      "Database module was written as a thin wrapper over duckdb without considering the error boundary — raw library exceptions propagate through the full stack",
+      "Parallel processing design (multiprocessing Pool) requires serializable error handling, pushing the codebase toward return-value-based error signaling in workers rather than exceptions",
+      "OCR fallback (extract_tables_with_ocr) was treated as best-effort from the start, leading to overly broad exception handling rather than explicit degradation states"
+    ]
+  },
+  "context_updates": {
+    "error_consistency": {
+      "add": [
+        {
+          "header": "Clean exception hierarchy in exceptions.py",
+          "description": "AnalyzerError base with 4 domain subclasses (DataSourceError, ParsingError, AnalysisError, ConfigurationError) provides a solid foundation for domain-level error handling throughout the codebase.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Async download uses result objects not exceptions",
+          "description": "_download_pdf_async returns DownloadResult with status/error fields rather than raising — appropriate for parallel async work where individual task failures should not abort the batch. This is a legitimate layer-specific strategy, not inconsistency.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Row-level parsing returns None as filter",
+          "description": "_process_row returns None for malformed rows rather than raising, which feeds into parse_pdf_table's list comprehension filter. This is a deliberate pattern for row-level data cleaning where individual bad rows are expected and skippable.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Database module lacks domain error wrapping",
+          "description": "database.py has zero try/except blocks — all duckdb library exceptions propagate as raw implementation errors. This is the most significant error consistency gap since the database is the core I/O boundary.",
+          "settled": true,
+          "positive": false
+        },
+        {
+          "header": "ConfigurationError is dead code",
+          "description": "Defined in exceptions.py but never imported or raised anywhere. Either configuration validation doesn't happen or it uses generic exceptions. Suggests the error strategy is not fully implemented.",
+          "settled": true,
+          "positive": false
+        }
+      ]
+    }
+  }
+}

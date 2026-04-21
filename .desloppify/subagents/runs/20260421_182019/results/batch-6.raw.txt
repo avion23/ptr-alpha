@@ -1,0 +1,133 @@
+{
+  "batch": "abstraction_fitness",
+  "batch_index": 6,
+  "assessments": {
+    "abstraction_fitness": 78.3
+  },
+  "dimension_notes": {
+    "abstraction_fitness": {
+      "evidence": [
+        "interfaces.py defines TransactionSource and PriceSource ABCs, each with exactly one concrete implementation (HouseTransactionSource, YFinancePriceSource) and no extension mechanism, plugin registry, or test-based polymorphism",
+        "TransactionType enum (PURCHASE='Purchase', SALE='Sale') is defined in models.py but bypassed in 9 locations across analysis.py (lines 49,104,119,136,164,214) and pipeline.py (line 100) using raw string 'Purchase' comparisons instead of the enum member",
+        "FilingType enum (PTR='P') is defined but bypassed in datasources.py (lines 142,180) using raw string 'P' comparisons",
+        "Transaction model uses TransactionType enum for its field type, but the DataFrame column 'transaction_type' flowing through analysis.py contains raw strings, creating a type lie at the boundary",
+        "No delegation-heavy classes: all 15 Database methods contain real SQL logic, not forwarding",
+        "No pure forwarding functions: pipeline_step decorator adds error-handling policy; fetch_and_cache_pdfs sync wrapper is a legitimate async bridge",
+        "No generic helper modules: each module has a clear domain responsibility",
+        "Indirection chains (cli→pipeline→datasource→database) each add genuine policy: arg parsing, orchestration/error-handling, caching/transformation, SQL execution",
+        "Facade module flags are false positives: datasources.py (300 LOC) and database.py (232 LOC) have high import ratios because they import dependencies, not because they re-export"
+      ],
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor",
+      "confidence": "high",
+      "issues_preventing_higher_score": "ABCs without extension pressure and systematic enum bypass create a gap between the type definitions and runtime behavior. The abstractions exist but aren't leveraged, reducing definition_directness.",
+      "sub_axes": {
+        "abstraction_leverage": 72.0,
+        "indirection_cost": 88.0,
+        "interface_honesty": 74.0,
+        "delegation_density": 96.0,
+        "definition_directness": 48.0,
+        "type_discipline": 72.0
+      }
+    }
+  },
+  "dimension_judgment": {
+    "abstraction_fitness": {
+      "dimension_character": "The codebase is pragmatic and avoids most abstraction anti-patterns: no delegation-heavy classes, no pure forwarding functions, no generic helper bags, and each indirection layer adds real policy. However, two abstract base classes in interfaces.py each have only one implementation with no extension mechanism, making them speculative abstractions that add indirection without polymorphic benefit. Additionally, the TransactionType and FilingType enums are systematically bypassed in favor of raw string comparisons across 9 call sites, creating a disconnect between type definitions and runtime usage.",
+      "score_rationale": "The score reflects strong fundamentals in avoiding gratuitous indirection (high delegation_density, high indirection_cost) offset by two concrete defects: premature ABC abstraction without extension pressure and systematic enum bypass that undermines type discipline. The ABC issue is localized and low-cost to remove; the enum bypass is more pervasive and creates a type-safety gap between model definitions and data-flow code. A codebase this small (10 files, 1410 LOC) should favor direct concrete types over speculative abstractions."
+    }
+  },
+  "issues": [
+    {
+      "dimension": "abstraction_fitness",
+      "identifier": "speculative-abc-interfaces",
+      "summary": "Two ABCs in interfaces.py each have exactly one implementation with no extension mechanism",
+      "related_files": ["src/analyzer/interfaces.py", "src/analyzer/datasources.py"],
+      "evidence": [
+        "TransactionSource ABC has one implementation: HouseTransactionSource",
+        "PriceSource ABC has one implementation: YFinancePriceSource",
+        "No plugin registry, factory, or test-based polymorphism exists",
+        "ABCs are imported only in datasources.py for inheritance — no other module references them"
+      ],
+      "suggestion": "Remove interfaces.py and have HouseTransactionSource and YFinancePriceSource be standalone classes. If polymorphic dispatch is needed later, introduce the ABC at that point when the second implementation arrives (YAGNI). This eliminates an import hop and simplifies the module graph.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": "premature_abstraction"
+    },
+    {
+      "dimension": "abstraction_fitness",
+      "identifier": "enum-bypass-transaction-type",
+      "summary": "TransactionType enum defined but bypassed with raw string 'Purchase' in 7 locations across analysis.py and pipeline.py",
+      "related_files": ["src/analyzer/analysis.py", "src/analyzer/pipeline.py", "src/analyzer/models.py"],
+      "evidence": [
+        "analysis.py lines 49,104,119,136,164: compare transaction_type column against 'Purchase' string",
+        "analysis.py line 214: compare transaction_type against 'Purchase' in score_ticker_by_buyers",
+        "pipeline.py line 100: compare transaction_type against 'Purchase' in run_recent_ticker_scoring",
+        "TransactionType enum in models.py defines PURCHASE='Purchase' and SALE='Sale' but is never used for comparison",
+        "Transaction model's transaction_type field is typed as TransactionType but DataFrame columns use raw strings"
+      ],
+      "suggestion": "Reference TransactionType.PURCHASE.value (or import and use the enum member directly) at comparison sites instead of raw 'Purchase' strings. Better yet, ensure the transaction_type column contains enum values rather than strings at the DataFrame construction boundary (in parsing.py's consolidate_transactions), so downstream code can compare against the enum member directly.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "multi_file_refactor",
+      "root_cause_cluster": "enum_bypass"
+    },
+    {
+      "dimension": "abstraction_fitness",
+      "identifier": "enum-bypass-filing-type",
+      "summary": "FilingType enum defined but bypassed with raw string 'P' in 2 locations in datasources.py",
+      "related_files": ["src/analyzer/datasources.py", "src/analyzer/models.py"],
+      "evidence": [
+        "datasources.py line 142: metadata[metadata['FilingType'] == 'P'] in _fetch_and_cache_pdfs_async",
+        "datasources.py line 180: metadata[metadata['FilingType'] == 'P'] in parse_cached_pdfs",
+        "FilingType enum defines PTR='P' and AMENDMENT='A' in models.py but neither is referenced in datasources.py"
+      ],
+      "suggestion": "Replace raw 'P' string comparisons with FilingType.PTR.value. Since the FilingType column comes from external data (House Clerk metadata), the raw string comparison is technically valid, but using the enum's value ensures the mapping stays in one place if the enum values ever change.",
+      "confidence": "medium",
+      "impact_scope": "local",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": "enum_bypass"
+    }
+  ],
+  "retrospective": {
+    "root_causes": [
+      "ABCs introduced speculatively during initial design without a second implementation driver",
+      "Enum types defined in a models file but data flow uses raw strings from external sources (House Clerk API, PDF parsing), creating a impedance mismatch at the DataFrame boundary"
+    ],
+    "likely_symptoms": [],
+    "possible_false_positives": [
+      "Facade module flags on datasources.py and database.py are import-count artifacts, not re-export facades"
+    ]
+  },
+  "context_updates": {
+    "abstraction_fitness": {
+      "add": [
+        {
+          "header": "No delegation-heavy classes",
+          "description": "Database class has 15 methods but all contain real SQL/logic — no forwarding wrappers. High delegation_density score is deserved.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Pipeline decorator adds error policy",
+          "description": "pipeline_step decorator catches AnalyzerError and logs it, converting exceptions to boolean returns. This is genuine policy, not forwarding, so it's appropriately excluded from wrapper condemnation.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Enum bypass from external data boundary",
+          "description": "TransactionType and FilingType enums exist but DataFrame columns flowing through analysis use raw strings because the data originates from external sources (House Clerk ZIP, PDF parsing). The enum values match but the enum members are never referenced at comparison sites, creating a type-definition vs runtime gap.",
+          "settled": true,
+          "positive": false
+        },
+        {
+          "header": "Speculative ABCs without polymorphic consumers",
+          "description": "interfaces.py defines TransactionSource and PriceSource ABCs each with exactly one implementation. No factory, no registry, no test-based mocking against the ABC. The abstraction is speculative — YAGNI violation in a 10-file codebase.",
+          "settled": true,
+          "positive": false
+        }
+      ]
+    }
+  }
+}

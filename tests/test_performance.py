@@ -2,7 +2,6 @@ import unittest
 import pandas as pd
 import numpy as np
 import time
-from datetime import datetime, timedelta
 from analyzer.analysis import calculate_signal_potential
 
 def create_large_test_data(n_transactions=10000, n_tickers=500):

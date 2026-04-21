@@ -1,8 +1,13 @@
 import pandas as pd
 import numpy as np
-from .exceptions import AnalysisError
+from analyzer.models import TransactionType
+from analyzer.exceptions import AnalysisError
 
-def calculate_signal_potential(transactions_df, prices_df, horizons=[30, 60, 90, 180]):
+def calculate_signal_potential(
+    transactions_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    horizons: list[int] = [30, 60, 90, 180],
+) -> pd.DataFrame:
     if transactions_df.empty:
         raise AnalysisError("Empty transactions dataframe")
     if prices_df.empty:
@@ -46,7 +51,7 @@ def calculate_signal_potential(transactions_df, prices_df, horizons=[30, 60, 90,
     if final.empty:
         raise AnalysisError("No valid signals calculated after price analysis")
 
-    is_purchase = final['transaction_type'] == 'Purchase'
+    is_purchase = final['transaction_type'] == TransactionType.PURCHASE.value
 
     peak_potential = np.where(
         is_purchase,
@@ -59,7 +64,7 @@ def calculate_signal_potential(transactions_df, prices_df, horizons=[30, 60, 90,
         peak_potential_pct=peak_potential
     )[['member', 'ticker', 'disclosure_date', 'signal_type', 'horizon_days', 'entry_price', 'peak_potential_pct']]
 
-def rank_members(signal_df, horizon=90, threshold=5.0):
+def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 5.0) -> pd.DataFrame:
     if signal_df.empty:
         raise AnalysisError("Empty signal dataframe")
 
@@ -97,11 +102,11 @@ def rank_members(signal_df, horizon=90, threshold=5.0):
         return result.sort_values('avg_peak_return_pct', ascending=False)
     return result
 
-def get_horizon_performance(signal_df, threshold=5.0):
+def get_horizon_performance(signal_df: pd.DataFrame, threshold: float = 5.0) -> pd.DataFrame:
     if signal_df.empty:
         raise AnalysisError("Empty signal dataframe")
 
-    purchase_data = signal_df[signal_df['signal_type'] == 'Purchase']
+    purchase_data = signal_df[signal_df['signal_type'] == TransactionType.PURCHASE.value]
     if purchase_data.empty:
         raise AnalysisError("No purchase signals found")
 
@@ -110,13 +115,13 @@ def get_horizon_performance(signal_df, threshold=5.0):
         ('hit_rate_pct', lambda x: (x > threshold).mean() * 100)
     ]).round(2)
 
-def get_top_signals(signal_df, horizon=90, top_n=15):
+def get_top_signals(signal_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:
     if signal_df.empty:
         raise AnalysisError("Empty signal dataframe")
 
     top_data = signal_df[
         (signal_df['horizon_days'] == horizon) &
-        (signal_df['signal_type'] == 'Purchase')
+        (signal_df['signal_type'] == TransactionType.PURCHASE.value)
     ]
 
     if top_data.empty:
@@ -126,14 +131,14 @@ def get_top_signals(signal_df, horizon=90, top_n=15):
         ['member', 'ticker', 'disclosure_date', 'peak_potential_pct']
     ]
 
-def get_member_signals(signal_df, member, horizon=90, top_n=5):
+def get_member_signals(signal_df: pd.DataFrame, member: str, horizon: int = 90, top_n: int = 5) -> pd.DataFrame:
     if signal_df.empty:
         raise AnalysisError("Empty signal dataframe")
 
     member_data = signal_df[
         (signal_df['member'] == member) &
         (signal_df['horizon_days'] == horizon) &
-        (signal_df['signal_type'] == 'Purchase')
+        (signal_df['signal_type'] == TransactionType.PURCHASE.value)
     ]
 
     if member_data.empty:
@@ -143,14 +148,28 @@ def get_member_signals(signal_df, member, horizon=90, top_n=5):
         ['ticker', 'disclosure_date', 'peak_potential_pct']
     ]
 
-def get_analysis_table(signals_df, member_filter, show_signals, horizon, top_n, threshold):
+def get_analysis_table(
+    signals_df: pd.DataFrame,
+    member_filter: str | None,
+    show_signals: bool,
+    horizon: int,
+    top_n: int | None,
+    threshold: float,
+) -> pd.DataFrame:
     if member_filter:
         return get_member_signals(signals_df, member_filter, horizon, top_n)
     if show_signals:
         return get_top_signals(signals_df, horizon, top_n)
     return rank_members(signals_df, horizon, threshold)
 
-def score_ticker_by_buyers(ticker, transactions_df, signals_df, horizon=90, threshold=5.0, member_rankings=None):
+def score_ticker_by_buyers(
+    ticker: str,
+    transactions_df: pd.DataFrame,
+    signals_df: pd.DataFrame,
+    horizon: int = 90,
+    threshold: float = 5.0,
+    member_rankings: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if signals_df.empty:
         raise AnalysisError("Empty signal dataframe")
     if transactions_df.empty:
@@ -161,7 +180,7 @@ def score_ticker_by_buyers(ticker, transactions_df, signals_df, horizon=90, thre
 
     ticker_trades = transactions_df[
         (transactions_df['ticker'] == ticker) &
-        (transactions_df['transaction_type'] == 'Purchase')
+        (transactions_df['transaction_type'] == TransactionType.PURCHASE.value)
     ]
 
     if ticker_trades.empty:
@@ -201,7 +220,13 @@ def score_ticker_by_buyers(ticker, transactions_df, signals_df, horizon=90, thre
         'signal_score': [round(signal_score, 2)]
     })
 
-def get_ticker_buyers_with_rankings(ticker, transactions_df, signals_df, horizon=90, threshold=5.0):
+def get_ticker_buyers_with_rankings(
+    ticker: str,
+    transactions_df: pd.DataFrame,
+    signals_df: pd.DataFrame,
+    horizon: int = 90,
+    threshold: float = 5.0,
+) -> pd.DataFrame:
     if signals_df.empty:
         raise AnalysisError("Empty signal dataframe")
     if transactions_df.empty:
@@ -211,7 +236,7 @@ def get_ticker_buyers_with_rankings(ticker, transactions_df, signals_df, horizon
 
     ticker_trades = transactions_df[
         (transactions_df['ticker'] == ticker) &
-        (transactions_df['transaction_type'] == 'Purchase')
+        (transactions_df['transaction_type'] == TransactionType.PURCHASE.value)
     ]
 
     if ticker_trades.empty:

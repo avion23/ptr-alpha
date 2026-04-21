@@ -1,0 +1,129 @@
+{
+  "batch": "naming_quality",
+  "batch_index": 5,
+  "assessments": {"naming_quality": 86.0},
+  "dimension_notes": {
+    "naming_quality": {
+      "evidence": [
+        "Consistent snake_case across all 62 identifiers — zero camelCase leakage in Python code",
+        "Domain vocabulary is uniform: TransactionType, FilingType, DownloadStatus, Signal, Transaction, Filing",
+        "Database methods follow a clear verb pattern: get_X, upsert_X, X_exists, clear_X — predictable and honest",
+        "Exception hierarchy is well-named: AnalyzerError → DataSourceError, ParsingError, AnalysisError, ConfigurationError",
+        "Analysis functions use descriptive domain verbs: calculate_signal_potential, rank_members, score_ticker_by_buyers",
+        "Pipeline functions clearly name the stage: run_fetch_pipeline, run_parse_pipeline, run_analysis_pipeline",
+        "Parsing functions describe their transformation: extract_ticker_from_name, normalize_house_metadata, consolidate_transactions",
+        "14 get_ prefixed functions form a consistent codebase convention for retrieval operations",
+        "parse_cached_pdfs (datasources.py:178) writes transactions to the database — name implies pure parsing but has a mutation side effect",
+        "_save_results (pipeline.py:119) prints to console when format is 'console' — the verb 'save' misrepresents the print-to-stdout path",
+        "AnalysisParams (pipeline.py:13) contains output/display fields (output_format, show_signals, member_filter) that are not analysis parameters",
+        "get_missing_price_data (database.py:200) returns a (missing_tickers, missing_dates) gap description tuple — 'get ... data' suggests retrieving price data"
+      ],
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "confidence": "high"
+    }
+  },
+  "dimension_judgment": {
+    "naming_quality": {
+      "dimension_character": "The codebase demonstrates strong, consistent naming practices across a small, focused Python project. Domain vocabulary is uniform (TransactionType, FilingType, Signal), verb conventions are predictable (get_/upsert_/clear_ for database, calculate/rank/score for analysis, extract/normalize/consolidate for parsing), and snake_case is used universally without framework leakage. The four defects found are localized name/behavior mismatches where function names under-specify side effects — a sign of solid baseline discipline rather than systemic neglect.",
+      "score_rationale": "An 86 reflects a codebase where the vast majority of names communicate intent accurately and follow consistent internal conventions. The deductions stem from four local-level name/behavior mismatches where functions have hidden side effects or misleading scopes — none are architectural or codebase-spanning. The 62 consistent snake_case identifiers, well-structured exception hierarchy, and domain-aligned vocabulary establish a high floor that the minor issues don't undermine."
+    }
+  },
+  "issues": [
+    {
+      "dimension": "naming_quality",
+      "identifier": "parse_cached_pdfs_side_effect",
+      "summary": "parse_cached_pdfs writes to the database but its name implies pure parsing",
+      "related_files": ["src/analyzer/datasources.py"],
+      "evidence": [
+        "def parse_cached_pdfs(self, year) at datasources.py:178 calls self.db.upsert_transactions(df) at line 214, mutating the database as a side effect that the function name does not communicate"
+      ],
+      "suggestion": "Rename to parse_and_store_cached_pdfs or extract the database write into the caller so parse_cached_pdfs is a pure transformation",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": "name_behavior_mismatch"
+    },
+    {
+      "dimension": "naming_quality",
+      "identifier": "save_results_prints",
+      "summary": "_save_results prints to stdout for 'console' format but 'save' implies file I/O",
+      "related_files": ["src/analyzer/pipeline.py"],
+      "evidence": [
+        "def _save_results(table, output_format, ...) at pipeline.py:119 enters the else branch at line 133 which calls print(table.to_string(index=False)) — the verb 'save' is misleading when the function merely prints to stdout"
+      ],
+      "suggestion": "Rename to _output_results or _render_results to accurately describe both the file-save and console-print paths",
+      "confidence": "medium",
+      "impact_scope": "local",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": "name_behavior_mismatch"
+    },
+    {
+      "dimension": "naming_quality",
+      "identifier": "analysis_params_overloaded",
+      "summary": "AnalysisParams contains display/output fields unrelated to analysis configuration",
+      "related_files": ["src/analyzer/pipeline.py"],
+      "evidence": [
+        "AnalysisParams at pipeline.py:13 includes output_format (line 21), show_signals (line 20), and member_filter (line 18) — these control output rendering, not analysis behavior"
+      ],
+      "suggestion": "Rename to PipelineParams or AnalysisCommandParams to reflect that it bundles both analysis configuration and output/display settings",
+      "confidence": "medium",
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": "name_behavior_mismatch"
+    },
+    {
+      "dimension": "naming_quality",
+      "identifier": "get_missing_price_data_vague",
+      "summary": "get_missing_price_data returns a gap-description tuple, not price data",
+      "related_files": ["src/analyzer/database.py"],
+      "evidence": [
+        "def get_missing_price_data(self, tickers, start_date, end_date) at database.py:200 returns (missing_tickers, all_dates) or ([], missing_dates) or (missing_tickers, all_dates) — the 'get ... data' name suggests retrieving price records, but it returns identifiers of what is absent"
+      ],
+      "suggestion": "Rename to find_price_data_gaps or identify_missing_price_coverage to accurately describe the gap-analysis nature of the return value",
+      "confidence": "medium",
+      "impact_scope": "local",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": "name_behavior_mismatch"
+    }
+  ],
+  "retrospective": {
+    "root_causes": [
+      "Functions that combine transformation with persistence (parse_cached_pdfs) tend to get named after the primary transformation step, hiding the write side effect",
+      "Command-level parameter bags (AnalysisParams) accumulate fields across concerns when a CLI command maps to one dataclass — the name reflects only one of the bundled concerns",
+      "The codebase's consistent get_ convention (14 uses) is strong overall but creates false expectations when a get_-prefixed function returns gap metadata rather than actual data (get_missing_price_data)"
+    ],
+    "likely_symptoms": [],
+    "possible_false_positives": []
+  },
+  "context_updates": {
+    "naming_quality": {
+      "add": [
+        {
+          "header": "Consistent snake_case and get_ convention",
+          "description": "All 62 identifiers follow snake_case with zero camelCase leakage. The get_ prefix (14 uses) is the dominant retrieval convention. This is a strong, settled positive pattern.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Domain-aligned model vocabulary",
+          "description": "Transaction, Filing, Signal, TransactionType, FilingType, DownloadStatus form a coherent domain vocabulary used consistently across models.py, datasources.py, analysis.py, and database.py.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Verb conventions follow module responsibility",
+          "description": "Database uses get/upsert/clear, analysis uses calculate/rank/score, parsing uses extract/normalize/consolidate, pipeline uses run_. Each module's verb set maps naturally to its domain role.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Name/behavior mismatch pattern in datasources",
+          "description": "parse_cached_pdfs both parses and persists to database. The naming reflects the primary transformation step but hides the write side effect — a minor but recurring pattern where multi-step functions get named after the first step.",
+          "settled": false,
+          "positive": false
+        }
+      ]
+    }
+  }
+}

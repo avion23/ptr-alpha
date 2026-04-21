@@ -3,15 +3,24 @@ import pandas as pd
 import pathlib
 import logging
 from datetime import datetime
+from analyzer.exceptions import AnalysisError
+
 
 logger = logging.getLogger(__name__)
 
 
+class DatabaseError(AnalysisError):
+    pass
+
+
 class Database:
-    def __init__(self, db_path):
+    def __init__(self, db_path: str | pathlib.Path):
         self.db_path = pathlib.Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = duckdb.connect(str(self.db_path))
+        try:
+            self.conn = duckdb.connect(str(self.db_path))
+        except duckdb.Error as e:
+            raise DatabaseError(f"Failed to open database at {self.db_path}: {e}")
         self._init_schema()
 
     def _init_schema(self):
@@ -75,7 +84,7 @@ class Database:
             )
         """)
 
-    def upsert_metadata(self, df):
+    def upsert_metadata(self, df: pd.DataFrame) -> None:
         self.conn.execute("""
             INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
             SELECT doc_id, first_name, last_name, filing_date, filing_type, fetched_at
@@ -88,7 +97,7 @@ class Database:
                 fetched_at = EXCLUDED.fetched_at
         """)
 
-    def get_metadata(self, year):
+    def get_metadata(self, year: int) -> pd.DataFrame:
         result = self.conn.execute(
             """
             SELECT doc_id AS "DocID", first_name AS "First", last_name AS "Last",
@@ -100,7 +109,7 @@ class Database:
         ).fetchdf()
         return result
 
-    def metadata_exists(self, year):
+    def metadata_exists(self, year: int) -> bool:
         count = self.conn.execute(
             """
             SELECT COUNT(*) FROM metadata
@@ -110,8 +119,7 @@ class Database:
         ).fetchone()[0]
         return count > 0
 
-    def clear_metadata(self, year):
-        """Clear all metadata for a year to force refresh."""
+    def clear_metadata(self, year: int) -> None:
         self.conn.execute(
             """
             DELETE FROM metadata
@@ -121,7 +129,7 @@ class Database:
         )
         logger.info(f"Cleared metadata for year {year}")
 
-    def upsert_transactions(self, df):
+    def upsert_transactions(self, df: pd.DataFrame) -> None:
         df = df.copy()
         df["created_at"] = datetime.now()
 
@@ -134,7 +142,7 @@ class Database:
         """)
         self.conn.execute("DROP TABLE staging_transactions")
 
-    def get_transactions(self, year):
+    def get_transactions(self, year: int) -> pd.DataFrame:
         result = self.conn.execute(
             """
             SELECT member, ticker, transaction_date, disclosure_date, transaction_type
@@ -146,7 +154,7 @@ class Database:
         ).fetchdf()
         return result
 
-    def transactions_exist(self, year):
+    def transactions_exist(self, year: int) -> bool:
         count = self.conn.execute(
             """
             SELECT COUNT(*) FROM transactions
@@ -156,7 +164,7 @@ class Database:
         ).fetchone()[0]
         return count > 0
 
-    def upsert_prices(self, df):
+    def upsert_prices(self, df: pd.DataFrame) -> None:
         if df.empty:
             return
 
@@ -176,7 +184,7 @@ class Database:
                 close = EXCLUDED.close
         """)
 
-    def get_prices(self, tickers, start_date, end_date):
+    def get_prices(self, tickers: list[str], start_date, end_date) -> pd.DataFrame:
         if not tickers:
             return pd.DataFrame()
 
@@ -197,7 +205,7 @@ class Database:
         pivot = result.pivot(index="date", columns="ticker", values="close")
         return pivot
 
-    def get_missing_price_data(self, tickers, start_date, end_date):
+    def get_missing_price_data(self, tickers: list[str], start_date, end_date) -> tuple[list[str], pd.DatetimeIndex]:
         all_dates = pd.date_range(start_date, end_date, freq="D")
         existing = self.conn.execute(
             """
@@ -222,7 +230,7 @@ class Database:
 
         return missing_tickers, all_dates
 
-    def close(self):
+    def close(self) -> None:
         self.conn.close()
 
     def __enter__(self):

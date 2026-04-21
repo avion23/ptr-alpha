@@ -1,0 +1,77 @@
+{
+  "batch": "initialization_coupling",
+  "batch_index": 16,
+  "assessments": {"initialization_coupling": 83.0},
+  "dimension_notes": {
+    "initialization_coupling": {
+      "evidence": [
+        "Import graph is a clean DAG with no circular dependencies: cli imports datasources/pipeline/settings/exceptions; datasources imports database/parsing/models/interfaces/exceptions; pipeline imports analysis/exceptions",
+        "Settings() is only instantiated at runtime in cli.py get_context(), never at import time — no env var reads during module loading",
+        "datasources.py:27 calls requests_cache.install_cache('http_cache', backend='sqlite', expire_after=3600) at module scope — performs file I/O and patches global requests library on import",
+        "tests/test_integration.py imports HouseTransactionSource and YFinancePriceSource from datasources, triggering the install_cache side effect and creating http_cache.sqlite in the working directory",
+        "parsing.py:177-178 uses function-level imports for optional OCR deps (pdf2image, pytesseract) — appropriate lazy loading, not a circular import workaround",
+        "database.py module-level code is limited to logging.getLogger(__name__) — standard library init (skipped per rubric)",
+        "No global mutable singletons with ordering dependencies; typer app in cli.py is the entry point and not imported by other production modules"
+      ],
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "confidence": "high",
+      "issues_preventing_higher_score": "requests_cache.install_cache() at module scope in datasources.py creates file I/O and global requests patching on every import, contaminating any test or consumer that transitively imports the module",
+      "sub_axes": {}
+    }
+  },
+  "dimension_judgment": {
+    "initialization_coupling": {
+      "dimension_character": "The codebase has a clean, acyclic import graph with no circular dependencies, no import-time environment variable reads, and settings only instantiated at runtime. The single significant defect is a module-level requests_cache.install_cache() call in datasources.py that performs SQLite file I/O and globally patches the requests library on import, affecting all downstream consumers including tests.",
+      "score_rationale": "The import graph and initialization ordering are well-structured throughout the codebase — the only real initialization coupling defect is the import-time side effect in datasources.py:27 which mutates global state (requests library + SQLite cache file creation) on module load. Everything else follows good practice: settings deferred to runtime, clean DAG imports, lazy loading for optional dependencies."
+    }
+  },
+  "issues": [
+    {
+      "dimension": "initialization_coupling",
+      "identifier": "import-time-cache-install",
+      "summary": "requests_cache.install_cache() runs at module scope, performing file I/O and patching global requests on import",
+      "related_files": ["src/analyzer/datasources.py"],
+      "evidence": [
+        "datasources.py:27: requests_cache.install_cache('http_cache', backend='sqlite', expire_after=3600) executes at module scope",
+        "This creates/modifies a SQLite cache file (http_cache.sqlite) relative to CWD",
+        "Patches the global requests library behavior for the entire process",
+        "Any module importing from datasources.py triggers this side effect (including test_integration.py)"
+      ],
+      "suggestion": "Move the cache installation into HouseTransactionSource.__init__() or use requests_cache.CachedSession() directly instead of patching the global requests module. Alternatively, use a requests Session object configured with caching that is passed to methods explicitly.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": null
+    }
+  ],
+  "retrospective": {
+    "root_causes": [],
+    "likely_symptoms": [],
+    "possible_false_positives": []
+  },
+  "context_updates": {
+    "initialization_coupling": {
+      "add": [
+        {
+          "header": "Clean acyclic import graph",
+          "description": "The import dependency graph forms a clean DAG with no circular dependencies. All imports are at module level except for optional OCR dependencies in parsing.py which use function-level lazy imports.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Settings deferred to runtime",
+          "description": "Settings() is only instantiated inside get_context() in cli.py, not at module scope. Environment variable and TOML config reads happen at explicit construction time, avoiding import-time coupling.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Import-time requests cache side effect",
+          "description": "requests_cache.install_cache() at module scope in datasources.py creates a SQLite cache file and patches the global requests library on import, contaminating tests and any module that transitively imports datasources.",
+          "settled": true,
+          "positive": false
+        }
+      ]
+    }
+  }
+}

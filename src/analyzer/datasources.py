@@ -18,13 +18,20 @@ from analyzer.parsing import (
     consolidate_transactions,
     extract_tables_with_ocr,
 )
-from analyzer.models import DownloadResult, DownloadStatus
+from analyzer.models import DownloadResult, DownloadStatus, FilingType
 from analyzer.interfaces import TransactionSource, PriceSource
 from analyzer.database import Database
 
 logger = logging.getLogger(__name__)
 
-requests_cache.install_cache("http_cache", backend="sqlite", expire_after=3600)
+_cache_initialized = False
+
+
+def _ensure_request_cache():
+    global _cache_initialized
+    if not _cache_initialized:
+        requests_cache.install_cache("http_cache", backend="sqlite", expire_after=3600)
+        _cache_initialized = True
 
 
 def _parse_pdf_worker(pdf_path):
@@ -54,6 +61,7 @@ class HouseTransactionSource(TransactionSource):
         self.metadata_url_template = settings.sources.house_metadata_url
         self.pdf_url_template = settings.sources.house_pdf_url
         self.parallel_workers = settings.data.get_workers()
+        _ensure_request_cache()
         self.db = Database(self.data_dir / "congress.duckdb")
 
     def get_transactions(self, year):
@@ -139,7 +147,7 @@ class HouseTransactionSource(TransactionSource):
 
     async def _fetch_and_cache_pdfs_async(self, year):
         metadata = self.fetch_metadata(year)
-        ptrs = metadata[metadata["FilingType"] == "P"]
+        ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
         pdf_dir = self.data_dir / str(year) / "pdfs"
         os.makedirs(pdf_dir, exist_ok=True)
 
@@ -177,7 +185,7 @@ class HouseTransactionSource(TransactionSource):
 
     def parse_cached_pdfs(self, year):
         metadata = self.fetch_metadata(year)
-        ptrs = metadata[metadata["FilingType"] == "P"]
+        ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
         pdf_dir = self.data_dir / str(year) / "pdfs"
 
         if not pdf_dir.exists():

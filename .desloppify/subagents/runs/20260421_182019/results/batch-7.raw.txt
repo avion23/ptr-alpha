@@ -1,0 +1,84 @@
+{
+  "batch": "dependency_health",
+  "batch_index": 7,
+  "assessments": {"dependency_health": 80.0},
+  "dimension_notes": {
+    "dependency_health": {
+      "evidence": [
+        "pypdf declared in pyproject.toml but never imported in any source or test file (11 production + 5 test files checked)",
+        "pyarrow declared in pyproject.toml but never imported anywhere — no to_parquet/read_parquet calls exist; all storage goes through DuckDB",
+        "Import graph is a clean DAG with no circular dependencies: leaf modules (models, exceptions, settings, interfaces, database) have no internal imports; parsing and analysis import only exceptions; pipeline imports exceptions+analysis; datasources imports exceptions+parsing+models+interfaces+database; cli imports pipeline+exceptions+settings+datasources",
+        "requests and aiohttp coexist but serve distinct purposes: requests for synchronous metadata fetch (datasources.py:80), aiohttp for async concurrent PDF downloads (datasources.py:115-138) — legitimate dual-use pattern",
+        "All actively used dependencies are domain-appropriate: pandas/numpy for data analysis, duckdb for local analytics DB, camelot-py for PDF table extraction, pytesseract/pdf2image for OCR fallback, yfinance for market data, pydantic for config/models, typer for CLI",
+        "numpy only used for np.where() in analysis.py:51 but is already a transitive dependency of pandas — declaring it explicitly is harmless",
+        "No lock file (uv.lock, poetry.lock, requirements.txt) exists for reproducible builds across 16 dependencies including heavy system-level ones (camelot-py[cv], pytesseract)",
+        "Pillow declared but never directly imported — it is a runtime peer dependency of pdf2image and pytesseract, so explicit declaration is reasonable"
+      ],
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "confidence": "high",
+      "issues_preventing_higher_score": "Two clearly unused dependencies (pypdf, pyarrow) that were likely added for planned features that were never implemented or were superseded by DuckDB storage"
+    }
+  },
+  "dimension_judgment": {
+    "dependency_health": {
+      "dimension_character": "The dependency selection is lean and purposeful — each declared dependency maps to a clear domain need (data analysis, PDF parsing, market data, CLI) with no overlapping libraries for the same purpose. The internal import graph is a clean acyclic DAG with well-separated leaf modules. The main weakness is two dead dependencies (pypdf, pyarrow) that inflate the manifest without serving any runtime purpose, suggesting either abandoned feature plans or a migration from Parquet to DuckDB that wasn't cleaned up.",
+      "score_rationale": "Score of 80.0 reflects a fundamentally healthy dependency graph: no circular deps, no duplicate libraries, no heavy-dep-for-light-use anti-patterns. The two unused dependencies (pypdf, pyarrow) are the sole meaningful defect — they add install overhead and confuse maintenance. The lack of a lock file is a mild reproducibility concern but common for small projects. A clean removal of the dead deps would push this into the mid-to-high 80s."
+    }
+  },
+  "issues": [
+    {
+      "dimension": "dependency_health",
+      "identifier": "unused-pypdf",
+      "summary": "pypdf declared as dependency but never imported anywhere in codebase",
+      "related_files": ["pyproject.toml"],
+      "evidence": ["pypdf listed in pyproject.toml line 17", "rg search for 'pypdf' returns 0 results across all 16 .py files in src/ and tests/"],
+      "suggestion": "Remove pypdf from pyproject.toml dependencies list. If PDF reading was intended, the codebase already uses camelot-py[cv] for table extraction and pdf2image+pytesseract for OCR fallback.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": "stale_dependency"
+    },
+    {
+      "dimension": "dependency_health",
+      "identifier": "unused-pyarrow",
+      "summary": "pyarrow declared as dependency but never imported — no Parquet I/O exists in codebase",
+      "related_files": ["pyproject.toml"],
+      "evidence": ["pyarrow listed in pyproject.toml line 20", "rg search for 'pyarrow' returns 0 results across all .py files", "All data persistence goes through DuckDB (database.py) with no to_parquet/read_parquet calls anywhere"],
+      "suggestion": "Remove pyarrow from pyproject.toml. The CLI docstring mentions 'Parse cached PDFs to Parquet' but the implementation stores everything in DuckDB. Either update the docstring to match reality or remove the unused dep.",
+      "confidence": "high",
+      "impact_scope": "module",
+      "fix_scope": "single_edit",
+      "root_cause_cluster": "stale_dependency"
+    }
+  ],
+  "retrospective": {
+    "root_causes": ["Likely added during initial planning for Parquet-based storage that was superseded by DuckDB before implementation", "pypdf may have been intended for PDF text extraction but camelot-py[cv] and pytesseract cover all PDF parsing needs"],
+    "likely_symptoms": [],
+    "possible_false_positives": []
+  },
+  "context_updates": {
+    "dependency_health": {
+      "add": [
+        {
+          "header": "Clean acyclic import DAG",
+          "description": "Internal module imports form a strict DAG with no cycles. Leaf modules (models, exceptions, settings, interfaces, database) have zero internal imports, providing a stable foundation layer.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "Justified requests + aiohttp dual use",
+          "description": "Both sync (requests) and async (aiohttp) HTTP clients coexist for legitimate reasons: requests for single metadata fetch, aiohttp for concurrent bulk PDF downloads via TaskGroup.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "No lock file for 16 dependencies",
+          "description": "Project has no uv.lock, poetry.lock, or pinned requirements.txt despite 16 dependencies including system-heavy ones (camelot-py[cv], pytesseract). Builds are not reproducible across environments.",
+          "settled": false,
+          "positive": false
+        }
+      ]
+    }
+  }
+}

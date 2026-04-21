@@ -1,7 +1,8 @@
 import logging
 import pandas as pd
 import re
-from .exceptions import ParsingError
+from analyzer.models import TransactionType
+from analyzer.exceptions import ParsingError
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +25,17 @@ def extract_ticker_from_name(asset_name):
 def _extract_ticker(asset_cell):
     if not asset_cell:
         return None
-    ticker_match = re.search(r'\(([A-Z][A-Z.\-]{0,9})\)', asset_cell)
+    ticker_match = re.search(r'\(([A-Z][A-Z.\-]{1,5})\)', asset_cell)
     return ticker_match.group(1) if ticker_match else None
 
 def _extract_transaction_type(tx_type_cell):
     if not tx_type_cell:
         return None
     tx_type_lower = tx_type_cell.lower()
-    if 'purchase' in tx_type_lower:
-        return 'Purchase'
-    elif 'sale' in tx_type_lower:
-        return 'Sale'
+    if 'purchase' in tx_type_lower or tx_type_lower.startswith('p'):
+        return TransactionType.PURCHASE.value
+    elif 'sale' in tx_type_lower or tx_type_lower.startswith('s'):
+        return TransactionType.SALE.value
     return None
 
 def _extract_date(date_cell):
@@ -158,9 +159,9 @@ def _parse_ocr_text_to_rows(text):
         tx_type = None
         rest_clean = re.sub(r'\s+', ' ', rest)
         if re.match(r'^P\s', rest_clean) or rest_clean.startswith('PP '):
-            tx_type = 'Purchase'
+            tx_type = TransactionType.PURCHASE.value
         elif re.match(r'^S\s', rest_clean) or rest_clean.startswith('S '):
-            tx_type = 'Sale'
+            tx_type = TransactionType.SALE.value
 
         # Look for date in rest
         date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', rest)

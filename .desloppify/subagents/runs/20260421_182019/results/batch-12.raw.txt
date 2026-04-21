@@ -1,0 +1,45 @@
+{
+  "batch": "authorization_consistency",
+  "batch_index": 12,
+  "assessments": {"authorization_consistency": 95.0},
+  "dimension_notes": {
+    "authorization_consistency": {
+      "evidence": [
+        "This is a local CLI tool (Typer-based) with no web server, HTTP endpoints, or API routes — no auth surface exists to be inconsistent",
+        "Database is DuckDB (local embedded file), not a multi-user RDBMS — Row-Level Security is not applicable; the scanner's RLS flags are false positives from a tool that assumed PostgreSQL",
+        "Zero references to auth, login, permission, role, token, api_key, secret, password, or credential anywhere in the source code — confirmed by grep across all .py files (only pydantic's file_secret_settings framework parameter matched, not actual secret handling)",
+        "All data sources are public government APIs (House Clerk disclosures, Yahoo Finance) — no protected resources that would require authentication",
+        "config.toml contains only data paths, URLs, and analysis defaults — no credential storage",
+        "No multi-user access patterns, no shared state, no network-exposed services — the tool runs as a single-user desktop CLI"
+      ],
+      "impact_scope": "local",
+      "fix_scope": "single_edit",
+      "confidence": "high"
+    }
+  },
+  "dimension_judgment": {
+    "authorization_consistency": {
+      "dimension_character": "This codebase is a single-user local CLI tool that processes public congressional disclosure data into a local DuckDB file. There is no authentication surface, no multi-user access, no network-exposed endpoints, and no protected resources — the entire concept of authorization is inapplicable. The mechanical scanner's RLS flags are false positives arising from DuckDB being misidentified as a PostgreSQL-style database.",
+      "score_rationale": "Scored 95.0 because authorization_consistency is vacuously satisfied: there are zero auth patterns to be inconsistent about, and none are needed for a local CLI tool reading public data. The 5-point deduction reflects the absence of any defensive input sanitization on user-supplied ticker/member strings that get embedded in log messages and CSV filenames, which would become relevant if the tool were ever exposed as a service."
+    }
+  },
+  "issues": [],
+  "context_updates": {
+    "authorization_consistency": {
+      "add": [
+        {
+          "header": "No auth surface — local CLI tool",
+          "description": "The codebase is a Typer-based CLI that reads public data and writes to a local DuckDB file. No web server, no HTTP endpoints, no multi-user access. Authorization is structurally inapplicable — the dimension is vacuously consistent.",
+          "settled": true,
+          "positive": true
+        },
+        {
+          "header": "RLS scan evidence is false positive",
+          "description": "The mechanical scanner flagged all four DuckDB tables (metadata, pdf_downloads, prices, transactions) as lacking RLS. DuckDB is an embedded single-process database with no RLS support — this is a scanner tool limitation, not a codebase defect.",
+          "settled": true,
+          "positive": false
+        }
+      ]
+    }
+  }
+}

@@ -17,18 +17,19 @@ Track which congressional members consistently outperform the market and create 
 
 ```
 src/analyzer/
-├── sources.py      # Data acquisition (House PTRs, yfinance prices)
-├── parsing.py      # PDF extraction and ticker identification
-├── analysis.py     # Signal calculation and member ranking
-├── pipeline.py     # End-to-end processing orchestration
-└── cli.py          # Command-line interface
+├── datasources.py      # Data acquisition (House PTRs, yfinance prices)
+├── parsing.py          # PDF extraction and ticker identification
+├── analysis.py         # Signal calculation and member ranking
+├── pipeline.py         # End-to-end processing orchestration
+├── database.py         # DuckDB database layer
+├── models.py           # Data models and enums
+└── cli.py              # Command-line interface
 
 data/
+├── congress.duckdb     # SQLite-backed DuckDB database
 ├── {year}/
-│   ├── transactions.parquet    # Parsed congressional trades
-│   ├── metadata.parquet        # Member information
-│   └── pdfs/                   # Raw disclosure files
-└── top_signals.csv             # Best trading opportunities
+│   └── pdfs/           # Raw disclosure PDFs
+└── *.csv               # Analysis output files
 ```
 
 ### Core Pipeline

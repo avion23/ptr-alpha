@@ -2,10 +2,25 @@ import unittest
 import pandas as pd
 import numpy as np
 from analyzer.analysis import (
-    calculate_signal_potential, rank_members, get_horizon_performance,
+    calculate_signal_potential, rank_members,
     get_top_signals, get_member_signals, get_analysis_table
 )
 from analyzer.exceptions import AnalysisError
+
+
+def _make_entry_prices(transactions_df, prices_df):
+    prices_long = prices_df.stack().reset_index(name="price")
+    prices_long.columns = ["price_date", "ticker", "price"]
+    prices_long = prices_long.sort_values("price_date")
+    trans_sorted = transactions_df.sort_values("disclosure_date")
+    merged = pd.merge_asof(
+        trans_sorted, prices_long,
+        left_on="disclosure_date", right_on="price_date", by="ticker"
+    ).dropna(subset=["price"])
+    return merged[["member", "ticker", "disclosure_date", "transaction_type", "price"]].rename(
+        columns={"price": "entry_price"}
+    ).reset_index(drop=True)
+
 
 class TestAnalysis(unittest.TestCase):
 
@@ -25,8 +40,10 @@ class TestAnalysis(unittest.TestCase):
             'MSFT': 300 + np.cumsum(np.random.randn(len(dates)) * 1)
         }, index=dates)
 
+        self.entry_prices = _make_entry_prices(self.sample_transactions, self.sample_prices)
+
     def test_calculate_signal_potential_basic(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [30, 90])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [30, 90])
 
         self.assertFalse(signals.empty)
         self.assertEqual(len(signals), 8)
@@ -46,15 +63,15 @@ class TestAnalysis(unittest.TestCase):
             calculate_signal_potential(pd.DataFrame(), self.sample_prices)
 
         with self.assertRaises(AnalysisError):
-            calculate_signal_potential(self.sample_transactions, pd.DataFrame())
+            calculate_signal_potential(self.entry_prices, pd.DataFrame())
 
     def test_calculate_signal_potential_missing_columns(self):
-        bad_transactions = self.sample_transactions.drop(columns=['ticker'])
+        bad_data = self.entry_prices.drop(columns=['ticker'])
         with self.assertRaises(AnalysisError):
-            calculate_signal_potential(bad_transactions, self.sample_prices)
+            calculate_signal_potential(bad_data, self.sample_prices)
 
     def test_calculate_signal_potential_purchase_vs_sale(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [30])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [30])
 
         purchases = signals[signals['signal_type'] == 'Purchase']
         sales = signals[signals['signal_type'] == 'Sale']
@@ -69,7 +86,7 @@ class TestAnalysis(unittest.TestCase):
             self.assertTrue(row['peak_potential_pct'] >= -100)
 
     def test_rank_members_basic(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [90])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
         rankings = rank_members(signals, horizon=90, threshold=5.0)
 
         self.assertFalse(rankings.empty)
@@ -84,7 +101,7 @@ class TestAnalysis(unittest.TestCase):
             rank_members(pd.DataFrame())
 
     def test_get_top_signals_basic(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [90])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
         top_signals = get_top_signals(signals, horizon=90, top_n=2)
 
         self.assertFalse(top_signals.empty)
@@ -94,7 +111,7 @@ class TestAnalysis(unittest.TestCase):
             self.assertIn(col, top_signals.columns)
 
         if len(top_signals) > 1:
-            values = top_signals['peak_potential_pct'].values
+            values = top_signals['spy_alpha_pct'].values
             self.assertTrue((values[:-1] >= values[1:]).all())
 
     def test_get_top_signals_empty_input(self):
@@ -102,7 +119,7 @@ class TestAnalysis(unittest.TestCase):
             get_top_signals(pd.DataFrame())
 
     def test_get_member_signals_basic(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [90])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
         member_signals = get_member_signals(signals, 'Alice', horizon=90, top_n=5)
 
         self.assertFalse(member_signals.empty)
@@ -113,19 +130,19 @@ class TestAnalysis(unittest.TestCase):
             self.assertIn(col, member_signals.columns)
 
     def test_get_member_signals_nonexistent_member(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [90])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
         with self.assertRaises(AnalysisError):
             get_member_signals(signals, 'NonExistent', horizon=90, top_n=5)
 
     def test_get_analysis_table_member_filter(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [90])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
         table = get_analysis_table(signals, 'Alice', False, 90, 5, 5.0)
 
         self.assertFalse(table.empty)
         self.assertIn('ticker', table.columns)
 
     def test_get_analysis_table_show_signals(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [90])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
         table = get_analysis_table(signals, None, True, 90, 5, 5.0)
 
         self.assertFalse(table.empty)
@@ -133,22 +150,11 @@ class TestAnalysis(unittest.TestCase):
             self.assertIn(col, table.columns)
 
     def test_get_analysis_table_rank_members(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [90])
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
         table = get_analysis_table(signals, None, False, 90, 5, 5.0)
 
         self.assertFalse(table.empty)
         self.assertTrue('member' in table.columns)
-
-    def test_horizon_performance(self):
-        signals = calculate_signal_potential(self.sample_transactions, self.sample_prices, [30, 90])
-        perf = get_horizon_performance(signals, threshold=5.0)
-
-        self.assertFalse(perf.empty)
-        self.assertTrue(30 in perf.index)
-        self.assertTrue(90 in perf.index)
-
-        for col in ['avg_peak_pct', 'hit_rate_pct']:
-            self.assertIn(col, perf.columns)
 
 if __name__ == '__main__':
     unittest.main()

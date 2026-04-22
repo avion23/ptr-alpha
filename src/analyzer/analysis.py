@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
-from typing import Optional
 
 from analyzer.models import TransactionType
 from analyzer.exceptions import AnalysisError
@@ -10,158 +9,163 @@ from analyzer.exceptions import AnalysisError
 DECAY_LAMBDA = 0.05
 
 
-class SignalAnalyzer:
-    """
-    Encapsulates signal analysis on a signals DataFrame.
-    All metrics avoid look-ahead bias. Primary ranking metric is spy_alpha_pct
-    (decayed return minus benchmark), not peak_potential_pct which uses future peak.
-    """
+def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
+    alpha = market_prior * 100
+    beta = (1 - market_prior) * 100
+    return (alpha + wins) / (alpha + beta + wins + losses)
 
-    def __init__(self, signals_df: pd.DataFrame):
-        if signals_df.empty:
-            raise AnalysisError("Empty signals dataframe")
-        self.signals = signals_df.copy()
 
-    def _get_horizon_data(
-        self, horizon: int, transaction_type: Optional[str] = None
-    ) -> pd.DataFrame:
-        data = self.signals[self.signals["horizon_days"] == horizon]
-        if transaction_type is not None:
-            data = data[data["signal_type"] == transaction_type]
-        return data
+def _get_horizon_data(
+    signals_df: pd.DataFrame, horizon: int, transaction_type: str | None = None
+) -> pd.DataFrame:
+    data = signals_df[signals_df["horizon_days"] == horizon]
+    if transaction_type is not None:
+        data = data[data["signal_type"] == transaction_type]
+    return data
 
-    def _compute_dynamic_prior(self, horizon: int) -> float:
-        spy_signals = self.signals[
-            (self.signals["horizon_days"] == horizon)
-        ]
-        if spy_signals.empty:
-            return 0.50
-        up_prob = (spy_signals["decayed_return_pct"] > 0).mean()
-        return max(up_prob, 0.50)
 
-    def rank_members(
-        self, horizon: int = 90, threshold: float = 5.0
-    ) -> pd.DataFrame:
-        purchases = self._get_horizon_data(horizon, TransactionType.PURCHASE.value)
-        if purchases.empty:
-            raise AnalysisError(f"No purchase signals found for horizon {horizon}")
+def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:
+    horizon_signals = signals_df[signals_df["horizon_days"] == horizon]
+    if horizon_signals.empty:
+        return 0.50
+    up_prob = (horizon_signals["decayed_return_pct"] > 0).mean()
+    return max(up_prob, 0.50)
 
-        market_prior = self._compute_dynamic_prior(horizon)
-        member_stats = []
 
-        for member, grp in purchases.groupby("member"):
-            rets = grp["decayed_return_pct"].values
-            hit_rate = (grp["peak_potential_pct"] > threshold).mean() * 100
+def _rank_members(
+    signals_df: pd.DataFrame, horizon: int = 90, threshold: float = 5.0
+) -> pd.DataFrame:
+    purchases = _get_horizon_data(signals_df, horizon, TransactionType.PURCHASE.value)
+    if purchases.empty:
+        raise AnalysisError(f"No purchase signals found for horizon {horizon}")
 
-            median_ret = np.median(rets)
-            mean_ret = np.mean(rets)
-            std_ret = np.std(rets) if len(rets) > 1 else 0.0
-            sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
+    market_prior = _compute_dynamic_prior(signals_df, horizon)
+    member_stats = []
 
-            p_up_given_buy = (rets > 0).sum() / len(rets)
-            bayes_factor = p_up_given_buy / market_prior
+    for member, grp in purchases.groupby("member"):
+        rets = grp["decayed_return_pct"].values
+        hit_rate = (grp["peak_potential_pct"] > threshold).mean() * 100
 
-            spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
-            avg_spy_alpha = np.mean(spy_alpha_vals) if len(spy_alpha_vals) > 0 else 0.0
+        median_ret = np.median(rets)
+        mean_ret = np.mean(rets)
+        std_ret = np.std(rets) if len(rets) > 1 else 0.0
+        sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
 
-            member_stats.append({
-                "member": member,
-                "avg_peak_return_pct": round(mean_ret, 2),
-                "median_peak_return_pct": round(median_ret, 2),
-                "hit_rate_pct": round(hit_rate, 2),
-                "purchase_trades": len(rets),
-                "sharpe_ratio": round(sharpe, 3),
-                "prob_up_given_buy": round(p_up_given_buy, 3),
-                "bayes_factor": round(bayes_factor, 3),
-                "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
-            })
+        wins = int((rets > 0).sum())
+        losses = int(len(rets) - wins)
+        p_up_given_buy = wins / len(rets)
+        bayes_win_prob = bayesian_win_probability(wins, losses, market_prior)
+        bayes_factor = bayes_win_prob / market_prior
 
-        result = pd.DataFrame(member_stats)
-        if result.empty:
-            return result
+        spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
+        avg_spy_alpha = np.mean(spy_alpha_vals) if len(spy_alpha_vals) > 0 else 0.0
 
-        return result.sort_values("avg_spy_alpha_pct", ascending=False)
+        member_stats.append({
+            "member": member,
+            "avg_peak_return_pct": round(mean_ret, 2),
+            "median_peak_return_pct": round(median_ret, 2),
+            "hit_rate_pct": round(hit_rate, 2),
+            "purchase_trades": len(rets),
+            "sharpe_ratio": round(sharpe, 3),
+            "prob_up_given_buy": round(p_up_given_buy, 3),
+            "bayes_win_prob": round(bayes_win_prob, 3),
+            "bayes_factor": round(bayes_factor, 3),
+            "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
+        })
 
-    def rank_sales(self, horizon: int = 90) -> pd.DataFrame:
-        sales = self._get_horizon_data(horizon, TransactionType.SALE.value)
-        if sales.empty:
-            raise AnalysisError(f"No sale signals found for horizon {horizon}")
+    result = pd.DataFrame(member_stats)
+    if result.empty:
+        return result
 
-        market_prior = self._compute_dynamic_prior(horizon)
-        member_stats = []
+    return result.sort_values("avg_spy_alpha_pct", ascending=False)
 
-        for member, grp in sales.groupby("member"):
-            rets = grp["decayed_return_pct"].values
 
-            median_ret = np.median(rets)
-            mean_ret = np.mean(rets)
-            std_ret = np.std(rets) if len(rets) > 1 else 0.0
-            sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
+def _rank_sales(signals_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
+    sales = _get_horizon_data(signals_df, horizon, TransactionType.SALE.value)
+    if sales.empty:
+        raise AnalysisError(f"No sale signals found for horizon {horizon}")
 
-            p_up_given_sell = (rets > 0).sum() / len(rets)
-            bayes_factor = p_up_given_sell / market_prior
+    market_prior = _compute_dynamic_prior(signals_df, horizon)
+    member_stats = []
 
-            spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
-            avg_spy_alpha = np.mean(spy_alpha_vals) if len(spy_alpha_vals) > 0 else 0.0
+    for member, grp in sales.groupby("member"):
+        rets = grp["decayed_return_pct"].values
 
-            member_stats.append({
-                "member": member,
-                "avg_loss_avoided_pct": round(mean_ret, 2),
-                "median_loss_avoided_pct": round(median_ret, 2),
-                "purchase_trades": len(rets),
-                "sharpe_ratio": round(sharpe, 3),
-                "prob_up_given_sell": round(p_up_given_sell, 3),
-                "bayes_factor": round(bayes_factor, 3),
-                "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
-            })
+        median_ret = np.median(rets)
+        mean_ret = np.mean(rets)
+        std_ret = np.std(rets) if len(rets) > 1 else 0.0
+        sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
 
-        result = pd.DataFrame(member_stats)
-        if result.empty:
-            return result
+        p_up_given_sell = (rets > 0).sum() / len(rets)
+        wins = int((rets > 0).sum())
+        losses = int(len(rets) - wins)
+        bayes_win_prob = bayesian_win_probability(wins, losses, market_prior)
+        bayes_factor = bayes_win_prob / market_prior
 
-        return result.sort_values("avg_spy_alpha_pct", ascending=False)
+        spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
+        avg_spy_alpha = np.mean(spy_alpha_vals) if len(spy_alpha_vals) > 0 else 0.0
 
-    def get_top_signals(self, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:
-        top_data = self._get_horizon_data(horizon, TransactionType.PURCHASE.value)
-        if top_data.empty:
-            raise AnalysisError(f"No purchase signals found for horizon {horizon}")
+        member_stats.append({
+            "member": member,
+            "avg_loss_avoided_pct": round(mean_ret, 2),
+            "median_loss_avoided_pct": round(median_ret, 2),
+            "sale_trades": len(rets),
+            "sharpe_ratio": round(sharpe, 3),
+            "prob_up_given_sell": round(p_up_given_sell, 3),
+            "bayes_win_prob": round(bayes_win_prob, 3),
+            "bayes_factor": round(bayes_factor, 3),
+            "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
+        })
 
-        return top_data.nlargest(top_n, "spy_alpha_pct")[
-            ["member", "ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct"]
-        ]
+    result = pd.DataFrame(member_stats)
+    if result.empty:
+        return result
 
-    def get_member_signals(
-        self, member: str, horizon: int = 90, top_n: int = 5
-    ) -> pd.DataFrame:
-        member_data = self._get_horizon_data(horizon)
-        member_data = member_data[member_data["member"] == member]
+    return result.sort_values("avg_spy_alpha_pct", ascending=False)
 
-        if member_data.empty:
-            raise AnalysisError(f"No signals found for member {member} at horizon {horizon}")
 
-        purchases = member_data[member_data["signal_type"] == TransactionType.PURCHASE.value]
-        if purchases.empty:
-            raise AnalysisError(f"No purchase signals for member {member} at horizon {horizon}")
+def _get_top_signals(signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:
+    top_data = _get_horizon_data(signals_df, horizon, TransactionType.PURCHASE.value)
+    if top_data.empty:
+        raise AnalysisError(f"No purchase signals found for horizon {horizon}")
 
-        return purchases.nlargest(top_n, "spy_alpha_pct")[
-            ["ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct"]
-        ]
+    return top_data.nlargest(top_n, "spy_alpha_pct")[
+        ["member", "ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct"]
+    ]
+
+
+def _get_member_signals(
+    signals_df: pd.DataFrame, member: str, horizon: int = 90, top_n: int = 5
+) -> pd.DataFrame:
+    member_data = _get_horizon_data(signals_df, horizon)
+    member_data = member_data[member_data["member"] == member]
+
+    if member_data.empty:
+        raise AnalysisError(f"No signals found for member {member} at horizon {horizon}")
+
+    purchases = member_data[member_data["signal_type"] == TransactionType.PURCHASE.value]
+    if purchases.empty:
+        raise AnalysisError(f"No purchase signals for member {member} at horizon {horizon}")
+
+    return purchases.nlargest(top_n, "spy_alpha_pct")[
+        ["ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct"]
+    ]
 
 
 def calculate_signal_potential(
-    transactions_df: pd.DataFrame,
+    entry_prices_df: pd.DataFrame,
     prices_df: pd.DataFrame,
     horizons: list[int] = [30, 60, 90, 180],
     decay_lambda: float = DECAY_LAMBDA,
 ) -> pd.DataFrame:
-    if transactions_df.empty:
-        raise AnalysisError("Empty transactions dataframe")
+    if entry_prices_df.empty:
+        raise AnalysisError("Empty entry prices dataframe")
     if prices_df.empty:
         raise AnalysisError("Empty prices dataframe")
 
-    required_cols = {"member", "ticker", "disclosure_date", "transaction_type"}
-    if not required_cols.issubset(transactions_df.columns):
-        raise AnalysisError(f"Missing columns in transactions: {required_cols - set(transactions_df.columns)}")
+    required_cols = {"member", "ticker", "disclosure_date", "transaction_type", "entry_price"}
+    if not required_cols.issubset(entry_prices_df.columns):
+        raise AnalysisError(f"Missing columns in entry_prices: {required_cols - set(entry_prices_df.columns)}")
 
     prices_long = prices_df.stack().reset_index(name="price")
     prices_long.columns = ["price_date", "ticker", "price"]
@@ -171,15 +175,7 @@ def calculate_signal_potential(
     )
     prices_long = prices_long[prices_long["ticker"] != "SPY"].copy()
 
-    trans_sorted = transactions_df.sort_values("disclosure_date").reset_index(drop=True)
-    prices_sorted = prices_long.sort_values("price_date")
-
-    signals = pd.merge_asof(
-        trans_sorted, prices_sorted,
-        left_on="disclosure_date", right_on="price_date", by="ticker"
-    ).dropna(subset=["price"]).rename(
-        columns={"price": "entry_price", "price_date": "disclosure_price_date"}
-    )
+    signals = entry_prices_df.copy()
 
     if signals.empty:
         raise AnalysisError("No valid price matches found for transactions")
@@ -188,8 +184,6 @@ def calculate_signal_potential(
     signals["horizon_days"] = signals["horizon_days"].astype("int32")
     signals["window_end"] = signals["disclosure_date"] + pd.to_timedelta(signals["horizon_days"], unit="D")
     signals["signal_id"] = range(len(signals))
-    if "price_date" in signals.columns:
-        signals = signals.drop(columns=["price_date"])
 
     merged = signals.merge(prices_long, on="ticker", suffixes=("", "_price"))
     window_mask = (merged["price_date"] >= merged["disclosure_date"]) & (merged["price_date"] <= merged["window_end"])
@@ -209,11 +203,13 @@ def calculate_signal_potential(
     else:
         windowed["spy_return"] = 0.0
 
+    windowed["weighted_spy_return"] = windowed["spy_return"] * windowed["decay_factor"]
+
     agg = windowed.groupby("signal_id").agg(
         peak_price=("price", "max"),
         trough_price=("price", "min"),
-        decayed_return=("weighted_return", "max"),
-        spy_cumulative=("spy_return", "max"),
+        decayed_return=("weighted_return", "sum"),
+        spy_cumulative=("weighted_spy_return", "sum"),
         entry_price_first=("entry_price", "first"),
         last_price=("price", "last")
     )
@@ -248,29 +244,21 @@ def calculate_signal_potential(
 
 
 def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 5.0) -> pd.DataFrame:
-    return SignalAnalyzer(signal_df).rank_members(horizon, threshold)
-
-
-def get_horizon_performance(signal_df: pd.DataFrame, threshold: float = 5.0) -> pd.DataFrame:
     if signal_df.empty:
-        raise AnalysisError("Empty signal dataframe")
-
-    purchase_data = signal_df[signal_df["signal_type"] == TransactionType.PURCHASE.value]
-    if purchase_data.empty:
-        raise AnalysisError("No purchase signals found")
-
-    return purchase_data.groupby("horizon_days")["peak_potential_pct"].agg([
-        ("avg_peak_pct", "mean"),
-        ("hit_rate_pct", lambda x: (x > threshold).mean() * 100)
-    ]).round(2)
+        raise AnalysisError("Empty signals dataframe")
+    return _rank_members(signal_df, horizon, threshold)
 
 
 def get_top_signals(signal_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:
-    return SignalAnalyzer(signal_df).get_top_signals(horizon, top_n)
+    if signal_df.empty:
+        raise AnalysisError("Empty signals dataframe")
+    return _get_top_signals(signal_df, horizon, top_n)
 
 
 def get_member_signals(signal_df: pd.DataFrame, member: str, horizon: int = 90, top_n: int = 5) -> pd.DataFrame:
-    return SignalAnalyzer(signal_df).get_member_signals(member, horizon, top_n)
+    if signal_df.empty:
+        raise AnalysisError("Empty signals dataframe")
+    return _get_member_signals(signal_df, member, horizon, top_n)
 
 
 def get_analysis_table(
@@ -281,12 +269,11 @@ def get_analysis_table(
     top_n: int | None,
     threshold: float,
 ) -> pd.DataFrame:
-    analyzer = SignalAnalyzer(signals_df)
     if member_filter:
-        return analyzer.get_member_signals(member_filter, horizon, top_n or 5)
+        return _get_member_signals(signals_df, member_filter, horizon, top_n or 5)
     if show_signals:
-        return analyzer.get_top_signals(horizon, top_n or 15)
-    return analyzer.rank_members(horizon, threshold)
+        return _get_top_signals(signals_df, horizon, top_n or 15)
+    return _rank_members(signals_df, horizon, threshold)
 
 
 def score_ticker_by_buyers(
@@ -392,4 +379,6 @@ def get_ticker_buyers_with_rankings(
 
 
 def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
-    return SignalAnalyzer(signal_df).rank_sales(horizon)
+    if signal_df.empty:
+        raise AnalysisError("Empty signals dataframe")
+    return _rank_sales(signal_df, horizon)

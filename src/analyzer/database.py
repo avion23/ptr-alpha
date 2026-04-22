@@ -167,6 +167,27 @@ class Database:
         ).fetchdf()
         return result
 
+    def get_entry_prices(self, tickers: list[str], start_date, end_date) -> pd.DataFrame:
+        if not tickers:
+            return pd.DataFrame()
+
+        result = self.conn.execute(
+            """
+            SELECT t.member, t.ticker, t.disclosure_date, t.transaction_type,
+                   p.close AS entry_price
+            FROM transactions t
+            ASOF JOIN prices p
+              ON t.ticker = p.ticker
+              AND p.date <= t.disclosure_date
+            WHERE t.ticker IN (SELECT UNNEST(?))
+              AND t.disclosure_date BETWEEN ? AND ?
+              AND p.close IS NOT NULL
+        """,
+            [tickers, start_date, end_date],
+        ).fetchdf()
+
+        return result
+
     def transactions_exist(self, year: int) -> bool:
         count = self.conn.execute(
             """

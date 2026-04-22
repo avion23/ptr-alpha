@@ -1,7 +1,7 @@
 import unittest
 import pandas as pd
 from analyzer.parsing import (
-    clean_text, extract_ticker_from_name, parse_pdf_table,
+    clean_text, parse_pdf_table,
     normalize_house_metadata, consolidate_transactions
 )
 from analyzer.exceptions import ParsingError
@@ -13,18 +13,6 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(clean_text(None), "")
         self.assertEqual(clean_text(""), "")
         self.assertEqual(clean_text("normal text"), "normal text")
-
-    def test_extract_ticker_from_name(self):
-        self.assertEqual(extract_ticker_from_name("Apple Inc. (AAPL)"), "AAPL")
-        self.assertEqual(extract_ticker_from_name("Google (GOOGL)"), "GOOGL")
-        self.assertEqual(extract_ticker_from_name("Microsoft Corp (MSFT)"), "MSFT")
-
-        self.assertIsNone(extract_ticker_from_name("No ticker here"))
-        self.assertIsNone(extract_ticker_from_name("Too long ticker (TOOLONG)"))
-        self.assertIsNone(extract_ticker_from_name("Numbers (123A)"))
-        self.assertIsNone(extract_ticker_from_name("Lowercase (aapl)"))
-        self.assertIsNone(extract_ticker_from_name(""))
-        self.assertIsNone(extract_ticker_from_name(None))
 
     def test_parse_pdf_table_valid(self):
         table = [

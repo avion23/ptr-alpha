@@ -118,8 +118,7 @@ def analyze(
         trades, prices, signals = _prepare_analysis_data(
             app_ctx.transaction_source, app_ctx.price_source, year, horizons
         )
-        analyzer = analysis.SignalAnalyzer(signals)
-        result = analyzer.rank_sales(horizons[0])
+        result = analysis.rank_sales(signals, horizons[0])
         _print_or_save(result, output, data_dir, "member_sales.csv")
         raise typer.Exit(0)
 
@@ -170,8 +169,7 @@ def rank_sales(
     trades, prices, signals = _prepare_analysis_data(
         app_ctx.transaction_source, app_ctx.price_source, year, horizons
     )
-    analyzer = analysis.SignalAnalyzer(signals)
-    result = analyzer.rank_sales(horizons[0])
+    result = analysis.rank_sales(signals, horizons[0])
     _print_or_save(result.head(top_n), output, Path(app_ctx.settings.data.data_dir), "member_sales.csv")
     raise typer.Exit(0)
 
@@ -288,7 +286,7 @@ def parse(
     year: int = typer.Option(2025, help="Year to process"),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
-    """Parse cached PDFs to Parquet"""
+    """Parse cached PDFs to database"""
     app_ctx = get_context(ctx, data_dir, read_only=False)
     success = run_parse_pipeline(app_ctx.transaction_source, year)
     raise typer.Exit(0 if success else 1)

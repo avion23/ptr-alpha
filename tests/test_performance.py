@@ -4,6 +4,20 @@ import numpy as np
 import time
 from analyzer.analysis import calculate_signal_potential
 
+
+def _make_entry_prices(transactions_df, prices_df):
+    prices_long = prices_df.stack().reset_index(name="price")
+    prices_long.columns = ["price_date", "ticker", "price"]
+    prices_long = prices_long.sort_values("price_date")
+    trans_sorted = transactions_df.sort_values("disclosure_date")
+    merged = pd.merge_asof(
+        trans_sorted, prices_long,
+        left_on="disclosure_date", right_on="price_date", by="ticker"
+    ).dropna(subset=["price"])
+    return merged[["member", "ticker", "disclosure_date", "transaction_type", "price"]].rename(
+        columns={"price": "entry_price"}
+    ).reset_index(drop=True)
+
 def create_large_test_data(n_transactions=10000, n_tickers=500):
     np.random.seed(42)
 
@@ -33,9 +47,10 @@ class TestPerformance(unittest.TestCase):
 
     def test_vectorized_performance_small(self):
         transactions, prices = create_large_test_data(1000, 50)
+        entry_prices = _make_entry_prices(transactions, prices)
 
         start_time = time.time()
-        signals = calculate_signal_potential(transactions, prices, [30, 90])
+        signals = calculate_signal_potential(entry_prices, prices, [30, 90])
         elapsed_time = time.time() - start_time
 
         self.assertFalse(signals.empty)
@@ -48,9 +63,10 @@ class TestPerformance(unittest.TestCase):
 
     def test_vectorized_performance_medium(self):
         transactions, prices = create_large_test_data(5000, 100)
+        entry_prices = _make_entry_prices(transactions, prices)
 
         start_time = time.time()
-        signals = calculate_signal_potential(transactions, prices, [90])
+        signals = calculate_signal_potential(entry_prices, prices, [90])
         elapsed_time = time.time() - start_time
 
         self.assertFalse(signals.empty)
@@ -75,7 +91,9 @@ class TestPerformance(unittest.TestCase):
             'GOOGL': [2000] + [2000 - i * 2 for i in range(1, len(dates))]
         }, index=dates)
 
-        signals = calculate_signal_potential(transactions, prices, [30])
+        entry_prices = _make_entry_prices(transactions, prices)
+
+        signals = calculate_signal_potential(entry_prices, prices, [30])
 
         self.assertFalse(signals.empty, "Should generate signals for the test data")
         self.assertGreater(len(signals), 0)

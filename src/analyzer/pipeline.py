@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 from datetime import timedelta
 import logging
 import pandas as pd
 import os
 from functools import wraps
 from dataclasses import dataclass
-from typing import Optional
 from analyzer.exceptions import AnalyzerError, DataSourceError
 from analyzer.models import TransactionType
 from analyzer import analysis
@@ -16,31 +17,29 @@ def _load_sector_data(tickers: list[str]) -> pd.DataFrame:
     """Load sector info for tickers using yfinance."""
     try:
         import yfinance as yf
+        from concurrent.futures import ThreadPoolExecutor, as_completed
     except ImportError:
         return pd.DataFrame(columns=["ticker", "sector"])
-    records = []
-    for ticker in tickers:
-        if ticker in ("SPY", "SP500"):
-            continue
+
+    filtered = [t for t in tickers if t not in ("SPY", "SP500")]
+    if not filtered:
+        return pd.DataFrame(columns=["ticker", "sector"])
+
+    def fetch_sector(ticker):
         try:
-            info = yf.Ticker(ticker).info
-            records.append({
-                "ticker": ticker,
-                "sector": info.get("sector", "Unknown"),
-            })
+            return ticker, yf.Ticker(ticker).info.get("sector", "Unknown")
         except Exception:
-            records.append({"ticker": ticker, "sector": "Unknown"})
+            return ticker, "Unknown"
+
+    records = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch_sector, t): t for t in filtered}
+        for future in as_completed(futures):
+            ticker, sector = future.result()
+            records.append({"ticker": ticker, "sector": sector})
+
     return pd.DataFrame(records)
 
-
-def _print_or_save(df, output_format, data_dir, filename):
-    if output_format == "csv":
-        filepath = data_dir / filename
-        os.makedirs(data_dir, exist_ok=True)
-        df.to_csv(filepath, index=False)
-        logger.info(f"Results saved to {filepath}")
-    else:
-        print(df.to_string(index=False))
 
 
 @dataclass
@@ -49,8 +48,8 @@ class AnalysisParams:
     year: int
     horizons: list[int]
     threshold: float
-    member_filter: Optional[str] = None
-    top_n: Optional[int] = None
+    member_filter: str | None = None
+    top_n: int | None = None
     show_signals: bool = False
     output_format: str = 'console'
 
@@ -81,7 +80,11 @@ def _prepare_analysis_data(transaction_source, price_source, year, horizons):
     prices = price_source.get_prices(trades['ticker'].unique(), start_date, end_date)
     logger.info(f"Fetched price data for {len(prices.columns)} tickers")
 
-    signals = analysis.calculate_signal_potential(trades, prices, horizons)
+    all_tickers = trades['ticker'].unique().tolist()
+    entry_prices = transaction_source.db.get_entry_prices(all_tickers, start_date, end_date)
+    logger.info(f"Computed entry prices for {len(entry_prices)} transactions")
+
+    signals = analysis.calculate_signal_potential(entry_prices, prices, horizons)
     logger.info(f"Calculated {len(signals)} signals")
 
     return trades, prices, signals
@@ -157,34 +160,33 @@ def run_recent_ticker_scoring(transaction_source, price_source, year, horizons, 
     return True
 
 def _save_results(table, output_format, member_filter, show_signals, data_dir):
-        if show_signals:
-            display_cols = [
-                'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct'
-            ]
-        elif 'avg_spy_alpha_pct' in table.columns:
-            display_cols = [
-                'member', 'avg_spy_alpha_pct', 'median_peak_return_pct', 'avg_peak_return_pct',
-                'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
-            ]
-        else:
-            display_cols = list(table.columns)
-        available_display = [c for c in display_cols if c in table.columns]
-        display_table = table[available_display]
+    if show_signals:
+        display_cols = [
+            'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct'
+        ]
+    elif 'avg_spy_alpha_pct' in table.columns:
+        display_cols = [
+            'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
+        ]
+    else:
+        display_cols = list(table.columns)
+    available_display = [c for c in display_cols if c in table.columns]
+    display_table = table[available_display]
 
-        if output_format == 'csv':
-            if member_filter:
-                filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
-            elif show_signals:
-                filename = "top_signals.csv"
-            else:
-                filename = "member_rankings.csv"
-
-            filepath = data_dir / filename
-            os.makedirs(data_dir, exist_ok=True)
-            table.to_csv(filepath, index=False)
-            logger.info(f"Results saved to {filepath}")
+    if output_format == 'csv':
+        if member_filter:
+            filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
+        elif show_signals:
+            filename = "top_signals.csv"
         else:
-            print(display_table.to_string(index=False))
+            filename = "member_rankings.csv"
+
+        filepath = data_dir / filename
+        os.makedirs(data_dir, exist_ok=True)
+        display_table.to_csv(filepath, index=False)
+        logger.info(f"Results saved to {filepath}")
+    else:
+        print(display_table.to_string(index=False))
 
 
 def _analyze_by_sector(trades, signals, horizons):
@@ -204,9 +206,8 @@ def _analyze_by_sector(trades, signals, horizons):
         ]
         if len(sector_purchases) < 3:
             continue
-        sector_analyzer = analysis.SignalAnalyzer(sector_purchases)
         try:
-            ranked = sector_analyzer.rank_members(horizons[0])
+            ranked = analysis._rank_members(sector_purchases, horizons[0])
             if not ranked.empty:
                 results.append({
                     "sector": sector,

@@ -15,7 +15,7 @@ class TestIntegration(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
         self.settings = Settings(data=DataSettings(data_dir=self.temp_dir, cache_enabled=False))
 
-    def _insert_mock_transactions(self):
+    def _insert_mock_data(self):
         np.random.seed(42)
         db = Database(Path(self.temp_dir) / "congress.duckdb")
         transactions = pd.DataFrame({
@@ -27,28 +27,22 @@ class TestIntegration(unittest.TestCase):
             'transaction_type': np.random.choice(['Purchase', 'Sale'], 30, p=[0.7, 0.3])
         })
         db.upsert_transactions(transactions)
-        db.close()
-        return transactions
 
-    def _create_mock_price_source(self):
         np.random.seed(99)
-        price_source = YFinancePriceSource(self.settings)
+        tickers = sorted(list(set(transactions['ticker'].unique()) | {'SPY'}))
+        dates = pd.date_range('2023-11-01', '2024-06-30', freq='D')
+        price_data = {}
+        for ticker in tickers:
+            base_price = 100.0 + hash(ticker) % 50
+            price_data[ticker] = base_price + np.cumsum(np.random.normal(0.1, 2, len(dates)))
+        db.upsert_prices(pd.DataFrame(price_data, index=dates))
 
-        def mock_get_prices(tickers, start, end):
-            dates = pd.date_range(start, end, freq='D')
-            price_data = {}
-            for ticker in tickers:
-                base_price = 100.0 + hash(ticker) % 50
-                price_data[ticker] = base_price + np.cumsum(np.random.normal(0.1, 2, len(dates)))
-            return pd.DataFrame(price_data, index=dates)
-
-        price_source.get_prices = mock_get_prices
-        return price_source
+        db.close()
 
     def test_end_to_end_house_analysis(self):
-        self._insert_mock_transactions()
+        self._insert_mock_data()
         transaction_source = HouseTransactionSource(self.settings)
-        price_source = self._create_mock_price_source()
+        price_source = YFinancePriceSource(self.settings)
 
         params = AnalysisParams(
             source='house',
@@ -65,9 +59,9 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(result, "Analysis pipeline should succeed")
 
     def test_member_specific_analysis(self):
-        self._insert_mock_transactions()
+        self._insert_mock_data()
         transaction_source = HouseTransactionSource(self.settings)
-        price_source = self._create_mock_price_source()
+        price_source = YFinancePriceSource(self.settings)
 
         params = AnalysisParams(
             source='house',

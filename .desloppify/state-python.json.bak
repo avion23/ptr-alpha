@@ -5469,11 +5469,11 @@
     }
   },
   "reminder_history": {
-    "zone_classification": 2,
-    "report_scores": 2,
-    "review_issues_pending": 1,
+    "zone_classification": 3,
+    "report_scores": 3,
+    "review_issues_pending": 2,
     "stagnant_nudge": 5,
-    "feedback_nudge": 1
+    "feedback_nudge": 2
   },
   "concern_dismissals": {
     "b7632289c3d432b0": {

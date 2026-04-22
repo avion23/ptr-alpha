@@ -11,17 +11,6 @@ def clean_text(text):
         return ""
     return re.sub(r'\s+', ' ', str(text)).strip()
 
-def extract_ticker_from_name(asset_name):
-    if not asset_name:
-        return None
-
-    match = re.search(r'\(([A-Z][A-Z.\-]{1,5})\)', asset_name)
-    if match:
-        ticker = match.group(1).strip()
-        if 1 <= len(ticker) <= 5:
-            return ticker
-    return None
-
 def _extract_ticker(asset_cell):
     if not asset_cell:
         return None
@@ -31,12 +20,17 @@ def _extract_ticker(asset_cell):
 def _extract_transaction_type(tx_type_cell):
     if not tx_type_cell:
         return None
-    tx_type_lower = tx_type_cell.lower()
-    if 'purchase' in tx_type_lower or tx_type_lower.startswith('p'):
-        return TransactionType.PURCHASE.value
-    elif 'sale' in tx_type_lower or tx_type_lower.startswith('s'):
-        return TransactionType.SALE.value
-    return None
+    match tx_type_cell.strip().lower():
+        case s if 'purchase' in s:
+            return TransactionType.PURCHASE.value
+        case s if s.startswith('p') and len(s) <= 2:
+            return TransactionType.PURCHASE.value
+        case s if 'sale' in s or 'sell' in s:
+            return TransactionType.SALE.value
+        case s if s.startswith('s') and len(s) <= 2:
+            return TransactionType.SALE.value
+        case _:
+            return None
 
 def _extract_date(date_cell):
     if not date_cell:
@@ -116,6 +110,7 @@ def consolidate_transactions(pdf_transactions, member_metadata):
         doc_id = pdf_path.stem
         member_info = member_metadata.get(doc_id)
         if not member_info:
+            logger.warning(f"No metadata found for doc_id={doc_id}, skipping {len(transactions)} transaction(s)")
             continue
 
         for tx in transactions:
@@ -135,7 +130,7 @@ def consolidate_transactions(pdf_transactions, member_metadata):
     df['transaction_date'] = pd.to_datetime(df['transaction_date'], errors='coerce')
     df['disclosure_date'] = pd.to_datetime(df['disclosure_date'], errors='coerce')
 
-    return df.dropna(subset=['transaction_date'])
+    return df.dropna(subset=['transaction_date', 'disclosure_date'])
 
 
 def _parse_ocr_text_to_rows(text):

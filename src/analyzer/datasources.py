@@ -49,7 +49,7 @@ def _parse_pdf_worker(pdf_path):
             for table in ocr_tables:
                 transactions.extend(parse_pdf_table(table))
         return pdf_path, transactions
-    except (OSError, ParsingError) as e:
+    except Exception as e:
         logger.warning(f"Failed to parse PDF {pdf_path}: {e}")
         return pdf_path, []
 
@@ -63,6 +63,16 @@ class HouseTransactionSource(TransactionSource):
         self.parallel_workers = settings.data.get_workers()
         _ensure_request_cache()
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
+
+    def close(self):
+        self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def get_transactions(self, year):
         if not self.db.transactions_exist(year):
@@ -228,6 +238,16 @@ class YFinancePriceSource(PriceSource):
         self.settings = settings
         self.data_dir = pathlib.Path(settings.data.data_dir)
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
+
+    def close(self):
+        self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def get_prices(self, tickers, start, end):
         if len(tickers) == 0:

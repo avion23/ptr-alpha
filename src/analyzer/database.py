@@ -47,10 +47,10 @@ class Database:
                 transaction_date DATE,
                 disclosure_date DATE,
                 transaction_type VARCHAR,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(doc_id, ticker, transaction_date, member)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique ON transactions(doc_id, ticker, transaction_date, member)")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))"
         )

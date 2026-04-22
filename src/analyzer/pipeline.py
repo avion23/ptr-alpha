@@ -116,17 +116,25 @@ def run_recent_ticker_scoring(transaction_source, price_source, year, horizons, 
     return True
 
 def _save_results(table, output_format, member_filter, show_signals, data_dir):
-    if output_format == 'csv':
-        if member_filter:
-            filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
-        elif show_signals:
-            filename = "top_signals.csv"
-        else:
-            filename = "member_rankings.csv"
+        display_cols = [
+            'member', 'median_peak_return_pct', 'avg_peak_return_pct',
+            'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'avg_spy_alpha_pct',
+            'purchase_trades'
+        ]
+        available_display = [c for c in display_cols if c in table.columns]
+        display_table = table[available_display]
 
-        filepath = data_dir / filename
-        os.makedirs(data_dir, exist_ok=True)
-        table.to_csv(filepath, index=False)
-        logger.info(f"Results saved to {filepath}")
-    else:
-        print(table.to_string(index=False))
+        if output_format == 'csv':
+            if member_filter:
+                filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
+            elif show_signals:
+                filename = "top_signals.csv"
+            else:
+                filename = "member_rankings.csv"
+
+            filepath = data_dir / filename
+            os.makedirs(data_dir, exist_ok=True)
+            table.to_csv(filepath, index=False)
+            logger.info(f"Results saved to {filepath}")
+        else:
+            print(display_table.to_string(index=False))

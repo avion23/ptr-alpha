@@ -11,6 +11,38 @@ from analyzer import analysis
 
 logger = logging.getLogger(__name__)
 
+
+def _load_sector_data(tickers: list[str]) -> pd.DataFrame:
+    """Load sector info for tickers using yfinance."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return pd.DataFrame(columns=["ticker", "sector"])
+    records = []
+    for ticker in tickers:
+        if ticker in ("SPY", "SP500"):
+            continue
+        try:
+            info = yf.Ticker(ticker).info
+            records.append({
+                "ticker": ticker,
+                "sector": info.get("sector", "Unknown"),
+            })
+        except Exception:
+            records.append({"ticker": ticker, "sector": "Unknown"})
+    return pd.DataFrame(records)
+
+
+def _print_or_save(df, output_format, data_dir, filename):
+    if output_format == "csv":
+        filepath = data_dir / filename
+        os.makedirs(data_dir, exist_ok=True)
+        df.to_csv(filepath, index=False)
+        logger.info(f"Results saved to {filepath}")
+    else:
+        print(df.to_string(index=False))
+
+
 @dataclass
 class AnalysisParams:
     source: str
@@ -21,6 +53,10 @@ class AnalysisParams:
     top_n: Optional[int] = None
     show_signals: bool = False
     output_format: str = 'console'
+
+    @property
+    def output(self) -> str:
+        return self.output_format
 
 def pipeline_step(func):
     @wraps(func)
@@ -70,6 +106,11 @@ def run_analysis_pipeline(params, transaction_source, price_source, data_dir, ou
     logger.info(f"Generated analysis table with {len(table)} rows")
 
     _save_results(table, output_format, params.member_filter, params.show_signals, data_dir)
+
+    sector_results = _analyze_by_sector(trades, signals, params.horizons)
+    if sector_results is not None and not params.member_filter and not params.show_signals:
+        print("\n=== Sector Analysis ===")
+        print(sector_results.to_string(index=False))
     return True
 
 @pipeline_step
@@ -117,9 +158,8 @@ def run_recent_ticker_scoring(transaction_source, price_source, year, horizons, 
 
 def _save_results(table, output_format, member_filter, show_signals, data_dir):
         display_cols = [
-            'member', 'median_peak_return_pct', 'avg_peak_return_pct',
-            'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'avg_spy_alpha_pct',
-            'purchase_trades'
+            'member', 'avg_spy_alpha_pct', 'median_peak_return_pct', 'avg_peak_return_pct',
+            'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
         ]
         available_display = [c for c in display_cols if c in table.columns]
         display_table = table[available_display]
@@ -138,3 +178,42 @@ def _save_results(table, output_format, member_filter, show_signals, data_dir):
             logger.info(f"Results saved to {filepath}")
         else:
             print(display_table.to_string(index=False))
+
+
+def _analyze_by_sector(trades, signals, horizons):
+    tickers = trades['ticker'].unique()
+    sectors = _load_sector_data(tickers.tolist())
+    if sectors.empty:
+        logger.info("No sector data available")
+        return None
+
+    trans_with_sector = trades.merge(sectors, on="ticker", how="left")
+    sig_with_sector = signals.merge(sectors, on="ticker", how="left")
+
+    analyzer = analysis.SignalAnalyzer(sig_with_sector)
+
+    results = []
+    for sector in sectors["sector"].unique():
+        sector_purchases = sig_with_sector[
+            (sig_with_sector["sector"] == sector) &
+            (sig_with_sector["signal_type"] == TransactionType.PURCHASE.value)
+        ]
+        if len(sector_purchases) < 3:
+            continue
+        sector_analyzer = analysis.SignalAnalyzer(sector_purchases)
+        try:
+            ranked = sector_analyzer.rank_members(horizons[0])
+            if not ranked.empty:
+                results.append({
+                    "sector": sector,
+                    "top_member": ranked.iloc[0]["member"],
+                    "top_member_alpha": ranked.iloc[0]["avg_spy_alpha_pct"],
+                    "num_trades": len(sector_purchases),
+                    "num_members": sector_purchases["member"].nunique(),
+                })
+        except AnalysisError:
+            continue
+
+    if not results:
+        return None
+    return pd.DataFrame(results).sort_values("top_member_alpha", ascending=False)

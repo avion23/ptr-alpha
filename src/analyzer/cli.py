@@ -36,15 +36,15 @@ def setup_logging(verbose):
     )
 
 
-def get_context(ctx, data_dir=None):
+def get_context(ctx, data_dir=None, read_only=True):
     if ctx.obj is None:
         settings = Settings()
         if data_dir and data_dir != "data":
             settings.data.data_dir = data_dir
         ctx.obj = AppContext(
             settings=settings,
-            transaction_source=HouseTransactionSource(settings),
-            price_source=YFinancePriceSource(settings),
+            transaction_source=HouseTransactionSource(settings, read_only=read_only),
+            price_source=YFinancePriceSource(settings, read_only=read_only),
         )
     return ctx.obj
 
@@ -275,7 +275,7 @@ def fetch(
     refresh_metadata: bool = typer.Option(False, "--refresh-metadata", help="Force refresh of metadata from House Clerk"),
 ):
     """Download House PDFs for a year"""
-    app_ctx = get_context(ctx, data_dir)
+    app_ctx = get_context(ctx, data_dir, read_only=False)
     if refresh_metadata:
         app_ctx.transaction_source.fetch_metadata(year, refresh=True)
     success = run_fetch_pipeline(app_ctx.transaction_source, year)
@@ -289,7 +289,7 @@ def parse(
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """Parse cached PDFs to Parquet"""
-    app_ctx = get_context(ctx, data_dir)
+    app_ctx = get_context(ctx, data_dir, read_only=False)
     success = run_parse_pipeline(app_ctx.transaction_source, year)
     raise typer.Exit(0 if success else 1)
 

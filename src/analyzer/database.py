@@ -14,14 +14,23 @@ class DatabaseError(AnalysisError):
 
 
 class Database:
-    def __init__(self, db_path: str | pathlib.Path):
+    def __init__(self, db_path: str | pathlib.Path, read_only: bool = False):
         self.db_path = pathlib.Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = read_only
         try:
-            self.conn = duckdb.connect(str(self.db_path))
+            if read_only:
+                self.conn = duckdb.connect(str(self.db_path), read_only=True)
+            else:
+                self.conn = duckdb.connect(str(self.db_path))
         except duckdb.Error as e:
             raise DatabaseError(f"Failed to open database at {self.db_path}: {e}")
-        self._init_schema()
+        if not read_only:
+            self._init_schema()
+
+    @property
+    def is_read_only(self) -> bool:
+        return self._read_only
 
     def _init_schema(self):
         self.conn.execute("""

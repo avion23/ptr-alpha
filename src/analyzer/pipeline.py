@@ -157,10 +157,17 @@ def run_recent_ticker_scoring(transaction_source, price_source, year, horizons, 
     return True
 
 def _save_results(table, output_format, member_filter, show_signals, data_dir):
-        display_cols = [
-            'member', 'avg_spy_alpha_pct', 'median_peak_return_pct', 'avg_peak_return_pct',
-            'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
-        ]
+        if show_signals:
+            display_cols = [
+                'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct'
+            ]
+        elif 'avg_spy_alpha_pct' in table.columns:
+            display_cols = [
+                'member', 'avg_spy_alpha_pct', 'median_peak_return_pct', 'avg_peak_return_pct',
+                'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
+            ]
+        else:
+            display_cols = list(table.columns)
         available_display = [c for c in display_cols if c in table.columns]
         display_table = table[available_display]
 
@@ -187,10 +194,7 @@ def _analyze_by_sector(trades, signals, horizons):
         logger.info("No sector data available")
         return None
 
-    trans_with_sector = trades.merge(sectors, on="ticker", how="left")
     sig_with_sector = signals.merge(sectors, on="ticker", how="left")
-
-    analyzer = analysis.SignalAnalyzer(sig_with_sector)
 
     results = []
     for sector in sectors["sector"].unique():
@@ -211,7 +215,7 @@ def _analyze_by_sector(trades, signals, horizons):
                     "num_trades": len(sector_purchases),
                     "num_members": sector_purchases["member"].nunique(),
                 })
-        except AnalysisError:
+        except analysis.AnalysisError:
             continue
 
     if not results:

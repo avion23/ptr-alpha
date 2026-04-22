@@ -55,14 +55,14 @@ def _parse_pdf_worker(pdf_path):
 
 
 class HouseTransactionSource(TransactionSource):
-    def __init__(self, settings):
+    def __init__(self, settings, read_only: bool = False):
         self.settings = settings
         self.data_dir = pathlib.Path(settings.data.data_dir)
         self.metadata_url_template = settings.sources.house_metadata_url
         self.pdf_url_template = settings.sources.house_pdf_url
         self.parallel_workers = settings.data.get_workers()
         _ensure_request_cache()
-        self.db = Database(self.data_dir / "congress.duckdb")
+        self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
     def get_transactions(self, year):
         if not self.db.transactions_exist(year):
@@ -224,10 +224,10 @@ class HouseTransactionSource(TransactionSource):
 
 
 class YFinancePriceSource(PriceSource):
-    def __init__(self, settings):
+    def __init__(self, settings, read_only: bool = False):
         self.settings = settings
         self.data_dir = pathlib.Path(settings.data.data_dir)
-        self.db = Database(self.data_dir / "congress.duckdb")
+        self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
     def get_prices(self, tickers, start, end):
         if len(tickers) == 0:

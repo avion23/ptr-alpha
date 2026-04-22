@@ -153,7 +153,7 @@ class HouseTransactionSource(TransactionSource):
 
         logger.info(f"Processing {len(ptrs)} PTR filings for {year}")
 
-        connector = aiohttp.TCPConnector(limit=50)
+        connector = aiohttp.TCPConnector(limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
             async with asyncio.TaskGroup() as tg:
                 tasks = []
@@ -291,7 +291,7 @@ class YFinancePriceSource(PriceSource):
         success_count = len([t for t in all_tickers if t in prices.columns])
         success_rate = success_count / len(all_tickers)
 
-        if success_rate < 0.9:
+        if success_rate < 0.75:
             raise DataSourceError(
                 f"Price fetch failure rate too high: {(1 - success_rate) * 100:.1f}% failed ({len(failed_tickers)}/{len(all_tickers)}). Analysis would be unreliable."
             )

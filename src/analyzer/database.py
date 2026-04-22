@@ -47,7 +47,8 @@ class Database:
                 transaction_date DATE,
                 disclosure_date DATE,
                 transaction_type VARCHAR,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(doc_id, ticker, transaction_date, member)
             )
         """)
         self.conn.execute(
@@ -138,7 +139,10 @@ class Database:
             INSERT INTO transactions (doc_id, member, ticker, transaction_date, disclosure_date, transaction_type, created_at)
             SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type, created_at
             FROM staging_transactions
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (doc_id, ticker, transaction_date, member) DO UPDATE SET
+                transaction_type = EXCLUDED.transaction_type,
+                disclosure_date = EXCLUDED.disclosure_date,
+                created_at = EXCLUDED.created_at
         """)
         self.conn.execute("DROP TABLE staging_transactions")
 

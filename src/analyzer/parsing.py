@@ -1,8 +1,10 @@
 import logging
-import pandas as pd
 import re
-from analyzer.models import TransactionType
+
+import pandas as pd
+
 from analyzer.exceptions import ParsingError
+from analyzer.models import TransactionType
 
 logger = logging.getLogger(__name__)
 

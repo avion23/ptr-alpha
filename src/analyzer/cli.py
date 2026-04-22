@@ -313,10 +313,8 @@ def main():
         print("\nOperation cancelled by user", file=sys.stderr)
         raise typer.Exit(130)
     except Exception as e:
-        import traceback
-
-        print(f"Unexpected error: {e}", file=sys.stderr)
-        traceback.print_exc()
+        logger = logging.getLogger(__name__)
+        logger.exception(f"Unexpected error: {e}")
         raise typer.Exit(1)
 
 

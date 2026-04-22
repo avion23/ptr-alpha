@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import timedelta
-import logging
-import pandas as pd
-import os
-from functools import wraps
 from dataclasses import dataclass
+from functools import wraps
+import logging
+import os
+from pathlib import Path
+
+import pandas as pd
+
 from analyzer.exceptions import AnalyzerError, DataSourceError
 from analyzer.models import TransactionType
 from analyzer import analysis
@@ -67,7 +70,9 @@ def pipeline_step(func):
             return False
     return wrapper
 
-def _prepare_analysis_data(transaction_source, price_source, year, horizons):
+def _prepare_analysis_data(
+    transaction_source, price_source, year: int, horizons: list[int]
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     trades = transaction_source.get_transactions(year)
     logger.info(f"Loaded {len(trades)} transactions for {year}")
 
@@ -90,19 +95,21 @@ def _prepare_analysis_data(transaction_source, price_source, year, horizons):
     return trades, prices, signals
 
 @pipeline_step
-def run_fetch_pipeline(transaction_source, year):
+def run_fetch_pipeline(transaction_source, year: int) -> bool:
     transaction_source.fetch_and_cache_pdfs(year)
     logger.info(f"Successfully fetched PDFs for {year}")
     return True
 
 @pipeline_step
-def run_parse_pipeline(transaction_source, year):
+def run_parse_pipeline(transaction_source, year: int) -> bool:
     transaction_source.parse_cached_pdfs(year)
     logger.info(f"Successfully parsed PDFs for {year}")
     return True
 
 @pipeline_step
-def run_analysis_pipeline(params, transaction_source, price_source, data_dir, output_format):
+def run_analysis_pipeline(
+    params: AnalysisParams, transaction_source, price_source, data_dir: Path, output_format: str
+) -> bool:
     trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, params.year, params.horizons)
 
     table = analysis.get_analysis_table(signals, params.member_filter, params.show_signals, params.horizons[0], params.top_n, params.threshold)
@@ -117,7 +124,9 @@ def run_analysis_pipeline(params, transaction_source, price_source, data_dir, ou
     return True
 
 @pipeline_step
-def run_ticker_analysis(ticker, transaction_source, price_source, year, horizon, threshold):
+def run_ticker_analysis(
+    ticker: str, transaction_source, price_source, year: int, horizon: int, threshold: float
+) -> bool:
     trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, year, [horizon])
 
     buyers = analysis.get_ticker_buyers_with_rankings(ticker, trades, signals, horizon, threshold)
@@ -130,7 +139,10 @@ def run_ticker_analysis(ticker, transaction_source, price_source, year, horizon,
     return True
 
 @pipeline_step
-def run_recent_ticker_scoring(transaction_source, price_source, year, horizons, threshold, days_back, min_buyers, top_n):
+def run_recent_ticker_scoring(
+    transaction_source, price_source, year: int, horizons: list[int],
+    threshold: float, days_back: int, min_buyers: int, top_n: int
+) -> bool:
     if days_back < 1:
         raise DataSourceError("days_back must be at least 1")
 
@@ -159,7 +171,10 @@ def run_recent_ticker_scoring(transaction_source, price_source, year, horizons, 
     print(result.to_string(index=False))
     return True
 
-def _save_results(table, output_format, member_filter, show_signals, data_dir):
+def _save_results(
+    table: pd.DataFrame, output_format: str,
+    member_filter: str | None, show_signals: bool, data_dir: Path
+) -> None:
     if show_signals:
         display_cols = [
             'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct'
@@ -189,7 +204,9 @@ def _save_results(table, output_format, member_filter, show_signals, data_dir):
         print(display_table.to_string(index=False))
 
 
-def _analyze_by_sector(trades, signals, horizons):
+def _analyze_by_sector(
+    trades: pd.DataFrame, signals: pd.DataFrame, horizons: list[int]
+) -> pd.DataFrame | None:
     tickers = trades['ticker'].unique()
     sectors = _load_sector_data(tickers.tolist())
     if sectors.empty:

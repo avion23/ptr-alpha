@@ -53,11 +53,16 @@ def calculate_signal_potential(
 
     is_purchase = final['transaction_type'] == TransactionType.PURCHASE.value
 
-    peak_potential = np.where(
-        is_purchase,
-        (final['peak_price'] / final['entry_price'] - 1) * 100,
-        (final['entry_price'] / final['trough_price'] - 1) * 100
-    )
+    purchase_mask = is_purchase & (final['entry_price'] != 0)
+    sale_mask = ~is_purchase & (final['trough_price'] != 0)
+
+    peak_potential = np.zeros(len(final))
+    peak_potential[purchase_mask.values] = (
+        (final.loc[purchase_mask.values, 'peak_price'] / final.loc[purchase_mask.values, 'entry_price'] - 1) * 100
+    ).values
+    peak_potential[sale_mask.values] = (
+        (final.loc[sale_mask.values, 'entry_price'] / final.loc[sale_mask.values, 'trough_price'] - 1) * 100
+    ).values
 
     return final.assign(
         signal_type=final['transaction_type'],

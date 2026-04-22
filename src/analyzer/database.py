@@ -206,7 +206,7 @@ class Database:
         return pivot
 
     def get_missing_price_data(self, tickers: list[str], start_date, end_date) -> tuple[list[str], pd.DatetimeIndex]:
-        all_dates = pd.date_range(start_date, end_date, freq="D")
+        all_dates = pd.date_range(start_date, end_date, freq="B")
         existing = self.conn.execute(
             """
             SELECT DISTINCT ticker, date

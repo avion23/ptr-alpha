@@ -142,33 +142,56 @@ def _parse_ocr_text_to_rows(text):
     rows = []
     lines = text.strip().split('\n')
 
-    for line in lines:
-        line = line.strip()
-        if not line:
+    pending_tx = None
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
             continue
 
-        # Look for ticker pattern
-        ticker_match = re.search(r'\(([A-Z][A-Z0-9.\-]{1,5})\)', line)
-        if not ticker_match:
-            continue
+        ticker_match = re.search(r'\(([A-Z][A-Z0-9.\-]{1,5})\)', stripped)
 
-        asset_name = line[:ticker_match.end()].strip()
-        rest = line[ticker_match.end():].strip()
+        if ticker_match:
+            asset_name = stripped[:ticker_match.end()].strip()
+            rest = stripped[ticker_match.end():].strip()
+            rest_clean = re.sub(r'\s+', ' ', rest).strip().upper()
 
-        # Handle single-letter transaction codes: P=Purchase, S=Sale, PP=Purchase
-        tx_type = None
-        rest_clean = re.sub(r'\s+', ' ', rest)
-        if re.match(r'^P\s', rest_clean) or rest_clean.startswith('PP '):
-            tx_type = TransactionType.PURCHASE.value
-        elif re.match(r'^S\s', rest_clean) or rest_clean.startswith('S '):
-            tx_type = TransactionType.SALE.value
+            tx_type = None
+            date_str = None
 
-        # Look for date in rest
-        date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', rest)
-        date_str = date_match.group(1) if date_match else None
+            if rest_clean.startswith('P ') or rest_clean.startswith('PP '):
+                tx_type = TransactionType.PURCHASE.value
+            elif rest_clean.startswith('S ') or rest_clean.startswith('SS '):
+                tx_type = TransactionType.SALE.value
 
-        if tx_type and date_str:
-            rows.append([asset_name, tx_type, date_str])
+            date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', rest)
+            if date_match:
+                date_str = date_match.group(1)
+
+            if tx_type and date_str:
+                rows.append([asset_name, tx_type, date_str])
+            elif pending_tx:
+                rows.append([asset_name, pending_tx['tx_type'], pending_tx['date_str']])
+
+            pending_tx = None
+
+        else:
+            rest_clean = re.sub(r'\s+', ' ', stripped).upper()
+
+            has_s = ' S ' in rest_clean or rest_clean.startswith('S ') or re.search(r'[A-Z0-9]S\s+\d', rest_clean)
+            has_p = ' P ' in rest_clean or rest_clean.startswith('P ') or re.search(r'[A-Z0-9]P\s+\d', rest_clean)
+
+            if has_s and not has_p:
+                tx_type = TransactionType.SALE.value
+            elif has_p:
+                tx_type = TransactionType.PURCHASE.value
+            else:
+                tx_type = None
+
+            if tx_type:
+                date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', stripped)
+                if date_match:
+                    pending_tx = {'tx_type': tx_type, 'date_str': date_match.group(1)}
 
     return rows
 
@@ -182,7 +205,7 @@ def extract_tables_with_ocr(pdf_path):
         return []
 
     try:
-        images = convert_from_path(str(pdf_path), dpi=300)
+        images = convert_from_path(str(pdf_path), dpi=200)
     except Exception as e:
         logger.warning(f"Failed to convert PDF to images for OCR {pdf_path}: {e}")
         return []

@@ -206,7 +206,7 @@ class Database:
         if df.empty:
             return
 
-        df_reset = df.reset_index()
+        df_reset = df.reset_index().copy()
         index_col_name = df_reset.columns[0]
         prices_long = df_reset.melt(
             id_vars=[index_col_name], var_name="ticker", value_name="close"

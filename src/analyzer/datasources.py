@@ -306,10 +306,17 @@ class YFinancePriceSource(PriceSource):
         )
         new_prices = new_prices.dropna(axis=1, how="all")
 
-        self.db.upsert_prices(new_prices)
-        logger.info(f"Cached {len(new_prices.columns)} tickers to database")
-
-        prices = self.db.get_prices(all_tickers, start, end)
+        if self.db.is_read_only:
+            logger.info(
+                f"Read-only mode: merging {len(new_prices.columns)} fetched tickers with cache"
+            )
+            merged = pd.concat([cached_prices, new_prices], axis=1)
+            merged = merged[~merged.index.duplicated(keep="last")]
+            prices = merged
+        else:
+            self.db.upsert_prices(new_prices)
+            logger.info(f"Cached {len(new_prices.columns)} tickers to database")
+            prices = self.db.get_prices(all_tickers, start, end)
 
         failed_tickers = sorted(set(all_tickers) - set(prices.columns))
         success_count = len([t for t in all_tickers if t in prices.columns])

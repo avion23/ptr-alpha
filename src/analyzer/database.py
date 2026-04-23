@@ -1,8 +1,12 @@
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime
+from pathlib import Path
+
 import duckdb
 import pandas as pd
-import pathlib
-import logging
-from datetime import datetime
+
 from analyzer.exceptions import AnalysisError
 
 
@@ -14,8 +18,8 @@ class DatabaseError(AnalysisError):
 
 
 class Database:
-    def __init__(self, db_path: str | pathlib.Path, read_only: bool = False):
-        self.db_path = pathlib.Path(db_path)
+    def __init__(self, db_path: str | Path, read_only: bool = False):
+        self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._read_only = read_only
         try:
@@ -167,7 +171,7 @@ class Database:
         ).fetchdf()
         return result
 
-    def get_entry_prices(self, tickers: list[str], start_date, end_date) -> pd.DataFrame:
+    def get_entry_prices(self, tickers: list[str], start_date: date, end_date: date) -> pd.DataFrame:
         if not tickers:
             return pd.DataFrame()
 
@@ -218,7 +222,7 @@ class Database:
                 close = EXCLUDED.close
         """)
 
-    def get_prices(self, tickers: list[str], start_date, end_date) -> pd.DataFrame:
+    def get_prices(self, tickers: list[str], start_date: date, end_date: date) -> pd.DataFrame:
         if not tickers:
             return pd.DataFrame()
 
@@ -239,7 +243,7 @@ class Database:
         pivot = result.pivot(index="date", columns="ticker", values="close")
         return pivot
 
-    def get_missing_price_data(self, tickers: list[str], start_date, end_date) -> tuple[list[str], pd.DatetimeIndex]:
+    def get_missing_price_data(self, tickers: list[str], start_date: date, end_date: date) -> tuple[list[str], pd.DatetimeIndex]:
         all_dates = pd.date_range(start_date, end_date, freq="B")
         existing = self.conn.execute(
             """

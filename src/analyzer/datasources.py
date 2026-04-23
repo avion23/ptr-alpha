@@ -1,40 +1,44 @@
+import asyncio
+import logging
+import os
+import zipfile
+from datetime import date, datetime
+from io import BytesIO
+from multiprocessing import Pool
+from pathlib import Path
+
+import aiohttp
+import camelot
+import pandas as pd
 import requests
 import requests_cache
 import yfinance as yf
-import zipfile
-import camelot
-import os
-import pathlib
-import logging
-import asyncio
-import aiohttp
-from datetime import datetime
-from io import BytesIO
-from multiprocessing import Pool
+
+from analyzer.database import Database
 from analyzer.exceptions import DataSourceError, ParsingError
+from analyzer.interfaces import PriceSource, TransactionSource
+from analyzer.settings import Settings
+from analyzer.models import DownloadResult, DownloadStatus, FilingType
 from analyzer.parsing import (
-    parse_pdf_table,
-    normalize_house_metadata,
     consolidate_transactions,
     extract_tables_with_ocr,
+    normalize_house_metadata,
+    parse_pdf_table,
 )
-from analyzer.models import DownloadResult, DownloadStatus, FilingType
-from analyzer.interfaces import TransactionSource, PriceSource
-from analyzer.database import Database
 
 logger = logging.getLogger(__name__)
 
 _cache_initialized = False
 
 
-def _ensure_request_cache():
+def _ensure_request_cache() -> None:
     global _cache_initialized
     if not _cache_initialized:
         requests_cache.install_cache("http_cache", backend="sqlite", expire_after=3600)
         _cache_initialized = True
 
 
-def _parse_pdf_worker(pdf_path):
+def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
     try:
         transactions = []
         tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
@@ -55,26 +59,26 @@ def _parse_pdf_worker(pdf_path):
 
 
 class HouseTransactionSource(TransactionSource):
-    def __init__(self, settings, read_only: bool = False):
+    def __init__(self, settings: Settings, read_only: bool = False):
         self.settings = settings
-        self.data_dir = pathlib.Path(settings.data.data_dir)
+        self.data_dir = Path(settings.data.data_dir)
         self.metadata_url_template = settings.sources.house_metadata_url
         self.pdf_url_template = settings.sources.house_pdf_url
         self.parallel_workers = settings.data.get_workers()
         _ensure_request_cache()
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
-    def close(self):
+    def close(self) -> None:
         self.db.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         self.close()
         return False
 
-    def get_transactions(self, year):
+    def get_transactions(self, year: int) -> pd.DataFrame:
         if not self.db.transactions_exist(year):
             raise DataSourceError(
                 f"No cached data found for {year}. Run 'insider-trading parse --year {year}' first."
@@ -84,7 +88,7 @@ class HouseTransactionSource(TransactionSource):
         logger.info(f"Loaded {len(df)} cached transactions for {year}")
         return df
 
-    def fetch_metadata(self, year, refresh=False):
+    def fetch_metadata(self, year: int, refresh: bool = False) -> pd.DataFrame:
         if not refresh and self.db.metadata_exists(year):
             logger.info(f"Loading cached metadata for {year}")
             return self.db.get_metadata(year)
@@ -190,10 +194,10 @@ class HouseTransactionSource(TransactionSource):
             f"PDF download complete: {downloaded} downloaded, {skipped} skipped, {failed} failed"
         )
 
-    def fetch_and_cache_pdfs(self, year):
+    def fetch_and_cache_pdfs(self, year: int) -> None:
         return asyncio.run(self._fetch_and_cache_pdfs_async(year))
 
-    def parse_cached_pdfs(self, year):
+    def parse_cached_pdfs(self, year: int) -> None:
         metadata = self.fetch_metadata(year)
         ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
         pdf_dir = self.data_dir / str(year) / "pdfs"
@@ -234,22 +238,22 @@ class HouseTransactionSource(TransactionSource):
 
 
 class YFinancePriceSource(PriceSource):
-    def __init__(self, settings, read_only: bool = False):
+    def __init__(self, settings: Settings, read_only: bool = False):
         self.settings = settings
-        self.data_dir = pathlib.Path(settings.data.data_dir)
+        self.data_dir = Path(settings.data.data_dir)
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
-    def close(self):
+    def close(self) -> None:
         self.db.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         self.close()
         return False
 
-    def get_prices(self, tickers, start, end):
+    def get_prices(self, tickers: list[str], start: date, end: date) -> pd.DataFrame:
         if len(tickers) == 0:
             raise DataSourceError("No tickers provided for price fetching")
 

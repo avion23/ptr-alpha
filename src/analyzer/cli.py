@@ -13,6 +13,7 @@ from analyzer.pipeline import (
     run_ticker_analysis,
     run_recent_ticker_scoring,
     AnalysisParams,
+    TickerScoringParams,
 )
 from analyzer.exceptions import AnalyzerError
 from analyzer.settings import Settings
@@ -101,15 +102,18 @@ def analyze(
     app_ctx = get_context(ctx, data_dir)
 
     if mode == "tickers":
+        params = TickerScoringParams(
+            year=year,
+            horizons=horizons,
+            threshold=threshold,
+            days_back=days_back,
+            min_buyers=min_buyers,
+            top_n=top_n,
+        )
         success = run_recent_ticker_scoring(
             app_ctx.transaction_source,
             app_ctx.price_source,
-            year,
-            horizons,
-            threshold,
-            days_back,
-            min_buyers,
-            top_n,
+            params,
         )
         raise typer.Exit(0 if success else 1)
 
@@ -252,15 +256,18 @@ def score_recent_tickers(
 ):
     """Score multi-buyer tickers from recent period"""
     app_ctx = get_context(ctx, data_dir)
+    params = TickerScoringParams(
+        year=year,
+        horizons=horizons,
+        threshold=threshold,
+        days_back=days_back,
+        min_buyers=min_buyers,
+        top_n=top_n,
+    )
     success = run_recent_ticker_scoring(
         app_ctx.transaction_source,
         app_ctx.price_source,
-        year,
-        horizons,
-        threshold,
-        days_back,
-        min_buyers,
-        top_n,
+        params,
     )
     raise typer.Exit(0 if success else 1)
 
@@ -313,10 +320,8 @@ def main():
         print("\nOperation cancelled by user", file=sys.stderr)
         raise typer.Exit(130)
     except Exception as e:
-        import traceback
-
-        print(f"Unexpected error: {e}", file=sys.stderr)
-        traceback.print_exc()
+        logger = logging.getLogger(__name__)
+        logger.exception(f"Unexpected error: {e}")
         raise typer.Exit(1)
 
 

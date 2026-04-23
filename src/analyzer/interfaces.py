@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+from datetime import date
+
 import pandas as pd
 
 
@@ -10,5 +12,5 @@ class TransactionSource(ABC):
 
 class PriceSource(ABC):
     @abstractmethod
-    def get_prices(self, tickers: list[str], start, end) -> pd.DataFrame:
+    def get_prices(self, tickers: list[str], start: date, end: date) -> pd.DataFrame:
         pass

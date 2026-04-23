@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from analyzer.models import TransactionType
 from analyzer.exceptions import AnalysisError
+from analyzer.models import TransactionType
 
 DECAY_LAMBDA = 0.05
 
@@ -276,6 +276,16 @@ def get_analysis_table(
     return _rank_members(signals_df, horizon, threshold)
 
 
+def _get_ticker_purchases(
+    ticker: str,
+    transactions_df: pd.DataFrame,
+) -> pd.DataFrame:
+    return transactions_df[
+        (transactions_df["ticker"] == ticker)
+        & (transactions_df["transaction_type"] == TransactionType.PURCHASE.value)
+    ]
+
+
 def score_ticker_by_buyers(
     ticker: str,
     transactions_df: pd.DataFrame,
@@ -292,10 +302,7 @@ def score_ticker_by_buyers(
     if member_rankings is None:
         member_rankings = rank_members(signals_df, horizon, threshold)
 
-    ticker_trades = transactions_df[
-        (transactions_df["ticker"] == ticker) &
-        (transactions_df["transaction_type"] == TransactionType.PURCHASE.value)
-    ]
+    ticker_trades = _get_ticker_purchases(ticker, transactions_df)
 
     if ticker_trades.empty:
         return pd.DataFrame({
@@ -351,10 +358,7 @@ def get_ticker_buyers_with_rankings(
 
     member_rankings = rank_members(signals_df, horizon, threshold)
 
-    ticker_trades = transactions_df[
-        (transactions_df["ticker"] == ticker) &
-        (transactions_df["transaction_type"] == TransactionType.PURCHASE.value)
-    ]
+    ticker_trades = _get_ticker_purchases(ticker, transactions_df)
 
     if ticker_trades.empty:
         raise AnalysisError(f"No purchases found for {ticker}")

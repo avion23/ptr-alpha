@@ -17,6 +17,7 @@ import yfinance as yf
 from analyzer.database import Database
 from analyzer.exceptions import DataSourceError, ParsingError
 from analyzer.interfaces import PriceSource, TransactionSource
+from analyzer.settings import Settings
 from analyzer.models import DownloadResult, DownloadStatus, FilingType
 from analyzer.parsing import (
     consolidate_transactions,
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 _cache_initialized = False
 
 
-def _ensure_request_cache():
+def _ensure_request_cache() -> None:
     global _cache_initialized
     if not _cache_initialized:
         requests_cache.install_cache("http_cache", backend="sqlite", expire_after=3600)
@@ -58,7 +59,7 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
 
 
 class HouseTransactionSource(TransactionSource):
-    def __init__(self, settings, read_only: bool = False):
+    def __init__(self, settings: Settings, read_only: bool = False):
         self.settings = settings
         self.data_dir = Path(settings.data.data_dir)
         self.metadata_url_template = settings.sources.house_metadata_url
@@ -67,13 +68,13 @@ class HouseTransactionSource(TransactionSource):
         _ensure_request_cache()
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
-    def close(self):
+    def close(self) -> None:
         self.db.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         self.close()
         return False
 
@@ -193,10 +194,10 @@ class HouseTransactionSource(TransactionSource):
             f"PDF download complete: {downloaded} downloaded, {skipped} skipped, {failed} failed"
         )
 
-    def fetch_and_cache_pdfs(self, year):
+    def fetch_and_cache_pdfs(self, year: int) -> None:
         return asyncio.run(self._fetch_and_cache_pdfs_async(year))
 
-    def parse_cached_pdfs(self, year):
+    def parse_cached_pdfs(self, year: int) -> None:
         metadata = self.fetch_metadata(year)
         ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
         pdf_dir = self.data_dir / str(year) / "pdfs"
@@ -237,18 +238,18 @@ class HouseTransactionSource(TransactionSource):
 
 
 class YFinancePriceSource(PriceSource):
-    def __init__(self, settings, read_only: bool = False):
+    def __init__(self, settings: Settings, read_only: bool = False):
         self.settings = settings
         self.data_dir = Path(settings.data.data_dir)
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
-    def close(self):
+    def close(self) -> None:
         self.db.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         self.close()
         return False
 

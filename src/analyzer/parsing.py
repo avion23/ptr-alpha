@@ -1,5 +1,6 @@
 import logging
 import re
+from pathlib import Path
 
 import pandas as pd
 
@@ -8,18 +9,18 @@ from analyzer.models import TransactionType
 
 logger = logging.getLogger(__name__)
 
-def clean_text(text):
+def clean_text(text: str | None) -> str:
     if text is None:
         return ""
     return re.sub(r'\s+', ' ', str(text)).strip()
 
-def _extract_ticker(asset_cell):
+def _extract_ticker(asset_cell: str | None) -> str | None:
     if not asset_cell:
         return None
     ticker_match = re.search(r'\(([A-Z][A-Z.\-]{1,5})\)', asset_cell)
     return ticker_match.group(1) if ticker_match else None
 
-def _extract_transaction_type(tx_type_cell):
+def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
     if not tx_type_cell:
         return None
     match tx_type_cell.strip().lower():
@@ -34,14 +35,14 @@ def _extract_transaction_type(tx_type_cell):
         case _:
             return None
 
-def _extract_date(date_cell):
+def _extract_date(date_cell: str | None) -> str | None:
     if not date_cell:
         return None
     # Support both MM/DD/YYYY and YYYY-MM-DD formats
     date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', date_cell)
     return date_match.group(1) if date_match else None
 
-def _process_row(row):
+def _process_row(row: list) -> dict | None:
     try:
         asset_cell = str(row[0])
         tx_type_cell = str(row[1])
@@ -61,14 +62,14 @@ def _process_row(row):
     except IndexError:
         return None
 
-def parse_pdf_table(table):
+def parse_pdf_table(table: list) -> list[dict]:
     if not table or len(table) < 2:
         return []
 
     return [tx for tx in (_process_row(row) for row in table[1:]) if tx]
 
 
-def normalize_house_metadata(content):
+def normalize_house_metadata(content: str) -> pd.DataFrame:
     if not content:
         raise ParsingError("Empty metadata content")
 
@@ -100,7 +101,7 @@ def normalize_house_metadata(content):
 
     return df
 
-def consolidate_transactions(pdf_transactions, member_metadata):
+def consolidate_transactions(pdf_transactions: dict[Path, list[dict]], member_metadata: dict[str, dict]) -> pd.DataFrame:
     if not pdf_transactions:
         return pd.DataFrame()
 
@@ -135,7 +136,7 @@ def consolidate_transactions(pdf_transactions, member_metadata):
     return df.dropna(subset=['transaction_date', 'disclosure_date'])
 
 
-def _parse_ocr_text_to_rows(text):
+def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
     rows = []
     lines = text.strip().split('\n')
 
@@ -193,7 +194,7 @@ def _parse_ocr_text_to_rows(text):
     return rows
 
 
-def extract_tables_with_ocr(pdf_path):
+def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
     try:
         from pdf2image import convert_from_path
         import pytesseract

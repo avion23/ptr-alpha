@@ -56,4 +56,5 @@ http_cache.sqlite
 *.db
 
 # User configuration
+config/
 config.toml

@@ -91,9 +91,9 @@ class TestAnalysis(unittest.TestCase):
 
         self.assertFalse(rankings.empty)
         self.assertTrue('member' in rankings.columns)
-        self.assertTrue('avg_peak_return_pct' in rankings.columns)
+        self.assertTrue('avg_purchase_return_pct' in rankings.columns)
 
-        returns = rankings['avg_peak_return_pct'].dropna()
+        returns = rankings['avg_purchase_return_pct'].dropna()
         self.assertTrue(len(returns) > 0)
 
     def test_rank_members_empty_input(self):

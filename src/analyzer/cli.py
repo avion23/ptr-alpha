@@ -101,6 +101,17 @@ def analyze(
     """
     app_ctx = get_context(ctx, data_dir)
 
+    if ticker:
+        success = run_ticker_analysis(
+            ticker,
+            app_ctx.transaction_source,
+            app_ctx.price_source,
+            year,
+            horizons[0],
+            threshold,
+        )
+        raise typer.Exit(0 if success else 1)
+
     if mode == "tickers":
         params = TickerScoringParams(
             year=year,
@@ -133,141 +144,6 @@ def analyze(
     data_path = Path(app_ctx.settings.data.data_dir)
     success = run_analysis_pipeline(
         params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
-    )
-    raise typer.Exit(0 if success else 1)
-
-
-@app.command("rank-members")
-def rank_members(
-    ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to process"),
-    source: str = typer.Option("house", help="Data source"),
-    horizons: list[int] = typer.Option([90], help="Time horizons in days"),
-    threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
-    top_n: int = typer.Option(20, help="Number of results to show"),
-    output: str = typer.Option("console", help="Output format: console or csv"),
-    data_dir: str = typer.Option("data", help="Data directory"),
-):
-    """Rank congressional members by trading performance"""
-    params = _get_analysis_params(source, year, horizons, threshold, None, top_n, False, output)
-    app_ctx = get_context(ctx, data_dir)
-    data_path = Path(app_ctx.settings.data.data_dir)
-    success = run_analysis_pipeline(
-        params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
-    )
-    raise typer.Exit(0 if success else 1)
-
-
-@app.command("rank-sales")
-def rank_sales(
-    ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to process"),
-    horizons: list[int] = typer.Option([90], help="Time horizons in days"),
-    top_n: int = typer.Option(20, help="Number of results to show"),
-    output: str = typer.Option("console", help="Output format: console or csv"),
-    data_dir: str = typer.Option("data", help="Data directory"),
-):
-    """Rank congressional members by loss avoidance (sale performance)"""
-    app_ctx = get_context(ctx, data_dir)
-    from analyzer.pipeline import _prepare_analysis_data
-    trades, prices, signals = _prepare_analysis_data(
-        app_ctx.transaction_source, app_ctx.price_source, year, horizons
-    )
-    result = analysis.rank_sales(signals, horizons[0])
-    _print_or_save(result.head(top_n), output, Path(app_ctx.settings.data.data_dir), "member_sales.csv")
-    raise typer.Exit(0)
-
-
-@app.command()
-def show_signals(
-    ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to process"),
-    source: str = typer.Option("house", help="Data source"),
-    horizons: list[int] = typer.Option([90], help="Time horizons in days"),
-    top_n: int = typer.Option(15, help="Number of results to show"),
-    output: str = typer.Option("console", help="Output format: console or csv"),
-    data_dir: str = typer.Option("data", help="Data directory"),
-):
-    """Show top trading signals"""
-    params = _get_analysis_params(source, year, horizons, 5.0, None, top_n, True, output)
-    app_ctx = get_context(ctx, data_dir)
-    data_path = Path(app_ctx.settings.data.data_dir)
-    success = run_analysis_pipeline(
-        params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
-    )
-    raise typer.Exit(0 if success else 1)
-
-
-@app.command()
-def show_member_signals(
-    ctx: typer.Context,
-    member: str = typer.Argument(..., help="Member name to analyze"),
-    year: int = typer.Option(2025, help="Year to process"),
-    source: str = typer.Option("house", help="Data source"),
-    horizons: list[int] = typer.Option([90], help="Time horizons in days"),
-    top_n: int = typer.Option(10, help="Number of results to show"),
-    output: str = typer.Option("console", help="Output format: console or csv"),
-    data_dir: str = typer.Option("data", help="Data directory"),
-):
-    """Show signals for a specific member"""
-    params = _get_analysis_params(source, year, horizons, 5.0, member, top_n, False, output)
-    app_ctx = get_context(ctx, data_dir)
-    data_path = Path(app_ctx.settings.data.data_dir)
-    success = run_analysis_pipeline(
-        params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
-    )
-    raise typer.Exit(0 if success else 1)
-
-
-@app.command()
-def analyze_ticker(
-    ctx: typer.Context,
-    ticker: str = typer.Argument(..., help="Ticker symbol to analyze"),
-    year: int = typer.Option(2025, help="Year to process"),
-    source: str = typer.Option("house", help="Data source"),
-    horizon: int = typer.Option(90, help="Time horizon in days"),
-    threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
-    data_dir: str = typer.Option("data", help="Data directory"),
-):
-    """Show all buyers of a ticker with rankings and signal score"""
-    app_ctx = get_context(ctx, data_dir)
-    success = run_ticker_analysis(
-        ticker,
-        app_ctx.transaction_source,
-        app_ctx.price_source,
-        year,
-        horizon,
-        threshold,
-    )
-    raise typer.Exit(0 if success else 1)
-
-
-@app.command()
-def score_recent_tickers(
-    ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to process"),
-    source: str = typer.Option("house", help="Data source"),
-    horizons: list[int] = typer.Option([90], help="Time horizons in days"),
-    threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
-    days_back: int = typer.Option(28, help="How many days back to analyze"),
-    min_buyers: int = typer.Option(2, help="Minimum number of buyers required"),
-    top_n: int = typer.Option(15, help="Number of top signals to show"),
-    data_dir: str = typer.Option("data", help="Data directory"),
-):
-    """Score multi-buyer tickers from recent period"""
-    app_ctx = get_context(ctx, data_dir)
-    params = TickerScoringParams(
-        year=year,
-        horizons=horizons,
-        threshold=threshold,
-        days_back=days_back,
-        min_buyers=min_buyers,
-        top_n=top_n,
-    )
-    success = run_recent_ticker_scoring(
-        app_ctx.transaction_source,
-        app_ctx.price_source,
-        params,
     )
     raise typer.Exit(0 if success else 1)
 

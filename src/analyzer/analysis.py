@@ -32,96 +32,67 @@ def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:
     return max(up_prob, 0.50)
 
 
+def _rank_by_signal(
+    signals_df: pd.DataFrame,
+    transaction_type: str,
+    metric_name: str,
+    horizon: int = 90,
+    threshold: float = 5.0,
+) -> pd.DataFrame:
+    filtered = _get_horizon_data(signals_df, horizon, transaction_type)
+    if filtered.empty:
+        raise AnalysisError(f"No {transaction_type} signals found for horizon {horizon}")
+
+    market_prior = _compute_dynamic_prior(signals_df, horizon)
+    member_stats = []
+
+    for member, grp in filtered.groupby("member"):
+        rets = grp["decayed_return_pct"].values
+        hit_rate = (grp["peak_potential_pct"] > threshold).mean() * 100 if transaction_type == TransactionType.PURCHASE.value else None
+
+        median_ret = np.median(rets)
+        mean_ret = np.mean(rets)
+        std_ret = np.std(rets) if len(rets) > 1 else 0.0
+        sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
+
+        wins = int((rets > 0).sum())
+        losses = int(len(rets) - wins)
+        p_up = wins / len(rets)
+        bayes_win_prob = bayesian_win_probability(wins, losses, market_prior)
+        bayes_factor = bayes_win_prob / market_prior
+
+        spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
+        avg_spy_alpha = np.mean(spy_alpha_vals) if len(spy_alpha_vals) > 0 else 0.0
+
+        stat = {
+            "member": member,
+            f"avg_{metric_name}_return_pct": round(mean_ret, 2),
+            f"median_{metric_name}_return_pct": round(median_ret, 2),
+            f"{metric_name}_trades": len(rets),
+            "sharpe_ratio": round(sharpe, 3),
+            "prob_up": round(p_up, 3),
+            "bayes_win_prob": round(bayes_win_prob, 3),
+            "bayes_factor": round(bayes_factor, 3),
+            "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
+        }
+        if hit_rate is not None:
+            stat["hit_rate_pct"] = round(hit_rate, 2)
+        member_stats.append(stat)
+
+    result = pd.DataFrame(member_stats)
+    if result.empty:
+        return result
+    return result.sort_values("avg_spy_alpha_pct", ascending=False)
+
+
 def _rank_members(
     signals_df: pd.DataFrame, horizon: int = 90, threshold: float = 5.0
 ) -> pd.DataFrame:
-    purchases = _get_horizon_data(signals_df, horizon, TransactionType.PURCHASE.value)
-    if purchases.empty:
-        raise AnalysisError(f"No purchase signals found for horizon {horizon}")
-
-    market_prior = _compute_dynamic_prior(signals_df, horizon)
-    member_stats = []
-
-    for member, grp in purchases.groupby("member"):
-        rets = grp["decayed_return_pct"].values
-        hit_rate = (grp["peak_potential_pct"] > threshold).mean() * 100
-
-        median_ret = np.median(rets)
-        mean_ret = np.mean(rets)
-        std_ret = np.std(rets) if len(rets) > 1 else 0.0
-        sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
-
-        wins = int((rets > 0).sum())
-        losses = int(len(rets) - wins)
-        p_up_given_buy = wins / len(rets)
-        bayes_win_prob = bayesian_win_probability(wins, losses, market_prior)
-        bayes_factor = bayes_win_prob / market_prior
-
-        spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
-        avg_spy_alpha = np.mean(spy_alpha_vals) if len(spy_alpha_vals) > 0 else 0.0
-
-        member_stats.append({
-            "member": member,
-            "avg_peak_return_pct": round(mean_ret, 2),
-            "median_peak_return_pct": round(median_ret, 2),
-            "hit_rate_pct": round(hit_rate, 2),
-            "purchase_trades": len(rets),
-            "sharpe_ratio": round(sharpe, 3),
-            "prob_up_given_buy": round(p_up_given_buy, 3),
-            "bayes_win_prob": round(bayes_win_prob, 3),
-            "bayes_factor": round(bayes_factor, 3),
-            "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
-        })
-
-    result = pd.DataFrame(member_stats)
-    if result.empty:
-        return result
-
-    return result.sort_values("avg_spy_alpha_pct", ascending=False)
+    return _rank_by_signal(signals_df, TransactionType.PURCHASE.value, "purchase", horizon, threshold)
 
 
 def _rank_sales(signals_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
-    sales = _get_horizon_data(signals_df, horizon, TransactionType.SALE.value)
-    if sales.empty:
-        raise AnalysisError(f"No sale signals found for horizon {horizon}")
-
-    market_prior = _compute_dynamic_prior(signals_df, horizon)
-    member_stats = []
-
-    for member, grp in sales.groupby("member"):
-        rets = grp["decayed_return_pct"].values
-
-        median_ret = np.median(rets)
-        mean_ret = np.mean(rets)
-        std_ret = np.std(rets) if len(rets) > 1 else 0.0
-        sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
-
-        p_up_given_sell = (rets > 0).sum() / len(rets)
-        wins = int((rets > 0).sum())
-        losses = int(len(rets) - wins)
-        bayes_win_prob = bayesian_win_probability(wins, losses, market_prior)
-        bayes_factor = bayes_win_prob / market_prior
-
-        spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
-        avg_spy_alpha = np.mean(spy_alpha_vals) if len(spy_alpha_vals) > 0 else 0.0
-
-        member_stats.append({
-            "member": member,
-            "avg_loss_avoided_pct": round(mean_ret, 2),
-            "median_loss_avoided_pct": round(median_ret, 2),
-            "sale_trades": len(rets),
-            "sharpe_ratio": round(sharpe, 3),
-            "prob_up_given_sell": round(p_up_given_sell, 3),
-            "bayes_win_prob": round(bayes_win_prob, 3),
-            "bayes_factor": round(bayes_factor, 3),
-            "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
-        })
-
-    result = pd.DataFrame(member_stats)
-    if result.empty:
-        return result
-
-    return result.sort_values("avg_spy_alpha_pct", ascending=False)
+    return _rank_by_signal(signals_df, TransactionType.SALE.value, "loss_avoided", horizon)
 
 
 def _get_top_signals(signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:

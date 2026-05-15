@@ -3,7 +3,7 @@ import pandas as pd
 from analyzer.parsing import (
     clean_text, _extract_ticker, _extract_date, _extract_transaction_type,
     parse_pdf_table, normalize_house_metadata, consolidate_transactions,
-    _extract_amount_midpoint, _extract_owner_code
+    _extract_amount_midpoint, _extract_owner_code, _parse_ocr_text_to_rows
 )
 from analyzer.exceptions import ParsingError
 
@@ -52,11 +52,32 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(_extract_owner_code('DC'), 'DC')
         self.assertIsNone(_extract_owner_code(''))
 
+    def test_extract_owner_code_normalizes_house_codes(self):
+        self.assertEqual(_extract_owner_code('Spouse'), 'SP')
+        self.assertEqual(_extract_owner_code('SP'), 'SP')
+        self.assertEqual(_extract_owner_code('Joint'), 'J')
+        self.assertEqual(_extract_owner_code('J'), 'J')
+        self.assertEqual(_extract_owner_code('Self'), 'S')
+        self.assertEqual(_extract_owner_code('S'), 'S')
+
+    def test_extract_owner_code_independent_not_dependent(self):
+        self.assertNotEqual(_extract_owner_code('Independent'), 'DC')
+
     def test_extract_amount_midpoint_range(self):
         amount_raw, amount_midpoint = _extract_amount_midpoint('$1,001 - $15,000')
 
         self.assertEqual(amount_raw, '$1,001 - $15,000')
         self.assertAlmostEqual(amount_midpoint, 8000.5)
+
+    def test_extract_amount_midpoint_no_dollar_sign(self):
+        amount_raw, amount_midpoint = _extract_amount_midpoint('1,001 - 15,000')
+        self.assertEqual(amount_raw, '1,001 - 15,000')
+        self.assertIsNone(amount_midpoint)
+
+    def test_extract_amount_midpoint_single_value(self):
+        amount_raw, amount_midpoint = _extract_amount_midpoint('$50,000')
+        self.assertEqual(amount_raw, '$50,000')
+        self.assertAlmostEqual(amount_midpoint, 50000.0)
 
     def test_parse_pdf_table_no_asset_column(self):
         table = [
@@ -196,6 +217,12 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(_extract_ticker("Apple Inc. (AAPL) extra (STUFF)"), "AAPL")
         self.assertEqual(_extract_ticker("Fund (ABC) Def (XYZ)"), "ABC")
 
+    def test_extract_ticker_single_letter(self):
+        self.assertEqual(_extract_ticker("Ford Motor (F)"), "F")
+        self.assertEqual(_extract_ticker("Citigroup (C)"), "C")
+        self.assertEqual(_extract_ticker("Visa Inc. (V)"), "V")
+        self.assertEqual(_extract_ticker("Kellanova (K)"), "K")
+
     def test_extract_date_mm_dd_yyyy(self):
         self.assertEqual(_extract_date("01/15/2024"), "01/15/2024")
         self.assertEqual(_extract_date("Transaction on 12/31/2023 confirmed"), "12/31/2023")
@@ -298,6 +325,38 @@ class TestParsing(unittest.TestCase):
         content += "001\tJohn\tDoe\tnotadate\n"
         with self.assertRaises(ParsingError):
             normalize_house_metadata(content)
+
+    def test_parse_pdf_table_single_letter_ticker(self):
+        table = [
+            ['Asset', 'Type', 'Date'],
+            ['Ford Motor Co (F)', 'Purchase', '01/15/2024'],
+            ['Visa Inc (V)', 'Sale', '01/16/2024']
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 2)
+        self.assertEqual(transactions[0]['ticker'], 'F')
+        self.assertEqual(transactions[1]['ticker'], 'V')
+
+    def test_parse_ocr_text_single_letter_ticker(self):
+        text = "Ford Motor Co (F) P 01/15/2024\nVisa Inc (V) S 01/16/2024\n"
+        rows = _parse_ocr_text_to_rows(text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][0], "Ford Motor Co (F)")
+        self.assertEqual(rows[1][0], "Visa Inc (V)")
+
+    def test_parse_pdf_table_owner_code_normalization(self):
+        table = [
+            ['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date'],
+            ['Apple Inc (AAPL)', 'Spouse', 'Purchase', '2024-01-01'],
+            ['Microsoft Corp (MSFT)', 'Joint', 'Sale', '2024-01-02'],
+            ['Ford Motor Co (F)', 'Self', 'Purchase', '2024-01-03'],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 3)
+        self.assertEqual(transactions[0]['owner_code'], 'SP')
+        self.assertEqual(transactions[1]['owner_code'], 'J')
+        self.assertEqual(transactions[2]['owner_code'], 'S')
+        self.assertEqual(transactions[2]['ticker'], 'F')
 
 if __name__ == '__main__':
     unittest.main()

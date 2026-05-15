@@ -67,7 +67,8 @@ class Database:
             )
         """)
         self._ensure_transaction_columns()
-        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique ON transactions(doc_id, ticker, transaction_date, member)")
+        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique ON transactions(doc_id, ticker, transaction_date, member, transaction_type)")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))"
         )
@@ -177,7 +178,7 @@ class Database:
             SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
                    owner_code, amount_raw, amount_midpoint, created_at
             FROM staging_transactions
-            ON CONFLICT (doc_id, ticker, transaction_date, member) DO UPDATE SET
+            ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type) DO UPDATE SET
                 transaction_type = EXCLUDED.transaction_type,
                 disclosure_date = EXCLUDED.disclosure_date,
                 owner_code = EXCLUDED.owner_code,

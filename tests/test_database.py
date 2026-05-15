@@ -213,6 +213,31 @@ class TestTransactions(unittest.TestCase):
     def test_transactions_exist_returns_false_when_absent(self):
         self.assertFalse(self.db.transactions_exist(2024))
 
+    def test_upsert_preserves_buy_and_sell_same_ticker_same_date(self):
+        df = pd.DataFrame([
+            {
+                "doc_id": "doc1",
+                "member": "John Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+            },
+            {
+                "doc_id": "doc1",
+                "member": "John Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Sale",
+            },
+        ])
+        self.db.upsert_transactions(df)
+        result = self.db.get_transactions(2024)
+        self.assertEqual(len(result), 2)
+        types = set(result["transaction_type"].values)
+        self.assertEqual(types, {"Purchase", "Sale"})
+
 
 class TestPrices(unittest.TestCase):
     def setUp(self):

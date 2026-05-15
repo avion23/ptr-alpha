@@ -17,7 +17,7 @@ def clean_text(text: str | None) -> str:
 def _extract_ticker(asset_cell: str | None) -> str | None:
     if not asset_cell:
         return None
-    ticker_match = re.search(r'\(([A-Z][A-Z.\-]{1,5})\)', asset_cell)
+    ticker_match = re.search(r'\(([A-Z][A-Z.\-]{0,5})\)', asset_cell)
     return ticker_match.group(1) if ticker_match else None
 
 def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
@@ -47,8 +47,16 @@ def _extract_owner_code(owner_cell: str | None) -> str | None:
     owner = clean_text(owner_cell).upper()
     if not owner:
         return None
-    if "DEPENDENT" in owner:
+    if owner.startswith("DEPENDENT"):
         return "DC"
+    if owner.startswith("SPOUSE"):
+        return "SP"
+    if owner.startswith("JOINT"):
+        return "J"
+    if owner.startswith("SELF"):
+        return "S"
+    if owner in ("DC", "SP", "J", "S"):
+        return owner
     return owner[:8]
 
 
@@ -56,7 +64,7 @@ def _extract_amount_midpoint(amount_cell: str | None) -> tuple[str | None, float
     amount = clean_text(amount_cell)
     if not amount:
         return None, None
-    values = [float(value.replace(",", "")) for value in re.findall(r"\$?([0-9][0-9,]*)", amount)]
+    values = [float(value.replace(",", "")) for value in re.findall(r'\$([0-9][0-9,]*)', amount)]
     if not values:
         return amount, None
     return amount, sum(values[:2]) / min(len(values), 2)
@@ -208,7 +216,7 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
         if not stripped:
             continue
 
-        ticker_match = re.search(r'\(([A-Z][A-Z0-9.\-]{1,5})\)', stripped)
+        ticker_match = re.search(r'\(([A-Z][A-Z0-9.\-]{0,5})\)', stripped)
 
         if ticker_match:
             asset_name = stripped[:ticker_match.end()].strip()

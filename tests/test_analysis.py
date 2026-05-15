@@ -2,7 +2,7 @@ import unittest
 import pandas as pd
 import numpy as np
 from analyzer.analysis import (
-    calculate_signal_potential, rank_members,
+    calculate_signal_potential, rank_members, rank_sales,
     get_top_signals, get_member_signals, get_analysis_table,
     score_ticker_by_buyers
 )
@@ -188,6 +188,95 @@ class TestAnalysis(unittest.TestCase):
 
         self.assertFalse(table.empty)
         self.assertTrue('member' in table.columns)
+
+    def test_score_ticker_by_buyers_uses_rated_buyers_not_all_buyers(self):
+        transactions = pd.DataFrame({
+            'member': ['Alice', 'Charlie', 'Unranked'],
+            'ticker': ['AAPL', 'AAPL', 'AAPL'],
+            'transaction_date': pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-03']),
+            'disclosure_date': pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-03']),
+            'transaction_type': ['Purchase', 'Purchase', 'Purchase'],
+        })
+        member_rankings = pd.DataFrame({
+            'member': ['Alice', 'Charlie'],
+            'avg_spy_alpha_pct': [10.0, 20.0],
+            'purchase_trades': [3, 2],
+        })
+        signals = pd.DataFrame({
+            'member': ['Alice', 'Charlie'],
+            'ticker': ['AAPL', 'AAPL'],
+            'signal_type': ['Purchase', 'Purchase'],
+            'horizon_days': [90, 90],
+            'decayed_return_pct': [10.0, 10.0],
+            'peak_potential_pct': [12.0, 12.0],
+            'spy_alpha_pct': [10.0, 10.0],
+        })
+
+        score = score_ticker_by_buyers('AAPL', transactions, signals, member_rankings=member_rankings)
+
+        avg_rank = (10.0 + 20.0) / 2.0
+        expected_base = 2 * avg_rank
+        inflated_base = 3 * avg_rank
+        self.assertEqual(score.iloc[0]['num_buyers'], 3)
+        self.assertEqual(score.iloc[0]['base_signal_score'], expected_base)
+        self.assertNotEqual(score.iloc[0]['base_signal_score'], inflated_base)
+
+    def test_rank_members_skips_members_with_all_nan_returns(self):
+        signals = pd.DataFrame({
+            'member': ['Alice', 'Bob'],
+            'ticker': ['AAPL', 'GOOGL'],
+            'signal_type': ['Purchase', 'Purchase'],
+            'horizon_days': [90, 90],
+            'decayed_return_pct': [10.0, float('nan')],
+            'peak_potential_pct': [12.0, float('nan')],
+            'spy_alpha_pct': [10.0, float('nan')],
+        })
+
+        rankings = rank_members(signals, horizon=90)
+
+        self.assertEqual(len(rankings), 1)
+        self.assertEqual(rankings.iloc[0]['member'], 'Alice')
+        self.assertFalse(np.isnan(rankings.iloc[0]['avg_peak_return_pct']))
+
+    def test_rank_sales_skips_members_with_all_nan_returns(self):
+        signals = pd.DataFrame({
+            'member': ['Alice', 'Bob'],
+            'ticker': ['AAPL', 'GOOGL'],
+            'signal_type': ['Sale', 'Sale'],
+            'horizon_days': [90, 90],
+            'decayed_return_pct': [5.0, float('nan')],
+            'peak_potential_pct': [8.0, float('nan')],
+            'spy_alpha_pct': [5.0, float('nan')],
+        })
+
+        rankings = rank_sales(signals, horizon=90)
+
+        self.assertEqual(len(rankings), 1)
+        self.assertEqual(rankings.iloc[0]['member'], 'Alice')
+        self.assertFalse(np.isnan(rankings.iloc[0]['avg_loss_avoided_pct']))
+
+    def test_sale_peak_potential_no_nan_with_valid_data(self):
+        transactions = pd.DataFrame({
+            'member': ['Alice'],
+            'ticker': ['AAPL'],
+            'disclosure_date': pd.to_datetime(['2024-01-15']),
+            'transaction_type': ['Sale'],
+            'owner_code': [None],
+            'amount_midpoint': [50000.0],
+        })
+
+        dates = pd.date_range('2023-12-15', '2024-02-15', freq='D')
+        np.random.seed(99)
+        prices = pd.DataFrame({
+            'AAPL': 100 + np.cumsum(np.random.randn(len(dates)) * 0.5),
+        }, index=dates)
+
+        entry_prices = _make_entry_prices(transactions, prices)
+        signals = calculate_signal_potential(entry_prices, prices, [90])
+
+        sales = signals[signals['signal_type'] == 'Sale']
+        self.assertEqual(len(sales), 1)
+        self.assertFalse(np.isnan(sales.iloc[0]['peak_potential_pct']))
 
 if __name__ == '__main__':
     unittest.main()

@@ -156,7 +156,7 @@ def calculate_signal_potential(
 
     is_purchase = final["transaction_type"] == TransactionType.PURCHASE.value
     purchase_mask = is_purchase & (final["entry_price"] != 0)
-    sale_mask = ~is_purchase & (final["trough_price"] != 0)
+    sale_mask = ~is_purchase & (final["trough_price"].notna()) & (final["trough_price"] != 0)
 
     peak_potential = np.zeros(len(final))
     peak_potential[purchase_mask.values] = (
@@ -192,7 +192,9 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
     member_stats = []
 
     for member, grp in purchases.groupby("member"):
-        rets = grp["decayed_return_pct"].values
+        rets = grp["decayed_return_pct"].dropna().values
+        if len(rets) == 0:
+            continue
         hit_rate = (grp["peak_potential_pct"] > threshold).mean() * 100
 
         median_ret = np.median(rets)
@@ -307,7 +309,8 @@ def score_ticker_by_buyers(
     avg_rank = buyer_stats["avg_spy_alpha_pct"].mean()
     max_rank = buyer_stats["avg_spy_alpha_pct"].max()
     total_trades = buyer_stats["purchase_trades"].sum()
-    base_signal_score = len(buyers) * avg_rank
+    rated_buyers = len(buyer_stats)
+    base_signal_score = rated_buyers * avg_rank
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
     signal_score = base_signal_score * size_factor * owner_factor
@@ -379,7 +382,9 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
     member_stats = []
 
     for member, grp in sales.groupby("member"):
-        rets = grp["decayed_return_pct"].values
+        rets = grp["decayed_return_pct"].dropna().values
+        if len(rets) == 0:
+            continue
 
         median_ret = np.median(rets)
         mean_ret = np.mean(rets)

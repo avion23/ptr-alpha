@@ -7,6 +7,7 @@ import pandas as pd
 
 from analyzer.pipeline import (
     AnalysisParams,
+    TickerAnalysisParams,
     TickerScoringParams,
     _prepare_analysis_data,
     _save_results,
@@ -81,6 +82,23 @@ class TestPipelineStep(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             bad_fn()
+
+
+class TestTickerAnalysisParams(unittest.TestCase):
+
+    def test_constructs_with_defaults(self):
+        p = TickerAnalysisParams(ticker="AAPL", year=2024)
+        self.assertEqual(p.ticker, "AAPL")
+        self.assertEqual(p.year, 2024)
+        self.assertEqual(p.horizon, 90)
+        self.assertEqual(p.threshold, 5.0)
+
+    def test_constructs_with_all_fields(self):
+        p = TickerAnalysisParams(ticker="GOOGL", year=2025, horizon=30, threshold=10.0)
+        self.assertEqual(p.ticker, "GOOGL")
+        self.assertEqual(p.year, 2025)
+        self.assertEqual(p.horizon, 30)
+        self.assertEqual(p.threshold, 10.0)
 
 
 class TestPrepareAnalysisData(unittest.TestCase):
@@ -225,6 +243,48 @@ class TestSaveResults(unittest.TestCase):
             saved = pd.read_csv(data_dir / "member_rankings.csv")
             self.assertIn("col_a", saved.columns)
             self.assertIn("col_b", saved.columns)
+
+    def test_sales_columns_included_in_display(self):
+        table = pd.DataFrame({
+            "member": ["Alice"],
+            "avg_loss_avoided_pct": [12.5],
+            "median_loss_avoided_pct": [10.0],
+            "sale_trades": [3],
+            "sharpe_ratio": [1.1],
+            "bayes_win_prob": [0.75],
+            "bayes_factor": [2.0],
+            "avg_spy_alpha_pct": [8.0],
+        })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _save_results(table, "csv", None, False, data_dir)
+
+            saved = pd.read_csv(data_dir / "member_rankings.csv")
+            self.assertIn("avg_loss_avoided_pct", saved.columns)
+            self.assertIn("median_loss_avoided_pct", saved.columns)
+            self.assertIn("sale_trades", saved.columns)
+            self.assertIn("avg_spy_alpha_pct", saved.columns)
+
+    def test_sales_columns_excluded_ranking_columns(self):
+        table = pd.DataFrame({
+            "member": ["Alice"],
+            "avg_loss_avoided_pct": [12.5],
+            "median_loss_avoided_pct": [10.0],
+            "sale_trades": [3],
+            "sharpe_ratio": [1.1],
+            "bayes_win_prob": [0.75],
+            "bayes_factor": [2.0],
+            "avg_spy_alpha_pct": [8.0],
+        })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _save_results(table, "csv", None, False, data_dir)
+
+            saved = pd.read_csv(data_dir / "member_rankings.csv")
+            self.assertNotIn("purchase_trades", saved.columns)
+            self.assertNotIn("hit_rate_pct", saved.columns)
 
 
 class TestAnalyzeBySector(unittest.TestCase):

@@ -202,6 +202,12 @@ def _save_results(
         display_cols = [
             'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct'
         ]
+    elif 'avg_loss_avoided_pct' in table.columns:
+        display_cols = [
+            'member', 'avg_loss_avoided_pct', 'median_loss_avoided_pct',
+            'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'bayes_factor',
+            'avg_spy_alpha_pct',
+        ]
     elif 'avg_spy_alpha_pct' in table.columns:
         display_cols = [
             'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'

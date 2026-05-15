@@ -14,6 +14,7 @@ from analyzer.pipeline import (
     run_ticker_analysis,
     run_recent_ticker_scoring,
     AnalysisParams,
+    TickerAnalysisParams,
     TickerScoringParams,
 )
 from analyzer.exceptions import AnalyzerError
@@ -89,13 +90,11 @@ def analyze(
     app_ctx = get_context(ctx, data_dir, read_only=False)
 
     if ticker:
+        params = TickerAnalysisParams(ticker=ticker, year=year, horizon=horizons[0], threshold=threshold)
         success = run_ticker_analysis(
-            ticker,
+            params,
             app_ctx.transaction_source,
             app_ctx.price_source,
-            year,
-            horizons[0],
-            threshold,
         )
         raise typer.Exit(0 if success else 1)
 

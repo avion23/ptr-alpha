@@ -60,9 +60,13 @@ class Database:
                 transaction_date DATE,
                 disclosure_date DATE,
                 transaction_type VARCHAR,
+                owner_code VARCHAR,
+                amount_raw VARCHAR,
+                amount_midpoint DOUBLE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self._ensure_transaction_columns()
         self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique ON transactions(doc_id, ticker, transaction_date, member)")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))"
@@ -97,6 +101,20 @@ class Database:
                 downloaded_at TIMESTAMP
             )
         """)
+
+    def _ensure_transaction_columns(self) -> None:
+        existing_columns = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info('transactions')").fetchall()
+        }
+        required_columns = {
+            "owner_code": "VARCHAR",
+            "amount_raw": "VARCHAR",
+            "amount_midpoint": "DOUBLE",
+        }
+        for column, column_type in required_columns.items():
+            if column not in existing_columns:
+                self.conn.execute(f"ALTER TABLE transactions ADD COLUMN {column} {column_type}")
 
     def upsert_metadata(self, df: pd.DataFrame) -> None:
         self.conn.execute("""
@@ -145,16 +163,26 @@ class Database:
 
     def upsert_transactions(self, df: pd.DataFrame) -> None:
         df = df.copy()
+        for column in ["owner_code", "amount_raw", "amount_midpoint"]:
+            if column not in df.columns:
+                df[column] = None
         df["created_at"] = datetime.now()
 
         self.conn.execute("CREATE TEMP TABLE staging_transactions AS SELECT * FROM df")
         self.conn.execute("""
-            INSERT INTO transactions (doc_id, member, ticker, transaction_date, disclosure_date, transaction_type, created_at)
-            SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type, created_at
+            INSERT INTO transactions (
+                doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                owner_code, amount_raw, amount_midpoint, created_at
+            )
+            SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                   owner_code, amount_raw, amount_midpoint, created_at
             FROM staging_transactions
             ON CONFLICT (doc_id, ticker, transaction_date, member) DO UPDATE SET
                 transaction_type = EXCLUDED.transaction_type,
                 disclosure_date = EXCLUDED.disclosure_date,
+                owner_code = EXCLUDED.owner_code,
+                amount_raw = EXCLUDED.amount_raw,
+                amount_midpoint = EXCLUDED.amount_midpoint,
                 created_at = EXCLUDED.created_at
         """)
         self.conn.execute("DROP TABLE staging_transactions")
@@ -162,7 +190,8 @@ class Database:
     def get_transactions(self, year: int) -> pd.DataFrame:
         result = self.conn.execute(
             """
-            SELECT member, ticker, transaction_date, disclosure_date, transaction_type
+            SELECT member, ticker, transaction_date, disclosure_date, transaction_type,
+                   owner_code, amount_raw, amount_midpoint
             FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
             ORDER BY disclosure_date DESC
@@ -178,7 +207,7 @@ class Database:
         result = self.conn.execute(
             """
             SELECT t.member, t.ticker, t.disclosure_date, t.transaction_type,
-                   p.close AS entry_price
+                   t.owner_code, t.amount_midpoint, p.close AS entry_price
             FROM transactions t
             ASOF JOIN prices p
               ON t.ticker = p.ticker

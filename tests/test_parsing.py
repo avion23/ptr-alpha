@@ -2,7 +2,8 @@ import unittest
 import pandas as pd
 from analyzer.parsing import (
     clean_text, _extract_ticker, _extract_date, _extract_transaction_type,
-    parse_pdf_table, normalize_house_metadata, consolidate_transactions
+    parse_pdf_table, normalize_house_metadata, consolidate_transactions,
+    _extract_amount_midpoint, _extract_owner_code
 )
 from analyzer.exceptions import ParsingError
 
@@ -29,6 +30,33 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(transactions[0]['transaction_type'], 'Purchase')
         self.assertEqual(transactions[1]['ticker'], 'GOOGL')
         self.assertEqual(transactions[1]['transaction_type'], 'Sale')
+
+    def test_parse_pdf_table_house_owner_and_amount_columns(self):
+        table = [
+            ['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date', 'Notification Date', 'Amount'],
+            ['TransDigm Group Incorporated (TDG)', 'Dependent Child', 'P', '04/16/2026', '05/06/2026', '$15,001 - $50,000'],
+            ['Packaging Corporation of America (PKG)', 'DC', 'Purchase', '04/24/2026', '05/06/2026', '$1,001 - $15,000'],
+        ]
+
+        transactions = parse_pdf_table(table)
+
+        self.assertEqual(len(transactions), 2)
+        self.assertEqual(transactions[0]['ticker'], 'TDG')
+        self.assertEqual(transactions[0]['owner_code'], 'DC')
+        self.assertEqual(transactions[0]['amount_raw'], '$15,001 - $50,000')
+        self.assertAlmostEqual(transactions[0]['amount_midpoint'], 32500.5)
+        self.assertEqual(transactions[1]['owner_code'], 'DC')
+
+    def test_extract_owner_code_dependent_child(self):
+        self.assertEqual(_extract_owner_code('Dependent Child'), 'DC')
+        self.assertEqual(_extract_owner_code('DC'), 'DC')
+        self.assertIsNone(_extract_owner_code(''))
+
+    def test_extract_amount_midpoint_range(self):
+        amount_raw, amount_midpoint = _extract_amount_midpoint('$1,001 - $15,000')
+
+        self.assertEqual(amount_raw, '$1,001 - $15,000')
+        self.assertAlmostEqual(amount_midpoint, 8000.5)
 
     def test_parse_pdf_table_no_asset_column(self):
         table = [
@@ -104,6 +132,29 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(df.iloc[0]['ticker'], 'AAPL')
         self.assertEqual(df.iloc[1]['member'], 'Jane Smith')
         self.assertEqual(df.iloc[1]['ticker'], 'GOOGL')
+
+    def test_consolidate_transactions_preserves_owner_and_amount(self):
+        from pathlib import Path
+
+        pdf_transactions = {
+            Path('12345.pdf'): [{
+                'ticker': 'PKG',
+                'transaction_type': 'Purchase',
+                'transaction_date': '2026-04-24',
+                'owner_code': 'DC',
+                'amount_raw': '$1,001 - $15,000',
+                'amount_midpoint': 8000.5,
+            }]
+        }
+        member_metadata = {
+            '12345': {'First': 'April', 'Last': 'Delaney', 'FilingDate': pd.to_datetime('2026-05-06')}
+        }
+
+        df = consolidate_transactions(pdf_transactions, member_metadata)
+
+        self.assertEqual(df.iloc[0]['owner_code'], 'DC')
+        self.assertEqual(df.iloc[0]['amount_raw'], '$1,001 - $15,000')
+        self.assertAlmostEqual(df.iloc[0]['amount_midpoint'], 8000.5)
 
     def test_consolidate_transactions_empty(self):
         df = consolidate_transactions({}, {})

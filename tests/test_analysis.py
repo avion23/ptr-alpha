@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 from analyzer.analysis import (
     calculate_signal_potential, rank_members,
-    get_top_signals, get_member_signals, get_analysis_table
+    get_top_signals, get_member_signals, get_analysis_table,
+    score_ticker_by_buyers
 )
 from analyzer.exceptions import AnalysisError
 
@@ -17,7 +18,8 @@ def _make_entry_prices(transactions_df, prices_df):
         trans_sorted, prices_long,
         left_on="disclosure_date", right_on="price_date", by="ticker"
     ).dropna(subset=["price"])
-    return merged[["member", "ticker", "disclosure_date", "transaction_type", "price"]].rename(
+    optional_columns = [column for column in ["owner_code", "amount_midpoint"] if column in merged.columns]
+    return merged[["member", "ticker", "disclosure_date", "transaction_type", "price", *optional_columns]].rename(
         columns={"price": "entry_price"}
     ).reset_index(drop=True)
 
@@ -29,7 +31,9 @@ class TestAnalysis(unittest.TestCase):
             'member': ['Alice', 'Bob', 'Alice', 'Charlie'],
             'ticker': ['AAPL', 'GOOGL', 'MSFT', 'AAPL'],
             'disclosure_date': pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-03', '2024-01-04']),
-            'transaction_type': ['Purchase', 'Sale', 'Purchase', 'Purchase']
+            'transaction_type': ['Purchase', 'Sale', 'Purchase', 'Purchase'],
+            'owner_code': [None, None, 'DC', None],
+            'amount_midpoint': [8000.5, 8000.5, 32500.5, 100000.0],
         })
 
         dates = pd.date_range('2023-12-15', '2024-02-15', freq='D')
@@ -54,9 +58,38 @@ class TestAnalysis(unittest.TestCase):
 
         self.assertTrue(all(h in [30, 90] for h in signals['horizon_days'].unique()))
         self.assertTrue(all(st in ['Purchase', 'Sale'] for st in signals['signal_type'].unique()))
+        self.assertIn('owner_code', signals.columns)
+        self.assertIn('amount_midpoint', signals.columns)
 
         self.assertFalse(signals['peak_potential_pct'].isna().any())
         self.assertTrue((signals['entry_price'] > 0).all())
+
+    def test_score_ticker_by_buyers_applies_small_metadata_adjustments(self):
+        transactions = pd.DataFrame({
+            'member': ['Alice', 'Charlie'],
+            'ticker': ['AAPL', 'AAPL'],
+            'transaction_date': pd.to_datetime(['2024-01-01', '2024-01-02']),
+            'disclosure_date': pd.to_datetime(['2024-01-03', '2024-01-04']),
+            'transaction_type': ['Purchase', 'Purchase'],
+            'owner_code': [None, 'DC'],
+            'amount_midpoint': [100000.0, 100000.0],
+        })
+        signals = pd.DataFrame({
+            'member': ['Alice', 'Charlie'],
+            'ticker': ['AAPL', 'AAPL'],
+            'signal_type': ['Purchase', 'Purchase'],
+            'horizon_days': [90, 90],
+            'decayed_return_pct': [10.0, 10.0],
+            'peak_potential_pct': [12.0, 12.0],
+            'spy_alpha_pct': [10.0, 10.0],
+        })
+
+        score = score_ticker_by_buyers('AAPL', transactions, signals)
+
+        self.assertEqual(score.iloc[0]['base_signal_score'], 20.0)
+        self.assertGreater(score.iloc[0]['size_factor'], 1.0)
+        self.assertLess(score.iloc[0]['owner_factor'], 1.0)
+        self.assertNotEqual(score.iloc[0]['signal_score'], score.iloc[0]['base_signal_score'])
 
     def test_calculate_signal_potential_empty_input(self):
         with self.assertRaises(AnalysisError):

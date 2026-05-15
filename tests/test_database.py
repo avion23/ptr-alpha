@@ -168,6 +168,9 @@ class TestTransactions(unittest.TestCase):
                 "transaction_date": date(2024, 3, 10),
                 "disclosure_date": date(2024, 3, 15),
                 "transaction_type": "Buy",
+                "owner_code": "DC",
+                "amount_raw": "$1,001 - $15,000",
+                "amount_midpoint": 8000.5,
             },
             {
                 "doc_id": "doc2",
@@ -176,13 +179,22 @@ class TestTransactions(unittest.TestCase):
                 "transaction_date": date(2024, 5, 5),
                 "disclosure_date": date(2024, 5, 10),
                 "transaction_type": "Sell",
+                "owner_code": None,
+                "amount_raw": "$15,001 - $50,000",
+                "amount_midpoint": 32500.5,
             },
         ])
         self.db.upsert_transactions(df)
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2)
-        cols = {"member", "ticker", "transaction_date", "disclosure_date", "transaction_type"}
+        cols = {
+            "member", "ticker", "transaction_date", "disclosure_date", "transaction_type",
+            "owner_code", "amount_raw", "amount_midpoint",
+        }
         self.assertTrue(cols.issubset(set(result.columns)))
+        aapl = result[result["ticker"] == "AAPL"].iloc[0]
+        self.assertEqual(aapl["owner_code"], "DC")
+        self.assertAlmostEqual(aapl["amount_midpoint"], 8000.5)
 
     def test_transactions_exist_returns_true_when_present(self):
         df = pd.DataFrame([
@@ -326,6 +338,8 @@ class TestGetEntryPrices(unittest.TestCase):
                 "transaction_date": date(2024, 1, 5),
                 "disclosure_date": date(2024, 1, 5),
                 "transaction_type": "Buy",
+                "owner_code": "DC",
+                "amount_midpoint": 8000.5,
             },
         ])
         self.db.upsert_transactions(tx)
@@ -338,6 +352,8 @@ class TestGetEntryPrices(unittest.TestCase):
         idx_5 = list(dates).index(disclosure_jan5)
         expected_price = aapl_prices[idx_5]
         self.assertAlmostEqual(result.iloc[0]["entry_price"], expected_price)
+        self.assertEqual(result.iloc[0]["owner_code"], "DC")
+        self.assertAlmostEqual(result.iloc[0]["amount_midpoint"], 8000.5)
 
     def test_asof_join_returns_prior_price_when_no_exact_match(self):
         dates = pd.bdate_range("2024-01-01", "2024-01-04")

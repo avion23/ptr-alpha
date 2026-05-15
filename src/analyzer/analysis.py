@@ -7,6 +7,8 @@ from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
 
 DECAY_LAMBDA = 0.05
+POSITION_SIZE_BASELINE = 15000.0
+MAX_DISCLOSURE_METADATA_ADJUSTMENT = 0.05
 
 
 def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
@@ -30,6 +32,28 @@ def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:
         return 0.50
     up_prob = (horizon_signals["decayed_return_pct"] > 0).mean()
     return max(up_prob, 0.50)
+
+
+def _size_score_factor(trades: pd.DataFrame) -> float:
+    if "amount_midpoint" not in trades.columns:
+        return 1.0
+    amount = trades["amount_midpoint"].dropna()
+    if amount.empty:
+        return 1.0
+    average_amount = max(float(amount.mean()), 1.0)
+    adjustment = np.log10(average_amount / POSITION_SIZE_BASELINE) * 0.025
+    adjustment = float(np.clip(adjustment, -MAX_DISCLOSURE_METADATA_ADJUSTMENT, MAX_DISCLOSURE_METADATA_ADJUSTMENT))
+    return 1.0 + adjustment
+
+
+def _owner_score_factor(trades: pd.DataFrame) -> float:
+    if "owner_code" not in trades.columns:
+        return 1.0
+    owner_codes = trades["owner_code"].fillna("").astype(str).str.upper()
+    if owner_codes.empty:
+        return 1.0
+    dependent_child_ratio = (owner_codes == "DC").mean()
+    return 1.0 - dependent_child_ratio * MAX_DISCLOSURE_METADATA_ADJUSTMENT
 
 
 
@@ -142,14 +166,19 @@ def calculate_signal_potential(
         (final.loc[sale_mask.values, "entry_price"] / final.loc[sale_mask.values, "trough_price"] - 1) * 100
     ).values
 
+    optional_columns = [column for column in ["owner_code", "amount_midpoint"] if column in final.columns]
+    result_columns = [
+        "member", "ticker", "disclosure_date", "signal_type", "horizon_days", "entry_price",
+        "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct", "total_return_pct", *optional_columns,
+    ]
+
     return final.assign(
         signal_type=final["transaction_type"],
         peak_potential_pct=peak_potential,
         decayed_return_pct=final["decayed_return"].fillna(0).values * 100,
         spy_alpha_pct=(final["decayed_return"].fillna(0) - final["spy_cumulative"].fillna(0)).values * 100,
         total_return_pct=final["total_return"].fillna(0).values * 100,
-    )[["member", "ticker", "disclosure_date", "signal_type", "horizon_days", "entry_price",
-       "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct", "total_return_pct"]]
+    )[result_columns]
 
 
 def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 5.0) -> pd.DataFrame:
@@ -278,7 +307,10 @@ def score_ticker_by_buyers(
     avg_rank = buyer_stats["avg_spy_alpha_pct"].mean()
     max_rank = buyer_stats["avg_spy_alpha_pct"].max()
     total_trades = buyer_stats["purchase_trades"].sum()
-    signal_score = len(buyers) * avg_rank
+    base_signal_score = len(buyers) * avg_rank
+    size_factor = _size_score_factor(ticker_trades)
+    owner_factor = _owner_score_factor(ticker_trades)
+    signal_score = base_signal_score * size_factor * owner_factor
 
     top_buyers = buyer_stats["member"].head(3).tolist()
     buyer_label = f"Top {len(top_buyers)} of {len(buyers)}" if len(buyers) > 3 else f"{len(buyers)}"
@@ -291,6 +323,9 @@ def score_ticker_by_buyers(
         "avg_buyer_performance": [round(avg_rank, 2)],
         "best_buyer_performance": [round(max_rank, 2)],
         "total_buyer_trades": [int(total_trades)],
+        "base_signal_score": [round(base_signal_score, 2)],
+        "size_factor": [round(size_factor, 3)],
+        "owner_factor": [round(owner_factor, 3)],
         "signal_score": [round(signal_score, 2)]
     })
 

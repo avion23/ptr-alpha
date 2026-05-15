@@ -42,21 +42,78 @@ def _extract_date(date_cell: str | None) -> str | None:
     date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', date_cell)
     return date_match.group(1) if date_match else None
 
-def _process_row(row: list) -> dict | None:
+
+def _extract_owner_code(owner_cell: str | None) -> str | None:
+    owner = clean_text(owner_cell).upper()
+    if not owner:
+        return None
+    if "DEPENDENT" in owner:
+        return "DC"
+    return owner[:8]
+
+
+def _extract_amount_midpoint(amount_cell: str | None) -> tuple[str | None, float | None]:
+    amount = clean_text(amount_cell)
+    if not amount:
+        return None, None
+    values = [float(value.replace(",", "")) for value in re.findall(r"\$?([0-9][0-9,]*)", amount)]
+    if not values:
+        return amount, None
+    return amount, sum(values[:2]) / min(len(values), 2)
+
+
+def _normalize_header(header: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", clean_text(header).lower())
+
+
+def _column_index(headers: list[str], candidates: set[str]) -> int | None:
+    for idx, header in enumerate(headers):
+        normalized = _normalize_header(header)
+        if normalized in candidates:
+            return idx
+    return None
+
+
+def _column_indexes(header: list) -> dict[str, int]:
+    headers = [str(cell) for cell in header]
+    indexes = {
+        "asset": _column_index(headers, {"asset", "assetname", "description"}),
+        "owner": _column_index(headers, {"owner", "ownership"}),
+        "type": _column_index(headers, {"type", "transactiontype", "txtype"}),
+        "date": _column_index(headers, {"date", "transactiondate"}),
+        "amount": _column_index(headers, {"amount", "transactionamount"}),
+    }
+    if indexes["asset"] is None or indexes["type"] is None or indexes["date"] is None:
+        return {"asset": 0, "type": 1, "date": 2}
+    return indexes
+
+
+def _get_cell(row: list, index: int | None) -> str | None:
+    if index is None or index >= len(row):
+        return None
+    return str(row[index])
+
+
+def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | None:
     try:
-        asset_cell = str(row[0])
-        tx_type_cell = str(row[1])
-        date_cell = str(row[2])
+        indexes = indexes or {"asset": 0, "type": 1, "date": 2}
+        asset_cell = _get_cell(row, indexes.get("asset"))
+        tx_type_cell = _get_cell(row, indexes.get("type"))
+        date_cell = _get_cell(row, indexes.get("date"))
 
         ticker = _extract_ticker(asset_cell)
         tx_type = _extract_transaction_type(tx_type_cell)
         tx_date = _extract_date(date_cell)
 
         if ticker and tx_type and tx_date:
+            amount_raw, amount_midpoint = _extract_amount_midpoint(_get_cell(row, indexes.get("amount")))
             return {
                 'ticker': ticker,
                 'transaction_type': tx_type,
                 'transaction_date': tx_date,
+                'owner_code': _extract_owner_code(_get_cell(row, indexes.get("owner"))),
+                'amount_raw': amount_raw,
+                'amount_midpoint': amount_midpoint,
             }
         return None
     except IndexError:
@@ -66,7 +123,8 @@ def parse_pdf_table(table: list) -> list[dict]:
     if not table or len(table) < 2:
         return []
 
-    return [tx for tx in (_process_row(row) for row in table[1:]) if tx]
+    indexes = _column_indexes(table[0])
+    return [tx for tx in (_process_row(row, indexes) for row in table[1:]) if tx]
 
 
 def normalize_house_metadata(content: str) -> pd.DataFrame:
@@ -124,6 +182,9 @@ def consolidate_transactions(pdf_transactions: dict[Path, list[dict]], member_me
                 'disclosure_date': member_info['FilingDate'],
                 'ticker': tx['ticker'],
                 'transaction_type': tx['transaction_type'],
+                'owner_code': tx.get('owner_code'),
+                'amount_raw': tx.get('amount_raw'),
+                'amount_midpoint': tx.get('amount_midpoint'),
             })
 
     if not all_transactions:

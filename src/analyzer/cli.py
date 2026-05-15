@@ -14,7 +14,6 @@ from analyzer.pipeline import (
     run_ticker_analysis,
     run_recent_ticker_scoring,
     AnalysisParams,
-    TickerAnalysisParams,
     TickerScoringParams,
 )
 from analyzer.exceptions import AnalyzerError

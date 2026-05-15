@@ -10,15 +10,16 @@ from analyzer.pipeline import (
     run_fetch_pipeline,
     run_parse_pipeline,
     run_analysis_pipeline,
+    run_sales_pipeline,
     run_ticker_analysis,
     run_recent_ticker_scoring,
     AnalysisParams,
+    TickerAnalysisParams,
     TickerScoringParams,
 )
 from analyzer.exceptions import AnalyzerError
 from analyzer.settings import Settings
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
-from analyzer import analysis
 
 app = typer.Typer(help="Congressional insider trading analyzer", no_args_is_help=True)
 
@@ -37,7 +38,7 @@ def setup_logging(verbose):
     )
 
 
-def get_context(ctx, data_dir=None, read_only=True):
+def get_context(ctx, data_dir=None, read_only=False):
     if ctx.obj is None:
         settings = Settings()
         if data_dir and data_dir != "data":
@@ -48,19 +49,6 @@ def get_context(ctx, data_dir=None, read_only=True):
             price_source=YFinancePriceSource(settings, read_only=read_only),
         )
     return ctx.obj
-
-
-def _get_analysis_params(
-    source: str,
-    year: int,
-    horizons: list[int],
-    threshold: float,
-    member: str | None,
-    top_n: int | None,
-    show_signals: bool,
-    output: str,
-) -> AnalysisParams:
-    return AnalysisParams(source, year, horizons, threshold, member, top_n, show_signals, output)
 
 
 @app.callback()
@@ -99,7 +87,7 @@ def analyze(
       sales    - Rank members by loss avoidance (sale performance)
       tickers  - Score multi-buyer tickers from recent period
     """
-    app_ctx = get_context(ctx, data_dir)
+    app_ctx = get_context(ctx, data_dir, read_only=False)
 
     if ticker:
         success = run_ticker_analysis(
@@ -129,23 +117,21 @@ def analyze(
         raise typer.Exit(0 if success else 1)
 
     if mode == "sales":
-        from analyzer.pipeline import _prepare_analysis_data
-        trades, prices, signals = _prepare_analysis_data(
-            app_ctx.transaction_source, app_ctx.price_source, year, horizons
+        data_path = Path(app_ctx.settings.data.data_dir)
+        success = run_sales_pipeline(
+            year, horizons, top_n,
+            app_ctx.transaction_source, app_ctx.price_source, data_path, output
         )
-        result = analysis.rank_sales(signals, horizons[0])
-        _print_or_save(result, output, data_dir, "member_sales.csv")
-        raise typer.Exit(0)
+        raise typer.Exit(0 if success else 1)
 
     show_signals = mode == "signals"
-    params = _get_analysis_params(
-        source, year, horizons, threshold, member, top_n, show_signals, output
-    )
+    params = AnalysisParams(source, year, horizons, threshold, member, top_n, show_signals)
     data_path = Path(app_ctx.settings.data.data_dir)
     success = run_analysis_pipeline(
         params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
     )
     raise typer.Exit(0 if success else 1)
+
 
 
 @app.command()
@@ -173,17 +159,6 @@ def parse(
     app_ctx = get_context(ctx, data_dir, read_only=False)
     success = run_parse_pipeline(app_ctx.transaction_source, year)
     raise typer.Exit(0 if success else 1)
-
-
-def _print_or_save(df, output_format, data_dir, filename):
-    if output_format == "csv":
-        filepath = Path(data_dir) / filename
-        import os
-        os.makedirs(data_dir, exist_ok=True)
-        df.to_csv(filepath, index=False)
-        print(f"Results saved to {filepath}")
-    else:
-        print(df.to_string(index=False))
 
 
 def main():

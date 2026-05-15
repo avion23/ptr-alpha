@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from analyzer.exceptions import AnalyzerError, DataSourceError
+from analyzer.exceptions import AnalyzerError, DataSourceError, AnalysisError
 from analyzer.models import TransactionType
 from analyzer import analysis
 
@@ -31,7 +31,7 @@ def _load_sector_data(tickers: list[str]) -> pd.DataFrame:
     def fetch_sector(ticker):
         try:
             return ticker, yf.Ticker(ticker).info.get("sector", "Unknown")
-        except Exception:
+        except (OSError, ValueError, KeyError):
             return ticker, "Unknown"
 
     records = []
@@ -54,11 +54,6 @@ class AnalysisParams:
     member_filter: str | None = None
     top_n: int | None = None
     show_signals: bool = False
-    output_format: str = 'console'
-
-    @property
-    def output(self) -> str:
-        return self.output_format
 
 
 @dataclass
@@ -70,13 +65,20 @@ class TickerScoringParams:
     min_buyers: int = 2
     top_n: int = 15
 
+
+@dataclass
+class TickerAnalysisParams:
+    ticker: str
+    year: int
+    horizon: int = 90
+    threshold: float = 5.0
+
 def pipeline_step(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except AnalyzerError as e:
-            logger.error(f"{func.__name__} failed: {e}")
+        except AnalyzerError:
             return False
     return wrapper
 
@@ -134,15 +136,27 @@ def run_analysis_pipeline(
     return True
 
 @pipeline_step
-def run_ticker_analysis(
-    ticker: str, transaction_source, price_source, year: int, horizon: int, threshold: float
+def run_sales_pipeline(
+    year: int, horizons: list[int], top_n: int,
+    transaction_source, price_source, data_dir: Path, output_format: str
 ) -> bool:
-    trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, year, [horizon])
+    trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, year, horizons)
+    result = analysis.rank_sales(signals, horizons[0])
+    result = result.head(top_n)
+    _save_results(result, output_format, member_filter=None, show_signals=False, data_dir=data_dir)
+    return True
 
-    buyers = analysis.get_ticker_buyers_with_rankings(ticker, trades, signals, horizon, threshold)
-    score = analysis.score_ticker_by_buyers(ticker, trades, signals, horizon, threshold)
 
-    print(f"\n=== Buyers of {ticker} ===")
+@pipeline_step
+def run_ticker_analysis(
+    params: TickerAnalysisParams, transaction_source, price_source
+) -> bool:
+    trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, params.year, [params.horizon])
+
+    buyers = analysis.get_ticker_buyers_with_rankings(params.ticker, trades, signals, params.horizon, params.threshold)
+    score = analysis.score_ticker_by_buyers(params.ticker, trades, signals, params.horizon, params.threshold)
+
+    print(f"\n=== Buyers of {params.ticker} ===")
     print(buyers.to_string(index=False))
     print("\n=== Signal Score ===")
     print(score.to_string(index=False))
@@ -233,7 +247,7 @@ def _analyze_by_sector(
         if len(sector_purchases) < 3:
             continue
         try:
-            ranked = analysis._rank_members(sector_purchases, horizons[0])
+            ranked = analysis.rank_members(sector_purchases, horizons[0])
             if not ranked.empty:
                 results.append({
                     "sector": sector,
@@ -242,7 +256,8 @@ def _analyze_by_sector(
                     "num_trades": len(sector_purchases),
                     "num_members": sector_purchases["member"].nunique(),
                 })
-        except analysis.AnalysisError:
+        except AnalysisError as e:
+            logger.warning(f"Skipping sector '{sector}' analysis: {e}")
             continue
 
     if not results:

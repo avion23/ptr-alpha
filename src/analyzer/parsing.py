@@ -204,7 +204,7 @@ def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
 
     try:
         images = convert_from_path(str(pdf_path), dpi=200)
-    except Exception as e:
+    except (OSError, ValueError) as e:
         logger.warning(f"Failed to convert PDF to images for OCR {pdf_path}: {e}")
         return []
 

@@ -243,7 +243,7 @@ class Database:
         pivot = result.pivot(index="date", columns="ticker", values="close")
         return pivot
 
-    def get_missing_price_data(self, tickers: list[str], start_date: date, end_date: date) -> tuple[list[str], pd.DatetimeIndex]:
+    def get_missing_price_data(self, tickers: list[str], start_date: date, end_date: date) -> tuple[list[str], list[pd.Timestamp]]:
         all_dates = pd.date_range(start_date, end_date, freq="B")
         existing = self.conn.execute(
             """
@@ -256,7 +256,7 @@ class Database:
         ).fetchdf()
 
         if existing.empty:
-            return tickers, all_dates
+            return tickers, all_dates.to_list()
 
         existing_tickers = set(existing["ticker"].unique())
         missing_tickers = [t for t in tickers if t not in existing_tickers]
@@ -266,7 +266,7 @@ class Database:
             missing_dates = [d for d in all_dates if d not in existing_dates]
             return [], missing_dates
 
-        return missing_tickers, all_dates
+        return missing_tickers, all_dates.to_list()
 
     def close(self) -> None:
         self.conn.close()

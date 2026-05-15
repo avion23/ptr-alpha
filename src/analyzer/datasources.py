@@ -28,15 +28,6 @@ from analyzer.parsing import (
 
 logger = logging.getLogger(__name__)
 
-_cache_initialized = False
-
-
-def _ensure_request_cache() -> None:
-    global _cache_initialized
-    if not _cache_initialized:
-        requests_cache.install_cache("http_cache", backend="sqlite", expire_after=3600)
-        _cache_initialized = True
-
 
 def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
     try:
@@ -53,8 +44,11 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
             for table in ocr_tables:
                 transactions.extend(parse_pdf_table(table))
         return pdf_path, transactions
-    except Exception as e:
+    except ParsingError as e:
         logger.warning(f"Failed to parse PDF {pdf_path}: {e}")
+        return pdf_path, []
+    except Exception as e:
+        logger.error(f"Unexpected error parsing PDF {pdf_path}: {e}", exc_info=True)
         return pdf_path, []
 
 
@@ -65,7 +59,7 @@ class HouseTransactionSource(TransactionSource):
         self.metadata_url_template = settings.sources.house_metadata_url
         self.pdf_url_template = settings.sources.house_pdf_url
         self.parallel_workers = settings.data.get_workers()
-        _ensure_request_cache()
+        requests_cache.install_cache("http_cache", backend="sqlite", expire_after=3600)
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
     def close(self) -> None:

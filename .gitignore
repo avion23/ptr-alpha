@@ -50,6 +50,10 @@ member_rankings.csv
 top_signals.csv
 recent_*.csv
 
+# Desloppify tool state
+.desloppify/
+scorecard.png
+
 # Cache files
 http_cache.sqlite
 *.sqlite

@@ -23,11 +23,12 @@ class TestAnalysisParams(unittest.TestCase):
         self.assertIsNone(p.member_filter)
         self.assertIsNone(p.top_n)
         self.assertFalse(p.show_signals)
-        self.assertEqual(p.output_format, "console")
 
-    def test_output_property(self):
-        p = AnalysisParams(source="house", year=2024, horizons=[90], threshold=5.0, output_format="csv")
-        self.assertEqual(p.output, "csv")
+    def test_with_all_params(self):
+        p = AnalysisParams(source="house", year=2024, horizons=[90], threshold=5.0, member_filter="test", top_n=10, show_signals=True)
+        self.assertEqual(p.member_filter, "test")
+        self.assertEqual(p.top_n, 10)
+        self.assertTrue(p.show_signals)
 
 
 class TestTickerScoringParams(unittest.TestCase):
@@ -228,7 +229,7 @@ class TestSaveResults(unittest.TestCase):
 
 class TestAnalyzeBySector(unittest.TestCase):
 
-    @patch("analyzer.pipeline.analysis._rank_members")
+    @patch("analyzer.pipeline.analysis.rank_members")
     @patch("analyzer.pipeline._load_sector_data")
     def test_returns_dataframe_with_sectors(self, mock_load_sector, mock_rank):
         mock_load_sector.return_value = pd.DataFrame({

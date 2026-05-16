@@ -8,20 +8,7 @@ from analyzer.analysis import (
 )
 from analyzer.exceptions import AnalysisError
 
-
-def _make_entry_prices(transactions_df, prices_df):
-    prices_long = prices_df.stack().reset_index(name="price")
-    prices_long.columns = ["price_date", "ticker", "price"]
-    prices_long = prices_long.sort_values("price_date")
-    trans_sorted = transactions_df.sort_values("disclosure_date")
-    merged = pd.merge_asof(
-        trans_sorted, prices_long,
-        left_on="disclosure_date", right_on="price_date", by="ticker"
-    ).dropna(subset=["price"])
-    optional_columns = [column for column in ["owner_code", "amount_midpoint"] if column in merged.columns]
-    return merged[["member", "ticker", "disclosure_date", "transaction_type", "price", *optional_columns]].rename(
-        columns={"price": "entry_price"}
-    ).reset_index(drop=True)
+from .conftest import make_entry_prices
 
 
 class TestAnalysis(unittest.TestCase):
@@ -44,7 +31,7 @@ class TestAnalysis(unittest.TestCase):
             'MSFT': 300 + np.cumsum(np.random.randn(len(dates)) * 1)
         }, index=dates)
 
-        self.entry_prices = _make_entry_prices(self.sample_transactions, self.sample_prices)
+        self.entry_prices = make_entry_prices(self.sample_transactions, self.sample_prices)
 
     def test_calculate_signal_potential_basic(self):
         signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [30, 90])
@@ -271,7 +258,7 @@ class TestAnalysis(unittest.TestCase):
             'AAPL': 100 + np.cumsum(np.random.randn(len(dates)) * 0.5),
         }, index=dates)
 
-        entry_prices = _make_entry_prices(transactions, prices)
+        entry_prices = make_entry_prices(transactions, prices)
         signals = calculate_signal_potential(entry_prices, prices, [90])
 
         sales = signals[signals['signal_type'] == 'Sale']

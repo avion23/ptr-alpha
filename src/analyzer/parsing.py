@@ -82,7 +82,7 @@ def _column_index(headers: list[str], candidates: set[str]) -> int | None:
     return None
 
 
-def _column_indexes(header: list) -> dict[str, int]:
+def _column_indexes(header: list[str]) -> dict[str, int]:
     headers = [str(cell) for cell in header]
     indexes = {
         "asset": _column_index(headers, {"asset", "assetname", "description"}),

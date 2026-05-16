@@ -1,5 +1,3 @@
-import shutil
-import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
@@ -8,17 +6,10 @@ import duckdb
 import pandas as pd
 
 from analyzer.database import Database
+from .conftest import DatabaseTestCase
 
 
-class TestDatabaseSchema(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-        self.db_path = Path(self.tmp_dir) / "test.duckdb"
-        self.db = Database(self.db_path)
-
-    def tearDown(self):
-        self.db.close()
-        shutil.rmtree(self.tmp_dir)
+class TestDatabaseSchema(DatabaseTestCase):
 
     def test_tables_created_on_init(self):
         tables = self.db.conn.execute(
@@ -38,15 +29,7 @@ class TestDatabaseSchema(unittest.TestCase):
         self.assertIn("idx_tx_unique", index_names)
 
 
-class TestMetadata(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-        self.db_path = Path(self.tmp_dir) / "test.duckdb"
-        self.db = Database(self.db_path)
-
-    def tearDown(self):
-        self.db.close()
-        shutil.rmtree(self.tmp_dir)
+class TestMetadata(DatabaseTestCase):
 
     def test_upsert_and_get_metadata_round_trip(self):
         df = pd.DataFrame([
@@ -149,15 +132,7 @@ class TestMetadata(unittest.TestCase):
         self.assertTrue(self.db.metadata_exists(2023))
 
 
-class TestTransactions(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-        self.db_path = Path(self.tmp_dir) / "test.duckdb"
-        self.db = Database(self.db_path)
-
-    def tearDown(self):
-        self.db.close()
-        shutil.rmtree(self.tmp_dir)
+class TestTransactions(DatabaseTestCase):
 
     def test_upsert_and_get_transactions_round_trip(self):
         df = pd.DataFrame([
@@ -239,15 +214,7 @@ class TestTransactions(unittest.TestCase):
         self.assertEqual(types, {"Purchase", "Sale"})
 
 
-class TestPrices(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-        self.db_path = Path(self.tmp_dir) / "test.duckdb"
-        self.db = Database(self.db_path)
-
-    def tearDown(self):
-        self.db.close()
-        shutil.rmtree(self.tmp_dir)
+class TestPrices(DatabaseTestCase):
 
     def test_upsert_and_get_prices_round_trip(self):
         dates = pd.date_range("2024-01-01", "2024-01-04", freq="B")
@@ -291,15 +258,7 @@ class TestPrices(unittest.TestCase):
         self.assertAlmostEqual(result.loc[pd.Timestamp("2024-01-02"), "AAPL"], 101.0)
 
 
-class TestGetMissingPriceData(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-        self.db_path = Path(self.tmp_dir) / "test.duckdb"
-        self.db = Database(self.db_path)
-
-    def tearDown(self):
-        self.db.close()
-        shutil.rmtree(self.tmp_dir)
+class TestGetMissingPriceData(DatabaseTestCase):
 
     def test_missing_tickers_returned_when_no_data(self):
         missing_tickers, missing_dates = self.db.get_missing_price_data(
@@ -339,15 +298,7 @@ class TestGetMissingPriceData(unittest.TestCase):
         self.assertNotIn("AAPL", missing_tickers)
 
 
-class TestGetEntryPrices(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-        self.db_path = Path(self.tmp_dir) / "test.duckdb"
-        self.db = Database(self.db_path)
-
-    def tearDown(self):
-        self.db.close()
-        shutil.rmtree(self.tmp_dir)
+class TestGetEntryPrices(DatabaseTestCase):
 
     def test_asof_join_returns_price_on_disclosure_date(self):
         dates = pd.bdate_range("2024-01-01", "2024-01-10")
@@ -448,32 +399,24 @@ class TestGetEntryPrices(unittest.TestCase):
         self.assertEqual(len(result), 1)
 
 
-class TestContextManager(unittest.TestCase):
+class TestContextManager(DatabaseTestCase):
     def test_context_manager_closes_connection(self):
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            db_path = Path(tmp_dir) / "test_ctx.duckdb"
-            with Database(db_path) as db:
-                tables = db.conn.execute(
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-                ).fetchall()
-                self.assertTrue(len(tables) > 0)
-            with self.assertRaises(duckdb.ConnectionException):
-                db.conn.execute("SELECT 1")
-        finally:
-            shutil.rmtree(tmp_dir)
+        db_path = Path(self.tmp_dir) / "test_ctx.duckdb"
+        with Database(db_path) as db:
+            tables = db.conn.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            ).fetchall()
+            self.assertTrue(len(tables) > 0)
+        with self.assertRaises(duckdb.ConnectionException):
+            db.conn.execute("SELECT 1")
 
     def test_read_only_mode(self):
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            db_path = Path(tmp_dir) / "test_ro.duckdb"
-            with Database(db_path) as rw_db:
-                rw_db.close()
-            ro_db = Database(db_path, read_only=True)
-            self.assertTrue(ro_db.is_read_only)
-            ro_db.close()
-        finally:
-            shutil.rmtree(tmp_dir)
+        db_path = Path(self.tmp_dir) / "test_ro.duckdb"
+        with Database(db_path) as rw_db:
+            rw_db.close()
+        ro_db = Database(db_path, read_only=True)
+        self.assertTrue(ro_db.is_read_only)
+        ro_db.close()
 
 
 if __name__ == "__main__":

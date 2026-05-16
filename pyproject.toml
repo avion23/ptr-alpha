@@ -25,3 +25,8 @@ dependencies = [
 
 [project.scripts]
 insider-trading = "analyzer.cli:main"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore::DeprecationWarning:pypdf._crypt_providers._cryptography",
+]

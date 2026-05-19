@@ -130,8 +130,9 @@ def calculate_signal_potential(
 
     if not spy_prices.empty:
         spy_merged = windowed.merge(spy_prices, on="price_date", how="left")
-        spy_merged["spy_entry_price"] = spy_merged.groupby("signal_id")["spy_price"].transform("first")
-        windowed["spy_return"] = spy_merged["spy_price"] / spy_merged["spy_entry_price"] - 1
+        first_idx = spy_merged.groupby("signal_id")["price_date"].idxmin()
+        spy_entry_prices = spy_merged.loc[first_idx].set_index("signal_id")["spy_price"]
+        windowed["spy_return"] = spy_merged["spy_price"] / spy_merged["signal_id"].map(spy_entry_prices) - 1
     else:
         windowed["spy_return"] = 0.0
 
@@ -142,9 +143,12 @@ def calculate_signal_potential(
         trough_price=("price", "min"),
         decayed_return=("weighted_return", "sum"),
         spy_cumulative=("weighted_spy_return", "sum"),
+        weight_sum=("decay_factor", "sum"),
         entry_price_first=("entry_price", "first"),
         last_price=("price", "last")
     )
+    agg["decayed_return"] = agg["decayed_return"] / agg["weight_sum"]
+    agg["spy_cumulative"] = agg["spy_cumulative"] / agg["weight_sum"]
     agg["total_return"] = (agg["last_price"] / agg["entry_price_first"] - 1)
     agg = agg.reset_index()
 
@@ -213,7 +217,8 @@ def _compute_member_stats(
         "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
     }
     if threshold is not None:
-        stats["hit_rate_pct"] = round((grp["peak_potential_pct"] > threshold).mean() * 100, 2)
+        stats["peak_hit_rate_pct"] = round((grp["peak_potential_pct"] > threshold).mean() * 100, 2)
+        stats["realized_hit_rate_pct"] = round((grp["total_return_pct"] > 0).mean() * 100, 2)
     return stats
 
 
@@ -371,7 +376,7 @@ def get_ticker_buyers_with_rankings(
 
     result = pd.merge(
         buyers_with_dates,
-        member_rankings[["member", "avg_spy_alpha_pct", "hit_rate_pct", "purchase_trades"]],
+        member_rankings[["member", "avg_spy_alpha_pct", "peak_hit_rate_pct", "purchase_trades"]],
         on="member",
         how="left"
     )
@@ -380,7 +385,7 @@ def get_ticker_buyers_with_rankings(
     result["num_purchases"] = result["transaction_date"].apply(len)
 
     return result[["member", "num_purchases", "transaction_date", "disclosure_date",
-                   "avg_spy_alpha_pct", "hit_rate_pct", "purchase_trades"]]
+                   "avg_spy_alpha_pct", "peak_hit_rate_pct", "purchase_trades"]]
 
 
 def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:

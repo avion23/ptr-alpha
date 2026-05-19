@@ -171,7 +171,7 @@ class TestSaveResults(unittest.TestCase):
             "member": ["Alice"],
             "avg_spy_alpha_pct": [10.5],
             "bayes_win_prob": [0.8],
-            "hit_rate_pct": [70.0],
+            "peak_hit_rate_pct": [70.0],
             "sharpe_ratio": [1.2],
             "bayes_factor": [2.1],
             "purchase_trades": [5],
@@ -187,7 +187,7 @@ class TestSaveResults(unittest.TestCase):
             "member": ["Alice"],
             "avg_spy_alpha_pct": [10.5],
             "bayes_win_prob": [0.8],
-            "hit_rate_pct": [70.0],
+            "peak_hit_rate_pct": [70.0],
             "sharpe_ratio": [1.2],
             "bayes_factor": [2.1],
             "purchase_trades": [5],
@@ -284,7 +284,7 @@ class TestSaveResults(unittest.TestCase):
 
             saved = pd.read_csv(data_dir / "member_rankings.csv")
             self.assertNotIn("purchase_trades", saved.columns)
-            self.assertNotIn("hit_rate_pct", saved.columns)
+            self.assertNotIn("peak_hit_rate_pct", saved.columns)
 
 
 class TestAnalyzeBySector(unittest.TestCase):

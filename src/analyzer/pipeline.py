@@ -210,7 +210,7 @@ def _save_results(
         ]
     elif 'avg_spy_alpha_pct' in table.columns:
         display_cols = [
-            'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
+            'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
         ]
     else:
         display_cols = list(table.columns)

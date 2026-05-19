@@ -218,7 +218,8 @@ def _compute_member_stats(
     }
     if threshold is not None:
         stats["peak_hit_rate_pct"] = round((grp["peak_potential_pct"] > threshold).mean() * 100, 2)
-        stats["realized_hit_rate_pct"] = round((grp["total_return_pct"] > 0).mean() * 100, 2)
+        if "total_return_pct" in grp.columns:
+            stats["realized_hit_rate_pct"] = round((grp["total_return_pct"] > 0).mean() * 100, 2)
     return stats
 
 

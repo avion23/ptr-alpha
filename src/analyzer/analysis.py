@@ -12,8 +12,8 @@ MAX_DISCLOSURE_METADATA_ADJUSTMENT = 0.05
 
 
 def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
-    alpha = market_prior * 100
-    beta = (1 - market_prior) * 100
+    alpha = market_prior * 20
+    beta = (1 - market_prior) * 20
     return (alpha + wins) / (alpha + beta + wins + losses)
 
 
@@ -189,7 +189,7 @@ def _compute_member_stats(
 
     median_ret = float(np.median(rets))
     mean_ret = float(np.mean(rets))
-    std_ret = float(np.std(rets)) if len(rets) > 1 else 0.0
+    std_ret = float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0
     sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
 
     wins = int((rets > 0).sum())

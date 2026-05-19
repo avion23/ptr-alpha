@@ -1,6 +1,6 @@
-# Congressional Insider Trading Analysis
+# PTR Alpha
 
-Analyze congressional financial disclosures to identify trading patterns and performance signals.
+Analyze congressional Periodic Transaction Report (PTR) disclosures to identify trading patterns and performance signals.
 
 ## Approach
 
@@ -28,14 +28,14 @@ src/analyzer/
 ## CLI
 
 ```bash
-insider-trading fetch --year 2026                          # Download House PTR PDFs
-insider-trading parse --year 2026                          # Extract transactions to DuckDB
-insider-trading analyze --year 2026 --mode ranks           # Rank members by Spy alpha
-insider-trading analyze --year 2026 --mode signals         # Top individual trade signals
-insider-trading analyze --year 2026 --mode sales           # Rank members by loss avoidance
-insider-trading analyze --year 2026 --mode tickers         # Multi-buyer ticker scores
-insider-trading analyze --year 2026 --mode member --member "Nancy Pelosi"  # Member-specific signals
-insider-trading analyze --year 2026 --ticker NVDA          # Deep-dive single ticker
+ptr-alpha fetch --year 2026                          # Download House PTR PDFs
+ptr-alpha parse --year 2026                          # Extract transactions to DuckDB
+ptr-alpha analyze --year 2026 --mode ranks           # Rank members by Spy alpha
+ptr-alpha analyze --year 2026 --mode signals         # Top individual trade signals
+ptr-alpha analyze --year 2026 --mode sales           # Rank members by loss avoidance
+ptr-alpha analyze --year 2026 --mode tickers         # Multi-buyer ticker scores
+ptr-alpha analyze --year 2026 --mode member --member "Nancy Pelosi"  # Member-specific signals
+ptr-alpha analyze --year 2026 --ticker NVDA          # Deep-dive single ticker
 ```
 
 All analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` flags.

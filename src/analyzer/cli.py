@@ -21,7 +21,7 @@ from analyzer.exceptions import AnalyzerError
 from analyzer.settings import Settings
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
 
-app = typer.Typer(help="Congressional insider trading analyzer", no_args_is_help=True)
+app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 
 
 @dataclass

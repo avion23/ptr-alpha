@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "insider-trading"
+name = "ptr-alpha"
 version = "0.1.0"
-description = "Congressional insider trading analysis tool"
+description = "Congressional PTR disclosure analysis tool"
 dependencies = [
     "pandas",
     "numpy",
@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.scripts]
-insider-trading = "analyzer.cli:main"
+ptr-alpha = "analyzer.cli:main"
 
 [tool.pytest.ini_options]
 filterwarnings = [

@@ -73,7 +73,9 @@ class TestAnalysis(unittest.TestCase):
 
         score = score_ticker_by_buyers('AAPL', transactions, signals)
 
-        self.assertEqual(score.iloc[0]['base_signal_score'], 20.0)
+        buyer_diminishing = np.log1p(2) / np.log1p(1)
+        expected_base = round(buyer_diminishing * 10.0, 2)
+        self.assertEqual(score.iloc[0]['base_signal_score'], expected_base)
         self.assertGreater(score.iloc[0]['size_factor'], 1.0)
         self.assertLess(score.iloc[0]['owner_factor'], 1.0)
         self.assertNotEqual(score.iloc[0]['signal_score'], score.iloc[0]['base_signal_score'])
@@ -201,10 +203,14 @@ class TestAnalysis(unittest.TestCase):
 
         score = score_ticker_by_buyers('AAPL', transactions, signals, member_rankings=member_rankings)
 
-        avg_rank = (10.0 + 20.0) / 2.0
-        expected_base = 2 * avg_rank
-        inflated_base = 3 * avg_rank
-        self.assertEqual(score.iloc[0]['num_buyers'], 3)
+        buyer_diminishing = np.log1p(2) / np.log1p(1)
+        quality_weighted_sum = 10.0 * 3 + 20.0 * 2
+        quality_adjusted_avg = quality_weighted_sum / 5
+        expected_base = round(buyer_diminishing * quality_adjusted_avg, 2)
+        inflated_buyers = np.log1p(3) / np.log1p(1)
+        inflated_base = round(inflated_buyers * quality_adjusted_avg, 2)
+        self.assertEqual(score.iloc[0]['num_buyers'], 2)
+        self.assertEqual(score.iloc[0]['total_buyers'], 3)
         self.assertEqual(score.iloc[0]['base_signal_score'], expected_base)
         self.assertNotEqual(score.iloc[0]['base_signal_score'], inflated_base)
 

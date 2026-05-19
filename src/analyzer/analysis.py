@@ -7,8 +7,8 @@ from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
 
 DECAY_LAMBDA = 0.05
-POSITION_SIZE_BASELINE = 15000.0
-MAX_DISCLOSURE_METADATA_ADJUSTMENT = 0.05
+POSITION_SIZE_BASELINE = 10000.0
+MAX_DISCLOSURE_METADATA_ADJUSTMENT = 0.15
 
 
 def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
@@ -323,11 +323,14 @@ def score_ticker_by_buyers(
             "signal_score": [0.0]
         })
 
-    avg_rank = buyer_stats["avg_spy_alpha_pct"].mean()
-    max_rank = buyer_stats["avg_spy_alpha_pct"].max()
+    best_rank = buyer_stats["avg_spy_alpha_pct"].max()
+    quality_weighted_sum = (buyer_stats["avg_spy_alpha_pct"] * buyer_stats["purchase_trades"]).sum()
     total_trades = buyer_stats["purchase_trades"].sum()
     rated_buyers = len(buyer_stats)
-    base_signal_score = rated_buyers * avg_rank
+    quality_adjusted_avg = quality_weighted_sum / total_trades if total_trades > 0 else 0
+
+    buyer_diminishing = np.log1p(rated_buyers) / np.log1p(1)
+    base_signal_score = buyer_diminishing * quality_adjusted_avg
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
     signal_score = base_signal_score * size_factor * owner_factor
@@ -337,11 +340,12 @@ def score_ticker_by_buyers(
 
     return pd.DataFrame({
         "ticker": [ticker],
-        "num_buyers": [len(buyers)],
+        "num_buyers": [rated_buyers],
+        "total_buyers": [len(buyers)],
         "buyer_label": [buyer_label],
         "buyers": [", ".join(top_buyers)],
-        "avg_buyer_performance": [round(avg_rank, 2)],
-        "best_buyer_performance": [round(max_rank, 2)],
+        "avg_buyer_performance": [round(quality_adjusted_avg, 2)],
+        "best_buyer_performance": [round(best_rank, 2)],
         "total_buyer_trades": [int(total_trades)],
         "base_signal_score": [round(base_signal_score, 2)],
         "size_factor": [round(size_factor, 3)],

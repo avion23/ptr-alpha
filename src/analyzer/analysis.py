@@ -27,7 +27,7 @@ def _get_horizon_data(
 
 
 def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:
-    horizon_signals = _get_horizon_data(signals_df, horizon)
+    horizon_signals = _get_horizon_data(signals_df, horizon, TransactionType.PURCHASE.value)
     if horizon_signals.empty:
         return 0.50
     up_prob = (horizon_signals["decayed_return_pct"] > 0).mean()
@@ -129,26 +129,28 @@ def calculate_signal_potential(
     windowed["weighted_return"] = (windowed["price"] / windowed["entry_price"] - 1) * windowed["decay_factor"]
 
     if not spy_prices.empty:
-        spy_merged = windowed.merge(spy_prices, on="price_date", how="left")
-        first_idx = spy_merged.groupby("signal_id")["price_date"].idxmin()
-        spy_entry_prices = spy_merged.loc[first_idx].set_index("signal_id")["spy_price"]
-        windowed["spy_return"] = spy_merged["spy_price"] / spy_merged["signal_id"].map(spy_entry_prices) - 1
+        windowed = windowed.merge(spy_prices, on="price_date", how="left")
+        first_idx = windowed.dropna(subset=["spy_price"]).groupby("signal_id")["price_date"].idxmin()
+        spy_entry_prices = windowed.loc[first_idx].set_index("signal_id")["spy_price"]
+        windowed["spy_return"] = windowed["spy_price"] / windowed["signal_id"].map(spy_entry_prices) - 1
     else:
         windowed["spy_return"] = 0.0
 
     windowed["weighted_spy_return"] = windowed["spy_return"] * windowed["decay_factor"]
+    windowed["spy_decay_factor"] = windowed["decay_factor"].where(windowed["spy_return"].notna())
 
     agg = windowed.groupby("signal_id").agg(
         peak_price=("price", "max"),
         trough_price=("price", "min"),
         decayed_return=("weighted_return", "sum"),
-        spy_cumulative=("weighted_spy_return", "sum"),
+        spy_cumulative=("weighted_spy_return", lambda values: values.sum(min_count=1)),
+        spy_weight_sum=("spy_decay_factor", lambda values: values.sum(min_count=1)),
         weight_sum=("decay_factor", "sum"),
         entry_price_first=("entry_price", "first"),
         last_price=("price", "last")
     )
     agg["decayed_return"] = agg["decayed_return"] / agg["weight_sum"]
-    agg["spy_cumulative"] = agg["spy_cumulative"] / agg["weight_sum"]
+    agg["spy_cumulative"] = agg["spy_cumulative"] / agg["spy_weight_sum"]
     agg["total_return"] = (agg["last_price"] / agg["entry_price_first"] - 1)
     agg = agg.reset_index()
 
@@ -178,18 +180,24 @@ def calculate_signal_potential(
     return final.assign(
         signal_type=final["transaction_type"],
         peak_potential_pct=peak_potential,
-        decayed_return_pct=final["decayed_return"].fillna(0).values * 100,
-        spy_alpha_pct=(final["decayed_return"].fillna(0) - final["spy_cumulative"].fillna(0)).values * 100,
-        total_return_pct=final["total_return"].fillna(0).values * 100,
+        decayed_return_pct=final["decayed_return"].values * 100,
+        spy_alpha_pct=(final["decayed_return"] - final["spy_cumulative"]).values * 100,
+        total_return_pct=final["total_return"].values * 100,
     )[result_columns]
 
 
 def _compute_member_stats(
-    member: str, grp: pd.DataFrame, market_prior: float, threshold: float | None = None
+    member: str,
+    grp: pd.DataFrame,
+    market_prior: float,
+    threshold: float | None = None,
+    invert_returns: bool = False,
 ) -> dict | None:
     rets = grp["decayed_return_pct"].dropna().values
     if len(rets) == 0:
         return None
+    if invert_returns:
+        rets = -rets
 
     median_ret = float(np.median(rets))
     mean_ret = float(np.mean(rets))
@@ -203,6 +211,8 @@ def _compute_member_stats(
     bayes_factor = bayes_win_prob / market_prior
 
     spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
+    if invert_returns:
+        spy_alpha_vals = -spy_alpha_vals
     avg_spy_alpha = float(np.mean(spy_alpha_vals)) if len(spy_alpha_vals) > 0 else 0.0
 
     stats = {
@@ -403,7 +413,7 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
     market_prior = _compute_dynamic_prior(signal_df, horizon)
     member_stats = []
     for member, sale_grp in sales.groupby("member"):
-        row = _compute_member_stats(member, sale_grp, market_prior)
+        row = _compute_member_stats(member, sale_grp, market_prior, invert_returns=True)
         if row is not None:
             member_stats.append(row)
 

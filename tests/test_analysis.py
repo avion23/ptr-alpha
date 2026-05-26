@@ -248,6 +248,43 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(rankings.iloc[0]['member'], 'Alice')
         self.assertFalse(np.isnan(rankings.iloc[0]['avg_loss_avoided_pct']))
 
+    def test_rank_sales_rewards_post_sale_declines(self):
+        signals = pd.DataFrame({
+            'member': ['Good Seller', 'Bad Seller'],
+            'ticker': ['AAPL', 'GOOGL'],
+            'signal_type': ['Sale', 'Sale'],
+            'horizon_days': [90, 90],
+            'decayed_return_pct': [-10.0, 10.0],
+            'peak_potential_pct': [10.0, 0.0],
+            'spy_alpha_pct': [-5.0, 5.0],
+        })
+
+        rankings = rank_sales(signals, horizon=90)
+
+        self.assertEqual(rankings.iloc[0]['member'], 'Good Seller')
+        self.assertEqual(rankings.iloc[0]['avg_loss_avoided_pct'], 10.0)
+        self.assertEqual(rankings.iloc[0]['avg_spy_alpha_pct'], 5.0)
+
+    def test_missing_price_windows_do_not_count_as_zero_return_trades(self):
+        entry_prices = pd.DataFrame({
+            'member': ['Alice', 'Alice'],
+            'ticker': ['AAPL', 'MSFT'],
+            'disclosure_date': pd.to_datetime(['2024-01-01', '2024-06-01']),
+            'transaction_type': ['Purchase', 'Purchase'],
+            'entry_price': [100.0, 200.0],
+        })
+        prices = pd.DataFrame({
+            'AAPL': [100.0, 110.0],
+            'MSFT': [np.nan, np.nan],
+            'SPY': [100.0, 100.0],
+        }, index=pd.to_datetime(['2024-01-01', '2024-01-02']))
+
+        signals = calculate_signal_potential(entry_prices, prices, [30])
+        rankings = rank_members(signals, horizon=30)
+
+        self.assertTrue(np.isnan(signals.loc[signals['ticker'] == 'MSFT', 'decayed_return_pct'].iloc[0]))
+        self.assertEqual(rankings.iloc[0]['purchase_trades'], 1)
+
     def test_sale_peak_potential_no_nan_with_valid_data(self):
         transactions = pd.DataFrame({
             'member': ['Alice'],

@@ -183,7 +183,7 @@ def run_recent_ticker_scoring(
 
     member_rankings = analysis.rank_members(signals, params.horizons[0], params.threshold)
 
-    scores = [analysis.score_ticker_by_buyers(ticker, trades, signals, params.horizons[0], params.threshold, member_rankings) for ticker in multi_buyer_tickers]
+    scores = [analysis.score_ticker_by_buyers(ticker, recent_trades, signals, params.horizons[0], params.threshold, member_rankings) for ticker in multi_buyer_tickers]
 
     if not scores:
         logger.warning(f"No tickers found with {params.min_buyers}+ buyers in last {params.days_back} days")

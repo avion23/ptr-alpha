@@ -13,6 +13,7 @@ from analyzer.pipeline import (
     _save_results,
     _analyze_by_sector,
     pipeline_step,
+    run_recent_ticker_scoring,
 )
 from analyzer.exceptions import AnalyzerError, DataSourceError
 
@@ -162,6 +163,47 @@ class TestPrepareAnalysisData(unittest.TestCase):
             _prepare_analysis_data(mock_tx_source, mock_price_source, 2024, [90])
 
         mock_calc_signals.assert_not_called()
+
+
+class TestRecentTickerScoring(unittest.TestCase):
+
+    @patch("analyzer.pipeline.analysis.rank_members")
+    @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
+    @patch("analyzer.pipeline._prepare_analysis_data")
+    def test_scores_use_recent_trades_not_full_year_trades(self, mock_prepare, mock_score, mock_rank):
+        trades = pd.DataFrame({
+            "member": ["Alice", "Bob", "Old Buyer"],
+            "ticker": ["AAPL", "AAPL", "AAPL"],
+            "disclosure_date": pd.to_datetime(["2024-05-01", "2024-05-02", "2024-01-01"]),
+            "transaction_type": ["Purchase", "Purchase", "Purchase"],
+        })
+        signals = pd.DataFrame({
+            "member": ["Alice", "Bob", "Old Buyer"],
+            "ticker": ["AAPL", "AAPL", "AAPL"],
+            "signal_type": ["Purchase", "Purchase", "Purchase"],
+            "horizon_days": [90, 90, 90],
+            "decayed_return_pct": [1.0, 1.0, 1.0],
+            "peak_potential_pct": [1.0, 1.0, 1.0],
+            "spy_alpha_pct": [1.0, 1.0, 1.0],
+        })
+        rankings = pd.DataFrame({
+            "member": ["Alice", "Bob", "Old Buyer"],
+            "avg_spy_alpha_pct": [1.0, 1.0, 100.0],
+            "purchase_trades": [1, 1, 1],
+        })
+        mock_prepare.return_value = (trades, pd.DataFrame(), signals)
+        mock_rank.return_value = rankings
+        mock_score.return_value = pd.DataFrame({
+            "ticker": ["AAPL"],
+            "signal_score": [1.0],
+        })
+
+        result = run_recent_ticker_scoring(MagicMock(), MagicMock(), TickerScoringParams(year=2024, horizons=[90], days_back=30))
+
+        self.assertTrue(result)
+        scored_trades = mock_score.call_args.args[1]
+        self.assertEqual(set(scored_trades["member"]), {"Alice", "Bob"})
+        self.assertNotIn("Old Buyer", set(scored_trades["member"]))
 
 
 class TestSaveResults(unittest.TestCase):

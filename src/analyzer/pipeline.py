@@ -31,7 +31,7 @@ def _load_sector_data(tickers: list[str]) -> pd.DataFrame:
     def fetch_sector(ticker):
         try:
             return ticker, yf.Ticker(ticker).info.get("sector", "Unknown")
-        except (OSError, ValueError, KeyError):
+        except Exception:
             return ticker, "Unknown"
 
     records = []

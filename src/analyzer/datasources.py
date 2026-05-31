@@ -280,14 +280,18 @@ class YFinancePriceSource(PriceSource):
             f"Fetching price data for {len(fetch_tickers)} tickers using yfinance"
         )
 
-        data = yf.download(
-            fetch_tickers,
-            start=start,
-            end=end,
-            progress=False,
-            threads=True,
-            auto_adjust=True,
-        )
+        try:
+            data = yf.download(
+                fetch_tickers,
+                start=start,
+                end=end,
+                progress=False,
+                threads=True,
+                auto_adjust=True,
+            )
+        except Exception as e:
+            logger.warning(f"yfinance request failed ({e}), falling back to cached data")
+            data = pd.DataFrame()
 
         if data.empty:
             if not cached_prices.empty:

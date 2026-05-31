@@ -59,7 +59,11 @@ class HouseTransactionSource(TransactionSource):
         self.metadata_url_template = settings.sources.house_metadata_url
         self.pdf_url_template = settings.sources.house_pdf_url
         self.parallel_workers = settings.data.get_workers()
-        requests_cache.install_cache("http_cache", backend="sqlite", expire_after=3600)
+        self.session = requests_cache.CachedSession(
+            cache_name=str(self.data_dir / "http_cache"),
+            backend="sqlite",
+            expire_after=3600,
+        )
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
     def close(self) -> None:
@@ -93,7 +97,7 @@ class HouseTransactionSource(TransactionSource):
         metadata_url = self.metadata_url_template.format(year=year)
         try:
             logger.info(f"Downloading metadata for {year} from House disclosures")
-            response = requests.get(metadata_url, timeout=30)
+            response = self.session.get(metadata_url, timeout=30)
             if response.status_code != 200:
                 raise DataSourceError(
                     f"Failed to fetch metadata for {year}, status: {response.status_code}"
@@ -126,6 +130,9 @@ class HouseTransactionSource(TransactionSource):
 
             return self.db.get_metadata(year)
         except requests.RequestException as e:
+            raise DataSourceError(f"Failed to fetch metadata for {year}: {e}")
+
+        except Exception as e:
             raise DataSourceError(f"Failed to fetch metadata for {year}: {e}")
 
     async def _download_pdf_async(self, session, doc_id, pdf_path, url):

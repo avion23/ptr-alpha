@@ -2,6 +2,27 @@
 
 Analyze congressional Periodic Transaction Report (PTR) disclosures to identify trading patterns and performance signals.
 
+## Prerequisites
+
+Python 3.11+ and system libraries for PDF parsing:
+
+```bash
+# macOS
+brew install tesseract poppler ghostscript
+
+# Ubuntu/Debian
+sudo apt-get install tesseract-ocr poppler-utils ghostscript
+```
+
+## Install
+
+```bash
+pip install .
+
+# With dev dependencies
+pip install ".[dev]"
+```
+
 ## Approach
 
 1. **Data Collection**: Downloads and parses official House PTR disclosures from government sources
@@ -39,3 +60,9 @@ ptr-alpha analyze --year 2026 --ticker NVDA          # Deep-dive single ticker
 ```
 
 All analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` flags.
+
+## Tests
+
+```bash
+pytest
+```

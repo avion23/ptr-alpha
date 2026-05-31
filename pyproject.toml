@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ptr-alpha"
 version = "0.1.0"
 description = "Congressional PTR disclosure analysis tool"
+requires-python = ">=3.11"
 dependencies = [
     "pandas",
     "numpy",
@@ -21,6 +22,13 @@ dependencies = [
     "typer>=0.9",
     "aiohttp>=3.9",
     "duckdb>=0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "ruff",
 ]
 
 [project.scripts]

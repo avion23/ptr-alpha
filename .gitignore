@@ -59,6 +59,10 @@ http_cache.sqlite
 *.sqlite
 *.db
 
+# Cache
+*.djcache
+cache/
+
 # User configuration
 config/
 config.toml

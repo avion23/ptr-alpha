@@ -4,7 +4,8 @@ import numpy as np
 from analyzer.analysis import (
     calculate_signal_potential, rank_members, rank_sales,
     get_top_signals, get_member_signals, get_analysis_table,
-    score_ticker_by_buyers
+    score_ticker_by_buyers, bayesian_win_probability,
+    bayes_factor_against_market,
 )
 from analyzer.exceptions import AnalysisError
 
@@ -73,7 +74,7 @@ class TestAnalysis(unittest.TestCase):
 
         score = score_ticker_by_buyers('AAPL', transactions, signals)
 
-        buyer_diminishing = np.log1p(2) / np.log1p(1)
+        buyer_diminishing = 1.0 + np.log1p(1) * 0.30
         expected_base = round(buyer_diminishing * 10.0, 2)
         self.assertEqual(score.iloc[0]['base_signal_score'], expected_base)
         self.assertGreater(score.iloc[0]['size_factor'], 1.0)
@@ -113,14 +114,64 @@ class TestAnalysis(unittest.TestCase):
 
         self.assertFalse(rankings.empty)
         self.assertTrue('member' in rankings.columns)
-        self.assertTrue('avg_peak_return_pct' in rankings.columns)
+        self.assertTrue('avg_decay_return_pct' in rankings.columns)
 
-        returns = rankings['avg_peak_return_pct'].dropna()
+        returns = rankings['avg_decay_return_pct'].dropna()
         self.assertTrue(len(returns) > 0)
 
     def test_rank_members_empty_input(self):
         with self.assertRaises(AnalysisError):
             rank_members(pd.DataFrame())
+
+    def test_rank_members_filters_by_horizon(self):
+        signals = pd.DataFrame({
+            'member': ['Alice', 'Alice'],
+            'ticker': ['AAPL', 'AAPL'],
+            'signal_type': ['Purchase', 'Purchase'],
+            'horizon_days': [30, 90],
+            'decayed_return_pct': [-50.0, 50.0],
+            'peak_potential_pct': [-40.0, 60.0],
+            'spy_alpha_pct': [-45.0, 45.0],
+        })
+
+        r30 = rank_members(signals, horizon=30)
+        r90 = rank_members(signals, horizon=90)
+
+        self.assertEqual(r30.iloc[0]['avg_spy_alpha_pct'], -45.0)
+        self.assertEqual(r90.iloc[0]['avg_spy_alpha_pct'], 45.0)
+        self.assertEqual(r30.iloc[0]['purchase_trades'], 1)
+        self.assertEqual(r90.iloc[0]['purchase_trades'], 1)
+
+    def test_rank_sales_filters_by_horizon(self):
+        signals = pd.DataFrame({
+            'member': ['Alice', 'Alice'],
+            'ticker': ['AAPL', 'AAPL'],
+            'signal_type': ['Sale', 'Sale'],
+            'horizon_days': [30, 90],
+            'decayed_return_pct': [-20.0, 20.0],
+            'peak_potential_pct': [30.0, -10.0],
+            'spy_alpha_pct': [-15.0, 15.0],
+        })
+
+        r30 = rank_sales(signals, horizon=30)
+        r90 = rank_sales(signals, horizon=90)
+
+        self.assertEqual(r30.iloc[0]['avg_loss_avoided_pct'], 20.0)
+        self.assertEqual(r90.iloc[0]['avg_loss_avoided_pct'], -20.0)
+        self.assertEqual(r30.iloc[0]['sale_trades'], 1)
+        self.assertEqual(r90.iloc[0]['sale_trades'], 1)
+
+    def test_bayesian_win_probability_formula(self):
+        posterior = bayesian_win_probability(0, 3, 0.55)
+        expected = (0.55 * 20) / (20 + 3)
+
+        self.assertAlmostEqual(posterior, expected)
+
+    def test_bayes_factor_against_market_formula(self):
+        bayes_factor = bayes_factor_against_market(5, 5, 0.55)
+
+        self.assertGreater(bayes_factor, 0)
+        self.assertLess(bayes_factor, 2)
 
     def test_get_top_signals_basic(self):
         signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
@@ -203,16 +254,47 @@ class TestAnalysis(unittest.TestCase):
 
         score = score_ticker_by_buyers('AAPL', transactions, signals, member_rankings=member_rankings)
 
-        buyer_diminishing = np.log1p(2) / np.log1p(1)
-        quality_weighted_sum = 10.0 * 3 + 20.0 * 2
-        quality_adjusted_avg = quality_weighted_sum / 5
+        buyer_diminishing = 1.0 + np.log1p(1) * 0.30
+        alice_weight = np.sqrt(3) * np.exp(-0.03)
+        charlie_weight = np.sqrt(2)
+        quality_weighted_sum = 10.0 * alice_weight + 20.0 * charlie_weight
+        quality_adjusted_avg = quality_weighted_sum / (alice_weight + charlie_weight)
         expected_base = round(buyer_diminishing * quality_adjusted_avg, 2)
-        inflated_buyers = np.log1p(3) / np.log1p(1)
+        inflated_buyers = 1.0 + np.log1p(2) * 0.30
         inflated_base = round(inflated_buyers * quality_adjusted_avg, 2)
         self.assertEqual(score.iloc[0]['num_buyers'], 2)
         self.assertEqual(score.iloc[0]['total_buyers'], 3)
         self.assertEqual(score.iloc[0]['base_signal_score'], expected_base)
         self.assertNotEqual(score.iloc[0]['base_signal_score'], inflated_base)
+
+    def test_score_ticker_by_buyers_uses_sqrt_confidence_not_trade_count_dominance(self):
+        transactions = pd.DataFrame({
+            'member': ['Focused', 'NoiseBot'],
+            'ticker': ['AAPL', 'AAPL'],
+            'transaction_date': pd.to_datetime(['2024-01-01', '2024-01-02']),
+            'disclosure_date': pd.to_datetime(['2024-01-01', '2024-01-02']),
+            'transaction_type': ['Purchase', 'Purchase'],
+        })
+        member_rankings = pd.DataFrame({
+            'member': ['Focused', 'NoiseBot'],
+            'avg_spy_alpha_pct': [18.0, 3.0],
+            'purchase_trades': [5, 500],
+            'bayes_win_prob': [0.75, 0.55],
+        })
+        signals = pd.DataFrame({
+            'member': ['Focused', 'NoiseBot'],
+            'ticker': ['AAPL', 'AAPL'],
+            'signal_type': ['Purchase', 'Purchase'],
+            'horizon_days': [90, 90],
+            'decayed_return_pct': [18.0, 3.0],
+            'peak_potential_pct': [20.0, 5.0],
+            'spy_alpha_pct': [18.0, 3.0],
+        })
+
+        score = score_ticker_by_buyers('AAPL', transactions, signals, member_rankings=member_rankings)
+
+        self.assertGreater(score.iloc[0]['avg_buyer_performance'], 3.0)
+        self.assertLess(score.iloc[0]['avg_buyer_performance'], 8.0)
 
     def test_rank_members_skips_members_with_all_nan_returns(self):
         signals = pd.DataFrame({
@@ -229,7 +311,7 @@ class TestAnalysis(unittest.TestCase):
 
         self.assertEqual(len(rankings), 1)
         self.assertEqual(rankings.iloc[0]['member'], 'Alice')
-        self.assertFalse(np.isnan(rankings.iloc[0]['avg_peak_return_pct']))
+        self.assertFalse(np.isnan(rankings.iloc[0]['avg_decay_return_pct']))
 
     def test_rank_sales_skips_members_with_all_nan_returns(self):
         signals = pd.DataFrame({

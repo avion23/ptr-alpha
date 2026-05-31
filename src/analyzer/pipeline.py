@@ -205,12 +205,12 @@ def _save_results(
     elif 'avg_loss_avoided_pct' in table.columns:
         display_cols = [
             'member', 'avg_loss_avoided_pct', 'median_loss_avoided_pct',
-            'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'bayes_factor',
+            'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'posterior_lift', 'bayes_factor',
             'avg_spy_alpha_pct',
         ]
     elif 'avg_spy_alpha_pct' in table.columns:
         display_cols = [
-            'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
+            'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
         ]
     else:
         display_cols = list(table.columns)

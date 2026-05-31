@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import exp, lgamma, log
+
 import numpy as np
 import pandas as pd
 
@@ -9,12 +11,34 @@ from analyzer.models import TransactionType
 DECAY_LAMBDA = 0.05
 POSITION_SIZE_BASELINE = 10000.0
 MAX_DISCLOSURE_METADATA_ADJUSTMENT = 0.15
+BAYES_PRIOR_STRENGTH = 20.0
+BUYER_RECENCY_DECAY = 0.03
+BUYER_CONVERGENCE_WEIGHT = 0.30
 
 
 def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
-    alpha = market_prior * 20
-    beta = (1 - market_prior) * 20
+    alpha = market_prior * BAYES_PRIOR_STRENGTH
+    beta = (1 - market_prior) * BAYES_PRIOR_STRENGTH
     return (alpha + wins) / (alpha + beta + wins + losses)
+
+
+def bayes_factor_against_market(wins: int, losses: int, market_prior: float = 0.55) -> float:
+    observations = wins + losses
+    if observations == 0:
+        return 1.0
+    market_prior = float(np.clip(market_prior, 1e-6, 1 - 1e-6))
+    alpha = market_prior * BAYES_PRIOR_STRENGTH
+    beta = (1 - market_prior) * BAYES_PRIOR_STRENGTH
+    log_marginal = (
+        lgamma(alpha + wins)
+        + lgamma(beta + losses)
+        - lgamma(alpha + beta + observations)
+        - lgamma(alpha)
+        - lgamma(beta)
+        + lgamma(alpha + beta)
+    )
+    log_market = wins * log(market_prior) + losses * log(1 - market_prior)
+    return exp(float(np.clip(log_marginal - log_market, -50, 50)))
 
 
 def _get_horizon_data(
@@ -208,7 +232,8 @@ def _compute_member_stats(
     losses = int(len(rets) - wins)
     p_up = wins / len(rets)
     bayes_win_prob = bayesian_win_probability(wins, losses, market_prior)
-    bayes_factor = bayes_win_prob / market_prior
+    posterior_lift = bayes_win_prob / market_prior
+    bayes_factor = bayes_factor_against_market(wins, losses, market_prior)
 
     spy_alpha_vals = grp["spy_alpha_pct"].dropna().values
     if invert_returns:
@@ -224,6 +249,7 @@ def _compute_member_stats(
         "prob_up": round(p_up, 3),
         "bayes_win_prob": round(bayes_win_prob, 3),
         "bayes_factor": round(bayes_factor, 3),
+        "posterior_lift": round(posterior_lift, 3),
         "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
     }
     if threshold is not None:
@@ -236,7 +262,7 @@ def _compute_member_stats(
 def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 5.0) -> pd.DataFrame:
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")
-    purchases = signal_df[signal_df["signal_type"] == TransactionType.PURCHASE.value]
+    purchases = _get_horizon_data(signal_df, horizon, TransactionType.PURCHASE.value)
     if purchases.empty:
         raise AnalysisError(f"No purchase signals found for horizon {horizon}")
 
@@ -252,8 +278,8 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
         return result
 
     return result.rename(columns={
-        "mean_return_pct": "avg_peak_return_pct",
-        "median_return_pct": "median_peak_return_pct",
+        "mean_return_pct": "avg_decay_return_pct",
+        "median_return_pct": "median_decay_return_pct",
         "trades": "purchase_trades",
         "prob_up": "prob_up_given_buy",
     }).sort_values("avg_spy_alpha_pct", ascending=False)
@@ -335,12 +361,25 @@ def score_ticker_by_buyers(
         })
 
     best_rank = buyer_stats["avg_spy_alpha_pct"].max()
-    quality_weighted_sum = (buyer_stats["avg_spy_alpha_pct"] * buyer_stats["purchase_trades"]).sum()
     total_trades = buyer_stats["purchase_trades"].sum()
     rated_buyers = len(buyer_stats)
-    quality_adjusted_avg = quality_weighted_sum / total_trades if total_trades > 0 else 0
+    confidence_weights = np.sqrt(buyer_stats["purchase_trades"].clip(lower=1).astype(float).values)
+    if "bayes_win_prob" in buyer_stats.columns:
+        confidence_weights *= buyer_stats["bayes_win_prob"].fillna(0.55).astype(float).values
+    if "disclosure_date" in ticker_trades.columns:
+        rated_ticker_trades = ticker_trades[ticker_trades["member"].isin(buyer_stats["member"])]
+        latest_disclosure = rated_ticker_trades["disclosure_date"].max()
+        member_disclosures = rated_ticker_trades.groupby("member")["disclosure_date"].max()
+        days_since = (latest_disclosure - member_disclosures.reindex(buyer_stats["member"])).dt.days.fillna(0).clip(lower=0)
+        confidence_weights *= np.exp(-BUYER_RECENCY_DECAY * days_since.values)
+    confidence_weight_sum = confidence_weights.sum()
+    quality_adjusted_avg = (
+        (buyer_stats["avg_spy_alpha_pct"].values * confidence_weights).sum() / confidence_weight_sum
+        if confidence_weight_sum > 0
+        else 0
+    )
 
-    buyer_diminishing = np.log1p(rated_buyers) / np.log1p(1)
+    buyer_diminishing = 1.0 + np.log1p(max(rated_buyers - 1, 0)) * BUYER_CONVERGENCE_WEIGHT
     base_signal_score = buyer_diminishing * quality_adjusted_avg
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
@@ -358,6 +397,7 @@ def score_ticker_by_buyers(
         "avg_buyer_performance": [round(quality_adjusted_avg, 2)],
         "best_buyer_performance": [round(best_rank, 2)],
         "total_buyer_trades": [int(total_trades)],
+        "convergence_factor": [round(buyer_diminishing, 3)],
         "base_signal_score": [round(base_signal_score, 2)],
         "size_factor": [round(size_factor, 3)],
         "owner_factor": [round(owner_factor, 3)],
@@ -406,7 +446,7 @@ def get_ticker_buyers_with_rankings(
 def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")
-    sales = signal_df[signal_df["signal_type"] == TransactionType.SALE.value]
+    sales = _get_horizon_data(signal_df, horizon, TransactionType.SALE.value)
     if sales.empty:
         raise AnalysisError(f"No sale signals found for horizon {horizon}")
 

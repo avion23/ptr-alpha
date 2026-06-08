@@ -62,7 +62,7 @@ class TickerScoringParams:
     horizons: list[int]
     threshold: float = 5.0
     days_back: int = 28
-    min_buyers: int = 2
+    min_buyers: int = 3
     top_n: int = 15
 
 
@@ -183,7 +183,7 @@ def run_recent_ticker_scoring(
 
     member_rankings = analysis.rank_members(signals, params.horizons[0], params.threshold)
 
-    scores = [analysis.score_ticker_by_buyers(ticker, recent_trades, signals, params.horizons[0], params.threshold, member_rankings) for ticker in multi_buyer_tickers]
+    scores = [analysis.score_ticker_by_buyers(ticker, recent_trades, signals, params.horizons[0], params.threshold, member_rankings, params.min_buyers) for ticker in multi_buyer_tickers]
 
     if not scores:
         logger.warning(f"No tickers found with {params.min_buyers}+ buyers in last {params.days_back} days")
@@ -200,7 +200,8 @@ def _save_results(
 ) -> None:
     if show_signals:
         display_cols = [
-            'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct'
+            'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct',
+            'total_return_pct', 'signal_score'
         ]
     elif 'avg_loss_avoided_pct' in table.columns:
         display_cols = [
@@ -210,7 +211,7 @@ def _save_results(
         ]
     elif 'avg_spy_alpha_pct' in table.columns:
         display_cols = [
-            'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'purchase_trades'
+            'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'conviction_score', 'purchase_trades'
         ]
     else:
         display_cols = list(table.columns)

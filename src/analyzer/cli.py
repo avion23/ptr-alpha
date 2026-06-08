@@ -73,7 +73,7 @@ def analyze(
     horizons: list[int] = typer.Option([90], help="Time horizons in days"),
     threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
     days_back: int = typer.Option(28, help="Days back for ticker scoring"),
-    min_buyers: int = typer.Option(2, help="Minimum buyers for ticker scoring"),
+    min_buyers: int = typer.Option(3, help="Minimum buyers for ticker scoring"),
     top_n: int = typer.Option(20, help="Number of results to show"),
     output: str = typer.Option("console", help="Output format: console or csv"),
     data_dir: str = typer.Option("data", help="Data directory"),

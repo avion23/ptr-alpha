@@ -14,6 +14,9 @@ MAX_DISCLOSURE_METADATA_ADJUSTMENT = 0.15
 BAYES_PRIOR_STRENGTH = 20.0
 BUYER_RECENCY_DECAY = 0.03
 BUYER_CONVERGENCE_WEIGHT = 0.30
+MIN_ENTRY_PRICE = 3.0
+CONVICTION_WEIGHT_ALPHA = 0.6
+CONVICTION_WEIGHT_REALIZED = 0.4
 
 
 def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
@@ -39,6 +42,25 @@ def bayes_factor_against_market(wins: int, losses: int, market_prior: float = 0.
     )
     log_market = wins * log(market_prior) + losses * log(1 - market_prior)
     return exp(float(np.clip(log_marginal - log_market, -50, 50)))
+
+
+def _apply_quality_filter(signals_df: pd.DataFrame) -> pd.DataFrame:
+    if "entry_price" not in signals_df.columns:
+        return signals_df
+    return signals_df[signals_df["entry_price"] >= MIN_ENTRY_PRICE].copy()
+
+
+def _conviction_score(trades: pd.DataFrame) -> float:
+    trade_count = len(trades)
+    if trade_count == 0:
+        return 0.0
+    count_score = min(trade_count / 10.0, 1.0)
+    has_amounts = "amount_midpoint" in trades.columns and trades["amount_midpoint"].notna().any()
+    size_score = 1.0
+    if has_amounts:
+        avg_amount = trades["amount_midpoint"].dropna().mean()
+        size_score = min(avg_amount / 50000.0, 1.0)
+    return count_score * 0.6 + size_score * 0.4
 
 
 def _get_horizon_data(
@@ -85,8 +107,19 @@ def _get_top_signals(signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 1
     if top_data.empty:
         raise AnalysisError(f"No purchase signals found for horizon {horizon}")
 
-    return top_data.nlargest(top_n, "spy_alpha_pct")[
-        ["member", "ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct"]
+    top_data = _apply_quality_filter(top_data)
+    if top_data.empty:
+        raise AnalysisError(f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})")
+
+    top_data = top_data.copy()
+    top_data["signal_score"] = (
+        top_data["spy_alpha_pct"].fillna(0) * CONVICTION_WEIGHT_ALPHA
+        + top_data["total_return_pct"].fillna(0) * CONVICTION_WEIGHT_REALIZED
+    )
+
+    return top_data.nlargest(top_n, "signal_score")[
+        ["member", "ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct",
+         "total_return_pct", "signal_score"]
     ]
 
 
@@ -103,8 +136,18 @@ def _get_member_signals(
     if purchases.empty:
         raise AnalysisError(f"No purchase signals for member {member} at horizon {horizon}")
 
-    return purchases.nlargest(top_n, "spy_alpha_pct")[
-        ["ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct"]
+    purchases = _apply_quality_filter(purchases)
+    if purchases.empty:
+        raise AnalysisError(f"No signals survived quality filter for {member}")
+
+    purchases = purchases.copy()
+    purchases["signal_score"] = (
+        purchases["spy_alpha_pct"].fillna(0) * CONVICTION_WEIGHT_ALPHA
+        + purchases["total_return_pct"].fillna(0) * CONVICTION_WEIGHT_REALIZED
+    )
+
+    return purchases.nlargest(top_n, "signal_score")[
+        ["ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct", "total_return_pct", "signal_score"]
     ]
 
 
@@ -266,11 +309,17 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
     if purchases.empty:
         raise AnalysisError(f"No purchase signals found for horizon {horizon}")
 
+    purchases = _apply_quality_filter(purchases)
+    if purchases.empty:
+        raise AnalysisError(f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})")
+
     market_prior = _compute_dynamic_prior(signal_df, horizon)
     member_stats = []
     for member, purchase_grp in purchases.groupby("member"):
         row = _compute_member_stats(member, purchase_grp, market_prior, threshold)
         if row is not None:
+            conviction = _conviction_score(purchase_grp)
+            row["conviction_score"] = round(conviction, 3)
             member_stats.append(row)
 
     result = pd.DataFrame(member_stats)
@@ -329,6 +378,7 @@ def score_ticker_by_buyers(
     horizon: int = 90,
     threshold: float = 5.0,
     member_rankings: pd.DataFrame | None = None,
+    min_buyers: int = 2,
 ) -> pd.DataFrame:
     if signals_df.empty:
         raise AnalysisError("Empty signal dataframe")
@@ -345,6 +395,15 @@ def score_ticker_by_buyers(
             "ticker": [ticker],
             "num_buyers": [0],
             "signal_score": [0.0]
+        })
+
+    min_trades = ticker_trades["member"].nunique()
+    if min_trades < min_buyers:
+        return pd.DataFrame({
+            "ticker": [ticker],
+            "num_buyers": [min_trades],
+            "signal_score": [0.0],
+            "note": [f"Below minimum buyer threshold ({min_buyers})"]
         })
 
     buyers = ticker_trades["member"].unique()

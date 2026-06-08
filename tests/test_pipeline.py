@@ -39,7 +39,7 @@ class TestTickerScoringParams(unittest.TestCase):
         p = TickerScoringParams(year=2024, horizons=[90])
         self.assertEqual(p.threshold, 5.0)
         self.assertEqual(p.days_back, 28)
-        self.assertEqual(p.min_buyers, 2)
+        self.assertEqual(p.min_buyers, 3)
         self.assertEqual(p.top_n, 15)
 
     def test_custom_values(self):
@@ -198,7 +198,7 @@ class TestRecentTickerScoring(unittest.TestCase):
             "signal_score": [1.0],
         })
 
-        result = run_recent_ticker_scoring(MagicMock(), MagicMock(), TickerScoringParams(year=2024, horizons=[90], days_back=30))
+        result = run_recent_ticker_scoring(MagicMock(), MagicMock(), TickerScoringParams(year=2024, horizons=[90], days_back=30, min_buyers=2))
 
         self.assertTrue(result)
         scored_trades = mock_score.call_args.args[1]

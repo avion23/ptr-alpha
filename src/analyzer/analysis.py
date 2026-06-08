@@ -77,7 +77,7 @@ def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:
     if horizon_signals.empty:
         return 0.50
     up_prob = (horizon_signals["decayed_return_pct"] > 0).mean()
-    return max(up_prob, 0.50)
+    return float(np.clip(up_prob, 0.10, 0.90))
 
 
 def _size_score_factor(trades: pd.DataFrame) -> float:
@@ -113,13 +113,13 @@ def _get_top_signals(signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 1
 
     top_data = top_data.copy()
     top_data["signal_score"] = (
-        top_data["spy_alpha_pct"].fillna(0) * CONVICTION_WEIGHT_ALPHA
+        top_data["total_spy_alpha_pct"].fillna(0) * CONVICTION_WEIGHT_ALPHA
         + top_data["total_return_pct"].fillna(0) * CONVICTION_WEIGHT_REALIZED
     )
 
     return top_data.nlargest(top_n, "signal_score")[
         ["member", "ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct",
-         "total_return_pct", "signal_score"]
+         "total_return_pct", "total_spy_alpha_pct", "signal_score"]
     ]
 
 
@@ -142,12 +142,12 @@ def _get_member_signals(
 
     purchases = purchases.copy()
     purchases["signal_score"] = (
-        purchases["spy_alpha_pct"].fillna(0) * CONVICTION_WEIGHT_ALPHA
+        purchases["total_spy_alpha_pct"].fillna(0) * CONVICTION_WEIGHT_ALPHA
         + purchases["total_return_pct"].fillna(0) * CONVICTION_WEIGHT_REALIZED
     )
 
     return purchases.nlargest(top_n, "signal_score")[
-        ["ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct", "total_return_pct", "signal_score"]
+        ["ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct", "total_return_pct", "total_spy_alpha_pct", "signal_score"]
     ]
 
 
@@ -191,14 +191,18 @@ def calculate_signal_potential(
     if windowed.empty:
         raise AnalysisError("No price data found in signal windows")
 
+    first_price_idx = windowed.groupby("signal_id")["price_date"].idxmin()
+    disclosure_prices = windowed.loc[first_price_idx].set_index("signal_id")["price"]
+    windowed["disclosure_baseline"] = windowed["signal_id"].map(disclosure_prices)
+
     windowed["days_from_disclosure"] = (windowed["price_date"] - windowed["disclosure_date"]).dt.days
     windowed["decay_factor"] = np.exp(-decay_lambda * windowed["days_from_disclosure"])
-    windowed["weighted_return"] = (windowed["price"] / windowed["entry_price"] - 1) * windowed["decay_factor"]
+    windowed["weighted_return"] = (windowed["price"] / windowed["disclosure_baseline"] - 1) * windowed["decay_factor"]
 
     if not spy_prices.empty:
         windowed = windowed.merge(spy_prices, on="price_date", how="left")
-        first_idx = windowed.dropna(subset=["spy_price"]).groupby("signal_id")["price_date"].idxmin()
-        spy_entry_prices = windowed.loc[first_idx].set_index("signal_id")["spy_price"]
+        first_spy_idx = windowed.dropna(subset=["spy_price"]).groupby("signal_id")["price_date"].idxmin()
+        spy_entry_prices = windowed.loc[first_spy_idx].set_index("signal_id")["spy_price"]
         windowed["spy_return"] = windowed["spy_price"] / windowed["signal_id"].map(spy_entry_prices) - 1
     else:
         windowed["spy_return"] = 0.0
@@ -213,26 +217,27 @@ def calculate_signal_potential(
         spy_cumulative=("weighted_spy_return", lambda values: values.sum(min_count=1)),
         spy_weight_sum=("spy_decay_factor", lambda values: values.sum(min_count=1)),
         weight_sum=("decay_factor", "sum"),
-        entry_price_first=("entry_price", "first"),
+        disclosure_price_first=("disclosure_baseline", "first"),
         last_price=("price", "last")
     )
     agg["decayed_return"] = agg["decayed_return"] / agg["weight_sum"]
     agg["spy_cumulative"] = agg["spy_cumulative"] / agg["spy_weight_sum"]
-    agg["total_return"] = (agg["last_price"] / agg["entry_price_first"] - 1)
+    agg["total_return"] = (agg["last_price"] / agg["disclosure_price_first"] - 1)
     agg = agg.reset_index()
 
     final = signals.merge(
-        agg[["signal_id", "peak_price", "trough_price", "decayed_return", "spy_cumulative", "total_return"]],
+        agg[["signal_id", "peak_price", "trough_price", "decayed_return", "spy_cumulative", "total_return", "disclosure_price_first"]],
         on="signal_id", how="left"
     )
 
     is_purchase = final["transaction_type"] == TransactionType.PURCHASE.value
-    purchase_mask = is_purchase & (final["entry_price"] != 0)
+    has_disclosure_price = final["disclosure_price_first"].notna() & (final["disclosure_price_first"] != 0)
+    purchase_mask = is_purchase & has_disclosure_price
     sale_mask = ~is_purchase & (final["trough_price"].notna()) & (final["trough_price"] != 0)
 
     peak_potential = np.zeros(len(final))
     peak_potential[purchase_mask.values] = (
-        (final.loc[purchase_mask.values, "peak_price"] / final.loc[purchase_mask.values, "entry_price"] - 1) * 100
+        (final.loc[purchase_mask.values, "peak_price"] / final.loc[purchase_mask.values, "disclosure_price_first"] - 1) * 100
     ).values
     peak_potential[sale_mask.values] = (
         (final.loc[sale_mask.values, "entry_price"] / final.loc[sale_mask.values, "trough_price"] - 1) * 100
@@ -241,7 +246,8 @@ def calculate_signal_potential(
     optional_columns = [column for column in ["owner_code", "amount_midpoint"] if column in final.columns]
     result_columns = [
         "member", "ticker", "disclosure_date", "signal_type", "horizon_days", "entry_price",
-        "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct", "total_return_pct", *optional_columns,
+        "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct", "total_return_pct",
+        "total_spy_alpha_pct", *optional_columns,
     ]
 
     return final.assign(
@@ -250,6 +256,7 @@ def calculate_signal_potential(
         decayed_return_pct=final["decayed_return"].values * 100,
         spy_alpha_pct=(final["decayed_return"] - final["spy_cumulative"]).values * 100,
         total_return_pct=final["total_return"].values * 100,
+        total_spy_alpha_pct=(final["total_return"] - final["spy_cumulative"]).values * 100,
     )[result_columns]
 
 
@@ -283,6 +290,11 @@ def _compute_member_stats(
         spy_alpha_vals = -spy_alpha_vals
     avg_spy_alpha = float(np.mean(spy_alpha_vals)) if len(spy_alpha_vals) > 0 else 0.0
 
+    total_spy_alpha_vals = grp["total_spy_alpha_pct"].dropna().values if "total_spy_alpha_pct" in grp.columns else np.array([])
+    if invert_returns:
+        total_spy_alpha_vals = -total_spy_alpha_vals
+    avg_total_spy_alpha = float(np.mean(total_spy_alpha_vals)) if len(total_spy_alpha_vals) > 0 else avg_spy_alpha
+
     stats = {
         "member": member,
         "median_return_pct": round(median_ret, 2),
@@ -294,6 +306,7 @@ def _compute_member_stats(
         "bayes_factor": round(bayes_factor, 3),
         "posterior_lift": round(posterior_lift, 3),
         "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
+        "avg_total_spy_alpha_pct": round(avg_total_spy_alpha, 2),
     }
     if threshold is not None:
         stats["peak_hit_rate_pct"] = round((grp["peak_potential_pct"] > threshold).mean() * 100, 2)
@@ -331,7 +344,7 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
         "median_return_pct": "median_decay_return_pct",
         "trades": "purchase_trades",
         "prob_up": "prob_up_given_buy",
-    }).sort_values("avg_spy_alpha_pct", ascending=False)
+    }).sort_values("avg_total_spy_alpha_pct", ascending=False)
 
 
 def get_top_signals(signal_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:

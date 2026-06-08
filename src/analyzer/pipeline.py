@@ -201,7 +201,7 @@ def _save_results(
     if show_signals:
         display_cols = [
             'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct',
-            'total_return_pct', 'signal_score'
+            'total_return_pct', 'total_spy_alpha_pct', 'signal_score'
         ]
     elif 'avg_loss_avoided_pct' in table.columns:
         display_cols = [
@@ -211,7 +211,7 @@ def _save_results(
         ]
     elif 'avg_spy_alpha_pct' in table.columns:
         display_cols = [
-            'member', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'conviction_score', 'purchase_trades'
+            'member', 'avg_total_spy_alpha_pct', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'conviction_score', 'purchase_trades'
         ]
     else:
         display_cols = list(table.columns)

@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import zipfile
 from datetime import date, datetime
 from io import BytesIO
@@ -164,22 +163,20 @@ class HouseTransactionSource(TransactionSource):
         metadata = self.fetch_metadata(year)
         ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
         pdf_dir = self.data_dir / str(year) / "pdfs"
-        os.makedirs(pdf_dir, exist_ok=True)
+        pdf_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"Processing {len(ptrs)} PTR filings for {year}")
 
         connector = aiohttp.TCPConnector(limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
             async with asyncio.TaskGroup() as tg:
-                tasks = []
-                for _, row in ptrs.iterrows():
-                    doc_id = row["DocID"]
-                    pdf_path = pdf_dir / f"{doc_id}.pdf"
-                    url = self.pdf_url_template.format(year=year, doc_id=doc_id)
-                    task = tg.create_task(
-                        self._download_pdf_async(session, doc_id, pdf_path, url)
-                    )
-                    tasks.append(task)
+                doc_ids = ptrs["DocID"].values
+                pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
+                urls = [self.pdf_url_template.format(year=year, doc_id=doc_id) for doc_id in doc_ids]
+                tasks = [
+                    tg.create_task(self._download_pdf_async(session, doc_id, pdf_path, url))
+                    for doc_id, pdf_path, url in zip(doc_ids, pdf_paths, urls)
+                ]
 
             results = [task.result() for task in tasks]
 
@@ -208,17 +205,17 @@ class HouseTransactionSource(TransactionSource):
 
         logger.info(f"Parsing {len(ptrs)} PDFs for {year}")
 
-        pdf_paths = []
-        member_lookup = {}
-        for _, row in ptrs.iterrows():
-            pdf_path = pdf_dir / f"{row['DocID']}.pdf"
-            if pdf_path.exists():
-                pdf_paths.append(pdf_path)
-                member_lookup[row["DocID"]] = {
-                    "First": row["First"],
-                    "Last": row["Last"],
-                    "FilingDate": row["FilingDate"],
-                }
+        doc_ids = ptrs["DocID"].values
+        all_pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
+        exists_mask = [p.exists() for p in all_pdf_paths]
+        pdf_paths = [p for p, e in zip(all_pdf_paths, exists_mask) if e]
+        existing_docs = ptrs[exists_mask]
+        member_lookup = dict(zip(
+            existing_docs["DocID"].values,
+            [{"First": f, "Last": l, "FilingDate": d} for f, l, d in zip(
+                existing_docs["First"].values, existing_docs["Last"].values, existing_docs["FilingDate"].values
+            )]
+        ))
 
         if not pdf_paths:
             raise DataSourceError(f"No PDF files found in {pdf_dir}")

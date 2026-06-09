@@ -260,6 +260,81 @@ def calculate_signal_potential(
     )[result_columns]
 
 
+def _assign_episode_ids(group_sorted: pd.DataFrame, max_gap_days: int) -> np.ndarray:
+    dates = pd.to_datetime(group_sorted["disclosure_date"])
+    if len(dates) <= 1:
+        return np.zeros(len(dates), dtype=np.int64)
+    gaps = dates.diff().dt.days.fillna(0).astype(int)
+    return (gaps > max_gap_days).cumsum().values.astype(np.int64)
+
+
+def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> pd.DataFrame:
+    if signals_df.empty:
+        return signals_df
+
+    group_cols = ["member", "ticker", "horizon_days", "signal_type"]
+    if not all(c in signals_df.columns for c in group_cols):
+        return signals_df
+
+    if "disclosure_date" not in signals_df.columns:
+        return signals_df
+
+    df = signals_df.copy()
+    df = df.sort_values(group_cols + ["disclosure_date"]).reset_index(drop=True)
+
+    episode_ids = np.zeros(len(df), dtype=np.int64)
+    for _, group in df.groupby(group_cols, sort=False):
+        loc = group.index
+        sorted_group = group.sort_values("disclosure_date")
+        episode_ids[loc] = _assign_episode_ids(sorted_group, max_gap_days)
+    df["_episode_id"] = episode_ids
+
+    if "amount_midpoint" in df.columns:
+        df["_weight"] = df["amount_midpoint"].fillna(1.0)
+    else:
+        df["_weight"] = 1.0
+
+    avg_cols = ["decayed_return_pct", "spy_alpha_pct", "total_return_pct", "total_spy_alpha_pct", "peak_potential_pct"]
+    existing_avg_cols = [c for c in avg_cols if c in df.columns]
+
+    for col in existing_avg_cols:
+        non_nan = df[col].notna()
+        df[f"_wp_{col}"] = np.where(non_nan, df[col] * df["_weight"], 0.0)
+        df[f"_ws_{col}"] = np.where(non_nan, df["_weight"], 0.0)
+
+    episode_key = group_cols + ["_episode_id"]
+
+    agg_dict = {
+        "episode_count": ("_weight", "count"),
+        "_weight_sum": ("_weight", "sum"),
+    }
+
+    for col, func in {"disclosure_date": "min", "entry_price": "first", "amount_midpoint": "sum"}.items():
+        if col in df.columns:
+            agg_dict[col] = (col, func)
+
+    if "owner_code" in df.columns:
+        agg_dict["owner_code"] = ("owner_code", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
+
+    for col in existing_avg_cols:
+        agg_dict[col] = (f"_wp_{col}", "sum")
+        agg_dict[f"_ws_{col}"] = (f"_ws_{col}", "sum")
+
+    collapsed = df.groupby(episode_key, sort=False).agg(**agg_dict).reset_index()
+
+    for col in existing_avg_cols:
+        ws = collapsed[f"_ws_{col}"]
+        collapsed[col] = np.where(ws > 0, collapsed[col] / ws, np.nan)
+        collapsed = collapsed.drop(columns=[f"_ws_{col}"])
+
+    collapsed = collapsed.drop(columns=["_weight_sum", "_episode_id"])
+
+    orig_cols = [c for c in signals_df.columns if c in collapsed.columns]
+    collapsed = collapsed[orig_cols + ["episode_count"]]
+
+    return collapsed
+
+
 def _compute_member_stats(
     member: str,
     grp: pd.DataFrame,
@@ -325,6 +400,8 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
     purchases = _apply_quality_filter(purchases)
     if purchases.empty:
         raise AnalysisError(f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})")
+
+    purchases = _collapse_to_episodes(purchases)
 
     market_prior = _compute_dynamic_prior(signal_df, horizon)
     member_stats = []
@@ -521,6 +598,8 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
     sales = _get_horizon_data(signal_df, horizon, TransactionType.SALE.value)
     if sales.empty:
         raise AnalysisError(f"No sale signals found for horizon {horizon}")
+
+    sales = _collapse_to_episodes(sales)
 
     market_prior = _compute_dynamic_prior(signal_df, horizon)
     member_stats = []

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import timedelta
 from dataclasses import dataclass
+from enum import StrEnum
 from functools import wraps
 import logging
-import os
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +14,13 @@ from analyzer.models import TransactionType
 from analyzer import analysis
 
 logger = logging.getLogger(__name__)
+
+
+class DisplayMode(StrEnum):
+    MEMBER_SIGNALS = "member_signals"
+    TOP_SIGNALS = "top_signals"
+    SALE_RANKINGS = "sale_rankings"
+    MEMBER_RANKINGS = "member_rankings"
 
 
 def _load_sector_data(tickers: list[str]) -> pd.DataFrame:
@@ -127,7 +134,13 @@ def run_analysis_pipeline(
     table = analysis.get_analysis_table(signals, params.member_filter, params.show_signals, params.horizons[0], params.top_n, params.threshold)
     logger.info(f"Generated analysis table with {len(table)} rows")
 
-    _save_results(table, output_format, params.member_filter, params.show_signals, data_dir)
+    if params.member_filter:
+        display_mode = DisplayMode.MEMBER_SIGNALS
+    elif params.show_signals:
+        display_mode = DisplayMode.TOP_SIGNALS
+    else:
+        display_mode = DisplayMode.MEMBER_RANKINGS
+    _save_results(table, output_format, display_mode, params.member_filter, params.show_signals, data_dir)
 
     sector_results = _analyze_by_sector(trades, signals, params.horizons)
     if sector_results is not None and not params.member_filter and not params.show_signals:
@@ -143,7 +156,7 @@ def run_sales_pipeline(
     trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, year, horizons)
     result = analysis.rank_sales(signals, horizons[0])
     result = result.head(top_n)
-    _save_results(result, output_format, member_filter=None, show_signals=False, data_dir=data_dir)
+    _save_results(result, output_format, DisplayMode.SALE_RANKINGS, member_filter=None, show_signals=False, data_dir=data_dir)
     return True
 
 
@@ -195,26 +208,27 @@ def run_recent_ticker_scoring(
     return True
 
 def _save_results(
-    table: pd.DataFrame, output_format: str,
+    table: pd.DataFrame, output_format: str, display_mode: DisplayMode,
     member_filter: str | None, show_signals: bool, data_dir: Path
 ) -> None:
-    if show_signals:
-        display_cols = [
-            'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct',
-            'total_return_pct', 'total_spy_alpha_pct', 'signal_score'
-        ]
-    elif 'avg_loss_avoided_pct' in table.columns:
-        display_cols = [
-            'member', 'avg_loss_avoided_pct', 'median_loss_avoided_pct',
-            'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'posterior_lift', 'bayes_factor',
-            'avg_spy_alpha_pct',
-        ]
-    elif 'avg_spy_alpha_pct' in table.columns:
-        display_cols = [
-            'member', 'avg_total_spy_alpha_pct', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'conviction_score', 'purchase_trades'
-        ]
-    else:
-        display_cols = list(table.columns)
+    match display_mode:
+        case DisplayMode.MEMBER_SIGNALS | DisplayMode.TOP_SIGNALS:
+            display_cols = [
+                'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct',
+                'total_return_pct', 'total_spy_alpha_pct', 'signal_score'
+            ]
+        case DisplayMode.SALE_RANKINGS:
+            display_cols = [
+                'member', 'avg_loss_avoided_pct', 'median_loss_avoided_pct',
+                'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'posterior_lift', 'bayes_factor',
+                'avg_spy_alpha_pct',
+            ]
+        case DisplayMode.MEMBER_RANKINGS:
+            display_cols = [
+                'member', 'avg_total_spy_alpha_pct', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'conviction_score', 'purchase_trades'
+            ]
+        case _:
+            display_cols = list(table.columns)
     available_display = [c for c in display_cols if c in table.columns]
     display_table = table[available_display]
 
@@ -227,7 +241,7 @@ def _save_results(
             filename = "member_rankings.csv"
 
         filepath = data_dir / filename
-        os.makedirs(data_dir, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
         display_table.to_csv(filepath, index=False)
         logger.info(f"Results saved to {filepath}")
     else:

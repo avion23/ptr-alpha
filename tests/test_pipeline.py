@@ -7,6 +7,7 @@ import pandas as pd
 
 from analyzer.pipeline import (
     AnalysisParams,
+    DisplayMode,
     TickerAnalysisParams,
     TickerScoringParams,
     _prepare_analysis_data,
@@ -220,7 +221,7 @@ class TestSaveResults(unittest.TestCase):
         })
 
         try:
-            _save_results(table, "console", None, False, Path("/tmp"))
+            _save_results(table, "console", DisplayMode.MEMBER_RANKINGS, None, False, Path("/tmp"))
         except Exception as e:
             self.fail(f"_save_results raised {e} unexpectedly")
 
@@ -237,7 +238,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", None, False, data_dir)
+            _save_results(table, "csv", DisplayMode.MEMBER_RANKINGS, None, False, data_dir)
 
             filepath = data_dir / "member_rankings.csv"
             self.assertTrue(filepath.exists())
@@ -254,7 +255,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", "John Doe", True, data_dir)
+            _save_results(table, "csv", DisplayMode.MEMBER_SIGNALS, "John Doe", True, data_dir)
 
             filepath = data_dir / "john_doe_signals.csv"
             self.assertTrue(filepath.exists())
@@ -267,24 +268,34 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", None, True, data_dir)
+            _save_results(table, "csv", DisplayMode.TOP_SIGNALS, None, True, data_dir)
 
             filepath = data_dir / "top_signals.csv"
             self.assertTrue(filepath.exists())
 
     def test_fallback_columns(self):
         table = pd.DataFrame({
+            "member": ["Alice"],
+            "avg_loss_avoided_pct": [12.5],
+            "median_loss_avoided_pct": [10.0],
+            "sale_trades": [3],
+            "sharpe_ratio": [1.1],
+            "bayes_win_prob": [0.75],
+            "bayes_factor": [2.0],
+            "avg_spy_alpha_pct": [8.0],
             "col_a": [1],
             "col_b": [2],
         })
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", None, False, data_dir)
+            _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
 
             saved = pd.read_csv(data_dir / "member_rankings.csv")
-            self.assertIn("col_a", saved.columns)
-            self.assertIn("col_b", saved.columns)
+            self.assertIn("avg_loss_avoided_pct", saved.columns)
+            self.assertIn("median_loss_avoided_pct", saved.columns)
+            self.assertNotIn("col_a", saved.columns)
+            self.assertNotIn("col_b", saved.columns)
 
     def test_sales_columns_included_in_display(self):
         table = pd.DataFrame({
@@ -300,7 +311,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", None, False, data_dir)
+            _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
 
             saved = pd.read_csv(data_dir / "member_rankings.csv")
             self.assertIn("avg_loss_avoided_pct", saved.columns)
@@ -322,7 +333,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", None, False, data_dir)
+            _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
 
             saved = pd.read_csv(data_dir / "member_rankings.csv")
             self.assertNotIn("purchase_trades", saved.columns)

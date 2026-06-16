@@ -217,6 +217,8 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
             continue
 
         ticker_match = re.search(r'\(([A-Z][A-Z0-9.\-]{0,5})\)', stripped)
+        amount_match = re.search(r'\$[\d,]+\s*-\s*\$[\d,]+', stripped)
+        amount_str = amount_match.group(0) if amount_match else None
 
         if ticker_match:
             asset_name = stripped[:ticker_match.end()].strip()
@@ -236,9 +238,9 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
                 date_str = date_match.group(1)
 
             if tx_type and date_str:
-                rows.append([asset_name, tx_type, date_str])
+                rows.append([asset_name, tx_type, date_str, amount_str or ""])
             elif pending_tx:
-                rows.append([asset_name, pending_tx['tx_type'], pending_tx['date_str']])
+                rows.append([asset_name, pending_tx['tx_type'], pending_tx['date_str'], pending_tx.get('amount') or ""])
 
             pending_tx = None
 
@@ -258,7 +260,7 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
             if tx_type:
                 date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', stripped)
                 if date_match:
-                    pending_tx = {'tx_type': tx_type, 'date_str': date_match.group(1)}
+                    pending_tx = {'tx_type': tx_type, 'date_str': date_match.group(1), 'amount': amount_str}
 
     return rows
 
@@ -285,5 +287,5 @@ def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
     if not all_rows:
         return []
 
-    table = [['Asset Name', 'Transaction Type', 'Transaction Date']] + all_rows
+    table = [['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']] + all_rows
     return [table]

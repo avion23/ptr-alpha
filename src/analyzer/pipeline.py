@@ -84,11 +84,11 @@ class TickerAnalysisParams:
 class BacktestParams:
     start_date: date
     end_date: date
-    horizon: int = 90
+    horizon: int = 120
     lookback_days: int = 60
     training_lookback_days: int = 365
     min_buyers: int = 2
-    top_n: int = 10
+    top_n: int = 5
     threshold: float = 5.0
     frequency_days: int = 30
 

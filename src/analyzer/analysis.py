@@ -725,26 +725,37 @@ def evaluate_backtest(
 
     spy_start = _price_at_or_before(prices_df, "SPY", as_of_date)
     spy_end = _price_at_or_near(prices_df, "SPY", exit_date)
-    spy_return_pct = ((spy_end / spy_start - 1) * 100) if spy_start and spy_end else None
+    if not spy_start or not spy_end:
+        raise AnalysisError(
+            f"SPY price not available for backtest period "
+            f"(as_of={as_of_date.date()}, exit={exit_date.date()})"
+        )
+    spy_return_pct = (spy_end / spy_start - 1) * 100
 
     rows = []
     for _, rec in recommendations.iterrows():
         ticker = rec["ticker"]
         entry = _price_at_or_before(prices_df, ticker, as_of_date)
         exit_price = _price_at_or_near(prices_df, ticker, exit_date)
-        if entry and exit_price:
-            return_pct = (exit_price / entry - 1) * 100
-            alpha_pct = return_pct - spy_return_pct if spy_return_pct is not None else None
-        else:
-            return_pct = None
-            alpha_pct = None
+        if not entry:
+            raise AnalysisError(
+                f"No price for {ticker} at/as_of {as_of_date.date()} "
+                f"— cannot backtest"
+            )
+        if not exit_price:
+            raise AnalysisError(
+                f"No price for {ticker} near exit {exit_date.date()} "
+                f"(as_of={as_of_date.date()}) — cannot backtest"
+            )
+        return_pct = (exit_price / entry - 1) * 100
+        alpha_pct = return_pct - spy_return_pct
         rows.append({
             "ticker": ticker,
-            "bt_entry_price": round(entry, 2) if entry else None,
-            "bt_exit_price": round(exit_price, 2) if exit_price else None,
-            "bt_return_pct": round(return_pct, 2) if return_pct is not None else None,
-            "bt_spy_return_pct": round(spy_return_pct, 2) if spy_return_pct is not None else None,
-            "bt_alpha_pct": round(alpha_pct, 2) if alpha_pct is not None else None,
+            "bt_entry_price": round(entry, 2),
+            "bt_exit_price": round(exit_price, 2),
+            "bt_return_pct": round(return_pct, 2),
+            "bt_spy_return_pct": round(spy_return_pct, 2),
+            "bt_alpha_pct": round(alpha_pct, 2),
         })
 
     eval_df = pd.DataFrame(rows)
@@ -752,7 +763,7 @@ def evaluate_backtest(
 
 
 def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
-    valid = results.dropna(subset=["bt_return_pct"]).copy()
+    valid = results.dropna(subset=["bt_return_pct"])
     if valid.empty:
         return pd.DataFrame()
 

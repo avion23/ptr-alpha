@@ -305,12 +305,22 @@ class Database:
         existing_tickers = set(existing["ticker"].unique())
         missing_tickers = [t for t in tickers if t not in existing_tickers]
 
-        if not missing_tickers:
-            existing_dates = set(existing["date"].unique())
-            missing_dates = [d for d in all_dates if d not in existing_dates]
-            return [], missing_dates
+        start_cutoff = pd.Timestamp(start_date) + pd.Timedelta(days=7)
+        ticker_starts = existing.groupby("ticker")["date"].min()
+        insufficient: list[str] = []
+        for t in tickers:
+            if t in ticker_starts.index:
+                val = ticker_starts.loc[t]
+                if pd.notna(val) and pd.Timestamp(val) > start_cutoff:
+                    insufficient.append(t)
 
-        return missing_tickers, all_dates.to_list()
+        need_full_fetch = missing_tickers + insufficient
+        if need_full_fetch:
+            return need_full_fetch, all_dates.to_list()
+
+        existing_dates = set(existing["date"].unique())
+        missing_dates = [d for d in all_dates if d not in existing_dates]
+        return [], missing_dates
 
     def close(self) -> None:
         self.conn.close()

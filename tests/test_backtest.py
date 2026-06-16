@@ -257,12 +257,19 @@ class TestEvaluateBacktest(unittest.TestCase):
         )
         self.assertTrue(result.empty)
 
-    def test_missing_exit_price_yields_none(self):
+    def test_missing_exit_price_raises(self):
         short_prices = self.prices.loc[:"2025-01-15"].copy()
-        result = evaluate_backtest(
-            self.recommendations, short_prices, pd.Timestamp("2025-01-01"), horizon=90
-        )
-        self.assertTrue(result["bt_return_pct"].isna().all())
+        with self.assertRaises(AnalysisError):
+            evaluate_backtest(
+                self.recommendations, short_prices, pd.Timestamp("2025-01-01"), horizon=90
+            )
+
+    def test_missing_entry_price_raises(self):
+        no_aapl = self.prices.drop(columns=["AAPL"])
+        with self.assertRaises(AnalysisError):
+            evaluate_backtest(
+                self.recommendations, no_aapl, pd.Timestamp("2025-01-01"), horizon=90
+            )
 
 
 class TestSummarizeBacktest(unittest.TestCase):

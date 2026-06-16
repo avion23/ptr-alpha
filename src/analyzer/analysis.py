@@ -17,6 +17,7 @@ BUYER_CONVERGENCE_WEIGHT = 0.30
 MIN_ENTRY_PRICE = 3.0
 CONVICTION_WEIGHT_ALPHA = 0.6
 CONVICTION_WEIGHT_REALIZED = 0.4
+TICKER_PERF_MIN_TRADES = 3
 
 
 def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
@@ -100,6 +101,34 @@ def _owner_score_factor(trades: pd.DataFrame) -> float:
         return 1.0
     dependent_child_ratio = (owner_codes == "DC").mean()
     return 1.0 - dependent_child_ratio * MAX_DISCLOSURE_METADATA_ADJUSTMENT
+
+
+def _compute_ticker_member_performance(
+    signals_df: pd.DataFrame, ticker: str, horizon: int
+) -> dict[str, tuple[float, int]]:
+    """Per-member win rate on a specific ticker from historical signals.
+
+    Returns {member: (win_rate, trade_count)} for members with >= TICKER_PERF_MIN_TRADES trades.
+    """
+    if signals_df.empty or "ticker" not in signals_df.columns:
+        return {}
+
+    purchases = signals_df[
+        (signals_df["ticker"] == ticker)
+        & (signals_df["horizon_days"] == horizon)
+        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
+    ]
+    if purchases.empty:
+        return {}
+
+    result: dict[str, tuple[float, int]] = {}
+    for member, grp in purchases.groupby("member"):
+        returns = grp["decayed_return_pct"].dropna()
+        if len(returns) < TICKER_PERF_MIN_TRADES:
+            continue
+        win_rate = float((returns > 0).mean())
+        result[member] = (win_rate, len(returns))
+    return result
 
 
 def _get_top_signals(signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:
@@ -469,6 +498,7 @@ def score_ticker_by_buyers(
     threshold: float = 5.0,
     member_rankings: pd.DataFrame | None = None,
     min_buyers: int = 2,
+    ticker_perf_signals: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if signals_df.empty:
         raise AnalysisError("Empty signal dataframe")
@@ -502,11 +532,25 @@ def score_ticker_by_buyers(
     )
 
     if buyer_stats.empty:
+        fallback_score = 0.0
+        fallback_source = "none"
+        perf_signals = ticker_perf_signals if ticker_perf_signals is not None else signals_df
+        if not perf_signals.empty and "ticker" in perf_signals.columns:
+            ticker_hist = perf_signals[
+                (perf_signals["ticker"] == ticker)
+                & (perf_signals["signal_type"] == TransactionType.PURCHASE.value)
+                & (perf_signals["total_spy_alpha_pct"].notna())
+            ]
+            if len(ticker_hist) >= 2:
+                fallback_score = float(ticker_hist["total_spy_alpha_pct"].mean())
+                fallback_source = f"ticker_hist({len(ticker_hist)})"
+
         return pd.DataFrame({
             "ticker": [ticker],
             "num_buyers": [len(buyers)],
             "buyers": [", ".join(buyers[:3])],
-            "signal_score": [0.0]
+            "signal_score": [round(fallback_score, 2)],
+            "fallback_source": [fallback_source],
         })
 
     best_rank = buyer_stats["avg_spy_alpha_pct"].max()
@@ -532,7 +576,26 @@ def score_ticker_by_buyers(
     base_signal_score = buyer_diminishing * quality_adjusted_avg
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
-    signal_score = base_signal_score * size_factor * owner_factor
+
+    ticker_perf = _compute_ticker_member_performance(
+        ticker_perf_signals if ticker_perf_signals is not None else signals_df,
+        ticker, horizon,
+    )
+    if ticker_perf:
+        member_trade_counts = ticker_trades.groupby("member").size()
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for member in buyer_stats["member"]:
+            if member in ticker_perf:
+                win_rate, _ = ticker_perf[member]
+                n = member_trade_counts.get(member, 1)
+                weighted_sum += win_rate * n
+                weight_total += n
+        ticker_perf_factor = weighted_sum / weight_total if weight_total > 0 else 1.0
+    else:
+        ticker_perf_factor = 1.0
+
+    signal_score = base_signal_score * size_factor * owner_factor * ticker_perf_factor
 
     top_buyers = buyer_stats["member"].head(3).tolist()
     buyer_label = f"Top {len(top_buyers)} of {len(buyers)}" if len(buyers) > 3 else f"{len(buyers)}"
@@ -547,10 +610,12 @@ def score_ticker_by_buyers(
         "best_buyer_performance": [round(best_rank, 2)],
         "total_buyer_trades": [int(total_trades)],
         "convergence_factor": [round(buyer_diminishing, 3)],
+        "ticker_perf_factor": [round(ticker_perf_factor, 3)],
         "base_signal_score": [round(base_signal_score, 2)],
         "size_factor": [round(size_factor, 3)],
         "owner_factor": [round(owner_factor, 3)],
-        "signal_score": [round(signal_score, 2)]
+        "signal_score": [round(signal_score, 2)],
+        "fallback_source": ["member_ranked"],
     })
 
 
@@ -710,12 +775,18 @@ def backtest_recommendations(
     if not candidate_tickers:
         return pd.DataFrame()
 
+    ticker_perf_signals = signals_df[
+        (signals_df["horizon_days"] == horizon)
+        & (signals_df["disclosure_date"] <= as_of_date)
+    ].copy()
+
     scores = []
     for ticker in candidate_tickers:
         try:
             score = score_ticker_by_buyers(
                 ticker, recent_trades, training, horizon, threshold,
                 member_rankings, min_buyers,
+                ticker_perf_signals=ticker_perf_signals,
             )
             scores.append(score)
         except AnalysisError:

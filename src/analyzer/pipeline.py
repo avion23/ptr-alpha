@@ -240,7 +240,8 @@ def run_backtest_pipeline(
     price_start = tx_start
     price_end = params.end_date + timedelta(days=params.horizon + 10)
     all_tickers = all_transactions["ticker"].unique().tolist()
-    prices = price_source.get_prices(all_tickers, price_start, price_end)
+    all_tickers = sorted(set(all_tickers) | {"SPY"})
+    prices = transaction_source.db.get_prices(all_tickers, price_start, price_end)
 
     if prices.empty:
         raise DataSourceError("No price data available for backtest window")
@@ -275,7 +276,11 @@ def run_backtest_pipeline(
             print("  No recommendations (insufficient training or candidate data)")
             continue
 
-        evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
+        try:
+            evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
+        except Exception as e:
+            print(f"  SKIPPED: {e}")
+            continue
         evaluated.insert(0, "as_of_date", as_of_ts.date())
         all_results.append(evaluated)
 

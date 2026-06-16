@@ -618,3 +618,162 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
         "trades": "sale_trades",
         "prob_up": "prob_up_given_sell",
     }).sort_values("avg_spy_alpha_pct", ascending=False)
+
+
+def _price_at_or_before(
+    prices_df: pd.DataFrame, ticker: str, target_date: pd.Timestamp
+) -> float | None:
+    if ticker not in prices_df.columns:
+        return None
+    series = prices_df[ticker].dropna()
+    eligible = series[series.index <= pd.Timestamp(target_date)]
+    if eligible.empty:
+        return None
+    return float(eligible.iloc[-1])
+
+
+def _price_at_or_near(
+    prices_df: pd.DataFrame, ticker: str, target_date: pd.Timestamp,
+    tolerance_days: int = 7,
+) -> float | None:
+    if ticker not in prices_df.columns:
+        return None
+    series = prices_df[ticker].dropna()
+    target = pd.Timestamp(target_date)
+    lower = target - pd.Timedelta(days=tolerance_days)
+    upper = target + pd.Timedelta(days=tolerance_days)
+    window = series[(series.index >= lower) & (series.index <= upper)]
+    if window.empty:
+        return None
+    distances = np.abs(window.index - target)
+    return float(window.iloc[distances.argmin()])
+
+
+def backtest_recommendations(
+    signals_df: pd.DataFrame,
+    transactions_df: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    horizon: int = 90,
+    lookback_days: int = 60,
+    min_buyers: int = 2,
+    top_n: int = 10,
+    threshold: float = 5.0,
+) -> pd.DataFrame:
+    elapsed_cutoff = as_of_date - pd.Timedelta(days=horizon)
+    training = signals_df[
+        (signals_df["horizon_days"] == horizon)
+        & (signals_df["disclosure_date"] <= elapsed_cutoff)
+    ].copy()
+
+    member_rankings = None
+    if not training.empty:
+        try:
+            member_rankings = rank_members(training, horizon, threshold)
+        except AnalysisError:
+            member_rankings = None
+
+    if member_rankings is None or member_rankings.empty:
+        return pd.DataFrame()
+
+    lookback_start = as_of_date - pd.Timedelta(days=lookback_days)
+    recent_mask = (
+        (transactions_df["disclosure_date"] >= lookback_start)
+        & (transactions_df["disclosure_date"] <= as_of_date)
+        & (transactions_df["transaction_type"] == TransactionType.PURCHASE.value)
+    )
+    recent_trades = transactions_df[recent_mask].copy()
+
+    if recent_trades.empty:
+        return pd.DataFrame()
+
+    buyer_counts = recent_trades.groupby("ticker")["member"].nunique()
+    candidate_tickers = buyer_counts[buyer_counts >= min_buyers].index.tolist()
+
+    if not candidate_tickers:
+        return pd.DataFrame()
+
+    scores = []
+    for ticker in candidate_tickers:
+        try:
+            score = score_ticker_by_buyers(
+                ticker, recent_trades, training, horizon, threshold,
+                member_rankings, min_buyers,
+            )
+            scores.append(score)
+        except AnalysisError:
+            continue
+
+    if not scores:
+        return pd.DataFrame()
+
+    result = pd.concat(scores, ignore_index=True)
+    result = result.sort_values("signal_score", ascending=False).head(top_n).reset_index(drop=True)
+    result.insert(0, "rank", range(1, len(result) + 1))
+    return result
+
+
+def evaluate_backtest(
+    recommendations: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    horizon: int,
+) -> pd.DataFrame:
+    if recommendations.empty:
+        return recommendations
+
+    exit_date = as_of_date + pd.Timedelta(days=horizon)
+
+    spy_start = _price_at_or_before(prices_df, "SPY", as_of_date)
+    spy_end = _price_at_or_near(prices_df, "SPY", exit_date)
+    spy_return_pct = ((spy_end / spy_start - 1) * 100) if spy_start and spy_end else None
+
+    rows = []
+    for _, rec in recommendations.iterrows():
+        ticker = rec["ticker"]
+        entry = _price_at_or_before(prices_df, ticker, as_of_date)
+        exit_price = _price_at_or_near(prices_df, ticker, exit_date)
+        if entry and exit_price:
+            return_pct = (exit_price / entry - 1) * 100
+            alpha_pct = return_pct - spy_return_pct if spy_return_pct is not None else None
+        else:
+            return_pct = None
+            alpha_pct = None
+        rows.append({
+            "ticker": ticker,
+            "bt_entry_price": round(entry, 2) if entry else None,
+            "bt_exit_price": round(exit_price, 2) if exit_price else None,
+            "bt_return_pct": round(return_pct, 2) if return_pct is not None else None,
+            "bt_spy_return_pct": round(spy_return_pct, 2) if spy_return_pct is not None else None,
+            "bt_alpha_pct": round(alpha_pct, 2) if alpha_pct is not None else None,
+        })
+
+    eval_df = pd.DataFrame(rows)
+    return recommendations.merge(eval_df, on="ticker", how="left")
+
+
+def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
+    valid = results.dropna(subset=["bt_return_pct"]).copy()
+    if valid.empty:
+        return pd.DataFrame()
+
+    by_rank = []
+    for rank, grp in valid.groupby("rank"):
+        by_rank.append({
+            "rank": rank,
+            "count": len(grp),
+            "win_rate_pct": round((grp["bt_return_pct"] > 0).mean() * 100, 1),
+            "avg_return_pct": round(grp["bt_return_pct"].mean(), 2),
+            "avg_alpha_pct": round(grp["bt_alpha_pct"].mean(), 2) if "bt_alpha_pct" in grp.columns else None,
+        })
+
+    summary = pd.DataFrame(by_rank)
+
+    overall = {
+        "rank": "ALL",
+        "count": len(valid),
+        "win_rate_pct": round((valid["bt_return_pct"] > 0).mean() * 100, 1),
+        "avg_return_pct": round(valid["bt_return_pct"].mean(), 2),
+        "avg_alpha_pct": round(valid["bt_alpha_pct"].mean(), 2) if "bt_alpha_pct" in valid.columns else None,
+    }
+    summary = pd.concat([summary, pd.DataFrame([overall])], ignore_index=True)
+    return summary

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import date, timedelta
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import wraps
@@ -79,6 +79,18 @@ class TickerAnalysisParams:
     year: int
     horizon: int = 90
     threshold: float = 5.0
+
+@dataclass
+class BacktestParams:
+    start_date: date
+    end_date: date
+    horizon: int = 90
+    lookback_days: int = 60
+    training_lookback_days: int = 365
+    min_buyers: int = 2
+    top_n: int = 10
+    threshold: float = 5.0
+    frequency_days: int = 30
 
 def pipeline_step(func):
     @wraps(func)
@@ -206,6 +218,95 @@ def run_recent_ticker_scoring(
     print(f"\n=== Top {params.top_n} Recent Signals (Last {params.days_back} Days, {params.min_buyers}+ Buyers) ===")
     print(result.to_string(index=False))
     return True
+
+
+@pipeline_step
+def run_backtest_pipeline(
+    params: BacktestParams,
+    transaction_source,
+    price_source,
+) -> bool:
+    tx_start = params.start_date - timedelta(
+        days=params.training_lookback_days + params.horizon + 30
+    )
+    tx_end = params.end_date
+
+    all_transactions = transaction_source.db.get_transactions_by_date_range(tx_start, tx_end)
+    if all_transactions.empty:
+        raise DataSourceError(f"No transactions found between {tx_start} and {tx_end}")
+
+    logger.info(f"Loaded {len(all_transactions)} transactions for backtest window")
+
+    price_start = tx_start
+    price_end = params.end_date + timedelta(days=params.horizon + 10)
+    all_tickers = all_transactions["ticker"].unique().tolist()
+    prices = price_source.get_prices(all_tickers, price_start, price_end)
+
+    if prices.empty:
+        raise DataSourceError("No price data available for backtest window")
+
+    entry_prices = transaction_source.db.get_entry_prices(all_tickers, price_start, price_end)
+    if entry_prices.empty:
+        raise DataSourceError("No entry prices could be computed")
+
+    signals = analysis.calculate_signal_potential(entry_prices, prices, [params.horizon])
+    logger.info(f"Computed {len(signals)} signals for backtest")
+
+    as_of_dates = pd.date_range(
+        params.start_date, params.end_date, freq=f"{params.frequency_days}D"
+    )
+
+    all_results = []
+    for as_of in as_of_dates:
+        as_of_ts = pd.Timestamp(as_of)
+
+        recs = analysis.backtest_recommendations(
+            signals, all_transactions, as_of_ts,
+            horizon=params.horizon,
+            lookback_days=params.lookback_days,
+            min_buyers=params.min_buyers,
+            top_n=params.top_n,
+            threshold=params.threshold,
+        )
+
+        print(f"\n=== Backtest as of {as_of_ts.date()} ===")
+
+        if recs.empty:
+            print("  No recommendations (insufficient training or candidate data)")
+            continue
+
+        evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
+        evaluated.insert(0, "as_of_date", as_of_ts.date())
+        all_results.append(evaluated)
+
+        display_cols = [
+            "rank", "ticker", "num_buyers", "signal_score",
+            "bt_entry_price", "bt_exit_price", "bt_return_pct", "bt_spy_return_pct", "bt_alpha_pct",
+        ]
+        available = [c for c in display_cols if c in evaluated.columns]
+        print(evaluated[available].to_string(index=False))
+
+    if not all_results:
+        print("\n=== No backtest results produced ===")
+        return True
+
+    combined = pd.concat(all_results, ignore_index=True)
+
+    print(f"\n{'=' * 60}")
+    print("=== Backtest Summary (by rank) ===")
+    print(f"{'=' * 60}")
+    summary = analysis.summarize_backtest(combined)
+    if not summary.empty:
+        print(summary.to_string(index=False))
+
+    valid_returns = combined.dropna(subset=["bt_return_pct"])
+    evaluable_dates = valid_returns["as_of_date"].nunique() if not valid_returns.empty else 0
+    total_dates = combined["as_of_date"].nunique() if not combined.empty else 0
+    print(f"\nDates evaluated: {evaluable_dates}/{total_dates}")
+    print(f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}")
+
+    return True
+
 
 def _save_results(
     table: pd.DataFrame, output_format: str, display_mode: DisplayMode,

@@ -201,6 +201,20 @@ class Database:
         ).fetchdf()
         return result
 
+    def get_transactions_by_date_range(self, start_date: date, end_date: date) -> pd.DataFrame:
+        result = self.conn.execute(
+            """
+            SELECT member, ticker, transaction_date, disclosure_date, transaction_type,
+                   owner_code, amount_raw, amount_midpoint
+            FROM transactions
+            WHERE disclosure_date BETWEEN ? AND ?
+              AND transaction_date <= disclosure_date
+            ORDER BY disclosure_date DESC
+        """,
+            [start_date, end_date],
+        ).fetchdf()
+        return result
+
     def get_entry_prices(self, tickers: list[str], start_date: date, end_date: date) -> pd.DataFrame:
         if not tickers:
             return pd.DataFrame()

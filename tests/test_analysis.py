@@ -262,8 +262,8 @@ class TestAnalysis(unittest.TestCase):
         expected_base = round(buyer_diminishing * quality_adjusted_avg, 2)
         inflated_buyers = 1.0 + np.log1p(2) * 0.30
         inflated_base = round(inflated_buyers * quality_adjusted_avg, 2)
-        self.assertEqual(score.iloc[0]['num_buyers'], 2)
-        self.assertEqual(score.iloc[0]['total_buyers'], 3)
+        self.assertEqual(score.iloc[0]['num_buyers'], 3)
+        self.assertEqual(score.iloc[0]['rated_buyers'], 2)
         self.assertEqual(score.iloc[0]['base_signal_score'], expected_base)
         self.assertNotEqual(score.iloc[0]['base_signal_score'], inflated_base)
 

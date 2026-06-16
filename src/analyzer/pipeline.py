@@ -306,8 +306,8 @@ def run_backtest_pipeline(
 
     valid_returns = combined.dropna(subset=["bt_return_pct"])
     evaluable_dates = valid_returns["as_of_date"].nunique() if not valid_returns.empty else 0
-    total_dates = combined["as_of_date"].nunique() if not combined.empty else 0
-    print(f"\nDates evaluated: {evaluable_dates}/{total_dates}")
+    total_as_of_dates = len(pd.date_range(params.start_date, params.end_date, freq=f"{params.frequency_days}D"))
+    print(f"\nDates evaluated: {evaluable_dates}/{total_as_of_dates}")
     print(f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}")
 
     return True

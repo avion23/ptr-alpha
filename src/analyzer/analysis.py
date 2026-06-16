@@ -539,8 +539,8 @@ def score_ticker_by_buyers(
 
     return pd.DataFrame({
         "ticker": [ticker],
-        "num_buyers": [rated_buyers],
-        "total_buyers": [len(buyers)],
+        "num_buyers": [len(buyers)],
+        "rated_buyers": [rated_buyers],
         "buyer_label": [buyer_label],
         "buyers": [", ".join(top_buyers)],
         "avg_buyer_performance": [round(quality_adjusted_avg, 2)],
@@ -649,6 +649,24 @@ def _price_at_or_near(
     return float(window.iloc[distances.argmin()])
 
 
+def _price_on_or_before(
+    prices_df: pd.DataFrame, ticker: str, target_date: pd.Timestamp,
+    max_staleness_days: int = 5,
+) -> float | None:
+    if ticker not in prices_df.columns:
+        return None
+    series = prices_df[ticker].dropna()
+    target = pd.Timestamp(target_date)
+    eligible = series[series.index <= target]
+    if eligible.empty:
+        return None
+    price_date = eligible.index[-1]
+    staleness = (target - price_date).days
+    if staleness > max_staleness_days:
+        return None
+    return float(eligible.iloc[-1])
+
+
 def backtest_recommendations(
     signals_df: pd.DataFrame,
     transactions_df: pd.DataFrame,
@@ -724,7 +742,7 @@ def evaluate_backtest(
     exit_date = as_of_date + pd.Timedelta(days=horizon)
 
     spy_start = _price_at_or_before(prices_df, "SPY", as_of_date)
-    spy_end = _price_at_or_near(prices_df, "SPY", exit_date)
+    spy_end = _price_on_or_before(prices_df, "SPY", exit_date)
     if not spy_start or not spy_end:
         raise AnalysisError(
             f"SPY price not available for backtest period "
@@ -736,7 +754,7 @@ def evaluate_backtest(
     for _, rec in recommendations.iterrows():
         ticker = rec["ticker"]
         entry = _price_at_or_before(prices_df, ticker, as_of_date)
-        exit_price = _price_at_or_near(prices_df, ticker, exit_date)
+        exit_price = _price_on_or_before(prices_df, ticker, exit_date)
         if not entry:
             raise AnalysisError(
                 f"No price for {ticker} at/as_of {as_of_date.date()} "
@@ -744,7 +762,7 @@ def evaluate_backtest(
             )
         if not exit_price:
             raise AnalysisError(
-                f"No price for {ticker} near exit {exit_date.date()} "
+                f"No price for {ticker} on/before exit {exit_date.date()} "
                 f"(as_of={as_of_date.date()}) — cannot backtest"
             )
         return_pct = (exit_price / entry - 1) * 100

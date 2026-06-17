@@ -91,6 +91,9 @@ class BacktestParams:
     top_n: int = 5
     threshold: float = 5.0
     frequency_days: int = 30
+    dynamic_exit: bool = False
+    max_horizon: int = 365
+    rho: float = 0.000137
 
 def pipeline_step(func):
     @wraps(func)
@@ -268,6 +271,7 @@ def run_backtest_pipeline(
             min_buyers=params.min_buyers,
             top_n=params.top_n,
             threshold=params.threshold,
+            prices_df=prices,
         )
 
         print(f"\n=== Backtest as of {as_of_ts.date()} ===")
@@ -277,7 +281,13 @@ def run_backtest_pipeline(
             continue
 
         try:
-            evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
+            if params.dynamic_exit:
+                evaluated = analysis.evaluate_backtest_dynamic(
+                    recs, prices, as_of_ts,
+                    max_horizon=params.max_horizon, rho=params.rho,
+                )
+            else:
+                evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
         except Exception as e:
             print(f"  SKIPPED: {e}")
             continue
@@ -285,7 +295,7 @@ def run_backtest_pipeline(
         all_results.append(evaluated)
 
         display_cols = [
-            "rank", "ticker", "num_buyers", "signal_score",
+            "rank", "ticker", "num_buyers", "signal_score", "ou_entry_value",
             "bt_entry_price", "bt_exit_price", "bt_return_pct", "bt_spy_return_pct", "bt_alpha_pct",
         ]
         available = [c for c in display_cols if c in evaluated.columns]

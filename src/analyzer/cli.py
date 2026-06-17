@@ -174,6 +174,8 @@ def backtest(
     top_n: int = typer.Option(5, help="Top N recommendations per backtest date"),
     threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
     frequency_days: int = typer.Option(30, help="Days between rolling backtest dates"),
+    dynamic_exit: bool = typer.Option(False, "--dynamic-exit", help="Use OU return process for dynamic exit timing"),
+    max_horizon: int = typer.Option(365, help="Max hold period in days (dynamic exit only)"),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """
@@ -209,6 +211,8 @@ def backtest(
         top_n=top_n,
         threshold=threshold,
         frequency_days=frequency_days,
+        dynamic_exit=dynamic_exit,
+        max_horizon=max_horizon,
     )
     success = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source)
     raise typer.Exit(0 if success else 1)

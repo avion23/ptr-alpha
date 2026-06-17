@@ -7,6 +7,7 @@ import pandas as pd
 from analyzer.analysis import (
     backtest_recommendations,
     evaluate_backtest,
+    evaluate_backtest_dynamic,
     summarize_backtest,
     _price_at_or_before,
 )
@@ -369,6 +370,102 @@ class TestDatabaseDateRange(DatabaseTestCase):
             date(2025, 1, 1), date(2025, 6, 1)
         )
         self.assertTrue(result.empty)
+
+
+class TestEvaluateBacktestDynamic(unittest.TestCase):
+
+    def _make_prices(self, ticker, dates, start_price=100.0, daily_drift=0.001):
+        """Generate a pivoted price DataFrame (tickers as columns, dates as index)."""
+        prices = [start_price]
+        rng = np.random.default_rng(42)
+        for _ in range(1, len(dates)):
+            prices.append(prices[-1] * (1 + daily_drift + rng.normal(0, 0.01)))
+        df = pd.DataFrame({ticker: prices, "SPY": [100.0] * len(dates)}, index=dates)
+        return df
+
+    def test_dynamic_exit_early_on_losses(self):
+        """Position that drops should exit before max_horizon."""
+        dates = pd.date_range("2024-01-02", periods=120, freq="B")
+        prices = self._make_prices("AAPL", dates, start_price=100.0, daily_drift=-0.003)
+
+        recs = pd.DataFrame([{
+            "rank": 1, "ticker": "AAPL", "num_buyers": 3, "signal_score": 3.0,
+        }])
+        as_of = pd.Timestamp("2024-01-02")
+
+        result = evaluate_backtest_dynamic(
+            recs, prices, as_of, max_horizon=120, default_theta=0.05,
+        )
+        self.assertLess(result.iloc[0]["bt_exit_day"], 120)
+        self.assertLess(result.iloc[0]["bt_return_pct"], 0)
+
+    def test_dynamic_exit_holds_winners(self):
+        """Strong uptrend should not trigger early exit."""
+        dates = pd.date_range("2024-01-02", periods=120, freq="B")
+        prices = self._make_prices("AAPL", dates, start_price=100.0, daily_drift=0.005)
+
+        recs = pd.DataFrame([{
+            "rank": 1, "ticker": "AAPL", "num_buyers": 3, "signal_score": 3.0,
+        }])
+        as_of = pd.Timestamp("2024-01-02")
+
+        result = evaluate_backtest_dynamic(
+            recs, prices, as_of, max_horizon=120, default_theta=0.05,
+        )
+        # Should either exit late or at max_horizon
+        self.assertGreater(result.iloc[0]["bt_return_pct"], 0)
+
+    def test_empty_recommendations(self):
+        """Empty recs returns empty."""
+        dates = pd.date_range("2024-01-02", periods=50, freq="B")
+        spy = pd.DataFrame({"SPY": [100.0] * len(dates)}, index=dates)
+        result = evaluate_backtest_dynamic(
+            pd.DataFrame(), spy, pd.Timestamp("2024-01-02"),
+        )
+        self.assertTrue(result.empty)
+
+    def test_forced_exit_at_max_horizon(self):
+        """Flat price with noise may exit early, but return should be ~0."""
+        dates = pd.date_range("2024-01-02", periods=120, freq="B")
+        prices = pd.DataFrame({
+            "AAPL": [100.0] * len(dates),
+            "SPY": [100.0] * len(dates),
+        }, index=dates)
+
+        recs = pd.DataFrame([{
+            "rank": 1, "ticker": "AAPL", "num_buyers": 3, "signal_score": 3.0,
+        }])
+        as_of = pd.Timestamp("2024-01-02")
+
+        result = evaluate_backtest_dynamic(
+            recs, prices, as_of, max_horizon=119, default_theta=0.05,
+        )
+        # Flat price → return ~0 regardless of exit timing
+        self.assertAlmostEqual(result.iloc[0]["bt_return_pct"], 0.0, places=1)
+        self.assertEqual(result.iloc[0]["bt_alpha_pct"], 0.0)
+
+    def test_alpha_computed(self):
+        """Alpha = stock return - SPY return."""
+        dates = pd.date_range("2024-01-02", periods=120, freq="B")
+        aapl_prices = [100.0 * (1.02 ** (i / 120)) for i in range(120)]
+        spy_prices = [100.0 * (1.01 ** (i / 120)) for i in range(120)]
+
+        prices = pd.DataFrame({"AAPL": aapl_prices, "SPY": spy_prices}, index=dates)
+
+        recs = pd.DataFrame([{
+            "rank": 1, "ticker": "AAPL", "num_buyers": 3, "signal_score": 3.0,
+        }])
+        as_of = pd.Timestamp("2024-01-02")
+
+        result = evaluate_backtest_dynamic(
+            recs, prices, as_of, max_horizon=119, default_theta=0.05,
+        )
+        row = result.iloc[0]
+        self.assertAlmostEqual(
+            row["bt_alpha_pct"],
+            row["bt_return_pct"] - row["bt_spy_return_pct"],
+            places=1,
+        )
 
 
 if __name__ == "__main__":

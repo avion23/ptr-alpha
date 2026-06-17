@@ -1,0 +1,340 @@
+"""
+Ornstein-Uhlenbeck return process model for entry valuation.
+
+Models each position's return r(t) = P(t)/P(entry) - 1 as:
+    dr = θ(μ - r)dt + σdW
+
+Entry value at time 0 (r=0):
+    V(0) = μ/ρ + (0 - μ)/(θ + ρ)
+         = μ * θ / (ρ * (θ + ρ))
+
+V(0) > 0 → expected profitable entry
+V(0) < 0 → expected loss → skip
+
+Parameters are fit from historical return curves via AR(1) MLE.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Parameter containers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OUParams:
+    """Ornstein-Uhlenbeck parameters estimated from a return curve."""
+
+    theta: float
+    mu: float
+    sigma: float
+
+    @property
+    def a(self) -> float:
+        """AR(1) coefficient: a = e^{-theta}."""
+        return float(np.exp(-self.theta))
+
+    @property
+    def one_minus_a(self) -> float:
+        return 1.0 - self.a
+
+    @property
+    def sigma2_ou(self) -> float:
+        """OU innovation variance: sigma^2 / (2*theta) * (1 - e^{-2*theta})."""
+        if self.theta < 1e-8:
+            return float(self.sigma ** 2)
+        return float(
+            self.sigma ** 2 / (2.0 * self.theta) * (1.0 - np.exp(-2.0 * self.theta))
+        )
+
+    @property
+    def beta(self) -> float:
+        """Location parameter: beta = mu * (1 - a)."""
+        return self.mu * self.one_minus_a
+
+
+@dataclass
+class OUPosterior:
+    """Posterior over mu at a point in time."""
+
+    mu_mean: float
+    mu_var: float
+    theta: float
+    sigma2_ou: float
+    n_obs: int
+
+    @property
+    def mu_std(self) -> float:
+        return float(np.sqrt(max(self.mu_var, 0.0)))
+
+    def v(self, r_tau: float, rho: float) -> float:
+        """Expected discounted future reward V(tau)."""
+        denom = self.theta + rho
+        if abs(denom) < 1e-12:
+            return 0.0
+        return self.mu_mean / rho + (r_tau - self.mu_mean) / denom
+
+    def should_exit(self, r_tau: float, rho: float) -> bool:
+        return self.v(r_tau, rho) < 0.0
+
+
+# ---------------------------------------------------------------------------
+# AR(1) / OU fitting (offline, on historical curves)
+# ---------------------------------------------------------------------------
+
+def fit_ar1(returns: np.ndarray) -> tuple[float, float, float]:
+    """
+    Fit AR(1): r(t+1) = b + a*r(t) + eps, eps ~ N(0, s2).
+
+    Returns (a, b, s2).
+    """
+    r = np.asarray(returns, dtype=np.float64)
+    if len(r) < 3:
+        return 0.95, 0.0, 0.01
+
+    r_bar = float(r.mean())
+    r_next = r[1:]
+    r_prev = r[:-1]
+
+    r_next_dm = r_next - r_bar
+    r_prev_dm = r_prev - r_bar
+
+    denom = float(np.dot(r_prev_dm, r_prev_dm))
+    if denom < 1e-12:
+        return 0.95, 0.0, float(np.var(r_next_dm))
+
+    a = float(np.dot(r_next_dm, r_prev_dm) / denom)
+    a = max(-0.99, min(a, 0.999))  # stationarity
+
+    b = r_bar * (1.0 - a)
+    resid = r_next - b - a * r_prev
+    s2 = float(np.mean(resid ** 2))
+
+    return a, b, max(s2, 1e-10)
+
+
+def ar1_to_ou(a: float, b: float, s2: float) -> OUParams:
+    """Convert AR(1) parameters to OU parameters."""
+    a = max(a, 1e-6)
+    theta = -np.log(a)
+    mu = b / (1.0 - a) if abs(1.0 - a) > 1e-8 else 0.0
+    if theta > 1e-8:
+        sigma2 = s2 * 2.0 * theta / (1.0 - np.exp(-2.0 * theta))
+    else:
+        sigma2 = s2
+    sigma = float(np.sqrt(max(sigma2, 1e-10)))
+    return OUParams(theta=float(theta), mu=float(mu), sigma=sigma)
+
+
+def fit_ou(returns: np.ndarray) -> OUParams:
+    """Fit OU process to an observed return curve via AR(1) MLE."""
+    a, b, s2 = fit_ar1(returns)
+    return ar1_to_ou(a, b, s2)
+
+
+# ---------------------------------------------------------------------------
+# Prior construction from historical data (offline, one-time)
+# ---------------------------------------------------------------------------
+
+def build_prior(
+    historical_return_curves: list[np.ndarray],
+    default_theta: float = 0.05,
+    default_sigma2: float = 0.01,
+) -> tuple[float, float, float, float]:
+    """
+    Build global prior from historical return curves.
+
+    Returns (theta_global, beta_prior, P_prior, sigma2_ou).
+    """
+    if not historical_return_curves:
+        return default_theta, 0.0, 1.0, default_sigma2
+
+    thetas = []
+    betas = []
+    s2s = []
+
+    for curve in historical_return_curves:
+        c = np.asarray(curve, dtype=np.float64)
+        if len(c) < 3:
+            continue
+        ou = fit_ou(c)
+        if 0.001 < ou.theta < 5.0:  # sane range
+            thetas.append(ou.theta)
+            betas.append(ou.beta)
+            s2s.append(ou.sigma2_ou)
+
+    if not betas:
+        return default_theta, 0.0, 1.0, default_sigma2
+
+    theta_global = float(np.median(thetas))
+    beta_prior = float(np.mean(betas))
+    sigma2_ou = float(np.mean(s2s))
+
+    # Prior variance = cross-position variance of beta + floor
+    beta_var = float(np.var(betas)) if len(betas) > 1 else 1.0
+    P_prior = max(beta_var, 0.01)
+
+    return theta_global, beta_prior, P_prior, sigma2_ou
+
+
+# ---------------------------------------------------------------------------
+# Entry valuation: V(0) from historical curves
+# ---------------------------------------------------------------------------
+
+def compute_entry_value(
+    historical_return_curves: list[np.ndarray],
+    rho: float = 0.000137,
+    default_theta: float = 0.05,
+    default_mu: float = 0.0,
+) -> tuple[float, float, float]:
+    """
+    Estimate entry value V(0) from historical return curves for a ticker.
+
+    Returns (V0, mu, theta).
+    V0 = mu * theta / (rho * (theta + rho))
+    """
+    if not historical_return_curves:
+        return default_mu * default_theta / (rho * (default_theta + rho)), default_mu, default_theta
+
+    thetas = []
+    mus = []
+
+    for curve in historical_return_curves:
+        c = np.asarray(curve, dtype=np.float64)
+        if len(c) < 3:
+            continue
+        ou = fit_ou(c)
+        if 0.001 < ou.theta < 5.0:
+            thetas.append(ou.theta)
+            mus.append(ou.mu)
+
+    if not mus:
+        return default_mu * default_theta / (rho * (default_theta + rho)), default_mu, default_theta
+
+    mu = float(np.mean(mus))
+    theta = float(np.median(thetas))
+    v0 = mu * theta / (rho * (theta + rho))
+    return v0, mu, theta
+
+
+# ---------------------------------------------------------------------------
+# Kalman filter for online mu tracking
+# ---------------------------------------------------------------------------
+
+class KalmanFilter1D:
+    """
+    Scalar Kalman filter for a constant-plus-noise state.
+
+    State model:  x(t+1) = x(t) + eta(t),  eta ~ N(0, Q)
+    Observation:  z(t) = x(t) + eps(t),     eps ~ N(0, R)
+    """
+
+    def __init__(self, x0: float, P0: float, Q: float, R: float):
+        self.x = x0
+        self.P = P0
+        self.Q = Q
+        self.R = R
+
+    def update(self, z: float) -> tuple[float, float]:
+        """Predict + correct. Returns (posterior_mean, posterior_var)."""
+        # Predict
+        x_pred = self.x
+        P_pred = self.P + self.Q
+
+        # Update
+        K = P_pred / (P_pred + self.R)
+        self.x = x_pred + K * (z - x_pred)
+        self.P = (1.0 - K) * P_pred
+
+        return self.x, self.P
+
+
+# ---------------------------------------------------------------------------
+# Per-position tracker (online, continuous)
+# ---------------------------------------------------------------------------
+
+class ReturnProcessTracker:
+    """
+    Tracks a single position's return process via Kalman filter.
+    Makes continuous exit decisions via discounted future reward.
+
+    Usage:
+        tracker = ReturnProcessTracker(theta, beta_prior, P_prior, sigma2_ou)
+        for day, r_t in enumerate(daily_returns):
+            posterior = tracker.update(r_t)
+            if posterior.should_exit(r_t, rho):
+                return day  # exit here
+    """
+
+    def __init__(
+        self,
+        theta: float,
+        beta_prior: float,
+        P_prior: float,
+        sigma2_ou: float,
+        rho: float = 0.000137,   # 5% annual discount rate
+        process_noise: float = 0.0,  # Q: mu drift (0 = constant mu, pure averaging)
+        min_observations: int = 5,
+    ):
+        self.theta = theta
+        self.sigma2_ou = sigma2_ou
+        self.rho = rho
+        self.min_observations = min_observations
+        self.n_obs = 0
+        self.returns: list[float] = []
+
+        self.kf = KalmanFilter1D(
+            x0=beta_prior,
+            P0=P_prior,
+            Q=process_noise,
+            R=sigma2_ou,
+        )
+
+    def update(self, r_t: float) -> OUPosterior:
+        """Incorporate new return observation. Return current posterior."""
+        self.returns.append(r_t)
+        self.n_obs = len(self.returns) - 1  # transitions = observations - 1
+
+        if self.n_obs < 1:
+            return self._posterior()
+
+        r_prev = self.returns[-2]
+        r_curr = self.returns[-1]
+
+        # Innovation: z = r(t) - r(t-1) * e^{-theta}
+        a = np.exp(-self.theta)
+        z = r_curr - r_prev * a
+
+        # Kalman filter update on beta = mu * (1 - a)
+        self.kf.update(z)
+
+        return self._posterior()
+
+    def get_posterior(self) -> OUPosterior:
+        """Get current posterior without triggering an update."""
+        return self._posterior()
+
+    def _posterior(self) -> OUPosterior:
+        one_minus_a = 1.0 - np.exp(-self.theta)
+        if abs(one_minus_a) < 1e-8:
+            mu_mean = self.kf.x / 1e-8
+            mu_var = self.kf.P / 1e-16
+        else:
+            mu_mean = self.kf.x / one_minus_a
+            mu_var = self.kf.P / (one_minus_a ** 2)
+
+        return OUPosterior(
+            mu_mean=float(mu_mean),
+            mu_var=float(max(mu_var, 0.0)),
+            theta=self.theta,
+            sigma2_ou=self.sigma2_ou,
+            n_obs=self.n_obs,
+        )
+
+    def ready(self) -> bool:
+        """True if enough observations to make a decision."""
+        return self.n_obs >= self.min_observations

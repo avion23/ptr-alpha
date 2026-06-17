@@ -61,9 +61,10 @@ def _compute_ticker_entry_value(
         v0, _mu, _theta = compute_entry_value(curves, rho=rho)
         return v0
 
-    # Fallback: global prior from ALL historical curves (not filtered by cutoff)
+    # Fallback: global prior from historical curves (filtered by cutoff to avoid look-ahead)
     all_purchases = signals_df[
         (signals_df["horizon_days"] == horizon)
+        & (signals_df["disclosure_date"] <= as_of_date - pd.Timedelta(days=horizon))
         & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
     ].copy()
 
@@ -652,8 +653,7 @@ def score_ticker_by_buyers(
         else 0
     )
 
-    buyer_diminishing = 1.0 + np.log1p(max(rated_buyers - 1, 0)) * BUYER_CONVERGENCE_WEIGHT
-    base_signal_score = buyer_diminishing * quality_adjusted_avg
+    base_signal_score = quality_adjusted_avg
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
 
@@ -689,7 +689,7 @@ def score_ticker_by_buyers(
         "avg_buyer_performance": [round(quality_adjusted_avg, 2)],
         "best_buyer_performance": [round(best_rank, 2)],
         "total_buyer_trades": [int(total_trades)],
-        "convergence_factor": [round(buyer_diminishing, 3)],
+        "convergence_factor": [1.0],
         "ticker_perf_factor": [round(ticker_perf_factor, 3)],
         "base_signal_score": [round(base_signal_score, 2)],
         "size_factor": [round(size_factor, 3)],
@@ -965,140 +965,3 @@ def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
     summary = pd.concat([summary, pd.DataFrame([overall])], ignore_index=True)
     return summary
 
-
-# ---------------------------------------------------------------------------
-# Dynamic exit evaluation using OU return process tracker
-# ---------------------------------------------------------------------------
-
-def evaluate_backtest_dynamic(
-    recommendations: pd.DataFrame,
-    prices_df: pd.DataFrame,
-    as_of_date: pd.Timestamp,
-    max_horizon: int = 365,
-    rho: float = 0.000137,
-    default_theta: float = 0.05,
-    default_sigma2: float = 0.01,
-    priors: dict[str, tuple[float, float, float, float]] | None = None,
-) -> pd.DataFrame:
-    """Evaluate backtest with dynamic exit via OU return process tracker.
-
-    Instead of holding for a fixed horizon, each position is tracked with a
-    ReturnProcessTracker. Exit is triggered when V(tau) < 0 (discounted
-    future reward goes negative).
-
-    Args:
-        recommendations: Output of backtest_recommendations().
-        prices_df: Daily prices for all tickers.
-        as_of_date: Entry date.
-        max_horizon: Maximum hold period (days). Exit forced if not triggered sooner.
-        rho: Daily discount rate (0.000137 = 5% annual).
-        default_theta: Default OU mean-reversion speed.
-        default_sigma2: Default OU noise variance.
-        priors: Per-ticker priors from build_prior(). If None, use defaults.
-
-    Returns:
-        DataFrame with bt_exit_day, bt_exit_date, bt_exit_price, bt_return_pct, etc.
-    """
-    from analyzer.return_process import (
-        ReturnProcessTracker, OUParams, build_prior,
-    )
-
-    if recommendations.empty:
-        return recommendations
-
-    if priors is None:
-        priors = {}
-
-    spy_entry = _price_at_or_before(prices_df, "SPY", as_of_date)
-    if not spy_entry:
-        raise AnalysisError(
-            f"SPY price not available at {as_of_date.date()} for dynamic backtest"
-        )
-
-    rows = []
-    for _, rec in recommendations.iterrows():
-        ticker = rec["ticker"]
-        entry_price = _price_at_or_before(prices_df, ticker, as_of_date)
-        if not entry_price:
-            raise AnalysisError(
-                f"No price for {ticker} at/as_of {as_of_date.date()}"
-            )
-
-        # Get daily prices from entry to max exit
-        if ticker not in prices_df.columns:
-            raise AnalysisError(f"No price data for {ticker}")
-        ticker_series = prices_df[ticker].dropna()
-        after_entry = ticker_series[ticker_series.index >= as_of_date]
-        before_exit = after_entry[
-            after_entry.index <= as_of_date + pd.Timedelta(days=max_horizon + 5)
-        ]
-        if before_exit.empty:
-            raise AnalysisError(
-                f"No price data for {ticker} after {as_of_date.date()}"
-            )
-
-        daily_prices = before_exit.values
-        daily_dates = before_exit.index
-
-        # Build tracker with per-ticker prior or defaults
-        if ticker in priors:
-            theta, beta_prior, P_prior, sigma2_ou = priors[ticker]
-        else:
-            theta = default_theta
-            beta_prior = 0.0
-            P_prior = 0.5
-            sigma2_ou = default_sigma2
-
-        tracker = ReturnProcessTracker(
-            theta=theta,
-            beta_prior=beta_prior,
-            P_prior=P_prior,
-            sigma2_ou=sigma2_ou,
-            rho=rho,
-        )
-
-        # Feed daily returns and look for exit signal
-        exit_day = None
-        exit_price = None
-
-        for day_idx in range(len(daily_prices)):
-            r_t = daily_prices[day_idx] / entry_price - 1.0  # cumulative return
-            post = tracker.update(r_t)
-
-            if tracker.ready() and post.should_exit(r_t, rho):
-                exit_day = day_idx
-                exit_price = float(daily_prices[day_idx])
-                break
-
-        # Force exit at max_horizon if no dynamic exit triggered
-        if exit_day is None:
-            exit_day = len(daily_prices) - 1
-            exit_price = float(daily_prices[exit_day])
-
-        exit_date = pd.Timestamp(daily_dates[exit_day])
-        return_pct = (exit_price / entry_price - 1) * 100
-
-        # SPY return over same period
-        spy_exit = _price_on_or_before(prices_df, "SPY", exit_date)
-        if not spy_exit:
-            spy_exit = spy_entry
-        spy_return_pct = (spy_exit / spy_entry - 1) * 100
-
-        alpha_pct = return_pct - spy_return_pct
-
-        post = tracker.get_posterior()
-        rows.append({
-            "ticker": ticker,
-            "bt_entry_price": round(entry_price, 2),
-            "bt_exit_price": round(exit_price, 2),
-            "bt_exit_day": exit_day,
-            "bt_exit_date": exit_date.date(),
-            "bt_return_pct": round(return_pct, 2),
-            "bt_spy_return_pct": round(spy_return_pct, 2),
-            "bt_alpha_pct": round(alpha_pct, 2),
-            "ou_mu": round(post.mu_mean, 4),
-            "ou_theta": round(post.theta, 4),
-        })
-
-    eval_df = pd.DataFrame(rows)
-    return recommendations.merge(eval_df, on="ticker", how="left")

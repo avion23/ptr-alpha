@@ -117,13 +117,6 @@ class TestOUPosterior:
         v = post.v(r_tau=-0.02, rho=0.000137)
         assert v < 0
 
-    def test_should_exit(self):
-        post = OUPosterior(mu_mean=-0.10, mu_var=0.01, theta=0.05, sigma2_ou=0.01, n_obs=20)
-        assert post.should_exit(r_tau=-0.05, rho=0.000137)
-
-    def test_should_hold(self):
-        post = OUPosterior(mu_mean=0.15, mu_var=0.001, theta=0.05, sigma2_ou=0.01, n_obs=20)
-        assert not post.should_exit(r_tau=0.10, rho=0.000137)
 
 
 class TestReturnProcessTracker:
@@ -163,38 +156,6 @@ class TestReturnProcessTracker:
         assert abs(post.mu_mean - mu_sample) < 0.05, (
             f"mu={post.mu_mean:.3f} != sample mean={mu_sample:.3f}"
         )
-
-    def test_exit_on_losing_position(self):
-        """Declining position should trigger exit."""
-        losses = np.array([0.0, -0.02, -0.04, -0.06, -0.08, -0.10, -0.12, -0.14])
-        ou = fit_ou(losses)
-        tracker = ReturnProcessTracker(
-            theta=max(ou.theta, 0.01), beta_prior=0.0, P_prior=0.5,
-            sigma2_ou=max(ou.sigma2_ou, 0.001), min_observations=5, process_noise=0.001,
-        )
-        exited = False
-        for day, r_t in enumerate(losses):
-            post = tracker.update(r_t)
-            if tracker.ready() and post.should_exit(r_t, rho=0.000137):
-                exited = True
-                break
-        assert exited, "Should have exited on losing position"
-
-    def test_hold_on_winning_position(self):
-        """Strong winning position should not trigger exit."""
-        wins = np.array([0.0, 0.02, 0.05, 0.08, 0.12, 0.15, 0.18, 0.20])
-        ou = fit_ou(wins)
-        tracker = ReturnProcessTracker(
-            theta=max(ou.theta, 0.01), beta_prior=0.05, P_prior=0.1,
-            sigma2_ou=max(ou.sigma2_ou, 0.001), min_observations=5, process_noise=0.001,
-        )
-        exited = False
-        for day, r_t in enumerate(wins):
-            post = tracker.update(r_t)
-            if tracker.ready() and post.should_exit(r_t, rho=0.000137):
-                exited = True
-                break
-        assert not exited, "Should hold on winning position"
 
     def test_ready(self):
         tracker = ReturnProcessTracker(

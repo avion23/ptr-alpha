@@ -91,9 +91,6 @@ class BacktestParams:
     top_n: int = 5
     threshold: float = 5.0
     frequency_days: int = 30
-    dynamic_exit: bool = False
-    max_horizon: int = 365
-    rho: float = 0.000137
 
 def pipeline_step(func):
     @wraps(func)
@@ -281,13 +278,7 @@ def run_backtest_pipeline(
             continue
 
         try:
-            if params.dynamic_exit:
-                evaluated = analysis.evaluate_backtest_dynamic(
-                    recs, prices, as_of_ts,
-                    max_horizon=params.max_horizon, rho=params.rho,
-                )
-            else:
-                evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
+            evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
         except Exception as e:
             print(f"  SKIPPED: {e}")
             continue

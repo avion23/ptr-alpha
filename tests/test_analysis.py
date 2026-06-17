@@ -74,9 +74,7 @@ class TestAnalysis(unittest.TestCase):
 
         score = score_ticker_by_buyers('AAPL', transactions, signals)
 
-        buyer_diminishing = 1.0 + np.log1p(1) * 0.30
-        expected_base = round(buyer_diminishing * 10.0, 2)
-        self.assertEqual(score.iloc[0]['base_signal_score'], expected_base)
+        self.assertEqual(score.iloc[0]['base_signal_score'], 10.0)
         self.assertGreater(score.iloc[0]['size_factor'], 1.0)
         self.assertLess(score.iloc[0]['owner_factor'], 1.0)
         self.assertNotEqual(score.iloc[0]['signal_score'], score.iloc[0]['base_signal_score'])
@@ -254,18 +252,13 @@ class TestAnalysis(unittest.TestCase):
 
         score = score_ticker_by_buyers('AAPL', transactions, signals, member_rankings=member_rankings)
 
-        buyer_diminishing = 1.0 + np.log1p(1) * 0.30
         alice_weight = np.sqrt(3) * np.exp(-0.03)
         charlie_weight = np.sqrt(2)
         quality_weighted_sum = 10.0 * alice_weight + 20.0 * charlie_weight
         quality_adjusted_avg = quality_weighted_sum / (alice_weight + charlie_weight)
-        expected_base = round(buyer_diminishing * quality_adjusted_avg, 2)
-        inflated_buyers = 1.0 + np.log1p(2) * 0.30
-        inflated_base = round(inflated_buyers * quality_adjusted_avg, 2)
         self.assertEqual(score.iloc[0]['num_buyers'], 3)
         self.assertEqual(score.iloc[0]['rated_buyers'], 2)
-        self.assertEqual(score.iloc[0]['base_signal_score'], expected_base)
-        self.assertNotEqual(score.iloc[0]['base_signal_score'], inflated_base)
+        self.assertEqual(score.iloc[0]['base_signal_score'], round(quality_adjusted_avg, 2))
 
     def test_score_ticker_by_buyers_uses_sqrt_confidence_not_trade_count_dominance(self):
         transactions = pd.DataFrame({

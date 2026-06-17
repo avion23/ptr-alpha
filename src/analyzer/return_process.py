@@ -78,8 +78,6 @@ class OUPosterior:
             return 0.0
         return self.mu_mean / rho + (r_tau - self.mu_mean) / denom
 
-    def should_exit(self, r_tau: float, rho: float) -> bool:
-        return self.v(r_tau, rho) < 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -266,8 +264,6 @@ class ReturnProcessTracker:
         tracker = ReturnProcessTracker(theta, beta_prior, P_prior, sigma2_ou)
         for day, r_t in enumerate(daily_returns):
             posterior = tracker.update(r_t)
-            if posterior.should_exit(r_t, rho):
-                return day  # exit here
     """
 
     def __init__(

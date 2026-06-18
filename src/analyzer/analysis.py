@@ -316,9 +316,12 @@ def calculate_signal_potential(
         windowed["spy_return"] = windowed["spy_price"] / windowed["signal_id"].map(spy_entry_prices) - 1
     else:
         windowed["spy_return"] = 0.0
+        windowed["spy_price"] = np.nan
 
     windowed["weighted_spy_return"] = windowed["spy_return"] * windowed["decay_factor"]
     windowed["spy_decay_factor"] = windowed["decay_factor"].where(windowed["spy_return"].notna())
+
+    windowed = windowed.sort_values(["signal_id", "price_date"])
 
     agg = windowed.groupby("signal_id").agg(
         peak_price=("price", "max"),
@@ -328,15 +331,22 @@ def calculate_signal_potential(
         spy_weight_sum=("spy_decay_factor", lambda values: values.sum(min_count=1)),
         weight_sum=("decay_factor", "sum"),
         disclosure_price_first=("disclosure_baseline", "first"),
-        last_price=("price", "last")
+        last_price=("price", "last"),
+        spy_first_price=("spy_price", lambda v: v.dropna().iloc[0] if not v.dropna().empty else np.nan),
+        spy_last_price=("spy_price", lambda v: v.dropna().iloc[-1] if not v.dropna().empty else np.nan),
     )
     agg["decayed_return"] = agg["decayed_return"] / agg["weight_sum"]
     agg["spy_cumulative"] = agg["spy_cumulative"] / agg["spy_weight_sum"]
     agg["total_return"] = (agg["last_price"] / agg["disclosure_price_first"] - 1)
+    agg["actual_spy_return"] = np.where(
+        agg["spy_first_price"].notna() & (agg["spy_first_price"] != 0),
+        agg["spy_last_price"] / agg["spy_first_price"] - 1,
+        0.0,
+    )
     agg = agg.reset_index()
 
     final = signals.merge(
-        agg[["signal_id", "peak_price", "trough_price", "decayed_return", "spy_cumulative", "total_return", "disclosure_price_first"]],
+        agg[["signal_id", "peak_price", "trough_price", "decayed_return", "spy_cumulative", "actual_spy_return", "total_return", "disclosure_price_first"]],
         on="signal_id", how="left"
     )
 
@@ -357,7 +367,7 @@ def calculate_signal_potential(
     result_columns = [
         "member", "ticker", "disclosure_date", "signal_type", "horizon_days", "entry_price",
         "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct", "total_return_pct",
-        "total_spy_alpha_pct", *optional_columns,
+        "total_spy_alpha_pct", "decayed_spy_return_pct", *optional_columns,
     ]
 
     return final.assign(
@@ -366,7 +376,8 @@ def calculate_signal_potential(
         decayed_return_pct=final["decayed_return"].values * 100,
         spy_alpha_pct=(final["decayed_return"] - final["spy_cumulative"]).values * 100,
         total_return_pct=final["total_return"].values * 100,
-        total_spy_alpha_pct=(final["total_return"] - final["spy_cumulative"]).values * 100,
+        total_spy_alpha_pct=(final["total_return"] - final["actual_spy_return"]).values * 100,
+        decayed_spy_return_pct=final["spy_cumulative"].values * 100,
     )[result_columns]
 
 

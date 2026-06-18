@@ -11,6 +11,7 @@ import pandas as pd
 
 from analyzer.exceptions import AnalyzerError, DataSourceError, AnalysisError
 from analyzer.models import TransactionType
+from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer import analysis
 
 logger = logging.getLogger(__name__)
@@ -241,6 +242,20 @@ def run_backtest_pipeline(
     price_end = params.end_date + timedelta(days=params.horizon + 10)
     all_tickers = all_transactions["ticker"].unique().tolist()
     all_tickers = sorted(set(all_tickers) | {"SPY"})
+
+    # Create price snapshot for reproducibility
+    snapshot = create_snapshot(transaction_source.db, all_tickers, price_start, price_end)
+    print(f"\n=== Price Snapshot ===")
+    print(f"  Snapshot ID:  {snapshot.snapshot_id}")
+    print(f"  Created:      {snapshot.created_at}")
+    print(f"  Git SHA:      {snapshot.git_sha[:12]}")
+    print(f"  yfinance:     {snapshot.yfinance_version}")
+    print(f"  Tickers:      {snapshot.resolved_tickers}/{snapshot.requested_tickers} resolved")
+    if snapshot.unresolved_tickers:
+        print(f"  Unresolved:   {', '.join(snapshot.unresolved_tickers[:10])}")
+    print(f"  Price rows:   {snapshot.price_rows}")
+    print(f"  Date range:   {snapshot.first_date} to {snapshot.last_date}")
+
     prices = transaction_source.db.get_prices(all_tickers, price_start, price_end)
 
     if prices.empty:
@@ -308,6 +323,11 @@ def run_backtest_pipeline(
     total_as_of_dates = len(pd.date_range(params.start_date, params.end_date, freq=f"{params.frequency_days}D"))
     print(f"\nDates evaluated: {evaluable_dates}/{total_as_of_dates}")
     print(f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}")
+
+    # Save snapshot alongside backtest results
+    snapshot_path = "data/price_snapshot.json"
+    save_snapshot(snapshot, snapshot_path)
+    logger.info(f"Price snapshot saved to {snapshot_path}")
 
     return True
 

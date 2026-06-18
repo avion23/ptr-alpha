@@ -20,6 +20,7 @@ from analyzer.pipeline import (
     TickerScoringParams,
     BacktestParams,
 )
+from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer.exceptions import AnalyzerError
 from analyzer.settings import Settings
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
@@ -212,6 +213,51 @@ def backtest(
     )
     success = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source)
     raise typer.Exit(0 if success else 1)
+
+
+@app.command()
+def snapshot(
+    ctx: typer.Context,
+    data_dir: str = typer.Option("data", help="Data directory"),
+    output: str = typer.Option("data/price_snapshot.json", help="Output path for snapshot JSON"),
+):
+    """Create a frozen price snapshot manifest for reproducible backtests."""
+    app_ctx = get_context(ctx, data_dir, read_only=True)
+
+    from analyzer.settings import Settings
+    settings = Settings()
+    if data_dir and data_dir != "data":
+        settings.data.data_dir = data_dir
+
+    db = app_ctx.transaction_source.db
+    tickers_result = db.conn.execute("SELECT DISTINCT ticker FROM prices").fetchall()
+    all_tickers = sorted({row[0] for row in tickers_result})
+
+    if not all_tickers:
+        print("No price data found in database")
+        raise typer.Exit(1)
+
+    date_range = db.conn.execute(
+        "SELECT MIN(date), MAX(date) FROM prices"
+    ).fetchone()
+    start_date = date_range[0]
+    end_date = date_range[1]
+
+    snap = create_snapshot(db, all_tickers, start_date, end_date)
+    save_snapshot(snap, output)
+
+    print(f"Snapshot created: {snap.snapshot_id}")
+    print(f"  Created at:     {snap.created_at}")
+    print(f"  Git SHA:        {snap.git_sha[:12]}")
+    print(f"  yfinance:       {snap.yfinance_version}")
+    print(f"  Python:         {snap.python_version}")
+    print(f"  Tickers:        {snap.resolved_tickers}/{snap.requested_tickers} resolved")
+    if snap.unresolved_tickers:
+        print(f"  Unresolved:     {', '.join(snap.unresolved_tickers[:10])}")
+    print(f"  Price rows:     {snap.price_rows}")
+    print(f"  Date range:     {snap.first_date} to {snap.last_date}")
+    print(f"  Saved to:       {output}")
+    raise typer.Exit(0)
 
 
 def main():

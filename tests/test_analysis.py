@@ -383,6 +383,55 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(len(sales), 1)
         self.assertFalse(np.isnan(sales.iloc[0]['peak_potential_pct']))
 
+    def test_total_spy_alpha_uses_actual_spy_return(self):
+        dates = pd.date_range('2024-01-01', '2024-04-01', freq='D')
+        entry_prices = pd.DataFrame({
+            'member': ['Alice'],
+            'ticker': ['AAPL'],
+            'disclosure_date': pd.to_datetime(['2024-01-01']),
+            'transaction_type': ['Purchase'],
+            'entry_price': [150.0],
+        })
+        # AAPL goes 150 -> 165, SPY goes 400 -> 420 over 91 days
+        prices = pd.DataFrame({
+            'AAPL': np.linspace(150, 165, len(dates)),
+            'SPY': np.linspace(400, 420, len(dates)),
+        }, index=dates)
+
+        signals = calculate_signal_potential(entry_prices, prices, [30])
+
+        self.assertEqual(len(signals), 1)
+        row = signals.iloc[0]
+
+        # Over 30-day window: AAPL and SPY prices at day 30
+        horizon_days = 30
+        spy_entry = 400.0
+        spy_exit = 400.0 + (420.0 - 400.0) * horizon_days / (len(dates) - 1)
+        aapl_exit = 150.0 + (165.0 - 150.0) * horizon_days / (len(dates) - 1)
+        actual_spy_return_pct = (spy_exit / spy_entry - 1) * 100
+        total_return_pct = (aapl_exit / 150.0 - 1) * 100
+        expected_alpha = total_return_pct - actual_spy_return_pct
+
+        self.assertAlmostEqual(row['total_spy_alpha_pct'], expected_alpha, places=2)
+
+    def test_decayed_spy_return_pct_column_present(self):
+        entry_prices = pd.DataFrame({
+            'member': ['Alice'],
+            'ticker': ['AAPL'],
+            'disclosure_date': pd.to_datetime(['2024-01-01']),
+            'transaction_type': ['Purchase'],
+            'entry_price': [100.0],
+        })
+        dates = pd.date_range('2024-01-01', '2024-04-01', freq='D')
+        prices = pd.DataFrame({
+            'AAPL': 100 + np.cumsum(np.random.randn(len(dates)) * 0.5),
+            'SPY': 400 + np.cumsum(np.random.randn(len(dates)) * 1),
+        }, index=dates)
+
+        signals = calculate_signal_potential(entry_prices, prices, [30])
+        self.assertIn('decayed_spy_return_pct', signals.columns)
+        self.assertIn('total_spy_alpha_pct', signals.columns)
+
 
 class TestEpisodeCollapse(unittest.TestCase):
 

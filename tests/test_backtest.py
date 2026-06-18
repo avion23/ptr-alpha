@@ -209,6 +209,83 @@ class TestBacktestRecommendations(unittest.TestCase):
         )
 
 
+    def test_no_lookahead_in_ticker_perf_signals(self):
+        """Regression: not-elapsed signals must not leak into ticker_perf_signals."""
+        as_of = pd.Timestamp("2025-01-01")
+        horizon = 90
+        elapsed_cutoff = as_of - pd.Timedelta(days=horizon)
+
+        # 3 fully-elapsed signals for Alpha on CAND (enough for TICKER_PERF_MIN_TRADES)
+        elapsed_signals = [
+            {
+                "member": "Alpha", "ticker": "CAND",
+                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=90),
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 50.0, "decayed_return_pct": 10.0,
+                "peak_potential_pct": 15.0, "spy_alpha_pct": 5.0,
+                "total_return_pct": 12.0, "total_spy_alpha_pct": 8.0,
+            },
+            {
+                "member": "Alpha", "ticker": "CAND",
+                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=60),
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 50.0, "decayed_return_pct": -5.0,
+                "peak_potential_pct": 5.0, "spy_alpha_pct": -3.0,
+                "total_return_pct": -4.0, "total_spy_alpha_pct": -2.0,
+            },
+            {
+                "member": "Alpha", "ticker": "CAND",
+                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=30),
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 50.0, "decayed_return_pct": 8.0,
+                "peak_potential_pct": 12.0, "spy_alpha_pct": 4.0,
+                "total_return_pct": 9.0, "total_spy_alpha_pct": 5.0,
+            },
+        ]
+        # Not-elapsed signal: disclosed 30 days before as_of, horizon 90 not yet elapsed
+        not_elapsed_signal = {
+            "member": "Alpha", "ticker": "CAND",
+            "disclosure_date": as_of - pd.Timedelta(days=30),
+            "signal_type": "Purchase", "horizon_days": 90,
+            "entry_price": 50.0, "decayed_return_pct": 500.0,
+            "peak_potential_pct": 600.0, "spy_alpha_pct": 500.0,
+            "total_return_pct": 500.0, "total_spy_alpha_pct": 500.0,
+        }
+
+        signals_elapsed_only = _make_signals(elapsed_signals)
+        signals_with_leak = _make_signals(elapsed_signals + [not_elapsed_signal])
+
+        recent_txns = _make_transactions([
+            {
+                "member": "Alpha", "ticker": "CAND",
+                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
+                "transaction_type": "Purchase",
+            },
+            {
+                "member": "Beta", "ticker": "CAND",
+                "transaction_date": "2024-12-12", "disclosure_date": "2024-12-17",
+                "transaction_type": "Purchase",
+            },
+        ])
+
+        recs_elapsed = backtest_recommendations(
+            signals_elapsed_only, recent_txns, as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+        )
+        recs_with_leak = backtest_recommendations(
+            signals_with_leak, recent_txns, as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+        )
+
+        self.assertFalse(recs_elapsed.empty)
+        self.assertFalse(recs_with_leak.empty)
+        self.assertEqual(
+            recs_elapsed.iloc[0]["signal_score"],
+            recs_with_leak.iloc[0]["signal_score"],
+            "Not-elapsed signal leaked into ticker_perf_signals scoring",
+        )
+
+
 class TestEvaluateBacktest(unittest.TestCase):
 
     def setUp(self):

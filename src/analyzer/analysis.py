@@ -858,7 +858,7 @@ def backtest_recommendations(
 
     ticker_perf_signals = signals_df[
         (signals_df["horizon_days"] == horizon)
-        & (signals_df["disclosure_date"] <= as_of_date)
+        & (signals_df["disclosure_date"] <= elapsed_cutoff)
     ].copy()
 
     scores = []

@@ -216,6 +216,158 @@ def backtest(
 
 
 @app.command()
+def portfolio(
+    ctx: typer.Context,
+    start: str = typer.Option(..., help="Simulation start date (YYYY-MM-DD)"),
+    end: str = typer.Option(..., help="Simulation end date (YYYY-MM-DD)"),
+    horizon: int = typer.Option(120, help="Forward return horizon in days"),
+    lookback_days: int = typer.Option(60, help="Candidate purchase lookback window in days"),
+    training_lookback_days: int = typer.Option(365, help="Training data lookback window in days"),
+    min_buyers: int = typer.Option(2, help="Minimum buyers for a candidate ticker"),
+    top_n: int = typer.Option(5, help="Top N recommendations per backtest date"),
+    threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
+    frequency_days: int = typer.Option(14, help="Days between rolling backtest dates"),
+    initial_capital: float = typer.Option(20000, help="Initial portfolio capital"),
+    max_positions: int = typer.Option(5, help="Maximum concurrent positions"),
+    hold_days: int = typer.Option(120, help="Hold period in days before forced exit"),
+    data_dir: str = typer.Option("data", help="Data directory"),
+):
+    """
+    Run portfolio-level simulation with overlapping positions and constraints.
+
+    Unlike the backtest command which evaluates each recommendation independently,
+    this simulates a real portfolio with position sizing, sector limits, and
+    cash management across overlapping holding periods.
+    """
+    try:
+        start_date = date.fromisoformat(start)
+        end_date = date.fromisoformat(end)
+    except ValueError:
+        print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
+        raise typer.Exit(1)
+
+    if end_date < start_date:
+        print("Error: --end must be on or after --start", file=sys.stderr)
+        raise typer.Exit(1)
+
+    app_ctx = get_context(ctx, data_dir, read_only=True)
+
+    from analyzer.pipeline import BacktestParams, run_backtest_pipeline
+    from analyzer.portfolio_sim import PortfolioSimulator, PortfolioConfig
+
+    params = BacktestParams(
+        start_date=start_date,
+        end_date=end_date,
+        horizon=horizon,
+        lookback_days=lookback_days,
+        training_lookback_days=training_lookback_days,
+        min_buyers=min_buyers,
+        top_n=top_n,
+        threshold=threshold,
+        frequency_days=frequency_days,
+    )
+
+    # Collect all backtest recommendations (reuse existing pipeline logic)
+    from datetime import timedelta
+    from analyzer import analysis
+
+    tx_start = start_date - timedelta(days=training_lookback_days + horizon + 30)
+    all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(tx_start, end_date)
+    if all_transactions.empty:
+        print("Error: no transactions found for portfolio simulation", file=sys.stderr)
+        raise typer.Exit(1)
+
+    price_start = tx_start
+    price_end_sim = end_date + timedelta(days=horizon + 10)
+    all_tickers = sorted(set(all_transactions["ticker"].unique().tolist()) | {"SPY"})
+    prices = app_ctx.transaction_source.db.get_prices(all_tickers, price_start, price_end_sim)
+    if prices.empty:
+        print("Error: no price data available", file=sys.stderr)
+        raise typer.Exit(1)
+
+    entry_prices = app_ctx.transaction_source.db.get_entry_prices(all_tickers, price_start, price_end_sim)
+    if entry_prices.empty:
+        print("Error: no entry prices computed", file=sys.stderr)
+        raise typer.Exit(1)
+
+    signals = analysis.calculate_signal_potential(entry_prices, prices, [horizon])
+
+    as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency_days}D")
+    all_recs = []
+    for as_of in as_of_dates:
+        recs = analysis.backtest_recommendations(
+            signals, all_transactions, pd.Timestamp(as_of),
+            horizon=horizon,
+            lookback_days=lookback_days,
+            min_buyers=min_buyers,
+            top_n=top_n,
+            threshold=threshold,
+            prices_df=prices,
+            training_lookback_days=training_lookback_days,
+        )
+        if not recs.empty:
+            recs = recs.copy()
+            recs["as_of_date"] = as_of
+            all_recs.append(recs)
+
+    if not all_recs:
+        print("No recommendations produced for any backtest date", file=sys.stderr)
+        raise typer.Exit(1)
+
+    recommendations = pd.concat(all_recs, ignore_index=True)
+    print(f"Collected {len(recommendations)} recommendations across {len(as_of_dates)} dates")
+
+    config = PortfolioConfig(
+        initial_capital=initial_capital,
+        max_positions=max_positions,
+        hold_period_days=hold_days,
+        rebalance_freq_days=frequency_days,
+    )
+
+    sim = PortfolioSimulator(config)
+    results_df = sim.run(recommendations, prices, start_date, end_date)
+
+    print(f"\n{'=' * 60}")
+    print("=== Portfolio Simulation Results ===")
+    print(f"{'=' * 60}")
+    if not results_df.empty:
+        print(f"  Period:             {start_date} to {end_date}")
+        print(f"  Initial capital:    ${config.initial_capital:,.2f}")
+        print(f"  Final value:        ${results_df.iloc[-1]['total_value']:,.2f}")
+        print(f"  Cash remaining:     ${results_df.iloc[-1]['cash']:,.2f}")
+        print(f"  Max positions:      {max_positions}")
+        print(f"  Hold period:        {hold_days} days")
+
+    metrics = sim.compute_metrics(prices)
+    if metrics:
+        print(f"\n=== Performance Metrics ===")
+        print(f"  Total return:       {metrics['total_return_pct']:.2f}%")
+        print(f"  Annualized return:  {metrics['annualized_return_pct']:.2f}%")
+        print(f"  Sharpe ratio:       {metrics['sharpe_ratio']:.3f}")
+        print(f"  Max drawdown:       {metrics['max_drawdown_pct']:.2f}%")
+        print(f"  Win rate:           {metrics['win_rate_pct']:.1f}%")
+        print(f"  Avg holding days:   {metrics['avg_holding_days']:.1f}")
+        print(f"  Turnover rate:      {metrics['turnover_rate']:.3f}")
+        print(f"  Max concurrent:     {metrics['max_concurrent_positions']}")
+        print(f"  Total closed:       {metrics['total_closed_trades']}")
+        if metrics.get("spy_return_pct") is not None:
+            print(f"  SPY buy-and-hold:   {metrics['spy_return_pct']:.2f}%")
+        if metrics.get("sector_concentration"):
+            print(f"\n=== Sector Concentration ===")
+            for sector, pct in sorted(metrics["sector_concentration"].items(), key=lambda x: -x[1]):
+                print(f"  {sector}: {pct:.1f}%")
+
+    if sim.closed_positions:
+        print(f"\n=== Closed Positions ({len(sim.closed_positions)}) ===")
+        closed_df = pd.DataFrame(sim.closed_positions)
+        display_cols = ["ticker", "entry_date", "exit_date", "return_pct", "holding_days", "sector"]
+        available = [c for c in display_cols if c in closed_df.columns]
+        print(closed_df[available].to_string(index=False))
+
+    raise typer.Exit(0)
+
+
+@app.command()
 def snapshot(
     ctx: typer.Context,
     data_dir: str = typer.Option("data", help="Data directory"),

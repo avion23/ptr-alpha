@@ -602,6 +602,8 @@ def score_ticker_by_buyers(
     member_rankings: pd.DataFrame | None = None,
     min_buyers: int = 2,
     ticker_perf_signals: pd.DataFrame | None = None,
+    member_skills: dict | None = None,
+    uncertainty_penalty_lambda: float = 0.5,
 ) -> pd.DataFrame:
     if signals_df.empty:
         raise AnalysisError("Empty signal dataframe")
@@ -630,52 +632,97 @@ def score_ticker_by_buyers(
         })
 
     buyers = ticker_trades["member"].unique()
-    buyer_stats = member_rankings[member_rankings["member"].isin(buyers)].sort_values(
-        "avg_spy_alpha_pct", ascending=False
-    )
 
-    if buyer_stats.empty:
-        fallback_score = 0.0
-        fallback_source = "none"
-        perf_signals = ticker_perf_signals if ticker_perf_signals is not None else signals_df
-        if not perf_signals.empty and "ticker" in perf_signals.columns:
-            ticker_hist = perf_signals[
-                (perf_signals["ticker"] == ticker)
-                & (perf_signals["signal_type"] == TransactionType.PURCHASE.value)
-                & (perf_signals["total_spy_alpha_pct"].notna())
-            ]
-            if len(ticker_hist) >= 2:
-                fallback_score = float(ticker_hist["total_spy_alpha_pct"].mean())
-                fallback_source = f"ticker_hist({len(ticker_hist)})"
+    # If Bayesian skill posteriors are provided, use them instead of raw rankings
+    use_skills = member_skills is not None and len(member_skills) > 0
 
-        return pd.DataFrame({
-            "ticker": [ticker],
-            "num_buyers": [len(buyers)],
-            "buyers": [", ".join(buyers[:3])],
-            "signal_score": [round(fallback_score, 2)],
-            "fallback_source": [fallback_source],
-        })
+    if use_skills:
+        from analyzer.member_skill import score_members_for_ticker
 
-    best_rank = buyer_stats["avg_spy_alpha_pct"].max()
-    total_trades = buyer_stats["purchase_trades"].sum()
-    rated_buyers = len(buyer_stats)
-    confidence_weights = np.sqrt(buyer_stats["purchase_trades"].clip(lower=1).astype(float).values)
-    if "bayes_win_prob" in buyer_stats.columns:
-        confidence_weights *= buyer_stats["bayes_win_prob"].fillna(0.55).astype(float).values
-    if "disclosure_date" in ticker_trades.columns:
-        rated_ticker_trades = ticker_trades[ticker_trades["member"].isin(buyer_stats["member"])]
-        latest_disclosure = rated_ticker_trades["disclosure_date"].max()
-        member_disclosures = rated_ticker_trades.groupby("member")["disclosure_date"].max()
-        days_since = (latest_disclosure - member_disclosures.reindex(buyer_stats["member"])).dt.days.fillna(0).clip(lower=0)
-        confidence_weights *= np.exp(-BUYER_RECENCY_DECAY * days_since.values)
-    confidence_weight_sum = confidence_weights.sum()
-    quality_adjusted_avg = (
-        (buyer_stats["avg_spy_alpha_pct"].values * confidence_weights).sum() / confidence_weight_sum
-        if confidence_weight_sum > 0
-        else 0
-    )
+        skill_score, skill_uncertainty = score_members_for_ticker(
+            ticker, list(buyers), member_skills
+        )
+        # Build buyer stats from skills for downstream display fields
+        skill_buyers = [m for m in buyers if m in member_skills]
+        buyer_stats = member_rankings[
+            member_rankings["member"].isin(buyers)
+        ].sort_values("avg_spy_alpha_pct", ascending=False) if member_rankings is not None else pd.DataFrame()
 
-    base_signal_score = quality_adjusted_avg
+        if not buyer_stats.empty:
+            best_rank = buyer_stats["avg_spy_alpha_pct"].max()
+            total_trades = buyer_stats["purchase_trades"].sum()
+            rated_buyers = len(buyer_stats)
+        else:
+            best_rank = skill_score
+            total_trades = len(skill_buyers)
+            rated_buyers = len(skill_buyers)
+
+        # Quality-adjusted average uses posterior means weighted by inverse uncertainty
+        if skill_buyers:
+            skill_posteriors = [member_skills[m] for m in skill_buyers]
+            inv_stds = np.array([1.0 / max(s.alpha_std, 1e-6) for s in skill_posteriors])
+            inv_std_sum = inv_stds.sum()
+            if inv_std_sum > 0:
+                weights = inv_stds / inv_std_sum
+                quality_adjusted_avg = float(np.dot(
+                    weights,
+                    np.array([s.alpha_mean for s in skill_posteriors]),
+                ))
+            else:
+                quality_adjusted_avg = skill_score
+        else:
+            quality_adjusted_avg = skill_score
+
+        # Uncertainty penalty
+        base_signal_score = quality_adjusted_avg - uncertainty_penalty_lambda * skill_uncertainty
+    else:
+        buyer_stats = member_rankings[member_rankings["member"].isin(buyers)].sort_values(
+            "avg_spy_alpha_pct", ascending=False
+        )
+
+        if buyer_stats.empty:
+            fallback_score = 0.0
+            fallback_source = "none"
+            perf_signals = ticker_perf_signals if ticker_perf_signals is not None else signals_df
+            if not perf_signals.empty and "ticker" in perf_signals.columns:
+                ticker_hist = perf_signals[
+                    (perf_signals["ticker"] == ticker)
+                    & (perf_signals["signal_type"] == TransactionType.PURCHASE.value)
+                    & (perf_signals["total_spy_alpha_pct"].notna())
+                ]
+                if len(ticker_hist) >= 2:
+                    fallback_score = float(ticker_hist["total_spy_alpha_pct"].mean())
+                    fallback_source = f"ticker_hist({len(ticker_hist)})"
+
+            return pd.DataFrame({
+                "ticker": [ticker],
+                "num_buyers": [len(buyers)],
+                "buyers": [", ".join(buyers[:3])],
+                "signal_score": [round(fallback_score, 2)],
+                "fallback_source": [fallback_source],
+            })
+
+        best_rank = buyer_stats["avg_spy_alpha_pct"].max()
+        total_trades = buyer_stats["purchase_trades"].sum()
+        rated_buyers = len(buyer_stats)
+        confidence_weights = np.sqrt(buyer_stats["purchase_trades"].clip(lower=1).astype(float).values)
+        if "bayes_win_prob" in buyer_stats.columns:
+            confidence_weights *= buyer_stats["bayes_win_prob"].fillna(0.55).astype(float).values
+        if "disclosure_date" in ticker_trades.columns:
+            rated_ticker_trades = ticker_trades[ticker_trades["member"].isin(buyer_stats["member"])]
+            latest_disclosure = rated_ticker_trades["disclosure_date"].max()
+            member_disclosures = rated_ticker_trades.groupby("member")["disclosure_date"].max()
+            days_since = (latest_disclosure - member_disclosures.reindex(buyer_stats["member"])).dt.days.fillna(0).clip(lower=0)
+            confidence_weights *= np.exp(-BUYER_RECENCY_DECAY * days_since.values)
+        confidence_weight_sum = confidence_weights.sum()
+        quality_adjusted_avg = (
+            (buyer_stats["avg_spy_alpha_pct"].values * confidence_weights).sum() / confidence_weight_sum
+            if confidence_weight_sum > 0
+            else 0
+        )
+
+        base_signal_score = quality_adjusted_avg
+
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
 
@@ -683,7 +730,7 @@ def score_ticker_by_buyers(
         ticker_perf_signals if ticker_perf_signals is not None else signals_df,
         ticker, horizon,
     )
-    if ticker_perf:
+    if ticker_perf and not buyer_stats.empty:
         member_trade_counts = ticker_trades.groupby("member").size()
         weighted_sum = 0.0
         weight_total = 0.0
@@ -699,7 +746,11 @@ def score_ticker_by_buyers(
 
     signal_score = base_signal_score * size_factor * owner_factor * ticker_perf_factor
 
-    top_buyers = buyer_stats["member"].head(3).tolist()
+    if not buyer_stats.empty:
+        top_buyers = buyer_stats["member"].head(3).tolist()
+    else:
+        skill_members = [m for m in buyers if m in (member_skills or {})]
+        top_buyers = skill_members[:3] if skill_members else list(buyers[:3])
     buyer_label = f"Top {len(top_buyers)} of {len(buyers)}" if len(buyers) > 3 else f"{len(buyers)}"
 
     return pd.DataFrame({
@@ -718,6 +769,7 @@ def score_ticker_by_buyers(
         "owner_factor": [round(owner_factor, 3)],
         "signal_score": [round(signal_score, 2)],
         "fallback_source": ["member_ranked"],
+        "uncertainty_lambda": [uncertainty_penalty_lambda if use_skills else 0.0],
     })
 
 
@@ -895,6 +947,12 @@ def backtest_recommendations(
         & (signals_df["disclosure_date"] <= elapsed_cutoff)
     ].copy()
 
+    from analyzer.signal_features import (
+        compute_signal_features,
+        compute_disclosure_lag_weight,
+        estimate_crash_hazard,
+    )
+
     scores = []
     for ticker in candidate_tickers:
         try:
@@ -903,12 +961,50 @@ def backtest_recommendations(
                 member_rankings, min_buyers,
                 ticker_perf_signals=ticker_perf_signals,
             )
+
             # Compute OU entry value V(0) if prices available
             if prices_df is not None:
                 v0 = _compute_ticker_entry_value(
                     ticker, signals_df, prices_df, as_of_date, horizon,
                 )
                 score["ou_entry_value"] = round(v0, 4) if v0 is not None else None
+
+            # Compute signal features and crash hazard for this ticker
+            # Use the most recent transaction date for this ticker
+            ticker_recent = recent_trades[recent_trades["ticker"] == ticker]
+            if not ticker_recent.empty and prices_df is not None:
+                latest_tx = ticker_recent.sort_values("disclosure_date").iloc[-1]
+                tx_date = latest_tx.get("transaction_date")
+                if tx_date is not None:
+                    tx_date = pd.Timestamp(tx_date).date()
+                disc_date = pd.Timestamp(latest_tx["disclosure_date"]).date()
+
+                features = compute_signal_features(
+                    ticker=ticker,
+                    disclosure_date=disc_date,
+                    transaction_date=tx_date,
+                    prices_df=prices_df,
+                    all_tx=recent_trades,
+                    as_of_date=as_of_date.date() if hasattr(as_of_date, 'date') else as_of_date,
+                )
+                crash = estimate_crash_hazard(features)
+
+                # Apply lag weight
+                lag_weight = compute_disclosure_lag_weight(features.lag_days)
+                base_score = float(score["signal_score"].iloc[0])
+                adjusted_score = base_score * lag_weight
+
+                # Apply crash penalty
+                adjusted_score *= (1 - crash.crash_prob)
+
+                score["signal_score"] = round(adjusted_score, 2)
+                score["lag_days"] = features.lag_days
+                score["lag_weight"] = round(lag_weight, 4)
+                score["crash_prob"] = crash.crash_prob
+                score["crash_var_95"] = crash.var_95
+                score["volatility_20d"] = round(features.volatility_20d, 4)
+                score["drawdown_from_ath"] = round(features.drawdown_from_ath, 4)
+
             scores.append(score)
         except AnalysisError:
             continue

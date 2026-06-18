@@ -116,7 +116,14 @@ class PortfolioSimulator:
 
         # Get entry price with slippage
         as_of_ts = pd.Timestamp(as_of)
-        price_series = prices_df[ticker].dropna() if ticker in prices_df.columns else pd.Series(dtype=float)
+        if ticker not in prices_df.columns:
+            return
+        price_series = prices_df[ticker].dropna()
+        if price_series.empty:
+            return
+        # Ensure index is DatetimeIndex for comparison
+        if not isinstance(price_series.index, pd.DatetimeIndex):
+            price_series.index = pd.to_datetime(price_series.index)
         eligible = price_series[price_series.index <= as_of_ts]
         if eligible.empty:
             return
@@ -184,7 +191,13 @@ class PortfolioSimulator:
             return
 
         as_of_ts = pd.Timestamp(as_of)
-        price_series = prices_df[ticker].dropna() if ticker in prices_df.columns else pd.Series(dtype=float)
+        if ticker not in prices_df.columns:
+            return
+        price_series = prices_df[ticker].dropna()
+        if price_series.empty:
+            return
+        if not isinstance(price_series.index, pd.DatetimeIndex):
+            price_series.index = pd.to_datetime(price_series.index)
         eligible = price_series[price_series.index <= as_of_ts]
         if eligible.empty:
             return
@@ -243,7 +256,15 @@ class PortfolioSimulator:
         value = self.cash
         as_of_ts = pd.Timestamp(as_of)
         for pos in self.positions:
-            price_series = prices_df[pos.ticker].dropna() if pos.ticker in prices_df.columns else pd.Series(dtype=float)
+            if pos.ticker not in prices_df.columns:
+                value += pos.cost
+                continue
+            price_series = prices_df[pos.ticker].dropna()
+            if price_series.empty:
+                value += pos.cost
+                continue
+            if not isinstance(price_series.index, pd.DatetimeIndex):
+                price_series.index = pd.to_datetime(price_series.index)
             eligible = price_series[price_series.index <= as_of_ts]
             if not eligible.empty:
                 value += pos.shares * float(eligible.iloc[-1])

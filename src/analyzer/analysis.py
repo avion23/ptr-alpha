@@ -936,6 +936,12 @@ def backtest_recommendations(
         & (signals_df["disclosure_date"] <= elapsed_cutoff)
     ].copy()
 
+    from analyzer.signal_features import (
+        compute_signal_features,
+        compute_disclosure_lag_weight,
+        estimate_crash_hazard,
+    )
+
     scores = []
     for ticker in candidate_tickers:
         try:
@@ -944,12 +950,50 @@ def backtest_recommendations(
                 member_rankings, min_buyers,
                 ticker_perf_signals=ticker_perf_signals,
             )
+
             # Compute OU entry value V(0) if prices available
             if prices_df is not None:
                 v0 = _compute_ticker_entry_value(
                     ticker, signals_df, prices_df, as_of_date, horizon,
                 )
                 score["ou_entry_value"] = round(v0, 4) if v0 is not None else None
+
+            # Compute signal features and crash hazard for this ticker
+            # Use the most recent transaction date for this ticker
+            ticker_recent = recent_trades[recent_trades["ticker"] == ticker]
+            if not ticker_recent.empty and prices_df is not None:
+                latest_tx = ticker_recent.sort_values("disclosure_date").iloc[-1]
+                tx_date = latest_tx.get("transaction_date")
+                if tx_date is not None:
+                    tx_date = pd.Timestamp(tx_date).date()
+                disc_date = pd.Timestamp(latest_tx["disclosure_date"]).date()
+
+                features = compute_signal_features(
+                    ticker=ticker,
+                    disclosure_date=disc_date,
+                    transaction_date=tx_date,
+                    prices_df=prices_df,
+                    all_tx=recent_trades,
+                    as_of_date=as_of_date.date() if hasattr(as_of_date, 'date') else as_of_date,
+                )
+                crash = estimate_crash_hazard(features)
+
+                # Apply lag weight
+                lag_weight = compute_disclosure_lag_weight(features.lag_days)
+                base_score = float(score["signal_score"].iloc[0])
+                adjusted_score = base_score * lag_weight
+
+                # Apply crash penalty
+                adjusted_score *= (1 - crash.crash_prob)
+
+                score["signal_score"] = round(adjusted_score, 2)
+                score["lag_days"] = features.lag_days
+                score["lag_weight"] = round(lag_weight, 4)
+                score["crash_prob"] = crash.crash_prob
+                score["crash_var_95"] = crash.var_95
+                score["volatility_20d"] = round(features.volatility_20d, 4)
+                score["drawdown_from_ath"] = round(features.drawdown_from_ath, 4)
+
             scores.append(score)
         except AnalysisError:
             continue

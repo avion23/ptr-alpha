@@ -481,6 +481,140 @@ class TestDatabaseDateRange(DatabaseTestCase):
         self.assertTrue(result.empty)
 
 
+class TestTrainingLookbackDays(unittest.TestCase):
+    """Tests that training_lookback_days enforces a rolling window on training signals."""
 
-if __name__ == "__main__":
-    unittest.main()
+    def setUp(self):
+        self.as_of = pd.Timestamp("2024-06-15")
+        horizon = 90
+        elapsed_cutoff = self.as_of - pd.Timedelta(days=horizon)
+
+        # Old signals from 2022 — far outside a 365-day lookback from 2024-06-15
+        # Uses same members (Alpha, Beta) as recent signals and transactions
+        # so they affect member_rankings when included.
+        self.old_signals = _make_signals([
+            {
+                "member": "Alpha", "ticker": "OLDT",
+                "disclosure_date": "2022-06-01",
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 50.0, "decayed_return_pct": 30.0,
+                "peak_potential_pct": 40.0, "spy_alpha_pct": 20.0,
+                "total_return_pct": 35.0, "total_spy_alpha_pct": 25.0,
+            },
+            {
+                "member": "Alpha", "ticker": "OLDT2",
+                "disclosure_date": "2022-09-01",
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 60.0, "decayed_return_pct": 25.0,
+                "peak_potential_pct": 35.0, "spy_alpha_pct": 18.0,
+                "total_return_pct": 28.0, "total_spy_alpha_pct": 20.0,
+            },
+        ])
+
+        # Recent signals from 2024 — within a 365-day lookback from 2024-06-15
+        self.recent_signals = _make_signals([
+            {
+                "member": "Alpha", "ticker": "RECN",
+                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=10),
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 100.0, "decayed_return_pct": 15.0,
+                "peak_potential_pct": 25.0, "spy_alpha_pct": 10.0,
+                "total_return_pct": 18.0, "total_spy_alpha_pct": 12.0,
+            },
+            {
+                "member": "Beta", "ticker": "RECN2",
+                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=5),
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 80.0, "decayed_return_pct": 12.0,
+                "peak_potential_pct": 20.0, "spy_alpha_pct": 8.0,
+                "total_return_pct": 14.0, "total_spy_alpha_pct": 9.0,
+            },
+        ])
+
+        self.all_signals = pd.concat(
+            [self.old_signals, self.recent_signals], ignore_index=True
+        )
+
+        # Recent transactions that create candidate tickers — uses same members
+        self.recent_transactions = _make_transactions([
+            {
+                "member": "Alpha", "ticker": "CAND",
+                "transaction_date": "2024-06-01", "disclosure_date": "2024-06-05",
+                "transaction_type": "Purchase",
+            },
+            {
+                "member": "Beta", "ticker": "CAND",
+                "transaction_date": "2024-06-02", "disclosure_date": "2024-06-06",
+                "transaction_type": "Purchase",
+            },
+        ])
+
+    def test_without_lookback_uses_all_loaded_signals(self):
+        """Without training_lookback_days, old signals contribute to rankings."""
+        recs = backtest_recommendations(
+            self.all_signals, self.recent_transactions, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+        )
+        self.assertFalse(recs.empty)
+        # OldMember signals are included in training → they affect member_rankings
+        # The result should have a non-zero signal_score shaped by all training data
+        score_without = recs.iloc[0]["signal_score"]
+        self.assertIsNotNone(score_without)
+
+    def test_with_lookback_excludes_old_signals(self):
+        """With training_lookback_days=365, signals from 2022 are excluded."""
+        recs = backtest_recommendations(
+            self.all_signals, self.recent_transactions, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            training_lookback_days=365,
+        )
+        self.assertFalse(recs.empty)
+        score_with = recs.iloc[0]["signal_score"]
+        self.assertIsNotNone(score_with)
+
+    def test_lookback_changes_member_rankings(self):
+        """Scores differ when old signals are excluded vs included."""
+        recs_without = backtest_recommendations(
+            self.all_signals, self.recent_transactions, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+        )
+        recs_with = backtest_recommendations(
+            self.all_signals, self.recent_transactions, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            training_lookback_days=365,
+        )
+        self.assertFalse(recs_without.empty)
+        self.assertFalse(recs_with.empty)
+        # The signal_score should differ because member rankings change
+        # when old signals are filtered out
+        self.assertNotEqual(
+            recs_without.iloc[0]["signal_score"],
+            recs_with.iloc[0]["signal_score"],
+            "signal_score should differ when training_lookback_days filters old signals",
+        )
+
+    def test_lookback_only_recent_signals_unchanged(self):
+        """When all signals are within the lookback, results match no-lookback."""
+        recs_no_lookback = backtest_recommendations(
+            self.recent_signals, self.recent_transactions, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+        )
+        recs_with_lookback = backtest_recommendations(
+            self.recent_signals, self.recent_transactions, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            training_lookback_days=365,
+        )
+        pd.testing.assert_frame_equal(recs_no_lookback, recs_with_lookback)
+
+    def test_lookback_none_has_no_effect(self):
+        """training_lookback_days=None behaves like no filter."""
+        recs_none = backtest_recommendations(
+            self.all_signals, self.recent_transactions, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            training_lookback_days=None,
+        )
+        recs_default = backtest_recommendations(
+            self.all_signals, self.recent_transactions, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+        )
+        pd.testing.assert_frame_equal(recs_none, recs_default)

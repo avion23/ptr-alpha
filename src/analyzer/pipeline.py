@@ -269,6 +269,7 @@ def run_backtest_pipeline(
             top_n=params.top_n,
             threshold=params.threshold,
             prices_df=prices,
+            training_lookback_days=params.training_lookback_days,
         )
 
         print(f"\n=== Backtest as of {as_of_ts.date()} ===")

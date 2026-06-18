@@ -5,6 +5,7 @@ import logging
 from datetime import date
 from pathlib import Path
 from dataclasses import dataclass
+import pandas as pd
 import typer
 
 from analyzer.pipeline import (

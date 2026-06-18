@@ -822,12 +822,17 @@ def backtest_recommendations(
     top_n: int = 10,
     threshold: float = 5.0,
     prices_df: pd.DataFrame | None = None,
+    training_lookback_days: int | None = None,
 ) -> pd.DataFrame:
     elapsed_cutoff = as_of_date - pd.Timedelta(days=horizon)
     training = signals_df[
         (signals_df["horizon_days"] == horizon)
         & (signals_df["disclosure_date"] <= elapsed_cutoff)
     ].copy()
+
+    if training_lookback_days is not None:
+        training_start = as_of_date - pd.Timedelta(days=training_lookback_days)
+        training = training[training["disclosure_date"] >= training_start]
 
     member_rankings = None
     if not training.empty:

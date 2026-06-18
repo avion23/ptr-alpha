@@ -7,6 +7,7 @@ import pandas as pd
 
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
+from analyzer.ticker_resolver import TickerResolver
 
 DECAY_LAMBDA = 0.05
 POSITION_SIZE_BASELINE = 10000.0
@@ -285,6 +286,16 @@ def calculate_signal_potential(
     prices_long = prices_long[prices_long["ticker"] != "SPY"].copy()
 
     signals = entry_prices_df.copy()
+
+    # Resolve tickers so the merge matches prices_df columns
+    resolver = TickerResolver()
+    price_tickers = set(prices_long["ticker"].unique())
+    raw_tickers = signals["ticker"].unique()
+    for raw in raw_tickers:
+        if raw not in price_tickers:
+            resolved = resolver.resolve(raw)
+            if resolved.price_symbol in price_tickers:
+                signals.loc[signals["ticker"] == raw, "ticker"] = resolved.price_symbol
 
     if signals.empty:
         raise AnalysisError("No valid price matches found for transactions")

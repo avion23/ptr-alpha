@@ -18,6 +18,7 @@ from analyzer.exceptions import DataSourceError, ParsingError
 from analyzer.interfaces import PriceSource, TransactionSource
 from analyzer.settings import Settings
 from analyzer.models import DownloadResult, DownloadStatus, FilingType
+from analyzer.ticker_resolver import TickerResolver
 from analyzer.parsing import (
     consolidate_transactions,
     extract_tables_with_ocr,
@@ -240,6 +241,7 @@ class YFinancePriceSource(PriceSource):
         self.settings = settings
         self.data_dir = Path(settings.data.data_dir)
         self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        self.resolver = TickerResolver()
 
     def close(self) -> None:
         self.db.close()
@@ -257,6 +259,23 @@ class YFinancePriceSource(PriceSource):
 
         all_tickers = sorted(list(set(tickers) | {"SPY"}))
 
+        # Resolve raw tickers to yfinance-compatible symbols
+        resolutions = self.resolver.resolve_batch(all_tickers)
+        # Mapping: raw_ticker -> price_symbol
+        raw_to_yf: dict[str, str] = {r.raw_ticker: r.price_symbol for r in resolutions.values()}
+        # Reverse mapping: yfinance symbol -> raw_ticker (for renaming back)
+        yf_to_raw: dict[str, str] = {}
+        for raw, yf in raw_to_yf.items():
+            if yf not in yf_to_raw:
+                yf_to_raw[yf] = raw
+
+        resolved_tickers = sorted(set(raw_to_yf.values()))
+
+        # Log resolutions
+        for r in resolutions.values():
+            if r.status != "valid":
+                logger.info(f"Ticker resolution: {r.notes}")
+
         cached_prices = self.db.get_prices(all_tickers, start, end)
         if not cached_prices.empty:
             logger.info(
@@ -273,13 +292,15 @@ class YFinancePriceSource(PriceSource):
             return cached_prices[available_tickers].dropna(axis=1, how="all")
 
         fetch_tickers = missing_tickers if missing_tickers else all_tickers
+        # Resolve the tickers we need to fetch
+        fetch_resolved = sorted(set(raw_to_yf.get(t, t) for t in fetch_tickers))
         logger.info(
-            f"Fetching price data for {len(fetch_tickers)} tickers using yfinance"
+            f"Fetching price data for {len(fetch_resolved)} tickers using yfinance"
         )
 
         try:
             data = yf.download(
-                fetch_tickers,
+                fetch_resolved,
                 start=start,
                 end=end,
                 progress=False,
@@ -303,10 +324,14 @@ class YFinancePriceSource(PriceSource):
 
         new_prices = (
             data["Close"]
-            if len(fetch_tickers) > 1
-            else data["Close"].to_frame(fetch_tickers[0])
+            if len(fetch_resolved) > 1
+            else data["Close"].to_frame(fetch_resolved[0])
         )
         new_prices = new_prices.dropna(axis=1, how="all")
+
+        # Rename columns from yfinance symbols back to raw tickers for storage
+        rename_map = {yf: raw for yf, raw in yf_to_raw.items() if yf in new_prices.columns}
+        new_prices = new_prices.rename(columns=rename_map)
 
         if self.db.is_read_only:
             logger.info(

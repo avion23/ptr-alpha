@@ -72,6 +72,26 @@ class TestPriceAtOrBefore(unittest.TestCase):
         result = _price_at_or_before(self.prices, "GOOG", pd.Timestamp("2024-01-02"))
         self.assertEqual(result, 200.0)
 
+    def test_returns_none_when_stale(self):
+        # Price is Jan 1, target is Jan 20 → 19 days stale, max=10
+        result = _price_at_or_before(
+            self.prices, "AAPL", pd.Timestamp("2024-01-20"), max_staleness_days=10
+        )
+        self.assertIsNone(result)
+
+    def test_returns_price_within_staleness_limit(self):
+        # Price is Jan 3, target is Jan 5 → 2 days stale, max=10
+        result = _price_at_or_before(
+            self.prices, "AAPL", pd.Timestamp("2024-01-05"), max_staleness_days=10
+        )
+        self.assertEqual(result, 102.0)
+
+    def test_returns_price_when_no_staleness_limit(self):
+        result = _price_at_or_before(
+            self.prices, "AAPL", pd.Timestamp("2024-12-01"), max_staleness_days=None
+        )
+        self.assertEqual(result, 102.0)
+
 
 class TestBacktestRecommendations(unittest.TestCase):
 
@@ -257,19 +277,32 @@ class TestEvaluateBacktest(unittest.TestCase):
         )
         self.assertTrue(result.empty)
 
-    def test_missing_exit_price_raises(self):
-        short_prices = self.prices.loc[:"2025-01-15"].copy()
-        with self.assertRaises(AnalysisError):
-            evaluate_backtest(
-                self.recommendations, short_prices, pd.Timestamp("2025-01-01"), horizon=90
-            )
+    def test_missing_exit_price_skips_row(self):
+        # Include SPY through exit but cut AAPL/GOOG short, pad with NaN
+        full_dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        short_end = pd.Timestamp("2025-01-15")
+        n_full = len(full_dates)
+        n_short = len(pd.date_range("2024-12-01", short_end, freq="D"))
+        aapl_vals = [100.0 + i * 0.1 for i in range(n_short)] + [np.nan] * (n_full - n_short)
+        goog_vals = [200.0 - i * 0.05 for i in range(n_short)] + [np.nan] * (n_full - n_short)
+        spy_vals = [400.0 + i * 0.02 for i in range(n_full)]
+        prices = pd.DataFrame(
+            {"AAPL": aapl_vals, "GOOG": goog_vals, "SPY": spy_vals},
+            index=full_dates,
+        )
+        result = evaluate_backtest(
+            self.recommendations, prices, pd.Timestamp("2025-01-01"), horizon=90
+        )
+        # Both AAPL/GOOG lack exit prices → all rows skipped
+        self.assertTrue(result.dropna(subset=["bt_return_pct"]).empty)
 
-    def test_missing_entry_price_raises(self):
+    def test_missing_entry_price_skips_row(self):
         no_aapl = self.prices.drop(columns=["AAPL"])
-        with self.assertRaises(AnalysisError):
-            evaluate_backtest(
-                self.recommendations, no_aapl, pd.Timestamp("2025-01-01"), horizon=90
-            )
+        result = evaluate_backtest(
+            self.recommendations, no_aapl, pd.Timestamp("2025-01-01"), horizon=90
+        )
+        # AAPL has no price → skipped, GOOG still evaluated
+        self.assertEqual(len(result.dropna(subset=["bt_return_pct"])), 1)
 
 
 class TestSummarizeBacktest(unittest.TestCase):

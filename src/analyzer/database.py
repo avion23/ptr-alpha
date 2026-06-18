@@ -215,14 +215,21 @@ class Database:
         ).fetchdf()
         return result
 
-    def get_entry_prices(self, tickers: list[str], start_date: date, end_date: date) -> pd.DataFrame:
+    def get_entry_prices(
+        self,
+        tickers: list[str],
+        start_date: date,
+        end_date: date,
+        max_staleness_days: int = 30,
+    ) -> pd.DataFrame:
         if not tickers:
             return pd.DataFrame()
 
         result = self.conn.execute(
             """
             SELECT t.member, t.ticker, t.disclosure_date, t.transaction_type,
-                   t.owner_code, t.amount_midpoint, p.close AS entry_price
+                   t.owner_code, t.amount_midpoint, p.close AS entry_price,
+                   p.date AS entry_price_date
             FROM transactions t
             ASOF JOIN prices p
               ON t.ticker = p.ticker
@@ -233,6 +240,18 @@ class Database:
         """,
             [tickers, start_date, end_date],
         ).fetchdf()
+
+        if not result.empty and max_staleness_days is not None:
+            result["disclosure_date"] = pd.to_datetime(result["disclosure_date"])
+            result["entry_price_date"] = pd.to_datetime(result["entry_price_date"])
+            staleness = (result["disclosure_date"] - result["entry_price_date"]).dt.days
+            stale_mask = staleness > max_staleness_days
+            result.loc[stale_mask, "entry_price"] = None
+            result.loc[stale_mask, "member"] = None
+            result = result.dropna(subset=["member"])
+            result = result.drop(columns=["entry_price_date"])
+        elif not result.empty:
+            result = result.drop(columns=["entry_price_date"])
 
         return result
 

@@ -398,6 +398,49 @@ class TestGetEntryPrices(DatabaseTestCase):
         )
         self.assertEqual(len(result), 1)
 
+    def test_get_entry_prices_filters_stale_prices(self):
+        # Transaction disclosure is 2024-06-01, last price before that is 2024-01-05
+        # That's ~147 days stale — should be filtered with max_staleness_days=30
+        early_prices = pd.bdate_range("2024-01-01", "2024-01-10")
+        early_price_data = pd.DataFrame({"AAPL": [100.0 + i for i in range(len(early_prices))]}, index=early_prices)
+        self.db.upsert_prices(early_price_data)
+
+        tx = pd.DataFrame([{
+            "doc_id": "doc-stale",
+            "member": "Alice",
+            "ticker": "AAPL",
+            "transaction_date": date(2024, 5, 25),
+            "disclosure_date": date(2024, 6, 1),
+            "transaction_type": "Purchase",
+        }])
+        self.db.upsert_transactions(tx)
+
+        result = self.db.get_entry_prices(
+            ["AAPL"], date(2024, 6, 1), date(2024, 6, 1), max_staleness_days=30
+        )
+        self.assertTrue(result.empty)
+
+    def test_get_entry_prices_keeps_fresh_prices(self):
+        dates = pd.bdate_range("2024-01-01", "2024-01-31")
+        price_data = pd.DataFrame({"AAPL": [100.0 + i for i in range(len(dates))]}, index=dates)
+        self.db.upsert_prices(price_data)
+
+        tx = pd.DataFrame([{
+            "doc_id": "doc-fresh",
+            "member": "Alice",
+            "ticker": "AAPL",
+            "transaction_date": date(2024, 1, 25),
+            "disclosure_date": date(2024, 1, 28),
+            "transaction_type": "Purchase",
+        }])
+        self.db.upsert_transactions(tx)
+
+        result = self.db.get_entry_prices(
+            ["AAPL"], date(2024, 1, 28), date(2024, 1, 28), max_staleness_days=30
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIsNotNone(result.iloc[0]["entry_price"])
+
 
 class TestContextManager(DatabaseTestCase):
     def test_context_manager_closes_connection(self):

@@ -277,11 +277,8 @@ def run_backtest_pipeline(
             print("  No recommendations (insufficient training or candidate data)")
             continue
 
-        try:
-            evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
-        except Exception as e:
-            print(f"  SKIPPED: {e}")
-            continue
+        evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
+        evaluated = evaluated.dropna(subset=["bt_return_pct"])
         evaluated.insert(0, "as_of_date", as_of_ts.date())
         all_results.append(evaluated)
 

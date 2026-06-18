@@ -9,7 +9,7 @@ from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
 from analyzer.ticker_resolver import TickerResolver
 
-DECAY_LAMBDA = 0.05
+DECAY_LAMBDA = 0.005
 POSITION_SIZE_BASELINE = 10000.0
 MAX_DISCLOSURE_METADATA_ADJUSTMENT = 0.15
 BAYES_PRIOR_STRENGTH = 20.0

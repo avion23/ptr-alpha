@@ -23,17 +23,23 @@ def _extract_ticker(asset_cell: str | None) -> str | None:
 def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
     if not tx_type_cell:
         return None
-    match tx_type_cell.strip().lower():
-        case s if 'purchase' in s:
-            return TransactionType.PURCHASE.value
-        case s if s.startswith('p') and len(s) <= 2:
-            return TransactionType.PURCHASE.value
-        case s if 'sale' in s or 'sell' in s:
-            return TransactionType.SALE.value
-        case s if s.startswith('s') and len(s) <= 2:
-            return TransactionType.SALE.value
-        case _:
-            return None
+    raw = tx_type_cell.strip()
+    s = raw.lower()
+    # Handle "(partial)" suffix: "P (partial)", "S (partial)", "Purchase (partial)", etc.
+    s_stripped = re.sub(r'\s*\(partial\)\s*$', '', s).strip()
+    if s_stripped in ('p', 'purchase', 'buy'):
+        return TransactionType.PURCHASE.value
+    if s_stripped in ('s', 'sale', 'sold'):
+        return TransactionType.SALE.value
+    if 'purchase' in s or 'buy' in s:
+        return TransactionType.PURCHASE.value
+    if 'sale' in s or 'sell' in s or 'sold' in s:
+        return TransactionType.SALE.value
+    if s_stripped.startswith('p') and len(s_stripped) <= 2:
+        return TransactionType.PURCHASE.value
+    if s_stripped.startswith('s') and len(s_stripped) <= 2:
+        return TransactionType.SALE.value
+    return None
 
 def _extract_date(date_cell: str | None) -> str | None:
     if not date_cell:
@@ -127,12 +133,30 @@ def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | Non
     except IndexError:
         return None
 
+KNOWN_HEADERS = {"asset", "assetname", "description", "owner", "ownership",
+                 "type", "transactiontype", "txtype", "date", "transactiondate",
+                 "amount", "transactionamount"}
+
+
+def _find_header_row(table: list, max_scan: int = 3) -> int | None:
+    """Scan the first `max_scan` rows for one that contains known column headers."""
+    for i, row in enumerate(table[:max_scan]):
+        matches = sum(1 for cell in row if _normalize_header(str(cell)) in KNOWN_HEADERS)
+        if matches >= 2:
+            return i
+    return None
+
+
 def parse_pdf_table(table: list) -> list[dict]:
     if not table or len(table) < 2:
         return []
 
-    indexes = _column_indexes(table[0])
-    return [tx for tx in (_process_row(row, indexes) for row in table[1:]) if tx]
+    header_idx = _find_header_row(table)
+    if header_idx is None:
+        header_idx = 0
+    indexes = _column_indexes(table[header_idx])
+    data_rows = table[header_idx + 1:]
+    return [tx for tx in (_process_row(row, indexes) for row in data_rows) if tx]
 
 
 def normalize_house_metadata(content: str) -> pd.DataFrame:

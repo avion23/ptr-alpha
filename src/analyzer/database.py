@@ -103,6 +103,20 @@ class Database:
             )
         """)
 
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS pdf_parse_runs (
+                doc_id VARCHAR,
+                year INTEGER,
+                parser_version VARCHAR,
+                status VARCHAR,
+                engines_attempted VARCHAR,
+                raw_row_count INTEGER,
+                transaction_count INTEGER,
+                error_message VARCHAR,
+                parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
     def _ensure_transaction_columns(self) -> None:
         existing_columns = {
             row[1]
@@ -187,6 +201,28 @@ class Database:
                 created_at = EXCLUDED.created_at
         """)
         self.conn.execute("DROP TABLE staging_transactions")
+
+    def delete_transactions_for_doc(self, doc_id: str) -> None:
+        self.conn.execute("DELETE FROM transactions WHERE doc_id = ?", [doc_id])
+
+    def upsert_parse_run(
+        self,
+        doc_id: str,
+        year: int,
+        parser_version: str,
+        status: str,
+        engines_attempted: str,
+        raw_row_count: int,
+        transaction_count: int,
+        error_message: str = "",
+    ) -> None:
+        self.conn.execute("""
+            INSERT INTO pdf_parse_runs (
+                doc_id, year, parser_version, status, engines_attempted,
+                raw_row_count, transaction_count, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, [doc_id, year, parser_version, status, engines_attempted,
+              raw_row_count, transaction_count, error_message])
 
     def get_transactions(self, year: int) -> pd.DataFrame:
         result = self.conn.execute(

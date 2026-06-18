@@ -29,26 +29,39 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
+    transactions = []
+    engines_attempted = []
+
+    # Try lattice first
     try:
-        transactions = []
         tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
+        engines_attempted.append("lattice")
         for table in tables:
             transactions.extend(parse_pdf_table(table.data))
-        if not tables:
+    except Exception as e:
+        logger.debug(f"Lattice failed for {pdf_path}: {e}")
+
+    # Try stream if lattice produced nothing
+    if not transactions:
+        try:
             tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="stream")
+            engines_attempted.append("stream")
             for table in tables:
                 transactions.extend(parse_pdf_table(table.data))
-        if not transactions:
+        except Exception as e:
+            logger.debug(f"Stream failed for {pdf_path}: {e}")
+
+    # Try OCR as final fallback
+    if not transactions:
+        try:
             ocr_tables = extract_tables_with_ocr(pdf_path)
+            engines_attempted.append("ocr")
             for table in ocr_tables:
                 transactions.extend(parse_pdf_table(table))
-        return pdf_path, transactions
-    except ParsingError as e:
-        logger.warning(f"Failed to parse PDF {pdf_path}: {e}")
-        return pdf_path, []
-    except Exception as e:
-        logger.error(f"Unexpected error parsing PDF {pdf_path}: {e}", exc_info=True)
-        return pdf_path, []
+        except Exception as e:
+            logger.debug(f"OCR failed for {pdf_path}: {e}")
+
+    return pdf_path, transactions, engines_attempted
 
 
 class HouseTransactionSource(TransactionSource):
@@ -223,13 +236,29 @@ class HouseTransactionSource(TransactionSource):
         with Pool(self.parallel_workers) as pool:
             results = pool.map(_parse_pdf_worker, pdf_paths)
 
-        pdf_transactions = {
-            pdf_path: transactions for pdf_path, transactions in results
-        }
+        pdf_transactions = {}
+        for pdf_path, transactions, engines_attempted in results:
+            doc_id = pdf_path.stem
+            pdf_transactions[pdf_path] = transactions
+            status = "success" if transactions else "zero_rows"
+            self.db.upsert_parse_run(
+                doc_id=doc_id,
+                year=year,
+                parser_version="v2",
+                status=status,
+                engines_attempted=",".join(engines_attempted),
+                raw_row_count=0,
+                transaction_count=len(transactions),
+            )
+
         df = consolidate_transactions(pdf_transactions, member_lookup)
 
         if df.empty:
             raise ParsingError("No transactions found after parsing all PDFs")
+
+        # Delete old rows for each doc_id before inserting new ones
+        for doc_id in df["doc_id"].unique():
+            self.db.delete_transactions_for_doc(doc_id)
 
         self.db.upsert_transactions(df)
         logger.info(f"Saved {len(df)} transactions to database")

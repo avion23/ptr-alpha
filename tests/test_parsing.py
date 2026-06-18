@@ -3,7 +3,8 @@ import pandas as pd
 from analyzer.parsing import (
     clean_text, _extract_ticker, _extract_date, _extract_transaction_type,
     parse_pdf_table, normalize_house_metadata, consolidate_transactions,
-    _extract_amount_midpoint, _extract_owner_code, _parse_ocr_text_to_rows
+    _extract_amount_midpoint, _extract_owner_code, _parse_ocr_text_to_rows,
+    _find_header_row,
 )
 from analyzer.exceptions import ParsingError
 
@@ -357,6 +358,95 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(transactions[1]['owner_code'], 'J')
         self.assertEqual(transactions[2]['owner_code'], 'S')
         self.assertEqual(transactions[2]['ticker'], 'F')
+
+    def test_extract_transaction_type_partial_suffix(self):
+        self.assertEqual(_extract_transaction_type("P (partial)"), "Purchase")
+        self.assertEqual(_extract_transaction_type("S (partial)"), "Sale")
+        self.assertEqual(_extract_transaction_type("Purchase (partial)"), "Purchase")
+        self.assertEqual(_extract_transaction_type("Sale (partial)"), "Sale")
+        self.assertEqual(_extract_transaction_type("S (PARTIAL)"), "Sale")
+        self.assertEqual(_extract_transaction_type("P (PARTIAL)"), "Purchase")
+
+    def test_extract_transaction_type_bare_s_and_p(self):
+        self.assertEqual(_extract_transaction_type("S"), "Sale")
+        self.assertEqual(_extract_transaction_type("P"), "Purchase")
+        self.assertEqual(_extract_transaction_type("s"), "Sale")
+        self.assertEqual(_extract_transaction_type("p"), "Purchase")
+
+    def test_extract_transaction_type_buy_sold(self):
+        self.assertEqual(_extract_transaction_type("Buy"), "Purchase")
+        self.assertEqual(_extract_transaction_type("Sold"), "Sale")
+        self.assertEqual(_extract_transaction_type("buy"), "Purchase")
+        self.assertEqual(_extract_transaction_type("sold"), "Sale")
+
+    def test_extract_transaction_type_sale_purchase_full_words(self):
+        self.assertEqual(_extract_transaction_type("Sale"), "Sale")
+        self.assertEqual(_extract_transaction_type("Purchase"), "Purchase")
+
+    def test_find_header_row_in_row_0(self):
+        table = [
+            ['Asset', 'Type', 'Date'],
+            ['Apple Inc. (AAPL)', 'Purchase', '2024-01-01'],
+        ]
+        self.assertEqual(_find_header_row(table), 0)
+
+    def test_find_header_row_in_row_1(self):
+        table = [
+            ['Some title row'],
+            ['Asset Name', 'Transaction Type', 'Transaction Date'],
+            ['Apple Inc. (AAPL)', 'Purchase', '2024-01-01'],
+        ]
+        self.assertEqual(_find_header_row(table), 1)
+
+    def test_find_header_row_in_row_2(self):
+        table = [
+            ['Title row'],
+            ['Subtitle row'],
+            ['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date'],
+            ['Apple Inc. (AAPL)', 'Self', 'Purchase', '2024-01-01'],
+        ]
+        self.assertEqual(_find_header_row(table), 2)
+
+    def test_find_header_row_returns_none_when_no_match(self):
+        table = [
+            ['Random', 'Stuff', 'Here'],
+            ['More', 'Random', 'Data'],
+        ]
+        self.assertIsNone(_find_header_row(table))
+
+    def test_parse_pdf_table_header_not_in_row_0(self):
+        table = [
+            ['Quarterly Transaction Report 2024'],
+            ['Asset Name', 'Transaction Type', 'Transaction Date'],
+            ['Apple Inc. (AAPL)', 'Purchase', '2024-01-01'],
+            ['Google LLC (GOOGL)', 'Sale', '2024-01-02'],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 2)
+        self.assertEqual(transactions[0]['ticker'], 'AAPL')
+        self.assertEqual(transactions[0]['transaction_type'], 'Purchase')
+        self.assertEqual(transactions[1]['ticker'], 'GOOGL')
+        self.assertEqual(transactions[1]['transaction_type'], 'Sale')
+
+    def test_parse_pdf_table_header_with_owner_in_row_1(self):
+        table = [
+            ['Filing Header'],
+            ['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date', 'Amount'],
+            ['TransDigm Group Inc (TDG)', 'Dependent Child', 'P', '04/16/2026', '$15,001 - $50,000'],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]['ticker'], 'TDG')
+        self.assertEqual(transactions[0]['owner_code'], 'DC')
+
+    def test_parse_ocr_text_partial_suffix(self):
+        text = "Apple Inc (AAPL) P (partial) 01/15/2024\nGoogle LLC (GOOGL) S (partial) 01/16/2024\n"
+        rows = _parse_ocr_text_to_rows(text)
+        # Partial suffixes on their own lines won't have a ticker on the same line
+        # but the P/S prefix pattern should match
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][1], "Purchase")
+        self.assertEqual(rows[1][1], "Sale")
 
 if __name__ == '__main__':
     unittest.main()

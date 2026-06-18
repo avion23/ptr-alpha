@@ -462,5 +462,142 @@ class TestContextManager(DatabaseTestCase):
         ro_db.close()
 
 
+class TestDeleteTransactionsForDoc(DatabaseTestCase):
+
+    def test_delete_removes_only_that_docs_rows(self):
+        df = pd.DataFrame([
+            {
+                "doc_id": "doc1",
+                "member": "John Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+            },
+            {
+                "doc_id": "doc2",
+                "member": "Jane Smith",
+                "ticker": "GOOG",
+                "transaction_date": date(2024, 4, 1),
+                "disclosure_date": date(2024, 4, 5),
+                "transaction_type": "Sale",
+            },
+        ])
+        self.db.upsert_transactions(df)
+        self.assertEqual(len(self.db.get_transactions(2024)), 2)
+
+        self.db.delete_transactions_for_doc("doc1")
+        result = self.db.get_transactions(2024)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["ticker"], "GOOG")
+
+    def test_delete_nonexistent_doc_is_noop(self):
+        df = pd.DataFrame([
+            {
+                "doc_id": "doc1",
+                "member": "John Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+            },
+        ])
+        self.db.upsert_transactions(df)
+        self.db.delete_transactions_for_doc("nonexistent")
+        self.assertEqual(len(self.db.get_transactions(2024)), 1)
+
+
+class TestParseRunsTable(DatabaseTestCase):
+
+    def test_pdf_parse_runs_table_exists(self):
+        tables = self.db.conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+        ).fetchall()
+        table_names = {t[0] for t in tables}
+        self.assertIn("pdf_parse_runs", table_names)
+
+    def test_upsert_parse_run_inserts_row(self):
+        self.db.upsert_parse_run(
+            doc_id="doc1",
+            year=2024,
+            parser_version="v2",
+            status="success",
+            engines_attempted="lattice,stream,ocr",
+            raw_row_count=10,
+            transaction_count=5,
+        )
+        result = self.db.conn.execute("SELECT * FROM pdf_parse_runs WHERE doc_id = 'doc1'").fetchall()
+        self.assertEqual(len(result), 1)
+        row = result[0]
+        self.assertEqual(row[0], "doc1")   # doc_id
+        self.assertEqual(row[1], 2024)     # year
+        self.assertEqual(row[2], "v2")     # parser_version
+        self.assertEqual(row[3], "success")  # status
+        self.assertEqual(row[4], "lattice,stream,ocr")  # engines_attempted
+        self.assertEqual(row[6], 5)        # transaction_count
+
+    def test_upsert_parse_run_zero_rows_status(self):
+        self.db.upsert_parse_run(
+            doc_id="doc2",
+            year=2024,
+            parser_version="v2",
+            status="zero_rows",
+            engines_attempted="lattice,stream,ocr",
+            raw_row_count=0,
+            transaction_count=0,
+        )
+        result = self.db.conn.execute("SELECT status FROM pdf_parse_runs WHERE doc_id = 'doc2'").fetchone()
+        self.assertEqual(result[0], "zero_rows")
+
+    def test_upsert_parse_run_error_status(self):
+        self.db.upsert_parse_run(
+            doc_id="doc3",
+            year=2024,
+            parser_version="v2",
+            status="error",
+            engines_attempted="lattice,stream,ocr",
+            raw_row_count=0,
+            transaction_count=0,
+            error_message="PDFTextExtractionNotAllowed",
+        )
+        result = self.db.conn.execute(
+            "SELECT error_message FROM pdf_parse_runs WHERE doc_id = 'doc3'"
+        ).fetchone()
+        self.assertEqual(result[0], "PDFTextExtractionNotAllowed")
+
+    def test_reparse_replaces_old_rows(self):
+        """Re-parsing a doc_id should delete old rows then insert new ones."""
+        df1 = pd.DataFrame([
+            {
+                "doc_id": "doc1",
+                "member": "John Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+            },
+        ])
+        self.db.upsert_transactions(df1)
+        self.assertEqual(len(self.db.get_transactions(2024)), 1)
+
+        # Simulate re-parse: delete old, insert new with different data
+        self.db.delete_transactions_for_doc("doc1")
+        df2 = pd.DataFrame([
+            {
+                "doc_id": "doc1",
+                "member": "John Doe",
+                "ticker": "MSFT",
+                "transaction_date": date(2024, 5, 1),
+                "disclosure_date": date(2024, 5, 5),
+                "transaction_type": "Sale",
+            },
+        ])
+        self.db.upsert_transactions(df2)
+        result = self.db.get_transactions(2024)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["ticker"], "MSFT")
+        self.assertEqual(result.iloc[0]["transaction_type"], "Sale")
+
+
 if __name__ == "__main__":
     unittest.main()

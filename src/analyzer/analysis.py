@@ -766,13 +766,20 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
 
 
 def _price_at_or_before(
-    prices_df: pd.DataFrame, ticker: str, target_date: pd.Timestamp
+    prices_df: pd.DataFrame,
+    ticker: str,
+    target_date: pd.Timestamp,
+    max_staleness_days: int | None = None,
 ) -> float | None:
     if ticker not in prices_df.columns:
         return None
     series = prices_df[ticker].dropna()
-    eligible = series[series.index <= pd.Timestamp(target_date)]
+    target = pd.Timestamp(target_date)
+    eligible = series[series.index <= target]
     if eligible.empty:
+        return None
+    price_date = eligible.index[-1]
+    if max_staleness_days is not None and (target - price_date).days > max_staleness_days:
         return None
     return float(eligible.iloc[-1])
 
@@ -893,13 +900,14 @@ def evaluate_backtest(
     prices_df: pd.DataFrame,
     as_of_date: pd.Timestamp,
     horizon: int,
+    max_staleness_days: int | None = 30,
 ) -> pd.DataFrame:
     if recommendations.empty:
         return recommendations
 
     exit_date = as_of_date + pd.Timedelta(days=horizon)
 
-    spy_start = _price_at_or_before(prices_df, "SPY", as_of_date)
+    spy_start = _price_at_or_before(prices_df, "SPY", as_of_date, max_staleness_days)
     spy_end = _price_on_or_before(prices_df, "SPY", exit_date)
     if not spy_start or not spy_end:
         raise AnalysisError(
@@ -911,18 +919,10 @@ def evaluate_backtest(
     rows = []
     for _, rec in recommendations.iterrows():
         ticker = rec["ticker"]
-        entry = _price_at_or_before(prices_df, ticker, as_of_date)
+        entry = _price_at_or_before(prices_df, ticker, as_of_date, max_staleness_days)
         exit_price = _price_on_or_before(prices_df, ticker, exit_date)
-        if not entry:
-            raise AnalysisError(
-                f"No price for {ticker} at/as_of {as_of_date.date()} "
-                f"— cannot backtest"
-            )
-        if not exit_price:
-            raise AnalysisError(
-                f"No price for {ticker} on/before exit {exit_date.date()} "
-                f"(as_of={as_of_date.date()}) — cannot backtest"
-            )
+        if not entry or not exit_price:
+            continue
         return_pct = (exit_price / entry - 1) * 100
         alpha_pct = return_pct - spy_return_pct
         rows.append({
@@ -935,6 +935,11 @@ def evaluate_backtest(
         })
 
     eval_df = pd.DataFrame(rows)
+    if eval_df.empty:
+        recommendations = recommendations.copy()
+        for col in ["bt_entry_price", "bt_exit_price", "bt_return_pct", "bt_spy_return_pct", "bt_alpha_pct"]:
+            recommendations[col] = None
+        return recommendations
     return recommendations.merge(eval_df, on="ticker", how="left")
 
 

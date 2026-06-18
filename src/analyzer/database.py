@@ -8,6 +8,7 @@ import duckdb
 import pandas as pd
 
 from analyzer.exceptions import AnalysisError
+from analyzer.ticker_resolver import TickerResolver
 
 
 logger = logging.getLogger(__name__)
@@ -261,6 +262,21 @@ class Database:
         if not tickers:
             return pd.DataFrame()
 
+        # Resolve tickers so the ASOF join can match both raw and resolved symbols
+        resolver = TickerResolver()
+        resolutions = resolver.resolve_batch(tickers)
+        # Build expanded ticker set: raw tickers + their resolved yfinance symbols
+        expanded_tickers: list[str] = []
+        seen: set[str] = set()
+        for raw in tickers:
+            if raw not in seen:
+                seen.add(raw)
+                expanded_tickers.append(raw)
+            resolved = resolutions[raw].price_symbol
+            if resolved not in seen:
+                seen.add(resolved)
+                expanded_tickers.append(resolved)
+
         result = self.conn.execute(
             """
             SELECT t.member, t.ticker, t.disclosure_date, t.transaction_type,
@@ -274,7 +290,7 @@ class Database:
               AND t.disclosure_date BETWEEN ? AND ?
               AND p.close IS NOT NULL
         """,
-            [tickers, start_date, end_date],
+            [expanded_tickers, start_date, end_date],
         ).fetchdf()
 
         if not result.empty and max_staleness_days is not None:

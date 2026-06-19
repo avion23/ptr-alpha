@@ -64,6 +64,9 @@ class Database:
                 owner_code VARCHAR,
                 amount_raw VARCHAR,
                 amount_midpoint DOUBLE,
+                instrument_type VARCHAR,
+                strike_price DOUBLE,
+                expiry_date VARCHAR,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -127,6 +130,9 @@ class Database:
             "owner_code": "VARCHAR",
             "amount_raw": "VARCHAR",
             "amount_midpoint": "DOUBLE",
+            "instrument_type": "VARCHAR",
+            "strike_price": "DOUBLE",
+            "expiry_date": "VARCHAR",
         }
         for column, column_type in required_columns.items():
             if column not in existing_columns:
@@ -179,7 +185,7 @@ class Database:
 
     def upsert_transactions(self, df: pd.DataFrame) -> None:
         df = df.copy()
-        for column in ["owner_code", "amount_raw", "amount_midpoint"]:
+        for column in ["owner_code", "amount_raw", "amount_midpoint", "instrument_type", "strike_price", "expiry_date"]:
             if column not in df.columns:
                 df[column] = None
         df["created_at"] = datetime.now()
@@ -188,10 +194,10 @@ class Database:
         self.conn.execute("""
             INSERT INTO transactions (
                 doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                owner_code, amount_raw, amount_midpoint, created_at
+                owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
             )
             SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                   owner_code, amount_raw, amount_midpoint, created_at
+                   owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
             FROM staging_transactions
             ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type) DO UPDATE SET
                 transaction_type = EXCLUDED.transaction_type,
@@ -199,6 +205,9 @@ class Database:
                 owner_code = EXCLUDED.owner_code,
                 amount_raw = EXCLUDED.amount_raw,
                 amount_midpoint = EXCLUDED.amount_midpoint,
+                instrument_type = EXCLUDED.instrument_type,
+                strike_price = EXCLUDED.strike_price,
+                expiry_date = EXCLUDED.expiry_date,
                 created_at = EXCLUDED.created_at
         """)
         self.conn.execute("DROP TABLE staging_transactions")
@@ -229,7 +238,7 @@ class Database:
         result = self.conn.execute(
             """
             SELECT member, ticker, transaction_date, disclosure_date, transaction_type,
-                   owner_code, amount_raw, amount_midpoint
+                   owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date
             FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
             ORDER BY disclosure_date DESC
@@ -242,7 +251,7 @@ class Database:
         result = self.conn.execute(
             """
             SELECT member, ticker, transaction_date, disclosure_date, transaction_type,
-                   owner_code, amount_raw, amount_midpoint
+                   owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date
             FROM transactions
             WHERE disclosure_date BETWEEN ? AND ?
               AND transaction_date <= disclosure_date
@@ -280,8 +289,8 @@ class Database:
         result = self.conn.execute(
             """
             SELECT t.member, t.ticker, t.disclosure_date, t.transaction_type,
-                   t.owner_code, t.amount_midpoint, p.close AS entry_price,
-                   p.date AS entry_price_date
+                   t.owner_code, t.amount_midpoint, t.instrument_type, t.strike_price, t.expiry_date,
+                   p.close AS entry_price, p.date AS entry_price_date
             FROM transactions t
             ASOF JOIN prices p
               ON t.ticker = p.ticker

@@ -305,7 +305,7 @@ def _lookup_buyer_bayes_win_prob(
     return float(val) if pd.notna(val) else None
 
 
-@df_memoize(copy=False)
+@df_memoize(copy=True)
 def score_ticker_by_buyers(
     ticker: str,
     transactions_df: pd.DataFrame,

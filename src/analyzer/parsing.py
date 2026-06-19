@@ -516,7 +516,7 @@ def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
 
     # Pattern 2: Lines without owner prefix (asset starts at beginning):
     tx_no_owner = re.compile(
-        r'^\s{0,4}'
+        r'^\s{0,30}'
         r'(.+?)\s+'                  # asset name
         r'(' + tx_type_pat + r')\s+' # type
         r'(\d{2}/\d{2}/\d{4})\s+'    # tx date
@@ -525,12 +525,17 @@ def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
     )
 
     # Headers and metadata lines to skip
+    # Note: single-letter patterns removed — they caused false skips on
+    # transaction lines like "TripleBlind..." (starts with T) and "Treasury..."
     skip_patterns = [
         'ID', 'Owner', 'Asset', 'Transaction', 'Date', 'Type',
         'Notification', 'Amount', 'Cap.', 'Gains', 'CERTIFY',
         'I CERTIFY', 'Digitally', 'Filing', 'Clerk', 'PERIODIC',
-        'Name:', 'Status:', 'State/District:', 'F', 'I', 'P', 'T', 'R',
+        'Name:', 'Status:', 'State/District:',
     ]
+    # Single-letter header lines (e.g. standalone "T", "F", "I") are short —
+    # skip them by length check instead of prefix.
+    _max_single_letter_len = 4
 
     transactions = []
     i = 0
@@ -538,7 +543,8 @@ def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
         line = lines[i]
 
         # Skip headers, empty lines, metadata
-        if not line.strip() or any(line.strip().startswith(s) for s in skip_patterns):
+        stripped = line.strip()
+        if not stripped or len(stripped) <= _max_single_letter_len or any(stripped.startswith(s) for s in skip_patterns):
             i += 1
             continue
 

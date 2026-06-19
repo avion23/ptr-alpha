@@ -188,15 +188,13 @@ def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> p
     if "disclosure_date" not in signals_df.columns:
         return signals_df
 
-    df = signals_df.copy()
-    df = df.sort_values(group_cols + ["disclosure_date"]).reset_index(drop=True)
+    df = signals_df.sort_values(group_cols + ["disclosure_date"]).reset_index(drop=True)
 
-    episode_ids = np.zeros(len(df), dtype=np.int64)
-    for _, group in df.groupby(group_cols, sort=False):
-        loc = group.index
-        sorted_group = group.sort_values("disclosure_date")
-        episode_ids[loc] = _assign_episode_ids(sorted_group, max_gap_days)
-    df["_episode_id"] = episode_ids
+    dates = pd.to_datetime(df["disclosure_date"])
+    gaps = dates.diff().dt.days.fillna(0).astype(np.int64)
+    first_per_group = df.groupby(group_cols, sort=False).head(1).index
+    gaps.loc[first_per_group] = 0
+    df["_episode_id"] = (gaps > max_gap_days).cumsum().astype(np.int64)
 
     if "amount_midpoint" in df.columns:
         df["_weight"] = df["amount_midpoint"].fillna(1.0)

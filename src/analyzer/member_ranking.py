@@ -79,7 +79,7 @@ def _conviction_score(trades: pd.DataFrame) -> float:
     return count_score * 0.6 + size_score * 0.4
 
 
-@df_memoize
+@df_memoize(copy=False)
 def _compute_ticker_member_performance(
     signals_df: pd.DataFrame, ticker: str, horizon: int,
     _bayes_prior_strength: float | None = None,
@@ -206,8 +206,15 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
 
 
 @df_memoize(copy=False)
-def _rank_members_impl(signal_df: pd.DataFrame, horizon: int, threshold: float,
-                       _bayes_prior_strength: float) -> pd.DataFrame:
+def _prepare_member_data(
+    signal_df: pd.DataFrame, horizon: int, threshold: float,
+) -> tuple[pd.DataFrame, float, pd.DataFrame]:
+    """Prepare collapsed purchases and market prior (bayes-independent).
+
+    This is the expensive part of _rank_members_impl that doesn't depend on
+    bayes_prior_strength. Extracting it allows memoization to hit cache for
+    2/3 of combos (all but the bayes_prior dimension change).
+    """
     purchases = _get_horizon_data(signal_df, horizon, TransactionType.PURCHASE.value)
     if purchases.empty:
         raise AnalysisError(f"No purchase signals found for horizon {horizon}")
@@ -217,13 +224,20 @@ def _rank_members_impl(signal_df: pd.DataFrame, horizon: int, threshold: float,
         raise AnalysisError(f"No signals survived quality filter (min price ${_signals.MIN_ENTRY_PRICE})")
 
     purchases = _collapse_to_episodes(purchases)
-
     market_prior = _compute_dynamic_prior(signal_df, horizon)
+    return purchases, market_prior
+
+
+@df_memoize(copy=False)
+def _rank_members_impl(signal_df: pd.DataFrame, horizon: int, threshold: float,
+                       _bayes_prior_strength: float) -> pd.DataFrame:
+    purchases, market_prior = _prepare_member_data(signal_df, horizon, threshold)
+
     alpha_col = "total_spy_alpha_pct" if "total_spy_alpha_pct" in purchases.columns else "spy_alpha_pct"
     prior_alpha_mean = float(purchases[alpha_col].mean())
     if pd.isna(prior_alpha_mean):
         prior_alpha_mean = 0.0
-    prior_strength = _signals.BAYES_PRIOR_STRENGTH
+    prior_strength = _bayes_prior_strength
     member_stats = []
     for member, purchase_grp in purchases.groupby("member"):
         row = _compute_member_stats(member, purchase_grp, market_prior, threshold)
@@ -276,6 +290,7 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
     }).sort_values("avg_spy_alpha_pct", ascending=False)
 
 
+@df_memoize(copy=False)
 def _get_ticker_purchases(
     ticker: str,
     transactions_df: pd.DataFrame,
@@ -303,6 +318,22 @@ def _lookup_buyer_bayes_win_prob(
         return None
     val = row["bayes_win_prob"].iloc[0]
     return float(val) if pd.notna(val) else None
+
+
+def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, float]:
+    """Precompute {member: bayes_win_prob} dict for O(1) lookups.
+
+    Replaces repeated linear scans of member_rankings DataFrame.
+    """
+    if member_rankings is None or member_rankings.empty:
+        return {}
+    if "bayes_win_prob" not in member_rankings.columns:
+        return {}
+    return {
+        row["member"]: float(row["bayes_win_prob"])
+        for _, row in member_rankings[["member", "bayes_win_prob"]].iterrows()
+        if pd.notna(row["bayes_win_prob"])
+    }
 
 
 @df_memoize(copy=False)
@@ -548,7 +579,7 @@ def estimate_member_decay_lambda(
     return default_lambda
 
 
-@df_memoize(copy=True)
+@df_memoize(copy=False)
 def get_member_decay_map(
     signals_df: pd.DataFrame,
     horizon: int = 90,

@@ -131,7 +131,7 @@ def _filter_ticker_perf(
     ].copy()
 
 
-@df_memoize
+@df_memoize(copy=False)
 def _build_ticker_curves(
     ticker: str,
     signals_df: pd.DataFrame,
@@ -160,7 +160,7 @@ def _build_ticker_curves(
     return _build_curves_for_rows(eligible, prices_df, horizon)
 
 
-@df_memoize
+@df_memoize(copy=False)
 def _build_global_curves(
     signals_df: pd.DataFrame,
     prices_df: pd.DataFrame,
@@ -239,7 +239,7 @@ def _build_curves_for_rows(
     return curves
 
 
-@df_memoize
+@df_memoize(copy=False)
 def _compute_ticker_entry_value(
     ticker: str,
     signals_df: pd.DataFrame,
@@ -282,7 +282,7 @@ def _compute_ticker_entry_value(
     return v0
 
 
-@df_memoize
+@df_memoize(copy=False)
 def _compute_ticker_optimal_horizon(
     ticker: str,
     signals_df: pd.DataFrame,
@@ -358,6 +358,9 @@ def backtest_recommendations(
     if not candidate_tickers:
         return pd.DataFrame()
 
+    # Pre-group recent_trades by ticker to avoid repeated boolean masking
+    recent_by_ticker = {t: grp for t, grp in recent_trades.groupby("ticker")}
+
     ticker_perf_signals = _filter_ticker_perf(signals_df, horizon, as_of_iso)
 
     from analyzer.signal_features import (
@@ -369,6 +372,9 @@ def backtest_recommendations(
     as_of_for_features = (
         as_of_date.date() if hasattr(as_of_date, "date") else as_of_date
     )
+
+    # Precompute buyer_bayes_dict from member_rankings for O(1) lookups
+    # (avoids repeated linear scans in _lookup_buyer_bayes_win_prob)
 
     scores = []
     for ticker in candidate_tickers:
@@ -405,7 +411,7 @@ def backtest_recommendations(
 
             # Compute signal features and crash hazard for this ticker
             # Use the most recent transaction date for this ticker
-            ticker_recent = recent_trades[recent_trades["ticker"] == ticker]
+            ticker_recent = recent_by_ticker.get(ticker, pd.DataFrame())
             if not ticker_recent.empty and prices_df is not None:
                 try:
                     latest_tx = ticker_recent.sort_values("disclosure_date").iloc[-1]

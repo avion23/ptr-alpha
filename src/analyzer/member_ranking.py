@@ -189,12 +189,21 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
     purchases = _collapse_to_episodes(purchases)
 
     market_prior = _compute_dynamic_prior(signal_df, horizon)
+    alpha_col = "total_spy_alpha_pct" if "total_spy_alpha_pct" in purchases.columns else "spy_alpha_pct"
+    prior_alpha_mean = float(purchases[alpha_col].mean())
+    if pd.isna(prior_alpha_mean):
+        prior_alpha_mean = 0.0
+    prior_strength = _signals.BAYES_PRIOR_STRENGTH
     member_stats = []
     for member, purchase_grp in purchases.groupby("member"):
         row = _compute_member_stats(member, purchase_grp, market_prior, threshold)
         if row is not None:
             conviction = _conviction_score(purchase_grp)
             row["conviction_score"] = round(conviction, 3)
+            alpha_vals = purchase_grp[alpha_col].dropna() if alpha_col in purchase_grp.columns else pd.Series(dtype=float)
+            alpha_sum = float(alpha_vals.sum()) if len(alpha_vals) > 0 else 0.0
+            n = len(alpha_vals)
+            row["shrunk_alpha"] = (prior_alpha_mean * prior_strength + alpha_sum) / (prior_strength + n)
             member_stats.append(row)
 
     result = pd.DataFrame(member_stats)
@@ -206,7 +215,7 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
         "median_return_pct": "median_decay_return_pct",
         "trades": "purchase_trades",
         "prob_up": "prob_up_given_buy",
-    }).sort_values("avg_total_spy_alpha_pct", ascending=False)
+    }).sort_values("shrunk_alpha", ascending=False)
 
 
 def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:

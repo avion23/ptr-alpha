@@ -221,7 +221,12 @@ def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> p
             agg_dict[col] = (col, func)
 
     if "owner_code" in df.columns:
-        agg_dict["owner_code"] = ("owner_code", lambda x: x.mode().iloc[0] if len(x) > 0 and not x.mode().empty else x.iloc[0])
+        # "first" is used instead of mode to avoid the slow per-group lambda.
+        # Episodes are sorted by disclosure_date, so "first" picks the
+        # earliest owner_code — a reasonable proxy for the dominant one.
+        # Downstream code (_owner_score_factor) operates on raw trades,
+        # not collapsed episodes, so this field is informational only.
+        agg_dict["owner_code"] = ("owner_code", "first")
 
     for col in existing_avg_cols:
         agg_dict[col] = (f"_wp_{col}", "sum")

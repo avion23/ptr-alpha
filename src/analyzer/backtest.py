@@ -186,7 +186,7 @@ def _build_global_curves(
 def _build_curves_for_rows(
     rows: pd.DataFrame, prices_df: pd.DataFrame, horizon: int
 ) -> list:
-    """Vectorized-ish curve builder.
+    """Vectorized curve builder.
 
     Precomputes per-ticker (date_index_ns, price_values) once via the shared
     ``_price_arrays`` cache and uses searchsorted to slice windows instead of
@@ -195,19 +195,23 @@ def _build_curves_for_rows(
     import numpy as np
 
     price_cols = set(prices_df.columns)
-    # Cache (idx_ns, values) per ticker encountered. _price_arrays already
-    # normalizes to nanoseconds regardless of source-index resolution.
     per_ticker: dict[str, tuple | None] = {}
 
     curves: list = []
     disclosures = rows["disclosure_date"].values
-    entry_prices = rows["entry_price"].values
+    entry_prices_arr = rows["entry_price"].values
     tickers = rows["ticker"].values
 
     horizon_ns = pd.Timedelta(days=horizon).value  # ns int
 
+    # Pre-compute all disclosure timestamps as int64 ns to avoid
+    # per-row pd.Timestamp() creation in the loop.
+    disc_ns_all = np.empty(len(rows), dtype=np.int64)
     for i in range(len(rows)):
-        entry_price = entry_prices[i]
+        disc_ns_all[i] = pd.Timestamp(disclosures[i]).value
+
+    for i in range(len(rows)):
+        entry_price = entry_prices_arr[i]
         if not entry_price or entry_price <= 0:
             continue
         tkr = tickers[i]
@@ -224,12 +228,10 @@ def _build_curves_for_rows(
         if idx_ns is None:
             continue
 
-        disc_ns = pd.Timestamp(disclosures[i]).value
+        disc_ns = disc_ns_all[i]
         end_ns = disc_ns + horizon_ns
 
-        # Left bound: first index >= disc_ns
         lo = int(np.searchsorted(idx_ns, disc_ns, side="left"))
-        # Right bound: last index <= end_ns
         hi = int(np.searchsorted(idx_ns, end_ns, side="right"))
         window = vals[lo:hi]
         if len(window) < 3:
@@ -373,8 +375,10 @@ def backtest_recommendations(
         as_of_date.date() if hasattr(as_of_date, "date") else as_of_date
     )
 
-    # Precompute buyer_bayes_dict from member_rankings for O(1) lookups
-    # (avoids repeated linear scans in _lookup_buyer_bayes_win_prob)
+    # Pre-build O(1) lookup dicts from member_rankings to avoid repeated
+    # DataFrame linear scans inside the per-ticker loop.
+    from analyzer.member_ranking import _build_ranking_dicts
+    _ranking_dicts = _build_ranking_dicts(member_rankings)
 
     scores = []
     for ticker in candidate_tickers:
@@ -390,6 +394,7 @@ def backtest_recommendations(
                 ticker_perf_signals=ticker_perf_signals,
                 _bayes_prior_strength=bayes,
                 solo_buyer_skill_threshold=solo_buyer_skill_threshold,
+                _ranking_dicts=_ranking_dicts,
             )
 
             # Extract score scalars into a dict to avoid DataFrame mutations

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from analyzer._memo import df_memoize
@@ -22,29 +23,60 @@ def _find_dip_entry(
 
     Returns (entry_price, delay_days). If no dip, returns (price_at_as_of, 0).
     """
-    if ticker not in prices_df.columns:
+    arrs = _price_arrays(prices_df, ticker)
+    if arrs is None:
         return 0.0, 0
-
-    ticker_prices = prices_df[ticker].dropna()
-    post_disc = ticker_prices[ticker_prices.index >= as_of_date]
-
-    if post_disc.empty:
+    idx_ns, vals = arrs
+    if idx_ns is None:
         return 0.0, 0
+    return _find_dip_entry_arrays(idx_ns, vals, as_of_date, pullback_pct, max_wait_days)
 
-    disc_price = float(post_disc.iloc[0])
+
+def _find_dip_entry_arrays(
+    idx_ns, vals, as_of_date, pullback_pct=0.05, max_wait_days=10,
+):
+    """Find dip entry using pre-extracted price arrays (avoids repeated _price_arrays lookup)."""
+    target_ns = pd.Timestamp(as_of_date).value
+    window_end_ns = target_ns + max_wait_days * 86_400_000_000_000
+
+    # First price >= as_of_date
+    lo = int(np.searchsorted(idx_ns, target_ns, side="left"))
+    if lo >= len(idx_ns):
+        return 0.0, 0
+    disc_price = float(vals[lo])
     if disc_price <= 0:
         return 0.0, 0
 
-    window_end = as_of_date + pd.Timedelta(days=max_wait_days)
-    window = ticker_prices[(ticker_prices.index >= as_of_date) & (ticker_prices.index <= window_end)]
+    # Window of prices within [as_of_date, as_of_date + max_wait_days]
+    hi = int(np.searchsorted(idx_ns, window_end_ns, side="right"))
+    window_vals = vals[lo:hi]
+    if len(window_vals) == 0:
+        return 0.0, 0
 
     target_price = disc_price * (1 - pullback_pct)
-
-    for i, (date_idx, price) in enumerate(window.items()):
-        if price <= target_price:
-            return float(price), i
+    for i in range(len(window_vals)):
+        if window_vals[i] <= target_price:
+            return float(window_vals[i]), i
 
     return disc_price, 0
+
+
+def _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=None):
+    """Price lookup using pre-extracted arrays."""
+    target = pd.Timestamp(target_date).value
+    pos = int(np.searchsorted(idx_ns, target, side="right")) - 1
+    if pos < 0:
+        return None
+    if max_staleness_days is not None:
+        staleness_ns = target - int(idx_ns[pos])
+        if staleness_ns > max_staleness_days * 86_400_000_000_000:
+            return None
+    return float(vals[pos])
+
+
+def _price_on_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=5):
+    """Price lookup using pre-extracted arrays."""
+    return _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=max_staleness_days)
 
 
 @df_memoize(copy=False)
@@ -346,7 +378,7 @@ def backtest_recommendations(
             # keys are content-stable because their DataFrame inputs
             # (training, recent_trades, ticker_perf_signals, signals_df,
             # prices_df) all have stable identities across sweep calls.
-            score = score_ticker_by_buyers(
+            score_df = score_ticker_by_buyers(
                 ticker, recent_trades, training, horizon, threshold,
                 member_rankings, min_buyers,
                 ticker_perf_signals=ticker_perf_signals,
@@ -354,18 +386,22 @@ def backtest_recommendations(
                 solo_buyer_skill_threshold=solo_buyer_skill_threshold,
             )
 
+            # Extract score scalars into a dict to avoid DataFrame mutations
+            # (avoids N × __setitem__ overhead on 1-row DataFrames).
+            row = {c: score_df[c].iloc[0] for c in score_df.columns}
+
             # Compute OU entry value V(0) if prices available
             if prices_df is not None:
                 v0 = _compute_ticker_entry_value(
                     ticker, signals_df, prices_df, as_of_date, horizon,
                 )
-                score["ou_entry_value"] = round(v0, 4) if v0 is not None else None
+                row["ou_entry_value"] = round(v0, 4) if v0 is not None else None
 
                 # Compute optimal holding period from OU half-life
                 optimal_h = _compute_ticker_optimal_horizon(
                     ticker, signals_df, prices_df, as_of_date, horizon,
                 )
-                score["optimal_horizon"] = optimal_h
+                row["optimal_horizon"] = optimal_h
 
             # Compute signal features and crash hazard for this ticker
             # Use the most recent transaction date for this ticker
@@ -390,32 +426,32 @@ def backtest_recommendations(
 
                     # Apply lag weight
                     lag_weight = compute_disclosure_lag_weight(features.lag_days)
-                    base_score = float(score["signal_score"].iloc[0])
+                    base_score = float(row.get("signal_score", 0))
                     adjusted_score = base_score * lag_weight
 
                     # Apply crash penalty (only if crash_prob is reasonable)
                     if 0.0 <= crash.crash_prob <= 1.0:
                         adjusted_score *= (1 - crash.crash_prob)
 
-                    score["signal_score"] = round(adjusted_score, 2)
-                    score["lag_days"] = features.lag_days
-                    score["lag_weight"] = round(lag_weight, 4)
-                    score["crash_prob"] = crash.crash_prob
-                    score["crash_var_95"] = crash.var_95
-                    score["volatility_20d"] = round(features.volatility_20d, 4)
-                    score["drawdown_from_ath"] = round(features.drawdown_from_ath, 4)
+                    row["signal_score"] = round(adjusted_score, 2)
+                    row["lag_days"] = features.lag_days
+                    row["lag_weight"] = round(lag_weight, 4)
+                    row["crash_prob"] = crash.crash_prob
+                    row["crash_var_95"] = crash.var_95
+                    row["volatility_20d"] = round(features.volatility_20d, 4)
+                    row["drawdown_from_ath"] = round(features.drawdown_from_ath, 4)
                 except Exception:
                     # Crash hazard estimation can fail on edge cases — keep base score
                     pass
 
-            scores.append(score)
+            scores.append(row)
         except AnalysisError:
             continue
 
     if not scores:
         return pd.DataFrame()
 
-    result = pd.concat(scores, ignore_index=True)
+    result = pd.DataFrame(scores)
     # Drop rejected rows. score_ticker_by_buyers emits a zero signal_score
     # (with a `note`) for tickers that fail the min-buyers / solo-buyer skill
     # gate; those should not surface as recommendations.
@@ -463,52 +499,86 @@ def evaluate_backtest(
 
     from analyzer.options import estimate_options_leverage
 
+    # ── Precompute SPY benchmark once per as_of_date (hoisted out of loop) ──
+    # Use the max horizon across all recs so we can compute all spy exits at once.
+    horizons = recommendations["optimal_horizon"].values if "optimal_horizon" in recommendations.columns else None
+    max_h = int(horizons.max()) if horizons is not None else horizon
+
+    spy_start = _price_at_or_before(prices_df, "SPY", as_of_date, max_staleness_days)
+    # Precompute spy_end for each unique horizon
+    spy_ends: dict[int, float | None] = {}
+    spy_returns: dict[int, float] = {}
+    if spy_start:
+        spy_entry_adj = spy_start * (1 + entry_slippage_bps / 10000)
+        for h in set(horizons) if horizons is not None else [horizon]:
+            spy_exit_date = as_of_date + pd.Timedelta(days=int(h))
+            se = _price_on_or_before(prices_df, "SPY", spy_exit_date, max_staleness_days=30)
+            spy_ends[h] = se
+            if se:
+                spy_exit_adj = se * (1 - exit_slippage_bps / 10000)
+                spy_returns[h] = round((spy_exit_adj / spy_entry_adj - 1) * 100, 2)
+            else:
+                spy_returns[h] = 0.0
+
+    # ── Batch price lookups for all tickers at once ──
+    tickers = recommendations["ticker"].tolist()
+    ticker_horizons = (
+        [int(h) for h in horizons]
+        if horizons is not None
+        else [horizon] * len(tickers)
+    )
+
+    # Pre-extract price arrays for all tickers (one searchsorted call each)
+    price_cache: dict[str, tuple | None] = {}
+    for t in tickers:
+        price_cache[t] = _price_arrays(prices_df, t)
+
     rows = []
-    for _, rec in recommendations.iterrows():
+    for idx, rec in recommendations.iterrows():
         ticker = rec["ticker"]
-        # Use per-ticker optimal horizon if available
-        ticker_horizon = int(rec.get("optimal_horizon", horizon)) if "optimal_horizon" in rec.index else horizon
+        rec_idx = tickers.index(ticker)
+        t_horizon = ticker_horizons[rec_idx]
+
+        cached = price_cache.get(ticker)
+        if cached is None:
+            continue
+        idx_ns, vals = cached
+        if idx_ns is None:
+            continue
 
         # Entry with dip timing
         entry_delay = 0
         if use_dip_entry:
-            entry, entry_delay = _find_dip_entry(
-                prices_df, ticker, as_of_date, pullback_pct, max_wait_days,
+            entry, entry_delay = _find_dip_entry_arrays(
+                idx_ns, vals, as_of_date, pullback_pct, max_wait_days,
             )
             if entry <= 0:
-                entry = _price_at_or_before(prices_df, ticker, as_of_date, max_staleness_days)
+                entry = _price_at_or_before_arrays(idx_ns, vals, as_of_date, max_staleness_days)
                 entry_delay = 0
         else:
-            entry = _price_at_or_before(prices_df, ticker, as_of_date, max_staleness_days)
+            entry = _price_at_or_before_arrays(idx_ns, vals, as_of_date, max_staleness_days)
             entry_delay = 0
 
         if not entry:
             continue
 
-        # Adjust exit date based on entry delay (hold for horizon from entry, not disclosure)
         actual_entry_date = as_of_date + pd.Timedelta(days=entry_delay)
-        exit_date = actual_entry_date + pd.Timedelta(days=ticker_horizon)
-
-        exit_price = _price_on_or_before(prices_df, ticker, exit_date, max_staleness_days=30)
+        exit_date = actual_entry_date + pd.Timedelta(days=t_horizon)
+        exit_price = _price_on_or_before_arrays(idx_ns, vals, exit_date, max_staleness_days=30)
         if not exit_price:
             continue
 
-        # Apply slippage
-        entry *= (1 + entry_slippage_bps / 10000)
-        exit_price *= (1 - exit_slippage_bps / 10000)
-        return_pct = (exit_price / entry - 1) * 100
+        entry_adj = entry * (1 + entry_slippage_bps / 10000)
+        exit_adj = exit_price * (1 - exit_slippage_bps / 10000)
+        return_pct = (exit_adj / entry_adj - 1) * 100
 
-        # SPY benchmark: use original disclosure date for consistency
-        spy_exit_date = as_of_date + pd.Timedelta(days=ticker_horizon)
-        spy_start = _price_at_or_before(prices_df, "SPY", as_of_date, max_staleness_days)
-        spy_end = _price_on_or_before(prices_df, "SPY", spy_exit_date, max_staleness_days=30)
-        if not spy_start or not spy_end:
+        # SPY benchmark (precomputed)
+        spy_ret = spy_returns.get(t_horizon, 0.0)
+        if not spy_start or spy_ret == 0.0 and not spy_ends.get(t_horizon):
+            # Spy lookup failed for this horizon — skip rec
             continue
-        spy_start_adj = spy_start * (1 + entry_slippage_bps / 10000)
-        spy_end_adj = spy_end * (1 - exit_slippage_bps / 10000)
-        spy_return_pct = (spy_end_adj / spy_start_adj - 1) * 100
 
-        # Apply options leverage
+        # Options leverage
         inst_type = "stock"
         if "instrument_type" in rec.index:
             val = rec["instrument_type"]
@@ -517,7 +587,7 @@ def evaluate_backtest(
         amount = rec.get("amount_midpoint") if "amount_midpoint" in rec.index else None
         leverage = estimate_options_leverage(inst_type, amount)
         leveraged_return_pct = return_pct * leverage
-        alpha_pct = leveraged_return_pct - spy_return_pct
+        alpha_pct = leveraged_return_pct - spy_ret
 
         rows.append({
             "ticker": ticker,
@@ -526,9 +596,9 @@ def evaluate_backtest(
             "bt_raw_return_pct": round(return_pct, 2),
             "bt_return_pct": round(leveraged_return_pct, 2),
             "bt_leverage": round(leverage, 2),
-            "bt_spy_return_pct": round(spy_return_pct, 2),
+            "bt_spy_return_pct": spy_ret,
             "bt_alpha_pct": round(alpha_pct, 2),
-            "bt_horizon_days": ticker_horizon,
+            "bt_horizon_days": t_horizon,
             "bt_entry_delay": entry_delay,
         })
 

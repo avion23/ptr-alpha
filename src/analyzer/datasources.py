@@ -22,6 +22,7 @@ from analyzer.ticker_resolver import TickerResolver
 from analyzer.parsing import (
     consolidate_transactions,
     extract_tables_with_ocr,
+    extract_tables_with_pdftotext,
     normalize_house_metadata,
     parse_pdf_table,
     _parse_ocr_text_to_rows,
@@ -68,6 +69,19 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
                     break  # Found transactions, stop scanning
         except Exception as e:
             logger.debug(f"Stream failed for {pdf_path}: {e}")
+
+    # Try pdftotext as fallback (handles encrypted PDFs where camelot fails)
+    if not transactions:
+        try:
+            pdftext_tables = extract_tables_with_pdftotext(pdf_path)
+            engines_attempted.append("pdftotext")
+            for table in pdftext_tables:
+                txs = parse_pdf_table(table)
+                if txs:
+                    transactions.extend(txs)
+                    break
+        except Exception as e:
+            logger.debug(f"pdftotext failed for {pdf_path}: {e}")
 
     # Try OCR as final fallback
     if not transactions:

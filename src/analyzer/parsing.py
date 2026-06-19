@@ -18,7 +18,16 @@ def _extract_ticker(asset_cell: str | None) -> str | None:
     if not asset_cell:
         return None
     ticker_match = re.search(r'\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)', asset_cell)
-    return ticker_match.group(1).upper() if ticker_match else None
+    if ticker_match:
+        return ticker_match.group(1).upper()
+    # For non-stock assets (government securities, etc.) without tickers,
+    # generate a pseudo-ticker from the first meaningful word
+    cleaned = re.sub(r'\[.*?\]', '', asset_cell).strip()  # Remove [GS], [ST], etc.
+    words = re.findall(r'[A-Za-z]{2,}', cleaned)
+    if words:
+        # Use first 3-4 chars of first word as pseudo-ticker
+        return words[0][:4].upper()
+    return None
 
 def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
     if not tx_type_cell:
@@ -31,10 +40,14 @@ def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
         return TransactionType.PURCHASE.value
     if s_stripped in ('s', 'sale', 'sold'):
         return TransactionType.SALE.value
+    if s_stripped in ('e', 'exchange'):
+        return TransactionType.PURCHASE.value
     if 'purchase' in s or 'buy' in s:
         return TransactionType.PURCHASE.value
     if 'sale' in s or 'sell' in s or 'sold' in s:
         return TransactionType.SALE.value
+    if 'exchange' in s:
+        return TransactionType.PURCHASE.value
     if s_stripped.startswith('p') and len(s_stripped) <= 2:
         return TransactionType.PURCHASE.value
     if s_stripped.startswith('s') and len(s_stripped) <= 2:
@@ -461,6 +474,144 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
                     pending_tx = {'tx_type': tx_type, 'date_str': date_match.group(1), 'amount': amount_str}
 
     return rows
+
+
+def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
+    """Extract transaction tables using pdftotext (handles encrypted PDFs).
+
+    Uses pdftotext -layout to preserve column alignment, then parses the
+    structured output to extract transaction rows.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ['pdftotext', '-layout', str(pdf_path), '-'],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.debug(f"pdftotext failed for {pdf_path}: {e}")
+        return []
+
+    text = result.stdout
+    lines = text.split('\n')
+
+    # Transaction type pattern
+    tx_type_pat = r'(?:S|P|E)(?:\s*\(partial\))?'
+    # Amount pattern (handles split amounts across lines)
+    amount_pat = r'(?:\$[\d,]+(?:\s*-\s*\$[\d,]+)?|[\-]+\$[\d,]+)'
+
+    # Pattern 1: Lines with owner prefix:  "JT  Asset Name  S  01/01/2025  01/01/2025  $1,001 - $15,000"
+    tx_with_owner = re.compile(
+        r'^\s{2,}'
+        r'([A-Z]{1,4})\s+'           # owner code
+        r'(.+?)\s+'                  # asset name
+        r'(' + tx_type_pat + r')\s+' # type
+        r'(\d{2}/\d{2}/\d{4})\s+'    # tx date
+        r'(\d{2}/\d{2}/\d{4})\s+'    # notif date
+        r'(' + amount_pat + r')'      # amount
+    )
+
+    # Pattern 2: Lines without owner prefix (asset starts at beginning):
+    tx_no_owner = re.compile(
+        r'^\s{0,4}'
+        r'(.+?)\s+'                  # asset name
+        r'(' + tx_type_pat + r')\s+' # type
+        r'(\d{2}/\d{2}/\d{4})\s+'    # tx date
+        r'(\d{2}/\d{2}/\d{4})\s+'    # notif date
+        r'(' + amount_pat + r')'      # amount
+    )
+
+    # Headers and metadata lines to skip
+    skip_patterns = [
+        'ID', 'Owner', 'Asset', 'Transaction', 'Date', 'Type',
+        'Notification', 'Amount', 'Cap.', 'Gains', 'CERTIFY',
+        'I CERTIFY', 'Digitally', 'Filing', 'Clerk', 'PERIODIC',
+        'Name:', 'Status:', 'State/District:', 'F', 'I', 'P', 'T', 'R',
+    ]
+
+    transactions = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Skip headers, empty lines, metadata
+        if not line.strip() or any(line.strip().startswith(s) for s in skip_patterns):
+            i += 1
+            continue
+
+        # Try with-owner pattern first
+        m = tx_with_owner.match(line)
+        if m:
+            owner, asset, tx_type, tx_date, notif_date, amount = m.groups()
+            asset = asset.strip()
+            # Collect continuation lines for multi-line asset names
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j].strip()
+                if not next_line:
+                    break
+                # Lines that are clearly not asset continuations:
+                # owner code + standalone tx type (not "Stock", "Sale", etc.)
+                if re.match(r'^[A-Z]{1,4}\s+\S', next_line) and re.search(r'\b(?:S|P|E)(?:\s*\(partial\))?\b', next_line):
+                    break
+                if next_line.startswith('F ') or next_line.startswith('S ') or next_line.startswith('D '):
+                    break
+                if re.match(r'^\[', next_line) or re.match(r'^\d', next_line):
+                    asset += ' ' + next_line
+                    j += 1
+                elif re.search(r'\([A-Za-z][A-Za-z0-9.\-]{0,5}\)', next_line):
+                    # Continuation line with ticker in parens, e.g. "Stock (NVDA) [ST]"
+                    asset += ' ' + next_line
+                    j += 1
+                else:
+                    break
+
+            transactions.append([asset, tx_type, tx_date, amount])
+            i = j
+            continue
+
+        # Try no-owner pattern
+        m = tx_no_owner.match(line)
+        if m:
+            asset, tx_type, tx_date, notif_date, amount = m.groups()
+            asset = asset.strip()
+            # Skip lines where "asset" is actually a header/metadata
+            if asset in ('ID', 'F', 'I', 'P', 'T', 'R', 'Cap.', 'Gains', 'CERTIFY'):
+                i += 1
+                continue
+            # Collect continuation lines
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j].strip()
+                if not next_line:
+                    break
+                if re.match(r'^[A-Z]{1,4}\s+\S', next_line) and re.search(r'\b(?:S|P|E)(?:\s*\(partial\))?\b', next_line):
+                    break
+                if next_line.startswith('F ') or next_line.startswith('S ') or next_line.startswith('D '):
+                    break
+                if re.match(r'^\[', next_line) or re.match(r'^\d', next_line):
+                    asset += ' ' + next_line
+                    j += 1
+                elif re.search(r'\([A-Za-z][A-Za-z0-9.\-]{0,5}\)', next_line):
+                    asset += ' ' + next_line
+                    j += 1
+                else:
+                    break
+
+            transactions.append([asset, tx_type, tx_date, amount])
+            i = j
+            continue
+
+        i += 1
+
+    if not transactions:
+        return []
+
+    table = [['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']] + transactions
+    return [table]
 
 
 def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:

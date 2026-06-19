@@ -55,7 +55,8 @@ class BacktestCache:
     #     -> dict[member, (shrunk_wr, n)]
     ticker_member_perf: dict[tuple, dict] = field(default_factory=dict)
     # (id_tx, lookback_days, as_of_iso, ticker, id_sigs, horizon, threshold,
-    #  training_lookback, bayes_prior, min_buyers, uncertainty_lambda)
+    #  training_lookback, bayes_prior, min_buyers, uncertainty_lambda,
+    #  solo_buyer_skill_threshold)
     #     -> pd.DataFrame (1-row ticker score)
     ticker_scores: dict[tuple, Any] = field(default_factory=dict)
 
@@ -224,23 +225,23 @@ class BacktestCache:
     def ticker_scores_key(
         self, transactions_df, lookback_days, as_of, ticker,
         signals_df, horizon, threshold, training_lookback, bayes_prior,
-        min_buyers, uncertainty_lambda,
+        min_buyers, uncertainty_lambda, solo_buyer_skill_threshold=0.60,
     ) -> tuple:
         return (
             id(transactions_df), lookback_days, _as_of_key(as_of), ticker,
             id(signals_df), horizon, threshold, training_lookback, bayes_prior,
-            min_buyers, uncertainty_lambda,
+            min_buyers, uncertainty_lambda, solo_buyer_skill_threshold,
         )
 
     def get_ticker_scores(
         self, transactions_df, lookback_days, as_of, ticker,
         signals_df, horizon, threshold, training_lookback, bayes_prior,
-        min_buyers, uncertainty_lambda,
+        min_buyers, uncertainty_lambda, solo_buyer_skill_threshold=0.60,
     ):
         k = self.ticker_scores_key(
             transactions_df, lookback_days, as_of, ticker,
             signals_df, horizon, threshold, training_lookback, bayes_prior,
-            min_buyers, uncertainty_lambda,
+            min_buyers, uncertainty_lambda, solo_buyer_skill_threshold,
         )
         if k in self.ticker_scores:
             self._hit("ticker_scores")
@@ -252,11 +253,12 @@ class BacktestCache:
         self, transactions_df, lookback_days, as_of, ticker,
         signals_df, horizon, threshold, training_lookback, bayes_prior,
         min_buyers, uncertainty_lambda, score,
+        solo_buyer_skill_threshold=0.60,
     ):
         k = self.ticker_scores_key(
             transactions_df, lookback_days, as_of, ticker,
             signals_df, horizon, threshold, training_lookback, bayes_prior,
-            min_buyers, uncertainty_lambda,
+            min_buyers, uncertainty_lambda, solo_buyer_skill_threshold,
         )
         # Defensive copy — callers mutate the returned frame (insert, .loc set)
         self.ticker_scores[k] = score.copy() if hasattr(score, "copy") else score

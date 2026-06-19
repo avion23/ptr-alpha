@@ -247,6 +247,25 @@ def _get_ticker_purchases(
     ]
 
 
+def _lookup_buyer_bayes_win_prob(
+    member: str, member_rankings: pd.DataFrame | None
+) -> float | None:
+    """Fetch a member's Bayesian win probability from member_rankings.
+
+    Returns None when rankings are missing, the column is absent, the member
+    is unrated, or the value is NaN.
+    """
+    if member_rankings is None or member_rankings.empty:
+        return None
+    if "bayes_win_prob" not in member_rankings.columns:
+        return None
+    row = member_rankings.loc[member_rankings["member"] == member]
+    if row.empty:
+        return None
+    val = row["bayes_win_prob"].iloc[0]
+    return float(val) if pd.notna(val) else None
+
+
 def score_ticker_by_buyers(
     ticker: str,
     transactions_df: pd.DataFrame,
@@ -258,6 +277,8 @@ def score_ticker_by_buyers(
     ticker_perf_signals: pd.DataFrame | None = None,
     member_skills: dict | None = None,
     uncertainty_penalty_lambda: float = 0.5,
+    solo_buyer_skill_threshold: float = 0.60,
+    solo_buyer_penalty: float = 0.8,
     cache=None,
     as_of_date=None,
     cache_parent_signals: pd.DataFrame | None = None,
@@ -287,6 +308,32 @@ def score_ticker_by_buyers(
             "signal_score": [0.0],
             "note": [f"Below minimum buyer threshold ({min_buyers})"]
         })
+
+    # Solo-buyer skill gate: when min_buyers=1 is requested and only one
+    # member bought this ticker, require that buyer's Bayesian win
+    # probability to clear a skill threshold. High-skill single buyers
+    # (e.g. conviction picks) proceed with a confidence penalty; the rest
+    # are rejected as before. Only applies when min_buyers == 1 — the
+    # min_buyers >= 2 path is unchanged.
+    apply_solo_penalty = False
+    if (
+        min_buyers == 1
+        and min_trades == 1
+        and solo_buyer_skill_threshold > 0
+    ):
+        sole_buyer = str(ticker_trades["member"].iloc[0])
+        bayes_prob = _lookup_buyer_bayes_win_prob(sole_buyer, member_rankings)
+        if bayes_prob is None or bayes_prob < solo_buyer_skill_threshold:
+            return pd.DataFrame({
+                "ticker": [ticker],
+                "num_buyers": [min_trades],
+                "signal_score": [0.0],
+                "note": [
+                    f"Solo buyer '{sole_buyer}' below skill threshold "
+                    f"({solo_buyer_skill_threshold})"
+                ],
+            })
+        apply_solo_penalty = True
 
     buyers = ticker_trades["member"].unique()
 
@@ -422,6 +469,8 @@ def score_ticker_by_buyers(
         ticker_perf_factor = 1.0
 
     signal_score = base_signal_score * size_factor * owner_factor * ticker_perf_factor
+    if apply_solo_penalty:
+        signal_score *= solo_buyer_penalty
 
     if not buyer_stats.empty:
         top_buyers = buyer_stats["member"].head(3).tolist()
@@ -447,6 +496,7 @@ def score_ticker_by_buyers(
         "signal_score": [round(signal_score, 2)],
         "fallback_source": ["member_ranked"],
         "uncertainty_lambda": [uncertainty_penalty_lambda if use_skills else 0.0],
+        "solo_buyer": [apply_solo_penalty],
     })
 
 

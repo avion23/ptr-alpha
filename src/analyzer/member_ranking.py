@@ -7,13 +7,10 @@ from math import exp, lgamma, log
 import numpy as np
 import pandas as pd
 
+from analyzer import signals as _signals
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
 from analyzer.signals import (
-    TICKER_PERF_MIN_TRADES,
-    MIN_ENTRY_PRICE,
-    BAYES_PRIOR_STRENGTH,
-    BUYER_RECENCY_DECAY,
     _apply_quality_filter,
     _collapse_to_episodes,
     _compute_dynamic_prior,
@@ -22,8 +19,8 @@ from analyzer.signals import (
 
 
 def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
-    alpha = market_prior * BAYES_PRIOR_STRENGTH
-    beta = (1 - market_prior) * BAYES_PRIOR_STRENGTH
+    alpha = market_prior * _signals.BAYES_PRIOR_STRENGTH
+    beta = (1 - market_prior) * _signals.BAYES_PRIOR_STRENGTH
     return (alpha + wins) / (alpha + beta + wins + losses)
 
 
@@ -32,8 +29,8 @@ def bayes_factor_against_market(wins: int, losses: int, market_prior: float = 0.
     if observations == 0:
         return 1.0
     market_prior = float(np.clip(market_prior, 1e-6, 1 - 1e-6))
-    alpha = market_prior * BAYES_PRIOR_STRENGTH
-    beta = (1 - market_prior) * BAYES_PRIOR_STRENGTH
+    alpha = market_prior * _signals.BAYES_PRIOR_STRENGTH
+    beta = (1 - market_prior) * _signals.BAYES_PRIOR_STRENGTH
     log_marginal = (
         lgamma(alpha + wins)
         + lgamma(beta + losses)
@@ -107,7 +104,7 @@ def _compute_ticker_member_performance(
     ]
     all_returns = all_purchases["decayed_return_pct"].dropna()
     global_win_rate = float((all_returns > 0).mean()) if len(all_returns) > 0 else 0.5
-    prior_strength = BAYES_PRIOR_STRENGTH  # 20 pseudo-observations
+    prior_strength = _signals.BAYES_PRIOR_STRENGTH  # 20 pseudo-observations
 
     result: dict[str, tuple[float, int]] = {}
     for member, grp in purchases.groupby("member"):
@@ -187,7 +184,7 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
 
     purchases = _apply_quality_filter(purchases)
     if purchases.empty:
-        raise AnalysisError(f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})")
+        raise AnalysisError(f"No signals survived quality filter (min price ${_signals.MIN_ENTRY_PRICE})")
 
     purchases = _collapse_to_episodes(purchases)
 
@@ -370,7 +367,7 @@ def score_ticker_by_buyers(
             latest_disclosure = rated_ticker_trades["disclosure_date"].max()
             member_disclosures = rated_ticker_trades.groupby("member")["disclosure_date"].max()
             days_since = (latest_disclosure - member_disclosures.reindex(buyer_stats["member"])).dt.days.fillna(0).clip(lower=0)
-            confidence_weights *= np.exp(-BUYER_RECENCY_DECAY * days_since.values)
+            confidence_weights *= np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.values)
         confidence_weight_sum = confidence_weights.sum()
         quality_adjusted_avg = (
             (buyer_stats["avg_spy_alpha_pct"].values * confidence_weights).sum() / confidence_weight_sum

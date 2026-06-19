@@ -227,8 +227,10 @@ def calculate_signal_potential(
     entry_prices_df: pd.DataFrame,
     prices_df: pd.DataFrame,
     horizons: list[int] = [30, 60, 90, 180],
-    decay_lambda: float = DECAY_LAMBDA,
+    decay_lambda: float | None = None,
 ) -> pd.DataFrame:
+    if decay_lambda is None:
+        decay_lambda = DECAY_LAMBDA
     if entry_prices_df.empty:
         raise AnalysisError("Empty entry prices dataframe")
     if prices_df.empty:

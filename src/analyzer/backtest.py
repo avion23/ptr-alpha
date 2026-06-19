@@ -6,8 +6,114 @@ import pandas as pd
 
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
-from analyzer.signals import _price_at_or_before, _price_on_or_before
+from analyzer.signals import _price_at_or_before, _price_on_or_before, _price_arrays
 from analyzer.member_ranking import rank_members, score_ticker_by_buyers
+
+
+def _build_ticker_curves(
+    ticker: str,
+    signals_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    horizon: int,
+) -> list:
+    """Build historical return curves for a specific ticker's prior purchases.
+
+    Returns a list of 1-D numpy arrays. Each array is the cumulative return
+    curve r(t) = P(t)/P(entry) - 1 over [disclosure, disclosure+horizon].
+    """
+    if ticker not in prices_df.columns:
+        return []
+
+    cutoff = as_of_date - pd.Timedelta(days=horizon)
+    eligible = signals_df[
+        (signals_df["ticker"] == ticker)
+        & (signals_df["horizon_days"] == horizon)
+        & (signals_df["disclosure_date"] <= cutoff)
+        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
+    ]
+    if eligible.empty:
+        return []
+
+    return _build_curves_for_rows(eligible, prices_df, horizon)
+
+
+def _build_global_curves(
+    signals_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    horizon: int,
+) -> list:
+    """Build historical return curves across ALL tickers' prior purchases.
+
+    Used as a global prior when a ticker has no own disclosure history.
+    """
+    cutoff = as_of_date - pd.Timedelta(days=horizon)
+    all_purchases = signals_df[
+        (signals_df["horizon_days"] == horizon)
+        & (signals_df["disclosure_date"] <= cutoff)
+        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
+    ]
+    if all_purchases.empty:
+        return []
+
+    return _build_curves_for_rows(all_purchases, prices_df, horizon)
+
+
+def _build_curves_for_rows(
+    rows: pd.DataFrame, prices_df: pd.DataFrame, horizon: int
+) -> list:
+    """Vectorized-ish curve builder.
+
+    Precomputes per-ticker (date_index_ns, price_values) once via the shared
+    ``_price_arrays`` cache and uses searchsorted to slice windows instead of
+    re-filtering pandas for every row.
+    """
+    import numpy as np
+
+    price_cols = set(prices_df.columns)
+    # Cache (idx_ns, values) per ticker encountered. _price_arrays already
+    # normalizes to nanoseconds regardless of source-index resolution.
+    per_ticker: dict[str, tuple | None] = {}
+
+    curves: list = []
+    disclosures = rows["disclosure_date"].values
+    entry_prices = rows["entry_price"].values
+    tickers = rows["ticker"].values
+
+    horizon_ns = pd.Timedelta(days=horizon).value  # ns int
+
+    for i in range(len(rows)):
+        entry_price = entry_prices[i]
+        if not entry_price or entry_price <= 0:
+            continue
+        tkr = tickers[i]
+        if tkr not in price_cols:
+            continue
+
+        if tkr not in per_ticker:
+            per_ticker[tkr] = _price_arrays(prices_df, tkr)
+
+        cached = per_ticker[tkr]
+        if cached is None:
+            continue
+        idx_ns, vals = cached
+        if idx_ns is None:
+            continue
+
+        disc_ns = pd.Timestamp(disclosures[i]).value
+        end_ns = disc_ns + horizon_ns
+
+        # Left bound: first index >= disc_ns
+        lo = int(np.searchsorted(idx_ns, disc_ns, side="left"))
+        # Right bound: last index <= end_ns
+        hi = int(np.searchsorted(idx_ns, end_ns, side="right"))
+        window = vals[lo:hi]
+        if len(window) < 3:
+            continue
+        curves.append(window / entry_price - 1.0)
+
+    return curves
 
 
 def _compute_ticker_entry_value(
@@ -17,77 +123,93 @@ def _compute_ticker_entry_value(
     as_of_date: pd.Timestamp,
     horizon: int,
     rho: float = 0.000137,
+    cache=None,
 ) -> float | None:
     """Compute OU entry value V(0) for a ticker from historical return curves.
 
     Falls back to global prior (average across all tickers) if ticker has
     no prior disclosure history.
+
+    When ``cache`` (a :class:`analyzer.sweep_cache.BacktestCache`) is provided,
+    both the per-ticker curves, the global fallback curves, and the final V0
+    are memoized across calls that share the same logical inputs. This is the
+    single biggest win in the parameter sweep because V0 depends only on
+    (ticker, as_of_date, horizon) given fixed signals/prices inputs.
     """
     from analyzer.return_process import compute_entry_value
 
-    ticker_col = ticker in prices_df.columns if hasattr(prices_df, 'columns') else False
+    if cache is not None:
+        hit, v0 = cache.get_entry_value(
+            signals_df, prices_df, ticker, as_of_date, horizon
+        )
+        if hit:
+            return v0
 
-    # Get all prior fully-elapsed purchase signals for this ticker
-    eligible = signals_df[
-        (signals_df["ticker"] == ticker)
-        & (signals_df["horizon_days"] == horizon)
-        & (signals_df["disclosure_date"] <= as_of_date - pd.Timedelta(days=horizon))
-        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
-    ].copy()
+    ticker_col = ticker in prices_df.columns if hasattr(prices_df, "columns") else False
 
-    curves = []
-    if ticker_col and not eligible.empty:
-        ticker_prices = prices_df[ticker].dropna()
-        for _, row in eligible.iterrows():
-            disc_date = row["disclosure_date"]
-            entry_price = row.get("entry_price")
-            if not entry_price or entry_price <= 0:
-                continue
-            end_date = disc_date + pd.Timedelta(days=horizon)
-            window = ticker_prices[
-                (ticker_prices.index >= disc_date) & (ticker_prices.index <= end_date)
-            ]
-            if len(window) < 3:
-                continue
-            curve = (window.values / entry_price) - 1.0
-            curves.append(curve)
+    # Per-ticker curves
+    curves: list = []
+    if ticker_col:
+        if cache is not None:
+            hit, curves = cache.get_ticker_curves(
+                signals_df, prices_df, ticker, as_of_date, horizon
+            )
+            if not hit:
+                curves = _build_ticker_curves(
+                    ticker, signals_df, prices_df, as_of_date, horizon
+                )
+                cache.set_ticker_curves(
+                    signals_df, prices_df, ticker, as_of_date, horizon, curves
+                )
+        else:
+            curves = _build_ticker_curves(
+                ticker, signals_df, prices_df, as_of_date, horizon
+            )
 
     if curves:
         v0, _mu, _theta = compute_entry_value(curves, rho=rho)
+        if cache is not None:
+            cache.set_entry_value(
+                signals_df, prices_df, ticker, as_of_date, horizon, v0
+            )
         return v0
 
-    # Fallback: global prior from historical curves (filtered by cutoff to avoid look-ahead)
-    all_purchases = signals_df[
-        (signals_df["horizon_days"] == horizon)
-        & (signals_df["disclosure_date"] <= as_of_date - pd.Timedelta(days=horizon))
-        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
-    ].copy()
-
-    if all_purchases.empty or not ticker_col:
+    # Global fallback
+    if not ticker_col:
+        if cache is not None:
+            cache.set_entry_value(
+                signals_df, prices_df, ticker, as_of_date, horizon, None
+            )
         return None
 
-    ticker_prices = prices_df[ticker].dropna()
-    global_curves = []
-    for _, row in all_purchases.iterrows():
-        disc_date = row["disclosure_date"]
-        entry_price = row.get("entry_price")
-        tkr = row["ticker"]
-        if not entry_price or entry_price <= 0 or tkr not in prices_df.columns:
-            continue
-        tkr_prices = prices_df[tkr].dropna()
-        end_date = disc_date + pd.Timedelta(days=horizon)
-        window = tkr_prices[
-            (tkr_prices.index >= disc_date) & (tkr_prices.index <= end_date)
-        ]
-        if len(window) < 3:
-            continue
-        curve = (window.values / entry_price) - 1.0
-        global_curves.append(curve)
+    if cache is not None:
+        hit, global_curves = cache.get_global_curves(
+            signals_df, prices_df, as_of_date, horizon
+        )
+        if not hit:
+            global_curves = _build_global_curves(
+                signals_df, prices_df, as_of_date, horizon
+            )
+            cache.set_global_curves(
+                signals_df, prices_df, as_of_date, horizon, global_curves
+            )
+    else:
+        global_curves = _build_global_curves(
+            signals_df, prices_df, as_of_date, horizon
+        )
 
     if not global_curves:
+        if cache is not None:
+            cache.set_entry_value(
+                signals_df, prices_df, ticker, as_of_date, horizon, None
+            )
         return None
 
     v0, _mu, _theta = compute_entry_value(global_curves, rho=rho)
+    if cache is not None:
+        cache.set_entry_value(
+            signals_df, prices_df, ticker, as_of_date, horizon, v0
+        )
     return v0
 
 
@@ -102,6 +224,7 @@ def backtest_recommendations(
     threshold: float = 5.0,
     prices_df: pd.DataFrame | None = None,
     training_lookback_days: int | None = None,
+    cache=None,
 ) -> pd.DataFrame:
     elapsed_cutoff = as_of_date - pd.Timedelta(days=horizon)
     training = signals_df[
@@ -115,10 +238,25 @@ def backtest_recommendations(
 
     member_rankings = None
     if not training.empty:
-        try:
-            member_rankings = rank_members(training, horizon, threshold)
-        except AnalysisError:
-            member_rankings = None
+        if cache is not None:
+            from analyzer import member_ranking as mr_mod
+            bayes_prior = mr_mod.BAYES_PRIOR_STRENGTH
+            hit, cached_rankings = cache.get_rank_members(
+                signals_df, horizon, threshold, bayes_prior,
+                training_lookback_days, as_of_date,
+            )
+            if hit:
+                member_rankings = cached_rankings
+        if member_rankings is None:
+            try:
+                member_rankings = rank_members(training, horizon, threshold)
+            except AnalysisError:
+                member_rankings = None
+            if cache is not None and member_rankings is not None:
+                cache.set_rank_members(
+                    signals_df, horizon, threshold, bayes_prior,
+                    training_lookback_days, as_of_date, member_rankings,
+                )
 
     if member_rankings is None or member_rankings.empty:
         return pd.DataFrame()
@@ -151,19 +289,46 @@ def backtest_recommendations(
         estimate_crash_hazard,
     )
 
+    as_of_for_features = (
+        as_of_date.date() if hasattr(as_of_date, "date") else as_of_date
+    )
+
+    # Read bayes_prior once for cache keys (only sweep mutates this global).
+    bayes_prior_for_key = None
+    if cache is not None:
+        from analyzer import member_ranking as _mr_for_key
+        bayes_prior_for_key = _mr_for_key.BAYES_PRIOR_STRENGTH
+
     scores = []
     for ticker in candidate_tickers:
         try:
+            # Fast path: full per-ticker score (including entry value,
+            # signal_features, crash hazard adjustments) is content-determined
+            # by the params below — so we cache the assembled 1-row frame and
+            # hand the caller a fresh copy (callers mutate via .loc / insert).
+            if cache is not None and bayes_prior_for_key is not None:
+                hit, cached_score = cache.get_ticker_scores(
+                    transactions_df, lookback_days, as_of_date, ticker,
+                    signals_df, horizon, threshold, training_lookback_days,
+                    bayes_prior_for_key, min_buyers, 0.5,
+                )
+                if hit:
+                    scores.append(cached_score.copy())
+                    continue
+
             score = score_ticker_by_buyers(
                 ticker, recent_trades, training, horizon, threshold,
                 member_rankings, min_buyers,
                 ticker_perf_signals=ticker_perf_signals,
+                cache=cache, as_of_date=as_of_date,
+                cache_parent_signals=signals_df,
             )
 
             # Compute OU entry value V(0) if prices available
             if prices_df is not None:
                 v0 = _compute_ticker_entry_value(
                     ticker, signals_df, prices_df, as_of_date, horizon,
+                    cache=cache,
                 )
                 score["ou_entry_value"] = round(v0, 4) if v0 is not None else None
 
@@ -178,14 +343,33 @@ def backtest_recommendations(
                         tx_date = pd.Timestamp(tx_date).date()
                     disc_date = pd.Timestamp(latest_tx["disclosure_date"]).date()
 
-                    features = compute_signal_features(
-                        ticker=ticker,
-                        disclosure_date=disc_date,
-                        transaction_date=tx_date,
-                        prices_df=prices_df,
-                        all_tx=recent_trades,
-                        as_of_date=as_of_date.date() if hasattr(as_of_date, 'date') else as_of_date,
-                    )
+                    if cache is not None:
+                        hit, features = cache.get_signal_features(
+                            prices_df, transactions_df, ticker,
+                            disc_date, tx_date, as_of_for_features,
+                        )
+                        if not hit:
+                            features = compute_signal_features(
+                                ticker=ticker,
+                                disclosure_date=disc_date,
+                                transaction_date=tx_date,
+                                prices_df=prices_df,
+                                all_tx=recent_trades,
+                                as_of_date=as_of_for_features,
+                            )
+                            cache.set_signal_features(
+                                prices_df, transactions_df, ticker,
+                                disc_date, tx_date, as_of_for_features, features,
+                            )
+                    else:
+                        features = compute_signal_features(
+                            ticker=ticker,
+                            disclosure_date=disc_date,
+                            transaction_date=tx_date,
+                            prices_df=prices_df,
+                            all_tx=recent_trades,
+                            as_of_date=as_of_for_features,
+                        )
                     crash = estimate_crash_hazard(features)
 
                     # Apply lag weight
@@ -208,6 +392,12 @@ def backtest_recommendations(
                     # Crash hazard estimation can fail on edge cases — keep base score
                     pass
 
+            if cache is not None and bayes_prior_for_key is not None:
+                cache.set_ticker_scores(
+                    transactions_df, lookback_days, as_of_date, ticker,
+                    signals_df, horizon, threshold, training_lookback_days,
+                    bayes_prior_for_key, min_buyers, 0.5, score,
+                )
             scores.append(score)
         except AnalysisError:
             continue

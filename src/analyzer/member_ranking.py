@@ -261,6 +261,9 @@ def score_ticker_by_buyers(
     ticker_perf_signals: pd.DataFrame | None = None,
     member_skills: dict | None = None,
     uncertainty_penalty_lambda: float = 0.5,
+    cache=None,
+    as_of_date=None,
+    cache_parent_signals: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if signals_df.empty:
         raise AnalysisError("Empty signal dataframe")
@@ -383,10 +386,30 @@ def score_ticker_by_buyers(
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
 
-    ticker_perf = _compute_ticker_member_performance(
-        ticker_perf_signals if ticker_perf_signals is not None else signals_df,
-        ticker, horizon,
-    )
+    perf_source = ticker_perf_signals if ticker_perf_signals is not None else signals_df
+    # For the ticker_member_perf cache key, use the PARENT signals df (stable
+    # identity across calls in a sweep) rather than the freshly-filtered
+    # perf_source slice (whose id() differs every call). The result of
+    # _compute_ticker_member_performance depends only on the parent's content
+    # restricted to (ticker, horizon, as_of), so the parent id is content-stable.
+    cache_key_df = cache_parent_signals if cache_parent_signals is not None else perf_source
+    if cache is not None and as_of_date is not None:
+        from analyzer import member_ranking as mr_mod
+        bayes_prior = mr_mod.BAYES_PRIOR_STRENGTH
+        hit, ticker_perf = cache.get_ticker_member_perf(
+            cache_key_df, ticker, horizon, bayes_prior, as_of_date,
+        )
+        if not hit:
+            ticker_perf = _compute_ticker_member_performance(
+                perf_source, ticker, horizon,
+            )
+            cache.set_ticker_member_perf(
+                cache_key_df, ticker, horizon, bayes_prior, as_of_date, ticker_perf,
+            )
+    else:
+        ticker_perf = _compute_ticker_member_performance(
+            perf_source, ticker, horizon,
+        )
     if ticker_perf and not buyer_stats.empty:
         member_trade_counts = ticker_trades.groupby("member").size()
         weighted_sum = 0.0

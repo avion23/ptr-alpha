@@ -6,6 +6,8 @@ from datetime import date
 
 import pandas as pd
 
+from analyzer._memo import df_memoize
+
 
 @dataclass
 class SignalFeatures:
@@ -68,6 +70,7 @@ def _drawdown_from_ath(prices: pd.Series) -> float:
     return float((ath - prices.iloc[-1]) / ath)
 
 
+@df_memoize
 def compute_signal_features(
     ticker: str,
     disclosure_date: date,

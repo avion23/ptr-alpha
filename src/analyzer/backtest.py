@@ -4,12 +4,66 @@ from __future__ import annotations
 
 import pandas as pd
 
+from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
 from analyzer.signals import _price_at_or_before, _price_on_or_before, _price_arrays
 from analyzer.member_ranking import rank_members, score_ticker_by_buyers
 
 
+@df_memoize(copy=False)
+def _filter_training(
+    signals_df: pd.DataFrame,
+    horizon: int,
+    as_of_iso: str,
+    training_lookback_iso: str | None,
+) -> pd.DataFrame:
+    """Filter signals to the training window. Result is shared (id-stable)."""
+    as_of_date = pd.Timestamp(as_of_iso)
+    cutoff = as_of_date - pd.Timedelta(days=horizon)
+    training = signals_df[
+        (signals_df["horizon_days"] == horizon)
+        & (signals_df["disclosure_date"] <= cutoff)
+    ].copy()
+    if training_lookback_iso is not None:
+        training_start = pd.Timestamp(training_lookback_iso)
+        training = training[training["disclosure_date"] >= training_start]
+    return training
+
+
+@df_memoize(copy=False)
+def _filter_recent_trades(
+    transactions_df: pd.DataFrame,
+    lookback_days: int,
+    as_of_iso: str,
+) -> pd.DataFrame:
+    """Filter transactions to the recent-trade window (Purchase only)."""
+    as_of_date = pd.Timestamp(as_of_iso)
+    lookback_start = as_of_date - pd.Timedelta(days=lookback_days)
+    mask = (
+        (transactions_df["disclosure_date"] >= lookback_start)
+        & (transactions_df["disclosure_date"] <= as_of_date)
+        & (transactions_df["transaction_type"] == TransactionType.PURCHASE.value)
+    )
+    return transactions_df[mask].copy()
+
+
+@df_memoize(copy=False)
+def _filter_ticker_perf(
+    signals_df: pd.DataFrame,
+    horizon: int,
+    as_of_iso: str,
+) -> pd.DataFrame:
+    """Filter signals to the ticker-performance window. Result is id-stable."""
+    as_of_date = pd.Timestamp(as_of_iso)
+    cutoff = as_of_date - pd.Timedelta(days=horizon)
+    return signals_df[
+        (signals_df["horizon_days"] == horizon)
+        & (signals_df["disclosure_date"] <= cutoff)
+    ].copy()
+
+
+@df_memoize
 def _build_ticker_curves(
     ticker: str,
     signals_df: pd.DataFrame,
@@ -38,6 +92,7 @@ def _build_ticker_curves(
     return _build_curves_for_rows(eligible, prices_df, horizon)
 
 
+@df_memoize
 def _build_global_curves(
     signals_df: pd.DataFrame,
     prices_df: pd.DataFrame,
@@ -116,6 +171,7 @@ def _build_curves_for_rows(
     return curves
 
 
+@df_memoize
 def _compute_ticker_entry_value(
     ticker: str,
     signals_df: pd.DataFrame,
@@ -123,93 +179,38 @@ def _compute_ticker_entry_value(
     as_of_date: pd.Timestamp,
     horizon: int,
     rho: float = 0.000137,
-    cache=None,
 ) -> float | None:
     """Compute OU entry value V(0) for a ticker from historical return curves.
 
     Falls back to global prior (average across all tickers) if ticker has
-    no prior disclosure history.
-
-    When ``cache`` (a :class:`analyzer.sweep_cache.BacktestCache`) is provided,
-    both the per-ticker curves, the global fallback curves, and the final V0
-    are memoized across calls that share the same logical inputs. This is the
-    single biggest win in the parameter sweep because V0 depends only on
-    (ticker, as_of_date, horizon) given fixed signals/prices inputs.
+    no prior disclosure history. Result depends only on
+    (ticker, signals_df, prices_df, as_of_date, horizon, rho), so it is
+    memoized via :func:`df_memoize` and shared across sweep combos.
     """
     from analyzer.return_process import compute_entry_value
 
-    if cache is not None:
-        hit, v0 = cache.get_entry_value(
-            signals_df, prices_df, ticker, as_of_date, horizon
-        )
-        if hit:
-            return v0
-
     ticker_col = ticker in prices_df.columns if hasattr(prices_df, "columns") else False
 
-    # Per-ticker curves
     curves: list = []
     if ticker_col:
-        if cache is not None:
-            hit, curves = cache.get_ticker_curves(
-                signals_df, prices_df, ticker, as_of_date, horizon
-            )
-            if not hit:
-                curves = _build_ticker_curves(
-                    ticker, signals_df, prices_df, as_of_date, horizon
-                )
-                cache.set_ticker_curves(
-                    signals_df, prices_df, ticker, as_of_date, horizon, curves
-                )
-        else:
-            curves = _build_ticker_curves(
-                ticker, signals_df, prices_df, as_of_date, horizon
-            )
+        curves = _build_ticker_curves(
+            ticker, signals_df, prices_df, as_of_date, horizon
+        )
 
     if curves:
         v0, _mu, _theta = compute_entry_value(curves, rho=rho)
-        if cache is not None:
-            cache.set_entry_value(
-                signals_df, prices_df, ticker, as_of_date, horizon, v0
-            )
         return v0
 
-    # Global fallback
     if not ticker_col:
-        if cache is not None:
-            cache.set_entry_value(
-                signals_df, prices_df, ticker, as_of_date, horizon, None
-            )
         return None
 
-    if cache is not None:
-        hit, global_curves = cache.get_global_curves(
-            signals_df, prices_df, as_of_date, horizon
-        )
-        if not hit:
-            global_curves = _build_global_curves(
-                signals_df, prices_df, as_of_date, horizon
-            )
-            cache.set_global_curves(
-                signals_df, prices_df, as_of_date, horizon, global_curves
-            )
-    else:
-        global_curves = _build_global_curves(
-            signals_df, prices_df, as_of_date, horizon
-        )
-
+    global_curves = _build_global_curves(
+        signals_df, prices_df, as_of_date, horizon
+    )
     if not global_curves:
-        if cache is not None:
-            cache.set_entry_value(
-                signals_df, prices_df, ticker, as_of_date, horizon, None
-            )
         return None
 
     v0, _mu, _theta = compute_entry_value(global_curves, rho=rho)
-    if cache is not None:
-        cache.set_entry_value(
-            signals_df, prices_df, ticker, as_of_date, horizon, v0
-        )
     return v0
 
 
@@ -224,51 +225,37 @@ def backtest_recommendations(
     threshold: float = 5.0,
     prices_df: pd.DataFrame | None = None,
     training_lookback_days: int | None = None,
-    cache=None,
 ) -> pd.DataFrame:
-    elapsed_cutoff = as_of_date - pd.Timedelta(days=horizon)
-    training = signals_df[
-        (signals_df["horizon_days"] == horizon)
-        & (signals_df["disclosure_date"] <= elapsed_cutoff)
-    ].copy()
+    # Read the bayes prior strength once at entry. The sweep mutates the
+    # module global per combo; we capture the current value and plumb it
+    # explicitly through the memoized leaf functions so their cache keys
+    # distinguish combos that differ only in bayes prior.
+    from analyzer import member_ranking as mr_mod
+    bayes = mr_mod.BAYES_PRIOR_STRENGTH
 
-    if training_lookback_days is not None:
-        training_start = as_of_date - pd.Timedelta(days=training_lookback_days)
-        training = training[training["disclosure_date"] >= training_start]
+    as_of_iso = as_of_date.isoformat()
+    training_lookback_iso = (
+        (as_of_date - pd.Timedelta(days=training_lookback_days)).isoformat()
+        if training_lookback_days is not None
+        else None
+    )
 
-    member_rankings = None
+    training = _filter_training(signals_df, horizon, as_of_iso, training_lookback_iso)
+
+    member_rankings: pd.DataFrame | None = None
     if not training.empty:
-        if cache is not None:
-            from analyzer import member_ranking as mr_mod
-            bayes_prior = mr_mod.BAYES_PRIOR_STRENGTH
-            hit, cached_rankings = cache.get_rank_members(
-                signals_df, horizon, threshold, bayes_prior,
-                training_lookback_days, as_of_date,
+        try:
+            member_rankings = rank_members(
+                training, horizon, threshold,
+                _bayes_prior_strength=bayes,
             )
-            if hit:
-                member_rankings = cached_rankings
-        if member_rankings is None:
-            try:
-                member_rankings = rank_members(training, horizon, threshold)
-            except AnalysisError:
-                member_rankings = None
-            if cache is not None and member_rankings is not None:
-                cache.set_rank_members(
-                    signals_df, horizon, threshold, bayes_prior,
-                    training_lookback_days, as_of_date, member_rankings,
-                )
+        except AnalysisError:
+            member_rankings = None
 
     if member_rankings is None or member_rankings.empty:
         return pd.DataFrame()
 
-    lookback_start = as_of_date - pd.Timedelta(days=lookback_days)
-    recent_mask = (
-        (transactions_df["disclosure_date"] >= lookback_start)
-        & (transactions_df["disclosure_date"] <= as_of_date)
-        & (transactions_df["transaction_type"] == TransactionType.PURCHASE.value)
-    )
-    recent_trades = transactions_df[recent_mask].copy()
-
+    recent_trades = _filter_recent_trades(transactions_df, lookback_days, as_of_iso)
     if recent_trades.empty:
         return pd.DataFrame()
 
@@ -278,10 +265,7 @@ def backtest_recommendations(
     if not candidate_tickers:
         return pd.DataFrame()
 
-    ticker_perf_signals = signals_df[
-        (signals_df["horizon_days"] == horizon)
-        & (signals_df["disclosure_date"] <= elapsed_cutoff)
-    ].copy()
+    ticker_perf_signals = _filter_ticker_perf(signals_df, horizon, as_of_iso)
 
     from analyzer.signal_features import (
         compute_signal_features,
@@ -293,42 +277,25 @@ def backtest_recommendations(
         as_of_date.date() if hasattr(as_of_date, "date") else as_of_date
     )
 
-    # Read bayes_prior once for cache keys (only sweep mutates this global).
-    bayes_prior_for_key = None
-    if cache is not None:
-        from analyzer import member_ranking as _mr_for_key
-        bayes_prior_for_key = _mr_for_key.BAYES_PRIOR_STRENGTH
-
     scores = []
     for ticker in candidate_tickers:
         try:
-            # Fast path: full per-ticker score (including entry value,
-            # signal_features, crash hazard adjustments) is content-determined
-            # by the params below — so we cache the assembled 1-row frame and
-            # hand the caller a fresh copy (callers mutate via .loc / insert).
-            if cache is not None and bayes_prior_for_key is not None:
-                hit, cached_score = cache.get_ticker_scores(
-                    transactions_df, lookback_days, as_of_date, ticker,
-                    signals_df, horizon, threshold, training_lookback_days,
-                    bayes_prior_for_key, min_buyers, 0.5,
-                )
-                if hit:
-                    scores.append(cached_score.copy())
-                    continue
-
+            # score_ticker_by_buyers, _compute_ticker_entry_value and
+            # compute_signal_features are all `@df_memoize`'d. Their cache
+            # keys are content-stable because their DataFrame inputs
+            # (training, recent_trades, ticker_perf_signals, signals_df,
+            # prices_df) all have stable identities across sweep calls.
             score = score_ticker_by_buyers(
                 ticker, recent_trades, training, horizon, threshold,
                 member_rankings, min_buyers,
                 ticker_perf_signals=ticker_perf_signals,
-                cache=cache, as_of_date=as_of_date,
-                cache_parent_signals=signals_df,
+                _bayes_prior_strength=bayes,
             )
 
             # Compute OU entry value V(0) if prices available
             if prices_df is not None:
                 v0 = _compute_ticker_entry_value(
                     ticker, signals_df, prices_df, as_of_date, horizon,
-                    cache=cache,
                 )
                 score["ou_entry_value"] = round(v0, 4) if v0 is not None else None
 
@@ -343,33 +310,14 @@ def backtest_recommendations(
                         tx_date = pd.Timestamp(tx_date).date()
                     disc_date = pd.Timestamp(latest_tx["disclosure_date"]).date()
 
-                    if cache is not None:
-                        hit, features = cache.get_signal_features(
-                            prices_df, transactions_df, ticker,
-                            disc_date, tx_date, as_of_for_features,
-                        )
-                        if not hit:
-                            features = compute_signal_features(
-                                ticker=ticker,
-                                disclosure_date=disc_date,
-                                transaction_date=tx_date,
-                                prices_df=prices_df,
-                                all_tx=recent_trades,
-                                as_of_date=as_of_for_features,
-                            )
-                            cache.set_signal_features(
-                                prices_df, transactions_df, ticker,
-                                disc_date, tx_date, as_of_for_features, features,
-                            )
-                    else:
-                        features = compute_signal_features(
-                            ticker=ticker,
-                            disclosure_date=disc_date,
-                            transaction_date=tx_date,
-                            prices_df=prices_df,
-                            all_tx=recent_trades,
-                            as_of_date=as_of_for_features,
-                        )
+                    features = compute_signal_features(
+                        ticker=ticker,
+                        disclosure_date=disc_date,
+                        transaction_date=tx_date,
+                        prices_df=prices_df,
+                        all_tx=recent_trades,
+                        as_of_date=as_of_for_features,
+                    )
                     crash = estimate_crash_hazard(features)
 
                     # Apply lag weight
@@ -392,12 +340,6 @@ def backtest_recommendations(
                     # Crash hazard estimation can fail on edge cases — keep base score
                     pass
 
-            if cache is not None and bayes_prior_for_key is not None:
-                cache.set_ticker_scores(
-                    transactions_df, lookback_days, as_of_date, ticker,
-                    signals_df, horizon, threshold, training_lookback_days,
-                    bayes_prior_for_key, min_buyers, 0.5, score,
-                )
             scores.append(score)
         except AnalysisError:
             continue

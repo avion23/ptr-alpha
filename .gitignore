@@ -66,3 +66,6 @@ cache/
 # User configuration
 config/
 config.toml
+
+# Ralph loop state
+.opencode/

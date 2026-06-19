@@ -433,6 +433,32 @@ def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, f
     }
 
 
+def _build_ranking_dicts(
+    member_rankings: pd.DataFrame | None,
+) -> dict[str, dict[str, float]]:
+    """Pre-build O(1) lookup dicts from member_rankings DataFrame.
+
+    Returns {"alpha": {member: float}, "trades": {member: int}, "prob": {member: float}}.
+    Avoids repeated DataFrame linear scans in the per-ticker scoring loop.
+    """
+    if member_rankings is None or member_rankings.empty:
+        return {"alpha": {}, "trades": {}, "prob": {}, "has_shrunk": False}
+
+    has_shrunk = "shrunk_alpha" in member_rankings.columns
+    alpha_col = "shrunk_alpha" if has_shrunk else "avg_spy_alpha_pct"
+
+    alpha = {}
+    trades = {}
+    prob = {}
+    for _, row in member_rankings.iterrows():
+        m = row["member"]
+        alpha[m] = float(row[alpha_col]) if pd.notna(row.get(alpha_col)) else 0.0
+        trades[m] = int(row.get("purchase_trades", 0)) if pd.notna(row.get("purchase_trades")) else 0
+        prob[m] = float(row.get("bayes_win_prob", 0.5)) if pd.notna(row.get("bayes_win_prob")) else 0.5
+
+    return {"alpha": alpha, "trades": trades, "prob": prob, "has_shrunk": has_shrunk}
+
+
 @df_memoize(copy=False)
 def score_ticker_by_buyers(
     ticker: str,
@@ -448,8 +474,13 @@ def score_ticker_by_buyers(
     solo_buyer_skill_threshold: float = 0.60,
     solo_buyer_penalty: float = 0.8,
     _bayes_prior_strength: float | None = None,
+    _ranking_dicts: dict | None = None,
 ) -> pd.DataFrame:
-    """Score a ticker by its buyer composition. Memoized via @df_memoize."""
+    """Score a ticker by its buyer composition. Memoized via @df_memoize.
+
+    When ``_ranking_dicts`` is provided (pre-built by the caller), dict
+    lookups replace DataFrame linear scans for buyer stats.
+    """
     if signals_df.empty:
         raise AnalysisError("Empty signal dataframe")
     if transactions_df.empty:
@@ -478,12 +509,7 @@ def score_ticker_by_buyers(
             "note": [f"Below minimum buyer threshold ({min_buyers})"]
         })
 
-    # Solo-buyer skill gate: when min_buyers=1 is requested and only one
-    # member bought this ticker, require that buyer's Bayesian win
-    # probability to clear a skill threshold. High-skill single buyers
-    # (e.g. conviction picks) proceed with a confidence penalty; the rest
-    # are rejected as before. Only applies when min_buyers == 1 — the
-    # min_buyers >= 2 path is unchanged.
+    # Solo-buyer skill gate
     apply_solo_penalty = False
     if (
         min_buyers == 1
@@ -505,9 +531,12 @@ def score_ticker_by_buyers(
         apply_solo_penalty = True
 
     buyers = ticker_trades["member"].unique()
+    use_skills = member_rankings is not None and member_skills is not None and len(member_skills) > 0
 
-    # If Bayesian skill posteriors are provided, use them instead of raw rankings
-    use_skills = member_skills is not None and len(member_skills) > 0
+    # Build or use pre-built ranking dicts for O(1) member lookups
+    rd = _ranking_dicts if _ranking_dicts is not None else _build_ranking_dicts(member_rankings)
+    alpha_dict = rd["alpha"]
+    trades_dict = rd["trades"]
 
     if use_skills:
         from analyzer.member_skill import score_members_for_ticker
@@ -515,22 +544,19 @@ def score_ticker_by_buyers(
         skill_score, skill_uncertainty = score_members_for_ticker(
             ticker, list(buyers), member_skills
         )
-        # Build buyer stats from skills for downstream display fields
         skill_buyers = [m for m in buyers if m in member_skills]
-        buyer_stats = member_rankings[
-            member_rankings["member"].isin(buyers)
-        ].sort_values("avg_spy_alpha_pct", ascending=False) if member_rankings is not None else pd.DataFrame()
 
-        if not buyer_stats.empty:
-            best_rank = buyer_stats["avg_spy_alpha_pct"].max()
-            total_trades = buyer_stats["purchase_trades"].sum()
-            rated_buyers = len(buyer_stats)
+        # O(1) lookups via dict instead of DataFrame filter
+        rated_buyers_list = [m for m in buyers if m in alpha_dict]
+        if rated_buyers_list:
+            best_rank = max(alpha_dict[m] for m in rated_buyers_list)
+            total_trades = sum(trades_dict.get(m, 0) for m in rated_buyers_list)
+            rated_buyers = len(rated_buyers_list)
         else:
             best_rank = skill_score
             total_trades = len(skill_buyers)
             rated_buyers = len(skill_buyers)
 
-        # Quality-adjusted average uses posterior means weighted by inverse uncertainty
         if skill_buyers:
             skill_posteriors = [member_skills[m] for m in skill_buyers]
             inv_stds = np.array([1.0 / max(s.alpha_std, 1e-6) for s in skill_posteriors])
@@ -546,14 +572,14 @@ def score_ticker_by_buyers(
         else:
             quality_adjusted_avg = skill_score
 
-        # Uncertainty penalty
         base_signal_score = quality_adjusted_avg - uncertainty_penalty_lambda * skill_uncertainty
+        buyer_stats_empty = not rated_buyers_list
     else:
-        buyer_stats = member_rankings[member_rankings["member"].isin(buyers)].sort_values(
-            "avg_spy_alpha_pct", ascending=False
-        )
+        # O(1) dict lookups instead of DataFrame isin filter
+        rated_buyers_list = [m for m in buyers if m in alpha_dict]
 
-        if buyer_stats.empty:
+        if not rated_buyers_list:
+            # Fallback: ticker history score
             fallback_score = 0.0
             fallback_source = "none"
             perf_signals = ticker_perf_signals if ticker_perf_signals is not None else signals_df
@@ -575,42 +601,43 @@ def score_ticker_by_buyers(
                 "fallback_source": [fallback_source],
             })
 
-        best_rank = buyer_stats["avg_spy_alpha_pct"].max()
-        total_trades = buyer_stats["purchase_trades"].sum()
-        rated_buyers = len(buyer_stats)
-        # Use shrunk_alpha (Bayesian-shrunk) instead of raw avg_spy_alpha_pct
-        # Recency weighting only — skill already baked into shrunk_alpha
-        alpha_col = "shrunk_alpha" if "shrunk_alpha" in buyer_stats.columns else "avg_spy_alpha_pct"
-        confidence_weights = np.ones(len(buyer_stats), dtype=float)
+        best_rank = max(alpha_dict[m] for m in rated_buyers_list)
+        total_trades = sum(trades_dict.get(m, 0) for m in rated_buyers_list)
+        rated_buyers = len(rated_buyers_list)
+
+        # Recency weighting via dict lookups
+        n_rated = len(rated_buyers_list)
+        confidence_weights = np.ones(n_rated, dtype=float)
         if "disclosure_date" in ticker_trades.columns:
-            rated_ticker_trades = ticker_trades[ticker_trades["member"].isin(buyer_stats["member"])]
+            rated_ticker_trades = ticker_trades[ticker_trades["member"].isin(rated_buyers_list)]
             if not rated_ticker_trades.empty:
                 latest_disclosure = rated_ticker_trades["disclosure_date"].max()
                 member_disclosures = rated_ticker_trades.groupby("member")["disclosure_date"].max()
-                days_since = (latest_disclosure - member_disclosures.reindex(buyer_stats["member"])).dt.days.fillna(0).clip(lower=0)
+                days_since = (latest_disclosure - member_disclosures.reindex(rated_buyers_list)).dt.days.fillna(0).clip(lower=0)
                 confidence_weights = np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.values)
+
+        alpha_values = np.array([alpha_dict[m] for m in rated_buyers_list])
         confidence_weight_sum = confidence_weights.sum()
         quality_adjusted_avg = (
-            (buyer_stats[alpha_col].values * confidence_weights).sum() / confidence_weight_sum
+            (alpha_values * confidence_weights).sum() / confidence_weight_sum
             if confidence_weight_sum > 0
             else 0
         )
 
         base_signal_score = quality_adjusted_avg
+        buyer_stats_empty = False
 
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
-
-    # ticker_perf_factor removed — it was inversely correlated with future returns.
-    # Skill is already captured in shrunk_alpha via member rankings.
     ticker_perf_factor = 1.0
 
     signal_score = base_signal_score * size_factor * owner_factor
     if apply_solo_penalty:
         signal_score *= solo_buyer_penalty
 
-    if not buyer_stats.empty:
-        top_buyers = buyer_stats["member"].head(3).tolist()
+    if not buyer_stats_empty:
+        # Sort rated buyers by alpha for top-3 display
+        top_buyers = sorted(rated_buyers_list, key=lambda m: alpha_dict.get(m, 0), reverse=True)[:3]
     else:
         skill_members = [m for m in buyers if m in (member_skills or {})]
         top_buyers = skill_members[:3] if skill_members else list(buyers[:3])

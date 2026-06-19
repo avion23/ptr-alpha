@@ -89,11 +89,52 @@ def fit_ar1(returns: np.ndarray) -> tuple[float, float, float]:
     Fit AR(1): r(t+1) = b + a*r(t) + eps, eps ~ N(0, s2).
 
     Returns (a, b, s2).
+    Optimized for small arrays (3-90 elements): avoids np.asarray overhead
+    by checking dtype first, uses raw Python loops for tiny arrays.
     """
-    r = np.asarray(returns, dtype=np.float64)
-    if len(r) < 3:
+    n = len(returns)
+    if n < 3:
         return 0.95, 0.0, 0.01
 
+    # Avoid np.asarray overhead when input is already float64
+    if isinstance(returns, np.ndarray) and returns.dtype == np.float64:
+        r = returns
+    else:
+        r = np.asarray(returns, dtype=np.float64)
+
+    # For very small arrays (n <= 10), use pure Python to avoid numpy overhead
+    if n <= 10:
+        r_bar = 0.0
+        for i in range(n):
+            r_bar += r[i]
+        r_bar /= n
+
+        denom = 0.0
+        cov = 0.0
+        for i in range(n - 1):
+            d_prev = r[i] - r_bar
+            d_next = r[i + 1] - r_bar
+            denom += d_prev * d_prev
+            cov += d_next * d_prev
+
+        if denom < 1e-12:
+            var_sum = 0.0
+            for i in range(1, n):
+                d = r[i] - r_bar
+                var_sum += d * d
+            return 0.95, 0.0, max(var_sum / max(n - 1, 1), 1e-10)
+
+        a = cov / denom
+        a = max(-0.99, min(a, 0.999))
+        b = r_bar * (1.0 - a)
+        s2 = 0.0
+        for i in range(n - 1):
+            resid = r[i + 1] - b - a * r[i]
+            s2 += resid * resid
+        s2 /= (n - 1)
+        return a, b, max(s2, 1e-10)
+
+    # Standard numpy path for larger arrays
     r_bar = float(r.mean())
     r_next = r[1:]
     r_prev = r[:-1]
@@ -116,16 +157,17 @@ def fit_ar1(returns: np.ndarray) -> tuple[float, float, float]:
 
 
 def ar1_to_ou(a: float, b: float, s2: float) -> OUParams:
-    """Convert AR(1) parameters to OU parameters."""
+    """Convert AR(1) parameters to OU parameters. Uses math module for speed."""
+    import math
     a = max(a, 1e-6)
-    theta = -np.log(a)
+    theta = -math.log(a)
     mu = b / (1.0 - a) if abs(1.0 - a) > 1e-8 else 0.0
     if theta > 1e-8:
-        sigma2 = s2 * 2.0 * theta / (1.0 - np.exp(-2.0 * theta))
+        sigma2 = s2 * 2.0 * theta / (1.0 - math.exp(-2.0 * theta))
     else:
         sigma2 = s2
-    sigma = float(np.sqrt(max(sigma2, 1e-10)))
-    return OUParams(theta=float(theta), mu=float(mu), sigma=sigma)
+    sigma = math.sqrt(max(sigma2, 1e-10))
+    return OUParams(theta=theta, mu=mu, sigma=sigma)
 
 
 def fit_ou(returns: np.ndarray) -> OUParams:

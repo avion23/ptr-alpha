@@ -125,9 +125,16 @@ def compute_signal_features(
     all_tx: pd.DataFrame,
     as_of_date: date,
 ) -> SignalFeatures:
-    """Compute point-in-time features for a signal."""
+    """Compute point-in-time features for a signal.
+
+    Uses numpy arrays via ``_price_arrays`` for O(log N) price lookups
+    instead of pandas Series boolean masking.
+    """
+    from analyzer.signals import _price_arrays
+
     disc_ts = pd.Timestamp(disclosure_date)
     as_of_ts = pd.Timestamp(as_of_date)
+    as_of_ns = as_of_ts.value
 
     # Lag days
     if transaction_date is not None:
@@ -135,56 +142,95 @@ def compute_signal_features(
     else:
         lag_days = 0
 
-    # Get price series for this ticker up to as_of_date
-    if ticker in prices_df.columns:
-        ticker_prices = prices_df[ticker].dropna()
-        prices_before_asof = ticker_prices[ticker_prices.index <= as_of_ts]
-    else:
-        prices_before_asof = pd.Series(dtype=float)
+    # Get price arrays (numpy) for this ticker — O(1) lookup via cache
+    arrs = _price_arrays(prices_df, ticker)
+    idx_ns = None
+    vals = None
+    if arrs is not None:
+        idx_ns, vals = arrs
 
     # Pre-disclosure return
     pre_disclosure_return = 0.0
     pre_disclosure_alpha = 0.0
-    if transaction_date is not None and not prices_before_asof.empty:
-        tx_ts = pd.Timestamp(transaction_date)
-        entry_price = prices_before_asof[prices_before_asof.index >= tx_ts]
-        disclosure_price = prices_before_asof[prices_before_asof.index >= disc_ts]
-        if len(entry_price) > 0 and len(disclosure_price) > 0:
-            p_tx = float(entry_price.iloc[0])
-            p_disc = float(disclosure_price.iloc[0])
-            if p_tx > 0:
-                pre_disclosure_return = (p_disc / p_tx) - 1.0
+    if transaction_date is not None and idx_ns is not None and len(idx_ns) > 0:
+        tx_ns = pd.Timestamp(transaction_date).value
+        disc_ns = disc_ts.value
 
-                # SPY alpha
-                if "SPY" in prices_df.columns:
-                    spy_prices = prices_df["SPY"].dropna()
-                    spy_before = spy_prices[spy_prices.index <= as_of_ts]
-                    spy_tx = spy_before[spy_before.index >= tx_ts]
-                    spy_disc = spy_before[spy_before.index >= disc_ts]
-                    if len(spy_tx) > 0 and len(spy_disc) > 0:
-                        spy_p_tx = float(spy_tx.iloc[0])
-                        spy_p_disc = float(spy_disc.iloc[0])
-                        if spy_p_tx > 0:
-                            spy_return = (spy_p_disc / spy_p_tx) - 1.0
-                            pre_disclosure_alpha = pre_disclosure_return - spy_return
+        # Price at transaction date (first price >= tx_ts AND <= as_of_ts)
+        pos_tx = int(np.searchsorted(idx_ns, tx_ns, side="left"))
+        # Walk forward to find first price >= tx_ts
+        while pos_tx < len(idx_ns) and idx_ns[pos_tx] < tx_ns:
+            pos_tx += 1
+        if pos_tx < len(idx_ns) and idx_ns[pos_tx] <= as_of_ns:
+            p_tx = float(vals[pos_tx])
+            # Price at disclosure date (first price >= disc_ts AND <= as_of_ts)
+            pos_disc = int(np.searchsorted(idx_ns, disc_ns, side="left"))
+            while pos_disc < len(idx_ns) and idx_ns[pos_disc] < disc_ns:
+                pos_disc += 1
+            if pos_disc < len(idx_ns) and idx_ns[pos_disc] <= as_of_ns:
+                p_disc = float(vals[pos_disc])
+                if p_tx > 0:
+                    pre_disclosure_return = (p_disc / p_tx) - 1.0
+
+                    # SPY alpha
+                    spy_arrs = _price_arrays(prices_df, "SPY")
+                    if spy_arrs is not None and spy_arrs[0] is not None:
+                        spy_ns, spy_vals = spy_arrs
+                        # SPY at transaction date
+                        sp = int(np.searchsorted(spy_ns, tx_ns, side="left"))
+                        while sp < len(spy_ns) and spy_ns[sp] < tx_ns:
+                            sp += 1
+                        if sp < len(spy_ns) and spy_ns[sp] <= as_of_ns:
+                            spy_p_tx = float(spy_vals[sp])
+                            # SPY at disclosure date
+                            sd = int(np.searchsorted(spy_ns, disc_ns, side="left"))
+                            while sd < len(spy_ns) and spy_ns[sd] < disc_ns:
+                                sd += 1
+                            if sd < len(spy_ns) and spy_ns[sd] <= as_of_ns:
+                                spy_p_disc = float(spy_vals[sd])
+                                if spy_p_tx > 0:
+                                    spy_return = (spy_p_disc / spy_p_tx) - 1.0
+                                    pre_disclosure_alpha = pre_disclosure_return - spy_return
 
     # Max drawdown from disclosure to entry (using as_of as entry proxy)
     max_dd_to_entry = 0.0
-    if not prices_before_asof.empty:
-        post_disc = prices_before_asof[prices_before_asof.index >= disc_ts]
-        if len(post_disc) >= 2:
-            max_dd_to_entry = _max_drawdown(post_disc)
+    if idx_ns is not None and len(idx_ns) > 0:
+        disc_ns = disc_ts.value
+        lo = int(np.searchsorted(idx_ns, disc_ns, side="left"))
+        hi = int(np.searchsorted(idx_ns, as_of_ns, side="right"))
+        post_disc_vals = vals[lo:hi]
+        if len(post_disc_vals) >= 2:
+            cummax = np.maximum.accumulate(post_disc_vals)
+            drawdowns = (post_disc_vals - cummax) / cummax
+            max_dd_to_entry = float(abs(drawdowns.min())) if len(drawdowns) > 0 else 0.0
 
     # 20-day realized vol at entry (as of date)
-    volatility_20d = _realized_vol(prices_before_asof, window=20)
+    volatility_20d = 0.0
+    if idx_ns is not None and len(idx_ns) > 1:
+        # Get last ~20 trading days up to as_of_ns
+        pos = int(np.searchsorted(idx_ns, as_of_ns, side="right"))
+        start = max(0, pos - 21)
+        window_vals = vals[start:pos]
+        if len(window_vals) >= 3:
+            returns = np.diff(window_vals) / window_vals[:-1]
+            returns = returns[np.isfinite(returns)]
+            if len(returns) >= 2:
+                volatility_20d = float(np.std(returns, ddof=1) * np.sqrt(252))
 
     # Drawdown from ATH
-    drawdown_ath = _drawdown_from_ath(prices_before_asof)
+    drawdown_ath = 0.0
+    if idx_ns is not None and len(idx_ns) > 0:
+        pos = int(np.searchsorted(idx_ns, as_of_ns, side="right"))
+        hist_vals = vals[:pos]
+        if len(hist_vals) > 0:
+            ath = float(hist_vals.max())
+            if ath > 0:
+                drawdown_ath = float((ath - hist_vals[-1]) / ath)
 
     # Days since IPO (approximate: first available price date)
     days_since_ipo = None
-    if not prices_before_asof.empty:
-        first_date = prices_before_asof.index.min()
+    if idx_ns is not None and len(idx_ns) > 0:
+        first_date = pd.Timestamp(idx_ns[0], unit="ns")
         days_since_ipo = (as_of_ts - first_date).days
 
     # Number of buyers in last 30 days

@@ -66,6 +66,37 @@ def _extract_owner_code(owner_cell: str | None) -> str | None:
     return owner[:8]
 
 
+def _extract_instrument_type(asset_cell: str | None) -> str:
+    """Detect whether an asset description is a stock, call option, or put option."""
+    if not asset_cell:
+        return 'stock'
+    text = asset_cell.lower()
+    if re.search(r'\bput\s+opt', text) or re.search(r'\bput\b', text):
+        return 'put'
+    if re.search(r'\bcall\s+opt', text) or re.search(r'\bcall\b', text):
+        return 'call'
+    return 'stock'
+
+
+def _extract_option_details(asset_cell: str | None) -> dict:
+    """Extract strike price and expiry date from an option asset description.
+
+    Returns dict with optional 'strike_price' (float) and 'expiry_date' (str MM/DD/YYYY).
+    """
+    details: dict = {}
+    if not asset_cell:
+        return details
+    # Strike price: "Strike $150" or "Strike: 150.00"
+    strike_match = re.search(r'(?:strike[:\s]*\$?)(\d+(?:\.\d+)?)', asset_cell, re.IGNORECASE)
+    if strike_match:
+        details['strike_price'] = float(strike_match.group(1))
+    # Expiry date: "Exp MM/DD/YYYY" or "Expire: MM/DD/YYYY" or "Expiring MM/DD/YYYY"
+    exp_match = re.search(r'(?:exp(?:ir(?:e|ation|ing)?)?[:\s]+(\d{2}/\d{2}/\d{4}))', asset_cell, re.IGNORECASE)
+    if exp_match:
+        details['expiry_date'] = exp_match.group(1)
+    return details
+
+
 def _extract_amount_midpoint(amount_cell: str | None) -> tuple[str | None, float | None]:
     amount = clean_text(amount_cell)
     if not amount:
@@ -121,6 +152,8 @@ def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | Non
 
         if ticker and tx_type and tx_date:
             amount_raw, amount_midpoint = _extract_amount_midpoint(_get_cell(row, indexes.get("amount")))
+            instrument_type = _extract_instrument_type(asset_cell)
+            option_details = _extract_option_details(asset_cell) if instrument_type != 'stock' else {}
             return {
                 'ticker': ticker,
                 'transaction_type': tx_type,
@@ -128,6 +161,9 @@ def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | Non
                 'owner_code': _extract_owner_code(_get_cell(row, indexes.get("owner"))),
                 'amount_raw': amount_raw,
                 'amount_midpoint': amount_midpoint,
+                'instrument_type': instrument_type,
+                'strike_price': option_details.get('strike_price'),
+                'expiry_date': option_details.get('expiry_date'),
             }
         return None
     except IndexError:
@@ -217,6 +253,9 @@ def consolidate_transactions(pdf_transactions: dict[Path, list[dict]], member_me
                 'owner_code': tx.get('owner_code'),
                 'amount_raw': tx.get('amount_raw'),
                 'amount_midpoint': tx.get('amount_midpoint'),
+                'instrument_type': tx.get('instrument_type', 'stock'),
+                'strike_price': tx.get('strike_price'),
+                'expiry_date': tx.get('expiry_date'),
             })
 
     if not all_transactions:

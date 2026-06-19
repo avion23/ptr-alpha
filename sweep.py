@@ -7,6 +7,7 @@ then iterate backtest params. ~7 min for 216 combos.
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 import time
 from dataclasses import dataclass, asdict
@@ -213,48 +214,28 @@ def main():
     from analyzer.sweep_cache import BacktestCache
     cache = BacktestCache()
 
-    results = []
+    # Decide serial vs parallel. Parallel uses fork (Linux/macOS) so child
+    # processes inherit the precomputed signal_cache + prices + transactions
+    # without re-loading from disk. Each child runs a disjoint subset of
+    # combos with its own BacktestCache. Override via SWEEP_WORKERS env var.
+    workers = int(os.environ.get("SWEEP_WORKERS", "1"))
+    if workers < 1:
+        workers = 1
+
+    results: list[SweepResult] = []
     start_time = time.time()
 
-    for i, combo in enumerate(combinations):
-        params_dict = dict(zip(keys, combo))
-        params = BacktestParams(
-            start_date=date(2022, 1, 1),
-            end_date=date(2025, 6, 30),
-            horizon=params_dict["horizon"],
-            lookback_days=60,
-            training_lookback_days=params_dict["training_lookback_days"],
-            min_buyers=params_dict["min_buyers"],
-            top_n=params_dict["top_n"],
-            threshold=5.0,
-            frequency_days=params_dict["frequency_days"],
+    if workers == 1:
+        results = _run_serial(
+            combinations, keys, signal_cache, all_transactions, prices, cache,
         )
-
-        sigs = signal_cache[(params_dict["horizon"], params_dict["decay_lambda"])]
-
-        result = run_single_backtest(
-            all_transactions, prices, params, sigs,
-            bayes_prior_strength=params_dict["bayes_prior_strength"],
-            decay_lambda=params_dict["decay_lambda"],
-            cache=cache,
+    else:
+        results = _run_parallel(
+            combinations, keys, signal_cache, all_transactions, prices, workers,
         )
-        results.append(result)
-
-        if (i + 1) % 50 == 0 or i == 0:
-            elapsed = time.time() - start_time
-            rate = (i + 1) / elapsed
-            eta = (total - i - 1) / rate if rate > 0 else 0
-            print(
-                f"  [{i+1}/{total}] "
-                f"alpha={result.overall_alpha:+.1f}% "
-                f"slope={result.alpha_slope:+.1f}% "
-                f"win={result.win_rate:.0f}% "
-                f"sharpe={result.sharpe:+.2f} "
-                f"({rate:.1f}/s, ETA {eta:.0f}s)"
-            )
 
     elapsed = time.time() - start_time
-    print(f"\nSweep completed in {elapsed:.1f}s ({total} combos)")
+    print(f"\nSweep completed in {elapsed:.1f}s ({total} combos, workers={workers})")
     print(f"Cache stats: {cache.stats}")
 
     # Save results
@@ -287,6 +268,153 @@ def main():
     print("\n=== Bottom 5 (worst alpha_slope) ===")
     bottom = results_df.nsmallest(5, "alpha_slope")
     print(bottom[cols].to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
+# Serial / parallel sweep drivers
+# ---------------------------------------------------------------------------
+
+# Module-level globals populated by main() before forking workers. Children
+# inherit these via fork on Linux/macOS.
+_SWEEP_CTX: dict = {}
+
+
+def _run_serial(
+    combinations, keys, signal_cache, all_transactions, prices, cache,
+) -> list[SweepResult]:
+    total = len(combinations)
+    results: list[SweepResult] = []
+    start_time = time.time()
+    for i, combo in enumerate(combinations):
+        params_dict = dict(zip(keys, combo))
+        result = _eval_combo(
+            params_dict, keys, signal_cache, all_transactions, prices, cache,
+        )
+        results.append(result)
+        if (i + 1) % 50 == 0 or i == 0:
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed
+            eta = (total - i - 1) / rate if rate > 0 else 0
+            print(
+                f"  [{i+1}/{total}] "
+                f"alpha={result.overall_alpha:+.1f}% "
+                f"slope={result.alpha_slope:+.1f}% "
+                f"win={result.win_rate:.0f}% "
+                f"sharpe={result.sharpe:+.2f} "
+                f"({rate:.1f}/s, ETA {eta:.0f}s)"
+            )
+    return results
+
+
+def _eval_combo(params_dict, keys, signal_cache, all_transactions, prices, cache):
+    """Evaluate one parameter combination and return its SweepResult."""
+    params = BacktestParams(
+        start_date=date(2022, 1, 1),
+        end_date=date(2025, 6, 30),
+        horizon=params_dict["horizon"],
+        lookback_days=60,
+        training_lookback_days=params_dict["training_lookback_days"],
+        min_buyers=params_dict["min_buyers"],
+        top_n=params_dict["top_n"],
+        threshold=5.0,
+        frequency_days=params_dict["frequency_days"],
+    )
+    sigs = signal_cache[(params_dict["horizon"], params_dict["decay_lambda"])]
+    return run_single_backtest(
+        all_transactions, prices, params, sigs,
+        bayes_prior_strength=params_dict["bayes_prior_strength"],
+        decay_lambda=params_dict["decay_lambda"],
+        cache=cache,
+    )
+
+
+def _worker_run(combo_group):
+    """Worker entry point: evaluate a group of parameter combinations.
+
+    Inherits _SWEEP_CTX from parent via fork. Builds its own BacktestCache
+    so memoization is per-worker (no cross-process locking needed).
+    """
+    from analyzer.sweep_cache import BacktestCache
+    cache = BacktestCache()
+    keys = _SWEEP_CTX["keys"]
+    signal_cache = _SWEEP_CTX["signal_cache"]
+    all_transactions = _SWEEP_CTX["all_transactions"]
+    prices = _SWEEP_CTX["prices"]
+
+    out: list[SweepResult] = []
+    t0 = time.time()
+    for params_dict in combo_group:
+        out.append(
+            _eval_combo(
+                params_dict, keys, signal_cache, all_transactions, prices, cache,
+            )
+        )
+    pid = os.getpid()
+    print(
+        f"  worker {pid}: {len(combo_group)} combos in {time.time() - t0:.1f}s "
+        f"(cache: {cache.stats})",
+        file=sys.stderr,
+    )
+    return out
+
+
+def _run_parallel(
+    combinations, keys, signal_cache, all_transactions, prices, workers,
+) -> list[SweepResult]:
+    """Partition combos across worker processes.
+
+    Groups combinations by (horizon, decay_lambda) so each worker handles a
+    coherent subset that maximizes per-worker cache reuse, then dispatches
+    groups to a fork-based process pool.
+    """
+    import multiprocessing as mp
+
+    # Sort combinations into (horizon, decay_lambda) buckets so workers
+    # inherit maximal cache reuse.
+    keys_index = {k: i for i, k in enumerate(keys)}
+    h_idx = keys_index["horizon"]
+    d_idx = keys_index["decay_lambda"]
+    buckets: dict[tuple, list[dict]] = {}
+    for combo in combinations:
+        pd_dict = dict(zip(keys, combo))
+        bkey = (pd_dict["horizon"], pd_dict["decay_lambda"])
+        buckets.setdefault(bkey, []).append(pd_dict)
+
+    bucket_list = list(buckets.values())
+
+    # Populate the inherited context for forked workers.
+    _SWEEP_CTX.clear()
+    _SWEEP_CTX["keys"] = keys
+    _SWEEP_CTX["signal_cache"] = signal_cache
+    _SWEEP_CTX["all_transactions"] = all_transactions
+    _SWEEP_CTX["prices"] = prices
+
+    # Fork is required to inherit signal_cache + prices without re-loading.
+    # On macOS Python 3.8+ this is no longer the default; we opt in explicitly.
+    ctx = mp.get_context("fork")
+    # Cap effective worker count at the number of (horizon, decay) buckets:
+    # subdividing buckets trades cache reuse for parallelism and empirically
+    # never wins for this dataset because per-bucket cold work dominates.
+    effective_workers = min(workers, len(bucket_list))
+    print(
+        f"Running parallel sweep: {effective_workers} workers "
+        f"(requested {workers}, capped at {len(bucket_list)} buckets), "
+        f"{len(combinations)} total combos",
+        file=sys.stderr,
+    )
+    with ctx.Pool(processes=effective_workers) as pool:
+        # One work chunk per (horizon, decay) bucket. Each chunk has maximal
+        # cache reuse since all of its combos share the same signal_cache df.
+        grouped = [list(b) for b in bucket_list]
+        results_nested = pool.map(_worker_run, grouped)
+
+    # Flatten in bucket order (deterministic; bucket_list order is stable
+    # because we built it from a dict whose insertion order matches the
+    # itertools.product order for the param grid).
+    flat: list[SweepResult] = []
+    for r in results_nested:
+        flat.extend(r)
+    return flat
 
 
 if __name__ == "__main__":

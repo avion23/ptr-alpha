@@ -6,8 +6,8 @@ from math import exp, log, sqrt
 import numpy as np
 import pandas as pd
 
+from analyzer import signals as _signals
 from analyzer.analysis import TransactionType, _collapse_to_episodes
-from analyzer.signals import BAYES_PRIOR_STRENGTH
 
 
 @dataclass
@@ -150,7 +150,7 @@ def estimate_member_skills(
         return {}
 
     if prior_strength is None:
-        prior_strength = BAYES_PRIOR_STRENGTH  # 20, unified with member_ranking
+        prior_strength = _signals.BAYES_PRIOR_STRENGTH  # 20, unified with member_ranking
     if ref_date is None:
         ref_date = pd.Timestamp.now()
     raw = _compute_member_raw_alphas(

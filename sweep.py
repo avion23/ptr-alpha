@@ -156,7 +156,7 @@ def main():
 
     price_start = tx_start
     price_end = pd.Timestamp("2025-06-30") + pd.Timedelta(days=130)
-    all_tickers = sorted(set(all_transactions["ticker"].unique().tolist()) | {"SPY"})
+    all_tickers = sorted(set(t for t in all_transactions["ticker"].dropna().unique() if isinstance(t, str)) | {"SPY"})
 
     prices = db.get_prices(all_tickers, price_start, price_end)
     entry_prices = db.get_entry_prices(all_tickers, price_start, price_end)

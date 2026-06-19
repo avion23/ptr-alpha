@@ -1,4 +1,10 @@
-"""Signal generation and calculation."""
+"""Signal generation and calculation.
+
+Data-oriented redesign: replaces the merge-then-filter pattern
+(75M+ intermediate rows → 3M filtered) with per-ticker searchsorted
+lookups via the _price_arrays index. Pre-computes SPY log returns
+once on the full Series instead of per-signal groupby shifts.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +26,8 @@ MIN_ENTRY_PRICE = 3.0
 # Use pure SPY alpha as signal score — avoids double-counting stock return
 CONVICTION_WEIGHT_ALPHA = 1.0
 CONVICTION_WEIGHT_REALIZED = 0.0
+
+_NS_PER_DAY = 86_400_000_000_000  # nanoseconds in a day
 
 
 # Module-level per-prices_df index cache. Keyed by id(prices_df); cleaned up
@@ -110,7 +118,7 @@ def _price_at_or_before(
     if max_staleness_days is not None:
         # Staleness in days: (target - found_date) ns / (1e9 * 86400)
         staleness_ns = target - int(idx_ns[pos])
-        if staleness_ns > max_staleness_days * 86_400_000_000_000:
+        if staleness_ns > max_staleness_days * _NS_PER_DAY:
             return None
     return float(vals[pos])
 
@@ -126,7 +134,7 @@ def _price_at_or_near(
     if idx_ns is None:
         return None
     target = pd.Timestamp(target_date).value
-    tol_ns = tolerance_days * 86_400_000_000_000
+    tol_ns = tolerance_days * _NS_PER_DAY
     lo = int(np.searchsorted(idx_ns, target - tol_ns, side="left"))
     hi = int(np.searchsorted(idx_ns, target + tol_ns, side="right"))
     if lo >= hi:
@@ -294,6 +302,115 @@ def _get_member_signals(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Vectorized inner kernel: compute signal metrics for a single ticker's
+# price window using numpy searchsorted + array ops (no pandas overhead).
+# ---------------------------------------------------------------------------
+
+def _compute_ticker_signals(
+    t_indices: np.ndarray,
+    t_disc_ns: np.ndarray,
+    t_end_ns: np.ndarray,
+    dates_ns: np.ndarray,
+    vals: np.ndarray,
+    spy_dates_ns: np.ndarray | None,
+    spy_vals: np.ndarray | None,
+    spy_log_ret: np.ndarray | None,
+    decay_lambda: float,
+    r_peak: np.ndarray,
+    r_trough: np.ndarray,
+    r_decayed_ret: np.ndarray,
+    r_disc_baseline: np.ndarray,
+    r_last_price: np.ndarray,
+    r_spy_cum: np.ndarray,
+    r_spy_wsum: np.ndarray,
+    r_spy_first: np.ndarray,
+    r_spy_last: np.ndarray,
+) -> None:
+    """Mutate pre-allocated result arrays for signals belonging to one ticker."""
+    n_signals = len(t_indices)
+    if n_signals == 0:
+        return
+
+    # Vectorized searchsorted for all signals of this ticker at once
+    t_lo = np.searchsorted(dates_ns, t_disc_ns, side="left")
+    t_hi = np.searchsorted(dates_ns, t_end_ns, side="right")
+
+    spy_has = spy_dates_ns is not None and spy_vals is not None and spy_log_ret is not None
+
+    for i in range(n_signals):
+        lo = int(t_lo[i])
+        hi = int(t_hi[i])
+        if lo >= hi:
+            continue
+
+        idx = int(t_indices[i])
+        disc = t_disc_ns[i]
+
+        w_vals = vals[lo:hi]
+        w_dates = dates_ns[lo:hi]
+        n_w = len(w_vals)
+
+        # Baseline, last, peak, trough
+        r_disc_baseline[idx] = w_vals[0]
+        r_last_price[idx] = w_vals[-1]
+        r_peak[idx] = w_vals.max()
+        r_trough[idx] = w_vals.min()
+
+        # Days from disclosure (vectorized)
+        days = ((w_dates - disc) // _NS_PER_DAY).astype(np.float64)
+
+        # Daily log returns (vectorized, handles zero prices)
+        log_ret = np.zeros(n_w, dtype=np.float64)
+        if n_w > 1:
+            prev_vals = w_vals[:-1]
+            valid = prev_vals > 0
+            log_ret[1:][valid] = np.log(w_vals[1:][valid] / prev_vals[valid])
+
+        # Mid-decay: weight by midpoint between consecutive days
+        prev_days = np.empty(n_w, dtype=np.float64)
+        prev_days[0] = 0.0
+        prev_days[1:] = days[:-1]
+        mid_d = np.exp(-decay_lambda * (days + prev_days) * 0.5)
+
+        # Decay-weighted return normalized by total decay weight
+        w_ret = log_ret * mid_d
+        w_sum = mid_d.sum()
+        if w_sum > 0:
+            r_decayed_ret[idx] = w_ret.sum() / w_sum
+
+        # SPY returns for the same window
+        if spy_has:
+            spy_lo = int(np.searchsorted(spy_dates_ns, disc, side="left"))
+            spy_hi_end = int(np.searchsorted(spy_dates_ns, t_end_ns[i], side="right"))
+            if spy_lo < spy_hi_end:
+                sw_vals = spy_vals[spy_lo:spy_hi_end]
+                sw_dates = spy_dates_ns[spy_lo:spy_hi_end]
+                n_sw = len(sw_vals)
+
+                r_spy_first[idx] = sw_vals[0]
+                r_spy_last[idx] = sw_vals[-1]
+
+                # Reuse pre-computed SPY log returns via index mapping
+                spy_lr = np.zeros(n_sw, dtype=np.float64)
+                if n_sw > 1:
+                    # Map window positions back to full SPY array indices
+                    spy_full_lo = spy_lo
+                    spy_lr[1:] = spy_log_ret[spy_full_lo + 1 : spy_full_lo + n_sw]
+
+                s_days = ((sw_dates - disc) // _NS_PER_DAY).astype(np.float64)
+                s_prev = np.empty(n_sw, dtype=np.float64)
+                s_prev[0] = 0.0
+                s_prev[1:] = s_days[:-1]
+                s_mid = np.exp(-decay_lambda * (s_days + s_prev) * 0.5)
+
+                s_wr = spy_lr * s_mid
+                s_ws = s_mid.sum()
+                if s_ws > 0:
+                    r_spy_cum[idx] = s_wr.sum() / s_ws
+                    r_spy_wsum[idx] = s_ws
+
+
 def calculate_signal_potential(
     entry_prices_df: pd.DataFrame,
     prices_df: pd.DataFrame,
@@ -314,22 +431,14 @@ def calculate_signal_potential(
     if not required_cols.issubset(entry_prices_df.columns):
         raise AnalysisError(f"Missing columns in entry_prices: {required_cols - set(entry_prices_df.columns)}")
 
-    prices_long = prices_df.stack().reset_index(name="price")
-    prices_long.columns = ["price_date", "ticker", "price"]
-
-    spy_prices = prices_long[prices_long["ticker"] == "SPY"][["price_date", "price"]].rename(
-        columns={"price": "spy_price"}
-    )
-    prices_long = prices_long[prices_long["ticker"] != "SPY"].copy()
-
     signals = entry_prices_df.copy()
 
-    # Resolve tickers so the merge matches prices_df columns
+    # Resolve tickers so lookups match prices_df columns
     resolver = TickerResolver()
-    price_tickers = set(prices_long["ticker"].unique())
+    price_tickers = set(prices_df.columns)
     raw_tickers = signals["ticker"].unique()
     for raw in raw_tickers:
-        if raw not in price_tickers:
+        if raw not in price_tickers and raw != "SPY":
             resolved = resolver.resolve(raw)
             if resolved.price_symbol in price_tickers:
                 signals.loc[signals["ticker"] == raw, "ticker"] = resolved.price_symbol
@@ -337,132 +446,123 @@ def calculate_signal_potential(
     if signals.empty:
         raise AnalysisError("No valid price matches found for transactions")
 
+    # Explode across horizons
     signals = signals.assign(horizon_days=[horizons] * len(signals)).explode("horizon_days").reset_index(drop=True)
     signals["horizon_days"] = signals["horizon_days"].astype("int32")
     signals["window_end"] = signals["disclosure_date"] + pd.to_timedelta(signals["horizon_days"], unit="D")
     signals["signal_id"] = range(len(signals))
 
-    merged = signals.merge(prices_long, on="ticker", suffixes=("", "_price"))
-    window_mask = (merged["price_date"] >= merged["disclosure_date"]) & (merged["price_date"] <= merged["window_end"])
-    windowed = merged[window_mask].copy()
+    n = len(signals)
 
-    if windowed.empty:
-        raise AnalysisError("No price data found in signal windows")
+    # --- Vectorized signal metadata (numpy arrays, no pandas overhead) ---
+    disc_ns = signals["disclosure_date"].astype(np.int64).values
+    end_ns = signals["window_end"].astype(np.int64).values
+    # Convert to numpy object arrays to avoid pandas StringDtype comparison overhead
+    # (pandas StringDtype.__eq__ triggers _isna_string_dtype per element)
+    ticker_arr = signals["ticker"].to_numpy(dtype=object, na_value=None)
+    entry_prices_arr = signals["entry_price"].values
+    txn_types = signals["transaction_type"].to_numpy(dtype=object, na_value=None)
+    horizon_days_arr = signals["horizon_days"].values
 
-    first_price_idx = windowed.groupby("signal_id")["price_date"].idxmin()
-    disclosure_prices = windowed.loc[first_price_idx].set_index("signal_id")["price"]
-    windowed["disclosure_baseline"] = windowed["signal_id"].map(disclosure_prices)
+    # --- Pre-compute SPY data once (vectorized log returns) ---
+    spy_arrs = _price_arrays(prices_df, "SPY")
+    spy_dates_ns = None
+    spy_vals = None
+    spy_log_ret = None
+    if spy_arrs is not None and spy_arrs[0] is not None:
+        spy_dates_ns, spy_vals = spy_arrs
+        spy_log_ret = np.zeros(len(spy_vals), dtype=np.float64)
+        if len(spy_vals) > 1:
+            valid_spy = spy_vals[:-1] > 0
+            spy_log_ret[1:][valid_spy] = np.log(spy_vals[1:][valid_spy] / spy_vals[:-1][valid_spy])
 
-    windowed["days_from_disclosure"] = (windowed["price_date"] - windowed["disclosure_date"]).dt.days
-    windowed["decay_factor"] = np.exp(-decay_lambda * windowed["days_from_disclosure"])
+    # --- Pre-allocate result arrays ---
+    r_peak = np.full(n, np.nan, dtype=np.float64)
+    r_trough = np.full(n, np.nan, dtype=np.float64)
+    r_decayed_ret = np.zeros(n, dtype=np.float64)
+    r_disc_baseline = np.full(n, np.nan, dtype=np.float64)
+    r_last_price = np.full(n, np.nan, dtype=np.float64)
+    r_spy_cum = np.zeros(n, dtype=np.float64)
+    r_spy_wsum = np.zeros(n, dtype=np.float64)
+    r_spy_first = np.full(n, np.nan, dtype=np.float64)
+    r_spy_last = np.full(n, np.nan, dtype=np.float64)
 
-    # Incremental log-returns instead of cumulative returns
-    # This avoids double-counting: each day's contribution is independent
-    windowed = windowed.sort_values(["signal_id", "price_date"])
-    windowed["prev_price"] = windowed.groupby("signal_id")["price"].shift(1)
-    windowed["prev_days"] = windowed.groupby("signal_id")["days_from_disclosure"].shift(1)
-    # First observation per signal has no prior price — use 0 return
-    is_first = windowed["prev_price"].isna() | (windowed["prev_price"] == 0)
-    windowed["daily_log_return"] = np.where(
-        is_first, 0.0,
-        np.log(windowed["price"] / windowed["prev_price"])
-    )
-    # Adjust decay: weight by the midpoint between consecutive days
-    windowed["mid_decay"] = np.exp(-decay_lambda * (windowed["days_from_disclosure"] + windowed["prev_days"].fillna(0)) / 2)
-    windowed["weighted_return"] = windowed["daily_log_return"] * windowed["mid_decay"]
+    # --- Process per-ticker (avoids 75M+ row merge) ---
+    unique_tickers = np.unique(ticker_arr)
+    for ticker in unique_tickers:
+        if ticker == "SPY":
+            continue
+        arrs = _price_arrays(prices_df, str(ticker))
+        if arrs is None or arrs[0] is None:
+            continue
+        dates_ns, vals = arrs
 
-    if not spy_prices.empty:
-        windowed = windowed.merge(spy_prices, on="price_date", how="left")
-        # Incremental SPY log-returns
-        windowed["prev_spy"] = windowed.groupby("signal_id")["spy_price"].shift(1)
-        windowed["spy_daily_return"] = np.where(
-            windowed["prev_spy"].isna() | (windowed["prev_spy"] == 0), 0.0,
-            np.log(windowed["spy_price"] / windowed["prev_spy"])
+        # Get indices of signals for this ticker
+        tmask = ticker_arr == ticker
+        t_indices = np.where(tmask)[0]
+        if len(t_indices) == 0:
+            continue
+
+        _compute_ticker_signals(
+            t_indices,
+            disc_ns[t_indices],
+            end_ns[t_indices],
+            dates_ns,
+            vals,
+            spy_dates_ns,
+            spy_vals,
+            spy_log_ret,
+            decay_lambda,
+            r_peak, r_trough, r_decayed_ret, r_disc_baseline,
+            r_last_price, r_spy_cum, r_spy_wsum, r_spy_first, r_spy_last,
         )
-        windowed["weighted_spy_return"] = windowed["spy_daily_return"] * windowed["mid_decay"]
-        windowed["spy_decay_factor"] = windowed["mid_decay"].where(windowed["spy_daily_return"].notna())
-    else:
-        windowed["weighted_spy_return"] = 0.0
-        windowed["spy_price"] = np.nan
-        windowed["spy_decay_factor"] = windowed["decay_factor"]
 
-    # --- Main aggregation (no lambdas) ---
-    agg = windowed.groupby("signal_id").agg(
-        peak_price=("price", "max"),
-        trough_price=("price", "min"),
-        decayed_return=("weighted_return", "sum"),
-        weight_sum=("decay_factor", "sum"),
-        disclosure_price_first=("disclosure_baseline", "first"),
-        last_price=("price", "last"),
-    )
-    # Normalize by weight sum for proper decay-weighted average
-    agg["decayed_return"] = agg["decayed_return"] / agg["weight_sum"]
+    # --- Derived columns (vectorized) ---
+    valid_disc = (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
+    total_return = np.zeros(n, dtype=np.float64)
+    total_return[valid_disc] = r_last_price[valid_disc] / r_disc_baseline[valid_disc] - 1
 
-    # --- SPY aggregation on pre-filtered rows (vectorized, no lambdas) ---
-    spy_valid = windowed.dropna(subset=["spy_price"])
-    if not spy_valid.empty:
-        spy_agg = spy_valid.groupby("signal_id").agg(
-            spy_cumulative=("weighted_spy_return", "sum"),
-            spy_weight_sum=("spy_decay_factor", "sum"),
-            spy_first_price=("spy_price", "first"),
-            spy_last_price=("spy_price", "last"),
-        )
-        # min_count=1 semantics: sum returns 0 for all-NaN groups, but those
-        # groups don't exist here because we pre-filtered on spy_price.notna().
-        # If a signal_id is missing from spy_valid, it stays NaN after join.
-        agg = agg.join(spy_agg, how="left")
-    else:
-        agg["spy_cumulative"] = 0.0
-        agg["spy_weight_sum"] = 0.0
-        agg["spy_first_price"] = np.nan
-        agg["spy_last_price"] = np.nan
-    agg["spy_cumulative"] = np.where(
-        agg["spy_weight_sum"].fillna(0) > 0,
-        agg["spy_cumulative"].fillna(0) / agg["spy_weight_sum"].fillna(0),
-        0.0,
-    )
-    agg["total_return"] = (agg["last_price"] / agg["disclosure_price_first"] - 1)
-    agg["actual_spy_return"] = np.where(
-        agg["spy_first_price"].notna() & (agg["spy_first_price"] != 0),
-        agg["spy_last_price"] / agg["spy_first_price"] - 1,
-        0.0,
-    )
-    agg = agg.reset_index()
+    valid_spy = (r_spy_first > 0) & np.isfinite(r_spy_first)
+    actual_spy_return = np.zeros(n, dtype=np.float64)
+    actual_spy_return[valid_spy] = r_spy_last[valid_spy] / r_spy_first[valid_spy] - 1
 
-    final = signals.merge(
-        agg[["signal_id", "peak_price", "trough_price", "decayed_return", "spy_cumulative", "actual_spy_return", "total_return", "disclosure_price_first"]],
-        on="signal_id", how="left"
-    )
+    spy_cum = np.where(r_spy_wsum > 0, r_spy_cum / np.maximum(r_spy_wsum, 1e-15), 0.0)
 
-    is_purchase = final["transaction_type"] == TransactionType.PURCHASE.value
-    has_disclosure_price = final["disclosure_price_first"].notna() & (final["disclosure_price_first"] != 0)
-    purchase_mask = is_purchase & has_disclosure_price
-    sale_mask = ~is_purchase & (final["trough_price"].notna()) & (final["trough_price"] != 0)
+    # Peak potential
+    is_purchase = txn_types == TransactionType.PURCHASE.value
+    purchase_mask = is_purchase & valid_disc
+    sale_mask = ~is_purchase & (r_trough > 0) & np.isfinite(r_trough)
 
-    peak_potential = np.zeros(len(final))
-    peak_potential[purchase_mask.values] = (
-        (final.loc[purchase_mask.values, "peak_price"] / final.loc[purchase_mask.values, "disclosure_price_first"] - 1) * 100
-    ).values
-    peak_potential[sale_mask.values] = (
-        (final.loc[sale_mask.values, "entry_price"] / final.loc[sale_mask.values, "trough_price"] - 1) * 100
-    ).values
+    peak_potential = np.zeros(n, dtype=np.float64)
+    peak_potential[purchase_mask] = (r_peak[purchase_mask] / r_disc_baseline[purchase_mask] - 1) * 100
+    peak_potential[sale_mask] = (entry_prices_arr[sale_mask] / r_trough[sale_mask] - 1) * 100
 
-    optional_columns = [column for column in ["owner_code", "amount_midpoint"] if column in final.columns]
+    # --- Assemble output DataFrame ---
+    optional_columns = [col for col in ["owner_code", "amount_midpoint"] if col in signals.columns]
     result_columns = [
         "member", "ticker", "disclosure_date", "signal_type", "horizon_days", "entry_price",
         "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct", "total_return_pct",
         "total_spy_alpha_pct", "decayed_spy_return_pct", *optional_columns,
     ]
 
-    return final.assign(
-        signal_type=final["transaction_type"],
-        peak_potential_pct=peak_potential,
-        decayed_return_pct=final["decayed_return"].values * 100,
-        spy_alpha_pct=(final["decayed_return"] - final["spy_cumulative"]).values * 100,
-        total_return_pct=final["total_return"].values * 100,
-        total_spy_alpha_pct=(final["total_return"] - final["actual_spy_return"]).values * 100,
-        decayed_spy_return_pct=final["spy_cumulative"].values * 100,
-    )[result_columns]
+    result_data = {
+        "member": signals["member"].values,
+        "ticker": ticker_arr,
+        "disclosure_date": signals["disclosure_date"].values,
+        "signal_type": txn_types,
+        "horizon_days": horizon_days_arr,
+        "entry_price": entry_prices_arr,
+        "peak_potential_pct": peak_potential,
+        "decayed_return_pct": r_decayed_ret * 100,
+        "spy_alpha_pct": (r_decayed_ret - spy_cum) * 100,
+        "total_return_pct": total_return * 100,
+        "total_spy_alpha_pct": (total_return - actual_spy_return) * 100,
+        "decayed_spy_return_pct": spy_cum * 100,
+    }
+    for col in optional_columns:
+        result_data[col] = signals[col].values
+
+    return pd.DataFrame(result_data)[result_columns]
 
 
 def get_top_signals(signal_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:

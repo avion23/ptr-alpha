@@ -1,5 +1,4 @@
 import unittest
-from math import exp, log
 
 import numpy as np
 import pandas as pd

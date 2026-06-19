@@ -84,9 +84,10 @@ def _conviction_score(trades: pd.DataFrame) -> float:
 def _compute_ticker_member_performance(
     signals_df: pd.DataFrame, ticker: str, horizon: int
 ) -> dict[str, tuple[float, int]]:
-    """Per-member win rate on a specific ticker from historical signals.
+    """Per-member Bayesian-shrunk win rate on a specific ticker from historical signals.
 
-    Returns {member: (win_rate, trade_count)} for members with >= TICKER_PERF_MIN_TRADES trades.
+    Returns {member: (shrunk_win_rate, trade_count)} for members with >= 1 trade.
+    Uses Bayesian shrinkage toward global prior instead of raw win-rate penalty.
     """
     if signals_df.empty or "ticker" not in signals_df.columns:
         return {}
@@ -99,13 +100,25 @@ def _compute_ticker_member_performance(
     if purchases.empty:
         return {}
 
+    # Global prior from all purchase signals
+    all_purchases = signals_df[
+        (signals_df["horizon_days"] == horizon)
+        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
+    ]
+    all_returns = all_purchases["decayed_return_pct"].dropna()
+    global_win_rate = float((all_returns > 0).mean()) if len(all_returns) > 0 else 0.5
+    prior_strength = BAYES_PRIOR_STRENGTH  # 20 pseudo-observations
+
     result: dict[str, tuple[float, int]] = {}
     for member, grp in purchases.groupby("member"):
         returns = grp["decayed_return_pct"].dropna()
-        if len(returns) < TICKER_PERF_MIN_TRADES:
+        if len(returns) == 0:
             continue
-        win_rate = float((returns > 0).mean())
-        result[member] = (win_rate, len(returns))
+        wins = int((returns > 0).sum())
+        n = len(returns)
+        # Bayesian shrinkage: pull toward global win rate
+        shrunk_wr = (global_win_rate * prior_strength + wins) / (prior_strength + n)
+        result[member] = (shrunk_wr, n)
     return result
 
 
@@ -116,7 +129,6 @@ def _compute_member_stats(
     threshold: float | None = None,
     invert_returns: bool = False,
 ) -> dict | None:
-    from analyzer.signals import BAYES_PRIOR_STRENGTH
 
     rets = grp["decayed_return_pct"].dropna().values
     if len(rets) == 0:
@@ -381,9 +393,9 @@ def score_ticker_by_buyers(
         weight_total = 0.0
         for member in buyer_stats["member"]:
             if member in ticker_perf:
-                win_rate, _ = ticker_perf[member]
-                n = member_trade_counts.get(member, 1)
-                weighted_sum += win_rate * n
+                shrunk_wr, n = ticker_perf[member]
+                # Weight by trade count (more data = more weight on shrunk rate)
+                weighted_sum += shrunk_wr * n
                 weight_total += n
         ticker_perf_factor = weighted_sum / weight_total if weight_total > 0 else 1.0
     else:

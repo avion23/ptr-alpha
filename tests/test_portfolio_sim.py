@@ -1,16 +1,13 @@
 """Tests for portfolio simulation module."""
 
 import unittest
-from datetime import date, timedelta
+from datetime import date
 from unittest.mock import patch
 
-import numpy as np
 import pandas as pd
 
 from analyzer.portfolio_sim import (
     PortfolioConfig,
-    PortfolioPosition,
-    PortfolioSnapshot,
     PortfolioSimulator,
 )
 

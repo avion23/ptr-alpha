@@ -10,7 +10,6 @@ from analyzer.analysis import (
     summarize_backtest,
     _price_at_or_before,
 )
-from analyzer.exceptions import AnalysisError
 
 from .conftest import DatabaseTestCase
 

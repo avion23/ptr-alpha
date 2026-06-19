@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -373,7 +373,7 @@ def print_matched_control_summary(results: pd.DataFrame) -> None:
 
     # By sector
     if "sector" in valid.columns and valid["sector"].nunique() > 1:
-        print(f"\n--- By Sector ---")
+        print("\n--- By Sector ---")
         sector_summary = valid.groupby("sector").agg(
             n=("excess_alpha", "size"),
             mean_excess=("excess_alpha", "mean"),
@@ -383,7 +383,7 @@ def print_matched_control_summary(results: pd.DataFrame) -> None:
 
     # By rank
     if "rank" in valid.columns and valid["rank"].nunique() > 1:
-        print(f"\n--- By Rank ---")
+        print("\n--- By Rank ---")
         rank_summary = valid.groupby("rank").agg(
             n=("excess_alpha", "size"),
             mean_excess=("excess_alpha", "mean"),

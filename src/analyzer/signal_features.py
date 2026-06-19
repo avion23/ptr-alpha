@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 
-import numpy as np
 import pandas as pd
 
 
@@ -210,7 +209,7 @@ def estimate_crash_hazard(
     # VaR and CVaR (parametric normal approximation)
     # Use vol to scale the tail
     vol = max(features.volatility_20d, 0.05)  # floor at 5%
-    var_95 = expected_return - 1.645 * vol / math.sqrt(252) * 120  # ~120d horizon
+    var_95 = expected_return - 1.645 * (vol / math.sqrt(252)) * math.sqrt(120)  # 120d horizon, sqrt(T) scaling
     cvar_95 = var_95 * 1.25  # CVaR is worse than VaR
 
     return CrashHazard(

@@ -253,20 +253,7 @@ def portfolio(
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
-    from analyzer.pipeline import BacktestParams, run_backtest_pipeline
     from analyzer.portfolio_sim import PortfolioSimulator, PortfolioConfig
-
-    params = BacktestParams(
-        start_date=start_date,
-        end_date=end_date,
-        horizon=horizon,
-        lookback_days=lookback_days,
-        training_lookback_days=training_lookback_days,
-        min_buyers=min_buyers,
-        top_n=top_n,
-        threshold=threshold,
-        frequency_days=frequency_days,
-    )
 
     # Collect all backtest recommendations (reuse existing pipeline logic)
     from datetime import timedelta
@@ -341,7 +328,7 @@ def portfolio(
 
     metrics = sim.compute_metrics(prices)
     if metrics:
-        print(f"\n=== Performance Metrics ===")
+        print("\n=== Performance Metrics ===")
         print(f"  Total return:       {metrics['total_return_pct']:.2f}%")
         print(f"  Annualized return:  {metrics['annualized_return_pct']:.2f}%")
         print(f"  Sharpe ratio:       {metrics['sharpe_ratio']:.3f}")
@@ -354,7 +341,7 @@ def portfolio(
         if metrics.get("spy_return_pct") is not None:
             print(f"  SPY buy-and-hold:   {metrics['spy_return_pct']:.2f}%")
         if metrics.get("sector_concentration"):
-            print(f"\n=== Sector Concentration ===")
+            print("\n=== Sector Concentration ===")
             for sector, pct in sorted(metrics["sector_concentration"].items(), key=lambda x: -x[1]):
                 print(f"  {sector}: {pct:.1f}%")
 

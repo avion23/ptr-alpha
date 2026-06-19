@@ -226,7 +226,7 @@ class HouseTransactionSource(TransactionSource):
         existing_docs = ptrs[exists_mask]
         member_lookup = dict(zip(
             existing_docs["DocID"].values,
-            [{"First": f, "Last": l, "FilingDate": d} for f, l, d in zip(
+            [{"First": f, "Last": last, "FilingDate": d} for f, last, d in zip(
                 existing_docs["First"].values, existing_docs["Last"].values, existing_docs["FilingDate"].values
             )]
         ))
@@ -294,11 +294,9 @@ class YFinancePriceSource(PriceSource):
         raw_to_yf: dict[str, str] = {r.raw_ticker: r.price_symbol for r in resolutions.values()}
         # Reverse mapping: yfinance symbol -> raw_ticker (for renaming back)
         yf_to_raw: dict[str, str] = {}
-        for raw, yf in raw_to_yf.items():
-            if yf not in yf_to_raw:
-                yf_to_raw[yf] = raw
-
-        resolved_tickers = sorted(set(raw_to_yf.values()))
+        for raw, sym in raw_to_yf.items():
+            if sym not in yf_to_raw:
+                yf_to_raw[sym] = raw
 
         # Log resolutions
         for r in resolutions.values():
@@ -359,14 +357,25 @@ class YFinancePriceSource(PriceSource):
         new_prices = new_prices.dropna(axis=1, how="all")
 
         # Rename columns from yfinance symbols back to raw tickers for storage
-        rename_map = {yf: raw for yf, raw in yf_to_raw.items() if yf in new_prices.columns}
+        # Build reverse mapping: yfinance symbol -> list of raw tickers
+        yf_to_raws: dict[str, list[str]] = {}
+        for raw, sym in raw_to_yf.items():
+            yf_to_raws.setdefault(sym, []).append(raw)
+        # Only rename when yfinance symbol maps to exactly one raw ticker
+        rename_map = {
+            sym: raws[0]
+            for sym, raws in yf_to_raws.items()
+            if sym in new_prices.columns and len(raws) == 1
+        }
         new_prices = new_prices.rename(columns=rename_map)
 
         if self.db.is_read_only:
             logger.info(
                 f"Read-only mode: merging {len(new_prices.columns)} fetched tickers with cache"
             )
+            # Drop duplicate columns (keep cached, fill gaps from new)
             merged = pd.concat([cached_prices, new_prices], axis=1)
+            merged = merged.loc[:, ~merged.columns.duplicated(keep="first")]
             merged = merged[~merged.index.duplicated(keep="last")]
             prices = merged
         else:

@@ -17,8 +17,9 @@ BUYER_RECENCY_DECAY = 0.03
 TICKER_PERF_MIN_TRADES = 3
 
 MIN_ENTRY_PRICE = 3.0
-CONVICTION_WEIGHT_ALPHA = 0.6
-CONVICTION_WEIGHT_REALIZED = 0.4
+# Use pure SPY alpha as signal score — avoids double-counting stock return
+CONVICTION_WEIGHT_ALPHA = 1.0
+CONVICTION_WEIGHT_REALIZED = 0.0
 
 
 def _price_at_or_before(
@@ -278,21 +279,36 @@ def calculate_signal_potential(
 
     windowed["days_from_disclosure"] = (windowed["price_date"] - windowed["disclosure_date"]).dt.days
     windowed["decay_factor"] = np.exp(-decay_lambda * windowed["days_from_disclosure"])
-    windowed["weighted_return"] = (windowed["price"] / windowed["disclosure_baseline"] - 1) * windowed["decay_factor"]
+
+    # Incremental log-returns instead of cumulative returns
+    # This avoids double-counting: each day's contribution is independent
+    windowed = windowed.sort_values(["signal_id", "price_date"])
+    windowed["prev_price"] = windowed.groupby("signal_id")["price"].shift(1)
+    windowed["prev_days"] = windowed.groupby("signal_id")["days_from_disclosure"].shift(1)
+    # First observation per signal has no prior price — use 0 return
+    is_first = windowed["prev_price"].isna() | (windowed["prev_price"] == 0)
+    windowed["daily_log_return"] = np.where(
+        is_first, 0.0,
+        np.log(windowed["price"] / windowed["prev_price"])
+    )
+    # Adjust decay: weight by the midpoint between consecutive days
+    windowed["mid_decay"] = np.exp(-decay_lambda * (windowed["days_from_disclosure"] + windowed["prev_days"].fillna(0)) / 2)
+    windowed["weighted_return"] = windowed["daily_log_return"] * windowed["mid_decay"]
 
     if not spy_prices.empty:
         windowed = windowed.merge(spy_prices, on="price_date", how="left")
-        first_spy_idx = windowed.dropna(subset=["spy_price"]).groupby("signal_id")["price_date"].idxmin()
-        spy_entry_prices = windowed.loc[first_spy_idx].set_index("signal_id")["spy_price"]
-        windowed["spy_return"] = windowed["spy_price"] / windowed["signal_id"].map(spy_entry_prices) - 1
+        # Incremental SPY log-returns
+        windowed["prev_spy"] = windowed.groupby("signal_id")["spy_price"].shift(1)
+        windowed["spy_daily_return"] = np.where(
+            windowed["prev_spy"].isna() | (windowed["prev_spy"] == 0), 0.0,
+            np.log(windowed["spy_price"] / windowed["prev_spy"])
+        )
+        windowed["weighted_spy_return"] = windowed["spy_daily_return"] * windowed["mid_decay"]
+        windowed["spy_decay_factor"] = windowed["mid_decay"].where(windowed["spy_daily_return"].notna())
     else:
-        windowed["spy_return"] = 0.0
+        windowed["weighted_spy_return"] = 0.0
         windowed["spy_price"] = np.nan
-
-    windowed["weighted_spy_return"] = windowed["spy_return"] * windowed["decay_factor"]
-    windowed["spy_decay_factor"] = windowed["decay_factor"].where(windowed["spy_return"].notna())
-
-    windowed = windowed.sort_values(["signal_id", "price_date"])
+        windowed["spy_decay_factor"] = windowed["decay_factor"]
 
     agg = windowed.groupby("signal_id").agg(
         peak_price=("price", "max"),
@@ -306,8 +322,13 @@ def calculate_signal_potential(
         spy_first_price=("spy_price", lambda v: v.dropna().iloc[0] if not v.dropna().empty else np.nan),
         spy_last_price=("spy_price", lambda v: v.dropna().iloc[-1] if not v.dropna().empty else np.nan),
     )
+    # Normalize by weight sum for proper decay-weighted average
     agg["decayed_return"] = agg["decayed_return"] / agg["weight_sum"]
-    agg["spy_cumulative"] = agg["spy_cumulative"] / agg["spy_weight_sum"]
+    agg["spy_cumulative"] = np.where(
+        agg["spy_weight_sum"] > 0,
+        agg["spy_cumulative"] / agg["spy_weight_sum"],
+        0.0,
+    )
     agg["total_return"] = (agg["last_price"] / agg["disclosure_price_first"] - 1)
     agg["actual_spy_return"] = np.where(
         agg["spy_first_price"].notna() & (agg["spy_first_price"] != 0),

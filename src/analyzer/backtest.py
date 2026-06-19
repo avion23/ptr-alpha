@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from analyzer.exceptions import AnalysisError
@@ -24,7 +23,7 @@ def _compute_ticker_entry_value(
     Falls back to global prior (average across all tickers) if ticker has
     no prior disclosure history.
     """
-    from analyzer.return_process import compute_entry_value, fit_ou
+    from analyzer.return_process import compute_entry_value
 
     ticker_col = ticker in prices_df.columns if hasattr(prices_df, 'columns') else False
 
@@ -172,37 +171,42 @@ def backtest_recommendations(
             # Use the most recent transaction date for this ticker
             ticker_recent = recent_trades[recent_trades["ticker"] == ticker]
             if not ticker_recent.empty and prices_df is not None:
-                latest_tx = ticker_recent.sort_values("disclosure_date").iloc[-1]
-                tx_date = latest_tx.get("transaction_date")
-                if tx_date is not None:
-                    tx_date = pd.Timestamp(tx_date).date()
-                disc_date = pd.Timestamp(latest_tx["disclosure_date"]).date()
+                try:
+                    latest_tx = ticker_recent.sort_values("disclosure_date").iloc[-1]
+                    tx_date = latest_tx.get("transaction_date")
+                    if tx_date is not None:
+                        tx_date = pd.Timestamp(tx_date).date()
+                    disc_date = pd.Timestamp(latest_tx["disclosure_date"]).date()
 
-                features = compute_signal_features(
-                    ticker=ticker,
-                    disclosure_date=disc_date,
-                    transaction_date=tx_date,
-                    prices_df=prices_df,
-                    all_tx=recent_trades,
-                    as_of_date=as_of_date.date() if hasattr(as_of_date, 'date') else as_of_date,
-                )
-                crash = estimate_crash_hazard(features)
+                    features = compute_signal_features(
+                        ticker=ticker,
+                        disclosure_date=disc_date,
+                        transaction_date=tx_date,
+                        prices_df=prices_df,
+                        all_tx=recent_trades,
+                        as_of_date=as_of_date.date() if hasattr(as_of_date, 'date') else as_of_date,
+                    )
+                    crash = estimate_crash_hazard(features)
 
-                # Apply lag weight
-                lag_weight = compute_disclosure_lag_weight(features.lag_days)
-                base_score = float(score["signal_score"].iloc[0])
-                adjusted_score = base_score * lag_weight
+                    # Apply lag weight
+                    lag_weight = compute_disclosure_lag_weight(features.lag_days)
+                    base_score = float(score["signal_score"].iloc[0])
+                    adjusted_score = base_score * lag_weight
 
-                # Apply crash penalty
-                adjusted_score *= (1 - crash.crash_prob)
+                    # Apply crash penalty (only if crash_prob is reasonable)
+                    if 0.0 <= crash.crash_prob <= 1.0:
+                        adjusted_score *= (1 - crash.crash_prob)
 
-                score["signal_score"] = round(adjusted_score, 2)
-                score["lag_days"] = features.lag_days
-                score["lag_weight"] = round(lag_weight, 4)
-                score["crash_prob"] = crash.crash_prob
-                score["crash_var_95"] = crash.var_95
-                score["volatility_20d"] = round(features.volatility_20d, 4)
-                score["drawdown_from_ath"] = round(features.drawdown_from_ath, 4)
+                    score["signal_score"] = round(adjusted_score, 2)
+                    score["lag_days"] = features.lag_days
+                    score["lag_weight"] = round(lag_weight, 4)
+                    score["crash_prob"] = crash.crash_prob
+                    score["crash_var_95"] = crash.var_95
+                    score["volatility_20d"] = round(features.volatility_20d, 4)
+                    score["drawdown_from_ath"] = round(features.drawdown_from_ath, 4)
+                except Exception:
+                    # Crash hazard estimation can fail on edge cases — keep base score
+                    pass
 
             scores.append(score)
         except AnalysisError:
@@ -223,6 +227,8 @@ def evaluate_backtest(
     as_of_date: pd.Timestamp,
     horizon: int,
     max_staleness_days: int | None = 30,
+    entry_slippage_bps: float = 10.0,
+    exit_slippage_bps: float = 10.0,
 ) -> pd.DataFrame:
     if recommendations.empty:
         return recommendations
@@ -230,21 +236,26 @@ def evaluate_backtest(
     exit_date = as_of_date + pd.Timedelta(days=horizon)
 
     spy_start = _price_at_or_before(prices_df, "SPY", as_of_date, max_staleness_days)
-    spy_end = _price_on_or_before(prices_df, "SPY", exit_date)
+    spy_end = _price_on_or_before(prices_df, "SPY", exit_date, max_staleness_days=30)
     if not spy_start or not spy_end:
         raise AnalysisError(
             f"SPY price not available for backtest period "
             f"(as_of={as_of_date.date()}, exit={exit_date.date()})"
         )
+    spy_start *= (1 + entry_slippage_bps / 10000)
+    spy_end *= (1 - exit_slippage_bps / 10000)
     spy_return_pct = (spy_end / spy_start - 1) * 100
 
     rows = []
     for _, rec in recommendations.iterrows():
         ticker = rec["ticker"]
         entry = _price_at_or_before(prices_df, ticker, as_of_date, max_staleness_days)
-        exit_price = _price_on_or_before(prices_df, ticker, exit_date)
+        exit_price = _price_on_or_before(prices_df, ticker, exit_date, max_staleness_days=30)
         if not entry or not exit_price:
             continue
+        # Apply slippage
+        entry *= (1 + entry_slippage_bps / 10000)
+        exit_price *= (1 - exit_slippage_bps / 10000)
         return_pct = (exit_price / entry - 1) * 100
         alpha_pct = return_pct - spy_return_pct
         rows.append({

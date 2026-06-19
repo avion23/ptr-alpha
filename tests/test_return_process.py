@@ -1,7 +1,6 @@
 """Tests for the OU return process model."""
 
 import numpy as np
-import pytest
 
 from analyzer.return_process import (
     OUParams,

@@ -245,7 +245,7 @@ def run_backtest_pipeline(
 
     # Create price snapshot for reproducibility
     snapshot = create_snapshot(transaction_source.db, all_tickers, price_start, price_end)
-    print(f"\n=== Price Snapshot ===")
+    print("\n=== Price Snapshot ===")
     print(f"  Snapshot ID:  {snapshot.snapshot_id}")
     print(f"  Created:      {snapshot.created_at}")
     print(f"  Git SHA:      {snapshot.git_sha[:12]}")
@@ -256,7 +256,7 @@ def run_backtest_pipeline(
     print(f"  Price rows:   {snapshot.price_rows}")
     print(f"  Date range:   {snapshot.first_date} to {snapshot.last_date}")
 
-    prices = transaction_source.db.get_prices(all_tickers, price_start, price_end)
+    prices = price_source.get_prices(all_tickers, price_start, price_end)
 
     if prices.empty:
         raise DataSourceError("No price data available for backtest window")

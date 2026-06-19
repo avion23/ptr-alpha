@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.analysis import TransactionType, _collapse_to_episodes
-from analyzer.exceptions import AnalysisError
+from analyzer.signals import BAYES_PRIOR_STRENGTH
 
 
 @dataclass
@@ -116,8 +116,8 @@ def _compute_member_sector_skills(
 
 def estimate_member_skills(
     signals_df: pd.DataFrame,
-    min_episodes: int = 3,
-    prior_strength: float = 5.0,
+    min_episodes: int = 1,
+    prior_strength: float | None = None,
     recency_half_life_days: int = 365,
     horizon: int = 90,
     ref_date: pd.Timestamp | None = None,
@@ -135,9 +135,13 @@ def estimate_member_skills(
             spy_alpha_pct.
         min_episodes: Minimum episodes required to include a member.
         prior_strength: Strength of the prior (pseudo-observations).
+            Defaults to BAYES_PRIOR_STRENGTH (20) for consistency with
+            member_ranking module.
         recency_half_life_days: Half-life for recency weighting in days.
         horizon: Horizon in days to filter signals.
-        ref_date: Reference date for recency weighting (default: now).
+        ref_date: Reference date for recency weighting. MUST be provided
+            for backtesting to avoid look-ahead bias. Defaults to now()
+            only for live analysis.
 
     Returns:
         Mapping of member name to MemberSkillPosterior.
@@ -145,6 +149,8 @@ def estimate_member_skills(
     if signals_df.empty:
         return {}
 
+    if prior_strength is None:
+        prior_strength = BAYES_PRIOR_STRENGTH  # 20, unified with member_ranking
     if ref_date is None:
         ref_date = pd.Timestamp.now()
     raw = _compute_member_raw_alphas(

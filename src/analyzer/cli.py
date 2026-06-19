@@ -400,6 +400,40 @@ def snapshot(
     raise typer.Exit(0)
 
 
+@app.command()
+def fetch_capitol(
+    ctx: typer.Context,
+    politician: str | None = typer.Option(None, help="Fetch trades for a specific politician"),
+    all: bool = typer.Option(False, "--all", help="Fetch all recent trades"),
+    chamber: str | None = typer.Option(None, help="Filter by chamber (house/senate)"),
+    start: str | None = typer.Option(None, help="Start date filter (YYYY-MM-DD)"),
+    end: str | None = typer.Option(None, help="End date filter (YYYY-MM-DD)"),
+    data_dir: str = typer.Option("data", help="Data directory"),
+):
+    """Fetch congressional trades from Capitol Trades API (backup data source)."""
+    from analyzer.capitol_trades import CapitolTradesSource
+
+    if not politician and not all:
+        print("Error: specify --politician NAME or --all", file=sys.stderr)
+        raise typer.Exit(1)
+
+    start_date = date.fromisoformat(start) if start else None
+    end_date = date.fromisoformat(end) if end else None
+
+    capitol = CapitolTradesSource(data_dir=data_dir, read_only=False)
+    try:
+        if politician:
+            count = capitol.fetch_and_save_politician(politician, start_date, end_date)
+            print(f"Saved {count} trades for {politician}")
+        else:
+            count = capitol.fetch_and_save_all(start_date, end_date, chamber)
+            print(f"Saved {count} trades from Capitol Trades API")
+    finally:
+        capitol.close()
+
+    raise typer.Exit(0)
+
+
 def main():
     try:
         app()

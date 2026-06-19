@@ -450,18 +450,20 @@ def score_ticker_by_buyers(
         best_rank = buyer_stats["avg_spy_alpha_pct"].max()
         total_trades = buyer_stats["purchase_trades"].sum()
         rated_buyers = len(buyer_stats)
-        confidence_weights = np.sqrt(buyer_stats["purchase_trades"].clip(lower=1).astype(float).values)
-        if "bayes_win_prob" in buyer_stats.columns:
-            confidence_weights *= buyer_stats["bayes_win_prob"].fillna(0.55).astype(float).values
+        # Use shrunk_alpha (Bayesian-shrunk) instead of raw avg_spy_alpha_pct
+        # Recency weighting only — skill already baked into shrunk_alpha
+        alpha_col = "shrunk_alpha" if "shrunk_alpha" in buyer_stats.columns else "avg_spy_alpha_pct"
+        confidence_weights = np.ones(len(buyer_stats), dtype=float)
         if "disclosure_date" in ticker_trades.columns:
             rated_ticker_trades = ticker_trades[ticker_trades["member"].isin(buyer_stats["member"])]
-            latest_disclosure = rated_ticker_trades["disclosure_date"].max()
-            member_disclosures = rated_ticker_trades.groupby("member")["disclosure_date"].max()
-            days_since = (latest_disclosure - member_disclosures.reindex(buyer_stats["member"])).dt.days.fillna(0).clip(lower=0)
-            confidence_weights *= np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.values)
+            if not rated_ticker_trades.empty:
+                latest_disclosure = rated_ticker_trades["disclosure_date"].max()
+                member_disclosures = rated_ticker_trades.groupby("member")["disclosure_date"].max()
+                days_since = (latest_disclosure - member_disclosures.reindex(buyer_stats["member"])).dt.days.fillna(0).clip(lower=0)
+                confidence_weights = np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.values)
         confidence_weight_sum = confidence_weights.sum()
         quality_adjusted_avg = (
-            (buyer_stats["avg_spy_alpha_pct"].values * confidence_weights).sum() / confidence_weight_sum
+            (buyer_stats[alpha_col].values * confidence_weights).sum() / confidence_weight_sum
             if confidence_weight_sum > 0
             else 0
         )
@@ -471,27 +473,11 @@ def score_ticker_by_buyers(
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
 
-    perf_source = ticker_perf_signals if ticker_perf_signals is not None else signals_df
-    # _compute_ticker_member_performance is @df_memoize'd; its cache key is
-    # (perf_source id, ticker, horizon, _bayes_prior_strength).
-    ticker_perf = _compute_ticker_member_performance(
-        perf_source, ticker, horizon, _bayes_prior_strength=bayes_prior,
-    )
-    if ticker_perf and not buyer_stats.empty:
-        member_trade_counts = ticker_trades.groupby("member").size()
-        weighted_sum = 0.0
-        weight_total = 0.0
-        for member in buyer_stats["member"]:
-            if member in ticker_perf:
-                shrunk_wr, n = ticker_perf[member]
-                # Weight by trade count (more data = more weight on shrunk rate)
-                weighted_sum += shrunk_wr * n
-                weight_total += n
-        ticker_perf_factor = weighted_sum / weight_total if weight_total > 0 else 1.0
-    else:
-        ticker_perf_factor = 1.0
+    # ticker_perf_factor removed — it was inversely correlated with future returns.
+    # Skill is already captured in shrunk_alpha via member rankings.
+    ticker_perf_factor = 1.0
 
-    signal_score = base_signal_score * size_factor * owner_factor * ticker_perf_factor
+    signal_score = base_signal_score * size_factor * owner_factor
     if apply_solo_penalty:
         signal_score *= solo_buyer_penalty
 

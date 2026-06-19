@@ -252,15 +252,18 @@ class TestAnalysis(unittest.TestCase):
 
         score = score_ticker_by_buyers('AAPL', transactions, signals, member_rankings=member_rankings)
 
-        alice_weight = np.sqrt(3) * np.exp(-0.03)
-        charlie_weight = np.sqrt(2)
+        # New: recency-only weights (no sqrt-trades, no bayes_win_prob multiplication)
+        # Alice disclosed 2024-01-01, Charlie 2024-01-02 → latest = Jan 2
+        # Alice: 1 day since latest, Charlie: 0 days since
+        alice_weight = np.exp(-0.03 * 1)
+        charlie_weight = np.exp(-0.03 * 0)  # = 1.0
         quality_weighted_sum = 10.0 * alice_weight + 20.0 * charlie_weight
         quality_adjusted_avg = quality_weighted_sum / (alice_weight + charlie_weight)
         self.assertEqual(score.iloc[0]['num_buyers'], 3)
         self.assertEqual(score.iloc[0]['rated_buyers'], 2)
         self.assertEqual(score.iloc[0]['base_signal_score'], round(quality_adjusted_avg, 2))
 
-    def test_score_ticker_by_buyers_uses_sqrt_confidence_not_trade_count_dominance(self):
+    def test_score_ticker_by_buyers_uses_recency_weights_not_trade_count(self):
         transactions = pd.DataFrame({
             'member': ['Focused', 'NoiseBot'],
             'ticker': ['AAPL', 'AAPL'],
@@ -286,8 +289,13 @@ class TestAnalysis(unittest.TestCase):
 
         score = score_ticker_by_buyers('AAPL', transactions, signals, member_rankings=member_rankings)
 
-        self.assertGreater(score.iloc[0]['avg_buyer_performance'], 3.0)
-        self.assertLess(score.iloc[0]['avg_buyer_performance'], 8.0)
+        # With recency-only weights, avg_buyer_performance is a recency-weighted
+        # average of avg_spy_alpha_pct. Focused disclosed Jan 1 (1 day old),
+        # NoiseBot Jan 2 (0 days old). No sqrt-trades or bayes_win_prob weighting.
+        focused_w = np.exp(-0.03 * 1)
+        noisebot_w = np.exp(-0.03 * 0)
+        expected_avg = (18.0 * focused_w + 3.0 * noisebot_w) / (focused_w + noisebot_w)
+        self.assertAlmostEqual(score.iloc[0]['avg_buyer_performance'], round(expected_avg, 2))
 
     def test_rank_members_skips_members_with_all_nan_returns(self):
         signals = pd.DataFrame({

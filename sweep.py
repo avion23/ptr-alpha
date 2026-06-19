@@ -22,8 +22,6 @@ from analyzer.database import Database
 from analyzer import analysis
 from analyzer.pipeline import BacktestParams
 from analyzer import signals as signals_mod
-from analyzer import member_ranking as mr_mod
-from analyzer import member_skill as ms_mod
 
 
 @dataclass
@@ -60,8 +58,6 @@ def run_single_backtest(
     old_decay = signals_mod.DECAY_LAMBDA
     signals_mod.BAYES_PRIOR_STRENGTH = bayes_prior_strength
     signals_mod.DECAY_LAMBDA = decay_lambda
-    mr_mod.BAYES_PRIOR_STRENGTH = bayes_prior_strength
-    ms_mod.BAYES_PRIOR_STRENGTH = bayes_prior_strength
 
     try:
         as_of_dates = pd.date_range(
@@ -148,8 +144,6 @@ def run_single_backtest(
     finally:
         signals_mod.BAYES_PRIOR_STRENGTH = old_bayes
         signals_mod.DECAY_LAMBDA = old_decay
-        mr_mod.BAYES_PRIOR_STRENGTH = old_bayes
-        ms_mod.BAYES_PRIOR_STRENGTH = old_bayes
 
 
 def main():

@@ -69,3 +69,8 @@ config.toml
 
 # Ralph loop state
 .opencode/
+
+# Build/profiling artifacts
+CodeResources
+profile_sweep.py
+uv.lock

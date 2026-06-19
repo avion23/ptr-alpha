@@ -426,11 +426,10 @@ def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, f
         return {}
     if "bayes_win_prob" not in member_rankings.columns:
         return {}
-    return {
-        row["member"]: float(row["bayes_win_prob"])
-        for _, row in member_rankings[["member", "bayes_win_prob"]].iterrows()
-        if pd.notna(row["bayes_win_prob"])
-    }
+    # Vectorized — no iterrows
+    valid = member_rankings["bayes_win_prob"].notna()
+    subset = member_rankings.loc[valid, ["member", "bayes_win_prob"]]
+    return dict(zip(subset["member"], subset["bayes_win_prob"].astype(float)))
 
 
 @df_memoize(copy=False)

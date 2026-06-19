@@ -54,23 +54,25 @@ def _compute_member_raw_alphas(
 
     collapsed = _collapse_to_episodes(eligible)
 
+    # Vectorized recency weight computation (no iterrows)
+    days_ago = (ref_date - pd.to_datetime(collapsed["disclosure_date"])).dt.days
+    days_ago = days_ago.clip(lower=0)
+    weights = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
+
+    collapsed["_weight_vals"] = weights
+    collapsed["_alpha_weighted"] = collapsed["spy_alpha_pct"].values * weights
+
+    grp = collapsed.groupby("member")
+    weight_sums = grp["_weight_vals"].sum()
+    alpha_sums = grp["_alpha_weighted"].sum()
+    n_episodes = grp.size()
+
+    # Filter groups with weight_sum > 0
+    valid = weight_sums > 0
     result: dict[str, tuple[float, float, int]] = {}
-    for member, grp in collapsed.groupby("member"):
-        alpha_sum = 0.0
-        weight_sum = 0.0
-        n_episodes = 0
-        for _, row in grp.iterrows():
-            alpha = float(row["spy_alpha_pct"])
-            weight = _recency_weight(
-                pd.Timestamp(row["disclosure_date"]),
-                ref_date,
-                recency_half_life_days,
-            )
-            alpha_sum += alpha * weight
-            weight_sum += weight
-            n_episodes += 1
-        if weight_sum > 0:
-            result[member] = (alpha_sum / weight_sum, weight_sum, n_episodes)
+    for member in weight_sums.index[valid]:
+        w = float(weight_sums[member])
+        result[member] = (float(alpha_sums[member]) / w, w, int(n_episodes[member]))
     return result
 
 
@@ -96,21 +98,20 @@ def _compute_member_sector_skills(
     if member_signals.empty:
         return {}
 
-    sector_alphas: dict[str, tuple[float, float]] = {}
-    for ticker, grp in member_signals.groupby("ticker"):
-        alpha_sum = 0.0
-        weight_sum = 0.0
-        for _, row in grp.iterrows():
-            alpha = float(row["spy_alpha_pct"])
-            weight = _recency_weight(
-                pd.Timestamp(row["disclosure_date"]),
-                ref_date,
-                recency_half_life_days,
-            )
-            alpha_sum += alpha * weight
-            weight_sum += weight
-        if weight_sum > 0:
-            sector_alphas[ticker] = alpha_sum / weight_sum
+    # Vectorized recency weights (no iterrows)
+    days_ago = (ref_date - pd.to_datetime(member_signals["disclosure_date"])).dt.days
+    days_ago = days_ago.clip(lower=0)
+    member_signals["_weight"] = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
+    member_signals["_alpha_weighted"] = member_signals["spy_alpha_pct"].values * member_signals["_weight"]
+
+    grp = member_signals.groupby("ticker")
+    weight_sums = grp["_weight"].sum()
+    alpha_sums = grp["_alpha_weighted"].sum()
+
+    valid = weight_sums > 0
+    sector_alphas: dict[str, float] = {}
+    for ticker in weight_sums.index[valid]:
+        sector_alphas[ticker] = float(alpha_sums[ticker]) / float(weight_sums[ticker])
     return sector_alphas
 
 
@@ -232,15 +233,13 @@ def score_members_for_ticker(
     means = np.array([p.alpha_mean for p in posteriors])
     expected_alpha = float(np.dot(weight_arr, means))
 
-    # Uncertainty via bootstrap
+    # Uncertainty via bootstrap (vectorized — no per-iteration loop)
     rng = np.random.default_rng(42)
-    bootstrap_alphas = np.empty(n_bootstrap)
-    for i in range(n_bootstrap):
-        sampled = np.array([
-            rng.normal(p.alpha_mean, max(p.alpha_std, 1e-6))
-            for p in posteriors
-        ])
-        bootstrap_alphas[i] = np.dot(weight_arr, sampled)
+    # Generate all samples at once: shape (n_bootstrap, n_posteriors)
+    means_arr = np.array([p.alpha_mean for p in posteriors])
+    stds_arr = np.array([max(p.alpha_std, 1e-6) for p in posteriors])
+    all_samples = rng.normal(means_arr[None, :], stds_arr[None, :], size=(n_bootstrap, len(posteriors)))
+    bootstrap_alphas = all_samples @ weight_arr
 
     uncertainty = float(np.std(bootstrap_alphas))
     return (expected_alpha, uncertainty)

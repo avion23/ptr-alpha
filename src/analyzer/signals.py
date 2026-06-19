@@ -221,7 +221,7 @@ def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> p
             agg_dict[col] = (col, func)
 
     if "owner_code" in df.columns:
-        agg_dict["owner_code"] = ("owner_code", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
+        agg_dict["owner_code"] = ("owner_code", lambda x: x.mode().iloc[0] if len(x) > 0 and not x.mode().empty else x.iloc[0])
 
     for col in existing_avg_cols:
         agg_dict[col] = (f"_wp_{col}", "sum")

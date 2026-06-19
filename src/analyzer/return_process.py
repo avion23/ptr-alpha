@@ -261,6 +261,55 @@ def compute_entry_value(
     return v0, mu, theta
 
 
+def compute_entry_value_and_horizon(
+    historical_return_curves: list[np.ndarray],
+    rho: float = 0.000137,
+    default_theta: float = 0.05,
+    default_mu: float = 0.0,
+    min_horizon: int = 20,
+    max_horizon: int = 120,
+    default_horizon: int = 60,
+) -> tuple[float, float, float, int]:
+    """Compute both entry value V(0) and optimal horizon in a single pass.
+
+    Fits OU once per curve and derives both V0 and optimal holding period.
+    Returns (V0, mu, theta, optimal_horizon).
+    """
+    if not historical_return_curves:
+        v0 = default_mu * default_theta / (rho * (default_theta + rho))
+        return v0, default_mu, default_theta, default_horizon
+
+    thetas = []
+    mus = []
+
+    for curve in historical_return_curves:
+        c = np.asarray(curve, dtype=np.float64)
+        if len(c) < 3:
+            continue
+        ou = fit_ou(c)
+        if 0.001 < ou.theta < 5.0:
+            thetas.append(ou.theta)
+            mus.append(ou.mu)
+
+    if not mus:
+        v0 = default_mu * default_theta / (rho * (default_theta + rho))
+        return v0, default_mu, default_theta, default_horizon
+
+    mu = float(np.mean(mus))
+    theta = float(np.median(thetas))
+    v0 = mu * theta / (rho * (theta + rho))
+
+    # Optimal horizon from half-life
+    if theta < 1e-6:
+        optimal = max_horizon
+    else:
+        half_life = np.log(2) / theta
+        optimal = int(2 * half_life)
+        optimal = max(min_horizon, min(max_horizon, optimal))
+
+    return v0, mu, theta, optimal
+
+
 # ---------------------------------------------------------------------------
 # Optimal horizon from OU half-life
 # ---------------------------------------------------------------------------

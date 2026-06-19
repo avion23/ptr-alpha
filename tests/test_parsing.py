@@ -4,7 +4,8 @@ from analyzer.parsing import (
     clean_text, _extract_ticker, _extract_date, _extract_transaction_type,
     parse_pdf_table, normalize_house_metadata, consolidate_transactions,
     _extract_amount_midpoint, _extract_owner_code, _parse_ocr_text_to_rows,
-    _find_header_row,
+    _find_header_row, _extract_instrument_type, _extract_option_details,
+    _column_indexes, _find_amount_in_row,
 )
 from analyzer.exceptions import ParsingError
 
@@ -447,6 +448,135 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0][1], "Purchase")
         self.assertEqual(rows[1][1], "Sale")
+
+    # --- Column index robustness ---
+
+    def test_column_indexes_amount_value_header(self):
+        indexes = _column_indexes(['Asset', 'Type', 'Date', 'Value'])
+        self.assertEqual(indexes['amount'], 3)
+
+    def test_column_indexes_amount_proceeds_header(self):
+        indexes = _column_indexes(['Description', 'TxType', 'TxDate', 'Proceeds'])
+        self.assertEqual(indexes['amount'], 3)
+
+    def test_column_indexes_amount_transaction_value_header(self):
+        indexes = _column_indexes(['Asset Name', 'Transaction Type', 'Transaction Date', 'TransactionValue'])
+        self.assertEqual(indexes['amount'], 3)
+
+    def test_column_indexes_no_amount_col(self):
+        indexes = _column_indexes(['Asset', 'Type', 'Date'])
+        self.assertIsNone(indexes.get('amount'))
+
+    def test_column_indexes_fallback_to_defaults_when_core_missing(self):
+        indexes = _column_indexes(['Random', 'Stuff', 'Here'])
+        self.assertEqual(indexes['asset'], 0)
+        self.assertEqual(indexes['type'], 1)
+        self.assertEqual(indexes['date'], 2)
+
+    # --- Amount fallback ---
+
+    def test_find_amount_in_row_range(self):
+        row = ['Apple Inc (AAPL)', 'Purchase', '01/15/2024', '', '$1,001 - $15,000']
+        self.assertEqual(_find_amount_in_row(row), '$1,001 - $15,000')
+
+    def test_find_amount_in_row_single(self):
+        row = ['Apple Inc (AAPL)', 'Purchase', '01/15/2024', '$50,000']
+        self.assertEqual(_find_amount_in_row(row), '$50,000')
+
+    def test_find_amount_in_row_none(self):
+        row = ['Apple Inc (AAPL)', 'Purchase', '01/15/2024']
+        self.assertIsNone(_find_amount_in_row(row))
+
+    def test_find_amount_in_row_embedded(self):
+        row = ['Apple Inc (AAPL)', 'Purchase', '01/15/2024', 'some text $10,001 - $50,000 here']
+        self.assertEqual(_find_amount_in_row(row), '$10,001 - $50,000')
+
+    def test_parse_pdf_table_amount_fallback_no_amount_col(self):
+        """When no amount column exists in headers, fallback should find $ pattern in cells."""
+        table = [
+            ['Asset Name', 'Transaction Type', 'Transaction Date', 'Extra Col'],
+            ['Apple Inc. (AAPL)', 'Purchase', '01/15/2024', '$1,001 - $15,000'],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]['amount_raw'], '$1,001 - $15,000')
+        self.assertAlmostEqual(transactions[0]['amount_midpoint'], 8000.5)
+
+    # --- Options detection ---
+
+    def test_instrument_type_call_option(self):
+        self.assertEqual(_extract_instrument_type('NVIDIA Corp Common Stock Call Option (NVDA)'), 'call')
+
+    def test_instrument_type_put_option(self):
+        self.assertEqual(_extract_instrument_type('NVIDIA Corp Common Stock Put Option (NVDA)'), 'put')
+
+    def test_instrument_type_bare_call(self):
+        self.assertEqual(_extract_instrument_type('NVDA Call $120 Exp 12/20/2024'), 'call')
+
+    def test_instrument_type_bare_put(self):
+        self.assertEqual(_extract_instrument_type('NVDA Put $120 Exp 12/20/2024'), 'put')
+
+    def test_instrument_type_stock(self):
+        self.assertEqual(_extract_instrument_type('Apple Inc. Common Stock (AAPL)'), 'stock')
+
+    def test_instrument_type_option_without_call_put(self):
+        """When 'option' appears with strike/expiry but no call/put, defaults to 'call'."""
+        self.assertEqual(_extract_instrument_type('Some Fund Option Strike $50 Exp 06/30/2025'), 'call')
+
+    def test_instrument_type_empty(self):
+        self.assertEqual(_extract_instrument_type(''), 'stock')
+        self.assertEqual(_extract_instrument_type(None), 'stock')
+
+    # --- Option details extraction ---
+
+    def test_option_details_strike_and_expiry(self):
+        details = _extract_option_details('NVDA Call Strike $120 Exp 12/20/2024')
+        self.assertAlmostEqual(details['strike_price'], 120.0)
+        self.assertEqual(details['expiry_date'], '12/20/2024')
+
+    def test_option_details_inline_strike(self):
+        """$120 before 'Exp' should be captured as strike."""
+        details = _extract_option_details('NVDA Call $150.50 Exp 06/30/2025')
+        self.assertAlmostEqual(details['strike_price'], 150.50)
+        self.assertEqual(details['expiry_date'], '06/30/2025')
+
+    def test_option_details_no_details(self):
+        details = _extract_option_details('Apple Inc (AAPL)')
+        self.assertNotIn('strike_price', details)
+        self.assertNotIn('expiry_date', details)
+
+    def test_option_details_expiry_only(self):
+        details = _extract_option_details('Some Option Exp 01/15/2025')
+        self.assertNotIn('strike_price', details)
+        self.assertEqual(details['expiry_date'], '01/15/2025')
+
+    def test_option_details_strike_only(self):
+        details = _extract_option_details('Some Option Strike $75')
+        self.assertAlmostEqual(details['strike_price'], 75.0)
+        self.assertNotIn('expiry_date', details)
+
+    # --- Full parse with options ---
+
+    def test_parse_pdf_table_with_options(self):
+        table = [
+            ['Asset Name', 'Transaction Type', 'Transaction Date'],
+            ['NVIDIA Corp Call Option (NVDA)', 'Purchase', '2024-01-15'],
+            ['Apple Inc. Common Stock (AAPL)', 'Sale', '2024-01-16'],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 2)
+        self.assertEqual(transactions[0]['instrument_type'], 'call')
+        self.assertEqual(transactions[1]['instrument_type'], 'stock')
+
+    def test_parse_pdf_table_with_put_option(self):
+        table = [
+            ['Asset Name', 'Transaction Type', 'Transaction Date'],
+            ['Tesla Inc Put Option (TSLA)', 'Sale', '2024-03-01'],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]['instrument_type'], 'put')
+        self.assertEqual(transactions[0]['ticker'], 'TSLA')
 
 if __name__ == '__main__':
     unittest.main()

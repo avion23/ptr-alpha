@@ -67,14 +67,28 @@ def _extract_owner_code(owner_cell: str | None) -> str | None:
 
 
 def _extract_instrument_type(asset_cell: str | None) -> str:
-    """Detect whether an asset description is a stock, call option, or put option."""
+    """Detect whether an asset description is a stock, call option, or put option.
+
+    Handles common PTR formats:
+      - "NVIDIA Corp Common Stock Call Option (NVDA)"
+      - "NVDA Call $120 Exp 12/20/2024"
+      - "Call Option" / "Put Option" as separate field in asset text
+      - Bare "call" / "put" keywords
+    """
     if not asset_cell:
         return 'stock'
     text = asset_cell.lower()
-    if re.search(r'\bput\s+opt', text) or re.search(r'\bput\b', text):
+    # Put detection — check before call since "put call" is unlikely but "call put" might appear
+    if re.search(r'\bput\s*(?:option|opt)\b', text) or re.search(r'\bput\b', text):
         return 'put'
-    if re.search(r'\bcall\s+opt', text) or re.search(r'\bcall\b', text):
+    # Call detection — broad match including "call option", "call opt"
+    if re.search(r'\bcall\s*(?:option|opt)\b', text) or re.search(r'\bcall\b', text):
         return 'call'
+    # Generic "option" without call/put qualifier — try to infer from context
+    if re.search(r'\boption\b', text):
+        # Heuristic: if there's a strike/expiry pattern, it's an option but type unknown — default to 'call'
+        if re.search(r'\b(?:strike|exp|strike\s*price|expir)\b', text):
+            return 'call'
     return 'stock'
 
 
@@ -82,6 +96,11 @@ def _extract_option_details(asset_cell: str | None) -> dict:
     """Extract strike price and expiry date from an option asset description.
 
     Returns dict with optional 'strike_price' (float) and 'expiry_date' (str MM/DD/YYYY).
+    Handles formats:
+      - "Strike $150" / "Strike: 150.00"
+      - "$120" preceding "Exp" in "NVDA Call $120 Exp 12/20/2024"
+      - "Exp MM/DD/YYYY" / "Expire MM/DD/YYYY" / "Expiring MM/DD/YYYY"
+      - "Exp 12/20/2024" (bare exp abbreviation)
     """
     details: dict = {}
     if not asset_cell:
@@ -90,6 +109,12 @@ def _extract_option_details(asset_cell: str | None) -> dict:
     strike_match = re.search(r'(?:strike[:\s]*\$?)(\d+(?:\.\d+)?)', asset_cell, re.IGNORECASE)
     if strike_match:
         details['strike_price'] = float(strike_match.group(1))
+    else:
+        # Fallback: dollar amount before Exp/expiry, e.g. "$120 Exp 12/20/2024"
+        strike_fallback = re.search(r'\$(\d+(?:\.\d+)?)\s+(?:exp|strike)', asset_cell, re.IGNORECASE)
+        if strike_fallback:
+            details['strike_price'] = float(strike_fallback.group(1))
+
     # Expiry date: "Exp MM/DD/YYYY" or "Expire: MM/DD/YYYY" or "Expiring MM/DD/YYYY"
     exp_match = re.search(r'(?:exp(?:ir(?:e|ation|ing)?)?[:\s]+(\d{2}/\d{2}/\d{4}))', asset_cell, re.IGNORECASE)
     if exp_match:
@@ -122,11 +147,14 @@ def _column_index(headers: list[str], candidates: set[str]) -> int | None:
 def _column_indexes(header: list[str]) -> dict[str, int]:
     headers = [str(cell) for cell in header]
     indexes = {
-        "asset": _column_index(headers, {"asset", "assetname", "description"}),
-        "owner": _column_index(headers, {"owner", "ownership"}),
-        "type": _column_index(headers, {"type", "transactiontype", "txtype"}),
-        "date": _column_index(headers, {"date", "transactiondate"}),
-        "amount": _column_index(headers, {"amount", "transactionamount"}),
+        "asset": _column_index(headers, {"asset", "assetname", "description", "desc", "desciption"}),
+        "owner": _column_index(headers, {"owner", "ownership", "ownercode", "reportedby"}),
+        "type": _column_index(headers, {"type", "transactiontype", "txtype", "transaction", "txtype"}),
+        "date": _column_index(headers, {"date", "transactiondate", "txdate", "notifdate", "notificationdate"}),
+        "amount": _column_index(headers, {
+            "amount", "transactionamount", "value", "transactionvalue",
+            "valueamount", "price", "cost", "proceeds", "tradedamount",
+        }),
     }
     if indexes["asset"] is None or indexes["type"] is None or indexes["date"] is None:
         return {"asset": 0, "type": 1, "date": 2}
@@ -137,6 +165,19 @@ def _get_cell(row: list, index: int | None) -> str | None:
     if index is None or index >= len(row):
         return None
     return str(row[index])
+
+
+def _find_amount_in_row(row: list) -> str | None:
+    """Fallback: scan all cells for a '$X,XXX - $X,XXX' or '$X,XXX' amount pattern."""
+    amount_re = re.compile(r'\$\d[\d,]*(?:\s*-\s*\$\d[\d,]*)?')
+    for cell in row:
+        if cell is None:
+            continue
+        text = str(cell).strip()
+        match = amount_re.search(text)
+        if match:
+            return match.group(0)
+    return None
 
 
 def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | None:
@@ -151,7 +192,11 @@ def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | Non
         tx_date = _extract_date(date_cell)
 
         if ticker and tx_type and tx_date:
-            amount_raw, amount_midpoint = _extract_amount_midpoint(_get_cell(row, indexes.get("amount")))
+            amount_cell = _get_cell(row, indexes.get("amount"))
+            # Fallback: if amount column not mapped, search all cells for $ pattern
+            if amount_cell is None and indexes.get("amount") is None:
+                amount_cell = _find_amount_in_row(row)
+            amount_raw, amount_midpoint = _extract_amount_midpoint(amount_cell)
             instrument_type = _extract_instrument_type(asset_cell)
             option_details = _extract_option_details(asset_cell) if instrument_type != 'stock' else {}
             return {
@@ -169,9 +214,14 @@ def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | Non
     except IndexError:
         return None
 
-KNOWN_HEADERS = {"asset", "assetname", "description", "owner", "ownership",
-                 "type", "transactiontype", "txtype", "date", "transactiondate",
-                 "amount", "transactionamount"}
+KNOWN_HEADERS = {
+    "asset", "assetname", "description", "desc", "desciption",
+    "owner", "ownership", "ownertype", "ownercode", "reportedby",
+    "type", "transactiontype", "txtype", "transaction",
+    "date", "transactiondate", "txdate", "notifdate", "notificationdate",
+    "amount", "transactionamount", "value", "transactionvalue",
+    "valueamount", "price", "cost", "proceeds", "tradedamount",
+}
 
 
 def _find_header_row(table: list, max_scan: int = 3) -> int | None:

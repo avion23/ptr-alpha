@@ -8,7 +8,7 @@ import pandas as pd
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
-from analyzer.signals import _price_at_or_before, _price_on_or_before, _price_arrays
+from analyzer.signals import _price_arrays
 from analyzer.member_ranking import rank_members, score_ticker_by_buyers
 
 
@@ -515,9 +515,7 @@ def evaluate_backtest(
     NS_PER_DAY = 86_400_000_000_000
 
     # ── Precompute SPY benchmark once per as_of_date (hoisted out of loop) ──
-    # Use the max horizon across all recs so we can compute all spy exits at once.
     horizons = recommendations["optimal_horizon"].values if "optimal_horizon" in recommendations.columns else None
-    max_h = int(horizons.max()) if horizons is not None else horizon
 
     # Pre-extract SPY price arrays once (avoids repeated _price_arrays lookups)
     spy_arrs = _price_arrays(prices_df, "SPY")

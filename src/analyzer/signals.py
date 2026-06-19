@@ -8,6 +8,8 @@ once on the full Series instead of per-signal groupby shifts.
 
 from __future__ import annotations
 
+import weakref as _weakref
+
 import numpy as np
 import pandas as pd
 
@@ -36,7 +38,6 @@ _NS_PER_DAY = 86_400_000_000_000  # nanoseconds in a day
 # Stores per-ticker (sorted-non-NaN dates as int64 ns, values as np.ndarray)
 # tuples so price lookups become O(log N) via searchsorted instead of O(N) via
 # boolean masking + dropna.
-import weakref as _weakref
 
 _PRICE_INDEX_DATA: dict[int, dict] = {}
 
@@ -455,8 +456,11 @@ def calculate_signal_potential(
     n = len(signals)
 
     # --- Vectorized signal metadata (numpy arrays, no pandas overhead) ---
-    disc_ns = signals["disclosure_date"].astype(np.int64).values
-    end_ns = signals["window_end"].astype(np.int64).values
+    # Convert to nanoseconds explicitly: pandas may use datetime64[us] internally,
+    # and asi8 returns storage units (microseconds), not nanoseconds. price_arrays
+    # already converts to ns via as_unit("ns"), so we must match.
+    disc_ns = pd.DatetimeIndex(signals["disclosure_date"]).as_unit("ns").asi8
+    end_ns = pd.DatetimeIndex(signals["window_end"]).as_unit("ns").asi8
     # Convert to numpy object arrays to avoid pandas StringDtype comparison overhead
     # (pandas StringDtype.__eq__ triggers _isna_string_dtype per element)
     ticker_arr = signals["ticker"].to_numpy(dtype=object, na_value=None)
@@ -479,7 +483,7 @@ def calculate_signal_potential(
     # --- Pre-allocate result arrays ---
     r_peak = np.full(n, np.nan, dtype=np.float64)
     r_trough = np.full(n, np.nan, dtype=np.float64)
-    r_decayed_ret = np.zeros(n, dtype=np.float64)
+    r_decayed_ret = np.full(n, np.nan, dtype=np.float64)
     r_disc_baseline = np.full(n, np.nan, dtype=np.float64)
     r_last_price = np.full(n, np.nan, dtype=np.float64)
     r_spy_cum = np.zeros(n, dtype=np.float64)

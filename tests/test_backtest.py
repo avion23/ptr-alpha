@@ -617,3 +617,109 @@ class TestTrainingLookbackDays(unittest.TestCase):
             horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
         )
         pd.testing.assert_frame_equal(recs_none, recs_default)
+
+
+class TestSoloBuyerSkillGate(unittest.TestCase):
+    """Integration tests for the min_buyers=1 solo-buyer skill gate."""
+
+    def setUp(self):
+        self.as_of = pd.Timestamp("2025-01-01")
+        horizon = 90
+        elapsed_cutoff = self.as_of - pd.Timedelta(days=horizon)
+
+        # Training signals for one high-skill member ("Star") with strong wins
+        # so rank_members produces a high bayes_win_prob (Bayesian shrinkage
+        # is strong: needs ~6 wins to clear the default 0.60 threshold).
+        star_signals = []
+        for i, tk in enumerate(["AAA", "BBB", "CCC", "GGG", "HHH", "III"]):
+            star_signals.append({
+                "member": "Star", "ticker": tk,
+                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=80 - i * 5),
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 100.0, "decayed_return_pct": 25.0 + i,
+                "peak_potential_pct": 35.0 + i, "spy_alpha_pct": 20.0 + i,
+                "total_return_pct": 30.0 + i, "total_spy_alpha_pct": 22.0 + i,
+            })
+        dud_signals = []
+        for i, tk in enumerate(["DDD", "EEE", "FFF", "JJJ", "KKK", "LLL"]):
+            dud_signals.append({
+                "member": "Dud", "ticker": tk,
+                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=55 - i * 3),
+                "signal_type": "Purchase", "horizon_days": 90,
+                "entry_price": 100.0, "decayed_return_pct": -20.0 - i,
+                "peak_potential_pct": -10.0 - i, "spy_alpha_pct": -25.0 - i,
+                "total_return_pct": -22.0 - i, "total_spy_alpha_pct": -28.0 - i,
+            })
+        self.signals = _make_signals(star_signals + dud_signals)
+
+    def test_high_skill_solo_buyer_recommended_with_min_buyers_1(self):
+        """A single high-skill buyer should appear when min_buyers=1."""
+        solo_txns = _make_transactions([
+            {
+                "member": "Star", "ticker": "SOLO1",
+                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
+                "transaction_type": "Purchase",
+            },
+        ])
+        recs = backtest_recommendations(
+            self.signals, solo_txns, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
+        )
+        self.assertFalse(recs.empty)
+        self.assertEqual(recs.iloc[0]["ticker"], "SOLO1")
+        self.assertGreater(recs.iloc[0]["signal_score"], 0.0)
+
+    def test_low_skill_solo_buyer_filtered_with_min_buyers_1(self):
+        """A single low-skill buyer should still be rejected."""
+        solo_txns = _make_transactions([
+            {
+                "member": "Dud", "ticker": "SOLO2",
+                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
+                "transaction_type": "Purchase",
+            },
+        ])
+        recs = backtest_recommendations(
+            self.signals, solo_txns, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
+            solo_buyer_skill_threshold=0.60,
+        )
+        self.assertTrue(recs.empty)
+
+    def test_min_buyers_2_still_filters_single_buyer(self):
+        """Default min_buyers=2 keeps rejecting single-buyer tickers."""
+        solo_txns = _make_transactions([
+            {
+                "member": "Star", "ticker": "SOLO3",
+                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
+                "transaction_type": "Purchase",
+            },
+        ])
+        recs = backtest_recommendations(
+            self.signals, solo_txns, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+        )
+        self.assertTrue(recs.empty)
+
+    def test_solo_skill_threshold_passes_through(self):
+        """Raising the threshold filters a borderline-skill solo buyer."""
+        solo_txns = _make_transactions([
+            {
+                "member": "Star", "ticker": "SOLO4",
+                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
+                "transaction_type": "Purchase",
+            },
+        ])
+        # Default threshold (0.60): Star passes → recommendation produced.
+        recs_default = backtest_recommendations(
+            self.signals, solo_txns, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
+        )
+        self.assertFalse(recs_default.empty)
+
+        # Impossibly strict threshold (0.99): Star rejected.
+        recs_strict = backtest_recommendations(
+            self.signals, solo_txns, self.as_of,
+            horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
+            solo_buyer_skill_threshold=0.99,
+        )
+        self.assertTrue(recs_strict.empty)

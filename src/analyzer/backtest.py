@@ -224,6 +224,7 @@ def backtest_recommendations(
     threshold: float = 5.0,
     prices_df: pd.DataFrame | None = None,
     training_lookback_days: int | None = None,
+    solo_buyer_skill_threshold: float = 0.60,
     cache=None,
 ) -> pd.DataFrame:
     elapsed_cutoff = as_of_date - pd.Timedelta(days=horizon)
@@ -311,6 +312,7 @@ def backtest_recommendations(
                     transactions_df, lookback_days, as_of_date, ticker,
                     signals_df, horizon, threshold, training_lookback_days,
                     bayes_prior_for_key, min_buyers, 0.5,
+                    solo_buyer_skill_threshold,
                 )
                 if hit:
                     scores.append(cached_score.copy())
@@ -322,6 +324,7 @@ def backtest_recommendations(
                 ticker_perf_signals=ticker_perf_signals,
                 cache=cache, as_of_date=as_of_date,
                 cache_parent_signals=signals_df,
+                solo_buyer_skill_threshold=solo_buyer_skill_threshold,
             )
 
             # Compute OU entry value V(0) if prices available
@@ -397,6 +400,7 @@ def backtest_recommendations(
                     transactions_df, lookback_days, as_of_date, ticker,
                     signals_df, horizon, threshold, training_lookback_days,
                     bayes_prior_for_key, min_buyers, 0.5, score,
+                    solo_buyer_skill_threshold,
                 )
             scores.append(score)
         except AnalysisError:
@@ -406,6 +410,13 @@ def backtest_recommendations(
         return pd.DataFrame()
 
     result = pd.concat(scores, ignore_index=True)
+    # Drop rejected rows. score_ticker_by_buyers emits a zero signal_score
+    # (with a `note`) for tickers that fail the min-buyers / solo-buyer skill
+    # gate; those should not surface as recommendations.
+    if "signal_score" in result.columns:
+        result = result[result["signal_score"].fillna(0) > 0]
+    if result.empty:
+        return pd.DataFrame()
     result = result.sort_values("signal_score", ascending=False).head(top_n).reset_index(drop=True)
     result.insert(0, "rank", range(1, len(result) + 1))
     return result

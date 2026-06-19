@@ -509,5 +509,220 @@ class TestEpisodeCollapse(unittest.TestCase):
         rankings = rank_members(signals, horizon=90, threshold=5.0)
         self.assertEqual(rankings.iloc[0]["purchase_trades"], 2)
 
+
+class TestSoloBuyerSkillGate(unittest.TestCase):
+    """Tests for the min_buyers=1 solo-buyer skill gate in score_ticker_by_buyers."""
+
+    def _make_solo_setup(self, bayes_win_prob: float):
+        transactions = pd.DataFrame({
+            "member": ["Pelosi"],
+            "ticker": ["AVGO"],
+            "transaction_date": pd.to_datetime(["2024-01-01"]),
+            "disclosure_date": pd.to_datetime(["2024-01-03"]),
+            "transaction_type": ["Purchase"],
+            "owner_code": [None],
+            "amount_midpoint": [50000.0],
+        })
+        member_rankings = pd.DataFrame({
+            "member": ["Pelosi"],
+            "avg_spy_alpha_pct": [20.0],
+            "purchase_trades": [5],
+            "bayes_win_prob": [bayes_win_prob],
+        })
+        signals = pd.DataFrame({
+            "member": ["Pelosi"],
+            "ticker": ["AVGO"],
+            "signal_type": ["Purchase"],
+            "horizon_days": [90],
+            "decayed_return_pct": [20.0],
+            "peak_potential_pct": [25.0],
+            "spy_alpha_pct": [20.0],
+        })
+        return transactions, member_rankings, signals
+
+    def test_high_skill_solo_buyer_passes_gate_with_penalty(self):
+        transactions, member_rankings, signals = self._make_solo_setup(0.85)
+
+        score = score_ticker_by_buyers(
+            "AVGO", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+        )
+
+        self.assertGreater(score.iloc[0]["signal_score"], 0.0)
+        self.assertEqual(score.iloc[0]["num_buyers"], 1)
+        # Penalty (0.8) is applied on top of size_factor * owner_factor * ticker_perf_factor
+        # base_signal_score is unaffected; only signal_score is scaled down.
+        base = score.iloc[0]["base_signal_score"]
+        penalized = score.iloc[0]["signal_score"]
+        size_factor = score.iloc[0]["size_factor"]
+        owner_factor = score.iloc[0]["owner_factor"]
+        ticker_perf_factor = score.iloc[0]["ticker_perf_factor"]
+        expected = round(base * size_factor * owner_factor * ticker_perf_factor * 0.8, 2)
+        self.assertAlmostEqual(penalized, expected, places=1)
+        self.assertTrue(score.iloc[0]["solo_buyer"])
+
+    def test_low_skill_solo_buyer_rejected(self):
+        transactions, member_rankings, signals = self._make_solo_setup(0.40)
+
+        score = score_ticker_by_buyers(
+            "AVGO", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+        )
+
+        self.assertEqual(score.iloc[0]["signal_score"], 0.0)
+        self.assertIn("note", score.columns)
+        self.assertIn("skill threshold", score.iloc[0]["note"])
+
+    def test_threshold_boundary_passes(self):
+        # bayes_win_prob exactly at threshold (0.60) passes (not < threshold).
+        transactions, member_rankings, signals = self._make_solo_setup(0.60)
+
+        score = score_ticker_by_buyers(
+            "AVGO", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+            solo_buyer_skill_threshold=0.60,
+        )
+
+        self.assertGreater(score.iloc[0]["signal_score"], 0.0)
+        self.assertTrue(score.iloc[0]["solo_buyer"])
+
+    def test_custom_threshold_can_reject_default_passer(self):
+        # bayes_win_prob=0.65 passes default 0.60 but fails stricter 0.70.
+        transactions, member_rankings, signals = self._make_solo_setup(0.65)
+
+        strict = score_ticker_by_buyers(
+            "AVGO", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+            solo_buyer_skill_threshold=0.70,
+        )
+        self.assertEqual(strict.iloc[0]["signal_score"], 0.0)
+
+        default = score_ticker_by_buyers(
+            "AVGO", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+        )
+        self.assertGreater(default.iloc[0]["signal_score"], 0.0)
+
+    def test_min_buyers_ge_2_unchanged_by_solo_gate(self):
+        # Single buyer with min_buyers=2 still rejected via the original path,
+        # regardless of solo_buyer_skill_threshold.
+        transactions, member_rankings, signals = self._make_solo_setup(0.95)
+
+        score = score_ticker_by_buyers(
+            "AVGO", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=2,
+            solo_buyer_skill_threshold=0.60,
+        )
+
+        self.assertEqual(score.iloc[0]["signal_score"], 0.0)
+        self.assertEqual(score.iloc[0]["num_buyers"], 1)
+        self.assertIn("minimum buyer threshold", score.iloc[0]["note"])
+
+    def test_two_buyers_with_min_buyers_1_no_penalty(self):
+        # min_buyers=1 with 2 buyers: solo gate does not fire, no penalty.
+        transactions = pd.DataFrame({
+            "member": ["Alice", "Bob"],
+            "ticker": ["AAPL", "AAPL"],
+            "transaction_date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
+            "disclosure_date": pd.to_datetime(["2024-01-03", "2024-01-04"]),
+            "transaction_type": ["Purchase", "Purchase"],
+        })
+        member_rankings = pd.DataFrame({
+            "member": ["Alice", "Bob"],
+            "avg_spy_alpha_pct": [10.0, 8.0],
+            "purchase_trades": [3, 2],
+            "bayes_win_prob": [0.55, 0.50],
+        })
+        signals = pd.DataFrame({
+            "member": ["Alice", "Bob"],
+            "ticker": ["AAPL", "AAPL"],
+            "signal_type": ["Purchase", "Purchase"],
+            "horizon_days": [90, 90],
+            "decayed_return_pct": [10.0, 8.0],
+            "peak_potential_pct": [12.0, 10.0],
+            "spy_alpha_pct": [10.0, 8.0],
+        })
+
+        score = score_ticker_by_buyers(
+            "AAPL", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+        )
+
+        self.assertGreater(score.iloc[0]["signal_score"], 0.0)
+        self.assertFalse(score.iloc[0]["solo_buyer"])
+        self.assertEqual(score.iloc[0]["num_buyers"], 2)
+
+    def test_unrated_solo_buyer_rejected(self):
+        # Buyer not present in member_rankings → bayes_win_prob unknown → reject.
+        transactions = pd.DataFrame({
+            "member": ["Newbie"],
+            "ticker": ["AAPL"],
+            "transaction_date": pd.to_datetime(["2024-01-01"]),
+            "disclosure_date": pd.to_datetime(["2024-01-03"]),
+            "transaction_type": ["Purchase"],
+        })
+        member_rankings = pd.DataFrame({
+            "member": ["OtherMember"],
+            "avg_spy_alpha_pct": [10.0],
+            "purchase_trades": [3],
+            "bayes_win_prob": [0.90],
+        })
+        signals = pd.DataFrame({
+            "member": ["OtherMember"],
+            "ticker": ["AAPL"],
+            "signal_type": ["Purchase"],
+            "horizon_days": [90],
+            "decayed_return_pct": [10.0],
+            "peak_potential_pct": [12.0],
+            "spy_alpha_pct": [10.0],
+        })
+
+        score = score_ticker_by_buyers(
+            "AAPL", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+        )
+
+        self.assertEqual(score.iloc[0]["signal_score"], 0.0)
+
+    def test_threshold_zero_disables_gate(self):
+        # solo_buyer_skill_threshold=0 disables the gate entirely.
+        transactions, member_rankings, signals = self._make_solo_setup(0.10)
+
+        score = score_ticker_by_buyers(
+            "AVGO", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+            solo_buyer_skill_threshold=0.0,
+        )
+
+        self.assertGreater(score.iloc[0]["signal_score"], 0.0)
+        self.assertFalse(score.iloc[0]["solo_buyer"])
+
+    def test_custom_penalty_multiplier(self):
+        transactions, member_rankings, signals = self._make_solo_setup(0.85)
+
+        score = score_ticker_by_buyers(
+            "AVGO", transactions, signals,
+            member_rankings=member_rankings,
+            min_buyers=1,
+            solo_buyer_penalty=0.5,
+        )
+
+        base = score.iloc[0]["base_signal_score"]
+        size_factor = score.iloc[0]["size_factor"]
+        owner_factor = score.iloc[0]["owner_factor"]
+        ticker_perf_factor = score.iloc[0]["ticker_perf_factor"]
+        expected = round(base * size_factor * owner_factor * ticker_perf_factor * 0.5, 2)
+        self.assertAlmostEqual(score.iloc[0]["signal_score"], expected, places=1)
+
+
 if __name__ == '__main__':
     unittest.main()

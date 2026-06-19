@@ -458,3 +458,43 @@ def get_member_signals(signal_df: pd.DataFrame, member: str, horizon: int = 90, 
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")
     return _get_member_signals(signal_df, member, horizon, top_n)
+
+
+def compute_signal_potential_with_member_decay(
+    entry_prices_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    horizons: list[int] = [30, 60, 90, 180],
+    member_decay_map: dict[str, float] | None = None,
+) -> pd.DataFrame:
+    """Compute signal potential with per-member decay rates.
+
+    If member_decay_map is provided, each member's trades use their
+    personal decay lambda instead of the global default.
+    """
+    if member_decay_map is None or not member_decay_map:
+        return calculate_signal_potential(entry_prices_df, prices_df, horizons)
+
+    all_members = entry_prices_df["member"].unique()
+    default_members = [m for m in all_members if m not in member_decay_map]
+    custom_members = [m for m in all_members if m in member_decay_map]
+
+    results = []
+    if default_members:
+        default_df = entry_prices_df[entry_prices_df["member"].isin(default_members)]
+        if not default_df.empty:
+            results.append(calculate_signal_potential(default_df, prices_df, horizons))
+
+    for member in custom_members:
+        member_df = entry_prices_df[entry_prices_df["member"] == member]
+        if member_df.empty:
+            continue
+        member_lambda = member_decay_map[member]
+        member_signals = calculate_signal_potential(
+            member_df, prices_df, horizons, decay_lambda=member_lambda,
+        )
+        results.append(member_signals)
+
+    if not results:
+        return pd.DataFrame()
+
+    return pd.concat(results, ignore_index=True)

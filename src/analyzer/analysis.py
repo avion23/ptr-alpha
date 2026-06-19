@@ -25,6 +25,7 @@ from analyzer.signals import (  # noqa: F401
     _get_top_signals,
     _get_member_signals,
     calculate_signal_potential,
+    compute_signal_potential_with_member_decay,
     get_top_signals,
     get_member_signals,
 )
@@ -41,10 +42,13 @@ from analyzer.member_ranking import (  # noqa: F401
     rank_sales,
     score_ticker_by_buyers,
     get_ticker_buyers_with_rankings,
+    estimate_member_decay_lambda,
+    get_member_decay_map,
 )
 
 from analyzer.backtest import (  # noqa: F401
     _compute_ticker_entry_value,
+    _compute_ticker_optimal_horizon,
     backtest_recommendations,
     evaluate_backtest,
     summarize_backtest,

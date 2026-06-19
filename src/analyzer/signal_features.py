@@ -9,6 +9,50 @@ import pandas as pd
 from analyzer._memo import df_memoize
 
 
+def compute_optimal_entry(
+    prices_df: pd.DataFrame,
+    ticker: str,
+    disclosure_date: date,
+    pullback_pct: float = 0.05,
+    max_wait_days: int = 10,
+) -> tuple[float, int, bool]:
+    """Compute optimal entry price after disclosure.
+
+    Strategy: wait for `pullback_pct` dip from disclosure price within `max_wait_days`.
+    If dip occurs, enter at the dip price. Otherwise enter at disclosure price.
+
+    Returns (entry_price, entry_delay_days, is_dip_entry).
+    """
+    disc_ts = pd.Timestamp(disclosure_date)
+
+    if ticker not in prices_df.columns:
+        return 0.0, 0, False
+
+    ticker_prices = prices_df[ticker].dropna()
+
+    # Get disclosure price (first price on or after disclosure)
+    post_disc = ticker_prices[ticker_prices.index >= disc_ts]
+    if post_disc.empty:
+        return 0.0, 0, False
+
+    disc_price = float(post_disc.iloc[0])
+    if disc_price <= 0:
+        return 0.0, 0, False
+
+    # Look for pullback within max_wait_days
+    window_end = disc_ts + pd.Timedelta(days=max_wait_days)
+    window = ticker_prices[(ticker_prices.index >= disc_ts) & (ticker_prices.index <= window_end)]
+
+    target_price = disc_price * (1 - pullback_pct)
+
+    for i, (date_idx, price) in enumerate(window.items()):
+        if price <= target_price:
+            return float(price), i, True
+
+    # No pullback found — enter at disclosure price
+    return disc_price, 0, False
+
+
 @dataclass
 class SignalFeatures:
     ticker: str

@@ -11,6 +11,42 @@ from analyzer.signals import _price_at_or_before, _price_on_or_before, _price_ar
 from analyzer.member_ranking import rank_members, score_ticker_by_buyers
 
 
+def _find_dip_entry(
+    prices_df: pd.DataFrame,
+    ticker: str,
+    as_of_date: pd.Timestamp,
+    pullback_pct: float = 0.05,
+    max_wait_days: int = 10,
+) -> tuple[float, int]:
+    """Find dip entry price after as_of_date (which represents disclosure date in backtest).
+
+    Returns (entry_price, delay_days). If no dip, returns (price_at_as_of, 0).
+    """
+    if ticker not in prices_df.columns:
+        return 0.0, 0
+
+    ticker_prices = prices_df[ticker].dropna()
+    post_disc = ticker_prices[ticker_prices.index >= as_of_date]
+
+    if post_disc.empty:
+        return 0.0, 0
+
+    disc_price = float(post_disc.iloc[0])
+    if disc_price <= 0:
+        return 0.0, 0
+
+    window_end = as_of_date + pd.Timedelta(days=max_wait_days)
+    window = ticker_prices[(ticker_prices.index >= as_of_date) & (ticker_prices.index <= window_end)]
+
+    target_price = disc_price * (1 - pullback_pct)
+
+    for i, (date_idx, price) in enumerate(window.items()):
+        if price <= target_price:
+            return float(price), i
+
+    return disc_price, 0
+
+
 @df_memoize(copy=False)
 def _filter_training(
     signals_df: pd.DataFrame,
@@ -214,6 +250,30 @@ def _compute_ticker_entry_value(
     return v0
 
 
+@df_memoize
+def _compute_ticker_optimal_horizon(
+    ticker: str,
+    signals_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    horizon: int,
+    min_horizon: int = 20,
+    max_horizon: int = 120,
+) -> int:
+    """Compute optimal holding period for a ticker from historical curves."""
+    from analyzer.return_process import compute_optimal_horizon
+
+    ticker_col = ticker in prices_df.columns
+    if not ticker_col:
+        return horizon
+
+    curves = _build_ticker_curves(ticker, signals_df, prices_df, as_of_date, horizon)
+    if not curves:
+        return horizon
+
+    return compute_optimal_horizon(curves, min_horizon=min_horizon, max_horizon=max_horizon)
+
+
 def backtest_recommendations(
     signals_df: pd.DataFrame,
     transactions_df: pd.DataFrame,
@@ -301,6 +361,12 @@ def backtest_recommendations(
                 )
                 score["ou_entry_value"] = round(v0, 4) if v0 is not None else None
 
+                # Compute optimal holding period from OU half-life
+                optimal_h = _compute_ticker_optimal_horizon(
+                    ticker, signals_df, prices_df, as_of_date, horizon,
+                )
+                score["optimal_horizon"] = optimal_h
+
             # Compute signal features and crash hazard for this ticker
             # Use the most recent transaction date for this ticker
             ticker_recent = recent_trades[recent_trades["ticker"] == ticker]
@@ -359,6 +425,24 @@ def backtest_recommendations(
         return pd.DataFrame()
     result = result.sort_values("signal_score", ascending=False).head(top_n).reset_index(drop=True)
     result.insert(0, "rank", range(1, len(result) + 1))
+
+    # Propagate instrument_type and amount_midpoint from recent trades so
+    # evaluate_backtest can apply options leverage.
+    if "instrument_type" in recent_trades.columns:
+        inst_map = (
+            recent_trades.drop_duplicates("ticker")
+            .set_index("ticker")["instrument_type"]
+            .to_dict()
+        )
+        result["instrument_type"] = result["ticker"].map(inst_map).fillna("stock")
+    if "amount_midpoint" in recent_trades.columns:
+        amt_map = (
+            recent_trades.drop_duplicates("ticker")
+            .set_index("ticker")["amount_midpoint"]
+            .to_dict()
+        )
+        result["amount_midpoint"] = result["ticker"].map(amt_map)
+
     return result
 
 
@@ -370,48 +454,88 @@ def evaluate_backtest(
     max_staleness_days: int | None = 30,
     entry_slippage_bps: float = 10.0,
     exit_slippage_bps: float = 10.0,
+    use_dip_entry: bool = True,
+    pullback_pct: float = 0.05,
+    max_wait_days: int = 10,
 ) -> pd.DataFrame:
     if recommendations.empty:
         return recommendations
 
-    exit_date = as_of_date + pd.Timedelta(days=horizon)
-
-    spy_start = _price_at_or_before(prices_df, "SPY", as_of_date, max_staleness_days)
-    spy_end = _price_on_or_before(prices_df, "SPY", exit_date, max_staleness_days=30)
-    if not spy_start or not spy_end:
-        raise AnalysisError(
-            f"SPY price not available for backtest period "
-            f"(as_of={as_of_date.date()}, exit={exit_date.date()})"
-        )
-    spy_start *= (1 + entry_slippage_bps / 10000)
-    spy_end *= (1 - exit_slippage_bps / 10000)
-    spy_return_pct = (spy_end / spy_start - 1) * 100
+    from analyzer.options import estimate_options_leverage
 
     rows = []
     for _, rec in recommendations.iterrows():
         ticker = rec["ticker"]
-        entry = _price_at_or_before(prices_df, ticker, as_of_date, max_staleness_days)
-        exit_price = _price_on_or_before(prices_df, ticker, exit_date, max_staleness_days=30)
-        if not entry or not exit_price:
+        # Use per-ticker optimal horizon if available
+        ticker_horizon = int(rec.get("optimal_horizon", horizon)) if "optimal_horizon" in rec.index else horizon
+
+        # Entry with dip timing
+        entry_delay = 0
+        if use_dip_entry:
+            entry, entry_delay = _find_dip_entry(
+                prices_df, ticker, as_of_date, pullback_pct, max_wait_days,
+            )
+            if entry <= 0:
+                entry = _price_at_or_before(prices_df, ticker, as_of_date, max_staleness_days)
+                entry_delay = 0
+        else:
+            entry = _price_at_or_before(prices_df, ticker, as_of_date, max_staleness_days)
+            entry_delay = 0
+
+        if not entry:
             continue
+
+        # Adjust exit date based on entry delay (hold for horizon from entry, not disclosure)
+        actual_entry_date = as_of_date + pd.Timedelta(days=entry_delay)
+        exit_date = actual_entry_date + pd.Timedelta(days=ticker_horizon)
+
+        exit_price = _price_on_or_before(prices_df, ticker, exit_date, max_staleness_days=30)
+        if not exit_price:
+            continue
+
         # Apply slippage
         entry *= (1 + entry_slippage_bps / 10000)
         exit_price *= (1 - exit_slippage_bps / 10000)
         return_pct = (exit_price / entry - 1) * 100
-        alpha_pct = return_pct - spy_return_pct
+
+        # SPY benchmark: use original disclosure date for consistency
+        spy_exit_date = as_of_date + pd.Timedelta(days=ticker_horizon)
+        spy_start = _price_at_or_before(prices_df, "SPY", as_of_date, max_staleness_days)
+        spy_end = _price_on_or_before(prices_df, "SPY", spy_exit_date, max_staleness_days=30)
+        if not spy_start or not spy_end:
+            continue
+        spy_start_adj = spy_start * (1 + entry_slippage_bps / 10000)
+        spy_end_adj = spy_end * (1 - exit_slippage_bps / 10000)
+        spy_return_pct = (spy_end_adj / spy_start_adj - 1) * 100
+
+        # Apply options leverage
+        inst_type = "stock"
+        if "instrument_type" in rec.index:
+            val = rec["instrument_type"]
+            if pd.notna(val):
+                inst_type = str(val)
+        amount = rec.get("amount_midpoint") if "amount_midpoint" in rec.index else None
+        leverage = estimate_options_leverage(inst_type, amount)
+        leveraged_return_pct = return_pct * leverage
+        alpha_pct = leveraged_return_pct - spy_return_pct
+
         rows.append({
             "ticker": ticker,
             "bt_entry_price": round(entry, 2),
             "bt_exit_price": round(exit_price, 2),
-            "bt_return_pct": round(return_pct, 2),
+            "bt_raw_return_pct": round(return_pct, 2),
+            "bt_return_pct": round(leveraged_return_pct, 2),
+            "bt_leverage": round(leverage, 2),
             "bt_spy_return_pct": round(spy_return_pct, 2),
             "bt_alpha_pct": round(alpha_pct, 2),
+            "bt_horizon_days": ticker_horizon,
+            "bt_entry_delay": entry_delay,
         })
 
     eval_df = pd.DataFrame(rows)
     if eval_df.empty:
         recommendations = recommendations.copy()
-        for col in ["bt_entry_price", "bt_exit_price", "bt_return_pct", "bt_spy_return_pct", "bt_alpha_pct"]:
+        for col in ["bt_entry_price", "bt_exit_price", "bt_raw_return_pct", "bt_return_pct", "bt_leverage", "bt_spy_return_pct", "bt_alpha_pct", "bt_entry_delay"]:
             recommendations[col] = None
         return recommendations
     return recommendations.merge(eval_df, on="ticker", how="left")
@@ -424,13 +548,18 @@ def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
 
     by_rank = []
     for rank, grp in valid.groupby("rank"):
-        by_rank.append({
+        entry = {
             "rank": rank,
             "count": len(grp),
             "win_rate_pct": round((grp["bt_return_pct"] > 0).mean() * 100, 1),
             "avg_return_pct": round(grp["bt_return_pct"].mean(), 2),
             "avg_alpha_pct": round(grp["bt_alpha_pct"].mean(), 2) if "bt_alpha_pct" in grp.columns else None,
-        })
+        }
+        if "bt_raw_return_pct" in grp.columns:
+            entry["avg_raw_return_pct"] = round(grp["bt_raw_return_pct"].mean(), 2)
+        if "bt_leverage" in grp.columns:
+            entry["avg_leverage"] = round(grp["bt_leverage"].mean(), 2)
+        by_rank.append(entry)
 
     summary = pd.DataFrame(by_rank)
 
@@ -441,5 +570,9 @@ def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
         "avg_return_pct": round(valid["bt_return_pct"].mean(), 2),
         "avg_alpha_pct": round(valid["bt_alpha_pct"].mean(), 2) if "bt_alpha_pct" in valid.columns else None,
     }
+    if "bt_raw_return_pct" in valid.columns:
+        overall["avg_raw_return_pct"] = round(valid["bt_raw_return_pct"].mean(), 2)
+    if "bt_leverage" in valid.columns:
+        overall["avg_leverage"] = round(valid["bt_leverage"].mean(), 2)
     summary = pd.concat([summary, pd.DataFrame([overall])], ignore_index=True)
     return summary

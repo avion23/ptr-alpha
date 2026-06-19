@@ -220,6 +220,45 @@ def compute_entry_value(
 
 
 # ---------------------------------------------------------------------------
+# Optimal horizon from OU half-life
+# ---------------------------------------------------------------------------
+
+def compute_optimal_horizon(
+    historical_return_curves: list[np.ndarray],
+    min_horizon: int = 20,
+    max_horizon: int = 120,
+    default_horizon: int = 60,
+) -> int:
+    """Estimate optimal holding period from OU half-life.
+
+    Uses 2 * half-life as the optimal exit (captures ~75% of mean reversion).
+    Clamped to [min_horizon, max_horizon].
+    """
+    if not historical_return_curves:
+        return default_horizon
+
+    thetas = []
+    for curve in historical_return_curves:
+        c = np.asarray(curve, dtype=np.float64)
+        if len(c) < 3:
+            continue
+        ou = fit_ou(c)
+        if 0.001 < ou.theta < 5.0:
+            thetas.append(ou.theta)
+
+    if not thetas:
+        return default_horizon
+
+    median_theta = float(np.median(thetas))
+    if median_theta < 1e-6:
+        return max_horizon
+
+    half_life = np.log(2) / median_theta
+    optimal = int(2 * half_life)  # 2 half-lives captures ~75% of reversion
+    return max(min_horizon, min(max_horizon, optimal))
+
+
+# ---------------------------------------------------------------------------
 # Kalman filter for online mu tracking
 # ---------------------------------------------------------------------------
 

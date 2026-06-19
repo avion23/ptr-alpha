@@ -54,7 +54,6 @@ def run_single_backtest(
     signals: pd.DataFrame,
     bayes_prior_strength: float,
     decay_lambda: float,
-    cache=None,
 ) -> SweepResult:
     """Run one backtest with given params and return metrics."""
     old_bayes = signals_mod.BAYES_PRIOR_STRENGTH
@@ -81,7 +80,6 @@ def run_single_backtest(
                 threshold=params.threshold,
                 prices_df=prices,
                 training_lookback_days=params.training_lookback_days,
-                cache=cache,
             )
             if recs.empty:
                 continue
@@ -206,18 +204,10 @@ def main():
             signal_cache[(h, d)] = sigs
     print(f"Signal precomputation done in {time.time() - t0:.1f}s")
 
-    # Long-lived memoization cache shared across all 648 combos. Subcomputations
-    # whose results depend only on a subset of the sweep params (entry value,
-    # signal features, rank_members, ticker-member perf) are reused across
-    # combos that share those params. This is the single biggest speedup:
-    # most leaf work depends only on (ticker, as_of_date, horizon, decay).
-    from analyzer.sweep_cache import BacktestCache
-    cache = BacktestCache()
-
     # Decide serial vs parallel. Parallel uses fork (Linux/macOS) so child
     # processes inherit the precomputed signal_cache + prices + transactions
     # without re-loading from disk. Each child runs a disjoint subset of
-    # combos with its own BacktestCache. Override via SWEEP_WORKERS env var.
+    # combos with its own lru_cache. Override via SWEEP_WORKERS env var.
     workers = int(os.environ.get("SWEEP_WORKERS", "1"))
     if workers < 1:
         workers = 1
@@ -227,7 +217,7 @@ def main():
 
     if workers == 1:
         results = _run_serial(
-            combinations, keys, signal_cache, all_transactions, prices, cache,
+            combinations, keys, signal_cache, all_transactions, prices,
         )
     else:
         results = _run_parallel(
@@ -236,7 +226,6 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"\nSweep completed in {elapsed:.1f}s ({total} combos, workers={workers})")
-    print(f"Cache stats: {cache.stats}")
 
     # Save results
     results_df = pd.DataFrame([asdict(r) for r in results])
@@ -280,7 +269,7 @@ _SWEEP_CTX: dict = {}
 
 
 def _run_serial(
-    combinations, keys, signal_cache, all_transactions, prices, cache,
+    combinations, keys, signal_cache, all_transactions, prices,
 ) -> list[SweepResult]:
     total = len(combinations)
     results: list[SweepResult] = []
@@ -288,7 +277,7 @@ def _run_serial(
     for i, combo in enumerate(combinations):
         params_dict = dict(zip(keys, combo))
         result = _eval_combo(
-            params_dict, keys, signal_cache, all_transactions, prices, cache,
+            params_dict, keys, signal_cache, all_transactions, prices,
         )
         results.append(result)
         if (i + 1) % 50 == 0 or i == 0:
@@ -306,7 +295,7 @@ def _run_serial(
     return results
 
 
-def _eval_combo(params_dict, keys, signal_cache, all_transactions, prices, cache):
+def _eval_combo(params_dict, keys, signal_cache, all_transactions, prices):
     """Evaluate one parameter combination and return its SweepResult."""
     params = BacktestParams(
         start_date=date(2022, 1, 1),
@@ -324,18 +313,15 @@ def _eval_combo(params_dict, keys, signal_cache, all_transactions, prices, cache
         all_transactions, prices, params, sigs,
         bayes_prior_strength=params_dict["bayes_prior_strength"],
         decay_lambda=params_dict["decay_lambda"],
-        cache=cache,
     )
 
 
 def _worker_run(combo_group):
     """Worker entry point: evaluate a group of parameter combinations.
 
-    Inherits _SWEEP_CTX from parent via fork. Builds its own BacktestCache
-    so memoization is per-worker (no cross-process locking needed).
+    Inherits _SWEEP_CTX from parent via fork. Uses functools.lru_cache
+    (via @df_memoize) for per-worker memoization (no cross-process locking).
     """
-    from analyzer.sweep_cache import BacktestCache
-    cache = BacktestCache()
     keys = _SWEEP_CTX["keys"]
     signal_cache = _SWEEP_CTX["signal_cache"]
     all_transactions = _SWEEP_CTX["all_transactions"]
@@ -346,13 +332,12 @@ def _worker_run(combo_group):
     for params_dict in combo_group:
         out.append(
             _eval_combo(
-                params_dict, keys, signal_cache, all_transactions, prices, cache,
+                params_dict, keys, signal_cache, all_transactions, prices,
             )
         )
     pid = os.getpid()
     print(
-        f"  worker {pid}: {len(combo_group)} combos in {time.time() - t0:.1f}s "
-        f"(cache: {cache.stats})",
+        f"  worker {pid}: {len(combo_group)} combos in {time.time() - t0:.1f}s",
         file=sys.stderr,
     )
     return out

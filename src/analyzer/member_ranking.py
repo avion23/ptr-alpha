@@ -16,6 +16,7 @@ from analyzer.signals import (
     _compute_dynamic_prior,
     _get_horizon_data,
 )
+from analyzer._memo import df_memoize
 
 
 def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
@@ -78,14 +79,19 @@ def _conviction_score(trades: pd.DataFrame) -> float:
     return count_score * 0.6 + size_score * 0.4
 
 
+@df_memoize
 def _compute_ticker_member_performance(
-    signals_df: pd.DataFrame, ticker: str, horizon: int
+    signals_df: pd.DataFrame, ticker: str, horizon: int,
+    _bayes_prior_strength: float | None = None,
 ) -> dict[str, tuple[float, int]]:
     """Per-member Bayesian-shrunk win rate on a specific ticker from historical signals.
 
     Returns {member: (shrunk_win_rate, trade_count)} for members with >= 1 trade.
-    Uses Bayesian shrinkage toward global prior instead of raw win-rate penalty.
+    Result is memoized via @df_memoize using signals_df identity + ticker + horizon.
+    The _bayes_prior_strength kwarg distinguishes cache keys when the module global
+    BAYES_PRIOR_STRENGTH varies across sweep combos.
     """
+    prior_strength = _bayes_prior_strength if _bayes_prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
     if signals_df.empty or "ticker" not in signals_df.columns:
         return {}
 
@@ -104,7 +110,6 @@ def _compute_ticker_member_performance(
     ]
     all_returns = all_purchases["decayed_return_pct"].dropna()
     global_win_rate = float((all_returns > 0).mean()) if len(all_returns) > 0 else 0.5
-    prior_strength = _signals.BAYES_PRIOR_STRENGTH  # 20 pseudo-observations
 
     result: dict[str, tuple[float, int]] = {}
     for member, grp in purchases.groupby("member"):
@@ -175,9 +180,34 @@ def _compute_member_stats(
     return stats
 
 
-def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 5.0) -> pd.DataFrame:
+def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 5.0,
+                  _bayes_prior_strength: float | None = None) -> pd.DataFrame:
+    """Rank members by historical purchase performance.
+
+    bayesian_win_probability / bayes_factor_against_market read the module
+    global BAYES_PRIOR_STRENGTH. Temporarily set it so the computation
+    reflects the correct prior for this call, then restore.
+    """
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")
+
+    bayes_prior = _bayes_prior_strength if _bayes_prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
+
+    # bayesian_win_probability / bayes_factor_against_market read the module
+    # global BAYES_PRIOR_STRENGTH from the signals module. Temporarily set it
+    # so the computation reflects the correct prior for this call, then restore.
+    _saved_bayes = _signals.BAYES_PRIOR_STRENGTH
+    _signals.BAYES_PRIOR_STRENGTH = bayes_prior
+
+    try:
+        return _rank_members_impl(signal_df, horizon, threshold, bayes_prior)
+    finally:
+        _signals.BAYES_PRIOR_STRENGTH = _saved_bayes
+
+
+@df_memoize(copy=False)
+def _rank_members_impl(signal_df: pd.DataFrame, horizon: int, threshold: float,
+                       _bayes_prior_strength: float) -> pd.DataFrame:
     purchases = _get_horizon_data(signal_df, horizon, TransactionType.PURCHASE.value)
     if purchases.empty:
         raise AnalysisError(f"No purchase signals found for horizon {horizon}")
@@ -275,6 +305,7 @@ def _lookup_buyer_bayes_win_prob(
     return float(val) if pd.notna(val) else None
 
 
+@df_memoize(copy=False)
 def score_ticker_by_buyers(
     ticker: str,
     transactions_df: pd.DataFrame,
@@ -288,17 +319,18 @@ def score_ticker_by_buyers(
     uncertainty_penalty_lambda: float = 0.5,
     solo_buyer_skill_threshold: float = 0.60,
     solo_buyer_penalty: float = 0.8,
-    cache=None,
-    as_of_date=None,
-    cache_parent_signals: pd.DataFrame | None = None,
+    _bayes_prior_strength: float | None = None,
 ) -> pd.DataFrame:
+    """Score a ticker by its buyer composition. Memoized via @df_memoize."""
     if signals_df.empty:
         raise AnalysisError("Empty signal dataframe")
     if transactions_df.empty:
         raise AnalysisError("Empty transactions dataframe")
 
+    bayes_prior = _bayes_prior_strength if _bayes_prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
+
     if member_rankings is None:
-        member_rankings = rank_members(signals_df, horizon, threshold)
+        member_rankings = rank_members(signals_df, horizon, threshold, _bayes_prior_strength=bayes_prior)
 
     ticker_trades = _get_ticker_purchases(ticker, transactions_df)
 
@@ -440,29 +472,11 @@ def score_ticker_by_buyers(
     owner_factor = _owner_score_factor(ticker_trades)
 
     perf_source = ticker_perf_signals if ticker_perf_signals is not None else signals_df
-    # For the ticker_member_perf cache key, use the PARENT signals df (stable
-    # identity across calls in a sweep) rather than the freshly-filtered
-    # perf_source slice (whose id() differs every call). The result of
-    # _compute_ticker_member_performance depends only on the parent's content
-    # restricted to (ticker, horizon, as_of), so the parent id is content-stable.
-    cache_key_df = cache_parent_signals if cache_parent_signals is not None else perf_source
-    if cache is not None and as_of_date is not None:
-        from analyzer import member_ranking as mr_mod
-        bayes_prior = mr_mod.BAYES_PRIOR_STRENGTH
-        hit, ticker_perf = cache.get_ticker_member_perf(
-            cache_key_df, ticker, horizon, bayes_prior, as_of_date,
-        )
-        if not hit:
-            ticker_perf = _compute_ticker_member_performance(
-                perf_source, ticker, horizon,
-            )
-            cache.set_ticker_member_perf(
-                cache_key_df, ticker, horizon, bayes_prior, as_of_date, ticker_perf,
-            )
-    else:
-        ticker_perf = _compute_ticker_member_performance(
-            perf_source, ticker, horizon,
-        )
+    # _compute_ticker_member_performance is @df_memoize'd; its cache key is
+    # (perf_source id, ticker, horizon, _bayes_prior_strength).
+    ticker_perf = _compute_ticker_member_performance(
+        perf_source, ticker, horizon, _bayes_prior_strength=bayes_prior,
+    )
     if ticker_perf and not buyer_stats.empty:
         member_trade_counts = ticker_trades.groupby("member").size()
         weighted_sum = 0.0

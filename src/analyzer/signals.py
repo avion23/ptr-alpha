@@ -383,23 +383,39 @@ def calculate_signal_potential(
         windowed["spy_price"] = np.nan
         windowed["spy_decay_factor"] = windowed["decay_factor"]
 
+    # --- Main aggregation (no lambdas) ---
     agg = windowed.groupby("signal_id").agg(
         peak_price=("price", "max"),
         trough_price=("price", "min"),
         decayed_return=("weighted_return", "sum"),
-        spy_cumulative=("weighted_spy_return", lambda values: values.sum(min_count=1)),
-        spy_weight_sum=("spy_decay_factor", lambda values: values.sum(min_count=1)),
         weight_sum=("decay_factor", "sum"),
         disclosure_price_first=("disclosure_baseline", "first"),
         last_price=("price", "last"),
-        spy_first_price=("spy_price", lambda v: v.dropna().iloc[0] if not v.dropna().empty else np.nan),
-        spy_last_price=("spy_price", lambda v: v.dropna().iloc[-1] if not v.dropna().empty else np.nan),
     )
     # Normalize by weight sum for proper decay-weighted average
     agg["decayed_return"] = agg["decayed_return"] / agg["weight_sum"]
+
+    # --- SPY aggregation on pre-filtered rows (vectorized, no lambdas) ---
+    spy_valid = windowed.dropna(subset=["spy_price"])
+    if not spy_valid.empty:
+        spy_agg = spy_valid.groupby("signal_id").agg(
+            spy_cumulative=("weighted_spy_return", "sum"),
+            spy_weight_sum=("spy_decay_factor", "sum"),
+            spy_first_price=("spy_price", "first"),
+            spy_last_price=("spy_price", "last"),
+        )
+        # min_count=1 semantics: sum returns 0 for all-NaN groups, but those
+        # groups don't exist here because we pre-filtered on spy_price.notna().
+        # If a signal_id is missing from spy_valid, it stays NaN after join.
+        agg = agg.join(spy_agg, how="left")
+    else:
+        agg["spy_cumulative"] = 0.0
+        agg["spy_weight_sum"] = 0.0
+        agg["spy_first_price"] = np.nan
+        agg["spy_last_price"] = np.nan
     agg["spy_cumulative"] = np.where(
-        agg["spy_weight_sum"] > 0,
-        agg["spy_cumulative"] / agg["spy_weight_sum"],
+        agg["spy_weight_sum"].fillna(0) > 0,
+        agg["spy_cumulative"].fillna(0) / agg["spy_weight_sum"].fillna(0),
         0.0,
     )
     agg["total_return"] = (agg["last_price"] / agg["disclosure_price_first"] - 1)

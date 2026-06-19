@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from datetime import date
 
+import numpy as np
 import pandas as pd
 
 from analyzer._memo import df_memoize
@@ -45,9 +46,10 @@ def compute_optimal_entry(
 
     target_price = disc_price * (1 - pullback_pct)
 
-    for i, (date_idx, price) in enumerate(window.items()):
-        if price <= target_price:
-            return float(price), i, True
+    window_vals = window.values
+    hits = np.where(window_vals <= target_price)[0]
+    if len(hits) > 0:
+        return float(window_vals[hits[0]]), int(hits[0]), True
 
     # No pullback found — enter at disclosure price
     return disc_price, 0, False

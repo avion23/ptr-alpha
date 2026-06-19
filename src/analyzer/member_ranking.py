@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from math import exp, lgamma, log
+from scipy.special import gammaln as _gammaln
 
 import numpy as np
 import pandas as pd
@@ -238,21 +239,117 @@ def _rank_members_impl(signal_df: pd.DataFrame, horizon: int, threshold: float,
     if pd.isna(prior_alpha_mean):
         prior_alpha_mean = 0.0
     prior_strength = _bayes_prior_strength
-    member_stats = []
-    for member, purchase_grp in purchases.groupby("member"):
-        row = _compute_member_stats(member, purchase_grp, market_prior, threshold)
-        if row is not None:
-            conviction = _conviction_score(purchase_grp)
-            row["conviction_score"] = round(conviction, 3)
-            alpha_vals = purchase_grp[alpha_col].dropna() if alpha_col in purchase_grp.columns else pd.Series(dtype=float)
-            alpha_sum = float(alpha_vals.sum()) if len(alpha_vals) > 0 else 0.0
-            n = len(alpha_vals)
-            row["shrunk_alpha"] = (prior_alpha_mean * prior_strength + alpha_sum) / (prior_strength + n)
-            member_stats.append(row)
 
-    result = pd.DataFrame(member_stats)
-    if result.empty:
-        return result
+    grp = purchases.groupby("member")
+
+    # --- Vectorized aggregations (single pass) ---
+    ret_agg = grp["decayed_return_pct"].agg(
+        ret_nonnan="count",
+        median_ret="median",
+        mean_ret="mean",
+        std_ret="std",
+    )
+
+    # Filter to members with >= 1 non-NaN return
+    ret_agg = ret_agg[ret_agg["ret_nonnan"] > 0]
+    if ret_agg.empty:
+        return pd.DataFrame()
+
+    idx = ret_agg.index
+    n = ret_agg["ret_nonnan"].astype(int)
+
+    # Wins: positive returns (NaN comparisons → NaN, skipped by groupby sum)
+    wins = (purchases["decayed_return_pct"] > 0).groupby(purchases["member"]).sum().reindex(idx, fill_value=0).astype(int)
+    losses = n - wins
+
+    # Fix std: NaN for single-element groups → 0.0
+    ret_agg["std_ret"] = ret_agg["std_ret"].fillna(0.0)
+
+    # --- Vectorized derived stats ---
+    sharpe = np.where(ret_agg["std_ret"] > 0, ret_agg["mean_ret"] / ret_agg["std_ret"], 0.0)
+    prob_up = wins.values / n.values
+
+    # Bayesian win probability
+    bayes_alpha = market_prior * prior_strength
+    bayes_beta = (1 - market_prior) * prior_strength
+    bayes_win_prob = (bayes_alpha + wins.values) / (bayes_alpha + bayes_beta + wins.values + losses.values)
+    posterior_lift = bayes_win_prob / market_prior
+
+    # Bayes factor against market (vectorized log-space)
+    n_vals = n.values.astype(float)
+    wins_f = wins.values.astype(float)
+    losses_f = losses.values.astype(float)
+    log_marginal = (
+        _gammaln(bayes_alpha + wins_f)
+        + _gammaln(bayes_beta + losses_f)
+        - _gammaln(bayes_alpha + bayes_beta + n_vals)
+        - _gammaln(bayes_alpha)
+        - _gammaln(bayes_beta)
+        + _gammaln(bayes_alpha + bayes_beta)
+    )
+    mp_clipped = float(np.clip(market_prior, 1e-6, 1 - 1e-6))
+    log_market = wins_f * np.log(mp_clipped) + losses_f * np.log(1 - mp_clipped)
+    bayes_factor = np.exp(np.clip(log_marginal - log_market, -50, 50))
+
+    # Spy alpha
+    avg_spy = grp["spy_alpha_pct"].mean().reindex(idx).fillna(0.0)
+    if "total_spy_alpha_pct" in purchases.columns:
+        avg_total_spy = grp["total_spy_alpha_pct"].mean().reindex(idx)
+        avg_total_spy = avg_total_spy.fillna(avg_spy)
+    else:
+        avg_total_spy = avg_spy.copy()
+
+    # Hit rates (if threshold provided)
+    threshold_has_total = False
+    if threshold is not None:
+        peak_hits = (purchases["peak_potential_pct"] > threshold).groupby(purchases["member"]).mean().reindex(idx) * 100
+        threshold_has_total = "total_return_pct" in purchases.columns
+        if threshold_has_total:
+            realized_hits = (purchases["total_return_pct"] > 0).groupby(purchases["member"]).mean().reindex(idx) * 100
+
+    # --- Conviction score (vectorized) ---
+    group_sizes = grp.size().reindex(idx)
+    count_scores = np.minimum(group_sizes.values / 10.0, 1.0)
+    has_amounts_col = "amount_midpoint" in purchases.columns
+    if has_amounts_col:
+        avg_amounts = grp["amount_midpoint"].mean().reindex(idx)
+        amount_has_data = (grp["amount_midpoint"].count().reindex(idx) > 0).values
+        size_scores = np.where(
+            amount_has_data,
+            np.minimum(avg_amounts.fillna(0.0).values / 50000.0, 1.0),
+            1.0,
+        )
+    else:
+        size_scores = np.ones(len(idx))
+    conviction = count_scores * 0.6 + size_scores * 0.4
+
+    # --- Shrunk alpha (vectorized shrinkage) ---
+    alpha_sums = grp[alpha_col].sum().reindex(idx).fillna(0.0)
+    alpha_counts = grp[alpha_col].count().reindex(idx).fillna(0).astype(int)
+    shrunk_alpha = (prior_alpha_mean * prior_strength + alpha_sums) / (prior_strength + alpha_counts)
+
+    # --- Build result DataFrame ---
+    result = pd.DataFrame({
+        "member": idx,
+        "median_return_pct": np.round(ret_agg["median_ret"].values, 2),
+        "mean_return_pct": np.round(ret_agg["mean_ret"].values, 2),
+        "trades": n.values,
+        "sharpe_ratio": np.round(sharpe, 3),
+        "prob_up": np.round(prob_up, 3),
+        "bayes_win_prob": np.round(bayes_win_prob, 3),
+        "bayes_factor": np.round(bayes_factor, 3),
+        "posterior_lift": np.round(posterior_lift, 3),
+        "avg_spy_alpha_pct": np.round(avg_spy.values, 2),
+        "avg_total_spy_alpha_pct": np.round(avg_total_spy.values, 2),
+    })
+
+    if threshold is not None:
+        result["peak_hit_rate_pct"] = np.round(peak_hits.values, 2)
+        if threshold_has_total:
+            result["realized_hit_rate_pct"] = np.round(realized_hits.values, 2)
+
+    result["conviction_score"] = np.round(conviction, 3)
+    result["shrunk_alpha"] = shrunk_alpha.values
 
     return result.rename(columns={
         "mean_return_pct": "avg_decay_return_pct",

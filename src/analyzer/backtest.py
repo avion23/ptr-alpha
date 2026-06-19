@@ -539,11 +539,17 @@ def evaluate_backtest(
     for t in tickers:
         price_cache[t] = _price_arrays(prices_df, t)
 
+    # Pre-extract column arrays to avoid per-row Series creation
+    ticker_arr = recommendations["ticker"].values
+    has_inst_type = "instrument_type" in recommendations.columns
+    has_amount = "amount_midpoint" in recommendations.columns
+    inst_type_arr = recommendations["instrument_type"].values if has_inst_type else None
+    amount_arr = recommendations["amount_midpoint"].values if has_amount else None
+
     rows = []
-    for idx, rec in recommendations.iterrows():
-        ticker = rec["ticker"]
-        rec_idx = tickers.index(ticker)
-        t_horizon = ticker_horizons[rec_idx]
+    for i in range(len(ticker_arr)):
+        ticker = ticker_arr[i]
+        t_horizon = ticker_horizons[i]
 
         cached = price_cache.get(ticker)
         if cached is None:
@@ -586,11 +592,11 @@ def evaluate_backtest(
 
         # Options leverage
         inst_type = "stock"
-        if "instrument_type" in rec.index:
-            val = rec["instrument_type"]
+        if inst_type_arr is not None:
+            val = inst_type_arr[i]
             if pd.notna(val):
                 inst_type = str(val)
-        amount = rec.get("amount_midpoint") if "amount_midpoint" in rec.index else None
+        amount = amount_arr[i] if amount_arr is not None else None
         leverage = estimate_options_leverage(inst_type, amount)
         leveraged_return_pct = return_pct * leverage
         alpha_pct = leveraged_return_pct - spy_ret

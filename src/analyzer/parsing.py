@@ -17,8 +17,8 @@ def clean_text(text: str | None) -> str:
 def _extract_ticker(asset_cell: str | None) -> str | None:
     if not asset_cell:
         return None
-    ticker_match = re.search(r'\(([A-Z][A-Z.\-]{0,5})\)', asset_cell)
-    return ticker_match.group(1) if ticker_match else None
+    ticker_match = re.search(r'\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)', asset_cell)
+    return ticker_match.group(1).upper() if ticker_match else None
 
 def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
     if not tx_type_cell:
@@ -144,7 +144,17 @@ def _column_index(headers: list[str], candidates: set[str]) -> int | None:
     return None
 
 
-def _column_indexes(header: list[str]) -> dict[str, int]:
+def _column_index_substring(headers: list[str], candidates: set[str]) -> int | None:
+    """Like _column_index but matches if any candidate is a substring of the normalized header."""
+    for idx, header in enumerate(headers):
+        normalized = _normalize_header(header)
+        for candidate in candidates:
+            if candidate in normalized:
+                return idx
+    return None
+
+
+def _column_indexes(header: list[str], next_row: list[str] | None = None) -> dict[str, int]:
     headers = [str(cell) for cell in header]
     indexes = {
         "asset": _column_index(headers, {"asset", "assetname", "description", "desc", "desciption"}),
@@ -156,6 +166,37 @@ def _column_indexes(header: list[str]) -> dict[str, int]:
             "valueamount", "price", "cost", "proceeds", "tradedamount",
         }),
     }
+    # If core columns are missing, try merging with next row (2-row header case)
+    if (indexes["asset"] is None or indexes["type"] is None or indexes["date"] is None) and next_row:
+        merged = []
+        for i, cell in enumerate(headers):
+            top = cell.strip()
+            bottom = str(next_row[i]).strip() if i < len(next_row) else ""
+            if top and bottom:
+                merged.append(f"{top} {bottom}")
+            elif bottom:
+                merged.append(bottom)
+            else:
+                merged.append(top)
+        indexes = {
+            "asset": _column_index(merged, {"asset", "assetname", "description", "desc", "desciption"}),
+            "owner": _column_index(merged, {"owner", "ownership", "ownercode", "reportedby"}),
+            "type": _column_index(merged, {"type", "transactiontype", "txtype", "transaction", "txtype"}),
+            "date": _column_index(merged, {"date", "transactiondate", "txdate", "notifdate", "notificationdate"}),
+            "amount": _column_index(merged, {
+                "amount", "transactionamount", "value", "transactionvalue",
+                "valueamount", "price", "cost", "proceeds", "tradedamount",
+            }),
+        }
+        # Substring fallback for all columns (e.g., "Owner Asset" contains "owner")
+        asset_cands = {"asset", "assetname", "description", "desc", "desciption"}
+        owner_cands = {"owner", "ownership", "ownercode", "reportedby"}
+        type_cands = {"type", "transactiontype", "txtype", "transaction"}
+        date_cands = {"date", "transactiondate", "txdate", "notifdate", "notificationdate"}
+        amount_cands = {"amount", "transactionamount", "value", "transactionvalue", "valueamount", "price", "cost", "proceeds", "tradedamount"}
+        for key, cands in [("asset", asset_cands), ("owner", owner_cands), ("type", type_cands), ("date", date_cands), ("amount", amount_cands)]:
+            if indexes[key] is None:
+                indexes[key] = _column_index_substring(merged, cands)
     if indexes["asset"] is None or indexes["type"] is None or indexes["date"] is None:
         return {"asset": 0, "type": 1, "date": 2}
     return indexes
@@ -180,7 +221,7 @@ def _find_amount_in_row(row: list) -> str | None:
     return None
 
 
-def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | None:
+def _process_row(row: list, indexes: dict[str, int] | None = None, next_row: list | None = None) -> dict | None:
     try:
         indexes = indexes or {"asset": 0, "type": 1, "date": 2}
         asset_cell = _get_cell(row, indexes.get("asset"))
@@ -190,6 +231,21 @@ def _process_row(row: list, indexes: dict[str, int] | None = None) -> dict | Non
         ticker = _extract_ticker(asset_cell)
         tx_type = _extract_transaction_type(tx_type_cell)
         tx_date = _extract_date(date_cell)
+
+        # Fix 5: If no ticker, no tx_type, and no date — row looks like a continuation.
+        # Try merging asset cell with next row's asset cell.
+        if not ticker and not tx_type and not tx_date and next_row:
+            next_asset = _get_cell(next_row, indexes.get("asset"))
+            if next_asset:
+                merged = f"{asset_cell or ''} {next_asset}".strip()
+                ticker = _extract_ticker(merged)
+                if ticker:
+                    asset_cell = merged
+                    # Also pull tx_type and date from the next row
+                    tx_type_cell = _get_cell(next_row, indexes.get("type"))
+                    date_cell = _get_cell(next_row, indexes.get("date"))
+                    tx_type = _extract_transaction_type(tx_type_cell)
+                    tx_date = _extract_date(date_cell)
 
         if ticker and tx_type and tx_date:
             amount_cell = _get_cell(row, indexes.get("amount"))
@@ -240,9 +296,38 @@ def parse_pdf_table(table: list) -> list[dict]:
     header_idx = _find_header_row(table)
     if header_idx is None:
         header_idx = 0
-    indexes = _column_indexes(table[header_idx])
-    data_rows = table[header_idx + 1:]
-    return [tx for tx in (_process_row(row, indexes) for row in data_rows) if tx]
+
+    # Pass next row for 2-row header detection
+    next_header_row = table[header_idx + 1] if header_idx + 1 < len(table) else None
+    indexes = _column_indexes(table[header_idx], next_header_row)
+
+    # Determine how many rows to skip for data (1 for single-row header, 2 for 2-row header)
+    data_start = header_idx + 1
+    if next_header_row is not None:
+        # If merged headers were needed (core columns were None before merge), skip 2 rows
+        pre_merge_indexes = _column_indexes(table[header_idx])
+        if pre_merge_indexes.get("asset") is None or pre_merge_indexes.get("type") is None or pre_merge_indexes.get("date") is None:
+            data_start = header_idx + 2
+
+    data_rows = table[data_start:]
+    results = []
+    skip_next = False
+    for i, row in enumerate(data_rows):
+        if skip_next:
+            skip_next = False
+            continue
+        next_row = data_rows[i + 1] if i + 1 < len(data_rows) else None
+        tx = _process_row(row, indexes, next_row)
+        if tx:
+            results.append(tx)
+            # If we merged with next_row, skip it to avoid duplicate
+            if next_row and not _extract_ticker(_get_cell(row, indexes.get("asset"))):
+                next_asset = _get_cell(next_row, indexes.get("asset"))
+                if next_asset:
+                    merged = f"{_get_cell(row, indexes.get('asset')) or ''} {next_asset}".strip()
+                    if _extract_ticker(merged):
+                        skip_next = True
+    return results
 
 
 def normalize_house_metadata(content: str) -> pd.DataFrame:
@@ -329,7 +414,7 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
         if not stripped:
             continue
 
-        ticker_match = re.search(r'\(([A-Z][A-Z0-9.\-]{0,5})\)', stripped)
+        ticker_match = re.search(r'\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)', stripped)
         amount_match = re.search(r'\$[\d,]+\s*-\s*\$[\d,]+', stripped)
         amount_str = amount_match.group(0) if amount_match else None
 

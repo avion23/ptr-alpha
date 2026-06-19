@@ -24,6 +24,7 @@ from analyzer.parsing import (
     extract_tables_with_ocr,
     normalize_house_metadata,
     parse_pdf_table,
+    _parse_ocr_text_to_rows,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,19 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
         tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
         engines_attempted.append("lattice")
         for table in tables:
-            transactions.extend(parse_pdf_table(table.data))
+            data = table.data
+            # Fix 1: If lattice produced a 1-column table (null bytes collapse),
+            # split cell content by newlines and parse as OCR text
+            if data and len(data[0]) == 1:
+                for row in data:
+                    cell_text = row[0] if row else ""
+                    if cell_text:
+                        ocr_rows = _parse_ocr_text_to_rows(cell_text)
+                        if ocr_rows:
+                            ocr_table = [['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']] + ocr_rows
+                            transactions.extend(parse_pdf_table(ocr_table))
+            else:
+                transactions.extend(parse_pdf_table(data))
     except Exception as e:
         logger.debug(f"Lattice failed for {pdf_path}: {e}")
 
@@ -47,8 +60,12 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
         try:
             tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="stream")
             engines_attempted.append("stream")
+            # Fix 2: Try ALL detected tables, not just the first one
             for table in tables:
-                transactions.extend(parse_pdf_table(table.data))
+                txs = parse_pdf_table(table.data)
+                if txs:
+                    transactions.extend(txs)
+                    break  # Found transactions, stop scanning
         except Exception as e:
             logger.debug(f"Stream failed for {pdf_path}: {e}")
 

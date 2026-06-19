@@ -209,7 +209,8 @@ class TestParsing(unittest.TestCase):
     def test_extract_ticker_no_parens(self):
         self.assertIsNone(_extract_ticker("Apple Inc"))
         self.assertIsNone(_extract_ticker("Some Company Name"))
-        self.assertIsNone(_extract_ticker("lowercase (nope)"))
+        # Lowercase tickers are now accepted (case-insensitive) and uppercased
+        self.assertEqual(_extract_ticker("lowercase (nope)"), "NOPE")
 
     def test_extract_ticker_empty(self):
         self.assertIsNone(_extract_ticker(""))

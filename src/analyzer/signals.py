@@ -221,7 +221,11 @@ def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> p
             agg_dict[col] = (col, func)
 
     if "owner_code" in df.columns:
-        agg_dict["owner_code"] = ("owner_code", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
+        # Use first() instead of mode() — mode() calls Series.mode() per group
+        # which is O(N log N) and dominates _collapse_to_episodes cost.
+        # Within an episode (same member/ticker, ≤14d gap), owner_code is
+        # effectively constant so first() is equivalent.
+        agg_dict["owner_code"] = ("owner_code", "first")
 
     for col in existing_avg_cols:
         agg_dict[col] = (f"_wp_{col}", "sum")

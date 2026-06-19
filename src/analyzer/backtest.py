@@ -240,22 +240,23 @@ def _build_curves_for_rows(
 
 
 @df_memoize(copy=False)
-def _compute_ticker_entry_value(
+def _compute_ticker_ou_params(
     ticker: str,
     signals_df: pd.DataFrame,
     prices_df: pd.DataFrame,
     as_of_date: pd.Timestamp,
     horizon: int,
     rho: float = 0.000137,
-) -> float | None:
-    """Compute OU entry value V(0) for a ticker from historical return curves.
+) -> tuple[float | None, int]:
+    """Compute both OU entry value V(0) and optimal horizon for a ticker.
 
-    Falls back to global prior (average across all tickers) if ticker has
-    no prior disclosure history. Result depends only on
-    (ticker, signals_df, prices_df, as_of_date, horizon, rho), so it is
-    memoized via :func:`df_memoize` and shared across sweep combos.
+    Builds curves once and fits OU once, returning both V0 and optimal
+    holding period.  Falls back to global prior (average across all
+    tickers) when the ticker has no own disclosure history.
+
+    Returns (v0, optimal_horizon).
     """
-    from analyzer.return_process import compute_entry_value
+    from analyzer.return_process import compute_entry_value_and_horizon
 
     ticker_col = ticker in prices_df.columns if hasattr(prices_df, "columns") else False
 
@@ -265,20 +266,29 @@ def _compute_ticker_entry_value(
             ticker, signals_df, prices_df, as_of_date, horizon
         )
 
-    if curves:
-        v0, _mu, _theta = compute_entry_value(curves, rho=rho)
-        return v0
+    if not curves and ticker_col:
+        curves = _build_global_curves(
+            signals_df, prices_df, as_of_date, horizon
+        )
 
-    if not ticker_col:
-        return None
+    if not curves:
+        return (None, horizon) if ticker_col else (None, horizon)
 
-    global_curves = _build_global_curves(
-        signals_df, prices_df, as_of_date, horizon
-    )
-    if not global_curves:
-        return None
+    v0, _mu, _theta, optimal_h = compute_entry_value_and_horizon(curves, rho=rho)
+    return v0, optimal_h
 
-    v0, _mu, _theta = compute_entry_value(global_curves, rho=rho)
+
+@df_memoize(copy=False)
+def _compute_ticker_entry_value(
+    ticker: str,
+    signals_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    as_of_date: pd.Timestamp,
+    horizon: int,
+    rho: float = 0.000137,
+) -> float | None:
+    """Compute OU entry value V(0) for a ticker from historical return curves."""
+    v0, _ = _compute_ticker_ou_params(ticker, signals_df, prices_df, as_of_date, horizon, rho)
     return v0
 
 
@@ -293,17 +303,8 @@ def _compute_ticker_optimal_horizon(
     max_horizon: int = 120,
 ) -> int:
     """Compute optimal holding period for a ticker from historical curves."""
-    from analyzer.return_process import compute_optimal_horizon
-
-    ticker_col = ticker in prices_df.columns
-    if not ticker_col:
-        return horizon
-
-    curves = _build_ticker_curves(ticker, signals_df, prices_df, as_of_date, horizon)
-    if not curves:
-        return horizon
-
-    return compute_optimal_horizon(curves, min_horizon=min_horizon, max_horizon=max_horizon)
+    _v0, optimal_h = _compute_ticker_ou_params(ticker, signals_df, prices_df, as_of_date, horizon)
+    return max(min_horizon, min(max_horizon, optimal_h))
 
 
 def backtest_recommendations(
@@ -373,86 +374,99 @@ def backtest_recommendations(
         as_of_date.date() if hasattr(as_of_date, "date") else as_of_date
     )
 
-    # Precompute buyer_bayes_dict from member_rankings for O(1) lookups
+    # Pre-build buyer_bayes_dict from member_rankings for O(1) lookups
     # (avoids repeated linear scans in _lookup_buyer_bayes_win_prob)
+    from analyzer.member_ranking import _build_buyer_bayes_dict
+    buyer_bayes_dict = _build_buyer_bayes_dict(member_rankings)
+
+    # Pre-check which tickers have prices (avoids per-ticker hasattr)
+    has_prices = prices_df is not None
+    price_cols = set(prices_df.columns) if has_prices else set()
+
+    # Pre-compute instrument_type and amount_midpoint maps from recent_trades
+    # once, outside the ticker loop.
+    inst_map: dict = {}
+    amt_map: dict = {}
+    if has_prices and "instrument_type" in recent_trades.columns:
+        inst_map = (
+            recent_trades.drop_duplicates("ticker")
+            .set_index("ticker")["instrument_type"]
+            .to_dict()
+        )
+    if has_prices and "amount_midpoint" in recent_trades.columns:
+        amt_map = (
+            recent_trades.drop_duplicates("ticker")
+            .set_index("ticker")["amount_midpoint"]
+            .to_dict()
+        )
 
     scores = []
     for ticker in candidate_tickers:
-        try:
-            # score_ticker_by_buyers, _compute_ticker_entry_value and
-            # compute_signal_features are all `@df_memoize`'d. Their cache
-            # keys are content-stable because their DataFrame inputs
-            # (training, recent_trades, ticker_perf_signals, signals_df,
-            # prices_df) all have stable identities across sweep calls.
-            score_df = score_ticker_by_buyers(
-                ticker, recent_trades, training, horizon, threshold,
-                member_rankings, min_buyers,
-                ticker_perf_signals=ticker_perf_signals,
-                _bayes_prior_strength=bayes,
-                solo_buyer_skill_threshold=solo_buyer_skill_threshold,
-            )
+        # score_ticker_by_buyers is @df_memoize'd — cache keys are stable
+        # because their DataFrame inputs have stable identities.
+        score_df = score_ticker_by_buyers(
+            ticker, recent_trades, training, horizon, threshold,
+            member_rankings, min_buyers,
+            ticker_perf_signals=ticker_perf_signals,
+            _bayes_prior_strength=bayes,
+            solo_buyer_skill_threshold=solo_buyer_skill_threshold,
+        )
 
-            # Extract score scalars into a dict to avoid DataFrame mutations
-            # (avoids N × __setitem__ overhead on 1-row DataFrames).
-            row = {c: score_df[c].iloc[0] for c in score_df.columns}
-
-            # Compute OU entry value V(0) if prices available
-            if prices_df is not None:
-                v0 = _compute_ticker_entry_value(
-                    ticker, signals_df, prices_df, as_of_date, horizon,
-                )
-                row["ou_entry_value"] = round(v0, 4) if v0 is not None else None
-
-                # Compute optimal holding period from OU half-life
-                optimal_h = _compute_ticker_optimal_horizon(
-                    ticker, signals_df, prices_df, as_of_date, horizon,
-                )
-                row["optimal_horizon"] = optimal_h
-
-            # Compute signal features and crash hazard for this ticker
-            # Use the most recent transaction date for this ticker
-            ticker_recent = recent_by_ticker.get(ticker, pd.DataFrame())
-            if not ticker_recent.empty and prices_df is not None:
-                try:
-                    latest_tx = ticker_recent.sort_values("disclosure_date").iloc[-1]
-                    tx_date = latest_tx.get("transaction_date")
-                    if tx_date is not None:
-                        tx_date = pd.Timestamp(tx_date).date()
-                    disc_date = pd.Timestamp(latest_tx["disclosure_date"]).date()
-
-                    features = compute_signal_features(
-                        ticker=ticker,
-                        disclosure_date=disc_date,
-                        transaction_date=tx_date,
-                        prices_df=prices_df,
-                        all_tx=recent_trades,
-                        as_of_date=as_of_for_features,
-                    )
-                    crash = estimate_crash_hazard(features)
-
-                    # Apply lag weight
-                    lag_weight = compute_disclosure_lag_weight(features.lag_days)
-                    base_score = float(row.get("signal_score", 0))
-                    adjusted_score = base_score * lag_weight
-
-                    # Apply crash penalty (only if crash_prob is reasonable)
-                    if 0.0 <= crash.crash_prob <= 1.0:
-                        adjusted_score *= (1 - crash.crash_prob)
-
-                    row["signal_score"] = round(adjusted_score, 2)
-                    row["lag_days"] = features.lag_days
-                    row["lag_weight"] = round(lag_weight, 4)
-                    row["crash_prob"] = crash.crash_prob
-                    row["crash_var_95"] = crash.var_95
-                    row["volatility_20d"] = round(features.volatility_20d, 4)
-                    row["drawdown_from_ath"] = round(features.drawdown_from_ath, 4)
-                except Exception:
-                    # Crash hazard estimation can fail on edge cases — keep base score
-                    pass
-
-            scores.append(row)
-        except AnalysisError:
+        if score_df.empty:
             continue
+
+        # Extract score scalars into a dict to avoid DataFrame mutations
+        # (avoids N x __setitem__ overhead on 1-row DataFrames).
+        row = {c: score_df[c].iloc[0] for c in score_df.columns}
+
+        # Compute OU entry value V(0) + optimal horizon in one pass
+        if has_prices and ticker in price_cols:
+            v0, optimal_h = _compute_ticker_ou_params(
+                ticker, signals_df, prices_df, as_of_date, horizon,
+            )
+            row["ou_entry_value"] = round(v0, 4) if v0 is not None else None
+            row["optimal_horizon"] = optimal_h
+        else:
+            row["ou_entry_value"] = None
+            row["optimal_horizon"] = horizon
+
+        # Compute signal features and crash hazard for this ticker
+        ticker_recent = recent_by_ticker.get(ticker)
+        if ticker_recent is not None and has_prices:
+            latest_tx = ticker_recent.sort_values("disclosure_date").iloc[-1]
+            tx_date = latest_tx.get("transaction_date")
+            if tx_date is not None:
+                tx_date = pd.Timestamp(tx_date).date()
+            disc_date = pd.Timestamp(latest_tx["disclosure_date"]).date()
+
+            features = compute_signal_features(
+                ticker=ticker,
+                disclosure_date=disc_date,
+                transaction_date=tx_date,
+                prices_df=prices_df,
+                all_tx=recent_trades,
+                as_of_date=as_of_for_features,
+            )
+            crash = estimate_crash_hazard(features)
+
+            # Apply lag weight
+            lag_weight = compute_disclosure_lag_weight(features.lag_days)
+            base_score = float(row.get("signal_score", 0))
+            adjusted_score = base_score * lag_weight
+
+            # Apply crash penalty (only if crash_prob is reasonable)
+            if 0.0 <= crash.crash_prob <= 1.0:
+                adjusted_score *= (1 - crash.crash_prob)
+
+            row["signal_score"] = round(adjusted_score, 2)
+            row["lag_days"] = features.lag_days
+            row["lag_weight"] = round(lag_weight, 4)
+            row["crash_prob"] = crash.crash_prob
+            row["crash_var_95"] = crash.var_95
+            row["volatility_20d"] = round(features.volatility_20d, 4)
+            row["drawdown_from_ath"] = round(features.drawdown_from_ath, 4)
+
+        scores.append(row)
 
     if not scores:
         return pd.DataFrame()
@@ -469,20 +483,11 @@ def backtest_recommendations(
     result.insert(0, "rank", range(1, len(result) + 1))
 
     # Propagate instrument_type and amount_midpoint from recent trades so
-    # evaluate_backtest can apply options leverage.
-    if "instrument_type" in recent_trades.columns:
-        inst_map = (
-            recent_trades.drop_duplicates("ticker")
-            .set_index("ticker")["instrument_type"]
-            .to_dict()
-        )
+    # evaluate_backtest can apply options leverage.  Maps were precomputed
+    # above, outside the ticker loop.
+    if inst_map:
         result["instrument_type"] = result["ticker"].map(inst_map).fillna("stock")
-    if "amount_midpoint" in recent_trades.columns:
-        amt_map = (
-            recent_trades.drop_duplicates("ticker")
-            .set_index("ticker")["amount_midpoint"]
-            .to_dict()
-        )
+    if amt_map:
         result["amount_midpoint"] = result["ticker"].map(amt_map)
 
     return result
@@ -505,23 +510,37 @@ def evaluate_backtest(
 
     from analyzer.options import estimate_options_leverage
 
+    # Precompute slippage multipliers and ns-per-day constant
+    entry_mult = 1.0 + entry_slippage_bps / 10000
+    exit_mult = 1.0 - exit_slippage_bps / 10000
+    NS_PER_DAY = 86_400_000_000_000
+
     # ── Precompute SPY benchmark once per as_of_date (hoisted out of loop) ──
     # Use the max horizon across all recs so we can compute all spy exits at once.
     horizons = recommendations["optimal_horizon"].values if "optimal_horizon" in recommendations.columns else None
     max_h = int(horizons.max()) if horizons is not None else horizon
 
-    spy_start = _price_at_or_before(prices_df, "SPY", as_of_date, max_staleness_days)
-    # Precompute spy_end for each unique horizon
+    # Pre-extract SPY price arrays once (avoids repeated _price_arrays lookups)
+    spy_arrs = _price_arrays(prices_df, "SPY")
+    spy_ns, spy_vals = (spy_arrs if spy_arrs and spy_arrs[0] is not None else (None, None))
+
+    spy_start = None
+    spy_entry_adj = 0.0
+    if spy_ns is not None:
+        spy_start = _price_at_or_before_arrays(spy_ns, spy_vals, as_of_date, max_staleness_days)
+        if spy_start:
+            spy_entry_adj = spy_start * entry_mult
+
+    # Precompute spy_end for each unique horizon using arrays
     spy_ends: dict[int, float | None] = {}
     spy_returns: dict[int, float] = {}
     if spy_start:
-        spy_entry_adj = spy_start * (1 + entry_slippage_bps / 10000)
         for h in set(horizons) if horizons is not None else [horizon]:
-            spy_exit_date = as_of_date + pd.Timedelta(days=int(h))
-            se = _price_on_or_before(prices_df, "SPY", spy_exit_date, max_staleness_days=30)
+            spy_exit_ns = as_of_date.value + int(h) * NS_PER_DAY
+            se = _price_on_or_before_arrays(spy_ns, spy_vals, pd.Timestamp(spy_exit_ns), max_staleness_days=30)
             spy_ends[h] = se
             if se:
-                spy_exit_adj = se * (1 - exit_slippage_bps / 10000)
+                spy_exit_adj = se * exit_mult
                 spy_returns[h] = round((spy_exit_adj / spy_entry_adj - 1) * 100, 2)
             else:
                 spy_returns[h] = 0.0
@@ -574,19 +593,20 @@ def evaluate_backtest(
         if not entry:
             continue
 
-        actual_entry_date = as_of_date + pd.Timedelta(days=entry_delay)
-        exit_date = actual_entry_date + pd.Timedelta(days=t_horizon)
-        exit_price = _price_on_or_before_arrays(idx_ns, vals, exit_date, max_staleness_days=30)
+        # Compute exit date as ns timestamp directly (avoids Timedelta creation)
+        as_of_ns = as_of_date.value
+        exit_ns = as_of_ns + (entry_delay + t_horizon) * NS_PER_DAY
+        exit_price = _price_on_or_before_arrays(idx_ns, vals, pd.Timestamp(exit_ns), max_staleness_days=30)
         if not exit_price:
             continue
 
-        entry_adj = entry * (1 + entry_slippage_bps / 10000)
-        exit_adj = exit_price * (1 - exit_slippage_bps / 10000)
+        entry_adj = entry * entry_mult
+        exit_adj = exit_price * exit_mult
         return_pct = (exit_adj / entry_adj - 1) * 100
 
         # SPY benchmark (precomputed)
         spy_ret = spy_returns.get(t_horizon, 0.0)
-        if not spy_start or spy_ret == 0.0 and not spy_ends.get(t_horizon):
+        if not spy_start or (spy_ret == 0.0 and not spy_ends.get(t_horizon)):
             # Spy lookup failed for this horizon — skip rec
             continue
 
@@ -596,7 +616,7 @@ def evaluate_backtest(
             val = inst_type_arr[i]
             if pd.notna(val):
                 inst_type = str(val)
-        amount = amount_arr[i] if amount_arr is not None else None
+        amount = amount_arr[i] if has_amount else None
         leverage = estimate_options_leverage(inst_type, amount)
         leveraged_return_pct = return_pct * leverage
         alpha_pct = leveraged_return_pct - spy_ret

@@ -114,6 +114,10 @@ def _prepare_analysis_data(
     if len(trades) == 0:
         raise DataSourceError("No trading data found")
 
+    # Filter out transactions with NULL tickers (from parser failures)
+    trades = trades[trades['ticker'].notna()].copy()
+    logger.info(f"After filtering NULL tickers: {len(trades)} transactions")
+
     start_date = trades['disclosure_date'].min() - timedelta(days=30)
     end_date = trades['disclosure_date'].max() + timedelta(days=max(horizons) + 10)
 
@@ -244,6 +248,11 @@ def run_backtest_pipeline(
     price_start = tx_start
     price_end = params.end_date + timedelta(days=params.horizon + 10)
     all_tickers = all_transactions["ticker"].unique().tolist()
+    all_tickers = [t for t in all_tickers if t and str(t).strip() and str(t) != "nan"]
+    # Filter out non-stock tickers (OCR garbage) - same regex as datasources.py
+    import re
+    _valid_ticker_re = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+    all_tickers = [t for t in all_tickers if _valid_ticker_re.match(str(t))]
     all_tickers = sorted(set(all_tickers) | {"SPY"})
 
     # Create price snapshot for reproducibility

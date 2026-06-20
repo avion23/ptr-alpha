@@ -354,7 +354,18 @@ class YFinancePriceSource(PriceSource):
         if len(tickers) == 0:
             raise DataSourceError("No tickers provided for price fetching")
 
-        all_tickers = sorted(list(set(tickers) | {"SPY"}))
+        # Filter out NaN/None/empty tickers (from NULL DB values read as numpy NaN)
+        clean_tickers = [t for t in tickers if t and str(t).strip() and str(t) != "nan"]
+
+        # Filter out tickers that can't possibly be real stock tickers.
+        # OCR garbage from scanned PDFs produces things like "--", "NY", "US",
+        # common English words, etc. Real tickers: 1-5 uppercase letters, optionally
+        # with dot or dash for class shares (e.g. BRK.B, BF-B, CWEN-A).
+        import re
+        _valid_ticker_re = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+        all_tickers = sorted(
+            list(set(t for t in clean_tickers if _valid_ticker_re.match(str(t))) | {"SPY"})
+        )
 
         # Resolve raw tickers to yfinance-compatible symbols
         resolutions = self.resolver.resolve_batch(all_tickers)

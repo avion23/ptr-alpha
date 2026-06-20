@@ -115,6 +115,43 @@ def _compute_member_sector_skills(
     return sector_alphas
 
 
+def _compute_member_sector_skills_from_group(
+    member_signals: pd.DataFrame,
+    horizon: int,
+    ref_date: pd.Timestamp,
+    recency_half_life_days: int,
+) -> dict[str, float]:
+    """Compute sector-specific skill from a pre-filtered member group.
+
+    Same logic as _compute_member_sector_skills but assumes the caller has
+    already filtered by member. Avoids repeated full-table boolean masks.
+    """
+    if member_signals.empty:
+        return {}
+
+    filtered = member_signals[
+        (member_signals["horizon_days"] == horizon)
+        & (member_signals["signal_type"] == TransactionType.PURCHASE.value)
+        & (member_signals["disclosure_date"] <= ref_date - pd.Timedelta(days=horizon))
+        & (member_signals["spy_alpha_pct"].notna())
+    ]
+
+    if filtered.empty:
+        return {}
+
+    days_ago = (ref_date - pd.to_datetime(filtered["disclosure_date"])).dt.days
+    days_ago = days_ago.clip(lower=0)
+    weight = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
+    alpha_weighted = filtered["spy_alpha_pct"].values * weight
+
+    grp = filtered.groupby("ticker")
+    weight_sums = grp["_weight"].sum() if "_weight" in filtered.columns else pd.Series(weight, index=filtered.index).groupby(filtered["ticker"]).sum()
+    alpha_sums = pd.Series(alpha_weighted, index=filtered.index).groupby(filtered["ticker"]).sum()
+
+    valid = weight_sums > 0
+    return {t: float(alpha_sums[t]) / float(weight_sums[t]) for t in weight_sums.index[valid]}
+
+
 def estimate_member_skills(
     signals_df: pd.DataFrame,
     min_episodes: int = 1,
@@ -179,13 +216,20 @@ def estimate_member_skills(
     global_std = sqrt(global_var)
 
     posteriors: dict[str, MemberSkillPosterior] = {}
+    # Pre-group signals_df by member to avoid repeated full-table scans
+    member_groups: dict[str, pd.DataFrame] = {}
+    for m in qualifying:
+        if m not in member_groups:
+            member_groups[m] = signals_df[signals_df["member"] == m]
+
     for member, (raw_alpha, weight_sum, n) in qualifying.items():
         shrinkage = prior_strength / (n + prior_strength)
         posterior_mean = (1 - shrinkage) * raw_alpha + shrinkage * global_mean
         posterior_std = global_std / sqrt(n + prior_strength)
 
-        sector_skills = _compute_member_sector_skills(
-            signals_df, member, horizon, ref_date, recency_half_life_days
+        member_signals = member_groups.get(member, pd.DataFrame())
+        sector_skills = _compute_member_sector_skills_from_group(
+            member_signals, horizon, ref_date, recency_half_life_days
         )
 
         posteriors[member] = MemberSkillPosterior(

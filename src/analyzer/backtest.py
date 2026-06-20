@@ -54,9 +54,9 @@ def _find_dip_entry_arrays(
         return 0.0, 0
 
     target_price = disc_price * (1 - pullback_pct)
-    for i in range(len(window_vals)):
-        if window_vals[i] <= target_price:
-            return float(window_vals[i]), i
+    hits = np.where(window_vals <= target_price)[0]
+    if len(hits) > 0:
+        return float(window_vals[hits[0]]), int(hits[0])
 
     return disc_price, 0
 
@@ -432,7 +432,8 @@ def backtest_recommendations(
         # Compute signal features and crash hazard for this ticker
         ticker_recent = recent_by_ticker.get(ticker)
         if ticker_recent is not None and has_prices:
-            latest_tx = ticker_recent.sort_values("disclosure_date").iloc[-1]
+            latest_idx = ticker_recent["disclosure_date"].idxmax()
+            latest_tx = ticker_recent.loc[latest_idx]
             tx_date = latest_tx.get("transaction_date")
             if tx_date is not None:
                 tx_date = pd.Timestamp(tx_date).date()

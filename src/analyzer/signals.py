@@ -158,16 +158,16 @@ def _price_on_or_before(
 def _get_horizon_data(
     signals_df: pd.DataFrame, horizon: int, transaction_type: str | None = None
 ) -> pd.DataFrame:
-    data = signals_df[signals_df["horizon_days"] == horizon]
+    mask = signals_df["horizon_days"] == horizon
     if transaction_type is not None:
-        data = data[data["signal_type"] == transaction_type]
-    return data
+        mask = mask & (signals_df["signal_type"] == transaction_type)
+    return signals_df.loc[mask]
 
 
 def _apply_quality_filter(signals_df: pd.DataFrame) -> pd.DataFrame:
     if "entry_price" not in signals_df.columns:
         return signals_df
-    return signals_df[signals_df["entry_price"] >= MIN_ENTRY_PRICE].copy()
+    return signals_df[signals_df["entry_price"] >= MIN_ENTRY_PRICE]
 
 
 def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:

@@ -158,15 +158,10 @@ def compute_signal_features(
 
         # Price at transaction date (first price >= tx_ts AND <= as_of_ts)
         pos_tx = int(np.searchsorted(idx_ns, tx_ns, side="left"))
-        # Walk forward to find first price >= tx_ts
-        while pos_tx < len(idx_ns) and idx_ns[pos_tx] < tx_ns:
-            pos_tx += 1
         if pos_tx < len(idx_ns) and idx_ns[pos_tx] <= as_of_ns:
             p_tx = float(vals[pos_tx])
             # Price at disclosure date (first price >= disc_ts AND <= as_of_ts)
             pos_disc = int(np.searchsorted(idx_ns, disc_ns, side="left"))
-            while pos_disc < len(idx_ns) and idx_ns[pos_disc] < disc_ns:
-                pos_disc += 1
             if pos_disc < len(idx_ns) and idx_ns[pos_disc] <= as_of_ns:
                 p_disc = float(vals[pos_disc])
                 if p_tx > 0:
@@ -178,14 +173,10 @@ def compute_signal_features(
                         spy_ns, spy_vals = spy_arrs
                         # SPY at transaction date
                         sp = int(np.searchsorted(spy_ns, tx_ns, side="left"))
-                        while sp < len(spy_ns) and spy_ns[sp] < tx_ns:
-                            sp += 1
                         if sp < len(spy_ns) and spy_ns[sp] <= as_of_ns:
                             spy_p_tx = float(spy_vals[sp])
                             # SPY at disclosure date
                             sd = int(np.searchsorted(spy_ns, disc_ns, side="left"))
-                            while sd < len(spy_ns) and spy_ns[sd] < disc_ns:
-                                sd += 1
                             if sd < len(spy_ns) and spy_ns[sd] <= as_of_ns:
                                 spy_p_disc = float(spy_vals[sd])
                                 if spy_p_tx > 0:

@@ -20,19 +20,21 @@ from analyzer.signals import (
 from analyzer._memo import df_memoize
 
 
-def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55) -> float:
-    alpha = market_prior * _signals.BAYES_PRIOR_STRENGTH
-    beta = (1 - market_prior) * _signals.BAYES_PRIOR_STRENGTH
+def bayesian_win_probability(wins: int, losses: int, market_prior: float = 0.55, prior_strength: float | None = None) -> float:
+    ps = prior_strength if prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
+    alpha = market_prior * ps
+    beta = (1 - market_prior) * ps
     return (alpha + wins) / (alpha + beta + wins + losses)
 
 
-def bayes_factor_against_market(wins: int, losses: int, market_prior: float = 0.55) -> float:
+def bayes_factor_against_market(wins: int, losses: int, market_prior: float = 0.55, prior_strength: float | None = None) -> float:
     observations = wins + losses
     if observations == 0:
         return 1.0
+    ps = prior_strength if prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
     market_prior = float(np.clip(market_prior, 1e-6, 1 - 1e-6))
-    alpha = market_prior * _signals.BAYES_PRIOR_STRENGTH
-    beta = (1 - market_prior) * _signals.BAYES_PRIOR_STRENGTH
+    alpha = market_prior * ps
+    beta = (1 - market_prior) * ps
     log_marginal = (
         lgamma(alpha + wins)
         + lgamma(beta + losses)
@@ -194,16 +196,7 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90, threshold: float = 
 
     bayes_prior = _bayes_prior_strength if _bayes_prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
 
-    # bayesian_win_probability / bayes_factor_against_market read the module
-    # global BAYES_PRIOR_STRENGTH from the signals module. Temporarily set it
-    # so the computation reflects the correct prior for this call, then restore.
-    _saved_bayes = _signals.BAYES_PRIOR_STRENGTH
-    _signals.BAYES_PRIOR_STRENGTH = bayes_prior
-
-    try:
-        return _rank_members_impl(signal_df, horizon, threshold, bayes_prior)
-    finally:
-        _signals.BAYES_PRIOR_STRENGTH = _saved_bayes
+    return _rank_members_impl(signal_df, horizon, threshold, bayes_prior)
 
 
 @df_memoize(copy=False)
@@ -446,14 +439,14 @@ def _build_ranking_dicts(
     has_shrunk = "shrunk_alpha" in member_rankings.columns
     alpha_col = "shrunk_alpha" if has_shrunk else "avg_spy_alpha_pct"
 
-    alpha = {}
-    trades = {}
-    prob = {}
-    for _, row in member_rankings.iterrows():
-        m = row["member"]
-        alpha[m] = float(row[alpha_col]) if pd.notna(row.get(alpha_col)) else 0.0
-        trades[m] = int(row.get("purchase_trades", 0)) if pd.notna(row.get("purchase_trades")) else 0
-        prob[m] = float(row.get("bayes_win_prob", 0.5)) if pd.notna(row.get("bayes_win_prob")) else 0.5
+    # Vectorized dict construction (avoids iterrows — O(N) Series allocs)
+    cols = ["member", alpha_col, "purchase_trades"]
+    if "bayes_win_prob" in member_rankings.columns:
+        cols.append("bayes_win_prob")
+    valid = member_rankings[cols].dropna(subset=["member"])
+    alpha = dict(zip(valid["member"], valid[alpha_col].astype(float)))
+    trades = dict(zip(valid["member"], valid["purchase_trades"].fillna(0).astype(int)))
+    prob = dict(zip(valid["member"], valid["bayes_win_prob"].fillna(0.5).astype(float))) if "bayes_win_prob" in valid.columns else {}
 
     return {"alpha": alpha, "trades": trades, "prob": prob, "has_shrunk": has_shrunk}
 

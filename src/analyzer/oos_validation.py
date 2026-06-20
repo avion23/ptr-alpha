@@ -8,17 +8,14 @@ Usage:
 from __future__ import annotations
 
 import json
-import sys
-sys.argv = ["ptr-alpha"]
-
-import pandas as pd
-import numpy as np
 from pathlib import Path
 from datetime import date
 
+import numpy as np
+import pandas as pd
+
 from analyzer.database import Database
 from analyzer import analysis
-from analyzer.pipeline import BacktestParams
 
 
 # Best config from parameter sweeps
@@ -45,12 +42,6 @@ def run_backtest_split(
     label: str = "",
 ) -> dict:
     """Run backtest for a date range and return summary metrics."""
-    params = BacktestParams(
-        start_date=start_date, end_date=end_date,
-        horizon=horizon, lookback_days=60, training_lookback_days=365,
-        min_buyers=min_buyers, top_n=top_n, threshold=5.0, frequency_days=30,
-    )
-
     signals = analysis.calculate_signal_potential(entry_prices, prices, [horizon])
     as_of_dates = pd.date_range(start_date, end_date, freq="30D")
 
@@ -232,7 +223,7 @@ def main():
     is_slope = split_result["is"]["slope"]
     oos_slope = split_result["oos"]["slope"]
 
-    print(f"\n  Split OOS (IS=2022-23, OOS=2024-25):")
+    print("\n  Split OOS (IS=2022-23, OOS=2024-25):")
     print(f"    IS:  alpha={is_alpha:+.1f}%  slope={is_slope:+.1f}%  win={split_result['is']['win%']:.0f}%  N={split_result['is']['N']}")
     print(f"    OOS: alpha={oos_alpha:+.1f}%  slope={oos_slope:+.1f}%  win={split_result['oos']['win%']:.0f}%  N={split_result['oos']['N']}")
     print(f"    Ratio: {split_result['oos_is_ratio']:.2f}")
@@ -242,7 +233,7 @@ def main():
     wf_slopes = [f["oos"]["slope"] for f in wf_result["folds"]]
     wf_ratios = [f["oos_is_ratio"] for f in wf_result["folds"]]
 
-    print(f"\n  Walk-Forward (3 folds):")
+    print("\n  Walk-Forward (3 folds):")
     for fr in wf_result["folds"]:
         o = fr["oos"]
         print(f"    {fr['fold']:45s} alpha={o['alpha']:+6.1f}% slope={o['slope']:+6.1f}% ratio={fr['oos_is_ratio']:.2f}")
@@ -252,16 +243,16 @@ def main():
     # Robustness assessment
     positive_oos = sum(1 for a in wf_alphas if a > 0)
     slope_robust = sum(1 for s in wf_slopes if s > 0)
-    print(f"\n  Robustness:")
+    print("\n  Robustness:")
     print(f"    Positive OOS alpha in {positive_oos}/3 folds")
     print(f"    Positive OOS slope (r1>r5) in {slope_robust}/3 folds")
     print(f"    Avg OOS/IS ratio: {avg_ratio:.2f}")
     if positive_oos >= 2 and avg_ratio > 0.3:
-        print(f"    -> SIGNAL IS ROBUST (alpha survives OOS)")
+        print("    -> SIGNAL IS ROBUST (alpha survives OOS)")
     elif positive_oos >= 1 and avg_ratio > 0.1:
-        print(f"    -> SIGNAL IS PARTIALLY ROBUST (some alpha survives)")
+        print("    -> SIGNAL IS PARTIALLY ROBUST (some alpha survives)")
     else:
-        print(f"    -> SIGNAL IS NOT ROBUST (alpha degrades OOS)")
+        print("    -> SIGNAL IS NOT ROBUST (alpha degrades OOS)")
 
     # ── Write JSON results ──
     output = {

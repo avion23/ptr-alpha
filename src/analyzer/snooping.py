@@ -310,7 +310,6 @@ def analyze_snooping(
     overall_alpha = float(row["overall_alpha"])
     sharpe = float(row["sharpe"])
     dates_evaluated = int(row.get("dates_evaluated", 0))
-    total_recs = int(row.get("total_recs", 0))
 
     # --- T-test on alpha_slope ---
     # Use the sweep-wide std of alpha_slope as a proxy for within-strategy std

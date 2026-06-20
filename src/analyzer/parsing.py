@@ -1,5 +1,29 @@
+"""PDF table extraction for House PTR disclosures.
+
+Engine pipeline (benchmark-driven, see data/pdf_converter_benchmark_*.json):
+  1. pdfplumber   — primary, 0.075s/PDF, MIT, handles text + encrypted PDFs
+  2. camelot lattice/stream — fallback for rulled/stream tables
+  3. pdftotext    — fallback for encrypted PDFs where pdfplumber returns 0
+  4. Docling      — OCR fallback for SCANNED IMAGE PDFs (no text layer).
+                    MIT license, IBM TableFormer; runs via `uvx` subprocess.
+                    Benchmark winner over Marker (better accuracy 75% vs 58%,
+                    MIT vs GPL, no Cyrillic-E OCR bug).
+  5. pytesseract  — last resort when docling is unavailable
+
+Benchmark results on 30 PTR PDFs (12 successful parses + 18 known failures):
+  - pdfplumber: 8/12 SUCCESS recovery, 4/18 FAILED recovery, 0.075s avg
+  - Docling:    9/12 SUCCESS recovery, 6/18 FAILED recovery, 43.4s avg
+  - Marker:     7/12 SUCCESS recovery, 6/18 FAILED recovery, 49.7s avg
+  (FAILED recovery is bounded by ~11/18 being bonds with no ticker by design)
+
+Decision: hybrid pdfplumber-primary + Docling-OCR. pdfplumber is 580x faster
+than Docling on text PDFs; Docling is the only tool that recovers the 4 large
+scanned 2024-2025 filings (8220660/0674/1212/0750, ~263 transactions).
+"""
+
 import logging
 import re
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -86,21 +110,40 @@ def _extract_instrument_type(asset_cell: str | None) -> str:
       - "NVIDIA Corp Common Stock Call Option (NVDA)"
       - "NVDA Call $120 Exp 12/20/2024"
       - "Call Option" / "Put Option" as separate field in asset text
-      - Bare "call" / "put" keywords
+      - "Stock Option (NVDA)" — a standalone phrase without explicit call/put
     """
     if not asset_cell:
         return 'stock'
     text = asset_cell.lower()
-    # Put detection — check before call since "put call" is unlikely but "call put" might appear
-    if re.search(r'\bput\s*(?:option|opt)\b', text) or re.search(r'\bput\b', text):
+
+    # Put detection — use compound patterns first; avoid matching bare "put" (too many false positives)
+    if re.search(r'\bput\s+option\b', text):
         return 'put'
-    # Call detection — broad match including "call option", "call opt"
-    if re.search(r'\bcall\s*(?:option|opt)\b', text) or re.search(r'\bcall\b', text):
+    if re.search(r'\bput\s+opt\b', text):
+        return 'put'
+    if re.search(r'\bstock\s+put\b', text):
+        return 'put'
+    if re.search(r'\bput\b.*\b(?:strike|exp|expir)\b', text):
+        return 'put'
+
+    # Call detection — use compound patterns first; avoid matching bare "call" (too many false positives)
+    if re.search(r'\bcall\s+option\b', text):
         return 'call'
+    if re.search(r'\bcall\s+opt\b', text):
+        return 'call'
+    if re.search(r'\bstock\s+call\b', text):
+        return 'call'
+    if re.search(r'\bcall\b.*\b(?:strike|exp|expir)\b', text):
+        return 'call'
+
+    # "Stock Option" standalone — a common PTR label; default to 'call' as most
+    # stock options in congressional disclosures are call options
+    if re.search(r'\bstock\s+option\b', text):
+        return 'call'
+
     # Generic "option" without call/put qualifier — try to infer from context
     if re.search(r'\boption\b', text):
-        # Heuristic: if there's a strike/expiry pattern, it's an option but type unknown — default to 'call'
-        if re.search(r'\b(?:strike|exp|strike\s*price|expir)\b', text):
+        if re.search(r'\b(?:strike|exp|expir)\b', text):
             return 'call'
     return 'stock'
 
@@ -114,12 +157,15 @@ def _extract_option_details(asset_cell: str | None) -> dict:
       - "$120" preceding "Exp" in "NVDA Call $120 Exp 12/20/2024"
       - "Exp MM/DD/YYYY" / "Expire MM/DD/YYYY" / "Expiring MM/DD/YYYY"
       - "Exp 12/20/2024" (bare exp abbreviation)
+      - "Strike Price $150.00"
+      - "NVDA Call Option $120 Exp 12/20/2024"
     """
     details: dict = {}
     if not asset_cell:
         return details
-    # Strike price: "Strike $150" or "Strike: 150.00"
-    strike_match = re.search(r'(?:strike[:\s]*\$?)(\d+(?:\.\d+)?)', asset_cell, re.IGNORECASE)
+
+    # Strike price: "Strike Price $150", "Strike $150", "Strike: 150.00"
+    strike_match = re.search(r'strike\s*(?:price)?[:\s]*\$?(\d+(?:\.\d+)?)', asset_cell, re.IGNORECASE)
     if strike_match:
         details['strike_price'] = float(strike_match.group(1))
     else:
@@ -128,7 +174,7 @@ def _extract_option_details(asset_cell: str | None) -> dict:
         if strike_fallback:
             details['strike_price'] = float(strike_fallback.group(1))
 
-    # Expiry date: "Exp MM/DD/YYYY" or "Expire: MM/DD/YYYY" or "Expiring MM/DD/YYYY"
+    # Expiry date: "Exp MM/DD/YYYY" / "Expire: MM/DD/YYYY" / "Expiring MM/DD/YYYY"
     exp_match = re.search(r'(?:exp(?:ir(?:e|ation|ing)?)?[:\s]+(\d{2}/\d{2}/\d{4}))', asset_cell, re.IGNORECASE)
     if exp_match:
         details['expiry_date'] = exp_match.group(1)
@@ -474,6 +520,127 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
                     pending_tx = {'tx_type': tx_type, 'date_str': date_match.group(1), 'amount': amount_str}
 
     return rows
+
+
+def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
+    """Extract transaction tables using pdfplumber (fast text-layer parser).
+
+    Benchmark winner for text-based PDFs: 0.075s/PDF avg, 8/12 success on
+    text-based PTRs vs camelot's slower lattice/stream engines. Handles
+    encrypted PDFs natively. Returns 0 tables on scanned image-only PDFs
+    (no text layer) — caller should fall back to OCR for those.
+
+    Returns tables in the same format as camelot: list of 2D string grids.
+    """
+    try:
+        import pdfplumber
+    except ImportError as e:
+        logger.debug(f"pdfplumber not available: {e}")
+        return []
+
+    tables_out: list[list[list[str]]] = []
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page in pdf.pages:
+                # page.extract_tables() returns list[list[list[str|None]]]
+                page_tables = page.extract_tables()
+                for tbl in page_tables:
+                    if not tbl or len(tbl) < 2:
+                        continue
+                    # Normalize: replace None with "" and strip null bytes
+                    # (PTR PDFs sometimes emit \x00 chars that pollute regex)
+                    cleaned = [
+                        [("" if cell is None else str(cell).replace("\x00", "").strip()) for cell in row]
+                        for row in tbl
+                    ]
+                    # Drop fully-empty rows
+                    cleaned = [row for row in cleaned if any(c for c in row)]
+                    if len(cleaned) >= 2:
+                        tables_out.append(cleaned)
+    except Exception as e:
+        logger.debug(f"pdfplumber failed for {pdf_path}: {e}")
+        return []
+
+    return tables_out
+
+
+def extract_tables_with_docling(pdf_path: Path, timeout: int = 300) -> list[list[list[str]]]:
+    """OCR fallback using Docling (TableFormer + RapidOCR).
+
+    Benchmark winner for scanned image PDFs: handles the 4 large 2024-2025
+    scanned filings (8220660/0674/1212/0750, ~263 transactions) that no
+    text-layer parser can touch. MIT license, IBM-backed. Runs as isolated
+    subprocess via `uvx` so it does not pollute the project venv with its
+    ~500MB ML model dependencies.
+
+    Returns markdown-derived tables in the same 2D string grid format.
+    """
+    import subprocess
+    import tempfile
+
+    # Always prefer uvx (isolated env) — the system docling binary often has
+    # OpenMP/runtime conflicts. Fall back to system docling only if no uvx.
+    uvx = shutil.which("uvx")
+    if uvx:
+        cmd = ["uvx", "--from", "docling", "docling",
+               "--input-path", str(pdf_path), "--output"]
+    elif shutil.which("docling"):
+        cmd = ["docling", "--input-path", str(pdf_path), "--output"]
+    else:
+        logger.debug("Neither uvx nor docling on PATH — skipping Docling OCR")
+        return []
+
+    with tempfile.TemporaryDirectory(prefix="docling_") as out_dir:
+        full_cmd = cmd + [out_dir]
+        try:
+            result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                logger.debug(f"docling failed for {pdf_path}: rc={result.returncode}, stderr tail={result.stderr[-300:]}")
+                return []
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.debug(f"docling timed out/missing for {pdf_path}: {e}")
+            return []
+
+        # Docling emits <stem>.md and <stem>.json in the output dir
+        md_files = list(Path(out_dir).rglob("*.md"))
+        if not md_files:
+            return []
+
+        text = md_files[0].read_text(encoding="utf-8", errors="ignore")
+        return _parse_markdown_tables(text)
+
+
+def _parse_markdown_tables(text: str) -> list[list[list[str]]]:
+    """Parse GitHub-flavored markdown tables into 2D string grids.
+
+    Docling and Marker emit standard markdown pipe tables; this converts them
+    back to the row/column grid that parse_pdf_table() expects.
+    """
+    tables: list[list[list[str]]] = []
+    current: list[list[str]] = []
+
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line.startswith("|"):
+            if current:
+                tables.append(current)
+                current = []
+            continue
+
+        # Split on |, drop leading/trailing empty cells from outer pipes
+        parts = [c.strip() for c in line.strip("|").split("|")]
+        # Skip markdown separator rows: |---|---|---|
+        if all(re.fullmatch(r":?-{2,}:?", p) for p in parts if p):
+            continue
+        # Replace None/empty with empty string, strip null bytes
+        parts = [("" if p is None else p.replace("\x00", "")) for p in parts]
+        current.append(parts)
+
+    if current:
+        tables.append(current)
+
+    # Only keep tables that look like PTR data (>=2 rows, >=3 cols)
+    return [t for t in tables if len(t) >= 2 and len(t[0]) >= 3]
 
 
 def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:

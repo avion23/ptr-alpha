@@ -21,7 +21,9 @@ from analyzer.models import DownloadResult, DownloadStatus, FilingType
 from analyzer.ticker_resolver import TickerResolver
 from analyzer.parsing import (
     consolidate_transactions,
+    extract_tables_with_docling,
     extract_tables_with_ocr,
+    extract_tables_with_pdfplumber,
     extract_tables_with_pdftotext,
     normalize_house_metadata,
     parse_pdf_table,
@@ -31,32 +33,46 @@ from analyzer.parsing import (
 logger = logging.getLogger(__name__)
 
 
-def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
+def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     transactions = []
     engines_attempted = []
 
-    # Try lattice first
+    # 1) pdfplumber — benchmark winner for text-based PDFs (0.075s avg).
+    # Handles encrypted PDFs natively; returns 0 on scanned images.
     try:
-        tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
-        engines_attempted.append("lattice")
-        for table in tables:
-            data = table.data
-            # Fix 1: If lattice produced a 1-column table (null bytes collapse),
-            # split cell content by newlines and parse as OCR text
-            if data and len(data[0]) == 1:
-                for row in data:
-                    cell_text = row[0] if row else ""
-                    if cell_text:
-                        ocr_rows = _parse_ocr_text_to_rows(cell_text)
-                        if ocr_rows:
-                            ocr_table = [['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']] + ocr_rows
-                            transactions.extend(parse_pdf_table(ocr_table))
-            else:
-                transactions.extend(parse_pdf_table(data))
+        pp_tables = extract_tables_with_pdfplumber(pdf_path)
+        if pp_tables:
+            engines_attempted.append("pdfplumber")
+            for table in pp_tables:
+                txs = parse_pdf_table(table)
+                if txs:
+                    transactions.extend(txs)
     except Exception as e:
-        logger.debug(f"Lattice failed for {pdf_path}: {e}")
+        logger.debug(f"pdfplumber failed for {pdf_path}: {e}")
 
-    # Try stream if lattice produced nothing
+    # 2) camelot lattice — was the previous primary; keeps PDFs with ruling lines
+    if not transactions:
+        try:
+            tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
+            engines_attempted.append("lattice")
+            for table in tables:
+                data = table.data
+                # Fix 1: If lattice produced a 1-column table (null bytes collapse),
+                # split cell content by newlines and parse as OCR text
+                if data and len(data[0]) == 1:
+                    for row in data:
+                        cell_text = row[0] if row else ""
+                        if cell_text:
+                            ocr_rows = _parse_ocr_text_to_rows(cell_text)
+                            if ocr_rows:
+                                ocr_table = [['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']] + ocr_rows
+                                transactions.extend(parse_pdf_table(ocr_table))
+                else:
+                    transactions.extend(parse_pdf_table(data))
+        except Exception as e:
+            logger.debug(f"Lattice failed for {pdf_path}: {e}")
+
+    # 3) camelot stream — fallback for unrulled tables
     if not transactions:
         try:
             tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="stream")
@@ -70,7 +86,7 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
         except Exception as e:
             logger.debug(f"Stream failed for {pdf_path}: {e}")
 
-    # Try pdftotext as fallback (handles encrypted PDFs where camelot fails)
+    # 4) pdftotext — handles encrypted PDFs where camelot/pdfplumber return nothing
     if not transactions:
         try:
             pdftext_tables = extract_tables_with_pdftotext(pdf_path)
@@ -83,7 +99,24 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict]]:
         except Exception as e:
             logger.debug(f"pdftotext failed for {pdf_path}: {e}")
 
-    # Try OCR as final fallback
+    # 5) Docling — OCR fallback for SCANNED IMAGE PDFs (no text layer).
+    # Benchmark winner over Marker (MIT license, no Cyrillic-E bug, better
+    # accuracy 75% vs 58%). Slow (13-300s) but only runs when all text-layer
+    # parsers return nothing.
+    if not transactions:
+        engines_attempted.append("docling")
+        try:
+            docling_tables = extract_tables_with_docling(pdf_path)
+            for table in docling_tables:
+                txs = parse_pdf_table(table)
+                if txs:
+                    transactions.extend(txs)
+                    break
+        except Exception as e:
+            logger.debug(f"Docling failed for {pdf_path}: {e}")
+
+    # 6) pytesseract — last resort, kept for backward compatibility when
+    # docling/uvx is unavailable.
     if not transactions:
         try:
             ocr_tables = extract_tables_with_ocr(pdf_path)

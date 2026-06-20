@@ -10,10 +10,12 @@ requires-python = ">=3.11"
 dependencies = [
     "pandas",
     "numpy",
+    "scipy",
     "requests",
     "requests-cache",
     "yfinance",
     "camelot-py[cv]",
+    "pdfplumber>=0.11",
     "pytesseract",
     "pdf2image",
     "Pillow",

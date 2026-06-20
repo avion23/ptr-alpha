@@ -73,7 +73,7 @@ def main():
         print(f"Unique tickers:  {df['ticker'].nunique()}")
         print(f"Date range:      {df['transaction_date'].min()} to {df['transaction_date'].max()}")
         tx_types = df["transaction_type"].value_counts()
-        print(f"Transaction types:")
+        print("Transaction types:")
         for t, count in tx_types.items():
             print(f"  {t}: {count}")
     print("\nDone.")

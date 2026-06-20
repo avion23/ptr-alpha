@@ -9,16 +9,13 @@ warnings.filterwarnings("ignore", module="cryptography")
 sys.path.insert(0, "/tmp/wt-kelly/src")
 
 from datetime import date, timedelta
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from analyzer.settings import Settings
 from analyzer.datasources import HouseTransactionSource
 from analyzer.portfolio import (
     KellyConfig,
-    build_kelly_portfolio,
     build_portfolios_from_backtest,
     compute_portfolio_metrics,
     simulate_portfolio_returns,
@@ -109,7 +106,7 @@ def main():
     print(f"  Min weight:     {portfolio_df['weight'].min():.3f}")
     print(f"  Mean kelly:     {portfolio_df['kelly_fraction'].mean():.4f}")
     print(f"  Mean position:  ${portfolio_df['position_value'].mean():,.0f}")
-    print(f"  Total invested per period:")
+    print("  Total invested per period:")
     totals = portfolio_df.groupby("as_of_date")["position_value"].sum()
     print(f"    Mean:   ${totals.mean():,.0f}")
     print(f"    Median: ${totals.median():,.0f}")

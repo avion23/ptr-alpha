@@ -682,7 +682,6 @@ def _parse_docling_markdown(text: str) -> list[list[list[str]]]:
 
         # Extract asset name and ticker
         asset_name = line.lstrip('- ').strip()
-        ticker = m.group(2).upper()
 
         # Scan forward up to 8 lines for tx code + date/amount
         tx_type = None

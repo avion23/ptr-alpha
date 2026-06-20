@@ -589,5 +589,51 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(transactions[0]['instrument_type'], 'put')
         self.assertEqual(transactions[0]['ticker'], 'TSLA')
 
+    # --- New option detection patterns ---
+
+    def test_instrument_type_stock_option_standalone(self):
+        """'Stock Option (NVDA)' should be detected as call."""
+        self.assertEqual(_extract_instrument_type('Stock Option (NVDA)'), 'call')
+
+    def test_instrument_type_common_stock_option(self):
+        """'NVIDIA Corp Common Stock Call Option (NVDA)' still works."""
+        self.assertEqual(_extract_instrument_type('NVIDIA Corp Common Stock Call Option (NVDA)'), 'call')
+
+    def test_instrument_type_no_false_positive_recall(self):
+        """'recall' should NOT match as call option."""
+        self.assertEqual(_extract_instrument_type('Recall Notice (AAPL)'), 'stock')
+
+    def test_instrument_type_no_false_positive_local(self):
+        """'local' should NOT match as call option."""
+        self.assertEqual(_extract_instrument_type('Local Bancorp (LBC)'), 'stock')
+
+    def test_instrument_type_no_false_positive_bare_put(self):
+        """Bare 'put' without strike/expiry context should be stock (too ambiguous)."""
+        self.assertEqual(_extract_instrument_type('Putnam Fund (PNM)'), 'stock')
+
+    def test_instrument_type_put_with_strike(self):
+        """'put' with strike/expiry context should be detected."""
+        self.assertEqual(_extract_instrument_type('TSLA Put Strike $250 Exp 09/30/2025'), 'put')
+
+    def test_instrument_type_call_with_strike(self):
+        """'call' with strike/expiry context should be detected."""
+        self.assertEqual(_extract_instrument_type('AAPL Call Strike $200 Exp 12/31/2025'), 'call')
+
+    def test_instrument_type_stock_put_option(self):
+        """'Stock Put Option' should be detected as put."""
+        self.assertEqual(_extract_instrument_type('Tesla Inc Stock Put Option (TSLA)'), 'put')
+
+    def test_instrument_type_stock_call_option(self):
+        """'Stock Call Option' should be detected as call."""
+        self.assertEqual(_extract_instrument_type('Apple Inc Stock Call Option (AAPL)'), 'call')
+
+    # --- Option details extraction ---
+
+    def test_option_details_strike_price_format(self):
+        """'Strike Price $150' should be captured."""
+        details = _extract_option_details('NVDA Call Option Strike Price $150.00 Exp 06/30/2025')
+        self.assertAlmostEqual(details['strike_price'], 150.00)
+        self.assertEqual(details['expiry_date'], '06/30/2025')
+
 if __name__ == '__main__':
     unittest.main()

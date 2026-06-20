@@ -321,6 +321,7 @@ def backtest_recommendations(
     prices_df: pd.DataFrame | None = None,
     training_lookback_days: int | None = None,
     solo_buyer_skill_threshold: float = 0.60,
+    scoring_mode: str = "shrunk_alpha",
 ) -> pd.DataFrame:
     # Read the bayes prior strength once at entry. The sweep mutates the
     # module global per combo; we capture the current value and plumb it
@@ -378,7 +379,7 @@ def backtest_recommendations(
 
     # Pre-build O(1) lookup dicts from member_rankings
     from analyzer.member_ranking import _build_ranking_dicts
-    _ranking_dicts = _build_ranking_dicts(member_rankings)
+    _ranking_dicts = _build_ranking_dicts(member_rankings, scoring_mode=scoring_mode)
 
     # Pre-check which tickers have prices (avoids per-ticker hasattr)
     has_prices = prices_df is not None

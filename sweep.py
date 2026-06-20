@@ -33,6 +33,7 @@ class SweepResult:
     top_n: int
     decay_lambda: float
     bayes_prior_strength: float
+    scoring_mode: str = "shrunk_alpha"
     total_recs: int = 0
     dates_evaluated: int = 0
     overall_alpha: float = 0.0
@@ -52,6 +53,7 @@ def run_single_backtest(
     signals: pd.DataFrame,
     bayes_prior_strength: float,
     decay_lambda: float,
+    scoring_mode: str = "shrunk_alpha",
 ) -> SweepResult:
     """Run one backtest with given params and return metrics."""
     old_bayes = signals_mod.BAYES_PRIOR_STRENGTH
@@ -76,6 +78,7 @@ def run_single_backtest(
                 threshold=params.threshold,
                 prices_df=prices,
                 training_lookback_days=params.training_lookback_days,
+                scoring_mode=scoring_mode,
             )
             if recs.empty:
                 continue
@@ -98,6 +101,7 @@ def run_single_backtest(
                 top_n=params.top_n,
                 decay_lambda=decay_lambda,
                 bayes_prior_strength=bayes_prior_strength,
+                scoring_mode=scoring_mode,
             )
 
         combined = pd.concat(all_results, ignore_index=True)
@@ -111,6 +115,7 @@ def run_single_backtest(
             top_n=params.top_n,
             decay_lambda=decay_lambda,
             bayes_prior_strength=bayes_prior_strength,
+            scoring_mode=scoring_mode,
             total_recs=len(combined),
             dates_evaluated=int(valid["as_of_date"].nunique()),
             overall_alpha=round(float(valid["bt_alpha_pct"].mean()), 2),
@@ -172,6 +177,7 @@ def main():
         "top_n": [3, 5],
         "decay_lambda": [0.001, 0.005, 0.02],
         "bayes_prior_strength": [5, 20, 50],
+        "scoring_mode": ["shrunk_alpha", "consistency"],
     }
 
     keys = list(param_grid.keys())
@@ -307,6 +313,7 @@ def _eval_combo(params_dict, keys, signal_cache, all_transactions, prices):
         all_transactions, prices, params, sigs,
         bayes_prior_strength=params_dict["bayes_prior_strength"],
         decay_lambda=params_dict["decay_lambda"],
+        scoring_mode=params_dict.get("scoring_mode", "shrunk_alpha"),
     )
 
 

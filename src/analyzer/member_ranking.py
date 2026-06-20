@@ -427,11 +427,18 @@ def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, f
 
 def _build_ranking_dicts(
     member_rankings: pd.DataFrame | None,
+    scoring_mode: str = "shrunk_alpha",
 ) -> dict[str, dict[str, float]]:
     """Pre-build O(1) lookup dicts from member_rankings DataFrame.
 
     Returns {"alpha": {member: float}, "trades": {member: int}, "prob": {member: float}}.
     Avoids repeated DataFrame linear scans in the per-ticker scoring loop.
+
+    scoring_mode controls how member scores are computed:
+      - "shrunk_alpha": Bayesian-shrunk historical SPY alpha (default)
+      - "consistency": prob_up * log(1 + trades) — continuous, differentiable
+      - "bayesian_quality": bayes_win_prob * shrunk_alpha
+      - "trade_frequency": log(1 + trades)
     """
     if member_rankings is None or member_rankings.empty:
         return {"alpha": {}, "trades": {}, "prob": {}, "has_shrunk": False}
@@ -443,12 +450,30 @@ def _build_ranking_dicts(
     cols = ["member", alpha_col, "purchase_trades"]
     if "bayes_win_prob" in member_rankings.columns:
         cols.append("bayes_win_prob")
+    if "prob_up_given_buy" in member_rankings.columns:
+        cols.append("prob_up_given_buy")
     valid = member_rankings[cols].dropna(subset=["member"])
-    alpha = dict(zip(valid["member"], valid[alpha_col].astype(float)))
-    trades = dict(zip(valid["member"], valid["purchase_trades"].fillna(0).astype(int)))
+
+    # Compute alpha scores based on scoring_mode
+    if scoring_mode == "consistency":
+        prob_up = valid["prob_up_given_buy"].fillna(0.5).values if "prob_up_given_buy" in valid.columns else np.full(len(valid), 0.5)
+        trades = valid["purchase_trades"].fillna(0).values.astype(float)
+        alpha_values = prob_up * np.log1p(trades)
+        alpha = dict(zip(valid["member"], alpha_values))
+    elif scoring_mode == "bayesian_quality":
+        bayes = valid["bayes_win_prob"].fillna(0.5).values if "bayes_win_prob" in valid.columns else np.full(len(valid), 0.5)
+        raw_alpha = valid[alpha_col].fillna(0.0).values.astype(float)
+        alpha = dict(zip(valid["member"], bayes * raw_alpha))
+    elif scoring_mode == "trade_frequency":
+        trades = valid["purchase_trades"].fillna(0).values.astype(float)
+        alpha = dict(zip(valid["member"], np.log1p(trades)))
+    else:  # "shrunk_alpha" (default)
+        alpha = dict(zip(valid["member"], valid[alpha_col].astype(float)))
+
+    trades_dict = dict(zip(valid["member"], valid["purchase_trades"].fillna(0).astype(int)))
     prob = dict(zip(valid["member"], valid["bayes_win_prob"].fillna(0.5).astype(float))) if "bayes_win_prob" in valid.columns else {}
 
-    return {"alpha": alpha, "trades": trades, "prob": prob, "has_shrunk": has_shrunk}
+    return {"alpha": alpha, "trades": trades_dict, "prob": prob, "has_shrunk": has_shrunk}
 
 
 @df_memoize(copy=False)

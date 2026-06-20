@@ -582,10 +582,10 @@ def extract_tables_with_docling(pdf_path: Path, timeout: int = 300) -> list[list
     # OpenMP/runtime conflicts. Fall back to system docling only if no uvx.
     uvx = shutil.which("uvx")
     if uvx:
-        cmd = ["uvx", "--from", "docling", "docling",
-               "--input-path", str(pdf_path), "--output"]
+        cmd = ["uvx", "--from", "docling", "docling", "convert",
+               str(pdf_path), "--to", "md", "--output"]
     elif shutil.which("docling"):
-        cmd = ["docling", "--input-path", str(pdf_path), "--output"]
+        cmd = ["docling", "convert", str(pdf_path), "--to", "md", "--output"]
     else:
         logger.debug("Neither uvx nor docling on PATH — skipping Docling OCR")
         return []
@@ -607,7 +607,13 @@ def extract_tables_with_docling(pdf_path: Path, timeout: int = 300) -> list[list
             return []
 
         text = md_files[0].read_text(encoding="utf-8", errors="ignore")
-        return _parse_markdown_tables(text)
+        # For scanned PDFs, Docling renders transactions as markdown lists
+        # (each tx spans 3-5 lines). The list parser handles this format;
+        # the pipe-table parser is a fallback for cleaner digital PDFs.
+        tables = _parse_docling_markdown(text)
+        if not tables:
+            tables = _parse_markdown_tables(text)
+        return tables
 
 
 def _parse_markdown_tables(text: str) -> list[list[list[str]]]:
@@ -641,6 +647,83 @@ def _parse_markdown_tables(text: str) -> list[list[list[str]]]:
 
     # Only keep tables that look like PTR data (>=2 rows, >=3 cols)
     return [t for t in tables if len(t) >= 2 and len(t[0]) >= 3]
+
+
+def _parse_docling_markdown(text: str) -> list[list[list[str]]]:
+    """Parse Docling's list-style markdown OCR output into transaction tables.
+
+    Docling renders scanned PTR PDFs as markdown lists where each transaction
+    spans 3-5 lines:
+      Line 1: "- SP Asset Name (TICKER) [ST]"
+      Line 2: "S" or "P" or "·S (partial)"      (transaction code)
+      Line 3: "09/25/2025 10/01/2025 $1,001-$15,000"  (date + amount)
+
+    This parser scans for ticker lines, then looks ahead for tx code + dates.
+    Returns one synthetic table consumable by parse_pdf_table().
+    """
+    lines = text.split("\n")
+    rows: list[list[str]] = []
+
+    ticker_re = re.compile(r'(.+?)\s*\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)\s*(\[[A-Z]+\])?')
+    tx_code_re = re.compile(r'^[·\-\s]*([PSE])\s*(\(partial\))?\s*$', re.IGNORECASE)
+    date_amount_re = re.compile(
+        r'(\d{2}/\d{2}/\d{4})'                    # tx date
+        r'(?:\s+\d{2}/\d{2}/\d{4})?'              # optional notification date
+        r'\s*(\$[\d,]+\s*-\s*\$[\d,]+|\$[\d,]+)?'  # optional amount
+    )
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        m = ticker_re.search(line)
+        if not m or '[ST]' not in line and not re.search(r'\([A-Z]{1,6}\)', line):
+            i += 1
+            continue
+
+        # Extract asset name and ticker
+        asset_name = line.lstrip('- ').strip()
+        ticker = m.group(2).upper()
+
+        # Scan forward up to 8 lines for tx code + date/amount
+        tx_type = None
+        tx_date = None
+        amount = None
+        for j in range(i + 1, min(i + 9, len(lines))):
+            lookahead = lines[j].strip()
+            if not lookahead:
+                continue
+            # Stop if we hit the next ticker line
+            if ticker_re.search(lookahead) and re.search(r'\([A-Z]{1,6}\)', lookahead):
+                break
+
+            # Check for tx code (standalone P/S/E)
+            if tx_type is None:
+                tm = tx_code_re.match(lookahead)
+                if tm:
+                    code = tm.group(1).upper()
+                    partial = tm.group(2) is not None
+                    tx_type = f"{code} {'(partial)' if partial else ''}".strip()
+
+            # Check for date + amount
+            if tx_date is None:
+                dm = date_amount_re.search(lookahead)
+                if dm:
+                    tx_date = dm.group(1)
+                    if dm.group(2):
+                        amount = dm.group(2)
+
+            if tx_type and tx_date:
+                break
+
+        if tx_type and tx_date:
+            rows.append([asset_name, tx_type, tx_date, amount or ""])
+        i += 1
+
+    if not rows:
+        return []
+    header = ['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']
+    table = [header] + rows  # one table (list of rows)
+    return [table]  # list of tables
 
 
 def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:

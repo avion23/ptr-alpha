@@ -34,8 +34,10 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
+    import os
     transactions = []
     engines_attempted = []
+    skip_docling = os.environ.get("PTR_SKIP_DOCLING") == "1"
 
     # 1) pdfplumber — benchmark winner for text-based PDFs (0.075s avg).
     # Handles encrypted PDFs natively; returns 0 on scanned images.
@@ -102,8 +104,10 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     # 5) Docling — OCR fallback for SCANNED IMAGE PDFs (no text layer).
     # Benchmark winner over Marker (MIT license, no Cyrillic-E bug, better
     # accuracy 75% vs 58%). Slow (13-300s) but only runs when all text-layer
-    # parsers return nothing.
-    if not transactions:
+    # parsers return nothing. Skip when PTR_SKIP_DOCLING=1 (set during the
+    # bulk first pass; stragglers are re-parsed with Docling in a second pass
+    # using reduced worker count to avoid OOM — each Docling proc uses ~2GB).
+    if not transactions and not skip_docling:
         engines_attempted.append("docling")
         try:
             docling_tables = extract_tables_with_docling(pdf_path)
@@ -309,7 +313,7 @@ class HouseTransactionSource(TransactionSource):
             self.db.upsert_parse_run(
                 doc_id=doc_id,
                 year=year,
-                parser_version="v2",
+                parser_version="v3",
                 status=status,
                 engines_attempted=",".join(engines_attempted),
                 raw_row_count=0,

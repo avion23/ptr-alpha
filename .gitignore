@@ -75,3 +75,4 @@ CodeResources
 profile_sweep.py
 uv.lock
 .opencode/ralph-loop.local.md
+.worktrees/

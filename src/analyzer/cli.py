@@ -157,10 +157,16 @@ def parse(
     ctx: typer.Context,
     year: int = typer.Option(2025, help="Year to process"),
     data_dir: str = typer.Option("data", help="Data directory"),
+    use_gemini_ocr: bool = typer.Option(
+        False, "--gemini-ocr", help="Use Gemini LLM OCR for zero-row PDFs (slower, costs API quota)"
+    ),
 ):
     """Parse cached PDFs to database"""
     app_ctx = get_context(ctx, data_dir, read_only=False)
     success = run_parse_pipeline(app_ctx.transaction_source, year)
+    if use_gemini_ocr:
+        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
+        run_gemini_ocr_for_year(year)
     raise typer.Exit(0 if success else 1)
 
 

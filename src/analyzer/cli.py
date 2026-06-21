@@ -246,6 +246,45 @@ def portfolio(
     this simulates a real portfolio with position sizing, sector limits, and
     cash management across overlapping holding periods.
     """
+    start_date, end_date = _parse_sim_dates(start, end)
+
+    app_ctx = get_context(ctx, data_dir, read_only=True)
+
+    from analyzer.portfolio_sim import PortfolioSimulator, PortfolioConfig
+    from datetime import timedelta
+
+    tx_start = start_date - timedelta(days=training_lookback_days + horizon + 30)
+    all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(tx_start, end_date)
+    if all_transactions.empty:
+        print("Error: no transactions found for portfolio simulation", file=sys.stderr)
+        raise typer.Exit(1)
+
+    prices, entry_prices, signals, recommendations = _load_portfolio_inputs(
+        app_ctx, all_transactions, tx_start, end_date, horizon,
+        lookback_days, training_lookback_days, min_buyers, top_n,
+        threshold, frequency_days, start_date,
+    )
+
+    config = PortfolioConfig(
+        initial_capital=initial_capital,
+        max_positions=max_positions,
+        hold_period_days=hold_days,
+        rebalance_freq_days=frequency_days,
+    )
+
+    sim = PortfolioSimulator(config)
+    results_df = sim.run(recommendations, prices, start_date, end_date)
+    _print_portfolio_results(results_df, config, start_date, end_date, hold_days, max_positions)
+
+    metrics = sim.compute_metrics(prices)
+    if metrics:
+        _print_portfolio_metrics(metrics)
+    if sim.closed_positions:
+        _print_closed_positions(sim.closed_positions)
+
+
+def _parse_sim_dates(start: str, end: str) -> tuple[date, date]:
+    """Parse YYYY-MM-DD CLI date inputs and validate end >= start."""
     try:
         start_date = date.fromisoformat(start)
         end_date = date.fromisoformat(end)
@@ -257,30 +296,31 @@ def portfolio(
         print("Error: --end must be on or after --start", file=sys.stderr)
         raise typer.Exit(1)
 
-    app_ctx = get_context(ctx, data_dir, read_only=True)
+    return start_date, end_date
 
-    from analyzer.portfolio_sim import PortfolioSimulator, PortfolioConfig
 
-    # Collect all backtest recommendations (reuse existing pipeline logic)
+def _load_portfolio_inputs(
+    app_ctx, all_transactions, tx_start, end_date, horizon,
+    lookback_days, training_lookback_days, min_buyers, top_n,
+    threshold, frequency_days, start_date,
+):
+    """Load prices + entry_prices + signals + walk-forward recommendations.
+
+    Returns (prices_df, entry_prices_df, signals_df, recommendations_df).
+    Errors with `typer.Exit(1)` if any input is missing.
+    """
     from datetime import timedelta
     from analyzer import analysis
 
-    tx_start = start_date - timedelta(days=training_lookback_days + horizon + 30)
-    all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(tx_start, end_date)
-    if all_transactions.empty:
-        print("Error: no transactions found for portfolio simulation", file=sys.stderr)
-        raise typer.Exit(1)
-
-    price_start = tx_start
     price_end_sim = end_date + timedelta(days=horizon + 10)
     raw_tickers = all_transactions["ticker"].dropna().unique().tolist()
     all_tickers = sorted({t for t in raw_tickers if isinstance(t, str) and t.strip()} | {"SPY"})
-    prices = app_ctx.transaction_source.db.get_prices(all_tickers, price_start, price_end_sim)
+    prices = app_ctx.transaction_source.db.get_prices(all_tickers, tx_start, price_end_sim)
     if prices.empty:
         print("Error: no price data available", file=sys.stderr)
         raise typer.Exit(1)
 
-    entry_prices = app_ctx.transaction_source.db.get_entry_prices(all_tickers, price_start, price_end_sim)
+    entry_prices = app_ctx.transaction_source.db.get_entry_prices(all_tickers, tx_start, price_end_sim)
     if entry_prices.empty:
         print("Error: no entry prices computed", file=sys.stderr)
         raise typer.Exit(1)
@@ -312,16 +352,14 @@ def portfolio(
     recommendations = pd.concat(all_recs, ignore_index=True)
     print(f"Collected {len(recommendations)} recommendations across {len(as_of_dates)} dates")
 
-    config = PortfolioConfig(
-        initial_capital=initial_capital,
-        max_positions=max_positions,
-        hold_period_days=hold_days,
-        rebalance_freq_days=frequency_days,
-    )
+    return prices, entry_prices, signals, recommendations
 
-    sim = PortfolioSimulator(config)
-    results_df = sim.run(recommendations, prices, start_date, end_date)
 
+def _print_portfolio_results(
+    results_df: pd.DataFrame, config, start_date, end_date,
+    hold_days: int, max_positions: int,
+) -> None:
+    """Print the simulation result summary block."""
     print(f"\n{'=' * 60}")
     print("=== Portfolio Simulation Results ===")
     print(f"{'=' * 60}")
@@ -333,33 +371,34 @@ def portfolio(
         print(f"  Max positions:      {max_positions}")
         print(f"  Hold period:        {hold_days} days")
 
-    metrics = sim.compute_metrics(prices)
-    if metrics:
-        print("\n=== Performance Metrics ===")
-        print(f"  Total return:       {metrics['total_return_pct']:.2f}%")
-        print(f"  Annualized return:  {metrics['annualized_return_pct']:.2f}%")
-        print(f"  Sharpe ratio:       {metrics['sharpe_ratio']:.3f}")
-        print(f"  Max drawdown:       {metrics['max_drawdown_pct']:.2f}%")
-        print(f"  Win rate:           {metrics['win_rate_pct']:.1f}%")
-        print(f"  Avg holding days:   {metrics['avg_holding_days']:.1f}")
-        print(f"  Turnover rate:      {metrics['turnover_rate']:.3f}")
-        print(f"  Max concurrent:     {metrics['max_concurrent_positions']}")
-        print(f"  Total closed:       {metrics['total_closed_trades']}")
-        if metrics.get("spy_return_pct") is not None:
-            print(f"  SPY buy-and-hold:   {metrics['spy_return_pct']:.2f}%")
-        if metrics.get("sector_concentration"):
-            print("\n=== Sector Concentration ===")
-            for sector, pct in sorted(metrics["sector_concentration"].items(), key=lambda x: -x[1]):
-                print(f"  {sector}: {pct:.1f}%")
 
-    if sim.closed_positions:
-        print(f"\n=== Closed Positions ({len(sim.closed_positions)}) ===")
-        closed_df = pd.DataFrame(sim.closed_positions)
-        display_cols = ["ticker", "entry_date", "exit_date", "return_pct", "holding_days", "sector"]
-        available = [c for c in display_cols if c in closed_df.columns]
-        print(closed_df[available].to_string(index=False))
+def _print_portfolio_metrics(metrics: dict) -> None:
+    """Print performance metrics (Sharpe, drawdown, win rate, etc.)."""
+    print("\n=== Performance Metrics ===")
+    print(f"  Total return:       {metrics['total_return_pct']:.2f}%")
+    print(f"  Annualized return:  {metrics['annualized_return_pct']:.2f}%")
+    print(f"  Sharpe ratio:       {metrics['sharpe_ratio']:.3f}")
+    print(f"  Max drawdown:       {metrics['max_drawdown_pct']:.2f}%")
+    print(f"  Win rate:           {metrics['win_rate_pct']:.1f}%")
+    print(f"  Avg holding days:   {metrics['avg_holding_days']:.1f}")
+    print(f"  Turnover rate:      {metrics['turnover_rate']:.3f}")
+    print(f"  Max concurrent:     {metrics['max_concurrent_positions']}")
+    print(f"  Total closed:       {metrics['total_closed_trades']}")
+    if metrics.get("spy_return_pct") is not None:
+        print(f"  SPY buy-and-hold:   {metrics['spy_return_pct']:.2f}%")
+    if metrics.get("sector_concentration"):
+        print("\n=== Sector Concentration ===")
+        for sector, pct in sorted(metrics["sector_concentration"].items(), key=lambda x: -x[1]):
+            print(f"  {sector}: {pct:.1f}%")
 
-    raise typer.Exit(0)
+
+def _print_closed_positions(closed_positions: list[dict]) -> None:
+    """Print per-position close details (ticker, return, holding days)."""
+    print(f"\n=== Closed Positions ({len(closed_positions)}) ===")
+    closed_df = pd.DataFrame(closed_positions)
+    display_cols = ["ticker", "entry_date", "exit_date", "return_pct", "holding_days", "sector"]
+    available = [c for c in display_cols if c in closed_df.columns]
+    print(closed_df[available].to_string(index=False))
 
 
 @app.command()

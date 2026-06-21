@@ -1,7 +1,5 @@
 """Smoke tests for analyzer.interfaces module."""
 import unittest
-from abc import ABC
-from datetime import date
 
 import pandas as pd
 

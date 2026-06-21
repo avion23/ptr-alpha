@@ -1,6 +1,5 @@
 """Smoke tests for analyzer.cli module."""
 import unittest
-from unittest.mock import patch
 
 from typer.testing import CliRunner
 

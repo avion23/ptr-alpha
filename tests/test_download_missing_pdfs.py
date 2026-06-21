@@ -1,10 +1,9 @@
 """Smoke tests for scripts.download_missing_pdfs module."""
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pandas as pd
 
-from analyzer.models import DownloadResult, DownloadStatus
 
 
 class TestDownloadMissingPdfs(unittest.TestCase):

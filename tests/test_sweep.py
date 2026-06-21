@@ -1,6 +1,5 @@
 """Smoke tests for the sweep script."""
 import unittest
-from unittest.mock import MagicMock
 
 import pandas as pd
 

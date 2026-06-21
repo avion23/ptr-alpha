@@ -4,8 +4,7 @@
 Uses `llm -a` with Gemini 3.1 Flash Lite to extract transactions.
 Gemini auto-rotates PDFs and handles checkbox detection.
 """
-import json, os, re, sys, time, subprocess, duckdb
-from pathlib import Path
+import json, os, re, time, subprocess, duckdb
 
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress.json"

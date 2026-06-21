@@ -1,0 +1,110 @@
+"""OCR fallback backend: pytesseract + pdf2image.
+
+Last-resort engine when no text layer is available AND Docling subprocess
+fails. Rasterizes each page to a 200dpi image, runs tesseract on it, then
+extracts ticker / tx-type / date / amount rows from the resulting plaintext.
+"""
+
+import logging
+import re
+from pathlib import Path
+
+from analyzer.models import TransactionType
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    lines = text.strip().split('\n')
+    pending_tx: dict | None = None
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        ticker_match = re.search(r'\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)', stripped)
+        amount_match = re.search(r'\$[\d,]+\s*-\s*\$[\d,]+', stripped)
+        amount_str = amount_match.group(0) if amount_match else None
+
+        if ticker_match:
+            row, pending_tx = _handle_ticker_line(stripped, ticker_match, amount_str, pending_tx)
+            if row is not None:
+                rows.append(row)
+        else:
+            pending_tx = _handle_continuation_line(stripped, amount_str)
+
+    return rows
+
+
+def _handle_ticker_line(stripped: str, ticker_match: re.Match, amount_str: str | None, pending_tx: dict | None):
+    asset_name = stripped[:ticker_match.end()].strip()
+    rest = stripped[ticker_match.end():].strip()
+    rest_clean = re.sub(r'\s+', ' ', rest).strip().upper()
+
+    tx_type, date_str = _tx_type_and_date(rest_clean, rest)
+    if tx_type and date_str:
+        return [asset_name, tx_type, date_str, amount_str or ""], None
+    if pending_tx:
+        return [asset_name, pending_tx['tx_type'], pending_tx['date_str'], pending_tx.get('amount') or ""], None
+    return None, None
+
+
+def _tx_type_and_date(rest_clean: str, rest: str) -> tuple[str | None, str | None]:
+    tx_type: str | None = None
+    if rest_clean.startswith('P ') or rest_clean.startswith('PP '):
+        tx_type = TransactionType.PURCHASE.value
+    elif rest_clean.startswith('S ') or rest_clean.startswith('SS '):
+        tx_type = TransactionType.SALE.value
+
+    date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', rest)
+    return tx_type, date_match.group(1) if date_match else None
+
+
+def _handle_continuation_line(stripped: str, amount_str: str | None) -> dict | None:
+    rest_clean = re.sub(r'\s+', ' ', stripped).upper()
+
+    has_s = ' S ' in rest_clean or rest_clean.startswith('S ') or re.search(r'[A-Z0-9]S\s+\d', rest_clean)
+    has_p = ' P ' in rest_clean or rest_clean.startswith('P ') or re.search(r'[A-Z0-9]P\s+\d', rest_clean)
+
+    if has_s and not has_p:
+        tx_type = TransactionType.SALE.value
+    elif has_p:
+        tx_type = TransactionType.PURCHASE.value
+    else:
+        tx_type = None
+
+    if tx_type is None:
+        return None
+
+    date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', stripped)
+    if not date_match:
+        return None
+    return {'tx_type': tx_type, 'date_str': date_match.group(1), 'amount': amount_str}
+
+
+def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+    except ImportError as e:
+        logger.warning(f"OCR dependencies not available: {e}")
+        return []
+
+    try:
+        images = convert_from_path(str(pdf_path), dpi=200)
+    except (OSError, ValueError) as e:
+        logger.warning(f"Failed to convert PDF to images for OCR {pdf_path}: {e}")
+        return []
+
+    all_rows = []
+    for image in images:
+        text = pytesseract.image_to_string(image)
+        all_rows.extend(_parse_ocr_text_to_rows(text))
+
+    if not all_rows:
+        return []
+
+    table = [['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']] + all_rows
+    return [table]

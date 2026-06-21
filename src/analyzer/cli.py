@@ -267,7 +267,8 @@ def portfolio(
 
     price_start = tx_start
     price_end_sim = end_date + timedelta(days=horizon + 10)
-    all_tickers = sorted(set(all_transactions["ticker"].unique().tolist()) | {"SPY"})
+    raw_tickers = all_transactions["ticker"].dropna().unique().tolist()
+    all_tickers = sorted({t for t in raw_tickers if isinstance(t, str) and t.strip()} | {"SPY"})
     prices = app_ctx.transaction_source.db.get_prices(all_tickers, price_start, price_end_sim)
     if prices.empty:
         print("Error: no price data available", file=sys.stderr)
@@ -371,7 +372,7 @@ def snapshot(
 
     db = app_ctx.transaction_source.db
     tickers_result = db.conn.execute("SELECT DISTINCT ticker FROM prices").fetchall()
-    all_tickers = sorted({row[0] for row in tickers_result})
+    all_tickers = sorted({row[0] for row in tickers_result if row[0] and isinstance(row[0], str)})
 
     if not all_tickers:
         print("No price data found in database")

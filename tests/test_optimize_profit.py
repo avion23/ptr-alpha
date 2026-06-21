@@ -8,9 +8,9 @@ class TestOptimizeProfitImports(unittest.TestCase):
 
     def test_module_imports(self):
         import optimize_profit
-        assert callable(optimize_profit.main)
         assert callable(optimize_profit.run_walk_forward)
-        assert callable(optimize_profit.score_shrunk_alpha)
+        assert callable(optimize_profit.precompute_walk_forward_data)
+        assert "SCORING_FUNCTIONS" in dir(optimize_profit)
 
 
 class TestScoringFunctions(unittest.TestCase):
@@ -19,7 +19,7 @@ class TestScoringFunctions(unittest.TestCase):
         # All scoring functions should accept a minimal DataFrame with the
         # required columns. They return either a dict or a float depending
         # on the function, so we just check that they don't crash.
-        from optimize_profit import (
+        from optimize_profit.scoring import (
             score_bayesian_quality,
             score_consistency,
             score_inverted_alpha,
@@ -56,14 +56,14 @@ class TestScoringFunctions(unittest.TestCase):
 class TestScoringFunctionsDict(unittest.TestCase):
 
     def test_shrunk_alpha_returns_dict_for_minimal_df(self):
-        from optimize_profit import score_shrunk_alpha
+        from optimize_profit.scoring import score_shrunk_alpha
         minimal_df = pd.DataFrame({"member": [], "shrunk_alpha": []})
         result = score_shrunk_alpha(minimal_df)
         # Returns dict mapping member -> score; empty df -> empty dict
         self.assertEqual(result, {})
 
     def test_inverted_alpha_returns_dict_for_minimal_df(self):
-        from optimize_profit import score_inverted_alpha
+        from optimize_profit.scoring import score_inverted_alpha
         minimal_df = pd.DataFrame({"member": [], "shrunk_alpha": []})
         result = score_inverted_alpha(minimal_df)
         self.assertEqual(result, {})

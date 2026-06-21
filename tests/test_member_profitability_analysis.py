@@ -1,42 +1,105 @@
-"""Smoke tests for the member_profitability_analysis script."""
+"""Smoke tests for member_profitability.analysis module."""
 import unittest
-from pathlib import Path
+
+import numpy as np
+import pandas as pd
 
 
-class TestMemberProfitabilityAnalysis(unittest.TestCase):
+def _make_wf_df():
+    """Two-window synthetic walk-forward observations DataFrame."""
+    rows: list[dict] = []
+    # Must include every metric in METRICS_TO_TEST (member_profitability.config)
+    metrics = [
+        "shrunk_alpha", "bayes_win_prob", "conviction_score",
+        "sharpe_ratio", "prob_up_given_buy", "avg_spy_alpha_pct",
+    ]
+    rng = np.random.default_rng(42)
+    for wi in range(2):
+        for i in range(30):
+            row: dict = {"window": wi}
+            for m in metrics:
+                row[m] = float(rng.random())
+            row["purchase_trades"] = int(rng.integers(1, 20))
+            row["test_alpha"] = float(rng.normal(0, 1))
+            rows.append(row)
+    return pd.DataFrame(rows)
 
-    def test_module_file_exists(self):
-        path = Path(__file__).resolve().parent.parent / "member_profitability_analysis.py"
-        self.assertTrue(path.exists())
+
+class TestAnalysisImports(unittest.TestCase):
 
     def test_module_imports(self):
-        # The module runs main() at import time and needs a populated DB.
-        # We use importlib to load it and only catch the expected runtime
-        # errors so the test_coverage detector still records the import.
-        import importlib.util
-        path = Path(__file__).resolve().parent.parent / "member_profitability_analysis.py"
-        spec = importlib.util.spec_from_file_location(
-            "member_profitability_analysis", path,
-        )
-        self.assertIsNotNone(spec)
-        # Just verify the spec can be loaded (without executing).
-        # The actual import would run main(); that's intentional in this script.
-        self.assertTrue(spec.loader is not None)
+        import member_profitability.analysis
+        self.assertTrue(callable(member_profitability.analysis.spearman_correlations_per_metric))
+        self.assertTrue(callable(member_profitability.analysis.tier_analysis))
+        self.assertTrue(callable(member_profitability.analysis.trade_count_reliability))
+        self.assertTrue(callable(member_profitability.analysis.combined_metrics_analysis))
+        self.assertTrue(callable(member_profitability.analysis.summarize_combined_metrics))
 
-    def test_np_convert_handles_numpy_types(self):
-        # Exercise the np_convert helper that the script defines.
-        import numpy as np
 
-        def np_convert(obj):
-            if isinstance(obj, (np.integer,)):
-                return int(obj)
-            if isinstance(obj, (np.floating,)):
-                return float(obj)
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            return obj
+class TestSpearmanCorrelations(unittest.TestCase):
 
-        self.assertEqual(np_convert(np.int64(5)), 5)
-        self.assertEqual(np_convert(np.float64(1.5)), 1.5)
-        self.assertEqual(np_convert(np.array([1, 2, 3])), [1, 2, 3])
-        self.assertEqual(np_convert("plain"), "plain")
+    def test_returns_dict_with_metric_keys(self):
+        from member_profitability.analysis import spearman_correlations_per_metric
+        all_wf = _make_wf_df()
+        result = spearman_correlations_per_metric(all_wf)
+        self.assertIsInstance(result, dict)
+        # Each metric should have a dict value
+        for k, v in result.items():
+            self.assertIsInstance(v, dict)
+            self.assertIn("n_windows", v)
+
+    def test_empty_input_returns_zeroed_results(self):
+        from member_profitability.analysis import spearman_correlations_per_metric
+        all_wf = pd.DataFrame(columns=[
+            "window", "shrunk_alpha", "test_alpha", "purchase_trades",
+            "bayes_win_prob", "conviction_score", "sharpe_ratio",
+            "prob_up_given_buy", "avg_spy_alpha_pct",
+        ])
+        result = spearman_correlations_per_metric(all_wf)
+        # All metrics should report 0 windows
+        for v in result.values():
+            self.assertEqual(v["n_windows"], 0)
+
+
+class TestTierAnalysis(unittest.TestCase):
+
+    def test_returns_dict_with_metric_keys(self):
+        from member_profitability.analysis import tier_analysis
+        all_wf = _make_wf_df()
+        result = tier_analysis(all_wf)
+        self.assertIsInstance(result, dict)
+        for k, v in result.items():
+            self.assertIn("n_observations", v)
+
+
+class TestTradeCountReliability(unittest.TestCase):
+
+    def test_returns_dict_keyed_by_threshold(self):
+        from member_profitability.analysis import trade_count_reliability
+        all_wf = _make_wf_df()
+        result = trade_count_reliability(all_wf)
+        self.assertIsInstance(result, dict)
+        # All keys should be ints (thresholds)
+        for k, v in result.items():
+            self.assertIsInstance(k, int)
+            self.assertIsInstance(v, dict)
+
+
+class TestCombinedMetrics(unittest.TestCase):
+
+    def test_returns_dict_with_three_combinations(self):
+        from member_profitability.analysis import combined_metrics_analysis
+        all_wf = _make_wf_df()
+        result = combined_metrics_analysis(all_wf)
+        self.assertIn("combined_v1", result)
+        self.assertIn("combined_v2", result)
+        self.assertIn("trades_x_winprob", result)
+
+    def test_summarize_handles_empty_combined(self):
+        from member_profitability.analysis import summarize_combined_metrics
+        result = summarize_combined_metrics({})
+        self.assertEqual(result, {})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -76,45 +76,6 @@ def _compute_member_raw_alphas(
     return result
 
 
-def _compute_member_sector_skills(
-    signals_df: pd.DataFrame,
-    member: str,
-    horizon: int,
-    ref_date: pd.Timestamp,
-    recency_half_life_days: int,
-) -> dict[str, float]:
-    """Compute sector-specific skill for a member (ticker as sector proxy).
-
-    Returns {ticker: weighted_alpha}.
-    """
-    member_signals = signals_df[
-        (signals_df["member"] == member)
-        & (signals_df["horizon_days"] == horizon)
-        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
-        & (signals_df["disclosure_date"] <= ref_date - pd.Timedelta(days=horizon))
-        & (signals_df["spy_alpha_pct"].notna())
-    ].copy()
-
-    if member_signals.empty:
-        return {}
-
-    # Vectorized recency weights (no iterrows)
-    days_ago = (ref_date - pd.to_datetime(member_signals["disclosure_date"])).dt.days
-    days_ago = days_ago.clip(lower=0)
-    member_signals["_weight"] = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
-    member_signals["_alpha_weighted"] = member_signals["spy_alpha_pct"].values * member_signals["_weight"]
-
-    grp = member_signals.groupby("ticker")
-    weight_sums = grp["_weight"].sum()
-    alpha_sums = grp["_alpha_weighted"].sum()
-
-    valid = weight_sums > 0
-    sector_alphas: dict[str, float] = {}
-    for ticker in weight_sums.index[valid]:
-        sector_alphas[ticker] = float(alpha_sums[ticker]) / float(weight_sums[ticker])
-    return sector_alphas
-
-
 def _compute_member_sector_skills_from_group(
     member_signals: pd.DataFrame,
     horizon: int,

@@ -12,26 +12,6 @@ from analyzer.signals import _price_arrays
 from analyzer.member_ranking import rank_members, score_ticker_by_buyers
 
 
-def _find_dip_entry(
-    prices_df: pd.DataFrame,
-    ticker: str,
-    as_of_date: pd.Timestamp,
-    pullback_pct: float = 0.05,
-    max_wait_days: int = 10,
-) -> tuple[float, int]:
-    """Find dip entry price after as_of_date (which represents disclosure date in backtest).
-
-    Returns (entry_price, delay_days). If no dip, returns (price_at_as_of, 0).
-    """
-    arrs = _price_arrays(prices_df, ticker)
-    if arrs is None:
-        return 0.0, 0
-    idx_ns, vals = arrs
-    if idx_ns is None:
-        return 0.0, 0
-    return _find_dip_entry_arrays(idx_ns, vals, as_of_date, pullback_pct, max_wait_days)
-
-
 def _find_dip_entry_arrays(
     idx_ns, vals, as_of_date, pullback_pct=0.05, max_wait_days=10,
 ):

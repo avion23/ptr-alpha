@@ -87,35 +87,6 @@ def compute_disclosure_lag_weight(
     return math.exp(-lag_days * math.log(2) / half_life)
 
 
-def _realized_vol(prices: pd.Series, window: int = 20) -> float:
-    """Compute annualized realized volatility from a price series."""
-    if len(prices) < window + 1:
-        return 0.0
-    returns = prices.pct_change().dropna().tail(window)
-    if len(returns) < 2:
-        return 0.0
-    return float(returns.std() * math.sqrt(252))
-
-
-def _max_drawdown(prices: pd.Series) -> float:
-    """Compute max drawdown from peak as a positive fraction."""
-    if prices.empty:
-        return 0.0
-    cummax = prices.cummax()
-    drawdowns = (prices - cummax) / cummax
-    return float(abs(drawdowns.min())) if len(drawdowns) > 0 else 0.0
-
-
-def _drawdown_from_ath(prices: pd.Series) -> float:
-    """Compute current drawdown from all-time high as a positive fraction."""
-    if prices.empty:
-        return 0.0
-    ath = prices.max()
-    if ath <= 0:
-        return 0.0
-    return float((ath - prices.iloc[-1]) / ath)
-
-
 @df_memoize
 def compute_signal_features(
     ticker: str,

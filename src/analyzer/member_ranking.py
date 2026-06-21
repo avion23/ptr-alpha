@@ -410,21 +410,6 @@ def _lookup_buyer_bayes_win_prob(
     return float(val) if pd.notna(val) else None
 
 
-def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, float]:
-    """Precompute {member: bayes_win_prob} dict for O(1) lookups.
-
-    Replaces repeated linear scans of member_rankings DataFrame.
-    """
-    if member_rankings is None or member_rankings.empty:
-        return {}
-    if "bayes_win_prob" not in member_rankings.columns:
-        return {}
-    # Vectorized — no iterrows
-    valid = member_rankings["bayes_win_prob"].notna()
-    subset = member_rankings.loc[valid, ["member", "bayes_win_prob"]]
-    return dict(zip(subset["member"], subset["bayes_win_prob"].astype(float)))
-
-
 def _build_ranking_dicts(
     member_rankings: pd.DataFrame | None,
     scoring_mode: str = "shrunk_alpha",

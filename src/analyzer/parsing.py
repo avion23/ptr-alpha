@@ -466,7 +466,11 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
     rows = []
     lines = text.strip().split('\n')
 
-    pending_tx = None
+    # Pending tx state held over from a previous (non-ticker) line so the next
+    # ticker line can fill in date/type when those are missing on its own line.
+    pending_tx_type: str | None = None
+    pending_date_str: str | None = None
+    pending_amount: str | None = None
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
@@ -496,10 +500,12 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
 
             if tx_type and date_str:
                 rows.append([asset_name, tx_type, date_str, amount_str or ""])
-            elif pending_tx:
-                rows.append([asset_name, pending_tx['tx_type'], pending_tx['date_str'], pending_tx.get('amount') or ""])
+            elif pending_tx_type:
+                rows.append([asset_name, pending_tx_type, pending_date_str, pending_amount or ""])
 
-            pending_tx = None
+            pending_tx_type = None
+            pending_date_str = None
+            pending_amount = None
 
         else:
             rest_clean = re.sub(r'\s+', ' ', stripped).upper()
@@ -517,7 +523,9 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
             if tx_type:
                 date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', stripped)
                 if date_match:
-                    pending_tx = {'tx_type': tx_type, 'date_str': date_match.group(1), 'amount': amount_str}
+                    pending_tx_type = tx_type
+                    pending_date_str = date_match.group(1)
+                    pending_amount = amount_str
 
     return rows
 

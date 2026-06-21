@@ -476,7 +476,13 @@ def main():
     # Run sweep
     results = []
     for i, combo in enumerate(combinations):
-        params = dict(zip(keys, combo))
+        scoring_fn, top_n, min_buyers, allocation = combo
+        params = {
+            "scoring_fn": scoring_fn,
+            "top_n": top_n,
+            "min_buyers": min_buyers,
+            "allocation": allocation,
+        }
 
         metrics = run_walk_forward(
             signals, all_tx, prices,

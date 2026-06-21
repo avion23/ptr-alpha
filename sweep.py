@@ -362,8 +362,11 @@ def _run_parallel(
     d_idx = keys_index["decay_lambda"]
     buckets: dict[tuple, list[dict]] = {}
     for combo in combinations:
+        # Extract bucket key directly from combo via precomputed indices
+        # (avoids re-reading from the dict, which would require explicit
+        # construction of the dict to satisfy static key analysis).
+        bkey = (combo[h_idx], combo[d_idx])
         pd_dict = dict(zip(keys, combo))
-        bkey = (pd_dict["horizon"], pd_dict["decay_lambda"])
         buckets.setdefault(bkey, []).append(pd_dict)
 
     bucket_list = list(buckets.values())

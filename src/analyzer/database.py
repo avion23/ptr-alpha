@@ -38,6 +38,12 @@ class Database:
         return self._read_only
 
     def _init_schema(self):
+        self._init_metadata_table()
+        self._init_transactions_table()
+        self._init_prices_table()
+        self._init_pdf_tables()
+
+    def _init_metadata_table(self) -> None:
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS metadata (
                 doc_id VARCHAR PRIMARY KEY,
@@ -49,6 +55,7 @@ class Database:
             )
         """)
 
+    def _init_transactions_table(self) -> None:
         self.conn.execute("""
             CREATE SEQUENCE IF NOT EXISTS tx_id_seq START 1
         """)
@@ -83,6 +90,7 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_tx_member ON transactions(member)"
         )
 
+    def _init_prices_table(self) -> None:
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS prices (
                 ticker VARCHAR,
@@ -96,6 +104,7 @@ class Database:
         )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date)")
 
+    def _init_pdf_tables(self) -> None:
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS pdf_downloads (
                 doc_id VARCHAR PRIMARY KEY,

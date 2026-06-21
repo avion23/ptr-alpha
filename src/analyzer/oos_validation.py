@@ -8,14 +8,14 @@ Usage:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from analyzer.database import Database
 from analyzer import analysis
+from analyzer.database import Database
 
 
 # Best config from parameter sweeps
@@ -29,6 +29,8 @@ BEST_CONFIG = dict(
     threshold=5.0,
 )
 
+
+# ── Per-period backtest + summary metrics ────────────────────────────────
 
 def run_backtest_split(
     all_tx: pd.DataFrame,
@@ -65,13 +67,22 @@ def run_backtest_split(
             continue
 
     if not all_results:
-        return {"label": label, "N": 0, "alpha": 0, "slope": 0, "t": 0, "win%": 0, "r1": 0, "r5": 0}
+        return _empty_backtest_summary(label)
 
     v = pd.concat(all_results, ignore_index=True).dropna(subset=["bt_alpha_pct"])
+    return _summarize_backtest_results(label, v)
+
+
+def _empty_backtest_summary(label: str) -> dict:
+    return {"label": label, "N": 0, "alpha": 0, "slope": 0, "t": 0, "win%": 0, "r1": 0, "r5": 0}
+
+
+def _summarize_backtest_results(label: str, v: pd.DataFrame) -> dict:
+    """Aggregate per-recommendation results into IS/OOS summary metrics."""
     ra = v.groupby("rank")["bt_alpha_pct"].mean()
     r1 = ra.get(1, 0)
     r5 = ra.get(5, 0)
-    t = float(v["bt_alpha_pct"].mean() / (v["bt_alpha_pct"].std() / np.sqrt(len(v)))) if len(v) > 1 and v["bt_alpha_pct"].std() > 0 else 0
+    t = _t_stat(v["bt_alpha_pct"])
 
     return {
         "label": label,
@@ -85,6 +96,13 @@ def run_backtest_split(
     }
 
 
+def _t_stat(alpha: pd.Series) -> float:
+    """t-statistic of mean alpha over its standard error. 0 if undefined."""
+    if len(alpha) > 1 and alpha.std() > 0:
+        return float(alpha.mean() / (alpha.std() / np.sqrt(len(alpha))))
+    return 0.0
+
+
 def _degradation_ratio(is_alpha: float, oos_alpha: float) -> float:
     """OOS/IS ratio. >1 = alpha grew, 0.5-1 = healthy decay, <0.5 = degraded."""
     if is_alpha == 0:
@@ -96,6 +114,8 @@ def _print_fold(result: dict) -> None:
     print(f"  {result['label']:45s} N={result['N']:3d} alpha={result['alpha']:+6.1f}% "
           f"slope={result['slope']:+6.1f}% t={result['t']:+6.2f} win={result['win%']:.0f}%")
 
+
+# ── Split OOS (IS 2022-2023, OOS 2024-2025) ───────────────────────────────
 
 def run_split_oos(
     all_tx: pd.DataFrame,
@@ -134,6 +154,8 @@ def run_split_oos(
     }
 
 
+# ── Walk-forward (3 expanding-window folds) ───────────────────────────
+
 def run_walk_forward(
     all_tx: pd.DataFrame,
     prices: pd.DataFrame,
@@ -141,7 +163,21 @@ def run_walk_forward(
     h: int,
 ) -> dict:
     """Walk-forward validation across 3 expanding-window folds."""
-    folds = [
+    folds = _build_folds()
+
+    print(f"\n{'='*70}")
+    print(f"Walk-Forward Validation (h={h}, freq=30, mb=2, top_n=5)")
+    print(f"{'='*70}")
+
+    fold_results = []
+    for fold in folds:
+        fold_results.append(_run_one_fold(all_tx, prices, entry_prices, h, fold))
+
+    return {"folds": fold_results}
+
+
+def _build_folds() -> list[dict]:
+    return [
         {"train_start": "2022-01-01", "train_end": "2022-12-31",
          "test_start": "2023-01-01", "test_end": "2023-12-31",
          "label": "Fold 1: train 2022, test 2023"},
@@ -153,52 +189,53 @@ def run_walk_forward(
          "label": "Fold 3: train 2022-24, test 2025-H1"},
     ]
 
-    print(f"\n{'='*70}")
-    print(f"Walk-Forward Validation (h={h}, freq=30, mb=2, top_n=5)")
-    print(f"{'='*70}")
 
-    fold_results = []
-    for fold in folds:
-        is_result = run_backtest_split(
-            all_tx, prices, entry_prices,
-            date.fromisoformat(fold["train_start"]),
-            date.fromisoformat(fold["train_end"]),
-            h,
-            label=f"Train {fold['train_start'][:4]}-{fold['train_end'][:4]}",
-        )
-        oos_result = run_backtest_split(
-            all_tx, prices, entry_prices,
-            date.fromisoformat(fold["test_start"]),
-            date.fromisoformat(fold["test_end"]),
-            h,
-            label=f"Test  {fold['test_start'][:4]}-{fold['test_end'][:4]}",
-        )
-        ratio = _degradation_ratio(is_result["alpha"], oos_result["alpha"])
+def _run_one_fold(all_tx, prices, entry_prices, h, fold) -> dict:
+    """Run one walk-forward fold (IS + OOS) and return the fold record."""
+    is_result = run_backtest_split(
+        all_tx, prices, entry_prices,
+        date.fromisoformat(fold["train_start"]),
+        date.fromisoformat(fold["train_end"]),
+        h,
+        label=f"Train {fold['train_start'][:4]}-{fold['train_end'][:4]}",
+    )
+    oos_result = run_backtest_split(
+        all_tx, prices, entry_prices,
+        date.fromisoformat(fold["test_start"]),
+        date.fromisoformat(fold["test_end"]),
+        h,
+        label=f"Test  {fold['test_start'][:4]}-{fold['test_end'][:4]}",
+    )
+    ratio = _degradation_ratio(is_result["alpha"], oos_result["alpha"])
 
-        print(f"\n  {fold['label']}")
-        _print_fold({**is_result, "label": is_result["label"]})
-        _print_fold({**oos_result, "label": oos_result["label"]})
-        print(f"  OOS/IS ratio: {ratio:.2f}")
+    print(f"\n  {fold['label']}")
+    _print_fold({**is_result, "label": is_result["label"]})
+    _print_fold({**oos_result, "label": oos_result["label"]})
+    print(f"  OOS/IS ratio: {ratio:.2f}")
 
-        fold_results.append({
-            "fold": fold["label"],
-            "is": is_result,
-            "oos": oos_result,
-            "oos_is_ratio": ratio,
-        })
-
-    return {"folds": fold_results}
+    return {
+        "fold": fold["label"],
+        "is": is_result,
+        "oos": oos_result,
+        "oos_is_ratio": ratio,
+    }
 
 
-def main():
-    db = Database(Path("data") / "congress.duckdb", read_only=False)
+# ── Data loading + summary printing + output serialization ─────────────
+
+def _load_data(db: Database):
+    """Load all transactions, prices, and entry_prices for the OOS period."""
     tx_start = pd.Timestamp("2021-10-07")
     tx_end = pd.Timestamp("2025-06-30")
+    price_end = tx_end + pd.Timedelta(days=130)
     all_tx = db.get_transactions_by_date_range(tx_start, tx_end)
     all_tickers = sorted(set(all_tx["ticker"].dropna().astype(str).unique().tolist()) | {"SPY"})
-    prices = db.get_prices(all_tickers, tx_start, pd.Timestamp("2025-06-30") + pd.Timedelta(days=130))
-    entry_prices = db.get_entry_prices(all_tickers, tx_start, pd.Timestamp("2025-06-30") + pd.Timedelta(days=130))
+    prices = db.get_prices(all_tickers, tx_start, price_end)
+    entry_prices = db.get_entry_prices(all_tickers, tx_start, price_end)
+    return all_tx, prices, entry_prices
 
+
+def _print_header(all_tx: pd.DataFrame, prices: pd.DataFrame) -> None:
     print("Out-of-Sample Validation")
     print("=" * 70)
     print(f"Data: {len(all_tx)} tx, {prices.shape[1]} tickers")
@@ -206,29 +243,21 @@ def main():
           f"mb={BEST_CONFIG['min_buyers']}, top_n={BEST_CONFIG['top_n']}")
     print()
 
-    # ── Split OOS validation ──
-    h = BEST_CONFIG["horizon"]
-    split_result = run_split_oos(all_tx, prices, entry_prices, h)
 
-    # ── Walk-forward validation ──
-    wf_result = run_walk_forward(all_tx, prices, entry_prices, h)
-
-    # ── Summary ──
+def _print_summary(split_result: dict, wf_result: dict) -> None:
     print(f"\n{'='*70}")
     print("SUMMARY")
     print(f"{'='*70}")
 
-    is_alpha = split_result["is"]["alpha"]
-    oos_alpha = split_result["oos"]["alpha"]
-    is_slope = split_result["is"]["slope"]
-    oos_slope = split_result["oos"]["slope"]
-
+    is_r = split_result["is"]
+    oos_r = split_result["oos"]
     print("\n  Split OOS (IS=2022-23, OOS=2024-25):")
-    print(f"    IS:  alpha={is_alpha:+.1f}%  slope={is_slope:+.1f}%  win={split_result['is']['win%']:.0f}%  N={split_result['is']['N']}")
-    print(f"    OOS: alpha={oos_alpha:+.1f}%  slope={oos_slope:+.1f}%  win={split_result['oos']['win%']:.0f}%  N={split_result['oos']['N']}")
+    print(f"    IS:  alpha={is_r['alpha']:+.1f}%  slope={is_r['slope']:+.1f}%  "
+          f"win={is_r['win%']:.0f}%  N={is_r['N']}")
+    print(f"    OOS: alpha={oos_r['alpha']:+.1f}%  slope={oos_r['slope']:+.1f}%  "
+          f"win={oos_r['win%']:.0f}%  N={oos_r['N']}")
     print(f"    Ratio: {split_result['oos_is_ratio']:.2f}")
 
-    # Walk-forward summary
     wf_alphas = [f["oos"]["alpha"] for f in wf_result["folds"]]
     wf_slopes = [f["oos"]["slope"] for f in wf_result["folds"]]
     wf_ratios = [f["oos_is_ratio"] for f in wf_result["folds"]]
@@ -236,11 +265,16 @@ def main():
     print("\n  Walk-Forward (3 folds):")
     for fr in wf_result["folds"]:
         o = fr["oos"]
-        print(f"    {fr['fold']:45s} alpha={o['alpha']:+6.1f}% slope={o['slope']:+6.1f}% ratio={fr['oos_is_ratio']:.2f}")
+        print(f"    {fr['fold']:45s} alpha={o['alpha']:+6.1f}% "
+              f"slope={o['slope']:+6.1f}% ratio={fr['oos_is_ratio']:.2f}")
     avg_ratio = round(np.mean(wf_ratios), 2)
-    print(f"    {'Average':45s} alpha={np.mean(wf_alphas):+6.1f}% slope={np.mean(wf_slopes):+6.1f}% ratio={avg_ratio:.2f}")
+    print(f"    {'Average':45s} alpha={np.mean(wf_alphas):+6.1f}% "
+          f"slope={np.mean(wf_slopes):+6.1f}% ratio={avg_ratio:.2f}")
 
-    # Robustness assessment
+    _print_robustness(wf_alphas, wf_slopes, avg_ratio)
+
+
+def _print_robustness(wf_alphas: list[float], wf_slopes: list[float], avg_ratio: float) -> None:
     positive_oos = sum(1 for a in wf_alphas if a > 0)
     slope_robust = sum(1 for s in wf_slopes if s > 0)
     print("\n  Robustness:")
@@ -254,8 +288,16 @@ def main():
     else:
         print("    -> SIGNAL IS NOT ROBUST (alpha degrades OOS)")
 
-    # ── Write JSON results ──
-    output = {
+
+def _build_output_dict(
+    all_tx: pd.DataFrame, prices: pd.DataFrame,
+    split_result: dict, wf_result: dict,
+) -> dict:
+    """Build the JSON-serializable output dict."""
+    wf_alphas = [f["oos"]["alpha"] for f in wf_result["folds"]]
+    wf_slopes = [f["oos"]["slope"] for f in wf_result["folds"]]
+    wf_ratios = [f["oos_is_ratio"] for f in wf_result["folds"]]
+    return {
         "config": BEST_CONFIG,
         "data": {"tx_count": len(all_tx), "ticker_count": prices.shape[1]},
         "split_oos": {
@@ -268,12 +310,24 @@ def main():
         "summary": {
             "avg_oos_alpha": round(float(np.mean(wf_alphas)), 2),
             "avg_oos_slope": round(float(np.mean(wf_slopes)), 2),
-            "avg_oos_is_ratio": avg_ratio,
-            "positive_oos_alpha_folds": positive_oos,
-            "positive_oos_slope_folds": slope_robust,
+            "avg_oos_is_ratio": round(float(np.mean(wf_ratios)), 2),
+            "positive_oos_alpha_folds": sum(1 for a in wf_alphas if a > 0),
+            "positive_oos_slope_folds": sum(1 for s in wf_slopes if s > 0),
         },
     }
 
+
+def main():
+    db = Database(Path("data") / "congress.duckdb", read_only=False)
+    all_tx, prices, entry_prices = _load_data(db)
+    _print_header(all_tx, prices)
+
+    h = BEST_CONFIG["horizon"]
+    split_result = run_split_oos(all_tx, prices, entry_prices, h)
+    wf_result = run_walk_forward(all_tx, prices, entry_prices, h)
+    _print_summary(split_result, wf_result)
+
+    output = _build_output_dict(all_tx, prices, split_result, wf_result)
     out_path = Path("data") / "oos_results.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:

@@ -5,7 +5,6 @@ Used to recover from DB corruption without re-running slow OCR.
 """
 from __future__ import annotations
 import os, sys, time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 # Must set env BEFORE importing analyzer (it may import OCR libs lazily)
@@ -15,7 +14,6 @@ os.environ["PTR_SKIP_DOCLING"] = "1"
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from analyzer.database import Database
-from analyzer.parsing.rows import parse_pdf_table
 
 # Import the text-layer engine functions
 from analyzer.datasources import (

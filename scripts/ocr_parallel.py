@@ -1,5 +1,5 @@
 """Parallel Gemini OCR. Threaded fetch, single-writer DB."""
-import json, os, re, sys, time, subprocess, threading, queue
+import json, os, re, time, subprocess, threading, queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import duckdb
 

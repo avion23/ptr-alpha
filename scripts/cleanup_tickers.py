@@ -4,7 +4,6 @@ Distinguishes "matched to None" (explicit NULL) vs "no match" (leave alone).
 """
 from __future__ import annotations
 import duckdb
-import sys
 
 # Mappings: company name prefix -> proper ticker
 NAME_TO_TICKER = {

@@ -33,6 +33,20 @@ class TestCliApp(unittest.TestCase):
         result = self.runner.invoke(app, ["fetch", "--help"])
         self.assertEqual(result.exit_code, 0)
 
+    def test_parse_help(self):
+        result = self.runner.invoke(app, ["parse", "--help"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("--gemini-ocr", result.output)
+
+    def test_analyze_invalid_mode(self):
+        result = self.runner.invoke(app, ["analyze", "--mode", "invalid_mode"])
+        self.assertNotEqual(result.exit_code, 0)
+
+    def test_analyze_help_shows_valid_modes(self):
+        result = self.runner.invoke(app, ["analyze", "--help"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("ranks", result.output)
+
 
 if __name__ == "__main__":
     unittest.main()

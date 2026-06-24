@@ -22,9 +22,9 @@ DEFAULT_PAGE_SIZE = 50
 # Mapping from API transaction_type values to our canonical types
 TX_TYPE_MAP = {
     "purchase": "Purchase",
-    "sale": "Sale Full",
-    "sale (full)": "Sale Full",
-    "sale (partial)": "Sale Partial",
+    "sale": "Sale",
+    "sale (full)": "Sale",
+    "sale (partial)": "Sale",
     "exchange": "Exchange",
 }
 

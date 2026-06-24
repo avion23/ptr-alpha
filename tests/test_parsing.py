@@ -234,8 +234,27 @@ class TestParsing(unittest.TestCase):
     def test_extract_ticker_single_letter(self):
         self.assertEqual(_extract_ticker("Ford Motor (F)"), "F")
         self.assertEqual(_extract_ticker("Citigroup (C)"), "C")
-        self.assertEqual(_extract_ticker("Visa Inc. (V)"), "V")
-        self.assertEqual(_extract_ticker("Kellanova (K)"), "K")
+        # V and K are blacklisted as common non-ticker single letters
+        self.assertIsNone(_extract_ticker("Visa Inc. (V)"))
+        self.assertIsNone(_extract_ticker("Kellanova (K)"))
+
+    def test_extract_ticker_blacklisted_single_letter(self):
+        self.assertIsNone(_extract_ticker("Payment (Y)"))
+        self.assertIsNone(_extract_ticker("Transaction (A)"))
+        self.assertIsNone(_extract_ticker("Fund (X)"))
+        self.assertIsNone(_extract_ticker("Holding (O)"))
+
+    def test_extract_ticker_blacklisted_word(self):
+        self.assertIsNone(_extract_ticker("Treasury Fund (CASH)"))
+        self.assertIsNone(_extract_ticker("Investment (BOND)"))
+        self.assertIsNone(_extract_ticker("Government (TIPS)"))
+        self.assertIsNone(_extract_ticker("Fixed Income (NOTE)"))
+
+    def test_extract_ticker_valid_not_blacklisted(self):
+        self.assertEqual(_extract_ticker("Apple (AAPL)"), "AAPL")
+        self.assertEqual(_extract_ticker("Google (GOOGL)"), "GOOGL")
+        self.assertEqual(_extract_ticker("Microsoft (MSFT)"), "MSFT")
+        self.assertEqual(_extract_ticker("Tesla (TSLA)"), "TSLA")
 
     def test_extract_date_mm_dd_yyyy(self):
         self.assertEqual(_extract_date("01/15/2024"), "01/15/2024")
@@ -354,12 +373,12 @@ class TestParsing(unittest.TestCase):
         table = [
             ['Asset', 'Type', 'Date'],
             ['Ford Motor Co (F)', 'Purchase', '01/15/2024'],
-            ['Visa Inc (V)', 'Sale', '01/16/2024']
+            ['Dominion Energy (D)', 'Sale', '01/16/2024']
         ]
         transactions = parse_pdf_table(table)
         self.assertEqual(len(transactions), 2)
         self.assertEqual(transactions[0]['ticker'], 'F')
-        self.assertEqual(transactions[1]['ticker'], 'V')
+        self.assertEqual(transactions[1]['ticker'], 'D')
 
     def test_parse_ocr_text_single_letter_ticker(self):
         text = "Ford Motor Co (F) P 01/15/2024\nVisa Inc (V) S 01/16/2024\n"

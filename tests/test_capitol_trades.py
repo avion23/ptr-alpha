@@ -166,7 +166,7 @@ class TestCapitolTradesSource(unittest.TestCase):
         self.assertEqual(len(df), 2)
         self.assertEqual(df.iloc[0]["member"], "Nancy Pelosi")
         self.assertEqual(df.iloc[0]["ticker"], "AAPL")
-        self.assertEqual(df.iloc[0]["transaction_type"], "Sale Full")
+        self.assertEqual(df.iloc[0]["transaction_type"], "Sale")
         self.assertEqual(df.iloc[0]["instrument_type"], "Stock")
         self.assertEqual(df.iloc[0]["amount_midpoint"], 375000.5)
         self.assertEqual(df.iloc[0]["amount_raw"], "$250,001 - $500,000")
@@ -282,7 +282,7 @@ class TestCapitolTradesSource(unittest.TestCase):
 
         df = self.source.fetch_trades("Nancy Pelosi")
 
-        self.assertEqual(df.iloc[0]["transaction_type"], "Sale Full")
+        self.assertEqual(df.iloc[0]["transaction_type"], "Sale")
 
     @patch("analyzer.capitol_trades.requests.Session.get")
     def test_normalize_preserves_amount_when_no_min_max(self, mock_get):

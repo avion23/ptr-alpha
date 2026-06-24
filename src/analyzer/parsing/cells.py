@@ -9,6 +9,16 @@ import re
 
 from analyzer.models import TransactionType
 
+_TICKER_BLACKLIST = {
+    # Single letters that are common non-ticker matches
+    'A', 'I', 'O', 'V', 'X', 'Y', 'K',
+    # Transaction type letters accidentally captured
+    'P', 'S', 'E',
+    # Common non-ticker words
+    'CASH', 'FUND', 'BOND', 'NOTE', 'BILLS', 'TIPS',
+    'THE', 'NEW', 'DEL', 'OLD',
+}
+
 
 def clean_text(text: str | None) -> str:
     if text is None:
@@ -21,14 +31,20 @@ def _extract_ticker(asset_cell: str | None) -> str | None:
         return None
     ticker_match = re.search(r'\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)', asset_cell)
     if ticker_match:
-        return ticker_match.group(1).upper()
+        candidate = ticker_match.group(1).upper()
+        if candidate not in _TICKER_BLACKLIST:
+            return candidate
     # Also match $TICKER and TICKER: formats
     dollar_match = re.search(r'\$([A-Za-z][A-Za-z0-9.\-]{0,5})', asset_cell)
     if dollar_match:
-        return dollar_match.group(1).upper()
+        candidate = dollar_match.group(1).upper()
+        if candidate not in _TICKER_BLACKLIST:
+            return candidate
     colon_match = re.search(r'\b([A-Za-z][A-Za-z0-9.\-]{0,5}):', asset_cell)
     if colon_match:
-        return colon_match.group(1).upper()
+        candidate = colon_match.group(1).upper()
+        if candidate not in _TICKER_BLACKLIST:
+            return candidate
     return None
 
 

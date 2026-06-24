@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer._memo import df_memoize
+from analyzer.models import TransactionType
 
 
 def compute_optimal_entry(
@@ -203,7 +204,7 @@ def compute_signal_features(
             (all_tx["ticker"] == ticker)
             & (all_tx["disclosure_date"] >= lookback)
             & (all_tx["disclosure_date"] <= as_of_ts)
-            & (all_tx["transaction_type"] == "Purchase")
+            & (all_tx["transaction_type"] == TransactionType.PURCHASE.value)
         ]
         if not recent_tx.empty:
             n_buyers_30d = int(recent_tx["member"].nunique())

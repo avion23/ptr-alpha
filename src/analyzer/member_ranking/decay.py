@@ -12,6 +12,7 @@ from __future__ import annotations
 import pandas as pd
 
 from analyzer._memo import df_memoize
+from analyzer.models import TransactionType
 
 
 def estimate_member_decay_lambda(
@@ -32,7 +33,7 @@ def estimate_member_decay_lambda(
     member_signals = signals_df[
         (signals_df["member"] == member)
         & (signals_df["horizon_days"] == horizon)
-        & (signals_df["signal_type"] == "Purchase")
+        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
     ]
 
     if len(member_signals) < min_trades:
@@ -67,7 +68,7 @@ def get_member_decay_map(
     """
     members = signals_df[
         (signals_df["horizon_days"] == horizon)
-        & (signals_df["signal_type"] == "Purchase")
+        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
     ]["member"].unique()
 
     result: dict[str, float] = {}

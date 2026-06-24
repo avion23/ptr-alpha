@@ -116,6 +116,10 @@ def parse_output(output):
             else:
                 continue
         
+        # Normalize Partial Sale to Sale for consistency with TransactionType enum
+        if tx_type == "Partial Sale":
+            tx_type = "Sale"
+        
         # Map amount letter
         amt_letter = ""
         amount_clean = amount.strip().upper()

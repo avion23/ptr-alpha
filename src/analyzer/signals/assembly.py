@@ -74,10 +74,12 @@ def _compute_peak_potential(metadata: dict, result_arrays: dict) -> np.ndarray:
     entry_prices_arr = metadata["entry_prices_arr"]
     txn_types = metadata["txn_types"]
 
+    from analyzer.models import TransactionType
     valid_disc = (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
-    is_purchase = txn_types == "Purchase"
+    is_purchase = txn_types == TransactionType.PURCHASE.value
+    is_sale = txn_types == TransactionType.SALE.value
     purchase_mask = is_purchase & valid_disc
-    sale_mask = ~is_purchase & (r_trough > 0) & np.isfinite(r_trough)
+    sale_mask = is_sale & (r_trough > 0) & np.isfinite(r_trough)
 
     peak_potential = np.zeros(n, dtype=np.float64)
     peak_potential[purchase_mask] = (r_peak[purchase_mask] / r_disc_baseline[purchase_mask] - 1) * 100

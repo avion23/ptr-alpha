@@ -19,7 +19,6 @@ class TestDatabaseSchema(DatabaseTestCase):
         self.assertIn("metadata", table_names)
         self.assertIn("transactions", table_names)
         self.assertIn("prices", table_names)
-        self.assertIn("pdf_downloads", table_names)
 
     def test_transactions_unique_index_exists(self):
         indexes = self.db.conn.execute(

@@ -88,9 +88,8 @@ class TestParsing(unittest.TestCase):
         ]
 
         transactions = parse_pdf_table(table)
-        # Pseudo-ticker from "Apple Inc." -> "APPL"
-        self.assertEqual(len(transactions), 1)
-        self.assertEqual(transactions[0]['ticker'], 'APPL')
+        # No asset column means no ticker pattern -> filtered out
+        self.assertEqual(len(transactions), 0)
 
     def test_parse_pdf_table_empty_or_invalid(self):
         self.assertEqual(parse_pdf_table([]), [])
@@ -105,10 +104,8 @@ class TestParsing(unittest.TestCase):
         ]
 
         transactions = parse_pdf_table(table)
-        # Pseudo-tickers generated for non-paren assets
-        self.assertEqual(len(transactions), 2)
-        self.assertEqual(transactions[0]['ticker'], 'SOME')
-        self.assertEqual(transactions[1]['ticker'], 'ANOT')
+        # No ticker patterns -> all filtered out
+        self.assertEqual(len(transactions), 0)
 
 
     def test_normalize_house_metadata_valid(self):
@@ -212,11 +209,19 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(_extract_ticker("BRK-B (BRK-B)"), "BRK-B")
 
     def test_extract_ticker_no_parens(self):
-        # Non-paren assets now get pseudo-tickers (first word, uppercased, 4 chars)
-        self.assertEqual(_extract_ticker("Apple Inc"), "APPL")
-        self.assertEqual(_extract_ticker("Some Company Name"), "SOME")
+        # Assets without ticker patterns return None (no pseudo-ticker fallback)
+        self.assertIsNone(_extract_ticker("Apple Inc"))
+        self.assertIsNone(_extract_ticker("Some Company Name"))
+        self.assertIsNone(_extract_ticker("US Treasury Bond"))
+        self.assertIsNone(_extract_ticker("Municipal Revenue Notes"))
         # Lowercase tickers are now accepted (case-insensitive) and uppercased
         self.assertEqual(_extract_ticker("lowercase (nope)"), "NOPE")
+
+    def test_extract_ticker_dollar_and_colon(self):
+        # $TICKER format
+        self.assertEqual(_extract_ticker("Buy $AAPL 100 shares"), "AAPL")
+        # TICKER: format
+        self.assertEqual(_extract_ticker("AAPL: Apple Inc Common Stock"), "AAPL")
 
     def test_extract_ticker_empty(self):
         self.assertIsNone(_extract_ticker(""))
@@ -239,6 +244,12 @@ class TestParsing(unittest.TestCase):
     def test_extract_date_yyyy_mm_dd(self):
         self.assertEqual(_extract_date("2024-01-15"), "2024-01-15")
         self.assertEqual(_extract_date("Date: 2023-12-31 end"), "2023-12-31")
+
+    def test_extract_date_mm_dd_yy(self):
+        self.assertEqual(_extract_date("01/15/24"), "01/15/2024")
+        self.assertEqual(_extract_date("Transaction on 12/31/23 confirmed"), "12/31/2023")
+        self.assertEqual(_extract_date("06/15/99"), "06/15/1999")
+        self.assertEqual(_extract_date("06/15/50"), "06/15/1950")
 
     def test_extract_date_no_date(self):
         self.assertIsNone(_extract_date("no date here"))
@@ -306,12 +317,10 @@ class TestParsing(unittest.TestCase):
             ['Another No Ticker', 'Sale', '2024-01-04']
         ]
         transactions = parse_pdf_table(table)
-        # All rows now produce transactions (pseudo-tickers for non-paren assets)
-        self.assertEqual(len(transactions), 4)
+        # Only rows with ticker patterns produce transactions (NULL tickers filtered)
+        self.assertEqual(len(transactions), 2)
         self.assertEqual(transactions[0]['ticker'], 'AAPL')
-        self.assertEqual(transactions[1]['ticker'], 'NO')  # pseudo-ticker
-        self.assertEqual(transactions[2]['ticker'], 'GOOGL')
-        self.assertEqual(transactions[3]['ticker'], 'ANOT')  # pseudo-ticker
+        self.assertEqual(transactions[1]['ticker'], 'GOOGL')
 
     def test_normalize_house_metadata_mm_dd_yyyy(self):
         content = "DocID\tFirst\tLast\tFilingDate\tFilingType\n"

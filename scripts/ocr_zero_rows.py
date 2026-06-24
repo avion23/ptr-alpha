@@ -162,6 +162,253 @@ def extract_ticker(asset):
             return match.group(1)
     return None
 
+# Hardcoded mapping of common company names/keywords → ticker symbols
+# Used when OCR asset descriptions lack explicit ticker symbols.
+COMPANY_TICKER_MAP = {
+    # Mega-cap tech
+    "apple": "AAPL", "microsoft": "MSFT", "amazon": "AMZN", "google": "GOOGL",
+    "alphabet": "GOOGL", "meta": "META", "facebook": "META", "tesla": "TSLA",
+    "nvidia": "NVDA", "netflix": "NFLX", "adobe": "ADBE", "salesforce": "CRM",
+    "oracle": "ORCL", "intel": "INTC", "amd": "AMD", "broadcom": "AVGO",
+    "cisco": "CSCO", "qualcomm": "QCOM", "ibm": "IBM", "tx": "TXN",
+    "intuit": "INTU", "paypal": "PYPL", "shopify": "SHOP", "uber": "UBER",
+    "lyft": "LYFT", "snap": "SNAP", "pinterest": "PINS", "robinhood": "HOOD",
+    "coinbase": "COIN", "block": "SQ", "square": "SQ", "zoom": "ZM",
+    "crowdstrike": "CRWD", "palo alto": "PANW", "cloudflare": "NET",
+    "datadog": "DDOG", "mongodb": "MDB", "snowflake": "SNOW", "databricks": "DBX",
+    "twilio": "TWLO", "spotify": "SPOT", "roku": "ROKU", " palantir": "PLTR",
+    "palantir": "PLTR", "unity": "U", "roblox": "RBLX", "doximity": "DOCS",
+    # Finance / Banking
+    "jpmorgan": "JPM", "jp morgan": "JPM", "bank of america": "BAC",
+    "goldman sachs": "GS", "goldman": "GS", "morgan stanley": "MS",
+    "wells fargo": "WFC", "citigroup": "C", "citi": "C", "us bancorp": "USB",
+    "truist": "TFC", "pnc": "PNC", "charles schwab": "SCHW", "schwab": "SCHW",
+    "barclays": "BCS", "hsbc": "HSBC", "ubs": "UBS", "credit suisse": "CS",
+    "american express": "AXP", "visa": "V", "mastercard": "MA",
+    "blackrock": "BLK", "blackstone": "BX", "vanguard": "VT", "fidelity": "FNF",
+    "state street": "STT", "northern trust": "NTRS", "t rowe price": "TROW",
+    "berkshire": "BRK", "berkshire hathaway": "BRK",
+    "capital one": "COF", "discover": "DFS", "synchrony": "SYF",
+    "stock exchange": "ICE", "cme group": "CME", "nasdaq": "NDAQ",
+    "intercontinental exchange": "ICE", "spglobal": "SPGI",
+    "s&p global": "SPGI", "moody": "MCO", "moody's": "MCO",
+    # Healthcare / Pharma
+    "johnson & johnson": "JNJ", "johnson and johnson": "JNJ", "pfizer": "PFE",
+    "unitedhealth": "UNH", "united health": "UNH", "abbvie": "ABBV",
+    "merck": "MRK", "abbott": "ABT", "amgen": "AMGN", "gilead": "GILD",
+    "bristol-myers": "BMY", "bristol myers": "BMY", "eli lilly": "LLY",
+    "lilly": "LLY", "regeneron": "REGN", "vertex": "VRTX", "moderna": "MRNA",
+    "biogen": "BIIB", "vertex pharmaceuticals": "VRTX", "cigna": "CI",
+    "humana": "HUM", "anthem": "ELV", "elevance": "ELV", "centene": "CNC",
+    "aetna": "AET", "mcdermott": "MCD", "medtronic": "MDT",
+    "baxter": "BAX", "becton dickinson": "BDX", "stryker": "SYK",
+    "zimmer biomet": "ZBH", "intuitive surgical": "ISRG", "intuitive": "ISRG",
+    "hologic": "HOLX", "idexx": "IDXX", "charles river": "CRL",
+    # Consumer / Retail
+    "walmart": "WMT", "costco": "COST", "target": "TGT", "home depot": "HD",
+    "lowes": "LOW", "ikea": "INGKA", "dollar general": "DG",
+    "dollar tree": "DLTR", "best buy": "BBY", "nordstrom": "JWN",
+    "macys": "M", "macy's": "M", "kohl's": "KSS", "tjx": "TJX",
+    "ross stores": "ROST", "lululemon": "LULU", "nike": "NKE",
+    "adidas": "ADDYY", "puma": "PUMAY", "under armour": "UAA",
+    "gap": "GPS", "old navy": "GPS", "zara": "ITX", "h&m": "HNNMY",
+    "starbucks": "SBUX", "mcdonald's": "MCD", "mcdonalds": "MCD",
+    "chipotle": "CMG", "yum": "YUM", "yum brands": "YUM",
+    "coca-cola": "KO", "coca cola": "KO", "pepsi": "PEP", "pepsico": "PEP",
+    "procter": "PG", "procter & gamble": "PG", "unilever": "UL",
+    "colgate": "CL", "kellogg's": "K", "kellogg": "K", "general mills": "GIS",
+    "campbell": "CPB", "conagra": "CAG", "kraft heinz": "KHC",
+    "mondelez": "MDLZ", "mars": "MWWC", "nestle": "NSRGY",
+    # Energy / Oil & Gas
+    "exxon": "XOM", "exxon mobil": "XOM", "chevron": "CVX",
+    "conocophillips": "COP", "shell": "SHEL", "bp": "BP",
+    "occidental": "OXY", "occidental petroleum": "OXY",
+    "devon": "DVN", "devon energy": "DVN", "marathon": "MPC",
+    "marathon petroleum": "MPC", "valero": "VLO", "phillips 66": "PSX",
+    "sunoco": "SUN", "nextera": "NEE", "nextera energy": "NEE",
+    "duke energy": "DUK", "southern company": "SO", "dominion": "D",
+    "dominion energy": "D", "american electric": "AEP",
+    "first solar": "FSLR", "enphase": "ENPH", "solar edge": "SEDG",
+    # Industrials / Aerospace
+    "boeing": "BA", "lockheed": "LMT", "lockheed martin": "LMT",
+    "raytheon": "RTX", "rtx": "RTX", "northrop grumman": "NOC",
+    "general dynamics": "GD", "l3harris": "LHX", "transdigm": "TDG",
+    "honeywell": "HON", "3m": "MMM", "caterpillar": "CAT",
+    "deere": "DE", "john deere": "DE", "general electric": "GE",
+    "siemens": "SIEGY", "schneider electric": "SU.PA", "emerson": "EMR",
+    "parker hannifin": "PH", "rockwell": "ROK", "illinois tool": "ITW",
+    "union pacific": "UNP", "burlington northern": "BRK",
+    "csx": "CSX", "norfolk southern": "NSC", "fedex": "FDX",
+    "ups": "UPS", "xpo": "XPO", "j.b. hunt": "JBHT",
+    "waste management": "WM", "republic services": "RSG",
+    "cintas": "CTAS", "aramark": "ARMK",
+    # Telecom / Media
+    "at&t": "T", "at&t inc": "T", "verizon": "VZ", "t-mobile": "TMUS",
+    "comcast": "CMCSA", "charter": "CHTR", "charter communications": "CHTR",
+    "dish": "DISH", "dish network": "DISH", "disney": "DIS",
+    "warner bros": "WBD", "warner discovery": "WBD", "paramount": "PARA",
+    "fox": "FOX", "fox corporation": "FOX", "nbcuniversal": "CMCSA",
+    "viacom": "VIA", "live nation": "LYV", "spotify technology": "SPOT",
+    # Real Estate / REITs
+    "prologis": "PLD", "american tower": "AMT", "equinix": "EQIX",
+    "realty income": "O", "public storage": "PSA", "welltower": "WELL",
+    "avalonbay": "AVB", "easterly government": "DEA",
+    "digital realty": "DLR", "crown castle": "CCI",
+    "simon property": "SPG", "tanger": "SKT",
+    # Food / Beverage
+    "starbucks corporation": "SBUX", "monster beverage": "MNST",
+    "constellation": "STZ", "brown forman": "BF.B",
+    "domino's": "DPZ", "dominos": "DPZ", "dard": "DRI",
+    "darden": "DRI", "wingstop": "WING", "sweetgreen": "SG",
+    "shake shack": "SHAK", "caesars": "CZR", "caesars entertainment": "CZR",
+    "las vegas sands": "LVS", "mgm": "MGM", "wynn": "WYNN",
+    "melco": "MLCO",
+    # EV / Auto
+    "rivian": "RIVN", "lucid": "LCID", "lucid motors": "LCID",
+    "nio": "NIO", "xpeng": "XPEV", "li auto": "LI",
+    "toyota": "TM", "honda": "HMC", "hyundai": "HYMTF",
+    "ford": "F", "general motors": "GM", "gm": "GM",
+    "stellantis": "STLA", "ferrari": "RACE", "porsche": "POAHY",
+    "lamborghini": "VOW3.DE",
+    # Semiconductor
+    "tsmc": "TSM", "taiwan semiconductor": "TSM", "samsung": "SSNLF",
+    "asml": "ASML", "arm holdings": "ARM", "arm": "ARM",
+    "micron": "MU", "micron technology": "MU", "on semiconductor": "ON",
+    "onsemi": "ON", "marvell": "MRVL", "marvell technology": "MRVL",
+    "analog devices": "ADI", "maxim": "MXIM", "microchip": "MCHP",
+    "nxpi": "NXPI", "nvidia corporation": "NVDA", "amd inc": "AMD",
+    # Software / SaaS
+    "microsoft corporation": "MSFT", "salesforce inc": "CRM",
+    "servicenow": "NOW", "workday": "WDAY", "adobe inc": "ADBE",
+    "vmware": "VMW", "broadcom inc": "AVGO", "synopsys": "SNPS",
+    "cadence": "CDNS", "ansys": "ANSS", "splunk": "SPLK",
+    "zscaler": "ZS", "okta": "OKTA", "cloudflare inc": "NET",
+    "dynatrace": "DT", "new relic": "NEWR", "jfrog": "FROG",
+    "confluent": "CFLT", "elastic": "ESTC", "hashicorp": "HCP",
+    "gitlab": "GTLB", "atlassian": "TEAM", "hubspot": "HUBS",
+    "zendesk": "ZEN", "freshworks": "FRSH", " monday.com": "MNDY",
+    "monday.com": "MNDY", "c3.ai": "AI", "c3 ai": "AI",
+    "openai": "PRIV", "anthropic": "PRIV", "databricks inc": "DBX",
+    # Travel / Hospitality
+    "marriott": "MAR", "marriott international": "MAR",
+    "hilton": "HLT", "hilton worldwide": "HLT",
+    "airbnb": "ABNB", "booking": "BKNG", "booking holdings": "BKNG",
+    "expedia": "EXPE", "tripadvisor": "TRIP", "american airlines": "AAL",
+    "delta": "DAL", "delta air lines": "DAL", "united airlines": "UAL",
+    "southwest": "LUV", "southwest airlines": "LUV",
+    "jetblue": "JBLU", "spirit airlines": "SAVE",
+    "carnival": "CCL", "royal caribbean": "RCL", "norwegian": "NCLH",
+    # Misc / Other
+    "berkshire hathaway inc": "BRK", "berkshire hathaway class a": "BRK.A",
+    "berkshire hathaway class b": "BRK.B",
+    "leidos": "LDOS", "booz allen": "BAH", "accenture": "ACN",
+    "deloitte": "PRIVATE", "pwc": "PRIVATE", "ey": "PRIVATE",
+    "kpmg": "PRIVATE", "mckinsey": "PRIVATE",
+    "spacex": "PRIV", "stripe": "PRIV", "airtable": "PRIV",
+    "canva": "PRIV", "notion": "PRIV", "figma": "PRIVATE",
+    "discord": "PRIV", "tiktok": "PRIV", "bytedance": "PRIV",
+    "temu": "PDD", "pinduoduo": "PDD", "alibaba": "BABA",
+    "baba": "BABA", "jd.com": "JD", "baidu": "BIDU",
+    "tencent": "TCEHY", "xiaomi": "XIACF", "huawei": "PRIVATE",
+    "boeing company": "BA", "the boeing company": "BA",
+    "lockheed martin corp": "LMT", "raytheon technologies": "RTX",
+    "lennar": "LEN", "pultegroup": "PHM", "d.r. horton": "DHI",
+    "dr horton": "DHI", "meritage": "MTH", "toll brothers": "TOL",
+    "nvr": "NVR", "pulte": "PHM", "dream finders": "DFH",
+    "green brick": "GRBK",
+    "schlumberger": "SLB", "slb": "SLB", "halliburton": "HAL",
+    "baker hughes": "BKR", "weatherford": "WFRD",
+    "crown holdings": "CCK", "sealed air": "SEE",
+    "ball corporation": "BLL", "silgan": "SLGN",
+    "verisk": "VRSK", "willis towers watson": "WTW",
+    "marsh": "MMC", "marsh & mclennan": "MMC",
+    "aon": "AON", "gallagher": "AJG", "arthur j": "AJG",
+    "progressive": "PGR", "allstate": "ALL", "chubb": "CB",
+    "hartford": "HIG", "travelers": "TRV", "metlife": "MET",
+    "prudential": "PRU", "lincoln national": "LNC",
+    "unum": "UNM", "aflac": "AFL", "cigna group": "CI",
+    "hca healthcare": "HCA", "tenet": "TCP", "tenet healthcare": "TCP",
+    "universal health": "UHS", "community health": "CYH",
+    "davita": "DVA", "encompass health": "EHC",
+    "waste connections": "WCN", "clean harcbors": "CLH",
+    "stericycle": "SRCL", "republic services inc": "RSG",
+    "deckers": "DECK", "columbia sportswear": "COLM",
+    "ralph lauren": "RL", "capri": "CPRI", "tapestry": "TPR",
+    "coach": "TPR", "kate spade": "CPRI", "michael kors": "CPRI",
+    "hugo boss": "BOSS.DE", "burberry": "BRBY.L",
+    "lvmh": "MC.PA", "hermes": "RMS.PA", "kering": "KER.PA",
+    "christian dior": "CDI.PA", "prada": "1913.HK",
+    "toyota motor": "TM", "honda motor": "HMC",
+    "volkswagen": "VOW3.DE", "bmw": "BAMXF", "mercedes": "MBG.DE",
+    "stellantis nv": "STLA",
+    "qualcomm inc": "QCOM", "broadcom limited": "AVGO",
+    "advanced micro devices": "AMD", "micron technology inc": "MU",
+    "applovin": "APP", "applovin corp": "APP",
+    "sea limited": "SE", "sea": "SE",
+    "grab holdings": "GRAB", "grab": "GRAB",
+    "sofi": "SOFI", "sofi technologies": "SOFI",
+    "affirm": "AFRM", "affirm holdings": "AFRM",
+    "upstart": "UPST", "upstart holdings": "UPST",
+    "lendingclub": "LC", "lending club": "LC",
+    "chime": "PRIV", "nubank": "NU",
+    "nubank holdings": "NU", "nu holdings": "NU",
+    "rocket companies": "RKT", "rocket mortgage": "RKT",
+    "uwm": "UWMC", "united wholesale mortgage": "UWMC",
+    "zillow": "Z", "zillow group": "Z",
+    "redfin": "RDFN", "redfin corp": "RDFN",
+    "opendoor": "OPEN", "opendoor technologies": "OPEN",
+    "we work": "WE", "wework": "WE",
+    "peloton": "PTON", "peloton interactive": "PTON",
+    "whatnot": "PRIV", "poshmark": "POSH",
+    "depop": "ETSY", "etsy": "ETSY", "etsy inc": "ETSY",
+    "ebay": "EBAY", "ebay inc": "EBAY",
+    "craigslist": "PRIVATE", "facebook marketplace": "META",
+    "amazon marketplace": "AMZN", "amazon web services": "AMZN",
+    "aws": "AMZN", "microsoft azure": "MSFT", "azure": "MSFT",
+    "google cloud": "GOOGL", "gcp": "GOOGL",
+    "openai chatgpt": "PRIV", "chatgpt": "PRIV",
+    "midjourney": "PRIV", "stability ai": "PRIV",
+    "cathie wood": "ARKK", "ark invest": "ARKK",
+    "ark innovation": "ARKK", "ark genomics": "ARKG",
+    "vanguard s&p 500": "VOO", "vanguard total": "VT",
+    "ishares": "IVV", "spdr s&p": "SPY", "qqq": "QQQ",
+    "invesco qqq": "QQQ", "ark": "ARKK",
+    "bitcoin": "BTC-USD", "ethereum": "ETH-USD",
+    "solana": "SOL-USD", "crypto": "BTC-USD",
+    "treasury": "TLT", "treasury bond": "TLT",
+    "i bonds": "GOVT", "tips": "TIP",
+    "real estate investment trust": "VNQ",
+    "reit": "VNQ", "vanguard real estate": "VNQ",
+    "jpmorgan chase": "JPM", "jpmorgan chase & co": "JPM",
+    "jpmorgan chase and co": "JPM",
+    "bank of new york": "BK", "bnymellon": "BK",
+    "state street corp": "STT", "northern trust corp": "NTRS",
+    "visa inc": "V", "mastercard incorporated": "MA",
+    "mastercard inc": "MA",
+    "booz allen hamilton": "BAH", "booz allen hamilton holding": "BAH",
+    "leidos holdings": "LDOS", "leidos inc": "LDOS",
+    "general dynamics corp": "GD", "l3harris technologies": "LHX",
+    "transdigm group": "TDG", "transdigm holdings": "TDG",
+    "northrop grumman corp": "NOC",
+}
+
+def resolve_ticker(asset):
+    """Resolve ticker from asset description text using keyword matching.
+
+    Tries substring matching against COMPANY_TICKER_MAP keys. Returns
+    the longest matching key's ticker (most specific match), or None.
+    """
+    if not asset:
+        return None
+    text = asset.lower()
+    best_ticker = None
+    best_len = 0
+    for name, ticker in COMPANY_TICKER_MAP.items():
+        if len(name) > best_len and name in text:
+            best_ticker = ticker
+            best_len = len(name)
+    return best_ticker
+
 def get_filing_date(conn, doc_id):
     row = conn.execute(
         "SELECT filing_date FROM metadata WHERE doc_id = ?",
@@ -197,7 +444,7 @@ def insert_transactions(doc_id, year, member, transactions):
             # Convert dates to YYYY-MM-DD format
             tx_date = normalize_date(tx["date"])
             notif_date = filing_date or normalize_date(tx["notif_date"]) or tx_date
-            ticker = extract_ticker(tx["asset"])
+            ticker = extract_ticker(tx["asset"]) or resolve_ticker(tx["asset"])
             
             if not tx_date:
                 errors.append(f"bad date: {tx['date']}")
@@ -213,7 +460,7 @@ def insert_transactions(doc_id, year, member, transactions):
                 tx_type = "Exchange"
             
             conn.execute("""
-                INSERT OR IGNORE INTO transactions 
+                INSERT INTO transactions 
                 (doc_id, member, ticker, transaction_date, disclosure_date, 
                  transaction_type, amount_raw, amount_midpoint, owner_code, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -224,6 +471,9 @@ def insert_transactions(doc_id, year, member, transactions):
                 None
             ])
             count += 1
+        except duckdb.ConstraintException:
+            # Duplicate row — skip silently
+            continue
         except Exception as e:
             errors.append(f"{tx.get('asset', '?')}: {e}")
     if errors:
@@ -282,9 +532,10 @@ def main():
     print(f"Total inserted: {total_inserted}")
 
 
-def run_gemini_ocr_for_year(year: int):
+def run_gemini_ocr_for_year(year: int, data_dir: str = "data"):
     """Process all zero-row PDFs for a specific year."""
-    conn = duckdb.connect(DB_PATH, read_only=True)
+    db_path = os.path.join(data_dir, "congress.duckdb")
+    conn = duckdb.connect(db_path, read_only=True)
     rows = conn.execute("""
         WITH latest AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY parsed_at DESC) as rn
@@ -296,8 +547,8 @@ def run_gemini_ocr_for_year(year: int):
     """, [year]).fetchall()
     conn.close()
     
-    pdfs = [(d, y, f"data/{y}/pdfs/{d}.pdf") for d, y in rows
-            if os.path.exists(f"data/{y}/pdfs/{d}.pdf")]
+    pdfs = [(d, y, os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf")) for d, y in rows
+            if os.path.exists(os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf"))]
     print(f"Zero-row PDFs for {year}: {len(pdfs)}")
     
     progress = load_progress()
@@ -313,7 +564,7 @@ def run_gemini_ocr_for_year(year: int):
         if output is None:
             progress["errors"].append(doc_id)
             save_progress(progress)
-            conn = duckdb.connect(DB_PATH)
+            conn = duckdb.connect(db_path)
             record_parse_run(conn, doc_id, yr, "error", 0, 0, error)
             conn.close()
             print(f"  ERROR: {error}", flush=True)

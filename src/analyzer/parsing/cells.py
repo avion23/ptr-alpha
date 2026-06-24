@@ -22,13 +22,13 @@ def _extract_ticker(asset_cell: str | None) -> str | None:
     ticker_match = re.search(r'\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)', asset_cell)
     if ticker_match:
         return ticker_match.group(1).upper()
-    # For non-stock assets (government securities, etc.) without tickers,
-    # generate a pseudo-ticker from the first meaningful word
-    cleaned = re.sub(r'\[.*?\]', '', asset_cell).strip()  # Remove [GS], [ST], etc.
-    words = re.findall(r'[A-Za-z]{2,}', cleaned)
-    if words:
-        # Use first 3-4 chars of first word as pseudo-ticker
-        return words[0][:4].upper()
+    # Also match $TICKER and TICKER: formats
+    dollar_match = re.search(r'\$([A-Za-z][A-Za-z0-9.\-]{0,5})', asset_cell)
+    if dollar_match:
+        return dollar_match.group(1).upper()
+    colon_match = re.search(r'\b([A-Za-z][A-Za-z0-9.\-]{0,5}):', asset_cell)
+    if colon_match:
+        return colon_match.group(1).upper()
     return None
 
 
@@ -61,9 +61,18 @@ def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
 def _extract_date(date_cell: str | None) -> str | None:
     if not date_cell:
         return None
-    # Support both MM/DD/YYYY and YYYY-MM-DD formats
+    # Support MM/DD/YYYY, YYYY-MM-DD, and MM/DD/YY formats
     date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', date_cell)
-    return date_match.group(1) if date_match else None
+    if date_match:
+        return date_match.group(1)
+    # MM/DD/YY format — normalize 2-digit year
+    date_short = re.search(r'(\d{2}/\d{2}/(\d{2}))', date_cell)
+    if date_short:
+        full = date_short.group(1)
+        yy = int(date_short.group(2))
+        year_prefix = "19" if yy >= 50 else "20"
+        return f"{full[:5]}/{year_prefix}{date_short.group(2)}"
+    return None
 
 
 def _extract_owner_code(owner_cell: str | None) -> str | None:

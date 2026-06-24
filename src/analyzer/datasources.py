@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 import zipfile
 from datetime import date, datetime
 from io import BytesIO
@@ -182,7 +183,7 @@ def _try_tesseract(pdf_path: Path) -> list[dict]:
 # ── HouseTransactionSource: House disclosure download + parse driver ──
 
 class HouseTransactionSource(TransactionSource):
-    def __init__(self, settings: Settings, read_only: bool = False):
+    def __init__(self, settings: Settings, read_only: bool = False, db: Database | None = None):
         self.settings = settings
         self.data_dir = Path(settings.data.data_dir)
         self.metadata_url_template = settings.sources.house_metadata_url
@@ -193,10 +194,12 @@ class HouseTransactionSource(TransactionSource):
             backend="sqlite",
             expire_after=3600,
         )
-        self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        self._owns_db = db is None
+        self.db = db if db is not None else Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
     def close(self) -> None:
-        self.db.close()
+        if self._owns_db:
+            self.db.close()
 
     def __enter__(self):
         return self
@@ -406,14 +409,16 @@ def _build_member_lookup(existing_docs: pd.DataFrame) -> dict:
 # ── YFinancePriceSource: yfinance-backed price fetcher with cache merge ──
 
 class YFinancePriceSource(PriceSource):
-    def __init__(self, settings: Settings, read_only: bool = False):
+    def __init__(self, settings: Settings, read_only: bool = False, db: Database | None = None):
         self.settings = settings
         self.data_dir = Path(settings.data.data_dir)
-        self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        self._owns_db = db is None
+        self.db = db if db is not None else Database(self.data_dir / "congress.duckdb", read_only=read_only)
         self.resolver = TickerResolver()
 
     def close(self) -> None:
-        self.db.close()
+        if self._owns_db:
+            self.db.close()
 
     def __enter__(self):
         return self
@@ -500,18 +505,32 @@ class YFinancePriceSource(PriceSource):
         return _validate_and_log_prices(prices, all_tickers)
 
     def _download_yfinance(self, fetch_resolved: list[str], start, end) -> pd.DataFrame:
-        try:
-            return yf.download(
-                fetch_resolved,
-                start=start,
-                end=end,
-                progress=False,
-                threads=True,
-                auto_adjust=True,
-            )
-        except Exception as e:
-            logger.warning(f"yfinance request failed ({e}), falling back to cached data")
-            return pd.DataFrame()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return yf.download(
+                    fetch_resolved,
+                    start=start,
+                    end=end,
+                    progress=False,
+                    threads=True,
+                    auto_adjust=True,
+                )
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = 2 ** (attempt + 1)
+                    logger.warning(
+                        f"yfinance request failed (attempt {attempt + 1}/{max_retries}: {e}), "
+                        f"retrying in {delay}s"
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.warning(
+                        f"yfinance request failed after {max_retries} attempts ({e}), "
+                        "falling back to cached data"
+                    )
+                    return pd.DataFrame()
+        return pd.DataFrame()
 
     def _rename_yf_columns(self, new_prices: pd.DataFrame, raw_to_yf: dict) -> pd.DataFrame:
         """Rename yf-symbol columns back to their raw tickers so downstream

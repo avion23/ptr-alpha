@@ -24,6 +24,7 @@ from analyzer.pipeline import (
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer.exceptions import AnalyzerError
 from analyzer.settings import Settings
+from analyzer.database import Database
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
@@ -48,10 +49,13 @@ def get_context(ctx, data_dir=None, read_only=False):
         settings = Settings()
         if data_dir and data_dir != "data":
             settings.data.data_dir = data_dir
+        # Share a single DuckDB connection across both data sources to avoid
+        # two independent Database instances pointing at the same file.
+        shared_db = Database(Path(settings.data.data_dir) / "congress.duckdb", read_only=read_only)
         ctx.obj = AppContext(
             settings=settings,
-            transaction_source=HouseTransactionSource(settings, read_only=read_only),
-            price_source=YFinancePriceSource(settings, read_only=read_only),
+            transaction_source=HouseTransactionSource(settings, read_only=read_only, db=shared_db),
+            price_source=YFinancePriceSource(settings, read_only=read_only, db=shared_db),
         )
     return ctx.obj
 
@@ -163,10 +167,13 @@ def parse(
 ):
     """Parse cached PDFs to database"""
     app_ctx = get_context(ctx, data_dir, read_only=False)
-    success = run_parse_pipeline(app_ctx.transaction_source, year)
+    try:
+        success = run_parse_pipeline(app_ctx.transaction_source, year)
+    except Exception:
+        success = False
     if use_gemini_ocr:
         from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-        run_gemini_ocr_for_year(year)
+        run_gemini_ocr_for_year(year, data_dir=app_ctx.settings.data.data_dir)
     raise typer.Exit(0 if success else 1)
 
 
@@ -409,11 +416,6 @@ def snapshot(
 ):
     """Create a frozen price snapshot manifest for reproducible backtests."""
     app_ctx = get_context(ctx, data_dir, read_only=True)
-
-    from analyzer.settings import Settings
-    settings = Settings()
-    if data_dir and data_dir != "data":
-        settings.data.data_dir = data_dir
 
     db = app_ctx.transaction_source.db
     tickers_result = db.conn.execute("SELECT DISTINCT ticker FROM prices").fetchall()

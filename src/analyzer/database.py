@@ -106,17 +106,6 @@ class Database:
 
     def _init_pdf_tables(self) -> None:
         self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS pdf_downloads (
-                doc_id VARCHAR PRIMARY KEY,
-                year INTEGER,
-                status VARCHAR,
-                status_code INTEGER,
-                error_message VARCHAR,
-                downloaded_at TIMESTAMP
-            )
-        """)
-
-        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS pdf_parse_runs (
                 doc_id VARCHAR,
                 year INTEGER,

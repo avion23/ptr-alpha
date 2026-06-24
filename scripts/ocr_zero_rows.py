@@ -7,7 +7,7 @@ Gemini auto-rotates PDFs and handles checkbox detection.
 import json, os, re, time, subprocess, duckdb
 
 DB_PATH = "data/congress.duckdb"
-PROGRESS_PATH = "data/ocr_progress.json"
+PROGRESS_PATH = "data/ocr_progress_gemini_manual.json"
 COOLDOWN = 3  # seconds between requests (Lite model allows rapid fire)
 MODEL = "gemini/gemini-3.1-flash-lite"
 
@@ -37,7 +37,7 @@ def get_zero_row_pdfs():
         )
         SELECT l.doc_id, l.year
         FROM latest l
-        WHERE l.rn = 1 AND l.status = 'zero_rows'
+        WHERE l.rn = 1 AND l.status IN ('zero_rows', 'error')
     """).fetchall()
     conn.close()
     return [(d, y, f"data/{y}/pdfs/{d}.pdf") for d, y in rows
@@ -58,13 +58,15 @@ def call_gemini(pdf_path):
     try:
         result = subprocess.run(
             ["llm", "-m", MODEL, "-a", pdf_path, PROMPT],
-            capture_output=True, text=True, timeout=60
+            capture_output=True, text=True, timeout=180
         )
-        return result.stdout
+        if result.returncode != 0:
+            return None, result.stderr.strip() or f"llm exited {result.returncode}"
+        return result.stdout, ""
     except subprocess.TimeoutExpired:
-        return None
-    except Exception:
-        return None
+        return None, "llm timed out"
+    except Exception as exc:
+        return None, str(exc)
 
 def parse_output(output):
     """Parse Gemini output into structured data."""
@@ -144,19 +146,58 @@ def normalize_date(date_str):
         year = "20" + year if int(year) < 50 else "19" + year
     return f"{year}-{int(month):02d}-{int(day):02d}"
 
+def extract_ticker(asset):
+    """Extract stock ticker from common House asset formats."""
+    if not asset:
+        return None
+    text = asset.upper()
+    patterns = [
+        r"\(([A-Z]{1,5}(?:\.[AB])?)\)",
+        r"\bTICKER\s*[:=]\s*([A-Z]{1,5}(?:\.[AB])?)\b",
+        r"\$([A-Z]{1,5}(?:\.[AB])?)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+def get_filing_date(conn, doc_id):
+    row = conn.execute(
+        "SELECT filing_date FROM metadata WHERE doc_id = ?",
+        [str(doc_id)],
+    ).fetchone()
+    return row[0] if row else None
+
+def record_parse_run(conn, doc_id, year, status, raw_count, tx_count, error_message=""):
+    conn.execute("""
+        INSERT INTO pdf_parse_runs (
+            doc_id, year, parser_version, status, engines_attempted,
+            raw_row_count, transaction_count, error_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        str(doc_id), year, "v4-gemini-manual", status, MODEL,
+        raw_count, tx_count, error_message[:1000],
+    ])
+
 def insert_transactions(doc_id, year, member, transactions):
     """Insert transactions into DB. Returns count inserted."""
-    if not transactions:
-        return 0
-    
     conn = duckdb.connect(DB_PATH)
+    filing_date = get_filing_date(conn, doc_id)
+    conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
+    if not transactions:
+        record_parse_run(conn, doc_id, year, "no_txs", 0, 0)
+        conn.close()
+        return 0
+
     count = 0
     errors = []
     for tx in transactions:
         try:
             # Convert dates to YYYY-MM-DD format
             tx_date = normalize_date(tx["date"])
-            notif_date = normalize_date(tx["notif_date"]) or tx_date
+            notif_date = filing_date or normalize_date(tx["notif_date"]) or tx_date
+            ticker = extract_ticker(tx["asset"])
             
             if not tx_date:
                 errors.append(f"bad date: {tx['date']}")
@@ -177,23 +218,26 @@ def insert_transactions(doc_id, year, member, transactions):
                  transaction_type, amount_raw, amount_midpoint, owner_code, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """, [
-                doc_id, member or "Unknown", tx["asset"],
+                str(doc_id), member or "Unknown", ticker,
                 tx_date, notif_date,
                 tx_type, tx["amount_letter"] or "Unknown", tx["amount_midpoint"],
-                "JT"
+                None
             ])
             count += 1
         except Exception as e:
             errors.append(f"{tx.get('asset', '?')}: {e}")
     if errors:
         print(f"  INSERT ERRORS ({len(errors)}): {errors[:3]}", flush=True)
+    status = "success" if count else "no_txs"
+    record_parse_run(conn, doc_id, year, status, len(transactions), count, "; ".join(errors))
+    conn.execute("CHECKPOINT")
     conn.close()
     return count
 
 def main():
     pdfs = get_zero_row_pdfs()
     progress = load_progress()
-    completed = set(progress["completed"] + progress["errors"] + progress["no_txs"])
+    completed = set(progress["completed"] + progress["no_txs"])
     
     remaining = [p for p in pdfs if p[0] not in completed]
     print(f"Total zero-row PDFs: {len(pdfs)}")
@@ -207,15 +251,19 @@ def main():
         
         time.sleep(COOLDOWN)
         
-        output = call_gemini(path)
+        output, error = call_gemini(path)
         if output is None:
             progress["errors"].append(doc_id)
             save_progress(progress)
-            print(f"  ERROR: timeout or API failure", flush=True)
+            conn = duckdb.connect(DB_PATH)
+            record_parse_run(conn, doc_id, year, "error", 0, 0, error)
+            conn.close()
+            print(f"  ERROR: {error}", flush=True)
             continue
         
         member, transactions = parse_output(output)
         if not transactions:
+            insert_transactions(doc_id, year, member, [])
             progress["no_txs"].append(doc_id)
             save_progress(progress)
             print(f"  No transactions found", flush=True)
@@ -244,7 +292,7 @@ def run_gemini_ocr_for_year(year: int):
         )
         SELECT l.doc_id, l.year
         FROM latest l
-        WHERE l.rn = 1 AND l.status = 'zero_rows' AND l.year = ?
+        WHERE l.rn = 1 AND l.status IN ('zero_rows', 'error') AND l.year = ?
     """, [year]).fetchall()
     conn.close()
     
@@ -253,7 +301,7 @@ def run_gemini_ocr_for_year(year: int):
     print(f"Zero-row PDFs for {year}: {len(pdfs)}")
     
     progress = load_progress()
-    completed = set(progress["completed"] + progress["errors"] + progress["no_txs"])
+    completed = set(progress["completed"] + progress["no_txs"])
     remaining = [p for p in pdfs if p[0] not in completed]
     print(f"Remaining: {len(remaining)}")
     
@@ -261,14 +309,18 @@ def run_gemini_ocr_for_year(year: int):
     for i, (doc_id, yr, path) in enumerate(remaining):
         print(f"\n[{i+1}/{len(remaining)}] {doc_id} ({yr})...", flush=True)
         time.sleep(COOLDOWN)
-        output = call_gemini(path)
+        output, error = call_gemini(path)
         if output is None:
             progress["errors"].append(doc_id)
             save_progress(progress)
-            print(f"  ERROR: timeout", flush=True)
+            conn = duckdb.connect(DB_PATH)
+            record_parse_run(conn, doc_id, yr, "error", 0, 0, error)
+            conn.close()
+            print(f"  ERROR: {error}", flush=True)
             continue
         member, transactions = parse_output(output)
         if not transactions:
+            insert_transactions(doc_id, yr, member, [])
             progress["no_txs"].append(doc_id)
             save_progress(progress)
             print(f"  No transactions found", flush=True)

@@ -55,10 +55,10 @@ def _load_sector_data(tickers: list[str]) -> pd.DataFrame:
 
 @dataclass
 class AnalysisParams:
-    source: str
     year: int
     horizons: list[int]
     threshold: float
+    source: str = "house"
     member_filter: str | None = None
     top_n: int | None = None
     show_signals: bool = False
@@ -233,6 +233,7 @@ def run_backtest_pipeline(
     params: BacktestParams,
     transaction_source,
     price_source,
+    data_dir: Path = Path("data"),
 ) -> bool:
     tx_start = params.start_date - timedelta(
         days=params.training_lookback_days + params.horizon + 30
@@ -337,7 +338,7 @@ def run_backtest_pipeline(
     print(f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}")
 
     # Save snapshot alongside backtest results
-    snapshot_path = "data/price_snapshot.json"
+    snapshot_path = data_dir / "price_snapshot.json"
     save_snapshot(snapshot, snapshot_path)
     logger.info(f"Price snapshot saved to {snapshot_path}")
 

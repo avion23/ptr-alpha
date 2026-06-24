@@ -44,13 +44,13 @@ def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
     if s_stripped in ('s', 'sale', 'sold'):
         return TransactionType.SALE.value
     if s_stripped in ('e', 'exchange'):
-        return TransactionType.PURCHASE.value
+        return TransactionType.EXCHANGE.value
     if 'purchase' in s or 'buy' in s:
         return TransactionType.PURCHASE.value
     if 'sale' in s or 'sell' in s or 'sold' in s:
         return TransactionType.SALE.value
     if 'exchange' in s:
-        return TransactionType.PURCHASE.value
+        return TransactionType.EXCHANGE.value
     if s_stripped.startswith('p') and len(s_stripped) <= 2:
         return TransactionType.PURCHASE.value
     if s_stripped.startswith('s') and len(s_stripped) <= 2:
@@ -62,16 +62,17 @@ def _extract_date(date_cell: str | None) -> str | None:
     if not date_cell:
         return None
     # Support MM/DD/YYYY, YYYY-MM-DD, and MM/DD/YY formats
-    date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', date_cell)
+    date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})', date_cell)
     if date_match:
         return date_match.group(1)
     # MM/DD/YY format — normalize 2-digit year
-    date_short = re.search(r'(\d{2}/\d{2}/(\d{2}))', date_cell)
+    date_short = re.search(r'(\d{1,2}/\d{1,2}/(\d{2}))', date_cell)
     if date_short:
         full = date_short.group(1)
         yy = int(date_short.group(2))
         year_prefix = "19" if yy >= 50 else "20"
-        return f"{full[:5]}/{year_prefix}{date_short.group(2)}"
+        date_part = full.rsplit('/', 1)[0]
+        return f"{date_part}/{year_prefix}{date_short.group(2)}"
     return None
 
 

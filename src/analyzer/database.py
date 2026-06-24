@@ -275,26 +275,44 @@ class Database:
         # Build expanded ticker set: raw tickers + their resolved yfinance symbols
         expanded_tickers: list[str] = []
         seen: set[str] = set()
+        # Build raw→resolved mapping for the SQL CTE
+        ticker_map_entries: list[tuple[str, str]] = []
         for raw in tickers:
             if raw not in seen:
                 seen.add(raw)
                 expanded_tickers.append(raw)
             resolved = resolutions[raw].price_symbol
+            ticker_map_entries.append((raw, resolved))
             if resolved not in seen:
                 seen.add(resolved)
                 expanded_tickers.append(resolved)
 
+        # Build VALUES clause for the ticker resolution CTE
+        values_parts = [
+            f"('{raw.replace(chr(39), chr(39)*2)}', '{res.replace(chr(39), chr(39)*2)}')"
+            for raw, res in ticker_map_entries
+        ]
+        values_str = ", ".join(values_parts)
+
         result = self.conn.execute(
-            """
-            SELECT t.member, t.ticker, t.disclosure_date, t.transaction_type,
-                   t.owner_code, t.amount_midpoint, t.instrument_type, t.strike_price, t.expiry_date,
+            f"""
+            WITH ticker_map(raw, resolved) AS (
+                VALUES {values_str}
+            ),
+            resolved_tickers AS (
+                SELECT t.*, COALESCE(tm.resolved, t.ticker) AS resolved_ticker
+                FROM transactions t
+                LEFT JOIN ticker_map tm ON t.ticker = tm.raw
+            )
+            SELECT r.member, r.ticker, r.disclosure_date, r.transaction_type,
+                   r.owner_code, r.amount_midpoint, r.instrument_type, r.strike_price, r.expiry_date,
                    p.close AS entry_price, p.date AS entry_price_date
-            FROM transactions t
+            FROM resolved_tickers r
             ASOF JOIN prices p
-              ON t.ticker = p.ticker
-              AND p.date <= t.disclosure_date
-            WHERE t.ticker IN (SELECT UNNEST(?))
-              AND t.disclosure_date BETWEEN ? AND ?
+              ON r.resolved_ticker = p.ticker
+              AND p.date <= r.disclosure_date
+            WHERE r.ticker IN (SELECT UNNEST(?))
+              AND r.disclosure_date BETWEEN ? AND ?
               AND p.close IS NOT NULL
         """,
             [expanded_tickers, start_date, end_date],

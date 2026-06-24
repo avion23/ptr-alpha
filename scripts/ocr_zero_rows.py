@@ -427,9 +427,9 @@ def record_parse_run(conn, doc_id, year, status, raw_count, tx_count, error_mess
         raw_count, tx_count, error_message[:1000],
     ])
 
-def insert_transactions(doc_id, year, member, transactions):
+def insert_transactions(doc_id, year, member, transactions, db_path: str = DB_PATH):
     """Insert transactions into DB. Returns count inserted."""
-    conn = duckdb.connect(DB_PATH)
+    conn = duckdb.connect(db_path)
     filing_date = get_filing_date(conn, doc_id)
     conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
     if not transactions:
@@ -571,16 +571,18 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data"):
             continue
         member, transactions = parse_output(output)
         if not transactions:
-            insert_transactions(doc_id, yr, member, [])
+            insert_transactions(doc_id, yr, member, [], db_path=db_path)
             progress["no_txs"].append(doc_id)
             save_progress(progress)
             print(f"  No transactions found", flush=True)
             continue
-        inserted = insert_transactions(doc_id, yr, member, transactions)
+        inserted = insert_transactions(doc_id, yr, member, transactions, db_path=db_path)
         total_inserted += inserted
         progress["completed"].append(doc_id)
         save_progress(progress)
         print(f"  Inserted: {inserted}/{len(transactions)}", flush=True)
+
+    return total_inserted
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from pydantic import BaseModel
 class TransactionType(StrEnum):
     PURCHASE = "Purchase"
     SALE = "Sale"
+    EXCHANGE = "Exchange"
 
 
 class FilingType(StrEnum):

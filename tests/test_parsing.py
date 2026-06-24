@@ -276,9 +276,11 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(_extract_transaction_type("Sell"), "Sale")
         self.assertEqual(_extract_transaction_type("Partial Sale"), "Sale")
 
-    def test_extract_transaction_type_unknown(self):
-        # "Exchange" and "E" are now treated as Purchase (asset acquisition)
-        self.assertEqual(_extract_transaction_type("Exchange"), "Purchase")
+    def test_extract_transaction_type_exchange(self):
+        # "Exchange" and "E" are now recognized as a distinct transaction type
+        self.assertEqual(_extract_transaction_type("Exchange"), "Exchange")
+        self.assertEqual(_extract_transaction_type("E"), "Exchange")
+        self.assertEqual(_extract_transaction_type("exchange"), "Exchange")
         self.assertIsNone(_extract_transaction_type("X"))
         self.assertIsNone(_extract_transaction_type("Hold"))
         self.assertIsNone(_extract_transaction_type(""))
@@ -643,6 +645,61 @@ class TestParsing(unittest.TestCase):
         details = _extract_option_details('NVDA Call Option Strike Price $150.00 Exp 06/30/2025')
         self.assertAlmostEqual(details['strike_price'], 150.00)
         self.assertEqual(details['expiry_date'], '06/30/2025')
+
+    # --- Exchange transaction type ---
+
+    def test_extract_transaction_type_exchange_full_word(self):
+        self.assertEqual(_extract_transaction_type("Exchange"), "Exchange")
+
+    def test_extract_transaction_type_exchange_bare_e(self):
+        self.assertEqual(_extract_transaction_type("E"), "Exchange")
+
+    def test_extract_transaction_type_exchange_case_insensitive(self):
+        self.assertEqual(_extract_transaction_type("exchange"), "Exchange")
+        self.assertEqual(_extract_transaction_type("EXCHANGE"), "Exchange")
+
+    def test_extract_transaction_type_exchange_partial_suffix(self):
+        self.assertEqual(_extract_transaction_type("E (partial)"), "Exchange")
+        self.assertEqual(_extract_transaction_type("Exchange (partial)"), "Exchange")
+
+    def test_parse_pdf_table_exchange_type(self):
+        table = [
+            ['Asset Name', 'Transaction Type', 'Transaction Date'],
+            ['Apple Inc. (AAPL)', 'Exchange', '2024-01-15'],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]['transaction_type'], 'Exchange')
+        self.assertEqual(transactions[0]['ticker'], 'AAPL')
+
+    # --- Single-digit dates ---
+
+    def test_extract_date_single_digit_month(self):
+        self.assertEqual(_extract_date("1/15/2024"), "1/15/2024")
+
+    def test_extract_date_single_digit_day(self):
+        self.assertEqual(_extract_date("01/5/2024"), "01/5/2024")
+
+    def test_extract_date_single_digit_both(self):
+        self.assertEqual(_extract_date("1/5/2024"), "1/5/2024")
+
+    def test_extract_date_single_digit_in_text(self):
+        self.assertEqual(_extract_date("Date: 3/7/2024 confirmed"), "3/7/2024")
+
+    def test_extract_date_short_single_digit(self):
+        self.assertEqual(_extract_date("1/15/24"), "1/15/2024")
+        self.assertEqual(_extract_date("3/7/99"), "3/7/1999")
+
+    def test_parse_pdf_table_single_digit_dates(self):
+        table = [
+            ['Asset Name', 'Transaction Type', 'Transaction Date'],
+            ['Apple Inc. (AAPL)', 'Purchase', '1/5/2024'],
+            ['Google LLC (GOOGL)', 'Sale', '3/7/2024'],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(len(transactions), 2)
+        self.assertEqual(transactions[0]['transaction_date'], '1/5/2024')
+        self.assertEqual(transactions[1]['transaction_date'], '3/7/2024')
 
 if __name__ == '__main__':
     unittest.main()

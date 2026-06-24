@@ -28,6 +28,7 @@ from analyzer.database import Database
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,7 +73,6 @@ def main_callback(
 def analyze(
     ctx: typer.Context,
     year: int = typer.Option(2025, help="Year to process"),
-    source: str = typer.Option("house", help="Data source"),
     mode: str = typer.Option(
         "ranks",
         help="Output mode: ranks | signals | member | sales | tickers",
@@ -96,6 +96,10 @@ def analyze(
       sales    - Rank members by loss avoidance (sale performance)
       tickers  - Score multi-buyer tickers from recent period
     """
+    valid_modes = {"ranks", "signals", "member", "sales", "tickers"}
+    if mode not in valid_modes:
+        print(f"Error: --mode must be one of {sorted(valid_modes)}", file=sys.stderr)
+        raise typer.Exit(1)
     app_ctx = get_context(ctx, data_dir, read_only=False)
 
     if ticker:
@@ -132,7 +136,7 @@ def analyze(
         raise typer.Exit(0 if success else 1)
 
     show_signals = mode == "signals"
-    params = AnalysisParams(source, year, horizons, threshold, member, top_n, show_signals)
+    params = AnalysisParams(year, horizons, threshold, member, top_n, show_signals)
     data_path = Path(app_ctx.settings.data.data_dir)
     success = run_analysis_pipeline(
         params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
@@ -170,10 +174,14 @@ def parse(
     try:
         success = run_parse_pipeline(app_ctx.transaction_source, year)
     except Exception:
+        logger.exception("Parse pipeline failed")
         success = False
+    ocr_inserted = 0
     if use_gemini_ocr:
         from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-        run_gemini_ocr_for_year(year, data_dir=app_ctx.settings.data.data_dir)
+        ocr_inserted = run_gemini_ocr_for_year(year, data_dir=app_ctx.settings.data.data_dir)
+    if use_gemini_ocr and ocr_inserted > 0:
+        raise typer.Exit(0)
     raise typer.Exit(0 if success else 1)
 
 
@@ -225,7 +233,7 @@ def backtest(
         threshold=threshold,
         frequency_days=frequency_days,
     )
-    success = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source)
+    success = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source, Path(data_dir))
     raise typer.Exit(0 if success else 1)
 
 

@@ -102,6 +102,20 @@ def analyze(
         raise typer.Exit(1)
     app_ctx = get_context(ctx, data_dir, read_only=False)
 
+    # Freshness check — warn if data looks stale
+    try:
+        import duckdb as _duckdb
+        _conn = _duckdb.connect(str(Path(data_dir) / "congress.duckdb"), read_only=True)
+        _max_date = _conn.execute("SELECT MAX(transaction_date) FROM transactions").fetchone()[0]
+        _conn.close()
+        if _max_date:
+            from datetime import date as _date, timedelta
+            _age = (_date.today() - _max_date).days
+            if _age > 30:
+                print(f"WARNING: Data is {_age} days old (latest: {_max_date}). Run 'ptr-alpha refresh' first.", file=sys.stderr)
+    except Exception:
+        pass  # Don't let freshness check block analysis
+
     if ticker:
         params = TickerAnalysisParams(ticker=ticker, year=year, horizon=horizons[0], threshold=threshold)
         success = run_ticker_analysis(
@@ -453,6 +467,90 @@ def snapshot(
     print(f"  Price rows:     {snap.price_rows}")
     print(f"  Date range:     {snap.first_date} to {snap.last_date}")
     print(f"  Saved to:       {output}")
+    raise typer.Exit(0)
+
+
+@app.command()
+def refresh(
+    ctx: typer.Context,
+    year: int = typer.Option(2025, help="Year to refresh"),
+    data_dir: str = typer.Option("data", help="Data directory"),
+    use_gemini_ocr: bool = typer.Option(
+        False, "--gemini-ocr", help="Use Gemini LLM OCR for zero-row PDFs"
+    ),
+    skip_capitol: bool = typer.Option(
+        False, "--skip-capitol", help="Skip Capitol Trades API fetch"
+    ),
+    refresh_metadata: bool = typer.Option(
+        False, "--refresh-metadata", help="Force refresh House Clerk metadata"
+    ),
+):
+    """
+    Full pipeline refresh: fetch House PDFs + parse + Capitol Trades API.
+
+    This is the single command to keep the database up to date. It runs:
+      1. Fetch House Clerk metadata and download new PTR PDFs
+      2. Parse all cached PDFs into transactions
+      3. Fetch Capitol Trades API (backup source for any missed filings)
+      4. Optionally run Gemini OCR on zero-row PDFs
+    """
+    app_ctx = get_context(ctx, data_dir, read_only=False)
+    db_path = Path(app_ctx.settings.data.data_dir) / "congress.duckdb"
+
+    # Count before
+    conn = __import__("duckdb").connect(str(db_path), read_only=True)
+    count_before = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    conn.close()
+
+    # Step 1: Fetch House PDFs
+    print(f"[1/4] Fetching House PDFs for {year}...")
+    if refresh_metadata:
+        app_ctx.transaction_source.fetch_metadata(year, refresh=True)
+    try:
+        run_fetch_pipeline(app_ctx.transaction_source, year)
+    except Exception as e:
+        logger.warning(f"House PDF fetch failed: {e}")
+
+    # Step 2: Parse cached PDFs
+    print(f"[2/4] Parsing cached PDFs for {year}...")
+    try:
+        run_parse_pipeline(app_ctx.transaction_source, year)
+    except Exception as e:
+        logger.warning(f"PDF parse failed: {e}")
+
+    # Step 3: Capitol Trades API
+    if not skip_capitol:
+        print("[3/4] Fetching Capitol Trades API...")
+        from analyzer.capitol_trades import CapitolTradesSource
+        capitol = CapitolTradesSource(data_dir=data_dir, read_only=False)
+        try:
+            capitol_count = capitol.fetch_and_save_all()
+            print(f"  Capitol Trades: {capitol_count} transactions upserted")
+        except Exception as e:
+            logger.warning(f"Capitol Trades fetch failed: {e}")
+        finally:
+            capitol.close()
+    else:
+        print("[3/4] Skipping Capitol Trades API (--skip-capitol)")
+
+    # Step 4: Gemini OCR (optional)
+    if use_gemini_ocr:
+        print("[4/4] Running Gemini OCR on zero-row PDFs...")
+        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
+        ocr_inserted = run_gemini_ocr_for_year(year, data_dir=data_dir)
+        print(f"  Gemini OCR: {ocr_inserted} transactions inserted")
+    else:
+        print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
+
+    # Count after
+    conn = __import__("duckdb").connect(str(db_path), read_only=True)
+    count_after = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    max_date = conn.execute("SELECT MAX(transaction_date) FROM transactions").fetchone()[0]
+    conn.close()
+
+    added = count_after - count_before
+    print(f"\nDone. {count_before} -> {count_after} transactions ({'+' if added >= 0 else ''}{added} new)")
+    print(f"Latest transaction date: {max_date}")
     raise typer.Exit(0)
 
 

@@ -10,13 +10,13 @@ import re
 from analyzer.models import TransactionType
 
 _TICKER_BLACKLIST = {
-    # Single letters that are common non-ticker matches
-    'A', 'I', 'O', 'V', 'X', 'Y', 'K',
     # Transaction type letters accidentally captured
     'P', 'S', 'E',
     # Common non-ticker words
     'CASH', 'FUND', 'BOND', 'NOTE', 'BILLS', 'TIPS',
     'THE', 'NEW', 'DEL', 'OLD',
+    # Single letters with high false-positive rate in garbled PDFs
+    'A', 'I', 'O', 'X', 'Y',
 }
 
 
@@ -45,7 +45,209 @@ def _extract_ticker(asset_cell: str | None) -> str | None:
         candidate = colon_match.group(1).upper()
         if candidate not in _TICKER_BLACKLIST:
             return candidate
-    return None
+    return _resolve_company_name_ticker(asset_cell)
+
+
+# Company-name-to-ticker mapping used as fallback when regex patterns fail.
+# Sorted longest-first so more specific names match before shorter ones.
+_COMPANY_NAME_TICKER_MAP: dict[str, str] = {
+    "berkshire hathaway class b": "BRK.B", "berkshire hathaway class a": "BRK.A",
+    "berkshire hathaway inc": "BRK", "berkshire hathaway": "BRK",
+    "bank of america": "BAC", "bank of new york": "BK",
+    "booz allen hamilton holding": "BAH", "booz allen hamilton": "BAH",
+    "coca-cola company": "KO", "coca-cola": "KO", "coca cola": "KO",
+    "charter communications": "CHTR", "columbia sportswear": "COLM",
+    "costco wholesale": "COST", "costco": "COST",
+    "delta air lines": "DAL", "disney": "DIS",
+    "domino's": "DPZ", "dominos": "DPZ",
+    "d.r. horton": "DHI", "dr horton": "DHI",
+    "general dynamics": "GD", "general electric": "GE",
+    "general mills": "GIS", "general motors": "GM",
+    "goldman sachs": "GS", "google cloud": "GOOGL",
+    "home depot": "HD", "honda motor": "HMC",
+    "johnson & johnson": "JNJ", "johnson and johnson": "JNJ",
+    "jpmorgan chase & co": "JPM", "jpmorgan chase and co": "JPM",
+    "jpmorgan chase": "JPM", "jp morgan": "JPM",
+    "kraft heinz": "KHC", "l3harris technologies": "LHX",
+    "lennar": "LEN", "leidos holdings": "LDOS", "leidos": "LDOS",
+    "lockheed martin": "LMT", "louis vuitton": "MC.PA",
+    "marsh & mclennan": "MMC", "marriott international": "MAR",
+    "mastercard incorporated": "MA", "mastercard inc": "MA",
+    "mcdonald's": "MCD", "mcdonalds": "MCD",
+    "merck & co": "MRK", "microsoft corporation": "MSFT",
+    "micron technology": "MU", "morgan stanley": "MS",
+    "monster beverage": "MNST", "northrop grumman": "NOC",
+    "norfolk southern": "NSC", "northern trust corp": "NTRS",
+    "northern trust": "NTRS",
+    "occidental petroleum": "OXY", "palo alto networks": "PANW",
+    "pepsico": "PEP", "pultegroup": "PHM", "pulte": "PHM",
+    "procter & gamble": "PG", "procter": "PG",
+    "qualcomm inc": "QCOM", "ralph lauren": "RL",
+    "republic services": "RSG", "raytheon technologies": "RTX",
+    "ross stores": "ROST", "royal caribbean": "RCL",
+    "schlumberger": "SLB", "seal air": "SEE",
+    "simon property": "SPG", "southwest airlines": "LUV",
+    "state street corp": "STT", "state street": "STT",
+    "target": "TGT", "taiwan semiconductor": "TSM",
+    "the boeing company": "BA", "toll brothers": "TOL",
+    "toyota motor": "TM", "transdigm group": "TDG",
+    "transdigm holdings": "TDG",
+    "united airlines": "UAL", "united health": "UNH",
+    "unitedhealth": "UNH", "universal health": "UHS",
+    "ups": "UPS", "visa inc": "V",
+    "waste connections": "WCN", "waste management": "WM",
+    "wells fargo": "WFC", "willis towers watson": "WTW",
+    # Mega-cap tech
+    "apple": "AAPL", "microsoft": "MSFT", "amazon": "AMZN",
+    "alphabet": "GOOGL", "meta": "META", "facebook": "META",
+    "tesla": "TSLA", "nvidia": "NVDA", "netflix": "NFLX",
+    "adobe": "ADBE", "salesforce": "CRM", "oracle": "ORCL",
+    "intel": "INTC", "amd": "AMD", "broadcom": "AVGO",
+    "cisco": "CSCO", "qualcomm": "QCOM", "ibm": "IBM",
+    "intuit": "INTU", "paypal": "PYPL", "shopify": "SHOP",
+    "uber": "UBER", "lyft": "LYFT", "snap": "SNAP",
+    "pinterest": "PINS", "robinhood": "HOOD",
+    "coinbase": "COIN", "block": "SQ", "square": "SQ",
+    "zoom": "ZM", "crowdstrike": "CRWD",
+    "cloudflare": "NET", "datadog": "DDOG",
+    "mongodb": "MDB", "snowflake": "SNOW",
+    "twilio": "TWLO", "spotify": "SPOT", "roku": "ROKU",
+    "palantir": "PLTR", "roblox": "RBLX",
+    "applovin": "APP", "sofi": "SOFI",
+    # Finance / Banking
+    "jpmorgan": "JPM", "goldman": "GS",
+    "wells fargo": "WFC", "citigroup": "C", "citi": "C",
+    "us bancorp": "USB", "truist": "TFC", "charles schwab": "SCHW",
+    "schwab": "SCHW", "american express": "AXP",
+    "visa": "V", "mastercard": "MA",
+    "blackrock": "BLK", "blackstone": "BX",
+    "berkshire": "BRK",
+    "capital one": "COF", "discover": "DFS",
+    "nasdaq": "NDAQ", "nasdaq inc": "NDAQ",
+    "intercontinental exchange": "ICE",
+    "s&p global": "SPGI", "spglobal": "SPGI",
+    "moody's": "MCO", "moody": "MCO",
+    # Healthcare / Pharma
+    "pfizer": "PFE", "abbvie": "ABBV",
+    "merck": "MRK", "abbott": "ABT", "amgen": "AMGN",
+    "gilead": "GILD", "bristol-myers": "BMY",
+    "bristol myers": "BMY", "eli lilly": "LLY", "lilly": "LLY",
+    "regeneron": "REGN", "vertex": "VRTX",
+    "moderna": "MRNA", "biogen": "BIIB",
+    "cigna": "CI", "humana": "HUM", "anthem": "ELV",
+    "elevance": "ELV", "centene": "CNC",
+    "medtronic": "MDT", "stryker": "SYK",
+    "intuitive surgical": "ISRG", "intuitive": "ISRG",
+    "hca healthcare": "HCA", "tenet healthcare": "TCP",
+    "davita": "DVA", "encompass health": "EHC",
+    # Consumer / Retail
+    "walmart": "WMT", "target": "TGT",
+    "lowes": "LOW", "dollar general": "DG",
+    "dollar tree": "DLTR", "best buy": "BBY",
+    "lululemon": "LULU", "nike": "NKE",
+    "under armour": "UAA", "gap": "GPS",
+    "starbucks": "SBUX", "chipotle": "CMG",
+    "yum brands": "YUM", "yum": "YUM",
+    "pepsi": "PEP",
+    "colgate": "CL", "kellogg": "K", "kellogg's": "K",
+    "campbell": "CPB", "conagra": "CAG",
+    "mondelez": "MDLZ", "nestle": "NSRGY",
+    # Energy / Oil & Gas
+    "exxon": "XOM", "exxon mobil": "XOM", "chevron": "CVX",
+    "conocophillips": "COP", "shell": "SHEL", "bp": "BP",
+    "occidental": "OXY", "devon energy": "DVN", "devon": "DVN",
+    "marathon petroleum": "MPC", "marathon": "MPC",
+    "valero": "VLO", "phillips 66": "PSX",
+    "nextera energy": "NEE", "nextera": "NEE",
+    "duke energy": "DUK", "southern company": "SO",
+    "dominion energy": "D", "dominion": "D",
+    "american electric": "AEP",
+    "first solar": "FSLR", "enphase": "ENPH",
+    # Industrials / Aerospace
+    "boeing": "BA", "lockheed": "LMT",
+    "raytheon": "RTX", "rtx": "RTX",
+    "general dynamics": "GD", "l3harris": "LHX",
+    "transdigm": "TDG", "honeywell": "HON",
+    "3m": "MMM", "caterpillar": "CAT",
+    "deere": "DE", "john deere": "DE",
+    "siemens": "SIEGY", "emerson": "EMR",
+    "union pacific": "UNP", "csx": "CSX",
+    "fedex": "FDX", "xpo": "XPO",
+    "waste management": "WM",
+    "cintas": "CTAS", "aramark": "ARMK",
+    # Telecom / Media
+    "at&t": "T", "verizon": "VZ", "t-mobile": "TMUS",
+    "comcast": "CMCSA", "charter": "CHTR",
+    "disney": "DIS", "warner bros": "WBD",
+    "warner discovery": "WBD", "paramount": "PARA",
+    "fox": "FOX", "live nation": "LYV",
+    # Real Estate / REITs
+    "prologis": "PLD", "american tower": "AMT",
+    "equinix": "EQIX", "realty income": "O",
+    "public storage": "PSA", "welltower": "WELL",
+    "digital realty": "DLR", "crown castle": "CCI",
+    # Food / Beverage
+    "constellation": "STZ", "domino's": "DPZ",
+    "darden": "DRI", "wingstop": "WING",
+    "shake shack": "SHAK", "caesars": "CZR",
+    "las vegas sands": "LVS", "mgm": "MGM",
+    "wynn": "WYNN",
+    # EV / Auto
+    "rivian": "RIVN", "lucid": "LCID",
+    "nio": "NIO", "xpeng": "XPEV", "li auto": "LI",
+    "toyota": "TM", "honda": "HMC", "hyundai": "HYMTF",
+    "ford": "F", "general motors": "GM", "gm": "GM",
+    "stellantis": "STLA", "ferrari": "RACE",
+    # Semiconductor
+    "tsmc": "TSM", "asml": "ASML", "arm": "ARM",
+    "micron": "MU", "onsemi": "ON",
+    "marvell": "MRVL", "analog devices": "ADI",
+    "microchip": "MCHP",
+    # Software / SaaS
+    "servicenow": "NOW", "workday": "WDAY",
+    "synopsys": "SNPS", "cadence": "CDNS",
+    "zscaler": "ZS", "okta": "OKTA",
+    "dynatrace": "DT", "confluent": "CFLT",
+    "elastic": "ESTC", "gitlab": "GTLB",
+    "atlassian": "TEAM", "hubspot": "HUBS",
+    "c3.ai": "AI", "c3 ai": "AI",
+    # Travel / Hospitality
+    "marriott": "MAR", "hilton": "HLT",
+    "airbnb": "ABNB", "booking": "BKNG",
+    "booking holdings": "BKNG",
+    "american airlines": "AAL", "delta": "DAL",
+    "united airlines": "UAL", "southwest": "LUV",
+    "jetblue": "JBLU", "carnival": "CCL",
+    "norwegian": "NCLH",
+    # Misc
+    "accenture": "ACN", "booz allen": "BAH",
+    "alibaba": "BABA", "baidu": "BIDU",
+    "tencent": "TCEHY",
+    "progressive": "PGR", "allstate": "ALL",
+    "chubb": "CB", "hartford": "HIG",
+    "travelers": "TRV", "metlife": "MET",
+    "prudential": "PRU", "aflac": "AFL",
+    "affirm": "AFRM", "upstart": "UPST",
+    "sofi technologies": "SOFI",
+    "rocket companies": "RKT", "rocket mortgage": "RKT",
+    "zillow": "Z", "redfin": "RDFN",
+    "peloton": "PTON", "etsy": "ETSY",
+    "ebay": "EBAY",
+    "deckers": "DECK", "tapestry": "TPR",
+    "coach": "TPR",
+}
+
+
+def _resolve_company_name_ticker(asset_cell: str) -> str | None:
+    """Match asset description against company names. Longest match wins."""
+    text = asset_cell.lower()
+    best_ticker = None
+    best_len = 0
+    for name, ticker in _COMPANY_NAME_TICKER_MAP.items():
+        if len(name) > best_len and name in text and ticker not in _TICKER_BLACKLIST:
+            best_ticker = ticker
+            best_len = len(name)
+    return best_ticker
 
 
 def _extract_transaction_type(tx_type_cell: str | None) -> str | None:

@@ -88,8 +88,9 @@ class TestParsing(unittest.TestCase):
         ]
 
         transactions = parse_pdf_table(table)
-        # No asset column means no ticker pattern -> filtered out
-        self.assertEqual(len(transactions), 0)
+        # "Apple Inc." resolves via company name matching even without explicit asset column
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]['ticker'], 'AAPL')
 
     def test_parse_pdf_table_empty_or_invalid(self):
         self.assertEqual(parse_pdf_table([]), [])
@@ -104,8 +105,9 @@ class TestParsing(unittest.TestCase):
         ]
 
         transactions = parse_pdf_table(table)
-        # No ticker patterns -> all filtered out
-        self.assertEqual(len(transactions), 0)
+        # No ticker patterns, but rows are kept with ticker=None for later backfill
+        self.assertEqual(len(transactions), 2)
+        self.assertTrue(all(t['ticker'] is None for t in transactions))
 
 
     def test_normalize_house_metadata_valid(self):
@@ -209,9 +211,11 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(_extract_ticker("BRK-B (BRK-B)"), "BRK-B")
 
     def test_extract_ticker_no_parens(self):
-        # Assets without ticker patterns return None (no pseudo-ticker fallback)
-        self.assertIsNone(_extract_ticker("Apple Inc"))
+        # Assets matching company names resolve via name lookup
+        self.assertEqual(_extract_ticker("Apple Inc"), "AAPL")
+        # Unknown names still return None
         self.assertIsNone(_extract_ticker("Some Company Name"))
+        # Treasury/bond keywords are blacklisted
         self.assertIsNone(_extract_ticker("US Treasury Bond"))
         self.assertIsNone(_extract_ticker("Municipal Revenue Notes"))
         # Lowercase tickers are now accepted (case-insensitive) and uppercased
@@ -234,15 +238,20 @@ class TestParsing(unittest.TestCase):
     def test_extract_ticker_single_letter(self):
         self.assertEqual(_extract_ticker("Ford Motor (F)"), "F")
         self.assertEqual(_extract_ticker("Citigroup (C)"), "C")
-        # V and K are blacklisted as common non-ticker single letters
-        self.assertIsNone(_extract_ticker("Visa Inc. (V)"))
-        self.assertIsNone(_extract_ticker("Kellanova (K)"))
+        # V is a real ticker (Visa) — should be extracted
+        self.assertEqual(_extract_ticker("Visa Inc. (V)"), "V")
+        self.assertEqual(_extract_ticker("AT&T (T)"), "T")
+        # K is a real ticker (Kellanova) — should be extracted
+        self.assertEqual(_extract_ticker("Kellanova (K)"), "K")
 
     def test_extract_ticker_blacklisted_single_letter(self):
         self.assertIsNone(_extract_ticker("Payment (Y)"))
         self.assertIsNone(_extract_ticker("Transaction (A)"))
         self.assertIsNone(_extract_ticker("Fund (X)"))
         self.assertIsNone(_extract_ticker("Holding (O)"))
+        # V and K are real tickers — not blacklisted
+        self.assertEqual(_extract_ticker("Visa Inc. (V)"), "V")
+        self.assertEqual(_extract_ticker("Kellogg (K)"), "K")
 
     def test_extract_ticker_blacklisted_word(self):
         self.assertIsNone(_extract_ticker("Treasury Fund (CASH)"))
@@ -338,10 +347,16 @@ class TestParsing(unittest.TestCase):
             ['Another No Ticker', 'Sale', '2024-01-04']
         ]
         transactions = parse_pdf_table(table)
-        # Only rows with ticker patterns produce transactions (NULL tickers filtered)
-        self.assertEqual(len(transactions), 2)
+        # All valid rows are now kept (even without tickers) for later backfill.
+        # The continuation merge is only attempted when all three fields are missing.
+        self.assertEqual(len(transactions), 4)
+        tickers = [t['ticker'] for t in transactions]
+        self.assertIn('AAPL', tickers)
+        self.assertIn('GOOGL', tickers)
+        none_count = sum(1 for t in transactions if t['ticker'] is None)
+        self.assertEqual(none_count, 2)
         self.assertEqual(transactions[0]['ticker'], 'AAPL')
-        self.assertEqual(transactions[1]['ticker'], 'GOOGL')
+        self.assertEqual(transactions[2]['ticker'], 'GOOGL')
 
     def test_normalize_house_metadata_mm_dd_yyyy(self):
         content = "DocID\tFirst\tLast\tFilingDate\tFilingType\n"

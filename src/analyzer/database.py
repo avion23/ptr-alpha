@@ -183,31 +183,61 @@ class Database:
 
     def upsert_transactions(self, df: pd.DataFrame) -> None:
         df = df.copy()
-        for column in ["owner_code", "amount_raw", "amount_midpoint", "instrument_type", "strike_price", "expiry_date"]:
+        for column in ["owner_code", "amount_raw", "amount_midpoint", "instrument_type", "strike_price", "expiry_date", "asset_description"]:
             if column not in df.columns:
                 df[column] = None
         df["created_at"] = datetime.now()
 
+        # Check if asset_description column exists in the table
+        has_asset_desc = any(
+            r[0] == "asset_description"
+            for r in self.conn.execute("DESCRIBE transactions").fetchall()
+        )
+
         self.conn.execute("CREATE TEMP TABLE staging_transactions AS SELECT * FROM df")
-        self.conn.execute("""
-            INSERT INTO transactions (
-                doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
-            )
-            SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                   owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
-            FROM staging_transactions
-            ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type) DO UPDATE SET
-                transaction_type = EXCLUDED.transaction_type,
-                disclosure_date = EXCLUDED.disclosure_date,
-                owner_code = EXCLUDED.owner_code,
-                amount_raw = EXCLUDED.amount_raw,
-                amount_midpoint = EXCLUDED.amount_midpoint,
-                instrument_type = EXCLUDED.instrument_type,
-                strike_price = EXCLUDED.strike_price,
-                expiry_date = EXCLUDED.expiry_date,
-                created_at = EXCLUDED.created_at
-        """)
+        if has_asset_desc:
+            self.conn.execute("""
+                INSERT INTO transactions (
+                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
+                    asset_description
+                )
+                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
+                       asset_description
+                FROM staging_transactions
+                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type) DO UPDATE SET
+                    transaction_type = EXCLUDED.transaction_type,
+                    disclosure_date = EXCLUDED.disclosure_date,
+                    owner_code = EXCLUDED.owner_code,
+                    amount_raw = EXCLUDED.amount_raw,
+                    amount_midpoint = EXCLUDED.amount_midpoint,
+                    instrument_type = EXCLUDED.instrument_type,
+                    strike_price = EXCLUDED.strike_price,
+                    expiry_date = EXCLUDED.expiry_date,
+                    created_at = EXCLUDED.created_at,
+                    asset_description = EXCLUDED.asset_description
+            """)
+        else:
+            self.conn.execute("""
+                INSERT INTO transactions (
+                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
+                )
+                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
+                FROM staging_transactions
+                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type) DO UPDATE SET
+                    transaction_type = EXCLUDED.transaction_type,
+                    disclosure_date = EXCLUDED.disclosure_date,
+                    owner_code = EXCLUDED.owner_code,
+                    amount_raw = EXCLUDED.amount_raw,
+                    amount_midpoint = EXCLUDED.amount_midpoint,
+                    instrument_type = EXCLUDED.instrument_type,
+                    strike_price = EXCLUDED.strike_price,
+                    expiry_date = EXCLUDED.expiry_date,
+                    created_at = EXCLUDED.created_at
+            """)
         self.conn.execute("DROP TABLE staging_transactions")
 
     def delete_transactions_for_doc(self, doc_id: str) -> None:

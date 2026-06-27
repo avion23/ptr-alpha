@@ -466,13 +466,14 @@ def insert_transactions(doc_id, year, member, transactions, db_path: str = DB_PA
             conn.execute("""
                 INSERT INTO transactions 
                 (doc_id, member, ticker, transaction_date, disclosure_date, 
-                 transaction_type, amount_raw, amount_midpoint, owner_code, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 transaction_type, amount_raw, amount_midpoint, owner_code, created_at,
+                 asset_description)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
             """, [
                 str(doc_id), member or "Unknown", ticker,
                 tx_date, notif_date,
                 tx_type, tx["amount_letter"] or "Unknown", tx["amount_midpoint"],
-                None
+                None, tx["asset"][:500] if tx.get("asset") else None
             ])
             count += 1
         except duckdb.ConstraintException:

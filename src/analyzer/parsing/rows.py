@@ -13,6 +13,7 @@ from analyzer.parsing.cells import (
     _extract_owner_code,
     _extract_ticker,
     _extract_transaction_type,
+    clean_text,
 )
 from analyzer.parsing.columns import (
     _column_indexes,
@@ -32,17 +33,19 @@ def _process_row(row: list, indexes: dict[str, int] | None = None, next_row: lis
         ticker = _extract_ticker(asset_cell)
         tx_type = _extract_transaction_type(tx_type_cell)
         tx_date = _extract_date(date_cell)
+        merged = False
 
         if not ticker and not tx_type and not tx_date and next_row:
             ticker, asset_cell, tx_type_cell, date_cell, tx_type, tx_date = _try_merge_continuation(
                 row, next_row, indexes, asset_cell
             )
+            merged = bool(ticker)
 
-        if ticker and tx_type and tx_date:
-            return _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date)
-        return None
+        if tx_type and tx_date:
+            return _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date), merged
+        return None, False
     except IndexError:
-        return None
+        return None, False
 
 
 def _try_merge_continuation(row, next_row, indexes, asset_cell):
@@ -88,6 +91,7 @@ def _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date) -> dict:
         'instrument_type': instrument_type,
         'strike_price': option_details.get('strike_price'),
         'expiry_date': option_details.get('expiry_date'),
+        'asset_description': clean_text(asset_cell)[:500] if asset_cell else None,
     }
 
 
@@ -132,19 +136,20 @@ def _extract_transactions(data_rows: list, indexes: dict[str, int]) -> list[dict
             skip_next = False
             continue
         next_row = data_rows[i + 1] if i + 1 < len(data_rows) else None
-        tx = _process_row(row, indexes, next_row)
+        tx, merged = _process_row(row, indexes, next_row)
         if tx:
             results.append(tx)
-            # If we merged with next_row, skip it to avoid duplicate
-            if next_row and _should_skip_next(row, next_row, indexes):
+            # If we merged with next_row via continuation, skip it to avoid duplicate
+            if merged:
                 skip_next = True
     return results
 
 
 def _should_skip_next(row, next_row, indexes) -> bool:
-    """True when the current row's asset cell had no ticker and merging with
-    next_row produced one — so next_row is a continuation, not a new transaction."""
+    """True when the current row's asset had no ticker and merging with
+    next_row would produce one — so next_row is a continuation, not a new transaction."""
     cur_asset = _get_cell(row, indexes.get("asset"))
+    # Only skip if the current row itself had no ticker (merge would have been attempted)
     if _extract_ticker(cur_asset):
         return False
     next_asset = _get_cell(next_row, indexes.get("asset"))

@@ -94,9 +94,15 @@ def _rank_members_impl(
     conviction = _conviction_scores(grp, idx, purchases)
     shrunk_alpha = _shrunk_alpha_by_member(grp, alpha_col, idx, prior_alpha_mean, _bayes_prior_strength)
 
+    avg_realized = (
+        grp["total_return_pct"].mean().reindex(idx).fillna(0.0)
+        if "total_return_pct" in purchases.columns
+        else pd.Series(0.0, index=idx)
+    )
+
     result = _build_ranking_result(
         idx, ret_agg, stats, avg_spy, avg_total_spy,
-        hit_rates, conviction, shrunk_alpha,
+        hit_rates, conviction, shrunk_alpha, avg_realized,
     )
     return _finalize_ranking(result)
 
@@ -208,7 +214,7 @@ def _shrunk_alpha_by_member(grp, alpha_col: str, idx, prior_alpha_mean: float, p
     return (prior_alpha_mean * prior_strength + alpha_sums) / (prior_strength + alpha_counts)
 
 
-def _build_ranking_result(idx, ret_agg, stats, avg_spy, avg_total_spy, hit_rates, conviction, shrunk_alpha):
+def _build_ranking_result(idx, ret_agg, stats, avg_spy, avg_total_spy, hit_rates, conviction, shrunk_alpha, avg_realized):
     result = pd.DataFrame({
         "member": idx,
         "median_return_pct": np.round(ret_agg["median_ret"].values, 2),
@@ -219,6 +225,7 @@ def _build_ranking_result(idx, ret_agg, stats, avg_spy, avg_total_spy, hit_rates
         "bayes_win_prob": np.round(stats["bayes_win_prob"], 3),
         "bayes_factor": np.round(stats["bayes_factor"], 3),
         "posterior_lift": np.round(stats["posterior_lift"], 3),
+        "avg_return_pct": np.round(avg_realized.values, 2),
         "avg_spy_alpha_pct": np.round(avg_spy.values, 2),
         "avg_total_spy_alpha_pct": np.round(avg_total_spy.values, 2),
     })

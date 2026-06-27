@@ -20,7 +20,9 @@ from pathlib import Path  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from analyzer import analysis  # noqa: E402
+from analyzer._memo import clear_all_caches  # noqa: E402
 from analyzer.database import Database  # noqa: E402
+from analyzer.signals import constants as sig_constants  # noqa: E402
 
 from optimize_profit.precompute import precompute_walk_forward_data  # noqa: E402
 from optimize_profit.reporting import (  # noqa: E402
@@ -107,9 +109,10 @@ def _run_sweep(signals, all_tx, prices, precomputed, t0: float) -> list:
     """Iterate the full parameter grid and return a list of result dicts."""
     param_grid = {
         "scoring_fn": list(SCORING_FUNCTIONS.keys()),
-        "top_n": [3, 5, 10],
-        "min_buyers": [2, 3],
+        "top_n": [3, 5],
+        "min_buyers": [1, 2, 3],
         "allocation": ["equal", "signal"],
+        "decay_lambda": [0.003, 0.005],
     }
     keys = list(param_grid.keys())
     values = list(param_grid.values())
@@ -117,22 +120,34 @@ def _run_sweep(signals, all_tx, prices, precomputed, t0: float) -> list:
     total = len(combinations)
     print(f"Grid: {total} combinations ({len(SCORING_FUNCTIONS)} scorings x "
           f"{len(param_grid['top_n'])} top_n x {len(param_grid['min_buyers'])} min_buyers x "
-          f"{len(param_grid['allocation'])} allocations)")
+          f"{len(param_grid['allocation'])} allocations x "
+          f"{len(param_grid['decay_lambda'])} decay)")
 
     results = []
     for i, combo in enumerate(combinations):
         params = dict(zip(keys, combo))
-        metrics = run_walk_forward(
-            signals, all_tx, prices,
-            precomputed,
-            scoring_fn=SCORING_FUNCTIONS[params["scoring_fn"]],
-            top_n=params["top_n"],
-            min_buyers=params["min_buyers"],
-            allocation=params["allocation"],
-            max_dd_pct=50,
-        )
-        results.append({**params, **metrics})
-        _maybe_log_progress(i, total, params, metrics, t0)
+
+        # Save originals, set current combo values
+        orig_decay = sig_constants.DECAY_LAMBDA
+        sig_constants.DECAY_LAMBDA = params["decay_lambda"]
+
+        clear_all_caches()
+
+        try:
+            metrics = run_walk_forward(
+                signals, all_tx, prices,
+                precomputed,
+                scoring_fn=SCORING_FUNCTIONS[params["scoring_fn"]],
+                top_n=params["top_n"],
+                min_buyers=params["min_buyers"],
+                allocation=params["allocation"],
+                max_dd_pct=50,
+            )
+            results.append({**params, **metrics})
+            _maybe_log_progress(i, total, params, metrics, t0)
+        finally:
+            # Restore originals
+            sig_constants.DECAY_LAMBDA = orig_decay
 
     elapsed = time.time() - t0
     print(f"\nSweep completed in {elapsed:.1f}s ({total} combos)")
@@ -151,6 +166,7 @@ def _maybe_log_progress(i: int, total: int, params: dict, metrics: dict, t0: flo
         f"top={params['top_n']} "
         f"mb={params['min_buyers']} "
         f"{params['allocation']:6s} "
+        f"decay={params.get('decay_lambda', 0):.3f} "
         f"→ ret={metrics['total_return_pct']:+7.1f}% "
         f"sharpe={metrics['sharpe']:+5.2f} "
         f"DD={metrics['max_drawdown_pct']:6.1f}% "

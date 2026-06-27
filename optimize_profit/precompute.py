@@ -27,6 +27,7 @@ def precompute_walk_forward_data(
     lookback_days,
     training_lookback_days,
     min_buyers_list,
+    bayes_prior_strength=None,
 ):
     """Precompute per-as_of_date data shared across all scoring combos.
 
@@ -44,7 +45,7 @@ def precompute_walk_forward_data(
         if training.empty:
             continue
 
-        member_rankings = _rank_members_for_period(training, horizon)
+        member_rankings = _rank_members_for_period(training, horizon, bayes_prior_strength)
         if member_rankings is None or member_rankings.empty:
             continue
 
@@ -82,9 +83,9 @@ def _filter_training_for_period(signals_df, horizon, as_of_iso, training_lookbac
     return _filter_training(signals_df, horizon, as_of_iso, training_lookback_iso)
 
 
-def _rank_members_for_period(training, horizon):
+def _rank_members_for_period(training, horizon, bayes_prior_strength=None):
     try:
-        return rank_members(training, horizon, 5.0)
+        return rank_members(training, horizon, 5.0, _bayes_prior_strength=bayes_prior_strength)
     except Exception:
         return None
 

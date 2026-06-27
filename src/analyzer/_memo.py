@@ -26,6 +26,21 @@ from typing import Any, Callable
 import pandas as pd
 
 
+_REGISTRY: list = []
+"""Track all ``df_memoize``-wrapped functions so the sweep can clear them."""
+
+
+def clear_all_caches() -> None:
+    """Clear every ``lru_cache`` created by :func:`df_memoize`.
+
+    Call this between parameter-sweep combos when a swept constant
+    (e.g. ``DECAY_LAMBDA``) affects cached results but is *not* an
+    explicit argument to the memoized function.
+    """
+    for w in _REGISTRY:
+        w.cache_clear()
+
+
 class _IdentityProxy:
     """Identity-based hashable proxy for unhashable objects (DataFrame, dict, etc)."""
 
@@ -82,6 +97,7 @@ def df_memoize(func: Callable | None = None, *, copy: bool = True) -> Callable:
 
         wrapper.cache_clear = _cached.cache_clear  # type: ignore[attr-defined]
         wrapper.cache_info = _cached.cache_info  # type: ignore[attr-defined]
+        _REGISTRY.append(wrapper)
         return wrapper
 
     if func is None:

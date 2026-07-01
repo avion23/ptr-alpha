@@ -29,6 +29,9 @@ from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 logger = logging.getLogger(__name__)
+_BACKTEST_DEFAULTS = {
+    name: field.default for name, field in BacktestParams.__dataclass_fields__.items()
+}
 
 
 @dataclass
@@ -105,7 +108,7 @@ def analyze(
     # Freshness check — warn if data looks stale
     try:
         _max_date = app_ctx.transaction_source.db.conn.execute(
-            "SELECT MAX(transaction_date) FROM transactions"
+            "SELECT MAX(disclosure_date) FROM transactions"
         ).fetchone()[0]
         if _max_date:
             from datetime import date as _date
@@ -113,9 +116,11 @@ def analyze(
             if _age > 30:
                 print(f"WARNING: Data is {_age} days old (latest: {_max_date}). Run 'ptr-alpha refresh' first.", file=sys.stderr)
     except Exception:
-        pass  # Don't let freshness check block analysis
+        logger.debug("Freshness check failed", exc_info=True)
 
     if ticker:
+        if output == "csv":
+            print("WARNING: CSV output is not supported for --ticker analysis; using console output.", file=sys.stderr)
         params = TickerAnalysisParams(ticker=ticker, year=year, horizon=horizons[0], threshold=threshold)
         success = run_ticker_analysis(
             params,
@@ -125,6 +130,8 @@ def analyze(
         raise typer.Exit(0 if success else 1)
 
     if mode == "tickers":
+        if output == "csv":
+            print("WARNING: CSV output is not supported for --mode tickers; using console output.", file=sys.stderr)
         params = TickerScoringParams(
             year=year,
             horizons=horizons,
@@ -200,8 +207,8 @@ def parse(
     if use_gemini_ocr:
         from scripts.ocr_zero_rows import run_gemini_ocr_for_year
         ocr_inserted = run_gemini_ocr_for_year(year, data_dir=app_ctx.settings.data.data_dir)
-    if use_gemini_ocr and ocr_inserted > 0:
-        raise typer.Exit(0)
+    if not success and use_gemini_ocr and ocr_inserted > 0:
+        logger.warning("Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted)
     raise typer.Exit(0 if success else 1)
 
 
@@ -210,13 +217,13 @@ def backtest(
     ctx: typer.Context,
     start: str = typer.Option(..., help="Backtest start date (YYYY-MM-DD)"),
     end: str = typer.Option(..., help="Backtest end date (YYYY-MM-DD)"),
-    horizon: int = typer.Option(120, help="Forward return horizon in days"),
-    lookback_days: int = typer.Option(60, help="Candidate purchase lookback window in days"),
-    training_lookback_days: int = typer.Option(365, help="Training data lookback window in days"),
-    min_buyers: int = typer.Option(2, help="Minimum buyers for a candidate ticker"),
-    top_n: int = typer.Option(5, help="Top N recommendations per backtest date"),
-    threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
-    frequency_days: int = typer.Option(30, help="Days between rolling backtest dates"),
+    horizon: int = typer.Option(_BACKTEST_DEFAULTS["horizon"], help="Forward return horizon in days"),
+    lookback_days: int = typer.Option(_BACKTEST_DEFAULTS["lookback_days"], help="Candidate purchase lookback window in days"),
+    training_lookback_days: int = typer.Option(_BACKTEST_DEFAULTS["training_lookback_days"], help="Training data lookback window in days"),
+    min_buyers: int = typer.Option(_BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"),
+    top_n: int = typer.Option(_BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"),
+    threshold: float = typer.Option(_BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"),
+    frequency_days: int = typer.Option(_BACKTEST_DEFAULTS["frequency_days"], help="Days between rolling backtest dates"),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """
@@ -262,13 +269,13 @@ def portfolio(
     ctx: typer.Context,
     start: str = typer.Option(..., help="Simulation start date (YYYY-MM-DD)"),
     end: str = typer.Option(..., help="Simulation end date (YYYY-MM-DD)"),
-    horizon: int = typer.Option(120, help="Forward return horizon in days"),
-    lookback_days: int = typer.Option(60, help="Candidate purchase lookback window in days"),
-    training_lookback_days: int = typer.Option(365, help="Training data lookback window in days"),
-    min_buyers: int = typer.Option(2, help="Minimum buyers for a candidate ticker"),
-    top_n: int = typer.Option(5, help="Top N recommendations per backtest date"),
-    threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
-    frequency_days: int = typer.Option(14, help="Days between rolling backtest dates"),
+    horizon: int = typer.Option(_BACKTEST_DEFAULTS["horizon"], help="Forward return horizon in days"),
+    lookback_days: int = typer.Option(_BACKTEST_DEFAULTS["lookback_days"], help="Candidate purchase lookback window in days"),
+    training_lookback_days: int = typer.Option(_BACKTEST_DEFAULTS["training_lookback_days"], help="Training data lookback window in days"),
+    min_buyers: int = typer.Option(_BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"),
+    top_n: int = typer.Option(_BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"),
+    threshold: float = typer.Option(_BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"),
+    frequency_days: int = typer.Option(_BACKTEST_DEFAULTS["frequency_days"], help="Days between rolling backtest dates"),
     initial_capital: float = typer.Option(20000, help="Initial portfolio capital"),
     max_positions: int = typer.Option(5, help="Maximum concurrent positions"),
     hold_days: int = typer.Option(120, help="Hold period in days before forced exit"),

@@ -127,7 +127,11 @@ def run_single_backtest(
             result.rank1_alpha = round(float(rank_alpha.loc[1]), 2)
         if 5 in rank_alpha.index:
             result.rank5_alpha = round(float(rank_alpha.loc[5]), 2)
-        result.alpha_slope = round(result.rank5_alpha - result.rank1_alpha, 2)
+        # Convention: rank 1 = highest-scored ticker (best model prediction).
+        # A well-calibrated ranker has rank-1 picks outperforming rank-5 picks,
+        # so alpha_slope > 0 means the ranker is working.  nlargest(alpha_slope)
+        # therefore correctly selects configs where top-ranked tickers earn more.
+        result.alpha_slope = round(result.rank1_alpha - result.rank5_alpha, 2)
 
         result.win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
 

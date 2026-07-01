@@ -36,7 +36,14 @@ def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:
     horizon_signals = _get_horizon_data(signals_df, horizon, TransactionType.PURCHASE.value)
     if horizon_signals.empty:
         return 0.50
-    up_prob = (horizon_signals["decayed_return_pct"] > 0).mean()
+    # Bug #2: NaN decayed_return_pct was previously treated as a loss because
+    # (NaN > 0) evaluates to False in pandas.  Exclude NaN from both the
+    # numerator (wins) and denominator (total) so missing price windows do not
+    # bias the market-wide up-rate.
+    valid = horizon_signals["decayed_return_pct"].dropna()
+    if len(valid) == 0:
+        return 0.50
+    up_prob = (valid > 0).mean()
     return float(np.clip(up_prob, 0.10, 0.90))
 
 

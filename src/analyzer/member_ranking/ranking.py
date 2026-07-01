@@ -175,17 +175,23 @@ def _hit_rates_by_member(purchases: pd.DataFrame, idx, threshold: float | None):
     available, so callers can distinguish the two."""
     if threshold is None:
         return None
+    # Bug #3: (NaN > threshold) evaluates to False in pandas, so NaN rows
+    # were counted as misses in both numerator and denominator.  Restrict to
+    # non-NaN rows before computing per-member means.
+    valid_peak = purchases[purchases["peak_potential_pct"].notna()]
     peak_hits = (
-        (purchases["peak_potential_pct"] > threshold)
-        .groupby(purchases["member"])
+        (valid_peak["peak_potential_pct"] > threshold)
+        .groupby(valid_peak["member"])
         .mean()
         .reindex(idx) * 100
     )
     realized_hits = None
     if "total_return_pct" in purchases.columns:
+        # Bug #3: same NaN-as-miss problem for realized returns.
+        valid_ret = purchases[purchases["total_return_pct"].notna()]
         realized_hits = (
-            (purchases["total_return_pct"] > 0)
-            .groupby(purchases["member"])
+            (valid_ret["total_return_pct"] > 0)
+            .groupby(valid_ret["member"])
             .mean()
             .reindex(idx) * 100
         )

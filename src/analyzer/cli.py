@@ -275,7 +275,9 @@ def portfolio(
     min_buyers: int = typer.Option(_BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"),
     top_n: int = typer.Option(_BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"),
     threshold: float = typer.Option(_BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"),
-    frequency_days: int = typer.Option(_BACKTEST_DEFAULTS["frequency_days"], help="Days between rolling backtest dates"),
+    # Intentionally bi-weekly (not the backtest's 30d step): rebalance cadence
+    # for the portfolio sim, independent of the sweep-calibrated backtest.
+    frequency_days: int = typer.Option(14, help="Days between rolling backtest dates"),
     initial_capital: float = typer.Option(20000, help="Initial portfolio capital"),
     max_positions: int = typer.Option(5, help="Maximum concurrent positions"),
     hold_days: int = typer.Option(120, help="Hold period in days before forced exit"),

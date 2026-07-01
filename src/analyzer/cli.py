@@ -149,7 +149,14 @@ def analyze(
         raise typer.Exit(0 if success else 1)
 
     show_signals = mode == "signals"
-    params = AnalysisParams(year, horizons, threshold, member, top_n, show_signals)
+    params = AnalysisParams(
+        year=year,
+        horizons=horizons,
+        threshold=threshold,
+        member_filter=member,
+        top_n=top_n,
+        show_signals=show_signals,
+    )
     data_path = Path(app_ctx.settings.data.data_dir)
     success = run_analysis_pipeline(
         params, app_ctx.transaction_source, app_ctx.price_source, data_path, output

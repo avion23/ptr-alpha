@@ -277,13 +277,16 @@ class TestGetMissingPriceData(DatabaseTestCase):
         self.assertEqual(len(missing_dates), 0)
 
     def test_partial_missing_dates(self):
+        # AAPL has only Jan 1-2 prices but the range is Jan 1-5.
+        # Fix 4: per-ticker gap detection — AAPL must appear in missing_tickers
+        # (old behavior incorrectly returned [] because the global date union was used).
         dates = pd.bdate_range("2024-01-01", "2024-01-02")
         prices = pd.DataFrame({"AAPL": [100.0, 101.0]}, index=dates)
         self.db.upsert_prices(prices)
         missing_tickers, missing_dates = self.db.get_missing_price_data(
             ["AAPL"], date(2024, 1, 1), date(2024, 1, 5)
         )
-        self.assertEqual(missing_tickers, [])
+        self.assertIn("AAPL", missing_tickers)
         self.assertTrue(len(missing_dates) > 0)
 
     def test_mixed_missing_tickers_and_dates(self):

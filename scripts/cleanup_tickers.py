@@ -4,6 +4,7 @@ Distinguishes "matched to None" (explicit NULL) vs "no match" (leave alone).
 """
 from __future__ import annotations
 import duckdb
+from analyzer.parsing.cells import _TICKER_BLACKLIST
 
 # Mappings: company name prefix -> proper ticker
 NAME_TO_TICKER = {
@@ -133,6 +134,15 @@ def main():
         cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [tok]).fetchone()[0]
         if cnt:
             con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [tok])
+            total_nulled += cnt
+
+    # Fix 6: null out blacklisted garbage fragments regardless of length
+    # (the query above only targets length > 5; short confirmed-garbage tickers
+    # like UNIT, TECH, BERK, BANK etc. must also be cleared).
+    for blacklisted in sorted(_TICKER_BLACKLIST):
+        cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [blacklisted]).fetchone()[0]
+        if cnt:
+            con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [blacklisted])
             total_nulled += cnt
     
     con.execute("CHECKPOINT")

@@ -285,7 +285,10 @@ class TestCapitolTradesSource(unittest.TestCase):
         self.assertEqual(df.iloc[0]["transaction_type"], "Sale")
 
     @patch("analyzer.capitol_trades.requests.Session.get")
-    def test_normalize_preserves_amount_when_no_min_max(self, mock_get):
+    def test_normalize_falls_back_to_text_midpoint_when_no_min_max(self, mock_get):
+        # Fix 2a: when amount_min/max are absent, midpoint must be parsed from amount_text.
+        # Old behavior incorrectly left amount_midpoint as None even when the text
+        # contained a parseable dollar range.
         resp = {
             "total": 1,
             "page": 1,
@@ -306,7 +309,8 @@ class TestCapitolTradesSource(unittest.TestCase):
         df = self.source.fetch_trades("Nancy Pelosi")
 
         self.assertEqual(df.iloc[0]["amount_raw"], "$15,001 - $50,000")
-        self.assertIsNone(df.iloc[0]["amount_midpoint"])
+        # Midpoint computed from text: (15001 + 50000) / 2 = 32500.5
+        self.assertAlmostEqual(df.iloc[0]["amount_midpoint"], 32500.5)
 
 
 class TestCapitolTradesSourceSchema(unittest.TestCase):

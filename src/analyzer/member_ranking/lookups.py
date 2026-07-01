@@ -15,6 +15,7 @@ import pandas as pd
 
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
+from analyzer.member_names import canonical_member_key
 from analyzer.models import TransactionType
 
 
@@ -34,12 +35,21 @@ def _lookup_buyer_bayes_win_prob(
 
     Returns None when rankings are missing, the column is absent, the member
     is unrated, or the value is NaN.
+
+    Tries exact match first, then canonical-key match to handle name variants
+    (e.g. 'MICHAEL MCCAUL' vs 'MICHAEL T. MCCAUL').
     """
     if member_rankings is None or member_rankings.empty:
         return None
     if "bayes_win_prob" not in member_rankings.columns:
         return None
     row = member_rankings.loc[member_rankings["member"] == member]
+    if row.empty:
+        # Fix 7: fall back to canonical key match for name variants
+        canon = canonical_member_key(member)
+        row = member_rankings.loc[
+            member_rankings["member"].apply(canonical_member_key) == canon
+        ]
     if row.empty:
         return None
     val = row["bayes_win_prob"].iloc[0]
@@ -50,6 +60,10 @@ def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, f
     """Precompute {member: bayes_win_prob} dict for O(1) lookups.
 
     Replaces repeated linear scans of member_rankings DataFrame.
+
+    Fix 7: also adds canonical-key entries so lookups work regardless of which
+    name variant a transaction uses (e.g. 'MICHAEL MCCAUL' and 'MICHAEL T. MCCAUL'
+    both resolve to the same ranking row).
     """
     if member_rankings is None or member_rankings.empty:
         return {}
@@ -58,7 +72,15 @@ def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, f
     # Vectorized — no iterrows
     valid = member_rankings["bayes_win_prob"].notna()
     subset = member_rankings.loc[valid, ["member", "bayes_win_prob"]]
-    return dict(zip(subset["member"], subset["bayes_win_prob"].astype(float)))
+    result: dict[str, float] = dict(zip(subset["member"], subset["bayes_win_prob"].astype(float)))
+    # Add canonical-key aliases so any name variant hits the same entry
+    aliases: dict[str, float] = {}
+    for name, val in result.items():
+        key = canonical_member_key(name)
+        if key not in result and key not in aliases:
+            aliases[key] = val
+    result.update(aliases)
+    return result
 
 
 def _build_ranking_dicts(
@@ -96,6 +118,17 @@ def _build_ranking_dicts(
         if "bayes_win_prob" in valid.columns
         else {}
     )
+
+    # Fix 7: add canonical-key aliases to all lookup dicts so any name variant
+    # (e.g. 'MICHAEL MCCAUL' vs 'MICHAEL T. MCCAUL') resolves to the same entry.
+    def _add_canonical_aliases(d: dict) -> dict:
+        aliases = {canonical_member_key(k): v for k, v in d.items() if canonical_member_key(k) not in d}
+        d.update(aliases)
+        return d
+
+    _add_canonical_aliases(alpha)
+    _add_canonical_aliases(trades_dict)
+    _add_canonical_aliases(prob)
 
     return {"alpha": alpha, "trades": trades_dict, "prob": prob, "has_shrunk": has_shrunk}
 

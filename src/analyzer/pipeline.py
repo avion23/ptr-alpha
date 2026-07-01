@@ -101,7 +101,8 @@ def pipeline_step(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except AnalyzerError:
+        except AnalyzerError as exc:
+            logger.error("Pipeline step %s failed: %s", func.__name__, exc)
             return False
     return wrapper
 

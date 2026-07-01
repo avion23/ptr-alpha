@@ -400,3 +400,50 @@ class TestAnalyzeBySector(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Pytest-style tests (use caplog fixture — cannot use unittest.TestCase here)
+# ---------------------------------------------------------------------------
+
+import logging
+import pytest
+
+
+def test_pipeline_step_logs_analyzer_error(caplog):
+    """BUG 2 regression: AnalyzerError must be logged, not silently swallowed."""
+    from analyzer.pipeline import pipeline_step
+    from analyzer.exceptions import AnalyzerError
+
+    @pipeline_step
+    def failing_fn():
+        raise AnalyzerError("something went wrong")
+
+    with caplog.at_level(logging.ERROR, logger="analyzer.pipeline"):
+        result = failing_fn()
+
+    assert result is False, "pipeline_step must still return False on AnalyzerError"
+    assert any("something went wrong" in r.message for r in caplog.records), (
+        f"AnalyzerError message not found in logs; records={caplog.records}"
+    )
+    assert any(r.levelno == logging.ERROR for r in caplog.records), (
+        "Log record must be at ERROR level"
+    )
+
+
+def test_pipeline_step_logs_data_source_error(caplog):
+    """DataSourceError (subclass of AnalyzerError) must also be logged."""
+    from analyzer.pipeline import pipeline_step
+    from analyzer.exceptions import DataSourceError
+
+    @pipeline_step
+    def failing_fn():
+        raise DataSourceError("no data available")
+
+    with caplog.at_level(logging.ERROR, logger="analyzer.pipeline"):
+        result = failing_fn()
+
+    assert result is False
+    assert any("no data available" in r.message for r in caplog.records), (
+        f"DataSourceError message not found in logs; records={caplog.records}"
+    )

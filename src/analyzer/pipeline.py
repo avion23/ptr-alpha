@@ -376,6 +376,8 @@ def _save_results(
             filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
         elif show_signals:
             filename = "top_signals.csv"
+        elif display_mode == DisplayMode.SALE_RANKINGS:
+            filename = "sale_rankings.csv"
         else:
             filename = "member_rankings.csv"
 

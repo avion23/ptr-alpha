@@ -291,11 +291,24 @@ class TestSaveResults(unittest.TestCase):
             data_dir = Path(tmp)
             _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
 
-            saved = pd.read_csv(data_dir / "member_rankings.csv")
+            saved = pd.read_csv(data_dir / "sale_rankings.csv")
             self.assertIn("avg_loss_avoided_pct", saved.columns)
             self.assertIn("median_loss_avoided_pct", saved.columns)
             self.assertNotIn("col_a", saved.columns)
             self.assertNotIn("col_b", saved.columns)
+
+    def test_sales_csv_output_uses_sale_rankings_filename(self):
+        table = pd.DataFrame({
+            "member": ["Alice"],
+            "avg_loss_avoided_pct": [12.5],
+        })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
+
+            self.assertTrue((data_dir / "sale_rankings.csv").exists())
+            self.assertFalse((data_dir / "member_rankings.csv").exists())
 
     def test_sales_columns_included_in_display(self):
         table = pd.DataFrame({
@@ -313,7 +326,7 @@ class TestSaveResults(unittest.TestCase):
             data_dir = Path(tmp)
             _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
 
-            saved = pd.read_csv(data_dir / "member_rankings.csv")
+            saved = pd.read_csv(data_dir / "sale_rankings.csv")
             self.assertIn("avg_loss_avoided_pct", saved.columns)
             self.assertIn("median_loss_avoided_pct", saved.columns)
             self.assertIn("sale_trades", saved.columns)
@@ -335,7 +348,7 @@ class TestSaveResults(unittest.TestCase):
             data_dir = Path(tmp)
             _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
 
-            saved = pd.read_csv(data_dir / "member_rankings.csv")
+            saved = pd.read_csv(data_dir / "sale_rankings.csv")
             self.assertNotIn("purchase_trades", saved.columns)
             self.assertNotIn("peak_hit_rate_pct", saved.columns)
 

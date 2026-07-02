@@ -28,12 +28,14 @@ def get_zero_row_pdfs():
 
 def load_progress():
     if os.path.exists(PROGRESS_PATH):
-        return json.load(open(PROGRESS_PATH))
+        with open(PROGRESS_PATH) as f:
+            return json.load(f)
     return {"completed": [], "errors": [], "no_txs": []}
 
 def save_progress(p):
     tmp = PROGRESS_PATH + ".tmp"
-    json.dump(p, open(tmp, "w"))
+    with open(tmp, "w") as f:
+        json.dump(p, f)
     os.replace(tmp, PROGRESS_PATH)
 
 def parse_output(output):

@@ -529,8 +529,10 @@ def main():
             progress["errors"].append(doc_id)
             save_progress(progress)
             conn = duckdb.connect(DB_PATH)
-            record_parse_run(conn, doc_id, year, "error", 0, 0, error)
-            conn.close()
+            try:
+                record_parse_run(conn, doc_id, year, "error", 0, 0, error)
+            finally:
+                conn.close()
             print(f"  ERROR: {error}", flush=True)
             continue
         
@@ -549,8 +551,10 @@ def main():
         print(f"  Validation rejections: {rejections}", flush=True)
         if rejections.get("row_count_exceeds_cap"):
             conn = duckdb.connect(DB_PATH)
-            record_parse_run(conn, doc_id, year, "rejected", raw_count, 0, "row_count_exceeds_cap")
-            conn.close()
+            try:
+                record_parse_run(conn, doc_id, year, "rejected", raw_count, 0, "row_count_exceeds_cap")
+            finally:
+                conn.close()
             progress["errors"].append(doc_id)
             save_progress(progress)
             print(f"  REJECTED: row_count_exceeds_cap ({raw_count})", flush=True)
@@ -603,8 +607,10 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             progress["errors"].append(doc_id)
             save_progress(progress, progress_path)
             conn = duckdb.connect(db_path)
-            record_parse_run(conn, doc_id, yr, "error", 0, 0, error)
-            conn.close()
+            try:
+                record_parse_run(conn, doc_id, yr, "error", 0, 0, error)
+            finally:
+                conn.close()
             print(f"  ERROR: {error}", flush=True)
             continue
         member, transactions = parse_output(output)
@@ -621,8 +627,10 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
         print(f"  Validation rejections: {rejections}", flush=True)
         if rejections.get("row_count_exceeds_cap"):
             conn = duckdb.connect(db_path)
-            record_parse_run(conn, doc_id, yr, "rejected", raw_count, 0, "row_count_exceeds_cap")
-            conn.close()
+            try:
+                record_parse_run(conn, doc_id, yr, "rejected", raw_count, 0, "row_count_exceeds_cap")
+            finally:
+                conn.close()
             progress["errors"].append(doc_id)
             save_progress(progress, progress_path)
             print(f"  REJECTED: row_count_exceeds_cap ({raw_count})", flush=True)

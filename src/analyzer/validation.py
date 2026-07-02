@@ -35,6 +35,12 @@ from analyzer.pipeline import BacktestParams
 from analyzer.snooping import benjamini_hochberg, bonferroni_correction
 
 
+# T-stats on fewer observations are noise; cf. minimum backtest length,
+# Bailey & Lopez de Prado 2012, referenced in snooping.py.
+MIN_DATES_FOR_CANDIDACY = 8
+MIN_RECS_FOR_CANDIDACY = 20
+
+
 # ---------------------------------------------------------------------------
 # SweepResult (moved verbatim from repo-root sweep.py)
 # ---------------------------------------------------------------------------
@@ -328,15 +334,22 @@ def sweep_configs(
 
         t_stat = newey_west_tstat(per_date, lag=lag)
         p_val = (
-            float(2.0 * stats.norm.sf(abs(t_stat)))
+            float(stats.norm.sf(t_stat))
             if math.isfinite(t_stat)
-            # Only positive-alpha configs are selection candidates; -inf must not survive BH.
+            # One-sided positive-alpha test; negative configs get p > 0.5 and cannot survive BH.
             else 0.0 if t_stat > 0 else 1.0
         )
 
         row = asdict(result)
+        min_sample_ok = (
+            result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
+            and result.total_recs >= MIN_RECS_FOR_CANDIDACY
+        )
+        if not min_sample_ok:
+            p_val = 1.0
         row["nw_tstat"] = round(t_stat, 4) if math.isfinite(t_stat) else t_stat
         row["p_value"] = p_val
+        row["min_sample_ok"] = min_sample_ok
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -363,11 +376,22 @@ def select_config(sweep_df: pd.DataFrame, alpha: float = 0.05) -> dict:
     """
     n_trials = len(sweep_df)
     bonf_thresh = bonferroni_correction(n_trials, alpha)
-    bh_mask = benjamini_hochberg(sweep_df["p_value"].values, alpha)
+    if "min_sample_ok" in sweep_df.columns:
+        candidate_mask = sweep_df["min_sample_ok"].astype(bool).values
+    else:
+        candidate_mask = np.ones(n_trials, dtype=bool)
+    sample_filter_exhausted = not bool(candidate_mask.any())
+
+    bh_mask = np.zeros(n_trials, dtype=bool)
+    if not sample_filter_exhausted:
+        bh_mask[candidate_mask] = benjamini_hochberg(
+            sweep_df.loc[candidate_mask, "p_value"].values, alpha
+        )
 
     survivors = sweep_df[bh_mask]
     if survivors.empty:
-        best_row = sweep_df.sort_values(
+        fallback_df = sweep_df if sample_filter_exhausted else sweep_df.loc[candidate_mask]
+        best_row = fallback_df.sort_values(
             ["alpha_slope", "overall_alpha"], ascending=False
         ).iloc[0]
         survives = False
@@ -384,6 +408,8 @@ def select_config(sweep_df: pd.DataFrame, alpha: float = 0.05) -> dict:
     result["n_trials"] = n_trials
     result["n_survivors"] = n_survivors
     result["bonferroni_threshold"] = bonf_thresh
+    result["n_min_sample_candidates"] = int(candidate_mask.sum())
+    result["sample_filter_exhausted"] = sample_filter_exhausted
     return result
 
 
@@ -464,6 +490,14 @@ def _run_validation_with_db(
 
     train_df = sweep_configs(all_tx, prices, entry_prices, grid, train_start, train_end)
     selected = select_config(train_df)
+    n_candidates = int(
+        train_df["min_sample_ok"].sum()
+        if "min_sample_ok" in train_df.columns else len(train_df)
+    )
+    print(
+        f"Candidates: {n_candidates}/{len(train_df)} pass min-sample filter "
+        f"(>={MIN_DATES_FOR_CANDIDACY} dates, >={MIN_RECS_FOR_CANDIDACY} recs)"
+    )
 
     print(
         f"Selected: horizon={int(selected['horizon'])}, "
@@ -561,6 +595,10 @@ def _run_validation_with_db(
             "n_trials": int(selected["n_trials"]),
             "n_survivors": int(selected["n_survivors"]),
             "bonferroni_threshold": float(selected["bonferroni_threshold"]),
+            "n_min_sample_candidates": int(selected["n_min_sample_candidates"]),
+            "min_dates_for_candidacy": MIN_DATES_FOR_CANDIDACY,
+            "min_recs_for_candidacy": MIN_RECS_FOR_CANDIDACY,
+            "sample_filter_exhausted": bool(selected["sample_filter_exhausted"]),
         },
         "train": _window_metrics(train_result, train_t, train_p, spy_train),
         "test": _window_metrics(test_result, test_t, test_p, spy_test),
@@ -662,6 +700,11 @@ def _print_summary(output: dict) -> None:
     )
 
     snoop = output["snooping"]
+    print(
+        f"  Candidates: {snoop['n_min_sample_candidates']}/{snoop['n_trials']} "
+        f"pass min-sample filter (>={snoop['min_dates_for_candidacy']} dates, "
+        f">={snoop['min_recs_for_candidacy']} recs)"
+    )
     print(
         f"  Snooping: {snoop['n_survivors']}/{snoop['n_trials']} survive BH "
         f"| Bonferroni α={snoop['bonferroni_threshold']:.5f} "

@@ -123,6 +123,7 @@ def _make_sweep_df(n: int = 10, p_values: list[float] | None = None) -> pd.DataF
             "max_drawdown": -5.0,
             "nw_tstat": 2.0,
             "p_value": p_values[i] if p_values else 0.9,  # default: no survivors
+            "min_sample_ok": True,
         })
     return pd.DataFrame(rows)
 
@@ -202,6 +203,8 @@ class TestSelectConfig:
                     decay_lambda=decay_lambda,
                     bayes_prior_strength=bayes_prior_strength,
                     scoring_mode=scoring_mode,
+                    total_recs=30,
+                    dates_evaluated=10,
                     overall_alpha=-5.0,
                     alpha_slope=99.0,
                 )
@@ -216,6 +219,8 @@ class TestSelectConfig:
                 decay_lambda=decay_lambda,
                 bayes_prior_strength=bayes_prior_strength,
                 scoring_mode=scoring_mode,
+                total_recs=30,
+                dates_evaluated=10,
                 overall_alpha=5.0,
                 alpha_slope=1.0,
             )
@@ -245,6 +250,103 @@ class TestSelectConfig:
         assert selected["min_buyers"] == 3
         assert selected["n_survivors"] == 1
         assert selected["survives_correction"] is True
+
+    def test_negative_finite_tstat_is_one_sided_and_does_not_survive_bh(self):
+        """A strongly negative finite t-stat gets p>0.5 and cannot survive BH."""
+        grid = {
+            "horizon": [60],
+            "frequency_days": [30],
+            "training_lookback_days": [365],
+            "min_buyers": [2],
+            "top_n": [5],
+            "decay_lambda": [0.005],
+            "bayes_prior_strength": [20.0],
+            "scoring_mode": ["shrunk_alpha"],
+        }
+
+        def fake_backtest_core(
+            all_tx, prices, params, signals, bayes_prior_strength, decay_lambda, scoring_mode
+        ):
+            result = SweepResult(
+                horizon=params.horizon,
+                frequency_days=params.frequency_days,
+                training_lookback_days=params.training_lookback_days,
+                min_buyers=params.min_buyers,
+                top_n=params.top_n,
+                decay_lambda=decay_lambda,
+                bayes_prior_strength=bayes_prior_strength,
+                scoring_mode=scoring_mode,
+                total_recs=30,
+                dates_evaluated=10,
+                overall_alpha=-5.0,
+                alpha_slope=99.0,
+            )
+            return result, pd.Series([-8.0, -7.0, -6.0, -5.0, -4.0, -6.0, -7.0, -8.0, -5.0, -6.0])
+
+        with (
+            patch("analyzer.validation.analysis.calculate_signal_potential", return_value=pd.DataFrame()),
+            patch("analyzer.validation._backtest_core", side_effect=fake_backtest_core),
+        ):
+            sweep_df = sweep_configs(
+                all_tx=pd.DataFrame(),
+                prices=pd.DataFrame(),
+                entry_prices=pd.DataFrame(),
+                grid=grid,
+                start=date(2022, 1, 1),
+                end=date(2022, 3, 1),
+            )
+
+        row = sweep_df.iloc[0]
+        assert row["nw_tstat"] < 0
+        assert row["p_value"] > 0.5
+        assert bool(row["min_sample_ok"]) is True
+
+        selected = select_config(sweep_df, alpha=0.05)
+        assert selected["survives_correction"] is False
+        assert selected["n_survivors"] == 0
+
+    def test_min_sample_filter_excludes_tiny_high_tstat_config(self):
+        """Tiny samples cannot win even with a huge positive t-stat."""
+        df = _make_sweep_df(n=2, p_values=[0.0, 0.02])
+        df.loc[0, ["dates_evaluated", "total_recs", "alpha_slope", "p_value", "min_sample_ok"]] = [
+            2,
+            2,
+            100.0,
+            1.0,
+            False,
+        ]
+        df.loc[1, ["dates_evaluated", "total_recs", "alpha_slope", "p_value", "min_sample_ok"]] = [
+            10,
+            30,
+            2.0,
+            0.02,
+            True,
+        ]
+
+        selected = select_config(df, alpha=0.05)
+
+        assert selected["alpha_slope"] == 2.0
+        assert selected["dates_evaluated"] == 10
+        assert selected["total_recs"] == 30
+        assert selected["survives_correction"] is True
+        assert selected["n_survivors"] == 1
+        assert selected["sample_filter_exhausted"] is False
+
+    def test_sample_filter_exhausted_falls_back_to_overall_best_with_flag(self):
+        """If all rows are too small, keep a deterministic fallback and flag it."""
+        df = _make_sweep_df(n=3, p_values=[1.0, 1.0, 1.0])
+        df["dates_evaluated"] = [1, 2, 3]
+        df["total_recs"] = [2, 4, 6]
+        df["min_sample_ok"] = False
+        df["alpha_slope"] = [1.0, 5.0, 3.0]
+
+        selected = select_config(df, alpha=0.05)
+
+        assert selected["alpha_slope"] == 5.0
+        assert selected["survives_correction"] is False
+        assert selected["n_survivors"] == 0
+        assert selected["n_min_sample_candidates"] == 0
+        assert selected["sample_filter_exhausted"] is True
 
 
 # ---------------------------------------------------------------------------

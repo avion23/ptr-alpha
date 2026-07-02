@@ -515,21 +515,26 @@ def refresh(
     count_before = app_ctx.transaction_source.db.conn.execute(
         "SELECT COUNT(*) FROM transactions"
     ).fetchone()[0]
+    failed_steps: list[str] = []
 
     # Step 1: Fetch House PDFs
     print(f"[1/4] Fetching House PDFs for {year}...")
     if refresh_metadata:
         app_ctx.transaction_source.fetch_metadata(year, refresh=True)
     try:
-        run_fetch_pipeline(app_ctx.transaction_source, year)
+        if not run_fetch_pipeline(app_ctx.transaction_source, year):
+            failed_steps.append("fetch")
     except Exception as e:
+        failed_steps.append("fetch")
         logger.warning(f"House PDF fetch failed: {e}")
 
     # Step 2: Parse cached PDFs
     print(f"[2/4] Parsing cached PDFs for {year}...")
     try:
-        run_parse_pipeline(app_ctx.transaction_source, year)
+        if not run_parse_pipeline(app_ctx.transaction_source, year):
+            failed_steps.append("parse")
     except Exception as e:
+        failed_steps.append("parse")
         logger.warning(f"PDF parse failed: {e}")
 
     # Step 3: Capitol Trades API
@@ -541,6 +546,7 @@ def refresh(
             capitol_count = capitol.fetch_and_save_all()
             print(f"  Capitol Trades: {capitol_count} transactions upserted")
         except Exception as e:
+            failed_steps.append("capitol")
             logger.warning(f"Capitol Trades fetch failed: {e}")
         finally:
             capitol.close()
@@ -550,9 +556,13 @@ def refresh(
     # Step 4: Gemini OCR (optional)
     if use_gemini_ocr:
         print("[4/4] Running Gemini OCR on zero-row PDFs...")
-        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-        ocr_inserted = run_gemini_ocr_for_year(year, data_dir=data_dir)
-        print(f"  Gemini OCR: {ocr_inserted} transactions inserted")
+        try:
+            from scripts.ocr_zero_rows import run_gemini_ocr_for_year
+            ocr_inserted = run_gemini_ocr_for_year(year, data_dir=data_dir)
+            print(f"  Gemini OCR: {ocr_inserted} transactions inserted")
+        except Exception as e:
+            failed_steps.append("gemini_ocr")
+            logger.warning(f"Gemini OCR failed: {e}")
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 
@@ -567,6 +577,9 @@ def refresh(
     added = count_after - count_before
     print(f"\nDone. {count_before} -> {count_after} transactions ({'+' if added >= 0 else ''}{added} new)")
     print(f"Latest transaction date: {max_date}")
+    if failed_steps:
+        print(f"FAILED steps: {', '.join(failed_steps)}")
+        raise typer.Exit(1)
     raise typer.Exit(0)
 
 

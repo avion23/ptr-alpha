@@ -305,6 +305,49 @@ class TestTransactions(DatabaseTestCase):
         ).fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_count_transactions_for_docs_returns_counts_by_doc_id(self):
+        df = pd.DataFrame([
+            {
+                "doc_id": "doc-count-1",
+                "member": "Jane Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 4, 1),
+                "disclosure_date": date(2024, 4, 5),
+                "transaction_type": "Purchase",
+                "amount_raw": "$1,001 - $15,000",
+            },
+            {
+                "doc_id": "doc-count-1",
+                "member": "Jane Doe",
+                "ticker": "MSFT",
+                "transaction_date": date(2024, 4, 2),
+                "disclosure_date": date(2024, 4, 5),
+                "transaction_type": "Sale",
+                "amount_raw": "$1,001 - $15,000",
+            },
+            {
+                "doc_id": "doc-count-2",
+                "member": "John Doe",
+                "ticker": "GOOG",
+                "transaction_date": date(2024, 4, 3),
+                "disclosure_date": date(2024, 4, 5),
+                "transaction_type": "Purchase",
+                "amount_raw": "$1,001 - $15,000",
+            },
+        ])
+        self.db.upsert_transactions(df, source="house_pdf")
+
+        counts = self.db.count_transactions_for_docs([
+            "doc-count-1",
+            "doc-count-2",
+            "missing-doc",
+        ])
+
+        self.assertEqual(counts, {"doc-count-1": 2, "doc-count-2": 1})
+
+    def test_count_transactions_for_docs_returns_empty_for_empty_input(self):
+        self.assertEqual(self.db.count_transactions_for_docs([]), {})
+
 
 class TestPrices(DatabaseTestCase):
 

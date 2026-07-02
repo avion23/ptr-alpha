@@ -14,6 +14,7 @@ os.environ["PTR_SKIP_DOCLING"] = "1"
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from analyzer.database import Database
+from analyzer.models import FilingType
 
 # Import the text-layer engine functions
 from analyzer.datasources import (
@@ -51,7 +52,7 @@ def parse_year(year: int, db: Database, settings: Settings):
     metadata = src.fetch_metadata(year)
     src.close()
     
-    ptrs = metadata[metadata["FilingType"] == "PTR.value"] if "PTR.value" in metadata["FilingType"].values else metadata
+    ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
     pdf_paths, existing_docs = _filter_existing_pdfs(ptrs, pdf_dir)
     if not pdf_paths:
         print(f"  {year}: no PDFs found")

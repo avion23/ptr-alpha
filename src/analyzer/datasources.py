@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import time
 import zipfile
@@ -39,15 +40,33 @@ _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 
 # ── Per-PDF worker: cascades 5 PDF engines until transactions are found ─
 
+def _is_valid_pdf(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    with open(path, "rb") as f:
+        return f.read(5) == b"%PDF-"
+
+
+def _result_quality(txs: list[dict]) -> float:
+    if not txs:
+        return 0.0
+    valid = sum(
+        1 for tx in txs
+        if tx.get("transaction_date") and tx.get("amount_midpoint")
+    )
+    return valid / len(txs)
+
+
 def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     """Cascade through pdfplumber → camelot lattice → camelot stream →
     pdftotext → Docling OCR → tesseract OCR. Each engine is tried only when
-    earlier ones returned 0 transactions; this minimises work on text-layer
-    PDFs where pdfplumber already extracts everything."""
-    import os
+    all text-layer parsers returned 0 transactions; this minimises OCR work
+    while allowing better text-layer engines to beat low-quality results."""
     skip_docling = os.environ.get("PTR_SKIP_DOCLING") == "1"
     engines_attempted: list[str] = []
-    transactions: list[dict] = []
+    best_transactions: list[dict] = []
+    best_engine = ""
+    best_quality = 0.0
 
     for engine_fn, engine_name in [
         (_try_pdfplumber, "pdfplumber"),
@@ -56,20 +75,35 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
         (_try_pdftotext, "pdftotext"),
     ]:
         transactions = engine_fn(pdf_path)
+        engines_attempted.append(engine_name)
         if transactions:
-            engines_attempted.append(engine_name)
-            return pdf_path, transactions, engines_attempted
+            quality = _result_quality(transactions)
+            if quality >= 0.7:
+                engines_attempted.append(f"won:{engine_name}")
+                return pdf_path, transactions, engines_attempted
+            if (quality, len(transactions)) > (best_quality, len(best_transactions)):
+                best_transactions = transactions
+                best_engine = engine_name
+                best_quality = quality
+
+    if best_transactions:
+        engines_attempted.append(f"won:{best_engine}")
+        return pdf_path, best_transactions, engines_attempted
+
+    transactions: list[dict] = []
 
     # Docling + tesseract: only run if all text-layer engines returned 0
     if not skip_docling:
+        engines_attempted.append("docling")
         transactions = _try_docling(pdf_path)
         if transactions:
-            engines_attempted.append("docling")
+            engines_attempted.append("won:docling")
             return pdf_path, transactions, engines_attempted
 
+    engines_attempted.append("ocr")
     transactions = _try_tesseract(pdf_path)
     if transactions:
-        engines_attempted.append("ocr")
+        engines_attempted.append("won:ocr")
 
     return pdf_path, transactions, engines_attempted
 
@@ -260,7 +294,7 @@ class HouseTransactionSource(TransactionSource):
         return self.db.get_metadata(year)
 
     async def _download_pdf_async(self, session, doc_id, pdf_path, url):
-        if pdf_path.exists():
+        if _is_valid_pdf(pdf_path):
             return DownloadResult(doc_id=doc_id, status=DownloadStatus.SKIPPED)
 
         try:
@@ -269,8 +303,17 @@ class HouseTransactionSource(TransactionSource):
             ) as response:
                 if response.status == 200:
                     content = await response.read()
-                    with open(pdf_path, "wb") as f:
+                    if not content.startswith(b"%PDF-"):
+                        return DownloadResult(
+                            doc_id=doc_id,
+                            status=DownloadStatus.FAILED,
+                            status_code=response.status,
+                            error_message="not a PDF (got HTML error page?)",
+                        )
+                    tmp_path = pdf_path.with_suffix(".pdf.tmp")
+                    with open(tmp_path, "wb") as f:
                         f.write(content)
+                    os.replace(tmp_path, pdf_path)
                     return DownloadResult(doc_id=doc_id, status=DownloadStatus.SUCCESS)
                 return DownloadResult(
                     doc_id=doc_id,
@@ -349,6 +392,7 @@ class HouseTransactionSource(TransactionSource):
         self, year: int, results: list, member_lookup: dict,
     ) -> None:
         pdf_transactions: dict = {}
+        zero_row_doc_ids: list[str] = []
         for pdf_path, transactions, engines_attempted in results:
             doc_id = pdf_path.stem
             pdf_transactions[pdf_path] = transactions
@@ -361,6 +405,18 @@ class HouseTransactionSource(TransactionSource):
                 engines_attempted=",".join(engines_attempted),
                 raw_row_count=0,
                 transaction_count=len(transactions),
+            )
+            if not transactions:
+                zero_row_doc_ids.append(doc_id)
+
+        stale_docs = self.db.count_transactions_for_docs(zero_row_doc_ids)
+        if stale_docs:
+            doc_ids = list(stale_docs)[:10]
+            logger.warning(
+                "%d docs parsed to zero rows but retain %d existing DB rows (stale?): %s",
+                len(stale_docs),
+                sum(stale_docs.values()),
+                ", ".join(doc_ids),
             )
 
         df = consolidate_transactions(pdf_transactions, member_lookup)

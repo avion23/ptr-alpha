@@ -1,0 +1,149 @@
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+import pytest
+from typer.testing import CliRunner
+
+from analyzer import datasources
+from analyzer.cli import app
+from analyzer.exceptions import ParsingError
+from analyzer.models import FilingType
+
+
+def _tx(transaction_date="2024-01-02", amount_midpoint=1000.0):
+    return {
+        "ticker": "AAPL",
+        "transaction_type": "P",
+        "transaction_date": transaction_date,
+        "owner_code": "SP",
+        "amount_raw": "$1,001 - $15,000",
+        "amount_midpoint": amount_midpoint,
+        "instrument_type": None,
+        "strike_price": None,
+        "expiry_date": None,
+        "asset_description": "Apple Inc.",
+    }
+
+
+def test_is_valid_pdf_requires_header_and_content(tmp_path):
+    valid = tmp_path / "valid.pdf"
+    valid.write_bytes(b"%PDF-1.7\nbody")
+    empty = tmp_path / "empty.pdf"
+    empty.write_bytes(b"")
+    html = tmp_path / "html.pdf"
+    html.write_bytes(b"<html>error</html>")
+
+    assert datasources._is_valid_pdf(valid)
+    assert not datasources._is_valid_pdf(empty)
+    assert not datasources._is_valid_pdf(html)
+
+
+def test_result_quality_counts_rows_with_date_and_amount():
+    assert datasources._result_quality([]) == 0.0
+    assert datasources._result_quality([_tx(), _tx(amount_midpoint=None)]) == 0.5
+
+
+def test_parse_worker_prefers_high_quality_later_text_engine(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "sample.pdf"
+    pdf_path.write_bytes(b"%PDF-1.7\nbody")
+    low_quality = [_tx(transaction_date=None, amount_midpoint=None)]
+    high_quality = [_tx() for _ in range(10)]
+
+    monkeypatch.setattr(datasources, "_try_pdfplumber", lambda path: low_quality)
+    monkeypatch.setattr(datasources, "_try_camelot_lattice", lambda path: [])
+    monkeypatch.setattr(datasources, "_try_camelot_stream", lambda path: [])
+    monkeypatch.setattr(datasources, "_try_pdftotext", lambda path: high_quality)
+    monkeypatch.setattr(datasources, "_try_docling", lambda path: (_ for _ in ()).throw(AssertionError("docling should not run")))
+    monkeypatch.setattr(datasources, "_try_tesseract", lambda path: (_ for _ in ()).throw(AssertionError("ocr should not run")))
+
+    _, transactions, engines_attempted = datasources._parse_pdf_worker(pdf_path)
+
+    assert transactions == high_quality
+    assert engines_attempted == [
+        "pdfplumber",
+        "lattice",
+        "stream",
+        "pdftotext",
+        "won:pdftotext",
+    ]
+
+
+def test_reparse_all_filters_ptr_filings_unconditionally(tmp_path):
+    from scripts import reparse_all
+
+    data_dir = tmp_path / "data"
+    (data_dir / "2024" / "pdfs").mkdir(parents=True)
+    settings = MagicMock()
+    settings.data.data_dir = str(data_dir)
+
+    metadata = pd.DataFrame(
+        {
+            "DocID": ["p1", "a1"],
+            "FilingType": [FilingType.PTR.value, FilingType.AMENDMENT.value],
+            "First": ["A", "B"],
+            "Last": ["One", "Two"],
+            "FilingDate": ["2024-01-01", "2024-01-02"],
+        }
+    )
+    source = MagicMock()
+    source.fetch_metadata.return_value = metadata
+
+    captured = {}
+
+    def fake_filter(ptrs, pdf_dir):
+        captured["ptrs"] = ptrs.copy()
+        return [], pd.DataFrame()
+
+    with patch.object(reparse_all, "HouseTransactionSource", return_value=source), \
+         patch.object(reparse_all, "_filter_existing_pdfs", side_effect=fake_filter):
+        assert reparse_all.parse_year(2024, MagicMock(), settings) == 0
+
+    assert captured["ptrs"]["DocID"].tolist() == ["p1"]
+
+
+def test_save_parse_results_warns_when_zero_row_doc_retains_db_rows(caplog, tmp_path):
+    source = datasources.HouseTransactionSource.__new__(datasources.HouseTransactionSource)
+    source.db = MagicMock()
+    source.db.count_transactions_for_docs.return_value = {"123": 3}
+    pdf_path = tmp_path / "123.pdf"
+
+    with patch.object(datasources, "consolidate_transactions", return_value=pd.DataFrame()), \
+         caplog.at_level("WARNING", logger="analyzer.datasources"), \
+         pytest.raises(ParsingError):
+        source._save_parse_results(2024, [(pdf_path, [], ["pdfplumber"])], {})
+
+    source.db.count_transactions_for_docs.assert_called_once_with(["123"])
+    assert "1 docs parsed to zero rows but retain 3 existing DB rows (stale?): 123" in caplog.text
+
+
+def _refresh_context():
+    ctx = MagicMock()
+    execute = ctx.transaction_source.db.conn.execute
+    execute.side_effect = [
+        MagicMock(fetchone=MagicMock(return_value=(10,))),
+        MagicMock(fetchone=MagicMock(return_value=(10,))),
+        MagicMock(fetchone=MagicMock(return_value=("2024-01-02",))),
+    ]
+    return ctx
+
+
+def test_refresh_exits_one_when_fetch_pipeline_returns_false():
+    runner = CliRunner()
+    with patch("analyzer.cli.get_context", return_value=_refresh_context()), \
+         patch("analyzer.cli.run_fetch_pipeline", return_value=False), \
+         patch("analyzer.cli.run_parse_pipeline", return_value=True):
+        result = runner.invoke(app, ["refresh", "--skip-capitol"])
+
+    assert result.exit_code == 1, result.output
+    assert "FAILED steps: fetch" in result.output
+
+
+def test_refresh_exits_zero_when_all_steps_succeed():
+    runner = CliRunner()
+    with patch("analyzer.cli.get_context", return_value=_refresh_context()), \
+         patch("analyzer.cli.run_fetch_pipeline", return_value=True), \
+         patch("analyzer.cli.run_parse_pipeline", return_value=True):
+        result = runner.invoke(app, ["refresh", "--skip-capitol"])
+
+    assert result.exit_code == 0, result.output
+    assert "FAILED steps:" not in result.output

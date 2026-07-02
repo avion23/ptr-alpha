@@ -6,6 +6,7 @@ but as a standalone script so it can run without the CLI framework.
 """
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import requests_cache
 import pandas as pd
 
 from analyzer.database import Database
+from analyzer.datasources import _is_valid_pdf
 from analyzer.models import DownloadResult, DownloadStatus, FilingType
 from analyzer.parsing import normalize_house_metadata
 from analyzer.settings import Settings
@@ -73,16 +75,25 @@ def fetch_metadata_for_year(
 
 
 async def download_pdf(session, doc_id, pdf_path, url):
-    """Download a single PDF, skipping if it already exists."""
-    if pdf_path.exists():
+    """Download a single PDF, skipping only valid existing PDFs."""
+    if _is_valid_pdf(pdf_path):
         return DownloadResult(doc_id=doc_id, status=DownloadStatus.SKIPPED)
 
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
             if response.status == 200:
                 content = await response.read()
-                with open(pdf_path, "wb") as f:
+                if not content.startswith(b"%PDF-"):
+                    return DownloadResult(
+                        doc_id=doc_id,
+                        status=DownloadStatus.FAILED,
+                        status_code=response.status,
+                        error_message="not a PDF (got HTML error page?)",
+                    )
+                tmp_path = pdf_path.with_suffix(".pdf.tmp")
+                with open(tmp_path, "wb") as f:
                     f.write(content)
+                os.replace(tmp_path, pdf_path)
                 return DownloadResult(doc_id=doc_id, status=DownloadStatus.SUCCESS)
             else:
                 return DownloadResult(
@@ -119,7 +130,7 @@ async def download_missing_pdfs(years: list[int]):
         pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
         urls = [settings.sources.house_pdf_url.format(year=year, doc_id=doc_id) for doc_id in doc_ids]
 
-        missing = sum(1 for p in pdf_paths if not p.exists())
+        missing = sum(1 for p in pdf_paths if not _is_valid_pdf(p))
         logger.info(f"Year {year}: {len(doc_ids)} PTR filings, {missing} missing PDFs, {len(doc_ids) - missing} already downloaded")
 
         if missing == 0:

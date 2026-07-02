@@ -164,6 +164,8 @@ def _simulate_one_position(
 
     entry_adj = entry * entry_mult
     exit_adj = exit_price * exit_mult
+    if entry_adj <= 0 or exit_adj < 0:
+        return None
     return {
         "ticker": ticker,
         "weight": weight,
@@ -185,4 +187,8 @@ def _compute_spy_return(
     )
     if spy_entry is None or spy_exit is None:
         return 0.0
-    return (spy_exit * exit_mult / (spy_entry * entry_mult) - 1.0) * 100
+    entry_adj = spy_entry * entry_mult
+    exit_adj = spy_exit * exit_mult
+    if entry_adj <= 0 or exit_adj < 0:
+        return 0.0
+    return (exit_adj / entry_adj - 1.0) * 100

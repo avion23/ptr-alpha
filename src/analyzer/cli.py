@@ -103,7 +103,7 @@ def analyze(
     if mode not in valid_modes:
         print(f"Error: --mode must be one of {sorted(valid_modes)}", file=sys.stderr)
         raise typer.Exit(1)
-    if mode == "member" and member is None:
+    if mode == "member" and member is None and ticker is None:
         print("Error: --mode member requires --member NAME", file=sys.stderr)
         raise typer.Exit(1)
     if mode == "sales" and member is not None:

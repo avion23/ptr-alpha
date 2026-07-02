@@ -16,7 +16,6 @@ from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
 from analyzer.signals import (
     _collapse_to_episodes,
-    _compute_dynamic_prior,
     _get_horizon_data,
 )
 
@@ -109,13 +108,12 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
         raise AnalysisError(f"No sale signals found for horizon {horizon}")
 
     sales = _collapse_to_episodes(sales)
-    market_prior = _compute_dynamic_prior(signal_df, horizon)
-
-    # Invert the prior for sales: a "win" when invert_returns=True is
-    # avoiding a loss (negative original return).  The purchase up-rate
-    # measures positive-return frequency, so the loss-avoidance prior is
-    # 1 − market_prior.
-    sale_prior = 1.0 - market_prior
+    valid_sale_returns = sales["decayed_return_pct"].dropna()
+    sale_prior = (
+        float(np.clip((valid_sale_returns < 0).mean(), 0.10, 0.90))
+        if len(valid_sale_returns) > 0
+        else 0.50
+    )
 
     member_stats = []
     for member, sale_grp in sales.groupby("member"):

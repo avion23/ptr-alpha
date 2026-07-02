@@ -351,6 +351,62 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(rankings.iloc[0]['avg_loss_avoided_pct'], 10.0)
         self.assertEqual(rankings.iloc[0]['avg_spy_alpha_pct'], 5.0)
 
+    def test_rank_sales_prior_uses_sale_episode_loss_rate(self):
+        signals = pd.DataFrame({
+            'member': ['Alice', 'Bob', 'Carol', 'Dave', 'Buyer'],
+            'ticker': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA'],
+            'signal_type': ['Sale', 'Sale', 'Sale', 'Sale', 'Purchase'],
+            'horizon_days': [90, 90, 90, 90, 90],
+            'decayed_return_pct': [-10.0, -8.0, -6.0, 5.0, -100.0],
+            'peak_potential_pct': [10.0, 8.0, 6.0, -5.0, -100.0],
+            'spy_alpha_pct': [-10.0, -8.0, -6.0, 5.0, -100.0],
+        })
+
+        rankings = rank_sales(signals, horizon=90)
+        alice = rankings.set_index('member').loc['Alice']
+
+        expected_prior = 0.75
+        expected_posterior = (expected_prior * 20 + 1) / 21
+        self.assertAlmostEqual(alice['bayes_win_prob'], round(expected_posterior, 3))
+
+    def test_rank_sales_prior_uses_collapsed_episode_loss_rate(self):
+        # Alice has 3 AAPL sales within 14 days (disclosure_date present) so they
+        # collapse into one episode.  Other members/tickers form separate episodes.
+        # The sale_prior is computed from collapsed episodes, not raw rows.
+        signals = pd.DataFrame({
+            'member': ['Alice', 'Alice', 'Alice', 'Bob', 'Carol'],
+            'ticker': ['AAPL', 'AAPL', 'AAPL', 'AAPL', 'MSFT'],
+            'signal_type': ['Sale', 'Sale', 'Sale', 'Sale', 'Sale'],
+            'disclosure_date': pd.to_datetime([
+                '2024-01-01', '2024-01-05', '2024-01-10',
+                '2024-02-01', '2024-03-01',
+            ]),
+            'horizon_days': [90, 90, 90, 90, 90],
+            'decayed_return_pct': [-10.0, -6.0, -8.0, 5.0, -10.0],
+            'peak_potential_pct': [10.0, 8.0, 6.0, -5.0, 10.0],
+            'spy_alpha_pct': [-10.0, -6.0, -8.0, 5.0, -10.0],
+            'amount_midpoint': [1000.0, 2000.0, 1000.0, 5000.0, 3000.0],
+        })
+
+        # Manually compute the collapsed weighted-average return for Alice's episode:
+        # (-10 * 1000 + -6 * 2000 + -8 * 1000) / (1000 + 2000 + 1000) = -7.0
+        collapsed_alice_return = -7.0
+        bob_return = 5.0
+        carol_return = -10.0
+
+        # Collapsed episodes: 3 (Alice collapsed, Bob, Carol)
+        # P(return < 0) = 2/3 (Alice -7.0 and Carol -10.0 are negative)
+        expected_prior = np.clip((2 / 3), 0.10, 0.90)
+
+        rankings = rank_sales(signals, horizon=90)
+        alice = rankings.set_index('member').loc['Alice']
+
+        # Alice's inverted return = -(-7.0) = 7.0 > 0 → 1 win, 0 losses
+        expected_bayes = (expected_prior * 20 + 1) / 21
+        self.assertAlmostEqual(alice['bayes_win_prob'], round(expected_bayes, 3))
+        # sale_trades = 1 (one collapsed episode for Alice)
+        self.assertEqual(alice['sale_trades'], 1)
+
     def test_missing_price_windows_do_not_count_as_zero_return_trades(self):
         entry_prices = pd.DataFrame({
             'member': ['Alice', 'Alice'],

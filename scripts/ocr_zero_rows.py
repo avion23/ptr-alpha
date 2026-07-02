@@ -4,7 +4,7 @@
 Uses `llm -a` with Gemini 3.1 Flash Lite to extract transactions.
 Gemini auto-rotates PDFs and handles checkbox detection.
 """
-import argparse, json, os, re, time, duckdb
+import argparse, datetime, json, os, re, time, duckdb
 from pathlib import Path
 
 from scripts.gemini_ocr_common import MODEL, call_gemini, validate_transactions
@@ -131,6 +131,11 @@ def normalize_date(date_str):
         return None
     if len(year) == 2:
         year = "20" + year if int(year) < 50 else "19" + year
+    year_i = int(year)
+    try:
+        datetime.date(year_i, month_i, day_i)
+    except ValueError:
+        return None
     return f"{year}-{month_i:02d}-{day_i:02d}"
 
 def extract_ticker(asset):

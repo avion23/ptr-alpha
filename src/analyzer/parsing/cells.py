@@ -248,7 +248,11 @@ def _resolve_company_name_ticker(asset_cell: str) -> str | None:
     best_ticker = None
     best_len = 0
     for name, ticker in _COMPANY_NAME_TICKER_MAP.items():
-        if len(name) > best_len and name in text and ticker not in _TICKER_BLACKLIST:
+        # NOTE: We do NOT filter by _TICKER_BLACKLIST here. The blacklist
+        # guards regex-based extraction (where single letters are noisy),
+        # but a company-name match is a strong signal — blocking valid
+        # tickers like "O" (Realty Income) would be a false negative.
+        if len(name) > best_len and name in text:
             best_ticker = ticker
             best_len = len(name)
     return best_ticker
@@ -387,7 +391,7 @@ def _extract_option_details(asset_cell: str | None) -> dict:
             details['strike_price'] = float(strike_fallback.group(1))
 
     # Expiry date: "Exp MM/DD/YYYY" / "Expire: MM/DD/YYYY" / "Expiring MM/DD/YYYY"
-    exp_match = re.search(r'(?:exp(?:ir(?:e|ation|ing)?)?[:\s]+(\d{2}/\d{2}/\d{4}))', asset_cell, re.IGNORECASE)
+    exp_match = re.search(r'(?:exp(?:ir(?:e|ation|ing)?)?[:\s]+(\d{1,2}/\d{1,2}/\d{4}))', asset_cell, re.IGNORECASE)
     if exp_match:
         details['expiry_date'] = exp_match.group(1)
     return details

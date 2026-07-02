@@ -140,7 +140,7 @@ def _parse_docling_markdown(text: str) -> list[list[list[str]]]:
     while i < len(lines):
         line = lines[i].strip()
         m = ticker_re.search(line)
-        if not m or '[ST]' not in line and not re.search(r'\([A-Z]{1,6}\)', line):
+        if not m or ('[ST]' not in line and not re.search(r'\([A-Z]{1,6}\)', line)):
             i += 1
             continue
 

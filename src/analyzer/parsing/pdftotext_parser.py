@@ -160,13 +160,10 @@ def _collect_asset_continuation(asset: str, start: int, lines: list[str]) -> tup
             break
         if _is_new_tx_header(next_line):
             break
-        if next_line.startswith('F ') or next_line.startswith('S ') or next_line.startswith('D '):
-            break
         if re.match(r'^\[', next_line) or re.match(r'^\d', next_line):
             asset += ' ' + next_line
             j += 1
         elif _TICKER_PARENS.search(next_line):
-            # Continuation line with ticker in parens, e.g. "Stock (NVDA) [ST]"
             asset += ' ' + next_line
             j += 1
         else:

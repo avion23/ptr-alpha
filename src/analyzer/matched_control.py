@@ -35,7 +35,7 @@ class MatchedControlResult:
 def _compute_realized_volatility(
     prices_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp, window: int = 20,
 ) -> float | None:
-    """Annualized 20-day realized volatility (std of daily returns)."""
+    """Realized 20-day volatility (std of daily returns, NOT annualized)."""
     if ticker not in prices_df.columns:
         return None
     series = prices_df[ticker].dropna()

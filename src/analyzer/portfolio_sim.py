@@ -140,9 +140,9 @@ class PortfolioSimulator:
         target_pct = min(1.0 / self.config.max_positions, self.config.max_position_pct)
         target_value = total_value * target_pct
 
-        # Sector constraint check
+        # Sector constraint check (mark-to-market, consistent with total_value)
         sector = self._get_sector(ticker)
-        sector_exposure = self._sector_exposure()
+        sector_exposure = self._sector_exposure(prices_df, as_of)
         current_sector_pct = sector_exposure.get(sector, 0.0)
         max_sector_value = total_value * self.config.max_sector_pct
         current_sector_value = current_sector_pct * total_value
@@ -239,38 +239,49 @@ class PortfolioSimulator:
         self._sector_cache[ticker] = sector
         return sector
 
-    def _sector_exposure(self) -> dict[str, float]:
-        """Current sector allocation as fraction of total value."""
+    def _position_value(
+        self, pos: PortfolioPosition, prices_df: pd.DataFrame, as_of_ts: pd.Timestamp
+    ) -> float:
+        """Mark-to-market value of a single position, falling back to cost."""
+        if pos.ticker not in prices_df.columns:
+            return pos.cost
+        price_series = prices_df[pos.ticker].dropna()
+        if price_series.empty:
+            return pos.cost
+        if not isinstance(price_series.index, pd.DatetimeIndex):
+            price_series.index = pd.to_datetime(price_series.index)
+        eligible = price_series[price_series.index <= as_of_ts]
+        if not eligible.empty:
+            return pos.shares * float(eligible.iloc[-1])
+        return pos.cost
+
+    def _sector_exposure(
+        self, prices_df: pd.DataFrame, as_of: date
+    ) -> dict[str, float]:
+        """Current sector allocation (mark-to-market) as fraction of total value.
+
+        Uses mark-to-market position values so sector constraints are enforced
+        consistently against current market value (same basis as
+        :meth:`_total_value`), not against stale cost basis.
+        """
         if not self.positions:
             return {}
-        total = sum(p.cost for p in self.positions) + self.cash
-        if total <= 0:
-            return {}
+        as_of_ts = pd.Timestamp(as_of)
         sector_values: dict[str, float] = {}
         for p in self.positions:
-            sector_values[p.sector] = sector_values.get(p.sector, 0) + p.cost
+            mtm = self._position_value(p, prices_df, as_of_ts)
+            sector_values[p.sector] = sector_values.get(p.sector, 0.0) + mtm
+        total = sum(sector_values.values()) + self.cash
+        if total <= 0:
+            return {}
         return {s: v / total for s, v in sector_values.items()}
 
     def _total_value(self, prices_df: pd.DataFrame, as_of: date) -> float:
         """Total portfolio value (cash + mark-to-market positions)."""
-        value = self.cash
         as_of_ts = pd.Timestamp(as_of)
-        for pos in self.positions:
-            if pos.ticker not in prices_df.columns:
-                value += pos.cost
-                continue
-            price_series = prices_df[pos.ticker].dropna()
-            if price_series.empty:
-                value += pos.cost
-                continue
-            if not isinstance(price_series.index, pd.DatetimeIndex):
-                price_series.index = pd.to_datetime(price_series.index)
-            eligible = price_series[price_series.index <= as_of_ts]
-            if not eligible.empty:
-                value += pos.shares * float(eligible.iloc[-1])
-            else:
-                value += pos.cost
-        return value
+        return self.cash + sum(
+            self._position_value(p, prices_df, as_of_ts) for p in self.positions
+        )
 
     def _record_snapshot(self, prices_df: pd.DataFrame, as_of: date):
         total = self._total_value(prices_df, as_of)
@@ -337,8 +348,12 @@ class PortfolioSimulator:
             sharpe = 0.0
 
         # Max drawdown
-        peak = np.maximum.accumulate(values)
-        drawdowns = (values - peak) / peak
+        # Anchor the equity curve to initial_capital so a first-period loss
+        # counts as a drawdown from the starting capital, not just from the
+        # first snapshot's post-trade value.
+        full_values = np.concatenate([[initial], values])
+        peak = np.maximum.accumulate(full_values)
+        drawdowns = (full_values - peak) / peak
         max_drawdown = float(np.min(drawdowns)) * 100
 
         # Win rate

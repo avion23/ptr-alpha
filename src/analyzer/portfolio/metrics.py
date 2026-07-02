@@ -71,8 +71,13 @@ def _sharpe_ratio(rets: np.ndarray) -> float:
 
 
 def _max_drawdown(rets: np.ndarray) -> float:
-    """Max drawdown on cumulative equity curve (returned as negative %)."""
-    equity = np.cumprod(1 + rets / 100)
+    """Max drawdown on cumulative equity curve (returned as negative %).
+
+    The equity curve is anchored to the initial unit capital (1.0) so that a
+    first-period loss is correctly counted as a drawdown from the starting
+    capital rather than from the post-return equity.
+    """
+    equity = np.concatenate([[1.0], np.cumprod(1 + rets / 100)])
     peak = np.maximum.accumulate(equity)
     drawdowns = (equity - peak) / peak
     return float(np.min(drawdowns)) * 100 if len(drawdowns) > 0 else 0.0
@@ -83,7 +88,10 @@ def _win_rate(rets: np.ndarray) -> float:
 
 
 def _avg_alpha(portfolio_returns: pd.DataFrame) -> float:
-    return float(portfolio_returns["portfolio_alpha"].values.mean())
+    # pandas .mean() skips NaN, unlike .values.mean() which propagates it.
+    # Guard against all-NaN / empty series returning NaN.
+    mean_val = portfolio_returns["portfolio_alpha"].mean()
+    return float(mean_val) if pd.notna(mean_val) else 0.0
 
 
 def _total_positions(portfolio_returns: pd.DataFrame) -> int:

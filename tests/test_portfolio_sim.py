@@ -319,5 +319,56 @@ class TestOverlappingPositions(unittest.TestCase):
         self.assertGreaterEqual(metrics["max_concurrent_positions"], 1)
 
 
+class TestDrawdownFromInitialCapital(unittest.TestCase):
+    """Regression: max_drawdown must anchor to initial_capital, not just
+    to the first snapshot's post-trade value."""
+
+    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
+    def test_drawdown_captures_first_period_loss(self, _mock_sector):
+        cfg = PortfolioConfig(
+            initial_capital=10000, max_positions=1, hold_period_days=365,
+            entry_slippage_pct=0.0, exit_slippage_pct=0.0,
+        )
+        sim = PortfolioSimulator(cfg)
+        # Price declines 2% per day from 100 -> drawdown should be negative.
+        prices = _make_prices(
+            ["A"], "2024-01-01", "2024-01-10",
+            base_prices={"A": 100.0}, daily_drift=-0.02,
+        )
+        sim.run(_make_recs(["A"], "2024-01-01"), prices,
+                date(2024, 1, 1), date(2024, 1, 5))
+        metrics = sim.compute_metrics(prices)
+        # Position loses value continuously from the initial capital; the
+        # pre-fix code reported 0% drawdown because the peak only tracked
+        # post-entry equity.
+        self.assertLess(metrics["max_drawdown_pct"], -1.0)
+
+
+class TestSectorExposureMarkToMarket(unittest.TestCase):
+    """Regression: _sector_exposure must use mark-to-market, not cost basis,
+    so sector constraints reflect current market value."""
+
+    def test_sector_exposure_uses_mtm(self):
+        from analyzer.portfolio_sim import PortfolioPosition
+        cfg = PortfolioConfig(initial_capital=10000, max_sector_pct=0.40)
+        sim = PortfolioSimulator(cfg)
+        # Hold a Tech position bought at 100, now priced at 200 (mtm = 10000).
+        sim.cash = 5000
+        sim.positions = [
+            PortfolioPosition(
+                ticker="A", entry_date=date(2024, 1, 1), entry_price=100.0,
+                shares=50, cost=5000.0, sector="Tech",
+                signal_score=10.0, rank=1,
+            )
+        ]
+        dates = pd.date_range("2024-01-01", "2024-01-10", freq="D")
+        prices = pd.DataFrame(
+            {"A": [100.0] * 5 + [200.0] * 5}, index=dates,
+        )
+        exposure = sim._sector_exposure(prices, date(2024, 1, 8))
+        # mtm = 50 * 200 = 10000; cash = 5000; total = 15000; tech = 10000/15000
+        self.assertAlmostEqual(exposure["Tech"], 10000.0 / 15000.0, places=3)
+
+
 if __name__ == "__main__":
     unittest.main()

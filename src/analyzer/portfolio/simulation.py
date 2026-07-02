@@ -83,7 +83,7 @@ def simulate_portfolio_returns(
     vs SPY benchmark.
 
     Returns DataFrame with columns: as_of_date, portfolio_return, spy_return,
-        portfolio_alpha, individual_returns (list).
+        portfolio_alpha, num_positions.
     """
     if portfolio_df.empty or prices_df.empty:
         return pd.DataFrame()
@@ -113,8 +113,7 @@ def _simulate_one_period(
     """Simulate one portfolio over its holding period."""
     as_of_ts = pd.Timestamp(as_of_date)
     weighted_return = 0.0
-    total_weight = 0.0
-    individual: list[dict] = []
+    num_positions = 0
     exit_ns = as_of_ts.value + horizon * NS_PER_DAY
 
     for _, pos in group.iterrows():
@@ -124,8 +123,7 @@ def _simulate_one_period(
         if per_position is None:
             continue
         weighted_return += per_position["weight"] * per_position["return_pct"]
-        total_weight += per_position["weight"]
-        individual.append(per_position)
+        num_positions += 1
 
     spy_return = _compute_spy_return(spy_arrs, as_of_ts, exit_ns, entry_mult, exit_mult)
 
@@ -134,7 +132,7 @@ def _simulate_one_period(
         "portfolio_return": round(weighted_return, 2),
         "spy_return": round(spy_return, 2),
         "portfolio_alpha": round(weighted_return - spy_return, 2),
-        "num_positions": len(individual),
+        "num_positions": num_positions,
     }
 
 
@@ -156,12 +154,12 @@ def _simulate_one_position(
     idx_ns, vals = tkr_arrs
 
     entry = _price_at_or_before_arrays(idx_ns, vals, as_of_ts, max_staleness_days=30)
-    if not entry:
+    if entry is None:
         return None
     exit_price = _price_on_or_before_arrays(
         idx_ns, vals, pd.Timestamp(exit_ns), max_staleness_days=30,
     )
-    if not exit_price:
+    if exit_price is None:
         return None
 
     entry_adj = entry * entry_mult
@@ -178,13 +176,13 @@ def _compute_spy_return(
     entry_mult: float, exit_mult: float,
 ) -> float:
     """SPY benchmark return over the same holding window, or 0 if no data."""
-    if not spy_arrs or spy_arrs[0] is None:
+    if spy_arrs is None or spy_arrs[0] is None:
         return 0.0
     spy_ns, spy_vals = spy_arrs
     spy_entry = _price_at_or_before_arrays(spy_ns, spy_vals, as_of_ts, max_staleness_days=30)
     spy_exit = _price_on_or_before_arrays(
         spy_ns, spy_vals, pd.Timestamp(exit_ns), max_staleness_days=30,
     )
-    if not (spy_entry and spy_exit):
+    if spy_entry is None or spy_exit is None:
         return 0.0
     return (spy_exit * exit_mult / (spy_entry * entry_mult) - 1.0) * 100

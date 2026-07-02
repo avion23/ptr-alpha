@@ -1,5 +1,6 @@
 """Tests for Kelly criterion portfolio construction."""
 
+import math
 import unittest
 
 import pandas as pd
@@ -206,6 +207,34 @@ class TestComputePortfolioMetrics(unittest.TestCase):
     def test_empty_returns(self):
         metrics = compute_portfolio_metrics(pd.DataFrame())
         self.assertEqual(metrics, {})
+
+    def test_max_drawdown_captures_first_period_loss(self):
+        # Regression: equity curve must be anchored to 1.0 so a first-period
+        # loss counts as a drawdown from starting capital.
+        df = pd.DataFrame({
+            "as_of_date": ["2024-01-01", "2024-02-01"],
+            "portfolio_return": [-10.0, 5.0],
+            "spy_return": [0.0, 0.0],
+            "portfolio_alpha": [-10.0, 5.0],
+            "num_positions": [1, 1],
+        })
+        metrics = compute_portfolio_metrics(df)
+        # Worst drawdown is the first-period -10% loss from starting capital.
+        self.assertAlmostEqual(metrics["max_drawdown_pct"], -10.0, places=2)
+
+    def test_avg_alpha_handles_nan(self):
+        # Regression: NaN alphas must not propagate; mean should skip them.
+        df = pd.DataFrame({
+            "as_of_date": ["2024-01-01", "2024-02-01", "2024-03-01"],
+            "portfolio_return": [1.0, float("nan"), 2.0],
+            "spy_return": [0.0, 0.0, 0.0],
+            "portfolio_alpha": [1.0, float("nan"), 2.0],
+            "num_positions": [1, 1, 1],
+        })
+        metrics = compute_portfolio_metrics(df)
+        # avg of [1.0, 2.0] skipping NaN = 1.5
+        self.assertAlmostEqual(metrics["avg_alpha_per_period_pct"], 1.5, places=2)
+        self.assertFalse(math.isnan(metrics["avg_alpha_per_period_pct"]))
 
 
 class TestKellyConfig(unittest.TestCase):

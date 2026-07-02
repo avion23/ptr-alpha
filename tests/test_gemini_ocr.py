@@ -1,7 +1,9 @@
 from datetime import datetime
+import queue
 
 from analyzer.database import Database
 from scripts import gemini_ocr_common
+from scripts import ocr_parallel
 from scripts.ocr_zero_rows import insert_transactions
 
 
@@ -86,6 +88,80 @@ def test_call_gemini_cache_round_trip(monkeypatch, tmp_path):
     assert calls[0][-4:] == ["-o", "temperature", "0", gemini_ocr_common.PROMPT]
 
 
+def test_call_gemini_empty_stdout_not_cached(monkeypatch, tmp_path):
+    def fake_run(args, capture_output, text, timeout):
+        class Result:
+            returncode = 0
+            stdout = "  \n\t"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
+
+    output, error = gemini_ocr_common.call_gemini(
+        "sample.pdf", doc_id="doc-empty", cache_dir=str(tmp_path)
+    )
+
+    assert output == ""
+    assert error == "empty_response"
+    assert not (tmp_path / "doc-empty.txt").exists()
+
+
+def test_call_gemini_ignores_empty_cache_file(monkeypatch, tmp_path):
+    (tmp_path / "doc-empty-cache.txt").write_text("\n")
+    calls = []
+
+    def fake_run(args, capture_output, text, timeout):
+        calls.append(args)
+
+        class Result:
+            returncode = 0
+            stdout = "MEMBER: Jane Doe\nApple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
+
+    output, error = gemini_ocr_common.call_gemini(
+        "sample.pdf", doc_id="doc-empty-cache", cache_dir=str(tmp_path)
+    )
+
+    assert output is not None
+    assert "MEMBER: Jane Doe" in output
+    assert error == ""
+    assert len(calls) == 1
+
+
+def test_cache_path_sanitizes_doc_id(tmp_path):
+    path = gemini_ocr_common.cache_path("folder/doc\\id", cache_dir=str(tmp_path))
+
+    assert path == tmp_path / "folder_doc_id.txt"
+
+
+def test_parallel_empty_response_enqueues_error(monkeypatch):
+    test_queue = queue.Queue()
+    monkeypatch.setattr(ocr_parallel, "write_q", test_queue)
+    monkeypatch.setattr(
+        ocr_parallel,
+        "call_gemini",
+        lambda pdf_path, doc_id=None, refresh=False, timeout=90: ("", "empty_response"),
+    )
+
+    doc_id, year, status, count, error = ocr_parallel.process_one(("doc-empty", 2024, "sample.pdf"))
+    queued = test_queue.get_nowait()
+
+    assert (doc_id, year, status, count, error) == ("doc-empty", 2024, "error", 0, "empty_response")
+    assert queued == {
+        "doc_id": "doc-empty",
+        "year": 2024,
+        "status": "error",
+        "raw_count": 0,
+        "error": "empty_response",
+    }
+
+
 def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
@@ -116,3 +192,31 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
     assert rows == [("Jane Doe", "AAPL", "Apple Inc. (AAPL)", "gemini_ocr")]
     assert len(parse_runs) == 2
     assert parse_runs[-1] == ("v4-gemini-manual", "success", 1, 1)
+
+
+def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):
+    db_path = tmp_path / "congress.duckdb"
+    db = Database(db_path)
+    db.conn.execute("""
+        INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
+        VALUES ('doc-preserve', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
+    """)
+    db.conn.close()
+
+    assert insert_transactions("doc-preserve", 2024, "Jane Doe", [_tx()], db_path=str(db_path)) == 1
+    assert insert_transactions("doc-preserve", 2024, "Jane Doe", [], db_path=str(db_path)) == 0
+
+    con = Database(db_path).conn
+    row_count = con.execute("SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc-preserve'").fetchone()[0]
+    latest_run = con.execute("""
+        SELECT status, raw_row_count, transaction_count
+        FROM pdf_parse_runs
+        WHERE doc_id = 'doc-preserve'
+        ORDER BY parsed_at DESC
+        LIMIT 1
+    """).fetchone()
+    con.close()
+
+    assert row_count == 1
+    assert latest_run is not None
+    assert latest_run == ("no_txs", 0, 0)

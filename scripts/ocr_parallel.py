@@ -121,7 +121,7 @@ def _flush(batch):
 def process_one(item, refresh=False):
     doc_id, year, pdf_path = item
     output, error = call_gemini(pdf_path, doc_id=doc_id, refresh=refresh, timeout=90)
-    if output is None:
+    if output is None or error:
         write_q.put({"doc_id": doc_id, "year": year, "status": "error", "raw_count": 0, "error": str(error)[:1000]})
         return doc_id, year, "error", 0, error
     member, txs = parse_output(output)
@@ -185,7 +185,7 @@ def main():
     
     # Signal writer to flush and exit
     write_q.put(SENTINEL)
-    writer_thread.join(timeout=30)
+    writer_thread.join()
     save_progress(progress)
     print(f"\nDone: {completed} PDFs, {total_inserted} tx in {time.time()-t0:.0f}s")
 

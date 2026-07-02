@@ -31,13 +31,16 @@ One line per transaction. No markdown, no tables, no explanations."""
 
 
 def cache_path(doc_id: str, cache_dir: str = CACHE_DIR) -> Path:
-    return Path(cache_dir) / f"{doc_id}.txt"
+    safe_doc_id = str(doc_id).replace(os.sep, "_").replace("/", "_").replace("\\", "_")
+    return Path(cache_dir) / f"{safe_doc_id}.txt"
 
 
 def read_cached_response(doc_id: str, cache_dir: str = CACHE_DIR) -> str | None:
     path = cache_path(doc_id, cache_dir)
     if path.exists():
-        return path.read_text()
+        cached = path.read_text()
+        if cached.strip():
+            return cached
     return None
 
 
@@ -61,6 +64,8 @@ def call_gemini(pdf_path: str, doc_id: str | None = None, refresh: bool = False,
         )
         if result.returncode != 0:
             return None, result.stderr.strip() or f"llm exited {result.returncode}"
+        if not result.stdout.strip():
+            return "", "empty_response"
         if doc_id:
             write_cached_response(str(doc_id), result.stdout, cache_dir)
         return result.stdout, ""

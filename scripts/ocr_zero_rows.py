@@ -420,12 +420,12 @@ def insert_transactions(doc_id, year, member, transactions, db_path: str = DB_PA
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
     filing_date = get_filing_date(conn, doc_id)
-    conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
     if not transactions:
         record_parse_run(conn, doc_id, year, "no_txs", raw_count or 0, 0, parser_version=parser_version)
         conn.close()
         return 0
 
+    conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
     count = 0
     errors = []
     for tx in transactions:
@@ -501,7 +501,7 @@ def main():
         time.sleep(COOLDOWN)
         
         output, error = call_gemini(path, doc_id=doc_id, refresh=args.refresh)
-        if output is None:
+        if output is None or error:
             progress["errors"].append(doc_id)
             save_progress(progress)
             conn = duckdb.connect(DB_PATH)
@@ -574,7 +574,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
         print(f"\n[{i+1}/{len(remaining)}] {doc_id} ({yr})...", flush=True)
         time.sleep(COOLDOWN)
         output, error = call_gemini(path, doc_id=doc_id, refresh=refresh, cache_dir=os.path.join(data_dir, "gemini_cache"))
-        if output is None:
+        if output is None or error:
             progress["errors"].append(doc_id)
             save_progress(progress)
             conn = duckdb.connect(db_path)

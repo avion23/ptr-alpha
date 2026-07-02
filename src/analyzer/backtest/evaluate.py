@@ -30,6 +30,7 @@ Bug fixes applied here (see prices.py for Bug 1b/1c low-level fixes):
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from analyzer.backtest.prices import (
@@ -40,6 +41,12 @@ from analyzer.backtest.prices import (
 from analyzer.signals import _price_arrays
 
 NS_PER_DAY = 86_400_000_000_000
+
+# Sentinel returned by _evaluate_one_recommendation when a ticker is
+# discovered to have been delisted BEFORE the entry/as_of date — meaning the
+# position was never actionable.  Distinct from None (other skips) so the
+# caller can count it in n_no_price.
+_UNTRADEABLE = object()
 
 _EMPTY_BT_COLS = [
     "bt_entry_price", "bt_exit_price", "bt_raw_return_pct", "bt_return_pct",
@@ -116,7 +123,10 @@ def evaluate_backtest(
             inst_type_arr[i] if inst_type_arr is not None else None,
             amount_arr[i] if amount_arr is not None else None,
         )
-        if row is not None:
+        if row is _UNTRADEABLE:
+            # Ticker was already delisted before entry — never actionable
+            n_no_price += 1
+        elif row is not None:
             if row.get("bt_delisted"):
                 n_delisted += 1
             rows.append(row)
@@ -261,10 +271,20 @@ def _evaluate_one_recommendation(
     exit_price = _price_on_or_before_arrays(idx_ns, vals, pd.Timestamp(exit_ns), max_staleness_days=30)
     is_delisted = False
     if not exit_price:
-        exit_price = _price_at_or_before_arrays(idx_ns, vals, pd.Timestamp(exit_ns), max_staleness_days=None)
-        if not exit_price:
-            return None  # Truly no price data — skip (counted as n_no_price by caller)
-        is_delisted = True
+        # Finding 2 fix: only treat as "delisted during hold" when the last
+        # known price is STRICTLY AFTER the entry date.  If the last price
+        # predates or equals the entry (ticker already dead at recommendation
+        # time), the position was never actionable — return _UNTRADEABLE so
+        # the caller can count it in n_no_price.
+        entry_ns = as_of_ns + entry_delay * NS_PER_DAY
+        fallback_pos = int(np.searchsorted(idx_ns, int(exit_ns), side="right")) - 1
+        if fallback_pos >= 0 and int(idx_ns[fallback_pos]) > entry_ns:
+            exit_price = float(vals[fallback_pos])
+            is_delisted = True
+        else:
+            # No usable price: either no data at all, or ticker already
+            # delisted before/at entry — caller counts this in n_no_price.
+            return _UNTRADEABLE
 
     # Bug 1b: SPY return must cover the same calendar window as the position.
     # When entry_delay > 0 (dip entry) the window is shifted; precomputed

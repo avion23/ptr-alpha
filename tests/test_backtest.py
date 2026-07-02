@@ -514,8 +514,8 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         result_dip = evaluate_backtest(recs, prices, as_of, horizon=horizon,
                                        use_dip_entry=True, pullback_pct=0.05, max_wait_days=10)
         valid = result_dip.dropna(subset=["bt_return_pct"])
-        if valid.empty:
-            self.skipTest("no dip triggered — price data setup may need adjustment")
+        # Finding 4 fix: assertFalse instead of skipTest so regressions are visible.
+        self.assertFalse(valid.empty, "dip should have been triggered by the 6% price drop on Jan 6")
 
         # entry_delay should be 5 calendar days (Jan 1 → Jan 6)
         self.assertEqual(valid.iloc[0]["bt_entry_delay"], 5)
@@ -549,8 +549,7 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         result = evaluate_backtest(recs, prices, as_of, horizon=90,
                                    use_dip_entry=True, pullback_pct=0.05, max_wait_days=10)
         valid = result.dropna(subset=["bt_return_pct"])
-        if valid.empty:
-            self.skipTest("dip not triggered — adjust price setup")
+        self.assertFalse(valid.empty, "dip should have been triggered by the 10% price drop on Jan 6")
         entry_delay = valid.iloc[0]["bt_entry_delay"]
         # Old buggy code: would return 1 (array-row index hits[0])
         # Correct code:   must return 3 (calendar days Jan 3 → Jan 6)
@@ -671,7 +670,7 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         prices = self._make_prices(dates, {
             # GOOG: full data, evaluated normally
             "GOOG": [200.0 + i * 0.1 for i in range(n)],
-            # AAPL: delisted early
+            # AAPL: delisted early (after as_of → counts as n_delisted)
             "AAPL": [100.0] * n_alive + [float("nan")] * (n - n_alive),
             "SPY": [400.0 + i * 0.02 for i in range(n)],
         })
@@ -685,6 +684,94 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         summary = summarize_backtest(ev)
         self.assertEqual(summary.attrs.get("n_no_price"), 1)   # MSFT
         self.assertEqual(summary.attrs.get("n_delisted"), 1)   # AAPL
+
+    # ---- Finding 2: ticker delisted BEFORE as_of must NOT be included
+
+    def test_ticker_delisted_before_as_of_is_not_included(self):
+        """Finding 2: if a ticker last traded before as_of_date it was never
+        actionable.  It must NOT be included with bt_delisted=True (which would
+        produce a spurious near-zero return of pure slippage) and must be
+        counted in n_no_price, not n_delisted."""
+        as_of = pd.Timestamp("2025-01-15")
+        # Ticker last traded Dec 31 — 15 days before as_of, within the 30-day
+        # entry staleness window so the entry lookup succeeds.  The exit date
+        # is 90 days later (~April 15).  The fallback exit price is also Dec 31
+        # (same stale price), so entry ≈ exit ≈ pure slippage ≈ -0.2%.
+        last_trade = pd.Timestamp("2024-12-31")
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        n_alive = len(pd.date_range("2024-12-01", last_trade, freq="D"))
+        aapl_arr = [100.0] * n_alive + [float("nan")] * (len(dates) - n_alive)
+        spy_arr = [400.0 + i * 0.02 for i in range(len(dates))]
+        prices = self._make_prices(dates, {"AAPL": aapl_arr, "SPY": spy_arr})
+        recs = self._single_rec("AAPL")
+
+        result = evaluate_backtest(recs, prices, as_of, horizon=90)
+        # Ticker was already dead at recommendation time → must NOT be included
+        self.assertTrue(
+            result.dropna(subset=["bt_return_pct"]).empty,
+            "ticker delisted before as_of must not be included (not tradeable at rec time)",
+        )
+        # Must be counted as n_no_price (untradeable), NOT n_delisted
+        self.assertEqual(result.attrs.get("n_no_price", 0), 1,
+                         "pre-as_of delisting must be counted in n_no_price")
+        self.assertEqual(result.attrs.get("n_delisted", 0), 0,
+                         "pre-as_of delisting must NOT increment n_delisted")
+
+    # ---- Finding 1: multi-date concat must preserve summed coverage counts
+
+    def test_multi_date_concat_preserves_coverage_counts(self):
+        """Finding 1: pd.concat drops differing .attrs in pandas 3.x.
+        The pipeline must accumulate per-date counts explicitly so that
+        summarize_backtest sees the correct totals after concatenation."""
+        # Simulate two evaluate_backtest calls (two as_of dates), each with
+        # different coverage counts, then concat and verify summarize sees sum.
+        dates = pd.date_range("2024-12-01", "2025-09-01", freq="D")
+        n = len(dates)
+        last_alive = pd.Timestamp("2025-02-01")
+        n_alive = len(pd.date_range("2024-12-01", last_alive, freq="D"))
+
+        prices = self._make_prices(dates, {
+            "AAPL": [100.0 + i * 0.05 for i in range(n)],
+            # GOOG delisted after last_alive
+            "GOOG": [200.0] * n_alive + [float("nan")] * (n - n_alive),
+            "SPY": [400.0 + i * 0.02 for i in range(n)],
+        })
+
+        # as_of_1: AAPL OK, MSFT missing (n_no_price=1), GOOG alive (n_delisted=0)
+        recs1 = pd.DataFrame({
+            "rank": [1, 2], "ticker": ["AAPL", "MSFT"],
+            "signal_score": [50.0, 40.0], "num_buyers": [2, 2],
+        })
+        ev1 = evaluate_backtest(recs1, prices, pd.Timestamp("2025-01-01"), horizon=90)
+        self.assertEqual(ev1.attrs.get("n_no_price", 0), 1)   # MSFT
+
+        # as_of_2: AAPL OK, GOOG now delisted during hold (n_delisted=1)
+        recs2 = pd.DataFrame({
+            "rank": [1, 2], "ticker": ["AAPL", "GOOG"],
+            "signal_score": [50.0, 40.0], "num_buyers": [2, 2],
+        })
+        ev2 = evaluate_backtest(recs2, prices, pd.Timestamp("2025-01-15"), horizon=90)
+        self.assertEqual(ev2.attrs.get("n_delisted", 0), 1)   # GOOG
+
+        # Mimic the pipeline: sum counts, set on combined, then summarize
+        combined = pd.concat(
+            [ev1.dropna(subset=["bt_return_pct"]),
+             ev2.dropna(subset=["bt_return_pct"])],
+            ignore_index=True,
+        )
+        # pd.concat drops attrs → combined.attrs is {} — must set manually
+        combined.attrs["n_no_price"] = (
+            ev1.attrs.get("n_no_price", 0) + ev2.attrs.get("n_no_price", 0)
+        )
+        combined.attrs["n_delisted"] = (
+            ev1.attrs.get("n_delisted", 0) + ev2.attrs.get("n_delisted", 0)
+        )
+
+        summary = summarize_backtest(combined)
+        self.assertEqual(summary.attrs.get("n_no_price"), 1,
+                         "summed n_no_price must survive concat → summarize")
+        self.assertEqual(summary.attrs.get("n_delisted"), 1,
+                         "summed n_delisted must survive concat → summarize")
 
 
 class TestDatabaseDateRange(DatabaseTestCase):

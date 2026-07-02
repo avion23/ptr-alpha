@@ -142,7 +142,7 @@ _COMPANY_NAME_TICKER_MAP: dict[str, str] = {
     "elevance": "ELV", "centene": "CNC",
     "medtronic": "MDT", "stryker": "SYK",
     "intuitive surgical": "ISRG", "intuitive": "ISRG",
-    "hca healthcare": "HCA", "tenet healthcare": "TCP",
+    "hca healthcare": "HCA", "tenet healthcare": "THC",
     "davita": "DVA", "encompass health": "EHC",
     # Consumer / Retail
     "walmart": "WMT", "target": "TGT",

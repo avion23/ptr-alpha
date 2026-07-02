@@ -265,10 +265,19 @@ def estimate_crash_hazard(
     expected_return = -0.10 * crash_prob
 
     # VaR and CVaR (parametric normal approximation)
-    # Use vol to scale the tail
-    vol = max(features.volatility_20d, 0.05)  # floor at 5%
-    var_95 = expected_return - 1.645 * (vol / math.sqrt(252)) * math.sqrt(120)  # 120d horizon, sqrt(T) scaling
-    cvar_95 = var_95 * 1.25  # CVaR is worse than VaR
+    # Use vol to scale the tail to the 120-day horizon.
+    vol = max(features.volatility_20d, 0.05)  # annualized vol, floor at 5%
+    sigma_120d = (vol / math.sqrt(252)) * math.sqrt(120)  # 120-day std via sqrt-T scaling
+    # 95% one-sided VaR: VaR = mu - z_alpha * sigma with z_alpha = 1.645
+    var_95 = expected_return - 1.645 * sigma_120d
+    # CVaR (Expected Shortfall) at 5% for a normal distribution:
+    #   ES_alpha = mu - sigma * phi(z_alpha) / alpha
+    # where phi is the standard normal pdf and alpha = 0.05.  phi(-1.645) ≈
+    # 0.1031, giving a multiplier of ~2.063 (vs 1.645 for VaR).  CVaR is the
+    # average loss conditional on breaching VaR, so it is always more negative
+    # than VaR for a left-tailed risk measure.
+    _phi_z = math.exp(-1.645 ** 2 / 2) / math.sqrt(2 * math.pi)
+    cvar_95 = expected_return - (_phi_z / 0.05) * sigma_120d
 
     return CrashHazard(
         crash_prob=round(crash_prob, 4),

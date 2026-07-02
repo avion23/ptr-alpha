@@ -171,16 +171,23 @@ def _backtest_core(
         result.alpha_slope = round(result.rank1_alpha - result.rank5_alpha, 2)
         result.win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
 
-        if len(valid) > 1:
-            mean_a = valid["bt_alpha_pct"].mean()
-            std_a = valid["bt_alpha_pct"].std()
+        # Sharpe and max_drawdown are time-series portfolio metrics and must
+        # be computed on the per-date mean-alpha series (one observation per
+        # rebalance date).  Using per-rec alphas here would (a) treat same-date
+        # correlated picks as independent obs for Sharpe and (b) compound
+        # returns across (date, ticker) pairs in arbitrary concat order for
+        # max_drawdown — neither of which corresponds to a portfolio the
+        # strategy actually held.
+        if len(per_date) > 1:
+            mean_a = per_date.mean()
+            std_a = per_date.std()
             if std_a > 0:
                 periods_per_year = 365 / params.frequency_days
                 result.sharpe = round(
                     float(mean_a / std_a * (periods_per_year ** 0.5)), 2
                 )
 
-        cumulative = (1 + valid["bt_alpha_pct"] / 100).cumprod()
+        cumulative = (1 + per_date / 100).cumprod()
         rolling_max = cumulative.cummax()
         drawdown = (cumulative - rolling_max) / rolling_max
         result.max_drawdown = round(float(drawdown.min()) * 100, 2)

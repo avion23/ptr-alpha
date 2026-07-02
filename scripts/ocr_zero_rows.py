@@ -7,7 +7,7 @@ Gemini auto-rotates PDFs and handles checkbox detection.
 import argparse, json, os, re, time, duckdb
 from pathlib import Path
 
-from scripts.gemini_ocr_common import MODEL, PROMPT, call_gemini, validate_transactions
+from scripts.gemini_ocr_common import MODEL, call_gemini, validate_transactions
 
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress_gemini_manual.json"

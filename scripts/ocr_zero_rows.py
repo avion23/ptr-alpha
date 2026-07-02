@@ -469,13 +469,14 @@ def insert_transactions(doc_id, year, member, transactions, *, db_path: str,
         return 0
 
     count = 0
+    committed = False
     try:
         conn.execute("BEGIN TRANSACTION")
         conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
         for row in rows:
             conn.execute("""
-                INSERT INTO transactions 
-                (doc_id, member, ticker, transaction_date, disclosure_date, 
+                INSERT INTO transactions
+                (doc_id, member, ticker, transaction_date, disclosure_date,
                  transaction_type, amount_raw, amount_midpoint, owner_code, created_at,
                  asset_description, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
@@ -483,15 +484,19 @@ def insert_transactions(doc_id, year, member, transactions, *, db_path: str,
             count += 1
         record_parse_run(conn, doc_id, year, "success", raw_count if raw_count is not None else len(transactions), count, "; ".join(errors), parser_version=parser_version)
         conn.execute("COMMIT")
+        committed = True
         conn.execute("CHECKPOINT")
-        conn.close()
         return count
     except Exception as e:
-        conn.execute("ROLLBACK")
-        record_parse_run(conn, doc_id, year, "error", raw_count if raw_count is not None else len(transactions), 0, str(e), parser_version=parser_version)
-        conn.execute("CHECKPOINT")
-        conn.close()
+        # A CHECKPOINT failure after COMMIT must not trigger ROLLBACK (no
+        # active transaction — would mask the original error); the data is
+        # already committed, so only re-raise.
+        if not committed:
+            conn.execute("ROLLBACK")
+            record_parse_run(conn, doc_id, year, "error", raw_count if raw_count is not None else len(transactions), 0, str(e), parser_version=parser_version)
         raise
+    finally:
+        conn.close()
 
 def validate_for_insert(conn, doc_id, member, transactions):
     filing_date = get_filing_date(conn, doc_id)

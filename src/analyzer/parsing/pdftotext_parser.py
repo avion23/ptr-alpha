@@ -80,12 +80,17 @@ def _run_pdftotext(pdf_path: Path) -> str | None:
     try:
         result = subprocess.run(
             ['pdftotext', '-layout', str(pdf_path), '-'],
-            capture_output=True, text=True, timeout=_PDFTOTEXT_TIMEOUT
+            capture_output=True, text=True, errors='replace', timeout=_PDFTOTEXT_TIMEOUT
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+    except OSError as e:
+        # FileNotFoundError (binary missing), PermissionError, and other
+        # OS-level errors should not crash the parse pipeline.
         logger.debug(f"pdftotext failed for {pdf_path}: {e}")
+        return None
+    except subprocess.TimeoutExpired as e:
+        logger.debug(f"pdftotext timed out for {pdf_path}: {e}")
         return None
     return result.stdout
 

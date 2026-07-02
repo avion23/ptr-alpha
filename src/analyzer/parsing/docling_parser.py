@@ -65,12 +65,19 @@ def _build_docling_cmd(pdf_path: Path) -> list[str] | None:
 
 def _run_docling(full_cmd: list[str], pdf_path: Path, timeout: int) -> str | None:
     try:
-        result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            full_cmd, capture_output=True, text=True,
+            errors='replace', timeout=timeout,
+        )
         if result.returncode != 0:
             logger.debug(f"docling failed for {pdf_path}: rc={result.returncode}, stderr tail={result.stderr[-300:]}")
             return None
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        logger.debug(f"docling timed out/missing for {pdf_path}: {e}")
+    except subprocess.TimeoutExpired as e:
+        logger.debug(f"docling timed out for {pdf_path}: {e}")
+        return None
+    except OSError as e:
+        # FileNotFoundError (uvx/docling missing), PermissionError, etc.
+        logger.debug(f"docling failed to spawn for {pdf_path}: {e}")
         return None
 
     # Docling emits <stem>.md and <stem>.json in the output dir

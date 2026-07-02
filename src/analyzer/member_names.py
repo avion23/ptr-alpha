@@ -12,6 +12,7 @@ of the same person map to one stable key.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 
 # Tokens that are not part of a person's core first/last name and should be
@@ -26,7 +27,9 @@ def canonical_member_key(name: str) -> str:
     """Return a canonical lookup key for a member name.
 
     Algorithm:
-    1. Uppercase.
+    1. Uppercase and ASCII-fold (NFKD + ASCII ignore) so accented characters
+       like 'é' → 'E' and 'ñ' → 'N'. Without this, 'Renée Zellweger' would
+       collapse to 'REN ZELLWEGER' because the regex strips non-ASCII letters.
     2. Replace all non-alphanumeric characters (punctuation, dots, commas) with
        spaces so 'T.' and 'T' are both just 'T'.
     3. Split into tokens and drop honorifics (DR, JR, III, HON, …) and
@@ -43,12 +46,17 @@ def canonical_member_key(name: str) -> str:
         canonical_member_key('Diana Lynn Harshbarger') # → 'DIANA HARSHBARGER'
         canonical_member_key('Diana Harshbarger')   # → 'DIANA HARSHBARGER'
         canonical_member_key('Dr. John Smith Jr.')  # → 'JOHN SMITH'
+        canonical_member_key('Renée Zellweger')     # → 'RENEE ZELLWEGER'
+        canonical_member_key('José E. Serrano')     # → 'JOSE SERRANO'
     """
     if not name:
         return ""
 
-    # Step 1-2: uppercase, replace non-alpha with spaces
-    s = re.sub(r"[^A-Za-z0-9 ]", " ", name.upper())
+    # Step 1: uppercase + ASCII-fold (drop combining accents after NFKD).
+    folded = unicodedata.normalize('NFKD', name.upper()).encode('ascii', 'ignore').decode('ascii')
+
+    # Step 2: replace non-alphanumeric with spaces
+    s = re.sub(r"[^A-Za-z0-9 ]", " ", folded)
 
     # Step 3: tokenize, drop honorifics and single-letter tokens (middle initials)
     tokens = [t for t in s.split() if t not in _HONORIFICS and len(t) > 1]

@@ -53,12 +53,20 @@ def _handle_ticker_line(stripped: str, ticker_match: re.Match, amount_str: str |
 
 def _tx_type_and_date(rest_clean: str, rest: str) -> tuple[str | None, str | None]:
     tx_type: str | None = None
-    if rest_clean.startswith('P ') or rest_clean.startswith('PP '):
+    # Strip leading asset/owner markers like '[ST]', '[SP]', '[JC]' that can
+    # appear between the ticker and the tx code in OCR'd output. Without this,
+    # a line like "(AAPL) [ST] P 01/15/2024" misses the tx code and the whole
+    # row is dropped.
+    body = re.sub(r'^(?:\[[^\]]*\]\s*)+', '', rest_clean).lstrip()
+    if body.startswith('P ') or body.startswith('PP '):
         tx_type = TransactionType.PURCHASE.value
-    elif rest_clean.startswith('S ') or rest_clean.startswith('SS '):
+    elif body.startswith('S ') or body.startswith('SS '):
         tx_type = TransactionType.SALE.value
+    elif body.startswith('E '):
+        tx_type = TransactionType.EXCHANGE.value
 
-    date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', rest)
+    # Accept 1- or 2-digit month/day to match cells-level extractor behavior.
+    date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})', rest)
     return tx_type, date_match.group(1) if date_match else None
 
 
@@ -78,7 +86,7 @@ def _handle_continuation_line(stripped: str, amount_str: str | None) -> dict | N
     if tx_type is None:
         return None
 
-    date_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', stripped)
+    date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})', stripped)
     if not date_match:
         return None
     return {'tx_type': tx_type, 'date_str': date_match.group(1), 'amount': amount_str}
@@ -100,7 +108,20 @@ def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
 
     all_rows = []
     for image in images:
-        text = pytesseract.image_to_string(image)
+        try:
+            text = pytesseract.image_to_string(image)
+        except Exception as e:
+            # Tesseract can raise runtime errors per page (missing binary,
+            # corrupt image, decode failures). Skip the page rather than abort
+            # the whole PDF — other pages may OCR cleanly.
+            logger.warning(f"OCR failed for one page of {pdf_path}: {e}")
+            continue
+        finally:
+            # pdf2image returns PIL images that hold raster data; close them
+            # promptly to avoid memory pressure on large multi-page PDFs.
+            close = getattr(image, "close", None)
+            if callable(close):
+                close()
         all_rows.extend(_parse_ocr_text_to_rows(text))
 
     if not all_rows:

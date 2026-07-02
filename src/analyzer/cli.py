@@ -260,7 +260,8 @@ def backtest(
         threshold=threshold,
         frequency_days=frequency_days,
     )
-    success = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source, Path(data_dir))
+    resolved_data_dir = Path(app_ctx.settings.data.data_dir)
+    success = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source, resolved_data_dir)
     raise typer.Exit(0 if success else 1)
 
 
@@ -541,7 +542,11 @@ def refresh(
     if not skip_capitol:
         print("[3/4] Fetching Capitol Trades API...")
         from analyzer.capitol_trades import CapitolTradesSource
-        capitol = CapitolTradesSource(data_dir=data_dir, read_only=False)
+        capitol = CapitolTradesSource(
+            data_dir=app_ctx.settings.data.data_dir,
+            read_only=False,
+            db=app_ctx.transaction_source.db,
+        )
         try:
             capitol_count = capitol.fetch_and_save_all()
             print(f"  Capitol Trades: {capitol_count} transactions upserted")
@@ -600,8 +605,12 @@ def fetch_capitol(
         print("Error: specify --politician NAME or --all", file=sys.stderr)
         raise typer.Exit(1)
 
-    start_date = date.fromisoformat(start) if start else None
-    end_date = date.fromisoformat(end) if end else None
+    try:
+        start_date = date.fromisoformat(start) if start else None
+        end_date = date.fromisoformat(end) if end else None
+    except ValueError:
+        print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
+        raise typer.Exit(1)
 
     capitol = CapitolTradesSource(data_dir=data_dir, read_only=False)
     try:
@@ -687,8 +696,12 @@ def validate(
         n_trials *= len(v)
     print(f"Running validation with {n_trials} configs (trials for snooping correction)")
 
-    db_path = Path(data_dir) / "congress.duckdb"
-    out_path = Path(data_dir) / "validation_results.json"
+    settings = Settings()
+    if data_dir and data_dir != "data":
+        settings.data.data_dir = data_dir
+    resolved_data_dir = Path(settings.data.data_dir)
+    db_path = resolved_data_dir / "congress.duckdb"
+    out_path = resolved_data_dir / "validation_results.json"
     try:
         run_validation(
             db_path=db_path,

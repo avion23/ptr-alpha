@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from functools import wraps
 import logging
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +16,8 @@ from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer import analysis
 
 logger = logging.getLogger(__name__)
+
+_VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 
 
 class DisplayMode(StrEnum):
@@ -251,10 +254,8 @@ def run_backtest_pipeline(
     price_end = params.end_date + timedelta(days=params.horizon + 10)
     all_tickers = all_transactions["ticker"].unique().tolist()
     all_tickers = [t for t in all_tickers if t and str(t).strip() and str(t) != "nan"]
-    # Filter out non-stock tickers (OCR garbage) - same regex as datasources.py
-    import re
-    _valid_ticker_re = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
-    all_tickers = [t for t in all_tickers if _valid_ticker_re.match(str(t))]
+    # Filter out non-stock tickers (OCR garbage)
+    all_tickers = [t for t in all_tickers if _VALID_TICKER_RE.match(str(t))]
     all_tickers = sorted(set(all_tickers) | {"SPY"})
 
     # Create price snapshot for reproducibility

@@ -405,12 +405,14 @@ class Database:
         start_date: date,
         end_date: date,
         max_staleness_days: int = 30,
+        resolver: TickerResolver | None = None,
     ) -> pd.DataFrame:
         if not tickers:
             return pd.DataFrame()
 
         # Resolve tickers so the ASOF join can match both raw and resolved symbols
-        resolver = TickerResolver()
+        if resolver is None:
+            resolver = TickerResolver()
         resolutions = resolver.resolve_batch(tickers)
         # Build expanded ticker set: raw tickers + their resolved yfinance symbols
         expanded_tickers: list[str] = []

@@ -39,15 +39,18 @@ class CapitolTradesError(Exception):
 class CapitolTradesSource(TransactionSource):
     """Fetches congressional trading data from the Capitol Trades API."""
 
-    def __init__(self, data_dir: str | Path = "data", read_only: bool = False):
+    def __init__(self, data_dir: str | Path = "data", read_only: bool = False, db: Database | None = None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.db = Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        self._owns_db = db is None
+        self.db = db if db is not None else Database(self.data_dir / "congress.duckdb", read_only=read_only)
         self.session = requests.Session()
         self.session.headers["Accept"] = "application/json"
 
     def close(self) -> None:
-        self.db.close()
+        self.session.close()
+        if self._owns_db:
+            self.db.close()
 
     def __enter__(self):
         return self

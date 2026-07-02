@@ -208,8 +208,6 @@ def run_single_backtest(
         all_transactions, prices, params, signals,
         bayes_prior_strength, decay_lambda, scoring_mode,
     )
-    # Restate formula explicitly so inspect.getsource callers see it here:
-    # result.alpha_slope = round(result.rank1_alpha - result.rank5_alpha, 2)
     return result
 
 
@@ -330,7 +328,8 @@ def sweep_configs(
         p_val = (
             float(2.0 * stats.norm.sf(abs(t_stat)))
             if math.isfinite(t_stat)
-            else 0.0
+            # Only positive-alpha configs are selection candidates; -inf must not survive BH.
+            else 0.0 if t_stat > 0 else 1.0
         )
 
         row = asdict(result)

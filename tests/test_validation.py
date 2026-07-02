@@ -16,6 +16,7 @@ from analyzer.validation import (
     newey_west_tstat,
     run_single_backtest,
     select_config,
+    sweep_configs,
 )
 
 
@@ -166,6 +167,76 @@ class TestSelectConfig:
         result = select_config(df, alpha=0.05)
         assert result["alpha_slope"] == 99.0
         assert result["n_survivors"] == 4
+
+    def test_negative_infinite_tstat_does_not_survive_bh(self):
+        """A degenerate negative-alpha config gets p=1 and cannot survive BH."""
+        grid = {
+            "horizon": [60],
+            "frequency_days": [30],
+            "training_lookback_days": [365],
+            "min_buyers": [2, 3],
+            "top_n": [5],
+            "decay_lambda": [0.005],
+            "bayes_prior_strength": [20.0],
+            "scoring_mode": ["shrunk_alpha"],
+        }
+
+        def fake_backtest_core(
+            all_tx, prices, params, signals, bayes_prior_strength, decay_lambda, scoring_mode
+        ):
+            if params.min_buyers == 2:
+                result = SweepResult(
+                    horizon=params.horizon,
+                    frequency_days=params.frequency_days,
+                    training_lookback_days=params.training_lookback_days,
+                    min_buyers=params.min_buyers,
+                    top_n=params.top_n,
+                    decay_lambda=decay_lambda,
+                    bayes_prior_strength=bayes_prior_strength,
+                    scoring_mode=scoring_mode,
+                    overall_alpha=-5.0,
+                    alpha_slope=99.0,
+                )
+                return result, pd.Series([-5.0, -5.0, -5.0])
+
+            result = SweepResult(
+                horizon=params.horizon,
+                frequency_days=params.frequency_days,
+                training_lookback_days=params.training_lookback_days,
+                min_buyers=params.min_buyers,
+                top_n=params.top_n,
+                decay_lambda=decay_lambda,
+                bayes_prior_strength=bayes_prior_strength,
+                scoring_mode=scoring_mode,
+                overall_alpha=5.0,
+                alpha_slope=1.0,
+            )
+            return result, pd.Series([5.0, 5.0, 5.0])
+
+        with (
+            patch("analyzer.validation.analysis.calculate_signal_potential", return_value=pd.DataFrame()),
+            patch("analyzer.validation._backtest_core", side_effect=fake_backtest_core),
+        ):
+            sweep_df = sweep_configs(
+                all_tx=pd.DataFrame(),
+                prices=pd.DataFrame(),
+                entry_prices=pd.DataFrame(),
+                grid=grid,
+                start=date(2022, 1, 1),
+                end=date(2022, 3, 1),
+            )
+
+        negative = sweep_df.loc[sweep_df["min_buyers"] == 2].iloc[0]
+        positive = sweep_df.loc[sweep_df["min_buyers"] == 3].iloc[0]
+        assert negative["nw_tstat"] == -math.inf
+        assert negative["p_value"] == 1.0
+        assert positive["nw_tstat"] == math.inf
+        assert positive["p_value"] == 0.0
+
+        selected = select_config(sweep_df, alpha=0.05)
+        assert selected["min_buyers"] == 3
+        assert selected["n_survivors"] == 1
+        assert selected["survives_correction"] is True
 
 
 # ---------------------------------------------------------------------------

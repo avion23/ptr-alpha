@@ -611,7 +611,7 @@ def validate(
     train_end: str = typer.Option("2023-12-31", help="Training window end (YYYY-MM-DD)"),
     test_start: str = typer.Option("2024-01-01", help="Test window start (YYYY-MM-DD)"),
     test_end: str = typer.Option("2025-06-30", help="Test window end (YYYY-MM-DD)"),
-    full_grid: bool = typer.Option(False, "--full-grid", help="Use full 648-combo grid (slow)"),
+    full_grid: bool = typer.Option(False, "--full-grid", help="Use full 1296-combo grid (slow)"),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """

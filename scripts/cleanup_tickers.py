@@ -4,7 +4,20 @@ Distinguishes "matched to None" (explicit NULL) vs "no match" (leave alone).
 """
 from __future__ import annotations
 import duckdb
-from analyzer.parsing.cells import _TICKER_BLACKLIST
+
+# IMPORTANT: do NOT use the parser's _TICKER_BLACKLIST here.
+# That set contains single-letter tokens ('A', 'O', 'X', 'S', 'P', 'E') that
+# the PDF parser blocks as ambiguous parse-context signals, but they ARE valid
+# real tickers (A=Agilent, O=Realty Income, X=US Steel, S=SentinelOne,
+# P=Primerica, E=Eni). Nulling them in the DB would permanently destroy valid
+# trades. Only the 16 *confirmed* garbage fragments — partial company-name words
+# that OCR/pdftotext captured in parentheses instead of actual tickers — are
+# safe to null out here.
+_CONFIRMED_GARBAGE: frozenset[str] = frozenset({
+    'UNIT', 'TECH', 'NORT', 'MARY', 'CITI', 'AMER',
+    'BERK', 'BANK', 'MICH', 'WISC', 'KING', 'SOUT',
+    'EAST', 'WEST', 'PORT', 'LAKE',
+})
 
 # Mappings: company name prefix -> proper ticker
 NAME_TO_TICKER = {
@@ -136,13 +149,14 @@ def main():
             con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [tok])
             total_nulled += cnt
 
-    # Fix 6: null out blacklisted garbage fragments regardless of length
-    # (the query above only targets length > 5; short confirmed-garbage tickers
-    # like UNIT, TECH, BERK, BANK etc. must also be cleared).
-    for blacklisted in sorted(_TICKER_BLACKLIST):
-        cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [blacklisted]).fetchone()[0]
+    # Fix 6: null out confirmed garbage fragments regardless of length.
+    # The main query above only targets tickers with length > 5; short fragments
+    # like UNIT, TECH, BERK, BANK etc. slip through. Use _CONFIRMED_GARBAGE (NOT
+    # the full parser blacklist — see module-level comment).
+    for garbage in sorted(_CONFIRMED_GARBAGE):
+        cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [garbage]).fetchone()[0]
         if cnt:
-            con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [blacklisted])
+            con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [garbage])
             total_nulled += cnt
     
     con.execute("CHECKPOINT")

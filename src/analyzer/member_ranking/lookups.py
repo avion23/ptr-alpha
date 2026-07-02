@@ -121,6 +121,11 @@ def _build_ranking_dicts(
 
     # Fix 7: add canonical-key aliases to all lookup dicts so any name variant
     # (e.g. 'MICHAEL MCCAUL' vs 'MICHAEL T. MCCAUL') resolves to the same entry.
+    # Collision note: when two genuinely different members collapse to the same
+    # canonical key (rare but possible), the last writer wins for the alias entry.
+    # Exact original-name keys always take precedence (the `if canonical_member_key(k) not in d`
+    # guard prevents overwriting them); collisions only affect fallback lookups for
+    # members not in the rankings under their exact name.
     def _add_canonical_aliases(d: dict) -> dict:
         aliases = {canonical_member_key(k): v for k, v in d.items() if canonical_member_key(k) not in d}
         d.update(aliases)

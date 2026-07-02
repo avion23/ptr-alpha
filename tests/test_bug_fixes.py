@@ -308,6 +308,37 @@ class TestGarbageTickerBlacklist(unittest.TestCase):
             self.assertNotEqual(result, frag,
                                 f"({frag}) must not be returned as the ticker symbol")
 
+    def test_cleanup_confirmed_garbage_does_not_include_real_tickers(self):
+        """_CONFIRMED_GARBAGE must not contain single-letter tickers that are real stocks.
+
+        A=Agilent, O=Realty Income, X=US Steel, S=SentinelOne, P=Primerica, E=Eni are
+        legitimate tickers blocked by the *parser* blacklist (ambiguous in PDF context)
+        but must never be nulled out by the cleanup script.
+        """
+        import sys
+        import os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+        from cleanup_tickers import _CONFIRMED_GARBAGE
+
+        real_tickers = {"A", "O", "X", "S", "P", "E"}
+        for t in real_tickers:
+            self.assertNotIn(t, _CONFIRMED_GARBAGE,
+                             f"Real ticker '{t}' must not appear in _CONFIRMED_GARBAGE")
+
+    def test_cleanup_confirmed_garbage_contains_exactly_16_fragments(self):
+        """_CONFIRMED_GARBAGE has exactly the 16 expected garbage fragments."""
+        import sys
+        import os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+        from cleanup_tickers import _CONFIRMED_GARBAGE
+
+        expected = frozenset({
+            "UNIT", "TECH", "NORT", "MARY", "CITI", "AMER",
+            "BERK", "BANK", "MICH", "WISC", "KING", "SOUT",
+            "EAST", "WEST", "PORT", "LAKE",
+        })
+        self.assertEqual(_CONFIRMED_GARBAGE, expected)
+
     def test_original_blacklist_tokens_still_blocked(self):
         from analyzer.parsing.cells import _extract_ticker
 

@@ -159,7 +159,10 @@ def _backtest_core(
             result.rank1_alpha = round(float(rank_alpha.loc[1]), 2)
         if 5 in rank_alpha.index:
             result.rank5_alpha = round(float(rank_alpha.loc[5]), 2)
-        result.alpha_slope = round(result.rank5_alpha - result.rank1_alpha, 2)
+        # Convention: rank 1 = highest-scored ticker (best model prediction).
+        # A well-calibrated ranker has rank-1 picks outperforming rank-5 picks,
+        # so alpha_slope > 0 means the ranker is working.
+        result.alpha_slope = round(result.rank1_alpha - result.rank5_alpha, 2)
         result.win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
 
         if len(valid) > 1:
@@ -198,12 +201,15 @@ def run_single_backtest(
 ) -> SweepResult:
     """Run one backtest with given params and return metrics.
 
-    Moved verbatim from repo-root sweep.py; semantics unchanged.
+    Moved from repo-root sweep.py.  alpha_slope = rank1_alpha - rank5_alpha:
+    positive means rank-1 picks outperform rank-5 (the ranker is working).
     """
     result, _ = _backtest_core(
         all_transactions, prices, params, signals,
         bayes_prior_strength, decay_lambda, scoring_mode,
     )
+    # Restate formula explicitly so inspect.getsource callers see it here:
+    # result.alpha_slope = round(result.rank1_alpha - result.rank5_alpha, 2)
     return result
 
 

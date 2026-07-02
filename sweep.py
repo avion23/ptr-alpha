@@ -108,7 +108,7 @@ def main():
     print(f"Results saved to {out_path}")
 
     # Top 10 by alpha_slope
-    print("\n=== Top 10 by alpha_slope (rank5 - rank1) ===")
+    print("\n=== Top 10 by alpha_slope (rank1 - rank5) ===")
     cols = [
         "horizon", "frequency_days", "training_lookback_days",
         "min_buyers", "top_n", "decay_lambda", "bayes_prior_strength",

@@ -64,9 +64,18 @@ def _compute_member_stats(
         "avg_total_spy_alpha_pct": round(avg_total_spy_alpha, 2),
     }
     if threshold is not None:
-        stats["peak_hit_rate_pct"] = round((grp["peak_potential_pct"] > threshold).mean() * 100, 2)
+        # Bug #3: (NaN > threshold) evaluates to False, making NaN rows count
+        # as misses in both numerator and denominator.  Exclude NaN rows first.
+        valid_peak = grp["peak_potential_pct"].dropna()
+        stats["peak_hit_rate_pct"] = (
+            round((valid_peak > threshold).mean() * 100, 2) if len(valid_peak) > 0 else float("nan")
+        )
         if "total_return_pct" in grp.columns:
-            stats["realized_hit_rate_pct"] = round((grp["total_return_pct"] > 0).mean() * 100, 2)
+            # Bug #3: same NaN-as-miss pattern for realized returns.
+            valid_ret = grp["total_return_pct"].dropna()
+            stats["realized_hit_rate_pct"] = (
+                round((valid_ret > 0).mean() * 100, 2) if len(valid_ret) > 0 else float("nan")
+            )
     return stats
 
 

@@ -353,8 +353,10 @@ class TestEvaluateBacktest(unittest.TestCase):
         )
         self.assertTrue(result.empty)
 
-    def test_missing_exit_price_skips_row(self):
-        # Include SPY through exit but cut AAPL/GOOG short, pad with NaN
+    def test_delisted_ticker_included_at_last_price(self):
+        # Bug 2 regression: tickers with data ending before the exit date
+        # (delisted/suspended) must be included at their last available price,
+        # NOT silently dropped from both numerator and denominator.
         full_dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
         short_end = pd.Timestamp("2025-01-15")
         n_full = len(full_dates)
@@ -369,8 +371,12 @@ class TestEvaluateBacktest(unittest.TestCase):
         result = evaluate_backtest(
             self.recommendations, prices, pd.Timestamp("2025-01-01"), horizon=90
         )
-        # Both AAPL/GOOG lack exit prices → all rows skipped
-        self.assertTrue(result.dropna(subset=["bt_return_pct"]).empty)
+        # Both AAPL/GOOG have data that ends before exit → both included at last price
+        evaluated = result.dropna(subset=["bt_return_pct"])
+        self.assertEqual(len(evaluated), 2, "delisted tickers must be included, not dropped")
+        self.assertTrue(evaluated["bt_delisted"].all(), "both should be flagged as delisted")
+        # Coverage counts should be propagated in attrs
+        self.assertEqual(result.attrs.get("n_delisted"), 2)
 
     def test_missing_entry_price_skips_row(self):
         no_aapl = self.prices.drop(columns=["AAPL"])
@@ -384,13 +390,16 @@ class TestEvaluateBacktest(unittest.TestCase):
 class TestSummarizeBacktest(unittest.TestCase):
 
     def test_groups_by_rank(self):
+        # Bug 4: summary now includes SPY_BH baseline row in addition to
+        # per-rank rows and ALL. len == 4 (rank1, rank2, ALL, SPY_BH).
         results = pd.DataFrame({
             "rank": [1, 1, 2, 2],
             "bt_return_pct": [10.0, -5.0, 20.0, 15.0],
             "bt_alpha_pct": [5.0, -8.0, 15.0, 10.0],
+            "bt_spy_return_pct": [3.0, 1.0, 4.0, 2.0],
         })
         summary = summarize_backtest(results)
-        self.assertEqual(len(summary), 3)
+        self.assertEqual(len(summary), 4)  # rank1, rank2, ALL, SPY_BH
         rank1 = summary[summary["rank"] == 1].iloc[0]
         rank2 = summary[summary["rank"] == 2].iloc[0]
         self.assertEqual(rank1["count"], 2)
@@ -417,14 +426,352 @@ class TestSummarizeBacktest(unittest.TestCase):
         self.assertTrue(summary.empty)
 
     def test_all_nan_returns_dropped(self):
+        # Bug 4: summary now includes SPY_BH baseline, so len == 3 (rank1, ALL, SPY_BH).
         results = pd.DataFrame({
             "rank": [1, 2],
             "bt_return_pct": [10.0, None],
             "bt_alpha_pct": [5.0, None],
+            "bt_spy_return_pct": [3.0, None],
         })
         summary = summarize_backtest(results)
-        self.assertEqual(len(summary), 2)
+        self.assertEqual(len(summary), 3)  # rank1, ALL, SPY_BH (rank2 dropped as NaN)
         self.assertEqual(summary[summary["rank"] == 1].iloc[0]["count"], 1)
+
+
+class TestBacktestCorrectnessRegressions(unittest.TestCase):
+    """Regression tests for the four backtest-correctness bugs fixed in
+    backtest/prices.py, backtest/evaluate.py, and backtest/summary.py.
+    Each test proves one specific invariant holds after the fix."""
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _make_prices(dates, tickers_data: dict) -> pd.DataFrame:
+        return pd.DataFrame(tickers_data, index=dates)
+
+    @staticmethod
+    def _single_rec(ticker="AAPL"):
+        return pd.DataFrame({
+            "rank": [1],
+            "ticker": [ticker],
+            "signal_score": [50.0],
+            "num_buyers": [2],
+        })
+
+    # ---- Bug 1a: default use_dip_entry=False, entry = as_of price
+
+    def test_default_entry_is_as_of_price_not_future_dip(self):
+        """Bug 1a: use_dip_entry defaults to False — entry must be the price at
+        as_of, not a future dip price obtained by looking forward."""
+        as_of = pd.Timestamp("2025-01-02")
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        # At as_of the price is 100; one day later it drops to 80 (a big dip).
+        # With use_dip_entry=False the entry must be ~100, not 80.
+        prices_arr = [100.0 if d <= as_of else 80.0 for d in dates]
+        spy_arr = [400.0 + i * 0.01 for i in range(len(dates))]
+        prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
+        recs = self._single_rec()
+
+        result = evaluate_backtest(recs, prices, as_of, horizon=90)  # default use_dip_entry=False
+        self.assertFalse(result.dropna(subset=["bt_return_pct"]).empty, "trade should be evaluated")
+        # Entry must be the as_of price (100), not the future dip (80)
+        self.assertAlmostEqual(result.iloc[0]["bt_entry_price"], 100.0, places=1)
+
+    # ---- Bug 1b: use_dip_entry=True — no fill when no dip; SPY aligned
+
+    def test_dip_entry_skips_position_when_no_dip_occurs(self):
+        """Bug 1b: when use_dip_entry=True and no pullback occurs within
+        max_wait_days, the position must NOT be taken (no fallback fill)."""
+        as_of = pd.Timestamp("2025-01-02")
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        # Price rises monotonically — no 5% pullback will occur
+        prices_arr = [100.0 + i * 0.3 for i in range(len(dates))]
+        spy_arr = [400.0 + i * 0.01 for i in range(len(dates))]
+        prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
+        recs = self._single_rec()
+
+        result = evaluate_backtest(recs, prices, as_of, horizon=90,
+                                   use_dip_entry=True, pullback_pct=0.05, max_wait_days=10)
+        # No dip → position not taken → bt_return_pct is NaN
+        self.assertTrue(result.dropna(subset=["bt_return_pct"]).empty,
+                        "no dip → position must not be taken (no fallback fill)")
+
+    def test_spy_window_aligned_with_dip_entry_date(self):
+        """Bug 1b: when use_dip_entry=True the SPY return must cover the same
+        calendar window as the position [dip_date, dip_date + horizon], not
+        the shifted [as_of, as_of + horizon] window."""
+        as_of = pd.Timestamp("2025-01-01")
+        horizon = 30
+        # Dip occurs on Jan 6 (5 calendar days after Jan 1).
+        dip_date = pd.Timestamp("2025-01-06")
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        prices_arr = [100.0 if d < dip_date else 94.0 for d in dates]  # 6% drop
+        # Make SPY non-flat so the two windows give different returns.
+        spy_arr = [400.0 + i * 0.5 for i in range(len(dates))]
+        prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
+        recs = self._single_rec()
+
+        result_dip = evaluate_backtest(recs, prices, as_of, horizon=horizon,
+                                       use_dip_entry=True, pullback_pct=0.05, max_wait_days=10)
+        valid = result_dip.dropna(subset=["bt_return_pct"])
+        # Finding 4 fix: assertFalse instead of skipTest so regressions are visible.
+        self.assertFalse(valid.empty, "dip should have been triggered by the 6% price drop on Jan 6")
+
+        # entry_delay should be 5 calendar days (Jan 1 → Jan 6)
+        self.assertEqual(valid.iloc[0]["bt_entry_delay"], 5)
+
+        # SPY return in the dip window must differ from the as_of window
+        # because SPY rises 0.5/day and 5 days of shift matters.
+        spy_from_as_of = round((spy_arr[dates.get_loc(as_of + pd.Timedelta(days=horizon))]
+                                / spy_arr[dates.get_loc(as_of)] - 1) * 100, 2)
+        spy_from_dip = valid.iloc[0]["bt_spy_return_pct"]
+        # The two windows must be different (SPY is non-flat)
+        self.assertNotAlmostEqual(
+            spy_from_dip, spy_from_as_of, places=1,
+            msg="SPY return in dip window must differ from as_of window when entry is delayed",
+        )
+
+    # ---- Bug 1c: calendar-day delay, not array-row count
+
+    def test_dip_entry_delay_uses_calendar_days_not_trading_rows(self):
+        """Bug 1c: entry_delay must be calendar days, not the array-row offset.
+        A dip on Monday after a Friday as_of spans 3 calendar days but only
+        1 trading row (no weekend rows in the price array)."""
+        as_of = pd.Timestamp("2025-01-03")   # Friday
+        dip_date = pd.Timestamp("2025-01-06")  # Monday: 3 calendar days, 1 trading row
+        # Use only business-day prices so the array index gap is 1 but calendar gap is 3
+        bdays = pd.date_range("2024-12-02", "2025-06-01", freq="B")
+        prices_arr = [90.0 if d >= dip_date else 100.0 for d in bdays]  # 10% drop
+        spy_arr = [400.0 + i * 0.1 for i in range(len(bdays))]
+        prices = self._make_prices(bdays, {"AAPL": prices_arr, "SPY": spy_arr})
+        recs = self._single_rec()
+
+        result = evaluate_backtest(recs, prices, as_of, horizon=90,
+                                   use_dip_entry=True, pullback_pct=0.05, max_wait_days=10)
+        valid = result.dropna(subset=["bt_return_pct"])
+        self.assertFalse(valid.empty, "dip should have been triggered by the 10% price drop on Jan 6")
+        entry_delay = valid.iloc[0]["bt_entry_delay"]
+        # Old buggy code: would return 1 (array-row index hits[0])
+        # Correct code:   must return 3 (calendar days Jan 3 → Jan 6)
+        self.assertEqual(entry_delay, 3,
+                         "entry_delay must be calendar days (3), not trading-row count (1)")
+
+    # ---- Bug 2: survivorship — delisted ticker included at last price
+
+    def test_no_price_at_all_is_skipped_and_counted(self):
+        """Bug 2: a ticker with no price data at all (column absent) must be
+        skipped and counted in n_no_price, not n_delisted."""
+        as_of = pd.Timestamp("2025-01-01")
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        spy_arr = [400.0 + i * 0.01 for i in range(len(dates))]
+        # AAPL column is absent — no data at all
+        prices = self._make_prices(dates, {"SPY": spy_arr})
+        recs = self._single_rec("AAPL")
+
+        result = evaluate_backtest(recs, prices, as_of, horizon=90)
+        self.assertTrue(result.dropna(subset=["bt_return_pct"]).empty, "no-price ticker must be skipped")
+        self.assertEqual(result.attrs.get("n_no_price", 0), 1)
+        self.assertEqual(result.attrs.get("n_delisted", 0), 0)
+
+    def test_delisted_ticker_uses_last_available_price_and_is_flagged(self):
+        """Bug 2: a ticker whose data ends before the exit date (delisted) must
+        be included at its last available price and flagged bt_delisted=True."""
+        as_of = pd.Timestamp("2025-01-01")
+        horizon = 90
+        last_day = pd.Timestamp("2025-01-20")  # data ends 10+ days before exit
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        n_alive = len(pd.date_range("2024-12-01", last_day, freq="D"))
+        # AAPL prices: 100 → 110 while alive, then NaN
+        aapl_arr = [100.0 + i * (10.0 / (n_alive - 1)) for i in range(n_alive)] + \
+                   [float("nan")] * (len(dates) - n_alive)
+        spy_arr = [400.0 + i * 0.02 for i in range(len(dates))]
+        prices = self._make_prices(dates, {"AAPL": aapl_arr, "SPY": spy_arr})
+        recs = self._single_rec("AAPL")
+
+        result = evaluate_backtest(recs, prices, as_of, horizon=horizon)
+        valid = result.dropna(subset=["bt_return_pct"])
+        self.assertEqual(len(valid), 1, "delisted ticker must be included")
+        self.assertTrue(valid.iloc[0]["bt_delisted"], "bt_delisted flag must be True")
+        self.assertAlmostEqual(valid.iloc[0]["bt_exit_price"], 110.0, places=0,
+                               msg="exit must use the last available price")
+        self.assertEqual(result.attrs.get("n_delisted"), 1)
+        self.assertEqual(result.attrs.get("n_no_price"), 0)
+
+    # ---- Bug 3: merge — one output row per recommendation
+
+    def test_duplicate_ticker_in_recs_produces_two_rows_not_four(self):
+        """Bug 3: two recommendations for the same ticker must produce exactly
+        two output rows, not 2×2=4 (fan-out from ticker-based merge)."""
+        as_of = pd.Timestamp("2025-01-01")
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        n = len(dates)
+        prices = self._make_prices(dates, {
+            "AAPL": [100.0 + i * 0.1 for i in range(n)],
+            "SPY": [400.0 + i * 0.02 for i in range(n)],
+        })
+        # Two separate recommendations for the same ticker
+        recs = pd.DataFrame({
+            "rank": [1, 2],
+            "ticker": ["AAPL", "AAPL"],
+            "signal_score": [50.0, 30.0],
+            "num_buyers": [3, 2],
+        })
+
+        result = evaluate_backtest(recs, prices, as_of, horizon=90)
+        self.assertEqual(len(result), 2,
+                         "duplicate-ticker recommendations must not fan-out: expected 2 rows not 4")
+        self.assertEqual(list(result["rank"]), [1, 2])
+        # Both rows should have the same bt_entry_price (same ticker, same as_of)
+        self.assertEqual(result.iloc[0]["bt_entry_price"], result.iloc[1]["bt_entry_price"])
+
+    # ---- Bug 4: SPY baseline in summary, coverage counts
+
+    def test_summary_includes_spy_baseline_row(self):
+        """Bug 4: summarize_backtest must include a SPY_BH baseline row so
+        callers can compare strategy returns against buy-and-hold SPY."""
+        results = pd.DataFrame({
+            "rank": [1, 1, 2],
+            "bt_return_pct": [10.0, -5.0, 20.0],
+            "bt_alpha_pct": [5.0, -8.0, 15.0],
+            "bt_spy_return_pct": [4.0, 2.0, 3.0],
+        })
+        summary = summarize_backtest(results)
+        self.assertIn("SPY_BH", summary["rank"].values, "SPY_BH baseline row must be present")
+        spy_row = summary[summary["rank"] == "SPY_BH"].iloc[0]
+        self.assertEqual(spy_row["count"], 3)
+        # All three SPY returns are positive → win_rate = 100 %
+        self.assertEqual(spy_row["win_rate_pct"], 100.0)
+        self.assertAlmostEqual(spy_row["avg_return_pct"], (4.0 + 2.0 + 3.0) / 3, places=2)
+        self.assertEqual(spy_row["avg_alpha_pct"], 0.0)  # SPY vs itself is zero
+
+    def test_summary_propagates_coverage_counts_from_attrs(self):
+        """Bug 4: summarize_backtest must propagate n_no_price and n_delisted
+        from result.attrs so coverage gaps are visible to callers."""
+        results = pd.DataFrame({
+            "rank": [1],
+            "bt_return_pct": [10.0],
+            "bt_alpha_pct": [5.0],
+            "bt_spy_return_pct": [3.0],
+        })
+        results.attrs["n_no_price"] = 5
+        results.attrs["n_delisted"] = 2
+        summary = summarize_backtest(results)
+        self.assertEqual(summary.attrs.get("n_no_price"), 5)
+        self.assertEqual(summary.attrs.get("n_delisted"), 2)
+
+    def test_coverage_counts_flow_end_to_end(self):
+        """Integration: evaluate_backtest → summarize_backtest propagates
+        n_no_price and n_delisted end-to-end via .attrs."""
+        as_of = pd.Timestamp("2025-01-01")
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        n = len(dates)
+        last_alive = pd.Timestamp("2025-01-20")
+        n_alive = len(pd.date_range("2024-12-01", last_alive, freq="D"))
+        prices = self._make_prices(dates, {
+            # GOOG: full data, evaluated normally
+            "GOOG": [200.0 + i * 0.1 for i in range(n)],
+            # AAPL: delisted early (after as_of → counts as n_delisted)
+            "AAPL": [100.0] * n_alive + [float("nan")] * (n - n_alive),
+            "SPY": [400.0 + i * 0.02 for i in range(n)],
+        })
+        recs = pd.DataFrame({
+            "rank": [1, 2, 3],
+            "ticker": ["GOOG", "AAPL", "MSFT"],  # MSFT has no price data
+            "signal_score": [50.0, 40.0, 30.0],
+            "num_buyers": [3, 2, 2],
+        })
+        ev = evaluate_backtest(recs, prices, as_of, horizon=90)
+        summary = summarize_backtest(ev)
+        self.assertEqual(summary.attrs.get("n_no_price"), 1)   # MSFT
+        self.assertEqual(summary.attrs.get("n_delisted"), 1)   # AAPL
+
+    # ---- Finding 2: ticker delisted BEFORE as_of must NOT be included
+
+    def test_ticker_delisted_before_as_of_is_not_included(self):
+        """Finding 2: if a ticker last traded before as_of_date it was never
+        actionable.  It must NOT be included with bt_delisted=True (which would
+        produce a spurious near-zero return of pure slippage) and must be
+        counted in n_no_price, not n_delisted."""
+        as_of = pd.Timestamp("2025-01-15")
+        # Ticker last traded Dec 31 — 15 days before as_of, within the 30-day
+        # entry staleness window so the entry lookup succeeds.  The exit date
+        # is 90 days later (~April 15).  The fallback exit price is also Dec 31
+        # (same stale price), so entry ≈ exit ≈ pure slippage ≈ -0.2%.
+        last_trade = pd.Timestamp("2024-12-31")
+        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        n_alive = len(pd.date_range("2024-12-01", last_trade, freq="D"))
+        aapl_arr = [100.0] * n_alive + [float("nan")] * (len(dates) - n_alive)
+        spy_arr = [400.0 + i * 0.02 for i in range(len(dates))]
+        prices = self._make_prices(dates, {"AAPL": aapl_arr, "SPY": spy_arr})
+        recs = self._single_rec("AAPL")
+
+        result = evaluate_backtest(recs, prices, as_of, horizon=90)
+        # Ticker was already dead at recommendation time → must NOT be included
+        self.assertTrue(
+            result.dropna(subset=["bt_return_pct"]).empty,
+            "ticker delisted before as_of must not be included (not tradeable at rec time)",
+        )
+        # Must be counted as n_no_price (untradeable), NOT n_delisted
+        self.assertEqual(result.attrs.get("n_no_price", 0), 1,
+                         "pre-as_of delisting must be counted in n_no_price")
+        self.assertEqual(result.attrs.get("n_delisted", 0), 0,
+                         "pre-as_of delisting must NOT increment n_delisted")
+
+    # ---- Finding 1: multi-date concat must preserve summed coverage counts
+
+    def test_multi_date_concat_preserves_coverage_counts(self):
+        """Finding 1: pd.concat drops differing .attrs in pandas 3.x.
+        The pipeline must accumulate per-date counts explicitly so that
+        summarize_backtest sees the correct totals after concatenation."""
+        # Simulate two evaluate_backtest calls (two as_of dates), each with
+        # different coverage counts, then concat and verify summarize sees sum.
+        dates = pd.date_range("2024-12-01", "2025-09-01", freq="D")
+        n = len(dates)
+        last_alive = pd.Timestamp("2025-02-01")
+        n_alive = len(pd.date_range("2024-12-01", last_alive, freq="D"))
+
+        prices = self._make_prices(dates, {
+            "AAPL": [100.0 + i * 0.05 for i in range(n)],
+            # GOOG delisted after last_alive
+            "GOOG": [200.0] * n_alive + [float("nan")] * (n - n_alive),
+            "SPY": [400.0 + i * 0.02 for i in range(n)],
+        })
+
+        # as_of_1: AAPL OK, MSFT missing (n_no_price=1), GOOG alive (n_delisted=0)
+        recs1 = pd.DataFrame({
+            "rank": [1, 2], "ticker": ["AAPL", "MSFT"],
+            "signal_score": [50.0, 40.0], "num_buyers": [2, 2],
+        })
+        ev1 = evaluate_backtest(recs1, prices, pd.Timestamp("2025-01-01"), horizon=90)
+        self.assertEqual(ev1.attrs.get("n_no_price", 0), 1)   # MSFT
+
+        # as_of_2: AAPL OK, GOOG now delisted during hold (n_delisted=1)
+        recs2 = pd.DataFrame({
+            "rank": [1, 2], "ticker": ["AAPL", "GOOG"],
+            "signal_score": [50.0, 40.0], "num_buyers": [2, 2],
+        })
+        ev2 = evaluate_backtest(recs2, prices, pd.Timestamp("2025-01-15"), horizon=90)
+        self.assertEqual(ev2.attrs.get("n_delisted", 0), 1)   # GOOG
+
+        # Mimic the pipeline: sum counts, set on combined, then summarize
+        combined = pd.concat(
+            [ev1.dropna(subset=["bt_return_pct"]),
+             ev2.dropna(subset=["bt_return_pct"])],
+            ignore_index=True,
+        )
+        # pd.concat drops attrs → combined.attrs is {} — must set manually
+        combined.attrs["n_no_price"] = (
+            ev1.attrs.get("n_no_price", 0) + ev2.attrs.get("n_no_price", 0)
+        )
+        combined.attrs["n_delisted"] = (
+            ev1.attrs.get("n_delisted", 0) + ev2.attrs.get("n_delisted", 0)
+        )
+
+        summary = summarize_backtest(combined)
+        self.assertEqual(summary.attrs.get("n_no_price"), 1,
+                         "summed n_no_price must survive concat → summarize")
+        self.assertEqual(summary.attrs.get("n_delisted"), 1,
+                         "summed n_delisted must survive concat → summarize")
 
 
 class TestDatabaseDateRange(DatabaseTestCase):

@@ -17,6 +17,10 @@ _TICKER_BLACKLIST = {
     'THE', 'NEW', 'DEL', 'OLD',
     # Single letters with high false-positive rate in garbled PDFs
     'A', 'I', 'O', 'X', 'Y',
+    # Confirmed garbage fragments present in the DB (partial company name words
+    # that OCR/pdftotext incorrectly captures as ticker symbols)
+    'UNIT', 'TECH', 'NORT', 'MARY', 'CITI', 'AMER', 'BERK', 'BANK', 'MICH', 'WISC',
+    'KING', 'SOUT', 'EAST', 'WEST', 'PORT', 'LAKE',
 }
 
 

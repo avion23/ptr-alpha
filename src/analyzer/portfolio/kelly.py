@@ -133,9 +133,15 @@ def _estimate_win_loss(df: pd.DataFrame, config: KellyConfig) -> tuple[float, fl
     else:
         return config.default_avg_win * 100, config.default_avg_loss * 100
 
-    if not avg_win or avg_win <= 0:
+    # Bug #4: when all returns are positive, the losing-side slice is empty and
+    # .mean() returns NaN.  bool(NaN) is True in Python, so `not avg_loss`
+    # evaluates to False and `NaN <= 0` is also False — the NaN slips through
+    # to compute_payout_ratio, which propagates it to kelly_fraction, yielding
+    # an empty portfolio instead of using the config default.  Explicitly check
+    # for NaN (and the symmetric all-positive / all-negative cases).
+    if pd.isna(avg_win) or avg_win <= 0:
         avg_win = config.default_avg_win * 100
-    if not avg_loss or avg_loss <= 0:
+    if pd.isna(avg_loss) or avg_loss <= 0:
         avg_loss = config.default_avg_loss * 100
     return float(avg_win), float(avg_loss)
 

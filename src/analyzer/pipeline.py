@@ -101,7 +101,8 @@ def pipeline_step(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except AnalyzerError:
+        except AnalyzerError as exc:
+            logger.error("Pipeline step %s failed: %s", func.__name__, exc)
             return False
     return wrapper
 
@@ -286,6 +287,11 @@ def run_backtest_pipeline(
     )
 
     all_results = []
+    # Finding 1 fix: accumulate per-date attrs counts explicitly because
+    # pd.concat of DataFrames with differing .attrs yields attrs={} in
+    # pandas 3.x.  We sum here and set them on the combined frame.
+    total_no_price = 0
+    total_delisted = 0
     for as_of in as_of_dates:
         as_of_ts = pd.Timestamp(as_of)
 
@@ -307,6 +313,8 @@ def run_backtest_pipeline(
             continue
 
         evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
+        total_no_price += evaluated.attrs.get("n_no_price", 0)
+        total_delisted += evaluated.attrs.get("n_delisted", 0)
         evaluated = evaluated.dropna(subset=["bt_return_pct"])
         evaluated.insert(0, "as_of_date", as_of_ts.date())
         all_results.append(evaluated)
@@ -323,6 +331,10 @@ def run_backtest_pipeline(
         return True
 
     combined = pd.concat(all_results, ignore_index=True)
+    # Set accumulated coverage counts on the combined frame so summarize_backtest
+    # can propagate them (Finding 1: pd.concat drops attrs in pandas 3.x).
+    combined.attrs["n_no_price"] = total_no_price
+    combined.attrs["n_delisted"] = total_delisted
 
     print(f"\n{'=' * 60}")
     print("=== Backtest Summary (by rank) ===")
@@ -375,6 +387,8 @@ def _save_results(
             filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
         elif show_signals:
             filename = "top_signals.csv"
+        elif display_mode == DisplayMode.SALE_RANKINGS:
+            filename = "sale_rankings.csv"
         else:
             filename = "member_rankings.csv"
 

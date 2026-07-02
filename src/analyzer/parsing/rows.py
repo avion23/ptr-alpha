@@ -42,7 +42,10 @@ def _process_row(row: list, indexes: dict[str, int] | None = None, next_row: lis
             merged = bool(ticker)
 
         if tx_type and tx_date:
-            return _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date), merged
+            # Fix 5: when a continuation was merged, amount/owner live in next_row
+            # (the original row only had partial asset text with no transaction fields).
+            amount_owner_row = next_row if merged else None
+            return _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date, amount_owner_row=amount_owner_row), merged
         return None, False
     except IndexError:
         return None, False
@@ -73,11 +76,14 @@ def _try_merge_continuation(row, next_row, indexes, asset_cell):
     )
 
 
-def _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date) -> dict:
-    amount_cell = _get_cell(row, indexes.get("amount"))
+def _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date, *, amount_owner_row=None) -> dict:
+    # Fix 5: in continuation-row merges, amount and owner live in the next row
+    # (the original row only had partial asset text). Use amount_owner_row when provided.
+    source = amount_owner_row if amount_owner_row is not None else row
+    amount_cell = _get_cell(source, indexes.get("amount"))
     # Fallback: if amount column not mapped, search all cells for $ pattern
     if amount_cell is None and indexes.get("amount") is None:
-        amount_cell = _find_amount_in_row(row)
+        amount_cell = _find_amount_in_row(source)
     amount_raw, amount_midpoint = _extract_amount_midpoint(amount_cell)
     instrument_type = _extract_instrument_type(asset_cell)
     option_details = _extract_option_details(asset_cell) if instrument_type != 'stock' else {}
@@ -85,7 +91,7 @@ def _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date) -> dict:
         'ticker': ticker,
         'transaction_type': tx_type,
         'transaction_date': tx_date,
-        'owner_code': _extract_owner_code(_get_cell(row, indexes.get("owner"))),
+        'owner_code': _extract_owner_code(_get_cell(source, indexes.get("owner"))),
         'amount_raw': amount_raw,
         'amount_midpoint': amount_midpoint,
         'instrument_type': instrument_type,

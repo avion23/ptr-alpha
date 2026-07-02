@@ -4,12 +4,15 @@ Fetches from https://trades.telep.io/api (free, no auth).
 Supports both per-politician and global trade listing with pagination.
 """
 
+import hashlib
 import logging
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import requests
+
+from analyzer.parsing.cells import _extract_amount_midpoint as _parse_amount_midpoint
 
 from analyzer.database import Database
 from analyzer.interfaces import TransactionSource
@@ -172,11 +175,31 @@ class CapitolTradesSource(TransactionSource):
             amount_max = t.get("amount_max")
             midpoint = self._compute_midpoint(amount_min, amount_max)
 
+            # Fix 2a: fall back to parsing amount_text when numeric fields are absent
+            if midpoint is None:
+                amount_text = t.get("amount_text")
+                if amount_text:
+                    _, midpoint = _parse_amount_midpoint(amount_text)
+
             tx_type_raw = t.get("transaction_type", "")
             tx_type = TX_TYPE_MAP.get(tx_type_raw, tx_type_raw.title())
 
+            # Fix 2b: rows without a real doc_id get a deterministic synthetic ID
+            # so they don't all collapse under one bogus key in the dedup index.
+            raw_doc_id = t.get("doc_id")
+            doc_id_str = str(raw_doc_id) if raw_doc_id is not None else ""
+            if not doc_id_str or doc_id_str == "None":
+                components = "|".join([
+                    t.get("politician_name", ""),
+                    t.get("ticker", "") or "",
+                    str(t.get("transaction_date", "")),
+                    str(t.get("transaction_type", "")),
+                    t.get("amount_text", "") or "",
+                ])
+                doc_id_str = "ct-" + hashlib.sha1(components.encode()).hexdigest()[:16]
+
             rows.append({
-                "doc_id": str(t.get("doc_id", "")),
+                "doc_id": doc_id_str,
                 "member": t.get("politician_name", ""),
                 "ticker": t.get("ticker"),
                 "transaction_date": self._parse_date(t.get("transaction_date")),
@@ -191,8 +214,8 @@ class CapitolTradesSource(TransactionSource):
             })
 
         df = pd.DataFrame(rows)
-        # Drop rows with missing critical fields
-        df = df.dropna(subset=["doc_id", "member", "transaction_date"])
+        # Drop rows with missing critical fields (doc_id is always set now)
+        df = df.dropna(subset=["member", "transaction_date"])
         return df
 
     def _filter_dates(

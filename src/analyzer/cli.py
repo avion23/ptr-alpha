@@ -103,6 +103,11 @@ def analyze(
     if mode not in valid_modes:
         print(f"Error: --mode must be one of {sorted(valid_modes)}", file=sys.stderr)
         raise typer.Exit(1)
+    if mode == "member" and member is None:
+        print("Error: --mode member requires --member NAME", file=sys.stderr)
+        raise typer.Exit(1)
+    if mode == "sales" and member is not None:
+        print("WARNING: --member flag is ignored for --mode sales (sales rankings are aggregate).", file=sys.stderr)
     app_ctx = get_context(ctx, data_dir, read_only=False)
 
     # Freshness check — warn if data looks stale
@@ -111,8 +116,7 @@ def analyze(
             "SELECT MAX(disclosure_date) FROM transactions"
         ).fetchone()[0]
         if _max_date:
-            from datetime import date as _date
-            _age = (_date.today() - _max_date).days
+            _age = (date.today() - _max_date).days
             if _age > 30:
                 print(f"WARNING: Data is {_age} days old (latest: {_max_date}). Run 'ptr-alpha refresh' first.", file=sys.stderr)
     except Exception:
@@ -563,7 +567,7 @@ def refresh(
         print("[4/4] Running Gemini OCR on zero-row PDFs...")
         try:
             from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-            ocr_inserted = run_gemini_ocr_for_year(year, data_dir=data_dir)
+            ocr_inserted = run_gemini_ocr_for_year(year, data_dir=app_ctx.settings.data.data_dir)
             print(f"  Gemini OCR: {ocr_inserted} transactions inserted")
         except Exception as e:
             failed_steps.append("gemini_ocr")

@@ -78,8 +78,17 @@ class Database:
             )
         """)
         self._ensure_transaction_columns()
+        # Fix 1: expand unique key to include amount_raw + owner_code so distinct
+        # same-day lots (different amounts) or SP vs JT trades are not collapsed.
+        # Normalize NULLs to '' first so ON CONFLICT dedupes re-parses of the same row.
+        self.conn.execute(
+            "UPDATE transactions SET owner_code=COALESCE(owner_code,''), amount_raw=COALESCE(amount_raw,'')"
+        )
         self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique")
-        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique ON transactions(doc_id, ticker, transaction_date, member, transaction_type)")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique "
+            "ON transactions(doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code)"
+        )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))"
         )
@@ -186,6 +195,10 @@ class Database:
         for column in ["owner_code", "amount_raw", "amount_midpoint", "instrument_type", "strike_price", "expiry_date", "asset_description"]:
             if column not in df.columns:
                 df[column] = None
+        # Fix 1: normalize NULL → '' for dedup-key columns so ON CONFLICT fires
+        # correctly when re-parsing the same row (NULLs are distinct in DuckDB indexes).
+        df["owner_code"] = df["owner_code"].fillna("").astype(str).replace("None", "")
+        df["amount_raw"] = df["amount_raw"].fillna("").astype(str).replace("None", "")
         df["created_at"] = datetime.now()
 
         # Check if asset_description column exists in the table
@@ -206,7 +219,7 @@ class Database:
                        owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
                        asset_description
                 FROM staging_transactions
-                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type) DO UPDATE SET
+                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code) DO UPDATE SET
                     transaction_type = EXCLUDED.transaction_type,
                     disclosure_date = EXCLUDED.disclosure_date,
                     owner_code = EXCLUDED.owner_code,
@@ -227,7 +240,7 @@ class Database:
                 SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
                        owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
                 FROM staging_transactions
-                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type) DO UPDATE SET
+                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code) DO UPDATE SET
                     transaction_type = EXCLUDED.transaction_type,
                     disclosure_date = EXCLUDED.disclosure_date,
                     owner_code = EXCLUDED.owner_code,
@@ -263,12 +276,30 @@ class Database:
               raw_row_count, transaction_count, error_message])
 
     def get_transactions(self, year: int) -> pd.DataFrame:
+        # Fix 8: count and log rows where transaction_date > disclosure_date (OCR date swap)
+        excluded = self.conn.execute(
+            """
+            SELECT COUNT(*) FROM transactions
+            WHERE EXTRACT(YEAR FROM disclosure_date) = ?
+              AND transaction_date IS NOT NULL
+              AND transaction_date > disclosure_date
+            """,
+            [year],
+        ).fetchone()[0]
+        if excluded > 0:
+            logger.debug(
+                "Excluding %d transactions with transaction_date > disclosure_date "
+                "(likely OCR date swap) for year %d",
+                excluded,
+                year,
+            )
         result = self.conn.execute(
             """
             SELECT member, ticker, transaction_date, disclosure_date, transaction_type,
                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date
             FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
+              AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
             ORDER BY disclosure_date DESC
         """,
             [year],
@@ -276,13 +307,31 @@ class Database:
         return result
 
     def get_transactions_by_date_range(self, start_date: date, end_date: date) -> pd.DataFrame:
+        # Fix 8: exclude rows where transaction_date > disclosure_date (OCR date swap)
+        excluded = self.conn.execute(
+            """
+            SELECT COUNT(*) FROM transactions
+            WHERE disclosure_date BETWEEN ? AND ?
+              AND transaction_date IS NOT NULL
+              AND transaction_date > disclosure_date
+            """,
+            [start_date, end_date],
+        ).fetchone()[0]
+        if excluded > 0:
+            logger.debug(
+                "Excluding %d transactions with transaction_date > disclosure_date "
+                "(likely OCR date swap) for date range %s to %s",
+                excluded,
+                start_date,
+                end_date,
+            )
         result = self.conn.execute(
             """
             SELECT member, ticker, transaction_date, disclosure_date, transaction_type,
                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date
             FROM transactions
             WHERE disclosure_date BETWEEN ? AND ?
-              AND transaction_date <= disclosure_date
+              AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
             ORDER BY disclosure_date DESC
         """,
             [start_date, end_date],
@@ -324,6 +373,10 @@ class Database:
         ]
         values_str = ", ".join(values_parts)
 
+        # Fix 3: ASOF join tries resolved_ticker first, then falls back to raw ticker.
+        # YFinancePriceSource caches prices under the raw symbol (e.g. 'BRK.B'), while
+        # the resolver yields 'BRK-B'. The second LEFT ASOF JOIN on the raw ticker
+        # covers the miss when resolved symbol has no cached prices.
         result = self.conn.execute(
             f"""
             WITH ticker_map(raw, resolved) AS (
@@ -336,14 +389,18 @@ class Database:
             )
             SELECT r.member, r.ticker, r.disclosure_date, r.transaction_type,
                    r.owner_code, r.amount_midpoint, r.instrument_type, r.strike_price, r.expiry_date,
-                   p.close AS entry_price, p.date AS entry_price_date
+                   COALESCE(p_res.close, p_raw.close) AS entry_price,
+                   COALESCE(p_res.date, p_raw.date) AS entry_price_date
             FROM resolved_tickers r
-            ASOF JOIN prices p
-              ON r.resolved_ticker = p.ticker
-              AND p.date <= r.disclosure_date
+            ASOF LEFT JOIN prices p_res
+              ON r.resolved_ticker = p_res.ticker
+              AND p_res.date <= r.disclosure_date
+            ASOF LEFT JOIN prices p_raw
+              ON r.ticker = p_raw.ticker
+              AND p_raw.date <= r.disclosure_date
             WHERE r.ticker IN (SELECT UNNEST(?))
               AND r.disclosure_date BETWEEN ? AND ?
-              AND p.close IS NOT NULL
+              AND COALESCE(p_res.close, p_raw.close) IS NOT NULL
         """,
             [expanded_tickers, start_date, end_date],
         ).fetchdf()
@@ -444,9 +501,33 @@ class Database:
         if need_full_fetch:
             return need_full_fetch, all_dates.to_list()
 
-        existing_dates = set(existing["date"].unique())
-        missing_dates = [d for d in all_dates if d not in existing_dates]
-        return [], missing_dates
+        # Fix 4: per-ticker gap detection — don't collapse across tickers globally.
+        # A ticker with one cached row was previously treated as complete because
+        # another ticker covered the date in the union. Check gaps per-ticker instead.
+        existing["date"] = pd.to_datetime(existing["date"])
+        all_dates_set = set(all_dates)
+        per_ticker_dates = existing.groupby("ticker")["date"].apply(set)
+
+        tickers_with_gaps: list[str] = []
+        gap_dates: set = set()
+        for ticker in tickers:
+            if ticker in per_ticker_dates.index:
+                ticker_dates = per_ticker_dates[ticker]
+                gaps = all_dates_set - ticker_dates
+                if gaps:
+                    tickers_with_gaps.append(ticker)
+                    gap_dates.update(gaps)
+
+        if tickers_with_gaps:
+            missing_dates_list = sorted(gap_dates)
+            logger.debug(
+                "Per-ticker price gaps: %d tickers with missing dates (%d distinct dates)",
+                len(tickers_with_gaps),
+                len(missing_dates_list),
+            )
+            return tickers_with_gaps, missing_dates_list
+
+        return [], []
 
     def close(self) -> None:
         self.conn.close()

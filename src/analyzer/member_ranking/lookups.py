@@ -179,13 +179,19 @@ def get_ticker_buyers_with_rankings(
         "disclosure_date": list
     }).reset_index()
 
+    ranking_cols = ["member", "avg_spy_alpha_pct", "purchase_trades"]
+    if "peak_hit_rate_pct" in member_rankings.columns:
+        ranking_cols.append("peak_hit_rate_pct")
     result = pd.merge(
         buyers_with_dates,
-        member_rankings[["member", "avg_spy_alpha_pct", "peak_hit_rate_pct", "purchase_trades"]],
+        member_rankings[ranking_cols],
         on="member",
         how="left"
     )
     result = result.sort_values("avg_spy_alpha_pct", ascending=False, na_position="last")
     result["num_purchases"] = result["transaction_date"].apply(len)
-    return result[["member", "num_purchases", "transaction_date", "disclosure_date",
-                   "avg_spy_alpha_pct", "peak_hit_rate_pct", "purchase_trades"]]
+    return_cols = ["member", "num_purchases", "transaction_date", "disclosure_date",
+                   "avg_spy_alpha_pct", "purchase_trades"]
+    if "peak_hit_rate_pct" in result.columns:
+        return_cols.insert(4, "peak_hit_rate_pct")
+    return result[return_cols]

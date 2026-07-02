@@ -160,7 +160,7 @@ COMPANY_TICKER_MAP = {
     "coinbase": "COIN", "block": "SQ", "square": "SQ", "zoom": "ZM",
     "crowdstrike": "CRWD", "palo alto": "PANW", "cloudflare": "NET",
     "datadog": "DDOG", "mongodb": "MDB", "snowflake": "SNOW", "databricks": "DBX",
-    "twilio": "TWLO", "spotify": "SPOT", "roku": "ROKU", " palantir": "PLTR",
+    "twilio": "TWLO", "spotify": "SPOT", "roku": "ROKU",
     "palantir": "PLTR", "unity": "U", "roblox": "RBLX", "doximity": "DOCS",
     # Finance / Banking
     "jpmorgan": "JPM", "jp morgan": "JPM", "bank of america": "BAC",
@@ -270,7 +270,7 @@ COMPANY_TICKER_MAP = {
     "dynatrace": "DT", "new relic": "NEWR", "jfrog": "FROG",
     "confluent": "CFLT", "elastic": "ESTC", "hashicorp": "HCP",
     "gitlab": "GTLB", "atlassian": "TEAM", "hubspot": "HUBS",
-    "zendesk": "ZEN", "freshworks": "FRSH", " monday.com": "MNDY",
+    "zendesk": "ZEN", "freshworks": "FRSH",
     "monday.com": "MNDY", "c3.ai": "AI", "c3 ai": "AI",
     "openai": "PRIV", "anthropic": "PRIV", "databricks inc": "DBX",
     # Travel / Hospitality

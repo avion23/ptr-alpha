@@ -101,7 +101,7 @@ def _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=Non
         return None
     if max_staleness_days is not None:
         staleness_ns = target - int(idx_ns[pos])
-        if staleness_ns > max_staleness_days * 86_400_000_000_000:
+        if staleness_ns > max_staleness_days * NS_PER_DAY:
             return None
     return float(vals[pos])
 

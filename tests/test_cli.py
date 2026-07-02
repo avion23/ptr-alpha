@@ -90,6 +90,27 @@ class TestCliApp(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1, result.output)
 
+    def test_refresh_fails_when_gemini_ocr_raises_after_other_steps_run(self):
+        mock_ctx = MagicMock()
+        execute = mock_ctx.transaction_source.db.conn.execute
+        execute.side_effect = [
+            MagicMock(fetchone=MagicMock(return_value=(10,))),
+            MagicMock(fetchone=MagicMock(return_value=(10,))),
+            MagicMock(fetchone=MagicMock(return_value=("2024-01-02",))),
+        ]
+
+        with patch("analyzer.cli.get_context", return_value=mock_ctx), \
+             patch("analyzer.cli.run_fetch_pipeline", return_value=True) as fetch_pipeline, \
+             patch("analyzer.cli.run_parse_pipeline", return_value=True) as parse_pipeline, \
+             patch("scripts.ocr_zero_rows.run_gemini_ocr_for_year", side_effect=RuntimeError("quota")):
+            result = self.runner.invoke(app, ["refresh", "--skip-capitol", "--gemini-ocr"])
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        fetch_pipeline.assert_called_once_with(mock_ctx.transaction_source, 2025)
+        parse_pipeline.assert_called_once_with(mock_ctx.transaction_source, 2025)
+        self.assertIn("Done. 10 -> 10 transactions (+0 new)", result.output)
+        self.assertIn("FAILED steps: gemini_ocr", result.output)
+
     def test_ticker_csv_output_warns_not_supported(self):
         mock_ctx = MagicMock()
         mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)

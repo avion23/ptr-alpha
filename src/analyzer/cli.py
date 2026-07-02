@@ -556,9 +556,13 @@ def refresh(
     # Step 4: Gemini OCR (optional)
     if use_gemini_ocr:
         print("[4/4] Running Gemini OCR on zero-row PDFs...")
-        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-        ocr_inserted = run_gemini_ocr_for_year(year, data_dir=data_dir)
-        print(f"  Gemini OCR: {ocr_inserted} transactions inserted")
+        try:
+            from scripts.ocr_zero_rows import run_gemini_ocr_for_year
+            ocr_inserted = run_gemini_ocr_for_year(year, data_dir=data_dir)
+            print(f"  Gemini OCR: {ocr_inserted} transactions inserted")
+        except Exception as e:
+            failed_steps.append("gemini_ocr")
+            logger.warning(f"Gemini OCR failed: {e}")
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 

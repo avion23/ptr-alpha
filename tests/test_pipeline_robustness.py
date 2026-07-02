@@ -104,7 +104,7 @@ def test_reparse_all_filters_ptr_filings_unconditionally(tmp_path):
 def test_save_parse_results_warns_when_zero_row_doc_retains_db_rows(caplog, tmp_path):
     source = datasources.HouseTransactionSource.__new__(datasources.HouseTransactionSource)
     source.db = MagicMock()
-    source.db.count_transactions_for_doc.return_value = 3
+    source.db.count_transactions_for_docs.return_value = {"123": 3}
     pdf_path = tmp_path / "123.pdf"
 
     with patch.object(datasources, "consolidate_transactions", return_value=pd.DataFrame()), \
@@ -112,7 +112,7 @@ def test_save_parse_results_warns_when_zero_row_doc_retains_db_rows(caplog, tmp_
          pytest.raises(ParsingError):
         source._save_parse_results(2024, [(pdf_path, [], ["pdfplumber"])], {})
 
-    source.db.count_transactions_for_doc.assert_called_once_with("123")
+    source.db.count_transactions_for_docs.assert_called_once_with(["123"])
     assert "1 docs parsed to zero rows but retain 3 existing DB rows (stale?): 123" in caplog.text
 
 

@@ -56,6 +56,7 @@ def _result_quality(txs: list[dict]) -> float:
     )
     return valid / len(txs)
 
+
 def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     """Cascade through pdfplumber → camelot lattice → camelot stream →
     pdftotext → Docling OCR → tesseract OCR. Each engine is tried only when
@@ -391,7 +392,7 @@ class HouseTransactionSource(TransactionSource):
         self, year: int, results: list, member_lookup: dict,
     ) -> None:
         pdf_transactions: dict = {}
-        stale_docs: dict[str, int] = {}
+        zero_row_doc_ids: list[str] = []
         for pdf_path, transactions, engines_attempted in results:
             doc_id = pdf_path.stem
             pdf_transactions[pdf_path] = transactions
@@ -406,10 +407,9 @@ class HouseTransactionSource(TransactionSource):
                 transaction_count=len(transactions),
             )
             if not transactions:
-                existing_rows = self.db.count_transactions_for_doc(doc_id)
-                if existing_rows:
-                    stale_docs[doc_id] = existing_rows
+                zero_row_doc_ids.append(doc_id)
 
+        stale_docs = self.db.count_transactions_for_docs(zero_row_doc_ids)
         if stale_docs:
             doc_ids = list(stale_docs)[:10]
             logger.warning(

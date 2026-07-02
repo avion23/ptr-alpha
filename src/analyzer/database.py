@@ -290,10 +290,21 @@ class Database:
     def delete_transactions_for_doc(self, doc_id: str) -> None:
         self.conn.execute("DELETE FROM transactions WHERE doc_id = ?", [doc_id])
 
-    def count_transactions_for_doc(self, doc_id: str) -> int:
-        return self.conn.execute(
-            "SELECT COUNT(*) FROM transactions WHERE doc_id = ?", [doc_id]
-        ).fetchone()[0]
+    def count_transactions_for_docs(self, doc_ids: list[str]) -> dict[str, int]:
+        if not doc_ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in doc_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT doc_id, COUNT(*)
+            FROM transactions
+            WHERE doc_id IN ({placeholders})
+            GROUP BY doc_id
+            """,
+            doc_ids,
+        ).fetchall()
+        return {doc_id: count for doc_id, count in rows}
 
     def upsert_parse_run(
         self,

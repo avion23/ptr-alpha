@@ -131,7 +131,7 @@ def create_snapshot(
     return snapshot
 
 
-def save_snapshot(snapshot: PriceSnapshot, path: str = "data/price_snapshot.json") -> None:
+def save_snapshot(snapshot: PriceSnapshot, path: str | Path) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:

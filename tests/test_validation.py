@@ -374,9 +374,10 @@ class TestSelectConfig:
 class TestRunValidationConfigFreezing:
     """Verify that run_validation applies the TRAIN-selected config to the TEST eval."""
 
-    def test_test_evaluation_uses_train_selected_config(self, tmp_path):
+    def test_test_evaluation_uses_train_selected_config(self, tmp_path, monkeypatch):
         """The TEST backtest must use every parameter from the TRAIN-selected config."""
         from analyzer.validation import run_validation, _backtest_core
+        monkeypatch.chdir(tmp_path)
 
         # Synthetic selected config returned by mock sweep
         sweep_row = {
@@ -496,6 +497,36 @@ class TestRunValidationConfigFreezing:
         assert "test" in result
         assert "verdict" in result
         assert isinstance(result["verdict"], str)
+        assert not (tmp_path / "data" / "validation_results.json").exists()
+
+        out_path = tmp_path / "validation" / "results.json"
+        with (
+            patch("analyzer.validation.sweep_configs", return_value=sweep_df),
+            patch("analyzer.validation._backtest_core", side_effect=fake_backtest_core),
+            patch(
+                "analyzer.validation.analysis.calculate_signal_potential",
+                return_value=pd.DataFrame(),
+            ),
+            patch("analyzer.database.Database") as MockDB,
+        ):
+            mock_db = MagicMock()
+            mock_db.get_transactions_by_date_range.return_value = fake_tx
+            mock_db.get_prices.return_value = fake_prices
+            mock_db.get_entry_prices.return_value = fake_entry
+            MockDB.return_value = mock_db
+            mock_db.conn = MagicMock()
+
+            run_validation(
+                db_path=str(tmp_path / "test.duckdb"),
+                train_start=date(2022, 1, 1),
+                train_end=date(2023, 12, 31),
+                test_start=date(2024, 1, 1),
+                test_end=date(2025, 6, 30),
+                grid=grid,
+                out_path=out_path,
+            )
+
+        assert out_path.exists()
 
 
 # ---------------------------------------------------------------------------

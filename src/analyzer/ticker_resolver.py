@@ -22,9 +22,12 @@ class TickerResolver:
     RENAME_MAP: dict[str, tuple[str, str]] = {
         "FB": ("META", "2021-10-28"),
         "SQ": ("XYZ", "2024-02-01"),
+        "BLL": ("BALL", "2022-06-13"),
+    }
+
+    ACQUISITION_MAP: dict[str, tuple[str, str]] = {
         "ATVI": ("MSFT", "2023-10-13"),
         "CELG": ("BMY", "2019-11-20"),
-        "BLL": ("AMCR", "2019-04-11"),
     }
 
     CLASS_SHARE_MAP: dict[str, str] = {
@@ -53,8 +56,10 @@ class TickerResolver:
 
         Resolution order:
         1. Class-share dot-to-hyphen mapping
-        2. Rename/acquisition mapping (with date-based validity check)
-        3. Pass through as-is (already valid)
+        2. True rename mapping (with date-based validity check)
+        3. Acquisition mapping (always evaluate under original symbol)
+        4. Pseudo-ticker parser artifact mapping
+        5. Pass through as-is (already valid)
         """
         if not raw_ticker:
             return TickerResolution(
@@ -78,7 +83,7 @@ class TickerResolver:
                 notes=f"Class-share variant: {normalized} -> {mapped}",
             )
 
-        # 2. Rename/acquisition mapping
+        # 2. True rename mapping
         if normalized in self.RENAME_MAP:
             new_symbol, effective_date_str = self.RENAME_MAP[normalized]
             effective_date = date.fromisoformat(effective_date_str)
@@ -104,7 +109,21 @@ class TickerResolver:
                     ),
                 )
 
-        # 3. Pseudo-ticker mapping (pdftotext parser artifacts)
+        # 3. Acquisition mapping
+        if normalized in self.ACQUISITION_MAP:
+            acquirer, acquisition_date = self.ACQUISITION_MAP[normalized]
+            return TickerResolution(
+                raw_ticker=raw_ticker,
+                price_symbol=normalized,
+                status="acquired",
+                confidence=0.5,
+                notes=(
+                    f"{normalized} acquired by {acquirer} on {acquisition_date}; "
+                    "evaluated under original symbol (never the acquirer's prices)"
+                ),
+            )
+
+        # 4. Pseudo-ticker mapping (pdftotext parser artifacts)
         if normalized in self.PSEUDO_TICKER_MAP:
             mapped = self.PSEUDO_TICKER_MAP[normalized]
             return TickerResolution(
@@ -115,7 +134,7 @@ class TickerResolver:
                 notes=f"Pseudo-ticker {normalized} -> {mapped}",
             )
 
-        # 4. Already valid — pass through
+        # 5. Already valid — pass through
         return TickerResolution(
             raw_ticker=raw_ticker,
             price_symbol=normalized,

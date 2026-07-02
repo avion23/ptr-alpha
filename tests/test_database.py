@@ -26,7 +26,7 @@ class TestDatabaseSchema(DatabaseTestCase):
             "SELECT index_name FROM duckdb_indexes()"
         ).fetchall()
         index_names = {i[0] for i in indexes}
-        self.assertIn("idx_tx_unique", index_names)
+        self.assertIn("idx_tx_unique_v2", index_names)
 
 
 class TestMetadata(DatabaseTestCase):
@@ -263,7 +263,7 @@ class TestTransactions(DatabaseTestCase):
         ).fetchall()
         self.assertEqual([row[0] for row in descriptions], ["Municipal bond A", "Municipal bond B"])
 
-    def test_upsert_writes_source_and_conflict_preserves_existing_source(self):
+    def test_upsert_writes_source_and_keeps_distinct_asset_descriptions(self):
         df1 = pd.DataFrame([{
             "doc_id": "doc-source",
             "member": "Jane Doe",
@@ -280,11 +280,30 @@ class TestTransactions(DatabaseTestCase):
         self.db.upsert_transactions(df1, source="house_pdf")
         self.db.upsert_transactions(df2, source="capitol_trades")
 
-        row = self.db.conn.execute(
-            "SELECT source, asset_description FROM transactions WHERE doc_id = 'doc-source'"
-        ).fetchone()
-        self.assertEqual(row[0], "house_pdf")
-        self.assertEqual(row[1], "Apple Inc updated")
+        rows = self.db.conn.execute(
+            "SELECT source, asset_description FROM transactions WHERE doc_id = 'doc-source' ORDER BY asset_description"
+        ).fetchall()
+        self.assertEqual(rows, [("house_pdf", "Apple Inc"), ("capitol_trades", "Apple Inc updated")])
+
+    def test_upsert_identical_asset_description_is_idempotent(self):
+        df = pd.DataFrame([{
+            "doc_id": "doc-idempotent-asset",
+            "member": "Jane Doe",
+            "ticker": "AAPL",
+            "transaction_date": date(2024, 4, 1),
+            "disclosure_date": date(2024, 4, 5),
+            "transaction_type": "Purchase",
+            "amount_raw": "$1,001 - $15,000",
+            "asset_description": "Apple Inc",
+        }])
+
+        self.db.upsert_transactions(df, source="house_pdf")
+        self.db.upsert_transactions(df, source="house_pdf")
+
+        count = self.db.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc-idempotent-asset'"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
 
     def test_count_transactions_for_docs_returns_counts_by_doc_id(self):
         df = pd.DataFrame([

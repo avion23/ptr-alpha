@@ -220,3 +220,59 @@ def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):
     assert row_count == 1
     assert latest_run is not None
     assert latest_run == ("no_txs", 0, 0)
+
+
+def test_insert_transactions_all_bad_rows_preserves_existing_rows(tmp_path):
+    db_path = tmp_path / "congress.duckdb"
+    db = Database(db_path)
+    db.conn.execute("""
+        INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
+        VALUES ('doc-bad', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
+    """)
+    db.conn.close()
+
+    assert insert_transactions("doc-bad", 2024, "Jane Doe", [_tx()], db_path=str(db_path)) == 1
+    bad_txs = [_tx(date="not a date")]
+    assert insert_transactions("doc-bad", 2024, "Jane Doe", bad_txs, db_path=str(db_path)) == 0
+
+    con = Database(db_path).conn
+    rows = con.execute("SELECT ticker, asset_description FROM transactions WHERE doc_id = 'doc-bad'").fetchall()
+    latest_run = con.execute("""
+        SELECT status, raw_row_count, transaction_count, error_message
+        FROM pdf_parse_runs
+        WHERE doc_id = 'doc-bad'
+        ORDER BY parsed_at DESC
+        LIMIT 1
+    """).fetchone()
+    con.close()
+
+    assert rows == [("AAPL", "Apple Inc. (AAPL)")]
+    assert latest_run == ("no_txs", 1, 0, "bad date: not a date")
+
+
+def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):
+    db_path = tmp_path / "congress.duckdb"
+    db = Database(db_path)
+    db.conn.execute("""
+        INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
+        VALUES ('doc-mixed', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
+    """)
+    db.conn.close()
+
+    assert insert_transactions("doc-mixed", 2024, "Jane Doe", [_tx(asset="Old Inc. (OLD)")], db_path=str(db_path)) == 1
+    txs = [_tx(asset="Microsoft Corp. (MSFT)"), _tx(asset="Bad Corp. (BAD)", date="bad")]
+    assert insert_transactions("doc-mixed", 2024, "Jane Doe", txs, db_path=str(db_path)) == 1
+
+    con = Database(db_path).conn
+    rows = con.execute("SELECT ticker, asset_description FROM transactions WHERE doc_id = 'doc-mixed'").fetchall()
+    latest_run = con.execute("""
+        SELECT status, raw_row_count, transaction_count, error_message
+        FROM pdf_parse_runs
+        WHERE doc_id = 'doc-mixed'
+        ORDER BY parsed_at DESC
+        LIMIT 1
+    """).fetchone()
+    con.close()
+
+    assert rows == [("MSFT", "Microsoft Corp. (MSFT)")]
+    assert latest_run == ("success", 2, 1, "bad date: bad")

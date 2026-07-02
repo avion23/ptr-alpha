@@ -635,7 +635,7 @@ def validate(
     then evaluates the selected config exactly once on the TEST window.
 
     Uses Newey-West HAC t-stats to correct for overlapping return windows.
-    Results are written to data/validation_results.json.
+    Results are written to <data-dir>/validation_results.json.
     """
     from analyzer.validation import run_validation
 
@@ -688,6 +688,7 @@ def validate(
     print(f"Running validation with {n_trials} configs (trials for snooping correction)")
 
     db_path = Path(data_dir) / "congress.duckdb"
+    out_path = Path(data_dir) / "validation_results.json"
     try:
         run_validation(
             db_path=db_path,
@@ -696,6 +697,7 @@ def validate(
             test_start=vs,
             test_end=ve,
             grid=grid,
+            out_path=out_path,
         )
     except Exception:
         logger.exception("Validation failed")

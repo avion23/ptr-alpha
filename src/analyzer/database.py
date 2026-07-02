@@ -78,17 +78,26 @@ class Database:
             )
         """)
         self._ensure_transaction_columns()
-        # Fix 1: expand unique key to include amount_raw + owner_code so distinct
-        # same-day lots (different amounts) or SP vs JT trades are not collapsed.
-        # Normalize NULLs to '' first so ON CONFLICT dedupes re-parses of the same row.
+        # Fix 1: expand unique key to include amount_raw + owner_code +
+        # asset_description so distinct same-day lots, owners, or asset rows are
+        # not collapsed. DuckDB ART indexes do not conflict on NULL keys; the
+        # anti-join in upsert_transactions remains the dedup guard for NULL
+        # asset_description rows, same convention as ticker.
         self.conn.execute(
             "UPDATE transactions SET owner_code=COALESCE(owner_code,''), amount_raw=COALESCE(amount_raw,'')"
         )
         self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique")
-        self.conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique "
-            "ON transactions(doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code)"
-        )
+        try:
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique_v2 "
+                "ON transactions(doc_id, ticker, transaction_date, member, transaction_type, "
+                "amount_raw, owner_code, asset_description)"
+            )
+        except duckdb.ConstraintException as e:
+            raise RuntimeError(
+                "Failed to create transactions unique index. Run "
+                "`python3 scripts/purge_phantom_rows.py --execute` first."
+            ) from e
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))"
         )
@@ -259,7 +268,7 @@ class Database:
                    asset_description, source
             FROM filtered_staging_transactions
             WHERE ticker IS NOT NULL
-            ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code) DO UPDATE SET
+            ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code, asset_description) DO UPDATE SET
                 transaction_type = EXCLUDED.transaction_type,
                 disclosure_date = EXCLUDED.disclosure_date,
                 owner_code = EXCLUDED.owner_code,

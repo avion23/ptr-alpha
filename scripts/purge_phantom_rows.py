@@ -79,7 +79,8 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
 
-    conn = duckdb.connect(str(Path(args.db_path)))
+    # Dry-run must not take DuckDB's exclusive write lock on a live DB.
+    conn = duckdb.connect(str(Path(args.db_path)), read_only=not args.execute)
     try:
         counts = count_phantom_rows(conn)
         if not args.execute:

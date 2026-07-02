@@ -208,7 +208,7 @@ class CapitolTradesSource(TransactionSource):
                 "owner_code": None,
                 "amount_raw": t.get("amount_text"),
                 "amount_midpoint": midpoint,
-                "instrument_type": t.get("asset_type"),
+                "instrument_type": self._normalize_instrument_type(t.get("asset_type")),
                 "strike_price": None,
                 "expiry_date": None,
             })
@@ -252,3 +252,20 @@ class CapitolTradesSource(TransactionSource):
             return pd.Timestamp(value)
         except Exception:
             return None
+
+    @staticmethod
+    def _normalize_instrument_type(raw: str | None) -> str:
+        """Normalize raw API asset_type to canonical lowercase values.
+
+        The Capitol Trades API returns values like "Call Option", "Put Option",
+        "Stock Option", while downstream code (e.g. options.estimate_options_leverage)
+        expects lowercase 'call', 'put', 'stock'.
+        """
+        if not raw:
+            return "stock"
+        lower = raw.lower()
+        if "call" in lower:
+            return "call"
+        if "put" in lower:
+            return "put"
+        return "stock"

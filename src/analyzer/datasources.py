@@ -232,6 +232,7 @@ class HouseTransactionSource(TransactionSource):
         self.db = db if db is not None else Database(self.data_dir / "congress.duckdb", read_only=read_only)
 
     def close(self) -> None:
+        self.session.close()
         if self._owns_db:
             self.db.close()
 

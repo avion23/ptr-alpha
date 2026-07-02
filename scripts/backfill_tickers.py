@@ -16,7 +16,8 @@ def backfill():
         "SELECT COUNT(*) FROM transactions WHERE ticker IS NULL OR ticker = ''"
     ).fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-    print(f"Before: {before}/{total} no-ticker ({before/total*100:.1f}%)")
+    pct_before = before / total * 100 if total > 0 else 0.0
+    print(f"Before: {before}/{total} no-ticker ({pct_before:.1f}%)")
 
     rows = conn.execute("""
         SELECT id, asset_description FROM transactions
@@ -41,7 +42,8 @@ def backfill():
         "SELECT COUNT(*) FROM transactions WHERE ticker IS NULL OR ticker = ''"
     ).fetchone()[0]
     print(f"Updated: {updated} rows")
-    print(f"After: {after}/{total} no-ticker ({after/total*100:.1f}%)")
+    pct_after = after / total * 100 if total > 0 else 0.0
+    print(f"After: {after}/{total} no-ticker ({pct_after:.1f}%)")
     print(f"Resolved: {before - after} new tickers")
     conn.close()
 

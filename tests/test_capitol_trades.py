@@ -167,7 +167,7 @@ class TestCapitolTradesSource(unittest.TestCase):
         self.assertEqual(df.iloc[0]["member"], "Nancy Pelosi")
         self.assertEqual(df.iloc[0]["ticker"], "AAPL")
         self.assertEqual(df.iloc[0]["transaction_type"], "Sale")
-        self.assertEqual(df.iloc[0]["instrument_type"], "Stock")
+        self.assertEqual(df.iloc[0]["instrument_type"], "stock")
         self.assertEqual(df.iloc[0]["amount_midpoint"], 375000.5)
         self.assertEqual(df.iloc[0]["amount_raw"], "$250,001 - $500,000")
         self.assertEqual(df.iloc[0]["doc_id"], "20033337")

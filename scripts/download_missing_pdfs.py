@@ -109,7 +109,7 @@ async def download_pdf(session, doc_id, pdf_path, url):
 async def download_missing_pdfs(years: list[int]):
     settings = Settings()
     data_dir = Path(settings.data.data_dir)
-    db = Database(data_dir / "congress.duckdb", read_only=True)
+    db = Database(data_dir / "congress.duckdb", read_only=False)
     session = requests_cache.CachedSession(
         cache_name=str(data_dir / "http_cache"),
         backend="sqlite",

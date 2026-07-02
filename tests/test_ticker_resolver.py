@@ -84,14 +84,29 @@ class TestTickerResolver(unittest.TestCase):
         self.assertIn("Y", results)
         self.assertIsInstance(results["X"], TickerResolution)
 
-    def test_atvi_to_msft(self):
+    def test_atvi_acquired_uses_original_symbol(self):
         resolution = self.resolver.resolve("ATVI")
-        self.assertEqual(resolution.price_symbol, "MSFT")
-        self.assertEqual(resolution.status, "renamed")
+        self.assertEqual(resolution.price_symbol, "ATVI")
+        self.assertEqual(resolution.status, "acquired")
+        self.assertIn("MSFT", resolution.notes)
 
-    def test_celg_to_bmy(self):
+    def test_atvi_acquired_ignores_trade_date(self):
+        before = self.resolver.resolve("ATVI", trade_date=date(2020, 1, 1))
+        after = self.resolver.resolve("ATVI", trade_date=date(2025, 1, 1))
+        self.assertEqual(before.price_symbol, "ATVI")
+        self.assertEqual(after.price_symbol, "ATVI")
+        self.assertEqual(before.status, "acquired")
+        self.assertEqual(after.status, "acquired")
+
+    def test_celg_acquired_uses_original_symbol(self):
         resolution = self.resolver.resolve("CELG")
-        self.assertEqual(resolution.price_symbol, "BMY")
+        self.assertEqual(resolution.price_symbol, "CELG")
+        self.assertEqual(resolution.status, "acquired")
+        self.assertIn("BMY", resolution.notes)
+
+    def test_bll_to_ball_after_rename_date(self):
+        resolution = self.resolver.resolve("BLL", trade_date=date(2022, 6, 13))
+        self.assertEqual(resolution.price_symbol, "BALL")
         self.assertEqual(resolution.status, "renamed")
 
     def test_get_yfinance_tickers_deduplicates(self):

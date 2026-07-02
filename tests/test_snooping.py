@@ -1,6 +1,7 @@
 """Tests for data snooping corrections."""
 
 import math
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -286,18 +287,53 @@ class TestAnalyzeSnooping(unittest.TestCase):
     """Integration test for the full snooping analysis."""
 
     def setUp(self):
-        # Load the real sweep results
-        csv_path = Path(__file__).parent.parent / "data" / "sweep_results.csv"
-        if csv_path.exists():
-            self.sweep = pd.read_csv(csv_path)
-            self.has_data = True
-        else:
-            self.has_data = False
+        self.tmpdir = tempfile.TemporaryDirectory()
+        csv_path = Path(self.tmpdir.name) / "sweep_results.csv"
+        self.sweep = pd.DataFrame([
+            {
+                "horizon": 60,
+                "frequency_days": 30,
+                "min_buyers": 2,
+                "top_n": 5,
+                "decay_lambda": 0.001,
+                "bayes_prior_strength": 50,
+                "alpha_slope": 3.5,
+                "overall_alpha": 2.0,
+                "sharpe": 1.2,
+                "dates_evaluated": 30,
+            },
+            {
+                "horizon": 90,
+                "frequency_days": 30,
+                "min_buyers": 3,
+                "top_n": 3,
+                "decay_lambda": 0.005,
+                "bayes_prior_strength": 20,
+                "alpha_slope": 0.5,
+                "overall_alpha": 0.2,
+                "sharpe": 0.3,
+                "dates_evaluated": 30,
+            },
+            {
+                "horizon": 120,
+                "frequency_days": 90,
+                "min_buyers": 5,
+                "top_n": 5,
+                "decay_lambda": 0.02,
+                "bayes_prior_strength": 5,
+                "alpha_slope": -0.2,
+                "overall_alpha": -0.1,
+                "sharpe": -0.1,
+                "dates_evaluated": 30,
+            },
+        ])
+        self.sweep.to_csv(csv_path, index=False)
+        self.sweep = pd.read_csv(csv_path)
 
-    def test_with_real_data(self):
-        if not self.has_data:
-            self.skipTest("sweep_results.csv not available")
+    def tearDown(self):
+        self.tmpdir.cleanup()
 
+    def test_with_synthetic_data(self):
         report = analyze_snooping(
             self.sweep,
             best_config={

@@ -5,6 +5,7 @@ Uses `llm -a` with Gemini 3.1 Flash Lite to extract transactions.
 Gemini auto-rotates PDFs and handles checkbox detection.
 """
 import argparse, json, os, re, time, duckdb
+from pathlib import Path
 
 from scripts.gemini_ocr_common import MODEL, PROMPT, call_gemini, validate_transactions
 
@@ -33,15 +34,19 @@ def get_zero_row_pdfs():
     return [(d, y, f"data/{y}/pdfs/{d}.pdf") for d, y in rows
             if os.path.exists(f"data/{y}/pdfs/{d}.pdf")]
 
-def load_progress():
-    if os.path.exists(PROGRESS_PATH):
-        with open(PROGRESS_PATH) as f:
+def load_progress(path: str | Path = PROGRESS_PATH):
+    if os.path.exists(path):
+        with open(path) as f:
             return json.load(f)
     return {"completed": [], "errors": [], "no_txs": []}
 
-def save_progress(progress):
-    with open(PROGRESS_PATH, "w") as f:
+def save_progress(progress, path: str | Path = PROGRESS_PATH):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, "w") as f:
         json.dump(progress, f, indent=2)
+    os.replace(tmp_path, path)
 
 def parse_output(output):
     """Parse Gemini output into structured data."""
@@ -415,7 +420,7 @@ def record_parse_run(conn, doc_id, year, status, raw_count, tx_count, error_mess
         raw_count, tx_count, error_message[:1000],
     ])
 
-def insert_transactions(doc_id, year, member, transactions, db_path: str = DB_PATH,
+def insert_transactions(doc_id, year, member, transactions, *, db_path: str,
                         parser_version: str = "v4-gemini-manual", raw_count: int | None = None):
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
@@ -425,9 +430,8 @@ def insert_transactions(doc_id, year, member, transactions, db_path: str = DB_PA
         conn.close()
         return 0
 
-    conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
-    count = 0
     errors = []
+    rows = []
     for tx in transactions:
         try:
             # Convert dates to YYYY-MM-DD format
@@ -447,32 +451,47 @@ def insert_transactions(doc_id, year, member, transactions, db_path: str = DB_PA
                 tx_type = "Sale"
             elif tx_type in ("E",):
                 tx_type = "Exchange"
-            
+
+            rows.append([
+                str(doc_id), tx.get("member") or member or "Unknown", ticker,
+                tx_date, notif_date,
+                tx_type, tx["amount_letter"] or "Unknown", tx["amount_midpoint"],
+                None, tx["asset"][:500] if tx.get("asset") else None, "gemini_ocr"
+            ])
+        except Exception as e:
+            errors.append(f"{tx.get('asset', '?')}: {e}")
+    if errors:
+        print(f"  INSERT ERRORS ({len(errors)}): {errors[:3]}", flush=True)
+    if not rows:
+        record_parse_run(conn, doc_id, year, "no_txs", raw_count if raw_count is not None else len(transactions), 0, "; ".join(errors), parser_version=parser_version)
+        conn.execute("CHECKPOINT")
+        conn.close()
+        return 0
+
+    count = 0
+    try:
+        conn.execute("BEGIN TRANSACTION")
+        conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
+        for row in rows:
             conn.execute("""
                 INSERT INTO transactions 
                 (doc_id, member, ticker, transaction_date, disclosure_date, 
                  transaction_type, amount_raw, amount_midpoint, owner_code, created_at,
                  asset_description, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-            """, [
-                str(doc_id), tx.get("member") or member or "Unknown", ticker,
-                tx_date, notif_date,
-                tx_type, tx["amount_letter"] or "Unknown", tx["amount_midpoint"],
-                None, tx["asset"][:500] if tx.get("asset") else None, "gemini_ocr"
-            ])
+            """, row)
             count += 1
-        except duckdb.ConstraintException:
-            # Duplicate row — skip silently
-            continue
-        except Exception as e:
-            errors.append(f"{tx.get('asset', '?')}: {e}")
-    if errors:
-        print(f"  INSERT ERRORS ({len(errors)}): {errors[:3]}", flush=True)
-    status = "success" if count else "no_txs"
-    record_parse_run(conn, doc_id, year, status, raw_count if raw_count is not None else len(transactions), count, "; ".join(errors), parser_version=parser_version)
-    conn.execute("CHECKPOINT")
-    conn.close()
-    return count
+        record_parse_run(conn, doc_id, year, "success", raw_count if raw_count is not None else len(transactions), count, "; ".join(errors), parser_version=parser_version)
+        conn.execute("COMMIT")
+        conn.execute("CHECKPOINT")
+        conn.close()
+        return count
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        record_parse_run(conn, doc_id, year, "error", raw_count if raw_count is not None else len(transactions), 0, str(e), parser_version=parser_version)
+        conn.execute("CHECKPOINT")
+        conn.close()
+        raise
 
 def validate_for_insert(conn, doc_id, member, transactions):
     filing_date = get_filing_date(conn, doc_id)
@@ -512,7 +531,7 @@ def main():
         
         member, transactions = parse_output(output)
         if not transactions:
-            insert_transactions(doc_id, year, member, [])
+            insert_transactions(doc_id, year, member, [], db_path=DB_PATH)
             progress["no_txs"].append(doc_id)
             save_progress(progress)
             print(f"  No transactions found", flush=True)
@@ -532,7 +551,7 @@ def main():
             print(f"  REJECTED: row_count_exceeds_cap ({raw_count})", flush=True)
             continue
         member = transactions[0].get("member", member) if transactions else member
-        inserted = insert_transactions(doc_id, year, member, transactions)
+        inserted = insert_transactions(doc_id, year, member, transactions, db_path=DB_PATH)
         total_inserted += inserted
         progress["completed" if inserted else "no_txs"].append(doc_id)
         save_progress(progress)
@@ -548,6 +567,7 @@ def main():
 def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = False):
     """Process all zero-row PDFs for a specific year."""
     db_path = os.path.join(data_dir, "congress.duckdb")
+    progress_path = Path(data_dir) / "ocr_progress_gemini_manual.json"
     conn = duckdb.connect(db_path, read_only=True)
     rows = conn.execute("""
         WITH latest AS (
@@ -564,7 +584,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             if os.path.exists(os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf"))]
     print(f"Zero-row PDFs for {year}: {len(pdfs)}")
     
-    progress = load_progress()
+    progress = load_progress(progress_path)
     completed = set(progress["completed"] + progress["no_txs"])
     remaining = [p for p in pdfs if p[0] not in completed]
     print(f"Remaining: {len(remaining)}")
@@ -576,7 +596,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
         output, error = call_gemini(path, doc_id=doc_id, refresh=refresh, cache_dir=os.path.join(data_dir, "gemini_cache"))
         if output is None or error:
             progress["errors"].append(doc_id)
-            save_progress(progress)
+            save_progress(progress, progress_path)
             conn = duckdb.connect(db_path)
             record_parse_run(conn, doc_id, yr, "error", 0, 0, error)
             conn.close()
@@ -586,7 +606,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
         if not transactions:
             insert_transactions(doc_id, yr, member, [], db_path=db_path)
             progress["no_txs"].append(doc_id)
-            save_progress(progress)
+            save_progress(progress, progress_path)
             print(f"  No transactions found", flush=True)
             continue
         raw_count = len(transactions)
@@ -599,14 +619,14 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             record_parse_run(conn, doc_id, yr, "rejected", raw_count, 0, "row_count_exceeds_cap")
             conn.close()
             progress["errors"].append(doc_id)
-            save_progress(progress)
+            save_progress(progress, progress_path)
             print(f"  REJECTED: row_count_exceeds_cap ({raw_count})", flush=True)
             continue
         member = transactions[0].get("member", member) if transactions else member
         inserted = insert_transactions(doc_id, yr, member, transactions, db_path=db_path)
         total_inserted += inserted
         progress["completed" if inserted else "no_txs"].append(doc_id)
-        save_progress(progress)
+        save_progress(progress, progress_path)
         print(f"  Inserted: {inserted}/{len(transactions)}", flush=True)
 
     return total_inserted

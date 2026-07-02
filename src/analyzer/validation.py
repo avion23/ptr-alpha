@@ -417,6 +417,8 @@ def run_validation(
     test_start: date,
     test_end: date,
     grid: dict,
+    *,
+    out_path: Path | None = None,
 ) -> dict:
     """Full honest time-split validation pipeline.
 
@@ -425,13 +427,14 @@ def run_validation(
        the best config.
     3. Evaluate the frozen config EXACTLY ONCE on the TEST window.
     4. Compute Newey-West t-stats for both windows.
-    5. Write results to data/validation_results.json and print a summary.
+    5. Optionally write results to *out_path* and print a summary.
 
     Args:
         db_path: Path to congress.duckdb.
         train_start / train_end: In-sample calibration window.
         test_start / test_end: Genuine out-of-sample evaluation window.
         grid: Parameter grid dict (same format as sweep_configs).
+        out_path: Optional JSON output path. No file is written when None.
 
     Returns:
         JSON-serializable dict containing train/test metrics, selected config,
@@ -442,7 +445,7 @@ def run_validation(
     db = Database(Path(db_path), read_only=True)
     try:
         return _run_validation_with_db(
-            db, train_start, train_end, test_start, test_end, grid
+            db, train_start, train_end, test_start, test_end, grid, out_path=out_path
         )
     finally:
         db.conn.close()
@@ -459,6 +462,8 @@ def _run_validation_with_db(
     test_start: date,
     test_end: date,
     grid: dict,
+    *,
+    out_path: Path | None = None,
 ) -> dict:
     """Inner implementation that accepts an open Database connection."""
     tx_start = pd.Timestamp("2021-10-07")
@@ -566,9 +571,10 @@ def _run_validation_with_db(
     )
 
     train_t = newey_west_tstat(train_per_date, lag=lag)
-    train_p = float(2.0 * stats.norm.sf(abs(train_t))) if math.isfinite(train_t) else 1.0
+    # One-sided H1: alpha > 0, matching sweep_configs.
+    train_p = float(stats.norm.sf(train_t)) if math.isfinite(train_t) else (0.0 if train_t > 0 else 1.0)
     test_t = newey_west_tstat(test_per_date, lag=lag)
-    test_p = float(2.0 * stats.norm.sf(abs(test_t))) if math.isfinite(test_t) else 1.0
+    test_p = float(stats.norm.sf(test_t)) if math.isfinite(test_t) else (0.0 if test_t > 0 else 1.0)
 
     spy_train = _spy_mean_return(prices, train_start, train_end, horizon)
     spy_test = _spy_mean_return(prices, test_start, test_end, horizon)
@@ -612,11 +618,11 @@ def _run_validation_with_db(
 
     _print_summary(output)
 
-    out_path = Path("data") / "validation_results.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(output, f, indent=2, default=str)
-    print(f"\nResults written to {out_path}")
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(output, f, indent=2, default=str)
+        print(f"\nResults written to {out_path}")
 
     return output
 

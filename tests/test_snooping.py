@@ -333,7 +333,7 @@ class TestAnalyzeSnooping(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def test_with_synthetic_data(self):
+    def test_with_basic_config(self):
         report = analyze_snooping(
             self.sweep,
             best_config={

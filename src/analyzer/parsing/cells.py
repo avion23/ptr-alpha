@@ -267,9 +267,9 @@ def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
         return TransactionType.SALE.value
     if s_stripped in ('e', 'exchange'):
         return TransactionType.EXCHANGE.value
-    if 'purchase' in s or 'buy' in s:
+    if 'purchase' in s or re.search(r'\bbuy\b', s):
         return TransactionType.PURCHASE.value
-    if 'sale' in s or 'sell' in s or 'sold' in s:
+    if re.search(r'\bsale\b', s) or re.search(r'\bsell\b', s) or re.search(r'\bsold\b', s):
         return TransactionType.SALE.value
     if 'exchange' in s:
         return TransactionType.EXCHANGE.value

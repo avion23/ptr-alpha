@@ -108,8 +108,8 @@ def deflated_sharpe_ratio(
         n_observations: Number of independent observations used to compute
             the Sharpe ratio.
         skew: Skewness of the returns distribution.
-        kurtosis: Excess kurtosis of the returns distribution (default 3.0
-            for normal distribution; use excess kurtosis + 3 internally).
+        kurtosis: Total kurtosis of the returns distribution (default 3.0
+            for normal distribution; internally converted to excess kurtosis).
 
     Returns:
         The Deflated Sharpe Ratio (probability that the Sharpe ratio is

@@ -1,22 +1,14 @@
 """Parallel Gemini OCR. Threaded fetch, single-writer DB."""
-import json, os, re, time, subprocess, threading, queue
+import argparse, json, os, re, time, threading, queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import duckdb
 
+from scripts.gemini_ocr_common import MODEL, PROMPT, call_gemini, validate_transactions
+from scripts.ocr_zero_rows import get_filing_date, get_metadata_member, insert_transactions, record_parse_run
+
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress.json"
-MODEL = "gemini/gemini-3.1-flash-lite"
 MAX_WORKERS = 15
-
-PROMPT = """This is a US House Periodic Transaction Report (PTR). The FIRST data row is an EXAMPLE labeled "Example: Mega Corp. Common Stock" - SKIP IT. Only extract REAL transactions below it.
-
-Output format:
-MEMBER: [full name of filer]
-[asset name] | [Purchase/Sale/Exchange] | [MM/DD/YY] | [MM/DD/YY] | [amount range]
-
-Amount ranges: A=$1K-15K, B=$15K-50K, C=$50K-100K, D=$100K-250K, E=$250K-500K, F=$500K-1M, G=$1M-5M, H=$5M-25M, I=$25M-50M, J=over $50M
-
-One line per transaction. No markdown, no tables, no explanations."""
 
 AMOUNT_MIDPOINTS = {"A":8000,"B":32500,"C":75000,"D":175000,"E":375000,
                     "F":750000,"G":3000000,"H":15000000,"I":37500000,"J":50000000}
@@ -44,16 +36,6 @@ def save_progress(p):
     json.dump(p, open(tmp, "w"))
     os.replace(tmp, PROGRESS_PATH)
 
-def call_gemini(pdf_path):
-    try:
-        r = subprocess.run(
-            ["llm", "-a", pdf_path, "-m", MODEL, PROMPT],
-            capture_output=True, text=True, timeout=90
-        )
-        return r.stdout if r.returncode == 0 else None
-    except subprocess.TimeoutExpired:
-        return None
-
 def parse_output(output):
     if not output:
         return None, []
@@ -76,8 +58,9 @@ def parse_output(output):
             if ttype_clean:
                 transactions.append({
                     "asset": asset, "type": ttype_clean,
-                    "tx_date": tx_date, "disc_date": disc_date,
-                    "amount": amount.upper().strip()[0] if amount.strip() else None,
+                    "date": tx_date, "notif_date": disc_date,
+                    "amount_letter": amount.upper().strip()[0] if amount.strip() else None,
+                    "amount_midpoint": AMOUNT_MIDPOINTS.get(amount.upper().strip()[0]) if amount.strip() else None,
                 })
     return member, transactions
 
@@ -99,61 +82,71 @@ write_q = queue.Queue()
 SENTINEL = object()
 def db_writer():
     """Single thread that owns the DuckDB connection."""
-    con = duckdb.connect(DB_PATH)
     batch = []
     flush_count = 0
     while True:
         item = write_q.get()
         if item is SENTINEL:
             if batch:
-                _flush(con, batch)
-            con.execute("CHECKPOINT")
-            con.close()
+                _flush(batch)
             return
         batch.append(item)
         if len(batch) >= 50:
-            _flush(con, batch)
+            _flush(batch)
             batch = []
             flush_count += 1
             print(f"  [writer] flushed batch #{flush_count}")
 
-def _flush(con, batch):
-    """Insert a batch of transactions."""
-    for tx in batch:
+def _flush(batch):
+    """Insert validated documents with delete-then-insert semantics."""
+    for item in batch:
         try:
-            con.execute("""
-                INSERT OR IGNORE INTO transactions
-                (doc_id, member, ticker, transaction_date, disclosure_date,
-                 transaction_type, amount_raw, amount_midpoint, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, [tx["doc_id"], tx["member"], tx["ticker"], tx["tx_date"],
-                  tx["disc_date"], tx["type"], tx["amount"],
-                  AMOUNT_MIDPOINTS.get(tx["amount"]) if tx["amount"] else None])
+            if item.get("status") in ("error", "rejected"):
+                con = duckdb.connect(DB_PATH)
+                record_parse_run(
+                    con, item["doc_id"], item["year"], item["status"],
+                    item["raw_count"], 0, item.get("error", ""),
+                    parser_version="v4-gemini-parallel",
+                )
+                con.close()
+                continue
+            count = insert_transactions(
+                item["doc_id"], item["year"], item["member"], item["transactions"],
+                db_path=DB_PATH, parser_version="v4-gemini-parallel", raw_count=item["raw_count"],
+            )
+            item["inserted"] = count
         except Exception as e:
-            print(f"  insert err {tx['doc_id']}: {e}")
+            print(f"  insert err {item['doc_id']}: {e}")
 
-def process_one(item):
+def process_one(item, refresh=False):
     doc_id, year, pdf_path = item
-    output = call_gemini(pdf_path)
+    output, error = call_gemini(pdf_path, doc_id=doc_id, refresh=refresh, timeout=90)
+    if output is None:
+        write_q.put({"doc_id": doc_id, "year": year, "status": "error", "raw_count": 0, "error": str(error)[:1000]})
+        return doc_id, year, "error", 0, error
     member, txs = parse_output(output)
     if not txs:
+        write_q.put({"doc_id": doc_id, "year": year, "member": member, "transactions": [], "raw_count": 0})
         return doc_id, year, "no_txs", 0, []
-    parsed = []
-    for tx in txs:
-        ticker = extract_ticker(tx["asset"])
-        tx_date = normalize_date(tx["tx_date"])
-        disc_date = normalize_date(tx["disc_date"])
-        if not tx_date: continue
-        parsed.append({
-            "doc_id": doc_id, "member": member, "ticker": ticker,
-            "tx_date": tx_date, "disc_date": disc_date,
-            "type": tx["type"], "amount": tx.get("amount"),
-        })
-    for p in parsed:
-        write_q.put(p)
-    return doc_id, year, "ok", len(parsed), parsed
+    raw_count = len(txs)
+    con = duckdb.connect(DB_PATH, read_only=True)
+    filing_date = get_filing_date(con, doc_id)
+    expected_member = get_metadata_member(con, doc_id)
+    con.close()
+    txs, rejections = validate_transactions(doc_id, member, txs, filing_date, expected_member)
+    print(f"  {doc_id} validation rejections: {rejections}")
+    if rejections.get("row_count_exceeds_cap"):
+        write_q.put({"doc_id": doc_id, "year": year, "status": "rejected", "raw_count": raw_count, "error": "row_count_exceeds_cap"})
+        return doc_id, year, "rejected", 0, []
+    member = txs[0].get("member", member) if txs else member
+    write_q.put({"doc_id": doc_id, "year": year, "member": member, "transactions": txs, "raw_count": raw_count})
+    return doc_id, year, "ok" if txs else "no_txs", len(txs), txs
 
 def main():
+    parser = argparse.ArgumentParser(description="Parallel Gemini OCR for zero-row PDFs")
+    parser.add_argument("--refresh", action="store_true", help="Ignore cached Gemini responses")
+    args = parser.parse_args()
+
     progress = load_progress()
     done = set(progress["completed"]) | set(progress["no_txs"]) | set(progress["errors"])
     pending = [(d, y, p) for d, y, p in get_zero_row_pdfs() if d not in done]
@@ -170,7 +163,7 @@ def main():
     total_inserted = 0
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(process_one, item): item for item in pending}
+        futures = {pool.submit(process_one, item, args.refresh): item for item in pending}
         for fut in as_completed(futures):
             doc_id, year, status, n, _ = fut.result()
             completed += 1

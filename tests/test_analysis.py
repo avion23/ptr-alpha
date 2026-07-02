@@ -182,8 +182,11 @@ class TestAnalysis(unittest.TestCase):
             self.assertIn(col, top_signals.columns)
 
         if len(top_signals) > 1:
-            values = top_signals['spy_alpha_pct'].values
-            self.assertTrue((values[:-1] >= values[1:]).all())
+            # get_top_signals sorts by signal_score, not spy_alpha_pct.
+            # spy_alpha_pct may be NaN when SPY prices are absent (bug #6 fix),
+            # so assert ordering on the actual sort key instead.
+            scores = top_signals['signal_score'].values
+            self.assertTrue((scores[:-1] >= scores[1:]).all())
 
     def test_get_top_signals_empty_input(self):
         with self.assertRaises(AnalysisError):

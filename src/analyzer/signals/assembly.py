@@ -45,14 +45,20 @@ def _compute_derived_arrays(metadata: dict, result_arrays: dict) -> dict:
     r_spy_wsum = result_arrays["r_spy_wsum"]
 
     valid_disc = (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
-    total_return = np.zeros(n, dtype=np.float64)
+    # Bug #6: use NaN (not 0.0) for missing price windows so downstream
+    # NaN-exclusion in aggregations (dynamic prior, hit rates) handles them.
+    total_return = np.full(n, np.nan, dtype=np.float64)
     total_return[valid_disc] = r_last_price[valid_disc] / r_disc_baseline[valid_disc] - 1
 
     valid_spy = (r_spy_first > 0) & np.isfinite(r_spy_first)
-    actual_spy_return = np.zeros(n, dtype=np.float64)
+    actual_spy_return = np.full(n, np.nan, dtype=np.float64)
     actual_spy_return[valid_spy] = r_spy_last[valid_spy] / r_spy_first[valid_spy] - 1
 
-    spy_cum = np.where(r_spy_wsum > 0, r_spy_cum / np.maximum(r_spy_wsum, 1e-15), 0.0)
+    # Bug #1: _populate_spy_arrays already stores the decay-weighted mean
+    # (s_wr.sum() / s_ws) in r_spy_cum.  Dividing again by r_spy_wsum is a
+    # double-division bug.  Use r_spy_cum directly.
+    # Bug #6: missing SPY windows produce NaN instead of 0.0.
+    spy_cum = np.where(r_spy_wsum > 0, r_spy_cum, np.nan)
 
     return {
         "total_return": total_return,

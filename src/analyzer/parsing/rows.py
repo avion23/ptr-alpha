@@ -149,17 +149,3 @@ def _extract_transactions(data_rows: list, indexes: dict[str, int]) -> list[dict
             if merged:
                 skip_next = True
     return results
-
-
-def _should_skip_next(row, next_row, indexes) -> bool:
-    """True when the current row's asset had no ticker and merging with
-    next_row would produce one — so next_row is a continuation, not a new transaction."""
-    cur_asset = _get_cell(row, indexes.get("asset"))
-    # Only skip if the current row itself had no ticker (merge would have been attempted)
-    if _extract_ticker(cur_asset):
-        return False
-    next_asset = _get_cell(next_row, indexes.get("asset"))
-    if not next_asset:
-        return False
-    merged = f"{cur_asset or ''} {next_asset}".strip()
-    return bool(_extract_ticker(merged))

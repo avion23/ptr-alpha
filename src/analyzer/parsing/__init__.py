@@ -65,7 +65,6 @@ from analyzer.parsing.rows import (
     _data_start_offset,
     _extract_transactions,
     _process_row,
-    _should_skip_next,
     _try_merge_continuation,
     parse_pdf_table,
 )
@@ -111,7 +110,6 @@ __all__ = [
     "_data_start_offset",
     "_extract_transactions",
     "_process_row",
-    "_should_skip_next",
     "_try_merge_continuation",
     "parse_pdf_table",
     "consolidate_transactions",

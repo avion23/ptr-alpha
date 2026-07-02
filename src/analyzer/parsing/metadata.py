@@ -35,12 +35,17 @@ def normalize_house_metadata(content: str) -> pd.DataFrame:
 
 def _parse_metadata_rows(lines: list[str], header: list[str]) -> list[list[str]]:
     data: list[list[str]] = []
+    n_dropped = 0
     for line in lines:
         if not line.strip():
             continue
         row = [col.strip() for col in line.split('\t')]
         if len(row) >= len(header):
             data.append(row[:len(header)])
+        else:
+            n_dropped += 1
+    if n_dropped:
+        logger.warning(f"Dropped {n_dropped} metadata row(s) with fewer columns than header ({len(header)})")
     return data
 
 
@@ -72,10 +77,16 @@ def consolidate_transactions(pdf_transactions: dict[Path, list[dict]], member_me
             logger.warning(f"No metadata found for doc_id={doc_id}, skipping {len(transactions)} transaction(s)")
             continue
 
+        first = member_info.get('First', '')
+        last = member_info.get('Last', '')
+        if not first and not last:
+            logger.warning(f"No 'First'/'Last' keys in metadata for doc_id={doc_id}, skipping {len(transactions)} transaction(s)")
+            continue
+
         for tx in transactions:
             all_transactions.append({
                 'doc_id': doc_id,
-                'member': f"{member_info['First']} {member_info['Last']}",
+                'member': f"{first} {last}".strip(),
                 'transaction_date': tx['transaction_date'],
                 'disclosure_date': member_info['FilingDate'],
                 'ticker': tx['ticker'],

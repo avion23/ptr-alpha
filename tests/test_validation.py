@@ -84,6 +84,14 @@ class TestNeweyWestTstat:
         t = newey_west_tstat(x, lag=2)
         assert math.isfinite(t) or math.isinf(t)  # no crash
 
+    def test_lag_capped_at_len_minus_1_for_two_observations(self):
+        x = pd.Series([1.0, 3.0])
+        assert newey_west_tstat(x, lag=3) == newey_west_tstat(x, lag=1)
+
+    def test_lag_capped_at_len_minus_1_for_five_observations(self):
+        x = pd.Series([1.0, 2.0, 4.0, 8.0, 16.0])
+        assert newey_west_tstat(x, lag=10) == newey_west_tstat(x, lag=4)
+
 
 # ---------------------------------------------------------------------------
 # select_config

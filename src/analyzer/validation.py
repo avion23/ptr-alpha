@@ -229,6 +229,8 @@ def newey_west_tstat(alpha_series: pd.Series, lag: int) -> float:
     n = len(x)
     if n < 2:
         return 0.0
+    # Autocovariances beyond lag n-1 are undefined; cap the Bartlett window accordingly.
+    lag = max(0, min(lag, n - 1))
 
     mu = float(x.mean())
     demeaned = x - mu

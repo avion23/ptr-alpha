@@ -345,16 +345,49 @@ class TestSweepAlphaSlopeSign(unittest.TestCase):
         self.assertEqual(fixed_slope, 4.0)
 
     def test_sweep_module_uses_correct_sign(self):
-        """Inspect sweep source to confirm alpha_slope = rank1 - rank5."""
-        import inspect
-        import sweep
-        src = inspect.getsource(sweep.run_single_backtest)
-        # The attribute access form used in run_single_backtest is
-        # result.rank1_alpha - result.rank5_alpha (positive = good).
-        self.assertIn("rank1_alpha - result.rank5_alpha", src,
-                      "run_single_backtest must use rank1_alpha - rank5_alpha (rank1 first)")
-        self.assertNotIn("rank5_alpha - result.rank1_alpha", src,
-                         "old sign-inverted formula (rank5 first) must be removed")
+        """Sign regression guard: executed alpha_slope is rank1 - rank5."""
+        from datetime import date
+        from unittest.mock import patch
+
+        import analyzer.validation as validation
+        from analyzer.pipeline import BacktestParams
+        from analyzer.validation import _backtest_core
+
+        recs = pd.DataFrame({
+            "rank": [1, 2, 3, 4, 5],
+            "ticker": ["A", "B", "C", "D", "E"],
+        })
+        evaluated = pd.DataFrame({
+            "rank": [1, 2, 3, 4, 5],
+            "ticker": ["A", "B", "C", "D", "E"],
+            "bt_alpha_pct": [5.0, 2.0, 0.0, -2.0, -5.0],
+            "bt_return_pct": [5.0, 2.0, 0.0, -2.0, -5.0],
+        })
+        params = BacktestParams(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 1),
+            horizon=60,
+            frequency_days=30,
+            min_buyers=2,
+            top_n=5,
+        )
+
+        with (
+            patch.object(validation.analysis, "backtest_recommendations", return_value=recs),
+            patch.object(validation.analysis, "evaluate_backtest", return_value=evaluated),
+        ):
+            result, _ = _backtest_core(
+                all_transactions=pd.DataFrame(),
+                prices=pd.DataFrame(),
+                params=params,
+                signals=pd.DataFrame(),
+                bayes_prior_strength=20.0,
+                decay_lambda=0.005,
+                scoring_mode="shrunk_alpha",
+            )
+
+        self.assertEqual(result.rank1_alpha, 5.0)
+        self.assertEqual(result.alpha_slope, 10.0)
 
 
 # ── Bug #6: Missing price windows should yield NaN (not 0.0) ─────────────────

@@ -5,8 +5,9 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", module="cryptography")
 
-# Ensure worktree src is importable
-sys.path.insert(0, "/tmp/wt-kelly/src")
+# Ensure repo src is importable regardless of working directory
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
 
 from datetime import date, timedelta
 

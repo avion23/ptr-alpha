@@ -604,6 +604,92 @@ def fetch_capitol(
     raise typer.Exit(0)
 
 
+@app.command()
+def validate(
+    ctx: typer.Context,
+    train_start: str = typer.Option("2022-01-01", help="Training window start (YYYY-MM-DD)"),
+    train_end: str = typer.Option("2023-12-31", help="Training window end (YYYY-MM-DD)"),
+    test_start: str = typer.Option("2024-01-01", help="Test window start (YYYY-MM-DD)"),
+    test_end: str = typer.Option("2025-06-30", help="Test window end (YYYY-MM-DD)"),
+    full_grid: bool = typer.Option(False, "--full-grid", help="Use full 1296-combo grid (slow)"),
+    data_dir: str = typer.Option("data", help="Data directory"),
+):
+    """
+    Honest time-split validation with snooping corrections.
+
+    Sweeps parameter configurations on the TRAINING window only, applies
+    Benjamini-Hochberg / Bonferroni corrections for multiple comparisons,
+    then evaluates the selected config exactly once on the TEST window.
+
+    Uses Newey-West HAC t-stats to correct for overlapping return windows.
+    Results are written to data/validation_results.json.
+    """
+    from analyzer.validation import run_validation
+
+    try:
+        ts = date.fromisoformat(train_start)
+        te = date.fromisoformat(train_end)
+        vs = date.fromisoformat(test_start)
+        ve = date.fromisoformat(test_end)
+    except ValueError:
+        print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
+        raise typer.Exit(1)
+
+    if te < ts:
+        print("Error: --train-end must be on or after --train-start", file=sys.stderr)
+        raise typer.Exit(1)
+    if ve < vs:
+        print("Error: --test-end must be on or after --test-start", file=sys.stderr)
+        raise typer.Exit(1)
+    if vs <= te:
+        print("Error: --test-start must be after --train-end (no overlap)", file=sys.stderr)
+        raise typer.Exit(1)
+
+    if full_grid:
+        grid = {
+            "horizon": [60, 90, 120],
+            "frequency_days": [30, 90],
+            "training_lookback_days": [180, 365],
+            "min_buyers": [2, 3, 5],
+            "top_n": [3, 5],
+            "decay_lambda": [0.001, 0.005, 0.02],
+            "bayes_prior_strength": [5, 20, 50],
+            "scoring_mode": ["shrunk_alpha", "consistency"],
+        }
+    else:
+        # Default ~36-combo grid: 3*3*2*2 combinations
+        grid = {
+            "horizon": [60, 90, 120],
+            "frequency_days": [30],
+            "training_lookback_days": [365],
+            "min_buyers": [2, 3, 5],
+            "top_n": [3, 5],
+            "decay_lambda": [0.005],
+            "bayes_prior_strength": [20],
+            "scoring_mode": ["shrunk_alpha", "consistency"],
+        }
+
+    n_trials = 1
+    for v in grid.values():
+        n_trials *= len(v)
+    print(f"Running validation with {n_trials} configs (trials for snooping correction)")
+
+    db_path = Path(data_dir) / "congress.duckdb"
+    try:
+        run_validation(
+            db_path=db_path,
+            train_start=ts,
+            train_end=te,
+            test_start=vs,
+            test_end=ve,
+            grid=grid,
+        )
+    except Exception:
+        logger.exception("Validation failed")
+        raise typer.Exit(1)
+    raise typer.Exit(0)
+
+
 def main():
     try:
         app()

@@ -92,7 +92,7 @@ def parse_year(year: int, db: Database, settings: Settings):
     for doc_id in df["doc_id"].unique():
         db.delete_transactions_for_doc(doc_id)
     
-    db.upsert_transactions(df)
+    db.upsert_transactions(df, source="house_pdf")
     print(f"  {year}: saved {len(df)} transactions")
     return len(df)
 

@@ -26,7 +26,7 @@ class TestIntegration(unittest.TestCase):
             'transaction_date': pd.date_range('2023-12-25', periods=30, freq='D'),
             'transaction_type': np.random.choice(['Purchase', 'Sale'], 30, p=[0.7, 0.3])
         })
-        db.upsert_transactions(transactions)
+        db.upsert_transactions(transactions, source="house_pdf")
 
         np.random.seed(99)
         tickers = sorted(list(set(transactions['ticker'].unique()) | {'SPY'}))

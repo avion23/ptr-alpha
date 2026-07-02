@@ -6,6 +6,7 @@ import duckdb
 import pandas as pd
 
 from analyzer.database import Database
+from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
 from .conftest import DatabaseTestCase
 
 
@@ -158,7 +159,7 @@ class TestTransactions(DatabaseTestCase):
                 "amount_midpoint": 32500.5,
             },
         ])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2)
         cols = {
@@ -181,7 +182,7 @@ class TestTransactions(DatabaseTestCase):
                 "transaction_type": "Buy",
             },
         ])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         self.assertTrue(self.db.transactions_exist(2024))
 
     def test_transactions_exist_returns_false_when_absent(self):
@@ -206,11 +207,84 @@ class TestTransactions(DatabaseTestCase):
                 "transaction_type": "Sale",
             },
         ])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2)
         types = set(result["transaction_type"].values)
         self.assertEqual(types, {"Purchase", "Sale"})
+
+    def test_upsert_dedupes_repeated_null_ticker_rows(self):
+        df = pd.DataFrame([{
+            "doc_id": "doc-null",
+            "member": "John Doe",
+            "ticker": None,
+            "transaction_date": date(2024, 3, 10),
+            "disclosure_date": date(2024, 3, 15),
+            "transaction_type": "Purchase",
+            "amount_raw": "$1,001 - $15,000",
+            "owner_code": None,
+            "asset_description": "Corporate bond",
+        }])
+        self.db.upsert_transactions(df, source="house_pdf")
+        self.db.upsert_transactions(df, source="house_pdf")
+
+        count = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        ticker = self.db.conn.execute("SELECT ticker FROM transactions").fetchone()[0]
+        self.assertEqual(count, 1)
+        self.assertIsNone(ticker)
+
+    def test_upsert_keeps_distinct_null_ticker_asset_descriptions(self):
+        df = pd.DataFrame([
+            {
+                "doc_id": "doc-null-assets",
+                "member": "John Doe",
+                "ticker": None,
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+                "amount_raw": "$1,001 - $15,000",
+                "asset_description": "Municipal bond A",
+            },
+            {
+                "doc_id": "doc-null-assets",
+                "member": "John Doe",
+                "ticker": None,
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+                "amount_raw": "$1,001 - $15,000",
+                "asset_description": "Municipal bond B",
+            },
+        ])
+        self.db.upsert_transactions(df, source="house_pdf")
+
+        descriptions = self.db.conn.execute(
+            "SELECT asset_description FROM transactions ORDER BY asset_description"
+        ).fetchall()
+        self.assertEqual([row[0] for row in descriptions], ["Municipal bond A", "Municipal bond B"])
+
+    def test_upsert_writes_source_and_conflict_preserves_existing_source(self):
+        df1 = pd.DataFrame([{
+            "doc_id": "doc-source",
+            "member": "Jane Doe",
+            "ticker": "AAPL",
+            "transaction_date": date(2024, 4, 1),
+            "disclosure_date": date(2024, 4, 5),
+            "transaction_type": "Purchase",
+            "amount_raw": "$1,001 - $15,000",
+            "asset_description": "Apple Inc",
+        }])
+        df2 = df1.copy()
+        df2["asset_description"] = "Apple Inc updated"
+
+        self.db.upsert_transactions(df1, source="house_pdf")
+        self.db.upsert_transactions(df2, source="capitol_trades")
+
+        row = self.db.conn.execute(
+            "SELECT source, asset_description FROM transactions WHERE doc_id = 'doc-source'"
+        ).fetchone()
+        self.assertEqual(row[0], "house_pdf")
+        self.assertEqual(row[1], "Apple Inc updated")
 
 
 class TestPrices(DatabaseTestCase):
@@ -320,7 +394,7 @@ class TestGetEntryPrices(DatabaseTestCase):
                 "amount_midpoint": 8000.5,
             },
         ])
-        self.db.upsert_transactions(tx)
+        self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
             ["AAPL"], date(2024, 1, 1), date(2024, 1, 10)
@@ -349,7 +423,7 @@ class TestGetEntryPrices(DatabaseTestCase):
                 "transaction_type": "Sell",
             },
         ])
-        self.db.upsert_transactions(tx)
+        self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
             ["AAPL"], date(2024, 1, 1), date(2024, 1, 10)
@@ -393,7 +467,7 @@ class TestGetEntryPrices(DatabaseTestCase):
                 "transaction_type": "Buy",
             },
         ])
-        self.db.upsert_transactions(tx)
+        self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
             ["AAPL"], date(2024, 1, 1), date(2024, 1, 10)
@@ -415,7 +489,7 @@ class TestGetEntryPrices(DatabaseTestCase):
             "disclosure_date": date(2024, 6, 1),
             "transaction_type": "Purchase",
         }])
-        self.db.upsert_transactions(tx)
+        self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
             ["AAPL"], date(2024, 6, 1), date(2024, 6, 1), max_staleness_days=30
@@ -435,7 +509,7 @@ class TestGetEntryPrices(DatabaseTestCase):
             "disclosure_date": date(2024, 1, 28),
             "transaction_type": "Purchase",
         }])
-        self.db.upsert_transactions(tx)
+        self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
             ["AAPL"], date(2024, 1, 28), date(2024, 1, 28), max_staleness_days=30
@@ -485,7 +559,7 @@ class TestDeleteTransactionsForDoc(DatabaseTestCase):
                 "transaction_type": "Sale",
             },
         ])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         self.assertEqual(len(self.db.get_transactions(2024)), 2)
 
         self.db.delete_transactions_for_doc("doc1")
@@ -504,7 +578,7 @@ class TestDeleteTransactionsForDoc(DatabaseTestCase):
                 "transaction_type": "Purchase",
             },
         ])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         self.db.delete_transactions_for_doc("nonexistent")
         self.assertEqual(len(self.db.get_transactions(2024)), 1)
 
@@ -579,7 +653,7 @@ class TestParseRunsTable(DatabaseTestCase):
                 "transaction_type": "Purchase",
             },
         ])
-        self.db.upsert_transactions(df1)
+        self.db.upsert_transactions(df1, source="house_pdf")
         self.assertEqual(len(self.db.get_transactions(2024)), 1)
 
         # Simulate re-parse: delete old, insert new with different data
@@ -594,11 +668,38 @@ class TestParseRunsTable(DatabaseTestCase):
                 "transaction_type": "Sale",
             },
         ])
-        self.db.upsert_transactions(df2)
+        self.db.upsert_transactions(df2, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[0]["ticker"], "MSFT")
         self.assertEqual(result.iloc[0]["transaction_type"], "Sale")
+
+
+class TestPhantomPurge(DatabaseTestCase):
+
+    def _insert_transaction(self, doc_id, ticker, asset_description):
+        self.db.conn.execute("""
+            INSERT INTO transactions (
+                doc_id, member, ticker, transaction_date, disclosure_date,
+                transaction_type, owner_code, amount_raw, asset_description, source
+            ) VALUES (?, 'John Doe', ?, DATE '2024-03-10', DATE '2024-03-15',
+                      'Purchase', '', '$1,001 - $15,000', ?, 'house_pdf')
+        """, [doc_id, ticker, asset_description])
+
+    def test_purge_script_dry_run_counts_and_execute_deletes_duplicates(self):
+        self._insert_transaction("doc-null-dupe", None, "Bond A")
+        self._insert_transaction("doc-null-dupe", None, "Bond A")
+        self._insert_transaction("doc-null-dupe", None, "Bond B")
+        self._insert_transaction("doc-ticker", "AAPL", "Apple")
+
+        counts = count_phantom_rows(self.db.conn)
+        self.assertEqual(counts, {True: 1})
+
+        stats = purge_phantom_rows(self.db.conn)
+        self.assertEqual(stats, {"before": 4, "deleted": 1, "after": 3})
+        self.assertEqual(count_phantom_rows(self.db.conn), {})
+        remaining = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        self.assertEqual(remaining, 3)
 
 
 if __name__ == "__main__":

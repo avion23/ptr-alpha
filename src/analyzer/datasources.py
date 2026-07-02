@@ -370,7 +370,7 @@ class HouseTransactionSource(TransactionSource):
         for doc_id in df["doc_id"].unique():
             self.db.delete_transactions_for_doc(doc_id)
 
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         logger.info(f"Saved {len(df)} transactions to database")
 
 

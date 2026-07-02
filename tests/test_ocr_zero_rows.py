@@ -48,6 +48,7 @@ class TestOcrZeroRows(unittest.TestCase):
         from scripts import ocr_zero_rows
         self.assertIsNone(ocr_zero_rows.normalize_date("01/32/24"))
         self.assertIsNone(ocr_zero_rows.normalize_date("01/00/24"))
+        self.assertIsNone(ocr_zero_rows.normalize_date("02/31/24"))
 
     # --- parse_output ---
 

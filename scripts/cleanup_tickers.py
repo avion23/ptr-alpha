@@ -80,22 +80,23 @@ def is_cash_or_fund(ticker: str) -> bool:
 
 def main():
     con = duckdb.connect('data/congress.duckdb')
-    
-    # Get distinct tickers that don't look like proper ticker symbols
-    rows = con.execute("""
-        SELECT DISTINCT ticker FROM transactions
-        WHERE ticker IS NOT NULL
-          AND ticker NOT SIMILAR TO '[A-Z]{1,5}(\\.[AB])?'
-          AND length(ticker) > 5
-    """).fetchall()
-    
-    total_updated = 0
-    total_deleted = 0
-    total_nulled = 0
-    distinct_fixed = 0
-    
-    con.execute("BEGIN TRANSACTION")
+    in_transaction = False
     try:
+        # Get distinct tickers that don't look like proper ticker symbols
+        rows = con.execute("""
+            SELECT DISTINCT ticker FROM transactions
+            WHERE ticker IS NOT NULL
+              AND ticker NOT SIMILAR TO '[A-Z]{1,5}(\\.[AB])?'
+              AND length(ticker) > 5
+        """).fetchall()
+        
+        total_updated = 0
+        total_deleted = 0
+        total_nulled = 0
+        distinct_fixed = 0
+        
+        con.execute("BEGIN TRANSACTION")
+        in_transaction = True
         for (orig,) in rows:
             upper = orig.upper()
             
@@ -160,21 +161,24 @@ def main():
             if cnt:
                 con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [garbage])
                 total_nulled += cnt
+        con.execute("COMMIT")
+        in_transaction = False
+        
+        con.execute("CHECKPOINT")
+        print(f'Fixed {distinct_fixed} distinct name→ticker mappings ({total_updated} rows updated)')
+        print(f'Deleted {total_deleted} duplicates after remap')
+        print(f'NULL-ed {total_nulled} cash/fund rows')
+        print()
+        print('Final state:')
+        print('  Total tx:', con.execute("SELECT COUNT(*) FROM transactions").fetchone()[0])
+        print('  With ticker:', con.execute("SELECT COUNT(*) FROM transactions WHERE ticker IS NOT NULL").fetchone()[0])
+        print('  Distinct tickers:', con.execute("SELECT COUNT(DISTINCT ticker) FROM transactions WHERE ticker IS NOT NULL").fetchone()[0])
     except Exception:
-        con.execute("ROLLBACK")
+        if in_transaction:
+            con.execute("ROLLBACK")
         raise
-    con.execute("COMMIT")
-    
-    con.execute("CHECKPOINT")
-    print(f'Fixed {distinct_fixed} distinct name→ticker mappings ({total_updated} rows updated)')
-    print(f'Deleted {total_deleted} duplicates after remap')
-    print(f'NULL-ed {total_nulled} cash/fund rows')
-    print()
-    print('Final state:')
-    print('  Total tx:', con.execute("SELECT COUNT(*) FROM transactions").fetchone()[0])
-    print('  With ticker:', con.execute("SELECT COUNT(*) FROM transactions WHERE ticker IS NOT NULL").fetchone()[0])
-    print('  Distinct tickers:', con.execute("SELECT COUNT(DISTINCT ticker) FROM transactions WHERE ticker IS NOT NULL").fetchone()[0])
-    con.close()
+    finally:
+        con.close()
 
 
 if __name__ == "__main__":

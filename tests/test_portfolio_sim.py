@@ -327,21 +327,22 @@ class TestDrawdownFromInitialCapital(unittest.TestCase):
     def test_drawdown_captures_first_period_loss(self, _mock_sector):
         cfg = PortfolioConfig(
             initial_capital=10000, max_positions=1, hold_period_days=365,
-            entry_slippage_pct=0.0, exit_slippage_pct=0.0,
+            entry_slippage_pct=0.01, exit_slippage_pct=0.0,
         )
         sim = PortfolioSimulator(cfg)
-        # Price declines 2% per day from 100 -> drawdown should be negative.
+        # Flat prices with entry slippage make the first recorded snapshot the
+        # trough relative to initial capital; later snapshots are not lower.
         prices = _make_prices(
             ["A"], "2024-01-01", "2024-01-10",
-            base_prices={"A": 100.0}, daily_drift=-0.02,
+            base_prices={"A": 100.0}, daily_drift=0.0,
         )
         sim.run(_make_recs(["A"], "2024-01-01"), prices,
                 date(2024, 1, 1), date(2024, 1, 5))
         metrics = sim.compute_metrics(prices)
-        # Position loses value continuously from the initial capital; the
-        # pre-fix code reported 0% drawdown because the peak only tracked
-        # post-entry equity.
-        self.assertLess(metrics["max_drawdown_pct"], -1.0)
+        # The pre-fix code reported 0% drawdown because the peak only tracked
+        # post-entry equity; anchoring to initial capital captures the first
+        # snapshot drawdown caused by entry slippage.
+        self.assertAlmostEqual(metrics["max_drawdown_pct"], -0.24, places=2)
 
 
 class TestSectorExposureMarkToMarket(unittest.TestCase):

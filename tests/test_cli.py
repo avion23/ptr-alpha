@@ -122,6 +122,17 @@ class TestCliApp(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("CSV output is not supported for --ticker analysis", result.output)
 
+    def test_member_mode_with_ticker_does_not_require_member(self):
+        mock_ctx = MagicMock()
+        mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)
+
+        with patch("analyzer.cli.get_context", return_value=mock_ctx), \
+             patch("analyzer.cli.run_ticker_analysis", return_value=True):
+            result = self.runner.invoke(app, ["analyze", "--mode", "member", "--ticker", "AAPL"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn("--mode member requires --member NAME", result.output)
+
     def test_tickers_mode_csv_output_warns_not_supported(self):
         mock_ctx = MagicMock()
         mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)

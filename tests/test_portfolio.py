@@ -187,6 +187,44 @@ class TestSimulatePortfolioReturns(unittest.TestCase):
         )
         self.assertTrue(result.empty)
 
+    def test_zero_entry_price_skips_position_and_spy_return(self):
+        portfolio = pd.DataFrame({
+            "ticker": ["A"],
+            "weight": [1.0],
+            "as_of_date": [pd.Timestamp("2024-01-01").date()],
+        })
+        prices = pd.DataFrame(
+            {"A": [0.0, 1.0], "SPY": [0.0, 1.0]},
+            index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        )
+
+        result = simulate_portfolio_returns(
+            portfolio, prices, horizon=1, entry_slippage_bps=0.0, exit_slippage_bps=0.0,
+        )
+
+        self.assertEqual(result.iloc[0]["num_positions"], 0)
+        self.assertEqual(result.iloc[0]["portfolio_return"], 0.0)
+        self.assertEqual(result.iloc[0]["spy_return"], 0.0)
+
+    def test_zero_exit_price_with_positive_entry_is_full_loss(self):
+        portfolio = pd.DataFrame({
+            "ticker": ["A"],
+            "weight": [1.0],
+            "as_of_date": [pd.Timestamp("2024-01-01").date()],
+        })
+        prices = pd.DataFrame(
+            {"A": [100.0, 0.0], "SPY": [100.0, 0.0]},
+            index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        )
+
+        result = simulate_portfolio_returns(
+            portfolio, prices, horizon=1, entry_slippage_bps=0.0, exit_slippage_bps=0.0,
+        )
+
+        self.assertEqual(result.iloc[0]["num_positions"], 1)
+        self.assertEqual(result.iloc[0]["portfolio_return"], -100.0)
+        self.assertEqual(result.iloc[0]["spy_return"], -100.0)
+
 
 class TestComputePortfolioMetrics(unittest.TestCase):
     def test_basic_metrics(self):

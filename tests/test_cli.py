@@ -122,6 +122,24 @@ class TestCliApp(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("CSV output is not supported for --ticker analysis", result.output)
 
+    def test_ticker_with_non_default_mode_warns(self):
+        mock_ctx = MagicMock()
+        mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)
+
+        with patch("analyzer.cli.get_context", return_value=mock_ctx), \
+             patch("analyzer.cli.run_ticker_analysis", return_value=True):
+            # Non-default mode should produce warning
+            result = self.runner.invoke(app, ["analyze", "--mode", "sales", "--ticker", "AAPL"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("--mode sales is ignored when --ticker is provided", result.output)
+
+        with patch("analyzer.cli.get_context", return_value=mock_ctx), \
+             patch("analyzer.cli.run_ticker_analysis", return_value=True):
+            # Default mode should produce no warning
+            result = self.runner.invoke(app, ["analyze", "--ticker", "AAPL"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn("is ignored when --ticker is provided", result.output)
+
     def test_member_mode_with_ticker_does_not_require_member(self):
         mock_ctx = MagicMock()
         mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)

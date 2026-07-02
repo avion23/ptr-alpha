@@ -123,6 +123,8 @@ def analyze(
         logger.debug("Freshness check failed", exc_info=True)
 
     if ticker:
+        if mode != "ranks":
+            print(f"WARNING: --mode {mode} is ignored when --ticker is provided; running ticker analysis.", file=sys.stderr)
         if output == "csv":
             print("WARNING: CSV output is not supported for --ticker analysis; using console output.", file=sys.stderr)
         params = TickerAnalysisParams(ticker=ticker, year=year, horizon=horizons[0], threshold=threshold)

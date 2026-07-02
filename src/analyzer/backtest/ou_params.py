@@ -42,7 +42,7 @@ def _compute_ticker_ou_params(
             ticker, signals_df, prices_df, as_of_date, horizon
         )
 
-    if not curves and ticker_col:
+    if not curves:
         curves = _build_global_curves(
             signals_df, prices_df, as_of_date, horizon
         )

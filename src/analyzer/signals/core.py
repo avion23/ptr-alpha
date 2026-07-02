@@ -149,7 +149,7 @@ def _populate_spy_arrays(
 def calculate_signal_potential(
     entry_prices_df: pd.DataFrame,
     prices_df: pd.DataFrame,
-    horizons: list[int] = [30, 60, 90, 180],
+    horizons: list[int] | None = None,
     decay_lambda: float | None = None,
 ) -> pd.DataFrame:
     """Compute per-(transaction, horizon) signal potential metrics.
@@ -165,6 +165,8 @@ def calculate_signal_potential(
     # Resolve at call time so callers that mutate the module global
     # (e.g. the parameter sweep) see the updated value. A default-arg
     # would freeze the value at function-definition time.
+    if horizons is None:
+        horizons = [30, 60, 90, 180]
     if decay_lambda is None:
         decay_lambda = DECAY_LAMBDA
     _validate_inputs(entry_prices_df, prices_df)
@@ -323,7 +325,7 @@ def _assemble_result_dataframe(signals: pd.DataFrame, metadata: dict, result_arr
 def compute_signal_potential_with_member_decay(
     entry_prices_df: pd.DataFrame,
     prices_df: pd.DataFrame,
-    horizons: list[int] = [30, 60, 90, 180],
+    horizons: list[int] | None = None,
     member_decay_map: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Compute signal potential with per-member decay rates.
@@ -331,6 +333,8 @@ def compute_signal_potential_with_member_decay(
     If member_decay_map is provided, each member's trades use their
     personal decay lambda instead of the global default.
     """
+    if horizons is None:
+        horizons = [30, 60, 90, 180]
     if member_decay_map is None or not member_decay_map:
         return calculate_signal_potential(entry_prices_df, prices_df, horizons)
 

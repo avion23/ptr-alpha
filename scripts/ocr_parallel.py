@@ -101,16 +101,21 @@ def db_writer():
 
 def _flush(batch):
     """Insert validated documents with delete-then-insert semantics."""
-    for item in batch:
+    errors_in_batch = [item for item in batch if item.get("status") in ("error", "rejected")]
+    if errors_in_batch:
+        con = duckdb.connect(DB_PATH)
         try:
-            if item.get("status") in ("error", "rejected"):
-                con = duckdb.connect(DB_PATH)
+            for item in errors_in_batch:
                 record_parse_run(
                     con, item["doc_id"], item["year"], item["status"],
                     item["raw_count"], 0, item.get("error", ""),
                     parser_version="v4-gemini-parallel",
                 )
-                con.close()
+        finally:
+            con.close()
+    for item in batch:
+        try:
+            if item.get("status") in ("error", "rejected"):
                 continue
             count = insert_transactions(
                 item["doc_id"], item["year"], item["member"], item["transactions"],

@@ -126,9 +126,12 @@ def normalize_date(date_str):
     if not m:
         return None
     month, day, year = m.groups()
+    month_i, day_i = int(month), int(day)
+    if month_i < 1 or month_i > 12 or day_i < 1 or day_i > 31:
+        return None
     if len(year) == 2:
         year = "20" + year if int(year) < 50 else "19" + year
-    return f"{year}-{int(month):02d}-{int(day):02d}"
+    return f"{year}-{month_i:02d}-{day_i:02d}"
 
 def extract_ticker(asset):
     """Extract stock ticker from common House asset formats."""
@@ -463,7 +466,12 @@ def insert_transactions(doc_id, year, member, transactions, *, db_path: str,
     if errors:
         print(f"  INSERT ERRORS ({len(errors)}): {errors[:3]}", flush=True)
     if not rows:
-        record_parse_run(conn, doc_id, year, "no_txs", raw_count if raw_count is not None else len(transactions), 0, "; ".join(errors), parser_version=parser_version)
+        # If transactions were provided but all failed validation, record as
+        # "error" so get_zero_row_pdfs() will retry them; only use "no_txs"
+        # when the caller passed an empty list (nothing to retry).
+        input_count = raw_count if raw_count is not None else len(transactions)
+        status = "no_txs" if input_count == 0 else "error"
+        record_parse_run(conn, doc_id, year, status, input_count, 0, "; ".join(errors), parser_version=parser_version)
         conn.execute("CHECKPOINT")
         conn.close()
         return 0

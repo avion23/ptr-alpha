@@ -26,23 +26,26 @@ def fetch_all_trades() -> list[dict]:
     all_trades: list[dict] = []
     page = 1
 
-    while True:
-        params = {"page": page, "per_page": PER_PAGE}
-        resp = session.get(f"{BASE_URL}/trades", params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+    try:
+        while True:
+            params = {"page": page, "per_page": PER_PAGE}
+            resp = session.get(f"{BASE_URL}/trades", params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
 
-        trades = data.get("trades", [])
-        all_trades.extend(trades)
+            trades = data.get("trades", [])
+            all_trades.extend(trades)
 
-        total_pages = data.get("pages", 1)
-        total = data.get("total", "?")
-        print(f"  Page {page}/{total_pages}: +{len(trades)} trades (cumulative: {len(all_trades)}/{total})")
+            total_pages = data.get("pages", 1)
+            total = data.get("total", "?")
+            print(f"  Page {page}/{total_pages}: +{len(trades)} trades (cumulative: {len(all_trades)}/{total})")
 
-        if page >= total_pages:
-            break
-        page += 1
-        time.sleep(0.3)  # be polite
+            if page >= total_pages:
+                break
+            page += 1
+            time.sleep(0.3)  # be polite
+    finally:
+        session.close()
 
     return all_trades
 

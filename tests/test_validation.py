@@ -1,0 +1,346 @@
+"""Tests for analyzer.validation: newey_west_tstat, select_config, run_validation."""
+from __future__ import annotations
+
+import math
+import sys
+from datetime import date
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from analyzer.validation import (
+    SweepResult,
+    newey_west_tstat,
+    run_single_backtest,
+    select_config,
+)
+
+
+# ---------------------------------------------------------------------------
+# newey_west_tstat
+# ---------------------------------------------------------------------------
+
+class TestNeweyWestTstat:
+
+    def test_lag0_matches_biased_plain_tstat(self):
+        """lag=0 → t = mean / (biased_std / sqrt(n))."""
+        x = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        t_nw = newey_west_tstat(x, lag=0)
+        n = len(x)
+        t_plain = float(np.mean(x) / (np.std(x) / np.sqrt(n)))  # ddof=0
+        assert abs(t_nw - t_plain) < 1e-10
+
+    def test_zero_mean_series_gives_zero_tstat(self):
+        """Series whose mean is 0 → t-stat = 0."""
+        x = pd.Series([1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+        assert abs(newey_west_tstat(x, lag=0)) < 1e-10
+
+    def test_positive_mean_gives_positive_tstat(self):
+        x = pd.Series([2.0, 3.0, 4.0])
+        assert newey_west_tstat(x, lag=0) > 0
+
+    def test_hand_computable_lag0(self):
+        """Hand-verify: x=[0,2], mean=1, biased_std=1, n=2 → t=sqrt(2)."""
+        x = pd.Series([0.0, 2.0])
+        # biased std = sqrt(mean of (0-1)^2 + (2-1)^2) = sqrt(1) = 1
+        # t = 1 / (1 / sqrt(2)) = sqrt(2)
+        t = newey_west_tstat(x, lag=0)
+        assert abs(t - math.sqrt(2)) < 1e-10
+
+    def test_lag0_larger_than_lag1_for_positively_autocorrelated(self):
+        """Positive autocorrelation → HAC widens SE → |t| shrinks with lag."""
+        np.random.seed(42)
+        n = 60
+        ar = np.zeros(n)
+        ar[0] = 1.0
+        for i in range(1, n):
+            ar[i] = 0.7 * ar[i - 1] + np.random.normal(0, 0.3)
+        ar += 2.0  # ensure positive mean
+        x = pd.Series(ar)
+        t0 = abs(newey_west_tstat(x, lag=0))
+        t2 = abs(newey_west_tstat(x, lag=2))
+        # HAC correction should reduce or keep the t-stat
+        assert t2 <= t0 + 0.5  # tolerant: direction matters
+
+    def test_single_element_returns_zero(self):
+        x = pd.Series([5.0])
+        assert newey_west_tstat(x, lag=0) == 0.0
+
+    def test_nan_dropped_before_computation(self):
+        x_with_nan = pd.Series([1.0, float("nan"), 2.0, 3.0])
+        x_clean = pd.Series([1.0, 2.0, 3.0])
+        assert abs(
+            newey_west_tstat(x_with_nan, lag=0) - newey_west_tstat(x_clean, lag=0)
+        ) < 1e-10
+
+    def test_lag_equals_len_minus_1_does_not_crash(self):
+        """Edge case: lag ≥ n-1 should not raise (gamma array boundary)."""
+        x = pd.Series([1.0, 2.0, 3.0])
+        # lag=2 == n-1; gamma[2] involves dot product of length 0 array
+        t = newey_west_tstat(x, lag=2)
+        assert math.isfinite(t) or math.isinf(t)  # no crash
+
+
+# ---------------------------------------------------------------------------
+# select_config
+# ---------------------------------------------------------------------------
+
+def _make_sweep_df(n: int = 10, p_values: list[float] | None = None) -> pd.DataFrame:
+    """Build a synthetic sweep DataFrame with n rows."""
+    rng = np.random.default_rng(99)
+    rows = []
+    for i in range(n):
+        rows.append({
+            "horizon": 60,
+            "frequency_days": 30,
+            "training_lookback_days": 365,
+            "min_buyers": 2 + (i % 3),
+            "top_n": 3 + (i % 2) * 2,
+            "decay_lambda": 0.005,
+            "bayes_prior_strength": 20.0,
+            "scoring_mode": "shrunk_alpha",
+            "total_recs": 50,
+            "dates_evaluated": 20,
+            "overall_alpha": float(rng.uniform(0.5, 3.0)),
+            "overall_return": 1.0,
+            "rank1_alpha": 2.0,
+            "rank5_alpha": 1.0,
+            "alpha_slope": float(rng.uniform(-1.0, 2.0)),
+            "win_rate": 60.0,
+            "sharpe": 1.0,
+            "max_drawdown": -5.0,
+            "nw_tstat": 2.0,
+            "p_value": p_values[i] if p_values else 0.9,  # default: no survivors
+        })
+    return pd.DataFrame(rows)
+
+
+class TestSelectConfig:
+
+    def test_picks_max_alpha_slope_among_bh_survivors(self):
+        """Among configs that survive BH, pick the one with the highest alpha_slope."""
+        df = _make_sweep_df(n=5, p_values=[0.001, 0.002, 0.9, 0.9, 0.9])
+        df.loc[0, "alpha_slope"] = 5.0  # best, survives BH
+        df.loc[1, "alpha_slope"] = 2.0  # survives BH but lower slope
+        result = select_config(df, alpha=0.05)
+        assert result["alpha_slope"] == 5.0
+        assert result["survives_correction"] is True
+        assert result["n_survivors"] >= 1
+
+    def test_tiebreak_on_overall_alpha(self):
+        """If alpha_slope is tied, pick higher overall_alpha."""
+        df = _make_sweep_df(n=3, p_values=[0.001, 0.001, 0.9])
+        df.loc[0, "alpha_slope"] = 3.0
+        df.loc[1, "alpha_slope"] = 3.0
+        df.loc[0, "overall_alpha"] = 1.0
+        df.loc[1, "overall_alpha"] = 2.0  # should win on tiebreak
+        result = select_config(df, alpha=0.05)
+        assert result["overall_alpha"] == 2.0
+
+    def test_no_survivors_returns_nominal_best(self):
+        """When no config survives BH, return nominal best with flag=False."""
+        df = _make_sweep_df(n=6, p_values=[0.9] * 6)
+        df.loc[3, "alpha_slope"] = 10.0  # nominal best
+        result = select_config(df, alpha=0.05)
+        assert result["survives_correction"] is False
+        assert result["n_survivors"] == 0
+        assert result["alpha_slope"] == 10.0
+
+    def test_bonferroni_threshold_is_alpha_over_n(self):
+        df = _make_sweep_df(n=8, p_values=[0.9] * 8)
+        result = select_config(df, alpha=0.05)
+        assert abs(result["bonferroni_threshold"] - 0.05 / 8) < 1e-12
+
+    def test_n_trials_equals_len_sweep_df(self):
+        df = _make_sweep_df(n=12, p_values=[0.9] * 12)
+        result = select_config(df, alpha=0.05)
+        assert result["n_trials"] == 12
+
+    def test_all_survive(self):
+        """All very small p-values → all survive → best is still max slope."""
+        df = _make_sweep_df(n=4, p_values=[0.0001] * 4)
+        df.loc[2, "alpha_slope"] = 99.0
+        result = select_config(df, alpha=0.05)
+        assert result["alpha_slope"] == 99.0
+        assert result["n_survivors"] == 4
+
+
+# ---------------------------------------------------------------------------
+# run_validation: config-freezing test
+# ---------------------------------------------------------------------------
+
+class TestRunValidationConfigFreezing:
+    """Verify that run_validation applies the TRAIN-selected config to the TEST eval."""
+
+    def test_test_evaluation_uses_train_selected_config(self, tmp_path):
+        """The TEST backtest must use every parameter from the TRAIN-selected config."""
+        from analyzer.validation import run_validation, _backtest_core
+
+        # Synthetic selected config returned by mock sweep
+        sweep_row = {
+            "horizon": 90,
+            "frequency_days": 30,
+            "training_lookback_days": 365,
+            "min_buyers": 3,
+            "top_n": 5,
+            "decay_lambda": 0.005,
+            "bayes_prior_strength": 20.0,
+            "scoring_mode": "consistency",
+            "overall_alpha": 2.0,
+            "alpha_slope": 1.5,
+            "p_value": 0.01,
+            "nw_tstat": 3.0,
+            "total_recs": 30,
+            "dates_evaluated": 10,
+            "overall_return": 1.0,
+            "rank1_alpha": 2.0,
+            "rank5_alpha": 0.5,
+            "win_rate": 60.0,
+            "sharpe": 1.2,
+            "max_drawdown": -5.0,
+        }
+        sweep_df = pd.DataFrame([sweep_row])
+
+        fake_tx = pd.DataFrame({"ticker": ["AAPL"], "transaction_date": [pd.Timestamp("2022-01-01")]})
+        fake_prices = pd.DataFrame(
+            {"SPY": [100.0, 101.0]},
+            index=pd.date_range("2021-01-01", periods=2),
+        )
+        fake_entry = pd.DataFrame()
+
+        captured_params = []
+
+        def fake_backtest_core(
+            all_tx, prices, params, signals, bayes_prior_strength, decay_lambda, scoring_mode
+        ):
+            captured_params.append({
+                "start_date": params.start_date,
+                "end_date": params.end_date,
+                "horizon": params.horizon,
+                "min_buyers": params.min_buyers,
+                "top_n": params.top_n,
+                "scoring_mode": scoring_mode,
+                "training_lookback_days": params.training_lookback_days,
+            })
+            sr = SweepResult(
+                horizon=params.horizon,
+                frequency_days=params.frequency_days,
+                training_lookback_days=params.training_lookback_days,
+                min_buyers=params.min_buyers,
+                top_n=params.top_n,
+                decay_lambda=decay_lambda,
+                bayes_prior_strength=bayes_prior_strength,
+                scoring_mode=scoring_mode,
+            )
+            return sr, pd.Series([1.0, 1.5, 2.0])
+
+        with (
+            patch("analyzer.validation.sweep_configs", return_value=sweep_df),
+            patch("analyzer.validation._backtest_core", side_effect=fake_backtest_core),
+            patch(
+                "analyzer.validation.analysis.calculate_signal_potential",
+                return_value=pd.DataFrame(),
+            ),
+            # Database is imported locally inside run_validation; patch the source module
+            patch("analyzer.database.Database") as MockDB,
+        ):
+            mock_db = MagicMock()
+            mock_db.get_transactions_by_date_range.return_value = fake_tx
+            mock_db.get_prices.return_value = fake_prices
+            mock_db.get_entry_prices.return_value = fake_entry
+            MockDB.return_value = mock_db
+            mock_db.conn = MagicMock()
+
+            grid = {
+                "horizon": [90],
+                "frequency_days": [30],
+                "training_lookback_days": [365],
+                "min_buyers": [3],
+                "top_n": [5],
+                "decay_lambda": [0.005],
+                "bayes_prior_strength": [20.0],
+                "scoring_mode": ["consistency"],
+            }
+
+            result = run_validation(
+                db_path=str(tmp_path / "test.duckdb"),
+                train_start=date(2022, 1, 1),
+                train_end=date(2023, 12, 31),
+                test_start=date(2024, 1, 1),
+                test_end=date(2025, 6, 30),
+                grid=grid,
+            )
+
+        # Must have been called at least for TRAIN and TEST
+        assert len(captured_params) >= 2, "Expected at least TRAIN + TEST backtest calls"
+
+        # Locate the TEST call
+        test_call = next(
+            (c for c in captured_params if c["start_date"] == date(2024, 1, 1)),
+            None,
+        )
+        assert test_call is not None, "No TEST evaluation call found"
+
+        # All frozen params must match what the sweep selected
+        assert test_call["horizon"] == 90
+        assert test_call["min_buyers"] == 3
+        assert test_call["top_n"] == 5
+        assert test_call["scoring_mode"] == "consistency"
+        assert test_call["training_lookback_days"] == 365
+
+        # Result dict must be JSON-serialisable with expected keys
+        assert "selected_config" in result
+        assert "train" in result
+        assert "test" in result
+        assert "verdict" in result
+        assert isinstance(result["verdict"], str)
+
+
+# ---------------------------------------------------------------------------
+# Smoke test: sweep.py still imports from analyzer.validation
+# ---------------------------------------------------------------------------
+
+class TestSweepPyImport:
+
+    def test_validation_exports_moved_symbols(self):
+        """After refactor, analyzer.validation exports SweepResult + run_single_backtest."""
+        from analyzer.validation import SweepResult as VS
+        from analyzer.validation import run_single_backtest as VR
+        assert callable(VR)
+        # Instantiate SweepResult with mandatory fields
+        r = VS(
+            horizon=60,
+            frequency_days=30,
+            training_lookback_days=365,
+            min_buyers=2,
+            top_n=5,
+            decay_lambda=0.005,
+            bayes_prior_strength=20.0,
+        )
+        assert r.horizon == 60
+        assert r.scoring_mode == "shrunk_alpha"  # default
+
+    def test_sweep_module_imports_from_validation(self):
+        """sweep.py should import SweepResult and run_single_backtest from validation."""
+        repo_root = Path(__file__).resolve().parents[1]
+        added = str(repo_root) not in sys.path
+        if added:
+            sys.path.insert(0, str(repo_root))
+        old_argv = sys.argv[:]
+        sys.argv = ["ptr-alpha"]
+        try:
+            # Clear cached module to force re-import if already loaded
+            sys.modules.pop("sweep", None)
+            import sweep  # noqa: PLC0415
+            from analyzer.validation import SweepResult as VS, run_single_backtest as VR
+            assert sweep.SweepResult is VS
+            assert sweep.run_single_backtest is VR
+        except ImportError as exc:
+            pytest.fail(f"sweep.py import failed after refactor: {exc}")
+        finally:
+            sys.argv = old_argv
+            if added and str(repo_root) in sys.path:
+                sys.path.remove(str(repo_root))

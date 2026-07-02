@@ -10,7 +10,7 @@ import itertools
 import os
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 
@@ -22,137 +22,11 @@ from analyzer.database import Database
 from analyzer import analysis
 from analyzer.pipeline import BacktestParams
 from analyzer import signals as signals_mod
-
-
-@dataclass
-class SweepResult:
-    horizon: int
-    frequency_days: int
-    training_lookback_days: int
-    min_buyers: int
-    top_n: int
-    decay_lambda: float
-    bayes_prior_strength: float
-    scoring_mode: str = "shrunk_alpha"
-    total_recs: int = 0
-    dates_evaluated: int = 0
-    overall_alpha: float = 0.0
-    overall_return: float = 0.0
-    rank1_alpha: float = 0.0
-    rank5_alpha: float = 0.0
-    alpha_slope: float = 0.0
-    win_rate: float = 0.0
-    sharpe: float = 0.0
-    max_drawdown: float = 0.0
-
-
-def run_single_backtest(
-    all_transactions: pd.DataFrame,
-    prices: pd.DataFrame,
-    params: BacktestParams,
-    signals: pd.DataFrame,
-    bayes_prior_strength: float,
-    decay_lambda: float,
-    scoring_mode: str = "shrunk_alpha",
-) -> SweepResult:
-    """Run one backtest with given params and return metrics."""
-    old_bayes = signals_mod.BAYES_PRIOR_STRENGTH
-    old_decay = signals_mod.DECAY_LAMBDA
-    signals_mod.BAYES_PRIOR_STRENGTH = bayes_prior_strength
-    signals_mod.DECAY_LAMBDA = decay_lambda
-
-    try:
-        as_of_dates = pd.date_range(
-            params.start_date, params.end_date, freq=f"{params.frequency_days}D"
-        )
-
-        all_results = []
-        for as_of in as_of_dates:
-            as_of_ts = pd.Timestamp(as_of)
-            recs = analysis.backtest_recommendations(
-                signals, all_transactions, as_of_ts,
-                horizon=params.horizon,
-                lookback_days=params.lookback_days,
-                min_buyers=params.min_buyers,
-                top_n=params.top_n,
-                threshold=params.threshold,
-                prices_df=prices,
-                training_lookback_days=params.training_lookback_days,
-                scoring_mode=scoring_mode,
-            )
-            if recs.empty:
-                continue
-            try:
-                evaluated = analysis.evaluate_backtest(
-                    recs, prices, as_of_ts, params.horizon
-                )
-                evaluated = evaluated.dropna(subset=["bt_return_pct"])
-                evaluated.insert(0, "as_of_date", as_of_ts.date())
-                all_results.append(evaluated)
-            except Exception:
-                continue
-
-        if not all_results:
-            return SweepResult(
-                horizon=params.horizon,
-                frequency_days=params.frequency_days,
-                training_lookback_days=params.training_lookback_days,
-                min_buyers=params.min_buyers,
-                top_n=params.top_n,
-                decay_lambda=decay_lambda,
-                bayes_prior_strength=bayes_prior_strength,
-                scoring_mode=scoring_mode,
-            )
-
-        combined = pd.concat(all_results, ignore_index=True)
-        valid = combined.dropna(subset=["bt_alpha_pct"])
-
-        result = SweepResult(
-            horizon=params.horizon,
-            frequency_days=params.frequency_days,
-            training_lookback_days=params.training_lookback_days,
-            min_buyers=params.min_buyers,
-            top_n=params.top_n,
-            decay_lambda=decay_lambda,
-            bayes_prior_strength=bayes_prior_strength,
-            scoring_mode=scoring_mode,
-            total_recs=len(combined),
-            dates_evaluated=int(valid["as_of_date"].nunique()),
-            overall_alpha=round(float(valid["bt_alpha_pct"].mean()), 2),
-            overall_return=round(float(valid["bt_return_pct"].mean()), 2),
-        )
-
-        rank_alpha = valid.groupby("rank")["bt_alpha_pct"].mean()
-        if 1 in rank_alpha.index:
-            result.rank1_alpha = round(float(rank_alpha.loc[1]), 2)
-        if 5 in rank_alpha.index:
-            result.rank5_alpha = round(float(rank_alpha.loc[5]), 2)
-        result.alpha_slope = round(result.rank5_alpha - result.rank1_alpha, 2)
-
-        result.win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
-
-        if len(valid) > 1:
-            mean_alpha = valid["bt_alpha_pct"].mean()
-            std_alpha = valid["bt_alpha_pct"].std()
-            if std_alpha > 0:
-                periods_per_year = 365 / params.frequency_days
-                result.sharpe = round(
-                    float(mean_alpha / std_alpha * (periods_per_year ** 0.5)), 2
-                )
-
-        cumulative = (1 + valid["bt_alpha_pct"] / 100).cumprod()
-        rolling_max = cumulative.cummax()
-        drawdown = (cumulative - rolling_max) / rolling_max
-        result.max_drawdown = round(float(drawdown.min()) * 100, 2)
-
-        return result
-    finally:
-        signals_mod.BAYES_PRIOR_STRENGTH = old_bayes
-        signals_mod.DECAY_LAMBDA = old_decay
+from analyzer.validation import SweepResult, run_single_backtest  # noqa: F401  (re-exported)
 
 
 def main():
-    db = Database(Path("data") / "congress.duckdb", read_only=False)
+    db = Database(Path("data") / "congress.duckdb", read_only=True)
 
     # Load data once from DB (no yfinance — avoids rate limits)
     tx_start = pd.Timestamp("2021-10-07")

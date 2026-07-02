@@ -345,7 +345,7 @@ class TestCapitolTradesSourceSchema(unittest.TestCase):
 
         df = self.source.fetch_trades("Nancy Pelosi")
         # This should not raise
-        self.source.db.upsert_transactions(df)
+        self.source.db.upsert_transactions(df, source="capitol_trades")
 
         result = self.source.db.get_transactions(2025)
         self.assertGreaterEqual(len(result), 2)

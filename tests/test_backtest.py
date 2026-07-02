@@ -785,7 +785,7 @@ class TestDatabaseDateRange(DatabaseTestCase):
             "disclosure_date": pd.to_datetime(["2024-01-05", "2024-06-05", "2024-12-05"]),
             "transaction_type": ["Purchase", "Purchase", "Purchase"],
         })
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
 
         result = self.db.get_transactions_by_date_range(
             date(2024, 3, 1), date(2024, 10, 1)
@@ -802,7 +802,7 @@ class TestDatabaseDateRange(DatabaseTestCase):
             "disclosure_date": pd.to_datetime(["2024-06-05", "2024-06-05"]),
             "transaction_type": ["Purchase", "Purchase"],
         })
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
 
         result = self.db.get_transactions_by_date_range(
             date(2024, 1, 1), date(2024, 12, 31)
@@ -819,7 +819,7 @@ class TestDatabaseDateRange(DatabaseTestCase):
             "disclosure_date": pd.to_datetime(["2024-06-05"]),
             "transaction_type": ["Purchase"],
         })
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
 
         result = self.db.get_transactions_by_date_range(
             date(2025, 1, 1), date(2025, 6, 1)

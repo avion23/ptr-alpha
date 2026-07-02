@@ -103,7 +103,7 @@ class CapitolTradesSource(TransactionSource):
         """Upsert trades into the database. Returns count inserted."""
         if df.empty:
             return 0
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="capitol_trades")
         logger.info(f"Saved {len(df)} Capitol Trades transactions to database")
         return len(df)
 

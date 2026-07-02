@@ -43,15 +43,15 @@ class TestDedupKeyFix(DatabaseTestCase):
             self._base_tx(amount_raw="$1,001 - $15,000"),
             self._base_tx(amount_raw="$15,001 - $50,000"),
         ])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2, "Two distinct lots must not be collapsed")
 
     def test_reinserting_same_row_dedupes_to_one(self):
         row = self._base_tx(amount_raw="$1,001 - $15,000")
         df = pd.DataFrame([row])
-        self.db.upsert_transactions(df)
-        self.db.upsert_transactions(df)  # re-insert same row
+        self.db.upsert_transactions(df, source="house_pdf")
+        self.db.upsert_transactions(df, source="house_pdf")  # re-insert same row
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 1, "Re-inserting same row must not create duplicate")
 
@@ -61,14 +61,14 @@ class TestDedupKeyFix(DatabaseTestCase):
             self._base_tx(owner_code="SP", amount_raw="$1,001 - $15,000"),
             self._base_tx(owner_code="J", amount_raw="$1,001 - $15,000"),
         ])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2, "SP and JT trades must not collapse")
 
     def test_null_amount_raw_normalised_to_empty_string(self):
         """NULL amount_raw must be stored as '' so re-parses can still dedupe."""
         df = pd.DataFrame([self._base_tx(amount_raw=None)])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         raw = self.db.conn.execute(
             "SELECT amount_raw FROM transactions WHERE ticker='AAPL'"
         ).fetchone()[0]
@@ -167,7 +167,7 @@ class TestEntryPriceRawTickerFallback(DatabaseTestCase):
             "disclosure_date": date(2024, 1, 3),
             "transaction_type": "Purchase",
         }])
-        self.db.upsert_transactions(tx)
+        self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
             ["BRK.B"], date(2024, 1, 1), date(2024, 1, 5)
@@ -190,7 +190,7 @@ class TestEntryPriceRawTickerFallback(DatabaseTestCase):
             "disclosure_date": date(2024, 1, 2),
             "transaction_type": "Purchase",
         }])
-        self.db.upsert_transactions(tx)
+        self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
             ["AAPL"], date(2024, 1, 1), date(2024, 1, 5)
@@ -473,7 +473,7 @@ class TestNegativeLagFilter(DatabaseTestCase):
                 "transaction_type": "Purchase",
             },
         ])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
 
     def test_get_transactions_excludes_negative_lag(self):
         self._insert_negative_lag_tx()
@@ -497,7 +497,7 @@ class TestNegativeLagFilter(DatabaseTestCase):
             "disclosure_date": date(2024, 6, 1),
             "transaction_type": "Purchase",
         }])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 1)
 
@@ -511,7 +511,7 @@ class TestNegativeLagFilter(DatabaseTestCase):
             "disclosure_date": date(2024, 5, 1),
             "transaction_type": "Sale",
         }])
-        self.db.upsert_transactions(df)
+        self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 1)
 

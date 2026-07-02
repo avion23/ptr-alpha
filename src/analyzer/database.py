@@ -39,9 +39,9 @@ class Database:
 
     def _init_schema(self):
         self._init_metadata_table()
+        self._init_pdf_tables()
         self._init_transactions_table()
         self._init_prices_table()
-        self._init_pdf_tables()
 
     def _init_metadata_table(self) -> None:
         self.conn.execute("""
@@ -140,10 +140,30 @@ class Database:
             "instrument_type": "VARCHAR",
             "strike_price": "DOUBLE",
             "expiry_date": "VARCHAR",
+            "asset_description": "VARCHAR",
+            "source": "VARCHAR",
         }
         for column, column_type in required_columns.items():
             if column not in existing_columns:
                 self.conn.execute(f"ALTER TABLE transactions ADD COLUMN {column} {column_type}")
+
+        # Pre-migration rows of mixed house-PDF/Capitol-Trades provenance cannot
+        # be attributed reliably; new rows always carry a source.
+        self.conn.execute("""
+            UPDATE transactions
+            SET source = 'gemini_ocr'
+            WHERE source IS NULL
+              AND doc_id IN (
+                  SELECT doc_id FROM pdf_parse_runs
+                  WHERE parser_version LIKE 'v4-gemini%'
+              )
+        """)
+        self.conn.execute("""
+            UPDATE transactions
+            SET source = 'capitol_trades'
+            WHERE source IS NULL
+              AND doc_id LIKE 'ct-%'
+        """)
 
     def upsert_metadata(self, df: pd.DataFrame) -> None:
         self.conn.execute("""
@@ -190,7 +210,7 @@ class Database:
         )
         logger.info(f"Cleared metadata for year {year}")
 
-    def upsert_transactions(self, df: pd.DataFrame) -> None:
+    def upsert_transactions(self, df: pd.DataFrame, *, source: str) -> None:
         df = df.copy()
         for column in ["owner_code", "amount_raw", "amount_midpoint", "instrument_type", "strike_price", "expiry_date", "asset_description"]:
             if column not in df.columns:
@@ -200,6 +220,18 @@ class Database:
         df["owner_code"] = df["owner_code"].fillna("").astype(str).replace("None", "")
         df["amount_raw"] = df["amount_raw"].fillna("").astype(str).replace("None", "")
         df["created_at"] = datetime.now()
+        df["source"] = source
+
+        dedup_key = [
+            "doc_id", "ticker_key", "transaction_date", "member",
+            "transaction_type", "amount_raw", "owner_code", "asset_description_key",
+        ]
+        dedup_df = df.copy()
+        dedup_df["ticker_key"] = dedup_df["ticker"].fillna("").astype(str).replace("None", "")
+        dedup_df["asset_description_key"] = dedup_df["asset_description"].fillna("").astype(str).replace("None", "")
+        df = df.loc[~dedup_df.duplicated(subset=dedup_key, keep="first")].copy()
+        if df.empty:
+            return
 
         # Check if asset_description column exists in the table
         has_asset_desc = any(
@@ -208,17 +240,33 @@ class Database:
         )
 
         self.conn.execute("CREATE TEMP TABLE staging_transactions AS SELECT * FROM df")
+        self.conn.execute("""
+            CREATE TEMP TABLE filtered_staging_transactions AS
+            SELECT s.*
+            FROM staging_transactions s
+            LEFT JOIN transactions t
+              ON t.doc_id = s.doc_id
+             AND COALESCE(CAST(t.ticker AS VARCHAR), '') = COALESCE(CAST(s.ticker AS VARCHAR), '')
+             AND t.transaction_date IS NOT DISTINCT FROM s.transaction_date
+             AND t.member IS NOT DISTINCT FROM s.member
+             AND t.transaction_type IS NOT DISTINCT FROM s.transaction_type
+             AND COALESCE(t.amount_raw, '') = COALESCE(s.amount_raw, '')
+             AND COALESCE(t.owner_code, '') = COALESCE(s.owner_code, '')
+             AND COALESCE(CAST(t.asset_description AS VARCHAR), '') = COALESCE(CAST(s.asset_description AS VARCHAR), '')
+            WHERE t.id IS NULL
+        """)
         if has_asset_desc:
             self.conn.execute("""
                 INSERT INTO transactions (
                     doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
                     owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                    asset_description
+                    asset_description, source
                 )
                 SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
                        owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                       asset_description
-                FROM staging_transactions
+                       asset_description, source
+                FROM filtered_staging_transactions
+                WHERE ticker IS NOT NULL
                 ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code) DO UPDATE SET
                     transaction_type = EXCLUDED.transaction_type,
                     disclosure_date = EXCLUDED.disclosure_date,
@@ -229,17 +277,31 @@ class Database:
                     strike_price = EXCLUDED.strike_price,
                     expiry_date = EXCLUDED.expiry_date,
                     created_at = EXCLUDED.created_at,
-                    asset_description = EXCLUDED.asset_description
+                    asset_description = EXCLUDED.asset_description,
+                    source = COALESCE(transactions.source, EXCLUDED.source)
+            """)
+            self.conn.execute("""
+                INSERT INTO transactions (
+                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
+                    asset_description, source
+                )
+                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
+                       asset_description, source
+                FROM filtered_staging_transactions
+                WHERE ticker IS NULL
             """)
         else:
             self.conn.execute("""
                 INSERT INTO transactions (
                     doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
+                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at, source
                 )
                 SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at
-                FROM staging_transactions
+                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at, source
+                FROM filtered_staging_transactions
+                WHERE ticker IS NOT NULL
                 ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code) DO UPDATE SET
                     transaction_type = EXCLUDED.transaction_type,
                     disclosure_date = EXCLUDED.disclosure_date,
@@ -249,8 +311,20 @@ class Database:
                     instrument_type = EXCLUDED.instrument_type,
                     strike_price = EXCLUDED.strike_price,
                     expiry_date = EXCLUDED.expiry_date,
-                    created_at = EXCLUDED.created_at
+                    created_at = EXCLUDED.created_at,
+                    source = COALESCE(transactions.source, EXCLUDED.source)
             """)
+            self.conn.execute("""
+                INSERT INTO transactions (
+                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at, source
+                )
+                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at, source
+                FROM filtered_staging_transactions
+                WHERE ticker IS NULL
+            """)
+        self.conn.execute("DROP TABLE filtered_staging_transactions")
         self.conn.execute("DROP TABLE staging_transactions")
 
     def delete_transactions_for_doc(self, doc_id: str) -> None:

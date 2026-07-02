@@ -111,9 +111,15 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
     sales = _collapse_to_episodes(sales)
     market_prior = _compute_dynamic_prior(signal_df, horizon)
 
+    # Invert the prior for sales: a "win" when invert_returns=True is
+    # avoiding a loss (negative original return).  The purchase up-rate
+    # measures positive-return frequency, so the loss-avoidance prior is
+    # 1 − market_prior.
+    sale_prior = 1.0 - market_prior
+
     member_stats = []
     for member, sale_grp in sales.groupby("member"):
-        row = _compute_member_stats(member, sale_grp, market_prior, invert_returns=True)
+        row = _compute_member_stats(member, sale_grp, sale_prior, invert_returns=True)
         if row is not None:
             member_stats.append(row)
 

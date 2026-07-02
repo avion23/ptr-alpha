@@ -95,7 +95,7 @@ def _build_curves_for_rows(
 
     for i in range(len(rows)):
         entry_price = entry_prices_arr[i]
-        if not entry_price or entry_price <= 0:
+        if pd.isna(entry_price) or entry_price <= 0:
             continue
         tkr = tickers[i]
         if tkr not in price_cols:

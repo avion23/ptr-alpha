@@ -94,70 +94,76 @@ def main():
     total_nulled = 0
     distinct_fixed = 0
     
-    for (orig,) in rows:
-        upper = orig.upper()
-        
-        # 1. Try name-to-ticker mapping
-        matched_ticker = None
-        for name, ticker in sorted(NAME_TO_TICKER.items(), key=lambda x: -len(x[0])):
-            if upper.startswith(name):
-                matched_ticker = ticker
-                break
-        
-        if matched_ticker:
-            # Check for duplicates (ticker-version already exists for same key)
-            duplicates = con.execute("""
-                WITH name_rows AS (
-                    SELECT doc_id, member, transaction_date, transaction_type
-                    FROM transactions WHERE ticker=?
-                )
-                SELECT COUNT(*) FROM transactions t
-                INNER JOIN name_rows n USING (doc_id, member, transaction_date, transaction_type)
-                WHERE t.ticker=?
-            """, [orig, matched_ticker]).fetchone()[0]
+    con.execute("BEGIN TRANSACTION")
+    try:
+        for (orig,) in rows:
+            upper = orig.upper()
             
-            if duplicates > 0:
-                con.execute("""
-                    DELETE FROM transactions WHERE ticker=?
-                      AND (doc_id, member, transaction_date, transaction_type) IN (
+            # 1. Try name-to-ticker mapping
+            matched_ticker = None
+            for name, ticker in sorted(NAME_TO_TICKER.items(), key=lambda x: -len(x[0])):
+                if upper.startswith(name):
+                    matched_ticker = ticker
+                    break
+            
+            if matched_ticker:
+                # Check for duplicates (ticker-version already exists for same key)
+                duplicates = con.execute("""
+                    WITH name_rows AS (
                         SELECT doc_id, member, transaction_date, transaction_type
                         FROM transactions WHERE ticker=?
-                      )
-                """, [orig, matched_ticker])
-                total_deleted += duplicates
+                    )
+                    SELECT COUNT(*) FROM transactions t
+                    INNER JOIN name_rows n USING (doc_id, member, transaction_date, transaction_type)
+                    WHERE t.ticker=?
+                """, [orig, matched_ticker]).fetchone()[0]
+                
+                if duplicates > 0:
+                    con.execute("""
+                        DELETE FROM transactions WHERE ticker=?
+                          AND (doc_id, member, transaction_date, transaction_type) IN (
+                            SELECT doc_id, member, transaction_date, transaction_type
+                            FROM transactions WHERE ticker=?
+                          )
+                    """, [orig, matched_ticker])
+                    total_deleted += duplicates
+                
+                remaining = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [orig]).fetchone()[0]
+                if remaining > 0:
+                    con.execute("UPDATE transactions SET ticker=? WHERE ticker=?", [matched_ticker, orig])
+                    total_updated += remaining
+                    distinct_fixed += 1
+                continue
             
-            remaining = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [orig]).fetchone()[0]
-            if remaining > 0:
-                con.execute("UPDATE transactions SET ticker=? WHERE ticker=?", [matched_ticker, orig])
-                total_updated += remaining
-                distinct_fixed += 1
-            continue
+            # 2. Cash/fund → NULL
+            if is_cash_or_fund(orig):
+                cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [orig]).fetchone()[0]
+                con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [orig])
+                total_nulled += cnt
+                continue
+            
+            # 3. No match — LEAVE ALONE (this is the bug-fix)
         
-        # 2. Cash/fund → NULL
-        if is_cash_or_fund(orig):
-            cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [orig]).fetchone()[0]
-            con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [orig])
-            total_nulled += cnt
-            continue
-        
-        # 3. No match — LEAVE ALONE (this is the bug-fix)
-    
-    # Also handle single-token junk
-    for tok in ('US', 'TREA', 'NEW', '--', 'SP'):
-        cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [tok]).fetchone()[0]
-        if cnt:
-            con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [tok])
-            total_nulled += cnt
+        # Also handle single-token junk
+        for tok in ('US', 'TREA', 'NEW', '--', 'SP'):
+            cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [tok]).fetchone()[0]
+            if cnt:
+                con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [tok])
+                total_nulled += cnt
 
-    # Fix 6: null out confirmed garbage fragments regardless of length.
-    # The main query above only targets tickers with length > 5; short fragments
-    # like UNIT, TECH, BERK, BANK etc. slip through. Use _CONFIRMED_GARBAGE (NOT
-    # the full parser blacklist — see module-level comment).
-    for garbage in sorted(_CONFIRMED_GARBAGE):
-        cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [garbage]).fetchone()[0]
-        if cnt:
-            con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [garbage])
-            total_nulled += cnt
+        # Fix 6: null out confirmed garbage fragments regardless of length.
+        # The main query above only targets tickers with length > 5; short fragments
+        # like UNIT, TECH, BERK, BANK etc. slip through. Use _CONFIRMED_GARBAGE (NOT
+        # the full parser blacklist — see module-level comment).
+        for garbage in sorted(_CONFIRMED_GARBAGE):
+            cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [garbage]).fetchone()[0]
+            if cnt:
+                con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [garbage])
+                total_nulled += cnt
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    con.execute("COMMIT")
     
     con.execute("CHECKPOINT")
     print(f'Fixed {distinct_fixed} distinct name→ticker mappings ({total_updated} rows updated)')

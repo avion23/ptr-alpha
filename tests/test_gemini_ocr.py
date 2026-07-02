@@ -247,7 +247,7 @@ def test_insert_transactions_all_bad_rows_preserves_existing_rows(tmp_path):
     con.close()
 
     assert rows == [("AAPL", "Apple Inc. (AAPL)")]
-    assert latest_run == ("no_txs", 1, 0, "bad date: not a date")
+    assert latest_run == ("error", 1, 0, "bad date: not a date")
 
 
 def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):

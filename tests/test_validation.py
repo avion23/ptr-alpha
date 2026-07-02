@@ -332,6 +332,24 @@ class TestSelectConfig:
         assert selected["n_survivors"] == 1
         assert selected["sample_filter_exhausted"] is False
 
+    def test_bh_correction_counts_filtered_rows_as_trials(self):
+        """Filtered configs carry p=1 but still count in BH's trial denominator."""
+        df = _make_sweep_df(n=10, p_values=[0.02, 0.9] + [1.0] * 8)
+        df.loc[0, ["alpha_slope", "overall_alpha", "min_sample_ok"]] = [2.0, 2.0, True]
+        df.loc[1, ["alpha_slope", "overall_alpha", "min_sample_ok"]] = [1.0, 1.0, True]
+        df.loc[2:, "alpha_slope"] = 100.0
+        df.loc[2:, "overall_alpha"] = 100.0
+        df.loc[2:, "min_sample_ok"] = False
+
+        selected = select_config(df, alpha=0.05)
+
+        assert selected["n_trials"] == 10
+        assert selected["n_min_sample_candidates"] == 2
+        assert selected["n_survivors"] == 0
+        assert selected["survives_correction"] is False
+        assert selected["alpha_slope"] == 2.0
+        assert selected["sample_filter_exhausted"] is False
+
     def test_sample_filter_exhausted_falls_back_to_overall_best_with_flag(self):
         """If all rows are too small, keep a deterministic fallback and flag it."""
         df = _make_sweep_df(n=3, p_values=[1.0, 1.0, 1.0])

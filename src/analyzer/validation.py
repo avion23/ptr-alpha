@@ -382,11 +382,8 @@ def select_config(sweep_df: pd.DataFrame, alpha: float = 0.05) -> dict:
         candidate_mask = np.ones(n_trials, dtype=bool)
     sample_filter_exhausted = not bool(candidate_mask.any())
 
-    bh_mask = np.zeros(n_trials, dtype=bool)
-    if not sample_filter_exhausted:
-        bh_mask[candidate_mask] = benjamini_hochberg(
-            sweep_df.loc[candidate_mask, "p_value"].values, alpha
-        )
+    bh_mask = benjamini_hochberg(sweep_df["p_value"].values, alpha)
+    bh_mask = bh_mask & candidate_mask
 
     survivors = sweep_df[bh_mask]
     if survivors.empty:

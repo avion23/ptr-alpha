@@ -53,7 +53,10 @@ def count_phantom_rows(conn: duckdb.DuckDBPyConnection) -> dict[bool, int]:
 
 
 def purge_phantom_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
-    before = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    before_row = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()
+    if before_row is None:
+        raise RuntimeError("COUNT(*) query returned no row before purge")
+    before = before_row[0]
     deleted = sum(count_phantom_rows(conn).values())
     conn.execute(
         VICTIMS_CTE + """
@@ -61,7 +64,10 @@ def purge_phantom_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
         WHERE id IN (SELECT id FROM victims)
         """
     )
-    after = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    after_row = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()
+    if after_row is None:
+        raise RuntimeError("COUNT(*) query returned no row after purge")
+    after = after_row[0]
     conn.execute("CHECKPOINT")
     return {"before": before, "deleted": deleted, "after": after}
 

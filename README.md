@@ -25,44 +25,88 @@ pip install ".[dev]"
 
 ## Approach
 
-1. **Data Collection**: Downloads and parses official House PTR disclosures from government sources
-2. **Signal Generation**: Calculates trading signal potential across multiple time horizons (30, 60, 90, 180 days) using exponential decay weighting
-3. **Performance Analysis**: Ranks members by hit rate, Spy alpha, Bayesian win probability, and Sharpe ratio
-4. **Ticker Scoring**: Identifies tickers with multiple congressional buyers weighted by historical member performance, position size, and ownership type
+1. **Data Collection**: Downloads official House PTR PDFs and can ingest Capitol Trades API records as a backup source
+2. **Parsing**: Extracts transaction rows through a deterministic PDF parser cascade, with optional Gemini OCR for zero-row PDFs
+3. **Signal Generation**: Calculates trading signal potential across configurable time horizons using exponential decay weighting
+4. **Performance Analysis**: Ranks members by hit rate, SPY alpha, Bayesian win probability, and Sharpe ratio
+5. **Ticker Scoring**: Identifies tickers with multiple congressional buyers weighted by historical member performance, position size, and ownership type
 
 ## Architecture
 
 ```
 src/analyzer/
-├── datasources.py      # Data acquisition (House PTRs, yfinance prices)
-├── parsing.py          # PDF extraction, OCR fallback, ticker identification
-├── analysis.py         # Signal calculation, member ranking, ticker scoring
-├── pipeline.py         # End-to-end processing orchestration
-├── database.py         # DuckDB database layer (ASOF joins for entry prices)
-├── models.py           # Data models and enums
-├── interfaces.py       # Abstract sources (TransactionSource, PriceSource)
-├── exceptions.py       # Error hierarchy
-├── settings.py         # Configuration
-└── cli.py              # Unified command-line interface
+├── backtest/            # Recommendations, evaluation, prices, filters, curves, summaries, OU parameters
+├── member_ranking/      # Bayesian scoring, decay weighting, ranking, factors, buyer scoring, sales, lookups
+├── parsing/             # pdfplumber/pdftotext/docling/OCR parsers plus row, cell, column, and metadata helpers
+├── portfolio/           # Kelly sizing, portfolio simulation, and portfolio metrics
+├── signals/             # Core signal generation, assembly, filters, prices, constants, and top-signal helpers
+├── analysis.py          # Analysis output assembly for ranks, signals, members, sales, and tickers
+├── capitol_trades.py    # Capitol Trades API ingestion
+├── cli.py               # Typer command-line interface (`ptr-alpha`)
+├── database.py          # DuckDB schema, migrations, and query helpers
+├── datasources.py       # House PTR and yfinance data sources
+├── exceptions.py        # Analyzer exception hierarchy
+├── interfaces.py        # Source protocol interfaces
+├── matched_control.py   # Matched-control return comparisons
+├── member_skill.py      # Member skill and profitability helpers
+├── member_names.py      # Member name normalization helpers
+├── models.py            # Data models and enums
+├── options.py           # Option-contract parsing helpers
+├── pipeline.py          # Fetch, parse, analysis, and backtest orchestration
+├── portfolio_sim.py     # Portfolio simulator used by the CLI
+├── price_snapshot.py    # Price snapshot manifests for reproducible backtests
+├── return_process.py    # Return process statistics
+├── settings.py          # Pydantic settings for data paths and parser behavior
+├── signal_features.py   # Feature engineering for signals
+├── snooping.py          # Multiple-comparison corrections and HAC statistics
+├── ticker_resolver.py   # Ticker cleaning and symbol resolution
+└── validation.py        # Honest time-split calibration and evaluation
+
+scripts/
+├── cleanup_tickers.py       # Clean and backfill ticker symbols
+├── gemini_ocr_common.py     # Shared Gemini OCR cache and validation helpers
+├── ocr_parallel.py          # Parallel Gemini OCR runner
+├── ocr_zero_rows.py         # Gemini OCR for PDFs with no parsed rows
+├── purge_phantom_rows.py    # Remove historical duplicate transaction rows
+├── reparse_all.py           # Reparse cached PDFs
+└── run_kelly_backtest.py    # Kelly-sizing backtest helper
+
+sweep.py                     # Parameter sweep using analyzer.validation
 ```
 
 ## CLI
 
-```bash
-ptr-alpha fetch --year 2026                          # Download House PTR PDFs
-ptr-alpha parse --year 2026                          # Extract transactions to DuckDB
-ptr-alpha analyze --year 2026 --mode ranks           # Rank members by Spy alpha
-ptr-alpha analyze --year 2026 --mode signals         # Top individual trade signals
-ptr-alpha analyze --year 2026 --mode sales           # Rank members by loss avoidance
-ptr-alpha analyze --year 2026 --mode tickers         # Multi-buyer ticker scores
-ptr-alpha analyze --year 2026 --mode member --member "Nancy Pelosi"  # Member-specific signals
-ptr-alpha analyze --year 2026 --ticker NVDA          # Deep-dive single ticker
-```
+| Command | Description |
+| --- | --- |
+| `ptr-alpha fetch --year 2026` | Download House Clerk PTR PDFs for a year. |
+| `ptr-alpha parse --year 2026` | Parse cached PDFs into DuckDB. |
+| `ptr-alpha parse --year 2026 --gemini-ocr` | After deterministic parsing, run Gemini OCR for zero-row PDFs; results are validated and cached. |
+| `ptr-alpha analyze --year 2026 --mode ranks` | Rank members by trading performance. |
+| `ptr-alpha analyze --year 2026 --mode signals` | Show top individual trade signals. |
+| `ptr-alpha analyze --year 2026 --mode sales` | Rank members by sale/loss-avoidance performance. |
+| `ptr-alpha analyze --year 2026 --mode tickers` | Score recent multi-buyer ticker setups. |
+| `ptr-alpha analyze --year 2026 --mode member --member "Nancy Pelosi"` | Show signals for one member. |
+| `ptr-alpha analyze --year 2026 --ticker NVDA` | Deep-dive one ticker. |
+| `ptr-alpha backtest --start 2024-01-01 --end 2024-12-31` | Run a rolling, no-lookahead recommendation backtest. |
+| `ptr-alpha portfolio --start 2024-01-01 --end 2024-12-31` | Simulate portfolio-level execution with overlapping positions and constraints. |
+| `ptr-alpha snapshot` | Write a reproducible price snapshot manifest. |
+| `ptr-alpha refresh --year 2026` | Fetch House PDFs, parse cached PDFs, fetch Capitol Trades, and optionally run Gemini OCR. |
+| `ptr-alpha refresh --year 2026 --gemini-ocr` | Include Gemini OCR in the full refresh pipeline. |
+| `ptr-alpha fetch-capitol --all` | Fetch recent Capitol Trades API records. |
+| `ptr-alpha validate --train-start 2022-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2025-06-30` | Select parameters on the train window, then evaluate once on the test window. |
+| `ptr-alpha validate --full-grid` | Run the larger validation parameter grid. |
 
-All analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` flags.
+Analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` where supported. Ticker scoring also accepts `--days-back` and `--min-buyers`.
+
+## Data & caveats
+
+- The House Clerk publishes only a filing index; the PTR PDFs must be downloaded and parsed.
+- Parsing uses a deterministic parser cascade with an optional Gemini OCR fallback. Gemini OCR output is validated and cached under `data/gemini_cache/`.
+- Transactions carry a `source` provenance column (`house_pdf`, `capitol_trades`, or `gemini_ocr`); old pre-migration rows may have `NULL` source.
+- `ptr-alpha validate` does train-only parameter selection with Benjamini-Hochberg snooping correction and Newey-West statistics. As of 2026-07, no configuration shows statistically significant alpha.
 
 ## Tests
 
 ```bash
-pytest
+PYTHONPATH=$PWD/src python3 -m pytest -q
 ```

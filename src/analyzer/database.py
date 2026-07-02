@@ -147,8 +147,7 @@ class Database:
             if column not in existing_columns:
                 self.conn.execute(f"ALTER TABLE transactions ADD COLUMN {column} {column_type}")
 
-        # Pre-migration rows of mixed house-PDF/Capitol-Trades provenance cannot
-        # be attributed reliably; new rows always carry a source.
+        # Source values are 'house_pdf'|'capitol_trades'|'gemini_ocr'; pre-migration rows may remain NULL.
         self.conn.execute("""
             UPDATE transactions
             SET source = 'gemini_ocr'
@@ -233,12 +232,6 @@ class Database:
         if df.empty:
             return
 
-        # Check if asset_description column exists in the table
-        has_asset_desc = any(
-            r[0] == "asset_description"
-            for r in self.conn.execute("DESCRIBE transactions").fetchall()
-        )
-
         self.conn.execute("CREATE TEMP TABLE staging_transactions AS SELECT * FROM df")
         self.conn.execute("""
             CREATE TEMP TABLE filtered_staging_transactions AS
@@ -255,75 +248,42 @@ class Database:
              AND COALESCE(CAST(t.asset_description AS VARCHAR), '') = COALESCE(CAST(s.asset_description AS VARCHAR), '')
             WHERE t.id IS NULL
         """)
-        if has_asset_desc:
-            self.conn.execute("""
-                INSERT INTO transactions (
-                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                    asset_description, source
-                )
-                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                       asset_description, source
-                FROM filtered_staging_transactions
-                WHERE ticker IS NOT NULL
-                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code) DO UPDATE SET
-                    transaction_type = EXCLUDED.transaction_type,
-                    disclosure_date = EXCLUDED.disclosure_date,
-                    owner_code = EXCLUDED.owner_code,
-                    amount_raw = EXCLUDED.amount_raw,
-                    amount_midpoint = EXCLUDED.amount_midpoint,
-                    instrument_type = EXCLUDED.instrument_type,
-                    strike_price = EXCLUDED.strike_price,
-                    expiry_date = EXCLUDED.expiry_date,
-                    created_at = EXCLUDED.created_at,
-                    asset_description = EXCLUDED.asset_description,
-                    source = COALESCE(transactions.source, EXCLUDED.source)
-            """)
-            self.conn.execute("""
-                INSERT INTO transactions (
-                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                    asset_description, source
-                )
-                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                       asset_description, source
-                FROM filtered_staging_transactions
-                WHERE ticker IS NULL
-            """)
-        else:
-            self.conn.execute("""
-                INSERT INTO transactions (
-                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at, source
-                )
-                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at, source
-                FROM filtered_staging_transactions
-                WHERE ticker IS NOT NULL
-                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code) DO UPDATE SET
-                    transaction_type = EXCLUDED.transaction_type,
-                    disclosure_date = EXCLUDED.disclosure_date,
-                    owner_code = EXCLUDED.owner_code,
-                    amount_raw = EXCLUDED.amount_raw,
-                    amount_midpoint = EXCLUDED.amount_midpoint,
-                    instrument_type = EXCLUDED.instrument_type,
-                    strike_price = EXCLUDED.strike_price,
-                    expiry_date = EXCLUDED.expiry_date,
-                    created_at = EXCLUDED.created_at,
-                    source = COALESCE(transactions.source, EXCLUDED.source)
-            """)
-            self.conn.execute("""
-                INSERT INTO transactions (
-                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at, source
-                )
-                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at, source
-                FROM filtered_staging_transactions
-                WHERE ticker IS NULL
-            """)
+        self.conn.execute("""
+            INSERT INTO transactions (
+                doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
+                asset_description, source
+            )
+            SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                   owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
+                   asset_description, source
+            FROM filtered_staging_transactions
+            WHERE ticker IS NOT NULL
+            ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code) DO UPDATE SET
+                transaction_type = EXCLUDED.transaction_type,
+                disclosure_date = EXCLUDED.disclosure_date,
+                owner_code = EXCLUDED.owner_code,
+                amount_raw = EXCLUDED.amount_raw,
+                amount_midpoint = EXCLUDED.amount_midpoint,
+                instrument_type = EXCLUDED.instrument_type,
+                strike_price = EXCLUDED.strike_price,
+                expiry_date = EXCLUDED.expiry_date,
+                created_at = EXCLUDED.created_at,
+                asset_description = EXCLUDED.asset_description,
+                source = COALESCE(transactions.source, EXCLUDED.source)
+        """)
+        self.conn.execute("""
+            INSERT INTO transactions (
+                doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
+                asset_description, source
+            )
+            SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
+                   owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
+                   asset_description, source
+            FROM filtered_staging_transactions
+            WHERE ticker IS NULL
+        """)
         self.conn.execute("DROP TABLE filtered_staging_transactions")
         self.conn.execute("DROP TABLE staging_transactions")
 

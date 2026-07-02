@@ -290,6 +290,11 @@ class Database:
     def delete_transactions_for_doc(self, doc_id: str) -> None:
         self.conn.execute("DELETE FROM transactions WHERE doc_id = ?", [doc_id])
 
+    def count_transactions_for_doc(self, doc_id: str) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE doc_id = ?", [doc_id]
+        ).fetchone()[0]
+
     def upsert_parse_run(
         self,
         doc_id: str,

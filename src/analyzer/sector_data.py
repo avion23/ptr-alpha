@@ -32,8 +32,20 @@ def load_sector_data(tickers: list[str]) -> pd.DataFrame:
     records = []
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(fetch_sector, t): t for t in filtered}
-        for future in as_completed(futures):
-            ticker, sector = future.result()
-            records.append({"ticker": ticker, "sector": sector})
+        try:
+            for future in as_completed(futures, timeout=30):
+                try:
+                    ticker, sector = future.result(timeout=5)
+                except Exception as e:
+                    logger.debug("Timeout fetching sector for %s: %s", futures[future], e)
+                    records.append({"ticker": futures[future], "sector": "Unknown"})
+                    continue
+                records.append({"ticker": ticker, "sector": sector})
+        except TimeoutError:
+            for f, t in futures.items():
+                if not f.done():
+                    logger.debug("Outer timeout: sector lookup for %s incomplete", t)
+                    records.append({"ticker": t, "sector": "Unknown"})
 
+    records = [r for r in records if r["sector"] != "Unknown"]
     return pd.DataFrame(records)

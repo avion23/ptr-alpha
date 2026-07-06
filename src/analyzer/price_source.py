@@ -143,7 +143,6 @@ class YFinancePriceSource(PriceSource):
                         "falling back to cached data"
                     )
                     return pd.DataFrame()
-        return pd.DataFrame()
 
     def _rename_yf_columns(self, new_prices: pd.DataFrame, raw_to_yf: dict) -> pd.DataFrame:
         """Rename yf-symbol columns back to their raw tickers so downstream

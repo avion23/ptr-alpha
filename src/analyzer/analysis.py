@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from analyzer.models import TransactionType  # noqa: F401 — re-exported for backward compat
 
@@ -89,7 +93,8 @@ def analyze_by_sector(
                     "num_trades": len(sector_purchases),
                     "num_members": sector_purchases["member"].nunique(),
                 })
-        except AnalysisError:
+        except AnalysisError as e:
+            logger.debug("Skipping sector %s: %s", sector, e)
             continue
 
     if not results:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import math
 from dataclasses import dataclass, asdict
 from datetime import date
@@ -33,6 +34,8 @@ from analyzer import analysis
 from analyzer import signals as signals_mod
 from analyzer.pipeline import BacktestParams
 from analyzer.snooping import benjamini_hochberg, bonferroni_correction
+
+logger = logging.getLogger(__name__)
 
 
 # T-stats on fewer observations are noise; cf. minimum backtest length,
@@ -492,15 +495,15 @@ def _run_validation_with_db(
 
     n_tx = len(all_tx)
     n_tickers = prices.shape[1] if not prices.empty else 0
-    print(f"Data loaded: {n_tx} transactions, {n_tickers} tickers")
+    logger.info("Data loaded: %d transactions, %d tickers", n_tx, n_tickers)
 
     # Phase 1: sweep on TRAIN window only
     n_combos = 1
     for v in grid.values():
         n_combos *= len(v)
-    print(
-        f"Sweeping {n_combos} configs on TRAIN window "
-        f"[{train_start} → {train_end}] ..."
+    logger.info(
+        "Sweeping %d configs on TRAIN window [%s -> %s] ...",
+        n_combos, train_start, train_end,
     )
 
     train_df = sweep_configs(all_tx, prices, entry_prices, grid, train_start, train_end)
@@ -509,22 +512,24 @@ def _run_validation_with_db(
         train_df["min_sample_ok"].sum()
         if "min_sample_ok" in train_df.columns else len(train_df)
     )
-    print(
-        f"Candidates: {n_candidates}/{len(train_df)} pass min-sample filter "
-        f"(>={MIN_DATES_FOR_CANDIDACY} dates, >={MIN_RECS_FOR_CANDIDACY} recs)"
+    logger.info(
+        "Candidates: %d/%d pass min-sample filter (>=%d dates, >=%d recs)",
+        n_candidates, len(train_df), MIN_DATES_FOR_CANDIDACY, MIN_RECS_FOR_CANDIDACY,
     )
 
-    print(
-        f"Selected: horizon={int(selected['horizon'])}, "
-        f"min_buyers={int(selected['min_buyers'])}, "
-        f"top_n={int(selected['top_n'])}, "
-        f"scoring_mode={selected['scoring_mode']}"
+    logger.info(
+        "Selected: horizon=%d, min_buyers=%d, top_n=%d, scoring_mode=%s",
+        int(selected["horizon"]),
+        int(selected["min_buyers"]),
+        int(selected["top_n"]),
+        selected["scoring_mode"],
     )
-    print(
-        f"  Snooping: {selected['n_survivors']}/{selected['n_trials']} configs "
-        f"survive BH | Bonferroni threshold: "
-        f"{selected['bonferroni_threshold']:.5f} | "
-        f"survives={selected['survives_correction']}"
+    logger.info(
+        "  Snooping: %d/%d configs survive BH | Bonferroni threshold: %.5f | survives=%s",
+        selected["n_survivors"],
+        selected["n_trials"],
+        selected["bonferroni_threshold"],
+        selected["survives_correction"],
     )
 
     # Phase 2: evaluate frozen config ONCE on TEST window
@@ -635,7 +640,7 @@ def _run_validation_with_db(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2, default=str)
-        print(f"\nResults written to {out_path}")
+        logger.info("Results written to %s", out_path)
 
     return output
 
@@ -704,43 +709,43 @@ def _verdict(
 
 def _print_summary(output: dict) -> None:
     sep = "=" * 65
-    print(f"\n{sep}")
-    print("=== Validation Summary ===")
-    print(sep)
+    logger.info("\n%s", sep)
+    logger.info("=== Validation Summary ===")
+    logger.info("%s", sep)
 
     cfg = output["selected_config"]
-    print(
-        f"  Config:  horizon={cfg['horizon']}, freq={cfg['frequency_days']}, "
-        f"min_buyers={cfg['min_buyers']}, top_n={cfg['top_n']}, "
-        f"mode={cfg['scoring_mode']}"
+    logger.info(
+        "  Config:  horizon=%s, freq=%s, min_buyers=%s, top_n=%s, mode=%s",
+        cfg["horizon"], cfg["frequency_days"],
+        cfg["min_buyers"], cfg["top_n"], cfg["scoring_mode"],
     )
 
     snoop = output["snooping"]
-    print(
-        f"  Candidates: {snoop['n_min_sample_candidates']}/{snoop['n_trials']} "
-        f"pass min-sample filter (>={snoop['min_dates_for_candidacy']} dates, "
-        f">={snoop['min_recs_for_candidacy']} recs)"
+    logger.info(
+        "  Candidates: %d/%d pass min-sample filter (>=%d dates, >=%d recs)",
+        snoop["n_min_sample_candidates"], snoop["n_trials"],
+        snoop["min_dates_for_candidacy"], snoop["min_recs_for_candidacy"],
     )
-    print(
-        f"  Snooping: {snoop['n_survivors']}/{snoop['n_trials']} survive BH "
-        f"| Bonferroni α={snoop['bonferroni_threshold']:.5f} "
-        f"| survives={snoop['survives_bh']}"
+    logger.info(
+        "  Snooping: %d/%d survive BH | Bonferroni alpha=%.5f | survives=%s",
+        snoop["n_survivors"], snoop["n_trials"],
+        snoop["bonferroni_threshold"], snoop["survives_bh"],
     )
 
     for label, key in [("TRAIN (in-sample)", "train"), ("TEST  (out-of-sample)", "test")]:
         m = output[key]
         t_str = f"{m['nw_tstat']:+.2f}" if m["nw_tstat"] is not None else "N/A"
-        print(f"\n  {label}:")
-        print(f"    N={m['N']} recs, {m['dates_evaluated']} dates")
-        print(f"    mean alpha: {m['mean_alpha']:+.2f}%")
-        print(f"    win rate:   {m['win_rate']:.1f}%")
-        print(f"    rank1/5:    {m['rank1_alpha']:+.2f}% / {m['rank5_alpha']:+.2f}%")
-        print(f"    NW t-stat:  {t_str}  (p={m['nw_pval']:.4f})")
+        logger.info("\n  %s:", label)
+        logger.info("    N=%d recs, %d dates", m["N"], m["dates_evaluated"])
+        logger.info("    mean alpha: %+.2f%%", m["mean_alpha"])
+        logger.info("    win rate:   %.1f%%", m["win_rate"])
+        logger.info("    rank1/5:    %+.2f%% / %+.2f%%", m["rank1_alpha"], m["rank5_alpha"])
+        logger.info("    NW t-stat:  %s  (p=%.4f)", t_str, m["nw_pval"])
         if m.get("spy_mean_return") is not None:
-            print(f"    SPY return: {m['spy_mean_return']:+.2f}%")
+            logger.info("    SPY return: %+.2f%%", m["spy_mean_return"])
 
     deg = output["degradation_ratio"]
     if deg is not None:
-        print(f"\n  Degradation ratio (OOS/IS alpha): {deg:.3f}")
-    print(f"  Verdict: {output['verdict'].upper()}")
-    print(sep)
+        logger.info("\n  Degradation ratio (OOS/IS alpha): %.3f", deg)
+    logger.info("  Verdict: %s", output["verdict"].upper())
+    logger.info("%s", sep)

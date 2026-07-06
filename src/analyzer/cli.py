@@ -123,6 +123,131 @@ def main_callback(
     setup_logging(verbose)
 
 
+def _validate_mode(mode: str, member: str | None, ticker: str | None) -> None:
+    """Validate mode/member/ticker combinations. Exits on error."""
+    valid_modes = {"ranks", "signals", "member", "sales", "tickers"}
+    if mode not in valid_modes:
+        print(f"Error: --mode must be one of {sorted(valid_modes)}", file=sys.stderr)
+        raise typer.Exit(1)
+    if mode == "member" and member is None and ticker is None:
+        print("Error: --mode member requires --member NAME", file=sys.stderr)
+        raise typer.Exit(1)
+    if mode == "sales" and member is not None:
+        print("WARNING: --member flag is ignored for --mode sales (sales rankings are aggregate).", file=sys.stderr)
+
+
+def _check_data_freshness(app_ctx: AppContext) -> None:
+    """Warn if transaction data looks stale."""
+    try:
+        _max_date = app_ctx.transaction_source.db.conn.execute(
+            "SELECT MAX(disclosure_date) FROM transactions"
+        ).fetchone()[0]
+        if _max_date:
+            _age = (date.today() - _max_date).days
+            if _age > 30:
+                print(f"WARNING: Data is {_age} days old (latest: {_max_date}). Run 'ptr-alpha refresh' first.", file=sys.stderr)
+    except Exception:
+        logger.debug("Freshness check failed", exc_info=True)
+
+
+def _run_ticker_mode(
+    app_ctx: AppContext, mode: str, ticker: str, year: int,
+    horizons: list[int], threshold: float, output: str,
+) -> None:
+    """Handle --ticker analysis mode."""
+    if mode != "ranks":
+        print(f"WARNING: --mode {mode} is ignored when --ticker is provided; running ticker analysis.", file=sys.stderr)
+    if output == "csv":
+        print("WARNING: CSV output is not supported for --ticker analysis; using console output.", file=sys.stderr)
+    params = TickerAnalysisParams(ticker=ticker, year=year, horizon=horizons[0], threshold=threshold)
+    result = run_ticker_analysis(
+        params,
+        app_ctx.transaction_source,
+        app_ctx.price_source,
+    )
+    if result.success and hasattr(result, 'data') and result.data:
+        print(f"\n=== Buyers of {result.data['ticker']} ===")
+        print(result.data["buyers"].to_string(index=False))
+        print("\n=== Signal Score ===")
+        print(result.data["score"].to_string(index=False))
+    raise typer.Exit(0 if result.success else 1)
+
+
+def _run_tickers_mode(
+    app_ctx: AppContext, year: int, horizons: list[int], threshold: float,
+    days_back: int, min_buyers: int, top_n: int, output: str,
+) -> None:
+    """Handle --mode tickers."""
+    if output == "csv":
+        print("WARNING: CSV output is not supported for --mode tickers; using console output.", file=sys.stderr)
+    params = TickerScoringParams(
+        year=year,
+        horizons=tuple(horizons),
+        threshold=threshold,
+        days_back=days_back,
+        min_buyers=min_buyers,
+        top_n=top_n,
+    )
+    result = run_recent_ticker_scoring(
+        app_ctx.transaction_source,
+        app_ctx.price_source,
+        params,
+    )
+    if result.success and hasattr(result, 'data') and result.data:
+        data = result.data
+        if not data["result"].empty:
+            print(f"\n=== Top {data['top_n']} Recent Signals (Last {data['days_back']} Days, {data['min_buyers']}+ Buyers) ===")
+            print(data["result"].to_string(index=False))
+    raise typer.Exit(0 if result.success else 1)
+
+
+def _run_sales_mode(
+    app_ctx: AppContext, year: int, horizons: list[int], top_n: int, output: str,
+) -> None:
+    """Handle --mode sales."""
+    data_path = Path(app_ctx.settings.data.data_dir)
+    result = run_sales_pipeline(
+        year, tuple(horizons), top_n,
+        app_ctx.transaction_source, app_ctx.price_source, data_path, output
+    )
+    if result.success and hasattr(result, 'data') and result.data:
+        _save_results(result.data["table"], output, DisplayMode.SALE_RANKINGS, None, False, data_path)
+    raise typer.Exit(0 if result.success else 1)
+
+
+def _run_analysis_mode(
+    app_ctx: AppContext, year: int, horizons: list[int], threshold: float,
+    member: str | None, top_n: int, mode: str, output: str,
+) -> None:
+    """Handle ranks/signals/member modes via run_analysis_pipeline."""
+    show_signals = mode == "signals"
+    params = AnalysisParams(
+        year=year,
+        horizons=tuple(horizons),
+        threshold=threshold,
+        member_filter=member,
+        top_n=top_n,
+        show_signals=show_signals,
+    )
+    data_path = Path(app_ctx.settings.data.data_dir)
+    result = run_analysis_pipeline(
+        params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
+    )
+    if result.success and hasattr(result, 'data') and result.data:
+        if params.member_filter:
+            display_mode = DisplayMode.MEMBER_SIGNALS
+        elif show_signals:
+            display_mode = DisplayMode.TOP_SIGNALS
+        else:
+            display_mode = DisplayMode.MEMBER_RANKINGS
+        _save_results(result.data["table"], output, display_mode,
+                      result.data["member_filter"], result.data["show_signals"], data_path)
+        if result.data["sector_results"] is not None and not params.member_filter and not show_signals:
+            print("\n=== Sector Analysis ===")
+            print(result.data["sector_results"].to_string(index=False))
+    raise typer.Exit(0 if result.success else 1)
+
+
 @app.command()
 def analyze(
     ctx: typer.Context,
@@ -150,106 +275,18 @@ def analyze(
       sales    - Rank members by loss avoidance (sale performance)
       tickers  - Score multi-buyer tickers from recent period
     """
-    valid_modes = {"ranks", "signals", "member", "sales", "tickers"}
-    if mode not in valid_modes:
-        print(f"Error: --mode must be one of {sorted(valid_modes)}", file=sys.stderr)
-        raise typer.Exit(1)
-    if mode == "member" and member is None and ticker is None:
-        print("Error: --mode member requires --member NAME", file=sys.stderr)
-        raise typer.Exit(1)
-    if mode == "sales" and member is not None:
-        print("WARNING: --member flag is ignored for --mode sales (sales rankings are aggregate).", file=sys.stderr)
+    _validate_mode(mode, member, ticker)
     app_ctx = get_context(ctx, data_dir, read_only=False)
-
-    # Freshness check — warn if data looks stale
-    try:
-        _max_date = app_ctx.transaction_source.db.conn.execute(
-            "SELECT MAX(disclosure_date) FROM transactions"
-        ).fetchone()[0]
-        if _max_date:
-            _age = (date.today() - _max_date).days
-            if _age > 30:
-                print(f"WARNING: Data is {_age} days old (latest: {_max_date}). Run 'ptr-alpha refresh' first.", file=sys.stderr)
-    except Exception:
-        logger.debug("Freshness check failed", exc_info=True)
+    _check_data_freshness(app_ctx)
 
     if ticker:
-        if mode != "ranks":
-            print(f"WARNING: --mode {mode} is ignored when --ticker is provided; running ticker analysis.", file=sys.stderr)
-        if output == "csv":
-            print("WARNING: CSV output is not supported for --ticker analysis; using console output.", file=sys.stderr)
-        params = TickerAnalysisParams(ticker=ticker, year=year, horizon=horizons[0], threshold=threshold)
-        result = run_ticker_analysis(
-            params,
-            app_ctx.transaction_source,
-            app_ctx.price_source,
-        )
-        if result.success and hasattr(result, 'data') and result.data:
-            print(f"\n=== Buyers of {result.data['ticker']} ===")
-            print(result.data["buyers"].to_string(index=False))
-            print("\n=== Signal Score ===")
-            print(result.data["score"].to_string(index=False))
-        raise typer.Exit(0 if result.success else 1)
-
-    if mode == "tickers":
-        if output == "csv":
-            print("WARNING: CSV output is not supported for --mode tickers; using console output.", file=sys.stderr)
-        params = TickerScoringParams(
-            year=year,
-            horizons=tuple(horizons),
-            threshold=threshold,
-            days_back=days_back,
-            min_buyers=min_buyers,
-            top_n=top_n,
-        )
-        result = run_recent_ticker_scoring(
-            app_ctx.transaction_source,
-            app_ctx.price_source,
-            params,
-        )
-        if result.success and hasattr(result, 'data') and result.data:
-            data = result.data
-            if not data["result"].empty:
-                print(f"\n=== Top {data['top_n']} Recent Signals (Last {data['days_back']} Days, {data['min_buyers']}+ Buyers) ===")
-                print(data["result"].to_string(index=False))
-        raise typer.Exit(0 if result.success else 1)
-
-    if mode == "sales":
-        data_path = Path(app_ctx.settings.data.data_dir)
-        result = run_sales_pipeline(
-            year, tuple(horizons), top_n,
-            app_ctx.transaction_source, app_ctx.price_source, data_path, output
-        )
-        if result.success and hasattr(result, 'data') and result.data:
-            _save_results(result.data["table"], output, DisplayMode.SALE_RANKINGS, None, False, data_path)
-        raise typer.Exit(0 if result.success else 1)
-
-    show_signals = mode == "signals"
-    params = AnalysisParams(
-        year=year,
-        horizons=tuple(horizons),
-        threshold=threshold,
-        member_filter=member,
-        top_n=top_n,
-        show_signals=show_signals,
-    )
-    data_path = Path(app_ctx.settings.data.data_dir)
-    result = run_analysis_pipeline(
-        params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
-    )
-    if result.success and hasattr(result, 'data') and result.data:
-        if params.member_filter:
-            display_mode = DisplayMode.MEMBER_SIGNALS
-        elif show_signals:
-            display_mode = DisplayMode.TOP_SIGNALS
-        else:
-            display_mode = DisplayMode.MEMBER_RANKINGS
-        _save_results(result.data["table"], output, display_mode,
-                      result.data["member_filter"], result.data["show_signals"], data_path)
-        if result.data["sector_results"] is not None and not params.member_filter and not show_signals:
-            print("\n=== Sector Analysis ===")
-            print(result.data["sector_results"].to_string(index=False))
-    raise typer.Exit(0 if result.success else 1)
+        _run_ticker_mode(app_ctx, mode, ticker, year, horizons, threshold, output)
+    elif mode == "tickers":
+        _run_tickers_mode(app_ctx, year, horizons, threshold, days_back, min_buyers, top_n, output)
+    elif mode == "sales":
+        _run_sales_mode(app_ctx, year, horizons, top_n, output)
+    else:
+        _run_analysis_mode(app_ctx, year, horizons, threshold, member, top_n, mode, output)
 
 
 

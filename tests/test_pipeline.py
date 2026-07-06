@@ -9,7 +9,7 @@ from analyzer.pipeline import (
     AnalysisParams,
     TickerAnalysisParams,
     TickerScoringParams,
-    _prepare_analysis_data,
+    prepare_analysis_data,
     pipeline_step,
     run_recent_ticker_scoring,
 )
@@ -107,7 +107,7 @@ class TestTickerAnalysisParams(unittest.TestCase):
 class TestPrepareAnalysisData(unittest.TestCase):
 
     @patch("analyzer.pipeline.analysis.calculate_signal_potential")
-    def test_prepare_analysis_data(self, mock_calc_signals):
+    def testprepare_analysis_data(self, mock_calc_signals):
         mock_transactions = pd.DataFrame({
             "member": ["Alice"],
             "ticker": ["AAPL"],
@@ -144,7 +144,7 @@ class TestPrepareAnalysisData(unittest.TestCase):
         mock_price_source = MagicMock()
         mock_price_source.get_prices.return_value = mock_prices
 
-        trades, prices, signals = _prepare_analysis_data(mock_tx_source, mock_price_source, 2024, [90])
+        trades, prices, signals = prepare_analysis_data(mock_tx_source, mock_price_source, 2024, [90])
 
         mock_tx_source.get_transactions.assert_called_once_with(2024)
         mock_tx_source.db.get_entry_prices.assert_called_once()
@@ -155,14 +155,14 @@ class TestPrepareAnalysisData(unittest.TestCase):
         mock_calc_signals.assert_called_once_with(mock_entry_prices, mock_prices, [90])
 
     @patch("analyzer.pipeline.analysis.calculate_signal_potential")
-    def test_prepare_analysis_data_empty_trades_raises(self, mock_calc_signals):
+    def testprepare_analysis_data_empty_trades_raises(self, mock_calc_signals):
         mock_tx_source = MagicMock()
         mock_tx_source.get_transactions.return_value = pd.DataFrame()
 
         mock_price_source = MagicMock()
 
         with self.assertRaises(DataSourceError):
-            _prepare_analysis_data(mock_tx_source, mock_price_source, 2024, [90])
+            prepare_analysis_data(mock_tx_source, mock_price_source, 2024, [90])
 
         mock_calc_signals.assert_not_called()
 
@@ -171,7 +171,7 @@ class TestRecentTickerScoring(unittest.TestCase):
 
     @patch("analyzer.pipeline.analysis.rank_members")
     @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
-    @patch("analyzer.pipeline._prepare_analysis_data")
+    @patch("analyzer.pipeline.prepare_analysis_data")
     def test_scores_use_recent_trades_not_full_year_trades(self, mock_prepare, mock_score, mock_rank):
         trades = pd.DataFrame({
             "member": ["Alice", "Bob", "Old Buyer"],

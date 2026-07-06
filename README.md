@@ -35,35 +35,48 @@ pip install ".[dev]"
 
 ```
 src/analyzer/
-├── backtest/            # Recommendations, evaluation, prices, filters, curves, summaries, OU parameters
-├── member_ranking/      # Bayesian scoring, decay weighting, ranking, factors, buyer scoring, sales, lookups
-├── parsing/             # pdfplumber/pdftotext/docling/OCR parsers plus row, cell, column, and metadata helpers
-├── portfolio/           # Kelly sizing, portfolio simulation, and portfolio metrics
-├── signals/             # Core signal generation, assembly, filters, prices, constants, and top-signal helpers
-├── analysis.py          # Analysis output assembly for ranks, signals, members, sales, and tickers
-├── capitol_trades.py    # Capitol Trades API ingestion
-├── cli.py               # Typer command-line interface (`ptr-alpha`)
-├── database.py          # DuckDB schema, migrations, and query helpers
-├── datasources.py       # House PTR and yfinance data sources
-├── exceptions.py        # Analyzer exception hierarchy
-├── interfaces.py        # Source protocol interfaces
-├── matched_control.py   # Matched-control return comparisons
-├── member_skill.py      # Member skill and profitability helpers
-├── member_names.py      # Member name normalization helpers
-├── models.py            # Data models and enums
-├── options.py           # Option-contract parsing helpers
-├── pipeline.py          # Fetch, parse, analysis, and backtest orchestration
-├── portfolio_sim.py     # Portfolio simulator used by the CLI
-├── price_snapshot.py    # Price snapshot manifests for reproducible backtests
-├── return_process.py    # Return process statistics
-├── settings.py          # Pydantic settings for data paths and parser behavior
-├── signal_features.py   # Feature engineering for signals
-├── snooping.py          # Multiple-comparison corrections and HAC statistics
-├── ticker_resolver.py   # Ticker cleaning and symbol resolution
-└── validation.py        # Honest time-split calibration and evaluation
+├── backtest/                  # Recommendations, evaluation, prices, filters, curves, summaries, OU parameters
+├── member_ranking/            # Bayesian scoring, decay weighting, ranking, factors, buyer scoring, sales, lookups
+├── parsing/                   # pdfplumber/pdftotext/docling/OCR parsers plus row, cell, column, and metadata helpers
+├── portfolio/                 # Kelly sizing, portfolio simulation, and portfolio metrics
+├── signals/                   # Core signal generation, assembly, filters, prices, constants, and top-signal helpers
+├── analysis.py                # Analysis output assembly for ranks, signals, members, sales, and tickers
+├── capitol_trades.py          # Capitol Trades API ingestion
+├── cli.py                     # Typer CLI; all formatting and display logic
+├── database.py                # DuckDB facade delegating to repository modules
+├── datasources.py             # Backward-compatible re-exports (parser_cascade, download, price_source)
+├── download.py                # House PTR PDF download and caching
+├── exceptions.py              # Exception hierarchy, StepResult, DataResult types
+├── interfaces.py              # Source protocol interfaces
+├── matched_control.py         # Matched-control return comparisons
+├── member_skill.py            # Member skill and profitability helpers
+├── member_names.py            # Member name normalization helpers
+├── metadata_repository.py     # Metadata CRUD operations
+├── models.py                  # Data models and enums
+├── options.py                 # Option-contract parsing helpers
+├── parse_run_repository.py    # Parse run tracking
+├── parser_cascade.py          # Deterministic PDF parser cascade
+├── pipeline.py                # Fetch, parse, analysis, and backtest orchestration (returns DataResult)
+├── portfolio_sim.py           # Portfolio simulator used by the CLI
+├── price_repository.py        # Price data CRUD operations
+├── price_snapshot.py          # Price snapshot manifests for reproducible backtests
+├── price_source.py            # Price data sourcing with yfinance and cache
+├── return_process.py          # Return process statistics
+├── sector_data.py             # Sector data loading and analysis
+├── settings.py                # Pydantic settings for data paths and parser behavior
+├── signal_features.py         # Feature engineering for signals
+├── snooping.py                # Multiple-comparison corrections and HAC statistics
+├── ticker_resolver.py         # Ticker cleaning and symbol resolution
+├── transaction_repository.py  # Transaction CRUD operations
+└── validation.py              # Honest time-split calibration and evaluation
+```
 
+```
 scripts/
-├── cleanup_tickers.py       # Clean and backfill ticker symbols
+├── backfill_tickers.py      # Backfill missing ticker symbols
+├── cleanup_tickers.py       # Clean and normalize ticker symbols
+├── download_missing_pdfs.py # Download missing House PTR PDFs
+├── fetch_capitol_trades.py  # Fetch congressional trades from Capitol Trades API
 ├── gemini_ocr_common.py     # Shared Gemini OCR cache and validation helpers
 ├── ocr_parallel.py          # Parallel Gemini OCR runner
 ├── ocr_zero_rows.py         # Gemini OCR for PDFs with no parsed rows
@@ -73,6 +86,8 @@ scripts/
 
 sweep.py                     # Parameter sweep using analyzer.validation
 ```
+
+Modules follow a layered design: `cli.py` handles presentation and formatting, `pipeline.py` contains pure computation returning `DataResult`, repository modules (`transaction_repository`, `price_repository`, `metadata_repository`, `parse_run_repository`) encapsulate database access behind the `database.py` facade, and `exceptions.py` defines the `StepResult` and `DataResult[T]` types used throughout for error propagation.
 
 ## CLI
 

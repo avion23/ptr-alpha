@@ -130,12 +130,15 @@ class PriceRepository:
         expanded_tickers: list[str] = []
         seen: set[str] = set()
         ticker_map_entries: list[tuple[str, str]] = []
+        map_seen: set[str] = set()
         for raw in tickers:
             if raw not in seen:
                 seen.add(raw)
                 expanded_tickers.append(raw)
             resolved = resolutions[raw].price_symbol
-            ticker_map_entries.append((raw, resolved))
+            if raw not in map_seen:
+                map_seen.add(raw)
+                ticker_map_entries.append((raw, resolved))
             if resolved not in seen:
                 seen.add(resolved)
                 expanded_tickers.append(resolved)

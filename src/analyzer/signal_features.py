@@ -56,7 +56,7 @@ def compute_optimal_entry(
     return disc_price, 0, False
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class SignalFeatures:
     ticker: str
     disclosure_date: date
@@ -70,7 +70,7 @@ class SignalFeatures:
     n_buyers_30d: int                 # buyers in last 30 days
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class CrashHazard:
     crash_prob: float     # probability of >20% drawdown in next 120d
     expected_return: float

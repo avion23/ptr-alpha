@@ -128,53 +128,53 @@ def analyze(
         if output == "csv":
             print("WARNING: CSV output is not supported for --ticker analysis; using console output.", file=sys.stderr)
         params = TickerAnalysisParams(ticker=ticker, year=year, horizon=horizons[0], threshold=threshold)
-        success = run_ticker_analysis(
+        result = run_ticker_analysis(
             params,
             app_ctx.transaction_source,
             app_ctx.price_source,
         )
-        raise typer.Exit(0 if success else 1)
+        raise typer.Exit(0 if result.success else 1)
 
     if mode == "tickers":
         if output == "csv":
             print("WARNING: CSV output is not supported for --mode tickers; using console output.", file=sys.stderr)
         params = TickerScoringParams(
             year=year,
-            horizons=horizons,
+            horizons=tuple(horizons),
             threshold=threshold,
             days_back=days_back,
             min_buyers=min_buyers,
             top_n=top_n,
         )
-        success = run_recent_ticker_scoring(
+        result = run_recent_ticker_scoring(
             app_ctx.transaction_source,
             app_ctx.price_source,
             params,
         )
-        raise typer.Exit(0 if success else 1)
+        raise typer.Exit(0 if result.success else 1)
 
     if mode == "sales":
         data_path = Path(app_ctx.settings.data.data_dir)
-        success = run_sales_pipeline(
-            year, horizons, top_n,
+        result = run_sales_pipeline(
+            year, tuple(horizons), top_n,
             app_ctx.transaction_source, app_ctx.price_source, data_path, output
         )
-        raise typer.Exit(0 if success else 1)
+        raise typer.Exit(0 if result.success else 1)
 
     show_signals = mode == "signals"
     params = AnalysisParams(
         year=year,
-        horizons=horizons,
+        horizons=tuple(horizons),
         threshold=threshold,
         member_filter=member,
         top_n=top_n,
         show_signals=show_signals,
     )
     data_path = Path(app_ctx.settings.data.data_dir)
-    success = run_analysis_pipeline(
+    result = run_analysis_pipeline(
         params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
     )
-    raise typer.Exit(0 if success else 1)
+    raise typer.Exit(0 if result.success else 1)
 
 
 
@@ -189,8 +189,8 @@ def fetch(
     app_ctx = get_context(ctx, data_dir, read_only=False)
     if refresh_metadata:
         app_ctx.transaction_source.fetch_metadata(year, refresh=True)
-    success = run_fetch_pipeline(app_ctx.transaction_source, year)
-    raise typer.Exit(0 if success else 1)
+    result = run_fetch_pipeline(app_ctx.transaction_source, year)
+    raise typer.Exit(0 if result.success else 1)
 
 
 @app.command()
@@ -205,17 +205,17 @@ def parse(
     """Parse cached PDFs to database"""
     app_ctx = get_context(ctx, data_dir, read_only=False)
     try:
-        success = run_parse_pipeline(app_ctx.transaction_source, year)
+        result = run_parse_pipeline(app_ctx.transaction_source, year)
     except Exception:
         logger.exception("Parse pipeline failed")
-        success = False
+        result = None
     ocr_inserted = 0
     if use_gemini_ocr:
         from scripts.ocr_zero_rows import run_gemini_ocr_for_year
         ocr_inserted = run_gemini_ocr_for_year(year, data_dir=app_ctx.settings.data.data_dir)
-    if not success and use_gemini_ocr and ocr_inserted > 0:
+    if (result is None or not result.success) and use_gemini_ocr and ocr_inserted > 0:
         logger.warning("Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted)
-    raise typer.Exit(0 if success else 1)
+    raise typer.Exit(0 if result is not None and result.success else 1)
 
 
 @app.command()
@@ -267,8 +267,8 @@ def backtest(
         frequency_days=frequency_days,
     )
     resolved_data_dir = Path(app_ctx.settings.data.data_dir)
-    success = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source, resolved_data_dir)
-    raise typer.Exit(0 if success else 1)
+    result = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source, resolved_data_dir)
+    raise typer.Exit(0 if result.success else 1)
 
 
 @app.command()
@@ -529,7 +529,8 @@ def refresh(
     if refresh_metadata:
         app_ctx.transaction_source.fetch_metadata(year, refresh=True)
     try:
-        if not run_fetch_pipeline(app_ctx.transaction_source, year):
+        fetch_result = run_fetch_pipeline(app_ctx.transaction_source, year)
+        if not fetch_result.success:
             failed_steps.append("fetch")
     except Exception as e:
         failed_steps.append("fetch")
@@ -538,7 +539,8 @@ def refresh(
     # Step 2: Parse cached PDFs
     print(f"[2/4] Parsing cached PDFs for {year}...")
     try:
-        if not run_parse_pipeline(app_ctx.transaction_source, year):
+        parse_result = run_parse_pipeline(app_ctx.transaction_source, year)
+        if not parse_result.success:
             failed_steps.append("parse")
     except Exception as e:
         failed_steps.append("parse")

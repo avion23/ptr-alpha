@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from analyzer.cli import app, setup_logging
 from analyzer.pipeline import AnalysisParams, BacktestParams
+from analyzer.exceptions import StepResult
 
 
 class TestSetupLogging(unittest.TestCase):
@@ -55,7 +56,7 @@ class TestCliApp(unittest.TestCase):
 
         def fake_pipeline(params, tx_source, price_source, data_path):
             captured["params"] = params
-            return True
+            return StepResult(success=True)
 
         with patch("analyzer.cli.run_backtest_pipeline", side_effect=fake_pipeline), \
              patch("analyzer.cli.get_context", return_value=MagicMock()):
@@ -84,7 +85,7 @@ class TestCliApp(unittest.TestCase):
         mock_ctx.settings.data.data_dir = "data"
 
         with patch("analyzer.cli.get_context", return_value=mock_ctx), \
-             patch("analyzer.cli.run_parse_pipeline", return_value=False), \
+             patch("analyzer.cli.run_parse_pipeline", return_value=StepResult(success=False)), \
              patch("scripts.ocr_zero_rows.run_gemini_ocr_for_year", return_value=3):
             result = self.runner.invoke(app, ["parse", "--gemini-ocr"])
 
@@ -100,8 +101,8 @@ class TestCliApp(unittest.TestCase):
         ]
 
         with patch("analyzer.cli.get_context", return_value=mock_ctx), \
-             patch("analyzer.cli.run_fetch_pipeline", return_value=True) as fetch_pipeline, \
-             patch("analyzer.cli.run_parse_pipeline", return_value=True) as parse_pipeline, \
+             patch("analyzer.cli.run_fetch_pipeline", return_value=StepResult(success=True)) as fetch_pipeline, \
+             patch("analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)) as parse_pipeline, \
              patch("scripts.ocr_zero_rows.run_gemini_ocr_for_year", side_effect=RuntimeError("quota")):
             result = self.runner.invoke(app, ["refresh", "--skip-capitol", "--gemini-ocr"])
 
@@ -116,7 +117,7 @@ class TestCliApp(unittest.TestCase):
         mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)
 
         with patch("analyzer.cli.get_context", return_value=mock_ctx), \
-             patch("analyzer.cli.run_ticker_analysis", return_value=True):
+             patch("analyzer.cli.run_ticker_analysis", return_value=StepResult(success=True)):
             result = self.runner.invoke(app, ["analyze", "--ticker", "AAPL", "--output", "csv"])
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -127,14 +128,14 @@ class TestCliApp(unittest.TestCase):
         mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)
 
         with patch("analyzer.cli.get_context", return_value=mock_ctx), \
-             patch("analyzer.cli.run_ticker_analysis", return_value=True):
+             patch("analyzer.cli.run_ticker_analysis", return_value=StepResult(success=True)):
             # Non-default mode should produce warning
             result = self.runner.invoke(app, ["analyze", "--mode", "sales", "--ticker", "AAPL"])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("--mode sales is ignored when --ticker is provided", result.output)
 
         with patch("analyzer.cli.get_context", return_value=mock_ctx), \
-             patch("analyzer.cli.run_ticker_analysis", return_value=True):
+             patch("analyzer.cli.run_ticker_analysis", return_value=StepResult(success=True)):
             # Default mode should produce no warning
             result = self.runner.invoke(app, ["analyze", "--ticker", "AAPL"])
         self.assertEqual(result.exit_code, 0, result.output)
@@ -145,7 +146,7 @@ class TestCliApp(unittest.TestCase):
         mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)
 
         with patch("analyzer.cli.get_context", return_value=mock_ctx), \
-             patch("analyzer.cli.run_ticker_analysis", return_value=True):
+             patch("analyzer.cli.run_ticker_analysis", return_value=StepResult(success=True)):
             result = self.runner.invoke(app, ["analyze", "--mode", "member", "--ticker", "AAPL"])
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -156,7 +157,7 @@ class TestCliApp(unittest.TestCase):
         mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)
 
         with patch("analyzer.cli.get_context", return_value=mock_ctx), \
-             patch("analyzer.cli.run_recent_ticker_scoring", return_value=True):
+             patch("analyzer.cli.run_recent_ticker_scoring", return_value=StepResult(success=True)):
             result = self.runner.invoke(app, ["analyze", "--mode", "tickers", "--output", "csv"])
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -178,7 +179,7 @@ class TestAnalyzeParamsMapping(unittest.TestCase):
 
         def fake_pipeline(params, tx_source, price_source, data_path, output_format):
             captured["params"] = params
-            return True
+            return StepResult(success=True)
 
         # Also stub get_context so we don't need a real database.
         mock_ctx = MagicMock()
@@ -247,7 +248,7 @@ class TestAnalyzeParamsMapping(unittest.TestCase):
         mock_ctx = MagicMock()
         mock_ctx.transaction_source.db.conn.execute.side_effect = fake_execute
 
-        with patch("analyzer.cli.run_analysis_pipeline", return_value=True), \
+        with patch("analyzer.cli.run_analysis_pipeline", return_value=StepResult(success=True)), \
              patch("analyzer.cli.get_context", return_value=mock_ctx):
             result = self.runner.invoke(app, ["analyze"])
 

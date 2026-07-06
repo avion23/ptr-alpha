@@ -67,7 +67,8 @@ class TestPipelineStep(unittest.TestCase):
             raise AnalyzerError("boom")
 
         result = failing_fn()
-        self.assertFalse(result)
+        self.assertFalse(result.success)
+        self.assertIsInstance(result.error, AnalyzerError)
 
     def test_wraps_data_source_error_returns_false(self):
         @pipeline_step
@@ -75,7 +76,8 @@ class TestPipelineStep(unittest.TestCase):
             raise DataSourceError("no data")
 
         result = failing_fn()
-        self.assertFalse(result)
+        self.assertFalse(result.success)
+        self.assertIsInstance(result.error, DataSourceError)
 
     def test_non_analyzer_error_propagates(self):
         @pipeline_step
@@ -435,7 +437,8 @@ def test_pipeline_step_logs_analyzer_error(caplog):
     with caplog.at_level(logging.ERROR, logger="analyzer.pipeline"):
         result = failing_fn()
 
-    assert result is False, "pipeline_step must still return False on AnalyzerError"
+    assert not result.success, "pipeline_step must return StepResult(success=False) on AnalyzerError"
+    assert isinstance(result.error, AnalyzerError), "StepResult.error must be the AnalyzerError"
     assert any("something went wrong" in r.message for r in caplog.records), (
         f"AnalyzerError message not found in logs; records={caplog.records}"
     )
@@ -456,7 +459,8 @@ def test_pipeline_step_logs_data_source_error(caplog):
     with caplog.at_level(logging.ERROR, logger="analyzer.pipeline"):
         result = failing_fn()
 
-    assert result is False
+    assert not result.success
+    assert isinstance(result.error, DataSourceError)
     assert any("no data available" in r.message for r in caplog.records), (
         f"DataSourceError message not found in logs; records={caplog.records}"
     )

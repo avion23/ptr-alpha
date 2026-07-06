@@ -12,7 +12,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class PortfolioConfig:
     initial_capital: float = 20000.0
     max_positions: int = 5
@@ -25,7 +25,7 @@ class PortfolioConfig:
     min_signal_score: float = 0.0
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class PortfolioPosition:
     ticker: str
     entry_date: date

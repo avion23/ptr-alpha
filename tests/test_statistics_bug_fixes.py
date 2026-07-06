@@ -301,9 +301,8 @@ class TestSweepAlphaSlopeSign(unittest.TestCase):
         r = SweepResult(
             horizon=90, frequency_days=30, training_lookback_days=365,
             min_buyers=2, top_n=5, decay_lambda=0.005, bayes_prior_strength=20,
+            rank1_alpha=rank1, rank5_alpha=rank5,
         )
-        r.rank1_alpha = rank1
-        r.rank5_alpha = rank5
         return r
 
     def test_good_config_positive_slope(self):

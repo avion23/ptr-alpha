@@ -27,6 +27,7 @@ from analyzer.signals.constants import (
     MIN_ENTRY_PRICE,
     POSITION_SIZE_BASELINE,
     TICKER_PERF_MIN_TRADES,
+    _NS_PER_DAY,
 )
 
 # Price index + lookups
@@ -73,6 +74,7 @@ __all__ = [
     "MIN_ENTRY_PRICE",
     "CONVICTION_WEIGHT_ALPHA",
     "CONVICTION_WEIGHT_REALIZED",
+    "_NS_PER_DAY",
     "_clear_price_index_cache",
     "_price_arrays",
     "_price_at_or_before",

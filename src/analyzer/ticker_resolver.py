@@ -7,7 +7,7 @@ from datetime import date
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class TickerResolution:
     raw_ticker: str
     price_symbol: str

@@ -25,3 +25,11 @@ class DownloadResult(BaseModel):
     status: DownloadStatus
     error_message: str = ""
     status_code: int = 0
+
+
+# NOTE: A Transaction value object (frozen dataclass matching the DB schema)
+# was considered but is intentionally deferred.  The entire codebase passes
+# transactions as pd.DataFrame — from datasources.py through pipeline.py
+# to analysis.py — and introducing a typed value object would require a
+# large-scale refactor across all modules.  The DataFrame convention is
+# documented here as the intentional representation.

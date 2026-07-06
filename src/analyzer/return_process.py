@@ -25,7 +25,7 @@ import numpy as np
 # Parameter containers
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class OUParams:
     """Ornstein-Uhlenbeck parameters estimated from a return curve."""
 
@@ -57,7 +57,7 @@ class OUParams:
         return self.mu * self.one_minus_a
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class OUPosterior:
     """Posterior over mu at a point in time."""
 

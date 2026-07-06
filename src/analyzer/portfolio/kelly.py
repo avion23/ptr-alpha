@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class KellyConfig:
     """Configuration for Kelly portfolio construction."""
     capital: float = 100_000.0

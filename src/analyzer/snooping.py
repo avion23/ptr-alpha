@@ -244,7 +244,7 @@ def alpha_ttest(
     return float(t_stat), float(p_value)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class SnoopingReport:
     """Results of data snooping analysis for a single strategy configuration."""
     n_tests: int

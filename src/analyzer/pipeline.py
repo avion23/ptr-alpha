@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import wraps
 import logging
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from analyzer.exceptions import AnalyzerError, DataSourceError, AnalysisError
+from analyzer.exceptions import AnalyzerError, DataSourceError, AnalysisError, StepResult
 from analyzer.models import TransactionType
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer import analysis
@@ -56,10 +56,10 @@ def _load_sector_data(tickers: list[str]) -> pd.DataFrame:
 
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class AnalysisParams:
     year: int
-    horizons: list[int]
+    horizons: tuple[int, ...]
     threshold: float
     source: str = "house"
     member_filter: str | None = None
@@ -67,24 +67,25 @@ class AnalysisParams:
     show_signals: bool = False
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class TickerScoringParams:
     year: int
-    horizons: list[int]
+    horizons: tuple[int, ...]
     threshold: float = 5.0
     days_back: int = 28
     min_buyers: int = 3
     top_n: int = 15
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class TickerAnalysisParams:
     ticker: str
     year: int
     horizon: int = 90
     threshold: float = 5.0
 
-@dataclass
+
+@dataclass(frozen=True, slots=True)
 class BacktestParams:
     start_date: date
     end_date: date
@@ -103,14 +104,17 @@ def pipeline_step(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            if result is True:
+                return StepResult(success=True)
+            return result  # Already a StepResult or similar
         except AnalyzerError as exc:
             logger.error("Pipeline step %s failed: %s", func.__name__, exc)
-            return False
+            return StepResult(success=False, error=exc)
     return wrapper
 
 def _prepare_analysis_data(
-    transaction_source, price_source, year: int, horizons: list[int]
+    transaction_source, price_source, year: int, horizons: tuple[int, ...]
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     trades = transaction_source.get_transactions(year)
     logger.info(f"Loaded {len(trades)} transactions for {year}")
@@ -174,7 +178,7 @@ def run_analysis_pipeline(
 
 @pipeline_step
 def run_sales_pipeline(
-    year: int, horizons: list[int], top_n: int,
+    year: int, horizons: tuple[int, ...], top_n: int,
     transaction_source, price_source, data_dir: Path, output_format: str
 ) -> bool:
     trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, year, horizons)
@@ -188,7 +192,7 @@ def run_sales_pipeline(
 def run_ticker_analysis(
     params: TickerAnalysisParams, transaction_source, price_source
 ) -> bool:
-    trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, params.year, [params.horizon])
+    trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, params.year, (params.horizon,))
 
     buyers = analysis.get_ticker_buyers_with_rankings(params.ticker, trades, signals, params.horizon, params.threshold)
     score = analysis.score_ticker_by_buyers(params.ticker, trades, signals, params.horizon, params.threshold)
@@ -402,7 +406,7 @@ def _save_results(
 
 
 def _analyze_by_sector(
-    trades: pd.DataFrame, signals: pd.DataFrame, horizons: list[int]
+    trades: pd.DataFrame, signals: pd.DataFrame, horizons: tuple[int, ...]
 ) -> pd.DataFrame | None:
     tickers = trades['ticker'].unique()
     sectors = _load_sector_data(tickers.tolist())

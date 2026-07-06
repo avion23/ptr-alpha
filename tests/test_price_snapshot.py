@@ -47,7 +47,7 @@ class TestPriceSnapshot(unittest.TestCase):
         self.assertTrue(snap.python_version)
         self.assertEqual(snap.requested_tickers, 2)
         self.assertEqual(snap.resolved_tickers, 2)
-        self.assertEqual(snap.unresolved_tickers, [])
+        self.assertEqual(snap.unresolved_tickers, ())
         self.assertGreater(snap.price_rows, 0)
         self.assertEqual(snap.first_date, "2024-01-01")
         self.assertEqual(snap.last_date, "2024-01-10")
@@ -60,14 +60,14 @@ class TestPriceSnapshot(unittest.TestCase):
         snap = create_snapshot(self.db, tickers, date(2024, 1, 1), date(2024, 1, 15))
 
         self.assertEqual(snap.resolved_tickers, 2)
-        self.assertEqual(snap.unresolved_tickers, ["GOOG"])
+        self.assertEqual(snap.unresolved_tickers, ("GOOG",))
         self.assertEqual(snap.requested_tickers, 3)
 
     def test_create_snapshot_empty_db(self):
         snap = create_snapshot(self.db, ["AAPL"], date(2024, 1, 1), date(2024, 1, 15))
 
         self.assertEqual(snap.resolved_tickers, 0)
-        self.assertEqual(snap.unresolved_tickers, ["AAPL"])
+        self.assertEqual(snap.unresolved_tickers, ("AAPL",))
         self.assertEqual(snap.price_rows, 0)
         self.assertEqual(snap.first_date, "")
         self.assertEqual(snap.last_date, "")
@@ -101,7 +101,7 @@ class TestPriceSnapshot(unittest.TestCase):
             python_version="3.11.0",
             requested_tickers=1,
             resolved_tickers=1,
-            unresolved_tickers=[],
+            unresolved_tickers=(),
             price_rows=1,
             first_date="2024-01-01",
             last_date="2024-01-01",
@@ -120,7 +120,7 @@ class TestPriceSnapshot(unittest.TestCase):
             python_version="3.11.0",
             requested_tickers=2,
             resolved_tickers=2,
-            unresolved_tickers=[],
+            unresolved_tickers=(),
             price_rows=10,
             first_date="2024-01-01",
             last_date="2024-01-10",
@@ -137,7 +137,7 @@ class TestPriceSnapshot(unittest.TestCase):
             python_version="3.11.0",
             requested_tickers=3,
             resolved_tickers=3,
-            unresolved_tickers=[],
+            unresolved_tickers=(),
             price_rows=15,
             first_date="2024-01-01",
             last_date="2024-01-15",
@@ -163,7 +163,7 @@ class TestPriceSnapshot(unittest.TestCase):
             python_version="3.11.0",
             requested_tickers=2,
             resolved_tickers=2,
-            unresolved_tickers=[],
+            unresolved_tickers=(),
             price_rows=10,
             first_date="2024-01-01",
             last_date="2024-01-10",
@@ -180,7 +180,7 @@ class TestPriceSnapshot(unittest.TestCase):
             python_version="3.11.0",
             requested_tickers=1,
             resolved_tickers=1,
-            unresolved_tickers=[],
+            unresolved_tickers=(),
             price_rows=5,
             first_date="2024-01-01",
             last_date="2024-01-10",
@@ -201,7 +201,7 @@ class TestPriceSnapshot(unittest.TestCase):
             python_version="3.11.0",
             requested_tickers=1,
             resolved_tickers=1,
-            unresolved_tickers=[],
+            unresolved_tickers=(),
             price_rows=5,
             first_date="2024-01-01",
             last_date="2024-01-05",
@@ -217,7 +217,7 @@ class TestPriceSnapshot(unittest.TestCase):
             python_version="3.11.0",
             requested_tickers=1,
             resolved_tickers=1,
-            unresolved_tickers=[],
+            unresolved_tickers=(),
             price_rows=10,
             first_date="2024-01-01",
             last_date="2024-01-10",
@@ -240,7 +240,7 @@ class TestPriceSnapshot(unittest.TestCase):
             python_version="3.11.0",
             requested_tickers=1,
             resolved_tickers=1,
-            unresolved_tickers=[],
+            unresolved_tickers=(),
             price_rows=5,
             first_date="2024-01-01",
             last_date="2024-01-05",

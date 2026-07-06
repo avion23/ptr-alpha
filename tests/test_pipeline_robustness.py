@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from analyzer import datasources
 from analyzer.cli import app
+from analyzer.exceptions import StepResult
 from analyzer.exceptions import ParsingError
 from analyzer.models import FilingType
 
@@ -130,8 +131,8 @@ def _refresh_context():
 def test_refresh_exits_one_when_fetch_pipeline_returns_false():
     runner = CliRunner()
     with patch("analyzer.cli.get_context", return_value=_refresh_context()), \
-         patch("analyzer.cli.run_fetch_pipeline", return_value=False), \
-         patch("analyzer.cli.run_parse_pipeline", return_value=True):
+         patch("analyzer.cli.run_fetch_pipeline", return_value=StepResult(success=False)), \
+         patch("analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)):
         result = runner.invoke(app, ["refresh", "--skip-capitol"])
 
     assert result.exit_code == 1, result.output
@@ -141,8 +142,8 @@ def test_refresh_exits_one_when_fetch_pipeline_returns_false():
 def test_refresh_exits_zero_when_all_steps_succeed():
     runner = CliRunner()
     with patch("analyzer.cli.get_context", return_value=_refresh_context()), \
-         patch("analyzer.cli.run_fetch_pipeline", return_value=True), \
-         patch("analyzer.cli.run_parse_pipeline", return_value=True):
+         patch("analyzer.cli.run_fetch_pipeline", return_value=StepResult(success=True)), \
+         patch("analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)):
         result = runner.invoke(app, ["refresh", "--skip-capitol"])
 
     assert result.exit_code == 0, result.output

@@ -45,7 +45,7 @@ MIN_RECS_FOR_CANDIDACY = 20
 # SweepResult (moved verbatim from repo-root sweep.py)
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class SweepResult:
     horizon: int
     frequency_days: int
@@ -145,6 +145,38 @@ def _backtest_core(
             .sort_index()
         )
 
+        # Compute all mutable values before constructing the frozen SweepResult
+        rank_alpha = valid.groupby("rank")["bt_alpha_pct"].mean()
+        r1 = round(float(rank_alpha.loc[1]), 2) if 1 in rank_alpha.index else 0.0
+        r5 = round(float(rank_alpha.loc[5]), 2) if 5 in rank_alpha.index else 0.0
+        # Convention: rank 1 = highest-scored ticker (best model prediction).
+        # A well-calibrated ranker has rank-1 picks outperforming rank-5 picks,
+        # so alpha_slope > 0 means the ranker is working.
+        alpha_slope = round(r1 - r5, 2)
+        win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
+
+        # Sharpe and max_drawdown are time-series portfolio metrics and must
+        # be computed on the per-date mean-alpha series (one observation per
+        # rebalance date).  Using per-rec alphas here would (a) treat same-date
+        # correlated picks as independent obs for Sharpe and (b) compound
+        # returns across (date, ticker) pairs in arbitrary concat order for
+        # max_drawdown — neither of which corresponds to a portfolio the
+        # strategy actually held.
+        sharpe = 0.0
+        if len(per_date) > 1:
+            mean_a = per_date.mean()
+            std_a = per_date.std()
+            if std_a > 0:
+                periods_per_year = 365 / params.frequency_days
+                sharpe = round(
+                    float(mean_a / std_a * (periods_per_year ** 0.5)), 2
+                )
+
+        cumulative = (1 + per_date / 100).cumprod()
+        rolling_max = cumulative.cummax()
+        drawdown = (cumulative - rolling_max) / rolling_max
+        max_drawdown = round(float(drawdown.min()) * 100, 2)
+
         result = SweepResult(
             horizon=params.horizon,
             frequency_days=params.frequency_days,
@@ -158,39 +190,13 @@ def _backtest_core(
             dates_evaluated=int(valid["as_of_date"].nunique()),
             overall_alpha=round(float(valid["bt_alpha_pct"].mean()), 2),
             overall_return=round(float(valid["bt_return_pct"].mean()), 2),
+            rank1_alpha=r1,
+            rank5_alpha=r5,
+            alpha_slope=alpha_slope,
+            win_rate=win_rate,
+            sharpe=sharpe,
+            max_drawdown=max_drawdown,
         )
-
-        rank_alpha = valid.groupby("rank")["bt_alpha_pct"].mean()
-        if 1 in rank_alpha.index:
-            result.rank1_alpha = round(float(rank_alpha.loc[1]), 2)
-        if 5 in rank_alpha.index:
-            result.rank5_alpha = round(float(rank_alpha.loc[5]), 2)
-        # Convention: rank 1 = highest-scored ticker (best model prediction).
-        # A well-calibrated ranker has rank-1 picks outperforming rank-5 picks,
-        # so alpha_slope > 0 means the ranker is working.
-        result.alpha_slope = round(result.rank1_alpha - result.rank5_alpha, 2)
-        result.win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
-
-        # Sharpe and max_drawdown are time-series portfolio metrics and must
-        # be computed on the per-date mean-alpha series (one observation per
-        # rebalance date).  Using per-rec alphas here would (a) treat same-date
-        # correlated picks as independent obs for Sharpe and (b) compound
-        # returns across (date, ticker) pairs in arbitrary concat order for
-        # max_drawdown — neither of which corresponds to a portfolio the
-        # strategy actually held.
-        if len(per_date) > 1:
-            mean_a = per_date.mean()
-            std_a = per_date.std()
-            if std_a > 0:
-                periods_per_year = 365 / params.frequency_days
-                result.sharpe = round(
-                    float(mean_a / std_a * (periods_per_year ** 0.5)), 2
-                )
-
-        cumulative = (1 + per_date / 100).cumprod()
-        rolling_max = cumulative.cummax()
-        drawdown = (cumulative - rolling_max) / rolling_max
-        result.max_drawdown = round(float(drawdown.min()) * 100, 2)
 
         return result, per_date
 

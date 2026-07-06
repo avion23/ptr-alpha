@@ -32,7 +32,7 @@ def _get_yfinance_version() -> str:
         return "not installed"
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class PriceSnapshot:
     snapshot_id: str
     created_at: str
@@ -41,7 +41,7 @@ class PriceSnapshot:
     python_version: str
     requested_tickers: int
     resolved_tickers: int
-    unresolved_tickers: list[str]
+    unresolved_tickers: tuple[str, ...]
     price_rows: int
     first_date: str
     last_date: str
@@ -96,13 +96,13 @@ def create_snapshot(
     if prices.empty:
         coverage_by_ticker = {}
         resolved = 0
-        unresolved = list(tickers)
+        unresolved = tuple(tickers)
         total_rows = 0
         first_date = ""
         last_date = ""
     else:
         resolved_tickers_set = set(prices.columns)
-        unresolved = [t for t in tickers if t not in resolved_tickers_set]
+        unresolved = tuple(t for t in tickers if t not in resolved_tickers_set)
         resolved = len(resolved_tickers_set)
         total_rows = len(prices)
 
@@ -141,6 +141,9 @@ def save_snapshot(snapshot: PriceSnapshot, path: str | Path) -> None:
 def load_snapshot(path: str = "data/price_snapshot.json") -> PriceSnapshot:
     with open(path) as f:
         data = json.load(f)
+    # JSON arrays deserialize as lists; convert to tuple for frozen dataclass
+    if isinstance(data.get("unresolved_tickers"), list):
+        data["unresolved_tickers"] = tuple(data["unresolved_tickers"])
     return PriceSnapshot(**data)
 
 

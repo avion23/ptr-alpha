@@ -7,15 +7,14 @@ import pandas as pd
 
 from analyzer.pipeline import (
     AnalysisParams,
-    DisplayMode,
     TickerAnalysisParams,
     TickerScoringParams,
     _prepare_analysis_data,
-    _save_results,
-    _analyze_by_sector,
     pipeline_step,
     run_recent_ticker_scoring,
 )
+from analyzer.cli import DisplayMode, _save_results
+from analyzer.analysis import analyze_by_sector
 from analyzer.exceptions import AnalyzerError, DataSourceError
 
 
@@ -357,8 +356,8 @@ class TestSaveResults(unittest.TestCase):
 
 class TestAnalyzeBySector(unittest.TestCase):
 
-    @patch("analyzer.pipeline.analysis.rank_members")
-    @patch("analyzer.pipeline._load_sector_data")
+    @patch("analyzer.analysis.rank_members")
+    @patch("analyzer.analysis.load_sector_data")
     def test_returns_dataframe_with_sectors(self, mock_load_sector, mock_rank):
         mock_load_sector.return_value = pd.DataFrame({
             "ticker": ["AAPL", "GOOGL"],
@@ -386,7 +385,7 @@ class TestAnalyzeBySector(unittest.TestCase):
             "peak_potential_pct": [20.0, 15.0, 10.0, 12.0, 11.0, 8.0],
         })
 
-        result = _analyze_by_sector(trades, signals, [90])
+        result = analyze_by_sector(trades, signals, [90])
 
         self.assertIsNotNone(result)
         self.assertIsInstance(result, pd.DataFrame)
@@ -394,7 +393,7 @@ class TestAnalyzeBySector(unittest.TestCase):
         self.assertIn("top_member", result.columns)
         self.assertGreaterEqual(len(result), 1)
 
-    @patch("analyzer.pipeline._load_sector_data")
+    @patch("analyzer.analysis.load_sector_data")
     def test_returns_none_when_no_sector_data(self, mock_load_sector):
         mock_load_sector.return_value = pd.DataFrame(columns=["ticker", "sector"])
 
@@ -409,7 +408,7 @@ class TestAnalyzeBySector(unittest.TestCase):
             "horizon_days": [90],
         })
 
-        result = _analyze_by_sector(trades, signals, [90])
+        result = analyze_by_sector(trades, signals, [90])
         self.assertIsNone(result)
 
 

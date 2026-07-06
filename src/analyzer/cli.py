@@ -3,6 +3,7 @@
 import sys
 import logging
 from datetime import date
+from enum import StrEnum
 from pathlib import Path
 from dataclasses import dataclass
 import pandas as pd
@@ -26,6 +27,13 @@ from analyzer.exceptions import AnalyzerError
 from analyzer.settings import Settings
 from analyzer.database import Database
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
+
+
+class DisplayMode(StrEnum):
+    MEMBER_SIGNALS = "member_signals"
+    TOP_SIGNALS = "top_signals"
+    SALE_RANKINGS = "sale_rankings"
+    MEMBER_RANKINGS = "member_rankings"
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 logger = logging.getLogger(__name__)
@@ -62,6 +70,49 @@ def get_context(ctx, data_dir=None, read_only=False):
             price_source=YFinancePriceSource(settings, read_only=read_only, db=shared_db),
         )
     return ctx.obj
+
+
+def _save_results(
+    table: pd.DataFrame, output_format: str, display_mode: DisplayMode,
+    member_filter: str | None, show_signals: bool, data_dir: Path
+) -> None:
+    match display_mode:
+        case DisplayMode.MEMBER_SIGNALS | DisplayMode.TOP_SIGNALS:
+            display_cols = [
+                'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct',
+                'total_return_pct', 'total_spy_alpha_pct', 'signal_score'
+            ]
+        case DisplayMode.SALE_RANKINGS:
+            display_cols = [
+                'member', 'avg_loss_avoided_pct', 'median_loss_avoided_pct',
+                'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'posterior_lift', 'bayes_factor',
+                'avg_spy_alpha_pct',
+            ]
+        case DisplayMode.MEMBER_RANKINGS:
+            display_cols = [
+                'member', 'avg_total_spy_alpha_pct', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'conviction_score', 'purchase_trades'
+            ]
+        case _:
+            display_cols = list(table.columns)
+    available_display = [c for c in display_cols if c in table.columns]
+    display_table = table[available_display]
+
+    if output_format == 'csv':
+        if member_filter:
+            filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
+        elif show_signals:
+            filename = "top_signals.csv"
+        elif display_mode == DisplayMode.SALE_RANKINGS:
+            filename = "sale_rankings.csv"
+        else:
+            filename = "member_rankings.csv"
+
+        filepath = data_dir / filename
+        data_dir.mkdir(parents=True, exist_ok=True)
+        display_table.to_csv(filepath, index=False)
+        logger.info(f"Results saved to {filepath}")
+    else:
+        print(display_table.to_string(index=False))
 
 
 @app.callback()
@@ -133,6 +184,11 @@ def analyze(
             app_ctx.transaction_source,
             app_ctx.price_source,
         )
+        if result.success and hasattr(result, 'data') and result.data:
+            print(f"\n=== Buyers of {result.data['ticker']} ===")
+            print(result.data["buyers"].to_string(index=False))
+            print("\n=== Signal Score ===")
+            print(result.data["score"].to_string(index=False))
         raise typer.Exit(0 if result.success else 1)
 
     if mode == "tickers":
@@ -151,6 +207,11 @@ def analyze(
             app_ctx.price_source,
             params,
         )
+        if result.success and hasattr(result, 'data') and result.data:
+            data = result.data
+            if not data["result"].empty:
+                print(f"\n=== Top {data['top_n']} Recent Signals (Last {data['days_back']} Days, {data['min_buyers']}+ Buyers) ===")
+                print(data["result"].to_string(index=False))
         raise typer.Exit(0 if result.success else 1)
 
     if mode == "sales":
@@ -159,6 +220,8 @@ def analyze(
             year, tuple(horizons), top_n,
             app_ctx.transaction_source, app_ctx.price_source, data_path, output
         )
+        if result.success and hasattr(result, 'data') and result.data:
+            _save_results(result.data["table"], output, DisplayMode.SALE_RANKINGS, None, False, data_path)
         raise typer.Exit(0 if result.success else 1)
 
     show_signals = mode == "signals"
@@ -174,6 +237,18 @@ def analyze(
     result = run_analysis_pipeline(
         params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
     )
+    if result.success and hasattr(result, 'data') and result.data:
+        if params.member_filter:
+            display_mode = DisplayMode.MEMBER_SIGNALS
+        elif show_signals:
+            display_mode = DisplayMode.TOP_SIGNALS
+        else:
+            display_mode = DisplayMode.MEMBER_RANKINGS
+        _save_results(result.data["table"], output, display_mode,
+                      result.data["member_filter"], result.data["show_signals"], data_path)
+        if result.data["sector_results"] is not None and not params.member_filter and not show_signals:
+            print("\n=== Sector Analysis ===")
+            print(result.data["sector_results"].to_string(index=False))
     raise typer.Exit(0 if result.success else 1)
 
 
@@ -268,6 +343,44 @@ def backtest(
     )
     resolved_data_dir = Path(app_ctx.settings.data.data_dir)
     result = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source, resolved_data_dir)
+    if result.success and hasattr(result, 'data') and result.data:
+        data = result.data
+        snapshot = data.get("snapshot")
+        if snapshot:
+            print("\n=== Price Snapshot ===")
+            print(f"  Snapshot ID:  {snapshot.snapshot_id}")
+            print(f"  Created:      {snapshot.created_at}")
+            print(f"  Git SHA:      {snapshot.git_sha[:12]}")
+            print(f"  yfinance:     {snapshot.yfinance_version}")
+            print(f"  Tickers:      {snapshot.resolved_tickers}/{snapshot.requested_tickers} resolved")
+            if snapshot.unresolved_tickers:
+                print(f"  Unresolved:   {', '.join(snapshot.unresolved_tickers[:10])}")
+            print(f"  Price rows:   {snapshot.price_rows}")
+            print(f"  Date range:   {snapshot.first_date} to {snapshot.last_date}")
+
+        combined = data.get("combined", pd.DataFrame())
+        if not combined.empty:
+            display_cols = [
+                "as_of_date", "rank", "ticker", "num_buyers", "signal_score", "ou_entry_value",
+                "bt_entry_price", "bt_exit_price", "bt_return_pct", "bt_spy_return_pct", "bt_alpha_pct",
+            ]
+            available = [c for c in display_cols if c in combined.columns]
+            for as_of_date, group in combined.groupby("as_of_date"):
+                print(f"\n=== Backtest as of {as_of_date} ===")
+                print(group[available].to_string(index=False))
+
+            print(f"\n{'=' * 60}")
+            print("=== Backtest Summary (by rank) ===")
+            print(f"{'=' * 60}")
+            summary = data.get("summary", pd.DataFrame())
+            if not summary.empty:
+                print(summary.to_string(index=False))
+
+            valid_returns = combined.dropna(subset=["bt_return_pct"])
+            print(f"\nDates evaluated: {data.get('evaluable_dates', 0)}/{data.get('total_as_of_dates', 0)}")
+            print(f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}")
+        else:
+            print("\n=== No backtest results produced ===")
     raise typer.Exit(0 if result.success else 1)
 
 

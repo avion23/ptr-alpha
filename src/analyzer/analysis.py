@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pandas as pd
+
 from analyzer.models import TransactionType  # noqa: F401 — re-exported for backward compat
 
 from analyzer.signals import (  # noqa: F401
@@ -54,6 +56,45 @@ from analyzer.backtest import (  # noqa: F401
     evaluate_backtest,
     summarize_backtest,
 )
+
+from analyzer.sector_data import load_sector_data
+from analyzer.exceptions import AnalysisError
+
+
+def analyze_by_sector(
+    trades: pd.DataFrame, signals: pd.DataFrame, horizons: tuple[int, ...]
+) -> pd.DataFrame | None:
+    tickers = trades['ticker'].unique()
+    sectors = load_sector_data(tickers.tolist())
+    if sectors.empty:
+        return None
+
+    sig_with_sector = signals.merge(sectors, on="ticker", how="left")
+
+    results = []
+    for sector in sectors["sector"].unique():
+        sector_purchases = sig_with_sector[
+            (sig_with_sector["sector"] == sector) &
+            (sig_with_sector["signal_type"] == TransactionType.PURCHASE.value)
+        ]
+        if len(sector_purchases) < 3:
+            continue
+        try:
+            ranked = rank_members(sector_purchases, horizons[0])
+            if not ranked.empty:
+                results.append({
+                    "sector": sector,
+                    "top_member": ranked.iloc[0]["member"],
+                    "top_member_alpha": ranked.iloc[0]["avg_spy_alpha_pct"],
+                    "num_trades": len(sector_purchases),
+                    "num_members": sector_purchases["member"].nunique(),
+                })
+        except AnalysisError:
+            continue
+
+    if not results:
+        return None
+    return pd.DataFrame(results).sort_values("top_member_alpha", ascending=False)
 
 
 def get_analysis_table(

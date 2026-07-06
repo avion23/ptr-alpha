@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from dataclasses import dataclass, field
-from enum import StrEnum
 from functools import wraps
 import logging
 import re
@@ -10,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from analyzer.exceptions import AnalyzerError, DataSourceError, AnalysisError, StepResult
+from analyzer.exceptions import AnalyzerError, DataSourceError, AnalysisError, StepResult, DataResult
 from analyzer.models import TransactionType
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer import analysis
@@ -18,42 +17,6 @@ from analyzer import analysis
 logger = logging.getLogger(__name__)
 
 _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
-
-
-class DisplayMode(StrEnum):
-    MEMBER_SIGNALS = "member_signals"
-    TOP_SIGNALS = "top_signals"
-    SALE_RANKINGS = "sale_rankings"
-    MEMBER_RANKINGS = "member_rankings"
-
-
-def _load_sector_data(tickers: list[str]) -> pd.DataFrame:
-    """Load sector info for tickers using yfinance."""
-    try:
-        import yfinance as yf
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-    except ImportError:
-        return pd.DataFrame(columns=["ticker", "sector"])
-
-    filtered = [t for t in tickers if t not in ("SPY", "SP500")]
-    if not filtered:
-        return pd.DataFrame(columns=["ticker", "sector"])
-
-    def fetch_sector(ticker):
-        try:
-            return ticker, yf.Ticker(ticker).info.get("sector", "Unknown")
-        except Exception:
-            return ticker, "Unknown"
-
-    records = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(fetch_sector, t): t for t in filtered}
-        for future in as_completed(futures):
-            ticker, sector = future.result()
-            records.append({"ticker": ticker, "sector": sector})
-
-    return pd.DataFrame(records)
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +70,7 @@ def pipeline_step(func):
             result = func(*args, **kwargs)
             if result is True:
                 return StepResult(success=True)
-            return result  # Already a StepResult or similar
+            return result  # Already a StepResult or DataResult or similar
         except AnalyzerError as exc:
             logger.error("Pipeline step %s failed: %s", func.__name__, exc)
             return StepResult(success=False, error=exc)
@@ -156,57 +119,52 @@ def run_parse_pipeline(transaction_source, year: int) -> bool:
 @pipeline_step
 def run_analysis_pipeline(
     params: AnalysisParams, transaction_source, price_source, data_dir: Path, output_format: str
-) -> bool:
+) -> DataResult:
     trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, params.year, params.horizons)
 
     table = analysis.get_analysis_table(signals, params.member_filter, params.show_signals, params.horizons[0], params.top_n, params.threshold)
     logger.info(f"Generated analysis table with {len(table)} rows")
 
-    if params.member_filter:
-        display_mode = DisplayMode.MEMBER_SIGNALS
-    elif params.show_signals:
-        display_mode = DisplayMode.TOP_SIGNALS
-    else:
-        display_mode = DisplayMode.MEMBER_RANKINGS
-    _save_results(table, output_format, display_mode, params.member_filter, params.show_signals, data_dir)
-
-    sector_results = _analyze_by_sector(trades, signals, params.horizons)
-    if sector_results is not None and not params.member_filter and not params.show_signals:
-        print("\n=== Sector Analysis ===")
-        print(sector_results.to_string(index=False))
-    return True
+    sector_results = analysis.analyze_by_sector(trades, signals, params.horizons)
+    return DataResult(success=True, data={
+        "table": table,
+        "sector_results": sector_results,
+        "member_filter": params.member_filter,
+        "show_signals": params.show_signals,
+    })
 
 @pipeline_step
 def run_sales_pipeline(
     year: int, horizons: tuple[int, ...], top_n: int,
     transaction_source, price_source, data_dir: Path, output_format: str
-) -> bool:
+) -> DataResult:
     trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, year, horizons)
     result = analysis.rank_sales(signals, horizons[0])
     result = result.head(top_n)
-    _save_results(result, output_format, DisplayMode.SALE_RANKINGS, member_filter=None, show_signals=False, data_dir=data_dir)
-    return True
+    return DataResult(success=True, data={
+        "table": result,
+    })
 
 
 @pipeline_step
 def run_ticker_analysis(
     params: TickerAnalysisParams, transaction_source, price_source
-) -> bool:
+) -> DataResult:
     trades, prices, signals = _prepare_analysis_data(transaction_source, price_source, params.year, (params.horizon,))
 
     buyers = analysis.get_ticker_buyers_with_rankings(params.ticker, trades, signals, params.horizon, params.threshold)
     score = analysis.score_ticker_by_buyers(params.ticker, trades, signals, params.horizon, params.threshold)
 
-    print(f"\n=== Buyers of {params.ticker} ===")
-    print(buyers.to_string(index=False))
-    print("\n=== Signal Score ===")
-    print(score.to_string(index=False))
-    return True
+    return DataResult(success=True, data={
+        "buyers": buyers,
+        "score": score,
+        "ticker": params.ticker,
+    })
 
 @pipeline_step
 def run_recent_ticker_scoring(
     transaction_source, price_source, params: TickerScoringParams
-) -> bool:
+) -> DataResult:
     if params.days_back < 1:
         raise DataSourceError("days_back must be at least 1")
 
@@ -228,12 +186,20 @@ def run_recent_ticker_scoring(
 
     if not scores:
         logger.warning(f"No tickers found with {params.min_buyers}+ buyers in last {params.days_back} days")
-        return True
+        return DataResult(success=True, data={
+            "result": pd.DataFrame(),
+            "top_n": params.top_n,
+            "days_back": params.days_back,
+            "min_buyers": params.min_buyers,
+        })
 
     result = pd.concat(scores, ignore_index=True).sort_values('signal_score', ascending=False).head(params.top_n)
-    print(f"\n=== Top {params.top_n} Recent Signals (Last {params.days_back} Days, {params.min_buyers}+ Buyers) ===")
-    print(result.to_string(index=False))
-    return True
+    return DataResult(success=True, data={
+        "result": result,
+        "top_n": params.top_n,
+        "days_back": params.days_back,
+        "min_buyers": params.min_buyers,
+    })
 
 
 @pipeline_step
@@ -242,7 +208,7 @@ def run_backtest_pipeline(
     transaction_source,
     price_source,
     data_dir: Path = Path("data"),
-) -> bool:
+) -> DataResult:
     tx_start = params.start_date - timedelta(
         days=params.training_lookback_days + params.horizon + 30
     )
@@ -264,16 +230,6 @@ def run_backtest_pipeline(
 
     # Create price snapshot for reproducibility
     snapshot = create_snapshot(transaction_source.db, all_tickers, price_start, price_end)
-    print("\n=== Price Snapshot ===")
-    print(f"  Snapshot ID:  {snapshot.snapshot_id}")
-    print(f"  Created:      {snapshot.created_at}")
-    print(f"  Git SHA:      {snapshot.git_sha[:12]}")
-    print(f"  yfinance:     {snapshot.yfinance_version}")
-    print(f"  Tickers:      {snapshot.resolved_tickers}/{snapshot.requested_tickers} resolved")
-    if snapshot.unresolved_tickers:
-        print(f"  Unresolved:   {', '.join(snapshot.unresolved_tickers[:10])}")
-    print(f"  Price rows:   {snapshot.price_rows}")
-    print(f"  Date range:   {snapshot.first_date} to {snapshot.last_date}")
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)
 
@@ -311,10 +267,7 @@ def run_backtest_pipeline(
             training_lookback_days=params.training_lookback_days,
         )
 
-        print(f"\n=== Backtest as of {as_of_ts.date()} ===")
-
         if recs.empty:
-            print("  No recommendations (insufficient training or candidate data)")
             continue
 
         evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
@@ -324,16 +277,14 @@ def run_backtest_pipeline(
         evaluated.insert(0, "as_of_date", as_of_ts.date())
         all_results.append(evaluated)
 
-        display_cols = [
-            "rank", "ticker", "num_buyers", "signal_score", "ou_entry_value",
-            "bt_entry_price", "bt_exit_price", "bt_return_pct", "bt_spy_return_pct", "bt_alpha_pct",
-        ]
-        available = [c for c in display_cols if c in evaluated.columns]
-        print(evaluated[available].to_string(index=False))
-
     if not all_results:
-        print("\n=== No backtest results produced ===")
-        return True
+        return DataResult(success=True, data={
+            "combined": pd.DataFrame(),
+            "summary": pd.DataFrame(),
+            "snapshot": snapshot,
+            "evaluable_dates": 0,
+            "total_as_of_dates": len(as_of_dates),
+        })
 
     combined = pd.concat(all_results, ignore_index=True)
     # Set accumulated coverage counts on the combined frame so summarize_backtest
@@ -341,103 +292,21 @@ def run_backtest_pipeline(
     combined.attrs["n_no_price"] = total_no_price
     combined.attrs["n_delisted"] = total_delisted
 
-    print(f"\n{'=' * 60}")
-    print("=== Backtest Summary (by rank) ===")
-    print(f"{'=' * 60}")
     summary = analysis.summarize_backtest(combined)
-    if not summary.empty:
-        print(summary.to_string(index=False))
 
     valid_returns = combined.dropna(subset=["bt_return_pct"])
     evaluable_dates = valid_returns["as_of_date"].nunique() if not valid_returns.empty else 0
     total_as_of_dates = len(pd.date_range(params.start_date, params.end_date, freq=f"{params.frequency_days}D"))
-    print(f"\nDates evaluated: {evaluable_dates}/{total_as_of_dates}")
-    print(f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}")
 
     # Save snapshot alongside backtest results
     snapshot_path = data_dir / "price_snapshot.json"
     save_snapshot(snapshot, snapshot_path)
     logger.info(f"Price snapshot saved to {snapshot_path}")
 
-    return True
-
-
-def _save_results(
-    table: pd.DataFrame, output_format: str, display_mode: DisplayMode,
-    member_filter: str | None, show_signals: bool, data_dir: Path
-) -> None:
-    match display_mode:
-        case DisplayMode.MEMBER_SIGNALS | DisplayMode.TOP_SIGNALS:
-            display_cols = [
-                'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct',
-                'total_return_pct', 'total_spy_alpha_pct', 'signal_score'
-            ]
-        case DisplayMode.SALE_RANKINGS:
-            display_cols = [
-                'member', 'avg_loss_avoided_pct', 'median_loss_avoided_pct',
-                'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'posterior_lift', 'bayes_factor',
-                'avg_spy_alpha_pct',
-            ]
-        case DisplayMode.MEMBER_RANKINGS:
-            display_cols = [
-                'member', 'avg_total_spy_alpha_pct', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'conviction_score', 'purchase_trades'
-            ]
-        case _:
-            display_cols = list(table.columns)
-    available_display = [c for c in display_cols if c in table.columns]
-    display_table = table[available_display]
-
-    if output_format == 'csv':
-        if member_filter:
-            filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
-        elif show_signals:
-            filename = "top_signals.csv"
-        elif display_mode == DisplayMode.SALE_RANKINGS:
-            filename = "sale_rankings.csv"
-        else:
-            filename = "member_rankings.csv"
-
-        filepath = data_dir / filename
-        data_dir.mkdir(parents=True, exist_ok=True)
-        display_table.to_csv(filepath, index=False)
-        logger.info(f"Results saved to {filepath}")
-    else:
-        print(display_table.to_string(index=False))
-
-
-def _analyze_by_sector(
-    trades: pd.DataFrame, signals: pd.DataFrame, horizons: tuple[int, ...]
-) -> pd.DataFrame | None:
-    tickers = trades['ticker'].unique()
-    sectors = _load_sector_data(tickers.tolist())
-    if sectors.empty:
-        logger.info("No sector data available")
-        return None
-
-    sig_with_sector = signals.merge(sectors, on="ticker", how="left")
-
-    results = []
-    for sector in sectors["sector"].unique():
-        sector_purchases = sig_with_sector[
-            (sig_with_sector["sector"] == sector) &
-            (sig_with_sector["signal_type"] == TransactionType.PURCHASE.value)
-        ]
-        if len(sector_purchases) < 3:
-            continue
-        try:
-            ranked = analysis.rank_members(sector_purchases, horizons[0])
-            if not ranked.empty:
-                results.append({
-                    "sector": sector,
-                    "top_member": ranked.iloc[0]["member"],
-                    "top_member_alpha": ranked.iloc[0]["avg_spy_alpha_pct"],
-                    "num_trades": len(sector_purchases),
-                    "num_members": sector_purchases["member"].nunique(),
-                })
-        except AnalysisError as e:
-            logger.warning(f"Skipping sector '{sector}' analysis: {e}")
-            continue
-
-    if not results:
-        return None
-    return pd.DataFrame(results).sort_values("top_member_alpha", ascending=False)
+    return DataResult(success=True, data={
+        "combined": combined,
+        "summary": summary,
+        "snapshot": snapshot,
+        "evaluable_dates": evaluable_dates,
+        "total_as_of_dates": total_as_of_dates,
+    })

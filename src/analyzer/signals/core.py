@@ -20,11 +20,8 @@ import pandas as pd
 from analyzer.exceptions import AnalysisError
 from analyzer.ticker_resolver import TickerResolver
 
+from analyzer.signals import constants as _constants
 from analyzer.signals.assembly import assemble_result_dataframe
-from analyzer.signals.constants import (
-    DECAY_LAMBDA,
-    _NS_PER_DAY,
-)
 from analyzer.signals.prices import _price_arrays
 
 
@@ -79,7 +76,7 @@ def _compute_ticker_signals(
         r_trough[idx] = w_vals.min()
 
         # Days from disclosure (vectorized)
-        days = ((w_dates - disc) // _NS_PER_DAY).astype(np.float64)
+        days = ((w_dates - disc) // _constants._NS_PER_DAY).astype(np.float64)
 
         # Daily log returns (vectorized, handles zero prices)
         log_ret = np.zeros(n_w, dtype=np.float64)
@@ -133,7 +130,7 @@ def _populate_spy_arrays(
         spy_full_lo = spy_lo
         spy_lr[1:] = spy_log_ret[spy_full_lo + 1 : spy_full_lo + n_sw]
 
-    s_days = ((sw_dates - disc) // _NS_PER_DAY).astype(np.float64)
+    s_days = ((sw_dates - disc) // _constants._NS_PER_DAY).astype(np.float64)
     s_prev = np.empty(n_sw, dtype=np.float64)
     s_prev[0] = 0.0
     s_prev[1:] = s_days[:-1]
@@ -168,7 +165,7 @@ def calculate_signal_potential(
     if horizons is None:
         horizons = [30, 60, 90, 180]
     if decay_lambda is None:
-        decay_lambda = DECAY_LAMBDA
+        decay_lambda = _constants.DECAY_LAMBDA
     _validate_inputs(entry_prices_df, prices_df)
 
     signals = entry_prices_df.copy()

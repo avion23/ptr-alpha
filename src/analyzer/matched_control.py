@@ -334,12 +334,12 @@ def run_matched_control_backtest(
 def print_matched_control_summary(results: pd.DataFrame) -> None:
     """Print summary statistics for matched-control backtest results."""
     if results.empty:
-        print("\n=== Matched Control Backtest: No results ===")
+        logger.warning("Matched Control Backtest: No results")
         return
 
     valid = results.dropna(subset=["excess_alpha"])
     if valid.empty:
-        print("\n=== Matched Control Backtest: No valid excess alpha results ===")
+        logger.warning("Matched Control Backtest: No valid excess alpha results")
         return
 
     n = len(valid)
@@ -359,34 +359,34 @@ def print_matched_control_summary(results: pd.DataFrame) -> None:
 
     pct_positive = (valid["excess_alpha"] > 0).mean() * 100
 
-    print(f"\n{'=' * 60}")
-    print("=== Matched-Control Backtest Summary ===")
-    print(f"{'=' * 60}")
-    print(f"N recommendations evaluated: {n}")
-    print(f"Mean excess alpha:           {mean_excess:+.2f}%")
-    print(f"95% CI (bootstrap):          [{ci_lower:+.2f}%, {ci_upper:+.2f}%]")
-    print(f"%% positive excess alpha:    {pct_positive:.1f}%")
-    print(f"Mean raw treatment alpha:    {valid['alpha'].mean():+.2f}%")
-    print(f"Mean control group alpha:    {valid['control_mean_alpha'].mean():+.2f}%")
-    print(f"Median excess alpha:         {valid['excess_alpha'].median():+.2f}%")
-    print(f"Std excess alpha:            {std_excess:.2f}%")
+    logger.info("=" * 60)
+    logger.info("Matched-Control Backtest Summary")
+    logger.info("=" * 60)
+    logger.info("N recommendations evaluated: %d", n)
+    logger.info("Mean excess alpha:           %+.2f%%", mean_excess)
+    logger.info("95%% CI (bootstrap):          [%+.2f%%, %+.2f%%]", ci_lower, ci_upper)
+    logger.info("%% positive excess alpha:    %.1f%%", pct_positive)
+    logger.info("Mean raw treatment alpha:    %+.2f%%", valid["alpha"].mean())
+    logger.info("Mean control group alpha:    %+.2f%%", valid["control_mean_alpha"].mean())
+    logger.info("Median excess alpha:         %+.2f%%", valid["excess_alpha"].median())
+    logger.info("Std excess alpha:            %.2f%%", std_excess)
 
     # By sector
     if "sector" in valid.columns and valid["sector"].nunique() > 1:
-        print("\n--- By Sector ---")
+        logger.info("--- By Sector ---")
         sector_summary = valid.groupby("sector").agg(
             n=("excess_alpha", "size"),
             mean_excess=("excess_alpha", "mean"),
             pct_positive=("excess_alpha", lambda x: (x > 0).mean() * 100),
         ).sort_values("mean_excess", ascending=False)
-        print(sector_summary.to_string())
+        logger.info("%s", sector_summary.to_string())
 
     # By rank
     if "rank" in valid.columns and valid["rank"].nunique() > 1:
-        print("\n--- By Rank ---")
+        logger.info("--- By Rank ---")
         rank_summary = valid.groupby("rank").agg(
             n=("excess_alpha", "size"),
             mean_excess=("excess_alpha", "mean"),
             mean_alpha=("alpha", "mean"),
         ).sort_index()
-        print(rank_summary.to_string())
+        logger.info("%s", rank_summary.to_string())

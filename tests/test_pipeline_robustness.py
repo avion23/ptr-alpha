@@ -5,6 +5,8 @@ import pytest
 from typer.testing import CliRunner
 
 from analyzer import datasources
+from analyzer import parser_cascade
+from analyzer import download
 from analyzer.cli import app
 from analyzer.exceptions import StepResult
 from analyzer.exceptions import ParsingError
@@ -50,14 +52,14 @@ def test_parse_worker_prefers_high_quality_later_text_engine(monkeypatch, tmp_pa
     low_quality = [_tx(transaction_date=None, amount_midpoint=None)]
     high_quality = [_tx() for _ in range(10)]
 
-    monkeypatch.setattr(datasources, "_try_pdfplumber", lambda path: low_quality)
-    monkeypatch.setattr(datasources, "_try_camelot_lattice", lambda path: [])
-    monkeypatch.setattr(datasources, "_try_camelot_stream", lambda path: [])
-    monkeypatch.setattr(datasources, "_try_pdftotext", lambda path: high_quality)
-    monkeypatch.setattr(datasources, "_try_docling", lambda path: (_ for _ in ()).throw(AssertionError("docling should not run")))
-    monkeypatch.setattr(datasources, "_try_tesseract", lambda path: (_ for _ in ()).throw(AssertionError("ocr should not run")))
+    monkeypatch.setattr(parser_cascade, "_try_pdfplumber", lambda path: low_quality)
+    monkeypatch.setattr(parser_cascade, "_try_camelot_lattice", lambda path: [])
+    monkeypatch.setattr(parser_cascade, "_try_camelot_stream", lambda path: [])
+    monkeypatch.setattr(parser_cascade, "_try_pdftotext", lambda path: high_quality)
+    monkeypatch.setattr(parser_cascade, "_try_docling", lambda path: (_ for _ in ()).throw(AssertionError("docling should not run")))
+    monkeypatch.setattr(parser_cascade, "_try_tesseract", lambda path: (_ for _ in ()).throw(AssertionError("ocr should not run")))
 
-    _, transactions, engines_attempted = datasources._parse_pdf_worker(pdf_path)
+    _, transactions, engines_attempted = parser_cascade._parse_pdf_worker(pdf_path)
 
     assert transactions == high_quality
     assert engines_attempted == [
@@ -103,13 +105,13 @@ def test_reparse_all_filters_ptr_filings_unconditionally(tmp_path):
 
 
 def test_save_parse_results_warns_when_zero_row_doc_retains_db_rows(caplog, tmp_path):
-    source = datasources.HouseTransactionSource.__new__(datasources.HouseTransactionSource)
+    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
     source.db = MagicMock()
     source.db.count_transactions_for_docs.return_value = {"123": 3}
     pdf_path = tmp_path / "123.pdf"
 
-    with patch.object(datasources, "consolidate_transactions", return_value=pd.DataFrame()), \
-         caplog.at_level("WARNING", logger="analyzer.datasources"), \
+    with patch.object(download, "consolidate_transactions", return_value=pd.DataFrame()), \
+         caplog.at_level("WARNING", logger="analyzer.download"), \
          pytest.raises(ParsingError):
         source._save_parse_results(2024, [(pdf_path, [], ["pdfplumber"])], {})
 

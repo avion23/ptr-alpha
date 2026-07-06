@@ -89,6 +89,9 @@ def _prepare_analysis_data(
     trades = trades[trades['ticker'].notna()].copy()
     logger.info(f"After filtering NULL tickers: {len(trades)} transactions")
 
+    if trades.empty:
+        raise DataSourceError("No valid tickers found in transaction data")
+
     start_date = trades['disclosure_date'].min() - timedelta(days=30)
     end_date = trades['disclosure_date'].max() + timedelta(days=max(horizons) + 10)
 
@@ -105,16 +108,16 @@ def _prepare_analysis_data(
     return trades, prices, signals
 
 @pipeline_step
-def run_fetch_pipeline(transaction_source, year: int) -> bool:
+def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
     transaction_source.fetch_and_cache_pdfs(year)
     logger.info(f"Successfully fetched PDFs for {year}")
-    return True
+    return DataResult(success=True, data=None)
 
 @pipeline_step
-def run_parse_pipeline(transaction_source, year: int) -> bool:
+def run_parse_pipeline(transaction_source, year: int) -> DataResult:
     transaction_source.parse_cached_pdfs(year)
     logger.info(f"Successfully parsed PDFs for {year}")
-    return True
+    return DataResult(success=True, data=None)
 
 @pipeline_step
 def run_analysis_pipeline(

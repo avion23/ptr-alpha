@@ -1,0 +1,107 @@
+{
+  "generated_at": "2026-07-07T13:03:02",
+  "db_path": "/Users/avion/Documents.nosync/projects/insider-trading/data/congress.duckdb",
+  "match_window_days": 60,
+  "price_failures": [],
+  "table": [
+    {
+      "symbol": "IHG",
+      "qty": 10,
+      "entry": 161.34,
+      "current": 176.15,
+      "pnl_per_unit": 14.81,
+      "dollar_pnl": 148.1,
+      "congressional_total_tx": 1,
+      "congressional_buys": 0,
+      "matches_program": "N",
+      "match_details": [],
+      "note": "CLOSED, realized; IHG: only congressional SALE(S), no Purchase tracked"
+    },
+    {
+      "symbol": "SMPL",
+      "qty": 100,
+      "entry": 11.91,
+      "current": 13.431,
+      "pnl_per_unit": 1.521,
+      "dollar_pnl": 152.1,
+      "congressional_total_tx": 1,
+      "congressional_buys": 1,
+      "matches_program": "N",
+      "match_details": [],
+      "note": "open, unrealized"
+    },
+    {
+      "symbol": "VLTO",
+      "qty": 30,
+      "entry": 82.49,
+      "current": 93.25,
+      "pnl_per_unit": 10.76,
+      "dollar_pnl": 322.8,
+      "congressional_total_tx": 0,
+      "congressional_buys": 0,
+      "matches_program": "N",
+      "match_details": [],
+      "note": "open, unrealized; VLTO: ZERO congressional transactions ever"
+    },
+    {
+      "symbol": "NDAQ",
+      "qty": 15,
+      "entry": 85.22,
+      "current": 86.34,
+      "pnl_per_unit": 1.12,
+      "dollar_pnl": 16.8,
+      "congressional_total_tx": 13,
+      "congressional_buys": 7,
+      "matches_program": "N",
+      "match_details": [],
+      "note": "open, unrealized"
+    },
+    {
+      "symbol": "MSFT",
+      "qty": 7,
+      "entry": 391.62,
+      "current": 393.915,
+      "pnl_per_unit": 2.295,
+      "dollar_pnl": 16.07,
+      "congressional_total_tx": 319,
+      "congressional_buys": 151,
+      "matches_program": "Y",
+      "match_details": [
+        {
+          "member": "Maria Elvira Salazar",
+          "transaction_type": "Purchase",
+          "transaction_date": "2026-04-17",
+          "disclosure_date": "2026-05-08",
+          "eff_date": "2026-04-17"
+        }
+      ],
+      "note": "open, unrealized"
+    },
+    {
+      "symbol": "AVGO",
+      "qty": 7,
+      "entry": 415.85,
+      "current": 369.84,
+      "pnl_per_unit": -46.01,
+      "dollar_pnl": -322.07,
+      "congressional_total_tx": 96,
+      "congressional_buys": 49,
+      "matches_program": "N",
+      "match_details": [],
+      "note": "open, unrealized"
+    },
+    {
+      "symbol": "UNH",
+      "qty": 11,
+      "entry": 385.8,
+      "current": 426.99,
+      "pnl_per_unit": 41.19,
+      "dollar_pnl": 453.09,
+      "congressional_total_tx": 121,
+      "congressional_buys": 54,
+      "matches_program": "N",
+      "match_details": [],
+      "note": "open, unrealized"
+    }
+  ]
+}

@@ -22,6 +22,7 @@ from analyzer.datasources import (
     _build_member_lookup, _filter_existing_pdfs, consolidate_transactions,
 )
 from analyzer.datasources import HouseTransactionSource
+from analyzer.download import preserve_existing_fields
 from analyzer.settings import Settings
 from multiprocessing import Pool
 
@@ -89,10 +90,14 @@ def parse_year(year: int, db: Database, settings: Settings):
         print(f"  {year}: no transactions extracted")
         return 0
     
+    # Carry forward previously-resolved ticker/amount before the delete+reinsert
+    # so a weaker parse does not clobber good data already in the DB.
+    df = preserve_existing_fields(df, db)
+
     # Delete any existing tx for these doc_ids first
     for doc_id in df["doc_id"].unique():
         db.delete_transactions_for_doc(doc_id)
-    
+
     db.upsert_transactions(df, source="house_pdf")
     print(f"  {year}: saved {len(df)} transactions")
     return len(df)

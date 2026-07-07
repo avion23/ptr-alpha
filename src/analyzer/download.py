@@ -239,6 +239,8 @@ class HouseTransactionSource(TransactionSource):
         if df.empty:
             raise ParsingError("No transactions found after parsing all PDFs")
 
+        df = preserve_existing_fields(df, self.db)
+
         for doc_id in df["doc_id"].unique():
             self.db.delete_transactions_for_doc(doc_id)
 
@@ -247,6 +249,91 @@ class HouseTransactionSource(TransactionSource):
 
 
 # ── Helpers ──
+
+def _is_blank(value) -> bool:
+    """True when a field carries no usable value (None / NaN / empty string)."""
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _identity_key(member, transaction_date, transaction_type):
+    """Normalize the identity tuple so NaN/None match each other on lookup.
+
+    Date-like values (``datetime.date``, ``datetime.datetime``,
+    ``pandas.Timestamp``) are coerced to a plain ``date`` so the key built from a
+    freshly consolidated ``df`` matches one built from DB rows — DuckDB returns
+    DATE columns as ``pd.Timestamp``, while parsed rows use ``datetime.date``.
+    """
+    def _norm(v):
+        if v is None:
+            return None
+        if isinstance(v, float) and pd.isna(v):
+            return None
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        if not isinstance(v, str) and hasattr(v, "date"):
+            try:
+                return v.date()
+            except Exception:
+                return v
+        return v
+
+    return (_norm(member), _norm(transaction_date), _norm(transaction_type))
+
+
+def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
+    """Carry forward previously-resolved fields so re-parsing MERGEs, not clobbers.
+
+    Re-parsing deletes and re-inserts a document's transactions. If the fresh
+    parse yields a null/empty ``ticker`` (or ``amount_raw``) for a transaction
+    that a previous parse had correctly resolved, the good data would be
+    overwritten with NULL. This merges the previously-resolved values back into
+    ``df``, matched per ``doc_id`` by ``(member, transaction_date,
+    transaction_type)`` — the transaction identity. Identity fields themselves
+    are never modified.
+
+    Behaviour:
+    * new ticker null/empty/blank     -> keep existing ticker if present
+    * new ticker present and valid    -> keep new (never downgrade)
+    * new amount_raw null/empty       -> keep existing amount_raw if present
+    * multiple existing rows for identity -> any non-null value is carried forward
+    * doc has no existing rows         -> no-op
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+
+    for doc_id in df["doc_id"].unique():
+        existing = db.get_transactions_for_doc(doc_id)
+        if existing is None or existing.empty:
+            continue
+
+        lookup: dict[tuple, dict] = {}
+        for _, er in existing.iterrows():
+            key = _identity_key(er.get("member"), er.get("transaction_date"), er.get("transaction_type"))
+            slot = lookup.setdefault(key, {"ticker": None, "amount_raw": None})
+            if slot["ticker"] is None and not _is_blank(er.get("ticker")):
+                slot["ticker"] = er["ticker"]
+            if slot["amount_raw"] is None and not _is_blank(er.get("amount_raw")):
+                slot["amount_raw"] = er["amount_raw"]
+
+        for idx in df.index[df["doc_id"] == doc_id]:
+            key = _identity_key(df.at[idx, "member"], df.at[idx, "transaction_date"], df.at[idx, "transaction_type"])
+            slot = lookup.get(key)
+            if slot is None:
+                continue
+            if _is_blank(df.at[idx, "ticker"]) and slot["ticker"] is not None:
+                df.at[idx, "ticker"] = slot["ticker"]
+            if _is_blank(df.at[idx, "amount_raw"]) and slot["amount_raw"] is not None:
+                df.at[idx, "amount_raw"] = slot["amount_raw"]
+
+    return df
+
 
 def _read_first_text_from_zip(zip_bytes: bytes, year: int) -> str:
     """Open the metadata ZIP and return the first .txt file's content."""

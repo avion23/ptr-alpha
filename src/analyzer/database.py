@@ -221,6 +221,9 @@ class Database:
     def delete_transactions_for_doc(self, doc_id: str) -> None:
         self.transactions.delete_for_doc(doc_id)
 
+    def get_transactions_for_doc(self, doc_id: str) -> pd.DataFrame:
+        return self.transactions.get_for_doc(doc_id)
+
     def count_transactions_for_docs(self, doc_ids: list[str]) -> dict[str, int]:
         return self.transactions.count_for_docs(doc_ids)
 

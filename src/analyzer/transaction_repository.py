@@ -153,6 +153,20 @@ class TransactionRepository:
             self.conn.execute("DROP TABLE IF EXISTS filtered_staging_transactions")
             self.conn.execute("DROP TABLE IF EXISTS staging_transactions")
 
+    def get_for_doc(self, doc_id: str) -> pd.DataFrame:
+        return self.conn.execute(
+            """
+            SELECT id, doc_id, member, ticker, transaction_date, disclosure_date,
+                   transaction_type, owner_code, amount_raw, amount_midpoint,
+                   instrument_type, strike_price, expiry_date, asset_description,
+                   source, created_at
+            FROM transactions
+            WHERE doc_id = ?
+            ORDER BY id
+            """,
+            [doc_id],
+        ).fetchdf()
+
     def delete_for_doc(self, doc_id: str) -> None:
         self.conn.execute("DELETE FROM transactions WHERE doc_id = ?", [doc_id])
 

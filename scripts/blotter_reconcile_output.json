@@ -1,0 +1,252 @@
+{
+  "generated_at": "2026-07-07T13:11:18",
+  "db_path": "/Users/avion/Documents.nosync/projects/insider-trading/data/congress.duckdb",
+  "match_window_days": 60,
+  "report_windows": [
+    30,
+    45,
+    60,
+    90
+  ],
+  "recommendation_label": "congressional_buy_within_60d",
+  "recommendation_note": "FACTUAL PROXY only: 'Y' if >=1 congressional Purchase within the 60-day inclusive window before the user's earliest BTO. NOT the program's recommendation engine output; the real engine (src/analyzer/signals backtest / conviction+quality filter) was NOT invoked.",
+  "price_failures": [],
+  "warnings": [],
+  "parse_failures": [],
+  "table": [
+    {
+      "symbol": "IHG",
+      "qty": 10,
+      "entry": 161.34,
+      "current": 176.15,
+      "pnl_per_unit": 14.81,
+      "dollar_pnl": 148.1,
+      "congressional_total_tx": 1,
+      "congressional_buys": 0,
+      "window_counts": {
+        "30": 0,
+        "45": 0,
+        "60": 0,
+        "90": 0
+      },
+      "closest_buy_delta_days": null,
+      "closest_buy": null,
+      "expected_match_prob_by_window": {
+        "30": 0.0,
+        "45": 0.0,
+        "60": 0.0,
+        "90": 0.0
+      },
+      "congressional_buy_within_60d": "N",
+      "recommended_by_engine": null,
+      "match_details": [],
+      "note": "CLOSED, realized; IHG: only congressional SALE(S), no Purchase tracked"
+    },
+    {
+      "symbol": "SMPL",
+      "qty": 100,
+      "entry": 11.91,
+      "current": 13.4,
+      "pnl_per_unit": 1.49,
+      "dollar_pnl": 149.0,
+      "congressional_total_tx": 1,
+      "congressional_buys": 1,
+      "window_counts": {
+        "30": 0,
+        "45": 0,
+        "60": 0,
+        "90": 0
+      },
+      "closest_buy_delta_days": 101,
+      "closest_buy": {
+        "member": "Tim Moore",
+        "transaction_type": "Purchase",
+        "transaction_date": "2026-03-13",
+        "disclosure_date": "2026-03-24",
+        "eff_date": "2026-03-13"
+      },
+      "expected_match_prob_by_window": {
+        "30": 0.0,
+        "45": 0.0,
+        "60": 0.0,
+        "90": 0.0
+      },
+      "congressional_buy_within_60d": "N",
+      "recommended_by_engine": null,
+      "match_details": [],
+      "note": "open, unrealized"
+    },
+    {
+      "symbol": "VLTO",
+      "qty": 30,
+      "entry": 82.49,
+      "current": 93.17,
+      "pnl_per_unit": 10.68,
+      "dollar_pnl": 320.4,
+      "congressional_total_tx": 0,
+      "congressional_buys": 0,
+      "window_counts": {
+        "30": 0,
+        "45": 0,
+        "60": 0,
+        "90": 0
+      },
+      "closest_buy_delta_days": null,
+      "closest_buy": null,
+      "expected_match_prob_by_window": {
+        "30": 0.0,
+        "45": 0.0,
+        "60": 0.0,
+        "90": 0.0
+      },
+      "congressional_buy_within_60d": "N",
+      "recommended_by_engine": null,
+      "match_details": [],
+      "note": "open, unrealized; VLTO: ZERO congressional transactions ever"
+    },
+    {
+      "symbol": "NDAQ",
+      "qty": 15,
+      "entry": 85.22,
+      "current": 86.66,
+      "pnl_per_unit": 1.44,
+      "dollar_pnl": 21.6,
+      "congressional_total_tx": 13,
+      "congressional_buys": 7,
+      "window_counts": {
+        "30": 0,
+        "45": 0,
+        "60": 0,
+        "90": 0
+      },
+      "closest_buy_delta_days": 91,
+      "closest_buy": {
+        "member": "April McClain Delaney",
+        "transaction_type": "Purchase",
+        "transaction_date": "2026-03-18",
+        "disclosure_date": "2026-04-06",
+        "eff_date": "2026-03-18"
+      },
+      "expected_match_prob_by_window": {
+        "30": 0.111,
+        "45": 0.1619,
+        "60": 0.2098,
+        "90": 0.2975
+      },
+      "congressional_buy_within_60d": "N",
+      "recommended_by_engine": null,
+      "match_details": [],
+      "note": "open, unrealized"
+    },
+    {
+      "symbol": "MSFT",
+      "qty": 7,
+      "entry": 391.62,
+      "current": 393.98,
+      "pnl_per_unit": 2.36,
+      "dollar_pnl": 16.52,
+      "congressional_total_tx": 314,
+      "congressional_buys": 149,
+      "window_counts": {
+        "30": 0,
+        "45": 0,
+        "60": 1,
+        "90": 2
+      },
+      "closest_buy_delta_days": 60,
+      "closest_buy": {
+        "member": "Maria Elvira Salazar",
+        "transaction_type": "Purchase",
+        "transaction_date": "2026-04-17",
+        "disclosure_date": "2026-05-08",
+        "eff_date": "2026-04-17"
+      },
+      "expected_match_prob_by_window": {
+        "30": 0.753,
+        "45": 0.8772,
+        "60": 0.939,
+        "90": 0.9849
+      },
+      "congressional_buy_within_60d": "Y",
+      "recommended_by_engine": null,
+      "match_details": [
+        {
+          "member": "Maria Elvira Salazar",
+          "transaction_type": "Purchase",
+          "transaction_date": "2026-04-17",
+          "disclosure_date": "2026-05-08",
+          "eff_date": "2026-04-17"
+        }
+      ],
+      "note": "open, unrealized"
+    },
+    {
+      "symbol": "AVGO",
+      "qty": 7,
+      "entry": 415.85,
+      "current": 368.97,
+      "pnl_per_unit": -46.88,
+      "dollar_pnl": -328.16,
+      "congressional_total_tx": 96,
+      "congressional_buys": 49,
+      "window_counts": {
+        "30": 0,
+        "45": 0,
+        "60": 0,
+        "90": 0
+      },
+      "closest_buy_delta_days": 197,
+      "closest_buy": {
+        "member": "Gilbert Cisneros",
+        "transaction_type": "Purchase",
+        "transaction_date": "2025-11-18",
+        "disclosure_date": "2025-12-12",
+        "eff_date": "2025-11-18"
+      },
+      "expected_match_prob_by_window": {
+        "30": 0.5519,
+        "45": 0.7001,
+        "60": 0.7992,
+        "90": 0.9101
+      },
+      "congressional_buy_within_60d": "N",
+      "recommended_by_engine": null,
+      "match_details": [],
+      "note": "open, unrealized"
+    },
+    {
+      "symbol": "UNH",
+      "qty": 11,
+      "entry": 385.8,
+      "current": 427.065,
+      "pnl_per_unit": 41.265,
+      "dollar_pnl": 453.92,
+      "congressional_total_tx": 120,
+      "congressional_buys": 53,
+      "window_counts": {
+        "30": 0,
+        "45": 0,
+        "60": 0,
+        "90": 0
+      },
+      "closest_buy_delta_days": 95,
+      "closest_buy": {
+        "member": "Charles J Fleischmann",
+        "transaction_type": "Purchase",
+        "transaction_date": "2026-02-20",
+        "disclosure_date": "2026-03-20",
+        "eff_date": "2026-02-20"
+      },
+      "expected_match_prob_by_window": {
+        "30": 0.4945,
+        "45": 0.6405,
+        "60": 0.7444,
+        "90": 0.8708
+      },
+      "congressional_buy_within_60d": "N",
+      "recommended_by_engine": null,
+      "match_details": [],
+      "note": "open, unrealized"
+    }
+  ]
+}

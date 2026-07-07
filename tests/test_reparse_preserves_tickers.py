@@ -129,6 +129,29 @@ class TestReparsePreservesTickers(DatabaseTestCase):
         merged = preserve_existing_fields(fresh, self.db)
         self.assertEqual(merged.at[0, "ticker"], "HOG")
 
+    def test_ambiguous_identity_does_not_misassign_ticker(self):
+        # Same (member, transaction_date, transaction_type) but two different
+        # tickers resolved on prior parses. A fresh parse with tickerless rows
+        # must NOT mislabel one purchase as the other.
+        orig = pd.DataFrame([
+            _row(ticker="AAPL", owner_code="DC"),
+            _row(ticker="MSFT", owner_code="DC", disclosure_date=date(2024, 3, 16)),
+        ])
+        self.db.upsert_transactions(orig, source="house_pdf")
+
+        fresh = pd.DataFrame([
+            _row(ticker=None, owner_code="DC"),
+            _row(ticker=None, owner_code="DC", disclosure_date=date(2024, 3, 16)),
+        ])
+        merged = preserve_existing_fields(fresh, self.db)
+
+        # Disagreement -> neither row gets a ticker (no silent misassignment).
+        for idx in merged.index:
+            self.assertTrue(
+                merged.at[idx, "ticker"] is None or pd.isna(merged.at[idx, "ticker"]),
+                msg=f"row {idx} got ticker {merged.at[idx, 'ticker']!r}, expected blank",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

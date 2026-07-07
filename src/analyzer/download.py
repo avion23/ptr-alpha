@@ -301,7 +301,10 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
     * new ticker null/empty/blank     -> keep existing ticker if present
     * new ticker present and valid    -> keep new (never downgrade)
     * new amount_raw null/empty       -> keep existing amount_raw if present
-    * multiple existing rows for identity -> any non-null value is carried forward
+    * multiple existing rows for identity -> value carried only when all
+      existing rows for that identity agree on a single non-blank value;
+      disagreement (or no non-blank value) leaves the field blank (safe, never
+      guess)
     * doc has no existing rows         -> no-op
     """
     if df.empty:
@@ -316,21 +319,21 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
         lookup: dict[tuple, dict] = {}
         for _, er in existing.iterrows():
             key = _identity_key(er.get("member"), er.get("transaction_date"), er.get("transaction_type"))
-            slot = lookup.setdefault(key, {"ticker": None, "amount_raw": None})
-            if slot["ticker"] is None and not _is_blank(er.get("ticker")):
-                slot["ticker"] = er["ticker"]
-            if slot["amount_raw"] is None and not _is_blank(er.get("amount_raw")):
-                slot["amount_raw"] = er["amount_raw"]
+            slot = lookup.setdefault(key, {"tickers": set(), "amounts": set()})
+            if not _is_blank(er.get("ticker")):
+                slot["tickers"].add(er["ticker"])
+            if not _is_blank(er.get("amount_raw")):
+                slot["amounts"].add(er["amount_raw"])
 
         for idx in df.index[df["doc_id"] == doc_id]:
             key = _identity_key(df.at[idx, "member"], df.at[idx, "transaction_date"], df.at[idx, "transaction_type"])
             slot = lookup.get(key)
             if slot is None:
                 continue
-            if _is_blank(df.at[idx, "ticker"]) and slot["ticker"] is not None:
-                df.at[idx, "ticker"] = slot["ticker"]
-            if _is_blank(df.at[idx, "amount_raw"]) and slot["amount_raw"] is not None:
-                df.at[idx, "amount_raw"] = slot["amount_raw"]
+            if _is_blank(df.at[idx, "ticker"]) and len(slot["tickers"]) == 1:
+                df.at[idx, "ticker"] = next(iter(slot["tickers"]))
+            if _is_blank(df.at[idx, "amount_raw"]) and len(slot["amounts"]) == 1:
+                df.at[idx, "amount_raw"] = next(iter(slot["amounts"]))
 
     return df
 

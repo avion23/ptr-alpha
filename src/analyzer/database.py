@@ -212,6 +212,19 @@ class Database:
     def upsert_transactions(self, df: pd.DataFrame, *, source: str) -> None:
         self.transactions.upsert(df, source=source)
 
+    def replace_transactions_for_docs(self, df: pd.DataFrame, *, source: str) -> None:
+        """Atomically replace every transaction belonging to a parsed document."""
+        doc_ids = df["doc_id"].unique().tolist()
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            for doc_id in doc_ids:
+                self.transactions.delete_for_doc(doc_id)
+            self.transactions.upsert(df, source=source, _in_transaction=True)
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
     def get_transactions(self, year: int) -> pd.DataFrame:
         return self.transactions.get_by_year(year)
 

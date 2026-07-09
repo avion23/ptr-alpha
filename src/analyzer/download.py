@@ -241,10 +241,7 @@ class HouseTransactionSource(TransactionSource):
 
         df = preserve_existing_fields(df, self.db)
 
-        for doc_id in df["doc_id"].unique():
-            self.db.delete_transactions_for_doc(doc_id)
-
-        self.db.upsert_transactions(df, source="house_pdf")
+        self.db.replace_transactions_for_docs(df, source="house_pdf")
         logger.info(f"Saved {len(df)} transactions to database")
 
 

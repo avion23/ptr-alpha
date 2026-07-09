@@ -58,12 +58,9 @@ def _evaluate_grid(
         if not ticker_scores:
             continue
 
-        _accumulate_picks(
-            ticker_scores, top_n,
-            window_returns=window_returns,
-            window_wins_ref=lambda: window_wins,
-            window_total_ref=lambda: window_total,
-        )
+        wins, total = _accumulate_picks(ticker_scores, top_n, window_returns)
+        window_wins += wins
+        window_total += total
     return window_returns, window_wins, window_total
 
 
@@ -118,9 +115,9 @@ def _accumulate_picks(
     ticker_scores: list[dict],
     top_n: int,
     window_returns: list[float],
-    window_wins_ref,
-    window_total_ref,
-) -> None:
+) -> tuple[int, int]:
+    wins = 0
+    total = 0
     score_df = pd.DataFrame(ticker_scores)
     score_df = score_df.sort_values("composite_score", ascending=False).head(top_n)
     for _, row in score_df.iterrows():
@@ -128,9 +125,10 @@ def _accumulate_picks(
             continue
         avg_ret = float(np.mean(row["test_returns"]))
         window_returns.append(avg_ret)
-        window_total_ref()
+        total += 1
         if avg_ret > 0:
-            window_wins_ref()
+            wins += 1
+    return wins, total
 
 
 def _summarize_grid_result(
@@ -140,7 +138,7 @@ def _summarize_grid_result(
     top_n: int,
     min_buyers: int,
 ) -> dict:
-    avg_ret = float(np.mean(window_returns))
+    avg_ret = float(np.mean(window_returns)) if window_returns else 0.0
     std_ret = float(np.std(window_returns)) if len(window_returns) > 1 else 0.0
     sharpe = avg_ret / std_ret if std_ret > 0 else 0.0
     win_rate = window_wins / window_total * 100 if window_total > 0 else 0

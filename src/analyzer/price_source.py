@@ -107,9 +107,11 @@ class YFinancePriceSource(PriceSource):
             logger.info(
                 f"Read-only mode: merging {len(new_prices.columns)} fetched tickers with cache"
             )
-            merged = pd.concat([cached_prices, new_prices], axis=1)
-            merged = merged.loc[:, ~merged.columns.duplicated(keep="first")]
-            prices = merged[~merged.index.duplicated(keep="last")]
+            # ``concat`` followed by duplicate-column removal discards the
+            # fetched column entirely whenever a partial cached column exists.
+            # Prefer freshly fetched observations while retaining cached dates
+            # and tickers that were not fetched in this read-only session.
+            prices = new_prices.combine_first(cached_prices)
         else:
             self.db.upsert_prices(new_prices)
             logger.info(f"Cached {len(new_prices.columns)} tickers to database")

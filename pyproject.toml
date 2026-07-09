@@ -35,6 +35,16 @@ dev = [
 [project.scripts]
 ptr-alpha = "analyzer.cli:main"
 
+# Explicit package discovery: `analyzer` lives under src/ (src-layout), while
+# `scripts` (Gemini OCR helpers used by the `ptr-alpha parse --gemini-ocr` and
+# `ptr-alpha refresh --gemini-ocr` commands) lives at the repo root. Without
+# this, setuptools auto-discovery installs only `analyzer`, and the CLI's
+# `from scripts.ocr_zero_rows import run_gemini_ocr_for_year` fails with
+# ModuleNotFoundError when invoked via the installed entry point.
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["analyzer*", "scripts*"]
+
 [tool.pytest.ini_options]
 filterwarnings = [
     "ignore::cryptography.utils.CryptographyDeprecationWarning",

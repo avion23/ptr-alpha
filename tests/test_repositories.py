@@ -296,6 +296,41 @@ class TestTransactionRepository(DatabaseTestCase):
         ).fetchall()
         self.assertEqual([r[0] for r in rows], ["AAPL", None])
 
+    def test_upsert_rolls_back_when_null_ticker_insert_is_malformed(self):
+        """A failure in the second INSERT must not persist the first INSERT."""
+        df = pd.DataFrame([
+            {
+                "doc_id": "doc-good", "member": "A", "ticker": "AAPL",
+                "transaction_date": "2024-03-10", "disclosure_date": "2024-03-15",
+                "transaction_type": "Purchase",
+            },
+            {
+                "doc_id": "doc-bad", "member": "B", "ticker": None,
+                "transaction_date": "not-a-date", "disclosure_date": "2024-03-15",
+                "transaction_type": "Purchase",
+            },
+        ])
+
+        with self.assertRaises(Exception):
+            self.repo.upsert(df, source="house_pdf")
+
+        count = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_replace_for_docs_rolls_back_deletes_when_replacement_is_malformed(self):
+        self.repo.upsert(self._make_df(doc_id="doc-original"), source="house_pdf")
+        malformed = self._make_df(
+            doc_id="doc-original",
+            transaction_date="not-a-date",
+        )
+
+        with self.assertRaises(Exception):
+            self.db.replace_transactions_for_docs(malformed, source="house_pdf")
+
+        stored = self.repo.get_for_doc("doc-original")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored.iloc[0]["ticker"], "AAPL")
+
     def test_get_by_year_includes_null_transaction_date(self):
         # The exclusion clause is "txn_date IS NULL OR txn_date <=
         # disclosure_date" -- a NULL transaction_date must be INCLUDED.
@@ -872,6 +907,33 @@ class TestParseRunRepository(DatabaseTestCase):
         self.assertEqual(rows[0][0], "success")
         self.assertEqual(rows[0][1], "lattice,ocr")
         self.assertEqual(rows[0][2], 3)
+
+    def test_upsert_rolls_back_delete_when_replacement_is_malformed(self):
+        self.repo.upsert(
+            doc_id="doc-r",
+            year=2024,
+            parser_version="v2",
+            status="success",
+            engines_attempted="lattice",
+            raw_row_count=4,
+            transaction_count=3,
+        )
+
+        with self.assertRaises(Exception):
+            self.repo.upsert(
+                doc_id="doc-r",
+                year="not-a-year",
+                parser_version="v3",
+                status="error",
+                engines_attempted="ocr",
+                raw_row_count=0,
+                transaction_count=0,
+            )
+
+        row = self.db.conn.execute(
+            "SELECT year, parser_version, status FROM pdf_parse_runs WHERE doc_id = 'doc-r'"
+        ).fetchone()
+        self.assertEqual(row, (2024, "v2", "success"))
 
 
 if __name__ == "__main__":

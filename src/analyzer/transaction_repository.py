@@ -75,7 +75,7 @@ class TransactionRepository:
         ).fetchdf()
         return result
 
-    def upsert(self, df: pd.DataFrame, *, source: str) -> None:
+    def upsert(self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False) -> None:
         df = df.copy()
         for column in ["owner_code", "amount_raw", "amount_midpoint", "instrument_type", "strike_price", "expiry_date", "asset_description"]:
             if column not in df.columns:
@@ -98,6 +98,8 @@ class TransactionRepository:
 
         self.conn.execute("CREATE TEMP TABLE staging_transactions AS SELECT * FROM df")
         try:
+            if not _in_transaction:
+                self.conn.execute("BEGIN TRANSACTION")
             self.conn.execute("""
                 CREATE TEMP TABLE filtered_staging_transactions AS
                 SELECT s.*
@@ -149,6 +151,12 @@ class TransactionRepository:
                 FROM filtered_staging_transactions
                 WHERE ticker IS NULL
             """)
+            if not _in_transaction:
+                self.conn.execute("COMMIT")
+        except Exception:
+            if not _in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
         finally:
             self.conn.execute("DROP TABLE IF EXISTS filtered_staging_transactions")
             self.conn.execute("DROP TABLE IF EXISTS staging_transactions")

@@ -14,15 +14,13 @@ class TestPositionSizingImports(unittest.TestCase):
 class TestSummarizeGridResult(unittest.TestCase):
 
     def test_zero_picks_returns_zeroed(self):
-        import math
         from member_profitability.position_sizing import _summarize_grid_result
         out = _summarize_grid_result(
             window_returns=[], window_wins=0, window_total=0,
             top_n=5, min_buyers=2,
         )
         self.assertEqual(out["total_picks"], 0)
-        # Empty mean returns NaN; sharpe and win_rate are protected
-        self.assertTrue(math.isnan(out["avg_spy_alpha_pct"]))
+        self.assertEqual(out["avg_spy_alpha_pct"], 0.0)
         self.assertEqual(out["sharpe_proxy"], 0.0)
         self.assertEqual(out["win_rate_pct"], 0)
 
@@ -44,6 +42,36 @@ class TestSummarizeGridResult(unittest.TestCase):
         )
         # std=0 -> sharpe=0 (avoids divide-by-zero)
         self.assertEqual(out["sharpe_proxy"], 0.0)
+
+    def test_evaluate_grid_counts_picks_and_wins(self):
+        from unittest.mock import patch
+
+        from member_profitability.position_sizing import _evaluate_grid
+
+        ticker_scores = [
+            {"ticker": "A", "composite_score": 2.0, "test_returns": [3.0, 1.0]},
+            {"ticker": "B", "composite_score": 1.0, "test_returns": [-2.0]},
+        ]
+        nonempty = pd.DataFrame({"signal_type": ["Purchase"]})
+        with (
+            patch(
+                "member_profitability.position_sizing._slice_window",
+                return_value=(nonempty, nonempty),
+            ),
+            patch(
+                "member_profitability.position_sizing._rank_train",
+                return_value=pd.DataFrame({"member": ["m"], "shrunk_alpha": [1.0]}),
+            ),
+            patch(
+                "member_profitability.position_sizing._score_test_tickers",
+                return_value=ticker_scores,
+            ),
+        ):
+            returns, wins, total = _evaluate_grid(pd.DataFrame(), [{}], top_n=2, min_buyers=1)
+
+        self.assertEqual(returns, [2.0, -2.0])
+        self.assertEqual(wins, 1)
+        self.assertEqual(total, 2)
 
 
 class TestScoreTestTickers(unittest.TestCase):

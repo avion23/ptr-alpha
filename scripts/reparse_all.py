@@ -112,8 +112,7 @@ if __name__ == "__main__":
     t0 = time.time()
     for year in years:
         total += parse_year(year, db, settings)
-        if hasattr(db, "execute"):
-            db.execute("CHECKPOINT")
+        db.conn.execute("CHECKPOINT")
     
     print(f"\nDone. {total} tx inserted in {time.time()-t0:.1f}s total")
     db.close()

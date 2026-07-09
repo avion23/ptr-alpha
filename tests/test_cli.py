@@ -1,4 +1,5 @@
 """Smoke tests for analyzer.cli module."""
+import importlib
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -8,6 +9,8 @@ from typer.testing import CliRunner
 from analyzer.cli import app, setup_logging
 from analyzer.pipeline import AnalysisParams, BacktestParams
 from analyzer.exceptions import StepResult
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestSetupLogging(unittest.TestCase):
@@ -90,6 +93,32 @@ class TestCliApp(unittest.TestCase):
             result = self.runner.invoke(app, ["parse", "--gemini-ocr"])
 
         self.assertEqual(result.exit_code, 1, result.output)
+
+    def test_gemini_ocr_scripts_package_is_installed_with_cli(self):
+        """Regression: `ptr-alpha parse --gemini-ocr` imports
+        `scripts.ocr_zero_rows.run_gemini_ocr_for_year` at runtime. When the
+        package is installed via `pip install .` (no repo root on sys.path),
+        this import only resolves if `scripts` is declared as an installable
+        package in pyproject.toml AND has an `__init__.py`. A namespace
+        package (no __init__.py) is NOT installed by setuptools and the CLI
+        crashes with ModuleNotFoundError. This test pins both requirements.
+        """
+        # 1. scripts must be a real (regular) package, not a namespace pkg.
+        scripts_pkg = importlib.import_module("scripts")
+        self.assertIsNotNone(
+            getattr(scripts_pkg, "__file__", None),
+            "scripts/ must have an __init__.py so setuptools ships it; "
+            "a namespace package is not installed and breaks `ptr-alpha --gemini-ocr`.",
+        )
+
+        # 2. the symbol the CLI imports must resolve.
+        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
+        self.assertTrue(callable(run_gemini_ocr_for_year))
+
+        # 3. pyproject.toml must declare scripts in package discovery.
+        pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+        self.assertIn("[tool.setuptools.packages.find]", pyproject)
+        self.assertIn("scripts*", pyproject)
 
     def test_refresh_fails_when_gemini_ocr_raises_after_other_steps_run(self):
         mock_ctx = MagicMock()

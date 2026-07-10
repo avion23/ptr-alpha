@@ -331,6 +331,31 @@ class TestTransactionRepository(DatabaseTestCase):
         self.assertEqual(len(stored), 1)
         self.assertEqual(stored.iloc[0]["ticker"], "AAPL")
 
+    def test_replace_for_docs_rolls_back_transactions_when_parse_run_fails(self):
+        self.repo.upsert(self._make_df(doc_id="doc-original"), source="house_pdf")
+        replacement = self._make_df(doc_id="doc-original", ticker="MSFT")
+        malformed_run = {
+            "doc_id": "doc-original",
+            "year": "not-a-year",
+            "parser_version": "v3",
+            "status": "success",
+            "engines_attempted": "pdfplumber",
+            "raw_row_count": 1,
+            "transaction_count": 1,
+        }
+
+        with self.assertRaises(Exception):
+            self.db.replace_transactions_for_docs(
+                replacement, source="house_pdf", parse_runs=[malformed_run],
+            )
+
+        stored = self.repo.get_for_doc("doc-original")
+        self.assertEqual(stored["ticker"].tolist(), ["AAPL"])
+        audit_count = self.db.conn.execute(
+            "SELECT COUNT(*) FROM pdf_parse_runs WHERE doc_id = 'doc-original'"
+        ).fetchone()[0]
+        self.assertEqual(audit_count, 0)
+
     def test_get_by_year_includes_null_transaction_date(self):
         # The exclusion clause is "txn_date IS NULL OR txn_date <=
         # disclosure_date" -- a NULL transaction_date must be INCLUDED.

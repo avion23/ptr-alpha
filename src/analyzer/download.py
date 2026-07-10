@@ -256,11 +256,9 @@ class HouseTransactionSource(TransactionSource):
 
         df = preserve_existing_fields(df, self.db)
 
-        self.db.replace_transactions_for_docs(df, source="house_pdf")
-        # Do not publish successful parse audit records until the corresponding
-        # transaction replacement has succeeded.
-        for parse_run in parse_runs:
-            self.db.upsert_parse_run(**parse_run)
+        self.db.replace_transactions_for_docs(
+            df, source="house_pdf", parse_runs=parse_runs,
+        )
         logger.info(f"Saved {len(df)} transactions to database")
 
 

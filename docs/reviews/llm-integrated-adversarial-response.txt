@@ -1,0 +1,19 @@
+### **Severity 1: Destructive Data Loss & Logic Contradiction**
+*   **Symbol:** `scripts/cleanup_tickers.py` (Lines 144–147)
+*   **Failure Scenario:** While the patch removes `_CONFIRMED_GARBAGE` to protect symbols like `UNIT`, it retains a hardcoded loop that nulls `US`, `NEW`, and `SP`. `US` (United States Steel Corp) and `SP` (SP Plus Corp) are valid, high-volume tickers. This directly contradicts the updated module-level comment (Lines 13–15) stating that spelling alone is insufficient evidence to null symbols.
+*   **Minimal Fix:** Delete lines 144–147; rely on the existing `is_cash_or_fund` logic or a confirmed whitelist.
+
+### **Severity 2: Incomplete Atomicity (Audit-Data Drift)**
+*   **Symbol:** `HouseTransactionSource._save_parse_results` (Lines 256–261)
+*   **Failure Scenario:** The patch moves `upsert_parse_run` after transaction replacement but fails to wrap them in a single transaction. If the process crashes or the database locks after `replace_transactions_for_docs` succeeds but before the `parse_runs` loop finishes, the database will contain new transaction data with an missing or stale `pdf_parse_runs` audit trail. This violates the "MUST" requirement specified in the prior artifact (Fix 3).
+*   **Minimal Fix:** Update `Database.replace_transactions_for_docs` to accept `parse_runs` metadata and perform the `DELETE`, `INSERT` (transactions), and `UPSERT` (parse_run) within its existing `BEGIN TRANSACTION` block.
+
+### **Severity 3: False-Green / Weak Regression Test**
+*   **Symbol:** `TestGarbageTickerBlacklist.test_cleanup_does_not_classify_ambiguous_words_as_garbage`
+*   **Failure Scenario:** The test passes trivially because it only checks if `_CONFIRMED_GARBAGE` (now an empty set) is disjoint from `real_tickers`. It fails to verify the actual behavior of `main()`, which still contains hardcoded destructive `UPDATE` statements for valid tickers (`US`, `SP`).
+*   **Minimal Test:** Mock `duckdb.connect`, insert a row with `ticker='US'`, run `cleanup_tickers.main()`, and assert that the ticker remains `'US'`.
+
+### **Severity 4: Unestablished Fix (Audit Integrity)**
+*   **Symbol:** `src/analyzer/download.py` (Lines 226, 231)
+*   **Failure Scenario:** The `parse_runs` list is constructed using `results`, but it uses a hardcoded `raw_row_count=0`. This renders the audit record's "raw count" metric useless for identifying the "Partial Table" or "Incomplete Parse" scenarios identified in the prior review.
+*   **Minimal Fix:** Pass the actual length of un-normalized rows detected by the parser into the `parse_run` dictionary.

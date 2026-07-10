@@ -327,10 +327,12 @@ class TestGarbageTickerBlacklist(unittest.TestCase):
         import sys
         import os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
-        from cleanup_tickers import _CONFIRMED_GARBAGE
+        from cleanup_tickers import _CONFIRMED_GARBAGE, is_cash_or_fund
 
         real_tickers = {"UNIT", "TECH", "EAST", "WEST", "LAKE"}
         self.assertTrue(_CONFIRMED_GARBAGE.isdisjoint(real_tickers))
+        for ticker in {"US", "NEW", "SP"}:
+            self.assertFalse(is_cash_or_fund(ticker))
 
     def test_original_blacklist_tokens_still_blocked(self):
         from analyzer.parsing.cells import _extract_ticker

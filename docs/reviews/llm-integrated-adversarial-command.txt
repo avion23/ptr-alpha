@@ -1,0 +1,1 @@
+llm -m gemini-3-flash-preview < /tmp/llm-integrated-adversary-prompt.txt > docs/reviews/llm-integrated-adversarial-response.txt

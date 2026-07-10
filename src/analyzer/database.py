@@ -215,14 +215,22 @@ class Database:
     def upsert_transactions(self, df: pd.DataFrame, *, source: str) -> None:
         self.transactions.upsert(df, source=source)
 
-    def replace_transactions_for_docs(self, df: pd.DataFrame, *, source: str) -> None:
-        """Atomically replace every transaction belonging to a parsed document."""
+    def replace_transactions_for_docs(
+        self,
+        df: pd.DataFrame,
+        *,
+        source: str,
+        parse_runs: list[dict] | None = None,
+    ) -> None:
+        """Atomically replace parsed transactions and their optional audit records."""
         doc_ids = df["doc_id"].unique().tolist()
         self.conn.execute("BEGIN TRANSACTION")
         try:
             for doc_id in doc_ids:
                 self.transactions.delete_for_doc(doc_id)
             self.transactions.upsert(df, source=source, _in_transaction=True)
+            for parse_run in parse_runs or []:
+                self.parse_runs.upsert(**parse_run, _in_transaction=True)
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")

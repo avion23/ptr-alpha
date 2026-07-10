@@ -18,8 +18,10 @@ class ParseRunRepository:
         raw_row_count: int,
         transaction_count: int,
         error_message: str | None = None,
+        _in_transaction: bool = False,
     ) -> None:
-        self.conn.execute("BEGIN TRANSACTION")
+        if not _in_transaction:
+            self.conn.execute("BEGIN TRANSACTION")
         try:
             self.conn.execute("DELETE FROM pdf_parse_runs WHERE doc_id = ?", [doc_id])
             self.conn.execute("""
@@ -29,7 +31,9 @@ class ParseRunRepository:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, [doc_id, year, parser_version, status, engines_attempted,
                   raw_row_count, transaction_count, error_message])
-            self.conn.execute("COMMIT")
+            if not _in_transaction:
+                self.conn.execute("COMMIT")
         except Exception:
-            self.conn.execute("ROLLBACK")
+            if not _in_transaction:
+                self.conn.execute("ROLLBACK")
             raise

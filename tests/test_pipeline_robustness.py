@@ -137,6 +137,19 @@ def test_save_parse_results_does_not_mark_success_before_replacement(tmp_path):
         source._save_parse_results(2024, [(pdf_path, [_tx()], ["pdfplumber"])], {})
 
     source.db.upsert_parse_run.assert_not_called()
+    source.db.replace_transactions_for_docs.assert_called_once_with(
+        consolidated,
+        source="house_pdf",
+        parse_runs=[{
+            "doc_id": "123",
+            "year": 2024,
+            "parser_version": "v3",
+            "status": "success",
+            "engines_attempted": "pdfplumber",
+            "raw_row_count": 0,
+            "transaction_count": 1,
+        }],
+    )
 
 
 def test_failed_metadata_refresh_does_not_clear_cached_rows():

@@ -68,7 +68,7 @@ CASH_PATTERNS = [
 def is_cash_or_fund(ticker: str) -> bool:
     upper = ticker.upper()
     # Common pseudo-tickers for cash/treasurys
-    if upper in ('US', 'TREA', 'NEW', '--', 'SP', 'CASH'):
+    if upper in ('TREA', '--', 'CASH'):
         return True
     return any(p in upper for p in CASH_PATTERNS)
 
@@ -140,13 +140,6 @@ def main():
             
             # 3. No match — LEAVE ALONE (this is the bug-fix)
         
-        # Also handle single-token junk
-        for tok in ('US', 'TREA', 'NEW', '--', 'SP'):
-            cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [tok]).fetchone()[0]
-            if cnt:
-                con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [tok])
-                total_nulled += cnt
-
         con.execute("COMMIT")
         in_transaction = False
         

@@ -252,7 +252,10 @@ def _resolve_company_name_ticker(asset_cell: str) -> str | None:
         # guards regex-based extraction (where single letters are noisy),
         # but a company-name match is a strong signal — blocking valid
         # tickers like "O" (Realty Income) would be a false negative.
-        if len(name) > best_len and name in text:
+        # Require name boundaries: plain substring matching turns "farm" into
+        # ARM and "blocked" into Block/SQ.
+        pattern = rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])"
+        if len(name) > best_len and re.search(pattern, text):
             best_ticker = ticker
             best_len = len(name)
     return best_ticker

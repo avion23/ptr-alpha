@@ -11,6 +11,19 @@ from analyzer.exceptions import ParsingError
 
 class TestParsing(unittest.TestCase):
 
+    def test_parse_headerless_single_transaction(self):
+        table = [["Apple Inc. (AAPL)", "P", "01/02/2024"]]
+
+        transactions = parse_pdf_table(table)
+
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["ticker"], "AAPL")
+
+    def test_company_name_fallback_requires_name_boundaries(self):
+        self.assertIsNone(_extract_ticker("Farmland Partners common stock"))
+        self.assertIsNone(_extract_ticker("Blocked account holding"))
+        self.assertEqual(_extract_ticker("ARM Holdings plc"), "ARM")
+
     def test_clean_text_basic(self):
         self.assertEqual(clean_text("  hello   world  "), "hello world")
         self.assertEqual(clean_text(None), "")

@@ -100,7 +100,7 @@ def _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date, *, amoun
 
 
 def parse_pdf_table(table: list) -> list[dict]:
-    if not table or len(table) < 2:
+    if not table:
         return []
 
     header_idx = _find_header_row(table)

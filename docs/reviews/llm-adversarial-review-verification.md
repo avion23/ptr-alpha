@@ -1,12 +1,19 @@
 # LLM adversarial review verification
 
-Model: `gemini/gemini-flash-lite-latest` via `llm`.
+Two successful `llm` reviews were independently verified. The exact full-source prompt, response, and usage for the `gemini/gemini-flash-lite-latest` run are stored in the adjacent `llm-adversarial-review-{prompt,response,usage}.txt` files. The exact output from the separate AST-normalized all-source review is stored in `llm-adversarial-review-2025-02-18.md`.
 
-- Finding 1, parser cascade data loss: not established. The cascade intentionally accepts complete text-parser results and retains the highest-quality partial result; the proposed notion of a partial table has no reliable signal in the current parser API.
-- Finding 2, OCR parallel race: not established. Worker DB access is read-only and the writer owns mutations. The queue already serializes writes.
-- Finding 3, non-atomic persistence: false. `insert_transactions` wraps deletion, insertion, and the success parse-run record in one DuckDB transaction. Parse-run-only error/no-result paths do not mutate transactions.
-- Finding 4, ticker cleanup corruption: verified. `UNIT`, `TECH`, `EAST`, `WEST`, and `LAKE` can be real symbols, yet the cleanup script nulled them solely by spelling. The destructive set and update loop were removed and the regression test now protects ambiguous valid symbols.
-- Finding 5, Kelly NaN propagation: already fixed and covered by `test_estimate_win_loss_nan_does_not_propagate`.
-- Finding 6, SPY double weighting: already fixed in `_compute_derived_arrays` and covered by existing signal tests.
+## Verified defects fixed
 
-Verification: `uv run --extra dev pytest -q` passes 805 tests. `git diff --check` passes. Ruff still reports three pre-existing unused imports in `tests/test_bug_fixes.py`; `scripts/cleanup_tickers.py` is clean.
+- `scripts/cleanup_tickers.py` nulled symbols including `UNIT`, `TECH`, `EAST`, `WEST`, and `LAKE` solely by spelling even though they can be valid tickers. The destructive set and update loop were removed; a regression protects ambiguous valid symbols.
+- `HouseTransactionSource._save_parse_results` wrote `success` parse-run records before transaction replacement. A failed replacement could leave a false-success audit record. Parse-run writes now occur only after replacement succeeds. Regressions cover replacement failure and an all-zero batch that aborts before persistence.
+
+## Rejected or already-fixed findings
+
+- Parser-cascade data loss was not established. The proposed partial-table signal does not exist reliably in the current parser API.
+- DuckDB contention/races were asserted without a matching concurrent write path; workers read while the queue-owned writer serializes mutations.
+- Gemini transaction replacement already records deletion, insertion, and success atomically. Parse-run-only error/no-result paths do not mutate transactions.
+- `$100K` cannot match `_extract_ticker`'s dollar-ticker regex because the first character after `$` must be a letter.
+- A fixed row-count threshold for reparsing was rejected because valid parser improvements can merge duplicates and missing rows cannot be inferred safely from count alone. Replacement is transactional.
+- Kelly NaN propagation and SPY double weighting were already fixed and covered by tests.
+- Log-return conversion, event-driven Sharpe annualization, delisting policy, episode construction, and UTF-16 metadata require product or data evidence before changing semantics.
+- OCR orientation and the residual zero-row corpus are already documented; neither review supplied a new reproducible recovery method.

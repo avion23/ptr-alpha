@@ -223,11 +223,12 @@ class HouseTransactionSource(TransactionSource):
     ) -> None:
         pdf_transactions: dict = {}
         zero_row_doc_ids: list[str] = []
+        parse_runs: list[dict] = []
         for pdf_path, transactions, engines_attempted in results:
             doc_id = pdf_path.stem
             pdf_transactions[pdf_path] = transactions
             status = "success" if transactions else "zero_rows"
-            self.db.upsert_parse_run(
+            parse_runs.append(dict(
                 doc_id=doc_id,
                 year=year,
                 parser_version="v3",
@@ -235,7 +236,7 @@ class HouseTransactionSource(TransactionSource):
                 engines_attempted=",".join(engines_attempted),
                 raw_row_count=0,
                 transaction_count=len(transactions),
-            )
+            ))
             if not transactions:
                 zero_row_doc_ids.append(doc_id)
 
@@ -256,6 +257,10 @@ class HouseTransactionSource(TransactionSource):
         df = preserve_existing_fields(df, self.db)
 
         self.db.replace_transactions_for_docs(df, source="house_pdf")
+        # Do not publish successful parse audit records until the corresponding
+        # transaction replacement has succeeded.
+        for parse_run in parse_runs:
+            self.db.upsert_parse_run(**parse_run)
         logger.info(f"Saved {len(df)} transactions to database")
 
 

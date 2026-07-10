@@ -119,7 +119,24 @@ def test_save_parse_results_warns_when_zero_row_doc_retains_db_rows(caplog, tmp_
         source._save_parse_results(2024, [(pdf_path, [], ["pdfplumber"])], {})
 
     source.db.count_transactions_for_docs.assert_called_once_with(["123"])
+    source.db.upsert_parse_run.assert_not_called()
     assert "1 docs parsed to zero rows but retain 3 existing DB rows (stale?): 123" in caplog.text
+
+
+def test_save_parse_results_does_not_mark_success_before_replacement(tmp_path):
+    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
+    source.db = MagicMock()
+    source.db.count_transactions_for_docs.return_value = {}
+    source.db.replace_transactions_for_docs.side_effect = OSError("disk full")
+    pdf_path = tmp_path / "123.pdf"
+    consolidated = pd.DataFrame({"doc_id": ["123"]})
+
+    with patch.object(download, "consolidate_transactions", return_value=consolidated), \
+         patch.object(download, "preserve_existing_fields", return_value=consolidated), \
+         pytest.raises(OSError, match="disk full"):
+        source._save_parse_results(2024, [(pdf_path, [_tx()], ["pdfplumber"])], {})
+
+    source.db.upsert_parse_run.assert_not_called()
 
 
 def test_failed_metadata_refresh_does_not_clear_cached_rows():

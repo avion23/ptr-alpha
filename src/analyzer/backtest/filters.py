@@ -27,6 +27,10 @@ def _filter_training(
         (signals_df["horizon_days"] == horizon)
         & (signals_df["disclosure_date"] <= cutoff)
     ].copy()
+    # Defense in depth for price datasets that end before the requested
+    # horizon.  Such rows are censored observations, not realized outcomes.
+    if "total_spy_alpha_pct" in training.columns:
+        training = training[training["total_spy_alpha_pct"].notna()]
     if training_lookback_iso is not None:
         training_start = pd.Timestamp(training_lookback_iso)
         training = training[training["disclosure_date"] >= training_start]
@@ -59,7 +63,10 @@ def _filter_ticker_perf(
     """Filter signals to the ticker-performance window. Result is id-stable."""
     as_of_date = pd.Timestamp(as_of_iso)
     cutoff = as_of_date - pd.Timedelta(days=horizon)
-    return signals_df[
+    result = signals_df[
         (signals_df["horizon_days"] == horizon)
         & (signals_df["disclosure_date"] <= cutoff)
     ].copy()
+    if "total_spy_alpha_pct" in result.columns:
+        result = result[result["total_spy_alpha_pct"].notna()]
+    return result

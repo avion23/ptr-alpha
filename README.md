@@ -132,7 +132,8 @@ Analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv`
 - Transactions carry a `source` provenance column (`house_pdf`, `capitol_trades`, or `gemini_ocr`); old pre-migration rows may have `NULL` source.
 - Inspect `pdf_parse_runs` after every parse. A zero-row result is not proof that a filing has
   no trades, and parser success does not prove every row or field was extracted correctly.
-- `ptr-alpha validate` does train-only parameter selection with Benjamini-Hochberg snooping correction and Newey-West statistics. As of 2026-07, no configuration shows statistically significant alpha.
+- `ptr-alpha validate` requires disjoint, ordered train/test windows, does train-only parameter selection with Benjamini-Hochberg snooping correction, and reports Newey-West statistics. Forward-return labels remain missing until SPY prices reach the full requested horizon; partial windows are never shortened into apparently mature returns.
+- Recent ticker output includes only positive model scores. A positive score is a model ranking, not evidence of statistically significant alpha or individualized investment advice. As of 2026-07, no validated configuration shows statistically significant alpha.
 
 ## Tests
 

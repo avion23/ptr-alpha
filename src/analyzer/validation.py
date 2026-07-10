@@ -456,6 +456,13 @@ def run_validation(
         JSON-serializable dict containing train/test metrics, selected config,
         degradation ratio, and a plain-language verdict.
     """
+    if train_end < train_start or test_end < test_start:
+        raise ValueError("validation window end must be on or after its start")
+    if test_start <= train_end:
+        raise ValueError("test window must start after the training window ends")
+    if not grid or not grid.get("horizon"):
+        raise ValueError("validation grid must include at least one horizon")
+
     from analyzer.database import Database
 
     db = Database(Path(db_path), read_only=True)
@@ -484,7 +491,10 @@ def _run_validation_with_db(
     """Inner implementation that accepts an open Database connection."""
     tx_start = pd.Timestamp("2021-10-07")
     tx_end = pd.Timestamp(test_end)
-    price_end = pd.Timestamp(test_end) + pd.Timedelta(days=130)
+    # Cover the longest tested forward window.  The old fixed 130-day buffer
+    # silently truncated 180-day configurations into shorter outcomes.
+    max_horizon = max(int(h) for h in grid["horizon"])
+    price_end = pd.Timestamp(test_end) + pd.Timedelta(days=max_horizon + 10)
 
     all_tx = db.get_transactions_by_date_range(tx_start, tx_end)
     all_tickers = sorted(
@@ -680,7 +690,12 @@ def _spy_mean_return(
             end_ts = ts + pd.Timedelta(days=horizon)
             entry = spy.asof(ts)
             exit_ = spy.asof(end_ts)
-            if pd.notna(entry) and pd.notna(exit_) and entry > 0:
+            exit_pos = spy.index.searchsorted(end_ts, side="right") - 1
+            exit_is_mature = (
+                exit_pos >= 0
+                and end_ts - pd.Timestamp(spy.index[exit_pos]) <= pd.Timedelta(days=7)
+            )
+            if pd.notna(entry) and pd.notna(exit_) and entry > 0 and exit_is_mature:
                 returns.append((exit_ - entry) / entry * 100)
         return round(float(np.mean(returns)), 2) if returns else None
     except Exception:

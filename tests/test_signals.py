@@ -74,6 +74,24 @@ class TestCalculateSignalPotential(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertTrue(pd.isna(result.iloc[0]["spy_alpha_pct"]))
 
+    def test_incomplete_forward_window_is_not_shortened(self):
+        entry = self.entry_prices.iloc[[0]].copy()
+        entry["disclosure_date"] = pd.Timestamp("2024-05-20")
+        result = calculate_signal_potential(entry, self.prices_df, [180])
+
+        row = result.iloc[0]
+        for column in (
+            "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct",
+            "total_return_pct", "total_spy_alpha_pct",
+        ):
+            self.assertTrue(pd.isna(row[column]), column)
+
+    def test_weekend_window_end_is_considered_complete(self):
+        entry = self.entry_prices.iloc[[0]].copy()
+        entry["disclosure_date"] = pd.Timestamp("2024-04-30")
+        result = calculate_signal_potential(entry, self.prices_df, [30])
+        self.assertTrue(pd.notna(result.iloc[0]["total_spy_alpha_pct"]))
+
 
 class TestGetTopSignals(unittest.TestCase):
 

@@ -172,6 +172,26 @@ class TestRecentTickerScoring(unittest.TestCase):
     @patch("analyzer.pipeline.analysis.rank_members")
     @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
     @patch("analyzer.pipeline.prepare_analysis_data")
+    def test_does_not_present_negative_scores_as_buys(self, mock_prepare, mock_score, mock_rank):
+        trades = pd.DataFrame({
+            "member": ["Alice", "Bob"], "ticker": ["AAPL", "AAPL"],
+            "disclosure_date": pd.to_datetime(["2024-05-01", "2024-05-02"]),
+            "transaction_type": ["Purchase", "Purchase"],
+        })
+        mock_prepare.return_value = (trades, pd.DataFrame(), pd.DataFrame())
+        mock_rank.return_value = pd.DataFrame({"member": ["Alice"]})
+        mock_score.return_value = pd.DataFrame({"ticker": ["AAPL"], "signal_score": [-1.0]})
+
+        result = run_recent_ticker_scoring(
+            MagicMock(), MagicMock(),
+            TickerScoringParams(year=2024, horizons=[90], days_back=30, min_buyers=2),
+        )
+
+        self.assertTrue(result.data["result"].empty)
+
+    @patch("analyzer.pipeline.analysis.rank_members")
+    @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
+    @patch("analyzer.pipeline.prepare_analysis_data")
     def test_scores_use_recent_trades_not_full_year_trades(self, mock_prepare, mock_score, mock_rank):
         trades = pd.DataFrame({
             "member": ["Alice", "Bob", "Old Buyer"],

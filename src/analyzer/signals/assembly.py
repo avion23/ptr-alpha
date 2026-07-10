@@ -87,7 +87,8 @@ def _compute_peak_potential(metadata: dict, result_arrays: dict) -> np.ndarray:
     purchase_mask = is_purchase & valid_disc
     sale_mask = is_sale & (r_trough > 0) & np.isfinite(r_trough)
 
-    peak_potential = np.zeros(n, dtype=np.float64)
+    # Missing and not-yet-mature windows are unknown, not zero-return trades.
+    peak_potential = np.full(n, np.nan, dtype=np.float64)
     peak_potential[purchase_mask] = (r_peak[purchase_mask] / r_disc_baseline[purchase_mask] - 1) * 100
     peak_potential[sale_mask] = (entry_prices_arr[sale_mask] / r_trough[sale_mask] - 1) * 100
     return peak_potential

@@ -416,10 +416,10 @@ class TestAnalysis(unittest.TestCase):
             'entry_price': [100.0, 200.0],
         })
         prices = pd.DataFrame({
-            'AAPL': [100.0, 110.0],
-            'MSFT': [np.nan, np.nan],
-            'SPY': [100.0, 100.0],
-        }, index=pd.to_datetime(['2024-01-01', '2024-01-02']))
+            'AAPL': [100.0, 110.0, 110.0],
+            'MSFT': [np.nan, np.nan, np.nan],
+            'SPY': [100.0, 100.0, 100.0],
+        }, index=pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-31']))
 
         signals = calculate_signal_potential(entry_prices, prices, [30])
         rankings = rank_members(signals, horizon=30)

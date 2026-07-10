@@ -57,6 +57,12 @@ def _compute_ticker_signals(
     spy_has = spy_dates_ns is not None and spy_vals is not None and spy_log_ret is not None
 
     for i in range(n_signals):
+        # A forward-return label is valid only after the market benchmark has
+        # reached the requested window end.  Without this guard, a 180-day
+        # signal computed 20 days after disclosure was silently labelled with
+        # a 20-day return, contaminating member rankings and validation.
+        if not _market_window_is_complete(spy_dates_ns, t_end_ns[i]):
+            continue
         lo = int(t_lo[i])
         hi = int(t_hi[i])
         if lo >= hi:
@@ -104,6 +110,23 @@ def _compute_ticker_signals(
                 spy_dates_ns, spy_vals, spy_log_ret, decay_lambda,
                 r_spy_cum, r_spy_wsum, r_spy_first, r_spy_last,
             )
+
+
+def _market_window_is_complete(
+    spy_dates_ns: np.ndarray | None,
+    end_ns: int,
+    max_staleness_days: int = 7,
+) -> bool:
+    """Return whether benchmark data reaches a signal's intended end date."""
+    # Legacy/library callers may calculate absolute returns without a SPY
+    # column.  Benchmark-relative metrics remain NaN there; maturity is
+    # enforced when the production benchmark is present.
+    if spy_dates_ns is None or len(spy_dates_ns) == 0:
+        return True
+    pos = int(np.searchsorted(spy_dates_ns, end_ns, side="right")) - 1
+    if pos < 0:
+        return False
+    return int(end_ns) - int(spy_dates_ns[pos]) <= max_staleness_days * _constants._NS_PER_DAY
 
 
 def _populate_spy_arrays(

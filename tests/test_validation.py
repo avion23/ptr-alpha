@@ -17,7 +17,28 @@ from analyzer.validation import (
     run_single_backtest,
     select_config,
     sweep_configs,
+    run_validation,
 )
+
+
+class TestValidationBoundaries:
+    def test_rejects_overlapping_train_and_test_windows(self, tmp_path):
+        with pytest.raises(ValueError, match="test window must start after"):
+            run_validation(
+                tmp_path / "unused.duckdb",
+                date(2024, 1, 1), date(2024, 6, 30),
+                date(2024, 6, 30), date(2024, 12, 31),
+                {"horizon": [180]},
+            )
+
+    def test_rejects_missing_horizon_grid(self, tmp_path):
+        with pytest.raises(ValueError, match="at least one horizon"):
+            run_validation(
+                tmp_path / "unused.duckdb",
+                date(2023, 1, 1), date(2023, 12, 31),
+                date(2024, 1, 1), date(2024, 12, 31),
+                {},
+            )
 
 
 # ---------------------------------------------------------------------------

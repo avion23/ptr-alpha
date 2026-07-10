@@ -419,17 +419,10 @@ class TestAnalysis(unittest.TestCase):
         })
         price_dates = pd.date_range('2024-01-01', '2024-02-05', freq='D')
         prices = pd.DataFrame({
-<<<<<<< HEAD
-            'AAPL': [100.0, 110.0, 110.0],
-            'MSFT': [np.nan, np.nan, np.nan],
-            'SPY': [100.0, 100.0, 100.0],
-        }, index=pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-31']))
-=======
             'AAPL': np.linspace(100.0, 110.0, len(price_dates)),
             'MSFT': [np.nan] * len(price_dates),
             'SPY': [100.0] * len(price_dates),
         }, index=price_dates)
->>>>>>> 685b892 (Fix live recommendation horizon handling)
 
         signals = calculate_signal_potential(entry_prices, prices, [30])
         rankings = rank_members(signals, horizon=30)

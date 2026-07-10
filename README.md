@@ -128,7 +128,9 @@ Modules follow a layered design: `cli.py` handles presentation and formatting, `
 | `ptr-alpha validate --train-start 2022-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2025-06-30` | Select parameters on the train window, then evaluate once on the test window. |
 | `ptr-alpha validate --full-grid` | Run the larger validation parameter grid. |
 
-Analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` where supported. Ticker scoring also accepts `--days-back` and `--min-buyers`.
+Analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` where supported. `--top-n` limits rank output as well as signal output. Ticker scoring also accepts `--days-back` and `--min-buyers`. Counts, horizons, lookback windows, and simulation capital must be greater than zero; invalid values fail before the database is opened.
+
+Portfolio win rate, average holding period, and turnover are reported as `N/A` when the simulation ends with no closed trades. Open positions still contribute to final marked-to-market value, but they cannot produce closed-trade statistics.
 
 ## Data & caveats
 

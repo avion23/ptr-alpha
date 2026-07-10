@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 
 from typer.testing import CliRunner
 
-from analyzer.cli import app, setup_logging
+from analyzer.cli import app, setup_logging, _print_portfolio_metrics
 from analyzer.pipeline import AnalysisParams, BacktestParams
 from analyzer.exceptions import StepResult
 
@@ -53,6 +53,59 @@ class TestCliApp(unittest.TestCase):
         result = self.runner.invoke(app, ["analyze", "--help"])
         self.assertEqual(result.exit_code, 0)
         self.assertIn("ranks", result.output)
+
+    def test_analyze_rejects_invalid_numeric_and_output_options_before_db_open(self):
+        cases = [
+            ["--horizons", "0"],
+            ["--days-back", "0"],
+            ["--min-buyers", "0"],
+            ["--top-n", "0"],
+            ["--output", "json"],
+        ]
+        for args in cases:
+            with self.subTest(args=args), patch("analyzer.cli.get_context") as context:
+                result = self.runner.invoke(app, ["analyze", *args])
+                self.assertEqual(result.exit_code, 1, result.output)
+                self.assertIn("Error:", result.output)
+                context.assert_not_called()
+
+    def test_backtest_rejects_nonpositive_windows_before_db_open(self):
+        for option in ("--horizon", "--lookback-days", "--training-lookback-days",
+                       "--min-buyers", "--top-n", "--frequency-days"):
+            with self.subTest(option=option), patch("analyzer.cli.get_context") as context:
+                result = self.runner.invoke(app, [
+                    "backtest", "--start", "2024-01-01", "--end", "2024-02-01",
+                    option, "0",
+                ])
+                self.assertEqual(result.exit_code, 1, result.output)
+                context.assert_not_called()
+
+    def test_portfolio_rejects_nonpositive_constraints_before_db_open(self):
+        for option in ("--horizon", "--lookback-days", "--training-lookback-days",
+                       "--min-buyers", "--top-n", "--frequency-days",
+                       "--initial-capital", "--max-positions", "--hold-days"):
+            with self.subTest(option=option), patch("analyzer.cli.get_context") as context:
+                result = self.runner.invoke(app, [
+                    "portfolio", "--start", "2024-01-01", "--end", "2024-02-01",
+                    option, "0",
+                ])
+                self.assertEqual(result.exit_code, 1, result.output)
+                context.assert_not_called()
+
+    def test_portfolio_metrics_do_not_report_zero_performance_without_closed_trades(self):
+        metrics = {
+            "total_return_pct": 1.0, "annualized_return_pct": 2.0,
+            "sharpe_ratio": 0.5, "max_drawdown_pct": -1.0,
+            "win_rate_pct": 0.0, "avg_holding_days": 0.0,
+            "turnover_rate": 0.0, "max_concurrent_positions": 2,
+            "total_closed_trades": 0, "spy_return_pct": None,
+            "sector_concentration": {},
+        }
+        with patch("builtins.print") as printer:
+            _print_portfolio_metrics(metrics)
+        output = "\n".join(call.args[0] for call in printer.call_args_list)
+        self.assertIn("N/A (no closed trades)", output)
+        self.assertNotIn("Win rate:           0.0%", output)
 
     def test_backtest_cli_defaults_match_dataclass_defaults(self):
         captured = {}

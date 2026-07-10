@@ -114,4 +114,4 @@ def get_analysis_table(
         return _get_member_signals(signals_df, member_filter, horizon, top_n or 5)
     if show_signals:
         return _get_top_signals(signals_df, horizon, top_n or 15)
-    return rank_members(signals_df, horizon, threshold)
+    return rank_members(signals_df, horizon, threshold).head(top_n)

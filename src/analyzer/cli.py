@@ -136,6 +136,21 @@ def _validate_mode(mode: str, member: str | None, ticker: str | None) -> None:
         print("WARNING: --member flag is ignored for --mode sales (sales rankings are aggregate).", file=sys.stderr)
 
 
+def _validate_positive_options(**options: int | float) -> None:
+    """Reject nonsensical numeric CLI inputs before opening the database."""
+    for name, value in options.items():
+        if value <= 0:
+            option = name.replace("_", "-")
+            print(f"Error: --{option} must be greater than zero", file=sys.stderr)
+            raise typer.Exit(1)
+
+
+def _validate_output(output: str) -> None:
+    if output not in {"console", "csv"}:
+        print("Error: --output must be one of ['console', 'csv']", file=sys.stderr)
+        raise typer.Exit(1)
+
+
 def _check_data_freshness(app_ctx: AppContext) -> None:
     """Warn if transaction data looks stale."""
     try:
@@ -281,6 +296,16 @@ def analyze(
       tickers  - Score multi-buyer tickers from recent period
     """
     _validate_mode(mode, member, ticker)
+    _validate_positive_options(
+        year=year,
+        days_back=days_back,
+        min_buyers=min_buyers,
+        top_n=top_n,
+    )
+    if not horizons or any(horizon <= 0 for horizon in horizons):
+        print("Error: --horizons values must be greater than zero", file=sys.stderr)
+        raise typer.Exit(1)
+    _validate_output(output)
     app_ctx = get_context(ctx, data_dir, read_only=False)
     _check_data_freshness(app_ctx)
 
@@ -371,6 +396,15 @@ def backtest(
         print("Error: --end must be on or after --start", file=sys.stderr)
         raise typer.Exit(1)
 
+    _validate_positive_options(
+        horizon=horizon,
+        lookback_days=lookback_days,
+        training_lookback_days=training_lookback_days,
+        min_buyers=min_buyers,
+        top_n=top_n,
+        frequency_days=frequency_days,
+    )
+
     app_ctx = get_context(ctx, data_dir, read_only=True)
     params = BacktestParams(
         start_date=start_date,
@@ -453,6 +487,18 @@ def portfolio(
     cash management across overlapping holding periods.
     """
     start_date, end_date = _parse_sim_dates(start, end)
+
+    _validate_positive_options(
+        horizon=horizon,
+        lookback_days=lookback_days,
+        training_lookback_days=training_lookback_days,
+        min_buyers=min_buyers,
+        top_n=top_n,
+        frequency_days=frequency_days,
+        initial_capital=initial_capital,
+        max_positions=max_positions,
+        hold_days=hold_days,
+    )
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
@@ -585,9 +631,14 @@ def _print_portfolio_metrics(metrics: dict) -> None:
     print(f"  Annualized return:  {metrics['annualized_return_pct']:.2f}%")
     print(f"  Sharpe ratio:       {metrics['sharpe_ratio']:.3f}")
     print(f"  Max drawdown:       {metrics['max_drawdown_pct']:.2f}%")
-    print(f"  Win rate:           {metrics['win_rate_pct']:.1f}%")
-    print(f"  Avg holding days:   {metrics['avg_holding_days']:.1f}")
-    print(f"  Turnover rate:      {metrics['turnover_rate']:.3f}")
+    if metrics["total_closed_trades"]:
+        print(f"  Win rate:           {metrics['win_rate_pct']:.1f}%")
+        print(f"  Avg holding days:   {metrics['avg_holding_days']:.1f}")
+        print(f"  Turnover rate:      {metrics['turnover_rate']:.3f}")
+    else:
+        print("  Win rate:           N/A (no closed trades)")
+        print("  Avg holding days:   N/A (no closed trades)")
+        print("  Turnover rate:      N/A (no closed trades)")
     print(f"  Max concurrent:     {metrics['max_concurrent_positions']}")
     print(f"  Total closed:       {metrics['total_closed_trades']}")
     if metrics.get("spy_return_pct") is not None:

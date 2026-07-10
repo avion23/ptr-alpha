@@ -226,10 +226,11 @@ class TestAnalysis(unittest.TestCase):
 
     def test_get_analysis_table_rank_members(self):
         signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
-        table = get_analysis_table(signals, None, False, 90, 5, 5.0)
+        table = get_analysis_table(signals, None, False, 90, 1, 5.0)
 
         self.assertFalse(table.empty)
         self.assertTrue('member' in table.columns)
+        self.assertEqual(len(table), 1)
 
     def test_score_ticker_by_buyers_uses_rated_buyers_not_all_buyers(self):
         transactions = pd.DataFrame({

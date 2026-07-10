@@ -4,11 +4,8 @@ Each test class corresponds to one numbered finding.
 All tests use temp DuckDB files — never the production data/congress.duckdb.
 """
 
-import hashlib
 import unittest
 from datetime import date
-from pathlib import Path
-from unittest.mock import patch
 
 import pandas as pd
 

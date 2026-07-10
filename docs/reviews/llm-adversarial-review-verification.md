@@ -17,3 +17,7 @@ Two successful `llm` reviews were independently verified. The exact full-source 
 - Kelly NaN propagation and SPY double weighting were already fixed and covered by tests.
 - Log-return conversion, event-driven Sharpe annualization, delisting policy, episode construction, and UTF-16 metadata require product or data evidence before changing semantics.
 - OCR orientation and the residual zero-row corpus are already documented; neither review supplied a new reproducible recovery method.
+
+## Integration verification
+
+`uv run --extra dev pytest -q` passes 806 tests. Ruff passes for all changed Python files, and `git diff --check` passes.

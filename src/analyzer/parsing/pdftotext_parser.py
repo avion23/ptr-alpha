@@ -55,7 +55,7 @@ _TX_CODE_INLINE = re.compile(r'\b(?:S|P|E)(?:\s*\(partial\))?\b')
 _TICKER_PARENS = re.compile(r'\([A-Za-z][A-Za-z0-9.\-]{0,5}\)')
 _OWNER_TX_HEAD = re.compile(r'^[A-Z]{1,4}\s+\S')
 _OWNER_PREFIX = re.compile(r'^[A-Z]{1,4}\s+\S')
-_AMOUNT_CONTINUATION = re.compile(r'^\$[\d,]+$')
+_AMOUNT_CONTINUATION = re.compile(r'\$[\d,]+\s*$')
 _SOURCE_ACCOUNT = re.compile(r'^S\s+O\s*:\s*(.+)$')
 
 
@@ -160,18 +160,23 @@ def _collect_transaction_continuations(
     """Collect wrapped asset, amount, and source-account text for one PTR row."""
     asset, j = _collect_asset_continuation(asset, start, lines)
     if amount.rstrip().endswith("-"):
-        embedded_high = re.search(r"\s+(\$[\d,]+)\s*$", asset)
+        embedded_high = re.search(r"\s+(\$[\d,]+)(?=\s|$)", asset)
         if embedded_high:
             amount = f"{amount.rstrip()} {embedded_high.group(1)}"
-            asset = asset[:embedded_high.start()].rstrip()
+            asset = (
+                asset[: embedded_high.start()]
+                + asset[embedded_high.end() :]
+            ).strip()
     account = None
     while j < len(lines):
         line = lines[j]
         if _TX_WITH_OWNER.match(line) or _TX_NO_OWNER.match(line):
             break
         stripped = line.strip()
-        if amount.rstrip().endswith("-") and _AMOUNT_CONTINUATION.fullmatch(stripped):
-            amount = f"{amount.rstrip()} {stripped}"
+        if amount.rstrip().endswith("-"):
+            amount_match = _AMOUNT_CONTINUATION.search(stripped)
+            if amount_match:
+                amount = f"{amount.rstrip()} {amount_match.group().strip()}"
         account_match = _SOURCE_ACCOUNT.match(stripped)
         if account_match:
             account = account_match.group(1).strip()

@@ -108,3 +108,42 @@ def test_wrapped_asset_line_can_also_contain_amount_upper_bound(monkeypatch):
     assert transaction["amount_raw"] == "$15,001 - $50,000"
     assert transaction["amount_midpoint"] == 32500.5
     assert transaction["asset_description"] == "Alphabet Inc. - Class A Common Stock (GOOGL) [ST]"
+
+
+def test_wrapped_amount_after_non_asset_detail_lines(monkeypatch):
+    text = (
+        "  Alibaba Group Holding Limited S 02/11/2022 03/04/2022 $50,001 - b\n"
+        "                                                              c\n"
+        "  American Depositary Shares each                              $100,000\n"
+        "  representing eight Ordinary shares\n"
+        "  (BABA) [ST]\n"
+        "  FILING STATUS: New\n"
+    )
+    monkeypatch.setattr(
+        "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
+    )
+
+    transaction = parse_pdf_table(
+        extract_tables_with_pdftotext(Path("disclosure.pdf"))[0]
+    )[0]
+
+    assert transaction["amount_raw"] == "$50,001 - $100,000"
+    assert transaction["amount_midpoint"] == 75000.5
+
+
+def test_wrapped_amount_before_instrument_marker(monkeypatch):
+    text = (
+        "  IBM Common Stock P 06/03/2025 06/05/2025 $15,001 -\n"
+        "  (IBM)                                      $50,000 [ST]\n"
+        "  S O: Trust Account\n"
+    )
+    monkeypatch.setattr(
+        "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
+    )
+
+    transaction = parse_pdf_table(
+        extract_tables_with_pdftotext(Path("disclosure.pdf"))[0]
+    )[0]
+
+    assert transaction["amount_raw"] == "$15,001 - $50,000"
+    assert transaction["asset_description"] == "IBM Common Stock (IBM) [ST] [Account: Trust Account]"

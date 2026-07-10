@@ -462,6 +462,8 @@ def run_validation(
         raise ValueError("test window must start after the training window ends")
     if not grid or not grid.get("horizon"):
         raise ValueError("validation grid must include at least one horizon")
+    if any(int(horizon) < 1 for horizon in grid["horizon"]):
+        raise ValueError("validation horizons must be positive")
 
     from analyzer.database import Database
 

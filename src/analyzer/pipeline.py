@@ -220,6 +220,8 @@ def run_recent_ticker_scoring(
 ) -> DataResult:
     if params.days_back < 1:
         raise DataSourceError("days_back must be at least 1")
+    if not params.horizons or any(horizon < 1 for horizon in params.horizons):
+        raise DataSourceError("horizons must contain positive days")
 
     if params.training_lookback_days < 1:
         raise DataSourceError("training_lookback_days must be at least 1")

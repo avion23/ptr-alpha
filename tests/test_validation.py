@@ -39,6 +39,15 @@ class TestValidationBoundaries:
                 {},
             )
 
+    def test_rejects_non_positive_horizon(self, tmp_path):
+        with pytest.raises(ValueError, match="horizons must be positive"):
+            run_validation(
+                tmp_path / "unused.duckdb",
+                date(2023, 1, 1), date(2023, 12, 31),
+                date(2024, 1, 1), date(2024, 12, 31),
+                {"horizon": [0]},
+            )
+
 
 # ---------------------------------------------------------------------------
 # newey_west_tstat

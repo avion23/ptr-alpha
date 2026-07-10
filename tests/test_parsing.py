@@ -33,6 +33,31 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(transactions[1]['ticker'], 'GOOGL')
         self.assertEqual(transactions[1]['transaction_type'], 'Sale')
 
+    def test_parse_pdf_table_without_header_keeps_first_transaction(self):
+        table = [
+            ['Apple Inc. (AAPL)', 'Purchase', '01/15/2024'],
+            ['Google LLC (GOOGL)', 'Sale', '01/16/2024'],
+        ]
+
+        transactions = parse_pdf_table(table)
+
+        self.assertEqual([tx['ticker'] for tx in transactions], ['AAPL', 'GOOGL'])
+
+    def test_parse_pdf_table_merges_split_row_that_already_has_ticker(self):
+        table = [
+            ['Asset', 'Type', 'Date', 'Amount'],
+            ['Apple Inc. (AAPL)', '', '', ''],
+            ['', 'Purchase', '01/15/2024', '$1,001 - $15,000'],
+        ]
+
+        transactions = parse_pdf_table(table)
+
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]['ticker'], 'AAPL')
+        self.assertEqual(transactions[0]['transaction_type'], 'Purchase')
+        self.assertEqual(transactions[0]['transaction_date'], '01/15/2024')
+        self.assertEqual(transactions[0]['amount_raw'], '$1,001 - $15,000')
+
     def test_parse_pdf_table_house_owner_and_amount_columns(self):
         table = [
             ['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date', 'Notification Date', 'Amount'],
@@ -371,7 +396,7 @@ class TestParsing(unittest.TestCase):
         ]
         transactions = parse_pdf_table(table)
         # All valid rows are now kept (even without tickers) for later backfill.
-        # The continuation merge is only attempted when all three fields are missing.
+        # Rows with their own transaction fields are not treated as continuations.
         self.assertEqual(len(transactions), 4)
         tickers = [t['ticker'] for t in transactions]
         self.assertIn('AAPL', tickers)

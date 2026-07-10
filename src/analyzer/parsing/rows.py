@@ -35,7 +35,7 @@ def _process_row(row: list, indexes: dict[str, int] | None = None, next_row: lis
         tx_date = _extract_date(date_cell)
         merged = False
 
-        if not ticker and not tx_type and not tx_date and next_row:
+        if not tx_type and not tx_date and next_row:
             ticker, asset_cell, tx_type_cell, date_cell, tx_type, tx_date = _try_merge_continuation(
                 row, next_row, indexes, asset_cell
             )
@@ -57,9 +57,7 @@ def _try_merge_continuation(row, next_row, indexes, asset_cell):
     Returns updated (ticker, asset_cell, tx_type_cell, date_cell, tx_type, tx_date).
     """
     next_asset = _get_cell(next_row, indexes.get("asset"))
-    if not next_asset:
-        return None, asset_cell, None, None, None, None
-    merged = f"{asset_cell or ''} {next_asset}".strip()
+    merged = f"{asset_cell or ''} {next_asset or ''}".strip()
     ticker = _extract_ticker(merged)
     if not ticker:
         return None, asset_cell, None, None, None, None

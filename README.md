@@ -31,9 +31,14 @@ pip install ".[dev]"
 4. **Performance Analysis**: Ranks members by hit rate, SPY alpha, Bayesian win probability, and Sharpe ratio
 5. **Ticker Scoring**: Identifies tickers with multiple congressional buyers weighted by historical member performance, position size, and ownership type
 
-The complete House ingestion data flow, parser selection rules, persistence guarantees,
-diagnostic queries, and error catalogue are in
-[`docs/house-data-parsing.md`](docs/house-data-parsing.md).
+House ingestion documentation is split by purpose:
+
+- [`docs/house-data-parsing.md`](docs/house-data-parsing.md) describes data flow, parser
+  selection, persistence boundaries, and operational queries.
+- [`docs/house-ingestion-error-catalog.md`](docs/house-ingestion-error-catalog.md) is the
+  complete potential-error and mitigation register.
+- [`docs/HOUSE_PARSER_AUDIT.md`](docs/HOUSE_PARSER_AUDIT.md) records the dated, non-destructive
+  full local-corpus parser run and every zero-row document observed in that run.
 
 ## Architecture
 

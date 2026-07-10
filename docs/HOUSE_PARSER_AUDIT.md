@@ -31,6 +31,10 @@ The audit runner enumerated `data/*/pdfs/*.pdf`, validated each file with `_is_v
 
 ## Potential errors and limitations
 
+This section records limitations of this specific run. The canonical, severity-ranked list of
+potential ingestion errors is
+[`house-ingestion-error-catalog.md`](house-ingestion-error-catalog.md).
+
 - Every zero-row PDF is listed below. A zero result can mean a non-PTR or amendment document, an unsupported layout, a scanned disclosure that Tesseract could not read, or a real parser defect. Metadata was intentionally not consulted because this audit covered every cached PDF.
 - Docling was disabled to avoid its approximately 2 GB per-process footprint and 13-300 second per-document cost. Therefore these 440 files are candidates for the production second-pass Docling/Gemini OCR workflows, not confirmed permanent failures.
 - Parser-engine exceptions are caught internally and logged only at debug level. The outer audit observed no exceptions, but cannot distinguish a clean zero result from internally suppressed engine failures. This diagnostic gap is itself a potential observability error.
@@ -508,4 +512,3 @@ The audit runner enumerated `data/*/pdfs/*.pdf`, validated each file with `_is_v
 9116142.pdf
 9116146.pdf
 ```
-

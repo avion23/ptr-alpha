@@ -72,72 +72,14 @@ and should be audited like any nondeterministic extraction.
 - Reads exclude records where transaction date is later than disclosure date as likely OCR
   date swaps; those records remain stored and are reported only at debug log level.
 
-## Potential error modes
+## Error register and corpus evidence
 
-Treat all of the following as audit candidates, even when the command exits successfully.
-
-### Source and metadata
-
-- Network timeout, HTTP failure, rate limiting, cached HTTP response, HTML/error content, a
-  changed House URL or ZIP layout, corrupt ZIP, or the wrong first text member.
-- Empty, one-line, wrong-delimiter, renamed/missing/duplicate columns, BOM/encoding damage,
-  malformed row widths, invalid filing dates, missing names, incorrect filing type, duplicate
-  `DocID`, or a filing assigned to the wrong year.
-- Metadata refresh can be internally valid but incomplete; atomic replacement then faithfully
-  replaces the year with that incomplete upstream index.
-- A PDF may be absent from the index, indexed as non-PTR, renamed, withdrawn, amended, or
-  associated with metadata that does not match its contents.
-
-### Download and local files
-
-- Missing directory, permission/disk-full error, timeout, non-200 response, HTML masquerading
-  as a download, truncated/corrupt/encrypted PDF, or a file with a valid header but unreadable
-  body. The validity check verifies only existence, nonzero size, and the first five bytes.
-- Cached files are not checksummed or compared with the current upstream version, so a valid-
-  header stale or silently revised PDF can be reused.
-- Concurrent worker/OCR memory exhaustion, process termination, unavailable system binaries,
-  optional Python dependency failure, or platform-specific extraction differences.
-
-### Tables, rows, and cells
-
-- Backend returns no table, the wrong table, duplicated tables/pages, partial pages, reordered
-  rows, collapsed columns, or incorrectly segmented cells.
-- Header occurs after row 3, uses an unknown spelling, has fewer than two recognized labels,
-  or a two-row header is mistaken for data. Headerless fallback assumes a fixed three-column
-  layout and can silently mis-map other layouts.
-- A disclosure with only one extracted row is rejected because `parse_pdf_table()` requires at
-  least two table rows.
-- Continuation logic merges only the next row and may join unrelated rows or fail on three-way
-  splits. It activates when type and date are both missing; other partial splits can be lost.
-- Unknown transaction labels, malformed or ambiguous dates, two-digit-year normalization,
-  OCR digit swaps, missing tickers, ticker punctuation, fund/bond/private assets, and company-
-  name substring matches can cause false negatives or false positives.
-- The ticker blacklist and static company-name map are heuristic and can become stale. Company
-  renames, share classes, foreign listings, symbols that are ordinary words, and ticker reuse
-  require manual verification.
-- Owner codes outside known values are truncated to eight characters. Amount regex/range
-  parsing can miss OCR variants or infer the wrong midpoint. Generic stock options may be
-  classified as calls. Strike and expiry parsing can be absent or wrong.
-- A row is retained only when both type and date parse. Consolidation later drops invalid dates
-  without a per-row error record. Missing ticker rows can be stored, but downstream analysis
-  may be unable to use them until a ticker is resolved.
-
-### Selection, joins, and persistence
-
-- Any PDF stem that differs from metadata `DocID`, missing lookup entry, or blank member name
-  causes all its extracted transactions to be skipped.
-- The 0.7 quality threshold can select a shorter/incomplete parser result; quality ignores
-  correctness. Any nonempty text result prevents the slower OCR backends.
-- Carry-forward matching can preserve an old field onto an incorrectly matched new row, while
-  changed identity fields can prevent preservation. Deduplication can merge genuinely distinct
-  transactions or retain extraction duplicates whose key fields differ slightly.
-- Zero-row reparses intentionally preserve prior rows, which protects data from destructive
-  parsing failures but can retain records that an amended filing removed.
-- Parse-run status, transactions, and optional Gemini progress/cache are not committed as one
-  unit. A crash can leave their states inconsistent. `raw_row_count` is currently recorded as
-  zero by the deterministic pipeline and is not a useful completeness metric.
-- External scripts can use different parser versions, selection rules, or write paths. Record
-  `source`, `parser_version`, and command used when comparing results.
+The severity-ranked [`house-ingestion-error-catalog.md`](house-ingestion-error-catalog.md) is
+the canonical potential-error register. The dated
+[`HOUSE_PARSER_AUDIT.md`](HOUSE_PARSER_AUDIT.md) records observed results from a full local
+PDF-corpus run. Keep potential risks separate from observed run results: a successful parse is
+not proof of semantic correctness, while a zero-row result is not proof that a filing has no
+transactions.
 
 ## Operations and diagnostics
 

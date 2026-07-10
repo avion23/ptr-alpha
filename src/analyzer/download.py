@@ -222,24 +222,31 @@ class HouseTransactionSource(TransactionSource):
         self, year: int, results: list, member_lookup: dict,
     ) -> None:
         pdf_transactions: dict = {}
-        zero_row_doc_ids: list[str] = []
-        parse_runs: list[dict] = []
+        parse_attempts: list[tuple[str, list[str]]] = []
         for pdf_path, transactions, engines_attempted in results:
             doc_id = pdf_path.stem
             pdf_transactions[pdf_path] = transactions
-            status = "success" if transactions else "zero_rows"
-            parse_runs.append(dict(
-                doc_id=doc_id,
-                year=year,
-                parser_version="v3",
-                status=status,
-                engines_attempted=",".join(engines_attempted),
-                raw_row_count=0,
-                transaction_count=len(transactions),
-            ))
-            if not transactions:
-                zero_row_doc_ids.append(doc_id)
+            parse_attempts.append((doc_id, engines_attempted))
 
+        df = consolidate_transactions(pdf_transactions, member_lookup)
+        transaction_counts = (
+            df["doc_id"].astype(str).value_counts().to_dict()
+            if not df.empty else {}
+        )
+        parse_runs = [dict(
+            doc_id=doc_id,
+            year=year,
+            parser_version="v3",
+            status="success" if transaction_counts.get(doc_id, 0) else "zero_rows",
+            engines_attempted=",".join(engines_attempted),
+            raw_row_count=0,
+            transaction_count=transaction_counts.get(doc_id, 0),
+        ) for doc_id, engines_attempted in parse_attempts]
+
+        zero_row_doc_ids = [
+            doc_id for doc_id, _ in parse_attempts
+            if transaction_counts.get(doc_id, 0) == 0
+        ]
         stale_docs = self.db.count_transactions_for_docs(zero_row_doc_ids)
         if stale_docs:
             doc_ids = list(stale_docs)[:10]
@@ -250,7 +257,6 @@ class HouseTransactionSource(TransactionSource):
                 ", ".join(doc_ids),
             )
 
-        df = consolidate_transactions(pdf_transactions, member_lookup)
         if df.empty:
             raise ParsingError("No transactions found after parsing all PDFs")
 

@@ -152,6 +152,41 @@ def test_save_parse_results_does_not_mark_success_before_replacement(tmp_path):
     )
 
 
+def test_save_parse_results_audits_consolidated_rows(tmp_path):
+    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
+    source.db = MagicMock()
+    source.db.count_transactions_for_docs.return_value = {"dropped": 2}
+    kept_pdf = tmp_path / "kept.pdf"
+    dropped_pdf = tmp_path / "dropped.pdf"
+    consolidated = pd.DataFrame({"doc_id": ["kept"]})
+
+    with patch.object(download, "consolidate_transactions", return_value=consolidated), \
+         patch.object(download, "preserve_existing_fields", return_value=consolidated):
+        source._save_parse_results(
+            2024,
+            [
+                (kept_pdf, [_tx(), _tx()], ["pdfplumber"]),
+                (dropped_pdf, [_tx()], ["pdftotext"]),
+            ],
+            {},
+        )
+
+    source.db.count_transactions_for_docs.assert_called_once_with(["dropped"])
+    parse_runs = source.db.replace_transactions_for_docs.call_args.kwargs["parse_runs"]
+    assert parse_runs == [
+        {
+            "doc_id": "kept", "year": 2024, "parser_version": "v3",
+            "status": "success", "engines_attempted": "pdfplumber",
+            "raw_row_count": 0, "transaction_count": 1,
+        },
+        {
+            "doc_id": "dropped", "year": 2024, "parser_version": "v3",
+            "status": "zero_rows", "engines_attempted": "pdftotext",
+            "raw_row_count": 0, "transaction_count": 0,
+        },
+    ]
+
+
 def test_failed_metadata_refresh_does_not_clear_cached_rows():
     source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
     source.db = MagicMock()

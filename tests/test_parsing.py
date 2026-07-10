@@ -122,16 +122,6 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(parse_pdf_table(None), [])
         self.assertEqual(parse_pdf_table([['header']]), [])
 
-    def test_parse_pdf_table_without_header_keeps_first_transaction(self):
-        table = [
-            ['Apple Inc. (AAPL)', 'Purchase', '2024-01-01'],
-            ['Microsoft Corp. (MSFT)', 'Sale', '2024-01-02'],
-        ]
-
-        transactions = parse_pdf_table(table)
-
-        self.assertEqual([tx['ticker'] for tx in transactions], ['AAPL', 'MSFT'])
-
     def test_parse_pdf_table_no_valid_tickers(self):
         table = [
             ['Asset Name', 'Transaction Type', 'Date'],

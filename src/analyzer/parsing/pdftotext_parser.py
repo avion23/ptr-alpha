@@ -30,7 +30,7 @@ _SKIP_EXACT = {'ID', 'F', 'I', 'P', 'T', 'R', 'Cap.', 'Gains', 'CERTIFY'}
 # Transaction type pattern (shared by both regex flavors)
 _TX_TYPE = r'(?:S|P|E)(?:\s*\(partial\))?'
 # Amount pattern (handles split amounts across lines)
-_AMOUNT = r'(?:\$[\d,]+(?:\s*-\s*\$[\d,]+)?|[\-]+\$[\d,]+)'
+_AMOUNT = r'(?:\$[\d,]+(?:\s*-\s*(?:\$[\d,]+)?)?|[\-]+\$[\d,]+)'
 
 _TX_WITH_OWNER = re.compile(
     r'^\s{2,}'
@@ -55,6 +55,8 @@ _TX_CODE_INLINE = re.compile(r'\b(?:S|P|E)(?:\s*\(partial\))?\b')
 _TICKER_PARENS = re.compile(r'\([A-Za-z][A-Za-z0-9.\-]{0,5}\)')
 _OWNER_TX_HEAD = re.compile(r'^[A-Z]{1,4}\s+\S')
 _OWNER_PREFIX = re.compile(r'^[A-Z]{1,4}\s+\S')
+_AMOUNT_CONTINUATION = re.compile(r'^\$[\d,]+$')
+_SOURCE_ACCOUNT = re.compile(r'^S\s+O\s*:\s*(.+)$')
 
 
 def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
@@ -135,7 +137,7 @@ def _try_match_with_owner(line: str, i: int, lines: list[str]) -> tuple[str, str
         return None
     owner, asset, tx_type, tx_date, notif_date, amount = m.groups()
     asset = asset.strip()
-    asset, j = _collect_asset_continuation(asset, i + 1, lines)
+    asset, amount, j = _collect_transaction_continuations(asset, amount, i + 1, lines)
     return asset, owner, tx_type, tx_date, amount, j
 
 
@@ -148,8 +150,35 @@ def _try_match_no_owner(line: str, i: int, lines: list[str]) -> tuple[str, str, 
     # Skip lines where "asset" is actually a header/metadata
     if asset in _SKIP_EXACT:
         return None
-    asset, j = _collect_asset_continuation(asset, i + 1, lines)
+    asset, amount, j = _collect_transaction_continuations(asset, amount, i + 1, lines)
     return asset, "", tx_type, tx_date, amount, j
+
+
+def _collect_transaction_continuations(
+    asset: str, amount: str, start: int, lines: list[str]
+) -> tuple[str, str, int]:
+    """Collect wrapped asset, amount, and source-account text for one PTR row."""
+    asset, j = _collect_asset_continuation(asset, start, lines)
+    if amount.rstrip().endswith("-"):
+        embedded_high = re.search(r"\s+(\$[\d,]+)\s*$", asset)
+        if embedded_high:
+            amount = f"{amount.rstrip()} {embedded_high.group(1)}"
+            asset = asset[:embedded_high.start()].rstrip()
+    account = None
+    while j < len(lines):
+        line = lines[j]
+        if _TX_WITH_OWNER.match(line) or _TX_NO_OWNER.match(line):
+            break
+        stripped = line.strip()
+        if amount.rstrip().endswith("-") and _AMOUNT_CONTINUATION.fullmatch(stripped):
+            amount = f"{amount.rstrip()} {stripped}"
+        account_match = _SOURCE_ACCOUNT.match(stripped)
+        if account_match:
+            account = account_match.group(1).strip()
+        j += 1
+    if account:
+        asset = f"{asset} [Account: {account}]"
+    return asset, amount, j
 
 
 def _collect_asset_continuation(asset: str, start: int, lines: list[str]) -> tuple[str, int]:

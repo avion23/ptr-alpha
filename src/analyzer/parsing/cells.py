@@ -317,9 +317,9 @@ def _extract_owner_code(owner_cell: str | None) -> str | None:
         return "J"
     if owner.startswith("SELF"):
         return "S"
-    if owner in ("DC", "SP", "J", "S"):
+    if owner in ("DC", "SP", "JT", "J", "S"):
         return owner
-    return owner[:8]
+    return None
 
 
 def _extract_instrument_type(asset_cell: str | None) -> str:

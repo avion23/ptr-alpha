@@ -1,0 +1,2 @@
+Command: git diff --check 82a1d06..HEAD
+Result: passed with no output

@@ -41,6 +41,30 @@ potential ingestion errors is
 - The run did not call `parse_cached_pdfs`, consolidate metadata, or persist transactions. Database joins, member attribution, and write behavior were not exercised; this was required to avoid changing the live corpus.
 - Transaction counts measure emitted rows, not semantic correctness. Amounts, dates, owners, tickers, duplicate rows, and metadata linkage require separate validation.
 
+### Zero-row investigation
+
+An exhaustive `pdftotext -layout` check split the 440 documents into two reproducible
+classes:
+
+- **434 image-only scans** have no usable text layer. A representative sample is the
+  legacy, sideways checkbox PTR form. Tesseract was previously run without orientation
+  correction, so its output was inverted/rotated and unusable. The OCR backend now uses
+  Tesseract orientation detection and retries a page upright when the initial pass finds
+  no rows. Nine scanned documents known to contain transactions were rerun after this
+  fix; none emitted a transaction because the remaining legacy form requires checkbox
+  association and usually has no printed ticker. This fix therefore improves OCR input
+  but does **not** change the audited production-parser count.
+- **6 text PDFs** (`20018152`, `20019320`, `20021049`, `20021148`, `20023060`, and
+  `20025152`) contain a transaction but no resolvable public ticker. Their wrapped
+  `Spouse/DC Over $1,000,000` amount layout also falls outside the line parser. The
+  assets are private companies, bonds, or private funds, so manufacturing a ticker
+  would be incorrect; these remain intentionally unavailable to ticker-based analysis.
+
+The separate Gemini progress ledger covers 426 of these 440 document IDs: its current
+overlapping status lists include 382 completed, 44 no-transaction, and 15 error entries.
+Those model-assisted results are not part of this deterministic parser audit and must
+not be counted as parser recoveries. Fourteen audited IDs are absent from that ledger.
+
 ### All zero-row documents
 
 #### 2021 (111)

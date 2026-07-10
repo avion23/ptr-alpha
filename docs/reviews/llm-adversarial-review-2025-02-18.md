@@ -8,7 +8,7 @@ This adversarial review covers the **PTR Alpha** repository. Despite a high pass
 *   **Severity:** High (Distorts all rankings and signal scores)
 *   **Exact Reference:** `src/analyzer/signals/core.py` (Line 38-42) and `src/analyzer/signals/assembly.py` (Line 46).
 *   **Failure:** `core.py` calculates a weighted average of **logarithmic returns** (`np.log(w_vals[1:] / prev_vals)`). However, `assembly.py` treats the result as a **simple percentage return** by multiplying by 100 (`r_decayed_ret * 100`). Log returns are additive; simple returns are not. An "average log return" of 0.05 is not a 5% average return.
-*   **Test/Fix:** 
+*   **Test/Fix:**
     *   *Test:* Create a price series with 100% volatility (e.g., $100 \to $200 \to $100). The average log return is 0, but simple returns are +100% and -50%.
     *   *Fix:* Convert the weighted log-return back to a simple return using `(np.exp(r_decayed_ret) - 1) * 100` in `assembly.py`.
 
@@ -16,7 +16,7 @@ This adversarial review covers the **PTR Alpha** repository. Despite a high pass
 *   **Severity:** Critical (Irreversible data loss)
 *   **Exact Reference:** `src/analyzer/database.py`, `replace_transactions_for_docs` and `src/analyzer/parsing/metadata.py`, `consolidate_transactions`.
 *   **Failure:** The pipeline follows a "Delete-then-Insert" pattern for documents. `consolidate_transactions` drops rows with invalid dates. If a re-parse uses an engine that misinterprets a date (OCR swap), that specific row is dropped. The `replace_transactions_for_docs` method deletes **all** existing rows for that `doc_id` and only inserts the surviving (potentially empty) subset. Valid historical data is deleted because the new parse was "cleaner" but incomplete.
-*   **Test/Fix:** 
+*   **Test/Fix:**
     *   *Test:* Insert 10 rows for Doc A. Re-parse Doc A with a mock that returns only 5 rows. Observe that the DB now only has 5 rows.
     *   *Fix:* Implement a "high-water mark" check. If `new_row_count < existing_row_count * 0.8`, abort the transaction and move the document to an error queue for manual review.
 
@@ -24,7 +24,7 @@ This adversarial review covers the **PTR Alpha** repository. Despite a high pass
 *   **Severity:** Medium (False-positive signals)
 *   **Exact Reference:** `src/analyzer/parsing/cells.py`, `_TICKER_BLACKLIST`.
 *   **Failure:** The blacklist is a static `frozenset`. It is missing common OCR/Parsing artifacts that resemble tickers. Specifically, it includes "MARY" and "WISC" but omits "USD", "NAV", "DATE", and "TIME". Furthermore, `_extract_ticker` uses `re.search` for `$TICKER`. In House PDFs, a value like `$100K` will result in ticker `K` (Kellanova), creating highly weighted false signals for members "investing" in the letter K.
-*   **Test/Fix:** 
+*   **Test/Fix:**
     *   *Test:* Pass "Account Value $100K" into `_extract_ticker`. Verify it returns `K`.
     *   *Fix:* Enhance `_TICKER_BLACKLIST` with currency codes and common units. Update the regex in `cells.py` to ensure `$TICKER` is followed by a word boundary or whitespace, and reject single-letter tickers unless they are in an explicit whitelist (e.g., `F`, `T`, `V`).
 
@@ -32,7 +32,7 @@ This adversarial review covers the **PTR Alpha** repository. Despite a high pass
 *   **Severity:** Medium (Intermittent pipeline failure)
 *   **Exact Reference:** `scripts/ocr_parallel.py`, `process_one`.
 *   **Failure:** This script uses `ThreadPoolExecutor` (which is safe due to the single `db_writer` thread), but the `process_one` workers call `duckdb.connect(DB_PATH, read_only=True)`. In a multi-processing context (used by the main `parse` command via `Pool`), DuckDB will throw `duckdb.IOException: Process X holds a lock` if a write transaction is open in the main process.
-*   **Test/Fix:** 
+*   **Test/Fix:**
     *   *Fix:* Use a singleton connection pool or ensure all metadata lookups are done in the main process before spawning workers.
 
 ---

@@ -1,6 +1,10 @@
 # LLM adversarial review verification
 
-Two successful `llm` reviews were independently verified. The exact full-source prompt, response, and usage for the `gemini/gemini-flash-lite-latest` run are stored in the adjacent `llm-adversarial-review-{prompt,response,usage}.txt` files. The exact output from the separate AST-normalized all-source review is stored in `llm-adversarial-review-2025-02-18.md`.
+Two successful `llm` reviews were independently verified. Readable prompt,
+response, and usage copies are stored in the adjacent review files with trailing
+whitespace normalized. Their original byte-exact forms, including the separate
+AST-normalized all-source response, are preserved in
+`llm-review-byte-exact-artifacts.tar.gz`.
 
 ## Verified defects fixed
 

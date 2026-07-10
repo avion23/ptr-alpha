@@ -168,7 +168,7 @@ F541 [*] f-string without any placeholders
    --> scripts/ocr_zero_rows.py:585:11
     |
 583 |             print(f"    {tx['asset']} | {tx['type']} | {tx['date']} | {tx['amount_letter']}", flush=True)
-584 |     
+584 |
 585 |     print(f"\n=== DONE ===")
     |           ^^^^^^^^^^^^^^^^^
 586 |     print(f"Total inserted: {total_inserted}")
@@ -3465,7 +3465,7 @@ def score_consistency_bayes(member_rankings):
 
 def score_conviction_consistency(member_rankings):
     """Conviction-weighted consistency — rewards high-alpha consistent traders.
-    
+
     Combines consistency (prob_up * log(1+trades)) with a conviction factor
     that rewards members who have high average SPY alpha. This targets
     members who are both consistent AND generate excess returns.
@@ -3473,66 +3473,66 @@ def score_conviction_consistency(member_rankings):
     prob = member_rankings["prob_up_given_buy"].values
     trades = np.log1p(member_rankings["purchase_trades"].values)
     avg_alpha = member_rankings["avg_total_spy_alpha_pct"].values
-    
+
     consistency = prob * trades
     # Conviction: sigmoid-scaled alpha bonus (alpha > 5% gets full bonus)
     conviction = 1.0 + np.clip(avg_alpha / 10.0, -0.5, 1.0)
-    
+
     return dict(zip(member_rankings["member"], consistency * conviction))
 
 
 def score_recency_bayes(member_rankings):
     """Bayesian quality weighted by recency — hot streaks with statistical backing.
-    
+
     Combines bayes_win_prob with a recency bonus from sharpe ratio, then
     gates by trade count (minimum 3 trades for statistical relevance).
     """
     bayes = member_rankings["bayes_win_prob"].values
     trades = member_rankings["purchase_trades"].values.astype(float)
     sharpe = member_rankings["sharpe_ratio"].values
-    
+
     # Only activate for members with 3+ trades
     trade_gate = np.where(trades >= 3, 1.0, 0.3)
     recency_bonus = np.clip(1.0 + sharpe * 0.15, 0.5, 2.0)
-    
+
     return dict(zip(member_rankings["member"], bayes * trade_gate * recency_bonus))
 
 
 def score_volume_consistency(member_rankings):
     """Volume-weighted consistency — rewards high-activity consistent traders.
-    
+
     Uses log(1+trades)^2 to strongly reward volume, gated by prob_up.
     Members with many trades AND high win rate score highest.
     """
     prob = member_rankings["prob_up_given_buy"].values
     trades = np.log1p(member_rankings["purchase_trades"].values)
-    
+
     # Quadratic volume bonus: log(1+n)^2
     volume_signal = np.log1p(trades) ** 2 / 10.0  # normalize
-    
+
     return dict(zip(member_rankings["member"], prob * volume_signal))
 
 
 def score_alpha_consistency(member_rankings):
     """Alpha-gated consistency — only trades from positive-alpha members count.
-    
+
     Multiplies consistency by a hard gate: members with avg_total_spy_alpha > 0
     get full weight, negative-alpha members get penalized proportionally.
     """
     prob = member_rankings["prob_up_given_buy"].values
     trades = np.log1p(member_rankings["purchase_trades"].values)
     avg_alpha = member_rankings["avg_total_spy_alpha_pct"].values
-    
+
     consistency = prob * trades
     # Hard gate: full weight if alpha > 0, penalized if negative
     alpha_gate = np.where(avg_alpha > 0, 1.0, np.clip(0.3 + avg_alpha / 50.0, 0.1, 1.0))
-    
+
     return dict(zip(member_rankings["member"], consistency * alpha_gate))
 
 
 def score_meta_ensemble(member_rankings):
     """Ensemble of top signals — consistency * bayes * (1 + sharpe).
-    
+
     Combines the three most predictive dimensions into a single score:
     - prob_up * trades (consistency)
     - bayes_win_prob (statistical quality)
@@ -3542,10 +3542,10 @@ def score_meta_ensemble(member_rankings):
     trades = np.log1p(member_rankings["purchase_trades"].values)
     bayes = member_rankings["bayes_win_prob"].values
     sharpe = member_rankings["sharpe_ratio"].values
-    
+
     consistency = prob * trades
     quality = bayes * np.clip(1.0 + sharpe * 0.3, 0.5, 2.0)
-    
+
     return dict(zip(member_rankings["member"], consistency * quality))
 
 
@@ -4123,24 +4123,24 @@ def main():
               AND ticker NOT SIMILAR TO '[A-Z]{1,5}(\\.[AB])?'
               AND length(ticker) > 5
         """).fetchall()
-        
+
         total_updated = 0
         total_deleted = 0
         total_nulled = 0
         distinct_fixed = 0
-        
+
         con.execute("BEGIN TRANSACTION")
         in_transaction = True
         for (orig,) in rows:
             upper = orig.upper()
-            
+
             # 1. Try name-to-ticker mapping
             matched_ticker = None
             for name, ticker in sorted(NAME_TO_TICKER.items(), key=lambda x: -len(x[0])):
                 if upper.startswith(name):
                     matched_ticker = ticker
                     break
-            
+
             if matched_ticker:
                 # Check for duplicates (ticker-version already exists for same key)
                 duplicates = con.execute("""
@@ -4152,7 +4152,7 @@ def main():
                     INNER JOIN name_rows n USING (doc_id, member, transaction_date, transaction_type)
                     WHERE t.ticker=?
                 """, [orig, matched_ticker]).fetchone()[0]
-                
+
                 if duplicates > 0:
                     con.execute("""
                         DELETE FROM transactions WHERE ticker=?
@@ -4162,23 +4162,23 @@ def main():
                           )
                     """, [orig, matched_ticker])
                     total_deleted += duplicates
-                
+
                 remaining = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [orig]).fetchone()[0]
                 if remaining > 0:
                     con.execute("UPDATE transactions SET ticker=? WHERE ticker=?", [matched_ticker, orig])
                     total_updated += remaining
                     distinct_fixed += 1
                 continue
-            
+
             # 2. Cash/fund → NULL
             if is_cash_or_fund(orig):
                 cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [orig]).fetchone()[0]
                 con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [orig])
                 total_nulled += cnt
                 continue
-            
+
             # 3. No match — LEAVE ALONE (this is the bug-fix)
-        
+
         # Also handle single-token junk
         for tok in ('US', 'TREA', 'NEW', '--', 'SP'):
             cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [tok]).fetchone()[0]
@@ -4197,7 +4197,7 @@ def main():
                 total_nulled += cnt
         con.execute("COMMIT")
         in_transaction = False
-        
+
         con.execute("CHECKPOINT")
         print(f'Fixed {distinct_fixed} distinct name→ticker mappings ({total_updated} rows updated)')
         print(f'Deleted {total_deleted} duplicates after remap')
@@ -4794,15 +4794,15 @@ def main():
     print(f"Total pending: {len(pending)} (parallelism: {MAX_WORKERS})")
     if not pending:
         return
-    
+
     # Start DB writer thread
     writer_thread = threading.Thread(target=db_writer, daemon=True)
     writer_thread.start()
-    
+
     t0 = time.time()
     completed = 0
     total_inserted = 0
-    
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(process_one, item, args.refresh): item for item in pending}
         for fut in as_completed(futures):
@@ -4815,7 +4815,7 @@ def main():
                 progress["no_txs"].append(doc_id)
             else:
                 progress["errors"].append(doc_id)
-            
+
             if completed % 10 == 0 or completed == len(pending):
                 elapsed = time.time() - t0
                 rate = completed / elapsed if elapsed > 0 else 0
@@ -4823,7 +4823,7 @@ def main():
                 print(f"  [{completed}/{len(pending)}] {doc_id} ({year}) {status} +{n} | "
                       f"total {total_inserted} | {elapsed:.0f}s, ETA {eta:.0f}s")
                 save_progress(progress)
-    
+
     # Signal writer to flush and exit
     write_q.put(SENTINEL)
     writer_thread.join()
@@ -4889,35 +4889,35 @@ def parse_output(output):
     """Parse Gemini output into structured data."""
     if not output:
         return None, []
-    
+
     member = None
     transactions = []
-    
+
     for line in output.strip().split("\n"):
         line = line.strip()
         if not line:
             continue
-        
+
         # Extract MEMBER
         m = re.match(r"MEMBER:\s*(.+)", line, re.IGNORECASE)
         if m:
             member = m.group(1).strip()
             continue
-        
+
         # Skip markdown table separators and headers
         if "|" not in line or "---" in line or "ASSET" in line.upper():
             continue
-        
+
         parts = [p.strip() for p in line.split("|")]
         if len(parts) < 4:
             continue
-        
+
         asset = parts[0]
         tx_type = parts[1] if len(parts) > 1 else ""
         tx_date = parts[2] if len(parts) > 2 else ""
         notif_date = parts[3] if len(parts) > 3 else ""
         amount = parts[4] if len(parts) > 4 else ""
-        
+
         # Validate
         if not re.search(r"\d{2}/\d{2}/\d{2}", tx_date):
             continue
@@ -4932,18 +4932,18 @@ def parse_output(output):
                 tx_type = "Exchange"
             else:
                 continue
-        
+
         # Normalize Partial Sale to Sale for consistency with TransactionType enum
         if tx_type == "Partial Sale":
             tx_type = "Sale"
-        
+
         # Map amount letter
         amt_letter = ""
         amount_clean = amount.strip().upper()
         if amount_clean and amount_clean[0] in AMOUNT_MIDPOINTS:
             amt_letter = amount_clean[0]
         amt_mid = AMOUNT_MIDPOINTS.get(amt_letter)
-        
+
         transactions.append({
             "asset": asset,
             "type": tx_type,
@@ -4952,7 +4952,7 @@ def parse_output(output):
             "amount_letter": amt_letter,
             "amount_midpoint": amt_mid,
         })
-    
+
     return member, transactions
 
 def normalize_date(date_str):
@@ -5283,11 +5283,11 @@ def insert_transactions(doc_id, year, member, transactions, *, db_path: str,
             tx_date = normalize_date(tx["date"])
             notif_date = filing_date or normalize_date(tx["notif_date"]) or tx_date
             ticker = extract_ticker(tx["asset"]) or resolve_ticker(tx["asset"])
-            
+
             if not tx_date:
                 errors.append(f"bad date: {tx['date']}")
                 continue
-            
+
             # Normalize type
             tx_type = tx["type"]
             if tx_type in ("P",):
@@ -5361,19 +5361,19 @@ def main():
     pdfs = get_zero_row_pdfs()
     progress = load_progress()
     completed = set(progress["completed"] + progress["no_txs"])
-    
+
     remaining = [p for p in pdfs if p[0] not in completed]
     print(f"Total zero-row PDFs: {len(pdfs)}")
     print(f"Already processed: {len(completed)}")
     print(f"Remaining: {len(remaining)}")
-    
+
     total_inserted = 0
     for i, (doc_id, year, path) in enumerate(remaining):
         idx = i + 1
         print(f"\n[{idx}/{len(remaining)}] {doc_id} ({year})...", flush=True)
-        
+
         time.sleep(COOLDOWN)
-        
+
         output, error = call_gemini(path, doc_id=doc_id, refresh=args.refresh)
         if output is None or error:
             progress["errors"].append(doc_id)
@@ -5385,7 +5385,7 @@ def main():
                 conn.close()
             print(f"  ERROR: {error}", flush=True)
             continue
-        
+
         member, transactions = parse_output(output)
         if not transactions:
             insert_transactions(doc_id, year, member, [], db_path=DB_PATH)
@@ -5393,7 +5393,7 @@ def main():
             save_progress(progress)
             print(f"  No transactions found", flush=True)
             continue
-        
+
         raw_count = len(transactions)
         conn = duckdb.connect(DB_PATH, read_only=True)
         transactions, rejections = validate_for_insert(conn, doc_id, member, transactions)
@@ -5418,7 +5418,7 @@ def main():
         print(f"  Inserted: {inserted}/{len(transactions)} transactions (total: {total_inserted})", flush=True)
         for tx in transactions[:3]:
             print(f"    {tx['asset']} | {tx['type']} | {tx['date']} | {tx['amount_letter']}", flush=True)
-    
+
     print(f"\n=== DONE ===")
     print(f"Total inserted: {total_inserted}")
 
@@ -5438,16 +5438,16 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
         WHERE l.rn = 1 AND l.status IN ('zero_rows', 'error') AND l.year = ?
     """, [year]).fetchall()
     conn.close()
-    
+
     pdfs = [(d, y, os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf")) for d, y in rows
             if os.path.exists(os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf"))]
     print(f"Zero-row PDFs for {year}: {len(pdfs)}")
-    
+
     progress = load_progress(progress_path)
     completed = set(progress["completed"] + progress["no_txs"])
     remaining = [p for p in pdfs if p[0] not in completed]
     print(f"Remaining: {len(remaining)}")
-    
+
     total_inserted = 0
     for i, (doc_id, yr, path) in enumerate(remaining):
         print(f"\n[{i+1}/{len(remaining)}] {doc_id} ({yr})...", flush=True)
@@ -6322,30 +6322,30 @@ def parse_year(year: int, db: Database, settings: Settings):
     if not pdf_dir.exists():
         print(f"  {year}: no pdf dir, skipping")
         return 0
-    
+
     # Get metadata from DB
     src = HouseTransactionSource(settings)
     metadata = src.fetch_metadata(year)
     src.close()
-    
+
     ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
     pdf_paths, existing_docs = _filter_existing_pdfs(ptrs, pdf_dir)
     if not pdf_paths:
         print(f"  {year}: no PDFs found")
         return 0
-    
+
     member_lookup = _build_member_lookup(existing_docs)
     print(f"  {year}: parsing {len(pdf_paths)} PDFs with {settings.data.get_workers()} workers...")
     t0 = time.time()
-    
+
     with Pool(settings.data.get_workers()) as pool:
         results = pool.map(text_only_worker, pdf_paths)
-    
+
     elapsed = time.time() - t0
     success = sum(1 for _, txs, _ in results if txs)
     zero = sum(1 for _, txs, _ in results if not txs)
     print(f"  {year}: {success} with rows, {zero} zero-rows in {elapsed:.1f}s")
-    
+
     # Save parse runs
     for pdf_path, transactions, engines_attempted in results:
         doc_id = pdf_path.stem
@@ -6357,14 +6357,14 @@ def parse_year(year: int, db: Database, settings: Settings):
             engines_attempted=",".join(engines_attempted) if engines_attempted else "text-only-failed",
             raw_row_count=0, transaction_count=len(transactions),
         )
-    
+
     # Consolidate and save
     pdf_transactions = {pdf_path: txs for pdf_path, txs, _ in results}
     df = consolidate_transactions(pdf_transactions, member_lookup)
     if df.empty:
         print(f"  {year}: no transactions extracted")
         return 0
-    
+
     # Carry forward previously-resolved ticker/amount before the delete+reinsert
     # so a weaker parse does not clobber good data already in the DB.
     df = preserve_existing_fields(df, db)
@@ -6379,14 +6379,14 @@ def parse_year(year: int, db: Database, settings: Settings):
 if __name__ == "__main__":
     settings = Settings()
     db = Database(Path(settings.data.data_dir) / "congress.duckdb")
-    
+
     years = [int(y) for y in sys.argv[1:]] if len(sys.argv) > 1 else [2021, 2022, 2023, 2024, 2025, 2026]
     total = 0
     t0 = time.time()
     for year in years:
         total += parse_year(year, db, settings)
         db.conn.execute("CHECKPOINT")
-    
+
     print(f"\nDone. {total} tx inserted in {time.time()-t0:.1f}s total")
     db.close()
 

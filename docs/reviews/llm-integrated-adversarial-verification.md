@@ -1,6 +1,11 @@
 # Integrated LLM adversarial verification
 
-The exact command and response from the required follow-up `llm` invocation are stored in the adjacent `llm-integrated-adversarial-{command,response}.txt` files. Its prompt included the integrated diff from `82a1d06`, both prior exact LLM responses and the verification response, relevant full implementation/tests, and the `806 passed` result.
+Readable command and response copies from the required follow-up `llm`
+invocation are stored in the adjacent integrated-review files with trailing
+whitespace normalized. Their byte-exact originals are preserved in
+`llm-review-byte-exact-artifacts.tar.gz`. Its prompt included the integrated
+diff from `82a1d06`, both prior LLM responses and the verification response,
+relevant full implementation/tests, and the `806 passed` result.
 
 Two findings were verified and fixed:
 

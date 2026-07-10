@@ -44,6 +44,7 @@ def _compute_ticker_signals(
     r_spy_wsum: np.ndarray,
     r_spy_first: np.ndarray,
     r_spy_last: np.ndarray,
+    r_window_complete: np.ndarray,
 ) -> None:
     """Mutate pre-allocated result arrays for signals belonging to one ticker."""
     n_signals = len(t_indices)
@@ -53,6 +54,20 @@ def _compute_ticker_signals(
     # Vectorized searchsorted for all signals of this ticker at once
     t_lo = np.searchsorted(dates_ns, t_disc_ns, side="left")
     t_hi = np.searchsorted(dates_ns, t_end_ns, side="right")
+
+    # A forward-return horizon is an outcome only after both the security and
+    # benchmark datasets cover its end.  A seven-day tolerance accommodates
+    # weekends/market holidays without treating a partially elapsed horizon
+    # as a completed 30/90/180-day observation.
+    coverage_tolerance_ns = 7 * _constants._NS_PER_DAY
+    ticker_data_through = dates_ns[-1]
+    spy_data_through = spy_dates_ns[-1] if spy_dates_ns is not None and len(spy_dates_ns) else -1
+    today_ns = pd.Timestamp.now().normalize().value
+    r_window_complete[t_indices] = (
+        (t_end_ns <= today_ns)
+        & (ticker_data_through >= t_end_ns - coverage_tolerance_ns)
+        & (spy_data_through >= t_end_ns - coverage_tolerance_ns)
+    )
 
     spy_has = spy_dates_ns is not None and spy_vals is not None and spy_log_ret is not None
 
@@ -293,6 +308,7 @@ def _allocate_result_arrays(n: int) -> dict:
         "r_spy_wsum": np.zeros(n, dtype=np.float64),
         "r_spy_first": np.full(n, np.nan, dtype=np.float64),
         "r_spy_last": np.full(n, np.nan, dtype=np.float64),
+        "r_window_complete": np.zeros(n, dtype=bool),
     }
 
 
@@ -334,6 +350,7 @@ def _compute_all_ticker_signals(
             result_arrays["r_spy_wsum"],
             result_arrays["r_spy_first"],
             result_arrays["r_spy_last"],
+            result_arrays["r_window_complete"],
         )
 
 

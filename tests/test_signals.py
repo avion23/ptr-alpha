@@ -53,6 +53,28 @@ class TestCalculateSignalPotential(unittest.TestCase):
         }
         self.assertTrue(expected_cols.issubset(set(result.columns)))
 
+    def test_marks_only_fully_covered_horizons_complete(self):
+        result = calculate_signal_potential(
+            self.entry_prices.iloc[[0]], self.prices_df, [90, 180],
+        ).set_index("horizon_days")
+
+        self.assertTrue(bool(result.loc[90, "window_complete"]))
+        self.assertFalse(bool(result.loc[180, "window_complete"]))
+
+    def test_future_horizon_is_incomplete_even_with_future_prices(self):
+        disclosure = pd.Timestamp.today().normalize() - pd.Timedelta(days=10)
+        dates = pd.date_range(disclosure, disclosure + pd.Timedelta(days=40), freq="D")
+        prices = pd.DataFrame({"AAPL": 100.0, "SPY": 400.0}, index=dates)
+        entries = pd.DataFrame({
+            "member": ["Alice"], "ticker": ["AAPL"],
+            "disclosure_date": [disclosure], "transaction_type": ["Purchase"],
+            "entry_price": [100.0],
+        })
+
+        result = calculate_signal_potential(entries, prices, [30])
+
+        self.assertFalse(bool(result.iloc[0]["window_complete"]))
+
     def test_explodes_across_horizons(self):
         result = calculate_signal_potential(
             self.entry_prices, self.prices_df, [30, 60, 90],
@@ -121,6 +143,13 @@ class TestGetTopSignals(unittest.TestCase):
         top = get_top_signals(signals, horizon=90, top_n=2)
         self.assertEqual(len(top), 2)
         self.assertIn("signal_score", top.columns)
+
+    def test_excludes_non_positive_scores_from_top_signals(self):
+        signals = self._make_signals()
+        signals.loc[:, "total_return_pct"] = -10.0
+        signals.loc[:, "total_spy_alpha_pct"] = -10.0
+
+        self.assertTrue(get_top_signals(signals, horizon=90, top_n=3).empty)
 
 
 class TestGetMemberSignals(unittest.TestCase):

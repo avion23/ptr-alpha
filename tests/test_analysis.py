@@ -24,12 +24,13 @@ class TestAnalysis(unittest.TestCase):
             'amount_midpoint': [8000.5, 8000.5, 32500.5, 100000.0],
         })
 
-        dates = pd.date_range('2023-12-15', '2024-02-15', freq='D')
+        dates = pd.date_range('2023-12-15', '2024-05-15', freq='D')
         np.random.seed(42)
         self.sample_prices = pd.DataFrame({
             'AAPL': 100 + np.cumsum(np.random.randn(len(dates)) * 0.5),
             'GOOGL': 2000 + np.cumsum(np.random.randn(len(dates)) * 2),
-            'MSFT': 300 + np.cumsum(np.random.randn(len(dates)) * 1)
+            'MSFT': 300 + np.cumsum(np.random.randn(len(dates)) * 1),
+            'SPY': 400 + np.cumsum(np.random.randn(len(dates)) * 1),
         }, index=dates)
 
         self.entry_prices = make_entry_prices(self.sample_transactions, self.sample_prices)
@@ -415,11 +416,19 @@ class TestAnalysis(unittest.TestCase):
             'transaction_type': ['Purchase', 'Purchase'],
             'entry_price': [100.0, 200.0],
         })
+        price_dates = pd.date_range('2024-01-01', '2024-02-05', freq='D')
         prices = pd.DataFrame({
+<<<<<<< HEAD
             'AAPL': [100.0, 110.0, 110.0],
             'MSFT': [np.nan, np.nan, np.nan],
             'SPY': [100.0, 100.0, 100.0],
         }, index=pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-31']))
+=======
+            'AAPL': np.linspace(100.0, 110.0, len(price_dates)),
+            'MSFT': [np.nan] * len(price_dates),
+            'SPY': [100.0] * len(price_dates),
+        }, index=price_dates)
+>>>>>>> 685b892 (Fix live recommendation horizon handling)
 
         signals = calculate_signal_potential(entry_prices, prices, [30])
         rankings = rank_members(signals, horizon=30)

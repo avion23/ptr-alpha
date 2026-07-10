@@ -23,6 +23,8 @@ def _get_horizon_data(
     mask = signals_df["horizon_days"] == horizon
     if transaction_type is not None:
         mask = mask & (signals_df["signal_type"] == transaction_type)
+    if "window_complete" in signals_df.columns:
+        mask = mask & signals_df["window_complete"].fillna(False).astype(bool)
     return signals_df.loc[mask]
 
 

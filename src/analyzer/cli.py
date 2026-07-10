@@ -170,6 +170,9 @@ def _run_ticker_mode(
         print(result.data["buyers"].to_string(index=False))
         print("\n=== Signal Score ===")
         print(result.data["score"].to_string(index=False))
+        score = result.data["score"]["signal_score"].iloc[0]
+        verdict = "BUY CANDIDATE" if score > 0 else "NO BUY"
+        print(f"\nRecommendation: {verdict} (score {score:.2f})")
     raise typer.Exit(0 if result.success else 1)
 
 
@@ -196,8 +199,10 @@ def _run_tickers_mode(
     if result.success and hasattr(result, 'data') and result.data:
         data = result.data
         if not data["result"].empty:
-            print(f"\n=== Top {data['top_n']} Recent Signals (Last {data['days_back']} Days, {data['min_buyers']}+ Buyers) ===")
+            print(f"\n=== Current Buy Candidates as of {data['as_of_date']} (Last {data['days_back']} Days, {data['min_buyers']}+ Buyers) ===")
             print(data["result"].to_string(index=False))
+        else:
+            print(f"\nNo positive buy candidates as of {data['as_of_date']}.")
     raise typer.Exit(0 if result.success else 1)
 
 

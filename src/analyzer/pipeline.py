@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import wraps
 import logging
 import re
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from analyzer.exceptions import AnalyzerError, DataSourceError, AnalysisError, StepResult, DataResult
+from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
 from analyzer.models import TransactionType
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer import analysis
@@ -173,8 +173,12 @@ def run_recent_ticker_scoring(
 
     trades, prices, signals = prepare_analysis_data(transaction_source, price_source, params.year, params.horizons)
 
-    cutoff_date = trades['disclosure_date'].max() - timedelta(days=params.days_back)
-    recent_trades = trades[trades['disclosure_date'] > cutoff_date]
+    as_of_date = pd.Timestamp(date.today())
+    cutoff_date = as_of_date - timedelta(days=params.days_back)
+    disclosure_dates = pd.to_datetime(trades['disclosure_date'])
+    recent_trades = trades[
+        (disclosure_dates >= cutoff_date) & (disclosure_dates <= as_of_date)
+    ]
     logger.info("Analyzing %d transactions from last %d days", len(recent_trades), params.days_back)
 
     recent_purchases = recent_trades[recent_trades['transaction_type'] == TransactionType.PURCHASE.value]
@@ -194,9 +198,11 @@ def run_recent_ticker_scoring(
             "top_n": params.top_n,
             "days_back": params.days_back,
             "min_buyers": params.min_buyers,
+            "as_of_date": as_of_date.date(),
         })
 
     result = pd.concat(scores, ignore_index=True)
+<<<<<<< HEAD
     # This interface presents buy candidates, so rejected/negative scores must
     # not leak into the displayed recommendations merely to fill top_n.
     if "signal_score" not in result.columns:
@@ -205,12 +211,16 @@ def run_recent_ticker_scoring(
         result = result[
             pd.to_numeric(result["signal_score"], errors="coerce").fillna(0) > 0
         ]
+=======
+    result = result[result['signal_score'] > 0]
+>>>>>>> 685b892 (Fix live recommendation horizon handling)
     result = result.sort_values('signal_score', ascending=False).head(params.top_n)
     return DataResult(success=True, data={
         "result": result,
         "top_n": params.top_n,
         "days_back": params.days_back,
         "min_buyers": params.min_buyers,
+        "as_of_date": as_of_date.date(),
     })
 
 

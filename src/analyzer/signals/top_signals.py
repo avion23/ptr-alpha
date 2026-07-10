@@ -42,6 +42,7 @@ def _get_top_signals(signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 1
 
     top_data = top_data.copy()
     top_data["signal_score"] = _compute_conviction_score(top_data)
+    top_data = top_data[top_data["signal_score"] > 0]
     return top_data.nlargest(top_n, "signal_score")[_TOP_COLS]
 
 

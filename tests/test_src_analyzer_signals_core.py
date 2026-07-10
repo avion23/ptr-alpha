@@ -69,6 +69,7 @@ class TestAllocateResultArrays(unittest.TestCase):
         expected_keys = {
             "r_peak", "r_trough", "r_decayed_ret", "r_disc_baseline",
             "r_last_price", "r_spy_cum", "r_spy_wsum", "r_spy_first", "r_spy_last",
+            "r_window_complete",
         }
         self.assertEqual(set(arrays.keys()), expected_keys)
         for key, arr in arrays.items():

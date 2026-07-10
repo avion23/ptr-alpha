@@ -193,10 +193,11 @@ class TestRecentTickerScoring(unittest.TestCase):
     @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
     @patch("analyzer.pipeline.prepare_analysis_data")
     def test_scores_use_recent_trades_not_full_year_trades(self, mock_prepare, mock_score, mock_rank):
+        today = pd.Timestamp.today().normalize()
         trades = pd.DataFrame({
             "member": ["Alice", "Bob", "Old Buyer"],
             "ticker": ["AAPL", "AAPL", "AAPL"],
-            "disclosure_date": pd.to_datetime(["2024-05-01", "2024-05-02", "2024-01-01"]),
+            "disclosure_date": [today - pd.Timedelta(days=2), today - pd.Timedelta(days=1), today - pd.Timedelta(days=100)],
             "transaction_type": ["Purchase", "Purchase", "Purchase"],
         })
         signals = pd.DataFrame({
@@ -226,6 +227,34 @@ class TestRecentTickerScoring(unittest.TestCase):
         scored_trades = mock_score.call_args.args[1]
         self.assertEqual(set(scored_trades["member"]), {"Alice", "Bob"})
         self.assertNotIn("Old Buyer", set(scored_trades["member"]))
+
+    @patch("analyzer.pipeline.analysis.rank_members")
+    @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
+    @patch("analyzer.pipeline.prepare_analysis_data")
+    def test_excludes_future_trades_and_non_positive_scores(self, mock_prepare, mock_score, mock_rank):
+        today = pd.Timestamp.today().normalize()
+        trades = pd.DataFrame({
+            "member": ["Alice", "Bob", "Future"],
+            "ticker": ["AAPL", "AAPL", "MSFT"],
+            "disclosure_date": [today - pd.Timedelta(days=2), today - pd.Timedelta(days=1), today + pd.Timedelta(days=1)],
+            "transaction_type": ["Purchase"] * 3,
+        })
+        signals = pd.DataFrame({
+            "member": ["Alice"], "ticker": ["OLD"], "signal_type": ["Purchase"],
+            "horizon_days": [90], "decayed_return_pct": [1.0],
+        })
+        mock_prepare.return_value = (trades, pd.DataFrame(), signals)
+        mock_rank.return_value = pd.DataFrame()
+        mock_score.return_value = pd.DataFrame({"ticker": ["AAPL"], "signal_score": [-1.0]})
+
+        result = run_recent_ticker_scoring(
+            MagicMock(), MagicMock(),
+            TickerScoringParams(year=today.year, horizons=[90], days_back=30, min_buyers=2),
+        )
+
+        self.assertTrue(result.data["result"].empty)
+        self.assertEqual(result.data["as_of_date"], today.date())
+        self.assertNotIn("Future", set(mock_score.call_args.args[1]["member"]))
 
 
 class TestSaveResults(unittest.TestCase):

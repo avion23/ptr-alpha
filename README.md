@@ -31,6 +31,14 @@ pip install ".[dev]"
 4. **Performance Analysis**: Ranks members by hit rate, SPY alpha, Bayesian win probability, and Sharpe ratio
 5. **Ticker Scoring**: Identifies tickers with multiple congressional buyers weighted by historical member performance, position size, and ownership type
 
+Live ticker scoring uses the current date for its lookback, excludes future-dated
+disclosures and non-positive scores, and trains member rankings only on forward
+return windows whose full horizon is covered by available price data. A 180-day
+row observed after fewer than 180 days is marked `window_complete=False` and is
+not treated as a completed 180-day outcome.
+Console buy-candidate lists contain positive scores only; ticker deep dives
+print an explicit `BUY CANDIDATE` or `NO BUY` verdict.
+
 House ingestion documentation is split by purpose:
 
 - [`docs/house-data-parsing.md`](docs/house-data-parsing.md) describes data flow, parser

@@ -17,6 +17,7 @@ _FINAL_COLUMNS = [
     "member", "ticker", "disclosure_date", "signal_type", "horizon_days", "entry_price",
     "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct", "total_return_pct",
     "total_spy_alpha_pct", "decayed_spy_return_pct",
+    "window_complete",
 ]
 
 
@@ -118,6 +119,7 @@ def _build_result_data(
             derived["total_return"] - derived["actual_spy_return"]
         ) * 100,
         "decayed_spy_return_pct": derived["spy_cum"] * 100,
+        "window_complete": result_arrays["r_window_complete"],
     }
     for col in optional_columns:
         result_data[col] = signals[col].values

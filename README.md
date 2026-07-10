@@ -31,6 +31,10 @@ pip install ".[dev]"
 4. **Performance Analysis**: Ranks members by hit rate, SPY alpha, Bayesian win probability, and Sharpe ratio
 5. **Ticker Scoring**: Identifies tickers with multiple congressional buyers weighted by historical member performance, position size, and ownership type
 
+The complete House ingestion data flow, parser selection rules, persistence guarantees,
+diagnostic queries, and error catalogue are in
+[`docs/house-data-parsing.md`](docs/house-data-parsing.md).
+
 ## Architecture
 
 ```
@@ -117,7 +121,12 @@ Analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv`
 
 - The House Clerk publishes only a filing index; the PTR PDFs must be downloaded and parsed.
 - Parsing uses a deterministic parser cascade with an optional Gemini OCR fallback. Gemini OCR output is validated and cached under `data/gemini_cache/`.
+- A successful metadata refresh replaces that year's metadata atomically. Parsed rows are
+  replaced atomically only for documents that produced consolidated rows; zero-row documents
+  retain existing rows and emit a stale-row warning when applicable.
 - Transactions carry a `source` provenance column (`house_pdf`, `capitol_trades`, or `gemini_ocr`); old pre-migration rows may have `NULL` source.
+- Inspect `pdf_parse_runs` after every parse. A zero-row result is not proof that a filing has
+  no trades, and parser success does not prove every row or field was extracted correctly.
 - `ptr-alpha validate` does train-only parameter selection with Benjamini-Hochberg snooping correction and Newey-West statistics. As of 2026-07, no configuration shows statistically significant alpha.
 
 ## Tests

@@ -72,7 +72,7 @@ def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
     if not transactions:
         return []
 
-    table = [['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']] + transactions
+    table = [['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date', 'Amount']] + transactions
     return [table]
 
 
@@ -106,15 +106,15 @@ def _parse_pdftotext_lines(lines: list[str]) -> list[list[str]]:
 
         matched = _try_match_with_owner(line, i, lines)
         if matched is not None:
-            asset, tx_type, tx_date, amount, j = matched
-            transactions.append([asset, tx_type, tx_date, amount])
+            asset, owner, tx_type, tx_date, amount, j = matched
+            transactions.append([asset, owner, tx_type, tx_date, amount])
             i = j
             continue
 
         matched = _try_match_no_owner(line, i, lines)
         if matched is not None:
-            asset, tx_type, tx_date, amount, j = matched
-            transactions.append([asset, tx_type, tx_date, amount])
+            asset, owner, tx_type, tx_date, amount, j = matched
+            transactions.append([asset, owner, tx_type, tx_date, amount])
             i = j
             continue
 
@@ -129,17 +129,17 @@ def _is_skip_line(line: str) -> bool:
     return any(stripped.startswith(s) for s in _SKIP_PREFIXES)
 
 
-def _try_match_with_owner(line: str, i: int, lines: list[str]) -> tuple[str, str, str, str, int] | None:
+def _try_match_with_owner(line: str, i: int, lines: list[str]) -> tuple[str, str, str, str, str, int] | None:
     m = _TX_WITH_OWNER.match(line)
     if not m:
         return None
     owner, asset, tx_type, tx_date, notif_date, amount = m.groups()
     asset = asset.strip()
     asset, j = _collect_asset_continuation(asset, i + 1, lines)
-    return asset, tx_type, tx_date, amount, j
+    return asset, owner, tx_type, tx_date, amount, j
 
 
-def _try_match_no_owner(line: str, i: int, lines: list[str]) -> tuple[str, str, str, str, int] | None:
+def _try_match_no_owner(line: str, i: int, lines: list[str]) -> tuple[str, str, str, str, str, int] | None:
     m = _TX_NO_OWNER.match(line)
     if not m:
         return None
@@ -149,7 +149,7 @@ def _try_match_no_owner(line: str, i: int, lines: list[str]) -> tuple[str, str, 
     if asset in _SKIP_EXACT:
         return None
     asset, j = _collect_asset_continuation(asset, i + 1, lines)
-    return asset, tx_type, tx_date, amount, j
+    return asset, "", tx_type, tx_date, amount, j
 
 
 def _collect_asset_continuation(asset: str, start: int, lines: list[str]) -> tuple[str, int]:

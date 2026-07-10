@@ -97,6 +97,16 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(parse_pdf_table(None), [])
         self.assertEqual(parse_pdf_table([['header']]), [])
 
+    def test_parse_pdf_table_without_header_keeps_first_transaction(self):
+        table = [
+            ['Apple Inc. (AAPL)', 'Purchase', '2024-01-01'],
+            ['Microsoft Corp. (MSFT)', 'Sale', '2024-01-02'],
+        ]
+
+        transactions = parse_pdf_table(table)
+
+        self.assertEqual([tx['ticker'] for tx in transactions], ['AAPL', 'MSFT'])
+
     def test_parse_pdf_table_no_valid_tickers(self):
         table = [
             ['Asset Name', 'Transaction Type', 'Date'],
@@ -133,6 +143,19 @@ class TestParsing(unittest.TestCase):
         content = "DocID\tFirst\tLast\n12345\tJohn\tDoe\n"
 
         with self.assertRaises(ParsingError):
+            normalize_house_metadata(content)
+
+    def test_normalize_house_metadata_strips_utf8_bom(self):
+        content = "\ufeffDocID\tFirst\tLast\tFilingDate\n123\tJane\tDoe\t2024-01-01\n"
+
+        df = normalize_house_metadata(content)
+
+        self.assertEqual(df.iloc[0]['DocID'], '123')
+
+    def test_normalize_house_metadata_requires_identity_columns(self):
+        content = "DocID\tFirst\tFilingDate\n123\tJane\t2024-01-01\n"
+
+        with self.assertRaisesRegex(ParsingError, "Last"):
             normalize_house_metadata(content)
 
     def test_consolidate_transactions_valid(self):

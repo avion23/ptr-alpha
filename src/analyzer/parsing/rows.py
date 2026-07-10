@@ -107,7 +107,9 @@ def parse_pdf_table(table: list) -> list[dict]:
 
     header_idx = _find_header_row(table)
     if header_idx is None:
-        header_idx = 0
+        # Some extraction backends return only data rows.  Treating row zero as
+        # a header silently discarded the first disclosure in that case.
+        return _extract_transactions(table, {"asset": 0, "type": 1, "date": 2})
 
     # Pass next row for 2-row header detection
     next_header_row = table[header_idx + 1] if header_idx + 1 < len(table) else None

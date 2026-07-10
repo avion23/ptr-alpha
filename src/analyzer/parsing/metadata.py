@@ -23,7 +23,13 @@ def normalize_house_metadata(content: str) -> pd.DataFrame:
     if len(lines) < 2:
         raise ParsingError("Insufficient metadata lines")
 
-    header = [col.strip() for col in lines[0].split('\t')]
+    header = [col.strip() for col in lines[0].lstrip("\ufeff").split('\t')]
+    required = {"DocID", "First", "Last", "FilingDate"}
+    missing = required.difference(header)
+    if missing:
+        raise ParsingError(f"Missing required metadata column(s): {', '.join(sorted(missing))}")
+    if len(header) != len(set(header)):
+        raise ParsingError("Duplicate metadata column names")
     data = _parse_metadata_rows(lines[1:], header)
 
     if not data:

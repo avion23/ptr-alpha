@@ -71,6 +71,21 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(transactions[0]['transaction_date'], '01/15/2024')
         self.assertEqual(transactions[0]['amount_raw'], '$1,001 - $15,000')
 
+    def test_parse_pdf_table_merges_transaction_split_across_three_rows(self):
+        table = [
+            ['Asset', 'Type', 'Date', 'Amount'],
+            ['Berkshire Hathaway', '', '', ''],
+            ['Class B (BRK.B)', '', '', ''],
+            ['', 'Purchase', '01/15/2024', '$1,001 - $15,000'],
+            ['Apple Inc. (AAPL)', 'Sale', '01/16/2024', '$15,001 - $50,000'],
+        ]
+
+        transactions = parse_pdf_table(table)
+
+        self.assertEqual([tx['ticker'] for tx in transactions], ['BRK.B', 'AAPL'])
+        self.assertEqual(transactions[0]['asset_description'], 'Berkshire Hathaway Class B (BRK.B)')
+        self.assertEqual(transactions[0]['amount_raw'], '$1,001 - $15,000')
+
     def test_parse_pdf_table_house_owner_and_amount_columns(self):
         table = [
             ['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date', 'Notification Date', 'Amount'],
@@ -435,6 +450,28 @@ class TestParsing(unittest.TestCase):
         with self.assertRaises(ParsingError):
             normalize_house_metadata(content)
 
+    def test_normalize_house_metadata_rejects_extra_columns(self):
+        content = "DocID\tFirst\tLast\tFilingDate\n001\tJohn\tDoe\t2024-01-01\tshifted\n"
+
+        with self.assertRaisesRegex(ParsingError, "No data rows"):
+            normalize_house_metadata(content)
+
+    def test_normalize_house_metadata_rejects_blank_doc_id(self):
+        content = "DocID\tFirst\tLast\tFilingDate\n\tJohn\tDoe\t2024-01-01\n"
+
+        with self.assertRaisesRegex(ParsingError, "Blank DocID"):
+            normalize_house_metadata(content)
+
+    def test_normalize_house_metadata_rejects_duplicate_doc_ids(self):
+        content = (
+            "DocID\tFirst\tLast\tFilingDate\n"
+            "001\tJohn\tDoe\t2024-01-01\n"
+            "001\tJane\tRoe\t2024-01-02\n"
+        )
+
+        with self.assertRaisesRegex(ParsingError, "Duplicate DocID"):
+            normalize_house_metadata(content)
+
     def test_parse_pdf_table_single_letter_ticker(self):
         table = [
             ['Asset', 'Type', 'Date'],
@@ -514,6 +551,19 @@ class TestParsing(unittest.TestCase):
             ['Apple Inc. (AAPL)', 'Self', 'Purchase', '2024-01-01'],
         ]
         self.assertEqual(_find_header_row(table), 2)
+
+    def test_find_header_row_after_introductory_rows(self):
+        table = [
+            ['Periodic Transaction Report'],
+            ['Member Name'],
+            ['Status'],
+            ['Filing ID'],
+            ['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date'],
+            ['Apple Inc. (AAPL)', 'Self', 'Purchase', '2024-01-01'],
+        ]
+
+        self.assertEqual(_find_header_row(table), 4)
+        self.assertEqual([tx['ticker'] for tx in parse_pdf_table(table)], ['AAPL'])
 
     def test_find_header_row_returns_none_when_no_match(self):
         table = [

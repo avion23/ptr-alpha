@@ -136,16 +136,39 @@ def _data_start_offset(table: list, header_idx: int, next_header_row: list | Non
 
 def _extract_transactions(data_rows: list, indexes: dict[str, int]) -> list[dict]:
     results: list[dict] = []
-    skip_next = False
-    for i, row in enumerate(data_rows):
-        if skip_next:
-            skip_next = False
-            continue
-        next_row = data_rows[i + 1] if i + 1 < len(data_rows) else None
-        tx, merged = _process_row(row, indexes, next_row)
+    i = 0
+    while i < len(data_rows):
+        row = data_rows[i]
+        next_rows = data_rows[i + 1:i + 4]
+        tx, consumed = _process_with_continuations(row, next_rows, indexes)
         if tx:
             results.append(tx)
-            # If we merged with next_row via continuation, skip it to avoid duplicate
-            if merged:
-                skip_next = True
+        i += consumed + 1
     return results
+
+
+def _process_with_continuations(row: list, next_rows: list[list], indexes: dict[str, int]) -> tuple[dict | None, int]:
+    """Process a row and up to three physical continuation rows."""
+    next_row = next_rows[0] if next_rows else None
+    tx, merged = _process_row(row, indexes, next_row)
+    if tx or not next_rows:
+        return tx, int(merged)
+
+    combined = list(row)
+    asset_index = indexes.get("asset")
+    if asset_index is None:
+        return None, 0
+
+    for offset, candidate in enumerate(next_rows[:-1], start=1):
+        if _extract_transaction_type(_get_cell(candidate, indexes.get("type"))) or _extract_date(
+            _get_cell(candidate, indexes.get("date"))
+        ):
+            break
+        while len(combined) <= asset_index:
+            combined.append("")
+        combined[asset_index] = f"{_get_cell(combined, asset_index) or ''} {_get_cell(candidate, asset_index) or ''}".strip()
+        final_row = next_rows[offset]
+        tx, merged = _process_row(combined, indexes, final_row)
+        if tx and merged:
+            return tx, offset + 1
+    return None, 0

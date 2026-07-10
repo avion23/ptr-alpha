@@ -46,18 +46,26 @@ def _parse_metadata_rows(lines: list[str], header: list[str]) -> list[list[str]]
         if not line.strip():
             continue
         row = [col.strip() for col in line.split('\t')]
-        if len(row) >= len(header):
-            data.append(row[:len(header)])
+        if len(row) == len(header):
+            data.append(row)
         else:
             n_dropped += 1
     if n_dropped:
-        logger.warning(f"Dropped {n_dropped} metadata row(s) with fewer columns than header ({len(header)})")
+        logger.warning(f"Dropped {n_dropped} metadata row(s) with a column count different from header ({len(header)})")
     return data
 
 
 def _validate_filing_dates(df: pd.DataFrame) -> pd.DataFrame:
     if 'FilingDate' not in df.columns:
         raise ParsingError("Missing FilingDate column in metadata")
+
+    doc_ids = df['DocID'].astype(str).str.strip()
+    if (doc_ids == '').any():
+        raise ParsingError("Blank DocID in metadata")
+    duplicates = doc_ids[doc_ids.duplicated()].unique()
+    if len(duplicates):
+        raise ParsingError(f"Duplicate DocID(s) in metadata: {', '.join(duplicates[:5])}")
+    df['DocID'] = doc_ids
 
     df['FilingDate'] = pd.to_datetime(df['FilingDate'], errors='coerce')
     df = df.dropna(subset=['FilingDate'])

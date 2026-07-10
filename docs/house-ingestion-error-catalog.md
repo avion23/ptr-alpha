@@ -17,9 +17,9 @@ This catalog covers the House metadata-to-database path. It is an operational ri
 | UTF-8 BOM on first metadata header | Medium | Regression test | BOM is removed | Other encodings are decoded as UTF-8 with invalid bytes silently discarded |
 | Duplicate metadata headers | High | `ParsingError` | Entire file rejected | None known |
 | Metadata row has fewer columns than header | High | Warning with dropped-row count | Malformed row is skipped | Silent omission if warnings are not monitored; no doc IDs in warning |
-| Metadata row has extra columns or embedded tabs | High | Not explicitly detected | Extra fields are truncated | Column shift can misattribute names/dates/doc IDs |
+| Metadata row has extra columns or embedded tabs | High | Column-count validation and warning | Malformed row is dropped rather than truncated | Row is omitted; warning has no DocID because its alignment is untrusted |
 | Invalid filing date | High | Coercion then row drop; all-invalid file raises | Bad rows excluded | Partial loss is not summarized or thresholded |
-| Duplicate or blank DocID | High | Not explicitly validated here | Passed to repository upsert | Collisions/blank IDs can overwrite or create bad PDF paths depending on DB constraints |
+| Duplicate or blank DocID | High | Metadata validation | Entire metadata file is rejected before persistence | Duplicate IDs cannot currently represent amendments as separate records |
 | Wrong/missing `FilingType` | High | Later filtering or missing-column exception | Only exact PTR value is parsed | Case/schema drift can omit every filing |
 | Filing is absent, withdrawn, amended, renamed, assigned to another year, or indexed as non-PTR | High | Reconcile metadata and PDFs with the House source | Exact PTR metadata drives selection | Cached transactions/PDFs can outlive upstream changes; no amendment lineage is modeled |
 | Metadata refresh contains fewer valid rows than prior snapshot | Critical | No count/coverage guard | Valid refresh atomically replaces the year | A truncated but syntactically valid upstream file can delete cached metadata |
@@ -37,11 +37,11 @@ This catalog covers the House metadata-to-database path. It is an operational ri
 | Different engines return conflicting rows | High | Not detected | One engine wins; results are not reconciled | Wrong ticker/date/type/amount can look valid and persist |
 | Multiple tables/pages | High | Backend-specific | pdfplumber/lattice/Tesseract aggregate tables | Stream, pdftotext, Docling return the first table producing rows and can omit later tables |
 | Header absent | Medium | No header found | Default columns 0/1/2; first row retained, including a one-row table | Nonstandard column order is silently misparsed |
-| Header appears after first three rows | High | Not detected | Treated as headerless data | Transactions may be lost or fields shifted |
+| Header appears after first three rows | High | First ten rows are scanned | Introductory rows before a header are skipped | Headers after row ten are treated as headerless data |
 | Two-row header resembles data | Medium | Heuristic core-column test | May merge headers and skip both rows | False header classification can skip first transaction |
 | Unknown, misspelled, or reordered columns | High | Core mapping fallback | Defaults to asset/type/date positions | Owner/amount can be lost; incorrect dates/types can attach to another field |
 | Short/ragged row | Medium | Missing cells yield `None`; `IndexError` suppressed | Invalid rows are dropped | No per-row error count or source coordinates |
-| Split transaction spans more than two rows | High | Not detected | Only one following continuation row is merged | Transaction omitted or asset truncated |
+| Split transaction spans more than two rows | High | Parser lookahead | Up to three following physical rows are considered, without crossing a row containing transaction fields | Longer splits can still be omitted or truncated |
 | Split row already contains a ticker | Medium | Regression test | It is merged when type/date are on the next row | A next row belonging to another transaction can be consumed if it supplies plausible fields |
 | Duplicate transaction rows/pages | High | No parser-level deduplication | Sent to repository | Database key/upsert semantics may collapse some duplicates; genuine same-day same-type trades are hard to distinguish |
 | Ticker punctuation/length outside regex or company map | Medium | Ticker becomes null | Transaction may still persist | Foreign/exotic tickers and OCR variants are missed |

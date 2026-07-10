@@ -116,7 +116,7 @@ def _find_amount_in_row(row: list) -> str | None:
     return None
 
 
-def _find_header_row(table: list, max_scan: int = 3) -> int | None:
+def _find_header_row(table: list, max_scan: int = 10) -> int | None:
     """Scan the first `max_scan` rows for one that contains known column headers."""
     for i, row in enumerate(table[:max_scan]):
         matches = sum(1 for cell in row if _normalize_header(str(cell)) in KNOWN_HEADERS)

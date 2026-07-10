@@ -452,6 +452,10 @@ class TestParsing(unittest.TestCase):
             normalize_house_metadata(
                 header + "1\tA\tOne\t01/01/2024\tP\n1\tB\tTwo\t01/02/2024\tP"
             )
+        duplicate = normalize_house_metadata(
+            header + "1\tA\tOne\t01/01/2024\tP\n1\tA\tOne\t01/01/2024\tP"
+        )
+        self.assertEqual(len(duplicate), 1)
 
     def test_normalize_house_metadata_drops_extra_column_rows(self):
         content = (

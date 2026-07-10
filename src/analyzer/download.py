@@ -350,21 +350,42 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
 
 
 def _read_first_text_from_zip(zip_bytes: bytes, year: int) -> str:
-    """Open the metadata ZIP and return the first .txt file's content."""
+    """Open the metadata ZIP and return its unambiguous metadata text member."""
     with zipfile.ZipFile(BytesIO(zip_bytes)) as z:
         text_files = [f for f in z.namelist() if f.lower().endswith(".txt") and not f.endswith("/")]
         if not text_files:
             raise ParsingError(f"No text files found in metadata ZIP for {year}")
-        preferred = [f for f in text_files if str(year) in Path(f).stem]
-        selected = preferred[0] if len(preferred) == 1 else text_files[0]
-        with z.open(selected) as f:
-            raw = f.read()
-        try:
-            return raw.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
+        decoded: dict[str, str] = {}
+        for name in text_files:
+            with z.open(name) as f:
+                raw = f.read()
+            try:
+                decoded[name] = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                # Historical names can contain Windows-1252 punctuation. This
+                # fallback preserves every byte instead of silently dropping it.
+                logger.warning("Metadata text file %s is Windows-1252, not UTF-8", name)
+                decoded[name] = raw.decode("cp1252")
+
+        required = {"DocID", "First", "Last", "FilingDate"}
+        candidates = []
+        for name, content in decoded.items():
+            lines = content.splitlines()
+            if not lines:
+                continue
+            header = {c.strip().lstrip("\ufeff") for c in lines[0].split("\t")}
+            if required.issubset(header):
+                candidates.append(name)
+        if not candidates:
+            raise ParsingError(f"No House metadata table found in ZIP for {year}")
+        preferred = [name for name in candidates if str(year) in Path(name).stem]
+        if len(preferred) == 1:
+            return decoded[preferred[0]]
+        if len(candidates) != 1:
             raise ParsingError(
-                f"Metadata text file {selected!r} is not valid UTF-8 for {year}"
-            ) from exc
+                f"Ambiguous metadata ZIP for {year}: {', '.join(candidates[:10])}"
+            )
+        return decoded[candidates[0]]
 
 
 def _filter_existing_pdfs(ptrs: pd.DataFrame, pdf_dir: Path) -> tuple[list[Path], pd.DataFrame]:
@@ -379,14 +400,17 @@ def _filter_existing_pdfs(ptrs: pd.DataFrame, pdf_dir: Path) -> tuple[list[Path]
 
 def _build_member_lookup(existing_docs: pd.DataFrame) -> dict:
     """Map doc_id -> {First, Last, FilingDate} for downstream transaction join."""
-    duplicate_ids = existing_docs.loc[
-        existing_docs["DocID"].astype(str).duplicated(keep=False), "DocID"
+    identity_columns = ["DocID", "First", "Last", "FilingDate"]
+    distinct = existing_docs[identity_columns].drop_duplicates()
+    duplicate_ids = distinct.loc[
+        distinct["DocID"].astype(str).duplicated(keep=False), "DocID"
     ].astype(str).unique()
     if len(duplicate_ids):
         raise ParsingError(
             "Duplicate metadata DocID(s) would make member attribution ambiguous: "
             + ", ".join(duplicate_ids[:10])
         )
+    existing_docs = distinct.drop_duplicates(subset=["DocID"])
     return dict(zip(
         existing_docs["DocID"].values,
         [{"First": f, "Last": last, "FilingDate": d} for f, last, d in zip(

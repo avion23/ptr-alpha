@@ -136,19 +136,40 @@ def test_failed_metadata_refresh_does_not_clear_cached_rows():
     )
 
 
-def test_metadata_zip_accepts_uppercase_txt_and_rejects_bad_encoding(tmp_path):
+def test_metadata_zip_accepts_uppercase_txt_and_windows_1252(tmp_path):
     import io
     import zipfile
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
-        archive.writestr("2024FD.TXT", "DocID\tFirst\n1\tAda")
+        archive.writestr("2024FD.TXT", "DocID\tFirst\tLast\tFilingDate\n1\tAda\tLovelace\t2024-01-01")
     assert download._read_first_text_from_zip(buf.getvalue(), 2024).startswith("DocID")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
-        archive.writestr("2024FD.txt", b"DocID\tFirst\n1\t\xff")
-    with pytest.raises(ParsingError, match="not valid UTF-8"):
+        archive.writestr(
+            "2024FD.txt",
+            b"DocID\tFirst\tLast\tFilingDate\n1\tRen\xe9\tDoe\t2024-01-01",
+        )
+    assert "René" in download._read_first_text_from_zip(buf.getvalue(), 2024)
+
+
+def test_metadata_zip_selects_table_not_readme_and_rejects_ambiguity():
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("README.txt", "instructions")
+        archive.writestr("2024FD.txt", "DocID\tFirst\tLast\tFilingDate\n1\tA\tOne\t2024-01-01")
+    assert download._read_first_text_from_zip(buf.getvalue(), 2024).startswith("DocID")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        header = "DocID\tFirst\tLast\tFilingDate\n"
+        archive.writestr("one.txt", header + "1\tA\tOne\t2024-01-01")
+        archive.writestr("two.txt", header + "2\tB\tTwo\t2024-01-02")
+    with pytest.raises(ParsingError, match="Ambiguous metadata ZIP"):
         download._read_first_text_from_zip(buf.getvalue(), 2024)
 
 
@@ -172,6 +193,14 @@ def test_member_lookup_rejects_ambiguous_duplicate_doc_id():
     })
     with pytest.raises(ParsingError, match="member attribution ambiguous"):
         download._build_member_lookup(docs)
+
+
+def test_member_lookup_allows_identical_duplicate_doc_id():
+    docs = pd.DataFrame({
+        "DocID": ["1", "1"], "First": ["A", "A"], "Last": ["One", "One"],
+        "FilingDate": ["2024-01-01", "2024-01-01"],
+    })
+    assert download._build_member_lookup(docs)["1"]["First"] == "A"
 
 
 @pytest.mark.asyncio

@@ -12,14 +12,14 @@ This catalog covers the House metadata-to-database path. It is an operational ri
 |---|---|---|---|---|
 | Metadata HTTP failure, timeout, non-200 response | High | Exception and command failure | Existing cached rows remain; refresh replacement occurs only after download and validation | Cache may be stale; no retry/backoff in this layer |
 | HTTP cache serves an obsolete but valid response | High | Compare `fetched_at`, upstream index, and prior snapshot | Cache expires after one hour | A revised upstream index can be missed within the cache window |
-| Response is not a ZIP, ZIP is corrupt, or has no `.txt` member | High | ZIP/`ParsingError` propagated as `DataSourceError` | No database replacement | Uppercase `.TXT` is accepted and a uniquely year-named member is preferred; archives with several plausible text members remain ambiguous |
+| Response is not a ZIP, ZIP is corrupt, or has no `.txt` member | High | ZIP/`ParsingError` propagated as `DataSourceError` | No database replacement | Uppercase `.TXT` is accepted; members are identified by required headers and ambiguous tables are rejected |
 | Metadata is empty, header-only, or lacks identity/date columns | High | `ParsingError` | Rejected before persistence | A syntactically valid but semantically wrong text member may pass |
-| UTF-8 BOM on first metadata header | Medium | Regression test | BOM is removed | Non-UTF-8 metadata is rejected rather than silently deleting bytes; a genuine upstream encoding change requires explicit support |
+| UTF-8 BOM on first metadata header | Medium | Regression test | BOM is removed | Windows-1252 is decoded with a warning rather than silently deleting bytes; other encodings require explicit support |
 | Duplicate metadata headers | High | `ParsingError` | Entire file rejected | None known |
 | Metadata row has fewer columns than header | High | Warning with dropped-row count and up to ten document IDs | Malformed row is skipped | Silent omission if warnings are not monitored |
 | Metadata row has extra columns or embedded tabs | High | Column-count validation, warning, and up to ten document IDs | Rows with extra fields are dropped rather than truncated | A malformed row is omitted; only the first ten affected IDs appear in logs |
 | Invalid filing date | High | Warning with dropped-row count and up to ten document IDs; all-invalid file raises | Bad rows excluded | Partial loss is not thresholded |
-| Duplicate or blank DocID | High | Validation error before persistence | The metadata refresh is rejected; legacy duplicate cache rows are also rejected before member lookup | Operators must repair legacy bad cache rows |
+| Duplicate or blank DocID | High | Validation error before persistence | Conflicting duplicates reject the refresh or lookup; identical duplicates are safely collapsed | Operators must repair legacy bad cache rows |
 | Wrong/missing `FilingType` | High | Missing column is rejected during House download | Only exact PTR value is parsed | Case/value drift can still omit filings |
 | Filing is absent, withdrawn, amended, renamed, assigned to another year, or indexed as non-PTR | High | Reconcile metadata and PDFs with the House source | Exact PTR metadata drives selection | Cached transactions/PDFs can outlive upstream changes; no amendment lineage is modeled |
 | Metadata refresh contains fewer valid rows than prior snapshot | Critical | No count/coverage guard | Valid refresh atomically replaces the year | A truncated but syntactically valid upstream file can delete cached metadata |

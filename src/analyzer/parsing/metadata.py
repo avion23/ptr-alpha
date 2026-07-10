@@ -39,11 +39,20 @@ def normalize_house_metadata(content: str) -> pd.DataFrame:
     doc_ids = df["DocID"].astype(str).str.strip()
     if (doc_ids == "").any():
         raise ParsingError("Blank DocID in metadata")
-    duplicates = doc_ids[doc_ids.duplicated(keep=False)].unique()
-    if len(duplicates):
-        sample = ", ".join(duplicates[:5])
+    duplicate_mask = doc_ids.duplicated(keep=False)
+    unique_duplicate_rows = (
+        df.loc[duplicate_mask].assign(DocID=doc_ids[duplicate_mask]).drop_duplicates()
+    )
+    conflicting_ids = unique_duplicate_rows.loc[
+        unique_duplicate_rows["DocID"].duplicated(keep=False), "DocID"
+    ].unique()
+    if len(conflicting_ids):
+        sample = ", ".join(conflicting_ids[:5])
         raise ParsingError(f"Duplicate DocID(s) in metadata: {sample}")
     df["DocID"] = doc_ids
+    if duplicate_mask.any():
+        logger.warning("Removed %d identical duplicate metadata row(s)", int(df.duplicated().sum()))
+        df = df.drop_duplicates()
     return _validate_filing_dates(df)
 
 

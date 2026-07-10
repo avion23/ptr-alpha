@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
@@ -203,8 +204,7 @@ def test_member_lookup_allows_identical_duplicate_doc_id():
     assert download._build_member_lookup(docs)["1"]["First"] == "A"
 
 
-@pytest.mark.asyncio
-async def test_pdf_batch_failure_is_reported_to_caller(tmp_path):
+def test_pdf_batch_failure_is_reported_to_caller(tmp_path):
     source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
     source.fetch_metadata = MagicMock(return_value=pd.DataFrame({
         "DocID": ["1"], "FilingType": [FilingType.PTR.value],
@@ -216,7 +216,7 @@ async def test_pdf_batch_failure_is_reported_to_caller(tmp_path):
     ))
 
     with pytest.raises(DataSourceError, match="Failed to download 1 of 1"):
-        await source._fetch_and_cache_pdfs_async(2024)
+        asyncio.run(source._fetch_and_cache_pdfs_async(2024))
 
 
 def _refresh_context():

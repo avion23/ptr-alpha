@@ -209,6 +209,9 @@ class Database:
     def clear_metadata(self, year: int) -> None:
         self.metadata.clear(year)
 
+    def replace_metadata(self, year: int, df: pd.DataFrame) -> None:
+        self.metadata.replace_year(year, df)
+
     def upsert_transactions(self, df: pd.DataFrame, *, source: str) -> None:
         self.transactions.upsert(df, source=source)
 

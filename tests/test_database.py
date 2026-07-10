@@ -31,6 +31,27 @@ class TestDatabaseSchema(DatabaseTestCase):
 
 class TestMetadata(DatabaseTestCase):
 
+    def test_replace_metadata_is_atomic_and_removes_stale_rows(self):
+        old = pd.DataFrame([
+            {"doc_id": "old", "first_name": "Old", "last_name": "Row",
+             "filing_date": datetime(2024, 1, 1), "filing_type": "P",
+             "fetched_at": datetime(2024, 1, 2)},
+            {"doc_id": "other-year", "first_name": "Other", "last_name": "Row",
+             "filing_date": datetime(2023, 1, 1), "filing_type": "P",
+             "fetched_at": datetime(2023, 1, 2)},
+        ])
+        fresh = pd.DataFrame([
+            {"doc_id": "fresh", "first_name": "Fresh", "last_name": "Row",
+             "filing_date": datetime(2024, 2, 1), "filing_type": "P",
+             "fetched_at": datetime(2024, 2, 2)},
+        ])
+        self.db.upsert_metadata(old)
+
+        self.db.replace_metadata(2024, fresh)
+
+        self.assertEqual(self.db.get_metadata(2024)["DocID"].tolist(), ["fresh"])
+        self.assertEqual(self.db.get_metadata(2023)["DocID"].tolist(), ["other-year"])
+
     def test_upsert_and_get_metadata_round_trip(self):
         df = pd.DataFrame([
             {

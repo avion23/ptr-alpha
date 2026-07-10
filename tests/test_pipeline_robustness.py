@@ -11,6 +11,7 @@ from analyzer.cli import app
 from analyzer.exceptions import StepResult
 from analyzer.exceptions import ParsingError
 from analyzer.models import FilingType
+from analyzer.exceptions import DataSourceError
 
 
 def _tx(transaction_date="2024-01-02", amount_midpoint=1000.0):
@@ -117,6 +118,21 @@ def test_save_parse_results_warns_when_zero_row_doc_retains_db_rows(caplog, tmp_
 
     source.db.count_transactions_for_docs.assert_called_once_with(["123"])
     assert "1 docs parsed to zero rows but retain 3 existing DB rows (stale?): 123" in caplog.text
+
+
+def test_failed_metadata_refresh_does_not_clear_cached_rows():
+    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
+    source.db = MagicMock()
+    source.metadata_url_template = "https://example.test/{year}.zip"
+    source._download_and_upsert_metadata = MagicMock(side_effect=OSError("bad zip"))
+
+    with pytest.raises(DataSourceError):
+        source.fetch_metadata(2024, refresh=True)
+
+    source.db.clear_metadata.assert_not_called()
+    source._download_and_upsert_metadata.assert_called_once_with(
+        2024, "https://example.test/2024.zip", replace=True,
+    )
 
 
 def _refresh_context():

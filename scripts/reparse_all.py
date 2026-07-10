@@ -4,7 +4,9 @@ Skips Docling and tesseract OCR; only uses pdfplumber/camelot/pdftotext.
 Used to recover from DB corruption without re-running slow OCR.
 """
 from __future__ import annotations
-import os, sys, time
+import os
+import sys
+import time
 from pathlib import Path
 
 # Must set env BEFORE importing analyzer (it may import OCR libs lazily)
@@ -94,11 +96,9 @@ def parse_year(year: int, db: Database, settings: Settings):
     # so a weaker parse does not clobber good data already in the DB.
     df = preserve_existing_fields(df, db)
 
-    # Delete any existing tx for these doc_ids first
-    for doc_id in df["doc_id"].unique():
-        db.delete_transactions_for_doc(doc_id)
-
-    db.upsert_transactions(df, source="house_pdf")
+    # Delete and insert in one transaction so a malformed replacement cannot
+    # destroy the previously parsed rows.
+    db.replace_transactions_for_docs(df, source="house_pdf")
     print(f"  {year}: saved {len(df)} transactions")
     return len(df)
 

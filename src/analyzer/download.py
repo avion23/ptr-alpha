@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import re
 import zipfile
 from datetime import datetime
 from io import BytesIO
@@ -73,18 +72,17 @@ class HouseTransactionSource(TransactionSource):
             logger.info(f"Loading cached metadata for {year}")
             return self.db.get_metadata(year)
 
-        if refresh:
-            self.db.clear_metadata(year)
-
         metadata_url = self.metadata_url_template.format(year=year)
         try:
-            return self._download_and_upsert_metadata(year, metadata_url)
+            return self._download_and_upsert_metadata(year, metadata_url, replace=refresh)
         except requests.RequestException as e:
             raise DataSourceError(f"Failed to fetch metadata for {year}: {e}")
         except Exception as e:
             raise DataSourceError(f"Failed to fetch metadata for {year}: {e}")
 
-    def _download_and_upsert_metadata(self, year: int, metadata_url: str) -> pd.DataFrame:
+    def _download_and_upsert_metadata(
+        self, year: int, metadata_url: str, *, replace: bool = False,
+    ) -> pd.DataFrame:
         logger.info(f"Downloading metadata for {year} from House disclosures")
         response = self.session.get(metadata_url, timeout=30)
         if response.status_code != 200:
@@ -105,7 +103,10 @@ class HouseTransactionSource(TransactionSource):
             }
         )
 
-        self.db.upsert_metadata(df)
+        if replace:
+            self.db.replace_metadata(year, df)
+        else:
+            self.db.upsert_metadata(df)
         logger.info(f"Cached metadata for {year}: {len(df)} records")
         return self.db.get_metadata(year)
 

@@ -26,6 +26,20 @@ class MetadataRepository:
                 fetched_at = EXCLUDED.fetched_at
         """)
 
+    def replace_year(self, year: int, df: pd.DataFrame) -> None:
+        """Atomically replace one year's metadata after a successful download."""
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute(
+                "DELETE FROM metadata WHERE EXTRACT(YEAR FROM filing_date) = ?",
+                [year],
+            )
+            self.upsert(df)
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
     def get_by_year(self, year: int) -> pd.DataFrame:
         result = self.conn.execute(
             """

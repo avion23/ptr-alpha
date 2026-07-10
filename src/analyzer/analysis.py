@@ -6,8 +6,6 @@ import logging
 
 import pandas as pd
 
-logger = logging.getLogger(__name__)
-
 from analyzer.models import TransactionType  # noqa: F401 — re-exported for backward compat
 
 from analyzer.signals import (  # noqa: F401
@@ -63,6 +61,8 @@ from analyzer.backtest import (  # noqa: F401
 
 from analyzer.sector_data import load_sector_data
 from analyzer.exceptions import AnalysisError
+
+logger = logging.getLogger(__name__)
 
 
 def analyze_by_sector(

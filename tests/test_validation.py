@@ -14,7 +14,6 @@ import pytest
 from analyzer.validation import (
     SweepResult,
     newey_west_tstat,
-    run_single_backtest,
     select_config,
     sweep_configs,
     run_validation,
@@ -397,7 +396,7 @@ class TestRunValidationConfigFreezing:
 
     def test_test_evaluation_uses_train_selected_config(self, tmp_path, monkeypatch):
         """The TEST backtest must use every parameter from the TRAIN-selected config."""
-        from analyzer.validation import run_validation, _backtest_core
+        from analyzer.validation import run_validation
         monkeypatch.chdir(tmp_path)
 
         # Synthetic selected config returned by mock sweep

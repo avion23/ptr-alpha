@@ -392,9 +392,6 @@ class TestAnalysis(unittest.TestCase):
 
         # Manually compute the collapsed weighted-average return for Alice's episode:
         # (-10 * 1000 + -6 * 2000 + -8 * 1000) / (1000 + 2000 + 1000) = -7.0
-        collapsed_alice_return = -7.0
-        bob_return = 5.0
-        carol_return = -10.0
 
         # Collapsed episodes: 3 (Alice collapsed, Bob, Carol)
         # P(return < 0) = 2/3 (Alice -7.0 and Carol -10.0 are negative)

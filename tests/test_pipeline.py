@@ -1,4 +1,5 @@
 import unittest
+import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -469,8 +470,6 @@ if __name__ == "__main__":
 # Pytest-style tests (use caplog fixture — cannot use unittest.TestCase here)
 # ---------------------------------------------------------------------------
 
-import logging
-import pytest
 
 
 def test_pipeline_step_logs_analyzer_error(caplog):

@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 from typer.testing import CliRunner
 
 from analyzer.cli import app, setup_logging, _print_portfolio_metrics
-from analyzer.pipeline import AnalysisParams, BacktestParams
+from analyzer.pipeline import BacktestParams
 from analyzer.exceptions import StepResult
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

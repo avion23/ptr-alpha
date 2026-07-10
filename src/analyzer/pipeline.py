@@ -202,7 +202,7 @@ def run_recent_ticker_scoring(
         })
 
     result = pd.concat(scores, ignore_index=True)
-# This interface presents buy candidates, so rejected/negative scores must
+    # This interface presents buy candidates, so rejected/negative scores must
     # not leak into the displayed recommendations merely to fill top_n.
     if "signal_score" not in result.columns:
         result = result.iloc[0:0]

@@ -61,12 +61,13 @@ def _compute_ticker_signals(
     # as a completed 30/90/180-day observation.
     coverage_tolerance_ns = 7 * _constants._NS_PER_DAY
     ticker_data_through = dates_ns[-1]
-    spy_data_through = spy_dates_ns[-1] if spy_dates_ns is not None and len(spy_dates_ns) else -1
+    has_benchmark = spy_dates_ns is not None and len(spy_dates_ns) > 0
+    spy_data_through = spy_dates_ns[-1] if has_benchmark else 0
     today_ns = pd.Timestamp.now().normalize().value
     r_window_complete[t_indices] = (
         (t_end_ns <= today_ns)
         & (ticker_data_through >= t_end_ns - coverage_tolerance_ns)
-        & (spy_data_through >= t_end_ns - coverage_tolerance_ns)
+        & ((not has_benchmark) | (spy_data_through >= t_end_ns - coverage_tolerance_ns))
     )
 
     spy_has = spy_dates_ns is not None and spy_vals is not None and spy_log_ret is not None

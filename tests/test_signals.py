@@ -75,6 +75,16 @@ class TestCalculateSignalPotential(unittest.TestCase):
 
         self.assertFalse(bool(result.iloc[0]["window_complete"]))
 
+    def test_absolute_return_window_can_complete_without_spy(self):
+        prices = self.prices_df[["AAPL"]]
+        result = calculate_signal_potential(
+            self.entry_prices.iloc[[0]], prices, [90],
+        )
+
+        self.assertTrue(bool(result.iloc[0]["window_complete"]))
+        self.assertTrue(np.isfinite(result.iloc[0]["total_return_pct"]))
+        self.assertTrue(np.isnan(result.iloc[0]["total_spy_alpha_pct"]))
+
     def test_explodes_across_horizons(self):
         result = calculate_signal_potential(
             self.entry_prices, self.prices_df, [30, 60, 90],

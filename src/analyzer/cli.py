@@ -194,6 +194,7 @@ def _run_ticker_mode(
 def _run_tickers_mode(
     app_ctx: AppContext, year: int, horizons: list[int], threshold: float,
     days_back: int, min_buyers: int, top_n: int, output: str,
+    training_lookback_days: int, as_of_date: date | None,
 ) -> None:
     """Handle --mode tickers."""
     if output == "csv":
@@ -205,6 +206,8 @@ def _run_tickers_mode(
         days_back=days_back,
         min_buyers=min_buyers,
         top_n=top_n,
+        training_lookback_days=training_lookback_days,
+        as_of_date=as_of_date,
     )
     result = run_recent_ticker_scoring(
         app_ctx.transaction_source,
@@ -237,7 +240,7 @@ def _run_sales_mode(
 
 def _run_analysis_mode(
     app_ctx: AppContext, year: int, horizons: list[int], threshold: float,
-    member: str | None, top_n: int, mode: str, output: str,
+    member: str | None, top_n: int, mode: str, output: str, sectors: bool,
 ) -> None:
     """Handle ranks/signals/member modes via run_analysis_pipeline."""
     show_signals = mode == "signals"
@@ -248,6 +251,7 @@ def _run_analysis_mode(
         member_filter=member,
         top_n=top_n,
         show_signals=show_signals,
+        include_sector_analysis=sectors,
     )
     data_path = Path(app_ctx.settings.data.data_dir)
     result = run_analysis_pipeline(
@@ -283,6 +287,15 @@ def analyze(
     days_back: int = typer.Option(28, help="Days back for ticker scoring"),
     min_buyers: int = typer.Option(3, help="Minimum buyers for ticker scoring"),
     top_n: int = typer.Option(20, help="Number of results to show"),
+    training_lookback_days: int = typer.Option(
+        1095, help="Historical days used to train live ticker rankings",
+    ),
+    as_of: str | None = typer.Option(
+        None, help="Live ticker scoring date (YYYY-MM-DD; defaults to today)",
+    ),
+    sectors: bool = typer.Option(
+        False, "--sectors", help="Fetch optional sector metadata for rank output",
+    ),
     output: str = typer.Option("console", help="Output format: console or csv"),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
@@ -301,22 +314,34 @@ def analyze(
         days_back=days_back,
         min_buyers=min_buyers,
         top_n=top_n,
+        training_lookback_days=training_lookback_days,
     )
     if not horizons or any(horizon <= 0 for horizon in horizons):
         print("Error: --horizons values must be greater than zero", file=sys.stderr)
         raise typer.Exit(1)
     _validate_output(output)
+    try:
+        as_of_date = date.fromisoformat(as_of) if as_of else None
+    except ValueError:
+        print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
+        raise typer.Exit(1)
     app_ctx = get_context(ctx, data_dir, read_only=False)
     _check_data_freshness(app_ctx)
 
     if ticker:
         _run_ticker_mode(app_ctx, mode, ticker, year, horizons, threshold, output)
     elif mode == "tickers":
-        _run_tickers_mode(app_ctx, year, horizons, threshold, days_back, min_buyers, top_n, output)
+        _run_tickers_mode(
+            app_ctx, year, horizons, threshold, days_back, min_buyers, top_n,
+            output, training_lookback_days, as_of_date,
+        )
     elif mode == "sales":
         _run_sales_mode(app_ctx, year, horizons, top_n, output)
     else:
-        _run_analysis_mode(app_ctx, year, horizons, threshold, member, top_n, mode, output)
+        _run_analysis_mode(
+            app_ctx, year, horizons, threshold, member, top_n, mode, output,
+            sectors,
+        )
 
 
 

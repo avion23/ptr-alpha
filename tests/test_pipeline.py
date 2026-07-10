@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 import logging
 import tempfile
 from pathlib import Path
@@ -11,6 +12,7 @@ from analyzer.pipeline import (
     TickerAnalysisParams,
     TickerScoringParams,
     prepare_analysis_data,
+    prepare_live_analysis_data,
     pipeline_step,
     run_recent_ticker_scoring,
 )
@@ -170,9 +172,43 @@ class TestPrepareAnalysisData(unittest.TestCase):
 
 class TestRecentTickerScoring(unittest.TestCase):
 
+    @patch("analyzer.pipeline.analysis.calculate_signal_potential")
+    def test_live_training_loads_history_and_caps_all_data_at_as_of(self, mock_calc):
+        source = MagicMock()
+        prices = MagicMock()
+        as_of = pd.Timestamp("2026-07-10")
+        source.db.get_transactions_by_date_range.return_value = pd.DataFrame({
+            "member": ["Historical", "Recent", "Future"],
+            "ticker": ["AAPL", "MSFT", "TSLA"],
+            "disclosure_date": pd.to_datetime([
+                "2024-08-01", "2026-07-01", "2026-07-11",
+            ]),
+            "transaction_type": ["Purchase"] * 3,
+        })
+        prices.get_prices.return_value = pd.DataFrame(
+            {"AAPL": [100.0], "MSFT": [200.0], "SPY": [500.0]},
+            index=[as_of],
+        )
+        source.db.get_entry_prices.return_value = pd.DataFrame()
+        mock_calc.return_value = pd.DataFrame({
+            "disclosure_date": pd.to_datetime(["2024-08-01", "2026-07-01"]),
+        })
+
+        trades, _, signals = prepare_live_analysis_data(
+            source, prices, (180,), as_of, 1095,
+        )
+
+        self.assertEqual(set(trades["member"]), {"Historical", "Recent"})
+        self.assertEqual(len(signals), 2)
+        _, query_end = source.db.get_transactions_by_date_range.call_args.args
+        self.assertEqual(query_end, as_of)
+        _, price_start, price_end = prices.get_prices.call_args.args
+        self.assertLess(price_start, pd.Timestamp("2024-08-01"))
+        self.assertEqual(price_end, as_of)
+
     @patch("analyzer.pipeline.analysis.rank_members")
     @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
-    @patch("analyzer.pipeline.prepare_analysis_data")
+    @patch("analyzer.pipeline.prepare_live_analysis_data")
     def test_does_not_present_negative_scores_as_buys(self, mock_prepare, mock_score, mock_rank):
         trades = pd.DataFrame({
             "member": ["Alice", "Bob"], "ticker": ["AAPL", "AAPL"],
@@ -185,14 +221,14 @@ class TestRecentTickerScoring(unittest.TestCase):
 
         result = run_recent_ticker_scoring(
             MagicMock(), MagicMock(),
-            TickerScoringParams(year=2024, horizons=[90], days_back=30, min_buyers=2),
+            TickerScoringParams(year=2024, horizons=[90], days_back=30, min_buyers=2, as_of_date=date(2024, 5, 15)),
         )
 
         self.assertTrue(result.data["result"].empty)
 
     @patch("analyzer.pipeline.analysis.rank_members")
     @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
-    @patch("analyzer.pipeline.prepare_analysis_data")
+    @patch("analyzer.pipeline.prepare_live_analysis_data")
     def test_scores_use_recent_trades_not_full_year_trades(self, mock_prepare, mock_score, mock_rank):
         today = pd.Timestamp.today().normalize()
         trades = pd.DataFrame({
@@ -222,7 +258,7 @@ class TestRecentTickerScoring(unittest.TestCase):
             "signal_score": [1.0],
         })
 
-        result = run_recent_ticker_scoring(MagicMock(), MagicMock(), TickerScoringParams(year=2024, horizons=[90], days_back=30, min_buyers=2))
+        result = run_recent_ticker_scoring(MagicMock(), MagicMock(), TickerScoringParams(year=today.year, horizons=[90], days_back=30, min_buyers=2))
 
         self.assertTrue(result)
         scored_trades = mock_score.call_args.args[1]
@@ -231,7 +267,7 @@ class TestRecentTickerScoring(unittest.TestCase):
 
     @patch("analyzer.pipeline.analysis.rank_members")
     @patch("analyzer.pipeline.analysis.score_ticker_by_buyers")
-    @patch("analyzer.pipeline.prepare_analysis_data")
+    @patch("analyzer.pipeline.prepare_live_analysis_data")
     def test_excludes_future_trades_and_non_positive_scores(self, mock_prepare, mock_score, mock_rank):
         today = pd.Timestamp.today().normalize()
         trades = pd.DataFrame({

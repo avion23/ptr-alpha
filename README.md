@@ -31,8 +31,9 @@ pip install ".[dev]"
 4. **Performance Analysis**: Ranks members by hit rate, SPY alpha, Bayesian win probability, and Sharpe ratio
 5. **Ticker Scoring**: Identifies tickers with multiple congressional buyers weighted by historical member performance, position size, and ownership type
 
-Live ticker scoring uses the current date for its lookback, excludes future-dated
-disclosures and non-positive scores, and trains member rankings only on forward
+Live ticker scoring uses the current date (or explicit `--as-of`) for its
+lookback, excludes future-dated disclosures and non-positive scores, and trains
+member rankings over `--training-lookback-days` only on forward
 return windows whose full horizon is covered by available price data. A 180-day
 row observed after fewer than 180 days is marked `window_complete=False` and is
 not treated as a completed 180-day outcome.
@@ -128,7 +129,7 @@ Modules follow a layered design: `cli.py` handles presentation and formatting, `
 | `ptr-alpha validate --train-start 2022-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2025-06-30` | Select parameters on the train window, then evaluate once on the test window. |
 | `ptr-alpha validate --full-grid` | Run the larger validation parameter grid. |
 
-Analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` where supported. `--top-n` limits rank output as well as signal output. Ticker scoring also accepts `--days-back` and `--min-buyers`. Counts, horizons, lookback windows, and simulation capital must be greater than zero; invalid values fail before the database is opened.
+Analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` where supported. `--top-n` limits rank output as well as signal output. Ticker scoring also accepts `--days-back`, `--min-buyers`, `--training-lookback-days`, and `--as-of`. Optional network-backed sector enrichment is disabled unless `--sectors` is supplied. Counts, horizons, lookback windows, and simulation capital must be greater than zero; invalid values fail before the database is opened.
 
 Portfolio win rate, average holding period, and turnover are reported as `N/A` when the simulation ends with no closed trades. Open positions still contribute to final marked-to-market value, but they cannot produce closed-trade statistics.
 

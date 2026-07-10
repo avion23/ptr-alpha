@@ -28,6 +28,7 @@ class AnalysisParams:
     member_filter: str | None = None
     top_n: int | None = None
     show_signals: bool = False
+    include_sector_analysis: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,8 @@ class TickerScoringParams:
     days_back: int = 28
     min_buyers: int = 3
     top_n: int = 15
+    training_lookback_days: int = 1095
+    as_of_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +110,49 @@ def prepare_analysis_data(
 
     return trades, prices, signals
 
+
+def prepare_live_analysis_data(
+    transaction_source,
+    price_source,
+    horizons: tuple[int, ...],
+    as_of_date: pd.Timestamp,
+    training_lookback_days: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build live features from historical data available by ``as_of_date``."""
+    history_start = as_of_date - timedelta(days=training_lookback_days + max(horizons))
+    trades = transaction_source.db.get_transactions_by_date_range(
+        history_start, as_of_date,
+    )
+    if trades.empty:
+        raise DataSourceError("No trading data found through as-of date")
+
+    disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
+    trades = trades[
+        trades["ticker"].notna()
+        & disclosure_dates.notna()
+        & (disclosure_dates <= as_of_date)
+    ].copy()
+    if trades.empty:
+        raise DataSourceError("No valid tickers found through as-of date")
+
+    price_start = history_start - timedelta(days=30)
+    prices = price_source.get_prices(
+        trades["ticker"].unique(), price_start, as_of_date,
+    )
+    entry_prices = transaction_source.db.get_entry_prices(
+        trades["ticker"].unique().tolist(), price_start, as_of_date,
+    )
+    signals = analysis.calculate_signal_potential(entry_prices, prices, horizons)
+
+    # Outcomes before the training boundary are needed only to cover their
+    # forward horizon; they must not influence member ranking themselves.
+    training_start = as_of_date - timedelta(days=training_lookback_days)
+    signal_dates = pd.to_datetime(signals["disclosure_date"], errors="coerce")
+    signals = signals[
+        (signal_dates >= training_start) & (signal_dates <= as_of_date)
+    ].copy()
+    return trades, prices, signals
+
 @pipeline_step
 def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
     transaction_source.fetch_and_cache_pdfs(year)
@@ -128,7 +174,11 @@ def run_analysis_pipeline(
     table = analysis.get_analysis_table(signals, params.member_filter, params.show_signals, params.horizons[0], params.top_n, params.threshold)
     logger.info("Generated analysis table with %d rows", len(table))
 
-    sector_results = analysis.analyze_by_sector(trades, signals, params.horizons)
+    sector_results = (
+        analysis.analyze_by_sector(trades, signals, params.horizons)
+        if params.include_sector_analysis
+        else None
+    )
     return DataResult(success=True, data={
         "table": table,
         "sector_results": sector_results,
@@ -171,9 +221,19 @@ def run_recent_ticker_scoring(
     if params.days_back < 1:
         raise DataSourceError("days_back must be at least 1")
 
-    trades, prices, signals = prepare_analysis_data(transaction_source, price_source, params.year, params.horizons)
+    if params.training_lookback_days < 1:
+        raise DataSourceError("training_lookback_days must be at least 1")
 
-    as_of_date = pd.Timestamp(date.today())
+    as_of_date = pd.Timestamp(params.as_of_date or date.today()).normalize()
+    if as_of_date.year != params.year:
+        raise DataSourceError("year must match the as-of date year")
+    trades, prices, signals = prepare_live_analysis_data(
+        transaction_source,
+        price_source,
+        params.horizons,
+        as_of_date,
+        params.training_lookback_days,
+    )
     cutoff_date = as_of_date - timedelta(days=params.days_back)
     disclosure_dates = pd.to_datetime(trades['disclosure_date'])
     recent_trades = trades[

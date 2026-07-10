@@ -36,12 +36,20 @@ def normalize_house_metadata(content: str) -> pd.DataFrame:
         raise ParsingError("No data rows in metadata")
 
     df = pd.DataFrame(data, columns=header)
+    doc_ids = df["DocID"].astype(str).str.strip()
+    if (doc_ids == "").any():
+        raise ParsingError("Blank DocID in metadata")
+    duplicates = doc_ids[doc_ids.duplicated(keep=False)].unique()
+    if len(duplicates):
+        sample = ", ".join(duplicates[:5])
+        raise ParsingError(f"Duplicate DocID(s) in metadata: {sample}")
+    df["DocID"] = doc_ids
     return _validate_filing_dates(df)
 
 
 def _parse_metadata_rows(lines: list[str], header: list[str]) -> list[list[str]]:
     data: list[list[str]] = []
-    n_dropped = 0
+    malformed: list[str] = []
     for line in lines:
         if not line.strip():
             continue
@@ -49,9 +57,12 @@ def _parse_metadata_rows(lines: list[str], header: list[str]) -> list[list[str]]
         if len(row) == len(header):
             data.append(row)
         else:
-            n_dropped += 1
-    if n_dropped:
-        logger.warning(f"Dropped {n_dropped} metadata row(s) with a column count different from header ({len(header)})")
+            malformed.append(row[header.index("DocID")] if len(row) > header.index("DocID") else "<unknown>")
+    if malformed:
+        logger.warning(
+            "Dropped %d metadata row(s) with a column count different from header (%d); doc IDs: %s",
+            len(malformed), len(header), ", ".join(malformed[:10]),
+        )
     return data
 
 
@@ -59,14 +70,12 @@ def _validate_filing_dates(df: pd.DataFrame) -> pd.DataFrame:
     if 'FilingDate' not in df.columns:
         raise ParsingError("Missing FilingDate column in metadata")
 
-    doc_ids = df['DocID'].astype(str).str.strip()
-    if (doc_ids == '').any():
-        raise ParsingError("Blank DocID in metadata")
-    duplicates = doc_ids[doc_ids.duplicated()].unique()
-    if len(duplicates):
-        raise ParsingError(f"Duplicate DocID(s) in metadata: {', '.join(duplicates[:5])}")
-    df['DocID'] = doc_ids
-
+    invalid = pd.to_datetime(df['FilingDate'], errors='coerce').isna()
+    if invalid.any():
+        logger.warning(
+            "Dropped %d metadata row(s) with invalid filing dates; doc IDs: %s",
+            int(invalid.sum()), ", ".join(df.loc[invalid, "DocID"].astype(str).head(10)),
+        )
     df['FilingDate'] = pd.to_datetime(df['FilingDate'], errors='coerce')
     df = df.dropna(subset=['FilingDate'])
 
@@ -119,5 +128,10 @@ def consolidate_transactions(pdf_transactions: dict[Path, list[dict]], member_me
     df = pd.DataFrame(all_transactions)
     df['transaction_date'] = pd.to_datetime(df['transaction_date'], errors='coerce')
     df['disclosure_date'] = pd.to_datetime(df['disclosure_date'], errors='coerce')
-
-    return df.dropna(subset=['transaction_date', 'disclosure_date'])
+    invalid = df[['transaction_date', 'disclosure_date']].isna().any(axis=1)
+    if invalid.any():
+        logger.warning(
+            "Dropped %d consolidated transaction(s) with invalid dates; doc IDs: %s",
+            int(invalid.sum()), ", ".join(df.loc[invalid, 'doc_id'].astype(str).unique()[:10]),
+        )
+    return df.loc[~invalid].copy()

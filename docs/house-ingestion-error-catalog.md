@@ -12,22 +12,22 @@ This catalog covers the House metadata-to-database path. It is an operational ri
 |---|---|---|---|---|
 | Metadata HTTP failure, timeout, non-200 response | High | Exception and command failure | Existing cached rows remain; refresh replacement occurs only after download and validation | Cache may be stale; no retry/backoff in this layer |
 | HTTP cache serves an obsolete but valid response | High | Compare `fetched_at`, upstream index, and prior snapshot | Cache expires after one hour | A revised upstream index can be missed within the cache window |
-| Response is not a ZIP, ZIP is corrupt, or has no `.txt` member | High | ZIP/`ParsingError` propagated as `DataSourceError` | No database replacement | Uppercase `.TXT` is not recognized; first matching member is selected without semantic validation |
+| Response is not a ZIP, ZIP is corrupt, or has no `.txt` member | High | ZIP/`ParsingError` propagated as `DataSourceError` | No database replacement | Uppercase `.TXT` is accepted and a uniquely year-named member is preferred; archives with several plausible text members remain ambiguous |
 | Metadata is empty, header-only, or lacks identity/date columns | High | `ParsingError` | Rejected before persistence | A syntactically valid but semantically wrong text member may pass |
-| UTF-8 BOM on first metadata header | Medium | Regression test | BOM is removed | Other encodings are decoded as UTF-8 with invalid bytes silently discarded |
+| UTF-8 BOM on first metadata header | Medium | Regression test | BOM is removed | Non-UTF-8 metadata is rejected rather than silently deleting bytes; a genuine upstream encoding change requires explicit support |
 | Duplicate metadata headers | High | `ParsingError` | Entire file rejected | None known |
-| Metadata row has fewer columns than header | High | Warning with dropped-row count | Malformed row is skipped | Silent omission if warnings are not monitored; no doc IDs in warning |
-| Metadata row has extra columns or embedded tabs | High | Column-count validation and warning | Malformed row is dropped rather than truncated | Row is omitted; warning has no DocID because its alignment is untrusted |
-| Invalid filing date | High | Coercion then row drop; all-invalid file raises | Bad rows excluded | Partial loss is not summarized or thresholded |
-| Duplicate or blank DocID | High | Metadata validation | Entire metadata file is rejected before persistence | Duplicate IDs cannot currently represent amendments as separate records |
-| Wrong/missing `FilingType` | High | Later filtering or missing-column exception | Only exact PTR value is parsed | Case/schema drift can omit every filing |
+| Metadata row has fewer columns than header | High | Warning with dropped-row count and up to ten document IDs | Malformed row is skipped | Silent omission if warnings are not monitored |
+| Metadata row has extra columns or embedded tabs | High | Column-count validation, warning, and up to ten document IDs | Rows with extra fields are dropped rather than truncated | A malformed row is omitted; only the first ten affected IDs appear in logs |
+| Invalid filing date | High | Warning with dropped-row count and up to ten document IDs; all-invalid file raises | Bad rows excluded | Partial loss is not thresholded |
+| Duplicate or blank DocID | High | Validation error before persistence | The metadata refresh is rejected; legacy duplicate cache rows are also rejected before member lookup | Operators must repair legacy bad cache rows |
+| Wrong/missing `FilingType` | High | Missing column is rejected during House download | Only exact PTR value is parsed | Case/value drift can still omit filings |
 | Filing is absent, withdrawn, amended, renamed, assigned to another year, or indexed as non-PTR | High | Reconcile metadata and PDFs with the House source | Exact PTR metadata drives selection | Cached transactions/PDFs can outlive upstream changes; no amendment lineage is modeled |
 | Metadata refresh contains fewer valid rows than prior snapshot | Critical | No count/coverage guard | Valid refresh atomically replaces the year | A truncated but syntactically valid upstream file can delete cached metadata |
-| PDF HTTP failure/timeout | High | Download result and summary count | Existing valid PDF is retained; failed new file is not installed | Overall fetch does not fail solely because individual downloads fail |
+| PDF HTTP failure/timeout | High | Download result, summary count, and command failure | Existing valid PDF is retained; failed new file is not installed; any incomplete batch fails the fetch | Successfully downloaded files remain cached for retry |
 | HTTP 200 contains HTML/error bytes | High | `%PDF-` signature check | Rejected | Signature-only checks cannot detect truncated/corrupt PDFs |
-| Process dies while writing PDF | Medium | `.pdf.tmp` may remain | Temporary write plus atomic `os.replace` protects final file | Temporary files are not cleaned automatically |
+| Process dies while writing PDF | Medium | `.pdf.tmp` may remain | Temporary write plus atomic `os.replace` protects final file; ordinary failures clean temporary files | An uncatchable process termination can leave a temporary file |
 | PDF directory is unwritable or storage is full | High | `OSError`/download error result and summary | Failed temporary write is not installed as the final PDF | Other downloads can succeed, leaving incomplete year coverage |
-| Existing PDF begins `%PDF-` but is truncated/corrupt | High | Parser engines fail or yield zero rows | Old DB rows are retained and warning is emitted | Download is skipped, so corruption is not self-healed |
+| Existing PDF begins `%PDF-` but is truncated/corrupt | High | Parser engines fail or yield zero rows | Old DB rows are retained and warning is emitted | Signature-invalid cached files are treated as missing and downloaded again; signature-valid truncation still needs parser detection |
 | Missing PDF directory / no files | High | `DataSourceError` | Parse stops without transaction replacement | Missing subset of PDFs is only visible through counts/logs |
 | Parser dependency absent (pdftotext, Ghostscript, OCR/Docling) | Medium | Engine debug logs; usually zero rows | Cascade continues to other engines | Debug-only diagnostics and `engines_attempted` do not distinguish unavailable from no match |
 | Dependency/version/platform differences change extraction | High | Re-run fixtures/corpus under pinned environments and compare per-document output | Deterministic ordering within one environment | Native PDF tools and OCR can emit different tables without an exception |
@@ -58,9 +58,9 @@ This catalog covers the House metadata-to-database path. It is an operational ri
 | Asset description over 500 characters | Low | Deterministic truncation | Bounded storage | Useful identifier/details beyond limit are lost; description is not consolidated into final dataframe |
 | Metadata lookup missing for parsed doc | High | Warning with doc ID/count | All its transactions are skipped | Partial batch can still be saved; no failure threshold |
 | Member first/last absent | High | Warning | Transactions skipped | Name changes/suffixes are not a stable member identity |
-| Duplicate DocID maps to different members | Critical | Not detected in lookup construction | Last dictionary entry wins | Transactions can be attributed to the wrong member |
+| Duplicate DocID maps to different members | Critical | Metadata and lookup validation | Refresh or parsing is rejected before attribution | Operators must repair legacy duplicate cache rows |
 | Consolidated required transaction keys absent | Medium | `KeyError` aborts save | No transaction replacement has occurred yet | Parse-run records may already have been written, producing misleading status |
-| Consolidated date coercion drops rows | High | Not reported | Invalid transaction/disclosure dates removed | Partial data loss can be silent and can turn a document into no replacement while other docs replace |
+| Consolidated date coercion drops rows | High | Warning includes count and up to ten document IDs | Invalid transaction/disclosure dates are removed | Partial loss can still turn a document into no replacement while other docs replace |
 | Fresh parse returns zero rows for a previously stored doc | High | Parse-run `zero_rows` and stale-row warning | Existing transactions are retained | Stale data can survive indefinitely and parser regression is not a hard failure |
 | Fresh parse finds fewer nonzero rows than stored | Critical | No comparison/threshold | Successfully parsed doc is atomically replaced | Partial parse can delete valid historical rows |
 | Reparse loses resolved ticker or raw amount | High | Regression tests | Unambiguous existing values are carried forward by member/date/type identity | Other fields are not preserved; same-day same-type trades are ambiguous; changed identity prevents carry-forward |

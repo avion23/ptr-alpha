@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -12,6 +12,7 @@ from analyzer.exceptions import StepResult
 from analyzer.exceptions import ParsingError
 from analyzer.models import FilingType
 from analyzer.exceptions import DataSourceError
+from analyzer.models import DownloadResult, DownloadStatus
 
 
 def _tx(transaction_date="2024-01-02", amount_midpoint=1000.0):
@@ -133,6 +134,60 @@ def test_failed_metadata_refresh_does_not_clear_cached_rows():
     source._download_and_upsert_metadata.assert_called_once_with(
         2024, "https://example.test/2024.zip", replace=True,
     )
+
+
+def test_metadata_zip_accepts_uppercase_txt_and_rejects_bad_encoding(tmp_path):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("2024FD.TXT", "DocID\tFirst\n1\tAda")
+    assert download._read_first_text_from_zip(buf.getvalue(), 2024).startswith("DocID")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("2024FD.txt", b"DocID\tFirst\n1\t\xff")
+    with pytest.raises(ParsingError, match="not valid UTF-8"):
+        download._read_first_text_from_zip(buf.getvalue(), 2024)
+
+
+def test_filter_existing_pdfs_excludes_invalid_files(tmp_path):
+    valid = tmp_path / "1.pdf"
+    invalid = tmp_path / "2.pdf"
+    valid.write_bytes(b"%PDF-1.7\nbody")
+    invalid.write_bytes(b"<html>error</html>")
+    ptrs = pd.DataFrame({"DocID": ["1", "2"]})
+
+    paths, docs = download._filter_existing_pdfs(ptrs, tmp_path)
+
+    assert paths == [valid]
+    assert docs["DocID"].tolist() == ["1"]
+
+
+def test_member_lookup_rejects_ambiguous_duplicate_doc_id():
+    docs = pd.DataFrame({
+        "DocID": ["1", "1"], "First": ["A", "B"], "Last": ["One", "Two"],
+        "FilingDate": ["2024-01-01", "2024-01-01"],
+    })
+    with pytest.raises(ParsingError, match="member attribution ambiguous"):
+        download._build_member_lookup(docs)
+
+
+@pytest.mark.asyncio
+async def test_pdf_batch_failure_is_reported_to_caller(tmp_path):
+    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
+    source.fetch_metadata = MagicMock(return_value=pd.DataFrame({
+        "DocID": ["1"], "FilingType": [FilingType.PTR.value],
+    }))
+    source.data_dir = tmp_path
+    source.pdf_url_template = "https://example.test/{year}/{doc_id}.pdf"
+    source._download_pdf_async = AsyncMock(return_value=DownloadResult(
+        doc_id="1", status=DownloadStatus.FAILED, error_message="HTTP 500",
+    ))
+
+    with pytest.raises(DataSourceError, match="Failed to download 1 of 1"):
+        await source._fetch_and_cache_pdfs_async(2024)
 
 
 def _refresh_context():

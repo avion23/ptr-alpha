@@ -444,6 +444,23 @@ class TestParsing(unittest.TestCase):
         with self.assertRaises(ParsingError):
             normalize_house_metadata(content)
 
+    def test_normalize_house_metadata_rejects_blank_and_duplicate_doc_ids(self):
+        header = "DocID\tFirst\tLast\tFilingDate\tFilingType\n"
+        with self.assertRaisesRegex(ParsingError, "Blank DocID"):
+            normalize_house_metadata(header + "\tA\tOne\t01/01/2024\tP")
+        with self.assertRaisesRegex(ParsingError, "Duplicate DocID"):
+            normalize_house_metadata(
+                header + "1\tA\tOne\t01/01/2024\tP\n1\tB\tTwo\t01/02/2024\tP"
+            )
+
+    def test_normalize_house_metadata_drops_extra_column_rows(self):
+        content = (
+            "DocID\tFirst\tLast\tFilingDate\tFilingType\n"
+            "bad\tA\tOne\t01/01/2024\tP\textra\n"
+            "good\tB\tTwo\t01/02/2024\tP"
+        )
+        assert normalize_house_metadata(content)["DocID"].tolist() == ["good"]
+
     def test_normalize_house_metadata_invalid_dates(self):
         content = "DocID\tFirst\tLast\tFilingDate\n"
         content += "001\tJohn\tDoe\tnotadate\n"

@@ -92,6 +92,8 @@ class HouseTransactionSource(TransactionSource):
 
         content = _read_first_text_from_zip(response.content, year)
         df = normalize_house_metadata(content)
+        if "FilingType" not in df.columns:
+            raise ParsingError("Missing required metadata column: FilingType")
         df["fetched_at"] = datetime.now()
         df = df.rename(
             columns={
@@ -114,6 +116,7 @@ class HouseTransactionSource(TransactionSource):
         if _is_valid_pdf(pdf_path):
             return DownloadResult(doc_id=doc_id, status=DownloadStatus.SKIPPED)
 
+        tmp_path = pdf_path.with_suffix(".pdf.tmp")
         try:
             async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=30)
@@ -127,7 +130,6 @@ class HouseTransactionSource(TransactionSource):
                             status_code=response.status,
                             error_message="not a PDF (got HTML error page?)",
                         )
-                    tmp_path = pdf_path.with_suffix(".pdf.tmp")
                     with open(tmp_path, "wb") as f:
                         f.write(content)
                     os.replace(tmp_path, pdf_path)
@@ -142,6 +144,11 @@ class HouseTransactionSource(TransactionSource):
             return DownloadResult(
                 doc_id=doc_id, status=DownloadStatus.ERROR, error_message=str(e),
             )
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Unable to remove temporary PDF %s", tmp_path)
 
     async def _fetch_and_cache_pdfs_async(self, year):
         metadata = self.fetch_metadata(year)
@@ -169,6 +176,12 @@ class HouseTransactionSource(TransactionSource):
             results = [task.result() for task in tasks]
 
         self._log_download_summary(results)
+        failures = [r for r in results if r.status in (DownloadStatus.FAILED, DownloadStatus.ERROR)]
+        if failures:
+            sample = ", ".join(str(r.doc_id) for r in failures[:10])
+            raise DataSourceError(
+                f"Failed to download {len(failures)} of {len(results)} House PDFs; doc IDs: {sample}"
+            )
 
     def _log_download_summary(self, results: list[DownloadResult]) -> None:
         downloaded = sum(1 for r in results if r.status == DownloadStatus.SUCCESS)
@@ -339,18 +352,26 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
 def _read_first_text_from_zip(zip_bytes: bytes, year: int) -> str:
     """Open the metadata ZIP and return the first .txt file's content."""
     with zipfile.ZipFile(BytesIO(zip_bytes)) as z:
-        text_files = [f for f in z.namelist() if f.endswith(".txt")]
+        text_files = [f for f in z.namelist() if f.lower().endswith(".txt") and not f.endswith("/")]
         if not text_files:
             raise ParsingError(f"No text files found in metadata ZIP for {year}")
-        with z.open(text_files[0]) as f:
-            return f.read().decode("utf-8", errors="ignore")
+        preferred = [f for f in text_files if str(year) in Path(f).stem]
+        selected = preferred[0] if len(preferred) == 1 else text_files[0]
+        with z.open(selected) as f:
+            raw = f.read()
+        try:
+            return raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ParsingError(
+                f"Metadata text file {selected!r} is not valid UTF-8 for {year}"
+            ) from exc
 
 
 def _filter_existing_pdfs(ptrs: pd.DataFrame, pdf_dir: Path) -> tuple[list[Path], pd.DataFrame]:
     """Return (existing PDF paths, the subset of `ptrs` whose PDFs are on disk)."""
     doc_ids = ptrs["DocID"].values
     all_pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
-    exists_mask = [p.exists() for p in all_pdf_paths]
+    exists_mask = [_is_valid_pdf(p) for p in all_pdf_paths]
     pdf_paths = [p for p, e in zip(all_pdf_paths, exists_mask) if e]
     existing_docs = ptrs[exists_mask]
     return pdf_paths, existing_docs
@@ -358,6 +379,14 @@ def _filter_existing_pdfs(ptrs: pd.DataFrame, pdf_dir: Path) -> tuple[list[Path]
 
 def _build_member_lookup(existing_docs: pd.DataFrame) -> dict:
     """Map doc_id -> {First, Last, FilingDate} for downstream transaction join."""
+    duplicate_ids = existing_docs.loc[
+        existing_docs["DocID"].astype(str).duplicated(keep=False), "DocID"
+    ].astype(str).unique()
+    if len(duplicate_ids):
+        raise ParsingError(
+            "Duplicate metadata DocID(s) would make member attribution ambiguous: "
+            + ", ".join(duplicate_ids[:10])
+        )
     return dict(zip(
         existing_docs["DocID"].values,
         [{"First": f, "Last": last, "FilingDate": d} for f, last, d in zip(

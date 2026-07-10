@@ -4,9 +4,60 @@ Date: 2026-07-10
 
 ## Invocation
 
-`opencode run -m opencode/big-pickle ... -f /tmp/opencode-adversarial-input.txt`
+The attachment was constructed from the checkout at `783b5a1` with:
 
-The attachment was 1,941,452 bytes and contained 163 tracked text files: production Python, scripts, tests, configuration, documentation, and the fresh test output. OpenCode inspected the commit range `82a1d06..783b5a1`. The readable response is preserved in `opencode-adversarial-review-response.txt`.
+```bash
+uv run python - <<'PY'
+from pathlib import Path
+import subprocess
+
+files = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+extensions = {".py", ".toml", ".md", ".txt", ".yaml", ".yml", ".json"}
+selected = [path for path in files if Path(path).suffix in extensions]
+output = Path("/tmp/opencode-adversarial-input.txt")
+with output.open("w", encoding="utf-8") as stream:
+    stream.write(
+        "ADVERSARIAL REVIEW INPUT: ALL TRACKED TEXT SOURCE, TESTS, "
+        "CONFIGURATION, DOCUMENTATION, AND RESULTS\n"
+    )
+    for path in selected:
+        try:
+            source = Path(path).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        stream.write(f"\n\n===== FILE: {path} =====\n{source}")
+print(len(selected), output.stat().st_size)
+PY
+```
+
+The successful review invocation was:
+
+```bash
+opencode run -m opencode/big-pickle --title 'PTR adversarial review 2025-07-10' \
+  "$(cat docs/reviews/opencode-adversarial-review-prompt.md)" \
+  -f /tmp/opencode-adversarial-input.txt 2>&1 \
+  | tee docs/reviews/opencode-adversarial-review-response.txt
+```
+
+The attachment was 1,941,452 bytes and contained 163 tracked text files:
+production Python, scripts, tests, configuration, documentation, and the fresh
+test output. Its SHA-256 was
+`52e497527dee5d993ca798eb8b795ef065b82a546af1abfce3a4a0ad0bffa8b8`.
+OpenCode inspected the commit range `82a1d06..783b5a1`.
+
+The stream returned after exploration, so the recorded session was prompted once
+more with:
+
+```bash
+opencode run -s ses_0b5cefde2ffeXhHuHeWoYLX8iP -m opencode/big-pickle \
+  "Finish the adversarial review now. Return the requested final actionable findings only. Do not make edits or run more broad exploration; independently reason from what you have read." \
+  2>&1 | tee -a docs/reviews/opencode-adversarial-review-response.txt
+```
+
+The response artifact contains the complete substantive findings at lines
+356-433, followed by three asynchronously flushed exploration lines ending in
+an incomplete sentence. It is preserved verbatim but is not a complete transport
+transcript. The resumed command emitted no separate final response.
 
 ## Independent verification
 

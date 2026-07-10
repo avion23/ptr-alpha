@@ -325,19 +325,15 @@ class TestGarbageTickerBlacklist(unittest.TestCase):
             self.assertNotIn(t, _CONFIRMED_GARBAGE,
                              f"Real ticker '{t}' must not appear in _CONFIRMED_GARBAGE")
 
-    def test_cleanup_confirmed_garbage_contains_exactly_16_fragments(self):
-        """_CONFIRMED_GARBAGE has exactly the 16 expected garbage fragments."""
+    def test_cleanup_does_not_classify_ambiguous_words_as_garbage(self):
+        """Valid symbols must not be nulled based only on their spelling."""
         import sys
         import os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
         from cleanup_tickers import _CONFIRMED_GARBAGE
 
-        expected = frozenset({
-            "UNIT", "TECH", "NORT", "MARY", "CITI", "AMER",
-            "BERK", "BANK", "MICH", "WISC", "KING", "SOUT",
-            "EAST", "WEST", "PORT", "LAKE",
-        })
-        self.assertEqual(_CONFIRMED_GARBAGE, expected)
+        real_tickers = {"UNIT", "TECH", "EAST", "WEST", "LAKE"}
+        self.assertTrue(_CONFIRMED_GARBAGE.isdisjoint(real_tickers))
 
     def test_original_blacklist_tokens_still_blocked(self):
         from analyzer.parsing.cells import _extract_ticker

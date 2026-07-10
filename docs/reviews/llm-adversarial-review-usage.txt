@@ -1,0 +1,1 @@
+Token usage: 217,802 input, 1,201 output, {"candidatesTokenCount": 1201, "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 217802}], "serviceTier": "standard"}

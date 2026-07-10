@@ -10,14 +10,9 @@ import duckdb
 # the PDF parser blocks as ambiguous parse-context signals, but they ARE valid
 # real tickers (A=Agilent, O=Realty Income, X=US Steel, S=SentinelOne,
 # P=Primerica, E=Eni). Nulling them in the DB would permanently destroy valid
-# trades. Only the 16 *confirmed* garbage fragments — partial company-name words
-# that OCR/pdftotext captured in parentheses instead of actual tickers — are
-# safe to null out here.
-_CONFIRMED_GARBAGE: frozenset[str] = frozenset({
-    'UNIT', 'TECH', 'NORT', 'MARY', 'CITI', 'AMER',
-    'BERK', 'BANK', 'MICH', 'WISC', 'KING', 'SOUT',
-    'EAST', 'WEST', 'PORT', 'LAKE',
-})
+# trades. Tokens that resemble OCR fragments are not safe either: several are
+# also valid symbols, so spelling alone is insufficient evidence to null them.
+_CONFIRMED_GARBAGE: frozenset[str] = frozenset()
 
 # Mappings: company name prefix -> proper ticker
 NAME_TO_TICKER = {
@@ -152,15 +147,6 @@ def main():
                 con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [tok])
                 total_nulled += cnt
 
-        # Fix 6: null out confirmed garbage fragments regardless of length.
-        # The main query above only targets tickers with length > 5; short fragments
-        # like UNIT, TECH, BERK, BANK etc. slip through. Use _CONFIRMED_GARBAGE (NOT
-        # the full parser blacklist — see module-level comment).
-        for garbage in sorted(_CONFIRMED_GARBAGE):
-            cnt = con.execute("SELECT COUNT(*) FROM transactions WHERE ticker=?", [garbage]).fetchone()[0]
-            if cnt:
-                con.execute("UPDATE transactions SET ticker=NULL WHERE ticker=?", [garbage])
-                total_nulled += cnt
         con.execute("COMMIT")
         in_transaction = False
         

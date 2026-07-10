@@ -1,0 +1,51 @@
+This adversarial code review identifies significant issues ranging from data integrity risks in the House parser to race conditions and subtle logic bugs.
+
+### 1. Silent Data Loss in `parser_cascade` (Critical)
+*   **File:** `src/analyzer/parser_cascade.py`
+*   **Triggering Scenario:** A PDF with a non-text layer that contains transactions will skip text-based parsers, fall through to OCR, but potentially emit incorrect, incomplete, or duplicate data.
+*   **Why existing tests miss it:** Tests rely on structural validity (`_is_valid_pdf`) and transaction counts, but the audit (as noted in `HOUSE_PARSER_AUDIT.md`) confirms that 440 PDFs yield zero results while Tesseract OCR often produces rotated/inverted garbage because the orientation correction is only attempted *if the first pass yields zero*.
+*   **Fix:** Implement a "fallback-only" engine order. If any text-based parser finds *partial* data (e.g., table structure exists but cells are empty), the cascade must treat this as a signal to retry with more aggressive OCR/preprocessing rather than continuing to the next engine.
+
+### 2. Race Condition in `ocr_parallel.py` (High)
+*   **File:** `scripts/ocr_parallel.py`
+*   **Triggering Scenario:** High-frequency batch processing. The `db_writer` thread handles DuckDB updates, but the `ThreadPoolExecutor` workers invoke `process_one` which performs independent file IO. If the DB writer flushes while a worker is still parsing, atomicity is violated.
+*   **Why existing tests miss it:** Tests run serially and lack contention.
+*   **Fix:** Use a thread-safe `queue` for incoming parsed documents and ensure the `db_writer` thread exclusively manages all DB connections. `process_one` should *only* handle Gemini API interaction and parsing, returning structured dicts to the writer queue.
+
+### 3. Non-Atomic Parse Run Persistence (Medium)
+*   **File:** `scripts/ocr_zero_rows.py` (and `ocr_parallel.py`)
+*   **Triggering Scenario:** If `insert_transactions` succeeds but the subsequent `record_parse_run` or `CHECKPOINT` fails, the system logs the status as `error` or `no_txs` in `pdf_parse_runs` while the `transactions` table contains the actual data.
+*   **Why existing tests miss it:** The current testing approach assumes the DB is a single, consistent state and does not simulate failure at the transaction-commit boundary.
+*   **Fix:** The `record_parse_run` MUST be wrapped in the same transaction as the deletion and insertion of transaction rows.
+    ```python
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        conn.execute("DELETE ...")
+        conn.execute("INSERT ...")
+        conn.execute("INSERT INTO pdf_parse_runs ...")
+        conn.execute("COMMIT")
+    except:
+        conn.execute("ROLLBACK")
+    ```
+
+### 4. Data Corruption: Ticker Normalization (High)
+*   **File:** `scripts/cleanup_tickers.py`
+*   **Triggering Scenario:** The script uses a hardcoded `_CONFIRMED_GARBAGE` set to NULL-out tickers. If a legitimate ticker (e.g., 'UNIT' or 'TECH') appears in a disclosure, it is permanently deleted from the DB.
+*   **Why existing tests miss it:** Tests check for "successful" cleanup but do not verify that legitimate ticker symbols were not clobbered.
+*   **Fix:** Remove the hardcoded `_CONFIRMED_GARBAGE` list. Use a whitelist-based approach to validation rather than a blacklist of ambiguous tokens. If a ticker is not in the whitelist, move it to a `unresolved_tickers` table for human inspection, never silently delete it.
+
+### 5. Floating Point Inaccuracy in `kelly.py` (Low)
+*   **File:** `src/analyzer/portfolio/kelly.py`
+*   **Triggering Scenario:** `_estimate_win_loss` returns `NaN` if a slice is empty (all-positive or all-negative trades). The current code checks `not avg_loss`, which is false for `NaN`. This leads to `NaN` propagation through `kelly_fraction` to the portfolio.
+*   **Why existing tests miss it:** The test suite does not exercise scenarios with purely positive or negative trade sets.
+*   **Fix:** Explicitly handle `pd.isna()` for return statistics.
+    ```python
+    if pd.isna(avg_win) or avg_win <= 0:
+        avg_win = config.default_avg_win * 100
+    ```
+
+### 6. Logic Bug: SPY Return Weighting (Medium)
+*   **File:** `src/analyzer/signals/assembly.py`
+*   **Triggering Scenario:** The `r_spy_cum` field is calculated using a sum of weighted log returns. Downstream code then divides this sum again by `r_spy_wsum`.
+*   **Why existing tests miss it:** The test suite compares relative performance rather than checking the SPY-return magnitude against a ground-truth return formula.
+*   **Fix:** Ensure that if `r_spy_cum` already represents the normalized weighted mean, it is not further divided during assembly. Adjust `_compute_derived_arrays` to return the pre-normalized value once.

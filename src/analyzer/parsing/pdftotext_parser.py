@@ -34,7 +34,7 @@ _AMOUNT = r'(?:\$[\d,]+(?:\s*-\s*\$[\d,]+)?|[\-]+\$[\d,]+)'
 
 _TX_WITH_OWNER = re.compile(
     r'^\s{2,}'
-    r'([A-Z]{1,4})\s+'           # owner code
+    r'(SP|DC|JT|J|S)\s+'         # House owner code
     r'(.+?)\s+'                  # asset name
     rf'({_TX_TYPE})\s+'          # type
     r'(\d{2}/\d{2}/\d{4})\s+'    # tx date

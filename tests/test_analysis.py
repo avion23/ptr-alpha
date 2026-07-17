@@ -302,6 +302,43 @@ class TestAnalysis(unittest.TestCase):
         expected_avg = (18.0 * focused_w + 3.0 * noisebot_w) / (focused_w + noisebot_w)
         self.assertAlmostEqual(score.iloc[0]['avg_buyer_performance'], round(expected_avg, 2))
 
+    def test_score_ticker_by_buyers_canonicalizes_buyer_identity_for_gate(self):
+        transactions = pd.DataFrame({
+            'member': [
+                'Donald Sternoff Beyer',
+                'Donald Sternoff Honorable Beyer',
+                'Tim Moore',
+                'Tim Moore',
+            ],
+            'ticker': ['AAPL'] * 4,
+            'transaction_date': pd.to_datetime(['2024-01-01'] * 4),
+            'disclosure_date': pd.to_datetime([
+                '2024-01-02', '2024-01-03', '2024-01-04', '2024-01-05',
+            ]),
+            'transaction_type': ['Purchase'] * 4,
+        })
+        member_rankings = pd.DataFrame({
+            'member': ['Donald Sternoff Beyer', 'Tim Moore'],
+            'avg_spy_alpha_pct': [10.0, 8.0],
+            'purchase_trades': [2, 2],
+        })
+        signals = pd.DataFrame({
+            'member': ['Donald Sternoff Beyer', 'Tim Moore'],
+            'ticker': ['AAPL', 'AAPL'],
+            'signal_type': ['Purchase', 'Purchase'],
+            'horizon_days': [90, 90],
+            'decayed_return_pct': [10.0, 8.0],
+            'peak_potential_pct': [12.0, 10.0],
+            'spy_alpha_pct': [10.0, 8.0],
+        })
+
+        score = score_ticker_by_buyers(
+            'AAPL', transactions, signals, member_rankings=member_rankings, min_buyers=3,
+        )
+
+        self.assertEqual(score.iloc[0]['num_buyers'], 2)
+        self.assertIn('minimum buyer threshold', score.iloc[0]['note'])
+
     def test_rank_members_skips_members_with_all_nan_returns(self):
         signals = pd.DataFrame({
             'member': ['Alice', 'Bob'],

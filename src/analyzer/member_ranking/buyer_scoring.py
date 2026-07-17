@@ -15,6 +15,7 @@ import pandas as pd
 from analyzer import signals as _signals
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
+from analyzer.member_names import canonical_member_key
 from analyzer.models import TransactionType
 
 from analyzer.member_ranking.factors import _owner_score_factor, _size_score_factor
@@ -55,11 +56,12 @@ def score_ticker_by_buyers(
     if member_rankings is None:
         member_rankings = rank_members(signals_df, horizon, threshold, _bayes_prior_strength=bayes_prior)
 
-    ticker_trades = _get_ticker_purchases(ticker, transactions_df)
+    ticker_trades = _get_ticker_purchases(ticker, transactions_df).copy()
     if ticker_trades.empty:
         return _empty_ticker_result(ticker)
 
-    min_trades = ticker_trades["member"].nunique()
+    ticker_trades["_member_canonical"] = ticker_trades["member"].map(canonical_member_key)
+    min_trades = ticker_trades["_member_canonical"].nunique()
     if min_trades < min_buyers:
         return _below_threshold_result(ticker, min_trades, min_buyers)
 
@@ -68,7 +70,13 @@ def score_ticker_by_buyers(
         return solo_gate
     apply_solo_penalty = solo_gate
 
-    buyers = ticker_trades["member"].unique()
+    buyers = ticker_trades["_member_canonical"].unique()
+    if member_skills:
+        member_skills = member_skills | {
+            canonical_member_key(member): skill
+            for member, skill in member_skills.items()
+            if canonical_member_key(member) not in member_skills
+        }
     use_skills = member_rankings is not None and member_skills is not None and len(member_skills) > 0
     rd = _ranking_dicts if _ranking_dicts is not None else _build_ranking_dicts(member_rankings)
     alpha_dict = rd["alpha"]
@@ -228,11 +236,12 @@ def _recency_weights(ticker_trades: pd.DataFrame, rated_buyers_list) -> np.ndarr
     n_rated = len(rated_buyers_list)
     if n_rated == 0 or "disclosure_date" not in ticker_trades.columns:
         return np.ones(n_rated, dtype=float)
-    rated_ticker_trades = ticker_trades[ticker_trades["member"].isin(rated_buyers_list)]
+    member_col = "_member_canonical" if "_member_canonical" in ticker_trades.columns else "member"
+    rated_ticker_trades = ticker_trades[ticker_trades[member_col].isin(rated_buyers_list)]
     if rated_ticker_trades.empty:
         return np.ones(n_rated, dtype=float)
     latest_disclosure = rated_ticker_trades["disclosure_date"].max()
-    member_disclosures = rated_ticker_trades.groupby("member")["disclosure_date"].max()
+    member_disclosures = rated_ticker_trades.groupby(member_col)["disclosure_date"].max()
     days_since = (latest_disclosure - member_disclosures.reindex(rated_buyers_list)).dt.days.fillna(0).clip(lower=0)
     return np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.values)
 

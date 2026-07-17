@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
+from analyzer.member_names import canonical_member_key
 from analyzer.models import TransactionType
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer import analysis
@@ -243,8 +244,11 @@ def run_recent_ticker_scoring(
     ]
     logger.info("Analyzing %d transactions from last %d days", len(recent_trades), params.days_back)
 
-    recent_purchases = recent_trades[recent_trades['transaction_type'] == TransactionType.PURCHASE.value]
-    ticker_buyer_counts = recent_purchases.groupby('ticker')['member'].nunique()
+    recent_purchases = recent_trades[
+        recent_trades['transaction_type'] == TransactionType.PURCHASE.value
+    ].copy()
+    recent_purchases['_member_canonical'] = recent_purchases['member'].map(canonical_member_key)
+    ticker_buyer_counts = recent_purchases.groupby('ticker')['_member_canonical'].nunique()
     multi_buyer_tickers = ticker_buyer_counts[ticker_buyer_counts >= params.min_buyers].index.tolist()
 
     logger.info("Found %d tickers with %d+ buyers", len(multi_buyer_tickers), params.min_buyers)

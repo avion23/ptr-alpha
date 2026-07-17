@@ -26,6 +26,7 @@ from analyzer.parsing import (
 from analyzer.parser_cascade import _is_valid_pdf, _parse_pdf_worker
 
 logger = logging.getLogger(__name__)
+_PARSE_VERSION = "v3"
 
 
 # ── HouseTransactionSource: House disclosure download + parse driver ──
@@ -198,7 +199,7 @@ class HouseTransactionSource(TransactionSource):
     def fetch_and_cache_pdfs(self, year: int) -> None:
         return asyncio.run(self._fetch_and_cache_pdfs_async(year))
 
-    def parse_cached_pdfs(self, year: int) -> None:
+    def parse_cached_pdfs(self, year: int, *, force: bool = False) -> None:
         metadata = self.fetch_metadata(year)
         ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
         pdf_dir = self.data_dir / str(year) / "pdfs"
@@ -210,8 +211,32 @@ class HouseTransactionSource(TransactionSource):
         if not pdf_paths:
             raise DataSourceError(f"No PDF files found in {pdf_dir}")
 
+        if not force:
+            cached = self.db.parse_runs.get_cached_doc_ids(
+                year=year, parser_version=_PARSE_VERSION
+            )
+            if cached:
+                keep_mask = existing_docs["DocID"].astype(str).map(
+                    lambda d: d not in cached
+                ).to_numpy()
+                skipped = int((~keep_mask).sum()) if len(keep_mask) else 0
+                pdf_paths = [p for p, keep in zip(pdf_paths, keep_mask) if keep]
+                existing_docs = (
+                    existing_docs[keep_mask]
+                    if len(keep_mask)
+                    else existing_docs.iloc[0:0]
+                )
+                logger.info(
+                    "Skipping %d already-parsed PDFs for %d (%d remain)",
+                    skipped, year, len(pdf_paths),
+                )
+
+        if not pdf_paths:
+            logger.info("All PDFs for %d already parsed; nothing to do", year)
+            return
+
         member_lookup = _build_member_lookup(existing_docs)
-        logger.info(f"Parsing {len(ptrs)} PDFs for {year}")
+        logger.info(f"Parsing {len(pdf_paths)} PDFs for {year}")
 
         with Pool(self.parallel_workers) as pool:
             results = pool.map(_parse_pdf_worker, pdf_paths)
@@ -236,7 +261,7 @@ class HouseTransactionSource(TransactionSource):
         parse_runs = [dict(
             doc_id=doc_id,
             year=year,
-            parser_version="v3",
+            parser_version=_PARSE_VERSION,
             status="success" if transaction_counts.get(doc_id, 0) else "zero_rows",
             engines_attempted=",".join(engines_attempted),
             raw_row_count=0,
@@ -258,7 +283,20 @@ class HouseTransactionSource(TransactionSource):
             )
 
         if df.empty:
-            raise ParsingError("No transactions found after parsing all PDFs")
+            # Cache zero-row results so image PDFs are not re-parsed next run.
+            self.db.conn.execute("BEGIN TRANSACTION")
+            try:
+                for parse_run in parse_runs:
+                    self.db.parse_runs.upsert(**parse_run, _in_transaction=True)
+                self.db.conn.execute("COMMIT")
+            except Exception:
+                self.db.conn.execute("ROLLBACK")
+                raise
+            logger.info(
+                "Parsed %d PDFs but found no transactions; recorded zero_rows",
+                len(parse_runs),
+            )
+            return
 
         df = preserve_existing_fields(df, self.db)
 

@@ -9,6 +9,7 @@ from analyzer import datasources
 from analyzer import parser_cascade
 from analyzer import download
 from analyzer.cli import app
+from analyzer.database import Database
 from analyzer.exceptions import StepResult
 from analyzer.exceptions import ParsingError
 from analyzer.models import FilingType
@@ -114,13 +115,66 @@ def test_save_parse_results_warns_when_zero_row_doc_retains_db_rows(caplog, tmp_
     pdf_path = tmp_path / "123.pdf"
 
     with patch.object(download, "consolidate_transactions", return_value=pd.DataFrame()), \
-         caplog.at_level("WARNING", logger="analyzer.download"), \
-         pytest.raises(ParsingError):
+         caplog.at_level("WARNING", logger="analyzer.download"):
         source._save_parse_results(2024, [(pdf_path, [], ["pdfplumber"])], {})
 
     source.db.count_transactions_for_docs.assert_called_once_with(["123"])
-    source.db.upsert_parse_run.assert_not_called()
+    source.db.parse_runs.upsert.assert_called_once_with(
+        doc_id="123",
+        year=2024,
+        parser_version="v3",
+        status="zero_rows",
+        engines_attempted="pdfplumber",
+        raw_row_count=0,
+        transaction_count=0,
+        _in_transaction=True,
+    )
     assert "1 docs parsed to zero rows but retain 3 existing DB rows (stale?): 123" in caplog.text
+
+
+def test_parse_cached_pdfs_skips_cached_and_force_reparses(tmp_path):
+    year = 2026
+    pdf_dir = tmp_path / str(year) / "pdfs"
+    pdf_dir.mkdir(parents=True)
+    for doc_id in ("1", "2"):
+        (pdf_dir / f"{doc_id}.pdf").write_bytes(b"%PDF-1.7\nbody")
+
+    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
+    source.data_dir = tmp_path
+    source.parallel_workers = 1
+    source.db = Database(tmp_path / "test.duckdb")
+    source.fetch_metadata = MagicMock(return_value=pd.DataFrame({
+        "DocID": ["1", "2"],
+        "FilingType": [FilingType.PTR.value, FilingType.PTR.value],
+        "First": ["A", "B"],
+        "Last": ["One", "Two"],
+        "FilingDate": ["2026-01-01", "2026-01-02"],
+    }))
+    parsed_batches = []
+
+    class FakePool:
+        def __init__(self, workers):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def map(self, worker, paths):
+            parsed_batches.append([path.stem for path in paths])
+            return [(path, [_tx()], ["pdfplumber"]) for path in paths]
+
+    try:
+        with patch.object(download, "Pool", FakePool):
+            source.parse_cached_pdfs(year)
+            source.parse_cached_pdfs(year)
+            source.parse_cached_pdfs(year, force=True)
+    finally:
+        source.db.close()
+
+    assert parsed_batches == [["1", "2"], ["1", "2"]]
 
 
 def test_save_parse_results_does_not_mark_success_before_replacement(tmp_path):

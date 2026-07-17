@@ -37,3 +37,17 @@ class ParseRunRepository:
             if not _in_transaction:
                 self.conn.execute("ROLLBACK")
             raise
+
+    def get_cached_doc_ids(self, *, year: int, parser_version: str) -> set[str]:
+        """doc_ids with a terminal (non-error) parse_run for this year + parser_version.
+
+        These PDFs need not be re-parsed: their result is deterministic for the
+        given parser_version. 'error' runs are excluded so failures get retried.
+        """
+        rows = self.conn.execute(
+            "SELECT doc_id FROM pdf_parse_runs "
+            "WHERE year = ? AND parser_version = ? "
+            "AND status IN ('success', 'zero_rows', 'no_txs')",
+            [year, parser_version],
+        ).fetchall()
+        return {str(r[0]) for r in rows}

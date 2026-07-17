@@ -987,6 +987,44 @@ class TestParseRunRepository(DatabaseTestCase):
         ).fetchone()
         self.assertEqual(row, (2024, "v2", "success"))
 
+    def test_get_cached_doc_ids_returns_terminal_only(self):
+        for status in ("success", "zero_rows", "no_txs", "error"):
+            self.repo.upsert(
+                doc_id=f"doc-{status}",
+                year=2026,
+                parser_version="v3",
+                status=status,
+                engines_attempted="pdfplumber",
+                raw_row_count=0,
+                transaction_count=0,
+            )
+
+        self.assertEqual(
+            self.repo.get_cached_doc_ids(year=2026, parser_version="v3"),
+            {"doc-success", "doc-zero_rows", "doc-no_txs"},
+        )
+
+    def test_get_cached_doc_ids_filters_by_year_and_version(self):
+        for doc_id, year, parser_version in (
+            ("doc-2025", 2025, "v3"),
+            ("doc-2026", 2026, "v3"),
+            ("doc-v4", 2026, "v4"),
+        ):
+            self.repo.upsert(
+                doc_id=doc_id,
+                year=year,
+                parser_version=parser_version,
+                status="success",
+                engines_attempted="pdfplumber",
+                raw_row_count=1,
+                transaction_count=1,
+            )
+
+        self.assertEqual(
+            self.repo.get_cached_doc_ids(year=2026, parser_version="v3"),
+            {"doc-2026"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

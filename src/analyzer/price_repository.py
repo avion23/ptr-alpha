@@ -172,6 +172,7 @@ class PriceRepository:
               AND p_raw.date <= r.disclosure_date
             WHERE r.ticker IN (SELECT UNNEST(?))
               AND r.disclosure_date BETWEEN ? AND ?
+              AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)
               AND COALESCE(p_res.close, p_raw.close) IS NOT NULL
         """,
             [expanded_tickers, start_date, end_date],

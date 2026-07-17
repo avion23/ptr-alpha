@@ -629,6 +629,33 @@ class TestPriceRepository(DatabaseTestCase):
         self.assertEqual(len(result), 1)
         self.assertAlmostEqual(result.iloc[0]["entry_price"], 220.0)
 
+    def test_entry_prices_excludes_future_transaction_dates(self):
+        self._seed_transactions([
+            {
+                "doc_id": "valid", "member": "Valid Member", "ticker": "AAPL",
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+            },
+            {
+                "doc_id": "invalid", "member": "Invalid Member", "ticker": "AAPL",
+                "transaction_date": date(2024, 3, 20),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+            },
+        ])
+        self.repo.upsert(pd.DataFrame(
+            {"AAPL": [220.0]},
+            index=pd.bdate_range("2024-03-14", "2024-03-14"),
+        ))
+
+        result = self.repo.get_entry_prices(
+            ["AAPL"], date(2024, 3, 1), date(2024, 3, 31), max_staleness_days=30
+        )
+
+        self.assertEqual(list(result["member"]), ["Valid Member"])
+        self.assertNotIn("Invalid Member", set(result["member"]))
+
     def test_entry_prices_excludes_ticker_with_no_prices(self):
         # Two transactions; only AAPL has price history. The COALESCE(...) IS
         # NOT NULL clause must drop the MSFT row entirely.

@@ -102,6 +102,9 @@ class TransactionRepository:
         try:
             if not _in_transaction:
                 self.conn.execute("BEGIN TRANSACTION")
+            count_before = self.conn.execute(
+                "SELECT COUNT(*) FROM transactions"
+            ).fetchone()[0]
             self.conn.execute("""
                 CREATE TEMP TABLE filtered_staging_transactions AS
                 SELECT s.*
@@ -117,9 +120,6 @@ class TransactionRepository:
                  AND COALESCE(CAST(t.asset_description AS VARCHAR), '') = COALESCE(CAST(s.asset_description AS VARCHAR), '')
                 WHERE t.id IS NULL
             """)
-            inserted_count = self.conn.execute(
-                "SELECT COUNT(*) FROM filtered_staging_transactions"
-            ).fetchone()[0]
             self.conn.execute("""
                 INSERT INTO transactions (
                     doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
@@ -156,6 +156,10 @@ class TransactionRepository:
                 FROM filtered_staging_transactions
                 WHERE ticker IS NULL
             """)
+            count_after = self.conn.execute(
+                "SELECT COUNT(*) FROM transactions"
+            ).fetchone()[0]
+            inserted_count = count_after - count_before
             if not _in_transaction:
                 self.conn.execute("COMMIT")
         except Exception:

@@ -824,13 +824,18 @@ def refresh(
                 MAX(disclosure_date),
                 COUNT(*) FILTER (WHERE transaction_date > disclosure_date)
             FROM transactions
-            """
+            WHERE EXTRACT(YEAR FROM disclosure_date) = ?
+            """,
+            [year],
         ).fetchone()
     )
 
     added = count_after - count_before
     print(f"\nDone. {count_before} -> {count_after} transactions ({'+' if added >= 0 else ''}{added} new)")
-    print(f"Latest eligible transaction date: {max_date}")
+    print(
+        f"Latest transaction date: {max_date} "
+        "(eligible: not after disclosure)"
+    )
     print(f"Latest disclosure date: {max_disclosure_date}")
     if implausible_date_count:
         print(

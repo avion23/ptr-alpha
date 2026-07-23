@@ -180,7 +180,11 @@ class TestTransactionRepository(DatabaseTestCase):
                 "asset_description": "Apple",
             },
         ])
-        self.repo.upsert(df, source="house_pdf")
+        before = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        inserted = self.repo.upsert(df, source="house_pdf")
+        after = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        self.assertEqual(inserted, after - before)
+        self.assertEqual(inserted, 1)
         count = self.db.conn.execute(
             "SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc-dupe'"
         ).fetchone()[0]
@@ -188,13 +192,45 @@ class TestTransactionRepository(DatabaseTestCase):
 
     def test_upsert_idempotent(self):
         df = self._make_df()
-        self.repo.upsert(df, source="house_pdf")
-        self.repo.upsert(df, source="house_pdf")
+        self.assertEqual(self.repo.upsert(df, source="house_pdf"), 1)
+        before = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        inserted = self.repo.upsert(df, source="house_pdf")
+        after = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        self.assertEqual(inserted, after - before)
+        self.assertEqual(inserted, 0)
 
         count = self.db.conn.execute(
             "SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc1'"
         ).fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_upsert_count_matches_delta_when_values_collide_after_cast(self):
+        rows = []
+        for doc_id in (1, "1"):
+            rows.append({
+                "doc_id": doc_id,
+                "member": "John Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 3, 10),
+                "disclosure_date": date(2024, 3, 15),
+                "transaction_type": "Purchase",
+                "amount_raw": "$1,001 - $15,000",
+                "owner_code": "DC",
+                "asset_description": "Apple",
+            })
+
+        before = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        inserted = self.repo.upsert(pd.DataFrame(rows), source="house_pdf")
+        after = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+
+        self.assertEqual(inserted, after - before)
+        self.assertEqual(inserted, 1)
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE doc_id = '1'"
+            ).fetchone()[0],
+            1,
+        )
 
     def test_upsert_null_ticker_inserts(self):
         df = pd.DataFrame([

@@ -344,7 +344,7 @@ def _refresh_context():
     execute.side_effect = [
         MagicMock(fetchone=MagicMock(return_value=(10,))),
         MagicMock(fetchone=MagicMock(return_value=(10,))),
-        MagicMock(fetchone=MagicMock(return_value=("2024-01-02",))),
+        MagicMock(fetchone=MagicMock(return_value=("2024-01-02", "2024-01-03", 0))),
     ]
     return ctx
 
@@ -369,3 +369,5 @@ def test_refresh_exits_zero_when_all_steps_succeed():
 
     assert result.exit_code == 0, result.output
     assert "FAILED steps:" not in result.output
+    assert "Latest eligible transaction date: 2024-01-02" in result.output
+    assert "Latest disclosure date: 2024-01-03" in result.output

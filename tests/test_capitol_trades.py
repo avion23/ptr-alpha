@@ -250,6 +250,28 @@ class TestCapitolTradesSource(unittest.TestCase):
         transactions = self.source.db.get_transactions(2025)
         self.assertEqual(len(transactions), 2)
 
+        # Re-fetching the same API page is idempotent and reports no new rows.
+        count = self.source.fetch_and_save_politician("Nancy Pelosi")
+        self.assertEqual(count, 0)
+
+    def test_save_reports_deduplicated_insert_count(self):
+        row = {
+            "doc_id": "duplicate-doc",
+            "member": "Test Member",
+            "ticker": "TEST",
+            "transaction_date": pd.Timestamp("2025-01-02"),
+            "disclosure_date": pd.Timestamp("2025-01-03"),
+            "transaction_type": "Purchase",
+            "owner_code": None,
+            "amount_raw": "$1,001 - $15,000",
+            "amount_midpoint": 8000.5,
+            "instrument_type": "stock",
+            "strike_price": None,
+            "expiry_date": None,
+        }
+
+        self.assertEqual(self.source.save_to_db(pd.DataFrame([row, row])), 1)
+
     @patch("analyzer.capitol_trades.requests.Session.get")
     def test_fetch_trades_empty_response(self, mock_get):
         mock_get.return_value = _mock_response({

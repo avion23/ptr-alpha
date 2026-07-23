@@ -212,8 +212,8 @@ class Database:
     def replace_metadata(self, year: int, df: pd.DataFrame) -> None:
         self.metadata.replace_year(year, df)
 
-    def upsert_transactions(self, df: pd.DataFrame, *, source: str) -> None:
-        self.transactions.upsert(df, source=source)
+    def upsert_transactions(self, df: pd.DataFrame, *, source: str) -> int:
+        return self.transactions.upsert(df, source=source)
 
     def replace_transactions_for_docs(
         self,

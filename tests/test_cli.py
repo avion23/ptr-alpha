@@ -179,7 +179,7 @@ class TestCliApp(unittest.TestCase):
         execute.side_effect = [
             MagicMock(fetchone=MagicMock(return_value=(10,))),
             MagicMock(fetchone=MagicMock(return_value=(10,))),
-            MagicMock(fetchone=MagicMock(return_value=("2024-01-02",))),
+            MagicMock(fetchone=MagicMock(return_value=("2024-01-02", "2024-01-03", 0))),
         ]
 
         with patch("analyzer.cli.get_context", return_value=mock_ctx), \

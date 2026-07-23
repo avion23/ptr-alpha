@@ -103,12 +103,16 @@ class CapitolTradesSource(TransactionSource):
         return df
 
     def save_to_db(self, df: pd.DataFrame) -> int:
-        """Upsert trades into the database. Returns count inserted."""
+        """Upsert trades into the database. Return newly inserted row count."""
         if df.empty:
             return 0
-        self.db.upsert_transactions(df, source="capitol_trades")
-        logger.info(f"Saved {len(df)} Capitol Trades transactions to database")
-        return len(df)
+        inserted = self.db.upsert_transactions(df, source="capitol_trades")
+        logger.info(
+            "Inserted %d new Capitol Trades transactions from %d API records",
+            inserted,
+            len(df),
+        )
+        return inserted
 
     def fetch_and_save_politician(
         self,

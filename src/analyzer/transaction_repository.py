@@ -75,7 +75,8 @@ class TransactionRepository:
         ).fetchdf()
         return result
 
-    def upsert(self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False) -> None:
+    def upsert(self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False) -> int:
+        """Insert previously unseen canonical rows and return their count."""
         df = df.copy()
         for column in ["owner_code", "amount_raw", "amount_midpoint", "instrument_type", "strike_price", "expiry_date", "asset_description"]:
             if column not in df.columns:
@@ -94,9 +95,10 @@ class TransactionRepository:
         dedup_df["asset_description_key"] = dedup_df["asset_description"].fillna("").astype(str).replace("None", "")
         df = df.loc[~dedup_df.duplicated(subset=dedup_key, keep="first")].copy()
         if df.empty:
-            return
+            return 0
 
         self.conn.execute("CREATE TEMP TABLE staging_transactions AS SELECT * FROM df")
+        inserted_count = 0
         try:
             if not _in_transaction:
                 self.conn.execute("BEGIN TRANSACTION")
@@ -115,6 +117,9 @@ class TransactionRepository:
                  AND COALESCE(CAST(t.asset_description AS VARCHAR), '') = COALESCE(CAST(s.asset_description AS VARCHAR), '')
                 WHERE t.id IS NULL
             """)
+            inserted_count = self.conn.execute(
+                "SELECT COUNT(*) FROM filtered_staging_transactions"
+            ).fetchone()[0]
             self.conn.execute("""
                 INSERT INTO transactions (
                     doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
@@ -160,6 +165,7 @@ class TransactionRepository:
         finally:
             self.conn.execute("DROP TABLE IF EXISTS filtered_staging_transactions")
             self.conn.execute("DROP TABLE IF EXISTS staging_transactions")
+        return inserted_count
 
     def get_for_doc(self, doc_id: str) -> pd.DataFrame:
         return self.conn.execute(

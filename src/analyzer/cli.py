@@ -814,13 +814,29 @@ def refresh(
     count_after = app_ctx.transaction_source.db.conn.execute(
         "SELECT COUNT(*) FROM transactions"
     ).fetchone()[0]
-    max_date = app_ctx.transaction_source.db.conn.execute(
-        "SELECT MAX(transaction_date) FROM transactions"
-    ).fetchone()[0]
+    max_date, max_disclosure_date, implausible_date_count = (
+        app_ctx.transaction_source.db.conn.execute(
+            """
+            SELECT
+                MAX(transaction_date) FILTER (
+                    WHERE transaction_date IS NULL OR transaction_date <= disclosure_date
+                ),
+                MAX(disclosure_date),
+                COUNT(*) FILTER (WHERE transaction_date > disclosure_date)
+            FROM transactions
+            """
+        ).fetchone()
+    )
 
     added = count_after - count_before
     print(f"\nDone. {count_before} -> {count_after} transactions ({'+' if added >= 0 else ''}{added} new)")
-    print(f"Latest transaction date: {max_date}")
+    print(f"Latest eligible transaction date: {max_date}")
+    print(f"Latest disclosure date: {max_disclosure_date}")
+    if implausible_date_count:
+        print(
+            f"Excluded from analyses: {implausible_date_count} transaction(s) "
+            "dated after disclosure"
+        )
     if failed_steps:
         print(f"FAILED steps: {', '.join(failed_steps)}")
         raise typer.Exit(1)

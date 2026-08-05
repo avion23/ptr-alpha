@@ -53,7 +53,7 @@ class TestIntegration(unittest.TestCase):
         )
 
         result = run_analysis_pipeline(
-            params, transaction_source, price_source, Path(self.temp_dir), 'console'
+            params, transaction_source, price_source
         )
 
         self.assertTrue(result, "Analysis pipeline should succeed")
@@ -73,7 +73,7 @@ class TestIntegration(unittest.TestCase):
         )
 
         result = run_analysis_pipeline(
-            params, transaction_source, price_source, Path(self.temp_dir), 'console'
+            params, transaction_source, price_source
         )
 
         self.assertTrue(result, "Member analysis pipeline should succeed")

@@ -231,7 +231,7 @@ def _run_sales_mode(
     data_path = Path(app_ctx.settings.data.data_dir)
     result = run_sales_pipeline(
         year, tuple(horizons), top_n,
-        app_ctx.transaction_source, app_ctx.price_source, data_path, output
+        app_ctx.transaction_source, app_ctx.price_source
     )
     if result.success and hasattr(result, 'data') and result.data:
         _save_results(result.data["table"], output, DisplayMode.SALE_RANKINGS, None, False, data_path)
@@ -255,7 +255,7 @@ def _run_analysis_mode(
     )
     data_path = Path(app_ctx.settings.data.data_dir)
     result = run_analysis_pipeline(
-        params, app_ctx.transaction_source, app_ctx.price_source, data_path, output
+        params, app_ctx.transaction_source, app_ctx.price_source
     )
     if result.success and hasattr(result, 'data') and result.data:
         if params.member_filter:

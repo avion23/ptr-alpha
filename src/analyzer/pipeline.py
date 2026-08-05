@@ -168,7 +168,7 @@ def run_parse_pipeline(transaction_source, year: int) -> DataResult:
 
 @pipeline_step
 def run_analysis_pipeline(
-    params: AnalysisParams, transaction_source, price_source, data_dir: Path, output_format: str
+    params: AnalysisParams, transaction_source, price_source
 ) -> DataResult:
     trades, prices, signals = prepare_analysis_data(transaction_source, price_source, params.year, params.horizons)
 
@@ -190,7 +190,7 @@ def run_analysis_pipeline(
 @pipeline_step
 def run_sales_pipeline(
     year: int, horizons: tuple[int, ...], top_n: int,
-    transaction_source, price_source, data_dir: Path, output_format: str
+    transaction_source, price_source
 ) -> DataResult:
     trades, prices, signals = prepare_analysis_data(transaction_source, price_source, year, horizons)
     result = analysis.rank_sales(signals, horizons[0])

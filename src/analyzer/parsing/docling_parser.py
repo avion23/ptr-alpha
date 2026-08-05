@@ -11,7 +11,7 @@ parsers below.
 import logging
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 from pathlib import Path
 
@@ -65,7 +65,7 @@ def _build_docling_cmd(pdf_path: Path) -> list[str] | None:
 
 def _run_docling(full_cmd: list[str], pdf_path: Path, timeout: int) -> str | None:
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603
             full_cmd, capture_output=True, text=True,
             errors='replace', timeout=timeout,
         )

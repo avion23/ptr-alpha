@@ -133,7 +133,7 @@ class SenateEFDSource(TransactionSource):
                     raise SenateEFDBlockedError(
                         f"eFD request failed after {attempts} attempts: {e}"
                     ) from e
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)  # nosec B311
                 logger.warning("eFD request error (%s); retrying in %.1fs", e, delay)
                 time.sleep(delay)
                 continue
@@ -172,7 +172,7 @@ class SenateEFDSource(TransactionSource):
                     raise SenateEFDBlockedError(
                         f"eFD server error HTTP {resp.status_code} after {attempts} attempts"
                     )
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)  # nosec B311
                 logger.warning("eFD HTTP %d; retrying in %.1fs", resp.status_code, delay)
                 time.sleep(delay)
                 continue
@@ -185,7 +185,7 @@ class SenateEFDSource(TransactionSource):
         if self._session is not None:
             try:
                 self._session.close()
-            except Exception:
+            except Exception:  # noqa: B110  # nosec B110
                 pass
         session = cffi_requests.Session(impersonate=BROWSER_IMPERSONATE)
         self._session = session
@@ -216,7 +216,7 @@ class SenateEFDSource(TransactionSource):
     def _require_session(self) -> cffi_requests.Session:
         if self._session is None:
             self._open_session()
-        assert self._session is not None
+        assert self._session is not None  # nosec B101
         return self._session
 
     def _search_reports(self, start_date: date, end_date: date) -> list[dict]:
@@ -427,7 +427,7 @@ class SenateEFDSource(TransactionSource):
         m = _UUID_RE.search(report_path)
         if m:
             return m.group(0)
-        return "efd-" + hashlib.sha1(report_path.encode()).hexdigest()[:16]
+        return "efd-" + hashlib.sha1(report_path.encode(), usedforsecurity=False).hexdigest()[:16]
 
     @staticmethod
     def _one_year_before(d: date) -> date:

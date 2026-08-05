@@ -143,16 +143,13 @@ class PriceRepository:
                 seen.add(resolved)
                 expanded_tickers.append(resolved)
 
-        values_parts = [
-            f"('{raw.replace(chr(39), chr(39)*2)}', '{res.replace(chr(39), chr(39)*2)}')"
-            for raw, res in ticker_map_entries
-        ]
-        values_str = ", ".join(values_parts)
+        raw_tickers = [raw for raw, _ in ticker_map_entries]
+        resolved_tickers = [resolved for _, resolved in ticker_map_entries]
 
         result = self.conn.execute(
-            f"""
+            """
             WITH ticker_map(raw, resolved) AS (
-                VALUES {values_str}
+                SELECT UNNEST(?), UNNEST(?)
             ),
             resolved_tickers AS (
                 SELECT t.*, COALESCE(tm.resolved, t.ticker) AS resolved_ticker
@@ -175,7 +172,7 @@ class PriceRepository:
               AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)
               AND COALESCE(p_res.close, p_raw.close) IS NOT NULL
         """,
-            [expanded_tickers, start_date, end_date],
+            [raw_tickers, resolved_tickers, expanded_tickers, start_date, end_date],
         ).fetchdf()
 
         if not result.empty:

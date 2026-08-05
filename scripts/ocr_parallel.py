@@ -1,9 +1,15 @@
 """Parallel Gemini OCR. Threaded fetch, single-writer DB."""
-import argparse, json, os, re, time, threading, queue
+import argparse
+import json
+import os
+import queue
+import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import duckdb
 
-from scripts.gemini_ocr_common import MODEL, PROMPT, call_gemini, validate_transactions
+from scripts.gemini_ocr_common import call_gemini, validate_transactions
 from scripts.ocr_zero_rows import get_filing_date, get_metadata_member, insert_transactions, record_parse_run
 
 DB_PATH = "data/congress.duckdb"
@@ -41,7 +47,7 @@ def save_progress(p):
 def parse_output(output):
     if not output:
         return None, []
-    lines = [l.strip() for l in output.split("\n") if l.strip()]
+    lines = [line.strip() for line in output.split("\n") if line.strip()]
     member, transactions = None, []
     for line in lines:
         if line.upper().startswith("MEMBER:"):
@@ -54,9 +60,12 @@ def parse_output(output):
             asset, ttype, tx_date, disc_date, amount = parts[:5]
             ttype_clean = None
             tl = ttype.lower()
-            if "purchase" in tl or tl == "p": ttype_clean = "Purchase"
-            elif "sale" in tl or tl == "s": ttype_clean = "Sale"
-            elif "exchange" in tl or tl == "e": ttype_clean = "Exchange"
+            if "purchase" in tl or tl == "p":
+                ttype_clean = "Purchase"
+            elif "sale" in tl or tl == "s":
+                ttype_clean = "Sale"
+            elif "exchange" in tl or tl == "e":
+                ttype_clean = "Exchange"
             if ttype_clean:
                 transactions.append({
                     "asset": asset, "type": ttype_clean,
@@ -68,11 +77,14 @@ def parse_output(output):
 
 def normalize_date(s):
     from datetime import datetime
-    if not s: return None
+    if not s:
+        return None
     s = s.strip()
     for fmt in ("%m/%d/%y", "%m/%d/%Y", "%m-%d-%y", "%m-%d-%Y"):
-        try: return datetime.strptime(s, fmt).date().isoformat()
-        except ValueError: continue
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
     return None
 
 def extract_ticker(asset):

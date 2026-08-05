@@ -203,7 +203,9 @@ class CapitolTradesSource(TransactionSource):
                     str(t.get("transaction_type", "")),
                     t.get("amount_text", "") or "",
                 ])
-                doc_id_str = "ct-" + hashlib.sha1(components.encode()).hexdigest()[:16]
+                doc_id_str = "ct-" + hashlib.sha1(
+                    components.encode(), usedforsecurity=False
+                ).hexdigest()[:16]
 
             rows.append({
                 "doc_id": doc_id_str,

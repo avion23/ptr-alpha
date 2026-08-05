@@ -133,7 +133,7 @@ def _backtest_core(
                 evaluated.insert(0, "as_of_date", as_of_ts.date())
                 all_results.append(evaluated)
             except Exception:
-                continue
+                continue  # nosec B112
 
         if not all_results:
             return empty, pd.Series(dtype=float)

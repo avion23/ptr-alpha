@@ -4,7 +4,14 @@
 Uses `llm -a` with Gemini 3.1 Flash Lite to extract transactions.
 Gemini auto-rotates PDFs and handles checkbox detection.
 """
-import argparse, datetime, json, os, re, time, duckdb
+import argparse
+import datetime
+import json
+import os
+import re
+import time
+
+import duckdb
 from pathlib import Path
 
 from scripts.gemini_ocr_common import MODEL, call_gemini, validate_transactions
@@ -554,7 +561,7 @@ def main():
             insert_transactions(doc_id, year, member, [], db_path=DB_PATH)
             progress["no_txs"].append(doc_id)
             save_progress(progress)
-            print(f"  No transactions found", flush=True)
+            print("  No transactions found", flush=True)
             continue
         
         raw_count = len(transactions)
@@ -582,7 +589,7 @@ def main():
         for tx in transactions[:3]:
             print(f"    {tx['asset']} | {tx['type']} | {tx['date']} | {tx['amount_letter']}", flush=True)
     
-    print(f"\n=== DONE ===")
+    print("\n=== DONE ===")
     print(f"Total inserted: {total_inserted}")
 
 
@@ -631,7 +638,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             insert_transactions(doc_id, yr, member, [], db_path=db_path)
             progress["no_txs"].append(doc_id)
             save_progress(progress, progress_path)
-            print(f"  No transactions found", flush=True)
+            print("  No transactions found", flush=True)
             continue
         raw_count = len(transactions)
         conn = duckdb.connect(db_path, read_only=True)

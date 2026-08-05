@@ -8,7 +8,7 @@ descriptions back into a single row.
 
 import logging
 import re
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
 
 def _run_pdftotext(pdf_path: Path) -> str | None:
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 B607
             ['pdftotext', '-layout', str(pdf_path), '-'],
             capture_output=True, text=True, errors='replace', timeout=_PDFTOTEXT_TIMEOUT
         )

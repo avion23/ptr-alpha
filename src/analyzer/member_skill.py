@@ -105,7 +105,6 @@ def _compute_member_sector_skills_from_group(
     weight = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
     alpha_weighted = filtered["spy_alpha_pct"].values * weight
 
-    grp = filtered.groupby("ticker")
     weight_sums = pd.Series(weight, index=filtered.index).groupby(filtered["ticker"]).sum()
     alpha_sums = pd.Series(alpha_weighted, index=filtered.index).groupby(filtered["ticker"]).sum()
 

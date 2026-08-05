@@ -193,15 +193,9 @@ class TransactionRepository:
             return {}
 
         placeholders = ", ".join("?" for _ in doc_ids)
-        rows = self.conn.execute(
-            f"""
-            SELECT doc_id, COUNT(*)
-            FROM transactions
-            WHERE doc_id IN ({placeholders})
-            GROUP BY doc_id
-            """,
-            doc_ids,
-        ).fetchall()
+        # Only generated placeholders are interpolated; doc_ids remain bound parameters.
+        query = f"SELECT doc_id, COUNT(*) FROM transactions WHERE doc_id IN ({placeholders}) GROUP BY doc_id"  # nosec B608
+        rows = self.conn.execute(query, doc_ids).fetchall()
         return {doc_id: count for doc_id, count in rows}
 
     def exists(self, year: int) -> bool:

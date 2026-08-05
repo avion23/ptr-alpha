@@ -138,7 +138,7 @@ def get_current_price(ticker: str):
         price = float(last["Close"])
         price_date = pd.Timestamp(last.name).date()
         return price, price_date
-    except Exception as e:  # noqa: BLE001 - network/parse can fail broadly
+    except Exception:  # noqa: BLE001 - network/parse can fail broadly
         return None, None
 
 
@@ -345,7 +345,6 @@ def main() -> int:
         total_tx = len(rows)
         buys = [r for r in rows if str(r[4]).strip().lower() in BUY_TYPES]
         n_buys = len(buys)
-        buy_eff_dates = [d for d in (_eff_date(r) for r in buys) if d is not None]
 
         # data span for base-rate (issue H2): min->max effective date over ALL
         # transactions for this ticker.

@@ -32,6 +32,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov",
     "ruff",
+    "bandit>=1.7",
 ]
 
 [project.scripts]
@@ -46,6 +47,16 @@ ptr-alpha = "analyzer.cli:main"
 [tool.setuptools.packages.find]
 where = ["src", "."]
 include = ["analyzer*", "scripts*"]
+
+[tool.ruff.lint.per-file-ignores]
+# E402: standalone scripts and tests bootstrap sys.path before importing the
+# project package, so a module-level import after a sys.path.insert is intended.
+"scripts/*.py" = ["E402"]
+"tests/conftest.py" = ["E402"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "scripts", "data"]
+skips = ["B404", "B603", "B607"]
 
 [tool.pytest.ini_options]
 filterwarnings = [

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import subprocess  # nosec B404
 import sys
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -13,7 +13,7 @@ import pandas as pd
 
 def _get_git_sha() -> str:
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 B607
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,

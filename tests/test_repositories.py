@@ -556,6 +556,31 @@ class TestPriceRepository(DatabaseTestCase):
         self.assertEqual(missing_tickers, [])
         self.assertEqual(missing_dates, [])
 
+    def test_get_missing_counts_columbus_day_trading_day(self):
+        # Columbus Day is a federal holiday but a normal NYSE trading day.
+        # A missing price there must be reported, not treated as a closure.
+        dates = pd.to_datetime(["2024-10-11", "2024-10-15"])
+        self.repo.upsert(pd.DataFrame({"AAPL": [100.0, 102.0]}, index=dates))
+
+        missing_tickers, missing_dates = self.repo.get_missing(
+            ["AAPL"], date(2024, 10, 11), date(2024, 10, 15)
+        )
+
+        self.assertEqual(missing_tickers, ["AAPL"])
+        self.assertEqual(missing_dates, [pd.Timestamp("2024-10-14")])
+
+    def test_get_missing_ignores_good_friday(self):
+        # Good Friday is an NYSE closure (not a federal holiday).
+        dates = pd.to_datetime(["2024-03-28", "2024-04-01"])
+        self.repo.upsert(pd.DataFrame({"AAPL": [100.0, 102.0]}, index=dates))
+
+        missing_tickers, missing_dates = self.repo.get_missing(
+            ["AAPL"], date(2024, 3, 28), date(2024, 4, 1)
+        )
+
+        self.assertEqual(missing_tickers, [])
+        self.assertEqual(missing_dates, [])
+
     def test_get_missing_partial_gaps(self):
         # AAPL has Jan 1-2 only; gaps are Jan 3-5 business days.
         dates = pd.bdate_range("2024-01-01", "2024-01-02")

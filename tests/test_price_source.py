@@ -38,7 +38,13 @@ class TestReadOnlyPriceMerge(unittest.TestCase):
         self.assertEqual(prices.loc[pd.Timestamp("2024-01-03"), "AAPL"], 103.0)
 
 
-def test_recent_gap_fetches_only_missing_span(tmp_path, monkeypatch):
+def test_recent_gap_refetches_full_window(tmp_path, monkeypatch):
+    """A ticker with any gap re-fetches the full analysis window.
+
+    Narrow gap repair would mix an auto_adjust basis across a corporate
+    action, producing artificial jumps. Re-fetching the full window keeps the
+    cached series on a single adjustment basis.
+    """
     db = Database(tmp_path / "prices.duckdb")
     try:
         trading_dates = pd.to_datetime(
@@ -74,8 +80,8 @@ def test_recent_gap_fetches_only_missing_span(tmp_path, monkeypatch):
         )
 
         assert calls == [
-            (["AAPL"], pd.Timestamp("2024-01-09").date(),
-             pd.Timestamp("2024-01-11").date())
+            (["AAPL"], pd.Timestamp("2024-01-01").date(),
+             pd.Timestamp("2024-01-10").date())
         ]
         assert prices.loc[pd.Timestamp("2024-01-10"), "AAPL"] == 106.0
     finally:

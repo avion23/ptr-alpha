@@ -5,12 +5,58 @@ from datetime import date
 
 import duckdb
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar,
+    GoodFriday,
+    Holiday,
+    USLaborDay,
+    USMartinLutherKingJr,
+    USMemorialDay,
+    USPresidentsDay,
+    USThanksgivingDay,
+    nearest_workday,
+)
 
 from analyzer.ticker_resolver import TickerResolver
 
 
 logger = logging.getLogger(__name__)
+
+
+class _NYSEHolidayCalendar(AbstractHolidayCalendar):
+    """NYSE trading-day closures.
+
+    ``USFederalHolidayCalendar`` is wrong for equity prices: it includes
+    Columbus Day and Veterans Day (regular NYSE trading days) and omits
+    Good Friday (an NYSE closure). Building the calendar from the actual
+    NYSE closure rules keeps ``get_missing`` honest about missing prices.
+    """
+
+    rules = [
+        Holiday("New Year's Day", month=1, day=1, observance=nearest_workday),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday(
+            "Juneteenth National Independence Day",
+            month=6,
+            day=19,
+            start_date="2022-01-01",
+            observance=nearest_workday,
+        ),
+        Holiday(
+            "Independence Day", month=7, day=4, observance=nearest_workday
+        ),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday(
+            "Christmas Day", month=12, day=25, observance=nearest_workday
+        ),
+    ]
+
+
+_NYSE_HOLIDAYS = _NYSEHolidayCalendar()
 
 
 class PriceRepository:
@@ -65,7 +111,7 @@ class PriceRepository:
             return [], []
 
         business_dates = pd.bdate_range(start_date, end_date)
-        holidays = USFederalHolidayCalendar().holidays(start=start_date, end=end_date)
+        holidays = _NYSE_HOLIDAYS.holidays(start=start_date, end=end_date)
         required_dates = business_dates.difference(holidays)
         if required_dates.empty:
             return [], []

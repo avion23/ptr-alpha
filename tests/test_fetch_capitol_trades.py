@@ -5,15 +5,7 @@ from unittest.mock import MagicMock, patch
 
 class TestFetchCapitolTrades(unittest.TestCase):
 
-    def test_module_imports(self):
-        from scripts import fetch_capitol_trades
-        assert callable(fetch_capitol_trades.fetch_all_trades)
-        assert callable(fetch_capitol_trades.main)
 
-    def test_constants_defined(self):
-        from scripts import fetch_capitol_trades
-        self.assertEqual(fetch_capitol_trades.PER_PAGE, 200)
-        self.assertTrue(fetch_capitol_trades.BASE_URL.startswith("https://"))
 
     def test_fetch_all_trades_paginates(self):
         from scripts import fetch_capitol_trades

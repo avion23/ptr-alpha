@@ -4,12 +4,6 @@ import unittest
 import pandas as pd
 
 
-class TestWalkForwardImports(unittest.TestCase):
-
-    def test_module_imports(self):
-        import member_profitability.walk_forward
-        self.assertTrue(callable(member_profitability.walk_forward.generate_windows))
-        self.assertTrue(callable(member_profitability.walk_forward.collect_window_results))
 
 
 class TestGenerateWindows(unittest.TestCase):

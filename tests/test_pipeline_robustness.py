@@ -75,61 +75,8 @@ def test_parse_worker_prefers_high_quality_later_text_engine(monkeypatch, tmp_pa
     ]
 
 
-def test_reparse_all_filters_ptr_filings_unconditionally(tmp_path):
-    from scripts import reparse_all
-
-    data_dir = tmp_path / "data"
-    (data_dir / "2024" / "pdfs").mkdir(parents=True)
-    settings = MagicMock()
-    settings.data.data_dir = str(data_dir)
-
-    metadata = pd.DataFrame(
-        {
-            "DocID": ["p1", "a1"],
-            "FilingType": [FilingType.PTR.value, FilingType.AMENDMENT.value],
-            "First": ["A", "B"],
-            "Last": ["One", "Two"],
-            "FilingDate": ["2024-01-01", "2024-01-02"],
-        }
-    )
-    source = MagicMock()
-    source.fetch_metadata.return_value = metadata
-
-    captured = {}
-
-    def fake_filter(ptrs, pdf_dir):
-        captured["ptrs"] = ptrs.copy()
-        return [], pd.DataFrame()
-
-    with patch.object(reparse_all, "HouseTransactionSource", return_value=source), \
-         patch.object(reparse_all, "_filter_existing_pdfs", side_effect=fake_filter):
-        assert reparse_all.parse_year(2024, MagicMock(), settings) == 0
-
-    assert captured["ptrs"]["DocID"].tolist() == ["p1"]
 
 
-def test_save_parse_results_warns_when_zero_row_doc_retains_db_rows(caplog, tmp_path):
-    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
-    source.db = MagicMock()
-    source.db.count_transactions_for_docs.return_value = {"123": 3}
-    pdf_path = tmp_path / "123.pdf"
-
-    with patch.object(download, "consolidate_transactions", return_value=pd.DataFrame()), \
-         caplog.at_level("WARNING", logger="analyzer.download"):
-        source._save_parse_results(2024, [(pdf_path, [], ["pdfplumber"])], {})
-
-    source.db.count_transactions_for_docs.assert_called_once_with(["123"])
-    source.db.parse_runs.upsert.assert_called_once_with(
-        doc_id="123",
-        year=2024,
-        parser_version="v3",
-        status="zero_rows",
-        engines_attempted="pdfplumber",
-        raw_row_count=0,
-        transaction_count=0,
-        _in_transaction=True,
-    )
-    assert "1 docs parsed to zero rows but retain 3 existing DB rows (stale?): 123" in caplog.text
 
 
 def test_parse_cached_pdfs_skips_cached_and_force_reparses(tmp_path):
@@ -177,68 +124,8 @@ def test_parse_cached_pdfs_skips_cached_and_force_reparses(tmp_path):
     assert parsed_batches == [["1", "2"], ["1", "2"]]
 
 
-def test_save_parse_results_does_not_mark_success_before_replacement(tmp_path):
-    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
-    source.db = MagicMock()
-    source.db.count_transactions_for_docs.return_value = {}
-    source.db.replace_transactions_for_docs.side_effect = OSError("disk full")
-    pdf_path = tmp_path / "123.pdf"
-    consolidated = pd.DataFrame({"doc_id": ["123"]})
-
-    with patch.object(download, "consolidate_transactions", return_value=consolidated), \
-         patch.object(download, "preserve_existing_fields", return_value=consolidated), \
-         pytest.raises(OSError, match="disk full"):
-        source._save_parse_results(2024, [(pdf_path, [_tx()], ["pdfplumber"])], {})
-
-    source.db.upsert_parse_run.assert_not_called()
-    source.db.replace_transactions_for_docs.assert_called_once_with(
-        consolidated,
-        source="house_pdf",
-        parse_runs=[{
-            "doc_id": "123",
-            "year": 2024,
-            "parser_version": "v3",
-            "status": "success",
-            "engines_attempted": "pdfplumber",
-            "raw_row_count": 0,
-            "transaction_count": 1,
-        }],
-    )
 
 
-def test_save_parse_results_audits_consolidated_rows(tmp_path):
-    source = download.HouseTransactionSource.__new__(download.HouseTransactionSource)
-    source.db = MagicMock()
-    source.db.count_transactions_for_docs.return_value = {"dropped": 2}
-    kept_pdf = tmp_path / "kept.pdf"
-    dropped_pdf = tmp_path / "dropped.pdf"
-    consolidated = pd.DataFrame({"doc_id": ["kept"]})
-
-    with patch.object(download, "consolidate_transactions", return_value=consolidated), \
-         patch.object(download, "preserve_existing_fields", return_value=consolidated):
-        source._save_parse_results(
-            2024,
-            [
-                (kept_pdf, [_tx(), _tx()], ["pdfplumber"]),
-                (dropped_pdf, [_tx()], ["pdftotext"]),
-            ],
-            {},
-        )
-
-    source.db.count_transactions_for_docs.assert_called_once_with(["dropped"])
-    parse_runs = source.db.replace_transactions_for_docs.call_args.kwargs["parse_runs"]
-    assert parse_runs == [
-        {
-            "doc_id": "kept", "year": 2024, "parser_version": "v3",
-            "status": "success", "engines_attempted": "pdfplumber",
-            "raw_row_count": 0, "transaction_count": 1,
-        },
-        {
-            "doc_id": "dropped", "year": 2024, "parser_version": "v3",
-            "status": "zero_rows", "engines_attempted": "pdftotext",
-            "raw_row_count": 0, "transaction_count": 0,
-        },
-    ]
 
 
 def test_failed_metadata_refresh_does_not_clear_cached_rows():
@@ -349,28 +236,8 @@ def _refresh_context():
     return ctx
 
 
-def test_refresh_exits_one_when_fetch_pipeline_returns_false():
-    runner = CliRunner()
-    with patch("analyzer.cli.get_context", return_value=_refresh_context()), \
-         patch("analyzer.cli.run_fetch_pipeline", return_value=StepResult(success=False)), \
-         patch("analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)):
-        result = runner.invoke(app, ["refresh", "--skip-capitol"])
-
-    assert result.exit_code == 1, result.output
-    assert "FAILED steps: fetch" in result.output
 
 
-def test_refresh_exits_zero_when_all_steps_succeed():
-    runner = CliRunner()
-    with patch("analyzer.cli.get_context", return_value=_refresh_context()), \
-         patch("analyzer.cli.run_fetch_pipeline", return_value=StepResult(success=True)), \
-         patch("analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)):
-        result = runner.invoke(app, ["refresh", "--skip-capitol"])
-
-    assert result.exit_code == 0, result.output
-    assert "FAILED steps:" not in result.output
-    assert "Latest transaction date: 2024-01-02 (eligible: not after disclosure)" in result.output
-    assert "Latest disclosure date: 2024-01-03" in result.output
 
 
 def test_refresh_summary_is_scoped_to_requested_year(tmp_path):

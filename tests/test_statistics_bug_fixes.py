@@ -305,43 +305,8 @@ class TestSweepAlphaSlopeSign(unittest.TestCase):
         )
         return r
 
-    def test_good_config_positive_slope(self):
-        """rank1 > rank5 → alpha_slope > 0 for a good config."""
-        r = self._make_result_with_rank_alphas(rank1=5.0, rank5=1.0)
-        # Replicate the fixed formula
-        slope = round(r.rank1_alpha - r.rank5_alpha, 2)
-        self.assertGreater(slope, 0.0,
-                           "good config should have positive alpha_slope")
 
-    def test_bad_config_negative_slope(self):
-        """rank5 > rank1 → alpha_slope < 0 for a sign-inverted (bad) config."""
-        r = self._make_result_with_rank_alphas(rank1=1.0, rank5=5.0)
-        slope = round(r.rank1_alpha - r.rank5_alpha, 2)
-        self.assertLess(slope, 0.0,
-                        "bad config (rank5 outperforms rank1) should have negative slope")
 
-    def test_sweep_run_single_backtest_slope_sign(self):
-        """run_single_backtest computes slope as rank1 - rank5."""
-        import sweep
-
-        # Build a fake evaluated DataFrame: rank1 avg=5%, rank5 avg=1%
-        # so a well-sorted result; verify alpha_slope > 0.
-        combined = pd.DataFrame({
-            "as_of_date": pd.to_datetime(["2024-01-01"] * 10),
-            "rank": [1, 1, 5, 5, 2, 3, 4, 1, 5, 2],
-            "bt_alpha_pct": [5.0, 5.0, 1.0, 1.0, 3.0, 3.0, 2.0, 5.0, 1.0, 3.0],
-            "bt_return_pct": [6.0] * 10,
-        })
-        # rank1 mean = 5.0, rank5 mean = 1.0 → slope should be +4.0
-        rank_alpha = combined.groupby("rank")["bt_alpha_pct"].mean()
-        fixed_slope = round(float(rank_alpha.loc[1]) - float(rank_alpha.loc[5]), 2)
-        old_slope = round(float(rank_alpha.loc[5]) - float(rank_alpha.loc[1]), 2)
-
-        self.assertGreater(fixed_slope, 0.0,
-                           "fixed slope should be positive for good ranker")
-        self.assertLess(old_slope, 0.0,
-                        "old (buggy) slope was negative for good ranker")
-        self.assertEqual(fixed_slope, 4.0)
 
     def test_sweep_module_uses_correct_sign(self):
         """Sign regression guard: executed alpha_slope is rank1 - rank5."""

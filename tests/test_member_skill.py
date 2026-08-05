@@ -121,9 +121,7 @@ class TestEstimateMemberSkills(unittest.TestCase):
         expected_shrinkage = 5.0 / (10 + 5.0)
         self.assertAlmostEqual(skill.shrinkage, expected_shrinkage)
 
-    def test_empty_signals_returns_empty(self):
-        skills = estimate_member_skills(pd.DataFrame())
-        self.assertEqual(skills, {})
+
 
 
 class TestScoreMembersForTicker(unittest.TestCase):

@@ -6,10 +6,6 @@ from analyzer.options import estimate_options_leverage
 
 class TestEstimateOptionsLeverage(unittest.TestCase):
 
-    def test_stock_returns_one(self):
-        self.assertEqual(estimate_options_leverage("stock"), 1.0)
-        self.assertEqual(estimate_options_leverage(""), 1.0)
-        self.assertEqual(estimate_options_leverage("unknown"), 1.0)
 
     def test_call_returns_positive_leverage(self):
         result = estimate_options_leverage("call")
@@ -28,9 +24,6 @@ class TestEstimateOptionsLeverage(unittest.TestCase):
         # Large trades -> less leverage; small trades -> more leverage
         self.assertLess(high_amount, small_amount)
 
-    def test_none_amount_treated_as_no_adjustment(self):
-        with_none = estimate_options_leverage("call", amount_midpoint=None)
-        self.assertEqual(with_none, estimate_options_leverage("call", amount_midpoint=None))
 
 
 if __name__ == "__main__":

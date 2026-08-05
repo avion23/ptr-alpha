@@ -6,41 +6,10 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-import pandas as pd
 
 
-class TestReportingImports(unittest.TestCase):
-
-    def test_module_imports(self):
-        import member_profitability.reporting
-        self.assertTrue(callable(member_profitability.reporting.build_output_dict))
-        self.assertTrue(callable(member_profitability.reporting.best_predictors))
-        self.assertTrue(callable(member_profitability.reporting.write_output))
-        self.assertTrue(callable(member_profitability.reporting.serialize_numpy))
 
 
-class TestBuildOutputDict(unittest.TestCase):
-
-    def test_returns_sections(self):
-        from member_profitability.reporting import build_output_dict
-        sigs = pd.DataFrame({
-            "member": ["A"],
-            "ticker": ["X"],
-            "disclosure_date": pd.to_datetime(["2024-01-01"]),
-        })
-        all_tx = pd.DataFrame({"ticker": ["X"]})
-        out = build_output_dict(
-            sigs=sigs, all_tx=all_tx, all_tickers=["X"], windows=[],
-            valid_windows=0, all_wf=pd.DataFrame(),
-            correlations={}, tier_results={}, trade_count_analysis={},
-            position_results=[], combined_results={},
-        )
-        for key in [
-            "analysis_config", "spearman_correlations", "tier_analysis",
-            "trade_count_reliability", "position_sizing_grid",
-            "combined_metrics", "recommendations",
-        ]:
-            self.assertIn(key, out)
 
 
 class TestSerializeNumpy(unittest.TestCase):

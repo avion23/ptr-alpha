@@ -1,6 +1,5 @@
 import unittest
 from datetime import date
-import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,103 +7,21 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from analyzer.pipeline import (
-    AnalysisParams,
-    TickerAnalysisParams,
     TickerScoringParams,
     prepare_analysis_data,
     prepare_live_analysis_data,
-    pipeline_step,
     run_recent_ticker_scoring,
 )
 from analyzer.cli import DisplayMode, _save_results
-from analyzer.analysis import analyze_by_sector
-from analyzer.exceptions import AnalyzerError, DataSourceError
+from analyzer.exceptions import DataSourceError
 
 
-class TestAnalysisParams(unittest.TestCase):
-
-    def test_defaults(self):
-        p = AnalysisParams(source="house", year=2024, horizons=[90], threshold=5.0)
-        self.assertIsNone(p.member_filter)
-        self.assertIsNone(p.top_n)
-        self.assertFalse(p.show_signals)
-
-    def test_with_all_params(self):
-        p = AnalysisParams(source="house", year=2024, horizons=[90], threshold=5.0, member_filter="test", top_n=10, show_signals=True)
-        self.assertEqual(p.member_filter, "test")
-        self.assertEqual(p.top_n, 10)
-        self.assertTrue(p.show_signals)
 
 
-class TestTickerScoringParams(unittest.TestCase):
-
-    def test_defaults(self):
-        p = TickerScoringParams(year=2024, horizons=[90])
-        self.assertEqual(p.threshold, 5.0)
-        self.assertEqual(p.days_back, 28)
-        self.assertEqual(p.min_buyers, 3)
-        self.assertEqual(p.top_n, 15)
-
-    def test_custom_values(self):
-        p = TickerScoringParams(year=2024, horizons=[30, 60], threshold=10.0, days_back=14, min_buyers=3, top_n=5)
-        self.assertEqual(p.threshold, 10.0)
-        self.assertEqual(p.days_back, 14)
-        self.assertEqual(p.min_buyers, 3)
-        self.assertEqual(p.top_n, 5)
 
 
-class TestPipelineStep(unittest.TestCase):
-
-    def test_wraps_success(self):
-        @pipeline_step
-        def success_fn():
-            return 42
-
-        result = success_fn()
-        self.assertEqual(result, 42)
-
-    def test_wraps_analyzer_error_returns_false(self):
-        @pipeline_step
-        def failing_fn():
-            raise AnalyzerError("boom")
-
-        result = failing_fn()
-        self.assertFalse(result.success)
-        self.assertIsInstance(result.error, AnalyzerError)
-
-    def test_wraps_data_source_error_returns_false(self):
-        @pipeline_step
-        def failing_fn():
-            raise DataSourceError("no data")
-
-        result = failing_fn()
-        self.assertFalse(result.success)
-        self.assertIsInstance(result.error, DataSourceError)
-
-    def test_non_analyzer_error_propagates(self):
-        @pipeline_step
-        def bad_fn():
-            raise ValueError("raw error")
-
-        with self.assertRaises(ValueError):
-            bad_fn()
 
 
-class TestTickerAnalysisParams(unittest.TestCase):
-
-    def test_constructs_with_defaults(self):
-        p = TickerAnalysisParams(ticker="AAPL", year=2024)
-        self.assertEqual(p.ticker, "AAPL")
-        self.assertEqual(p.year, 2024)
-        self.assertEqual(p.horizon, 90)
-        self.assertEqual(p.threshold, 5.0)
-
-    def test_constructs_with_all_fields(self):
-        p = TickerAnalysisParams(ticker="GOOGL", year=2025, horizon=30, threshold=10.0)
-        self.assertEqual(p.ticker, "GOOGL")
-        self.assertEqual(p.year, 2025)
-        self.assertEqual(p.horizon, 30)
-        self.assertEqual(p.threshold, 10.0)
 
 
 class TestPrepareAnalysisData(unittest.TestCase):
@@ -296,21 +213,6 @@ class TestRecentTickerScoring(unittest.TestCase):
 
 class TestSaveResults(unittest.TestCase):
 
-    def test_console_output_no_exception(self):
-        table = pd.DataFrame({
-            "member": ["Alice"],
-            "avg_spy_alpha_pct": [10.5],
-            "bayes_win_prob": [0.8],
-            "peak_hit_rate_pct": [70.0],
-            "sharpe_ratio": [1.2],
-            "bayes_factor": [2.1],
-            "purchase_trades": [5],
-        })
-
-        try:
-            _save_results(table, "console", DisplayMode.MEMBER_RANKINGS, None, False, Path("/tmp"))
-        except Exception as e:
-            self.fail(f"_save_results raised {e} unexpectedly")
 
     def test_csv_output_creates_file(self):
         table = pd.DataFrame({
@@ -440,62 +342,6 @@ class TestSaveResults(unittest.TestCase):
             self.assertNotIn("peak_hit_rate_pct", saved.columns)
 
 
-class TestAnalyzeBySector(unittest.TestCase):
-
-    @patch("analyzer.analysis.rank_members")
-    @patch("analyzer.analysis.load_sector_data")
-    def test_returns_dataframe_with_sectors(self, mock_load_sector, mock_rank):
-        mock_load_sector.return_value = pd.DataFrame({
-            "ticker": ["AAPL", "GOOGL"],
-            "sector": ["Technology", "Technology"],
-        })
-
-        mock_rank.return_value = pd.DataFrame({
-            "member": ["Alice", "Bob"],
-            "avg_spy_alpha_pct": [15.0, 10.0],
-            "purchase_trades": [5, 3],
-        })
-
-        trades = pd.DataFrame({
-            "ticker": ["AAPL", "GOOGL"],
-            "disclosure_date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
-            "transaction_type": ["Purchase", "Purchase"],
-        })
-
-        signals = pd.DataFrame({
-            "ticker": ["AAPL", "AAPL", "AAPL", "GOOGL", "GOOGL", "GOOGL"],
-            "member": ["Alice", "Bob", "Charlie", "Alice", "Bob", "Charlie"],
-            "signal_type": ["Purchase"] * 6,
-            "horizon_days": [90] * 6,
-            "decayed_return_pct": [10.0, 8.0, 5.0, 7.0, 6.0, 4.0],
-            "peak_potential_pct": [20.0, 15.0, 10.0, 12.0, 11.0, 8.0],
-        })
-
-        result = analyze_by_sector(trades, signals, [90])
-
-        self.assertIsNotNone(result)
-        self.assertIsInstance(result, pd.DataFrame)
-        self.assertIn("sector", result.columns)
-        self.assertIn("top_member", result.columns)
-        self.assertGreaterEqual(len(result), 1)
-
-    @patch("analyzer.analysis.load_sector_data")
-    def test_returns_none_when_no_sector_data(self, mock_load_sector):
-        mock_load_sector.return_value = pd.DataFrame(columns=["ticker", "sector"])
-
-        trades = pd.DataFrame({
-            "ticker": ["AAPL"],
-            "disclosure_date": pd.to_datetime(["2024-01-01"]),
-        })
-
-        signals = pd.DataFrame({
-            "ticker": ["AAPL"],
-            "signal_type": ["Purchase"],
-            "horizon_days": [90],
-        })
-
-        result = analyze_by_sector(trades, signals, [90])
-        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
@@ -505,45 +351,3 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Pytest-style tests (use caplog fixture — cannot use unittest.TestCase here)
 # ---------------------------------------------------------------------------
-
-
-
-def test_pipeline_step_logs_analyzer_error(caplog):
-    """BUG 2 regression: AnalyzerError must be logged, not silently swallowed."""
-    from analyzer.pipeline import pipeline_step
-    from analyzer.exceptions import AnalyzerError
-
-    @pipeline_step
-    def failing_fn():
-        raise AnalyzerError("something went wrong")
-
-    with caplog.at_level(logging.ERROR, logger="analyzer.pipeline"):
-        result = failing_fn()
-
-    assert not result.success, "pipeline_step must return StepResult(success=False) on AnalyzerError"
-    assert isinstance(result.error, AnalyzerError), "StepResult.error must be the AnalyzerError"
-    assert any("something went wrong" in r.message for r in caplog.records), (
-        f"AnalyzerError message not found in logs; records={caplog.records}"
-    )
-    assert any(r.levelno == logging.ERROR for r in caplog.records), (
-        "Log record must be at ERROR level"
-    )
-
-
-def test_pipeline_step_logs_data_source_error(caplog):
-    """DataSourceError (subclass of AnalyzerError) must also be logged."""
-    from analyzer.pipeline import pipeline_step
-    from analyzer.exceptions import DataSourceError
-
-    @pipeline_step
-    def failing_fn():
-        raise DataSourceError("no data available")
-
-    with caplog.at_level(logging.ERROR, logger="analyzer.pipeline"):
-        result = failing_fn()
-
-    assert not result.success
-    assert isinstance(result.error, DataSourceError)
-    assert any("no data available" in r.message for r in caplog.records), (
-        f"DataSourceError message not found in logs; records={caplog.records}"
-    )

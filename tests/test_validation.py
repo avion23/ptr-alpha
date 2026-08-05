@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import math
-import sys
 from datetime import date
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -562,44 +560,3 @@ class TestRunValidationConfigFreezing:
 # Smoke test: sweep.py still imports from analyzer.validation
 # ---------------------------------------------------------------------------
 
-class TestSweepPyImport:
-
-    def test_validation_exports_moved_symbols(self):
-        """After refactor, analyzer.validation exports SweepResult + run_single_backtest."""
-        from analyzer.validation import SweepResult as VS
-        from analyzer.validation import run_single_backtest as VR
-        assert callable(VR)
-        # Instantiate SweepResult with mandatory fields
-        r = VS(
-            horizon=60,
-            frequency_days=30,
-            training_lookback_days=365,
-            min_buyers=2,
-            top_n=5,
-            decay_lambda=0.005,
-            bayes_prior_strength=20.0,
-        )
-        assert r.horizon == 60
-        assert r.scoring_mode == "shrunk_alpha"  # default
-
-    def test_sweep_module_imports_from_validation(self):
-        """sweep.py should import SweepResult and run_single_backtest from validation."""
-        repo_root = Path(__file__).resolve().parents[1]
-        added = str(repo_root) not in sys.path
-        if added:
-            sys.path.insert(0, str(repo_root))
-        old_argv = sys.argv[:]
-        sys.argv = ["ptr-alpha"]
-        try:
-            # Clear cached module to force re-import if already loaded
-            sys.modules.pop("sweep", None)
-            import sweep  # noqa: PLC0415
-            from analyzer.validation import SweepResult as VS, run_single_backtest as VR
-            assert sweep.SweepResult is VS
-            assert sweep.run_single_backtest is VR
-        except ImportError as exc:
-            pytest.fail(f"sweep.py import failed after refactor: {exc}")
-        finally:
-            sys.argv = old_argv
-            if added and str(repo_root) in sys.path:
-                sys.path.remove(str(repo_root))

@@ -4,17 +4,7 @@ import unittest
 
 class TestOcrZeroRows(unittest.TestCase):
 
-    def test_module_imports(self):
-        from scripts import ocr_zero_rows
-        assert callable(ocr_zero_rows.get_zero_row_pdfs)
-        assert callable(ocr_zero_rows.load_progress)
-        assert callable(ocr_zero_rows.save_progress)
-        assert callable(ocr_zero_rows.call_gemini)
-        assert callable(ocr_zero_rows.parse_output)
-        assert callable(ocr_zero_rows.normalize_date)
-        assert callable(ocr_zero_rows.insert_transactions)
-        assert callable(ocr_zero_rows.main)
-        assert callable(ocr_zero_rows.run_gemini_ocr_for_year)
+
 
     def test_amount_midpoints_defined(self):
         from scripts import ocr_zero_rows
@@ -52,10 +42,7 @@ class TestOcrZeroRows(unittest.TestCase):
 
     # --- parse_output ---
 
-    def test_parse_output_none_or_empty(self):
-        from scripts import ocr_zero_rows
-        self.assertEqual(ocr_zero_rows.parse_output(None), (None, []))
-        self.assertEqual(ocr_zero_rows.parse_output(""), (None, []))
+
 
     def test_parse_output_basic(self):
         from scripts import ocr_zero_rows

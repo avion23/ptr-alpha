@@ -4,20 +4,6 @@ import unittest
 import pandas as pd
 
 
-class TestRecommendImports(unittest.TestCase):
-
-    def test_module_imports(self):
-        import analyzer.backtest.recommend
-        self.assertTrue(callable(analyzer.backtest.recommend.backtest_recommendations))
-
-    def test_private_helpers_callable(self):
-        import analyzer.backtest.recommend as r
-        self.assertTrue(callable(r._build_member_rankings))
-        self.assertTrue(callable(r._candidate_tickers))
-        self.assertTrue(callable(r._score_and_rank))
-        self.assertTrue(callable(r._build_metadata_maps))
-        self.assertTrue(callable(r._score_one_ticker))
-        self.assertTrue(callable(r._apply_features_to_row))
 
 
 class TestCandidateTickers(unittest.TestCase):

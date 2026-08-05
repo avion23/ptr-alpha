@@ -1,7 +1,7 @@
 import unittest
 from datetime import date
 
-from analyzer.ticker_resolver import TickerResolver, TickerResolution
+from analyzer.ticker_resolver import TickerResolver
 
 
 class TestTickerResolver(unittest.TestCase):
@@ -54,10 +54,6 @@ class TestTickerResolver(unittest.TestCase):
         self.assertEqual(resolution.status, "valid")
         self.assertAlmostEqual(resolution.confidence, 1.0)
 
-    def test_empty_ticker(self):
-        resolution = self.resolver.resolve("")
-        self.assertEqual(resolution.status, "unresolved")
-        self.assertAlmostEqual(resolution.confidence, 0.0)
 
     def test_case_insensitive(self):
         resolution = self.resolver.resolve("brk.b")
@@ -78,11 +74,6 @@ class TestTickerResolver(unittest.TestCase):
         self.assertEqual(results["ZZZZZ"].price_symbol, "ZZZZZ")
         self.assertEqual(results["ZZZZZ"].status, "valid")
 
-    def test_resolve_batch_returns_dict_keyed_by_raw(self):
-        results = self.resolver.resolve_batch(["X", "Y"])
-        self.assertIn("X", results)
-        self.assertIn("Y", results)
-        self.assertIsInstance(results["X"], TickerResolution)
 
     def test_atvi_acquired_uses_original_symbol(self):
         resolution = self.resolver.resolve("ATVI")

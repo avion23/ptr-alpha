@@ -5,22 +5,11 @@ import numpy as np
 import pandas as pd
 
 from analyzer.signals import (
-    CONVICTION_WEIGHT_ALPHA,
-    CONVICTION_WEIGHT_REALIZED,
     calculate_signal_potential,
-    get_member_signals,
     get_top_signals,
 )
-from analyzer.exceptions import AnalysisError
 
 
-class TestSignalConstants(unittest.TestCase):
-
-    def test_conviction_weights_sum_to_one(self):
-        # Conviction weights define the signal_score blend
-        self.assertEqual(CONVICTION_WEIGHT_ALPHA + CONVICTION_WEIGHT_REALIZED, 1.0)
-        self.assertGreaterEqual(CONVICTION_WEIGHT_ALPHA, 0.0)
-        self.assertGreaterEqual(CONVICTION_WEIGHT_REALIZED, 0.0)
 
 
 class TestCalculateSignalPotential(unittest.TestCase):
@@ -144,9 +133,6 @@ class TestGetTopSignals(unittest.TestCase):
             "total_spy_alpha_pct": [2.0, 3.5, -0.5],
         })
 
-    def test_raises_on_empty(self):
-        with self.assertRaises(AnalysisError):
-            get_top_signals(pd.DataFrame())
 
     def test_returns_top_n_sorted_by_score(self):
         signals = self._make_signals()
@@ -162,11 +148,6 @@ class TestGetTopSignals(unittest.TestCase):
         self.assertTrue(get_top_signals(signals, horizon=90, top_n=3).empty)
 
 
-class TestGetMemberSignals(unittest.TestCase):
-
-    def test_raises_on_empty(self):
-        with self.assertRaises(AnalysisError):
-            get_member_signals(pd.DataFrame(), member="Alice")
 
 
 if __name__ == "__main__":

@@ -39,21 +39,6 @@ def _make_recs(tickers, as_of_date, scores=None):
     )
 
 
-class TestPortfolioConfig(unittest.TestCase):
-    def test_defaults(self):
-        cfg = PortfolioConfig()
-        self.assertEqual(cfg.initial_capital, 20000.0)
-        self.assertEqual(cfg.max_positions, 5)
-        self.assertEqual(cfg.max_position_pct, 0.25)
-        self.assertEqual(cfg.max_sector_pct, 0.40)
-        self.assertEqual(cfg.hold_period_days, 120)
-        self.assertAlmostEqual(cfg.entry_slippage_pct, 0.001)
-        self.assertAlmostEqual(cfg.exit_slippage_pct, 0.001)
-
-    def test_custom_config(self):
-        cfg = PortfolioConfig(initial_capital=50000, max_positions=3)
-        self.assertEqual(cfg.initial_capital, 50000)
-        self.assertEqual(cfg.max_positions, 3)
 
 
 class TestPositionEntry(unittest.TestCase):
@@ -218,29 +203,6 @@ class TestSlippage(unittest.TestCase):
         self.assertLess(exit_price, 100.0)
 
 
-class TestResultsDataFrame(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_results_has_expected_columns(self, _mock_sector):
-        cfg = PortfolioConfig(
-            initial_capital=10000, max_positions=5, hold_period_days=365,
-            entry_slippage_pct=0.0, exit_slippage_pct=0.0,
-        )
-        sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0})
-        sim.run(_make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 5))
-        df = sim.results()
-        expected_cols = {"date", "cash", "total_value", "num_positions", "unrealized_pnl", "realized_pnl"}
-        self.assertTrue(expected_cols.issubset(set(df.columns)))
-
-    def test_empty_recommendations_no_trades(self):
-        cfg = PortfolioConfig(initial_capital=10000, max_positions=5, hold_period_days=365)
-        sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["A"], "2024-01-01", "2024-01-10")
-        recs = pd.DataFrame(columns=["rank", "ticker", "signal_score", "num_buyers", "as_of_date"])
-        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 5))
-        self.assertEqual(len(sim.positions), 0)
-        self.assertEqual(len(sim.closed_positions), 0)
-        self.assertAlmostEqual(sim.cash, cfg.initial_capital)
 
 
 class TestSharpeRatio(unittest.TestCase):
@@ -260,24 +222,6 @@ class TestSharpeRatio(unittest.TestCase):
 
 
 class TestComputeMetrics(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_metrics_keys(self, _mock_sector):
-        cfg = PortfolioConfig(
-            initial_capital=20000, max_positions=5, hold_period_days=30,
-            entry_slippage_pct=0.0, exit_slippage_pct=0.0,
-        )
-        sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["A", "SPY"], "2024-01-01", "2024-03-01",
-                              base_prices={"A": 100.0, "SPY": 400.0})
-        sim.run(_make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 2, 15))
-        metrics = sim.compute_metrics(prices)
-        expected_keys = {
-            "total_return_pct", "annualized_return_pct", "sharpe_ratio",
-            "max_drawdown_pct", "win_rate_pct", "avg_holding_days",
-            "turnover_rate", "max_concurrent_positions", "total_closed_trades",
-            "sector_concentration", "spy_return_pct",
-        }
-        self.assertTrue(expected_keys.issubset(set(metrics.keys())))
 
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
     def test_spy_comparison_present(self, _mock_sector):

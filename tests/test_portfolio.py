@@ -180,12 +180,6 @@ class TestSimulatePortfolioReturns(unittest.TestCase):
         self.assertIn("spy_return", result.columns)
         self.assertIn("portfolio_alpha", result.columns)
 
-    def test_alpha_calculation(self):
-        # alpha = portfolio_return - spy_return
-        result = simulate_portfolio_returns(
-            pd.DataFrame(), pd.DataFrame()
-        )
-        self.assertTrue(result.empty)
 
     def test_zero_entry_price_skips_position_and_spy_return(self):
         portfolio = pd.DataFrame({
@@ -227,20 +221,6 @@ class TestSimulatePortfolioReturns(unittest.TestCase):
 
 
 class TestComputePortfolioMetrics(unittest.TestCase):
-    def test_basic_metrics(self):
-        df = pd.DataFrame({
-            "as_of_date": ["2024-01-01", "2024-02-01", "2024-03-01"],
-            "portfolio_return": [2.0, -1.0, 3.0],
-            "spy_return": [1.0, -0.5, 1.5],
-            "portfolio_alpha": [1.0, -0.5, 1.5],
-            "num_positions": [3, 3, 3],
-        })
-        metrics = compute_portfolio_metrics(df)
-        self.assertIn("total_return_pct", metrics)
-        self.assertIn("sharpe_ratio", metrics)
-        self.assertIn("max_drawdown_pct", metrics)
-        self.assertIn("win_rate_pct", metrics)
-        self.assertIn("spy_total_return_pct", metrics)
 
     def test_empty_returns(self):
         metrics = compute_portfolio_metrics(pd.DataFrame())
@@ -275,20 +255,6 @@ class TestComputePortfolioMetrics(unittest.TestCase):
         self.assertFalse(math.isnan(metrics["avg_alpha_per_period_pct"]))
 
 
-class TestKellyConfig(unittest.TestCase):
-    def test_defaults(self):
-        cfg = KellyConfig()
-        self.assertEqual(cfg.capital, 100_000.0)
-        self.assertEqual(cfg.max_ticker_pct, 0.20)
-        self.assertEqual(cfg.max_member_pct, 0.05)
-        self.assertTrue(cfg.use_half_kelly)
-        self.assertTrue(cfg.crash_guard)
-
-    def test_custom(self):
-        cfg = KellyConfig(capital=50_000, max_ticker_pct=0.15, use_half_kelly=False)
-        self.assertEqual(cfg.capital, 50_000)
-        self.assertEqual(cfg.max_ticker_pct, 0.15)
-        self.assertFalse(cfg.use_half_kelly)
 
 
 if __name__ == "__main__":

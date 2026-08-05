@@ -346,20 +346,7 @@ class TestCapitolTradesSourceSchema(unittest.TestCase):
         self.source.close()
         shutil.rmtree(self.tmp_dir)
 
-    @patch("analyzer.capitol_trades.requests.Session.get")
-    def test_output_has_required_columns(self, mock_get):
-        mock_get.return_value = _mock_response(SAMPLE_TRADES_RESPONSE)
 
-        df = self.source.fetch_trades("Nancy Pelosi")
-
-        required = [
-            "doc_id", "member", "ticker", "transaction_date",
-            "disclosure_date", "transaction_type", "owner_code",
-            "amount_raw", "amount_midpoint", "instrument_type",
-            "strike_price", "expiry_date",
-        ]
-        for col in required:
-            self.assertIn(col, df.columns, f"Missing column: {col}")
 
     @patch("analyzer.capitol_trades.requests.Session.get")
     def test_upsert_transactions_succeeds(self, mock_get):

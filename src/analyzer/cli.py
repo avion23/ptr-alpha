@@ -887,6 +887,48 @@ def fetch_capitol(
 
 
 @app.command()
+def fetch_senate_efd(
+    ctx: typer.Context,
+    start: str | None = typer.Option(None, help="Start date (YYYY-MM-DD). Defaults to one year before end."),
+    end: str | None = typer.Option(None, help="End date (YYYY-MM-DD). Defaults to today."),
+    lookback: int | None = typer.Option(None, help="If set, look back N days from end (overrides --start)"),
+    data_dir: str = typer.Option("data/senate", help="Data directory (default: isolated senate DB)"),
+):
+    """Fetch Senate PTR trades from efdsearch.senate.gov (official source).
+
+    Loads into an isolated data directory so chamber separation is exact.
+    Then run: ptr-alpha analyze --year <YYYY> --data-dir data/senate
+    """
+    from datetime import timedelta
+    from analyzer.senate_efd import SenateEFDSource
+
+    try:
+        end_date = date.fromisoformat(end) if end else date.today()
+        if lookback is not None:
+            if lookback <= 0:
+                raise ValueError("lookback must be positive")
+            start_date = end_date - timedelta(days=lookback)
+        else:
+            start_date = date.fromisoformat(start) if start else end_date.replace(year=end_date.year - 1)
+    except ValueError:
+        print("Error: dates must be YYYY-MM-DD and lookback > 0", file=sys.stderr)
+        raise typer.Exit(1)
+
+    if start_date > end_date:
+        print("Error: --start must be on or before --end", file=sys.stderr)
+        raise typer.Exit(1)
+
+    src = SenateEFDSource(data_dir=data_dir, read_only=False)
+    try:
+        count = src.fetch_and_save_all(start_date, end_date)
+        print(f"Saved {count} new Senate eFD trades ({start_date} to {end_date}) into {data_dir}/")
+    finally:
+        src.close()
+
+    raise typer.Exit(0)
+
+
+@app.command()
 def validate(
     ctx: typer.Context,
     train_start: str = typer.Option("2022-01-01", help="Training window start (YYYY-MM-DD)"),

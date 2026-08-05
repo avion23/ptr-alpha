@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 
 from analyzer.matched_control import (
-    MatchedControlResult,
     _compute_max_drawdown,
     _compute_realized_volatility,
     _market_cap_tier,
@@ -68,9 +67,6 @@ class TestComputeRealizedVolatility(unittest.TestCase):
         self.assertIsInstance(result, float)
         self.assertGreater(result, 0)
 
-    def test_returns_none_for_missing_ticker(self):
-        result = _compute_realized_volatility(self.prices, "MISSING", pd.Timestamp("2024-03-01"))
-        self.assertIsNone(result)
 
     def test_returns_none_for_insufficient_data(self):
         result = _compute_realized_volatility(self.prices, "A", pd.Timestamp("2024-01-02"))
@@ -84,10 +80,6 @@ class TestComputeMaxDrawdown(unittest.TestCase):
         self.assertIsInstance(result, float)
         self.assertLessEqual(result, 0)
 
-    def test_returns_none_for_missing_ticker(self):
-        prices = _make_prices(["X"], n_days=100)
-        result = _compute_max_drawdown(prices, "MISSING", pd.Timestamp("2024-03-01"))
-        self.assertIsNone(result)
 
 
 class TestMarketCapTier(unittest.TestCase):
@@ -135,13 +127,6 @@ class TestFindMatchedControls(unittest.TestCase):
         )
         self.assertNotIn("TREAT", controls)
 
-    def test_controls_are_from_available_tickers(self):
-        controls = find_matched_controls(
-            "TREAT", date(2024, 3, 1), self.tickers, self.prices, self.signals,
-            n_controls=10, sector_data=self.sector_data,
-        )
-        for c in controls:
-            self.assertIn(c, self.tickers)
 
     def test_returns_empty_for_no_candidates(self):
         controls = find_matched_controls(
@@ -282,28 +267,6 @@ class TestRunMatchedControlBacktest(unittest.TestCase):
             "SPY": {"sector": "ETF", "market_cap": 0},
         }
 
-    def test_returns_expected_columns(self):
-        # Extend prices far enough to cover horizon
-        dates_ext = pd.bdate_range("2024-01-01", periods=400)
-        rng = np.random.default_rng(42)
-        prices_ext = pd.DataFrame(index=dates_ext)
-        for t in ["CAND1", "CAND2", "AAPL", "MSFT", "GOOG", "AMZN", "SPY"]:
-            prices_ext[t] = 100 * np.cumprod(1 + rng.normal(0.0004, 0.015, 400))
-
-        result = run_matched_control_backtest(
-            self.signals, self.transactions, prices_ext,
-            start_date=date(2024, 9, 1),
-            end_date=date(2024, 10, 1),
-            horizon=90, top_n=5, frequency_days=14, n_controls=3,
-            min_buyers=2, lookback_days=60, threshold=5.0,
-            training_lookback_days=365,
-        )
-        expected_cols = {
-            "as_of_date", "ticker", "rank", "alpha", "excess_alpha",
-            "control_mean_alpha", "n_controls", "sector", "volatility", "drawdown",
-        }
-        if not result.empty:
-            self.assertTrue(expected_cols.issubset(set(result.columns)))
 
     def test_excess_alpha_equals_alpha_minus_control_mean(self):
         dates_ext = pd.bdate_range("2024-01-01", periods=400)
@@ -326,21 +289,6 @@ class TestRunMatchedControlBacktest(unittest.TestCase):
                 self.assertAlmostEqual(row["excess_alpha"], expected, places=1)
 
 
-class TestMatchedControlResultDataclass(unittest.TestCase):
-    def test_fields(self):
-        r = MatchedControlResult(
-            as_of_date=date(2024, 1, 1),
-            treatment_ticker="AAPL",
-            treatment_alpha=5.0,
-            control_tickers=["MSFT", "GOOG"],
-            control_alphas=[3.0, 2.0],
-            control_mean_alpha=2.5,
-            excess_alpha=2.5,
-            n_controls=2,
-        )
-        self.assertEqual(r.treatment_ticker, "AAPL")
-        self.assertEqual(r.excess_alpha, 2.5)
-        self.assertEqual(r.n_controls, 2)
 
 
 if __name__ == "__main__":

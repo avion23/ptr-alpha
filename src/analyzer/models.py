@@ -8,6 +8,13 @@ class TransactionType(StrEnum):
     EXCHANGE = "Exchange"
 
 
+class AnalysisMode(StrEnum):
+    MEMBER_SIGNALS = "member_signals"
+    TOP_SIGNALS = "top_signals"
+    MEMBER_RANKINGS = "member_rankings"
+    SALE_RANKINGS = "sale_rankings"
+
+
 class FilingType(StrEnum):
     PTR = "P"
     AMENDMENT = "A"

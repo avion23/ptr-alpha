@@ -12,10 +12,12 @@ import pytest
 from analyzer.validation import (
     SweepResult,
     newey_west_tstat,
+    run_single_backtest,
     select_config,
     sweep_configs,
     run_validation,
 )
+from analyzer.pipeline import BacktestParams
 
 
 class TestValidationBoundaries:
@@ -46,6 +48,100 @@ class TestValidationBoundaries:
                 {"horizon": [0]},
             )
 
+
+class TestBacktestParameterIsolation:
+    @staticmethod
+    def _params() -> BacktestParams:
+        return BacktestParams(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 1),
+            horizon=60,
+            lookback_days=60,
+            training_lookback_days=365,
+            min_buyers=1,
+            top_n=1,
+            threshold=5.0,
+            frequency_days=30,
+        )
+
+    def test_bayes_prior_is_explicit_different_and_deterministic(self):
+        from analyzer import signals as signals_mod
+
+        original_bayes = signals_mod.BAYES_PRIOR_STRENGTH
+        original_decay = signals_mod.DECAY_LAMBDA
+        observed_strengths = []
+
+        def fake_recommendations(*args, bayes_prior_strength=None, **kwargs):
+            observed_strengths.append(bayes_prior_strength)
+            return pd.DataFrame(
+                {"rank": [1], "ticker": ["TEST"], "prior": [bayes_prior_strength]}
+            )
+
+        def fake_evaluate(recommendations, *args, **kwargs):
+            prior = float(recommendations["prior"].iloc[0])
+            return recommendations.assign(bt_return_pct=prior, bt_alpha_pct=prior)
+
+        with (
+            patch(
+                "analyzer.validation.analysis.backtest_recommendations",
+                side_effect=fake_recommendations,
+            ),
+            patch(
+                "analyzer.validation.analysis.evaluate_backtest",
+                side_effect=fake_evaluate,
+            ),
+        ):
+            low = run_single_backtest(
+                pd.DataFrame(), pd.DataFrame(), self._params(), pd.DataFrame(), 1.0, 0.001
+            )
+            high = run_single_backtest(
+                pd.DataFrame(), pd.DataFrame(), self._params(), pd.DataFrame(), 40.0, 0.001
+            )
+            low_again = run_single_backtest(
+                pd.DataFrame(), pd.DataFrame(), self._params(), pd.DataFrame(), 1.0, 0.001
+            )
+
+        assert low == low_again
+        assert low.overall_alpha != high.overall_alpha
+        assert observed_strengths == [1.0, 40.0, 1.0]
+        assert signals_mod.BAYES_PRIOR_STRENGTH == original_bayes
+        assert signals_mod.DECAY_LAMBDA == original_decay
+
+    def test_expected_data_error_is_logged_and_skipped(self, caplog):
+        with (
+            patch(
+                "analyzer.validation.analysis.backtest_recommendations",
+                return_value=pd.DataFrame({"rank": [1]}),
+            ),
+            patch(
+                "analyzer.validation.analysis.evaluate_backtest",
+                side_effect=KeyError("missing price column"),
+            ),
+            caplog.at_level("WARNING", logger="analyzer.validation"),
+        ):
+            result = run_single_backtest(
+                pd.DataFrame(), pd.DataFrame(), self._params(), pd.DataFrame(), 20.0, 0.005
+            )
+
+        assert result.total_recs == 0
+        assert "2024-01-01" in caplog.text
+        assert "Skipped 1 backtest evaluation date(s)" in caplog.text
+
+    def test_programming_error_propagates(self):
+        with (
+            patch(
+                "analyzer.validation.analysis.backtest_recommendations",
+                return_value=pd.DataFrame({"rank": [1]}),
+            ),
+            patch(
+                "analyzer.validation.analysis.evaluate_backtest",
+                side_effect=RuntimeError("bug"),
+            ),
+            pytest.raises(RuntimeError, match="bug"),
+        ):
+            run_single_backtest(
+                pd.DataFrame(), pd.DataFrame(), self._params(), pd.DataFrame(), 20.0, 0.005
+            )
 
 # ---------------------------------------------------------------------------
 # newey_west_tstat
@@ -559,4 +655,3 @@ class TestRunValidationConfigFreezing:
 # ---------------------------------------------------------------------------
 # Smoke test: sweep.py still imports from analyzer.validation
 # ---------------------------------------------------------------------------
-

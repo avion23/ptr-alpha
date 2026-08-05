@@ -5,6 +5,7 @@ from datetime import date
 
 import duckdb
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 
 from analyzer.ticker_resolver import TickerResolver
 
@@ -57,8 +58,18 @@ class PriceRepository:
                 close = EXCLUDED.close
         """)
 
-    def get_missing(self, tickers: list[str], start_date: date, end_date: date) -> tuple[list[str], list[pd.Timestamp]]:
-        all_dates = pd.date_range(start_date, end_date, freq="B")
+    def get_missing(
+        self, tickers: list[str], start_date: date, end_date: date
+    ) -> tuple[list[str], list[pd.Timestamp]]:
+        if not tickers:
+            return [], []
+
+        business_dates = pd.bdate_range(start_date, end_date)
+        holidays = USFederalHolidayCalendar().holidays(start=start_date, end=end_date)
+        required_dates = business_dates.difference(holidays)
+        if required_dates.empty:
+            return [], []
+
         existing = self.conn.execute(
             """
             SELECT DISTINCT ticker, date
@@ -70,7 +81,7 @@ class PriceRepository:
         ).fetchdf()
 
         if existing.empty:
-            return tickers, all_dates.to_list()
+            return tickers, required_dates.to_list()
 
         existing_tickers = set(existing["ticker"].unique())
         missing_tickers = [t for t in tickers if t not in existing_tickers]
@@ -84,23 +95,22 @@ class PriceRepository:
                 if pd.notna(val) and pd.Timestamp(val) > start_cutoff:
                     insufficient.append(t)
 
-        need_full_fetch = missing_tickers + insufficient
-        if need_full_fetch:
-            return need_full_fetch, all_dates.to_list()
-
         existing["date"] = pd.to_datetime(existing["date"])
-        all_dates_set = set(all_dates)
+        required_dates_set = set(required_dates)
         per_ticker_dates = existing.groupby("ticker")["date"].apply(set)
 
-        tickers_with_gaps: list[str] = []
-        gap_dates: set = set()
+        tickers_with_gaps = list(missing_tickers)
+        gap_dates: set[pd.Timestamp] = set()
         for ticker in tickers:
-            if ticker in per_ticker_dates.index:
-                ticker_dates = per_ticker_dates[ticker]
-                gaps = all_dates_set - ticker_dates
-                if gaps:
-                    tickers_with_gaps.append(ticker)
-                    gap_dates.update(gaps)
+            if ticker not in per_ticker_dates.index:
+                gap_dates.update(required_dates_set)
+                continue
+
+            ticker_dates = per_ticker_dates[ticker]
+            gaps = required_dates_set - ticker_dates
+            if gaps or ticker in insufficient:
+                tickers_with_gaps.append(ticker)
+                gap_dates.update(gaps)
 
         if tickers_with_gaps:
             missing_dates_list = sorted(gap_dates)

@@ -3,7 +3,6 @@
 import sys
 import logging
 from datetime import date
-from enum import StrEnum
 from pathlib import Path
 from dataclasses import dataclass
 import pandas as pd
@@ -27,13 +26,7 @@ from analyzer.exceptions import AnalyzerError
 from analyzer.settings import Settings
 from analyzer.database import Database
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
-
-
-class DisplayMode(StrEnum):
-    MEMBER_SIGNALS = "member_signals"
-    TOP_SIGNALS = "top_signals"
-    SALE_RANKINGS = "sale_rankings"
-    MEMBER_RANKINGS = "member_rankings"
+from analyzer.models import AnalysisMode
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 logger = logging.getLogger(__name__)
@@ -73,22 +66,25 @@ def get_context(ctx, data_dir=None, read_only=False):
 
 
 def _save_results(
-    table: pd.DataFrame, output_format: str, display_mode: DisplayMode,
-    member_filter: str | None, show_signals: bool, data_dir: Path
+    table: pd.DataFrame,
+    output_format: str,
+    mode: AnalysisMode,
+    member_filter: str | None,
+    data_dir: Path,
 ) -> None:
-    match display_mode:
-        case DisplayMode.MEMBER_SIGNALS | DisplayMode.TOP_SIGNALS:
+    match mode:
+        case AnalysisMode.MEMBER_SIGNALS | AnalysisMode.TOP_SIGNALS:
             display_cols = [
                 'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct',
                 'total_return_pct', 'total_spy_alpha_pct', 'signal_score'
             ]
-        case DisplayMode.SALE_RANKINGS:
+        case AnalysisMode.SALE_RANKINGS:
             display_cols = [
                 'member', 'avg_loss_avoided_pct', 'median_loss_avoided_pct',
                 'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'posterior_lift', 'bayes_factor',
                 'avg_spy_alpha_pct',
             ]
-        case DisplayMode.MEMBER_RANKINGS:
+        case AnalysisMode.MEMBER_RANKINGS:
             display_cols = [
                 'member', 'avg_total_spy_alpha_pct', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'bayes_factor', 'conviction_score', 'purchase_trades'
             ]
@@ -98,14 +94,17 @@ def _save_results(
     display_table = table[available_display]
 
     if output_format == 'csv':
-        if member_filter:
-            filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
-        elif show_signals:
-            filename = "top_signals.csv"
-        elif display_mode == DisplayMode.SALE_RANKINGS:
-            filename = "sale_rankings.csv"
-        else:
-            filename = "member_rankings.csv"
+        match mode:
+            case AnalysisMode.MEMBER_SIGNALS:
+                if member_filter is None:
+                    raise ValueError("member_filter is required for member signals")
+                filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
+            case AnalysisMode.TOP_SIGNALS:
+                filename = "top_signals.csv"
+            case AnalysisMode.SALE_RANKINGS:
+                filename = "sale_rankings.csv"
+            case AnalysisMode.MEMBER_RANKINGS:
+                filename = "member_rankings.csv"
 
         filepath = data_dir / filename
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -234,7 +233,9 @@ def _run_sales_mode(
         app_ctx.transaction_source, app_ctx.price_source
     )
     if result.success and hasattr(result, 'data') and result.data:
-        _save_results(result.data["table"], output, DisplayMode.SALE_RANKINGS, None, False, data_path)
+        _save_results(
+            result.data["table"], output, AnalysisMode.SALE_RANKINGS, None, data_path
+        )
     raise typer.Exit(0 if result.success else 1)
 
 
@@ -243,14 +244,19 @@ def _run_analysis_mode(
     member: str | None, top_n: int, mode: str, output: str, sectors: bool,
 ) -> None:
     """Handle ranks/signals/member modes via run_analysis_pipeline."""
-    show_signals = mode == "signals"
+    if member is not None:
+        analysis_mode = AnalysisMode.MEMBER_SIGNALS
+    elif mode == "signals":
+        analysis_mode = AnalysisMode.TOP_SIGNALS
+    else:
+        analysis_mode = AnalysisMode.MEMBER_RANKINGS
     params = AnalysisParams(
         year=year,
         horizons=tuple(horizons),
         threshold=threshold,
         member_filter=member,
         top_n=top_n,
-        show_signals=show_signals,
+        mode=analysis_mode,
         include_sector_analysis=sectors,
     )
     data_path = Path(app_ctx.settings.data.data_dir)
@@ -258,15 +264,17 @@ def _run_analysis_mode(
         params, app_ctx.transaction_source, app_ctx.price_source
     )
     if result.success and hasattr(result, 'data') and result.data:
-        if params.member_filter:
-            display_mode = DisplayMode.MEMBER_SIGNALS
-        elif show_signals:
-            display_mode = DisplayMode.TOP_SIGNALS
-        else:
-            display_mode = DisplayMode.MEMBER_RANKINGS
-        _save_results(result.data["table"], output, display_mode,
-                      result.data["member_filter"], result.data["show_signals"], data_path)
-        if result.data["sector_results"] is not None and not params.member_filter and not show_signals:
+        _save_results(
+            result.data["table"],
+            output,
+            result.data["mode"],
+            result.data["member_filter"],
+            data_path,
+        )
+        if (
+            result.data["sector_results"] is not None
+            and result.data["mode"] == AnalysisMode.MEMBER_RANKINGS
+        ):
             print("\n=== Sector Analysis ===")
             print(result.data["sector_results"].to_string(index=False))
     raise typer.Exit(0 if result.success else 1)

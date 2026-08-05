@@ -12,8 +12,9 @@ from analyzer.pipeline import (
     prepare_live_analysis_data,
     run_recent_ticker_scoring,
 )
-from analyzer.cli import DisplayMode, _save_results
+from analyzer.cli import _save_results
 from analyzer.exceptions import DataSourceError
+from analyzer.models import AnalysisMode
 
 
 
@@ -227,7 +228,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", DisplayMode.MEMBER_RANKINGS, None, False, data_dir)
+            _save_results(table, "csv", AnalysisMode.MEMBER_RANKINGS, None, data_dir)
 
             filepath = data_dir / "member_rankings.csv"
             self.assertTrue(filepath.exists())
@@ -244,12 +245,12 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", DisplayMode.MEMBER_SIGNALS, "John Doe", True, data_dir)
+            _save_results(table, "csv", AnalysisMode.MEMBER_SIGNALS, "John Doe", data_dir)
 
             filepath = data_dir / "john_doe_signals.csv"
             self.assertTrue(filepath.exists())
 
-    def test_csv_output_show_signals_filename(self):
+    def test_csv_output_top_signals_filename(self):
         table = pd.DataFrame({
             "member": ["Alice"],
             "spy_alpha_pct": [10.0],
@@ -257,7 +258,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", DisplayMode.TOP_SIGNALS, None, True, data_dir)
+            _save_results(table, "csv", AnalysisMode.TOP_SIGNALS, None, data_dir)
 
             filepath = data_dir / "top_signals.csv"
             self.assertTrue(filepath.exists())
@@ -278,7 +279,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
+            _save_results(table, "csv", AnalysisMode.SALE_RANKINGS, None, data_dir)
 
             saved = pd.read_csv(data_dir / "sale_rankings.csv")
             self.assertIn("avg_loss_avoided_pct", saved.columns)
@@ -294,7 +295,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
+            _save_results(table, "csv", AnalysisMode.SALE_RANKINGS, None, data_dir)
 
             self.assertTrue((data_dir / "sale_rankings.csv").exists())
             self.assertFalse((data_dir / "member_rankings.csv").exists())
@@ -313,7 +314,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
+            _save_results(table, "csv", AnalysisMode.SALE_RANKINGS, None, data_dir)
 
             saved = pd.read_csv(data_dir / "sale_rankings.csv")
             self.assertIn("avg_loss_avoided_pct", saved.columns)
@@ -335,7 +336,7 @@ class TestSaveResults(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            _save_results(table, "csv", DisplayMode.SALE_RANKINGS, None, False, data_dir)
+            _save_results(table, "csv", AnalysisMode.SALE_RANKINGS, None, data_dir)
 
             saved = pd.read_csv(data_dir / "sale_rankings.csv")
             self.assertNotIn("purchase_trades", saved.columns)

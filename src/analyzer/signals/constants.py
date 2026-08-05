@@ -1,9 +1,9 @@
 """Module-level constants for the signals pipeline.
 
-These are global defaults read by ``calculate_signal_potential`` and other
-signal functions.  ``DECAY_LAMBDA`` and ``BAYES_PRIOR_STRENGTH`` are **not**
-``Final`` — ``validation.py`` saves/restores them at runtime during parameter
-sweeps.  The remaining constants are truly immutable and declared ``Final``.
+These are module defaults read by ``calculate_signal_potential`` and other
+signal functions. Parameter sweeps pass ``DECAY_LAMBDA`` and
+``BAYES_PRIOR_STRENGTH`` values explicitly instead of changing these defaults.
+The remaining constants are immutable and declared ``Final``.
 """
 
 from typing import Final

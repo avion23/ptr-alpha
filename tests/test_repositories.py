@@ -537,13 +537,24 @@ class TestPriceRepository(DatabaseTestCase):
         self.assertEqual(count, 0)
 
     def test_get_missing_all_missing(self):
-        # Brand-new ticker → full business-day date range returned.
+        # Brand-new ticker → full trading-day date range returned.
         missing_tickers, missing_dates = self.repo.get_missing(
             ["AAPL"], date(2024, 1, 1), date(2024, 1, 5)
         )
         self.assertEqual(missing_tickers, ["AAPL"])
-        expected = list(pd.date_range("2024-01-01", "2024-01-05", freq="B"))
+        expected = list(pd.date_range("2024-01-02", "2024-01-05", freq="B"))
         self.assertEqual(missing_dates, expected)
+
+    def test_get_missing_ignores_market_holiday(self):
+        dates = pd.to_datetime(["2024-07-03", "2024-07-05"])
+        self.repo.upsert(pd.DataFrame({"AAPL": [100.0, 101.0]}, index=dates))
+
+        missing_tickers, missing_dates = self.repo.get_missing(
+            ["AAPL"], date(2024, 7, 3), date(2024, 7, 5)
+        )
+
+        self.assertEqual(missing_tickers, [])
+        self.assertEqual(missing_dates, [])
 
     def test_get_missing_partial_gaps(self):
         # AAPL has Jan 1-2 only; gaps are Jan 3-5 business days.
@@ -601,7 +612,7 @@ class TestPriceRepository(DatabaseTestCase):
     def test_get_missing_insufficient_history(self):
         # Ticker EXISTS but its earliest price is more than 7 calendar days
         # after start_date (start_cutoff) -> the "insufficient" branch
-        # triggers a FULL refetch (all business days), not just the early gap.
+        # remains a real coverage gap and returns the actual missing trading days.
         late_dates = pd.bdate_range("2024-01-20", "2024-01-31")
         prices = pd.DataFrame({"AAPL": range(len(late_dates))}, index=late_dates)
         self.repo.upsert(prices)
@@ -610,9 +621,11 @@ class TestPriceRepository(DatabaseTestCase):
             ["AAPL"], date(2024, 1, 1), date(2024, 1, 31)
         )
         self.assertEqual(missing_tickers, ["AAPL"])
-        # Full business-day range Jan 1-31, not just the Jan 1-19 hole.
         self.assertEqual(
-            missing_dates, list(pd.bdate_range("2024-01-01", "2024-01-31"))
+            missing_dates,
+            list(pd.bdate_range("2024-01-02", "2024-01-19").difference(
+                pd.to_datetime(["2024-01-15"])
+            )),
         )
 
     # -- get_entry_prices (previously completely untested) ---------------

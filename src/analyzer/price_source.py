@@ -3,7 +3,7 @@
 import logging
 import re
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -68,22 +68,23 @@ class YFinancePriceSource(PriceSource):
 
         return self._fetch_and_merge_prices(
             all_tickers, raw_to_yf, yf_to_raw, cached_prices, start, end,
-            missing_tickers,
+            missing_tickers, missing_dates,
         )
 
     def _fetch_and_merge_prices(
         self, all_tickers, raw_to_yf, yf_to_raw, cached_prices, start, end,
-        missing_tickers,
+        missing_tickers, missing_dates,
     ) -> pd.DataFrame:
         """Fetch missing data from yfinance and merge with the cache."""
         fetch_tickers = missing_tickers if missing_tickers else all_tickers
         fetch_resolved = sorted(set(raw_to_yf.get(t, t) for t in fetch_tickers))
+        fetch_start, fetch_end = _missing_fetch_window(missing_dates, start, end)
 
         logger.info(
             f"Fetching price data for {len(fetch_resolved)} tickers using yfinance"
         )
 
-        data = self._download_yfinance(fetch_resolved, start, end)
+        data = self._download_yfinance(fetch_resolved, fetch_start, fetch_end)
         if data.empty:
             if not cached_prices.empty:
                 logger.warning("yfinance failed, using cached data")
@@ -162,6 +163,15 @@ class YFinancePriceSource(PriceSource):
 
 
 # ── Helpers ──
+
+def _missing_fetch_window(missing_dates, start: date, end: date) -> tuple[date, date]:
+    """Return the narrow missing span, with an exclusive yfinance end date."""
+    if not missing_dates:
+        return start, end + timedelta(days=1)
+
+    first_missing = pd.Timestamp(min(missing_dates)).date()
+    last_missing = pd.Timestamp(max(missing_dates)).date()
+    return max(start, first_missing), min(end, last_missing) + timedelta(days=1)
 
 def _clean_tickers(tickers: list[str]) -> list[str]:
     """Filter out NaN/None/empty/garbage tickers from the input list."""

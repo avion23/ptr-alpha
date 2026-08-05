@@ -22,23 +22,23 @@ from __future__ import annotations
 
 import functools
 from typing import Any, Callable
+from weakref import WeakSet
 
 import pandas as pd
 
 
-_REGISTRY: list = []
-"""Track all ``df_memoize``-wrapped functions so the sweep can clear them."""
+_CACHE_MAXSIZE = 2048
+_REGISTRY: WeakSet[Callable] = WeakSet()
+"""Weakly track live ``df_memoize`` wrappers for bulk cache clearing."""
 
 
 def clear_all_caches() -> None:
     """Clear every ``lru_cache`` created by :func:`df_memoize`.
 
-    Call this between parameter-sweep combos when a swept constant
-    (e.g. ``DECAY_LAMBDA``) affects cached results but is *not* an
-    explicit argument to the memoized function.
+    Dead transient wrappers disappear from the weak registry automatically.
     """
-    for w in _REGISTRY:
-        w.cache_clear()
+    for wrapper in list(_REGISTRY):
+        wrapper.cache_clear()  # type: ignore[attr-defined]
 
 
 class _IdentityProxy:
@@ -80,7 +80,7 @@ def df_memoize(func: Callable | None = None, *, copy: bool = True) -> Callable:
     """
 
     def _decorator(f: Callable) -> Callable:
-        @functools.lru_cache(maxsize=None)
+        @functools.lru_cache(maxsize=_CACHE_MAXSIZE)
         def _cached(*w_args: Any, **w_kwargs: Any) -> Any:
             args = tuple(_unwrap(a) for a in w_args)
             kwargs = {k: _unwrap(v) for k, v in w_kwargs.items()}
@@ -97,7 +97,7 @@ def df_memoize(func: Callable | None = None, *, copy: bool = True) -> Callable:
 
         wrapper.cache_clear = _cached.cache_clear  # type: ignore[attr-defined]
         wrapper.cache_info = _cached.cache_info  # type: ignore[attr-defined]
-        _REGISTRY.append(wrapper)
+        _REGISTRY.add(wrapper)
         return wrapper
 
     if func is None:

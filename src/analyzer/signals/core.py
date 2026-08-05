@@ -198,9 +198,8 @@ def calculate_signal_potential(
       - total_spy_alpha_pct total_return - actual_spy_return (× 100)
       - decayed_spy_return_pct  SPY return on the same window
     """
-    # Resolve at call time so callers that mutate the module global
-    # (e.g. the parameter sweep) see the updated value. A default-arg
-    # would freeze the value at function-definition time.
+    # Resolve at call time so a changed application default is observed. Sweeps
+    # pass this argument explicitly and do not mutate shared module state.
     if horizons is None:
         horizons = [30, 60, 90, 180]
     if decay_lambda is None:

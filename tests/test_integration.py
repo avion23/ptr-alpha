@@ -7,6 +7,7 @@ from analyzer.settings import Settings, DataSettings
 from analyzer.pipeline import run_analysis_pipeline, AnalysisParams
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
 from analyzer.database import Database
+from analyzer.models import AnalysisMode
 
 
 class TestIntegration(unittest.TestCase):
@@ -69,6 +70,7 @@ class TestIntegration(unittest.TestCase):
             horizons=[30, 90],
             threshold=5.0,
             member_filter='Alice Smith',
+            mode=AnalysisMode.MEMBER_SIGNALS,
             top_n=5,
         )
 

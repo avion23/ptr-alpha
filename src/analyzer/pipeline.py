@@ -11,7 +11,7 @@ import pandas as pd
 
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
 from analyzer.member_names import canonical_member_key
-from analyzer.models import TransactionType
+from analyzer.models import AnalysisMode, TransactionType
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer import analysis
 
@@ -28,7 +28,7 @@ class AnalysisParams:
     source: str = "house"
     member_filter: str | None = None
     top_n: int | None = None
-    show_signals: bool = False
+    mode: AnalysisMode = AnalysisMode.MEMBER_RANKINGS
     include_sector_analysis: bool = False
 
 
@@ -172,7 +172,14 @@ def run_analysis_pipeline(
 ) -> DataResult:
     trades, prices, signals = prepare_analysis_data(transaction_source, price_source, params.year, params.horizons)
 
-    table = analysis.get_analysis_table(signals, params.member_filter, params.show_signals, params.horizons[0], params.top_n, params.threshold)
+    table = analysis.get_analysis_table(
+        signals,
+        params.mode,
+        params.member_filter,
+        params.horizons[0],
+        params.top_n,
+        params.threshold,
+    )
     logger.info("Generated analysis table with %d rows", len(table))
 
     sector_results = (
@@ -184,7 +191,7 @@ def run_analysis_pipeline(
         "table": table,
         "sector_results": sector_results,
         "member_filter": params.member_filter,
-        "show_signals": params.show_signals,
+        "mode": params.mode,
     })
 
 @pipeline_step

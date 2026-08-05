@@ -40,13 +40,13 @@ def backtest_recommendations(
     training_lookback_days: int | None = None,
     solo_buyer_skill_threshold: float = 0.60,
     scoring_mode: str = "shrunk_alpha",
+    bayes_prior_strength: float | None = None,
 ) -> pd.DataFrame:
-    # Read the bayes prior strength once at entry. The sweep mutates the
-    # module global per combo; we capture the current value and plumb it
-    # explicitly through the memoized leaf functions so their cache keys
-    # distinguish combos that differ only in bayes prior.
-    from analyzer.signals import BAYES_PRIOR_STRENGTH
-    bayes = BAYES_PRIOR_STRENGTH
+    if bayes_prior_strength is None:
+        from analyzer.signals import BAYES_PRIOR_STRENGTH
+
+        bayes_prior_strength = BAYES_PRIOR_STRENGTH
+    bayes = bayes_prior_strength
 
     as_of_iso = as_of_date.isoformat()
     training_lookback_iso = (

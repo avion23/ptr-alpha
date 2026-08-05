@@ -8,6 +8,7 @@ from analyzer.analysis import (
     bayes_factor_against_market, _collapse_to_episodes,
 )
 from analyzer.exceptions import AnalysisError
+from analyzer.models import AnalysisMode
 
 from .conftest import make_entry_prices
 
@@ -211,14 +212,26 @@ class TestAnalysis(unittest.TestCase):
 
     def test_get_analysis_table_member_filter(self):
         signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
-        table = get_analysis_table(signals, 'Alice', False, 90, 5, 5.0)
+        table = get_analysis_table(
+            signals, AnalysisMode.MEMBER_SIGNALS, 'Alice', 90, 5, 5.0
+        )
 
         self.assertFalse(table.empty)
         self.assertIn('ticker', table.columns)
 
-    def test_get_analysis_table_show_signals(self):
+    def test_get_analysis_table_member_mode_requires_member(self):
         signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
-        table = get_analysis_table(signals, None, True, 90, 5, 5.0)
+
+        with self.assertRaisesRegex(ValueError, "member_filter is required"):
+            get_analysis_table(
+                signals, AnalysisMode.MEMBER_SIGNALS, None, 90, 5, 5.0
+            )
+
+    def test_get_analysis_table_top_signals(self):
+        signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
+        table = get_analysis_table(
+            signals, AnalysisMode.TOP_SIGNALS, None, 90, 5, 5.0
+        )
 
         self.assertFalse(table.empty)
         for col in ['member', 'ticker', 'disclosure_date', 'peak_potential_pct']:
@@ -226,7 +239,9 @@ class TestAnalysis(unittest.TestCase):
 
     def test_get_analysis_table_rank_members(self):
         signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])
-        table = get_analysis_table(signals, None, False, 90, 1, 5.0)
+        table = get_analysis_table(
+            signals, AnalysisMode.MEMBER_RANKINGS, None, 90, 1, 5.0
+        )
 
         self.assertFalse(table.empty)
         self.assertTrue('member' in table.columns)

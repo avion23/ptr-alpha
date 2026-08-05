@@ -31,7 +31,7 @@ import pandas as pd
 from scipy import stats
 
 from analyzer import analysis
-from analyzer import signals as signals_mod
+from analyzer.exceptions import AnalysisError
 from analyzer.pipeline import BacktestParams
 from analyzer.snooping import benjamini_hochberg, bonferroni_correction
 
@@ -88,11 +88,6 @@ def _backtest_core(
     The per-date series is needed for Newey-West t-stat computation.
     run_single_backtest is a thin public wrapper that discards the series.
     """
-    old_bayes = signals_mod.BAYES_PRIOR_STRENGTH
-    old_decay = signals_mod.DECAY_LAMBDA
-    signals_mod.BAYES_PRIOR_STRENGTH = bayes_prior_strength
-    signals_mod.DECAY_LAMBDA = decay_lambda
-
     empty = SweepResult(
         horizon=params.horizon,
         frequency_days=params.frequency_days,
@@ -104,108 +99,109 @@ def _backtest_core(
         scoring_mode=scoring_mode,
     )
 
-    try:
-        as_of_dates = pd.date_range(
-            params.start_date, params.end_date, freq=f"{params.frequency_days}D"
-        )
+    as_of_dates = pd.date_range(
+        params.start_date, params.end_date, freq=f"{params.frequency_days}D"
+    )
 
-        all_results = []
-        for as_of in as_of_dates:
-            as_of_ts = pd.Timestamp(as_of)
-            recs = analysis.backtest_recommendations(
-                signals, all_transactions, as_of_ts,
-                horizon=params.horizon,
-                lookback_days=params.lookback_days,
-                min_buyers=params.min_buyers,
-                top_n=params.top_n,
-                threshold=params.threshold,
-                prices_df=prices,
-                training_lookback_days=params.training_lookback_days,
-                scoring_mode=scoring_mode,
-            )
-            if recs.empty:
-                continue
-            try:
-                evaluated = analysis.evaluate_backtest(
-                    recs, prices, as_of_ts, params.horizon
-                )
-                evaluated = evaluated.dropna(subset=["bt_return_pct"])
-                evaluated.insert(0, "as_of_date", as_of_ts.date())
-                all_results.append(evaluated)
-            except Exception:
-                continue  # nosec B112
-
-        if not all_results:
-            return empty, pd.Series(dtype=float)
-
-        combined = pd.concat(all_results, ignore_index=True)
-        valid = combined.dropna(subset=["bt_alpha_pct"])
-
-        # Per-date mean alpha (NW t-stat needs this series ordered by date)
-        per_date = (
-            valid.groupby("as_of_date")["bt_alpha_pct"]
-            .mean()
-            .sort_index()
-        )
-
-        # Compute all mutable values before constructing the frozen SweepResult
-        rank_alpha = valid.groupby("rank")["bt_alpha_pct"].mean()
-        r1 = round(float(rank_alpha.loc[1]), 2) if 1 in rank_alpha.index else 0.0
-        r5 = round(float(rank_alpha.loc[5]), 2) if 5 in rank_alpha.index else 0.0
-        # Convention: rank 1 = highest-scored ticker (best model prediction).
-        # A well-calibrated ranker has rank-1 picks outperforming rank-5 picks,
-        # so alpha_slope > 0 means the ranker is working.
-        alpha_slope = round(r1 - r5, 2)
-        win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
-
-        # Sharpe and max_drawdown are time-series portfolio metrics and must
-        # be computed on the per-date mean-alpha series (one observation per
-        # rebalance date).  Using per-rec alphas here would (a) treat same-date
-        # correlated picks as independent obs for Sharpe and (b) compound
-        # returns across (date, ticker) pairs in arbitrary concat order for
-        # max_drawdown — neither of which corresponds to a portfolio the
-        # strategy actually held.
-        sharpe = 0.0
-        if len(per_date) > 1:
-            mean_a = per_date.mean()
-            std_a = per_date.std()
-            if std_a > 0:
-                periods_per_year = 365 / params.frequency_days
-                sharpe = round(
-                    float(mean_a / std_a * (periods_per_year ** 0.5)), 2
-                )
-
-        cumulative = (1 + per_date / 100).cumprod()
-        rolling_max = cumulative.cummax()
-        drawdown = (cumulative - rolling_max) / rolling_max
-        max_drawdown = round(float(drawdown.min()) * 100, 2)
-
-        result = SweepResult(
+    all_results = []
+    failures: list[tuple[object, Exception]] = []
+    for as_of in as_of_dates:
+        as_of_ts = pd.Timestamp(as_of)
+        recs = analysis.backtest_recommendations(
+            signals, all_transactions, as_of_ts,
             horizon=params.horizon,
-            frequency_days=params.frequency_days,
-            training_lookback_days=params.training_lookback_days,
+            lookback_days=params.lookback_days,
             min_buyers=params.min_buyers,
             top_n=params.top_n,
-            decay_lambda=decay_lambda,
-            bayes_prior_strength=bayes_prior_strength,
+            threshold=params.threshold,
+            prices_df=prices,
+            training_lookback_days=params.training_lookback_days,
             scoring_mode=scoring_mode,
-            total_recs=len(combined),
-            dates_evaluated=int(valid["as_of_date"].nunique()),
-            overall_alpha=round(float(valid["bt_alpha_pct"].mean()), 2),
-            overall_return=round(float(valid["bt_return_pct"].mean()), 2),
-            rank1_alpha=r1,
-            rank5_alpha=r5,
-            alpha_slope=alpha_slope,
-            win_rate=win_rate,
-            sharpe=sharpe,
-            max_drawdown=max_drawdown,
+            bayes_prior_strength=bayes_prior_strength,
         )
+        if recs.empty:
+            continue
+        try:
+            evaluated = analysis.evaluate_backtest(
+                recs, prices, as_of_ts, params.horizon
+            )
+            evaluated = evaluated.dropna(subset=["bt_return_pct"])
+            evaluated.insert(0, "as_of_date", as_of_ts.date())
+            all_results.append(evaluated)
+        except (AnalysisError, KeyError) as exc:
+            failures.append((as_of_ts, exc))
+            logger.warning(
+                "Backtest evaluation unavailable for %s: %s", as_of_ts.date(), exc
+            )
 
-        return result, per_date
+    if failures:
+        logger.warning("Skipped %d backtest evaluation date(s)", len(failures))
 
-    finally:
-        signals_mod.BAYES_PRIOR_STRENGTH = old_bayes
-        signals_mod.DECAY_LAMBDA = old_decay
+    if not all_results:
+        return empty, pd.Series(dtype=float)
+
+    combined = pd.concat(all_results, ignore_index=True)
+    valid = combined.dropna(subset=["bt_alpha_pct"])
+
+    # Per-date mean alpha (NW t-stat needs this series ordered by date)
+    per_date = (
+        valid.groupby("as_of_date")["bt_alpha_pct"]
+        .mean()
+        .sort_index()
+    )
+
+    # Compute all mutable values before constructing the frozen SweepResult
+    rank_alpha = valid.groupby("rank")["bt_alpha_pct"].mean()
+    r1 = round(float(rank_alpha.loc[1]), 2) if 1 in rank_alpha.index else 0.0
+    r5 = round(float(rank_alpha.loc[5]), 2) if 5 in rank_alpha.index else 0.0
+    # Convention: rank 1 = highest-scored ticker (best model prediction).
+    # A well-calibrated ranker has rank-1 picks outperforming rank-5 picks,
+    # so alpha_slope > 0 means the ranker is working.
+    alpha_slope = round(r1 - r5, 2)
+    win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
+
+    # Sharpe and max_drawdown are time-series portfolio metrics and must
+    # be computed on the per-date mean-alpha series (one observation per
+    # rebalance date). Using per-rec alphas here would treat same-date
+    # correlated picks as independent observations and compound returns in
+    # arbitrary order.
+    sharpe = 0.0
+    if len(per_date) > 1:
+        mean_a = per_date.mean()
+        std_a = per_date.std()
+        if std_a > 0:
+            periods_per_year = 365 / params.frequency_days
+            sharpe = round(
+                float(mean_a / std_a * (periods_per_year ** 0.5)), 2
+            )
+
+    cumulative = (1 + per_date / 100).cumprod()
+    rolling_max = cumulative.cummax()
+    drawdown = (cumulative - rolling_max) / rolling_max
+    max_drawdown = round(float(drawdown.min()) * 100, 2)
+
+    result = SweepResult(
+        horizon=params.horizon,
+        frequency_days=params.frequency_days,
+        training_lookback_days=params.training_lookback_days,
+        min_buyers=params.min_buyers,
+        top_n=params.top_n,
+        decay_lambda=decay_lambda,
+        bayes_prior_strength=bayes_prior_strength,
+        scoring_mode=scoring_mode,
+        total_recs=len(combined),
+        dates_evaluated=int(valid["as_of_date"].nunique()),
+        overall_alpha=round(float(valid["bt_alpha_pct"].mean()), 2),
+        overall_return=round(float(valid["bt_return_pct"].mean()), 2),
+        rank1_alpha=r1,
+        rank5_alpha=r5,
+        alpha_slope=alpha_slope,
+        win_rate=win_rate,
+        sharpe=sharpe,
+        max_drawdown=max_drawdown,
+    )
+
+    return result, per_date
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ import logging
 
 import pandas as pd
 
-from analyzer.models import TransactionType  # noqa: F401 — re-exported for backward compat
+from analyzer.models import AnalysisMode, TransactionType  # noqa: F401 — re-exported for backward compat
 
 from analyzer.signals import (  # noqa: F401
     DECAY_LAMBDA,
@@ -104,14 +104,20 @@ def analyze_by_sector(
 
 def get_analysis_table(
     signals_df,
-    member_filter,
-    show_signals,
+    mode: AnalysisMode,
+    member_filter: str | None,
     horizon,
     top_n,
     threshold,
 ):
-    if member_filter:
-        return _get_member_signals(signals_df, member_filter, horizon, top_n or 5)
-    if show_signals:
-        return _get_top_signals(signals_df, horizon, top_n or 15)
-    return rank_members(signals_df, horizon, threshold).head(top_n)
+    match mode:
+        case AnalysisMode.MEMBER_SIGNALS:
+            if member_filter is None:
+                raise ValueError("member_filter is required for member signals")
+            return _get_member_signals(signals_df, member_filter, horizon, top_n or 5)
+        case AnalysisMode.TOP_SIGNALS:
+            return _get_top_signals(signals_df, horizon, top_n or 15)
+        case AnalysisMode.MEMBER_RANKINGS:
+            return rank_members(signals_df, horizon, threshold).head(top_n)
+        case _:
+            raise ValueError(f"Unsupported analysis mode: {mode}")

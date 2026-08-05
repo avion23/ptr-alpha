@@ -50,6 +50,9 @@ member_rankings.csv
 top_signals.csv
 recent_*.csv
 
+# Script outputs (regeneratable, machine-specific paths)
+blotter_reconcile_output.json
+
 # Desloppify tool state
 .desloppify/
 scorecard.png

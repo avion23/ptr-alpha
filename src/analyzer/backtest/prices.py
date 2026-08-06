@@ -106,6 +106,19 @@ def _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=Non
     return float(vals[pos])
 
 
+def _price_before_arrays(idx_ns, vals, target_date, max_staleness_days=None):
+    """Return the latest price strictly before ``target_date``."""
+    target = pd.Timestamp(target_date).value
+    pos = int(np.searchsorted(idx_ns, target, side="left")) - 1
+    if pos < 0:
+        return None
+    if max_staleness_days is not None:
+        staleness_ns = target - int(idx_ns[pos])
+        if staleness_ns > max_staleness_days * NS_PER_DAY:
+            return None
+    return float(vals[pos])
+
+
 def _price_on_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=5):
     """Price lookup using pre-extracted arrays."""
     return _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=max_staleness_days)

@@ -10,7 +10,8 @@ multipliers) is hoisted out of the per-row loop.
 Bug fixes applied here (see prices.py for Bug 1b/1c low-level fixes):
 
   Bug 1a — default use_dip_entry changed from True to False: honest baseline
-            uses first available price on/after as_of with zero entry delay.
+            uses the latest close strictly before as_of with zero entry delay;
+            the same-day close is unavailable.
 
   Bug 1b — SPY benchmark aligned with actual entry/exit dates: when
             use_dip_entry=True the SPY window is [entry_date, exit_date], not
@@ -20,8 +21,11 @@ Bug fixes applied here (see prices.py for Bug 1b/1c low-level fixes):
   Bug 2  — Survivorship bias removed: when a ticker's price history ends before
             the exit date (delisted/suspended), the last available price is used
             as exit price and the trade IS included. A `bt_delisted` flag marks
-            these rows. Only tickers with no price data at all are skipped, and
-            their count is stored in result.attrs["n_no_price"].
+            these rows. When that last exit is more than 25 calendar days stale,
+            `bt_return_pct` is conservatively forced to -100 while
+            `bt_raw_return_pct` retains the price-derived audit value. Tickers
+            with no actionable price remain untradeable and count in
+            result.attrs["n_no_price"].
 
   Bug 3  — Merge fan-out fixed: results are merged on a per-row index key
             (_bt_idx) rather than on ticker alone, so two recommendations for
@@ -36,11 +40,13 @@ import pandas as pd
 from analyzer.backtest.prices import (
     _find_dip_entry_arrays,
     _price_at_or_before_arrays,
+    _price_before_arrays,
     _price_on_or_before_arrays,
 )
 from analyzer.signals import _price_arrays
 
 NS_PER_DAY = 86_400_000_000_000
+_EXIT_STALENESS_DAYS = 25
 
 # Sentinel returned by _evaluate_one_recommendation when a ticker is
 # discovered to have been delisted BEFORE the entry/as_of date — meaning the
@@ -162,7 +168,7 @@ def _slippage_multipliers(entry_slippage_bps: float, exit_slippage_bps: float) -
 def _spy_start(spy_ns, spy_vals, as_of_date, entry_mult, max_staleness_days):
     if spy_ns is None:
         return None, 0.0
-    start = _price_at_or_before_arrays(spy_ns, spy_vals, as_of_date, max_staleness_days)
+    start = _price_before_arrays(spy_ns, spy_vals, as_of_date, max_staleness_days)
     if not start:
         return None, 0.0
     return start, start * entry_mult
@@ -268,8 +274,11 @@ def _evaluate_one_recommendation(
     # Bug 2: when the exit price lookup fails the staleness check (ticker
     # delisted/suspended), fall back to the last available price rather than
     # silently dropping the trade from both numerator and denominator.
-    exit_price = _price_on_or_before_arrays(idx_ns, vals, pd.Timestamp(exit_ns), max_staleness_days=30)
+    exit_price = _price_on_or_before_arrays(
+        idx_ns, vals, pd.Timestamp(exit_ns), max_staleness_days=_EXIT_STALENESS_DAYS,
+    )
     is_delisted = False
+    stale_delisted = False
     if not exit_price:
         # Finding 2 fix: only treat as "delisted during hold" when the last
         # known price is STRICTLY AFTER the entry date.  If the last price
@@ -281,6 +290,10 @@ def _evaluate_one_recommendation(
         if fallback_pos >= 0 and int(idx_ns[fallback_pos]) > entry_ns:
             exit_price = float(vals[fallback_pos])
             is_delisted = True
+            stale_delisted = (
+                int(exit_ns) - int(idx_ns[fallback_pos])
+                > _EXIT_STALENESS_DAYS * NS_PER_DAY
+            )
         else:
             # No usable price: either no data at all, or ticker already
             # delisted before/at entry — caller counts this in n_no_price.
@@ -307,6 +320,9 @@ def _evaluate_one_recommendation(
         ticker, entry, entry_delay, exit_price, t_horizon,
         entry_mult, exit_mult, spy_ret, inst_type, amount,
     )
+    if stale_delisted:
+        row["bt_return_pct"] = -100.0
+        row["bt_alpha_pct"] = round(row["bt_return_pct"] - spy_ret, 2)
     row["_bt_idx"] = row_idx      # Bug 3: used for 1:1 merge
     row["bt_delisted"] = is_delisted  # Bug 2: flag for coverage reporting
     return row
@@ -327,7 +343,7 @@ def _resolve_entry(use_dip_entry, idx_ns, vals, as_of_date, pullback_pct, max_wa
         if entry <= 0:
             return None, 0  # No fallback — position is not taken
     else:
-        entry = _price_at_or_before_arrays(idx_ns, vals, as_of_date, max_staleness_days)
+        entry = _price_before_arrays(idx_ns, vals, as_of_date, max_staleness_days)
         entry_delay = 0
     return entry, entry_delay
 

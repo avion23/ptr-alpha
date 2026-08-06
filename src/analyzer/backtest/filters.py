@@ -48,7 +48,7 @@ def _filter_recent_trades(
     lookback_start = as_of_date - pd.Timedelta(days=lookback_days)
     mask = (
         (transactions_df["disclosure_date"] >= lookback_start)
-        & (transactions_df["disclosure_date"] <= as_of_date)
+        & (transactions_df["disclosure_date"] < as_of_date)
         & (transactions_df["transaction_type"] == TransactionType.PURCHASE.value)
     )
     return transactions_df[mask].copy()

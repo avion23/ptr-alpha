@@ -1,15 +1,16 @@
-"""Simple options leverage model for congressional trading analysis."""
+"""Simple model estimates for options leverage in backtest returns."""
 
-# Average leverage factors for ATM options
-# These are rough approximations — real delta depends on moneyness, time to expiry, vol
-CALL_LEVERAGE = 10.0  # ~10x for 3-month ATM call
-PUT_LEVERAGE = -5.0   # ~-5x for 3-month ATM put (negative = inverse)
+# These are rough model estimates, not actual contract leverage. Real deltas
+# depend on moneyness, time to expiry, and volatility.
+CALL_LEVERAGE = 4.0   # ~4x for a call
+PUT_LEVERAGE = -2.0   # ~-2x for a put (negative = inverse)
 
 
 def estimate_options_leverage(instrument_type: str, amount_midpoint: float | None = None) -> float:
     """Estimate the leverage multiplier for a trade.
 
-    Returns 1.0 for stocks, ~10 for calls, ~-5 for puts.
+    Returns 1.0 for stocks, ~4 for calls, and ~-2 for puts. These are model
+    estimates, not actual contract leverage.
     If amount is available, adjust slightly (larger amounts -> slightly lower leverage).
     """
     if instrument_type == 'call':

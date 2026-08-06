@@ -5,7 +5,6 @@ from analyzer.analysis import (
     calculate_signal_potential, rank_members, rank_sales,
     get_top_signals, get_member_signals, get_analysis_table,
     score_ticker_by_buyers, bayesian_win_probability,
-    bayes_factor_against_market,
 )
 from analyzer.exceptions import AnalysisError
 from analyzer.models import AnalysisMode
@@ -166,12 +165,6 @@ class TestAnalysis(unittest.TestCase):
         expected = (0.55 * 20) / (20 + 3)
 
         self.assertAlmostEqual(posterior, expected)
-
-    def test_bayes_factor_against_market_formula(self):
-        bayes_factor = bayes_factor_against_market(5, 5, 0.55)
-
-        self.assertGreater(bayes_factor, 0)
-        self.assertLess(bayes_factor, 2)
 
     def test_get_top_signals_basic(self):
         signals = calculate_signal_potential(self.entry_prices, self.sample_prices, [90])

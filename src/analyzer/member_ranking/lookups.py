@@ -27,35 +27,6 @@ def _get_ticker_purchases(ticker: str, transactions_df: pd.DataFrame) -> pd.Data
     ]
 
 
-def _lookup_buyer_bayes_win_prob(
-    member: str,
-    member_rankings: pd.DataFrame | None,
-) -> float | None:
-    """Fetch a member's Bayesian win probability from member_rankings.
-
-    Returns None when rankings are missing, the column is absent, the member
-    is unrated, or the value is NaN.
-
-    Tries exact match first, then canonical-key match to handle name variants
-    (e.g. 'MICHAEL MCCAUL' vs 'MICHAEL T. MCCAUL').
-    """
-    if member_rankings is None or member_rankings.empty:
-        return None
-    if "bayes_win_prob" not in member_rankings.columns:
-        return None
-    row = member_rankings.loc[member_rankings["member"] == member]
-    if row.empty:
-        # Fix 7: fall back to canonical key match for name variants
-        canon = canonical_member_key(member)
-        row = member_rankings.loc[
-            member_rankings["member"].apply(canonical_member_key) == canon
-        ]
-    if row.empty:
-        return None
-    val = row["bayes_win_prob"].iloc[0]
-    return float(val) if pd.notna(val) else None
-
-
 def _lookup_buyer_posterior_lift(
     member: str,
     member_rankings: pd.DataFrame | None,
@@ -83,33 +54,6 @@ def _lookup_buyer_posterior_lift(
         return None
     val = row["posterior_lift"].iloc[0]
     return float(val) if pd.notna(val) else None
-
-
-def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, float]:
-    """Precompute {member: bayes_win_prob} dict for O(1) lookups.
-
-    Replaces repeated linear scans of member_rankings DataFrame.
-
-    Fix 7: also adds canonical-key entries so lookups work regardless of which
-    name variant a transaction uses (e.g. 'MICHAEL MCCAUL' and 'MICHAEL T. MCCAUL'
-    both resolve to the same ranking row).
-    """
-    if member_rankings is None or member_rankings.empty:
-        return {}
-    if "bayes_win_prob" not in member_rankings.columns:
-        return {}
-    # Vectorized — no iterrows
-    valid = member_rankings["bayes_win_prob"].notna()
-    subset = member_rankings.loc[valid, ["member", "bayes_win_prob"]]
-    result: dict[str, float] = dict(zip(subset["member"], subset["bayes_win_prob"].astype(float)))
-    # Add canonical-key aliases so any name variant hits the same entry
-    aliases: dict[str, float] = {}
-    for name, val in result.items():
-        key = canonical_member_key(name)
-        if key not in result and key not in aliases:
-            aliases[key] = val
-    result.update(aliases)
-    return result
 
 
 def _build_ranking_dicts(

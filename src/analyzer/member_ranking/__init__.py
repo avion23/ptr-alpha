@@ -3,7 +3,6 @@
 Public API:
   Bayesian helpers:
     - bayesian_win_probability(wins, losses, market_prior=0.55)
-    - bayes_factor_against_market(wins, losses, market_prior=0.55)
   Score factors:
     - _size_score_factor
     - _owner_score_factor
@@ -15,8 +14,7 @@ Public API:
     - rank_sales(signal_df, horizon=90)
     - _compute_member_stats
     - _get_ticker_purchases
-    - _lookup_buyer_bayes_win_prob
-    - _build_buyer_bayes_dict
+    - _lookup_buyer_posterior_lift
     - _build_ranking_dicts
     - get_ticker_buyers_with_rankings(...)
   Buyer composition scoring:
@@ -36,7 +34,6 @@ The package is split into:
 """
 
 from analyzer.member_ranking.bayes import (
-    bayes_factor_against_market,
     bayesian_win_probability,
 )
 from analyzer.member_ranking.factors import (
@@ -58,17 +55,15 @@ from analyzer.member_ranking.sales import (
     rank_sales,
 )
 from analyzer.member_ranking.lookups import (
-    _build_buyer_bayes_dict,
     _build_ranking_dicts,
     _get_ticker_purchases,
-    _lookup_buyer_bayes_win_prob,
+    _lookup_buyer_posterior_lift,
     get_ticker_buyers_with_rankings,
 )
 from analyzer.member_ranking.buyer_scoring import score_ticker_by_buyers
 
 __all__ = [
     "bayesian_win_probability",
-    "bayes_factor_against_market",
     "_size_score_factor",
     "_owner_score_factor",
     "_conviction_score",
@@ -80,8 +75,7 @@ __all__ = [
     "_rank_members_impl",
     "_compute_member_stats",
     "_get_ticker_purchases",
-    "_lookup_buyer_bayes_win_prob",
-    "_build_buyer_bayes_dict",
+    "_lookup_buyer_posterior_lift",
     "_build_ranking_dicts",
     "get_ticker_buyers_with_rankings",
     "score_ticker_by_buyers",

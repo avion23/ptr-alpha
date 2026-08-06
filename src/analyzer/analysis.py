@@ -36,7 +36,6 @@ from analyzer.signals import (  # noqa: F401
 
 from analyzer.member_ranking import (  # noqa: F401
     bayesian_win_probability,
-    bayes_factor_against_market,
     _size_score_factor,
     _owner_score_factor,
     _conviction_score,

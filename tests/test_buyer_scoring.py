@@ -19,6 +19,7 @@ def test_final_result_emits_unrounded_solo_adjusted_score():
             "avg_spy_alpha_pct": [1.2345],
             "purchase_trades": [5],
             "bayes_win_prob": [0.9],
+            "posterior_lift": [1.8],
         }
     )
 
@@ -28,7 +29,7 @@ def test_final_result_emits_unrounded_solo_adjusted_score():
         signals,
         member_rankings=rankings,
         min_buyers=1,
-        solo_buyer_skill_threshold=0.6,
+        solo_buyer_skill_threshold=1.0,
         solo_buyer_penalty=0.8,
     )
     row = result.iloc[0]

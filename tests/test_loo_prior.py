@@ -1,0 +1,110 @@
+import unittest
+
+import pandas as pd
+
+from analyzer.member_ranking.ranking import rank_members
+from analyzer.member_ranking.sales import rank_sales
+
+
+PRIOR_STRENGTH = 20.0
+
+
+def _signals(rows: list[tuple[str, str, str, float]], signal_type: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "member": [row[0] for row in rows],
+            "ticker": [row[1] for row in rows],
+            "disclosure_date": pd.to_datetime([row[2] for row in rows]),
+            "signal_type": signal_type,
+            "horizon_days": 90,
+            "window_complete": True,
+            "decayed_return_pct": [row[3] for row in rows],
+            "peak_potential_pct": [max(row[3], 0.0) for row in rows],
+            "spy_alpha_pct": [row[3] for row in rows],
+            "total_spy_alpha_pct": [row[3] for row in rows],
+            "entry_price": 10.0,
+            "amount_midpoint": 1_000.0,
+        }
+    )
+
+
+class TestLeaveOneOutPrior(unittest.TestCase):
+    def test_purchase_prior_excludes_each_members_episodes(self):
+        signals = _signals(
+            [
+                ("Strong", "S1", "2024-01-01", 10.0),
+                ("Strong", "S2", "2024-02-01", 8.0),
+                ("Strong", "S3", "2024-03-01", 6.0),
+                ("Weak", "W1", "2024-01-01", -4.0),
+                ("Weak", "W2", "2024-02-01", -6.0),
+            ],
+            "Purchase",
+        )
+
+        ranked = rank_members(signals, _bayes_prior_strength=PRIOR_STRENGTH).set_index("member")
+
+        strong_prior = 0.10  # (3 total wins - 3 Strong wins) / (5 - 3), clipped
+        weak_prior = 0.90  # (3 total wins - 0 Weak wins) / (5 - 2), clipped
+        strong_expected = (strong_prior * PRIOR_STRENGTH + 3) / (PRIOR_STRENGTH + 3)
+        weak_expected = (weak_prior * PRIOR_STRENGTH) / (PRIOR_STRENGTH + 2)
+        self.assertAlmostEqual(ranked.loc["Strong", "bayes_win_prob"], strong_expected, places=3)
+        self.assertAlmostEqual(ranked.loc["Weak", "bayes_win_prob"], weak_expected, places=3)
+
+    def test_single_member_uses_global_prior_fallback(self):
+        signals = _signals(
+            [
+                ("Solo", "A", "2024-01-01", 5.0),
+                ("Solo", "B", "2024-02-01", -2.0),
+            ],
+            "Purchase",
+        )
+
+        probability = rank_members(signals).iloc[0]["bayes_win_prob"]
+
+        self.assertGreater(probability, 0.0)
+        self.assertLess(probability, 1.0)
+
+    def test_purchase_output_omits_bayes_factor(self):
+        signals = _signals([("Solo", "A", "2024-01-01", 5.0)], "Purchase")
+
+        self.assertNotIn("bayes_factor", rank_members(signals).columns)
+
+    def test_sales_prior_excludes_members_own_episodes_and_output_omits_factor(self):
+        signals = _signals(
+            [
+                ("Early Seller", "A", "2024-01-01", -10.0),
+                ("Early Seller", "B", "2024-02-01", -8.0),
+                ("Early Seller", "C", "2024-03-01", -6.0),
+                ("Late Seller", "D", "2024-01-01", 5.0),
+            ],
+            "Sale",
+        )
+
+        ranked = rank_sales(signals).set_index("member")
+
+        early_seller_prior = 0.10  # The other member has zero loss-avoidance wins.
+        expected = (early_seller_prior * PRIOR_STRENGTH + 3) / (PRIOR_STRENGTH + 3)
+        self.assertAlmostEqual(ranked.loc["Early Seller", "bayes_win_prob"], expected, places=3)
+        self.assertNotIn("bayes_factor", ranked.columns)
+
+    def test_purchase_prior_counts_collapsed_episodes(self):
+        signals = _signals(
+            [
+                ("Target", "T", "2024-01-01", 5.0),
+                ("Peer", "P", "2024-01-01", 8.0),
+                ("Peer", "P", "2024-01-05", 8.0),
+                ("Peer", "Q", "2024-02-01", -4.0),
+            ],
+            "Purchase",
+        )
+
+        ranked = rank_members(signals, _bayes_prior_strength=PRIOR_STRENGTH).set_index("member")
+
+        collapsed_peer_prior = 0.5  # One winning episode and one losing episode.
+        expected = (collapsed_peer_prior * PRIOR_STRENGTH + 1) / (PRIOR_STRENGTH + 1)
+        self.assertEqual(ranked.loc["Peer", "purchase_trades"], 2)
+        self.assertAlmostEqual(ranked.loc["Target", "bayes_win_prob"], expected, places=3)
+
+
+if __name__ == "__main__":
+    unittest.main()

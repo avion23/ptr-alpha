@@ -76,11 +76,11 @@ class TestEstimateMemberSkills(unittest.TestCase):
                 self.assertGreaterEqual(skill.alpha_mean, low - 0.1)
                 self.assertLessEqual(skill.alpha_mean, high + 0.1)
 
-    def test_posterior_std_decreases_with_more_episodes(self):
-        """posterior_std is smaller for members with more episodes."""
+    def test_one_episode_has_higher_posterior_std_than_ten(self):
+        """The same per-episode distribution is more certain with more data."""
         signals = _make_signals({
-            "FEW": [10.0, 12.0],
-            "MANY": [10.0] * 20,
+            "ONE": [10.0],
+            "TEN": [10.0] * 10,
         })
 
         skills = estimate_member_skills(
@@ -88,7 +88,50 @@ class TestEstimateMemberSkills(unittest.TestCase):
             recency_half_life_days=365, horizon=HORIZON, ref_date=REF_DATE,
         )
 
-        self.assertLess(skills["MANY"].alpha_std, skills["FEW"].alpha_std)
+        self.assertGreater(skills["ONE"].alpha_std, skills["TEN"].alpha_std)
+
+    def test_effective_n_increases_uncertainty_and_shrinkage_for_old_trades(self):
+        rows = []
+        recent_days_ago = [100 + 20 * i for i in range(10)]
+        old_days_ago = [100] + [500 + 50 * i for i in range(9)]
+        for member, days_ago_values, center in (
+            ("RECENT", recent_days_ago, 0.0),
+            ("OLD", old_days_ago, 20.0),
+        ):
+            for i, days_ago in enumerate(days_ago_values):
+                alpha = center + (-1.0 if i % 2 == 0 else 1.0)
+                rows.append({
+                    "member": member,
+                    "ticker": f"T{i % 3}",
+                    "disclosure_date": REF_DATE - pd.Timedelta(days=days_ago),
+                    "signal_type": "Purchase",
+                    "horizon_days": HORIZON,
+                    "spy_alpha_pct": alpha,
+                })
+
+        skills = estimate_member_skills(
+            pd.DataFrame(rows), min_episodes=1, prior_strength=5.0,
+            recency_half_life_days=100, horizon=HORIZON, ref_date=REF_DATE,
+        )
+
+        self.assertEqual(skills["OLD"].n_episodes, skills["RECENT"].n_episodes)
+        self.assertGreater(skills["OLD"].alpha_std, skills["RECENT"].alpha_std)
+        self.assertGreater(skills["OLD"].shrinkage, skills["RECENT"].shrinkage)
+
+    def test_global_mean_member_has_nonzero_finite_posterior_std(self):
+        signals = _make_signals({
+            "LOW": [0.0] * 5,
+            "CENTER": [10.0] * 5,
+            "HIGH": [20.0] * 5,
+        })
+
+        skills = estimate_member_skills(
+            signals, min_episodes=1, prior_strength=5.0,
+            recency_half_life_days=365, horizon=HORIZON, ref_date=REF_DATE,
+        )
+
+        self.assertGreater(skills["CENTER"].alpha_std, 0.0)
+        self.assertTrue(all(np.isfinite(skill.alpha_std) for skill in skills.values()))
 
 class TestScoreMembersForTicker(unittest.TestCase):
     def test_with_known_members(self):

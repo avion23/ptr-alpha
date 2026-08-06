@@ -925,8 +925,9 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         elapsed_cutoff = self.as_of - pd.Timedelta(days=horizon)
 
         # Training signals for one high-skill member ("Star") with strong wins
-        # so rank_members produces a high bayes_win_prob (Bayesian shrinkage
-        # is strong: needs ~6 wins to clear the default 0.60 threshold).
+        # so rank_members produces a high posterior_lift (LOO prior for a
+        # 6/6-win sole member is clipped low, so lift ends up ~3.08, clearing
+        # the default 1.0 lift threshold).
         star_signals = []
         for i, tk in enumerate(["AAA", "BBB", "CCC", "GGG", "HHH", "III"]):
             star_signals.append({
@@ -967,7 +968,7 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         self.assertGreater(recs.iloc[0]["signal_score"], 0.0)
 
     def test_low_skill_solo_buyer_filtered_with_min_buyers_1(self):
-        """A single low-skill buyer should still be rejected."""
+        """A single low-skill buyer (posterior_lift < 1.0) should be rejected."""
         solo_txns = _make_transactions([
             {
                 "member": "Dud", "ticker": "SOLO2",
@@ -978,7 +979,6 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         recs = backtest_recommendations(
             self.signals, solo_txns, self.as_of,
             horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
-            solo_buyer_skill_threshold=0.60,
         )
         self.assertTrue(recs.empty)
 
@@ -1006,17 +1006,17 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
                 "transaction_type": "Purchase",
             },
         ])
-        # Default threshold (0.60): Star passes → recommendation produced.
+        # Default threshold (1.0): Star (posterior_lift ~3.08) passes → recommendation produced.
         recs_default = backtest_recommendations(
             self.signals, solo_txns, self.as_of,
             horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
         )
         self.assertFalse(recs_default.empty)
 
-        # Impossibly strict threshold (0.99): Star rejected.
+        # Strict lift threshold (3.5) above Star's posterior_lift: Star rejected.
         recs_strict = backtest_recommendations(
             self.signals, solo_txns, self.as_of,
             horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
-            solo_buyer_skill_threshold=0.99,
+            solo_buyer_skill_threshold=3.5,
         )
         self.assertTrue(recs_strict.empty)

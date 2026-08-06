@@ -56,6 +56,35 @@ def _lookup_buyer_bayes_win_prob(
     return float(val) if pd.notna(val) else None
 
 
+def _lookup_buyer_posterior_lift(
+    member: str,
+    member_rankings: pd.DataFrame | None,
+) -> float | None:
+    """Fetch a member's posterior lift (posterior / prior) from member_rankings.
+
+    Returns None when rankings are missing, the column is absent, the member
+    is unrated, or the value is NaN.
+
+    `posterior_lift` is the prior-invariant skill statistic; unlike
+    `bayes_win_prob` it stays comparable across members even when each
+    member's prior is estimated leave-one-out.
+    """
+    if member_rankings is None or member_rankings.empty:
+        return None
+    if "posterior_lift" not in member_rankings.columns:
+        return None
+    row = member_rankings.loc[member_rankings["member"] == member]
+    if row.empty:
+        canon = canonical_member_key(member)
+        row = member_rankings.loc[
+            member_rankings["member"].apply(canonical_member_key) == canon
+        ]
+    if row.empty:
+        return None
+    val = row["posterior_lift"].iloc[0]
+    return float(val) if pd.notna(val) else None
+
+
 def _build_buyer_bayes_dict(member_rankings: pd.DataFrame | None) -> dict[str, float]:
     """Precompute {member: bayes_win_prob} dict for O(1) lookups.
 

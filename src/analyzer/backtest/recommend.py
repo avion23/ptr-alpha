@@ -38,7 +38,7 @@ def backtest_recommendations(
     threshold: float = 5.0,
     prices_df: pd.DataFrame | None = None,
     training_lookback_days: int | None = None,
-    solo_buyer_skill_threshold: float = 0.60,
+    solo_buyer_skill_threshold: float = 1.0,
     scoring_mode: str = "shrunk_alpha",
     bayes_prior_strength: float | None = None,
 ) -> pd.DataFrame:

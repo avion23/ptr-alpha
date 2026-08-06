@@ -24,7 +24,7 @@ from analyzer.member_ranking.ranking import rank_members
 from analyzer.member_ranking.lookups import (
     _build_ranking_dicts,
     _get_ticker_purchases,
-    _lookup_buyer_bayes_win_prob,
+    _lookup_buyer_posterior_lift,
 )
 
 
@@ -40,7 +40,7 @@ def score_ticker_by_buyers(
     ticker_perf_signals: pd.DataFrame | None = None,
     member_skills: dict | None = None,
     uncertainty_penalty_lambda: float = 0.5,
-    solo_buyer_skill_threshold: float = 0.60,
+    solo_buyer_skill_threshold: float = 1.0,
     solo_buyer_penalty: float = 0.8,
     _bayes_prior_strength: float | None = None,
     _ranking_dicts: dict | None = None,
@@ -128,8 +128,13 @@ def _solo_buyer_gate(ticker, ticker_trades, member_rankings, min_buyers, min_tra
     if not (min_buyers == 1 and min_trades == 1 and solo_buyer_skill_threshold > 0):
         return False
     sole_buyer = str(ticker_trades["member"].iloc[0])
-    bayes_prob = _lookup_buyer_bayes_win_prob(sole_buyer, member_rankings)
-    if bayes_prob is None or bayes_prob < solo_buyer_skill_threshold:
+    # The gate compares posterior_lift (posterior / market prior), not the
+    # absolute bayes_win_prob. Each member's prior is now estimated
+    # leave-one-out, so bayes_win_prob is no longer comparable across members
+    # against a fixed threshold; posterior_lift is the prior-invariant skill
+    # statistic (a lift above 1.0 means the buyer beats their market prior).
+    lift = _lookup_buyer_posterior_lift(sole_buyer, member_rankings)
+    if lift is None or lift < solo_buyer_skill_threshold:
         result = pd.DataFrame({
             "ticker": [ticker],
             "num_buyers": [min_trades],
@@ -268,7 +273,7 @@ def _final_result(
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
 
-    signal_score_raw = base_signal_score * size_factor * owner_factor
+    signal_score_raw = base_signal_score
     if apply_solo_penalty:
         signal_score_raw *= solo_buyer_penalty
     signal_score = round(signal_score_raw, 2)

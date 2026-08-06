@@ -4,7 +4,6 @@ Public API:
   Bayesian helpers:
     - bayesian_win_probability(wins, losses, market_prior=0.55)
     - bayes_factor_against_market(wins, losses, market_prior=0.55)
-    - _compute_ticker_member_performance(...)
   Score factors:
     - _size_score_factor
     - _owner_score_factor
@@ -27,7 +26,7 @@ Public API:
     - get_member_decay_map
 
 The package is split into:
-  - bayes.py          Bayesian math + ticker performance
+  - bayes.py          Bayesian math helpers
   - factors.py        score factor helpers (size/owner/conviction)
   - ranking.py        ranking pipeline (purchase side)
   - sales.py          ranking pipeline (sale side) + per-member stats
@@ -39,7 +38,6 @@ The package is split into:
 from analyzer.member_ranking.bayes import (
     bayes_factor_against_market,
     bayesian_win_probability,
-    _compute_ticker_member_performance,
 )
 from analyzer.member_ranking.factors import (
     _conviction_score,
@@ -71,7 +69,6 @@ from analyzer.member_ranking.buyer_scoring import score_ticker_by_buyers
 __all__ = [
     "bayesian_win_probability",
     "bayes_factor_against_market",
-    "_compute_ticker_member_performance",
     "_size_score_factor",
     "_owner_score_factor",
     "_conviction_score",

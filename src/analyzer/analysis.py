@@ -40,7 +40,6 @@ from analyzer.member_ranking import (  # noqa: F401
     _size_score_factor,
     _owner_score_factor,
     _conviction_score,
-    _compute_ticker_member_performance,
     _compute_member_stats,
     _build_ranking_dicts,
     rank_members,

@@ -1,7 +1,7 @@
-"""Score factor helpers used by ticker scoring.
+"""Diagnostic metrics used by ticker scoring.
 
-Three small multipliers (size, owner-code, conviction) that adjust the raw
-Bayesian-shrunk alpha before producing a final ticker signal score.
+Size and owner-code factors describe transaction metadata without changing the
+Bayesian posterior alpha. Conviction summarizes trade count and size.
 """
 
 from __future__ import annotations

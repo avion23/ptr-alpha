@@ -37,10 +37,10 @@ def _compute_member_raw_alphas(
     horizon: int,
     ref_date: pd.Timestamp,
     recency_half_life_days: int,
-) -> dict[str, tuple[float, float, int]]:
+) -> dict[str, tuple[float, float, int, float]]:
     """Compute recency-weighted alpha per member.
 
-    Returns {member: (weighted_alpha, weight_sum, n_episodes)}.
+    Returns {member: (weighted_alpha, weight_sum, n_episodes, weight_sq_sum)}.
     """
     eligible = signals_df[
         (signals_df["horizon_days"] == horizon)
@@ -60,19 +60,26 @@ def _compute_member_raw_alphas(
     weights = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
 
     collapsed["_weight_vals"] = weights
+    collapsed["_weight_sq_vals"] = weights**2
     collapsed["_alpha_weighted"] = collapsed["spy_alpha_pct"].values * weights
 
     grp = collapsed.groupby("member")
     weight_sums = grp["_weight_vals"].sum()
+    weight_sq_sums = grp["_weight_sq_vals"].sum()
     alpha_sums = grp["_alpha_weighted"].sum()
     n_episodes = grp.size()
 
     # Filter groups with weight_sum > 0
     valid = weight_sums > 0
-    result: dict[str, tuple[float, float, int]] = {}
+    result: dict[str, tuple[float, float, int, float]] = {}
     for member in weight_sums.index[valid]:
         w = float(weight_sums[member])
-        result[member] = (float(alpha_sums[member]) / w, w, int(n_episodes[member]))
+        result[member] = (
+            float(alpha_sums[member]) / w,
+            w,
+            int(n_episodes[member]),
+            float(weight_sq_sums[member]),
+        )
     return result
 
 
@@ -160,8 +167,8 @@ def estimate_member_skills(
 
     # Filter members with enough episodes
     qualifying = {
-        m: (alpha, w, n)
-        for m, (alpha, w, n) in raw.items()
+        m: (alpha, w, n, w_sq)
+        for m, (alpha, w, n, w_sq) in raw.items()
         if n >= min_episodes
     }
 
@@ -173,7 +180,6 @@ def estimate_member_skills(
     alphas = np.array([v[0] for v in qualifying.values()])
     global_mean = float(np.mean(alphas))
     global_var = float(np.var(alphas)) if len(alphas) > 1 else 0.0
-    global_std = sqrt(global_var)
 
     posteriors: dict[str, MemberSkillPosterior] = {}
     # Pre-group signals_df by member to avoid repeated full-table scans
@@ -182,10 +188,43 @@ def estimate_member_skills(
         if m not in member_groups:
             member_groups[m] = signals_df[signals_df["member"] == m]
 
-    for member, (raw_alpha, weight_sum, n) in qualifying.items():
-        shrinkage = prior_strength / (n + prior_strength)
+    pooled_residual_sum = 0.0
+    pooled_weight_sum = 0.0
+    for member, (raw_alpha, _, _, _) in qualifying.items():
+        member_signals = member_groups[member]
+        eligible = member_signals[
+            (member_signals["horizon_days"] == horizon)
+            & (member_signals["signal_type"] == TransactionType.PURCHASE.value)
+            & (member_signals["disclosure_date"] <= ref_date - pd.Timedelta(days=horizon))
+            & (member_signals["spy_alpha_pct"].notna())
+        ].copy()
+        collapsed = _collapse_to_episodes(eligible)
+        days_ago = (ref_date - pd.to_datetime(collapsed["disclosure_date"])).dt.days
+        weights = np.exp(
+            -days_ago.clip(lower=0).values * np.log(2) / recency_half_life_days
+        )
+        residuals = collapsed["spy_alpha_pct"].to_numpy() - raw_alpha
+        pooled_residual_sum += float(np.dot(weights, residuals**2))
+        pooled_weight_sum += float(weights.sum())
+
+    residual_dof = pooled_weight_sum - len(qualifying)
+    within_var = pooled_residual_sum / residual_dof if residual_dof > 0 else global_var
+    if not np.isfinite(within_var) or within_var < 0:
+        within_var = global_var
+
+    variance_floor = 1e-12
+    for member, (raw_alpha, weight_sum, n, weight_sq_sum) in qualifying.items():
+        if weight_sum > 0 and weight_sq_sum > 0:
+            effective_n = weight_sum**2 / weight_sq_sum
+        else:
+            effective_n = float(n)
+
+        shrinkage = prior_strength / (effective_n + prior_strength)
         posterior_mean = (1 - shrinkage) * raw_alpha + shrinkage * global_mean
-        posterior_std = global_std / sqrt(n + prior_strength)
+        sigma_sq = max(within_var, variance_floor)
+        tau_sq = max(global_var, variance_floor)
+        posterior_var = 1.0 / (effective_n / sigma_sq + 1.0 / tau_sq)
+        posterior_std = sqrt(max(posterior_var, variance_floor**2))
 
         member_signals = member_groups.get(member, pd.DataFrame())
         sector_skills = _compute_member_sector_skills_from_group(

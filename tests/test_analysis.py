@@ -54,7 +54,7 @@ class TestAnalysis(unittest.TestCase):
         self.assertFalse(signals['peak_potential_pct'].isna().any())
         self.assertTrue((signals['entry_price'] > 0).all())
 
-    def test_score_ticker_by_buyers_applies_small_metadata_adjustments(self):
+    def test_score_ticker_by_buyers_reports_metadata_diagnostics_without_adjustment(self):
         transactions = pd.DataFrame({
             'member': ['Alice', 'Charlie'],
             'ticker': ['AAPL', 'AAPL'],
@@ -79,7 +79,7 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(score.iloc[0]['base_signal_score'], 10.0)
         self.assertGreater(score.iloc[0]['size_factor'], 1.0)
         self.assertLess(score.iloc[0]['owner_factor'], 1.0)
-        self.assertNotEqual(score.iloc[0]['signal_score'], score.iloc[0]['base_signal_score'])
+        self.assertAlmostEqual(score.iloc[0]['signal_score_raw'], score.iloc[0]['base_signal_score'])
 
     def test_calculate_signal_potential_empty_input(self):
         with self.assertRaises(AnalysisError):
@@ -419,7 +419,9 @@ class TestAnalysis(unittest.TestCase):
         rankings = rank_sales(signals, horizon=90)
         alice = rankings.set_index('member').loc['Alice']
 
-        expected_prior = 0.75
+        # LOO sale prior: peers are Bob/Carol/Dave (Buyer is a purchase).
+        # Peers have 2 sale wins out of 3 episodes → prior 2/3.
+        expected_prior = 2 / 3
         expected_posterior = (expected_prior * 20 + 1) / 21
         self.assertAlmostEqual(alice['bayes_win_prob'], round(expected_posterior, 3))
 
@@ -447,12 +449,14 @@ class TestAnalysis(unittest.TestCase):
 
         # Collapsed episodes: 3 (Alice collapsed, Bob, Carol)
         # P(return < 0) = 2/3 (Alice -7.0 and Carol -10.0 are negative)
-        expected_prior = np.clip((2 / 3), 0.10, 0.90)
 
         rankings = rank_sales(signals, horizon=90)
         alice = rankings.set_index('member').loc['Alice']
 
-        # Alice's inverted return = -(-7.0) = 7.0 > 0 → 1 win, 0 losses
+        # Alice's inverted return = -(-7.0) = 7.0 > 0 → 1 win, 0 losses.
+        # LOO sale prior from peer episodes (Bob +5.0 is a loss, Carol -10.0 is
+        # a win): 1 win out of 2 peers → prior 0.5.
+        expected_prior = 0.5
         expected_bayes = (expected_prior * 20 + 1) / 21
         self.assertAlmostEqual(alice['bayes_win_prob'], round(expected_bayes, 3))
         # sale_trades = 1 (one collapsed episode for Alice)
@@ -574,7 +578,7 @@ class TestEpisodeCollapse(unittest.TestCase):
 class TestSoloBuyerSkillGate(unittest.TestCase):
     """Tests for the min_buyers=1 solo-buyer skill gate in score_ticker_by_buyers."""
 
-    def _make_solo_setup(self, bayes_win_prob: float):
+    def _make_solo_setup(self, posterior_lift: float):
         transactions = pd.DataFrame({
             "member": ["Pelosi"],
             "ticker": ["AVGO"],
@@ -588,7 +592,8 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
             "member": ["Pelosi"],
             "avg_spy_alpha_pct": [20.0],
             "purchase_trades": [5],
-            "bayes_win_prob": [bayes_win_prob],
+            "bayes_win_prob": [round(posterior_lift * 0.5, 3)],
+            "posterior_lift": [posterior_lift],
         })
         signals = pd.DataFrame({
             "member": ["Pelosi"],
@@ -602,7 +607,7 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         return transactions, member_rankings, signals
 
     def test_high_skill_solo_buyer_passes_gate_with_penalty(self):
-        transactions, member_rankings, signals = self._make_solo_setup(0.85)
+        transactions, member_rankings, signals = self._make_solo_setup(1.7)
 
         score = score_ticker_by_buyers(
             "AVGO", transactions, signals,
@@ -612,19 +617,15 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
 
         self.assertGreater(score.iloc[0]["signal_score"], 0.0)
         self.assertEqual(score.iloc[0]["num_buyers"], 1)
-        # Penalty (0.8) is applied on top of size_factor * owner_factor * ticker_perf_factor
-        # base_signal_score is unaffected; only signal_score is scaled down.
+        # The solo-buyer penalty scales the Bayesian posterior directly.
         base = score.iloc[0]["base_signal_score"]
         penalized = score.iloc[0]["signal_score"]
-        size_factor = score.iloc[0]["size_factor"]
-        owner_factor = score.iloc[0]["owner_factor"]
-        ticker_perf_factor = score.iloc[0]["ticker_perf_factor"]
-        expected = round(base * size_factor * owner_factor * ticker_perf_factor * 0.8, 2)
+        expected = round(base * 0.8, 2)
         self.assertAlmostEqual(penalized, expected, places=1)
         self.assertTrue(score.iloc[0]["solo_buyer"])
 
     def test_low_skill_solo_buyer_rejected(self):
-        transactions, member_rankings, signals = self._make_solo_setup(0.40)
+        transactions, member_rankings, signals = self._make_solo_setup(0.5)
 
         score = score_ticker_by_buyers(
             "AVGO", transactions, signals,
@@ -637,28 +638,28 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         self.assertIn("skill threshold", score.iloc[0]["note"])
 
     def test_threshold_boundary_passes(self):
-        # bayes_win_prob exactly at threshold (0.60) passes (not < threshold).
-        transactions, member_rankings, signals = self._make_solo_setup(0.60)
+        # posterior_lift exactly at threshold (1.0) passes (not < threshold).
+        transactions, member_rankings, signals = self._make_solo_setup(1.0)
 
         score = score_ticker_by_buyers(
             "AVGO", transactions, signals,
             member_rankings=member_rankings,
             min_buyers=1,
-            solo_buyer_skill_threshold=0.60,
+            solo_buyer_skill_threshold=1.0,
         )
 
         self.assertGreater(score.iloc[0]["signal_score"], 0.0)
         self.assertTrue(score.iloc[0]["solo_buyer"])
 
     def test_custom_threshold_can_reject_default_passer(self):
-        # bayes_win_prob=0.65 passes default 0.60 but fails stricter 0.70.
-        transactions, member_rankings, signals = self._make_solo_setup(0.65)
+        # posterior_lift=1.3 passes default 1.0 but fails stricter 1.4.
+        transactions, member_rankings, signals = self._make_solo_setup(1.3)
 
         strict = score_ticker_by_buyers(
             "AVGO", transactions, signals,
             member_rankings=member_rankings,
             min_buyers=1,
-            solo_buyer_skill_threshold=0.70,
+            solo_buyer_skill_threshold=1.4,
         )
         self.assertEqual(strict.iloc[0]["signal_score"], 0.0)
 
@@ -672,13 +673,13 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
     def test_min_buyers_ge_2_unchanged_by_solo_gate(self):
         # Single buyer with min_buyers=2 still rejected via the original path,
         # regardless of solo_buyer_skill_threshold.
-        transactions, member_rankings, signals = self._make_solo_setup(0.95)
+        transactions, member_rankings, signals = self._make_solo_setup(1.9)
 
         score = score_ticker_by_buyers(
             "AVGO", transactions, signals,
             member_rankings=member_rankings,
             min_buyers=2,
-            solo_buyer_skill_threshold=0.60,
+            solo_buyer_skill_threshold=1.0,
         )
 
         self.assertEqual(score.iloc[0]["signal_score"], 0.0)
@@ -756,7 +757,6 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
     def test_threshold_zero_disables_gate(self):
         # solo_buyer_skill_threshold=0 disables the gate entirely.
         transactions, member_rankings, signals = self._make_solo_setup(0.10)
-
         score = score_ticker_by_buyers(
             "AVGO", transactions, signals,
             member_rankings=member_rankings,
@@ -768,7 +768,7 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         self.assertFalse(score.iloc[0]["solo_buyer"])
 
     def test_custom_penalty_multiplier(self):
-        transactions, member_rankings, signals = self._make_solo_setup(0.85)
+        transactions, member_rankings, signals = self._make_solo_setup(1.7)
 
         score = score_ticker_by_buyers(
             "AVGO", transactions, signals,
@@ -778,10 +778,7 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         )
 
         base = score.iloc[0]["base_signal_score"]
-        size_factor = score.iloc[0]["size_factor"]
-        owner_factor = score.iloc[0]["owner_factor"]
-        ticker_perf_factor = score.iloc[0]["ticker_perf_factor"]
-        expected = round(base * size_factor * owner_factor * ticker_perf_factor * 0.5, 2)
+        expected = round(base * 0.5, 2)
         self.assertAlmostEqual(score.iloc[0]["signal_score"], expected, places=1)
 
 

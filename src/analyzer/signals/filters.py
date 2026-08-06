@@ -1,10 +1,9 @@
 """Filters, episode collapsing, and dynamic-prior estimation.
 
-`_get_horizon_data` and `_apply_quality_filter` are the cheap per-call
-filters used by every downstream consumer. `_collapse_to_episodes` is
-the expensive groupby that aggregates same-member/same-ticker signals
-within a 14-day window into one row. `_compute_dynamic_prior` returns
-the global up-rate for the dynamic-prior Bayesian shrinkage.
+`_get_horizon_data` and `_apply_quality_filter` are cheap per-call filters.
+`_collapse_to_episodes` aggregates same-member/same-ticker signals within a
+14-day window into one row. `_compute_dynamic_prior` returns a clipped global
+up-rate for consumers that need one shared prior.
 """
 
 from __future__ import annotations

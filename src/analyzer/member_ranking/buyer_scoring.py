@@ -128,11 +128,11 @@ def _solo_buyer_gate(ticker, ticker_trades, member_rankings, min_buyers, min_tra
     if not (min_buyers == 1 and min_trades == 1 and solo_buyer_skill_threshold > 0):
         return False
     sole_buyer = str(ticker_trades["member"].iloc[0])
-    # The gate compares posterior_lift (posterior / market prior), not the
-    # absolute bayes_win_prob. Each member's prior is now estimated
+    # The gate compares posterior_lift (posterior / leave-one-out peer prior),
+    # not the absolute bayes_win_prob. Each member's prior is estimated
     # leave-one-out, so bayes_win_prob is no longer comparable across members
     # against a fixed threshold; posterior_lift is the prior-invariant skill
-    # statistic (a lift above 1.0 means the buyer beats their market prior).
+    # statistic (a lift above 1.0 means the buyer beats their peer prior).
     lift = _lookup_buyer_posterior_lift(sole_buyer, member_rankings)
     if lift is None or lift < solo_buyer_skill_threshold:
         result = pd.DataFrame({

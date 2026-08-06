@@ -88,15 +88,15 @@ def _rank_members_impl(
     global_prior = float(np.clip(total_wins / total_n, 0.10, 0.90))
     peer_n = total_n - n
     peer_wins = total_wins - wins
-    market_priors = pd.Series(global_prior, index=idx, dtype=float)
+    loo_priors = pd.Series(global_prior, index=idx, dtype=float)
     has_peer_observations = peer_n > 0
-    market_priors.loc[has_peer_observations] = np.clip(
+    loo_priors.loc[has_peer_observations] = np.clip(
         peer_wins.loc[has_peer_observations] / peer_n.loc[has_peer_observations],
         0.10,
         0.90,
     )
 
-    stats = _compute_bayes_stats(n, wins, market_priors, _bayes_prior_strength, ret_agg)
+    stats = _compute_bayes_stats(n, wins, loo_priors, _bayes_prior_strength, ret_agg)
     avg_spy, avg_total_spy = _spy_alpha_by_member(purchases, grp, idx)
     hit_rates = _hit_rates_by_member(purchases, idx, threshold)
     conviction = _conviction_scores(grp, idx, purchases)
@@ -138,8 +138,8 @@ def _wins_by_member(purchases: pd.DataFrame, idx) -> pd.Series:
     )
 
 
-def _compute_bayes_stats(n, wins, market_priors, prior_strength: float, ret_agg: pd.DataFrame):
-    prior_values = market_priors.to_numpy(dtype=float)
+def _compute_bayes_stats(n, wins, loo_priors, prior_strength: float, ret_agg: pd.DataFrame):
+    prior_values = loo_priors.to_numpy(dtype=float)
     bayes_alpha = prior_values * prior_strength
     bayes_beta = (1 - prior_values) * prior_strength
     n_vals = n.values.astype(float)

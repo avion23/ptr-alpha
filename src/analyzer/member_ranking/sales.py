@@ -26,7 +26,7 @@ from analyzer.member_ranking.bayes import bayesian_win_probability
 def _compute_member_stats(
     member: str,
     grp: pd.DataFrame,
-    market_prior: float,
+    base_prior: float,
     threshold: float | None = None,
     invert_returns: bool = False,
 ) -> dict | None:
@@ -44,8 +44,8 @@ def _compute_member_stats(
     wins = int((rets > 0).sum())
     losses = int(len(rets) - wins)
     p_up = wins / len(rets)
-    bayes_win_prob = bayesian_win_probability(wins, losses, market_prior)
-    posterior_lift = bayes_win_prob / market_prior
+    bayes_win_prob = bayesian_win_probability(wins, losses, base_prior)
+    posterior_lift = bayes_win_prob / base_prior
 
     avg_spy_alpha, avg_total_spy_alpha = _alpha_stats(grp, invert_returns)
 

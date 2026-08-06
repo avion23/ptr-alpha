@@ -53,13 +53,20 @@ def _assign_episode_ids(group_sorted: pd.DataFrame, max_gap_days: int) -> np.nda
     dates = pd.to_datetime(group_sorted["disclosure_date"])
     if len(dates) <= 1:
         return np.zeros(len(dates), dtype=np.int64)
-    gaps = dates.diff().dt.days.fillna(0).astype(int)
-    return (gaps > max_gap_days).cumsum().values.astype(np.int64)
+    episode_ids = np.zeros(len(dates), dtype=np.int64)
+    episode_id = 0
+    episode_start = dates.iloc[0]
+    for position in range(1, len(dates)):
+        if (dates.iloc[position] - episode_start).days > max_gap_days:
+            episode_id += 1
+            episode_start = dates.iloc[position]
+        episode_ids[position] = episode_id
+    return episode_ids
 
 
 def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> pd.DataFrame:
     """Collapse same-member/same-ticker/same-horizon/same-type signals that
-    fall within `max_gap_days` of each other into a single weighted-average
+    fall within `max_gap_days` of an episode's start into a weighted-average
     row. Used by `rank_members`/`_compute_member_stats` to deduplicate
     rapid-fire buy/sell activity into discrete trading episodes."""
     if signals_df.empty:
@@ -83,11 +90,10 @@ def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> p
 
 
 def _assign_episode_column(df: pd.DataFrame, group_cols: list[str], max_gap_days: int) -> pd.DataFrame:
-    dates = pd.to_datetime(df["disclosure_date"])
-    gaps = dates.diff().dt.days.fillna(0).astype(np.int64)
-    first_per_group = df.groupby(group_cols, sort=False).head(1).index
-    gaps.loc[first_per_group] = 0
-    df["_episode_id"] = (gaps > max_gap_days).cumsum().astype(np.int64)
+    episode_ids = np.zeros(len(df), dtype=np.int64)
+    for positions in df.groupby(group_cols, sort=False).indices.values():
+        episode_ids[positions] = _assign_episode_ids(df.iloc[positions], max_gap_days)
+    df["_episode_id"] = episode_ids
     return df
 
 

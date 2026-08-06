@@ -17,6 +17,7 @@ from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
 from analyzer.models import TransactionType
+from analyzer.signals import TICKER_PERF_MIN_TRADES
 
 from analyzer.member_ranking.factors import _owner_score_factor, _size_score_factor
 from analyzer.member_ranking.ranking import rank_members
@@ -108,6 +109,7 @@ def _empty_ticker_result(ticker: str) -> pd.DataFrame:
         "ticker": [ticker],
         "num_buyers": [0],
         "signal_score": [0.0],
+        "signal_score_raw": [0.0],
     })
 
 
@@ -116,6 +118,7 @@ def _below_threshold_result(ticker: str, min_trades: int, min_buyers: int) -> pd
         "ticker": [ticker],
         "num_buyers": [min_trades],
         "signal_score": [0.0],
+        "signal_score_raw": [0.0],
         "note": [f"Below minimum buyer threshold ({min_buyers})"],
     })
 
@@ -131,6 +134,7 @@ def _solo_buyer_gate(ticker, ticker_trades, member_rankings, min_buyers, min_tra
             "ticker": [ticker],
             "num_buyers": [min_trades],
             "signal_score": [0.0],
+            "signal_score_raw": [0.0],
             "note": [
                 f"Solo buyer '{sole_buyer}' below skill threshold "
                 f"({solo_buyer_skill_threshold})"
@@ -219,7 +223,9 @@ def _ticker_history_fallback(ticker, buyers, signals_df, ticker_perf_signals):
             & (perf_signals["signal_type"] == TransactionType.PURCHASE.value)
             & (perf_signals["total_spy_alpha_pct"].notna())
         ]
-        if len(ticker_hist) >= 2:
+        if "window_complete" in ticker_hist.columns:
+            ticker_hist = ticker_hist[ticker_hist["window_complete"].fillna(False).astype(bool)]
+        if len(ticker_hist) >= TICKER_PERF_MIN_TRADES:
             fallback_score = float(ticker_hist["total_spy_alpha_pct"].mean())
             fallback_source = f"ticker_hist({len(ticker_hist)})"
 
@@ -228,6 +234,7 @@ def _ticker_history_fallback(ticker, buyers, signals_df, ticker_perf_signals):
         "num_buyers": [len(buyers)],
         "buyers": [", ".join(buyers[:3])],
         "signal_score": [round(fallback_score, 2)],
+        "signal_score_raw": [fallback_score],
         "fallback_source": [fallback_source],
     })
 
@@ -261,9 +268,10 @@ def _final_result(
     size_factor = _size_score_factor(ticker_trades)
     owner_factor = _owner_score_factor(ticker_trades)
 
-    signal_score = base_signal_score * size_factor * owner_factor
+    signal_score_raw = base_signal_score * size_factor * owner_factor
     if apply_solo_penalty:
-        signal_score *= solo_buyer_penalty
+        signal_score_raw *= solo_buyer_penalty
+    signal_score = round(signal_score_raw, 2)
 
     top_buyers = _top_buyers_for_label(buyers, rated_buyers_list, alpha_dict, member_skills)
     buyer_label = _buyer_label(len(top_buyers), len(buyers))
@@ -282,7 +290,8 @@ def _final_result(
         "base_signal_score": [round(base_signal_score, 2)],
         "size_factor": [round(size_factor, 3)],
         "owner_factor": [round(owner_factor, 3)],
-        "signal_score": [round(signal_score, 2)],
+        "signal_score": [signal_score],
+        "signal_score_raw": [signal_score_raw],
         "fallback_source": ["member_ranked"],
         "uncertainty_lambda": [uncertainty_penalty_lambda if use_skills else 0.0],
         "solo_buyer": [apply_solo_penalty],

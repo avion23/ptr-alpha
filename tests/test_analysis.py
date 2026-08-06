@@ -479,7 +479,7 @@ class TestAnalysis(unittest.TestCase):
         self.assertTrue(np.isnan(signals.loc[signals['ticker'] == 'MSFT', 'decayed_return_pct'].iloc[0]))
         self.assertEqual(rankings.iloc[0]['purchase_trades'], 1)
 
-    def test_sale_peak_potential_no_nan_with_valid_data(self):
+    def test_sale_peak_potential_nan_with_incomplete_ticker_coverage(self):
         transactions = pd.DataFrame({
             'member': ['Alice'],
             'ticker': ['AAPL'],
@@ -500,7 +500,8 @@ class TestAnalysis(unittest.TestCase):
 
         sales = signals[signals['signal_type'] == 'Sale']
         self.assertEqual(len(sales), 1)
-        self.assertFalse(np.isnan(sales.iloc[0]['peak_potential_pct']))
+        self.assertTrue(np.isnan(sales.iloc[0]['peak_potential_pct']))
+        self.assertFalse(sales.iloc[0]['window_complete'])
 
     def test_total_spy_alpha_uses_actual_spy_return(self):
         dates = pd.date_range('2024-01-01', '2024-04-01', freq='D')

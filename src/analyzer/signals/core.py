@@ -60,13 +60,21 @@ def _compute_ticker_signals(
     # weekends/market holidays without treating a partially elapsed horizon
     # as a completed 30/90/180-day observation.
     coverage_tolerance_ns = 7 * _constants._NS_PER_DAY
-    ticker_data_through = dates_ns[-1]
+    t_end_pos = t_hi - 1
+    ticker_end_valid = t_end_pos >= 0
+    ticker_end_dates_ns = np.zeros(n_signals, dtype=np.int64)
+    ticker_end_dates_ns[ticker_end_valid] = dates_ns[t_end_pos[ticker_end_valid]]
+    ticker_window_complete = (
+        ticker_end_valid
+        & ((t_end_ns - ticker_end_dates_ns) <= coverage_tolerance_ns)
+    )
     has_benchmark = spy_dates_ns is not None and len(spy_dates_ns) > 0
     spy_data_through = spy_dates_ns[-1] if has_benchmark else 0
     today_ns = pd.Timestamp.now().normalize().value
     r_window_complete[t_indices] = (
         (t_end_ns <= today_ns)
-        & (ticker_data_through >= t_end_ns - coverage_tolerance_ns)
+        & (t_lo < t_hi)
+        & ticker_window_complete
         & ((not has_benchmark) | (spy_data_through >= t_end_ns - coverage_tolerance_ns))
     )
 
@@ -77,7 +85,10 @@ def _compute_ticker_signals(
         # reached the requested window end.  Without this guard, a 180-day
         # signal computed 20 days after disclosure was silently labelled with
         # a 20-day return, contaminating member rankings and validation.
-        if not _market_window_is_complete(spy_dates_ns, t_end_ns[i]):
+        if (
+            not ticker_window_complete[i]
+            or not _market_window_is_complete(spy_dates_ns, t_end_ns[i])
+        ):
             continue
         lo = int(t_lo[i])
         hi = int(t_hi[i])

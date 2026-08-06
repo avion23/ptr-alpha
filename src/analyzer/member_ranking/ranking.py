@@ -60,7 +60,7 @@ def _prepare_member_data(
         raise AnalysisError(f"No signals survived quality filter (min price ${_signals.MIN_ENTRY_PRICE})")
 
     purchases = _collapse_to_episodes(purchases)
-    market_prior = _compute_dynamic_prior(signal_df, horizon)
+    market_prior = _compute_dynamic_prior(purchases, horizon)
     return purchases, market_prior
 
 

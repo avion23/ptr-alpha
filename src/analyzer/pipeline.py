@@ -277,11 +277,11 @@ def run_recent_ticker_scoring(
     result = pd.concat(scores, ignore_index=True)
     # This interface presents buy candidates, so rejected/negative scores must
     # not leak into the displayed recommendations merely to fill top_n.
-    if "signal_score" not in result.columns:
+    if "signal_score_raw" not in result.columns:
         result = result.iloc[0:0]
     else:
         result = result[
-            pd.to_numeric(result["signal_score"], errors="coerce").fillna(0) > 0
+            pd.to_numeric(result["signal_score_raw"], errors="coerce").fillna(0) > 0
         ]
     result = result.sort_values('signal_score', ascending=False).head(params.top_n)
     return DataResult(success=True, data={

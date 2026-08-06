@@ -20,6 +20,11 @@ class TestTickerResolver(unittest.TestCase):
         self.assertEqual(resolution.price_symbol, "BRK-A")
         self.assertEqual(resolution.status, "class_share")
 
+    def test_bare_brk_defaults_to_brk_b(self):
+        resolution = self.resolver.resolve("BRK")
+        self.assertEqual(resolution.price_symbol, "BRK-B")
+        self.assertEqual(resolution.status, "class_share")
+
     def test_bf_b_to_bf_b(self):
         resolution = self.resolver.resolve("BF.B")
         self.assertEqual(resolution.price_symbol, "BF-B")

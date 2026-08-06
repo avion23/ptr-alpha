@@ -31,6 +31,7 @@ class TickerResolver:
     }
 
     CLASS_SHARE_MAP: dict[str, str] = {
+        "BRK": "BRK-B",
         "BRK.B": "BRK-B",
         "BRK.A": "BRK-A",
         "BF.B": "BF-B",

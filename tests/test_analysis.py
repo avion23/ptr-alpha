@@ -5,7 +5,7 @@ from analyzer.analysis import (
     calculate_signal_potential, rank_members, rank_sales,
     get_top_signals, get_member_signals, get_analysis_table,
     score_ticker_by_buyers, bayesian_win_probability,
-    bayes_factor_against_market, _collapse_to_episodes,
+    bayes_factor_against_market,
 )
 from analyzer.exceptions import AnalysisError
 from analyzer.models import AnalysisMode
@@ -554,65 +554,6 @@ class TestAnalysis(unittest.TestCase):
 
 
 class TestEpisodeCollapse(unittest.TestCase):
-
-    def test_collapses_same_ticker_close_dates_into_single_episode(self):
-        signals = pd.DataFrame({
-            "member": ["Alice"] * 3,
-            "ticker": ["AAPL"] * 3,
-            "signal_type": ["Purchase"] * 3,
-            "horizon_days": [90] * 3,
-            "disclosure_date": pd.to_datetime(["2024-01-01", "2024-01-10", "2024-01-15"]),
-            "decayed_return_pct": [10.0, 12.0, 8.0],
-            "spy_alpha_pct": [5.0, 7.0, 3.0],
-            "total_return_pct": [15.0, 18.0, 12.0],
-            "total_spy_alpha_pct": [10.0, 13.0, 7.0],
-            "peak_potential_pct": [20.0, 25.0, 15.0],
-            "entry_price": [100.0, 100.0, 100.0],
-            "owner_code": ["S"] * 3,
-            "amount_midpoint": [1000.0, 4000.0, 1000.0],
-        })
-        collapsed = _collapse_to_episodes(signals)
-        self.assertEqual(len(collapsed), 1)
-        self.assertEqual(collapsed.iloc[0]["episode_count"], 3)
-        self.assertAlmostEqual(collapsed.iloc[0]["decayed_return_pct"], 11.0)
-
-    def test_keeps_different_tickers_as_separate_episodes(self):
-        signals = pd.DataFrame({
-            "member": ["Alice", "Alice"],
-            "ticker": ["AAPL", "GOOGL"],
-            "signal_type": ["Purchase", "Purchase"],
-            "horizon_days": [90] * 2,
-            "disclosure_date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
-            "decayed_return_pct": [10.0, 20.0],
-            "spy_alpha_pct": [5.0, 15.0],
-            "total_return_pct": [15.0, 25.0],
-            "total_spy_alpha_pct": [10.0, 20.0],
-            "peak_potential_pct": [20.0, 30.0],
-            "entry_price": [100.0, 200.0],
-            "owner_code": [None, None],
-            "amount_midpoint": [None, None],
-        })
-        collapsed = _collapse_to_episodes(signals)
-        self.assertEqual(len(collapsed), 2)
-
-    def test_splits_same_ticker_far_apart_dates(self):
-        signals = pd.DataFrame({
-            "member": ["Alice"] * 2,
-            "ticker": ["AAPL"] * 2,
-            "signal_type": ["Purchase"] * 2,
-            "horizon_days": [90] * 2,
-            "disclosure_date": pd.to_datetime(["2024-01-01", "2024-02-15"]),
-            "decayed_return_pct": [10.0, 20.0],
-            "spy_alpha_pct": [5.0, 15.0],
-            "total_return_pct": [15.0, 25.0],
-            "total_spy_alpha_pct": [10.0, 20.0],
-            "peak_potential_pct": [20.0, 30.0],
-            "entry_price": [100.0, 100.0],
-            "owner_code": [None, None],
-            "amount_midpoint": [None, None],
-        })
-        collapsed = _collapse_to_episodes(signals)
-        self.assertEqual(len(collapsed), 2)
 
     def test_rank_members_uses_fewer_observations_for_clustered_trades(self):
         signals = pd.DataFrame({

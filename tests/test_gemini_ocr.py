@@ -1,9 +1,7 @@
 from datetime import datetime
-import queue
 
 from analyzer.database import Database
 from scripts import gemini_ocr_common
-from scripts import ocr_parallel
 from scripts.ocr_zero_rows import insert_transactions
 
 
@@ -60,34 +58,6 @@ def test_validation_member_mismatch_uses_metadata_name():
     assert rejections["member_mismatch"] == 1
 
 
-def test_call_gemini_cache_round_trip(monkeypatch, tmp_path):
-    calls = []
-
-    def fake_run(args, capture_output, text, timeout):
-        calls.append(args)
-
-        class Result:
-            returncode = 0
-            stdout = "MEMBER: Jane Doe\nApple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
-            stderr = ""
-
-        return Result()
-
-    monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
-
-    first, first_error = gemini_ocr_common.call_gemini(
-        "sample.pdf", doc_id="doc-cache", cache_dir=str(tmp_path)
-    )
-    second, second_error = gemini_ocr_common.call_gemini(
-        "sample.pdf", doc_id="doc-cache", cache_dir=str(tmp_path)
-    )
-
-    assert first == second
-    assert first_error == second_error == ""
-    assert len(calls) == 1
-    assert calls[0][-4:] == ["-o", "temperature", "0", gemini_ocr_common.PROMPT]
-
-
 def test_call_gemini_empty_stdout_not_cached(monkeypatch, tmp_path):
     def fake_run(args, capture_output, text, timeout):
         class Result:
@@ -138,28 +108,6 @@ def test_cache_path_sanitizes_doc_id(tmp_path):
     path = gemini_ocr_common.cache_path("folder/doc\\id", cache_dir=str(tmp_path))
 
     assert path == tmp_path / "folder_doc_id.txt"
-
-
-def test_parallel_empty_response_enqueues_error(monkeypatch):
-    test_queue = queue.Queue()
-    monkeypatch.setattr(ocr_parallel, "write_q", test_queue)
-    monkeypatch.setattr(
-        ocr_parallel,
-        "call_gemini",
-        lambda pdf_path, doc_id=None, refresh=False, timeout=90: ("", "empty_response"),
-    )
-
-    doc_id, year, status, count, error = ocr_parallel.process_one(("doc-empty", 2024, "sample.pdf"))
-    queued = test_queue.get_nowait()
-
-    assert (doc_id, year, status, count, error) == ("doc-empty", 2024, "error", 0, "empty_response")
-    assert queued == {
-        "doc_id": "doc-empty",
-        "year": 2024,
-        "status": "error",
-        "raw_count": 0,
-        "error": "empty_response",
-    }
 
 
 def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):

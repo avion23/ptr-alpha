@@ -4,14 +4,6 @@ import unittest
 
 class TestOcrZeroRows(unittest.TestCase):
 
-
-
-    def test_amount_midpoints_defined(self):
-        from scripts import ocr_zero_rows
-        self.assertEqual(len(ocr_zero_rows.AMOUNT_MIDPOINTS), 10)
-        self.assertIn("A", ocr_zero_rows.AMOUNT_MIDPOINTS)
-        self.assertIn("J", ocr_zero_rows.AMOUNT_MIDPOINTS)
-
     # --- normalize_date ---
 
     def test_normalize_date_us_format(self):

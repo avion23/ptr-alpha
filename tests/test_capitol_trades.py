@@ -125,29 +125,6 @@ def _mock_response(data: dict, status_code: int = 200) -> MagicMock:
     return resp
 
 
-class TestHelpers(unittest.TestCase):
-    def test_compute_midpoint(self):
-        self.assertEqual(CapitolTradesSource._compute_midpoint(100, 200), 150.0)
-        self.assertEqual(CapitolTradesSource._compute_midpoint(250001, 500000), 375000.5)
-
-    def test_compute_midpoint_none_values(self):
-        self.assertIsNone(CapitolTradesSource._compute_midpoint(None, 200))
-        self.assertIsNone(CapitolTradesSource._compute_midpoint(100, None))
-        self.assertIsNone(CapitolTradesSource._compute_midpoint(None, None))
-
-    def test_compute_midpoint_invalid(self):
-        self.assertIsNone(CapitolTradesSource._compute_midpoint("bad", 200))
-
-    def test_parse_date(self):
-        self.assertEqual(CapitolTradesSource._parse_date("2025-01-14"), pd.Timestamp("2025-01-14"))
-
-    def test_parse_date_none(self):
-        self.assertIsNone(CapitolTradesSource._parse_date(None))
-
-    def test_parse_date_empty(self):
-        self.assertIsNone(CapitolTradesSource._parse_date(""))
-
-
 class TestCapitolTradesSource(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()

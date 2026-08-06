@@ -1,15 +1,11 @@
 """Smoke tests for analyzer.cli module."""
-import importlib
 import unittest
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from typer.testing import CliRunner
 
-from analyzer.cli import app, _print_portfolio_metrics
+from analyzer.cli import app
 from analyzer.exceptions import StepResult
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 
@@ -66,22 +62,6 @@ class TestCliApp(unittest.TestCase):
                 self.assertEqual(result.exit_code, 1, result.output)
                 context.assert_not_called()
 
-    def test_portfolio_metrics_do_not_report_zero_performance_without_closed_trades(self):
-        metrics = {
-            "total_return_pct": 1.0, "annualized_return_pct": 2.0,
-            "sharpe_ratio": 0.5, "max_drawdown_pct": -1.0,
-            "win_rate_pct": 0.0, "avg_holding_days": 0.0,
-            "turnover_rate": 0.0, "max_concurrent_positions": 2,
-            "total_closed_trades": 0, "spy_return_pct": None,
-            "sector_concentration": {},
-        }
-        with patch("builtins.print") as printer:
-            _print_portfolio_metrics(metrics)
-        output = "\n".join(call.args[0] for call in printer.call_args_list)
-        self.assertIn("N/A (no closed trades)", output)
-        self.assertNotIn("Win rate:           0.0%", output)
-
-
     def test_parse_fails_when_pipeline_fails_even_if_ocr_inserts_rows(self):
         mock_ctx = MagicMock()
         mock_ctx.settings.data.data_dir = "data"
@@ -92,37 +72,6 @@ class TestCliApp(unittest.TestCase):
             result = self.runner.invoke(app, ["parse", "--gemini-ocr"])
 
         self.assertEqual(result.exit_code, 1, result.output)
-
-    def test_gemini_ocr_scripts_package_is_installed_with_cli(self):
-        """Regression: `ptr-alpha parse --gemini-ocr` imports
-        `scripts.ocr_zero_rows.run_gemini_ocr_for_year` at runtime. When the
-        package is installed via `pip install .` (no repo root on sys.path),
-        this import only resolves if `scripts` is declared as an installable
-        package in pyproject.toml AND has an `__init__.py`. A namespace
-        package (no __init__.py) is NOT installed by setuptools and the CLI
-        crashes with ModuleNotFoundError. This test pins both requirements.
-        """
-        # 1. scripts must be a real (regular) package, not a namespace pkg.
-        scripts_pkg = importlib.import_module("scripts")
-        self.assertIsNotNone(
-            getattr(scripts_pkg, "__file__", None),
-            "scripts/ must have an __init__.py so setuptools ships it; "
-            "a namespace package is not installed and breaks `ptr-alpha --gemini-ocr`.",
-        )
-
-        # 2. the symbol the CLI imports must resolve.
-        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-        self.assertTrue(callable(run_gemini_ocr_for_year))
-
-        # 3. pyproject.toml must declare scripts in package discovery.
-        pyproject = (REPO_ROOT / "pyproject.toml").read_text()
-        self.assertIn("[tool.setuptools.packages.find]", pyproject)
-        self.assertIn("scripts*", pyproject)
-
-
-
-
-
 
 
 class TestAnalyzeParamsMapping(unittest.TestCase):

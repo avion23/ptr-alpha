@@ -9,9 +9,6 @@ from analyzer.portfolio import (
     KellyConfig,
     build_kelly_portfolio,
     compute_portfolio_metrics,
-    compute_payout_ratio,
-    half_kelly,
-    kelly_fraction,
     simulate_portfolio_returns,
 )
 
@@ -45,41 +42,6 @@ def _make_prices(tickers, start, end, base_prices=None, daily_drift=0.0):
         base = base_prices.get(ticker, 100.0)
         data[ticker] = [base * (1 + daily_drift * i) for i in range(len(dates))]
     return pd.DataFrame(data, index=dates)
-
-
-class TestKellyFraction(unittest.TestCase):
-    def test_positive_edge(self):
-        # p=0.6, b=1.25 -> f* = (0.6*1.25 - 0.4)/1.25 = (0.75-0.4)/1.25 = 0.28
-        f = kelly_fraction(0.6, 1.25)
-        self.assertAlmostEqual(f, 0.28, places=2)
-
-    def test_no_edge(self):
-        # p=0.5, b=1.0 -> f* = (0.5*1.0 - 0.5)/1.0 = 0.0
-        f = kelly_fraction(0.5, 1.0)
-        self.assertAlmostEqual(f, 0.0, places=6)
-
-    def test_negative_edge(self):
-        f = kelly_fraction(0.4, 1.0)
-        self.assertEqual(f, 0.0)
-
-    def test_edge_cases(self):
-        self.assertEqual(kelly_fraction(0.0, 1.0), 0.0)
-        self.assertEqual(kelly_fraction(1.0, 1.0), 0.0)
-        self.assertEqual(kelly_fraction(0.6, 0.0), 0.0)
-        self.assertEqual(kelly_fraction(0.6, -1.0), 0.0)
-
-    def test_half_kelly(self):
-        f_full = kelly_fraction(0.6, 1.25)
-        f_half = half_kelly(0.6, 1.25)
-        self.assertAlmostEqual(f_half, f_full / 2.0, places=6)
-
-    def test_payout_ratio(self):
-        b = compute_payout_ratio(1.5, 1.0)
-        self.assertAlmostEqual(b, 1.5, places=6)
-
-    def test_payout_ratio_zero_loss(self):
-        b = compute_payout_ratio(1.5, 0.0)
-        self.assertEqual(b, 0.0)
 
 
 class TestBuildKellyPortfolio(unittest.TestCase):

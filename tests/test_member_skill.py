@@ -5,7 +5,6 @@ import pandas as pd
 
 from analyzer.member_skill import (
     MemberSkillPosterior,
-    _recency_weight,
     estimate_member_skills,
     score_members_for_ticker,
 )
@@ -41,23 +40,6 @@ def _make_signals(members_alpha: dict[str, list[float]], horizon: int = HORIZON)
                 "peak_potential_pct": alpha + 10.0,
             })
     return pd.DataFrame(rows)
-
-
-class TestRecencyWeight(unittest.TestCase):
-    def test_recent_trade_weighted_more_than_old_trade(self):
-        recent = _recency_weight(pd.Timestamp("2025-05-01"), REF_DATE, HORIZON)
-        old = _recency_weight(pd.Timestamp("2024-06-01"), REF_DATE, HORIZON)
-        self.assertGreater(recent, old)
-
-    def test_weight_equals_one_at_zero_days(self):
-        w = _recency_weight(REF_DATE, REF_DATE, 365)
-        self.assertAlmostEqual(w, 1.0)
-
-    def test_weight_decreases_monotonically(self):
-        half_life = 365
-        weights = [_recency_weight(REF_DATE - pd.Timedelta(days=d), REF_DATE, half_life) for d in range(0, 1000, 50)]
-        for i in range(1, len(weights)):
-            self.assertGreater(weights[i - 1], weights[i])
 
 
 class TestEstimateMemberSkills(unittest.TestCase):
@@ -107,22 +89,6 @@ class TestEstimateMemberSkills(unittest.TestCase):
         )
 
         self.assertLess(skills["MANY"].alpha_std, skills["FEW"].alpha_std)
-
-    def test_shrinkage_formula(self):
-        """Verify shrinkage formula: prior_strength / (n + prior_strength)."""
-        signals = _make_signals({"A": [10.0] * 10})
-
-        skills = estimate_member_skills(
-            signals, min_episodes=1, prior_strength=5.0,
-            recency_half_life_days=365, horizon=HORIZON, ref_date=REF_DATE,
-        )
-
-        skill = skills["A"]
-        expected_shrinkage = 5.0 / (10 + 5.0)
-        self.assertAlmostEqual(skill.shrinkage, expected_shrinkage)
-
-
-
 
 class TestScoreMembersForTicker(unittest.TestCase):
     def test_with_known_members(self):

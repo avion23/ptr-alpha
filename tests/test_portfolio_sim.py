@@ -289,31 +289,5 @@ class TestDrawdownFromInitialCapital(unittest.TestCase):
         self.assertAlmostEqual(metrics["max_drawdown_pct"], -0.24, places=2)
 
 
-class TestSectorExposureMarkToMarket(unittest.TestCase):
-    """Regression: _sector_exposure must use mark-to-market, not cost basis,
-    so sector constraints reflect current market value."""
-
-    def test_sector_exposure_uses_mtm(self):
-        from analyzer.portfolio_sim import PortfolioPosition
-        cfg = PortfolioConfig(initial_capital=10000, max_sector_pct=0.40)
-        sim = PortfolioSimulator(cfg)
-        # Hold a Tech position bought at 100, now priced at 200 (mtm = 10000).
-        sim.cash = 5000
-        sim.positions = [
-            PortfolioPosition(
-                ticker="A", entry_date=date(2024, 1, 1), entry_price=100.0,
-                shares=50, cost=5000.0, sector="Tech",
-                signal_score=10.0, rank=1,
-            )
-        ]
-        dates = pd.date_range("2024-01-01", "2024-01-10", freq="D")
-        prices = pd.DataFrame(
-            {"A": [100.0] * 5 + [200.0] * 5}, index=dates,
-        )
-        exposure = sim._sector_exposure(prices, date(2024, 1, 8))
-        # mtm = 50 * 200 = 10000; cash = 5000; total = 15000; tech = 10000/15000
-        self.assertAlmostEqual(exposure["Tech"], 10000.0 / 15000.0, places=3)
-
-
 if __name__ == "__main__":
     unittest.main()

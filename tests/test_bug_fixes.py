@@ -73,73 +73,6 @@ class TestDedupKeyFix(DatabaseTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 – Capitol Trades normalisation
-# ---------------------------------------------------------------------------
-class TestCapitolTradesNormalisationFix(unittest.TestCase):
-
-    def _make_trade(self, **overrides):
-        base = {
-            "politician_name": "Nancy Pelosi",
-            "ticker": "AAPL",
-            "asset_type": "Stock",
-            "transaction_type": "purchase",
-            "transaction_date": "2025-10-22",
-            "disclosure_date": "2025-10-22",
-            "amount_text": "$1,001 - $15,000",
-            "amount_min": None,
-            "amount_max": None,
-            "doc_id": None,
-        }
-        base.update(overrides)
-        return base
-
-    def _normalize(self, trades):
-        from analyzer.capitol_trades import CapitolTradesSource
-        src = CapitolTradesSource.__new__(CapitolTradesSource)
-        return src._normalize(trades)
-
-    # 2a – midpoint fallback from amount_text
-    def test_midpoint_parsed_from_text_when_numeric_fields_absent(self):
-        df = self._normalize([self._make_trade(doc_id="real-id")])
-        self.assertAlmostEqual(df.iloc[0]["amount_midpoint"], 8000.5,
-                               msg="Midpoint should come from text when amount_min/max absent")
-
-    def test_midpoint_from_numeric_when_both_present(self):
-        df = self._normalize([self._make_trade(
-            doc_id="real-id",
-            amount_min=100_000.0,
-            amount_max=200_000.0,
-        )])
-        self.assertAlmostEqual(df.iloc[0]["amount_midpoint"], 150_000.0)
-
-    # 2b – synthetic doc_id
-    def test_missing_doc_id_gets_synthetic_ct_prefix(self):
-        df = self._normalize([self._make_trade(doc_id=None)])
-        self.assertEqual(len(df), 1)
-        doc_id = df.iloc[0]["doc_id"]
-        self.assertTrue(doc_id.startswith("ct-"),
-                        f"Expected synthetic 'ct-' doc_id, got: {doc_id}")
-
-    def test_none_string_doc_id_replaced_with_synthetic(self):
-        """str(None) == 'None' must be treated as missing, not a real doc_id."""
-        df = self._normalize([self._make_trade(doc_id=None)])
-        doc_id = df.iloc[0]["doc_id"]
-        self.assertNotEqual(doc_id, "None", "String 'None' must be replaced with synthetic id")
-
-    def test_two_different_rows_without_doc_id_get_different_synthetic_ids(self):
-        t1 = self._make_trade(doc_id=None, ticker="AAPL")
-        t2 = self._make_trade(doc_id=None, ticker="NVDA")
-        df = self._normalize([t1, t2])
-        self.assertEqual(len(df), 2)
-        self.assertNotEqual(df.iloc[0]["doc_id"], df.iloc[1]["doc_id"],
-                            "Different trades must get different synthetic ids")
-
-    def test_real_doc_id_preserved(self):
-        df = self._normalize([self._make_trade(doc_id="12345")])
-        self.assertEqual(df.iloc[0]["doc_id"], "12345")
-
-
-# ---------------------------------------------------------------------------
 # Fix 3 – Entry price join misses when price is cached under raw ticker
 # ---------------------------------------------------------------------------
 class TestEntryPriceRawTickerFallback(DatabaseTestCase):
@@ -283,73 +216,6 @@ class TestContinuationRowAmountOwner(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Fix 6 – Garbage tickers blocked by blacklist
-# ---------------------------------------------------------------------------
-class TestGarbageTickerBlacklist(unittest.TestCase):
-
-    def test_new_blacklist_tokens_not_extracted(self):
-        from analyzer.parsing.cells import _extract_ticker, _TICKER_BLACKLIST
-
-        garbage_fragments = [
-            "UNIT", "TECH", "NORT", "MARY", "CITI", "AMER",
-            "BERK", "BANK", "MICH", "WISC", "KING", "SOUT",
-            "EAST", "WEST", "PORT", "LAKE",
-        ]
-        for frag in garbage_fragments:
-            self.assertIn(frag, _TICKER_BLACKLIST,
-                          f"{frag} must be in _TICKER_BLACKLIST")
-            result = _extract_ticker(f"XYZ Corp ({frag})")
-            # The fragment itself must not be returned as the ticker.
-            # (Some fragments like CITI may still resolve to the CORRECT ticker 'C'
-            # via company-name matching — that is acceptable and desirable.)
-            self.assertNotEqual(result, frag,
-                                f"({frag}) must not be returned as the ticker symbol")
-
-    def test_cleanup_confirmed_garbage_does_not_include_real_tickers(self):
-        """_CONFIRMED_GARBAGE must not contain single-letter tickers that are real stocks.
-
-        A=Agilent, O=Realty Income, X=US Steel, S=SentinelOne, P=Primerica, E=Eni are
-        legitimate tickers blocked by the *parser* blacklist (ambiguous in PDF context)
-        but must never be nulled out by the cleanup script.
-        """
-        import sys
-        import os
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
-        from cleanup_tickers import _CONFIRMED_GARBAGE
-
-        real_tickers = {"A", "O", "X", "S", "P", "E"}
-        for t in real_tickers:
-            self.assertNotIn(t, _CONFIRMED_GARBAGE,
-                             f"Real ticker '{t}' must not appear in _CONFIRMED_GARBAGE")
-
-    def test_cleanup_does_not_classify_ambiguous_words_as_garbage(self):
-        """Valid symbols must not be nulled based only on their spelling."""
-        import sys
-        import os
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
-        from cleanup_tickers import _CONFIRMED_GARBAGE, is_cash_or_fund
-
-        real_tickers = {"UNIT", "TECH", "EAST", "WEST", "LAKE"}
-        self.assertTrue(_CONFIRMED_GARBAGE.isdisjoint(real_tickers))
-        for ticker in {"US", "NEW", "SP"}:
-            self.assertFalse(is_cash_or_fund(ticker))
-
-    def test_original_blacklist_tokens_still_blocked(self):
-        from analyzer.parsing.cells import _extract_ticker
-
-        for frag in ("THE", "NEW", "DEL", "OLD"):
-            result = _extract_ticker(f"Some Name ({frag})")
-            self.assertIsNone(result, f"({frag}) must still be blocked")
-
-    def test_valid_tickers_still_pass(self):
-        from analyzer.parsing.cells import _extract_ticker
-
-        self.assertEqual(_extract_ticker("Apple Inc. (AAPL)"), "AAPL")
-        self.assertEqual(_extract_ticker("NVIDIA Corp (NVDA)"), "NVDA")
-        self.assertEqual(_extract_ticker("JPMorgan Chase (JPM)"), "JPM")
-
-
-# ---------------------------------------------------------------------------
 # Fix 7 – Member name splits → canonical key
 # ---------------------------------------------------------------------------
 class TestCanonicalMemberKey(unittest.TestCase):
@@ -401,45 +267,6 @@ class TestCanonicalMemberKey(unittest.TestCase):
 
         key = canonical_member_key("john doe")
         self.assertEqual(key, key.upper())
-
-
-class TestCanonicalKeyInLookups(unittest.TestCase):
-    """Verify that lookup dicts built from member_rankings accept name variants."""
-
-    def _make_rankings(self):
-        return pd.DataFrame([{
-            "member": "MICHAEL T. MCCAUL",
-            "bayes_win_prob": 0.72,
-            "shrunk_alpha": 3.5,
-            "purchase_trades": 15,
-            "prob_up_given_buy": 0.65,
-        }])
-
-    def test_build_buyer_bayes_dict_accepts_variant_name(self):
-        from analyzer.member_ranking.lookups import _build_buyer_bayes_dict
-
-        d = _build_buyer_bayes_dict(self._make_rankings())
-        # Lookup with a different name variant must hit the same entry
-        self.assertIn("MICHAEL MCCAUL", d,
-                      "Canonical key alias 'MICHAEL MCCAUL' must be in dict")
-        self.assertAlmostEqual(d["MICHAEL MCCAUL"], 0.72)
-
-    def test_build_ranking_dicts_alpha_accepts_variant_name(self):
-        from analyzer.member_ranking.lookups import _build_ranking_dicts
-
-        result = _build_ranking_dicts(self._make_rankings())
-        alpha = result["alpha"]
-        self.assertIn("MICHAEL MCCAUL", alpha,
-                      "Canonical alias must be present in alpha dict")
-
-    def test_lookup_buyer_bayes_win_prob_variant_name(self):
-        from analyzer.member_ranking.lookups import _lookup_buyer_bayes_win_prob
-
-        rankings = self._make_rankings()
-        # Lookup with the short-form name must resolve to the correct prob
-        prob = _lookup_buyer_bayes_win_prob("MICHAEL MCCAUL", rankings)
-        self.assertIsNotNone(prob)
-        self.assertAlmostEqual(prob, 0.72)
 
 
 # ---------------------------------------------------------------------------

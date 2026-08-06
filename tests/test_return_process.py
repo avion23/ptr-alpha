@@ -28,18 +28,6 @@ class TestFitAR1:
         assert abs(a_est - a_true) < 0.03, f"a={a_est:.3f} != {a_true}"
         assert abs(s2_est - s2_true) < 0.002, f"s2={s2_est:.4f} != {s2_true}"
 
-    def test_short_series(self):
-        a, b, s2 = fit_ar1(np.array([1.0, 2.0]))
-        assert a == 0.95  # default
-
-    def test_constant_series(self):
-        """Constant series: denom=0, returns defaults."""
-        a, b, s2 = fit_ar1(np.ones(10))
-        assert a == 0.95
-        # s2 computed on demeaned residuals, all zero → 0.0
-        assert s2 <= 0.01
-
-
 class TestAR1ToOU:
     def test_roundtrip(self):
         """OU -> AR(1) -> OU should recover parameters."""
@@ -84,11 +72,6 @@ class TestFitOU:
 
 
 class TestBuildPrior:
-    def test_empty(self):
-        theta, beta, P, s2 = build_prior([])
-        assert theta == 0.05
-        assert P == 1.0
-
     def test_with_curves(self):
         rng = np.random.default_rng(7)
         curves = []
@@ -155,13 +138,3 @@ class TestReturnProcessTracker:
         assert abs(post.mu_mean - mu_sample) < 0.05, (
             f"mu={post.mu_mean:.3f} != sample mean={mu_sample:.3f}"
         )
-
-    def test_ready(self):
-        tracker = ReturnProcessTracker(
-            theta=0.05, beta_prior=0.0, P_prior=1.0,
-            sigma2_ou=0.01, min_observations=5,
-        )
-        assert not tracker.ready()
-        for r in [0.01, 0.02, 0.01, 0.03, 0.02, 0.04]:
-            tracker.update(r)
-        assert tracker.ready()

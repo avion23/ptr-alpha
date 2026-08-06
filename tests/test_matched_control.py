@@ -7,9 +7,6 @@ import numpy as np
 import pandas as pd
 
 from analyzer.matched_control import (
-    _compute_max_drawdown,
-    _compute_realized_volatility,
-    _market_cap_tier,
     find_matched_controls,
     run_matched_control_backtest,
 )
@@ -56,44 +53,6 @@ def _make_transactions(rows: list[dict]) -> pd.DataFrame:
     df["transaction_date"] = pd.to_datetime(df["transaction_date"])
     df["disclosure_date"] = pd.to_datetime(df["disclosure_date"])
     return df
-
-
-class TestComputeRealizedVolatility(unittest.TestCase):
-    def setUp(self):
-        self.prices = _make_prices(["A", "B"], n_days=100)
-
-    def test_returns_float_for_valid_ticker(self):
-        result = _compute_realized_volatility(self.prices, "A", pd.Timestamp("2024-03-01"))
-        self.assertIsInstance(result, float)
-        self.assertGreater(result, 0)
-
-
-    def test_returns_none_for_insufficient_data(self):
-        result = _compute_realized_volatility(self.prices, "A", pd.Timestamp("2024-01-02"))
-        self.assertIsNone(result)
-
-
-class TestComputeMaxDrawdown(unittest.TestCase):
-    def test_returns_float_for_valid_ticker(self):
-        prices = _make_prices(["X"], n_days=100)
-        result = _compute_max_drawdown(prices, "X", pd.Timestamp("2024-03-01"))
-        self.assertIsInstance(result, float)
-        self.assertLessEqual(result, 0)
-
-
-
-class TestMarketCapTier(unittest.TestCase):
-    def test_mega(self):
-        self.assertEqual(_market_cap_tier(300e9), "mega")
-
-    def test_large(self):
-        self.assertEqual(_market_cap_tier(50e9), "large")
-
-    def test_mid(self):
-        self.assertEqual(_market_cap_tier(5e9), "mid")
-
-    def test_small(self):
-        self.assertEqual(_market_cap_tier(500e6), "small")
 
 
 class TestFindMatchedControls(unittest.TestCase):

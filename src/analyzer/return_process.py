@@ -25,6 +25,7 @@ import numpy as np
 # Parameter containers
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True, slots=True)
 class OUParams:
     """Ornstein-Uhlenbeck parameters estimated from a return curve."""
@@ -46,9 +47,9 @@ class OUParams:
     def sigma2_ou(self) -> float:
         """OU innovation variance: sigma^2 / (2*theta) * (1 - e^{-2*theta})."""
         if self.theta < 1e-8:
-            return float(self.sigma ** 2)
+            return float(self.sigma**2)
         return float(
-            self.sigma ** 2 / (2.0 * self.theta) * (1.0 - np.exp(-2.0 * self.theta))
+            self.sigma**2 / (2.0 * self.theta) * (1.0 - np.exp(-2.0 * self.theta))
         )
 
     @property
@@ -79,10 +80,10 @@ class OUPosterior:
         return self.mu_mean / rho + (r_tau - self.mu_mean) / denom
 
 
-
 # ---------------------------------------------------------------------------
 # AR(1) / OU fitting (offline, on historical curves)
 # ---------------------------------------------------------------------------
+
 
 def fit_ar1(returns: np.ndarray) -> tuple[float, float, float]:
     """
@@ -131,7 +132,7 @@ def fit_ar1(returns: np.ndarray) -> tuple[float, float, float]:
         for i in range(n - 1):
             resid = r[i + 1] - b - a * r[i]
             s2 += resid * resid
-        s2 /= (n - 1)
+        s2 /= n - 1
         return a, b, max(s2, 1e-10)
 
     # Standard numpy path for larger arrays
@@ -151,7 +152,7 @@ def fit_ar1(returns: np.ndarray) -> tuple[float, float, float]:
 
     b = r_bar * (1.0 - a)
     resid = r_next - b - a * r_prev
-    s2 = float(np.mean(resid ** 2))
+    s2 = float(np.mean(resid**2))
 
     return a, b, max(s2, 1e-10)
 
@@ -159,6 +160,7 @@ def fit_ar1(returns: np.ndarray) -> tuple[float, float, float]:
 def ar1_to_ou(a: float, b: float, s2: float) -> OUParams:
     """Convert AR(1) parameters to OU parameters. Uses math module for speed."""
     import math
+
     a = max(a, 1e-6)
     theta = -math.log(a)
     mu = b / (1.0 - a) if abs(1.0 - a) > 1e-8 else 0.0
@@ -179,6 +181,7 @@ def fit_ou(returns: np.ndarray) -> OUParams:
 # ---------------------------------------------------------------------------
 # Prior construction from historical data (offline, one-time)
 # ---------------------------------------------------------------------------
+
 
 def build_prior(
     historical_return_curves: list[np.ndarray],
@@ -225,6 +228,7 @@ def build_prior(
 # Entry valuation: V(0) from historical curves
 # ---------------------------------------------------------------------------
 
+
 def compute_entry_value(
     historical_return_curves: list[np.ndarray],
     rho: float = 0.000137,
@@ -238,7 +242,11 @@ def compute_entry_value(
     V0 = mu * theta / (rho * (theta + rho))
     """
     if not historical_return_curves:
-        return default_mu * default_theta / (rho * (default_theta + rho)), default_mu, default_theta
+        return (
+            default_mu * default_theta / (rho * (default_theta + rho)),
+            default_mu,
+            default_theta,
+        )
 
     thetas = []
     mus = []
@@ -253,7 +261,11 @@ def compute_entry_value(
             mus.append(ou.mu)
 
     if not mus:
-        return default_mu * default_theta / (rho * (default_theta + rho)), default_mu, default_theta
+        return (
+            default_mu * default_theta / (rho * (default_theta + rho)),
+            default_mu,
+            default_theta,
+        )
 
     mu = float(np.mean(mus))
     theta = float(np.median(thetas))
@@ -314,6 +326,7 @@ def compute_entry_value_and_horizon(
 # Optimal horizon from OU half-life
 # ---------------------------------------------------------------------------
 
+
 def compute_optimal_horizon(
     historical_return_curves: list[np.ndarray],
     min_horizon: int = 20,
@@ -353,6 +366,7 @@ def compute_optimal_horizon(
 # Kalman filter for online mu tracking
 # ---------------------------------------------------------------------------
 
+
 class KalmanFilter1D:
     """
     Scalar Kalman filter for a constant-plus-noise state.
@@ -385,6 +399,7 @@ class KalmanFilter1D:
 # Per-position tracker (online, continuous)
 # ---------------------------------------------------------------------------
 
+
 class ReturnProcessTracker:
     """
     Tracks a single position's return process via Kalman filter.
@@ -402,7 +417,7 @@ class ReturnProcessTracker:
         beta_prior: float,
         P_prior: float,
         sigma2_ou: float,
-        rho: float = 0.000137,   # 5% annual discount rate
+        rho: float = 0.000137,  # 5% annual discount rate
         process_noise: float = 0.0,  # Q: mu drift (0 = constant mu, pure averaging)
         min_observations: int = 5,
     ):
@@ -451,7 +466,7 @@ class ReturnProcessTracker:
             mu_var = self.kf.P / 1e-16
         else:
             mu_mean = self.kf.x / one_minus_a
-            mu_var = self.kf.P / (one_minus_a ** 2)
+            mu_var = self.kf.P / (one_minus_a**2)
 
         return OUPosterior(
             mu_mean=float(mu_mean),

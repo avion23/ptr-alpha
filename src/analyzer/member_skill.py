@@ -14,10 +14,12 @@ from analyzer.analysis import TransactionType, _collapse_to_episodes
 class MemberSkillPosterior:
     member: str
     alpha_mean: float  # posterior mean
-    alpha_std: float   # posterior std
-    n_episodes: int    # number of fully-elapsed episodes
-    shrinkage: float   # how much pulled toward global mean
-    sector_skills: dict[str, float] = field(default_factory=dict)  # sector-specific skill
+    alpha_std: float  # posterior std
+    n_episodes: int  # number of fully-elapsed episodes
+    shrinkage: float  # how much pulled toward global mean
+    sector_skills: dict[str, float] = field(
+        default_factory=dict
+    )  # sector-specific skill
 
 
 def _recency_weight(
@@ -112,11 +114,20 @@ def _compute_member_sector_skills_from_group(
     weight = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
     alpha_weighted = filtered["spy_alpha_pct"].values * weight
 
-    weight_sums = pd.Series(weight, index=filtered.index).groupby(filtered["ticker"]).sum()
-    alpha_sums = pd.Series(alpha_weighted, index=filtered.index).groupby(filtered["ticker"]).sum()
+    weight_sums = (
+        pd.Series(weight, index=filtered.index).groupby(filtered["ticker"]).sum()
+    )
+    alpha_sums = (
+        pd.Series(alpha_weighted, index=filtered.index)
+        .groupby(filtered["ticker"])
+        .sum()
+    )
 
     valid = weight_sums > 0
-    return {t: float(alpha_sums[t]) / float(weight_sums[t]) for t in weight_sums.index[valid]}
+    return {
+        t: float(alpha_sums[t]) / float(weight_sums[t])
+        for t in weight_sums.index[valid]
+    }
 
 
 def estimate_member_skills(
@@ -155,7 +166,9 @@ def estimate_member_skills(
         return {}
 
     if prior_strength is None:
-        prior_strength = _signals.BAYES_PRIOR_STRENGTH  # 20, unified with member_ranking
+        prior_strength = (
+            _signals.BAYES_PRIOR_STRENGTH
+        )  # 20, unified with member_ranking
     if ref_date is None:
         ref_date = pd.Timestamp.now()
     raw = _compute_member_raw_alphas(
@@ -195,7 +208,10 @@ def estimate_member_skills(
         eligible = member_signals[
             (member_signals["horizon_days"] == horizon)
             & (member_signals["signal_type"] == TransactionType.PURCHASE.value)
-            & (member_signals["disclosure_date"] <= ref_date - pd.Timedelta(days=horizon))
+            & (
+                member_signals["disclosure_date"]
+                <= ref_date - pd.Timedelta(days=horizon)
+            )
             & (member_signals["spy_alpha_pct"].notna())
         ].copy()
         collapsed = _collapse_to_episodes(eligible)
@@ -281,7 +297,9 @@ def score_members_for_ticker(
     # Generate all samples at once: shape (n_bootstrap, n_posteriors)
     means_arr = np.array([p.alpha_mean for p in posteriors])
     stds_arr = np.array([max(p.alpha_std, 1e-6) for p in posteriors])
-    all_samples = rng.normal(means_arr[None, :], stds_arr[None, :], size=(n_bootstrap, len(posteriors)))
+    all_samples = rng.normal(
+        means_arr[None, :], stds_arr[None, :], size=(n_bootstrap, len(posteriors))
+    )
     bootstrap_alphas = all_samples @ weight_arr
 
     uncertainty = float(np.std(bootstrap_alphas))

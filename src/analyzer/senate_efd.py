@@ -34,7 +34,11 @@ from curl_cffi import requests as cffi_requests
 
 from analyzer.database import Database
 from analyzer.interfaces import TransactionSource
-from analyzer.parsing.cells import _extract_amount_midpoint, _extract_owner_code, _extract_ticker
+from analyzer.parsing.cells import (
+    _extract_amount_midpoint,
+    _extract_owner_code,
+    _extract_ticker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +55,9 @@ RETRY_JITTER = 0.3
 
 _LINK_RE = re.compile(r'href="(?P<path>/search/view/ptr/[^"]+)"')
 _CSRF_RE = re.compile(r'name="csrfmiddlewaretoken" value="([^"]+)"')
-_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I
+)
 
 _HEADER_NAME_MAP = {
     "transaction_date": "transaction date",
@@ -76,11 +82,20 @@ class SenateEFDBlockedError(SenateEFDError):
 class SenateEFDSource(TransactionSource):
     """Scrapes official Senate PTR filings from efdsearch.senate.gov."""
 
-    def __init__(self, data_dir: str | Path = "data", read_only: bool = False, db: Database | None = None):
+    def __init__(
+        self,
+        data_dir: str | Path = "data",
+        read_only: bool = False,
+        db: Database | None = None,
+    ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._owns_db = db is None
-        self.db = db if db is not None else Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        self.db = (
+            db
+            if db is not None
+            else Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        )
         self._session: cffi_requests.Session | None = None
         self._csrf_token: str | None = None
 
@@ -133,7 +148,9 @@ class SenateEFDSource(TransactionSource):
                     raise SenateEFDBlockedError(
                         f"eFD request failed after {attempts} attempts: {e}"
                     ) from e
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)  # nosec B311
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(
+                    0, RETRY_JITTER
+                )  # nosec B311
                 logger.warning("eFD request error (%s); retrying in %.1fs", e, delay)
                 time.sleep(delay)
                 continue
@@ -143,10 +160,16 @@ class SenateEFDSource(TransactionSource):
 
             if resp.status_code == 429:
                 if attempt == attempts:
-                    raise SenateEFDBlockedError("eFD rate-limited (HTTP 429) after retries")
+                    raise SenateEFDBlockedError(
+                        "eFD rate-limited (HTTP 429) after retries"
+                    )
                 retry_after = resp.headers.get("Retry-After")
                 try:
-                    delay = float(retry_after) if retry_after else RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    delay = (
+                        float(retry_after)
+                        if retry_after
+                        else RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    )
                 except ValueError:
                     delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.warning("eFD HTTP 429; sleeping %.1fs", delay)
@@ -156,7 +179,8 @@ class SenateEFDSource(TransactionSource):
             if resp.status_code in (401, 403):
                 if not refreshed and attempt < attempts:
                     logger.warning(
-                        "eFD auth/block response HTTP %d; refreshing session", resp.status_code
+                        "eFD auth/block response HTTP %d; refreshing session",
+                        resp.status_code,
                     )
                     self._open_session()
                     session = self._require_session()
@@ -172,8 +196,12 @@ class SenateEFDSource(TransactionSource):
                     raise SenateEFDBlockedError(
                         f"eFD server error HTTP {resp.status_code} after {attempts} attempts"
                     )
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)  # nosec B311
-                logger.warning("eFD HTTP %d; retrying in %.1fs", resp.status_code, delay)
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(
+                    0, RETRY_JITTER
+                )  # nosec B311
+                logger.warning(
+                    "eFD HTTP %d; retrying in %.1fs", resp.status_code, delay
+                )
                 time.sleep(delay)
                 continue
 
@@ -191,10 +219,14 @@ class SenateEFDSource(TransactionSource):
         self._session = session
         resp = session.get(f"{EFD_BASE}/search/", timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
-            raise SenateEFDBlockedError(f"eFD search page returned HTTP {resp.status_code}")
+            raise SenateEFDBlockedError(
+                f"eFD search page returned HTTP {resp.status_code}"
+            )
         m = _CSRF_RE.search(resp.text)
         if not m:
-            raise SenateEFDError("csrfmiddlewaretoken not found; eFD layout may have changed")
+            raise SenateEFDError(
+                "csrfmiddlewaretoken not found; eFD layout may have changed"
+            )
         form_token = m.group(1)
 
         agree = session.post(
@@ -204,7 +236,9 @@ class SenateEFDSource(TransactionSource):
             timeout=REQUEST_TIMEOUT,
         )
         if agree.status_code != 200:
-            raise SenateEFDBlockedError(f"eFD agreement POST returned HTTP {agree.status_code}")
+            raise SenateEFDBlockedError(
+                f"eFD agreement POST returned HTTP {agree.status_code}"
+            )
 
         csrf_cookie = session.cookies.get("csrftoken")
         if not csrf_cookie:
@@ -232,10 +266,17 @@ class SenateEFDSource(TransactionSource):
             win_end = min(cursor + timedelta(days=SEARCH_WINDOW_DAYS - 1), end_date)
             self._search_window(cursor, win_end, reports)
             cursor = win_end + timedelta(days=1)
-        logger.info("eFD search found %d unique PTR filings (%s..%s)", len(reports), start_date, end_date)
+        logger.info(
+            "eFD search found %d unique PTR filings (%s..%s)",
+            len(reports),
+            start_date,
+            end_date,
+        )
         return list(reports.values())
 
-    def _search_window(self, start_date: date, end_date: date, reports: dict[str, dict]) -> None:
+    def _search_window(
+        self, start_date: date, end_date: date, reports: dict[str, dict]
+    ) -> None:
         start_offset = 0
         before = len(reports)
         stale_pages = 0
@@ -279,7 +320,9 @@ class SenateEFDSource(TransactionSource):
                 path = link_m.group("path")
                 if path in reports:
                     continue
-                name = re.sub(r"\s+", " ", f"{first_name} {last_name}".strip()).strip(" ,")
+                name = re.sub(r"\s+", " ", f"{first_name} {last_name}".strip()).strip(
+                    " ,"
+                )
                 reports[path] = {
                     "senator": name,
                     "report_path": path,
@@ -293,7 +336,9 @@ class SenateEFDSource(TransactionSource):
                 if stale_pages >= 3:
                     logger.warning(
                         "eFD window %s..%s pagination stopped after %d stable pages",
-                        start_date, end_date, stale_pages,
+                        start_date,
+                        end_date,
+                        stale_pages,
                     )
                     break
             else:
@@ -305,7 +350,11 @@ class SenateEFDSource(TransactionSource):
         """GET one PTR detail and parse its transaction table from headers."""
         resp = self._request_with_retry("GET", f"{EFD_BASE}{report_path}")
         if resp.status_code in (404, 410):
-            logger.warning("eFD filing %s unavailable (HTTP %d); skipping", report_path, resp.status_code)
+            logger.warning(
+                "eFD filing %s unavailable (HTTP %d); skipping",
+                report_path,
+                resp.status_code,
+            )
             return []
         soup = BeautifulSoup(resp.text, "html.parser")
         table = soup.find("table", {"class": "table-striped"})
@@ -316,7 +365,9 @@ class SenateEFDSource(TransactionSource):
         tbody = table.find("tbody")
         if thead is None or tbody is None:
             raise SenateEFDError(f"PTR {report_path} has no parseable header/body")
-        headers = [th.get_text(strip=True).lower() for th in thead.find_all(["th", "td"])]
+        headers = [
+            th.get_text(strip=True).lower() for th in thead.find_all(["th", "td"])
+        ]
         col: dict[str, int] = {}
         for key, label in _HEADER_NAME_MAP.items():
             if label in headers:
@@ -344,15 +395,17 @@ class SenateEFDSource(TransactionSource):
                 ticker = ticker_raw.upper()
             else:
                 ticker = _extract_ticker(asset_name)
-            out.append({
-                "ticker": ticker,
-                "asset_name": asset_name,
-                "asset_type": cell("asset_type"),
-                "owner": _extract_owner_code(cell("owner")),
-                "type": cell("tx_type"),
-                "transaction_date": cell("transaction_date"),
-                "amount_range": cell("amount"),
-            })
+            out.append(
+                {
+                    "ticker": ticker,
+                    "asset_name": asset_name,
+                    "asset_type": cell("asset_type"),
+                    "owner": _extract_owner_code(cell("owner")),
+                    "type": cell("tx_type"),
+                    "transaction_date": cell("transaction_date"),
+                    "amount_range": cell("amount"),
+                }
+            )
         return out
 
     @staticmethod
@@ -367,15 +420,24 @@ class SenateEFDSource(TransactionSource):
         best: dict[tuple, dict] = {}
         for t in raw:
             key = (
-                t.get("senator"), t.get("ticker"), t.get("transaction_date"),
-                t.get("type"), t.get("amount_range"), t.get("owner"), t.get("asset_name"),
+                t.get("senator"),
+                t.get("ticker"),
+                t.get("transaction_date"),
+                t.get("type"),
+                t.get("amount_range"),
+                t.get("owner"),
+                t.get("asset_name"),
             )
             prev = best.get(key)
-            if prev is None or (t.get("filed_date") or pd.Timestamp.min) >= (prev.get("filed_date") or pd.Timestamp.min):
+            if prev is None or (t.get("filed_date") or pd.Timestamp.min) >= (
+                prev.get("filed_date") or pd.Timestamp.min
+            ):
                 best[key] = t
         dropped = len(raw) - len(best)
         if dropped:
-            logger.warning("Dropped %d restated transactions across filings (amendments)", dropped)
+            logger.warning(
+                "Dropped %d restated transactions across filings (amendments)", dropped
+            )
         return list(best.values())
 
     def fetch_all_trades(
@@ -390,7 +452,9 @@ class SenateEFDSource(TransactionSource):
         Senate-only; any non-None value other than 'senate' raises.
         """
         if chamber is not None and chamber.lower() != "senate":
-            raise SenateEFDError(f"SenateEFDSource is senate-only; got chamber={chamber!r}")
+            raise SenateEFDError(
+                f"SenateEFDSource is senate-only; got chamber={chamber!r}"
+            )
         end_date = end_date or date.today()
         start_date = start_date or self._one_year_before(end_date)
 
@@ -409,17 +473,21 @@ class SenateEFDSource(TransactionSource):
                 logger.error("Failed to parse %s: %s", report["report_path"], e)
                 continue
             for tx in txns:
-                raw.append({
-                    "doc_id": doc_id,
-                    "senator": report["senator"],
-                    "filed_date": report["filed_date"],
-                    **tx,
-                })
+                raw.append(
+                    {
+                        "doc_id": doc_id,
+                        "senator": report["senator"],
+                        "filed_date": report["filed_date"],
+                        **tx,
+                    }
+                )
             time.sleep(PTR_FETCH_DELAY)
         if failures:
             logger.warning("Failed to parse %d of %d filings", failures, len(reports))
         raw = self._dedupe_restatements(raw)
-        logger.info("Fetched %d raw Senate transactions from %d filings", len(raw), len(reports))
+        logger.info(
+            "Fetched %d raw Senate transactions from %d filings", len(raw), len(reports)
+        )
         return self._normalize(raw)
 
     @staticmethod
@@ -427,7 +495,10 @@ class SenateEFDSource(TransactionSource):
         m = _UUID_RE.search(report_path)
         if m:
             return m.group(0)
-        return "efd-" + hashlib.sha1(report_path.encode(), usedforsecurity=False).hexdigest()[:16]
+        return (
+            "efd-"
+            + hashlib.sha1(report_path.encode(), usedforsecurity=False).hexdigest()[:16]
+        )
 
     @staticmethod
     def _one_year_before(d: date) -> date:
@@ -438,9 +509,19 @@ class SenateEFDSource(TransactionSource):
 
     def _normalize(self, trades: list[dict]) -> pd.DataFrame:
         columns = [
-            "doc_id", "member", "ticker", "transaction_date", "disclosure_date",
-            "transaction_type", "owner_code", "amount_raw", "amount_midpoint",
-            "instrument_type", "strike_price", "expiry_date", "asset_description",
+            "doc_id",
+            "member",
+            "ticker",
+            "transaction_date",
+            "disclosure_date",
+            "transaction_type",
+            "owner_code",
+            "amount_raw",
+            "amount_midpoint",
+            "instrument_type",
+            "strike_price",
+            "expiry_date",
+            "asset_description",
         ]
         if not trades:
             return pd.DataFrame(columns=columns)
@@ -515,7 +596,9 @@ class SenateEFDSource(TransactionSource):
         if df.empty:
             return 0
         inserted = self.db.upsert_transactions(df, source="senate_efd")
-        logger.info("Inserted %d new Senate eFD transactions from %d records", inserted, len(df))
+        logger.info(
+            "Inserted %d new Senate eFD transactions from %d records", inserted, len(df)
+        )
         return inserted
 
     def fetch_and_save_all(

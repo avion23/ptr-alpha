@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Shared Gemini OCR helpers for House PTR extraction scripts."""
+
 from __future__ import annotations
 
 import os
@@ -50,8 +51,13 @@ def write_cached_response(doc_id: str, output: str, cache_dir: str = CACHE_DIR) 
     path.write_text(output)
 
 
-def call_gemini(pdf_path: str, doc_id: str | None = None, refresh: bool = False,
-                cache_dir: str = CACHE_DIR, timeout: int = 180) -> tuple[str | None, str]:
+def call_gemini(
+    pdf_path: str,
+    doc_id: str | None = None,
+    refresh: bool = False,
+    cache_dir: str = CACHE_DIR,
+    timeout: int = 180,
+) -> tuple[str | None, str]:
     """Call Gemini via llm -a, caching raw output by doc_id before parsing."""
     if doc_id and not refresh:
         cached = read_cached_response(str(doc_id), cache_dir)
@@ -60,7 +66,9 @@ def call_gemini(pdf_path: str, doc_id: str | None = None, refresh: bool = False,
     try:
         result = subprocess.run(
             ["llm", "-m", MODEL, "-a", pdf_path, "-o", "temperature", "0", PROMPT],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         if result.returncode != 0:
             return None, result.stderr.strip() or f"llm exited {result.returncode}"
@@ -121,7 +129,9 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
     end = filing + timedelta(days=7) if filing else None
 
     effective_member = member or expected_member or "Unknown"
-    if expected_member and canonical_member_key(member or "") != canonical_member_key(expected_member):
+    if expected_member and canonical_member_key(member or "") != canonical_member_key(
+        expected_member
+    ):
         effective_member = expected_member
         rejections["member_mismatch"] += 1
 
@@ -129,7 +139,12 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
     valid = []
     for tx in transactions:
         parsed_date = _parse_date(_tx_date(tx))
-        if filing and start and end and (parsed_date is None or parsed_date < start or parsed_date > end):
+        if (
+            filing
+            and start
+            and end
+            and (parsed_date is None or parsed_date < start or parsed_date > end)
+        ):
             rejections["date_out_of_window"] += 1
             continue
         duplicate_key = (

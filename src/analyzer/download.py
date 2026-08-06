@@ -31,8 +31,11 @@ _PARSE_VERSION = "v3"
 
 # ── HouseTransactionSource: House disclosure download + parse driver ──
 
+
 class HouseTransactionSource(TransactionSource):
-    def __init__(self, settings: Settings, read_only: bool = False, db: Database | None = None):
+    def __init__(
+        self, settings: Settings, read_only: bool = False, db: Database | None = None
+    ):
         self.settings = settings
         self.data_dir = Path(settings.data.data_dir)
         self.metadata_url_template = settings.sources.house_metadata_url
@@ -44,7 +47,11 @@ class HouseTransactionSource(TransactionSource):
             expire_after=3600,
         )
         self._owns_db = db is None
-        self.db = db if db is not None else Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        self.db = (
+            db
+            if db is not None
+            else Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        )
 
     def close(self) -> None:
         self.session.close()
@@ -75,14 +82,20 @@ class HouseTransactionSource(TransactionSource):
 
         metadata_url = self.metadata_url_template.format(year=year)
         try:
-            return self._download_and_upsert_metadata(year, metadata_url, replace=refresh)
+            return self._download_and_upsert_metadata(
+                year, metadata_url, replace=refresh
+            )
         except requests.RequestException as e:
             raise DataSourceError(f"Failed to fetch metadata for {year}: {e}")
         except Exception as e:
             raise DataSourceError(f"Failed to fetch metadata for {year}: {e}")
 
     def _download_and_upsert_metadata(
-        self, year: int, metadata_url: str, *, replace: bool = False,
+        self,
+        year: int,
+        metadata_url: str,
+        *,
+        replace: bool = False,
     ) -> pd.DataFrame:
         logger.info(f"Downloading metadata for {year} from House disclosures")
         response = self.session.get(metadata_url, timeout=30)
@@ -143,7 +156,9 @@ class HouseTransactionSource(TransactionSource):
                 )
         except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as e:
             return DownloadResult(
-                doc_id=doc_id, status=DownloadStatus.ERROR, error_message=str(e),
+                doc_id=doc_id,
+                status=DownloadStatus.ERROR,
+                error_message=str(e),
             )
         finally:
             try:
@@ -162,22 +177,27 @@ class HouseTransactionSource(TransactionSource):
         doc_ids = ptrs["DocID"].values
         pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
         urls = [
-            self.pdf_url_template.format(year=year, doc_id=doc_id)
-            for doc_id in doc_ids
+            self.pdf_url_template.format(year=year, doc_id=doc_id) for doc_id in doc_ids
         ]
 
         connector = aiohttp.TCPConnector(limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
             async with asyncio.TaskGroup() as tg:
                 tasks = [
-                    tg.create_task(self._download_pdf_async(session, doc_id, pdf_path, url))
+                    tg.create_task(
+                        self._download_pdf_async(session, doc_id, pdf_path, url)
+                    )
                     for doc_id, pdf_path, url in zip(doc_ids, pdf_paths, urls)
                 ]
 
             results = [task.result() for task in tasks]
 
         self._log_download_summary(results)
-        failures = [r for r in results if r.status in (DownloadStatus.FAILED, DownloadStatus.ERROR)]
+        failures = [
+            r
+            for r in results
+            if r.status in (DownloadStatus.FAILED, DownloadStatus.ERROR)
+        ]
         if failures:
             sample = ", ".join(str(r.doc_id) for r in failures[:10])
             raise DataSourceError(
@@ -216,9 +236,12 @@ class HouseTransactionSource(TransactionSource):
                 year=year, parser_version=_PARSE_VERSION
             )
             if cached:
-                keep_mask = existing_docs["DocID"].astype(str).map(
-                    lambda d: d not in cached
-                ).to_numpy()
+                keep_mask = (
+                    existing_docs["DocID"]
+                    .astype(str)
+                    .map(lambda d: d not in cached)
+                    .to_numpy()
+                )
                 skipped = int((~keep_mask).sum()) if len(keep_mask) else 0
                 pdf_paths = [p for p, keep in zip(pdf_paths, keep_mask) if keep]
                 existing_docs = (
@@ -228,7 +251,9 @@ class HouseTransactionSource(TransactionSource):
                 )
                 logger.info(
                     "Skipping %d already-parsed PDFs for %d (%d remain)",
-                    skipped, year, len(pdf_paths),
+                    skipped,
+                    year,
+                    len(pdf_paths),
                 )
 
         if not pdf_paths:
@@ -244,7 +269,10 @@ class HouseTransactionSource(TransactionSource):
         self._save_parse_results(year, results, member_lookup)
 
     def _save_parse_results(
-        self, year: int, results: list, member_lookup: dict,
+        self,
+        year: int,
+        results: list,
+        member_lookup: dict,
     ) -> None:
         pdf_transactions: dict = {}
         parse_attempts: list[tuple[str, list[str]]] = []
@@ -255,21 +283,24 @@ class HouseTransactionSource(TransactionSource):
 
         df = consolidate_transactions(pdf_transactions, member_lookup)
         transaction_counts = (
-            df["doc_id"].astype(str).value_counts().to_dict()
-            if not df.empty else {}
+            df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
         )
-        parse_runs = [dict(
-            doc_id=doc_id,
-            year=year,
-            parser_version=_PARSE_VERSION,
-            status="success" if transaction_counts.get(doc_id, 0) else "zero_rows",
-            engines_attempted=",".join(engines_attempted),
-            raw_row_count=0,
-            transaction_count=transaction_counts.get(doc_id, 0),
-        ) for doc_id, engines_attempted in parse_attempts]
+        parse_runs = [
+            dict(
+                doc_id=doc_id,
+                year=year,
+                parser_version=_PARSE_VERSION,
+                status="success" if transaction_counts.get(doc_id, 0) else "zero_rows",
+                engines_attempted=",".join(engines_attempted),
+                raw_row_count=0,
+                transaction_count=transaction_counts.get(doc_id, 0),
+            )
+            for doc_id, engines_attempted in parse_attempts
+        ]
 
         zero_row_doc_ids = [
-            doc_id for doc_id, _ in parse_attempts
+            doc_id
+            for doc_id, _ in parse_attempts
             if transaction_counts.get(doc_id, 0) == 0
         ]
         stale_docs = self.db.count_transactions_for_docs(zero_row_doc_ids)
@@ -301,12 +332,15 @@ class HouseTransactionSource(TransactionSource):
         df = preserve_existing_fields(df, self.db)
 
         self.db.replace_transactions_for_docs(
-            df, source="house_pdf", parse_runs=parse_runs,
+            df,
+            source="house_pdf",
+            parse_runs=parse_runs,
         )
         logger.info(f"Saved {len(df)} transactions to database")
 
 
 # ── Helpers ──
+
 
 def _is_blank(value) -> bool:
     """True when a field carries no usable value (None / NaN / empty string)."""
@@ -327,6 +361,7 @@ def _identity_key(member, transaction_date, transaction_type):
     freshly consolidated ``df`` matches one built from DB rows — DuckDB returns
     DATE columns as ``pd.Timestamp``, while parsed rows use ``datetime.date``.
     """
+
     def _norm(v):
         if v is None:
             return None
@@ -376,7 +411,9 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
 
         lookup: dict[tuple, dict] = {}
         for _, er in existing.iterrows():
-            key = _identity_key(er.get("member"), er.get("transaction_date"), er.get("transaction_type"))
+            key = _identity_key(
+                er.get("member"), er.get("transaction_date"), er.get("transaction_type")
+            )
             slot = lookup.setdefault(key, {"tickers": set(), "amounts": set()})
             if not _is_blank(er.get("ticker")):
                 slot["tickers"].add(er["ticker"])
@@ -384,7 +421,11 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
                 slot["amounts"].add(er["amount_raw"])
 
         for idx in df.index[df["doc_id"] == doc_id]:
-            key = _identity_key(df.at[idx, "member"], df.at[idx, "transaction_date"], df.at[idx, "transaction_type"])
+            key = _identity_key(
+                df.at[idx, "member"],
+                df.at[idx, "transaction_date"],
+                df.at[idx, "transaction_type"],
+            )
             slot = lookup.get(key)
             if slot is None:
                 continue
@@ -399,7 +440,11 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
 def _read_first_text_from_zip(zip_bytes: bytes, year: int) -> str:
     """Open the metadata ZIP and return its unambiguous metadata text member."""
     with zipfile.ZipFile(BytesIO(zip_bytes)) as z:
-        text_files = [f for f in z.namelist() if f.lower().endswith(".txt") and not f.endswith("/")]
+        text_files = [
+            f
+            for f in z.namelist()
+            if f.lower().endswith(".txt") and not f.endswith("/")
+        ]
         if not text_files:
             raise ParsingError(f"No text files found in metadata ZIP for {year}")
         decoded: dict[str, str] = {}
@@ -435,7 +480,9 @@ def _read_first_text_from_zip(zip_bytes: bytes, year: int) -> str:
         return decoded[candidates[0]]
 
 
-def _filter_existing_pdfs(ptrs: pd.DataFrame, pdf_dir: Path) -> tuple[list[Path], pd.DataFrame]:
+def _filter_existing_pdfs(
+    ptrs: pd.DataFrame, pdf_dir: Path
+) -> tuple[list[Path], pd.DataFrame]:
     """Return (existing PDF paths, the subset of `ptrs` whose PDFs are on disk)."""
     doc_ids = ptrs["DocID"].values
     all_pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
@@ -449,20 +496,27 @@ def _build_member_lookup(existing_docs: pd.DataFrame) -> dict:
     """Map doc_id -> {First, Last, FilingDate} for downstream transaction join."""
     identity_columns = ["DocID", "First", "Last", "FilingDate"]
     distinct = existing_docs[identity_columns].drop_duplicates()
-    duplicate_ids = distinct.loc[
-        distinct["DocID"].astype(str).duplicated(keep=False), "DocID"
-    ].astype(str).unique()
+    duplicate_ids = (
+        distinct.loc[distinct["DocID"].astype(str).duplicated(keep=False), "DocID"]
+        .astype(str)
+        .unique()
+    )
     if len(duplicate_ids):
         raise ParsingError(
             "Duplicate metadata DocID(s) would make member attribution ambiguous: "
             + ", ".join(duplicate_ids[:10])
         )
     existing_docs = distinct.drop_duplicates(subset=["DocID"])
-    return dict(zip(
-        existing_docs["DocID"].values,
-        [{"First": f, "Last": last, "FilingDate": d} for f, last, d in zip(
-            existing_docs["First"].values,
-            existing_docs["Last"].values,
-            existing_docs["FilingDate"].values,
-        )],
-    ))
+    return dict(
+        zip(
+            existing_docs["DocID"].values,
+            [
+                {"First": f, "Last": last, "FilingDate": d}
+                for f, last, d in zip(
+                    existing_docs["First"].values,
+                    existing_docs["Last"].values,
+                    existing_docs["FilingDate"].values,
+                )
+            ],
+        )
+    )

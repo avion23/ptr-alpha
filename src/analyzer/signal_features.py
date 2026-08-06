@@ -43,7 +43,9 @@ def compute_optimal_entry(
 
     # Look for pullback within max_wait_days
     window_end = disc_ts + pd.Timedelta(days=max_wait_days)
-    window = ticker_prices[(ticker_prices.index >= disc_ts) & (ticker_prices.index <= window_end)]
+    window = ticker_prices[
+        (ticker_prices.index >= disc_ts) & (ticker_prices.index <= window_end)
+    ]
 
     target_price = disc_price * (1 - pullback_pct)
 
@@ -60,22 +62,22 @@ def compute_optimal_entry(
 class SignalFeatures:
     ticker: str
     disclosure_date: date
-    lag_days: int                     # disclosure_date - transaction_date
-    pre_disclosure_return: float      # return from transaction_date to disclosure_date
-    pre_disclosure_alpha: float       # alpha vs SPY over same period
-    max_drawdown_to_entry: float      # max drawdown from disclosure to entry
-    volatility_20d: float             # 20-day realized vol at entry
-    drawdown_from_ath: float          # drawdown from all-time high
-    days_since_ipo: int | None        # approximate IPO age
-    n_buyers_30d: int                 # buyers in last 30 days
+    lag_days: int  # disclosure_date - transaction_date
+    pre_disclosure_return: float  # return from transaction_date to disclosure_date
+    pre_disclosure_alpha: float  # alpha vs SPY over same period
+    max_drawdown_to_entry: float  # max drawdown from disclosure to entry
+    volatility_20d: float  # 20-day realized vol at entry
+    drawdown_from_ath: float  # drawdown from all-time high
+    days_since_ipo: int | None  # approximate IPO age
+    n_buyers_30d: int  # buyers in last 30 days
 
 
 @dataclass(frozen=True, slots=True)
 class CrashHazard:
-    crash_prob: float     # probability of >20% drawdown in next 120d
+    crash_prob: float  # probability of >20% drawdown in next 120d
     expected_return: float
-    var_95: float         # 5th percentile return
-    cvar_95: float        # conditional VaR at 5%
+    var_95: float  # 5th percentile return
+    cvar_95: float  # conditional VaR at 5%
 
 
 def compute_disclosure_lag_weight(
@@ -153,7 +155,9 @@ def compute_signal_features(
                                 spy_p_disc = float(spy_vals[sd])
                                 if spy_p_tx > 0:
                                     spy_return = (spy_p_disc / spy_p_tx) - 1.0
-                                    pre_disclosure_alpha = pre_disclosure_return - spy_return
+                                    pre_disclosure_alpha = (
+                                        pre_disclosure_return - spy_return
+                                    )
 
     # Max drawdown from disclosure to entry (using as_of as entry proxy)
     max_dd_to_entry = 0.0
@@ -242,10 +246,12 @@ def estimate_crash_hazard(
     base_logit = math.log(historical_crash_rate / (1 - historical_crash_rate))
 
     # Coefficients
-    b_vol = 1.5          # high vol increases crash risk
-    b_drawdown = 1.0     # falling knife effect
-    b_lag = 0.01         # each day of lag adds risk
-    b_newness = -0.005   # fewer days since IPO -> higher risk (negative coef, fewer days = more risk)
+    b_vol = 1.5  # high vol increases crash risk
+    b_drawdown = 1.0  # falling knife effect
+    b_lag = 0.01  # each day of lag adds risk
+    b_newness = (
+        -0.005
+    )  # fewer days since IPO -> higher risk (negative coef, fewer days = more risk)
 
     # Normalize features
     vol_feature = features.volatility_20d
@@ -255,7 +261,13 @@ def estimate_crash_hazard(
     # IPO age: use a proxy if None (assume very new = 30 days)
     ipo_days = features.days_since_ipo if features.days_since_ipo is not None else 30
 
-    logit_p = base_logit + b_vol * vol_feature + b_drawdown * dd_feature + b_lag * lag_feature + b_newness * ipo_days
+    logit_p = (
+        base_logit
+        + b_vol * vol_feature
+        + b_drawdown * dd_feature
+        + b_lag * lag_feature
+        + b_newness * ipo_days
+    )
 
     # Clamp to avoid overflow
     logit_p = max(min(logit_p, 10.0), -10.0)
@@ -267,7 +279,9 @@ def estimate_crash_hazard(
     # VaR and CVaR (parametric normal approximation)
     # Use vol to scale the tail to the 120-day horizon.
     vol = max(features.volatility_20d, 0.05)  # annualized vol, floor at 5%
-    sigma_120d = (vol / math.sqrt(252)) * math.sqrt(120)  # 120-day std via sqrt-T scaling
+    sigma_120d = (vol / math.sqrt(252)) * math.sqrt(
+        120
+    )  # 120-day std via sqrt-T scaling
     # 95% one-sided VaR: VaR = mu - z_alpha * sigma with z_alpha = 1.645
     var_95 = expected_return - 1.645 * sigma_120d
     # CVaR (Expected Shortfall) at 5% for a normal distribution:
@@ -276,7 +290,7 @@ def estimate_crash_hazard(
     # 0.1031, giving a multiplier of ~2.063 (vs 1.645 for VaR).  CVaR is the
     # average loss conditional on breaching VaR, so it is always more negative
     # than VaR for a left-tailed risk measure.
-    _phi_z = math.exp(-1.645 ** 2 / 2) / math.sqrt(2 * math.pi)
+    _phi_z = math.exp(-(1.645**2) / 2) / math.sqrt(2 * math.pi)
     cvar_95 = expected_return - (_phi_z / 0.05) * sigma_120d
 
     return CrashHazard(

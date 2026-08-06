@@ -36,10 +36,12 @@ class TestDedupKeyFix(DatabaseTestCase):
         return row
 
     def test_two_lots_different_amount_raw_both_survive(self):
-        df = pd.DataFrame([
-            self._base_tx(amount_raw="$1,001 - $15,000"),
-            self._base_tx(amount_raw="$15,001 - $50,000"),
-        ])
+        df = pd.DataFrame(
+            [
+                self._base_tx(amount_raw="$1,001 - $15,000"),
+                self._base_tx(amount_raw="$15,001 - $50,000"),
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2, "Two distinct lots must not be collapsed")
@@ -50,14 +52,18 @@ class TestDedupKeyFix(DatabaseTestCase):
         self.db.upsert_transactions(df, source="house_pdf")
         self.db.upsert_transactions(df, source="house_pdf")  # re-insert same row
         result = self.db.get_transactions(2024)
-        self.assertEqual(len(result), 1, "Re-inserting same row must not create duplicate")
+        self.assertEqual(
+            len(result), 1, "Re-inserting same row must not create duplicate"
+        )
 
     def test_sp_vs_jt_owner_code_both_survive(self):
         """SP-owned and JT-owned trades on the same day must be kept separate."""
-        df = pd.DataFrame([
-            self._base_tx(owner_code="SP", amount_raw="$1,001 - $15,000"),
-            self._base_tx(owner_code="J", amount_raw="$1,001 - $15,000"),
-        ])
+        df = pd.DataFrame(
+            [
+                self._base_tx(owner_code="SP", amount_raw="$1,001 - $15,000"),
+                self._base_tx(owner_code="J", amount_raw="$1,001 - $15,000"),
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2, "SP and JT trades must not collapse")
@@ -85,46 +91,56 @@ class TestEntryPriceRawTickerFallback(DatabaseTestCase):
     def test_brk_b_raw_ticker_price_lookup(self):
         # Insert prices under the RAW symbol 'BRK.B'
         dates = pd.bdate_range("2024-01-01", "2024-01-05")
-        prices = pd.DataFrame({"BRK.B": [350.0 + i for i in range(len(dates))]}, index=dates)
+        prices = pd.DataFrame(
+            {"BRK.B": [350.0 + i for i in range(len(dates))]}, index=dates
+        )
         self.db.upsert_prices(prices)
 
         # Insert transaction with raw ticker 'BRK.B'
-        tx = pd.DataFrame([{
-            "doc_id": "brk-test",
-            "member": "Pelosi",
-            "ticker": "BRK.B",
-            "transaction_date": date(2024, 1, 3),
-            "disclosure_date": date(2024, 1, 3),
-            "transaction_type": "Purchase",
-        }])
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "brk-test",
+                    "member": "Pelosi",
+                    "ticker": "BRK.B",
+                    "transaction_date": date(2024, 1, 3),
+                    "disclosure_date": date(2024, 1, 3),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
         self.db.upsert_transactions(tx, source="house_pdf")
 
-        result = self.db.get_entry_prices(
-            ["BRK.B"], date(2024, 1, 1), date(2024, 1, 5)
+        result = self.db.get_entry_prices(["BRK.B"], date(2024, 1, 1), date(2024, 1, 5))
+        self.assertFalse(
+            result.empty, "Entry price must be found via raw ticker fallback"
         )
-        self.assertFalse(result.empty, "Entry price must be found via raw ticker fallback")
         self.assertIsNotNone(result.iloc[0]["entry_price"])
         self.assertGreater(result.iloc[0]["entry_price"], 0)
 
     def test_standard_ticker_unaffected(self):
         """Non-remapped tickers (AAPL) still return correct price."""
         dates = pd.bdate_range("2024-01-01", "2024-01-05")
-        prices = pd.DataFrame({"AAPL": [180.0 + i for i in range(len(dates))]}, index=dates)
+        prices = pd.DataFrame(
+            {"AAPL": [180.0 + i for i in range(len(dates))]}, index=dates
+        )
         self.db.upsert_prices(prices)
 
-        tx = pd.DataFrame([{
-            "doc_id": "aapl-test",
-            "member": "Smith",
-            "ticker": "AAPL",
-            "transaction_date": date(2024, 1, 2),
-            "disclosure_date": date(2024, 1, 2),
-            "transaction_type": "Purchase",
-        }])
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "aapl-test",
+                    "member": "Smith",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 1, 2),
+                    "disclosure_date": date(2024, 1, 2),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
         self.db.upsert_transactions(tx, source="house_pdf")
 
-        result = self.db.get_entry_prices(
-            ["AAPL"], date(2024, 1, 1), date(2024, 1, 5)
-        )
+        result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 5))
         self.assertFalse(result.empty)
         self.assertAlmostEqual(result.iloc[0]["entry_price"], 181.0)
 
@@ -133,29 +149,40 @@ class TestEntryPriceRawTickerFallback(DatabaseTestCase):
 # Fix 4 – Price cache completeness (per-ticker gaps)
 # ---------------------------------------------------------------------------
 class TestMissingPriceDataPerTicker(DatabaseTestCase):
-
     def test_ticker_with_gap_appears_in_missing_tickers(self):
         """Ticker missing some dates must appear in missing_tickers, not just missing_dates."""
         # AAPL has Jan 1-2, MSFT has all dates Jan 1-5
         aapl_dates = pd.bdate_range("2024-01-01", "2024-01-02")
         msft_dates = pd.bdate_range("2024-01-01", "2024-01-05")
-        self.db.upsert_prices(pd.DataFrame({"AAPL": range(len(aapl_dates))}, index=aapl_dates))
-        self.db.upsert_prices(pd.DataFrame({"MSFT": range(len(msft_dates))}, index=msft_dates))
+        self.db.upsert_prices(
+            pd.DataFrame({"AAPL": range(len(aapl_dates))}, index=aapl_dates)
+        )
+        self.db.upsert_prices(
+            pd.DataFrame({"MSFT": range(len(msft_dates))}, index=msft_dates)
+        )
 
         missing_tickers, missing_dates = self.db.get_missing_price_data(
             ["AAPL", "MSFT"], date(2024, 1, 1), date(2024, 1, 5)
         )
-        self.assertIn("AAPL", missing_tickers,
-                      "AAPL has a per-ticker gap and must appear in missing_tickers")
-        self.assertNotIn("MSFT", missing_tickers,
-                         "MSFT has complete coverage and must not appear in missing_tickers")
+        self.assertIn(
+            "AAPL",
+            missing_tickers,
+            "AAPL has a per-ticker gap and must appear in missing_tickers",
+        )
+        self.assertNotIn(
+            "MSFT",
+            missing_tickers,
+            "MSFT has complete coverage and must not appear in missing_tickers",
+        )
         self.assertTrue(len(missing_dates) > 0)
 
     def test_both_tickers_complete_returns_empty(self):
         """No gaps → both lists empty."""
         dates = pd.bdate_range("2024-01-01", "2024-01-05")
         self.db.upsert_prices(
-            pd.DataFrame({"AAPL": range(len(dates)), "MSFT": range(len(dates))}, index=dates)
+            pd.DataFrame(
+                {"AAPL": range(len(dates)), "MSFT": range(len(dates))}, index=dates
+            )
         )
         missing_tickers, missing_dates = self.db.get_missing_price_data(
             ["AAPL", "MSFT"], date(2024, 1, 1), date(2024, 1, 5)
@@ -168,7 +195,9 @@ class TestMissingPriceDataPerTicker(DatabaseTestCase):
         aapl_dates = pd.bdate_range("2024-01-01", "2024-01-01")  # only 1 day
         msft_dates = pd.bdate_range("2024-01-01", "2024-01-05")  # all days
         self.db.upsert_prices(pd.DataFrame({"AAPL": [100.0]}, index=aapl_dates))
-        self.db.upsert_prices(pd.DataFrame({"MSFT": range(len(msft_dates))}, index=msft_dates))
+        self.db.upsert_prices(
+            pd.DataFrame({"MSFT": range(len(msft_dates))}, index=msft_dates)
+        )
 
         missing_tickers, _ = self.db.get_missing_price_data(
             ["AAPL", "MSFT"], date(2024, 1, 1), date(2024, 1, 5)
@@ -180,7 +209,6 @@ class TestMissingPriceDataPerTicker(DatabaseTestCase):
 # Fix 5 – Continuation rows lose amount/owner
 # ---------------------------------------------------------------------------
 class TestContinuationRowAmountOwner(unittest.TestCase):
-
     def test_amount_from_next_row_in_continuation(self):
         """Amount lives in next_row when asset name spans two rows."""
         from analyzer.parsing.rows import parse_pdf_table
@@ -197,10 +225,15 @@ class TestContinuationRowAmountOwner(unittest.TestCase):
         tx = txs[0]
         self.assertEqual(tx["ticker"], "AAPL")
         # Fix 5: amount must now come from next_row
-        self.assertEqual(tx["amount_raw"], "$1,001 - $15,000",
-                         "amount_raw must be populated from the continuation row")
-        self.assertIsNotNone(tx["amount_midpoint"],
-                             "amount_midpoint must be parsed from continuation row amount")
+        self.assertEqual(
+            tx["amount_raw"],
+            "$1,001 - $15,000",
+            "amount_raw must be populated from the continuation row",
+        )
+        self.assertIsNotNone(
+            tx["amount_midpoint"],
+            "amount_midpoint must be parsed from continuation row amount",
+        )
 
     def test_non_continuation_row_amount_unaffected(self):
         """Normal (non-continuation) rows still extract amount from the same row."""
@@ -219,7 +252,6 @@ class TestContinuationRowAmountOwner(unittest.TestCase):
 # Fix 7 – Member name splits → canonical key
 # ---------------------------------------------------------------------------
 class TestCanonicalMemberKey(unittest.TestCase):
-
     def test_mccaul_variants_map_to_same_key(self):
         from analyzer.member_names import canonical_member_key
 
@@ -273,28 +305,29 @@ class TestCanonicalMemberKey(unittest.TestCase):
 # Fix 8 – Negative lag (transaction_date > disclosure_date)
 # ---------------------------------------------------------------------------
 class TestNegativeLagFilter(DatabaseTestCase):
-
     def _insert_negative_lag_tx(self):
         """Insert one valid + one impossible (tx_date > disclosure_date) row."""
-        df = pd.DataFrame([
-            {
-                "doc_id": "good",
-                "member": "Alice",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 1, 10),
-                "disclosure_date": date(2024, 1, 15),
-                "transaction_type": "Purchase",
-            },
-            {
-                "doc_id": "bad",
-                "member": "Bob",
-                "ticker": "MSFT",
-                # OCR date swap: tx_date is AFTER disclosure_date
-                "transaction_date": date(2024, 3, 15),
-                "disclosure_date": date(2024, 1, 15),
-                "transaction_type": "Purchase",
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "good",
+                    "member": "Alice",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 1, 10),
+                    "disclosure_date": date(2024, 1, 15),
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "doc_id": "bad",
+                    "member": "Bob",
+                    "ticker": "MSFT",
+                    # OCR date swap: tx_date is AFTER disclosure_date
+                    "transaction_date": date(2024, 3, 15),
+                    "disclosure_date": date(2024, 1, 15),
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
 
     def test_get_transactions_excludes_negative_lag(self):
@@ -305,34 +338,44 @@ class TestNegativeLagFilter(DatabaseTestCase):
 
     def test_get_transactions_by_date_range_excludes_negative_lag(self):
         self._insert_negative_lag_tx()
-        result = self.db.get_transactions_by_date_range(date(2024, 1, 1), date(2024, 12, 31))
+        result = self.db.get_transactions_by_date_range(
+            date(2024, 1, 1), date(2024, 12, 31)
+        )
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[0]["ticker"], "AAPL")
 
     def test_row_with_null_transaction_date_not_excluded(self):
         """Rows with NULL transaction_date must not be filtered out."""
-        df = pd.DataFrame([{
-            "doc_id": "null-date",
-            "member": "Carol",
-            "ticker": "GOOG",
-            "transaction_date": None,
-            "disclosure_date": date(2024, 6, 1),
-            "transaction_type": "Purchase",
-        }])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "null-date",
+                    "member": "Carol",
+                    "ticker": "GOOG",
+                    "transaction_date": None,
+                    "disclosure_date": date(2024, 6, 1),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 1)
 
     def test_valid_row_where_dates_equal_not_excluded(self):
         """transaction_date == disclosure_date is valid and must be kept."""
-        df = pd.DataFrame([{
-            "doc_id": "same-date",
-            "member": "Dave",
-            "ticker": "TSLA",
-            "transaction_date": date(2024, 5, 1),
-            "disclosure_date": date(2024, 5, 1),
-            "transaction_type": "Sale",
-        }])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "same-date",
+                    "member": "Dave",
+                    "ticker": "TSLA",
+                    "transaction_date": date(2024, 5, 1),
+                    "disclosure_date": date(2024, 5, 1),
+                    "transaction_type": "Sale",
+                }
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 1)

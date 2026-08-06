@@ -18,16 +18,17 @@ import pandas as pd
 @dataclass(frozen=True, slots=True)
 class KellyConfig:
     """Configuration for Kelly portfolio construction."""
+
     capital: float = 100_000.0
-    max_ticker_pct: float = 0.20       # max 20% per ticker
-    max_member_pct: float = 0.05       # max 5% per member
-    total_exposure_pct: float = 1.00    # max 100% invested
-    use_half_kelly: bool = True         # safer half-Kelly by default
-    crash_guard: bool = True            # reduce by crash_prob
-    min_kelly_floor: float = 0.01       # minimum fraction to include
-    default_win_rate: float = 0.575     # from sweep results
-    default_avg_win: float = 0.015      # avg winning trade return (1.5%)
-    default_avg_loss: float = 0.012     # avg losing trade return (1.2%)
+    max_ticker_pct: float = 0.20  # max 20% per ticker
+    max_member_pct: float = 0.05  # max 5% per member
+    total_exposure_pct: float = 1.00  # max 100% invested
+    use_half_kelly: bool = True  # safer half-Kelly by default
+    crash_guard: bool = True  # reduce by crash_prob
+    min_kelly_floor: float = 0.01  # minimum fraction to include
+    default_win_rate: float = 0.575  # from sweep results
+    default_avg_win: float = 0.015  # avg winning trade return (1.5%)
+    default_avg_loss: float = 0.012  # avg losing trade return (1.2%)
 
 
 def kelly_fraction(p: float, b: float) -> float:
@@ -86,7 +87,9 @@ def build_kelly_portfolio(
 
     df["kelly_fraction"] = _compute_kelly_per_row(df, payout_ratio, config)
     if config.crash_guard:
-        df["kelly_fraction"] = df["kelly_fraction"] * (1.0 - df["crash_prob"].clip(0, 0.95))
+        df["kelly_fraction"] = df["kelly_fraction"] * (
+            1.0 - df["crash_prob"].clip(0, 0.95)
+        )
 
     df = df[df["kelly_fraction"] > config.min_kelly_floor].copy()
     if df.empty:
@@ -102,7 +105,9 @@ def build_kelly_portfolio(
     return _select_output_columns(df)
 
 
-def _prepare_recommendations(recommendations: pd.DataFrame, config: KellyConfig) -> pd.DataFrame:
+def _prepare_recommendations(
+    recommendations: pd.DataFrame, config: KellyConfig
+) -> pd.DataFrame:
     """Copy and fill in default values for member/crash_prob/win_rate columns."""
     df = recommendations.copy()
 
@@ -146,8 +151,11 @@ def _estimate_win_loss(df: pd.DataFrame, config: KellyConfig) -> tuple[float, fl
     return float(avg_win), float(avg_loss)
 
 
-def _compute_kelly_per_row(df: pd.DataFrame, payout_ratio: float, config: KellyConfig) -> pd.Series:
+def _compute_kelly_per_row(
+    df: pd.DataFrame, payout_ratio: float, config: KellyConfig
+) -> pd.Series:
     """Compute Kelly fraction per row (vectorized: loop once with .apply)."""
+
     def _kelly(row):
         p = row["_win_rate"]
         return (
@@ -155,6 +163,7 @@ def _compute_kelly_per_row(df: pd.DataFrame, payout_ratio: float, config: KellyC
             if config.use_half_kelly
             else kelly_fraction(p, payout_ratio)
         )
+
     return df.apply(_kelly, axis=1)
 
 
@@ -221,16 +230,32 @@ def _scale_to_exposure(df: pd.DataFrame, config: KellyConfig) -> None:
 def _select_output_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Project to the public output schema and sort by dollar position."""
     out_cols = [
-        "ticker", "member", "weight", "kelly_fraction", "signal_score",
-        "crash_prob", "position_value",
+        "ticker",
+        "member",
+        "weight",
+        "kelly_fraction",
+        "signal_score",
+        "crash_prob",
+        "position_value",
     ]
     available = [c for c in out_cols if c in df.columns]
-    return df[available].sort_values("position_value", ascending=False).reset_index(drop=True)
+    return (
+        df[available]
+        .sort_values("position_value", ascending=False)
+        .reset_index(drop=True)
+    )
 
 
 def _empty_portfolio() -> pd.DataFrame:
     """Return empty DataFrame with expected columns."""
-    return pd.DataFrame(columns=[
-        "ticker", "member", "weight", "kelly_fraction",
-        "signal_score", "crash_prob", "position_value",
-    ])
+    return pd.DataFrame(
+        columns=[
+            "ticker",
+            "member",
+            "weight",
+            "kelly_fraction",
+            "signal_score",
+            "crash_prob",
+            "position_value",
+        ]
+    )

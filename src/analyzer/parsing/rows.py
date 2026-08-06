@@ -23,7 +23,9 @@ from analyzer.parsing.columns import (
 )
 
 
-def _process_row(row: list, indexes: dict[str, int] | None = None, next_row: list | None = None) -> dict | None:
+def _process_row(
+    row: list, indexes: dict[str, int] | None = None, next_row: list | None = None
+) -> dict | None:
     try:
         indexes = indexes or {"asset": 0, "type": 1, "date": 2}
         asset_cell = _get_cell(row, indexes.get("asset"))
@@ -36,8 +38,8 @@ def _process_row(row: list, indexes: dict[str, int] | None = None, next_row: lis
         merged = False
 
         if not tx_type and not tx_date and next_row:
-            ticker, asset_cell, tx_type_cell, date_cell, tx_type, tx_date = _try_merge_continuation(
-                row, next_row, indexes, asset_cell
+            ticker, asset_cell, tx_type_cell, date_cell, tx_type, tx_date = (
+                _try_merge_continuation(row, next_row, indexes, asset_cell)
             )
             merged = bool(ticker)
 
@@ -45,7 +47,15 @@ def _process_row(row: list, indexes: dict[str, int] | None = None, next_row: lis
             # Fix 5: when a continuation was merged, amount/owner live in next_row
             # (the original row only had partial asset text with no transaction fields).
             amount_owner_row = next_row if merged else None
-            return _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date, amount_owner_row=amount_owner_row), merged
+            return _build_row_dict(
+                row,
+                indexes,
+                asset_cell,
+                ticker,
+                tx_type,
+                tx_date,
+                amount_owner_row=amount_owner_row,
+            ), merged
         return None, False
     except IndexError:
         return None, False
@@ -74,7 +84,9 @@ def _try_merge_continuation(row, next_row, indexes, asset_cell):
     )
 
 
-def _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date, *, amount_owner_row=None) -> dict:
+def _build_row_dict(
+    row, indexes, asset_cell, ticker, tx_type, tx_date, *, amount_owner_row=None
+) -> dict:
     # Fix 5: in continuation-row merges, amount and owner live in the next row
     # (the original row only had partial asset text). Use amount_owner_row when provided.
     source = amount_owner_row if amount_owner_row is not None else row
@@ -84,18 +96,20 @@ def _build_row_dict(row, indexes, asset_cell, ticker, tx_type, tx_date, *, amoun
         amount_cell = _find_amount_in_row(source)
     amount_raw, amount_midpoint = _extract_amount_midpoint(amount_cell)
     instrument_type = _extract_instrument_type(asset_cell)
-    option_details = _extract_option_details(asset_cell) if instrument_type != 'stock' else {}
+    option_details = (
+        _extract_option_details(asset_cell) if instrument_type != "stock" else {}
+    )
     return {
-        'ticker': ticker,
-        'transaction_type': tx_type,
-        'transaction_date': tx_date,
-        'owner_code': _extract_owner_code(_get_cell(source, indexes.get("owner"))),
-        'amount_raw': amount_raw,
-        'amount_midpoint': amount_midpoint,
-        'instrument_type': instrument_type,
-        'strike_price': option_details.get('strike_price'),
-        'expiry_date': option_details.get('expiry_date'),
-        'asset_description': clean_text(asset_cell)[:500] if asset_cell else None,
+        "ticker": ticker,
+        "transaction_type": tx_type,
+        "transaction_date": tx_date,
+        "owner_code": _extract_owner_code(_get_cell(source, indexes.get("owner"))),
+        "amount_raw": amount_raw,
+        "amount_midpoint": amount_midpoint,
+        "instrument_type": instrument_type,
+        "strike_price": option_details.get("strike_price"),
+        "expiry_date": option_details.get("expiry_date"),
+        "asset_description": clean_text(asset_cell)[:500] if asset_cell else None,
     }
 
 
@@ -118,7 +132,9 @@ def parse_pdf_table(table: list) -> list[dict]:
     return _extract_transactions(data_rows, indexes)
 
 
-def _data_start_offset(table: list, header_idx: int, next_header_row: list | None) -> int:
+def _data_start_offset(
+    table: list, header_idx: int, next_header_row: list | None
+) -> int:
     """Determine how many rows to skip after the header (1 or 2)."""
     data_start = header_idx + 1
     if next_header_row is None:
@@ -139,7 +155,7 @@ def _extract_transactions(data_rows: list, indexes: dict[str, int]) -> list[dict
     i = 0
     while i < len(data_rows):
         row = data_rows[i]
-        next_rows = data_rows[i + 1:i + 4]
+        next_rows = data_rows[i + 1 : i + 4]
         tx, consumed = _process_with_continuations(row, next_rows, indexes)
         if tx:
             results.append(tx)
@@ -147,7 +163,9 @@ def _extract_transactions(data_rows: list, indexes: dict[str, int]) -> list[dict
     return results
 
 
-def _process_with_continuations(row: list, next_rows: list[list], indexes: dict[str, int]) -> tuple[dict | None, int]:
+def _process_with_continuations(
+    row: list, next_rows: list[list], indexes: dict[str, int]
+) -> tuple[dict | None, int]:
     """Process a row and up to three physical continuation rows."""
     next_row = next_rows[0] if next_rows else None
     tx, merged = _process_row(row, indexes, next_row)
@@ -160,13 +178,15 @@ def _process_with_continuations(row: list, next_rows: list[list], indexes: dict[
         return None, 0
 
     for offset, candidate in enumerate(next_rows[:-1], start=1):
-        if _extract_transaction_type(_get_cell(candidate, indexes.get("type"))) or _extract_date(
-            _get_cell(candidate, indexes.get("date"))
-        ):
+        if _extract_transaction_type(
+            _get_cell(candidate, indexes.get("type"))
+        ) or _extract_date(_get_cell(candidate, indexes.get("date"))):
             break
         while len(combined) <= asset_index:
             combined.append("")
-        combined[asset_index] = f"{_get_cell(combined, asset_index) or ''} {_get_cell(candidate, asset_index) or ''}".strip()
+        combined[asset_index] = (
+            f"{_get_cell(combined, asset_index) or ''} {_get_cell(candidate, asset_index) or ''}".strip()
+        )
         final_row = next_rows[offset]
         tx, merged = _process_row(combined, indexes, final_row)
         if tx and merged:

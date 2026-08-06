@@ -38,7 +38,9 @@ def fetch_all_trades() -> list[dict]:
 
             total_pages = data.get("pages", 1)
             total = data.get("total", "?")
-            print(f"  Page {page}/{total_pages}: +{len(trades)} trades (cumulative: {len(all_trades)}/{total})")
+            print(
+                f"  Page {page}/{total_pages}: +{len(trades)} trades (cumulative: {len(all_trades)}/{total})"
+            )
 
             if page >= total_pages:
                 break
@@ -74,7 +76,9 @@ def main():
     if df is not None and not df.empty:
         print(f"Unique members:  {df['member'].nunique()}")
         print(f"Unique tickers:  {df['ticker'].nunique()}")
-        print(f"Date range:      {df['transaction_date'].min()} to {df['transaction_date'].max()}")
+        print(
+            f"Date range:      {df['transaction_date'].min()} to {df['transaction_date'].max()}"
+        )
         tx_types = df["transaction_type"].value_counts()
         print("Transaction types:")
         for t, count in tx_types.items():

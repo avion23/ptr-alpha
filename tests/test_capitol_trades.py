@@ -190,7 +190,12 @@ class TestCapitolTradesSource(unittest.TestCase):
 
         self.assertEqual(len(df), 2)
         # Both senate trades have senate-specific doc_id patterns
-        self.assertTrue(all("senate" not in str(df.iloc[i]["doc_id"]).lower() or True for i in range(len(df))))
+        self.assertTrue(
+            all(
+                "senate" not in str(df.iloc[i]["doc_id"]).lower() or True
+                for i in range(len(df))
+            )
+        )
         # Verify Katie Britt and Gary Peters are included (both senate)
         members = set(df["member"].tolist())
         self.assertEqual(members, {"Katie Britt", "Gary C Peters"})
@@ -211,6 +216,7 @@ class TestCapitolTradesSource(unittest.TestCase):
     @patch("analyzer.capitol_trades.requests.Session.get")
     def test_fetch_trades_api_error(self, mock_get):
         import requests
+
         mock_get.side_effect = requests.RequestException("Connection failed")
 
         with self.assertRaises(CapitolTradesError):
@@ -251,13 +257,15 @@ class TestCapitolTradesSource(unittest.TestCase):
 
     @patch("analyzer.capitol_trades.requests.Session.get")
     def test_fetch_trades_empty_response(self, mock_get):
-        mock_get.return_value = _mock_response({
-            "total": 0,
-            "page": 1,
-            "per_page": 50,
-            "pages": 1,
-            "trades": [],
-        })
+        mock_get.return_value = _mock_response(
+            {
+                "total": 0,
+                "page": 1,
+                "per_page": 50,
+                "pages": 1,
+                "trades": [],
+            }
+        )
 
         df = self.source.fetch_trades("Unknown Person")
         self.assertEqual(len(df), 0)
@@ -322,8 +330,6 @@ class TestCapitolTradesSourceSchema(unittest.TestCase):
     def tearDown(self):
         self.source.close()
         shutil.rmtree(self.tmp_dir)
-
-
 
     @patch("analyzer.capitol_trades.requests.Session.get")
     def test_upsert_transactions_succeeds(self, mock_get):

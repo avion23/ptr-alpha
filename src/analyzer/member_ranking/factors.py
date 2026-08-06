@@ -37,7 +37,9 @@ def _conviction_score(trades: pd.DataFrame) -> float:
     if trade_count == 0:
         return 0.0
     count_score = min(trade_count / 10.0, 1.0)
-    has_amounts = "amount_midpoint" in trades.columns and trades["amount_midpoint"].notna().any()
+    has_amounts = (
+        "amount_midpoint" in trades.columns and trades["amount_midpoint"].notna().any()
+    )
     size_score = 1.0
     if has_amounts:
         avg_amount = trades["amount_midpoint"].dropna().mean()

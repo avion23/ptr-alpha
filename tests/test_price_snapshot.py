@@ -29,8 +29,10 @@ class TestPriceSnapshot(unittest.TestCase):
     def _seed_prices(self):
         dates = pd.bdate_range("2024-01-01", "2024-01-10")
         prices = pd.DataFrame(
-            {"AAPL": [180.0 + i for i in range(len(dates))],
-             "MSFT": [370.0 + i for i in range(len(dates))]},
+            {
+                "AAPL": [180.0 + i for i in range(len(dates))],
+                "MSFT": [370.0 + i for i in range(len(dates))],
+            },
             index=dates,
         )
         self.db.upsert_prices(prices)
@@ -74,7 +76,9 @@ class TestPriceSnapshot(unittest.TestCase):
 
     def test_save_load_roundtrip(self):
         self._seed_prices()
-        snap = create_snapshot(self.db, ["AAPL", "MSFT"], date(2024, 1, 1), date(2024, 1, 15))
+        snap = create_snapshot(
+            self.db, ["AAPL", "MSFT"], date(2024, 1, 1), date(2024, 1, 15)
+        )
         path = Path(self.tmp_dir) / "snapshot.json"
         save_snapshot(snap, str(path))
 
@@ -105,7 +109,9 @@ class TestPriceSnapshot(unittest.TestCase):
             price_rows=1,
             first_date="2024-01-01",
             last_date="2024-01-01",
-            coverage_by_ticker={"A": {"first": "2024-01-01", "last": "2024-01-01", "days": 1, "gaps": 0}},
+            coverage_by_ticker={
+                "A": {"first": "2024-01-01", "last": "2024-01-01", "days": 1, "gaps": 0}
+            },
         )
         nested_path = Path(self.tmp_dir) / "sub" / "dir" / "snapshot.json"
         save_snapshot(snap, str(nested_path))
@@ -125,8 +131,18 @@ class TestPriceSnapshot(unittest.TestCase):
             first_date="2024-01-01",
             last_date="2024-01-10",
             coverage_by_ticker={
-                "AAPL": {"first": "2024-01-01", "last": "2024-01-10", "days": 8, "gaps": 0},
-                "MSFT": {"first": "2024-01-01", "last": "2024-01-10", "days": 8, "gaps": 0},
+                "AAPL": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-10",
+                    "days": 8,
+                    "gaps": 0,
+                },
+                "MSFT": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-10",
+                    "days": 8,
+                    "gaps": 0,
+                },
             },
         )
         new = PriceSnapshot(
@@ -142,9 +158,24 @@ class TestPriceSnapshot(unittest.TestCase):
             first_date="2024-01-01",
             last_date="2024-01-15",
             coverage_by_ticker={
-                "AAPL": {"first": "2024-01-01", "last": "2024-01-10", "days": 8, "gaps": 0},
-                "MSFT": {"first": "2024-01-01", "last": "2024-01-10", "days": 8, "gaps": 0},
-                "GOOG": {"first": "2024-01-05", "last": "2024-01-15", "days": 8, "gaps": 2},
+                "AAPL": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-10",
+                    "days": 8,
+                    "gaps": 0,
+                },
+                "MSFT": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-10",
+                    "days": 8,
+                    "gaps": 0,
+                },
+                "GOOG": {
+                    "first": "2024-01-05",
+                    "last": "2024-01-15",
+                    "days": 8,
+                    "gaps": 2,
+                },
             },
         )
         result = compare_snapshots(old, new)
@@ -168,8 +199,18 @@ class TestPriceSnapshot(unittest.TestCase):
             first_date="2024-01-01",
             last_date="2024-01-10",
             coverage_by_ticker={
-                "AAPL": {"first": "2024-01-01", "last": "2024-01-10", "days": 8, "gaps": 0},
-                "MSFT": {"first": "2024-01-01", "last": "2024-01-10", "days": 8, "gaps": 0},
+                "AAPL": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-10",
+                    "days": 8,
+                    "gaps": 0,
+                },
+                "MSFT": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-10",
+                    "days": 8,
+                    "gaps": 0,
+                },
             },
         )
         new = PriceSnapshot(
@@ -185,7 +226,12 @@ class TestPriceSnapshot(unittest.TestCase):
             first_date="2024-01-01",
             last_date="2024-01-10",
             coverage_by_ticker={
-                "AAPL": {"first": "2024-01-01", "last": "2024-01-10", "days": 8, "gaps": 0},
+                "AAPL": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-10",
+                    "days": 8,
+                    "gaps": 0,
+                },
             },
         )
         result = compare_snapshots(old, new)
@@ -206,7 +252,12 @@ class TestPriceSnapshot(unittest.TestCase):
             first_date="2024-01-01",
             last_date="2024-01-05",
             coverage_by_ticker={
-                "AAPL": {"first": "2024-01-01", "last": "2024-01-05", "days": 5, "gaps": 0},
+                "AAPL": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-05",
+                    "days": 5,
+                    "gaps": 0,
+                },
             },
         )
         new = PriceSnapshot(
@@ -222,7 +273,12 @@ class TestPriceSnapshot(unittest.TestCase):
             first_date="2024-01-01",
             last_date="2024-01-10",
             coverage_by_ticker={
-                "AAPL": {"first": "2024-01-01", "last": "2024-01-10", "days": 10, "gaps": 0},
+                "AAPL": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-10",
+                    "days": 10,
+                    "gaps": 0,
+                },
             },
         )
         result = compare_snapshots(old, new)
@@ -245,7 +301,12 @@ class TestPriceSnapshot(unittest.TestCase):
             first_date="2024-01-01",
             last_date="2024-01-05",
             coverage_by_ticker={
-                "AAPL": {"first": "2024-01-01", "last": "2024-01-05", "days": 5, "gaps": 0},
+                "AAPL": {
+                    "first": "2024-01-01",
+                    "last": "2024-01-05",
+                    "days": 5,
+                    "gaps": 0,
+                },
             },
         )
         result = compare_snapshots(snap, snap)
@@ -265,6 +326,7 @@ class TestPriceSnapshot(unittest.TestCase):
 
     def test_snapshot_captures_versions(self):
         import sys
+
         self._seed_prices()
         snap = create_snapshot(self.db, ["AAPL"], date(2024, 1, 1), date(2024, 1, 10))
         expected_py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"

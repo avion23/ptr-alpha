@@ -134,5 +134,8 @@ def _price_on_or_before(
     max_staleness_days: int = 5,
 ) -> float | None:
     return _price_at_or_before(
-        prices_df, ticker, target_date, max_staleness_days=max_staleness_days,
+        prices_df,
+        ticker,
+        target_date,
+        max_staleness_days=max_staleness_days,
     )

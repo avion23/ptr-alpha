@@ -4,6 +4,7 @@
 Reuses the download logic from analyzer.datasources.HouseTransactionSource
 but as a standalone script so it can run without the CLI framework.
 """
+
 import asyncio
 import logging
 import os
@@ -43,7 +44,9 @@ def fetch_metadata_for_year(
     logger.info(f"Downloading metadata for {year}")
     response = session.get(metadata_url, timeout=30)
     if response.status_code != 200:
-        logger.error(f"Failed to fetch metadata for {year}: HTTP {response.status_code}")
+        logger.error(
+            f"Failed to fetch metadata for {year}: HTTP {response.status_code}"
+        )
         return pd.DataFrame()
 
     import zipfile
@@ -80,7 +83,9 @@ async def download_pdf(session, doc_id, pdf_path, url):
         return DownloadResult(doc_id=doc_id, status=DownloadStatus.SKIPPED)
 
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=30)
+        ) as response:
             if response.status == 200:
                 content = await response.read()
                 if not content.startswith(b"%PDF-"):
@@ -103,7 +108,9 @@ async def download_pdf(session, doc_id, pdf_path, url):
                     error_message=f"HTTP {response.status}",
                 )
     except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as e:
-        return DownloadResult(doc_id=doc_id, status=DownloadStatus.ERROR, error_message=str(e))
+        return DownloadResult(
+            doc_id=doc_id, status=DownloadStatus.ERROR, error_message=str(e)
+        )
 
 
 async def download_missing_pdfs(years: list[int]):
@@ -128,10 +135,15 @@ async def download_missing_pdfs(years: list[int]):
 
         doc_ids = ptrs["DocID"].values
         pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
-        urls = [settings.sources.house_pdf_url.format(year=year, doc_id=doc_id) for doc_id in doc_ids]
+        urls = [
+            settings.sources.house_pdf_url.format(year=year, doc_id=doc_id)
+            for doc_id in doc_ids
+        ]
 
         missing = sum(1 for p in pdf_paths if not _is_valid_pdf(p))
-        logger.info(f"Year {year}: {len(doc_ids)} PTR filings, {missing} missing PDFs, {len(doc_ids) - missing} already downloaded")
+        logger.info(
+            f"Year {year}: {len(doc_ids)} PTR filings, {missing} missing PDFs, {len(doc_ids) - missing} already downloaded"
+        )
 
         if missing == 0:
             continue
@@ -147,9 +159,15 @@ async def download_missing_pdfs(years: list[int]):
         results = [task.result() for task in tasks]
         downloaded = sum(1 for r in results if r.status == DownloadStatus.SUCCESS)
         skipped = sum(1 for r in results if r.status == DownloadStatus.SKIPPED)
-        failed = sum(1 for r in results if r.status in (DownloadStatus.FAILED, DownloadStatus.ERROR))
+        failed = sum(
+            1
+            for r in results
+            if r.status in (DownloadStatus.FAILED, DownloadStatus.ERROR)
+        )
 
-        logger.info(f"Year {year} complete: {downloaded} downloaded, {skipped} skipped, {failed} failed")
+        logger.info(
+            f"Year {year} complete: {downloaded} downloaded, {skipped} skipped, {failed} failed"
+        )
 
     db.close()
     session.close()

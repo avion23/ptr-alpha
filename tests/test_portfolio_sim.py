@@ -39,8 +39,6 @@ def _make_recs(tickers, as_of_date, scores=None):
     )
 
 
-
-
 class TestPositionEntry(unittest.TestCase):
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
     def test_respects_max_positions(self, _mock_sector):
@@ -68,7 +66,9 @@ class TestPositionEntry(unittest.TestCase):
             exit_slippage_pct=0.0,
         )
         sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0})
+        prices = _make_prices(
+            ["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0}
+        )
         recs = _make_recs(["A"], "2024-01-01")
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 1))
         self.assertEqual(len(sim.positions), 1)
@@ -90,11 +90,18 @@ class TestSectorConstraint(unittest.TestCase):
         sim = PortfolioSimulator(cfg)
 
         sector_map = {"A": "Tech", "B": "Tech", "C": "Tech", "D": "Finance"}
-        with patch.object(sim, "_get_sector", side_effect=lambda t: sector_map.get(t, "Unknown")):
-            prices = _make_prices(["A", "B", "C", "D"], "2024-01-01", "2024-01-10",
-                                  base_prices={"A": 100, "B": 100, "C": 100, "D": 100})
-            recs = _make_recs(["A", "B", "C", "D"], "2024-01-01",
-                              scores=[40, 30, 20, 10])
+        with patch.object(
+            sim, "_get_sector", side_effect=lambda t: sector_map.get(t, "Unknown")
+        ):
+            prices = _make_prices(
+                ["A", "B", "C", "D"],
+                "2024-01-01",
+                "2024-01-10",
+                base_prices={"A": 100, "B": 100, "C": 100, "D": 100},
+            )
+            recs = _make_recs(
+                ["A", "B", "C", "D"], "2024-01-01", scores=[40, 30, 20, 10]
+            )
             sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 1))
 
         # At least one tech should be excluded due to sector cap
@@ -117,8 +124,9 @@ class TestExitAfterHoldPeriod(unittest.TestCase):
             exit_slippage_pct=0.0,
         )
         sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["AAPL"], "2024-01-01", "2024-03-01",
-                              base_prices={"AAPL": 150.0})
+        prices = _make_prices(
+            ["AAPL"], "2024-01-01", "2024-03-01", base_prices={"AAPL": 150.0}
+        )
         recs = _make_recs(["AAPL"], "2024-01-01")
 
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 2, 15))
@@ -141,7 +149,9 @@ class TestCashFlows(unittest.TestCase):
         )
         sim = PortfolioSimulator(cfg)
         initial_cash = sim.cash
-        prices = _make_prices(["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0})
+        prices = _make_prices(
+            ["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0}
+        )
         recs = _make_recs(["A"], "2024-01-01")
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 1))
         self.assertLess(sim.cash, initial_cash)
@@ -156,7 +166,9 @@ class TestCashFlows(unittest.TestCase):
             exit_slippage_pct=0.0,
         )
         sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["A"], "2024-01-01", "2024-02-01", base_prices={"A": 100.0})
+        prices = _make_prices(
+            ["A"], "2024-01-01", "2024-02-01", base_prices={"A": 100.0}
+        )
         recs = _make_recs(["A"], "2024-01-01")
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 15))
         # After exit, cash should have increased from the entry deduction
@@ -170,69 +182,106 @@ class TestSlippage(unittest.TestCase):
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
     def test_entry_slippage_applied(self, _mock_sector):
         cfg_no_slip = PortfolioConfig(
-            initial_capital=10000, max_positions=5, hold_period_days=365,
-            entry_slippage_pct=0.0, exit_slippage_pct=0.0,
+            initial_capital=10000,
+            max_positions=5,
+            hold_period_days=365,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
         )
         cfg_slip = PortfolioConfig(
-            initial_capital=10000, max_positions=5, hold_period_days=365,
-            entry_slippage_pct=0.01, exit_slippage_pct=0.0,
+            initial_capital=10000,
+            max_positions=5,
+            hold_period_days=365,
+            entry_slippage_pct=0.01,
+            exit_slippage_pct=0.0,
         )
-        prices = _make_prices(["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0})
+        prices = _make_prices(
+            ["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0}
+        )
 
         sim_no = PortfolioSimulator(cfg_no_slip)
-        sim_no.run(_make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 1))
+        sim_no.run(
+            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 1)
+        )
 
         sim_slip = PortfolioSimulator(cfg_slip)
-        sim_slip.run(_make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 1))
+        sim_slip.run(
+            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 1)
+        )
 
         self.assertEqual(len(sim_no.positions), 1)
         self.assertEqual(len(sim_slip.positions), 1)
-        self.assertGreater(sim_slip.positions[0].entry_price, sim_no.positions[0].entry_price)
+        self.assertGreater(
+            sim_slip.positions[0].entry_price, sim_no.positions[0].entry_price
+        )
 
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
     def test_exit_slippage_applied(self, _mock_sector):
         cfg = PortfolioConfig(
-            initial_capital=10000, max_positions=5, hold_period_days=5,
-            entry_slippage_pct=0.0, exit_slippage_pct=0.05,
+            initial_capital=10000,
+            max_positions=5,
+            hold_period_days=5,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.05,
         )
         sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["A"], "2024-01-01", "2024-02-01", base_prices={"A": 100.0})
-        sim.run(_make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 15))
+        prices = _make_prices(
+            ["A"], "2024-01-01", "2024-02-01", base_prices={"A": 100.0}
+        )
+        sim.run(
+            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 15)
+        )
         self.assertEqual(len(sim.closed_positions), 1)
         exit_price = sim.closed_positions[0]["exit_price"]
         self.assertLess(exit_price, 100.0)
-
-
 
 
 class TestSharpeRatio(unittest.TestCase):
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
     def test_sharpe_ratio_computed(self, _mock_sector):
         cfg = PortfolioConfig(
-            initial_capital=20000, max_positions=5, hold_period_days=5,
-            entry_slippage_pct=0.0, exit_slippage_pct=0.0,
+            initial_capital=20000,
+            max_positions=5,
+            hold_period_days=5,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
         )
         sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["A"], "2024-01-01", "2024-06-01",
-                              base_prices={"A": 100.0}, daily_drift=0.001)
-        sim.run(_make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 5, 1))
+        prices = _make_prices(
+            ["A"],
+            "2024-01-01",
+            "2024-06-01",
+            base_prices={"A": 100.0},
+            daily_drift=0.001,
+        )
+        sim.run(
+            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 5, 1)
+        )
         metrics = sim.compute_metrics(prices)
         self.assertIn("sharpe_ratio", metrics)
         self.assertIsInstance(metrics["sharpe_ratio"], float)
 
 
 class TestComputeMetrics(unittest.TestCase):
-
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
     def test_spy_comparison_present(self, _mock_sector):
         cfg = PortfolioConfig(
-            initial_capital=20000, max_positions=5, hold_period_days=30,
-            entry_slippage_pct=0.0, exit_slippage_pct=0.0,
+            initial_capital=20000,
+            max_positions=5,
+            hold_period_days=30,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
         )
         sim = PortfolioSimulator(cfg)
-        prices = _make_prices(["A", "SPY"], "2024-01-01", "2024-03-01",
-                              base_prices={"A": 100.0, "SPY": 400.0})
-        sim.run(_make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 2, 15))
+        prices = _make_prices(
+            ["A", "SPY"],
+            "2024-01-01",
+            "2024-03-01",
+            base_prices={"A": 100.0, "SPY": 400.0},
+        )
+        sim.run(
+            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 2, 15)
+        )
         metrics = sim.compute_metrics(prices)
         self.assertIsNotNone(metrics["spy_return_pct"])
 
@@ -241,13 +290,17 @@ class TestOverlappingPositions(unittest.TestCase):
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
     def test_overlapping_positions_tracked(self, _mock_sector):
         cfg = PortfolioConfig(
-            initial_capital=100000, max_positions=5, hold_period_days=60,
-            entry_slippage_pct=0.0, exit_slippage_pct=0.0,
+            initial_capital=100000,
+            max_positions=5,
+            hold_period_days=60,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
         )
         sim = PortfolioSimulator(cfg)
         prices = _make_prices(
             ["A", "B", "C", "D", "E"],
-            "2024-01-01", "2024-06-01",
+            "2024-01-01",
+            "2024-06-01",
             base_prices={"A": 100, "B": 100, "C": 100, "D": 100, "E": 100},
         )
         # Create recommendations for multiple dates to generate overlap
@@ -270,18 +323,25 @@ class TestDrawdownFromInitialCapital(unittest.TestCase):
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
     def test_drawdown_captures_first_period_loss(self, _mock_sector):
         cfg = PortfolioConfig(
-            initial_capital=10000, max_positions=1, hold_period_days=365,
-            entry_slippage_pct=0.01, exit_slippage_pct=0.0,
+            initial_capital=10000,
+            max_positions=1,
+            hold_period_days=365,
+            entry_slippage_pct=0.01,
+            exit_slippage_pct=0.0,
         )
         sim = PortfolioSimulator(cfg)
         # Flat prices with entry slippage make the first recorded snapshot the
         # trough relative to initial capital; later snapshots are not lower.
         prices = _make_prices(
-            ["A"], "2024-01-01", "2024-01-10",
-            base_prices={"A": 100.0}, daily_drift=0.0,
+            ["A"],
+            "2024-01-01",
+            "2024-01-10",
+            base_prices={"A": 100.0},
+            daily_drift=0.0,
         )
-        sim.run(_make_recs(["A"], "2024-01-01"), prices,
-                date(2024, 1, 1), date(2024, 1, 5))
+        sim.run(
+            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 5)
+        )
         metrics = sim.compute_metrics(prices)
         # The pre-fix code reported 0% drawdown because the peak only tracked
         # post-entry equity; anchoring to initial capital captures the first

@@ -5,10 +5,7 @@ from analyzer.parsing.rows import parse_pdf_table
 
 
 def test_pdftotext_preserves_owner_code(monkeypatch):
-    text = (
-        "  SP Apple Inc. (AAPL) P 01/02/2024 01/03/2024 "
-        "$1,001 - $15,000\n"
-    )
+    text = "  SP Apple Inc. (AAPL) P 01/02/2024 01/03/2024 $1,001 - $15,000\n"
     monkeypatch.setattr(
         "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
     )
@@ -21,10 +18,7 @@ def test_pdftotext_preserves_owner_code(monkeypatch):
 
 
 def test_pdftotext_no_owner_keeps_column_alignment(monkeypatch):
-    text = (
-        "Apple Inc. (AAPL) P 01/02/2024 01/03/2024 "
-        "$1,001 - $15,000\n"
-    )
+    text = "Apple Inc. (AAPL) P 01/02/2024 01/03/2024 $1,001 - $15,000\n"
     monkeypatch.setattr(
         "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
     )
@@ -37,10 +31,7 @@ def test_pdftotext_no_owner_keeps_column_alignment(monkeypatch):
 
 
 def test_indented_uppercase_asset_is_not_misclassified_as_owner(monkeypatch):
-    text = (
-        "    IBM (IBM) P 01/02/2024 01/03/2024 "
-        "$1,001 - $15,000\n"
-    )
+    text = "    IBM (IBM) P 01/02/2024 01/03/2024 $1,001 - $15,000\n"
     monkeypatch.setattr(
         "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
     )
@@ -107,7 +98,10 @@ def test_wrapped_asset_line_can_also_contain_amount_upper_bound(monkeypatch):
     assert transaction["ticker"] == "GOOGL"
     assert transaction["amount_raw"] == "$15,001 - $50,000"
     assert transaction["amount_midpoint"] == 32500.5
-    assert transaction["asset_description"] == "Alphabet Inc. - Class A Common Stock (GOOGL) [ST]"
+    assert (
+        transaction["asset_description"]
+        == "Alphabet Inc. - Class A Common Stock (GOOGL) [ST]"
+    )
 
 
 def test_wrapped_amount_after_non_asset_detail_lines(monkeypatch):
@@ -146,4 +140,7 @@ def test_wrapped_amount_before_instrument_marker(monkeypatch):
     )[0]
 
     assert transaction["amount_raw"] == "$15,001 - $50,000"
-    assert transaction["asset_description"] == "IBM Common Stock (IBM) [ST] [Account: Trust Account]"
+    assert (
+        transaction["asset_description"]
+        == "IBM Common Stock (IBM) [ST] [Account: Trust Account]"
+    )

@@ -4,6 +4,7 @@
 Scans all no-ticker rows, applies _extract_ticker() (which now includes company
 name matching), and updates the ticker column where a match is found.
 """
+
 import duckdb
 from analyzer.parsing.cells import _extract_ticker
 

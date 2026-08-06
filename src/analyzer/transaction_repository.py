@@ -75,10 +75,20 @@ class TransactionRepository:
         ).fetchdf()
         return result
 
-    def upsert(self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False) -> int:
+    def upsert(
+        self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False
+    ) -> int:
         """Insert previously unseen canonical rows and return their count."""
         df = df.copy()
-        for column in ["owner_code", "amount_raw", "amount_midpoint", "instrument_type", "strike_price", "expiry_date", "asset_description"]:
+        for column in [
+            "owner_code",
+            "amount_raw",
+            "amount_midpoint",
+            "instrument_type",
+            "strike_price",
+            "expiry_date",
+            "asset_description",
+        ]:
             if column not in df.columns:
                 df[column] = None
         df["owner_code"] = df["owner_code"].fillna("").astype(str).replace("None", "")
@@ -87,12 +97,22 @@ class TransactionRepository:
         df["source"] = source
 
         dedup_key = [
-            "doc_id", "ticker_key", "transaction_date", "member",
-            "transaction_type", "amount_raw", "owner_code", "asset_description_key",
+            "doc_id",
+            "ticker_key",
+            "transaction_date",
+            "member",
+            "transaction_type",
+            "amount_raw",
+            "owner_code",
+            "asset_description_key",
         ]
         dedup_df = df.copy()
-        dedup_df["ticker_key"] = dedup_df["ticker"].fillna("").astype(str).replace("None", "")
-        dedup_df["asset_description_key"] = dedup_df["asset_description"].fillna("").astype(str).replace("None", "")
+        dedup_df["ticker_key"] = (
+            dedup_df["ticker"].fillna("").astype(str).replace("None", "")
+        )
+        dedup_df["asset_description_key"] = (
+            dedup_df["asset_description"].fillna("").astype(str).replace("None", "")
+        )
         df = df.loc[~dedup_df.duplicated(subset=dedup_key, keep="first")].copy()
         if df.empty:
             return 0

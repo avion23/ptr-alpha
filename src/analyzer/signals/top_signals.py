@@ -22,23 +22,38 @@ from analyzer.signals.filters import _apply_quality_filter, _get_horizon_data
 
 
 _TOP_COLS = [
-    "member", "ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct",
-    "total_return_pct", "total_spy_alpha_pct", "signal_score",
+    "member",
+    "ticker",
+    "disclosure_date",
+    "spy_alpha_pct",
+    "peak_potential_pct",
+    "total_return_pct",
+    "total_spy_alpha_pct",
+    "signal_score",
 ]
 _MEMBER_TOP_COLS = [
-    "ticker", "disclosure_date", "spy_alpha_pct", "peak_potential_pct",
-    "total_return_pct", "total_spy_alpha_pct", "signal_score",
+    "ticker",
+    "disclosure_date",
+    "spy_alpha_pct",
+    "peak_potential_pct",
+    "total_return_pct",
+    "total_spy_alpha_pct",
+    "signal_score",
 ]
 
 
-def _get_top_signals(signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:
+def _get_top_signals(
+    signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 15
+) -> pd.DataFrame:
     top_data = _get_horizon_data(signals_df, horizon, TransactionType.PURCHASE.value)
     if top_data.empty:
         raise AnalysisError(f"No purchase signals found for horizon {horizon}")
 
     top_data = _apply_quality_filter(top_data)
     if top_data.empty:
-        raise AnalysisError(f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})")
+        raise AnalysisError(
+            f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})"
+        )
 
     top_data = top_data.copy()
     top_data["signal_score"] = _compute_conviction_score(top_data)
@@ -47,17 +62,26 @@ def _get_top_signals(signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 1
 
 
 def _get_member_signals(
-    signals_df: pd.DataFrame, member: str, horizon: int = 90, top_n: int = 5,
+    signals_df: pd.DataFrame,
+    member: str,
+    horizon: int = 90,
+    top_n: int = 5,
 ) -> pd.DataFrame:
     member_data = _get_horizon_data(signals_df, horizon)
     member_data = member_data[member_data["member"] == member]
 
     if member_data.empty:
-        raise AnalysisError(f"No signals found for member {member} at horizon {horizon}")
+        raise AnalysisError(
+            f"No signals found for member {member} at horizon {horizon}"
+        )
 
-    purchases = member_data[member_data["signal_type"] == TransactionType.PURCHASE.value]
+    purchases = member_data[
+        member_data["signal_type"] == TransactionType.PURCHASE.value
+    ]
     if purchases.empty:
-        raise AnalysisError(f"No purchase signals for member {member} at horizon {horizon}")
+        raise AnalysisError(
+            f"No purchase signals for member {member} at horizon {horizon}"
+        )
 
     purchases = _apply_quality_filter(purchases)
     if purchases.empty:
@@ -68,14 +92,19 @@ def _get_member_signals(
     return purchases.nlargest(top_n, "signal_score")[_MEMBER_TOP_COLS]
 
 
-def get_top_signals(signal_df: pd.DataFrame, horizon: int = 90, top_n: int = 15) -> pd.DataFrame:
+def get_top_signals(
+    signal_df: pd.DataFrame, horizon: int = 90, top_n: int = 15
+) -> pd.DataFrame:
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")
     return _get_top_signals(signal_df, horizon, top_n)
 
 
 def get_member_signals(
-    signal_df: pd.DataFrame, member: str, horizon: int = 90, top_n: int = 5,
+    signal_df: pd.DataFrame,
+    member: str,
+    horizon: int = 90,
+    top_n: int = 5,
 ) -> pd.DataFrame:
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")

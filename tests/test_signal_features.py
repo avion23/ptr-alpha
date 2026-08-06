@@ -13,7 +13,6 @@ from analyzer.signal_features import (
 
 
 class TestDisclosureLagWeight(unittest.TestCase):
-
     def test_zero_lag_returns_one(self):
         self.assertEqual(compute_disclosure_lag_weight(0), 1.0)
 
@@ -36,7 +35,6 @@ class TestDisclosureLagWeight(unittest.TestCase):
 
 
 class TestCrashHazard(unittest.TestCase):
-
     def _make_features(self, **overrides) -> SignalFeatures:
         defaults = dict(
             ticker="TEST",
@@ -72,7 +70,9 @@ class TestCrashHazard(unittest.TestCase):
         self.assertGreater(crash_large.crash_prob, crash_small.crash_prob)
 
     def test_crash_prob_bounded(self):
-        features = self._make_features(volatility_20d=2.0, drawdown_from_ath=0.9, lag_days=300)
+        features = self._make_features(
+            volatility_20d=2.0, drawdown_from_ath=0.9, lag_days=300
+        )
         crash = estimate_crash_hazard(features)
         self.assertGreater(crash.crash_prob, 0.0)
         self.assertLessEqual(crash.crash_prob, 1.0)
@@ -89,21 +89,27 @@ class TestCrashHazard(unittest.TestCase):
 
 
 class TestComputeSignalFeatures(unittest.TestCase):
-
     def setUp(self):
         dates = pd.date_range("2024-01-01", "2024-06-01", freq="D")
         np.random.seed(42)
-        self.prices_df = pd.DataFrame({
-            "AAPL": 100 + np.cumsum(np.random.randn(len(dates)) * 0.5),
-            "SPY": 400 + np.cumsum(np.random.randn(len(dates)) * 1),
-        }, index=dates)
+        self.prices_df = pd.DataFrame(
+            {
+                "AAPL": 100 + np.cumsum(np.random.randn(len(dates)) * 0.5),
+                "SPY": 400 + np.cumsum(np.random.randn(len(dates)) * 1),
+            },
+            index=dates,
+        )
 
-        self.all_tx = pd.DataFrame({
-            "member": ["Alice", "Bob", "Charlie"],
-            "ticker": ["AAPL", "AAPL", "MSFT"],
-            "transaction_type": ["Purchase", "Purchase", "Purchase"],
-            "disclosure_date": pd.to_datetime(["2024-03-01", "2024-03-15", "2024-03-10"]),
-        })
+        self.all_tx = pd.DataFrame(
+            {
+                "member": ["Alice", "Bob", "Charlie"],
+                "ticker": ["AAPL", "AAPL", "MSFT"],
+                "transaction_type": ["Purchase", "Purchase", "Purchase"],
+                "disclosure_date": pd.to_datetime(
+                    ["2024-03-01", "2024-03-15", "2024-03-10"]
+                ),
+            }
+        )
 
     def test_returns_valid_features_no_nan(self):
         features = compute_signal_features(
@@ -172,7 +178,6 @@ class TestComputeSignalFeatures(unittest.TestCase):
 
 
 class TestLagAndCrashPenaltyIntegration(unittest.TestCase):
-
     def test_lag_reduces_score(self):
         base_score = 10.0
         lag_0 = compute_disclosure_lag_weight(0)
@@ -182,6 +187,7 @@ class TestLagAndCrashPenaltyIntegration(unittest.TestCase):
         score_stale = base_score * lag_90
 
         self.assertGreater(score_fresh, score_stale)
+
 
 if __name__ == "__main__":
     unittest.main()

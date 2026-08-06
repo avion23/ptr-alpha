@@ -43,9 +43,7 @@ def _compute_ticker_ou_params(
         )
 
     if not curves:
-        curves = _build_global_curves(
-            signals_df, prices_df, as_of_date, horizon
-        )
+        curves = _build_global_curves(signals_df, prices_df, as_of_date, horizon)
 
     if not curves:
         return (None, horizon)
@@ -64,7 +62,9 @@ def _compute_ticker_entry_value(
     rho: float = 0.000137,
 ) -> float | None:
     """Compute OU entry value V(0) for a ticker from historical return curves."""
-    v0, _ = _compute_ticker_ou_params(ticker, signals_df, prices_df, as_of_date, horizon, rho)
+    v0, _ = _compute_ticker_ou_params(
+        ticker, signals_df, prices_df, as_of_date, horizon, rho
+    )
     return v0
 
 
@@ -79,5 +79,7 @@ def _compute_ticker_optimal_horizon(
     max_horizon: int = 120,
 ) -> int:
     """Compute optimal holding period for a ticker from historical curves."""
-    _v0, optimal_h = _compute_ticker_ou_params(ticker, signals_df, prices_df, as_of_date, horizon)
+    _v0, optimal_h = _compute_ticker_ou_params(
+        ticker, signals_df, prices_df, as_of_date, horizon
+    )
     return max(min_horizon, min(max_horizon, optimal_h))

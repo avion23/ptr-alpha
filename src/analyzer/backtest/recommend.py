@@ -69,9 +69,20 @@ def backtest_recommendations(
         return pd.DataFrame()
 
     return _score_and_rank(
-        signals_df, prices_df, training, member_rankings, recent_trades,
-        candidate_tickers, as_of_date, horizon, threshold, min_buyers,
-        top_n, scoring_mode, bayes, solo_buyer_skill_threshold,
+        signals_df,
+        prices_df,
+        training,
+        member_rankings,
+        recent_trades,
+        candidate_tickers,
+        as_of_date,
+        horizon,
+        threshold,
+        min_buyers,
+        top_n,
+        scoring_mode,
+        bayes,
+        solo_buyer_skill_threshold,
     )
 
 
@@ -90,9 +101,20 @@ def _candidate_tickers(recent_trades: pd.DataFrame, min_buyers: int) -> list:
 
 
 def _score_and_rank(
-    signals_df, prices_df, training, member_rankings, recent_trades,
-    candidate_tickers, as_of_date, horizon, threshold, min_buyers,
-    top_n, scoring_mode, bayes, solo_buyer_skill_threshold,
+    signals_df,
+    prices_df,
+    training,
+    member_rankings,
+    recent_trades,
+    candidate_tickers,
+    as_of_date,
+    horizon,
+    threshold,
+    min_buyers,
+    top_n,
+    scoring_mode,
+    bayes,
+    solo_buyer_skill_threshold,
 ) -> pd.DataFrame:
     as_of_for_features = (
         as_of_date.date() if hasattr(as_of_date, "date") else as_of_date
@@ -105,20 +127,30 @@ def _score_and_rank(
 
     inst_map, amt_map = _build_metadata_maps(recent_trades, has_prices)
 
-    ticker_perf_signals = _filter_ticker_perf(signals_df, horizon, as_of_date.isoformat())
+    ticker_perf_signals = _filter_ticker_perf(
+        signals_df, horizon, as_of_date.isoformat()
+    )
     recent_by_ticker = {t: grp for t, grp in recent_trades.groupby("ticker")}
 
     scores = []
     for ticker in candidate_tickers:
         row = _score_one_ticker(
             ticker=ticker,
-            recent_trades=recent_trades, training=training,
-            member_rankings=member_rankings, ticker_perf_signals=ticker_perf_signals,
-            horizon=horizon, threshold=threshold, min_buyers=min_buyers,
-            bayes=bayes, solo_buyer_skill_threshold=solo_buyer_skill_threshold,
+            recent_trades=recent_trades,
+            training=training,
+            member_rankings=member_rankings,
+            ticker_perf_signals=ticker_perf_signals,
+            horizon=horizon,
+            threshold=threshold,
+            min_buyers=min_buyers,
+            bayes=bayes,
+            solo_buyer_skill_threshold=solo_buyer_skill_threshold,
             _ranking_dicts=_ranking_dicts,
-            signals_df=signals_df, prices_df=prices_df, as_of_date=as_of_date,
-            has_prices=has_prices, price_cols=price_cols,
+            signals_df=signals_df,
+            prices_df=prices_df,
+            as_of_date=as_of_date,
+            has_prices=has_prices,
+            price_cols=price_cols,
             as_of_for_features=as_of_for_features,
             ticker_recent=recent_by_ticker.get(ticker),
         )
@@ -136,7 +168,11 @@ def _score_and_rank(
         result = result[result["signal_score"].fillna(0) > 0]
     if result.empty:
         return pd.DataFrame()
-    result = result.sort_values("signal_score", ascending=False).head(top_n).reset_index(drop=True)
+    result = (
+        result.sort_values("signal_score", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
     result.insert(0, "rank", range(1, len(result) + 1))
 
     # Propagate instrument_type and amount_midpoint from recent trades so
@@ -150,7 +186,9 @@ def _score_and_rank(
     return result
 
 
-def _build_metadata_maps(recent_trades: pd.DataFrame, has_prices: bool) -> tuple[dict, dict]:
+def _build_metadata_maps(
+    recent_trades: pd.DataFrame, has_prices: bool
+) -> tuple[dict, dict]:
     """Precompute {ticker: instrument_type} and {ticker: amount_midpoint} maps
     so evaluate_backtest can apply options leverage without re-scanning."""
     inst_map: dict = {}
@@ -172,14 +210,33 @@ def _build_metadata_maps(recent_trades: pd.DataFrame, has_prices: bool) -> tuple
 
 def _score_one_ticker(
     *,
-    ticker, recent_trades, training, member_rankings, ticker_perf_signals,
-    horizon, threshold, min_buyers, bayes, solo_buyer_skill_threshold,
-    _ranking_dicts, signals_df, prices_df, as_of_date,
-    has_prices, price_cols, as_of_for_features, ticker_recent,
+    ticker,
+    recent_trades,
+    training,
+    member_rankings,
+    ticker_perf_signals,
+    horizon,
+    threshold,
+    min_buyers,
+    bayes,
+    solo_buyer_skill_threshold,
+    _ranking_dicts,
+    signals_df,
+    prices_df,
+    as_of_date,
+    has_prices,
+    price_cols,
+    as_of_for_features,
+    ticker_recent,
 ) -> dict | None:
     score_df = score_ticker_by_buyers(
-        ticker, recent_trades, training, horizon, threshold,
-        member_rankings, min_buyers,
+        ticker,
+        recent_trades,
+        training,
+        horizon,
+        threshold,
+        member_rankings,
+        min_buyers,
         ticker_perf_signals=ticker_perf_signals,
         _bayes_prior_strength=bayes,
         solo_buyer_skill_threshold=solo_buyer_skill_threshold,
@@ -192,7 +249,11 @@ def _score_one_ticker(
 
     if has_prices and ticker in price_cols:
         v0, optimal_h = _compute_ticker_ou_params(
-            ticker, signals_df, prices_df, as_of_date, horizon,
+            ticker,
+            signals_df,
+            prices_df,
+            as_of_date,
+            horizon,
         )
         row["ou_entry_value"] = round(v0, 4) if v0 is not None else None
         row["optimal_horizon"] = optimal_h
@@ -202,14 +263,20 @@ def _score_one_ticker(
 
     if ticker_recent is not None and has_prices:
         _apply_features_to_row(
-            row, ticker, ticker_recent, prices_df, recent_trades,
+            row,
+            ticker,
+            ticker_recent,
+            prices_df,
+            recent_trades,
             as_of_for_features,
         )
 
     return row
 
 
-def _apply_features_to_row(row, ticker, ticker_recent, prices_df, recent_trades, as_of_for_features):
+def _apply_features_to_row(
+    row, ticker, ticker_recent, prices_df, recent_trades, as_of_for_features
+):
     """Compute signal features + crash hazard, apply lag/crash adjustments."""
     from analyzer.signal_features import (
         compute_signal_features,
@@ -239,7 +306,7 @@ def _apply_features_to_row(row, ticker, ticker_recent, prices_df, recent_trades,
     adjusted_score = base_score * lag_weight
 
     if 0.0 <= crash.crash_prob <= 1.0:
-        adjusted_score *= (1 - crash.crash_prob)
+        adjusted_score *= 1 - crash.crash_prob
 
     row["signal_score"] = round(adjusted_score, 2)
     row["lag_days"] = features.lag_days

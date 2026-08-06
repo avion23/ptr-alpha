@@ -48,6 +48,7 @@ MIN_RECS_FOR_CANDIDACY = 20
 # SweepResult (moved verbatim from repo-root sweep.py)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True, slots=True)
 class SweepResult:
     horizon: int
@@ -73,6 +74,7 @@ class SweepResult:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
 
 def _backtest_core(
     all_transactions: pd.DataFrame,
@@ -108,7 +110,9 @@ def _backtest_core(
     for as_of in as_of_dates:
         as_of_ts = pd.Timestamp(as_of)
         recs = analysis.backtest_recommendations(
-            signals, all_transactions, as_of_ts,
+            signals,
+            all_transactions,
+            as_of_ts,
             horizon=params.horizon,
             lookback_days=params.lookback_days,
             min_buyers=params.min_buyers,
@@ -144,11 +148,7 @@ def _backtest_core(
     valid = combined.dropna(subset=["bt_alpha_pct"])
 
     # Per-date mean alpha (NW t-stat needs this series ordered by date)
-    per_date = (
-        valid.groupby("as_of_date")["bt_alpha_pct"]
-        .mean()
-        .sort_index()
-    )
+    per_date = valid.groupby("as_of_date")["bt_alpha_pct"].mean().sort_index()
 
     # Compute all mutable values before constructing the frozen SweepResult
     rank_alpha = valid.groupby("rank")["bt_alpha_pct"].mean()
@@ -171,9 +171,7 @@ def _backtest_core(
         std_a = per_date.std()
         if std_a > 0:
             periods_per_year = 365 / params.frequency_days
-            sharpe = round(
-                float(mean_a / std_a * (periods_per_year ** 0.5)), 2
-            )
+            sharpe = round(float(mean_a / std_a * (periods_per_year**0.5)), 2)
 
     cumulative = (1 + per_date / 100).cumprod()
     rolling_max = cumulative.cummax()
@@ -208,6 +206,7 @@ def _backtest_core(
 # Public functions
 # ---------------------------------------------------------------------------
 
+
 def run_single_backtest(
     all_transactions: pd.DataFrame,
     prices: pd.DataFrame,
@@ -223,8 +222,13 @@ def run_single_backtest(
     positive means rank-1 picks outperform rank-5 (the ranker is working).
     """
     result, _ = _backtest_core(
-        all_transactions, prices, params, signals,
-        bayes_prior_strength, decay_lambda, scoring_mode,
+        all_transactions,
+        prices,
+        params,
+        signals,
+        bayes_prior_strength,
+        decay_lambda,
+        scoring_mode,
     )
     return result
 
@@ -254,10 +258,9 @@ def newey_west_tstat(alpha_series: pd.Series, lag: int) -> float:
     demeaned = x - mu
 
     # Autocovariances: γ_k = (1/n) Σ_{t=k}^{n-1} (x_t − μ)(x_{t-k} − μ)
-    gamma = np.array([
-        np.dot(demeaned[k:], demeaned[: n - k]) / n
-        for k in range(lag + 1)
-    ])
+    gamma = np.array(
+        [np.dot(demeaned[k:], demeaned[: n - k]) / n for k in range(lag + 1)]
+    )
 
     if lag == 0:
         long_run_var = float(gamma[0])
@@ -312,7 +315,10 @@ def sweep_configs(
     for h in unique_horizons:
         for d in unique_decays:
             signal_cache[(h, d)] = analysis.calculate_signal_potential(
-                entry_prices, prices, [h], decay_lambda=d,
+                entry_prices,
+                prices,
+                [h],
+                decay_lambda=d,
             )
 
     keys = list(grid.keys())
@@ -338,7 +344,10 @@ def sweep_configs(
         )
         sigs = signal_cache[(horizon, float(params_dict["decay_lambda"]))]
         result, per_date = _backtest_core(
-            all_tx, prices, params, sigs,
+            all_tx,
+            prices,
+            params,
+            sigs,
             bayes_prior_strength=float(params_dict["bayes_prior_strength"]),
             decay_lambda=float(params_dict["decay_lambda"]),
             scoring_mode=str(params_dict.get("scoring_mode", "shrunk_alpha")),
@@ -349,7 +358,9 @@ def sweep_configs(
             float(stats.norm.sf(t_stat))
             if math.isfinite(t_stat)
             # One-sided positive-alpha test; negative configs get p > 0.5 and cannot survive BH.
-            else 0.0 if t_stat > 0 else 1.0
+            else 0.0
+            if t_stat > 0
+            else 1.0
         )
 
         row = asdict(result)
@@ -399,7 +410,9 @@ def select_config(sweep_df: pd.DataFrame, alpha: float = 0.05) -> dict:
 
     survivors = sweep_df[bh_mask]
     if survivors.empty:
-        fallback_df = sweep_df if sample_filter_exhausted else sweep_df.loc[candidate_mask]
+        fallback_df = (
+            sweep_df if sample_filter_exhausted else sweep_df.loc[candidate_mask]
+        )
         best_row = fallback_df.sort_values(
             ["alpha_slope", "overall_alpha"], ascending=False
         ).iloc[0]
@@ -476,6 +489,7 @@ def run_validation(
 # Private implementation helpers
 # ---------------------------------------------------------------------------
 
+
 def _run_validation_with_db(
     db,
     train_start: date,
@@ -511,18 +525,24 @@ def _run_validation_with_db(
         n_combos *= len(v)
     logger.info(
         "Sweeping %d configs on TRAIN window [%s -> %s] ...",
-        n_combos, train_start, train_end,
+        n_combos,
+        train_start,
+        train_end,
     )
 
     train_df = sweep_configs(all_tx, prices, entry_prices, grid, train_start, train_end)
     selected = select_config(train_df)
     n_candidates = int(
         train_df["min_sample_ok"].sum()
-        if "min_sample_ok" in train_df.columns else len(train_df)
+        if "min_sample_ok" in train_df.columns
+        else len(train_df)
     )
     logger.info(
         "Candidates: %d/%d pass min-sample filter (>=%d dates, >=%d recs)",
-        n_candidates, len(train_df), MIN_DATES_FOR_CANDIDACY, MIN_RECS_FOR_CANDIDACY,
+        n_candidates,
+        len(train_df),
+        MIN_DATES_FOR_CANDIDACY,
+        MIN_RECS_FOR_CANDIDACY,
     )
 
     logger.info(
@@ -554,7 +574,10 @@ def _run_validation_with_db(
 
     # Pre-compute signals for the frozen (horizon, decay_lambda) once
     frozen_signals = analysis.calculate_signal_potential(
-        entry_prices, prices, [horizon], decay_lambda=decay_lambda,
+        entry_prices,
+        prices,
+        [horizon],
+        decay_lambda=decay_lambda,
     )
 
     train_params = BacktestParams(
@@ -582,7 +605,10 @@ def _run_validation_with_db(
 
     # Re-run TRAIN with the selected config to get per-date series for NW stat
     train_result, train_per_date = _backtest_core(
-        all_tx, prices, train_params, frozen_signals,
+        all_tx,
+        prices,
+        train_params,
+        frozen_signals,
         bayes_prior_strength=bayes_prior,
         decay_lambda=decay_lambda,
         scoring_mode=scoring_mode,
@@ -590,7 +616,10 @@ def _run_validation_with_db(
 
     # One evaluation on TEST — no peeking before this point
     test_result, test_per_date = _backtest_core(
-        all_tx, prices, test_params, frozen_signals,
+        all_tx,
+        prices,
+        test_params,
+        frozen_signals,
         bayes_prior_strength=bayes_prior,
         decay_lambda=decay_lambda,
         scoring_mode=scoring_mode,
@@ -598,9 +627,17 @@ def _run_validation_with_db(
 
     train_t = newey_west_tstat(train_per_date, lag=lag)
     # One-sided H1: alpha > 0, matching sweep_configs.
-    train_p = float(stats.norm.sf(train_t)) if math.isfinite(train_t) else (0.0 if train_t > 0 else 1.0)
+    train_p = (
+        float(stats.norm.sf(train_t))
+        if math.isfinite(train_t)
+        else (0.0 if train_t > 0 else 1.0)
+    )
     test_t = newey_west_tstat(test_per_date, lag=lag)
-    test_p = float(stats.norm.sf(test_t)) if math.isfinite(test_t) else (0.0 if test_t > 0 else 1.0)
+    test_p = (
+        float(stats.norm.sf(test_t))
+        if math.isfinite(test_t)
+        else (0.0 if test_t > 0 else 1.0)
+    )
 
     spy_train = _spy_mean_return(prices, train_start, train_end, horizon)
     spy_test = _spy_mean_return(prices, test_start, test_end, horizon)
@@ -609,11 +646,19 @@ def _run_validation_with_db(
     test_alpha = test_result.overall_alpha
     deg_ratio = round(test_alpha / train_alpha, 3) if train_alpha != 0 else None
 
-    verdict = _verdict(test_result, test_t, test_p, deg_ratio, selected["survives_correction"])
+    verdict = _verdict(
+        test_result, test_t, test_p, deg_ratio, selected["survives_correction"]
+    )
 
     config_keys = [
-        "horizon", "frequency_days", "training_lookback_days",
-        "min_buyers", "top_n", "decay_lambda", "bayes_prior_strength", "scoring_mode",
+        "horizon",
+        "frequency_days",
+        "training_lookback_days",
+        "min_buyers",
+        "top_n",
+        "decay_lambda",
+        "bayes_prior_strength",
+        "scoring_mode",
     ]
     frozen_config = {k: selected[k] for k in config_keys if k in selected}
 
@@ -689,10 +734,9 @@ def _spy_mean_return(
             entry = spy.asof(ts)
             exit_ = spy.asof(end_ts)
             exit_pos = spy.index.searchsorted(end_ts, side="right") - 1
-            exit_is_mature = (
-                exit_pos >= 0
-                and end_ts - pd.Timestamp(spy.index[exit_pos]) <= pd.Timedelta(days=7)
-            )
+            exit_is_mature = exit_pos >= 0 and end_ts - pd.Timestamp(
+                spy.index[exit_pos]
+            ) <= pd.Timedelta(days=7)
             if pd.notna(entry) and pd.notna(exit_) and entry > 0 and exit_is_mature:
                 returns.append((exit_ - entry) / entry * 100)
         return round(float(np.mean(returns)), 2) if returns else None
@@ -729,30 +773,42 @@ def _print_summary(output: dict) -> None:
     cfg = output["selected_config"]
     logger.info(
         "  Config:  horizon=%s, freq=%s, min_buyers=%s, top_n=%s, mode=%s",
-        cfg["horizon"], cfg["frequency_days"],
-        cfg["min_buyers"], cfg["top_n"], cfg["scoring_mode"],
+        cfg["horizon"],
+        cfg["frequency_days"],
+        cfg["min_buyers"],
+        cfg["top_n"],
+        cfg["scoring_mode"],
     )
 
     snoop = output["snooping"]
     logger.info(
         "  Candidates: %d/%d pass min-sample filter (>=%d dates, >=%d recs)",
-        snoop["n_min_sample_candidates"], snoop["n_trials"],
-        snoop["min_dates_for_candidacy"], snoop["min_recs_for_candidacy"],
+        snoop["n_min_sample_candidates"],
+        snoop["n_trials"],
+        snoop["min_dates_for_candidacy"],
+        snoop["min_recs_for_candidacy"],
     )
     logger.info(
         "  Snooping: %d/%d survive BH | Bonferroni alpha=%.5f | survives=%s",
-        snoop["n_survivors"], snoop["n_trials"],
-        snoop["bonferroni_threshold"], snoop["survives_bh"],
+        snoop["n_survivors"],
+        snoop["n_trials"],
+        snoop["bonferroni_threshold"],
+        snoop["survives_bh"],
     )
 
-    for label, key in [("TRAIN (in-sample)", "train"), ("TEST  (out-of-sample)", "test")]:
+    for label, key in [
+        ("TRAIN (in-sample)", "train"),
+        ("TEST  (out-of-sample)", "test"),
+    ]:
         m = output[key]
         t_str = f"{m['nw_tstat']:+.2f}" if m["nw_tstat"] is not None else "N/A"
         logger.info("\n  %s:", label)
         logger.info("    N=%d recs, %d dates", m["N"], m["dates_evaluated"])
         logger.info("    mean alpha: %+.2f%%", m["mean_alpha"])
         logger.info("    win rate:   %.1f%%", m["win_rate"])
-        logger.info("    rank1/5:    %+.2f%% / %+.2f%%", m["rank1_alpha"], m["rank5_alpha"])
+        logger.info(
+            "    rank1/5:    %+.2f%% / %+.2f%%", m["rank1_alpha"], m["rank5_alpha"]
+        )
         logger.info("    NW t-stat:  %s  (p=%.4f)", t_str, m["nw_pval"])
         if m.get("spy_mean_return") is not None:
             logger.info("    SPY return: %+.2f%%", m["spy_mean_return"])

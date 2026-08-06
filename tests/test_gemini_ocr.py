@@ -120,8 +120,14 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
     db.conn.close()
 
     txs = [_tx()]
-    assert insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path)) == 1
-    assert insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path)) == 1
+    assert (
+        insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path))
+        == 1
+    )
+    assert (
+        insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path))
+        == 1
+    )
 
     con = Database(db_path).conn
     rows = con.execute("""
@@ -151,11 +157,21 @@ def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):
     """)
     db.conn.close()
 
-    assert insert_transactions("doc-preserve", 2024, "Jane Doe", [_tx()], db_path=str(db_path)) == 1
-    assert insert_transactions("doc-preserve", 2024, "Jane Doe", [], db_path=str(db_path)) == 0
+    assert (
+        insert_transactions(
+            "doc-preserve", 2024, "Jane Doe", [_tx()], db_path=str(db_path)
+        )
+        == 1
+    )
+    assert (
+        insert_transactions("doc-preserve", 2024, "Jane Doe", [], db_path=str(db_path))
+        == 0
+    )
 
     con = Database(db_path).conn
-    row_count = con.execute("SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc-preserve'").fetchone()[0]
+    row_count = con.execute(
+        "SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc-preserve'"
+    ).fetchone()[0]
     latest_run = con.execute("""
         SELECT status, raw_row_count, transaction_count
         FROM pdf_parse_runs
@@ -179,12 +195,20 @@ def test_insert_transactions_all_bad_rows_preserves_existing_rows(tmp_path):
     """)
     db.conn.close()
 
-    assert insert_transactions("doc-bad", 2024, "Jane Doe", [_tx()], db_path=str(db_path)) == 1
+    assert (
+        insert_transactions("doc-bad", 2024, "Jane Doe", [_tx()], db_path=str(db_path))
+        == 1
+    )
     bad_txs = [_tx(date="not a date")]
-    assert insert_transactions("doc-bad", 2024, "Jane Doe", bad_txs, db_path=str(db_path)) == 0
+    assert (
+        insert_transactions("doc-bad", 2024, "Jane Doe", bad_txs, db_path=str(db_path))
+        == 0
+    )
 
     con = Database(db_path).conn
-    rows = con.execute("SELECT ticker, asset_description FROM transactions WHERE doc_id = 'doc-bad'").fetchall()
+    rows = con.execute(
+        "SELECT ticker, asset_description FROM transactions WHERE doc_id = 'doc-bad'"
+    ).fetchall()
     latest_run = con.execute("""
         SELECT status, raw_row_count, transaction_count, error_message
         FROM pdf_parse_runs
@@ -207,12 +231,29 @@ def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):
     """)
     db.conn.close()
 
-    assert insert_transactions("doc-mixed", 2024, "Jane Doe", [_tx(asset="Old Inc. (OLD)")], db_path=str(db_path)) == 1
-    txs = [_tx(asset="Microsoft Corp. (MSFT)"), _tx(asset="Bad Corp. (BAD)", date="bad")]
-    assert insert_transactions("doc-mixed", 2024, "Jane Doe", txs, db_path=str(db_path)) == 1
+    assert (
+        insert_transactions(
+            "doc-mixed",
+            2024,
+            "Jane Doe",
+            [_tx(asset="Old Inc. (OLD)")],
+            db_path=str(db_path),
+        )
+        == 1
+    )
+    txs = [
+        _tx(asset="Microsoft Corp. (MSFT)"),
+        _tx(asset="Bad Corp. (BAD)", date="bad"),
+    ]
+    assert (
+        insert_transactions("doc-mixed", 2024, "Jane Doe", txs, db_path=str(db_path))
+        == 1
+    )
 
     con = Database(db_path).conn
-    rows = con.execute("SELECT ticker, asset_description FROM transactions WHERE doc_id = 'doc-mixed'").fetchall()
+    rows = con.execute(
+        "SELECT ticker, asset_description FROM transactions WHERE doc_id = 'doc-mixed'"
+    ).fetchall()
     latest_run = con.execute("""
         SELECT status, raw_row_count, transaction_count, error_message
         FROM pdf_parse_runs

@@ -52,9 +52,17 @@ _EXIT_STALENESS_DAYS = 25
 _UNTRADEABLE = object()
 
 _EMPTY_BT_COLS = [
-    "bt_entry_price", "bt_exit_price", "bt_raw_return_pct", "bt_return_pct",
-    "bt_leverage", "bt_spy_return_pct", "bt_alpha_pct", "bt_entry_delay",
-    "bt_delisted", "bt_coverage", "bt_stale_exit",
+    "bt_entry_price",
+    "bt_exit_price",
+    "bt_raw_return_pct",
+    "bt_return_pct",
+    "bt_leverage",
+    "bt_spy_return_pct",
+    "bt_alpha_pct",
+    "bt_entry_delay",
+    "bt_delisted",
+    "bt_coverage",
+    "bt_stale_exit",
 ]
 
 
@@ -66,7 +74,7 @@ def evaluate_backtest(
     max_staleness_days: int | None = 30,
     entry_slippage_bps: float = 10.0,
     exit_slippage_bps: float = 10.0,
-    use_dip_entry: bool = False,   # Bug 1a: was True; False = honest baseline
+    use_dip_entry: bool = False,  # Bug 1a: was True; False = honest baseline
     pullback_pct: float = 0.05,
     max_wait_days: int = 10,
 ) -> pd.DataFrame:
@@ -82,18 +90,27 @@ def evaluate_backtest(
     )
 
     spy_arrs = _price_arrays(prices_df, "SPY")
-    spy_ns, spy_vals = (spy_arrs if spy_arrs and spy_arrs[0] is not None else (None, None))
+    spy_ns, spy_vals = (
+        spy_arrs if spy_arrs and spy_arrs[0] is not None else (None, None)
+    )
 
-    spy_start, spy_entry_adj = _spy_start(spy_ns, spy_vals, as_of_date, entry_mult, max_staleness_days)
+    spy_start, spy_entry_adj = _spy_start(
+        spy_ns, spy_vals, as_of_date, entry_mult, max_staleness_days
+    )
     spy_ends, spy_returns = _spy_returns_by_horizon(
-        spy_ns, spy_vals, as_of_date, spy_start, spy_entry_adj, exit_mult, horizons, horizon,
+        spy_ns,
+        spy_vals,
+        as_of_date,
+        spy_start,
+        spy_entry_adj,
+        exit_mult,
+        horizons,
+        horizon,
     )
 
     tickers = recommendations["ticker"].tolist()
     ticker_horizons = (
-        [int(h) for h in horizons]
-        if horizons is not None
-        else [horizon] * len(tickers)
+        [int(h) for h in horizons] if horizons is not None else [horizon] * len(tickers)
     )
 
     price_cache = {t: _price_arrays(prices_df, t) for t in tickers}
@@ -117,11 +134,21 @@ def evaluate_backtest(
             continue
 
         row = _evaluate_one_recommendation(
-            ticker, i, t_horizon, cached,
-            as_of_date, entry_mult, exit_mult,
-            spy_ns, spy_vals,
-            spy_start, spy_returns, spy_ends,
-            use_dip_entry, pullback_pct, max_wait_days,
+            ticker,
+            i,
+            t_horizon,
+            cached,
+            as_of_date,
+            entry_mult,
+            exit_mult,
+            spy_ns,
+            spy_vals,
+            spy_start,
+            spy_returns,
+            spy_ends,
+            use_dip_entry,
+            pullback_pct,
+            max_wait_days,
             max_staleness_days,
             inst_type_arr[i] if inst_type_arr is not None else None,
             amount_arr[i] if amount_arr is not None else None,
@@ -158,7 +185,9 @@ def evaluate_backtest(
     return result
 
 
-def _slippage_multipliers(entry_slippage_bps: float, exit_slippage_bps: float) -> tuple[float, float]:
+def _slippage_multipliers(
+    entry_slippage_bps: float, exit_slippage_bps: float
+) -> tuple[float, float]:
     return (1.0 + entry_slippage_bps / 10000, 1.0 - exit_slippage_bps / 10000)
 
 
@@ -172,8 +201,14 @@ def _spy_start(spy_ns, spy_vals, as_of_date, entry_mult, max_staleness_days):
 
 
 def _spy_returns_by_horizon(
-    spy_ns, spy_vals, as_of_date, spy_start, spy_entry_adj,
-    exit_mult, horizons, default_horizon,
+    spy_ns,
+    spy_vals,
+    as_of_date,
+    spy_start,
+    spy_entry_adj,
+    exit_mult,
+    horizons,
+    default_horizon,
 ):
     """Pre-compute SPY returns for every distinct horizon from as_of_date.
 
@@ -188,7 +223,9 @@ def _spy_returns_by_horizon(
     horizon_iter = set(horizons) if horizons is not None else [default_horizon]
     for h in horizon_iter:
         spy_exit_ns = as_of_date.value + int(h) * NS_PER_DAY
-        se = _price_on_or_before_arrays(spy_ns, spy_vals, pd.Timestamp(spy_exit_ns), max_staleness_days=30)
+        se = _price_on_or_before_arrays(
+            spy_ns, spy_vals, pd.Timestamp(spy_exit_ns), max_staleness_days=30
+        )
         spy_ends[h] = se
         if se:
             spy_exit_adj = se * exit_mult
@@ -199,8 +236,14 @@ def _spy_returns_by_horizon(
 
 
 def _compute_spy_return_shifted(
-    spy_ns, spy_vals, as_of_ns, entry_delay, t_horizon,
-    entry_mult, exit_mult, max_staleness_days,
+    spy_ns,
+    spy_vals,
+    as_of_ns,
+    entry_delay,
+    t_horizon,
+    entry_mult,
+    exit_mult,
+    max_staleness_days,
 ):
     """Compute SPY return for the shifted window [as_of + entry_delay, …+ horizon].
 
@@ -211,10 +254,14 @@ def _compute_spy_return_shifted(
         return None
     entry_ns = as_of_ns + entry_delay * NS_PER_DAY
     exit_ns = entry_ns + t_horizon * NS_PER_DAY
-    spy_entry = _price_at_or_before_arrays(spy_ns, spy_vals, pd.Timestamp(entry_ns), max_staleness_days)
+    spy_entry = _price_at_or_before_arrays(
+        spy_ns, spy_vals, pd.Timestamp(entry_ns), max_staleness_days
+    )
     if not spy_entry:
         return None
-    spy_exit = _price_on_or_before_arrays(spy_ns, spy_vals, pd.Timestamp(exit_ns), max_staleness_days=30)
+    spy_exit = _price_on_or_before_arrays(
+        spy_ns, spy_vals, pd.Timestamp(exit_ns), max_staleness_days=30
+    )
     if not spy_exit:
         return None
     return round((spy_exit * exit_mult / (spy_entry * entry_mult) - 1) * 100, 2)
@@ -239,13 +286,24 @@ def _empty_eval_joined(recommendations: pd.DataFrame) -> pd.DataFrame:
 
 
 def _evaluate_one_recommendation(
-    ticker, row_idx, t_horizon, cached,
-    as_of_date, entry_mult, exit_mult,
-    spy_ns, spy_vals,
-    spy_start, spy_returns, spy_ends,
-    use_dip_entry, pullback_pct, max_wait_days,
+    ticker,
+    row_idx,
+    t_horizon,
+    cached,
+    as_of_date,
+    entry_mult,
+    exit_mult,
+    spy_ns,
+    spy_vals,
+    spy_start,
+    spy_returns,
+    spy_ends,
+    use_dip_entry,
+    pullback_pct,
+    max_wait_days,
     max_staleness_days,
-    inst_type_val, amount_val,
+    inst_type_val,
+    amount_val,
 ) -> dict | None:
     """Returns dict of bt_* fields for one ticker, or None to skip.
 
@@ -257,8 +315,13 @@ def _evaluate_one_recommendation(
     idx_ns, vals = cached
 
     entry, entry_delay = _resolve_entry(
-        use_dip_entry, idx_ns, vals, as_of_date,
-        pullback_pct, max_wait_days, max_staleness_days,
+        use_dip_entry,
+        idx_ns,
+        vals,
+        as_of_date,
+        pullback_pct,
+        max_wait_days,
+        max_staleness_days,
     )
     if not entry:
         return None
@@ -272,7 +335,10 @@ def _evaluate_one_recommendation(
     # delisted/suspended), fall back to the last available price rather than
     # silently dropping the trade from both numerator and denominator.
     exit_price = _price_on_or_before_arrays(
-        idx_ns, vals, pd.Timestamp(exit_ns), max_staleness_days=_EXIT_STALENESS_DAYS,
+        idx_ns,
+        vals,
+        pd.Timestamp(exit_ns),
+        max_staleness_days=_EXIT_STALENESS_DAYS,
     )
     is_delisted = False
     stale_exit = False
@@ -301,8 +367,14 @@ def _evaluate_one_recommendation(
     # spy_returns (anchored at as_of) would produce phantom alpha.
     if use_dip_entry and entry_delay > 0:
         spy_ret = _compute_spy_return_shifted(
-            spy_ns, spy_vals, as_of_ns, entry_delay, t_horizon,
-            entry_mult, exit_mult, max_staleness_days,
+            spy_ns,
+            spy_vals,
+            as_of_ns,
+            entry_delay,
+            t_horizon,
+            entry_mult,
+            exit_mult,
+            max_staleness_days,
         )
         if spy_ret is None:
             return None  # SPY data unavailable for shifted window — skip
@@ -311,20 +383,40 @@ def _evaluate_one_recommendation(
         if not spy_start or (spy_ret == 0.0 and not spy_ends.get(t_horizon)):
             return None
 
-    inst_type = str(inst_type_val) if inst_type_val is not None and pd.notna(inst_type_val) else "stock"
+    inst_type = (
+        str(inst_type_val)
+        if inst_type_val is not None and pd.notna(inst_type_val)
+        else "stock"
+    )
     amount = amount_val if amount_val is not None else None
     row = _bt_row(
-        ticker, entry, entry_delay, exit_price, t_horizon,
-        entry_mult, exit_mult, spy_ret, inst_type, amount,
+        ticker,
+        entry,
+        entry_delay,
+        exit_price,
+        t_horizon,
+        entry_mult,
+        exit_mult,
+        spy_ret,
+        inst_type,
+        amount,
     )
-    row["_bt_idx"] = row_idx      # Bug 3: used for 1:1 merge
+    row["_bt_idx"] = row_idx  # Bug 3: used for 1:1 merge
     row["bt_delisted"] = is_delisted  # Bug 2: flag for coverage reporting
     row["bt_coverage"] = "stale" if stale_exit else "complete"
     row["bt_stale_exit"] = stale_exit
     return row
 
 
-def _resolve_entry(use_dip_entry, idx_ns, vals, as_of_date, pullback_pct, max_wait_days, max_staleness_days):
+def _resolve_entry(
+    use_dip_entry,
+    idx_ns,
+    vals,
+    as_of_date,
+    pullback_pct,
+    max_wait_days,
+    max_staleness_days,
+):
     """Compute entry price and entry delay (calendar days), with optional dip timing.
 
     Bug 1b: when use_dip_entry=True and no dip is found within max_wait_days,
@@ -333,7 +425,11 @@ def _resolve_entry(use_dip_entry, idx_ns, vals, as_of_date, pullback_pct, max_wa
     """
     if use_dip_entry:
         entry, entry_delay = _find_dip_entry_arrays(
-            idx_ns, vals, as_of_date, pullback_pct, max_wait_days,
+            idx_ns,
+            vals,
+            as_of_date,
+            pullback_pct,
+            max_wait_days,
         )
         # (0.0, 0) from _find_dip_entry_arrays means "no dip found"
         if entry <= 0:
@@ -344,7 +440,18 @@ def _resolve_entry(use_dip_entry, idx_ns, vals, as_of_date, pullback_pct, max_wa
     return entry, entry_delay
 
 
-def _bt_row(ticker, entry, entry_delay, exit_price, t_horizon, entry_mult, exit_mult, spy_ret, inst_type, amount):
+def _bt_row(
+    ticker,
+    entry,
+    entry_delay,
+    exit_price,
+    t_horizon,
+    entry_mult,
+    exit_mult,
+    spy_ret,
+    inst_type,
+    amount,
+):
     """Build the bt_* row dict after all inputs are resolved."""
     from analyzer.options import estimate_options_leverage
 

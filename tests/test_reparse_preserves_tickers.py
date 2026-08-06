@@ -48,7 +48,6 @@ def _merge_path(db: Database, df: pd.DataFrame) -> pd.DataFrame:
 
 
 class TestReparsePreservesTickers(DatabaseTestCase):
-
     def test_existing_ticker_carried_forward_when_new_is_null(self):
         orig = pd.DataFrame([_row(ticker="SMPL")])
         self.db.upsert_transactions(orig, source="house_pdf")
@@ -90,20 +89,32 @@ class TestReparsePreservesTickers(DatabaseTestCase):
         self.assertEqual(stored.iloc[0]["ticker"], "AAPL")
 
     def test_transactions_not_dropped_count_preserved(self):
-        orig = pd.DataFrame([
-            _row(ticker="SMPL", transaction_type="Purchase"),
-            _row(ticker="CBRL", transaction_type="Sale"),
-            _row(ticker="DNUT", transaction_type="Purchase", transaction_date=date(2024, 3, 11)),
-        ])
+        orig = pd.DataFrame(
+            [
+                _row(ticker="SMPL", transaction_type="Purchase"),
+                _row(ticker="CBRL", transaction_type="Sale"),
+                _row(
+                    ticker="DNUT",
+                    transaction_type="Purchase",
+                    transaction_date=date(2024, 3, 11),
+                ),
+            ]
+        )
         self.db.upsert_transactions(orig, source="house_pdf")
 
         # Fresh parse loses all tickers (the bug scenario) but keeps all rows.
         # Each row has a distinct identity so carry-forward is unambiguous.
-        fresh = pd.DataFrame([
-            _row(ticker=None, transaction_type="Purchase"),
-            _row(ticker=None, transaction_type="Sale"),
-            _row(ticker=None, transaction_type="Purchase", transaction_date=date(2024, 3, 11)),
-        ])
+        fresh = pd.DataFrame(
+            [
+                _row(ticker=None, transaction_type="Purchase"),
+                _row(ticker=None, transaction_type="Sale"),
+                _row(
+                    ticker=None,
+                    transaction_type="Purchase",
+                    transaction_date=date(2024, 3, 11),
+                ),
+            ]
+        )
         merged = preserve_existing_fields(fresh, self.db)
         self.assertEqual(len(merged), 3)
 
@@ -115,14 +126,18 @@ class TestReparsePreservesTickers(DatabaseTestCase):
     def test_doc_with_no_existing_rows_is_noop(self):
         fresh = pd.DataFrame([_row(ticker=None, amount_raw=None)])
         merged = preserve_existing_fields(fresh, self.db)
-        self.assertTrue(merged.at[0, "ticker"] is None or pd.isna(merged.at[0, "ticker"]))
+        self.assertTrue(
+            merged.at[0, "ticker"] is None or pd.isna(merged.at[0, "ticker"])
+        )
 
     def test_multiple_existing_rows_any_non_null_ticker_carried(self):
-        orig = pd.DataFrame([
-            # Two rows share the same identity but only one resolved a ticker.
-            _row(ticker=None, owner_code="DC"),
-            _row(ticker="HOG", owner_code="DC", disclosure_date=date(2024, 3, 16)),
-        ])
+        orig = pd.DataFrame(
+            [
+                # Two rows share the same identity but only one resolved a ticker.
+                _row(ticker=None, owner_code="DC"),
+                _row(ticker="HOG", owner_code="DC", disclosure_date=date(2024, 3, 16)),
+            ]
+        )
         self.db.upsert_transactions(orig, source="house_pdf")
 
         fresh = pd.DataFrame([_row(ticker=None, owner_code="DC")])
@@ -133,16 +148,20 @@ class TestReparsePreservesTickers(DatabaseTestCase):
         # Same (member, transaction_date, transaction_type) but two different
         # tickers resolved on prior parses. A fresh parse with tickerless rows
         # must NOT mislabel one purchase as the other.
-        orig = pd.DataFrame([
-            _row(ticker="AAPL", owner_code="DC"),
-            _row(ticker="MSFT", owner_code="DC", disclosure_date=date(2024, 3, 16)),
-        ])
+        orig = pd.DataFrame(
+            [
+                _row(ticker="AAPL", owner_code="DC"),
+                _row(ticker="MSFT", owner_code="DC", disclosure_date=date(2024, 3, 16)),
+            ]
+        )
         self.db.upsert_transactions(orig, source="house_pdf")
 
-        fresh = pd.DataFrame([
-            _row(ticker=None, owner_code="DC"),
-            _row(ticker=None, owner_code="DC", disclosure_date=date(2024, 3, 16)),
-        ])
+        fresh = pd.DataFrame(
+            [
+                _row(ticker=None, owner_code="DC"),
+                _row(ticker=None, owner_code="DC", disclosure_date=date(2024, 3, 16)),
+            ]
+        )
         merged = preserve_existing_fields(fresh, self.db)
 
         # Disagreement -> neither row gets a ticker (no silent misassignment).

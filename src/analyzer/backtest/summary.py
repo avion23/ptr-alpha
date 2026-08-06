@@ -74,12 +74,22 @@ def _spy_baseline_row(valid: pd.DataFrame) -> dict:
     re-fetching prices.  avg_alpha_pct is 0 by definition (SPY vs itself).
     """
     if "bt_spy_return_pct" not in valid.columns:
-        return {"rank": "SPY_BH", "count": 0, "win_rate_pct": None,
-                "avg_return_pct": None, "avg_alpha_pct": 0.0}
+        return {
+            "rank": "SPY_BH",
+            "count": 0,
+            "win_rate_pct": None,
+            "avg_return_pct": None,
+            "avg_alpha_pct": 0.0,
+        }
     spy_rets = valid["bt_spy_return_pct"].dropna()
     if spy_rets.empty:
-        return {"rank": "SPY_BH", "count": 0, "win_rate_pct": None,
-                "avg_return_pct": None, "avg_alpha_pct": 0.0}
+        return {
+            "rank": "SPY_BH",
+            "count": 0,
+            "win_rate_pct": None,
+            "avg_return_pct": None,
+            "avg_alpha_pct": 0.0,
+        }
     return {
         "rank": "SPY_BH",
         "count": len(spy_rets),

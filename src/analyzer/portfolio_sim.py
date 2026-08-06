@@ -74,7 +74,9 @@ class PortfolioSimulator:
         has_as_of = "as_of_date" in recommendations.columns
         if has_as_of:
             recommendations = recommendations.copy()
-            recommendations["as_of_date"] = pd.to_datetime(recommendations["as_of_date"])
+            recommendations["as_of_date"] = pd.to_datetime(
+                recommendations["as_of_date"]
+            )
 
         current = start_date
         while current <= end_date:
@@ -178,7 +180,8 @@ class PortfolioSimulator:
     def _try_exit_expired(self, prices_df: pd.DataFrame, as_of: date):
         """Exit positions that have exceeded the hold period."""
         expired = [
-            p for p in self.positions
+            p
+            for p in self.positions
             if (as_of - p.entry_date).days >= self.config.hold_period_days
         ]
         for pos in expired:
@@ -233,6 +236,7 @@ class PortfolioSimulator:
             return self._sector_cache[ticker]
         try:
             import yfinance as yf
+
             sector = yf.Ticker(ticker).info.get("sector", "Unknown")
         except Exception:
             sector = "Unknown"
@@ -303,8 +307,12 @@ class PortfolioSimulator:
         if not self.snapshots:
             return pd.DataFrame(
                 columns=[
-                    "date", "cash", "total_value", "num_positions",
-                    "unrealized_pnl", "realized_pnl",
+                    "date",
+                    "cash",
+                    "total_value",
+                    "num_positions",
+                    "unrealized_pnl",
+                    "realized_pnl",
                 ]
             )
         rows = []
@@ -339,11 +347,15 @@ class PortfolioSimulator:
         ann_return = ((values[-1] / initial) ** (365.0 / max(days, 1)) - 1) * 100
 
         # Daily returns
-        daily_returns = np.diff(values) / values[:-1] if len(values) > 1 else np.array([0.0])
+        daily_returns = (
+            np.diff(values) / values[:-1] if len(values) > 1 else np.array([0.0])
+        )
 
         # Sharpe ratio (annualized)
         if len(daily_returns) > 1 and np.std(daily_returns) > 0:
-            sharpe = float(np.mean(daily_returns) / np.std(daily_returns, ddof=1) * np.sqrt(252))
+            sharpe = float(
+                np.mean(daily_returns) / np.std(daily_returns, ddof=1) * np.sqrt(252)
+            )
         else:
             sharpe = 0.0
 
@@ -381,10 +393,11 @@ class PortfolioSimulator:
         sector_counts: dict[str, int] = {}
         for cp in self.closed_positions:
             sector_counts[cp["sector"]] = sector_counts.get(cp["sector"], 0) + 1
-        sector_concentration = {
-            s: c / len(self.closed_positions) * 100
-            for s, c in sector_counts.items()
-        } if self.closed_positions else {}
+        sector_concentration = (
+            {s: c / len(self.closed_positions) * 100 for s, c in sector_counts.items()}
+            if self.closed_positions
+            else {}
+        )
 
         # SPY comparison
         spy_return = None
@@ -395,7 +408,9 @@ class PortfolioSimulator:
             spy_start = spy_series[spy_series.index <= start_ts]
             spy_end = spy_series[spy_series.index <= end_ts]
             if not spy_start.empty and not spy_end.empty:
-                spy_return = (float(spy_end.iloc[-1]) / float(spy_start.iloc[-1]) - 1) * 100
+                spy_return = (
+                    float(spy_end.iloc[-1]) / float(spy_start.iloc[-1]) - 1
+                ) * 100
 
         return {
             "total_return_pct": round(total_return, 2),

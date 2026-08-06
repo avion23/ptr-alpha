@@ -20,43 +20,58 @@ _MAX_SINGLE_LETTER_LEN = 4
 # Single-letter patterns removed — they caused false skips on transaction
 # lines like "TripleBlind..." (starts with T) and "Treasury..." (starts with T).
 _SKIP_PREFIXES = (
-    'ID', 'Owner', 'Asset', 'Transaction', 'Date', 'Type',
-    'Notification', 'Amount', 'Cap.', 'Gains', 'CERTIFY',
-    'I CERTIFY', 'Digitally', 'Filing', 'Clerk', 'PERIODIC',
-    'Name:', 'Status:', 'State/District:',
+    "ID",
+    "Owner",
+    "Asset",
+    "Transaction",
+    "Date",
+    "Type",
+    "Notification",
+    "Amount",
+    "Cap.",
+    "Gains",
+    "CERTIFY",
+    "I CERTIFY",
+    "Digitally",
+    "Filing",
+    "Clerk",
+    "PERIODIC",
+    "Name:",
+    "Status:",
+    "State/District:",
 )
-_SKIP_EXACT = {'ID', 'F', 'I', 'P', 'T', 'R', 'Cap.', 'Gains', 'CERTIFY'}
+_SKIP_EXACT = {"ID", "F", "I", "P", "T", "R", "Cap.", "Gains", "CERTIFY"}
 
 # Transaction type pattern (shared by both regex flavors)
-_TX_TYPE = r'(?:S|P|E)(?:\s*\(partial\))?'
+_TX_TYPE = r"(?:S|P|E)(?:\s*\(partial\))?"
 # Amount pattern (handles split amounts across lines)
-_AMOUNT = r'(?:\$[\d,]+(?:\s*-\s*(?:\$[\d,]+)?)?|[\-]+\$[\d,]+)'
+_AMOUNT = r"(?:\$[\d,]+(?:\s*-\s*(?:\$[\d,]+)?)?|[\-]+\$[\d,]+)"
 
 _TX_WITH_OWNER = re.compile(
-    r'^\s{2,}'
-    r'(SP|DC|JT|J|S)\s+'         # House owner code
-    r'(.+?)\s+'                  # asset name
-    rf'({_TX_TYPE})\s+'          # type
-    r'(\d{2}/\d{2}/\d{4})\s+'    # tx date
-    r'(\d{2}/\d{2}/\d{4})\s+'    # notif date
-    rf'({_AMOUNT})'              # amount
+    r"^\s{2,}"
+    r"(SP|DC|JT|J|S)\s+"  # House owner code
+    r"(.+?)\s+"  # asset name
+    rf"({_TX_TYPE})\s+"  # type
+    r"(\d{2}/\d{2}/\d{4})\s+"  # tx date
+    r"(\d{2}/\d{2}/\d{4})\s+"  # notif date
+    rf"({_AMOUNT})"  # amount
 )
 
 _TX_NO_OWNER = re.compile(
-    r'^\s{0,30}'
-    r'(.+?)\s+'                  # asset name
-    rf'({_TX_TYPE})\s+'          # type
-    r'(\d{2}/\d{2}/\d{4})\s+'    # tx date
-    r'(\d{2}/\d{2}/\d{4})\s+'    # notif date
-    rf'({_AMOUNT})'              # amount
+    r"^\s{0,30}"
+    r"(.+?)\s+"  # asset name
+    rf"({_TX_TYPE})\s+"  # type
+    r"(\d{2}/\d{2}/\d{4})\s+"  # tx date
+    r"(\d{2}/\d{2}/\d{4})\s+"  # notif date
+    rf"({_AMOUNT})"  # amount
 )
 
-_TX_CODE_INLINE = re.compile(r'\b(?:S|P|E)(?:\s*\(partial\))?\b')
-_TICKER_PARENS = re.compile(r'\([A-Za-z][A-Za-z0-9.\-]{0,5}\)')
-_OWNER_TX_HEAD = re.compile(r'^[A-Z]{1,4}\s+\S')
-_OWNER_PREFIX = re.compile(r'^[A-Z]{1,4}\s+\S')
-_AMOUNT_CONTINUATION = re.compile(r'\$[\d,]+\s*$')
-_SOURCE_ACCOUNT = re.compile(r'^S\s+O\s*:\s*(.+)$')
+_TX_CODE_INLINE = re.compile(r"\b(?:S|P|E)(?:\s*\(partial\))?\b")
+_TICKER_PARENS = re.compile(r"\([A-Za-z][A-Za-z0-9.\-]{0,5}\)")
+_OWNER_TX_HEAD = re.compile(r"^[A-Z]{1,4}\s+\S")
+_OWNER_PREFIX = re.compile(r"^[A-Z]{1,4}\s+\S")
+_AMOUNT_CONTINUATION = re.compile(r"\$[\d,]+\s*$")
+_SOURCE_ACCOUNT = re.compile(r"^S\s+O\s*:\s*(.+)$")
 
 
 def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
@@ -69,20 +84,25 @@ def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
     if text is None:
         return []
 
-    lines = text.split('\n')
+    lines = text.split("\n")
     transactions = _parse_pdftotext_lines(lines)
     if not transactions:
         return []
 
-    table = [['Asset Name', 'Owner', 'Transaction Type', 'Transaction Date', 'Amount']] + transactions
+    table = [
+        ["Asset Name", "Owner", "Transaction Type", "Transaction Date", "Amount"]
+    ] + transactions
     return [table]
 
 
 def _run_pdftotext(pdf_path: Path) -> str | None:
     try:
         result = subprocess.run(  # nosec B603 B607
-            ['pdftotext', '-layout', str(pdf_path), '-'],
-            capture_output=True, text=True, errors='replace', timeout=_PDFTOTEXT_TIMEOUT
+            ["pdftotext", "-layout", str(pdf_path), "-"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_PDFTOTEXT_TIMEOUT,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
@@ -131,7 +151,9 @@ def _is_skip_line(line: str) -> bool:
     return any(stripped.startswith(s) for s in _SKIP_PREFIXES)
 
 
-def _try_match_with_owner(line: str, i: int, lines: list[str]) -> tuple[str, str, str, str, str, int] | None:
+def _try_match_with_owner(
+    line: str, i: int, lines: list[str]
+) -> tuple[str, str, str, str, str, int] | None:
     m = _TX_WITH_OWNER.match(line)
     if not m:
         return None
@@ -141,7 +163,9 @@ def _try_match_with_owner(line: str, i: int, lines: list[str]) -> tuple[str, str
     return asset, owner, tx_type, tx_date, amount, j
 
 
-def _try_match_no_owner(line: str, i: int, lines: list[str]) -> tuple[str, str, str, str, str, int] | None:
+def _try_match_no_owner(
+    line: str, i: int, lines: list[str]
+) -> tuple[str, str, str, str, str, int] | None:
     m = _TX_NO_OWNER.match(line)
     if not m:
         return None
@@ -164,8 +188,7 @@ def _collect_transaction_continuations(
         if embedded_high:
             amount = f"{amount.rstrip()} {embedded_high.group(1)}"
             asset = (
-                asset[: embedded_high.start()]
-                + asset[embedded_high.end() :]
+                asset[: embedded_high.start()] + asset[embedded_high.end() :]
             ).strip()
     account = None
     while j < len(lines):
@@ -186,7 +209,9 @@ def _collect_transaction_continuations(
     return asset, amount, j
 
 
-def _collect_asset_continuation(asset: str, start: int, lines: list[str]) -> tuple[str, int]:
+def _collect_asset_continuation(
+    asset: str, start: int, lines: list[str]
+) -> tuple[str, int]:
     """Fold continuation lines (e.g. 'Stock (NVDA) [ST]', '[GS]' markers) into the asset name.
 
     Stops on the next transaction header (owner + tx code) or numeric date line.
@@ -199,11 +224,11 @@ def _collect_asset_continuation(asset: str, start: int, lines: list[str]) -> tup
             break
         if _is_new_tx_header(next_line):
             break
-        if re.match(r'^\[', next_line) or re.match(r'^\d', next_line):
-            asset += ' ' + next_line
+        if re.match(r"^\[", next_line) or re.match(r"^\d", next_line):
+            asset += " " + next_line
             j += 1
         elif _TICKER_PARENS.search(next_line):
-            asset += ' ' + next_line
+            asset += " " + next_line
             j += 1
         else:
             break

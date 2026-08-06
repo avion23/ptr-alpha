@@ -177,7 +177,9 @@ class Database:
         }
         for column, column_type in required_columns.items():
             if column not in existing_columns:
-                self.conn.execute(f"ALTER TABLE transactions ADD COLUMN {column} {column_type}")
+                self.conn.execute(
+                    f"ALTER TABLE transactions ADD COLUMN {column} {column_type}"
+                )
 
         self.conn.execute("""
             UPDATE transactions
@@ -239,7 +241,9 @@ class Database:
     def get_transactions(self, year: int) -> pd.DataFrame:
         return self.transactions.get_by_year(year)
 
-    def get_transactions_by_date_range(self, start_date: date, end_date: date) -> pd.DataFrame:
+    def get_transactions_by_date_range(
+        self, start_date: date, end_date: date
+    ) -> pd.DataFrame:
         return self.transactions.get_by_date_range(start_date, end_date)
 
     def delete_transactions_for_doc(self, doc_id: str) -> None:
@@ -257,10 +261,14 @@ class Database:
     def upsert_prices(self, df: pd.DataFrame) -> None:
         self.prices.upsert(df)
 
-    def get_prices(self, tickers: list[str], start_date: date, end_date: date) -> pd.DataFrame:
+    def get_prices(
+        self, tickers: list[str], start_date: date, end_date: date
+    ) -> pd.DataFrame:
         return self.prices.get(tickers, start_date, end_date)
 
-    def get_missing_price_data(self, tickers: list[str], start_date: date, end_date: date) -> tuple[list[str], list[pd.Timestamp]]:
+    def get_missing_price_data(
+        self, tickers: list[str], start_date: date, end_date: date
+    ) -> tuple[list[str], list[pd.Timestamp]]:
         return self.prices.get_missing(tickers, start_date, end_date)
 
     def get_entry_prices(
@@ -271,7 +279,13 @@ class Database:
         max_staleness_days: int = 30,
         resolver: TickerResolver | None = None,
     ) -> pd.DataFrame:
-        return self.prices.get_entry_prices(tickers, start_date, end_date, max_staleness_days=max_staleness_days, resolver=resolver)
+        return self.prices.get_entry_prices(
+            tickers,
+            start_date,
+            end_date,
+            max_staleness_days=max_staleness_days,
+            resolver=resolver,
+        )
 
     def upsert_parse_run(
         self,

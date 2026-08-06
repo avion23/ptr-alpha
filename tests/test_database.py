@@ -8,21 +8,39 @@ from .conftest import DatabaseTestCase
 
 
 class TestMetadata(DatabaseTestCase):
-
     def test_replace_metadata_is_atomic_and_removes_stale_rows(self):
-        old = pd.DataFrame([
-            {"doc_id": "old", "first_name": "Old", "last_name": "Row",
-             "filing_date": datetime(2024, 1, 1), "filing_type": "P",
-             "fetched_at": datetime(2024, 1, 2)},
-            {"doc_id": "other-year", "first_name": "Other", "last_name": "Row",
-             "filing_date": datetime(2023, 1, 1), "filing_type": "P",
-             "fetched_at": datetime(2023, 1, 2)},
-        ])
-        fresh = pd.DataFrame([
-            {"doc_id": "fresh", "first_name": "Fresh", "last_name": "Row",
-             "filing_date": datetime(2024, 2, 1), "filing_type": "P",
-             "fetched_at": datetime(2024, 2, 2)},
-        ])
+        old = pd.DataFrame(
+            [
+                {
+                    "doc_id": "old",
+                    "first_name": "Old",
+                    "last_name": "Row",
+                    "filing_date": datetime(2024, 1, 1),
+                    "filing_type": "P",
+                    "fetched_at": datetime(2024, 1, 2),
+                },
+                {
+                    "doc_id": "other-year",
+                    "first_name": "Other",
+                    "last_name": "Row",
+                    "filing_date": datetime(2023, 1, 1),
+                    "filing_type": "P",
+                    "fetched_at": datetime(2023, 1, 2),
+                },
+            ]
+        )
+        fresh = pd.DataFrame(
+            [
+                {
+                    "doc_id": "fresh",
+                    "first_name": "Fresh",
+                    "last_name": "Row",
+                    "filing_date": datetime(2024, 2, 1),
+                    "filing_type": "P",
+                    "fetched_at": datetime(2024, 2, 2),
+                },
+            ]
+        )
         self.db.upsert_metadata(old)
 
         self.db.replace_metadata(2024, fresh)
@@ -31,24 +49,26 @@ class TestMetadata(DatabaseTestCase):
         self.assertEqual(self.db.get_metadata(2023)["DocID"].tolist(), ["other-year"])
 
     def test_upsert_and_get_metadata_round_trip(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "first_name": "John",
-                "last_name": "Doe",
-                "filing_date": datetime(2024, 3, 15, 12, 0, 0),
-                "filing_type": "F1",
-                "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
-            },
-            {
-                "doc_id": "doc2",
-                "first_name": "Jane",
-                "last_name": "Smith",
-                "filing_date": datetime(2024, 6, 20, 14, 0, 0),
-                "filing_type": "F2",
-                "fetched_at": datetime(2024, 6, 21, 9, 0, 0),
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "first_name": "John",
+                    "last_name": "Doe",
+                    "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "filing_type": "F1",
+                    "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
+                },
+                {
+                    "doc_id": "doc2",
+                    "first_name": "Jane",
+                    "last_name": "Smith",
+                    "filing_date": datetime(2024, 6, 20, 14, 0, 0),
+                    "filing_type": "F2",
+                    "fetched_at": datetime(2024, 6, 21, 9, 0, 0),
+                },
+            ]
+        )
         self.db.upsert_metadata(df)
         result = self.db.get_metadata(2024)
         self.assertEqual(len(result), 2)
@@ -60,26 +80,30 @@ class TestMetadata(DatabaseTestCase):
         self.assertEqual(row_doc2["Last"], "Smith")
 
     def test_upsert_metadata_conflict_updates(self):
-        df1 = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "first_name": "John",
-                "last_name": "Doe",
-                "filing_date": datetime(2024, 3, 15, 12, 0, 0),
-                "filing_type": "F1",
-                "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
-            },
-        ])
-        df2 = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "first_name": "Jonathan",
-                "last_name": "Doe",
-                "filing_date": datetime(2024, 3, 15, 12, 0, 0),
-                "filing_type": "F1-AMENDED",
-                "fetched_at": datetime(2024, 3, 17, 10, 0, 0),
-            },
-        ])
+        df1 = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "first_name": "John",
+                    "last_name": "Doe",
+                    "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "filing_type": "F1",
+                    "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
+                },
+            ]
+        )
+        df2 = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "first_name": "Jonathan",
+                    "last_name": "Doe",
+                    "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "filing_type": "F1-AMENDED",
+                    "fetched_at": datetime(2024, 3, 17, 10, 0, 0),
+                },
+            ]
+        )
         self.db.upsert_metadata(df1)
         self.db.upsert_metadata(df2)
         result = self.db.get_metadata(2024)
@@ -88,16 +112,18 @@ class TestMetadata(DatabaseTestCase):
         self.assertEqual(result.iloc[0]["FilingType"], "F1-AMENDED")
 
     def test_metadata_exists_returns_true_when_present(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "first_name": "John",
-                "last_name": "Doe",
-                "filing_date": datetime(2024, 3, 15, 12, 0, 0),
-                "filing_type": "F1",
-                "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "first_name": "John",
+                    "last_name": "Doe",
+                    "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "filing_type": "F1",
+                    "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
+                },
+            ]
+        )
         self.db.upsert_metadata(df)
         self.assertTrue(self.db.metadata_exists(2024))
 
@@ -105,24 +131,26 @@ class TestMetadata(DatabaseTestCase):
         self.assertFalse(self.db.metadata_exists(2024))
 
     def test_clear_metadata_removes_records(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "first_name": "John",
-                "last_name": "Doe",
-                "filing_date": datetime(2024, 3, 15, 12, 0, 0),
-                "filing_type": "F1",
-                "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
-            },
-            {
-                "doc_id": "doc2",
-                "first_name": "Jane",
-                "last_name": "Smith",
-                "filing_date": datetime(2023, 6, 20, 14, 0, 0),
-                "filing_type": "F2",
-                "fetched_at": datetime(2023, 6, 21, 9, 0, 0),
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "first_name": "John",
+                    "last_name": "Doe",
+                    "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "filing_type": "F1",
+                    "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
+                },
+                {
+                    "doc_id": "doc2",
+                    "first_name": "Jane",
+                    "last_name": "Smith",
+                    "filing_date": datetime(2023, 6, 20, 14, 0, 0),
+                    "filing_type": "F2",
+                    "fetched_at": datetime(2023, 6, 21, 9, 0, 0),
+                },
+            ]
+        )
         self.db.upsert_metadata(df)
         self.assertTrue(self.db.metadata_exists(2024))
         self.assertTrue(self.db.metadata_exists(2023))
@@ -132,38 +160,45 @@ class TestMetadata(DatabaseTestCase):
 
 
 class TestTransactions(DatabaseTestCase):
-
     def test_upsert_and_get_transactions_round_trip(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Buy",
-                "owner_code": "DC",
-                "amount_raw": "$1,001 - $15,000",
-                "amount_midpoint": 8000.5,
-            },
-            {
-                "doc_id": "doc2",
-                "member": "Jane Smith",
-                "ticker": "MSFT",
-                "transaction_date": date(2024, 5, 5),
-                "disclosure_date": date(2024, 5, 10),
-                "transaction_type": "Sell",
-                "owner_code": None,
-                "amount_raw": "$15,001 - $50,000",
-                "amount_midpoint": 32500.5,
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Buy",
+                    "owner_code": "DC",
+                    "amount_raw": "$1,001 - $15,000",
+                    "amount_midpoint": 8000.5,
+                },
+                {
+                    "doc_id": "doc2",
+                    "member": "Jane Smith",
+                    "ticker": "MSFT",
+                    "transaction_date": date(2024, 5, 5),
+                    "disclosure_date": date(2024, 5, 10),
+                    "transaction_type": "Sell",
+                    "owner_code": None,
+                    "amount_raw": "$15,001 - $50,000",
+                    "amount_midpoint": 32500.5,
+                },
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2)
         cols = {
-            "member", "ticker", "transaction_date", "disclosure_date", "transaction_type",
-            "owner_code", "amount_raw", "amount_midpoint",
+            "member",
+            "ticker",
+            "transaction_date",
+            "disclosure_date",
+            "transaction_type",
+            "owner_code",
+            "amount_raw",
+            "amount_midpoint",
         }
         self.assertTrue(cols.issubset(set(result.columns)))
         aapl = result[result["ticker"] == "AAPL"].iloc[0]
@@ -171,16 +206,18 @@ class TestTransactions(DatabaseTestCase):
         self.assertAlmostEqual(aapl["amount_midpoint"], 8000.5)
 
     def test_transactions_exist_returns_true_when_present(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Buy",
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Buy",
+                },
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         self.assertTrue(self.db.transactions_exist(2024))
 
@@ -188,24 +225,26 @@ class TestTransactions(DatabaseTestCase):
         self.assertFalse(self.db.transactions_exist(2024))
 
     def test_upsert_preserves_buy_and_sell_same_ticker_same_date(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Purchase",
-            },
-            {
-                "doc_id": "doc1",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Sale",
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "doc_id": "doc1",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Sale",
+                },
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2)
@@ -213,17 +252,21 @@ class TestTransactions(DatabaseTestCase):
         self.assertEqual(types, {"Purchase", "Sale"})
 
     def test_upsert_dedupes_repeated_null_ticker_rows(self):
-        df = pd.DataFrame([{
-            "doc_id": "doc-null",
-            "member": "John Doe",
-            "ticker": None,
-            "transaction_date": date(2024, 3, 10),
-            "disclosure_date": date(2024, 3, 15),
-            "transaction_type": "Purchase",
-            "amount_raw": "$1,001 - $15,000",
-            "owner_code": None,
-            "asset_description": "Corporate bond",
-        }])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-null",
+                    "member": "John Doe",
+                    "ticker": None,
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Purchase",
+                    "amount_raw": "$1,001 - $15,000",
+                    "owner_code": None,
+                    "asset_description": "Corporate bond",
+                }
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         self.db.upsert_transactions(df, source="house_pdf")
 
@@ -233,46 +276,54 @@ class TestTransactions(DatabaseTestCase):
         self.assertIsNone(ticker)
 
     def test_upsert_keeps_distinct_null_ticker_asset_descriptions(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc-null-assets",
-                "member": "John Doe",
-                "ticker": None,
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Purchase",
-                "amount_raw": "$1,001 - $15,000",
-                "asset_description": "Municipal bond A",
-            },
-            {
-                "doc_id": "doc-null-assets",
-                "member": "John Doe",
-                "ticker": None,
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Purchase",
-                "amount_raw": "$1,001 - $15,000",
-                "asset_description": "Municipal bond B",
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-null-assets",
+                    "member": "John Doe",
+                    "ticker": None,
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Purchase",
+                    "amount_raw": "$1,001 - $15,000",
+                    "asset_description": "Municipal bond A",
+                },
+                {
+                    "doc_id": "doc-null-assets",
+                    "member": "John Doe",
+                    "ticker": None,
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Purchase",
+                    "amount_raw": "$1,001 - $15,000",
+                    "asset_description": "Municipal bond B",
+                },
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
 
         descriptions = self.db.conn.execute(
             "SELECT asset_description FROM transactions ORDER BY asset_description"
         ).fetchall()
-        self.assertEqual([row[0] for row in descriptions], ["Municipal bond A", "Municipal bond B"])
+        self.assertEqual(
+            [row[0] for row in descriptions], ["Municipal bond A", "Municipal bond B"]
+        )
 
     def test_upsert_writes_source_and_keeps_distinct_asset_descriptions(self):
-        df1 = pd.DataFrame([{
-            "doc_id": "doc-source",
-            "member": "Jane Doe",
-            "ticker": "AAPL",
-            "transaction_date": date(2024, 4, 1),
-            "disclosure_date": date(2024, 4, 5),
-            "transaction_type": "Purchase",
-            "amount_raw": "$1,001 - $15,000",
-            "asset_description": "Apple Inc",
-        }])
+        df1 = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-source",
+                    "member": "Jane Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 4, 1),
+                    "disclosure_date": date(2024, 4, 5),
+                    "transaction_type": "Purchase",
+                    "amount_raw": "$1,001 - $15,000",
+                    "asset_description": "Apple Inc",
+                }
+            ]
+        )
         df2 = df1.copy()
         df2["asset_description"] = "Apple Inc updated"
 
@@ -282,19 +333,25 @@ class TestTransactions(DatabaseTestCase):
         rows = self.db.conn.execute(
             "SELECT source, asset_description FROM transactions WHERE doc_id = 'doc-source' ORDER BY asset_description"
         ).fetchall()
-        self.assertEqual(rows, [("house_pdf", "Apple Inc"), ("capitol_trades", "Apple Inc updated")])
+        self.assertEqual(
+            rows, [("house_pdf", "Apple Inc"), ("capitol_trades", "Apple Inc updated")]
+        )
 
     def test_upsert_identical_asset_description_is_idempotent(self):
-        df = pd.DataFrame([{
-            "doc_id": "doc-idempotent-asset",
-            "member": "Jane Doe",
-            "ticker": "AAPL",
-            "transaction_date": date(2024, 4, 1),
-            "disclosure_date": date(2024, 4, 5),
-            "transaction_type": "Purchase",
-            "amount_raw": "$1,001 - $15,000",
-            "asset_description": "Apple Inc",
-        }])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-idempotent-asset",
+                    "member": "Jane Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 4, 1),
+                    "disclosure_date": date(2024, 4, 5),
+                    "transaction_type": "Purchase",
+                    "amount_raw": "$1,001 - $15,000",
+                    "asset_description": "Apple Inc",
+                }
+            ]
+        )
 
         self.db.upsert_transactions(df, source="house_pdf")
         self.db.upsert_transactions(df, source="house_pdf")
@@ -305,42 +362,46 @@ class TestTransactions(DatabaseTestCase):
         self.assertEqual(count, 1)
 
     def test_count_transactions_for_docs_returns_counts_by_doc_id(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc-count-1",
-                "member": "Jane Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 4, 1),
-                "disclosure_date": date(2024, 4, 5),
-                "transaction_type": "Purchase",
-                "amount_raw": "$1,001 - $15,000",
-            },
-            {
-                "doc_id": "doc-count-1",
-                "member": "Jane Doe",
-                "ticker": "MSFT",
-                "transaction_date": date(2024, 4, 2),
-                "disclosure_date": date(2024, 4, 5),
-                "transaction_type": "Sale",
-                "amount_raw": "$1,001 - $15,000",
-            },
-            {
-                "doc_id": "doc-count-2",
-                "member": "John Doe",
-                "ticker": "GOOG",
-                "transaction_date": date(2024, 4, 3),
-                "disclosure_date": date(2024, 4, 5),
-                "transaction_type": "Purchase",
-                "amount_raw": "$1,001 - $15,000",
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-count-1",
+                    "member": "Jane Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 4, 1),
+                    "disclosure_date": date(2024, 4, 5),
+                    "transaction_type": "Purchase",
+                    "amount_raw": "$1,001 - $15,000",
+                },
+                {
+                    "doc_id": "doc-count-1",
+                    "member": "Jane Doe",
+                    "ticker": "MSFT",
+                    "transaction_date": date(2024, 4, 2),
+                    "disclosure_date": date(2024, 4, 5),
+                    "transaction_type": "Sale",
+                    "amount_raw": "$1,001 - $15,000",
+                },
+                {
+                    "doc_id": "doc-count-2",
+                    "member": "John Doe",
+                    "ticker": "GOOG",
+                    "transaction_date": date(2024, 4, 3),
+                    "disclosure_date": date(2024, 4, 5),
+                    "transaction_type": "Purchase",
+                    "amount_raw": "$1,001 - $15,000",
+                },
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
 
-        counts = self.db.count_transactions_for_docs([
-            "doc-count-1",
-            "doc-count-2",
-            "missing-doc",
-        ])
+        counts = self.db.count_transactions_for_docs(
+            [
+                "doc-count-1",
+                "doc-count-2",
+                "missing-doc",
+            ]
+        )
 
         self.assertEqual(counts, {"doc-count-1": 2, "doc-count-2": 1})
 
@@ -349,15 +410,19 @@ class TestTransactions(DatabaseTestCase):
 
 
 class TestPrices(DatabaseTestCase):
-
     def test_upsert_and_get_prices_round_trip(self):
         dates = pd.date_range("2024-01-01", "2024-01-04", freq="B")
-        price_data = pd.DataFrame({
-            "AAPL": [180.0, 181.0, 182.0, 183.0],
-            "MSFT": [370.0, 371.0, 372.0, 373.0],
-        }, index=dates)
+        price_data = pd.DataFrame(
+            {
+                "AAPL": [180.0, 181.0, 182.0, 183.0],
+                "MSFT": [370.0, 371.0, 372.0, 373.0],
+            },
+            index=dates,
+        )
         self.db.upsert_prices(price_data)
-        result = self.db.get_prices(["AAPL", "MSFT"], date(2024, 1, 1), date(2024, 1, 5))
+        result = self.db.get_prices(
+            ["AAPL", "MSFT"], date(2024, 1, 1), date(2024, 1, 5)
+        )
         self.assertIsInstance(result, pd.DataFrame)
         self.assertIn("AAPL", result.columns)
         self.assertIn("MSFT", result.columns)
@@ -393,7 +458,6 @@ class TestPrices(DatabaseTestCase):
 
 
 class TestGetMissingPriceData(DatabaseTestCase):
-
     def test_missing_tickers_returned_when_no_data(self):
         missing_tickers, missing_dates = self.db.get_missing_price_data(
             ["AAPL", "MSFT"], date(2024, 1, 1), date(2024, 1, 5)
@@ -436,30 +500,29 @@ class TestGetMissingPriceData(DatabaseTestCase):
 
 
 class TestGetEntryPrices(DatabaseTestCase):
-
     def test_asof_join_returns_price_on_disclosure_date(self):
         dates = pd.bdate_range("2024-01-01", "2024-01-10")
         aapl_prices = [150.0 + i for i in range(len(dates))]
         prices = pd.DataFrame({"AAPL": aapl_prices}, index=dates)
         self.db.upsert_prices(prices)
 
-        tx = pd.DataFrame([
-            {
-                "doc_id": "doc-tx1",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 1, 5),
-                "disclosure_date": date(2024, 1, 5),
-                "transaction_type": "Buy",
-                "owner_code": "DC",
-                "amount_midpoint": 8000.5,
-            },
-        ])
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-tx1",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 1, 5),
+                    "disclosure_date": date(2024, 1, 5),
+                    "transaction_type": "Buy",
+                    "owner_code": "DC",
+                    "amount_midpoint": 8000.5,
+                },
+            ]
+        )
         self.db.upsert_transactions(tx, source="house_pdf")
 
-        result = self.db.get_entry_prices(
-            ["AAPL"], date(2024, 1, 1), date(2024, 1, 10)
-        )
+        result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 10))
         self.assertEqual(len(result), 1)
         disclosure_jan5 = pd.Timestamp("2024-01-05")
         idx_5 = list(dates).index(disclosure_jan5)
@@ -474,21 +537,21 @@ class TestGetEntryPrices(DatabaseTestCase):
         prices = pd.DataFrame({"AAPL": aapl_prices}, index=dates)
         self.db.upsert_prices(prices)
 
-        tx = pd.DataFrame([
-            {
-                "doc_id": "doc-tx2",
-                "member": "Jane Smith",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 1, 6),
-                "disclosure_date": date(2024, 1, 7),
-                "transaction_type": "Sell",
-            },
-        ])
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-tx2",
+                    "member": "Jane Smith",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 1, 6),
+                    "disclosure_date": date(2024, 1, 7),
+                    "transaction_type": "Sell",
+                },
+            ]
+        )
         self.db.upsert_transactions(tx, source="house_pdf")
 
-        result = self.db.get_entry_prices(
-            ["AAPL"], date(2024, 1, 1), date(2024, 1, 10)
-        )
+        result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 10))
         self.assertEqual(len(result), 1)
         self.assertAlmostEqual(result.iloc[0]["entry_price"], 153.0)
 
@@ -500,9 +563,7 @@ class TestGetEntryPrices(DatabaseTestCase):
         dates = pd.bdate_range("2024-01-01", "2024-01-10")
         prices = pd.DataFrame({"AAPL": range(len(dates))}, index=dates)
         self.db.upsert_prices(prices)
-        result = self.db.get_entry_prices(
-            ["AAPL"], date(2024, 1, 1), date(2024, 1, 10)
-        )
+        result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 10))
         self.assertTrue(result.empty)
 
     def test_get_entry_prices_filters_by_date_range(self):
@@ -510,46 +571,52 @@ class TestGetEntryPrices(DatabaseTestCase):
         prices = pd.DataFrame({"AAPL": range(len(dates))}, index=dates)
         self.db.upsert_prices(prices)
 
-        tx = pd.DataFrame([
-            {
-                "doc_id": "doc-tx3",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 1, 5),
-                "disclosure_date": date(2024, 1, 5),
-                "transaction_type": "Buy",
-            },
-            {
-                "doc_id": "doc-tx4",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 1, 15),
-                "disclosure_date": date(2024, 1, 15),
-                "transaction_type": "Buy",
-            },
-        ])
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-tx3",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 1, 5),
+                    "disclosure_date": date(2024, 1, 5),
+                    "transaction_type": "Buy",
+                },
+                {
+                    "doc_id": "doc-tx4",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 1, 15),
+                    "disclosure_date": date(2024, 1, 15),
+                    "transaction_type": "Buy",
+                },
+            ]
+        )
         self.db.upsert_transactions(tx, source="house_pdf")
 
-        result = self.db.get_entry_prices(
-            ["AAPL"], date(2024, 1, 1), date(2024, 1, 10)
-        )
+        result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 10))
         self.assertEqual(len(result), 1)
 
     def test_get_entry_prices_filters_stale_prices(self):
         # Transaction disclosure is 2024-06-01, last price before that is 2024-01-05
         # That's ~147 days stale — should be filtered with max_staleness_days=30
         early_prices = pd.bdate_range("2024-01-01", "2024-01-10")
-        early_price_data = pd.DataFrame({"AAPL": [100.0 + i for i in range(len(early_prices))]}, index=early_prices)
+        early_price_data = pd.DataFrame(
+            {"AAPL": [100.0 + i for i in range(len(early_prices))]}, index=early_prices
+        )
         self.db.upsert_prices(early_price_data)
 
-        tx = pd.DataFrame([{
-            "doc_id": "doc-stale",
-            "member": "Alice",
-            "ticker": "AAPL",
-            "transaction_date": date(2024, 5, 25),
-            "disclosure_date": date(2024, 6, 1),
-            "transaction_type": "Purchase",
-        }])
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-stale",
+                    "member": "Alice",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 5, 25),
+                    "disclosure_date": date(2024, 6, 1),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
         self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
@@ -559,17 +626,23 @@ class TestGetEntryPrices(DatabaseTestCase):
 
     def test_get_entry_prices_keeps_fresh_prices(self):
         dates = pd.bdate_range("2024-01-01", "2024-01-31")
-        price_data = pd.DataFrame({"AAPL": [100.0 + i for i in range(len(dates))]}, index=dates)
+        price_data = pd.DataFrame(
+            {"AAPL": [100.0 + i for i in range(len(dates))]}, index=dates
+        )
         self.db.upsert_prices(price_data)
 
-        tx = pd.DataFrame([{
-            "doc_id": "doc-fresh",
-            "member": "Alice",
-            "ticker": "AAPL",
-            "transaction_date": date(2024, 1, 25),
-            "disclosure_date": date(2024, 1, 28),
-            "transaction_type": "Purchase",
-        }])
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-fresh",
+                    "member": "Alice",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 1, 25),
+                    "disclosure_date": date(2024, 1, 28),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
         self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
@@ -580,26 +653,27 @@ class TestGetEntryPrices(DatabaseTestCase):
 
 
 class TestDeleteTransactionsForDoc(DatabaseTestCase):
-
     def test_delete_removes_only_that_docs_rows(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Purchase",
-            },
-            {
-                "doc_id": "doc2",
-                "member": "Jane Smith",
-                "ticker": "GOOG",
-                "transaction_date": date(2024, 4, 1),
-                "disclosure_date": date(2024, 4, 5),
-                "transaction_type": "Sale",
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "doc_id": "doc2",
+                    "member": "Jane Smith",
+                    "ticker": "GOOG",
+                    "transaction_date": date(2024, 4, 1),
+                    "disclosure_date": date(2024, 4, 5),
+                    "transaction_type": "Sale",
+                },
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         self.assertEqual(len(self.db.get_transactions(2024)), 2)
 
@@ -609,23 +683,24 @@ class TestDeleteTransactionsForDoc(DatabaseTestCase):
         self.assertEqual(result.iloc[0]["ticker"], "GOOG")
 
     def test_delete_nonexistent_doc_is_noop(self):
-        df = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Purchase",
-            },
-        ])
+        df = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc1",
+                    "member": "John Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 3, 10),
+                    "disclosure_date": date(2024, 3, 15),
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
         self.db.upsert_transactions(df, source="house_pdf")
         self.db.delete_transactions_for_doc("nonexistent")
         self.assertEqual(len(self.db.get_transactions(2024)), 1)
 
 
 class TestParseRunsTable(DatabaseTestCase):
-
     def test_upsert_parse_run_zero_rows_status(self):
         self.db.upsert_parse_run(
             doc_id="doc2",
@@ -636,7 +711,9 @@ class TestParseRunsTable(DatabaseTestCase):
             raw_row_count=0,
             transaction_count=0,
         )
-        result = self.db.conn.execute("SELECT status FROM pdf_parse_runs WHERE doc_id = 'doc2'").fetchone()
+        result = self.db.conn.execute(
+            "SELECT status FROM pdf_parse_runs WHERE doc_id = 'doc2'"
+        ).fetchone()
         self.assertEqual(result[0], "zero_rows")
 
     def test_upsert_parse_run_error_status(self):
@@ -657,15 +734,17 @@ class TestParseRunsTable(DatabaseTestCase):
 
 
 class TestPhantomPurge(DatabaseTestCase):
-
     def _insert_transaction(self, doc_id, ticker, asset_description):
-        self.db.conn.execute("""
+        self.db.conn.execute(
+            """
             INSERT INTO transactions (
                 doc_id, member, ticker, transaction_date, disclosure_date,
                 transaction_type, owner_code, amount_raw, asset_description, source
             ) VALUES (?, 'John Doe', ?, DATE '2024-03-10', DATE '2024-03-15',
                       'Purchase', '', '$1,001 - $15,000', ?, 'house_pdf')
-        """, [doc_id, ticker, asset_description])
+        """,
+            [doc_id, ticker, asset_description],
+        )
 
     def test_purge_script_dry_run_counts_and_execute_deletes_duplicates(self):
         self._insert_transaction("doc-null-dupe", None, "Bond A")
@@ -679,7 +758,9 @@ class TestPhantomPurge(DatabaseTestCase):
         stats = purge_phantom_rows(self.db.conn)
         self.assertEqual(stats, {"before": 4, "deleted": 1, "after": 3})
         self.assertEqual(count_phantom_rows(self.db.conn), {})
-        remaining = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        remaining = self.db.conn.execute(
+            "SELECT COUNT(*) FROM transactions"
+        ).fetchone()[0]
         self.assertEqual(remaining, 3)
 
 

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # ── Per-PDF worker: cascades 5 PDF engines until transactions are found ─
 
+
 def _is_valid_pdf(path: Path) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
@@ -31,8 +32,7 @@ def _result_quality(txs: list[dict]) -> float:
     if not txs:
         return 0.0
     valid = sum(
-        1 for tx in txs
-        if tx.get("transaction_date") and tx.get("amount_midpoint")
+        1 for tx in txs if tx.get("transaction_date") and tx.get("amount_midpoint")
     )
     return valid / len(txs)
 
@@ -123,7 +123,12 @@ def _try_camelot_lattice(pdf_path: Path) -> list[dict]:
                     ocr_rows = _parse_ocr_text_to_rows(cell_text)
                     if ocr_rows:
                         ocr_table = [
-                            ['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']
+                            [
+                                "Asset Name",
+                                "Transaction Type",
+                                "Transaction Date",
+                                "Amount",
+                            ]
                         ] + ocr_rows
                         txs.extend(parse_pdf_table(ocr_table))
         else:

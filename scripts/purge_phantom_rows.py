@@ -42,7 +42,8 @@ VICTIMS_CTE = """
 
 def count_phantom_rows(conn: duckdb.DuckDBPyConnection) -> dict[bool, int]:
     rows = conn.execute(
-        VICTIMS_CTE + """
+        VICTIMS_CTE
+        + """
         SELECT ticker_is_null, COUNT(*)
         FROM victims
         GROUP BY ticker_is_null
@@ -59,7 +60,8 @@ def purge_phantom_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
     before = before_row[0]
     deleted = sum(count_phantom_rows(conn).values())
     conn.execute(
-        VICTIMS_CTE + """
+        VICTIMS_CTE
+        + """
         DELETE FROM transactions
         WHERE id IN (SELECT id FROM victims)
         """

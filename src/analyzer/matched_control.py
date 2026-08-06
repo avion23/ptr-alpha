@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 # Data classes
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class MatchedControlResult:
     as_of_date: date
@@ -32,8 +33,12 @@ class MatchedControlResult:
 # Characteristic computation
 # ---------------------------------------------------------------------------
 
+
 def _compute_realized_volatility(
-    prices_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp, window: int = 20,
+    prices_df: pd.DataFrame,
+    ticker: str,
+    as_of_date: pd.Timestamp,
+    window: int = 20,
 ) -> float | None:
     """Realized 20-day volatility (std of daily returns, NOT annualized)."""
     if ticker not in prices_df.columns:
@@ -50,7 +55,10 @@ def _compute_realized_volatility(
 
 
 def _compute_max_drawdown(
-    prices_df: pd.DataFrame, ticker: str, as_of_date: pd.Timestamp, lookback: int = 60,
+    prices_df: pd.DataFrame,
+    ticker: str,
+    as_of_date: pd.Timestamp,
+    lookback: int = 60,
 ) -> float | None:
     """Max drawdown from all-time-high over the last `lookback` days (as a fraction)."""
     if ticker not in prices_df.columns:
@@ -107,6 +115,7 @@ def _market_cap_tier(market_cap: float) -> str:
 # Matching
 # ---------------------------------------------------------------------------
 
+
 def find_matched_controls(
     ticker: str,
     as_of_date: date,
@@ -127,8 +136,14 @@ def find_matched_controls(
         return []
 
     # Treatment characteristics
-    treat_vol = _compute_realized_volatility(prices_df, ticker, as_of_ts) if match_volatility else None
-    treat_dd = _compute_max_drawdown(prices_df, ticker, as_of_ts) if match_drawdown else None
+    treat_vol = (
+        _compute_realized_volatility(prices_df, ticker, as_of_ts)
+        if match_volatility
+        else None
+    )
+    treat_dd = (
+        _compute_max_drawdown(prices_df, ticker, as_of_ts) if match_drawdown else None
+    )
 
     # Sector data
     if sector_data is None:
@@ -146,7 +161,7 @@ def find_matched_controls(
         cand_cap = _market_cap_tier(cand_info.get("market_cap", 0))
 
         # Sector match: hard filter first, relaxed later
-        sector_match = (cand_sector == treat_sector)
+        sector_match = cand_sector == treat_sector
         if match_sector and not sector_match:
             # Allow adjacent (same cap tier) as fallback
             if cand_cap != treat_cap:
@@ -175,7 +190,9 @@ def find_matched_controls(
         # Distance score (lower = better match)
         score = 0.0
         if treat_vol is not None:
-            cand_vol_val = _compute_realized_volatility(prices_df, cand, as_of_ts) or 0.0
+            cand_vol_val = (
+                _compute_realized_volatility(prices_df, cand, as_of_ts) or 0.0
+            )
             score += abs(cand_vol_val - treat_vol)
         if treat_dd is not None:
             cand_dd_val = _compute_max_drawdown(prices_df, cand, as_of_ts) or 0.0
@@ -192,6 +209,7 @@ def find_matched_controls(
 # ---------------------------------------------------------------------------
 # Alpha computation helpers
 # ---------------------------------------------------------------------------
+
 
 def _forward_alpha(
     prices_df: pd.DataFrame,
@@ -213,7 +231,9 @@ def _forward_alpha(
     return_pct = (exit_price / entry - 1) * 100
 
     if spy_start is None:
-        spy_start = _price_at_or_before(prices_df, "SPY", as_of_date, max_staleness_days=30)
+        spy_start = _price_at_or_before(
+            prices_df, "SPY", as_of_date, max_staleness_days=30
+        )
     spy_exit = _price_on_or_before(
         prices_df, "SPY", as_of_date + pd.Timedelta(days=horizon)
     )
@@ -228,6 +248,7 @@ def _forward_alpha(
 # ---------------------------------------------------------------------------
 # Matched-control backtest
 # ---------------------------------------------------------------------------
+
 
 def run_matched_control_backtest(
     signals_df: pd.DataFrame,
@@ -263,7 +284,9 @@ def run_matched_control_backtest(
 
         # Get recommendations using existing backtest logic
         recs = analysis.backtest_recommendations(
-            signals_df, all_tx, as_of_ts,
+            signals_df,
+            all_tx,
+            as_of_ts,
             horizon=horizon,
             lookback_days=lookback_days,
             min_buyers=min_buyers,
@@ -276,21 +299,30 @@ def run_matched_control_backtest(
         if recs.empty:
             continue
 
-        spy_start = analysis._price_at_or_before(prices_df, "SPY", as_of_ts, max_staleness_days=30)
+        spy_start = analysis._price_at_or_before(
+            prices_df, "SPY", as_of_ts, max_staleness_days=30
+        )
 
         for _, rec in recs.iterrows():
             ticker = rec["ticker"]
             rank = rec.get("rank", 0)
 
             # Treatment alpha
-            treat_alpha = _forward_alpha(prices_df, ticker, as_of_ts, horizon, spy_start)
+            treat_alpha = _forward_alpha(
+                prices_df, ticker, as_of_ts, horizon, spy_start
+            )
             if treat_alpha is None:
                 continue
 
             # Find matched controls
             controls = find_matched_controls(
-                ticker, as_of_ts.date(), all_tickers, prices_df, signals_df,
-                n_controls=n_controls, sector_data=sector_data,
+                ticker,
+                as_of_ts.date(),
+                all_tickers,
+                prices_df,
+                signals_df,
+                n_controls=n_controls,
+                sector_data=sector_data,
             )
 
             # Compute control alphas
@@ -311,18 +343,20 @@ def run_matched_control_backtest(
             dd = _compute_max_drawdown(prices_df, ticker, as_of_ts)
             sector = sector_data.get(ticker, {}).get("sector", "Unknown")
 
-            rows.append({
-                "as_of_date": as_of_ts.date(),
-                "ticker": ticker,
-                "rank": rank,
-                "alpha": round(treat_alpha, 2),
-                "excess_alpha": round(excess, 2),
-                "control_mean_alpha": round(control_mean, 2),
-                "n_controls": len(control_alphas),
-                "sector": sector,
-                "volatility": round(vol, 4) if vol is not None else None,
-                "drawdown": round(dd, 4) if dd is not None else None,
-            })
+            rows.append(
+                {
+                    "as_of_date": as_of_ts.date(),
+                    "ticker": ticker,
+                    "rank": rank,
+                    "alpha": round(treat_alpha, 2),
+                    "excess_alpha": round(excess, 2),
+                    "control_mean_alpha": round(control_mean, 2),
+                    "n_controls": len(control_alphas),
+                    "sector": sector,
+                    "volatility": round(vol, 4) if vol is not None else None,
+                    "drawdown": round(dd, 4) if dd is not None else None,
+                }
+            )
 
     return pd.DataFrame(rows)
 
@@ -330,6 +364,7 @@ def run_matched_control_backtest(
 # ---------------------------------------------------------------------------
 # Summary statistics
 # ---------------------------------------------------------------------------
+
 
 def print_matched_control_summary(results: pd.DataFrame) -> None:
     """Print summary statistics for matched-control backtest results."""
@@ -367,26 +402,36 @@ def print_matched_control_summary(results: pd.DataFrame) -> None:
     logger.info("95%% CI (bootstrap):          [%+.2f%%, %+.2f%%]", ci_lower, ci_upper)
     logger.info("%% positive excess alpha:    %.1f%%", pct_positive)
     logger.info("Mean raw treatment alpha:    %+.2f%%", valid["alpha"].mean())
-    logger.info("Mean control group alpha:    %+.2f%%", valid["control_mean_alpha"].mean())
+    logger.info(
+        "Mean control group alpha:    %+.2f%%", valid["control_mean_alpha"].mean()
+    )
     logger.info("Median excess alpha:         %+.2f%%", valid["excess_alpha"].median())
     logger.info("Std excess alpha:            %.2f%%", std_excess)
 
     # By sector
     if "sector" in valid.columns and valid["sector"].nunique() > 1:
         logger.info("--- By Sector ---")
-        sector_summary = valid.groupby("sector").agg(
-            n=("excess_alpha", "size"),
-            mean_excess=("excess_alpha", "mean"),
-            pct_positive=("excess_alpha", lambda x: (x > 0).mean() * 100),
-        ).sort_values("mean_excess", ascending=False)
+        sector_summary = (
+            valid.groupby("sector")
+            .agg(
+                n=("excess_alpha", "size"),
+                mean_excess=("excess_alpha", "mean"),
+                pct_positive=("excess_alpha", lambda x: (x > 0).mean() * 100),
+            )
+            .sort_values("mean_excess", ascending=False)
+        )
         logger.info("%s", sector_summary.to_string())
 
     # By rank
     if "rank" in valid.columns and valid["rank"].nunique() > 1:
         logger.info("--- By Rank ---")
-        rank_summary = valid.groupby("rank").agg(
-            n=("excess_alpha", "size"),
-            mean_excess=("excess_alpha", "mean"),
-            mean_alpha=("alpha", "mean"),
-        ).sort_index()
+        rank_summary = (
+            valid.groupby("rank")
+            .agg(
+                n=("excess_alpha", "size"),
+                mean_excess=("excess_alpha", "mean"),
+                mean_alpha=("alpha", "mean"),
+            )
+            .sort_index()
+        )
         logger.info("%s", rank_summary.to_string())

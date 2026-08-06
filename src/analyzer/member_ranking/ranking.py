@@ -32,7 +32,11 @@ def rank_members(
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")
 
-    bayes_prior = _bayes_prior_strength if _bayes_prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
+    bayes_prior = (
+        _bayes_prior_strength
+        if _bayes_prior_strength is not None
+        else _signals.BAYES_PRIOR_STRENGTH
+    )
 
     return _rank_members_impl(signal_df, horizon, threshold, bayes_prior)
 
@@ -55,7 +59,9 @@ def _prepare_member_data(
 
     purchases = _apply_quality_filter(purchases)
     if purchases.empty:
-        raise AnalysisError(f"No signals survived quality filter (min price ${_signals.MIN_ENTRY_PRICE})")
+        raise AnalysisError(
+            f"No signals survived quality filter (min price ${_signals.MIN_ENTRY_PRICE})"
+        )
 
     return _collapse_to_episodes(purchases)
 
@@ -69,7 +75,11 @@ def _rank_members_impl(
 ) -> pd.DataFrame:
     purchases = _prepare_member_data(signal_df, horizon, threshold)
 
-    alpha_col = "total_spy_alpha_pct" if "total_spy_alpha_pct" in purchases.columns else "spy_alpha_pct"
+    alpha_col = (
+        "total_spy_alpha_pct"
+        if "total_spy_alpha_pct" in purchases.columns
+        else "spy_alpha_pct"
+    )
     prior_alpha_mean = float(purchases[alpha_col].mean())
     if pd.isna(prior_alpha_mean):
         prior_alpha_mean = 0.0
@@ -100,7 +110,9 @@ def _rank_members_impl(
     avg_spy, avg_total_spy = _spy_alpha_by_member(purchases, grp, idx)
     hit_rates = _hit_rates_by_member(purchases, idx, threshold)
     conviction = _conviction_scores(grp, idx, purchases)
-    shrunk_alpha = _shrunk_alpha_by_member(grp, alpha_col, idx, prior_alpha_mean, _bayes_prior_strength)
+    shrunk_alpha = _shrunk_alpha_by_member(
+        grp, alpha_col, idx, prior_alpha_mean, _bayes_prior_strength
+    )
 
     avg_realized = (
         grp["total_return_pct"].mean().reindex(idx).fillna(0.0)
@@ -109,8 +121,15 @@ def _rank_members_impl(
     )
 
     result = _build_ranking_result(
-        idx, ret_agg, stats, avg_spy, avg_total_spy,
-        hit_rates, conviction, shrunk_alpha, avg_realized,
+        idx,
+        ret_agg,
+        stats,
+        avg_spy,
+        avg_total_spy,
+        hit_rates,
+        conviction,
+        shrunk_alpha,
+        avg_realized,
     )
     return _finalize_ranking(result)
 
@@ -138,7 +157,9 @@ def _wins_by_member(purchases: pd.DataFrame, idx) -> pd.Series:
     )
 
 
-def _compute_bayes_stats(n, wins, loo_priors, prior_strength: float, ret_agg: pd.DataFrame):
+def _compute_bayes_stats(
+    n, wins, loo_priors, prior_strength: float, ret_agg: pd.DataFrame
+):
     prior_values = loo_priors.to_numpy(dtype=float)
     bayes_alpha = prior_values * prior_strength
     bayes_beta = (1 - prior_values) * prior_strength
@@ -146,7 +167,9 @@ def _compute_bayes_stats(n, wins, loo_priors, prior_strength: float, ret_agg: pd
     wins_f = wins.values.astype(float)
     bayes_win_prob = (bayes_alpha + wins_f) / (bayes_alpha + bayes_beta + n_vals)
     posterior_lift = bayes_win_prob / prior_values
-    sharpe = np.where(ret_agg["std_ret"] > 0, ret_agg["mean_ret"] / ret_agg["std_ret"], 0.0)
+    sharpe = np.where(
+        ret_agg["std_ret"] > 0, ret_agg["mean_ret"] / ret_agg["std_ret"], 0.0
+    )
     return {
         "sharpe": sharpe,
         "prob_up": wins_f / n_vals,
@@ -175,22 +198,16 @@ def _hit_rates_by_member(purchases: pd.DataFrame, idx, threshold: float | None):
     # were counted as misses in both numerator and denominator.  Restrict to
     # non-NaN rows before computing per-member means.
     valid_peak = purchases[purchases["peak_potential_pct"].notna()]
-    peak_hits = (
-        (valid_peak["peak_potential_pct"] > threshold)
-        .groupby(valid_peak["member"])
-        .mean()
-        .reindex(idx) * 100
-    )
+    peak_hits = (valid_peak["peak_potential_pct"] > threshold).groupby(
+        valid_peak["member"]
+    ).mean().reindex(idx) * 100
     realized_hits = None
     if "total_return_pct" in purchases.columns:
         # Bug #3: same NaN-as-miss problem for realized returns.
         valid_ret = purchases[purchases["total_return_pct"].notna()]
-        realized_hits = (
-            (valid_ret["total_return_pct"] > 0)
-            .groupby(valid_ret["member"])
-            .mean()
-            .reindex(idx) * 100
-        )
+        realized_hits = (valid_ret["total_return_pct"] > 0).groupby(
+            valid_ret["member"]
+        ).mean().reindex(idx) * 100
     return peak_hits, realized_hits
 
 
@@ -210,26 +227,42 @@ def _conviction_scores(grp, idx, purchases: pd.DataFrame) -> np.ndarray:
     return count_scores * 0.6 + size_scores * 0.4
 
 
-def _shrunk_alpha_by_member(grp, alpha_col: str, idx, prior_alpha_mean: float, prior_strength: float):
+def _shrunk_alpha_by_member(
+    grp, alpha_col: str, idx, prior_alpha_mean: float, prior_strength: float
+):
     alpha_sums = grp[alpha_col].sum().reindex(idx).fillna(0.0)
     alpha_counts = grp[alpha_col].count().reindex(idx).fillna(0).astype(int)
-    return (prior_alpha_mean * prior_strength + alpha_sums) / (prior_strength + alpha_counts)
+    return (prior_alpha_mean * prior_strength + alpha_sums) / (
+        prior_strength + alpha_counts
+    )
 
 
-def _build_ranking_result(idx, ret_agg, stats, avg_spy, avg_total_spy, hit_rates, conviction, shrunk_alpha, avg_realized):
-    result = pd.DataFrame({
-        "member": idx,
-        "median_return_pct": np.round(ret_agg["median_ret"].values, 2),
-        "mean_return_pct": np.round(ret_agg["mean_ret"].values, 2),
-        "trades": ret_agg["ret_nonnan"].astype(int).values,
-        "sharpe_ratio": np.round(stats["sharpe"], 3),
-        "prob_up": np.round(stats["prob_up"], 3),
-        "bayes_win_prob": np.round(stats["bayes_win_prob"], 3),
-        "posterior_lift": np.round(stats["posterior_lift"], 3),
-        "avg_return_pct": np.round(avg_realized.values, 2),
-        "avg_spy_alpha_pct": np.round(avg_spy.values, 2),
-        "avg_total_spy_alpha_pct": np.round(avg_total_spy.values, 2),
-    })
+def _build_ranking_result(
+    idx,
+    ret_agg,
+    stats,
+    avg_spy,
+    avg_total_spy,
+    hit_rates,
+    conviction,
+    shrunk_alpha,
+    avg_realized,
+):
+    result = pd.DataFrame(
+        {
+            "member": idx,
+            "median_return_pct": np.round(ret_agg["median_ret"].values, 2),
+            "mean_return_pct": np.round(ret_agg["mean_ret"].values, 2),
+            "trades": ret_agg["ret_nonnan"].astype(int).values,
+            "sharpe_ratio": np.round(stats["sharpe"], 3),
+            "prob_up": np.round(stats["prob_up"], 3),
+            "bayes_win_prob": np.round(stats["bayes_win_prob"], 3),
+            "posterior_lift": np.round(stats["posterior_lift"], 3),
+            "avg_return_pct": np.round(avg_realized.values, 2),
+            "avg_spy_alpha_pct": np.round(avg_spy.values, 2),
+            "avg_total_spy_alpha_pct": np.round(avg_total_spy.values, 2),
+        }
+    )
     if hit_rates is not None:
         peak_hits, realized_hits = hit_rates
         result["peak_hit_rate_pct"] = np.round(peak_hits.values, 2)
@@ -241,9 +274,11 @@ def _build_ranking_result(idx, ret_agg, stats, avg_spy, avg_total_spy, hit_rates
 
 
 def _finalize_ranking(result: pd.DataFrame) -> pd.DataFrame:
-    return result.rename(columns={
-        "mean_return_pct": "avg_decay_return_pct",
-        "median_return_pct": "median_decay_return_pct",
-        "trades": "purchase_trades",
-        "prob_up": "prob_up_given_buy",
-    }).sort_values("shrunk_alpha", ascending=False)
+    return result.rename(
+        columns={
+            "mean_return_pct": "avg_decay_return_pct",
+            "median_return_pct": "median_decay_return_pct",
+            "trades": "purchase_trades",
+            "prob_up": "prob_up_given_buy",
+        }
+    ).sort_values("shrunk_alpha", ascending=False)

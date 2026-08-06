@@ -66,13 +66,17 @@ def _compute_member_stats(
         # as misses in both numerator and denominator.  Exclude NaN rows first.
         valid_peak = grp["peak_potential_pct"].dropna()
         stats["peak_hit_rate_pct"] = (
-            round((valid_peak > threshold).mean() * 100, 2) if len(valid_peak) > 0 else float("nan")
+            round((valid_peak > threshold).mean() * 100, 2)
+            if len(valid_peak) > 0
+            else float("nan")
         )
         if "total_return_pct" in grp.columns:
             # Bug #3: same NaN-as-miss pattern for realized returns.
             valid_ret = grp["total_return_pct"].dropna()
             stats["realized_hit_rate_pct"] = (
-                round((valid_ret > 0).mean() * 100, 2) if len(valid_ret) > 0 else float("nan")
+                round((valid_ret > 0).mean() * 100, 2)
+                if len(valid_ret) > 0
+                else float("nan")
             )
     return stats
 
@@ -119,7 +123,9 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
         peer_n = total_n - member_n
         if peer_n > 0:
             member_wins = int((member_returns < 0).sum())
-            member_prior = float(np.clip((total_wins - member_wins) / peer_n, 0.10, 0.90))
+            member_prior = float(
+                np.clip((total_wins - member_wins) / peer_n, 0.10, 0.90)
+            )
         else:
             member_prior = global_prior
         row = _compute_member_stats(member, sale_grp, member_prior, invert_returns=True)
@@ -130,9 +136,11 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
     if result.empty:
         return result
 
-    return result.rename(columns={
-        "mean_return_pct": "avg_loss_avoided_pct",
-        "median_return_pct": "median_loss_avoided_pct",
-        "trades": "sale_trades",
-        "prob_up": "prob_up_given_sell",
-    }).sort_values("avg_spy_alpha_pct", ascending=False)
+    return result.rename(
+        columns={
+            "mean_return_pct": "avg_loss_avoided_pct",
+            "median_return_pct": "median_loss_avoided_pct",
+            "trades": "sale_trades",
+            "prob_up": "prob_up_given_sell",
+        }
+    ).sort_values("avg_spy_alpha_pct", ascending=False)

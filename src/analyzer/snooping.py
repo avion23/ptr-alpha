@@ -44,7 +44,9 @@ def bonferroni_correction(n_tests: int, alpha: float = 0.05) -> float:
     return alpha / n_tests
 
 
-def benjamini_hochberg(p_values: list[float] | np.ndarray, alpha: float = 0.05) -> np.ndarray:
+def benjamini_hochberg(
+    p_values: list[float] | np.ndarray, alpha: float = 0.05
+) -> np.ndarray:
     """Apply the Benjamini-Hochberg procedure to control the false discovery rate.
 
     Controls FDR at level `alpha` rather than FWER, making it more powerful
@@ -129,9 +131,8 @@ def deflated_sharpe_ratio(
     # The expression under the sqrt can go negative with extreme skew;
     # clamp to zero in that case (the SE floor is then 0).
     se_sq = (
-        (1 - skew * observed_sharpe + (kurtosis - 1) / 4 * observed_sharpe**2)
-        / n_observations
-    )
+        1 - skew * observed_sharpe + (kurtosis - 1) / 4 * observed_sharpe**2
+    ) / n_observations
     se = math.sqrt(max(se_sq, 0.0))
 
     if se == 0:
@@ -165,9 +166,8 @@ def _expected_max_sharpe(
 
     # Adjust for non-normality (skew and excess kurtosis)
     excess_kurt = kurtosis - 3.0
-    adjustment = (
-        skew / (6 * math.sqrt(n_observations))
-        + excess_kurt / (24 * n_observations)
+    adjustment = skew / (6 * math.sqrt(n_observations)) + excess_kurt / (
+        24 * n_observations
     )
 
     return base + adjustment
@@ -238,7 +238,9 @@ def alpha_ttest(
         return 0.0, 1.0
     se = std_alpha / math.sqrt(n_observations)
     if se == 0:
-        return (float("inf") if mean_alpha > 0 else float("-inf") if mean_alpha < 0 else 0.0), 1.0
+        return (
+            float("inf") if mean_alpha > 0 else float("-inf") if mean_alpha < 0 else 0.0
+        ), 1.0
     t_stat = mean_alpha / se
     p_value = 2 * (1 - stats.t.cdf(abs(t_stat), df=n_observations - 1))
     return float(t_stat), float(p_value)
@@ -247,6 +249,7 @@ def alpha_ttest(
 @dataclass(frozen=True, slots=True)
 class SnoopingReport:
     """Results of data snooping analysis for a single strategy configuration."""
+
     n_tests: int
     alpha_slope: float
     overall_alpha: float
@@ -338,7 +341,11 @@ def analyze_snooping(
 
     # --- Deflated Sharpe Ratio ---
     skew = float(sweep_results["sharpe"].skew()) if len(sweep_results) > 2 else 0.0
-    kurt = float(sweep_results["sharpe"].kurtosis()) + 3.0 if len(sweep_results) > 3 else 3.0
+    kurt = (
+        float(sweep_results["sharpe"].kurtosis()) + 3.0
+        if len(sweep_results) > 3
+        else 3.0
+    )
     dsr = deflated_sharpe_ratio(
         observed_sharpe=sharpe,
         n_trials=n_tests,

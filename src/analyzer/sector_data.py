@@ -37,7 +37,9 @@ def load_sector_data(tickers: list[str]) -> pd.DataFrame:
                 try:
                     ticker, sector = future.result(timeout=5)
                 except Exception as e:
-                    logger.debug("Timeout fetching sector for %s: %s", futures[future], e)
+                    logger.debug(
+                        "Timeout fetching sector for %s: %s", futures[future], e
+                    )
                     records.append({"ticker": futures[future], "sector": "Unknown"})
                     continue
                 records.append({"ticker": ticker, "sector": sector})

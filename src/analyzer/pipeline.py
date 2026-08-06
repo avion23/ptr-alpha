@@ -67,6 +67,7 @@ class BacktestParams:
     threshold: float = 5.0
     frequency_days: int = 30
 
+
 def pipeline_step(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -78,7 +79,9 @@ def pipeline_step(func):
         except AnalyzerError as exc:
             logger.error("Pipeline step %s failed: %s", func.__name__, exc)
             return StepResult(success=False, error=exc)
+
     return wrapper
+
 
 def prepare_analysis_data(
     transaction_source, price_source, year: int, horizons: tuple[int, ...]
@@ -90,20 +93,22 @@ def prepare_analysis_data(
         raise DataSourceError("No trading data found")
 
     # Filter out transactions with NULL tickers (from parser failures)
-    trades = trades[trades['ticker'].notna()].copy()
+    trades = trades[trades["ticker"].notna()].copy()
     logger.info("After filtering NULL tickers: %d transactions", len(trades))
 
     if trades.empty:
         raise DataSourceError("No valid tickers found in transaction data")
 
-    start_date = trades['disclosure_date'].min() - timedelta(days=30)
-    end_date = trades['disclosure_date'].max() + timedelta(days=max(horizons) + 10)
+    start_date = trades["disclosure_date"].min() - timedelta(days=30)
+    end_date = trades["disclosure_date"].max() + timedelta(days=max(horizons) + 10)
 
-    prices = price_source.get_prices(trades['ticker'].unique(), start_date, end_date)
+    prices = price_source.get_prices(trades["ticker"].unique(), start_date, end_date)
     logger.info("Fetched price data for %d tickers", len(prices.columns))
 
-    all_tickers = trades['ticker'].unique().tolist()
-    entry_prices = transaction_source.db.get_entry_prices(all_tickers, start_date, end_date)
+    all_tickers = trades["ticker"].unique().tolist()
+    entry_prices = transaction_source.db.get_entry_prices(
+        all_tickers, start_date, end_date
+    )
     logger.info("Computed entry prices for %d transactions", len(entry_prices))
 
     signals = analysis.calculate_signal_potential(entry_prices, prices, horizons)
@@ -122,7 +127,8 @@ def prepare_live_analysis_data(
     """Build live features from historical data available by ``as_of_date``."""
     history_start = as_of_date - timedelta(days=training_lookback_days + max(horizons))
     trades = transaction_source.db.get_transactions_by_date_range(
-        history_start, as_of_date,
+        history_start,
+        as_of_date,
     )
     if trades.empty:
         raise DataSourceError("No trading data found through as-of date")
@@ -138,10 +144,14 @@ def prepare_live_analysis_data(
 
     price_start = history_start - timedelta(days=30)
     prices = price_source.get_prices(
-        trades["ticker"].unique(), price_start, as_of_date,
+        trades["ticker"].unique(),
+        price_start,
+        as_of_date,
     )
     entry_prices = transaction_source.db.get_entry_prices(
-        trades["ticker"].unique().tolist(), price_start, as_of_date,
+        trades["ticker"].unique().tolist(),
+        price_start,
+        as_of_date,
     )
     signals = analysis.calculate_signal_potential(entry_prices, prices, horizons)
 
@@ -154,11 +164,13 @@ def prepare_live_analysis_data(
     ].copy()
     return trades, prices, signals
 
+
 @pipeline_step
 def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
     transaction_source.fetch_and_cache_pdfs(year)
     logger.info("Successfully fetched PDFs for %d", year)
     return DataResult(success=True, data=None)
+
 
 @pipeline_step
 def run_parse_pipeline(transaction_source, year: int) -> DataResult:
@@ -166,11 +178,14 @@ def run_parse_pipeline(transaction_source, year: int) -> DataResult:
     logger.info("Successfully parsed PDFs for %d", year)
     return DataResult(success=True, data=None)
 
+
 @pipeline_step
 def run_analysis_pipeline(
     params: AnalysisParams, transaction_source, price_source
 ) -> DataResult:
-    trades, prices, signals = prepare_analysis_data(transaction_source, price_source, params.year, params.horizons)
+    trades, prices, signals = prepare_analysis_data(
+        transaction_source, price_source, params.year, params.horizons
+    )
 
     table = analysis.get_analysis_table(
         signals,
@@ -187,40 +202,58 @@ def run_analysis_pipeline(
         if params.include_sector_analysis
         else None
     )
-    return DataResult(success=True, data={
-        "table": table,
-        "sector_results": sector_results,
-        "member_filter": params.member_filter,
-        "mode": params.mode,
-    })
+    return DataResult(
+        success=True,
+        data={
+            "table": table,
+            "sector_results": sector_results,
+            "member_filter": params.member_filter,
+            "mode": params.mode,
+        },
+    )
+
 
 @pipeline_step
 def run_sales_pipeline(
-    year: int, horizons: tuple[int, ...], top_n: int,
-    transaction_source, price_source
+    year: int, horizons: tuple[int, ...], top_n: int, transaction_source, price_source
 ) -> DataResult:
-    trades, prices, signals = prepare_analysis_data(transaction_source, price_source, year, horizons)
+    trades, prices, signals = prepare_analysis_data(
+        transaction_source, price_source, year, horizons
+    )
     result = analysis.rank_sales(signals, horizons[0])
     result = result.head(top_n)
-    return DataResult(success=True, data={
-        "table": result,
-    })
+    return DataResult(
+        success=True,
+        data={
+            "table": result,
+        },
+    )
 
 
 @pipeline_step
 def run_ticker_analysis(
     params: TickerAnalysisParams, transaction_source, price_source
 ) -> DataResult:
-    trades, prices, signals = prepare_analysis_data(transaction_source, price_source, params.year, (params.horizon,))
+    trades, prices, signals = prepare_analysis_data(
+        transaction_source, price_source, params.year, (params.horizon,)
+    )
 
-    buyers = analysis.get_ticker_buyers_with_rankings(params.ticker, trades, signals, params.horizon, params.threshold)
-    score = analysis.score_ticker_by_buyers(params.ticker, trades, signals, params.horizon, params.threshold)
+    buyers = analysis.get_ticker_buyers_with_rankings(
+        params.ticker, trades, signals, params.horizon, params.threshold
+    )
+    score = analysis.score_ticker_by_buyers(
+        params.ticker, trades, signals, params.horizon, params.threshold
+    )
 
-    return DataResult(success=True, data={
-        "buyers": buyers,
-        "score": score,
-        "ticker": params.ticker,
-    })
+    return DataResult(
+        success=True,
+        data={
+            "buyers": buyers,
+            "score": score,
+            "ticker": params.ticker,
+        },
+    )
+
 
 @pipeline_step
 def run_recent_ticker_scoring(
@@ -245,34 +278,66 @@ def run_recent_ticker_scoring(
         params.training_lookback_days,
     )
     cutoff_date = as_of_date - timedelta(days=params.days_back)
-    disclosure_dates = pd.to_datetime(trades['disclosure_date'])
+    disclosure_dates = pd.to_datetime(trades["disclosure_date"])
     recent_trades = trades[
         (disclosure_dates >= cutoff_date) & (disclosure_dates <= as_of_date)
     ]
-    logger.info("Analyzing %d transactions from last %d days", len(recent_trades), params.days_back)
+    logger.info(
+        "Analyzing %d transactions from last %d days",
+        len(recent_trades),
+        params.days_back,
+    )
 
     recent_purchases = recent_trades[
-        recent_trades['transaction_type'] == TransactionType.PURCHASE.value
+        recent_trades["transaction_type"] == TransactionType.PURCHASE.value
     ].copy()
-    recent_purchases['_member_canonical'] = recent_purchases['member'].map(canonical_member_key)
-    ticker_buyer_counts = recent_purchases.groupby('ticker')['_member_canonical'].nunique()
-    multi_buyer_tickers = ticker_buyer_counts[ticker_buyer_counts >= params.min_buyers].index.tolist()
+    recent_purchases["_member_canonical"] = recent_purchases["member"].map(
+        canonical_member_key
+    )
+    ticker_buyer_counts = recent_purchases.groupby("ticker")[
+        "_member_canonical"
+    ].nunique()
+    multi_buyer_tickers = ticker_buyer_counts[
+        ticker_buyer_counts >= params.min_buyers
+    ].index.tolist()
 
-    logger.info("Found %d tickers with %d+ buyers", len(multi_buyer_tickers), params.min_buyers)
+    logger.info(
+        "Found %d tickers with %d+ buyers", len(multi_buyer_tickers), params.min_buyers
+    )
 
-    member_rankings = analysis.rank_members(signals, params.horizons[0], params.threshold)
+    member_rankings = analysis.rank_members(
+        signals, params.horizons[0], params.threshold
+    )
 
-    scores = [analysis.score_ticker_by_buyers(ticker, recent_trades, signals, params.horizons[0], params.threshold, member_rankings, params.min_buyers) for ticker in multi_buyer_tickers]
+    scores = [
+        analysis.score_ticker_by_buyers(
+            ticker,
+            recent_trades,
+            signals,
+            params.horizons[0],
+            params.threshold,
+            member_rankings,
+            params.min_buyers,
+        )
+        for ticker in multi_buyer_tickers
+    ]
 
     if not scores:
-        logger.warning("No tickers found with %d+ buyers in last %d days", params.min_buyers, params.days_back)
-        return DataResult(success=True, data={
-            "result": pd.DataFrame(),
-            "top_n": params.top_n,
-            "days_back": params.days_back,
-            "min_buyers": params.min_buyers,
-            "as_of_date": as_of_date.date(),
-        })
+        logger.warning(
+            "No tickers found with %d+ buyers in last %d days",
+            params.min_buyers,
+            params.days_back,
+        )
+        return DataResult(
+            success=True,
+            data={
+                "result": pd.DataFrame(),
+                "top_n": params.top_n,
+                "days_back": params.days_back,
+                "min_buyers": params.min_buyers,
+                "as_of_date": as_of_date.date(),
+            },
+        )
 
     result = pd.concat(scores, ignore_index=True)
     # This interface presents buy candidates, so rejected/negative scores must
@@ -283,14 +348,17 @@ def run_recent_ticker_scoring(
         result = result[
             pd.to_numeric(result["signal_score_raw"], errors="coerce").fillna(0) > 0
         ]
-    result = result.sort_values('signal_score', ascending=False).head(params.top_n)
-    return DataResult(success=True, data={
-        "result": result,
-        "top_n": params.top_n,
-        "days_back": params.days_back,
-        "min_buyers": params.min_buyers,
-        "as_of_date": as_of_date.date(),
-    })
+    result = result.sort_values("signal_score", ascending=False).head(params.top_n)
+    return DataResult(
+        success=True,
+        data={
+            "result": result,
+            "top_n": params.top_n,
+            "days_back": params.days_back,
+            "min_buyers": params.min_buyers,
+            "as_of_date": as_of_date.date(),
+        },
+    )
 
 
 @pipeline_step
@@ -305,7 +373,9 @@ def run_backtest_pipeline(
     )
     tx_end = params.end_date
 
-    all_transactions = transaction_source.db.get_transactions_by_date_range(tx_start, tx_end)
+    all_transactions = transaction_source.db.get_transactions_by_date_range(
+        tx_start, tx_end
+    )
     if all_transactions.empty:
         raise DataSourceError(f"No transactions found between {tx_start} and {tx_end}")
 
@@ -320,18 +390,24 @@ def run_backtest_pipeline(
     all_tickers = sorted(set(all_tickers) | {"SPY"})
 
     # Create price snapshot for reproducibility
-    snapshot = create_snapshot(transaction_source.db, all_tickers, price_start, price_end)
+    snapshot = create_snapshot(
+        transaction_source.db, all_tickers, price_start, price_end
+    )
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)
 
     if prices.empty:
         raise DataSourceError("No price data available for backtest window")
 
-    entry_prices = transaction_source.db.get_entry_prices(all_tickers, price_start, price_end)
+    entry_prices = transaction_source.db.get_entry_prices(
+        all_tickers, price_start, price_end
+    )
     if entry_prices.empty:
         raise DataSourceError("No entry prices could be computed")
 
-    signals = analysis.calculate_signal_potential(entry_prices, prices, [params.horizon])
+    signals = analysis.calculate_signal_potential(
+        entry_prices, prices, [params.horizon]
+    )
     logger.info("Computed %d signals for backtest", len(signals))
 
     as_of_dates = pd.date_range(
@@ -348,7 +424,9 @@ def run_backtest_pipeline(
         as_of_ts = pd.Timestamp(as_of)
 
         recs = analysis.backtest_recommendations(
-            signals, all_transactions, as_of_ts,
+            signals,
+            all_transactions,
+            as_of_ts,
             horizon=params.horizon,
             lookback_days=params.lookback_days,
             min_buyers=params.min_buyers,
@@ -369,13 +447,16 @@ def run_backtest_pipeline(
         all_results.append(evaluated)
 
     if not all_results:
-        return DataResult(success=True, data={
-            "combined": pd.DataFrame(),
-            "summary": pd.DataFrame(),
-            "snapshot": snapshot,
-            "evaluable_dates": 0,
-            "total_as_of_dates": len(as_of_dates),
-        })
+        return DataResult(
+            success=True,
+            data={
+                "combined": pd.DataFrame(),
+                "summary": pd.DataFrame(),
+                "snapshot": snapshot,
+                "evaluable_dates": 0,
+                "total_as_of_dates": len(as_of_dates),
+            },
+        )
 
     combined = pd.concat(all_results, ignore_index=True)
     # Set accumulated coverage counts on the combined frame so summarize_backtest
@@ -386,18 +467,27 @@ def run_backtest_pipeline(
     summary = analysis.summarize_backtest(combined)
 
     valid_returns = combined.dropna(subset=["bt_return_pct"])
-    evaluable_dates = valid_returns["as_of_date"].nunique() if not valid_returns.empty else 0
-    total_as_of_dates = len(pd.date_range(params.start_date, params.end_date, freq=f"{params.frequency_days}D"))
+    evaluable_dates = (
+        valid_returns["as_of_date"].nunique() if not valid_returns.empty else 0
+    )
+    total_as_of_dates = len(
+        pd.date_range(
+            params.start_date, params.end_date, freq=f"{params.frequency_days}D"
+        )
+    )
 
     # Save snapshot alongside backtest results
     snapshot_path = data_dir / "price_snapshot.json"
     save_snapshot(snapshot, snapshot_path)
     logger.info("Price snapshot saved to %s", snapshot_path)
 
-    return DataResult(success=True, data={
-        "combined": combined,
-        "summary": summary,
-        "snapshot": snapshot,
-        "evaluable_dates": evaluable_dates,
-        "total_as_of_dates": total_as_of_dates,
-    })
+    return DataResult(
+        success=True,
+        data={
+            "combined": combined,
+            "summary": summary,
+            "snapshot": snapshot,
+            "evaluable_dates": evaluable_dates,
+            "total_as_of_dates": total_as_of_dates,
+        },
+    )

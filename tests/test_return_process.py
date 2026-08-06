@@ -28,6 +28,7 @@ class TestFitAR1:
         assert abs(a_est - a_true) < 0.03, f"a={a_est:.3f} != {a_true}"
         assert abs(s2_est - s2_true) < 0.002, f"s2={s2_est:.4f} != {s2_true}"
 
+
 class TestAR1ToOU:
     def test_roundtrip(self):
         """OU -> AR(1) -> OU should recover parameters."""
@@ -89,16 +90,19 @@ class TestBuildPrior:
 class TestOUPosterior:
     def test_v_positive_mu(self):
         """High mu should give positive V."""
-        post = OUPosterior(mu_mean=0.10, mu_var=0.01, theta=0.05, sigma2_ou=0.01, n_obs=20)
+        post = OUPosterior(
+            mu_mean=0.10, mu_var=0.01, theta=0.05, sigma2_ou=0.01, n_obs=20
+        )
         v = post.v(r_tau=0.05, rho=0.000137)
         assert v > 0
 
     def test_v_negative_mu(self):
         """Low mu and low current return should give negative V."""
-        post = OUPosterior(mu_mean=-0.05, mu_var=0.01, theta=0.05, sigma2_ou=0.01, n_obs=20)
+        post = OUPosterior(
+            mu_mean=-0.05, mu_var=0.01, theta=0.05, sigma2_ou=0.01, n_obs=20
+        )
         v = post.v(r_tau=-0.02, rho=0.000137)
         assert v < 0
-
 
 
 class TestReturnProcessTracker:
@@ -126,8 +130,11 @@ class TestReturnProcessTracker:
 
         ou = fit_ou(r)
         tracker = ReturnProcessTracker(
-            theta=ou.theta, beta_prior=mu_true * (1 - np.exp(-ou.theta)), P_prior=0.1,
-            sigma2_ou=ou.sigma2_ou, min_observations=10,
+            theta=ou.theta,
+            beta_prior=mu_true * (1 - np.exp(-ou.theta)),
+            P_prior=0.1,
+            sigma2_ou=ou.sigma2_ou,
+            min_observations=10,
         )
         for r_t in r:
             tracker.update(r_t)

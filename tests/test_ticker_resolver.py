@@ -5,7 +5,6 @@ from analyzer.ticker_resolver import TickerResolver
 
 
 class TestTickerResolver(unittest.TestCase):
-
     def setUp(self):
         self.resolver = TickerResolver()
 
@@ -59,7 +58,6 @@ class TestTickerResolver(unittest.TestCase):
         self.assertEqual(resolution.status, "valid")
         self.assertAlmostEqual(resolution.confidence, 1.0)
 
-
     def test_case_insensitive(self):
         resolution = self.resolver.resolve("brk.b")
         self.assertEqual(resolution.price_symbol, "BRK-B")
@@ -78,7 +76,6 @@ class TestTickerResolver(unittest.TestCase):
         self.assertEqual(results["AAPL"].status, "valid")
         self.assertEqual(results["ZZZZZ"].price_symbol, "ZZZZZ")
         self.assertEqual(results["ZZZZZ"].status, "valid")
-
 
     def test_atvi_acquired_uses_original_symbol(self):
         resolution = self.resolver.resolve("ATVI")

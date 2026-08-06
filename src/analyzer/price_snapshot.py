@@ -27,6 +27,7 @@ def _get_git_sha() -> str:
 def _get_yfinance_version() -> str:
     try:
         import yfinance
+
         return yfinance.__version__
     except ImportError:
         return "not installed"
@@ -159,11 +160,13 @@ def compare_snapshots(old: PriceSnapshot, new: PriceSnapshot) -> dict:
         old_cov = old.coverage_by_ticker[ticker]
         new_cov = new.coverage_by_ticker[ticker]
         if old_cov != new_cov:
-            changed.append({
-                "ticker": ticker,
-                "old": old_cov,
-                "new": new_cov,
-            })
+            changed.append(
+                {
+                    "ticker": ticker,
+                    "old": old_cov,
+                    "new": new_cov,
+                }
+            )
 
     return {
         "old_snapshot_id": old.snapshot_id,

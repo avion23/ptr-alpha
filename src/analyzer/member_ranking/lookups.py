@@ -85,7 +85,9 @@ def _build_ranking_dicts(
     valid = member_rankings[cols].dropna(subset=["member"])
 
     alpha = _compute_alpha_for_scoring_mode(valid, alpha_col, scoring_mode)
-    trades_dict = dict(zip(valid["member"], valid["purchase_trades"].fillna(0).astype(int)))
+    trades_dict = dict(
+        zip(valid["member"], valid["purchase_trades"].fillna(0).astype(int))
+    )
     prob = (
         dict(zip(valid["member"], valid["bayes_win_prob"].fillna(0.5).astype(float)))
         if "bayes_win_prob" in valid.columns
@@ -100,7 +102,11 @@ def _build_ranking_dicts(
     # guard prevents overwriting them); collisions only affect fallback lookups for
     # members not in the rankings under their exact name.
     def _add_canonical_aliases(d: dict) -> dict:
-        aliases = {canonical_member_key(k): v for k, v in d.items() if canonical_member_key(k) not in d}
+        aliases = {
+            canonical_member_key(k): v
+            for k, v in d.items()
+            if canonical_member_key(k) not in d
+        }
         d.update(aliases)
         return d
 
@@ -108,16 +114,31 @@ def _build_ranking_dicts(
     _add_canonical_aliases(trades_dict)
     _add_canonical_aliases(prob)
 
-    return {"alpha": alpha, "trades": trades_dict, "prob": prob, "has_shrunk": has_shrunk}
+    return {
+        "alpha": alpha,
+        "trades": trades_dict,
+        "prob": prob,
+        "has_shrunk": has_shrunk,
+    }
 
 
-def _compute_alpha_for_scoring_mode(valid: pd.DataFrame, alpha_col: str, scoring_mode: str) -> dict:
+def _compute_alpha_for_scoring_mode(
+    valid: pd.DataFrame, alpha_col: str, scoring_mode: str
+) -> dict:
     if scoring_mode == "consistency":
-        prob_up = valid["prob_up_given_buy"].fillna(0.5).values if "prob_up_given_buy" in valid.columns else np.full(len(valid), 0.5)
+        prob_up = (
+            valid["prob_up_given_buy"].fillna(0.5).values
+            if "prob_up_given_buy" in valid.columns
+            else np.full(len(valid), 0.5)
+        )
         trades = valid["purchase_trades"].fillna(0).values.astype(float)
         alpha_values = prob_up * np.log1p(trades)
     elif scoring_mode == "bayesian_quality":
-        bayes = valid["bayes_win_prob"].fillna(0.5).values if "bayes_win_prob" in valid.columns else np.full(len(valid), 0.5)
+        bayes = (
+            valid["bayes_win_prob"].fillna(0.5).values
+            if "bayes_win_prob" in valid.columns
+            else np.full(len(valid), 0.5)
+        )
         raw_alpha = valid[alpha_col].fillna(0.0).values.astype(float)
         alpha_values = bayes * raw_alpha
     elif scoring_mode == "trade_frequency":
@@ -147,24 +168,30 @@ def get_ticker_buyers_with_rankings(
     if ticker_trades.empty:
         raise AnalysisError(f"No purchases found for {ticker}")
 
-    buyers_with_dates = ticker_trades.groupby("member").agg({
-        "transaction_date": list,
-        "disclosure_date": list
-    }).reset_index()
+    buyers_with_dates = (
+        ticker_trades.groupby("member")
+        .agg({"transaction_date": list, "disclosure_date": list})
+        .reset_index()
+    )
 
     ranking_cols = ["member", "avg_spy_alpha_pct", "purchase_trades"]
     if "peak_hit_rate_pct" in member_rankings.columns:
         ranking_cols.append("peak_hit_rate_pct")
     result = pd.merge(
-        buyers_with_dates,
-        member_rankings[ranking_cols],
-        on="member",
-        how="left"
+        buyers_with_dates, member_rankings[ranking_cols], on="member", how="left"
     )
-    result = result.sort_values("avg_spy_alpha_pct", ascending=False, na_position="last")
+    result = result.sort_values(
+        "avg_spy_alpha_pct", ascending=False, na_position="last"
+    )
     result["num_purchases"] = result["transaction_date"].apply(len)
-    return_cols = ["member", "num_purchases", "transaction_date", "disclosure_date",
-                   "avg_spy_alpha_pct", "purchase_trades"]
+    return_cols = [
+        "member",
+        "num_purchases",
+        "transaction_date",
+        "disclosure_date",
+        "avg_spy_alpha_pct",
+        "purchase_trades",
+    ]
     if "peak_hit_rate_pct" in result.columns:
         return_cols.insert(4, "peak_hit_rate_pct")
     return result[return_cols]

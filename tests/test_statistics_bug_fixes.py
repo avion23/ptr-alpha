@@ -8,6 +8,7 @@ Bug summary:
   #5 Sweep objective alpha_slope sign-inversion in sweep.py (critical)
   #6 Missing price windows default to 0.0 instead of NaN (medium)
 """
+
 from __future__ import annotations
 
 import math
@@ -17,6 +18,7 @@ import pandas as pd
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 
 def _make_signal_df_with_nan(**override) -> pd.DataFrame:
     """Minimal purchase signal DataFrame; override any column with NaN."""
@@ -39,6 +41,7 @@ def _make_signal_df_with_nan(**override) -> pd.DataFrame:
 
 # ── Bug #1: SPY double-division ───────────────────────────────────────────────
 
+
 class TestSpyDoubleDivision(unittest.TestCase):
     """
     _populate_spy_arrays stores the decay-weighted mean (s_wr.sum() / s_ws) in
@@ -56,20 +59,26 @@ class TestSpyDoubleDivision(unittest.TestCase):
 
     def setUp(self):
         # Two prices: disclosure day 0 and day 1
-        self.entry_prices = pd.DataFrame({
-            "member": ["Alice"],
-            "ticker": ["TICK"],
-            "disclosure_date": pd.to_datetime(["2024-01-01"]),
-            "transaction_type": ["Purchase"],
-            "entry_price": [100.0],
-        })
-        self.prices = pd.DataFrame({
-            "TICK": [100.0, 100.0],   # flat ticker (decayed_return ≈ 0)
-            "SPY":  [100.0, 110.0],   # SPY rises 10%
-        }, index=pd.to_datetime(["2024-01-01", "2024-01-02"]))
+        self.entry_prices = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["TICK"],
+                "disclosure_date": pd.to_datetime(["2024-01-01"]),
+                "transaction_type": ["Purchase"],
+                "entry_price": [100.0],
+            }
+        )
+        self.prices = pd.DataFrame(
+            {
+                "TICK": [100.0, 100.0],  # flat ticker (decayed_return ≈ 0)
+                "SPY": [100.0, 110.0],  # SPY rises 10%
+            },
+            index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        )
 
     def test_spy_return_not_double_divided(self):
         from analyzer.signals.core import calculate_signal_potential
+
         signals = calculate_signal_potential(
             self.entry_prices, self.prices, [1], decay_lambda=0.0
         )
@@ -78,11 +87,17 @@ class TestSpyDoubleDivision(unittest.TestCase):
         # Correct value ≈ 4.77%; buggy value was ≈ 2.38%.
         # log(110/100) ≈ 0.09531; two weights (1,1) → mean = 0.04765
         expected = math.log(110.0 / 100.0) / 2.0 * 100  # ≈ 4.77
-        self.assertAlmostEqual(dsr, expected, places=3,
-                               msg=f"decayed_spy_return_pct={dsr:.4f} expected≈{expected:.4f}; "
-                                   "double-division bug may not be fixed")
+        self.assertAlmostEqual(
+            dsr,
+            expected,
+            places=3,
+            msg=f"decayed_spy_return_pct={dsr:.4f} expected≈{expected:.4f}; "
+            "double-division bug may not be fixed",
+        )
+
 
 # ── Bug #3: NaN-as-miss in hit rates ────────────────────────────────────────
+
 
 class TestHitRateNaN(unittest.TestCase):
     """
@@ -95,20 +110,25 @@ class TestHitRateNaN(unittest.TestCase):
 
     def test_peak_hit_rate_excludes_nan(self):
         from analyzer.member_ranking.ranking import _hit_rates_by_member
-        purchases = pd.DataFrame({
-            "member": ["Alice", "Alice"],
-            "peak_potential_pct": [10.0, float("nan")],
-            "total_return_pct": [6.0, float("nan")],
-            "entry_price": [100.0, 100.0],
-            "disclosure_date": pd.to_datetime(["2024-01-01", "2024-02-01"]),
-        })
+
+        purchases = pd.DataFrame(
+            {
+                "member": ["Alice", "Alice"],
+                "peak_potential_pct": [10.0, float("nan")],
+                "total_return_pct": [6.0, float("nan")],
+                "entry_price": [100.0, 100.0],
+                "disclosure_date": pd.to_datetime(["2024-01-01", "2024-02-01"]),
+            }
+        )
         idx = pd.Index(["Alice"])
         peak, _ = _hit_rates_by_member(purchases, idx, threshold=5.0)
-        self.assertAlmostEqual(peak.loc["Alice"], 100.0, places=5,
-                               msg="peak_hit_rate counted NaN as miss")
+        self.assertAlmostEqual(
+            peak.loc["Alice"], 100.0, places=5, msg="peak_hit_rate counted NaN as miss"
+        )
 
 
 # ── Bug #4: Kelly NaN fallback ───────────────────────────────────────────────
+
 
 class TestKellyNaNFallback(unittest.TestCase):
     """
@@ -120,22 +140,28 @@ class TestKellyNaNFallback(unittest.TestCase):
     """
 
     def _make_recs_all_positive(self):
-        return pd.DataFrame({
-            "ticker": ["A", "B", "C"],
-            "signal_score": [10.0, 8.0, 6.0],
-            "member": ["m1", "m2", "m3"],
-            "crash_prob": [0.0, 0.0, 0.0],
-            "avg_return_pct": [5.0, 3.0, 1.0],  # all positive → avg_loss=NaN
-        })
+        return pd.DataFrame(
+            {
+                "ticker": ["A", "B", "C"],
+                "signal_score": [10.0, 8.0, 6.0],
+                "member": ["m1", "m2", "m3"],
+                "crash_prob": [0.0, 0.0, 0.0],
+                "avg_return_pct": [5.0, 3.0, 1.0],  # all positive → avg_loss=NaN
+            }
+        )
 
     def test_all_positive_returns_produces_non_empty_portfolio(self):
         from analyzer.portfolio.kelly import build_kelly_portfolio, KellyConfig
+
         recs = self._make_recs_all_positive()
         portfolio = build_kelly_portfolio(recs, KellyConfig())
-        self.assertGreater(len(portfolio), 0,
-                           "portfolio is empty; NaN avg_loss fallback not triggered")
+        self.assertGreater(
+            len(portfolio), 0, "portfolio is empty; NaN avg_loss fallback not triggered"
+        )
+
 
 # ── Bug #6: Missing price windows should yield NaN (not 0.0) ─────────────────
+
 
 class TestMissingWindowsNaN(unittest.TestCase):
     """
@@ -156,66 +182,84 @@ class TestMissingWindowsNaN(unittest.TestCase):
     def test_total_return_pct_is_nan_for_missing_ticker_prices(self):
         """All-NaN ticker prices → r_disc_baseline stays NaN → total_return NaN."""
         from analyzer.signals.core import calculate_signal_potential
-        entry_prices = pd.DataFrame({
-            "member": ["Alice"],
-            "ticker": ["TICK"],
-            "disclosure_date": pd.to_datetime(["2024-01-01"]),
-            "transaction_type": ["Purchase"],
-            "entry_price": [100.0],
-        })
+
+        entry_prices = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["TICK"],
+                "disclosure_date": pd.to_datetime(["2024-01-01"]),
+                "transaction_type": ["Purchase"],
+                "entry_price": [100.0],
+            }
+        )
         # TICK column is all-NaN → _price_arrays returns (None, None) → kernel skips
-        prices = pd.DataFrame({
-            "TICK": [float("nan"), float("nan")],
-            "SPY":  [400.0, 401.0],
-        }, index=pd.to_datetime(["2024-01-01", "2024-02-01"]))
+        prices = pd.DataFrame(
+            {
+                "TICK": [float("nan"), float("nan")],
+                "SPY": [400.0, 401.0],
+            },
+            index=pd.to_datetime(["2024-01-01", "2024-02-01"]),
+        )
         signals = calculate_signal_potential(entry_prices, prices, [30])
         self.assertEqual(len(signals), 1)
         row = signals.iloc[0]
         self.assertTrue(
             pd.isna(row["total_return_pct"]),
-            f"total_return_pct={row['total_return_pct']}; should be NaN when ticker has no prices"
+            f"total_return_pct={row['total_return_pct']}; should be NaN when ticker has no prices",
         )
 
     def test_decayed_spy_return_is_nan_when_no_spy_column(self):
         """prices_df without SPY column → spy_has=False → decayed_spy_return NaN."""
         from analyzer.signals.core import calculate_signal_potential
-        entry_prices = pd.DataFrame({
-            "member": ["Alice"],
-            "ticker": ["TICK"],
-            "disclosure_date": pd.to_datetime(["2024-01-01"]),
-            "transaction_type": ["Purchase"],
-            "entry_price": [100.0],
-        })
+
+        entry_prices = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["TICK"],
+                "disclosure_date": pd.to_datetime(["2024-01-01"]),
+                "transaction_type": ["Purchase"],
+                "entry_price": [100.0],
+            }
+        )
         # No SPY column → spy arrays are None → r_spy_wsum stays 0 → spy_cum=NaN
-        prices_no_spy = pd.DataFrame({
-            "TICK": [100.0, 101.0, 102.0],
-        }, index=pd.to_datetime(["2024-01-01", "2024-01-15", "2024-02-01"]))
+        prices_no_spy = pd.DataFrame(
+            {
+                "TICK": [100.0, 101.0, 102.0],
+            },
+            index=pd.to_datetime(["2024-01-01", "2024-01-15", "2024-02-01"]),
+        )
         signals = calculate_signal_potential(entry_prices, prices_no_spy, [30])
         self.assertEqual(len(signals), 1)
         row = signals.iloc[0]
         self.assertTrue(
             pd.isna(row["decayed_spy_return_pct"]),
-            f"decayed_spy_return_pct={row['decayed_spy_return_pct']}; should be NaN without SPY"
+            f"decayed_spy_return_pct={row['decayed_spy_return_pct']}; should be NaN without SPY",
         )
 
     def test_spy_alpha_pct_is_nan_without_spy_data(self):
         """When prices_df has no SPY column, spy_alpha_pct must be NaN."""
         from analyzer.signals.core import calculate_signal_potential
-        entry_prices = pd.DataFrame({
-            "member": ["Alice"],
-            "ticker": ["TICK"],
-            "disclosure_date": pd.to_datetime(["2024-01-01"]),
-            "transaction_type": ["Purchase"],
-            "entry_price": [100.0],
-        })
-        prices_no_spy = pd.DataFrame({
-            "TICK": [100.0, 101.0, 102.0],
-        }, index=pd.to_datetime(["2024-01-01", "2024-01-15", "2024-02-01"]))
+
+        entry_prices = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["TICK"],
+                "disclosure_date": pd.to_datetime(["2024-01-01"]),
+                "transaction_type": ["Purchase"],
+                "entry_price": [100.0],
+            }
+        )
+        prices_no_spy = pd.DataFrame(
+            {
+                "TICK": [100.0, 101.0, 102.0],
+            },
+            index=pd.to_datetime(["2024-01-01", "2024-01-15", "2024-02-01"]),
+        )
         signals = calculate_signal_potential(entry_prices, prices_no_spy, [30])
         row = signals.iloc[0]
         self.assertTrue(
             pd.isna(row["spy_alpha_pct"]),
-            "spy_alpha_pct should be NaN when no SPY data is available"
+            "spy_alpha_pct should be NaN when no SPY data is available",
         )
 
 

@@ -1,4 +1,5 @@
 """Backward-compatible re-exports. Import from submodules directly for new code."""
+
 from analyzer.parser_cascade import (
     _is_valid_pdf,
     _parse_pdf_worker,

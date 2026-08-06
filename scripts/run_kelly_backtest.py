@@ -2,11 +2,13 @@
 
 import sys
 import warnings
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", module="cryptography")
 
 # Ensure repo src is importable regardless of working directory
 from pathlib import Path as _Path
+
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
 
 from datetime import date, timedelta
@@ -21,6 +23,7 @@ from analyzer.portfolio import (
     compute_portfolio_metrics,
     simulate_portfolio_returns,
 )
+
 
 def main():
     settings = Settings()
@@ -65,6 +68,7 @@ def main():
 
     print("Computing signals...")
     from analyzer import analysis
+
     signals = analysis.calculate_signal_potential(entry_prices, prices, [horizon])
     print(f"  {len(signals)} signals")
 
@@ -82,7 +86,10 @@ def main():
 
     print(f"\nBuilding Kelly portfolios across {len(as_of_dates)} rebalance dates...")
     portfolio_df = build_portfolios_from_backtest(
-        signals, all_transactions, prices, as_of_dates,
+        signals,
+        all_transactions,
+        prices,
+        as_of_dates,
         horizon=horizon,
         lookback_days=30,
         min_buyers=min_buyers,
@@ -97,7 +104,9 @@ def main():
         tx_source.close()
         return
 
-    print(f"  {len(portfolio_df)} portfolio entries across {portfolio_df['as_of_date'].nunique()} dates")
+    print(
+        f"  {len(portfolio_df)} portfolio entries across {portfolio_df['as_of_date'].nunique()} dates"
+    )
 
     # Position sizing distribution
     print("\n=== Position Sizing Distribution ===")
@@ -143,7 +152,9 @@ def main():
     # Win/loss analysis
     wins = returns_df[returns_df["portfolio_return"] > 0]
     losses = returns_df[returns_df["portfolio_return"] <= 0]
-    print(f"\nWinning periods: {len(wins)}/{len(returns_df)} ({len(wins)/len(returns_df)*100:.1f}%)")
+    print(
+        f"\nWinning periods: {len(wins)}/{len(returns_df)} ({len(wins) / len(returns_df) * 100:.1f}%)"
+    )
     if not wins.empty:
         print(f"  Avg win:  {wins['portfolio_return'].mean():.2f}%")
     if not losses.empty:

@@ -74,7 +74,11 @@ def get_member_decay_map(
     result: dict[str, float] = {}
     for member in members:
         lam = estimate_member_decay_lambda(
-            member, signals_df, horizon, default_lambda, min_trades,
+            member,
+            signals_df,
+            horizon,
+            default_lambda,
+            min_trades,
         )
         if abs(lam - default_lambda) > 1e-6:
             result[member] = lam

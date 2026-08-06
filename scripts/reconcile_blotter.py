@@ -17,6 +17,7 @@ IMPORTANT (honesty note):
     verdict from the program's conviction/quality-filter engine. Treat it as a
     coincidence proxy only.
 """
+
 from __future__ import annotations
 
 import csv
@@ -36,6 +37,7 @@ warnings.filterwarnings("ignore")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
+
 
 # Resolve the congressional duckdb. The main repo lives one level above the
 # worktree; the file may also be present locally under data/.
@@ -210,15 +212,21 @@ def main() -> int:
 
     print(f"DB:        {DB_PATH}")
     print(f"Blotter:   {csv_path}")
-    print(f"Proxy win: congressional Purchase within {MATCH_WINDOW_DAYS} days "
-          f"before user BTO (INCLUSIVE of both endpoints)")
+    print(
+        f"Proxy win: congressional Purchase within {MATCH_WINDOW_DAYS} days "
+        f"before user BTO (INCLUSIVE of both endpoints)"
+    )
     print("=" * 80)
-    print("HONESTY NOTE: 'congressional_buy_within_60d' is a FACTUAL PROXY "
-          "(raw congressional")
-    print("buy timing), NOT the program's recommendation engine output. The real "
-          "engine")
-    print("(src/analyzer/signals backtest / conviction+quality filter) was NOT "
-          "invoked.")
+    print(
+        "HONESTY NOTE: 'congressional_buy_within_60d' is a FACTUAL PROXY "
+        "(raw congressional"
+    )
+    print(
+        "buy timing), NOT the program's recommendation engine output. The real engine"
+    )
+    print(
+        "(src/analyzer/signals backtest / conviction+quality filter) was NOT invoked."
+    )
     print("=" * 80)
 
     # --- parse blotter -------------------------------------------------------
@@ -326,14 +334,11 @@ def main() -> int:
                 # Defensive: unexpected side should not reach here (parser
                 # restricts to BTO/STC/STO/BTC), but never crash on it.
                 warnings_list.append(
-                    f"{sym}: unexpected side {fl['side']!r} on {fl['date']} "
-                    f"(skipped)"
+                    f"{sym}: unexpected side {fl['side']!r} on {fl['date']} (skipped)"
                 )
 
         open_qty = sum(q for _, q in lots)
-        open_entry = (
-            sum(p * q for p, q in lots) / open_qty if open_qty > 0 else 0.0
-        )
+        open_entry = sum(p * q for p, q in lots) / open_qty if open_qty > 0 else 0.0
 
         # --- market price ----------------------------------------------------
         price, price_date = get_current_price(sym)
@@ -478,7 +483,9 @@ def main() -> int:
                 "symbol": sym,
                 "qty": qty_shown,
                 "entry": round(entry, 4) if entry is not None else None,
-                "current": round(current_shown, 4) if current_shown is not None else None,
+                "current": round(current_shown, 4)
+                if current_shown is not None
+                else None,
                 "pnl_per_unit": round(pnl_unit, 4) if pnl_unit is not None else None,
                 "dollar_pnl": round(dollar, 2) if dollar is not None else None,
                 "congressional_total_tx": total_tx,
@@ -527,7 +534,9 @@ def main() -> int:
                 f"{r['window_counts'][45]}",
                 f"{r['window_counts'][60]}",
                 f"{r['window_counts'][90]}",
-                f"{r['closest_buy_delta_days']}" if r["closest_buy_delta_days"] is not None else "-",
+                f"{r['closest_buy_delta_days']}"
+                if r["closest_buy_delta_days"] is not None
+                else "-",
                 f"{r['expected_match_prob_by_window'][60]:.2f}",
                 r["congressional_buy_within_60d"],
                 r["note"],
@@ -563,20 +572,23 @@ def main() -> int:
     print("=" * 80)
     print("SUMMARY")
     print("=" * 80)
-    print("RECOMMENDATION LABEL USED: 'congressional_buy_within_60d' — a FACTUAL "
-          "PROXY.")
-    print("It is 'Y' when >=1 congressional Purchase occurred within 60 "
-          "INCLUSIVE days")
-    print("before the user's earliest BTO. It is NOT a program recommendation; "
-          "the real")
-    print("engine (signals backtest / conviction+quality filter) was NOT "
-          "invoked here.")
-    print("'Exp@60' = expected match probability by chance (Poisson base-rate), "
-          "judge a")
-    print("hit against its prior, not in isolation. W30/W45/W60/W90 = "
-          "congressional buy")
-    print("counts within that many inclusive days before the BTO. Δd = day-delta "
-          "to the")
+    print(
+        "RECOMMENDATION LABEL USED: 'congressional_buy_within_60d' — a FACTUAL PROXY."
+    )
+    print("It is 'Y' when >=1 congressional Purchase occurred within 60 INCLUSIVE days")
+    print(
+        "before the user's earliest BTO. It is NOT a program recommendation; the real"
+    )
+    print("engine (signals backtest / conviction+quality filter) was NOT invoked here.")
+    print(
+        "'Exp@60' = expected match probability by chance (Poisson base-rate), judge a"
+    )
+    print(
+        "hit against its prior, not in isolation. W30/W45/W60/W90 = congressional buy"
+    )
+    print(
+        "counts within that many inclusive days before the BTO. Δd = day-delta to the"
+    )
     print("closest congressional buy (0 = same day as BTO).")
     print("-" * 80)
     for r in results:

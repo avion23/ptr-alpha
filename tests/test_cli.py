@@ -1,4 +1,5 @@
 """Smoke tests for analyzer.cli module."""
+
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -8,21 +9,13 @@ from analyzer.cli import app
 from analyzer.exceptions import StepResult
 
 
-
-
 class TestCliApp(unittest.TestCase):
-
     def setUp(self):
         self.runner = CliRunner()
-
-
-
-
 
     def test_analyze_invalid_mode(self):
         result = self.runner.invoke(app, ["analyze", "--mode", "invalid_mode"])
         self.assertNotEqual(result.exit_code, 0)
-
 
     def test_analyze_rejects_invalid_numeric_and_output_options_before_db_open(self):
         cases = [
@@ -40,25 +33,61 @@ class TestCliApp(unittest.TestCase):
                 context.assert_not_called()
 
     def test_backtest_rejects_nonpositive_windows_before_db_open(self):
-        for option in ("--horizon", "--lookback-days", "--training-lookback-days",
-                       "--min-buyers", "--top-n", "--frequency-days"):
-            with self.subTest(option=option), patch("analyzer.cli.get_context") as context:
-                result = self.runner.invoke(app, [
-                    "backtest", "--start", "2024-01-01", "--end", "2024-02-01",
-                    option, "0",
-                ])
+        for option in (
+            "--horizon",
+            "--lookback-days",
+            "--training-lookback-days",
+            "--min-buyers",
+            "--top-n",
+            "--frequency-days",
+        ):
+            with (
+                self.subTest(option=option),
+                patch("analyzer.cli.get_context") as context,
+            ):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "backtest",
+                        "--start",
+                        "2024-01-01",
+                        "--end",
+                        "2024-02-01",
+                        option,
+                        "0",
+                    ],
+                )
                 self.assertEqual(result.exit_code, 1, result.output)
                 context.assert_not_called()
 
     def test_portfolio_rejects_nonpositive_constraints_before_db_open(self):
-        for option in ("--horizon", "--lookback-days", "--training-lookback-days",
-                       "--min-buyers", "--top-n", "--frequency-days",
-                       "--initial-capital", "--max-positions", "--hold-days"):
-            with self.subTest(option=option), patch("analyzer.cli.get_context") as context:
-                result = self.runner.invoke(app, [
-                    "portfolio", "--start", "2024-01-01", "--end", "2024-02-01",
-                    option, "0",
-                ])
+        for option in (
+            "--horizon",
+            "--lookback-days",
+            "--training-lookback-days",
+            "--min-buyers",
+            "--top-n",
+            "--frequency-days",
+            "--initial-capital",
+            "--max-positions",
+            "--hold-days",
+        ):
+            with (
+                self.subTest(option=option),
+                patch("analyzer.cli.get_context") as context,
+            ):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "portfolio",
+                        "--start",
+                        "2024-01-01",
+                        "--end",
+                        "2024-02-01",
+                        option,
+                        "0",
+                    ],
+                )
                 self.assertEqual(result.exit_code, 1, result.output)
                 context.assert_not_called()
 
@@ -66,9 +95,14 @@ class TestCliApp(unittest.TestCase):
         mock_ctx = MagicMock()
         mock_ctx.settings.data.data_dir = "data"
 
-        with patch("analyzer.cli.get_context", return_value=mock_ctx), \
-             patch("analyzer.cli.run_parse_pipeline", return_value=StepResult(success=False)), \
-             patch("scripts.ocr_zero_rows.run_gemini_ocr_for_year", return_value=3):
+        with (
+            patch("analyzer.cli.get_context", return_value=mock_ctx),
+            patch(
+                "analyzer.cli.run_parse_pipeline",
+                return_value=StepResult(success=False),
+            ),
+            patch("scripts.ocr_zero_rows.run_gemini_ocr_for_year", return_value=3),
+        ):
             result = self.runner.invoke(app, ["parse", "--gemini-ocr"])
 
         self.assertEqual(result.exit_code, 1, result.output)
@@ -93,10 +127,14 @@ class TestAnalyzeParamsMapping(unittest.TestCase):
 
         # Also stub get_context so we don't need a real database.
         mock_ctx = MagicMock()
-        mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (None,)
+        mock_ctx.transaction_source.db.conn.execute.return_value.fetchone.return_value = (
+            None,
+        )
 
-        with patch("analyzer.cli.run_analysis_pipeline", side_effect=fake_pipeline), \
-             patch("analyzer.cli.get_context", return_value=mock_ctx):
+        with (
+            patch("analyzer.cli.run_analysis_pipeline", side_effect=fake_pipeline),
+            patch("analyzer.cli.get_context", return_value=mock_ctx),
+        ):
             args = ["analyze"] + (extra_args or [])
             result = self.runner.invoke(app, args)
 

@@ -69,7 +69,9 @@ def _build_global_curves(
 
 
 def _build_curves_for_rows(
-    rows: pd.DataFrame, prices_df: pd.DataFrame, horizon: int,
+    rows: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    horizon: int,
 ) -> list:
     """Vectorized curve builder.
 

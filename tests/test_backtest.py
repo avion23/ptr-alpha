@@ -43,56 +43,84 @@ def _make_transactions(rows):
 
 
 class TestBacktestRecommendations(unittest.TestCase):
-
     def setUp(self):
         self.as_of = pd.Timestamp("2025-01-01")
         horizon = 90
         elapsed_cutoff = self.as_of - pd.Timedelta(days=horizon)
 
-        self.signals = _make_signals([
-            {
-                "member": "Alpha", "ticker": "AAPL",
-                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=30),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 100.0, "decayed_return_pct": 20.0,
-                "peak_potential_pct": 30.0, "spy_alpha_pct": 15.0,
-                "total_return_pct": 25.0, "total_spy_alpha_pct": 18.0,
-            },
-            {
-                "member": "Alpha", "ticker": "MSFT",
-                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=20),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 200.0, "decayed_return_pct": 15.0,
-                "peak_potential_pct": 25.0, "spy_alpha_pct": 10.0,
-                "total_return_pct": 18.0, "total_spy_alpha_pct": 12.0,
-            },
-            {
-                "member": "Beta", "ticker": "GOOG",
-                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=25),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 50.0, "decayed_return_pct": -10.0,
-                "peak_potential_pct": 5.0, "spy_alpha_pct": -15.0,
-                "total_return_pct": -12.0, "total_spy_alpha_pct": -18.0,
-            },
-        ])
+        self.signals = _make_signals(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "AAPL",
+                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=30),
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 100.0,
+                    "decayed_return_pct": 20.0,
+                    "peak_potential_pct": 30.0,
+                    "spy_alpha_pct": 15.0,
+                    "total_return_pct": 25.0,
+                    "total_spy_alpha_pct": 18.0,
+                },
+                {
+                    "member": "Alpha",
+                    "ticker": "MSFT",
+                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=20),
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 200.0,
+                    "decayed_return_pct": 15.0,
+                    "peak_potential_pct": 25.0,
+                    "spy_alpha_pct": 10.0,
+                    "total_return_pct": 18.0,
+                    "total_spy_alpha_pct": 12.0,
+                },
+                {
+                    "member": "Beta",
+                    "ticker": "GOOG",
+                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=25),
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 50.0,
+                    "decayed_return_pct": -10.0,
+                    "peak_potential_pct": 5.0,
+                    "spy_alpha_pct": -15.0,
+                    "total_return_pct": -12.0,
+                    "total_spy_alpha_pct": -18.0,
+                },
+            ]
+        )
 
-        self.recent_transactions = _make_transactions([
-            {
-                "member": "Alpha", "ticker": "CAND",
-                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
-                "transaction_type": "Purchase",
-            },
-            {
-                "member": "Beta", "ticker": "CAND",
-                "transaction_date": "2024-12-12", "disclosure_date": "2024-12-17",
-                "transaction_type": "Purchase",
-            },
-        ])
+        self.recent_transactions = _make_transactions(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "CAND",
+                    "transaction_date": "2024-12-10",
+                    "disclosure_date": "2024-12-15",
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "member": "Beta",
+                    "ticker": "CAND",
+                    "transaction_date": "2024-12-12",
+                    "disclosure_date": "2024-12-17",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
 
     def test_produces_recommendations_for_multi_buyer_ticker(self):
         recs = backtest_recommendations(
-            self.signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertFalse(recs.empty)
         self.assertEqual(len(recs), 1)
@@ -101,82 +129,140 @@ class TestBacktestRecommendations(unittest.TestCase):
         self.assertEqual(recs.iloc[0]["rank"], 1)
 
     def test_returns_empty_when_no_elapsed_training_data(self):
-        recent_signals = _make_signals([
-            {
-                "member": "Alpha", "ticker": "AAPL",
-                "disclosure_date": self.as_of - pd.Timedelta(days=10),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 100.0, "decayed_return_pct": 20.0,
-                "peak_potential_pct": 30.0, "spy_alpha_pct": 15.0,
-                "total_return_pct": 25.0, "total_spy_alpha_pct": 18.0,
-            },
-        ])
+        recent_signals = _make_signals(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "AAPL",
+                    "disclosure_date": self.as_of - pd.Timedelta(days=10),
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 100.0,
+                    "decayed_return_pct": 20.0,
+                    "peak_potential_pct": 30.0,
+                    "spy_alpha_pct": 15.0,
+                    "total_return_pct": 25.0,
+                    "total_spy_alpha_pct": 18.0,
+                },
+            ]
+        )
         recs = backtest_recommendations(
-            recent_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            recent_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertTrue(recs.empty)
 
     def test_returns_empty_when_no_recent_candidates(self):
-        old_transactions = _make_transactions([
-            {
-                "member": "Alpha", "ticker": "CAND",
-                "transaction_date": "2024-01-10", "disclosure_date": "2024-01-15",
-                "transaction_type": "Purchase",
-            },
-            {
-                "member": "Beta", "ticker": "CAND",
-                "transaction_date": "2024-01-12", "disclosure_date": "2024-01-17",
-                "transaction_type": "Purchase",
-            },
-        ])
+        old_transactions = _make_transactions(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "CAND",
+                    "transaction_date": "2024-01-10",
+                    "disclosure_date": "2024-01-15",
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "member": "Beta",
+                    "ticker": "CAND",
+                    "transaction_date": "2024-01-12",
+                    "disclosure_date": "2024-01-17",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
         recs = backtest_recommendations(
-            self.signals, old_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.signals,
+            old_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertTrue(recs.empty)
 
     def test_filters_below_min_buyers(self):
-        single_buyer = _make_transactions([
-            {
-                "member": "Alpha", "ticker": "SOLO",
-                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
-                "transaction_type": "Purchase",
-            },
-        ])
+        single_buyer = _make_transactions(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "SOLO",
+                    "transaction_date": "2024-12-10",
+                    "disclosure_date": "2024-12-15",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
         recs = backtest_recommendations(
-            self.signals, single_buyer, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.signals,
+            single_buyer,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertTrue(recs.empty)
 
     def test_no_lookahead_future_signals_excluded_from_training(self):
-        signals_with_future = pd.concat([
-            self.signals,
-            _make_signals([{
-                "member": "Alpha", "ticker": "FUT",
-                "disclosure_date": self.as_of - pd.Timedelta(days=30),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 100.0, "decayed_return_pct": -50.0,
-                "peak_potential_pct": -40.0, "spy_alpha_pct": -45.0,
-                "total_return_pct": -50.0, "total_spy_alpha_pct": -48.0,
-            }]),
-        ], ignore_index=True)
+        signals_with_future = pd.concat(
+            [
+                self.signals,
+                _make_signals(
+                    [
+                        {
+                            "member": "Alpha",
+                            "ticker": "FUT",
+                            "disclosure_date": self.as_of - pd.Timedelta(days=30),
+                            "signal_type": "Purchase",
+                            "horizon_days": 90,
+                            "entry_price": 100.0,
+                            "decayed_return_pct": -50.0,
+                            "peak_potential_pct": -40.0,
+                            "spy_alpha_pct": -45.0,
+                            "total_return_pct": -50.0,
+                            "total_spy_alpha_pct": -48.0,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
 
         recs_elapsed = backtest_recommendations(
-            self.signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         recs_with_future = backtest_recommendations(
-            signals_with_future, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            signals_with_future,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
 
         self.assertEqual(
             recs_elapsed.iloc[0]["signal_score"],
             recs_with_future.iloc[0]["signal_score"],
         )
-
 
     def test_no_lookahead_in_ticker_perf_signals(self):
         """Regression: not-elapsed signals must not leak into ticker_perf_signals."""
@@ -187,63 +273,101 @@ class TestBacktestRecommendations(unittest.TestCase):
         # 3 fully-elapsed signals for Alpha on CAND (enough for TICKER_PERF_MIN_TRADES)
         elapsed_signals = [
             {
-                "member": "Alpha", "ticker": "CAND",
+                "member": "Alpha",
+                "ticker": "CAND",
                 "disclosure_date": elapsed_cutoff - pd.Timedelta(days=90),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 50.0, "decayed_return_pct": 10.0,
-                "peak_potential_pct": 15.0, "spy_alpha_pct": 5.0,
-                "total_return_pct": 12.0, "total_spy_alpha_pct": 8.0,
+                "signal_type": "Purchase",
+                "horizon_days": 90,
+                "entry_price": 50.0,
+                "decayed_return_pct": 10.0,
+                "peak_potential_pct": 15.0,
+                "spy_alpha_pct": 5.0,
+                "total_return_pct": 12.0,
+                "total_spy_alpha_pct": 8.0,
             },
             {
-                "member": "Alpha", "ticker": "CAND",
+                "member": "Alpha",
+                "ticker": "CAND",
                 "disclosure_date": elapsed_cutoff - pd.Timedelta(days=60),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 50.0, "decayed_return_pct": -5.0,
-                "peak_potential_pct": 5.0, "spy_alpha_pct": -3.0,
-                "total_return_pct": -4.0, "total_spy_alpha_pct": -2.0,
+                "signal_type": "Purchase",
+                "horizon_days": 90,
+                "entry_price": 50.0,
+                "decayed_return_pct": -5.0,
+                "peak_potential_pct": 5.0,
+                "spy_alpha_pct": -3.0,
+                "total_return_pct": -4.0,
+                "total_spy_alpha_pct": -2.0,
             },
             {
-                "member": "Alpha", "ticker": "CAND",
+                "member": "Alpha",
+                "ticker": "CAND",
                 "disclosure_date": elapsed_cutoff - pd.Timedelta(days=30),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 50.0, "decayed_return_pct": 8.0,
-                "peak_potential_pct": 12.0, "spy_alpha_pct": 4.0,
-                "total_return_pct": 9.0, "total_spy_alpha_pct": 5.0,
+                "signal_type": "Purchase",
+                "horizon_days": 90,
+                "entry_price": 50.0,
+                "decayed_return_pct": 8.0,
+                "peak_potential_pct": 12.0,
+                "spy_alpha_pct": 4.0,
+                "total_return_pct": 9.0,
+                "total_spy_alpha_pct": 5.0,
             },
         ]
         # Not-elapsed signal: disclosed 30 days before as_of, horizon 90 not yet elapsed
         not_elapsed_signal = {
-            "member": "Alpha", "ticker": "CAND",
+            "member": "Alpha",
+            "ticker": "CAND",
             "disclosure_date": as_of - pd.Timedelta(days=30),
-            "signal_type": "Purchase", "horizon_days": 90,
-            "entry_price": 50.0, "decayed_return_pct": 500.0,
-            "peak_potential_pct": 600.0, "spy_alpha_pct": 500.0,
-            "total_return_pct": 500.0, "total_spy_alpha_pct": 500.0,
+            "signal_type": "Purchase",
+            "horizon_days": 90,
+            "entry_price": 50.0,
+            "decayed_return_pct": 500.0,
+            "peak_potential_pct": 600.0,
+            "spy_alpha_pct": 500.0,
+            "total_return_pct": 500.0,
+            "total_spy_alpha_pct": 500.0,
         }
 
         signals_elapsed_only = _make_signals(elapsed_signals)
         signals_with_leak = _make_signals(elapsed_signals + [not_elapsed_signal])
 
-        recent_txns = _make_transactions([
-            {
-                "member": "Alpha", "ticker": "CAND",
-                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
-                "transaction_type": "Purchase",
-            },
-            {
-                "member": "Beta", "ticker": "CAND",
-                "transaction_date": "2024-12-12", "disclosure_date": "2024-12-17",
-                "transaction_type": "Purchase",
-            },
-        ])
+        recent_txns = _make_transactions(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "CAND",
+                    "transaction_date": "2024-12-10",
+                    "disclosure_date": "2024-12-15",
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "member": "Beta",
+                    "ticker": "CAND",
+                    "transaction_date": "2024-12-12",
+                    "disclosure_date": "2024-12-17",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
 
         recs_elapsed = backtest_recommendations(
-            signals_elapsed_only, recent_txns, as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            signals_elapsed_only,
+            recent_txns,
+            as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         recs_with_leak = backtest_recommendations(
-            signals_with_leak, recent_txns, as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            signals_with_leak,
+            recent_txns,
+            as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
 
         self.assertFalse(recs_elapsed.empty)
@@ -256,7 +380,6 @@ class TestBacktestRecommendations(unittest.TestCase):
 
 
 class TestEvaluateBacktest(unittest.TestCase):
-
     def setUp(self):
         dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
         n = len(dates)
@@ -311,8 +434,12 @@ class TestEvaluateBacktest(unittest.TestCase):
         short_end = pd.Timestamp("2025-01-15")
         n_full = len(full_dates)
         n_short = len(pd.date_range("2024-12-01", short_end, freq="D"))
-        aapl_vals = [100.0 + i * 0.1 for i in range(n_short)] + [np.nan] * (n_full - n_short)
-        goog_vals = [200.0 - i * 0.05 for i in range(n_short)] + [np.nan] * (n_full - n_short)
+        aapl_vals = [100.0 + i * 0.1 for i in range(n_short)] + [np.nan] * (
+            n_full - n_short
+        )
+        goog_vals = [200.0 - i * 0.05 for i in range(n_short)] + [np.nan] * (
+            n_full - n_short
+        )
         spy_vals = [400.0 + i * 0.02 for i in range(n_full)]
         prices = pd.DataFrame(
             {"AAPL": aapl_vals, "GOOG": goog_vals, "SPY": spy_vals},
@@ -323,8 +450,12 @@ class TestEvaluateBacktest(unittest.TestCase):
         )
         # Both AAPL/GOOG have data that ends before exit → both included at last price
         evaluated = result.dropna(subset=["bt_return_pct"])
-        self.assertEqual(len(evaluated), 2, "delisted tickers must be included, not dropped")
-        self.assertTrue(evaluated["bt_delisted"].all(), "both should be flagged as delisted")
+        self.assertEqual(
+            len(evaluated), 2, "delisted tickers must be included, not dropped"
+        )
+        self.assertTrue(
+            evaluated["bt_delisted"].all(), "both should be flagged as delisted"
+        )
         # Coverage counts should be propagated in attrs
         self.assertEqual(result.attrs.get("n_delisted"), 2)
 
@@ -338,16 +469,17 @@ class TestEvaluateBacktest(unittest.TestCase):
 
 
 class TestSummarizeBacktest(unittest.TestCase):
-
     def test_groups_by_rank(self):
         # Bug 4: summary now includes SPY_BH baseline row in addition to
         # per-rank rows and ALL. len == 4 (rank1, rank2, ALL, SPY_BH).
-        results = pd.DataFrame({
-            "rank": [1, 1, 2, 2],
-            "bt_return_pct": [10.0, -5.0, 20.0, 15.0],
-            "bt_alpha_pct": [5.0, -8.0, 15.0, 10.0],
-            "bt_spy_return_pct": [3.0, 1.0, 4.0, 2.0],
-        })
+        results = pd.DataFrame(
+            {
+                "rank": [1, 1, 2, 2],
+                "bt_return_pct": [10.0, -5.0, 20.0, 15.0],
+                "bt_alpha_pct": [5.0, -8.0, 15.0, 10.0],
+                "bt_spy_return_pct": [3.0, 1.0, 4.0, 2.0],
+            }
+        )
         summary = summarize_backtest(results)
         self.assertEqual(len(summary), 4)  # rank1, rank2, ALL, SPY_BH
         rank1 = summary[summary["rank"] == 1].iloc[0]
@@ -359,11 +491,13 @@ class TestSummarizeBacktest(unittest.TestCase):
         self.assertEqual(rank2["win_rate_pct"], 100.0)
 
     def test_includes_overall_row(self):
-        results = pd.DataFrame({
-            "rank": [1, 2],
-            "bt_return_pct": [10.0, -5.0],
-            "bt_alpha_pct": [5.0, -8.0],
-        })
+        results = pd.DataFrame(
+            {
+                "rank": [1, 2],
+                "bt_return_pct": [10.0, -5.0],
+                "bt_alpha_pct": [5.0, -8.0],
+            }
+        )
         summary = summarize_backtest(results)
         overall = summary[summary["rank"] == "ALL"].iloc[0]
         self.assertEqual(overall["count"], 2)
@@ -377,12 +511,14 @@ class TestSummarizeBacktest(unittest.TestCase):
 
     def test_all_nan_returns_dropped(self):
         # Bug 4: summary now includes SPY_BH baseline, so len == 3 (rank1, ALL, SPY_BH).
-        results = pd.DataFrame({
-            "rank": [1, 2],
-            "bt_return_pct": [10.0, None],
-            "bt_alpha_pct": [5.0, None],
-            "bt_spy_return_pct": [3.0, None],
-        })
+        results = pd.DataFrame(
+            {
+                "rank": [1, 2],
+                "bt_return_pct": [10.0, None],
+                "bt_alpha_pct": [5.0, None],
+                "bt_spy_return_pct": [3.0, None],
+            }
+        )
         summary = summarize_backtest(results)
         self.assertEqual(len(summary), 3)  # rank1, ALL, SPY_BH (rank2 dropped as NaN)
         self.assertEqual(summary[summary["rank"] == 1].iloc[0]["count"], 1)
@@ -401,12 +537,14 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
 
     @staticmethod
     def _single_rec(ticker="AAPL"):
-        return pd.DataFrame({
-            "rank": [1],
-            "ticker": [ticker],
-            "signal_score": [50.0],
-            "num_buyers": [2],
-        })
+        return pd.DataFrame(
+            {
+                "rank": [1],
+                "ticker": [ticker],
+                "signal_score": [50.0],
+                "num_buyers": [2],
+            }
+        )
 
     # ---- Bug 1a: default use_dip_entry=False, entry = as_of price
 
@@ -422,8 +560,12 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
         recs = self._single_rec()
 
-        result = evaluate_backtest(recs, prices, as_of, horizon=90)  # default use_dip_entry=False
-        self.assertFalse(result.dropna(subset=["bt_return_pct"]).empty, "trade should be evaluated")
+        result = evaluate_backtest(
+            recs, prices, as_of, horizon=90
+        )  # default use_dip_entry=False
+        self.assertFalse(
+            result.dropna(subset=["bt_return_pct"]).empty, "trade should be evaluated"
+        )
         # Entry must be the as_of price (100), not the future dip (80)
         self.assertAlmostEqual(result.iloc[0]["bt_entry_price"], 100.0, places=1)
 
@@ -440,11 +582,20 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
         recs = self._single_rec()
 
-        result = evaluate_backtest(recs, prices, as_of, horizon=90,
-                                   use_dip_entry=True, pullback_pct=0.05, max_wait_days=10)
+        result = evaluate_backtest(
+            recs,
+            prices,
+            as_of,
+            horizon=90,
+            use_dip_entry=True,
+            pullback_pct=0.05,
+            max_wait_days=10,
+        )
         # No dip → position not taken → bt_return_pct is NaN
-        self.assertTrue(result.dropna(subset=["bt_return_pct"]).empty,
-                        "no dip → position must not be taken (no fallback fill)")
+        self.assertTrue(
+            result.dropna(subset=["bt_return_pct"]).empty,
+            "no dip → position must not be taken (no fallback fill)",
+        )
 
     def test_spy_window_aligned_with_dip_entry_date(self):
         """Bug 1b: when use_dip_entry=True the SPY return must cover the same
@@ -461,23 +612,41 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
         recs = self._single_rec()
 
-        result_dip = evaluate_backtest(recs, prices, as_of, horizon=horizon,
-                                       use_dip_entry=True, pullback_pct=0.05, max_wait_days=10)
+        result_dip = evaluate_backtest(
+            recs,
+            prices,
+            as_of,
+            horizon=horizon,
+            use_dip_entry=True,
+            pullback_pct=0.05,
+            max_wait_days=10,
+        )
         valid = result_dip.dropna(subset=["bt_return_pct"])
         # Finding 4 fix: assertFalse instead of skipTest so regressions are visible.
-        self.assertFalse(valid.empty, "dip should have been triggered by the 6% price drop on Jan 6")
+        self.assertFalse(
+            valid.empty, "dip should have been triggered by the 6% price drop on Jan 6"
+        )
 
         # entry_delay should be 5 calendar days (Jan 1 → Jan 6)
         self.assertEqual(valid.iloc[0]["bt_entry_delay"], 5)
 
         # SPY return in the dip window must differ from the as_of window
         # because SPY rises 0.5/day and 5 days of shift matters.
-        spy_from_as_of = round((spy_arr[dates.get_loc(as_of + pd.Timedelta(days=horizon))]
-                                / spy_arr[dates.get_loc(as_of)] - 1) * 100, 2)
+        spy_from_as_of = round(
+            (
+                spy_arr[dates.get_loc(as_of + pd.Timedelta(days=horizon))]
+                / spy_arr[dates.get_loc(as_of)]
+                - 1
+            )
+            * 100,
+            2,
+        )
         spy_from_dip = valid.iloc[0]["bt_spy_return_pct"]
         # The two windows must be different (SPY is non-flat)
         self.assertNotAlmostEqual(
-            spy_from_dip, spy_from_as_of, places=1,
+            spy_from_dip,
+            spy_from_as_of,
+            places=1,
             msg="SPY return in dip window must differ from as_of window when entry is delayed",
         )
 
@@ -487,7 +656,7 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         """Bug 1c: entry_delay must be calendar days, not the array-row offset.
         A dip on Monday after a Friday as_of spans 3 calendar days but only
         1 trading row (no weekend rows in the price array)."""
-        as_of = pd.Timestamp("2025-01-03")   # Friday
+        as_of = pd.Timestamp("2025-01-03")  # Friday
         dip_date = pd.Timestamp("2025-01-06")  # Monday: 3 calendar days, 1 trading row
         # Use only business-day prices so the array index gap is 1 but calendar gap is 3
         bdays = pd.date_range("2024-12-02", "2025-06-01", freq="B")
@@ -496,15 +665,27 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         prices = self._make_prices(bdays, {"AAPL": prices_arr, "SPY": spy_arr})
         recs = self._single_rec()
 
-        result = evaluate_backtest(recs, prices, as_of, horizon=90,
-                                   use_dip_entry=True, pullback_pct=0.05, max_wait_days=10)
+        result = evaluate_backtest(
+            recs,
+            prices,
+            as_of,
+            horizon=90,
+            use_dip_entry=True,
+            pullback_pct=0.05,
+            max_wait_days=10,
+        )
         valid = result.dropna(subset=["bt_return_pct"])
-        self.assertFalse(valid.empty, "dip should have been triggered by the 10% price drop on Jan 6")
+        self.assertFalse(
+            valid.empty, "dip should have been triggered by the 10% price drop on Jan 6"
+        )
         entry_delay = valid.iloc[0]["bt_entry_delay"]
         # Old buggy code: would return 1 (array-row index hits[0])
         # Correct code:   must return 3 (calendar days Jan 3 → Jan 6)
-        self.assertEqual(entry_delay, 3,
-                         "entry_delay must be calendar days (3), not trading-row count (1)")
+        self.assertEqual(
+            entry_delay,
+            3,
+            "entry_delay must be calendar days (3), not trading-row count (1)",
+        )
 
     # ---- Bug 2: survivorship — delisted ticker included at last price
 
@@ -519,7 +700,10 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         recs = self._single_rec("AAPL")
 
         result = evaluate_backtest(recs, prices, as_of, horizon=90)
-        self.assertTrue(result.dropna(subset=["bt_return_pct"]).empty, "no-price ticker must be skipped")
+        self.assertTrue(
+            result.dropna(subset=["bt_return_pct"]).empty,
+            "no-price ticker must be skipped",
+        )
         self.assertEqual(result.attrs.get("n_no_price", 0), 1)
         self.assertEqual(result.attrs.get("n_delisted", 0), 0)
 
@@ -532,8 +716,9 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
         n_alive = len(pd.date_range("2024-12-01", last_day, freq="D"))
         # AAPL prices: 100 → 110 while alive, then NaN
-        aapl_arr = [100.0 + i * (10.0 / (n_alive - 1)) for i in range(n_alive)] + \
-                   [float("nan")] * (len(dates) - n_alive)
+        aapl_arr = [100.0 + i * (10.0 / (n_alive - 1)) for i in range(n_alive)] + [
+            float("nan")
+        ] * (len(dates) - n_alive)
         spy_arr = [400.0 + i * 0.02 for i in range(len(dates))]
         prices = self._make_prices(dates, {"AAPL": aapl_arr, "SPY": spy_arr})
         recs = self._single_rec("AAPL")
@@ -542,8 +727,12 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         valid = result.dropna(subset=["bt_return_pct"])
         self.assertEqual(len(valid), 1, "delisted ticker must be included")
         self.assertTrue(valid.iloc[0]["bt_delisted"], "bt_delisted flag must be True")
-        self.assertAlmostEqual(valid.iloc[0]["bt_exit_price"], 110.0, places=0,
-                               msg="exit must use the last available price")
+        self.assertAlmostEqual(
+            valid.iloc[0]["bt_exit_price"],
+            110.0,
+            places=0,
+            msg="exit must use the last available price",
+        )
         self.assertEqual(result.attrs.get("n_delisted"), 1)
         self.assertEqual(result.attrs.get("n_no_price"), 0)
 
@@ -555,54 +744,72 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         as_of = pd.Timestamp("2025-01-01")
         dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
         n = len(dates)
-        prices = self._make_prices(dates, {
-            "AAPL": [100.0 + i * 0.1 for i in range(n)],
-            "SPY": [400.0 + i * 0.02 for i in range(n)],
-        })
+        prices = self._make_prices(
+            dates,
+            {
+                "AAPL": [100.0 + i * 0.1 for i in range(n)],
+                "SPY": [400.0 + i * 0.02 for i in range(n)],
+            },
+        )
         # Two separate recommendations for the same ticker
-        recs = pd.DataFrame({
-            "rank": [1, 2],
-            "ticker": ["AAPL", "AAPL"],
-            "signal_score": [50.0, 30.0],
-            "num_buyers": [3, 2],
-        })
+        recs = pd.DataFrame(
+            {
+                "rank": [1, 2],
+                "ticker": ["AAPL", "AAPL"],
+                "signal_score": [50.0, 30.0],
+                "num_buyers": [3, 2],
+            }
+        )
 
         result = evaluate_backtest(recs, prices, as_of, horizon=90)
-        self.assertEqual(len(result), 2,
-                         "duplicate-ticker recommendations must not fan-out: expected 2 rows not 4")
+        self.assertEqual(
+            len(result),
+            2,
+            "duplicate-ticker recommendations must not fan-out: expected 2 rows not 4",
+        )
         self.assertEqual(list(result["rank"]), [1, 2])
         # Both rows should have the same bt_entry_price (same ticker, same as_of)
-        self.assertEqual(result.iloc[0]["bt_entry_price"], result.iloc[1]["bt_entry_price"])
+        self.assertEqual(
+            result.iloc[0]["bt_entry_price"], result.iloc[1]["bt_entry_price"]
+        )
 
     # ---- Bug 4: SPY baseline in summary, coverage counts
 
     def test_summary_includes_spy_baseline_row(self):
         """Bug 4: summarize_backtest must include a SPY_BH baseline row so
         callers can compare strategy returns against buy-and-hold SPY."""
-        results = pd.DataFrame({
-            "rank": [1, 1, 2],
-            "bt_return_pct": [10.0, -5.0, 20.0],
-            "bt_alpha_pct": [5.0, -8.0, 15.0],
-            "bt_spy_return_pct": [4.0, 2.0, 3.0],
-        })
+        results = pd.DataFrame(
+            {
+                "rank": [1, 1, 2],
+                "bt_return_pct": [10.0, -5.0, 20.0],
+                "bt_alpha_pct": [5.0, -8.0, 15.0],
+                "bt_spy_return_pct": [4.0, 2.0, 3.0],
+            }
+        )
         summary = summarize_backtest(results)
-        self.assertIn("SPY_BH", summary["rank"].values, "SPY_BH baseline row must be present")
+        self.assertIn(
+            "SPY_BH", summary["rank"].values, "SPY_BH baseline row must be present"
+        )
         spy_row = summary[summary["rank"] == "SPY_BH"].iloc[0]
         self.assertEqual(spy_row["count"], 3)
         # All three SPY returns are positive → win_rate = 100 %
         self.assertEqual(spy_row["win_rate_pct"], 100.0)
-        self.assertAlmostEqual(spy_row["avg_return_pct"], (4.0 + 2.0 + 3.0) / 3, places=2)
+        self.assertAlmostEqual(
+            spy_row["avg_return_pct"], (4.0 + 2.0 + 3.0) / 3, places=2
+        )
         self.assertEqual(spy_row["avg_alpha_pct"], 0.0)  # SPY vs itself is zero
 
     def test_summary_propagates_coverage_counts_from_attrs(self):
         """Bug 4: summarize_backtest must propagate n_no_price and n_delisted
         from result.attrs so coverage gaps are visible to callers."""
-        results = pd.DataFrame({
-            "rank": [1],
-            "bt_return_pct": [10.0],
-            "bt_alpha_pct": [5.0],
-            "bt_spy_return_pct": [3.0],
-        })
+        results = pd.DataFrame(
+            {
+                "rank": [1],
+                "bt_return_pct": [10.0],
+                "bt_alpha_pct": [5.0],
+                "bt_spy_return_pct": [3.0],
+            }
+        )
         results.attrs["n_no_price"] = 5
         results.attrs["n_delisted"] = 2
         summary = summarize_backtest(results)
@@ -617,23 +824,28 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         n = len(dates)
         last_alive = pd.Timestamp("2025-01-20")
         n_alive = len(pd.date_range("2024-12-01", last_alive, freq="D"))
-        prices = self._make_prices(dates, {
-            # GOOG: full data, evaluated normally
-            "GOOG": [200.0 + i * 0.1 for i in range(n)],
-            # AAPL: delisted early (after as_of → counts as n_delisted)
-            "AAPL": [100.0] * n_alive + [float("nan")] * (n - n_alive),
-            "SPY": [400.0 + i * 0.02 for i in range(n)],
-        })
-        recs = pd.DataFrame({
-            "rank": [1, 2, 3],
-            "ticker": ["GOOG", "AAPL", "MSFT"],  # MSFT has no price data
-            "signal_score": [50.0, 40.0, 30.0],
-            "num_buyers": [3, 2, 2],
-        })
+        prices = self._make_prices(
+            dates,
+            {
+                # GOOG: full data, evaluated normally
+                "GOOG": [200.0 + i * 0.1 for i in range(n)],
+                # AAPL: delisted early (after as_of → counts as n_delisted)
+                "AAPL": [100.0] * n_alive + [float("nan")] * (n - n_alive),
+                "SPY": [400.0 + i * 0.02 for i in range(n)],
+            },
+        )
+        recs = pd.DataFrame(
+            {
+                "rank": [1, 2, 3],
+                "ticker": ["GOOG", "AAPL", "MSFT"],  # MSFT has no price data
+                "signal_score": [50.0, 40.0, 30.0],
+                "num_buyers": [3, 2, 2],
+            }
+        )
         ev = evaluate_backtest(recs, prices, as_of, horizon=90)
         summary = summarize_backtest(ev)
-        self.assertEqual(summary.attrs.get("n_no_price"), 1)   # MSFT
-        self.assertEqual(summary.attrs.get("n_delisted"), 1)   # AAPL
+        self.assertEqual(summary.attrs.get("n_no_price"), 1)  # MSFT
+        self.assertEqual(summary.attrs.get("n_delisted"), 1)  # AAPL
 
     # ---- Finding 2: ticker delisted BEFORE as_of must NOT be included
 
@@ -662,10 +874,16 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
             "ticker delisted before as_of must not be included (not tradeable at rec time)",
         )
         # Must be counted as n_no_price (untradeable), NOT n_delisted
-        self.assertEqual(result.attrs.get("n_no_price", 0), 1,
-                         "pre-as_of delisting must be counted in n_no_price")
-        self.assertEqual(result.attrs.get("n_delisted", 0), 0,
-                         "pre-as_of delisting must NOT increment n_delisted")
+        self.assertEqual(
+            result.attrs.get("n_no_price", 0),
+            1,
+            "pre-as_of delisting must be counted in n_no_price",
+        )
+        self.assertEqual(
+            result.attrs.get("n_delisted", 0),
+            0,
+            "pre-as_of delisting must NOT increment n_delisted",
+        )
 
     # ---- Finding 1: multi-date concat must preserve summed coverage counts
 
@@ -680,61 +898,85 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         last_alive = pd.Timestamp("2025-02-01")
         n_alive = len(pd.date_range("2024-12-01", last_alive, freq="D"))
 
-        prices = self._make_prices(dates, {
-            "AAPL": [100.0 + i * 0.05 for i in range(n)],
-            # GOOG delisted after last_alive
-            "GOOG": [200.0] * n_alive + [float("nan")] * (n - n_alive),
-            "SPY": [400.0 + i * 0.02 for i in range(n)],
-        })
+        prices = self._make_prices(
+            dates,
+            {
+                "AAPL": [100.0 + i * 0.05 for i in range(n)],
+                # GOOG delisted after last_alive
+                "GOOG": [200.0] * n_alive + [float("nan")] * (n - n_alive),
+                "SPY": [400.0 + i * 0.02 for i in range(n)],
+            },
+        )
 
         # as_of_1: AAPL OK, MSFT missing (n_no_price=1), GOOG alive (n_delisted=0)
-        recs1 = pd.DataFrame({
-            "rank": [1, 2], "ticker": ["AAPL", "MSFT"],
-            "signal_score": [50.0, 40.0], "num_buyers": [2, 2],
-        })
+        recs1 = pd.DataFrame(
+            {
+                "rank": [1, 2],
+                "ticker": ["AAPL", "MSFT"],
+                "signal_score": [50.0, 40.0],
+                "num_buyers": [2, 2],
+            }
+        )
         ev1 = evaluate_backtest(recs1, prices, pd.Timestamp("2025-01-01"), horizon=90)
-        self.assertEqual(ev1.attrs.get("n_no_price", 0), 1)   # MSFT
+        self.assertEqual(ev1.attrs.get("n_no_price", 0), 1)  # MSFT
 
         # as_of_2: AAPL OK, GOOG now delisted during hold (n_delisted=1)
-        recs2 = pd.DataFrame({
-            "rank": [1, 2], "ticker": ["AAPL", "GOOG"],
-            "signal_score": [50.0, 40.0], "num_buyers": [2, 2],
-        })
+        recs2 = pd.DataFrame(
+            {
+                "rank": [1, 2],
+                "ticker": ["AAPL", "GOOG"],
+                "signal_score": [50.0, 40.0],
+                "num_buyers": [2, 2],
+            }
+        )
         ev2 = evaluate_backtest(recs2, prices, pd.Timestamp("2025-01-15"), horizon=90)
-        self.assertEqual(ev2.attrs.get("n_delisted", 0), 1)   # GOOG
+        self.assertEqual(ev2.attrs.get("n_delisted", 0), 1)  # GOOG
 
         # Mimic the pipeline: sum counts, set on combined, then summarize
         combined = pd.concat(
-            [ev1.dropna(subset=["bt_return_pct"]),
-             ev2.dropna(subset=["bt_return_pct"])],
+            [
+                ev1.dropna(subset=["bt_return_pct"]),
+                ev2.dropna(subset=["bt_return_pct"]),
+            ],
             ignore_index=True,
         )
         # pd.concat drops attrs → combined.attrs is {} — must set manually
-        combined.attrs["n_no_price"] = (
-            ev1.attrs.get("n_no_price", 0) + ev2.attrs.get("n_no_price", 0)
+        combined.attrs["n_no_price"] = ev1.attrs.get("n_no_price", 0) + ev2.attrs.get(
+            "n_no_price", 0
         )
-        combined.attrs["n_delisted"] = (
-            ev1.attrs.get("n_delisted", 0) + ev2.attrs.get("n_delisted", 0)
+        combined.attrs["n_delisted"] = ev1.attrs.get("n_delisted", 0) + ev2.attrs.get(
+            "n_delisted", 0
         )
 
         summary = summarize_backtest(combined)
-        self.assertEqual(summary.attrs.get("n_no_price"), 1,
-                         "summed n_no_price must survive concat → summarize")
-        self.assertEqual(summary.attrs.get("n_delisted"), 1,
-                         "summed n_delisted must survive concat → summarize")
+        self.assertEqual(
+            summary.attrs.get("n_no_price"),
+            1,
+            "summed n_no_price must survive concat → summarize",
+        )
+        self.assertEqual(
+            summary.attrs.get("n_delisted"),
+            1,
+            "summed n_delisted must survive concat → summarize",
+        )
 
 
 class TestDatabaseDateRange(DatabaseTestCase):
-
     def test_filters_by_date_range(self):
-        df = pd.DataFrame({
-            "doc_id": ["d1", "d2", "d3"],
-            "member": ["Alice", "Bob", "Charlie"],
-            "ticker": ["AAPL", "GOOG", "MSFT"],
-            "transaction_date": pd.to_datetime(["2024-01-01", "2024-06-01", "2024-12-01"]),
-            "disclosure_date": pd.to_datetime(["2024-01-05", "2024-06-05", "2024-12-05"]),
-            "transaction_type": ["Purchase", "Purchase", "Purchase"],
-        })
+        df = pd.DataFrame(
+            {
+                "doc_id": ["d1", "d2", "d3"],
+                "member": ["Alice", "Bob", "Charlie"],
+                "ticker": ["AAPL", "GOOG", "MSFT"],
+                "transaction_date": pd.to_datetime(
+                    ["2024-01-01", "2024-06-01", "2024-12-01"]
+                ),
+                "disclosure_date": pd.to_datetime(
+                    ["2024-01-05", "2024-06-05", "2024-12-05"]
+                ),
+                "transaction_type": ["Purchase", "Purchase", "Purchase"],
+            }
+        )
         self.db.upsert_transactions(df, source="house_pdf")
 
         result = self.db.get_transactions_by_date_range(
@@ -744,14 +986,16 @@ class TestDatabaseDateRange(DatabaseTestCase):
         self.assertEqual(result.iloc[0]["ticker"], "GOOG")
 
     def test_excludes_transaction_date_after_disclosure(self):
-        df = pd.DataFrame({
-            "doc_id": ["good", "bad"],
-            "member": ["Alice", "Bob"],
-            "ticker": ["AAPL", "GOOG"],
-            "transaction_date": pd.to_datetime(["2024-06-01", "2024-12-01"]),
-            "disclosure_date": pd.to_datetime(["2024-06-05", "2024-06-05"]),
-            "transaction_type": ["Purchase", "Purchase"],
-        })
+        df = pd.DataFrame(
+            {
+                "doc_id": ["good", "bad"],
+                "member": ["Alice", "Bob"],
+                "ticker": ["AAPL", "GOOG"],
+                "transaction_date": pd.to_datetime(["2024-06-01", "2024-12-01"]),
+                "disclosure_date": pd.to_datetime(["2024-06-05", "2024-06-05"]),
+                "transaction_type": ["Purchase", "Purchase"],
+            }
+        )
         self.db.upsert_transactions(df, source="house_pdf")
 
         result = self.db.get_transactions_by_date_range(
@@ -761,14 +1005,16 @@ class TestDatabaseDateRange(DatabaseTestCase):
         self.assertEqual(result.iloc[0]["ticker"], "AAPL")
 
     def test_empty_range_returns_empty(self):
-        df = pd.DataFrame({
-            "doc_id": ["d1"],
-            "member": ["Alice"],
-            "ticker": ["AAPL"],
-            "transaction_date": pd.to_datetime(["2024-06-01"]),
-            "disclosure_date": pd.to_datetime(["2024-06-05"]),
-            "transaction_type": ["Purchase"],
-        })
+        df = pd.DataFrame(
+            {
+                "doc_id": ["d1"],
+                "member": ["Alice"],
+                "ticker": ["AAPL"],
+                "transaction_date": pd.to_datetime(["2024-06-01"]),
+                "disclosure_date": pd.to_datetime(["2024-06-05"]),
+                "transaction_type": ["Purchase"],
+            }
+        )
         self.db.upsert_transactions(df, source="house_pdf")
 
         result = self.db.get_transactions_by_date_range(
@@ -788,68 +1034,104 @@ class TestTrainingLookbackDays(unittest.TestCase):
         # Old signals from 2022 — far outside a 365-day lookback from 2024-06-15
         # Uses same members (Alpha, Beta) as recent signals and transactions
         # so they affect member_rankings when included.
-        self.old_signals = _make_signals([
-            {
-                "member": "Alpha", "ticker": "OLDT",
-                "disclosure_date": "2022-06-01",
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 50.0, "decayed_return_pct": 30.0,
-                "peak_potential_pct": 40.0, "spy_alpha_pct": 20.0,
-                "total_return_pct": 35.0, "total_spy_alpha_pct": 25.0,
-            },
-            {
-                "member": "Alpha", "ticker": "OLDT2",
-                "disclosure_date": "2022-09-01",
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 60.0, "decayed_return_pct": 25.0,
-                "peak_potential_pct": 35.0, "spy_alpha_pct": 18.0,
-                "total_return_pct": 28.0, "total_spy_alpha_pct": 20.0,
-            },
-        ])
+        self.old_signals = _make_signals(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "OLDT",
+                    "disclosure_date": "2022-06-01",
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 50.0,
+                    "decayed_return_pct": 30.0,
+                    "peak_potential_pct": 40.0,
+                    "spy_alpha_pct": 20.0,
+                    "total_return_pct": 35.0,
+                    "total_spy_alpha_pct": 25.0,
+                },
+                {
+                    "member": "Alpha",
+                    "ticker": "OLDT2",
+                    "disclosure_date": "2022-09-01",
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 60.0,
+                    "decayed_return_pct": 25.0,
+                    "peak_potential_pct": 35.0,
+                    "spy_alpha_pct": 18.0,
+                    "total_return_pct": 28.0,
+                    "total_spy_alpha_pct": 20.0,
+                },
+            ]
+        )
 
         # Recent signals from 2024 — within a 365-day lookback from 2024-06-15
-        self.recent_signals = _make_signals([
-            {
-                "member": "Alpha", "ticker": "RECN",
-                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=10),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 100.0, "decayed_return_pct": 15.0,
-                "peak_potential_pct": 25.0, "spy_alpha_pct": 10.0,
-                "total_return_pct": 18.0, "total_spy_alpha_pct": 12.0,
-            },
-            {
-                "member": "Beta", "ticker": "RECN2",
-                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=5),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 80.0, "decayed_return_pct": 12.0,
-                "peak_potential_pct": 20.0, "spy_alpha_pct": 8.0,
-                "total_return_pct": 14.0, "total_spy_alpha_pct": 9.0,
-            },
-        ])
+        self.recent_signals = _make_signals(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "RECN",
+                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=10),
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 100.0,
+                    "decayed_return_pct": 15.0,
+                    "peak_potential_pct": 25.0,
+                    "spy_alpha_pct": 10.0,
+                    "total_return_pct": 18.0,
+                    "total_spy_alpha_pct": 12.0,
+                },
+                {
+                    "member": "Beta",
+                    "ticker": "RECN2",
+                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=5),
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 80.0,
+                    "decayed_return_pct": 12.0,
+                    "peak_potential_pct": 20.0,
+                    "spy_alpha_pct": 8.0,
+                    "total_return_pct": 14.0,
+                    "total_spy_alpha_pct": 9.0,
+                },
+            ]
+        )
 
         self.all_signals = pd.concat(
             [self.old_signals, self.recent_signals], ignore_index=True
         )
 
         # Recent transactions that create candidate tickers — uses same members
-        self.recent_transactions = _make_transactions([
-            {
-                "member": "Alpha", "ticker": "CAND",
-                "transaction_date": "2024-06-01", "disclosure_date": "2024-06-05",
-                "transaction_type": "Purchase",
-            },
-            {
-                "member": "Beta", "ticker": "CAND",
-                "transaction_date": "2024-06-02", "disclosure_date": "2024-06-06",
-                "transaction_type": "Purchase",
-            },
-        ])
+        self.recent_transactions = _make_transactions(
+            [
+                {
+                    "member": "Alpha",
+                    "ticker": "CAND",
+                    "transaction_date": "2024-06-01",
+                    "disclosure_date": "2024-06-05",
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "member": "Beta",
+                    "ticker": "CAND",
+                    "transaction_date": "2024-06-02",
+                    "disclosure_date": "2024-06-06",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
 
     def test_without_lookback_uses_all_loaded_signals(self):
         """Without training_lookback_days, old signals contribute to rankings."""
         recs = backtest_recommendations(
-            self.all_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.all_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertFalse(recs.empty)
         # OldMember signals are included in training → they affect member_rankings
@@ -860,8 +1142,14 @@ class TestTrainingLookbackDays(unittest.TestCase):
     def test_with_lookback_excludes_old_signals(self):
         """With training_lookback_days=365, signals from 2022 are excluded."""
         recs = backtest_recommendations(
-            self.all_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.all_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
             training_lookback_days=365,
         )
         self.assertFalse(recs.empty)
@@ -871,12 +1159,24 @@ class TestTrainingLookbackDays(unittest.TestCase):
     def test_lookback_changes_member_rankings(self):
         """Scores differ when old signals are excluded vs included."""
         recs_without = backtest_recommendations(
-            self.all_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.all_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         recs_with = backtest_recommendations(
-            self.all_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.all_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
             training_lookback_days=365,
         )
         self.assertFalse(recs_without.empty)
@@ -892,12 +1192,24 @@ class TestTrainingLookbackDays(unittest.TestCase):
     def test_lookback_only_recent_signals_unchanged(self):
         """When all signals are within the lookback, results match no-lookback."""
         recs_no_lookback = backtest_recommendations(
-            self.recent_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.recent_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         recs_with_lookback = backtest_recommendations(
-            self.recent_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.recent_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
             training_lookback_days=365,
         )
         pd.testing.assert_frame_equal(recs_no_lookback, recs_with_lookback)
@@ -905,13 +1217,25 @@ class TestTrainingLookbackDays(unittest.TestCase):
     def test_lookback_none_has_no_effect(self):
         """training_lookback_days=None behaves like no filter."""
         recs_none = backtest_recommendations(
-            self.all_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.all_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
             training_lookback_days=None,
         )
         recs_default = backtest_recommendations(
-            self.all_signals, self.recent_transactions, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.all_signals,
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         pd.testing.assert_frame_equal(recs_none, recs_default)
 
@@ -930,38 +1254,62 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         # the default 1.0 lift threshold).
         star_signals = []
         for i, tk in enumerate(["AAA", "BBB", "CCC", "GGG", "HHH", "III"]):
-            star_signals.append({
-                "member": "Star", "ticker": tk,
-                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=80 - i * 5),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 100.0, "decayed_return_pct": 25.0 + i,
-                "peak_potential_pct": 35.0 + i, "spy_alpha_pct": 20.0 + i,
-                "total_return_pct": 30.0 + i, "total_spy_alpha_pct": 22.0 + i,
-            })
+            star_signals.append(
+                {
+                    "member": "Star",
+                    "ticker": tk,
+                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=80 - i * 5),
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 100.0,
+                    "decayed_return_pct": 25.0 + i,
+                    "peak_potential_pct": 35.0 + i,
+                    "spy_alpha_pct": 20.0 + i,
+                    "total_return_pct": 30.0 + i,
+                    "total_spy_alpha_pct": 22.0 + i,
+                }
+            )
         dud_signals = []
         for i, tk in enumerate(["DDD", "EEE", "FFF", "JJJ", "KKK", "LLL"]):
-            dud_signals.append({
-                "member": "Dud", "ticker": tk,
-                "disclosure_date": elapsed_cutoff - pd.Timedelta(days=55 - i * 3),
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 100.0, "decayed_return_pct": -20.0 - i,
-                "peak_potential_pct": -10.0 - i, "spy_alpha_pct": -25.0 - i,
-                "total_return_pct": -22.0 - i, "total_spy_alpha_pct": -28.0 - i,
-            })
+            dud_signals.append(
+                {
+                    "member": "Dud",
+                    "ticker": tk,
+                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=55 - i * 3),
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 100.0,
+                    "decayed_return_pct": -20.0 - i,
+                    "peak_potential_pct": -10.0 - i,
+                    "spy_alpha_pct": -25.0 - i,
+                    "total_return_pct": -22.0 - i,
+                    "total_spy_alpha_pct": -28.0 - i,
+                }
+            )
         self.signals = _make_signals(star_signals + dud_signals)
 
     def test_high_skill_solo_buyer_recommended_with_min_buyers_1(self):
         """A single high-skill buyer should appear when min_buyers=1."""
-        solo_txns = _make_transactions([
-            {
-                "member": "Star", "ticker": "SOLO1",
-                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
-                "transaction_type": "Purchase",
-            },
-        ])
+        solo_txns = _make_transactions(
+            [
+                {
+                    "member": "Star",
+                    "ticker": "SOLO1",
+                    "transaction_date": "2024-12-10",
+                    "disclosure_date": "2024-12-15",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
         recs = backtest_recommendations(
-            self.signals, solo_txns, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
+            self.signals,
+            solo_txns,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=1,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertFalse(recs.empty)
         self.assertEqual(recs.iloc[0]["ticker"], "SOLO1")
@@ -969,54 +1317,90 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
 
     def test_low_skill_solo_buyer_filtered_with_min_buyers_1(self):
         """A single low-skill buyer (posterior_lift < 1.0) should be rejected."""
-        solo_txns = _make_transactions([
-            {
-                "member": "Dud", "ticker": "SOLO2",
-                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
-                "transaction_type": "Purchase",
-            },
-        ])
+        solo_txns = _make_transactions(
+            [
+                {
+                    "member": "Dud",
+                    "ticker": "SOLO2",
+                    "transaction_date": "2024-12-10",
+                    "disclosure_date": "2024-12-15",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
         recs = backtest_recommendations(
-            self.signals, solo_txns, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
+            self.signals,
+            solo_txns,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=1,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertTrue(recs.empty)
 
     def test_min_buyers_2_still_filters_single_buyer(self):
         """Default min_buyers=2 keeps rejecting single-buyer tickers."""
-        solo_txns = _make_transactions([
-            {
-                "member": "Star", "ticker": "SOLO3",
-                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
-                "transaction_type": "Purchase",
-            },
-        ])
+        solo_txns = _make_transactions(
+            [
+                {
+                    "member": "Star",
+                    "ticker": "SOLO3",
+                    "transaction_date": "2024-12-10",
+                    "disclosure_date": "2024-12-15",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
         recs = backtest_recommendations(
-            self.signals, solo_txns, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=2, top_n=10, threshold=5.0,
+            self.signals,
+            solo_txns,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertTrue(recs.empty)
 
     def test_solo_skill_threshold_passes_through(self):
         """Raising the threshold filters a borderline-skill solo buyer."""
-        solo_txns = _make_transactions([
-            {
-                "member": "Star", "ticker": "SOLO4",
-                "transaction_date": "2024-12-10", "disclosure_date": "2024-12-15",
-                "transaction_type": "Purchase",
-            },
-        ])
+        solo_txns = _make_transactions(
+            [
+                {
+                    "member": "Star",
+                    "ticker": "SOLO4",
+                    "transaction_date": "2024-12-10",
+                    "disclosure_date": "2024-12-15",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
         # Default threshold (1.0): Star (posterior_lift ~3.08) passes → recommendation produced.
         recs_default = backtest_recommendations(
-            self.signals, solo_txns, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
+            self.signals,
+            solo_txns,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=1,
+            top_n=10,
+            threshold=5.0,
         )
         self.assertFalse(recs_default.empty)
 
         # Strict lift threshold (3.5) above Star's posterior_lift: Star rejected.
         recs_strict = backtest_recommendations(
-            self.signals, solo_txns, self.as_of,
-            horizon=90, lookback_days=60, min_buyers=1, top_n=10, threshold=5.0,
+            self.signals,
+            solo_txns,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=1,
+            top_n=10,
+            threshold=5.0,
             solo_buyer_skill_threshold=3.5,
         )
         self.assertTrue(recs_strict.empty)

@@ -45,14 +45,10 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
             start_date="2022-01-01",
             observance=nearest_workday,
         ),
-        Holiday(
-            "Independence Day", month=7, day=4, observance=nearest_workday
-        ),
+        Holiday("Independence Day", month=7, day=4, observance=nearest_workday),
         USLaborDay,
         USThanksgivingDay,
-        Holiday(
-            "Christmas Day", month=12, day=25, observance=nearest_workday
-        ),
+        Holiday("Christmas Day", month=12, day=25, observance=nearest_workday),
     ]
 
 
@@ -235,7 +231,9 @@ class PriceRepository:
             result["entry_price_date"] = pd.to_datetime(result["entry_price_date"])
             if max_staleness_days is not None:
                 result["disclosure_date"] = pd.to_datetime(result["disclosure_date"])
-                staleness = (result["disclosure_date"] - result["entry_price_date"]).dt.days
+                staleness = (
+                    result["disclosure_date"] - result["entry_price_date"]
+                ).dt.days
                 result = result[staleness <= max_staleness_days]
             result = result.drop(columns=["entry_price_date"])
 

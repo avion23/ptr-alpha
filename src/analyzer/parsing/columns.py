@@ -11,12 +11,34 @@ from analyzer.parsing.cells import clean_text
 
 
 KNOWN_HEADERS = {
-    "asset", "assetname", "description", "desc", "desciption",
-    "owner", "ownership", "ownertype", "ownercode", "reportedby",
-    "type", "transactiontype", "txtype", "transaction",
-    "date", "transactiondate", "txdate", "notifdate", "notificationdate",
-    "amount", "transactionamount", "value", "transactionvalue",
-    "valueamount", "price", "cost", "proceeds", "tradedamount",
+    "asset",
+    "assetname",
+    "description",
+    "desc",
+    "desciption",
+    "owner",
+    "ownership",
+    "ownertype",
+    "ownercode",
+    "reportedby",
+    "type",
+    "transactiontype",
+    "txtype",
+    "transaction",
+    "date",
+    "transactiondate",
+    "txdate",
+    "notifdate",
+    "notificationdate",
+    "amount",
+    "transactionamount",
+    "value",
+    "transactionvalue",
+    "valueamount",
+    "price",
+    "cost",
+    "proceeds",
+    "tradedamount",
 }
 
 _ASSET_CANDS = {"asset", "assetname", "description", "desc", "desciption"}
@@ -24,8 +46,15 @@ _OWNER_CANDS = {"owner", "ownership", "ownercode", "reportedby"}
 _TYPE_CANDS = {"type", "transactiontype", "txtype", "transaction", "txtype"}
 _DATE_CANDS = {"date", "transactiondate", "txdate", "notifdate", "notificationdate"}
 _AMOUNT_CANDS = {
-    "amount", "transactionamount", "value", "transactionvalue",
-    "valueamount", "price", "cost", "proceeds", "tradedamount",
+    "amount",
+    "transactionamount",
+    "value",
+    "transactionvalue",
+    "valueamount",
+    "price",
+    "cost",
+    "proceeds",
+    "tradedamount",
 }
 
 
@@ -51,11 +80,15 @@ def _column_index_substring(headers: list[str], candidates: set[str]) -> int | N
     return None
 
 
-def _column_indexes(header: list[str], next_row: list[str] | None = None) -> dict[str, int]:
+def _column_indexes(
+    header: list[str], next_row: list[str] | None = None
+) -> dict[str, int]:
     headers = [str(cell) for cell in header]
     indexes = _indexes_from_headers(headers)
     # If core columns are missing, try merging with next row (2-row header case)
-    if (indexes["asset"] is None or indexes["type"] is None or indexes["date"] is None) and next_row:
+    if (
+        indexes["asset"] is None or indexes["type"] is None or indexes["date"] is None
+    ) and next_row:
         merged = _merge_two_row_headers(headers, next_row)
         indexes = _indexes_from_headers(merged)
         # Substring fallback for all columns (e.g., "Owner Asset" contains "owner")
@@ -105,7 +138,7 @@ def _get_cell(row: list, index: int | None) -> str | None:
 
 def _find_amount_in_row(row: list) -> str | None:
     """Fallback: scan all cells for a '$X,XXX - $X,XXX' or '$X,XXX' amount pattern."""
-    amount_re = re.compile(r'\$\d[\d,]*(?:\s*-\s*\$\d[\d,]*)?')
+    amount_re = re.compile(r"\$\d[\d,]*(?:\s*-\s*\$\d[\d,]*)?")
     for cell in row:
         if cell is None:
             continue
@@ -119,7 +152,9 @@ def _find_amount_in_row(row: list) -> str | None:
 def _find_header_row(table: list, max_scan: int = 10) -> int | None:
     """Scan the first `max_scan` rows for one that contains known column headers."""
     for i, row in enumerate(table[:max_scan]):
-        matches = sum(1 for cell in row if _normalize_header(str(cell)) in KNOWN_HEADERS)
+        matches = sum(
+            1 for cell in row if _normalize_header(str(cell)) in KNOWN_HEADERS
+        )
         if matches >= 2:
             return i
     return None

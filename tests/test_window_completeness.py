@@ -11,12 +11,14 @@ def test_ticker_gap_does_not_use_stale_last_price_for_incomplete_horizon():
         disclosure + pd.Timedelta(days=90),
     ]
 
-    price_dates = pd.DatetimeIndex([
-        disclosure,
-        horizon_ends[0],
-        horizon_ends[1],
-        disclosure + pd.Timedelta(days=95),
-    ])
+    price_dates = pd.DatetimeIndex(
+        [
+            disclosure,
+            horizon_ends[0],
+            horizon_ends[1],
+            disclosure + pd.Timedelta(days=95),
+        ]
+    )
     prices = pd.DataFrame(
         {
             "AAPL": [100.0, 110.0, np.nan, 200.0],
@@ -54,11 +56,13 @@ def test_ticker_gap_does_not_use_stale_last_price_for_incomplete_horizon():
 
 def test_quote_before_disclosure_does_not_complete_empty_window():
     disclosure = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
-    price_dates = pd.DatetimeIndex([
-        disclosure - pd.Timedelta(days=1),
-        disclosure,
-        disclosure + pd.Timedelta(days=1),
-    ])
+    price_dates = pd.DatetimeIndex(
+        [
+            disclosure - pd.Timedelta(days=1),
+            disclosure,
+            disclosure + pd.Timedelta(days=1),
+        ]
+    )
     prices = pd.DataFrame(
         {
             "AAPL": [100.0, np.nan, np.nan],
@@ -77,7 +81,9 @@ def test_quote_before_disclosure_does_not_complete_empty_window():
         }
     )
 
-    result = calculate_signal_potential(entries, prices, horizons=[1]).set_index("ticker")
+    result = calculate_signal_potential(entries, prices, horizons=[1]).set_index(
+        "ticker"
+    )
 
     assert not bool(result.loc["AAPL", "window_complete"])
     for column in (

@@ -113,14 +113,14 @@ class TestBenjaminiHochberg(unittest.TestCase):
         # BH should reject more hypotheses than Bonferroni for the same data
         rng = np.random.default_rng(123)
         # Generate some significant p-values mixed with noise
-        p_values = np.concatenate([
-            rng.uniform(0, 0.02, size=10),
-            rng.uniform(0.3, 0.9, size=90),
-        ])
-        rejected_bh = benjamini_hochberg(p_values, alpha=0.05)
-        n_bonferroni = sum(
-            p < bonferroni_correction(100, 0.05) for p in p_values
+        p_values = np.concatenate(
+            [
+                rng.uniform(0, 0.02, size=10),
+                rng.uniform(0.3, 0.9, size=90),
+            ]
         )
+        rejected_bh = benjamini_hochberg(p_values, alpha=0.05)
+        n_bonferroni = sum(p < bonferroni_correction(100, 0.05) for p in p_values)
         # BH should reject at least as many as Bonferroni
         self.assertGreaterEqual(rejected_bh.sum(), n_bonferroni)
 
@@ -170,12 +170,18 @@ class TestDeflatedSharpeRatio(unittest.TestCase):
         # Positive skew shifts the expected max upward and adjusts the SE,
         # changing DSR. Use few trials so DSR is in a visible range.
         dsr_normal = deflated_sharpe_ratio(
-            1.5, n_trials=5, n_observations=100,
-            skew=0.0, kurtosis=3.0,
+            1.5,
+            n_trials=5,
+            n_observations=100,
+            skew=0.0,
+            kurtosis=3.0,
         )
         dsr_skewed = deflated_sharpe_ratio(
-            1.5, n_trials=5, n_observations=100,
-            skew=2.0, kurtosis=3.0,
+            1.5,
+            n_trials=5,
+            n_observations=100,
+            skew=2.0,
+            kurtosis=3.0,
         )
         # The two should differ (skew changes both E[max] and SE)
         self.assertFalse(
@@ -195,8 +201,11 @@ class TestDeflatedSharpeRatio(unittest.TestCase):
         # With very few observations and high Sharpe, DSR should still
         # be a valid probability in [0, 1] even though SE is large.
         dsr = deflated_sharpe_ratio(
-            10.0, n_trials=10, n_observations=1,
-            skew=0.0, kurtosis=3.0,
+            10.0,
+            n_trials=10,
+            n_observations=1,
+            skew=0.0,
+            kurtosis=3.0,
         )
         self.assertGreaterEqual(dsr, 0.0)
         self.assertLessEqual(dsr, 1.0)
@@ -210,6 +219,7 @@ class TestMinBacktestLength(unittest.TestCase):
         # SR=1.0 → need T=(z_alpha/SR)^2 years for p<0.05
         # z_0.05 one-sided = norm.ppf(0.95) ≈ 1.6449
         from scipy.stats import norm as sp_norm
+
         z = sp_norm.ppf(0.95)
         years = min_backtest_length(1.0, alpha=0.05)
         expected = (z / 1.0) ** 2
@@ -275,44 +285,46 @@ class TestAnalyzeSnooping(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         csv_path = Path(self.tmpdir.name) / "sweep_results.csv"
-        self.sweep = pd.DataFrame([
-            {
-                "horizon": 60,
-                "frequency_days": 30,
-                "min_buyers": 2,
-                "top_n": 5,
-                "decay_lambda": 0.001,
-                "bayes_prior_strength": 50,
-                "alpha_slope": 3.5,
-                "overall_alpha": 2.0,
-                "sharpe": 1.2,
-                "dates_evaluated": 30,
-            },
-            {
-                "horizon": 90,
-                "frequency_days": 30,
-                "min_buyers": 3,
-                "top_n": 3,
-                "decay_lambda": 0.005,
-                "bayes_prior_strength": 20,
-                "alpha_slope": 0.5,
-                "overall_alpha": 0.2,
-                "sharpe": 0.3,
-                "dates_evaluated": 30,
-            },
-            {
-                "horizon": 120,
-                "frequency_days": 90,
-                "min_buyers": 5,
-                "top_n": 5,
-                "decay_lambda": 0.02,
-                "bayes_prior_strength": 5,
-                "alpha_slope": -0.2,
-                "overall_alpha": -0.1,
-                "sharpe": -0.1,
-                "dates_evaluated": 30,
-            },
-        ])
+        self.sweep = pd.DataFrame(
+            [
+                {
+                    "horizon": 60,
+                    "frequency_days": 30,
+                    "min_buyers": 2,
+                    "top_n": 5,
+                    "decay_lambda": 0.001,
+                    "bayes_prior_strength": 50,
+                    "alpha_slope": 3.5,
+                    "overall_alpha": 2.0,
+                    "sharpe": 1.2,
+                    "dates_evaluated": 30,
+                },
+                {
+                    "horizon": 90,
+                    "frequency_days": 30,
+                    "min_buyers": 3,
+                    "top_n": 3,
+                    "decay_lambda": 0.005,
+                    "bayes_prior_strength": 20,
+                    "alpha_slope": 0.5,
+                    "overall_alpha": 0.2,
+                    "sharpe": 0.3,
+                    "dates_evaluated": 30,
+                },
+                {
+                    "horizon": 120,
+                    "frequency_days": 90,
+                    "min_buyers": 5,
+                    "top_n": 5,
+                    "decay_lambda": 0.02,
+                    "bayes_prior_strength": 5,
+                    "alpha_slope": -0.2,
+                    "overall_alpha": -0.1,
+                    "sharpe": -0.1,
+                    "dates_evaluated": 30,
+                },
+            ]
+        )
         self.sweep.to_csv(csv_path, index=False)
         self.sweep = pd.read_csv(csv_path)
 

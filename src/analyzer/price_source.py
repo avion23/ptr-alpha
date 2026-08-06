@@ -22,12 +22,19 @@ _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 
 # ── YFinancePriceSource: yfinance-backed price fetcher with cache merge ──
 
+
 class YFinancePriceSource(PriceSource):
-    def __init__(self, settings: Settings, read_only: bool = False, db: Database | None = None):
+    def __init__(
+        self, settings: Settings, read_only: bool = False, db: Database | None = None
+    ):
         self.settings = settings
         self.data_dir = Path(settings.data.data_dir)
         self._owns_db = db is None
-        self.db = db if db is not None else Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        self.db = (
+            db
+            if db is not None
+            else Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        )
 
     def close(self) -> None:
         if self._owns_db:
@@ -46,7 +53,10 @@ class YFinancePriceSource(PriceSource):
 
         clean_tickers = _clean_tickers(tickers)
         all_tickers = sorted(
-            list(set(t for t in clean_tickers if _VALID_TICKER_RE.match(str(t))) | {"SPY"})
+            list(
+                set(t for t in clean_tickers if _VALID_TICKER_RE.match(str(t)))
+                | {"SPY"}
+            )
         )
 
         raw_to_yf, yf_to_raw = _resolve_tickers(all_tickers)
@@ -58,7 +68,9 @@ class YFinancePriceSource(PriceSource):
             )
 
         missing_tickers, missing_dates = self.db.get_missing_price_data(
-            all_tickers, start, end,
+            all_tickers,
+            start,
+            end,
         )
 
         if not missing_tickers and not missing_dates:
@@ -67,13 +79,26 @@ class YFinancePriceSource(PriceSource):
             return cached_prices[available_tickers].dropna(axis=1, how="all")
 
         return self._fetch_and_merge_prices(
-            all_tickers, raw_to_yf, yf_to_raw, cached_prices, start, end,
-            missing_tickers, missing_dates,
+            all_tickers,
+            raw_to_yf,
+            yf_to_raw,
+            cached_prices,
+            start,
+            end,
+            missing_tickers,
+            missing_dates,
         )
 
     def _fetch_and_merge_prices(
-        self, all_tickers, raw_to_yf, yf_to_raw, cached_prices, start, end,
-        missing_tickers, missing_dates,
+        self,
+        all_tickers,
+        raw_to_yf,
+        yf_to_raw,
+        cached_prices,
+        start,
+        end,
+        missing_tickers,
+        missing_dates,
     ) -> pd.DataFrame:
         """Fetch missing data from yfinance and merge with the cache.
 
@@ -156,7 +181,9 @@ class YFinancePriceSource(PriceSource):
                     )
                     return pd.DataFrame()
 
-    def _rename_yf_columns(self, new_prices: pd.DataFrame, raw_to_yf: dict) -> pd.DataFrame:
+    def _rename_yf_columns(
+        self, new_prices: pd.DataFrame, raw_to_yf: dict
+    ) -> pd.DataFrame:
         """Rename yf-symbol columns back to their raw tickers so downstream
         consumers see consistent identifiers across sources."""
         yf_to_raws: dict[str, list[str]] = {}
@@ -172,6 +199,7 @@ class YFinancePriceSource(PriceSource):
 
 
 # ── Helpers ──
+
 
 def _clean_tickers(tickers: list[str]) -> list[str]:
     """Filter out NaN/None/empty/garbage tickers from the input list."""
@@ -193,7 +221,9 @@ def _resolve_tickers(all_tickers: list[str]) -> tuple[dict, dict]:
     return raw_to_yf, yf_to_raw
 
 
-def _validate_and_log_prices(prices: pd.DataFrame, all_tickers: list[str]) -> pd.DataFrame:
+def _validate_and_log_prices(
+    prices: pd.DataFrame, all_tickers: list[str]
+) -> pd.DataFrame:
     """Fail loudly when too many tickers couldn't be fetched (>25%)."""
     failed_tickers = sorted(set(all_tickers) - set(prices.columns))
     success_count = len([t for t in all_tickers if t in prices.columns])

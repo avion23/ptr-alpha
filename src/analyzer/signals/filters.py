@@ -34,7 +34,9 @@ def _apply_quality_filter(signals_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:
-    horizon_signals = _get_horizon_data(signals_df, horizon, TransactionType.PURCHASE.value)
+    horizon_signals = _get_horizon_data(
+        signals_df, horizon, TransactionType.PURCHASE.value
+    )
     if horizon_signals.empty:
         return 0.50
     # Bug #2: NaN decayed_return_pct was previously treated as a loss because
@@ -63,7 +65,9 @@ def _assign_episode_ids(group_sorted: pd.DataFrame, max_gap_days: int) -> np.nda
     return episode_ids
 
 
-def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> pd.DataFrame:
+def _collapse_to_episodes(
+    signals_df: pd.DataFrame, max_gap_days: int = 14
+) -> pd.DataFrame:
     """Collapse same-member/same-ticker/same-horizon/same-type signals that
     fall within `max_gap_days` of an episode's start into a weighted-average
     row. Used by `rank_members`/`_compute_member_stats` to deduplicate
@@ -88,7 +92,9 @@ def _collapse_to_episodes(signals_df: pd.DataFrame, max_gap_days: int = 14) -> p
     return _aggregate_episodes(df, group_cols, existing_avg_cols, signals_df.columns)
 
 
-def _assign_episode_column(df: pd.DataFrame, group_cols: list[str], max_gap_days: int) -> pd.DataFrame:
+def _assign_episode_column(
+    df: pd.DataFrame, group_cols: list[str], max_gap_days: int
+) -> pd.DataFrame:
     episode_ids = np.zeros(len(df), dtype=np.int64)
     for positions in df.groupby(group_cols, sort=False).indices.values():
         episode_ids[positions] = _assign_episode_ids(df.iloc[positions], max_gap_days)
@@ -106,13 +112,18 @@ def _add_weight_column(df: pd.DataFrame) -> pd.DataFrame:
 
 def _get_existing_avg_cols(df: pd.DataFrame) -> list[str]:
     avg_cols = [
-        "decayed_return_pct", "spy_alpha_pct", "total_return_pct",
-        "total_spy_alpha_pct", "peak_potential_pct",
+        "decayed_return_pct",
+        "spy_alpha_pct",
+        "total_return_pct",
+        "total_spy_alpha_pct",
+        "peak_potential_pct",
     ]
     return [c for c in avg_cols if c in df.columns]
 
 
-def _add_weighted_columns(df: pd.DataFrame, existing_avg_cols: list[str]) -> pd.DataFrame:
+def _add_weighted_columns(
+    df: pd.DataFrame, existing_avg_cols: list[str]
+) -> pd.DataFrame:
     for col in existing_avg_cols:
         non_nan = df[col].notna()
         df[f"_wp_{col}"] = np.where(non_nan, df[col] * df["_weight"], 0.0)
@@ -131,7 +142,11 @@ def _aggregate_episodes(
         "episode_count": ("_weight", "count"),
         "_weight_sum": ("_weight", "sum"),
     }
-    for col, func in {"disclosure_date": "min", "entry_price": "first", "amount_midpoint": "sum"}.items():
+    for col, func in {
+        "disclosure_date": "min",
+        "entry_price": "first",
+        "amount_midpoint": "sum",
+    }.items():
         if col in df.columns:
             agg_dict[col] = (col, func)
     if "owner_code" in df.columns:

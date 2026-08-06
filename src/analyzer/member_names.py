@@ -17,10 +17,22 @@ import unicodedata
 
 # Tokens that are not part of a person's core first/last name and should be
 # stripped before computing the canonical key.
-_HONORIFICS = frozenset({
-    "DR", "MR", "MRS", "MS", "HON", "REP", "SEN", "SR",
-    "JR", "II", "III", "IV",
-})
+_HONORIFICS = frozenset(
+    {
+        "DR",
+        "MR",
+        "MRS",
+        "MS",
+        "HON",
+        "REP",
+        "SEN",
+        "SR",
+        "JR",
+        "II",
+        "III",
+        "IV",
+    }
+)
 
 
 def canonical_member_key(name: str) -> str:
@@ -53,7 +65,11 @@ def canonical_member_key(name: str) -> str:
         return ""
 
     # Step 1: uppercase + ASCII-fold (drop combining accents after NFKD).
-    folded = unicodedata.normalize('NFKD', name.upper()).encode('ascii', 'ignore').decode('ascii')
+    folded = (
+        unicodedata.normalize("NFKD", name.upper())
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
 
     # Step 2: replace non-alphanumeric with spaces
     s = re.sub(r"[^A-Za-z0-9 ]", " ", folded)

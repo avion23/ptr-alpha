@@ -56,11 +56,17 @@ def get_context(ctx, data_dir=None, read_only=False):
             settings.data.data_dir = data_dir
         # Share a single DuckDB connection across both data sources to avoid
         # two independent Database instances pointing at the same file.
-        shared_db = Database(Path(settings.data.data_dir) / "congress.duckdb", read_only=read_only)
+        shared_db = Database(
+            Path(settings.data.data_dir) / "congress.duckdb", read_only=read_only
+        )
         ctx.obj = AppContext(
             settings=settings,
-            transaction_source=HouseTransactionSource(settings, read_only=read_only, db=shared_db),
-            price_source=YFinancePriceSource(settings, read_only=read_only, db=shared_db),
+            transaction_source=HouseTransactionSource(
+                settings, read_only=read_only, db=shared_db
+            ),
+            price_source=YFinancePriceSource(
+                settings, read_only=read_only, db=shared_db
+            ),
         )
     return ctx.obj
 
@@ -75,25 +81,44 @@ def _save_results(
     match mode:
         case AnalysisMode.MEMBER_SIGNALS | AnalysisMode.TOP_SIGNALS:
             display_cols = [
-                'member', 'ticker', 'disclosure_date', 'spy_alpha_pct', 'peak_potential_pct',
-                'total_return_pct', 'total_spy_alpha_pct', 'signal_score'
+                "member",
+                "ticker",
+                "disclosure_date",
+                "spy_alpha_pct",
+                "peak_potential_pct",
+                "total_return_pct",
+                "total_spy_alpha_pct",
+                "signal_score",
             ]
         case AnalysisMode.SALE_RANKINGS:
             display_cols = [
-                'member', 'avg_loss_avoided_pct', 'median_loss_avoided_pct',
-                'sale_trades', 'sharpe_ratio', 'bayes_win_prob', 'posterior_lift',
-                'avg_spy_alpha_pct',
+                "member",
+                "avg_loss_avoided_pct",
+                "median_loss_avoided_pct",
+                "sale_trades",
+                "sharpe_ratio",
+                "bayes_win_prob",
+                "posterior_lift",
+                "avg_spy_alpha_pct",
             ]
         case AnalysisMode.MEMBER_RANKINGS:
             display_cols = [
-                'member', 'avg_total_spy_alpha_pct', 'avg_spy_alpha_pct', 'bayes_win_prob', 'posterior_lift', 'peak_hit_rate_pct', 'sharpe_ratio', 'conviction_score', 'purchase_trades'
+                "member",
+                "avg_total_spy_alpha_pct",
+                "avg_spy_alpha_pct",
+                "bayes_win_prob",
+                "posterior_lift",
+                "peak_hit_rate_pct",
+                "sharpe_ratio",
+                "conviction_score",
+                "purchase_trades",
             ]
         case _:
             display_cols = list(table.columns)
     available_display = [c for c in display_cols if c in table.columns]
     display_table = table[available_display]
 
-    if output_format == 'csv':
+    if output_format == "csv":
         match mode:
             case AnalysisMode.MEMBER_SIGNALS:
                 if member_filter is None:
@@ -117,7 +142,9 @@ def _save_results(
 @app.callback()
 def main_callback(
     ctx: typer.Context,
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Enable verbose logging"
+    ),
 ):
     setup_logging(verbose)
 
@@ -132,7 +159,10 @@ def _validate_mode(mode: str, member: str | None, ticker: str | None) -> None:
         print("Error: --mode member requires --member NAME", file=sys.stderr)
         raise typer.Exit(1)
     if mode == "sales" and member is not None:
-        print("WARNING: --member flag is ignored for --mode sales (sales rankings are aggregate).", file=sys.stderr)
+        print(
+            "WARNING: --member flag is ignored for --mode sales (sales rankings are aggregate).",
+            file=sys.stderr,
+        )
 
 
 def _validate_positive_options(**options: int | float) -> None:
@@ -159,27 +189,43 @@ def _check_data_freshness(app_ctx: AppContext) -> None:
         if _max_date:
             _age = (date.today() - _max_date).days
             if _age > 30:
-                print(f"WARNING: Data is {_age} days old (latest: {_max_date}). Run 'ptr-alpha refresh' first.", file=sys.stderr)
+                print(
+                    f"WARNING: Data is {_age} days old (latest: {_max_date}). Run 'ptr-alpha refresh' first.",
+                    file=sys.stderr,
+                )
     except Exception:
         logger.debug("Freshness check failed", exc_info=True)
 
 
 def _run_ticker_mode(
-    app_ctx: AppContext, mode: str, ticker: str, year: int,
-    horizons: list[int], threshold: float, output: str,
+    app_ctx: AppContext,
+    mode: str,
+    ticker: str,
+    year: int,
+    horizons: list[int],
+    threshold: float,
+    output: str,
 ) -> None:
     """Handle --ticker analysis mode."""
     if mode != "ranks":
-        print(f"WARNING: --mode {mode} is ignored when --ticker is provided; running ticker analysis.", file=sys.stderr)
+        print(
+            f"WARNING: --mode {mode} is ignored when --ticker is provided; running ticker analysis.",
+            file=sys.stderr,
+        )
     if output == "csv":
-        print("WARNING: CSV output is not supported for --ticker analysis; using console output.", file=sys.stderr)
-    params = TickerAnalysisParams(ticker=ticker, year=year, horizon=horizons[0], threshold=threshold)
+        print(
+            "WARNING: CSV output is not supported for --ticker analysis; using console output.",
+            file=sys.stderr,
+        )
+    params = TickerAnalysisParams(
+        ticker=ticker, year=year, horizon=horizons[0], threshold=threshold
+    )
     result = run_ticker_analysis(
         params,
         app_ctx.transaction_source,
         app_ctx.price_source,
     )
-    if result.success and hasattr(result, 'data') and result.data:
+    if result.success and hasattr(result, "data") and result.data:
         print(f"\n=== Buyers of {result.data['ticker']} ===")
         print(result.data["buyers"].to_string(index=False))
         print("\n=== Signal Score ===")
@@ -191,13 +237,23 @@ def _run_ticker_mode(
 
 
 def _run_tickers_mode(
-    app_ctx: AppContext, year: int, horizons: list[int], threshold: float,
-    days_back: int, min_buyers: int, top_n: int, output: str,
-    training_lookback_days: int, as_of_date: date | None,
+    app_ctx: AppContext,
+    year: int,
+    horizons: list[int],
+    threshold: float,
+    days_back: int,
+    min_buyers: int,
+    top_n: int,
+    output: str,
+    training_lookback_days: int,
+    as_of_date: date | None,
 ) -> None:
     """Handle --mode tickers."""
     if output == "csv":
-        print("WARNING: CSV output is not supported for --mode tickers; using console output.", file=sys.stderr)
+        print(
+            "WARNING: CSV output is not supported for --mode tickers; using console output.",
+            file=sys.stderr,
+        )
     params = TickerScoringParams(
         year=year,
         horizons=tuple(horizons),
@@ -213,10 +269,12 @@ def _run_tickers_mode(
         app_ctx.price_source,
         params,
     )
-    if result.success and hasattr(result, 'data') and result.data:
+    if result.success and hasattr(result, "data") and result.data:
         data = result.data
         if not data["result"].empty:
-            print(f"\n=== Current Buy Candidates as of {data['as_of_date']} (Last {data['days_back']} Days, {data['min_buyers']}+ Buyers) ===")
+            print(
+                f"\n=== Current Buy Candidates as of {data['as_of_date']} (Last {data['days_back']} Days, {data['min_buyers']}+ Buyers) ==="
+            )
             print(data["result"].to_string(index=False))
         else:
             print(f"\nNo positive buy candidates as of {data['as_of_date']}.")
@@ -224,15 +282,18 @@ def _run_tickers_mode(
 
 
 def _run_sales_mode(
-    app_ctx: AppContext, year: int, horizons: list[int], top_n: int, output: str,
+    app_ctx: AppContext,
+    year: int,
+    horizons: list[int],
+    top_n: int,
+    output: str,
 ) -> None:
     """Handle --mode sales."""
     data_path = Path(app_ctx.settings.data.data_dir)
     result = run_sales_pipeline(
-        year, tuple(horizons), top_n,
-        app_ctx.transaction_source, app_ctx.price_source
+        year, tuple(horizons), top_n, app_ctx.transaction_source, app_ctx.price_source
     )
-    if result.success and hasattr(result, 'data') and result.data:
+    if result.success and hasattr(result, "data") and result.data:
         _save_results(
             result.data["table"], output, AnalysisMode.SALE_RANKINGS, None, data_path
         )
@@ -240,8 +301,15 @@ def _run_sales_mode(
 
 
 def _run_analysis_mode(
-    app_ctx: AppContext, year: int, horizons: list[int], threshold: float,
-    member: str | None, top_n: int, mode: str, output: str, sectors: bool,
+    app_ctx: AppContext,
+    year: int,
+    horizons: list[int],
+    threshold: float,
+    member: str | None,
+    top_n: int,
+    mode: str,
+    output: str,
+    sectors: bool,
 ) -> None:
     """Handle ranks/signals/member modes via run_analysis_pipeline."""
     if member is not None:
@@ -263,7 +331,7 @@ def _run_analysis_mode(
     result = run_analysis_pipeline(
         params, app_ctx.transaction_source, app_ctx.price_source
     )
-    if result.success and hasattr(result, 'data') and result.data:
+    if result.success and hasattr(result, "data") and result.data:
         _save_results(
             result.data["table"],
             output,
@@ -296,13 +364,17 @@ def analyze(
     min_buyers: int = typer.Option(3, help="Minimum buyers for ticker scoring"),
     top_n: int = typer.Option(20, help="Number of results to show"),
     training_lookback_days: int = typer.Option(
-        1095, help="Historical days used to train live ticker rankings",
+        1095,
+        help="Historical days used to train live ticker rankings",
     ),
     as_of: str | None = typer.Option(
-        None, help="Live ticker scoring date (YYYY-MM-DD; defaults to today)",
+        None,
+        help="Live ticker scoring date (YYYY-MM-DD; defaults to today)",
     ),
     sectors: bool = typer.Option(
-        False, "--sectors", help="Fetch optional sector metadata for rank output",
+        False,
+        "--sectors",
+        help="Fetch optional sector metadata for rank output",
     ),
     output: str = typer.Option("console", help="Output format: console or csv"),
     data_dir: str = typer.Option("data", help="Data directory"),
@@ -340,17 +412,31 @@ def analyze(
         _run_ticker_mode(app_ctx, mode, ticker, year, horizons, threshold, output)
     elif mode == "tickers":
         _run_tickers_mode(
-            app_ctx, year, horizons, threshold, days_back, min_buyers, top_n,
-            output, training_lookback_days, as_of_date,
+            app_ctx,
+            year,
+            horizons,
+            threshold,
+            days_back,
+            min_buyers,
+            top_n,
+            output,
+            training_lookback_days,
+            as_of_date,
         )
     elif mode == "sales":
         _run_sales_mode(app_ctx, year, horizons, top_n, output)
     else:
         _run_analysis_mode(
-            app_ctx, year, horizons, threshold, member, top_n, mode, output,
+            app_ctx,
+            year,
+            horizons,
+            threshold,
+            member,
+            top_n,
+            mode,
+            output,
             sectors,
         )
-
 
 
 @app.command()
@@ -358,7 +444,9 @@ def fetch(
     ctx: typer.Context,
     year: int = typer.Option(2025, help="Year to process"),
     data_dir: str = typer.Option("data", help="Data directory"),
-    refresh_metadata: bool = typer.Option(False, "--refresh-metadata", help="Force refresh of metadata from House Clerk"),
+    refresh_metadata: bool = typer.Option(
+        False, "--refresh-metadata", help="Force refresh of metadata from House Clerk"
+    ),
 ):
     """Download House PDFs for a year"""
     app_ctx = get_context(ctx, data_dir, read_only=False)
@@ -374,7 +462,9 @@ def parse(
     year: int = typer.Option(2025, help="Year to process"),
     data_dir: str = typer.Option("data", help="Data directory"),
     use_gemini_ocr: bool = typer.Option(
-        False, "--gemini-ocr", help="Use Gemini LLM OCR for zero-row PDFs (slower, costs API quota)"
+        False,
+        "--gemini-ocr",
+        help="Use Gemini LLM OCR for zero-row PDFs (slower, costs API quota)",
     ),
 ):
     """Parse cached PDFs to database"""
@@ -387,9 +477,14 @@ def parse(
     ocr_inserted = 0
     if use_gemini_ocr:
         from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-        ocr_inserted = run_gemini_ocr_for_year(year, data_dir=app_ctx.settings.data.data_dir)
+
+        ocr_inserted = run_gemini_ocr_for_year(
+            year, data_dir=app_ctx.settings.data.data_dir
+        )
     if (result is None or not result.success) and use_gemini_ocr and ocr_inserted > 0:
-        logger.warning("Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted)
+        logger.warning(
+            "Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted
+        )
     raise typer.Exit(0 if result is not None and result.success else 1)
 
 
@@ -398,13 +493,29 @@ def backtest(
     ctx: typer.Context,
     start: str = typer.Option(..., help="Backtest start date (YYYY-MM-DD)"),
     end: str = typer.Option(..., help="Backtest end date (YYYY-MM-DD)"),
-    horizon: int = typer.Option(_BACKTEST_DEFAULTS["horizon"], help="Forward return horizon in days"),
-    lookback_days: int = typer.Option(_BACKTEST_DEFAULTS["lookback_days"], help="Candidate purchase lookback window in days"),
-    training_lookback_days: int = typer.Option(_BACKTEST_DEFAULTS["training_lookback_days"], help="Training data lookback window in days"),
-    min_buyers: int = typer.Option(_BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"),
-    top_n: int = typer.Option(_BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"),
-    threshold: float = typer.Option(_BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"),
-    frequency_days: int = typer.Option(_BACKTEST_DEFAULTS["frequency_days"], help="Days between rolling backtest dates"),
+    horizon: int = typer.Option(
+        _BACKTEST_DEFAULTS["horizon"], help="Forward return horizon in days"
+    ),
+    lookback_days: int = typer.Option(
+        _BACKTEST_DEFAULTS["lookback_days"],
+        help="Candidate purchase lookback window in days",
+    ),
+    training_lookback_days: int = typer.Option(
+        _BACKTEST_DEFAULTS["training_lookback_days"],
+        help="Training data lookback window in days",
+    ),
+    min_buyers: int = typer.Option(
+        _BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"
+    ),
+    top_n: int = typer.Option(
+        _BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"
+    ),
+    threshold: float = typer.Option(
+        _BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"
+    ),
+    frequency_days: int = typer.Option(
+        _BACKTEST_DEFAULTS["frequency_days"], help="Days between rolling backtest dates"
+    ),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """
@@ -451,8 +562,10 @@ def backtest(
         frequency_days=frequency_days,
     )
     resolved_data_dir = Path(app_ctx.settings.data.data_dir)
-    result = run_backtest_pipeline(params, app_ctx.transaction_source, app_ctx.price_source, resolved_data_dir)
-    if result.success and hasattr(result, 'data') and result.data:
+    result = run_backtest_pipeline(
+        params, app_ctx.transaction_source, app_ctx.price_source, resolved_data_dir
+    )
+    if result.success and hasattr(result, "data") and result.data:
         data = result.data
         snapshot = data.get("snapshot")
         if snapshot:
@@ -461,7 +574,9 @@ def backtest(
             print(f"  Created:      {snapshot.created_at}")
             print(f"  Git SHA:      {snapshot.git_sha[:12]}")
             print(f"  yfinance:     {snapshot.yfinance_version}")
-            print(f"  Tickers:      {snapshot.resolved_tickers}/{snapshot.requested_tickers} resolved")
+            print(
+                f"  Tickers:      {snapshot.resolved_tickers}/{snapshot.requested_tickers} resolved"
+            )
             if snapshot.unresolved_tickers:
                 print(f"  Unresolved:   {', '.join(snapshot.unresolved_tickers[:10])}")
             print(f"  Price rows:   {snapshot.price_rows}")
@@ -470,8 +585,17 @@ def backtest(
         combined = data.get("combined", pd.DataFrame())
         if not combined.empty:
             display_cols = [
-                "as_of_date", "rank", "ticker", "num_buyers", "signal_score", "ou_entry_value",
-                "bt_entry_price", "bt_exit_price", "bt_return_pct", "bt_spy_return_pct", "bt_alpha_pct",
+                "as_of_date",
+                "rank",
+                "ticker",
+                "num_buyers",
+                "signal_score",
+                "ou_entry_value",
+                "bt_entry_price",
+                "bt_exit_price",
+                "bt_return_pct",
+                "bt_spy_return_pct",
+                "bt_alpha_pct",
             ]
             available = [c for c in display_cols if c in combined.columns]
             for as_of_date, group in combined.groupby("as_of_date"):
@@ -486,8 +610,12 @@ def backtest(
                 print(summary.to_string(index=False))
 
             valid_returns = combined.dropna(subset=["bt_return_pct"])
-            print(f"\nDates evaluated: {data.get('evaluable_dates', 0)}/{data.get('total_as_of_dates', 0)}")
-            print(f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}")
+            print(
+                f"\nDates evaluated: {data.get('evaluable_dates', 0)}/{data.get('total_as_of_dates', 0)}"
+            )
+            print(
+                f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}"
+            )
         else:
             print("\n=== No backtest results produced ===")
     raise typer.Exit(0 if result.success else 1)
@@ -498,12 +626,26 @@ def portfolio(
     ctx: typer.Context,
     start: str = typer.Option(..., help="Simulation start date (YYYY-MM-DD)"),
     end: str = typer.Option(..., help="Simulation end date (YYYY-MM-DD)"),
-    horizon: int = typer.Option(_BACKTEST_DEFAULTS["horizon"], help="Forward return horizon in days"),
-    lookback_days: int = typer.Option(_BACKTEST_DEFAULTS["lookback_days"], help="Candidate purchase lookback window in days"),
-    training_lookback_days: int = typer.Option(_BACKTEST_DEFAULTS["training_lookback_days"], help="Training data lookback window in days"),
-    min_buyers: int = typer.Option(_BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"),
-    top_n: int = typer.Option(_BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"),
-    threshold: float = typer.Option(_BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"),
+    horizon: int = typer.Option(
+        _BACKTEST_DEFAULTS["horizon"], help="Forward return horizon in days"
+    ),
+    lookback_days: int = typer.Option(
+        _BACKTEST_DEFAULTS["lookback_days"],
+        help="Candidate purchase lookback window in days",
+    ),
+    training_lookback_days: int = typer.Option(
+        _BACKTEST_DEFAULTS["training_lookback_days"],
+        help="Training data lookback window in days",
+    ),
+    min_buyers: int = typer.Option(
+        _BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"
+    ),
+    top_n: int = typer.Option(
+        _BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"
+    ),
+    threshold: float = typer.Option(
+        _BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"
+    ),
     # Intentionally bi-weekly (not the backtest's 30d step): rebalance cadence
     # for the portfolio sim, independent of the sweep-calibrated backtest.
     frequency_days: int = typer.Option(14, help="Days between rolling backtest dates"),
@@ -539,15 +681,26 @@ def portfolio(
     from datetime import timedelta
 
     tx_start = start_date - timedelta(days=training_lookback_days + horizon + 30)
-    all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(tx_start, end_date)
+    all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(
+        tx_start, end_date
+    )
     if all_transactions.empty:
         print("Error: no transactions found for portfolio simulation", file=sys.stderr)
         raise typer.Exit(1)
 
     prices, entry_prices, signals, recommendations = _load_portfolio_inputs(
-        app_ctx, all_transactions, tx_start, end_date, horizon,
-        lookback_days, training_lookback_days, min_buyers, top_n,
-        threshold, frequency_days, start_date,
+        app_ctx,
+        all_transactions,
+        tx_start,
+        end_date,
+        horizon,
+        lookback_days,
+        training_lookback_days,
+        min_buyers,
+        top_n,
+        threshold,
+        frequency_days,
+        start_date,
     )
 
     config = PortfolioConfig(
@@ -559,7 +712,9 @@ def portfolio(
 
     sim = PortfolioSimulator(config)
     results_df = sim.run(recommendations, prices, start_date, end_date)
-    _print_portfolio_results(results_df, config, start_date, end_date, hold_days, max_positions)
+    _print_portfolio_results(
+        results_df, config, start_date, end_date, hold_days, max_positions
+    )
 
     metrics = sim.compute_metrics(prices)
     if metrics:
@@ -585,9 +740,18 @@ def _parse_sim_dates(start: str, end: str) -> tuple[date, date]:
 
 
 def _load_portfolio_inputs(
-    app_ctx, all_transactions, tx_start, end_date, horizon,
-    lookback_days, training_lookback_days, min_buyers, top_n,
-    threshold, frequency_days, start_date,
+    app_ctx,
+    all_transactions,
+    tx_start,
+    end_date,
+    horizon,
+    lookback_days,
+    training_lookback_days,
+    min_buyers,
+    top_n,
+    threshold,
+    frequency_days,
+    start_date,
 ):
     """Load prices + entry_prices + signals + walk-forward recommendations.
 
@@ -599,13 +763,19 @@ def _load_portfolio_inputs(
 
     price_end_sim = end_date + timedelta(days=horizon + 10)
     raw_tickers = all_transactions["ticker"].dropna().unique().tolist()
-    all_tickers = sorted({t for t in raw_tickers if isinstance(t, str) and t.strip()} | {"SPY"})
-    prices = app_ctx.transaction_source.db.get_prices(all_tickers, tx_start, price_end_sim)
+    all_tickers = sorted(
+        {t for t in raw_tickers if isinstance(t, str) and t.strip()} | {"SPY"}
+    )
+    prices = app_ctx.transaction_source.db.get_prices(
+        all_tickers, tx_start, price_end_sim
+    )
     if prices.empty:
         print("Error: no price data available", file=sys.stderr)
         raise typer.Exit(1)
 
-    entry_prices = app_ctx.transaction_source.db.get_entry_prices(all_tickers, tx_start, price_end_sim)
+    entry_prices = app_ctx.transaction_source.db.get_entry_prices(
+        all_tickers, tx_start, price_end_sim
+    )
     if entry_prices.empty:
         print("Error: no entry prices computed", file=sys.stderr)
         raise typer.Exit(1)
@@ -616,7 +786,9 @@ def _load_portfolio_inputs(
     all_recs = []
     for as_of in as_of_dates:
         recs = analysis.backtest_recommendations(
-            signals, all_transactions, pd.Timestamp(as_of),
+            signals,
+            all_transactions,
+            pd.Timestamp(as_of),
             horizon=horizon,
             lookback_days=lookback_days,
             min_buyers=min_buyers,
@@ -635,14 +807,20 @@ def _load_portfolio_inputs(
         raise typer.Exit(1)
 
     recommendations = pd.concat(all_recs, ignore_index=True)
-    print(f"Collected {len(recommendations)} recommendations across {len(as_of_dates)} dates")
+    print(
+        f"Collected {len(recommendations)} recommendations across {len(as_of_dates)} dates"
+    )
 
     return prices, entry_prices, signals, recommendations
 
 
 def _print_portfolio_results(
-    results_df: pd.DataFrame, config, start_date, end_date,
-    hold_days: int, max_positions: int,
+    results_df: pd.DataFrame,
+    config,
+    start_date,
+    end_date,
+    hold_days: int,
+    max_positions: int,
 ) -> None:
     """Print the simulation result summary block."""
     print(f"\n{'=' * 60}")
@@ -678,7 +856,9 @@ def _print_portfolio_metrics(metrics: dict) -> None:
         print(f"  SPY buy-and-hold:   {metrics['spy_return_pct']:.2f}%")
     if metrics.get("sector_concentration"):
         print("\n=== Sector Concentration ===")
-        for sector, pct in sorted(metrics["sector_concentration"].items(), key=lambda x: -x[1]):
+        for sector, pct in sorted(
+            metrics["sector_concentration"].items(), key=lambda x: -x[1]
+        ):
             print(f"  {sector}: {pct:.1f}%")
 
 
@@ -686,7 +866,14 @@ def _print_closed_positions(closed_positions: list[dict]) -> None:
     """Print per-position close details (ticker, return, holding days)."""
     print(f"\n=== Closed Positions ({len(closed_positions)}) ===")
     closed_df = pd.DataFrame(closed_positions)
-    display_cols = ["ticker", "entry_date", "exit_date", "return_pct", "holding_days", "sector"]
+    display_cols = [
+        "ticker",
+        "entry_date",
+        "exit_date",
+        "return_pct",
+        "holding_days",
+        "sector",
+    ]
     available = [c for c in display_cols if c in closed_df.columns]
     print(closed_df[available].to_string(index=False))
 
@@ -695,22 +882,24 @@ def _print_closed_positions(closed_positions: list[dict]) -> None:
 def snapshot(
     ctx: typer.Context,
     data_dir: str = typer.Option("data", help="Data directory"),
-    output: str = typer.Option("data/price_snapshot.json", help="Output path for snapshot JSON"),
+    output: str = typer.Option(
+        "data/price_snapshot.json", help="Output path for snapshot JSON"
+    ),
 ):
     """Create a frozen price snapshot manifest for reproducible backtests."""
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
     db = app_ctx.transaction_source.db
     tickers_result = db.conn.execute("SELECT DISTINCT ticker FROM prices").fetchall()
-    all_tickers = sorted({row[0] for row in tickers_result if row[0] and isinstance(row[0], str)})
+    all_tickers = sorted(
+        {row[0] for row in tickers_result if row[0] and isinstance(row[0], str)}
+    )
 
     if not all_tickers:
         print("No price data found in database")
         raise typer.Exit(1)
 
-    date_range = db.conn.execute(
-        "SELECT MIN(date), MAX(date) FROM prices"
-    ).fetchone()
+    date_range = db.conn.execute("SELECT MIN(date), MAX(date) FROM prices").fetchone()
     start_date = date_range[0]
     end_date = date_range[1]
 
@@ -722,7 +911,9 @@ def snapshot(
     print(f"  Git SHA:        {snap.git_sha[:12]}")
     print(f"  yfinance:       {snap.yfinance_version}")
     print(f"  Python:         {snap.python_version}")
-    print(f"  Tickers:        {snap.resolved_tickers}/{snap.requested_tickers} resolved")
+    print(
+        f"  Tickers:        {snap.resolved_tickers}/{snap.requested_tickers} resolved"
+    )
     if snap.unresolved_tickers:
         print(f"  Unresolved:     {', '.join(snap.unresolved_tickers[:10])}")
     print(f"  Price rows:     {snap.price_rows}")
@@ -789,6 +980,7 @@ def refresh(
     if not skip_capitol:
         print("[3/4] Fetching Capitol Trades API...")
         from analyzer.capitol_trades import CapitolTradesSource
+
         capitol = CapitolTradesSource(
             data_dir=app_ctx.settings.data.data_dir,
             read_only=False,
@@ -810,7 +1002,10 @@ def refresh(
         print("[4/4] Running Gemini OCR on zero-row PDFs...")
         try:
             from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-            ocr_inserted = run_gemini_ocr_for_year(year, data_dir=app_ctx.settings.data.data_dir)
+
+            ocr_inserted = run_gemini_ocr_for_year(
+                year, data_dir=app_ctx.settings.data.data_dir
+            )
             print(f"  Gemini OCR: {ocr_inserted} transactions inserted")
         except Exception as e:
             failed_steps.append("gemini_ocr")
@@ -839,11 +1034,10 @@ def refresh(
     )
 
     added = count_after - count_before
-    print(f"\nDone. {count_before} -> {count_after} transactions ({'+' if added >= 0 else ''}{added} new)")
     print(
-        f"Latest transaction date: {max_date} "
-        "(eligible: not after disclosure)"
+        f"\nDone. {count_before} -> {count_after} transactions ({'+' if added >= 0 else ''}{added} new)"
     )
+    print(f"Latest transaction date: {max_date} (eligible: not after disclosure)")
     print(f"Latest disclosure date: {max_disclosure_date}")
     if implausible_date_count:
         print(
@@ -859,7 +1053,9 @@ def refresh(
 @app.command()
 def fetch_capitol(
     ctx: typer.Context,
-    politician: str | None = typer.Option(None, help="Fetch trades for a specific politician"),
+    politician: str | None = typer.Option(
+        None, help="Fetch trades for a specific politician"
+    ),
     all: bool = typer.Option(False, "--all", help="Fetch all recent trades"),
     chamber: str | None = typer.Option(None, help="Filter by chamber (house/senate)"),
     start: str | None = typer.Option(None, help="Start date filter (YYYY-MM-DD)"),
@@ -897,10 +1093,18 @@ def fetch_capitol(
 @app.command()
 def fetch_senate_efd(
     ctx: typer.Context,
-    start: str | None = typer.Option(None, help="Start date (YYYY-MM-DD). Defaults to one year before end."),
-    end: str | None = typer.Option(None, help="End date (YYYY-MM-DD). Defaults to today."),
-    lookback: int | None = typer.Option(None, help="If set, look back N days from end (overrides --start)"),
-    data_dir: str = typer.Option("data/senate", help="Data directory (default: isolated senate DB)"),
+    start: str | None = typer.Option(
+        None, help="Start date (YYYY-MM-DD). Defaults to one year before end."
+    ),
+    end: str | None = typer.Option(
+        None, help="End date (YYYY-MM-DD). Defaults to today."
+    ),
+    lookback: int | None = typer.Option(
+        None, help="If set, look back N days from end (overrides --start)"
+    ),
+    data_dir: str = typer.Option(
+        "data/senate", help="Data directory (default: isolated senate DB)"
+    ),
 ):
     """Fetch Senate PTR trades from efdsearch.senate.gov (official source).
 
@@ -917,7 +1121,11 @@ def fetch_senate_efd(
                 raise ValueError("lookback must be positive")
             start_date = end_date - timedelta(days=lookback)
         else:
-            start_date = date.fromisoformat(start) if start else end_date.replace(year=end_date.year - 1)
+            start_date = (
+                date.fromisoformat(start)
+                if start
+                else end_date.replace(year=end_date.year - 1)
+            )
     except ValueError:
         print("Error: dates must be YYYY-MM-DD and lookback > 0", file=sys.stderr)
         raise typer.Exit(1)
@@ -929,7 +1137,9 @@ def fetch_senate_efd(
     src = SenateEFDSource(data_dir=data_dir, read_only=False)
     try:
         count = src.fetch_and_save_all(start_date, end_date)
-        print(f"Saved {count} new Senate eFD trades ({start_date} to {end_date}) into {data_dir}/")
+        print(
+            f"Saved {count} new Senate eFD trades ({start_date} to {end_date}) into {data_dir}/"
+        )
     finally:
         src.close()
 
@@ -939,11 +1149,17 @@ def fetch_senate_efd(
 @app.command()
 def validate(
     ctx: typer.Context,
-    train_start: str = typer.Option("2022-01-01", help="Training window start (YYYY-MM-DD)"),
-    train_end: str = typer.Option("2023-12-31", help="Training window end (YYYY-MM-DD)"),
+    train_start: str = typer.Option(
+        "2022-01-01", help="Training window start (YYYY-MM-DD)"
+    ),
+    train_end: str = typer.Option(
+        "2023-12-31", help="Training window end (YYYY-MM-DD)"
+    ),
     test_start: str = typer.Option("2024-01-01", help="Test window start (YYYY-MM-DD)"),
     test_end: str = typer.Option("2025-06-30", help="Test window end (YYYY-MM-DD)"),
-    full_grid: bool = typer.Option(False, "--full-grid", help="Use full 1296-combo grid (slow)"),
+    full_grid: bool = typer.Option(
+        False, "--full-grid", help="Use full 1296-combo grid (slow)"
+    ),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """
@@ -974,7 +1190,10 @@ def validate(
         print("Error: --test-end must be on or after --test-start", file=sys.stderr)
         raise typer.Exit(1)
     if vs <= te:
-        print("Error: --test-start must be after --train-end (no overlap)", file=sys.stderr)
+        print(
+            "Error: --test-start must be after --train-end (no overlap)",
+            file=sys.stderr,
+        )
         raise typer.Exit(1)
 
     if full_grid:
@@ -1004,7 +1223,9 @@ def validate(
     n_trials = 1
     for v in grid.values():
         n_trials *= len(v)
-    print(f"Running validation with {n_trials} configs (trials for snooping correction)")
+    print(
+        f"Running validation with {n_trials} configs (trials for snooping correction)"
+    )
 
     settings = Settings()
     if data_dir and data_dir != "data":

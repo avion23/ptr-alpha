@@ -1,4 +1,5 @@
 """Smoke tests for analyzer.signals module."""
+
 import unittest
 
 import numpy as np
@@ -10,41 +11,55 @@ from analyzer.signals import (
 )
 
 
-
-
 class TestCalculateSignalPotential(unittest.TestCase):
-
     def setUp(self):
         np.random.seed(42)
         self.dates = pd.date_range("2024-01-01", "2024-06-01", freq="D")
-        self.prices_df = pd.DataFrame({
-            "AAPL": 100 + np.cumsum(np.random.randn(len(self.dates)) * 0.5),
-            "SPY": 400 + np.cumsum(np.random.randn(len(self.dates)) * 1),
-        }, index=self.dates)
+        self.prices_df = pd.DataFrame(
+            {
+                "AAPL": 100 + np.cumsum(np.random.randn(len(self.dates)) * 0.5),
+                "SPY": 400 + np.cumsum(np.random.randn(len(self.dates)) * 1),
+            },
+            index=self.dates,
+        )
 
-        self.entry_prices = pd.DataFrame({
-            "member": ["Alice", "Bob"],
-            "ticker": ["AAPL", "AAPL"],
-            "disclosure_date": pd.to_datetime(["2024-02-01", "2024-03-01"]),
-            "transaction_type": ["Purchase", "Purchase"],
-            "entry_price": [102.0, 105.0],
-        })
+        self.entry_prices = pd.DataFrame(
+            {
+                "member": ["Alice", "Bob"],
+                "ticker": ["AAPL", "AAPL"],
+                "disclosure_date": pd.to_datetime(["2024-02-01", "2024-03-01"]),
+                "transaction_type": ["Purchase", "Purchase"],
+                "entry_price": [102.0, 105.0],
+            }
+        )
 
     def test_returns_dataframe_with_expected_columns(self):
         result = calculate_signal_potential(
-            self.entry_prices, self.prices_df, [30, 60],
+            self.entry_prices,
+            self.prices_df,
+            [30, 60],
         )
         expected_cols = {
-            "member", "ticker", "disclosure_date", "signal_type",
-            "horizon_days", "entry_price", "peak_potential_pct",
-            "decayed_return_pct", "spy_alpha_pct", "total_return_pct",
-            "total_spy_alpha_pct", "decayed_spy_return_pct",
+            "member",
+            "ticker",
+            "disclosure_date",
+            "signal_type",
+            "horizon_days",
+            "entry_price",
+            "peak_potential_pct",
+            "decayed_return_pct",
+            "spy_alpha_pct",
+            "total_return_pct",
+            "total_spy_alpha_pct",
+            "decayed_spy_return_pct",
         }
         self.assertTrue(expected_cols.issubset(set(result.columns)))
 
     def test_marks_only_fully_covered_horizons_complete(self):
         result = calculate_signal_potential(
-            self.entry_prices.iloc[[0]], self.prices_df, [90, 180],
+            self.entry_prices.iloc[[0]],
+            self.prices_df,
+            [90, 180],
         ).set_index("horizon_days")
 
         self.assertTrue(bool(result.loc[90, "window_complete"]))
@@ -54,11 +69,15 @@ class TestCalculateSignalPotential(unittest.TestCase):
         disclosure = pd.Timestamp.today().normalize() - pd.Timedelta(days=10)
         dates = pd.date_range(disclosure, disclosure + pd.Timedelta(days=40), freq="D")
         prices = pd.DataFrame({"AAPL": 100.0, "SPY": 400.0}, index=dates)
-        entries = pd.DataFrame({
-            "member": ["Alice"], "ticker": ["AAPL"],
-            "disclosure_date": [disclosure], "transaction_type": ["Purchase"],
-            "entry_price": [100.0],
-        })
+        entries = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["AAPL"],
+                "disclosure_date": [disclosure],
+                "transaction_type": ["Purchase"],
+                "entry_price": [100.0],
+            }
+        )
 
         result = calculate_signal_potential(entries, prices, [30])
 
@@ -67,7 +86,9 @@ class TestCalculateSignalPotential(unittest.TestCase):
     def test_absolute_return_window_can_complete_without_spy(self):
         prices = self.prices_df[["AAPL"]]
         result = calculate_signal_potential(
-            self.entry_prices.iloc[[0]], prices, [90],
+            self.entry_prices.iloc[[0]],
+            prices,
+            [90],
         )
 
         self.assertTrue(bool(result.iloc[0]["window_complete"]))
@@ -76,20 +97,24 @@ class TestCalculateSignalPotential(unittest.TestCase):
 
     def test_explodes_across_horizons(self):
         result = calculate_signal_potential(
-            self.entry_prices, self.prices_df, [30, 60, 90],
+            self.entry_prices,
+            self.prices_df,
+            [30, 60, 90],
         )
         # 2 entries * 3 horizons = 6 rows
         self.assertEqual(len(result), 6)
         self.assertEqual(set(result["horizon_days"].unique()), {30, 60, 90})
 
     def test_handles_missing_ticker(self):
-        entry_prices = pd.DataFrame({
-            "member": ["Alice"],
-            "ticker": ["MISSING"],
-            "disclosure_date": pd.to_datetime(["2024-02-01"]),
-            "transaction_type": ["Purchase"],
-            "entry_price": [100.0],
-        })
+        entry_prices = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["MISSING"],
+                "disclosure_date": pd.to_datetime(["2024-02-01"]),
+                "transaction_type": ["Purchase"],
+                "entry_price": [100.0],
+            }
+        )
         result = calculate_signal_potential(entry_prices, self.prices_df, [30])
         # Missing ticker should produce NaN signal values rather than crash
         self.assertEqual(len(result), 1)
@@ -102,8 +127,11 @@ class TestCalculateSignalPotential(unittest.TestCase):
 
         row = result.iloc[0]
         for column in (
-            "peak_potential_pct", "decayed_return_pct", "spy_alpha_pct",
-            "total_return_pct", "total_spy_alpha_pct",
+            "peak_potential_pct",
+            "decayed_return_pct",
+            "spy_alpha_pct",
+            "total_return_pct",
+            "total_spy_alpha_pct",
         ):
             self.assertTrue(pd.isna(row[column]), column)
 
@@ -115,24 +143,28 @@ class TestCalculateSignalPotential(unittest.TestCase):
 
 
 class TestGetTopSignals(unittest.TestCase):
-
     def _make_signals(self) -> pd.DataFrame:
-        return pd.DataFrame({
-            "member": ["Alice", "Bob", "Charlie"],
-            "ticker": ["AAPL", "AAPL", "AAPL"],
-            "disclosure_date": pd.to_datetime([
-                "2024-02-01", "2024-02-15", "2024-03-01",
-            ]),
-            "signal_type": ["Purchase", "Purchase", "Purchase"],
-            "horizon_days": [90, 90, 90],
-            "entry_price": [100.0, 105.0, 110.0],
-            "peak_potential_pct": [5.0, 8.0, 3.0],
-            "decayed_return_pct": [2.0, 4.0, 1.0],
-            "spy_alpha_pct": [1.0, 2.5, -0.5],
-            "total_return_pct": [3.0, 5.0, 0.5],
-            "total_spy_alpha_pct": [2.0, 3.5, -0.5],
-        })
-
+        return pd.DataFrame(
+            {
+                "member": ["Alice", "Bob", "Charlie"],
+                "ticker": ["AAPL", "AAPL", "AAPL"],
+                "disclosure_date": pd.to_datetime(
+                    [
+                        "2024-02-01",
+                        "2024-02-15",
+                        "2024-03-01",
+                    ]
+                ),
+                "signal_type": ["Purchase", "Purchase", "Purchase"],
+                "horizon_days": [90, 90, 90],
+                "entry_price": [100.0, 105.0, 110.0],
+                "peak_potential_pct": [5.0, 8.0, 3.0],
+                "decayed_return_pct": [2.0, 4.0, 1.0],
+                "spy_alpha_pct": [1.0, 2.5, -0.5],
+                "total_return_pct": [3.0, 5.0, 0.5],
+                "total_spy_alpha_pct": [2.0, 3.5, -0.5],
+            }
+        )
 
     def test_returns_top_n_sorted_by_score(self):
         signals = self._make_signals()
@@ -146,8 +178,6 @@ class TestGetTopSignals(unittest.TestCase):
         signals.loc[:, "total_spy_alpha_pct"] = -10.0
 
         self.assertTrue(get_top_signals(signals, horizon=90, top_n=3).empty)
-
-
 
 
 if __name__ == "__main__":

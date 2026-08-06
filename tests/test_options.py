@@ -1,12 +1,11 @@
 """Smoke tests for analyzer.options module."""
+
 import unittest
 
 from analyzer.options import estimate_options_leverage
 
 
 class TestEstimateOptionsLeverage(unittest.TestCase):
-
-
     def test_call_returns_positive_leverage(self):
         result = estimate_options_leverage("call")
         self.assertGreater(result, 1.0)
@@ -23,7 +22,6 @@ class TestEstimateOptionsLeverage(unittest.TestCase):
         small_amount = estimate_options_leverage("call", amount_midpoint=1_000)
         # Large trades -> less leverage; small trades -> more leverage
         self.assertLess(high_amount, small_amount)
-
 
 
 if __name__ == "__main__":

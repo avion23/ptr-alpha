@@ -49,7 +49,10 @@ def _clean_table(tbl: list[list[str | None]]) -> list[list[str]] | None:
     if not tbl or len(tbl) < 2:
         return None
     cleaned = [
-        [("" if cell is None else str(cell).replace("\x00", "").strip()) for cell in row]
+        [
+            ("" if cell is None else str(cell).replace("\x00", "").strip())
+            for cell in row
+        ]
         for row in tbl
     ]
     # Drop fully-empty rows

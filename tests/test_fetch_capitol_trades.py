@@ -1,18 +1,20 @@
 """Smoke tests for scripts.fetch_capitol_trades module."""
+
 import unittest
 from unittest.mock import MagicMock, patch
 
 
 class TestFetchCapitolTrades(unittest.TestCase):
-
-
-
     def test_fetch_all_trades_paginates(self):
         from scripts import fetch_capitol_trades
 
         # Mock response for two pages
         page1 = MagicMock()
-        page1.json.return_value = {"trades": [{"id": 1}, {"id": 2}], "pages": 2, "total": 3}
+        page1.json.return_value = {
+            "trades": [{"id": 1}, {"id": 2}],
+            "pages": 2,
+            "total": 3,
+        }
         page1.raise_for_status = MagicMock()
 
         page2 = MagicMock()

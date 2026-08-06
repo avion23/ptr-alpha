@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 _MAX_LOOKAHEAD_LINES = 8
 
 
-def extract_tables_with_docling(pdf_path: Path, timeout: int = 300) -> list[list[list[str]]]:
+def extract_tables_with_docling(
+    pdf_path: Path, timeout: int = 300
+) -> list[list[list[str]]]:
     """OCR fallback using Docling (TableFormer + RapidOCR).
 
     Benchmark winner for scanned image PDFs: handles the 4 large 2024-2025
@@ -55,8 +57,17 @@ def _build_docling_cmd(pdf_path: Path) -> list[str] | None:
     # OpenMP/runtime conflicts. Fall back to system docling only if no uvx.
     uvx = shutil.which("uvx")
     if uvx:
-        return ["uvx", "--from", "docling", "docling", "convert",
-                str(pdf_path), "--to", "md", "--output"]
+        return [
+            "uvx",
+            "--from",
+            "docling",
+            "docling",
+            "convert",
+            str(pdf_path),
+            "--to",
+            "md",
+            "--output",
+        ]
     if shutil.which("docling"):
         return ["docling", "convert", str(pdf_path), "--to", "md", "--output"]
     logger.debug("Neither uvx nor docling on PATH — skipping Docling OCR")
@@ -66,11 +77,16 @@ def _build_docling_cmd(pdf_path: Path) -> list[str] | None:
 def _run_docling(full_cmd: list[str], pdf_path: Path, timeout: int) -> str | None:
     try:
         result = subprocess.run(  # nosec B603
-            full_cmd, capture_output=True, text=True,
-            errors='replace', timeout=timeout,
+            full_cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
         )
         if result.returncode != 0:
-            logger.debug(f"docling failed for {pdf_path}: rc={result.returncode}, stderr tail={result.stderr[-300:]}")
+            logger.debug(
+                f"docling failed for {pdf_path}: rc={result.returncode}, stderr tail={result.stderr[-300:]}"
+            )
             return None
     except subprocess.TimeoutExpired as e:
         logger.debug(f"docling timed out for {pdf_path}: {e}")
@@ -135,24 +151,24 @@ def _parse_docling_markdown(text: str) -> list[list[list[str]]]:
     lines = text.split("\n")
     rows: list[list[str]] = []
 
-    ticker_re = re.compile(r'(.+?)\s*\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)\s*(\[[A-Z]+\])?')
-    tx_code_re = re.compile(r'^[·\-\s]*([PSE])\s*(\(partial\))?\s*$', re.IGNORECASE)
+    ticker_re = re.compile(r"(.+?)\s*\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)\s*(\[[A-Z]+\])?")
+    tx_code_re = re.compile(r"^[·\-\s]*([PSE])\s*(\(partial\))?\s*$", re.IGNORECASE)
     date_amount_re = re.compile(
-        r'(\d{2}/\d{2}/\d{4})'                    # tx date
-        r'(?:\s+\d{2}/\d{2}/\d{4})?'              # optional notification date
-        r'\s*(\$[\d,]+\s*-\s*\$[\d,]+|\$[\d,]+)?'  # optional amount
+        r"(\d{2}/\d{2}/\d{4})"  # tx date
+        r"(?:\s+\d{2}/\d{2}/\d{4})?"  # optional notification date
+        r"\s*(\$[\d,]+\s*-\s*\$[\d,]+|\$[\d,]+)?"  # optional amount
     )
 
     i = 0
     while i < len(lines):
         line = lines[i].strip()
         m = ticker_re.search(line)
-        if not m or ('[ST]' not in line and not re.search(r'\([A-Z]{1,6}\)', line)):
+        if not m or ("[ST]" not in line and not re.search(r"\([A-Z]{1,6}\)", line)):
             i += 1
             continue
 
         # Extract asset name and ticker
-        asset_name = line.lstrip('- ').strip()
+        asset_name = line.lstrip("- ").strip()
 
         tx_type, tx_date, amount, next_i = _scan_forward_for_tx(
             lines, i, ticker_re, tx_code_re, date_amount_re
@@ -163,7 +179,7 @@ def _parse_docling_markdown(text: str) -> list[list[list[str]]]:
 
     if not rows:
         return []
-    header = ['Asset Name', 'Transaction Type', 'Transaction Date', 'Amount']
+    header = ["Asset Name", "Transaction Type", "Transaction Date", "Amount"]
     table = [header] + rows  # one table (list of rows)
     return [table]  # list of tables
 
@@ -181,7 +197,7 @@ def _scan_forward_for_tx(lines, i, ticker_re, tx_code_re, date_amount_re):
         if not lookahead:
             continue
         # Stop if we hit the next ticker line
-        if ticker_re.search(lookahead) and re.search(r'\([A-Z]{1,6}\)', lookahead):
+        if ticker_re.search(lookahead) and re.search(r"\([A-Z]{1,6}\)", lookahead):
             break
 
         # Check for tx code (standalone P/S/E)

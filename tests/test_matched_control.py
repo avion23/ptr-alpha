@@ -73,32 +73,51 @@ class TestFindMatchedControls(unittest.TestCase):
 
     def test_returns_correct_number_of_controls(self):
         controls = find_matched_controls(
-            "TREAT", date(2024, 3, 1), self.tickers, self.prices, self.signals,
-            n_controls=3, sector_data=self.sector_data,
+            "TREAT",
+            date(2024, 3, 1),
+            self.tickers,
+            self.prices,
+            self.signals,
+            n_controls=3,
+            sector_data=self.sector_data,
         )
         self.assertLessEqual(len(controls), 3)
         self.assertGreater(len(controls), 0)
 
     def test_treatment_ticker_excluded(self):
         controls = find_matched_controls(
-            "TREAT", date(2024, 3, 1), self.tickers, self.prices, self.signals,
-            n_controls=10, sector_data=self.sector_data,
+            "TREAT",
+            date(2024, 3, 1),
+            self.tickers,
+            self.prices,
+            self.signals,
+            n_controls=10,
+            sector_data=self.sector_data,
         )
         self.assertNotIn("TREAT", controls)
 
-
     def test_returns_empty_for_no_candidates(self):
         controls = find_matched_controls(
-            "TREAT", date(2024, 3, 1), ["TREAT"], self.prices, self.signals,
-            n_controls=10, sector_data=self.sector_data,
+            "TREAT",
+            date(2024, 3, 1),
+            ["TREAT"],
+            self.prices,
+            self.signals,
+            n_controls=10,
+            sector_data=self.sector_data,
         )
         self.assertEqual(controls, [])
 
     def test_sector_filtering(self):
         """Controls should prefer same-sector tickers."""
         controls = find_matched_controls(
-            "TREAT", date(2024, 3, 1), self.tickers, self.prices, self.signals,
-            n_controls=10, sector_data=self.sector_data,
+            "TREAT",
+            date(2024, 3, 1),
+            self.tickers,
+            self.prices,
+            self.signals,
+            n_controls=10,
+            sector_data=self.sector_data,
         )
         # C3 is Health sector — should be deprioritized vs Tech sector tickers
         if len(controls) >= 3:
@@ -140,8 +159,13 @@ class TestFindMatchedControlsMatching(unittest.TestCase):
 
     def test_volatility_matching_prefers_similar_vol(self):
         controls = find_matched_controls(
-            "TREAT", date(2024, 4, 1), self.all_tickers, self.prices, self.signals,
-            n_controls=2, sector_data=self.sector_data,
+            "TREAT",
+            date(2024, 4, 1),
+            self.all_tickers,
+            self.prices,
+            self.signals,
+            n_controls=2,
+            sector_data=self.sector_data,
         )
         # Low-vol controls should be preferred over high-vol ones
         for c in controls:
@@ -158,63 +182,95 @@ class TestRunMatchedControlBacktest(unittest.TestCase):
             self.prices[t] = 100 * np.cumprod(1 + rng.normal(0.0004, 0.015, 300))
 
         # Signals: enough history for training
-        self.signals = _make_signals([
-            {
-                "member": "Alice", "ticker": "AAPL",
-                "disclosure_date": "2023-06-01",
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 95.0, "decayed_return_pct": 15.0,
-                "peak_potential_pct": 25.0, "spy_alpha_pct": 10.0,
-                "total_return_pct": 20.0, "total_spy_alpha_pct": 12.0,
-            },
-            {
-                "member": "Bob", "ticker": "AAPL",
-                "disclosure_date": "2023-08-01",
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 98.0, "decayed_return_pct": 12.0,
-                "peak_potential_pct": 20.0, "spy_alpha_pct": 8.0,
-                "total_return_pct": 18.0, "total_spy_alpha_pct": 10.0,
-            },
-            {
-                "member": "Alice", "ticker": "MSFT",
-                "disclosure_date": "2023-07-01",
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 90.0, "decayed_return_pct": 10.0,
-                "peak_potential_pct": 18.0, "spy_alpha_pct": 6.0,
-                "total_return_pct": 14.0, "total_spy_alpha_pct": 8.0,
-            },
-            {
-                "member": "Bob", "ticker": "MSFT",
-                "disclosure_date": "2023-09-01",
-                "signal_type": "Purchase", "horizon_days": 90,
-                "entry_price": 92.0, "decayed_return_pct": 8.0,
-                "peak_potential_pct": 15.0, "spy_alpha_pct": 5.0,
-                "total_return_pct": 12.0, "total_spy_alpha_pct": 7.0,
-            },
-        ])
+        self.signals = _make_signals(
+            [
+                {
+                    "member": "Alice",
+                    "ticker": "AAPL",
+                    "disclosure_date": "2023-06-01",
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 95.0,
+                    "decayed_return_pct": 15.0,
+                    "peak_potential_pct": 25.0,
+                    "spy_alpha_pct": 10.0,
+                    "total_return_pct": 20.0,
+                    "total_spy_alpha_pct": 12.0,
+                },
+                {
+                    "member": "Bob",
+                    "ticker": "AAPL",
+                    "disclosure_date": "2023-08-01",
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 98.0,
+                    "decayed_return_pct": 12.0,
+                    "peak_potential_pct": 20.0,
+                    "spy_alpha_pct": 8.0,
+                    "total_return_pct": 18.0,
+                    "total_spy_alpha_pct": 10.0,
+                },
+                {
+                    "member": "Alice",
+                    "ticker": "MSFT",
+                    "disclosure_date": "2023-07-01",
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 90.0,
+                    "decayed_return_pct": 10.0,
+                    "peak_potential_pct": 18.0,
+                    "spy_alpha_pct": 6.0,
+                    "total_return_pct": 14.0,
+                    "total_spy_alpha_pct": 8.0,
+                },
+                {
+                    "member": "Bob",
+                    "ticker": "MSFT",
+                    "disclosure_date": "2023-09-01",
+                    "signal_type": "Purchase",
+                    "horizon_days": 90,
+                    "entry_price": 92.0,
+                    "decayed_return_pct": 8.0,
+                    "peak_potential_pct": 15.0,
+                    "spy_alpha_pct": 5.0,
+                    "total_return_pct": 12.0,
+                    "total_spy_alpha_pct": 7.0,
+                },
+            ]
+        )
 
-        self.transactions = _make_transactions([
-            {
-                "member": "Alice", "ticker": "CAND1",
-                "transaction_date": "2024-08-01", "disclosure_date": "2024-08-05",
-                "transaction_type": "Purchase",
-            },
-            {
-                "member": "Bob", "ticker": "CAND1",
-                "transaction_date": "2024-08-02", "disclosure_date": "2024-08-06",
-                "transaction_type": "Purchase",
-            },
-            {
-                "member": "Alice", "ticker": "CAND2",
-                "transaction_date": "2024-08-10", "disclosure_date": "2024-08-14",
-                "transaction_type": "Purchase",
-            },
-            {
-                "member": "Bob", "ticker": "CAND2",
-                "transaction_date": "2024-08-11", "disclosure_date": "2024-08-15",
-                "transaction_type": "Purchase",
-            },
-        ])
+        self.transactions = _make_transactions(
+            [
+                {
+                    "member": "Alice",
+                    "ticker": "CAND1",
+                    "transaction_date": "2024-08-01",
+                    "disclosure_date": "2024-08-05",
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "member": "Bob",
+                    "ticker": "CAND1",
+                    "transaction_date": "2024-08-02",
+                    "disclosure_date": "2024-08-06",
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "member": "Alice",
+                    "ticker": "CAND2",
+                    "transaction_date": "2024-08-10",
+                    "disclosure_date": "2024-08-14",
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "member": "Bob",
+                    "ticker": "CAND2",
+                    "transaction_date": "2024-08-11",
+                    "disclosure_date": "2024-08-15",
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
 
         self.sector_data = {
             "CAND1": {"sector": "Tech", "market_cap": 50e9},
@@ -226,7 +282,6 @@ class TestRunMatchedControlBacktest(unittest.TestCase):
             "SPY": {"sector": "ETF", "market_cap": 0},
         }
 
-
     def test_excess_alpha_equals_alpha_minus_control_mean(self):
         dates_ext = pd.bdate_range("2024-01-01", periods=400)
         rng = np.random.default_rng(42)
@@ -235,19 +290,24 @@ class TestRunMatchedControlBacktest(unittest.TestCase):
             prices_ext[t] = 100 * np.cumprod(1 + rng.normal(0.0004, 0.015, 400))
 
         result = run_matched_control_backtest(
-            self.signals, self.transactions, prices_ext,
+            self.signals,
+            self.transactions,
+            prices_ext,
             start_date=date(2024, 9, 1),
             end_date=date(2024, 10, 1),
-            horizon=90, top_n=5, frequency_days=14, n_controls=3,
-            min_buyers=2, lookback_days=60, threshold=5.0,
+            horizon=90,
+            top_n=5,
+            frequency_days=14,
+            n_controls=3,
+            min_buyers=2,
+            lookback_days=60,
+            threshold=5.0,
             training_lookback_days=365,
         )
         if not result.empty:
             for _, row in result.iterrows():
                 expected = round(row["alpha"] - row["control_mean_alpha"], 2)
                 self.assertAlmostEqual(row["excess_alpha"], expected, places=1)
-
-
 
 
 if __name__ == "__main__":

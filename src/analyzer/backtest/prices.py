@@ -121,4 +121,6 @@ def _price_before_arrays(idx_ns, vals, target_date, max_staleness_days=None):
 
 def _price_on_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=5):
     """Price lookup using pre-extracted arrays."""
-    return _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=max_staleness_days)
+    return _price_at_or_before_arrays(
+        idx_ns, vals, target_date, max_staleness_days=max_staleness_days
+    )

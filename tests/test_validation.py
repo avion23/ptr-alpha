@@ -1,4 +1,5 @@
 """Tests for analyzer.validation: newey_west_tstat, select_config."""
+
 from __future__ import annotations
 
 import math
@@ -16,8 +17,8 @@ from analyzer.validation import (
 # newey_west_tstat
 # ---------------------------------------------------------------------------
 
-class TestNeweyWestTstat:
 
+class TestNeweyWestTstat:
     def test_lag0_matches_biased_plain_tstat(self):
         """lag=0 → t = mean / (biased_std / sqrt(n))."""
         x = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
@@ -65,9 +66,10 @@ class TestNeweyWestTstat:
     def test_nan_dropped_before_computation(self):
         x_with_nan = pd.Series([1.0, float("nan"), 2.0, 3.0])
         x_clean = pd.Series([1.0, 2.0, 3.0])
-        assert abs(
-            newey_west_tstat(x_with_nan, lag=0) - newey_west_tstat(x_clean, lag=0)
-        ) < 1e-10
+        assert (
+            abs(newey_west_tstat(x_with_nan, lag=0) - newey_west_tstat(x_clean, lag=0))
+            < 1e-10
+        )
 
     def test_lag_equals_len_minus_1_does_not_crash(self):
         """Edge case: lag ≥ n-1 should not raise (gamma array boundary)."""
@@ -89,39 +91,41 @@ class TestNeweyWestTstat:
 # select_config
 # ---------------------------------------------------------------------------
 
+
 def _make_sweep_df(n: int = 10, p_values: list[float] | None = None) -> pd.DataFrame:
     """Build a synthetic sweep DataFrame with n rows."""
     rng = np.random.default_rng(99)
     rows = []
     for i in range(n):
-        rows.append({
-            "horizon": 60,
-            "frequency_days": 30,
-            "training_lookback_days": 365,
-            "min_buyers": 2 + (i % 3),
-            "top_n": 3 + (i % 2) * 2,
-            "decay_lambda": 0.005,
-            "bayes_prior_strength": 20.0,
-            "scoring_mode": "shrunk_alpha",
-            "total_recs": 50,
-            "dates_evaluated": 20,
-            "overall_alpha": float(rng.uniform(0.5, 3.0)),
-            "overall_return": 1.0,
-            "rank1_alpha": 2.0,
-            "rank5_alpha": 1.0,
-            "alpha_slope": float(rng.uniform(-1.0, 2.0)),
-            "win_rate": 60.0,
-            "sharpe": 1.0,
-            "max_drawdown": -5.0,
-            "nw_tstat": 2.0,
-            "p_value": p_values[i] if p_values else 0.9,  # default: no survivors
-            "min_sample_ok": True,
-        })
+        rows.append(
+            {
+                "horizon": 60,
+                "frequency_days": 30,
+                "training_lookback_days": 365,
+                "min_buyers": 2 + (i % 3),
+                "top_n": 3 + (i % 2) * 2,
+                "decay_lambda": 0.005,
+                "bayes_prior_strength": 20.0,
+                "scoring_mode": "shrunk_alpha",
+                "total_recs": 50,
+                "dates_evaluated": 20,
+                "overall_alpha": float(rng.uniform(0.5, 3.0)),
+                "overall_return": 1.0,
+                "rank1_alpha": 2.0,
+                "rank5_alpha": 1.0,
+                "alpha_slope": float(rng.uniform(-1.0, 2.0)),
+                "win_rate": 60.0,
+                "sharpe": 1.0,
+                "max_drawdown": -5.0,
+                "nw_tstat": 2.0,
+                "p_value": p_values[i] if p_values else 0.9,  # default: no survivors
+                "min_sample_ok": True,
+            }
+        )
     return pd.DataFrame(rows)
 
 
 class TestSelectConfig:
-
     def test_picks_max_alpha_slope_among_bh_survivors(self):
         """Among configs that survive BH, pick the one with the highest alpha_slope."""
         df = _make_sweep_df(n=5, p_values=[0.001, 0.002, 0.9, 0.9, 0.9])
@@ -172,14 +176,32 @@ class TestSelectConfig:
     def test_min_sample_filter_excludes_tiny_high_tstat_config(self):
         """Tiny samples cannot win even with a huge positive t-stat."""
         df = _make_sweep_df(n=2, p_values=[0.0, 0.02])
-        df.loc[0, ["dates_evaluated", "total_recs", "alpha_slope", "p_value", "min_sample_ok"]] = [
+        df.loc[
+            0,
+            [
+                "dates_evaluated",
+                "total_recs",
+                "alpha_slope",
+                "p_value",
+                "min_sample_ok",
+            ],
+        ] = [
             2,
             2,
             100.0,
             1.0,
             False,
         ]
-        df.loc[1, ["dates_evaluated", "total_recs", "alpha_slope", "p_value", "min_sample_ok"]] = [
+        df.loc[
+            1,
+            [
+                "dates_evaluated",
+                "total_recs",
+                "alpha_slope",
+                "p_value",
+                "min_sample_ok",
+            ],
+        ] = [
             10,
             30,
             2.0,

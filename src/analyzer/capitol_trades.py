@@ -39,11 +39,20 @@ class CapitolTradesError(Exception):
 class CapitolTradesSource(TransactionSource):
     """Fetches congressional trading data from the Capitol Trades API."""
 
-    def __init__(self, data_dir: str | Path = "data", read_only: bool = False, db: Database | None = None):
+    def __init__(
+        self,
+        data_dir: str | Path = "data",
+        read_only: bool = False,
+        db: Database | None = None,
+    ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._owns_db = db is None
-        self.db = db if db is not None else Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        self.db = (
+            db
+            if db is not None
+            else Database(self.data_dir / "congress.duckdb", read_only=read_only)
+        )
         self.session = requests.Session()
         self.session.headers["Accept"] = "application/json"
 
@@ -169,10 +178,18 @@ class CapitolTradesSource(TransactionSource):
         if not trades:
             return pd.DataFrame(
                 columns=[
-                    "doc_id", "member", "ticker", "transaction_date",
-                    "disclosure_date", "transaction_type", "owner_code",
-                    "amount_raw", "amount_midpoint", "instrument_type",
-                    "strike_price", "expiry_date",
+                    "doc_id",
+                    "member",
+                    "ticker",
+                    "transaction_date",
+                    "disclosure_date",
+                    "transaction_type",
+                    "owner_code",
+                    "amount_raw",
+                    "amount_midpoint",
+                    "instrument_type",
+                    "strike_price",
+                    "expiry_date",
                 ]
             )
 
@@ -196,31 +213,40 @@ class CapitolTradesSource(TransactionSource):
             raw_doc_id = t.get("doc_id")
             doc_id_str = str(raw_doc_id) if raw_doc_id is not None else ""
             if not doc_id_str or doc_id_str == "None":
-                components = "|".join([
-                    t.get("politician_name", ""),
-                    t.get("ticker", "") or "",
-                    str(t.get("transaction_date", "")),
-                    str(t.get("transaction_type", "")),
-                    t.get("amount_text", "") or "",
-                ])
-                doc_id_str = "ct-" + hashlib.sha1(
-                    components.encode(), usedforsecurity=False
-                ).hexdigest()[:16]
+                components = "|".join(
+                    [
+                        t.get("politician_name", ""),
+                        t.get("ticker", "") or "",
+                        str(t.get("transaction_date", "")),
+                        str(t.get("transaction_type", "")),
+                        t.get("amount_text", "") or "",
+                    ]
+                )
+                doc_id_str = (
+                    "ct-"
+                    + hashlib.sha1(
+                        components.encode(), usedforsecurity=False
+                    ).hexdigest()[:16]
+                )
 
-            rows.append({
-                "doc_id": doc_id_str,
-                "member": t.get("politician_name", ""),
-                "ticker": t.get("ticker"),
-                "transaction_date": self._parse_date(t.get("transaction_date")),
-                "disclosure_date": self._parse_date(t.get("disclosure_date")),
-                "transaction_type": tx_type,
-                "owner_code": None,
-                "amount_raw": t.get("amount_text"),
-                "amount_midpoint": midpoint,
-                "instrument_type": self._normalize_instrument_type(t.get("asset_type")),
-                "strike_price": None,
-                "expiry_date": None,
-            })
+            rows.append(
+                {
+                    "doc_id": doc_id_str,
+                    "member": t.get("politician_name", ""),
+                    "ticker": t.get("ticker"),
+                    "transaction_date": self._parse_date(t.get("transaction_date")),
+                    "disclosure_date": self._parse_date(t.get("disclosure_date")),
+                    "transaction_type": tx_type,
+                    "owner_code": None,
+                    "amount_raw": t.get("amount_text"),
+                    "amount_midpoint": midpoint,
+                    "instrument_type": self._normalize_instrument_type(
+                        t.get("asset_type")
+                    ),
+                    "strike_price": None,
+                    "expiry_date": None,
+                }
+            )
 
         df = pd.DataFrame(rows)
         # Drop rows with missing critical fields (doc_id is always set now)

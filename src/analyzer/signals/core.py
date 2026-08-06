@@ -64,9 +64,8 @@ def _compute_ticker_signals(
     ticker_end_valid = t_end_pos >= 0
     ticker_end_dates_ns = np.zeros(n_signals, dtype=np.int64)
     ticker_end_dates_ns[ticker_end_valid] = dates_ns[t_end_pos[ticker_end_valid]]
-    ticker_window_complete = (
-        ticker_end_valid
-        & ((t_end_ns - ticker_end_dates_ns) <= coverage_tolerance_ns)
+    ticker_window_complete = ticker_end_valid & (
+        (t_end_ns - ticker_end_dates_ns) <= coverage_tolerance_ns
     )
     has_benchmark = spy_dates_ns is not None and len(spy_dates_ns) > 0
     spy_data_through = spy_dates_ns[-1] if has_benchmark else 0
@@ -78,16 +77,17 @@ def _compute_ticker_signals(
         & ((not has_benchmark) | (spy_data_through >= t_end_ns - coverage_tolerance_ns))
     )
 
-    spy_has = spy_dates_ns is not None and spy_vals is not None and spy_log_ret is not None
+    spy_has = (
+        spy_dates_ns is not None and spy_vals is not None and spy_log_ret is not None
+    )
 
     for i in range(n_signals):
         # A forward-return label is valid only after the market benchmark has
         # reached the requested window end.  Without this guard, a 180-day
         # signal computed 20 days after disclosure was silently labelled with
         # a 20-day return, contaminating member rankings and validation.
-        if (
-            not ticker_window_complete[i]
-            or not _market_window_is_complete(spy_dates_ns, t_end_ns[i])
+        if not ticker_window_complete[i] or not _market_window_is_complete(
+            spy_dates_ns, t_end_ns[i]
         ):
             continue
         lo = int(t_lo[i])
@@ -133,9 +133,18 @@ def _compute_ticker_signals(
         # SPY returns for the same window
         if spy_has:
             _populate_spy_arrays(
-                idx, disc, t_end_ns[i], i,
-                spy_dates_ns, spy_vals, spy_log_ret, decay_lambda,
-                r_spy_cum, r_spy_wsum, r_spy_first, r_spy_last,
+                idx,
+                disc,
+                t_end_ns[i],
+                i,
+                spy_dates_ns,
+                spy_vals,
+                spy_log_ret,
+                decay_lambda,
+                r_spy_cum,
+                r_spy_wsum,
+                r_spy_first,
+                r_spy_last,
             )
 
 
@@ -153,13 +162,25 @@ def _market_window_is_complete(
     pos = int(np.searchsorted(spy_dates_ns, end_ns, side="right")) - 1
     if pos < 0:
         return False
-    return int(end_ns) - int(spy_dates_ns[pos]) <= max_staleness_days * _constants._NS_PER_DAY
+    return (
+        int(end_ns) - int(spy_dates_ns[pos])
+        <= max_staleness_days * _constants._NS_PER_DAY
+    )
 
 
 def _populate_spy_arrays(
-    idx, disc, end_ns, i,
-    spy_dates_ns, spy_vals, spy_log_ret, decay_lambda,
-    r_spy_cum, r_spy_wsum, r_spy_first, r_spy_last,
+    idx,
+    disc,
+    end_ns,
+    i,
+    spy_dates_ns,
+    spy_vals,
+    spy_log_ret,
+    decay_lambda,
+    r_spy_cum,
+    r_spy_wsum,
+    r_spy_first,
+    r_spy_last,
 ) -> None:
     spy_lo = int(np.searchsorted(spy_dates_ns, disc, side="left"))
     spy_hi_end = int(np.searchsorted(spy_dates_ns, end_ns, side="right"))
@@ -228,8 +249,13 @@ def calculate_signal_potential(
     result_arrays = _allocate_result_arrays(n)
 
     _compute_all_ticker_signals(
-        signals, metadata, prices_df, decay_lambda,
-        spy_dates_ns, spy_vals, spy_log_ret,
+        signals,
+        metadata,
+        prices_df,
+        decay_lambda,
+        spy_dates_ns,
+        spy_vals,
+        spy_log_ret,
         result_arrays,
     )
 
@@ -238,13 +264,20 @@ def calculate_signal_potential(
 
 # ── Pipeline helpers (private) ──────────────────────────────────────────
 
+
 def _validate_inputs(entry_prices_df: pd.DataFrame, prices_df: pd.DataFrame) -> None:
     if entry_prices_df.empty:
         raise AnalysisError("Empty entry prices dataframe")
     if prices_df.empty:
         raise AnalysisError("Empty prices dataframe")
 
-    required_cols = {"member", "ticker", "disclosure_date", "transaction_type", "entry_price"}
+    required_cols = {
+        "member",
+        "ticker",
+        "disclosure_date",
+        "transaction_type",
+        "entry_price",
+    }
     if not required_cols.issubset(entry_prices_df.columns):
         raise AnalysisError(
             f"Missing columns in entry_prices: {required_cols - set(entry_prices_df.columns)}"
@@ -266,9 +299,15 @@ def _resolve_tickers(signals: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataF
 
 
 def _explode_by_horizon(signals: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
-    signals = signals.assign(horizon_days=[horizons] * len(signals)).explode("horizon_days").reset_index(drop=True)
+    signals = (
+        signals.assign(horizon_days=[horizons] * len(signals))
+        .explode("horizon_days")
+        .reset_index(drop=True)
+    )
     signals["horizon_days"] = signals["horizon_days"].astype("int32")
-    signals["window_end"] = signals["disclosure_date"] + pd.to_timedelta(signals["horizon_days"], unit="D")
+    signals["window_end"] = signals["disclosure_date"] + pd.to_timedelta(
+        signals["horizon_days"], unit="D"
+    )
     signals["signal_id"] = range(len(signals))
     return signals
 
@@ -304,7 +343,9 @@ def _precompute_spy_log_returns(prices_df: pd.DataFrame) -> tuple:
         spy_log_ret = np.zeros(len(spy_vals), dtype=np.float64)
         if len(spy_vals) > 1:
             valid_spy = spy_vals[:-1] > 0
-            spy_log_ret[1:][valid_spy] = np.log(spy_vals[1:][valid_spy] / spy_vals[:-1][valid_spy])
+            spy_log_ret[1:][valid_spy] = np.log(
+                spy_vals[1:][valid_spy] / spy_vals[:-1][valid_spy]
+            )
     return spy_dates_ns, spy_vals, spy_log_ret
 
 
@@ -324,8 +365,14 @@ def _allocate_result_arrays(n: int) -> dict:
 
 
 def _compute_all_ticker_signals(
-    signals, metadata, prices_df, decay_lambda,
-    spy_dates_ns, spy_vals, spy_log_ret, result_arrays,
+    signals,
+    metadata,
+    prices_df,
+    decay_lambda,
+    spy_dates_ns,
+    spy_vals,
+    spy_log_ret,
+    result_arrays,
 ) -> None:
     """Process per-ticker (avoids 75M+ row merge)."""
     unique_tickers = np.unique(metadata["ticker_arr"])
@@ -365,7 +412,9 @@ def _compute_all_ticker_signals(
         )
 
 
-def _assemble_result_dataframe(signals: pd.DataFrame, metadata: dict, result_arrays: dict) -> pd.DataFrame:
+def _assemble_result_dataframe(
+    signals: pd.DataFrame, metadata: dict, result_arrays: dict
+) -> pd.DataFrame:
     """Backward-compat thin wrapper that delegates to ``assembly.py``."""
     return assemble_result_dataframe(signals, metadata, result_arrays)
 
@@ -402,7 +451,10 @@ def compute_signal_potential_with_member_decay(
             continue
         member_lambda = member_decay_map[member]
         member_signals = calculate_signal_potential(
-            member_df, prices_df, horizons, decay_lambda=member_lambda,
+            member_df,
+            prices_df,
+            horizons,
+            decay_lambda=member_lambda,
         )
         results.append(member_signals)
 

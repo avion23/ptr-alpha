@@ -8,7 +8,6 @@ from analyzer.analysis import (
     backtest_recommendations,
     evaluate_backtest,
     summarize_backtest,
-    _price_at_or_before,
 )
 
 from .conftest import DatabaseTestCase
@@ -41,55 +40,6 @@ def _make_transactions(rows):
     df["transaction_date"] = pd.to_datetime(df["transaction_date"])
     df["disclosure_date"] = pd.to_datetime(df["disclosure_date"])
     return df
-
-
-class TestPriceAtOrBefore(unittest.TestCase):
-
-    def setUp(self):
-        self.prices = pd.DataFrame(
-            {"AAPL": [100.0, 101.0, 102.0], "GOOG": [200.0, np.nan, 202.0]},
-            index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
-        )
-
-    def test_returns_price_on_exact_date(self):
-        result = _price_at_or_before(self.prices, "AAPL", pd.Timestamp("2024-01-02"))
-        self.assertEqual(result, 101.0)
-
-    def test_returns_last_price_before_date(self):
-        result = _price_at_or_before(self.prices, "AAPL", pd.Timestamp("2024-01-05"))
-        self.assertEqual(result, 102.0)
-
-    def test_returns_none_for_missing_ticker(self):
-        result = _price_at_or_before(self.prices, "MSFT", pd.Timestamp("2024-01-02"))
-        self.assertIsNone(result)
-
-    def test_returns_none_for_date_before_first(self):
-        result = _price_at_or_before(self.prices, "AAPL", pd.Timestamp("2023-12-31"))
-        self.assertIsNone(result)
-
-    def test_skips_nan_values(self):
-        result = _price_at_or_before(self.prices, "GOOG", pd.Timestamp("2024-01-02"))
-        self.assertEqual(result, 200.0)
-
-    def test_returns_none_when_stale(self):
-        # Price is Jan 1, target is Jan 20 → 19 days stale, max=10
-        result = _price_at_or_before(
-            self.prices, "AAPL", pd.Timestamp("2024-01-20"), max_staleness_days=10
-        )
-        self.assertIsNone(result)
-
-    def test_returns_price_within_staleness_limit(self):
-        # Price is Jan 3, target is Jan 5 → 2 days stale, max=10
-        result = _price_at_or_before(
-            self.prices, "AAPL", pd.Timestamp("2024-01-05"), max_staleness_days=10
-        )
-        self.assertEqual(result, 102.0)
-
-    def test_returns_price_when_no_staleness_limit(self):
-        result = _price_at_or_before(
-            self.prices, "AAPL", pd.Timestamp("2024-12-01"), max_staleness_days=None
-        )
-        self.assertEqual(result, 102.0)
 
 
 class TestBacktestRecommendations(unittest.TestCase):

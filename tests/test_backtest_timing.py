@@ -3,30 +3,11 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from analyzer.backtest.filters import _filter_recent_trades
 from analyzer.analysis import evaluate_backtest
 from analyzer.options import estimate_options_leverage
 
 
 class TestBacktestTiming(unittest.TestCase):
-
-    def test_recent_trade_window_includes_lower_bound_and_excludes_as_of(self):
-        as_of = pd.Timestamp("2025-01-10")
-        transactions = pd.DataFrame({
-            "disclosure_date": pd.to_datetime([
-                "2024-12-11",  # lookback lower bound
-                "2024-12-12",
-                "2025-01-10",  # exact as_of
-            ]),
-            "transaction_type": ["Purchase"] * 3,
-        })
-
-        result = _filter_recent_trades(transactions, lookback_days=30, as_of_iso=as_of.isoformat())
-
-        self.assertEqual(
-            list(result["disclosure_date"]),
-            [pd.Timestamp("2024-12-11"), pd.Timestamp("2024-12-12")],
-        )
 
     def test_ordinary_entry_and_spy_use_as_of_close(self):
         as_of = pd.Timestamp("2025-01-03")

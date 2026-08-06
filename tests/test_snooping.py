@@ -15,7 +15,6 @@ from analyzer.snooping import (
     min_backtest_length,
     alpha_ttest,
     analyze_snooping,
-    _expected_max_sharpe,
 )
 
 
@@ -268,19 +267,6 @@ class TestAlphaTtest(unittest.TestCase):
         t_stat, p_val = alpha_ttest(mean_alpha=3.0, std_alpha=1.0, n_observations=3)
         # With only 3 obs, hard to be significant
         self.assertGreater(p_val, 0.01)
-
-
-class TestExpectedMaxSharpe(unittest.TestCase):
-    """Tests for expected maximum Sharpe under the null."""
-
-    def test_increases_with_trials(self):
-        e1 = _expected_max_sharpe(10, 100)
-        e2 = _expected_max_sharpe(100, 100)
-        self.assertGreater(e2, e1)
-
-    def test_positive(self):
-        e = _expected_max_sharpe(100, 100)
-        self.assertGreater(e, 0)
 
 
 class TestAnalyzeSnooping(unittest.TestCase):

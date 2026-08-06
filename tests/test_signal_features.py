@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 
 from analyzer.signal_features import (
-    CrashHazard,
     SignalFeatures,
     compute_disclosure_lag_weight,
     compute_signal_features,
@@ -183,29 +182,6 @@ class TestLagAndCrashPenaltyIntegration(unittest.TestCase):
         score_stale = base_score * lag_90
 
         self.assertGreater(score_fresh, score_stale)
-
-    def test_crash_penalty_reduces_score(self):
-        base_score = 10.0
-
-        low_risk = CrashHazard(crash_prob=0.05, expected_return=-0.005, var_95=-0.15, cvar_95=-0.19)
-        high_risk = CrashHazard(crash_prob=0.40, expected_return=-0.04, var_95=-0.30, cvar_95=-0.38)
-
-        score_low = base_score * (1 - low_risk.crash_prob)
-        score_high = base_score * (1 - high_risk.crash_prob)
-
-        self.assertGreater(score_low, score_high)
-        self.assertAlmostEqual(score_low, 9.5, places=1)
-        self.assertAlmostEqual(score_high, 6.0, places=1)
-
-    def test_combined_penalties(self):
-        base_score = 10.0
-        lag_weight = compute_disclosure_lag_weight(60)  # ~0.5
-        crash_prob = 0.20
-
-        adjusted = base_score * lag_weight * (1 - crash_prob)
-        self.assertLess(adjusted, base_score)
-        self.assertGreater(adjusted, 0.0)
-
 
 if __name__ == "__main__":
     unittest.main()

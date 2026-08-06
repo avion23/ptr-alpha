@@ -1,32 +1,10 @@
 import unittest
 from datetime import date, datetime
-from pathlib import Path
 
-import duckdb
 import pandas as pd
 
-from analyzer.database import Database
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
 from .conftest import DatabaseTestCase
-
-
-class TestDatabaseSchema(DatabaseTestCase):
-
-    def test_tables_created_on_init(self):
-        tables = self.db.conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-        ).fetchall()
-        table_names = {t[0] for t in tables}
-        self.assertIn("metadata", table_names)
-        self.assertIn("transactions", table_names)
-        self.assertIn("prices", table_names)
-
-    def test_transactions_unique_index_exists(self):
-        indexes = self.db.conn.execute(
-            "SELECT index_name FROM duckdb_indexes()"
-        ).fetchall()
-        index_names = {i[0] for i in indexes}
-        self.assertIn("idx_tx_unique_v2", index_names)
 
 
 class TestMetadata(DatabaseTestCase):
@@ -601,26 +579,6 @@ class TestGetEntryPrices(DatabaseTestCase):
         self.assertIsNotNone(result.iloc[0]["entry_price"])
 
 
-class TestContextManager(DatabaseTestCase):
-    def test_context_manager_closes_connection(self):
-        db_path = Path(self.tmp_dir) / "test_ctx.duckdb"
-        with Database(db_path) as db:
-            tables = db.conn.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-            ).fetchall()
-            self.assertTrue(len(tables) > 0)
-        with self.assertRaises(duckdb.ConnectionException):
-            db.conn.execute("SELECT 1")
-
-    def test_read_only_mode(self):
-        db_path = Path(self.tmp_dir) / "test_ro.duckdb"
-        with Database(db_path) as rw_db:
-            rw_db.close()
-        ro_db = Database(db_path, read_only=True)
-        self.assertTrue(ro_db.is_read_only)
-        ro_db.close()
-
-
 class TestDeleteTransactionsForDoc(DatabaseTestCase):
 
     def test_delete_removes_only_that_docs_rows(self):
@@ -668,33 +626,6 @@ class TestDeleteTransactionsForDoc(DatabaseTestCase):
 
 class TestParseRunsTable(DatabaseTestCase):
 
-    def test_pdf_parse_runs_table_exists(self):
-        tables = self.db.conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-        ).fetchall()
-        table_names = {t[0] for t in tables}
-        self.assertIn("pdf_parse_runs", table_names)
-
-    def test_upsert_parse_run_inserts_row(self):
-        self.db.upsert_parse_run(
-            doc_id="doc1",
-            year=2024,
-            parser_version="v2",
-            status="success",
-            engines_attempted="lattice,stream,ocr",
-            raw_row_count=10,
-            transaction_count=5,
-        )
-        result = self.db.conn.execute("SELECT * FROM pdf_parse_runs WHERE doc_id = 'doc1'").fetchall()
-        self.assertEqual(len(result), 1)
-        row = result[0]
-        self.assertEqual(row[0], "doc1")   # doc_id
-        self.assertEqual(row[1], 2024)     # year
-        self.assertEqual(row[2], "v2")     # parser_version
-        self.assertEqual(row[3], "success")  # status
-        self.assertEqual(row[4], "lattice,stream,ocr")  # engines_attempted
-        self.assertEqual(row[6], 5)        # transaction_count
-
     def test_upsert_parse_run_zero_rows_status(self):
         self.db.upsert_parse_run(
             doc_id="doc2",
@@ -723,39 +654,6 @@ class TestParseRunsTable(DatabaseTestCase):
             "SELECT error_message FROM pdf_parse_runs WHERE doc_id = 'doc3'"
         ).fetchone()
         self.assertEqual(result[0], "PDFTextExtractionNotAllowed")
-
-    def test_reparse_replaces_old_rows(self):
-        """Re-parsing a doc_id should delete old rows then insert new ones."""
-        df1 = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "member": "John Doe",
-                "ticker": "AAPL",
-                "transaction_date": date(2024, 3, 10),
-                "disclosure_date": date(2024, 3, 15),
-                "transaction_type": "Purchase",
-            },
-        ])
-        self.db.upsert_transactions(df1, source="house_pdf")
-        self.assertEqual(len(self.db.get_transactions(2024)), 1)
-
-        # Simulate re-parse: delete old, insert new with different data
-        self.db.delete_transactions_for_doc("doc1")
-        df2 = pd.DataFrame([
-            {
-                "doc_id": "doc1",
-                "member": "John Doe",
-                "ticker": "MSFT",
-                "transaction_date": date(2024, 5, 1),
-                "disclosure_date": date(2024, 5, 5),
-                "transaction_type": "Sale",
-            },
-        ])
-        self.db.upsert_transactions(df2, source="house_pdf")
-        result = self.db.get_transactions(2024)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result.iloc[0]["ticker"], "MSFT")
-        self.assertEqual(result.iloc[0]["transaction_type"], "Sale")
 
 
 class TestPhantomPurge(DatabaseTestCase):

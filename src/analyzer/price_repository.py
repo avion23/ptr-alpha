@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
+from functools import lru_cache
 
 import duckdb
 import numpy as np
@@ -24,6 +25,15 @@ from analyzer.ticker_resolver import TickerResolver
 logger = logging.getLogger(__name__)
 
 
+def _nyse_new_year_observance(day: pd.Timestamp) -> pd.Timestamp | None:
+    """NYSE does not observe a Saturday New Year on the preceding Friday."""
+    if day.weekday() == 5:
+        return None
+    if day.weekday() == 6:
+        return day + pd.Timedelta(days=1)
+    return day
+
+
 class _NYSEHolidayCalendar(AbstractHolidayCalendar):
     """NYSE trading-day closures.
 
@@ -34,7 +44,12 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
     """
 
     rules = [
-        Holiday("New Year's Day", month=1, day=1, observance=nearest_workday),
+        Holiday(
+            "New Year's Day",
+            month=1,
+            day=1,
+            observance=_nyse_new_year_observance,
+        ),
         USMartinLutherKingJr,
         USPresidentsDay,
         GoodFriday,
@@ -64,6 +79,52 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
 
 
 _NYSE_HOLIDAYS = _NYSEHolidayCalendar()
+
+
+def _normalize_session_date(value) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tz is not None:
+        timestamp = timestamp.tz_localize(None)
+    return timestamp.normalize()
+
+
+def nyse_sessions(start, end) -> pd.DatetimeIndex:
+    """Return expected full NYSE sessions for an inclusive date range."""
+    start_ts = _normalize_session_date(start)
+    end_ts = _normalize_session_date(end)
+    if end_ts < start_ts:
+        return pd.DatetimeIndex([])
+    weekdays = pd.bdate_range(start_ts, end_ts)
+    holidays = _NYSE_HOLIDAYS.holidays(start=start_ts, end=end_ts)
+    return weekdays.difference(holidays)
+
+
+@lru_cache(maxsize=8192)
+def _next_nyse_session_ns(day_ns: int) -> int:
+    day_ts = pd.Timestamp(day_ns)
+    sessions = nyse_sessions(day_ts + pd.Timedelta(days=1), day_ts + pd.Timedelta(days=14))
+    if sessions.empty:
+        raise ValueError(f"No NYSE session found after {day_ts.date()}")
+    return pd.Timestamp(sessions[0]).value
+
+
+def next_nyse_session(day) -> pd.Timestamp:
+    day_ts = _normalize_session_date(day)
+    return pd.Timestamp(_next_nyse_session_ns(day_ts.value))
+
+
+@lru_cache(maxsize=8192)
+def _previous_nyse_session_ns(day_ns: int) -> int:
+    day_ts = pd.Timestamp(day_ns)
+    sessions = nyse_sessions(day_ts - pd.Timedelta(days=14), day_ts)
+    if sessions.empty:
+        raise ValueError(f"No NYSE session found on or before {day_ts.date()}")
+    return pd.Timestamp(sessions[-1]).value
+
+
+def previous_nyse_session(day) -> pd.Timestamp:
+    day_ts = _normalize_session_date(day)
+    return pd.Timestamp(_previous_nyse_session_ns(day_ts.value))
 
 
 class PriceRepository:
@@ -97,7 +158,19 @@ class PriceRepository:
         if df.empty:
             return
 
-        df_reset = df.reset_index().copy()
+        normalized = df.copy()
+        try:
+            index = pd.DatetimeIndex(pd.to_datetime(normalized.index))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Price index must contain valid dates") from exc
+        if index.tz is not None:
+            index = index.tz_localize(None)
+        index = index.normalize()
+        if index.has_duplicates:
+            raise ValueError("Price index contains duplicate calendar dates")
+        normalized.index = index
+
+        df_reset = normalized.reset_index().copy()
         index_col_name = df_reset.columns[0]
         prices_long = df_reset.melt(
             id_vars=[index_col_name], var_name="ticker", value_name="close"
@@ -131,9 +204,7 @@ class PriceRepository:
         if not tickers:
             return [], []
 
-        business_dates = pd.bdate_range(start_date, end_date)
-        holidays = _NYSE_HOLIDAYS.holidays(start=start_date, end=end_date)
-        required_dates = business_dates.difference(holidays)
+        required_dates = nyse_sessions(start_date, end_date)
         if required_dates.empty:
             return [], []
 

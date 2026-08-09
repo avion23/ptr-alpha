@@ -2,13 +2,14 @@ import numpy as np
 import pandas as pd
 
 from analyzer.analysis import calculate_signal_potential
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
 
 
 def test_ticker_gap_does_not_use_stale_last_price_for_incomplete_horizon():
     disclosure = pd.Timestamp.now().normalize() - pd.Timedelta(days=120)
     dates = pd.date_range(disclosure, disclosure + pd.Timedelta(days=95), freq="D")
-    entry_date = disclosure + pd.Timedelta(days=1)
-    complete_exit = entry_date + pd.Timedelta(days=80)
+    entry_date = next_nyse_session(disclosure)
+    complete_exit = previous_nyse_session(entry_date + pd.Timedelta(days=80))
     aapl = pd.Series(np.nan, index=dates)
     aapl.loc[entry_date:complete_exit] = np.linspace(
         100.0, 110.0, len(aapl.loc[entry_date:complete_exit])
@@ -42,7 +43,7 @@ def test_ticker_gap_does_not_use_stale_last_price_for_incomplete_horizon():
 
 
 def test_quote_before_disclosure_does_not_complete_empty_window():
-    disclosure = pd.Timestamp.now().normalize() - pd.Timedelta(days=30)
+    disclosure = pd.Timestamp("2024-01-02")
     price_dates = pd.date_range(
         disclosure - pd.Timedelta(days=1), disclosure + pd.Timedelta(days=2), freq="D"
     )
@@ -154,3 +155,27 @@ def test_missing_spy_on_security_endpoint_makes_label_unavailable():
 
     assert not bool(row["window_complete"])
     assert np.isnan(row["total_spy_alpha_pct"])
+
+
+def test_six_day_early_security_exit_does_not_complete_label():
+    disclosure = pd.Timestamp("2025-01-02")
+    dates = pd.bdate_range("2025-01-02", "2025-01-14")
+    aapl = pd.Series(np.nan, index=dates)
+    aapl.loc["2025-01-03"] = 100.0
+    aapl.loc["2025-01-07"] = 110.0
+    prices = pd.DataFrame({"AAPL": aapl, "SPY": 400.0}, index=dates)
+    entries = pd.DataFrame(
+        {
+            "member": ["Alice"],
+            "ticker": ["AAPL"],
+            "disclosure_date": [disclosure],
+            "transaction_type": ["Purchase"],
+            "entry_price": [100.0],
+        }
+    )
+
+    row = calculate_signal_potential(entries, prices, [10]).iloc[0]
+
+    assert not bool(row["window_complete"])
+    assert pd.isna(row["label_exit_date"])
+    assert np.isnan(row["total_return_pct"])

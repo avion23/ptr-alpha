@@ -3,18 +3,20 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from analyzer.analysis import evaluate_backtest
+from analyzer.analysis import calculate_signal_potential, evaluate_backtest
+from analyzer.backtest.filters import _filter_ticker_perf, _filter_training
 from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
+from analyzer.pipeline import _entry_prices_from_matrix
 
 
 class TestBacktestTiming(unittest.TestCase):
     def test_ordinary_entry_uses_next_session_and_aligned_spy_dates(self):
         as_of = pd.Timestamp("2025-01-03")
-        dates = pd.date_range("2025-01-01", "2025-01-06", freq="D")
+        dates = pd.date_range("2025-01-01", "2025-01-07", freq="D")
         prices = pd.DataFrame(
             {
-                "AAPL": [90.0, 100.0, 200.0, 210.0, 220.0, 230.0],
-                "SPY": [300.0, 320.0, 600.0, 660.0, 700.0, 740.0],
+                "AAPL": [90.0, 100.0, 200.0, 210.0, 220.0, 230.0, 240.0],
+                "SPY": [300.0, 320.0, 600.0, 660.0, 700.0, 740.0, 760.0],
             },
             index=dates,
         )
@@ -28,17 +30,20 @@ class TestBacktestTiming(unittest.TestCase):
             exit_slippage_bps=0,
         ).iloc[0]
 
-        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-04").date())
-        self.assertEqual(row["bt_entry_price"], 210.0)
-        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-05").date())
-        self.assertEqual(row["bt_exit_price"], 220.0)
-        self.assertEqual(row["bt_spy_return_pct"], round((700 / 660 - 1) * 100, 2))
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-06").date())
+        self.assertEqual(row["bt_entry_price"], 230.0)
+        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-07").date())
+        self.assertEqual(row["bt_exit_price"], 240.0)
+        self.assertEqual(row["bt_spy_return_pct"], round((760 / 740 - 1) * 100, 2))
 
     def test_horizon_starts_at_actual_entry_session(self):
         as_of = pd.Timestamp("2025-01-03")
-        dates = pd.date_range("2025-01-03", "2025-01-06", freq="D")
+        dates = pd.date_range("2025-01-03", "2025-01-07", freq="D")
         prices = pd.DataFrame(
-            {"AAPL": [200.0, 210.0, 220.0, 230.0], "SPY": [600.0, 660.0, 700.0, 740.0]},
+            {
+                "AAPL": [200.0, 210.0, 220.0, 230.0, 240.0],
+                "SPY": [600.0, 660.0, 700.0, 740.0, 760.0],
+            },
             index=dates,
         )
 
@@ -51,9 +56,9 @@ class TestBacktestTiming(unittest.TestCase):
             exit_slippage_bps=0,
         ).iloc[0]
 
-        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-04").date())
-        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-05").date())
-        self.assertEqual(row["bt_raw_return_pct"], round((220 / 210 - 1) * 100, 2))
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-06").date())
+        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-07").date())
+        self.assertEqual(row["bt_raw_return_pct"], round((240 / 230 - 1) * 100, 2))
 
     def test_dip_entry_keeps_future_fill_timing(self):
         dates = pd.date_range("2025-01-02", "2025-01-10", freq="B")
@@ -211,6 +216,149 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertTrue(np.isnan(row["bt_return_pct"]))
         self.assertEqual(row["bt_coverage"], "unavailable")
         self.assertTrue(row["bt_stale_exit"])
+
+    def test_training_maturity_uses_actual_label_window_end(self):
+        signals = pd.DataFrame(
+            {
+                "horizon_days": [30],
+                "disclosure_date": [pd.Timestamp("2024-01-01")],
+                "label_window_end": [pd.Timestamp("2024-02-05")],
+                "window_complete": [True],
+                "total_spy_alpha_pct": [1.0],
+            }
+        )
+
+        early = _filter_training(signals, 30, "2024-02-01", None)
+        mature = _filter_training(signals, 30, "2024-02-06", None)
+        ticker_early = _filter_ticker_perf(signals, 30, "2024-02-01")
+
+        self.assertTrue(early.empty)
+        self.assertTrue(ticker_early.empty)
+        self.assertEqual(len(mature), 1)
+
+    def test_sale_peak_uses_executable_next_session_basis(self):
+        dates = pd.bdate_range("2024-01-08", "2024-01-12")
+        prices = pd.DataFrame(
+            {
+                "SALE": [190.0, 200.0, 150.0, 180.0, 180.0],
+                "SPY": [400.0] * len(dates),
+            },
+            index=dates,
+        )
+        entries = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["SALE"],
+                "disclosure_date": [pd.Timestamp("2024-01-08")],
+                "transaction_type": ["Sale"],
+                "entry_price": [100.0],
+            }
+        )
+
+        row = calculate_signal_potential(entries, prices, [2]).iloc[0]
+
+        self.assertEqual(row["label_entry_date"], pd.Timestamp("2024-01-09"))
+        self.assertAlmostEqual(row["peak_potential_pct"], (200 / 150 - 1) * 100)
+
+    def test_fresh_matrix_constructs_entry_without_database_cache(self):
+        transactions = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["AAPL"],
+                "transaction_date": [pd.Timestamp("2024-01-02")],
+                "disclosure_date": [pd.Timestamp("2024-01-02")],
+                "transaction_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"AAPL": [999.0], "SPY": [400.0]},
+            index=pd.DatetimeIndex(["2024-01-03"]),
+        )
+
+        entries = _entry_prices_from_matrix(transactions, prices)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries.iloc[0]["entry_price"], 999.0)
+        self.assertEqual(entries.iloc[0]["entry_price_date"], pd.Timestamp("2024-01-03"))
+
+    def test_six_day_early_quote_is_unavailable(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-14")
+        aapl = pd.Series(np.nan, index=dates)
+        aapl.loc["2025-01-03"] = 100.0
+        aapl.loc["2025-01-07"] = 110.0
+        prices = pd.DataFrame({"AAPL": aapl, "SPY": 400.0}, index=dates)
+
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-02"),
+            horizon=10,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertTrue(np.isnan(row["bt_return_pct"]))
+
+    def test_zero_entry_quote_is_skipped_to_next_valid_session(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-07")
+        prices = pd.DataFrame(
+            {"AAPL": [90.0, 0.0, 100.0, 110.0], "SPY": [390.0, 400.0, 410.0, 420.0]},
+            index=dates,
+        )
+
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-02"),
+            horizon=1,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-06").date())
+        self.assertEqual(row["bt_entry_price"], 100.0)
+        self.assertEqual(row["bt_exit_price"], 110.0)
+
+    def test_observed_zero_exit_is_total_loss(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-06")
+        prices = pd.DataFrame(
+            {"AAPL": [90.0, 100.0, 0.0], "SPY": [390.0, 400.0, 410.0]},
+            index=dates,
+        )
+
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-02"),
+            horizon=3,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_coverage"], "complete")
+        self.assertEqual(row["bt_exit_price"], 0.0)
+        self.assertEqual(row["bt_raw_return_pct"], -100.0)
+
+    def test_timezone_aware_daily_index_preserves_calendar_dates(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-07", tz="America/New_York")
+        prices = pd.DataFrame(
+            {"AAPL": [90.0, 100.0, 110.0, 120.0], "SPY": [390.0, 400.0, 410.0, 420.0]},
+            index=dates,
+        )
+
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-02", tz="America/New_York"),
+            horizon=1,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-03").date())
+        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-03").date())
+
 
 if __name__ == "__main__":
     unittest.main()

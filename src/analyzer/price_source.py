@@ -132,6 +132,7 @@ class YFinancePriceSource(PriceSource):
             )
 
         new_prices = self._extract_close_prices(data, fetch_resolved)
+        new_prices = self._normalize_price_index(new_prices)
         new_prices = new_prices.apply(pd.to_numeric, errors="coerce")
         invalid_mask = new_prices.notna() & (
             ~np.isfinite(new_prices) | new_prices.le(0)
@@ -208,6 +209,21 @@ class YFinancePriceSource(PriceSource):
         if len(fetch_resolved) == 1 and len(close.columns) == 1:
             return close.rename(columns={close.columns[0]: fetch_resolved[0]})
         return close.copy()
+
+    @staticmethod
+    def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:
+        try:
+            index = pd.DatetimeIndex(pd.to_datetime(prices.index))
+        except (TypeError, ValueError) as exc:
+            raise DataSourceError("yfinance returned an invalid date index") from exc
+        if index.tz is not None:
+            index = index.tz_localize(None)
+        index = index.normalize()
+        if index.has_duplicates:
+            raise DataSourceError("yfinance returned duplicate calendar dates")
+        normalized = prices.copy()
+        normalized.index = index
+        return normalized.sort_index()
 
     def _rename_yf_columns(
         self, new_prices: pd.DataFrame, raw_to_yf: dict

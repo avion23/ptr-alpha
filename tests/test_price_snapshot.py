@@ -364,6 +364,24 @@ class TestPriceSnapshot(unittest.TestCase):
         self.assertNotEqual(first.value_hash, second.value_hash)
         self.assertTrue(compare_snapshots(first, second)["value_hash_changed"])
 
+    def test_snapshot_normalizes_timezone_aware_daily_index(self):
+        prices = pd.DataFrame(
+            {"AAPL": [100.0, 101.0]},
+            index=pd.bdate_range("2025-01-02", periods=2, tz="America/New_York"),
+        )
+
+        snapshot = create_snapshot(
+            self.db,
+            ["AAPL"],
+            date(2025, 1, 2),
+            date(2025, 1, 3),
+            prices=prices,
+        )
+
+        self.assertEqual(snapshot.first_date, "2025-01-02")
+        self.assertEqual(snapshot.last_date, "2025-01-03")
+        self.assertEqual(snapshot.price_rows, 2)
+
     def test_coverage_detects_gaps(self):
         dates = pd.bdate_range("2024-01-01", "2024-01-05")
         # Only prices on Jan 1 and Jan 5, missing Jan 2-4

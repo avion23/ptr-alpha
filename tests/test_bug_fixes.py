@@ -11,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+from analyzer.price_repository import nyse_sessions
 from analyzer.price_source import YFinancePriceSource
 from analyzer.settings import Settings
 
@@ -467,3 +468,12 @@ class TestPriceAcquisitionCorrectness(DatabaseTestCase):
 
         self.assertEqual(missing_tickers, [])
         self.assertEqual(missing_dates, [])
+
+
+    def test_new_year_2022_does_not_close_2021_12_31(self):
+        sessions = nyse_sessions(date(2021, 12, 31), date(2022, 1, 3))
+
+        self.assertEqual(
+            [session.date() for session in sessions],
+            [date(2021, 12, 31), date(2022, 1, 3)],
+        )

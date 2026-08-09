@@ -29,11 +29,11 @@ import numpy as np
 import pandas as pd
 
 from analyzer.backtest.prices import _find_dip_entry_arrays
+from analyzer.price_repository import next_nyse_session, nyse_sessions, previous_nyse_session
 from analyzer.signals import _price_arrays
 
 NS_PER_DAY = 86_400_000_000_000
 _ENTRY_STALENESS_DAYS = 7
-_EXIT_STALENESS_DAYS = 7
 
 # Sentinel returned by _evaluate_one_recommendation when a ticker is
 # discovered to have been delisted BEFORE the entry/as_of date — meaning the
@@ -73,6 +73,8 @@ def evaluate_backtest(
     if recommendations.empty:
         return recommendations
 
+    prices_df = _normalize_price_frame(prices_df)
+    as_of_date = _normalize_date(as_of_date)
     entry_mult, exit_mult = _slippage_multipliers(entry_slippage_bps, exit_slippage_bps)
 
     horizons = (
@@ -221,18 +223,18 @@ def _evaluate_one_recommendation(
         return None if use_dip_entry else _UNTRADEABLE
 
     exit_target_ns = entry_date_ns + int(t_horizon) * NS_PER_DAY
-    exit_pos = int(np.searchsorted(idx_ns, exit_target_ns, side="right")) - 1
+    exit_date_ns = previous_nyse_session(pd.Timestamp(exit_target_ns)).value
+    exit_pos = int(np.searchsorted(idx_ns, exit_date_ns, side="left"))
     exit_price = None
-    exit_date_ns = None
-    if exit_pos >= 0:
-        candidate_date_ns = int(idx_ns[exit_pos])
-        if (
-            candidate_date_ns >= entry_date_ns
-            and exit_target_ns - candidate_date_ns
-            <= _EXIT_STALENESS_DAYS * NS_PER_DAY
-        ):
-            exit_price = float(vals[exit_pos])
-            exit_date_ns = candidate_date_ns
+    if (
+        exit_date_ns >= entry_date_ns
+        and exit_pos < len(idx_ns)
+        and int(idx_ns[exit_pos]) == exit_date_ns
+    ):
+        candidate = float(vals[exit_pos])
+        # An observed zero is a realized total loss, not missing data.
+        if np.isfinite(candidate) and candidate >= 0:
+            exit_price = candidate
 
     inst_type = (
         str(inst_type_val)
@@ -277,6 +279,28 @@ def _evaluate_one_recommendation(
     row["bt_coverage"] = "complete"
     row["bt_stale_exit"] = False
     return row
+
+
+def _normalize_date(value) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tz is not None:
+        timestamp = timestamp.tz_localize(None)
+    return timestamp.normalize()
+
+
+def _normalize_price_frame(prices: pd.DataFrame) -> pd.DataFrame:
+    try:
+        index = pd.DatetimeIndex(pd.to_datetime(prices.index))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Price index must contain valid dates") from exc
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    index = index.normalize()
+    if index.has_duplicates:
+        raise ValueError("Price index contains duplicate calendar dates")
+    normalized = prices.copy()
+    normalized.index = index
+    return normalized.sort_index()
 
 
 def _price_at_exact_ns(idx_ns, vals, target_ns):
@@ -337,20 +361,25 @@ def _resolve_entry(
         entry_date_ns = as_of_ns + entry_delay * NS_PER_DAY
         return entry, entry_delay, entry_date_ns
 
-    pos = int(np.searchsorted(idx_ns, as_of_ns, side="right"))
-    if pos >= len(idx_ns):
-        return None, 0, None
-    entry_date_ns = int(idx_ns[pos])
     max_delay = _ENTRY_STALENESS_DAYS
     if max_staleness_days is not None:
         max_delay = min(max_delay, max_staleness_days)
-    delay = int((entry_date_ns - as_of_ns) // NS_PER_DAY)
-    if delay > max_delay:
-        return None, 0, None
-    value = float(vals[pos])
-    if not np.isfinite(value) or value <= 0:
-        return None, 0, None
-    return value, delay, entry_date_ns
+    first_session = next_nyse_session(pd.Timestamp(as_of_ns))
+    last_date = pd.Timestamp(as_of_ns + max_delay * NS_PER_DAY)
+    valid_sessions = {
+        session.value for session in nyse_sessions(first_session, last_date)
+    }
+    pos = int(np.searchsorted(idx_ns, first_session.value, side="left"))
+    while pos < len(idx_ns):
+        entry_date_ns = int(idx_ns[pos])
+        delay = int((entry_date_ns - as_of_ns) // NS_PER_DAY)
+        if delay > max_delay:
+            return None, 0, None
+        value = float(vals[pos])
+        if entry_date_ns in valid_sessions and np.isfinite(value) and value > 0:
+            return value, delay, entry_date_ns
+        pos += 1
+    return None, 0, None
 
 
 def _bt_row(

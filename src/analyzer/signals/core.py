@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.exceptions import AnalysisError
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.ticker_resolver import TickerResolver
 
 from analyzer.signals import constants as _constants
@@ -45,12 +46,14 @@ def _compute_ticker_signals(
     r_spy_first: np.ndarray,
     r_spy_last: np.ndarray,
     r_window_complete: np.ndarray,
+    r_entry_date: np.ndarray,
+    r_exit_date: np.ndarray,
+    r_label_window_end: np.ndarray,
 ) -> None:
     """Populate labels only for mature, endpoint-aligned price windows."""
     if len(t_indices) == 0:
         return
 
-    tolerance_ns = 7 * _constants._NS_PER_DAY
     today_ns = pd.Timestamp.now().normalize().value
     has_benchmark = (
         spy_dates_ns is not None
@@ -62,30 +65,29 @@ def _compute_ticker_signals(
     for i, result_idx in enumerate(t_indices):
         disc_ns = int(t_disc_ns[i])
         horizon_ns = int(t_end_ns[i]) - disc_ns
+        idx = int(result_idx)
 
-        # A dated disclosure is actionable only after that date's session. Use
-        # the first subsequent quote and reject long gaps rather than silently
-        # shortening a horizon from an IPO or missing-data start.
-        entry_pos = int(np.searchsorted(dates_ns, disc_ns, side="right"))
-        if entry_pos >= len(dates_ns):
+        # The execution convention is explicit: enter on the next expected
+        # NYSE session after the dated decision, then hold for the full calendar
+        # horizon and exit on the expected NYSE session on or before that end.
+        entry_date_ns = next_nyse_session(pd.Timestamp(disc_ns)).value
+        entry_pos = int(np.searchsorted(dates_ns, entry_date_ns, side="left"))
+        if entry_pos >= len(dates_ns) or int(dates_ns[entry_pos]) != entry_date_ns:
             continue
-        entry_date_ns = int(dates_ns[entry_pos])
-        if entry_date_ns - disc_ns > tolerance_ns:
-            continue
+        r_entry_date[idx] = np.datetime64(entry_date_ns, "ns")
 
         intended_end_ns = entry_date_ns + horizon_ns
+        r_label_window_end[idx] = np.datetime64(intended_end_ns, "ns")
         if intended_end_ns > today_ns:
             continue
-        exit_pos = int(np.searchsorted(dates_ns, intended_end_ns, side="right")) - 1
-        if exit_pos < entry_pos:
+        exit_date_ns = previous_nyse_session(pd.Timestamp(intended_end_ns)).value
+        exit_pos = int(np.searchsorted(dates_ns, exit_date_ns, side="left"))
+        if exit_pos >= len(dates_ns) or int(dates_ns[exit_pos]) != exit_date_ns:
             continue
-        exit_date_ns = int(dates_ns[exit_pos])
-        if intended_end_ns - exit_date_ns > tolerance_ns:
-            continue
+        r_exit_date[idx] = np.datetime64(exit_date_ns, "ns")
 
         # Benchmark prices must exist on the security's actual entry and exit
-        # sessions. Independent nearest-date lookups create phantom alpha when
-        # either series has a gap.
+        # sessions. Independent nearest-date lookups create phantom alpha.
         if has_benchmark:
             spy_entry_pos = int(np.searchsorted(spy_dates_ns, entry_date_ns, side="left"))
             spy_exit_pos = int(np.searchsorted(spy_dates_ns, exit_date_ns, side="left"))
@@ -97,7 +99,6 @@ def _compute_ticker_signals(
             ):
                 continue
 
-        idx = int(result_idx)
         r_window_complete[idx] = True
         w_vals = vals[entry_pos : exit_pos + 1]
         w_dates = dates_ns[entry_pos : exit_pos + 1]
@@ -207,6 +208,7 @@ def calculate_signal_potential(
     if decay_lambda is None:
         decay_lambda = _constants.DECAY_LAMBDA
     _validate_inputs(entry_prices_df, prices_df)
+    prices_df = _normalize_price_frame(prices_df)
 
     signals = entry_prices_df.copy()
     signals = _resolve_tickers(signals, prices_df)
@@ -233,6 +235,22 @@ def calculate_signal_potential(
 
 
 # ── Pipeline helpers (private) ──────────────────────────────────────────
+
+
+def _normalize_price_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize daily price indexes without shifting their calendar dates."""
+    try:
+        index = pd.DatetimeIndex(pd.to_datetime(prices_df.index))
+    except (TypeError, ValueError) as exc:
+        raise AnalysisError("Price index must contain valid dates") from exc
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    index = index.normalize()
+    if index.has_duplicates:
+        raise AnalysisError("Price index contains duplicate calendar dates")
+    normalized = prices_df.copy()
+    normalized.index = index
+    return normalized.sort_index()
 
 
 def _validate_inputs(entry_prices_df: pd.DataFrame, prices_df: pd.DataFrame) -> None:
@@ -269,6 +287,10 @@ def _resolve_tickers(signals: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataF
 
 
 def _explode_by_horizon(signals: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
+    disclosure_dates = pd.DatetimeIndex(pd.to_datetime(signals["disclosure_date"]))
+    if disclosure_dates.tz is not None:
+        disclosure_dates = disclosure_dates.tz_localize(None)
+    signals["disclosure_date"] = disclosure_dates.normalize()
     signals = (
         signals.assign(horizon_days=[horizons] * len(signals))
         .explode("horizon_days")
@@ -331,6 +353,11 @@ def _allocate_result_arrays(n: int) -> dict:
         "r_spy_first": np.full(n, np.nan, dtype=np.float64),
         "r_spy_last": np.full(n, np.nan, dtype=np.float64),
         "r_window_complete": np.zeros(n, dtype=bool),
+        "r_entry_date": np.full(n, np.datetime64("NaT"), dtype="datetime64[ns]"),
+        "r_exit_date": np.full(n, np.datetime64("NaT"), dtype="datetime64[ns]"),
+        "r_label_window_end": np.full(
+            n, np.datetime64("NaT"), dtype="datetime64[ns]"
+        ),
     }
 
 
@@ -379,6 +406,9 @@ def _compute_all_ticker_signals(
             result_arrays["r_spy_first"],
             result_arrays["r_spy_last"],
             result_arrays["r_window_complete"],
+            result_arrays["r_entry_date"],
+            result_arrays["r_exit_date"],
+            result_arrays["r_label_window_end"],
         )
 
 

@@ -7,12 +7,15 @@ import logging
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
 from analyzer.member_names import canonical_member_key
 from analyzer.models import AnalysisMode, TransactionType
+from analyzer.price_repository import next_nyse_session
 from analyzer.price_snapshot import create_snapshot, save_snapshot
+from analyzer.ticker_resolver import TickerResolver
 from analyzer import analysis
 
 logger = logging.getLogger(__name__)
@@ -361,6 +364,69 @@ def run_recent_ticker_scoring(
     )
 
 
+def _entry_prices_from_matrix(
+    transactions: pd.DataFrame, prices: pd.DataFrame
+) -> pd.DataFrame:
+    """Build entry rows from the exact matrix used to calculate labels."""
+    if transactions.empty or prices.empty:
+        return pd.DataFrame()
+
+    index = pd.DatetimeIndex(pd.to_datetime(prices.index))
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    index = index.normalize()
+    if index.has_duplicates:
+        raise DataSourceError("Price matrix contains duplicate calendar dates")
+    matrix = prices.copy()
+    matrix.index = index
+    matrix = matrix.sort_index()
+
+    eligible = transactions[
+        transactions["ticker"].notna()
+        & transactions["disclosure_date"].notna()
+        & (
+            transactions["transaction_date"].isna()
+            | (
+                pd.to_datetime(transactions["transaction_date"])
+                <= pd.to_datetime(transactions["disclosure_date"])
+            )
+        )
+    ].copy()
+    if eligible.empty:
+        return pd.DataFrame()
+
+    resolver = TickerResolver()
+    price_columns = set(matrix.columns)
+    rows = []
+    for _, transaction in eligible.iterrows():
+        raw_ticker = str(transaction["ticker"])
+        price_ticker = raw_ticker
+        if price_ticker not in price_columns:
+            resolved = resolver.resolve(raw_ticker).price_symbol
+            if resolved not in price_columns:
+                continue
+            price_ticker = resolved
+
+        disclosure = pd.Timestamp(transaction["disclosure_date"])
+        if disclosure.tz is not None:
+            disclosure = disclosure.tz_localize(None)
+        entry_date = next_nyse_session(disclosure)
+        if entry_date not in matrix.index:
+            continue
+        entry_price = matrix.at[entry_date, price_ticker]
+        if pd.isna(entry_price) or not np.isfinite(entry_price) or entry_price <= 0:
+            continue
+
+        row = transaction.to_dict()
+        row["entry_price"] = float(entry_price)
+        row["entry_price_date"] = entry_date
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 @pipeline_step
 def run_backtest_pipeline(
     params: BacktestParams,
@@ -404,9 +470,7 @@ def run_backtest_pipeline(
         prices=prices,
     )
 
-    entry_prices = transaction_source.db.get_entry_prices(
-        all_tickers, price_start, price_end
-    )
+    entry_prices = _entry_prices_from_matrix(all_transactions, prices)
     if entry_prices.empty:
         raise DataSourceError("No entry prices could be computed")
 

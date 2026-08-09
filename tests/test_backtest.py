@@ -43,6 +43,13 @@ def _make_signals(rows):
             base[key].append(enriched.get(key))
     df = pd.DataFrame(base)
     df["disclosure_date"] = pd.to_datetime(df["disclosure_date"])
+    # Synthetic realized labels explicitly record their executable maturity.
+    df["label_window_end"] = [
+        pd.Timestamp(row["disclosure_date"])
+        + pd.Timedelta(days=int(row["horizon_days"]) + 1)
+        for row in rows
+    ]
+    df["window_complete"] = [row.get("window_complete", True) for row in rows]
     return df
 
 

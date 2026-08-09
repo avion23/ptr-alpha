@@ -93,6 +93,18 @@ def _compute_ticker_coverage(
     }
 
 
+def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:
+    index = pd.DatetimeIndex(pd.to_datetime(prices.index))
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    index = index.normalize()
+    if index.has_duplicates:
+        raise ValueError("Price index contains duplicate calendar dates")
+    normalized = prices.copy()
+    normalized.index = index
+    return normalized.sort_index()
+
+
 def _hash_price_values(prices: pd.DataFrame) -> str:
     """Hash sorted ticker/date/value triples for reproducibility."""
     digest = hashlib.sha256()
@@ -118,12 +130,12 @@ def create_snapshot(
 ) -> PriceSnapshot:
     if prices is None:
         prices = db.get_prices(tickers, start, end)
-    else:
-        wanted = [ticker for ticker in tickers if ticker in prices.columns]
-        prices = prices.loc[
-            (prices.index >= pd.Timestamp(start)) & (prices.index <= pd.Timestamp(end)),
-            wanted,
-        ].copy()
+    prices = _normalize_price_index(prices)
+    wanted = [ticker for ticker in tickers if ticker in prices.columns]
+    prices = prices.loc[
+        (prices.index >= pd.Timestamp(start)) & (prices.index <= pd.Timestamp(end)),
+        wanted,
+    ].copy()
     prices = prices.dropna(axis=0, how="all")
 
     if prices.empty:

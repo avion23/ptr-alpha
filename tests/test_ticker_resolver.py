@@ -27,7 +27,7 @@ class TestTickerResolver(unittest.TestCase):
     def test_alias_requires_trade_date(self):
         result = self.resolver.resolve("FB")
         self.assertEqual(result.price_symbol, "FB")
-        self.assertEqual(result.status, "date_required")
+        self.assertEqual(result.status, "unverified")
         self.assertFalse(self.resolver.is_strategy_eligible("FB"))
 
     def test_fb_uses_contemporaneous_symbol(self):
@@ -67,6 +67,17 @@ class TestTickerResolver(unittest.TestCase):
             {"ATVI"},
         )
         self.assertFalse(self.resolver.is_strategy_eligible("ATVI", date(2023, 10, 14)))
+
+    def test_unverified_syntax_is_never_strategy_eligible(self):
+        for ticker in ("AAPL", "NOTREAL", "VFINX"):
+            with self.subTest(ticker=ticker):
+                self.assertEqual(self.resolver.resolve(ticker).status, "unverified")
+                self.assertFalse(self.resolver.is_strategy_eligible(ticker))
+
+    def test_valid_symbols_are_not_hard_quarantined(self):
+        for ticker in ("TECH", "UNIT", "WEST"):
+            with self.subTest(ticker=ticker):
+                self.assertEqual(self.resolver.resolve(ticker).status, "unverified")
 
     def test_real_pdf_pseudo_canaries_are_quarantined(self):
         # 20034095/20034670: ALLI was stale parse text for ARLP.

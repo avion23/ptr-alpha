@@ -233,9 +233,13 @@ class TestCapitolTradesSource(unittest.TestCase):
         transactions = self.source.db.get_transactions(2025)
         self.assertEqual(len(transactions), 2)
 
-        # Re-fetching the same API page is idempotent and reports no new rows.
+        # Without source row identity, a replay cannot be distinguished from
+        # repeated lots and must remain visible rather than semantic-deduped.
         count = self.source.fetch_and_save_politician("Nancy Pelosi")
-        self.assertEqual(count, 0)
+        self.assertEqual(count, 2)
+        transactions = self.source.db.get_transactions(2025)
+        self.assertEqual(len(transactions), 4)
+        self.assertTrue(transactions["economic_duplicate_candidate"].all())
 
     def test_save_reports_deduplicated_insert_count(self):
         row = {
@@ -253,7 +257,9 @@ class TestCapitolTradesSource(unittest.TestCase):
             "expiry_date": None,
         }
 
-        self.assertEqual(self.source.save_to_db(pd.DataFrame([row, row])), 1)
+        self.assertEqual(self.source.save_to_db(pd.DataFrame([row, row])), 2)
+        saved = self.source.db.get_transactions(2025)
+        self.assertTrue(saved["economic_duplicate_candidate"].all())
 
     @patch("analyzer.capitol_trades.requests.Session.get")
     def test_fetch_trades_empty_response(self, mock_get):

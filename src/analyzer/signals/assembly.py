@@ -26,6 +26,7 @@ _OPTIONAL_COLS = (
     "source_row_id",
     "available_date",
     "notification_date",
+    "economic_duplicate_candidate",
 )
 
 _FINAL_COLUMNS = [

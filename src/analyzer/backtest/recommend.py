@@ -42,7 +42,7 @@ def backtest_recommendations(
     prices_df: pd.DataFrame | None = None,
     training_lookback_days: int | None = None,
     solo_buyer_skill_threshold: float = 1.0,
-    scoring_mode: str = "shrunk_alpha",
+    scoring_mode: str = "consensus",
     bayes_prior_strength: float | None = None,
 ) -> pd.DataFrame:
     if bayes_prior_strength is None:
@@ -58,12 +58,21 @@ def backtest_recommendations(
         else None
     )
 
+    is_consensus = scoring_mode == "consensus"
     signals_df = _filter_equity_rows(signals_df)
-    if signals_df.empty:
+    if not is_consensus and signals_df.empty:
         return pd.DataFrame()
-    training = _filter_training(signals_df, horizon, as_of_iso, training_lookback_iso)
-    member_rankings = _build_member_rankings(training, horizon, threshold, bayes)
-    if member_rankings is None or member_rankings.empty:
+    training = (
+        pd.DataFrame()
+        if is_consensus
+        else _filter_training(signals_df, horizon, as_of_iso, training_lookback_iso)
+    )
+    member_rankings = (
+        pd.DataFrame()
+        if is_consensus
+        else _build_member_rankings(training, horizon, threshold, bayes)
+    )
+    if not is_consensus and (member_rankings is None or member_rankings.empty):
         return pd.DataFrame()
 
     recent_trades = _filter_recent_trades(transactions_df, lookback_days, as_of_iso)
@@ -103,8 +112,9 @@ def _build_member_rankings(training, horizon, threshold, bayes):
 
 
 _UNSUPPORTED_ASSET_RE = re.compile(
-    r"\b(?:mutual fund|money market|treasury|government securit|corporate bond|"
-    r"municipal bond|real estate|cryptocurrency|private equity|limited partnership)\b",
+    r"\b(?:mutual fund|index fund|exchange-traded fund|money market|treasury|"
+    r"government securit|corporate bond|municipal bond|real estate|cryptocurrency|"
+    r"private equity|limited partnership)\b",
     re.IGNORECASE,
 )
 _UNSUPPORTED_ASSET_CLASSES = {
@@ -117,45 +127,76 @@ _UNSUPPORTED_ASSET_CLASSES = {
     "call",
     "put",
 }
+_SUPPORTED_ASSET_CLASSES = {"st", "stock", "common stock", "public equity", "equity"}
+_AUTHORITATIVE_TICKER_ORIGINS = {"official", "official_filing", "house", "senate"}
+_SUPPORTED_ASSET_RE = re.compile(
+    r"\[ST\]|\b(?:common stock|ordinary shares|public equity)\b", re.IGNORECASE
+)
 
 
 def _filter_equity_rows(rows: pd.DataFrame) -> pd.DataFrame:
-    """Keep rows positively identified as public stock; abstain otherwise."""
+    """Keep only rows with positive, authoritative public-stock evidence."""
     if rows.empty:
         return rows
-    mask = pd.Series(True, index=rows.index)
-    if "instrument_type" in rows.columns:
-        instruments = (
-            rows["instrument_type"].fillna("").astype(str).str.strip().str.lower()
-        )
-        mask &= instruments.eq("stock")
+    if "instrument_type" not in rows.columns:
+        return rows.iloc[0:0].copy()
+
+    instruments = rows["instrument_type"].fillna("").astype(str).str.strip().str.lower()
+    mask = instruments.eq("stock")
+    positive_evidence = pd.Series(False, index=rows.index)
+
     if "raw_asset_class" in rows.columns:
         classes = rows["raw_asset_class"].fillna("").astype(str).str.strip().str.lower()
         mask &= ~classes.isin(_UNSUPPORTED_ASSET_CLASSES)
+        positive_evidence |= classes.isin(_SUPPORTED_ASSET_CLASSES)
+
     descriptions = pd.Series("", index=rows.index, dtype="object")
     for column in ("asset_description", "raw_asset_description"):
         if column in rows.columns:
             descriptions = descriptions.str.cat(
                 rows[column].fillna("").astype(str), sep=" "
             )
+    positive_evidence |= descriptions.str.contains(_SUPPORTED_ASSET_RE, na=False)
     mask &= ~descriptions.str.contains(_UNSUPPORTED_ASSET_RE, na=False)
     mask &= ~descriptions.str.contains(
         r"\[(?:OP|OT|GS|GB|MF|OL|CT|HN|OI|RS)\]", case=False, regex=True
     )
-    return rows.loc[mask].copy()
+
+    if "ticker_origin" in rows.columns:
+        origins = rows["ticker_origin"].fillna("").astype(str).str.strip().str.lower()
+        positive_evidence |= origins.isin(_AUTHORITATIVE_TICKER_ORIGINS)
+    if "economic_duplicate_candidate" in rows.columns:
+        mask &= ~rows["economic_duplicate_candidate"].fillna(False).astype(bool)
+    return rows.loc[mask & positive_evidence].copy()
 
 
 def _candidate_tickers(recent_trades: pd.DataFrame, min_buyers: int) -> list:
     resolver = TickerResolver()
+    recent_trades = _filter_equity_rows(recent_trades)
     eligible: list[str] = []
     for ticker, trades in recent_trades.groupby("ticker"):
         dates = (
-            pd.to_datetime(trades["disclosure_date"], errors="coerce").dropna()
-            if "disclosure_date" in trades.columns
+            pd.to_datetime(trades["transaction_date"], errors="coerce").dropna()
+            if "transaction_date" in trades.columns
             else pd.Series(dtype="datetime64[ns]")
         )
         trade_date = dates.max().date() if not dates.empty else None
+        resolution = resolver.resolve(ticker, trade_date)
+        # The price pipeline must map aliases with each transaction date before
+        # renamed symbols can enter recommendations; raw aliases are unsafe here.
+        if ticker in resolver.RENAME_MAP:
+            continue
         if resolver.is_strategy_eligible(ticker, trade_date):
+            eligible.append(ticker)
+            continue
+        if resolution.status != "unverified":
+            continue
+        origins = (
+            trades["ticker_origin"].fillna("").astype(str).str.strip().str.lower()
+            if "ticker_origin" in trades.columns
+            else pd.Series(dtype="object")
+        )
+        if not origins.empty and origins.isin(_AUTHORITATIVE_TICKER_ORIGINS).all():
             eligible.append(ticker)
     buyer_counts = (
         recent_trades[recent_trades["ticker"].isin(eligible)]
@@ -192,8 +233,10 @@ def _score_and_rank(
 
     metadata_maps = _build_metadata_maps(recent_trades, has_prices)
 
-    ticker_perf_signals = _filter_ticker_perf(
-        signals_df, horizon, as_of_date.isoformat()
+    ticker_perf_signals = (
+        pd.DataFrame()
+        if scoring_mode == "consensus" or signals_df.empty
+        else _filter_ticker_perf(signals_df, horizon, as_of_date.isoformat())
     )
     recent_by_ticker = {t: grp for t, grp in recent_trades.groupby("ticker")}
 
@@ -209,8 +252,8 @@ def _score_and_rank(
             threshold=threshold,
             min_buyers=min_buyers,
             bayes=bayes,
-            scoring_mode=scoring_mode,
             solo_buyer_skill_threshold=solo_buyer_skill_threshold,
+            scoring_mode=scoring_mode,
             _ranking_dicts=_ranking_dicts,
             signals_df=signals_df,
             prices_df=prices_df,
@@ -292,8 +335,8 @@ def _score_one_ticker(
     threshold,
     min_buyers,
     bayes,
-    scoring_mode,
     solo_buyer_skill_threshold,
+    scoring_mode,
     _ranking_dicts,
     signals_df,
     prices_df,
@@ -303,6 +346,14 @@ def _score_one_ticker(
     as_of_for_features,
     ticker_recent,
 ) -> dict | None:
+    score_kwargs = {
+        "ticker_perf_signals": ticker_perf_signals,
+        "_bayes_prior_strength": bayes,
+        "solo_buyer_skill_threshold": solo_buyer_skill_threshold,
+        "scoring_mode": scoring_mode,
+        "as_of_date": as_of_date,
+        "_ranking_dicts": _ranking_dicts,
+    }
     score_df = score_ticker_by_buyers(
         ticker,
         recent_trades,

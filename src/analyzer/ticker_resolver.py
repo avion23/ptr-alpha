@@ -62,10 +62,8 @@ class TickerResolver:
         {
             "THE",
             "NEW",
-            "UNIT",
             "MARY",
             "NORT",
-            "TECH",
             "CITI",
             "SOUT",
             "AMER",
@@ -75,7 +73,6 @@ class TickerResolver:
             "BERK",
             "WISC",
             "EAST",
-            "WEST",
             "FUND",
             "KING",
             "LAKE",
@@ -138,11 +135,12 @@ class TickerResolver:
                 return TickerResolution(
                     raw_ticker=raw_ticker,
                     price_symbol=normalized,
-                    status="date_required",
+                    status="unverified",
                     confidence=0.0,
                     notes=(
-                        f"Ticker alias {normalized} -> {new_symbol} requires a trade date; "
-                        "no temporal guess was made"
+                        f"Ticker alias {normalized} -> {new_symbol} is temporally "
+                        "unverified without transaction_date; pass the transaction date "
+                        "before resolving a price symbol"
                     ),
                 )
             if trade_date >= effective_date:
@@ -212,16 +210,18 @@ class TickerResolver:
     def is_strategy_eligible(
         self, raw_ticker: str, trade_date: date | None = None
     ) -> bool:
-        """Reject symbols known to be ambiguous; unknown symbols remain unverified.
+        """Return true only for a positively verified, contemporaneous mapping.
 
-        Market-data availability is a separate requirement at the strategy boundary.
+        Ticker syntax is not evidence of a listed equity. Callers handling aliases
+        must pass the transaction date; source asset evidence is checked separately.
         """
         resolution = self.resolve(raw_ticker, trade_date)
-        return resolution.status not in {
-            "unresolved",
-            "quarantined",
-            "date_required",
-            "acquired",
+        return resolution.confidence > 0 and resolution.status in {
+            "class_share",
+            "renamed",
+            "pre_rename",
+            "pre_acquisition",
+            "pseudo_ticker",
         }
 
     def resolve_batch(

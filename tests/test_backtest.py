@@ -1,17 +1,24 @@
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from analyzer.analysis import (
-    backtest_recommendations,
+    backtest_recommendations as _backtest_recommendations,
     evaluate_backtest,
     summarize_backtest,
 )
 from analyzer.backtest.recommend import _candidate_tickers, _filter_equity_rows
 
 from .conftest import DatabaseTestCase
+
+
+def backtest_recommendations(*args, **kwargs):
+    """Run legacy ranking tests with an explicit non-default scoring mode."""
+    kwargs.setdefault("scoring_mode", "shrunk_alpha")
+    return _backtest_recommendations(*args, **kwargs)
 
 
 def _make_signals(rows):
@@ -27,10 +34,13 @@ def _make_signals(rows):
         "spy_alpha_pct": [],
         "total_return_pct": [],
         "total_spy_alpha_pct": [],
+        "instrument_type": [],
+        "ticker_origin": [],
     }
     for row in rows:
+        enriched = {"instrument_type": "stock", "ticker_origin": "official"} | row
         for key in base:
-            base[key].append(row.get(key))
+            base[key].append(enriched.get(key))
     df = pd.DataFrame(base)
     df["disclosure_date"] = pd.to_datetime(df["disclosure_date"])
     return df
@@ -38,6 +48,10 @@ def _make_signals(rows):
 
 def _make_transactions(rows):
     df = pd.DataFrame(rows)
+    if "instrument_type" not in df.columns:
+        df["instrument_type"] = "stock"
+    if "ticker_origin" not in df.columns:
+        df["ticker_origin"] = "official"
     df["transaction_date"] = pd.to_datetime(df["transaction_date"])
     df["disclosure_date"] = pd.to_datetime(df["disclosure_date"])
     return df
@@ -111,6 +125,31 @@ class TestBacktestRecommendations(unittest.TestCase):
                 },
             ]
         )
+
+    @patch("analyzer.backtest.recommend.score_ticker_by_buyers")
+    def test_default_consensus_cold_start_passes_absolute_as_of(self, score):
+        score.return_value = pd.DataFrame(
+            {
+                "ticker": ["AAPL"],
+                "num_buyers": [2],
+                "rated_buyers": [0],
+                "signal_score": [1.5],
+                "signal_score_raw": [1.5],
+                "scoring_mode": ["consensus"],
+            }
+        )
+        recommendations = _backtest_recommendations(
+            pd.DataFrame(),
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+        )
+        self.assertEqual(recommendations.iloc[0]["scoring_mode"], "consensus")
+        kwargs = score.call_args.kwargs
+        self.assertEqual(kwargs["scoring_mode"], "consensus")
+        self.assertEqual(kwargs["as_of_date"], self.as_of)
 
     def test_produces_recommendations_for_multi_buyer_ticker(self):
         recs = backtest_recommendations(
@@ -1438,10 +1477,40 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "member": ["A", "B"],
                 "ticker": ["ALLI", "AAPL"],
                 "instrument_type": ["stock", "stock"],
+                "ticker_origin": ["official", "official"],
                 "disclosure_date": pd.to_datetime(["2026-03-02", "2026-03-02"]),
             }
         )
         self.assertEqual(_candidate_tickers(stale, 1), ["AAPL"])
+
+    def test_unverified_fund_and_missing_metadata_are_ineligible(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["A", "B", "C"],
+                "ticker": ["VFINX", "NOTREAL", "TECH"],
+                "instrument_type": ["stock", "stock", "stock"],
+                "ticker_origin": ["official", None, "official"],
+                "asset_description": [
+                    "Vanguard 500 Index Fund",
+                    None,
+                    "Bio-Techne Corporation Common Stock [ST]",
+                ],
+            }
+        )
+        self.assertEqual(_filter_equity_rows(rows)["ticker"].tolist(), ["TECH"])
+
+    def test_aliases_wait_for_date_aware_price_mapping(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["A"],
+                "ticker": ["FB"],
+                "instrument_type": ["stock"],
+                "ticker_origin": ["official"],
+                "asset_description": ["Meta Platforms Common Stock [ST]"],
+                "transaction_date": pd.to_datetime(["2023-01-01"]),
+            }
+        )
+        self.assertEqual(_candidate_tickers(rows, 1), [])
 
     def test_unknown_instrument_abstains_when_column_is_present(self):
         rows = pd.DataFrame(
@@ -1449,6 +1518,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "member": ["A", "B"],
                 "ticker": ["AAPL", "MSFT"],
                 "instrument_type": [None, "stock"],
+                "ticker_origin": ["official", None],
             }
         )
-        self.assertEqual(_filter_equity_rows(rows)["ticker"].tolist(), ["MSFT"])
+        self.assertTrue(_filter_equity_rows(rows).empty)

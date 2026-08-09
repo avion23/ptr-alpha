@@ -11,6 +11,9 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+class AmbiguousTransactionIdentityError(ValueError):
+    """Raised when a legacy economic unique key blocks identity-safe storage."""
+
 _PROVENANCE_COLUMNS = (
     "chamber",
     "member_key",
@@ -123,16 +126,18 @@ def _normalize_frame(df: pd.DataFrame, *, deduplicate: bool) -> pd.DataFrame:
         df["instrument_type"] = df["instrument_type"].map(_normalize_instrument)
     if "amount_raw" in df.columns and "amount_midpoint" in df.columns:
         df["amount_midpoint"] = df.apply(_normalize_amount, axis=1)
-    if not deduplicate:
-        return df
+    if deduplicate and {"source_record_id", "source_row_id"}.issubset(df.columns):
+        record_ids = df["source_record_id"].fillna("").astype(str).str.strip()
+        row_ids = df["source_row_id"].fillna("").astype(str).str.strip()
+        identified = record_ids.ne("") & row_ids.ne("")
+        replay = identified & df.duplicated(
+            ["source_record_id", "source_row_id"], keep="last"
+        )
+        df = df.loc[~replay].copy()
 
-    df["_type_preference"] = (~original_type.isin(_TYPE_MAP)).astype(int)
-    dedup_key = [
-        col
-        for col in (
-            "doc_id",
-            "source_record_id",
-            "source_row_id",
+    economic_key = [
+        column
+        for column in (
             "member",
             "ticker",
             "transaction_date",
@@ -142,13 +147,12 @@ def _normalize_frame(df: pd.DataFrame, *, deduplicate: bool) -> pd.DataFrame:
             "asset_description",
             "raw_asset_description",
         )
-        if col in df.columns
+        if column in df.columns
     ]
-    sort_cols = ["_type_preference"] + (["id"] if "id" in df.columns else [])
-    df = df.sort_values(sort_cols, ascending=False).drop_duplicates(
-        dedup_key, keep="first"
+    df["economic_duplicate_candidate"] = (
+        df.duplicated(economic_key, keep=False) if economic_key else False
     )
-    return df.drop(columns=["_type_preference"])
+    return df
 
 
 SOURCE_TRANSACTION_COLUMNS = [
@@ -312,31 +316,6 @@ class TransactionRepository:
         df["source"] = source
         df = _normalize_frame(df, deduplicate=True)
 
-        dedup_key = ["doc_id"]
-        dedup_key.extend(
-            column
-            for column in ("source_record_id", "source_row_id")
-            if column in df.columns
-        )
-        dedup_key.extend(
-            [
-                "ticker_key",
-                "transaction_date",
-                "member",
-                "transaction_type",
-                "amount_raw",
-                "owner_code",
-                "asset_description_key",
-            ]
-        )
-        dedup_df = df.copy()
-        dedup_df["ticker_key"] = (
-            dedup_df["ticker"].fillna("").astype(str).replace("None", "")
-        )
-        dedup_df["asset_description_key"] = (
-            dedup_df["asset_description"].fillna("").astype(str).replace("None", "")
-        )
-        df = df.loc[~dedup_df.duplicated(subset=dedup_key, keep="first")].copy()
         if df.empty:
             return 0
 
@@ -393,41 +372,51 @@ class TransactionRepository:
                 for column in provenance_columns
             )
             update_sql = ", ".join(updates)
-            source_identity_sql = "".join(
-                f" AND t.{column} IS NOT DISTINCT FROM s.{column}"
-                for column in ("source_record_id", "source_row_id")
-                if column in write_columns
-            )
-            identity_sql = f"""
-                t.doc_id = s.doc_id
-                AND t.ticker IS NOT DISTINCT FROM s.ticker
-                AND t.transaction_date IS NOT DISTINCT FROM s.transaction_date
-                AND t.member IS NOT DISTINCT FROM s.member
-                AND t.transaction_type IS NOT DISTINCT FROM s.transaction_type
-                AND t.amount_raw IS NOT DISTINCT FROM s.amount_raw
-                AND t.owner_code IS NOT DISTINCT FROM s.owner_code
-                AND t.asset_description IS NOT DISTINCT FROM s.asset_description
-                {source_identity_sql}
-            """
-            self.conn.execute(
-                f"""UPDATE transactions AS t SET {update_sql}
-                    FROM filtered_staging_transactions AS s
-                    WHERE {identity_sql}"""  # nosec B608 -- identifiers are fixed schema constants
-            )
-            self.conn.execute(
-                f"""INSERT INTO transactions ({insert_columns_sql})
-                    SELECT {insert_columns_sql}
-                    FROM filtered_staging_transactions s
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM transactions t WHERE {identity_sql}
-                    )"""  # nosec B608 -- identifiers are fixed schema constants
-            )
+            has_artifact_identity = {
+                "source_record_id",
+                "source_row_id",
+            }.issubset(write_columns)
+            if has_artifact_identity:
+                identity_sql = """
+                    s.source_record_id IS NOT NULL
+                    AND TRIM(s.source_record_id) <> ''
+                    AND s.source_row_id IS NOT NULL
+                    AND TRIM(s.source_row_id) <> ''
+                    AND t.source_record_id = s.source_record_id
+                    AND t.source_row_id = s.source_row_id
+                """
+                self.conn.execute(
+                    f"""UPDATE transactions AS t SET {update_sql}
+                        FROM filtered_staging_transactions AS s
+                        WHERE {identity_sql}"""  # nosec B608 -- identifiers are fixed schema constants
+                )
+                self.conn.execute(
+                    f"""INSERT INTO transactions ({insert_columns_sql})
+                        SELECT {insert_columns_sql}
+                        FROM filtered_staging_transactions s
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM transactions t WHERE {identity_sql}
+                        )"""  # nosec B608 -- identifiers are fixed schema constants
+                )
+            else:
+                self.conn.execute(
+                    f"""INSERT INTO transactions ({insert_columns_sql})
+                        SELECT {insert_columns_sql}
+                        FROM filtered_staging_transactions"""  # nosec B608 -- identifiers are fixed schema constants
+                )
             count_after = self.conn.execute(
                 "SELECT COUNT(*) FROM transactions"
             ).fetchone()[0]
             inserted_count = count_after - count_before
             if not _in_transaction:
                 self.conn.execute("COMMIT")
+        except duckdb.ConstraintException as exc:
+            if not _in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise AmbiguousTransactionIdentityError(
+                "Legacy economic unique key blocked a transaction without exact "
+                "(source_record_id, source_row_id) identity"
+            ) from exc
         except Exception:
             if not _in_transaction:
                 self.conn.execute("ROLLBACK")

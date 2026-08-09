@@ -7,7 +7,11 @@ import pandas as pd
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.senate_efd import SenateEFDSource
-from analyzer.transaction_repository import SOURCE_TRANSACTION_COLUMNS, _normalize_frame
+from analyzer.transaction_repository import (
+    AmbiguousTransactionIdentityError,
+    SOURCE_TRANSACTION_COLUMNS,
+    _normalize_frame,
+)
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
 from .conftest import DatabaseTestCase
 
@@ -256,7 +260,7 @@ class TestTransactions(DatabaseTestCase):
         types = set(result["transaction_type"].values)
         self.assertEqual(types, {"Purchase", "Sale"})
 
-    def test_upsert_dedupes_repeated_null_ticker_rows(self):
+    def test_upsert_preserves_and_flags_repeated_null_ticker_rows(self):
         df = pd.DataFrame(
             [
                 {
@@ -277,8 +281,10 @@ class TestTransactions(DatabaseTestCase):
 
         count = self.db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         ticker = self.db.conn.execute("SELECT ticker FROM transactions").fetchone()[0]
-        self.assertEqual(count, 1)
+        self.assertEqual(count, 2)
         self.assertIsNone(ticker)
+        result = self.db.get_transactions(2024)
+        self.assertTrue(result["economic_duplicate_candidate"].all())
 
     def test_upsert_keeps_distinct_null_ticker_asset_descriptions(self):
         df = pd.DataFrame(
@@ -342,7 +348,7 @@ class TestTransactions(DatabaseTestCase):
             rows, [("house_pdf", "Apple Inc"), ("capitol_trades", "Apple Inc updated")]
         )
 
-    def test_upsert_identical_asset_description_is_idempotent(self):
+    def test_upsert_without_artifact_identity_preserves_repeated_lots(self):
         df = pd.DataFrame(
             [
                 {
@@ -359,12 +365,13 @@ class TestTransactions(DatabaseTestCase):
         )
 
         self.db.upsert_transactions(df, source="house_pdf")
-        self.db.upsert_transactions(df, source="house_pdf")
+        inserted = self.db.upsert_transactions(df, source="house_pdf")
+        self.assertEqual(inserted, 1)
 
         count = self.db.conn.execute(
             "SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc-idempotent-asset'"
         ).fetchone()[0]
-        self.assertEqual(count, 1)
+        self.assertEqual(count, 2)
 
     def test_count_transactions_for_docs_returns_counts_by_doc_id(self):
         df = pd.DataFrame(
@@ -755,7 +762,32 @@ class TestTransactionNormalization(DatabaseTestCase):
         self.assertEqual(normalized.iloc[0]["transaction_type"], "Sale")
         self.assertEqual(normalized.iloc[0]["raw_transaction_subtype"], "Sale Partial")
 
-    def test_sale_subtypes_normalize_and_deduplicate_on_read(self):
+    def test_only_exact_artifact_identity_replay_dedupes(self):
+        base = {
+            "source_record_id": "record-1",
+            "member": "Jane Doe",
+            "ticker": "AAPL",
+            "transaction_date": date(2024, 3, 10),
+            "transaction_type": "Purchase",
+            "amount_raw": "$1,001 - $15,000",
+            "amount_midpoint": 8000.5,
+        }
+        normalized = _normalize_frame(
+            pd.DataFrame(
+                [
+                    base | {"source_row_id": "page-1:row-1"},
+                    base | {"source_row_id": "page-1:row-1"},
+                    base | {"source_row_id": "page-1:row-2"},
+                ]
+            ),
+            deduplicate=True,
+        )
+        self.assertEqual(len(normalized), 2)
+        self.assertEqual(
+            set(normalized["source_row_id"]), {"page-1:row-1", "page-1:row-2"}
+        )
+
+    def test_sale_subtypes_normalize_without_hiding_ambiguous_lots(self):
         for transaction_type in ("Sale", "Sale Full"):
             self.db.conn.execute(
                 """
@@ -771,13 +803,13 @@ class TestTransactionNormalization(DatabaseTestCase):
             )
 
         result = self.db.get_transactions(2024)
-        self.assertEqual(len(result), 1)
-        row = result.iloc[0]
-        self.assertEqual(row["transaction_type"], "Sale")
-        self.assertEqual(row["owner_code"], "SP")
-        self.assertEqual(row["amount_midpoint"], 32500.5)
-        self.assertEqual(row["instrument_type"], "option")
-        self.assertEqual(row["asset_description"], "Apple (AAPL) [OP]")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(set(result["transaction_type"]), {"Sale"})
+        self.assertEqual(set(result["owner_code"]), {"SP"})
+        self.assertEqual(set(result["amount_midpoint"]), {32500.5})
+        self.assertEqual(set(result["instrument_type"]), {"option"})
+        self.assertEqual(set(result["asset_description"]), {"Apple (AAPL) [OP]"})
+        self.assertTrue(result["economic_duplicate_candidate"].all())
 
     def test_truncated_amount_and_invalid_owner_are_quarantined(self):
         self.db.conn.execute(

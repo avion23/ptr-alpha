@@ -16,9 +16,10 @@ from .conftest import DatabaseTestCase
 # Fix 1 – Dedup key collapses distinct trades
 # ---------------------------------------------------------------------------
 class TestDedupKeyFix(DatabaseTestCase):
-    """Two same-day lots with different amount_raw must both survive.
-    Re-inserting the identical row must still dedupe to one.
-    SP vs JT trades (different owner_code) must each survive.
+    """Lots survive unless an exact source record and row identity proves replay.
+
+    Economic equality without artifact identity is exposed as ambiguous rather
+    than used to erase a potentially repeated lot.
     """
 
     def _base_tx(self, **overrides):
@@ -46,15 +47,14 @@ class TestDedupKeyFix(DatabaseTestCase):
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2, "Two distinct lots must not be collapsed")
 
-    def test_reinserting_same_row_dedupes_to_one(self):
+    def test_reinserting_without_artifact_identity_remains_visible(self):
         row = self._base_tx(amount_raw="$1,001 - $15,000")
         df = pd.DataFrame([row])
         self.db.upsert_transactions(df, source="house_pdf")
-        self.db.upsert_transactions(df, source="house_pdf")  # re-insert same row
+        self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
-        self.assertEqual(
-            len(result), 1, "Re-inserting same row must not create duplicate"
-        )
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result["economic_duplicate_candidate"].all())
 
     def test_sp_vs_jt_owner_code_both_survive(self):
         """SP-owned and JT-owned trades on the same day must be kept separate."""

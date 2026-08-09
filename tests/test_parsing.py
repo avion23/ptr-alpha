@@ -1,6 +1,6 @@
+import os
 import unittest
 import hashlib
-import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -601,8 +601,8 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(transaction["strike_price"])
         self.assertIsNone(transaction["expiry_date"])
 
-    def test_prior_option_note_cannot_supply_next_option_contract_terms(self):
-        # 20026590: the NVDA $80 note was prepended to the following TEM row.
+    def test_option_note_before_marker_stays_with_option_row(self):
+        # 20026590: table extraction places the TEM option note before [OP].
         table = [
             ["Asset Name", "Transaction Type", "Transaction Date"],
             [
@@ -612,9 +612,9 @@ class TestParsing(unittest.TestCase):
             ],
         ]
         transaction = parse_pdf_table(table)[0]
-        self.assertEqual(transaction["instrument_type"], "option")
-        self.assertIsNone(transaction["strike_price"])
-        self.assertIsNone(transaction["expiry_date"])
+        self.assertEqual(transaction["instrument_type"], "call")
+        self.assertEqual(transaction["strike_price"], 80.0)
+        self.assertEqual(transaction["expiry_date"], "01/16/2026")
 
     def test_real_nokia_and_ge_option_notes(self):
         # 20034694 wording once the note is attached to its own [OP] row.
@@ -631,6 +631,85 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(
             [tx["instrument_type"] for tx in transactions], ["call", "put"]
         )
+
+    def test_real_pdf_safety_canaries(self):
+        from analyzer.parser_cascade import _parse_pdf_worker
+
+        data_root = next(
+            (
+                parent / "data"
+                for parent in Path(__file__).resolve().parents
+                if (parent / "data").is_dir()
+            ),
+            None,
+        )
+        if data_root is None:
+            self.skipTest("real disclosure artifacts are not available")
+
+        previous = os.environ.get("PTR_SKIP_DOCLING")
+        os.environ["PTR_SKIP_DOCLING"] = "1"
+        try:
+            option_rows = _parse_pdf_worker(
+                data_root / "2025" / "pdfs" / "20026590.pdf"
+            )[1]
+            nokia_rows = _parse_pdf_worker(
+                data_root / "2026" / "pdfs" / "20034694.pdf"
+            )[1]
+            berkshire_rows = _parse_pdf_worker(
+                data_root / "2026" / "pdfs" / "20034348.pdf"
+            )[1]
+            arlp_rows = [
+                row
+                for doc_id in ("20034095", "20034670")
+                for row in _parse_pdf_worker(
+                    data_root / "2026" / "pdfs" / f"{doc_id}.pdf"
+                )[1]
+            ]
+            fund_rows = _parse_pdf_worker(data_root / "2025" / "pdfs" / "20030630.pdf")[
+                1
+            ]
+        finally:
+            if previous is None:
+                os.environ.pop("PTR_SKIP_DOCLING", None)
+            else:
+                os.environ["PTR_SKIP_DOCLING"] = previous
+
+        self.assertEqual(
+            [
+                (
+                    row["ticker"],
+                    row["instrument_type"],
+                    row["strike_price"],
+                    row["expiry_date"],
+                )
+                for row in option_rows
+            ],
+            [
+                ("GOOGL", "option", None, None),
+                ("AMZN", "option", None, None),
+                ("AAPL", "stock", None, None),
+                ("NVDA", "stock", None, None),
+                ("NVDA", "stock", None, None),
+                ("NVDA", "option", None, None),
+                ("PANW", "stock", None, None),
+                ("TEM", "option", None, None),
+                ("VST", "option", None, None),
+            ],
+        )
+        self.assertEqual(
+            [(row["ticker"], row["instrument_type"]) for row in nokia_rows],
+            [
+                ("BAC", "stock"),
+                ("GE", "stock"),
+                ("NOK", "stock"),
+                ("NOK", "stock"),
+                ("NOK", "stock"),
+                ("NOK", "stock"),
+            ],
+        )
+        self.assertIn("BRK.B", {row["ticker"] for row in berkshire_rows})
+        self.assertNotIn("ALLI", {row["ticker"] for row in arlp_rows})
+        self.assertNotIn("MATT", {row["ticker"] for row in fund_rows})
 
     def test_parse_pdf_table_exchange_type(self):
         table = [

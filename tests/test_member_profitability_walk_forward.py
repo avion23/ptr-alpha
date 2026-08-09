@@ -140,10 +140,12 @@ class TestPointInTimeCanaries(unittest.TestCase):
 
         recs = _timestamped_recommendations(test_sigs, rankings, top_n=1, min_buyers=2)
 
-        self.assertEqual(len(recs), 1)
+        self.assertEqual(len(recs), 2)
         self.assertEqual(recs.iloc[0]["decision_date"], pd.Timestamp("2024-07-02"))
         self.assertEqual(recs.iloc[0]["rated_buyers"], 2)
         self.assertEqual(recs.iloc[0]["realized_excess_return_pct"], 2.0)
+        self.assertEqual(recs.iloc[1]["decision_date"], pd.Timestamp("2024-07-03"))
+        self.assertEqual(recs.iloc[1]["rated_buyers"], 3)
 
     def test_missing_outcome_changes_coverage_not_candidate_universe(self):
         from member_profitability.position_sizing import (
@@ -192,9 +194,9 @@ class TestChronologicalHoldout(unittest.TestCase):
         for decision_date, tickers in (
             ("2024-06-15", ("A", "B")),
             ("2024-08-03", ("C", "D")),  # 49 days: reject whole date
-            ("2024-08-15", ("E", "F")),  # 61 days: accept both rows
-            ("2024-09-15", ("G", "H")),  # 31 days: reject whole date
-            ("2024-10-14", ("I", "J")),  # 60 days: accept both rows
+            ("2024-08-14", ("E", "F")),  # 60 days: accept both rows
+            ("2024-09-14", ("G", "H")),  # 31 days: reject whole date
+            ("2024-10-13", ("I", "J")),  # 60 days: accept both rows
         ):
             for ticker in tickers:
                 rows.append(
@@ -211,13 +213,61 @@ class TestChronologicalHoldout(unittest.TestCase):
             dates,
             [
                 pd.Timestamp("2024-06-15"),
-                pd.Timestamp("2024-08-15"),
-                pd.Timestamp("2024-10-14"),
+                pd.Timestamp("2024-08-14"),
+                pd.Timestamp("2024-10-13"),
             ],
         )
         self.assertEqual(spaced.groupby("decision_date").size().tolist(), [2, 2, 2])
         gaps = pd.Series(dates).diff().dropna().dt.days
         self.assertGreaterEqual(int(gaps.min()), 60)
+
+    def test_end_to_end_windows_space_complete_candidate_stream_once(self):
+        from member_profitability.position_sizing import (
+            _recommendations_for_windows,
+            _summarize_recommendations,
+        )
+
+        windows = [
+            {
+                "train_start": pd.Timestamp("2023-08-06"),
+                "train_end": pd.Timestamp("2024-02-02"),
+                "test_start": pd.Timestamp("2024-02-02"),
+                "test_end": pd.Timestamp("2024-08-01"),
+            },
+            {
+                "train_start": pd.Timestamp("2024-02-02"),
+                "train_end": pd.Timestamp("2024-08-01"),
+                "test_start": pd.Timestamp("2024-08-01"),
+                "test_end": pd.Timestamp("2025-01-28"),
+            },
+        ]
+        signals = _signal_rows(
+            [
+                ("BUYER", "A", "2024-06-15", 1.0),
+                ("BUYER", "B", "2024-08-03", 2.0),
+                ("BUYER", "C", "2024-08-14", 3.0),
+            ]
+        )
+        rankings = pd.DataFrame(
+            {"member": ["BUYER"], "shrunk_excess_return_pct": [2.0]}
+        )
+        with patch(
+            "member_profitability.position_sizing._rank_train",
+            return_value=rankings,
+        ):
+            recommendations = _recommendations_for_windows(
+                signals, windows, top_n=1, min_buyers=1
+            )
+
+        self.assertEqual(
+            recommendations["decision_date"].tolist(),
+            [pd.Timestamp("2024-06-15"), pd.Timestamp("2024-08-14")],
+        )
+        self.assertEqual(recommendations["ticker"].tolist(), ["A", "C"])
+        summary = _summarize_recommendations(recommendations)
+        self.assertEqual(summary["n_eligible_recommendations"], 2)
+        self.assertEqual(summary["n_evaluable_recommendations"], 1)
+        self.assertEqual(summary["n_missing_outcome_recommendations"], 1)
 
     def test_holdout_outcomes_cannot_change_selected_parameters(self):
         from member_profitability.position_sizing import position_sizing_grid_search

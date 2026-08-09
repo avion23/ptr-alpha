@@ -172,13 +172,8 @@ def _timestamped_recommendations(
     ].to_dict()
 
     rows: list[dict] = []
-    last_decision: pd.Timestamp | None = None
     for decision_date in sorted(purchases["disclosure_date"].unique()):
         decision_date = pd.Timestamp(decision_date)
-        if last_decision is not None and (
-            decision_date - last_decision
-        ).days < HORIZON:
-            continue
         day = purchases[purchases["disclosure_date"] == decision_date]
         lookback_start = decision_date - pd.Timedelta(days=BUYER_LOOKBACK_DAYS)
         known = purchases[
@@ -215,8 +210,6 @@ def _timestamped_recommendations(
         outcomes = day.groupby("ticker", dropna=False)[TARGET_RETURN_COLUMN].mean()
         selected["realized_excess_return_pct"] = selected["ticker"].map(outcomes)
         rows.extend(selected.to_dict("records"))
-        # Outcomes of consecutive decisions must not overlap.
-        last_decision = decision_date
     return pd.DataFrame(rows)
 
 

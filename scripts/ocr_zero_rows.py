@@ -15,7 +15,15 @@ import time
 import duckdb
 from pathlib import Path
 
-from scripts.gemini_ocr_common import MODEL, call_gemini, validate_transactions
+from scripts.gemini_ocr_common import (
+    GEMINI_PARSER_VERSION,
+    MODEL,
+    GeminiOutputError as GeminiOutputError,
+    call_gemini,
+    parse_gemini_output,
+    pdf_sha256,
+    validate_transactions,
+)
 
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress_gemini_manual.json"
@@ -35,24 +43,71 @@ AMOUNT_MIDPOINTS = {
 }
 
 
-def get_zero_row_pdfs():
-    """Get all zero-row PDFs from DB that haven't been OCR'd yet."""
-    conn = duckdb.connect(DB_PATH, read_only=True)
-    rows = conn.execute("""
-        WITH latest AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY parsed_at DESC) as rn
+def get_ocr_work_items(
+    *,
+    db_path: str = DB_PATH,
+    data_dir: str | Path | None = None,
+    year: int | None = None,
+    parser_version: str = GEMINI_PARSER_VERSION,
+):
+    """Select unresolved deterministic parse failures from current DB state.
+
+    Progress JSON is deliberately not consulted. A current OCR success is terminal
+    only while its recorded row count still matches current Gemini rows; a current
+    OCR ``no_txs`` is terminal only while the document still has no rows.
+    """
+    conn = duckdb.connect(db_path, read_only=True)
+    rows = conn.execute(
+        """
+        WITH deterministic AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY doc_id ORDER BY parsed_at DESC
+            ) AS rn
             FROM pdf_parse_runs
+            WHERE parser_version NOT LIKE '%gemini%'
+        ), current_ocr AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY doc_id ORDER BY parsed_at DESC
+            ) AS rn
+            FROM pdf_parse_runs
+            WHERE parser_version = ?
+        ), tx AS (
+            SELECT doc_id,
+                   COUNT(*) AS row_count,
+                   COUNT(*) FILTER (WHERE source = 'gemini_ocr') AS ocr_row_count
+            FROM transactions
+            GROUP BY doc_id
         )
-        SELECT l.doc_id, l.year
-        FROM latest l
-        WHERE l.rn = 1 AND l.status IN ('zero_rows', 'error')
-    """).fetchall()
+        SELECT CAST(m.doc_id AS VARCHAR),
+               CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER)
+        FROM metadata m
+        JOIN deterministic d ON d.doc_id = m.doc_id AND d.rn = 1
+        LEFT JOIN current_ocr o ON o.doc_id = m.doc_id AND o.rn = 1
+        LEFT JOIN tx ON tx.doc_id = m.doc_id
+        WHERE m.filing_type = 'P'
+          AND d.status IN ('zero_rows', 'error', 'rejected')
+          AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
+          AND NOT COALESCE((
+              (o.status = 'success'
+               AND o.transaction_count = COALESCE(tx.ocr_row_count, 0))
+              OR
+              (o.status = 'no_txs' AND COALESCE(tx.row_count, 0) = 0)
+          ), FALSE)
+        ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
+        """,
+        [parser_version, year, year],
+    ).fetchall()
     conn.close()
+    base = Path(data_dir) if data_dir is not None else Path(db_path).parent
     return [
-        (d, y, f"data/{y}/pdfs/{d}.pdf")
-        for d, y in rows
-        if os.path.exists(f"data/{y}/pdfs/{d}.pdf")
+        (doc_id, doc_year, str(base / str(doc_year) / "pdfs" / f"{doc_id}.pdf"))
+        for doc_id, doc_year in rows
     ]
+
+
+def get_zero_row_pdfs():
+    """Backward-compatible all-year work selection from current DB state."""
+    return get_ocr_work_items()
 
 
 def load_progress(path: str | Path = PROGRESS_PATH):
@@ -71,85 +126,22 @@ def save_progress(progress, path: str | Path = PROGRESS_PATH):
     os.replace(tmp_path, path)
 
 
+def mark_progress(progress, doc_id, status):
+    """Record one confirmed terminal/current result without stale overlaps."""
+    key = "completed" if status == "success" else status
+    if key not in {"completed", "errors", "no_txs"}:
+        raise ValueError(f"unsupported progress status: {status}")
+    doc_id = str(doc_id)
+    for values in progress.values():
+        while doc_id in values:
+            values.remove(doc_id)
+    progress[key].append(doc_id)
+
+
 def parse_output(output):
-    """Parse Gemini output into structured data."""
-    if not output:
-        return None, []
-
-    member = None
-    transactions = []
-
-    for line in output.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-
-        # Extract MEMBER
-        m = re.match(r"MEMBER:\s*(.+)", line, re.IGNORECASE)
-        if m:
-            member = m.group(1).strip()
-            continue
-
-        # Skip markdown table separators and headers
-        if "|" not in line or "---" in line or "ASSET" in line.upper():
-            continue
-
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 4:
-            continue
-
-        asset = parts[0]
-        tx_type = parts[1] if len(parts) > 1 else ""
-        tx_date = parts[2] if len(parts) > 2 else ""
-        notif_date = parts[3] if len(parts) > 3 else ""
-        amount = parts[4] if len(parts) > 4 else ""
-
-        # Validate
-        if not re.search(r"\d{2}/\d{2}/\d{2}", tx_date):
-            continue
-        if tx_type not in (
-            "Purchase",
-            "Sale",
-            "Exchange",
-            "Partial Sale",
-            "P",
-            "S",
-            "E",
-        ):
-            # Try fuzzy match
-            tx_lower = tx_type.lower()
-            if "purchase" in tx_lower or tx_lower == "p":
-                tx_type = "Purchase"
-            elif "sale" in tx_lower or tx_lower == "s":
-                tx_type = "Sale"
-            elif "exchange" in tx_lower or tx_lower == "e":
-                tx_type = "Exchange"
-            else:
-                continue
-
-        # Normalize Partial Sale to Sale for consistency with TransactionType enum
-        if tx_type == "Partial Sale":
-            tx_type = "Sale"
-
-        # Map amount letter
-        amt_letter = ""
-        amount_clean = amount.strip().upper()
-        if amount_clean and amount_clean[0] in AMOUNT_MIDPOINTS:
-            amt_letter = amount_clean[0]
-        amt_mid = AMOUNT_MIDPOINTS.get(amt_letter)
-
-        transactions.append(
-            {
-                "asset": asset,
-                "type": tx_type,
-                "date": tx_date,
-                "notif_date": notif_date,
-                "amount_letter": amt_letter,
-                "amount_midpoint": amt_mid,
-            }
-        )
-
-    return member, transactions
+    """Parse a schema-validated Gemini response into the legacy tuple API."""
+    parsed = parse_gemini_output(output)
+    return parsed.member, parsed.transactions
 
 
 def normalize_date(date_str):
@@ -814,7 +806,7 @@ def record_parse_run(
     raw_count,
     tx_count,
     error_message="",
-    parser_version="v4-gemini-manual",
+    parser_version=GEMINI_PARSER_VERSION,
 ):
     conn.execute(
         """
@@ -843,64 +835,101 @@ def insert_transactions(
     transactions,
     *,
     db_path: str,
-    parser_version: str = "v4-gemini-manual",
+    parser_version: str = GEMINI_PARSER_VERSION,
     raw_count: int | None = None,
+    artifact_sha256: str | None = None,
 ):
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
     filing_date = get_filing_date(conn, doc_id)
+    expected_member = get_metadata_member(conn, doc_id)
     if not transactions:
+        status = "error" if raw_count else "no_txs"
+        message = "semantic_zero_after_raw_rows" if raw_count else ""
         record_parse_run(
             conn,
             doc_id,
             year,
-            "no_txs",
+            status,
             raw_count or 0,
             0,
+            message,
             parser_version=parser_version,
         )
         conn.close()
         return 0
 
+    input_count = raw_count if raw_count is not None else len(transactions)
+    validated, rejections = validate_transactions(
+        doc_id, member, transactions, filing_date, expected_member
+    )
+    fatal_rejections = {
+        key: value
+        for key, value in rejections.items()
+        if key not in {"duplicate_collapsed", "member_mismatch"}
+    }
+    if fatal_rejections:
+        record_parse_run(
+            conn,
+            doc_id,
+            year,
+            "error",
+            input_count,
+            0,
+            json.dumps(fatal_rejections, sort_keys=True),
+            parser_version=parser_version,
+        )
+        conn.close()
+        return 0
+    transactions = validated
+
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()
+    }
     errors = []
-    rows = []
+    rows: list[dict] = []
     for tx in transactions:
         try:
-            # Convert dates to YYYY-MM-DD format
             tx_date = normalize_date(tx["date"])
-            notif_date = filing_date or normalize_date(tx["notif_date"]) or tx_date
+            notification_date = normalize_date(tx["notif_date"])
+            disclosure_date = filing_date or notification_date or tx_date
             ticker = extract_ticker(tx["asset"]) or resolve_ticker(tx["asset"])
-
-            if not tx_date:
-                errors.append(f"bad date: {tx['date']}")
+            if not tx_date or not notification_date:
+                errors.append(f"bad date: {tx['date']} / {tx['notif_date']}")
                 continue
 
-            # Normalize type
-            tx_type = tx["type"]
-            if tx_type in ("P",):
-                tx_type = "Purchase"
-            elif tx_type in ("S",):
-                tx_type = "Sale"
-            elif tx_type in ("E",):
-                tx_type = "Exchange"
-
-            rows.append(
-                [
-                    str(doc_id),
-                    tx.get("member") or member or "Unknown",
-                    ticker,
-                    tx_date,
-                    notif_date,
-                    tx_type,
-                    tx["amount_letter"] or "Unknown",
-                    tx["amount_midpoint"],
-                    None,
-                    tx["asset"][:500] if tx.get("asset") else None,
-                    "gemini_ocr",
-                ]
+            values = {
+                "doc_id": str(doc_id),
+                "member": tx.get("member") or member,
+                "ticker": ticker,
+                "transaction_date": tx_date,
+                "disclosure_date": disclosure_date,
+                "transaction_type": tx["type"],
+                "amount_raw": tx["amount_letter"],
+                "amount_midpoint": tx["amount_midpoint"],
+                "owner_code": None,
+                "asset_description": tx["asset"][:500],
+                "source": "gemini_ocr",
+            }
+            authoritative_provenance = {
+                "chamber": "House",
+                "source_record_id": str(doc_id),
+                "official_filing_date": filing_date,
+                "notification_date": notification_date,
+                "raw_asset_description": tx["asset"][:500],
+                "ingestion_generation": parser_version,
+                "artifact_sha256": artifact_sha256,
+            }
+            values.update(
+                {
+                    key: value
+                    for key, value in authoritative_provenance.items()
+                    if key in existing_columns and value is not None
+                }
             )
-        except Exception as e:
-            errors.append(f"{tx.get('asset', '?')}: {e}")
+            rows.append(values)
+        except Exception as exc:
+            errors.append(f"{tx.get('asset', '?')}: {exc}")
     if errors:
         print(f"  INSERT ERRORS ({len(errors)}): {errors[:3]}", flush=True)
     if not rows:
@@ -929,15 +958,11 @@ def insert_transactions(
         conn.execute("BEGIN TRANSACTION")
         conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
         for row in rows:
+            columns = list(row)
+            placeholders = ", ".join("?" for _ in columns)
             conn.execute(
-                """
-                INSERT INTO transactions
-                (doc_id, member, ticker, transaction_date, disclosure_date,
-                 transaction_type, amount_raw, amount_midpoint, owner_code, created_at,
-                 asset_description, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-            """,
-                row,
+                f"INSERT INTO transactions ({', '.join(columns)}) VALUES ({placeholders})",
+                [row[column] for column in columns],
             )
             count += 1
         record_parse_run(
@@ -994,12 +1019,8 @@ def main():
 
     pdfs = get_zero_row_pdfs()
     progress = load_progress()
-    completed = set(progress["completed"] + progress["no_txs"])
-
-    remaining = [p for p in pdfs if p[0] not in completed]
-    print(f"Total zero-row PDFs: {len(pdfs)}")
-    print(f"Already processed: {len(completed)}")
-    print(f"Remaining: {len(remaining)}")
+    remaining = pdfs
+    print(f"Current unresolved OCR work: {len(remaining)}")
 
     total_inserted = 0
     for i, (doc_id, year, path) in enumerate(remaining):
@@ -1010,20 +1031,20 @@ def main():
 
         output, error = call_gemini(path, doc_id=doc_id, refresh=args.refresh)
         if output is None or error:
-            progress["errors"].append(doc_id)
-            save_progress(progress)
             conn = duckdb.connect(DB_PATH)
             try:
                 record_parse_run(conn, doc_id, year, "error", 0, 0, error)
             finally:
                 conn.close()
+            mark_progress(progress, doc_id, "errors")
+            save_progress(progress)
             print(f"  ERROR: {error}", flush=True)
             continue
 
         member, transactions = parse_output(output)
         if not transactions:
-            insert_transactions(doc_id, year, member, [], db_path=DB_PATH)
-            progress["no_txs"].append(doc_id)
+            insert_transactions(doc_id, year, member, [], db_path=DB_PATH, raw_count=0)
+            mark_progress(progress, doc_id, "no_txs")
             save_progress(progress)
             print("  No transactions found", flush=True)
             continue
@@ -1035,30 +1056,37 @@ def main():
         )
         conn.close()
         print(f"  Validation rejections: {rejections}", flush=True)
-        if rejections.get("row_count_exceeds_cap"):
+        fatal_rejections = {
+            key: value
+            for key, value in rejections.items()
+            if key not in {"duplicate_collapsed", "member_mismatch"}
+        }
+        if fatal_rejections:
+            status = (
+                "rejected" if "row_count_exceeds_cap" in fatal_rejections else "error"
+            )
+            message = json.dumps(fatal_rejections, sort_keys=True)
             conn = duckdb.connect(DB_PATH)
             try:
-                record_parse_run(
-                    conn,
-                    doc_id,
-                    year,
-                    "rejected",
-                    raw_count,
-                    0,
-                    "row_count_exceeds_cap",
-                )
+                record_parse_run(conn, doc_id, year, status, raw_count, 0, message)
             finally:
                 conn.close()
-            progress["errors"].append(doc_id)
+            mark_progress(progress, doc_id, "errors")
             save_progress(progress)
-            print(f"  REJECTED: row_count_exceeds_cap ({raw_count})", flush=True)
+            print(f"  {status.upper()}: {message}", flush=True)
             continue
         member = transactions[0].get("member", member) if transactions else member
         inserted = insert_transactions(
-            doc_id, year, member, transactions, db_path=DB_PATH
+            doc_id,
+            year,
+            member,
+            transactions,
+            db_path=DB_PATH,
+            raw_count=raw_count,
+            artifact_sha256=pdf_sha256(path),
         )
         total_inserted += inserted
-        progress["completed" if inserted else "no_txs"].append(doc_id)
+        mark_progress(progress, doc_id, "success" if inserted else "errors")
         save_progress(progress)
         print(f"  Member: {member}", flush=True)
         print(
@@ -1076,35 +1104,12 @@ def main():
 
 
 def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = False):
-    """Process all zero-row PDFs for a specific year."""
+    """Process unresolved deterministic OCR candidates for one year."""
     db_path = os.path.join(data_dir, "congress.duckdb")
     progress_path = Path(data_dir) / "ocr_progress_gemini_manual.json"
-    conn = duckdb.connect(db_path, read_only=True)
-    rows = conn.execute(
-        """
-        WITH latest AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY parsed_at DESC) as rn
-            FROM pdf_parse_runs
-        )
-        SELECT l.doc_id, l.year
-        FROM latest l
-        WHERE l.rn = 1 AND l.status IN ('zero_rows', 'error') AND l.year = ?
-    """,
-        [year],
-    ).fetchall()
-    conn.close()
-
-    pdfs = [
-        (d, y, os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf"))
-        for d, y in rows
-        if os.path.exists(os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf"))
-    ]
-    print(f"Zero-row PDFs for {year}: {len(pdfs)}")
-
+    remaining = get_ocr_work_items(db_path=db_path, data_dir=data_dir, year=year)
+    print(f"Current unresolved OCR work for {year}: {len(remaining)}")
     progress = load_progress(progress_path)
-    completed = set(progress["completed"] + progress["no_txs"])
-    remaining = [p for p in pdfs if p[0] not in completed]
-    print(f"Remaining: {len(remaining)}")
 
     total_inserted = 0
     for i, (doc_id, yr, path) in enumerate(remaining):
@@ -1115,49 +1120,91 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             doc_id=doc_id,
             refresh=refresh,
             cache_dir=os.path.join(data_dir, "gemini_cache"),
+            parser_version=GEMINI_PARSER_VERSION,
         )
         if output is None or error:
-            progress["errors"].append(doc_id)
-            save_progress(progress, progress_path)
             conn = duckdb.connect(db_path)
             try:
                 record_parse_run(conn, doc_id, yr, "error", 0, 0, error)
             finally:
                 conn.close()
+            mark_progress(progress, doc_id, "errors")
+            save_progress(progress, progress_path)
             print(f"  ERROR: {error}", flush=True)
             continue
+
         member, transactions = parse_output(output)
         if not transactions:
-            insert_transactions(doc_id, yr, member, [], db_path=db_path)
-            progress["no_txs"].append(doc_id)
+            insert_transactions(
+                doc_id,
+                yr,
+                member,
+                [],
+                db_path=db_path,
+                raw_count=0,
+                parser_version=GEMINI_PARSER_VERSION,
+            )
+            mark_progress(progress, doc_id, "no_txs")
             save_progress(progress, progress_path)
             print("  No transactions found", flush=True)
             continue
+
         raw_count = len(transactions)
         conn = duckdb.connect(db_path, read_only=True)
-        transactions, rejections = validate_for_insert(
-            conn, doc_id, member, transactions
-        )
-        conn.close()
+        try:
+            transactions, rejections = validate_for_insert(
+                conn, doc_id, member, transactions
+            )
+        finally:
+            conn.close()
         print(f"  Validation rejections: {rejections}", flush=True)
-        if rejections.get("row_count_exceeds_cap"):
+        fatal_rejections = {
+            key: value
+            for key, value in rejections.items()
+            if key not in {"duplicate_collapsed", "member_mismatch"}
+        }
+        if fatal_rejections:
+            status = (
+                "rejected" if "row_count_exceeds_cap" in fatal_rejections else "error"
+            )
+            message = json.dumps(fatal_rejections, sort_keys=True)
             conn = duckdb.connect(db_path)
             try:
                 record_parse_run(
-                    conn, doc_id, yr, "rejected", raw_count, 0, "row_count_exceeds_cap"
+                    conn,
+                    doc_id,
+                    yr,
+                    status,
+                    raw_count,
+                    0,
+                    message,
+                    parser_version=GEMINI_PARSER_VERSION,
                 )
             finally:
                 conn.close()
-            progress["errors"].append(doc_id)
+            mark_progress(progress, doc_id, "errors")
             save_progress(progress, progress_path)
-            print(f"  REJECTED: row_count_exceeds_cap ({raw_count})", flush=True)
+            print(f"  {status.upper()}: {message}", flush=True)
             continue
-        member = transactions[0].get("member", member) if transactions else member
+
+        member = transactions[0]["member"]
         inserted = insert_transactions(
-            doc_id, yr, member, transactions, db_path=db_path
+            doc_id,
+            yr,
+            member,
+            transactions,
+            db_path=db_path,
+            parser_version=GEMINI_PARSER_VERSION,
+            raw_count=raw_count,
+            artifact_sha256=pdf_sha256(path),
         )
+        if inserted <= 0:
+            mark_progress(progress, doc_id, "errors")
+            save_progress(progress, progress_path)
+            print("  ERROR: validated rows were not inserted", flush=True)
+            continue
         total_inserted += inserted
-        progress["completed" if inserted else "no_txs"].append(doc_id)
+        mark_progress(progress, doc_id, "success")
         save_progress(progress, progress_path)
         print(f"  Inserted: {inserted}/{len(transactions)}", flush=True)
 

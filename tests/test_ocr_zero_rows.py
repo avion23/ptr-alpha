@@ -43,7 +43,7 @@ class TestOcrZeroRows(unittest.TestCase):
         from scripts import ocr_zero_rows
 
         output = (
-            "MEMBER: Jane Doe\n"
+            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
             "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
             "Microsoft Corp. (MSFT) | Sale | 02/10/24 | 02/15/24 | B\n"
         )
@@ -57,7 +57,7 @@ class TestOcrZeroRows(unittest.TestCase):
     def test_parse_output_partial_sale_normalized_to_sale(self):
         from scripts import ocr_zero_rows
 
-        output = "MEMBER: Jane Doe\nApple Inc. (AAPL) | Partial Sale | 01/15/24 | 01/20/24 | A\n"
+        output = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple Inc. (AAPL) | Partial Sale | 01/15/24 | 01/20/24 | A\n"
         _, txs = ocr_zero_rows.parse_output(output)
         self.assertEqual(len(txs), 1)
         self.assertEqual(txs[0]["type"], "Sale")
@@ -66,18 +66,18 @@ class TestOcrZeroRows(unittest.TestCase):
         from scripts import ocr_zero_rows
 
         output = (
-            "MEMBER: Jane Doe\n"
+            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
             "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
             "Bad Corp. (BAD) | Purchase | not-a-date | 01/20/24 | A\n"
         )
-        _, txs = ocr_zero_rows.parse_output(output)
-        self.assertEqual(len(txs), 1)
+        with self.assertRaises(ocr_zero_rows.GeminiOutputError):
+            ocr_zero_rows.parse_output(output)
 
     def test_parse_output_fuzzy_match_transaction_types(self):
         from scripts import ocr_zero_rows
 
         output = (
-            "MEMBER: Jane Doe\n"
+            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
             "Apple Inc. (AAPL) | purchase | 01/15/24 | 01/20/24 | A\n"
             "Microsoft Corp. (MSFT) | p | 02/10/24 | 02/15/24 | B\n"
             "Google (GOOGL) | sale | 03/01/24 | 03/05/24 | C\n"
@@ -92,24 +92,42 @@ class TestOcrZeroRows(unittest.TestCase):
         from scripts import ocr_zero_rows
 
         output = (
-            "MEMBER: Jane Doe\n"
+            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
             "ASSET | TYPE | DATE | DISC | AMOUNT\n"
             "--- | --- | --- | --- | ---\n"
             "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
         )
-        _, txs = ocr_zero_rows.parse_output(output)
-        self.assertEqual(len(txs), 1)
+        with self.assertRaises(ocr_zero_rows.GeminiOutputError):
+            ocr_zero_rows.parse_output(output)
 
     def test_parse_output_amount_midpoint_mapped(self):
         from scripts import ocr_zero_rows
 
-        output = (
-            "MEMBER: Jane Doe\nApple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | D\n"
-        )
+        output = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | D\n"
         _, txs = ocr_zero_rows.parse_output(output)
         self.assertEqual(len(txs), 1)
         self.assertEqual(txs[0]["amount_letter"], "D")
         self.assertEqual(txs[0]["amount_midpoint"], 175000)
+
+    def test_parse_output_skips_prompt_example(self):
+        from scripts import ocr_zero_rows
+
+        output = (
+            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+            "Example: Mega Corp. Common Stock | Purchase | 01/01/24 | 01/02/24 | A\n"
+            "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | B\n"
+        )
+        _, txs = ocr_zero_rows.parse_output(output)
+        self.assertEqual([tx["asset"] for tx in txs], ["Apple (AAPL)"])
+
+    def test_parse_output_explicit_no_transactions(self):
+        from scripts import ocr_zero_rows
+
+        member, txs = ocr_zero_rows.parse_output(
+            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS"
+        )
+        self.assertEqual(member, "Jane Doe")
+        self.assertEqual(txs, [])
 
     # --- extract_ticker ---
 

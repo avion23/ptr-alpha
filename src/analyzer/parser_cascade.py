@@ -18,6 +18,19 @@ from analyzer.parsing import (
 logger = logging.getLogger(__name__)
 
 
+class ParserBackendError(RuntimeError):
+    """One parser backend failed instead of returning a true empty result."""
+
+    def __init__(self, engine: str, cause: Exception):
+        super().__init__(f"{engine}: {cause}")
+        self.engine = engine
+        self.cause = cause
+
+
+class ParserCascadeError(RuntimeError):
+    """No rows were recovered and at least one backend failed."""
+
+
 # ── Per-PDF worker: cascades 5 PDF engines until transactions are found ─
 
 
@@ -37,55 +50,107 @@ def _result_quality(txs: list[dict]) -> float:
     return valid / len(txs)
 
 
+def _semantic_score(transactions: list[dict]) -> tuple[int, int, int, float]:
+    complete = sum(
+        1
+        for tx in transactions
+        if tx.get("transaction_date") and tx.get("transaction_type")
+    )
+    with_amount = sum(1 for tx in transactions if tx.get("amount_midpoint"))
+    with_asset = sum(1 for tx in transactions if tx.get("asset_description"))
+    return complete, with_amount, with_asset, _result_quality(transactions)
+
+
+def _choose_best(candidates, engines_attempted):
+    if not candidates:
+        return []
+    counts = {name: len(rows) for name, rows in candidates}
+    if len(set(counts.values())) > 1:
+        detail = ",".join(f"{name}={count}" for name, count in counts.items())
+        engines_attempted.append(f"row_disagreement:{detail}")
+    engine_preference = {
+        "pdftotext": 5,
+        "pdfplumber": 4,
+        "lattice": 3,
+        "stream": 2,
+        "docling": 2,
+        "ocr": 1,
+    }
+    name, transactions = max(
+        candidates,
+        key=lambda candidate: (
+            _semantic_score(candidate[1]),
+            len(candidate[1]),
+            engine_preference.get(candidate[0], 0),
+        ),
+    )
+    engines_attempted.append(f"won:{name}")
+    return transactions
+
+
+def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
+    engines_attempted.append(engine_name)
+    try:
+        transactions = engine_fn(pdf_path)
+    except ParserBackendError as exc:
+        errors.append(str(exc))
+        engines_attempted.append(f"error:{engine_name}")
+        return None
+    if transactions:
+        engines_attempted.append(
+            f"candidate:{engine_name}:{len(transactions)}:{_result_quality(transactions):.3f}"
+        )
+        return engine_name, transactions
+    return None
+
+
 def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
-    """Cascade through pdfplumber → camelot lattice → camelot stream →
-    pdftotext → Docling OCR → tesseract OCR. Each engine is tried only when
-    all text-layer parsers returned 0 transactions; this minimises OCR work
-    while allowing better text-layer engines to beat low-quality results."""
+    """Compare every successful text engine, then every OCR engine if needed."""
     skip_docling = os.environ.get("PTR_SKIP_DOCLING") == "1"
     engines_attempted: list[str] = []
-    best_transactions: list[dict] = []
-    best_engine = ""
-    best_quality = 0.0
-
+    errors: list[str] = []
+    text_candidates = []
     for engine_fn, engine_name in [
         (_try_pdfplumber, "pdfplumber"),
         (_try_camelot_lattice, "lattice"),
         (_try_camelot_stream, "stream"),
         (_try_pdftotext, "pdftotext"),
     ]:
-        transactions = engine_fn(pdf_path)
-        engines_attempted.append(engine_name)
-        if transactions:
-            quality = _result_quality(transactions)
-            if quality >= 0.7:
-                engines_attempted.append(f"won:{engine_name}")
-                return pdf_path, transactions, engines_attempted
-            if (quality, len(transactions)) > (best_quality, len(best_transactions)):
-                best_transactions = transactions
-                best_engine = engine_name
-                best_quality = quality
+        candidate = _run_candidate(
+            engine_fn, engine_name, pdf_path, engines_attempted, errors
+        )
+        if candidate:
+            text_candidates.append(candidate)
+    if text_candidates:
+        return (
+            pdf_path,
+            _choose_best(text_candidates, engines_attempted),
+            engines_attempted,
+        )
 
-    if best_transactions:
-        engines_attempted.append(f"won:{best_engine}")
-        return pdf_path, best_transactions, engines_attempted
-
-    transactions: list[dict] = []
-
-    # Docling + tesseract: only run if all text-layer engines returned 0
+    ocr_candidates = []
     if not skip_docling:
-        engines_attempted.append("docling")
-        transactions = _try_docling(pdf_path)
-        if transactions:
-            engines_attempted.append("won:docling")
-            return pdf_path, transactions, engines_attempted
-
-    engines_attempted.append("ocr")
-    transactions = _try_tesseract(pdf_path)
-    if transactions:
-        engines_attempted.append("won:ocr")
-
-    return pdf_path, transactions, engines_attempted
+        candidate = _run_candidate(
+            _try_docling, "docling", pdf_path, engines_attempted, errors
+        )
+        if candidate:
+            ocr_candidates.append(candidate)
+    candidate = _run_candidate(
+        _try_tesseract, "ocr", pdf_path, engines_attempted, errors
+    )
+    if candidate:
+        ocr_candidates.append(candidate)
+    if ocr_candidates:
+        return (
+            pdf_path,
+            _choose_best(ocr_candidates, engines_attempted),
+            engines_attempted,
+        )
+    if errors:
+        raise ParserCascadeError(
+            f"{pdf_path}: parser backend failures with no recovered rows: {'; '.join(errors)}"
+        )
+    return pdf_path, [], engines_attempted
 
 
 def _try_pdfplumber(pdf_path: Path) -> list[dict]:
@@ -94,8 +159,7 @@ def _try_pdfplumber(pdf_path: Path) -> list[dict]:
     try:
         pp_tables = extract_tables_with_pdfplumber(pdf_path)
     except Exception as e:
-        logger.debug(f"pdfplumber failed for {pdf_path}: {e}")
-        return []
+        raise ParserBackendError("pdfplumber", e) from e
     if not pp_tables:
         return []
     txs: list[dict] = []
@@ -111,8 +175,7 @@ def _try_camelot_lattice(pdf_path: Path) -> list[dict]:
     try:
         tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
     except Exception as e:
-        logger.debug(f"Lattice failed for {pdf_path}: {e}")
-        return []
+        raise ParserBackendError("lattice", e) from e
     txs: list[dict] = []
     for table in tables:
         data = table.data
@@ -142,13 +205,11 @@ def _try_camelot_stream(pdf_path: Path) -> list[dict]:
     try:
         tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="stream")
     except Exception as e:
-        logger.debug(f"Stream failed for {pdf_path}: {e}")
-        return []
+        raise ParserBackendError("stream", e) from e
+    transactions: list[dict] = []
     for table in tables:
-        txs = parse_pdf_table(table.data)
-        if txs:
-            return txs
-    return []
+        transactions.extend(parse_pdf_table(table.data))
+    return transactions
 
 
 def _try_pdftotext(pdf_path: Path) -> list[dict]:
@@ -156,8 +217,7 @@ def _try_pdftotext(pdf_path: Path) -> list[dict]:
     try:
         pdftext_tables = extract_tables_with_pdftotext(pdf_path)
     except Exception as e:
-        logger.debug(f"pdftotext failed for {pdf_path}: {e}")
-        return []
+        raise ParserBackendError("pdftotext", e) from e
     for table in pdftext_tables:
         txs = parse_pdf_table(table)
         if txs:
@@ -176,8 +236,7 @@ def _try_docling(pdf_path: Path) -> list[dict]:
     try:
         docling_tables = extract_tables_with_docling(pdf_path)
     except Exception as e:
-        logger.debug(f"Docling failed for {pdf_path}: {e}")
-        return []
+        raise ParserBackendError("docling", e) from e
     for table in docling_tables:
         txs = parse_pdf_table(table)
         if txs:
@@ -191,8 +250,7 @@ def _try_tesseract(pdf_path: Path) -> list[dict]:
     try:
         ocr_tables = extract_tables_with_ocr(pdf_path)
     except Exception as e:
-        logger.debug(f"OCR failed for {pdf_path}: {e}")
-        return []
+        raise ParserBackendError("ocr", e) from e
     txs: list[dict] = []
     for table in ocr_tables:
         txs.extend(parse_pdf_table(table))

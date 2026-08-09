@@ -1,4 +1,10 @@
 import unittest
+import hashlib
+import os
+import sys
+from pathlib import Path
+from types import ModuleType
+from unittest.mock import patch
 import pandas as pd
 from analyzer.parsing import (
     clean_text,
@@ -506,3 +512,139 @@ class TestParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLocalOcrCanaries(unittest.TestCase):
+    def test_tickerless_legacy_two_digit_year(self):
+        from analyzer.parsing.ocr_parser import _parse_ocr_text_to_rows
+
+        rows = _parse_ocr_text_to_rows(
+            "Acme Private Fund [ST] P 01/15/24 $1,001 - $15,000"
+        )
+        self.assertEqual(
+            rows,
+            [["Acme Private Fund", "Purchase", "01/15/24", "$1,001 - $15,000"]],
+        )
+
+    def test_partial_first_orientation_is_reconciled_with_rotated_rows(self):
+        from analyzer.parsing.ocr_parser import extract_tables_with_ocr
+
+        class Image:
+            def __init__(self, name):
+                self.name = name
+
+            def rotate(self, angle, expand):
+                self.assert_rotate = (angle, expand)
+                return Image("rotated")
+
+            def close(self):
+                pass
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi: [Image("original")]
+        pytesseract = ModuleType("pytesseract")
+        pytesseract.image_to_osd = lambda image: "Rotate: 90\n"
+        pytesseract.image_to_string = lambda image: (
+            "Apple (AAPL) P 01/15/24 $1,001 - $15,000"
+            if image.name == "original"
+            else "Microsoft P 01/16/24 $15,001 - $50,000"
+        )
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            tables = extract_tables_with_ocr(Path("canary.pdf"))
+
+        self.assertEqual(len(tables[0]), 3)
+        self.assertEqual(tables[0][1][0], "Apple (AAPL)")
+        self.assertEqual(tables[0][2][0], "Microsoft")
+
+    def test_backend_failure_is_not_true_zero(self):
+        from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi: (_ for _ in ()).throw(
+            ValueError("corrupt")
+        )
+        pytesseract = ModuleType("pytesseract")
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            with self.assertRaisesRegex(OcrBackendError, "failed to rasterize"):
+                extract_tables_with_ocr(Path("corrupt.pdf"))
+
+    def test_cascade_compares_all_text_engines_and_prefers_complete_trusted_tie(self):
+        from analyzer import parser_cascade
+
+        def transactions(count):
+            return [
+                {
+                    "transaction_date": f"2024-01-{index + 1:02d}",
+                    "transaction_type": "Purchase",
+                    "amount_midpoint": 8000,
+                    "asset_description": f"Asset {index}",
+                }
+                for index in range(count)
+            ]
+
+        with (
+            patch.object(
+                parser_cascade, "_try_pdfplumber", return_value=transactions(2)
+            ),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(
+                parser_cascade, "_try_camelot_stream", return_value=transactions(4)
+            ),
+            patch.object(
+                parser_cascade, "_try_pdftotext", return_value=transactions(4)
+            ),
+        ):
+            _, result, engines = parser_cascade._parse_pdf_worker(Path("canary.pdf"))
+
+        self.assertEqual(len(result), 4)
+        self.assertIn("won:pdftotext", engines)
+        self.assertTrue(any(item.startswith("row_disagreement:") for item in engines))
+
+    def test_known_real_pdf_hash_and_row_count_canaries(self):
+        from analyzer.parser_cascade import _parse_pdf_worker
+
+        data_dir_value = os.environ.get("PTR_OCR_CANARY_DATA")
+        if not data_dir_value:
+            self.skipTest("set PTR_OCR_CANARY_DATA to run local corpus canaries")
+        data_dir = Path(data_dir_value)
+        expected = {
+            "20030977": (
+                "76053146c191866009c30ba05b192e472aac616195137db9f5ea0e87274da39a",
+                224,
+            ),
+            "20033737": (
+                "0b717e5a003cba305e42bcafc6e37042e45fdba7b8c4b9c6ca3528237eeef6b9",
+                16,
+            ),
+            "20033921": (
+                "b486c612866c86738cc2810f34aaa1613c20e537daac4d5a467ee02da889f96d",
+                15,
+            ),
+        }
+        for doc_id, (expected_hash, expected_count) in expected.items():
+            matches = list(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            self.assertEqual(len(matches), 1, doc_id)
+            pdf = matches[0]
+            self.assertEqual(
+                hashlib.sha256(pdf.read_bytes()).hexdigest(), expected_hash
+            )
+            with patch.dict(os.environ, {"PTR_SKIP_DOCLING": "1"}):
+                _, rows, engines = _parse_pdf_worker(pdf)
+            self.assertEqual(len(rows), expected_count, (doc_id, engines))
+            self.assertIn("won:pdftotext", engines)
+
+        scan_hashes = {
+            "9115808": "05b2fa3becd71c9bb141690130708079407e52a6e169cdacf42a467e09e0bda5",
+            "9115813": "737955c7c26c497eda37f4378e1af51409b6231204a82d7ae2c3f25c10e0ae84",
+            "9116141": "716cdcc10bd57c400f10d8bb4133eb667931a9699fb1835ed3b7deca010a36a1",
+        }
+        for doc_id, expected_hash in scan_hashes.items():
+            matches = list(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            self.assertEqual(len(matches), 1, doc_id)
+            self.assertEqual(
+                hashlib.sha256(matches[0].read_bytes()).hexdigest(), expected_hash
+            )

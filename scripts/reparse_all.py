@@ -5,6 +5,7 @@ production cascade still controls text-engine comparison and final OCR fallback.
 """
 
 from __future__ import annotations
+import hashlib
 import os
 import sys
 import time
@@ -66,40 +67,73 @@ def parse_year(year: int, db: Database, settings: Settings):
     pdf_transactions = {pdf_path: txs for pdf_path, txs, _ in results}
     emitted_counts = {pdf_path.stem: len(txs) for pdf_path, txs, _ in results}
     attempted_doc_ids = list(emitted_counts)
+    replacement_doc_ids = [
+        doc_id for doc_id, emitted in emitted_counts.items() if emitted > 0
+    ]
+    artifact_hashes = {
+        pdf_path.stem: _artifact_sha256(pdf_path) for pdf_path, _, _ in results
+    }
     df = consolidate_transactions(pdf_transactions, member_lookup)
+    consolidated_counts = (
+        df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
+    )
+    _verify_persisted_counts(
+        year,
+        {doc_id: emitted_counts[doc_id] for doc_id in replacement_doc_ids},
+        consolidated_counts,
+    )
 
     # Carry forward previously-resolved ticker/amount before the delete+reinsert
     # so a weaker parse does not clobber good data already in the DB.
     df = preserve_existing_fields(df, db)
-
-    # The database API owns atomic replacement of every attempted document,
-    # including zero-output documents. Query afterward instead of treating the
-    # emitted DataFrame length as proof of persistence.
-    db.replace_transactions_for_docs(
-        df,
-        source="house_pdf",
-        attempted_doc_ids=attempted_doc_ids,
-    )
-    persisted_counts = _persisted_house_counts(db, attempted_doc_ids)
-    _verify_persisted_counts(year, emitted_counts, persisted_counts)
-
-    for pdf_path, transactions, engines_attempted in results:
-        doc_id = pdf_path.stem
-        persisted = persisted_counts.get(doc_id, 0)
-        db.upsert_parse_run(
-            doc_id=doc_id,
+    parse_runs = [
+        dict(
+            doc_id=pdf_path.stem,
             year=year,
             parser_version="v3-reparse",
-            status="success" if persisted else "zero_rows",
+            status="success" if transactions else "zero_rows",
             engines_attempted=",".join(engines_attempted)
             if engines_attempted
             else "production-cascade-failed",
             raw_row_count=len(transactions),
-            transaction_count=persisted,
+            transaction_count=0,
+            artifact_sha256=artifact_hashes[pdf_path.stem],
         )
+        for pdf_path, transactions, engines_attempted in results
+    ]
 
-    persisted_total = sum(persisted_counts.values())
-    print(f"  {year}: persisted {persisted_total} verified transactions")
+    # Empty deterministic results are ambiguous: record the attempt, but do not
+    # replace prior House rows. Only nonzero successes (or a future explicit
+    # verified no_txs result) belong in replacement_doc_ids.
+    db.replace_transactions_for_docs(
+        df,
+        source="house_pdf",
+        attempted_doc_ids=attempted_doc_ids,
+        replacement_doc_ids=replacement_doc_ids,
+        parse_runs=parse_runs,
+    )
+    persisted_by_source = _persisted_counts_by_source(db, attempted_doc_ids)
+    persisted_house_counts = {
+        doc_id: persisted_by_source.get(doc_id, {}).get("house_pdf", 0)
+        for doc_id in replacement_doc_ids
+    }
+    _verify_persisted_counts(
+        year,
+        {doc_id: emitted_counts[doc_id] for doc_id in replacement_doc_ids},
+        persisted_house_counts,
+    )
+
+    persisted_total = sum(persisted_house_counts.values())
+    ambiguous_with_prior_house_rows = sum(
+        bool(persisted_by_source.get(doc_id, {}).get("house_pdf", 0))
+        for doc_id in attempted_doc_ids
+        if doc_id not in replacement_doc_ids
+    )
+    print(
+        f"  {year}: persisted {persisted_total} verified transactions; "
+        f"preserved prior House rows for {ambiguous_with_prior_house_rows} "
+        "ambiguous zero-row document(s)"
+    )
     return persisted_total
 
 
@@ -123,29 +157,34 @@ def _verify_persisted_counts(
     )
 
 
-def _persisted_house_counts(db: Database, doc_ids: list[str]) -> dict[str, int]:
-    """Return verified House row counts and reject mixed-source replacements."""
+def _artifact_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _persisted_counts_by_source(
+    db: Database, doc_ids: list[str]
+) -> dict[str, dict[str, int]]:
+    """Query actual post-replacement counts without hiding backup sources."""
     if not doc_ids:
         return {}
     placeholders = ", ".join("?" for _ in doc_ids)
     rows = db.conn.execute(
         f"""
-        SELECT doc_id, source, COUNT(*)
+        SELECT doc_id, COALESCE(source, '<legacy>'), COUNT(*)
         FROM transactions
         WHERE doc_id IN ({placeholders})
-        GROUP BY doc_id, source
+        GROUP BY doc_id, COALESCE(source, '<legacy>')
         """,  # nosec B608 -- placeholders only; values remain bound
         doc_ids,
     ).fetchall()
-    unexpected = [
-        (doc_id, source) for doc_id, source, _ in rows if source != "house_pdf"
-    ]
-    if unexpected:
-        sample = ", ".join(f"{doc_id}:{source}" for doc_id, source in unexpected[:10])
-        raise RuntimeError(
-            f"replacement retained non-House transaction source(s): {sample}"
-        )
-    return {doc_id: count for doc_id, _, count in rows}
+    counts: dict[str, dict[str, int]] = {}
+    for doc_id, source, count in rows:
+        counts.setdefault(str(doc_id), {})[str(source)] = int(count)
+    return counts
 
 
 if __name__ == "__main__":

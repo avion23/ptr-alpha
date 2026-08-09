@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import scripts.frozen_validation as fv
-from analyzer.exceptions import DatabaseError
+from analyzer.database import DatabaseError
 from analyzer.validation import (
     EvaluationAlreadyConsumedError,
     _canonical_ledger_path,

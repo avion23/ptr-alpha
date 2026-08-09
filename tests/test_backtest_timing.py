@@ -7,6 +7,7 @@ from analyzer.analysis import calculate_signal_potential, evaluate_backtest
 from analyzer.backtest.filters import _filter_ticker_perf, _filter_training
 from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
 from analyzer.pipeline import _entry_prices_from_matrix
+from analyzer.price_source import _validate_and_log_prices
 
 
 class TestBacktestTiming(unittest.TestCase):
@@ -300,27 +301,28 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertEqual(row["bt_coverage"], "unavailable")
         self.assertTrue(np.isnan(row["bt_return_pct"]))
 
-    def test_zero_entry_quote_is_skipped_to_next_valid_session(self):
+    def test_invalid_exact_entry_does_not_shift_to_later_quote(self):
         dates = pd.bdate_range("2025-01-02", "2025-01-07")
         prices = pd.DataFrame(
             {"AAPL": [90.0, 0.0, 100.0, 110.0], "SPY": [390.0, 400.0, 410.0, 420.0]},
             index=dates,
         )
 
-        row = evaluate_backtest(
+        result = evaluate_backtest(
             pd.DataFrame({"ticker": ["AAPL"]}),
             prices,
             pd.Timestamp("2025-01-02"),
             horizon=1,
             entry_slippage_bps=0,
             exit_slippage_bps=0,
-        ).iloc[0]
+        )
 
-        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-06").date())
-        self.assertEqual(row["bt_entry_price"], 100.0)
-        self.assertEqual(row["bt_exit_price"], 110.0)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["bt_coverage"], "unavailable")
+        self.assertTrue(np.isnan(result.iloc[0]["bt_entry_price"]))
+        self.assertEqual(result.attrs["n_unavailable"], 1)
 
-    def test_observed_zero_exit_is_total_loss(self):
+    def test_nonpositive_exact_exit_is_unavailable(self):
         dates = pd.bdate_range("2025-01-02", "2025-01-06")
         prices = pd.DataFrame(
             {"AAPL": [90.0, 100.0, 0.0], "SPY": [390.0, 400.0, 410.0]},
@@ -336,9 +338,73 @@ class TestBacktestTiming(unittest.TestCase):
             exit_slippage_bps=0,
         ).iloc[0]
 
-        self.assertEqual(row["bt_coverage"], "complete")
-        self.assertEqual(row["bt_exit_price"], 0.0)
-        self.assertEqual(row["bt_raw_return_pct"], -100.0)
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertTrue(np.isnan(row["bt_exit_price"]))
+        self.assertTrue(np.isnan(row["bt_raw_return_pct"]))
+
+    def test_fail_closed_acquisition_entry_and_execution_integration(self):
+        transactions = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["AAPL"],
+                "transaction_date": [pd.Timestamp("2025-01-02")],
+                "disclosure_date": [pd.Timestamp("2025-01-02")],
+                "transaction_type": ["Purchase"],
+            }
+        )
+        dates = pd.bdate_range("2025-01-02", "2025-01-06")
+
+        for invalid_entry in (0.0, np.nan):
+            with self.subTest(endpoint="entry", value=invalid_entry):
+                acquired = _validate_and_log_prices(
+                    pd.DataFrame(
+                        {
+                            "AAPL": [90.0, invalid_entry, 110.0],
+                            "SPY": [390.0, 400.0, 410.0],
+                        },
+                        index=dates,
+                    ),
+                    ["AAPL", "SPY"],
+                )
+                entries = _entry_prices_from_matrix(transactions, acquired)
+                evaluated = evaluate_backtest(
+                    pd.DataFrame({"ticker": ["AAPL"]}),
+                    acquired,
+                    pd.Timestamp("2025-01-02"),
+                    horizon=3,
+                    entry_slippage_bps=0,
+                    exit_slippage_bps=0,
+                )
+                self.assertTrue(entries.empty)
+                self.assertEqual(len(evaluated), 1)
+                self.assertEqual(evaluated.iloc[0]["bt_coverage"], "unavailable")
+                self.assertTrue(np.isnan(evaluated.iloc[0]["bt_entry_price"]))
+                self.assertEqual(evaluated.attrs["n_unavailable"], 1)
+
+        for invalid_exit in (0.0, np.nan):
+            with self.subTest(endpoint="exit", value=invalid_exit):
+                acquired = _validate_and_log_prices(
+                    pd.DataFrame(
+                        {
+                            "AAPL": [90.0, 100.0, invalid_exit],
+                            "SPY": [390.0, 400.0, 410.0],
+                        },
+                        index=dates,
+                    ),
+                    ["AAPL", "SPY"],
+                )
+                entries = _entry_prices_from_matrix(transactions, acquired)
+                row = evaluate_backtest(
+                    pd.DataFrame({"ticker": ["AAPL"]}),
+                    acquired,
+                    pd.Timestamp("2025-01-02"),
+                    horizon=3,
+                    entry_slippage_bps=0,
+                    exit_slippage_bps=0,
+                ).iloc[0]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(row["bt_coverage"], "unavailable")
+                self.assertTrue(np.isnan(row["bt_return_pct"]))
 
     def test_timezone_aware_daily_index_preserves_calendar_dates(self):
         dates = pd.bdate_range("2025-01-02", "2025-01-07", tz="America/New_York")

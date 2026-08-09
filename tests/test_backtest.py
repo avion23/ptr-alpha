@@ -868,11 +868,8 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         self.assertEqual(summary.attrs.get("n_delisted"), 0)
         self.assertEqual(ev.attrs.get("n_unavailable"), 1)
 
-    def test_ticker_delisted_before_as_of_is_not_included(self):
-        """Finding 2: if a ticker last traded before as_of_date it was never
-        actionable.  It must NOT be included with bt_delisted=True (which would
-        produce a spurious near-zero return of pure slippage) and must be
-        counted in n_no_price, not n_delisted."""
+    def test_ticker_without_exact_entry_is_unavailable(self):
+        """A stale pre-decision quote cannot establish an executable entry."""
         as_of = pd.Timestamp("2025-01-15")
         # Ticker last traded Dec 31 — 15 days before as_of, within the 30-day
         # entry staleness window so the entry lookup succeeds.  The exit date
@@ -892,17 +889,10 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
             result.dropna(subset=["bt_return_pct"]).empty,
             "ticker delisted before as_of must not be included (not tradeable at rec time)",
         )
-        # Must be counted as n_no_price (untradeable), NOT n_delisted
-        self.assertEqual(
-            result.attrs.get("n_no_price", 0),
-            1,
-            "pre-as_of delisting must be counted in n_no_price",
-        )
-        self.assertEqual(
-            result.attrs.get("n_delisted", 0),
-            0,
-            "pre-as_of delisting must NOT increment n_delisted",
-        )
+        self.assertEqual(result.iloc[0]["bt_coverage"], "unavailable")
+        self.assertEqual(result.attrs.get("n_unavailable", 0), 1)
+        self.assertEqual(result.attrs.get("n_no_price", 0), 0)
+        self.assertEqual(result.attrs.get("n_delisted", 0), 0)
 
     # ---- Finding 1: multi-date concat must preserve summed coverage counts
 

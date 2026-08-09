@@ -29,17 +29,11 @@ import numpy as np
 import pandas as pd
 
 from analyzer.backtest.prices import _find_dip_entry_arrays
-from analyzer.price_repository import next_nyse_session, nyse_sessions, previous_nyse_session
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals import _price_arrays
 
 NS_PER_DAY = 86_400_000_000_000
 _ENTRY_STALENESS_DAYS = 7
-
-# Sentinel returned by _evaluate_one_recommendation when a ticker is
-# discovered to have been delisted BEFORE the entry/as_of date — meaning the
-# position was never actionable.  Distinct from None (other skips) so the
-# caller can count it in n_no_price.
-_UNTRADEABLE = object()
 
 _EMPTY_BT_COLS = [
     "bt_entry_price",
@@ -131,10 +125,7 @@ def evaluate_backtest(
             inst_type_arr[i] if inst_type_arr is not None else None,
             amount_arr[i] if amount_arr is not None else None,
         )
-        if row is _UNTRADEABLE:
-            # Ticker was already delisted before entry — never actionable
-            n_no_price += 1
-        elif row is not None:
+        if row is not None:
             if row.get("bt_coverage") == "unavailable":
                 n_unavailable += 1
             if row.get("bt_delisted"):
@@ -210,6 +201,12 @@ def _evaluate_one_recommendation(
 ) -> dict | None:
     """Evaluate one recommendation without guessing unavailable outcomes."""
     idx_ns, vals = cached
+    inst_type = (
+        str(inst_type_val)
+        if inst_type_val is not None and not pd.isna(inst_type_val)
+        else "stock"
+    )
+    amount = amount_val if amount_val is not None else None
     entry, entry_delay, entry_date_ns = _resolve_entry(
         use_dip_entry,
         idx_ns,
@@ -220,7 +217,12 @@ def _evaluate_one_recommendation(
         max_staleness_days,
     )
     if not entry or entry_date_ns is None:
-        return None if use_dip_entry else _UNTRADEABLE
+        if use_dip_entry:
+            return None
+        expected_entry_ns = next_nyse_session(as_of_date).value
+        return _unavailable_no_entry_row(
+            ticker, row_idx, expected_entry_ns, inst_type, amount
+        )
 
     exit_target_ns = entry_date_ns + int(t_horizon) * NS_PER_DAY
     exit_date_ns = previous_nyse_session(pd.Timestamp(exit_target_ns)).value
@@ -232,16 +234,11 @@ def _evaluate_one_recommendation(
         and int(idx_ns[exit_pos]) == exit_date_ns
     ):
         candidate = float(vals[exit_pos])
-        # An observed zero is a realized total loss, not missing data.
-        if np.isfinite(candidate) and candidate >= 0:
+        # Without provider/corporate-action provenance, nonpositive quotes are
+        # invalid observations rather than evidence of a realized total loss.
+        if np.isfinite(candidate) and candidate > 0:
             exit_price = candidate
 
-    inst_type = (
-        str(inst_type_val)
-        if inst_type_val is not None and pd.notna(inst_type_val)
-        else "stock"
-    )
-    amount = amount_val if amount_val is not None else None
     if exit_price is None or exit_date_ns is None:
         return _unavailable_bt_row(
             ticker, row_idx, entry, entry_date_ns, entry_delay, inst_type, amount
@@ -313,6 +310,28 @@ def _price_at_exact_ns(idx_ns, vals, target_ns):
     return value if np.isfinite(value) and value > 0 else None
 
 
+def _unavailable_no_entry_row(ticker, row_idx, entry_date_ns, inst_type, amount):
+    from analyzer.options import estimate_options_leverage
+
+    return {
+        "_bt_idx": row_idx,
+        "ticker": ticker,
+        "bt_entry_price": np.nan,
+        "bt_entry_date": pd.Timestamp(entry_date_ns).date(),
+        "bt_exit_price": np.nan,
+        "bt_exit_date": None,
+        "bt_raw_return_pct": np.nan,
+        "bt_return_pct": np.nan,
+        "bt_leverage": estimate_options_leverage(inst_type, amount),
+        "bt_spy_return_pct": np.nan,
+        "bt_alpha_pct": np.nan,
+        "bt_entry_delay": np.nan,
+        "bt_delisted": False,
+        "bt_coverage": "unavailable",
+        "bt_stale_exit": False,
+    }
+
+
 def _unavailable_bt_row(
     ticker, row_idx, entry, entry_date_ns, entry_delay, inst_type, amount
 ):
@@ -364,22 +383,17 @@ def _resolve_entry(
     max_delay = _ENTRY_STALENESS_DAYS
     if max_staleness_days is not None:
         max_delay = min(max_delay, max_staleness_days)
-    first_session = next_nyse_session(pd.Timestamp(as_of_ns))
-    last_date = pd.Timestamp(as_of_ns + max_delay * NS_PER_DAY)
-    valid_sessions = {
-        session.value for session in nyse_sessions(first_session, last_date)
-    }
-    pos = int(np.searchsorted(idx_ns, first_session.value, side="left"))
-    while pos < len(idx_ns):
-        entry_date_ns = int(idx_ns[pos])
-        delay = int((entry_date_ns - as_of_ns) // NS_PER_DAY)
-        if delay > max_delay:
-            return None, 0, None
-        value = float(vals[pos])
-        if entry_date_ns in valid_sessions and np.isfinite(value) and value > 0:
-            return value, delay, entry_date_ns
-        pos += 1
-    return None, 0, None
+    entry_date_ns = next_nyse_session(pd.Timestamp(as_of_ns)).value
+    delay = int((entry_date_ns - as_of_ns) // NS_PER_DAY)
+    if delay > max_delay:
+        return None, 0, None
+    pos = int(np.searchsorted(idx_ns, entry_date_ns, side="left"))
+    if pos >= len(idx_ns) or int(idx_ns[pos]) != entry_date_ns:
+        return None, 0, None
+    value = float(vals[pos])
+    if not np.isfinite(value) or value <= 0:
+        return None, 0, None
+    return value, delay, entry_date_ns
 
 
 def _bt_row(

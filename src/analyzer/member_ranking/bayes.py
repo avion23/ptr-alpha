@@ -101,6 +101,7 @@ def normal_normal_posteriors(
     variance_floor = max(
         (np.finfo(float).eps * magnitude) ** 2,
         1.0 / np.finfo(float).max,
+
     )
     within_var = max(within_var, variance_floor)
 
@@ -115,6 +116,7 @@ def normal_normal_posteriors(
     # Prior strength is then applied explicitly as precision below, so it
     # controls shrinkage for every finite between-variance estimate.
     between_var = max(moment_between_var, within_var, variance_floor)
+
 
     weighted_sum = (frame["outcome"] * frame["weight"]).groupby(frame["group"]).sum()
     information = frame.groupby("group", sort=False)["weight"].sum()
@@ -131,11 +133,13 @@ def normal_normal_posteriors(
     posterior_mean = (1.0 - shrinkage) * weighted_means + shrinkage * global_mean
     posterior_var = (within_var / denominator) * between_var
 
+
     return pd.DataFrame(
         {
             "posterior_mean": posterior_mean,
             "posterior_std": np.sqrt(posterior_var),
             "shrinkage": shrinkage,
+
             "effective_information": information,
             "global_mean": global_mean,
             "within_var": within_var,

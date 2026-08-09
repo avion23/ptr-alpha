@@ -10,6 +10,7 @@ from analyzer.senate_efd import (
     SenateEFDSource,
     SenateRefreshSummary,
     SenateReportFetchResult,
+    SenateRowValidationError,
 )
 
 
@@ -37,6 +38,7 @@ def _raw_trade(**overrides):
         "notification_date": "01/29/2026",
         "amends_source_record_id": None,
         "ticker": "JPM",
+        "ticker_raw": "JPM",
         "ticker_origin": TickerOrigin.OFFICIAL.value,
         "transaction_date": "01/28/2026",
         "type": "Sale (Full)",
@@ -47,9 +49,6 @@ def _raw_trade(**overrides):
         "amount_range_raw": "$1,001 - $15,000",
         "asset_name": "JPMorgan Chase & Co. Common Stock",
         "asset_type": "Stock",
-        "restatement_source_record_ids": [KATIE_REPORT_ID],
-        "restatement_filing_dates": [pd.Timestamp("2026-01-29")],
-        "restatement_count": 1,
         "ingestion_generation": "generation-2026-08-09",
         "artifact_sha256": "a" * 64,
     }
@@ -64,7 +63,7 @@ def test_katie_britt_jpm_canary_preserves_provenance_and_normalizes_sale():
     row = result.iloc[0]
     assert row["chamber"] == "senate"
     assert row["source_record_id"] == KATIE_REPORT_ID
-    assert row["member_identity"] == "senate:KATIE BRITT"
+    assert row["chamber_member_key"] == "senate:KATIE BRITT"
     assert row["ticker"] == "JPM"
     assert row["ticker_origin"] == "official"
     assert row["transaction_type"] == "Sale"
@@ -97,6 +96,7 @@ def test_rick_scott_coupon_canary_is_non_equity_not_a_ticker():
 
 def test_report_html_preserves_raw_fields_and_artifact_hash():
     html = """
+    <html><head><title>eFD: Print Periodic Transaction Report</title></head><body>
     <table class="table-striped">
       <thead><tr>
         <th>Transaction Date</th><th>Notification Date</th><th>Owner</th>
@@ -109,6 +109,7 @@ def test_report_html_preserves_raw_fields_and_artifact_hash():
         <td>Sale (Full)</td><td>$1,001 - $15,000</td>
       </tr></tbody>
     </table>
+    </body></html>
     """
 
     class Response:
@@ -142,34 +143,36 @@ def test_report_html_preserves_raw_fields_and_artifact_hash():
     )
 
 
-def test_exact_restatement_keeps_earliest_official_availability_and_lineage():
-    early_id = "11111111-1111-1111-1111-111111111111"
-    later_id = "22222222-2222-2222-2222-222222222222"
-    early = _raw_trade(
-        doc_id=early_id,
-        source_record_id=early_id,
-        filed_date=pd.Timestamp("2025-06-14"),
-        official_filing_date=pd.Timestamp("2025-06-14"),
-        artifact_sha256="1" * 64,
-    )
-    later = _raw_trade(
-        doc_id=later_id,
-        source_record_id=later_id,
+def test_same_and_cross_report_rows_are_never_collapsed_without_row_ids():
+    first = _raw_trade()
+    same_report_duplicate = _raw_trade()
+    second_report_id = "22222222-2222-2222-2222-222222222222"
+    cross_report_duplicate = _raw_trade(
+        doc_id=second_report_id,
+        source_record_id=second_report_id,
+        source_report_path=f"/search/view/ptr/{second_report_id}/",
         filed_date=pd.Timestamp("2026-05-11"),
         official_filing_date=pd.Timestamp("2026-05-11"),
+        available_date=pd.Timestamp("2026-05-11"),
         artifact_sha256="2" * 64,
     )
 
-    reconciled = SenateEFDSource._dedupe_restatements([later, early])
-    result = _source()._normalize(reconciled)
+    result = _source()._normalize(
+        [first, same_report_duplicate, cross_report_duplicate]
+    )
 
-    assert len(reconciled) == 1
-    assert reconciled[0]["source_record_id"] == early_id
-    assert reconciled[0]["available_date"] == pd.Timestamp("2025-06-14")
-    assert reconciled[0]["restatement_source_record_ids"] == [early_id, later_id]
-    assert reconciled[0]["restatement_count"] == 2
-    assert result.iloc[0]["available_date"] == pd.Timestamp("2025-06-14")
-    assert result.iloc[0]["official_filing_date"] == pd.Timestamp("2025-06-14")
+    assert len(result) == 3
+    assert result["source_record_id"].tolist() == [
+        KATIE_REPORT_ID,
+        KATIE_REPORT_ID,
+        second_report_id,
+    ]
+    assert result["available_date"].tolist() == [
+        pd.Timestamp("2026-01-29"),
+        pd.Timestamp("2026-01-29"),
+        pd.Timestamp("2026-05-11"),
+    ]
+    assert result["amends_source_record_id"].isna().all()
 
 
 def test_refresh_accounts_for_parsed_paper_and_unavailable_reports(monkeypatch):
@@ -208,9 +211,6 @@ def test_refresh_accounts_for_parsed_paper_and_unavailable_reports(monkeypatch):
                             "official_filing_date",
                             "available_date",
                             "amends_source_record_id",
-                            "restatement_source_record_ids",
-                            "restatement_filing_dates",
-                            "restatement_count",
                             "ingestion_generation",
                             "artifact_sha256",
                         }
@@ -242,6 +242,10 @@ def test_refresh_accounts_for_parsed_paper_and_unavailable_reports(monkeypatch):
         "paper_only",
         "unavailable",
     ]
+    assert result.iloc[0]["source_record_id"] == KATIE_REPORT_ID
+    assert result.iloc[0]["artifact_sha256"] == "a" * 64
+    assert source.report_inventory[0]["source_record_id"] == KATIE_REPORT_ID
+    assert source.report_inventory[0]["artifact_sha256"] == "a" * 64
 
 
 def test_refresh_rejects_any_failed_report(monkeypatch):
@@ -281,3 +285,186 @@ def test_summary_rejects_unaccounted_reports():
             unavailable=1,
             failed=0,
         )
+
+
+def test_http_200_login_and_empty_table_are_failed_not_paper_or_parsed():
+    pages = [
+        "<html><head><title>eFD Login</title></head><body>Sign in</body></html>",
+        """
+        <html><head><title>eFD: Print Periodic Transaction Report</title></head>
+        <body><table class="table-striped">
+          <thead><tr><th>Transaction Date</th><th>Owner</th><th>Asset Name</th>
+          <th>Type</th><th>Amount</th></tr></thead><tbody></tbody>
+        </table></body></html>
+        """,
+    ]
+    source = _source()
+
+    for html in pages:
+
+        class Response:
+            status_code = 200
+            text = html
+            content = html.encode()
+
+        source._request_with_retry = lambda *args, **kwargs: Response()
+        result = source._fetch_report_transactions(KATIE_REPORT_PATH)
+        assert result.outcome is ReportOutcome.FAILED
+        assert result.artifact_sha256 == hashlib.sha256(html.encode()).hexdigest()
+
+
+def test_paper_only_requires_explicit_official_artifact_link():
+    html = """
+    <html><head><title>eFD: Print Periodic Transaction Report</title></head>
+    <body><a href="/media/paper-filings/report.pdf">Download paper filing</a></body>
+    </html>
+    """
+
+    class Response:
+        status_code = 200
+        text = html
+        content = html.encode()
+
+    source = _source()
+    source._request_with_retry = lambda *args, **kwargs: Response()
+
+    result = source._fetch_report_transactions(KATIE_REPORT_PATH)
+
+    assert result.outcome is ReportOutcome.PAPER_ONLY
+    assert result.paper_artifact_url == (
+        "https://efdsearch.senate.gov/media/paper-filings/report.pdf"
+    )
+    assert result.artifact_sha256 == hashlib.sha256(html.encode()).hexdigest()
+
+
+def test_source_supplied_debt_word_tickers_are_preserved_but_inference_is_guarded():
+    for supplied in ("BOND", "NOTE"):
+        ticker, origin = SenateEFDSource._resolve_ticker(
+            supplied,
+            "Example issuer corporate debt security",
+            "Corporate Bond",
+        )
+        assert ticker == supplied
+        assert origin is TickerOrigin.OFFICIAL
+
+    ticker, origin = SenateEFDSource._resolve_ticker(
+        "--",
+        "Example Treasury Note Matures:01/01/2030 (NOTE)",
+        "",
+    )
+    assert ticker is None
+    assert origin is TickerOrigin.NON_EQUITY
+
+
+def test_ambiguous_description_ticker_remains_unverified_and_not_stock():
+    ticker, origin = SenateEFDSource._resolve_ticker("--", "Acme Holdings (ACME)", "")
+
+    assert ticker == "ACME"
+    assert origin is TickerOrigin.UNVERIFIED
+    assert SenateEFDSource._normalize_instrument_type("") == "unknown"
+
+
+def test_malformed_row_fails_its_report_and_complete_refresh(monkeypatch):
+    good = {
+        key: value
+        for key, value in _raw_trade().items()
+        if key
+        not in {
+            "doc_id",
+            "source_record_id",
+            "source_report_path",
+            "senator",
+            "filed_date",
+            "official_filing_date",
+            "available_date",
+            "amends_source_record_id",
+            "ingestion_generation",
+            "artifact_sha256",
+        }
+    }
+    malformed = {**good, "transaction_date": "not-a-date"}
+    report = {
+        "senator": "Katie Britt",
+        "report_path": KATIE_REPORT_PATH,
+        "filed_date": pd.Timestamp("2026-01-29"),
+    }
+    source = _source()
+    source._open_session = lambda: None
+    source._search_reports = lambda start, end: [report]
+    source._fetch_report_transactions = lambda path: SenateReportFetchResult(
+        outcome=ReportOutcome.PARSED,
+        transactions=(good, malformed),
+        artifact_sha256="a" * 64,
+    )
+    monkeypatch.setattr("analyzer.senate_efd.time.sleep", lambda _: None)
+
+    with pytest.raises(SenateEFDError, match="failed=1"):
+        source.fetch_all_trades(date(2026, 1, 1), date(2026, 2, 1))
+
+    assert source.last_refresh_summary == SenateRefreshSummary(
+        found=1, parsed=0, paper_only=0, unavailable=0, failed=1
+    )
+    assert source.report_inventory[0]["artifact_sha256"] == "a" * 64
+    assert source.report_inventory[0]["raw_row_count"] == 2
+    assert source.report_inventory[0]["accepted_row_count"] == 1
+    assert source.report_inventory[0]["rejected_row_count"] == 1
+    assert (
+        "raw=2, accepted=1, rejected=1" in source.report_inventory[0]["error_message"]
+    )
+
+
+def test_direct_normalization_rejects_any_malformed_row_atomically():
+    with pytest.raises(SenateRowValidationError) as exc_info:
+        _source()._normalize([_raw_trade(), _raw_trade(transaction_date="not-a-date")])
+
+    assert exc_info.value.raw_count == 2
+    assert exc_info.value.accepted_count == 1
+    assert exc_info.value.rejected_count == 1
+
+
+def test_save_refuses_database_that_would_drop_provenance():
+    source = _source()
+    source.db = object()
+    source.last_refresh_summary = SenateRefreshSummary(
+        found=1, parsed=1, paper_only=0, unavailable=0, failed=0
+    )
+    source.report_inventory = [{"source_record_id": KATIE_REPORT_ID}]
+
+    with pytest.raises(SenateEFDError, match="persist_source_refresh"):
+        source.save_to_db(source._normalize([_raw_trade()]))
+
+
+def test_save_calls_atomic_refresh_persistence_with_inventory_and_rows():
+    calls = []
+
+    class Database:
+        @staticmethod
+        def persist_source_refresh(**kwargs):
+            calls.append(kwargs)
+            return len(kwargs["transactions"])
+
+    source = _source()
+    source.db = Database()
+    source.last_refresh_summary = SenateRefreshSummary(
+        found=1, parsed=1, paper_only=0, unavailable=0, failed=0
+    )
+    source.report_inventory = [
+        {
+            "chamber": "senate",
+            "source_record_id": KATIE_REPORT_ID,
+            "artifact_sha256": "a" * 64,
+            "outcome": "parsed",
+            "ingestion_generation": "generation-2026-08-09",
+        }
+    ]
+    frame = source._normalize([_raw_trade()])
+
+    inserted = source.save_to_db(frame)
+
+    assert inserted == 1
+    assert len(calls) == 1
+    assert calls[0]["source"] == "senate_efd"
+    assert calls[0]["chamber"] == "senate"
+    assert calls[0]["ingestion_generation"] == "generation-2026-08-09"
+    assert calls[0]["transactions"].equals(frame)
+    assert calls[0]["reports"].to_dict("records") == source.report_inventory

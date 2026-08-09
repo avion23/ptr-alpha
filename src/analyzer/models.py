@@ -10,6 +10,7 @@ class Chamber(StrEnum):
 class TickerOrigin(StrEnum):
     OFFICIAL = "official"
     ASSET_DESCRIPTION = "asset_description"
+    UNVERIFIED = "unverified"
     NON_EQUITY = "non_equity"
     INVALID = "invalid"
     MISSING = "missing"

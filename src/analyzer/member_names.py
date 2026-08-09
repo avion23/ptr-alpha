@@ -86,13 +86,11 @@ def canonical_member_key(name: str) -> str:
     return f"{tokens[0]} {tokens[-1]}"
 
 
-def canonical_member_identity(name: str, chamber: str) -> str:
-    """Return a chamber-scoped member identity key.
+def chamber_scoped_member_key(name: str, chamber: str) -> str:
+    """Scope a lossy canonical name key to its filing chamber.
 
-    Names alone are not stable congressional identities: a member can serve in
-    both chambers, and different people can share a first/last name. This key
-    does not replace an official member ID, but chamber scoping prevents House
-    and Senate histories from being merged implicitly.
+    This is a grouping key, not a person identity. An official member ID and
+    service-date dimension are still required to distinguish same-name people.
     """
     chamber_key = str(chamber).strip().lower()
     if chamber_key not in {"house", "senate"}:

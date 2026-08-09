@@ -439,7 +439,7 @@ class SenateEFDSource(TransactionSource):
     def _resolve_ticker(
         cls, ticker_raw: str, asset_name: str, asset_type: str
     ) -> tuple[str | None, str | None, TickerOrigin]:
-        raw = ticker_raw.strip().upper()
+        raw = str(ticker_raw or "").strip().upper()
         if raw and raw != "--":
             if not _EQUITY_TICKER_RE.fullmatch(raw):
                 return None, None, TickerOrigin.INVALID
@@ -1170,17 +1170,28 @@ class SenateEFDSource(TransactionSource):
             )
 
         required_columns = {
+            "doc_id",
             "chamber",
             "source_record_id",
+            "source_report_path",
+            "member",
             "source_row_id",
             "ticker",
+            "raw_ticker",
             "ticker_candidate",
             "transaction_date",
+            "disclosure_date",
+            "transaction_type",
             "official_filing_date",
             "available_date",
             "notification_date",
             "amends_source_record_id",
             "raw_transaction_subtype",
+            "owner_code",
+            "raw_owner",
+            "amount_raw",
+            "amount_midpoint",
+            "instrument_type",
             "ticker_origin",
             "raw_asset_class",
             "raw_asset_description",
@@ -1194,11 +1205,15 @@ class SenateEFDSource(TransactionSource):
             )
 
         required_values = [
+            "doc_id",
             "chamber",
             "source_record_id",
             "source_row_id",
+            "source_report_path",
+            "member",
             "official_filing_date",
             "available_date",
+            "amount_raw",
             "raw_transaction_subtype",
             "ticker_origin",
             "raw_asset_description",
@@ -1207,12 +1222,24 @@ class SenateEFDSource(TransactionSource):
         ]
         if not df.empty and df[required_values].isna().any().any():
             raise SenateEFDError("Senate transaction provenance values are incomplete")
-        if not df.empty and (
-            df["source_record_id"].astype(str).str.strip().eq("").any()
-            or df["source_row_id"].astype(str).str.strip().eq("").any()
+        nonblank_columns = [
+            "doc_id",
+            "source_record_id",
+            "source_row_id",
+            "source_report_path",
+            "member",
+            "amount_raw",
+            "raw_transaction_subtype",
+            "raw_asset_description",
+            "ingestion_generation",
+            "artifact_sha256",
+        ]
+        if not df.empty and any(
+            df[column].map(self._provenance_text).isna().any()
+            for column in nonblank_columns
         ):
             raise SenateEFDError(
-                "Senate source_record_id/source_row_id values must be nonblank"
+                "Senate transaction provenance text values must be nonblank"
             )
         if (
             not df.empty
@@ -1269,6 +1296,7 @@ class SenateEFDSource(TransactionSource):
             "ingestion_generation",
         }
         report_hashes: dict[str, str] = {}
+        report_bindings: dict[str, tuple[str, str, pd.Timestamp, ReportOutcome]] = {}
         outcome_counts = {outcome.value: 0 for outcome in ReportOutcome}
         transaction_counts = df.groupby("source_record_id").size().to_dict()
         for report in self.report_inventory:
@@ -1285,9 +1313,15 @@ class SenateEFDSource(TransactionSource):
                 raise SenateEFDError(
                     f"Duplicate Senate report inventory ID: {source_record_id}"
                 )
-            if not self._provenance_text(report["report_path"]):
+            report_path = self._provenance_text(report["report_path"])
+            if report_path is None:
                 raise SenateEFDError(f"Senate report path is blank: {source_record_id}")
-            if not self._provenance_text(report["member"]):
+            if self._path_to_source_record_id(report_path) != source_record_id:
+                raise SenateEFDError(
+                    f"Senate report path/record ID mismatch: {source_record_id}"
+                )
+            report_member = self._provenance_text(report["member"])
+            if report_member is None:
                 raise SenateEFDError(
                     f"Senate report member is blank: {source_record_id}"
                 )
@@ -1387,6 +1421,12 @@ class SenateEFDSource(TransactionSource):
                     f"Nonpaper Senate report has paper provenance: {source_record_id}"
                 )
             report_hashes[source_record_id] = artifact_sha256 or ""
+            report_bindings[source_record_id] = (
+                report_member,
+                report_path,
+                filing_date,
+                outcome,
+            )
 
         expected_counts = {
             "found": self.last_refresh_summary.found,
@@ -1410,11 +1450,112 @@ class SenateEFDSource(TransactionSource):
                 "Senate transactions have no report inventory: "
                 f"{sorted(unknown_transaction_reports)}"
             )
-        for row in df[["source_record_id", "artifact_sha256"]].itertuples(index=False):
-            if report_hashes.get(row.source_record_id) != row.artifact_sha256:
+        binding_columns = [
+            "doc_id",
+            "source_record_id",
+            "source_report_path",
+            "member",
+            "transaction_date",
+            "disclosure_date",
+            "official_filing_date",
+            "available_date",
+            "transaction_type",
+            "raw_transaction_subtype",
+            "ticker",
+            "raw_ticker",
+            "ticker_candidate",
+            "ticker_origin",
+            "raw_asset_description",
+            "raw_asset_class",
+            "owner_code",
+            "raw_owner",
+            "amount_raw",
+            "amount_midpoint",
+            "instrument_type",
+            "artifact_sha256",
+        ]
+        for row in df[binding_columns].itertuples(index=False):
+            source_record_id = self._provenance_text(row.source_record_id)
+            binding = report_bindings.get(source_record_id or "")
+            if binding is None:
+                raise SenateEFDError(
+                    f"Senate transaction has no report inventory: {source_record_id}"
+                )
+            report_member, report_path, filing_date, outcome = binding
+            if outcome is not ReportOutcome.PARSED:
+                raise SenateEFDError(
+                    f"Nonparsed Senate report has transactions: {source_record_id}"
+                )
+            if self._provenance_text(row.doc_id) != self._path_to_doc_id(report_path):
+                raise SenateEFDError(
+                    f"Senate transaction doc_id mismatch: {source_record_id}"
+                )
+            if row.member != report_member:
+                raise SenateEFDError(
+                    f"Senate transaction member mismatch: {source_record_id}"
+                )
+            if row.source_report_path != report_path:
+                raise SenateEFDError(
+                    f"Senate transaction report path mismatch: {source_record_id}"
+                )
+            transaction_filing_dates = (
+                self._parse_date(row.disclosure_date),
+                self._parse_date(row.official_filing_date),
+                self._parse_date(row.available_date),
+            )
+            if any(value != filing_date for value in transaction_filing_dates):
+                raise SenateEFDError(
+                    f"Senate transaction filing date binding mismatch: {source_record_id}"
+                )
+
+            resolved_ticker, resolved_candidate, resolved_origin = self._resolve_ticker(
+                row.raw_ticker,
+                self._provenance_text(row.raw_asset_description) or "",
+                self._provenance_text(row.raw_asset_class) or "",
+            )
+            actual_ticker = self._provenance_text(row.ticker)
+            actual_candidate = self._provenance_text(row.ticker_candidate)
+            if (
+                actual_ticker != resolved_ticker
+                or actual_candidate != resolved_candidate
+                or row.ticker_origin != resolved_origin.value
+            ):
+                raise SenateEFDError(
+                    f"Senate transaction ticker/raw binding mismatch: {source_record_id}"
+                )
+            if (
+                self._normalize_tx_type(row.raw_transaction_subtype)
+                != row.transaction_type
+            ):
+                raise SenateEFDError(
+                    f"Senate transaction subtype binding mismatch: {source_record_id}"
+                )
+            expected_owner = _extract_owner_code(
+                self._provenance_text(row.raw_owner) or ""
+            )
+            if expected_owner != row.owner_code:
+                raise SenateEFDError(
+                    f"Senate transaction owner binding mismatch: {source_record_id}"
+                )
+            rebound_amount, rebound_midpoint = _extract_amount_midpoint(row.amount_raw)
+            midpoint_matches = (
+                pd.isna(rebound_midpoint) and pd.isna(row.amount_midpoint)
+            ) or rebound_midpoint == row.amount_midpoint
+            if rebound_amount != row.amount_raw or not midpoint_matches:
+                raise SenateEFDError(
+                    f"Senate transaction amount binding mismatch: {source_record_id}"
+                )
+            if (
+                self._normalize_instrument_type(row.raw_asset_class)
+                != row.instrument_type
+            ):
+                raise SenateEFDError(
+                    f"Senate transaction asset class binding mismatch: {source_record_id}"
+                )
+            if report_hashes[source_record_id] != row.artifact_sha256:
                 raise SenateEFDError(
                     "Senate transaction artifact hash does not match report landing: "
-                    f"{row.source_record_id}"
+                    f"{source_record_id}"
                 )
 
         inserted = persist_refresh(

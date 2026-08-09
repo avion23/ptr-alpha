@@ -783,26 +783,41 @@ def test_save_rejects_duplicate_source_row_identity_and_incomplete_refresh():
 
 
 @pytest.mark.parametrize(
-    "ticker,candidate,origin",
+    "ticker,candidate,origin,raw_ticker,description,asset_class",
     [
-        ("JPM", None, "official"),
-        ("JPM", None, "asset_description"),
-        (None, "ACME", "unverified"),
-        (None, None, "non_equity"),
-        (None, None, "missing"),
-        (None, None, "invalid"),
-        (None, "BOND", "invalid"),
+        ("JPM", None, "official", "JPM", "JPMorgan", "Stock"),
+        ("JPM", None, "asset_description", "--", "JPMorgan (JPM)", "Stock"),
+        (None, "ACME", "unverified", "--", "Acme Holdings (ACME)", ""),
+        (None, None, "non_equity", "--", "Treasury Note", "Bond"),
+        (None, None, "missing", "--", "Private holding", ""),
+        (None, None, "invalid", "bad!", "Private holding", ""),
+        (None, "STOCK", "invalid", "--", "Private holding (STOCK)", "Stock"),
     ],
 )
 def test_save_accepts_every_valid_ticker_provenance_matrix_case(
-    ticker, candidate, origin
+    ticker, candidate, origin, raw_ticker, description, asset_class
 ):
     source = _ready_persistence_source()
     frame = source._normalize([_raw_trade()])
-    frame.loc[0, ["ticker", "ticker_candidate", "ticker_origin"]] = [
+    frame.loc[
+        0,
+        [
+            "ticker",
+            "ticker_candidate",
+            "ticker_origin",
+            "raw_ticker",
+            "raw_asset_description",
+            "raw_asset_class",
+            "instrument_type",
+        ],
+    ] = [
         ticker,
         candidate,
         origin,
+        raw_ticker,
+        description,
+        asset_class,
+        source._normalize_instrument_type(asset_class),
     ]
 
     assert source.save_to_db(frame) == 1
@@ -917,4 +932,114 @@ def test_save_accepts_verified_paper_without_transactions_and_rejects_with_rows(
         ]
     )
     with pytest.raises(SenateEFDError, match="Nonparsed Senate report"):
+        source.save_to_db(frame)
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "member",
+        "source_report_path",
+        "raw_ticker",
+        "raw_transaction_subtype",
+        "raw_asset_description",
+        "raw_asset_class",
+        "raw_owner",
+        "amount_raw",
+    ],
+)
+def test_save_requires_transaction_report_and_raw_binding_columns(column):
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()]).drop(columns=[column])
+
+    with pytest.raises(SenateEFDError, match="columns missing"):
+        source.save_to_db(frame)
+
+
+@pytest.mark.parametrize(
+    "column,value,error",
+    [
+        ("member", "Another Senator", "member mismatch"),
+        ("source_report_path", "/search/view/ptr/wrong/", "report path mismatch"),
+        ("official_filing_date", pd.Timestamp("2026-01-28"), "dates"),
+        ("available_date", pd.Timestamp("2026-01-28"), "dates"),
+        ("disclosure_date", pd.Timestamp("2026-01-28"), "filing date binding"),
+    ],
+)
+def test_save_rejects_each_transaction_report_binding_mutation(column, value, error):
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[0, column] = value
+
+    with pytest.raises(SenateEFDError, match=error):
+        source.save_to_db(frame)
+
+
+def test_save_rejects_report_path_record_id_and_transaction_doc_id_mutations():
+    source = _ready_persistence_source(
+        _report_inventory_row(report_path="/search/view/ptr/wrong/")
+    )
+    frame = source._normalize([_raw_trade()])
+    with pytest.raises(SenateEFDError, match="path/record ID mismatch"):
+        source.save_to_db(frame)
+
+    source = _ready_persistence_source()
+    frame.loc[0, "doc_id"] = "wrong-doc"
+    with pytest.raises(SenateEFDError, match="doc_id mismatch"):
+        source.save_to_db(frame)
+
+
+def test_save_rejects_raw_subtype_and_normalized_type_disagreement():
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[0, "raw_transaction_subtype"] = "Purchase"
+
+    with pytest.raises(SenateEFDError, match="subtype binding mismatch"):
+        source.save_to_db(frame)
+
+
+@pytest.mark.parametrize("mutation", ["raw_ticker", "description", "asset_class"])
+def test_save_rederives_exact_ticker_triple_from_raw_fields(mutation):
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[
+        0,
+        [
+            "ticker",
+            "ticker_candidate",
+            "ticker_origin",
+            "raw_ticker",
+            "raw_asset_description",
+            "raw_asset_class",
+            "instrument_type",
+        ],
+    ] = [None, "ACME", "unverified", "--", "Acme Holdings (ACME)", "", "unknown"]
+    if mutation == "raw_ticker":
+        frame.loc[0, "raw_ticker"] = "MSFT"
+    elif mutation == "description":
+        frame.loc[0, "raw_asset_description"] = "Beta Holdings (BETA)"
+    else:
+        frame.loc[0, "raw_asset_class"] = "Stock"
+        frame.loc[0, "instrument_type"] = "stock"
+
+    with pytest.raises(SenateEFDError, match="ticker/raw binding mismatch"):
+        source.save_to_db(frame)
+
+
+@pytest.mark.parametrize(
+    "column,value,error",
+    [
+        ("raw_owner", "Self", "owner binding mismatch"),
+        ("amount_raw", "$15,001 - $50,000", "amount binding mismatch"),
+        ("raw_asset_class", "Bond", "asset class binding mismatch"),
+    ],
+)
+def test_save_rejects_owner_amount_and_asset_raw_binding_mutations(
+    column, value, error
+):
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[0, column] = value
+
+    with pytest.raises(SenateEFDError, match=error):
         source.save_to_db(frame)

@@ -495,3 +495,28 @@ def test_house_get_transactions_rejects_capitol_only_year(tmp_path):
     finally:
         source.close()
         db.close()
+
+
+
+def test_house_get_transactions_rejects_ineligible_house_only_year(tmp_path):
+    source, db = _source(tmp_path)
+    db.upsert_transactions(
+        pd.DataFrame(
+            [{
+                "doc_id": "invalid-house-only",
+                "member": "Jane Doe",
+                "ticker": "BAD",
+                "transaction_date": date(2024, 1, 4),
+                "disclosure_date": date(2024, 1, 3),
+                "transaction_type": "Purchase",
+            }]
+        ),
+        source="house_pdf",
+    )
+
+    try:
+        with pytest.raises(DataSourceError, match="No cached data found for 2024"):
+            source.get_transactions(2024)
+    finally:
+        source.close()
+        db.close()

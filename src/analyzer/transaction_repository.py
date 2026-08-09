@@ -553,9 +553,16 @@ class TransactionRepository:
         return {doc_id: count for doc_id, count in rows}
 
     def house_exists(self, year: int) -> bool:
-        return self.exists(
-            year, sources=("house_pdf", "gemini_ocr")
-        )
+        count = self.conn.execute(
+            """
+            SELECT COUNT(*) FROM canonical_transactions
+            WHERE EXTRACT(YEAR FROM disclosure_date) = ?
+              AND source IN ('house_pdf', 'gemini_ocr')
+              AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
+            """,
+            [year],
+        ).fetchone()[0]
+        return count > 0
 
     def exists(
         self,

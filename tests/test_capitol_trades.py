@@ -202,27 +202,17 @@ class TestCapitolTradesSource(unittest.TestCase):
         with self.assertRaisesRegex(CapitolTradesError, "without a stable source ID"):
             self.source.fetch_all_trades()
 
-    def test_sentinel_equivalent_no_id_records_collide_before_fingerprinting(self):
-        first = _trade(
-            doc_id=None,
-            ticker=None,
-            state=None,
-            party=None,
-            asset_name=None,
-            asset_type=None,
-            amount_text=None,
-            filing_url=None,
-        )
-        second = _trade(
-            doc_id=" null ",
-            ticker=" None ",
-            state="NULL",
-            party=" nan ",
-            asset_name=" <NULL> ",
-            asset_type="none",
-            amount_text="   ",
-            filing_url="NaN",
-        )
+    def test_id_sentinels_collide_without_nulling_non_id_text(self):
+        first = _trade(doc_id=None)
+        second = _trade(doc_id=" null ")
+        self.source.session.get = MagicMock(return_value=_response([first, second]))
+
+        with self.assertRaisesRegex(CapitolTradesError, "without a stable source ID"):
+            self.source.fetch_all_trades()
+
+    def test_source_id_sentinels_are_missing_before_duplicate_detection(self):
+        first = _trade(id=None, doc_id="filing-1")
+        second = _trade(id=" None ", doc_id="filing-1")
         self.source.session.get = MagicMock(return_value=_response([first, second]))
 
         with self.assertRaisesRegex(CapitolTradesError, "without a stable source ID"):
@@ -235,12 +225,12 @@ class TestCapitolTradesSource(unittest.TestCase):
             chamber=" HOUSE ",
             state="ca",
             party="d",
-            ticker=None,
+            ticker=" nan ",
             asset_name=" Apple   Inc. ",
             asset_type=" STOCK ",
             transaction_type=" Sale ",
             amount_text="$250,001  -  $500,000",
-            filing_url=None,
+            filing_url=" HTTPS://EXAMPLE.TEST/FILING ",
         )
         self.source.session.get = MagicMock(return_value=_response([first]))
         first_id = self.source.fetch_all_trades().iloc[0]["doc_id"]
@@ -256,11 +246,11 @@ class TestCapitolTradesSource(unittest.TestCase):
                         chamber="house",
                         state="CA",
                         party="D",
-                        ticker=" null ",
+                        ticker="NAN",
                         asset_name="apple inc.",
                         asset_type="stock",
                         transaction_type="sale",
-                        filing_url="<NULL>",
+                        filing_url="https://example.test/filing",
                     )
                 ]
             )
@@ -269,6 +259,57 @@ class TestCapitolTradesSource(unittest.TestCase):
 
         self.assertEqual(first_id, second_id)
         self.assertTrue(first_id.startswith("ct-house-"))
+
+    def test_nan_ticker_and_literal_null_asset_text_are_not_id_sentinels(self):
+        records = [
+            _trade(
+                doc_id=None,
+                ticker=" NAN ",
+                asset_name=" None ",
+                asset_type=" null ",
+            ),
+            _trade(
+                doc_id="<NULL>",
+                ticker=None,
+                asset_name=None,
+                asset_type=None,
+            ),
+        ]
+        self.source.session.get = MagicMock(return_value=_response(records))
+
+        df = self.source.fetch_all_trades()
+
+        self.assertEqual(len(df), 2)
+        self.assertEqual(df.iloc[0]["ticker"], "NAN")
+        self.assertEqual(df.iloc[0]["ticker_origin"], "source_reported")
+        self.assertEqual(df.iloc[0]["asset_description"], "None")
+        self.assertEqual(df.iloc[0]["instrument_type"], "null")
+        self.assertEqual(df.iloc[0]["raw_asset_description"], " None ")
+        self.assertEqual(df.iloc[0]["raw_asset_class"], " null ")
+        self.assertNotEqual(df.iloc[0]["doc_id"], df.iloc[1]["doc_id"])
+
+    def test_raw_provenance_preserves_spaces_and_literal_sentinel_words(self):
+        record = _trade(
+            id=7,
+            doc_id=" NaN ",
+            transaction_type=" sale (full) ",
+            asset_name="  None  ",
+            asset_type=" NAN ",
+            amount_text="  $250,001 - $500,000  ",
+        )
+        self.source.session.get = MagicMock(return_value=_response([record]))
+
+        row = self.source.fetch_all_trades().iloc[0]
+
+        self.assertEqual(row["transaction_type"], "Sale")
+        self.assertEqual(row["asset_description"], "None")
+        self.assertEqual(row["instrument_type"], "nan")
+        self.assertEqual(row["amount_raw"], "  $250,001 - $500,000  ")
+        self.assertEqual(row["raw_transaction_subtype"], " sale (full) ")
+        self.assertEqual(row["raw_asset_description"], "  None  ")
+        self.assertEqual(row["raw_asset_class"], " NAN ")
+        self.assertTrue(pd.isna(row["source_filing_id"]))
+        self.assertTrue(row["doc_id"].startswith("ct-house-"))
 
     @patch("analyzer.capitol_trades.time.sleep")
     def test_repeated_source_record_id_fails_closed(self, _sleep):

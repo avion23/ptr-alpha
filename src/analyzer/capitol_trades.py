@@ -59,7 +59,7 @@ _REQUIRED_TRADE_FIELDS = frozenset(
 )
 _SOURCE_ID_FIELDS = ("id", "trade_id", "transaction_id")
 _INTERNAL_PREFIX = "_capitol_"
-_NULL_IDENTITY_TEXT = frozenset({"", "none", "null", "nan", "<null>"})
+_NULL_ID_SENTINELS = frozenset({"", "none", "null", "nan", "<null>"})
 
 
 class CapitolTradesError(Exception):
@@ -511,17 +511,17 @@ class CapitolTradesSource(TransactionSource):
             raise CapitolTradesError(
                 f"API schema error at {location}: missing fields {sorted(missing)}"
             )
-        politician_name = self._normalize_nullable_text(trade["politician_name"])
+        politician_name = self._normalize_model_text(trade["politician_name"])
         if politician_name is None:
             raise CapitolTradesError(
                 f"API schema error at {location}: politician_name must be non-empty"
             )
-        chamber = self._normalize_nullable_text(trade["chamber"])
+        chamber = self._normalize_model_text(trade["chamber"])
         if chamber is None or chamber.casefold() not in {"house", "senate"}:
             raise CapitolTradesError(
                 f"API schema error at {location}: invalid chamber {trade['chamber']!r}"
             )
-        tx_type = self._normalize_nullable_text(trade["transaction_type"])
+        tx_type = self._normalize_model_text(trade["transaction_type"])
         if tx_type is None:
             raise CapitolTradesError(
                 f"API schema error at {location}: transaction_type must be non-empty"
@@ -637,11 +637,11 @@ class CapitolTradesSource(TransactionSource):
             if midpoint is None and trade.get("amount_text"):
                 _, midpoint = _parse_amount_midpoint(trade["amount_text"])
 
-            raw_tx_type = self._normalize_nullable_text(trade["transaction_type"])
+            raw_tx_type = self._normalize_model_text(trade["transaction_type"])
             if raw_tx_type is None:
                 raise CapitolTradesError("Missing normalized transaction subtype")
             tx_type = TX_TYPE_MAP.get(raw_tx_type.casefold(), raw_tx_type.title())
-            chamber = self._normalize_nullable_text(trade["chamber"])
+            chamber = self._normalize_model_text(trade["chamber"])
             if chamber is None:
                 raise CapitolTradesError("Missing normalized chamber")
             chamber = chamber.casefold()
@@ -652,12 +652,12 @@ class CapitolTradesSource(TransactionSource):
                 record_fingerprint=record_fingerprint,
             )
             disclosure_date = self._parse_date(trade["disclosure_date"])
-            asset_name = self._normalize_nullable_text(trade.get("asset_name"))
-            asset_type = self._normalize_nullable_text(trade.get("asset_type"))
-            ticker = self._normalize_nullable_text(trade.get("ticker"))
+            asset_name = self._normalize_model_text(trade.get("asset_name"))
+            asset_type = self._normalize_model_text(trade.get("asset_type"))
+            ticker = self._normalize_model_text(trade.get("ticker"))
             if ticker is not None:
                 ticker = ticker.upper()
-            member = self._normalize_nullable_text(trade["politician_name"])
+            member = self._normalize_model_text(trade["politician_name"])
             if member is None:
                 raise CapitolTradesError("Missing normalized politician name")
             rows.append(
@@ -669,9 +669,7 @@ class CapitolTradesSource(TransactionSource):
                     "disclosure_date": disclosure_date,
                     "transaction_type": tx_type,
                     "owner_code": None,
-                    "amount_raw": self._normalize_nullable_text(
-                        trade.get("amount_text")
-                    ),
+                    "amount_raw": trade.get("amount_text"),
                     "amount_midpoint": midpoint,
                     "instrument_type": self._normalize_instrument_type(asset_type),
                     "strike_price": None,
@@ -684,17 +682,15 @@ class CapitolTradesSource(TransactionSource):
                     "available_date": None,
                     "notification_date": None,
                     "amends_source_record_id": None,
-                    "raw_transaction_subtype": raw_tx_type,
+                    "raw_transaction_subtype": trade["transaction_type"],
                     "ticker_origin": "source_reported" if ticker is not None else None,
-                    "raw_asset_class": asset_type,
-                    "raw_asset_description": asset_name,
+                    "raw_asset_class": trade.get("asset_type"),
+                    "raw_asset_description": trade.get("asset_name"),
                     "ingestion_generation": self.generation,
                     "artifact_sha256": artifact_sha256,
-                    "state": self._normalize_upper_text(trade.get("state")),
-                    "party": self._normalize_upper_text(trade.get("party")),
-                    "filing_url": self._normalize_nullable_text(
-                        trade.get("filing_url")
-                    ),
+                    "state": self._normalize_model_upper_text(trade.get("state")),
+                    "party": self._normalize_model_upper_text(trade.get("party")),
+                    "filing_url": self._normalize_model_text(trade.get("filing_url")),
                     "source_endpoint": trade.get("_capitol_endpoint"),
                     "source_params": trade.get("_capitol_params"),
                     "source_page": trade.get("_capitol_page"),
@@ -742,7 +738,7 @@ class CapitolTradesSource(TransactionSource):
                     "API schema error: source record IDs must be strings or integers: "
                     f"{present!r}"
                 )
-            normalized = cls._normalize_nullable_text(value)
+            normalized = cls._normalize_id_text(value)
             if normalized is not None:
                 values.add(normalized)
         if not values:
@@ -766,22 +762,20 @@ class CapitolTradesSource(TransactionSource):
     def _normalized_identity_payload(cls, trade: dict) -> dict[str, Any]:
         transaction_date = cls._parse_date(trade.get("transaction_date"))
         disclosure_date = cls._parse_date(trade.get("disclosure_date"))
-        chamber = cls._normalize_nullable_text(trade.get("chamber"))
-        transaction_type = cls._normalize_nullable_text(trade.get("transaction_type"))
-        politician_name = cls._normalize_nullable_text(trade.get("politician_name"))
-        ticker = cls._normalize_nullable_text(trade.get("ticker"))
         return {
             "source_record_id": cls._raw_source_record_id(trade),
             "source_filing_id": cls._normalize_filing_id(trade.get("doc_id")),
-            "politician_name": politician_name.casefold() if politician_name else None,
-            "chamber": chamber.casefold() if chamber else None,
-            "state": cls._normalize_upper_text(trade.get("state")),
-            "party": cls._normalize_upper_text(trade.get("party")),
-            "ticker": ticker.upper() if ticker else None,
-            "asset_name": cls._normalize_casefold_text(trade.get("asset_name")),
-            "asset_type": cls._normalize_casefold_text(trade.get("asset_type")),
-            "transaction_type": (
-                transaction_type.casefold() if transaction_type else None
+            "politician_name": cls._canonical_identity_text(
+                trade.get("politician_name")
+            ),
+            "chamber": cls._canonical_identity_text(trade.get("chamber")),
+            "state": cls._canonical_identity_text(trade.get("state")),
+            "party": cls._canonical_identity_text(trade.get("party")),
+            "ticker": cls._canonical_identity_text(trade.get("ticker")),
+            "asset_name": cls._canonical_identity_text(trade.get("asset_name")),
+            "asset_type": cls._canonical_identity_text(trade.get("asset_type")),
+            "transaction_type": cls._canonical_identity_text(
+                trade.get("transaction_type")
             ),
             "transaction_date": (
                 transaction_date.isoformat() if transaction_date is not None else None
@@ -789,10 +783,10 @@ class CapitolTradesSource(TransactionSource):
             "disclosure_date": (
                 disclosure_date.isoformat() if disclosure_date is not None else None
             ),
-            "amount_text": cls._normalize_casefold_text(trade.get("amount_text")),
+            "amount_text": cls._canonical_identity_text(trade.get("amount_text")),
             "amount_min": cls._normalize_identity_number(trade.get("amount_min")),
             "amount_max": cls._normalize_identity_number(trade.get("amount_max")),
-            "filing_url": cls._normalize_nullable_text(trade.get("filing_url")),
+            "filing_url": cls._canonical_identity_text(trade.get("filing_url")),
         }
 
     @staticmethod
@@ -809,26 +803,37 @@ class CapitolTradesSource(TransactionSource):
 
     @classmethod
     def _normalize_filing_id(cls, value: Any) -> str | None:
-        return cls._normalize_nullable_text(value)
+        return cls._normalize_id_text(value)
 
     @staticmethod
-    def _normalize_nullable_text(value: Any) -> str | None:
+    def _normalize_id_text(value: Any) -> str | None:
+        """Normalize only fields whose domain is an identifier."""
         if value is None:
             return None
         normalized = " ".join(str(value).split())
-        if normalized.casefold() in _NULL_IDENTITY_TEXT:
+        if normalized.casefold() in _NULL_ID_SENTINELS:
             return None
         return normalized
 
-    @classmethod
-    def _normalize_upper_text(cls, value: Any) -> str | None:
-        normalized = cls._normalize_nullable_text(value)
-        return normalized.upper() if normalized is not None else None
+    @staticmethod
+    def _normalize_model_text(value: Any) -> str | None:
+        """Trim modeling text without interpreting words such as NAN or null."""
+        if value is None:
+            return None
+        normalized = " ".join(str(value).split())
+        return normalized or None
+
+    @staticmethod
+    def _canonical_identity_text(value: Any) -> str | None:
+        """Canonicalize non-ID identity text without applying ID sentinels."""
+        if value is None:
+            return None
+        return " ".join(str(value).split()).casefold()
 
     @classmethod
-    def _normalize_casefold_text(cls, value: Any) -> str | None:
-        normalized = cls._normalize_nullable_text(value)
-        return normalized.casefold() if normalized is not None else None
+    def _normalize_model_upper_text(cls, value: Any) -> str | None:
+        normalized = cls._normalize_model_text(value)
+        return normalized.upper() if normalized is not None else None
 
     @staticmethod
     def _synthetic_doc_id(
@@ -869,12 +874,14 @@ class CapitolTradesSource(TransactionSource):
         return parsed
 
     @staticmethod
-    def _normalize_instrument_type(raw: str | None) -> str:
-        if not raw:
-            return "stock"
-        lower = raw.lower()
+    def _normalize_instrument_type(raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        lower = raw.casefold()
         if "call" in lower:
             return "call"
         if "put" in lower:
             return "put"
-        return "stock"
+        if "stock" in lower:
+            return "stock"
+        return lower

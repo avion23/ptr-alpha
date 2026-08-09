@@ -1088,7 +1088,7 @@ def fetch_capitol(
                 df = capitol.fetch_trades(politician, start_date, end_date)
             else:
                 df = capitol.fetch_all_trades(start_date, end_date, chamber)
-            capitol.write_reconciliation_artifact(df, output)
+            capitol.write_reconciliation_artifact(output)
         finally:
             capitol.close()
     except CapitolTradesError as exc:

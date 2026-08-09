@@ -21,7 +21,7 @@ def fetch_all_trades(*, generation: str, output: str | Path) -> pd.DataFrame:
         data_dir="data", read_only=True, generation=generation
     ) as source:
         df = source.fetch_all_trades()
-        source.write_reconciliation_artifact(df, output)
+        source.write_reconciliation_artifact(output)
         return df
 
 

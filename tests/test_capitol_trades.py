@@ -202,6 +202,74 @@ class TestCapitolTradesSource(unittest.TestCase):
         with self.assertRaisesRegex(CapitolTradesError, "without a stable source ID"):
             self.source.fetch_all_trades()
 
+    def test_sentinel_equivalent_no_id_records_collide_before_fingerprinting(self):
+        first = _trade(
+            doc_id=None,
+            ticker=None,
+            state=None,
+            party=None,
+            asset_name=None,
+            asset_type=None,
+            amount_text=None,
+            filing_url=None,
+        )
+        second = _trade(
+            doc_id=" null ",
+            ticker=" None ",
+            state="NULL",
+            party=" nan ",
+            asset_name=" <NULL> ",
+            asset_type="none",
+            amount_text="   ",
+            filing_url="NaN",
+        )
+        self.source.session.get = MagicMock(return_value=_response([first, second]))
+
+        with self.assertRaisesRegex(CapitolTradesError, "without a stable source ID"):
+            self.source.fetch_all_trades()
+
+    def test_logically_identical_no_id_rows_have_stable_ids_across_runs(self):
+        first = _trade(
+            doc_id=None,
+            politician_name=" Nancy   Pelosi ",
+            chamber=" HOUSE ",
+            state="ca",
+            party="d",
+            ticker=None,
+            asset_name=" Apple   Inc. ",
+            asset_type=" STOCK ",
+            transaction_type=" Sale ",
+            amount_text="$250,001  -  $500,000",
+            filing_url=None,
+        )
+        self.source.session.get = MagicMock(return_value=_response([first]))
+        first_id = self.source.fetch_all_trades().iloc[0]["doc_id"]
+
+        second_source = CapitolTradesSource(generation="next-generation")
+        self.addCleanup(second_source.close)
+        second_source.session.get = MagicMock(
+            return_value=_response(
+                [
+                    _trade(
+                        doc_id=" none ",
+                        politician_name="Nancy Pelosi",
+                        chamber="house",
+                        state="CA",
+                        party="D",
+                        ticker=" null ",
+                        asset_name="apple inc.",
+                        asset_type="stock",
+                        transaction_type="sale",
+                        filing_url="<NULL>",
+                    )
+                ]
+            )
+        )
+        second_id = second_source.fetch_all_trades().iloc[0]["doc_id"]
+
+        self.assertEqual(first_id, second_id)
+        self.assertTrue(first_id.startswith("ct-house-"))
+
     @patch("analyzer.capitol_trades.time.sleep")
     def test_repeated_source_record_id_fails_closed(self, _sleep):
         first = [_trade(id=7), _trade(id=8, ticker="NVDA")]
@@ -234,7 +302,7 @@ class TestCapitolTradesSource(unittest.TestCase):
     def test_invalid_date_and_numeric_fields_fail_schema(self):
         cases = [
             (_trade(transaction_date="not-a-date"), "invalid transaction_date"),
-            (_trade(amount_min="250001"), "amount_min must be numeric"),
+            (_trade(amount_min="250001"), "amount_min must be finite numeric"),
         ]
         for record, message in cases:
             with self.subTest(message=message):
@@ -337,10 +405,10 @@ class TestCapitolTradesSource(unittest.TestCase):
     def test_manifest_binds_pages_generation_and_records(self):
         response = _response([_trade(id=1)])
         self.source.session.get = MagicMock(return_value=response)
-        df = self.source.fetch_all_trades()
+        self.source.fetch_all_trades()
         with TemporaryDirectory() as tmp:
             output = Path(tmp) / "capitol.json"
-            self.source.write_reconciliation_artifact(df, output)
+            self.source.write_reconciliation_artifact(output)
             manifest = json.loads(output.read_text())
             self.assertTrue(manifest["reconciliation_only"])
             self.assertEqual(manifest["ingestion_generation"], "test-generation")
@@ -349,16 +417,117 @@ class TestCapitolTradesSource(unittest.TestCase):
             self.assertEqual(manifest["pages"][0]["artifact_sha256"], raw_hash)
             self.assertEqual(manifest["records"][0]["artifact_sha256"], raw_hash)
             with self.assertRaisesRegex(CapitolTradesError, "Refusing to overwrite"):
-                self.source.write_reconciliation_artifact(df, output)
+                self.source.write_reconciliation_artifact(output)
+
+    def test_manifest_rejects_subset_input_and_ignores_returned_frame_mutation(self):
+        response = _response([_trade(id=1), _trade(id=2, doc_id="20033338")])
+        self.source.session.get = MagicMock(return_value=response)
+        returned = self.source.fetch_all_trades()
+        subset = returned.iloc[:1]
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "bound.json"
+            with self.assertRaises(TypeError):
+                self.source.write_reconciliation_artifact(subset, output)
+
+            returned.loc[0, "member"] = "MUTATED OUTSIDE SOURCE"
+            detached_pages = self.source.last_page_artifacts
+            detached_pages[0]["artifact_sha256"] = "0" * 64
+            self.source.write_reconciliation_artifact(output)
+            manifest = json.loads(output.read_text())
+
+        self.assertEqual(manifest["emitted_count"], 2)
+        self.assertEqual(manifest["records"][0]["member"], "Nancy Pelosi")
+        self.assertNotEqual(manifest["pages"][0]["artifact_sha256"], "0" * 64)
+
+    def test_manifest_accounts_for_selection_and_exact_normalized_result(self):
+        records = [
+            _trade(id=1, chamber="house", disclosure_date="2025-07-02"),
+            _trade(
+                id=2,
+                chamber="senate",
+                politician_name="Katie Britt",
+                doc_id="senate-2",
+                disclosure_date="2025-07-03",
+            ),
+            _trade(id=3, doc_id="house-3", disclosure_date="2025-01-02"),
+        ]
+        self.source.session.get = MagicMock(return_value=_response(records))
+        df = self.source.fetch_all_trades(
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 12, 31),
+            chamber="house",
+        )
+        expected_hash = hashlib.sha256(
+            self.source._normalized_result_json(df).encode()
+        ).hexdigest()
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "selected.json"
+            self.source.write_reconciliation_artifact(output)
+            manifest = json.loads(output.read_text())
+
+        self.assertEqual(
+            manifest["selection"],
+            {
+                "politician": None,
+                "chamber": "house",
+                "start_date": "2025-06-01",
+                "end_date": "2025-12-31",
+            },
+        )
+        self.assertEqual(
+            manifest["source_reported"], {"total": 3, "pages": 1, "per_page": 50}
+        )
+        self.assertEqual(manifest["fetched_raw_count"], 3)
+        self.assertEqual(manifest["emitted_count"], 1)
+        self.assertEqual(manifest["filtered_count"], 2)
+        self.assertEqual(manifest["rejected_count"], 0)
+        self.assertEqual(manifest["normalized_result_sha256"], expected_hash)
+        serialized_records = json.dumps(
+            manifest["records"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+        self.assertEqual(
+            manifest["normalized_result_sha256"],
+            hashlib.sha256(serialized_records).hexdigest(),
+        )
+        self.assertEqual(len(manifest["records"]), 1)
+        self.assertEqual(
+            manifest["fetched_raw_count"],
+            manifest["emitted_count"]
+            + manifest["filtered_count"]
+            + manifest["rejected_count"],
+        )
+
+    def test_empty_filtered_manifest_is_accounted_and_hashed(self):
+        records = [_trade(id=1), _trade(id=2, doc_id="house-2")]
+        self.source.session.get = MagicMock(return_value=_response(records))
+        df = self.source.fetch_all_trades(chamber="senate")
+        self.assertTrue(df.empty)
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "empty.json"
+            self.source.write_reconciliation_artifact(output)
+            manifest = json.loads(output.read_text())
+
+        self.assertEqual(manifest["fetched_raw_count"], 2)
+        self.assertEqual(manifest["emitted_count"], 0)
+        self.assertEqual(manifest["filtered_count"], 2)
+        self.assertEqual(manifest["rejected_count"], 0)
+        self.assertEqual(manifest["records"], [])
+        self.assertEqual(
+            manifest["normalized_result_sha256"], hashlib.sha256(b"[]").hexdigest()
+        )
 
     def test_manifest_requires_validated_fetch(self):
         with (
             TemporaryDirectory() as tmp,
-            self.assertRaisesRegex(CapitolTradesError, "complete validated API fetch"),
+            self.assertRaisesRegex(
+                CapitolTradesError, "complete validated and filtered"
+            ),
         ):
-            self.source.write_reconciliation_artifact(
-                pd.DataFrame(), Path(tmp) / "x.json"
-            )
+            self.source.write_reconciliation_artifact(Path(tmp) / "x.json")
 
     def test_http_503_is_external_failure_not_empty_success(self):
         response = MagicMock()

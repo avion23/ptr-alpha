@@ -125,7 +125,7 @@ class TestCliApp(unittest.TestCase):
         )
         capitol.fetch_all_trades.assert_called_once_with(None, None, None)
         capitol.write_reconciliation_artifact.assert_called_once_with(
-            frame, Path("capitol.json")
+            Path("capitol.json")
         )
         capitol.save_to_db.assert_not_called()
         self.assertIn("No canonical transactions were saved", result.output)

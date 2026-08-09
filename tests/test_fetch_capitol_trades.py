@@ -27,7 +27,7 @@ class TestFetchCapitolTrades(unittest.TestCase):
         )
         source.fetch_all_trades.assert_called_once_with()
         source.write_reconciliation_artifact.assert_called_once_with(
-            expected, Path("artifact.json")
+            Path("artifact.json")
         )
 
     def test_main_requires_output_and_generation(self):

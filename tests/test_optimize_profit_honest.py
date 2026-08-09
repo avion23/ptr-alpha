@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -407,12 +409,21 @@ def test_final_maturity_fails_before_consumption_reservation():
 def test_final_endpoint_coverage_requires_each_ticker_and_spy_exactly():
     index = pd.DatetimeIndex(["2029-01-02", "2029-04-02"])
     complete = pd.DataFrame({"SPY": [100.0, 110.0], "AAA": [50.0, 55.0]}, index=index)
-    returns, spy_return, endpoints = main._strict_endpoint_returns(
+    returns, spy_return, endpoint_rows = main._strict_endpoint_returns(
         ["AAA"], complete, pd.Timestamp("2029-01-01"), 90
     )
     assert len(returns) == 1
     assert spy_return > 0
-    assert endpoints["entry_date"] == "2029-01-02"
+    assert endpoint_rows == [
+        {
+            "entry_date": "2029-01-02",
+            "exit_date": "2029-04-02",
+            "ticker_entry_price": 50.0,
+            "ticker_exit_price": 55.0,
+            "spy_entry_price": 100.0,
+            "spy_exit_price": 110.0,
+        }
+    ]
 
     missing = complete.copy()
     missing.loc[pd.Timestamp("2029-04-02"), "AAA"] = float("nan")
@@ -422,10 +433,24 @@ def test_final_endpoint_coverage_requires_each_ticker_and_spy_exactly():
 
 def test_append_only_consumption_reservation_is_atomic_and_irreversible(tmp_path):
     ledger = tmp_path / "consumption.jsonl"
-    with patch.object(main, "_canonical_consumption_ledger_path", return_value=ledger):
-        reservation = main._reserve_final_consumption("lock-sha")
-        with pytest.raises(RuntimeError, match="already has"):
-            main._reserve_final_consumption("lock-sha")
+    barrier = threading.Barrier(2)
+
+    def attempt_reservation():
+        barrier.wait()
+        try:
+            return ("reserved", main._reserve_final_consumption("lock-sha"))
+        except RuntimeError as exc:
+            return ("rejected", str(exc))
+
+    with (
+        patch.object(main, "_canonical_consumption_ledger_path", return_value=ledger),
+        patch.object(main, "_git_state", return_value={"commit": "canary"}),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        outcomes = list(pool.map(lambda _: attempt_reservation(), range(2)))
+        reservation = next(value for status, value in outcomes if status == "reserved")
+        assert sum(status == "reserved" for status, _ in outcomes) == 1
+        assert sum(status == "rejected" for status, _ in outcomes) == 1
         main._append_consumption_event(
             "lock-sha", reservation, "failed", {"error": "canary"}
         )
@@ -469,3 +494,10 @@ def test_final_claim_requires_power_null_constant_and_multiplicity_gates():
     assert result["claim_gates"]["pre_final_bonferroni_gate"] is False
     assert result["verdict"] == "no_validated_profit_claim"
     assert result["runtime"] == {"python": "canary"}
+
+
+def test_verifier_hardcodes_repository_lock_sha_and_ancestor():
+    assert main.EXPECTED_FINAL_LOCK_SHA256 == main._sha256_file(
+        main._canonical_final_lock_path()
+    )
+    assert main.FINAL_LOCK_COMMIT == "fb83710e4f615ff0e6a676f0fa661c337211daaa"

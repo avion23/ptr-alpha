@@ -64,8 +64,10 @@ FINAL_TEST_DATES = pd.DatetimeIndex(
         )
     )
 )
-EXPECTED_FINAL_LOCK_SHA256: str | None = None
-FINAL_LOCK_COMMIT: str | None = None
+EXPECTED_FINAL_LOCK_SHA256: str | None = (
+    "b36850601d3a28cdd0dd3e6ddb3b3554fde1ac79d3a9683e512b1abeccf094a1"
+)
+FINAL_LOCK_COMMIT: str | None = "fb83710e4f615ff0e6a676f0fa661c337211daaa"
 HORIZON = 90
 REBALANCE_DAYS = HORIZON
 LOOKBACK_DAYS = 60
@@ -853,6 +855,11 @@ def evaluate_locked_final(lock_path: Path, db_path: Path) -> Path:
         family = _run_strict_final_family(
             entry_prices, transactions, prices, precomputed, chosen, lock
         )
+        _, post_run_lock_sha = _load_and_verify_repository_lock(lock_path)
+        if post_run_lock_sha != lock_sha:
+            raise RuntimeError("Final lock changed during evaluation")
+        if _sha256_file(db_path) != db_sha:
+            raise RuntimeError("Database file changed during final evaluation")
         result = _final_claim_result(lock, lock_sha, db_sha, runtime, family)
         result["reservation_id"] = reservation_id
         result["consumption_ledger"] = str(_canonical_consumption_ledger_path())
@@ -940,7 +947,7 @@ def _run_strict_final(precomputed: dict, prices: pd.DataFrame, scorer, params) -
         weights = _portfolio_weights(
             selected["signal_score"].to_numpy(), str(params["allocation"])
         )
-        ticker_returns, spy_return, endpoints = _strict_endpoint_returns(
+        ticker_returns, spy_return, endpoint_rows = _strict_endpoint_returns(
             selected["ticker"].astype(str).tolist(),
             prices,
             data["as_of_ts"],
@@ -955,8 +962,8 @@ def _run_strict_final(precomputed: dict, prices: pd.DataFrame, scorer, params) -
                 "n_positions": top_n,
             }
         )
-        for ticker, ticker_return, weight in zip(
-            selected["ticker"], ticker_returns, weights
+        for ticker, ticker_return, weight, endpoints in zip(
+            selected["ticker"], ticker_returns, weights, endpoint_rows
         ):
             position_rows.append(
                 {
@@ -1001,6 +1008,7 @@ def _strict_endpoint_returns(tickers, prices, as_of, horizon):
     spy_return = (spy_exit * 0.999 / (spy_entry * 1.001) - 1) * 100
 
     returns = []
+    endpoint_rows = []
     for ticker in tickers:
         if ticker not in prices.columns:
             raise RuntimeError(f"Final ticker {ticker} has no price column")
@@ -1012,16 +1020,17 @@ def _strict_endpoint_returns(tickers, prices, as_of, horizon):
         if pd.isna(entry) or pd.isna(exit_price) or entry <= 0 or exit_price <= 0:
             raise RuntimeError(f"Final ticker {ticker} has invalid endpoint prices")
         returns.append((float(exit_price) * 0.999 / (float(entry) * 1.001) - 1) * 100)
-    return (
-        np.asarray(returns),
-        spy_return,
-        {
-            "entry_date": entry_date.date().isoformat(),
-            "exit_date": exit_date.date().isoformat(),
-            "spy_entry_price": spy_entry,
-            "spy_exit_price": spy_exit,
-        },
-    )
+        endpoint_rows.append(
+            {
+                "entry_date": entry_date.date().isoformat(),
+                "exit_date": exit_date.date().isoformat(),
+                "ticker_entry_price": float(entry),
+                "ticker_exit_price": float(exit_price),
+                "spy_entry_price": spy_entry,
+                "spy_exit_price": spy_exit,
+            }
+        )
+    return np.asarray(returns), spy_return, endpoint_rows
 
 
 def _final_claim_result(lock, lock_sha, db_sha, runtime, family) -> dict:
@@ -1049,11 +1058,20 @@ def _final_claim_result(lock, lock_sha, db_sha, runtime, family) -> dict:
             for row in strategy["period_results"]
         ),
     }
+    current_sources, current_source_aggregate = _source_hashes()
     return {
         "lock_sha256": lock_sha,
         "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
         "db_whole_file_sha256": db_sha,
+        "locked_config_sha256": lock["config_sha256"],
+        "locked_analytic_source_sha256": lock["analytic_source_sha256"],
+        "locked_analytic_source_aggregate_sha256": lock[
+            "analytic_source_aggregate_sha256"
+        ],
+        "evaluation_source_sha256": current_sources,
+        "evaluation_source_aggregate_sha256": current_source_aggregate,
         "runtime": runtime,
+        "runtime_fingerprint": _locked_runtime_fingerprint(),
         "git": _git_state(),
         "strategy_metrics": {key: strategy[key] for key in METRIC_KEYS},
         "constant_metrics": {key: constant[key] for key in METRIC_KEYS},

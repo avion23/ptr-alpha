@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -97,9 +97,13 @@ _PAPER_ARTIFACT_RE = re.compile(
 class SenateReportFetchResult:
     outcome: ReportOutcome
     transactions: tuple[dict, ...] = ()
-    artifact_sha256: str | None = None
-    paper_artifact_url: str | None = None
+    landing_sha256: str | None = None
+    paper_artifact_sha256: str | None = None
     error_message: str | None = None
+
+    @property
+    def transaction_artifact_sha256(self) -> str | None:
+        return self.landing_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +124,7 @@ class SenateRefreshSummary:
 
     @property
     def complete(self) -> bool:
-        return self.failed == 0
+        return self.failed == 0 and self.unavailable == 0
 
     def require_complete(self) -> None:
         if not self.complete:
@@ -432,54 +436,112 @@ class SenateEFDSource(TransactionSource):
     @classmethod
     def _resolve_ticker(
         cls, ticker_raw: str, asset_name: str, asset_type: str
-    ) -> tuple[str | None, TickerOrigin]:
+    ) -> tuple[str | None, str | None, TickerOrigin]:
         raw = ticker_raw.strip().upper()
         if raw and raw != "--":
             if not _EQUITY_TICKER_RE.fullmatch(raw):
-                return None, TickerOrigin.INVALID
-            return raw, TickerOrigin.OFFICIAL
+                return None, None, TickerOrigin.INVALID
+            return raw, None, TickerOrigin.OFFICIAL
 
         if cls._is_non_equity_asset(asset_name, asset_type):
-            return None, TickerOrigin.NON_EQUITY
+            return None, None, TickerOrigin.NON_EQUITY
 
         inferred = _extract_ticker(asset_name)
         if not inferred:
-            return None, TickerOrigin.MISSING
+            return None, None, TickerOrigin.MISSING
         inferred = inferred.strip().upper()
         if inferred in _RESERVED_INFERRED_TICKERS:
-            return None, TickerOrigin.INVALID
+            return None, inferred, TickerOrigin.INVALID
         if not _EQUITY_TICKER_RE.fullmatch(inferred):
-            return None, TickerOrigin.INVALID
+            return None, inferred, TickerOrigin.INVALID
 
         asset_class = cls._normalize_instrument_type(asset_type)
         if asset_class in {"stock", "fund", "call", "put"}:
-            return inferred, TickerOrigin.ASSET_DESCRIPTION
-        return inferred, TickerOrigin.UNVERIFIED
+            return inferred, None, TickerOrigin.ASSET_DESCRIPTION
+        return None, inferred, TickerOrigin.UNVERIFIED
+
+    @staticmethod
+    def _official_url_matches(actual_url: str, expected_url: str) -> bool:
+        try:
+            actual = urlparse(str(actual_url))
+            expected = urlparse(expected_url)
+            actual_port = actual.port
+        except (TypeError, ValueError):
+            return False
+        return (
+            actual.scheme == "https"
+            and actual.hostname == "efdsearch.senate.gov"
+            and actual.username is None
+            and actual.password is None
+            and actual_port in {None, 443}
+            and actual.path.rstrip("/") == expected.path.rstrip("/")
+        )
 
     @staticmethod
     def _paper_artifact_url(soup: BeautifulSoup) -> str | None:
         for link in soup.find_all("a", href=True):
             href = str(link.get("href") or "").strip()
-            if _PAPER_ARTIFACT_RE.search(href):
-                return urljoin(EFD_BASE, href)
+            if not _PAPER_ARTIFACT_RE.search(href):
+                continue
+            absolute = urljoin(EFD_BASE, href)
+            try:
+                parsed = urlparse(absolute)
+                parsed_port = parsed.port
+            except ValueError:
+                continue
+            if (
+                parsed.scheme == "https"
+                and parsed.hostname == "efdsearch.senate.gov"
+                and parsed.username is None
+                and parsed.password is None
+                and parsed_port in {None, 443}
+                and (
+                    parsed.path.startswith("/media/")
+                    or parsed.path.startswith("/search/view/paper/")
+                    or parsed.path.startswith("/search/view/paper-filing/")
+                )
+            ):
+                return absolute
         return None
+
+    def _fetch_paper_artifact(self, paper_url: str) -> tuple[str | None, str | None]:
+        response = self._request_with_retry("GET", paper_url)
+        if not self._official_url_matches(response.url, paper_url):
+            return None, "paper artifact redirected outside its official path"
+        if response.status_code != 200:
+            return None, f"paper artifact returned HTTP {response.status_code}"
+        content = response.content
+        if not content.startswith(b"%PDF-"):
+            return None, "paper artifact response is not a PDF"
+        return hashlib.sha256(content).hexdigest(), None
 
     def _fetch_report_transactions(self, report_path: str) -> SenateReportFetchResult:
         """GET one PTR detail and return a classified, hashed parse result."""
-        resp = self._request_with_retry("GET", f"{EFD_BASE}{report_path}")
+        expected_url = f"{EFD_BASE}{report_path}"
+        resp = self._request_with_retry("GET", expected_url)
+        landing_sha256 = hashlib.sha256(resp.content).hexdigest()
+        if not self._official_url_matches(resp.url, expected_url):
+            return SenateReportFetchResult(
+                outcome=ReportOutcome.FAILED,
+                landing_sha256=landing_sha256,
+                error_message=(
+                    f"eFD filing {report_path} redirected outside its official path"
+                ),
+            )
         if resp.status_code in (404, 410):
             logger.warning(
                 "eFD filing %s unavailable (HTTP %d)",
                 report_path,
                 resp.status_code,
             )
-            return SenateReportFetchResult(outcome=ReportOutcome.UNAVAILABLE)
-
-        artifact_sha256 = hashlib.sha256(resp.content).hexdigest()
+            return SenateReportFetchResult(
+                outcome=ReportOutcome.UNAVAILABLE,
+                landing_sha256=landing_sha256,
+            )
         if resp.status_code != 200:
             return SenateReportFetchResult(
                 outcome=ReportOutcome.FAILED,
-                artifact_sha256=artifact_sha256,
+                landing_sha256=landing_sha256,
                 error_message=(
                     f"eFD filing {report_path} returned HTTP {resp.status_code}"
                 ),
@@ -490,7 +552,7 @@ class SenateEFDSource(TransactionSource):
         if "periodic transaction report" not in title.lower():
             return SenateReportFetchResult(
                 outcome=ReportOutcome.FAILED,
-                artifact_sha256=artifact_sha256,
+                landing_sha256=landing_sha256,
                 error_message=(
                     f"eFD filing {report_path} returned an unrecognized page: "
                     f"title={title!r}"
@@ -500,18 +562,26 @@ class SenateEFDSource(TransactionSource):
         table = soup.find("table", {"class": "table-striped"})
         if table is None:
             paper_artifact_url = self._paper_artifact_url(soup)
-            if paper_artifact_url:
+            if not paper_artifact_url:
                 return SenateReportFetchResult(
-                    outcome=ReportOutcome.PAPER_ONLY,
-                    artifact_sha256=artifact_sha256,
-                    paper_artifact_url=paper_artifact_url,
+                    outcome=ReportOutcome.FAILED,
+                    landing_sha256=landing_sha256,
+                    error_message=(
+                        f"PTR {report_path} has no transaction table or "
+                        "allowlisted paper artifact link"
+                    ),
+                )
+            paper_sha256, paper_error = self._fetch_paper_artifact(paper_artifact_url)
+            if paper_error:
+                return SenateReportFetchResult(
+                    outcome=ReportOutcome.FAILED,
+                    landing_sha256=landing_sha256,
+                    error_message=paper_error,
                 )
             return SenateReportFetchResult(
-                outcome=ReportOutcome.FAILED,
-                artifact_sha256=artifact_sha256,
-                error_message=(
-                    f"PTR {report_path} has no transaction table or paper artifact link"
-                ),
+                outcome=ReportOutcome.PAPER_ONLY,
+                landing_sha256=landing_sha256,
+                paper_artifact_sha256=paper_sha256,
             )
 
         thead = table.find("thead")
@@ -519,7 +589,7 @@ class SenateEFDSource(TransactionSource):
         if thead is None or tbody is None:
             return SenateReportFetchResult(
                 outcome=ReportOutcome.FAILED,
-                artifact_sha256=artifact_sha256,
+                landing_sha256=landing_sha256,
                 error_message=f"PTR {report_path} has no parseable header/body",
             )
         headers = [
@@ -533,7 +603,7 @@ class SenateEFDSource(TransactionSource):
         if missing:
             return SenateReportFetchResult(
                 outcome=ReportOutcome.FAILED,
-                artifact_sha256=artifact_sha256,
+                landing_sha256=landing_sha256,
                 error_message=(
                     f"PTR {report_path} table missing columns {sorted(missing)}; "
                     f"headers={headers}"
@@ -555,7 +625,7 @@ class SenateEFDSource(TransactionSource):
             asset_name = cell("asset_name")
             asset_type = cell("asset_type")
             ticker_raw = cell("ticker")
-            ticker, ticker_origin = self._resolve_ticker(
+            ticker, ticker_candidate, ticker_origin = self._resolve_ticker(
                 ticker_raw, asset_name, asset_type
             )
             owner_raw = cell("owner")
@@ -572,6 +642,7 @@ class SenateEFDSource(TransactionSource):
                     "source_row_id": source_row_id,
                     "ticker": ticker,
                     "ticker_raw": ticker_raw or None,
+                    "ticker_candidate": ticker_candidate,
                     "ticker_origin": ticker_origin.value,
                     "asset_name": asset_name,
                     "asset_type": asset_type,
@@ -589,13 +660,25 @@ class SenateEFDSource(TransactionSource):
         if not out:
             return SenateReportFetchResult(
                 outcome=ReportOutcome.FAILED,
-                artifact_sha256=artifact_sha256,
+                landing_sha256=landing_sha256,
                 error_message=f"PTR {report_path} transaction table is empty",
+            )
+        source_row_ids = [str(row.get("source_row_id") or "").strip() for row in out]
+        if any(not source_row_id for source_row_id in source_row_ids) or len(
+            source_row_ids
+        ) != len(set(source_row_ids)):
+            return SenateReportFetchResult(
+                outcome=ReportOutcome.FAILED,
+                transactions=tuple(out),
+                landing_sha256=landing_sha256,
+                error_message=(
+                    f"PTR {report_path} has blank or duplicate source row IDs"
+                ),
             )
         return SenateReportFetchResult(
             outcome=ReportOutcome.PARSED,
             transactions=tuple(out),
-            artifact_sha256=artifact_sha256,
+            landing_sha256=landing_sha256,
         )
 
     def fetch_all_trades(
@@ -637,7 +720,9 @@ class SenateEFDSource(TransactionSource):
 
             raw_row_count = len(result.transactions)
             accepted_row_count = 0
-            rejected_row_count = 0
+            rejected_row_count = (
+                raw_row_count if result.outcome is ReportOutcome.FAILED else 0
+            )
             if result.outcome is ReportOutcome.PARSED:
                 report_rows = [
                     {
@@ -649,7 +734,7 @@ class SenateEFDSource(TransactionSource):
                         "official_filing_date": report["filed_date"],
                         "available_date": report["filed_date"],
                         "amends_source_record_id": None,
-                        "artifact_sha256": result.artifact_sha256,
+                        "artifact_sha256": result.transaction_artifact_sha256,
                         "ingestion_generation": self.ingestion_generation,
                         **transaction,
                     }
@@ -662,7 +747,8 @@ class SenateEFDSource(TransactionSource):
                     rejected_row_count = exc.rejected_count
                     result = SenateReportFetchResult(
                         outcome=ReportOutcome.FAILED,
-                        artifact_sha256=result.artifact_sha256,
+                        landing_sha256=result.landing_sha256,
+                        paper_artifact_sha256=result.paper_artifact_sha256,
                         error_message=str(exc),
                     )
                 else:
@@ -678,8 +764,9 @@ class SenateEFDSource(TransactionSource):
                     "member": report["senator"],
                     "official_filing_date": report["filed_date"],
                     "outcome": result.outcome.value,
-                    "artifact_sha256": result.artifact_sha256,
-                    "paper_artifact_url": result.paper_artifact_url,
+                    "artifact_sha256": result.transaction_artifact_sha256,
+                    "landing_sha256": result.landing_sha256,
+                    "paper_artifact_sha256": result.paper_artifact_sha256,
                     "error_message": result.error_message,
                     "raw_row_count": raw_row_count,
                     "accepted_row_count": accepted_row_count,
@@ -745,6 +832,30 @@ class SenateEFDSource(TransactionSource):
         except ValueError:
             return d.replace(year=d.year - 1, day=28)
 
+    @staticmethod
+    def _dates_are_valid(
+        transaction_date: pd.Timestamp | None,
+        official_filing_date: pd.Timestamp | None,
+        available_date: pd.Timestamp | None,
+        notification_date: pd.Timestamp | None,
+    ) -> bool:
+        required = (transaction_date, official_filing_date, available_date)
+        if any(value is None or not pd.notna(value) for value in required):
+            return False
+        minimum = pd.Timestamp("1900-01-01")
+        maximum = pd.Timestamp(date.today() + timedelta(days=1))
+        if any(value < minimum or value > maximum for value in required):
+            return False
+        if transaction_date > available_date:
+            return False
+        if available_date != official_filing_date:
+            return False
+        if notification_date is None:
+            return True
+        if not pd.notna(notification_date):
+            return False
+        return transaction_date <= notification_date <= official_filing_date
+
     def _normalize(self, trades: list[dict]) -> pd.DataFrame:
         columns = [
             "doc_id",
@@ -757,6 +868,7 @@ class SenateEFDSource(TransactionSource):
             "chamber_member_key",
             "ticker",
             "raw_ticker",
+            "ticker_candidate",
             "ticker_origin",
             "transaction_date",
             "disclosure_date",
@@ -789,11 +901,9 @@ class SenateEFDSource(TransactionSource):
                 transaction.get("amount_range")
             )
             member = transaction.get("senator")
-            available_date = self._parse_date(
-                transaction.get("available_date") or transaction.get("filed_date")
-            )
+            available_date = self._parse_date(transaction.get("available_date"))
             official_filing_date = self._parse_date(
-                transaction.get("official_filing_date") or transaction.get("filed_date")
+                transaction.get("official_filing_date")
             )
             row = {
                 "doc_id": transaction.get("doc_id"),
@@ -808,6 +918,7 @@ class SenateEFDSource(TransactionSource):
                 ),
                 "ticker": transaction.get("ticker"),
                 "raw_ticker": transaction.get("ticker_raw"),
+                "ticker_candidate": transaction.get("ticker_candidate"),
                 "ticker_origin": transaction.get("ticker_origin"),
                 "transaction_date": self._parse_date(
                     transaction.get("transaction_date")
@@ -838,37 +949,67 @@ class SenateEFDSource(TransactionSource):
             }
             if (
                 not row["doc_id"]
-                or not row["source_record_id"]
+                or not str(row["source_record_id"] or "").strip()
                 or not row["member"]
-                or row["transaction_date"] is None
-                or row["official_filing_date"] is None
-                or row["available_date"] is None
+                or not str(row["source_row_id"] or "").strip()
+                or not self._dates_are_valid(
+                    row["transaction_date"],
+                    row["official_filing_date"],
+                    row["available_date"],
+                    row["notification_date"],
+                )
                 or row["transaction_type"] not in {"Purchase", "Sale", "Exchange"}
                 or not row["raw_transaction_subtype"]
                 or not row["amount_raw"]
                 or not row["raw_asset_description"]
                 or not row["ticker_origin"]
+                or (
+                    row["ticker_origin"] == TickerOrigin.UNVERIFIED.value
+                    and (row["ticker"] is not None or not row["ticker_candidate"])
+                )
                 or not row["artifact_sha256"]
             ):
                 rejected += 1
                 continue
             rows.append(row)
+
+        frame = pd.DataFrame(rows, columns=columns)
+        if not frame.empty:
+            duplicate_mask = frame.duplicated(
+                subset=["source_record_id", "source_row_id"], keep=False
+            )
+            duplicate_count = int(duplicate_mask.sum())
+            if duplicate_count:
+                rejected += duplicate_count
+                frame = frame.loc[~duplicate_mask].copy()
         if rejected:
             raise SenateRowValidationError(
                 raw_count=len(trades),
-                accepted_count=len(rows),
+                accepted_count=len(frame),
                 rejected_count=rejected,
             )
-        return pd.DataFrame(rows, columns=columns)
+        return frame
 
     @staticmethod
     def _parse_date(value):
-        if not value:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
             return None
         try:
-            return pd.Timestamp(value)
-        except Exception:
+            if not pd.notna(value):
+                return None
+        except (TypeError, ValueError):
             return None
+        try:
+            parsed = pd.Timestamp(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not pd.notna(parsed):
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.tz_convert("UTC").tz_localize(None)
+        return parsed.normalize()
 
     @staticmethod
     def _normalize_tx_type(raw):
@@ -957,6 +1098,7 @@ class SenateEFDSource(TransactionSource):
         required_values = [
             "chamber",
             "source_record_id",
+            "source_row_id",
             "official_filing_date",
             "available_date",
             "raw_transaction_subtype",
@@ -967,6 +1109,32 @@ class SenateEFDSource(TransactionSource):
         ]
         if not df.empty and df[required_values].isna().any().any():
             raise SenateEFDError("Senate transaction provenance values are incomplete")
+        if not df.empty and (
+            df["source_record_id"].astype(str).str.strip().eq("").any()
+            or df["source_row_id"].astype(str).str.strip().eq("").any()
+        ):
+            raise SenateEFDError(
+                "Senate source_record_id/source_row_id values must be nonblank"
+            )
+        if (
+            not df.empty
+            and df.duplicated(
+                subset=["source_record_id", "source_row_id"], keep=False
+            ).any()
+        ):
+            raise SenateEFDError(
+                "Senate source_record_id/source_row_id values must be unique"
+            )
+        if (
+            not df.empty
+            and (
+                df["ticker_origin"].eq(TickerOrigin.UNVERIFIED.value)
+                & df["ticker"].notna()
+            ).any()
+        ):
+            raise SenateEFDError(
+                "Unverified Senate ticker candidates cannot be canonical tickers"
+            )
         if not df.empty and (
             not df["chamber"].eq(Chamber.SENATE.value).all()
             or not df["ingestion_generation"].eq(self.ingestion_generation).all()
@@ -988,16 +1156,19 @@ class SenateEFDSource(TransactionSource):
                     "Senate report inventory chamber/generation does not match refresh"
                 )
             artifact_sha256 = report.get("artifact_sha256")
-            if (
-                report.get("outcome")
-                in {
-                    ReportOutcome.PARSED.value,
-                    ReportOutcome.PAPER_ONLY.value,
-                }
-                and not artifact_sha256
-            ):
+            landing_sha256 = report.get("landing_sha256")
+            paper_sha256 = report.get("paper_artifact_sha256")
+            outcome = report.get("outcome")
+            if outcome in {
+                ReportOutcome.PARSED.value,
+                ReportOutcome.PAPER_ONLY.value,
+            } and (not artifact_sha256 or not landing_sha256):
                 raise SenateEFDError(
-                    f"Senate report artifact hash missing: {source_record_id}"
+                    f"Senate report landing hash missing: {source_record_id}"
+                )
+            if outcome == ReportOutcome.PAPER_ONLY.value and not paper_sha256:
+                raise SenateEFDError(
+                    f"Senate paper artifact hash missing: {source_record_id}"
                 )
             previous = report_hashes.setdefault(source_record_id, artifact_sha256)
             if previous != artifact_sha256:

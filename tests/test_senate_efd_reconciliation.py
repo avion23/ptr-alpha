@@ -30,6 +30,7 @@ def _raw_trade(**overrides):
     trade = {
         "doc_id": KATIE_REPORT_ID,
         "source_record_id": KATIE_REPORT_ID,
+        "source_row_id": "official:1",
         "source_report_path": KATIE_REPORT_PATH,
         "senator": "Katie Britt",
         "filed_date": pd.Timestamp("2026-01-29"),
@@ -63,6 +64,7 @@ def test_katie_britt_jpm_canary_preserves_provenance_and_normalizes_sale():
     row = result.iloc[0]
     assert row["chamber"] == "senate"
     assert row["source_record_id"] == KATIE_REPORT_ID
+    assert row["source_row_id"] == "official:1"
     assert row["chamber_member_key"] == "senate:KATIE BRITT"
     assert row["ticker"] == "JPM"
     assert row["ticker_origin"] == "official"
@@ -99,12 +101,12 @@ def test_report_html_preserves_raw_fields_and_artifact_hash():
     <html><head><title>eFD: Print Periodic Transaction Report</title></head><body>
     <table class="table-striped">
       <thead><tr>
-        <th>Transaction Date</th><th>Notification Date</th><th>Owner</th>
+        <th>#</th><th>Transaction Date</th><th>Notification Date</th><th>Owner</th>
         <th>Ticker</th><th>Asset Name</th><th>Asset Type</th>
         <th>Type</th><th>Amount</th>
       </tr></thead>
       <tbody><tr>
-        <td>01/28/2026</td><td>01/29/2026</td><td>Spouse</td>
+        <td>1</td><td>01/28/2026</td><td>01/29/2026</td><td>Spouse</td>
         <td>JPM</td><td>JPMorgan Chase &amp; Co. Common Stock</td><td>Stock</td>
         <td>Sale (Full)</td><td>$1,001 - $15,000</td>
       </tr></tbody>
@@ -126,6 +128,7 @@ def test_report_html_preserves_raw_fields_and_artifact_hash():
     assert result.artifact_sha256 == hashlib.sha256(html.encode()).hexdigest()
     assert result.transactions == (
         {
+            "source_row_id": "official:1",
             "ticker": "JPM",
             "ticker_raw": "JPM",
             "ticker_origin": "official",
@@ -143,9 +146,39 @@ def test_report_html_preserves_raw_fields_and_artifact_hash():
     )
 
 
+def test_report_without_official_row_id_uses_artifact_order_key():
+    html = """
+    <html><head><title>eFD: Print Periodic Transaction Report</title></head><body>
+    <table class="table-striped">
+      <thead><tr>
+        <th>Transaction Date</th><th>Owner</th><th>Ticker</th>
+        <th>Asset Name</th><th>Asset Type</th><th>Type</th><th>Amount</th>
+      </tr></thead>
+      <tbody><tr>
+        <td>01/28/2026</td><td>Spouse</td><td>JPM</td>
+        <td>JPMorgan Chase</td><td>Stock</td><td>Sale (Full)</td>
+        <td>$1,001 - $15,000</td>
+      </tr></tbody>
+    </table></body></html>
+    """
+
+    class Response:
+        status_code = 200
+        text = html
+        content = html.encode()
+
+    source = _source()
+    source._request_with_retry = lambda *args, **kwargs: Response()
+
+    result = source._fetch_report_transactions(KATIE_REPORT_PATH)
+
+    assert result.outcome is ReportOutcome.PARSED
+    assert result.transactions[0]["source_row_id"] == "table:000001"
+
+
 def test_same_and_cross_report_rows_are_never_collapsed_without_row_ids():
     first = _raw_trade()
-    same_report_duplicate = _raw_trade()
+    same_report_duplicate = _raw_trade(source_row_id="official:2")
     second_report_id = "22222222-2222-2222-2222-222222222222"
     cross_report_duplicate = _raw_trade(
         doc_id=second_report_id,
@@ -166,6 +199,11 @@ def test_same_and_cross_report_rows_are_never_collapsed_without_row_ids():
         KATIE_REPORT_ID,
         KATIE_REPORT_ID,
         second_report_id,
+    ]
+    assert result["source_row_id"].tolist() == [
+        "official:1",
+        "official:2",
+        "official:1",
     ]
     assert result["available_date"].tolist() == [
         pd.Timestamp("2026-01-29"),

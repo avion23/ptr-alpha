@@ -63,6 +63,7 @@ _UUID_RE = re.compile(
 )
 
 _HEADER_NAME_MAP = {
+    "source_row_id": "#",
     "transaction_date": "transaction date",
     "notification_date": "notification date",
     "owner": "owner",
@@ -540,7 +541,7 @@ class SenateEFDSource(TransactionSource):
             )
 
         out: list[dict] = []
-        for tr in tbody.find_all("tr"):
+        for row_position, tr in enumerate(tbody.find_all("tr"), start=1):
             cells = [td.get_text(strip=True) for td in tr.find_all("td")]
             if not cells:
                 continue
@@ -560,8 +561,15 @@ class SenateEFDSource(TransactionSource):
             owner_raw = cell("owner")
             tx_subtype_raw = cell("tx_type")
             amount_raw = cell("amount")
+            official_row_id = cell("source_row_id").strip()
+            source_row_id = (
+                f"official:{official_row_id}"
+                if official_row_id
+                else f"table:{row_position:06d}"
+            )
             out.append(
                 {
+                    "source_row_id": source_row_id,
                     "ticker": ticker,
                     "ticker_raw": ticker_raw or None,
                     "ticker_origin": ticker_origin.value,
@@ -742,6 +750,7 @@ class SenateEFDSource(TransactionSource):
             "doc_id",
             "chamber",
             "source_record_id",
+            "source_row_id",
             "source_report_path",
             "member",
             "member_key",
@@ -790,6 +799,7 @@ class SenateEFDSource(TransactionSource):
                 "doc_id": transaction.get("doc_id"),
                 "chamber": Chamber.SENATE.value,
                 "source_record_id": transaction.get("source_record_id"),
+                "source_row_id": transaction.get("source_row_id"),
                 "source_report_path": transaction.get("source_report_path"),
                 "member": member,
                 "member_key": canonical_member_key(member),
@@ -926,6 +936,7 @@ class SenateEFDSource(TransactionSource):
         required_columns = {
             "chamber",
             "source_record_id",
+            "source_row_id",
             "official_filing_date",
             "available_date",
             "notification_date",

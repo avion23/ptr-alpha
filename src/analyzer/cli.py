@@ -32,6 +32,7 @@ app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=
 logger = logging.getLogger(__name__)
 _CURRENT_YEAR = date.today().year
 _HOUSE_PTR_FIRST_ARCHIVE_YEAR = 2015
+_HOUSE_LEGACY_FIRST_ARCHIVE_YEAR = 2008
 _BACKTEST_DEFAULTS = {
     name: field.default for name, field in BacktestParams.__dataclass_fields__.items()
 }
@@ -1052,7 +1053,10 @@ def refresh(
         False,
         "--all-years",
         "--full-history",
-        help="Refresh every official House PTR archive from 2015 through today",
+        help=(
+            "Refresh the currently downloadable official House PTR scope "
+            "(2015 through today); legacy archives are inventoried as excluded"
+        ),
     ),
     force_full_reparse: bool = typer.Option(
         False,
@@ -1073,6 +1077,16 @@ def refresh(
         if all_years
         else [year]
     )
+
+    if all_years:
+        excluded_years = list(
+            range(_HOUSE_LEGACY_FIRST_ARCHIVE_YEAR, _HOUSE_PTR_FIRST_ARCHIVE_YEAR)
+        )
+        print(
+            "Official downloadable scope starts in 2015; "
+            f"excluded legacy archive count={len(excluded_years)} "
+            f"({excluded_years[0]}-{excluded_years[-1]}), PDF inventory unavailable"
+        )
 
     count_before = app_ctx.transaction_source.db.conn.execute(
         "SELECT COUNT(*) FROM transactions"
@@ -1162,6 +1176,22 @@ def refresh(
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 
+    for archive_year in archive_years:
+        unresolved = app_ctx.transaction_source.db.get_unresolved_house_doc_ids(
+            archive_year
+        )
+        if not unresolved:
+            app_ctx.transaction_source.db.mark_house_generation_parse_complete(
+                archive_year
+            )
+            continue
+        failed_steps.append(f"unresolved_house:{archive_year}")
+        preview = ", ".join(unresolved[:10])
+        print(
+            f"  House {archive_year} generation incomplete: "
+            f"{len(unresolved)} unresolved PDFs ({preview})"
+        )
+
     count_after = app_ctx.transaction_source.db.conn.execute(
         "SELECT COUNT(*) FROM transactions"
     ).fetchone()[0]
@@ -1183,8 +1213,9 @@ def refresh(
     )
 
     added = count_after - count_before
+    outcome = "Incomplete." if failed_steps else "Done."
     print(
-        f"\nDone. {count_before} -> {count_after} transactions "
+        f"\n{outcome} {count_before} -> {count_after} transactions "
         f"({'+' if added >= 0 else ''}{added} new)"
     )
     print(f"Latest transaction date: {max_date} (eligible: not after disclosure)")

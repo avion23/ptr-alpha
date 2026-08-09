@@ -18,24 +18,32 @@ class ParseRunRepository:
         raw_row_count: int,
         transaction_count: int,
         error_message: str | None = None,
+        artifact_sha256: str | None = None,
         _in_transaction: bool = False,
     ) -> None:
         if not _in_transaction:
             self.conn.execute("BEGIN TRANSACTION")
         try:
-            # Replace only this parser fingerprint. Other deterministic/OCR
-            # provenance for the same document remains auditable.
+            # Replace only this parser + artifact fingerprint. Prior artifact
+            # generations and OCR provenance remain auditable.
             self.conn.execute(
-                "DELETE FROM pdf_parse_runs "
-                "WHERE doc_id = ? AND parser_version = ?",
-                [doc_id, parser_version],
+                """
+                DELETE FROM pdf_parse_runs
+                WHERE doc_id = ? AND parser_version = ?
+                  AND (
+                    artifact_sha256 = ?
+                    OR (artifact_sha256 IS NULL AND ? IS NULL)
+                  )
+                """,
+                [doc_id, parser_version, artifact_sha256, artifact_sha256],
             )
             self.conn.execute(
                 """
                 INSERT INTO pdf_parse_runs (
                     doc_id, year, parser_version, status, engines_attempted,
-                    raw_row_count, transaction_count, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    raw_row_count, transaction_count, error_message,
+                    artifact_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 [
                     doc_id,
@@ -46,6 +54,7 @@ class ParseRunRepository:
                     raw_row_count,
                     transaction_count,
                     error_message,
+                    artifact_sha256,
                 ],
             )
             if not _in_transaction:
@@ -55,16 +64,25 @@ class ParseRunRepository:
                 self.conn.execute("ROLLBACK")
             raise
 
-    def get_cached_doc_ids(self, *, year: int, parser_version: str) -> set[str]:
-        """doc_ids with a terminal (non-error) parse_run for this year + parser_version.
-
-        These PDFs need not be re-parsed: their result is deterministic for the
-        given parser_version. 'error' runs are excluded so failures get retried.
-        """
+    def get_cached_doc_ids(
+        self,
+        *,
+        year: int,
+        parser_version: str,
+        artifact_hashes: dict[str, str],
+    ) -> set[str]:
+        """Return terminal runs only when parser and artifact bytes match."""
         rows = self.conn.execute(
-            "SELECT doc_id FROM pdf_parse_runs "
-            "WHERE year = ? AND parser_version = ? "
-            "AND status IN ('success', 'zero_rows', 'no_txs')",
+            """
+            SELECT doc_id, artifact_sha256 FROM pdf_parse_runs
+            WHERE year = ? AND parser_version = ?
+              AND status IN ('success', 'zero_rows', 'no_txs')
+            """,
             [year, parser_version],
         ).fetchall()
-        return {str(r[0]) for r in rows}
+        return {
+            str(doc_id)
+            for doc_id, artifact_sha256 in rows
+            if artifact_sha256
+            and artifact_hashes.get(str(doc_id)) == str(artifact_sha256)
+        }

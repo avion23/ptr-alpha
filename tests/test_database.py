@@ -19,7 +19,7 @@ from .conftest import DatabaseTestCase
 
 
 
-def test_database_backfills_archive_year_for_legacy_metadata(tmp_path):
+def test_database_keeps_legacy_archive_year_unknown_and_nonauthoritative(tmp_path):
     db_path = tmp_path / "legacy.duckdb"
     connection = duckdb.connect(str(db_path))
     connection.execute(
@@ -36,19 +36,28 @@ def test_database_backfills_archive_year_for_legacy_metadata(tmp_path):
     )
     connection.execute(
         "INSERT INTO metadata VALUES "
-        "('legacy', 'First', 'Last', '2024-12-31', 'P', '2025-01-01')"
+        "('8218519', 'Michael', 'McCaul', '2022-01-04', 'P', '2022-01-05')"
     )
     connection.close()
 
     db = Database(db_path)
     try:
         archive_year = db.conn.execute(
-            "SELECT archive_year FROM metadata WHERE doc_id = 'legacy'"
+            "SELECT archive_year FROM metadata WHERE doc_id = '8218519'"
         ).fetchone()[0]
     finally:
         db.close()
 
-    assert archive_year == 2024
+    assert archive_year is None
+
+    db = Database(db_path)
+    try:
+        assert not db.metadata_exists(2021)
+        assert not db.metadata_exists(2022)
+        assert db.get_metadata(2021).empty
+        assert db.get_metadata(2022).empty
+    finally:
+        db.close()
 
 
 def test_database_adds_nullable_cross_source_columns_without_backfill(tmp_path):
@@ -121,6 +130,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "Old",
                     "last_name": "Row",
                     "filing_date": datetime(2024, 1, 1),
+                    "archive_year": 2024,
                     "filing_type": "P",
                     "fetched_at": datetime(2024, 1, 2),
                 },
@@ -129,6 +139,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "Other",
                     "last_name": "Row",
                     "filing_date": datetime(2023, 1, 1),
+                    "archive_year": 2023,
                     "filing_type": "P",
                     "fetched_at": datetime(2023, 1, 2),
                 },
@@ -141,6 +152,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "Fresh",
                     "last_name": "Row",
                     "filing_date": datetime(2024, 2, 1),
+                    "archive_year": 2024,
                     "filing_type": "P",
                     "fetched_at": datetime(2024, 2, 2),
                 },
@@ -161,6 +173,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "John",
                     "last_name": "Doe",
                     "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "archive_year": 2024,
                     "filing_type": "F1",
                     "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
                 },
@@ -169,6 +182,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "Jane",
                     "last_name": "Smith",
                     "filing_date": datetime(2024, 6, 20, 14, 0, 0),
+                    "archive_year": 2024,
                     "filing_type": "F2",
                     "fetched_at": datetime(2024, 6, 21, 9, 0, 0),
                 },
@@ -192,6 +206,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "John",
                     "last_name": "Doe",
                     "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "archive_year": 2024,
                     "filing_type": "F1",
                     "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
                 },
@@ -204,6 +219,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "Jonathan",
                     "last_name": "Doe",
                     "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "archive_year": 2024,
                     "filing_type": "F1-AMENDED",
                     "fetched_at": datetime(2024, 3, 17, 10, 0, 0),
                 },
@@ -224,6 +240,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "John",
                     "last_name": "Doe",
                     "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "archive_year": 2024,
                     "filing_type": "F1",
                     "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
                 },
@@ -243,6 +260,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "John",
                     "last_name": "Doe",
                     "filing_date": datetime(2024, 3, 15, 12, 0, 0),
+                    "archive_year": 2024,
                     "filing_type": "F1",
                     "fetched_at": datetime(2024, 3, 16, 8, 0, 0),
                 },
@@ -251,6 +269,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "Jane",
                     "last_name": "Smith",
                     "filing_date": datetime(2023, 6, 20, 14, 0, 0),
+                    "archive_year": 2023,
                     "filing_type": "F2",
                     "fetched_at": datetime(2023, 6, 21, 9, 0, 0),
                 },
@@ -272,6 +291,7 @@ class TestMetadata(DatabaseTestCase):
                     "first_name": "Michael T.",
                     "last_name": "McCaul",
                     "filing_date": datetime(2022, 1, 4),
+                    "archive_year": 2022,
                     "filing_type": "P",
                     "fetched_at": datetime(2026, 8, 9),
                 }
@@ -920,6 +940,54 @@ class TestParseRunsTable(DatabaseTestCase):
         ).fetchone()
         self.assertEqual(result[0], "zero_rows")
 
+    def test_parse_cache_invalidates_when_pdf_artifact_hash_changes(self):
+        self.db.upsert_parse_run(
+            doc_id="corrected",
+            year=2024,
+            parser_version="v4-deterministic",
+            status="success",
+            engines_attempted="pdfplumber",
+            raw_row_count=1,
+            transaction_count=1,
+            artifact_sha256="old-sha",
+        )
+
+        self.assertEqual(
+            self.db.parse_runs.get_cached_doc_ids(
+                year=2024,
+                parser_version="v4-deterministic",
+                artifact_hashes={"corrected": "old-sha"},
+            ),
+            {"corrected"},
+        )
+        self.assertEqual(
+            self.db.parse_runs.get_cached_doc_ids(
+                year=2024,
+                parser_version="v4-deterministic",
+                artifact_hashes={"corrected": "corrected-sha"},
+            ),
+            set(),
+        )
+        self.db.upsert_parse_run(
+            doc_id="corrected",
+            year=2024,
+            parser_version="v4-deterministic",
+            status="success",
+            engines_attempted="pdfplumber",
+            raw_row_count=1,
+            transaction_count=1,
+            artifact_sha256="corrected-sha",
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                """
+                SELECT artifact_sha256 FROM pdf_parse_runs
+                WHERE doc_id = 'corrected' ORDER BY artifact_sha256
+                """
+            ).fetchall(),
+            [("corrected-sha",), ("old-sha",)],
+        )
+
     def test_upsert_parse_run_error_status(self):
         self.db.upsert_parse_run(
             doc_id="doc3",
@@ -1019,11 +1087,12 @@ class TestParseRunsTable(DatabaseTestCase):
             pd.DataFrame(),
             source="house_pdf",
             attempted_doc_ids=["ocr-doc"],
+            replacement_doc_ids=[],
             parse_runs=[parse_run],
         )
 
         transactions = self.db.conn.execute(
-            "SELECT source FROM transactions WHERE doc_id = 'ocr-doc'"
+            "SELECT source FROM transactions WHERE doc_id = 'ocr-doc' ORDER BY source"
         ).fetchall()
         persisted = self.db.conn.execute(
             """
@@ -1031,14 +1100,69 @@ class TestParseRunsTable(DatabaseTestCase):
             WHERE doc_id = 'ocr-doc' AND parser_version = 'v4-deterministic'
             """
         ).fetchone()
-        self.assertEqual(transactions, [("gemini_ocr",)])
-        self.assertEqual(persisted, ("zero_rows", 1))
+        self.assertEqual(
+            transactions,
+            [("gemini_ocr",), ("house_pdf",)],
+        )
+        self.assertEqual(persisted, ("zero_rows", 0))
         self.assertEqual(
             replacement.by_doc_source,
-            {"ocr-doc": {"gemini_ocr": 1}},
+            {"ocr-doc": {"gemini_ocr": 1, "house_pdf": 1}},
         )
-        self.assertEqual(replacement.by_doc_total, {"ocr-doc": 1})
-        self.assertEqual(replacement.total_current_rows, 1)
+        self.assertEqual(replacement.by_doc_total, {"ocr-doc": 2})
+        self.assertEqual(replacement.total_current_rows, 2)
+
+
+    def test_verified_no_txs_explicitly_replaces_stale_house_rows(self):
+        self.db.upsert_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "doc_id": "verified-empty",
+                        "member": "Jane Doe",
+                        "ticker": "AAPL",
+                        "transaction_date": date(2024, 1, 2),
+                        "disclosure_date": date(2024, 1, 3),
+                        "transaction_type": "Purchase",
+                    }
+                ]
+            ),
+            source="house_pdf",
+        )
+        parse_run = {
+            "doc_id": "verified-empty",
+            "year": 2024,
+            "parser_version": "v4-verified",
+            "status": "no_txs",
+            "engines_attempted": "verified",
+            "raw_row_count": 0,
+            "transaction_count": 99,
+        }
+
+        replacement = self.db.replace_transactions_for_docs(
+            pd.DataFrame(),
+            source="house_pdf",
+            attempted_doc_ids=["verified-empty"],
+            replacement_doc_ids=["verified-empty"],
+            parse_runs=[parse_run],
+        )
+
+        self.assertEqual(replacement.by_doc_total, {"verified-empty": 0})
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE doc_id = 'verified-empty'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                """
+                SELECT status, transaction_count FROM pdf_parse_runs
+                WHERE doc_id = 'verified-empty'
+                """
+            ).fetchone(),
+            ("no_txs", 0),
+        )
 
 
 class TestTransactionNormalization(DatabaseTestCase):

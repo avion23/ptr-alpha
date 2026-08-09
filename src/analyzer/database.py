@@ -86,6 +86,7 @@ class Database:
 
     def _init_schema(self):
         self._init_metadata_table()
+        self._init_house_archive_tables()
         self._init_pdf_tables()
         self._init_source_reports_table()
         self._init_transactions_table()
@@ -108,17 +109,75 @@ class Database:
         }
         if "archive_year" not in columns:
             self.conn.execute("ALTER TABLE metadata ADD COLUMN archive_year INTEGER")
-        # Legacy rows did not record their House archive. Filing year keeps them
-        # readable until an authoritative archive refresh corrects cross-year rows.
-        self.conn.execute("""
-            UPDATE metadata
-            SET archive_year = EXTRACT(YEAR FROM filing_date)::INTEGER
-            WHERE archive_year IS NULL
-        """)
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_metadata_archive_year "
             "ON metadata(archive_year)"
         )
+
+    def _init_house_archive_tables(self) -> None:
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS house_archive_generations (
+                archive_year INTEGER,
+                generation_id VARCHAR,
+                metadata_sha256 VARCHAR,
+                metadata_http_status INTEGER,
+                metadata_etag VARCHAR,
+                metadata_last_modified VARCHAR,
+                metadata_count INTEGER,
+                ptr_count INTEGER,
+                parse_status VARCHAR DEFAULT 'incomplete',
+                promoted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (archive_year, generation_id)
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS house_pdf_artifacts (
+                archive_year INTEGER,
+                doc_id VARCHAR,
+                generation_id VARCHAR,
+                artifact_sha256 VARCHAR,
+                http_status INTEGER,
+                etag VARCHAR,
+                last_modified VARCHAR,
+                content_length BIGINT,
+                acquired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (archive_year, doc_id, generation_id)
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS house_archive_quarantine (
+                archive_year INTEGER,
+                doc_id VARCHAR,
+                generation_id VARCHAR,
+                reason VARCHAR,
+                artifact_sha256 VARCHAR,
+                quarantine_path VARCHAR,
+                removed_house_rows INTEGER,
+                quarantined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS house_transaction_quarantine (
+                archive_year INTEGER,
+                doc_id VARCHAR,
+                generation_id VARCHAR,
+                transaction_id BIGINT,
+                transaction_json JSON,
+                reason VARCHAR,
+                quarantined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        generation_columns = {
+            row[1]
+            for row in self.conn.execute(
+                "PRAGMA table_info('house_archive_generations')"
+            ).fetchall()
+        }
+        if "parse_status" not in generation_columns:
+            self.conn.execute(
+                "ALTER TABLE house_archive_generations "
+                "ADD COLUMN parse_status VARCHAR DEFAULT 'incomplete'"
+            )
 
     def _init_transactions_table(self) -> None:
         self.conn.execute("""
@@ -202,9 +261,20 @@ class Database:
                 raw_row_count INTEGER,
                 transaction_count INTEGER,
                 error_message VARCHAR,
+                artifact_sha256 VARCHAR,
                 parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        columns = {
+            row[1]
+            for row in self.conn.execute(
+                "PRAGMA table_info('pdf_parse_runs')"
+            ).fetchall()
+        }
+        if "artifact_sha256" not in columns:
+            self.conn.execute(
+                "ALTER TABLE pdf_parse_runs ADD COLUMN artifact_sha256 VARCHAR"
+            )
 
     def _init_source_reports_table(self) -> None:
         self.conn.execute("""
@@ -367,6 +437,218 @@ class Database:
     def replace_metadata(self, archive_year: int, df: pd.DataFrame) -> None:
         self.metadata.replace_archive(archive_year, df)
 
+    def get_house_artifact_hashes(self, archive_year: int) -> dict[str, str]:
+        rows = self.conn.execute(
+            """
+            SELECT doc_id, artifact_sha256
+            FROM house_pdf_artifacts
+            WHERE archive_year = ?
+            QUALIFY row_number() OVER (
+                PARTITION BY doc_id ORDER BY acquired_at DESC, generation_id DESC
+            ) = 1
+            """,
+            [archive_year],
+        ).fetchall()
+        return {str(doc_id): str(sha256) for doc_id, sha256 in rows if sha256}
+
+    def get_unresolved_house_doc_ids(self, archive_year: int) -> list[str]:
+        rows = self.conn.execute(
+            """
+            WITH current_artifacts AS (
+                SELECT doc_id, artifact_sha256
+                FROM house_pdf_artifacts
+                WHERE archive_year = ?
+                QUALIFY row_number() OVER (
+                    PARTITION BY doc_id ORDER BY acquired_at DESC, generation_id DESC
+                ) = 1
+            )
+            SELECT a.doc_id
+            FROM current_artifacts a
+            LEFT JOIN pdf_parse_runs p
+              ON p.doc_id = a.doc_id
+             AND p.artifact_sha256 = a.artifact_sha256
+             AND p.status IN ('success', 'no_txs')
+            GROUP BY a.doc_id
+            HAVING COUNT(p.doc_id) = 0
+            ORDER BY a.doc_id
+            """,
+            [archive_year],
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def mark_house_generation_parse_complete(self, archive_year: int) -> None:
+        if self.get_unresolved_house_doc_ids(archive_year):
+            raise ValueError(
+                f"House archive {archive_year} still has unresolved artifacts"
+            )
+        self.conn.execute(
+            """
+            UPDATE house_archive_generations SET parse_status = 'complete'
+            WHERE archive_year = ? AND generation_id = (
+                SELECT generation_id FROM house_archive_generations
+                WHERE archive_year = ?
+                ORDER BY promoted_at DESC, generation_id DESC LIMIT 1
+            )
+            """,
+            [archive_year, archive_year],
+        )
+
+    def promote_house_archive(
+        self,
+        *,
+        archive_year: int,
+        metadata_df: pd.DataFrame,
+        generation_id: str,
+        metadata_sha256: str,
+        metadata_http_status: int | None,
+        metadata_etag: str | None,
+        metadata_last_modified: str | None,
+        artifacts: list[dict],
+        quarantined_artifacts: list[dict],
+    ) -> dict[str, int]:
+        """Atomically promote metadata/audit state and hide removed House rows."""
+        metadata_df = metadata_df.copy()
+        metadata_df["archive_year"] = archive_year
+        old_doc_ids = {
+            str(row[0])
+            for row in self.conn.execute(
+                "SELECT doc_id FROM metadata WHERE archive_year = ?",
+                [archive_year],
+            ).fetchall()
+        }
+        new_doc_ids = set(metadata_df["doc_id"].astype(str))
+        removed_doc_ids = sorted(old_doc_ids - new_doc_ids)
+        quarantine_by_doc = {
+            str(item["doc_id"]): item for item in quarantined_artifacts
+        }
+        removed_counts: dict[str, int] = {}
+
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute(
+                "DELETE FROM metadata WHERE archive_year = ?", [archive_year]
+            )
+            self.metadata.upsert(metadata_df)
+            for doc_id in removed_doc_ids:
+                removed_count = int(
+                    self.conn.execute(
+                        """
+                        SELECT COUNT(*) FROM transactions
+                        WHERE doc_id = ?
+                          AND (source = 'house_pdf' OR source IS NULL)
+                        """,
+                        [doc_id],
+                    ).fetchone()[0]
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO house_transaction_quarantine (
+                        archive_year, doc_id, generation_id, transaction_id,
+                        transaction_json, reason
+                    )
+                    SELECT ?, ?, ?, id, to_json(t), ?
+                    FROM transactions t
+                    WHERE doc_id = ?
+                      AND (source = 'house_pdf' OR source IS NULL)
+                    """,
+                    [
+                        archive_year,
+                        doc_id,
+                        generation_id,
+                        "removed_from_authoritative_archive",
+                        doc_id,
+                    ],
+                )
+                self.conn.execute(
+                    """
+                    DELETE FROM transactions
+                    WHERE doc_id = ?
+                      AND (source = 'house_pdf' OR source IS NULL)
+                    """,
+                    [doc_id],
+                )
+                removed_counts[doc_id] = removed_count
+                quarantine = quarantine_by_doc.get(doc_id, {})
+                self.conn.execute(
+                    """
+                    INSERT INTO house_archive_quarantine (
+                        archive_year, doc_id, generation_id, reason,
+                        artifact_sha256, quarantine_path, removed_house_rows
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        archive_year,
+                        doc_id,
+                        generation_id,
+                        "removed_from_authoritative_archive",
+                        quarantine.get("artifact_sha256"),
+                        quarantine.get("quarantine_path"),
+                        removed_count,
+                    ],
+                )
+            for doc_id, quarantine in quarantine_by_doc.items():
+                if doc_id in removed_counts:
+                    continue
+                self.conn.execute(
+                    """
+                    INSERT INTO house_archive_quarantine (
+                        archive_year, doc_id, generation_id, reason,
+                        artifact_sha256, quarantine_path, removed_house_rows
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    [
+                        archive_year,
+                        doc_id,
+                        generation_id,
+                        "orphan_pdf_not_in_authoritative_archive",
+                        quarantine.get("artifact_sha256"),
+                        quarantine.get("quarantine_path"),
+                    ],
+                )
+            self.conn.execute(
+                """
+                INSERT INTO house_archive_generations (
+                    archive_year, generation_id, metadata_sha256,
+                    metadata_http_status, metadata_etag, metadata_last_modified,
+                    metadata_count, ptr_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    archive_year,
+                    generation_id,
+                    metadata_sha256,
+                    metadata_http_status,
+                    metadata_etag,
+                    metadata_last_modified,
+                    len(metadata_df),
+                    int((metadata_df["filing_type"] == "P").sum()),
+                ],
+            )
+            for artifact in artifacts:
+                self.conn.execute(
+                    """
+                    INSERT INTO house_pdf_artifacts (
+                        archive_year, doc_id, generation_id, artifact_sha256,
+                        http_status, etag, last_modified, content_length
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        archive_year,
+                        artifact["doc_id"],
+                        generation_id,
+                        artifact["artifact_sha256"],
+                        artifact.get("http_status"),
+                        artifact.get("etag"),
+                        artifact.get("last_modified"),
+                        artifact.get("content_length"),
+                    ],
+                )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        return removed_counts
+
     def upsert_transactions(self, df: pd.DataFrame, *, source: str) -> int:
         return self.transactions.upsert(df, source=source)
 
@@ -376,22 +658,34 @@ class Database:
         *,
         source: str,
         attempted_doc_ids: list[str],
+        replacement_doc_ids: list[str],
         parse_runs: list[dict] | None = None,
     ) -> TransactionReplacementCounts:
         """Atomically replace attempted documents for one source.
 
-        Attempted IDs are explicit because zero-output documents are absent
-        from ``df``. Deterministic House attempts replace deterministic/legacy
-        House rows while preserving OCR and backup-source provenance.
+        Attempted IDs drive telemetry. Replacement IDs are independently
+        explicit because ambiguous deterministic ``zero_rows`` must preserve
+        prior House rows; only nonzero or verified ``no_txs`` outcomes replace.
+        OCR and backup-source provenance is always preserved.
         """
         attempted = list(dict.fromkeys(str(doc_id) for doc_id in attempted_doc_ids))
         attempted_set = set(attempted)
+        replacements = list(
+            dict.fromkeys(str(doc_id) for doc_id in replacement_doc_ids)
+        )
+        replacement_set = set(replacements)
+        unexpected_replacements = sorted(replacement_set - attempted_set)
+        if unexpected_replacements:
+            raise ValueError(
+                "Replacement IDs were not attempted: "
+                + ", ".join(unexpected_replacements)
+            )
         df_doc_ids = (
             set(df["doc_id"].astype(str))
             if not df.empty and "doc_id" in df.columns
             else set()
         )
-        unexpected_df_ids = sorted(df_doc_ids - attempted_set)
+        unexpected_df_ids = sorted(df_doc_ids - replacement_set)
         if unexpected_df_ids:
             raise ValueError(
                 "Replacement dataframe contains unattempted doc IDs: "
@@ -412,7 +706,7 @@ class Database:
 
         self.conn.execute("BEGIN TRANSACTION")
         try:
-            for doc_id in attempted:
+            for doc_id in replacements:
                 if source == "house_pdf":
                     self.conn.execute(
                         "DELETE FROM transactions "
@@ -446,7 +740,11 @@ class Database:
                 persisted_run = {
                     **parse_run,
                     "doc_id": doc_id,
-                    "transaction_count": by_doc_total[doc_id],
+                    "transaction_count": (
+                        by_doc_source[doc_id].get(source, 0)
+                        if doc_id in replacement_set
+                        else 0
+                    ),
                 }
                 self.parse_runs.upsert(**persisted_run, _in_transaction=True)
             total_current_rows = int(
@@ -541,6 +839,7 @@ class Database:
         raw_row_count: int,
         transaction_count: int,
         error_message: str | None = None,
+        artifact_sha256: str | None = None,
     ) -> None:
         self.parse_runs.upsert(
             doc_id=doc_id,
@@ -551,6 +850,7 @@ class Database:
             raw_row_count=raw_row_count,
             transaction_count=transaction_count,
             error_message=error_message,
+            artifact_sha256=artifact_sha256,
         )
 
     def replace_source_reports(

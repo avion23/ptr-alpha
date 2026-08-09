@@ -15,19 +15,11 @@ class MetadataRepository:
 
     @staticmethod
     def _with_archive_year(df: pd.DataFrame) -> pd.DataFrame:
-        """Return metadata with an integer archive year.
-
-        Legacy callers did not supply archive provenance. Filing year is the
-        only safe compatibility value available until the official archive is
-        fetched again; an archive refresh overwrites it with the authoritative
-        year.
-        """
+        """Keep unknown legacy archive provenance explicitly NULL."""
         if "archive_year" in df.columns:
             return df
         normalized = df.copy()
-        normalized["archive_year"] = pd.to_datetime(
-            normalized["filing_date"], errors="raise"
-        ).dt.year
+        normalized["archive_year"] = None
         return normalized
 
     def upsert(self, df: pd.DataFrame) -> None:

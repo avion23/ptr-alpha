@@ -230,6 +230,10 @@ def test_enabled_crash_guard_abstains_on_missing_or_malformed_probability():
     malformed.loc[0, "crash_prob"] = float("nan")
     assert build_kelly_portfolio(malformed, KellyConfig(crash_guard=True)).empty
 
+    certain_crash = rows.copy()
+    certain_crash.loc[0, "crash_prob"] = 1.0
+    assert build_kelly_portfolio(certain_crash, KellyConfig(crash_guard=True)).empty
+
     outside_range = rows.copy()
     outside_range.loc[0, "crash_prob"] = 1.1
     assert build_kelly_portfolio(outside_range, KellyConfig(crash_guard=True)).empty
@@ -326,3 +330,30 @@ def test_sizing_estimate_duplicates_and_malformed_rows_fail_clearly():
     malformed.loc[0, "as_of_date"] = "not-a-date"
     with pytest.raises(ValueError, match="malformed rows"):
         _prepare_sizing_inputs(malformed)
+
+
+def test_metrics_reject_nan_gross_notional_and_invalid_required_dates():
+    base_curve = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"]),
+            "simulation_start": pd.to_datetime(["2024-01-01"]),
+            "initial_capital": [100.0],
+            "liquidation_value": [100.0],
+            "gross_traded_notional": [0.0],
+        }
+    )
+
+    nan_gross = base_curve.copy()
+    nan_gross.loc[0, "gross_traded_notional"] = float("nan")
+    with pytest.raises(ValueError, match="gross_traded_notional"):
+        compute_portfolio_metrics(nan_gross)
+
+    invalid_date = base_curve.copy()
+    invalid_date.loc[0, "date"] = pd.NaT
+    with pytest.raises(ValueError, match="valid dates"):
+        compute_portfolio_metrics(invalid_date)
+
+    invalid_start = base_curve.copy()
+    invalid_start.loc[0, "simulation_start"] = pd.NaT
+    with pytest.raises(ValueError, match="valid dates"):
+        compute_portfolio_metrics(invalid_start)

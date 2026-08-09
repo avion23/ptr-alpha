@@ -165,7 +165,7 @@ def _row_kelly_fraction(row: pd.Series, config: KellyConfig) -> float:
         else kelly_fraction(row["win_rate"], payout)
     )
     if config.crash_guard:
-        fraction *= 1.0 - float(np.clip(row["crash_prob"], 0.0, 0.95))
+        fraction *= 1.0 - float(np.clip(row["crash_prob"], 0.0, 1.0))
     return fraction
 
 

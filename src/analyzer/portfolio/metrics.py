@@ -18,15 +18,50 @@ def compute_portfolio_metrics(equity_curve: pd.DataFrame) -> dict:
     if missing:
         raise ValueError(f"equity_curve missing required columns: {sorted(missing)}")
 
-    curve = equity_curve.sort_values("date", kind="stable").reset_index(drop=True)
-    dates = pd.to_datetime(curve["date"])
-    initial_date = pd.Timestamp(curve.iloc[0]["simulation_start"])
-    initial = float(curve.iloc[0]["initial_capital"])
-    values = pd.to_numeric(curve["liquidation_value"], errors="coerce").to_numpy(float)
-    if initial <= 0 or not np.isfinite(initial):
-        raise ValueError("initial capital must be positive and finite")
+    curve = equity_curve.copy()
+    curve["date"] = pd.to_datetime(curve["date"], errors="coerce")
+    curve["simulation_start"] = pd.to_datetime(
+        curve["simulation_start"], errors="coerce"
+    )
+    if curve["date"].isna().any() or curve["simulation_start"].isna().any():
+        raise ValueError("date and simulation_start must contain valid dates")
+    curve = curve.sort_values("date", kind="stable").reset_index(drop=True)
 
-    elapsed_days = max((dates.iloc[-1] - initial_date).days, 0)
+    try:
+        capital_series = pd.to_numeric(curve["initial_capital"], errors="raise")
+        value_series = pd.to_numeric(curve["liquidation_value"], errors="raise")
+        gross_series = pd.to_numeric(
+            curve["gross_traded_notional"], errors="raise"
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("required equity fields must be numeric") from exc
+    if (
+        not np.isfinite(capital_series).all()
+        or capital_series.le(0).any()
+        or not np.allclose(capital_series, capital_series.iloc[0])
+    ):
+        raise ValueError("initial_capital must be one positive finite value")
+    if np.isinf(value_series).any() or value_series.dropna().lt(0).any():
+        raise ValueError("liquidation_value must be non-negative or NaN when unavailable")
+    if not np.isfinite(gross_series).all() or gross_series.lt(0).any():
+        raise ValueError("gross_traded_notional must be non-negative and finite")
+    if gross_series.diff().dropna().lt(-1e-9).any():
+        raise ValueError("gross_traded_notional must be cumulative and non-decreasing")
+    if curve["simulation_start"].nunique() != 1:
+        raise ValueError("simulation_start must be constant across the equity curve")
+
+    curve["initial_capital"] = capital_series.astype(float)
+    curve["liquidation_value"] = value_series.astype(float)
+    curve["gross_traded_notional"] = gross_series.astype(float)
+    curve = curve.sort_values("date", kind="stable").reset_index(drop=True)
+    dates = curve["date"]
+    initial_date = pd.Timestamp(curve.iloc[0]["simulation_start"])
+    if (dates < initial_date).any():
+        raise ValueError("equity observation date cannot precede simulation_start")
+    initial = float(curve.iloc[0]["initial_capital"])
+    values = curve["liquidation_value"].to_numpy(float)
+
+    elapsed_days = (dates.iloc[-1] - initial_date).days
     valuation_complete = bool(np.isfinite(values).all())
     gross_traded = float(curve.iloc[-1]["gross_traded_notional"])
     if valuation_complete:

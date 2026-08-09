@@ -56,6 +56,12 @@ def position_sizing_grid_search(sigs: pd.DataFrame, windows: list[dict]) -> dict
             row["n_evaluable_decision_dates"],
         ),
     )
+    selected_recommendations = _recommendations_for_windows(
+        sigs,
+        selection_windows,
+        int(selected["top_n"]),
+        int(selected["min_buyers"]),
+    )
     holdout_recommendations = _recommendations_for_windows(
         sigs,
         [holdout_window],
@@ -69,6 +75,9 @@ def position_sizing_grid_search(sigs: pd.DataFrame, windows: list[dict]) -> dict
         "holdout_window": _serialize_window(holdout_window),
         "selection_grid": selection_grid,
         "selected_candidate": selected,
+        "selection_recommendations": _serialize_recommendations(
+            selected_recommendations
+        ),
         "holdout": holdout,
         "holdout_recommendations": _serialize_recommendations(holdout_recommendations),
         "status": status,
@@ -100,7 +109,32 @@ def _recommendations_for_windows(
         results.append(recommendations)
     if not results:
         return pd.DataFrame()
-    return pd.concat(results, ignore_index=True)
+    combined = pd.concat(results, ignore_index=True)
+    return _apply_global_decision_spacing(combined)
+
+
+def _apply_global_decision_spacing(recommendations: pd.DataFrame) -> pd.DataFrame:
+    """Apply one execution clock across all chronological research windows."""
+    if recommendations.empty:
+        return recommendations.copy()
+    result = recommendations.copy()
+    result["decision_date"] = pd.to_datetime(result["decision_date"]).dt.normalize()
+    accepted_dates: list[pd.Timestamp] = []
+    last_accepted: pd.Timestamp | None = None
+    for decision_date in sorted(result["decision_date"].unique()):
+        decision_date = pd.Timestamp(decision_date)
+        if last_accepted is not None and (
+            decision_date - last_accepted
+        ).days < HORIZON:
+            continue
+        accepted_dates.append(decision_date)
+        last_accepted = decision_date
+    # Keep every top-N row on an accepted date; spacing rejects whole dates.
+    return (
+        result[result["decision_date"].isin(accepted_dates)]
+        .sort_values(["decision_date", "score", "ticker"], ascending=[True, False, True])
+        .reset_index(drop=True)
+    )
 
 
 def _disclosed_test_events(sigs: pd.DataFrame, window: dict) -> pd.DataFrame:
@@ -302,6 +336,7 @@ def _empty_research_result(status: str) -> dict:
         "holdout_window": None,
         "selection_grid": [],
         "selected_candidate": None,
+        "selection_recommendations": [],
         "holdout": _summarize_recommendations(pd.DataFrame()),
         "holdout_recommendations": [],
         "status": status,

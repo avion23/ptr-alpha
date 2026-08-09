@@ -185,6 +185,40 @@ class TestPointInTimeCanaries(unittest.TestCase):
 
 
 class TestChronologicalHoldout(unittest.TestCase):
+    def test_global_spacing_rejects_whole_boundary_dates_and_preserves_top_n(self):
+        from member_profitability.position_sizing import _apply_global_decision_spacing
+
+        rows = []
+        for decision_date, tickers in (
+            ("2024-06-15", ("A", "B")),
+            ("2024-08-03", ("C", "D")),  # 49 days: reject whole date
+            ("2024-08-15", ("E", "F")),  # 61 days: accept both rows
+            ("2024-09-15", ("G", "H")),  # 31 days: reject whole date
+            ("2024-10-14", ("I", "J")),  # 60 days: accept both rows
+        ):
+            for ticker in tickers:
+                rows.append(
+                    {
+                        "decision_date": pd.Timestamp(decision_date),
+                        "ticker": ticker,
+                        "score": 1.0,
+                    }
+                )
+        spaced = _apply_global_decision_spacing(pd.DataFrame(rows))
+
+        dates = sorted(spaced["decision_date"].unique())
+        self.assertEqual(
+            dates,
+            [
+                pd.Timestamp("2024-06-15"),
+                pd.Timestamp("2024-08-15"),
+                pd.Timestamp("2024-10-14"),
+            ],
+        )
+        self.assertEqual(spaced.groupby("decision_date").size().tolist(), [2, 2, 2])
+        gaps = pd.Series(dates).diff().dropna().dt.days
+        self.assertGreaterEqual(int(gaps.min()), 60)
+
     def test_holdout_outcomes_cannot_change_selected_parameters(self):
         from member_profitability.position_sizing import position_sizing_grid_search
 
@@ -287,14 +321,18 @@ class TestReadOnlyLoading(unittest.TestCase):
         self.assertGreater(calls["prices"][1], calls["entries"][1])
 
     @unittest.skipUnless(os.environ.get("PTR_ALPHA_REAL_DB"), "real DB scenario not requested")
-    def test_real_database_scenario_is_read_only_and_bounded(self):
-        from member_profitability.data import load_transactions_and_prices
+    def test_real_database_scenario_is_read_only_bounded_and_globally_spaced(self):
+        from member_profitability.data import compute_signals, load_transactions_and_prices
+        from member_profitability.position_sizing import position_sizing_grid_search
+        from member_profitability.walk_forward import generate_windows
 
         db_path = Path(os.environ["PTR_ALPHA_REAL_DB"])
         before = db_path.stat().st_mtime_ns
-        _, _, entries, _ = load_transactions_and_prices(
+        _, prices, entries, _ = load_transactions_and_prices(
             db_path, "2021-10-07", "2025-06-30"
         )
+        signals = compute_signals(entries, prices)
+        result = position_sizing_grid_search(signals, generate_windows(signals))
         after = db_path.stat().st_mtime_ns
 
         self.assertEqual(before, after)
@@ -302,6 +340,16 @@ class TestReadOnlyLoading(unittest.TestCase):
             pd.to_datetime(entries["disclosure_date"]).max(),
             pd.Timestamp("2025-06-30"),
         )
+        for key in ("selection_recommendations", "holdout_recommendations"):
+            dates = pd.Series(
+                sorted(
+                    pd.to_datetime(row["decision_date"])
+                    for row in result[key]
+                )
+            ).drop_duplicates()
+            if len(dates) > 1:
+                gaps = dates.diff().dropna().dt.days
+                self.assertGreaterEqual(int(gaps.min()), 60, key)
 
 
 if __name__ == "__main__":

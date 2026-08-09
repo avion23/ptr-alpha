@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -469,7 +470,13 @@ def test_append_only_consumption_reservation_is_atomic_and_irreversible(tmp_path
     with (
         patch.object(main, "_canonical_consumption_ledger_path", return_value=ledger),
         patch.object(main, "_git_state", return_value={"commit": "canary"}),
+        patch.object(main, "_repository_has_reservation_object", return_value=False),
         patch.object(main, "_consumption_anchor_commit", return_value=None),
+        patch.object(
+            main,
+            "_anchored_ledger_bytes",
+            side_effect=lambda _: ledger.read_bytes(),
+        ),
         patch.object(main, "_commit_consumption_anchor"),
         ThreadPoolExecutor(max_workers=2) as pool,
     ):
@@ -546,15 +553,16 @@ def _init_git_repo(path: Path) -> None:
     subprocess.run(["git", "commit", "-qm", "base"], cwd=path, check=True)
 
 
-def test_consumption_reservation_is_git_committed_and_ref_survives_unlink(tmp_path):
+def test_reservation_bytes_are_anchored_and_survive_ref_and_ledger_delete(tmp_path):
     _init_git_repo(tmp_path)
     ledger = tmp_path / "data" / "optimize_profit_final_consumption.jsonl"
+    lock_sha = "a" * 64
     with (
         patch.object(main, "_repo_root", return_value=tmp_path),
         patch.object(main, "_canonical_consumption_ledger_path", return_value=ledger),
     ):
-        reservation = main._reserve_final_consumption("a" * 64)
-        anchor = main._consumption_anchor_commit("a" * 64)
+        reservation = main._reserve_final_consumption(lock_sha)
+        anchor = main._consumption_anchor_commit(lock_sha)
         assert (
             anchor
             == subprocess.run(
@@ -566,11 +574,33 @@ def test_consumption_reservation_is_git_committed_and_ref_survives_unlink(tmp_pa
             ).stdout.strip()
         )
         assert main._git_state()["dirty"] is False
-        event = json.loads(ledger.read_text().splitlines()[0])
+        anchored_bytes = main._anchored_ledger_bytes(lock_sha)
+        assert anchored_bytes == ledger.read_bytes()
+        event = json.loads(anchored_bytes)
         assert event["reservation_id"] == reservation
-        assert event["previous_event_sha256"] == "0" * 64
+        assert event["previous_ledger_sha256"] == hashlib.sha256(b"").hexdigest()
+
+        forged = dict(event)
+        forged["reserved_at_utc"] = "2099-01-01T00:00:00+00:00"
+        forged.pop("event_sha256")
+        forged["event_sha256"] = main._canonical_json_sha256(forged)
+        ledger.write_bytes(main._serialize_consumption_event(forged))
+        with pytest.raises(RuntimeError, match="differs byte-for-byte"):
+            main._append_consumption_event(
+                lock_sha, reservation, "failed", {"error": "forged timestamp"}
+            )
+
+        ledger.write_bytes(anchored_bytes)
+        subprocess.run(
+            ["git", "update-ref", "-d", main._consumption_ref(lock_sha)],
+            cwd=tmp_path,
+            check=True,
+        )
         ledger.unlink()
-        assert main._consumption_anchor_commit("a" * 64) == anchor
+        assert main._consumption_anchor_commit(lock_sha) is None
+        assert main._repository_has_reservation_object(lock_sha) is True
+        with pytest.raises(RuntimeError, match="reservation object in Git storage"):
+            main._reserve_final_consumption(lock_sha)
 
 
 def test_coordinated_lock_and_seal_tamper_is_rejected_by_git_history(tmp_path):

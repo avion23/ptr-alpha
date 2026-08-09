@@ -698,7 +698,7 @@ def _canonical_final_lock_path() -> Path:
 
 
 def _canonical_final_seal_path() -> Path:
-    return _repo_root() / "optimize_profit" / "final_lock.sha256"
+    return _repo_root() / "optimize_profit" / "final_lock.v3.sha256"
 
 
 def _read_repository_lock() -> dict:
@@ -819,22 +819,122 @@ def _consumption_anchor_commit(lock_sha: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def _hashed_consumption_event(payload: dict, previous_hash: str) -> dict:
-    event = {**payload, "previous_event_sha256": previous_hash}
+def _serialize_consumption_event(event: dict) -> bytes:
+    return (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _hashed_consumption_event(payload: dict, previous_ledger: bytes) -> dict:
+    event = {
+        **payload,
+        "previous_ledger_sha256": hashlib.sha256(previous_ledger).hexdigest(),
+    }
     event["event_sha256"] = _canonical_json_sha256(event)
     return event
 
 
-def _validate_consumption_chain(events: list[dict]) -> None:
-    previous = "0" * 64
-    for event in events:
+def _parse_and_validate_consumption_ledger(raw: bytes) -> list[dict]:
+    if raw and not raw.endswith(b"\n"):
+        raise RuntimeError("Final consumption ledger lacks a terminal newline")
+    prefix = b""
+    events = []
+    for line in raw.splitlines(keepends=True):
+        try:
+            event = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "Final consumption ledger contains invalid JSON"
+            ) from exc
         claimed = event.get("event_sha256")
         payload = {key: value for key, value in event.items() if key != "event_sha256"}
-        if event.get("previous_event_sha256") != previous:
-            raise RuntimeError("Final consumption ledger hash chain is broken")
+        if event.get("previous_ledger_sha256") != hashlib.sha256(prefix).hexdigest():
+            raise RuntimeError("Final consumption ledger byte-digest chain is broken")
         if _canonical_json_sha256(payload) != claimed:
             raise RuntimeError("Final consumption event hash is invalid")
-        previous = claimed
+        events.append(event)
+        prefix += line
+    return events
+
+
+def _blob_contains_reservation(raw: bytes, lock_sha: str) -> bool:
+    try:
+        events = _parse_and_validate_consumption_ledger(raw)
+    except RuntimeError:
+        return False
+    return any(
+        event.get("event") == "reserved" and event.get("lock_sha256") == lock_sha
+        for event in events
+    )
+
+
+def _ledger_blob_at_commit(commit: str) -> bytes | None:
+    ledger_path = _canonical_consumption_ledger_path().relative_to(_repo_root())
+    result = subprocess.run(
+        ["git", "show", f"{commit}:{ledger_path}"],
+        cwd=_repo_root(),
+        check=False,
+        capture_output=True,
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def _repository_has_reservation_object(lock_sha: str) -> bool:
+    """Search refs, reflogs, and unreachable Git objects for a reservation."""
+    if _consumption_anchor_commit(lock_sha) is not None:
+        return True
+    repo = _repo_root()
+    ledger_path = str(_canonical_consumption_ledger_path().relative_to(repo))
+    reachable = subprocess.run(
+        ["git", "log", "--all", "--reflog", "--format=%H", "--", ledger_path],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    checked_commits = set()
+    for commit in reachable:
+        checked_commits.add(commit)
+        raw = _ledger_blob_at_commit(commit)
+        if raw is not None and _blob_contains_reservation(raw, lock_sha):
+            return True
+
+    fsck = subprocess.run(
+        ["git", "fsck", "--full", "--unreachable", "--no-reflogs"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    for line in fsck:
+        parts = line.split()
+        if len(parts) < 3 or parts[0] not in {"unreachable", "dangling"}:
+            continue
+        object_type, object_id = parts[1], parts[2]
+        if object_type == "commit" and object_id not in checked_commits:
+            raw = _ledger_blob_at_commit(object_id)
+        elif object_type == "blob":
+            raw_result = subprocess.run(
+                ["git", "cat-file", "blob", object_id],
+                cwd=repo,
+                check=False,
+                capture_output=True,
+            )
+            raw = raw_result.stdout if raw_result.returncode == 0 else None
+        else:
+            raw = None
+        if raw is not None and _blob_contains_reservation(raw, lock_sha):
+            return True
+    return False
+
+
+def _anchored_ledger_bytes(lock_sha: str) -> bytes:
+    anchor = _consumption_anchor_commit(lock_sha)
+    if anchor is None:
+        raise RuntimeError("Final consumption Git anchor is missing")
+    raw = _ledger_blob_at_commit(anchor)
+    if raw is None:
+        raise RuntimeError("Final consumption anchor has no ledger blob")
+    _parse_and_validate_consumption_ledger(raw)
+    return raw
 
 
 def _commit_consumption_anchor(
@@ -879,23 +979,23 @@ def _commit_consumption_anchor(
         check=True,
         capture_output=True,
     ).stdout
-    if hashlib.sha256(committed).hexdigest() != _sha256_file(ledger):
-        raise RuntimeError("Committed consumption ledger differs from working ledger")
+    if committed != ledger.read_bytes():
+        raise RuntimeError("Committed consumption ledger differs byte-for-byte")
 
 
 def _reserve_final_consumption(lock_sha: str) -> str:
     """Atomically append and Git-anchor reservation before any DB access."""
-    if _consumption_anchor_commit(lock_sha) is not None:
-        raise RuntimeError("Locked final test already has a durable consumption anchor")
+    if _repository_has_reservation_object(lock_sha):
+        raise RuntimeError("Locked final test has a reservation object in Git storage")
     ledger = _canonical_consumption_ledger_path()
     ledger.parent.mkdir(parents=True, exist_ok=True)
     reservation_id = str(uuid.uuid4())
-    with ledger.open("a+", encoding="utf-8") as handle:
+    with ledger.open("a+b") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         handle.seek(0)
-        events = [json.loads(line) for line in handle if line.strip()]
-        _validate_consumption_chain(events)
-        if events or _consumption_anchor_commit(lock_sha) is not None:
+        raw = handle.read()
+        events = _parse_and_validate_consumption_ledger(raw)
+        if events or _repository_has_reservation_object(lock_sha):
             raise RuntimeError(
                 "Locked final test already has a consumption reservation"
             )
@@ -907,10 +1007,11 @@ def _reserve_final_consumption(lock_sha: str) -> str:
                 "reserved_at_utc": datetime.now(timezone.utc).isoformat(),
                 "git_commit_before_reservation": _git_state()["commit"],
             },
-            "0" * 64,
+            raw,
         )
+        serialized = _serialize_consumption_event(event)
         handle.seek(0, os.SEEK_END)
-        handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.write(serialized)
         handle.flush()
         os.fsync(handle.fileno())
         _commit_consumption_anchor(lock_sha, event)
@@ -926,11 +1027,16 @@ def _append_consumption_event(
     extra_paths: tuple[Path, ...] = (),
 ) -> None:
     ledger = _canonical_consumption_ledger_path()
-    with ledger.open("a+", encoding="utf-8") as handle:
+    with ledger.open("a+b") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         handle.seek(0)
-        events = [json.loads(line) for line in handle if line.strip()]
-        _validate_consumption_chain(events)
+        raw = handle.read()
+        anchored = _anchored_ledger_bytes(lock_sha)
+        if raw != anchored:
+            raise RuntimeError(
+                "Working consumption ledger differs byte-for-byte from its anchor"
+            )
+        events = _parse_and_validate_consumption_ledger(anchored)
         reserved = any(
             event.get("event") == "reserved"
             and event.get("lock_sha256") == lock_sha
@@ -947,10 +1053,10 @@ def _append_consumption_event(
                 "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
                 **payload,
             },
-            events[-1]["event_sha256"],
+            anchored,
         )
         handle.seek(0, os.SEEK_END)
-        handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.write(_serialize_consumption_event(event))
         handle.flush()
         os.fsync(handle.fileno())
         _commit_consumption_anchor(lock_sha, event, extra_paths)

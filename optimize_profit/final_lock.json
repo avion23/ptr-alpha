@@ -6,11 +6,14 @@
   },
   "config_sha256": "ab54ce36e98ba76520ee1d40623a10cbccef9d7086ae856f0cbb8dcb5465ce9c",
   "consumption": {
-    "anchor": "append-only SHA-256 event chain; each event and result is committed to Git; refs/optimize-profit/final-consumption/<lock-sha> advances atomically and survives branch reset or ledger unlink",
+    "anchor": "exact ledger bytes in a Git commit plus append-only byte-prefix SHA-256 event chain; refs/optimize-profit/final-consumption/<lock-sha> advances atomically",
     "canonical_ledger": "data/optimize_profit_final_consumption.jsonl",
     "canonical_result": "data/optimize_profit_final_result.json",
+    "discovery": "second reservation scans current refs, all refs and reflogs, and unreachable/dangling commit and blob objects via git fsck",
     "maximum_evaluations": 1,
-    "reservation": "Git-committed and ref-anchored before any database hash, open, or analytic query"
+    "reservation": "Git-committed and ref-anchored before any database hash, open, or analytic query",
+    "residual_limit": "an attacker with full local repository write access can erase evidence by deleting refs, expiring every reflog, and garbage-collecting unreachable objects; use an externally replicated Git remote for protection against that threat",
+    "rollback_resistance": "deleting the ledger, custom ref, or moving a branch does not bypass the object-store scan"
   },
   "db_access_statement": "Retrospective runs may read the DB whole file to hash it but do not analytically query locked final-period rows.",
   "decision_dates": [
@@ -32,8 +35,8 @@
   },
   "final_null_permutations": 999,
   "horizon_days": 90,
-  "lock_id": "ptr-alpha-final-2026q4-2028q3-v2",
-  "locked_at_utc": "2026-08-09T18:50:00Z",
+  "lock_id": "ptr-alpha-final-2026q4-2028q3-v3",
+  "locked_at_utc": "2026-08-09T20:50:00Z",
   "locked_config": {
     "allocation": "signal",
     "decay_lambda": 0.003,
@@ -129,11 +132,11 @@
       ]
     }
   },
-  "schema_version": 2,
-  "sealed_source_aggregate_sha256": "b4e18c3ae02b66cf52dcad115c83dfc5de4bc234a00161611bbf772079443fac",
+  "schema_version": 3,
+  "sealed_source_aggregate_sha256": "ca59d6671da72df14af05ef525bf385ea906bd16985b232284429b986514c29e",
   "sealed_source_sha256": {
     "optimize_profit/__init__.py": "f8e8c376aeddc23faae31d18ebdaa12c45ff5c5a87f111ef99312a10358cb0f9",
-    "optimize_profit/main.py": "eb9eb50e118ff8c848e014be5e567de97046bb3ad9fa295253836e5f4323ceaf",
+    "optimize_profit/main.py": "431218ea1270010f1e5e98b1e8d435a8949766285cd2e0e358fb608ec8afccbb",
     "optimize_profit/metrics.py": "dea238f90df2f6966703c5cedc6e6722e49b1e476f7cff8ace31480e0bd29c6e",
     "optimize_profit/precompute.py": "cc2055061a838416d67243a596e3707b59db888f8518f95afb22497bb6392db0",
     "optimize_profit/reporting.py": "ba235faef7300aef6172a2789018a52f62032791ce9005dc15be95debd07893a",

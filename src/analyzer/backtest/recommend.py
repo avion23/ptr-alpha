@@ -41,7 +41,6 @@ def backtest_recommendations(
     threshold: float = 5.0,
     prices_df: pd.DataFrame | None = None,
     training_lookback_days: int | None = None,
-    solo_buyer_skill_threshold: float = 1.0,
     scoring_mode: str = "consensus",
     bayes_prior_strength: float | None = None,
 ) -> pd.DataFrame:
@@ -98,7 +97,6 @@ def backtest_recommendations(
         top_n,
         scoring_mode,
         bayes,
-        solo_buyer_skill_threshold,
     )
 
 
@@ -220,7 +218,6 @@ def _score_and_rank(
     top_n,
     scoring_mode,
     bayes,
-    solo_buyer_skill_threshold,
 ) -> pd.DataFrame:
     as_of_for_features = (
         as_of_date.date() if hasattr(as_of_date, "date") else as_of_date
@@ -252,7 +249,6 @@ def _score_and_rank(
             threshold=threshold,
             min_buyers=min_buyers,
             bayes=bayes,
-            solo_buyer_skill_threshold=solo_buyer_skill_threshold,
             scoring_mode=scoring_mode,
             _ranking_dicts=_ranking_dicts,
             signals_df=signals_df,
@@ -335,7 +331,6 @@ def _score_one_ticker(
     threshold,
     min_buyers,
     bayes,
-    solo_buyer_skill_threshold,
     scoring_mode,
     _ranking_dicts,
     signals_df,
@@ -349,7 +344,6 @@ def _score_one_ticker(
     score_kwargs = {
         "ticker_perf_signals": ticker_perf_signals,
         "_bayes_prior_strength": bayes,
-        "solo_buyer_skill_threshold": solo_buyer_skill_threshold,
         "scoring_mode": scoring_mode,
         "as_of_date": as_of_date,
         "_ranking_dicts": _ranking_dicts,

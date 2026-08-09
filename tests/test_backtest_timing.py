@@ -406,6 +406,44 @@ class TestBacktestTiming(unittest.TestCase):
                 self.assertEqual(row["bt_coverage"], "unavailable")
                 self.assertTrue(np.isnan(row["bt_return_pct"]))
 
+    def test_mixed_stock_option_and_missing_instrument_are_isolated(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-06")
+        prices = pd.DataFrame(
+            {
+                "AAPL": [90.0, 100.0, 110.0],
+                "MSFT": [190.0, 200.0, 220.0],
+                "NVDA": [290.0, 300.0, 330.0],
+                "SPY": [390.0, 400.0, 410.0],
+            },
+            index=dates,
+        )
+        recommendations = pd.DataFrame(
+            {
+                "ticker": ["AAPL", "MSFT", "NVDA"],
+                "instrument_type": ["stock", "call", None],
+            }
+        )
+
+        result = evaluate_backtest(
+            recommendations,
+            prices,
+            pd.Timestamp("2025-01-02"),
+            horizon=3,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).set_index("ticker")
+
+        self.assertEqual(result.loc["AAPL", "bt_coverage"], "complete")
+        self.assertEqual(result.loc["AAPL", "bt_return_pct"], 10.0)
+        for ticker in ("MSFT", "NVDA"):
+            self.assertEqual(result.loc[ticker, "bt_coverage"], "unavailable")
+            self.assertEqual(
+                result.loc[ticker, "bt_unavailable_reason"],
+                "unsupported_instrument_pricing",
+            )
+            self.assertTrue(np.isnan(result.loc[ticker, "bt_return_pct"]))
+        self.assertEqual(result.attrs["n_unavailable"], 2)
+
     def test_timezone_aware_daily_index_preserves_calendar_dates(self):
         dates = pd.bdate_range("2025-01-02", "2025-01-07", tz="America/New_York")
         prices = pd.DataFrame(

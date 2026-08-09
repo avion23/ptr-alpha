@@ -48,6 +48,7 @@ _EMPTY_BT_COLS = [
     "bt_entry_delay",
     "bt_delisted",
     "bt_coverage",
+    "bt_unavailable_reason",
     "bt_stale_exit",
 ]
 
@@ -122,7 +123,7 @@ def evaluate_backtest(
             pullback_pct,
             max_wait_days,
             max_staleness_days,
-            inst_type_arr[i] if inst_type_arr is not None else None,
+            inst_type_arr[i] if inst_type_arr is not None else "stock",
             amount_arr[i] if amount_arr is not None else None,
         )
         if row is not None:
@@ -202,9 +203,9 @@ def _evaluate_one_recommendation(
     """Evaluate one recommendation without guessing unavailable outcomes."""
     idx_ns, vals = cached
     inst_type = (
-        str(inst_type_val)
+        str(inst_type_val).strip().lower()
         if inst_type_val is not None and not pd.isna(inst_type_val)
-        else "stock"
+        else None
     )
     amount = amount_val if amount_val is not None else None
     entry, entry_delay, entry_date_ns = _resolve_entry(
@@ -222,6 +223,18 @@ def _evaluate_one_recommendation(
         expected_entry_ns = next_nyse_session(as_of_date).value
         return _unavailable_no_entry_row(
             ticker, row_idx, expected_entry_ns, inst_type, amount
+        )
+
+    if inst_type != "stock":
+        return _unavailable_bt_row(
+            ticker,
+            row_idx,
+            entry,
+            entry_date_ns,
+            entry_delay,
+            inst_type,
+            amount,
+            reason="unsupported_instrument_pricing",
         )
 
     exit_target_ns = entry_date_ns + int(t_horizon) * NS_PER_DAY
@@ -250,30 +263,50 @@ def _evaluate_one_recommendation(
     spy_exit = _price_at_exact_ns(spy_ns, spy_vals, exit_date_ns)
     if not spy_entry or not spy_exit:
         return _unavailable_bt_row(
-            ticker, row_idx, entry, entry_date_ns, entry_delay, inst_type, amount
+            ticker,
+            row_idx,
+            entry,
+            entry_date_ns,
+            entry_delay,
+            inst_type,
+            amount,
+            reason="benchmark_quote_unavailable",
         )
     spy_ret = round(
         (spy_exit * exit_mult / (spy_entry * entry_mult) - 1) * 100,
         2,
     )
 
-    row = _bt_row(
-        ticker,
-        entry,
-        entry_delay,
-        exit_price,
-        t_horizon,
-        entry_mult,
-        exit_mult,
-        spy_ret,
-        inst_type,
-        amount,
-    )
+    try:
+        row = _bt_row(
+            ticker,
+            entry,
+            entry_delay,
+            exit_price,
+            t_horizon,
+            entry_mult,
+            exit_mult,
+            spy_ret,
+            inst_type,
+            amount,
+        )
+    except ValueError:
+        return _unavailable_bt_row(
+            ticker,
+            row_idx,
+            entry,
+            entry_date_ns,
+            entry_delay,
+            inst_type,
+            amount,
+            reason="instrument_pricing_unavailable",
+        )
     row["_bt_idx"] = row_idx
     row["bt_entry_date"] = pd.Timestamp(entry_date_ns).date()
     row["bt_exit_date"] = pd.Timestamp(exit_date_ns).date()
     row["bt_delisted"] = False
     row["bt_coverage"] = "complete"
+    row["bt_unavailable_reason"] = None
     row["bt_stale_exit"] = False
     return row
 
@@ -310,9 +343,15 @@ def _price_at_exact_ns(idx_ns, vals, target_ns):
     return value if np.isfinite(value) and value > 0 else None
 
 
-def _unavailable_no_entry_row(ticker, row_idx, entry_date_ns, inst_type, amount):
-    from analyzer.options import estimate_options_leverage
-
+def _unavailable_no_entry_row(
+    ticker,
+    row_idx,
+    entry_date_ns,
+    inst_type,
+    amount,
+    reason="entry_quote_unavailable",
+):
+    leverage = 1.0 if inst_type == "stock" else np.nan
     return {
         "_bt_idx": row_idx,
         "ticker": ticker,
@@ -322,21 +361,28 @@ def _unavailable_no_entry_row(ticker, row_idx, entry_date_ns, inst_type, amount)
         "bt_exit_date": None,
         "bt_raw_return_pct": np.nan,
         "bt_return_pct": np.nan,
-        "bt_leverage": estimate_options_leverage(inst_type, amount),
+        "bt_leverage": leverage,
         "bt_spy_return_pct": np.nan,
         "bt_alpha_pct": np.nan,
         "bt_entry_delay": np.nan,
         "bt_delisted": False,
         "bt_coverage": "unavailable",
+        "bt_unavailable_reason": reason,
         "bt_stale_exit": False,
     }
 
 
 def _unavailable_bt_row(
-    ticker, row_idx, entry, entry_date_ns, entry_delay, inst_type, amount
+    ticker,
+    row_idx,
+    entry,
+    entry_date_ns,
+    entry_delay,
+    inst_type,
+    amount,
+    reason="exit_quote_unavailable",
 ):
-    from analyzer.options import estimate_options_leverage
-
+    leverage = 1.0 if inst_type == "stock" else np.nan
     return {
         "_bt_idx": row_idx,
         "ticker": ticker,
@@ -346,12 +392,13 @@ def _unavailable_bt_row(
         "bt_exit_date": None,
         "bt_raw_return_pct": np.nan,
         "bt_return_pct": np.nan,
-        "bt_leverage": estimate_options_leverage(inst_type, amount),
+        "bt_leverage": leverage,
         "bt_spy_return_pct": np.nan,
         "bt_alpha_pct": np.nan,
         "bt_entry_delay": entry_delay,
         "bt_delisted": False,
         "bt_coverage": "unavailable",
+        "bt_unavailable_reason": reason,
         "bt_stale_exit": True,
     }
 

@@ -210,6 +210,26 @@ class TestCapitolTradesSource(unittest.TestCase):
         with self.assertRaisesRegex(CapitolTradesError, "without a stable source ID"):
             self.source.fetch_all_trades()
 
+    def _assert_none_and_blank_identity_field_collide(self, field: str):
+        first = _trade(doc_id="filing-1", **{field: None})
+        second = _trade(doc_id="filing-1", **{field: "  \t  "})
+        self.source.session.get = MagicMock(return_value=_response([first, second]))
+
+        with self.assertRaisesRegex(CapitolTradesError, "without a stable source ID"):
+            self.source.fetch_all_trades()
+
+    def test_none_and_blank_ticker_are_same_identity(self):
+        self._assert_none_and_blank_identity_field_collide("ticker")
+
+    def test_none_and_blank_state_are_same_identity(self):
+        self._assert_none_and_blank_identity_field_collide("state")
+
+    def test_none_and_blank_party_are_same_identity(self):
+        self._assert_none_and_blank_identity_field_collide("party")
+
+    def test_none_and_blank_filing_url_are_same_identity(self):
+        self._assert_none_and_blank_identity_field_collide("filing_url")
+
     def test_source_id_sentinels_are_missing_before_duplicate_detection(self):
         first = _trade(id=None, doc_id="filing-1")
         second = _trade(id=" None ", doc_id="filing-1")

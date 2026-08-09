@@ -828,7 +828,8 @@ class CapitolTradesSource(TransactionSource):
         """Canonicalize non-ID identity text without applying ID sentinels."""
         if value is None:
             return None
-        return " ".join(str(value).split()).casefold()
+        normalized = " ".join(str(value).split()).casefold()
+        return normalized or None
 
     @classmethod
     def _normalize_model_upper_text(cls, value: Any) -> str | None:

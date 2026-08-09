@@ -1,258 +1,339 @@
-"""Tests for analyzer.validation: newey_west_tstat, select_config."""
+"""Scenario tests for purged, fail-closed validation."""
 
 from __future__ import annotations
 
 import math
+from datetime import date
 
 import numpy as np
 import pandas as pd
+import pytest
 
+from analyzer.pipeline import BacktestParams
 from analyzer.validation import (
+    LOCKED_FINAL_START,
+    MIN_RELEASE_PERMUTATIONS,
+    PRIMARY_METRIC,
+    _backtest_core,
+    _build_manifest,
+    _phase_end,
     newey_west_tstat,
+    permute_signal_member_labels,
+    run_validation,
     select_config,
 )
 
 
-# ---------------------------------------------------------------------------
-# newey_west_tstat
-# ---------------------------------------------------------------------------
+def _series(values, start="2020-01-01"):
+    return pd.Series(
+        values, index=pd.date_range(start, periods=len(values), freq="D"), dtype=float
+    )
 
 
-class TestNeweyWestTstat:
-    def test_lag0_matches_biased_plain_tstat(self):
-        """lag=0 → t = mean / (biased_std / sqrt(n))."""
-        x = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
-        t_nw = newey_west_tstat(x, lag=0)
-        n = len(x)
-        t_plain = float(np.mean(x) / (np.std(x) / np.sqrt(n)))  # ddof=0
-        assert abs(t_nw - t_plain) < 1e-10
-
-    def test_zero_mean_series_gives_zero_tstat(self):
-        """Series whose mean is 0 → t-stat = 0."""
-        x = pd.Series([1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
-        assert abs(newey_west_tstat(x, lag=0)) < 1e-10
-
-    def test_positive_mean_gives_positive_tstat(self):
-        x = pd.Series([2.0, 3.0, 4.0])
-        assert newey_west_tstat(x, lag=0) > 0
-
-    def test_hand_computable_lag0(self):
-        """Hand-verify: x=[0,2], mean=1, biased_std=1, n=2 → t=sqrt(2)."""
-        x = pd.Series([0.0, 2.0])
-        # biased std = sqrt(mean of (0-1)^2 + (2-1)^2) = sqrt(1) = 1
-        # t = 1 / (1 / sqrt(2)) = sqrt(2)
-        t = newey_west_tstat(x, lag=0)
-        assert abs(t - math.sqrt(2)) < 1e-10
-
-    def test_lag0_larger_than_lag1_for_positively_autocorrelated(self):
-        """Positive autocorrelation → HAC widens SE → |t| shrinks with lag."""
-        np.random.seed(42)
-        n = 60
-        ar = np.zeros(n)
-        ar[0] = 1.0
-        for i in range(1, n):
-            ar[i] = 0.7 * ar[i - 1] + np.random.normal(0, 0.3)
-        ar += 2.0  # ensure positive mean
-        x = pd.Series(ar)
-        t0 = abs(newey_west_tstat(x, lag=0))
-        t2 = abs(newey_west_tstat(x, lag=2))
-        # HAC correction should reduce or keep the t-stat
-        assert t2 <= t0 + 0.5  # tolerant: direction matters
-
-    def test_single_element_returns_zero(self):
-        x = pd.Series([5.0])
-        assert newey_west_tstat(x, lag=0) == 0.0
-
-    def test_nan_dropped_before_computation(self):
-        x_with_nan = pd.Series([1.0, float("nan"), 2.0, 3.0])
-        x_clean = pd.Series([1.0, 2.0, 3.0])
-        assert (
-            abs(newey_west_tstat(x_with_nan, lag=0) - newey_west_tstat(x_clean, lag=0))
-            < 1e-10
-        )
-
-    def test_lag_equals_len_minus_1_does_not_crash(self):
-        """Edge case: lag ≥ n-1 should not raise (gamma array boundary)."""
-        x = pd.Series([1.0, 2.0, 3.0])
-        # lag=2 == n-1; gamma[2] involves dot product of length 0 array
-        t = newey_west_tstat(x, lag=2)
-        assert math.isfinite(t) or math.isinf(t)  # no crash
-
-    def test_lag_capped_at_len_minus_1_for_two_observations(self):
-        x = pd.Series([1.0, 3.0])
-        assert newey_west_tstat(x, lag=3) == newey_west_tstat(x, lag=1)
-
-    def test_lag_capped_at_len_minus_1_for_five_observations(self):
-        x = pd.Series([1.0, 2.0, 4.0, 8.0, 16.0])
-        assert newey_west_tstat(x, lag=10) == newey_west_tstat(x, lag=4)
-
-
-# ---------------------------------------------------------------------------
-# select_config
-# ---------------------------------------------------------------------------
-
-
-def _make_sweep_df(n: int = 10, p_values: list[float] | None = None) -> pd.DataFrame:
-    """Build a synthetic sweep DataFrame with n rows."""
-    rng = np.random.default_rng(99)
+def _selection_frame(
+    series_by_trial: dict[int, pd.Series], slopes=None
+) -> pd.DataFrame:
     rows = []
-    for i in range(n):
+    slopes = slopes or [0.0] * len(series_by_trial)
+    for trial_id, values in series_by_trial.items():
+        statistic = newey_west_tstat(values, lag=0)
+        p_value = (
+            float(__import__("scipy").stats.norm.sf(statistic))
+            if math.isfinite(statistic)
+            else (0.0 if statistic > 0 else 1.0)
+        )
         rows.append(
             {
+                "trial_id": trial_id,
                 "horizon": 60,
                 "frequency_days": 30,
                 "training_lookback_days": 365,
-                "min_buyers": 2 + (i % 3),
-                "top_n": 3 + (i % 2) * 2,
+                "min_buyers": 2,
+                "top_n": 5,
                 "decay_lambda": 0.005,
                 "bayes_prior_strength": 20.0,
                 "scoring_mode": "shrunk_alpha",
-                "total_recs": 50,
-                "dates_evaluated": 20,
-                "overall_alpha": float(rng.uniform(0.5, 3.0)),
-                "overall_return": 1.0,
-                "rank1_alpha": 2.0,
-                "rank5_alpha": 1.0,
-                "alpha_slope": float(rng.uniform(-1.0, 2.0)),
-                "win_rate": 60.0,
-                "sharpe": 1.0,
-                "max_drawdown": -5.0,
-                "nw_tstat": 2.0,
-                "p_value": p_values[i] if p_values else 0.9,  # default: no survivors
+                "total_recs": 100,
+                "dates_evaluated": len(values),
+                "overall_alpha": float(values.mean()),
+                "overall_return": max(float(values.mean()), 0.0),
+                "alpha_slope": slopes[trial_id],
+                "nw_lag": 0,
+                "nw_tstat": statistic,
+                "p_value": p_value,
                 "min_sample_ok": True,
             }
         )
     return pd.DataFrame(rows)
 
 
-class TestSelectConfig:
-    def test_picks_max_alpha_slope_among_bh_survivors(self):
-        """Among configs that survive BH, pick the one with the highest alpha_slope."""
-        df = _make_sweep_df(n=5, p_values=[0.001, 0.002, 0.9, 0.9, 0.9])
-        df.loc[0, "alpha_slope"] = 5.0  # best, survives BH
-        df.loc[1, "alpha_slope"] = 2.0  # survives BH but lower slope
-        result = select_config(df, alpha=0.05)
-        assert result["alpha_slope"] == 5.0
-        assert result["survives_correction"] is True
-        assert result["n_survivors"] >= 1
+class TestNeweyWest:
+    def test_zero_alpha_canary_is_exactly_null(self):
+        values = _series(np.zeros(40))
+        assert newey_west_tstat(values, lag=5) == 0.0
 
-    def test_tiebreak_on_overall_alpha(self):
-        """If alpha_slope is tied, pick higher overall_alpha."""
-        df = _make_sweep_df(n=3, p_values=[0.001, 0.001, 0.9])
-        df.loc[0, "alpha_slope"] = 3.0
-        df.loc[1, "alpha_slope"] = 3.0
-        df.loc[0, "overall_alpha"] = 1.0
-        df.loc[1, "overall_alpha"] = 2.0  # should win on tiebreak
-        result = select_config(df, alpha=0.05)
-        assert result["overall_alpha"] == 2.0
+    def test_lag_zero_matches_biased_plain_tstat(self):
+        values = _series(np.arange(1.0, 9.0))
+        expected = values.mean() / (np.std(values) / np.sqrt(len(values)))
+        assert newey_west_tstat(values, lag=0) == pytest.approx(expected)
 
-    def test_no_survivors_returns_nominal_best(self):
-        """When no config survives BH, return nominal best with flag=False."""
-        df = _make_sweep_df(n=6, p_values=[0.9] * 6)
-        df.loc[3, "alpha_slope"] = 10.0  # nominal best
-        result = select_config(df, alpha=0.05)
-        assert result["survives_correction"] is False
+    def test_lag_is_capped(self):
+        values = _series([1.0, 2.0, 4.0, 8.0])
+        assert newey_west_tstat(values, 99) == newey_west_tstat(values, 3)
+
+
+class TestCorrectedSelection:
+    def test_all_zero_canary_has_no_deployable_config(self):
+        null = {0: _series(np.zeros(60))}
+        result = select_config(
+            _selection_frame(null),
+            series_by_trial=null,
+            n_permutations=MIN_RELEASE_PERMUTATIONS,
+            block_days=5,
+        )
+        assert result["deployable_config"] is None
         assert result["n_survivors"] == 0
-        assert result["alpha_slope"] == 10.0
+        assert result["failure_reason"] == "no_dependence_safe_survivor"
 
-    def test_bonferroni_threshold_is_alpha_over_n(self):
-        df = _make_sweep_df(n=8, p_values=[0.9] * 8)
-        result = select_config(df, alpha=0.05)
-        assert abs(result["bonferroni_threshold"] - 0.05 / 8) < 1e-12
+    def test_insufficient_null_count_fails_closed(self):
+        strong = {0: _series(2.0 + np.random.default_rng(2).normal(0, 0.1, 120))}
+        result = select_config(
+            _selection_frame(strong),
+            series_by_trial=strong,
+            n_permutations=99,
+            block_days=1,
+        )
+        assert result["deployable_config"] is None
+        assert result["failure_reason"] == "insufficient_null_permutations"
+        assert result["permutation"]["release_ready"] is False
 
-    def test_n_trials_equals_len_sweep_df(self):
-        df = _make_sweep_df(n=12, p_values=[0.9] * 12)
-        result = select_config(df, alpha=0.05)
-        assert result["n_trials"] == 12
+    def test_missing_or_incomplete_null_series_fails_closed(self):
+        series = {0: _series(np.ones(30)), 1: _series(np.ones(30))}
+        frame = _selection_frame(series)
+        missing = select_config(frame, n_permutations=999)
+        incomplete = select_config(
+            frame, series_by_trial={0: series[0]}, n_permutations=999
+        )
+        assert missing["failure_reason"] == "missing_null_series"
+        assert incomplete["failure_reason"] == "incomplete_null_series"
+        assert missing["deployable_config"] is None
+        assert incomplete["deployable_config"] is None
 
-    def test_all_survive(self):
-        """All very small p-values → all survive → best is still max slope."""
-        df = _make_sweep_df(n=4, p_values=[0.0001] * 4)
-        df.loc[2, "alpha_slope"] = 99.0
-        result = select_config(df, alpha=0.05)
-        assert result["alpha_slope"] == 99.0
-        assert result["n_survivors"] == 4
+    def test_primary_mean_selects_not_rank_slope(self):
+        rng = np.random.default_rng(4)
+        series = {
+            0: _series(2.0 + rng.normal(0, 0.2, 180)),
+            1: _series(1.0 + rng.normal(0, 0.2, 180), start="2020-01-01"),
+        }
+        frame = _selection_frame(series, slopes=[-1000.0, 1000.0])
+        result = select_config(
+            frame,
+            series_by_trial=series,
+            n_permutations=999,
+            permutation_seed=7,
+            block_days=1,
+        )
+        assert result["deployable_config"] is not None
+        assert result["deployable_config"]["trial_id"] == 0
+        assert result["primary_metric"] == PRIMARY_METRIC
 
-    def test_min_sample_filter_excludes_tiny_high_tstat_config(self):
-        """Tiny samples cannot win even with a huge positive t-stat."""
-        df = _make_sweep_df(n=2, p_values=[0.0, 0.02])
-        df.loc[
-            0,
-            [
-                "dates_evaluated",
-                "total_recs",
-                "alpha_slope",
-                "p_value",
-                "min_sample_ok",
-            ],
-        ] = [
-            2,
-            2,
-            100.0,
-            1.0,
-            False,
-        ]
-        df.loc[
-            1,
-            [
-                "dates_evaluated",
-                "total_recs",
-                "alpha_slope",
-                "p_value",
-                "min_sample_ok",
-            ],
-        ] = [
-            10,
-            30,
-            2.0,
-            0.02,
-            True,
-        ]
+    def test_block_permuted_null_does_not_survive(self):
+        blocks = np.tile(np.concatenate([np.ones(5), -np.ones(5)]), 20)
+        null = {0: _series(blocks), 1: _series(-blocks)}
+        result = select_config(
+            _selection_frame(null),
+            series_by_trial=null,
+            n_permutations=999,
+            permutation_seed=11,
+            block_days=5,
+        )
+        assert result["n_survivors"] == 0
+        assert result["deployable_config"] is None
 
-        selected = select_config(df, alpha=0.05)
-
-        assert selected["alpha_slope"] == 2.0
-        assert selected["dates_evaluated"] == 10
-        assert selected["total_recs"] == 30
-        assert selected["survives_correction"] is True
-        assert selected["n_survivors"] == 1
-        assert selected["sample_filter_exhausted"] is False
-
-    def test_bh_correction_counts_filtered_rows_as_trials(self):
-        """Filtered configs carry p=1 but still count in BH's trial denominator."""
-        df = _make_sweep_df(n=10, p_values=[0.02, 0.9] + [1.0] * 8)
-        df.loc[0, ["alpha_slope", "overall_alpha", "min_sample_ok"]] = [2.0, 2.0, True]
-        df.loc[1, ["alpha_slope", "overall_alpha", "min_sample_ok"]] = [1.0, 1.0, True]
-        df.loc[2:, "alpha_slope"] = 100.0
-        df.loc[2:, "overall_alpha"] = 100.0
-        df.loc[2:, "min_sample_ok"] = False
-
-        selected = select_config(df, alpha=0.05)
-
-        assert selected["n_trials"] == 10
-        assert selected["n_min_sample_candidates"] == 2
-        assert selected["n_survivors"] == 0
-        assert selected["survives_correction"] is False
-        assert selected["alpha_slope"] == 2.0
-        assert selected["sample_filter_exhausted"] is False
-
-    def test_sample_filter_exhausted_falls_back_to_overall_best_with_flag(self):
-        """If all rows are too small, keep a deterministic fallback and flag it."""
-        df = _make_sweep_df(n=3, p_values=[1.0, 1.0, 1.0])
-        df["dates_evaluated"] = [1, 2, 3]
-        df["total_recs"] = [2, 4, 6]
-        df["min_sample_ok"] = False
-        df["alpha_slope"] = [1.0, 5.0, 3.0]
-
-        selected = select_config(df, alpha=0.05)
-
-        assert selected["alpha_slope"] == 5.0
-        assert selected["survives_correction"] is False
-        assert selected["n_survivors"] == 0
-        assert selected["n_min_sample_candidates"] == 0
-        assert selected["sample_filter_exhausted"] is True
+    def test_no_survivor_is_descriptive_only_not_a_fallback(self):
+        rng = np.random.default_rng(9)
+        null = {0: _series(rng.normal(0, 1, 80)), 1: _series(rng.normal(0, 1, 80))}
+        frame = _selection_frame(null, slopes=[1.0, 9999.0])
+        result = select_config(
+            frame,
+            series_by_trial=null,
+            n_permutations=999,
+            block_days=10,
+        )
+        assert result["deployable_config"] is None
+        assert result["descriptive_best"]["label"] == "descriptive_only_not_deployable"
 
 
-# ---------------------------------------------------------------------------
-# Smoke test: sweep.py still imports from analyzer.validation
-# ---------------------------------------------------------------------------
+class TestExecutionSupport:
+    def test_frequency_support_and_no_trade_cash_use_identical_spy_dates(
+        self, monkeypatch
+    ):
+        evaluation_calls = []
+
+        def fake_recommendations(*args, **kwargs):
+            as_of = pd.Timestamp(args[2])
+            if as_of.day != 16:
+                return pd.DataFrame()
+            return pd.DataFrame(
+                [
+                    {
+                        "rank": 1,
+                        "ticker": "AAA",
+                        "signal_score": 3.0,
+                        "optimal_horizon": 120,
+                    }
+                ]
+            )
+
+        def fake_evaluate(recommendations, prices, as_of, horizon):
+            evaluation_calls.append(
+                (recommendations.copy(), pd.Timestamp(as_of), horizon)
+            )
+            result = recommendations.copy()
+            if result.iloc[0]["ticker"] == "SPY":
+                result["bt_return_pct"] = 1.0
+                result["bt_spy_return_pct"] = 1.0
+                result["bt_alpha_pct"] = 0.0
+            else:
+                assert "optimal_horizon" not in result.columns
+                assert horizon == 60
+                result["bt_return_pct"] = 2.0
+                result["bt_spy_return_pct"] = 1.0
+                result["bt_alpha_pct"] = 1.0
+            return result
+
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.backtest_recommendations",
+            fake_recommendations,
+        )
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.evaluate_backtest", fake_evaluate
+        )
+        params = BacktestParams(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
+            horizon=60,
+            frequency_days=15,
+            training_lookback_days=365,
+            min_buyers=2,
+            top_n=3,
+        )
+        result, primary = _backtest_core(
+            pd.DataFrame(),
+            pd.DataFrame({"SPY": [1.0]}),
+            params,
+            pd.DataFrame(),
+            20,
+            0.005,
+        )
+        assert list(primary) == pytest.approx([-1.0, 1.0, -1.0])
+        assert result.scheduled_dates == 3
+        assert result.benchmark_dates == 3
+        assert result.dates_evaluated == 3
+        assert result.no_trade_dates == 2
+        assert result.coverage_pct == 100.0
+        assert result.overall_return == pytest.approx(2.0 / 3.0, abs=1e-4)
+        assert result.overall_spy_return == 1.0
+        assert result.overall_alpha == pytest.approx(-1.0 / 3.0, abs=1e-4)
+        assert math.isnan(result.rank5_alpha)
+        assert math.isnan(result.alpha_slope)
+        assert (
+            len(evaluation_calls) == 4
+        )  # one SPY check per date plus one strategy trade
+
+
+class TestPurgeAndManifest:
+    def test_purge_uses_max_executable_holding(self):
+        assert _phase_end(date(2023, 12, 31), 120, 0) == date(2023, 9, 2)
+        assert _phase_end(date(2023, 12, 31), 120, 10) == date(2023, 8, 23)
+
+    def test_locked_final_phase_is_rejected_before_database_open(self, tmp_path):
+        with pytest.raises(ValueError, match="locked final phase"):
+            run_validation(
+                tmp_path / "missing.duckdb",
+                date(2022, 1, 1),
+                date(2023, 12, 31),
+                date(2024, 1, 1),
+                LOCKED_FINAL_START,
+                {"horizon": [60]},
+            )
+
+    def test_manifest_hashes_and_locks_final_without_consuming_it(
+        self, tmp_path, monkeypatch
+    ):
+        database = tmp_path / "db.duckdb"
+        database.write_bytes(b"known database bytes")
+        frame = pd.DataFrame(
+            {"x": [1, 2]}, index=pd.date_range("2024-01-01", periods=2)
+        )
+        monkeypatch.setattr("analyzer.validation._code_hash", lambda: "c" * 64)
+        monkeypatch.setattr("analyzer.validation._git_revision", lambda: "git-known")
+        manifest = _build_manifest(
+            database,
+            frame,
+            frame,
+            frame,
+            {"horizon": [60], "frequency_days": [30]},
+            date(2022, 1, 1),
+            date(2023, 12, 31),
+            date(2023, 11, 1),
+            date(2024, 1, 1),
+            date(2025, 6, 30),
+            date(2025, 5, 1),
+            60,
+            999,
+            7,
+            0.05,
+        )
+        assert manifest["phases"]["locked_final"] == {
+            "start": "2026-01-01",
+            "end": None,
+            "status": "locked_not_loaded_not_evaluated",
+            "consumed": False,
+        }
+        assert manifest["phases"]["train"]["outcomes_end_by"] == "2023-12-31"
+        assert manifest["hashes"]["code_sha256"] == "c" * 64
+        assert manifest["hashes"]["git_revision"] == "git-known"
+        for key in [
+            "database_sha256",
+            "value_snapshot_sha256",
+            "config_sha256",
+            "dependency_sha256",
+        ]:
+            assert len(manifest["hashes"][key]) == 64
+        assert manifest["n_trials"] == 1
+
+
+class TestMemberPermutationCanary:
+    def test_member_label_permutation_is_bijective_and_preserves_values(self):
+        original = {
+            (60, 0.005): pd.DataFrame(
+                {
+                    "member": ["A", "A", "B", "C"],
+                    "ticker": ["X", "Y", "Z", "Q"],
+                    "outcome": [1.0, 2.0, 3.0, 4.0],
+                }
+            ),
+            (90, 0.005): pd.DataFrame(
+                {"member": ["A", "B", "C"], "outcome": [5.0, 6.0, 7.0]}
+            ),
+        }
+        permuted = permute_signal_member_labels(original, seed=3)
+        assert sorted(permuted[(60, 0.005)]["member"].value_counts()) == [1, 1, 2]
+        assert permuted[(60, 0.005)]["outcome"].tolist() == [1.0, 2.0, 3.0, 4.0]
+        assert (
+            permuted[(60, 0.005)]["member"].tolist()
+            != original[(60, 0.005)]["member"].tolist()
+        )
+        assert original[(60, 0.005)]["member"].tolist() == ["A", "A", "B", "C"]
+
+
+def test_legacy_sweep_refuses_winner_claims(capsys):
+    import sweep
+
+    with pytest.raises(SystemExit) as exc:
+        sweep.main()
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "disabled" in error
+    assert "no in-sample winner" in error

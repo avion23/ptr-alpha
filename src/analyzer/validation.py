@@ -1,29 +1,24 @@
-"""Honest time-split validation for PTR Alpha strategies.
+"""Purged nested validation for PTR Alpha strategies.
 
-Implements a proper train/test split:
-  1. Parameter sweep restricted to the TRAINING window only.
-  2. Benjamini-Hochberg / Bonferroni snooping corrections on all tested configs.
-  3. Newey-West HAC t-stats to account for overlapping return windows.
-  4. Frozen config evaluated EXACTLY ONCE on the TEST window.
-
-Public API
-----------
-SweepResult          – backtest summary dataclass (moved from repo-root sweep.py)
-run_single_backtest  – run one config, return SweepResult (moved from sweep.py)
-sweep_configs        – iterate a grid on a date window, return DataFrame
-newey_west_tstat     – Bartlett-kernel HAC t-statistic
-select_config        – BH-corrected config selection
-run_validation       – full train→select→test pipeline
+The validation contract is fail closed:
+* every phase ends early enough for the maximum executable holding to mature;
+* one per-date net-alpha statistic drives inference, correction, selection, and verdict;
+* arbitrary-dependence Bonferroni and synchronized block max-stat gates must pass;
+* fewer than 999 null permutations can never produce a deployable configuration;
+* the post-2025 final phase is locked and is never loaded by this module.
 """
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import logging
 import math
-from dataclasses import dataclass, asdict
-from datetime import date
+import platform
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timezone
+from importlib import metadata
 from pathlib import Path
 
 import numpy as np
@@ -33,20 +28,16 @@ from scipy import stats
 from analyzer import analysis
 from analyzer.exceptions import AnalysisError
 from analyzer.pipeline import BacktestParams
-from analyzer.snooping import benjamini_hochberg, bonferroni_correction
+from analyzer.snooping import bonferroni_correction, max_stat_block_permutation
 
 logger = logging.getLogger(__name__)
 
-
-# T-stats on fewer observations are noise; cf. minimum backtest length,
-# Bailey & Lopez de Prado 2012, referenced in snooping.py.
 MIN_DATES_FOR_CANDIDACY = 8
 MIN_RECS_FOR_CANDIDACY = 20
-
-
-# ---------------------------------------------------------------------------
-# SweepResult (moved verbatim from repo-root sweep.py)
-# ---------------------------------------------------------------------------
+MIN_RELEASE_PERMUTATIONS = 999
+LOCKED_FINAL_START = date(2026, 1, 1)
+VALIDATION_ENTRY_DELAY_DAYS = 0  # evaluate_backtest(use_dip_entry=False)
+PRIMARY_METRIC = "mean_per_date_net_alpha"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,19 +52,57 @@ class SweepResult:
     scoring_mode: str = "shrunk_alpha"
     total_recs: int = 0
     dates_evaluated: int = 0
+    scheduled_dates: int = 0
+    benchmark_dates: int = 0
+    no_trade_dates: int = 0
+    coverage_pct: float = 0.0
     overall_alpha: float = 0.0
     overall_return: float = 0.0
+    overall_spy_return: float = 0.0
     rank1_alpha: float = 0.0
     rank5_alpha: float = 0.0
-    alpha_slope: float = 0.0
+    alpha_slope: float = 0.0  # descriptive only; never a selection statistic
     win_rate: float = 0.0
     sharpe: float = 0.0
     max_drawdown: float = 0.0
 
 
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
+def _empty_result(
+    params: BacktestParams, bayes: float, decay: float, mode: str
+) -> SweepResult:
+    scheduled = len(
+        pd.date_range(
+            params.start_date, params.end_date, freq=f"{params.frequency_days}D"
+        )
+    )
+    return SweepResult(
+        horizon=params.horizon,
+        frequency_days=params.frequency_days,
+        training_lookback_days=params.training_lookback_days,
+        min_buyers=params.min_buyers,
+        top_n=params.top_n,
+        decay_lambda=decay,
+        bayes_prior_strength=bayes,
+        scoring_mode=mode,
+        scheduled_dates=scheduled,
+    )
+
+
+def _benchmark_return(
+    prices: pd.DataFrame, as_of: pd.Timestamp, horizon: int
+) -> float | None:
+    """Return the executable SPY return used by evaluate_backtest on one date."""
+    recommendation = pd.DataFrame(
+        [{"rank": 1, "ticker": "SPY", "signal_score": 1.0, "instrument_type": "stock"}]
+    )
+    try:
+        evaluated = analysis.evaluate_backtest(recommendation, prices, as_of, horizon)
+    except (AnalysisError, KeyError):
+        return None
+    if evaluated.empty or "bt_spy_return_pct" not in evaluated.columns:
+        return None
+    value = evaluated["bt_spy_return_pct"].iloc[0]
+    return float(value) if pd.notna(value) else None
 
 
 def _backtest_core(
@@ -85,98 +114,119 @@ def _backtest_core(
     decay_lambda: float,
     scoring_mode: str = "shrunk_alpha",
 ) -> tuple[SweepResult, pd.Series]:
-    """Core backtest loop returning (SweepResult, per_date_mean_alpha_series).
+    """Run one configuration and return its summary and primary alpha series.
 
-    The per-date series is needed for Newey-West t-stat computation.
-    run_single_backtest is a thin public wrapper that discards the series.
+    The support is the scheduled rebalance calendar for which the identical SPY
+    benchmark is executable. A date with no executable strategy trade earns a
+    zero cash return; it is not silently dropped. Validation removes the
+    data-dependent ``optimal_horizon`` column so the declared horizon is the
+    actual maximum holding used for both strategy and benchmark.
     """
-    empty = SweepResult(
-        horizon=params.horizon,
-        frequency_days=params.frequency_days,
-        training_lookback_days=params.training_lookback_days,
-        min_buyers=params.min_buyers,
-        top_n=params.top_n,
-        decay_lambda=decay_lambda,
-        bayes_prior_strength=bayes_prior_strength,
-        scoring_mode=scoring_mode,
-    )
-
+    empty = _empty_result(params, bayes_prior_strength, decay_lambda, scoring_mode)
     as_of_dates = pd.date_range(
         params.start_date, params.end_date, freq=f"{params.frequency_days}D"
     )
+    date_rows: list[dict] = []
+    evaluated_rows: list[pd.DataFrame] = []
+    total_recommendations = 0
+    failures: list[tuple[pd.Timestamp, Exception]] = []
 
-    all_results = []
-    failures: list[tuple[object, Exception]] = []
     for as_of in as_of_dates:
         as_of_ts = pd.Timestamp(as_of)
-        recs = analysis.backtest_recommendations(
-            signals,
-            all_transactions,
-            as_of_ts,
-            horizon=params.horizon,
-            lookback_days=params.lookback_days,
-            min_buyers=params.min_buyers,
-            top_n=params.top_n,
-            threshold=params.threshold,
-            prices_df=prices,
-            training_lookback_days=params.training_lookback_days,
-            scoring_mode=scoring_mode,
-            bayes_prior_strength=bayes_prior_strength,
-        )
-        if recs.empty:
+        benchmark_return = _benchmark_return(prices, as_of_ts, params.horizon)
+        if benchmark_return is None:
             continue
         try:
-            evaluated = analysis.evaluate_backtest(
-                recs, prices, as_of_ts, params.horizon
+            recommendations = analysis.backtest_recommendations(
+                signals,
+                all_transactions,
+                as_of_ts,
+                horizon=params.horizon,
+                lookback_days=params.lookback_days,
+                min_buyers=params.min_buyers,
+                top_n=params.top_n,
+                threshold=params.threshold,
+                prices_df=prices,
+                training_lookback_days=params.training_lookback_days,
+                scoring_mode=scoring_mode,
+                bayes_prior_strength=bayes_prior_strength,
             )
-            evaluated = evaluated.dropna(subset=["bt_return_pct"])
-            evaluated.insert(0, "as_of_date", as_of_ts.date())
-            all_results.append(evaluated)
         except (AnalysisError, KeyError) as exc:
             failures.append((as_of_ts, exc))
-            logger.warning(
-                "Backtest evaluation unavailable for %s: %s", as_of_ts.date(), exc
+            recommendations = pd.DataFrame()
+
+        strategy_return = 0.0
+        traded = False
+        if not recommendations.empty:
+            frozen_recommendations = recommendations.drop(
+                columns=["optimal_horizon"], errors="ignore"
             )
+            try:
+                evaluated = analysis.evaluate_backtest(
+                    frozen_recommendations, prices, as_of_ts, params.horizon
+                )
+            except (AnalysisError, KeyError) as exc:
+                failures.append((as_of_ts, exc))
+                evaluated = pd.DataFrame()
+            if not evaluated.empty and "bt_return_pct" in evaluated.columns:
+                returns = pd.to_numeric(evaluated["bt_return_pct"], errors="coerce")
+                strategy_return = float(
+                    returns.fillna(0.0).sum() / len(recommendations)
+                )
+                total_recommendations += int(returns.notna().sum())
+                valid = evaluated[returns.notna()].copy()
+                if not valid.empty:
+                    valid.insert(0, "as_of_date", as_of_ts.date())
+                    evaluated_rows.append(valid)
+                    traded = True
+
+        date_rows.append(
+            {
+                "as_of_date": as_of_ts,
+                "strategy_return_pct": strategy_return,
+                "spy_return_pct": benchmark_return,
+                "net_alpha_pct": strategy_return - benchmark_return,
+                "traded": traded,
+            }
+        )
 
     if failures:
-        logger.warning("Skipped %d backtest evaluation date(s)", len(failures))
-
-    if not all_results:
+        logger.warning(
+            "Skipped %d recommendation/evaluation operation(s)", len(failures)
+        )
+    if not date_rows:
         return empty, pd.Series(dtype=float)
 
-    combined = pd.concat(all_results, ignore_index=True)
-    valid = combined.dropna(subset=["bt_alpha_pct"])
+    by_date = pd.DataFrame(date_rows).set_index("as_of_date").sort_index()
+    per_date = by_date["net_alpha_pct"].astype(float)
+    combined = (
+        pd.concat(evaluated_rows, ignore_index=True)
+        if evaluated_rows
+        else pd.DataFrame(columns=["rank", "bt_alpha_pct"])
+    )
+    valid_alpha = (
+        combined.dropna(subset=["bt_alpha_pct"]) if not combined.empty else combined
+    )
+    rank_alpha = (
+        valid_alpha.groupby("rank")["bt_alpha_pct"].mean()
+        if not valid_alpha.empty
+        else pd.Series(dtype=float)
+    )
+    rank1 = float(rank_alpha.loc[1]) if 1 in rank_alpha.index else math.nan
+    rank5 = float(rank_alpha.loc[5]) if 5 in rank_alpha.index else math.nan
+    slope = rank1 - rank5 if math.isfinite(rank1) and math.isfinite(rank5) else math.nan
 
-    # Per-date mean alpha (NW t-stat needs this series ordered by date)
-    per_date = valid.groupby("as_of_date")["bt_alpha_pct"].mean().sort_index()
-
-    # Compute all mutable values before constructing the frozen SweepResult
-    rank_alpha = valid.groupby("rank")["bt_alpha_pct"].mean()
-    r1 = round(float(rank_alpha.loc[1]), 2) if 1 in rank_alpha.index else 0.0
-    r5 = round(float(rank_alpha.loc[5]), 2) if 5 in rank_alpha.index else 0.0
-    # Convention: rank 1 = highest-scored ticker (best model prediction).
-    # A well-calibrated ranker has rank-1 picks outperforming rank-5 picks,
-    # so alpha_slope > 0 means the ranker is working.
-    alpha_slope = round(r1 - r5, 2)
-    win_rate = round(float((valid["bt_alpha_pct"] > 0).mean()) * 100, 1)
-
-    # Sharpe and max_drawdown are time-series portfolio metrics and must
-    # be computed on the per-date mean-alpha series (one observation per
-    # rebalance date). Using per-rec alphas here would treat same-date
-    # correlated picks as independent observations and compound returns in
-    # arbitrary order.
+    standard_deviation = float(per_date.std())
     sharpe = 0.0
-    if len(per_date) > 1:
-        mean_a = per_date.mean()
-        std_a = per_date.std()
-        if std_a > 0:
-            periods_per_year = 365 / params.frequency_days
-            sharpe = round(float(mean_a / std_a * (periods_per_year**0.5)), 2)
-
-    cumulative = (1 + per_date / 100).cumprod()
-    rolling_max = cumulative.cummax()
-    drawdown = (cumulative - rolling_max) / rolling_max
-    max_drawdown = round(float(drawdown.min()) * 100, 2)
+    if len(per_date) > 1 and standard_deviation > 0:
+        periods_per_year = 365.0 / params.frequency_days
+        sharpe = float(
+            per_date.mean() / standard_deviation * math.sqrt(periods_per_year)
+        )
+    cumulative = (1.0 + by_date["strategy_return_pct"] / 100.0).cumprod()
+    drawdown = (cumulative - cumulative.cummax()) / cumulative.cummax()
+    scheduled = len(as_of_dates)
+    supported = len(by_date)
 
     result = SweepResult(
         horizon=params.horizon,
@@ -187,24 +237,23 @@ def _backtest_core(
         decay_lambda=decay_lambda,
         bayes_prior_strength=bayes_prior_strength,
         scoring_mode=scoring_mode,
-        total_recs=len(combined),
-        dates_evaluated=int(valid["as_of_date"].nunique()),
-        overall_alpha=round(float(valid["bt_alpha_pct"].mean()), 2),
-        overall_return=round(float(valid["bt_return_pct"].mean()), 2),
-        rank1_alpha=r1,
-        rank5_alpha=r5,
-        alpha_slope=alpha_slope,
-        win_rate=win_rate,
-        sharpe=sharpe,
-        max_drawdown=max_drawdown,
+        total_recs=total_recommendations,
+        dates_evaluated=supported,
+        scheduled_dates=scheduled,
+        benchmark_dates=supported,
+        no_trade_dates=int((~by_date["traded"]).sum()),
+        coverage_pct=round(100.0 * supported / scheduled, 2) if scheduled else 0.0,
+        overall_alpha=round(float(per_date.mean()), 4),
+        overall_return=round(float(by_date["strategy_return_pct"].mean()), 4),
+        overall_spy_return=round(float(by_date["spy_return_pct"].mean()), 4),
+        rank1_alpha=round(rank1, 4) if math.isfinite(rank1) else math.nan,
+        rank5_alpha=round(rank5, 4) if math.isfinite(rank5) else math.nan,
+        alpha_slope=round(slope, 4) if math.isfinite(slope) else math.nan,
+        win_rate=round(float((per_date > 0).mean()) * 100.0, 2),
+        sharpe=round(sharpe, 4),
+        max_drawdown=round(float(drawdown.min()) * 100.0, 4),
     )
-
     return result, per_date
-
-
-# ---------------------------------------------------------------------------
-# Public functions
-# ---------------------------------------------------------------------------
 
 
 def run_single_backtest(
@@ -216,11 +265,6 @@ def run_single_backtest(
     decay_lambda: float,
     scoring_mode: str = "shrunk_alpha",
 ) -> SweepResult:
-    """Run one backtest with given params and return metrics.
-
-    Moved from repo-root sweep.py.  alpha_slope = rank1_alpha - rank5_alpha:
-    positive means rank-1 picks outperform rank-5 (the ranker is working).
-    """
     result, _ = _backtest_core(
         all_transactions,
         prices,
@@ -234,50 +278,65 @@ def run_single_backtest(
 
 
 def newey_west_tstat(alpha_series: pd.Series, lag: int) -> float:
-    """t-statistic of the mean with Bartlett-kernel HAC standard error.
-
-    Uses 1/n normalization for autocovariances (standard Newey-West).
-    For lag=0 this is equivalent to mean / (biased_std / sqrt(n)).
-
-    Args:
-        alpha_series: Per-period alpha values (NaN are dropped).
-        lag: Maximum autocorrelation lag for HAC correction.
-             Recommended: max(0, ceil(horizon / frequency_days) - 1).
-
-    Returns:
-        HAC-robust t-statistic.
-    """
-    x = np.asarray(alpha_series.dropna(), dtype=float)
+    """Bartlett-kernel HAC t-statistic for the per-date net-alpha mean."""
+    x = np.asarray(pd.Series(alpha_series).dropna(), dtype=float)
     n = len(x)
     if n < 2:
         return 0.0
-    # Autocovariances beyond lag n-1 are undefined; cap the Bartlett window accordingly.
-    lag = max(0, min(lag, n - 1))
-
-    mu = float(x.mean())
-    demeaned = x - mu
-
-    # Autocovariances: γ_k = (1/n) Σ_{t=k}^{n-1} (x_t − μ)(x_{t-k} − μ)
+    lag = max(0, min(int(lag), n - 1))
+    mean = float(x.mean())
+    demeaned = x - mean
     gamma = np.array(
         [np.dot(demeaned[k:], demeaned[: n - k]) / n for k in range(lag + 1)]
     )
-
     if lag == 0:
-        long_run_var = float(gamma[0])
+        long_run_variance = float(gamma[0])
     else:
-        # Bartlett kernel: w_k = 1 − k/(lag+1)
         weights = 1.0 - np.arange(1, lag + 1) / (lag + 1)
-        long_run_var = float(gamma[0] + 2.0 * np.dot(weights, gamma[1:]))
-
-    long_run_var = max(long_run_var, 0.0)
-    se = math.sqrt(long_run_var / n)
-
-    if se < 1e-14:
-        if mu > 0:
+        long_run_variance = float(gamma[0] + 2.0 * np.dot(weights, gamma[1:]))
+    standard_error = math.sqrt(max(long_run_variance, 0.0) / n)
+    if standard_error < 1e-14:
+        if mean > 0:
             return math.inf
-        return -math.inf if mu < 0 else 0.0
+        if mean < 0:
+            return -math.inf
+        return 0.0
+    return float(mean / standard_error)
 
-    return float(mu / se)
+
+def permute_signal_member_labels(
+    signals_by_horizon: dict[tuple[int, float], pd.DataFrame], *, seed: int
+) -> dict[tuple[int, float], pd.DataFrame]:
+    """Return a deterministic member-attribution negative-control cache.
+
+    A single bijection is used across horizons so each member's complete
+    historical outcome path is attributed to another disclosed member while
+    row order, dates, tickers, outcomes, and the member-count distribution stay
+    unchanged. The real transaction candidate universe is not mutated.
+    """
+    members = sorted(
+        {
+            str(member)
+            for frame in signals_by_horizon.values()
+            if "member" in frame.columns
+            for member in frame["member"].dropna().unique()
+        }
+    )
+    if len(members) < 2:
+        raise ValueError("member-label permutation requires at least two members")
+    rng = np.random.default_rng(seed)
+    permuted = list(rng.permutation(members))
+    if all(source == target for source, target in zip(members, permuted)):
+        permuted = permuted[1:] + permuted[:1]
+    mapping = dict(zip(members, permuted))
+    output: dict[tuple[int, float], pd.DataFrame] = {}
+    for key, frame in signals_by_horizon.items():
+        changed = frame.copy()
+        changed["member"] = changed["member"].map(
+            lambda value: mapping.get(str(value), value) if pd.notna(value) else value
+        )
+        output[key] = changed
+    return output
 
 
 def sweep_configs(
@@ -287,152 +346,207 @@ def sweep_configs(
     grid: dict,
     start: date,
     end: date,
+    *,
+    signals_by_horizon: dict[tuple[int, float], pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
-    """Sweep a parameter grid restricted to the given date window.
+    """Evaluate every configuration on one already-purged phase."""
+    if end < start:
+        raise ValueError("purged sweep phase has no executable dates")
+    horizons = {int(value) for value in grid.get("horizon", [60])}
+    decays = {float(value) for value in grid.get("decay_lambda", [0.005])}
+    signal_cache = dict(signals_by_horizon or {})
+    for horizon in horizons:
+        for decay in decays:
+            if (horizon, decay) not in signal_cache:
+                signal_cache[(horizon, decay)] = analysis.calculate_signal_potential(
+                    entry_prices, prices, [horizon], decay_lambda=decay
+                )
 
-    Precomputes signals once per (horizon, decay_lambda) pair, then runs
-    each config's backtest over as_of dates in [start, end]. Appends
-    nw_tstat and p_value columns to the returned DataFrame.
-
-    Args:
-        all_tx: Transactions DataFrame.
-        prices: Wide-format prices (dates × tickers).
-        entry_prices: Entry-price DataFrame from db.get_entry_prices.
-        grid: Dict mapping param-name → list of values.  Must include the
-              keys used by BacktestParams plus decay_lambda,
-              bayes_prior_strength, scoring_mode.
-        start: Backtest window start date.
-        end: Backtest window end date.
-
-    Returns:
-        DataFrame with one row per config; all SweepResult fields plus
-        nw_tstat and p_value columns.
-    """
-    unique_horizons: set[int] = set(grid.get("horizon", [60]))
-    unique_decays: set[float] = set(grid.get("decay_lambda", [0.005]))
-
-    signal_cache: dict[tuple[int, float], pd.DataFrame] = {}
-    for h in unique_horizons:
-        for d in unique_decays:
-            signal_cache[(h, d)] = analysis.calculate_signal_potential(
-                entry_prices,
-                prices,
-                [h],
-                decay_lambda=d,
-            )
-
-    keys = list(grid.keys())
+    keys = list(grid)
     rows: list[dict] = []
-
-    for combo in itertools.product(*grid.values()):
-        params_dict = dict(zip(keys, combo))
-
-        horizon = int(params_dict["horizon"])
-        freq = int(params_dict.get("frequency_days", 30))
-        lag = max(0, math.ceil(horizon / freq) - 1)
-
+    series_by_trial: dict[int, pd.Series] = {}
+    for trial_id, combo in enumerate(itertools.product(*grid.values())):
+        values = dict(zip(keys, combo))
+        horizon = int(values["horizon"])
+        frequency = int(values.get("frequency_days", 30))
+        lag = max(0, math.ceil(horizon / frequency) - 1)
         params = BacktestParams(
             start_date=start,
             end_date=end,
             horizon=horizon,
             lookback_days=60,
-            training_lookback_days=int(params_dict.get("training_lookback_days", 365)),
-            min_buyers=int(params_dict["min_buyers"]),
-            top_n=int(params_dict["top_n"]),
-            threshold=float(params_dict.get("threshold", 5.0)),
-            frequency_days=freq,
+            training_lookback_days=int(values.get("training_lookback_days", 365)),
+            min_buyers=int(values["min_buyers"]),
+            top_n=int(values["top_n"]),
+            threshold=float(values.get("threshold", 5.0)),
+            frequency_days=frequency,
         )
-        sigs = signal_cache[(horizon, float(params_dict["decay_lambda"]))]
+        decay = float(values["decay_lambda"])
         result, per_date = _backtest_core(
             all_tx,
             prices,
             params,
-            sigs,
-            bayes_prior_strength=float(params_dict["bayes_prior_strength"]),
-            decay_lambda=float(params_dict["decay_lambda"]),
-            scoring_mode=str(params_dict.get("scoring_mode", "shrunk_alpha")),
+            signal_cache[(horizon, decay)],
+            bayes_prior_strength=float(values["bayes_prior_strength"]),
+            decay_lambda=decay,
+            scoring_mode=str(values.get("scoring_mode", "shrunk_alpha")),
         )
-
-        t_stat = newey_west_tstat(per_date, lag=lag)
-        p_val = (
-            float(stats.norm.sf(t_stat))
-            if math.isfinite(t_stat)
-            # One-sided positive-alpha test; negative configs get p > 0.5 and cannot survive BH.
-            else 0.0
-            if t_stat > 0
-            else 1.0
+        statistic = newey_west_tstat(per_date, lag)
+        p_value = (
+            float(stats.norm.sf(statistic))
+            if math.isfinite(statistic)
+            else (0.0 if statistic > 0 else 1.0)
         )
-
         row = asdict(result)
-        min_sample_ok = (
+        row["trial_id"] = trial_id
+        row["primary_metric"] = PRIMARY_METRIC
+        row["nw_lag"] = lag
+        row["nw_tstat"] = statistic
+        row["p_value"] = p_value
+        row["min_sample_ok"] = bool(
             result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
             and result.total_recs >= MIN_RECS_FOR_CANDIDACY
         )
-        if not min_sample_ok:
-            p_val = 1.0
-        row["nw_tstat"] = round(t_stat, 4) if math.isfinite(t_stat) else t_stat
-        row["p_value"] = p_val
-        row["min_sample_ok"] = min_sample_ok
         rows.append(row)
+        series_by_trial[trial_id] = per_date
+    frame = pd.DataFrame(rows)
+    frame.attrs["series_by_trial"] = series_by_trial
+    return frame
 
-    return pd.DataFrame(rows)
 
+def select_config(
+    sweep_df: pd.DataFrame,
+    alpha: float = 0.05,
+    *,
+    series_by_trial: dict[int, pd.Series] | None = None,
+    n_permutations: int = 999,
+    permutation_seed: int = 0,
+    block_days: int = 90,
+) -> dict:
+    """Select by the corrected primary metric or return no deployable config."""
+    if sweep_df.empty:
+        raise ValueError("sweep_df must not be empty")
+    required = {"overall_alpha", "overall_return", "p_value", "nw_tstat"}
+    missing = required - set(sweep_df.columns)
+    if missing:
+        raise ValueError(f"sweep_df missing required columns: {sorted(missing)}")
 
-def select_config(sweep_df: pd.DataFrame, alpha: float = 0.05) -> dict:
-    """Select best config with Benjamini-Hochberg snooping correction.
-
-    Among BH survivors, picks max alpha_slope (tie-break: overall_alpha).
-    If no configs survive BH, returns the nominal best flagged
-    survives_correction=False.
-
-    Args:
-        sweep_df: Output of sweep_configs.  Must have columns p_value,
-                  alpha_slope, overall_alpha.
-        alpha: FDR level (default 0.05).
-
-    Returns:
-        Dict of the selected row's fields, plus:
-          survives_correction (bool)
-          n_trials (int)
-          n_survivors (int)
-          bonferroni_threshold (float)
-    """
-    n_trials = len(sweep_df)
-    bonf_thresh = bonferroni_correction(n_trials, alpha)
-    if "min_sample_ok" in sweep_df.columns:
-        candidate_mask = sweep_df["min_sample_ok"].astype(bool).values
-    else:
-        candidate_mask = np.ones(n_trials, dtype=bool)
-    sample_filter_exhausted = not bool(candidate_mask.any())
-
-    bh_mask = benjamini_hochberg(sweep_df["p_value"].values, alpha)
-    bh_mask = bh_mask & candidate_mask
-
-    survivors = sweep_df[bh_mask]
-    if survivors.empty:
-        fallback_df = (
-            sweep_df if sample_filter_exhausted else sweep_df.loc[candidate_mask]
+    working = sweep_df.copy()
+    n_trials = len(working)
+    bonferroni_threshold = bonferroni_correction(n_trials, alpha)
+    candidate = (
+        working["min_sample_ok"].fillna(False).astype(bool).to_numpy()
+        if "min_sample_ok" in working.columns
+        else np.ones(n_trials, dtype=bool)
+    )
+    source_series = series_by_trial or sweep_df.attrs.get("series_by_trial")
+    expected_trial_ids = {
+        int(row.get("trial_id", position)) for position, row in working.iterrows()
+    }
+    supplied_trial_ids = {int(key) for key in source_series} if source_series else set()
+    complete_null_series = expected_trial_ids == supplied_trial_ids
+    max_stat_p = np.ones(n_trials, dtype=float)
+    null_ready = complete_null_series and n_permutations >= MIN_RELEASE_PERMUTATIONS
+    permutation_summary: dict = {
+        "method": "synchronized_calendar_block_sign_max_stat",
+        "n_permutations": int(n_permutations),
+        "minimum_release_permutations": MIN_RELEASE_PERMUTATIONS,
+        "block_days": int(block_days),
+        "seed": int(permutation_seed),
+        "release_ready": null_ready,
+    }
+    if source_series and complete_null_series:
+        normalized = {int(key): value for key, value in source_series.items()}
+        lags = {
+            int(row.get("trial_id", position)): int(row.get("nw_lag", 0))
+            for position, row in working.iterrows()
+        }
+        permutation = max_stat_block_permutation(
+            normalized,
+            lags,
+            n_permutations=n_permutations,
+            block_days=block_days,
+            seed=permutation_seed,
         )
-        best_row = fallback_df.sort_values(
-            ["alpha_slope", "overall_alpha"], ascending=False
-        ).iloc[0]
-        survives = False
-        n_survivors = 0
-    else:
-        best_row = survivors.sort_values(
-            ["alpha_slope", "overall_alpha"], ascending=False
-        ).iloc[0]
-        survives = True
-        n_survivors = int(bh_mask.sum())
+        trial_ids = sorted(normalized)
+        adjusted_by_trial = dict(zip(trial_ids, permutation.adjusted_p_values))
+        max_stat_p = np.asarray(
+            [
+                float(adjusted_by_trial.get(int(row.get("trial_id", position)), 1.0))
+                for position, row in working.iterrows()
+            ]
+        )
+        permutation_summary["null_max_t_quantile_95"] = float(
+            np.quantile(permutation.null_max_statistics, 0.95)
+        )
 
-    result = best_row.to_dict()
-    result["survives_correction"] = survives
-    result["n_trials"] = n_trials
-    result["n_survivors"] = n_survivors
-    result["bonferroni_threshold"] = bonf_thresh
-    result["n_min_sample_candidates"] = int(candidate_mask.sum())
-    result["sample_filter_exhausted"] = sample_filter_exhausted
-    return result
+    working["bonferroni_p_value"] = np.minimum(
+        pd.to_numeric(working["p_value"], errors="coerce").fillna(1.0) * n_trials,
+        1.0,
+    )
+    working["max_stat_p_value"] = max_stat_p
+    survivor = (
+        candidate
+        & null_ready
+        & (working["overall_alpha"].to_numpy(dtype=float) > 0)
+        & (working["overall_return"].to_numpy(dtype=float) > 0)
+        & (working["p_value"].to_numpy(dtype=float) <= bonferroni_threshold)
+        & (max_stat_p <= alpha)
+    )
+    valid_positions = np.flatnonzero(candidate)
+    descriptive_position = (
+        int(
+            valid_positions[
+                np.argmax(working.iloc[valid_positions]["overall_alpha"].to_numpy())
+            ]
+        )
+        if len(valid_positions)
+        else int(np.argmax(working["overall_alpha"].to_numpy(dtype=float)))
+    )
+    descriptive = working.iloc[descriptive_position].to_dict()
+    descriptive["label"] = "descriptive_only_not_deployable"
+
+    survivor_positions = np.flatnonzero(survivor)
+    deployable = None
+    if len(survivor_positions):
+        survivor_frame = working.iloc[survivor_positions]
+        order = survivor_frame.sort_values(
+            ["overall_alpha", "nw_tstat"], ascending=False
+        )
+        deployable = order.iloc[0].to_dict()
+        deployable["label"] = "deployable_train_survivor"
+
+    if not source_series:
+        reason = "missing_null_series"
+    elif not complete_null_series:
+        reason = "incomplete_null_series"
+    elif n_permutations < MIN_RELEASE_PERMUTATIONS:
+        reason = "insufficient_null_permutations"
+    elif deployable is None:
+        reason = "no_dependence_safe_survivor"
+    else:
+        reason = None
+    return {
+        "deployable_config": deployable,
+        "descriptive_best": descriptive,
+        "failure_reason": reason,
+        "primary_metric": PRIMARY_METRIC,
+        "n_trials": n_trials,
+        "n_min_sample_candidates": int(candidate.sum()),
+        "n_survivors": int(survivor.sum()),
+        "bonferroni_threshold": bonferroni_threshold,
+        "alpha": alpha,
+        "permutation": permutation_summary,
+    }
+
+
+def _phase_end(
+    boundary_end: date, max_holding_days: int, max_entry_delay_days: int
+) -> date:
+    return (
+        pd.Timestamp(boundary_end)
+        - pd.Timedelta(days=max_holding_days + max_entry_delay_days)
+    ).date()
 
 
 def run_validation(
@@ -444,213 +558,205 @@ def run_validation(
     grid: dict,
     *,
     out_path: Path | None = None,
+    n_permutations: int = 999,
+    permutation_seed: int = 0,
+    alpha: float = 0.05,
 ) -> dict:
-    """Full honest time-split validation pipeline.
-
-    1. Load all data once (read_only=True).
-    2. Sweep *grid* on the TRAIN window; apply snooping corrections to select
-       the best config.
-    3. Evaluate the frozen config EXACTLY ONCE on the TEST window.
-    4. Compute Newey-West t-stats for both windows.
-    5. Optionally write results to *out_path* and print a summary.
-
-    Args:
-        db_path: Path to congress.duckdb.
-        train_start / train_end: In-sample calibration window.
-        test_start / test_end: Genuine out-of-sample evaluation window.
-        grid: Parameter grid dict (same format as sweep_configs).
-        out_path: Optional JSON output path. No file is written when None.
-
-    Returns:
-        JSON-serializable dict containing train/test metrics, selected config,
-        degradation ratio, and a plain-language verdict.
-    """
+    """Run purged train selection and, only after survival, one test evaluation."""
     if train_end < train_start or test_end < test_start:
         raise ValueError("validation window end must be on or after its start")
     if test_start <= train_end:
         raise ValueError("test window must start after the training window ends")
+    if test_end >= LOCKED_FINAL_START:
+        raise ValueError(
+            f"test window enters locked final phase starting {LOCKED_FINAL_START}"
+        )
     if not grid or not grid.get("horizon"):
         raise ValueError("validation grid must include at least one horizon")
-    if any(int(horizon) < 1 for horizon in grid["horizon"]):
+    horizons = [int(value) for value in grid["horizon"]]
+    if any(value < 1 for value in horizons):
         raise ValueError("validation horizons must be positive")
+    max_holding = max(horizons)
+    train_effective_end = _phase_end(
+        train_end, max_holding, VALIDATION_ENTRY_DELAY_DAYS
+    )
+    test_effective_end = _phase_end(test_end, max_holding, VALIDATION_ENTRY_DELAY_DAYS)
+    if train_effective_end < train_start or test_effective_end < test_start:
+        raise ValueError("phase is too short after executable holding-period purge")
 
     from analyzer.database import Database
 
-    db = Database(Path(db_path), read_only=True)
+    db_path = Path(db_path)
+    db = Database(db_path, read_only=True)
     try:
         return _run_validation_with_db(
-            db, train_start, train_end, test_start, test_end, grid, out_path=out_path
+            db,
+            db_path,
+            train_start,
+            train_end,
+            train_effective_end,
+            test_start,
+            test_end,
+            test_effective_end,
+            grid,
+            max_holding=max_holding,
+            n_permutations=n_permutations,
+            permutation_seed=permutation_seed,
+            alpha=alpha,
+            out_path=out_path,
         )
     finally:
         db.conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Private implementation helpers
-# ---------------------------------------------------------------------------
-
-
 def _run_validation_with_db(
     db,
+    db_path: Path,
     train_start: date,
     train_end: date,
+    train_effective_end: date,
     test_start: date,
     test_end: date,
+    test_effective_end: date,
     grid: dict,
     *,
-    out_path: Path | None = None,
+    max_holding: int,
+    n_permutations: int,
+    permutation_seed: int,
+    alpha: float,
+    out_path: Path | None,
 ) -> dict:
-    """Inner implementation that accepts an open Database connection."""
     tx_start = pd.Timestamp("2021-10-07")
-    tx_end = pd.Timestamp(test_end)
-    # Cover the longest tested forward window.  The old fixed 130-day buffer
-    # silently truncated 180-day configurations into shorter outcomes.
-    max_horizon = max(int(h) for h in grid["horizon"])
-    price_end = pd.Timestamp(test_end) + pd.Timedelta(days=max_horizon + 10)
-
+    tx_end = pd.Timestamp(test_effective_end)
+    price_end = pd.Timestamp(test_end)
     all_tx = db.get_transactions_by_date_range(tx_start, tx_end)
-    all_tickers = sorted(
-        set(all_tx["ticker"].dropna().astype(str).unique().tolist()) | {"SPY"}
+    tickers = sorted(set(all_tx["ticker"].dropna().astype(str)) | {"SPY"})
+    prices = db.get_prices(tickers, tx_start, price_end)
+    entry_prices = db.get_entry_prices(tickers, tx_start, price_end)
+
+    train_df = sweep_configs(
+        all_tx, prices, entry_prices, grid, train_start, train_effective_end
     )
-    prices = db.get_prices(all_tickers, tx_start, price_end)
-    entry_prices = db.get_entry_prices(all_tickers, tx_start, price_end)
-
-    n_tx = len(all_tx)
-    n_tickers = prices.shape[1] if not prices.empty else 0
-    logger.info("Data loaded: %d transactions, %d tickers", n_tx, n_tickers)
-
-    # Phase 1: sweep on TRAIN window only
-    n_combos = 1
-    for v in grid.values():
-        n_combos *= len(v)
-    logger.info(
-        "Sweeping %d configs on TRAIN window [%s -> %s] ...",
-        n_combos,
+    selection = select_config(
+        train_df,
+        alpha,
+        n_permutations=n_permutations,
+        permutation_seed=permutation_seed,
+        block_days=max_holding,
+    )
+    manifest = _build_manifest(
+        db_path,
+        all_tx,
+        prices,
+        entry_prices,
+        grid,
         train_start,
         train_end,
+        train_effective_end,
+        test_start,
+        test_end,
+        test_effective_end,
+        max_holding,
+        n_permutations,
+        permutation_seed,
+        alpha,
     )
+    output = {
+        "status": "no_deployable_config",
+        "primary_metric": PRIMARY_METRIC,
+        "selected_config": None,
+        "descriptive_train_best": _json_safe(selection["descriptive_best"]),
+        "correction": _json_safe(
+            {
+                key: value
+                for key, value in selection.items()
+                if key not in {"deployable_config", "descriptive_best"}
+            }
+        ),
+        "train": _metrics_from_row(selection["descriptive_best"], "descriptive_only"),
+        "test": {"status": "not_run_without_corrected_train_survivor"},
+        "degradation_ratio": None,
+        "verdict": "not_robust",
+        "manifest": manifest,
+    }
 
-    train_df = sweep_configs(all_tx, prices, entry_prices, grid, train_start, train_end)
-    selected = select_config(train_df)
-    n_candidates = int(
-        train_df["min_sample_ok"].sum()
-        if "min_sample_ok" in train_df.columns
-        else len(train_df)
-    )
-    logger.info(
-        "Candidates: %d/%d pass min-sample filter (>=%d dates, >=%d recs)",
-        n_candidates,
-        len(train_df),
-        MIN_DATES_FOR_CANDIDACY,
-        MIN_RECS_FOR_CANDIDACY,
-    )
+    selected = selection["deployable_config"]
+    if selected is not None:
+        config = _config_from_row(selected)
+        signals = analysis.calculate_signal_potential(
+            entry_prices,
+            prices,
+            [int(config["horizon"])],
+            decay_lambda=float(config["decay_lambda"]),
+        )
+        train_result, train_series = _run_frozen(
+            all_tx, prices, signals, config, train_start, train_effective_end
+        )
+        test_result, test_series = _run_frozen(
+            all_tx, prices, signals, config, test_start, test_effective_end
+        )
+        lag = max(
+            0,
+            math.ceil(int(config["horizon"]) / int(config["frequency_days"])) - 1,
+        )
+        train_t, train_p = _statistic_and_p(train_series, lag)
+        test_t, test_p = _statistic_and_p(test_series, lag)
+        test_passes = bool(
+            test_result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
+            and test_result.total_recs >= MIN_RECS_FOR_CANDIDACY
+            and test_result.overall_alpha > 0
+            and test_result.overall_return > 0
+            and test_p <= alpha
+        )
+        output.update(
+            status="validated" if test_passes else "failed_out_of_sample",
+            selected_config=_json_safe(config),
+            train=_window_metrics(
+                train_result, train_t, train_p, "corrected_train_survivor"
+            ),
+            test=_window_metrics(
+                test_result, test_t, test_p, "single_frozen_out_of_sample"
+            ),
+            degradation_ratio=(
+                round(test_result.overall_alpha / train_result.overall_alpha, 4)
+                if train_result.overall_alpha
+                else None
+            ),
+            verdict="robust" if test_passes else "not_robust",
+        )
 
-    logger.info(
-        "Selected: horizon=%d, min_buyers=%d, top_n=%d, scoring_mode=%s",
-        int(selected["horizon"]),
-        int(selected["min_buyers"]),
-        int(selected["top_n"]),
-        selected["scoring_mode"],
-    )
-    logger.info(
-        "  Snooping: %d/%d configs survive BH | Bonferroni threshold: %.5f | survives=%s",
-        selected["n_survivors"],
-        selected["n_trials"],
-        selected["bonferroni_threshold"],
-        selected["survives_correction"],
-    )
+    _print_summary(output)
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(output, indent=2, sort_keys=True, default=str))
+    return output
 
-    # Phase 2: evaluate frozen config ONCE on TEST window
-    horizon = int(selected["horizon"])
-    freq = int(selected["frequency_days"])
-    lag = max(0, math.ceil(horizon / freq) - 1)
-    decay_lambda = float(selected["decay_lambda"])
-    bayes_prior = float(selected["bayes_prior_strength"])
-    scoring_mode = str(selected.get("scoring_mode", "shrunk_alpha"))
-    training_lookback = int(selected["training_lookback_days"])
-    min_buyers = int(selected["min_buyers"])
-    top_n = int(selected["top_n"])
-    threshold = float(selected.get("threshold", 5.0))
 
-    # Pre-compute signals for the frozen (horizon, decay_lambda) once
-    frozen_signals = analysis.calculate_signal_potential(
-        entry_prices,
-        prices,
-        [horizon],
-        decay_lambda=decay_lambda,
-    )
-
-    train_params = BacktestParams(
-        start_date=train_start,
-        end_date=train_end,
-        horizon=horizon,
+def _run_frozen(all_tx, prices, signals, config, start: date, end: date):
+    params = BacktestParams(
+        start_date=start,
+        end_date=end,
+        horizon=int(config["horizon"]),
         lookback_days=60,
-        training_lookback_days=training_lookback,
-        min_buyers=min_buyers,
-        top_n=top_n,
-        threshold=threshold,
-        frequency_days=freq,
+        training_lookback_days=int(config["training_lookback_days"]),
+        min_buyers=int(config["min_buyers"]),
+        top_n=int(config["top_n"]),
+        threshold=float(config.get("threshold", 5.0)),
+        frequency_days=int(config["frequency_days"]),
     )
-    test_params = BacktestParams(
-        start_date=test_start,
-        end_date=test_end,
-        horizon=horizon,
-        lookback_days=60,
-        training_lookback_days=training_lookback,
-        min_buyers=min_buyers,
-        top_n=top_n,
-        threshold=threshold,
-        frequency_days=freq,
-    )
-
-    # Re-run TRAIN with the selected config to get per-date series for NW stat
-    train_result, train_per_date = _backtest_core(
+    return _backtest_core(
         all_tx,
         prices,
-        train_params,
-        frozen_signals,
-        bayes_prior_strength=bayes_prior,
-        decay_lambda=decay_lambda,
-        scoring_mode=scoring_mode,
+        params,
+        signals,
+        float(config["bayes_prior_strength"]),
+        float(config["decay_lambda"]),
+        str(config.get("scoring_mode", "shrunk_alpha")),
     )
 
-    # One evaluation on TEST — no peeking before this point
-    test_result, test_per_date = _backtest_core(
-        all_tx,
-        prices,
-        test_params,
-        frozen_signals,
-        bayes_prior_strength=bayes_prior,
-        decay_lambda=decay_lambda,
-        scoring_mode=scoring_mode,
-    )
 
-    train_t = newey_west_tstat(train_per_date, lag=lag)
-    # One-sided H1: alpha > 0, matching sweep_configs.
-    train_p = (
-        float(stats.norm.sf(train_t))
-        if math.isfinite(train_t)
-        else (0.0 if train_t > 0 else 1.0)
-    )
-    test_t = newey_west_tstat(test_per_date, lag=lag)
-    test_p = (
-        float(stats.norm.sf(test_t))
-        if math.isfinite(test_t)
-        else (0.0 if test_t > 0 else 1.0)
-    )
-
-    spy_train = _spy_mean_return(prices, train_start, train_end, horizon)
-    spy_test = _spy_mean_return(prices, test_start, test_end, horizon)
-
-    train_alpha = train_result.overall_alpha
-    test_alpha = test_result.overall_alpha
-    deg_ratio = round(test_alpha / train_alpha, 3) if train_alpha != 0 else None
-
-    verdict = _verdict(
-        test_result, test_t, test_p, deg_ratio, selected["survives_correction"]
-    )
-
-    config_keys = [
+def _config_from_row(row: dict) -> dict:
+    keys = [
         "horizon",
         "frequency_days",
         "training_lookback_days",
@@ -660,161 +766,265 @@ def _run_validation_with_db(
         "bayes_prior_strength",
         "scoring_mode",
     ]
-    frozen_config = {k: selected[k] for k in config_keys if k in selected}
+    return {key: row[key] for key in keys if key in row}
 
-    output = {
-        "selected_config": frozen_config,
-        "snooping": {
-            "survives_bh": bool(selected["survives_correction"]),
-            "n_trials": int(selected["n_trials"]),
-            "n_survivors": int(selected["n_survivors"]),
-            "bonferroni_threshold": float(selected["bonferroni_threshold"]),
-            "n_min_sample_candidates": int(selected["n_min_sample_candidates"]),
-            "min_dates_for_candidacy": MIN_DATES_FOR_CANDIDACY,
-            "min_recs_for_candidacy": MIN_RECS_FOR_CANDIDACY,
-            "sample_filter_exhausted": bool(selected["sample_filter_exhausted"]),
-        },
-        "train": _window_metrics(train_result, train_t, train_p, spy_train),
-        "test": _window_metrics(test_result, test_t, test_p, spy_test),
-        "degradation_ratio": deg_ratio,
-        "verdict": verdict,
-        "meta": {
-            "train_window": [str(train_start), str(train_end)],
-            "test_window": [str(test_start), str(test_end)],
-            "nw_lag": lag,
-            "n_transactions": n_tx,
-            "n_tickers": n_tickers,
-        },
-    }
 
-    _print_summary(output)
-
-    if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w") as f:
-            json.dump(output, f, indent=2, default=str)
-        logger.info("Results written to %s", out_path)
-
-    return output
+def _statistic_and_p(series: pd.Series, lag: int) -> tuple[float, float]:
+    statistic = newey_west_tstat(series, lag)
+    p_value = (
+        float(stats.norm.sf(statistic))
+        if math.isfinite(statistic)
+        else (0.0 if statistic > 0 else 1.0)
+    )
+    return statistic, p_value
 
 
 def _window_metrics(
-    result: SweepResult,
-    t_stat: float,
-    p_val: float,
-    spy_return: float | None,
+    result: SweepResult, statistic: float, p_value: float, label: str
 ) -> dict:
     return {
-        "N": int(result.total_recs),
-        "dates_evaluated": int(result.dates_evaluated),
-        "mean_alpha": float(result.overall_alpha),
-        "win_rate": float(result.win_rate),
-        "rank1_alpha": float(result.rank1_alpha),
-        "rank5_alpha": float(result.rank5_alpha),
-        "alpha_slope": float(result.alpha_slope),
-        "nw_tstat": round(t_stat, 4) if math.isfinite(t_stat) else None,
-        "nw_pval": round(p_val, 6),
-        "spy_mean_return": spy_return,
+        "status": label,
+        "N": result.total_recs,
+        "dates_evaluated": result.dates_evaluated,
+        "scheduled_dates": result.scheduled_dates,
+        "benchmark_dates": result.benchmark_dates,
+        "no_trade_dates": result.no_trade_dates,
+        "coverage_pct": result.coverage_pct,
+        "mean_net_alpha": result.overall_alpha,
+        "mean_strategy_return": result.overall_return,
+        "mean_spy_return": result.overall_spy_return,
+        "win_rate": result.win_rate,
+        "nw_tstat": round(statistic, 6) if math.isfinite(statistic) else None,
+        "nw_pval": round(p_value, 8),
+        "rank1_alpha_descriptive": result.rank1_alpha,
+        "rank5_alpha_descriptive": result.rank5_alpha,
+        "rank_slope_descriptive": result.alpha_slope,
     }
 
 
-def _spy_mean_return(
-    prices: pd.DataFrame, start: date, end: date, horizon: int
-) -> float | None:
-    """Mean SPY forward return over the evaluation window, or None."""
-    if prices.empty or "SPY" not in prices.columns:
-        return None
+def _metrics_from_row(row: dict, label: str) -> dict:
+    return {
+        "status": label,
+        "N": int(row.get("total_recs", 0)),
+        "dates_evaluated": int(row.get("dates_evaluated", 0)),
+        "scheduled_dates": int(row.get("scheduled_dates", 0)),
+        "benchmark_dates": int(row.get("benchmark_dates", 0)),
+        "no_trade_dates": int(row.get("no_trade_dates", 0)),
+        "coverage_pct": float(row.get("coverage_pct", 0.0)),
+        "mean_net_alpha": float(row.get("overall_alpha", 0.0)),
+        "mean_strategy_return": float(row.get("overall_return", 0.0)),
+        "mean_spy_return": float(row.get("overall_spy_return", 0.0)),
+        "nw_tstat": _finite_or_none(row.get("nw_tstat")),
+        "nw_pval": float(row.get("p_value", 1.0)),
+        "label": "not_selected_for_deployment",
+    }
+
+
+def _finite_or_none(value):
     try:
-        spy = prices["SPY"].dropna()
-        dates = pd.date_range(start, end, freq="30D")
-        returns = []
-        for d in dates:
-            ts = pd.Timestamp(d)
-            end_ts = ts + pd.Timedelta(days=horizon)
-            entry = spy.asof(ts)
-            exit_ = spy.asof(end_ts)
-            exit_pos = spy.index.searchsorted(end_ts, side="right") - 1
-            exit_is_mature = exit_pos >= 0 and end_ts - pd.Timestamp(
-                spy.index[exit_pos]
-            ) <= pd.Timedelta(days=7)
-            if pd.notna(entry) and pd.notna(exit_) and entry > 0 and exit_is_mature:
-                returns.append((exit_ - entry) / entry * 100)
-        return round(float(np.mean(returns)), 2) if returns else None
-    except Exception:
+        numeric = float(value)
+    except (TypeError, ValueError):
         return None
+    return numeric if math.isfinite(numeric) else None
 
 
-def _verdict(
-    test_result: SweepResult,
-    test_t: float,
-    test_p: float,
-    deg_ratio: float | None,
-    survives_correction: bool,
-) -> str:
-    """Plain-language verdict: robust / partially robust / not robust."""
-    positive_alpha = test_result.overall_alpha > 0
-    # Use 10% significance for OOS (lower power due to smaller test window)
-    significant = math.isfinite(test_t) and test_p < 0.10
-    healthy_decay = deg_ratio is not None and deg_ratio > 0.3
+def _spy_mean_return(
+    prices: pd.DataFrame,
+    start: date,
+    end: date,
+    horizon: int,
+    frequency_days: int = 30,
+) -> float | None:
+    """Mean executable SPY return on exactly the requested calendar support."""
+    returns = [
+        _benchmark_return(prices, pd.Timestamp(as_of), horizon)
+        for as_of in pd.date_range(start, end, freq=f"{frequency_days}D")
+    ]
+    valid = [value for value in returns if value is not None]
+    return round(float(np.mean(valid)), 4) if valid else None
 
-    if positive_alpha and significant and healthy_decay and survives_correction:
-        return "robust"
-    if positive_alpha and healthy_decay:
-        return "partially robust"
-    return "not robust"
+
+def _build_manifest(
+    db_path: Path,
+    all_tx: pd.DataFrame,
+    prices: pd.DataFrame,
+    entry_prices: pd.DataFrame,
+    grid: dict,
+    train_start: date,
+    train_end: date,
+    train_effective_end: date,
+    test_start: date,
+    test_end: date,
+    test_effective_end: date,
+    max_holding: int,
+    n_permutations: int,
+    permutation_seed: int,
+    alpha: float,
+) -> dict:
+    config_payload = {
+        "grid": grid,
+        "alpha": alpha,
+        "n_permutations": n_permutations,
+        "permutation_seed": permutation_seed,
+        "primary_metric": PRIMARY_METRIC,
+        "max_holding_days": max_holding,
+        "max_entry_delay_days": VALIDATION_ENTRY_DELAY_DAYS,
+    }
+    dependencies = {
+        name: _dependency_version(name)
+        for name in ["numpy", "pandas", "scipy", "duckdb"]
+    }
+    dependencies["python"] = platform.python_version()
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "phases": {
+            "train": {
+                "boundary": [str(train_start), str(train_end)],
+                "executable_as_of": [str(train_start), str(train_effective_end)],
+                "outcomes_end_by": str(train_end),
+            },
+            "test": {
+                "boundary": [str(test_start), str(test_end)],
+                "executable_as_of": [str(test_start), str(test_effective_end)],
+                "outcomes_end_by": str(test_end),
+            },
+            "locked_final": {
+                "start": str(LOCKED_FINAL_START),
+                "end": None,
+                "status": "locked_not_loaded_not_evaluated",
+                "consumed": False,
+            },
+        },
+        "purge": {
+            "max_executable_entry_delay_days": VALIDATION_ENTRY_DELAY_DAYS,
+            "max_possible_holding_days": max_holding,
+            "calendar_purge_days": max_holding + VALIDATION_ENTRY_DELAY_DAYS,
+        },
+        "trial_grid": _json_safe(grid),
+        "n_trials": int(math.prod(len(values) for values in grid.values())),
+        "null": {
+            "method": "synchronized_calendar_block_sign_max_stat",
+            "n_permutations": n_permutations,
+            "minimum_release_permutations": MIN_RELEASE_PERMUTATIONS,
+            "seed": permutation_seed,
+        },
+        "hashes": {
+            "database_sha256": _sha256_file(db_path),
+            "value_snapshot_sha256": _value_snapshot_hash(all_tx, prices, entry_prices),
+            "code_sha256": _code_hash(),
+            "config_sha256": _sha256_json(config_payload),
+            "git_revision": _git_revision(),
+            "dependency_sha256": _sha256_json(dependencies),
+        },
+        "dependencies": dependencies,
+        "coverage_input": {
+            "transactions": len(all_tx),
+            "price_rows": len(prices),
+            "price_columns": len(prices.columns),
+            "entry_price_rows": len(entry_prices),
+            "price_start": str(prices.index.min()) if not prices.empty else None,
+            "price_end": str(prices.index.max()) if not prices.empty else None,
+        },
+    }
+
+
+def _dependency_version(name: str) -> str:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _value_snapshot_hash(*frames: pd.DataFrame) -> str:
+    digest = hashlib.sha256()
+    for frame in frames:
+        digest.update(json.dumps([str(value) for value in frame.columns]).encode())
+        digest.update(
+            pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes()
+        )
+    return digest.hexdigest()
+
+
+def _code_hash() -> str:
+    root = Path(__file__).resolve().parents[2]
+    paths = sorted((root / "src" / "analyzer").rglob("*.py")) + [root / "sweep.py"]
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _git_revision() -> str:
+    """Read the worktree Git revision without invoking a subprocess."""
+    root = Path(__file__).resolve().parents[2]
+    dot_git = root / ".git"
+    try:
+        if dot_git.is_file():
+            git_dir = Path(dot_git.read_text().split(":", 1)[1].strip())
+        else:
+            git_dir = dot_git
+        common_dir_file = git_dir / "commondir"
+        common_dir = (
+            (git_dir / common_dir_file.read_text().strip()).resolve()
+            if common_dir_file.exists()
+            else git_dir
+        )
+        head = (git_dir / "HEAD").read_text().strip()
+        if not head.startswith("ref: "):
+            return head
+        reference = head.removeprefix("ref: ")
+        loose = common_dir / reference
+        if loose.exists():
+            return loose.read_text().strip()
+        packed = common_dir / "packed-refs"
+        for line in packed.read_text().splitlines():
+            if line and not line.startswith(("#", "^")):
+                revision, name = line.split(" ", 1)
+                if name == reference:
+                    return revision
+    except (OSError, IndexError, ValueError):
+        return "unavailable"
+    return "unavailable"
+
+
+def _sha256_json(value) -> str:
+    return hashlib.sha256(
+        json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if isinstance(value, (pd.Timestamp, date, datetime)):
+        return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _print_summary(output: dict) -> None:
-    sep = "=" * 65
-    logger.info("\n%s", sep)
-    logger.info("=== Validation Summary ===")
-    logger.info("%s", sep)
-
-    cfg = output["selected_config"]
-    logger.info(
-        "  Config:  horizon=%s, freq=%s, min_buyers=%s, top_n=%s, mode=%s",
-        cfg["horizon"],
-        cfg["frequency_days"],
-        cfg["min_buyers"],
-        cfg["top_n"],
-        cfg["scoring_mode"],
-    )
-
-    snoop = output["snooping"]
-    logger.info(
-        "  Candidates: %d/%d pass min-sample filter (>=%d dates, >=%d recs)",
-        snoop["n_min_sample_candidates"],
-        snoop["n_trials"],
-        snoop["min_dates_for_candidacy"],
-        snoop["min_recs_for_candidacy"],
-    )
-    logger.info(
-        "  Snooping: %d/%d survive BH | Bonferroni alpha=%.5f | survives=%s",
-        snoop["n_survivors"],
-        snoop["n_trials"],
-        snoop["bonferroni_threshold"],
-        snoop["survives_bh"],
-    )
-
-    for label, key in [
-        ("TRAIN (in-sample)", "train"),
-        ("TEST  (out-of-sample)", "test"),
-    ]:
-        m = output[key]
-        t_str = f"{m['nw_tstat']:+.2f}" if m["nw_tstat"] is not None else "N/A"
-        logger.info("\n  %s:", label)
-        logger.info("    N=%d recs, %d dates", m["N"], m["dates_evaluated"])
-        logger.info("    mean alpha: %+.2f%%", m["mean_alpha"])
-        logger.info("    win rate:   %.1f%%", m["win_rate"])
-        logger.info(
-            "    rank1/5:    %+.2f%% / %+.2f%%", m["rank1_alpha"], m["rank5_alpha"]
+    logger.info("Validation status: %s", output["status"])
+    logger.info("Primary metric: %s", output["primary_metric"])
+    logger.info("Verdict: %s", output["verdict"])
+    if output["selected_config"] is None:
+        logger.warning(
+            "No deployable configuration: %s",
+            output["correction"].get("failure_reason"),
         )
-        logger.info("    NW t-stat:  %s  (p=%.4f)", t_str, m["nw_pval"])
-        if m.get("spy_mean_return") is not None:
-            logger.info("    SPY return: %+.2f%%", m["spy_mean_return"])
-
-    deg = output["degradation_ratio"]
-    if deg is not None:
-        logger.info("\n  Degradation ratio (OOS/IS alpha): %.3f", deg)
-    logger.info("  Verdict: %s", output["verdict"].upper())
-    logger.info("%s", sep)

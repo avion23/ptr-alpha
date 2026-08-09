@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import math
+from dataclasses import replace
 from datetime import date
 
 import numpy as np
@@ -64,7 +65,7 @@ def _selection_frame(
                 "top_n": 5,
                 "decay_lambda": 0.005,
                 "bayes_prior_strength": 20.0,
-                "scoring_mode": "shrunk_alpha",
+                "scoring_mode": "consensus",
                 "total_recs": 100,
                 "dates_evaluated": len(values),
                 "overall_alpha": float(values.mean()),
@@ -77,6 +78,12 @@ def _selection_frame(
             }
         )
     return pd.DataFrame(rows)
+
+
+def _with_series(frame: pd.DataFrame, series: dict[int, pd.Series]) -> pd.DataFrame:
+    frame = frame.copy()
+    frame.attrs["series_by_trial"] = series
+    return frame
 
 
 class TestNeweyWest:
@@ -206,6 +213,14 @@ class TestMemberIdentityGate:
             result["member_identity_control"]["status"] == "invalid_non_runner_control"
         )
 
+    def test_descriptive_scoring_modes_are_never_deployment_candidates(self):
+        series = {0: _series(np.full(180, 2.0))}
+        frame = _selection_frame(series)
+        frame["scoring_mode"] = "shrunk_alpha"
+        result = select_config(frame, series_by_trial=series, n_permutations=999)
+        assert result["statistical_candidate"] is None
+        assert result["deployable_config"] is None
+
     def test_identity_free_exemption_payload_is_never_accepted(self):
         series = {0: _series(np.full(180, 2.0))}
         frame = _selection_frame(series)
@@ -226,7 +241,7 @@ class TestMemberIdentityGate:
             result["member_identity_control"]["status"] == "invalid_non_runner_control"
         )
 
-    def test_production_member_control_runs_full_family_and_records_runtime(
+    def test_production_member_control_derives_executed_family_and_statistic(
         self, monkeypatch
     ):
         signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
@@ -234,44 +249,44 @@ class TestMemberIdentityGate:
             "analyzer.validation.analysis.calculate_signal_potential",
             lambda *args, **kwargs: signal,
         )
+        series = {0: _series(np.full(20, 3.0))}
+        baseline = _with_series(_selection_frame(series), series)
         calls = []
 
         def fake_sweep(*args, **kwargs):
             permuted = kwargs["signals_by_horizon"]
             calls.append(permuted)
             labels = permuted[(60, 0.005)]["member"].tolist()
-            statistic = 3.0 if labels == ["A", "B"] else 1.0
-            return pd.DataFrame([{"min_sample_ok": True, "nw_tstat": statistic}])
+            result = baseline.copy()
+            if labels != ["A", "B"]:
+                result["nw_tstat"] = 0.0
+            result.attrs["series_by_trial"] = series
+            return result
 
         monkeypatch.setattr("analyzer.validation.sweep_configs", fake_sweep)
         result = _run_member_identity_control(
             pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
-            {
-                "horizon": [60],
-                "decay_lambda": [0.005],
-                "frequency_days": [30],
-            },
+            {"horizon": [60], "decay_lambda": [0.005]},
             date(2022, 1, 1),
             date(2023, 1, 1),
-            observed_statistic=2.5,
             observed_trial_id=0,
-            family_sha256="f" * 64,
             n_permutations=3,
             seed=10,
         )
-        assert len(calls) == 2  # exact 2! group: identity and swap
+        assert len(calls) == 2  # baseline plus swap; identity reuses baseline
         assert result.status == "completed"
         assert result.exact_enumeration is True
         assert result.permutation_group_size == 2
         assert result.p_value_resolution == 0.5
-        assert result.max_stat_p_value >= 0.5  # identity is in the null
+        assert result.max_stat_p_value >= 0.5
+        assert result.observed_statistic == baseline.iloc[0]["nw_tstat"]
+        assert result.family_sha256 == _member_family_sha256(baseline, series)
         assert result.release_ready is True
-        assert result.runtime_seconds >= 0
 
     def test_large_group_samples_unique_uniform_permutations(self):
-        members = list("ABCDEFG")  # 7! exceeds exact-enumeration threshold
+        members = list("ABCDEFG")
         permutations, group_size, exact = _member_identity_permutations(
             members, 999, seed=8
         )
@@ -293,9 +308,10 @@ class TestMemberIdentityGate:
             "analyzer.validation.analysis.calculate_signal_potential",
             lambda *args, **kwargs: signal,
         )
+        series = {0: _series(np.ones(20))}
+        baseline = _with_series(_selection_frame(series), series)
         monkeypatch.setattr(
-            "analyzer.validation.sweep_configs",
-            lambda *args, **kwargs: pytest.fail("budget must stop before evaluation"),
+            "analyzer.validation.sweep_configs", lambda *args, **kwargs: baseline
         )
         result = _run_member_identity_control(
             pd.DataFrame(),
@@ -304,9 +320,7 @@ class TestMemberIdentityGate:
             {"horizon": [60], "decay_lambda": [0.005]},
             date(2022, 1, 1),
             date(2023, 1, 1),
-            observed_statistic=1.0,
             observed_trial_id=0,
-            family_sha256="f" * 64,
             n_permutations=999,
             seed=10,
             runtime_budget_seconds=0.0,
@@ -316,21 +330,26 @@ class TestMemberIdentityGate:
         assert result.release_ready is False
         assert result.max_stat_p_value == 1.0
 
-    def test_only_bound_runner_result_can_unlock_deployment(self, monkeypatch):
+    def test_only_bound_unedited_runner_result_can_unlock_deployment(self, monkeypatch):
         signal = pd.DataFrame({"member": list("ABCDEFG"), "value": np.arange(7.0)})
         monkeypatch.setattr(
             "analyzer.validation.analysis.calculate_signal_potential",
             lambda *args, **kwargs: signal,
         )
-        monkeypatch.setattr(
-            "analyzer.validation.sweep_configs",
-            lambda *args, **kwargs: pd.DataFrame(
-                [{"min_sample_ok": True, "nw_tstat": 0.0}]
-            ),
-        )
         series = {0: _series(np.full(180, 2.0))}
-        frame = _selection_frame(series)
-        family_sha256 = _member_family_sha256(frame, series)
+        baseline = _with_series(_selection_frame(series), series)
+        calls = 0
+
+        def fake_sweep(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = baseline.copy()
+            if calls > 1:
+                result["nw_tstat"] = 0.0
+            result.attrs["series_by_trial"] = series
+            return result
+
+        monkeypatch.setattr("analyzer.validation.sweep_configs", fake_sweep)
         control = _run_member_identity_control(
             pd.DataFrame(),
             pd.DataFrame(),
@@ -338,33 +357,37 @@ class TestMemberIdentityGate:
             {"horizon": [60], "decay_lambda": [0.005]},
             date(2022, 1, 1),
             date(2023, 1, 1),
-            observed_statistic=float(frame.iloc[0]["nw_tstat"]),
             observed_trial_id=0,
-            family_sha256=family_sha256,
             n_permutations=999,
             seed=1,
         )
-        result = select_config(
-            frame,
-            series_by_trial=series,
-            n_permutations=999,
-            member_control=control,
-        )
+        result = select_config(baseline, n_permutations=999, member_control=control)
         assert control.evaluated_permutations == 999
         assert control.release_ready is True
         assert result["deployable_config"] is not None
 
-    def test_runner_result_must_match_exact_family_hash(self, monkeypatch):
+        edited = replace(control, max_stat_p_value=0.0)
+        edited_result = select_config(
+            baseline, n_permutations=999, member_control=edited
+        )
+        assert edited_result["deployable_config"] is None
+
+        statistic_edited = replace(control, observed_statistic=0.0)
+        statistic_result = select_config(
+            baseline, n_permutations=999, member_control=statistic_edited
+        )
+        assert statistic_result["deployable_config"] is None
+
+    def test_runner_result_must_match_exact_executed_family(self, monkeypatch):
         signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
         monkeypatch.setattr(
             "analyzer.validation.analysis.calculate_signal_potential",
             lambda *args, **kwargs: signal,
         )
+        executed_series = {0: _series(np.full(180, 2.0))}
+        executed = _with_series(_selection_frame(executed_series), executed_series)
         monkeypatch.setattr(
-            "analyzer.validation.sweep_configs",
-            lambda *args, **kwargs: pd.DataFrame(
-                [{"min_sample_ok": True, "nw_tstat": 0.0}]
-            ),
+            "analyzer.validation.sweep_configs", lambda *args, **kwargs: executed
         )
         control = _run_member_identity_control(
             pd.DataFrame(),
@@ -373,19 +396,13 @@ class TestMemberIdentityGate:
             {"horizon": [60], "decay_lambda": [0.005]},
             date(2022, 1, 1),
             date(2023, 1, 1),
-            observed_statistic=100.0,
             observed_trial_id=0,
-            family_sha256="wrong-family",
             n_permutations=999,
             seed=1,
         )
-        series = {0: _series(np.full(180, 2.0))}
-        result = select_config(
-            _selection_frame(series),
-            series_by_trial=series,
-            n_permutations=999,
-            member_control=control,
-        )
+        changed_series = {0: _series(np.full(180, 3.0))}
+        changed = _with_series(_selection_frame(changed_series), changed_series)
+        result = select_config(changed, n_permutations=999, member_control=control)
         assert result["statistical_candidate"] is not None
         assert result["deployable_config"] is None
 
@@ -407,7 +424,9 @@ class TestExecutionSupport:
         evaluation_calls = []
 
         def fake_recommendations(*args, **kwargs):
-            as_of = pd.Timestamp(args[2])
+            assert len(args) == 2
+            assert kwargs["scoring_mode"] == "consensus"
+            as_of = pd.Timestamp(kwargs["as_of_date"])
             if as_of.day != 16:
                 return pd.DataFrame()
             return pd.DataFrame(
@@ -463,6 +482,11 @@ class TestExecutionSupport:
             0.005,
         )
         assert list(primary) == pytest.approx([-1.0, 1.0, -1.0])
+        assert result.scoring_mode == "consensus"
+        assert (
+            inspect.signature(_backtest_core).parameters["scoring_mode"].default
+            == "consensus"
+        )
         assert result.scheduled_dates == 3
         assert result.benchmark_dates == 3
         assert result.dates_evaluated == 3
@@ -593,6 +617,32 @@ class TestEvaluationConsumptionLedger:
         )
         _validate_ledger(payload)
 
+    def test_prior_v1_ledger_requires_explicit_archive_or_migration(self, tmp_path):
+        legacy = tmp_path / "validation_evaluation_ledger.json"
+        legacy.write_text(
+            __import__("json").dumps(
+                {
+                    "schema_version": 1,
+                    "evaluations": [{"window": ["2024-01-01", "2025-06-30"]}],
+                }
+            )
+        )
+        manifest = {
+            "hashes": {
+                "database_sha256": "a" * 64,
+                "value_snapshot_sha256": "b" * 64,
+            }
+        }
+        with pytest.raises(EvaluationLedgerIntegrityError, match="archive or migrate"):
+            _reserve_evaluation(
+                tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
+                manifest,
+                {},
+                {},
+                date(2024, 1, 1),
+                date(2025, 6, 30),
+            )
+
     def test_hash_chain_detects_local_tampering(self, tmp_path):
         ledger = tmp_path / "ledger.json"
         manifest = {
@@ -629,6 +679,23 @@ class TestEvaluationConsumptionLedger:
         first = hashlib.sha256()
         _hash_untracked_path(first, tmp_path, directory)
         value.write_text("second")
+        second = hashlib.sha256()
+        _hash_untracked_path(second, tmp_path, directory)
+        assert first.hexdigest() != second.hexdigest()
+
+    def test_untracked_hash_records_nested_directory_symlinks(self, tmp_path):
+        directory = tmp_path / "untracked"
+        directory.mkdir()
+        first_target = tmp_path / "first-target"
+        second_target = tmp_path / "second-target"
+        first_target.mkdir()
+        second_target.mkdir()
+        link = directory / "nested-link"
+        link.symlink_to(first_target, target_is_directory=True)
+        first = hashlib.sha256()
+        _hash_untracked_path(first, tmp_path, directory)
+        link.unlink()
+        link.symlink_to(second_target, target_is_directory=True)
         second = hashlib.sha256()
         _hash_untracked_path(second, tmp_path, directory)
         assert first.hexdigest() != second.hexdigest()

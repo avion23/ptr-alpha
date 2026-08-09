@@ -12,6 +12,7 @@ The validation contract is fail closed:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import itertools
 import json
 import logging
@@ -22,7 +23,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timezone
 from importlib import metadata
 from pathlib import Path
@@ -46,7 +47,7 @@ VALIDATION_ENTRY_DELAY_DAYS = 0  # evaluate_backtest(use_dip_entry=False)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
 MEMBER_EXACT_GROUP_LIMIT = 720
 MEMBER_RUNTIME_BUDGET_SECONDS = 300.0
-_MEMBER_CONTROL_TOKEN = object()
+_MEMBER_CONTROL_HMAC_KEY = os.urandom(32)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +67,8 @@ class MemberIdentityControlResult:
     runtime_budget_seconds: float
     family_sha256: str
     observed_trial_id: int
-    _runner_token: object = field(repr=False)
+    observed_statistic: float
+    integrity_hmac_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +80,7 @@ class SweepResult:
     top_n: int
     decay_lambda: float
     bayes_prior_strength: float
-    scoring_mode: str = "shrunk_alpha"
+    scoring_mode: str = "consensus"
     total_recs: int = 0
     dates_evaluated: int = 0
     scheduled_dates: int = 0
@@ -141,7 +143,7 @@ def _backtest_core(
     signals: pd.DataFrame,
     bayes_prior_strength: float,
     decay_lambda: float,
-    scoring_mode: str = "shrunk_alpha",
+    scoring_mode: str = "consensus",
 ) -> tuple[SweepResult, pd.Series]:
     """Run one configuration and return its summary and primary alpha series.
 
@@ -169,7 +171,7 @@ def _backtest_core(
             recommendations = analysis.backtest_recommendations(
                 signals,
                 all_transactions,
-                as_of_ts,
+                as_of_date=as_of_ts,
                 horizon=params.horizon,
                 lookback_days=params.lookback_days,
                 min_buyers=params.min_buyers,
@@ -292,7 +294,7 @@ def run_single_backtest(
     signals: pd.DataFrame,
     bayes_prior_strength: float,
     decay_lambda: float,
-    scoring_mode: str = "shrunk_alpha",
+    scoring_mode: str = "consensus",
 ) -> SweepResult:
     result, _ = _backtest_core(
         all_transactions,
@@ -433,7 +435,7 @@ def sweep_configs(
             signal_cache[(horizon, decay)],
             bayes_prior_strength=float(values["bayes_prior_strength"]),
             decay_lambda=decay,
-            scoring_mode=str(values.get("scoring_mode", "shrunk_alpha")),
+            scoring_mode=str(values.get("scoring_mode", "consensus")),
         )
         statistic = newey_west_tstat(per_date, lag)
         p_value = (
@@ -474,6 +476,28 @@ def _member_family_sha256(
     return digest.hexdigest()
 
 
+def _member_control_hmac(payload: dict) -> str:
+    serialized = json.dumps(
+        _json_safe(payload), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hmac.new(_MEMBER_CONTROL_HMAC_KEY, serialized, hashlib.sha256).hexdigest()
+
+
+def _member_control_payload(result: MemberIdentityControlResult) -> dict:
+    return {
+        item.name: getattr(result, item.name)
+        for item in fields(result)
+        if item.name != "integrity_hmac_sha256"
+    }
+
+
+def _valid_member_control_integrity(result: MemberIdentityControlResult) -> bool:
+    return hmac.compare_digest(
+        result.integrity_hmac_sha256,
+        _member_control_hmac(_member_control_payload(result)),
+    )
+
+
 def select_config(
     sweep_df: pd.DataFrame,
     alpha: float = 0.05,
@@ -508,10 +532,11 @@ def select_config(
     n_trials = len(working)
     bonferroni_threshold = bonferroni_correction(n_trials, alpha)
     candidate = (
-        working["min_sample_ok"].fillna(False).astype(bool).to_numpy()
+        working["min_sample_ok"].fillna(False).astype(bool).to_numpy(copy=True)
         if "min_sample_ok" in working.columns
         else np.ones(n_trials, dtype=bool)
     )
+    candidate &= working["scoring_mode"].astype(str).eq("consensus").to_numpy()
     source_series = series_by_trial or sweep_df.attrs.get("series_by_trial")
     expected_trial_ids = {int(value) for value in working["trial_id"]}
     supplied_trial_ids = {int(key) for key in source_series} if source_series else set()
@@ -642,10 +667,12 @@ def select_config(
         member_passes = bool(
             member_control.status == "completed"
             and member_control.release_ready
-            and member_control._runner_token is _MEMBER_CONTROL_TOKEN
+            and _valid_member_control_integrity(member_control)
             and member_control.family_sha256 == expected_family_sha256
             and member_control.observed_trial_id
             == int(statistical_candidate["trial_id"])
+            and member_control.observed_statistic
+            == float(statistical_candidate["nw_tstat"])
             and member_control.max_stat_p_value <= alpha
         )
         if member_passes:
@@ -683,6 +710,12 @@ def select_config(
     }
 
 
+def _empirical_upper_quantile(values: list[float], probability: float) -> float:
+    ordered = np.sort(np.asarray(values, dtype=float))
+    index = max(0, math.ceil(probability * len(ordered)) - 1)
+    return float(ordered[index])
+
+
 def _run_member_identity_control(
     all_tx: pd.DataFrame,
     prices: pd.DataFrame,
@@ -691,14 +724,12 @@ def _run_member_identity_control(
     start: date,
     end: date,
     *,
-    observed_statistic: float,
     observed_trial_id: int,
-    family_sha256: str,
     n_permutations: int,
     seed: int,
     runtime_budget_seconds: float = MEMBER_RUNTIME_BUDGET_SECONDS,
 ) -> MemberIdentityControlResult:
-    """Run a full-family identity null, or fail closed at the runtime budget."""
+    """Execute and fingerprint the actual family, then run its identity null."""
     started = time.perf_counter()
     signal_cache: dict[tuple[int, float], pd.DataFrame] = {}
     for horizon in {int(value) for value in grid["horizon"]}:
@@ -706,6 +737,31 @@ def _run_member_identity_control(
             signal_cache[(horizon, decay)] = analysis.calculate_signal_potential(
                 entry_prices, prices, [horizon], decay_lambda=decay
             )
+    baseline_frame = sweep_configs(
+        all_tx,
+        prices,
+        entry_prices,
+        grid,
+        start,
+        end,
+        signals_by_horizon=signal_cache,
+    )
+    baseline_series = baseline_frame.attrs.get("series_by_trial")
+    expected_ids = {int(value) for value in baseline_frame["trial_id"]}
+    if not isinstance(baseline_series, dict) or set(baseline_series) != expected_ids:
+        raise ValueError("executed member-control family lacks complete trial series")
+    selected = baseline_frame[baseline_frame["trial_id"] == observed_trial_id]
+    if len(selected) != 1:
+        raise ValueError("observed trial_id is not unique in executed family")
+    observed_statistic = float(selected.iloc[0]["nw_tstat"])
+    family_sha256 = _member_family_sha256(baseline_frame, baseline_series)
+    baseline_eligible = baseline_frame[baseline_frame["min_sample_ok"]]
+    baseline_max = (
+        float(baseline_eligible["nw_tstat"].max())
+        if not baseline_eligible.empty
+        else -math.inf
+    )
+
     members = sorted(
         {
             str(member)
@@ -720,11 +776,14 @@ def _run_member_identity_control(
     )
     null_max_statistics: list[float] = []
     status = "completed"
+    identity = tuple(members)
     for identity_permutation in permutations:
-        elapsed = time.perf_counter() - started
-        if elapsed >= runtime_budget_seconds:
+        if time.perf_counter() - started >= runtime_budget_seconds:
             status = "infeasible_runtime_budget"
             break
+        if identity_permutation == identity:
+            null_max_statistics.append(baseline_max)
+            continue
         permuted = permute_signal_member_labels(
             signal_cache, permutation=identity_permutation
         )
@@ -749,16 +808,14 @@ def _run_member_identity_control(
         quantile = None
     elif complete_exact:
         exceedances = int(np.sum(np.asarray(null_max_statistics) >= observed_statistic))
-        # The identity is a group element and reproduces the observed family;
-        # finite-group resolution can therefore never be below 1 / |G|.
         max_stat_p = float(max(1, exceedances) / group_size)
-        quantile = float(np.quantile(null_max_statistics, 0.95))
+        quantile = _empirical_upper_quantile(null_max_statistics, 0.95)
     else:
         max_stat_p = float(
             (1.0 + np.sum(np.asarray(null_max_statistics) >= observed_statistic))
             / (evaluated + 1.0)
         )
-        quantile = float(np.quantile(null_max_statistics, 0.95))
+        quantile = _empirical_upper_quantile(null_max_statistics, 0.95)
     release_ready = bool(
         status == "completed"
         and (
@@ -766,25 +823,28 @@ def _run_member_identity_control(
             or (complete_sample and evaluated >= MIN_RELEASE_PERMUTATIONS)
         )
     )
-    return MemberIdentityControlResult(
-        status=status,
-        method="uniform_full_permutation_group_family_max_stat",
-        requested_permutations=n_permutations,
-        evaluated_permutations=evaluated,
-        permutation_group_size=group_size,
-        exact_enumeration=complete_exact,
-        sampled_without_replacement=not exact,
-        p_value_resolution=(
+    payload = {
+        "status": status,
+        "method": "uniform_full_permutation_group_family_max_stat",
+        "requested_permutations": n_permutations,
+        "evaluated_permutations": evaluated,
+        "permutation_group_size": group_size,
+        "exact_enumeration": complete_exact,
+        "sampled_without_replacement": not exact,
+        "p_value_resolution": (
             1.0 / group_size if complete_exact else 1.0 / (evaluated + 1.0)
         ),
-        max_stat_p_value=max_stat_p,
-        null_max_t_quantile_95=quantile,
-        release_ready=release_ready,
-        runtime_seconds=round(time.perf_counter() - started, 3),
-        runtime_budget_seconds=runtime_budget_seconds,
-        family_sha256=family_sha256,
-        observed_trial_id=observed_trial_id,
-        _runner_token=_MEMBER_CONTROL_TOKEN,
+        "max_stat_p_value": max_stat_p,
+        "null_max_t_quantile_95": quantile,
+        "release_ready": release_ready,
+        "runtime_seconds": round(time.perf_counter() - started, 3),
+        "runtime_budget_seconds": runtime_budget_seconds,
+        "family_sha256": family_sha256,
+        "observed_trial_id": observed_trial_id,
+        "observed_statistic": observed_statistic,
+    }
+    return MemberIdentityControlResult(
+        **payload, integrity_hmac_sha256=_member_control_hmac(payload)
     )
 
 
@@ -871,6 +931,28 @@ def _append_ledger_event(ledger: dict, event: dict) -> None:
     ledger["events"].append({**payload, "event_sha256": _sha256_json(payload)})
 
 
+def _refuse_legacy_ledger(ledger_path: Path) -> None:
+    legacy_path = ledger_path.parent / "validation_evaluation_ledger.json"
+    if not legacy_path.exists():
+        return
+    try:
+        legacy = json.loads(legacy_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvaluationLedgerIntegrityError(
+            "legacy validation_evaluation_ledger.json exists but is unreadable; "
+            "archive or migrate it explicitly before validation"
+        ) from exc
+    if legacy.get("evaluations"):
+        raise EvaluationLedgerIntegrityError(
+            "legacy validation_evaluation_ledger.json contains consumed evaluations; "
+            "archive or migrate it explicitly before validation"
+        )
+    raise EvaluationLedgerIntegrityError(
+        "legacy validation_evaluation_ledger.json exists; archive or migrate it "
+        "explicitly before validation"
+    )
+
+
 def _reserve_evaluation(
     ledger_path: Path,
     manifest: dict,
@@ -882,6 +964,7 @@ def _reserve_evaluation(
     """Atomically append a reservation before a frozen evaluation."""
     import fcntl
 
+    _refuse_legacy_ledger(ledger_path)
     lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as lock:
@@ -1070,11 +1153,7 @@ def _run_validation_with_db(
             grid,
             train_start,
             train_effective_end,
-            observed_statistic=float(statistical_candidate["nw_tstat"]),
             observed_trial_id=int(statistical_candidate["trial_id"]),
-            family_sha256=_member_family_sha256(
-                train_df, train_df.attrs["series_by_trial"]
-            ),
             n_permutations=member_permutations,
             seed=permutation_seed + n_permutations,
         )
@@ -1236,7 +1315,7 @@ def _run_frozen(all_tx, prices, signals, config, start: date, end: date):
         signals,
         float(config["bayes_prior_strength"]),
         float(config["decay_lambda"]),
-        str(config.get("scoring_mode", "shrunk_alpha")),
+        str(config.get("scoring_mode", "consensus")),
     )
 
 
@@ -1415,6 +1494,9 @@ def _build_manifest(
             "small_group_policy": f"exact_enumeration_at_or_below_{MEMBER_EXACT_GROUP_LIMIT}",
             "large_group_policy": "unique_uniform_sample_without_replacement",
             "member_runtime_budget_seconds": MEMBER_RUNTIME_BUDGET_SECONDS,
+            "member_control_integrity": (
+                "process_local_hmac_sha256_over_executed_family_hash_trial_and_statistic"
+            ),
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "minimum_family_resolution_bootstrap": max(
                 MIN_RELEASE_PERMUTATIONS,
@@ -1442,6 +1524,9 @@ def _build_manifest(
             "path": str(_canonical_ledger_path(db_path)),
             "integrity": "append_only_sha256_hash_chain",
             "overlap_policy": "any_overlapping_reserved_interval_is_consumed",
+            "legacy_v1_policy": (
+                "validation_evaluation_ledger.json must be explicitly archived or migrated"
+            ),
             "local_tamper_limitation": (
                 "A local attacker who can rewrite the ledger can recompute the chain; "
                 "external anchoring is not implemented."
@@ -1498,7 +1583,9 @@ def _hash_untracked_path(digest: "hashlib._Hash", root: Path, path: Path) -> Non
     paths = [path]
     if path.is_dir() and not path.is_symlink():
         paths = sorted(
-            candidate for candidate in path.rglob("*") if not candidate.is_dir()
+            candidate
+            for candidate in path.rglob("*")
+            if candidate.is_symlink() or not candidate.is_dir()
         )
     for candidate in paths:
         relative = str(candidate.relative_to(root))

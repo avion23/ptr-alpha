@@ -1400,9 +1400,11 @@ def validate(
 
     Sweeps configurations on the purged training phase, then requires both
     Bonferroni and centered moving-block max-stat bootstrap survival plus a
-    full-family member-identity negative control. Fewer than 999 null samples
-    fail closed. The 2024-2025 test phase is previously used retrospective data,
-    not fresh out-of-sample evidence. The post-2025 final phase stays locked.
+    full-family member-identity negative control. Production selection uses only
+    fold-safe consensus scoring with each fold's explicit as-of timestamp; other
+    modes are descriptive. Under-resolved or incomplete nulls fail closed. The
+    2024-2025 test phase is retrospective, not fresh out-of-sample evidence. The
+    post-2025 final phase stays locked.
 
     Results are written to <data-dir>/validation_results.json and any frozen
     evaluation is atomically consumed in the evaluation ledger.
@@ -1440,7 +1442,7 @@ def validate(
             "top_n": [3, 5],
             "decay_lambda": [0.001, 0.005, 0.02],
             "bayes_prior_strength": [5, 20, 50],
-            "scoring_mode": ["shrunk_alpha", "consistency"],
+            "scoring_mode": ["consensus"],
         }
     else:
         # Default ~36-combo grid: 3*3*2*2 combinations
@@ -1452,7 +1454,7 @@ def validate(
             "top_n": [3, 5],
             "decay_lambda": [0.005],
             "bayes_prior_strength": [20],
-            "scoring_mode": ["shrunk_alpha", "consistency"],
+            "scoring_mode": ["consensus"],
         }
 
     if null_samples < 1 or member_null_samples < 1:

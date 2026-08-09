@@ -9,6 +9,7 @@ import duckdb
 import pandas as pd
 
 from analyzer.exceptions import AnalysisError
+from analyzer.member_names import canonical_member_key
 from analyzer.metadata_repository import MetadataRepository
 from analyzer.parse_run_repository import ParseRunRepository
 from analyzer.price_repository import PriceRepository
@@ -116,13 +117,13 @@ class Database:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique")
+        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique_v2")
+        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique_v3")
         self._ensure_transaction_columns()
         self.conn.execute(
             "UPDATE transactions SET owner_code=COALESCE(owner_code,''), amount_raw=COALESCE(amount_raw,'')"
         )
-        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique")
-        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique_v2")
-        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique_v3")
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_source_row_unique "
             "ON transactions(source, chamber, source_record_id, source_row_id, ingestion_generation)"
@@ -211,6 +212,8 @@ class Database:
             "source_record_id": "VARCHAR",
             "source_row_id": "VARCHAR",
             "source_report_path": "VARCHAR",
+            "member_key": "VARCHAR",
+            "chamber_member_key": "VARCHAR",
             "official_filing_date": "DATE",
             "available_date": "DATE",
             "notification_date": "DATE",
@@ -433,17 +436,14 @@ class Database:
         if not isinstance(source, str) or not source.strip():
             raise ValueError("source must be a non-empty string")
 
-        missing = set(SOURCE_TRANSACTION_COLUMNS) - set(transactions.columns)
-        if missing:
+        actual_columns = set(transactions.columns)
+        expected_columns = set(SOURCE_TRANSACTION_COLUMNS)
+        missing = expected_columns - actual_columns
+        unexpected = actual_columns - expected_columns
+        if missing or unexpected:
             raise ValueError(
-                "source transaction columns are missing: " + ", ".join(sorted(missing))
-            )
-        if (
-            "source" in transactions.columns
-            and not transactions["source"].eq(source).all()
-        ):
-            raise ValueError(
-                "all source transactions must match the persistence source"
+                "source transaction columns must match the persistence schema; "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
             )
         if not transactions["chamber"].eq(chamber).all():
             raise ValueError(
@@ -460,6 +460,8 @@ class Database:
             "source_row_id",
             "source_report_path",
             "member",
+            "member_key",
+            "chamber_member_key",
             "transaction_date",
             "disclosure_date",
             "official_filing_date",
@@ -531,6 +533,8 @@ class Database:
             "source_report_path",
             "doc_id",
             "member",
+            "member_key",
+            "chamber_member_key",
             "artifact_sha256",
             "official_filing_date",
             "available_date",
@@ -547,6 +551,15 @@ class Database:
                 raise ValueError(
                     "source transaction member does not match report inventory: "
                     f"{row.source_record_id}"
+                )
+            expected_member_key = canonical_member_key(row.member)
+            expected_chamber_key = f"{chamber.strip().lower()}:{expected_member_key}"
+            if (
+                row.member_key != expected_member_key
+                or row.chamber_member_key != expected_chamber_key
+            ):
+                raise ValueError(
+                    "source transaction member keys do not match bound member"
                 )
             if source == "senate_efd" and row.doc_id != row.source_record_id:
                 raise ValueError(

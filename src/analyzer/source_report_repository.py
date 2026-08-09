@@ -409,12 +409,20 @@ class SourceReportRepository:
                 f"unavailable={unavailable}, failed={failed}"
             )
 
-        for column in ["report_path", "member"]:
-            invalid = reports_df[column].map(
-                lambda value: not isinstance(value, str) or not value.strip()
+        invalid_paths = reports_df["report_path"].map(
+            lambda value: not isinstance(value, str) or not value.strip()
+        )
+        if invalid_paths.any():
+            raise ValueError("report_path must be a non-empty string")
+        invalid_members = reports_df["member"].map(
+            lambda value: (
+                not isinstance(value, str)
+                or not value.strip()
+                or value != value.strip()
             )
-            if invalid.any():
-                raise ValueError(f"{column} must be a non-empty string")
+        )
+        if invalid_members.any():
+            raise ValueError("member must be a non-empty stripped string")
         filing_dates = pd.to_datetime(
             reports_df["official_filing_date"], errors="coerce"
         )

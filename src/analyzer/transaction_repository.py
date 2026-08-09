@@ -17,6 +17,8 @@ SOURCE_TRANSACTION_COLUMNS = [
     "source_row_id",
     "source_report_path",
     "member",
+    "member_key",
+    "chamber_member_key",
     "ticker",
     "raw_ticker",
     "ticker_candidate",
@@ -241,7 +243,8 @@ class TransactionRepository:
             )
             self.conn.execute("""
                 INSERT INTO transactions (
-                    doc_id, member, ticker, transaction_date, disclosure_date,
+                    doc_id, member, member_key, chamber_member_key, ticker,
+                    transaction_date, disclosure_date,
                     transaction_type, owner_code, amount_raw, amount_midpoint,
                     instrument_type, strike_price, expiry_date, created_at,
                     asset_description, source, chamber, source_record_id,
@@ -254,7 +257,8 @@ class TransactionRepository:
                     artifact_sha256
                 )
                 SELECT
-                    doc_id, member, ticker, transaction_date, disclosure_date,
+                    doc_id, member, member_key, chamber_member_key, ticker,
+                    transaction_date, disclosure_date,
                     transaction_type, owner_code, amount_raw, amount_midpoint,
                     instrument_type, strike_price, expiry_date, created_at,
                     asset_description, source, chamber, source_record_id,
@@ -282,7 +286,8 @@ class TransactionRepository:
     def get_for_doc(self, doc_id: str) -> pd.DataFrame:
         return self.conn.execute(
             """
-            SELECT id, doc_id, member, ticker, transaction_date, disclosure_date,
+            SELECT id, doc_id, member, member_key, chamber_member_key, ticker,
+                   transaction_date, disclosure_date,
                    transaction_type, owner_code, amount_raw, amount_midpoint,
                    instrument_type, strike_price, expiry_date, asset_description,
                    source, chamber, source_record_id, source_row_id,

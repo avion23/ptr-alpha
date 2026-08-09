@@ -801,6 +801,8 @@ class TestSourceReports(DatabaseTestCase):
                 "/search/view/ptr/11111111-1111-4111-8111-111111111111/"
             ),
             "member": "Jane Doe",
+            "member_key": "JANE DOE",
+            "chamber_member_key": "senate:JANE DOE",
             "ticker": "AAPL",
             "raw_ticker": "AAPL",
             "ticker_candidate": None,
@@ -1477,6 +1479,7 @@ class TestSourceReports(DatabaseTestCase):
             (self.transaction(source_row_id=None), "provenance values are incomplete"),
             (self.transaction(source_row_id=""), "source_row_id must be"),
             (self.transaction(member="Other Member"), "member does not match"),
+            (self.transaction(member_key="WRONG"), "member keys do not match"),
             (self.transaction(source_report_path="/wrong/"), "path does not match"),
             (self.transaction(available_date=date(2026, 7, 11)), "dates do not match"),
             (self.transaction(artifact_sha256="b" * 64), "landing hash"),
@@ -1574,6 +1577,16 @@ class TestSourceReports(DatabaseTestCase):
                 doc_id, ticker, transaction_date, member, transaction_type,
                 amount_raw, owner_code, asset_description
             )
+            """
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO transactions (
+                doc_id, ticker, transaction_date, member, transaction_type,
+                amount_raw, owner_code, asset_description
+            ) VALUES
+                ('legacy', 'AAPL', '2026-01-01', 'Member', 'Purchase', NULL, NULL, 'Asset'),
+                ('legacy', 'AAPL', '2026-01-01', 'Member', 'Purchase', NULL, NULL, 'Asset')
             """
         )
         self.db.close()

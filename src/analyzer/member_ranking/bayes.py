@@ -96,9 +96,11 @@ def normal_normal_posteriors(
         float(np.ptp(values)),
         np.sqrt(np.finfo(float).tiny),
     )
+    # Keep reciprocal-scale quantities representable. Smallest subnormal
+    # variances overflow when inverted, even though the input is valid.
     variance_floor = max(
         (np.finfo(float).eps * magnitude) ** 2,
-        np.finfo(float).smallest_subnormal,
+        1.0 / np.finfo(float).max,
     )
     within_var = max(within_var, variance_floor)
 
@@ -109,12 +111,10 @@ def normal_normal_posteriors(
     )
     mean_sampling_var = float((within_var / group_counts).mean())
     moment_between_var = observed_between - mean_sampling_var
-    # If between-group dispersion is not identified beyond sampling noise,
-    # retain a regularized common-prior variance equivalent to
-    # ``prior_strength`` observations. A machine-only epsilon would report
-    # false near-zero posterior uncertainty under complete pooling.
-    regularization_var = within_var / prior_strength
-    between_var = max(moment_between_var, regularization_var, variance_floor)
+    # Regularize an unresolved population variance to one observation's noise.
+    # Prior strength is then applied explicitly as precision below, so it
+    # controls shrinkage for every finite between-variance estimate.
+    between_var = max(moment_between_var, within_var, variance_floor)
 
     weighted_sum = (frame["outcome"] * frame["weight"]).groupby(frame["group"]).sum()
     information = frame.groupby("group", sort=False)["weight"].sum()
@@ -123,18 +123,19 @@ def normal_normal_posteriors(
     information = information.reindex(group_order).astype(float)
     weighted_means = weighted_means.reindex(group_order).astype(float)
 
-    data_precision = information / within_var
-    prior_precision = 1.0 / between_var
-    posterior_precision = data_precision + prior_precision
-    posterior_mean = (
-        data_precision * weighted_means + prior_precision * global_mean
-    ) / posterior_precision
+    # Work in the variance domain instead of forming precision reciprocals.
+    # This remains finite for exact-zero data at the representable variance
+    # floor and is algebraically identical to normal-normal precision updates.
+    denominator = information * between_var + prior_strength * within_var
+    shrinkage = prior_strength * within_var / denominator
+    posterior_mean = (1.0 - shrinkage) * weighted_means + shrinkage * global_mean
+    posterior_var = (within_var / denominator) * between_var
 
     return pd.DataFrame(
         {
             "posterior_mean": posterior_mean,
-            "posterior_std": np.sqrt(1.0 / posterior_precision),
-            "shrinkage": prior_precision / posterior_precision,
+            "posterior_std": np.sqrt(posterior_var),
+            "shrinkage": shrinkage,
             "effective_information": information,
             "global_mean": global_mean,
             "within_var": within_var,

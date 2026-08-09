@@ -191,6 +191,22 @@ class TestEstimateMemberSkills(unittest.TestCase):
         self.assertGreater(skills["CENTER"].alpha_std, 0.0)
         self.assertTrue(all(np.isfinite(skill.alpha_std) for skill in skills.values()))
 
+    def test_all_zero_endpoint_alpha_has_finite_regularized_posteriors(self):
+        signals = _make_signals({"A": [0.0, 0.0], "B": [0.0, 0.0]})
+
+        skills = estimate_member_skills(signals, ref_date=REF_DATE)
+
+        self.assertEqual(set(skills), {"A", "B"})
+        for posterior in skills.values():
+            values = [
+                posterior.alpha_mean,
+                posterior.alpha_std,
+                posterior.shrinkage,
+                posterior.effective_information,
+            ]
+            self.assertTrue(np.isfinite(values).all())
+            self.assertGreater(posterior.alpha_std, 0.0)
+
 
 class TestScoreMembersForTicker(unittest.TestCase):
     def test_with_known_members(self):

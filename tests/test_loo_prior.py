@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import pandas as pd
 
 from analyzer.member_ranking.ranking import rank_members
@@ -113,6 +114,53 @@ class TestLeaveOneOutPrior(unittest.TestCase):
 
         self.assertEqual(ranked.loc["Mismatch", "prob_up_given_buy"], 0.0)
         self.assertEqual(ranked.loc["Positive", "prob_up_given_buy"], 1.0)
+
+    def test_all_zero_endpoint_alpha_has_finite_regularized_posteriors(self):
+        signals = _signals(
+            [
+                ("A", "A1", "2024-01-01", 0.0),
+                ("A", "A2", "2024-02-01", 0.0),
+                ("B", "B1", "2024-01-01", 0.0),
+                ("B", "B2", "2024-02-01", 0.0),
+            ],
+            "Purchase",
+        )
+
+        ranked = rank_members(signals)
+
+        columns = [
+            "shrunk_alpha",
+            "shrunk_alpha_std",
+            "alpha_shrinkage",
+            "alpha_effective_information",
+        ]
+        self.assertTrue(np.isfinite(ranked[columns].to_numpy()).all())
+        self.assertTrue((ranked["shrunk_alpha_std"] > 0).all())
+
+    def test_prior_strength_controls_continuous_shrinkage_across_range(self):
+        signals = _signals(
+            [
+                ("Strong", "S1", "2024-01-01", 10.0),
+                ("Strong", "S2", "2024-02-01", 12.0),
+                ("Weak", "W1", "2024-01-01", -10.0),
+                ("Weak", "W2", "2024-02-01", -12.0),
+            ],
+            "Purchase",
+        )
+
+        fits = {
+            strength: rank_members(
+                signals, _bayes_prior_strength=float(strength)
+            ).set_index("member")
+            for strength in (1, 20, 1000)
+        }
+
+        means = [abs(fits[s].loc["Strong", "shrunk_alpha"]) for s in (1, 20, 1000)]
+        shrinkages = [fits[s].loc["Strong", "alpha_shrinkage"] for s in (1, 20, 1000)]
+        self.assertGreater(means[0], means[1])
+        self.assertGreater(means[1], means[2])
+        self.assertLess(shrinkages[0], shrinkages[1])
+        self.assertLess(shrinkages[1], shrinkages[2])
 
     def test_sales_prior_excludes_members_own_episodes_and_output_omits_factor(self):
         signals = _signals(

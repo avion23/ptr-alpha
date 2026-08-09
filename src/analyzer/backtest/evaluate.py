@@ -277,30 +277,18 @@ def _evaluate_one_recommendation(
         2,
     )
 
-    try:
-        row = _bt_row(
-            ticker,
-            entry,
-            entry_delay,
-            exit_price,
-            t_horizon,
-            entry_mult,
-            exit_mult,
-            spy_ret,
-            inst_type,
-            amount,
-        )
-    except ValueError:
-        return _unavailable_bt_row(
-            ticker,
-            row_idx,
-            entry,
-            entry_date_ns,
-            entry_delay,
-            inst_type,
-            amount,
-            reason="instrument_pricing_unavailable",
-        )
+    row = _bt_row(
+        ticker,
+        entry,
+        entry_delay,
+        exit_price,
+        t_horizon,
+        entry_mult,
+        exit_mult,
+        spy_ret,
+        inst_type,
+        amount,
+    )
     row["_bt_idx"] = row_idx
     row["bt_entry_date"] = pd.Timestamp(entry_date_ns).date()
     row["bt_exit_date"] = pd.Timestamp(exit_date_ns).date()
@@ -399,7 +387,7 @@ def _unavailable_bt_row(
         "bt_delisted": False,
         "bt_coverage": "unavailable",
         "bt_unavailable_reason": reason,
-        "bt_stale_exit": True,
+        "bt_stale_exit": reason == "exit_quote_unavailable",
     }
 
 

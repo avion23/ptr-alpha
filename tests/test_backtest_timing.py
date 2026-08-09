@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -158,10 +159,11 @@ class TestBacktestTiming(unittest.TestCase):
         ).iloc[0]
 
         self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertEqual(row["bt_unavailable_reason"], "benchmark_quote_unavailable")
+        self.assertFalse(row["bt_stale_exit"])
         self.assertTrue(np.isnan(row["bt_alpha_pct"]))
 
-
-    def test_evaluator_abstains_from_underlying_based_option_returns(self):
+    def test_evaluator_isolates_underlying_based_option_returns(self):
         dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")
         prices = pd.DataFrame(
             {
@@ -174,15 +176,20 @@ class TestBacktestTiming(unittest.TestCase):
             {"ticker": ["CALL"], "instrument_type": ["call"]}
         )
 
-        with self.assertRaisesRegex(UnsupportedOptionPricingError, "contract prices"):
-            evaluate_backtest(
-                recommendations,
-                prices,
-                pd.Timestamp("2025-01-01"),
-                horizon=40,
-                entry_slippage_bps=0,
-                exit_slippage_bps=0,
-            )
+        row = evaluate_backtest(
+            recommendations,
+            prices,
+            pd.Timestamp("2025-01-01"),
+            horizon=40,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertEqual(
+            row["bt_unavailable_reason"], "unsupported_instrument_pricing"
+        )
+        self.assertTrue(np.isnan(row["bt_return_pct"]))
 
     def test_exactly_25_days_stale_is_unavailable(self):
         dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")
@@ -341,6 +348,8 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertEqual(row["bt_coverage"], "unavailable")
         self.assertTrue(np.isnan(row["bt_exit_price"]))
         self.assertTrue(np.isnan(row["bt_raw_return_pct"]))
+        self.assertEqual(row["bt_unavailable_reason"], "exit_quote_unavailable")
+        self.assertTrue(row["bt_stale_exit"])
 
     def test_fail_closed_acquisition_entry_and_execution_integration(self):
         transactions = pd.DataFrame(
@@ -379,6 +388,7 @@ class TestBacktestTiming(unittest.TestCase):
                 self.assertEqual(len(evaluated), 1)
                 self.assertEqual(evaluated.iloc[0]["bt_coverage"], "unavailable")
                 self.assertTrue(np.isnan(evaluated.iloc[0]["bt_entry_price"]))
+                self.assertFalse(evaluated.iloc[0]["bt_stale_exit"])
                 self.assertEqual(evaluated.attrs["n_unavailable"], 1)
 
         for invalid_exit in (0.0, np.nan):
@@ -442,7 +452,32 @@ class TestBacktestTiming(unittest.TestCase):
                 "unsupported_instrument_pricing",
             )
             self.assertTrue(np.isnan(result.loc[ticker, "bt_return_pct"]))
+            self.assertFalse(result.loc[ticker, "bt_stale_exit"])
         self.assertEqual(result.attrs["n_unavailable"], 2)
+
+    def test_stock_pricing_programming_error_propagates(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-06")
+        prices = pd.DataFrame(
+            {"AAPL": [90.0, 100.0, 110.0], "SPY": [390.0, 400.0, 410.0]},
+            index=dates,
+        )
+        recommendations = pd.DataFrame(
+            {"ticker": ["AAPL"], "instrument_type": ["stock"]}
+        )
+
+        with patch(
+            "analyzer.options.estimate_options_leverage",
+            side_effect=ValueError("programming error"),
+        ):
+            with self.assertRaisesRegex(ValueError, "programming error"):
+                evaluate_backtest(
+                    recommendations,
+                    prices,
+                    pd.Timestamp("2025-01-02"),
+                    horizon=3,
+                    entry_slippage_bps=0,
+                    exit_slippage_bps=0,
+                )
 
     def test_timezone_aware_daily_index_preserves_calendar_dates(self):
         dates = pd.bdate_range("2025-01-02", "2025-01-07", tz="America/New_York")

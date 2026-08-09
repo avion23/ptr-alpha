@@ -1228,13 +1228,20 @@ class SenateEFDSource(TransactionSource):
             )
 
         required_columns = set(_NORMALIZED_TRANSACTION_COLUMNS)
-        actual_columns = set(df.columns)
+        actual_column_tuple = tuple(df.columns)
+        actual_columns = set(actual_column_tuple)
         missing = required_columns - actual_columns
         unexpected = actual_columns - required_columns
-        if missing or unexpected:
+        if (
+            not df.columns.is_unique
+            or len(actual_column_tuple) != len(_NORMALIZED_TRANSACTION_COLUMNS)
+            or actual_column_tuple != _NORMALIZED_TRANSACTION_COLUMNS
+        ):
             raise SenateEFDError(
                 "Senate transaction provenance schema mismatch: "
-                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+                f"unique={df.columns.is_unique}, missing={sorted(missing)}, "
+                f"unexpected={sorted(unexpected)}, "
+                f"canonical_order={actual_column_tuple == _NORMALIZED_TRANSACTION_COLUMNS}"
             )
 
         required_values = [

@@ -1162,3 +1162,25 @@ def test_save_rejects_inventory_member_with_surrounding_whitespace():
 
     with pytest.raises(SenateEFDError, match="member must be nonblank and stripped"):
         source.save_to_db(frame)
+
+
+@pytest.mark.parametrize("column", ["ticker_candidate", "member"])
+def test_save_rejects_duplicate_nullable_and_nonnullable_column_labels(column):
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    duplicated = pd.concat([frame, frame[[column]]], axis=1)
+    assert duplicated.columns.is_unique is False
+
+    with pytest.raises(SenateEFDError, match="schema mismatch.*unique=False"):
+        source.save_to_db(duplicated)
+
+
+def test_save_rejects_noncanonical_transaction_column_order():
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    reordered = frame[[*frame.columns[1:], frame.columns[0]]]
+    assert set(reordered.columns) == set(frame.columns)
+    assert reordered.columns.is_unique
+
+    with pytest.raises(SenateEFDError, match="canonical_order=False"):
+        source.save_to_db(reordered)

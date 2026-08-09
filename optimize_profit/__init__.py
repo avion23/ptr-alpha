@@ -1,9 +1,8 @@
-"""Honest chronological optimization for congressional-trade strategies.
+"""Retrospective strategy selection with a locked future final test.
 
-The package enforces non-overlapping bankroll periods, selects configurations
-before a fixed untouched holdout, records coverage/rejections, and persists
-reproducible run artifacts. A passing holdout is evidence for further paper
-trading, never a guaranteed-profit claim.
+The package enforces non-overlapping support, treats scheduled no-trade periods
+as cash, records every rejection, and precommits a post-2025 test that normal
+retrospective runs never read. Reused 2024-2025 history is validation only.
 """
 
 from optimize_profit.precompute import precompute_walk_forward_data

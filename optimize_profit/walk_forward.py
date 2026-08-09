@@ -1,6 +1,8 @@
-"""Non-overlapping walk-forward evaluation with auditable coverage."""
+"""Non-overlapping walk-forward evaluation with identical scheduled support."""
 
 from __future__ import annotations
+
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -23,7 +25,6 @@ def _score_candidates(
     ticker_perf_signals,
     custom_ranking_dicts,
 ):
-    """Score candidates and return both accepted rows and explicit rejections."""
     scores: list[dict] = []
     rejections: list[dict] = []
     for ticker in candidate_tickers:
@@ -71,99 +72,100 @@ def run_walk_forward(
     allocation,
     max_dd_pct=None,
 ):
-    """Evaluate one frozen configuration on non-overlapping periods.
+    """Evaluate every scheduled period on identical non-overlapping support.
 
-    A period is one fully invested portfolio held for ``horizon`` calendar days.
-    Requested dates must be at least one horizon apart; this prevents reuse of the
-    same bankroll across overlapping vintages. Returned details contain every
-    executed period and every normal rejection. Unexpected failures propagate.
+    A normal rejection is represented as cash (zero strategy return) and retains
+    same-date SPY opportunity return. Unexpected failures propagate. Endpoint-only
+    observations never trigger a drawdown stop because intraperiod NAV is absent.
     """
-    del signals_df, transactions_df  # inputs retained for API compatibility
+    del signals_df, transactions_df
+    if max_dd_pct is not None:
+        raise ValueError(
+            "Endpoint-only drawdown stops were removed; daily NAV is required"
+        )
     _validate_non_overlapping_periods(precomputed)
 
     all_returns: list[dict] = []
     period_results: list[dict] = []
     rejection_ledger: list[dict] = []
-    cumulative_wealth = 1.0
-    peak_wealth = 1.0
-    stopped = False
 
-    for as_of_iso, data in precomputed.items():
+    for data in precomputed.values():
         as_of_date = data["as_of_ts"].date()
-        if stopped:
+        reason = _period_rejection_reason(data, min_buyers)
+        if reason is not None:
+            period = _cash_period(data, prices_df, reason)
+            all_returns.append(period)
+            period_results.append({**period, "status": "cash", "reason": reason})
             rejection_ledger.append(
-                {
-                    "as_of_date": as_of_date,
-                    "stage": "period",
-                    "reason": "drawdown_stop_active",
-                }
-            )
-            continue
-        if data.get("status") != "ready":
-            rejection_ledger.append(
-                {
-                    "as_of_date": as_of_date,
-                    "stage": "precompute",
-                    "reason": data.get("reason", "period_not_ready"),
-                    "detail": data.get("detail"),
-                }
-            )
-            continue
-        if not data["candidate_tickers"].get(min_buyers):
-            rejection_ledger.append(
-                {
-                    "as_of_date": as_of_date,
-                    "stage": "period",
-                    "reason": "no_candidates_for_min_buyers",
-                }
+                {"as_of_date": as_of_date, "stage": "period", "reason": reason}
             )
             continue
 
-        period_return, period_detail, period_rejections = _run_one_period(
+        period_return, detail, rejections = _run_one_period(
             data, min_buyers, scoring_fn, prices_df, top_n, allocation
         )
-        for rejection in period_rejections:
-            rejection_ledger.append({"as_of_date": as_of_date, **rejection})
+        rejection_ledger.extend(
+            {"as_of_date": as_of_date, **rejection} for rejection in rejections
+        )
         if period_return is None:
+            reason = detail["reason"]
+            period = _cash_period(data, prices_df, reason)
+            all_returns.append(period)
+            period_results.append({**period, "status": "cash", "reason": reason})
             rejection_ledger.append(
-                {
-                    "as_of_date": as_of_date,
-                    "stage": "period",
-                    "reason": period_detail["reason"],
-                }
+                {"as_of_date": as_of_date, "stage": "period", "reason": reason}
             )
             continue
 
         all_returns.append(period_return)
-        cumulative_wealth, peak_wealth, stopped = _track_drawdown(
-            cumulative_wealth,
-            peak_wealth,
-            period_return["portfolio_return_pct"] / 100,
-            max_dd_pct,
-        )
         period_results.append(
-            {
-                **period_detail,
-                **period_return,
-                "ending_wealth": cumulative_wealth,
-                "drawdown_stop_triggered": stopped,
-            }
+            {**detail, **period_return, "status": "invested", "reason": None}
         )
 
+    support = [row["as_of_date"].isoformat() for row in all_returns]
     metrics = summarize_walk_forward(
-        all_returns,
-        stopped,
-        periods_per_year=365.0 / _horizon_from(precomputed),
+        all_returns, periods_per_year=365.0 / _horizon_from(precomputed)
     )
     return {
         **metrics,
         "period_results": period_results,
         "rejection_ledger": rejection_ledger,
         "requested_periods": len(precomputed),
-        "coverage_pct": round(100 * len(all_returns) / len(precomputed), 1)
-        if precomputed
-        else 0.0,
+        "coverage_pct": 100.0 if len(all_returns) == len(precomputed) else 0.0,
+        "support_dates": support,
+        "support_sha256": hashlib.sha256("|".join(support).encode()).hexdigest(),
     }
+
+
+def _period_rejection_reason(data: dict, min_buyers: int) -> str | None:
+    if data.get("status") != "ready":
+        return str(data.get("reason", "period_not_ready"))
+    if not data["candidate_tickers"].get(min_buyers):
+        return "no_candidates_for_min_buyers"
+    return None
+
+
+def _cash_period(data: dict, prices_df: pd.DataFrame, reason: str) -> dict:
+    del reason
+    spy_return = _spy_period_return(prices_df, data["as_of_ts"], data["horizon"])
+    return {
+        "as_of_date": data["as_of_ts"].date(),
+        "portfolio_return_pct": 0.0,
+        "spy_return_pct": spy_return,
+        "n_positions": 0,
+    }
+
+
+def _spy_period_return(prices_df, as_of_ts, horizon) -> float:
+    evaluated = evaluate_backtest(
+        pd.DataFrame({"ticker": ["SPY"], "signal_score": [1.0]}),
+        prices_df,
+        as_of_ts,
+        horizon,
+    ).dropna(subset=["bt_return_pct"])
+    if evaluated.empty:
+        raise RuntimeError(f"SPY support unavailable for scheduled date {as_of_ts}")
+    return float(evaluated["bt_return_pct"].iloc[0])
 
 
 def _run_one_period(data, min_buyers, scoring_fn, prices_df, top_n, allocation):
@@ -253,7 +255,12 @@ def _build_custom_ranking_dicts(member_rankings, scoring_fn) -> dict:
             if canonical_member_key(str(member)) not in lookup
         }
         lookup.update(aliases)
-    return {"alpha": alpha, "trades": trades, "prob": probability, "has_shrunk": True}
+    return {
+        "alpha": alpha,
+        "trades": trades,
+        "prob": probability,
+        "has_shrunk": True,
+    }
 
 
 def _portfolio_weights(signal_scores, allocation: str) -> np.ndarray:
@@ -270,14 +277,6 @@ def _portfolio_weights(signal_scores, allocation: str) -> np.ndarray:
 
 def _portfolio_return(return_pcts: np.ndarray, weights: np.ndarray) -> float:
     return float(np.sum(weights * return_pcts.astype(float) / 100))
-
-
-def _track_drawdown(cumulative_wealth, peak_wealth, port_ret, max_dd_pct):
-    cumulative_wealth *= 1 + port_ret
-    peak_wealth = max(peak_wealth, cumulative_wealth)
-    current_dd = (cumulative_wealth - peak_wealth) / peak_wealth * 100
-    stopped = max_dd_pct is not None and current_dd <= -abs(max_dd_pct)
-    return cumulative_wealth, peak_wealth, stopped
 
 
 def _validate_non_overlapping_periods(precomputed: dict) -> None:

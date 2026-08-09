@@ -13,10 +13,9 @@ handshake before the search endpoint will respond.
 Senate filings are loaded into an isolated data directory (e.g. ``data/senate``)
 so chamber separation is exact without a schema change on the main database.
 
-Known limitation: efdsearch exposes no amendment/supersession metadata. An
-amended filing that restates transactions with changed amounts is stored
-alongside the original (the site itself behaves this way). Exact restatements
-across filings within one run are de-duplicated keeping the latest filing.
+Known limitation: efdsearch exposes no authoritative amendment/supersession
+pointer. Changed restatements remain separate. Exact restatements retain their
+source-record lineage and the earliest official filing as their availability.
 """
 
 import hashlib
@@ -24,6 +23,7 @@ import logging
 import random
 import re
 import time
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Literal
@@ -34,6 +34,8 @@ from curl_cffi import requests as cffi_requests
 
 from analyzer.database import Database
 from analyzer.interfaces import TransactionSource
+from analyzer.member_names import canonical_member_identity, canonical_member_key
+from analyzer.models import Chamber, ReportOutcome, TickerOrigin
 from analyzer.parsing.cells import (
     _extract_amount_midpoint,
     _extract_owner_code,
@@ -61,6 +63,7 @@ _UUID_RE = re.compile(
 
 _HEADER_NAME_MAP = {
     "transaction_date": "transaction date",
+    "notification_date": "notification date",
     "owner": "owner",
     "ticker": "ticker",
     "asset_name": "asset name",
@@ -69,6 +72,54 @@ _HEADER_NAME_MAP = {
     "amount": "amount",
 }
 _REQUIRED_HEADERS = {"transaction_date", "owner", "asset_name", "tx_type", "amount"}
+_EQUITY_TICKER_RE = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,2})?$")
+_NON_EQUITY_RE = re.compile(
+    r"(?:RATE\s*/?\s*COUPON|\bBONDS?\b|\bNOTES?\b|\bDEBENTURES?\b|"
+    r"\bTREASUR(?:Y|IES)\b|\bMUNICIPAL\b|\bFIXED[ -]INCOME\b|"
+    r"\bCERTIFICATES? OF DEPOSIT\b)",
+    re.I,
+)
+_RESERVED_TICKERS = frozenset(
+    {"COUPON", "BOND", "BONDS", "NOTE", "NOTES", "STOCK", "TICKER"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SenateReportFetchResult:
+    outcome: ReportOutcome
+    transactions: tuple[dict, ...] = ()
+    artifact_sha256: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SenateRefreshSummary:
+    found: int
+    parsed: int
+    paper_only: int
+    unavailable: int
+    failed: int
+
+    def __post_init__(self) -> None:
+        accounted = self.parsed + self.paper_only + self.unavailable + self.failed
+        if self.found != accounted:
+            raise ValueError(
+                f"Senate report accounting mismatch: found={self.found}, "
+                f"accounted={accounted}"
+            )
+
+    @property
+    def complete(self) -> bool:
+        return self.failed == 0
+
+    def require_complete(self) -> None:
+        if not self.complete:
+            raise SenateEFDError(
+                "Senate refresh incomplete: "
+                f"found={self.found}, parsed={self.parsed}, "
+                f"paper_only={self.paper_only}, unavailable={self.unavailable}, "
+                f"failed={self.failed}"
+            )
 
 
 class SenateEFDError(Exception):
@@ -87,6 +138,7 @@ class SenateEFDSource(TransactionSource):
         data_dir: str | Path = "data",
         read_only: bool = False,
         db: Database | None = None,
+        ingestion_generation: str | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -98,6 +150,9 @@ class SenateEFDSource(TransactionSource):
         )
         self._session: cffi_requests.Session | None = None
         self._csrf_token: str | None = None
+        self.ingestion_generation = ingestion_generation
+        self.report_inventory: list[dict] = []
+        self.last_refresh_summary: SenateRefreshSummary | None = None
 
     def close(self) -> None:
         if self._session is not None:
@@ -346,21 +401,55 @@ class SenateEFDSource(TransactionSource):
                 stale_pages = 0
             time.sleep(SEARCH_PAGE_DELAY)
 
-    def _fetch_report_transactions(self, report_path: str) -> list[dict]:
-        """GET one PTR detail and parse its transaction table from headers."""
+    @staticmethod
+    def _is_non_equity_asset(asset_name: str, asset_type: str) -> bool:
+        text = f"{asset_name} {asset_type}".strip()
+        return bool(_NON_EQUITY_RE.search(text))
+
+    @classmethod
+    def _resolve_ticker(
+        cls, ticker_raw: str, asset_name: str, asset_type: str
+    ) -> tuple[str | None, TickerOrigin]:
+        if cls._is_non_equity_asset(asset_name, asset_type):
+            return None, TickerOrigin.NON_EQUITY
+
+        raw = ticker_raw.strip().upper()
+        if raw and raw != "--":
+            if raw in _RESERVED_TICKERS or not _EQUITY_TICKER_RE.fullmatch(raw):
+                return None, TickerOrigin.INVALID
+            return raw, TickerOrigin.OFFICIAL
+
+        inferred = _extract_ticker(asset_name)
+        if not inferred:
+            return None, TickerOrigin.MISSING
+        inferred = inferred.strip().upper()
+        if inferred in _RESERVED_TICKERS or not _EQUITY_TICKER_RE.fullmatch(inferred):
+            return None, TickerOrigin.INVALID
+        return inferred, TickerOrigin.ASSET_DESCRIPTION
+
+    def _fetch_report_transactions(self, report_path: str) -> SenateReportFetchResult:
+        """GET one PTR detail and return a classified, hashed parse result."""
         resp = self._request_with_retry("GET", f"{EFD_BASE}{report_path}")
         if resp.status_code in (404, 410):
             logger.warning(
-                "eFD filing %s unavailable (HTTP %d); skipping",
+                "eFD filing %s unavailable (HTTP %d)",
                 report_path,
                 resp.status_code,
             )
-            return []
+            return SenateReportFetchResult(outcome=ReportOutcome.UNAVAILABLE)
+        if resp.status_code != 200:
+            raise SenateEFDError(
+                f"eFD filing {report_path} returned HTTP {resp.status_code}"
+            )
+
+        artifact_sha256 = hashlib.sha256(resp.content).hexdigest()
         soup = BeautifulSoup(resp.text, "html.parser")
         table = soup.find("table", {"class": "table-striped"})
         if table is None:
-            # Paper/PDF-only filing: no transaction table.
-            return []
+            return SenateReportFetchResult(
+                outcome=ReportOutcome.PAPER_ONLY,
+                artifact_sha256=artifact_sha256,
+            )
         thead = table.find("thead")
         tbody = table.find("tbody")
         if thead is None or tbody is None:
@@ -390,55 +479,93 @@ class SenateEFDSource(TransactionSource):
                 return cells[idx]
 
             asset_name = cell("asset_name")
-            ticker_raw = cell("ticker").strip()
-            if ticker_raw and ticker_raw != "--":
-                ticker = ticker_raw.upper()
-            else:
-                ticker = _extract_ticker(asset_name)
+            asset_type = cell("asset_type")
+            ticker_raw = cell("ticker")
+            ticker, ticker_origin = self._resolve_ticker(
+                ticker_raw, asset_name, asset_type
+            )
+            owner_raw = cell("owner")
+            tx_subtype_raw = cell("tx_type")
+            amount_raw = cell("amount")
             out.append(
                 {
                     "ticker": ticker,
+                    "ticker_raw": ticker_raw or None,
+                    "ticker_origin": ticker_origin.value,
                     "asset_name": asset_name,
-                    "asset_type": cell("asset_type"),
-                    "owner": _extract_owner_code(cell("owner")),
-                    "type": cell("tx_type"),
+                    "asset_type": asset_type,
+                    "owner": _extract_owner_code(owner_raw),
+                    "owner_raw": owner_raw or None,
+                    "type": tx_subtype_raw,
+                    "transaction_subtype_raw": tx_subtype_raw or None,
                     "transaction_date": cell("transaction_date"),
-                    "amount_range": cell("amount"),
+                    "notification_date": cell("notification_date") or None,
+                    "amount_range": amount_raw,
+                    "amount_range_raw": amount_raw or None,
                 }
             )
-        return out
+        return SenateReportFetchResult(
+            outcome=ReportOutcome.PARSED,
+            transactions=tuple(out),
+            artifact_sha256=artifact_sha256,
+        )
 
     @staticmethod
     def _dedupe_restatements(raw: list[dict]) -> list[dict]:
-        """Drop exact transaction restatements across filings within one run.
+        """Collapse exact restatements while retaining earliest availability.
 
-        An amendment re-filing restates identical transactions under a new
-        document id. Keep only the latest-filed copy. Amendments that alter
-        amounts or tickers are not de-duplicated because efdsearch exposes
-        no supersession metadata.
+        eFD does not publish an authoritative amendment pointer.  Exact copies
+        across report IDs are therefore represented as restatement lineage, not
+        asserted as amendments.  The earliest official filing remains the
+        canonical availability date so a later restatement cannot rewrite the
+        historical information set.
         """
-        best: dict[tuple, dict] = {}
-        for t in raw:
+        groups: dict[tuple, list[dict]] = {}
+        for transaction in raw:
             key = (
-                t.get("senator"),
-                t.get("ticker"),
-                t.get("transaction_date"),
-                t.get("type"),
-                t.get("amount_range"),
-                t.get("owner"),
-                t.get("asset_name"),
+                transaction.get("senator"),
+                transaction.get("ticker"),
+                transaction.get("transaction_date"),
+                transaction.get("type"),
+                transaction.get("amount_range"),
+                transaction.get("owner"),
+                transaction.get("asset_name"),
             )
-            prev = best.get(key)
-            if prev is None or (t.get("filed_date") or pd.Timestamp.min) >= (
-                prev.get("filed_date") or pd.Timestamp.min
-            ):
-                best[key] = t
-        dropped = len(raw) - len(best)
+            groups.setdefault(key, []).append(transaction)
+
+        reconciled: list[dict] = []
+        dropped = 0
+        for transactions in groups.values():
+            ordered = sorted(
+                transactions,
+                key=lambda item: (
+                    item.get("filed_date") or pd.Timestamp.max,
+                    str(item.get("source_record_id") or item.get("doc_id") or ""),
+                ),
+            )
+            canonical = dict(ordered[0])
+            source_records: list[str] = []
+            filing_dates: list = []
+            for item in ordered:
+                source_record_id = item.get("source_record_id") or item.get("doc_id")
+                if source_record_id and str(source_record_id) not in source_records:
+                    source_records.append(str(source_record_id))
+                filed_date = item.get("filed_date")
+                if filed_date is not None and filed_date not in filing_dates:
+                    filing_dates.append(filed_date)
+            canonical["available_date"] = canonical.get("filed_date")
+            canonical["restatement_source_record_ids"] = source_records
+            canonical["restatement_filing_dates"] = filing_dates
+            canonical["restatement_count"] = len(source_records)
+            reconciled.append(canonical)
+            dropped += len(ordered) - 1
+
         if dropped:
             logger.warning(
-                "Dropped %d restated transactions across filings (amendments)", dropped
+                "Collapsed %d exact restatement rows while preserving earliest availability",
+                dropped,
             )
-        return list(best.values())
+        return reconciled
 
     def fetch_all_trades(
         self,
@@ -461,40 +588,94 @@ class SenateEFDSource(TransactionSource):
         self._open_session()
         reports = self._search_reports(start_date, end_date)
         raw: list[dict] = []
-        failures = 0
+        counts = {outcome: 0 for outcome in ReportOutcome}
+        self.report_inventory = []
         for report in reports:
             doc_id = self._path_to_doc_id(report["report_path"])
+            source_record_id = self._path_to_source_record_id(report["report_path"])
             try:
-                txns = self._fetch_report_transactions(report["report_path"])
+                result = self._fetch_report_transactions(report["report_path"])
             except SenateEFDBlockedError:
                 raise
-            except SenateEFDError as e:
-                failures += 1
-                logger.error("Failed to parse %s: %s", report["report_path"], e)
-                continue
-            for tx in txns:
-                raw.append(
-                    {
-                        "doc_id": doc_id,
-                        "senator": report["senator"],
-                        "filed_date": report["filed_date"],
-                        **tx,
-                    }
+            except SenateEFDError as exc:
+                result = SenateReportFetchResult(
+                    outcome=ReportOutcome.FAILED,
+                    error_message=str(exc),
                 )
+                logger.error("Failed to parse %s: %s", report["report_path"], exc)
+
+            counts[result.outcome] += 1
+            self.report_inventory.append(
+                {
+                    "source_record_id": source_record_id,
+                    "report_path": report["report_path"],
+                    "member": report["senator"],
+                    "official_filing_date": report["filed_date"],
+                    "outcome": result.outcome.value,
+                    "artifact_sha256": result.artifact_sha256,
+                    "error_message": result.error_message,
+                    "ingestion_generation": self.ingestion_generation,
+                }
+            )
+            if result.outcome is ReportOutcome.PARSED:
+                for transaction in result.transactions:
+                    raw.append(
+                        {
+                            "doc_id": doc_id,
+                            "source_record_id": source_record_id,
+                            "source_report_path": report["report_path"],
+                            "senator": report["senator"],
+                            "filed_date": report["filed_date"],
+                            "official_filing_date": report["filed_date"],
+                            "amends_source_record_id": None,
+                            "artifact_sha256": result.artifact_sha256,
+                            "ingestion_generation": self.ingestion_generation,
+                            **transaction,
+                        }
+                    )
             time.sleep(PTR_FETCH_DELAY)
-        if failures:
-            logger.warning("Failed to parse %d of %d filings", failures, len(reports))
+
+        summary = SenateRefreshSummary(
+            found=len(reports),
+            parsed=counts[ReportOutcome.PARSED],
+            paper_only=counts[ReportOutcome.PAPER_ONLY],
+            unavailable=counts[ReportOutcome.UNAVAILABLE],
+            failed=counts[ReportOutcome.FAILED],
+        )
+        self.last_refresh_summary = summary
+        summary.require_complete()
+
         raw = self._dedupe_restatements(raw)
         logger.info(
-            "Fetched %d raw Senate transactions from %d filings", len(raw), len(reports)
+            "Fetched %d reconciled Senate transactions from %d filings "
+            "(%d parsed, %d paper-only, %d unavailable)",
+            len(raw),
+            summary.found,
+            summary.parsed,
+            summary.paper_only,
+            summary.unavailable,
         )
-        return self._normalize(raw)
+        normalized = self._normalize(raw)
+        normalized.attrs["refresh_summary"] = {
+            "found": summary.found,
+            "parsed": summary.parsed,
+            "paper_only": summary.paper_only,
+            "unavailable": summary.unavailable,
+            "failed": summary.failed,
+        }
+        normalized.attrs["report_inventory"] = list(self.report_inventory)
+        return normalized
+
+    @staticmethod
+    def _path_to_source_record_id(report_path: str) -> str:
+        match = _UUID_RE.search(report_path)
+        return match.group(0) if match else report_path
 
     @staticmethod
     def _path_to_doc_id(report_path: str) -> str:
-        m = _UUID_RE.search(report_path)
-        if m:
-            return m.group(0)
+        match = _UUID_RE.search(report_path)
+        if match:
+            return match.group(0)
         return (
             "efd-"
             + hashlib.sha1(report_path.encode(), usedforsecurity=False).hexdigest()[:16]
@@ -510,46 +691,107 @@ class SenateEFDSource(TransactionSource):
     def _normalize(self, trades: list[dict]) -> pd.DataFrame:
         columns = [
             "doc_id",
+            "chamber",
+            "source_record_id",
+            "source_report_path",
             "member",
+            "member_key",
+            "member_identity",
             "ticker",
+            "ticker_origin",
             "transaction_date",
             "disclosure_date",
+            "official_filing_date",
+            "available_date",
+            "notification_date",
             "transaction_type",
+            "raw_transaction_subtype",
             "owner_code",
+            "raw_owner",
             "amount_raw",
             "amount_midpoint",
             "instrument_type",
+            "raw_asset_class",
             "strike_price",
             "expiry_date",
             "asset_description",
+            "raw_asset_description",
+            "amends_source_record_id",
+            "restatement_source_record_ids",
+            "restatement_filing_dates",
+            "restatement_count",
+            "ingestion_generation",
+            "artifact_sha256",
         ]
         if not trades:
             return pd.DataFrame(columns=columns)
 
         rows = []
         rejected = 0
-        for t in trades:
-            amount_raw, midpoint = _extract_amount_midpoint(t.get("amount_range"))
+        for transaction in trades:
+            amount_raw, midpoint = _extract_amount_midpoint(
+                transaction.get("amount_range")
+            )
+            member = transaction.get("senator")
+            available_date = self._parse_date(
+                transaction.get("available_date") or transaction.get("filed_date")
+            )
+            official_filing_date = self._parse_date(
+                transaction.get("official_filing_date") or transaction.get("filed_date")
+            )
             row = {
-                "doc_id": t.get("doc_id"),
-                "member": t.get("senator"),
-                "ticker": t.get("ticker"),
-                "transaction_date": self._parse_date(t.get("transaction_date")),
-                "disclosure_date": self._parse_date(t.get("filed_date")),
-                "transaction_type": self._normalize_tx_type(t.get("type")),
-                "owner_code": t.get("owner"),
-                "amount_raw": amount_raw or t.get("amount_range"),
+                "doc_id": transaction.get("doc_id"),
+                "chamber": Chamber.SENATE.value,
+                "source_record_id": transaction.get("source_record_id"),
+                "source_report_path": transaction.get("source_report_path"),
+                "member": member,
+                "member_key": canonical_member_key(member),
+                "member_identity": canonical_member_identity(
+                    member, Chamber.SENATE.value
+                ),
+                "ticker": transaction.get("ticker"),
+                "ticker_origin": transaction.get("ticker_origin"),
+                "transaction_date": self._parse_date(
+                    transaction.get("transaction_date")
+                ),
+                "disclosure_date": available_date,
+                "official_filing_date": official_filing_date,
+                "available_date": available_date,
+                "notification_date": self._parse_date(
+                    transaction.get("notification_date")
+                ),
+                "transaction_type": self._normalize_tx_type(transaction.get("type")),
+                "raw_transaction_subtype": transaction.get("transaction_subtype_raw"),
+                "owner_code": transaction.get("owner"),
+                "raw_owner": transaction.get("owner_raw"),
+                "amount_raw": amount_raw or transaction.get("amount_range_raw"),
                 "amount_midpoint": midpoint,
-                "instrument_type": self._normalize_instrument_type(t.get("asset_type")),
+                "instrument_type": self._normalize_instrument_type(
+                    transaction.get("asset_type")
+                ),
+                "raw_asset_class": transaction.get("asset_type"),
                 "strike_price": None,
                 "expiry_date": None,
-                "asset_description": t.get("asset_name"),
+                "asset_description": transaction.get("asset_name"),
+                "raw_asset_description": transaction.get("asset_name"),
+                "amends_source_record_id": transaction.get("amends_source_record_id"),
+                "restatement_source_record_ids": transaction.get(
+                    "restatement_source_record_ids", []
+                ),
+                "restatement_filing_dates": transaction.get(
+                    "restatement_filing_dates", []
+                ),
+                "restatement_count": transaction.get("restatement_count", 1),
+                "ingestion_generation": transaction.get("ingestion_generation"),
+                "artifact_sha256": transaction.get("artifact_sha256"),
             }
             if (
                 not row["doc_id"]
+                or not row["source_record_id"]
                 or not row["member"]
                 or row["transaction_date"] is None
-                or row["disclosure_date"] is None
+                or row["official_filing_date"] is None
+                or row["available_date"] is None
                 or not row["transaction_type"]
             ):
                 rejected += 1
@@ -584,13 +826,21 @@ class SenateEFDSource(TransactionSource):
     @staticmethod
     def _normalize_instrument_type(raw):
         if not raw:
-            return "stock"
+            return "unknown"
         lower = raw.lower()
         if "call" in lower:
             return "call"
         if "put" in lower:
             return "put"
-        return "stock"
+        if any(
+            term in lower for term in ("bond", "note", "treasury", "municipal", "debt")
+        ):
+            return "bond"
+        if "fund" in lower or "etf" in lower:
+            return "fund"
+        if "stock" in lower or "equity" in lower:
+            return "stock"
+        return "other"
 
     def save_to_db(self, df: pd.DataFrame) -> int:
         if df.empty:

@@ -265,6 +265,15 @@ class PdfSnapshot:
     path: Path
     sha256: str
     page_count: int
+    byte_count: int
+
+
+@dataclass(frozen=True)
+class ArtifactMetadata:
+    sha256: str
+    page_count: int
+    byte_count: int
+    source_path: str
 
 
 @dataclass(frozen=True)
@@ -284,7 +293,9 @@ def snapshot_pdf(pdf_path: str | Path):
         snapshot_path = Path(directory) / "artifact.pdf"
         snapshot_path.write_bytes(source_bytes)
         snapshot_path.chmod(0o444)
-        snapshot = PdfSnapshot(snapshot_path, digest, pdf_page_count(snapshot_path))
+        snapshot = PdfSnapshot(
+            snapshot_path, digest, pdf_page_count(snapshot_path), len(source_bytes)
+        )
         yield snapshot
 
 
@@ -414,16 +425,22 @@ def call_gemini(
     cache_dir: str = CACHE_DIR,
     timeout: int = 180,
     parser_version: str = GEMINI_PARSER_VERSION,
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, ArtifactMetadata | None]:
     """Call Gemini against the same immutable bytes used for hash/cache checks."""
     try:
         with snapshot_pdf(pdf_path) as snapshot:
+            metadata = ArtifactMetadata(
+                snapshot.sha256,
+                snapshot.page_count,
+                snapshot.byte_count,
+                str(Path(pdf_path)),
+            )
             if doc_id and not refresh:
                 cached = _read_cached_snapshot(
                     str(doc_id), snapshot, cache_dir, parser_version
                 )
                 if cached is not None:
-                    return cached, ""
+                    return cached, "", metadata
             result = subprocess.run(
                 [
                     "llm",
@@ -441,22 +458,26 @@ def call_gemini(
                 timeout=timeout,
             )
             if result.returncode != 0:
-                return None, result.stderr.strip() or f"llm exited {result.returncode}"
+                return (
+                    None,
+                    result.stderr.strip() or f"llm exited {result.returncode}",
+                    metadata,
+                )
             try:
                 parse_gemini_output(
                     result.stdout, expected_page_count=snapshot.page_count
                 )
             except GeminiOutputError as exc:
-                return None, f"invalid_response: {exc}"
+                return None, f"invalid_response: {exc}", metadata
             if doc_id:
                 _write_cached_snapshot(
                     str(doc_id), snapshot, result.stdout, cache_dir, parser_version
                 )
-            return result.stdout, ""
+            return result.stdout, "", metadata
     except subprocess.TimeoutExpired:
-        return None, "llm timed out"
+        return None, "llm timed out", None
     except Exception as exc:
-        return None, str(exc)
+        return None, str(exc), None
 
 
 def _tx_date(tx: dict):

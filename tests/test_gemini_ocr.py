@@ -20,7 +20,10 @@ OCR_SCHEMA_COLUMNS = {
     "amends_source_record_id": "VARCHAR",
     "raw_transaction_subtype": "VARCHAR",
     "ticker_origin": "VARCHAR",
+    "raw_ticker": "VARCHAR",
+    "ticker_candidate": "VARCHAR",
     "raw_asset_class": "VARCHAR",
+    "raw_owner": "VARCHAR",
     "raw_asset_description": "VARCHAR",
     "ingestion_generation": "VARCHAR",
     "artifact_sha256": "VARCHAR",
@@ -35,7 +38,7 @@ def _enable_ocr_schema(connection):
     connection.execute("DROP INDEX IF EXISTS idx_tx_unique_v2")
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique_source_row "
-        "ON transactions(source_record_id, source_row_id)"
+        "ON transactions(source, chamber, source_record_id, source_row_id, ingestion_generation)"
     )
 
 
@@ -115,7 +118,7 @@ def test_call_gemini_empty_stdout_not_cached(monkeypatch, tmp_path):
         return Result()
 
     monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
-    output, error = gemini_ocr_common.call_gemini(
+    output, error, metadata = gemini_ocr_common.call_gemini(
         str(pdf), doc_id="doc-empty", cache_dir=str(tmp_path)
     )
 
@@ -141,7 +144,7 @@ def test_call_gemini_ignores_partial_cache_file(monkeypatch, tmp_path):
         return Result()
 
     monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
-    output, error = gemini_ocr_common.call_gemini(
+    output, error, metadata = gemini_ocr_common.call_gemini(
         str(pdf), doc_id="doc-partial", cache_dir=str(tmp_path)
     )
 
@@ -177,14 +180,14 @@ def test_cache_is_invalidated_when_pdf_changes(monkeypatch, tmp_path):
         return Result()
 
     monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
-    first, _ = gemini_ocr_common.call_gemini(
+    first, _, _ = gemini_ocr_common.call_gemini(
         str(pdf), doc_id="doc-hash", cache_dir=str(tmp_path)
     )
-    cached, _ = gemini_ocr_common.call_gemini(
+    cached, _, _ = gemini_ocr_common.call_gemini(
         str(pdf), doc_id="doc-hash", cache_dir=str(tmp_path)
     )
     pdf.write_bytes(b"%PDF-second")
-    changed, _ = gemini_ocr_common.call_gemini(
+    changed, _, _ = gemini_ocr_common.call_gemini(
         str(pdf), doc_id="doc-hash", cache_dir=str(tmp_path)
     )
 
@@ -215,7 +218,7 @@ def test_call_uses_one_immutable_pdf_snapshot(monkeypatch, tmp_path):
         return Result()
 
     monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
-    output, error = gemini_ocr_common.call_gemini(
+    output, error, metadata = gemini_ocr_common.call_gemini(
         str(pdf), doc_id="snapshot", cache_dir=str(tmp_path)
     )
     envelope = json.loads((tmp_path / "snapshot.json").read_text())
@@ -224,6 +227,33 @@ def test_call_uses_one_immutable_pdf_snapshot(monkeypatch, tmp_path):
     assert (
         envelope["pdf_sha256"] == gemini_ocr_common.hashlib.sha256(original).hexdigest()
     )
+    assert metadata is not None
+    assert metadata.sha256 == envelope["pdf_sha256"]
+    db_path = tmp_path / "snapshot.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata VALUES ('snapshot', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.close()
+    parsed = gemini_ocr_common.parse_gemini_output(output)
+    assert (
+        _insert_transactions(
+            "snapshot",
+            2024,
+            parsed.member,
+            parsed.transactions,
+            db_path=str(db_path),
+            artifact_sha256=metadata.sha256,
+        )
+        == 1
+    )
+    connection = duckdb.connect(str(db_path))
+    stored = connection.execute(
+        "SELECT artifact_sha256 FROM transactions WHERE doc_id='snapshot'"
+    ).fetchone()[0]
+    connection.close()
+    assert stored == gemini_ocr_common.hashlib.sha256(original).hexdigest()
 
 
 def test_cache_path_sanitizes_doc_id(tmp_path):
@@ -392,6 +422,45 @@ def test_insert_transactions_plumbs_authoritative_provenance_when_schema_support
         "Apple Inc. (AAPL)",
         gemini_ocr_common.GEMINI_PARSER_VERSION,
         "abc123",
+    )
+
+
+def test_tickerless_resolver_is_unverified_candidate_not_canonical(
+    monkeypatch, tmp_path
+):
+    from scripts import ocr_zero_rows
+
+    db_path = tmp_path / "candidate.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata VALUES ('candidate', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.close()
+    monkeypatch.setattr(ocr_zero_rows, "resolve_ticker", lambda asset: "ACME")
+    assert (
+        _insert_transactions(
+            "candidate",
+            2024,
+            "Jane Doe",
+            [_tx(asset="Acme Holdings")],
+            db_path=str(db_path),
+        )
+        == 1
+    )
+    connection = duckdb.connect(str(db_path))
+    row = connection.execute(
+        "SELECT ticker, raw_ticker, ticker_candidate, ticker_origin, available_date, raw_asset_class "
+        "FROM transactions WHERE doc_id='candidate'"
+    ).fetchone()
+    connection.close()
+    assert row == (
+        None,
+        "ACME",
+        "ACME",
+        "unverified",
+        datetime(2024, 1, 20).date(),
+        "Not separately reported",
     )
 
 

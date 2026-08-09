@@ -22,7 +22,6 @@ from scripts.gemini_ocr_common import (
     call_gemini,
     inspect_cached_response,
     parse_gemini_output,
-    pdf_sha256,
     validate_transactions,
 )
 
@@ -39,7 +38,10 @@ REQUIRED_OCR_SCHEMA_COLUMNS = {
     "amends_source_record_id",
     "raw_transaction_subtype",
     "ticker_origin",
+    "raw_ticker",
+    "ticker_candidate",
     "raw_asset_class",
+    "raw_owner",
     "raw_asset_description",
     "ingestion_generation",
     "artifact_sha256",
@@ -989,7 +991,17 @@ def insert_transactions(
             tx_date = normalize_date(tx["date"])
             notification_date = normalize_date(tx["notif_date"])
             disclosure_date = filing_date or notification_date or tx_date
-            ticker = extract_ticker(tx["asset"]) or resolve_ticker(tx["asset"])
+            disclosed_ticker = extract_ticker(tx["asset"])
+            ticker_candidate = None
+            if disclosed_ticker:
+                ticker = disclosed_ticker
+                raw_ticker = disclosed_ticker
+                ticker_origin = "official"
+            else:
+                ticker_candidate = resolve_ticker(tx["asset"])
+                ticker = None
+                raw_ticker = ticker_candidate
+                ticker_origin = "unverified" if ticker_candidate else "not_reported"
             if not tx_date or not notification_date:
                 errors.append(f"bad date: {tx['date']} / {tx['notif_date']}")
                 continue
@@ -1018,8 +1030,13 @@ def insert_transactions(
                 "source_record_id": str(doc_id),
                 "source_row_id": row_identity,
                 "official_filing_date": filing_date,
+                "available_date": filing_date,
                 "notification_date": notification_date,
                 "raw_transaction_subtype": tx["type"],
+                "ticker_origin": ticker_origin,
+                "raw_ticker": raw_ticker,
+                "ticker_candidate": ticker_candidate,
+                "raw_asset_class": "Not separately reported",
                 "raw_asset_description": tx["asset"][:500],
                 "ingestion_generation": parser_version,
                 "artifact_sha256": artifact_sha256,
@@ -1070,66 +1087,92 @@ def insert_transactions(
 
     count = 0
     committed = False
+    staging_table = "staging_gemini_ocr_transactions"
     try:
-        conn.execute("BEGIN TRANSACTION")
+        conn.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        conn.execute(
+            f"CREATE TEMP TABLE {staging_table} AS "
+            "SELECT * FROM transactions WHERE FALSE"
+        )
         for row in rows:
             columns = list(row)
             placeholders = ", ".join("?" for _ in columns)
-            update_columns = [
-                column
-                for column in columns
-                if column not in {"source_record_id", "source_row_id"}
-            ]
-            updates = ", ".join(
-                f"{column} = excluded.{column}" for column in update_columns
-            )
             conn.execute(
-                f"INSERT INTO transactions ({', '.join(columns)}) "
-                f"VALUES ({placeholders}) "
-                f"ON CONFLICT (source_record_id, source_row_id) "
-                f"DO UPDATE SET {updates}",
+                f"INSERT INTO {staging_table} ({', '.join(columns)}) "
+                f"VALUES ({placeholders})",
                 [row[column] for column in columns],
             )
-            count += 1
-        source_row_ids = [row["source_row_id"] for row in rows]
-        retained_placeholders = ", ".join("?" for _ in source_row_ids)
-        conn.execute(
-            f"DELETE FROM transactions WHERE doc_id = ? "
-            f"AND (source_row_id IS NULL OR source_row_id NOT IN ({retained_placeholders}))",
-            [str(doc_id), *source_row_ids],
+        columns = list(rows[0])
+        conn.execute("BEGIN TRANSACTION")
+        identity_columns = [
+            "source",
+            "chamber",
+            "source_record_id",
+            "source_row_id",
+            "ingestion_generation",
+        ]
+        mutable_columns = [
+            column for column in columns if column not in identity_columns
+        ]
+        identity_join = " AND ".join(
+            f"target.{column} = staged.{column}" for column in identity_columns
         )
+        updates = ", ".join(f"{column} = staged.{column}" for column in mutable_columns)
+        conn.execute(
+            f"UPDATE transactions AS target SET {updates} "
+            f"FROM {staging_table} AS staged WHERE {identity_join}"
+        )
+        conn.execute(
+            f"INSERT INTO transactions ({', '.join(columns)}) "
+            f"SELECT {', '.join(f'staged.{column}' for column in columns)} "
+            f"FROM {staging_table} AS staged WHERE NOT EXISTS ("
+            f"SELECT 1 FROM transactions AS target WHERE {identity_join})"
+        )
+        stale_identity_join = " AND ".join(
+            f"staged.{column} = target.{column}" for column in identity_columns
+        )
+        conn.execute(
+            "DELETE FROM transactions AS target "
+            "WHERE target.source = 'gemini_ocr' AND target.chamber = 'House' "
+            "AND target.source_record_id = ? AND target.ingestion_generation = ? "
+            f"AND NOT EXISTS (SELECT 1 FROM {staging_table} AS staged "
+            f"WHERE {stale_identity_join})",
+            [str(doc_id), parser_version],
+        )
+        count = len(rows)
         record_parse_run(
             conn,
             doc_id,
             year,
             "success",
-            raw_count if raw_count is not None else len(transactions),
+            input_count,
             count,
-            "; ".join(errors),
+            "",
             parser_version=parser_version,
         )
         conn.execute("COMMIT")
         committed = True
         conn.execute("CHECKPOINT")
         return count
-    except Exception as e:
-        # A CHECKPOINT failure after COMMIT must not trigger ROLLBACK (no
-        # active transaction — would mask the original error); the data is
-        # already committed, so only re-raise.
+    except Exception as exc:
         if not committed:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             record_parse_run(
                 conn,
                 doc_id,
                 year,
                 "error",
-                raw_count if raw_count is not None else len(transactions),
+                input_count,
                 0,
-                str(e),
+                str(exc),
                 parser_version=parser_version,
             )
         raise
     finally:
+        conn.execute(f"DROP TABLE IF EXISTS {staging_table}")
         conn.close()
 
 
@@ -1162,7 +1205,9 @@ def main():
 
         time.sleep(COOLDOWN)
 
-        output, error = call_gemini(path, doc_id=doc_id, refresh=args.refresh)
+        output, error, artifact_metadata = call_gemini(
+            path, doc_id=doc_id, refresh=args.refresh
+        )
         if output is None or error:
             conn = duckdb.connect(DB_PATH)
             try:
@@ -1214,7 +1259,7 @@ def main():
             transactions,
             db_path=DB_PATH,
             raw_count=raw_count,
-            artifact_sha256=pdf_sha256(path),
+            artifact_sha256=artifact_metadata.sha256,
         )
         total_inserted += inserted
         mark_progress(progress, doc_id, "success" if inserted else "errors")
@@ -1246,7 +1291,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
     for i, (doc_id, yr, path) in enumerate(remaining):
         print(f"\n[{i + 1}/{len(remaining)}] {doc_id} ({yr})...", flush=True)
         time.sleep(COOLDOWN)
-        output, error = call_gemini(
+        output, error, artifact_metadata = call_gemini(
             path,
             doc_id=doc_id,
             refresh=refresh,
@@ -1325,7 +1370,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             db_path=db_path,
             parser_version=GEMINI_PARSER_VERSION,
             raw_count=raw_count,
-            artifact_sha256=pdf_sha256(path),
+            artifact_sha256=artifact_metadata.sha256,
         )
         if inserted <= 0:
             mark_progress(progress, doc_id, "errors")

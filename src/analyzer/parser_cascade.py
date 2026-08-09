@@ -1,6 +1,7 @@
 """Per-PDF parser cascade: tries multiple PDF engines until transactions are found."""
 
 import os
+import re
 import logging
 from pathlib import Path
 
@@ -50,21 +51,24 @@ def _result_quality(txs: list[dict]) -> float:
     return valid / len(txs)
 
 
+def _normalize_identity_value(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
 def _transaction_identity(transaction: dict) -> tuple:
-    fields = (
-        "asset_description",
-        "ticker",
-        "transaction_date",
-        "transaction_type",
-        "amount_raw",
-        "amount_midpoint",
-        "owner_code",
-        "notification_date",
-        "page_number",
-        "source_record_id",
-    )
-    return tuple(
-        str(transaction.get(field) or "").strip().casefold() for field in fields
+    return (
+        _normalize_identity_value(
+            transaction.get("ticker") or transaction.get("asset_description")
+        ),
+        _normalize_identity_value(transaction.get("transaction_date")),
+        _normalize_identity_value(transaction.get("transaction_type")),
+        _normalize_identity_value(
+            transaction.get("amount_raw") or transaction.get("amount_midpoint")
+        ),
+        _normalize_identity_value(transaction.get("owner_code")),
+        _normalize_identity_value(transaction.get("notification_date")),
+        _normalize_identity_value(transaction.get("page_number")),
+        _normalize_identity_value(transaction.get("source_row_id")),
     )
 
 
@@ -124,19 +128,11 @@ def _reconcile_candidates(candidates, engines_attempted):
         ),
     )
     best_counts = counts_by_engine[best_name]
-    independently_confirmed = best_name == "pdftotext" and any(
-        name == "stream"
-        and len(rows) == len(best_rows)
-        and _semantic_score(rows) <= _semantic_score(best_rows)
-        for name, rows in candidates
-    )
-    complementary = not independently_confirmed and any(
+    complementary = any(
         not _multiset_subset(counts, best_counts)
         for name, counts in counts_by_engine.items()
         if name != best_name
     )
-    if independently_confirmed:
-        engines_attempted.append(f"confirmed_count:{len(best_rows)}")
     if not complementary:
         engines_attempted.append(f"won:{best_name}")
         return best_rows, False
@@ -146,8 +142,7 @@ def _reconcile_candidates(candidates, engines_attempted):
     for _, rows in candidates:
         counts, current_representatives = _candidate_counts(rows)
         for identity, count in counts.items():
-            if identity not in maximum_counts:
-                maximum_counts[identity] = count
+            maximum_counts[identity] = max(maximum_counts.get(identity, 0), count)
             representatives.setdefault(identity, current_representatives[identity])
     reconciled = []
     for identity, count in maximum_counts.items():
@@ -193,9 +188,22 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     reconciled_text, text_uncertain = _reconcile_candidates(
         text_candidates, engines_attempted
     )
-    if reconciled_text and not text_uncertain:
-        return pdf_path, reconciled_text, engines_attempted
-
+    trusted = {name: rows for name, rows in text_candidates}
+    pdfplumber_counts = _candidate_counts(trusted.get("pdfplumber", []))[0]
+    pdftotext_counts = _candidate_counts(trusted.get("pdftotext", []))[0]
+    trusted_overlap = sum(
+        min(count, pdftotext_counts.get(identity, 0))
+        for identity, count in pdfplumber_counts.items()
+    )
+    trusted_complete = (
+        bool(pdfplumber_counts)
+        and bool(pdftotext_counts)
+        and trusted_overlap / sum(pdfplumber_counts.values()) >= 0.8
+    )
+    if trusted_complete:
+        engines_attempted.append("trusted:pdfplumber_subset_pdftotext")
+        engines_attempted.append("won:pdftotext")
+        return pdf_path, trusted["pdftotext"], engines_attempted
     ocr_candidates = []
     if not skip_docling:
         candidate = _run_candidate(

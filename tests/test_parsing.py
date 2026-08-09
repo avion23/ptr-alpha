@@ -682,7 +682,44 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertEqual({row["asset_description"] for row in rows}, {"A", "B"})
         self.assertIn("won:reconciled_complete_ocr", engines)
 
-    def test_duplicate_heavy_engine_does_not_win(self):
+    def test_disjoint_or_single_text_engine_is_unresolved_without_complete_ocr(self):
+        from analyzer import parser_cascade
+
+        def tx(asset):
+            return {
+                "transaction_date": "2024-01-01",
+                "transaction_type": "Purchase",
+                "amount_midpoint": 8000,
+                "asset_description": asset,
+            }
+
+        scenarios = [
+            ([tx("A")], [tx("B")]),
+            ([], [tx("Only")]),
+        ]
+        for pdfplumber_rows, pdftotext_rows in scenarios:
+            with (
+                patch.object(
+                    parser_cascade, "_try_pdfplumber", return_value=pdfplumber_rows
+                ),
+                patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+                patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+                patch.object(
+                    parser_cascade, "_try_pdftotext", return_value=pdftotext_rows
+                ),
+                patch.object(parser_cascade, "_try_docling", return_value=[]),
+                patch.object(
+                    parser_cascade,
+                    "_try_tesseract",
+                    side_effect=parser_cascade.ParserBackendError(
+                        "ocr", RuntimeError("incomplete")
+                    ),
+                ),
+            ):
+                with self.assertRaises(parser_cascade.ParserCascadeError):
+                    parser_cascade._parse_pdf_worker(Path("uncertain.pdf"))
+
+    def test_reconciliation_preserves_maximum_source_lot_multiplicity(self):
         from analyzer import parser_cascade
 
         row = {
@@ -700,7 +737,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             patch.object(parser_cascade, "_try_tesseract", return_value=[row]),
         ):
             _, rows, _ = parser_cascade._parse_pdf_worker(Path("duplicates.pdf"))
-        self.assertEqual(rows, [row])
+        self.assertEqual(rows, [row] * 5)
 
     def test_known_real_pdf_hash_and_row_count_canaries(self):
         from analyzer.parser_cascade import _parse_pdf_worker

@@ -14,7 +14,6 @@ from scripts.gemini_ocr_common import (
     GEMINI_PARSER_VERSION,
     call_gemini,
     parse_gemini_output,
-    pdf_sha256,
     validate_transactions,
 )
 from scripts.ocr_zero_rows import (
@@ -138,7 +137,7 @@ def _record_failure(doc_id, year, status, raw_count, error):
 
 def process_one(item, refresh=False):
     doc_id, year, pdf_path = item
-    output, error = call_gemini(
+    output, error, artifact_metadata = call_gemini(
         pdf_path,
         doc_id=doc_id,
         refresh=refresh,
@@ -205,7 +204,7 @@ def process_one(item, refresh=False):
             "member": member,
             "transactions": transactions,
             "raw_count": parsed.raw_row_count,
-            "artifact_sha256": pdf_sha256(pdf_path),
+            "artifact_sha256": artifact_metadata.sha256,
         }
     )
     return doc_id, year, "success", inserted, transactions

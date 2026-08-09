@@ -4,6 +4,7 @@ import logging
 from datetime import date
 
 import duckdb
+import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import (
     AbstractHolidayCalendar,
@@ -49,6 +50,16 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
         USLaborDay,
         USThanksgivingDay,
         Holiday("Christmas Day", month=12, day=25, observance=nearest_workday),
+        # One-off full-session closures are not covered by recurring holiday
+        # rules. Keep them explicit so a valid cache is not treated as missing
+        # and repeatedly downloaded.
+        Holiday(
+            "National Day of Mourning for Jimmy Carter",
+            month=1,
+            day=9,
+            start_date="2025-01-09",
+            end_date="2025-01-09",
+        ),
     ]
 
 
@@ -69,6 +80,8 @@ class PriceRepository:
             FROM prices
             WHERE ticker IN (SELECT UNNEST(?))
               AND date BETWEEN ? AND ?
+              AND close > 0
+              AND isfinite(close)
             ORDER BY date
         """,
             [tickers, start_date, end_date],
@@ -90,7 +103,19 @@ class PriceRepository:
             id_vars=[index_col_name], var_name="ticker", value_name="close"
         )
         prices_long = prices_long.rename(columns={index_col_name: "date"})
-        prices_long = prices_long.dropna(subset=["close"])
+        prices_long["close"] = pd.to_numeric(prices_long["close"], errors="coerce")
+        has_close = prices_long["close"].notna()
+        valid_close = (
+            has_close
+            & np.isfinite(prices_long["close"])
+            & (prices_long["close"] > 0)
+        )
+        rejected = int((has_close & ~valid_close).sum())
+        if rejected:
+            logger.warning("Rejected %d non-finite or non-positive price observations", rejected)
+        prices_long = prices_long.loc[valid_close]
+        if prices_long.empty:
+            return
 
         self.conn.execute("""
             INSERT INTO prices (ticker, date, close)
@@ -118,6 +143,8 @@ class PriceRepository:
             FROM prices
             WHERE ticker IN (SELECT UNNEST(?))
               AND date BETWEEN ? AND ?
+              AND close > 0
+              AND isfinite(close)
         """,
             [tickers, start_date, end_date],
         ).fetchdf()
@@ -216,9 +243,13 @@ class PriceRepository:
             ASOF LEFT JOIN prices p_res
               ON r.resolved_ticker = p_res.ticker
               AND p_res.date <= r.disclosure_date
+              AND p_res.close > 0
+              AND isfinite(p_res.close)
             ASOF LEFT JOIN prices p_raw
               ON r.ticker = p_raw.ticker
               AND p_raw.date <= r.disclosure_date
+              AND p_raw.close > 0
+              AND isfinite(p_raw.close)
             WHERE r.ticker IN (SELECT UNNEST(?))
               AND r.disclosure_date BETWEEN ? AND ?
               AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)

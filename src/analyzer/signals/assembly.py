@@ -77,7 +77,8 @@ def _compute_derived_arrays(metadata: dict, result_arrays: dict) -> dict:
     r_spy_cum = result_arrays["r_spy_cum"]
     r_spy_wsum = result_arrays["r_spy_wsum"]
 
-    valid_disc = (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
+    complete = result_arrays["r_window_complete"]
+    valid_disc = complete & (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
     # Bug #6: use NaN (not 0.0) for missing price windows so downstream
     # NaN-exclusion in aggregations (dynamic prior, hit rates) handles them.
     total_return = np.full(n, np.nan, dtype=np.float64)
@@ -117,7 +118,8 @@ def _compute_peak_potential(metadata: dict, result_arrays: dict) -> np.ndarray:
 
     from analyzer.models import TransactionType
 
-    valid_disc = (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
+    complete = result_arrays["r_window_complete"]
+    valid_disc = complete & (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
     is_purchase = txn_types == TransactionType.PURCHASE.value
     is_sale = txn_types == TransactionType.SALE.value
     purchase_mask = is_purchase & valid_disc
@@ -142,7 +144,8 @@ def _build_result_data(
     optional_columns: list[str],
     result_arrays: dict,
 ) -> dict:
-    r_decayed_ret = result_arrays["r_decayed_ret"]
+    complete = result_arrays["r_window_complete"]
+    r_decayed_ret = np.where(complete, result_arrays["r_decayed_ret"], np.nan)
     result_data = {
         "member": signals["member"].values,
         "ticker": metadata["ticker_arr"],

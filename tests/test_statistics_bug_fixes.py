@@ -58,7 +58,7 @@ class TestSpyDoubleDivision(unittest.TestCase):
     """
 
     def setUp(self):
-        # Two prices: disclosure day 0 and day 1
+        # Disclosure on day 0; executable window is day 1 through day 2.
         self.entry_prices = pd.DataFrame(
             {
                 "member": ["Alice"],
@@ -70,10 +70,10 @@ class TestSpyDoubleDivision(unittest.TestCase):
         )
         self.prices = pd.DataFrame(
             {
-                "TICK": [100.0, 100.0],  # flat ticker (decayed_return ≈ 0)
-                "SPY": [100.0, 110.0],  # SPY rises 10%
+                "TICK": [99.0, 100.0, 100.0],  # flat over executable window
+                "SPY": [99.0, 100.0, 110.0],  # SPY rises 10% after entry
             },
-            index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+            index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
         )
 
     def test_spy_return_not_double_divided(self):

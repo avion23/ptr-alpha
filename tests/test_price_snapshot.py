@@ -50,7 +50,8 @@ class TestPriceSnapshot(unittest.TestCase):
         self.assertEqual(snap.requested_tickers, 2)
         self.assertEqual(snap.resolved_tickers, 2)
         self.assertEqual(snap.unresolved_tickers, ())
-        self.assertGreater(snap.price_rows, 0)
+        self.assertEqual(snap.price_rows, 16)
+        self.assertEqual(len(snap.value_hash), 64)
         self.assertEqual(snap.first_date, "2024-01-01")
         self.assertEqual(snap.last_date, "2024-01-10")
         self.assertIn("AAPL", snap.coverage_by_ticker)
@@ -94,6 +95,7 @@ class TestPriceSnapshot(unittest.TestCase):
         self.assertEqual(loaded.price_rows, snap.price_rows)
         self.assertEqual(loaded.first_date, snap.first_date)
         self.assertEqual(loaded.last_date, snap.last_date)
+        self.assertEqual(loaded.value_hash, snap.value_hash)
         self.assertEqual(loaded.coverage_by_ticker, snap.coverage_by_ticker)
 
     def test_save_creates_parent_directory(self):
@@ -332,6 +334,35 @@ class TestPriceSnapshot(unittest.TestCase):
         expected_py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
         self.assertEqual(snap.python_version, expected_py)
         self.assertTrue(snap.yfinance_version)
+
+    def test_snapshot_hashes_supplied_post_acquisition_values(self):
+        self._seed_prices()
+        dates = pd.DatetimeIndex(["2024-01-01", "2024-01-02"])
+        acquired = pd.DataFrame(
+            {"AAPL": [900.0, 901.0], "MSFT": [800.0, None]}, index=dates
+        )
+
+        first = create_snapshot(
+            self.db,
+            ["AAPL", "MSFT"],
+            date(2024, 1, 1),
+            date(2024, 1, 2),
+            prices=acquired,
+        )
+        changed = acquired.copy()
+        changed.loc[pd.Timestamp("2024-01-02"), "AAPL"] = 902.0
+        second = create_snapshot(
+            self.db,
+            ["AAPL", "MSFT"],
+            date(2024, 1, 1),
+            date(2024, 1, 2),
+            prices=changed,
+        )
+
+        self.assertEqual(first.price_rows, 3)
+        self.assertEqual(first.coverage_by_ticker["AAPL"]["days"], 2)
+        self.assertNotEqual(first.value_hash, second.value_hash)
+        self.assertTrue(compare_snapshots(first, second)["value_hash_changed"])
 
     def test_coverage_detects_gaps(self):
         dates = pd.bdate_range("2024-01-01", "2024-01-05")

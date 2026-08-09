@@ -389,15 +389,20 @@ def run_backtest_pipeline(
     all_tickers = [t for t in all_tickers if _VALID_TICKER_RE.match(str(t))]
     all_tickers = sorted(set(all_tickers) | {"SPY"})
 
-    # Create price snapshot for reproducibility
-    snapshot = create_snapshot(
-        transaction_source.db, all_tickers, price_start, price_end
-    )
-
     prices = price_source.get_prices(all_tickers, price_start, price_end)
 
     if prices.empty:
         raise DataSourceError("No price data available for backtest window")
+
+    # Snapshot the exact acquired in-memory values. In read-only mode the
+    # price source may have merged fresh observations without writing the DB.
+    snapshot = create_snapshot(
+        transaction_source.db,
+        all_tickers,
+        price_start,
+        price_end,
+        prices=prices,
+    )
 
     entry_prices = transaction_source.db.get_entry_prices(
         all_tickers, price_start, price_end
@@ -420,6 +425,7 @@ def run_backtest_pipeline(
     # pandas 3.x.  We sum here and set them on the combined frame.
     total_no_price = 0
     total_delisted = 0
+    total_unavailable = 0
     for as_of in as_of_dates:
         as_of_ts = pd.Timestamp(as_of)
 
@@ -442,6 +448,7 @@ def run_backtest_pipeline(
         evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
         total_no_price += evaluated.attrs.get("n_no_price", 0)
         total_delisted += evaluated.attrs.get("n_delisted", 0)
+        total_unavailable += evaluated.attrs.get("n_unavailable", 0)
         evaluated = evaluated.dropna(subset=["bt_return_pct"])
         evaluated.insert(0, "as_of_date", as_of_ts.date())
         all_results.append(evaluated)
@@ -463,6 +470,7 @@ def run_backtest_pipeline(
     # can propagate them (Finding 1: pd.concat drops attrs in pandas 3.x).
     combined.attrs["n_no_price"] = total_no_price
     combined.attrs["n_delisted"] = total_delisted
+    combined.attrs["n_unavailable"] = total_unavailable
 
     summary = analysis.summarize_backtest(combined)
 

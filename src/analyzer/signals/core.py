@@ -46,97 +46,88 @@ def _compute_ticker_signals(
     r_spy_last: np.ndarray,
     r_window_complete: np.ndarray,
 ) -> None:
-    """Mutate pre-allocated result arrays for signals belonging to one ticker."""
-    n_signals = len(t_indices)
-    if n_signals == 0:
+    """Populate labels only for mature, endpoint-aligned price windows."""
+    if len(t_indices) == 0:
         return
 
-    # Vectorized searchsorted for all signals of this ticker at once
-    t_lo = np.searchsorted(dates_ns, t_disc_ns, side="left")
-    t_hi = np.searchsorted(dates_ns, t_end_ns, side="right")
-
-    # A forward-return horizon is an outcome only after both the security and
-    # benchmark datasets cover its end.  A seven-day tolerance accommodates
-    # weekends/market holidays without treating a partially elapsed horizon
-    # as a completed 30/90/180-day observation.
-    coverage_tolerance_ns = 7 * _constants._NS_PER_DAY
-    t_end_pos = t_hi - 1
-    ticker_end_valid = t_end_pos >= 0
-    ticker_end_dates_ns = np.zeros(n_signals, dtype=np.int64)
-    ticker_end_dates_ns[ticker_end_valid] = dates_ns[t_end_pos[ticker_end_valid]]
-    ticker_window_complete = ticker_end_valid & (
-        (t_end_ns - ticker_end_dates_ns) <= coverage_tolerance_ns
-    )
-    has_benchmark = spy_dates_ns is not None and len(spy_dates_ns) > 0
-    spy_data_through = spy_dates_ns[-1] if has_benchmark else 0
+    tolerance_ns = 7 * _constants._NS_PER_DAY
     today_ns = pd.Timestamp.now().normalize().value
-    r_window_complete[t_indices] = (
-        (t_end_ns <= today_ns)
-        & (t_lo < t_hi)
-        & ticker_window_complete
-        & ((not has_benchmark) | (spy_data_through >= t_end_ns - coverage_tolerance_ns))
+    has_benchmark = (
+        spy_dates_ns is not None
+        and spy_vals is not None
+        and spy_log_ret is not None
+        and len(spy_dates_ns) > 0
     )
 
-    spy_has = (
-        spy_dates_ns is not None and spy_vals is not None and spy_log_ret is not None
-    )
+    for i, result_idx in enumerate(t_indices):
+        disc_ns = int(t_disc_ns[i])
+        horizon_ns = int(t_end_ns[i]) - disc_ns
 
-    for i in range(n_signals):
-        # A forward-return label is valid only after the market benchmark has
-        # reached the requested window end.  Without this guard, a 180-day
-        # signal computed 20 days after disclosure was silently labelled with
-        # a 20-day return, contaminating member rankings and validation.
-        if not ticker_window_complete[i] or not _market_window_is_complete(
-            spy_dates_ns, t_end_ns[i]
-        ):
+        # A dated disclosure is actionable only after that date's session. Use
+        # the first subsequent quote and reject long gaps rather than silently
+        # shortening a horizon from an IPO or missing-data start.
+        entry_pos = int(np.searchsorted(dates_ns, disc_ns, side="right"))
+        if entry_pos >= len(dates_ns):
             continue
-        lo = int(t_lo[i])
-        hi = int(t_hi[i])
-        if lo >= hi:
+        entry_date_ns = int(dates_ns[entry_pos])
+        if entry_date_ns - disc_ns > tolerance_ns:
             continue
 
-        idx = int(t_indices[i])
-        disc = t_disc_ns[i]
+        intended_end_ns = entry_date_ns + horizon_ns
+        if intended_end_ns > today_ns:
+            continue
+        exit_pos = int(np.searchsorted(dates_ns, intended_end_ns, side="right")) - 1
+        if exit_pos < entry_pos:
+            continue
+        exit_date_ns = int(dates_ns[exit_pos])
+        if intended_end_ns - exit_date_ns > tolerance_ns:
+            continue
 
-        w_vals = vals[lo:hi]
-        w_dates = dates_ns[lo:hi]
+        # Benchmark prices must exist on the security's actual entry and exit
+        # sessions. Independent nearest-date lookups create phantom alpha when
+        # either series has a gap.
+        if has_benchmark:
+            spy_entry_pos = int(np.searchsorted(spy_dates_ns, entry_date_ns, side="left"))
+            spy_exit_pos = int(np.searchsorted(spy_dates_ns, exit_date_ns, side="left"))
+            if (
+                spy_entry_pos >= len(spy_dates_ns)
+                or int(spy_dates_ns[spy_entry_pos]) != entry_date_ns
+                or spy_exit_pos >= len(spy_dates_ns)
+                or int(spy_dates_ns[spy_exit_pos]) != exit_date_ns
+            ):
+                continue
+
+        idx = int(result_idx)
+        r_window_complete[idx] = True
+        w_vals = vals[entry_pos : exit_pos + 1]
+        w_dates = dates_ns[entry_pos : exit_pos + 1]
         n_w = len(w_vals)
 
-        # Baseline, last, peak, trough
         r_disc_baseline[idx] = w_vals[0]
         r_last_price[idx] = w_vals[-1]
         r_peak[idx] = w_vals.max()
         r_trough[idx] = w_vals.min()
 
-        # Days from disclosure (vectorized)
-        days = ((w_dates - disc) // _constants._NS_PER_DAY).astype(np.float64)
-
-        # Daily log returns (vectorized, handles zero prices)
+        days = ((w_dates - entry_date_ns) // _constants._NS_PER_DAY).astype(
+            np.float64
+        )
         log_ret = np.zeros(n_w, dtype=np.float64)
         if n_w > 1:
-            prev_vals = w_vals[:-1]
-            valid = prev_vals > 0
-            log_ret[1:][valid] = np.log(w_vals[1:][valid] / prev_vals[valid])
+            log_ret[1:] = np.log(w_vals[1:] / w_vals[:-1])
 
-        # Mid-decay: weight by midpoint between consecutive days
         prev_days = np.empty(n_w, dtype=np.float64)
         prev_days[0] = 0.0
         prev_days[1:] = days[:-1]
         mid_d = np.exp(-decay_lambda * (days + prev_days) * 0.5)
-
-        # Decay-weighted return normalized by total decay weight
-        w_ret = log_ret * mid_d
         w_sum = mid_d.sum()
         if w_sum > 0:
-            r_decayed_ret[idx] = w_ret.sum() / w_sum
+            r_decayed_ret[idx] = (log_ret * mid_d).sum() / w_sum
 
-        # SPY returns for the same window
-        if spy_has:
+        if has_benchmark:
             _populate_spy_arrays(
                 idx,
-                disc,
-                t_end_ns[i],
-                i,
+                entry_date_ns,
+                exit_date_ns,
                 spy_dates_ns,
                 spy_vals,
                 spy_log_ret,
@@ -148,31 +139,10 @@ def _compute_ticker_signals(
             )
 
 
-def _market_window_is_complete(
-    spy_dates_ns: np.ndarray | None,
-    end_ns: int,
-    max_staleness_days: int = 7,
-) -> bool:
-    """Return whether benchmark data reaches a signal's intended end date."""
-    # Legacy/library callers may calculate absolute returns without a SPY
-    # column.  Benchmark-relative metrics remain NaN there; maturity is
-    # enforced when the production benchmark is present.
-    if spy_dates_ns is None or len(spy_dates_ns) == 0:
-        return True
-    pos = int(np.searchsorted(spy_dates_ns, end_ns, side="right")) - 1
-    if pos < 0:
-        return False
-    return (
-        int(end_ns) - int(spy_dates_ns[pos])
-        <= max_staleness_days * _constants._NS_PER_DAY
-    )
-
-
 def _populate_spy_arrays(
     idx,
     disc,
     end_ns,
-    i,
     spy_dates_ns,
     spy_vals,
     spy_log_ret,

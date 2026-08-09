@@ -9,21 +9,14 @@ multipliers) is hoisted out of the per-row loop.
 
 Bug fixes applied here (see prices.py for Bug 1b/1c low-level fixes):
 
-  Bug 1a — default use_dip_entry changed from True to False: honest baseline
-            uses the latest close at or before as_of with zero entry delay;
-            the same-day close is used when available.
+  Timing — The ordinary baseline enters on the first session strictly after
+           the decision. Dip orders also require a future fill and never fall
+           back after observing that no dip occurred.
 
-  Bug 1b — SPY benchmark aligned with actual entry/exit dates: when
-            use_dip_entry=True the SPY window is [entry_date, exit_date], not
-            the fixed [as_of, as_of+horizon] window. Positions where no dip
-            occurs within max_wait_days are NOT taken (no fallback fill).
-
-  Bug 2  — Survivorship bias removed: when a ticker's price history ends before
-            the exit date, the last available price is used as exit price and
-            the trade IS included. A `bt_delisted` flag marks rows whose last
-            quote is after entry. Stale fallback coverage is reported through
-            `bt_coverage` and `bt_stale_exit`. Tickers with no actionable price
-            remain untradeable and count in result.attrs["n_no_price"].
+  Coverage — Entry occurs on the first tradable session after the decision.
+             Security and SPY returns use identical entry/exit dates. Missing
+             horizon outcomes remain unavailable; a last quote is never
+             invented as a delisting or liquidation return.
 
   Bug 3  — Merge fan-out fixed: results are merged on a per-row index key
             (_bt_idx) rather than on ticker alone, so two recommendations for
@@ -35,15 +28,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from analyzer.backtest.prices import (
-    _find_dip_entry_arrays,
-    _price_at_or_before_arrays,
-    _price_on_or_before_arrays,
-)
+from analyzer.backtest.prices import _find_dip_entry_arrays
 from analyzer.signals import _price_arrays
 
 NS_PER_DAY = 86_400_000_000_000
-_EXIT_STALENESS_DAYS = 25
+_ENTRY_STALENESS_DAYS = 7
+_EXIT_STALENESS_DAYS = 7
 
 # Sentinel returned by _evaluate_one_recommendation when a ticker is
 # discovered to have been delisted BEFORE the entry/as_of date — meaning the
@@ -53,7 +43,9 @@ _UNTRADEABLE = object()
 
 _EMPTY_BT_COLS = [
     "bt_entry_price",
+    "bt_entry_date",
     "bt_exit_price",
+    "bt_exit_date",
     "bt_raw_return_pct",
     "bt_return_pct",
     "bt_leverage",
@@ -94,20 +86,6 @@ def evaluate_backtest(
         spy_arrs if spy_arrs and spy_arrs[0] is not None else (None, None)
     )
 
-    spy_start, spy_entry_adj = _spy_start(
-        spy_ns, spy_vals, as_of_date, entry_mult, max_staleness_days
-    )
-    spy_ends, spy_returns = _spy_returns_by_horizon(
-        spy_ns,
-        spy_vals,
-        as_of_date,
-        spy_start,
-        spy_entry_adj,
-        exit_mult,
-        horizons,
-        horizon,
-    )
-
     tickers = recommendations["ticker"].tolist()
     ticker_horizons = (
         [int(h) for h in horizons] if horizons is not None else [horizon] * len(tickers)
@@ -120,6 +98,7 @@ def evaluate_backtest(
     rows = []
     n_no_price = 0
     n_delisted = 0
+    n_unavailable = 0
 
     for i in range(len(recommendations)):
         ticker = recommendations["ticker"].iloc[i]
@@ -143,9 +122,6 @@ def evaluate_backtest(
             exit_mult,
             spy_ns,
             spy_vals,
-            spy_start,
-            spy_returns,
-            spy_ends,
             use_dip_entry,
             pullback_pct,
             max_wait_days,
@@ -157,6 +133,8 @@ def evaluate_backtest(
             # Ticker was already delisted before entry — never actionable
             n_no_price += 1
         elif row is not None:
+            if row.get("bt_coverage") == "unavailable":
+                n_unavailable += 1
             if row.get("bt_delisted"):
                 n_delisted += 1
             rows.append(row)
@@ -165,6 +143,7 @@ def evaluate_backtest(
         result = _empty_eval_joined(recommendations)
         result.attrs["n_no_price"] = n_no_price
         result.attrs["n_delisted"] = n_delisted
+        result.attrs["n_unavailable"] = n_unavailable
         return result
 
     eval_df = pd.DataFrame(rows)
@@ -182,6 +161,7 @@ def evaluate_backtest(
 
     result.attrs["n_no_price"] = n_no_price
     result.attrs["n_delisted"] = n_delisted
+    result.attrs["n_unavailable"] = n_unavailable
     return result
 
 
@@ -189,82 +169,6 @@ def _slippage_multipliers(
     entry_slippage_bps: float, exit_slippage_bps: float
 ) -> tuple[float, float]:
     return (1.0 + entry_slippage_bps / 10000, 1.0 - exit_slippage_bps / 10000)
-
-
-def _spy_start(spy_ns, spy_vals, as_of_date, entry_mult, max_staleness_days):
-    if spy_ns is None:
-        return None, 0.0
-    start = _price_at_or_before_arrays(spy_ns, spy_vals, as_of_date, max_staleness_days)
-    if not start:
-        return None, 0.0
-    return start, start * entry_mult
-
-
-def _spy_returns_by_horizon(
-    spy_ns,
-    spy_vals,
-    as_of_date,
-    spy_start,
-    spy_entry_adj,
-    exit_mult,
-    horizons,
-    default_horizon,
-):
-    """Pre-compute SPY returns for every distinct horizon from as_of_date.
-
-    These are the baseline SPY returns when entry_delay == 0.  When
-    use_dip_entry=True and entry_delay > 0 the per-recommendation SPY return
-    is computed separately by _compute_spy_return_shifted.
-    """
-    spy_ends: dict[int, float | None] = {}
-    spy_returns: dict[int, float] = {}
-    if not spy_start:
-        return spy_ends, spy_returns
-    horizon_iter = set(horizons) if horizons is not None else [default_horizon]
-    for h in horizon_iter:
-        spy_exit_ns = as_of_date.value + int(h) * NS_PER_DAY
-        se = _price_on_or_before_arrays(
-            spy_ns, spy_vals, pd.Timestamp(spy_exit_ns), max_staleness_days=30
-        )
-        spy_ends[h] = se
-        if se:
-            spy_exit_adj = se * exit_mult
-            spy_returns[h] = round((spy_exit_adj / spy_entry_adj - 1) * 100, 2)
-        else:
-            spy_returns[h] = 0.0
-    return spy_ends, spy_returns
-
-
-def _compute_spy_return_shifted(
-    spy_ns,
-    spy_vals,
-    as_of_ns,
-    entry_delay,
-    t_horizon,
-    entry_mult,
-    exit_mult,
-    max_staleness_days,
-):
-    """Compute SPY return for the shifted window [as_of + entry_delay, …+ horizon].
-
-    Bug 1b: when use_dip_entry=True the SPY benchmark must reflect the same
-    calendar window as the actual ticker position, not the fixed as_of window.
-    """
-    if spy_ns is None:
-        return None
-    entry_ns = as_of_ns + entry_delay * NS_PER_DAY
-    exit_ns = entry_ns + t_horizon * NS_PER_DAY
-    spy_entry = _price_at_or_before_arrays(
-        spy_ns, spy_vals, pd.Timestamp(entry_ns), max_staleness_days
-    )
-    if not spy_entry:
-        return None
-    spy_exit = _price_on_or_before_arrays(
-        spy_ns, spy_vals, pd.Timestamp(exit_ns), max_staleness_days=30
-    )
-    if not spy_exit:
-        return None
-    return round((spy_exit * exit_mult / (spy_entry * entry_mult) - 1) * 100, 2)
 
 
 def _extract_recommendation_arrays(recommendations: pd.DataFrame) -> tuple:
@@ -295,9 +199,6 @@ def _evaluate_one_recommendation(
     exit_mult,
     spy_ns,
     spy_vals,
-    spy_start,
-    spy_returns,
-    spy_ends,
     use_dip_entry,
     pullback_pct,
     max_wait_days,
@@ -305,16 +206,9 @@ def _evaluate_one_recommendation(
     inst_type_val,
     amount_val,
 ) -> dict | None:
-    """Returns dict of bt_* fields for one ticker, or None to skip.
-
-    ``row_idx`` is the position in the recommendations DataFrame; it is
-    written to the dict as ``_bt_idx`` so the caller can do a 1:1 merge
-    (Bug 3 fix).
-    """
-    # Caller already verified cached is a valid (idx_ns, vals) tuple.
+    """Evaluate one recommendation without guessing unavailable outcomes."""
     idx_ns, vals = cached
-
-    entry, entry_delay = _resolve_entry(
+    entry, entry_delay, entry_date_ns = _resolve_entry(
         use_dip_entry,
         idx_ns,
         vals,
@@ -323,65 +217,22 @@ def _evaluate_one_recommendation(
         max_wait_days,
         max_staleness_days,
     )
-    if not entry:
-        return None
+    if not entry or entry_date_ns is None:
+        return None if use_dip_entry else _UNTRADEABLE
 
-    as_of_ns = as_of_date.value
-    # Bug 1c: entry_delay is now calendar days (fixed in prices.py), so this
-    # arithmetic is correct even when weekends separate the dip from as_of.
-    exit_ns = as_of_ns + (entry_delay + t_horizon) * NS_PER_DAY
-
-    # Bug 2: when the exit price lookup fails the staleness check (ticker
-    # delisted/suspended), fall back to the last available price rather than
-    # silently dropping the trade from both numerator and denominator.
-    exit_price = _price_on_or_before_arrays(
-        idx_ns,
-        vals,
-        pd.Timestamp(exit_ns),
-        max_staleness_days=_EXIT_STALENESS_DAYS,
-    )
-    is_delisted = False
-    stale_exit = False
-    if not exit_price:
-        # Finding 2 fix: only treat as "delisted during hold" when the last
-        # known price is STRICTLY AFTER the entry date.  If the last price
-        # predates or equals the entry (ticker already dead at recommendation
-        # time), the position was never actionable — return _UNTRADEABLE so
-        # the caller can count it in n_no_price.
-        entry_ns = as_of_ns + entry_delay * NS_PER_DAY
-        fallback_pos = int(np.searchsorted(idx_ns, int(exit_ns), side="right")) - 1
-        if fallback_pos >= 0 and int(idx_ns[fallback_pos]) > entry_ns:
-            exit_price = float(vals[fallback_pos])
-            is_delisted = True
-            stale_exit = (
-                int(exit_ns) - int(idx_ns[fallback_pos])
-                > _EXIT_STALENESS_DAYS * NS_PER_DAY
-            )
-        else:
-            # No usable price: either no data at all, or ticker already
-            # delisted before/at entry — caller counts this in n_no_price.
-            return _UNTRADEABLE
-
-    # Bug 1b: SPY return must cover the same calendar window as the position.
-    # When entry_delay > 0 (dip entry) the window is shifted; precomputed
-    # spy_returns (anchored at as_of) would produce phantom alpha.
-    if use_dip_entry and entry_delay > 0:
-        spy_ret = _compute_spy_return_shifted(
-            spy_ns,
-            spy_vals,
-            as_of_ns,
-            entry_delay,
-            t_horizon,
-            entry_mult,
-            exit_mult,
-            max_staleness_days,
-        )
-        if spy_ret is None:
-            return None  # SPY data unavailable for shifted window — skip
-    else:
-        spy_ret = spy_returns.get(t_horizon, 0.0)
-        if not spy_start or (spy_ret == 0.0 and not spy_ends.get(t_horizon)):
-            return None
+    exit_target_ns = entry_date_ns + int(t_horizon) * NS_PER_DAY
+    exit_pos = int(np.searchsorted(idx_ns, exit_target_ns, side="right")) - 1
+    exit_price = None
+    exit_date_ns = None
+    if exit_pos >= 0:
+        candidate_date_ns = int(idx_ns[exit_pos])
+        if (
+            candidate_date_ns >= entry_date_ns
+            and exit_target_ns - candidate_date_ns
+            <= _EXIT_STALENESS_DAYS * NS_PER_DAY
+        ):
+            exit_price = float(vals[exit_pos])
+            exit_date_ns = candidate_date_ns
 
     inst_type = (
         str(inst_type_val)
@@ -389,6 +240,24 @@ def _evaluate_one_recommendation(
         else "stock"
     )
     amount = amount_val if amount_val is not None else None
+    if exit_price is None or exit_date_ns is None:
+        return _unavailable_bt_row(
+            ticker, row_idx, entry, entry_date_ns, entry_delay, inst_type, amount
+        )
+
+    # Benchmark the exact security holding endpoints. A nearest independent
+    # SPY date would compare different holding periods and manufacture alpha.
+    spy_entry = _price_at_exact_ns(spy_ns, spy_vals, entry_date_ns)
+    spy_exit = _price_at_exact_ns(spy_ns, spy_vals, exit_date_ns)
+    if not spy_entry or not spy_exit:
+        return _unavailable_bt_row(
+            ticker, row_idx, entry, entry_date_ns, entry_delay, inst_type, amount
+        )
+    spy_ret = round(
+        (spy_exit * exit_mult / (spy_entry * entry_mult) - 1) * 100,
+        2,
+    )
+
     row = _bt_row(
         ticker,
         entry,
@@ -401,11 +270,47 @@ def _evaluate_one_recommendation(
         inst_type,
         amount,
     )
-    row["_bt_idx"] = row_idx  # Bug 3: used for 1:1 merge
-    row["bt_delisted"] = is_delisted  # Bug 2: flag for coverage reporting
-    row["bt_coverage"] = "stale" if stale_exit else "complete"
-    row["bt_stale_exit"] = stale_exit
+    row["_bt_idx"] = row_idx
+    row["bt_entry_date"] = pd.Timestamp(entry_date_ns).date()
+    row["bt_exit_date"] = pd.Timestamp(exit_date_ns).date()
+    row["bt_delisted"] = False
+    row["bt_coverage"] = "complete"
+    row["bt_stale_exit"] = False
     return row
+
+
+def _price_at_exact_ns(idx_ns, vals, target_ns):
+    if idx_ns is None or vals is None:
+        return None
+    pos = int(np.searchsorted(idx_ns, target_ns, side="left"))
+    if pos >= len(idx_ns) or int(idx_ns[pos]) != int(target_ns):
+        return None
+    value = float(vals[pos])
+    return value if np.isfinite(value) and value > 0 else None
+
+
+def _unavailable_bt_row(
+    ticker, row_idx, entry, entry_date_ns, entry_delay, inst_type, amount
+):
+    from analyzer.options import estimate_options_leverage
+
+    return {
+        "_bt_idx": row_idx,
+        "ticker": ticker,
+        "bt_entry_price": round(float(entry), 2),
+        "bt_entry_date": pd.Timestamp(entry_date_ns).date(),
+        "bt_exit_price": np.nan,
+        "bt_exit_date": None,
+        "bt_raw_return_pct": np.nan,
+        "bt_return_pct": np.nan,
+        "bt_leverage": estimate_options_leverage(inst_type, amount),
+        "bt_spy_return_pct": np.nan,
+        "bt_alpha_pct": np.nan,
+        "bt_entry_delay": entry_delay,
+        "bt_delisted": False,
+        "bt_coverage": "unavailable",
+        "bt_stale_exit": True,
+    }
 
 
 def _resolve_entry(
@@ -417,12 +322,8 @@ def _resolve_entry(
     max_wait_days,
     max_staleness_days,
 ):
-    """Compute entry price and entry delay (calendar days), with optional dip timing.
-
-    Bug 1b: when use_dip_entry=True and no dip is found within max_wait_days,
-    returns (None, 0) so the caller skips the position.  There is no fallback
-    fill at a future known price.
-    """
+    """Return a fill strictly after the decision date."""
+    as_of_ns = pd.Timestamp(as_of_date).value
     if use_dip_entry:
         entry, entry_delay = _find_dip_entry_arrays(
             idx_ns,
@@ -431,13 +332,25 @@ def _resolve_entry(
             pullback_pct,
             max_wait_days,
         )
-        # (0.0, 0) from _find_dip_entry_arrays means "no dip found"
-        if entry <= 0:
-            return None, 0  # No fallback — position is not taken
-    else:
-        entry = _price_at_or_before_arrays(idx_ns, vals, as_of_date, max_staleness_days)
-        entry_delay = 0
-    return entry, entry_delay
+        if entry <= 0 or entry_delay <= 0:
+            return None, 0, None
+        entry_date_ns = as_of_ns + entry_delay * NS_PER_DAY
+        return entry, entry_delay, entry_date_ns
+
+    pos = int(np.searchsorted(idx_ns, as_of_ns, side="right"))
+    if pos >= len(idx_ns):
+        return None, 0, None
+    entry_date_ns = int(idx_ns[pos])
+    max_delay = _ENTRY_STALENESS_DAYS
+    if max_staleness_days is not None:
+        max_delay = min(max_delay, max_staleness_days)
+    delay = int((entry_date_ns - as_of_ns) // NS_PER_DAY)
+    if delay > max_delay:
+        return None, 0, None
+    value = float(vals[pos])
+    if not np.isfinite(value) or value <= 0:
+        return None, 0, None
+    return value, delay, entry_date_ns
 
 
 def _bt_row(

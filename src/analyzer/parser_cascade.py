@@ -75,8 +75,6 @@ def _transaction_identity(transaction: dict) -> tuple:
         ),
         _normalize_identity_value(transaction.get("owner_code")),
         _normalize_identity_value(transaction.get("notification_date")),
-        _normalize_identity_value(transaction.get("page_number")),
-        _normalize_identity_value(transaction.get("source_row_id")),
     )
 
 
@@ -199,19 +197,21 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     trusted = {name: rows for name, rows in text_candidates}
     pdfplumber_counts = _candidate_counts(trusted.get("pdfplumber", []))[0]
     pdftotext_counts = _candidate_counts(trusted.get("pdftotext", []))[0]
-    trusted_overlap = sum(
-        min(count, pdftotext_counts.get(identity, 0))
-        for identity, count in pdfplumber_counts.items()
+    pdfplumber_subset = bool(pdfplumber_counts) and _multiset_subset(
+        pdfplumber_counts, pdftotext_counts
     )
-    trusted_complete = (
-        bool(pdfplumber_counts)
-        and bool(pdftotext_counts)
-        and trusted_overlap / sum(pdfplumber_counts.values()) >= 0.85
+    pdftotext_subset = bool(pdftotext_counts) and _multiset_subset(
+        pdftotext_counts, pdfplumber_counts
     )
-    if trusted_complete:
+    if pdfplumber_subset:
         engines_attempted.append("trusted:pdfplumber_subset_pdftotext")
         engines_attempted.append("won:pdftotext")
         return pdf_path, trusted["pdftotext"], engines_attempted
+    if pdftotext_subset:
+        engines_attempted.append("trusted:pdftotext_subset_pdfplumber")
+        engines_attempted.append("won:pdfplumber")
+        return pdf_path, trusted["pdfplumber"], engines_attempted
+
     ocr_candidates = []
     if not skip_docling:
         candidate = _run_candidate(

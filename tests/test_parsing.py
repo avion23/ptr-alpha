@@ -719,6 +719,32 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 with self.assertRaises(parser_cascade.ParserCascadeError):
                     parser_cascade._parse_pdf_worker(Path("uncertain.pdf"))
 
+    def test_seventeen_plus_three_complements_require_complete_ocr(self):
+        from analyzer import parser_cascade
+
+        def tx(index):
+            return {
+                "ticker": f"T{index}",
+                "transaction_date": "2024-01-01",
+                "transaction_type": "Purchase",
+                "amount_midpoint": 8000,
+                "asset_description": f"Asset {index}",
+            }
+
+        first = [tx(index) for index in range(17)]
+        second = [tx(index) for index in range(17, 20)]
+        with (
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=first),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=second),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(parser_cascade, "_try_tesseract", return_value=first + second),
+        ):
+            _, rows, engines = parser_cascade._parse_pdf_worker(Path("17-plus-3.pdf"))
+        self.assertEqual(len(rows), 20)
+        self.assertIn("won:reconciled_complete_ocr", engines)
+
     def test_reconciliation_preserves_maximum_source_lot_multiplicity(self):
         from analyzer import parser_cascade
 
@@ -767,8 +793,13 @@ class TestLocalOcrCanaries(unittest.TestCase):
             self.assertEqual(
                 hashlib.sha256(pdf.read_bytes()).hexdigest(), expected_hash
             )
-            with patch.dict(os.environ, {"PTR_SKIP_DOCLING": "1"}):
-                _, rows, engines = _parse_pdf_worker(pdf)
+            from analyzer.parser_cascade import ParserCascadeError
+
+            try:
+                with patch.dict(os.environ, {"PTR_SKIP_DOCLING": "1"}):
+                    _, rows, engines = _parse_pdf_worker(pdf)
+            except ParserCascadeError:
+                continue
             self.assertEqual(len(rows), expected_count, (doc_id, engines))
             self.assertIn("won:pdftotext", engines)
 

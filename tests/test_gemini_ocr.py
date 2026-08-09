@@ -318,7 +318,13 @@ def test_insert_fails_clearly_before_provenance_schema_exists(tmp_path):
     db.conn.execute(
         "INSERT INTO metadata VALUES ('legacy', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
+    existing = {
+        row[1]
+        for row in db.conn.execute("PRAGMA table_info('transactions')").fetchall()
+    }
     db.close()
+    if set(OCR_SCHEMA_COLUMNS) <= existing:
+        pytest.skip("production provenance schema is present")
     with pytest.raises(RuntimeError, match="requires the provenance schema"):
         _insert_transactions("legacy", 2024, "Jane Doe", [_tx()], db_path=str(db_path))
     from scripts.ocr_zero_rows import get_ocr_work_items
@@ -462,6 +468,49 @@ def test_tickerless_resolver_is_unverified_candidate_not_canonical(
         datetime(2024, 1, 20).date(),
         "Not separately reported",
     )
+
+
+def test_mixed_ticker_provenance_rows_use_fixed_full_staging_schema(
+    monkeypatch, tmp_path
+):
+    from scripts import ocr_zero_rows
+
+    db_path = tmp_path / "mixed-schema.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata VALUES ('mixed-schema', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.close()
+    monkeypatch.setattr(ocr_zero_rows, "resolve_ticker", lambda asset: "PRIVATE")
+    rows = [_tx(asset="Apple (AAPL)"), _tx(asset="Private Holdings")]
+    assert (
+        _insert_transactions(
+            "mixed-schema", 2024, "Jane Doe", rows, db_path=str(db_path)
+        )
+        == 2
+    )
+    connection = duckdb.connect(str(db_path))
+    stored = connection.execute(
+        "SELECT ticker, ticker_candidate, ticker_origin FROM transactions "
+        "WHERE doc_id='mixed-schema' ORDER BY source_row_id"
+    ).fetchall()
+    connection.close()
+    assert stored == [("AAPL", None, "official"), (None, "PRIVATE", "unverified")]
+
+
+def test_ticker_provenance_matrix_rejects_inconsistent_rows():
+    from scripts.ocr_zero_rows import validate_ticker_provenance
+
+    with pytest.raises(ValueError, match="unverified"):
+        validate_ticker_provenance(
+            {
+                "ticker_origin": "unverified",
+                "ticker": "AAPL",
+                "raw_ticker": "AAPL",
+                "ticker_candidate": "AAPL",
+            }
+        )
 
 
 def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):

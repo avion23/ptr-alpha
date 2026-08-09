@@ -47,6 +47,56 @@ REQUIRED_OCR_SCHEMA_COLUMNS = {
     "artifact_sha256",
 }
 
+OCR_INSERT_COLUMNS = [
+    "doc_id",
+    "member",
+    "ticker",
+    "transaction_date",
+    "disclosure_date",
+    "transaction_type",
+    "amount_raw",
+    "amount_midpoint",
+    "owner_code",
+    "asset_description",
+    "source",
+    "chamber",
+    "source_record_id",
+    "source_row_id",
+    "official_filing_date",
+    "available_date",
+    "notification_date",
+    "amends_source_record_id",
+    "raw_transaction_subtype",
+    "ticker_origin",
+    "raw_ticker",
+    "ticker_candidate",
+    "raw_asset_class",
+    "raw_asset_description",
+    "raw_owner",
+    "ingestion_generation",
+    "artifact_sha256",
+]
+
+
+def validate_ticker_provenance(row):
+    origin = row["ticker_origin"]
+    ticker = row["ticker"]
+    raw_ticker = row["raw_ticker"]
+    candidate = row["ticker_candidate"]
+    if origin == "official":
+        if not ticker or ticker != raw_ticker or candidate is not None:
+            raise ValueError("official ticker provenance is inconsistent")
+        return
+    if origin == "unverified":
+        if ticker is not None or not raw_ticker or candidate != raw_ticker:
+            raise ValueError("unverified ticker provenance is inconsistent")
+        return
+    if origin == "not_reported":
+        if ticker is not None or raw_ticker is not None or candidate is not None:
+            raise ValueError("not-reported ticker provenance is inconsistent")
+        return
+    raise ValueError(f"invalid ticker_origin: {origin}")
+
 
 def require_ocr_schema(conn):
     existing = {
@@ -940,7 +990,7 @@ def insert_transactions(
 ):
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
-    existing_columns = require_ocr_schema(conn)
+    require_ocr_schema(conn)
     if not artifact_sha256 and transactions:
         conn.close()
         raise RuntimeError("OCR insertion requires artifact_sha256")
@@ -1041,14 +1091,10 @@ def insert_transactions(
                 "ingestion_generation": parser_version,
                 "artifact_sha256": artifact_sha256,
             }
-            values.update(
-                {
-                    key: value
-                    for key, value in authoritative_provenance.items()
-                    if key in existing_columns and value is not None
-                }
-            )
-            rows.append(values)
+            values.update(authoritative_provenance)
+            row = {column: values.get(column) for column in OCR_INSERT_COLUMNS}
+            validate_ticker_provenance(row)
+            rows.append(row)
         except Exception as exc:
             errors.append(f"{tx.get('asset', '?')}: {exc}")
     if errors:
@@ -1102,7 +1148,7 @@ def insert_transactions(
                 f"VALUES ({placeholders})",
                 [row[column] for column in columns],
             )
-        columns = list(rows[0])
+        columns = OCR_INSERT_COLUMNS
         conn.execute("BEGIN TRANSACTION")
         identity_columns = [
             "source",

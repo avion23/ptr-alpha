@@ -73,6 +73,9 @@ def parse_year(year: int, db: Database, settings: Settings):
     artifact_hashes = {
         pdf_path.stem: _artifact_sha256(pdf_path) for pdf_path, _, _ in results
     }
+    ingestion_generation = (
+        db.get_latest_house_generation(year) or f"legacy-untracked-{year}"
+    )
     df = consolidate_transactions(pdf_transactions, member_lookup)
     consolidated_counts = (
         df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
@@ -86,6 +89,9 @@ def parse_year(year: int, db: Database, settings: Settings):
     # Carry forward previously-resolved ticker/amount before the delete+reinsert
     # so a weaker parse does not clobber good data already in the DB.
     df = preserve_existing_fields(df, db)
+    if not df.empty:
+        df["ingestion_generation"] = ingestion_generation
+        df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
     parse_runs = [
         dict(
             doc_id=pdf_path.stem,
@@ -110,22 +116,23 @@ def parse_year(year: int, db: Database, settings: Settings):
         source="house_pdf",
         attempted_doc_ids=attempted_doc_ids,
         replacement_doc_ids=replacement_doc_ids,
+        ingestion_generation=ingestion_generation,
         parse_runs=parse_runs,
     )
-    persisted_by_source = _persisted_counts_by_source(db, attempted_doc_ids)
-    persisted_house_counts = {
-        doc_id: persisted_by_source.get(doc_id, {}).get("house_pdf", 0)
-        for doc_id in replacement_doc_ids
-    }
+    persisted_house_counts = _persisted_house_generation_counts(
+        db, attempted_doc_ids, ingestion_generation
+    )
     _verify_persisted_counts(
         year,
         {doc_id: emitted_counts[doc_id] for doc_id in replacement_doc_ids},
         persisted_house_counts,
     )
 
-    persisted_total = sum(persisted_house_counts.values())
+    persisted_total = sum(
+        persisted_house_counts.get(doc_id, 0) for doc_id in replacement_doc_ids
+    )
     ambiguous_with_prior_house_rows = sum(
-        bool(persisted_by_source.get(doc_id, {}).get("house_pdf", 0))
+        bool(persisted_house_counts.get(doc_id, 0))
         for doc_id in attempted_doc_ids
         if doc_id not in replacement_doc_ids
     )
@@ -165,26 +172,25 @@ def _artifact_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _persisted_counts_by_source(
-    db: Database, doc_ids: list[str]
-) -> dict[str, dict[str, int]]:
-    """Query actual post-replacement counts without hiding backup sources."""
+def _persisted_house_generation_counts(
+    db: Database, doc_ids: list[str], ingestion_generation: str
+) -> dict[str, int]:
+    """Query actual House counts for the targeted acquired generation."""
     if not doc_ids:
         return {}
     placeholders = ", ".join("?" for _ in doc_ids)
     rows = db.conn.execute(
         f"""
-        SELECT doc_id, COALESCE(source, '<legacy>'), COUNT(*)
+        SELECT doc_id, COUNT(*)
         FROM transactions
         WHERE doc_id IN ({placeholders})
-        GROUP BY doc_id, COALESCE(source, '<legacy>')
+          AND source = 'house_pdf'
+          AND ingestion_generation = ?
+        GROUP BY doc_id
         """,  # nosec B608 -- placeholders only; values remain bound
-        doc_ids,
+        [*doc_ids, ingestion_generation],
     ).fetchall()
-    counts: dict[str, dict[str, int]] = {}
-    for doc_id, source, count in rows:
-        counts.setdefault(str(doc_id), {})[str(source)] = int(count)
-    return counts
+    return {str(doc_id): int(count) for doc_id, count in rows}
 
 
 if __name__ == "__main__":

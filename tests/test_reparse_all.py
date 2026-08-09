@@ -71,6 +71,10 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
         def __init__(self):
             self.replacement = None
 
+        def get_latest_house_generation(self, archive_year):
+            assert archive_year == 2026
+            return "acquired-generation-2026"
+
         def replace_transactions_for_docs(self, df, **kwargs):
             self.replacement = (df.copy(), kwargs)
 
@@ -104,10 +108,10 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     monkeypatch.setattr(reparse_all, "preserve_existing_fields", lambda df, _db: df)
     monkeypatch.setattr(
         reparse_all,
-        "_persisted_counts_by_source",
-        lambda _db, doc_ids: {
-            "success": {"house_pdf": 1, "gemini_ocr": 2},
-            "ambiguous-zero": {"house_pdf": 4},
+        "_persisted_house_generation_counts",
+        lambda _db, doc_ids, generation: {
+            "success": 1,
+            "ambiguous-zero": 4,
         },
     )
 
@@ -116,8 +120,13 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     assert persisted == 1
     stored_df, kwargs = db.replacement
     assert stored_df["doc_id"].tolist() == ["success"]
+    assert stored_df["ingestion_generation"].tolist() == ["acquired-generation-2026"]
+    assert stored_df["artifact_sha256"].tolist() == [
+        hashlib.sha256(success_path.read_bytes()).hexdigest()
+    ]
     assert kwargs["attempted_doc_ids"] == ["success", "ambiguous-zero"]
     assert kwargs["replacement_doc_ids"] == ["success"]
+    assert kwargs["ingestion_generation"] == "acquired-generation-2026"
     parse_runs = {run["doc_id"]: run for run in kwargs["parse_runs"]}
     assert (
         parse_runs["success"]["artifact_sha256"]

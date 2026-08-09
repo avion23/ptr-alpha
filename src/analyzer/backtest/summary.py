@@ -137,7 +137,7 @@ def _spy_buy_hold_return(
     if not isinstance(series.index, pd.DatetimeIndex):
         series.index = pd.to_datetime(series.index)
     series = series.sort_index()
-    series = series[np.isfinite(series) & (series >= 0)]
+    series = series[np.isfinite(series)]
     if series.empty:
         return None, "spy_prices_empty"
 
@@ -165,8 +165,11 @@ def _spy_buy_hold_return(
     if exit_date < entry_date:
         return None, "spy_window_inverted"
 
+    raw_exit = float(exits.iloc[-1])
+    if raw_exit <= 0:
+        return None, "spy_exit_nonpositive"
     entry = float(entries.iloc[0]) * (1 + entry_slippage_bps / 10000)
-    exit_ = float(exits.iloc[-1]) * (1 - exit_slippage_bps / 10000)
+    exit_ = raw_exit * (1 - exit_slippage_bps / 10000)
     return (exit_ / entry - 1) * 100, None
 
 

@@ -548,7 +548,7 @@ class TestSummarizeBacktest(unittest.TestCase):
         self.assertEqual(spy_row["count"], 1)
         self.assertEqual(spy_row["avg_return_pct"], 20.0)
 
-    def test_spy_buy_hold_preserves_observed_zero_as_total_loss(self):
+    def test_spy_buy_hold_quarantines_unverified_zero_quote(self):
         results = pd.DataFrame(
             {
                 "bt_entry_date": ["2025-01-01"],
@@ -564,8 +564,9 @@ class TestSummarizeBacktest(unittest.TestCase):
         summary = summarize_backtest(
             results, spy, entry_slippage_bps=0, exit_slippage_bps=0
         )
-        spy_row = summary[summary["rank"] == "SPY_BUY_HOLD"].iloc[0]
-        self.assertEqual(spy_row["avg_return_pct"], -100.0)
+        self.assertNotIn("SPY_BUY_HOLD", summary["rank"].values)
+        self.assertEqual(summary.attrs["spy_benchmark_status"], "omitted")
+        self.assertEqual(summary.attrs["spy_benchmark_reason"], "spy_exit_nonpositive")
 
     def test_repeated_spy_windows_are_not_called_buy_hold(self):
         results = pd.DataFrame(

@@ -917,9 +917,14 @@ def _print_portfolio_metrics(metrics: dict) -> None:
         print(f"  Open positions:     {metrics.get('open_position_count', 0)}")
         return
     print(f"  Total return:       {metrics['total_return_pct']:.2f}%")
+    print(f"  Return status:      {metrics.get('return_status', 'unknown')}")
     print(f"  Annualized return:  {metrics['annualized_return_pct']:.2f}%")
-    print(f"  Sharpe ratio:       {metrics['sharpe_ratio']:.3f}")
-    print(f"  Max drawdown:       {metrics['max_drawdown_pct']:.2f}%")
+    if metrics.get("daily_risk_status") != "available":
+        print("  Daily risk metrics: UNAVAILABLE (nonconsecutive valuations)")
+    else:
+        print(f"  Sharpe ratio:       {metrics['sharpe_ratio']:.3f}")
+        print(f"  Max drawdown:       {metrics['max_drawdown_pct']:.2f}%")
+        print(f"  Volatility:         {metrics['volatility_pct']:.2f}%")
     if metrics["total_closed_trades"]:
         print(f"  Win rate:           {metrics['win_rate_pct']:.1f}%")
         print(f"  Avg holding days:   {metrics['avg_holding_days']:.1f}")

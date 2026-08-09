@@ -259,7 +259,6 @@ class PortfolioSimulator:
                 arrays[1],
                 target,
                 max_wait_days=None,
-                allow_zero=True,
             )
             if execution is None or execution.date.date() > current:
                 continue
@@ -269,7 +268,7 @@ class PortfolioSimulator:
         if pos not in self.positions:
             return
         raw_price = execution.price
-        if not np.isfinite(raw_price) or raw_price < 0:
+        if not np.isfinite(raw_price) or raw_price <= 0:
             return
         exit_price = raw_price * (1 - self.config.exit_slippage_pct)
         proceeds = pos.shares * exit_price
@@ -322,7 +321,6 @@ class PortfolioSimulator:
             arrays[1],
             as_of,
             max_staleness_days=self.config.max_price_staleness_days,
-            allow_zero=True,
         )
 
     def _position_value(
@@ -435,6 +433,12 @@ class PortfolioSimulator:
         full_values = np.concatenate([[initial], values])
         peaks = np.maximum.accumulate(full_values)
         max_drawdown = float(np.min((full_values - peaks) / peaks)) * 100
+        volatility = (
+            float(np.std(daily_returns, ddof=1) * np.sqrt(252) * 100)
+            if len(daily_returns) > 1
+            else 0.0
+        )
+        has_valuation_gaps = bool(self.valuation_unavailable_dates)
         wins = sum(cp["pnl"] > 0 for cp in self.closed_positions)
         closed_count = len(self.closed_positions)
         avg_hold = (
@@ -453,10 +457,23 @@ class PortfolioSimulator:
             "valuation_status": "available",
             "valuation_reason": None,
             "valuation_gap_count": len(self.valuation_unavailable_dates),
+            "return_status": (
+                "terminal_observed_after_valuation_gaps"
+                if has_valuation_gaps
+                else "complete_daily_valuation"
+            ),
+            "daily_risk_status": (
+                "unavailable_nonconsecutive_valuations"
+                if has_valuation_gaps
+                else "available"
+            ),
             "total_return_pct": round(total_return, 2),
             "annualized_return_pct": round(ann_return, 2),
-            "sharpe_ratio": round(sharpe, 3),
-            "max_drawdown_pct": round(max_drawdown, 2),
+            "sharpe_ratio": None if has_valuation_gaps else round(sharpe, 3),
+            "max_drawdown_pct": (
+                None if has_valuation_gaps else round(max_drawdown, 2)
+            ),
+            "volatility_pct": (None if has_valuation_gaps else round(volatility, 2)),
             "win_rate_pct": round(wins / closed_count * 100, 1)
             if closed_count
             else 0.0,
@@ -488,10 +505,13 @@ class PortfolioSimulator:
             "valuation_status": "unavailable",
             "valuation_reason": "unbounded_open_position_mark",
             "valuation_gap_count": len(self.valuation_unavailable_dates),
+            "return_status": "unavailable",
+            "daily_risk_status": "unavailable",
             "total_return_pct": None,
             "annualized_return_pct": None,
             "sharpe_ratio": None,
             "max_drawdown_pct": None,
+            "volatility_pct": None,
             "win_rate_pct": None,
             "avg_holding_days": None,
             "turnover_rate": None,
@@ -582,7 +602,6 @@ class PortfolioSimulator:
             arrays[1],
             end,
             max_staleness_days=self.config.max_price_staleness_days,
-            allow_zero=True,
         )
         if entry is None:
             return None, "spy_entry_outside_boundary"

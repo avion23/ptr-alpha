@@ -466,7 +466,7 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 3))
         self.assertEqual([p.ticker for p in sim.positions], ["A"])
 
-    def test_explicit_zero_exit_is_total_loss(self):
+    def test_unverified_zero_quote_makes_exit_and_valuation_unavailable(self):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
@@ -487,8 +487,11 @@ class TestCausalExecutionScenarios(unittest.TestCase):
             date(2024, 1, 1),
             date(2024, 1, 3),
         )
-        self.assertEqual(sim.closed_positions[0]["return_pct"], -100.0)
-        self.assertEqual(sim.cash, 0.0)
+        self.assertEqual(sim.closed_positions, [])
+        metrics = sim.compute_metrics(prices)
+        self.assertEqual(metrics["valuation_status"], "unavailable")
+        self.assertIsNone(metrics["total_return_pct"])
+        self.assertIsNone(metrics["open_positions"][0]["mark_price"])
 
     def test_expired_position_exits_first_quote_after_suspension(self):
         cfg = PortfolioConfig(
@@ -515,7 +518,19 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         self.assertEqual(sim.closed_positions[0]["exit_date"], date(2024, 1, 10))
         self.assertEqual(sim.closed_positions[0]["exit_price"], 80.0)
         self.assertGreater(len(sim.valuation_unavailable_dates), 0)
-        self.assertEqual(sim.compute_metrics(prices)["valuation_status"], "available")
+        metrics = sim.compute_metrics(prices)
+        self.assertEqual(metrics["valuation_status"], "available")
+        self.assertEqual(
+            metrics["return_status"], "terminal_observed_after_valuation_gaps"
+        )
+        self.assertEqual(
+            metrics["daily_risk_status"],
+            "unavailable_nonconsecutive_valuations",
+        )
+        self.assertEqual(metrics["total_return_pct"], -20.0)
+        self.assertIsNone(metrics["sharpe_ratio"])
+        self.assertIsNone(metrics["max_drawdown_pct"])
+        self.assertIsNone(metrics["volatility_pct"])
 
     def test_unresolved_stale_final_mark_abstains_from_return(self):
         cfg = PortfolioConfig(

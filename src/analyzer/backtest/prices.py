@@ -105,36 +105,31 @@ def _find_dip_entry_arrays(
     return 0.0, 0
 
 
-def _valid_price_at(vals, pos: int, *, allow_zero: bool = False) -> float | None:
+def _valid_price_at(vals, pos: int) -> float | None:
     if pos < 0 or pos >= len(vals):
         return None
     price = float(vals[pos])
-    if not np.isfinite(price) or price < 0 or (price == 0 and not allow_zero):
+    if not np.isfinite(price) or price <= 0:
         return None
     return price
 
 
 def _aligned_price_at_or_before_arrays(
-    idx_ns,
-    vals,
-    target_date,
-    max_staleness_days: int | None = None,
-    *,
-    allow_zero: bool = False,
+    idx_ns, vals, target_date, max_staleness_days: int | None = None
 ) -> AlignedPrice | None:
     """Return the latest valid price at/before target with its real quote date."""
     target = pd.Timestamp(target_date).normalize()
     pos = int(np.searchsorted(idx_ns, target.value, side="right")) - 1
-    while pos >= 0:
-        price = _valid_price_at(vals, pos, allow_zero=allow_zero)
-        quote_date = pd.Timestamp(int(idx_ns[pos])).normalize()
-        staleness_days = int((target - quote_date).days)
-        if max_staleness_days is not None and staleness_days > max_staleness_days:
-            return None
-        if price is not None:
-            return AlignedPrice(price, quote_date, staleness_days)
-        pos -= 1
-    return None
+    if pos < 0:
+        return None
+    quote_date = pd.Timestamp(int(idx_ns[pos])).normalize()
+    staleness_days = int((target - quote_date).days)
+    if max_staleness_days is not None and staleness_days > max_staleness_days:
+        return None
+    price = _valid_price_at(vals, pos)
+    if price is None:
+        return None
+    return AlignedPrice(price, quote_date, staleness_days)
 
 
 def _aligned_price_on_or_after_arrays(
@@ -144,13 +139,11 @@ def _aligned_price_on_or_after_arrays(
     *,
     strictly_after: bool = False,
     max_wait_days: int | None = None,
-    allow_zero: bool = False,
 ) -> AlignedPrice | None:
     """Return the first valid price on/after target and its execution date.
 
-    ``strictly_after=True`` models an order created from end-of-session inputs:
-    it cannot execute at the close used to create the signal and therefore waits
-    for the next tradable session.
+    ``strictly_after`` is used for end-of-day signals that can only execute on
+    the next tradable session.
     """
     target = pd.Timestamp(target_date).normalize()
     threshold = target + pd.Timedelta(days=1) if strictly_after else target
@@ -160,7 +153,7 @@ def _aligned_price_on_or_after_arrays(
         wait_days = int((quote_date - target).days)
         if max_wait_days is not None and wait_days > max_wait_days:
             return None
-        price = _valid_price_at(vals, pos, allow_zero=allow_zero)
+        price = _valid_price_at(vals, pos)
         if price is not None:
             return AlignedPrice(price, quote_date, wait_days)
         pos += 1

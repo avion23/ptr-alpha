@@ -470,3 +470,28 @@ def test_house_get_transactions_includes_pdf_and_gemini_but_not_capitol(tmp_path
         db.close()
 
     assert set(transactions["ticker"]) == {"PDF", "OCR"}
+
+
+
+def test_house_get_transactions_rejects_capitol_only_year(tmp_path):
+    source, db = _source(tmp_path)
+    db.upsert_transactions(
+        pd.DataFrame(
+            [{
+                "doc_id": "capitol-only",
+                "member": "Jane Doe",
+                "ticker": "CAP",
+                "transaction_date": date(2024, 1, 2),
+                "disclosure_date": date(2024, 1, 3),
+                "transaction_type": "Purchase",
+            }]
+        ),
+        source="capitol_trades",
+    )
+
+    try:
+        with pytest.raises(DataSourceError, match="No cached data found for 2024"):
+            source.get_transactions(2024)
+    finally:
+        source.close()
+        db.close()

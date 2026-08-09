@@ -552,6 +552,11 @@ class TransactionRepository:
         rows = self.conn.execute(query, doc_ids).fetchall()
         return {doc_id: count for doc_id, count in rows}
 
+    def house_exists(self, year: int) -> bool:
+        return self.exists(
+            year, sources=("house_pdf", "gemini_ocr")
+        )
+
     def exists(
         self,
         year: int,
@@ -564,6 +569,7 @@ class TransactionRepository:
         )
         row = self.conn.execute(
             f"""
+
             SELECT COUNT(*) FROM canonical_transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ? {source_clause}
             """,  # nosec B608 -- source_clause is a fixed internal fragment

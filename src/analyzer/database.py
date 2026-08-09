@@ -1031,6 +1031,9 @@ class Database:
     ) -> bool:
         return self.transactions.exists(year, source=source, sources=sources)
 
+    def house_transactions_exist(self, year: int) -> bool:
+        return self.transactions.house_exists(year)
+
     def upsert_prices(self, df: pd.DataFrame) -> None:
         self.prices.upsert(df)
 

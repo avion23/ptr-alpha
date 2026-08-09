@@ -98,6 +98,7 @@ class HouseTransactionSource(TransactionSource):
 
     def get_transactions(self, year: int) -> pd.DataFrame:
         if not self.db.transactions_exist(year, sources=("house_pdf", "gemini_ocr")):
+
             raise DataSourceError(
                 f"No cached data found for {year}. Run 'ptr-alpha parse --year {year}' first."
             )

@@ -1,26 +1,19 @@
-"""Walk-forward analysis: rolling train/test windows + per-window metric collection.
-
-Generates overlapping 6-month train / 6-month test windows over the
-disclosure-date range, then for each window:
-  1. Rank members on training data
-  2. Compute test-period realized alpha per member
-  3. Merge training metrics with test alpha
-  4. Append the merged observations to the global results list
-"""
+"""Non-overlapping, point-in-time member research windows."""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from analyzer.exceptions import AnalysisError
-from analyzer.member_ranking import rank_members
+from analyzer.signals import _apply_quality_filter, _collapse_to_episodes, _get_horizon_data
 
 from member_profitability.config import (
+    BAYES_PRIOR_STRENGTH,
     HORIZON,
     METRICS_TO_TEST,
     MIN_MEMBERS_FOR_CORR,
     MIN_TEST_TRADES,
+    TARGET_RETURN_COLUMN,
     TEST_WINDOW_DAYS,
     TRAIN_WINDOW_DAYS,
     WINDOW_SLIDE_DAYS,
@@ -28,102 +21,158 @@ from member_profitability.config import (
 
 
 def generate_windows(sigs: pd.DataFrame) -> list[dict]:
-    """Build the rolling-window schedule over the signal disclosure range.
-
-    Windows slide by WINDOW_SLIDE_DAYS (90d ≈ quarterly) so each window shares
-    some data with its neighbours — gives more sample points for correlation
-    stability estimation.
-    """
-    disc_dates = np.sort(sigs["disclosure_date"].dropna().unique())
-    min_date = pd.Timestamp(disc_dates.min())
-    max_date = pd.Timestamp(disc_dates.max())
+    """Build adjacent train/test windows with non-overlapping test periods."""
+    if sigs.empty or sigs["disclosure_date"].dropna().empty:
+        return []
+    min_date = pd.Timestamp(sigs["disclosure_date"].dropna().min()).normalize()
+    max_maturity = (
+        pd.Timestamp(sigs["disclosure_date"].dropna().max()).normalize()
+        + pd.Timedelta(days=HORIZON)
+    )
 
     windows: list[dict] = []
     start = min_date
-    while start + pd.Timedelta(days=TRAIN_WINDOW_DAYS + TEST_WINDOW_DAYS) <= max_date:
+    while start + pd.Timedelta(days=TRAIN_WINDOW_DAYS + TEST_WINDOW_DAYS) <= max_maturity:
         train_end = start + pd.Timedelta(days=TRAIN_WINDOW_DAYS)
         test_end = train_end + pd.Timedelta(days=TEST_WINDOW_DAYS)
-        windows.append({
-            "train_start": start,
-            "train_end": train_end,
-            "test_start": train_end,
-            "test_end": test_end,
-        })
+        windows.append(
+            {
+                "train_start": start,
+                "train_end": train_end,
+                "test_start": train_end,
+                "test_end": test_end,
+            }
+        )
         start += pd.Timedelta(days=WINDOW_SLIDE_DAYS)
     return windows
 
 
 def collect_window_results(sigs: pd.DataFrame, windows: list[dict]) -> pd.DataFrame:
-    """For each window, compute the per-member train-metric + test-alpha table.
-
-    Returns an empty DataFrame when no window has enough data.
-    """
+    """Collect one member observation per non-overlapping test period."""
     all_window_results: list[pd.DataFrame] = []
-    for wi, w in enumerate(windows):
-        train_sigs, test_sigs = _slice_window(sigs, w)
+    for wi, window in enumerate(windows):
+        train_sigs, test_sigs = _slice_window(sigs, window)
         if train_sigs.empty or test_sigs.empty:
             continue
-
         train_rankings = _rank_train(train_sigs)
         if train_rankings.empty or len(train_rankings) < MIN_MEMBERS_FOR_CORR:
             continue
-
-        test_alpha = _compute_test_alpha(test_sigs)
-        if test_alpha.empty:
+        test_outcomes = _compute_test_outcomes(test_sigs)
+        if test_outcomes.empty:
             continue
-
-        merged = _merge_train_test(train_rankings, test_alpha)
+        merged = _merge_train_test(train_rankings, test_outcomes)
         if merged.empty:
             continue
-
-        merged = _tag_window(merged, wi, w)
-        all_window_results.append(merged)
-
-        if (wi + 1) % 5 == 0:
-            print(f"  Window {wi+1}/{len(windows)}: {len(merged)} members with test data")
+        all_window_results.append(_tag_window(merged, wi, window))
 
     if not all_window_results:
         return pd.DataFrame()
     return pd.concat(all_window_results, ignore_index=True)
 
 
-def _slice_window(sigs: pd.DataFrame, w: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _slice_window(sigs: pd.DataFrame, window: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Slice labels that were fully known by their respective boundaries."""
+    disclosure = pd.to_datetime(sigs["disclosure_date"])
+    maturity = disclosure + pd.Timedelta(days=HORIZON)
     train = sigs[
-        (sigs["disclosure_date"] >= w["train_start"])
-        & (sigs["disclosure_date"] < w["train_end"])
+        (disclosure >= window["train_start"])
+        & (disclosure < window["train_end"])
+        & (maturity <= window["train_end"])
     ].copy()
     test = sigs[
-        (sigs["disclosure_date"] >= w["test_start"])
-        & (sigs["disclosure_date"] < w["test_end"])
+        (disclosure >= window["test_start"])
+        & (disclosure < window["test_end"])
+        & (maturity <= window["test_end"])
     ].copy()
     return train, test
 
 
 def _rank_train(train_sigs: pd.DataFrame) -> pd.DataFrame:
-    try:
-        return rank_members(train_sigs, HORIZON, threshold=5.0)
-    except AnalysisError:
+    """Estimate comparable member statistics from endpoint excess returns."""
+    purchases = _get_horizon_data(train_sigs, HORIZON, "Purchase")
+    purchases = _apply_quality_filter(purchases)
+    purchases = purchases[purchases[TARGET_RETURN_COLUMN].notna()]
+    if purchases.empty:
+        return pd.DataFrame()
+    purchases = _collapse_to_episodes(purchases)
+    purchases = purchases[purchases[TARGET_RETURN_COLUMN].notna()]
+    if purchases.empty:
         return pd.DataFrame()
 
-
-def _compute_test_alpha(test_sigs: pd.DataFrame) -> pd.DataFrame:
-    test_purchases = test_sigs[test_sigs["signal_type"] == "Purchase"].copy()
-    if test_purchases.empty:
-        return pd.DataFrame()
+    target = purchases[TARGET_RETURN_COLUMN]
+    global_mean = float(target.mean())
+    global_positive_rate = float(np.clip((target > 0).mean(), 0.10, 0.90))
+    grouped = purchases.groupby("member")
+    aggregate = grouped[TARGET_RETURN_COLUMN].agg(
+        purchase_trades="count",
+        avg_excess_return_pct="mean",
+        excess_return_std="std",
+        excess_return_sum="sum",
+    )
+    positive = (target > 0).groupby(purchases["member"]).sum().reindex(aggregate.index)
+    n = aggregate["purchase_trades"].astype(float)
+    aggregate["prob_positive_excess"] = positive / n
+    aggregate["bayes_positive_excess_prob"] = (
+        global_positive_rate * BAYES_PRIOR_STRENGTH + positive
+    ) / (BAYES_PRIOR_STRENGTH + n)
+    aggregate["shrunk_excess_return_pct"] = (
+        global_mean * BAYES_PRIOR_STRENGTH + aggregate["excess_return_sum"]
+    ) / (BAYES_PRIOR_STRENGTH + n)
+    aggregate["sharpe_excess_return"] = np.where(
+        aggregate["excess_return_std"].fillna(0.0) > 0,
+        aggregate["avg_excess_return_pct"] / aggregate["excess_return_std"],
+        0.0,
+    )
+    aggregate["conviction_score"] = _conviction(grouped, aggregate.index)
     return (
-        test_purchases.groupby("member")["spy_alpha_pct"]
-        .agg(["mean", "count", "std"])
-        .reset_index()
-        .rename(columns={"mean": "test_alpha", "count": "test_trades", "std": "test_std"})
+        aggregate.reset_index()
+        .drop(columns=["excess_return_std", "excess_return_sum"])
+        .sort_values("shrunk_excess_return_pct", ascending=False)
+        .reset_index(drop=True)
     )
 
 
-def _merge_train_test(train_rankings: pd.DataFrame, test_alpha: pd.DataFrame) -> pd.DataFrame:
+def _conviction(grouped, member_index: pd.Index) -> np.ndarray:
+    counts = grouped.size().reindex(member_index).to_numpy(dtype=float)
+    count_score = np.minimum(counts / 10.0, 1.0)
+    if "amount_midpoint" not in grouped.obj.columns:
+        return count_score
+    amount_count = grouped["amount_midpoint"].count().reindex(member_index).to_numpy()
+    amount_mean = (
+        grouped["amount_midpoint"].mean().reindex(member_index).fillna(0.0).to_numpy()
+    )
+    size_score = np.where(amount_count > 0, np.minimum(amount_mean / 50_000.0, 1.0), 0.0)
+    return count_score * 0.6 + size_score * 0.4
+
+
+def _compute_test_outcomes(test_sigs: pd.DataFrame) -> pd.DataFrame:
+    purchases = _get_horizon_data(test_sigs, HORIZON, "Purchase")
+    purchases = _apply_quality_filter(purchases)
+    purchases = purchases[purchases[TARGET_RETURN_COLUMN].notna()]
+    if purchases.empty:
+        return pd.DataFrame()
+    purchases = _collapse_to_episodes(purchases)
+    return (
+        purchases.groupby("member")[TARGET_RETURN_COLUMN]
+        .agg(test_excess_return_pct="mean", test_trades="count", test_std="std")
+        .reset_index()
+    )
+
+
+def _compute_test_alpha(test_sigs: pd.DataFrame) -> pd.DataFrame:
+    """Backward-compatible alias for the endpoint-excess outcome table."""
+    return _compute_test_outcomes(test_sigs)
+
+
+def _merge_train_test(
+    train_rankings: pd.DataFrame, test_outcomes: pd.DataFrame
+) -> pd.DataFrame:
     merged = pd.merge(
         train_rankings[["member"] + METRICS_TO_TEST],
-        test_alpha,
+        test_outcomes,
         on="member",
         how="inner",
+        validate="one_to_one",
     )
     merged = merged[merged["test_trades"] >= MIN_TEST_TRADES]
     if len(merged) < MIN_MEMBERS_FOR_CORR:
@@ -131,9 +180,9 @@ def _merge_train_test(train_rankings: pd.DataFrame, test_alpha: pd.DataFrame) ->
     return merged
 
 
-def _tag_window(merged: pd.DataFrame, wi: int, w: dict) -> pd.DataFrame:
-    merged = merged.copy()
-    merged["window"] = wi
-    merged["train_start"] = w["train_start"]
-    merged["test_start"] = w["test_start"]
-    return merged
+def _tag_window(merged: pd.DataFrame, wi: int, window: dict) -> pd.DataFrame:
+    result = merged.copy()
+    result["window"] = wi
+    for key in ("train_start", "train_end", "test_start", "test_end"):
+        result[key] = window[key]
+    return result

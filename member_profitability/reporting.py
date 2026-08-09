@@ -1,4 +1,4 @@
-"""Output JSON serialization and recommendation generation for member profitability."""
+"""Honest serialization and qualified research summaries."""
 
 from __future__ import annotations
 
@@ -8,9 +8,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from member_profitability.analysis import summarize_combined_metrics
 from member_profitability.config import (
+    DATA_SCOPE,
     DECAY_LAMBDA,
     HORIZON,
+    TARGET_RETURN_COLUMN,
     TEST_WINDOW_DAYS,
     TRAIN_WINDOW_DAYS,
 )
@@ -21,23 +24,25 @@ def build_output_dict(
     all_tx: pd.DataFrame,
     all_tickers: list[str],
     windows: list[dict],
-    valid_windows: int,
     all_wf: pd.DataFrame,
     correlations: dict,
     tier_results: dict,
     trade_count_analysis: dict,
-    position_results: list[dict],
+    position_research: dict,
     combined_results: dict,
+    db_path: str | Path,
 ) -> dict:
-    """Assemble the output dict that will be JSON-serialized."""
     return {
-        "analysis_config": _config_section(sigs, all_tx, all_tickers, windows, valid_windows, all_wf),
+        "analysis_config": _config_section(
+            sigs, all_tx, all_tickers, windows, all_wf, db_path
+        ),
         "spearman_correlations": correlations,
         "tier_analysis": tier_results,
-        "trade_count_reliability": _stringify_keys(trade_count_analysis),
-        "position_sizing_grid": position_results,
-        "combined_metrics": _summarize_combined(combined_results),
+        "trade_count_reliability": {str(key): value for key, value in trade_count_analysis.items()},
+        "position_research": position_research,
+        "combined_metrics": summarize_combined_metrics(combined_results),
         "recommendations": {},
+        "profitability_claim": "not_established",
     }
 
 
@@ -46,176 +51,124 @@ def _config_section(
     all_tx: pd.DataFrame,
     all_tickers: list[str],
     windows: list[dict],
-    valid_windows: int,
     all_wf: pd.DataFrame,
+    db_path: str | Path,
 ) -> dict:
     return {
+        "database": str(Path(db_path).expanduser().resolve()),
+        "data_scope": DATA_SCOPE,
+        "data_scope_note": (
+            "The input schema cannot prove chamber for every historical row; "
+            "results are mixed/unclassified and must not be labeled House or Senate."
+        ),
         "horizon": HORIZON,
+        "target_return_column": TARGET_RETURN_COLUMN,
         "train_window_days": TRAIN_WINDOW_DAYS,
         "test_window_days": TEST_WINDOW_DAYS,
         "decay_lambda": DECAY_LAMBDA,
-        "total_transactions": len(all_tx),
-        "total_tickers": len(all_tickers),
-        "total_signals": len(sigs),
-        "n_windows": len(windows),
-        "valid_windows_analyzed": valid_windows,
-        "total_window_observations": len(all_wf),
+        "total_transactions": int(len(all_tx)),
+        "unique_transaction_members": int(all_tx["member"].nunique()),
+        "total_tickers": int(len(all_tickers)),
+        "total_signals": int(len(sigs)),
+        "complete_signals": int(sigs["window_complete"].fillna(False).sum()),
+        "n_nonoverlapping_windows": int(len(windows)),
+        "research_windows_analyzed": int(all_wf["window"].nunique()) if not all_wf.empty else 0,
+        "unique_research_members": int(all_wf["member"].nunique()) if not all_wf.empty else 0,
+        "member_window_observations": int(len(all_wf)),
     }
-
-
-def _stringify_keys(d: dict) -> dict:
-    """JSON keys must be strings. Convert int trade-count thresholds to str."""
-    return {str(k): v for k, v in d.items()}
-
-
-def _summarize_combined(combined_results: dict) -> dict:
-    summary: dict = {}
-    for name, corrs in combined_results.items():
-        if not corrs:
-            continue
-        summary[name] = {
-            "mean_spearman": round(float(np.mean(corrs)), 4),
-            "std_spearman": round(float(np.std(corrs)), 4) if len(corrs) > 1 else 0.0,
-            "n_windows": len(corrs),
-        }
-    return summary
 
 
 def best_predictors(
     correlations: dict,
     combined_results: dict,
     tier_results: dict,
-    position_results: list[dict],
+    position_results,
 ) -> dict:
-    """Pick the best single metric, best combined, best tier, best grid."""
-    best_metric_name, best_metric = _pick_best_metric(correlations)
-    best_combined = _pick_best_combined(combined_results)
-    best_tier_name, best_tier = _pick_best_tier(tier_results)
-    best_grid = _pick_best_grid(position_results)
-
-    findings = _build_findings(
-        correlations, trade_count_lookup(), best_metric_name, best_metric,
-        best_tier_name, best_tier, best_grid, best_combined,
+    """Summarize exploratory leaders without making a profit claim."""
+    positive_metrics = [
+        (name, data)
+        for name, data in correlations.items()
+        if data.get("n_windows", 0) > 0 and data.get("mean_spearman", 0.0) > 0
+    ]
+    leading_metric = (
+        max(positive_metrics, key=lambda item: item[1]["mean_spearman"])
+        if positive_metrics
+        else (None, {})
     )
-
+    combined_summary = summarize_combined_metrics(combined_results)
+    positive_combined = [
+        (name, data)
+        for name, data in combined_summary.items()
+        if data["mean_spearman"] > 0
+    ]
+    leading_combined = (
+        max(positive_combined, key=lambda item: item[1]["mean_spearman"])
+        if positive_combined
+        else (None, {})
+    )
+    positive_tiers = [
+        (name, data)
+        for name, data in tier_results.items()
+        if data.get("n_windows", 0) > 0 and data.get("alpha_lift", 0.0) > 0
+    ]
+    leading_tier = (
+        max(positive_tiers, key=lambda item: item[1]["alpha_lift"])
+        if positive_tiers
+        else (None, {})
+    )
+    position = position_results if isinstance(position_results, dict) else {}
+    findings = [
+        "All metric comparisons are exploratory research-window results.",
+        "The final chronological holdout is reported separately and was not used for selection.",
+        "No profitability claim is established by this analysis.",
+    ]
     return {
-        "best_single_predictor": _single_predictor_entry(best_metric_name, best_metric),
-        "best_combined_predictor": best_combined,
-        "best_tier_metric": {
-            "metric": best_tier_name,
-            "alpha_lift": best_tier.get("alpha_lift", 0) if best_tier_name else 0,
-        },
-        "optimal_position_sizing": best_grid,
+        "best_single_predictor": _metric_entry(*leading_metric),
+        "leading_combined_metric": _metric_entry(*leading_combined),
+        "leading_positive_tier": _tier_entry(*leading_tier),
+        "selected_position_candidate": position.get("selected_candidate"),
+        "holdout_status": position.get("status", "not_evaluated"),
         "key_findings": findings,
     }
 
 
-def _pick_best_metric(correlations: dict) -> tuple[str, dict]:
-    return max(correlations.items(), key=lambda x: abs(x[1]["mean_spearman"]))
-
-
-def _pick_best_combined(combined_results: dict) -> dict | None:
-    if not combined_results:
+def _metric_entry(name: str | None, data: dict) -> dict | None:
+    if name is None:
         return None
-    name, corrs = max(
-        combined_results.items(),
-        key=lambda x: abs(np.mean(x[1])) if x[1] else 0,
-    )
     return {
-        "name": name,
-        "mean_spearman": round(float(np.mean(corrs)), 4),
+        "metric": name,
+        "mean_spearman": data.get("mean_spearman", 0.0),
+        "n_windows": data.get("n_windows", 0),
+        "interpretation": "exploratory_positive_association",
     }
 
 
-def _pick_best_tier(tier_results: dict) -> tuple[str | None, dict]:
-    if not tier_results:
-        return None, {}
-    return max(tier_results.items(), key=lambda x: abs(x[1].get("alpha_lift", 0)))
-
-
-def _pick_best_grid(position_results: list[dict]) -> dict:
-    if not position_results:
-        return {}
-    return max(position_results, key=lambda x: x["sharpe_proxy"])
-
-
-def trade_count_lookup() -> dict:
-    """Empty placeholder for the findings builder."""
-    return {}
-
-
-def _build_findings(
-    correlations: dict,
-    _trade_count_analysis: dict,
-    best_metric_name: str,
-    best_metric: dict,
-    best_tier_name: str | None,
-    best_tier: dict,
-    best_grid: dict,
-    best_combined: dict | None,
-) -> list[str]:
-    findings: list[str] = []
-
-    sorted_corrs = sorted(
-        correlations.items(),
-        key=lambda x: abs(x[1]["mean_spearman"]),
-        reverse=True,
-    )
-    findings.append(
-        f"Best single predictor of future alpha: '{sorted_corrs[0][0]}' "
-        f"(Spearman={sorted_corrs[0][1]['mean_spearman']:+.4f})"
-    )
-
-    if best_grid:
-        findings.append(
-            f"Optimal position sizing: top_n={best_grid.get('top_n', 'N/A')}, "
-            f"min_buyers={best_grid.get('min_buyers', 'N/A')} "
-            f"(sharpe_proxy={best_grid.get('sharpe_proxy', 0):.4f})"
-        )
-
-    if best_tier_name:
-        findings.append(
-            f"Best tier separation: '{best_tier_name}' "
-            f"(top10% vs bottom10% alpha lift={best_tier.get('alpha_lift', 0):+.4f}%)"
-        )
-
-    if best_combined:
-        findings.append(
-            f"Best combined predictor: '{best_combined['name']}' "
-            f"(Spearman={best_combined['mean_spearman']:+.4f})"
-        )
-
-    return findings
-
-
-def _single_predictor_entry(metric: str, data: dict) -> dict:
-    corr = data["mean_spearman"]
+def _tier_entry(name: str | None, data: dict) -> dict | None:
+    if name is None:
+        return None
     return {
-        "metric": metric,
-        "mean_spearman": corr,
-        "interpretation": (
-            "Strong positive" if corr > 0.2
-            else "Moderate positive" if corr > 0.05
-            else "Weak/no" if corr > -0.05
-            else "Negative (avoid)"
-        ),
+        "metric": name,
+        "mean_window_lift_pct": data.get("alpha_lift", 0.0),
+        "n_windows": data.get("n_windows", 0),
     }
 
 
 def serialize_numpy(obj):
-    """JSON serializer that converts numpy types to native Python types."""
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, np.floating):
         return float(obj)
     if isinstance(obj, np.ndarray):
         return obj.tolist()
-    return obj
+    if isinstance(obj, (pd.Timestamp, np.datetime64)):
+        return str(pd.Timestamp(obj))
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
-def write_output(output: dict, path: Path = Path("data/member_analysis.json")) -> None:
-    """Write the analysis output to JSON."""
+def write_output(output: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(output, f, indent=2, default=serialize_numpy)
-    print(f"\nResults written to: {path}")
+    with path.open("w") as handle:
+        json.dump(output, handle, indent=2, default=serialize_numpy, allow_nan=False)
+    print(f"Results written to: {path}")

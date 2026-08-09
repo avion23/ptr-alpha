@@ -468,10 +468,14 @@ def select_config(
     bootstrap_p = np.ones(n_trials, dtype=float)
     max_stat_p = np.ones(n_trials, dtype=float)
     bootstrap_error = None
+    minimum_resolution_bootstrap = max(
+        MIN_RELEASE_PERMUTATIONS, math.ceil(n_trials / alpha) - 1
+    )
     bootstrap_summary: dict = {
         "method": "centered_moving_block_bootstrap_max_stat",
         "n_bootstrap": int(n_permutations),
         "minimum_release_bootstrap": MIN_RELEASE_PERMUTATIONS,
+        "minimum_family_resolution_bootstrap": minimum_resolution_bootstrap,
         "seed": int(permutation_seed),
         "centered_null": True,
         "release_ready": False,
@@ -508,7 +512,7 @@ def select_config(
                 [float(adjusted_by_trial[int(value)]) for value in working["trial_id"]]
             )
             bootstrap_summary.update(
-                release_ready=n_permutations >= MIN_RELEASE_PERMUTATIONS,
+                release_ready=n_permutations >= minimum_resolution_bootstrap,
                 null_max_t_quantile_95=float(
                     np.quantile(bootstrap.null_max_statistics, 0.95)
                 ),
@@ -521,7 +525,7 @@ def select_config(
     bootstrap_ready = bool(
         complete_series
         and bootstrap_error is None
-        and n_permutations >= MIN_RELEASE_PERMUTATIONS
+        and n_permutations >= minimum_resolution_bootstrap
     )
     working["bootstrap_p_value"] = bootstrap_p
     working["bonferroni_p_value"] = np.minimum(bootstrap_p * n_trials, 1.0)
@@ -558,8 +562,10 @@ def select_config(
 
     deployable = None
     member_summary = member_control or {
-        "status": "not_run",
+        "status": "not_required_no_statistical_candidate",
         "release_ready": False,
+        "runtime_seconds": 0.0,
+        "required_before_deployment": True,
     }
     if statistical_candidate is not None:
         mode = str(statistical_candidate.get("scoring_mode", ""))
@@ -589,8 +595,8 @@ def select_config(
         reason = "incomplete_bootstrap_series"
     elif bootstrap_error is not None:
         reason = "bootstrap_sample_too_small"
-    elif n_permutations < MIN_RELEASE_PERMUTATIONS:
-        reason = "insufficient_bootstrap_count"
+    elif n_permutations < minimum_resolution_bootstrap:
+        reason = "insufficient_bootstrap_count_or_family_resolution"
     elif statistical_candidate is None:
         reason = "no_dependence_safe_survivor"
     elif deployable is None:
@@ -694,6 +700,11 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1229,6 +1240,11 @@ def _build_manifest(
             "member_identity_method": "bijective_member_identity_full_family_max_stat",
             "n_member_permutations": member_permutations,
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
+            "minimum_family_resolution_bootstrap": max(
+                MIN_RELEASE_PERMUTATIONS,
+                math.ceil(math.prod(len(values) for values in grid.values()) / alpha)
+                - 1,
+            ),
             "seed": permutation_seed,
             "assumptions": [
                 "local stationarity within moving blocks",

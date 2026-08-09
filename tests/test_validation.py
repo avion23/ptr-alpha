@@ -106,7 +106,10 @@ class TestCorrectedSelection:
             n_permutations=99,
         )
         assert result["deployable_config"] is None
-        assert result["failure_reason"] == "insufficient_bootstrap_count"
+        assert (
+            result["failure_reason"]
+            == "insufficient_bootstrap_count_or_family_resolution"
+        )
         assert result["bootstrap"]["release_ready"] is False
 
     def test_missing_or_incomplete_null_series_fails_closed(self):

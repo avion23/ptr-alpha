@@ -336,6 +336,8 @@ def min_backtest_length(
     Returns:
         Minimum number of years of data required.
     """
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
     if sharpe <= 0:
         return float("inf")  # Cannot achieve significance with non-positive Sharpe
 

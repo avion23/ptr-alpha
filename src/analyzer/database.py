@@ -998,6 +998,9 @@ class Database:
     ) -> pd.DataFrame:
         return self.transactions.get_by_year(year, source=source, sources=sources)
 
+    def get_house_transactions(self, year: int) -> pd.DataFrame:
+        return self.transactions.get_house_by_year(year)
+
     def get_transactions_by_date_range(
         self,
         start_date: date,

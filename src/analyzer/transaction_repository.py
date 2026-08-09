@@ -261,6 +261,11 @@ class TransactionRepository:
         ).fetchdf()
         return _normalize_frame(result, deduplicate=True)
 
+    def get_house_by_year(self, year: int) -> pd.DataFrame:
+        return self.get_by_year(
+            year, sources=("house_pdf", "gemini_ocr")
+        )
+
     def get_by_date_range(
         self,
         start_date: date,
@@ -273,6 +278,7 @@ class TransactionRepository:
             source=source, sources=sources
         )
         params: list[object] = [start_date, end_date, *source_params]
+
         excluded = self.conn.execute(
             f"""
 

@@ -103,6 +103,7 @@ class HouseTransactionSource(TransactionSource):
             )
 
         df = self.db.get_transactions(year, sources=("house_pdf", "gemini_ocr"))
+
         logger.info(f"Loaded {len(df)} cached transactions for {year}")
         return df
 

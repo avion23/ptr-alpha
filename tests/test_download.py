@@ -442,3 +442,31 @@ def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypat
 
     assert source.db.get_latest_house_generation.call_count == 1
     assert source._save_parse_results.call_args.args[-1] == "captured-g1"
+
+
+
+def test_house_get_transactions_includes_pdf_and_gemini_but_not_capitol(tmp_path):
+    source, db = _source(tmp_path)
+    base = {
+        "member": "Jane Doe",
+        "transaction_date": date(2024, 1, 2),
+        "disclosure_date": date(2024, 1, 3),
+        "transaction_type": "Purchase",
+    }
+    for doc_id, ticker, row_source in (
+        ("pdf", "PDF", "house_pdf"),
+        ("ocr", "OCR", "gemini_ocr"),
+        ("capitol", "CAP", "capitol_trades"),
+    ):
+        db.upsert_transactions(
+            pd.DataFrame([{**base, "doc_id": doc_id, "ticker": ticker}]),
+            source=row_source,
+        )
+
+    try:
+        transactions = source.get_transactions(2024)
+    finally:
+        source.close()
+        db.close()
+
+    assert set(transactions["ticker"]) == {"PDF", "OCR"}

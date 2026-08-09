@@ -15,6 +15,7 @@ SOURCE_TRANSACTION_COLUMNS = [
     "chamber",
     "source_record_id",
     "source_row_id",
+    "source_report_path",
     "member",
     "ticker",
     "raw_ticker",
@@ -214,7 +215,7 @@ class TransactionRepository:
             self.conn.execute("DROP TABLE IF EXISTS staging_transactions")
         return inserted_count
 
-    def replace_source_generation(
+    def replace_source_refresh(
         self,
         df: pd.DataFrame,
         *,
@@ -223,7 +224,7 @@ class TransactionRepository:
         ingestion_generation: str,
         _in_transaction: bool = False,
     ) -> int:
-        """Replace one source/chamber/generation without economic-key merging."""
+        """Replace the active source/chamber state without economic-key merging."""
         df = df[SOURCE_TRANSACTION_COLUMNS].copy()
         df["created_at"] = datetime.now()
         df["source"] = source
@@ -235,9 +236,8 @@ class TransactionRepository:
             if not _in_transaction:
                 self.conn.execute("BEGIN TRANSACTION")
             self.conn.execute(
-                "DELETE FROM transactions "
-                "WHERE source = ? AND chamber = ? AND ingestion_generation = ?",
-                [source, chamber, ingestion_generation],
+                "DELETE FROM transactions WHERE source = ? AND chamber = ?",
+                [source, chamber],
             )
             self.conn.execute("""
                 INSERT INTO transactions (
@@ -245,7 +245,8 @@ class TransactionRepository:
                     transaction_type, owner_code, amount_raw, amount_midpoint,
                     instrument_type, strike_price, expiry_date, created_at,
                     asset_description, source, chamber, source_record_id,
-                    source_row_id, official_filing_date, available_date,
+                    source_row_id, source_report_path, official_filing_date,
+                    available_date,
                     notification_date, amends_source_record_id,
                     raw_transaction_subtype, ticker_origin, raw_ticker,
                     ticker_candidate, raw_asset_class,
@@ -257,7 +258,8 @@ class TransactionRepository:
                     transaction_type, owner_code, amount_raw, amount_midpoint,
                     instrument_type, strike_price, expiry_date, created_at,
                     asset_description, source, chamber, source_record_id,
-                    source_row_id, official_filing_date, available_date,
+                    source_row_id, source_report_path, official_filing_date,
+                    available_date,
                     notification_date, amends_source_record_id,
                     raw_transaction_subtype, ticker_origin, raw_ticker,
                     ticker_candidate, raw_asset_class,
@@ -284,7 +286,8 @@ class TransactionRepository:
                    transaction_type, owner_code, amount_raw, amount_midpoint,
                    instrument_type, strike_price, expiry_date, asset_description,
                    source, chamber, source_record_id, source_row_id,
-                   official_filing_date, available_date, notification_date,
+                   source_report_path, official_filing_date, available_date,
+                   notification_date,
                    amends_source_record_id, raw_transaction_subtype, ticker_origin,
                    raw_ticker, ticker_candidate, raw_asset_class,
                    raw_asset_description, raw_owner,

@@ -4,6 +4,7 @@ from datetime import date, datetime
 import duckdb
 import pandas as pd
 
+from analyzer.database import Database
 from analyzer.transaction_repository import SOURCE_TRANSACTION_COLUMNS
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
 from .conftest import DatabaseTestCase
@@ -792,10 +793,13 @@ class TestSourceReports(DatabaseTestCase):
     @staticmethod
     def transaction(**overrides):
         row = {
-            "doc_id": "report-1",
+            "doc_id": "11111111-1111-4111-8111-111111111111",
             "chamber": "senate",
-            "source_record_id": "report-1",
+            "source_record_id": "11111111-1111-4111-8111-111111111111",
             "source_row_id": "table:000001",
+            "source_report_path": (
+                "/search/view/ptr/11111111-1111-4111-8111-111111111111/"
+            ),
             "member": "Jane Doe",
             "ticker": "AAPL",
             "raw_ticker": "AAPL",
@@ -849,13 +853,13 @@ class TestSourceReports(DatabaseTestCase):
                 "refresh-2026-08-09",
                 "house",
                 "1002",
-                None,
+                "2026/1002.pdf",
                 "John Doe",
                 date(2026, 8, 2),
                 "paper_only",
                 "b" * 64,
-                "e" * 64,
-                "https://example.test/paper/1002",
+                "b" * 64,
+                "https://efdsearch.senate.gov/media/1002.pdf",
                 "b" * 64,
                 None,
                 0,
@@ -866,7 +870,7 @@ class TestSourceReports(DatabaseTestCase):
                 "refresh-2026-08-09",
                 "house",
                 "1003",
-                None,
+                "2026/1003.pdf",
                 "Alex Doe",
                 date(2026, 8, 3),
                 "parsed",
@@ -875,16 +879,22 @@ class TestSourceReports(DatabaseTestCase):
                 None,
                 None,
                 None,
-                0,
-                0,
+                1,
+                1,
                 0,
             ),
         )
 
-        self.db.replace_source_reports("refresh-2026-08-09", "house", reports)
+        self.db.replace_source_reports(
+            "refresh-2026-08-09", "house_pdf", "house", reports
+        )
 
-        stored = self.db.get_source_reports("refresh-2026-08-09", "house")
-        self.assertEqual(stored.columns.tolist(), self.COLUMNS)
+        stored = self.db.get_source_reports("refresh-2026-08-09", "house_pdf", "house")
+        self.assertEqual(
+            stored.columns.tolist(),
+            ["ingestion_generation", "source", *self.COLUMNS[1:]],
+        )
+        self.assertEqual(set(stored["source"]), {"house_pdf"})
         self.assertEqual(stored["source_record_id"].tolist(), ["1001", "1002", "1003"])
         self.assertEqual(stored.iloc[0]["artifact_sha256"], parsed_sha)
         self.assertEqual(stored.iloc[0]["outcome"], "parsed")
@@ -893,7 +903,9 @@ class TestSourceReports(DatabaseTestCase):
         self.assertEqual(stored.iloc[0]["landing_sha256"], parsed_sha)
         self.assertEqual(stored.iloc[1]["paper_artifact_sha256"], "b" * 64)
         self.assertEqual(
-            self.db.get_source_report_reconciliation("refresh-2026-08-09", "house"),
+            self.db.get_source_report_reconciliation(
+                "refresh-2026-08-09", "house_pdf", "house"
+            ),
             {
                 "found": 3,
                 "parsed": 2,
@@ -925,22 +937,36 @@ class TestSourceReports(DatabaseTestCase):
                 )
             )
 
-        self.db.replace_source_reports("gen-1", "house", one("gen-1", "house", "a1"))
-        self.db.replace_source_reports("gen-1", "senate", one("gen-1", "senate", "b1"))
-        self.db.replace_source_reports("gen-2", "house", one("gen-2", "house", "c1"))
+        self.db.replace_source_reports(
+            "gen-1", "house_pdf", "house", one("gen-1", "house", "a1")
+        )
+        self.db.replace_source_reports(
+            "gen-1", "house_pdf", "senate", one("gen-1", "senate", "b1")
+        )
+        self.db.replace_source_reports(
+            "gen-2", "house_pdf", "house", one("gen-2", "house", "c1")
+        )
 
-        self.db.replace_source_reports("gen-1", "house", one("gen-1", "house", "d1"))
+        self.db.replace_source_reports(
+            "gen-1", "house_pdf", "house", one("gen-1", "house", "d1")
+        )
 
         self.assertEqual(
-            self.db.get_source_reports("gen-1", "house")["source_record_id"].tolist(),
+            self.db.get_source_reports("gen-1", "house_pdf", "house")[
+                "source_record_id"
+            ].tolist(),
             ["d1"],
         )
         self.assertEqual(
-            self.db.get_source_reports("gen-1", "senate")["source_record_id"].tolist(),
+            self.db.get_source_reports("gen-1", "house_pdf", "senate")[
+                "source_record_id"
+            ].tolist(),
             ["b1"],
         )
         self.assertEqual(
-            self.db.get_source_reports("gen-2", "house")["source_record_id"].tolist(),
+            self.db.get_source_reports("gen-2", "house_pdf", "house")[
+                "source_record_id"
+            ].tolist(),
             ["c1"],
         )
 
@@ -964,7 +990,7 @@ class TestSourceReports(DatabaseTestCase):
                 0,
             )
         )
-        self.db.replace_source_reports("gen-1", "house", original)
+        self.db.replace_source_reports("gen-1", "house_pdf", "house", original)
         duplicate = pd.concat(
             [
                 original.assign(source_record_id="duplicate"),
@@ -974,9 +1000,9 @@ class TestSourceReports(DatabaseTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "duplicate source_record_id"):
-            self.db.replace_source_reports("gen-1", "house", duplicate)
+            self.db.replace_source_reports("gen-1", "house_pdf", "house", duplicate)
 
-        stored = self.db.get_source_reports("gen-1", "house")
+        stored = self.db.get_source_reports("gen-1", "house_pdf", "house")
         self.assertEqual(stored["source_record_id"].tolist(), ["original"])
 
     def test_failed_or_unclassified_inventory_cannot_commit(self):
@@ -1000,7 +1026,7 @@ class TestSourceReports(DatabaseTestCase):
             )
         )
         with self.assertRaisesRegex(ValueError, "requires unavailable=0 and failed=0"):
-            self.db.replace_source_reports("gen-1", "house", failed)
+            self.db.replace_source_reports("gen-1", "house_pdf", "house", failed)
 
         unavailable = failed.assign(
             source_record_id="unavailable-report",
@@ -1008,7 +1034,7 @@ class TestSourceReports(DatabaseTestCase):
             error_message="artifact unavailable",
         )
         with self.assertRaisesRegex(ValueError, "requires unavailable=0 and failed=0"):
-            self.db.replace_source_reports("gen-1", "house", unavailable)
+            self.db.replace_source_reports("gen-1", "house_pdf", "house", unavailable)
 
         bad_row_counts = failed.assign(
             source_record_id="bad-counts",
@@ -1019,8 +1045,10 @@ class TestSourceReports(DatabaseTestCase):
             accepted_row_count=1,
             rejected_row_count=0,
         )
-        with self.assertRaisesRegex(ValueError, "row reconciliation failed"):
-            self.db.replace_source_reports("gen-1", "house", bad_row_counts)
+        with self.assertRaisesRegex(ValueError, "parsed reports require"):
+            self.db.replace_source_reports(
+                "gen-1", "house_pdf", "house", bad_row_counts
+            )
 
         unknown = failed.assign(
             source_record_id="unknown-report",
@@ -1028,10 +1056,12 @@ class TestSourceReports(DatabaseTestCase):
             error_message=None,
         )
         with self.assertRaisesRegex(ValueError, "reconciliation failed"):
-            self.db.replace_source_reports("gen-1", "house", unknown)
+            self.db.replace_source_reports("gen-1", "house_pdf", "house", unknown)
 
         self.assertEqual(
-            self.db.get_source_report_reconciliation("gen-1", "house")["found"],
+            self.db.get_source_report_reconciliation("gen-1", "house_pdf", "house")[
+                "found"
+            ],
             0,
         )
 
@@ -1055,16 +1085,16 @@ class TestSourceReports(DatabaseTestCase):
                 0,
             )
         )
-        self.db.replace_source_reports("gen-1", "house", original)
+        self.db.replace_source_reports("gen-1", "house_pdf", "house", original)
         invalid = original.assign(
             source_record_id="replacement",
             official_filing_date="not-a-date",
         )
 
-        with self.assertRaises(duckdb.ConversionException):
-            self.db.replace_source_reports("gen-1", "house", invalid)
+        with self.assertRaisesRegex(ValueError, "official_filing_date"):
+            self.db.replace_source_reports("gen-1", "house_pdf", "house", invalid)
 
-        stored = self.db.get_source_reports("gen-1", "house")
+        stored = self.db.get_source_reports("gen-1", "house_pdf", "house")
         self.assertEqual(stored["source_record_id"].tolist(), ["original"])
 
     def test_persist_source_refresh_preserves_distinct_source_rows(self):
@@ -1080,8 +1110,8 @@ class TestSourceReports(DatabaseTestCase):
                 {
                     "ingestion_generation": "gen-1",
                     "chamber": "senate",
-                    "source_record_id": "report-1",
-                    "report_path": "/reports/report-1",
+                    "source_record_id": "11111111-1111-4111-8111-111111111111",
+                    "report_path": "/search/view/ptr/11111111-1111-4111-8111-111111111111/",
                     "member": "Jane Doe",
                     "official_filing_date": date(2026, 7, 10),
                     "outcome": "parsed",
@@ -1096,14 +1126,14 @@ class TestSourceReports(DatabaseTestCase):
                 {
                     "ingestion_generation": "gen-1",
                     "chamber": "senate",
-                    "source_record_id": "paper-report",
-                    "report_path": "/reports/paper-report",
+                    "source_record_id": "22222222-2222-4222-8222-222222222222",
+                    "report_path": "/search/view/ptr/22222222-2222-4222-8222-222222222222/",
                     "member": "John Doe",
                     "official_filing_date": date(2026, 7, 11),
                     "outcome": "paper_only",
                     "artifact_sha256": "b" * 64,
-                    "landing_sha256": "e" * 64,
-                    "paper_artifact_url": "https://example.test/paper-report",
+                    "landing_sha256": "b" * 64,
+                    "paper_artifact_url": "https://efdsearch.senate.gov/media/paper.pdf",
                     "paper_artifact_sha256": "b" * 64,
                     "error_message": None,
                     "raw_row_count": 0,
@@ -1142,13 +1172,16 @@ class TestSourceReports(DatabaseTestCase):
         self.assertTrue(all(row[5] == "a" * 64 for row in stored_rows))
         self.assertTrue(all(row[6] == "Self" for row in stored_rows))
         self.assertTrue(all(row[9] == "AAPL" for row in stored_rows))
-        stored_reports = self.db.get_source_reports("gen-1", "senate")
+        stored_reports = self.db.get_source_reports("gen-1", "senate_efd", "senate")
         self.assertEqual(
             stored_reports["source_record_id"].tolist(),
-            ["paper-report", "report-1"],
+            [
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ],
         )
-        self.assertEqual(stored_reports.iloc[0]["outcome"], "paper_only")
-        self.assertEqual(stored_reports.iloc[0]["accepted_row_count"], 0)
+        self.assertEqual(stored_reports.iloc[1]["outcome"], "paper_only")
+        self.assertEqual(stored_reports.iloc[1]["accepted_row_count"], 0)
 
         read_rows = self.db.get_transactions_by_date_range(
             date(2026, 7, 1), date(2026, 7, 31)
@@ -1160,11 +1193,41 @@ class TestSourceReports(DatabaseTestCase):
             set(read_rows["available_date"]), {pd.Timestamp(date(2026, 7, 10))}
         )
 
-        replacement_transactions = pd.DataFrame(
-            [self.transaction(source_row_id="table:000003")],
+        other_transactions = pd.DataFrame(
+            [
+                self.transaction(
+                    source_row_id="table:000001",
+                    ingestion_generation="gen-1",
+                )
+            ],
             columns=SOURCE_TRANSACTION_COLUMNS,
         )
-        replacement_reports = reports[reports["source_record_id"].eq("report-1")].copy()
+        other_reports = reports[
+            reports["source_record_id"].eq("11111111-1111-4111-8111-111111111111")
+        ].copy()
+        other_reports["ingestion_generation"] = "gen-1"
+        other_reports["raw_row_count"] = 1
+        other_reports["accepted_row_count"] = 1
+        self.db.persist_source_refresh(
+            transactions=other_transactions,
+            reports=other_reports,
+            source="other_official_source",
+            chamber="senate",
+            ingestion_generation="gen-1",
+        )
+
+        replacement_transactions = pd.DataFrame(
+            [
+                self.transaction(
+                    source_row_id="table:000003", ingestion_generation="gen-2"
+                )
+            ],
+            columns=SOURCE_TRANSACTION_COLUMNS,
+        )
+        replacement_reports = reports[
+            reports["source_record_id"].eq("11111111-1111-4111-8111-111111111111")
+        ].copy()
+        replacement_reports["ingestion_generation"] = "gen-2"
         replacement_reports["raw_row_count"] = 1
         replacement_reports["accepted_row_count"] = 1
         self.assertEqual(
@@ -1173,7 +1236,7 @@ class TestSourceReports(DatabaseTestCase):
                 reports=replacement_reports,
                 source="senate_efd",
                 chamber="senate",
-                ingestion_generation="gen-1",
+                ingestion_generation="gen-2",
             ),
             1,
         )
@@ -1181,13 +1244,36 @@ class TestSourceReports(DatabaseTestCase):
             """
             SELECT source_row_id FROM transactions
             WHERE source = 'senate_efd' AND chamber = 'senate'
-              AND ingestion_generation = 'gen-1'
             """
         ).fetchall()
         self.assertEqual(replaced_rows, [("table:000003",)])
+        self.assertTrue(
+            self.db.get_source_reports("gen-1", "senate_efd", "senate").empty
+        )
         self.assertEqual(
-            self.db.get_source_reports("gen-1", "senate")["source_record_id"].tolist(),
-            ["report-1"],
+            self.db.get_source_reports("gen-2", "senate_efd", "senate")[
+                "source_record_id"
+            ].tolist(),
+            ["11111111-1111-4111-8111-111111111111"],
+        )
+        current_rows = self.db.get_transactions_by_date_range(
+            date(2026, 7, 1), date(2026, 7, 31)
+        )
+        self.assertEqual(len(current_rows[current_rows["source"].eq("senate_efd")]), 1)
+        self.assertEqual(
+            self.db.conn.execute(
+                """
+                SELECT COUNT(*) FROM transactions
+                WHERE source = 'other_official_source' AND chamber = 'senate'
+                """
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.db.get_source_reports("gen-1", "other_official_source", "senate")[
+                "source_record_id"
+            ].tolist(),
+            ["11111111-1111-4111-8111-111111111111"],
         )
 
     def test_persist_source_refresh_retains_all_zero_transaction_reports(self):
@@ -1196,14 +1282,15 @@ class TestSourceReports(DatabaseTestCase):
                 {
                     "ingestion_generation": "empty-gen",
                     "chamber": "senate",
-                    "source_record_id": "zero-report",
-                    "report_path": "/reports/zero",
+                    "source_record_id": "11111111-1111-4111-8111-111111111111",
+                    "report_path": "/search/view/ptr/11111111-1111-4111-8111-111111111111/",
                     "member": "Jane Doe",
                     "official_filing_date": date(2026, 7, 10),
-                    "outcome": "parsed",
+                    "outcome": "paper_only",
                     "artifact_sha256": "c" * 64,
                     "landing_sha256": "c" * 64,
-                    "paper_artifact_url": None,
+                    "paper_artifact_url": "https://efdsearch.senate.gov/media/zero.pdf",
+                    "paper_artifact_sha256": "d" * 64,
                     "error_message": None,
                     "raw_row_count": 0,
                     "accepted_row_count": 0,
@@ -1224,15 +1311,19 @@ class TestSourceReports(DatabaseTestCase):
 
         self.assertEqual(inserted, 0)
         self.assertEqual(
-            self.db.get_source_reports("empty-gen", "senate")["outcome"].tolist(),
-            ["parsed"],
+            self.db.get_source_reports("empty-gen", "senate_efd", "senate")[
+                "outcome"
+            ].tolist(),
+            ["paper_only"],
         )
         self.assertEqual(
-            self.db.get_source_report_reconciliation("empty-gen", "senate"),
+            self.db.get_source_report_reconciliation(
+                "empty-gen", "senate_efd", "senate"
+            ),
             {
                 "found": 1,
-                "parsed": 1,
-                "paper_only": 0,
+                "parsed": 0,
+                "paper_only": 1,
                 "unavailable": 0,
                 "failed": 0,
             },
@@ -1247,8 +1338,8 @@ class TestSourceReports(DatabaseTestCase):
                 {
                     "ingestion_generation": "gen-1",
                     "chamber": "senate",
-                    "source_record_id": "report-1",
-                    "report_path": "/reports/original",
+                    "source_record_id": "11111111-1111-4111-8111-111111111111",
+                    "report_path": "/search/view/ptr/11111111-1111-4111-8111-111111111111/",
                     "member": "Jane Doe",
                     "official_filing_date": date(2026, 7, 10),
                     "outcome": "parsed",
@@ -1273,7 +1364,7 @@ class TestSourceReports(DatabaseTestCase):
         invalid_transactions = original_transactions.assign(
             source_row_id="replacement", amount_midpoint="not-a-number"
         )
-        replacement_reports = original_reports.assign(report_path="/reports/new")
+        replacement_reports = original_reports.copy()
 
         with self.assertRaises(duckdb.ConversionException):
             self.db.persist_source_refresh(
@@ -1292,8 +1383,13 @@ class TestSourceReports(DatabaseTestCase):
             """
         ).fetchone()
         self.assertEqual(stored_transaction[0], "table:000001")
-        stored_report = self.db.get_source_reports("gen-1", "senate").iloc[0]
-        self.assertEqual(stored_report["report_path"], "/reports/original")
+        stored_report = self.db.get_source_reports(
+            "gen-1", "senate_efd", "senate"
+        ).iloc[0]
+        self.assertEqual(
+            stored_report["report_path"],
+            "/search/view/ptr/11111111-1111-4111-8111-111111111111/",
+        )
 
     def test_persist_source_refresh_rejects_mapping_and_count_contradictions(self):
         transactions = pd.DataFrame(
@@ -1304,8 +1400,8 @@ class TestSourceReports(DatabaseTestCase):
                 {
                     "ingestion_generation": "gen-1",
                     "chamber": "senate",
-                    "source_record_id": "report-1",
-                    "report_path": "/reports/report-1",
+                    "source_record_id": "11111111-1111-4111-8111-111111111111",
+                    "report_path": "/search/view/ptr/11111111-1111-4111-8111-111111111111/",
                     "member": "Jane Doe",
                     "official_filing_date": date(2026, 7, 10),
                     "outcome": "parsed",
@@ -1352,14 +1448,152 @@ class TestSourceReports(DatabaseTestCase):
                 ingestion_generation="gen-1",
             )
 
+    def test_persist_rejects_null_identity_and_bad_report_bindings(self):
+        reports = pd.DataFrame(
+            [
+                {
+                    "ingestion_generation": "gen-1",
+                    "chamber": "senate",
+                    "source_record_id": "11111111-1111-4111-8111-111111111111",
+                    "report_path": (
+                        "/search/view/ptr/11111111-1111-4111-8111-111111111111/"
+                    ),
+                    "member": "Jane Doe",
+                    "official_filing_date": date(2026, 7, 10),
+                    "outcome": "parsed",
+                    "artifact_sha256": "a" * 64,
+                    "landing_sha256": "a" * 64,
+                    "paper_artifact_url": None,
+                    "paper_artifact_sha256": None,
+                    "error_message": None,
+                    "raw_row_count": 1,
+                    "accepted_row_count": 1,
+                    "rejected_row_count": 0,
+                }
+            ],
+            columns=self.COLUMNS,
+        )
+        for transaction, message in [
+            (self.transaction(source_row_id=None), "provenance values are incomplete"),
+            (self.transaction(source_row_id=""), "source_row_id must be"),
+            (self.transaction(member="Other Member"), "member does not match"),
+            (self.transaction(source_report_path="/wrong/"), "path does not match"),
+            (self.transaction(available_date=date(2026, 7, 11)), "dates do not match"),
+            (self.transaction(artifact_sha256="b" * 64), "landing hash"),
+        ]:
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self.db.persist_source_refresh(
+                    transactions=pd.DataFrame(
+                        [transaction], columns=SOURCE_TRANSACTION_COLUMNS
+                    ),
+                    reports=reports,
+                    source="senate_efd",
+                    chamber="senate",
+                    ingestion_generation="gen-1",
+                )
+
+    def test_ticker_origin_matrix_rejects_every_inconsistent_shape(self):
+        bad_rows = [
+            {"ticker_origin": "official", "ticker": "AAPL", "ticker_candidate": "AAPL"},
+            {"ticker_origin": "official", "ticker": "AAPL1", "ticker_candidate": None},
+            {
+                "ticker_origin": "asset_description",
+                "ticker": "BOND",
+                "ticker_candidate": None,
+            },
+            {
+                "ticker_origin": "unverified",
+                "ticker": "AAPL",
+                "ticker_candidate": "AAPL",
+            },
+            {"ticker_origin": "unverified", "ticker": None, "ticker_candidate": "NOTE"},
+            {"ticker_origin": "non_equity", "ticker": "AAPL", "ticker_candidate": None},
+            {"ticker_origin": "missing", "ticker": None, "ticker_candidate": "AAPL"},
+            {"ticker_origin": "invalid", "ticker": None, "ticker_candidate": "AAPL"},
+            {"ticker_origin": "unknown", "ticker": None, "ticker_candidate": None},
+        ]
+        for overrides in bad_rows:
+            row = self.transaction(**overrides)
+            frame = pd.DataFrame([row], columns=SOURCE_TRANSACTION_COLUMNS)
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                self.db._validate_ticker_origin_matrix(frame)
+
+    def test_strict_report_outcomes_reject_partial_and_bad_paper(self):
+        parsed = self.reports(
+            (
+                "gen-1",
+                "senate",
+                "record",
+                "/record",
+                "Member",
+                date(2026, 8, 1),
+                "parsed",
+                "a" * 64,
+                "a" * 64,
+                None,
+                None,
+                None,
+                1,
+                1,
+                0,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "parsed reports require"):
+            self.db.replace_source_reports(
+                "gen-1",
+                "senate_efd",
+                "senate",
+                parsed.assign(raw_row_count=2, rejected_row_count=1),
+            )
+        paper = parsed.assign(
+            outcome="paper_only",
+            raw_row_count=0,
+            accepted_row_count=0,
+            artifact_sha256="b" * 64,
+            landing_sha256="b" * 64,
+            paper_artifact_sha256="c" * 64,
+            paper_artifact_url="https://evil.test/media/paper.pdf",
+        )
+        with self.assertRaisesRegex(ValueError, "official Senate paper URL"):
+            self.db.replace_source_reports("gen-1", "senate_efd", "senate", paper)
+        with self.assertRaisesRegex(ValueError, "must not set paper artifact fields"):
+            self.db.replace_source_reports(
+                "gen-1",
+                "senate_efd",
+                "senate",
+                parsed.assign(paper_artifact_sha256="c" * 64),
+            )
+
+    def test_initialization_drops_legacy_v3_unique_index(self):
+        self.db.conn.execute(
+            """
+            CREATE UNIQUE INDEX idx_tx_unique_v3 ON transactions (
+                doc_id, ticker, transaction_date, member, transaction_type,
+                amount_raw, owner_code, asset_description
+            )
+            """
+        )
+        self.db.close()
+        self.db = Database(self.db_path)
+        index_count = self.db.conn.execute(
+            """
+            SELECT COUNT(*) FROM duckdb_indexes()
+            WHERE index_name = 'idx_tx_unique_v3'
+            """
+        ).fetchone()[0]
+        self.assertEqual(index_count, 0)
+
     def test_unverified_ticker_candidate_is_not_canonical(self):
         reports = pd.DataFrame(
             [
                 {
                     "ingestion_generation": "gen-1",
                     "chamber": "senate",
-                    "source_record_id": "report-1",
-                    "report_path": "/reports/report-1",
+                    "source_record_id": "11111111-1111-4111-8111-111111111111",
+                    "report_path": "/search/view/ptr/11111111-1111-4111-8111-111111111111/",
                     "member": "Jane Doe",
                     "official_filing_date": date(2026, 7, 10),
                     "outcome": "parsed",
@@ -1402,7 +1636,7 @@ class TestSourceReports(DatabaseTestCase):
         ).fetchone()
         self.assertEqual(stored, (None, "BRK/B", "BRK.B"))
 
-        with self.assertRaisesRegex(ValueError, "must not set canonical ticker"):
+        with self.assertRaisesRegex(ValueError, "unverified ticker origin"):
             self.db.persist_source_refresh(
                 transactions=transactions.assign(ticker="BRK.B"),
                 reports=reports,

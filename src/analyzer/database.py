@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date
 from pathlib import Path
 
@@ -121,6 +122,7 @@ class Database:
         )
         self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique")
         self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique_v2")
+        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique_v3")
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_source_row_unique "
             "ON transactions(source, chamber, source_record_id, source_row_id, ingestion_generation)"
@@ -168,6 +170,7 @@ class Database:
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS source_reports (
                 ingestion_generation VARCHAR NOT NULL,
+                source VARCHAR NOT NULL,
                 chamber VARCHAR NOT NULL,
                 source_record_id VARCHAR NOT NULL,
                 report_path VARCHAR,
@@ -184,7 +187,9 @@ class Database:
                 raw_row_count INTEGER NOT NULL,
                 accepted_row_count INTEGER NOT NULL,
                 rejected_row_count INTEGER NOT NULL,
-                UNIQUE (ingestion_generation, chamber, source_record_id)
+                UNIQUE (
+                    ingestion_generation, source, chamber, source_record_id
+                )
             )
         """)
 
@@ -205,6 +210,7 @@ class Database:
             "chamber": "VARCHAR",
             "source_record_id": "VARCHAR",
             "source_row_id": "VARCHAR",
+            "source_report_path": "VARCHAR",
             "official_filing_date": "DATE",
             "available_date": "DATE",
             "notification_date": "DATE",
@@ -356,18 +362,21 @@ class Database:
     def replace_source_reports(
         self,
         generation: str,
+        source: str,
         chamber: str,
         reports_df: pd.DataFrame,
     ) -> None:
-        self.source_reports.replace_generation(generation, chamber, reports_df)
+        self.source_reports.replace_generation(generation, source, chamber, reports_df)
 
-    def get_source_reports(self, generation: str, chamber: str) -> pd.DataFrame:
-        return self.source_reports.get(generation, chamber)
+    def get_source_reports(
+        self, generation: str, source: str, chamber: str
+    ) -> pd.DataFrame:
+        return self.source_reports.get(generation, source, chamber)
 
     def get_source_report_reconciliation(
-        self, generation: str, chamber: str
+        self, generation: str, source: str, chamber: str
     ) -> dict[str, int]:
-        return self.source_reports.reconcile(generation, chamber)
+        return self.source_reports.reconcile(generation, source, chamber)
 
     def persist_source_refresh(
         self,
@@ -379,7 +388,9 @@ class Database:
         ingestion_generation: str,
     ) -> int:
         """Atomically replace a complete source refresh and its report inventory."""
-        self.source_reports.validate_replacement(ingestion_generation, chamber, reports)
+        self.source_reports.validate_replacement(
+            ingestion_generation, source, chamber, reports
+        )
         self._validate_source_refresh_transactions(
             transactions=transactions,
             reports=reports,
@@ -390,15 +401,16 @@ class Database:
 
         self.conn.execute("BEGIN TRANSACTION")
         try:
-            inserted = self.transactions.replace_source_generation(
+            inserted = self.transactions.replace_source_refresh(
                 transactions,
                 source=source,
                 chamber=chamber,
                 ingestion_generation=ingestion_generation,
                 _in_transaction=True,
             )
-            self.source_reports.replace_generation(
+            self.source_reports.replace_source_refresh(
                 ingestion_generation,
+                source,
                 chamber,
                 reports,
                 _in_transaction=True,
@@ -445,8 +457,11 @@ class Database:
         required_values = [
             "doc_id",
             "source_record_id",
+            "source_row_id",
+            "source_report_path",
             "member",
             "transaction_date",
+            "disclosure_date",
             "official_filing_date",
             "available_date",
             "transaction_type",
@@ -458,42 +473,24 @@ class Database:
         ]
         if transactions[required_values].isna().any().any():
             raise ValueError("source transaction provenance values are incomplete")
-        if (
-            transactions["source_record_id"]
-            .map(lambda value: not isinstance(value, str) or not value.strip())
-            .any()
-        ):
-            raise ValueError("source_record_id must be a non-empty string")
 
-        identified = transactions[transactions["source_row_id"].notna()]
-        if (
-            identified["source_row_id"]
-            .map(lambda value: not isinstance(value, str) or not value.strip())
-            .any()
-        ):
-            raise ValueError("non-null source_row_id values must be non-empty strings")
-        unverified = transactions["ticker_origin"].eq("unverified")
-        invalid_raw_ticker = transactions["raw_ticker"].map(
-            lambda value: not isinstance(value, str) or not value.strip()
-        )
-        invalid_ticker_candidate = transactions["ticker_candidate"].map(
-            lambda value: not isinstance(value, str) or not value.strip()
-        )
-        unverified_without_candidate = unverified & (
-            invalid_raw_ticker | invalid_ticker_candidate
-        )
-        if unverified_without_candidate.any():
-            raise ValueError(
-                "unverified ticker rows require raw_ticker and ticker_candidate"
+        for column in [
+            "source_record_id",
+            "source_row_id",
+            "source_report_path",
+            "member",
+        ]:
+            invalid = transactions[column].map(
+                lambda value: not isinstance(value, str) or not value.strip()
             )
-        if (unverified & transactions["ticker"].notna()).any():
-            raise ValueError("unverified ticker rows must not set canonical ticker")
+            if invalid.any():
+                raise ValueError(f"{column} must be a non-empty string")
 
-        duplicate_rows = identified.duplicated(
+        duplicate_rows = transactions.duplicated(
             subset=["source_record_id", "source_row_id"], keep=False
         )
         if duplicate_rows.any():
-            duplicates = identified.loc[
+            duplicates = transactions.loc[
                 duplicate_rows, ["source_record_id", "source_row_id"]
             ].drop_duplicates()
             rendered = [
@@ -505,6 +502,8 @@ class Database:
                 + ", ".join(rendered[:10])
             )
 
+        Database._validate_ticker_origin_matrix(transactions)
+
         report_index = reports.set_index("source_record_id")
         transaction_report_ids = set(transactions["source_record_id"])
         unknown_reports = transaction_report_ids - set(report_index.index)
@@ -514,24 +513,67 @@ class Database:
                 + ", ".join(sorted(str(value) for value in unknown_reports)[:10])
             )
 
-        for row in transactions[
-            ["source_record_id", "artifact_sha256", "official_filing_date"]
-        ].itertuples(index=False):
+        senate_path = re.compile(
+            r"^/search/view/ptr/"
+            r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/$"
+        )
+        if source == "senate_efd":
+            for report in reports.itertuples(index=False):
+                match = senate_path.fullmatch(str(report.report_path))
+                if match is None or match.group(1) != report.source_record_id:
+                    raise ValueError(
+                        "Senate report_path must be the canonical path for "
+                        f"source_record_id: {report.source_record_id}"
+                    )
+
+        binding_columns = [
+            "source_record_id",
+            "source_report_path",
+            "doc_id",
+            "member",
+            "artifact_sha256",
+            "official_filing_date",
+            "available_date",
+            "disclosure_date",
+        ]
+        for row in transactions[binding_columns].itertuples(index=False):
             report = report_index.loc[row.source_record_id]
-            if row.artifact_sha256 != report["artifact_sha256"]:
+            if row.source_report_path != report["report_path"]:
                 raise ValueError(
-                    "source transaction artifact hash does not match report inventory: "
+                    "source transaction report path does not match inventory: "
                     f"{row.source_record_id}"
                 )
-            transaction_date = pd.to_datetime(row.official_filing_date, errors="coerce")
+            if row.member != report["member"]:
+                raise ValueError(
+                    "source transaction member does not match report inventory: "
+                    f"{row.source_record_id}"
+                )
+            if source == "senate_efd" and row.doc_id != row.source_record_id:
+                raise ValueError(
+                    "Senate source transaction doc_id must equal source_record_id"
+                )
+            if row.artifact_sha256 != report["landing_sha256"]:
+                raise ValueError(
+                    "source transaction artifact hash does not match report landing hash: "
+                    f"{row.source_record_id}"
+                )
+
             report_date = pd.to_datetime(
                 report["official_filing_date"], errors="coerce"
             )
-            if pd.isna(transaction_date) or pd.isna(report_date):
-                raise ValueError("official_filing_date must be a valid date")
-            if transaction_date.date() != report_date.date():
+            bound_dates = [
+                pd.to_datetime(value, errors="coerce")
+                for value in (
+                    row.official_filing_date,
+                    row.available_date,
+                    row.disclosure_date,
+                )
+            ]
+            if pd.isna(report_date) or any(pd.isna(value) for value in bound_dates):
+                raise ValueError("report-bound dates must be valid dates")
+            if any(value.date() != report_date.date() for value in bound_dates):
                 raise ValueError(
-                    "source transaction filing date does not match report inventory: "
+                    "source transaction dates do not match report inventory: "
                     f"{row.source_record_id}"
                 )
 
@@ -549,6 +591,85 @@ class Database:
                     "transactions may only map to parsed report outcomes: "
                     f"{report.source_record_id}"
                 )
+
+    @staticmethod
+    def _validate_ticker_origin_matrix(transactions: pd.DataFrame) -> None:
+        valid_ticker = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,2})?$")
+        reserved = {
+            "COUPON",
+            "BOND",
+            "BONDS",
+            "NOTE",
+            "NOTES",
+            "STOCK",
+            "TICKER",
+        }
+        allowed_origins = {
+            "official",
+            "asset_description",
+            "unverified",
+            "non_equity",
+            "missing",
+            "invalid",
+        }
+
+        def is_null(value: object) -> bool:
+            return bool(pd.isna(value))
+
+        def is_valid(value: object) -> bool:
+            return isinstance(value, str) and valid_ticker.fullmatch(value) is not None
+
+        for row in transactions[
+            ["ticker", "ticker_candidate", "ticker_origin", "raw_ticker"]
+        ].itertuples(index=False):
+            ticker = row.ticker
+            candidate = row.ticker_candidate
+            origin = row.ticker_origin
+            if origin not in allowed_origins:
+                raise ValueError(f"unknown ticker_origin: {origin}")
+            if origin == "official":
+                if not is_valid(ticker) or not is_null(candidate):
+                    raise ValueError("official ticker origin has inconsistent values")
+                continue
+            if origin == "asset_description":
+                if not is_valid(ticker) or ticker in reserved or not is_null(candidate):
+                    raise ValueError(
+                        "asset_description ticker origin has inconsistent values"
+                    )
+                continue
+            if origin == "unverified":
+                if (
+                    not is_null(ticker)
+                    or not is_valid(candidate)
+                    or candidate in reserved
+                ):
+                    raise ValueError("unverified ticker origin has inconsistent values")
+                continue
+            if origin in {"non_equity", "missing"}:
+                if not is_null(ticker) or not is_null(candidate):
+                    raise ValueError(
+                        f"{origin} ticker origin must not set ticker values"
+                    )
+                continue
+
+            if not is_null(ticker):
+                raise ValueError("invalid ticker origin must not set canonical ticker")
+            if (
+                not is_null(candidate)
+                and is_valid(candidate)
+                and candidate not in reserved
+            ):
+                raise ValueError("invalid ticker origin has a valid ticker candidate")
+            if is_null(candidate):
+                raw_ticker = row.raw_ticker
+                if (
+                    not isinstance(raw_ticker, str)
+                    or not raw_ticker.strip()
+                    or (is_valid(raw_ticker) and raw_ticker not in reserved)
+                ):
+                    raise ValueError(
+                        "invalid ticker origin requires a rejected raw ticker"
+                    )
 
     # -- lifecycle ------------------------------------------------------------
 

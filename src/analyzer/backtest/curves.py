@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer._memo import df_memoize
+from analyzer.backtest.prices import _next_tradable_price_arrays
 from analyzer.models import TransactionType
 from analyzer.signals import _price_arrays
 
@@ -84,21 +85,10 @@ def _build_curves_for_rows(
 
     curves: list = []
     disclosures = rows["disclosure_date"].values
-    entry_prices_arr = rows["entry_price"].values
     tickers = rows["ticker"].values
-
-    horizon_ns = pd.Timedelta(days=horizon).value  # ns int
-
-    # Pre-compute all disclosure timestamps as int64 ns to avoid
-    # per-row pd.Timestamp() creation in the loop.
-    disc_ns_all = np.empty(len(rows), dtype=np.int64)
-    for i in range(len(rows)):
-        disc_ns_all[i] = pd.Timestamp(disclosures[i]).value
+    horizon_ns = pd.Timedelta(days=horizon).value
 
     for i in range(len(rows)):
-        entry_price = entry_prices_arr[i]
-        if pd.isna(entry_price) or entry_price <= 0:
-            continue
         tkr = tickers[i]
         if tkr not in price_cols:
             continue
@@ -113,14 +103,24 @@ def _build_curves_for_rows(
         if idx_ns is None:
             continue
 
-        disc_ns = disc_ns_all[i]
-        end_ns = disc_ns + horizon_ns
+        # Disclosure metadata has no publication timestamp. Historical curves
+        # are therefore entered on the first valid session strictly after the
+        # filing date, never at a pre-filing or same-close repository price.
+        entry = _next_tradable_price_arrays(
+            idx_ns, vals, pd.Timestamp(disclosures[i]), max_wait_days=7
+        )
+        if entry is None:
+            continue
 
-        lo = int(np.searchsorted(idx_ns, disc_ns, side="left"))
+        entry_ns = entry.date.value
+        end_ns = entry_ns + horizon_ns
+        lo = int(np.searchsorted(idx_ns, entry_ns, side="left"))
         hi = int(np.searchsorted(idx_ns, end_ns, side="right"))
         window = vals[lo:hi]
+        valid = np.isfinite(window) & (window > 0)
+        window = window[valid]
         if len(window) < 3:
             continue
-        curves.append(window / entry_price - 1.0)
+        curves.append(window / entry.price - 1.0)
 
     return curves

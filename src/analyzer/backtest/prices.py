@@ -9,10 +9,22 @@ repeated `_price_arrays` calls).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 
 from analyzer.signals import _price_arrays
+
+
+@dataclass(frozen=True, slots=True)
+class AlignedPrice:
+    """A positive finite market price aligned to a requested calendar date."""
+
+    price: float
+    date: pd.Timestamp
+    staleness_days: int
+
 
 NS_PER_DAY = 86_400_000_000_000
 
@@ -93,8 +105,77 @@ def _find_dip_entry_arrays(
     return 0.0, 0
 
 
+def _valid_price_at(vals, pos: int) -> float | None:
+    if pos < 0 or pos >= len(vals):
+        return None
+    price = float(vals[pos])
+    if not np.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
+def _aligned_price_at_or_before_arrays(
+    idx_ns, vals, target_date, max_staleness_days: int | None = None
+) -> AlignedPrice | None:
+    """Return the latest valid price at/before target with its real quote date."""
+    target = pd.Timestamp(target_date).normalize()
+    pos = int(np.searchsorted(idx_ns, target.value, side="right")) - 1
+    while pos >= 0:
+        price = _valid_price_at(vals, pos)
+        quote_date = pd.Timestamp(int(idx_ns[pos])).normalize()
+        staleness_days = int((target - quote_date).days)
+        if max_staleness_days is not None and staleness_days > max_staleness_days:
+            return None
+        if price is not None:
+            return AlignedPrice(price, quote_date, staleness_days)
+        pos -= 1
+    return None
+
+
+def _aligned_price_on_or_after_arrays(
+    idx_ns,
+    vals,
+    target_date,
+    *,
+    strictly_after: bool = False,
+    max_wait_days: int | None = None,
+) -> AlignedPrice | None:
+    """Return the first valid price on/after target and its execution date.
+
+    ``strictly_after=True`` models an order created from end-of-session inputs:
+    it cannot execute at the close used to create the signal and therefore waits
+    for the next tradable session.
+    """
+    target = pd.Timestamp(target_date).normalize()
+    threshold = target + pd.Timedelta(days=1) if strictly_after else target
+    pos = int(np.searchsorted(idx_ns, threshold.value, side="left"))
+    while pos < len(idx_ns):
+        quote_date = pd.Timestamp(int(idx_ns[pos])).normalize()
+        wait_days = int((quote_date - target).days)
+        if max_wait_days is not None and wait_days > max_wait_days:
+            return None
+        price = _valid_price_at(vals, pos)
+        if price is not None:
+            return AlignedPrice(price, quote_date, wait_days)
+        pos += 1
+    return None
+
+
+def _next_tradable_price_arrays(
+    idx_ns, vals, signal_date, max_wait_days: int | None = 7
+) -> AlignedPrice | None:
+    """Return the first valid session strictly after an end-of-day signal."""
+    return _aligned_price_on_or_after_arrays(
+        idx_ns,
+        vals,
+        signal_date,
+        strictly_after=True,
+        max_wait_days=max_wait_days,
+    )
+
+
 def _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=None):
-    """Price lookup using pre-extracted arrays."""
+    """Legacy scalar lookup; aligned execution callers use the strict helpers."""
     target = pd.Timestamp(target_date).value
     pos = int(np.searchsorted(idx_ns, target, side="right")) - 1
     if pos < 0:
@@ -107,7 +188,7 @@ def _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=Non
 
 
 def _price_before_arrays(idx_ns, vals, target_date, max_staleness_days=None):
-    """Return the latest price strictly before ``target_date``."""
+    """Legacy scalar lookup strictly before ``target_date``."""
     target = pd.Timestamp(target_date).value
     pos = int(np.searchsorted(idx_ns, target, side="left")) - 1
     if pos < 0:
@@ -120,7 +201,7 @@ def _price_before_arrays(idx_ns, vals, target_date, max_staleness_days=None):
 
 
 def _price_on_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=5):
-    """Price lookup using pre-extracted arrays."""
+    """Backward-compatible scalar on-or-before lookup."""
     return _price_at_or_before_arrays(
         idx_ns, vals, target_date, max_staleness_days=max_staleness_days
     )

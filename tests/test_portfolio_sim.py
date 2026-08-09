@@ -34,6 +34,7 @@ def _make_recs(tickers, as_of_date, scores=None):
             "ticker": tickers,
             "signal_score": scores,
             "num_buyers": [3] * len(tickers),
+            "sector": ["Technology"] * len(tickers),
             "as_of_date": pd.Timestamp(as_of_date),
         }
     )
@@ -52,7 +53,7 @@ class TestPositionEntry(unittest.TestCase):
         sim = PortfolioSimulator(cfg)
         prices = _make_prices(["A", "B", "C"], "2024-01-01", "2024-01-10")
         recs = _make_recs(["A", "B", "C"], "2024-01-01")
-        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 1))
+        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
         self.assertLessEqual(len(sim.positions), 2)
 
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
@@ -70,7 +71,7 @@ class TestPositionEntry(unittest.TestCase):
             ["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0}
         )
         recs = _make_recs(["A"], "2024-01-01")
-        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 1))
+        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
         self.assertEqual(len(sim.positions), 1)
         pos = sim.positions[0]
         max_value = cfg.initial_capital * cfg.max_position_pct
@@ -91,7 +92,9 @@ class TestSectorConstraint(unittest.TestCase):
 
         sector_map = {"A": "Tech", "B": "Tech", "C": "Tech", "D": "Finance"}
         with patch.object(
-            sim, "_get_sector", side_effect=lambda t: sector_map.get(t, "Unknown")
+            sim,
+            "_get_sector",
+            side_effect=lambda t, rec=None: sector_map.get(t, "Unknown"),
         ):
             prices = _make_prices(
                 ["A", "B", "C", "D"],
@@ -102,7 +105,7 @@ class TestSectorConstraint(unittest.TestCase):
             recs = _make_recs(
                 ["A", "B", "C", "D"], "2024-01-01", scores=[40, 30, 20, 10]
             )
-            sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 1))
+            sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
 
         # At least one tech should be excluded due to sector cap
         tech_count = sum(1 for p in sim.positions if p.sector == "Tech")
@@ -153,7 +156,7 @@ class TestCashFlows(unittest.TestCase):
             ["A"], "2024-01-01", "2024-01-10", base_prices={"A": 100.0}
         )
         recs = _make_recs(["A"], "2024-01-01")
-        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 1))
+        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
         self.assertLess(sim.cash, initial_cash)
 
     @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
@@ -201,12 +204,12 @@ class TestSlippage(unittest.TestCase):
 
         sim_no = PortfolioSimulator(cfg_no_slip)
         sim_no.run(
-            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 1)
+            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 2)
         )
 
         sim_slip = PortfolioSimulator(cfg_slip)
         sim_slip.run(
-            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 1)
+            _make_recs(["A"], "2024-01-01"), prices, date(2024, 1, 1), date(2024, 1, 2)
         )
 
         self.assertEqual(len(sim_no.positions), 1)
@@ -347,6 +350,121 @@ class TestDrawdownFromInitialCapital(unittest.TestCase):
         # post-entry equity; anchoring to initial capital captures the first
         # snapshot drawdown caused by entry slippage.
         self.assertAlmostEqual(metrics["max_drawdown_pct"], -0.24, places=2)
+
+
+class TestCausalExecutionScenarios(unittest.TestCase):
+    def test_weekend_signal_executes_monday_not_friday(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 120.0]},
+            index=pd.to_datetime(["2024-01-05", "2024-01-08"]),
+        )
+        recs = _make_recs(["A"], "2024-01-07")
+        sim = PortfolioSimulator(cfg)
+        sim.run(recs, prices, date(2024, 1, 7), date(2024, 1, 8))
+        self.assertEqual(sim.positions[0].entry_date, date(2024, 1, 8))
+        self.assertEqual(sim.positions[0].entry_price, 120.0)
+
+    def test_stale_or_missing_next_session_is_rejected(self):
+        cfg = PortfolioConfig(max_execution_wait_days=3)
+        prices = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-05"]))
+        sim = PortfolioSimulator(cfg)
+        sim.run(
+            _make_recs(["A"], "2024-01-07"),
+            prices,
+            date(2024, 1, 7),
+            date(2024, 1, 10),
+        )
+        self.assertFalse(sim.positions)
+        self.assertEqual(sim.rejected_orders[0]["reason"], "no_next_tradable_session")
+
+    def test_hand_ledger_shared_cash_and_gross_turnover(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+            hold_period_days=2,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
+        )
+        prices = pd.DataFrame(
+            {"A": [110.0, 120.0, 130.0]},
+            index=pd.to_datetime(["2024-01-08", "2024-01-09", "2024-01-10"]),
+        )
+        sim = PortfolioSimulator(cfg)
+        sim.run(
+            _make_recs(["A"], "2024-01-07"),
+            prices,
+            date(2024, 1, 7),
+            date(2024, 1, 10),
+        )
+        self.assertEqual(sim.closed_positions[0]["shares"], 9)
+        self.assertEqual(sim.cash, 1180.0)
+        self.assertEqual(sim.gross_traded_notional, 2160.0)
+        metrics = sim.compute_metrics(prices)
+        self.assertEqual(metrics["open_dollar_exposure"], 0.0)
+        self.assertEqual(metrics["open_positions"], [])
+        self.assertEqual(metrics["gross_traded_notional"], 2160.0)
+
+    def test_open_ledger_marks_liquidation_cost(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+            hold_period_days=30,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.10,
+        )
+        prices = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-02"]))
+        sim = PortfolioSimulator(cfg)
+        sim.run(
+            _make_recs(["A"], "2024-01-01"),
+            prices,
+            date(2024, 1, 1),
+            date(2024, 1, 2),
+        )
+        metrics = sim.compute_metrics(prices)
+        self.assertEqual(metrics["open_dollar_exposure"], 900.0)
+        self.assertEqual(metrics["open_positions"][0]["liquidation_value"], 900.0)
+        self.assertEqual(metrics["total_return_pct"], -10.0)
+
+    def test_missing_stored_sector_fails_loudly(self):
+        cfg = PortfolioConfig()
+        prices = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-02"]))
+        recs = _make_recs(["A"], "2024-01-01").drop(columns=["sector"])
+        with self.assertRaisesRegex(ValueError, "Missing stored sector"):
+            PortfolioSimulator(cfg).run(
+                recs, prices, date(2024, 1, 1), date(2024, 1, 2)
+            )
+
+    def test_recommendations_off_rebalance_cadence_are_not_traded(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=2,
+            max_position_pct=0.5,
+            max_sector_pct=1.0,
+            rebalance_freq_days=2,
+        )
+        recs = pd.concat(
+            [_make_recs(["A"], "2024-01-01"), _make_recs(["B"], "2024-01-02")],
+            ignore_index=True,
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 100.0], "B": [100.0, 100.0]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        )
+        sim = PortfolioSimulator(cfg)
+        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 3))
+        self.assertEqual([p.ticker for p in sim.positions], ["A"])
 
 
 if __name__ == "__main__":

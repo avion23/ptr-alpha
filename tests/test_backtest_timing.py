@@ -5,10 +5,16 @@ import numpy as np
 import pandas as pd
 
 from analyzer.analysis import calculate_signal_potential, evaluate_backtest
+from analyzer.backtest.curves import _build_curves_for_rows
 from analyzer.backtest.filters import _filter_ticker_perf, _filter_training
+from analyzer.backtest.prices import (
+    _aligned_price_at_or_before_arrays,
+    _next_tradable_price_arrays,
+)
 from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
 from analyzer.pipeline import _entry_prices_from_matrix
 from analyzer.price_source import _validate_and_log_prices
+from analyzer.signals import _price_arrays
 
 
 class TestBacktestTiming(unittest.TestCase):
@@ -501,3 +507,54 @@ class TestBacktestTiming(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAlignedPriceHelpers(unittest.TestCase):
+    def test_next_session_returns_execution_date_and_wait(self):
+        prices = pd.DataFrame(
+            {"A": [100.0, 120.0]},
+            index=pd.to_datetime(["2025-01-03", "2025-01-06"]),
+        )
+        idx_ns, vals = _price_arrays(prices, "A")
+        execution = _next_tradable_price_arrays(
+            idx_ns, vals, pd.Timestamp("2025-01-05"), max_wait_days=3
+        )
+        self.assertEqual(execution.price, 120.0)
+        self.assertEqual(execution.date, pd.Timestamp("2025-01-06"))
+        self.assertEqual(execution.staleness_days, 1)
+
+    def test_aligned_prior_rejects_stale_and_nonpositive(self):
+        prices = pd.DataFrame(
+            {"A": [100.0, 0.0]},
+            index=pd.to_datetime(["2025-01-01", "2025-01-03"]),
+        )
+        idx_ns, vals = _price_arrays(prices, "A")
+        self.assertIsNone(
+            _aligned_price_at_or_before_arrays(
+                idx_ns, vals, pd.Timestamp("2025-01-10"), max_staleness_days=5
+            )
+        )
+        aligned = _aligned_price_at_or_before_arrays(
+            idx_ns, vals, pd.Timestamp("2025-01-03"), max_staleness_days=3
+        )
+        self.assertEqual(aligned.price, 100.0)
+        self.assertEqual(aligned.date, pd.Timestamp("2025-01-01"))
+        self.assertEqual(aligned.staleness_days, 2)
+
+    def test_ou_curve_enters_after_weekend_disclosure(self):
+        rows = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "entry_price": [100.0],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 120.0, 132.0, 144.0]},
+            index=pd.to_datetime(
+                ["2025-01-03", "2025-01-06", "2025-01-07", "2025-01-08"]
+            ),
+        )
+        curves = _build_curves_for_rows(rows, prices, horizon=3)
+        self.assertEqual(len(curves), 1)
+        np.testing.assert_allclose(curves[0], [0.0, 0.1, 0.2])

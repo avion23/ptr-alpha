@@ -510,59 +510,69 @@ class TestEvaluateBacktest(unittest.TestCase):
 
 
 class TestSummarizeBacktest(unittest.TestCase):
-    def test_groups_by_rank(self):
-        # Bug 4: summary now includes SPY_BH baseline row in addition to
-        # per-rank rows and ALL. len == 4 (rank1, rank2, ALL, SPY_BH).
+    def test_equal_funds_once_per_rebalance_date(self):
         results = pd.DataFrame(
             {
-                "rank": [1, 1, 2, 2],
-                "bt_return_pct": [10.0, -5.0, 20.0, 15.0],
-                "bt_alpha_pct": [5.0, -8.0, 15.0, 10.0],
-                "bt_spy_return_pct": [3.0, 1.0, 4.0, 2.0],
+                "as_of_date": ["2025-01-01", "2025-01-02", "2025-01-02"],
+                "rank": [1, 1, 2],
+                "bt_return_pct": [0.0, 10.0, 20.0],
+                "bt_alpha_pct": [0.0, 5.0, 15.0],
+                "bt_horizon_days": [20, 30, 30],
             }
         )
         summary = summarize_backtest(results)
-        self.assertEqual(len(summary), 4)  # rank1, rank2, ALL, SPY_BH
-        rank1 = summary[summary["rank"] == 1].iloc[0]
-        rank2 = summary[summary["rank"] == 2].iloc[0]
-        self.assertEqual(rank1["count"], 2)
-        self.assertEqual(rank1["win_rate_pct"], 50.0)
-        self.assertAlmostEqual(rank1["avg_return_pct"], 2.5)
-        self.assertEqual(rank2["count"], 2)
-        self.assertEqual(rank2["win_rate_pct"], 100.0)
+        portfolio = summary[summary["rank"] == "PORTFOLIO"].iloc[0]
+        self.assertEqual(portfolio["count"], 2)
+        self.assertEqual(portfolio["recommendation_count"], 3)
+        self.assertEqual(portfolio["avg_return_pct"], 7.5)
+        self.assertEqual(portfolio["avg_alpha_pct"], 5.0)
+        self.assertEqual(portfolio["holding_policy"], "adaptive_20-30d")
 
-    def test_includes_overall_row(self):
+    def test_real_spy_buy_hold_uses_one_start_and_end_trade(self):
         results = pd.DataFrame(
             {
-                "rank": [1, 2],
-                "bt_return_pct": [10.0, -5.0],
-                "bt_alpha_pct": [5.0, -8.0],
+                "as_of_date": ["2025-01-01", "2025-01-02", "2025-01-02"],
+                "bt_exit_date": ["2025-01-03"] * 3,
+                "bt_return_pct": [0.0, 10.0, 20.0],
+                "bt_alpha_pct": [0.0, 5.0, 15.0],
+            }
+        )
+        spy = pd.Series(
+            [100.0, 110.0, 120.0],
+            index=pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03"]),
+        )
+        summary = summarize_backtest(
+            results, spy, entry_slippage_bps=0, exit_slippage_bps=0
+        )
+        spy_row = summary[summary["rank"] == "SPY_BUY_HOLD"].iloc[0]
+        self.assertEqual(spy_row["count"], 1)
+        self.assertEqual(spy_row["avg_return_pct"], 20.0)
+
+    def test_repeated_spy_windows_are_not_called_buy_hold(self):
+        results = pd.DataFrame(
+            {
+                "as_of_date": ["A", "B", "B", "B", "B", "B"],
+                "bt_return_pct": [0.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+                "bt_alpha_pct": [0.0] * 6,
+                "bt_spy_return_pct": [0.0, 10.0, 10.0, 10.0, 10.0, 10.0],
             }
         )
         summary = summarize_backtest(results)
-        overall = summary[summary["rank"] == "ALL"].iloc[0]
-        self.assertEqual(overall["count"], 2)
-        self.assertEqual(overall["win_rate_pct"], 50.0)
-        self.assertAlmostEqual(overall["avg_return_pct"], 2.5)
+        self.assertNotIn("SPY_BUY_HOLD", summary["rank"].values)
+        portfolio = summary.iloc[0]
+        self.assertEqual(portfolio["avg_return_pct"], 5.0)
 
     def test_empty_results_returns_empty(self):
-        results = pd.DataFrame({"rank": [], "bt_return_pct": [], "bt_alpha_pct": []})
-        summary = summarize_backtest(results)
-        self.assertTrue(summary.empty)
+        results = pd.DataFrame({"bt_return_pct": [], "bt_alpha_pct": []})
+        self.assertTrue(summarize_backtest(results).empty)
 
     def test_all_nan_returns_dropped(self):
-        # Bug 4: summary now includes SPY_BH baseline, so len == 3 (rank1, ALL, SPY_BH).
         results = pd.DataFrame(
-            {
-                "rank": [1, 2],
-                "bt_return_pct": [10.0, None],
-                "bt_alpha_pct": [5.0, None],
-                "bt_spy_return_pct": [3.0, None],
-            }
+            {"bt_return_pct": [10.0, None], "bt_alpha_pct": [5.0, None]}
         )
         summary = summarize_backtest(results)
-        self.assertEqual(len(summary), 3)  # rank1, ALL, SPY_BH (rank2 dropped as NaN)
-        self.assertEqual(summary[summary["rank"] == 1].iloc[0]["count"], 1)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary.iloc[0]["count"], 1)
 
 
 class TestBacktestCorrectnessRegressions(unittest.TestCase):
@@ -797,29 +807,17 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
 
     # ---- Bug 4: SPY baseline in summary, coverage counts
 
-    def test_summary_includes_spy_baseline_row(self):
-        """Bug 4: summarize_backtest must include a SPY_BH baseline row so
-        callers can compare strategy returns against buy-and-hold SPY."""
+    def test_summary_requires_real_prices_for_spy_buy_hold(self):
         results = pd.DataFrame(
             {
-                "rank": [1, 1, 2],
+                "as_of_date": ["2025-01-01", "2025-01-02", "2025-01-02"],
                 "bt_return_pct": [10.0, -5.0, 20.0],
                 "bt_alpha_pct": [5.0, -8.0, 15.0],
                 "bt_spy_return_pct": [4.0, 2.0, 3.0],
             }
         )
         summary = summarize_backtest(results)
-        self.assertIn(
-            "SPY_BH", summary["rank"].values, "SPY_BH baseline row must be present"
-        )
-        spy_row = summary[summary["rank"] == "SPY_BH"].iloc[0]
-        self.assertEqual(spy_row["count"], 3)
-        # All three SPY returns are positive → win_rate = 100 %
-        self.assertEqual(spy_row["win_rate_pct"], 100.0)
-        self.assertAlmostEqual(
-            spy_row["avg_return_pct"], (4.0 + 2.0 + 3.0) / 3, places=2
-        )
-        self.assertEqual(spy_row["avg_alpha_pct"], 0.0)  # SPY vs itself is zero
+        self.assertNotIn("SPY_BUY_HOLD", summary["rank"].values)
 
     def test_summary_propagates_coverage_counts_from_attrs(self):
         """Bug 4: summarize_backtest must propagate n_no_price and n_delisted

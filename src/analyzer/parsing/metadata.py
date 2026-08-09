@@ -148,6 +148,7 @@ def consolidate_transactions(
                     "strike_price": tx.get("strike_price"),
                     "expiry_date": tx.get("expiry_date"),
                     "asset_description": tx.get("asset_description"),
+                    "source_row_id": tx.get("source_row_id"),
                 }
             )
 

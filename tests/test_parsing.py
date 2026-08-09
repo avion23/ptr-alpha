@@ -69,6 +69,25 @@ class TestParsing(unittest.TestCase):
             "Accenture plc Class A Ordinary Shares (ACN) [ST]",
         )
 
+    def test_reparse_rejects_prior_2026_emitted_persisted_loss(self):
+        import os
+
+        previous = os.environ.get("PTR_SKIP_DOCLING")
+        try:
+            from scripts.reparse_all import _verify_persisted_counts
+        finally:
+            if previous is None:
+                os.environ.pop("PTR_SKIP_DOCLING", None)
+            else:
+                os.environ["PTR_SKIP_DOCLING"] = previous
+
+        with self.assertRaisesRegex(RuntimeError, "corpus=2698/2632"):
+            _verify_persisted_counts(
+                2026,
+                {"corpus": 2698},
+                {"corpus": 2632},
+            )
+
     def test_clean_text_basic(self):
         self.assertEqual(clean_text("  hello   world  "), "hello world")
         self.assertEqual(clean_text(None), "")
@@ -287,6 +306,7 @@ class TestParsing(unittest.TestCase):
                     "amount_raw": "$1,001 - $15,000",
                     "amount_midpoint": 8000.5,
                     "asset_description": "Packaging Corporation of America (PKG)",
+                    "source_row_id": "pdfplumber:p1:l23",
                 }
             ]
         }
@@ -307,6 +327,7 @@ class TestParsing(unittest.TestCase):
             df.iloc[0]["asset_description"],
             "Packaging Corporation of America (PKG)",
         )
+        self.assertEqual(df.iloc[0]["source_row_id"], "pdfplumber:p1:l23")
 
     def test_consolidate_transactions_empty(self):
         df = consolidate_transactions({}, {})

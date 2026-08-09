@@ -70,7 +70,6 @@ _TX_NO_OWNER = re.compile(
 )
 
 _TX_CODE_INLINE = re.compile(r"\b(?:S|P|E)(?:\s*\(partial\))?\b")
-_TICKER_PARENS = re.compile(r"\([A-Za-z][A-Za-z0-9.\-]{0,5}\)")
 _OWNER_TX_HEAD = re.compile(r"^[A-Z]{1,4}\s+\S")
 _OWNER_PREFIX = re.compile(r"^[A-Z]{1,4}\s+\S")
 _AMOUNT_CONTINUATION = re.compile(r"\$[\d,]+\s*$")
@@ -88,12 +87,19 @@ def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
         return []
 
     lines = text.split("\n")
-    transactions = _parse_pdftotext_lines(lines)
+    transactions = _parse_pdftotext_lines(lines, source_prefix="pdftotext")
     if not transactions:
         return []
 
     table = [
-        ["Asset Name", "Owner", "Transaction Type", "Transaction Date", "Amount"]
+        [
+            "Asset Name",
+            "Owner",
+            "Transaction Type",
+            "Transaction Date",
+            "Amount",
+            "Source Row ID",
+        ]
     ] + transactions
     return [table]
 
@@ -120,7 +126,9 @@ def _run_pdftotext(pdf_path: Path) -> str | None:
     return result.stdout
 
 
-def _parse_pdftotext_lines(lines: list[str]) -> list[list[str]]:
+def _parse_pdftotext_lines(
+    lines: list[str], *, source_prefix: str | None = None
+) -> list[list[str]]:
     transactions: list[list[str]] = []
     i = 0
     while i < len(lines):
@@ -132,14 +140,20 @@ def _parse_pdftotext_lines(lines: list[str]) -> list[list[str]]:
         matched = _try_match_with_owner(line, i, lines)
         if matched is not None:
             asset, owner, tx_type, tx_date, amount, j = matched
-            transactions.append([asset, owner, tx_type, tx_date, amount])
+            row = [asset, owner, tx_type, tx_date, amount]
+            if source_prefix is not None:
+                row.append(f"{source_prefix}:l{i}")
+            transactions.append(row)
             i = j
             continue
 
         matched = _try_match_no_owner(line, i, lines)
         if matched is not None:
             asset, owner, tx_type, tx_date, amount, j = matched
-            transactions.append([asset, owner, tx_type, tx_date, amount])
+            row = [asset, owner, tx_type, tx_date, amount]
+            if source_prefix is not None:
+                row.append(f"{source_prefix}:l{i}")
+            transactions.append(row)
             i = j
             continue
 
@@ -239,17 +253,27 @@ def _collect_asset_continuation(
         next_line = lines[j].strip()
         if not next_line:
             break
-        if _is_new_tx_header(next_line):
+        if _TX_WITH_OWNER.match(lines[j]) or _TX_NO_OWNER.match(lines[j]):
             break
-        if re.match(r"^\[", next_line) or re.match(r"^\d", next_line):
-            asset += " " + next_line
-            j += 1
-        elif _TICKER_PARENS.search(next_line):
-            asset += " " + next_line
-            j += 1
-        else:
+        if _is_new_tx_header(next_line) or _is_transaction_detail(next_line):
             break
+        if _AMOUNT_CONTINUATION.fullmatch(next_line):
+            break
+        asset += " " + next_line
+        j += 1
     return asset, j
+
+
+def _is_transaction_detail(line: str) -> bool:
+    if _is_skip_line(line):
+        return True
+    return bool(
+        re.match(
+            r"^(?:F\s+S|S\s+O|D|L|SOURCE OF|SUBHOLDING OF)\s*:",
+            line,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _is_new_tx_header(next_line: str) -> bool:

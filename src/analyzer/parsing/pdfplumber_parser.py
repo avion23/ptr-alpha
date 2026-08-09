@@ -36,16 +36,26 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
     layout_rows: list[list[str]] = []
     try:
         with pdfplumber.open(str(pdf_path)) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text(layout=True) or ""
-                layout_rows.extend(_parse_pdftotext_lines(page_text.splitlines()))
+            for page_number, page in enumerate(pdf.pages, start=1):
+                page_text = (page.extract_text(layout=True) or "").replace("\x00", "")
+                layout_rows.extend(
+                    _parse_pdftotext_lines(
+                        page_text.splitlines(),
+                        source_prefix=f"pdfplumber:p{page_number}",
+                    )
+                )
 
                 # page.extract_tables() returns list[list[list[str|None]]]
                 page_tables = page.extract_tables()
-                for tbl in page_tables:
+                for table_number, tbl in enumerate(page_tables):
                     cleaned = _clean_table(tbl)
                     if cleaned is not None:
-                        tables_out.append(cleaned)
+                        tables_out.append(
+                            _attach_source_row_ids(
+                                cleaned,
+                                f"pdfplumber:p{page_number}:t{table_number}",
+                            )
+                        )
     except Exception as e:
         logger.debug(f"pdfplumber failed for {pdf_path}: {e}")
         return []
@@ -53,7 +63,16 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
     table_row_count = sum(len(parse_pdf_table(table)) for table in tables_out)
     if layout_rows and len(layout_rows) >= table_row_count:
         return [
-            [["Asset Name", "Owner", "Transaction Type", "Transaction Date", "Amount"]]
+            [
+                [
+                    "Asset Name",
+                    "Owner",
+                    "Transaction Type",
+                    "Transaction Date",
+                    "Amount",
+                    "Source Row ID",
+                ]
+            ]
             + layout_rows
         ]
     return tables_out
@@ -74,6 +93,23 @@ def _clean_table(tbl: list[list[str | None]]) -> list[list[str]] | None:
     if len(cleaned) < 2:
         return None
     return _expand_flattened_transaction_rows(cleaned)
+
+
+def _attach_source_row_ids(
+    table: list[list[str]], source_prefix: str
+) -> list[list[str]]:
+    header_idx = _find_header_row(table)
+    if header_idx is None:
+        return table
+    return [
+        row
+        + [
+            "Source Row ID"
+            if row_index == header_idx
+            else f"{source_prefix}:r{row_index}"
+        ]
+        for row_index, row in enumerate(table)
+    ]
 
 
 def _expand_flattened_transaction_rows(table: list[list[str]]) -> list[list[str]]:

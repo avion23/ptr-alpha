@@ -110,6 +110,8 @@ def _build_row_dict(
         "strike_price": option_details.get("strike_price"),
         "expiry_date": option_details.get("expiry_date"),
         "asset_description": clean_text(asset_cell)[:500] if asset_cell else None,
+        "source_row_id": clean_text(_get_cell(row, indexes.get("source_row_id")))
+        or None,
     }
 
 
@@ -126,10 +128,21 @@ def parse_pdf_table(table: list) -> list[dict]:
     # Pass next row for 2-row header detection
     next_header_row = table[header_idx + 1] if header_idx + 1 < len(table) else None
     indexes = _column_indexes(table[header_idx], next_header_row)
+    indexes["source_row_id"] = _source_row_id_index(table[header_idx])
 
     data_start = _data_start_offset(table, header_idx, next_header_row)
     data_rows = table[data_start:]
     return _extract_transactions(data_rows, indexes)
+
+
+def _source_row_id_index(header: list) -> int | None:
+    for index, cell in enumerate(header):
+        normalized = "".join(
+            character for character in clean_text(cell).lower() if character.isalnum()
+        )
+        if normalized == "sourcerowid":
+            return index
+    return None
 
 
 def _data_start_offset(

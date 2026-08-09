@@ -187,7 +187,7 @@ def _check_data_freshness(app_ctx: AppContext) -> None:
     """Warn if transaction data looks stale."""
     try:
         _max_date = app_ctx.transaction_source.db.conn.execute(
-            "SELECT MAX(disclosure_date) FROM transactions"
+            "SELECT MAX(disclosure_date) FROM canonical_transactions"
         ).fetchone()[0]
         if _max_date:
             _age = (date.today() - _max_date).days
@@ -1091,7 +1091,10 @@ def refresh(
             f"({excluded_years[0]}-{excluded_years[-1]}), PDF inventory unavailable"
         )
 
-    count_before = app_ctx.transaction_source.db.conn.execute(
+    canonical_count_before = app_ctx.transaction_source.db.conn.execute(
+        "SELECT COUNT(*) FROM canonical_transactions"
+    ).fetchone()[0]
+    raw_count_before = app_ctx.transaction_source.db.conn.execute(
         "SELECT COUNT(*) FROM transactions"
     ).fetchone()[0]
     failed_steps: list[str] = []
@@ -1207,7 +1210,10 @@ def refresh(
             f"{len(unresolved)} unresolved PDFs ({preview})"
         )
 
-    count_after = app_ctx.transaction_source.db.conn.execute(
+    canonical_count_after = app_ctx.transaction_source.db.conn.execute(
+        "SELECT COUNT(*) FROM canonical_transactions"
+    ).fetchone()[0]
+    raw_count_after = app_ctx.transaction_source.db.conn.execute(
         "SELECT COUNT(*) FROM transactions"
     ).fetchone()[0]
     summary_year = archive_years[-1]
@@ -1220,18 +1226,22 @@ def refresh(
                 ),
                 MAX(disclosure_date),
                 COUNT(*) FILTER (WHERE transaction_date > disclosure_date)
-            FROM transactions
+            FROM canonical_transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
             """,
             [summary_year],
         ).fetchone()
     )
 
-    added = count_after - count_before
+    canonical_added = canonical_count_after - canonical_count_before
+    raw_added = raw_count_after - raw_count_before
     outcome = "Incomplete." if failed_steps else "Done."
     print(
-        f"\n{outcome} {count_before} -> {count_after} transactions "
-        f"({'+' if added >= 0 else ''}{added} new)"
+        f"\n{outcome} canonical {canonical_count_before} -> "
+        f"{canonical_count_after} transactions "
+        f"({'+' if canonical_added >= 0 else ''}{canonical_added}); "
+        f"raw {raw_count_before} -> {raw_count_after} "
+        f"({'+' if raw_added >= 0 else ''}{raw_added})"
     )
     print(f"Latest transaction date: {max_date} (eligible: not after disclosure)")
     print(f"Latest disclosure date: {max_disclosure_date}")

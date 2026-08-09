@@ -353,6 +353,7 @@ def test_removed_house_rows_remain_until_new_generation_activates(tmp_path):
             raw_row_count=0,
             transaction_count=0,
             artifact_sha256=current_sha,
+            ingestion_generation=db.get_latest_house_generation(2021),
         )
         db.mark_house_generation_parse_complete(2021)
         assert db.count_transactions_for_docs(["removed"]) == {}

@@ -303,7 +303,7 @@ class PriceRepository:
             ),
             resolved_tickers AS (
                 SELECT t.*, COALESCE(tm.resolved, t.ticker) AS resolved_ticker
-                FROM transactions t
+                FROM canonical_transactions t
                 LEFT JOIN ticker_map tm ON t.ticker = tm.raw
             )
             SELECT r.member, r.ticker, r.disclosure_date, r.transaction_type,

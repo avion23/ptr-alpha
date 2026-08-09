@@ -3,12 +3,13 @@
 import unittest
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 from typer.testing import CliRunner
 
-from analyzer.cli import _load_sector_map, app
+from analyzer.cli import _check_data_freshness, _load_sector_map, app
 from analyzer.exceptions import StepResult
 
 
@@ -133,7 +134,13 @@ class TestCliApp(unittest.TestCase):
     def test_official_refresh_never_constructs_capitol_source(self):
         mock_ctx = MagicMock()
         fetchone = mock_ctx.transaction_source.db.conn.execute.return_value.fetchone
-        fetchone.side_effect = [(10,), (10,), (date(2026, 8, 1), date(2026, 8, 2), 0)]
+        fetchone.side_effect = [
+            (10,),
+            (10,),
+            (10,),
+            (10,),
+            (date(2026, 8, 1), date(2026, 8, 2), 0),
+        ]
         mock_ctx.transaction_source.fetch_and_cache_pdfs.return_value = MagicMock(
             archive_year=2026,
             metadata_count=10,
@@ -142,6 +149,14 @@ class TestCliApp(unittest.TestCase):
             downloaded_count=0,
             skipped_count=10,
             orphan_pdf_count=0,
+            removed_doc_count=0,
+            quarantined_pdf_count=0,
+            generation_id="generation-2026",
+            generation_status="acquired",
+        )
+        mock_ctx.transaction_source.db.get_unresolved_house_doc_ids.return_value = []
+        mock_ctx.transaction_source.db.get_latest_house_generation.return_value = (
+            "generation-2026"
         )
         with (
             patch("analyzer.cli.get_context", return_value=mock_ctx),
@@ -277,3 +292,34 @@ class TestAnalyzeParamsMapping(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def test_data_freshness_reads_only_canonical_scope(capsys):
+    connection = MagicMock()
+    connection.execute.return_value.fetchone.return_value = (date.today(),)
+    context = SimpleNamespace(
+        transaction_source=SimpleNamespace(
+            db=SimpleNamespace(conn=connection)
+        )
+    )
+
+    _check_data_freshness(context)
+
+    query = connection.execute.call_args.args[0]
+    assert "canonical_transactions" in query
+    assert "WARNING" not in capsys.readouterr().err
+
+
+
+def test_reconcile_blotter_reads_only_canonical_scope(monkeypatch):
+    from scripts import reconcile_blotter
+
+    connection = MagicMock()
+    connection.execute.return_value.fetchall.return_value = []
+    monkeypatch.setattr(reconcile_blotter.duckdb, "connect", lambda *a, **k: connection)
+
+    assert reconcile_blotter.get_congressional("AAPL") == []
+    query = connection.execute.call_args.args[0]
+    assert "canonical_transactions" in query
+    connection.close.assert_called_once()

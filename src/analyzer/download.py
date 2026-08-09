@@ -527,6 +527,11 @@ class HouseTransactionSource(TransactionSource):
             raise DataSourceError(f"No PDF files found in {pdf_dir}")
 
         if not force:
+            ingestion_generation = self.db.get_latest_house_generation(year)
+            if ingestion_generation is None:
+                raise DataSourceError(
+                    f"No acquired House generation exists for archive {year}"
+                )
             artifact_hashes = {
                 path.stem: sha256
                 for path in pdf_paths
@@ -536,6 +541,7 @@ class HouseTransactionSource(TransactionSource):
                 year=year,
                 parser_version=_PARSE_VERSION,
                 artifact_hashes=artifact_hashes,
+                ingestion_generation=ingestion_generation,
             )
             if cached:
                 keep_mask = (
@@ -616,6 +622,7 @@ class HouseTransactionSource(TransactionSource):
                 # the actual persisted count inside the replacement transaction.
                 transaction_count=0,
                 artifact_sha256=artifact_hashes.get(doc_id),
+                ingestion_generation=ingestion_generation,
             )
             for doc_id, engines_attempted in parse_attempts
         ]
@@ -653,11 +660,12 @@ class HouseTransactionSource(TransactionSource):
         )
         logger.info(
             "Persisted %d transactions across %d parsed PDFs "
-            "(%d zero-row results; %d total database rows)",
+            "(%d zero-row results; canonical=%d raw=%d database rows)",
             sum(persisted.by_doc_total.values()),
             len(parse_attempts),
             len(zero_row_doc_ids),
             persisted.total_current_rows,
+            persisted.total_raw_rows,
         )
         logger.debug("Persisted rows by doc/source: %s", persisted.by_doc_source)
 

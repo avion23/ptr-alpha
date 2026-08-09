@@ -550,9 +550,31 @@ class TestTransactions(DatabaseTestCase):
             pd.DataFrame([{**base, "ticker": "NEW", "ingestion_generation": "g2"}]),
             source="house_pdf",
         )
+        self.db.upsert_transactions(
+            pd.DataFrame(
+                [{
+                    **base,
+                    "ticker": "UNTRACKED",
+                    "ingestion_generation": "legacy-untracked-2024",
+                }]
+            ),
+            source="house_pdf",
+        )
 
+        self.db.upsert_prices(
+            pd.DataFrame(
+                {"OLD": [10.0], "NEW": [20.0]},
+                index=pd.to_datetime(["2024-01-03"]),
+            )
+        )
         self.assertEqual(
             self.db.get_transactions_for_doc("generation-doc")["ticker"].tolist(),
+            ["OLD"],
+        )
+        self.assertEqual(
+            self.db.get_entry_prices(
+                ["OLD", "NEW"], date(2024, 1, 1), date(2024, 1, 10)
+            )["ticker"].tolist(),
             ["OLD"],
         )
         self.db.mark_house_generation_parse_complete(2024)
@@ -560,6 +582,96 @@ class TestTransactions(DatabaseTestCase):
             self.db.get_transactions_for_doc("generation-doc")["ticker"].tolist(),
             ["NEW"],
         )
+        self.assertEqual(
+            self.db.get_entry_prices(
+                ["OLD", "NEW"], date(2024, 1, 1), date(2024, 1, 10)
+            )["ticker"].tolist(),
+            ["NEW"],
+        )
+
+    def test_same_hash_generation_materializes_rows_and_parse_provenance(self):
+        metadata = pd.DataFrame(
+            [{
+                "doc_id": "same-hash",
+                "archive_year": 2024,
+                "first_name": "Jane",
+                "last_name": "Doe",
+                "filing_date": datetime(2024, 1, 3),
+                "filing_type": "P",
+                "fetched_at": datetime(2024, 1, 4),
+            }]
+        )
+        self.db.upsert_metadata(metadata)
+        self.db.conn.execute(
+            """
+            INSERT INTO house_archive_generations (
+                archive_year, generation_id, metadata_sha256,
+                metadata_count, ptr_count, parse_status
+            ) VALUES (2024, 'g1', 'metadata-1', 1, 1, 'complete')
+            """
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO house_pdf_artifacts (
+                archive_year, doc_id, generation_id, artifact_sha256
+            ) VALUES (2024, 'same-hash', 'g1', 'artifact-sha')
+            """
+        )
+        self.db.upsert_transactions(
+            pd.DataFrame([{
+                "doc_id": "same-hash",
+                "member": "Jane Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 1, 2),
+                "disclosure_date": date(2024, 1, 3),
+                "transaction_type": "Purchase",
+                "ingestion_generation": "g1",
+                "artifact_sha256": "artifact-sha",
+            }]),
+            source="house_pdf",
+        )
+        self.db.upsert_parse_run(
+            doc_id="same-hash",
+            year=2024,
+            parser_version="v4-deterministic",
+            status="success",
+            engines_attempted="pdfplumber",
+            raw_row_count=1,
+            transaction_count=1,
+            artifact_sha256="artifact-sha",
+            ingestion_generation="g1",
+        )
+
+        self.db.promote_house_archive(
+            archive_year=2024,
+            metadata_df=metadata,
+            generation_id="g2",
+            metadata_sha256="metadata-2",
+            metadata_http_status=200,
+            metadata_etag=None,
+            metadata_last_modified=None,
+            artifacts=[{
+                "doc_id": "same-hash",
+                "artifact_sha256": "artifact-sha",
+                "content_length": 100,
+            }],
+            quarantined_artifacts=[],
+        )
+
+        self.assertEqual(self.db.get_unresolved_house_doc_ids(2024), [])
+        self.assertEqual(
+            self.db.conn.execute(
+                """
+                SELECT ingestion_generation FROM transactions
+                WHERE doc_id = 'same-hash' ORDER BY ingestion_generation
+                """
+            ).fetchall(),
+            [("g1",), ("g2",)],
+        )
+        self.db.mark_house_generation_parse_complete(2024)
+        canonical = self.db.get_transactions_for_doc("same-hash")
+        self.assertEqual(canonical["ticker"].tolist(), ["AAPL"])
+        self.assertEqual(canonical["ingestion_generation"].tolist(), ["g2"])
 
     def test_source_row_id_preserves_distinct_repeated_lots(self):
         base = {
@@ -999,6 +1111,7 @@ class TestParseRunsTable(DatabaseTestCase):
             raw_row_count=1,
             transaction_count=1,
             artifact_sha256="old-sha",
+            ingestion_generation="g1",
         )
 
         self.assertEqual(
@@ -1006,6 +1119,7 @@ class TestParseRunsTable(DatabaseTestCase):
                 year=2024,
                 parser_version="v4-deterministic",
                 artifact_hashes={"corrected": "old-sha"},
+                ingestion_generation="g1",
             ),
             {"corrected"},
         )
@@ -1014,6 +1128,7 @@ class TestParseRunsTable(DatabaseTestCase):
                 year=2024,
                 parser_version="v4-deterministic",
                 artifact_hashes={"corrected": "corrected-sha"},
+                ingestion_generation="g1",
             ),
             set(),
         )
@@ -1026,6 +1141,7 @@ class TestParseRunsTable(DatabaseTestCase):
             raw_row_count=1,
             transaction_count=1,
             artifact_sha256="corrected-sha",
+            ingestion_generation="g1",
         )
         self.assertEqual(
             self.db.conn.execute(
@@ -1161,6 +1277,7 @@ class TestParseRunsTable(DatabaseTestCase):
         )
         self.assertEqual(replacement.by_doc_total, {"ocr-doc": 2})
         self.assertEqual(replacement.total_current_rows, 2)
+        self.assertEqual(replacement.total_raw_rows, 2)
 
 
     def test_verified_no_txs_explicitly_replaces_stale_house_rows(self):

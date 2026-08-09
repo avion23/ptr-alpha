@@ -30,6 +30,7 @@ class TransactionReplacementCounts:
     by_doc_source: dict[str, dict[str, int]]
     by_doc_total: dict[str, int]
     total_current_rows: int
+    total_raw_rows: int
 
 
 class DatabaseError(AnalysisError):
@@ -258,6 +259,14 @@ class Database:
                         SELECT 1 FROM house_archive_generations g
                         WHERE g.generation_id = t.ingestion_generation
                     )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM metadata m
+                        JOIN house_archive_generations g
+                          ON g.archive_year = m.archive_year
+                        WHERE m.doc_id = t.doc_id
+                          AND g.parse_status = 'complete'
+                    )
                )
                OR (
                     t.ingestion_generation IS NULL
@@ -298,6 +307,7 @@ class Database:
                 transaction_count INTEGER,
                 error_message VARCHAR,
                 artifact_sha256 VARCHAR,
+                ingestion_generation VARCHAR,
                 parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -310,6 +320,11 @@ class Database:
         if "artifact_sha256" not in columns:
             self.conn.execute(
                 "ALTER TABLE pdf_parse_runs ADD COLUMN artifact_sha256 VARCHAR"
+            )
+        if "ingestion_generation" not in columns:
+            self.conn.execute(
+                "ALTER TABLE pdf_parse_runs "
+                "ADD COLUMN ingestion_generation VARCHAR"
             )
 
     def _init_source_reports_table(self) -> None:
@@ -502,7 +517,7 @@ class Database:
         rows = self.conn.execute(
             """
             WITH current_artifacts AS (
-                SELECT doc_id, artifact_sha256
+                SELECT doc_id, artifact_sha256, generation_id
                 FROM house_pdf_artifacts
                 WHERE archive_year = ?
                 QUALIFY row_number() OVER (
@@ -514,6 +529,7 @@ class Database:
             LEFT JOIN pdf_parse_runs p
               ON p.doc_id = a.doc_id
              AND p.artifact_sha256 = a.artifact_sha256
+             AND p.ingestion_generation = a.generation_id
              AND p.status IN ('success', 'no_txs')
             GROUP BY a.doc_id
             HAVING COUNT(p.doc_id) = 0
@@ -700,6 +716,75 @@ class Database:
                         artifact.get("content_length"),
                     ],
                 )
+            previous = self.conn.execute(
+                """
+                SELECT generation_id FROM house_archive_generations
+                WHERE archive_year = ? AND parse_status = 'complete'
+                  AND generation_id <> ?
+                ORDER BY promoted_at DESC, generation_id DESC LIMIT 1
+                """,
+                [archive_year, generation_id],
+            ).fetchone()
+            if previous:
+                previous_generation = str(previous[0])
+                self.conn.execute(
+                    """
+                    INSERT INTO transactions BY NAME
+                    SELECT
+                        t.* EXCLUDE (
+                            id, ingestion_generation, artifact_sha256
+                        ),
+                        nextval('tx_id_seq') AS id,
+                        ? AS ingestion_generation,
+                        new_artifact.artifact_sha256 AS artifact_sha256
+                    FROM transactions t
+                    JOIN house_pdf_artifacts old_artifact
+                      ON old_artifact.doc_id = t.doc_id
+                     AND old_artifact.generation_id = ?
+                    JOIN house_pdf_artifacts new_artifact
+                      ON new_artifact.doc_id = old_artifact.doc_id
+                     AND new_artifact.generation_id = ?
+                     AND new_artifact.artifact_sha256 = old_artifact.artifact_sha256
+                    WHERE t.source = 'house_pdf'
+                      AND t.ingestion_generation = ?
+                    """,
+                    [
+                        generation_id,
+                        previous_generation,
+                        generation_id,
+                        previous_generation,
+                    ],
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO pdf_parse_runs (
+                        doc_id, year, parser_version, status, engines_attempted,
+                        raw_row_count, transaction_count, error_message,
+                        artifact_sha256, ingestion_generation
+                    )
+                    SELECT
+                        p.doc_id, p.year, p.parser_version, p.status,
+                        p.engines_attempted, p.raw_row_count,
+                        p.transaction_count, p.error_message,
+                        p.artifact_sha256, ?
+                    FROM pdf_parse_runs p
+                    JOIN house_pdf_artifacts old_artifact
+                      ON old_artifact.doc_id = p.doc_id
+                     AND old_artifact.generation_id = ?
+                     AND old_artifact.artifact_sha256 = p.artifact_sha256
+                    JOIN house_pdf_artifacts new_artifact
+                      ON new_artifact.doc_id = old_artifact.doc_id
+                     AND new_artifact.generation_id = ?
+                     AND new_artifact.artifact_sha256 = old_artifact.artifact_sha256
+                    WHERE p.ingestion_generation = ?
+                    """,
+                    [
+                        generation_id,
+                        previous_generation,
+                        generation_id,
+                        previous_generation,
+                    ],
+                )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -786,7 +871,8 @@ class Database:
                 source_rows = self.conn.execute(
                     """
                     SELECT COALESCE(source, '<legacy>'), COUNT(*)
-                    FROM transactions WHERE doc_id = ? GROUP BY 1 ORDER BY 1
+                    FROM canonical_transactions
+                    WHERE doc_id = ? GROUP BY 1 ORDER BY 1
                     """,
                     [doc_id],
                 ).fetchall()
@@ -815,6 +901,11 @@ class Database:
                 }
                 self.parse_runs.upsert(**persisted_run, _in_transaction=True)
             total_current_rows = int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM canonical_transactions"
+                ).fetchone()[0]
+            )
+            total_raw_rows = int(
                 self.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
             )
             self.conn.execute("COMMIT")
@@ -826,6 +917,7 @@ class Database:
             by_doc_source=by_doc_source,
             by_doc_total=by_doc_total,
             total_current_rows=total_current_rows,
+            total_raw_rows=total_raw_rows,
         )
 
     def get_transactions(
@@ -907,6 +999,7 @@ class Database:
         transaction_count: int,
         error_message: str | None = None,
         artifact_sha256: str | None = None,
+        ingestion_generation: str | None = None,
     ) -> None:
         self.parse_runs.upsert(
             doc_id=doc_id,
@@ -918,6 +1011,7 @@ class Database:
             transaction_count=transaction_count,
             error_message=error_message,
             artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
         )
 
     def replace_source_reports(

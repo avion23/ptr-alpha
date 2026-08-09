@@ -231,6 +231,7 @@ class TransactionRepository:
         params: list[object] = [year, *source_params]
         excluded = self.conn.execute(
             f"""
+
             SELECT COUNT(*) FROM canonical_transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND transaction_date IS NOT NULL
@@ -274,6 +275,7 @@ class TransactionRepository:
         params: list[object] = [start_date, end_date, *source_params]
         excluded = self.conn.execute(
             f"""
+
             SELECT COUNT(*) FROM canonical_transactions
             WHERE disclosure_date BETWEEN ? AND ?
               AND transaction_date IS NOT NULL
@@ -540,7 +542,7 @@ class TransactionRepository:
 
         placeholders = ", ".join("?" for _ in doc_ids)
         # Only generated placeholders are interpolated; doc_ids remain bound parameters.
-        query = f"SELECT doc_id, COUNT(*) FROM transactions WHERE doc_id IN ({placeholders}) GROUP BY doc_id"  # nosec B608
+        query = f"SELECT doc_id, COUNT(*) FROM canonical_transactions WHERE doc_id IN ({placeholders}) GROUP BY doc_id"  # nosec B608
         rows = self.conn.execute(query, doc_ids).fetchall()
         return {doc_id: count for doc_id, count in rows}
 

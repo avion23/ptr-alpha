@@ -325,7 +325,7 @@ def test_manifest_labels_reused_history_and_locks_unconsumed_final(tmp_path):
     assert "untouched" not in json.dumps(manifest).lower()
     assert manifest["final_test"]["status"] == "locked_not_evaluated"
     assert manifest["final_test"]["consumed"] is False
-    assert manifest["final_test"]["start"] == "2025-10-01"
+    assert manifest["final_test"]["start"] == "2026-01-01"
     assert manifest["source_aggregate_sha256"]
     assert any(key.startswith("src/analyzer/") for key in manifest["source_sha256"])
     assert any(key.startswith("optimize_profit/") for key in manifest["source_sha256"])

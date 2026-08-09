@@ -1037,17 +1037,29 @@ def insert_transactions(
     if not transactions:
         status = "error" if raw_count else "no_txs"
         message = "semantic_zero_after_raw_rows" if raw_count else ""
-        record_parse_run(
-            conn,
-            doc_id,
-            year,
-            status,
-            raw_count or 0,
-            0,
-            message,
-            parser_version=parser_version,
-        )
-        conn.close()
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            conn.execute(
+                "DELETE FROM transactions WHERE source = 'gemini_ocr' "
+                "AND doc_id = ? AND (chamber = 'House' OR chamber IS NULL)",
+                [str(doc_id)],
+            )
+            record_parse_run(
+                conn,
+                doc_id,
+                year,
+                status,
+                raw_count or 0,
+                0,
+                message,
+                parser_version=parser_version,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
         return 0
 
     input_count = raw_count if raw_count is not None else len(transactions)
@@ -1217,7 +1229,8 @@ def insert_transactions(
         )
         conn.execute(
             "DELETE FROM transactions AS target "
-            "WHERE target.source = 'gemini_ocr' AND target.source_record_id = ? "
+            "WHERE target.source = 'gemini_ocr' AND target.doc_id = ? "
+            "AND (target.chamber = 'House' OR target.chamber IS NULL) "
             f"AND NOT EXISTS (SELECT 1 FROM {staging_table} AS staged "
             f"WHERE {stale_identity_join})",
             [str(doc_id)],

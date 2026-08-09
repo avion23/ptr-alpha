@@ -513,7 +513,7 @@ def test_ticker_provenance_matrix_rejects_inconsistent_rows():
         )
 
 
-def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):
+def test_insert_transactions_empty_list_retires_existing_ocr_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -547,7 +547,7 @@ def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):
     """).fetchone()
     con.close()
 
-    assert row_count == 1
+    assert row_count == 0
     assert latest_run is not None
     assert latest_run == ("no_txs", 0, 0)
 
@@ -701,6 +701,77 @@ def test_parallel_writer_acknowledges_failure(monkeypatch):
     assert str(error) == "boom"
 
 
+def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
+    from scripts.ocr_zero_rows import get_ocr_work_items
+
+    db_path = tmp_path / "no-txs.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata VALUES ('no-txs', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.conn.execute(
+        "INSERT INTO pdf_parse_runs (doc_id, year, parser_version, status, engines_attempted, raw_row_count, transaction_count) "
+        "VALUES ('no-txs', 2024, 'v3', 'zero_rows', '', 0, 0)"
+    )
+    db.conn.execute(
+        """INSERT INTO transactions (
+               doc_id, member, ticker, transaction_date, disclosure_date,
+               transaction_type, amount_raw, source, chamber, source_record_id,
+               source_row_id, ingestion_generation, artifact_sha256
+           ) VALUES
+               ('no-txs', 'Jane Doe', 'OLD', DATE '2024-01-01', DATE '2024-01-20',
+                'Purchase', 'A', 'gemini_ocr', NULL, NULL, 'legacy-null', NULL, 'old-sha'),
+               ('no-txs', 'Jane Doe', 'CAP', DATE '2024-01-02', DATE '2024-01-20',
+                'Purchase', 'A', 'capitol_trades', 'House', 'no-txs', 'cap', 'v1', 'cap-sha')
+        """
+    )
+    db.close()
+    pdf_dir = tmp_path / "2024" / "pdfs"
+    pdf_dir.mkdir(parents=True)
+    pdf = pdf_dir / "no-txs.pdf"
+    pdf.write_bytes(b"%PDF-no-transactions")
+    gemini_ocr_common.write_cached_response(
+        "no-txs",
+        pdf,
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS",
+        cache_dir=str(tmp_path / "gemini_cache"),
+    )
+    assert [
+        item[0]
+        for item in get_ocr_work_items(
+            db_path=str(db_path), data_dir=tmp_path, year=2024
+        )
+    ] == ["no-txs"]
+
+    assert (
+        _insert_transactions(
+            "no-txs", 2024, "Jane Doe", [], db_path=str(db_path), raw_count=0
+        )
+        == 0
+    )
+    connection = duckdb.connect(str(db_path))
+    rows = connection.execute(
+        "SELECT source, COUNT(*) FROM transactions WHERE doc_id='no-txs' GROUP BY source"
+    ).fetchall()
+    latest = connection.execute(
+        "SELECT status, raw_row_count, transaction_count FROM pdf_parse_runs "
+        "WHERE doc_id='no-txs' ORDER BY parsed_at DESC LIMIT 1"
+    ).fetchone()
+    connection.close()
+    assert rows == [("capitol_trades", 1)]
+    assert latest == ("no_txs", 0, 0)
+    assert get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024) == []
+
+    assert (
+        _insert_transactions(
+            "no-txs", 2024, "Jane Doe", [], db_path=str(db_path), raw_count=0
+        )
+        == 0
+    )
+    assert get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024) == []
+
+
 def test_work_selection_uses_current_db_not_progress(tmp_path):
     from scripts.ocr_zero_rows import get_ocr_work_items
 
@@ -772,7 +843,7 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
                source_row_id, ingestion_generation, artifact_sha256
            ) VALUES
                ('done', 'Jane Doe', 'NULLGEN', DATE '2024-01-02', DATE '2024-01-20',
-                'Purchase', 'A', 'gemini_ocr', 'House', 'done', 'old-null-row', NULL, 'old-sha'),
+                'Purchase', 'A', 'gemini_ocr', NULL, NULL, 'old-null-row', NULL, 'old-sha'),
                ('done', 'Jane Doe', 'CAP', DATE '2024-01-03', DATE '2024-01-20',
                 'Purchase', 'A', 'capitol_trades', 'House', 'done', 'cap-row', 'v1', 'cap-sha')
         """

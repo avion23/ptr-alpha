@@ -512,6 +512,55 @@ class TestTransactions(DatabaseTestCase):
         ).fetchone()[0]
         self.assertEqual(count, 2)
 
+    def test_canonical_reader_keeps_previous_complete_generation_until_activation(self):
+        metadata = pd.DataFrame(
+            [{
+                "doc_id": "generation-doc",
+                "archive_year": 2024,
+                "first_name": "Jane",
+                "last_name": "Doe",
+                "filing_date": datetime(2024, 1, 3),
+                "filing_type": "P",
+                "fetched_at": datetime(2024, 1, 4),
+            }]
+        )
+        self.db.upsert_metadata(metadata)
+        for generation, status in (("g1", "complete"), ("g2", "incomplete")):
+            self.db.conn.execute(
+                """
+                INSERT INTO house_archive_generations (
+                    archive_year, generation_id, metadata_sha256,
+                    metadata_count, ptr_count, parse_status
+                ) VALUES (2024, ?, 'sha', 1, 1, ?)
+                """,
+                [generation, status],
+            )
+        base = {
+            "doc_id": "generation-doc",
+            "member": "Jane Doe",
+            "transaction_date": date(2024, 1, 2),
+            "disclosure_date": date(2024, 1, 3),
+            "transaction_type": "Purchase",
+        }
+        self.db.upsert_transactions(
+            pd.DataFrame([{**base, "ticker": "OLD", "ingestion_generation": "g1"}]),
+            source="house_pdf",
+        )
+        self.db.upsert_transactions(
+            pd.DataFrame([{**base, "ticker": "NEW", "ingestion_generation": "g2"}]),
+            source="house_pdf",
+        )
+
+        self.assertEqual(
+            self.db.get_transactions_for_doc("generation-doc")["ticker"].tolist(),
+            ["OLD"],
+        )
+        self.db.mark_house_generation_parse_complete(2024)
+        self.assertEqual(
+            self.db.get_transactions_for_doc("generation-doc")["ticker"].tolist(),
+            ["NEW"],
+        )
+
     def test_source_row_id_preserves_distinct_repeated_lots(self):
         base = {
             "doc_id": "repeated-lots",
@@ -1086,6 +1135,7 @@ class TestParseRunsTable(DatabaseTestCase):
         replacement = self.db.replace_transactions_for_docs(
             pd.DataFrame(),
             source="house_pdf",
+            ingestion_generation="test-generation",
             attempted_doc_ids=["ocr-doc"],
             replacement_doc_ids=[],
             parse_runs=[parse_run],
@@ -1124,6 +1174,7 @@ class TestParseRunsTable(DatabaseTestCase):
                         "transaction_date": date(2024, 1, 2),
                         "disclosure_date": date(2024, 1, 3),
                         "transaction_type": "Purchase",
+                        "ingestion_generation": "test-generation",
                     }
                 ]
             ),
@@ -1142,6 +1193,7 @@ class TestParseRunsTable(DatabaseTestCase):
         replacement = self.db.replace_transactions_for_docs(
             pd.DataFrame(),
             source="house_pdf",
+            ingestion_generation="test-generation",
             attempted_doc_ids=["verified-empty"],
             replacement_doc_ids=["verified-empty"],
             parse_runs=[parse_run],

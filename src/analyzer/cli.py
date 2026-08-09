@@ -454,7 +454,10 @@ def _print_house_fetch_summary(summary) -> None:
         f"  House {summary.archive_year}: metadata={summary.metadata_count}, "
         f"PTR={summary.ptr_count}, valid PDFs={summary.valid_pdf_count}, "
         f"downloaded={summary.downloaded_count}, skipped={summary.skipped_count}, "
-        f"orphan PDFs={summary.orphan_pdf_count}"
+        f"orphan PDFs={summary.orphan_pdf_count}, "
+        f"removed docs={summary.removed_doc_count}, "
+        f"quarantined PDFs={summary.quarantined_pdf_count}, "
+        f"generation={summary.generation_id} ({summary.generation_status})"
     )
 
 
@@ -1126,7 +1129,10 @@ def refresh(
         f"metadata={sum(item.metadata_count for item in summaries)}, "
         f"PTR={sum(item.ptr_count for item in summaries)}, "
         f"valid PDFs={sum(item.valid_pdf_count for item in summaries)}, "
-        f"orphan PDFs={sum(item.orphan_pdf_count for item in summaries)}"
+        f"orphan PDFs={sum(item.orphan_pdf_count for item in summaries)}, "
+        f"removed docs={sum(item.removed_doc_count for item in summaries)}, "
+        f"quarantined PDFs={sum(item.quarantined_pdf_count for item in summaries)}, "
+        "generation status=incomplete pending artifact-bound parse/OCR"
     )
 
     print(f"[2/4] Parsing cached House PDF archives {label}...")
@@ -1183,6 +1189,15 @@ def refresh(
         if not unresolved:
             app_ctx.transaction_source.db.mark_house_generation_parse_complete(
                 archive_year
+            )
+            generation_id = (
+                app_ctx.transaction_source.db.get_latest_house_generation(
+                    archive_year
+                )
+            )
+            print(
+                f"  House {archive_year} generation={generation_id} "
+                "status=complete (activated)"
             )
             continue
         failed_steps.append(f"unresolved_house:{archive_year}")

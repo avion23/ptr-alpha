@@ -1,4 +1,5 @@
 import hashlib
+import os
 import zipfile
 from contextlib import nullcontext
 from datetime import date, datetime
@@ -203,6 +204,7 @@ def test_parse_persistence_records_house_provenance_and_artifact_hash(tmp_path):
 
     assert stored["chamber"] == "house"
     assert stored["source_record_id"] == "doc"
+    assert stored["ingestion_generation"] == "legacy-untracked-2021"
     assert stored["official_filing_date"].date() == date(2021, 1, 3)
     assert stored["artifact_sha256"] == hashlib.sha256(pdf_bytes).hexdigest()
     assert parse_run == ("v4-deterministic", "success", 1, 1)
@@ -298,7 +300,7 @@ def test_staged_failure_leaves_prior_generation_untouched(tmp_path):
         db.close()
 
 
-def test_authoritative_promotion_quarantines_removed_pdf_and_house_rows(tmp_path):
+def test_removed_house_rows_remain_until_new_generation_activates(tmp_path):
     source, db = _source(tmp_path)
     old_metadata, _ = _acquired("removed")
     db.replace_metadata(2021, old_metadata)
@@ -339,8 +341,21 @@ def test_authoritative_promotion_quarantines_removed_pdf_and_house_rows(tmp_path
             WHERE doc_id = 'removed'
             """
         ).fetchone()[0]
-        assert db.count_transactions_for_docs(["removed"]) == {}
+        assert db.count_transactions_for_docs(["removed"]) == {"removed": 1}
         assert '"ticker":"AAPL"' in transaction_audit
+        current_sha = db.get_house_artifact_hashes(2021)["current"]
+        db.upsert_parse_run(
+            doc_id="current",
+            year=2021,
+            parser_version="verified",
+            status="no_txs",
+            engines_attempted="verified",
+            raw_row_count=0,
+            transaction_count=0,
+            artifact_sha256=current_sha,
+        )
+        db.mark_house_generation_parse_complete(2021)
+        assert db.count_transactions_for_docs(["removed"]) == {}
         assert not old_pdf.exists()
         assert Path(audit[2]).read_bytes() == b"%PDF-removed\n%%EOF"
     finally:
@@ -350,3 +365,40 @@ def test_authoritative_promotion_quarantines_removed_pdf_and_house_rows(tmp_path
     assert summary.removed_doc_count == 1
     assert summary.quarantined_pdf_count == 1
     assert audit[:2] == ("removed_from_authoritative_archive", 1)
+
+
+
+def test_second_directory_rename_failure_restores_prior_canonical(tmp_path, monkeypatch):
+    source, db = _source(tmp_path)
+    old_metadata, _ = _acquired("old")
+    db.replace_metadata(2021, old_metadata)
+    old_pdf = tmp_path / "2021" / "pdfs" / "old.pdf"
+    old_pdf.parent.mkdir(parents=True)
+    old_pdf.write_bytes(b"%PDF-old\n%%EOF")
+    source._acquire_metadata_archive = MagicMock(return_value=_acquired("new"))
+
+    async def download(_session, doc_id, pdf_path, _url):
+        pdf_path.write_bytes(b"%PDF-new\n%%EOF")
+        return DownloadResult(doc_id=doc_id, status=DownloadStatus.SUCCESS)
+
+    source._download_pdf_async = download
+    real_replace = os.replace
+    directory_renames = 0
+
+    def fail_second_directory_rename(src, dst):
+        nonlocal directory_renames
+        if Path(src).is_dir():
+            directory_renames += 1
+            if directory_renames == 2:
+                raise OSError("injected promotion rename failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("analyzer.download.os.replace", fail_second_directory_rename)
+    try:
+        with pytest.raises(OSError, match="injected promotion rename failure"):
+            source.fetch_and_cache_pdfs(2021, refresh_metadata=True)
+        assert old_pdf.read_bytes() == b"%PDF-old\n%%EOF"
+        assert db.get_metadata(2021)["DocID"].tolist() == ["old"]
+    finally:
+        source.close()
+        db.close()

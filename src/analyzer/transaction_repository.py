@@ -231,7 +231,7 @@ class TransactionRepository:
         params: list[object] = [year, *source_params]
         excluded = self.conn.execute(
             f"""
-            SELECT COUNT(*) FROM transactions
+            SELECT COUNT(*) FROM canonical_transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND transaction_date IS NOT NULL
               AND transaction_date > disclosure_date
@@ -249,7 +249,8 @@ class TransactionRepository:
         result = self.conn.execute(
             f"""
             SELECT *
-            FROM transactions
+            FROM canonical_transactions
+
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
               {source_clause}
@@ -273,7 +274,7 @@ class TransactionRepository:
         params: list[object] = [start_date, end_date, *source_params]
         excluded = self.conn.execute(
             f"""
-            SELECT COUNT(*) FROM transactions
+            SELECT COUNT(*) FROM canonical_transactions
             WHERE disclosure_date BETWEEN ? AND ?
               AND transaction_date IS NOT NULL
               AND transaction_date > disclosure_date
@@ -292,7 +293,8 @@ class TransactionRepository:
         result = self.conn.execute(
             f"""
             SELECT *
-            FROM transactions
+            FROM canonical_transactions
+
             WHERE disclosure_date BETWEEN ? AND ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
               {source_clause}
@@ -338,6 +340,7 @@ class TransactionRepository:
         df = _normalize_frame(df, deduplicate=True)
 
 
+
         if df.empty:
             return 0
 
@@ -368,6 +371,7 @@ class TransactionRepository:
             self.conn.execute("""
                 CREATE TEMP TABLE filtered_staging_transactions AS
                 SELECT * FROM staging_transactions
+
             """)
             insert_columns_sql = ", ".join(write_columns)
             mutable_columns = [
@@ -402,6 +406,7 @@ class TransactionRepository:
                     f"s.{column} IS NOT NULL AND TRIM(s.{column}) <> '' "
                     f"AND t.{column} = s.{column}"
                     for column in _ARTIFACT_IDENTITY_COLUMNS
+
                 )
                 self.conn.execute(
                     f"""UPDATE transactions AS t SET {update_sql}
@@ -517,7 +522,8 @@ class TransactionRepository:
             """
             SELECT *
 
-            FROM transactions
+            FROM canonical_transactions
+
             WHERE doc_id = ?
             ORDER BY id
             """,
@@ -550,7 +556,7 @@ class TransactionRepository:
         )
         row = self.conn.execute(
             f"""
-            SELECT COUNT(*) FROM transactions
+            SELECT COUNT(*) FROM canonical_transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ? {source_clause}
             """,  # nosec B608 -- source_clause is a fixed internal fragment
             [year, *source_params],

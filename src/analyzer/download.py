@@ -44,6 +44,8 @@ class HouseFetchSummary:
     orphan_pdf_count: int
     removed_doc_count: int = 0
     quarantined_pdf_count: int = 0
+    generation_id: str | None = None
+    generation_status: str = "incomplete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,11 +388,15 @@ class HouseTransactionSource(TransactionSource):
             backup_pdf_dir = stage_root / "previous-pdfs"
             quarantine_dir = archive_dir / "quarantine" / generation_id
             moved_orphans: list[tuple[Path, Path]] = []
-            if canonical_pdf_dir.exists():
-                os.replace(canonical_pdf_dir, backup_pdf_dir)
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            os.replace(stage_pdf_dir, canonical_pdf_dir)
+            old_generation_moved = False
+            new_generation_promoted = False
             try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                if canonical_pdf_dir.exists():
+                    os.replace(canonical_pdf_dir, backup_pdf_dir)
+                    old_generation_moved = True
+                os.replace(stage_pdf_dir, canonical_pdf_dir)
+                new_generation_promoted = True
                 quarantine_dir.mkdir(parents=True, exist_ok=False)
                 quarantined_artifacts = []
                 for doc_id in orphan_ids:
@@ -438,9 +444,9 @@ class HouseTransactionSource(TransactionSource):
                 for quarantine_path, old_path in reversed(moved_orphans):
                     if quarantine_path.exists():
                         os.replace(quarantine_path, old_path)
-                if canonical_pdf_dir.exists():
+                if new_generation_promoted and canonical_pdf_dir.exists():
                     os.replace(canonical_pdf_dir, stage_pdf_dir)
-                if backup_pdf_dir.exists():
+                if old_generation_moved and backup_pdf_dir.exists():
                     os.replace(backup_pdf_dir, canonical_pdf_dir)
                 shutil.rmtree(quarantine_dir, ignore_errors=True)
                 raise
@@ -466,6 +472,8 @@ class HouseTransactionSource(TransactionSource):
             orphan_pdf_count=len(orphan_ids),
             removed_doc_count=len(removed_counts),
             quarantined_pdf_count=len(moved_orphans),
+            generation_id=generation_id,
+            generation_status="incomplete",
         )
         logger.info(
             "House archive %d promoted: metadata=%d PTR=%d valid=%d "
@@ -584,8 +592,13 @@ class HouseTransactionSource(TransactionSource):
         artifact_hashes = {
             path.stem: _validated_pdf_sha256(path) for path in pdf_transactions
         }
+        ingestion_generation = (
+            self.db.get_latest_house_generation(year)
+            or f"legacy-untracked-{year}"
+        )
         if not df.empty:
             df["chamber"] = "house"
+            df["ingestion_generation"] = ingestion_generation
             df["source_record_id"] = df["doc_id"].astype(str)
             df["official_filing_date"] = df["disclosure_date"]
             df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
@@ -630,6 +643,7 @@ class HouseTransactionSource(TransactionSource):
             df,
             source="house_pdf",
             attempted_doc_ids=attempted_doc_ids,
+            ingestion_generation=ingestion_generation,
             replacement_doc_ids=(
                 df["doc_id"].astype(str).unique().tolist()
                 if not df.empty

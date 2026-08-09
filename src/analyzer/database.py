@@ -90,6 +90,7 @@ class Database:
         self._init_pdf_tables()
         self._init_source_reports_table()
         self._init_transactions_table()
+        self._init_canonical_transactions_view()
         self._init_prices_table()
 
     def _init_metadata_table(self) -> None:
@@ -235,6 +236,41 @@ class Database:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_member ON transactions(member)"
         )
+
+    def _init_canonical_transactions_view(self) -> None:
+        self.conn.execute("""
+            CREATE OR REPLACE VIEW canonical_transactions AS
+            SELECT t.* FROM transactions t
+            WHERE (t.source IS NOT NULL AND t.source <> 'house_pdf')
+               OR t.ingestion_generation = (
+                    SELECT active.generation_id
+                    FROM house_archive_generations own
+                    JOIN house_archive_generations active
+                      ON active.archive_year = own.archive_year
+                    WHERE own.generation_id = t.ingestion_generation
+                      AND active.parse_status = 'complete'
+                    ORDER BY active.promoted_at DESC, active.generation_id DESC
+                    LIMIT 1
+               )
+               OR (
+                    t.ingestion_generation IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM house_archive_generations g
+                        WHERE g.generation_id = t.ingestion_generation
+                    )
+               )
+               OR (
+                    t.ingestion_generation IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM metadata m
+                        JOIN house_archive_generations g
+                          ON g.archive_year = m.archive_year
+                        WHERE m.doc_id = t.doc_id
+                          AND g.parse_status = 'complete'
+                    )
+               )
+        """)
 
     def _init_prices_table(self) -> None:
         self.conn.execute("""
@@ -451,6 +487,17 @@ class Database:
         ).fetchall()
         return {str(doc_id): str(sha256) for doc_id, sha256 in rows if sha256}
 
+    def get_latest_house_generation(self, archive_year: int) -> str | None:
+        row = self.conn.execute(
+            """
+            SELECT generation_id FROM house_archive_generations
+            WHERE archive_year = ?
+            ORDER BY promoted_at DESC, generation_id DESC LIMIT 1
+            """,
+            [archive_year],
+        ).fetchone()
+        return str(row[0]) if row else None
+
     def get_unresolved_house_doc_ids(self, archive_year: int) -> list[str]:
         rows = self.conn.execute(
             """
@@ -481,17 +528,35 @@ class Database:
             raise ValueError(
                 f"House archive {archive_year} still has unresolved artifacts"
             )
-        self.conn.execute(
-            """
-            UPDATE house_archive_generations SET parse_status = 'complete'
-            WHERE archive_year = ? AND generation_id = (
-                SELECT generation_id FROM house_archive_generations
-                WHERE archive_year = ?
-                ORDER BY promoted_at DESC, generation_id DESC LIMIT 1
+        generation_id = self.get_latest_house_generation(archive_year)
+        if generation_id is None:
+            return
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute(
+                """
+                UPDATE house_archive_generations SET parse_status = 'complete'
+                WHERE archive_year = ? AND generation_id = ?
+                """,
+                [archive_year, generation_id],
             )
-            """,
-            [archive_year, archive_year],
-        )
+            self.conn.execute(
+                """
+                DELETE FROM transactions
+                WHERE doc_id IN (
+                    SELECT doc_id FROM house_archive_quarantine
+                    WHERE archive_year = ? AND generation_id = ?
+                      AND reason = 'removed_from_authoritative_archive'
+                )
+                  AND (source = 'house_pdf' OR source IS NULL)
+                  AND ingestion_generation IS DISTINCT FROM ?
+                """,
+                [archive_year, generation_id, generation_id],
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def promote_house_archive(
         self,
@@ -558,14 +623,6 @@ class Database:
                         "removed_from_authoritative_archive",
                         doc_id,
                     ],
-                )
-                self.conn.execute(
-                    """
-                    DELETE FROM transactions
-                    WHERE doc_id = ?
-                      AND (source = 'house_pdf' OR source IS NULL)
-                    """,
-                    [doc_id],
                 )
                 removed_counts[doc_id] = removed_count
                 quarantine = quarantine_by_doc.get(doc_id, {})
@@ -659,6 +716,7 @@ class Database:
         source: str,
         attempted_doc_ids: list[str],
         replacement_doc_ids: list[str],
+        ingestion_generation: str,
         parse_runs: list[dict] | None = None,
     ) -> TransactionReplacementCounts:
         """Atomically replace attempted documents for one source.
@@ -710,8 +768,9 @@ class Database:
                 if source == "house_pdf":
                     self.conn.execute(
                         "DELETE FROM transactions "
-                        "WHERE doc_id = ? AND (source = ? OR source IS NULL)",
-                        [doc_id, source],
+                        "WHERE doc_id = ? AND source = ? "
+                        "AND ingestion_generation = ?",
+                        [doc_id, source, ingestion_generation],
                     )
                 else:
                     self.conn.execute(
@@ -737,14 +796,22 @@ class Database:
 
             for parse_run in parse_runs or []:
                 doc_id = str(parse_run["doc_id"])
+                source_generation_count = 0
+                if doc_id in replacement_set:
+                    source_generation_count = int(
+                        self.conn.execute(
+                            """
+                            SELECT COUNT(*) FROM transactions
+                            WHERE doc_id = ? AND source = ?
+                              AND ingestion_generation = ?
+                            """,
+                            [doc_id, source, ingestion_generation],
+                        ).fetchone()[0]
+                    )
                 persisted_run = {
                     **parse_run,
                     "doc_id": doc_id,
-                    "transaction_count": (
-                        by_doc_source[doc_id].get(source, 0)
-                        if doc_id in replacement_set
-                        else 0
-                    ),
+                    "transaction_count": source_generation_count,
                 }
                 self.parse_runs.upsert(**persisted_run, _in_transaction=True)
             total_current_rows = int(

@@ -23,7 +23,13 @@ class ParseRunRepository:
         if not _in_transaction:
             self.conn.execute("BEGIN TRANSACTION")
         try:
-            self.conn.execute("DELETE FROM pdf_parse_runs WHERE doc_id = ?", [doc_id])
+            # Replace only this parser fingerprint. Other deterministic/OCR
+            # provenance for the same document remains auditable.
+            self.conn.execute(
+                "DELETE FROM pdf_parse_runs "
+                "WHERE doc_id = ? AND parser_version = ?",
+                [doc_id, parser_version],
+            )
             self.conn.execute(
                 """
                 INSERT INTO pdf_parse_runs (

@@ -134,12 +134,17 @@ class TestCliApp(unittest.TestCase):
         mock_ctx = MagicMock()
         fetchone = mock_ctx.transaction_source.db.conn.execute.return_value.fetchone
         fetchone.side_effect = [(10,), (10,), (date(2026, 8, 1), date(2026, 8, 2), 0)]
+        mock_ctx.transaction_source.fetch_and_cache_pdfs.return_value = MagicMock(
+            archive_year=2026,
+            metadata_count=10,
+            ptr_count=10,
+            valid_pdf_count=10,
+            downloaded_count=0,
+            skipped_count=10,
+            orphan_pdf_count=0,
+        )
         with (
             patch("analyzer.cli.get_context", return_value=mock_ctx),
-            patch(
-                "analyzer.cli.run_fetch_pipeline",
-                return_value=StepResult(success=True),
-            ),
             patch(
                 "analyzer.cli.run_parse_pipeline",
                 return_value=StepResult(success=True),

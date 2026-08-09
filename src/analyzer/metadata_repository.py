@@ -13,12 +13,35 @@ class MetadataRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.conn = conn
 
+    @staticmethod
+    def _with_archive_year(df: pd.DataFrame) -> pd.DataFrame:
+        """Return metadata with an integer archive year.
+
+        Legacy callers did not supply archive provenance. Filing year is the
+        only safe compatibility value available until the official archive is
+        fetched again; an archive refresh overwrites it with the authoritative
+        year.
+        """
+        if "archive_year" in df.columns:
+            return df
+        normalized = df.copy()
+        normalized["archive_year"] = pd.to_datetime(
+            normalized["filing_date"], errors="raise"
+        ).dt.year
+        return normalized
+
     def upsert(self, df: pd.DataFrame) -> None:
+        df = self._with_archive_year(df)
         self.conn.execute("""
-            INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
-            SELECT doc_id, first_name, last_name, filing_date, filing_type, fetched_at
+            INSERT INTO metadata (
+                doc_id, archive_year, first_name, last_name,
+                filing_date, filing_type, fetched_at
+            )
+            SELECT doc_id, archive_year, first_name, last_name,
+                   filing_date, filing_type, fetched_at
             FROM df
             ON CONFLICT (doc_id) DO UPDATE SET
+                archive_year = EXCLUDED.archive_year,
                 first_name = EXCLUDED.first_name,
                 last_name = EXCLUDED.last_name,
                 filing_date = EXCLUDED.filing_date,
@@ -26,13 +49,15 @@ class MetadataRepository:
                 fetched_at = EXCLUDED.fetched_at
         """)
 
-    def replace_year(self, year: int, df: pd.DataFrame) -> None:
-        """Atomically replace one year's metadata after a successful download."""
+    def replace_archive(self, archive_year: int, df: pd.DataFrame) -> None:
+        """Atomically replace one official House archive."""
+        df = df.copy()
+        df["archive_year"] = archive_year
         self.conn.execute("BEGIN TRANSACTION")
         try:
             self.conn.execute(
-                "DELETE FROM metadata WHERE EXTRACT(YEAR FROM filing_date) = ?",
-                [year],
+                "DELETE FROM metadata WHERE archive_year = ?",
+                [archive_year],
             )
             self.upsert(df)
             self.conn.execute("COMMIT")
@@ -40,34 +65,29 @@ class MetadataRepository:
             self.conn.execute("ROLLBACK")
             raise
 
-    def get_by_year(self, year: int) -> pd.DataFrame:
-        result = self.conn.execute(
+    def get_by_archive(self, archive_year: int) -> pd.DataFrame:
+        return self.conn.execute(
             """
-            SELECT doc_id AS "DocID", first_name AS "First", last_name AS "Last",
+            SELECT doc_id AS "DocID", archive_year AS "ArchiveYear",
+                   first_name AS "First", last_name AS "Last",
                    filing_date AS "FilingDate", filing_type AS "FilingType"
             FROM metadata
-            WHERE EXTRACT(YEAR FROM filing_date) = ?
+            WHERE archive_year = ?
+            ORDER BY doc_id
         """,
-            [year],
+            [archive_year],
         ).fetchdf()
-        return result
 
-    def exists(self, year: int) -> bool:
+    def exists(self, archive_year: int) -> bool:
         count = self.conn.execute(
-            """
-            SELECT COUNT(*) FROM metadata
-            WHERE EXTRACT(YEAR FROM filing_date) = ?
-        """,
-            [year],
+            "SELECT COUNT(*) FROM metadata WHERE archive_year = ?",
+            [archive_year],
         ).fetchone()[0]
         return count > 0
 
-    def clear(self, year: int) -> None:
+    def clear(self, archive_year: int) -> None:
         self.conn.execute(
-            """
-            DELETE FROM metadata
-            WHERE EXTRACT(YEAR FROM filing_date) = ?
-        """,
-            [year],
+            "DELETE FROM metadata WHERE archive_year = ?",
+            [archive_year],
         )
-        logger.info("Cleared metadata for year %s", year)
+        logger.info("Cleared metadata for archive %s", archive_year)

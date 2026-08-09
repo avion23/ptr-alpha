@@ -6,7 +6,8 @@ from typer.testing import CliRunner
 
 from analyzer.cli import app
 from analyzer.database import Database
-from analyzer.exceptions import DataResult, StepResult
+from analyzer.download import HouseFetchSummary
+from analyzer.exceptions import DataResult, DataSourceError, StepResult
 from analyzer.pipeline import (
     TickerAnalysisParams,
     TickerScoringParams,
@@ -50,13 +51,19 @@ def test_refresh_summary_is_scoped_to_requested_year(tmp_path):
     )
     ctx = MagicMock()
     ctx.transaction_source.db = db
+    ctx.transaction_source.fetch_and_cache_pdfs.return_value = HouseFetchSummary(
+        archive_year=2024,
+        metadata_count=10,
+        ptr_count=3,
+        valid_pdf_count=3,
+        downloaded_count=0,
+        skipped_count=3,
+        orphan_pdf_count=0,
+    )
 
     try:
         with (
             patch("analyzer.cli.get_context", return_value=ctx),
-            patch(
-                "analyzer.cli.run_fetch_pipeline", return_value=StepResult(success=True)
-            ),
             patch(
                 "analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)
             ),
@@ -191,3 +198,70 @@ def test_cli_as_of_reaches_single_ticker_analysis_params():
     assert result.exit_code == 0, result.output
     assert len(captured) == 1
     assert captured[0].as_of_date == date(2025, 6, 1)
+
+def test_refresh_stops_before_parse_and_backup_when_house_fetch_is_incomplete(
+    tmp_path,
+):
+    db = Database(tmp_path / "incomplete.duckdb")
+    ctx = MagicMock()
+    ctx.transaction_source.db = db
+    ctx.transaction_source.fetch_and_cache_pdfs.side_effect = DataSourceError(
+        "Incomplete House archive 2026: 1/2 valid PTR PDFs; missing 1: 2002 (HTTP 503)"
+    )
+
+    try:
+        with (
+            patch("analyzer.cli.get_context", return_value=ctx),
+            patch("analyzer.cli.run_parse_pipeline") as parse_pipeline,
+            patch("analyzer.capitol_trades.CapitolTradesSource") as capitol_source,
+        ):
+            result = CliRunner().invoke(app, ["refresh", "--year", "2026"])
+    finally:
+        db.close()
+
+    assert result.exit_code == 1, result.output
+    assert "missing 1: 2002 (HTTP 503)" in result.output
+    parse_pipeline.assert_not_called()
+    capitol_source.assert_not_called()
+
+
+
+def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
+    db = Database(tmp_path / "full-history.duckdb")
+    ctx = MagicMock()
+    ctx.transaction_source.db = db
+
+    def summary(archive_year, **_kwargs):
+        return HouseFetchSummary(
+            archive_year=archive_year,
+            metadata_count=1,
+            ptr_count=1,
+            valid_pdf_count=1,
+            downloaded_count=0,
+            skipped_count=1,
+            orphan_pdf_count=0,
+        )
+
+    ctx.transaction_source.fetch_and_cache_pdfs.side_effect = summary
+    try:
+        with (
+            patch("analyzer.cli.get_context", return_value=ctx),
+            patch(
+                "analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)
+            ) as parse_pipeline,
+        ):
+            result = CliRunner().invoke(
+                app, ["refresh", "--all-years", "--skip-capitol"]
+            )
+    finally:
+        db.close()
+
+    assert result.exit_code == 0, result.output
+    fetched_years = [call.args[0] for call in ctx.transaction_source.fetch_and_cache_pdfs.call_args_list]
+    parsed_years = [call.args[1] for call in parse_pipeline.call_args_list]
+    assert fetched_years == list(range(2015, date.today().year + 1))
+    assert parsed_years == fetched_years
+    assert all(
+        call.kwargs["refresh_metadata"]
+        for call in ctx.transaction_source.fetch_and_cache_pdfs.call_args_list
+    )

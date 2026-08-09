@@ -87,6 +87,7 @@ class Database:
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS metadata (
                 doc_id VARCHAR PRIMARY KEY,
+                archive_year INTEGER,
                 first_name VARCHAR,
                 last_name VARCHAR,
                 filing_date TIMESTAMP,
@@ -94,6 +95,22 @@ class Database:
                 fetched_at TIMESTAMP
             )
         """)
+        columns = {
+            row[1] for row in self.conn.execute("PRAGMA table_info('metadata')").fetchall()
+        }
+        if "archive_year" not in columns:
+            self.conn.execute("ALTER TABLE metadata ADD COLUMN archive_year INTEGER")
+        # Legacy rows did not record their House archive. Filing year keeps them
+        # readable until an authoritative archive refresh corrects cross-year rows.
+        self.conn.execute("""
+            UPDATE metadata
+            SET archive_year = EXTRACT(YEAR FROM filing_date)::INTEGER
+            WHERE archive_year IS NULL
+        """)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metadata_archive_year "
+            "ON metadata(archive_year)"
+        )
 
     def _init_transactions_table(self) -> None:
         self.conn.execute("""
@@ -114,7 +131,19 @@ class Database:
                 instrument_type VARCHAR,
                 strike_price DOUBLE,
                 expiry_date VARCHAR,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                chamber VARCHAR,
+                source_record_id VARCHAR,
+                official_filing_date DATE,
+                available_date DATE,
+                notification_date DATE,
+                amends_source_record_id VARCHAR,
+                raw_transaction_subtype VARCHAR,
+                ticker_origin VARCHAR,
+                raw_asset_class VARCHAR,
+                raw_asset_description VARCHAR,
+                ingestion_generation VARCHAR,
+                artifact_sha256 VARCHAR
             )
         """)
         self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique")
@@ -273,6 +302,7 @@ class Database:
             "source_report_path": "VARCHAR",
             "member_key": "VARCHAR",
             "chamber_member_key": "VARCHAR",
+
             "official_filing_date": "DATE",
             "available_date": "DATE",
             "notification_date": "DATE",
@@ -284,6 +314,7 @@ class Database:
             "raw_asset_class": "VARCHAR",
             "raw_asset_description": "VARCHAR",
             "raw_owner": "VARCHAR",
+
             "ingestion_generation": "VARCHAR",
             "artifact_sha256": "VARCHAR",
         }
@@ -314,17 +345,17 @@ class Database:
     def upsert_metadata(self, df: pd.DataFrame) -> None:
         self.metadata.upsert(df)
 
-    def get_metadata(self, year: int) -> pd.DataFrame:
-        return self.metadata.get_by_year(year)
+    def get_metadata(self, archive_year: int) -> pd.DataFrame:
+        return self.metadata.get_by_archive(archive_year)
 
-    def metadata_exists(self, year: int) -> bool:
-        return self.metadata.exists(year)
+    def metadata_exists(self, archive_year: int) -> bool:
+        return self.metadata.exists(archive_year)
 
-    def clear_metadata(self, year: int) -> None:
-        self.metadata.clear(year)
+    def clear_metadata(self, archive_year: int) -> None:
+        self.metadata.clear(archive_year)
 
-    def replace_metadata(self, year: int, df: pd.DataFrame) -> None:
-        self.metadata.replace_year(year, df)
+    def replace_metadata(self, archive_year: int, df: pd.DataFrame) -> None:
+        self.metadata.replace_archive(archive_year, df)
 
     def upsert_transactions(self, df: pd.DataFrame, *, source: str) -> int:
         return self.transactions.upsert(df, source=source)
@@ -336,15 +367,43 @@ class Database:
         source: str,
         parse_runs: list[dict] | None = None,
     ) -> None:
-        """Atomically replace parsed transactions and their optional audit records."""
-        doc_ids = df["doc_id"].unique().tolist()
+        """Atomically replace one source and record actual persisted row counts.
+
+        Deterministic House reparses replace only deterministic/legacy House
+        rows. OCR and backup-source rows remain available, including when a
+        deterministic parser produces zero rows.
+        """
+        doc_ids = (
+            df["doc_id"].astype(str).unique().tolist()
+            if not df.empty and "doc_id" in df.columns
+            else []
+        )
         self.conn.execute("BEGIN TRANSACTION")
         try:
             for doc_id in doc_ids:
-                self.transactions.delete_for_doc(doc_id)
-            self.transactions.upsert(df, source=source, _in_transaction=True)
+                if source == "house_pdf":
+                    self.conn.execute(
+                        "DELETE FROM transactions "
+                        "WHERE doc_id = ? AND (source = ? OR source IS NULL)",
+                        [doc_id, source],
+                    )
+                else:
+                    self.conn.execute(
+                        "DELETE FROM transactions WHERE doc_id = ? AND source = ?",
+                        [doc_id, source],
+                    )
+            if not df.empty:
+                self.transactions.upsert(df, source=source, _in_transaction=True)
             for parse_run in parse_runs or []:
-                self.parse_runs.upsert(**parse_run, _in_transaction=True)
+                persisted_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM transactions WHERE doc_id = ?",
+                    [parse_run["doc_id"]],
+                ).fetchone()[0]
+                persisted_run = {
+                    **parse_run,
+                    "transaction_count": persisted_count,
+                }
+                self.parse_runs.upsert(**persisted_run, _in_transaction=True)
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")

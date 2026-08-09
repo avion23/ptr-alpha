@@ -1,10 +1,12 @@
 """House disclosure download and PDF parse driver."""
 
 import asyncio
+import hashlib
 import logging
 import os
 import zipfile
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from io import BytesIO
 from multiprocessing import Pool
 from pathlib import Path
@@ -26,7 +28,18 @@ from analyzer.parsing import (
 from analyzer.parser_cascade import _is_valid_pdf, _parse_pdf_worker
 
 logger = logging.getLogger(__name__)
-_PARSE_VERSION = "v3"
+_PARSE_VERSION = "v4-deterministic"
+
+
+@dataclass(frozen=True, slots=True)
+class HouseFetchSummary:
+    archive_year: int
+    metadata_count: int
+    ptr_count: int
+    valid_pdf_count: int
+    downloaded_count: int
+    skipped_count: int
+    orphan_pdf_count: int
 
 
 # ── HouseTransactionSource: House disclosure download + parse driver ──
@@ -75,40 +88,58 @@ class HouseTransactionSource(TransactionSource):
         logger.info(f"Loaded {len(df)} cached transactions for {year}")
         return df
 
-    def fetch_metadata(self, year: int, refresh: bool = False) -> pd.DataFrame:
-        if not refresh and self.db.metadata_exists(year):
-            logger.info(f"Loading cached metadata for {year}")
-            return self.db.get_metadata(year)
+    def fetch_metadata(self, archive_year: int, refresh: bool = False) -> pd.DataFrame:
+        if not refresh and self.db.metadata_exists(archive_year):
+            logger.info("Loading cached metadata for archive %d", archive_year)
+            return self.db.get_metadata(archive_year)
 
-        metadata_url = self.metadata_url_template.format(year=year)
+        metadata_url = self.metadata_url_template.format(year=archive_year)
         try:
             return self._download_and_upsert_metadata(
-                year, metadata_url, replace=refresh
+                archive_year,
+                metadata_url,
+                replace=refresh,
+                bypass_cache=refresh,
             )
         except requests.RequestException as e:
-            raise DataSourceError(f"Failed to fetch metadata for {year}: {e}")
+            raise DataSourceError(
+                f"Failed to fetch metadata archive {archive_year}: {e}"
+            ) from e
+        except (DataSourceError, ParsingError):
+            raise
         except Exception as e:
-            raise DataSourceError(f"Failed to fetch metadata for {year}: {e}")
+            raise DataSourceError(
+                f"Failed to fetch metadata archive {archive_year}: {e}"
+            ) from e
 
     def _download_and_upsert_metadata(
         self,
-        year: int,
+        archive_year: int,
         metadata_url: str,
         *,
         replace: bool = False,
+        bypass_cache: bool = False,
     ) -> pd.DataFrame:
-        logger.info(f"Downloading metadata for {year} from House disclosures")
-        response = self.session.get(metadata_url, timeout=30)
+        logger.info(
+            "Downloading metadata archive %d from House disclosures", archive_year
+        )
+        if bypass_cache:
+            with self.session.cache_disabled():
+                response = self.session.get(metadata_url, timeout=30)
+        else:
+            response = self.session.get(metadata_url, timeout=30)
         if response.status_code != 200:
             raise DataSourceError(
-                f"Failed to fetch metadata for {year}, status: {response.status_code}"
+                f"Failed to fetch metadata archive {archive_year}, "
+                f"status: {response.status_code}"
             )
 
-        content = _read_first_text_from_zip(response.content, year)
+        content = _read_first_text_from_zip(response.content, archive_year)
         df = normalize_house_metadata(content)
         if "FilingType" not in df.columns:
             raise ParsingError("Missing required metadata column: FilingType")
         df["fetched_at"] = datetime.now()
+        df["archive_year"] = archive_year
         df = df.rename(
             columns={
                 "DocID": "doc_id",
@@ -120,11 +151,13 @@ class HouseTransactionSource(TransactionSource):
         )
 
         if replace:
-            self.db.replace_metadata(year, df)
+            self.db.replace_metadata(archive_year, df)
         else:
             self.db.upsert_metadata(df)
-        logger.info(f"Cached metadata for {year}: {len(df)} records")
-        return self.db.get_metadata(year)
+        logger.info(
+            "Cached metadata archive %d: %d records", archive_year, len(df)
+        )
+        return self.db.get_metadata(archive_year)
 
     async def _download_pdf_async(self, session, doc_id, pdf_path, url):
         if _is_valid_pdf(pdf_path):
@@ -166,18 +199,29 @@ class HouseTransactionSource(TransactionSource):
             except OSError:
                 logger.warning("Unable to remove temporary PDF %s", tmp_path)
 
-    async def _fetch_and_cache_pdfs_async(self, year):
-        metadata = self.fetch_metadata(year)
+    async def _fetch_and_cache_pdfs_async(
+        self,
+        archive_year: int,
+        *,
+        refresh_metadata: bool | None = None,
+    ) -> HouseFetchSummary:
+        if refresh_metadata is None:
+            refresh_metadata = archive_year == date.today().year
+        metadata = self.fetch_metadata(archive_year, refresh=refresh_metadata)
         ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
-        pdf_dir = self.data_dir / str(year) / "pdfs"
+        pdf_dir = self.data_dir / str(archive_year) / "pdfs"
         pdf_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Processing {len(ptrs)} PTR filings for {year}")
+        logger.info(
+            "Processing %d PTR filings for archive %d", len(ptrs), archive_year
+        )
 
-        doc_ids = ptrs["DocID"].values
+        doc_ids = ptrs["DocID"].astype(str).tolist()
+        official_doc_ids = set(doc_ids)
         pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
         urls = [
-            self.pdf_url_template.format(year=year, doc_id=doc_id) for doc_id in doc_ids
+            self.pdf_url_template.format(year=archive_year, doc_id=doc_id)
+            for doc_id in doc_ids
         ]
 
         connector = aiohttp.TCPConnector(limit=10)
@@ -193,16 +237,59 @@ class HouseTransactionSource(TransactionSource):
             results = [task.result() for task in tasks]
 
         self._log_download_summary(results)
-        failures = [
-            r
-            for r in results
-            if r.status in (DownloadStatus.FAILED, DownloadStatus.ERROR)
-        ]
-        if failures:
-            sample = ", ".join(str(r.doc_id) for r in failures[:10])
+        missing_doc_ids = sorted(
+            doc_id
+            for doc_id, pdf_path in zip(doc_ids, pdf_paths)
+            if not _is_valid_pdf(pdf_path)
+        )
+        if missing_doc_ids:
+            failure_by_id = {
+                str(result.doc_id): result
+                for result in results
+                if result.status in (DownloadStatus.FAILED, DownloadStatus.ERROR)
+            }
+            details = []
+            for doc_id in missing_doc_ids:
+                failure = failure_by_id.get(doc_id)
+                if failure is None:
+                    details.append(doc_id)
+                    continue
+                reason = failure.error_message or failure.status.value
+                details.append(f"{doc_id} ({reason})")
             raise DataSourceError(
-                f"Failed to download {len(failures)} of {len(results)} House PDFs; doc IDs: {sample}"
+                f"Incomplete House archive {archive_year}: "
+                f"{len(doc_ids) - len(missing_doc_ids)}/{len(doc_ids)} valid PTR PDFs; "
+                f"missing {len(missing_doc_ids)}: {', '.join(details)}"
             )
+
+        valid_pdf_ids = {
+            path.stem for path in pdf_dir.glob("*.pdf") if _is_valid_pdf(path)
+        }
+        summary = HouseFetchSummary(
+            archive_year=archive_year,
+            metadata_count=len(metadata),
+            ptr_count=len(doc_ids),
+            valid_pdf_count=len(official_doc_ids & valid_pdf_ids),
+            downloaded_count=sum(
+                result.status == DownloadStatus.SUCCESS for result in results
+            ),
+            skipped_count=sum(
+                result.status == DownloadStatus.SKIPPED for result in results
+            ),
+            orphan_pdf_count=len(valid_pdf_ids - official_doc_ids),
+        )
+        logger.info(
+            "House archive %d complete: metadata=%d PTR=%d valid=%d "
+            "downloaded=%d skipped=%d orphan=%d",
+            summary.archive_year,
+            summary.metadata_count,
+            summary.ptr_count,
+            summary.valid_pdf_count,
+            summary.downloaded_count,
+            summary.skipped_count,
+            summary.orphan_pdf_count,
+        )
+        return summary
 
     def _log_download_summary(self, results: list[DownloadResult]) -> None:
         downloaded = sum(1 for r in results if r.status == DownloadStatus.SUCCESS)
@@ -216,8 +303,18 @@ class HouseTransactionSource(TransactionSource):
             f"PDF download complete: {downloaded} downloaded, {skipped} skipped, {failed} failed"
         )
 
-    def fetch_and_cache_pdfs(self, year: int) -> None:
-        return asyncio.run(self._fetch_and_cache_pdfs_async(year))
+    def fetch_and_cache_pdfs(
+        self,
+        archive_year: int,
+        *,
+        refresh_metadata: bool | None = None,
+    ) -> HouseFetchSummary:
+        return asyncio.run(
+            self._fetch_and_cache_pdfs_async(
+                archive_year,
+                refresh_metadata=refresh_metadata,
+            )
+        )
 
     def parse_cached_pdfs(self, year: int, *, force: bool = False) -> None:
         metadata = self.fetch_metadata(year)
@@ -276,15 +373,27 @@ class HouseTransactionSource(TransactionSource):
     ) -> None:
         pdf_transactions: dict = {}
         parse_attempts: list[tuple[str, list[str]]] = []
+        raw_transaction_counts: dict[str, int] = {}
         for pdf_path, transactions, engines_attempted in results:
             doc_id = pdf_path.stem
             pdf_transactions[pdf_path] = transactions
+            raw_transaction_counts[doc_id] = len(transactions)
             parse_attempts.append((doc_id, engines_attempted))
 
         df = consolidate_transactions(pdf_transactions, member_lookup)
         transaction_counts = (
             df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
         )
+        if not df.empty:
+            artifact_hashes = {
+                path.stem: _sha256_file(path) for path in pdf_transactions
+            }
+            df["chamber"] = "house"
+            df["source_record_id"] = df["doc_id"].astype(str)
+            df["official_filing_date"] = df["disclosure_date"]
+            df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
+            if "asset_description" in df.columns:
+                df["raw_asset_description"] = df["asset_description"]
         parse_runs = [
             dict(
                 doc_id=doc_id,
@@ -292,8 +401,10 @@ class HouseTransactionSource(TransactionSource):
                 parser_version=_PARSE_VERSION,
                 status="success" if transaction_counts.get(doc_id, 0) else "zero_rows",
                 engines_attempted=",".join(engines_attempted),
-                raw_row_count=0,
-                transaction_count=transaction_counts.get(doc_id, 0),
+                raw_row_count=raw_transaction_counts.get(doc_id, 0),
+                # Database.replace_transactions_for_docs overwrites this with
+                # the actual persisted count inside the replacement transaction.
+                transaction_count=0,
             )
             for doc_id, engines_attempted in parse_attempts
         ]
@@ -313,33 +424,31 @@ class HouseTransactionSource(TransactionSource):
                 ", ".join(doc_ids),
             )
 
-        if df.empty:
-            # Cache zero-row results so image PDFs are not re-parsed next run.
-            self.db.conn.execute("BEGIN TRANSACTION")
-            try:
-                for parse_run in parse_runs:
-                    self.db.parse_runs.upsert(**parse_run, _in_transaction=True)
-                self.db.conn.execute("COMMIT")
-            except Exception:
-                self.db.conn.execute("ROLLBACK")
-                raise
-            logger.info(
-                "Parsed %d PDFs but found no transactions; recorded zero_rows",
-                len(parse_runs),
-            )
-            return
-
-        df = preserve_existing_fields(df, self.db)
+        if not df.empty:
+            df = preserve_existing_fields(df, self.db)
 
         self.db.replace_transactions_for_docs(
             df,
             source="house_pdf",
             parse_runs=parse_runs,
         )
-        logger.info(f"Saved {len(df)} transactions to database")
+        persisted_counts = self.db.count_transactions_for_docs(
+            [doc_id for doc_id, _ in parse_attempts]
+        )
+        logger.info(
+            "Persisted %d transactions across %d parsed PDFs (%d zero-row results)",
+            sum(persisted_counts.values()),
+            len(parse_attempts),
+            len(zero_row_doc_ids),
+        )
 
 
 # ── Helpers ──
+
+
+def _sha256_file(path: Path) -> str:
+    with open(path, "rb") as artifact:
+        return hashlib.file_digest(artifact, "sha256").hexdigest()
 
 
 def _is_blank(value) -> bool:

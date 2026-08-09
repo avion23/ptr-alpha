@@ -315,6 +315,18 @@ class TransactionRepository:
             "strike_price",
             "expiry_date",
             "asset_description",
+            "chamber",
+            "source_record_id",
+            "official_filing_date",
+            "available_date",
+            "notification_date",
+            "amends_source_record_id",
+            "raw_transaction_subtype",
+            "ticker_origin",
+            "raw_asset_class",
+            "raw_asset_description",
+            "ingestion_generation",
+            "artifact_sha256",
         ]:
             if column not in df.columns:
                 df[column] = None
@@ -408,6 +420,7 @@ class TransactionRepository:
                         SELECT {insert_columns_sql}
                         FROM filtered_staging_transactions"""  # nosec B608 -- identifiers are fixed schema constants
                 )
+
             count_after = self.conn.execute(
                 "SELECT COUNT(*) FROM transactions"
             ).fetchone()[0]
@@ -501,6 +514,7 @@ class TransactionRepository:
         result = self.conn.execute(
             """
             SELECT *
+
             FROM transactions
             WHERE doc_id = ?
             ORDER BY id

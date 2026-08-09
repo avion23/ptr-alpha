@@ -10,7 +10,6 @@ import pandas as pd
 import typer
 
 from analyzer.pipeline import (
-    run_fetch_pipeline,
     run_parse_pipeline,
     run_analysis_pipeline,
     run_sales_pipeline,
@@ -31,6 +30,8 @@ from analyzer.models import AnalysisMode
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 logger = logging.getLogger(__name__)
+_CURRENT_YEAR = date.today().year
+_HOUSE_PTR_FIRST_ARCHIVE_YEAR = 2015
 _BACKTEST_DEFAULTS = {
     name: field.default for name, field in BacktestParams.__dataclass_fields__.items()
 }
@@ -447,41 +448,67 @@ def analyze(
         )
 
 
+def _print_house_fetch_summary(summary) -> None:
+    print(
+        f"  House {summary.archive_year}: metadata={summary.metadata_count}, "
+        f"PTR={summary.ptr_count}, valid PDFs={summary.valid_pdf_count}, "
+        f"downloaded={summary.downloaded_count}, skipped={summary.skipped_count}, "
+        f"orphan PDFs={summary.orphan_pdf_count}"
+    )
+
+
 @app.command()
 def fetch(
     ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to process"),
+    year: int = typer.Option(_CURRENT_YEAR, help="House archive year to process"),
     data_dir: str = typer.Option("data", help="Data directory"),
     refresh_metadata: bool = typer.Option(
         False, "--refresh-metadata", help="Force refresh of metadata from House Clerk"
     ),
 ):
-    """Download House PDFs for a year"""
+    """Download and reconcile House PDFs for one official archive."""
     app_ctx = get_context(ctx, data_dir, read_only=False)
-    if refresh_metadata:
-        app_ctx.transaction_source.fetch_metadata(year, refresh=True)
-    result = run_fetch_pipeline(app_ctx.transaction_source, year)
-    raise typer.Exit(0 if result.success else 1)
+    try:
+        summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
+            year,
+            refresh_metadata=refresh_metadata or year == date.today().year,
+        )
+    except Exception as exc:
+        logger.error("House archive %d fetch failed: %s", year, exc)
+        print(f"House fetch incomplete: {exc}", file=sys.stderr)
+        raise typer.Exit(1) from None
+    _print_house_fetch_summary(summary)
+    raise typer.Exit(0)
 
 
 @app.command()
 def parse(
     ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to process"),
+    year: int = typer.Option(_CURRENT_YEAR, help="House archive year to process"),
     data_dir: str = typer.Option("data", help="Data directory"),
     use_gemini_ocr: bool = typer.Option(
         False,
         "--gemini-ocr",
         help="Use Gemini LLM OCR for zero-row PDFs (slower, costs API quota)",
     ),
+    force_full_reparse: bool = typer.Option(
+        False,
+        "--force-full-reparse",
+        help="Ignore deterministic parse fingerprints and reparse every cached PDF",
+    ),
 ):
-    """Parse cached PDFs to database"""
+    """Parse cached PDFs to database."""
     app_ctx = get_context(ctx, data_dir, read_only=False)
+    parse_success = False
     try:
-        result = run_parse_pipeline(app_ctx.transaction_source, year)
+        if force_full_reparse:
+            app_ctx.transaction_source.parse_cached_pdfs(year, force=True)
+            parse_success = True
+        else:
+            result = run_parse_pipeline(app_ctx.transaction_source, year)
+            parse_success = result.success
     except Exception:
         logger.exception("Parse pipeline failed")
-        result = None
     ocr_inserted = 0
     if use_gemini_ocr:
         from scripts.ocr_zero_rows import run_gemini_ocr_for_year
@@ -489,11 +516,11 @@ def parse(
         ocr_inserted = run_gemini_ocr_for_year(
             year, data_dir=app_ctx.settings.data.data_dir
         )
-    if (result is None or not result.success) and use_gemini_ocr and ocr_inserted > 0:
+    if not parse_success and use_gemini_ocr and ocr_inserted > 0:
         logger.warning(
             "Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted
         )
-    raise typer.Exit(0 if result is not None and result.success else 1)
+    raise typer.Exit(0 if parse_success else 1)
 
 
 @app.command()
@@ -1008,7 +1035,7 @@ def snapshot(
 @app.command()
 def refresh(
     ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to refresh"),
+    year: int = typer.Option(_CURRENT_YEAR, help="House archive year to refresh"),
     data_dir: str = typer.Option("data", help="Data directory"),
     use_gemini_ocr: bool = typer.Option(
         False, "--gemini-ocr", help="Use Gemini LLM OCR for zero-row PDFs"
@@ -1021,6 +1048,17 @@ def refresh(
     refresh_metadata: bool = typer.Option(
         False, "--refresh-metadata", help="Force refresh House Clerk metadata"
     ),
+    all_years: bool = typer.Option(
+        False,
+        "--all-years",
+        "--full-history",
+        help="Refresh every official House PTR archive from 2015 through today",
+    ),
+    force_full_reparse: bool = typer.Option(
+        False,
+        "--force-full-reparse",
+        help="Reparse every cached PDF after all requested archives reconcile",
+    ),
 ):
     """
     Official House refresh: fetch PDFs, parse, and optionally run Gemini OCR.
@@ -1028,65 +1066,106 @@ def refresh(
     Capitol Trades is third-party reconciliation data and is explicitly excluded
     from canonical refresh. Use `fetch-capitol` with an output manifest separately.
     """
-    app_ctx = get_context(ctx, data_dir, read_only=False)
 
-    # Count before
+    app_ctx = get_context(ctx, data_dir, read_only=False)
+    archive_years = (
+        list(range(_HOUSE_PTR_FIRST_ARCHIVE_YEAR, date.today().year + 1))
+        if all_years
+        else [year]
+    )
+
     count_before = app_ctx.transaction_source.db.conn.execute(
         "SELECT COUNT(*) FROM transactions"
     ).fetchone()[0]
     failed_steps: list[str] = []
 
-    # Step 1: Fetch House PDFs
-    print(f"[1/4] Fetching House PDFs for {year}...")
-    if refresh_metadata:
-        app_ctx.transaction_source.fetch_metadata(year, refresh=True)
+    # Fetch every requested archive before parsing or invoking a backup source.
+    # A partial PDF set is not a usable refresh generation.
+    label = (
+        f"{archive_years[0]}-{archive_years[-1]}"
+        if len(archive_years) > 1
+        else str(archive_years[0])
+    )
+    print(f"[1/4] Fetching and reconciling House PDF archives {label}...")
+    summaries = []
     try:
-        fetch_result = run_fetch_pipeline(app_ctx.transaction_source, year)
-        if not fetch_result.success:
-            failed_steps.append("fetch")
-    except Exception as e:
-        failed_steps.append("fetch")
-        logger.warning(f"House PDF fetch failed: {e}")
+        for archive_year in archive_years:
+            summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
+                archive_year,
+                refresh_metadata=(
+                    all_years
+                    or refresh_metadata
+                    or archive_year == date.today().year
+                ),
+            )
+            summaries.append(summary)
+            _print_house_fetch_summary(summary)
+    except Exception as exc:
+        logger.warning("House PDF fetch failed: %s", exc)
+        print(f"House fetch incomplete: {exc}")
+        print("FAILED steps: fetch")
+        raise typer.Exit(1) from None
 
-    # Step 2: Parse cached PDFs
-    print(f"[2/4] Parsing cached PDFs for {year}...")
-    try:
-        parse_result = run_parse_pipeline(app_ctx.transaction_source, year)
-        if not parse_result.success:
-            failed_steps.append("parse")
-    except Exception as e:
-        failed_steps.append("parse")
-        logger.warning(f"PDF parse failed: {e}")
+    print(
+        "  House totals: "
+        f"archives={len(summaries)}, "
+        f"metadata={sum(item.metadata_count for item in summaries)}, "
+        f"PTR={sum(item.ptr_count for item in summaries)}, "
+        f"valid PDFs={sum(item.valid_pdf_count for item in summaries)}, "
+        f"orphan PDFs={sum(item.orphan_pdf_count for item in summaries)}"
+    )
+
+    print(f"[2/4] Parsing cached House PDF archives {label}...")
+    for archive_year in archive_years:
+        try:
+            if force_full_reparse:
+                app_ctx.transaction_source.parse_cached_pdfs(
+                    archive_year, force=True
+                )
+            else:
+                parse_result = run_parse_pipeline(
+                    app_ctx.transaction_source, archive_year
+                )
+                if not parse_result.success:
+                    failed_steps.append(f"parse:{archive_year}")
+        except Exception as exc:
+            failed_steps.append(f"parse:{archive_year}")
+            logger.warning("PDF parse failed for %d: %s", archive_year, exc)
 
     # Step 3: Third-party reconciliation is never part of official refresh.
     if skip_capitol:
         print("[3/4] Skipping Capitol Trades reconciliation (--skip-capitol)")
+
     else:
         print(
             "[3/4] Excluding Capitol Trades from official refresh "
             "(use fetch-capitol --output ... --generation ... for reconciliation)"
         )
 
-    # Step 4: Gemini OCR (optional)
     if use_gemini_ocr:
         print("[4/4] Running Gemini OCR on zero-row PDFs...")
-        try:
-            from scripts.ocr_zero_rows import run_gemini_ocr_for_year
+        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
 
-            ocr_inserted = run_gemini_ocr_for_year(
-                year, data_dir=app_ctx.settings.data.data_dir
-            )
-            print(f"  Gemini OCR: {ocr_inserted} transactions inserted")
-        except Exception as e:
-            failed_steps.append("gemini_ocr")
-            logger.warning(f"Gemini OCR failed: {e}")
+        for archive_year in archive_years:
+            try:
+                ocr_inserted = run_gemini_ocr_for_year(
+                    archive_year,
+                    data_dir=app_ctx.settings.data.data_dir,
+                )
+                print(
+                    f"  Gemini OCR {archive_year}: "
+                    f"{ocr_inserted} transactions inserted"
+                )
+            except Exception as exc:
+                failed_steps.append(f"gemini_ocr:{archive_year}")
+                logger.warning("Gemini OCR failed for %d: %s", archive_year, exc)
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 
-    # Count after
     count_after = app_ctx.transaction_source.db.conn.execute(
         "SELECT COUNT(*) FROM transactions"
     ).fetchone()[0]
+    summary_year = archive_years[-1]
     max_date, max_disclosure_date, implausible_date_count = (
         app_ctx.transaction_source.db.conn.execute(
             """
@@ -1099,13 +1178,14 @@ def refresh(
             FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
             """,
-            [year],
+            [summary_year],
         ).fetchone()
     )
 
     added = count_after - count_before
     print(
-        f"\nDone. {count_before} -> {count_after} transactions ({'+' if added >= 0 else ''}{added} new)"
+        f"\nDone. {count_before} -> {count_after} transactions "
+        f"({'+' if added >= 0 else ''}{added} new)"
     )
     print(f"Latest transaction date: {max_date} (eligible: not after disclosure)")
     print(f"Latest disclosure date: {max_disclosure_date}")

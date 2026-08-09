@@ -12,8 +12,103 @@ from analyzer.transaction_repository import (
     SOURCE_TRANSACTION_COLUMNS,
     _normalize_frame,
 )
+
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
 from .conftest import DatabaseTestCase
+
+
+
+
+def test_database_backfills_archive_year_for_legacy_metadata(tmp_path):
+    db_path = tmp_path / "legacy.duckdb"
+    connection = duckdb.connect(str(db_path))
+    connection.execute(
+        """
+        CREATE TABLE metadata (
+            doc_id VARCHAR PRIMARY KEY,
+            first_name VARCHAR,
+            last_name VARCHAR,
+            filing_date TIMESTAMP,
+            filing_type VARCHAR,
+            fetched_at TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO metadata VALUES "
+        "('legacy', 'First', 'Last', '2024-12-31', 'P', '2025-01-01')"
+    )
+    connection.close()
+
+    db = Database(db_path)
+    try:
+        archive_year = db.conn.execute(
+            "SELECT archive_year FROM metadata WHERE doc_id = 'legacy'"
+        ).fetchone()[0]
+    finally:
+        db.close()
+
+    assert archive_year == 2024
+
+
+def test_database_adds_nullable_cross_source_columns_without_backfill(tmp_path):
+    db_path = tmp_path / "legacy-transactions.duckdb"
+    connection = duckdb.connect(str(db_path))
+    connection.execute(
+        """
+        CREATE TABLE transactions (
+            id INTEGER,
+            doc_id VARCHAR,
+            member VARCHAR,
+            ticker VARCHAR,
+            transaction_date DATE,
+            disclosure_date DATE,
+            transaction_type VARCHAR,
+            created_at TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO transactions VALUES (
+            1, 'legacy-doc', 'Legacy Member', 'ABC', '2024-01-01',
+            '2024-01-02', 'Purchase', '2024-01-03'
+        )
+        """
+    )
+    connection.close()
+
+    db = Database(db_path)
+    expected_columns = {
+        "chamber",
+        "source_record_id",
+        "official_filing_date",
+        "available_date",
+        "notification_date",
+        "amends_source_record_id",
+        "raw_transaction_subtype",
+        "ticker_origin",
+        "raw_asset_class",
+        "raw_asset_description",
+        "ingestion_generation",
+        "artifact_sha256",
+    }
+    try:
+        columns = {
+            row[1]
+            for row in db.conn.execute(
+                "PRAGMA table_info('transactions')"
+            ).fetchall()
+        }
+        legacy_values = db.conn.execute(
+            "SELECT " + ", ".join(sorted(expected_columns))
+            + " FROM transactions WHERE doc_id = 'legacy-doc'"
+        ).fetchone()
+    finally:
+        db.close()
+
+    assert expected_columns <= columns
+    assert legacy_values == (None,) * len(expected_columns)
 
 
 class TestMetadata(DatabaseTestCase):
@@ -166,6 +261,28 @@ class TestMetadata(DatabaseTestCase):
         self.db.clear_metadata(2024)
         self.assertFalse(self.db.metadata_exists(2024))
         self.assertTrue(self.db.metadata_exists(2023))
+
+
+    def test_archive_lookup_does_not_use_cross_year_filing_date(self):
+        cross_year = pd.DataFrame(
+            [
+                {
+                    "doc_id": "8218519",
+                    "first_name": "Michael T.",
+                    "last_name": "McCaul",
+                    "filing_date": datetime(2022, 1, 4),
+                    "filing_type": "P",
+                    "fetched_at": datetime(2026, 8, 9),
+                }
+            ]
+        )
+
+        self.db.replace_metadata(2021, cross_year)
+
+        archived = self.db.get_metadata(2021)
+        self.assertEqual(archived["DocID"].tolist(), ["8218519"])
+        self.assertEqual(archived["ArchiveYear"].tolist(), [2021])
+        self.assertTrue(self.db.get_metadata(2022).empty)
 
 
 class TestTransactions(DatabaseTestCase):
@@ -417,6 +534,40 @@ class TestTransactions(DatabaseTestCase):
         )
 
         self.assertEqual(counts, {"doc-count-1": 2, "doc-count-2": 1})
+
+    def test_cross_source_fields_round_trip_when_producer_supplies_them(self):
+        fields = {
+            "chamber": "house",
+            "source_record_id": "20035035",
+            "official_filing_date": date(2026, 8, 5),
+            "available_date": date(2026, 8, 6),
+            "notification_date": date(2026, 8, 7),
+            "amends_source_record_id": "20030000",
+            "raw_transaction_subtype": "purchase",
+            "ticker_origin": "explicit_filing",
+            "raw_asset_class": "Stock",
+            "raw_asset_description": "Apple Inc. - Common Stock",
+            "ingestion_generation": "generation-1",
+            "artifact_sha256": "a" * 64,
+        }
+        row = {
+            "doc_id": "20035035",
+            "member": "Jane Doe",
+            "ticker": "AAPL",
+            "transaction_date": date(2026, 8, 1),
+            "disclosure_date": date(2026, 8, 5),
+            "transaction_type": "Purchase",
+            **fields,
+        }
+
+        self.db.upsert_transactions(pd.DataFrame([row]), source="house_pdf")
+
+        stored = self.db.get_transactions_for_doc("20035035").iloc[0]
+        for name, expected in fields.items():
+            actual = stored[name]
+            if isinstance(expected, date):
+                actual = actual.date()
+            self.assertEqual(actual, expected)
 
     def test_count_transactions_for_docs_returns_empty_for_empty_input(self):
         self.assertEqual(self.db.count_transactions_for_docs([]), {})
@@ -744,6 +895,88 @@ class TestParseRunsTable(DatabaseTestCase):
             "SELECT error_message FROM pdf_parse_runs WHERE doc_id = 'doc3'"
         ).fetchone()
         self.assertEqual(result[0], "PDFTextExtractionNotAllowed")
+
+    def test_upsert_preserves_other_parser_fingerprints_and_collapses_duplicates(self):
+        self.db.conn.execute(
+            """
+            INSERT INTO pdf_parse_runs (
+                doc_id, year, parser_version, status, engines_attempted,
+                raw_row_count, transaction_count
+            ) VALUES
+                ('doc', 2024, 'v4-deterministic', 'success', 'old', 2, 2),
+                ('doc', 2024, 'v4-deterministic', 'success', 'duplicate', 2, 2),
+                ('doc', 2024, 'v4-gemini-manual', 'success', 'gemini', 1, 1)
+            """
+        )
+
+        self.db.parse_runs.upsert(
+            doc_id="doc",
+            year=2024,
+            parser_version="v4-deterministic",
+            status="zero_rows",
+            engines_attempted="pdfplumber",
+            raw_row_count=0,
+            transaction_count=1,
+        )
+
+        rows = self.db.conn.execute(
+            """
+            SELECT parser_version, status, transaction_count
+            FROM pdf_parse_runs WHERE doc_id = 'doc'
+            ORDER BY parser_version
+            """
+        ).fetchall()
+        self.assertEqual(
+            rows,
+            [
+                ("v4-deterministic", "zero_rows", 1),
+                ("v4-gemini-manual", "success", 1),
+            ],
+        )
+
+    def test_zero_row_reparse_preserves_ocr_and_records_persisted_count(self):
+        self.db.upsert_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "doc_id": "ocr-doc",
+                        "member": "Jane Doe",
+                        "ticker": "AAPL",
+                        "transaction_date": date(2024, 1, 2),
+                        "disclosure_date": date(2024, 1, 3),
+                        "transaction_type": "Purchase",
+                    }
+                ]
+            ),
+            source="gemini_ocr",
+        )
+        parse_run = {
+            "doc_id": "ocr-doc",
+            "year": 2024,
+            "parser_version": "v4-deterministic",
+            "status": "zero_rows",
+            "engines_attempted": "pdfplumber,pdftotext",
+            "raw_row_count": 0,
+            "transaction_count": 0,
+        }
+
+        self.db.replace_transactions_for_docs(
+            pd.DataFrame(),
+            source="house_pdf",
+            parse_runs=[parse_run],
+        )
+
+        transaction = self.db.conn.execute(
+            "SELECT source FROM transactions WHERE doc_id = 'ocr-doc'"
+        ).fetchone()
+        persisted = self.db.conn.execute(
+            """
+            SELECT status, transaction_count FROM pdf_parse_runs
+            WHERE doc_id = 'ocr-doc' AND parser_version = 'v4-deterministic'
+            """
+        ).fetchone()
+        self.assertEqual(transaction[0], "gemini_ocr")
+        self.assertEqual(persisted, ("zero_rows", 1))
 
 
 class TestTransactionNormalization(DatabaseTestCase):

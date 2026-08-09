@@ -124,12 +124,19 @@ def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
     for key, value in metrics.items():
         print(f"  {key:35s} {value}")
     final = equity.iloc[-1]
-    print(
-        f"\nFinal gross value ${final['gross_value']:,.2f}; "
-        f"liquidation value ${final['liquidation_value']:,.2f}; "
-        f"open exposure ${final['open_exposure']:,.2f}; "
-        f"estimated liquidation cost ${final['estimated_liquidation_cost']:,.2f}."
-    )
+    if final["valuation_complete"]:
+        print(
+            f"\nFinal gross value ${final['gross_value']:,.2f}; "
+            f"liquidation value ${final['liquidation_value']:,.2f}; "
+            f"open exposure ${final['open_exposure']:,.2f}; "
+            f"estimated liquidation cost ${final['estimated_liquidation_cost']:,.2f}."
+        )
+    else:
+        print(
+            "\nFinal portfolio value unavailable: "
+            f"{int(final['unavailable_open_positions'])} open positions lack a "
+            "fresh, valid mark."
+        )
     return 0
 
 

@@ -73,7 +73,9 @@ def build_kelly_portfolio(
     """
     config = config or KellyConfig()
     _validate_config(config)
-    df = _validated_recommendations(recommendations)
+    df = _validated_recommendations(
+        recommendations, require_crash_prob=config.crash_guard
+    )
     if df.empty:
         return _empty_portfolio()
 
@@ -105,12 +107,18 @@ def _validate_config(config: KellyConfig) -> None:
         raise ValueError("min_kelly_floor must be non-negative and finite")
 
 
-def _validated_recommendations(recommendations: pd.DataFrame) -> pd.DataFrame:
+def _validated_recommendations(
+    recommendations: pd.DataFrame, *, require_crash_prob: bool
+) -> pd.DataFrame:
     if recommendations.empty or not REQUIRED_SIZING_COLUMNS.issubset(recommendations.columns):
+        return pd.DataFrame()
+    if require_crash_prob and "crash_prob" not in recommendations.columns:
         return pd.DataFrame()
 
     df = recommendations.copy()
     numeric = ["signal_score", "win_rate", "avg_win_pct", "avg_loss_pct"]
+    if require_crash_prob:
+        numeric.append("crash_prob")
     for column in numeric:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
@@ -131,6 +139,8 @@ def _validated_recommendations(recommendations: pd.DataFrame) -> pd.DataFrame:
         & df["avg_win_pct"].gt(0)
         & df["avg_loss_pct"].gt(0)
     )
+    if require_crash_prob:
+        valid &= df["crash_prob"].between(0.0, 1.0, inclusive="both")
     df = df.loc[valid].copy()
     if df.empty:
         return df
@@ -139,7 +149,11 @@ def _validated_recommendations(recommendations: pd.DataFrame) -> pd.DataFrame:
     if "crash_prob" not in df.columns:
         df["crash_prob"] = 0.0
     else:
-        df["crash_prob"] = pd.to_numeric(df["crash_prob"], errors="coerce").fillna(0.0)
+        df["crash_prob"] = pd.to_numeric(
+            df["crash_prob"], errors="coerce"
+        )
+        if not require_crash_prob:
+            df["crash_prob"] = df["crash_prob"].fillna(0.0)
     return df
 
 

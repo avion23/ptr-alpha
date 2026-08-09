@@ -11,6 +11,7 @@ from analyzer.portfolio import (
     compute_portfolio_metrics,
     simulate_portfolio_returns,
 )
+from analyzer.portfolio.simulation import _attach_sizing_inputs, _prepare_sizing_inputs
 
 
 def _sizing_rows(tickers, members=None):
@@ -168,3 +169,160 @@ def test_empty_inputs_abstain():
     assert build_kelly_portfolio(pd.DataFrame()).empty
     assert simulate_portfolio_returns(pd.DataFrame(), pd.DataFrame()).empty
     assert compute_portfolio_metrics(pd.DataFrame()) == {}
+
+
+def test_zero_mark_is_preserved_as_total_loss():
+    targets = pd.DataFrame(
+        {"as_of_date": [date(2024, 1, 1)], "ticker": ["A"], "weight": [1.0]}
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0, 0.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+    )
+
+    curve = simulate_portfolio_returns(
+        targets, prices, horizon=60, entry_slippage_bps=0,
+        exit_slippage_bps=0, initial_capital=100,
+    )
+    metrics = compute_portfolio_metrics(curve)
+
+    assert curve.iloc[-1]["open_exposure"] == 0.0
+    assert curve.iloc[-1]["liquidation_value"] == 0.0
+    assert metrics["total_return_pct"] == -100.0
+    assert metrics["valuation_complete"] is True
+
+
+def test_stale_open_mark_makes_equity_unavailable_and_blocks_new_sizing():
+    targets = pd.DataFrame(
+        {
+            "as_of_date": [date(2024, 1, 1), date(2024, 1, 10)],
+            "ticker": ["A", "B"],
+            "weight": [0.5, 0.5],
+        }
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0, None], "B": [10.0, 10.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-10"]),
+    )
+
+    curve = simulate_portfolio_returns(
+        targets, prices, horizon=60, entry_slippage_bps=0, exit_slippage_bps=0,
+        initial_capital=100, max_mark_staleness_days=3,
+    )
+    metrics = compute_portfolio_metrics(curve)
+    final = curve.iloc[-1]
+
+    assert pd.isna(final["liquidation_value"])
+    assert final["unavailable_open_positions"] == 1
+    assert final["valuation_skips"] == 1
+    assert final["executed_positions"] == 1
+    assert metrics["valuation_complete"] is False
+    assert metrics["total_return_pct"] is None
+    assert metrics["open_exposure"] is None
+
+
+def test_enabled_crash_guard_abstains_on_missing_or_malformed_probability():
+    rows = _sizing_rows(["A"])
+    missing = rows.drop(columns="crash_prob")
+    assert build_kelly_portfolio(missing, KellyConfig(crash_guard=True)).empty
+
+    malformed = rows.copy()
+    malformed.loc[0, "crash_prob"] = float("nan")
+    assert build_kelly_portfolio(malformed, KellyConfig(crash_guard=True)).empty
+
+    outside_range = rows.copy()
+    outside_range.loc[0, "crash_prob"] = 1.1
+    assert build_kelly_portfolio(outside_range, KellyConfig(crash_guard=True)).empty
+
+
+def test_raw_invalid_targets_count_in_requested_coverage_and_skips():
+    targets = pd.DataFrame(
+        {
+            "as_of_date": [date(2024, 1, 1)] * 3,
+            "ticker": ["A", "B", ""],
+            "weight": [0.1, float("nan"), 0.1],
+        }
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0], "B": [100.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+
+    final = simulate_portfolio_returns(
+        targets, prices, initial_capital=100, entry_slippage_bps=0,
+        exit_slippage_bps=0,
+    ).iloc[-1]
+
+    assert final["requested_signals"] == 3
+    assert final["invalid_target_skips"] == 2
+    assert final["skipped_signals"] == 2
+    assert final["executed_positions"] == 1
+    assert final["signal_coverage_pct"] == pytest.approx(100 / 3)
+
+
+def test_all_or_skip_policy_never_counts_partial_fill_as_execution():
+    targets = pd.DataFrame(
+        {
+            "as_of_date": [date(2024, 1, 1), date(2024, 1, 1)],
+            "ticker": ["A", "B"],
+            "weight": [0.8, 0.8],
+        }
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0], "B": [100.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+
+    final = simulate_portfolio_returns(
+        targets, prices, initial_capital=100, entry_slippage_bps=0,
+        exit_slippage_bps=0,
+    ).iloc[-1]
+
+    assert final["execution_policy"] == "all_or_skip"
+    assert final["executed_positions"] == 1
+    assert final["cash_skips"] == 1
+    assert final["partial_fills"] == 0
+    assert final["requested_entry_notional"] == pytest.approx(160.0)
+    assert final["filled_entry_notional"] == pytest.approx(80.0)
+    assert final["notional_fill_pct"] == pytest.approx(50.0)
+
+
+def test_sizing_estimate_uses_latest_date_not_after_rebalance():
+    sizing = _prepare_sizing_inputs(
+        pd.DataFrame(
+            {
+                "as_of_date": ["2023-12-01", "2024-01-01", "2024-02-01"],
+                "ticker": ["A", "A", "A"],
+                "member": ["m", "m", "m"],
+                "win_rate": [0.55, 0.60, 0.90],
+                "avg_win_pct": [1.5, 1.5, 9.0],
+                "avg_loss_pct": [1.2, 1.2, 1.0],
+            }
+        )
+    )
+    recs = pd.DataFrame({"ticker": ["A"], "signal_score": [1.0]})
+
+    attached = _attach_sizing_inputs(recs, sizing, pd.Timestamp("2024-01-15"))
+
+    assert attached.iloc[0]["win_rate"] == pytest.approx(0.60)
+    assert attached.iloc[0]["avg_win_pct"] == pytest.approx(1.5)
+
+
+def test_sizing_estimate_duplicates_and_malformed_rows_fail_clearly():
+    duplicate = pd.DataFrame(
+        {
+            "as_of_date": ["2024-01-01", "2024-01-01"],
+            "ticker": ["A", "A"],
+            "member": ["m", "m"],
+            "win_rate": [0.6, 0.7],
+            "avg_win_pct": [1.5, 1.5],
+            "avg_loss_pct": [1.2, 1.2],
+        }
+    )
+    with pytest.raises(ValueError, match="duplicate dated ticker"):
+        _prepare_sizing_inputs(duplicate)
+
+    malformed = duplicate.iloc[:1].copy()
+    malformed.loc[0, "as_of_date"] = "not-a-date"
+    with pytest.raises(ValueError, match="malformed rows"):
+        _prepare_sizing_inputs(malformed)

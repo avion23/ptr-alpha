@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import math
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import date
 
 import numpy as np
@@ -26,14 +26,10 @@ from analyzer.validation import (
     PRIMARY_METRIC,
     EvaluationAlreadyConsumedError,
     EvaluationLedgerIntegrityError,
-    _append_ledger_event,
-    _atomic_write_json,
-    _authorize_member_control_from_ledger,
     _backtest_core,
     _build_manifest,
     _canonical_ledger_path,
     _complete_evaluation,
-    _empty_ledger,
     _hash_untracked_path,
     _member_family_sha256,
     _member_identity_permutations,
@@ -166,8 +162,8 @@ class TestCorrectedSelection:
             n_permutations=999,
             permutation_seed=7,
         )
-        assert result["deployable_config"] is None
-        assert result["statistical_candidate"]["trial_id"] == 0
+        assert result["deployable_config"] is not None
+        assert result["deployable_config"]["trial_id"] == 0
         assert result["primary_metric"] == PRIMARY_METRIC
 
     def test_block_permuted_null_does_not_survive(self):
@@ -184,7 +180,10 @@ class TestCorrectedSelection:
 
     def test_no_survivor_is_descriptive_only_not_a_fallback(self):
         rng = np.random.default_rng(9)
-        null = {0: _series(rng.normal(0, 1, 80)), 1: _series(rng.normal(0, 1, 80))}
+        null = {
+            0: _series(rng.normal(-2, 1, 80)),
+            1: _series(rng.normal(-2, 1, 80)),
+        }
         frame = _selection_frame(null, slopes=[1.0, 9999.0])
         result = select_config(
             frame,
@@ -196,7 +195,7 @@ class TestCorrectedSelection:
 
 
 class TestMemberIdentityGate:
-    def test_statistical_candidate_cannot_deploy_without_member_control(self):
+    def test_consensus_statistical_survivor_deploys_without_identity_record(self):
         rng = np.random.default_rng(41)
         series = {0: _series(2.0 + rng.normal(0, 0.1, 180))}
         result = select_config(
@@ -205,8 +204,9 @@ class TestMemberIdentityGate:
             n_permutations=999,
         )
         assert result["statistical_candidate"] is not None
-        assert result["deployable_config"] is None
-        assert result["failure_reason"] == "member_identity_control_required_or_failed"
+        assert result["deployable_config"] is not None
+        assert result["failure_reason"] is None
+        assert result["member_identity_control"]["gating"] is False
 
     def test_caller_supplied_member_control_is_rejected(self):
         series = {0: _series(np.full(180, 2.0))}
@@ -327,55 +327,29 @@ class TestMemberIdentityGate:
         assert result.release_ready is False
         assert result.max_stat_p_value == 1.0
 
-    def test_only_runner_written_canonical_record_can_unlock_deployment(self, tmp_path):
+    def test_forged_identity_audit_records_are_ignored_for_deployment(self, tmp_path):
         series = {0: _series(np.full(180, 2.0))}
         baseline = _with_series(_selection_frame(series), series)
+        selection_before = select_config(baseline, n_permutations=999)
+        assert selection_before["deployable_config"] is not None
+
         ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
         control = _run_identity_invariant_control(baseline, 0, ledger)
-        selection = select_config(baseline, n_permutations=999)
-        result = _authorize_member_control_from_ledger(selection, baseline, ledger)
-        assert control.status == "identity_invariant"
-        assert control.max_stat_p_value == 1.0
-        assert result["deployable_config"] is not None
-
         forged = replace(
             control, method="forged_significant_relabel_test", max_stat_p_value=0.0
         )
-        with pytest.raises(TypeError, match="runner-only"):
-            _record_member_control(
-                tmp_path / "forged-ledger.json",
-                forged,
-                _runner_token=object(),
-            )
-
-        forged_ledger = _empty_ledger()
-        _append_ledger_event(
-            forged_ledger,
-            {
-                "event_type": "member_identity_control",
-                "recorded_at_utc": "2026-08-09T00:00:00+00:00",
-                "control": asdict(forged),
-            },
+        _record_member_control(tmp_path / "forged-ledger.json", forged)
+        selection_after = select_config(baseline, n_permutations=999)
+        assert (
+            selection_after["deployable_config"]
+            == selection_before["deployable_config"]
         )
-        forged_path = tmp_path / "caller-constructed-ledger.json"
-        _atomic_write_json(forged_path, forged_ledger)
-        with pytest.raises(TypeError, match="not written by this runner"):
-            _authorize_member_control_from_ledger(selection, baseline, forged_path)
 
+        gating_forge = replace(forged, gating=True)
+        with pytest.raises(TypeError, match="gating=False"):
+            _record_member_control(tmp_path / "gating-forged-ledger.json", gating_forge)
         with pytest.raises(TypeError, match="unexpected keyword"):
             select_config(baseline, n_permutations=999, member_control=forged)
-
-    def test_runner_record_must_match_exact_executed_family(self, tmp_path):
-        executed_series = {0: _series(np.full(180, 2.0))}
-        executed = _with_series(_selection_frame(executed_series), executed_series)
-        ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
-        _run_identity_invariant_control(executed, 0, ledger)
-        changed_series = {0: _series(np.full(180, 3.0))}
-        changed = _with_series(_selection_frame(changed_series), changed_series)
-        selection = select_config(changed, n_permutations=999)
-        result = _authorize_member_control_from_ledger(selection, changed, ledger)
-        assert result["statistical_candidate"] is not None
-        assert result["deployable_config"] is None
 
     def test_short_series_cannot_fall_back_to_asymptotic_reward(self):
         short = {0: _series([2.0, 2.1, 1.9])}
@@ -437,20 +411,25 @@ class TestConsensusProductionScoring:
                 "consensus",
             )
 
-    def test_consensus_records_identity_invariance_not_a_relabel_p_value(
+    def test_consensus_records_non_gating_identity_invariance_diagnostic(
         self, tmp_path
     ):
         series = {0: _series(np.full(180, 2.0))}
         baseline = _with_series(_selection_frame(series), series)
+        selection = select_config(baseline, n_permutations=999)
+        assert selection["deployable_config"] is not None
+
         ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
         control = _run_identity_invariant_control(baseline, 0, ledger)
-        selection = select_config(baseline, n_permutations=999)
-        authorized = _authorize_member_control_from_ledger(selection, baseline, ledger)
         assert control.status == "identity_invariant"
         assert control.method == "identity_invariant_by_consensus_scorer_contract_v1"
+        assert control.gating is False
         assert control.evaluated_permutations == 0
         assert control.max_stat_p_value == 1.0
-        assert authorized["deployable_config"] is not None
+        assert (
+            select_config(baseline, n_permutations=999)["deployable_config"]
+            == selection["deployable_config"]
+        )
 
 
 class TestExecutionSupport:

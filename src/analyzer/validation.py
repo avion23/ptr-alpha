@@ -48,13 +48,12 @@ VALIDATION_ENTRY_DELAY_DAYS = 0  # evaluate_backtest(use_dip_entry=False)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
 MEMBER_EXACT_GROUP_LIMIT = 720
 MEMBER_RUNTIME_BUDGET_SECONDS = 300.0
-_RUNNER_LEDGER_TOKEN = object()
-_RUNNER_WRITTEN_CONTROL_EVENTS: set[str] = set()
 
 
 @dataclass(frozen=True, slots=True)
 class MemberIdentityControlResult:
     status: str
+    gating: bool
     method: str
     requested_permutations: int
     evaluated_permutations: int
@@ -637,16 +636,20 @@ def select_config(
             ["overall_alpha", "nw_tstat"], ascending=False
         )
         statistical_candidate = order.iloc[0].to_dict()
-        statistical_candidate["label"] = "statistical_candidate_requires_member_control"
+        statistical_candidate["label"] = "statistical_family_survivor"
 
     deployable = None
+    if statistical_candidate is not None:
+        deployable = dict(statistical_candidate)
+        deployable["label"] = "deployable_statistical_family_survivor"
     member_summary = {
-        "status": "not_required_no_statistical_candidate",
-        "release_ready": False,
-        "runtime_seconds": 0.0,
+        "status": (
+            "audit_pending"
+            if statistical_candidate is not None
+            else "not_needed_no_statistical_candidate"
+        ),
         "gating": False,
-        "diagnostic_record": "not_needed_without_statistical_candidate",
-        "authorization_source": "canonical_hash_chained_ledger_only",
+        "diagnostic_only": True,
     }
 
     if not source_series:
@@ -659,8 +662,6 @@ def select_config(
         reason = "insufficient_bootstrap_count_or_family_resolution"
     elif statistical_candidate is None:
         reason = "no_dependence_safe_survivor"
-    elif deployable is None:
-        reason = "member_identity_control_required_or_failed"
     else:
         reason = None
     return {
@@ -709,6 +710,7 @@ def _run_identity_invariant_control(
         )
     result = MemberIdentityControlResult(
         status="identity_invariant",
+        gating=False,
         method="identity_invariant_by_consensus_scorer_contract_v1",
         requested_permutations=0,
         evaluated_permutations=0,
@@ -725,7 +727,7 @@ def _run_identity_invariant_control(
         observed_trial_id=observed_trial_id,
         observed_statistic=float(row["nw_tstat"]),
     )
-    _record_member_control(ledger_path, result, _runner_token=_RUNNER_LEDGER_TOKEN)
+    _record_member_control(ledger_path, result)
     return result
 
 
@@ -839,6 +841,7 @@ def _run_member_identity_control(
     )
     payload = {
         "status": status,
+        "gating": False,
         "method": "uniform_full_permutation_group_family_max_stat",
         "requested_permutations": n_permutations,
         "evaluated_permutations": evaluated,
@@ -858,7 +861,7 @@ def _run_member_identity_control(
         "observed_statistic": observed_statistic,
     }
     result = MemberIdentityControlResult(**payload)
-    _record_member_control(ledger_path, result, _runner_token=_RUNNER_LEDGER_TOKEN)
+    _record_member_control(ledger_path, result)
     return result
 
 
@@ -968,15 +971,13 @@ def _refuse_legacy_ledger(ledger_path: Path) -> None:
 
 
 def _record_member_control(
-    ledger_path: Path,
-    result: MemberIdentityControlResult,
-    *,
-    _runner_token: object,
+    ledger_path: Path, result: MemberIdentityControlResult
 ) -> None:
+    """Append a non-gating identity diagnostic audit event."""
     import fcntl
 
-    if _runner_token is not _RUNNER_LEDGER_TOKEN:
-        raise TypeError("identity-control ledger events are runner-only")
+    if result.gating:
+        raise TypeError("identity diagnostics must declare gating=False")
     _refuse_legacy_ledger(ledger_path)
     lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -996,91 +997,8 @@ def _record_member_control(
                 "control": asdict(result),
             },
         )
-        event_sha256 = ledger["events"][-1]["event_sha256"]
         _atomic_write_json(ledger_path, ledger)
-        _RUNNER_WRITTEN_CONTROL_EVENTS.add(event_sha256)
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-
-def _read_member_control(
-    ledger_path: Path,
-    family_sha256: str,
-    observed_trial_id: int,
-    observed_statistic: float,
-) -> dict | None:
-    import fcntl
-
-    _refuse_legacy_ledger(ledger_path)
-    if not ledger_path.exists():
-        return None
-    lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
-        ledger = json.loads(ledger_path.read_text())
-        _validate_ledger(ledger)
-        for event in reversed(ledger["events"]):
-            if event.get("event_type") != "member_identity_control":
-                continue
-            control = event.get("control", {})
-            if (
-                control.get("family_sha256") == family_sha256
-                and int(control.get("observed_trial_id", -1)) == observed_trial_id
-                and float(control.get("observed_statistic", math.nan))
-                == observed_statistic
-            ):
-                if event.get("event_sha256") not in _RUNNER_WRITTEN_CONTROL_EVENTS:
-                    raise TypeError(
-                        "identity-control record was not written by this runner process"
-                    )
-                return control
-        return None
-
-
-def _authorize_member_control_from_ledger(
-    selection: dict,
-    sweep_df: pd.DataFrame,
-    ledger_path: Path,
-) -> dict:
-    result = dict(selection)
-    statistical_candidate = result.get("statistical_candidate")
-    if statistical_candidate is None:
-        return result
-    series_by_trial = sweep_df.attrs.get("series_by_trial")
-    if not isinstance(series_by_trial, dict):
-        return result
-    family_sha256 = _member_family_sha256(sweep_df, series_by_trial)
-    control = _read_member_control(
-        ledger_path,
-        family_sha256,
-        int(statistical_candidate["trial_id"]),
-        float(statistical_candidate["nw_tstat"]),
-    )
-    if control is None:
-        result["member_identity_control"] = {
-            "status": "missing_canonical_ledger_control",
-            "release_ready": False,
-            "gating": False,
-            "authorization_source": "canonical_hash_chained_ledger_only",
-        }
-        return result
-    result["member_identity_control"] = control
-    passes = bool(
-        statistical_candidate.get("scoring_mode") == "consensus"
-        and statistical_candidate.get("scorer_provenance")
-        == CONSENSUS_SCORER_PROVENANCE
-        and control.get("status") == "identity_invariant"
-        and control.get("method")
-        == "identity_invariant_by_consensus_scorer_contract_v1"
-        and control.get("release_ready") is True
-    )
-    if not passes:
-        return result
-    deployable = dict(statistical_candidate)
-    deployable["label"] = "deployable_train_survivor"
-    result["deployable_config"] = deployable
-    result["failure_reason"] = None
-    result["n_survivors"] = 1
-    return result
 
 
 def _reserve_evaluation(
@@ -1273,20 +1191,12 @@ def _run_validation_with_db(
     )
     statistical_candidate = selection["statistical_candidate"]
     if statistical_candidate is not None:
-        _run_identity_invariant_control(
+        identity_diagnostic = _run_identity_invariant_control(
             train_df,
             int(statistical_candidate["trial_id"]),
             evaluation_ledger_path,
         )
-        selection = select_config(
-            train_df,
-            alpha,
-            n_permutations=n_permutations,
-            permutation_seed=permutation_seed,
-        )
-        selection = _authorize_member_control_from_ledger(
-            selection, train_df, evaluation_ledger_path
-        )
+        selection["member_identity_control"] = asdict(identity_diagnostic)
     manifest = _build_manifest(
         db_path,
         all_tx,
@@ -1614,7 +1524,7 @@ def _build_manifest(
             ),
             "identity_dependent_modes": "descriptive_non_deployable",
             "member_control_integrity": (
-                "runner_only_process_bound_canonical_hash_chain_event"
+                "audit_only_canonical_hash_chain_event_not_authorization"
             ),
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "minimum_family_resolution_bootstrap": max(

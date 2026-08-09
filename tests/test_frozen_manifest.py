@@ -51,7 +51,7 @@ class TestFreeze:
             == "retrospective_previously_used_not_fresh_oos"
         )
         assert manifest["verdict_policy"]["top_level_verdict"] == "not_established"
-        assert manifest["phases"]["locked_final"]["consumed"] is False
+        assert manifest["config"]["phases"]["locked_final"]["consumed"] is False
         assert (
             manifest["config"]["phases"]["test"]["status"]
             == "retrospective_diagnostics_only"
@@ -88,14 +88,12 @@ class TestFreeze:
         manifest["config"]["alpha"] = 0.99
         ok, reasons = fv.verify_frozen_state(manifest)
         assert not ok
-        assert any("config_sha256 mismatch" in reason for reason in reasons)
+        assert any("config_sha256" in reason for reason in reasons)
 
     def test_verify_fails_closed_on_code_drift(self, tmp_path, monkeypatch):
         manifest_path = _freeze(tmp_path, monkeypatch)
         manifest = json.loads(manifest_path.read_text())
-        monkeypatch.setattr(
-            "analyzer.validation._code_hash", lambda: "f" * 64
-        )
+        monkeypatch.setattr(fv, "_code_hash", lambda: "f" * 64)
         ok, reasons = fv.verify_frozen_state(manifest)
         assert not ok
         assert any("code_sha256 mismatch" in reason for reason in reasons)
@@ -104,7 +102,8 @@ class TestFreeze:
         manifest_path = _freeze(tmp_path, monkeypatch)
         manifest = json.loads(manifest_path.read_text())
         monkeypatch.setattr(
-            "analyzer.validation._git_state",
+            fv,
+            "_git_state",
             lambda: {
                 "revision": "deadbeef" * 5,
                 "dirty": False,
@@ -119,7 +118,7 @@ class TestFreeze:
         manifest_path = _freeze(tmp_path, monkeypatch)
         manifest = json.loads(manifest_path.read_text())
         monkeypatch.setattr(
-            "analyzer.validation._dependency_version", lambda name: "0.0.0-drifted"
+            fv, "_dependency_version", lambda name: "0.0.0-drifted"
         )
         ok, reasons = fv.verify_frozen_state(manifest)
         assert not ok

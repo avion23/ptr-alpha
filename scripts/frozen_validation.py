@@ -206,6 +206,14 @@ def verify_frozen_state(manifest: dict) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     hashes = manifest.get("hashes", {})
     current = frozen_hashes()
+    # Self-consistency: the hash of the manifest's embedded config must equal
+    # the config hash the manifest records (tampering with either is caught).
+    embedded_config_hash = _sha256_json(manifest.get("config", {}))
+    if hashes.get("config_sha256") != embedded_config_hash:
+        reasons.append(
+            "config_sha256 self-consistency mismatch: embedded config does not "
+            "hash to the recorded config_sha256"
+        )
     for key in (
         "config_sha256",
         "code_sha256",
@@ -218,8 +226,8 @@ def verify_frozen_state(manifest: dict) -> tuple[bool, list[str]]:
             reasons.append(
                 f"{key} mismatch: frozen={hashes.get(key)} live={current[key]}"
             )
-    if current.get("git_dirty") is True:
-        reasons.append("working tree is dirty; diff_sha256 covers tracked and untracked drift")
+    # git_dirty is recorded for provenance only; the exact state is pinned by
+    # git_diff_sha256 (tracked diff + untracked files), so no separate guard.
     return (not reasons, reasons)
 
 

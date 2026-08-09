@@ -11,8 +11,11 @@ For each `as_of_date`, this:
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
+from analyzer.ticker_resolver import TickerResolver
 from analyzer.backtest.filters import (
     _filter_recent_trades,
     _filter_ticker_perf,
@@ -55,12 +58,16 @@ def backtest_recommendations(
         else None
     )
 
+    signals_df = _filter_equity_rows(signals_df)
+    if signals_df.empty:
+        return pd.DataFrame()
     training = _filter_training(signals_df, horizon, as_of_iso, training_lookback_iso)
     member_rankings = _build_member_rankings(training, horizon, threshold, bayes)
     if member_rankings is None or member_rankings.empty:
         return pd.DataFrame()
 
     recent_trades = _filter_recent_trades(transactions_df, lookback_days, as_of_iso)
+    recent_trades = _filter_equity_rows(recent_trades)
     if recent_trades.empty:
         return pd.DataFrame()
 
@@ -95,8 +102,66 @@ def _build_member_rankings(training, horizon, threshold, bayes):
         return None
 
 
+_UNSUPPORTED_ASSET_RE = re.compile(
+    r"\b(?:mutual fund|money market|treasury|government securit|corporate bond|"
+    r"municipal bond|real estate|cryptocurrency|private equity|limited partnership)\b",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_ASSET_CLASSES = {
+    "government securities",
+    "other",
+    "corporate securities",
+    "property/real estate",
+    "stock option",
+    "option",
+    "call",
+    "put",
+}
+
+
+def _filter_equity_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """Keep rows positively identified as public stock; abstain otherwise."""
+    if rows.empty:
+        return rows
+    mask = pd.Series(True, index=rows.index)
+    if "instrument_type" in rows.columns:
+        instruments = (
+            rows["instrument_type"].fillna("").astype(str).str.strip().str.lower()
+        )
+        mask &= instruments.eq("stock")
+    if "raw_asset_class" in rows.columns:
+        classes = rows["raw_asset_class"].fillna("").astype(str).str.strip().str.lower()
+        mask &= ~classes.isin(_UNSUPPORTED_ASSET_CLASSES)
+    descriptions = pd.Series("", index=rows.index, dtype="object")
+    for column in ("asset_description", "raw_asset_description"):
+        if column in rows.columns:
+            descriptions = descriptions.str.cat(
+                rows[column].fillna("").astype(str), sep=" "
+            )
+    mask &= ~descriptions.str.contains(_UNSUPPORTED_ASSET_RE, na=False)
+    mask &= ~descriptions.str.contains(
+        r"\[(?:OP|OT|GS|GB|MF|OL|CT|HN|OI|RS)\]", case=False, regex=True
+    )
+    return rows.loc[mask].copy()
+
+
 def _candidate_tickers(recent_trades: pd.DataFrame, min_buyers: int) -> list:
-    buyer_counts = recent_trades.groupby("ticker")["member"].nunique()
+    resolver = TickerResolver()
+    eligible: list[str] = []
+    for ticker, trades in recent_trades.groupby("ticker"):
+        dates = (
+            pd.to_datetime(trades["disclosure_date"], errors="coerce").dropna()
+            if "disclosure_date" in trades.columns
+            else pd.Series(dtype="datetime64[ns]")
+        )
+        trade_date = dates.max().date() if not dates.empty else None
+        if resolver.is_strategy_eligible(ticker, trade_date):
+            eligible.append(ticker)
+    buyer_counts = (
+        recent_trades[recent_trades["ticker"].isin(eligible)]
+        .groupby("ticker")["member"]
+        .nunique()
+    )
     return buyer_counts[buyer_counts >= min_buyers].index.tolist()
 
 
@@ -125,7 +190,7 @@ def _score_and_rank(
     has_prices = prices_df is not None
     price_cols = set(prices_df.columns) if has_prices else set()
 
-    inst_map, amt_map = _build_metadata_maps(recent_trades, has_prices)
+    metadata_maps = _build_metadata_maps(recent_trades, has_prices)
 
     ticker_perf_signals = _filter_ticker_perf(
         signals_df, horizon, as_of_date.isoformat()
@@ -144,6 +209,7 @@ def _score_and_rank(
             threshold=threshold,
             min_buyers=min_buyers,
             bayes=bayes,
+            scoring_mode=scoring_mode,
             solo_buyer_skill_threshold=solo_buyer_skill_threshold,
             _ranking_dicts=_ranking_dicts,
             signals_df=signals_df,
@@ -175,37 +241,44 @@ def _score_and_rank(
     )
     result.insert(0, "rank", range(1, len(result) + 1))
 
-    # Propagate instrument_type and amount_midpoint from recent trades so
-    # evaluate_backtest can apply options leverage. Maps were precomputed
-    # above, outside the ticker loop.
-    if inst_map:
-        result["instrument_type"] = result["ticker"].map(inst_map).fillna("stock")
-    if amt_map:
-        result["amount_midpoint"] = result["ticker"].map(amt_map)
+    # Preserve only unambiguous per-ticker metadata. Options never reach this
+    # point: without actual contract prices the strategy abstains.
+    for column, values in metadata_maps.items():
+        result[column] = result["ticker"].map(values)
 
     return result
 
 
 def _build_metadata_maps(
     recent_trades: pd.DataFrame, has_prices: bool
-) -> tuple[dict, dict]:
-    """Precompute {ticker: instrument_type} and {ticker: amount_midpoint} maps
-    so evaluate_backtest can apply options leverage without re-scanning."""
-    inst_map: dict = {}
-    amt_map: dict = {}
-    if has_prices and "instrument_type" in recent_trades.columns:
-        inst_map = (
-            recent_trades.drop_duplicates("ticker")
-            .set_index("ticker")["instrument_type"]
-            .to_dict()
-        )
-    if has_prices and "amount_midpoint" in recent_trades.columns:
-        amt_map = (
-            recent_trades.drop_duplicates("ticker")
-            .set_index("ticker")["amount_midpoint"]
-            .to_dict()
-        )
-    return inst_map, amt_map
+) -> dict[str, dict]:
+    """Build per-ticker maps only when all non-null values agree."""
+    if not has_prices:
+        return {}
+    maps: dict[str, dict] = {}
+    for column in (
+        "instrument_type",
+        "amount_midpoint",
+        "strike_price",
+        "expiry_date",
+        "asset_description",
+        "raw_asset_description",
+        "raw_asset_class",
+        "ticker_origin",
+        "source",
+        "source_record_id",
+        "source_row_id",
+        "available_date",
+        "notification_date",
+    ):
+        if column not in recent_trades.columns:
+            continue
+        values: dict = {}
+        for ticker, group in recent_trades.groupby("ticker"):
+            non_null = group[column].dropna().unique()
+            values[ticker] = non_null[0] if len(non_null) == 1 else None
+        maps[column] = values
+    return maps
 
 
 def _score_one_ticker(
@@ -219,6 +292,7 @@ def _score_one_ticker(
     threshold,
     min_buyers,
     bayes,
+    scoring_mode,
     solo_buyer_skill_threshold,
     _ranking_dicts,
     signals_df,
@@ -239,8 +313,9 @@ def _score_one_ticker(
         min_buyers,
         ticker_perf_signals=ticker_perf_signals,
         _bayes_prior_strength=bayes,
-        solo_buyer_skill_threshold=solo_buyer_skill_threshold,
         _ranking_dicts=_ranking_dicts,
+        scoring_mode=scoring_mode,
+        as_of_date=as_of_date,
     )
     if score_df.empty:
         return None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime
 
 import duckdb
@@ -8,6 +9,146 @@ import pandas as pd
 
 
 logger = logging.getLogger(__name__)
+
+
+_PROVENANCE_COLUMNS = (
+    "chamber",
+    "member_key",
+    "chamber_member_key",
+    "source_record_id",
+    "source_row_id",
+    "source_report_path",
+    "official_filing_date",
+    "available_date",
+    "notification_date",
+    "amends_source_record_id",
+    "raw_transaction_subtype",
+    "ticker_origin",
+    "raw_ticker",
+    "ticker_candidate",
+    "raw_owner",
+    "raw_asset_class",
+    "raw_asset_description",
+    "ingestion_generation",
+    "artifact_sha256",
+)
+_BASE_WRITE_COLUMNS = (
+    "doc_id",
+    "member",
+    "ticker",
+    "transaction_date",
+    "disclosure_date",
+    "transaction_type",
+    "owner_code",
+    "amount_raw",
+    "amount_midpoint",
+    "instrument_type",
+    "strike_price",
+    "expiry_date",
+    "created_at",
+    "asset_description",
+    "source",
+)
+_TYPE_MAP = {
+    "Sale Full": "Sale",
+    "Sale Partial": "Sale",
+    "Partial Sale": "Sale",
+}
+_OWNER_MAP = {
+    "DEPENDENT": "DC",
+    "DEPENDENT CHILD": "DC",
+    "DC": "DC",
+    "SPOUSE": "SP",
+    "SP": "SP",
+    "JOINT": "J",
+    "JT": "JT",
+    "J": "J",
+    "SELF": "S",
+    "S": "S",
+}
+_INSTRUMENT_MAP = {
+    "stock": "stock",
+    "call": "call",
+    "put": "put",
+    "option": "option",
+    "stock option": "option",
+}
+
+
+def _normalize_owner(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    normalized = str(value).strip().upper()
+    return _OWNER_MAP.get(normalized, "")
+
+
+def _normalize_instrument(value):
+    if value is None or pd.isna(value) or not str(value).strip():
+        return None
+    normalized = str(value).strip().lower()
+    return _INSTRUMENT_MAP.get(normalized, normalized)
+
+
+def _normalize_amount(row) -> float | None:
+    raw = "" if pd.isna(row.get("amount_raw")) else str(row.get("amount_raw")).strip()
+    midpoint = row.get("amount_midpoint")
+    if raw.endswith("-"):
+        return None
+    values = [
+        float(value.replace(",", "")) for value in re.findall(r"\$([0-9][0-9,]*)", raw)
+    ]
+    if len(values) >= 2:
+        return sum(values[:2]) / 2
+    if len(values) == 1 and int(values[0]) % 1000 == 1:
+        return None
+    if midpoint is None or pd.isna(midpoint):
+        return None
+    return float(midpoint)
+
+
+def _normalize_frame(df: pd.DataFrame, *, deduplicate: bool) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    original_type = df["transaction_type"].copy()
+    if "raw_transaction_subtype" not in df.columns:
+        df["raw_transaction_subtype"] = None
+    raw_missing = df["raw_transaction_subtype"].isna()
+    suffix_type = original_type.isin(_TYPE_MAP)
+    df.loc[raw_missing & suffix_type, "raw_transaction_subtype"] = original_type
+    df["transaction_type"] = df["transaction_type"].replace(_TYPE_MAP)
+    if "owner_code" in df.columns:
+        df["owner_code"] = df["owner_code"].map(_normalize_owner)
+    if "instrument_type" in df.columns:
+        df["instrument_type"] = df["instrument_type"].map(_normalize_instrument)
+    if "amount_raw" in df.columns and "amount_midpoint" in df.columns:
+        df["amount_midpoint"] = df.apply(_normalize_amount, axis=1)
+    if not deduplicate:
+        return df
+
+    df["_type_preference"] = (~original_type.isin(_TYPE_MAP)).astype(int)
+    dedup_key = [
+        col
+        for col in (
+            "doc_id",
+            "source_record_id",
+            "source_row_id",
+            "member",
+            "ticker",
+            "transaction_date",
+            "transaction_type",
+            "amount_raw",
+            "owner_code",
+            "asset_description",
+            "raw_asset_description",
+        )
+        if col in df.columns
+    ]
+    sort_cols = ["_type_preference"] + (["id"] if "id" in df.columns else [])
+    df = df.sort_values(sort_cols, ascending=False).drop_duplicates(
+        dedup_key, keep="first"
+    )
+    return df.drop(columns=["_type_preference"])
 
 
 SOURCE_TRANSACTION_COLUMNS = [
@@ -93,11 +234,9 @@ class TransactionRepository:
                 excluded,
                 year,
             )
-        return self.conn.execute(
+        result = self.conn.execute(
             f"""
-            SELECT member, ticker, transaction_date, disclosure_date, available_date,
-                   transaction_type, owner_code, amount_raw, amount_midpoint,
-                   instrument_type, strike_price, expiry_date, source, chamber
+            SELECT *
             FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
@@ -106,6 +245,7 @@ class TransactionRepository:
             """,  # nosec B608 -- source_clause is a fixed internal fragment
             params,
         ).fetchdf()
+        return _normalize_frame(result, deduplicate=True)
 
     def get_by_date_range(
         self,
@@ -137,11 +277,9 @@ class TransactionRepository:
                 start_date,
                 end_date,
             )
-        return self.conn.execute(
+        result = self.conn.execute(
             f"""
-            SELECT member, ticker, transaction_date, disclosure_date, available_date,
-                   transaction_type, owner_code, amount_raw, amount_midpoint,
-                   instrument_type, strike_price, expiry_date, source, chamber
+            SELECT *
             FROM transactions
             WHERE disclosure_date BETWEEN ? AND ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
@@ -150,6 +288,7 @@ class TransactionRepository:
             """,  # nosec B608 -- source_clause is a fixed internal fragment
             params,
         ).fetchdf()
+        return _normalize_frame(result, deduplicate=True)
 
     def upsert(
         self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False
@@ -171,17 +310,25 @@ class TransactionRepository:
         df["amount_raw"] = df["amount_raw"].fillna("").astype(str).replace("None", "")
         df["created_at"] = datetime.now()
         df["source"] = source
+        df = _normalize_frame(df, deduplicate=True)
 
-        dedup_key = [
-            "doc_id",
-            "ticker_key",
-            "transaction_date",
-            "member",
-            "transaction_type",
-            "amount_raw",
-            "owner_code",
-            "asset_description_key",
-        ]
+        dedup_key = ["doc_id"]
+        dedup_key.extend(
+            column
+            for column in ("source_record_id", "source_row_id")
+            if column in df.columns
+        )
+        dedup_key.extend(
+            [
+                "ticker_key",
+                "transaction_date",
+                "member",
+                "transaction_type",
+                "amount_raw",
+                "owner_code",
+                "asset_description_key",
+            ]
+        )
         dedup_df = df.copy()
         dedup_df["ticker_key"] = (
             dedup_df["ticker"].fillna("").astype(str).replace("None", "")
@@ -193,7 +340,23 @@ class TransactionRepository:
         if df.empty:
             return 0
 
-        self.conn.execute("CREATE TEMP TABLE staging_transactions AS SELECT * FROM df")
+        existing_column_types = {
+            row[1]: row[2]
+            for row in self.conn.execute("PRAGMA table_info('transactions')").fetchall()
+        }
+        write_columns = [
+            column
+            for column in _BASE_WRITE_COLUMNS + _PROVENANCE_COLUMNS
+            if column in existing_column_types and column in df.columns
+        ]
+        df = df[write_columns].copy()
+        staging_select = ", ".join(
+            f"CAST({column} AS {existing_column_types[column]}) AS {column}"
+            for column in write_columns
+        )
+        self.conn.execute(
+            f"CREATE TEMP TABLE staging_transactions AS SELECT {staging_select} FROM df"  # nosec B608 -- identifiers/types come from the database schema
+        )
         inserted_count = 0
         try:
             if not _in_transaction:
@@ -203,43 +366,62 @@ class TransactionRepository:
             ).fetchone()[0]
             self.conn.execute("""
                 CREATE TEMP TABLE filtered_staging_transactions AS
-                SELECT s.*
-                FROM staging_transactions s
-                LEFT JOIN transactions t
-                  ON t.doc_id = s.doc_id
-                 AND COALESCE(CAST(t.ticker AS VARCHAR), '') = COALESCE(CAST(s.ticker AS VARCHAR), '')
-                 AND t.transaction_date IS NOT DISTINCT FROM s.transaction_date
-                 AND t.member IS NOT DISTINCT FROM s.member
-                 AND t.transaction_type IS NOT DISTINCT FROM s.transaction_type
-                 AND COALESCE(t.amount_raw, '') = COALESCE(s.amount_raw, '')
-                 AND COALESCE(t.owner_code, '') = COALESCE(s.owner_code, '')
-                 AND COALESCE(CAST(t.asset_description AS VARCHAR), '') = COALESCE(CAST(s.asset_description AS VARCHAR), '')
-                WHERE t.id IS NULL
+                SELECT * FROM staging_transactions
             """)
-            self.conn.execute("""
-                INSERT INTO transactions (
-                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                    asset_description, source
+            insert_columns_sql = ", ".join(write_columns)
+            mutable_columns = [
+                column
+                for column in (
+                    "disclosure_date",
+                    "amount_midpoint",
+                    "instrument_type",
+                    "strike_price",
+                    "expiry_date",
+                    "created_at",
                 )
-                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                       asset_description, source
-                FROM filtered_staging_transactions
-                WHERE ticker IS NOT NULL
-            """)
-            self.conn.execute("""
-                INSERT INTO transactions (
-                    doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                    owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                    asset_description, source
-                )
-                SELECT doc_id, member, ticker, transaction_date, disclosure_date, transaction_type,
-                       owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date, created_at,
-                       asset_description, source
-                FROM filtered_staging_transactions
-                WHERE ticker IS NULL
-            """)
+                if column in write_columns
+            ]
+            provenance_columns = [
+                column
+                for column in ("source",) + _PROVENANCE_COLUMNS
+                if column in write_columns
+            ]
+            updates = [f"{column} = s.{column}" for column in mutable_columns]
+            updates.extend(
+                f"{column} = CASE WHEN t.{column} IS NULL "
+                f"THEN s.{column} ELSE t.{column} END"
+                for column in provenance_columns
+            )
+            update_sql = ", ".join(updates)
+            source_identity_sql = "".join(
+                f" AND t.{column} IS NOT DISTINCT FROM s.{column}"
+                for column in ("source_record_id", "source_row_id")
+                if column in write_columns
+            )
+            identity_sql = f"""
+                t.doc_id = s.doc_id
+                AND t.ticker IS NOT DISTINCT FROM s.ticker
+                AND t.transaction_date IS NOT DISTINCT FROM s.transaction_date
+                AND t.member IS NOT DISTINCT FROM s.member
+                AND t.transaction_type IS NOT DISTINCT FROM s.transaction_type
+                AND t.amount_raw IS NOT DISTINCT FROM s.amount_raw
+                AND t.owner_code IS NOT DISTINCT FROM s.owner_code
+                AND t.asset_description IS NOT DISTINCT FROM s.asset_description
+                {source_identity_sql}
+            """
+            self.conn.execute(
+                f"""UPDATE transactions AS t SET {update_sql}
+                    FROM filtered_staging_transactions AS s
+                    WHERE {identity_sql}"""  # nosec B608 -- identifiers are fixed schema constants
+            )
+            self.conn.execute(
+                f"""INSERT INTO transactions ({insert_columns_sql})
+                    SELECT {insert_columns_sql}
+                    FROM filtered_staging_transactions s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM transactions t WHERE {identity_sql}
+                    )"""  # nosec B608 -- identifiers are fixed schema constants
+            )
             count_after = self.conn.execute(
                 "SELECT COUNT(*) FROM transactions"
             ).fetchone()[0]
@@ -322,25 +504,16 @@ class TransactionRepository:
         return len(df)
 
     def get_for_doc(self, doc_id: str) -> pd.DataFrame:
-        return self.conn.execute(
+        result = self.conn.execute(
             """
-            SELECT id, doc_id, member, member_key, chamber_member_key, ticker,
-                   transaction_date, disclosure_date,
-                   transaction_type, owner_code, amount_raw, amount_midpoint,
-                   instrument_type, strike_price, expiry_date, asset_description,
-                   source, chamber, source_record_id, source_row_id,
-                   source_report_path, official_filing_date, available_date,
-                   notification_date,
-                   amends_source_record_id, raw_transaction_subtype, ticker_origin,
-                   raw_ticker, ticker_candidate, raw_asset_class,
-                   raw_asset_description, raw_owner,
-                   ingestion_generation, artifact_sha256, created_at
+            SELECT *
             FROM transactions
             WHERE doc_id = ?
             ORDER BY id
             """,
             [doc_id],
         ).fetchdf()
+        return _normalize_frame(result, deduplicate=True)
 
     def delete_for_doc(self, doc_id: str) -> None:
         self.conn.execute("DELETE FROM transactions WHERE doc_id = ?", [doc_id])

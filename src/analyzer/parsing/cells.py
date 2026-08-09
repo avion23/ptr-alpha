@@ -529,88 +529,85 @@ def _extract_owner_code(owner_cell: str | None) -> str | None:
 
 
 def _extract_instrument_type(asset_cell: str | None) -> str:
-    """Detect whether an asset description is a stock, call option, or put option.
+    """Return stock, call, put, option, or unknown from one asset row.
 
-    Handles common PTR formats:
-      - "NVIDIA Corp Common Stock Call Option (NVDA)"
-      - "NVDA Call $120 Exp 12/20/2024"
-      - "Call Option" / "Put Option" as separate field in asset text
-      - "Stock Option (NVDA)" — a standalone phrase without explicit call/put
+    House ``[OP]`` identifies an option but does not establish call/put direction.
+    ``[ST]`` is authoritative for the row and prevents a preceding row's wrapped
+    option note from changing the current stock into an option.
     """
     if not asset_cell:
-        return "stock"
+        return "unknown"
     text = asset_cell.lower()
 
-    # Put detection — use compound patterns first; avoid matching bare "put" (too many false positives)
-    if re.search(r"\bput\s+option\b", text):
-        return "put"
-    if re.search(r"\bput\s+opt\b", text):
-        return "put"
-    if re.search(r"\bstock\s+put\b", text):
-        return "put"
-    if re.search(r"\bput\b.*\b(?:strike|exp|expir)\b", text):
+    if re.search(r"\[st\]", text):
+        return "stock"
+
+    option_marker = re.search(r"\[op\]", text)
+    direction_text = text[option_marker.end() :] if option_marker else text
+    is_put = any(
+        re.search(pattern, direction_text)
+        for pattern in (
+            r"\bput\s+option\b",
+            r"\bput\s+opt\b",
+            r"\bstock\s+put\b",
+            r"\bput\b.*\b(?:strike|exp|expir)\b",
+        )
+    )
+    if is_put:
         return "put"
 
-    # Call detection — use compound patterns first; avoid matching bare "call" (too many false positives)
-    if re.search(r"\bcall\s+option\b", text):
-        return "call"
-    if re.search(r"\bcall\s+opt\b", text):
-        return "call"
-    if re.search(r"\bstock\s+call\b", text):
-        return "call"
-    if re.search(r"\bcall\b.*\b(?:strike|exp|expir)\b", text):
-        return "call"
-
-    # "Stock Option" standalone — a common PTR label; default to 'call' as most
-    # stock options in congressional disclosures are call options
-    if re.search(r"\bstock\s+option\b", text):
+    is_call = any(
+        re.search(pattern, direction_text)
+        for pattern in (
+            r"\bcall\s+option\b",
+            r"\bcall\s+opt\b",
+            r"\bstock\s+call\b",
+            r"\bcall\b.*\b(?:strike|exp|expir)\b",
+        )
+    )
+    if is_call:
         return "call"
 
-    # Generic "option" without call/put qualifier — try to infer from context
+    if re.search(r"\[op\]", text) or re.search(r"\bstock\s+option\b", text):
+        return "option"
     if re.search(r"\boption\b", text):
-        if re.search(r"\b(?:strike|exp|expir)\b", text):
-            return "call"
+        return "option"
     return "stock"
 
 
 def _extract_option_details(asset_cell: str | None) -> dict:
-    """Extract strike price and expiry date from an option asset description.
-
-    Returns dict with optional 'strike_price' (float) and 'expiry_date' (str MM/DD/YYYY).
-    Handles formats:
-      - "Strike $150" / "Strike: 150.00"
-      - "$120" preceding "Exp" in "NVDA Call $120 Exp 12/20/2024"
-      - "Exp MM/DD/YYYY" / "Expire MM/DD/YYYY" / "Expiring MM/DD/YYYY"
-      - "Exp 12/20/2024" (bare exp abbreviation)
-      - "Strike Price $150.00"
-      - "NVDA Call Option $120 Exp 12/20/2024"
-    """
+    """Extract explicit strike and expiry terms without inventing a contract."""
     details: dict = {}
     if not asset_cell:
         return details
 
-    # Strike price: "Strike Price $150", "Strike $150", "Strike: 150.00"
+    option_marker = re.search(r"\[op\]", asset_cell, re.IGNORECASE)
+    contract_text = asset_cell[option_marker.end() :] if option_marker else asset_cell
     strike_match = re.search(
-        r"strike\s*(?:price)?[:\s]*\$?(\d+(?:\.\d+)?)", asset_cell, re.IGNORECASE
+        r"strike\s*(?:price)?(?:\s+of)?[:\s]*\$?(\d+(?:\.\d+)?)",
+        contract_text,
+        re.IGNORECASE,
     )
     if strike_match:
         details["strike_price"] = float(strike_match.group(1))
     else:
-        # Fallback: dollar amount before Exp/expiry, e.g. "$120 Exp 12/20/2024"
         strike_fallback = re.search(
-            r"\$(\d+(?:\.\d+)?)\s+(?:exp|strike)", asset_cell, re.IGNORECASE
+            r"\$(\d+(?:\.\d+)?)\s+(?:exp|strike)", contract_text, re.IGNORECASE
         )
         if strike_fallback:
             details["strike_price"] = float(strike_fallback.group(1))
 
-    # Expiry date: "Exp MM/DD/YYYY" / "Expire: MM/DD/YYYY" / "Expiring MM/DD/YYYY"
     exp_match = re.search(
-        r"(?:exp(?:ir(?:e|ation|ing)?)?[:\s]+(\d{1,2}/\d{1,2}/\d{4}))",
-        asset_cell,
+        r"(?:exp(?:ir(?:e|ation|ing)?)?(?:\s+date)?(?:\s+of)?[:\s]+)"
+        r"(\d{1,2}/\d{1,2}/(?:\d{2}|\d{4}))",
+        contract_text,
         re.IGNORECASE,
     )
     if exp_match:
-        details["expiry_date"] = exp_match.group(1)
+        month, day, year = exp_match.group(1).split("/")
+        if len(year) == 2:
+            year = ("19" if int(year) >= 50 else "20") + year
+        details["expiry_date"] = f"{int(month):02d}/{int(day):02d}/{year}"
     return details
 
 

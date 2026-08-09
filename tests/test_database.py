@@ -7,7 +7,7 @@ import pandas as pd
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.senate_efd import SenateEFDSource
-from analyzer.transaction_repository import SOURCE_TRANSACTION_COLUMNS
+from analyzer.transaction_repository import SOURCE_TRANSACTION_COLUMNS, _normalize_frame
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
 from .conftest import DatabaseTestCase
 
@@ -736,6 +736,128 @@ class TestParseRunsTable(DatabaseTestCase):
             "SELECT error_message FROM pdf_parse_runs WHERE doc_id = 'doc3'"
         ).fetchone()
         self.assertEqual(result[0], "PDFTextExtractionNotAllowed")
+
+
+class TestTransactionNormalization(DatabaseTestCase):
+    def test_raw_sale_subtype_is_preserved(self):
+        normalized = _normalize_frame(
+            pd.DataFrame(
+                [
+                    {
+                        "transaction_type": "Sale Partial",
+                        "amount_raw": "$1,001 - $15,000",
+                        "amount_midpoint": 1,
+                    }
+                ]
+            ),
+            deduplicate=True,
+        )
+        self.assertEqual(normalized.iloc[0]["transaction_type"], "Sale")
+        self.assertEqual(normalized.iloc[0]["raw_transaction_subtype"], "Sale Partial")
+
+    def test_sale_subtypes_normalize_and_deduplicate_on_read(self):
+        for transaction_type in ("Sale", "Sale Full"):
+            self.db.conn.execute(
+                """
+                INSERT INTO transactions (
+                    doc_id, member, ticker, transaction_date, disclosure_date,
+                    transaction_type, owner_code, amount_raw, amount_midpoint,
+                    instrument_type, asset_description, source
+                ) VALUES ('doc-sale', 'Jane Doe', 'AAPL', DATE '2024-03-10',
+                    DATE '2024-03-15', ?, 'Spouse', '$15,001 - $50,000',
+                    1, 'Stock Option', 'Apple (AAPL) [OP]', 'house_pdf')
+                """,
+                [transaction_type],
+            )
+
+        result = self.db.get_transactions(2024)
+        self.assertEqual(len(result), 1)
+        row = result.iloc[0]
+        self.assertEqual(row["transaction_type"], "Sale")
+        self.assertEqual(row["owner_code"], "SP")
+        self.assertEqual(row["amount_midpoint"], 32500.5)
+        self.assertEqual(row["instrument_type"], "option")
+        self.assertEqual(row["asset_description"], "Apple (AAPL) [OP]")
+
+    def test_truncated_amount_and_invalid_owner_are_quarantined(self):
+        self.db.conn.execute(
+            """
+            INSERT INTO transactions (
+                doc_id, member, ticker, transaction_date, disclosure_date,
+                transaction_type, owner_code, amount_raw, amount_midpoint,
+                instrument_type, source
+            ) VALUES ('doc-bad', 'Jane Doe', 'BRK', DATE '2024-03-10',
+                DATE '2024-03-15', 'Purchase', 'BERKSHIR', '$15,001 -',
+                15001, 'stock', 'house_pdf')
+            """
+        )
+        row = self.db.get_transactions(2024).iloc[0]
+        self.assertEqual(row["owner_code"], "")
+        self.assertTrue(pd.isna(row["amount_midpoint"]))
+
+    def test_repository_plumbs_approved_nullable_provenance(self):
+        schema = {
+            "chamber": "VARCHAR",
+            "source_record_id": "VARCHAR",
+            "source_row_id": "VARCHAR",
+            "official_filing_date": "DATE",
+            "available_date": "DATE",
+            "notification_date": "DATE",
+            "amends_source_record_id": "VARCHAR",
+            "raw_transaction_subtype": "VARCHAR",
+            "ticker_origin": "VARCHAR",
+            "raw_asset_class": "VARCHAR",
+            "raw_asset_description": "VARCHAR",
+            "ingestion_generation": "VARCHAR",
+            "artifact_sha256": "VARCHAR",
+        }
+        existing = {
+            row[1] for row in self.db.conn.execute("PRAGMA table_info('transactions')").fetchall()
+        }
+        self.assertTrue(set(schema).issubset(existing))
+        row = {
+            "doc_id": "official-1",
+            "member": "Jane Doe",
+            "ticker": "AAPL",
+            "transaction_date": date(2024, 3, 10),
+            "disclosure_date": date(2024, 3, 15),
+            "transaction_type": "Purchase",
+            "amount_raw": "$1,001 - $15,000",
+            "chamber": "house",
+            "source_record_id": "official-1",
+            "source_row_id": "page-1:row-1",
+            "official_filing_date": date(2024, 3, 15),
+            "available_date": date(2024, 3, 16),
+            "notification_date": date(2024, 3, 14),
+            "amends_source_record_id": None,
+            "raw_transaction_subtype": "P",
+            "ticker_origin": "official",
+            "raw_asset_class": "ST",
+            "raw_asset_description": "Apple Inc. (AAPL) [ST]",
+            "ingestion_generation": "test-generation",
+            "artifact_sha256": "abc123",
+        }
+        repeated_lot = row | {"source_row_id": "page-1:row-2"}
+        inserted = self.db.upsert_transactions(
+            pd.DataFrame([row, repeated_lot]), source="house_pdf"
+        )
+        self.assertEqual(inserted, 2)
+        result = self.db.get_transactions(2024)
+        result = result.loc[result["source_row_id"] == "page-1:row-1"].iloc[0]
+        for column, value in row.items():
+            if column in schema and value is not None:
+                actual = result[column]
+                if isinstance(value, date):
+                    actual = pd.Timestamp(actual).date()
+                self.assertEqual(actual, value, column)
+        self.assertEqual(result["source"], "house_pdf")
+
+        inserted = self.db.upsert_transactions(
+            pd.DataFrame([row, repeated_lot]), source="house_pdf"
+        )
+        self.assertEqual(inserted, 0)
+        lots = self.db.get_transactions(2024)
+        self.assertEqual(set(lots["source_row_id"]), {"page-1:row-1", "page-1:row-2"})
 
 
 class TestPhantomPurge(DatabaseTestCase):

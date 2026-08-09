@@ -559,6 +559,79 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(transactions[0]["instrument_type"], "put")
         self.assertEqual(transactions[0]["ticker"], "TSLA")
 
+    def test_real_option_canaries_use_asset_code_without_guessing_direction(self):
+        # 20026590: [OP] proves option, but direction lives in a separate note.
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            ["Amazon.com, Inc. - Common Stock (AMZN) [OP]", "Purchase", "2025-01-14"],
+            ["Stock Option (BRK.B)", "Sale", "2025-01-15"],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(
+            [tx["instrument_type"] for tx in transactions], ["option", "option"]
+        )
+
+    def test_real_option_canary_parses_strike_and_two_digit_expiry(self):
+        # 20026590 wording.
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            [
+                "Tempus AI (TEM) [OP] Purchased 50 call options with a strike price of $20 and an expiration date of 1/16/26.",
+                "Purchase",
+                "2025-01-14",
+            ],
+        ]
+        transaction = parse_pdf_table(table)[0]
+        self.assertEqual(transaction["instrument_type"], "call")
+        self.assertEqual(transaction["strike_price"], 20.0)
+        self.assertEqual(transaction["expiry_date"], "01/16/2026")
+
+    def test_prior_option_note_cannot_change_current_stock_row(self):
+        # 20026590/20034694 parser joins can put the previous note before [ST].
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            [
+                "D: Purchased 50 call options with a strike price of $150 and an expiration date of 1/16/26. NVIDIA Corporation (NVDA) [ST]",
+                "Sale",
+                "2024-12-31",
+            ],
+        ]
+        transaction = parse_pdf_table(table)[0]
+        self.assertEqual(transaction["instrument_type"], "stock")
+        self.assertIsNone(transaction["strike_price"])
+        self.assertIsNone(transaction["expiry_date"])
+
+    def test_prior_option_note_cannot_supply_next_option_contract_terms(self):
+        # 20026590: the NVDA $80 note was prepended to the following TEM row.
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            [
+                "D: Purchased 50 call options with a strike price of $80 and an expiration date of 1/16/26. Tempus AI (TEM) [OP]",
+                "Purchase",
+                "2025-01-14",
+            ],
+        ]
+        transaction = parse_pdf_table(table)[0]
+        self.assertEqual(transaction["instrument_type"], "option")
+        self.assertIsNone(transaction["strike_price"])
+        self.assertIsNone(transaction["expiry_date"])
+
+    def test_real_nokia_and_ge_option_notes(self):
+        # 20034694 wording once the note is attached to its own [OP] row.
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            [
+                "GE Aerospace Common Stock (GE) [OP] D: Call option contracts",
+                "Sale",
+                "2026-06-16",
+            ],
+            ["Nokia (NOK) [OP] D: Put Option", "Sale", "2026-07-06"],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(
+            [tx["instrument_type"] for tx in transactions], ["call", "put"]
+        )
+
     def test_parse_pdf_table_exchange_type(self):
         table = [
             ["Asset Name", "Transaction Type", "Transaction Date"],

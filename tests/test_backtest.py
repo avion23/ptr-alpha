@@ -9,6 +9,7 @@ from analyzer.analysis import (
     evaluate_backtest,
     summarize_backtest,
 )
+from analyzer.backtest.recommend import _candidate_tickers, _filter_equity_rows
 
 from .conftest import DatabaseTestCase
 
@@ -1410,3 +1411,44 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         self.assertEqual(
             recs_default.iloc[0]["signal_score"], recs_strict.iloc[0]["signal_score"]
         )
+
+
+class TestEquityEligibilityCanaries(unittest.TestCase):
+    def test_options_and_known_non_equities_are_rejected(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["A", "B", "C", "D", "E"],
+                "ticker": ["AMZN", "MATT", "ALLI", "ARLP", "AAPL"],
+                "disclosure_date": pd.to_datetime(["2025-01-14"] * 5),
+                "instrument_type": ["option", "stock", "stock", "stock", "stock"],
+                "asset_description": [
+                    "Amazon (AMZN) [OP]",
+                    "Matthews International Mutual Fund [OT]",
+                    "Alliant Holdings, LP [OL]",
+                    "Alliance Resource Partners (ARLP) [ST]",
+                    "Apple (AAPL) [ST]",
+                ],
+            }
+        )
+        filtered = _filter_equity_rows(rows)
+        self.assertEqual(set(filtered["ticker"]), {"ARLP", "AAPL"})
+        # 20034095/20034670 stale ALLI is also quarantined when descriptions are absent.
+        stale = pd.DataFrame(
+            {
+                "member": ["A", "B"],
+                "ticker": ["ALLI", "AAPL"],
+                "instrument_type": ["stock", "stock"],
+                "disclosure_date": pd.to_datetime(["2026-03-02", "2026-03-02"]),
+            }
+        )
+        self.assertEqual(_candidate_tickers(stale, 1), ["AAPL"])
+
+    def test_unknown_instrument_abstains_when_column_is_present(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["A", "B"],
+                "ticker": ["AAPL", "MSFT"],
+                "instrument_type": [None, "stock"],
+            }
+        )
+        self.assertEqual(_filter_equity_rows(rows)["ticker"].tolist(), ["MSFT"])

@@ -11,7 +11,22 @@ import numpy as np
 import pandas as pd
 
 
-_OPTIONAL_COLS = ("owner_code", "amount_midpoint")
+_OPTIONAL_COLS = (
+    "owner_code",
+    "amount_midpoint",
+    "instrument_type",
+    "strike_price",
+    "expiry_date",
+    "asset_description",
+    "raw_asset_description",
+    "raw_asset_class",
+    "ticker_origin",
+    "source",
+    "source_record_id",
+    "source_row_id",
+    "available_date",
+    "notification_date",
+)
 
 _FINAL_COLUMNS = [
     "member",

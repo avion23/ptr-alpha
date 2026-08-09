@@ -215,6 +215,10 @@ def _is_filing_detail_row(asset_cell: str | None) -> bool:
     text = clean_text(asset_cell).upper()
     if not text:
         return False
+    if text.startswith(("DESCRIPTION:", "D:")) and (
+        "[ST]" in text or "[OP]" in text
+    ):
+        return False
     return text.startswith(
         (
             "FILING STATUS:",

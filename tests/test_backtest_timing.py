@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.analysis import evaluate_backtest
-from analyzer.options import estimate_options_leverage
+from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
 
 
 class TestBacktestTiming(unittest.TestCase):
@@ -87,11 +87,11 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertEqual(row["bt_entry_delay"], 3)
         self.assertAlmostEqual(row["bt_spy_return_pct"], 0.2, places=2)
 
-    def test_option_bases_and_amount_clamp(self):
-        self.assertEqual(estimate_options_leverage("call"), 4.0)
-        self.assertEqual(estimate_options_leverage("put"), -2.0)
-        self.assertEqual(estimate_options_leverage("call", 10_000_000), 2.8)
-        self.assertEqual(estimate_options_leverage("put", 10_000_000), -1.4)
+    def test_option_returns_require_contract_prices(self):
+        for instrument in ("call", "put", "option"):
+            with self.subTest(instrument=instrument):
+                with self.assertRaises(UnsupportedOptionPricingError):
+                    estimate_options_leverage(instrument, 10_000_000)
 
     def test_stale_exit_keeps_last_price_and_sets_coverage_flags(self):
         dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")
@@ -155,63 +155,28 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertTrue(row["bt_stale_exit"])
         self.assertTrue(row["bt_delisted"])
 
-    def test_stale_exit_returns_follow_stock_call_put_leverage(self):
+    def test_evaluator_abstains_from_underlying_based_option_returns(self):
         dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")
-        as_of = pd.Timestamp("2025-01-01")
-        last_trade = pd.Timestamp("2025-01-10")
-        history = [
-            100.0 if day <= as_of else 80.0 if day <= last_trade else np.nan
-            for day in dates
-        ]
         prices = pd.DataFrame(
             {
-                "STOCK": history,
-                "CALL": history,
-                "PUT": history,
+                "CALL": [100.0] * len(dates),
                 "SPY": [400.0 + i for i in range(len(dates))],
             },
             index=dates,
         )
         recommendations = pd.DataFrame(
-            {
-                "ticker": ["STOCK", "CALL", "PUT"],
-                "instrument_type": ["stock", "call", "put"],
-            }
+            {"ticker": ["CALL"], "instrument_type": ["call"]}
         )
 
-        result = evaluate_backtest(
-            recommendations,
-            prices,
-            as_of,
-            horizon=40,
-            entry_slippage_bps=0,
-            exit_slippage_bps=0,
-        )
-        rows = result.set_index("ticker")
-        expected = {
-            "STOCK": {"raw": -20.0, "leverage": 1.0, "final": -20.0},
-            "CALL": {"raw": -20.0, "leverage": 4.0, "final": -80.0},
-            "PUT": {"raw": -20.0, "leverage": -2.0, "final": 40.0},
-        }
-
-        for ticker, values in expected.items():
-            row = rows.loc[ticker]
-            self.assertEqual(row["bt_entry_price"], 100.0)
-            self.assertEqual(row["bt_exit_price"], 80.0)
-            self.assertEqual(row["bt_raw_return_pct"], values["raw"])
-            self.assertEqual(row["bt_leverage"], values["leverage"])
-            self.assertEqual(row["bt_return_pct"], values["final"])
-            self.assertEqual(
-                row["bt_return_pct"],
-                round(row["bt_raw_return_pct"] * row["bt_leverage"], 2),
+        with self.assertRaisesRegex(UnsupportedOptionPricingError, "contract prices"):
+            evaluate_backtest(
+                recommendations,
+                prices,
+                pd.Timestamp("2025-01-01"),
+                horizon=40,
+                entry_slippage_bps=0,
+                exit_slippage_bps=0,
             )
-            self.assertEqual(row["bt_coverage"], "stale")
-            self.assertTrue(row["bt_stale_exit"])
-            self.assertTrue(row["bt_delisted"])
-
-        self.assertLess(rows.loc["STOCK", "bt_return_pct"], 0)
-        self.assertLess(rows.loc["CALL", "bt_return_pct"], 0)
-        self.assertGreater(rows.loc["PUT", "bt_return_pct"], 0)
 
     def test_exactly_25_days_stale_keeps_price_derived_return(self):
         dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")

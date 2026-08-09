@@ -44,6 +44,7 @@ def _enable_ocr_schema(connection):
 
 def _insert_transactions(*args, **kwargs):
     kwargs.setdefault("artifact_sha256", "test-artifact-sha256")
+    kwargs.setdefault("ingestion_generation", "test-house-generation")
     return insert_transactions(*args, **kwargs)
 
 
@@ -233,7 +234,7 @@ def test_call_uses_one_immutable_pdf_snapshot(monkeypatch, tmp_path):
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('snapshot', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('snapshot', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.close()
     parsed = gemini_ocr_common.parse_gemini_output(output)
@@ -316,7 +317,7 @@ def test_insert_fails_clearly_before_provenance_schema_exists(tmp_path):
     db_path = tmp_path / "legacy.duckdb"
     db = Database(db_path)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('legacy', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('legacy', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     existing = {
         row[1]
@@ -377,7 +378,7 @@ def test_insert_preserves_repeated_lots_with_distinct_source_rows(tmp_path):
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('lots', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('lots', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.close()
     assert (
@@ -401,7 +402,7 @@ def test_insert_transactions_plumbs_authoritative_provenance_when_schema_support
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('doc-provenance', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('doc-provenance', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.close()
 
@@ -426,7 +427,7 @@ def test_insert_transactions_plumbs_authoritative_provenance_when_schema_support
         datetime(2024, 1, 20).date(),
         datetime(2024, 1, 20).date(),
         "Apple Inc. (AAPL)",
-        gemini_ocr_common.GEMINI_PARSER_VERSION,
+        "test-house-generation",
         "abc123",
     )
 
@@ -440,7 +441,7 @@ def test_tickerless_resolver_is_unverified_candidate_not_canonical(
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('candidate', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('candidate', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.close()
     monkeypatch.setattr(ocr_zero_rows, "resolve_ticker", lambda asset: "ACME")
@@ -479,7 +480,7 @@ def test_mixed_ticker_provenance_rows_use_fixed_full_staging_schema(
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('mixed-schema', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('mixed-schema', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.close()
     monkeypatch.setattr(ocr_zero_rows, "resolve_ticker", lambda asset: "PRIVATE")
@@ -644,7 +645,7 @@ def test_row_construction_failure_aborts_whole_batch_before_delete(
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('doc-construction', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('doc-construction', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.close()
     assert (
@@ -706,7 +707,7 @@ def test_semantic_zero_error_preserves_prior_ocr_rows(tmp_path):
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('error-preserves', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('error-preserves', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.conn.execute(
         """INSERT INTO transactions (
@@ -753,7 +754,7 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO metadata VALUES ('no-txs', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES ('no-txs', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.conn.execute(
         "INSERT INTO pdf_parse_runs (doc_id, year, parser_version, status, engines_attempted, raw_row_count, transaction_count) "
@@ -778,6 +779,21 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
     pdf_dir.mkdir(parents=True)
     pdf = pdf_dir / "no-txs.pdf"
     pdf.write_bytes(b"%PDF-no-transactions")
+    digest = gemini_ocr_common.pdf_sha256(pdf)
+    connection = duckdb.connect(str(db_path))
+    connection.execute(
+        """INSERT INTO house_archive_generations (
+               archive_year, generation_id, metadata_sha256,
+               metadata_http_status, metadata_count, ptr_count, parse_status
+           ) VALUES (2024, 'test-house-generation', 'metadata-sha', 200, 1, 1, 'incomplete')"""
+    )
+    connection.execute(
+        """INSERT INTO house_pdf_artifacts (
+               archive_year, doc_id, generation_id, artifact_sha256, http_status
+           ) VALUES (2024, 'no-txs', 'test-house-generation', ?, 200)""",
+        [digest],
+    )
+    connection.close()
     gemini_ocr_common.write_cached_response(
         "no-txs",
         pdf,
@@ -793,7 +809,13 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
 
     assert (
         _insert_transactions(
-            "no-txs", 2024, "Jane Doe", [], db_path=str(db_path), raw_count=0
+            "no-txs",
+            2024,
+            "Jane Doe",
+            [],
+            db_path=str(db_path),
+            raw_count=0,
+            artifact_sha256=digest,
         )
         == 0
     )
@@ -828,7 +850,7 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
     _enable_ocr_schema(db.conn)
     for doc_id in ("retry", "done", "rejected"):
         db.conn.execute(
-            "INSERT INTO metadata VALUES (?, 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)",
+            "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) VALUES (?, 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)",
             [doc_id],
         )
         db.conn.execute(
@@ -846,6 +868,24 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
         (pdf_dir / f"{doc_id}.pdf").write_bytes(artifact + doc_id.encode())
     digest = gemini_ocr_common.pdf_sha256(pdf_dir / "done.pdf")
     db.conn.execute(
+        """INSERT INTO house_archive_generations (
+               archive_year, generation_id, metadata_sha256,
+               metadata_http_status, metadata_count, ptr_count, parse_status
+           ) VALUES (2024, 'test-house-generation', 'metadata-sha', 200, 3, 3, 'incomplete')"""
+    )
+    db.conn.execute(
+        """INSERT INTO house_pdf_artifacts (
+               archive_year, doc_id, generation_id, artifact_sha256, http_status
+           ) VALUES (2024, 'done', 'test-house-generation', ?, 200)""",
+        [digest],
+    )
+    db.conn.execute(
+        """UPDATE pdf_parse_runs
+           SET artifact_sha256 = ?, ingestion_generation = 'test-house-generation'
+           WHERE doc_id = 'done' AND parser_version = ?""",
+        [digest, gemini_ocr_common.GEMINI_PARSER_VERSION],
+    )
+    db.conn.execute(
         """INSERT INTO transactions (
                doc_id, member, ticker, asset_description, transaction_date,
                disclosure_date, transaction_type, amount_raw, owner_code, source,
@@ -857,7 +897,7 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
                'done', 'done:page:1:row:1', ?, ?,
                'Apple Inc. (AAPL)', 'Purchase', DATE '2024-01-20'
            )""",
-        [gemini_ocr_common.GEMINI_PARSER_VERSION, digest],
+        ["test-house-generation", digest],
     )
     db.conn.execute(
         "INSERT INTO pdf_parse_runs (doc_id, year, parser_version, status, engines_attempted, raw_row_count, transaction_count) VALUES ('rejected', 2024, ?, 'rejected', '', 301, 0)",
@@ -924,7 +964,7 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
     connection.close()
     assert counts == [
         ("capitol_trades", "v1", 1),
-        ("gemini_ocr", gemini_ocr_common.GEMINI_PARSER_VERSION, 1),
+        ("gemini_ocr", "test-house-generation", 1),
     ]
     work = get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024)
     assert [item[0] for item in work] == ["rejected", "retry"]

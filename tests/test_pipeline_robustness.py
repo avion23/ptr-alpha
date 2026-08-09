@@ -9,8 +9,10 @@ from analyzer.database import Database
 from analyzer.download import HouseFetchSummary
 from analyzer.exceptions import DataResult, DataSourceError, StepResult
 from analyzer.pipeline import (
+    BacktestParams,
     TickerAnalysisParams,
     TickerScoringParams,
+    run_backtest_pipeline,
     run_recent_ticker_scoring,
     run_ticker_analysis,
 )
@@ -282,3 +284,77 @@ def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
         call.kwargs["refresh_metadata"]
         for call in ctx.transaction_source.fetch_and_cache_pdfs.call_args_list
     )
+
+
+def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):
+    transactions = pd.DataFrame(
+        {
+            "member": ["Alice"],
+            "ticker": ["AAPL"],
+            "transaction_date": pd.to_datetime(["2024-12-01"]),
+            "disclosure_date": pd.to_datetime(["2024-12-02"]),
+            "transaction_type": ["Purchase"],
+        }
+    )
+    index = pd.date_range("2024-11-01", "2025-01-20", freq="D")
+    prices = pd.DataFrame(
+        {
+            "AAPL": range(100, 100 + len(index)),
+            "SPY": range(400, 400 + len(index)),
+        },
+        index=index,
+    )
+    evaluated = pd.DataFrame(
+        {
+            "rank": [1],
+            "ticker": ["AAPL"],
+            "bt_return_pct": [10.0],
+            "bt_alpha_pct": [5.0],
+            "bt_raw_return_pct": [10.0],
+            "bt_entry_date": [date(2025, 1, 3)],
+            "bt_exit_date": [date(2025, 1, 10)],
+            "bt_leverage": [1.0],
+        }
+    )
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = transactions
+    price_source = MagicMock()
+    price_source.get_prices.return_value = prices
+
+    with (
+        patch("analyzer.pipeline.create_snapshot", return_value=MagicMock()),
+        patch("analyzer.pipeline.save_snapshot"),
+        patch(
+            "analyzer.pipeline._entry_prices_from_matrix",
+            return_value=pd.DataFrame({"entry_price": [100.0]}),
+        ),
+        patch(
+            "analyzer.pipeline.analysis.calculate_signal_potential",
+            return_value=pd.DataFrame({"member": ["Alice"]}),
+        ),
+        patch(
+            "analyzer.pipeline.analysis.backtest_recommendations",
+            return_value=pd.DataFrame({"ticker": ["AAPL"]}),
+        ),
+        patch(
+            "analyzer.pipeline.analysis.evaluate_backtest",
+            return_value=evaluated,
+        ),
+    ):
+        result = run_backtest_pipeline(
+            BacktestParams(
+                start_date=date(2025, 1, 2),
+                end_date=date(2025, 1, 2),
+                horizon=7,
+                frequency_days=1,
+            ),
+            transaction_source,
+            price_source,
+            data_dir=tmp_path,
+        )
+
+    assert result.success
+    summary = result.data["summary"]
+    assert "SPY_BUY_HOLD" in summary["rank"].tolist()
+    assert summary.attrs["spy_benchmark_status"] == "available"
+    assert summary.attrs["spy_benchmark_reason"] is None

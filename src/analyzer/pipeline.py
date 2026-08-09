@@ -577,7 +577,8 @@ def run_backtest_pipeline(
     combined.attrs["n_delisted"] = total_delisted
     combined.attrs["n_unavailable"] = total_unavailable
 
-    summary = analysis.summarize_backtest(combined)
+    spy_prices = prices["SPY"] if "SPY" in prices.columns else None
+    summary = analysis.summarize_backtest(combined, spy_prices)
 
     valid_returns = combined.dropna(subset=["bt_return_pct"])
     evaluable_dates = (

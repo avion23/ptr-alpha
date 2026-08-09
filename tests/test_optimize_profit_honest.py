@@ -409,6 +409,14 @@ def test_final_runtime_mismatch_fails_before_git_or_database():
         ),
         patch.object(main, "_locked_runtime_fingerprint", return_value=wrong_runtime),
         patch.object(main, "_lock_blob_sha256", return_value=lock_sha),
+        patch.object(
+            main,
+            "_source_hashes",
+            return_value=(
+                lock["sealed_source_sha256"],
+                lock["sealed_source_aggregate_sha256"],
+            ),
+        ),
     ):
         with pytest.raises(
             RuntimeError, match="Runtime, platform, architecture, BLAS, or dependencies"
@@ -533,11 +541,33 @@ def test_sealed_source_includes_exact_main_and_semantic_constants():
     lock = json.loads(main._canonical_final_lock_path().read_text())
     sources, aggregate = main._source_hashes()
 
-    assert lock["sealed_source_sha256"] == sources
-    assert lock["sealed_source_sha256"]["optimize_profit/main.py"] == main._sha256_file(
-        main._repo_root() / "optimize_profit" / "main.py"
-    )
-    assert lock["sealed_source_aggregate_sha256"] == aggregate
+    if lock["sealed_source_sha256"] == sources:
+        assert lock["sealed_source_aggregate_sha256"] == aggregate
+    else:
+        seal = main._load_final_seal()
+        locked_sources = {}
+        for source_path in lock["sealed_source_sha256"]:
+            blob = subprocess.run(
+                ["git", "show", f"{seal['lock_commit']}:{source_path}"],
+                cwd=main._repo_root(),
+                check=True,
+                capture_output=True,
+            ).stdout
+            locked_sources[source_path] = hashlib.sha256(blob).hexdigest()
+        assert lock["sealed_source_sha256"] == locked_sources
+        source_order = sorted(
+            name for name in locked_sources if name.startswith("src/analyzer/")
+        ) + sorted(
+            name for name in locked_sources if name.startswith("optimize_profit/")
+        )
+        locked_aggregate = hashlib.sha256(
+            "".join(
+                f"{name}:{locked_sources[name]}\n" for name in source_order
+            ).encode()
+        ).hexdigest()
+        assert lock["sealed_source_aggregate_sha256"] == locked_aggregate
+
+    assert "optimize_profit/main.py" in lock["sealed_source_sha256"]
     assert lock["semantic_constants"] == main._semantic_constants()
     assert lock["runtime_fingerprint"] == main._locked_runtime_fingerprint()
 

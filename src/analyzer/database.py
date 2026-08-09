@@ -255,7 +255,10 @@ class Database:
         self.conn.execute("""
             CREATE OR REPLACE VIEW canonical_transactions AS
             SELECT t.* FROM transactions t
-            WHERE (t.source IS NOT NULL AND t.source <> 'house_pdf')
+            WHERE (
+                    t.source IS NOT NULL
+                    AND t.source NOT IN ('house_pdf', 'gemini_ocr')
+                  )
                OR t.ingestion_generation = (
                     SELECT active.generation_id
                     FROM house_archive_generations own

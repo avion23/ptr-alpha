@@ -647,6 +647,11 @@ def backtest(
             summary = data.get("summary", pd.DataFrame())
             if not summary.empty:
                 print(summary.to_string(index=False))
+            benchmark_status = summary.attrs.get("spy_benchmark_status")
+            if benchmark_status:
+                benchmark_reason = summary.attrs.get("spy_benchmark_reason")
+                detail = f" ({benchmark_reason})" if benchmark_reason else ""
+                print(f"SPY buy/hold benchmark: {benchmark_status}{detail}")
 
             valid_returns = combined.dropna(subset=["bt_return_pct"])
             print(

@@ -23,6 +23,7 @@ from scripts.ocr_zero_rows import (
     insert_transactions,
     mark_progress,
     record_parse_run,
+    resolve_ingestion_generation,
 )
 
 DB_PATH = "data/congress.duckdb"
@@ -72,6 +73,8 @@ def _write_item(item):
                 0,
                 item.get("error", ""),
                 parser_version=GEMINI_PARSER_VERSION,
+                artifact_sha256=item.get("artifact_sha256"),
+                ingestion_generation=item.get("ingestion_generation"),
             )
         finally:
             connection.close()
@@ -86,6 +89,7 @@ def _write_item(item):
         parser_version=GEMINI_PARSER_VERSION,
         raw_count=item["raw_count"],
         artifact_sha256=item.get("artifact_sha256"),
+        ingestion_generation=item.get("ingestion_generation"),
     )
     if item["status"] == "success" and inserted <= 0:
         raise RuntimeError("validated OCR rows were not inserted")
@@ -123,7 +127,16 @@ def _acknowledged_write(item):
     return inserted
 
 
-def _record_failure(doc_id, year, status, raw_count, error):
+def _record_failure(
+    doc_id,
+    year,
+    status,
+    raw_count,
+    error,
+    *,
+    artifact_sha256=None,
+    ingestion_generation=None,
+):
     _acknowledged_write(
         {
             "doc_id": doc_id,
@@ -131,6 +144,8 @@ def _record_failure(doc_id, year, status, raw_count, error):
             "status": status,
             "raw_count": raw_count,
             "error": str(error)[:1000],
+            "artifact_sha256": artifact_sha256,
+            "ingestion_generation": ingestion_generation,
         }
     )
 
@@ -144,8 +159,24 @@ def process_one(item, refresh=False):
         timeout=90,
         parser_version=GEMINI_PARSER_VERSION,
     )
+    ingestion_generation = None
+    if artifact_metadata is not None:
+        try:
+            ingestion_generation = resolve_ingestion_generation(
+                DB_PATH, doc_id, year, artifact_metadata.sha256
+            )
+        except RuntimeError as exc:
+            output, error = None, str(exc)
     if output is None or error:
-        _record_failure(doc_id, year, "error", 0, error)
+        _record_failure(
+            doc_id,
+            year,
+            "error",
+            0,
+            error,
+            artifact_sha256=(artifact_metadata.sha256 if artifact_metadata else None),
+            ingestion_generation=ingestion_generation,
+        )
         return doc_id, year, "error", 0, error
 
     parsed = parse_gemini_output(output)
@@ -158,6 +189,8 @@ def process_one(item, refresh=False):
                 "member": parsed.member,
                 "transactions": [],
                 "raw_count": 0,
+                "artifact_sha256": artifact_metadata.sha256,
+                "ingestion_generation": ingestion_generation,
             }
         )
         return doc_id, year, "no_txs", 0, []
@@ -183,7 +216,15 @@ def process_one(item, refresh=False):
     if fatal_rejections:
         status = "rejected" if "row_count_exceeds_cap" in fatal_rejections else "error"
         message = json.dumps(fatal_rejections, sort_keys=True)
-        _record_failure(doc_id, year, status, parsed.raw_row_count, message)
+        _record_failure(
+            doc_id,
+            year,
+            status,
+            parsed.raw_row_count,
+            message,
+            artifact_sha256=artifact_metadata.sha256,
+            ingestion_generation=ingestion_generation,
+        )
         return doc_id, year, status, 0, fatal_rejections
     if not transactions:
         _record_failure(
@@ -192,6 +233,8 @@ def process_one(item, refresh=False):
             "error",
             parsed.raw_row_count,
             "semantic_zero_after_raw_rows",
+            artifact_sha256=artifact_metadata.sha256,
+            ingestion_generation=ingestion_generation,
         )
         return doc_id, year, "error", 0, {"semantic_zero_after_raw_rows": 1}
 
@@ -205,6 +248,7 @@ def process_one(item, refresh=False):
             "transactions": transactions,
             "raw_count": parsed.raw_row_count,
             "artifact_sha256": artifact_metadata.sha256,
+            "ingestion_generation": ingestion_generation,
         }
     )
     return doc_id, year, "success", inserted, transactions

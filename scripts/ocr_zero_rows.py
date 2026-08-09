@@ -242,6 +242,34 @@ def get_ocr_work_items(
             unresolved.append((doc_id, doc_year, pdf_path))
             continue
         parsed_count = len(cached.parsed.transactions)
+        try:
+            ingestion_generation = _resolve_ingestion_generation(
+                conn, doc_id, doc_year, cached.pdf_sha256
+            )
+        except RuntimeError:
+            unresolved.append((doc_id, doc_year, pdf_path))
+            continue
+        bound_run = conn.execute(
+            """
+            SELECT status, raw_row_count, transaction_count
+            FROM pdf_parse_runs
+            WHERE doc_id = ? AND parser_version = ?
+              AND artifact_sha256 = ? AND ingestion_generation = ?
+            ORDER BY parsed_at DESC LIMIT 1
+            """,
+            [
+                doc_id,
+                parser_version,
+                cached.pdf_sha256,
+                ingestion_generation,
+            ],
+        ).fetchone()
+        if bound_run is None:
+            status = None
+            recorded_raw_count = None
+            recorded_count = None
+        else:
+            status, recorded_raw_count, recorded_count = bound_run
         matching_rows = conn.execute(
             """
             SELECT source_row_id, raw_asset_description, raw_transaction_subtype,
@@ -252,8 +280,20 @@ def get_ocr_work_items(
               AND ingestion_generation = ? AND artifact_sha256 = ?
             ORDER BY source_row_id
             """,
-            [doc_id, parser_version, cached.pdf_sha256],
+            [doc_id, ingestion_generation, cached.pdf_sha256],
         ).fetchall()
+        current_ocr_row_count = len(matching_rows)
+        stale_ocr_row_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM transactions
+            WHERE doc_id = ? AND source = 'gemini_ocr'
+              AND (chamber = 'House' OR chamber IS NULL)
+              AND NOT (
+                  ingestion_generation = ? AND artifact_sha256 = ?
+              )
+            """,
+            [doc_id, ingestion_generation, cached.pdf_sha256],
+        ).fetchone()[0]
         expected_rows = []
         for source_row_number, transaction in enumerate(
             cached.parsed.transactions, start=1
@@ -989,6 +1029,41 @@ def get_metadata_member(conn, doc_id):
     return " ".join(part for part in row if part).strip() or None
 
 
+def _resolve_ingestion_generation(
+    conn, doc_id: str, year: int, artifact_sha256: str
+) -> str:
+    row = conn.execute(
+        """
+        SELECT artifact.generation_id
+        FROM house_pdf_artifacts AS artifact
+        JOIN house_archive_generations AS generation
+          ON generation.archive_year = artifact.archive_year
+         AND generation.generation_id = artifact.generation_id
+        WHERE artifact.doc_id = ?
+          AND artifact.archive_year = ?
+          AND artifact.artifact_sha256 = ?
+        ORDER BY artifact.acquired_at DESC, artifact.generation_id DESC
+        LIMIT 1
+        """,
+        [str(doc_id), year, artifact_sha256],
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            "OCR artifact is not bound to an acquired House ingestion generation"
+        )
+    return str(row[0])
+
+
+def resolve_ingestion_generation(
+    db_path: str, doc_id: str, year: int, artifact_sha256: str
+) -> str:
+    conn = duckdb.connect(db_path, read_only=True)
+    try:
+        return _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
+    finally:
+        conn.close()
+
+
 def record_parse_run(
     conn,
     doc_id,
@@ -998,13 +1073,16 @@ def record_parse_run(
     tx_count,
     error_message="",
     parser_version=GEMINI_PARSER_VERSION,
+    artifact_sha256: str | None = None,
+    ingestion_generation: str | None = None,
 ):
     conn.execute(
         """
         INSERT INTO pdf_parse_runs (
             doc_id, year, parser_version, status, engines_attempted,
-            raw_row_count, transaction_count, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            raw_row_count, transaction_count, error_message,
+            artifact_sha256, ingestion_generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         [
             str(doc_id),
@@ -1015,6 +1093,8 @@ def record_parse_run(
             raw_count,
             tx_count,
             error_message[:1000],
+            artifact_sha256,
+            ingestion_generation,
         ],
     )
 
@@ -1029,13 +1109,16 @@ def insert_transactions(
     parser_version: str = GEMINI_PARSER_VERSION,
     raw_count: int | None = None,
     artifact_sha256: str | None = None,
+    ingestion_generation: str | None = None,
 ):
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
     require_ocr_schema(conn)
-    if not artifact_sha256 and transactions:
+    if not artifact_sha256 or not ingestion_generation:
         conn.close()
-        raise RuntimeError("OCR insertion requires artifact_sha256")
+        raise RuntimeError(
+            "OCR insertion requires artifact_sha256 and ingestion_generation"
+        )
     filing_date = get_filing_date(conn, doc_id)
     expected_member = get_metadata_member(conn, doc_id)
     if not transactions:
@@ -1058,6 +1141,8 @@ def insert_transactions(
                 0,
                 message,
                 parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
             )
             conn.execute("COMMIT")
         except Exception:
@@ -1084,6 +1169,8 @@ def insert_transactions(
             0,
             json.dumps(fatal_rejections, sort_keys=True),
             parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
         )
         conn.close()
         return 0
@@ -1143,7 +1230,7 @@ def insert_transactions(
                 "ticker_candidate": ticker_candidate,
                 "raw_asset_class": "Not separately reported",
                 "raw_asset_description": tx["asset"][:500],
-                "ingestion_generation": parser_version,
+                "ingestion_generation": ingestion_generation,
                 "artifact_sha256": artifact_sha256,
             }
             values.update(authoritative_provenance)
@@ -1163,6 +1250,8 @@ def insert_transactions(
             0,
             message,
             parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
         )
         conn.close()
         return 0
@@ -1181,6 +1270,8 @@ def insert_transactions(
             0,
             "; ".join(errors),
             parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
         )
         conn.execute("CHECKPOINT")
         conn.close()
@@ -1250,6 +1341,8 @@ def insert_transactions(
             count,
             "",
             parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
         )
         conn.execute("COMMIT")
         committed = True
@@ -1270,6 +1363,8 @@ def insert_transactions(
                 0,
                 str(exc),
                 parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
             )
         raise
     finally:
@@ -1309,10 +1404,30 @@ def main():
         output, error, artifact_metadata = call_gemini(
             path, doc_id=doc_id, refresh=args.refresh
         )
+        ingestion_generation = None
+        if artifact_metadata is not None:
+            try:
+                ingestion_generation = resolve_ingestion_generation(
+                    DB_PATH, doc_id, year, artifact_metadata.sha256
+                )
+            except RuntimeError as exc:
+                output, error = None, str(exc)
         if output is None or error:
             conn = duckdb.connect(DB_PATH)
             try:
-                record_parse_run(conn, doc_id, year, "error", 0, 0, error)
+                record_parse_run(
+                    conn,
+                    doc_id,
+                    year,
+                    "error",
+                    0,
+                    0,
+                    error,
+                    artifact_sha256=(
+                        artifact_metadata.sha256 if artifact_metadata else None
+                    ),
+                    ingestion_generation=ingestion_generation,
+                )
             finally:
                 conn.close()
             mark_progress(progress, doc_id, "errors")
@@ -1322,7 +1437,16 @@ def main():
 
         member, transactions = parse_output(output)
         if not transactions:
-            insert_transactions(doc_id, year, member, [], db_path=DB_PATH, raw_count=0)
+            insert_transactions(
+                doc_id,
+                year,
+                member,
+                [],
+                db_path=DB_PATH,
+                raw_count=0,
+                artifact_sha256=artifact_metadata.sha256,
+                ingestion_generation=ingestion_generation,
+            )
             mark_progress(progress, doc_id, "no_txs")
             save_progress(progress)
             print("  No transactions found", flush=True)
@@ -1345,7 +1469,17 @@ def main():
             message = json.dumps(fatal_rejections, sort_keys=True)
             conn = duckdb.connect(DB_PATH)
             try:
-                record_parse_run(conn, doc_id, year, status, raw_count, 0, message)
+                record_parse_run(
+                    conn,
+                    doc_id,
+                    year,
+                    status,
+                    raw_count,
+                    0,
+                    message,
+                    artifact_sha256=artifact_metadata.sha256,
+                    ingestion_generation=ingestion_generation,
+                )
             finally:
                 conn.close()
             mark_progress(progress, doc_id, "errors")
@@ -1361,6 +1495,7 @@ def main():
             db_path=DB_PATH,
             raw_count=raw_count,
             artifact_sha256=artifact_metadata.sha256,
+            ingestion_generation=ingestion_generation,
         )
         total_inserted += inserted
         mark_progress(progress, doc_id, "success" if inserted else "errors")
@@ -1399,10 +1534,30 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             cache_dir=os.path.join(data_dir, "gemini_cache"),
             parser_version=GEMINI_PARSER_VERSION,
         )
+        ingestion_generation = None
+        if artifact_metadata is not None:
+            try:
+                ingestion_generation = resolve_ingestion_generation(
+                    db_path, doc_id, yr, artifact_metadata.sha256
+                )
+            except RuntimeError as exc:
+                output, error = None, str(exc)
         if output is None or error:
             conn = duckdb.connect(db_path)
             try:
-                record_parse_run(conn, doc_id, yr, "error", 0, 0, error)
+                record_parse_run(
+                    conn,
+                    doc_id,
+                    yr,
+                    "error",
+                    0,
+                    0,
+                    error,
+                    artifact_sha256=(
+                        artifact_metadata.sha256 if artifact_metadata else None
+                    ),
+                    ingestion_generation=ingestion_generation,
+                )
             finally:
                 conn.close()
             mark_progress(progress, doc_id, "errors")
@@ -1420,6 +1575,8 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
                 db_path=db_path,
                 raw_count=0,
                 parser_version=GEMINI_PARSER_VERSION,
+                artifact_sha256=artifact_metadata.sha256,
+                ingestion_generation=ingestion_generation,
             )
             mark_progress(progress, doc_id, "no_txs")
             save_progress(progress, progress_path)
@@ -1454,6 +1611,8 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
                     0,
                     message,
                     parser_version=GEMINI_PARSER_VERSION,
+                    artifact_sha256=artifact_metadata.sha256,
+                    ingestion_generation=ingestion_generation,
                 )
             finally:
                 conn.close()
@@ -1472,6 +1631,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             parser_version=GEMINI_PARSER_VERSION,
             raw_count=raw_count,
             artifact_sha256=artifact_metadata.sha256,
+            ingestion_generation=ingestion_generation,
         )
         if inserted <= 0:
             mark_progress(progress, doc_id, "errors")

@@ -104,6 +104,7 @@ def parse_year(year: int, db: Database, settings: Settings):
             raw_row_count=len(transactions),
             transaction_count=0,
             artifact_sha256=artifact_hashes[pdf_path.stem],
+            ingestion_generation=ingestion_generation,
         )
         for pdf_path, transactions, engines_attempted in results
     ]

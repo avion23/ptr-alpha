@@ -138,3 +138,7 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     )
     assert parse_runs["success"]["status"] == "success"
     assert parse_runs["ambiguous-zero"]["status"] == "zero_rows"
+    assert all(
+        run["ingestion_generation"] == "acquired-generation-2026"
+        for run in parse_runs.values()
+    )

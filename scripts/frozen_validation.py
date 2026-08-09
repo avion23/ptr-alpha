@@ -218,7 +218,6 @@ def verify_frozen_state(manifest: dict) -> tuple[bool, list[str]]:
         "config_sha256",
         "code_sha256",
         "harness_sha256",
-        "git_revision",
         "git_diff_sha256",
         "dependency_sha256",
     ):
@@ -226,8 +225,11 @@ def verify_frozen_state(manifest: dict) -> tuple[bool, list[str]]:
             reasons.append(
                 f"{key} mismatch: frozen={hashes.get(key)} live={current[key]}"
             )
-    # git_dirty is recorded for provenance only; the exact state is pinned by
-    # git_diff_sha256 (tracked diff + untracked files), so no separate guard.
+    # git_revision and git_dirty are recorded for provenance only: the exact
+    # evaluation content is pinned by git_diff_sha256 (tracked diff + untracked
+    # files) plus the code/harness hashes, so a content-identical checkout at
+    # any later revision (e.g. the manifest commit or the merged main) still
+    # verifies, while any content drift fails closed.
     return (not reasons, reasons)
 
 

@@ -98,9 +98,23 @@ class TestFreeze:
         assert not ok
         assert any("code_sha256 mismatch" in reason for reason in reasons)
 
-    def test_verify_fails_closed_on_git_drift(self, tmp_path, monkeypatch):
+    def test_verify_passes_on_content_identical_checkout_at_other_revision(
+        self, tmp_path, monkeypatch
+    ):
         manifest_path = _freeze(tmp_path, monkeypatch)
         manifest = json.loads(manifest_path.read_text())
+        # The evaluation content is pinned by hashes, not by the commit id:
+        # a later checkout (e.g. the manifest commit or the merged main) with
+        # identical content still verifies.
+        manifest["hashes"]["git_revision"] = "x" * 40
+        ok, reasons = fv.verify_frozen_state(manifest)
+        assert ok, reasons
+
+    def test_verify_fails_closed_on_working_tree_drift(self, tmp_path, monkeypatch):
+        manifest_path = _freeze(tmp_path, monkeypatch)
+        manifest = json.loads(manifest_path.read_text())
+        # A content-identical checkout at a different revision must still
+        # verify; any working-tree content drift must fail closed.
         monkeypatch.setattr(
             fv,
             "_git_state",
@@ -112,7 +126,7 @@ class TestFreeze:
         )
         ok, reasons = fv.verify_frozen_state(manifest)
         assert not ok
-        assert any("git_revision mismatch" in reason for reason in reasons)
+        assert any("git_diff_sha256 mismatch" in reason for reason in reasons)
 
     def test_verify_fails_closed_on_dependency_drift(self, tmp_path, monkeypatch):
         manifest_path = _freeze(tmp_path, monkeypatch)

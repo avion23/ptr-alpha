@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+import re
 
 import duckdb
 import pandas as pd
@@ -22,7 +23,13 @@ SOURCE_REPORT_COLUMNS = [
     "official_filing_date",
     "outcome",
     "artifact_sha256",
+    "landing_sha256",
+    "paper_artifact_url",
+    "paper_artifact_sha256",
     "error_message",
+    "raw_row_count",
+    "accepted_row_count",
+    "rejected_row_count",
 ]
 
 
@@ -35,12 +42,15 @@ class SourceReportRepository:
         generation: str,
         chamber: str,
         reports_df: pd.DataFrame,
+        *,
+        _in_transaction: bool = False,
     ) -> None:
         """Atomically replace one generation/chamber report inventory."""
-        self._validate_replacement(generation, chamber, reports_df)
+        self.validate_replacement(generation, chamber, reports_df)
         reports_df = reports_df[SOURCE_REPORT_COLUMNS].copy()
 
-        self.conn.execute("BEGIN TRANSACTION")
+        if not _in_transaction:
+            self.conn.execute("BEGIN TRANSACTION")
         try:
             self.conn.execute(
                 "DELETE FROM source_reports "
@@ -57,7 +67,13 @@ class SourceReportRepository:
                     official_filing_date,
                     outcome,
                     artifact_sha256,
-                    error_message
+                    landing_sha256,
+                    paper_artifact_url,
+                    paper_artifact_sha256,
+                    error_message,
+                    raw_row_count,
+                    accepted_row_count,
+                    rejected_row_count
                 )
                 SELECT
                     ingestion_generation,
@@ -68,12 +84,20 @@ class SourceReportRepository:
                     CAST(official_filing_date AS DATE),
                     outcome,
                     artifact_sha256,
-                    error_message
+                    landing_sha256,
+                    paper_artifact_url,
+                    paper_artifact_sha256,
+                    error_message,
+                    CAST(raw_row_count AS INTEGER),
+                    CAST(accepted_row_count AS INTEGER),
+                    CAST(rejected_row_count AS INTEGER)
                 FROM reports_df
             """)
-            self.conn.execute("COMMIT")
+            if not _in_transaction:
+                self.conn.execute("COMMIT")
         except Exception:
-            self.conn.execute("ROLLBACK")
+            if not _in_transaction:
+                self.conn.execute("ROLLBACK")
             raise
 
     def get(self, generation: str, chamber: str) -> pd.DataFrame:
@@ -88,7 +112,13 @@ class SourceReportRepository:
                 official_filing_date,
                 outcome,
                 artifact_sha256,
-                error_message
+                landing_sha256,
+                paper_artifact_url,
+                paper_artifact_sha256,
+                error_message,
+                raw_row_count,
+                accepted_row_count,
+                rejected_row_count
             FROM source_reports
             WHERE ingestion_generation = ? AND chamber = ?
             ORDER BY source_record_id
@@ -114,7 +144,7 @@ class SourceReportRepository:
         return dict(zip(names, (int(value) for value in row), strict=True))
 
     @staticmethod
-    def _validate_replacement(
+    def validate_replacement(
         generation: str,
         chamber: str,
         reports_df: pd.DataFrame,
@@ -161,6 +191,51 @@ class SourceReportRepository:
                 + ", ".join(duplicate_ids[:10])
             )
 
+        count_columns = [
+            "raw_row_count",
+            "accepted_row_count",
+            "rejected_row_count",
+        ]
+        numeric_counts = reports_df[count_columns].apply(pd.to_numeric, errors="coerce")
+        if (
+            numeric_counts.isna().any().any()
+            or (numeric_counts < 0).any().any()
+            or (numeric_counts % 1 != 0).any().any()
+        ):
+            raise ValueError("source report row counts must be non-negative integers")
+        invalid_equation = numeric_counts["raw_row_count"].ne(
+            numeric_counts["accepted_row_count"] + numeric_counts["rejected_row_count"]
+        )
+        if invalid_equation.any():
+            bad_ids = reports_df.loc[invalid_equation, "source_record_id"].tolist()
+            raise ValueError(
+                "source report row reconciliation failed for: "
+                + ", ".join(bad_ids[:10])
+            )
+
+        hash_columns = [
+            "artifact_sha256",
+            "landing_sha256",
+            "paper_artifact_sha256",
+        ]
+        for column in hash_columns:
+            hashes = reports_df[column]
+            invalid_hash = hashes.notna() & ~hashes.map(
+                lambda value: (
+                    isinstance(value, str)
+                    and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
+                    if value is not None
+                    else False
+                )
+            )
+            if invalid_hash.any():
+                raise ValueError(f"{column} must be a 64-character hexadecimal digest")
+        requires_artifact_hash = reports_df["outcome"].isin(
+            [SourceReportOutcome.PARSED.value, SourceReportOutcome.PAPER_ONLY.value]
+        )
+        if (requires_artifact_hash & reports_df["artifact_sha256"].isna()).any():
+            raise ValueError("parsed and paper_only reports require artifact_sha256")
+
         counts = reports_df["outcome"].value_counts().to_dict()
         found = len(reports_df)
         parsed = int(counts.get(SourceReportOutcome.PARSED.value, 0))
@@ -181,9 +256,9 @@ class SourceReportRepository:
                 f"found={found}, parsed={parsed}, paper_only={paper_only}, "
                 f"unavailable={unavailable}, failed={failed}, unknown={unknown}"
             )
-        if failed:
+        if failed or unavailable:
             raise ValueError(
-                "source report replacement requires failed=0; "
+                "source report replacement requires unavailable=0 and failed=0; "
                 f"found={found}, parsed={parsed}, paper_only={paper_only}, "
                 f"unavailable={unavailable}, failed={failed}"
             )

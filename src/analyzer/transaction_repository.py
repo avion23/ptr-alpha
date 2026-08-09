@@ -10,6 +10,38 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+SOURCE_TRANSACTION_COLUMNS = [
+    "doc_id",
+    "chamber",
+    "source_record_id",
+    "source_row_id",
+    "member",
+    "ticker",
+    "raw_ticker",
+    "transaction_date",
+    "disclosure_date",
+    "official_filing_date",
+    "available_date",
+    "notification_date",
+    "transaction_type",
+    "raw_transaction_subtype",
+    "owner_code",
+    "raw_owner",
+    "amount_raw",
+    "amount_midpoint",
+    "instrument_type",
+    "raw_asset_class",
+    "strike_price",
+    "expiry_date",
+    "asset_description",
+    "raw_asset_description",
+    "ticker_origin",
+    "amends_source_record_id",
+    "ingestion_generation",
+    "artifact_sha256",
+]
+
+
 class TransactionRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.conn = conn
@@ -33,8 +65,9 @@ class TransactionRepository:
             )
         result = self.conn.execute(
             """
-            SELECT member, ticker, transaction_date, disclosure_date, transaction_type,
-                   owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date
+            SELECT member, ticker, transaction_date, disclosure_date, available_date,
+                   transaction_type, owner_code, amount_raw, amount_midpoint,
+                   instrument_type, strike_price, expiry_date, source, chamber
             FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
@@ -64,8 +97,9 @@ class TransactionRepository:
             )
         result = self.conn.execute(
             """
-            SELECT member, ticker, transaction_date, disclosure_date, transaction_type,
-                   owner_code, amount_raw, amount_midpoint, instrument_type, strike_price, expiry_date
+            SELECT member, ticker, transaction_date, disclosure_date, available_date,
+                   transaction_type, owner_code, amount_raw, amount_midpoint,
+                   instrument_type, strike_price, expiry_date, source, chamber
             FROM transactions
             WHERE disclosure_date BETWEEN ? AND ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
@@ -151,18 +185,6 @@ class TransactionRepository:
                        asset_description, source
                 FROM filtered_staging_transactions
                 WHERE ticker IS NOT NULL
-                ON CONFLICT (doc_id, ticker, transaction_date, member, transaction_type, amount_raw, owner_code, asset_description) DO UPDATE SET
-                    transaction_type = EXCLUDED.transaction_type,
-                    disclosure_date = EXCLUDED.disclosure_date,
-                    owner_code = EXCLUDED.owner_code,
-                    amount_raw = EXCLUDED.amount_raw,
-                    amount_midpoint = EXCLUDED.amount_midpoint,
-                    instrument_type = EXCLUDED.instrument_type,
-                    strike_price = EXCLUDED.strike_price,
-                    expiry_date = EXCLUDED.expiry_date,
-                    created_at = EXCLUDED.created_at,
-                    asset_description = EXCLUDED.asset_description,
-                    source = COALESCE(transactions.source, EXCLUDED.source)
             """)
             self.conn.execute("""
                 INSERT INTO transactions (
@@ -191,13 +213,78 @@ class TransactionRepository:
             self.conn.execute("DROP TABLE IF EXISTS staging_transactions")
         return inserted_count
 
+    def replace_source_generation(
+        self,
+        df: pd.DataFrame,
+        *,
+        source: str,
+        chamber: str,
+        ingestion_generation: str,
+        _in_transaction: bool = False,
+    ) -> int:
+        """Replace one source/chamber/generation without economic-key merging."""
+        df = df[SOURCE_TRANSACTION_COLUMNS].copy()
+        df["created_at"] = datetime.now()
+        df["source"] = source
+        self.conn.execute(
+            "CREATE TEMP TABLE staging_source_transactions AS SELECT * FROM df"
+        )
+        succeeded = False
+        try:
+            if not _in_transaction:
+                self.conn.execute("BEGIN TRANSACTION")
+            self.conn.execute(
+                "DELETE FROM transactions "
+                "WHERE source = ? AND chamber = ? AND ingestion_generation = ?",
+                [source, chamber, ingestion_generation],
+            )
+            self.conn.execute("""
+                INSERT INTO transactions (
+                    doc_id, member, ticker, transaction_date, disclosure_date,
+                    transaction_type, owner_code, amount_raw, amount_midpoint,
+                    instrument_type, strike_price, expiry_date, created_at,
+                    asset_description, source, chamber, source_record_id,
+                    source_row_id, official_filing_date, available_date,
+                    notification_date, amends_source_record_id,
+                    raw_transaction_subtype, ticker_origin, raw_ticker, raw_asset_class,
+                    raw_asset_description, raw_owner, ingestion_generation,
+                    artifact_sha256
+                )
+                SELECT
+                    doc_id, member, ticker, transaction_date, disclosure_date,
+                    transaction_type, owner_code, amount_raw, amount_midpoint,
+                    instrument_type, strike_price, expiry_date, created_at,
+                    asset_description, source, chamber, source_record_id,
+                    source_row_id, official_filing_date, available_date,
+                    notification_date, amends_source_record_id,
+                    raw_transaction_subtype, ticker_origin, raw_ticker, raw_asset_class,
+                    raw_asset_description, raw_owner, ingestion_generation,
+                    artifact_sha256
+                FROM staging_source_transactions
+            """)
+            if not _in_transaction:
+                self.conn.execute("COMMIT")
+            succeeded = True
+        except Exception:
+            if not _in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+        finally:
+            if succeeded or not _in_transaction:
+                self.conn.execute("DROP TABLE IF EXISTS staging_source_transactions")
+        return len(df)
+
     def get_for_doc(self, doc_id: str) -> pd.DataFrame:
         return self.conn.execute(
             """
             SELECT id, doc_id, member, ticker, transaction_date, disclosure_date,
                    transaction_type, owner_code, amount_raw, amount_midpoint,
                    instrument_type, strike_price, expiry_date, asset_description,
-                   source, created_at
+                   source, chamber, source_record_id, source_row_id,
+                   official_filing_date, available_date, notification_date,
+                   amends_source_record_id, raw_transaction_subtype, ticker_origin,
+                   raw_ticker, raw_asset_class, raw_asset_description, raw_owner,
+                   ingestion_generation, artifact_sha256, created_at
             FROM transactions
             WHERE doc_id = ?
             ORDER BY id

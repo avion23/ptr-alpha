@@ -13,7 +13,10 @@ from analyzer.parse_run_repository import ParseRunRepository
 from analyzer.price_repository import PriceRepository
 from analyzer.source_report_repository import SourceReportRepository
 from analyzer.ticker_resolver import TickerResolver
-from analyzer.transaction_repository import TransactionRepository
+from analyzer.transaction_repository import (
+    SOURCE_TRANSACTION_COLUMNS,
+    TransactionRepository,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -117,17 +120,11 @@ class Database:
             "UPDATE transactions SET owner_code=COALESCE(owner_code,''), amount_raw=COALESCE(amount_raw,'')"
         )
         self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique")
-        try:
-            self.conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique_v2 "
-                "ON transactions(doc_id, ticker, transaction_date, member, transaction_type, "
-                "amount_raw, owner_code, asset_description)"
-            )
-        except duckdb.ConstraintException as e:
-            raise RuntimeError(
-                "Failed to create transactions unique index. Run "
-                "`python3 scripts/purge_phantom_rows.py --execute` first."
-            ) from e
+        self.conn.execute("DROP INDEX IF EXISTS idx_tx_unique_v2")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_source_row_unique "
+            "ON transactions(source, chamber, source_record_id, source_row_id, ingestion_generation)"
+        )
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))"
         )
@@ -180,7 +177,13 @@ class Database:
                     outcome IN ('parsed', 'paper_only', 'unavailable', 'failed')
                 ),
                 artifact_sha256 VARCHAR,
+                landing_sha256 VARCHAR,
+                paper_artifact_url VARCHAR,
+                paper_artifact_sha256 VARCHAR,
                 error_message VARCHAR,
+                raw_row_count INTEGER NOT NULL,
+                accepted_row_count INTEGER NOT NULL,
+                rejected_row_count INTEGER NOT NULL,
                 UNIQUE (ingestion_generation, chamber, source_record_id)
             )
         """)
@@ -199,6 +202,21 @@ class Database:
             "expiry_date": "VARCHAR",
             "asset_description": "VARCHAR",
             "source": "VARCHAR",
+            "chamber": "VARCHAR",
+            "source_record_id": "VARCHAR",
+            "source_row_id": "VARCHAR",
+            "official_filing_date": "DATE",
+            "available_date": "DATE",
+            "notification_date": "DATE",
+            "amends_source_record_id": "VARCHAR",
+            "raw_transaction_subtype": "VARCHAR",
+            "ticker_origin": "VARCHAR",
+            "raw_ticker": "VARCHAR",
+            "raw_asset_class": "VARCHAR",
+            "raw_asset_description": "VARCHAR",
+            "raw_owner": "VARCHAR",
+            "ingestion_generation": "VARCHAR",
+            "artifact_sha256": "VARCHAR",
         }
         for column, column_type in required_columns.items():
             if column not in existing_columns:
@@ -349,6 +367,158 @@ class Database:
         self, generation: str, chamber: str
     ) -> dict[str, int]:
         return self.source_reports.reconcile(generation, chamber)
+
+    def persist_source_refresh(
+        self,
+        *,
+        transactions: pd.DataFrame,
+        reports: pd.DataFrame,
+        source: str,
+        chamber: str,
+        ingestion_generation: str,
+    ) -> int:
+        """Atomically replace a complete source refresh and its report inventory."""
+        self.source_reports.validate_replacement(ingestion_generation, chamber, reports)
+        self._validate_source_refresh_transactions(
+            transactions=transactions,
+            reports=reports,
+            source=source,
+            chamber=chamber,
+            ingestion_generation=ingestion_generation,
+        )
+
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            inserted = self.transactions.replace_source_generation(
+                transactions,
+                source=source,
+                chamber=chamber,
+                ingestion_generation=ingestion_generation,
+                _in_transaction=True,
+            )
+            self.source_reports.replace_generation(
+                ingestion_generation,
+                chamber,
+                reports,
+                _in_transaction=True,
+            )
+            self.conn.execute("COMMIT")
+            return inserted
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _validate_source_refresh_transactions(
+        *,
+        transactions: pd.DataFrame,
+        reports: pd.DataFrame,
+        source: str,
+        chamber: str,
+        ingestion_generation: str,
+    ) -> None:
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("source must be a non-empty string")
+
+        missing = set(SOURCE_TRANSACTION_COLUMNS) - set(transactions.columns)
+        if missing:
+            raise ValueError(
+                "source transaction columns are missing: " + ", ".join(sorted(missing))
+            )
+        if (
+            "source" in transactions.columns
+            and not transactions["source"].eq(source).all()
+        ):
+            raise ValueError(
+                "all source transactions must match the persistence source"
+            )
+        if not transactions["chamber"].eq(chamber).all():
+            raise ValueError(
+                "all source transactions must match the persistence chamber"
+            )
+        if not transactions["ingestion_generation"].eq(ingestion_generation).all():
+            raise ValueError(
+                "all source transactions must match the ingestion generation"
+            )
+
+        required_values = [
+            "doc_id",
+            "source_record_id",
+            "member",
+            "transaction_date",
+            "official_filing_date",
+            "available_date",
+            "transaction_type",
+            "raw_transaction_subtype",
+            "amount_raw",
+            "raw_asset_description",
+            "ticker_origin",
+            "artifact_sha256",
+        ]
+        if transactions[required_values].isna().any().any():
+            raise ValueError("source transaction provenance values are incomplete")
+
+        identified = transactions[transactions["source_row_id"].notna()]
+        duplicate_rows = identified.duplicated(
+            subset=["source_record_id", "source_row_id"], keep=False
+        )
+        if duplicate_rows.any():
+            duplicates = identified.loc[
+                duplicate_rows, ["source_record_id", "source_row_id"]
+            ].drop_duplicates()
+            rendered = [
+                f"{row.source_record_id}/{row.source_row_id}"
+                for row in duplicates.itertuples(index=False)
+            ]
+            raise ValueError(
+                "duplicate source row identities are not allowed: "
+                + ", ".join(rendered[:10])
+            )
+
+        report_index = reports.set_index("source_record_id")
+        transaction_report_ids = set(transactions["source_record_id"])
+        unknown_reports = transaction_report_ids - set(report_index.index)
+        if unknown_reports:
+            raise ValueError(
+                "source transactions have no report inventory entry: "
+                + ", ".join(sorted(str(value) for value in unknown_reports)[:10])
+            )
+
+        for row in transactions[
+            ["source_record_id", "artifact_sha256", "official_filing_date"]
+        ].itertuples(index=False):
+            report = report_index.loc[row.source_record_id]
+            if row.artifact_sha256 != report["artifact_sha256"]:
+                raise ValueError(
+                    "source transaction artifact hash does not match report inventory: "
+                    f"{row.source_record_id}"
+                )
+            transaction_date = pd.to_datetime(row.official_filing_date, errors="coerce")
+            report_date = pd.to_datetime(
+                report["official_filing_date"], errors="coerce"
+            )
+            if pd.isna(transaction_date) or pd.isna(report_date):
+                raise ValueError("official_filing_date must be a valid date")
+            if transaction_date.date() != report_date.date():
+                raise ValueError(
+                    "source transaction filing date does not match report inventory: "
+                    f"{row.source_record_id}"
+                )
+
+        actual_counts = transactions["source_record_id"].value_counts().to_dict()
+        for report in reports.itertuples(index=False):
+            actual = int(actual_counts.get(report.source_record_id, 0))
+            accepted = int(report.accepted_row_count)
+            if actual != accepted:
+                raise ValueError(
+                    "accepted transaction count does not match report inventory: "
+                    f"{report.source_record_id} expected={accepted} actual={actual}"
+                )
+            if actual and report.outcome != "parsed":
+                raise ValueError(
+                    "transactions may only map to parsed report outcomes: "
+                    f"{report.source_record_id}"
+                )
 
     # -- lifecycle ------------------------------------------------------------
 

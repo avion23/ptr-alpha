@@ -950,6 +950,21 @@ class TestParseRunsTable(DatabaseTestCase):
             ),
             source="gemini_ocr",
         )
+        self.db.upsert_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "doc_id": "ocr-doc",
+                        "member": "Jane Doe",
+                        "ticker": "MSFT",
+                        "transaction_date": date(2024, 1, 2),
+                        "disclosure_date": date(2024, 1, 3),
+                        "transaction_type": "Purchase",
+                    }
+                ]
+            ),
+            source="house_pdf",
+        )
         parse_run = {
             "doc_id": "ocr-doc",
             "year": 2024,
@@ -960,23 +975,30 @@ class TestParseRunsTable(DatabaseTestCase):
             "transaction_count": 0,
         }
 
-        self.db.replace_transactions_for_docs(
+        replacement = self.db.replace_transactions_for_docs(
             pd.DataFrame(),
             source="house_pdf",
+            attempted_doc_ids=["ocr-doc"],
             parse_runs=[parse_run],
         )
 
-        transaction = self.db.conn.execute(
+        transactions = self.db.conn.execute(
             "SELECT source FROM transactions WHERE doc_id = 'ocr-doc'"
-        ).fetchone()
+        ).fetchall()
         persisted = self.db.conn.execute(
             """
             SELECT status, transaction_count FROM pdf_parse_runs
             WHERE doc_id = 'ocr-doc' AND parser_version = 'v4-deterministic'
             """
         ).fetchone()
-        self.assertEqual(transaction[0], "gemini_ocr")
+        self.assertEqual(transactions, [("gemini_ocr",)])
         self.assertEqual(persisted, ("zero_rows", 1))
+        self.assertEqual(
+            replacement.by_doc_source,
+            {"ocr-doc": {"gemini_ocr": 1}},
+        )
+        self.assertEqual(replacement.by_doc_total, {"ocr-doc": 1})
+        self.assertEqual(replacement.total_current_rows, 1)
 
 
 class TestTransactionNormalization(DatabaseTestCase):

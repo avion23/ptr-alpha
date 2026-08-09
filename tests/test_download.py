@@ -181,3 +181,56 @@ def test_parse_persistence_records_house_provenance_and_artifact_hash(tmp_path):
     assert stored["official_filing_date"].date() == date(2021, 1, 3)
     assert stored["artifact_sha256"] == hashlib.sha256(pdf_bytes).hexdigest()
     assert parse_run == ("v4-deterministic", "success", 1, 1)
+
+
+
+def test_zero_output_parse_deletes_stale_house_rows_but_preserves_ocr(tmp_path):
+    source, db = _source(tmp_path)
+    pdf_path = tmp_path / "2021" / "pdfs" / "zero.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-zero")
+    base = {
+        "doc_id": "zero",
+        "member": "Jane Doe",
+        "transaction_date": date(2021, 1, 2),
+        "disclosure_date": date(2021, 1, 3),
+        "transaction_type": "Purchase",
+    }
+    db.upsert_transactions(
+        pd.DataFrame([{**base, "ticker": "AAPL"}]),
+        source="gemini_ocr",
+    )
+    db.upsert_transactions(
+        pd.DataFrame([{**base, "ticker": "MSFT"}]),
+        source="house_pdf",
+    )
+    member_lookup = {
+        "zero": {
+            "First": "Jane",
+            "Last": "Doe",
+            "FilingDate": pd.Timestamp("2021-01-03"),
+        }
+    }
+
+    try:
+        source._save_parse_results(
+            2021,
+            [(pdf_path, [], ["pdfplumber", "pdftotext"])],
+            member_lookup,
+        )
+        rows = db.conn.execute(
+            "SELECT ticker, source FROM transactions WHERE doc_id = 'zero'"
+        ).fetchall()
+        parse_run = db.conn.execute(
+            """
+            SELECT status, raw_row_count, transaction_count
+            FROM pdf_parse_runs
+            WHERE doc_id = 'zero' AND parser_version = 'v4-deterministic'
+            """
+        ).fetchone()
+    finally:
+        source.close()
+        db.close()
+
+    assert rows == [("AAPL", "gemini_ocr")]
+    assert parse_run == ("zero_rows", 0, 1)

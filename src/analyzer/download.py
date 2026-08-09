@@ -427,20 +427,22 @@ class HouseTransactionSource(TransactionSource):
         if not df.empty:
             df = preserve_existing_fields(df, self.db)
 
-        self.db.replace_transactions_for_docs(
+        attempted_doc_ids = [doc_id for doc_id, _ in parse_attempts]
+        persisted = self.db.replace_transactions_for_docs(
             df,
             source="house_pdf",
+            attempted_doc_ids=attempted_doc_ids,
             parse_runs=parse_runs,
         )
-        persisted_counts = self.db.count_transactions_for_docs(
-            [doc_id for doc_id, _ in parse_attempts]
-        )
         logger.info(
-            "Persisted %d transactions across %d parsed PDFs (%d zero-row results)",
-            sum(persisted_counts.values()),
+            "Persisted %d transactions across %d parsed PDFs "
+            "(%d zero-row results; %d total database rows)",
+            sum(persisted.by_doc_total.values()),
             len(parse_attempts),
             len(zero_row_doc_ids),
+            persisted.total_current_rows,
         )
+        logger.debug("Persisted rows by doc/source: %s", persisted.by_doc_source)
 
 
 # ── Helpers ──

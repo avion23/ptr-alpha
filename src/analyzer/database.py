@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -22,6 +23,13 @@ from analyzer.transaction_repository import (
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionReplacementCounts:
+    by_doc_source: dict[str, dict[str, int]]
+    by_doc_total: dict[str, int]
+    total_current_rows: int
 
 
 class DatabaseError(AnalysisError):
@@ -365,22 +373,44 @@ class Database:
         df: pd.DataFrame,
         *,
         source: str,
+        attempted_doc_ids: list[str],
         parse_runs: list[dict] | None = None,
-    ) -> None:
-        """Atomically replace one source and record actual persisted row counts.
+    ) -> TransactionReplacementCounts:
+        """Atomically replace attempted documents for one source.
 
-        Deterministic House reparses replace only deterministic/legacy House
-        rows. OCR and backup-source rows remain available, including when a
-        deterministic parser produces zero rows.
+        Attempted IDs are explicit because zero-output documents are absent
+        from ``df``. Deterministic House attempts replace deterministic/legacy
+        House rows while preserving OCR and backup-source provenance.
         """
-        doc_ids = (
-            df["doc_id"].astype(str).unique().tolist()
+        attempted = list(dict.fromkeys(str(doc_id) for doc_id in attempted_doc_ids))
+        attempted_set = set(attempted)
+        df_doc_ids = (
+            set(df["doc_id"].astype(str))
             if not df.empty and "doc_id" in df.columns
-            else []
+            else set()
         )
+        unexpected_df_ids = sorted(df_doc_ids - attempted_set)
+        if unexpected_df_ids:
+            raise ValueError(
+                "Replacement dataframe contains unattempted doc IDs: "
+                + ", ".join(unexpected_df_ids)
+            )
+        unexpected_run_ids = sorted(
+            {
+                str(parse_run["doc_id"])
+                for parse_run in parse_runs or []
+                if str(parse_run["doc_id"]) not in attempted_set
+            }
+        )
+        if unexpected_run_ids:
+            raise ValueError(
+                "Parse runs contain unattempted doc IDs: "
+                + ", ".join(unexpected_run_ids)
+            )
+
         self.conn.execute("BEGIN TRANSACTION")
         try:
-            for doc_id in doc_ids:
+            for doc_id in attempted:
                 if source == "house_pdf":
                     self.conn.execute(
                         "DELETE FROM transactions "
@@ -394,20 +424,42 @@ class Database:
                     )
             if not df.empty:
                 self.transactions.upsert(df, source=source, _in_transaction=True)
+
+            by_doc_source: dict[str, dict[str, int]] = {}
+            by_doc_total: dict[str, int] = {}
+            for doc_id in attempted:
+                source_rows = self.conn.execute(
+                    """
+                    SELECT COALESCE(source, '<legacy>'), COUNT(*)
+                    FROM transactions WHERE doc_id = ? GROUP BY 1 ORDER BY 1
+                    """,
+                    [doc_id],
+                ).fetchall()
+                counts = {str(row_source): int(count) for row_source, count in source_rows}
+                by_doc_source[doc_id] = counts
+                by_doc_total[doc_id] = sum(counts.values())
+
             for parse_run in parse_runs or []:
-                persisted_count = self.conn.execute(
-                    "SELECT COUNT(*) FROM transactions WHERE doc_id = ?",
-                    [parse_run["doc_id"]],
-                ).fetchone()[0]
+                doc_id = str(parse_run["doc_id"])
                 persisted_run = {
                     **parse_run,
-                    "transaction_count": persisted_count,
+                    "doc_id": doc_id,
+                    "transaction_count": by_doc_total[doc_id],
                 }
                 self.parse_runs.upsert(**persisted_run, _in_transaction=True)
+            total_current_rows = int(
+                self.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+            )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+
+        return TransactionReplacementCounts(
+            by_doc_source=by_doc_source,
+            by_doc_total=by_doc_total,
+            total_current_rows=total_current_rows,
+        )
 
     def get_transactions(
         self,

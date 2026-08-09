@@ -1,0 +1,298 @@
+{
+  "claim_gates": {
+    "final_alpha_p_max": 0.05,
+    "final_null_p_max": 0.05,
+    "pre_final_permutation_p_max": 0.01
+  },
+  "config_sha256": "ab54ce36e98ba76520ee1d40623a10cbccef9d7086ae856f0cbb8dcb5465ce9c",
+  "consumption": {
+    "anchor": "exact ledger bytes in a Git commit plus append-only byte-prefix SHA-256 event chain; refs/optimize-profit/final-consumption/<lock-sha> advances atomically",
+    "canonical_ledger": "data/optimize_profit_final_consumption.jsonl",
+    "canonical_result": "data/optimize_profit_final_result.json",
+    "discovery": "second reservation scans current refs, all refs and reflogs, and unreachable/dangling commit and blob objects via git fsck",
+    "maximum_evaluations": 1,
+    "reservation": "Git-committed and ref-anchored before any database hash, open, or analytic query",
+    "residual_limit": "an attacker with full local repository write access can erase evidence by deleting refs, expiring every reflog, and garbage-collecting unreachable objects; use an externally replicated Git remote for protection against that threat",
+    "rollback_resistance": "deleting the ledger, custom ref, or moving a branch does not bypass the object-store scan"
+  },
+  "db_access_statement": "Retrospective runs may read the DB whole file to hash it but do not analytically query locked final-period rows.",
+  "decision_dates": [
+    "2026-10-01",
+    "2027-01-01",
+    "2027-04-01",
+    "2027-07-01",
+    "2027-10-01",
+    "2028-01-01",
+    "2028-04-01",
+    "2028-07-01"
+  ],
+  "endpoint_policy": {
+    "entry": "first SPY trading date on/after decision within 7 calendar days",
+    "exit": "first SPY trading date on/after decision+horizon within 7 calendar days",
+    "missing_data": "fail final evaluation; no stale, delisted fallback, skip, or cash substitution",
+    "round_trip_slippage_bps": 20,
+    "ticker_and_spy": "all selected ticker and SPY values must exist exactly on common endpoints"
+  },
+  "final_null_permutations": 999,
+  "horizon_days": 90,
+  "lock_id": "ptr-alpha-final-2026q4-2028q3-v3",
+  "locked_at_utc": "2026-08-09T20:50:00Z",
+  "locked_config": {
+    "allocation": "signal",
+    "decay_lambda": 0.003,
+    "min_buyers": 2,
+    "scoring_fn": "sharpe",
+    "top_n": 3
+  },
+  "minimum_final_observations": 8,
+  "pre_final_evidence": {
+    "bonferroni_passed": false,
+    "empirical_p_value": 0.028,
+    "phase": "retrospective_validation_reused_history",
+    "profit_claim_allowed": false,
+    "retrospective_alpha_sharpe": 0.61,
+    "retrospective_spy_return_pct": 21.85,
+    "retrospective_strategy_return_pct": 39.09,
+    "selection_empirical_permutation_p_value": 0.028,
+    "selection_trials": 408
+  },
+  "precommit_cutoff_date": "2026-08-09",
+  "required_price_through": "2028-09-29",
+  "runtime_fingerprint": {
+    "blas": {
+      "detection method": "system",
+      "found": true,
+      "include directory": "unknown",
+      "lib directory": "unknown",
+      "name": "accelerate",
+      "openblas configuration": "unknown",
+      "pc file directory": "unknown",
+      "version": "unknown"
+    },
+    "dependencies": {
+      "duckdb": "1.4.4",
+      "numpy": "2.4.6",
+      "pandas": "3.0.1",
+      "pydantic": "2.12.5",
+      "requests": null,
+      "scipy": "1.17.1",
+      "yfinance": "1.2.0"
+    },
+    "lapack": {
+      "detection method": "system",
+      "found": true,
+      "include directory": "unknown",
+      "lib directory": "unknown",
+      "name": "accelerate",
+      "openblas configuration": "unknown",
+      "pc file directory": "unknown",
+      "version": "unknown"
+    },
+    "numpy_machine": {
+      "build": {
+        "cpu": "aarch64",
+        "endian": "little",
+        "family": "aarch64",
+        "system": "darwin"
+      },
+      "host": {
+        "cpu": "aarch64",
+        "endian": "little",
+        "family": "aarch64",
+        "system": "darwin"
+      }
+    },
+    "platform": {
+      "architecture": [
+        "64bit",
+        "Mach-O"
+      ],
+      "byteorder": "little",
+      "machine": "arm64",
+      "processor": "arm",
+      "release": "25.5.0",
+      "system": "Darwin",
+      "version": "Darwin Kernel Version 25.5.0: Tue Jun  9 22:28:34 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T6041"
+    },
+    "python_implementation": "CPython",
+    "python_version": "3.14.6",
+    "simd": {
+      "baseline": [
+        "NEON",
+        "NEON_FP16",
+        "NEON_VFPV4",
+        "ASIMD"
+      ],
+      "found": [
+        "ASIMDHP",
+        "ASIMDDP"
+      ],
+      "not found": [
+        "ASIMDFHM"
+      ]
+    }
+  },
+  "schema_version": 3,
+  "sealed_source_aggregate_sha256": "ca59d6671da72df14af05ef525bf385ea906bd16985b232284429b986514c29e",
+  "sealed_source_sha256": {
+    "optimize_profit/__init__.py": "f8e8c376aeddc23faae31d18ebdaa12c45ff5c5a87f111ef99312a10358cb0f9",
+    "optimize_profit/main.py": "431218ea1270010f1e5e98b1e8d435a8949766285cd2e0e358fb608ec8afccbb",
+    "optimize_profit/metrics.py": "dea238f90df2f6966703c5cedc6e6722e49b1e476f7cff8ace31480e0bd29c6e",
+    "optimize_profit/precompute.py": "cc2055061a838416d67243a596e3707b59db888f8518f95afb22497bb6392db0",
+    "optimize_profit/reporting.py": "ba235faef7300aef6172a2789018a52f62032791ce9005dc15be95debd07893a",
+    "optimize_profit/scoring.py": "c06209ed8d65317b4e4ee92ada6a6114c5beef7226d3dddae80c5b3350c2852a",
+    "optimize_profit/walk_forward.py": "500c893b32ddeedfae1a5ea394786767fa0aea3496a368a83ca0591f92661bb1",
+    "src/analyzer/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/analyzer/_memo.py": "188f3c89ae0969137f1d5f793c587e83969c292de437a0b8374ac4e8498eacbe",
+    "src/analyzer/analysis.py": "3e271179613dc455d5db888630636f0bcdff631809a7b6397a318a3bee589bba",
+    "src/analyzer/backtest/__init__.py": "1cb69c72916051b7c20e09694bf2e68dc866b99d2823479ea2339478516dfcd2",
+    "src/analyzer/backtest/curves.py": "082b777debcb562005852cef2a7a2d8d69634521e96eadac8ee2ffd469c14e3f",
+    "src/analyzer/backtest/evaluate.py": "802e4753580b4a29e45570dcd9708483341baaa82b414b75c8374a67f1dbfc64",
+    "src/analyzer/backtest/filters.py": "2d8ccb65a7119ef4f0889c8f51966ddf4ab4570eac150fe92c6fb42d46a9642e",
+    "src/analyzer/backtest/ou_params.py": "fc1f0a29884dcff076a4d483b21a7f2b077af07383a18e3270ddfadb86f09c8f",
+    "src/analyzer/backtest/prices.py": "1f057253cb90ce18ad716ed6e2852d76c9d87860a1fdd9e480d30f0fbe0d437c",
+    "src/analyzer/backtest/recommend.py": "066745ead14870ddf9ce561bd67f7de93aa1967d3de3ca44de903574ad5e5a30",
+    "src/analyzer/backtest/summary.py": "d5ba23f1a3444c4d2f5b12281fe33d0be3699e46e75b8e7038ce75473ad212f8",
+    "src/analyzer/capitol_trades.py": "3bbc85f3f8ff33923264b44481f6c2c1393671015178e621d1705bb45178df2c",
+    "src/analyzer/cli.py": "5478ee5433c337ff7e15985f2741e314836295246887d2894fed7defd5e32fd7",
+    "src/analyzer/database.py": "e2a158c904e24ea5b875c6084fd17633cc6702820b7d67abc9c7fbe659513d92",
+    "src/analyzer/datasources.py": "fbb4211a03f5ad8ff5544074834a3c9e692b9b24db17e05c2184a3b8eb3ee16f",
+    "src/analyzer/download.py": "ad5ba7c967c674111331f8bf60845ddb1230354107d0d5ce93b14fe58a44c6ac",
+    "src/analyzer/exceptions.py": "bf334a8acd1a4076cb94d7304924513b279c6e4ae96f3c635b30584aba00338f",
+    "src/analyzer/interfaces.py": "e59506d1546d0551350edbd6c90cb5ddaf7d47aa492f1bc6f77942ef62b92d0f",
+    "src/analyzer/matched_control.py": "6d9af006fa5b3f59470b494a7a3c973f13900a2d243f68ad81fd6e9ab60fbfbd",
+    "src/analyzer/member_names.py": "fed1be7b3e32ca95b6c532feffc2761d6ad7ea8b182732c3ad0fe1924923602e",
+    "src/analyzer/member_ranking/__init__.py": "ac50c69c1ea7c7f1d6375a4d5e0c99fd93378b6022594758b126d79d576cacae",
+    "src/analyzer/member_ranking/bayes.py": "781b6b6dab2fe7e8644915e9f6bcf5495d3f25bdee6bb8ac3d5c6157845bf882",
+    "src/analyzer/member_ranking/buyer_scoring.py": "e765cd534463c649ad41dfdb1412a89d4c67289b6f721fb5dbb2061a357028f2",
+    "src/analyzer/member_ranking/decay.py": "58349c22b5235d458d9d3e3b9e8591c37e9ef6bdc223edb8bf4a6dd8dcb78b08",
+    "src/analyzer/member_ranking/factors.py": "13bbe3e362bf6f3b2e286b8ef300c9d63181af92234fa3c2340a42bdbb948727",
+    "src/analyzer/member_ranking/lookups.py": "54058d723229aa062f8f0d581578f8bdc4c3937f4b1a55636713a9ac02575c66",
+    "src/analyzer/member_ranking/ranking.py": "e664a5a68d649a307ec5c33c97b90da7f8405b77d6162abdada9744aed0e1afe",
+    "src/analyzer/member_ranking/sales.py": "f16ab7e678af5512c2fa46e4164dabef2607e30b15fc8129335cb94d9df98a41",
+    "src/analyzer/member_skill.py": "48c02b5feec6372c66c68ad10aace054393edbff4e39323f3f7afc6d431e0a52",
+    "src/analyzer/metadata_repository.py": "abbf0ca442d8da2f478f1db674d8478074dce39f90e4470a47cdbc47ec020b37",
+    "src/analyzer/models.py": "0766a6f65250912f5f99767fe4d411659207f7ec5aa554961518e584b4548118",
+    "src/analyzer/options.py": "e3dab9639fb88613adac7425aa2944264ccc4c1d4f328459cd6d24f822512234",
+    "src/analyzer/parse_run_repository.py": "c9e8269ba84f8b4c4c8d1d605abeb7e279cbf3e4955c1dc508d4af0330d22bb8",
+    "src/analyzer/parser_cascade.py": "320d5edd0c44e67c3f122a093ecb6d3187a66a27d234dfc01e046d3afd63fea5",
+    "src/analyzer/parsing/__init__.py": "25cad36c19056c4326ef7eb83951ddf163efd588f1d305134103f8e199f0a210",
+    "src/analyzer/parsing/cells.py": "a68654765292641c0ae033e82c10ad028f39753f3b680de770e40a41ed2f2d1c",
+    "src/analyzer/parsing/columns.py": "f2072106e0fd4a3e61d1c41a53b23fccfba7f2d4889271270ad3d16a7c86caad",
+    "src/analyzer/parsing/docling_parser.py": "8d6b03baf1614aaa25d2195e138f029a619d137faceaa2981088d83e887f66a5",
+    "src/analyzer/parsing/metadata.py": "5bf58e9fff8b5cd01a67d5b5f2c25e0411ee07d75ddab42673002b418b86df6a",
+    "src/analyzer/parsing/ocr_parser.py": "b87b4666542187dfd365852ca43ecc1827a10dc9d83888494a47e20ded3d412e",
+    "src/analyzer/parsing/pdfplumber_parser.py": "ef57101138ee4041019b280e4963a0c86b8c82ba414821377229609a33036207",
+    "src/analyzer/parsing/pdftotext_parser.py": "fcead8cce2ee2b042134b78588b439489e17afe3189a35e2bcdcba75a9535705",
+    "src/analyzer/parsing/rows.py": "b9eb0577c7eebf5cc55a7b30c65ff9ec17a2b68e07a2ad60b775020fb1967b8a",
+    "src/analyzer/pipeline.py": "b8dd221b71ec5a292a2207bdb62d64550faaea1ac97fd997bc1b390bae1cd648",
+    "src/analyzer/portfolio/__init__.py": "370aa5cdd6b6a8398d898f2dd436efd0cdfaa9e1a956469700c528f566f684b7",
+    "src/analyzer/portfolio/kelly.py": "e03f1765ce00a938fad501347ec6764c12c3fd030378453778a4efdc37353039",
+    "src/analyzer/portfolio/metrics.py": "393274e7a9226176d56474d264146fc227e233776688fe5f3304b835b86731ce",
+    "src/analyzer/portfolio/simulation.py": "b9d1b83bc71d8d904ef57b89417d10081f21d023e86272cc78c60f318ae6d189",
+    "src/analyzer/portfolio_sim.py": "889c9b60b8cbb51461d6f7e0ffff9de25191afadb1be2c0ac0d134f5b11955e9",
+    "src/analyzer/price_repository.py": "1889b06c467726b7dd6a87d0b4f6a3410a61395e79d2a127f66374ac283fca0c",
+    "src/analyzer/price_snapshot.py": "fa32ed3c49956707a8653178fb7e83c58ebc558b067f1f52c7eed7df9b3f904e",
+    "src/analyzer/price_source.py": "d3361d6e3cbf87427abd5b2f19ca96f2b123c970605c060ad81ee8f84a39a568",
+    "src/analyzer/return_process.py": "7e9d29072d50a41c480e77bc30c6ad3ab8a63c5b2a4138c2d04725e4cf250352",
+    "src/analyzer/sector_data.py": "445e8fc5e5d7f34a5a70491fe22c790cbf74bc5145f220d2958df5726c754470",
+    "src/analyzer/senate_efd.py": "132a48edda87e5c9fddb5b5ecd071a979eff8f8c501c7a1f6a49221212b8b786",
+    "src/analyzer/settings.py": "3ecea6886302119fc07ed987cbf85d9d37e029703f65ff7bb66bbd42de729644",
+    "src/analyzer/signal_features.py": "6724251f86d784c7019b7ab2e9e47262ab4e38b9489c1b96e4e5e164db740c3d",
+    "src/analyzer/signals/__init__.py": "481ed7bd17c1022062136521a3cea4575d3b2624524ec3b369d272ca6b3e9c10",
+    "src/analyzer/signals/assembly.py": "0af981e4261cef3387a80e5a3c4386c93f298b61d0e89ec3f09c794f197e9a06",
+    "src/analyzer/signals/constants.py": "cf36ec1e7765dc2a4f71ab7e6d872e98969276d11410e2356065411c0fb8d000",
+    "src/analyzer/signals/core.py": "1b7bf01889e39455e3d5e610d66779cb82934ad3260556ab7a308db94b3f98c7",
+    "src/analyzer/signals/filters.py": "6067dd9d09756e50ee617e67c692ec8c14471ee04744d4b46207c4764af48a63",
+    "src/analyzer/signals/prices.py": "1f4212591fd4e8fd83c0c1b2d8d60a934800596711d9695b106870d1038220d0",
+    "src/analyzer/signals/top_signals.py": "6bbb8151fdf271f78558fc798150a070a4e1336afdfcadb21d347a1c64c092ef",
+    "src/analyzer/snooping.py": "fac759a6473bffdeb088718d20886a1aff541501660244715b18f211c98ab20d",
+    "src/analyzer/ticker_resolver.py": "d02bdd0812e1cbb96587f4cc914d75a3dc5c36d0384ca262a6535647c5fabfa5",
+    "src/analyzer/transaction_repository.py": "05f3aa122ba639a92fa395b5ea0cebb9d8aa623f7e7295c752f75e78c6972350",
+    "src/analyzer/validation.py": "81880664e94bbb4a25f16ad95f781450561a954d53646edee3088a17a8ab6f86"
+  },
+  "semantic_constants": {
+    "buy_slippage_factor": 1.001,
+    "dependencies": [
+      "pandas",
+      "numpy",
+      "scipy",
+      "duckdb",
+      "pydantic",
+      "requests",
+      "yfinance"
+    ],
+    "endpoint_max_delay_days": 7,
+    "final_alpha": 0.05,
+    "final_null_alpha": 0.05,
+    "horizon_days": 90,
+    "lookback_days": 60,
+    "metric_keys": [
+      "total_return_pct",
+      "spy_total_return_pct",
+      "excess_total_return_pct",
+      "mean_alpha_pct",
+      "sharpe",
+      "alpha_sharpe",
+      "terminal_observation_drawdown_pct",
+      "win_rate_pct",
+      "n_periods",
+      "n_cash_periods",
+      "avg_positions",
+      "requested_periods",
+      "coverage_pct",
+      "support_sha256"
+    ],
+    "minimum_null_permutations": 999,
+    "parameter_grid": {
+      "allocation": [
+        "equal",
+        "signal"
+      ],
+      "decay_lambda": [
+        0.003,
+        0.005
+      ],
+      "min_buyers": [
+        1,
+        2,
+        3
+      ],
+      "scoring_fn": [
+        "shrunk_alpha",
+        "inverted_alpha",
+        "trade_frequency",
+        "consistency",
+        "bayesian_quality",
+        "neg_bayesian_quality",
+        "smooth_trade_thresh",
+        "softplus_quality",
+        "sharpe",
+        "recency_consistency",
+        "consistency_sharpe",
+        "consistency_bayes",
+        "conviction_consistency",
+        "recency_bayes",
+        "volume_consistency",
+        "alpha_consistency",
+        "meta_ensemble"
+      ],
+      "top_n": [
+        3,
+        5
+      ]
+    },
+    "rebalance_days": 90,
+    "retrospective_alpha": 0.1,
+    "retrospective_end": "2025-06-30",
+    "retrospective_start": "2024-07-01",
+    "selection_empirical_alpha": 0.01,
+    "selection_family_alpha": 0.05,
+    "selection_start": "2022-01-01",
+    "sell_slippage_factor": 0.999,
+    "training_lookback_days": 365,
+    "tx_start": "2021-10-07"
+  },
+  "test_end": "2028-07-01",
+  "test_start": "2026-10-01"
+}

@@ -106,8 +106,8 @@
     "dependency_sha256": "350f32a8097262d9852e9b1954cbe2d9a5f8a8fd06b8aa00a0a81f014806f967",
     "git_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "git_dirty": false,
-    "git_revision": "f1dff148b01e18d46969ad7903c663e4a6848a68",
-    "harness_sha256": "8fbc4206092d2dff333dd5dc640ec88cf3eff4558d9061e9c7d6e5b878d7dd9c",
+    "git_revision": "05c8465b62355bc4c808aae57867106646d9c265",
+    "harness_sha256": "e0908fffa183f59aae5e1aebf8ad12fa4ceaef861d59429f14448626cd3fce2a",
     "value_snapshot_sha256": null
   },
   "purpose": "Frozen capital-constrained validation manifest for the rebuilt staged congress.duckdb; evaluated exactly once via the canonical append-only ledger.",

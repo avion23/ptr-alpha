@@ -25,6 +25,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
+from numbers import Integral
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urljoin, urlparse
@@ -1069,6 +1070,85 @@ class SenateEFDSource(TransactionSource):
             return "stock"
         return "other"
 
+    @staticmethod
+    def _provenance_text(value) -> str | None:
+        if value is None:
+            return None
+        try:
+            if not pd.notna(value):
+                return None
+        except (TypeError, ValueError):
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _is_sha256(value) -> bool:
+        text = SenateEFDSource._provenance_text(value)
+        return bool(text and re.fullmatch(r"[0-9a-f]{64}", text))
+
+    @classmethod
+    def _validate_ticker_provenance(cls, df: pd.DataFrame) -> None:
+        for row in df[["ticker", "ticker_candidate", "ticker_origin"]].itertuples(
+            index=False
+        ):
+            ticker = cls._provenance_text(row.ticker)
+            candidate = cls._provenance_text(row.ticker_candidate)
+            try:
+                origin = TickerOrigin(row.ticker_origin)
+            except (TypeError, ValueError):
+                raise SenateEFDError(
+                    f"Unknown Senate ticker_origin: {row.ticker_origin!r}"
+                ) from None
+
+            ticker_is_valid = bool(ticker and _EQUITY_TICKER_RE.fullmatch(ticker))
+            candidate_is_valid = bool(
+                candidate and _EQUITY_TICKER_RE.fullmatch(candidate)
+            )
+            if origin in {
+                TickerOrigin.OFFICIAL,
+                TickerOrigin.ASSET_DESCRIPTION,
+            }:
+                if (
+                    not ticker_is_valid
+                    or candidate is not None
+                    or (
+                        origin is TickerOrigin.ASSET_DESCRIPTION
+                        and ticker in _RESERVED_INFERRED_TICKERS
+                    )
+                ):
+                    raise SenateEFDError(
+                        f"Invalid Senate {origin.value} ticker provenance"
+                    )
+                continue
+            if origin is TickerOrigin.UNVERIFIED:
+                if (
+                    ticker is not None
+                    or not candidate_is_valid
+                    or candidate in _RESERVED_INFERRED_TICKERS
+                ):
+                    raise SenateEFDError(
+                        "Unverified Senate ticker requires only a valid candidate"
+                    )
+                continue
+            if origin in {TickerOrigin.NON_EQUITY, TickerOrigin.MISSING}:
+                if ticker is not None or candidate is not None:
+                    raise SenateEFDError(
+                        f"Senate {origin.value} ticker provenance must be empty"
+                    )
+                continue
+            if origin is TickerOrigin.INVALID:
+                if ticker is not None or (
+                    candidate_is_valid and candidate not in _RESERVED_INFERRED_TICKERS
+                ):
+                    raise SenateEFDError(
+                        "Invalid Senate ticker provenance is inconsistent"
+                    )
+                # Candidate is NULL for a rejected raw_ticker. Otherwise it is
+                # retained only when syntax or a reserved token made it invalid.
+                continue
+            raise SenateEFDError(f"Unsupported Senate ticker_origin: {origin.value}")
+
     def save_to_db(self, df: pd.DataFrame) -> int:
         persist_refresh = getattr(self.db, "persist_source_refresh", None)
         if not callable(persist_refresh):
@@ -1160,16 +1240,9 @@ class SenateEFDSource(TransactionSource):
                 raise SenateEFDError(
                     "Senate transaction dates are incomplete or invalid"
                 )
-        if (
-            not df.empty
-            and (
-                df["ticker_origin"].eq(TickerOrigin.UNVERIFIED.value)
-                & df["ticker"].notna()
-            ).any()
-        ):
-            raise SenateEFDError(
-                "Unverified Senate ticker candidates cannot be canonical tickers"
-            )
+        self._validate_ticker_provenance(df)
+        if not df.empty and not df["artifact_sha256"].map(self._is_sha256).all():
+            raise SenateEFDError("Senate transaction artifact hashes are invalid")
         if not df.empty and (
             not df["chamber"].eq(Chamber.SENATE.value).all()
             or not df["ingestion_generation"].eq(self.ingestion_generation).all()
@@ -1178,57 +1251,169 @@ class SenateEFDSource(TransactionSource):
                 "Senate transaction chamber/generation does not match refresh"
             )
 
-        report_hashes: dict[str, str | None] = {}
+        required_report_fields = {
+            "chamber",
+            "source_record_id",
+            "report_path",
+            "member",
+            "official_filing_date",
+            "outcome",
+            "artifact_sha256",
+            "landing_sha256",
+            "paper_artifact_sha256",
+            "paper_artifact_url",
+            "error_message",
+            "raw_row_count",
+            "accepted_row_count",
+            "rejected_row_count",
+            "ingestion_generation",
+        }
+        report_hashes: dict[str, str] = {}
+        outcome_counts = {outcome.value: 0 for outcome in ReportOutcome}
+        transaction_counts = df.groupby("source_record_id").size().to_dict()
         for report in self.report_inventory:
-            source_record_id = str(report.get("source_record_id") or "").strip()
-            if not source_record_id:
+            missing_report_fields = required_report_fields - set(report)
+            if missing_report_fields:
+                raise SenateEFDError(
+                    "Senate report inventory fields missing: "
+                    f"{sorted(missing_report_fields)}"
+                )
+            source_record_id = self._provenance_text(report["source_record_id"])
+            if source_record_id is None:
                 raise SenateEFDError("Senate report inventory has no source_record_id")
             if source_record_id in report_hashes:
                 raise SenateEFDError(
                     f"Duplicate Senate report inventory ID: {source_record_id}"
                 )
-            filing_date = self._parse_date(report.get("official_filing_date"))
+            if not self._provenance_text(report["report_path"]):
+                raise SenateEFDError(f"Senate report path is blank: {source_record_id}")
+            if not self._provenance_text(report["member"]):
+                raise SenateEFDError(
+                    f"Senate report member is blank: {source_record_id}"
+                )
+            filing_date = self._parse_date(report["official_filing_date"])
             if not self._dates_are_valid(filing_date, filing_date, filing_date, None):
                 raise SenateEFDError(
                     f"Senate report filing date is invalid: {source_record_id}"
                 )
             if (
-                report.get("chamber") != Chamber.SENATE.value
-                or report.get("ingestion_generation") != self.ingestion_generation
+                report["chamber"] != Chamber.SENATE.value
+                or report["ingestion_generation"] != self.ingestion_generation
             ):
                 raise SenateEFDError(
                     "Senate report inventory chamber/generation does not match refresh"
                 )
-            artifact_sha256 = report.get("artifact_sha256")
-            landing_sha256 = report.get("landing_sha256")
-            paper_sha256 = report.get("paper_artifact_sha256")
-            outcome = report.get("outcome")
-            if outcome in {
-                ReportOutcome.PARSED.value,
-                ReportOutcome.PAPER_ONLY.value,
-            } and (not artifact_sha256 or not landing_sha256):
+            try:
+                outcome = ReportOutcome(report["outcome"])
+            except (TypeError, ValueError):
                 raise SenateEFDError(
-                    f"Senate report landing hash missing: {source_record_id}"
+                    f"Unknown Senate report outcome: {report['outcome']!r}"
+                ) from None
+            outcome_counts[outcome.value] += 1
+
+            count_values = {
+                name: report[name]
+                for name in (
+                    "raw_row_count",
+                    "accepted_row_count",
+                    "rejected_row_count",
                 )
-            if outcome == ReportOutcome.PAPER_ONLY.value and (
-                not paper_sha256
-                or not self._is_allowlisted_paper_url(
-                    str(report.get("paper_artifact_url") or "")
-                )
+            }
+            if any(
+                isinstance(value, bool) or not isinstance(value, Integral) or value < 0
+                for value in count_values.values()
             ):
                 raise SenateEFDError(
-                    f"Senate paper artifact provenance missing: {source_record_id}"
+                    f"Senate report row counts are invalid: {source_record_id}"
                 )
-            report_hashes[source_record_id] = artifact_sha256
+            raw_count = int(count_values["raw_row_count"])
+            accepted_count = int(count_values["accepted_row_count"])
+            rejected_count = int(count_values["rejected_row_count"])
+            if raw_count != accepted_count + rejected_count:
+                raise SenateEFDError(
+                    f"Senate report row accounting is invalid: {source_record_id}"
+                )
 
-        for row in (
-            df[["source_record_id", "artifact_sha256"]]
-            .drop_duplicates()
-            .itertuples(index=False)
-        ):
+            transaction_count = int(transaction_counts.get(source_record_id, 0))
+            if outcome is ReportOutcome.PARSED:
+                if (
+                    accepted_count == 0
+                    or rejected_count != 0
+                    or raw_count != accepted_count
+                    or transaction_count != accepted_count
+                ):
+                    raise SenateEFDError(
+                        "Parsed Senate report count does not match transaction rows: "
+                        f"{source_record_id}"
+                    )
+            elif transaction_count != 0:
+                raise SenateEFDError(
+                    f"Nonparsed Senate report has transactions: {source_record_id}"
+                )
+
+            artifact_sha256 = self._provenance_text(report["artifact_sha256"])
+            landing_sha256 = self._provenance_text(report["landing_sha256"])
+            paper_sha256 = self._provenance_text(report["paper_artifact_sha256"])
+            paper_url = self._provenance_text(report["paper_artifact_url"])
+            if outcome in {ReportOutcome.PARSED, ReportOutcome.PAPER_ONLY}:
+                if (
+                    not self._is_sha256(artifact_sha256)
+                    or not self._is_sha256(landing_sha256)
+                    or artifact_sha256 != landing_sha256
+                ):
+                    raise SenateEFDError(
+                        f"Senate report landing hash is invalid: {source_record_id}"
+                    )
+            elif artifact_sha256 != landing_sha256 or any(
+                value is not None and not self._is_sha256(value)
+                for value in (artifact_sha256, landing_sha256)
+            ):
+                raise SenateEFDError(
+                    f"Senate report artifact hash is invalid: {source_record_id}"
+                )
+
+            if outcome is ReportOutcome.PAPER_ONLY:
+                if (
+                    raw_count != 0
+                    or not self._is_sha256(paper_sha256)
+                    or not paper_url
+                    or not self._is_allowlisted_paper_url(paper_url)
+                ):
+                    raise SenateEFDError(
+                        f"Senate paper artifact provenance is invalid: {source_record_id}"
+                    )
+            elif paper_sha256 is not None or paper_url is not None:
+                raise SenateEFDError(
+                    f"Nonpaper Senate report has paper provenance: {source_record_id}"
+                )
+            report_hashes[source_record_id] = artifact_sha256 or ""
+
+        expected_counts = {
+            "found": self.last_refresh_summary.found,
+            "parsed": self.last_refresh_summary.parsed,
+            "paper_only": self.last_refresh_summary.paper_only,
+            "unavailable": self.last_refresh_summary.unavailable,
+            "failed": self.last_refresh_summary.failed,
+        }
+        actual_counts = {
+            "found": len(self.report_inventory),
+            **outcome_counts,
+        }
+        if actual_counts != expected_counts:
+            raise SenateEFDError(
+                "Senate report outcome counts do not match refresh summary: "
+                f"expected={expected_counts}, actual={actual_counts}"
+            )
+        unknown_transaction_reports = set(transaction_counts) - set(report_hashes)
+        if unknown_transaction_reports:
+            raise SenateEFDError(
+                "Senate transactions have no report inventory: "
+                f"{sorted(unknown_transaction_reports)}"
+            )
+        for row in df[["source_record_id", "artifact_sha256"]].itertuples(index=False):
             if report_hashes.get(row.source_record_id) != row.artifact_sha256:
                 raise SenateEFDError(
-                    "Senate transaction artifact hash does not match report inventory: "
+                    "Senate transaction artifact hash does not match report landing: "
                     f"{row.source_record_id}"
                 )
 

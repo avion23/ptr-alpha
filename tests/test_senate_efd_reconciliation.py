@@ -59,6 +59,43 @@ def _raw_trade(**overrides):
     return trade
 
 
+def _report_inventory_row(**overrides):
+    report = {
+        "chamber": "senate",
+        "source_record_id": KATIE_REPORT_ID,
+        "report_path": KATIE_REPORT_PATH,
+        "member": "Katie Britt",
+        "official_filing_date": pd.Timestamp("2026-01-29"),
+        "outcome": "parsed",
+        "artifact_sha256": "a" * 64,
+        "landing_sha256": "a" * 64,
+        "paper_artifact_sha256": None,
+        "paper_artifact_url": None,
+        "error_message": None,
+        "raw_row_count": 1,
+        "accepted_row_count": 1,
+        "rejected_row_count": 0,
+        "ingestion_generation": "generation-2026-08-09",
+    }
+    report.update(overrides)
+    return report
+
+
+def _ready_persistence_source(report=None):
+    class Database:
+        @staticmethod
+        def persist_source_refresh(**kwargs):
+            return len(kwargs["transactions"])
+
+    source = _source()
+    source.db = Database()
+    source.last_refresh_summary = SenateRefreshSummary(
+        found=1, parsed=1, paper_only=0, unavailable=0, failed=0
+    )
+    source.report_inventory = [report or _report_inventory_row()]
+    return source
+
+
 def test_katie_britt_jpm_canary_preserves_provenance_and_normalizes_sale():
     result = _source()._normalize([_raw_trade()])
 
@@ -689,18 +726,7 @@ def test_save_calls_atomic_refresh_persistence_with_inventory_and_rows():
     source.last_refresh_summary = SenateRefreshSummary(
         found=1, parsed=1, paper_only=0, unavailable=0, failed=0
     )
-    source.report_inventory = [
-        {
-            "chamber": "senate",
-            "source_record_id": KATIE_REPORT_ID,
-            "official_filing_date": pd.Timestamp("2026-01-29"),
-            "artifact_sha256": "a" * 64,
-            "landing_sha256": "a" * 64,
-            "paper_artifact_sha256": None,
-            "outcome": "parsed",
-            "ingestion_generation": "generation-2026-08-09",
-        }
-    ]
+    source.report_inventory = [_report_inventory_row()]
     frame = source._normalize([_raw_trade()])
 
     inserted = source.save_to_db(frame)
@@ -725,18 +751,7 @@ def test_save_rejects_duplicate_source_row_identity_and_incomplete_refresh():
     source.last_refresh_summary = SenateRefreshSummary(
         found=1, parsed=1, paper_only=0, unavailable=0, failed=0
     )
-    source.report_inventory = [
-        {
-            "chamber": "senate",
-            "source_record_id": KATIE_REPORT_ID,
-            "official_filing_date": pd.Timestamp("2026-01-29"),
-            "artifact_sha256": "a" * 64,
-            "landing_sha256": "a" * 64,
-            "paper_artifact_sha256": None,
-            "outcome": "parsed",
-            "ingestion_generation": "generation-2026-08-09",
-        }
-    ]
+    source.report_inventory = [_report_inventory_row()]
     frame = source._normalize([_raw_trade()])
     duplicated = pd.concat([frame, frame], ignore_index=True)
 
@@ -764,4 +779,142 @@ def test_save_rejects_duplicate_source_row_identity_and_incomplete_refresh():
         found=1, parsed=0, paper_only=0, unavailable=1, failed=0
     )
     with pytest.raises(SenateEFDError, match="complete Senate report inventory"):
+        source.save_to_db(frame)
+
+
+@pytest.mark.parametrize(
+    "ticker,candidate,origin",
+    [
+        ("JPM", None, "official"),
+        ("JPM", None, "asset_description"),
+        (None, "ACME", "unverified"),
+        (None, None, "non_equity"),
+        (None, None, "missing"),
+        (None, None, "invalid"),
+        (None, "BOND", "invalid"),
+    ],
+)
+def test_save_accepts_every_valid_ticker_provenance_matrix_case(
+    ticker, candidate, origin
+):
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[0, ["ticker", "ticker_candidate", "ticker_origin"]] = [
+        ticker,
+        candidate,
+        origin,
+    ]
+
+    assert source.save_to_db(frame) == 1
+
+
+@pytest.mark.parametrize(
+    "ticker,candidate,origin",
+    [
+        ("JPM", None, "bogus"),
+        (None, None, "official"),
+        ("JPM", "ACME", "official"),
+        ("bad!", None, "asset_description"),
+        ("BOND", None, "asset_description"),
+        ("ACME", "ACME", "unverified"),
+        (None, "bad!", "unverified"),
+        ("BOND", None, "non_equity"),
+        (None, "BOND", "non_equity"),
+        ("JPM", None, "missing"),
+        (None, "ACME", "missing"),
+        ("JPM", None, "invalid"),
+        (None, "ACME", "invalid"),
+    ],
+)
+def test_save_rejects_every_invalid_ticker_provenance_matrix_case(
+    ticker, candidate, origin
+):
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[0, ["ticker", "ticker_candidate", "ticker_origin"]] = [
+        ticker,
+        candidate,
+        origin,
+    ]
+
+    with pytest.raises(SenateEFDError, match="ticker"):
+        source.save_to_db(frame)
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"outcome": "bogus"}, "Unknown Senate report outcome"),
+        ({"raw_row_count": 2}, "row accounting is invalid"),
+        ({"raw_row_count": -1, "accepted_row_count": -1}, "row counts are invalid"),
+        (
+            {"raw_row_count": 2, "accepted_row_count": 2},
+            "count does not match transaction rows",
+        ),
+        (
+            {"artifact_sha256": "z" * 64, "landing_sha256": "z" * 64},
+            "landing hash is invalid",
+        ),
+        ({"artifact_sha256": "b" * 64}, "landing hash is invalid"),
+        ({"paper_artifact_sha256": "c" * 64}, "Nonpaper Senate report"),
+    ],
+)
+def test_save_rejects_bogus_report_outcome_counts_and_hashes(overrides, error):
+    source = _ready_persistence_source(_report_inventory_row(**overrides))
+    frame = source._normalize([_raw_trade()])
+
+    with pytest.raises(SenateEFDError, match=error):
+        source.save_to_db(frame)
+
+
+def test_save_requires_complete_report_schema_and_exact_summary_counts():
+    report = _report_inventory_row()
+    del report["raw_row_count"]
+    source = _ready_persistence_source(report)
+    frame = source._normalize([_raw_trade()])
+    with pytest.raises(SenateEFDError, match="fields missing"):
+        source.save_to_db(frame)
+
+    source = _ready_persistence_source()
+    source.last_refresh_summary = SenateRefreshSummary(
+        found=1, parsed=0, paper_only=1, unavailable=0, failed=0
+    )
+    with pytest.raises(SenateEFDError, match="outcome counts do not match"):
+        source.save_to_db(frame)
+
+
+def test_save_requires_parsed_transaction_hash_to_equal_report_landing_hash():
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[0, "artifact_sha256"] = "b" * 64
+
+    with pytest.raises(SenateEFDError, match="does not match report landing"):
+        source.save_to_db(frame)
+
+
+def test_save_accepts_verified_paper_without_transactions_and_rejects_with_rows():
+    paper_url = "https://efdsearch.senate.gov/media/paper-filings/report.pdf"
+    report = _report_inventory_row(
+        outcome="paper_only",
+        raw_row_count=0,
+        accepted_row_count=0,
+        artifact_sha256="b" * 64,
+        landing_sha256="b" * 64,
+        paper_artifact_sha256="c" * 64,
+        paper_artifact_url=paper_url,
+    )
+    source = _ready_persistence_source(report)
+    source.last_refresh_summary = SenateRefreshSummary(
+        found=1, parsed=0, paper_only=1, unavailable=0, failed=0
+    )
+    assert source.save_to_db(source._normalize([])) == 0
+
+    frame = source._normalize(
+        [
+            _raw_trade(
+                artifact_sha256="b" * 64,
+            )
+        ]
+    )
+    with pytest.raises(SenateEFDError, match="Nonparsed Senate report"):
         source.save_to_db(frame)

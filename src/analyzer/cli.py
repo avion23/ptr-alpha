@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import sys
 import logging
 from datetime import date
@@ -659,6 +660,11 @@ def portfolio(
     initial_capital: float = typer.Option(20000, help="Initial portfolio capital"),
     max_positions: int = typer.Option(5, help="Maximum concurrent positions"),
     hold_days: int = typer.Option(120, help="Hold period in days before forced exit"),
+    sector_map: str | None = typer.Option(
+        None,
+        "--sector-map",
+        help="Deterministic JSON mapping or CSV with ticker,sector columns",
+    ),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """
@@ -681,6 +687,12 @@ def portfolio(
         max_positions=max_positions,
         hold_days=hold_days,
     )
+
+    try:
+        sector_by_ticker = _load_sector_map(sector_map)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
@@ -710,24 +722,78 @@ def portfolio(
         start_date,
     )
 
+    missing_sectors = sorted(set(recommendations["ticker"]) - set(sector_by_ticker))
+    if missing_sectors:
+        sample = ", ".join(missing_sectors[:10])
+        print(
+            f"Error: sector map is missing {len(missing_sectors)} recommended ticker(s): {sample}",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
     config = PortfolioConfig(
         initial_capital=initial_capital,
         max_positions=max_positions,
         hold_period_days=hold_days,
         rebalance_freq_days=frequency_days,
+        sector_by_ticker=sector_by_ticker,
     )
 
     sim = PortfolioSimulator(config)
     results_df = sim.run(recommendations, prices, start_date, end_date)
-    _print_portfolio_results(
-        results_df, config, start_date, end_date, hold_days, max_positions
-    )
-
     metrics = sim.compute_metrics(prices)
+    if metrics.get("valuation_status") != "unavailable":
+        _print_portfolio_results(
+            results_df, config, start_date, end_date, hold_days, max_positions
+        )
     if metrics:
         _print_portfolio_metrics(metrics)
     if sim.closed_positions:
         _print_closed_positions(sim.closed_positions)
+
+
+def _load_sector_map(path_value: str | None) -> dict[str, str]:
+    """Load deterministic sector data without any live network fallback."""
+    if not path_value:
+        raise ValueError("--sector-map is required for portfolio simulation")
+    path = Path(path_value)
+    if not path.is_file():
+        raise ValueError(f"sector map file not found: {path}")
+
+    if path.suffix.lower() == ".json":
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid sector map JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "sector map JSON must be an object of ticker: sector pairs"
+            )
+        pairs = payload.items()
+    elif path.suffix.lower() == ".csv":
+        try:
+            frame = pd.read_csv(path)
+        except (OSError, pd.errors.ParserError) as exc:
+            raise ValueError(f"invalid sector map CSV: {exc}") from exc
+        required = {"ticker", "sector"}
+        if not required.issubset(frame.columns):
+            raise ValueError("sector map CSV must contain ticker and sector columns")
+        pairs = frame[["ticker", "sector"]].itertuples(index=False, name=None)
+    else:
+        raise ValueError("sector map must be a .json or .csv file")
+
+    sectors: dict[str, str] = {}
+    for raw_ticker, raw_sector in pairs:
+        ticker = str(raw_ticker).strip()
+        sector = str(raw_sector).strip()
+        if not ticker or not sector or sector.lower() == "nan":
+            raise ValueError("sector map contains a blank ticker or sector")
+        if ticker in sectors and sectors[ticker] != sector:
+            raise ValueError(f"sector map contains conflicting sectors for {ticker}")
+        sectors[ticker] = sector
+    if not sectors:
+        raise ValueError("sector map is empty")
+    return sectors
 
 
 def _parse_sim_dates(start: str, end: str) -> tuple[date, date]:
@@ -845,6 +911,11 @@ def _print_portfolio_results(
 def _print_portfolio_metrics(metrics: dict) -> None:
     """Print performance metrics (Sharpe, drawdown, win rate, etc.)."""
     print("\n=== Performance Metrics ===")
+    if metrics.get("valuation_status") == "unavailable":
+        print("  Valuation:          UNAVAILABLE")
+        print(f"  Reason:             {metrics.get('valuation_reason', 'unknown')}")
+        print(f"  Open positions:     {metrics.get('open_position_count', 0)}")
+        return
     print(f"  Total return:       {metrics['total_return_pct']:.2f}%")
     print(f"  Annualized return:  {metrics['annualized_return_pct']:.2f}%")
     print(f"  Sharpe ratio:       {metrics['sharpe_ratio']:.3f}")

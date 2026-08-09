@@ -69,6 +69,10 @@ class PortfolioSnapshot:
     realized_pnl: float
 
 
+class PortfolioValuationUnavailable(RuntimeError):
+    """Raised when an open position has no bounded observable mark."""
+
+
 class PortfolioSimulator:
     def __init__(self, config: PortfolioConfig):
         self.config = config
@@ -79,7 +83,9 @@ class PortfolioSimulator:
         self.rejected_orders: list[dict] = []
         self.snapshots: list[PortfolioSnapshot] = []
         self.gross_traded_notional = 0.0
+        self.valuation_unavailable_dates: list[date] = []
         self._scheduled_signals: set[tuple[date, str]] = set()
+        self._simulation_end_date: date | None = None
 
     def run(
         self,
@@ -94,6 +100,7 @@ class PortfolioSimulator:
         if self.config.rebalance_freq_days < 1:
             raise ValueError("rebalance_freq_days must be positive")
 
+        self._simulation_end_date = end_date
         recs = recommendations.copy()
         has_as_of = "as_of_date" in recs.columns
         if has_as_of:
@@ -114,7 +121,10 @@ class PortfolioSimulator:
                     candidates = recs
                 self._schedule_entries(candidates, prices_df, current)
 
-            self._record_snapshot(prices_df, current)
+            try:
+                self._record_snapshot(prices_df, current)
+            except PortfolioValuationUnavailable:
+                self.valuation_unavailable_dates.append(current)
             current += timedelta(days=1)
 
         return self.results()
@@ -173,7 +183,14 @@ class PortfolioSimulator:
                     str(order.recommendation["ticker"]), current, "max_positions"
                 )
                 continue
-            self._try_enter(order, prices_df, current)
+            try:
+                self._try_enter(order, prices_df, current)
+            except PortfolioValuationUnavailable:
+                self._reject(
+                    str(order.recommendation["ticker"]),
+                    current,
+                    "portfolio_valuation_unavailable",
+                )
 
     def _try_enter(
         self, order: PendingEntry, prices_df: pd.DataFrame, execution_date: date
@@ -241,7 +258,8 @@ class PortfolioSimulator:
                 arrays[0],
                 arrays[1],
                 target,
-                max_wait_days=self.config.max_execution_wait_days,
+                max_wait_days=None,
+                allow_zero=True,
             )
             if execution is None or execution.date.date() > current:
                 continue
@@ -251,7 +269,7 @@ class PortfolioSimulator:
         if pos not in self.positions:
             return
         raw_price = execution.price
-        if not np.isfinite(raw_price) or raw_price <= 0:
+        if not np.isfinite(raw_price) or raw_price < 0:
             return
         exit_price = raw_price * (1 - self.config.exit_slippage_pct)
         proceeds = pos.shares * exit_price
@@ -304,6 +322,7 @@ class PortfolioSimulator:
             arrays[1],
             as_of,
             max_staleness_days=self.config.max_price_staleness_days,
+            allow_zero=True,
         )
 
     def _position_value(
@@ -311,7 +330,9 @@ class PortfolioSimulator:
     ) -> float:
         mark = self._aligned_mark(pos.ticker, prices_df, as_of)
         if mark is None:
-            return 0.0
+            raise PortfolioValuationUnavailable(
+                f"No bounded mark for open position {pos.ticker} on {as_of}"
+            )
         # Mark at executable liquidation value so final equity includes exit cost.
         return pos.shares * mark.price * (1 - self.config.exit_slippage_pct)
 
@@ -377,9 +398,24 @@ class PortfolioSimulator:
         )
 
     def compute_metrics(self, prices_df: pd.DataFrame | None = None) -> dict:
+        if self.positions and prices_df is None:
+            raise ValueError(
+                "prices_df is required to value open positions; no fictional zero mark is allowed"
+            )
+
         results = self.results()
+        end_date = self._simulation_end_date or (
+            pd.Timestamp(results.iloc[-1]["date"]).date()
+            if not results.empty
+            else date.today()
+        )
+        open_ledger = self._open_ledger(prices_df, end_date)
+        unresolved = [row for row in open_ledger if row["liquidation_value"] is None]
+        if unresolved:
+            return self._unavailable_metrics(open_ledger, unresolved)
         if results.empty:
             return {}
+
         values = results["total_value"].to_numpy(dtype=float)
         dates = pd.to_datetime(results["date"])
         initial = self.config.initial_capital
@@ -408,10 +444,15 @@ class PortfolioSimulator:
         )
         avg_value = float(np.mean(values)) if len(values) else initial
         turnover = self.gross_traded_notional / avg_value if avg_value > 0 else 0.0
-        open_ledger = self._open_ledger(prices_df, dates.iloc[-1].date())
-        open_exposure = sum(row["liquidation_value"] for row in open_ledger)
+        open_exposure = sum(float(row["liquidation_value"]) for row in open_ledger)
+        spy_return, spy_reason = self._spy_buy_hold(
+            prices_df, dates.iloc[0].date(), end_date
+        )
 
         return {
+            "valuation_status": "available",
+            "valuation_reason": None,
+            "valuation_gap_count": len(self.valuation_unavailable_dates),
             "total_return_pct": round(total_return, 2),
             "annualized_return_pct": round(ann_return, 2),
             "sharpe_ratio": round(sharpe, 3),
@@ -425,29 +466,69 @@ class PortfolioSimulator:
             "open_dollar_exposure": round(open_exposure, 2),
             "open_position_count": len(open_ledger),
             "open_positions": open_ledger,
+            "unresolved_expired_positions": sum(
+                row["state"].startswith("exit_unresolved") for row in open_ledger
+            ),
             "pending_order_count": len(self.pending_entries),
             "rejected_order_count": len(self.rejected_orders),
             "max_concurrent_positions": int(results["num_positions"].max()),
             "total_closed_trades": closed_count,
             "sector_concentration": self._sector_concentration(),
-            "spy_return_pct": self._spy_buy_hold(
-                prices_df, dates.iloc[0].date(), dates.iloc[-1].date()
+            "spy_return_pct": spy_return,
+            "spy_benchmark_status": "available"
+            if spy_return is not None
+            else "omitted",
+            "spy_benchmark_reason": spy_reason,
+        }
+
+    def _unavailable_metrics(
+        self, open_ledger: list[dict], unresolved: list[dict]
+    ) -> dict:
+        return {
+            "valuation_status": "unavailable",
+            "valuation_reason": "unbounded_open_position_mark",
+            "valuation_gap_count": len(self.valuation_unavailable_dates),
+            "total_return_pct": None,
+            "annualized_return_pct": None,
+            "sharpe_ratio": None,
+            "max_drawdown_pct": None,
+            "win_rate_pct": None,
+            "avg_holding_days": None,
+            "turnover_rate": None,
+            "gross_traded_notional": round(self.gross_traded_notional, 2),
+            "open_dollar_exposure": None,
+            "open_position_count": len(open_ledger),
+            "open_positions": open_ledger,
+            "unresolved_expired_positions": sum(
+                row["state"].startswith("exit_unresolved") for row in unresolved
             ),
+            "pending_order_count": len(self.pending_entries),
+            "rejected_order_count": len(self.rejected_orders),
+            "max_concurrent_positions": None,
+            "total_closed_trades": len(self.closed_positions),
+            "sector_concentration": self._sector_concentration(),
+            "spy_return_pct": None,
+            "spy_benchmark_status": "omitted",
+            "spy_benchmark_reason": "portfolio_valuation_unavailable",
         }
 
     def _open_ledger(self, prices_df: pd.DataFrame | None, as_of: date) -> list[dict]:
+        if self.positions and prices_df is None:
+            raise ValueError(
+                "prices_df is required to produce the open-position ledger"
+            )
         ledger = []
         for pos in self.positions:
-            mark = (
-                self._aligned_mark(pos.ticker, prices_df, as_of)
-                if prices_df is not None
-                else None
-            )
+            mark = self._aligned_mark(pos.ticker, prices_df, as_of)
             liquidation_value = (
                 pos.shares * mark.price * (1 - self.config.exit_slippage_pct)
                 if mark is not None
-                else 0.0
+                else None
             )
+            exit_due = (as_of - pos.entry_date).days >= self.config.hold_period_days
+            state = "exit_unresolved" if exit_due else "open"
+            if mark is None:
+                state += "_valuation_unavailable"
             ledger.append(
                 {
                     "ticker": pos.ticker,
@@ -459,7 +540,12 @@ class PortfolioSimulator:
                     "mark_price": round(mark.price, 4) if mark is not None else None,
                     "mark_date": mark.date.date() if mark is not None else None,
                     "staleness_days": mark.staleness_days if mark is not None else None,
-                    "liquidation_value": round(liquidation_value, 2),
+                    "liquidation_value": (
+                        round(liquidation_value, 2)
+                        if liquidation_value is not None
+                        else None
+                    ),
+                    "state": state,
                 }
             )
         return ledger
@@ -479,12 +565,12 @@ class PortfolioSimulator:
 
     def _spy_buy_hold(
         self, prices_df: pd.DataFrame | None, start: date, end: date
-    ) -> float | None:
+    ) -> tuple[float | None, str | None]:
         if prices_df is None:
-            return None
+            return None, "spy_prices_not_supplied"
         arrays = _price_arrays(prices_df, "SPY")
         if arrays is None or arrays[0] is None:
-            return None
+            return None, "spy_prices_unavailable"
         entry = _aligned_price_on_or_after_arrays(
             arrays[0],
             arrays[1],
@@ -496,9 +582,14 @@ class PortfolioSimulator:
             arrays[1],
             end,
             max_staleness_days=self.config.max_price_staleness_days,
+            allow_zero=True,
         )
-        if entry is None or exit_ is None or exit_.date < entry.date:
-            return None
+        if entry is None:
+            return None, "spy_entry_outside_boundary"
+        if exit_ is None:
+            return None, "spy_exit_outside_boundary"
+        if exit_.date < entry.date:
+            return None, "spy_window_inverted"
         entry_price = entry.price * (1 + self.config.entry_slippage_pct)
         exit_price = exit_.price * (1 - self.config.exit_slippage_pct)
-        return round((exit_price / entry_price - 1) * 100, 2)
+        return round((exit_price / entry_price - 1) * 100, 2), None

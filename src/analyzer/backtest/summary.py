@@ -18,15 +18,19 @@ def summarize_backtest(
     Recommendation rows on the same date share one unit of capital equally. This
     prevents opportunity-dense dates from receiving more weight merely because
     they produced more recommendations. A SPY row is emitted only when an actual
-    buy/hold return can be computed from a supplied price series or a verified
-    scalar attached by the caller; repeated per-recommendation SPY windows are
-    never relabeled as buy-and-hold.
+    buy/hold return can be computed from a supplied price series over the full
+    bounded period. Repeated per-recommendation SPY windows are never relabeled
+    as buy-and-hold.
     """
     n_no_price = results.attrs.get("n_no_price", 0)
     n_delisted = results.attrs.get("n_delisted", 0)
+    n_unavailable = results.attrs.get("n_unavailable", 0)
     valid = results.dropna(subset=["bt_return_pct"]).copy()
     if valid.empty:
-        return _with_coverage(pd.DataFrame(), n_no_price, n_delisted)
+        summary = _with_coverage(pd.DataFrame(), n_no_price, n_delisted, n_unavailable)
+        summary.attrs["spy_benchmark_status"] = "omitted"
+        summary.attrs["spy_benchmark_reason"] = "no_valid_returns"
+        return summary
 
     periods = _funded_period_returns(valid)
     holding_policy, avg_holding_days = _holding_policy(valid)
@@ -47,7 +51,7 @@ def summarize_backtest(
         }
     ]
 
-    spy_return = _spy_buy_hold_return(
+    spy_return, benchmark_reason = _spy_buy_hold_return(
         valid,
         spy_prices,
         entry_slippage_bps=entry_slippage_bps,
@@ -69,7 +73,12 @@ def summarize_backtest(
             }
         )
 
-    return _with_coverage(pd.DataFrame(rows), n_no_price, n_delisted)
+    summary = _with_coverage(pd.DataFrame(rows), n_no_price, n_delisted, n_unavailable)
+    summary.attrs["spy_benchmark_status"] = (
+        "available" if spy_return is not None else "omitted"
+    )
+    summary.attrs["spy_benchmark_reason"] = benchmark_reason
+    return summary
 
 
 def _funded_period_returns(valid: pd.DataFrame) -> pd.DataFrame:
@@ -119,33 +128,46 @@ def _spy_buy_hold_return(
     *,
     entry_slippage_bps: float,
     exit_slippage_bps: float,
-) -> float | None:
-    attached = valid.attrs.get("spy_buy_hold_return_pct")
-    if attached is not None and np.isfinite(attached):
-        return float(attached)
+    max_boundary_gap_days: int = 7,
+) -> tuple[float | None, str | None]:
     if spy_prices is None:
-        return None
+        return None, "spy_prices_not_supplied"
 
-    series = spy_prices.dropna().sort_index()
-    series = series[np.isfinite(series) & (series > 0)]
-    if series.empty:
-        return None
+    series = spy_prices.dropna()
     if not isinstance(series.index, pd.DatetimeIndex):
         series.index = pd.to_datetime(series.index)
+    series = series.sort_index()
+    series = series[np.isfinite(series) & (series >= 0)]
+    if series.empty:
+        return None, "spy_prices_empty"
 
     start, end = _benchmark_bounds(valid)
-    entries = series[series.index >= start]
+    if pd.isna(start) or pd.isna(end):
+        return None, "benchmark_bounds_unavailable"
+    if start in (pd.Timestamp.min, pd.Timestamp.max) or end in (
+        pd.Timestamp.min,
+        pd.Timestamp.max,
+    ):
+        return None, "benchmark_bounds_unavailable"
+
+    entries = series[(series.index >= start) & (series > 0)]
     exits = series[series.index <= end]
-    if entries.empty or exits.empty:
-        return None
-    entry_date = entries.index[0]
-    exit_date = exits.index[-1]
+    if entries.empty:
+        return None, "spy_entry_unavailable"
+    if exits.empty:
+        return None, "spy_exit_unavailable"
+    entry_date = pd.Timestamp(entries.index[0]).normalize()
+    exit_date = pd.Timestamp(exits.index[-1]).normalize()
+    if (entry_date - start.normalize()).days > max_boundary_gap_days:
+        return None, "spy_entry_outside_boundary"
+    if (end.normalize() - exit_date).days > max_boundary_gap_days:
+        return None, "spy_exit_outside_boundary"
     if exit_date < entry_date:
-        return None
+        return None, "spy_window_inverted"
 
     entry = float(entries.iloc[0]) * (1 + entry_slippage_bps / 10000)
     exit_ = float(exits.iloc[-1]) * (1 - exit_slippage_bps / 10000)
-    return (exit_ / entry - 1) * 100
+    return (exit_ / entry - 1) * 100, None
 
 
 def _benchmark_bounds(valid: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -183,8 +205,12 @@ def _benchmark_days(valid: pd.DataFrame) -> int | None:
 
 
 def _with_coverage(
-    summary: pd.DataFrame, n_no_price: int, n_delisted: int
+    summary: pd.DataFrame,
+    n_no_price: int,
+    n_delisted: int,
+    n_unavailable: int,
 ) -> pd.DataFrame:
     summary.attrs["n_no_price"] = n_no_price
     summary.attrs["n_delisted"] = n_delisted
+    summary.attrs["n_unavailable"] = n_unavailable
     return summary

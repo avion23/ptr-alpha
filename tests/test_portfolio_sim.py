@@ -466,6 +466,107 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 3))
         self.assertEqual([p.ticker for p in sim.positions], ["A"])
 
+    def test_explicit_zero_exit_is_total_loss(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+            hold_period_days=1,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 0.0]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        )
+        sim = PortfolioSimulator(cfg)
+        sim.run(
+            _make_recs(["A"], "2024-01-01"),
+            prices,
+            date(2024, 1, 1),
+            date(2024, 1, 3),
+        )
+        self.assertEqual(sim.closed_positions[0]["return_pct"], -100.0)
+        self.assertEqual(sim.cash, 0.0)
+
+    def test_expired_position_exits_first_quote_after_suspension(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+            hold_period_days=1,
+            max_price_staleness_days=2,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 80.0]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-10"]),
+        )
+        sim = PortfolioSimulator(cfg)
+        sim.run(
+            _make_recs(["A"], "2024-01-01"),
+            prices,
+            date(2024, 1, 1),
+            date(2024, 1, 10),
+        )
+        self.assertEqual(sim.closed_positions[0]["exit_date"], date(2024, 1, 10))
+        self.assertEqual(sim.closed_positions[0]["exit_price"], 80.0)
+        self.assertGreater(len(sim.valuation_unavailable_dates), 0)
+        self.assertEqual(sim.compute_metrics(prices)["valuation_status"], "available")
+
+    def test_unresolved_stale_final_mark_abstains_from_return(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+            hold_period_days=1,
+            max_price_staleness_days=1,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 80.0]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-10"]),
+        )
+        sim = PortfolioSimulator(cfg)
+        sim.run(
+            _make_recs(["A"], "2024-01-01"),
+            prices,
+            date(2024, 1, 1),
+            date(2024, 1, 5),
+        )
+        metrics = sim.compute_metrics(prices)
+        self.assertEqual(metrics["valuation_status"], "unavailable")
+        self.assertIsNone(metrics["total_return_pct"])
+        self.assertIsNone(metrics["open_dollar_exposure"])
+        self.assertEqual(
+            metrics["open_positions"][0]["state"],
+            "exit_unresolved_valuation_unavailable",
+        )
+        self.assertIsNone(metrics["open_positions"][0]["liquidation_value"])
+
+    def test_compute_metrics_requires_prices_for_open_positions(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+        )
+        prices = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-02"]))
+        sim = PortfolioSimulator(cfg)
+        sim.run(
+            _make_recs(["A"], "2024-01-01"),
+            prices,
+            date(2024, 1, 1),
+            date(2024, 1, 2),
+        )
+        with self.assertRaisesRegex(ValueError, "prices_df is required"):
+            sim.compute_metrics()
+
 
 if __name__ == "__main__":
     unittest.main()

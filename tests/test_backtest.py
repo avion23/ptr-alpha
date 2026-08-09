@@ -548,6 +548,25 @@ class TestSummarizeBacktest(unittest.TestCase):
         self.assertEqual(spy_row["count"], 1)
         self.assertEqual(spy_row["avg_return_pct"], 20.0)
 
+    def test_spy_buy_hold_preserves_observed_zero_as_total_loss(self):
+        results = pd.DataFrame(
+            {
+                "bt_entry_date": ["2025-01-01"],
+                "bt_exit_date": ["2025-01-02"],
+                "bt_return_pct": [0.0],
+                "bt_alpha_pct": [0.0],
+            }
+        )
+        spy = pd.Series(
+            [100.0, 0.0],
+            index=pd.to_datetime(["2025-01-01", "2025-01-02"]),
+        )
+        summary = summarize_backtest(
+            results, spy, entry_slippage_bps=0, exit_slippage_bps=0
+        )
+        spy_row = summary[summary["rank"] == "SPY_BUY_HOLD"].iloc[0]
+        self.assertEqual(spy_row["avg_return_pct"], -100.0)
+
     def test_repeated_spy_windows_are_not_called_buy_hold(self):
         results = pd.DataFrame(
             {
@@ -573,6 +592,26 @@ class TestSummarizeBacktest(unittest.TestCase):
         summary = summarize_backtest(results)
         self.assertEqual(len(summary), 1)
         self.assertEqual(summary.iloc[0]["count"], 1)
+
+    def test_spy_buy_hold_omits_unbounded_price_window_with_reason(self):
+        results = pd.DataFrame(
+            {
+                "bt_entry_date": ["2025-01-01"],
+                "bt_exit_date": ["2025-01-31"],
+                "bt_return_pct": [1.0],
+                "bt_alpha_pct": [0.0],
+            }
+        )
+        spy = pd.Series(
+            [100.0, 110.0],
+            index=pd.to_datetime(["2025-01-10", "2025-01-20"]),
+        )
+        summary = summarize_backtest(results, spy)
+        self.assertNotIn("SPY_BUY_HOLD", summary["rank"].values)
+        self.assertEqual(summary.attrs["spy_benchmark_status"], "omitted")
+        self.assertEqual(
+            summary.attrs["spy_benchmark_reason"], "spy_entry_outside_boundary"
+        )
 
 
 class TestBacktestCorrectnessRegressions(unittest.TestCase):
@@ -832,9 +871,11 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         )
         results.attrs["n_no_price"] = 5
         results.attrs["n_delisted"] = 2
+        results.attrs["n_unavailable"] = 3
         summary = summarize_backtest(results)
         self.assertEqual(summary.attrs.get("n_no_price"), 5)
         self.assertEqual(summary.attrs.get("n_delisted"), 2)
+        self.assertEqual(summary.attrs.get("n_unavailable"), 3)
 
     def test_coverage_counts_flow_end_to_end(self):
         """Unavailable outcomes remain distinct from absent entry prices."""

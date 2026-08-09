@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 from typer.testing import CliRunner
 
-from analyzer.cli import app
+from analyzer.cli import _load_sector_map, app
 from analyzer.exceptions import StepResult
 
 
@@ -151,6 +151,74 @@ class TestCliApp(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         capitol.assert_not_called()
         self.assertIn("Excluding Capitol Trades from official refresh", result.output)
+
+    def test_portfolio_requires_sector_map_before_db_open(self):
+        with patch("analyzer.cli.get_context") as context:
+            result = self.runner.invoke(
+                app,
+                [
+                    "portfolio",
+                    "--start",
+                    "2024-01-01",
+                    "--end",
+                    "2024-02-01",
+                ],
+            )
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("--sector-map is required", result.output)
+        context.assert_not_called()
+
+    def test_sector_map_loader_validates_deterministic_json(self):
+        with self.runner.isolated_filesystem():
+            Path("sectors.json").write_text('{"AAPL": "Technology"}')
+            self.assertEqual(_load_sector_map("sectors.json"), {"AAPL": "Technology"})
+            Path("bad.json").write_text('{"AAPL": ""}')
+            with self.assertRaisesRegex(ValueError, "blank ticker or sector"):
+                _load_sector_map("bad.json")
+
+    def test_portfolio_fails_before_simulation_when_sector_ticker_missing(self):
+        mock_ctx = MagicMock()
+        mock_ctx.transaction_source.db.get_transactions_by_date_range.return_value = (
+            pd.DataFrame({"ticker": ["B"]})
+        )
+        recommendations = pd.DataFrame(
+            {
+                "ticker": ["B"],
+                "signal_score": [1.0],
+                "as_of_date": [pd.Timestamp("2024-01-01")],
+            }
+        )
+        with self.runner.isolated_filesystem():
+            Path("sectors.json").write_text('{"A": "Technology"}')
+            with (
+                patch("analyzer.cli.get_context", return_value=mock_ctx),
+                patch(
+                    "analyzer.cli._load_portfolio_inputs",
+                    return_value=(
+                        pd.DataFrame(),
+                        pd.DataFrame(),
+                        pd.DataFrame(),
+                        recommendations,
+                    ),
+                ),
+                patch("analyzer.portfolio_sim.PortfolioSimulator") as simulator,
+            ):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "portfolio",
+                        "--start",
+                        "2024-01-01",
+                        "--end",
+                        "2024-02-01",
+                        "--sector-map",
+                        "sectors.json",
+                    ],
+                )
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("sector map is missing 1 recommended ticker", result.output)
+        simulator.assert_not_called()
+
 
     def test_parse_fails_when_pipeline_fails_even_if_ocr_inserts_rows(self):
         mock_ctx = MagicMock()

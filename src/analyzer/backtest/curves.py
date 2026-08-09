@@ -12,7 +12,10 @@ import numpy as np
 import pandas as pd
 
 from analyzer._memo import df_memoize
-from analyzer.backtest.prices import _next_tradable_price_arrays
+from analyzer.backtest.prices import (
+    _aligned_price_at_or_before_arrays,
+    _next_tradable_price_arrays,
+)
 from analyzer.models import TransactionType
 from analyzer.signals import _price_arrays
 
@@ -43,7 +46,9 @@ def _build_ticker_curves(
     if eligible.empty:
         return []
 
-    return _build_curves_for_rows(eligible, prices_df, horizon)
+    return _build_curves_for_rows(
+        eligible, prices_df, horizon, available_through=as_of_date
+    )
 
 
 @df_memoize(copy=False)
@@ -66,13 +71,17 @@ def _build_global_curves(
     if all_purchases.empty:
         return []
 
-    return _build_curves_for_rows(all_purchases, prices_df, horizon)
+    return _build_curves_for_rows(
+        all_purchases, prices_df, horizon, available_through=as_of_date
+    )
 
 
 def _build_curves_for_rows(
     rows: pd.DataFrame,
     prices_df: pd.DataFrame,
     horizon: int,
+    *,
+    available_through: pd.Timestamp | None = None,
 ) -> list:
     """Vectorized curve builder.
 
@@ -87,6 +96,11 @@ def _build_curves_for_rows(
     disclosures = rows["disclosure_date"].values
     tickers = rows["ticker"].values
     horizon_ns = pd.Timedelta(days=horizon).value
+    available_ns = (
+        pd.Timestamp(available_through).normalize().value
+        if available_through is not None
+        else None
+    )
 
     for i in range(len(rows)):
         tkr = tickers[i]
@@ -114,10 +128,22 @@ def _build_curves_for_rows(
 
         entry_ns = entry.date.value
         end_ns = entry_ns + horizon_ns
+        if available_ns is not None and end_ns > available_ns:
+            continue
+        terminal = _aligned_price_at_or_before_arrays(
+            idx_ns,
+            vals,
+            pd.Timestamp(end_ns),
+            max_staleness_days=7,
+            allow_zero=True,
+        )
+        if terminal is None:
+            continue
+
         lo = int(np.searchsorted(idx_ns, entry_ns, side="left"))
         hi = int(np.searchsorted(idx_ns, end_ns, side="right"))
         window = vals[lo:hi]
-        valid = np.isfinite(window) & (window > 0)
+        valid = np.isfinite(window) & (window >= 0)
         window = window[valid]
         if len(window) < 3:
             continue

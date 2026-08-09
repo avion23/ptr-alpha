@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.analysis import calculate_signal_potential, evaluate_backtest
-from analyzer.backtest.curves import _build_curves_for_rows
+from analyzer.backtest.curves import _build_curves_for_rows, _build_ticker_curves
 from analyzer.backtest.filters import _filter_ticker_perf, _filter_training
 from analyzer.backtest.prices import (
     _aligned_price_at_or_before_arrays,
@@ -558,3 +558,28 @@ class TestAlignedPriceHelpers(unittest.TestCase):
         curves = _build_curves_for_rows(rows, prices, horizon=3)
         self.assertEqual(len(curves), 1)
         np.testing.assert_allclose(curves[0], [0.0, 0.1, 0.2])
+
+    def test_ou_curve_matures_from_actual_entry_before_as_of(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "entry_price": [100.0],
+                "horizon_days": [3],
+                "signal_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [120.0, 132.0, 144.0, 156.0]},
+            index=pd.to_datetime(
+                ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09"]
+            ),
+        )
+        immature = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-08"), horizon=3
+        )
+        mature = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-09"), horizon=3
+        )
+        self.assertEqual(immature, [])
+        self.assertEqual(len(mature), 1)

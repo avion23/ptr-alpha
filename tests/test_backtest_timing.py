@@ -594,6 +594,8 @@ class TestAlignedPriceHelpers(unittest.TestCase):
             "disclosure_date": [pd.Timestamp("2025-01-05")],
             "horizon_days": [3],
             "signal_type": ["Purchase"],
+            "label_entry_date": [pd.Timestamp("2025-01-06")],
+            "label_exit_date": [pd.Timestamp("2025-01-09")],
         }
         prices = pd.DataFrame(
             {"A": [120.0, 132.0, 144.0, 156.0, 168.0]},
@@ -611,7 +613,12 @@ class TestAlignedPriceHelpers(unittest.TestCase):
             {**base, "window_complete": [False], "label_window_end": ["2025-01-09"]}
         )
         future_label = pd.DataFrame(
-            {**base, "window_complete": [True], "label_window_end": ["2025-01-10"]}
+            {
+                **base,
+                "window_complete": [True],
+                "label_window_end": ["2025-01-10"],
+                "label_exit_date": [pd.Timestamp("2025-01-10")],
+            }
         )
         self.assertEqual(
             _build_ticker_curves(
@@ -634,6 +641,8 @@ class TestAlignedPriceHelpers(unittest.TestCase):
                 "horizon_days": [3],
                 "signal_type": ["Purchase"],
                 "window_complete": [True],
+                "label_entry_date": [pd.Timestamp("2025-01-06")],
+                "label_exit_date": [pd.Timestamp("2025-01-09")],
                 "label_window_end": [pd.Timestamp("2025-01-09")],
             }
         )
@@ -669,15 +678,15 @@ class TestAlignedPriceHelpers(unittest.TestCase):
                 ]
             ),
         )
-        before_expected_session = _build_ticker_curves(
-            "A", signals, prices, pd.Timestamp("2025-01-12"), horizon=5
+        before_calendar_maturity = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-10"), horizon=5
         )
         complete = _build_ticker_curves(
-            "A", signals, prices, pd.Timestamp("2025-01-13"), horizon=5
+            "A", signals, prices, pd.Timestamp("2025-01-11"), horizon=5
         )
-        self.assertEqual(before_expected_session, [])
+        self.assertEqual(before_calendar_maturity, [])
         self.assertEqual(len(complete), 1)
-        np.testing.assert_allclose(complete[0], [0.0, 0.1, 0.2, 0.3, 0.4])
+        np.testing.assert_allclose(complete[0], [0.0, 0.1, 0.2, 0.3])
 
     def test_legacy_ou_rejects_later_quote_when_expected_session_is_missing(self):
         signals = pd.DataFrame(
@@ -701,7 +710,7 @@ class TestAlignedPriceHelpers(unittest.TestCase):
         )
         prices = pd.DataFrame(
             {
-                "A": [100.0, 110.0, 120.0, 125.0, 130.0, np.nan, 140.0],
+                "A": [100.0, 110.0, 120.0, 125.0, np.nan, 130.0, 140.0],
                 "SPY": [500.0, 501.0, 502.0, 503.0, 504.0, 505.0, 506.0],
             },
             index=index,
@@ -711,7 +720,7 @@ class TestAlignedPriceHelpers(unittest.TestCase):
         )
         self.assertEqual(curves, [])
 
-    def test_ou_rejects_labeled_endpoint_before_full_entry_horizon(self):
+    def test_ou_uses_exact_labeled_endpoints_and_window_only_for_maturity(self):
         signals = pd.DataFrame(
             {
                 "ticker": ["A"],
@@ -719,11 +728,69 @@ class TestAlignedPriceHelpers(unittest.TestCase):
                 "horizon_days": [3],
                 "signal_type": ["Purchase"],
                 "window_complete": [True],
-                "label_window_end": [pd.Timestamp("2025-01-08")],
+                "label_entry_date": [pd.Timestamp("2025-01-06")],
+                "label_exit_date": [pd.Timestamp("2025-01-08")],
+                "label_window_end": [pd.Timestamp("2025-01-09")],
             }
         )
         prices = pd.DataFrame(
             {"A": [120.0, 132.0, 144.0, 156.0]},
+            index=pd.to_datetime(
+                ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09"]
+            ),
+        )
+        immature = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-08"), horizon=3
+        )
+        complete = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-09"), horizon=3
+        )
+        self.assertEqual(immature, [])
+        self.assertEqual(len(complete), 1)
+        np.testing.assert_allclose(complete[0], [0.0, 0.1, 0.2])
+
+    def test_legacy_ou_weekend_holiday_window_completes_at_calendar_maturity(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2024-12-19")],
+                "horizon_days": [8],
+                "signal_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 102.0, 104.0, 106.0, 108.0]},
+            index=pd.to_datetime(
+                [
+                    "2024-12-20",
+                    "2024-12-23",
+                    "2024-12-24",
+                    "2024-12-26",
+                    "2024-12-27",
+                ]
+            ),
+        )
+        before_maturity = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2024-12-27"), horizon=8
+        )
+        complete = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2024-12-28"), horizon=8
+        )
+        self.assertEqual(before_maturity, [])
+        self.assertEqual(len(complete), 1)
+        np.testing.assert_allclose(complete[0], [0.0, 0.02, 0.04, 0.06, 0.08])
+
+    def test_ou_rejects_entire_curve_with_interior_zero_quote(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "horizon_days": [3],
+                "signal_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 0.0, 120.0, 130.0]},
             index=pd.to_datetime(
                 ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09"]
             ),

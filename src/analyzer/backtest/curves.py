@@ -89,7 +89,7 @@ def _eligible_historical_rows(
     return signals_df[mask]
 
 
-def _expected_exchange_session(
+def _expected_exchange_session_on_or_after(
     sessions_ns: np.ndarray,
     target_date: pd.Timestamp,
     *,
@@ -103,6 +103,22 @@ def _expected_exchange_session(
         return None
     session = pd.Timestamp(int(sessions_ns[pos])).normalize()
     if (session - target).days > max_wait_days:
+        return None
+    return session
+
+
+def _expected_exchange_session_on_or_before(
+    sessions_ns: np.ndarray,
+    target_date: pd.Timestamp,
+    *,
+    max_staleness_days: int = 7,
+) -> pd.Timestamp | None:
+    target = pd.Timestamp(target_date).normalize()
+    pos = int(np.searchsorted(sessions_ns, target.value, side="right")) - 1
+    if pos < 0:
+        return None
+    session = pd.Timestamp(int(sessions_ns[pos])).normalize()
+    if (target - session).days > max_staleness_days:
         return None
     return session
 
@@ -126,20 +142,29 @@ def _build_curves_for_rows(
     curves: list = []
     disclosures = rows["disclosure_date"].values
     tickers = rows["ticker"].values
-    label_ends = (
+    has_labeled_rows = "label_window_end" in rows.columns
+    label_windows = (
         pd.to_datetime(rows["label_window_end"], errors="coerce").values
-        if "label_window_end" in rows.columns
+        if has_labeled_rows
         else None
     )
-    horizon_ns = pd.Timedelta(days=horizon).value
+    label_entries = (
+        pd.to_datetime(rows["label_entry_date"], errors="coerce").values
+        if "label_entry_date" in rows.columns
+        else None
+    )
+    label_exits = (
+        pd.to_datetime(rows["label_exit_date"], errors="coerce").values
+        if "label_exit_date" in rows.columns
+        else None
+    )
     available_ns = (
         pd.Timestamp(available_through).normalize().value
         if available_through is not None
         else None
     )
-    market_sessions = (
-        pd.DatetimeIndex(prices_df.index).normalize().unique().sort_values()
-    )
+    price_dates = pd.DatetimeIndex(prices_df.index).normalize()
+    market_sessions = price_dates.unique().sort_values()
     market_sessions_ns = np.asarray(
         [pd.Timestamp(session).value for session in market_sessions], dtype=np.int64
     )
@@ -159,57 +184,67 @@ def _build_curves_for_rows(
         if idx_ns is None:
             continue
 
-        # Disclosure metadata has no publication timestamp. Determine the
-        # expected exchange session first, then require this ticker's exact
-        # quote. A later ticker quote cannot silently replace a missing label
-        # endpoint or entry session.
-        expected_entry = _expected_exchange_session(
-            market_sessions_ns,
-            pd.Timestamp(disclosures[i]),
-            strictly_after=True,
-        )
-        if expected_entry is None:
-            continue
-        entry = _aligned_price_on_or_after_arrays(
-            idx_ns, vals, expected_entry, max_wait_days=0
-        )
-        if entry is None:
-            continue
-
-        entry_ns = entry.date.value
-        calendar_end = pd.Timestamp(entry_ns + horizon_ns)
-        if label_ends is not None:
-            if pd.isna(label_ends[i]):
+        if has_labeled_rows:
+            if label_entries is None or label_exits is None or label_windows is None:
                 continue
-            expected_end = pd.Timestamp(label_ends[i]).normalize()
-            if expected_end < calendar_end:
+            if (
+                pd.isna(label_entries[i])
+                or pd.isna(label_exits[i])
+                or pd.isna(label_windows[i])
+            ):
                 continue
+            expected_entry = pd.Timestamp(label_entries[i]).normalize()
+            expected_end = pd.Timestamp(label_exits[i]).normalize()
+            maturity = pd.Timestamp(label_windows[i]).normalize()
         else:
-            expected_end = _expected_exchange_session(
-                market_sessions_ns, calendar_end, strictly_after=False
+            # Date-only disclosures become available after that session. Use
+            # the next exchange session as entry, then the last exchange
+            # session on/before the calendar maturity, matching label/evaluate
+            # semantics without substituting a different ticker quote.
+            expected_entry = _expected_exchange_session_on_or_after(
+                market_sessions_ns,
+                pd.Timestamp(disclosures[i]),
+                strictly_after=True,
+            )
+            if expected_entry is None:
+                continue
+            maturity = expected_entry + pd.Timedelta(days=horizon)
+            expected_end = _expected_exchange_session_on_or_before(
+                market_sessions_ns, maturity
             )
             if expected_end is None:
                 continue
 
-        terminal = _aligned_price_on_or_after_arrays(
-            idx_ns,
-            vals,
-            expected_end,
-            max_wait_days=0,
-        )
-        if terminal is None:
+        if available_ns is not None and maturity.value > available_ns:
             continue
+        if expected_end < expected_entry:
+            continue
+
+        entry = _aligned_price_on_or_after_arrays(
+            idx_ns, vals, expected_entry, max_wait_days=0
+        )
+        terminal = _aligned_price_on_or_after_arrays(
+            idx_ns, vals, expected_end, max_wait_days=0
+        )
+        if entry is None or terminal is None:
+            continue
+
         end_ns = terminal.date.value
         if available_ns is not None and end_ns > available_ns:
             continue
 
-        lo = int(np.searchsorted(idx_ns, entry_ns, side="left"))
-        hi = int(np.searchsorted(idx_ns, end_ns, side="right"))
-        window = vals[lo:hi]
-        valid = np.isfinite(window) & (window >= 0)
-        window = window[valid]
-        if len(window) < 3:
+        raw_window = pd.to_numeric(
+            prices_df.loc[
+                (price_dates >= entry.date) & (price_dates <= terminal.date), tkr
+            ],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        if (
+            len(raw_window) < 3
+            or not np.isfinite(raw_window).all()
+            or (raw_window <= 0).any()
+        ):
             continue
-        curves.append(window / entry.price - 1.0)
+        curves.append(raw_window / entry.price - 1.0)
 
     return curves

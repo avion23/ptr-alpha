@@ -601,8 +601,8 @@ class TestParsing(unittest.TestCase):
         self.assertIsNone(transaction["strike_price"])
         self.assertIsNone(transaction["expiry_date"])
 
-    def test_option_note_before_marker_stays_with_option_row(self):
-        # 20026590: table extraction places the TEM option note before [OP].
+    def test_option_note_before_marker_cannot_supply_contract_terms(self):
+        # 20026590: flattened prefix text may belong to the preceding row.
         table = [
             ["Asset Name", "Transaction Type", "Transaction Date"],
             [
@@ -612,9 +612,9 @@ class TestParsing(unittest.TestCase):
             ],
         ]
         transaction = parse_pdf_table(table)[0]
-        self.assertEqual(transaction["instrument_type"], "call")
-        self.assertEqual(transaction["strike_price"], 80.0)
-        self.assertEqual(transaction["expiry_date"], "01/16/2026")
+        self.assertEqual(transaction["instrument_type"], "option")
+        self.assertIsNone(transaction["strike_price"])
+        self.assertIsNone(transaction["expiry_date"])
 
     def test_real_nokia_and_ge_option_notes(self):
         # 20034694 wording once the note is attached to its own [OP] row.
@@ -694,6 +694,7 @@ class TestParsing(unittest.TestCase):
                 ("PANW", "stock", None, None),
                 ("TEM", "option", None, None),
                 ("VST", "option", None, None),
+
             ],
         )
         self.assertEqual(
@@ -706,6 +707,7 @@ class TestParsing(unittest.TestCase):
                 ("NOK", "stock"),
                 ("NOK", "stock"),
             ],
+
         )
         self.assertIn("BRK.B", {row["ticker"] for row in berkshire_rows})
         self.assertNotIn("ALLI", {row["ticker"] for row in arlp_rows})

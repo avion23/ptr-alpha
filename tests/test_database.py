@@ -368,6 +368,7 @@ class TestTransactions(DatabaseTestCase):
         inserted = self.db.upsert_transactions(df, source="house_pdf")
         self.assertEqual(inserted, 1)
 
+
         count = self.db.conn.execute(
             "SELECT COUNT(*) FROM transactions WHERE doc_id = 'doc-idempotent-asset'"
         ).fetchone()[0]
@@ -762,9 +763,12 @@ class TestTransactionNormalization(DatabaseTestCase):
         self.assertEqual(normalized.iloc[0]["transaction_type"], "Sale")
         self.assertEqual(normalized.iloc[0]["raw_transaction_subtype"], "Sale Partial")
 
-    def test_only_exact_artifact_identity_replay_dedupes(self):
+    def test_full_artifact_identity_controls_replay_dedupe(self):
         base = {
+            "source": "house_pdf",
+            "chamber": "house",
             "source_record_id": "record-1",
+            "ingestion_generation": "generation-1",
             "member": "Jane Doe",
             "ticker": "AAPL",
             "transaction_date": date(2024, 3, 10),
@@ -778,13 +782,48 @@ class TestTransactionNormalization(DatabaseTestCase):
                     base | {"source_row_id": "page-1:row-1"},
                     base | {"source_row_id": "page-1:row-1"},
                     base | {"source_row_id": "page-1:row-2"},
+                    base
+                    | {
+                        "source": "senate_api",
+                        "source_row_id": "page-1:row-1",
+                    },
+                    base
+                    | {
+                        "ingestion_generation": "generation-2",
+                        "source_row_id": "page-1:row-1",
+                    },
+                    base
+                    | {
+                        "chamber": "senate",
+                        "source_row_id": "page-1:row-1",
+                    },
                 ]
             ),
             deduplicate=True,
         )
-        self.assertEqual(len(normalized), 2)
-        self.assertEqual(
-            set(normalized["source_row_id"]), {"page-1:row-1", "page-1:row-2"}
+        self.assertEqual(len(normalized), 5)
+        identities = set(
+            normalized[
+                [
+                    "source",
+                    "chamber",
+                    "source_record_id",
+                    "source_row_id",
+                    "ingestion_generation",
+                ]
+            ].itertuples(index=False, name=None)
+        )
+        self.assertIn(
+            ("house_pdf", "house", "record-1", "page-1:row-2", "generation-1"),
+            identities,
+        )
+        self.assertIn(
+            ("senate_api", "house", "record-1", "page-1:row-1", "generation-1"),
+            identities,
+        )
+        self.assertIn(
+            ("house_pdf", "house", "record-1", "page-1:row-1", "generation-2"),
+            identities,
         )
 
     def test_sale_subtypes_normalize_without_hiding_ambiguous_lots(self):

@@ -542,8 +542,10 @@ def _extract_instrument_type(asset_cell: str | None) -> str:
     if re.search(r"\[st\]", text):
         return "stock"
 
+    option_marker = re.search(r"\[op\]", text)
+    direction_text = text[option_marker.end() :] if option_marker else text
     is_put = any(
-        re.search(pattern, text)
+        re.search(pattern, direction_text)
         for pattern in (
             r"\bput\s+option\b",
             r"\bput\s+opt\b",
@@ -555,7 +557,7 @@ def _extract_instrument_type(asset_cell: str | None) -> str:
         return "put"
 
     is_call = any(
-        re.search(pattern, text)
+        re.search(pattern, direction_text)
         for pattern in (
             r"\bcall\s+option\b",
             r"\bcall\s+opt\b",
@@ -579,16 +581,18 @@ def _extract_option_details(asset_cell: str | None) -> dict:
     if not asset_cell:
         return details
 
+    option_marker = re.search(r"\[op\]", asset_cell, re.IGNORECASE)
+    contract_text = asset_cell[option_marker.end() :] if option_marker else asset_cell
     strike_match = re.search(
         r"strike\s*(?:price)?(?:\s+of)?[:\s]*\$?(\d+(?:\.\d+)?)",
-        asset_cell,
+        contract_text,
         re.IGNORECASE,
     )
     if strike_match:
         details["strike_price"] = float(strike_match.group(1))
     else:
         strike_fallback = re.search(
-            r"\$(\d+(?:\.\d+)?)\s+(?:exp|strike)", asset_cell, re.IGNORECASE
+            r"\$(\d+(?:\.\d+)?)\s+(?:exp|strike)", contract_text, re.IGNORECASE
         )
         if strike_fallback:
             details["strike_price"] = float(strike_fallback.group(1))
@@ -596,7 +600,7 @@ def _extract_option_details(asset_cell: str | None) -> dict:
     exp_match = re.search(
         r"(?:exp(?:ir(?:e|ation|ing)?)?(?:\s+date)?(?:\s+of)?[:\s]+)"
         r"(\d{1,2}/\d{1,2}/(?:\d{2}|\d{4}))",
-        asset_cell,
+        contract_text,
         re.IGNORECASE,
     )
     if exp_match:

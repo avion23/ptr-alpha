@@ -52,6 +52,13 @@ _BASE_WRITE_COLUMNS = (
     "asset_description",
     "source",
 )
+_ARTIFACT_IDENTITY_COLUMNS = (
+    "source",
+    "chamber",
+    "source_record_id",
+    "source_row_id",
+    "ingestion_generation",
+)
 _TYPE_MAP = {
     "Sale Full": "Sale",
     "Sale Partial": "Sale",
@@ -126,12 +133,13 @@ def _normalize_frame(df: pd.DataFrame, *, deduplicate: bool) -> pd.DataFrame:
         df["instrument_type"] = df["instrument_type"].map(_normalize_instrument)
     if "amount_raw" in df.columns and "amount_midpoint" in df.columns:
         df["amount_midpoint"] = df.apply(_normalize_amount, axis=1)
-    if deduplicate and {"source_record_id", "source_row_id"}.issubset(df.columns):
-        record_ids = df["source_record_id"].fillna("").astype(str).str.strip()
-        row_ids = df["source_row_id"].fillna("").astype(str).str.strip()
-        identified = record_ids.ne("") & row_ids.ne("")
+    if deduplicate and set(_ARTIFACT_IDENTITY_COLUMNS).issubset(df.columns):
+        identified = pd.Series(True, index=df.index)
+        for column in _ARTIFACT_IDENTITY_COLUMNS:
+            values = df[column].fillna("").astype(str).str.strip()
+            identified &= values.ne("")
         replay = identified & df.duplicated(
-            ["source_record_id", "source_row_id"], keep="last"
+            list(_ARTIFACT_IDENTITY_COLUMNS), keep="last"
         )
         df = df.loc[~replay].copy()
 
@@ -372,19 +380,15 @@ class TransactionRepository:
                 for column in provenance_columns
             )
             update_sql = ", ".join(updates)
-            has_artifact_identity = {
-                "source_record_id",
-                "source_row_id",
-            }.issubset(write_columns)
+            has_artifact_identity = set(_ARTIFACT_IDENTITY_COLUMNS).issubset(
+                write_columns
+            )
             if has_artifact_identity:
-                identity_sql = """
-                    s.source_record_id IS NOT NULL
-                    AND TRIM(s.source_record_id) <> ''
-                    AND s.source_row_id IS NOT NULL
-                    AND TRIM(s.source_row_id) <> ''
-                    AND t.source_record_id = s.source_record_id
-                    AND t.source_row_id = s.source_row_id
-                """
+                identity_sql = " AND ".join(
+                    f"s.{column} IS NOT NULL AND TRIM(s.{column}) <> '' "
+                    f"AND t.{column} = s.{column}"
+                    for column in _ARTIFACT_IDENTITY_COLUMNS
+                )
                 self.conn.execute(
                     f"""UPDATE transactions AS t SET {update_sql}
                         FROM filtered_staging_transactions AS s
@@ -415,7 +419,8 @@ class TransactionRepository:
                 self.conn.execute("ROLLBACK")
             raise AmbiguousTransactionIdentityError(
                 "Legacy economic unique key blocked a transaction without exact "
-                "(source_record_id, source_row_id) identity"
+                "(source, chamber, source_record_id, source_row_id, "
+                "ingestion_generation) identity"
             ) from exc
         except Exception:
             if not _in_transaction:

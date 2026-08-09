@@ -212,6 +212,7 @@ class Database:
             "raw_transaction_subtype": "VARCHAR",
             "ticker_origin": "VARCHAR",
             "raw_ticker": "VARCHAR",
+            "ticker_candidate": "VARCHAR",
             "raw_asset_class": "VARCHAR",
             "raw_asset_description": "VARCHAR",
             "raw_owner": "VARCHAR",
@@ -457,8 +458,37 @@ class Database:
         ]
         if transactions[required_values].isna().any().any():
             raise ValueError("source transaction provenance values are incomplete")
+        if (
+            transactions["source_record_id"]
+            .map(lambda value: not isinstance(value, str) or not value.strip())
+            .any()
+        ):
+            raise ValueError("source_record_id must be a non-empty string")
 
         identified = transactions[transactions["source_row_id"].notna()]
+        if (
+            identified["source_row_id"]
+            .map(lambda value: not isinstance(value, str) or not value.strip())
+            .any()
+        ):
+            raise ValueError("non-null source_row_id values must be non-empty strings")
+        unverified = transactions["ticker_origin"].eq("unverified")
+        invalid_raw_ticker = transactions["raw_ticker"].map(
+            lambda value: not isinstance(value, str) or not value.strip()
+        )
+        invalid_ticker_candidate = transactions["ticker_candidate"].map(
+            lambda value: not isinstance(value, str) or not value.strip()
+        )
+        unverified_without_candidate = unverified & (
+            invalid_raw_ticker | invalid_ticker_candidate
+        )
+        if unverified_without_candidate.any():
+            raise ValueError(
+                "unverified ticker rows require raw_ticker and ticker_candidate"
+            )
+        if (unverified & transactions["ticker"].notna()).any():
+            raise ValueError("unverified ticker rows must not set canonical ticker")
+
         duplicate_rows = identified.duplicated(
             subset=["source_record_id", "source_row_id"], keep=False
         )

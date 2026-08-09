@@ -18,6 +18,7 @@ SOURCE_TRANSACTION_COLUMNS = [
     "member",
     "ticker",
     "raw_ticker",
+    "ticker_candidate",
     "transaction_date",
     "disclosure_date",
     "official_filing_date",
@@ -246,7 +247,8 @@ class TransactionRepository:
                     asset_description, source, chamber, source_record_id,
                     source_row_id, official_filing_date, available_date,
                     notification_date, amends_source_record_id,
-                    raw_transaction_subtype, ticker_origin, raw_ticker, raw_asset_class,
+                    raw_transaction_subtype, ticker_origin, raw_ticker,
+                    ticker_candidate, raw_asset_class,
                     raw_asset_description, raw_owner, ingestion_generation,
                     artifact_sha256
                 )
@@ -257,7 +259,8 @@ class TransactionRepository:
                     asset_description, source, chamber, source_record_id,
                     source_row_id, official_filing_date, available_date,
                     notification_date, amends_source_record_id,
-                    raw_transaction_subtype, ticker_origin, raw_ticker, raw_asset_class,
+                    raw_transaction_subtype, ticker_origin, raw_ticker,
+                    ticker_candidate, raw_asset_class,
                     raw_asset_description, raw_owner, ingestion_generation,
                     artifact_sha256
                 FROM staging_source_transactions
@@ -283,7 +286,8 @@ class TransactionRepository:
                    source, chamber, source_record_id, source_row_id,
                    official_filing_date, available_date, notification_date,
                    amends_source_record_id, raw_transaction_subtype, ticker_origin,
-                   raw_ticker, raw_asset_class, raw_asset_description, raw_owner,
+                   raw_ticker, ticker_candidate, raw_asset_class,
+                   raw_asset_description, raw_owner,
                    ingestion_generation, artifact_sha256, created_at
             FROM transactions
             WHERE doc_id = ?

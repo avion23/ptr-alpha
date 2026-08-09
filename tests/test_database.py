@@ -799,6 +799,7 @@ class TestSourceReports(DatabaseTestCase):
             "member": "Jane Doe",
             "ticker": "AAPL",
             "raw_ticker": "AAPL",
+            "ticker_candidate": None,
             "transaction_date": date(2026, 7, 1),
             "disclosure_date": date(2026, 7, 10),
             "official_filing_date": date(2026, 7, 10),
@@ -836,7 +837,7 @@ class TestSourceReports(DatabaseTestCase):
                 date(2026, 8, 1),
                 "parsed",
                 parsed_sha,
-                "d" * 64,
+                parsed_sha,
                 None,
                 None,
                 None,
@@ -870,7 +871,7 @@ class TestSourceReports(DatabaseTestCase):
                 date(2026, 8, 3),
                 "parsed",
                 "c" * 64,
-                None,
+                "c" * 64,
                 None,
                 None,
                 None,
@@ -889,7 +890,7 @@ class TestSourceReports(DatabaseTestCase):
         self.assertEqual(stored.iloc[0]["outcome"], "parsed")
         self.assertEqual(stored.iloc[1]["outcome"], "paper_only")
         self.assertEqual(stored.iloc[2]["outcome"], "parsed")
-        self.assertEqual(stored.iloc[0]["landing_sha256"], "d" * 64)
+        self.assertEqual(stored.iloc[0]["landing_sha256"], parsed_sha)
         self.assertEqual(stored.iloc[1]["paper_artifact_sha256"], "b" * 64)
         self.assertEqual(
             self.db.get_source_report_reconciliation("refresh-2026-08-09", "house"),
@@ -914,7 +915,7 @@ class TestSourceReports(DatabaseTestCase):
                     date(2026, 8, 1),
                     "parsed",
                     source_record_id[0] * 64,
-                    None,
+                    source_record_id[0] * 64,
                     None,
                     None,
                     None,
@@ -954,7 +955,7 @@ class TestSourceReports(DatabaseTestCase):
                 date(2026, 8, 1),
                 "parsed",
                 "a" * 64,
-                None,
+                "a" * 64,
                 None,
                 None,
                 None,
@@ -1045,7 +1046,7 @@ class TestSourceReports(DatabaseTestCase):
                 date(2026, 8, 1),
                 "parsed",
                 "a" * 64,
-                None,
+                "a" * 64,
                 None,
                 None,
                 None,
@@ -1085,6 +1086,7 @@ class TestSourceReports(DatabaseTestCase):
                     "official_filing_date": date(2026, 7, 10),
                     "outcome": "parsed",
                     "artifact_sha256": "a" * 64,
+                    "landing_sha256": "a" * 64,
                     "paper_artifact_url": None,
                     "error_message": None,
                     "raw_row_count": 2,
@@ -1100,6 +1102,7 @@ class TestSourceReports(DatabaseTestCase):
                     "official_filing_date": date(2026, 7, 11),
                     "outcome": "paper_only",
                     "artifact_sha256": "b" * 64,
+                    "landing_sha256": "e" * 64,
                     "paper_artifact_url": "https://example.test/paper-report",
                     "paper_artifact_sha256": "b" * 64,
                     "error_message": None,
@@ -1199,6 +1202,7 @@ class TestSourceReports(DatabaseTestCase):
                     "official_filing_date": date(2026, 7, 10),
                     "outcome": "parsed",
                     "artifact_sha256": "c" * 64,
+                    "landing_sha256": "c" * 64,
                     "paper_artifact_url": None,
                     "error_message": None,
                     "raw_row_count": 0,
@@ -1249,6 +1253,7 @@ class TestSourceReports(DatabaseTestCase):
                     "official_filing_date": date(2026, 7, 10),
                     "outcome": "parsed",
                     "artifact_sha256": "a" * 64,
+                    "landing_sha256": "a" * 64,
                     "paper_artifact_url": None,
                     "error_message": None,
                     "raw_row_count": 1,
@@ -1305,6 +1310,7 @@ class TestSourceReports(DatabaseTestCase):
                     "official_filing_date": date(2026, 7, 10),
                     "outcome": "parsed",
                     "artifact_sha256": "a" * 64,
+                    "landing_sha256": "a" * 64,
                     "paper_artifact_url": None,
                     "error_message": None,
                     "raw_row_count": 1,
@@ -1315,6 +1321,14 @@ class TestSourceReports(DatabaseTestCase):
             columns=self.COLUMNS,
         )
 
+        with self.assertRaisesRegex(ValueError, "duplicate source row identities"):
+            self.db.persist_source_refresh(
+                transactions=pd.concat([transactions, transactions], ignore_index=True),
+                reports=reports,
+                source="senate_efd",
+                chamber="senate",
+                ingestion_generation="gen-1",
+            )
         with self.assertRaisesRegex(ValueError, "artifact hash does not match"):
             self.db.persist_source_refresh(
                 transactions=transactions.assign(artifact_sha256="b" * 64),
@@ -1332,6 +1346,65 @@ class TestSourceReports(DatabaseTestCase):
                     ],
                     ignore_index=True,
                 ),
+                reports=reports,
+                source="senate_efd",
+                chamber="senate",
+                ingestion_generation="gen-1",
+            )
+
+    def test_unverified_ticker_candidate_is_not_canonical(self):
+        reports = pd.DataFrame(
+            [
+                {
+                    "ingestion_generation": "gen-1",
+                    "chamber": "senate",
+                    "source_record_id": "report-1",
+                    "report_path": "/reports/report-1",
+                    "member": "Jane Doe",
+                    "official_filing_date": date(2026, 7, 10),
+                    "outcome": "parsed",
+                    "artifact_sha256": "a" * 64,
+                    "landing_sha256": "a" * 64,
+                    "paper_artifact_sha256": None,
+                    "paper_artifact_url": None,
+                    "error_message": None,
+                    "raw_row_count": 1,
+                    "accepted_row_count": 1,
+                    "rejected_row_count": 0,
+                }
+            ],
+            columns=self.COLUMNS,
+        )
+        transactions = pd.DataFrame(
+            [
+                self.transaction(
+                    ticker=None,
+                    raw_ticker="BRK/B",
+                    ticker_candidate="BRK.B",
+                    ticker_origin="unverified",
+                )
+            ],
+            columns=SOURCE_TRANSACTION_COLUMNS,
+        )
+
+        self.assertEqual(
+            self.db.persist_source_refresh(
+                transactions=transactions,
+                reports=reports,
+                source="senate_efd",
+                chamber="senate",
+                ingestion_generation="gen-1",
+            ),
+            1,
+        )
+        stored = self.db.conn.execute(
+            "SELECT ticker, raw_ticker, ticker_candidate FROM transactions"
+        ).fetchone()
+        self.assertEqual(stored, (None, "BRK/B", "BRK.B"))
+
+        with self.assertRaisesRegex(ValueError, "must not set canonical ticker"):
+            self.db.persist_source_refresh(
+                transactions=transactions.assign(ticker="BRK.B"),
                 reports=reports,
                 source="senate_efd",
                 chamber="senate",

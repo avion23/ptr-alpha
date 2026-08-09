@@ -230,11 +230,29 @@ class SourceReportRepository:
             )
             if invalid_hash.any():
                 raise ValueError(f"{column} must be a 64-character hexadecimal digest")
-        requires_artifact_hash = reports_df["outcome"].isin(
-            [SourceReportOutcome.PARSED.value, SourceReportOutcome.PAPER_ONLY.value]
+        parsed = reports_df["outcome"].eq(SourceReportOutcome.PARSED.value)
+        parsed_hash_missing = parsed & (
+            reports_df["artifact_sha256"].isna() | reports_df["landing_sha256"].isna()
         )
-        if (requires_artifact_hash & reports_df["artifact_sha256"].isna()).any():
-            raise ValueError("parsed and paper_only reports require artifact_sha256")
+        if parsed_hash_missing.any():
+            raise ValueError(
+                "parsed reports require artifact_sha256 and landing_sha256"
+            )
+        parsed_hash_mismatch = parsed & reports_df["artifact_sha256"].ne(
+            reports_df["landing_sha256"]
+        )
+        if parsed_hash_mismatch.any():
+            raise ValueError("parsed artifact_sha256 must equal landing_sha256")
+
+        paper_only = reports_df["outcome"].eq(SourceReportOutcome.PAPER_ONLY.value)
+        paper_hash_missing = paper_only & (
+            reports_df["landing_sha256"].isna()
+            | reports_df["paper_artifact_sha256"].isna()
+        )
+        if paper_hash_missing.any():
+            raise ValueError(
+                "paper_only reports require landing_sha256 and paper_artifact_sha256"
+            )
 
         counts = reports_df["outcome"].value_counts().to_dict()
         found = len(reports_df)

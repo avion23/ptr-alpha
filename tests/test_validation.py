@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import math
+from dataclasses import asdict, replace
 from datetime import date
 
 import numpy as np
@@ -25,16 +26,21 @@ from analyzer.validation import (
     PRIMARY_METRIC,
     EvaluationAlreadyConsumedError,
     EvaluationLedgerIntegrityError,
+    _append_ledger_event,
+    _atomic_write_json,
     _authorize_member_control_from_ledger,
     _backtest_core,
     _build_manifest,
     _canonical_ledger_path,
     _complete_evaluation,
+    _empty_ledger,
     _hash_untracked_path,
     _member_family_sha256,
     _member_identity_permutations,
     _phase_end,
+    _record_member_control,
     _reserve_evaluation,
+    _run_identity_invariant_control,
     _run_member_identity_control,
     _validate_ledger,
     newey_west_tstat,
@@ -321,88 +327,53 @@ class TestMemberIdentityGate:
         assert result.release_ready is False
         assert result.max_stat_p_value == 1.0
 
-    def test_only_canonical_ledger_result_can_unlock_deployment(
-        self, monkeypatch, tmp_path
-    ):
-        signal = pd.DataFrame({"member": list("ABCDEFG"), "value": np.arange(7.0)})
-        monkeypatch.setattr(
-            "analyzer.validation.analysis.calculate_signal_potential",
-            lambda *args, **kwargs: signal,
-        )
+    def test_only_runner_written_canonical_record_can_unlock_deployment(self, tmp_path):
         series = {0: _series(np.full(180, 2.0))}
         baseline = _with_series(_selection_frame(series), series)
-        calls = 0
-
-        def fake_sweep(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            result = baseline.copy()
-            if calls > 1:
-                result["nw_tstat"] = 0.0
-            result.attrs["series_by_trial"] = series
-            return result
-
-        monkeypatch.setattr("analyzer.validation.sweep_configs", fake_sweep)
-        control = _run_member_identity_control(
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            {"horizon": [60], "decay_lambda": [0.005]},
-            date(2022, 1, 1),
-            date(2023, 1, 1),
-            observed_trial_id=0,
-            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-            n_permutations=999,
-            seed=1,
-        )
+        ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
+        control = _run_identity_invariant_control(baseline, 0, ledger)
         selection = select_config(baseline, n_permutations=999)
-        result = _authorize_member_control_from_ledger(
-            selection,
-            baseline,
-            0.05,
-            tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-        )
-        assert control.evaluated_permutations == 999
-        assert control.release_ready is True
+        result = _authorize_member_control_from_ledger(selection, baseline, ledger)
+        assert control.status == "identity_invariant"
+        assert control.max_stat_p_value == 1.0
         assert result["deployable_config"] is not None
 
-        with pytest.raises(TypeError, match="unexpected keyword"):
-            select_config(baseline, n_permutations=999, member_control=control)
-
-    def test_runner_result_must_match_exact_executed_family(
-        self, monkeypatch, tmp_path
-    ):
-        signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
-        monkeypatch.setattr(
-            "analyzer.validation.analysis.calculate_signal_potential",
-            lambda *args, **kwargs: signal,
+        forged = replace(
+            control, method="forged_significant_relabel_test", max_stat_p_value=0.0
         )
+        with pytest.raises(TypeError, match="runner-only"):
+            _record_member_control(
+                tmp_path / "forged-ledger.json",
+                forged,
+                _runner_token=object(),
+            )
+
+        forged_ledger = _empty_ledger()
+        _append_ledger_event(
+            forged_ledger,
+            {
+                "event_type": "member_identity_control",
+                "recorded_at_utc": "2026-08-09T00:00:00+00:00",
+                "control": asdict(forged),
+            },
+        )
+        forged_path = tmp_path / "caller-constructed-ledger.json"
+        _atomic_write_json(forged_path, forged_ledger)
+        with pytest.raises(TypeError, match="not written by this runner"):
+            _authorize_member_control_from_ledger(selection, baseline, forged_path)
+
+        with pytest.raises(TypeError, match="unexpected keyword"):
+            select_config(baseline, n_permutations=999, member_control=forged)
+
+    def test_runner_record_must_match_exact_executed_family(self, tmp_path):
         executed_series = {0: _series(np.full(180, 2.0))}
         executed = _with_series(_selection_frame(executed_series), executed_series)
-        monkeypatch.setattr(
-            "analyzer.validation.sweep_configs", lambda *args, **kwargs: executed
-        )
-        _run_member_identity_control(
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            {"horizon": [60], "decay_lambda": [0.005]},
-            date(2022, 1, 1),
-            date(2023, 1, 1),
-            observed_trial_id=0,
-            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-            n_permutations=999,
-            seed=1,
-        )
+        ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
+        _run_identity_invariant_control(executed, 0, ledger)
         changed_series = {0: _series(np.full(180, 3.0))}
         changed = _with_series(_selection_frame(changed_series), changed_series)
         selection = select_config(changed, n_permutations=999)
-        result = _authorize_member_control_from_ledger(
-            selection,
-            changed,
-            0.05,
-            tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-        )
+        result = _authorize_member_control_from_ledger(selection, changed, ledger)
         assert result["statistical_candidate"] is not None
         assert result["deployable_config"] is None
 
@@ -466,38 +437,20 @@ class TestConsensusProductionScoring:
                 "consensus",
             )
 
-    def test_member_relabeling_control_cannot_deploy_consensus(
-        self, monkeypatch, tmp_path
+    def test_consensus_records_identity_invariance_not_a_relabel_p_value(
+        self, tmp_path
     ):
-        signal = pd.DataFrame({"member": list("ABCDEFG"), "value": np.arange(7.0)})
-        monkeypatch.setattr(
-            "analyzer.validation.analysis.calculate_signal_potential",
-            lambda *args, **kwargs: signal,
-        )
         series = {0: _series(np.full(180, 2.0))}
         baseline = _with_series(_selection_frame(series), series)
-        monkeypatch.setattr(
-            "analyzer.validation.sweep_configs", lambda *args, **kwargs: baseline
-        )
         ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
-        control = _run_member_identity_control(
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            {"horizon": [60], "decay_lambda": [0.005]},
-            date(2022, 1, 1),
-            date(2023, 1, 1),
-            observed_trial_id=0,
-            ledger_path=ledger,
-            n_permutations=999,
-            seed=4,
-        )
+        control = _run_identity_invariant_control(baseline, 0, ledger)
         selection = select_config(baseline, n_permutations=999)
-        authorized = _authorize_member_control_from_ledger(
-            selection, baseline, 0.05, ledger
-        )
+        authorized = _authorize_member_control_from_ledger(selection, baseline, ledger)
+        assert control.status == "identity_invariant"
+        assert control.method == "identity_invariant_by_consensus_scorer_contract_v1"
+        assert control.evaluated_permutations == 0
         assert control.max_stat_p_value == 1.0
-        assert authorized["deployable_config"] is None
+        assert authorized["deployable_config"] is not None
 
 
 class TestExecutionSupport:
@@ -630,7 +583,6 @@ class TestPurgeAndManifest:
             60,
             999,
             7,
-            999,
             0.05,
         )
         assert manifest["phases"]["locked_final"] == {

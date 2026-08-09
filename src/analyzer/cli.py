@@ -1413,20 +1413,15 @@ def validate(
         "--null-samples",
         help="Centered moving-block bootstrap samples (release minimum: 999)",
     ),
-    member_null_samples: int = typer.Option(
-        999,
-        "--member-null-samples",
-        help="Member-identity null draws (exact for small groups; 999 unique for large groups)",
-    ),
 ):
     """
     Purged retrospective validation with dependence-safe corrections.
 
     Sweeps configurations on the purged training phase, then requires both
-    Bonferroni and centered moving-block max-stat bootstrap survival plus a
-    full-family member-identity negative control. Production selection uses only
-    fold-safe consensus scoring with each fold's explicit as-of timestamp; other
-    modes are descriptive. Under-resolved or incomplete nulls fail closed. The
+    Bonferroni and centered moving-block max-stat bootstrap survival. Production
+    selection uses only identity-invariant consensus scoring with each fold's
+    explicit as-of timestamp; member-identity modes are nondeployable diagnostics.
+    Consensus has no member-identity hypothesis. Under-resolved nulls fail closed. The
     2024-2025 test phase is retrospective, not fresh out-of-sample evidence. The
     post-2025 final phase stays locked.
 
@@ -1459,8 +1454,8 @@ def validate(
 
     grid = _validation_grid(full_grid)
 
-    if null_samples < 1 or member_null_samples < 1:
-        print("Error: null sample counts must be positive", file=sys.stderr)
+    if null_samples < 1:
+        print("Error: null sample count must be positive", file=sys.stderr)
         raise typer.Exit(1)
 
     n_trials = 1
@@ -1486,7 +1481,6 @@ def validate(
             grid=grid,
             out_path=out_path,
             n_permutations=null_samples,
-            member_permutations=member_null_samples,
         )
     except Exception:
         logger.exception("Validation failed")

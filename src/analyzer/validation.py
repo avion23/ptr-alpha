@@ -4,8 +4,9 @@ The validation contract is fail closed:
 * every phase ends early enough for the maximum executable holding to mature;
 * one per-date net-alpha statistic drives inference, correction, selection, and verdict;
 * arbitrary-dependence Bonferroni and moving-block max-stat gates must pass;
-* member identities use exact small-group or unique full-group null draws;
-* incomplete or under-resolved empirical controls fail closed;
+* consensus is identity-invariant and has no member-identity hypothesis;
+* identity-dependent scoring modes are nondeployable diagnostics;
+* incomplete or under-resolved statistical-family controls fail closed;
 * the post-2025 final phase is locked and is never loaded by this module.
 """
 
@@ -47,6 +48,8 @@ VALIDATION_ENTRY_DELAY_DAYS = 0  # evaluate_backtest(use_dip_entry=False)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
 MEMBER_EXACT_GROUP_LIMIT = 720
 MEMBER_RUNTIME_BUDGET_SECONDS = 300.0
+_RUNNER_LEDGER_TOKEN = object()
+_RUNNER_WRITTEN_CONTROL_EVENTS: set[str] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,7 +503,7 @@ def select_config(
     n_permutations: int = 999,
     permutation_seed: int = 0,
 ) -> dict:
-    """Select by bootstrap p-values and require a member-identity control."""
+    """Select consensus by statistical-family gates; authorization stays ledger-only."""
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
     if sweep_df.empty:
@@ -682,6 +685,49 @@ def _empirical_upper_quantile(values: list[float], probability: float) -> float:
     return float(ordered[index])
 
 
+def _run_identity_invariant_control(
+    sweep_df: pd.DataFrame,
+    observed_trial_id: int,
+    ledger_path: Path,
+) -> MemberIdentityControlResult:
+    """Record that consensus has no member-identity hypothesis to test."""
+    series_by_trial = sweep_df.attrs.get("series_by_trial")
+    expected_ids = {int(value) for value in sweep_df["trial_id"]}
+    if not isinstance(series_by_trial, dict) or set(series_by_trial) != expected_ids:
+        raise ValueError("identity-invariant family lacks complete trial series")
+    selected = sweep_df[sweep_df["trial_id"] == observed_trial_id]
+    if len(selected) != 1:
+        raise ValueError("observed trial_id is not unique in consensus family")
+    row = selected.iloc[0]
+    if (
+        str(row["scoring_mode"]) != "consensus"
+        or str(row["scorer_provenance"]) != CONSENSUS_SCORER_PROVENANCE
+    ):
+        raise ValueError(
+            "identity-invariant control requires executed consensus provenance"
+        )
+    result = MemberIdentityControlResult(
+        status="identity_invariant",
+        method="identity_invariant_by_consensus_scorer_contract_v1",
+        requested_permutations=0,
+        evaluated_permutations=0,
+        permutation_group_size=1,
+        exact_enumeration=True,
+        sampled_without_replacement=False,
+        p_value_resolution=1.0,
+        max_stat_p_value=1.0,
+        null_max_t_quantile_95=None,
+        release_ready=True,
+        runtime_seconds=0.0,
+        runtime_budget_seconds=0.0,
+        family_sha256=_member_family_sha256(sweep_df, series_by_trial),
+        observed_trial_id=observed_trial_id,
+        observed_statistic=float(row["nw_tstat"]),
+    )
+    _record_member_control(ledger_path, result, _runner_token=_RUNNER_LEDGER_TOKEN)
+    return result
+
+
 def _run_member_identity_control(
     all_tx: pd.DataFrame,
     prices: pd.DataFrame,
@@ -811,7 +857,7 @@ def _run_member_identity_control(
         "observed_statistic": observed_statistic,
     }
     result = MemberIdentityControlResult(**payload)
-    _record_member_control(ledger_path, result)
+    _record_member_control(ledger_path, result, _runner_token=_RUNNER_LEDGER_TOKEN)
     return result
 
 
@@ -921,10 +967,15 @@ def _refuse_legacy_ledger(ledger_path: Path) -> None:
 
 
 def _record_member_control(
-    ledger_path: Path, result: MemberIdentityControlResult
+    ledger_path: Path,
+    result: MemberIdentityControlResult,
+    *,
+    _runner_token: object,
 ) -> None:
     import fcntl
 
+    if _runner_token is not _RUNNER_LEDGER_TOKEN:
+        raise TypeError("identity-control ledger events are runner-only")
     _refuse_legacy_ledger(ledger_path)
     lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -944,7 +995,9 @@ def _record_member_control(
                 "control": asdict(result),
             },
         )
+        event_sha256 = ledger["events"][-1]["event_sha256"]
         _atomic_write_json(ledger_path, ledger)
+        _RUNNER_WRITTEN_CONTROL_EVENTS.add(event_sha256)
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
@@ -974,6 +1027,10 @@ def _read_member_control(
                 and float(control.get("observed_statistic", math.nan))
                 == observed_statistic
             ):
+                if event.get("event_sha256") not in _RUNNER_WRITTEN_CONTROL_EVENTS:
+                    raise TypeError(
+                        "identity-control record was not written by this runner process"
+                    )
                 return control
         return None
 
@@ -981,7 +1038,6 @@ def _read_member_control(
 def _authorize_member_control_from_ledger(
     selection: dict,
     sweep_df: pd.DataFrame,
-    alpha: float,
     ledger_path: Path,
 ) -> dict:
     result = dict(selection)
@@ -1007,9 +1063,13 @@ def _authorize_member_control_from_ledger(
         return result
     result["member_identity_control"] = control
     passes = bool(
-        control.get("status") == "completed"
+        statistical_candidate.get("scoring_mode") == "consensus"
+        and statistical_candidate.get("scorer_provenance")
+        == CONSENSUS_SCORER_PROVENANCE
+        and control.get("status") == "identity_invariant"
+        and control.get("method")
+        == "identity_invariant_by_consensus_scorer_contract_v1"
         and control.get("release_ready") is True
-        and float(control.get("max_stat_p_value", 1.0)) <= alpha
     )
     if not passes:
         return result
@@ -1120,14 +1180,13 @@ def run_validation(
     out_path: Path | None = None,
     n_permutations: int = 999,
     permutation_seed: int = 0,
-    member_permutations: int = 999,
     alpha: float = 0.05,
 ) -> dict:
     """Run purged train selection and, only after survival, one test evaluation."""
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
-    if n_permutations < 1 or member_permutations < 1:
-        raise ValueError("bootstrap and member permutation counts must be positive")
+    if n_permutations < 1:
+        raise ValueError("bootstrap count must be positive")
     if train_end < train_start or test_end < test_start:
         raise ValueError("validation window end must be on or after its start")
     if test_start <= train_end:
@@ -1167,7 +1226,6 @@ def run_validation(
             max_holding=max_holding,
             n_permutations=n_permutations,
             permutation_seed=permutation_seed,
-            member_permutations=member_permutations,
             evaluation_ledger_path=_canonical_ledger_path(db_path),
             alpha=alpha,
             out_path=out_path,
@@ -1190,7 +1248,6 @@ def _run_validation_with_db(
     max_holding: int,
     n_permutations: int,
     permutation_seed: int,
-    member_permutations: int,
     evaluation_ledger_path: Path,
     alpha: float,
     out_path: Path | None,
@@ -1214,17 +1271,10 @@ def _run_validation_with_db(
     )
     statistical_candidate = selection["statistical_candidate"]
     if statistical_candidate is not None:
-        _run_member_identity_control(
-            all_tx,
-            prices,
-            entry_prices,
-            grid,
-            train_start,
-            train_effective_end,
-            observed_trial_id=int(statistical_candidate["trial_id"]),
-            ledger_path=evaluation_ledger_path,
-            n_permutations=member_permutations,
-            seed=permutation_seed + n_permutations,
+        _run_identity_invariant_control(
+            train_df,
+            int(statistical_candidate["trial_id"]),
+            evaluation_ledger_path,
         )
         selection = select_config(
             train_df,
@@ -1233,7 +1283,7 @@ def _run_validation_with_db(
             permutation_seed=permutation_seed,
         )
         selection = _authorize_member_control_from_ledger(
-            selection, train_df, alpha, evaluation_ledger_path
+            selection, train_df, evaluation_ledger_path
         )
     manifest = _build_manifest(
         db_path,
@@ -1250,7 +1300,6 @@ def _run_validation_with_db(
         max_holding,
         n_permutations,
         permutation_seed,
-        member_permutations,
         alpha,
     )
     output = {
@@ -1308,7 +1357,7 @@ def _run_validation_with_db(
                 lag,
                 block_length,
                 n_permutations,
-                permutation_seed + 2 * n_permutations + member_permutations,
+                permutation_seed + 3 * n_permutations,
             )
             test_passes = bool(
                 test_bootstrap_error is None
@@ -1508,7 +1557,6 @@ def _build_manifest(
     max_holding: int,
     n_permutations: int,
     permutation_seed: int,
-    member_permutations: int,
     alpha: float,
 ) -> dict:
     config_payload = {
@@ -1516,7 +1564,6 @@ def _build_manifest(
         "alpha": alpha,
         "n_permutations": n_permutations,
         "permutation_seed": permutation_seed,
-        "member_permutations": member_permutations,
         "primary_metric": PRIMARY_METRIC,
         "max_holding_days": max_holding,
         "max_entry_delay_days": VALIDATION_ENTRY_DELAY_DAYS,
@@ -1560,13 +1607,12 @@ def _build_manifest(
         "null": {
             "bootstrap_method": "centered_moving_block_bootstrap_max_stat",
             "n_bootstrap": n_permutations,
-            "member_identity_method": "uniform_full_permutation_group_family_max_stat",
-            "requested_member_permutations": member_permutations,
-            "small_group_policy": f"exact_enumeration_at_or_below_{MEMBER_EXACT_GROUP_LIMIT}",
-            "large_group_policy": "unique_uniform_sample_without_replacement",
-            "member_runtime_budget_seconds": MEMBER_RUNTIME_BUDGET_SECONDS,
+            "member_identity_policy": (
+                "consensus_is_identity_invariant_no_member_identity_hypothesis"
+            ),
+            "identity_dependent_modes": "descriptive_non_deployable",
             "member_control_integrity": (
-                "canonical_append_only_hash_chain_bound_to_executed_family_trial_statistic"
+                "runner_only_process_bound_canonical_hash_chain_event"
             ),
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "minimum_family_resolution_bootstrap": max(

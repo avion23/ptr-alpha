@@ -287,7 +287,7 @@ class SenateEFDSource(TransactionSource):
         return False
 
     def get_transactions(self, year: int) -> pd.DataFrame:
-        df = self.db.get_transactions(year)
+        df = self.db.get_transactions(year, source="senate_efd")
         if df.empty:
             raise SenateEFDError(
                 f"No cached Senate eFD data for {year}. "

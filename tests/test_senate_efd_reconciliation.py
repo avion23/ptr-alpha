@@ -1184,3 +1184,21 @@ def test_save_rejects_noncanonical_transaction_column_order():
 
     with pytest.raises(SenateEFDError, match="canonical_order=False"):
         source.save_to_db(reordered)
+
+
+def test_get_transactions_filters_cache_to_senate_source():
+    calls = []
+
+    class Database:
+        @staticmethod
+        def get_transactions(year, *, source=None):
+            calls.append((year, source))
+            return pd.DataFrame({"source": [source]})
+
+    source = _source()
+    source.db = Database()
+
+    result = source.get_transactions(2026)
+
+    assert calls == [(2026, "senate_efd")]
+    assert result.iloc[0]["source"] == "senate_efd"

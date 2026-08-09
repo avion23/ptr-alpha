@@ -16,8 +16,6 @@ TARGET_RETURN_COLUMN = "total_spy_alpha_pct"
 TEST_RETURN_COLUMN = "test_excess_return_pct"
 DATA_SCOPE = "mixed_unclassified"
 BUYER_LOOKBACK_DAYS = 28
-MIN_HOLDOUT_DECISION_DATES = 3
-ROBUST_P_VALUE = 0.05
 
 METRICS_TO_TEST = [
     "shrunk_excess_return_pct",

@@ -40,9 +40,12 @@ def main(argv: list[str] | None = None) -> int:
     signals = compute_signals(entry_prices, prices)
     windows = generate_windows(signals)
     if len(windows) < 2:
-        raise RuntimeError("At least two non-overlapping windows are required for a holdout")
+        raise RuntimeError(
+            "At least two non-overlapping windows are required for retrospective validation"
+        )
 
-    # The last chronological window is reserved for position-candidate holdout.
+    # The last window is selection-isolated in this run, but the history was
+    # previously explored and therefore supports retrospective validation only.
     research_windows = windows[:-1]
     all_wf = collect_window_results(signals, research_windows)
     if all_wf.empty:
@@ -72,7 +75,10 @@ def main(argv: list[str] | None = None) -> int:
     write_output(output, args.output)
 
     print(f"Data scope: {DATA_SCOPE}")
-    print(f"Holdout status: {position_research['status']}")
+    print(
+        "Retrospective validation status: "
+        f"{position_research['retrospective_validation_status']}"
+    )
     print("Profitability claim: not established")
     print(f"Elapsed: {time.time() - started:.1f}s")
     return 0

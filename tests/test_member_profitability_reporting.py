@@ -63,22 +63,29 @@ class TestQualifiedResearchLanguage(unittest.TestCase):
             tier_results={"negative": {"alpha_lift": -2.0, "n_windows": 5}},
             position_results={
                 "selected_candidate": {"top_n": 1, "min_buyers": 2},
-                "status": "nonpositive_holdout",
+                "retrospective_validation_status": (
+                    "nonpositive_retrospective_validation"
+                ),
             },
         )
 
         self.assertIsNone(result["best_single_predictor"])
         self.assertIsNone(result["leading_combined_metric"])
         self.assertIsNone(result["leading_positive_tier"])
-        self.assertEqual(result["holdout_status"], "nonpositive_holdout")
+        self.assertEqual(result["retrospective_validation_status"], "nonpositive_retrospective_validation")
         rendered = json.dumps(result).lower()
         self.assertNotIn("optimal", rendered)
         self.assertNotIn("profitable", rendered)
+        self.assertNotIn("holdout", rendered)
+        self.assertNotIn("untouched", rendered)
+        self.assertNotIn("prespecified", rendered)
+        self.assertNotIn("final test", rendered)
+        self.assertIn("retrospective validation", rendered)
 
-    def test_positive_small_holdout_is_explicitly_not_robust(self):
-        from member_profitability.position_sizing import _holdout_status
+    def test_positive_small_retrospective_validation_is_explicitly_not_robust(self):
+        from member_profitability.position_sizing import _retrospective_validation_status
 
-        status = _holdout_status(
+        status = _retrospective_validation_status(
             {
                 "n_eligible_recommendations": 2,
                 "n_evaluable_recommendations": 2,
@@ -89,7 +96,7 @@ class TestQualifiedResearchLanguage(unittest.TestCase):
             }
         )
 
-        self.assertEqual(status, "positive_holdout_not_robust")
+        self.assertEqual(status, "positive_retrospective_validation_not_robust")
 
     def test_json_writer_rejects_nan(self):
         from member_profitability.reporting import write_output

@@ -1,4 +1,4 @@
-"""Chronological candidate selection with a final untouched holdout."""
+"""Chronological candidate selection with retrospective validation."""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from member_profitability.config import (
     BUYER_LOOKBACK_DAYS,
     HORIZON,
     MIN_BUYERS_VALUES,
-    MIN_HOLDOUT_DECISION_DATES,
-    ROBUST_P_VALUE,
     TARGET_RETURN_COLUMN,
     TOP_N_VALUES,
 )
@@ -19,17 +17,18 @@ from member_profitability.walk_forward import _rank_train, _slice_window
 
 
 def position_sizing_grid_search(sigs: pd.DataFrame, windows: list[dict]) -> dict:
-    """Tune candidate-count parameters before evaluating one final holdout.
+    """Tune parameters, then report a selection-isolated retrospective window.
 
-    The final chronological window never participates in parameter selection.
-    Returned recommendations include their decision dates and use only buyers
-    disclosed on or before each date.
+    The last chronological window does not participate in parameter selection
+    in this run. The history has been used by earlier repository research, so
+    this window is retrospective validation, not prospective evidence.
+    Returned recommendations use only buyers disclosed by each decision date.
     """
     if len(windows) < 2:
         return _empty_research_result("insufficient_windows")
 
     selection_windows = windows[:-1]
-    holdout_window = windows[-1]
+    retrospective_validation_window = windows[-1]
     selection_grid: list[dict] = []
     for top_n in TOP_N_VALUES:
         for min_buyers in MIN_BUYERS_VALUES:
@@ -62,25 +61,31 @@ def position_sizing_grid_search(sigs: pd.DataFrame, windows: list[dict]) -> dict
         int(selected["top_n"]),
         int(selected["min_buyers"]),
     )
-    holdout_recommendations = _recommendations_for_windows(
+    retrospective_validation_recommendations = _recommendations_for_windows(
         sigs,
-        [holdout_window],
+        [retrospective_validation_window],
         int(selected["top_n"]),
         int(selected["min_buyers"]),
     )
-    holdout = _summarize_recommendations(holdout_recommendations)
-    status = _holdout_status(holdout)
+    retrospective_validation = _summarize_recommendations(
+        retrospective_validation_recommendations
+    )
+    validation_status = _retrospective_validation_status(retrospective_validation)
     return {
         "selection_window_count": len(selection_windows),
-        "holdout_window": _serialize_window(holdout_window),
+        "retrospective_validation_window": _serialize_window(
+            retrospective_validation_window
+        ),
         "selection_grid": selection_grid,
         "selected_candidate": selected,
         "selection_recommendations": _serialize_recommendations(
             selected_recommendations
         ),
-        "holdout": holdout,
-        "holdout_recommendations": _serialize_recommendations(holdout_recommendations),
-        "status": status,
+        "retrospective_validation": retrospective_validation,
+        "retrospective_validation_recommendations": _serialize_recommendations(
+            retrospective_validation_recommendations
+        ),
+        "retrospective_validation_status": validation_status,
     }
 
 
@@ -288,26 +293,23 @@ def _empty_summary() -> dict:
     }
 
 
-def _holdout_status(holdout: dict) -> str:
-    if holdout["n_eligible_recommendations"] == 0:
-        return "no_holdout_recommendations"
-    if holdout["n_evaluable_recommendations"] == 0:
-        return "holdout_outcomes_unavailable"
-    incomplete = holdout["n_missing_outcome_recommendations"] > 0
-    if holdout["mean_excess_return_pct"] <= 0:
+def _retrospective_validation_status(validation: dict) -> str:
+    if validation["n_eligible_recommendations"] == 0:
+        return "no_retrospective_validation_recommendations"
+    if validation["n_evaluable_recommendations"] == 0:
+        return "retrospective_validation_outcomes_unavailable"
+    incomplete = validation["n_missing_outcome_recommendations"] > 0
+    if validation["mean_excess_return_pct"] <= 0:
         return (
-            "nonpositive_holdout_incomplete_coverage"
+            "nonpositive_retrospective_validation_incomplete_coverage"
             if incomplete
-            else "nonpositive_holdout"
+            else "nonpositive_retrospective_validation"
         )
     if incomplete:
-        return "positive_holdout_incomplete_coverage_not_robust"
-    if (
-        holdout["n_evaluable_decision_dates"] < MIN_HOLDOUT_DECISION_DATES
-        or holdout["one_sided_p_value"] >= ROBUST_P_VALUE
-    ):
-        return "positive_holdout_not_robust"
-    return "positive_holdout_prespecified_test_passed"
+        return "positive_retrospective_validation_incomplete_coverage_not_robust"
+    # This history was previously explored. Even a positive p-value here is
+    # retrospective evidence and cannot establish robustness or profitability.
+    return "positive_retrospective_validation_not_robust"
 
 
 def _serialize_recommendations(recommendations: pd.DataFrame) -> list[dict]:
@@ -326,11 +328,11 @@ def _serialize_window(window: dict) -> dict:
 def _empty_research_result(status: str) -> dict:
     return {
         "selection_window_count": 0,
-        "holdout_window": None,
+        "retrospective_validation_window": None,
         "selection_grid": [],
         "selected_candidate": None,
         "selection_recommendations": [],
-        "holdout": _summarize_recommendations(pd.DataFrame()),
-        "holdout_recommendations": [],
-        "status": status,
+        "retrospective_validation": _summarize_recommendations(pd.DataFrame()),
+        "retrospective_validation_recommendations": [],
+        "retrospective_validation_status": status,
     }

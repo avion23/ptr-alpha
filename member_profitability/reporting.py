@@ -119,7 +119,10 @@ def best_predictors(
     position = position_results if isinstance(position_results, dict) else {}
     findings = [
         "All metric comparisons are exploratory research-window results.",
-        "The final chronological holdout is reported separately and was not used for selection.",
+        (
+            "The last package window is selection-isolated within this run but is "
+            "retrospective validation because this history was used by prior research."
+        ),
         "No profitability claim is established by this analysis.",
     ]
     return {
@@ -127,7 +130,9 @@ def best_predictors(
         "leading_combined_metric": _metric_entry(*leading_combined),
         "leading_positive_tier": _tier_entry(*leading_tier),
         "selected_position_candidate": position.get("selected_candidate"),
-        "holdout_status": position.get("status", "not_evaluated"),
+        "retrospective_validation_status": position.get(
+            "retrospective_validation_status", "not_evaluated"
+        ),
         "key_findings": findings,
     }
 

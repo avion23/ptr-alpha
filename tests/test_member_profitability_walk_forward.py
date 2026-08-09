@@ -186,7 +186,7 @@ class TestPointInTimeCanaries(unittest.TestCase):
         self.assertEqual(without_summary["n_missing_outcome_recommendations"], 1)
 
 
-class TestChronologicalHoldout(unittest.TestCase):
+class TestChronologicalRetrospectiveValidation(unittest.TestCase):
     def test_global_spacing_rejects_whole_boundary_dates_and_preserves_top_n(self):
         from member_profitability.position_sizing import _apply_global_decision_spacing
 
@@ -269,7 +269,7 @@ class TestChronologicalHoldout(unittest.TestCase):
         self.assertEqual(summary["n_evaluable_recommendations"], 1)
         self.assertEqual(summary["n_missing_outcome_recommendations"], 1)
 
-    def test_holdout_outcomes_cannot_change_selected_parameters(self):
+    def test_retrospective_validation_outcomes_cannot_change_selected_parameters(self):
         from member_profitability.position_sizing import position_sizing_grid_search
 
         windows = [
@@ -287,10 +287,10 @@ class TestChronologicalHoldout(unittest.TestCase):
             },
         ]
 
-        def run_with_holdout(holdout_return):
+        def run_with_retrospective_validation(retrospective_validation_return):
             def fake_recommendations(sigs, selected_windows, top_n, min_buyers):
-                is_holdout = selected_windows[0]["test_start"] == pd.Timestamp("2024-07-01")
-                realized = holdout_return if is_holdout else (
+                is_retrospective_validation = selected_windows[0]["test_start"] == pd.Timestamp("2024-07-01")
+                realized = retrospective_validation_return if is_retrospective_validation else (
                     10.0 if (top_n, min_buyers) == (2, 3) else -1.0
                 )
                 return pd.DataFrame(
@@ -306,15 +306,15 @@ class TestChronologicalHoldout(unittest.TestCase):
             ):
                 return position_sizing_grid_search(pd.DataFrame(), windows)
 
-        positive = run_with_holdout(100.0)
-        negative = run_with_holdout(-100.0)
+        positive = run_with_retrospective_validation(100.0)
+        negative = run_with_retrospective_validation(-100.0)
 
         self.assertEqual(positive["selected_candidate"]["top_n"], 2)
         self.assertEqual(positive["selected_candidate"]["min_buyers"], 3)
         self.assertEqual(
             positive["selected_candidate"], negative["selected_candidate"]
         )
-        self.assertNotEqual(positive["holdout"], negative["holdout"])
+        self.assertNotEqual(positive["retrospective_validation"], negative["retrospective_validation"])
 
 
 class TestReadOnlyLoading(unittest.TestCase):
@@ -390,7 +390,7 @@ class TestReadOnlyLoading(unittest.TestCase):
             pd.to_datetime(entries["disclosure_date"]).max(),
             pd.Timestamp("2025-06-30"),
         )
-        for key in ("selection_recommendations", "holdout_recommendations"):
+        for key in ("selection_recommendations", "retrospective_validation_recommendations"):
             dates = pd.Series(
                 sorted(
                     pd.to_datetime(row["decision_date"])

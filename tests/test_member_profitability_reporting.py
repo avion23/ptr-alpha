@@ -80,7 +80,10 @@ class TestQualifiedResearchLanguage(unittest.TestCase):
 
         status = _holdout_status(
             {
-                "n_decision_dates": 2,
+                "n_eligible_recommendations": 2,
+                "n_evaluable_recommendations": 2,
+                "n_missing_outcome_recommendations": 0,
+                "n_evaluable_decision_dates": 2,
                 "mean_excess_return_pct": 5.0,
                 "one_sided_p_value": 0.01,
             }

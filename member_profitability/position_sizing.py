@@ -40,7 +40,9 @@ def position_sizing_grid_search(sigs: pd.DataFrame, windows: list[dict]) -> dict
             summary.update({"top_n": top_n, "min_buyers": min_buyers})
             selection_grid.append(summary)
 
-    eligible = [row for row in selection_grid if row["n_decision_dates"] > 0]
+    eligible = [
+        row for row in selection_grid if row["n_evaluable_decision_dates"] > 0
+    ]
     if not eligible:
         result = _empty_research_result("no_selection_candidates")
         result["selection_grid"] = selection_grid
@@ -49,7 +51,10 @@ def position_sizing_grid_search(sigs: pd.DataFrame, windows: list[dict]) -> dict
 
     selected = max(
         eligible,
-        key=lambda row: (row["mean_excess_return_pct"], row["n_decision_dates"]),
+        key=lambda row: (
+            row["mean_excess_return_pct"],
+            row["n_evaluable_decision_dates"],
+        ),
     )
     holdout_recommendations = _recommendations_for_windows(
         sigs,
@@ -78,12 +83,13 @@ def _recommendations_for_windows(
 ) -> pd.DataFrame:
     results: list[pd.DataFrame] = []
     for window_index, window in enumerate(windows):
-        train_sigs, test_sigs = _slice_window(sigs, window)
+        train_sigs, _ = _slice_window(sigs, window)
         rankings = _rank_train(train_sigs)
         if rankings.empty:
             continue
+        test_events = _disclosed_test_events(sigs, window)
         recommendations = _timestamped_recommendations(
-            test_sigs,
+            test_events,
             rankings,
             top_n,
             min_buyers,
@@ -97,19 +103,36 @@ def _recommendations_for_windows(
     return pd.concat(results, ignore_index=True)
 
 
+def _disclosed_test_events(sigs: pd.DataFrame, window: dict) -> pd.DataFrame:
+    """Return all disclosed test events and mask labels immature at test_end."""
+    disclosure = pd.to_datetime(sigs["disclosure_date"])
+    events = sigs[
+        (disclosure >= window["test_start"])
+        & (disclosure < window["test_end"])
+    ].copy()
+    if events.empty:
+        return events
+    event_disclosure = pd.to_datetime(events["disclosure_date"])
+    mature = event_disclosure + pd.Timedelta(days=HORIZON) <= window["test_end"]
+    if "window_complete" in events.columns:
+        mature &= events["window_complete"].fillna(False).astype(bool)
+    events.loc[~mature, TARGET_RETURN_COLUMN] = np.nan
+    return events
+
+
 def _timestamped_recommendations(
     test_sigs: pd.DataFrame,
     train_rankings: pd.DataFrame,
     top_n: int,
     min_buyers: int,
 ) -> pd.DataFrame:
-    purchases = test_sigs[
-        (test_sigs["signal_type"] == "Purchase")
-        & test_sigs[TARGET_RETURN_COLUMN].notna()
-    ].copy()
+    """Select from disclosed events, then attach any available outcome labels."""
+    purchases = test_sigs[test_sigs["signal_type"] == "Purchase"].copy()
     if purchases.empty:
         return pd.DataFrame()
-    purchases["disclosure_date"] = pd.to_datetime(purchases["disclosure_date"]).dt.normalize()
+    purchases["disclosure_date"] = pd.to_datetime(
+        purchases["disclosure_date"]
+    ).dt.normalize()
     score_by_member = train_rankings.set_index("member")[
         "shrunk_excess_return_pct"
     ].to_dict()
@@ -135,11 +158,6 @@ def _timestamped_recommendations(
             buyer_scores = [score_by_member[b] for b in buyers if b in score_by_member]
             if len(buyer_scores) < min_buyers:
                 continue
-            event_returns = day.loc[
-                day["ticker"] == ticker, TARGET_RETURN_COLUMN
-            ].dropna()
-            if event_returns.empty:
-                continue
             score = float(np.mean(buyer_scores) * np.log1p(len(buyer_scores)))
             if score <= 0:
                 continue
@@ -149,7 +167,6 @@ def _timestamped_recommendations(
                     "ticker": ticker,
                     "rated_buyers": len(buyer_scores),
                     "score": score,
-                    "realized_excess_return_pct": float(event_returns.mean()),
                 }
             )
         if not candidates:
@@ -159,6 +176,10 @@ def _timestamped_recommendations(
             .sort_values(["score", "ticker"], ascending=[False, True])
             .head(top_n)
         )
+        # Selection is complete before labels are read. Missing outcomes affect
+        # evaluation coverage only, never eligibility, buyer counts, or rank.
+        outcomes = day.groupby("ticker", dropna=False)[TARGET_RETURN_COLUMN].mean()
+        selected["realized_excess_return_pct"] = selected["ticker"].map(outcomes)
         rows.extend(selected.to_dict("records"))
         # Outcomes of consecutive decisions must not overlap.
         last_decision = decision_date
@@ -167,14 +188,44 @@ def _timestamped_recommendations(
 
 def _summarize_recommendations(recommendations: pd.DataFrame) -> dict:
     if recommendations.empty:
-        return {
-            "n_recommendations": 0,
-            "n_decision_dates": 0,
-            "mean_excess_return_pct": 0.0,
-            "win_rate_pct": 0.0,
-            "one_sided_p_value": 1.0,
-        }
-    per_date = recommendations.groupby("decision_date")[
+        return _empty_summary()
+
+    eligible_recommendations = int(len(recommendations))
+    eligible_dates = int(recommendations["decision_date"].nunique())
+    evaluable = recommendations[
+        recommendations["realized_excess_return_pct"].notna()
+    ]
+    evaluable_recommendations = int(len(evaluable))
+    evaluable_dates = int(evaluable["decision_date"].nunique())
+    missing = recommendations[
+        recommendations["realized_excess_return_pct"].isna()
+    ]
+    missing_dates = int(missing["decision_date"].nunique())
+    base = {
+        "n_eligible_recommendations": eligible_recommendations,
+        "n_evaluable_recommendations": evaluable_recommendations,
+        "n_missing_outcome_recommendations": (
+            eligible_recommendations - evaluable_recommendations
+        ),
+        "n_eligible_decision_dates": eligible_dates,
+        "n_evaluable_decision_dates": evaluable_dates,
+        "n_missing_outcome_decision_dates": missing_dates,
+        "n_unevaluable_decision_dates": eligible_dates - evaluable_dates,
+        "evaluation_coverage_pct": round(
+            evaluable_recommendations / eligible_recommendations * 100,
+            1,
+        ),
+        # Backward-readable aliases. Their denominators are explicit above.
+        "n_recommendations": eligible_recommendations,
+        "n_decision_dates": evaluable_dates,
+        "mean_excess_return_pct": 0.0,
+        "win_rate_pct": 0.0,
+        "one_sided_p_value": 1.0,
+    }
+    if evaluable.empty:
+        return base
+
+    per_date = evaluable.groupby("decision_date")[
         "realized_excess_return_pct"
     ].mean()
     mean_return = float(per_date.mean())
@@ -182,22 +233,50 @@ def _summarize_recommendations(recommendations: pd.DataFrame) -> dict:
     if len(per_date) >= 2 and float(per_date.std(ddof=1)) > 0:
         test = stats.ttest_1samp(per_date, popmean=0.0, alternative="greater")
         p_value = float(test.pvalue)
+    base.update(
+        {
+            "mean_excess_return_pct": round(mean_return, 4),
+            "win_rate_pct": round(float((per_date > 0).mean() * 100), 1),
+            "one_sided_p_value": round(p_value, 6),
+        }
+    )
+    return base
+
+
+def _empty_summary() -> dict:
     return {
-        "n_recommendations": int(len(recommendations)),
-        "n_decision_dates": int(len(per_date)),
-        "mean_excess_return_pct": round(mean_return, 4),
-        "win_rate_pct": round(float((per_date > 0).mean() * 100), 1),
-        "one_sided_p_value": round(p_value, 6),
+        "n_eligible_recommendations": 0,
+        "n_evaluable_recommendations": 0,
+        "n_missing_outcome_recommendations": 0,
+        "n_eligible_decision_dates": 0,
+        "n_evaluable_decision_dates": 0,
+        "n_missing_outcome_decision_dates": 0,
+        "n_unevaluable_decision_dates": 0,
+        "evaluation_coverage_pct": 0.0,
+        "n_recommendations": 0,
+        "n_decision_dates": 0,
+        "mean_excess_return_pct": 0.0,
+        "win_rate_pct": 0.0,
+        "one_sided_p_value": 1.0,
     }
 
 
 def _holdout_status(holdout: dict) -> str:
-    if holdout["n_decision_dates"] == 0:
+    if holdout["n_eligible_recommendations"] == 0:
         return "no_holdout_recommendations"
+    if holdout["n_evaluable_recommendations"] == 0:
+        return "holdout_outcomes_unavailable"
+    incomplete = holdout["n_missing_outcome_recommendations"] > 0
     if holdout["mean_excess_return_pct"] <= 0:
-        return "nonpositive_holdout"
+        return (
+            "nonpositive_holdout_incomplete_coverage"
+            if incomplete
+            else "nonpositive_holdout"
+        )
+    if incomplete:
+        return "positive_holdout_incomplete_coverage_not_robust"
     if (
-        holdout["n_decision_dates"] < MIN_HOLDOUT_DECISION_DATES
+        holdout["n_evaluable_decision_dates"] < MIN_HOLDOUT_DECISION_DATES
         or holdout["one_sided_p_value"] >= ROBUST_P_VALUE
     ):
         return "positive_holdout_not_robust"
@@ -209,6 +288,7 @@ def _serialize_recommendations(recommendations: pd.DataFrame) -> list[dict]:
         return []
     result = recommendations.copy()
     result["decision_date"] = pd.to_datetime(result["decision_date"]).dt.strftime("%Y-%m-%d")
+    result = result.astype(object).where(pd.notna(result), None)
     return result.to_dict("records")
 
 

@@ -145,6 +145,44 @@ class TestPointInTimeCanaries(unittest.TestCase):
         self.assertEqual(recs.iloc[0]["rated_buyers"], 2)
         self.assertEqual(recs.iloc[0]["realized_excess_return_pct"], 2.0)
 
+    def test_missing_outcome_changes_coverage_not_candidate_universe(self):
+        from member_profitability.position_sizing import (
+            _summarize_recommendations,
+            _timestamped_recommendations,
+        )
+
+        disclosed = _signal_rows(
+            [
+                ("BUYER", "A", "2024-07-01", 4.0),
+                ("BUYER", "B", "2024-07-01", 4.0),
+            ]
+        )
+        rankings = pd.DataFrame(
+            {"member": ["BUYER"], "shrunk_excess_return_pct": [2.0]}
+        )
+        with_outcome = _timestamped_recommendations(
+            disclosed, rankings, top_n=1, min_buyers=1
+        )
+        missing = disclosed.copy()
+        missing.loc[missing["ticker"] == "A", "total_spy_alpha_pct"] = float("nan")
+        without_outcome = _timestamped_recommendations(
+            missing, rankings, top_n=1, min_buyers=1
+        )
+
+        selection_columns = ["decision_date", "ticker", "rated_buyers", "score"]
+        pd.testing.assert_frame_equal(
+            with_outcome[selection_columns].reset_index(drop=True),
+            without_outcome[selection_columns].reset_index(drop=True),
+        )
+        self.assertEqual(with_outcome.iloc[0]["ticker"], "A")
+        with_summary = _summarize_recommendations(with_outcome)
+        without_summary = _summarize_recommendations(without_outcome)
+        self.assertEqual(with_summary["n_eligible_recommendations"], 1)
+        self.assertEqual(without_summary["n_eligible_recommendations"], 1)
+        self.assertEqual(with_summary["n_evaluable_recommendations"], 1)
+        self.assertEqual(without_summary["n_evaluable_recommendations"], 0)
+        self.assertEqual(without_summary["n_missing_outcome_recommendations"], 1)
+
 
 class TestChronologicalHoldout(unittest.TestCase):
     def test_holdout_outcomes_cannot_change_selected_parameters(self):

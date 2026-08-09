@@ -53,5 +53,58 @@ class TestBestPredictors(unittest.TestCase):
         self.assertTrue(len(out["key_findings"]) > 0)
 
 
+class TestQualifiedResearchLanguage(unittest.TestCase):
+    def test_negative_results_are_not_called_optimal_or_profitable(self):
+        from member_profitability.reporting import best_predictors
+
+        result = best_predictors(
+            correlations={"negative": {"mean_spearman": -0.4, "n_windows": 5}},
+            combined_results={"negative_combo": [-0.3, -0.2]},
+            tier_results={"negative": {"alpha_lift": -2.0, "n_windows": 5}},
+            position_results={
+                "selected_candidate": {"top_n": 1, "min_buyers": 2},
+                "retrospective_validation_status": (
+                    "nonpositive_retrospective_validation"
+                ),
+            },
+        )
+
+        self.assertIsNone(result["best_single_predictor"])
+        self.assertIsNone(result["leading_combined_metric"])
+        self.assertIsNone(result["leading_positive_tier"])
+        self.assertEqual(result["retrospective_validation_status"], "nonpositive_retrospective_validation")
+        rendered = json.dumps(result).lower()
+        self.assertNotIn("optimal", rendered)
+        self.assertNotIn("profitable", rendered)
+        self.assertNotIn("holdout", rendered)
+        self.assertNotIn("untouched", rendered)
+        self.assertNotIn("prespecified", rendered)
+        self.assertNotIn("final test", rendered)
+        self.assertIn("retrospective validation", rendered)
+
+    def test_positive_small_retrospective_validation_is_explicitly_not_robust(self):
+        from member_profitability.position_sizing import _retrospective_validation_status
+
+        status = _retrospective_validation_status(
+            {
+                "n_eligible_recommendations": 2,
+                "n_evaluable_recommendations": 2,
+                "n_missing_outcome_recommendations": 0,
+                "n_evaluable_decision_dates": 2,
+                "mean_excess_return_pct": 5.0,
+                "one_sided_p_value": 0.01,
+            }
+        )
+
+        self.assertEqual(status, "positive_retrospective_validation_not_robust")
+
+    def test_json_writer_rejects_nan(self):
+        from member_profitability.reporting import write_output
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                write_output({"invalid": float("nan")}, Path(tmp) / "out.json")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -147,7 +147,7 @@ def get_current_price(ticker: str):
 def get_congressional(ticker: str):
     """Return congressional transactions for ticker, de-duplicated (issue M4).
 
-    The raw `transactions` table contains known phantom duplicate-row groups
+    The canonical transaction scope can contain legacy duplicate-row groups
     (see scripts/purge_phantom_rows.py). We de-dup on
     (member, ticker, transaction_date, transaction_type, disclosure_date) so
     that n_buys and match tests are not inflated.
@@ -162,7 +162,7 @@ def get_congressional(ticker: str):
                 )
                     member, ticker, transaction_date, disclosure_date,
                     transaction_type, owner_code, amount_raw
-                FROM transactions
+                FROM canonical_transactions
                 WHERE LOWER(ticker) = LOWER(?)
                 ORDER BY member, ticker, transaction_date,
                          transaction_type, disclosure_date

@@ -104,13 +104,24 @@ class TestAnalysis(unittest.TestCase):
             }
         )
 
-        score = score_ticker_by_buyers("AAPL", transactions, signals)
+        score = score_ticker_by_buyers(
+            "AAPL",
+            transactions,
+            signals,
+            as_of_date=pd.Timestamp("2024-02-01"),
+        )
 
-        self.assertEqual(score.iloc[0]["base_signal_score"], 10.0)
+        expected_consensus = np.exp(-0.03 * 29) + np.exp(-0.03 * 28)
+        self.assertEqual(
+            score.iloc[0]["base_signal_score"], round(expected_consensus, 2)
+        )
+        self.assertEqual(score.iloc[0]["scoring_mode"], "consensus")
         self.assertGreater(score.iloc[0]["size_factor"], 1.0)
         self.assertLess(score.iloc[0]["owner_factor"], 1.0)
         self.assertAlmostEqual(
-            score.iloc[0]["signal_score_raw"], score.iloc[0]["base_signal_score"]
+            score.iloc[0]["signal_score_raw"],
+            score.iloc[0]["base_signal_score"],
+            places=2,
         )
 
     def test_calculate_signal_potential_empty_input(self):
@@ -169,6 +180,7 @@ class TestAnalysis(unittest.TestCase):
                 "decayed_return_pct": [-50.0, 50.0],
                 "peak_potential_pct": [-40.0, 60.0],
                 "spy_alpha_pct": [-45.0, 45.0],
+                "total_spy_alpha_pct": [-45.0, 45.0],
             }
         )
 
@@ -327,7 +339,11 @@ class TestAnalysis(unittest.TestCase):
         )
 
         score = score_ticker_by_buyers(
-            "AAPL", transactions, signals, member_rankings=member_rankings
+            "AAPL",
+            transactions,
+            signals,
+            member_rankings=member_rankings,
+            scoring_mode="shrunk_alpha",
         )
 
         # New: recency-only weights (no sqrt-trades, no bayes_win_prob multiplication)
@@ -374,7 +390,11 @@ class TestAnalysis(unittest.TestCase):
         )
 
         score = score_ticker_by_buyers(
-            "AAPL", transactions, signals, member_rankings=member_rankings
+            "AAPL",
+            transactions,
+            signals,
+            member_rankings=member_rankings,
+            scoring_mode="shrunk_alpha",
         )
 
         # With recency-only weights, avg_buyer_performance is a recency-weighted
@@ -434,6 +454,7 @@ class TestAnalysis(unittest.TestCase):
             signals,
             member_rankings=member_rankings,
             min_buyers=3,
+            as_of_date=pd.Timestamp("2024-02-01"),
         )
 
         self.assertEqual(score.iloc[0]["num_buyers"], 2)
@@ -449,6 +470,7 @@ class TestAnalysis(unittest.TestCase):
                 "decayed_return_pct": [10.0, float("nan")],
                 "peak_potential_pct": [12.0, float("nan")],
                 "spy_alpha_pct": [10.0, float("nan")],
+                "total_spy_alpha_pct": [10.0, float("nan")],
             }
         )
 
@@ -695,6 +717,7 @@ class TestEpisodeCollapse(unittest.TestCase):
                 "decayed_return_pct": [10.0, 12.0, 8.0, 5.0],
                 "peak_potential_pct": [15.0] * 4,
                 "spy_alpha_pct": [5.0, 7.0, 3.0, 2.0],
+                "total_spy_alpha_pct": [5.0, 7.0, 3.0, 2.0],
                 "entry_price": [100.0] * 4,
             }
         )
@@ -702,9 +725,7 @@ class TestEpisodeCollapse(unittest.TestCase):
         self.assertEqual(rankings.iloc[0]["purchase_trades"], 2)
 
 
-class TestSoloBuyerSkillGate(unittest.TestCase):
-    """Tests for the min_buyers=1 solo-buyer skill gate in score_ticker_by_buyers."""
-
+class TestSoloBuyerConsensusScoring(unittest.TestCase):
     def _make_solo_setup(self, posterior_lift: float):
         transactions = pd.DataFrame(
             {
@@ -713,8 +734,6 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
                 "transaction_date": pd.to_datetime(["2024-01-01"]),
                 "disclosure_date": pd.to_datetime(["2024-01-03"]),
                 "transaction_type": ["Purchase"],
-                "owner_code": [None],
-                "amount_midpoint": [50000.0],
             }
         )
         member_rankings = pd.DataFrame(
@@ -726,225 +745,48 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
                 "posterior_lift": [posterior_lift],
             }
         )
-        signals = pd.DataFrame(
-            {
-                "member": ["Pelosi"],
-                "ticker": ["AVGO"],
-                "signal_type": ["Purchase"],
-                "horizon_days": [90],
-                "decayed_return_pct": [20.0],
-                "peak_potential_pct": [25.0],
-                "spy_alpha_pct": [20.0],
-            }
-        )
+        signals = pd.DataFrame({"member": ["diagnostic-only"]})
         return transactions, member_rankings, signals
 
-    def test_high_skill_solo_buyer_passes_gate_with_penalty(self):
-        transactions, member_rankings, signals = self._make_solo_setup(1.7)
+    def test_solo_score_does_not_depend_on_member_posterior(self):
+        low_tx, low_rankings, signals = self._make_solo_setup(0.1)
+        high_tx, high_rankings, _ = self._make_solo_setup(10.0)
+
+        low = score_ticker_by_buyers(
+            "AVGO",
+            low_tx,
+            signals,
+            member_rankings=low_rankings,
+            min_buyers=1,
+            as_of_date=pd.Timestamp("2024-02-01"),
+        )
+        high = score_ticker_by_buyers(
+            "AVGO",
+            high_tx,
+            signals,
+            member_rankings=high_rankings,
+            min_buyers=1,
+            as_of_date=pd.Timestamp("2024-02-01"),
+        )
+
+        expected = round(np.exp(-0.03 * 29), 2)
+        self.assertEqual(low.iloc[0]["signal_score"], expected)
+        self.assertEqual(low.iloc[0]["signal_score"], high.iloc[0]["signal_score"])
+
+    def test_minimum_distinct_buyer_gate_remains(self):
+        transactions, rankings, signals = self._make_solo_setup(10.0)
 
         score = score_ticker_by_buyers(
             "AVGO",
             transactions,
             signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-        )
-
-        self.assertGreater(score.iloc[0]["signal_score"], 0.0)
-        self.assertEqual(score.iloc[0]["num_buyers"], 1)
-        # The solo-buyer penalty scales the Bayesian posterior directly.
-        base = score.iloc[0]["base_signal_score"]
-        penalized = score.iloc[0]["signal_score"]
-        expected = round(base * 0.8, 2)
-        self.assertAlmostEqual(penalized, expected, places=1)
-        self.assertTrue(score.iloc[0]["solo_buyer"])
-
-    def test_low_skill_solo_buyer_rejected(self):
-        transactions, member_rankings, signals = self._make_solo_setup(0.5)
-
-        score = score_ticker_by_buyers(
-            "AVGO",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-        )
-
-        self.assertEqual(score.iloc[0]["signal_score"], 0.0)
-        self.assertIn("note", score.columns)
-        self.assertIn("skill threshold", score.iloc[0]["note"])
-
-    def test_threshold_boundary_passes(self):
-        # posterior_lift exactly at threshold (1.0) passes (not < threshold).
-        transactions, member_rankings, signals = self._make_solo_setup(1.0)
-
-        score = score_ticker_by_buyers(
-            "AVGO",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-            solo_buyer_skill_threshold=1.0,
-        )
-
-        self.assertGreater(score.iloc[0]["signal_score"], 0.0)
-        self.assertTrue(score.iloc[0]["solo_buyer"])
-
-    def test_custom_threshold_can_reject_default_passer(self):
-        # posterior_lift=1.3 passes default 1.0 but fails stricter 1.4.
-        transactions, member_rankings, signals = self._make_solo_setup(1.3)
-
-        strict = score_ticker_by_buyers(
-            "AVGO",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-            solo_buyer_skill_threshold=1.4,
-        )
-        self.assertEqual(strict.iloc[0]["signal_score"], 0.0)
-
-        default = score_ticker_by_buyers(
-            "AVGO",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-        )
-        self.assertGreater(default.iloc[0]["signal_score"], 0.0)
-
-    def test_min_buyers_ge_2_unchanged_by_solo_gate(self):
-        # Single buyer with min_buyers=2 still rejected via the original path,
-        # regardless of solo_buyer_skill_threshold.
-        transactions, member_rankings, signals = self._make_solo_setup(1.9)
-
-        score = score_ticker_by_buyers(
-            "AVGO",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
+            member_rankings=rankings,
             min_buyers=2,
-            solo_buyer_skill_threshold=1.0,
+            as_of_date=pd.Timestamp("2024-02-01"),
         )
 
         self.assertEqual(score.iloc[0]["signal_score"], 0.0)
-        self.assertEqual(score.iloc[0]["num_buyers"], 1)
         self.assertIn("minimum buyer threshold", score.iloc[0]["note"])
-
-    def test_two_buyers_with_min_buyers_1_no_penalty(self):
-        # min_buyers=1 with 2 buyers: solo gate does not fire, no penalty.
-        transactions = pd.DataFrame(
-            {
-                "member": ["Alice", "Bob"],
-                "ticker": ["AAPL", "AAPL"],
-                "transaction_date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
-                "disclosure_date": pd.to_datetime(["2024-01-03", "2024-01-04"]),
-                "transaction_type": ["Purchase", "Purchase"],
-            }
-        )
-        member_rankings = pd.DataFrame(
-            {
-                "member": ["Alice", "Bob"],
-                "avg_spy_alpha_pct": [10.0, 8.0],
-                "purchase_trades": [3, 2],
-                "bayes_win_prob": [0.55, 0.50],
-            }
-        )
-        signals = pd.DataFrame(
-            {
-                "member": ["Alice", "Bob"],
-                "ticker": ["AAPL", "AAPL"],
-                "signal_type": ["Purchase", "Purchase"],
-                "horizon_days": [90, 90],
-                "decayed_return_pct": [10.0, 8.0],
-                "peak_potential_pct": [12.0, 10.0],
-                "spy_alpha_pct": [10.0, 8.0],
-            }
-        )
-
-        score = score_ticker_by_buyers(
-            "AAPL",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-        )
-
-        self.assertGreater(score.iloc[0]["signal_score"], 0.0)
-        self.assertFalse(score.iloc[0]["solo_buyer"])
-        self.assertEqual(score.iloc[0]["num_buyers"], 2)
-
-    def test_unrated_solo_buyer_rejected(self):
-        # Buyer not present in member_rankings → bayes_win_prob unknown → reject.
-        transactions = pd.DataFrame(
-            {
-                "member": ["Newbie"],
-                "ticker": ["AAPL"],
-                "transaction_date": pd.to_datetime(["2024-01-01"]),
-                "disclosure_date": pd.to_datetime(["2024-01-03"]),
-                "transaction_type": ["Purchase"],
-            }
-        )
-        member_rankings = pd.DataFrame(
-            {
-                "member": ["OtherMember"],
-                "avg_spy_alpha_pct": [10.0],
-                "purchase_trades": [3],
-                "bayes_win_prob": [0.90],
-            }
-        )
-        signals = pd.DataFrame(
-            {
-                "member": ["OtherMember"],
-                "ticker": ["AAPL"],
-                "signal_type": ["Purchase"],
-                "horizon_days": [90],
-                "decayed_return_pct": [10.0],
-                "peak_potential_pct": [12.0],
-                "spy_alpha_pct": [10.0],
-            }
-        )
-
-        score = score_ticker_by_buyers(
-            "AAPL",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-        )
-
-        self.assertEqual(score.iloc[0]["signal_score"], 0.0)
-
-    def test_threshold_zero_disables_gate(self):
-        # solo_buyer_skill_threshold=0 disables the gate entirely.
-        transactions, member_rankings, signals = self._make_solo_setup(0.10)
-        score = score_ticker_by_buyers(
-            "AVGO",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-            solo_buyer_skill_threshold=0.0,
-        )
-
-        self.assertGreater(score.iloc[0]["signal_score"], 0.0)
-        self.assertFalse(score.iloc[0]["solo_buyer"])
-
-    def test_custom_penalty_multiplier(self):
-        transactions, member_rankings, signals = self._make_solo_setup(1.7)
-
-        score = score_ticker_by_buyers(
-            "AVGO",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            min_buyers=1,
-            solo_buyer_penalty=0.5,
-        )
-
-        base = score.iloc[0]["base_signal_score"]
-        expected = round(base * 0.5, 2)
-        self.assertAlmostEqual(score.iloc[0]["signal_score"], expected, places=1)
 
 
 if __name__ == "__main__":

@@ -84,3 +84,18 @@ def canonical_member_key(name: str) -> str:
 
     # Step 4: keep only FIRST + LAST
     return f"{tokens[0]} {tokens[-1]}"
+
+
+def chamber_scoped_member_key(name: str, chamber: str) -> str:
+    """Scope a lossy canonical name key to its filing chamber.
+
+    This is a grouping key, not a person identity. An official member ID and
+    service-date dimension are still required to distinguish same-name people.
+    """
+    chamber_key = str(chamber).strip().lower()
+    if chamber_key not in {"house", "senate"}:
+        raise ValueError(f"Unsupported chamber: {chamber!r}")
+    member_key = canonical_member_key(name)
+    if not member_key:
+        return ""
+    return f"{chamber_key}:{member_key}"

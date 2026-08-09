@@ -39,8 +39,8 @@ def bonferroni_correction(n_tests: int, alpha: float = 0.05) -> float:
     """
     if n_tests <= 0:
         raise ValueError(f"n_tests must be positive, got {n_tests}")
-    if alpha <= 0:
-        raise ValueError(f"alpha must be positive, got {alpha}")
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be between zero and one, got {alpha}")
     return alpha / n_tests
 
 
@@ -65,8 +65,8 @@ def benjamini_hochberg(
     p = np.asarray(p_values, dtype=float)
     if p.size == 0:
         raise ValueError("p_values must not be empty")
-    if alpha <= 0:
-        raise ValueError(f"alpha must be positive, got {alpha}")
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be between zero and one, got {alpha}")
 
     n = len(p)
     # Sort p-values and track original indices
@@ -88,6 +88,143 @@ def benjamini_hochberg(
     rejected = np.zeros(n, dtype=bool)
     rejected[sorted_indices[:max_rank]] = True
     return rejected
+
+
+@dataclass(frozen=True, slots=True)
+class MaxStatBootstrapResult:
+    """Centered moving-block bootstrap output for a family of strategies."""
+
+    marginal_p_values: np.ndarray
+    adjusted_p_values: np.ndarray
+    observed_statistics: np.ndarray
+    null_statistics: np.ndarray
+    null_max_statistics: np.ndarray
+    n_bootstrap: int
+    seed: int
+    assumptions: tuple[str, ...]
+
+
+def _hac_tstat(values: np.ndarray, lag: int) -> float:
+    """HAC t-statistic used internally to avoid a validation import cycle."""
+    x = np.asarray(values, dtype=float)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 2:
+        return 0.0
+    lag = max(0, min(int(lag), n - 1))
+    mean = float(x.mean())
+    demeaned = x - mean
+    gamma = np.array(
+        [np.dot(demeaned[k:], demeaned[: n - k]) / n for k in range(lag + 1)]
+    )
+    if lag == 0:
+        long_run_variance = float(gamma[0])
+    else:
+        weights = 1.0 - np.arange(1, lag + 1) / (lag + 1)
+        long_run_variance = float(gamma[0] + 2.0 * np.dot(weights, gamma[1:]))
+    standard_error = math.sqrt(max(long_run_variance, 0.0) / n)
+    if standard_error < 1e-14:
+        if mean > 0:
+            return math.inf
+        if mean < 0:
+            return -math.inf
+        return 0.0
+    return float(mean / standard_error)
+
+
+def max_stat_moving_block_bootstrap(
+    series_by_trial: dict[int, pd.Series],
+    lags_by_trial: dict[int, int],
+    block_lengths_by_trial: dict[int, int],
+    *,
+    n_bootstrap: int,
+    seed: int,
+) -> MaxStatBootstrapResult:
+    """Centered one-sided moving-block bootstrap with a family max statistic.
+
+    Each trial is centered under its zero-mean null. Shared block-start uniforms
+    are used across trials, preserving local serial order and cross-trial
+    dependence for aligned schedules. Configurations with different frequencies
+    use the same uniforms mapped to their own ordinal schedule. Bonferroni remains
+    the arbitrary-dependence gate; max-stat is an additional empirical gate.
+
+    The bootstrap is refused unless each series contains at least two complete
+    blocks. This prevents an asymptotic p-value from replacing inadequate null
+    support.
+    """
+    if not series_by_trial:
+        raise ValueError("series_by_trial must not be empty")
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be positive")
+    trial_ids = sorted(series_by_trial)
+    expected = set(trial_ids)
+    if set(lags_by_trial) != expected or set(block_lengths_by_trial) != expected:
+        raise ValueError(
+            "lags and block lengths must match every actual trial_id exactly"
+        )
+
+    centered: dict[int, np.ndarray] = {}
+    observed = np.empty(len(trial_ids), dtype=float)
+    blocks_needed = 0
+    for position, trial_id in enumerate(trial_ids):
+        values = pd.Series(series_by_trial[trial_id], dtype=float).dropna().to_numpy()
+        block_length = int(block_lengths_by_trial[trial_id])
+        if block_length < 1:
+            raise ValueError("block lengths must be positive")
+        if len(values) < 2 * block_length:
+            raise ValueError(
+                f"trial {trial_id} has {len(values)} observations; "
+                f"at least {2 * block_length} are required for two blocks"
+            )
+        centered[trial_id] = values - float(values.mean())
+        observed[position] = _hac_tstat(values, lags_by_trial[trial_id])
+        blocks_needed = max(blocks_needed, math.ceil(len(values) / block_length))
+
+    rng = np.random.default_rng(seed)
+    shared_uniforms = rng.random((n_bootstrap, blocks_needed))
+    null_statistics = np.empty((n_bootstrap, len(trial_ids)), dtype=float)
+    for bootstrap_index in range(n_bootstrap):
+        for position, trial_id in enumerate(trial_ids):
+            values = centered[trial_id]
+            block_length = int(block_lengths_by_trial[trial_id])
+            n_starts = len(values) - block_length + 1
+            n_blocks = math.ceil(len(values) / block_length)
+            samples = []
+            for uniform in shared_uniforms[bootstrap_index, :n_blocks]:
+                start = min(int(uniform * n_starts), n_starts - 1)
+                samples.append(values[start : start + block_length])
+            bootstrap_values = np.concatenate(samples)[: len(values)]
+            null_statistics[bootstrap_index, position] = _hac_tstat(
+                bootstrap_values, lags_by_trial[trial_id]
+            )
+    null_max = np.max(null_statistics, axis=1)
+    marginal = np.asarray(
+        [
+            (1.0 + float(np.sum(null_statistics[:, position] >= statistic)))
+            / (n_bootstrap + 1.0)
+            for position, statistic in enumerate(observed)
+        ]
+    )
+    adjusted = np.asarray(
+        [
+            (1.0 + float(np.sum(null_max >= statistic))) / (n_bootstrap + 1.0)
+            for statistic in observed
+        ]
+    )
+    return MaxStatBootstrapResult(
+        marginal_p_values=marginal,
+        adjusted_p_values=adjusted,
+        observed_statistics=observed,
+        null_statistics=null_statistics,
+        null_max_statistics=null_max,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+        assumptions=(
+            "per-date net-alpha series is locally stationary within moving blocks",
+            "ordinal schedules with different frequencies share dependence through block-start uniforms",
+            "Bonferroni is the controlling arbitrary-dependence gate",
+        ),
+    )
 
 
 def deflated_sharpe_ratio(
@@ -157,6 +294,8 @@ def _expected_max_sharpe(
 
     where γ ≈ 0.5772 is the Euler-Mascheroni constant.
     """
+    if n_trials == 1:
+        return 0.0
     gamma = 0.5772156649015329  # Euler-Mascheroni constant
 
     # Base term: expected max of n iid standard normals
@@ -197,6 +336,8 @@ def min_backtest_length(
     Returns:
         Minimum number of years of data required.
     """
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
     if sharpe <= 0:
         return float("inf")  # Cannot achieve significance with non-positive Sharpe
 
@@ -273,6 +414,9 @@ class SnoopingReport:
     significant_dsr: bool
 
     min_years: float
+    max_stat_p_value: float = 1.0
+    deployable: bool = False
+    inference_method: str = "centered_moving_block_bootstrap_bonferroni_max_stat"
 
     @property
     def significant_bonferroni_any(self) -> bool:
@@ -283,96 +427,122 @@ class SnoopingReport:
 def analyze_snooping(
     sweep_results: pd.DataFrame,
     best_config: dict | None = None,
-    n_tests: int = 648,
+    n_tests: int | None = None,
     alpha: float = 0.05,
+    *,
+    per_date_returns: dict[int, pd.Series] | None = None,
+    lags_by_trial: dict[int, int] | None = None,
+    block_lengths_by_trial: dict[int, int] | None = None,
+    n_permutations: int = 999,
+    seed: int = 0,
 ) -> SnoopingReport:
-    """Run the full snooping analysis on sweep results.
+    """Analyze one requested configuration from a complete family of returns.
 
-    Args:
-        sweep_results: DataFrame from the parameter sweep.
-        best_config: Dict of parameters identifying the best config.
-            If None, uses the config with highest alpha_slope.
-        n_tests: Total number of hypotheses tested (default 648).
-        alpha: Significance level (default 0.05).
-
-    Returns:
-        SnoopingReport with all corrections applied.
+    Every family row must carry a unique ``trial_id`` and callers must provide
+    exactly one return series, lag, and block length for each actual ID. Summary
+    rows, lone series, positional guesses, missing IDs, and extra IDs are
+    refused. All rewarded p-values come from the centered moving-block bootstrap.
     """
-    if best_config is not None:
-        mask = pd.Series(True, index=sweep_results.index)
-        for k, v in best_config.items():
-            mask &= sweep_results[k] == v
-        best_row = sweep_results[mask]
-        if best_row.empty:
-            raise ValueError(f"No matching config found for {best_config}")
-        row = best_row.iloc[0]
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
+    if sweep_results.empty:
+        raise ValueError("sweep_results must not be empty")
+    if "trial_id" not in sweep_results.columns:
+        raise ValueError("sweep_results must contain actual trial_id values")
+    trial_ids = [int(value) for value in sweep_results["trial_id"]]
+    if len(set(trial_ids)) != len(trial_ids):
+        raise ValueError("trial_id values must be unique")
+    actual_ids = set(trial_ids)
+    if not isinstance(per_date_returns, dict) or set(per_date_returns) != actual_ids:
+        raise ValueError(
+            "per_date_returns must be a complete dict keyed by actual trial_id"
+        )
+    if not isinstance(lags_by_trial, dict) or set(lags_by_trial) != actual_ids:
+        raise ValueError("lags_by_trial must match every actual trial_id exactly")
+    if (
+        not isinstance(block_lengths_by_trial, dict)
+        or set(block_lengths_by_trial) != actual_ids
+    ):
+        raise ValueError(
+            "block_lengths_by_trial must match every actual trial_id exactly"
+        )
+    trials = len(sweep_results)
+    if n_tests is not None and int(n_tests) != trials:
+        raise ValueError("n_tests must equal the complete supplied family size")
+
+    if best_config is None:
+        row_position = int(
+            np.argmax(sweep_results["overall_alpha"].to_numpy(dtype=float))
+        )
     else:
-        row = sweep_results.loc[sweep_results["alpha_slope"].idxmax()]
+        mask = pd.Series(True, index=sweep_results.index)
+        for key, value in best_config.items():
+            if key not in sweep_results.columns:
+                raise ValueError(f"Unknown config key: {key}")
+            mask &= sweep_results[key] == value
+        positions = np.flatnonzero(mask.to_numpy())
+        if len(positions) == 0:
+            raise ValueError(f"No matching config found for {best_config}")
+        row_position = int(positions[0])
+    row = sweep_results.iloc[row_position]
+    selected_trial_id = int(row["trial_id"])
 
-    alpha_slope = float(row["alpha_slope"])
-    overall_alpha = float(row["overall_alpha"])
-    sharpe = float(row["sharpe"])
-    dates_evaluated = int(row.get("dates_evaluated", 0))
+    bootstrap = max_stat_moving_block_bootstrap(
+        {
+            int(key): pd.Series(value, dtype=float)
+            for key, value in per_date_returns.items()
+        },
+        {int(key): int(value) for key, value in lags_by_trial.items()},
+        {int(key): int(value) for key, value in block_lengths_by_trial.items()},
+        n_bootstrap=n_permutations,
+        seed=seed,
+    )
+    ordered_ids = sorted(actual_ids)
+    selected_position = ordered_ids.index(selected_trial_id)
+    statistic = float(bootstrap.observed_statistics[selected_position])
+    bootstrap_p = float(bootstrap.marginal_p_values[selected_position])
+    max_stat_p = float(bootstrap.adjusted_p_values[selected_position])
+    bonferroni_threshold = bonferroni_correction(trials, alpha)
+    significant_bonferroni = bootstrap_p <= bonferroni_threshold
+    selected_series = pd.Series(
+        per_date_returns[selected_trial_id], dtype=float
+    ).dropna()
+    # This public diagnostic has no access to the production member-identity
+    # runner result and therefore can never authorize deployment.
+    deployable = False
 
-    # --- T-test on alpha_slope ---
-    # Use the sweep-wide std of alpha_slope as a proxy for within-strategy std
-    all_std = float(sweep_results["alpha_slope"].std())
-    all_mean = float(sweep_results["alpha_slope"].mean())
-    n_obs = max(dates_evaluated, 2)
-
-    # Estimate within-strategy std: use the sweep std scaled by sqrt(N)
-    # This is a conservative estimate; ideally we'd have per-period alphas.
-    t_stat, p_raw = alpha_ttest(alpha_slope, all_std, n_obs)
-
-    # --- Bonferroni ---
-    bonf_thresh = bonferroni_correction(n_tests, alpha)
-    sig_bonf = p_raw < bonf_thresh
-
-    # --- Benjamini-Hochberg ---
-    # Convert all configs' alpha_slope to pseudo-p-values using the sweep distribution
-    all_slopes = sweep_results["alpha_slope"].values
-    all_t_stats = (all_slopes - all_mean) / (all_std / math.sqrt(n_obs))
-    all_p_values = 2 * (1 - stats.t.cdf(np.abs(all_t_stats), df=n_obs - 1))
-    bh_rejected = benjamini_hochberg(all_p_values, alpha)
-
-    # Find our config's position
-    best_idx = int(sweep_results["alpha_slope"].idxmax())
-    bh_our_rejected = bool(bh_rejected[best_idx])
-
-    # --- Deflated Sharpe Ratio ---
-    skew = float(sweep_results["sharpe"].skew()) if len(sweep_results) > 2 else 0.0
-    kurt = (
-        float(sweep_results["sharpe"].kurtosis()) + 3.0
-        if len(sweep_results) > 3
+    clean = selected_series.to_numpy(dtype=float)
+    observed_sharpe = float(row.get("sharpe", 0.0))
+    skew = float(stats.skew(clean, bias=False)) if len(clean) > 2 else 0.0
+    kurtosis = (
+        float(stats.kurtosis(clean, fisher=False, bias=False))
+        if len(clean) > 3
         else 3.0
     )
     dsr = deflated_sharpe_ratio(
-        observed_sharpe=sharpe,
-        n_trials=n_tests,
-        n_observations=n_obs,
-        skew=skew,
-        kurtosis=kurt,
+        observed_sharpe=observed_sharpe,
+        n_trials=trials,
+        n_observations=max(len(clean), 1),
+        skew=skew if math.isfinite(skew) else 0.0,
+        kurtosis=kurtosis if math.isfinite(kurtosis) else 3.0,
     )
-    sig_dsr = dsr > 0.95  # 95% confidence threshold
-
-    # --- Minimum backtest length ---
-    min_yrs = min_backtest_length(sharpe, alpha=alpha)
-
     return SnoopingReport(
-        n_tests=n_tests,
-        alpha_slope=alpha_slope,
-        overall_alpha=overall_alpha,
-        sharpe=sharpe,
-        n_observations=n_obs,
-        dates_evaluated=dates_evaluated,
-        t_statistic=t_stat,
-        p_value_raw=p_raw,
-        bonferroni_threshold=bonf_thresh,
-        p_value_bonferroni=min(p_raw * n_tests, 1.0),
-        significant_bonferroni=sig_bonf,
-        bh_rejected=bh_our_rejected,
-        bh_adjusted_alpha=alpha,
+        n_tests=trials,
+        alpha_slope=float(row.get("alpha_slope", 0.0)),
+        overall_alpha=float(selected_series.mean()) if len(clean) else 0.0,
+        sharpe=observed_sharpe,
+        n_observations=len(clean),
+        dates_evaluated=len(clean),
+        t_statistic=statistic,
+        p_value_raw=bootstrap_p,
+        bonferroni_threshold=bonferroni_threshold,
+        p_value_bonferroni=min(bootstrap_p * trials, 1.0),
+        significant_bonferroni=significant_bonferroni,
+        bh_rejected=False,
+        bh_adjusted_alpha=bonferroni_threshold,
         dsr=dsr,
-        significant_dsr=sig_dsr,
-        min_years=min_yrs,
+        significant_dsr=dsr > 0.95,
+        min_years=min_backtest_length(observed_sharpe, alpha=alpha),
+        max_stat_p_value=max_stat_p,
+        deployable=deployable,
     )

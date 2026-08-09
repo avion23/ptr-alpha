@@ -1,5 +1,7 @@
+import numpy as np
 import pandas as pd
 
+from analyzer.member_ranking.bayes import normal_normal_posteriors
 from analyzer.signals.filters import _collapse_to_episodes
 
 
@@ -50,3 +52,21 @@ def test_episode_does_not_chain_past_fourteen_days():
 
     assert len(collapsed) == 2
     assert collapsed["episode_count"].tolist() == [2, 1]
+
+
+def test_normal_normal_fit_is_scale_equivariant_at_one_millionth():
+    outcomes = np.array([1.0, 2.0, -1.0, 0.0])
+    groups = np.array(["A", "A", "B", "B"])
+    base = normal_normal_posteriors(outcomes, groups, prior_strength=2.0)
+    scaled = normal_normal_posteriors(outcomes * 1e-6, groups, prior_strength=2.0)
+
+    np.testing.assert_allclose(
+        scaled["posterior_mean"], base["posterior_mean"] * 1e-6, rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        scaled["posterior_std"], base["posterior_std"] * 1e-6, rtol=1e-12
+    )
+    np.testing.assert_allclose(scaled["shrinkage"], base["shrinkage"], rtol=1e-12)
+    np.testing.assert_allclose(
+        scaled["effective_information"], base["effective_information"]
+    )

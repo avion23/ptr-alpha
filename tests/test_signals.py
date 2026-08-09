@@ -141,6 +141,23 @@ class TestCalculateSignalPotential(unittest.TestCase):
         result = calculate_signal_potential(entry, self.prices_df, [30])
         self.assertTrue(pd.notna(result.iloc[0]["total_spy_alpha_pct"]))
 
+    def test_preserves_asset_and_contract_metadata(self):
+        entry = self.entry_prices.iloc[[0]].copy()
+        entry["instrument_type"] = "call"
+        entry["strike_price"] = 20.0
+        entry["expiry_date"] = "01/16/2026"
+        entry["asset_description"] = "Tempus AI (TEM) [OP]"
+        entry["raw_asset_class"] = "OP"
+        entry["ticker_origin"] = "official"
+        result = calculate_signal_potential(entry, self.prices_df, [30])
+        row = result.iloc[0]
+        self.assertEqual(row["instrument_type"], "call")
+        self.assertEqual(row["strike_price"], 20.0)
+        self.assertEqual(row["expiry_date"], "01/16/2026")
+        self.assertEqual(row["asset_description"], "Tempus AI (TEM) [OP]")
+        self.assertEqual(row["raw_asset_class"], "OP")
+        self.assertEqual(row["ticker_origin"], "official")
+
 
 class TestGetTopSignals(unittest.TestCase):
     def _make_signals(self) -> pd.DataFrame:

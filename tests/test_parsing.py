@@ -1,4 +1,10 @@
+import os
 import unittest
+import hashlib
+import sys
+from pathlib import Path
+from types import ModuleType
+from unittest.mock import patch
 import pandas as pd
 from analyzer.parsing import (
     clean_text,
@@ -17,6 +23,70 @@ class TestParsing(unittest.TestCase):
 
         self.assertEqual(len(transactions), 1)
         self.assertEqual(transactions[0]["ticker"], "AAPL")
+
+    def test_pdfplumber_flattened_rows_do_not_pollute_following_asset(self):
+        from analyzer.parsing.pdfplumber_parser import (
+            _expand_flattened_transaction_rows,
+        )
+
+        table = [
+            [
+                "ID",
+                "Owner",
+                "Asset",
+                "Transaction Type",
+                "Date",
+                "Notification Date",
+                "Amount",
+            ],
+            [
+                "Abbott Laboratories Common Stock P 06/16/2026 07/02/2026 "
+                "$1,001 - $15,000\n(ABT) [ST]\nF S: New\nS O: Trust Account",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+            ["", "", "F S: New\nS O: Trust Account", "", "", "", ""],
+            [
+                "",
+                "",
+                "Accenture plc Class A Ordinary Shares (ACN) [ST]",
+                "P",
+                "06/16/2026",
+                "07/02/2026",
+                "$1,001 - $15,000",
+            ],
+        ]
+
+        transactions = parse_pdf_table(_expand_flattened_transaction_rows(table))
+
+        self.assertEqual([tx["ticker"] for tx in transactions], ["ABT", "ACN"])
+        self.assertEqual(
+            transactions[1]["asset_description"],
+            "Accenture plc Class A Ordinary Shares (ACN) [ST]",
+        )
+
+    def test_reparse_rejects_prior_2026_emitted_persisted_loss(self):
+        import os
+
+        previous = os.environ.get("PTR_SKIP_DOCLING")
+        try:
+            from scripts.reparse_all import _verify_persisted_counts
+        finally:
+            if previous is None:
+                os.environ.pop("PTR_SKIP_DOCLING", None)
+            else:
+                os.environ["PTR_SKIP_DOCLING"] = previous
+
+        with self.assertRaisesRegex(RuntimeError, "corpus=2698/2632"):
+            _verify_persisted_counts(
+                2026,
+                {"corpus": 2698},
+                {"corpus": 2632},
+            )
 
     def test_clean_text_basic(self):
         self.assertEqual(clean_text("  hello   world  "), "hello world")
@@ -235,6 +305,8 @@ class TestParsing(unittest.TestCase):
                     "owner_code": "DC",
                     "amount_raw": "$1,001 - $15,000",
                     "amount_midpoint": 8000.5,
+                    "asset_description": "Packaging Corporation of America (PKG)",
+                    "source_row_id": "pdfplumber:p1:l23",
                 }
             ]
         }
@@ -251,6 +323,11 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(df.iloc[0]["owner_code"], "DC")
         self.assertEqual(df.iloc[0]["amount_raw"], "$1,001 - $15,000")
         self.assertAlmostEqual(df.iloc[0]["amount_midpoint"], 8000.5)
+        self.assertEqual(
+            df.iloc[0]["asset_description"],
+            "Packaging Corporation of America (PKG)",
+        )
+        self.assertEqual(df.iloc[0]["source_row_id"], "pdfplumber:p1:l23")
 
     def test_consolidate_transactions_empty(self):
         df = consolidate_transactions({}, {})
@@ -482,6 +559,160 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(transactions[0]["instrument_type"], "put")
         self.assertEqual(transactions[0]["ticker"], "TSLA")
 
+    def test_real_option_canaries_use_asset_code_without_guessing_direction(self):
+        # 20026590: [OP] proves option, but direction lives in a separate note.
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            ["Amazon.com, Inc. - Common Stock (AMZN) [OP]", "Purchase", "2025-01-14"],
+            ["Stock Option (BRK.B)", "Sale", "2025-01-15"],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(
+            [tx["instrument_type"] for tx in transactions], ["option", "option"]
+        )
+
+    def test_real_option_canary_parses_strike_and_two_digit_expiry(self):
+        # 20026590 wording.
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            [
+                "Tempus AI (TEM) [OP] Purchased 50 call options with a strike price of $20 and an expiration date of 1/16/26.",
+                "Purchase",
+                "2025-01-14",
+            ],
+        ]
+        transaction = parse_pdf_table(table)[0]
+        self.assertEqual(transaction["instrument_type"], "call")
+        self.assertEqual(transaction["strike_price"], 20.0)
+        self.assertEqual(transaction["expiry_date"], "01/16/2026")
+
+    def test_prior_option_note_cannot_change_current_stock_row(self):
+        # 20026590/20034694 parser joins can put the previous note before [ST].
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            [
+                "D: Purchased 50 call options with a strike price of $150 and an expiration date of 1/16/26. NVIDIA Corporation (NVDA) [ST]",
+                "Sale",
+                "2024-12-31",
+            ],
+        ]
+        transaction = parse_pdf_table(table)[0]
+        self.assertEqual(transaction["instrument_type"], "stock")
+        self.assertIsNone(transaction["strike_price"])
+        self.assertIsNone(transaction["expiry_date"])
+
+    def test_option_note_before_marker_cannot_supply_contract_terms(self):
+        # 20026590: flattened prefix text may belong to the preceding row.
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            [
+                "D: Purchased 50 call options with a strike price of $80 and an expiration date of 1/16/26. Tempus AI (TEM) [OP]",
+                "Purchase",
+                "2025-01-14",
+            ],
+        ]
+        transaction = parse_pdf_table(table)[0]
+        self.assertEqual(transaction["instrument_type"], "option")
+        self.assertIsNone(transaction["strike_price"])
+        self.assertIsNone(transaction["expiry_date"])
+
+    def test_real_nokia_and_ge_option_notes(self):
+        # 20034694 wording once the note is attached to its own [OP] row.
+        table = [
+            ["Asset Name", "Transaction Type", "Transaction Date"],
+            [
+                "GE Aerospace Common Stock (GE) [OP] D: Call option contracts",
+                "Sale",
+                "2026-06-16",
+            ],
+            ["Nokia (NOK) [OP] D: Put Option", "Sale", "2026-07-06"],
+        ]
+        transactions = parse_pdf_table(table)
+        self.assertEqual(
+            [tx["instrument_type"] for tx in transactions], ["call", "put"]
+        )
+
+    def test_real_pdf_safety_canaries(self):
+        from analyzer.parser_cascade import _parse_pdf_worker
+
+        data_root = next(
+            (
+                parent / "data"
+                for parent in Path(__file__).resolve().parents
+                if (parent / "data").is_dir()
+            ),
+            None,
+        )
+        if data_root is None:
+            self.skipTest("real disclosure artifacts are not available")
+
+        previous = os.environ.get("PTR_SKIP_DOCLING")
+        os.environ["PTR_SKIP_DOCLING"] = "1"
+        try:
+            option_rows = _parse_pdf_worker(
+                data_root / "2025" / "pdfs" / "20026590.pdf"
+            )[1]
+            nokia_rows = _parse_pdf_worker(
+                data_root / "2026" / "pdfs" / "20034694.pdf"
+            )[1]
+            berkshire_rows = _parse_pdf_worker(
+                data_root / "2026" / "pdfs" / "20034348.pdf"
+            )[1]
+            arlp_rows = [
+                row
+                for doc_id in ("20034095", "20034670")
+                for row in _parse_pdf_worker(
+                    data_root / "2026" / "pdfs" / f"{doc_id}.pdf"
+                )[1]
+            ]
+            fund_rows = _parse_pdf_worker(data_root / "2025" / "pdfs" / "20030630.pdf")[
+                1
+            ]
+        finally:
+            if previous is None:
+                os.environ.pop("PTR_SKIP_DOCLING", None)
+            else:
+                os.environ["PTR_SKIP_DOCLING"] = previous
+
+        self.assertEqual(
+            [
+                (
+                    row["ticker"],
+                    row["instrument_type"],
+                    row["strike_price"],
+                    row["expiry_date"],
+                )
+                for row in option_rows
+            ],
+            [
+                ("GOOGL", "option", None, None),
+                ("AMZN", "option", None, None),
+                ("AAPL", "stock", None, None),
+                ("NVDA", "stock", None, None),
+                ("NVDA", "stock", None, None),
+                ("NVDA", "option", None, None),
+                ("PANW", "stock", None, None),
+                ("TEM", "option", None, None),
+                ("VST", "option", None, None),
+
+            ],
+        )
+        self.assertEqual(
+            [(row["ticker"], row["instrument_type"]) for row in nokia_rows],
+            [
+                ("BAC", "stock"),
+                ("GE", "stock"),
+                ("NOK", "stock"),
+                ("NOK", "stock"),
+                ("NOK", "stock"),
+                ("NOK", "stock"),
+            ],
+
+        )
+        self.assertIn("BRK.B", {row["ticker"] for row in berkshire_rows})
+        self.assertNotIn("ALLI", {row["ticker"] for row in arlp_rows})
+        self.assertNotIn("MATT", {row["ticker"] for row in fund_rows})
+
     def test_parse_pdf_table_exchange_type(self):
         table = [
             ["Asset Name", "Transaction Type", "Transaction Date"],
@@ -506,3 +737,341 @@ class TestParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLocalOcrCanaries(unittest.TestCase):
+    def test_tickerless_legacy_two_digit_year(self):
+        from analyzer.parsing.ocr_parser import _parse_ocr_text_to_rows
+
+        rows = _parse_ocr_text_to_rows(
+            "Acme Private Fund [ST] P 01/15/24 $1,001 - $15,000"
+        )
+        self.assertEqual(
+            rows,
+            [["Acme Private Fund", "Purchase", "01/15/24", "$1,001 - $15,000"]],
+        )
+
+    def test_partial_first_orientation_is_reconciled_with_rotated_rows(self):
+        from analyzer.parsing.ocr_parser import extract_tables_with_ocr
+
+        class Image:
+            def __init__(self, name):
+                self.name = name
+
+            def rotate(self, angle, expand):
+                self.assert_rotate = (angle, expand)
+                return Image("rotated")
+
+            def close(self):
+                pass
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi: [Image("original")]
+        pytesseract = ModuleType("pytesseract")
+        pytesseract.image_to_osd = lambda image: "Rotate: 90\n"
+        pytesseract.image_to_string = lambda image: (
+            "Apple (AAPL) P 01/15/24 $1,001 - $15,000"
+            if image.name == "original"
+            else "Microsoft P 01/16/24 $15,001 - $50,000"
+        )
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            tables = extract_tables_with_ocr(Path("canary.pdf"))
+
+        self.assertEqual(len(tables[0]), 3)
+        self.assertEqual(tables[0][1][0], "Apple (AAPL)")
+        self.assertEqual(tables[0][2][0], "Microsoft")
+
+    def test_orientation_failure_preserves_first_pass_rows_as_incomplete(self):
+        from analyzer.parsing.ocr_parser import (
+            OcrIncompleteError,
+            extract_tables_with_ocr,
+        )
+
+        class Image:
+            def close(self):
+                pass
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi: [Image()]
+        pytesseract = ModuleType("pytesseract")
+        pytesseract.image_to_string = lambda image: (
+            "Apple (AAPL) P 01/15/24 $1,001 - $15,000"
+        )
+        pytesseract.image_to_osd = lambda image: (_ for _ in ()).throw(
+            RuntimeError("osd unavailable")
+        )
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            with self.assertRaises(OcrIncompleteError) as raised:
+                extract_tables_with_ocr(Path("orientation.pdf"))
+        self.assertEqual(raised.exception.partial_tables[0][1][0], "Apple (AAPL)")
+
+    def test_zero_and_partial_page_ocr_are_incomplete(self):
+        from analyzer.parsing.ocr_parser import (
+            OcrIncompleteError,
+            extract_tables_with_ocr,
+        )
+
+        class Image:
+            def __init__(self, page):
+                self.page = page
+
+            def close(self):
+                pass
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi: [Image(1), Image(2)]
+        pytesseract = ModuleType("pytesseract")
+        pytesseract.image_to_string = lambda image: (
+            "Apple (AAPL) P 01/15/24 $1,001 - $15,000" if image.page == 1 else ""
+        )
+        pytesseract.image_to_osd = lambda image: "Rotate: 0\n"
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            with self.assertRaisesRegex(OcrIncompleteError, "page 2") as raised:
+                extract_tables_with_ocr(Path("partial.pdf"))
+        self.assertEqual(len(raised.exception.partial_tables[0]), 2)
+
+    def test_backend_failure_is_not_true_zero(self):
+        from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi: (_ for _ in ()).throw(
+            ValueError("corrupt")
+        )
+        pytesseract = ModuleType("pytesseract")
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            with self.assertRaisesRegex(OcrBackendError, "failed to rasterize"):
+                extract_tables_with_ocr(Path("corrupt.pdf"))
+
+    def test_cascade_compares_all_text_engines_and_prefers_complete_trusted_tie(self):
+        from analyzer import parser_cascade
+
+        def transactions(count):
+            return [
+                {
+                    "transaction_date": f"2024-01-{index + 1:02d}",
+                    "transaction_type": "Purchase",
+                    "amount_midpoint": 8000,
+                    "asset_description": f"Asset {index}",
+                }
+                for index in range(count)
+            ]
+
+        with (
+            patch.object(
+                parser_cascade, "_try_pdfplumber", return_value=transactions(2)
+            ),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(
+                parser_cascade, "_try_camelot_stream", return_value=transactions(4)
+            ),
+            patch.object(
+                parser_cascade, "_try_pdftotext", return_value=transactions(4)
+            ),
+        ):
+            _, result, engines = parser_cascade._parse_pdf_worker(Path("canary.pdf"))
+
+        self.assertEqual(len(result), 4)
+        self.assertIn("won:pdftotext", engines)
+        self.assertTrue(any(item.startswith("row_disagreement:") for item in engines))
+
+    def test_cascade_reconciles_complementary_rows_only_after_complete_ocr(self):
+        from analyzer import parser_cascade
+
+        def tx(asset):
+            return {
+                "transaction_date": "2024-01-01",
+                "transaction_type": "Purchase",
+                "amount_midpoint": 8000,
+                "asset_description": asset,
+            }
+
+        with (
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=[tx("A")]),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[tx("B")]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=[]),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(
+                parser_cascade, "_try_tesseract", return_value=[tx("A"), tx("B")]
+            ),
+        ):
+            _, rows, engines = parser_cascade._parse_pdf_worker(Path("complement.pdf"))
+        self.assertEqual({row["asset_description"] for row in rows}, {"A", "B"})
+        self.assertIn("won:reconciled_complete_ocr", engines)
+
+    def test_disjoint_or_single_text_engine_is_unresolved_without_complete_ocr(self):
+        from analyzer import parser_cascade
+
+        def tx(asset):
+            return {
+                "transaction_date": "2024-01-01",
+                "transaction_type": "Purchase",
+                "amount_midpoint": 8000,
+                "asset_description": asset,
+            }
+
+        scenarios = [
+            ([tx("A")], [tx("B")]),
+            ([], [tx("Only")]),
+        ]
+        for pdfplumber_rows, pdftotext_rows in scenarios:
+            with (
+                patch.object(
+                    parser_cascade, "_try_pdfplumber", return_value=pdfplumber_rows
+                ),
+                patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+                patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+                patch.object(
+                    parser_cascade, "_try_pdftotext", return_value=pdftotext_rows
+                ),
+                patch.object(parser_cascade, "_try_docling", return_value=[]),
+                patch.object(
+                    parser_cascade,
+                    "_try_tesseract",
+                    side_effect=parser_cascade.ParserBackendError(
+                        "ocr", RuntimeError("incomplete")
+                    ),
+                ),
+            ):
+                with self.assertRaises(parser_cascade.ParserCascadeError):
+                    parser_cascade._parse_pdf_worker(Path("uncertain.pdf"))
+
+    def test_seventeen_plus_three_complements_require_complete_ocr(self):
+        from analyzer import parser_cascade
+
+        def tx(index):
+            return {
+                "ticker": f"T{index}",
+                "transaction_date": "2024-01-01",
+                "transaction_type": "Purchase",
+                "amount_midpoint": 8000,
+                "asset_description": f"Asset {index}",
+            }
+
+        shared = [tx(index) for index in range(17)]
+        first = shared + [tx(index) for index in range(17, 20)]
+        second = shared + [tx(index) for index in range(20, 23)]
+        corroborated = [tx(index) for index in range(23)]
+        with (
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=first),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=second),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(parser_cascade, "_try_tesseract", return_value=corroborated),
+        ):
+            _, rows, engines = parser_cascade._parse_pdf_worker(Path("17-plus-3.pdf"))
+        self.assertEqual(len(rows), 23)
+        self.assertIn("won:reconciled_complete_ocr", engines)
+
+    def test_reconciliation_preserves_maximum_source_lot_multiplicity(self):
+        from analyzer import parser_cascade
+
+        row = {
+            "transaction_date": "2024-01-01",
+            "transaction_type": "Purchase",
+            "amount_midpoint": 8000,
+            "asset_description": "A",
+        }
+        with (
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=[row] * 5),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=[row]),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(parser_cascade, "_try_tesseract", return_value=[row]),
+        ):
+            _, rows, _ = parser_cascade._parse_pdf_worker(Path("duplicates.pdf"))
+        self.assertEqual(rows, [row] * 5)
+
+    def test_known_real_pdf_hash_and_row_count_canaries(self):
+        from analyzer.parser_cascade import _parse_pdf_worker
+
+        data_dir_value = os.environ.get("PTR_OCR_CANARY_DATA")
+        if not data_dir_value:
+            self.skipTest("set PTR_OCR_CANARY_DATA to run local corpus canaries")
+        data_dir = Path(data_dir_value)
+        expected = {
+            "20030977": (
+                "76053146c191866009c30ba05b192e472aac616195137db9f5ea0e87274da39a",
+                224,
+            ),
+            "20033737": (
+                "0b717e5a003cba305e42bcafc6e37042e45fdba7b8c4b9c6ca3528237eeef6b9",
+                16,
+            ),
+            "20033921": (
+                "b486c612866c86738cc2810f34aaa1613c20e537daac4d5a467ee02da889f96d",
+                15,
+            ),
+        }
+        for doc_id, (expected_hash, expected_count) in expected.items():
+            matches = list(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            self.assertEqual(len(matches), 1, doc_id)
+            pdf = matches[0]
+            self.assertEqual(
+                hashlib.sha256(pdf.read_bytes()).hexdigest(), expected_hash
+            )
+            with patch.dict(os.environ, {"PTR_SKIP_DOCLING": "1"}):
+                _, rows, engines = _parse_pdf_worker(pdf)
+            self.assertEqual(len(rows), expected_count, (doc_id, engines))
+            self.assertIn("won:pdftotext", engines)
+
+        scan_hashes = {
+            "8221322": "26f1ce2fb7823d2e84ea4fbde24514c5c6371b43a828720d50f21b1c8c7ad314",
+            "9115808": "05b2fa3becd71c9bb141690130708079407e52a6e169cdacf42a467e09e0bda5",
+            "9115813": "737955c7c26c497eda37f4378e1af51409b6231204a82d7ae2c3f25c10e0ae84",
+            "9116141": "716cdcc10bd57c400f10d8bb4133eb667931a9699fb1835ed3b7deca010a36a1",
+        }
+        for doc_id, expected_hash in scan_hashes.items():
+            matches = list(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            self.assertEqual(len(matches), 1, doc_id)
+            self.assertEqual(
+                hashlib.sha256(matches[0].read_bytes()).hexdigest(), expected_hash
+            )
+
+        from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
+
+        scan_truth = {
+            "9115808": (1, "spdr", "03/31/26"),
+            "9115813": (9, "richmond", "04/15/26"),
+            "9116141": (134, "whittier", "05/11/26"),
+        }
+        for doc_id, (
+            expected_count,
+            asset_fragment,
+            expected_date,
+        ) in scan_truth.items():
+            pdf = next(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            try:
+                tables = extract_tables_with_ocr(pdf)
+            except OcrBackendError:
+                continue
+            rows = tables[0][1:]
+            self.assertEqual(len(rows), expected_count, doc_id)
+            self.assertTrue(
+                any(
+                    asset_fragment in row[0].casefold() and row[2] == expected_date
+                    for row in rows
+                ),
+                doc_id,
+            )
+
+        from scripts.ocr_zero_rows import get_ocr_work_items
+
+        database_path = data_dir / "congress.duckdb"
+        unresolved = get_ocr_work_items(
+            db_path=str(database_path),
+            data_dir=data_dir,
+            year=2026,
+            require_schema=False,
+        )
+        self.assertIn("8221322", {doc_id for doc_id, _, _ in unresolved})

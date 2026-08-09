@@ -1,156 +1,338 @@
-"""Position-sizing grid search: pick top_n tickers by composite buyer score.
-
-For each (top_n, min_buyers) combo, walks through every window, ranks test-
-period tickers by their buyer-score (mean shrunk_alpha across rated buyers),
-picks the top_n, and accumulates realized alpha. Reports per-combo stats
-plus the best by sharpe_proxy.
-"""
+"""Chronological candidate selection with retrospective validation."""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from member_profitability.config import (
+    BUYER_LOOKBACK_DAYS,
+    HORIZON,
     MIN_BUYERS_VALUES,
+    TARGET_RETURN_COLUMN,
     TOP_N_VALUES,
 )
-from member_profitability.walk_forward import _slice_window, _rank_train
+from member_profitability.walk_forward import _rank_train, _slice_window
 
 
-def position_sizing_grid_search(sigs: pd.DataFrame, windows: list[dict]) -> list[dict]:
-    """Run a grid search over (top_n, min_buyers) for the position-sizing recommendation.
+def position_sizing_grid_search(sigs: pd.DataFrame, windows: list[dict]) -> dict:
+    """Tune parameters, then report a selection-isolated retrospective window.
 
-    Returns a list of per-combo result dicts (one per top_n × min_buyers combo).
+    The last chronological window does not participate in parameter selection
+    in this run. The history has been used by earlier repository research, so
+    this window is retrospective validation, not prospective evidence.
+    Returned recommendations use only buyers disclosed by each decision date.
     """
-    position_results: list[dict] = []
+    if len(windows) < 2:
+        return _empty_research_result("insufficient_windows")
+
+    selection_windows = windows[:-1]
+    retrospective_validation_window = windows[-1]
+    selection_grid: list[dict] = []
     for top_n in TOP_N_VALUES:
         for min_buyers in MIN_BUYERS_VALUES:
-            window_returns, window_wins, window_total = _evaluate_grid(
-                sigs, windows, top_n, min_buyers,
+            recommendations = _recommendations_for_windows(
+                sigs, selection_windows, top_n, min_buyers
             )
-            if window_returns:
-                position_results.append(_summarize_grid_result(
-                    window_returns, window_wins, window_total, top_n, min_buyers,
-                ))
-    return position_results
+            summary = _summarize_recommendations(recommendations)
+            summary.update({"top_n": top_n, "min_buyers": min_buyers})
+            selection_grid.append(summary)
+
+    eligible = [
+        row for row in selection_grid if row["n_evaluable_decision_dates"] > 0
+    ]
+    if not eligible:
+        result = _empty_research_result("no_selection_candidates")
+        result["selection_grid"] = selection_grid
+        result["selection_window_count"] = len(selection_windows)
+        return result
+
+    selected = max(
+        eligible,
+        key=lambda row: (
+            row["mean_excess_return_pct"],
+            row["n_evaluable_decision_dates"],
+        ),
+    )
+    selected_recommendations = _recommendations_for_windows(
+        sigs,
+        selection_windows,
+        int(selected["top_n"]),
+        int(selected["min_buyers"]),
+    )
+    retrospective_validation_recommendations = _recommendations_for_windows(
+        sigs,
+        [retrospective_validation_window],
+        int(selected["top_n"]),
+        int(selected["min_buyers"]),
+    )
+    retrospective_validation = _summarize_recommendations(
+        retrospective_validation_recommendations
+    )
+    validation_status = _retrospective_validation_status(retrospective_validation)
+    return {
+        "selection_window_count": len(selection_windows),
+        "retrospective_validation_window": _serialize_window(
+            retrospective_validation_window
+        ),
+        "selection_grid": selection_grid,
+        "selected_candidate": selected,
+        "selection_recommendations": _serialize_recommendations(
+            selected_recommendations
+        ),
+        "retrospective_validation": retrospective_validation,
+        "retrospective_validation_recommendations": _serialize_recommendations(
+            retrospective_validation_recommendations
+        ),
+        "retrospective_validation_status": validation_status,
+    }
 
 
-def _evaluate_grid(
+def _recommendations_for_windows(
     sigs: pd.DataFrame,
     windows: list[dict],
     top_n: int,
     min_buyers: int,
-) -> tuple[list[float], int, int]:
-    window_returns: list[float] = []
-    window_wins = 0
-    window_total = 0
-    for w in windows:
-        train_sigs, test_sigs = _slice_window(sigs, w)
-        if train_sigs.empty or test_sigs.empty:
+) -> pd.DataFrame:
+    results: list[pd.DataFrame] = []
+    for window_index, window in enumerate(windows):
+        train_sigs, _ = _slice_window(sigs, window)
+        rankings = _rank_train(train_sigs)
+        if rankings.empty:
             continue
-
-        train_rankings = _rank_train(train_sigs)
-        if train_rankings.empty:
+        test_events = _disclosed_test_events(sigs, window)
+        recommendations = _timestamped_recommendations(
+            test_events,
+            rankings,
+            top_n,
+            min_buyers,
+        )
+        if recommendations.empty:
             continue
+        recommendations["window_index"] = window_index
+        results.append(recommendations)
+    if not results:
+        return pd.DataFrame()
+    combined = pd.concat(results, ignore_index=True)
+    return _apply_global_decision_spacing(combined)
 
-        ticker_scores = _score_test_tickers(test_sigs, train_rankings, min_buyers)
-        if not ticker_scores:
+
+def _apply_global_decision_spacing(recommendations: pd.DataFrame) -> pd.DataFrame:
+    """Apply one execution clock across all chronological research windows."""
+    if recommendations.empty:
+        return recommendations.copy()
+    result = recommendations.copy()
+    result["decision_date"] = pd.to_datetime(result["decision_date"]).dt.normalize()
+    accepted_dates: list[pd.Timestamp] = []
+    last_accepted: pd.Timestamp | None = None
+    for decision_date in sorted(result["decision_date"].unique()):
+        decision_date = pd.Timestamp(decision_date)
+        if last_accepted is not None and (
+            decision_date - last_accepted
+        ).days < HORIZON:
             continue
+        accepted_dates.append(decision_date)
+        last_accepted = decision_date
+    # Keep every top-N row on an accepted date; spacing rejects whole dates.
+    return (
+        result[result["decision_date"].isin(accepted_dates)]
+        .sort_values(["decision_date", "score", "ticker"], ascending=[True, False, True])
+        .reset_index(drop=True)
+    )
 
-        wins, total = _accumulate_picks(ticker_scores, top_n, window_returns)
-        window_wins += wins
-        window_total += total
-    return window_returns, window_wins, window_total
+
+def _disclosed_test_events(sigs: pd.DataFrame, window: dict) -> pd.DataFrame:
+    """Return all disclosed test events and mask labels immature at test_end."""
+    disclosure = pd.to_datetime(sigs["disclosure_date"])
+    events = sigs[
+        (disclosure >= window["test_start"])
+        & (disclosure < window["test_end"])
+    ].copy()
+    if events.empty:
+        return events
+    event_disclosure = pd.to_datetime(events["disclosure_date"])
+    mature = event_disclosure + pd.Timedelta(days=HORIZON) <= window["test_end"]
+    if "window_complete" in events.columns:
+        mature &= events["window_complete"].fillna(False).astype(bool)
+    events.loc[~mature, TARGET_RETURN_COLUMN] = np.nan
+    return events
 
 
-def _score_test_tickers(
+def _timestamped_recommendations(
     test_sigs: pd.DataFrame,
     train_rankings: pd.DataFrame,
-    min_buyers: int,
-) -> list[dict]:
-    """For each ticker in the test period, score by mean shrunk_alpha across
-    its buyers (filtered to those present in the train rankings)."""
-    test_purchases = test_sigs[test_sigs["signal_type"] == "Purchase"].copy()
-    if test_purchases.empty:
-        return []
-
-    ticker_scores: list[dict] = []
-    for ticker, t_grp in test_purchases.groupby("ticker"):
-        buyers = t_grp["member"].unique()
-        if len(buyers) < min_buyers:
-            continue
-
-        buyer_scores = _buyer_alphas(buyers, train_rankings)
-        if not buyer_scores:
-            continue
-
-        avg_score = float(np.mean(buyer_scores))
-        best_score = max(buyer_scores)
-        count_bonus = float(np.log1p(len(buyers)))
-        composite = avg_score * count_bonus
-
-        ticker_scores.append({
-            "ticker": ticker,
-            "n_buyers": len(buyers),
-            "avg_buyer_alpha": avg_score,
-            "best_buyer_alpha": best_score,
-            "composite_score": composite,
-            "test_returns": t_grp["spy_alpha_pct"].dropna().tolist(),
-        })
-    return ticker_scores
-
-
-def _buyer_alphas(buyers: np.ndarray, train_rankings: pd.DataFrame) -> list[float]:
-    """Look up each buyer's shrunk_alpha from the train rankings."""
-    buyer_scores: list[float] = []
-    for b in buyers:
-        match = train_rankings[train_rankings["member"] == b]
-        if not match.empty and "shrunk_alpha" in match.columns:
-            buyer_scores.append(float(match["shrunk_alpha"].iloc[0]))
-    return buyer_scores
-
-
-def _accumulate_picks(
-    ticker_scores: list[dict],
-    top_n: int,
-    window_returns: list[float],
-) -> tuple[int, int]:
-    wins = 0
-    total = 0
-    score_df = pd.DataFrame(ticker_scores)
-    score_df = score_df.sort_values("composite_score", ascending=False).head(top_n)
-    for _, row in score_df.iterrows():
-        if not row["test_returns"]:
-            continue
-        avg_ret = float(np.mean(row["test_returns"]))
-        window_returns.append(avg_ret)
-        total += 1
-        if avg_ret > 0:
-            wins += 1
-    return wins, total
-
-
-def _summarize_grid_result(
-    window_returns: list[float],
-    window_wins: int,
-    window_total: int,
     top_n: int,
     min_buyers: int,
-) -> dict:
-    avg_ret = float(np.mean(window_returns)) if window_returns else 0.0
-    std_ret = float(np.std(window_returns)) if len(window_returns) > 1 else 0.0
-    sharpe = avg_ret / std_ret if std_ret > 0 else 0.0
-    win_rate = window_wins / window_total * 100 if window_total > 0 else 0
-    max_dd = float(np.min(window_returns)) if window_returns else 0.0
+) -> pd.DataFrame:
+    """Select from disclosed events, then attach any available outcome labels."""
+    purchases = test_sigs[test_sigs["signal_type"] == "Purchase"].copy()
+    if purchases.empty:
+        return pd.DataFrame()
+    purchases["disclosure_date"] = pd.to_datetime(
+        purchases["disclosure_date"]
+    ).dt.normalize()
+    score_by_member = train_rankings.set_index("member")[
+        "shrunk_excess_return_pct"
+    ].to_dict()
 
+    rows: list[dict] = []
+    for decision_date in sorted(purchases["disclosure_date"].unique()):
+        decision_date = pd.Timestamp(decision_date)
+        day = purchases[purchases["disclosure_date"] == decision_date]
+        lookback_start = decision_date - pd.Timedelta(days=BUYER_LOOKBACK_DAYS)
+        known = purchases[
+            (purchases["disclosure_date"] >= lookback_start)
+            & (purchases["disclosure_date"] <= decision_date)
+        ]
+        candidates: list[dict] = []
+        for ticker in sorted(day["ticker"].dropna().unique()):
+            ticker_known = known[known["ticker"] == ticker]
+            buyers = sorted(set(ticker_known["member"]))
+            buyer_scores = [score_by_member[b] for b in buyers if b in score_by_member]
+            if len(buyer_scores) < min_buyers:
+                continue
+            score = float(np.mean(buyer_scores) * np.log1p(len(buyer_scores)))
+            if score <= 0:
+                continue
+            candidates.append(
+                {
+                    "decision_date": decision_date,
+                    "ticker": ticker,
+                    "rated_buyers": len(buyer_scores),
+                    "score": score,
+                }
+            )
+        if not candidates:
+            continue
+        selected = (
+            pd.DataFrame(candidates)
+            .sort_values(["score", "ticker"], ascending=[False, True])
+            .head(top_n)
+        )
+        # Selection is complete before labels are read. Missing outcomes affect
+        # evaluation coverage only, never eligibility, buyer counts, or rank.
+        outcomes = day.groupby("ticker", dropna=False)[TARGET_RETURN_COLUMN].mean()
+        selected["realized_excess_return_pct"] = selected["ticker"].map(outcomes)
+        rows.extend(selected.to_dict("records"))
+    return pd.DataFrame(rows)
+
+
+def _summarize_recommendations(recommendations: pd.DataFrame) -> dict:
+    if recommendations.empty:
+        return _empty_summary()
+
+    eligible_recommendations = int(len(recommendations))
+    eligible_dates = int(recommendations["decision_date"].nunique())
+    evaluable = recommendations[
+        recommendations["realized_excess_return_pct"].notna()
+    ]
+    evaluable_recommendations = int(len(evaluable))
+    evaluable_dates = int(evaluable["decision_date"].nunique())
+    missing = recommendations[
+        recommendations["realized_excess_return_pct"].isna()
+    ]
+    missing_dates = int(missing["decision_date"].nunique())
+    base = {
+        "n_eligible_recommendations": eligible_recommendations,
+        "n_evaluable_recommendations": evaluable_recommendations,
+        "n_missing_outcome_recommendations": (
+            eligible_recommendations - evaluable_recommendations
+        ),
+        "n_eligible_decision_dates": eligible_dates,
+        "n_evaluable_decision_dates": evaluable_dates,
+        "n_missing_outcome_decision_dates": missing_dates,
+        "n_unevaluable_decision_dates": eligible_dates - evaluable_dates,
+        "evaluation_coverage_pct": round(
+            evaluable_recommendations / eligible_recommendations * 100,
+            1,
+        ),
+        # Backward-readable aliases. Their denominators are explicit above.
+        "n_recommendations": eligible_recommendations,
+        "n_decision_dates": evaluable_dates,
+        "mean_excess_return_pct": 0.0,
+        "win_rate_pct": 0.0,
+        "one_sided_p_value": 1.0,
+    }
+    if evaluable.empty:
+        return base
+
+    per_date = evaluable.groupby("decision_date")[
+        "realized_excess_return_pct"
+    ].mean()
+    mean_return = float(per_date.mean())
+    p_value = 1.0
+    if len(per_date) >= 2 and float(per_date.std(ddof=1)) > 0:
+        test = stats.ttest_1samp(per_date, popmean=0.0, alternative="greater")
+        p_value = float(test.pvalue)
+    base.update(
+        {
+            "mean_excess_return_pct": round(mean_return, 4),
+            "win_rate_pct": round(float((per_date > 0).mean() * 100), 1),
+            "one_sided_p_value": round(p_value, 6),
+        }
+    )
+    return base
+
+
+def _empty_summary() -> dict:
     return {
-        "top_n": top_n,
-        "min_buyers": min_buyers,
-        "total_picks": window_total,
-        "avg_spy_alpha_pct": round(avg_ret, 4),
-        "std_spy_alpha_pct": round(std_ret, 4),
-        "sharpe_proxy": round(float(sharpe), 4),
-        "win_rate_pct": round(win_rate, 1),
-        "worst_pick_alpha": round(max_dd, 4),
+        "n_eligible_recommendations": 0,
+        "n_evaluable_recommendations": 0,
+        "n_missing_outcome_recommendations": 0,
+        "n_eligible_decision_dates": 0,
+        "n_evaluable_decision_dates": 0,
+        "n_missing_outcome_decision_dates": 0,
+        "n_unevaluable_decision_dates": 0,
+        "evaluation_coverage_pct": 0.0,
+        "n_recommendations": 0,
+        "n_decision_dates": 0,
+        "mean_excess_return_pct": 0.0,
+        "win_rate_pct": 0.0,
+        "one_sided_p_value": 1.0,
+    }
+
+
+def _retrospective_validation_status(validation: dict) -> str:
+    if validation["n_eligible_recommendations"] == 0:
+        return "no_retrospective_validation_recommendations"
+    if validation["n_evaluable_recommendations"] == 0:
+        return "retrospective_validation_outcomes_unavailable"
+    incomplete = validation["n_missing_outcome_recommendations"] > 0
+    if validation["mean_excess_return_pct"] <= 0:
+        return (
+            "nonpositive_retrospective_validation_incomplete_coverage"
+            if incomplete
+            else "nonpositive_retrospective_validation"
+        )
+    if incomplete:
+        return "positive_retrospective_validation_incomplete_coverage_not_robust"
+    # This history was previously explored. Even a positive p-value here is
+    # retrospective evidence and cannot establish robustness or profitability.
+    return "positive_retrospective_validation_not_robust"
+
+
+def _serialize_recommendations(recommendations: pd.DataFrame) -> list[dict]:
+    if recommendations.empty:
+        return []
+    result = recommendations.copy()
+    result["decision_date"] = pd.to_datetime(result["decision_date"]).dt.strftime("%Y-%m-%d")
+    result = result.astype(object).where(pd.notna(result), None)
+    return result.to_dict("records")
+
+
+def _serialize_window(window: dict) -> dict:
+    return {key: str(pd.Timestamp(value).date()) for key, value in window.items()}
+
+
+def _empty_research_result(status: str) -> dict:
+    return {
+        "selection_window_count": 0,
+        "retrospective_validation_window": None,
+        "selection_grid": [],
+        "selected_candidate": None,
+        "selection_recommendations": [],
+        "retrospective_validation": _summarize_recommendations(pd.DataFrame()),
+        "retrospective_validation_recommendations": [],
+        "retrospective_validation_status": status,
     }

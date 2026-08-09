@@ -110,6 +110,8 @@ def _build_row_dict(
         "strike_price": option_details.get("strike_price"),
         "expiry_date": option_details.get("expiry_date"),
         "asset_description": clean_text(asset_cell)[:500] if asset_cell else None,
+        "source_row_id": clean_text(_get_cell(row, indexes.get("source_row_id")))
+        or None,
     }
 
 
@@ -126,10 +128,21 @@ def parse_pdf_table(table: list) -> list[dict]:
     # Pass next row for 2-row header detection
     next_header_row = table[header_idx + 1] if header_idx + 1 < len(table) else None
     indexes = _column_indexes(table[header_idx], next_header_row)
+    indexes["source_row_id"] = _source_row_id_index(table[header_idx])
 
     data_start = _data_start_offset(table, header_idx, next_header_row)
     data_rows = table[data_start:]
     return _extract_transactions(data_rows, indexes)
+
+
+def _source_row_id_index(header: list) -> int | None:
+    for index, cell in enumerate(header):
+        normalized = "".join(
+            character for character in clean_text(cell).lower() if character.isalnum()
+        )
+        if normalized == "sourcerowid":
+            return index
+    return None
 
 
 def _data_start_offset(
@@ -167,6 +180,9 @@ def _process_with_continuations(
     row: list, next_rows: list[list], indexes: dict[str, int]
 ) -> tuple[dict | None, int]:
     """Process a row and up to three physical continuation rows."""
+    if _is_filing_detail_row(_get_cell(row, indexes.get("asset"))):
+        return None, 0
+
     next_row = next_rows[0] if next_rows else None
     tx, merged = _process_row(row, indexes, next_row)
     if tx or not next_rows:
@@ -192,3 +208,27 @@ def _process_with_continuations(
         if tx and merged:
             return tx, offset + 1
     return None, 0
+
+
+def _is_filing_detail_row(asset_cell: str | None) -> bool:
+    """Identify filing metadata that must not prefix the next asset row."""
+    text = clean_text(asset_cell).upper()
+    if not text:
+        return False
+    if text.startswith(("DESCRIPTION:", "D:")) and (
+        "[ST]" in text or "[OP]" in text
+    ):
+        return False
+    return text.startswith(
+        (
+            "FILING STATUS:",
+            "F S:",
+            "SOURCE OF:",
+            "S O:",
+            "SUBHOLDING OF:",
+            "DESCRIPTION:",
+            "D:",
+            "LOCATION:",
+            "L:",
+        )
+    )

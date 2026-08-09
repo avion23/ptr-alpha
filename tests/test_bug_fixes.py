@@ -6,8 +6,14 @@ All tests use temp DuckDB files — never the production data/congress.duckdb.
 
 import unittest
 from datetime import date
+from unittest.mock import patch
 
+import numpy as np
 import pandas as pd
+
+from analyzer.price_repository import nyse_sessions
+from analyzer.price_source import YFinancePriceSource
+from analyzer.settings import Settings
 
 from .conftest import DatabaseTestCase
 
@@ -16,9 +22,10 @@ from .conftest import DatabaseTestCase
 # Fix 1 – Dedup key collapses distinct trades
 # ---------------------------------------------------------------------------
 class TestDedupKeyFix(DatabaseTestCase):
-    """Two same-day lots with different amount_raw must both survive.
-    Re-inserting the identical row must still dedupe to one.
-    SP vs JT trades (different owner_code) must each survive.
+    """Lots survive unless an exact source record and row identity proves replay.
+
+    Economic equality without artifact identity is exposed as ambiguous rather
+    than used to erase a potentially repeated lot.
     """
 
     def _base_tx(self, **overrides):
@@ -46,15 +53,14 @@ class TestDedupKeyFix(DatabaseTestCase):
         result = self.db.get_transactions(2024)
         self.assertEqual(len(result), 2, "Two distinct lots must not be collapsed")
 
-    def test_reinserting_same_row_dedupes_to_one(self):
+    def test_reinserting_without_artifact_identity_remains_visible(self):
         row = self._base_tx(amount_raw="$1,001 - $15,000")
         df = pd.DataFrame([row])
         self.db.upsert_transactions(df, source="house_pdf")
-        self.db.upsert_transactions(df, source="house_pdf")  # re-insert same row
+        self.db.upsert_transactions(df, source="house_pdf")
         result = self.db.get_transactions(2024)
-        self.assertEqual(
-            len(result), 1, "Re-inserting same row must not create duplicate"
-        )
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result["economic_duplicate_candidate"].all())
 
     def test_sp_vs_jt_owner_code_both_survive(self):
         """SP-owned and JT-owned trades on the same day must be kept separate."""
@@ -383,3 +389,91 @@ class TestNegativeLagFilter(DatabaseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPriceAcquisitionCorrectness(DatabaseTestCase):
+    def test_requested_end_is_inclusive_and_one_symbol_frame_is_supported(self):
+        source = YFinancePriceSource(Settings(), db=self.db)
+        captured = {}
+        columns = pd.MultiIndex.from_product([["Close"], ["SPY"]])
+        response = pd.DataFrame(
+            [[400.0], [401.0]],
+            index=pd.DatetimeIndex(["2025-01-02", "2025-01-03"]),
+            columns=columns,
+        )
+
+        def download(symbols, start, end, **kwargs):
+            captured["symbols"] = symbols
+            captured["end"] = pd.Timestamp(end)
+            return response
+
+        with patch("analyzer.price_source.yf.download", side_effect=download):
+            result = source.get_prices(
+                ["NOT_VALID"], date(2025, 1, 2), date(2025, 1, 3)
+            )
+
+        self.assertEqual(captured["symbols"], ["SPY"])
+        self.assertEqual(captured["end"], pd.Timestamp("2025-01-04"))
+        self.assertEqual(result.index.max(), pd.Timestamp("2025-01-03"))
+        self.assertEqual(result.loc[pd.Timestamp("2025-01-03"), "SPY"], 401.0)
+
+    def test_repository_quarantines_nonfinite_and_nonpositive_prices(self):
+        dates = pd.DatetimeIndex(["2025-01-02", "2025-01-03", "2025-01-06"])
+        self.db.upsert_prices(
+            pd.DataFrame({"AAPL": [100.0, -1.0, np.inf]}, index=dates)
+        )
+
+        result = self.db.get_prices(
+            ["AAPL"], date(2025, 1, 2), date(2025, 1, 6)
+        )
+        missing_tickers, missing_dates = self.db.get_missing_price_data(
+            ["AAPL"], date(2025, 1, 2), date(2025, 1, 6)
+        )
+
+        self.assertEqual(result["AAPL"].dropna().tolist(), [100.0])
+        self.assertEqual(missing_tickers, ["AAPL"])
+        self.assertEqual(
+            [d.date() for d in missing_dates],
+            [date(2025, 1, 3), date(2025, 1, 6)],
+        )
+
+        self.db.upsert_transactions(
+            pd.DataFrame(
+                {
+                    "doc_id": ["bad-price"],
+                    "member": ["Alice"],
+                    "ticker": ["BAD"],
+                    "transaction_date": [date(2025, 1, 2)],
+                    "disclosure_date": [date(2025, 1, 2)],
+                    "transaction_type": ["Purchase"],
+                }
+            ),
+            source="house_pdf",
+        )
+        self.db.conn.execute(
+            "INSERT INTO prices VALUES ('BAD', DATE '2025-01-02', -10.0)"
+        )
+        entries = self.db.get_entry_prices(
+            ["BAD"], date(2025, 1, 2), date(2025, 1, 2)
+        )
+        self.assertTrue(entries.empty)
+
+    def test_carter_market_closure_is_not_reported_missing(self):
+        dates = pd.DatetimeIndex(["2025-01-08", "2025-01-10"])
+        self.db.upsert_prices(pd.DataFrame({"SPY": [500.0, 501.0]}, index=dates))
+
+        missing_tickers, missing_dates = self.db.get_missing_price_data(
+            ["SPY"], date(2025, 1, 8), date(2025, 1, 10)
+        )
+
+        self.assertEqual(missing_tickers, [])
+        self.assertEqual(missing_dates, [])
+
+
+    def test_new_year_2022_does_not_close_2021_12_31(self):
+        sessions = nyse_sessions(date(2021, 12, 31), date(2022, 1, 3))
+
+        self.assertEqual(
+            [session.date() for session in sessions],
+            [date(2021, 12, 31), date(2022, 1, 3)],
+        )

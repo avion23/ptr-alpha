@@ -1,66 +1,72 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
-from analyzer.analysis import evaluate_backtest
-from analyzer.options import estimate_options_leverage
+from analyzer.analysis import calculate_signal_potential, evaluate_backtest
+from analyzer.backtest.curves import _build_curves_for_rows, _build_ticker_curves
+from analyzer.backtest.filters import _filter_ticker_perf, _filter_training
+from analyzer.backtest.prices import (
+    _aligned_price_at_or_before_arrays,
+    _next_tradable_price_arrays,
+)
+from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
+from analyzer.pipeline import _entry_prices_from_matrix
+from analyzer.price_source import _validate_and_log_prices
+from analyzer.signals import _price_arrays
 
 
 class TestBacktestTiming(unittest.TestCase):
-    def test_ordinary_entry_and_spy_use_as_of_close(self):
+    def test_ordinary_entry_uses_next_session_and_aligned_spy_dates(self):
         as_of = pd.Timestamp("2025-01-03")
-        dates = pd.date_range("2025-01-01", "2025-01-06", freq="D")
+        dates = pd.date_range("2025-01-01", "2025-01-07", freq="D")
         prices = pd.DataFrame(
             {
-                "AAPL": [90.0, 100.0, 200.0, 210.0, 220.0, 230.0],
-                "SPY": [300.0, 320.0, 600.0, 660.0, 700.0, 740.0],
+                "AAPL": [90.0, 100.0, 200.0, 210.0, 220.0, 230.0, 240.0],
+                "SPY": [300.0, 320.0, 600.0, 660.0, 700.0, 740.0, 760.0],
             },
             index=dates,
         )
 
-        result = evaluate_backtest(
+        row = evaluate_backtest(
             pd.DataFrame({"ticker": ["AAPL"]}),
             prices,
             as_of,
             horizon=1,
             entry_slippage_bps=0,
             exit_slippage_bps=0,
-        )
-        row = result.iloc[0]
+        ).iloc[0]
 
-        self.assertEqual(row["bt_entry_price"], 200.0)
-        self.assertEqual(row["bt_spy_return_pct"], 10.0)
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-06").date())
+        self.assertEqual(row["bt_entry_price"], 230.0)
+        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-07").date())
+        self.assertEqual(row["bt_exit_price"], 240.0)
+        self.assertEqual(row["bt_spy_return_pct"], round((760 / 740 - 1) * 100, 2))
 
-    def test_one_day_holding_period_uses_as_of_and_next_day_prices(self):
+    def test_horizon_starts_at_actual_entry_session(self):
         as_of = pd.Timestamp("2025-01-03")
-        entry_date = pd.Timestamp("2025-01-03")
-        exit_date = pd.Timestamp("2025-01-04")
+        dates = pd.date_range("2025-01-03", "2025-01-07", freq="D")
         prices = pd.DataFrame(
             {
-                "AAPL": [200.0, 210.0],
-                "SPY": [600.0, 660.0],
+                "AAPL": [200.0, 210.0, 220.0, 230.0, 240.0],
+                "SPY": [600.0, 660.0, 700.0, 740.0, 760.0],
             },
-            index=pd.DatetimeIndex([entry_date, exit_date]),
+            index=dates,
         )
 
-        result = evaluate_backtest(
+        row = evaluate_backtest(
             pd.DataFrame({"ticker": ["AAPL"]}),
             prices,
             as_of,
             horizon=1,
             entry_slippage_bps=0,
             exit_slippage_bps=0,
-        )
-        row = result.iloc[0]
+        ).iloc[0]
 
-        self.assertEqual(entry_date, as_of)
-        self.assertEqual(exit_date - entry_date, pd.Timedelta(days=1))
-        self.assertEqual(row["bt_entry_price"], prices.loc[as_of, "AAPL"])
-        self.assertEqual(
-            row["bt_exit_price"], prices.loc[as_of + pd.Timedelta(days=1), "AAPL"]
-        )
-        self.assertEqual(row["bt_raw_return_pct"], 5.0)
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-06").date())
+        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-07").date())
+        self.assertEqual(row["bt_raw_return_pct"], round((240 / 230 - 1) * 100, 2))
 
     def test_dip_entry_keeps_future_fill_timing(self):
         dates = pd.date_range("2025-01-02", "2025-01-10", freq="B")
@@ -72,7 +78,7 @@ class TestBacktestTiming(unittest.TestCase):
             index=dates,
         )
 
-        result = evaluate_backtest(
+        row = evaluate_backtest(
             pd.DataFrame({"ticker": ["AAPL"]}),
             prices,
             pd.Timestamp("2025-01-03"),
@@ -80,21 +86,22 @@ class TestBacktestTiming(unittest.TestCase):
             use_dip_entry=True,
             entry_slippage_bps=0,
             exit_slippage_bps=0,
-        )
-        row = result.iloc[0]
+        ).iloc[0]
 
         self.assertEqual(row["bt_entry_price"], 94.0)
         self.assertEqual(row["bt_entry_delay"], 3)
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-06").date())
         self.assertAlmostEqual(row["bt_spy_return_pct"], 0.2, places=2)
 
-    def test_option_bases_and_amount_clamp(self):
-        self.assertEqual(estimate_options_leverage("call"), 4.0)
-        self.assertEqual(estimate_options_leverage("put"), -2.0)
-        self.assertEqual(estimate_options_leverage("call", 10_000_000), 2.8)
-        self.assertEqual(estimate_options_leverage("put", 10_000_000), -1.4)
+    def test_option_returns_require_contract_prices(self):
+        for instrument in ("call", "put", "option"):
+            with self.subTest(instrument=instrument):
+                with self.assertRaises(UnsupportedOptionPricingError):
+                    estimate_options_leverage(instrument, 10_000_000)
 
-    def test_stale_exit_keeps_last_price_and_sets_coverage_flags(self):
-        dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")
+
+    def test_truncated_history_is_unavailable_not_an_invented_delisting_return(self):
+        dates = pd.date_range("2024-12-01", "2025-02-15", freq="D")
         last_trade = pd.Timestamp("2025-01-10")
         prices = pd.DataFrame(
             {
@@ -114,106 +121,83 @@ class TestBacktestTiming(unittest.TestCase):
         )
         row = result.iloc[0]
 
-        self.assertEqual(row["bt_exit_price"], 100.0)
-        self.assertTrue(row["bt_delisted"])
-        self.assertEqual(row["bt_raw_return_pct"], 0.0)
-        self.assertEqual(row["bt_return_pct"], 0.0)
-        self.assertEqual(row["bt_alpha_pct"], round(-row["bt_spy_return_pct"], 2))
-        self.assertEqual(row["bt_coverage"], "stale")
+        self.assertTrue(np.isnan(row["bt_exit_price"]))
+        self.assertTrue(np.isnan(row["bt_return_pct"]))
+        self.assertFalse(row["bt_delisted"])
+        self.assertEqual(row["bt_coverage"], "unavailable")
         self.assertTrue(row["bt_stale_exit"])
+        self.assertEqual(result.attrs["n_unavailable"], 1)
 
-    def test_truncated_history_keeps_price_derived_return(self):
-        dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")
-        as_of = pd.Timestamp("2025-01-01")
-        last_trade = pd.Timestamp("2025-01-10")
+    def test_weekend_exit_uses_bounded_prior_common_session(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-10")
         prices = pd.DataFrame(
-            {
-                "AAPL": [
-                    100.0 if day <= as_of else 130.0 if day <= last_trade else np.nan
-                    for day in dates
-                ],
-                "SPY": [400.0 + i for i in range(len(dates))],
-            },
+            {"AAPL": np.arange(len(dates)) + 100.0, "SPY": np.arange(len(dates)) + 400.0},
             index=dates,
         )
 
-        result = evaluate_backtest(
+        row = evaluate_backtest(
             pd.DataFrame({"ticker": ["AAPL"]}),
             prices,
-            as_of,
-            horizon=40,
+            pd.Timestamp("2025-01-02"),
+            horizon=2,
             entry_slippage_bps=0,
             exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-03").date())
+        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-03").date())
+        self.assertEqual(row["bt_coverage"], "complete")
+
+    def test_missing_spy_on_security_exit_is_unavailable(self):
+        dates = pd.date_range("2025-01-01", "2025-01-04", freq="D")
+        prices = pd.DataFrame(
+            {"AAPL": [100.0, 101.0, 102.0, 103.0], "SPY": [400.0, 401.0, np.nan, 403.0]},
+            index=dates,
         )
-        row = result.iloc[0]
 
-        self.assertEqual(row["bt_entry_price"], 100.0)
-        self.assertEqual(row["bt_exit_price"], 130.0)
-        self.assertEqual(row["bt_raw_return_pct"], 30.0)
-        self.assertEqual(row["bt_return_pct"], 30.0)
-        self.assertEqual(row["bt_coverage"], "stale")
-        self.assertTrue(row["bt_stale_exit"])
-        self.assertTrue(row["bt_delisted"])
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-01"),
+            horizon=1,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
 
-    def test_stale_exit_returns_follow_stock_call_put_leverage(self):
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertEqual(row["bt_unavailable_reason"], "benchmark_quote_unavailable")
+        self.assertFalse(row["bt_stale_exit"])
+        self.assertTrue(np.isnan(row["bt_alpha_pct"]))
+
+    def test_evaluator_isolates_underlying_based_option_returns(self):
         dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")
-        as_of = pd.Timestamp("2025-01-01")
-        last_trade = pd.Timestamp("2025-01-10")
-        history = [
-            100.0 if day <= as_of else 80.0 if day <= last_trade else np.nan
-            for day in dates
-        ]
         prices = pd.DataFrame(
             {
-                "STOCK": history,
-                "CALL": history,
-                "PUT": history,
+                "CALL": [100.0] * len(dates),
                 "SPY": [400.0 + i for i in range(len(dates))],
             },
             index=dates,
         )
         recommendations = pd.DataFrame(
-            {
-                "ticker": ["STOCK", "CALL", "PUT"],
-                "instrument_type": ["stock", "call", "put"],
-            }
+            {"ticker": ["CALL"], "instrument_type": ["call"]}
         )
 
-        result = evaluate_backtest(
+        row = evaluate_backtest(
             recommendations,
             prices,
-            as_of,
+            pd.Timestamp("2025-01-01"),
             horizon=40,
             entry_slippage_bps=0,
             exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertEqual(
+            row["bt_unavailable_reason"], "unsupported_instrument_pricing"
         )
-        rows = result.set_index("ticker")
-        expected = {
-            "STOCK": {"raw": -20.0, "leverage": 1.0, "final": -20.0},
-            "CALL": {"raw": -20.0, "leverage": 4.0, "final": -80.0},
-            "PUT": {"raw": -20.0, "leverage": -2.0, "final": 40.0},
-        }
+        self.assertTrue(np.isnan(row["bt_return_pct"]))
 
-        for ticker, values in expected.items():
-            row = rows.loc[ticker]
-            self.assertEqual(row["bt_entry_price"], 100.0)
-            self.assertEqual(row["bt_exit_price"], 80.0)
-            self.assertEqual(row["bt_raw_return_pct"], values["raw"])
-            self.assertEqual(row["bt_leverage"], values["leverage"])
-            self.assertEqual(row["bt_return_pct"], values["final"])
-            self.assertEqual(
-                row["bt_return_pct"],
-                round(row["bt_raw_return_pct"] * row["bt_leverage"], 2),
-            )
-            self.assertEqual(row["bt_coverage"], "stale")
-            self.assertTrue(row["bt_stale_exit"])
-            self.assertTrue(row["bt_delisted"])
-
-        self.assertLess(rows.loc["STOCK", "bt_return_pct"], 0)
-        self.assertLess(rows.loc["CALL", "bt_return_pct"], 0)
-        self.assertGreater(rows.loc["PUT", "bt_return_pct"], 0)
-
-    def test_exactly_25_days_stale_keeps_price_derived_return(self):
+    def test_exactly_25_days_stale_is_unavailable(self):
         dates = pd.date_range("2024-12-01", "2025-02-10", freq="D")
         last_trade = pd.Timestamp("2025-01-16")
         prices = pd.DataFrame(
@@ -241,12 +225,577 @@ class TestBacktestTiming(unittest.TestCase):
         )
         row = result.iloc[0]
 
-        self.assertEqual(row["bt_exit_price"], 110.0)
+        self.assertTrue(np.isnan(row["bt_exit_price"]))
         self.assertFalse(row["bt_delisted"])
-        self.assertEqual(row["bt_return_pct"], 10.0)
-        self.assertEqual(row["bt_coverage"], "complete")
-        self.assertFalse(row["bt_stale_exit"])
+        self.assertTrue(np.isnan(row["bt_return_pct"]))
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertTrue(row["bt_stale_exit"])
+
+    def test_training_maturity_uses_actual_label_window_end(self):
+        signals = pd.DataFrame(
+            {
+                "horizon_days": [30],
+                "disclosure_date": [pd.Timestamp("2024-01-01")],
+                "label_window_end": [pd.Timestamp("2024-02-05")],
+                "window_complete": [True],
+                "total_spy_alpha_pct": [1.0],
+            }
+        )
+
+        early = _filter_training(signals, 30, "2024-02-01", None)
+        mature = _filter_training(signals, 30, "2024-02-06", None)
+        ticker_early = _filter_ticker_perf(signals, 30, "2024-02-01")
+
+        self.assertTrue(early.empty)
+        self.assertTrue(ticker_early.empty)
+        self.assertEqual(len(mature), 1)
+
+    def test_sale_peak_uses_executable_next_session_basis(self):
+        dates = pd.bdate_range("2024-01-08", "2024-01-12")
+        prices = pd.DataFrame(
+            {
+                "SALE": [190.0, 200.0, 150.0, 180.0, 180.0],
+                "SPY": [400.0] * len(dates),
+            },
+            index=dates,
+        )
+        entries = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["SALE"],
+                "disclosure_date": [pd.Timestamp("2024-01-08")],
+                "transaction_type": ["Sale"],
+                "entry_price": [100.0],
+            }
+        )
+
+        row = calculate_signal_potential(entries, prices, [2]).iloc[0]
+
+        self.assertEqual(row["label_entry_date"], pd.Timestamp("2024-01-09"))
+        self.assertAlmostEqual(row["peak_potential_pct"], (200 / 150 - 1) * 100)
+
+    def test_fresh_matrix_constructs_entry_without_database_cache(self):
+        transactions = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["AAPL"],
+                "transaction_date": [pd.Timestamp("2024-01-02")],
+                "disclosure_date": [pd.Timestamp("2024-01-02")],
+                "transaction_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"AAPL": [999.0], "SPY": [400.0]},
+            index=pd.DatetimeIndex(["2024-01-03"]),
+        )
+
+        entries = _entry_prices_from_matrix(transactions, prices)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries.iloc[0]["entry_price"], 999.0)
+        self.assertEqual(entries.iloc[0]["entry_price_date"], pd.Timestamp("2024-01-03"))
+
+    def test_six_day_early_quote_is_unavailable(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-14")
+        aapl = pd.Series(np.nan, index=dates)
+        aapl.loc["2025-01-03"] = 100.0
+        aapl.loc["2025-01-07"] = 110.0
+        prices = pd.DataFrame({"AAPL": aapl, "SPY": 400.0}, index=dates)
+
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-02"),
+            horizon=10,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertTrue(np.isnan(row["bt_return_pct"]))
+
+    def test_invalid_exact_entry_does_not_shift_to_later_quote(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-07")
+        prices = pd.DataFrame(
+            {"AAPL": [90.0, 0.0, 100.0, 110.0], "SPY": [390.0, 400.0, 410.0, 420.0]},
+            index=dates,
+        )
+
+        result = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-02"),
+            horizon=1,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["bt_coverage"], "unavailable")
+        self.assertTrue(np.isnan(result.iloc[0]["bt_entry_price"]))
+        self.assertEqual(result.attrs["n_unavailable"], 1)
+
+    def test_nonpositive_exact_exit_is_unavailable(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-06")
+        prices = pd.DataFrame(
+            {"AAPL": [90.0, 100.0, 0.0], "SPY": [390.0, 400.0, 410.0]},
+            index=dates,
+        )
+
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-02"),
+            horizon=3,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertTrue(np.isnan(row["bt_exit_price"]))
+        self.assertTrue(np.isnan(row["bt_raw_return_pct"]))
+        self.assertEqual(row["bt_unavailable_reason"], "exit_quote_unavailable")
+        self.assertTrue(row["bt_stale_exit"])
+
+    def test_fail_closed_acquisition_entry_and_execution_integration(self):
+        transactions = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["AAPL"],
+                "transaction_date": [pd.Timestamp("2025-01-02")],
+                "disclosure_date": [pd.Timestamp("2025-01-02")],
+                "transaction_type": ["Purchase"],
+            }
+        )
+        dates = pd.bdate_range("2025-01-02", "2025-01-06")
+
+        for invalid_entry in (0.0, np.nan):
+            with self.subTest(endpoint="entry", value=invalid_entry):
+                acquired = _validate_and_log_prices(
+                    pd.DataFrame(
+                        {
+                            "AAPL": [90.0, invalid_entry, 110.0],
+                            "SPY": [390.0, 400.0, 410.0],
+                        },
+                        index=dates,
+                    ),
+                    ["AAPL", "SPY"],
+                )
+                entries = _entry_prices_from_matrix(transactions, acquired)
+                evaluated = evaluate_backtest(
+                    pd.DataFrame({"ticker": ["AAPL"]}),
+                    acquired,
+                    pd.Timestamp("2025-01-02"),
+                    horizon=3,
+                    entry_slippage_bps=0,
+                    exit_slippage_bps=0,
+                )
+                self.assertTrue(entries.empty)
+                self.assertEqual(len(evaluated), 1)
+                self.assertEqual(evaluated.iloc[0]["bt_coverage"], "unavailable")
+                self.assertTrue(np.isnan(evaluated.iloc[0]["bt_entry_price"]))
+                self.assertFalse(evaluated.iloc[0]["bt_stale_exit"])
+                self.assertEqual(evaluated.attrs["n_unavailable"], 1)
+
+        for invalid_exit in (0.0, np.nan):
+            with self.subTest(endpoint="exit", value=invalid_exit):
+                acquired = _validate_and_log_prices(
+                    pd.DataFrame(
+                        {
+                            "AAPL": [90.0, 100.0, invalid_exit],
+                            "SPY": [390.0, 400.0, 410.0],
+                        },
+                        index=dates,
+                    ),
+                    ["AAPL", "SPY"],
+                )
+                entries = _entry_prices_from_matrix(transactions, acquired)
+                row = evaluate_backtest(
+                    pd.DataFrame({"ticker": ["AAPL"]}),
+                    acquired,
+                    pd.Timestamp("2025-01-02"),
+                    horizon=3,
+                    entry_slippage_bps=0,
+                    exit_slippage_bps=0,
+                ).iloc[0]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(row["bt_coverage"], "unavailable")
+                self.assertTrue(np.isnan(row["bt_return_pct"]))
+
+    def test_mixed_stock_option_and_missing_instrument_are_isolated(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-06")
+        prices = pd.DataFrame(
+            {
+                "AAPL": [90.0, 100.0, 110.0],
+                "MSFT": [190.0, 200.0, 220.0],
+                "NVDA": [290.0, 300.0, 330.0],
+                "SPY": [390.0, 400.0, 410.0],
+            },
+            index=dates,
+        )
+        recommendations = pd.DataFrame(
+            {
+                "ticker": ["AAPL", "MSFT", "NVDA"],
+                "instrument_type": ["stock", "call", None],
+            }
+        )
+
+        result = evaluate_backtest(
+            recommendations,
+            prices,
+            pd.Timestamp("2025-01-02"),
+            horizon=3,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).set_index("ticker")
+
+        self.assertEqual(result.loc["AAPL", "bt_coverage"], "complete")
+        self.assertEqual(result.loc["AAPL", "bt_return_pct"], 10.0)
+        for ticker in ("MSFT", "NVDA"):
+            self.assertEqual(result.loc[ticker, "bt_coverage"], "unavailable")
+            self.assertEqual(
+                result.loc[ticker, "bt_unavailable_reason"],
+                "unsupported_instrument_pricing",
+            )
+            self.assertTrue(np.isnan(result.loc[ticker, "bt_return_pct"]))
+            self.assertFalse(result.loc[ticker, "bt_stale_exit"])
+        self.assertEqual(result.attrs["n_unavailable"], 2)
+
+    def test_stock_pricing_programming_error_propagates(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-06")
+        prices = pd.DataFrame(
+            {"AAPL": [90.0, 100.0, 110.0], "SPY": [390.0, 400.0, 410.0]},
+            index=dates,
+        )
+        recommendations = pd.DataFrame(
+            {"ticker": ["AAPL"], "instrument_type": ["stock"]}
+        )
+
+        with patch(
+            "analyzer.options.estimate_options_leverage",
+            side_effect=ValueError("programming error"),
+        ):
+            with self.assertRaisesRegex(ValueError, "programming error"):
+                evaluate_backtest(
+                    recommendations,
+                    prices,
+                    pd.Timestamp("2025-01-02"),
+                    horizon=3,
+                    entry_slippage_bps=0,
+                    exit_slippage_bps=0,
+                )
+
+    def test_timezone_aware_daily_index_preserves_calendar_dates(self):
+        dates = pd.bdate_range("2025-01-02", "2025-01-07", tz="America/New_York")
+        prices = pd.DataFrame(
+            {"AAPL": [90.0, 100.0, 110.0, 120.0], "SPY": [390.0, 400.0, 410.0, 420.0]},
+            index=dates,
+        )
+
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"]}),
+            prices,
+            pd.Timestamp("2025-01-02", tz="America/New_York"),
+            horizon=1,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-03").date())
+        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-03").date())
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAlignedPriceHelpers(unittest.TestCase):
+    def test_next_session_returns_execution_date_and_wait(self):
+        prices = pd.DataFrame(
+            {"A": [100.0, 120.0]},
+            index=pd.to_datetime(["2025-01-03", "2025-01-06"]),
+        )
+        idx_ns, vals = _price_arrays(prices, "A")
+        execution = _next_tradable_price_arrays(
+            idx_ns, vals, pd.Timestamp("2025-01-05"), max_wait_days=3
+        )
+        self.assertEqual(execution.price, 120.0)
+        self.assertEqual(execution.date, pd.Timestamp("2025-01-06"))
+        self.assertEqual(execution.staleness_days, 1)
+
+    def test_aligned_prior_rejects_stale_and_nonpositive(self):
+        prices = pd.DataFrame(
+            {"A": [100.0, 0.0]},
+            index=pd.to_datetime(["2025-01-01", "2025-01-03"]),
+        )
+        idx_ns, vals = _price_arrays(prices, "A")
+        self.assertIsNone(
+            _aligned_price_at_or_before_arrays(
+                idx_ns, vals, pd.Timestamp("2025-01-10"), max_staleness_days=5
+            )
+        )
+        aligned = _aligned_price_at_or_before_arrays(
+            idx_ns, vals, pd.Timestamp("2025-01-03"), max_staleness_days=3
+        )
+        self.assertIsNone(aligned)
+
+    def test_ou_curve_enters_after_weekend_disclosure(self):
+        rows = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "entry_price": [100.0],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 120.0, 132.0, 144.0, 156.0]},
+            index=pd.to_datetime(
+                [
+                    "2025-01-03",
+                    "2025-01-06",
+                    "2025-01-07",
+                    "2025-01-08",
+                    "2025-01-09",
+                ]
+            ),
+        )
+        curves = _build_curves_for_rows(rows, prices, horizon=3)
+        self.assertEqual(len(curves), 1)
+        np.testing.assert_allclose(curves[0], [0.0, 0.1, 0.2, 0.3])
+
+    def test_ou_curve_matures_from_actual_entry_before_as_of(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "entry_price": [100.0],
+                "horizon_days": [3],
+                "signal_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [120.0, 132.0, 144.0, 156.0]},
+            index=pd.to_datetime(
+                ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09"]
+            ),
+        )
+        immature = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-08"), horizon=3
+        )
+        mature = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-09"), horizon=3
+        )
+        self.assertEqual(immature, [])
+        self.assertEqual(len(mature), 1)
+
+    def test_ou_selection_requires_complete_label_known_by_as_of(self):
+        base = {
+            "ticker": ["A"],
+            "disclosure_date": [pd.Timestamp("2025-01-05")],
+            "horizon_days": [3],
+            "signal_type": ["Purchase"],
+            "label_entry_date": [pd.Timestamp("2025-01-06")],
+            "label_exit_date": [pd.Timestamp("2025-01-09")],
+        }
+        prices = pd.DataFrame(
+            {"A": [120.0, 132.0, 144.0, 156.0, 168.0]},
+            index=pd.to_datetime(
+                [
+                    "2025-01-06",
+                    "2025-01-07",
+                    "2025-01-08",
+                    "2025-01-09",
+                    "2025-01-10",
+                ]
+            ),
+        )
+        incomplete = pd.DataFrame(
+            {**base, "window_complete": [False], "label_window_end": ["2025-01-09"]}
+        )
+        future_label = pd.DataFrame(
+            {
+                **base,
+                "window_complete": [True],
+                "label_window_end": ["2025-01-10"],
+                "label_exit_date": [pd.Timestamp("2025-01-10")],
+            }
+        )
+        self.assertEqual(
+            _build_ticker_curves(
+                "A", incomplete, prices, pd.Timestamp("2025-01-09"), horizon=3
+            ),
+            [],
+        )
+        self.assertEqual(
+            _build_ticker_curves(
+                "A", future_label, prices, pd.Timestamp("2025-01-09"), horizon=3
+            ),
+            [],
+        )
+
+    def test_ou_rejects_missing_exact_labeled_endpoint(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "horizon_days": [3],
+                "signal_type": ["Purchase"],
+                "window_complete": [True],
+                "label_entry_date": [pd.Timestamp("2025-01-06")],
+                "label_exit_date": [pd.Timestamp("2025-01-09")],
+                "label_window_end": [pd.Timestamp("2025-01-09")],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [120.0, 132.0, 144.0, 168.0]},
+            index=pd.to_datetime(
+                ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-10"]
+            ),
+        )
+        curves = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-10"), horizon=3
+        )
+        self.assertEqual(curves, [])
+
+    def test_legacy_ou_waits_for_exact_next_session_endpoint(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "horizon_days": [5],
+                "signal_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 110.0, 120.0, 130.0, 140.0]},
+            index=pd.to_datetime(
+                [
+                    "2025-01-06",
+                    "2025-01-07",
+                    "2025-01-08",
+                    "2025-01-10",
+                    "2025-01-13",
+                ]
+            ),
+        )
+        before_calendar_maturity = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-10"), horizon=5
+        )
+        complete = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-11"), horizon=5
+        )
+        self.assertEqual(before_calendar_maturity, [])
+        self.assertEqual(len(complete), 1)
+        np.testing.assert_allclose(complete[0], [0.0, 0.1, 0.2, 0.3])
+
+    def test_legacy_ou_rejects_later_quote_when_expected_session_is_missing(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "horizon_days": [5],
+                "signal_type": ["Purchase"],
+            }
+        )
+        index = pd.to_datetime(
+            [
+                "2025-01-06",
+                "2025-01-07",
+                "2025-01-08",
+                "2025-01-09",
+                "2025-01-10",
+                "2025-01-13",
+                "2025-01-14",
+            ]
+        )
+        prices = pd.DataFrame(
+            {
+                "A": [100.0, 110.0, 120.0, 125.0, np.nan, 130.0, 140.0],
+                "SPY": [500.0, 501.0, 502.0, 503.0, 504.0, 505.0, 506.0],
+            },
+            index=index,
+        )
+        curves = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-14"), horizon=5
+        )
+        self.assertEqual(curves, [])
+
+    def test_ou_uses_exact_labeled_endpoints_and_window_only_for_maturity(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "horizon_days": [3],
+                "signal_type": ["Purchase"],
+                "window_complete": [True],
+                "label_entry_date": [pd.Timestamp("2025-01-06")],
+                "label_exit_date": [pd.Timestamp("2025-01-08")],
+                "label_window_end": [pd.Timestamp("2025-01-09")],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [120.0, 132.0, 144.0, 156.0]},
+            index=pd.to_datetime(
+                ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09"]
+            ),
+        )
+        immature = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-08"), horizon=3
+        )
+        complete = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-09"), horizon=3
+        )
+        self.assertEqual(immature, [])
+        self.assertEqual(len(complete), 1)
+        np.testing.assert_allclose(complete[0], [0.0, 0.1, 0.2])
+
+    def test_legacy_ou_weekend_holiday_window_completes_at_calendar_maturity(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2024-12-19")],
+                "horizon_days": [8],
+                "signal_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 102.0, 104.0, 106.0, 108.0]},
+            index=pd.to_datetime(
+                [
+                    "2024-12-20",
+                    "2024-12-23",
+                    "2024-12-24",
+                    "2024-12-26",
+                    "2024-12-27",
+                ]
+            ),
+        )
+        before_maturity = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2024-12-27"), horizon=8
+        )
+        complete = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2024-12-28"), horizon=8
+        )
+        self.assertEqual(before_maturity, [])
+        self.assertEqual(len(complete), 1)
+        np.testing.assert_allclose(complete[0], [0.0, 0.02, 0.04, 0.06, 0.08])
+
+    def test_ou_rejects_entire_curve_with_interior_zero_quote(self):
+        signals = pd.DataFrame(
+            {
+                "ticker": ["A"],
+                "disclosure_date": [pd.Timestamp("2025-01-05")],
+                "horizon_days": [3],
+                "signal_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 0.0, 120.0, 130.0]},
+            index=pd.to_datetime(
+                ["2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09"]
+            ),
+        )
+        curves = _build_ticker_curves(
+            "A", signals, prices, pd.Timestamp("2025-01-09"), horizon=3
+        )
+        self.assertEqual(curves, [])

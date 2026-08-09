@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 from datetime import date
+from functools import lru_cache
 
 import duckdb
+import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import (
     AbstractHolidayCalendar,
@@ -23,6 +25,15 @@ from analyzer.ticker_resolver import TickerResolver
 logger = logging.getLogger(__name__)
 
 
+def _nyse_new_year_observance(day: pd.Timestamp) -> pd.Timestamp | None:
+    """NYSE does not observe a Saturday New Year on the preceding Friday."""
+    if day.weekday() == 5:
+        return None
+    if day.weekday() == 6:
+        return day + pd.Timedelta(days=1)
+    return day
+
+
 class _NYSEHolidayCalendar(AbstractHolidayCalendar):
     """NYSE trading-day closures.
 
@@ -33,7 +44,12 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
     """
 
     rules = [
-        Holiday("New Year's Day", month=1, day=1, observance=nearest_workday),
+        Holiday(
+            "New Year's Day",
+            month=1,
+            day=1,
+            observance=_nyse_new_year_observance,
+        ),
         USMartinLutherKingJr,
         USPresidentsDay,
         GoodFriday,
@@ -49,10 +65,66 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
         USLaborDay,
         USThanksgivingDay,
         Holiday("Christmas Day", month=12, day=25, observance=nearest_workday),
+        # One-off full-session closures are not covered by recurring holiday
+        # rules. Keep them explicit so a valid cache is not treated as missing
+        # and repeatedly downloaded.
+        Holiday(
+            "National Day of Mourning for Jimmy Carter",
+            month=1,
+            day=9,
+            start_date="2025-01-09",
+            end_date="2025-01-09",
+        ),
     ]
 
 
 _NYSE_HOLIDAYS = _NYSEHolidayCalendar()
+
+
+def _normalize_session_date(value) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tz is not None:
+        timestamp = timestamp.tz_localize(None)
+    return timestamp.normalize()
+
+
+def nyse_sessions(start, end) -> pd.DatetimeIndex:
+    """Return expected full NYSE sessions for an inclusive date range."""
+    start_ts = _normalize_session_date(start)
+    end_ts = _normalize_session_date(end)
+    if end_ts < start_ts:
+        return pd.DatetimeIndex([])
+    weekdays = pd.bdate_range(start_ts, end_ts)
+    holidays = _NYSE_HOLIDAYS.holidays(start=start_ts, end=end_ts)
+    return weekdays.difference(holidays)
+
+
+@lru_cache(maxsize=8192)
+def _next_nyse_session_ns(day_ns: int) -> int:
+    day_ts = pd.Timestamp(day_ns)
+    sessions = nyse_sessions(day_ts + pd.Timedelta(days=1), day_ts + pd.Timedelta(days=14))
+    if sessions.empty:
+        raise ValueError(f"No NYSE session found after {day_ts.date()}")
+    return pd.Timestamp(sessions[0]).value
+
+
+def next_nyse_session(day) -> pd.Timestamp:
+    day_ts = _normalize_session_date(day)
+    return pd.Timestamp(_next_nyse_session_ns(day_ts.value))
+
+
+@lru_cache(maxsize=8192)
+def _previous_nyse_session_ns(day_ns: int) -> int:
+    day_ts = pd.Timestamp(day_ns)
+    sessions = nyse_sessions(day_ts - pd.Timedelta(days=14), day_ts)
+    if sessions.empty:
+        raise ValueError(f"No NYSE session found on or before {day_ts.date()}")
+    return pd.Timestamp(sessions[-1]).value
+
+
+def previous_nyse_session(day) -> pd.Timestamp:
+    day_ts = _normalize_session_date(day)
+    return pd.Timestamp(_previous_nyse_session_ns(day_ts.value))
 
 
 class PriceRepository:
@@ -69,6 +141,8 @@ class PriceRepository:
             FROM prices
             WHERE ticker IN (SELECT UNNEST(?))
               AND date BETWEEN ? AND ?
+              AND close > 0
+              AND isfinite(close)
             ORDER BY date
         """,
             [tickers, start_date, end_date],
@@ -84,13 +158,37 @@ class PriceRepository:
         if df.empty:
             return
 
-        df_reset = df.reset_index().copy()
+        normalized = df.copy()
+        try:
+            index = pd.DatetimeIndex(pd.to_datetime(normalized.index))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Price index must contain valid dates") from exc
+        if index.tz is not None:
+            index = index.tz_localize(None)
+        index = index.normalize()
+        if index.has_duplicates:
+            raise ValueError("Price index contains duplicate calendar dates")
+        normalized.index = index
+
+        df_reset = normalized.reset_index().copy()
         index_col_name = df_reset.columns[0]
         prices_long = df_reset.melt(
             id_vars=[index_col_name], var_name="ticker", value_name="close"
         )
         prices_long = prices_long.rename(columns={index_col_name: "date"})
-        prices_long = prices_long.dropna(subset=["close"])
+        prices_long["close"] = pd.to_numeric(prices_long["close"], errors="coerce")
+        has_close = prices_long["close"].notna()
+        valid_close = (
+            has_close
+            & np.isfinite(prices_long["close"])
+            & (prices_long["close"] > 0)
+        )
+        rejected = int((has_close & ~valid_close).sum())
+        if rejected:
+            logger.warning("Rejected %d non-finite or non-positive price observations", rejected)
+        prices_long = prices_long.loc[valid_close]
+        if prices_long.empty:
+            return
 
         self.conn.execute("""
             INSERT INTO prices (ticker, date, close)
@@ -106,9 +204,7 @@ class PriceRepository:
         if not tickers:
             return [], []
 
-        business_dates = pd.bdate_range(start_date, end_date)
-        holidays = _NYSE_HOLIDAYS.holidays(start=start_date, end=end_date)
-        required_dates = business_dates.difference(holidays)
+        required_dates = nyse_sessions(start_date, end_date)
         if required_dates.empty:
             return [], []
 
@@ -118,6 +214,8 @@ class PriceRepository:
             FROM prices
             WHERE ticker IN (SELECT UNNEST(?))
               AND date BETWEEN ? AND ?
+              AND close > 0
+              AND isfinite(close)
         """,
             [tickers, start_date, end_date],
         ).fetchdf()
@@ -205,7 +303,7 @@ class PriceRepository:
             ),
             resolved_tickers AS (
                 SELECT t.*, COALESCE(tm.resolved, t.ticker) AS resolved_ticker
-                FROM transactions t
+                FROM canonical_transactions t
                 LEFT JOIN ticker_map tm ON t.ticker = tm.raw
             )
             SELECT r.member, r.ticker, r.disclosure_date, r.transaction_type,
@@ -216,9 +314,13 @@ class PriceRepository:
             ASOF LEFT JOIN prices p_res
               ON r.resolved_ticker = p_res.ticker
               AND p_res.date <= r.disclosure_date
+              AND p_res.close > 0
+              AND isfinite(p_res.close)
             ASOF LEFT JOIN prices p_raw
               ON r.ticker = p_raw.ticker
               AND p_raw.date <= r.disclosure_date
+              AND p_raw.close > 0
+              AND isfinite(p_raw.close)
             WHERE r.ticker IN (SELECT UNNEST(?))
               AND r.disclosure_date BETWEEN ? AND ?
               AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)

@@ -1,27 +1,25 @@
-"""Smoke tests for analyzer.options module."""
+"""Option return safety tests."""
 
 import unittest
 
-from analyzer.options import estimate_options_leverage
+from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
 
 
 class TestEstimateOptionsLeverage(unittest.TestCase):
-    def test_call_returns_positive_leverage(self):
-        result = estimate_options_leverage("call")
-        self.assertGreater(result, 1.0)
-        self.assertLessEqual(result, 15.0)
+    def test_stock_uses_observed_underlying_return(self):
+        self.assertEqual(estimate_options_leverage("stock"), 1.0)
 
-    def test_put_returns_negative_leverage(self):
-        result = estimate_options_leverage("put")
-        self.assertLess(result, 0.0)
-        self.assertGreaterEqual(result, -10.0)
+    def test_options_require_actual_contract_prices(self):
+        for instrument in ("call", "put", "option", "Stock Option"):
+            with self.subTest(instrument=instrument):
+                with self.assertRaisesRegex(
+                    UnsupportedOptionPricingError, "contract prices"
+                ):
+                    estimate_options_leverage(instrument, amount_midpoint=10_000_000)
 
-    def test_amount_adjustment_within_bounds(self):
-        # Large amount should pull leverage toward floor
-        high_amount = estimate_options_leverage("call", amount_midpoint=10_000_000)
-        small_amount = estimate_options_leverage("call", amount_midpoint=1_000)
-        # Large trades -> less leverage; small trades -> more leverage
-        self.assertLess(high_amount, small_amount)
+    def test_unknown_instrument_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported instrument"):
+            estimate_options_leverage("government securities")
 
 
 if __name__ == "__main__":

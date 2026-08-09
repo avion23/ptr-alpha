@@ -15,6 +15,7 @@ from analyzer import signals as _signals
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
+from analyzer.member_ranking.bayes import normal_normal_posteriors
 from analyzer.signals import (
     _apply_quality_filter,
     _collapse_to_episodes,
@@ -75,44 +76,42 @@ def _rank_members_impl(
 ) -> pd.DataFrame:
     purchases = _prepare_member_data(signal_df, horizon, threshold)
 
-    alpha_col = (
-        "total_spy_alpha_pct"
-        if "total_spy_alpha_pct" in purchases.columns
-        else "spy_alpha_pct"
-    )
-    prior_alpha_mean = float(purchases[alpha_col].mean())
-    if pd.isna(prior_alpha_mean):
-        prior_alpha_mean = 0.0
+    outcome_col = "total_spy_alpha_pct"
+    if outcome_col not in purchases.columns:
+        raise AnalysisError(
+            "Member ranking requires endpoint SPY alpha; total_spy_alpha_pct is missing"
+        )
+    purchases = purchases[purchases[outcome_col].notna()].copy()
+    if purchases.empty:
+        raise AnalysisError("No complete endpoint SPY-alpha outcomes found")
 
     grp = purchases.groupby("member")
-    ret_agg = _aggregate_returns(grp)
+    ret_agg = _aggregate_returns(grp, outcome_col)
     if ret_agg.empty:
         return pd.DataFrame()
 
     idx = ret_agg.index
     n = ret_agg["ret_nonnan"].astype(int)
-    wins = _wins_by_member(purchases, idx)
+    wins = _wins_by_member(purchases, idx, outcome_col)
 
+    # One common empirical prior is estimated from the training frame supplied
+    # by the caller. Every member is compared against the same reference
+    # population; complementary leave-one-member-out priors can reverse perfect
+    # and zero-win records and are not posterior probabilities on one scale.
     total_n = int(n.sum())
     total_wins = int(wins.sum())
-    global_prior = float(np.clip(total_wins / total_n, 0.10, 0.90))
-    peer_n = total_n - n
-    peer_wins = total_wins - wins
-    loo_priors = pd.Series(global_prior, index=idx, dtype=float)
-    has_peer_observations = peer_n > 0
-    loo_priors.loc[has_peer_observations] = np.clip(
-        peer_wins.loc[has_peer_observations] / peer_n.loc[has_peer_observations],
-        0.10,
-        0.90,
-    )
+    common_prior = float(np.clip(total_wins / total_n, 0.10, 0.90))
 
-    stats = _compute_bayes_stats(n, wins, loo_priors, _bayes_prior_strength, ret_agg)
+    stats = _compute_bayes_stats(n, wins, common_prior, _bayes_prior_strength, ret_agg)
     avg_spy, avg_total_spy = _spy_alpha_by_member(purchases, grp, idx)
     hit_rates = _hit_rates_by_member(purchases, idx, threshold)
     conviction = _conviction_scores(grp, idx, purchases)
-    shrunk_alpha = _shrunk_alpha_by_member(
-        grp, alpha_col, idx, prior_alpha_mean, _bayes_prior_strength
-    )
+    (
+        shrunk_alpha,
+        shrunk_alpha_std,
+        alpha_shrinkage,
+        alpha_effective_information,
+    ) = _shrunk_alpha_by_member(grp, outcome_col, idx, _bayes_prior_strength)
 
     avg_realized = (
         grp["total_return_pct"].mean().reindex(idx).fillna(0.0)
@@ -129,27 +128,35 @@ def _rank_members_impl(
         hit_rates,
         conviction,
         shrunk_alpha,
+        shrunk_alpha_std,
+        alpha_shrinkage,
+        alpha_effective_information,
         avg_realized,
     )
     return _finalize_ranking(result)
 
 
-def _aggregate_returns(grp) -> pd.DataFrame:
-    ret_agg = grp["decayed_return_pct"].agg(
+def _aggregate_returns(grp, outcome_col: str) -> pd.DataFrame:
+    diagnostic_col = (
+        "decayed_return_pct" if "decayed_return_pct" in grp.obj.columns else outcome_col
+    )
+    ret_agg = grp[diagnostic_col].agg(
         ret_nonnan="count",
         median_ret="median",
         mean_ret="mean",
         std_ret="std",
     )
+    ret_agg["ret_nonnan"] = grp[outcome_col].count().reindex(ret_agg.index)
     ret_agg = ret_agg[ret_agg["ret_nonnan"] > 0]
     if not ret_agg.empty:
         ret_agg["std_ret"] = ret_agg["std_ret"].fillna(0.0)
     return ret_agg
 
 
-def _wins_by_member(purchases: pd.DataFrame, idx) -> pd.Series:
+def _wins_by_member(purchases: pd.DataFrame, idx, outcome_col: str) -> pd.Series:
+    """Count profitable endpoint excess-alpha episodes per member."""
     return (
-        (purchases["decayed_return_pct"] > 0)
+        (purchases[outcome_col] > 0)
         .groupby(purchases["member"])
         .sum()
         .reindex(idx, fill_value=0)
@@ -158,15 +165,13 @@ def _wins_by_member(purchases: pd.DataFrame, idx) -> pd.Series:
 
 
 def _compute_bayes_stats(
-    n, wins, loo_priors, prior_strength: float, ret_agg: pd.DataFrame
+    n, wins, common_prior: float, prior_strength: float, ret_agg: pd.DataFrame
 ):
-    prior_values = loo_priors.to_numpy(dtype=float)
-    bayes_alpha = prior_values * prior_strength
-    bayes_beta = (1 - prior_values) * prior_strength
+    bayes_alpha = common_prior * prior_strength
+    bayes_beta = (1 - common_prior) * prior_strength
     n_vals = n.values.astype(float)
     wins_f = wins.values.astype(float)
     bayes_win_prob = (bayes_alpha + wins_f) / (bayes_alpha + bayes_beta + n_vals)
-    posterior_lift = bayes_win_prob / prior_values
     sharpe = np.where(
         ret_agg["std_ret"] > 0, ret_agg["mean_ret"] / ret_agg["std_ret"], 0.0
     )
@@ -174,7 +179,7 @@ def _compute_bayes_stats(
         "sharpe": sharpe,
         "prob_up": wins_f / n_vals,
         "bayes_win_prob": bayes_win_prob,
-        "posterior_lift": posterior_lift,
+        "prior_win_prob": np.full(len(n_vals), common_prior),
     }
 
 
@@ -227,13 +232,19 @@ def _conviction_scores(grp, idx, purchases: pd.DataFrame) -> np.ndarray:
     return count_scores * 0.6 + size_scores * 0.4
 
 
-def _shrunk_alpha_by_member(
-    grp, alpha_col: str, idx, prior_alpha_mean: float, prior_strength: float
-):
-    alpha_sums = grp[alpha_col].sum().reindex(idx).fillna(0.0)
-    alpha_counts = grp[alpha_col].count().reindex(idx).fillna(0).astype(int)
-    return (prior_alpha_mean * prior_strength + alpha_sums) / (
-        prior_strength + alpha_counts
+def _shrunk_alpha_by_member(grp, alpha_col: str, idx, prior_strength: float):
+    """Return one shared descriptive normal-normal member estimate."""
+    frame = grp.obj[["member", alpha_col]].dropna()
+    fit = normal_normal_posteriors(
+        frame[alpha_col].to_numpy(dtype=float),
+        frame["member"].to_numpy(dtype=object),
+        prior_strength=prior_strength,
+    ).reindex(idx)
+    return (
+        fit["posterior_mean"],
+        fit["posterior_std"],
+        fit["shrinkage"],
+        fit["effective_information"],
     )
 
 
@@ -246,6 +257,9 @@ def _build_ranking_result(
     hit_rates,
     conviction,
     shrunk_alpha,
+    shrunk_alpha_std,
+    alpha_shrinkage,
+    alpha_effective_information,
     avg_realized,
 ):
     result = pd.DataFrame(
@@ -257,7 +271,7 @@ def _build_ranking_result(
             "sharpe_ratio": np.round(stats["sharpe"], 3),
             "prob_up": np.round(stats["prob_up"], 3),
             "bayes_win_prob": np.round(stats["bayes_win_prob"], 3),
-            "posterior_lift": np.round(stats["posterior_lift"], 3),
+            "prior_win_prob": np.round(stats["prior_win_prob"], 3),
             "avg_return_pct": np.round(avg_realized.values, 2),
             "avg_spy_alpha_pct": np.round(avg_spy.values, 2),
             "avg_total_spy_alpha_pct": np.round(avg_total_spy.values, 2),
@@ -270,6 +284,9 @@ def _build_ranking_result(
             result["realized_hit_rate_pct"] = np.round(realized_hits.values, 2)
     result["conviction_score"] = np.round(conviction, 3)
     result["shrunk_alpha"] = shrunk_alpha.values
+    result["shrunk_alpha_std"] = shrunk_alpha_std.values
+    result["alpha_shrinkage"] = alpha_shrinkage.values
+    result["alpha_effective_information"] = alpha_effective_information.values
     return result
 
 

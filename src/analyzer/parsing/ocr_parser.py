@@ -5,13 +5,22 @@ fails. Rasterizes each page to a 200dpi image, runs tesseract on it, then
 extracts ticker / tx-type / date / amount rows from the resulting plaintext.
 """
 
-import logging
 import re
 from pathlib import Path
 
 from analyzer.models import TransactionType
 
-logger = logging.getLogger(__name__)
+
+class OcrBackendError(RuntimeError):
+    """The local OCR backend could not execute reliably."""
+
+
+class OcrIncompleteError(OcrBackendError):
+    """OCR ran but did not establish complete page coverage."""
+
+    def __init__(self, message: str, partial_tables: list[list[list[str]]]):
+        super().__init__(message)
+        self.partial_tables = partial_tables
 
 
 def _orient_image(image, pytesseract):
@@ -24,21 +33,40 @@ def _orient_image(image, pytesseract):
         # OSD reports the clockwise correction. PIL uses counter-clockwise
         # positive angles, so apply its inverse.
         return image.rotate(360 - int(match.group(1)), expand=True)
-    except Exception as e:
-        logger.debug("OCR orientation detection failed: %s", e)
-        return image
+    except Exception as exc:
+        raise OcrBackendError(f"orientation detection failed: {exc}") from exc
+
+
+def _date_pattern() -> str:
+    return r"(?:\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})|\d{4}-\d{2}-\d{2})"
+
+
+def _parse_tickerless_inline(stripped: str, amount_str: str | None):
+    for match in re.finditer(r"(?<![A-Z0-9])(PP?|SS?|E)(?![A-Z0-9])", stripped.upper()):
+        date_match = re.search(_date_pattern(), stripped[match.end() :])
+        asset_name = re.sub(r"(?:\[[^]]+\]\s*)+$", "", stripped[: match.start()]).strip(
+            " -|"
+        )
+        if not date_match or not asset_name:
+            continue
+        code = match.group(1)[0]
+        tx_type = {
+            "P": TransactionType.PURCHASE.value,
+            "S": TransactionType.SALE.value,
+            "E": TransactionType.EXCHANGE.value,
+        }[code]
+        return [asset_name, tx_type, date_match.group(0), amount_str or ""]
+    return None
 
 
 def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
     rows: list[list[str]] = []
-    lines = text.strip().split("\n")
     pending_tx: dict | None = None
 
-    for line in lines:
-        stripped = line.strip()
+    for raw_line in text.strip().splitlines():
+        stripped = raw_line.strip()
         if not stripped:
             continue
-
         ticker_match = re.search(r"\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)", stripped)
         amount_match = re.search(r"\$[\d,]+\s*-\s*\$[\d,]+", stripped)
         amount_str = amount_match.group(0) if amount_match else None
@@ -49,8 +77,25 @@ def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
             )
             if row is not None:
                 rows.append(row)
-        else:
-            pending_tx = _handle_continuation_line(stripped, amount_str)
+            continue
+
+        inline_row = _parse_tickerless_inline(stripped, amount_str)
+        if inline_row is not None:
+            rows.append(inline_row)
+            pending_tx = None
+            continue
+        if pending_tx and not re.search(_date_pattern(), stripped):
+            rows.append(
+                [
+                    stripped,
+                    pending_tx["tx_type"],
+                    pending_tx["date_str"],
+                    pending_tx.get("amount") or "",
+                ]
+            )
+            pending_tx = None
+            continue
+        pending_tx = _handle_continuation_line(stripped, amount_str)
 
     return rows
 
@@ -93,8 +138,8 @@ def _tx_type_and_date(rest_clean: str, rest: str) -> tuple[str | None, str | Non
         tx_type = TransactionType.EXCHANGE.value
 
     # Accept 1- or 2-digit month/day to match cells-level extractor behavior.
-    date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})", rest)
-    return tx_type, date_match.group(1) if date_match else None
+    date_match = re.search(_date_pattern(), rest)
+    return tx_type, date_match.group(0) if date_match else None
 
 
 def _handle_continuation_line(stripped: str, amount_str: str | None) -> dict | None:
@@ -121,47 +166,63 @@ def _handle_continuation_line(stripped: str, amount_str: str | None) -> dict | N
     if tx_type is None:
         return None
 
-    date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})", stripped)
+    date_match = re.search(_date_pattern(), stripped)
     if not date_match:
         return None
-    return {"tx_type": tx_type, "date_str": date_match.group(1), "amount": amount_str}
+    return {"tx_type": tx_type, "date_str": date_match.group(0), "amount": amount_str}
+
+
+def _reconcile_rows(*row_sets: list[list[str]]) -> list[list[str]]:
+    reconciled: list[list[str]] = []
+    seen = set()
+    for rows in row_sets:
+        for row in rows:
+            key = tuple(
+                re.sub(r"\s+", " ", str(cell)).strip().casefold() for cell in row
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            reconciled.append(row)
+    return reconciled
 
 
 def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
     try:
         from pdf2image import convert_from_path
         import pytesseract
-    except ImportError as e:
-        logger.warning(f"OCR dependencies not available: {e}")
-        return []
+    except ImportError as exc:
+        raise OcrBackendError(f"OCR dependencies unavailable: {exc}") from exc
 
     try:
         images = convert_from_path(str(pdf_path), dpi=200)
-    except (OSError, ValueError) as e:
-        logger.warning(f"Failed to convert PDF to images for OCR {pdf_path}: {e}")
-        return []
+    except (OSError, ValueError) as exc:
+        raise OcrBackendError(f"failed to rasterize {pdf_path}: {exc}") from exc
+    if not images:
+        raise OcrBackendError(f"rasterizer returned no pages for {pdf_path}")
 
-    all_rows = []
-    for image in images:
+    all_rows: list[list[str]] = []
+    incomplete_pages: list[str] = []
+    for page_number, image in enumerate(images, start=1):
         oriented_image = image
+        first_rows: list[list[str]] = []
         try:
-            text = pytesseract.image_to_string(image)
-            page_rows = _parse_ocr_text_to_rows(text)
-            if not page_rows:
-                oriented_image = _orient_image(image, pytesseract)
-                if oriented_image is not image:
-                    text = pytesseract.image_to_string(oriented_image)
-                    page_rows = _parse_ocr_text_to_rows(text)
+            first_text = pytesseract.image_to_string(image)
+            first_rows = _parse_ocr_text_to_rows(first_text)
+            oriented_image = _orient_image(image, pytesseract)
+            page_rows = first_rows
+            if oriented_image is not image:
+                oriented_text = pytesseract.image_to_string(oriented_image)
+                oriented_rows = _parse_ocr_text_to_rows(oriented_text)
+                page_rows = _reconcile_rows(first_rows, oriented_rows)
             all_rows.extend(page_rows)
-        except Exception as e:
-            # Tesseract can raise runtime errors per page (missing binary,
-            # corrupt image, decode failures). Skip the page rather than abort
-            # the whole PDF — other pages may OCR cleanly.
-            logger.warning(f"OCR failed for one page of {pdf_path}: {e}")
-            continue
+            if not page_rows:
+                incomplete_pages.append(f"page {page_number}: no transaction rows")
+        except Exception as exc:
+            # Retain diagnosable first-pass rows, but never promote them to success.
+            all_rows.extend(first_rows)
+            incomplete_pages.append(f"page {page_number}: {exc}")
         finally:
-            # pdf2image returns PIL images that hold raster data; close them
-            # promptly to avoid memory pressure on large multi-page PDFs.
             if oriented_image is not image:
                 oriented_close = getattr(oriented_image, "close", None)
                 if callable(oriented_close):
@@ -169,10 +230,18 @@ def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
             image_close = getattr(image, "close", None)
             if callable(image_close):
                 image_close()
-    if not all_rows:
-        return []
 
-    table = [
-        ["Asset Name", "Transaction Type", "Transaction Date", "Amount"]
-    ] + all_rows
+    table = (
+        [["Asset Name", "Transaction Type", "Transaction Date", "Amount"]] + all_rows
+        if all_rows
+        else []
+    )
+    if incomplete_pages:
+        partial_tables = [table] if table else []
+        raise OcrIncompleteError(
+            f"incomplete OCR for {pdf_path}: {'; '.join(incomplete_pages)}",
+            partial_tables,
+        )
+    if not table:
+        raise OcrIncompleteError(f"OCR produced no rows for {pdf_path}", [])
     return [table]

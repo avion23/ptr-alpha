@@ -1,9 +1,9 @@
-"""Tests for Kelly criterion portfolio construction."""
+"""Deterministic Kelly sizing and shared-capital portfolio canaries."""
 
-import math
-import unittest
+from datetime import date
 
 import pandas as pd
+import pytest
 
 from analyzer.portfolio import (
     KellyConfig,
@@ -11,235 +11,349 @@ from analyzer.portfolio import (
     compute_portfolio_metrics,
     simulate_portfolio_returns,
 )
+from analyzer.portfolio.simulation import _attach_sizing_inputs, _prepare_sizing_inputs
 
 
-def _make_recs(tickers, scores=None, win_rates=None, crash_probs=None):
-    """Create a synthetic recommendations DataFrame."""
+def _sizing_rows(tickers, members=None):
     n = len(tickers)
-    if scores is None:
-        scores = list(range(n, 0, -1))
-    if win_rates is None:
-        win_rates = [0.6] * n
-    if crash_probs is None:
-        crash_probs = [0.0] * n
     return pd.DataFrame(
         {
-            "rank": range(1, n + 1),
             "ticker": tickers,
-            "signal_score": scores,
-            "win_rate": win_rates,
-            "crash_prob": crash_probs,
-            "member": ["m1", "m2", "m3", "m4", "m5"][:n],
+            "member": members or [f"member-{i}" for i in range(n)],
+            "signal_score": list(range(n, 0, -1)),
+            "win_rate": [0.60] * n,
+            "avg_win_pct": [1.50] * n,
+            "avg_loss_pct": [1.20] * n,
+            "crash_prob": [0.0] * n,
         }
     )
 
 
-def _make_prices(tickers, start, end, base_prices=None, daily_drift=0.0):
-    """Create a synthetic prices DataFrame."""
-    dates = pd.date_range(start, end, freq="D")
-    if base_prices is None:
-        base_prices = {t: 100.0 + i * 10 for i, t in enumerate(tickers)}
-    data = {}
-    for ticker in tickers:
-        base = base_prices.get(ticker, 100.0)
-        data[ticker] = [base * (1 + daily_drift * i) for i in range(len(dates))]
-    return pd.DataFrame(data, index=dates)
+def test_half_kelly_retains_absolute_fourteen_percent_bankroll():
+    # p=.60, b=1.5/1.2=1.25 -> full Kelly .28 -> half Kelly .14.
+    portfolio = build_kelly_portfolio(
+        _sizing_rows(["A"]),
+        KellyConfig(capital=100, max_ticker_pct=1, max_member_pct=1),
+    )
+
+    assert portfolio.iloc[0]["kelly_fraction"] == pytest.approx(0.14)
+    assert portfolio.iloc[0]["weight"] == pytest.approx(0.14)
+    assert portfolio.iloc[0]["position_value"] == pytest.approx(14.0)
 
 
-class TestBuildKellyPortfolio(unittest.TestCase):
-    def test_basic_sizing(self):
-        recs = _make_recs(["A", "B", "C"])
-        portfolio = build_kelly_portfolio(recs, KellyConfig(capital=100_000))
-        self.assertGreater(len(portfolio), 0)
-        self.assertTrue("ticker" in portfolio.columns)
-        self.assertTrue("weight" in portfolio.columns)
-        self.assertTrue("kelly_fraction" in portfolio.columns)
-        self.assertTrue("position_value" in portfolio.columns)
+def test_missing_or_placeholder_outcome_inputs_abstain():
+    assert build_kelly_portfolio(pd.DataFrame({"ticker": ["A"]})).empty
+    rows = _sizing_rows(["A"])
+    rows.loc[0, "member"] = "unknown"
+    assert build_kelly_portfolio(rows).empty
+    rows = _sizing_rows(["A"])
+    rows.loc[0, "avg_loss_pct"] = float("nan")
+    assert build_kelly_portfolio(rows).empty
 
-    def test_weights_sum_to_at_most_one(self):
-        recs = _make_recs(["A", "B", "C", "D"])
-        portfolio = build_kelly_portfolio(recs, KellyConfig(capital=100_000))
-        total_weight = portfolio["weight"].sum()
-        self.assertLessEqual(total_weight, 1.0 + 0.01)
-        self.assertGreater(total_weight, 0.0)
 
-    def test_position_values_sum_to_capital(self):
-        # Use relaxed caps so all capital can be deployed
-        recs = _make_recs(["A", "B", "C"])
-        portfolio = build_kelly_portfolio(
-            recs, KellyConfig(capital=100_000, max_member_pct=1.0, max_ticker_pct=1.0)
-        )
-        total_value = portfolio["position_value"].sum()
-        self.assertAlmostEqual(total_value, 100_000, delta=1000)
+def test_correlated_member_cap_reduces_without_redistribution():
+    rows = _sizing_rows(["A", "B"], members=["same", "same"])
+    portfolio = build_kelly_portfolio(
+        rows,
+        KellyConfig(
+            capital=100, max_ticker_pct=1, max_member_pct=0.20,
+            total_exposure_pct=1,
+        ),
+    )
 
-    def test_max_ticker_cap(self):
-        # One very strong signal should be capped at 20%
-        recs = _make_recs(["A", "B"], scores=[100, 1], win_rates=[0.8, 0.5])
-        portfolio = build_kelly_portfolio(
-            recs, KellyConfig(capital=100_000, max_ticker_pct=0.20)
-        )
-        max_weight = portfolio["weight"].max()
-        self.assertLessEqual(max_weight, 0.20 + 0.01)  # small tolerance
+    assert portfolio["kelly_fraction"].tolist() == pytest.approx([0.14, 0.14])
+    assert portfolio.groupby("member")["weight"].sum().iloc[0] == pytest.approx(0.20)
+    assert sorted(portfolio["weight"].tolist()) == pytest.approx([0.10, 0.10])
 
-    def test_max_member_cap(self):
-        # Same member on multiple tickers
-        recs = pd.DataFrame(
+
+def test_ticker_cap_applies_to_aggregate_duplicate_ticker_exposure():
+    rows = _sizing_rows(["A", "A"], members=["one", "two"])
+    portfolio = build_kelly_portfolio(
+        rows,
+        KellyConfig(capital=100, max_ticker_pct=0.20, max_member_pct=1),
+    )
+    assert portfolio.groupby("ticker")["weight"].sum().iloc[0] == pytest.approx(0.20)
+
+
+def test_crash_probability_is_not_applied_twice_by_default():
+    rows = _sizing_rows(["A", "B"])
+    rows["crash_prob"] = [0.5, 0.0]
+    portfolio = build_kelly_portfolio(
+        rows, KellyConfig(capital=100, max_ticker_pct=1, max_member_pct=1)
+    )
+    assert portfolio.set_index("ticker").loc["A", "weight"] == pytest.approx(
+        portfolio.set_index("ticker").loc["B", "weight"]
+    )
+
+
+def test_overlapping_full_bankroll_signal_cannot_reuse_one_hundred_dollars():
+    targets = pd.DataFrame(
+        {
+            "as_of_date": [date(2024, 1, 1), date(2024, 1, 31)],
+            "ticker": ["A", "B"],
+            "weight": [1.0, 1.0],
+        }
+    )
+    prices = pd.DataFrame(
+        {
+            "A": [100.0, 100.0, 110.0, 110.0],
+            "B": [None, 100.0, 100.0, 110.0],
+        },
+        index=pd.to_datetime(["2024-01-01", "2024-01-31", "2024-03-01", "2024-03-31"]),
+    )
+
+    curve = simulate_portfolio_returns(
+        targets, prices, horizon=60, entry_slippage_bps=0,
+        exit_slippage_bps=0, initial_capital=100,
+    )
+    metrics = compute_portfolio_metrics(curve)
+    final = curve.iloc[-1]
+
+    assert final["executed_positions"] == 1
+    assert final["skipped_signals"] == 1
+    assert final["closed_positions"] == 1
+    assert final["liquidation_value"] == pytest.approx(110.0)
+    assert metrics["total_return_pct"] == pytest.approx(10.0)
+    assert metrics["gross_traded_notional"] == pytest.approx(210.0)
+
+
+def test_open_position_reports_liquidation_cost_and_exposure():
+    targets = pd.DataFrame(
+        {"as_of_date": [date(2024, 1, 1)], "ticker": ["A"], "weight": [1.0]}
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0, 100.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+    )
+    curve = simulate_portfolio_returns(
+        targets, prices, horizon=60, entry_slippage_bps=0,
+        exit_slippage_bps=100, initial_capital=100,
+    )
+    metrics = compute_portfolio_metrics(curve)
+
+    assert metrics["open_positions"] == 1
+    assert metrics["open_exposure"] == pytest.approx(100.0)
+    assert metrics["estimated_liquidation_cost"] == pytest.approx(1.0)
+    assert metrics["total_return_pct"] == pytest.approx(-1.0)
+    assert metrics["close_coverage_pct"] == 0.0
+
+
+def test_metrics_anchor_drawdown_and_annualize_from_actual_dates():
+    curve = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-12-31"]),
+            "simulation_start": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "initial_capital": [100.0, 100.0],
+            "liquidation_value": [90.0, 110.0],
+            "gross_traded_notional": [100.0, 200.0],
+        }
+    )
+    metrics = compute_portfolio_metrics(curve)
+
+    assert metrics["total_return_pct"] == pytest.approx(10.0)
+    assert metrics["annualized_return_pct"] == pytest.approx(10.0, abs=0.05)
+    assert metrics["max_drawdown_pct"] == pytest.approx(-10.0)
+    assert metrics["elapsed_days"] == 365
+
+
+def test_initial_capital_is_explicit_or_unambiguously_inferred():
+    targets = pd.DataFrame(
+        {"as_of_date": [date(2024, 1, 1)], "ticker": ["A"], "weight": [0.1]}
+    )
+    prices = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-01"]))
+    with pytest.raises(ValueError, match="initial_capital"):
+        simulate_portfolio_returns(targets, prices)
+
+
+def test_empty_inputs_abstain():
+    assert build_kelly_portfolio(pd.DataFrame()).empty
+    assert simulate_portfolio_returns(pd.DataFrame(), pd.DataFrame()).empty
+    assert compute_portfolio_metrics(pd.DataFrame()) == {}
+
+
+def test_zero_mark_is_preserved_as_total_loss():
+    targets = pd.DataFrame(
+        {"as_of_date": [date(2024, 1, 1)], "ticker": ["A"], "weight": [1.0]}
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0, 0.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+    )
+
+    curve = simulate_portfolio_returns(
+        targets, prices, horizon=60, entry_slippage_bps=0,
+        exit_slippage_bps=0, initial_capital=100,
+    )
+    metrics = compute_portfolio_metrics(curve)
+
+    assert curve.iloc[-1]["open_exposure"] == 0.0
+    assert curve.iloc[-1]["liquidation_value"] == 0.0
+    assert metrics["total_return_pct"] == -100.0
+    assert metrics["valuation_complete"] is True
+
+
+def test_stale_open_mark_makes_equity_unavailable_and_blocks_new_sizing():
+    targets = pd.DataFrame(
+        {
+            "as_of_date": [date(2024, 1, 1), date(2024, 1, 10)],
+            "ticker": ["A", "B"],
+            "weight": [0.5, 0.5],
+        }
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0, None], "B": [10.0, 10.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-10"]),
+    )
+
+    curve = simulate_portfolio_returns(
+        targets, prices, horizon=60, entry_slippage_bps=0, exit_slippage_bps=0,
+        initial_capital=100, max_mark_staleness_days=3,
+    )
+    metrics = compute_portfolio_metrics(curve)
+    final = curve.iloc[-1]
+
+    assert pd.isna(final["liquidation_value"])
+    assert final["unavailable_open_positions"] == 1
+    assert final["valuation_skips"] == 1
+    assert final["executed_positions"] == 1
+    assert metrics["valuation_complete"] is False
+    assert metrics["total_return_pct"] is None
+    assert metrics["open_exposure"] is None
+
+
+def test_enabled_crash_guard_abstains_on_missing_or_malformed_probability():
+    rows = _sizing_rows(["A"])
+    missing = rows.drop(columns="crash_prob")
+    assert build_kelly_portfolio(missing, KellyConfig(crash_guard=True)).empty
+
+    malformed = rows.copy()
+    malformed.loc[0, "crash_prob"] = float("nan")
+    assert build_kelly_portfolio(malformed, KellyConfig(crash_guard=True)).empty
+
+    certain_crash = rows.copy()
+    certain_crash.loc[0, "crash_prob"] = 1.0
+    assert build_kelly_portfolio(certain_crash, KellyConfig(crash_guard=True)).empty
+
+    outside_range = rows.copy()
+    outside_range.loc[0, "crash_prob"] = 1.1
+    assert build_kelly_portfolio(outside_range, KellyConfig(crash_guard=True)).empty
+
+
+def test_raw_invalid_targets_count_in_requested_coverage_and_skips():
+    targets = pd.DataFrame(
+        {
+            "as_of_date": [date(2024, 1, 1)] * 3,
+            "ticker": ["A", "B", ""],
+            "weight": [0.1, float("nan"), 0.1],
+        }
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0], "B": [100.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+
+    final = simulate_portfolio_returns(
+        targets, prices, initial_capital=100, entry_slippage_bps=0,
+        exit_slippage_bps=0,
+    ).iloc[-1]
+
+    assert final["requested_signals"] == 3
+    assert final["invalid_target_skips"] == 2
+    assert final["skipped_signals"] == 2
+    assert final["executed_positions"] == 1
+    assert final["signal_coverage_pct"] == pytest.approx(100 / 3)
+
+
+def test_all_or_skip_policy_never_counts_partial_fill_as_execution():
+    targets = pd.DataFrame(
+        {
+            "as_of_date": [date(2024, 1, 1), date(2024, 1, 1)],
+            "ticker": ["A", "B"],
+            "weight": [0.8, 0.8],
+        }
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0], "B": [100.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+
+    final = simulate_portfolio_returns(
+        targets, prices, initial_capital=100, entry_slippage_bps=0,
+        exit_slippage_bps=0,
+    ).iloc[-1]
+
+    assert final["execution_policy"] == "all_or_skip"
+    assert final["executed_positions"] == 1
+    assert final["cash_skips"] == 1
+    assert final["partial_fills"] == 0
+    assert final["requested_entry_notional"] == pytest.approx(160.0)
+    assert final["filled_entry_notional"] == pytest.approx(80.0)
+    assert final["notional_fill_pct"] == pytest.approx(50.0)
+
+
+def test_sizing_estimate_uses_latest_date_not_after_rebalance():
+    sizing = _prepare_sizing_inputs(
+        pd.DataFrame(
             {
-                "rank": [1, 2, 3],
-                "ticker": ["A", "B", "C"],
-                "signal_score": [30, 20, 10],
-                "win_rate": [0.6, 0.6, 0.6],
-                "crash_prob": [0.0, 0.0, 0.0],
-                "member": ["same", "same", "other"],
+                "as_of_date": ["2023-12-01", "2024-01-01", "2024-02-01"],
+                "ticker": ["A", "A", "A"],
+                "member": ["m", "m", "m"],
+                "win_rate": [0.55, 0.60, 0.90],
+                "avg_win_pct": [1.5, 1.5, 9.0],
+                "avg_loss_pct": [1.2, 1.2, 1.0],
             }
         )
-        portfolio = build_kelly_portfolio(
-            recs, KellyConfig(capital=100_000, max_member_pct=0.05)
-        )
-        member_weights = portfolio.groupby("member")["weight"].sum()
-        self.assertLessEqual(member_weights.get("same", 0), 0.05 + 0.01)
+    )
+    recs = pd.DataFrame({"ticker": ["A"], "signal_score": [1.0]})
 
-    def test_crash_guard_reduces_kelly_fraction(self):
-        recs = _make_recs(["A", "B"], scores=[10, 10], crash_probs=[0.5, 0.0])
-        portfolio = build_kelly_portfolio(
-            recs, KellyConfig(capital=100_000, crash_guard=True)
-        )
-        kellys = portfolio.set_index("ticker")["kelly_fraction"]
-        if "A" in kellys.index and "B" in kellys.index:
-            self.assertLess(kellys["A"], kellys["B"])
+    attached = _attach_sizing_inputs(recs, sizing, pd.Timestamp("2024-01-15"))
 
-    def test_crash_guard_no_guard_equal(self):
-        recs = _make_recs(["A", "B"], scores=[10, 10], crash_probs=[0.5, 0.0])
-        no_guard = build_kelly_portfolio(
-            recs, KellyConfig(capital=100_000, crash_guard=False)
-        )
-        kellys = no_guard.set_index("ticker")["kelly_fraction"]
-        if "A" in kellys.index and "B" in kellys.index:
-            self.assertAlmostEqual(kellys["A"], kellys["B"], places=6)
-
-    def test_empty_recommendations(self):
-        portfolio = build_kelly_portfolio(pd.DataFrame())
-        self.assertTrue(portfolio.empty)
-
-    def test_all_zero_crash_probs(self):
-        recs = _make_recs(["A", "B"], crash_probs=[0.0, 0.0])
-        portfolio = build_kelly_portfolio(recs, KellyConfig(crash_guard=True))
-        self.assertGreater(len(portfolio), 0)
-
-    def test_low_win_rate_filtering(self):
-        # Very low win rates should produce zero Kelly -> filtered out
-        recs = _make_recs(["A", "B"], win_rates=[0.3, 0.3])
-        portfolio = build_kelly_portfolio(recs)
-        # With p=0.3, Kelly should be 0 or very low
-        if len(portfolio) > 0:
-            self.assertTrue(all(portfolio["kelly_fraction"] >= 0))
+    assert attached.iloc[0]["win_rate"] == pytest.approx(0.60)
+    assert attached.iloc[0]["avg_win_pct"] == pytest.approx(1.5)
 
 
-class TestSimulatePortfolioReturns(unittest.TestCase):
-    def test_single_period(self):
-        recs = _make_recs(["A", "B"], scores=[10, 5])
-        portfolio = build_kelly_portfolio(recs, KellyConfig(capital=100_000))
-        prices = _make_prices(
-            ["A", "B", "SPY"],
-            "2024-01-01",
-            "2024-04-01",
-            base_prices={"A": 100, "B": 110, "SPY": 400},
-        )
-        portfolio["as_of_date"] = pd.Timestamp("2024-01-01").date()
-        result = simulate_portfolio_returns(portfolio, prices, horizon=60)
-        self.assertGreater(len(result), 0)
-        self.assertIn("portfolio_return", result.columns)
-        self.assertIn("spy_return", result.columns)
-        self.assertIn("portfolio_alpha", result.columns)
+def test_sizing_estimate_duplicates_and_malformed_rows_fail_clearly():
+    duplicate = pd.DataFrame(
+        {
+            "as_of_date": ["2024-01-01", "2024-01-01"],
+            "ticker": ["A", "A"],
+            "member": ["m", "m"],
+            "win_rate": [0.6, 0.7],
+            "avg_win_pct": [1.5, 1.5],
+            "avg_loss_pct": [1.2, 1.2],
+        }
+    )
+    with pytest.raises(ValueError, match="duplicate dated ticker"):
+        _prepare_sizing_inputs(duplicate)
 
-    def test_zero_entry_price_skips_position_and_spy_return(self):
-        portfolio = pd.DataFrame(
-            {
-                "ticker": ["A"],
-                "weight": [1.0],
-                "as_of_date": [pd.Timestamp("2024-01-01").date()],
-            }
-        )
-        prices = pd.DataFrame(
-            {"A": [0.0, 1.0], "SPY": [0.0, 1.0]},
-            index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
-        )
-
-        result = simulate_portfolio_returns(
-            portfolio,
-            prices,
-            horizon=1,
-            entry_slippage_bps=0.0,
-            exit_slippage_bps=0.0,
-        )
-
-        self.assertEqual(result.iloc[0]["num_positions"], 0)
-        self.assertEqual(result.iloc[0]["portfolio_return"], 0.0)
-        self.assertEqual(result.iloc[0]["spy_return"], 0.0)
-
-    def test_zero_exit_price_with_positive_entry_is_full_loss(self):
-        portfolio = pd.DataFrame(
-            {
-                "ticker": ["A"],
-                "weight": [1.0],
-                "as_of_date": [pd.Timestamp("2024-01-01").date()],
-            }
-        )
-        prices = pd.DataFrame(
-            {"A": [100.0, 0.0], "SPY": [100.0, 0.0]},
-            index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
-        )
-
-        result = simulate_portfolio_returns(
-            portfolio,
-            prices,
-            horizon=1,
-            entry_slippage_bps=0.0,
-            exit_slippage_bps=0.0,
-        )
-
-        self.assertEqual(result.iloc[0]["num_positions"], 1)
-        self.assertEqual(result.iloc[0]["portfolio_return"], -100.0)
-        self.assertEqual(result.iloc[0]["spy_return"], -100.0)
+    malformed = duplicate.iloc[:1].copy()
+    malformed.loc[0, "as_of_date"] = "not-a-date"
+    with pytest.raises(ValueError, match="malformed rows"):
+        _prepare_sizing_inputs(malformed)
 
 
-class TestComputePortfolioMetrics(unittest.TestCase):
-    def test_empty_returns(self):
-        metrics = compute_portfolio_metrics(pd.DataFrame())
-        self.assertEqual(metrics, {})
+def test_metrics_reject_nan_gross_notional_and_invalid_required_dates():
+    base_curve = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01"]),
+            "simulation_start": pd.to_datetime(["2024-01-01"]),
+            "initial_capital": [100.0],
+            "liquidation_value": [100.0],
+            "gross_traded_notional": [0.0],
+        }
+    )
 
-    def test_max_drawdown_captures_first_period_loss(self):
-        # Regression: equity curve must be anchored to 1.0 so a first-period
-        # loss counts as a drawdown from starting capital.
-        df = pd.DataFrame(
-            {
-                "as_of_date": ["2024-01-01", "2024-02-01"],
-                "portfolio_return": [-10.0, 5.0],
-                "spy_return": [0.0, 0.0],
-                "portfolio_alpha": [-10.0, 5.0],
-                "num_positions": [1, 1],
-            }
-        )
-        metrics = compute_portfolio_metrics(df)
-        # Worst drawdown is the first-period -10% loss from starting capital.
-        self.assertAlmostEqual(metrics["max_drawdown_pct"], -10.0, places=2)
+    nan_gross = base_curve.copy()
+    nan_gross.loc[0, "gross_traded_notional"] = float("nan")
+    with pytest.raises(ValueError, match="gross_traded_notional"):
+        compute_portfolio_metrics(nan_gross)
 
-    def test_avg_alpha_handles_nan(self):
-        # Regression: NaN alphas must not propagate; mean should skip them.
-        df = pd.DataFrame(
-            {
-                "as_of_date": ["2024-01-01", "2024-02-01", "2024-03-01"],
-                "portfolio_return": [1.0, float("nan"), 2.0],
-                "spy_return": [0.0, 0.0, 0.0],
-                "portfolio_alpha": [1.0, float("nan"), 2.0],
-                "num_positions": [1, 1, 1],
-            }
-        )
-        metrics = compute_portfolio_metrics(df)
-        # avg of [1.0, 2.0] skipping NaN = 1.5
-        self.assertAlmostEqual(metrics["avg_alpha_per_period_pct"], 1.5, places=2)
-        self.assertFalse(math.isnan(metrics["avg_alpha_per_period_pct"]))
+    invalid_date = base_curve.copy()
+    invalid_date.loc[0, "date"] = pd.NaT
+    with pytest.raises(ValueError, match="valid dates"):
+        compute_portfolio_metrics(invalid_date)
 
-
-if __name__ == "__main__":
-    unittest.main()
+    invalid_start = base_curve.copy()
+    invalid_start.loc[0, "simulation_start"] = pd.NaT
+    with pytest.raises(ValueError, match="valid dates"):
+        compute_portfolio_metrics(invalid_start)

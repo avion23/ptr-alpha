@@ -1,13 +1,22 @@
-"""Portfolio-level simulation with overlapping positions and realistic constraints."""
+"""Shared-cash portfolio simulation with causal session-aligned execution."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
+from typing import Mapping
 
 import numpy as np
 import pandas as pd
+
+from analyzer.backtest.prices import (
+    AlignedPrice,
+    _aligned_price_at_or_before_arrays,
+    _aligned_price_on_or_after_arrays,
+    _next_tradable_price_arrays,
+)
+from analyzer.signals import _price_arrays
 
 logger = logging.getLogger(__name__)
 
@@ -16,25 +25,37 @@ logger = logging.getLogger(__name__)
 class PortfolioConfig:
     initial_capital: float = 20000.0
     max_positions: int = 5
-    max_position_pct: float = 0.25  # max 25% per position
-    max_sector_pct: float = 0.40  # max 40% per sector
+    max_position_pct: float = 0.25
+    max_sector_pct: float = 0.40
     rebalance_freq_days: int = 14
     hold_period_days: int = 120
-    entry_slippage_pct: float = 0.001  # 10bps
+    entry_slippage_pct: float = 0.001
     exit_slippage_pct: float = 0.001
     min_signal_score: float = 0.0
+    max_price_staleness_days: int = 5
+    max_execution_wait_days: int = 7
+    sector_by_ticker: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class PortfolioPosition:
     ticker: str
+    signal_date: date
     entry_date: date
     entry_price: float
     shares: int
     cost: float
+    entry_notional: float
     sector: str
     signal_score: float
     rank: int
+
+
+@dataclass(frozen=True, slots=True)
+class PendingEntry:
+    recommendation: pd.Series
+    signal_date: date
+    execution: AlignedPrice
 
 
 @dataclass
@@ -43,8 +64,13 @@ class PortfolioSnapshot:
     cash: float
     positions: list[PortfolioPosition]
     total_value: float
+    dollar_exposure: float
     unrealized_pnl: float
     realized_pnl: float
+
+
+class PortfolioValuationUnavailable(RuntimeError):
+    """Raised when an open position has no bounded observable mark."""
 
 
 class PortfolioSimulator:
@@ -52,8 +78,14 @@ class PortfolioSimulator:
         self.config = config
         self.cash = config.initial_capital
         self.positions: list[PortfolioPosition] = []
+        self.pending_entries: list[PendingEntry] = []
         self.closed_positions: list[dict] = []
+        self.rejected_orders: list[dict] = []
         self.snapshots: list[PortfolioSnapshot] = []
+        self.gross_traded_notional = 0.0
+        self.valuation_unavailable_dates: list[date] = []
+        self._scheduled_signals: set[tuple[date, str]] = set()
+        self._simulation_end_date: date | None = None
 
     def run(
         self,
@@ -62,366 +94,521 @@ class PortfolioSimulator:
         start_date: date,
         end_date: date,
     ) -> pd.DataFrame:
-        """Run portfolio simulation across all dates.
+        """Run daily accounting; end-of-day signals execute next session."""
+        if end_date < start_date:
+            raise ValueError("end_date must be on or after start_date")
+        if self.config.rebalance_freq_days < 1:
+            raise ValueError("rebalance_freq_days must be positive")
 
-        `recommendations` is the full DataFrame from `backtest_recommendations`
-        (may contain rows from multiple as_of dates, each with an `as_of_date`
-        column).  If there is no `as_of_date` column the caller is expected to
-        supply a single set of recommendations that applies to the whole period.
-
-        Returns a DataFrame of daily portfolio snapshots.
-        """
-        has_as_of = "as_of_date" in recommendations.columns
+        self._simulation_end_date = end_date
+        recs = recommendations.copy()
+        has_as_of = "as_of_date" in recs.columns
         if has_as_of:
-            recommendations = recommendations.copy()
-            recommendations["as_of_date"] = pd.to_datetime(
-                recommendations["as_of_date"]
-            )
+            recs["as_of_date"] = pd.to_datetime(recs["as_of_date"])
 
         current = start_date
         while current <= end_date:
             self._try_exit_expired(prices_df, current)
+            self._execute_pending_entries(prices_df, current)
 
-            if has_as_of:
-                as_of_candidates = recommendations[
-                    recommendations["as_of_date"].dt.date == current
-                ]
-            else:
-                as_of_candidates = recommendations
+            is_rebalance = (
+                current - start_date
+            ).days % self.config.rebalance_freq_days == 0
+            if is_rebalance:
+                if has_as_of:
+                    candidates = recs[recs["as_of_date"].dt.date == current]
+                else:
+                    candidates = recs
+                self._schedule_entries(candidates, prices_df, current)
 
-            if not as_of_candidates.empty:
-                sorted_recs = as_of_candidates.sort_values(
-                    "signal_score", ascending=False
-                )
-                for _, rec in sorted_recs.iterrows():
-                    if len(self.positions) >= self.config.max_positions:
-                        break
-                    self._try_enter(rec, prices_df, current)
-
-            self._record_snapshot(prices_df, current)
+            try:
+                self._record_snapshot(prices_df, current)
+            except PortfolioValuationUnavailable:
+                self.valuation_unavailable_dates.append(current)
             current += timedelta(days=1)
 
         return self.results()
 
-    def _try_enter(self, rec: pd.Series, prices_df: pd.DataFrame, as_of: date):
-        """Attempt to enter a position if constraints allow."""
-        ticker = rec["ticker"]
+    def _schedule_entries(
+        self, candidates: pd.DataFrame, prices_df: pd.DataFrame, signal_date: date
+    ) -> None:
+        if candidates.empty:
+            return
+        for _, rec in candidates.sort_values(
+            "signal_score", ascending=False
+        ).iterrows():
+            ticker = str(rec["ticker"])
+            key = (signal_date, ticker)
+            if key in self._scheduled_signals:
+                continue
+            self._scheduled_signals.add(key)
+            if float(rec.get("signal_score", 0)) < self.config.min_signal_score:
+                self._reject(ticker, signal_date, "signal_below_minimum")
+                continue
+            if any(p.ticker == ticker for p in self.positions) or any(
+                p.recommendation["ticker"] == ticker for p in self.pending_entries
+            ):
+                self._reject(ticker, signal_date, "already_held_or_pending")
+                continue
 
-        # Skip if already holding this ticker
-        if any(p.ticker == ticker for p in self.positions):
+            arrays = _price_arrays(prices_df, ticker)
+            if arrays is None or arrays[0] is None:
+                self._reject(ticker, signal_date, "no_price_history")
+                continue
+            execution = _next_tradable_price_arrays(
+                arrays[0],
+                arrays[1],
+                signal_date,
+                max_wait_days=self.config.max_execution_wait_days,
+            )
+            if execution is None:
+                self._reject(ticker, signal_date, "no_next_tradable_session")
+                continue
+            self.pending_entries.append(
+                PendingEntry(rec.copy(), signal_date, execution)
+            )
+
+    def _execute_pending_entries(self, prices_df: pd.DataFrame, current: date) -> None:
+        due = [p for p in self.pending_entries if p.execution.date.date() <= current]
+        self.pending_entries = [
+            p for p in self.pending_entries if p.execution.date.date() > current
+        ]
+        for order in sorted(
+            due,
+            key=lambda p: float(p.recommendation.get("signal_score", 0)),
+            reverse=True,
+        ):
+            if len(self.positions) >= self.config.max_positions:
+                self._reject(
+                    str(order.recommendation["ticker"]), current, "max_positions"
+                )
+                continue
+            try:
+                self._try_enter(order, prices_df, current)
+            except PortfolioValuationUnavailable:
+                self._reject(
+                    str(order.recommendation["ticker"]),
+                    current,
+                    "portfolio_valuation_unavailable",
+                )
+
+    def _try_enter(
+        self, order: PendingEntry, prices_df: pd.DataFrame, execution_date: date
+    ) -> None:
+        rec = order.recommendation
+        ticker = str(rec["ticker"])
+        if order.execution.date.date() != execution_date:
+            self._reject(ticker, execution_date, "execution_date_mismatch")
+            return
+        raw_price = order.execution.price
+        if not np.isfinite(raw_price) or raw_price <= 0:
+            self._reject(ticker, execution_date, "invalid_entry_price")
             return
 
-        # Check min signal score
-        signal_score = float(rec.get("signal_score", 0))
-        if signal_score < self.config.min_signal_score:
-            return
-
-        # Get entry price with slippage
-        as_of_ts = pd.Timestamp(as_of)
-        if ticker not in prices_df.columns:
-            return
-        price_series = prices_df[ticker].dropna()
-        if price_series.empty:
-            return
-        # Ensure index is DatetimeIndex for comparison
-        if not isinstance(price_series.index, pd.DatetimeIndex):
-            price_series.index = pd.to_datetime(price_series.index)
-        eligible = price_series[price_series.index <= as_of_ts]
-        if eligible.empty:
-            return
-        raw_price = float(eligible.iloc[-1])
-        entry_price = raw_price * (1 + self.config.entry_slippage_pct)
-
-        # Calculate available cash and position sizing
-        total_value = self._total_value(prices_df, as_of)
-        available_slots = self.config.max_positions - len(self.positions)
-        if available_slots <= 0:
-            return
-
-        # Equal-weight among available slots, capped by max_position_pct
+        sector = self._get_sector(ticker, rec)
+        total_value = self._total_value(prices_df, execution_date)
         target_pct = min(1.0 / self.config.max_positions, self.config.max_position_pct)
         target_value = total_value * target_pct
 
-        # Sector constraint check (mark-to-market, consistent with total_value)
-        sector = self._get_sector(ticker)
-        sector_exposure = self._sector_exposure(prices_df, as_of)
-        current_sector_pct = sector_exposure.get(sector, 0.0)
-        max_sector_value = total_value * self.config.max_sector_pct
-        current_sector_value = current_sector_pct * total_value
-        sector_room = max_sector_value - current_sector_value
+        sector_exposure = self._sector_exposure(prices_df, execution_date)
+        current_sector_value = sector_exposure.get(sector, 0.0) * total_value
+        sector_room = total_value * self.config.max_sector_pct - current_sector_value
         if sector_room <= 0:
+            self._reject(ticker, execution_date, "sector_limit")
             return
 
+        entry_price = raw_price * (1 + self.config.entry_slippage_pct)
         invest_amount = min(target_value, self.cash, sector_room)
         if invest_amount < entry_price:
+            self._reject(ticker, execution_date, "insufficient_cash")
             return
-
         shares = int(invest_amount / entry_price)
         cost = shares * entry_price
-
-        if cost > self.cash:
+        if shares <= 0 or cost > self.cash:
+            self._reject(ticker, execution_date, "insufficient_cash")
             return
 
         self.cash -= cost
-        rank = int(rec.get("rank", 0))
+        raw_notional = shares * raw_price
+        self.gross_traded_notional += raw_notional
         self.positions.append(
             PortfolioPosition(
                 ticker=ticker,
-                entry_date=as_of,
+                signal_date=order.signal_date,
+                entry_date=execution_date,
                 entry_price=entry_price,
                 shares=shares,
                 cost=cost,
+                entry_notional=raw_notional,
                 sector=sector,
-                signal_score=signal_score,
-                rank=rank,
+                signal_score=float(rec.get("signal_score", 0)),
+                rank=int(rec.get("rank", 0)),
             )
         )
 
-    def _try_exit_expired(self, prices_df: pd.DataFrame, as_of: date):
-        """Exit positions that have exceeded the hold period."""
-        expired = [
-            p
-            for p in self.positions
-            if (as_of - p.entry_date).days >= self.config.hold_period_days
-        ]
-        for pos in expired:
-            self._try_exit(pos.ticker, prices_df, as_of)
+    def _try_exit_expired(self, prices_df: pd.DataFrame, current: date) -> None:
+        for pos in list(self.positions):
+            target = pos.entry_date + timedelta(days=self.config.hold_period_days)
+            if current < target:
+                continue
+            arrays = _price_arrays(prices_df, pos.ticker)
+            if arrays is None or arrays[0] is None:
+                continue
+            execution = _aligned_price_on_or_after_arrays(
+                arrays[0],
+                arrays[1],
+                target,
+                max_wait_days=None,
+            )
+            if execution is None or execution.date.date() > current:
+                continue
+            self._try_exit(pos, execution)
 
-    def _try_exit(self, ticker: str, prices_df: pd.DataFrame, as_of: date):
-        """Exit a specific position."""
-        pos = next((p for p in self.positions if p.ticker == ticker), None)
-        if pos is None:
+    def _try_exit(self, pos: PortfolioPosition, execution: AlignedPrice) -> None:
+        if pos not in self.positions:
             return
-
-        as_of_ts = pd.Timestamp(as_of)
-        if ticker not in prices_df.columns:
+        raw_price = execution.price
+        if not np.isfinite(raw_price) or raw_price <= 0:
             return
-        price_series = prices_df[ticker].dropna()
-        if price_series.empty:
-            return
-        if not isinstance(price_series.index, pd.DatetimeIndex):
-            price_series.index = pd.to_datetime(price_series.index)
-        eligible = price_series[price_series.index <= as_of_ts]
-        if eligible.empty:
-            return
-        exit_price = float(eligible.iloc[-1]) * (1 - self.config.exit_slippage_pct)
-
+        exit_price = raw_price * (1 - self.config.exit_slippage_pct)
         proceeds = pos.shares * exit_price
+        raw_notional = pos.shares * raw_price
+        self.gross_traded_notional += raw_notional
         self.cash += proceeds
         self.closed_positions.append(
             {
                 "ticker": pos.ticker,
+                "signal_date": pos.signal_date,
                 "entry_date": pos.entry_date,
-                "exit_date": as_of,
+                "exit_date": execution.date.date(),
                 "entry_price": pos.entry_price,
                 "exit_price": exit_price,
                 "shares": pos.shares,
                 "cost": pos.cost,
                 "proceeds": proceeds,
+                "entry_notional": pos.entry_notional,
+                "exit_notional": raw_notional,
                 "pnl": proceeds - pos.cost,
                 "return_pct": (exit_price / pos.entry_price - 1) * 100,
                 "sector": pos.sector,
                 "signal_score": pos.signal_score,
                 "rank": pos.rank,
-                "holding_days": (as_of - pos.entry_date).days,
+                "holding_days": (execution.date.date() - pos.entry_date).days,
             }
         )
-        self.positions = [p for p in self.positions if p.ticker != ticker]
+        self.positions = [p for p in self.positions if p is not pos]
 
-    def _get_sector(self, ticker: str) -> str:
-        """Get sector for a ticker via yfinance, cached."""
-        if not hasattr(self, "_sector_cache"):
-            self._sector_cache: dict[str, str] = {}
-        if ticker in self._sector_cache:
-            return self._sector_cache[ticker]
-        try:
-            import yfinance as yf
+    def _get_sector(self, ticker: str, rec: pd.Series | None = None) -> str:
+        """Resolve only deterministic stored sector data; never make live calls."""
+        sector = rec.get("sector") if rec is not None and "sector" in rec else None
+        if sector is None or pd.isna(sector) or not str(sector).strip():
+            sector = self.config.sector_by_ticker.get(ticker)
+        if sector is None or not str(sector).strip():
+            raise ValueError(
+                f"Missing stored sector for {ticker}; provide recommendation.sector "
+                "or PortfolioConfig.sector_by_ticker"
+            )
+        return str(sector)
 
-            sector = yf.Ticker(ticker).info.get("sector", "Unknown")
-        except Exception:
-            sector = "Unknown"
-        self._sector_cache[ticker] = sector
-        return sector
+    def _aligned_mark(
+        self, ticker: str, prices_df: pd.DataFrame, as_of: date
+    ) -> AlignedPrice | None:
+        arrays = _price_arrays(prices_df, ticker)
+        if arrays is None or arrays[0] is None:
+            return None
+        return _aligned_price_at_or_before_arrays(
+            arrays[0],
+            arrays[1],
+            as_of,
+            max_staleness_days=self.config.max_price_staleness_days,
+        )
 
     def _position_value(
-        self, pos: PortfolioPosition, prices_df: pd.DataFrame, as_of_ts: pd.Timestamp
+        self, pos: PortfolioPosition, prices_df: pd.DataFrame, as_of: date
     ) -> float:
-        """Mark-to-market value of a single position, falling back to cost."""
-        if pos.ticker not in prices_df.columns:
-            return pos.cost
-        price_series = prices_df[pos.ticker].dropna()
-        if price_series.empty:
-            return pos.cost
-        if not isinstance(price_series.index, pd.DatetimeIndex):
-            price_series.index = pd.to_datetime(price_series.index)
-        eligible = price_series[price_series.index <= as_of_ts]
-        if not eligible.empty:
-            return pos.shares * float(eligible.iloc[-1])
-        return pos.cost
+        mark = self._aligned_mark(pos.ticker, prices_df, as_of)
+        if mark is None:
+            raise PortfolioValuationUnavailable(
+                f"No bounded mark for open position {pos.ticker} on {as_of}"
+            )
+        # Mark at executable liquidation value so final equity includes exit cost.
+        return pos.shares * mark.price * (1 - self.config.exit_slippage_pct)
 
     def _sector_exposure(
         self, prices_df: pd.DataFrame, as_of: date
     ) -> dict[str, float]:
-        """Current sector allocation (mark-to-market) as fraction of total value.
-
-        Uses mark-to-market position values so sector constraints are enforced
-        consistently against current market value (same basis as
-        :meth:`_total_value`), not against stale cost basis.
-        """
         if not self.positions:
             return {}
-        as_of_ts = pd.Timestamp(as_of)
-        sector_values: dict[str, float] = {}
-        for p in self.positions:
-            mtm = self._position_value(p, prices_df, as_of_ts)
-            sector_values[p.sector] = sector_values.get(p.sector, 0.0) + mtm
-        total = sum(sector_values.values()) + self.cash
-        if total <= 0:
-            return {}
-        return {s: v / total for s, v in sector_values.items()}
-
-    def _total_value(self, prices_df: pd.DataFrame, as_of: date) -> float:
-        """Total portfolio value (cash + mark-to-market positions)."""
-        as_of_ts = pd.Timestamp(as_of)
-        return self.cash + sum(
-            self._position_value(p, prices_df, as_of_ts) for p in self.positions
+        values: dict[str, float] = {}
+        for pos in self.positions:
+            values[pos.sector] = values.get(pos.sector, 0.0) + self._position_value(
+                pos, prices_df, as_of
+            )
+        total = self._total_value(prices_df, as_of)
+        return (
+            {sector: value / total for sector, value in values.items()}
+            if total > 0
+            else {}
         )
 
-    def _record_snapshot(self, prices_df: pd.DataFrame, as_of: date):
-        total = self._total_value(prices_df, as_of)
-        unrealized = total - self.cash - sum(p.cost for p in self.positions)
+    def _total_value(self, prices_df: pd.DataFrame, as_of: date) -> float:
+        return self.cash + sum(
+            self._position_value(pos, prices_df, as_of) for pos in self.positions
+        )
+
+    def _record_snapshot(self, prices_df: pd.DataFrame, as_of: date) -> None:
+        exposure = sum(
+            self._position_value(pos, prices_df, as_of) for pos in self.positions
+        )
+        total_value = self.cash + exposure
         realized = sum(cp["pnl"] for cp in self.closed_positions)
+        unrealized = total_value - self.cash - sum(p.cost for p in self.positions)
         self.snapshots.append(
             PortfolioSnapshot(
                 date=as_of,
                 cash=self.cash,
                 positions=list(self.positions),
-                total_value=total,
+                total_value=total_value,
+                dollar_exposure=exposure,
                 unrealized_pnl=unrealized,
                 realized_pnl=realized,
             )
         )
 
+    def _reject(self, ticker: str, as_of: date, reason: str) -> None:
+        self.rejected_orders.append({"ticker": ticker, "date": as_of, "reason": reason})
+
     def results(self) -> pd.DataFrame:
-        """Return daily portfolio values as DataFrame."""
-        if not self.snapshots:
-            return pd.DataFrame(
-                columns=[
-                    "date",
-                    "cash",
-                    "total_value",
-                    "num_positions",
-                    "unrealized_pnl",
-                    "realized_pnl",
-                ]
-            )
-        rows = []
-        for s in self.snapshots:
-            rows.append(
+        return pd.DataFrame(
+            [
                 {
-                    "date": s.date,
-                    "cash": s.cash,
-                    "total_value": s.total_value,
-                    "num_positions": len(s.positions),
-                    "unrealized_pnl": s.unrealized_pnl,
-                    "realized_pnl": s.realized_pnl,
+                    "date": snap.date,
+                    "cash": snap.cash,
+                    "positions_value": snap.dollar_exposure,
+                    "dollar_exposure": snap.dollar_exposure,
+                    "total_value": snap.total_value,
+                    "num_positions": len(snap.positions),
+                    "unrealized_pnl": snap.unrealized_pnl,
+                    "realized_pnl": snap.realized_pnl,
                 }
-            )
-        return pd.DataFrame(rows)
+                for snap in self.snapshots
+            ]
+        )
 
     def compute_metrics(self, prices_df: pd.DataFrame | None = None) -> dict:
-        """Compute portfolio performance metrics."""
-        if not self.snapshots:
-            return {}
+        if self.positions and prices_df is None:
+            raise ValueError(
+                "prices_df is required to value open positions; no fictional zero mark is allowed"
+            )
 
         results = self.results()
-        values = results["total_value"].values
+        end_date = self._simulation_end_date or (
+            pd.Timestamp(results.iloc[-1]["date"]).date()
+            if not results.empty
+            else date.today()
+        )
+        open_ledger = self._open_ledger(prices_df, end_date)
+        unresolved = [row for row in open_ledger if row["liquidation_value"] is None]
+        if unresolved:
+            return self._unavailable_metrics(open_ledger, unresolved)
+        if results.empty:
+            return {}
+
+        values = results["total_value"].to_numpy(dtype=float)
         dates = pd.to_datetime(results["date"])
         initial = self.config.initial_capital
-
-        # Total return
         total_return = (values[-1] / initial - 1) * 100
-
-        # Annualized return
         days = (dates.iloc[-1] - dates.iloc[0]).days
         ann_return = ((values[-1] / initial) ** (365.0 / max(days, 1)) - 1) * 100
-
-        # Daily returns
         daily_returns = (
             np.diff(values) / values[:-1] if len(values) > 1 else np.array([0.0])
         )
-
-        # Sharpe ratio (annualized)
-        if len(daily_returns) > 1 and np.std(daily_returns) > 0:
+        if len(daily_returns) > 1 and np.std(daily_returns, ddof=1) > 0:
             sharpe = float(
                 np.mean(daily_returns) / np.std(daily_returns, ddof=1) * np.sqrt(252)
             )
         else:
             sharpe = 0.0
 
-        # Max drawdown
-        # Anchor the equity curve to initial_capital so a first-period loss
-        # counts as a drawdown from the starting capital, not just from the
-        # first snapshot's post-trade value.
         full_values = np.concatenate([[initial], values])
-        peak = np.maximum.accumulate(full_values)
-        drawdowns = (full_values - peak) / peak
-        max_drawdown = float(np.min(drawdowns)) * 100
+        peaks = np.maximum.accumulate(full_values)
+        max_drawdown = float(np.min((full_values - peaks) / peaks)) * 100
+        volatility = (
+            float(np.std(daily_returns, ddof=1) * np.sqrt(252) * 100)
+            if len(daily_returns) > 1
+            else 0.0
+        )
+        has_valuation_gaps = bool(self.valuation_unavailable_dates)
+        wins = sum(cp["pnl"] > 0 for cp in self.closed_positions)
+        closed_count = len(self.closed_positions)
+        avg_hold = (
+            float(np.mean([cp["holding_days"] for cp in self.closed_positions]))
+            if closed_count
+            else 0.0
+        )
+        avg_value = float(np.mean(values)) if len(values) else initial
+        turnover = self.gross_traded_notional / avg_value if avg_value > 0 else 0.0
+        open_exposure = sum(float(row["liquidation_value"]) for row in open_ledger)
+        spy_return, spy_reason = self._spy_buy_hold(
+            prices_df, dates.iloc[0].date(), end_date
+        )
 
-        # Win rate
-        if self.closed_positions:
-            wins = sum(1 for cp in self.closed_positions if cp["pnl"] > 0)
-            win_rate = wins / len(self.closed_positions) * 100
-        else:
-            win_rate = 0.0
+        return {
+            "valuation_status": "available",
+            "valuation_reason": None,
+            "valuation_gap_count": len(self.valuation_unavailable_dates),
+            "return_status": (
+                "terminal_observed_after_valuation_gaps"
+                if has_valuation_gaps
+                else "complete_daily_valuation"
+            ),
+            "daily_risk_status": (
+                "unavailable_nonconsecutive_valuations"
+                if has_valuation_gaps
+                else "available"
+            ),
+            "total_return_pct": round(total_return, 2),
+            "annualized_return_pct": round(ann_return, 2),
+            "sharpe_ratio": None if has_valuation_gaps else round(sharpe, 3),
+            "max_drawdown_pct": (
+                None if has_valuation_gaps else round(max_drawdown, 2)
+            ),
+            "volatility_pct": (None if has_valuation_gaps else round(volatility, 2)),
+            "win_rate_pct": round(wins / closed_count * 100, 1)
+            if closed_count
+            else 0.0,
+            "avg_holding_days": round(avg_hold, 1),
+            "turnover_rate": round(turnover, 3),
+            "gross_traded_notional": round(self.gross_traded_notional, 2),
+            "open_dollar_exposure": round(open_exposure, 2),
+            "open_position_count": len(open_ledger),
+            "open_positions": open_ledger,
+            "unresolved_expired_positions": sum(
+                row["state"].startswith("exit_unresolved") for row in open_ledger
+            ),
+            "pending_order_count": len(self.pending_entries),
+            "rejected_order_count": len(self.rejected_orders),
+            "max_concurrent_positions": int(results["num_positions"].max()),
+            "total_closed_trades": closed_count,
+            "sector_concentration": self._sector_concentration(),
+            "spy_return_pct": spy_return,
+            "spy_benchmark_status": "available"
+            if spy_return is not None
+            else "omitted",
+            "spy_benchmark_reason": spy_reason,
+        }
 
-        # Average holding period
-        if self.closed_positions:
-            avg_hold = np.mean([cp["holding_days"] for cp in self.closed_positions])
-        else:
-            avg_hold = 0.0
+    def _unavailable_metrics(
+        self, open_ledger: list[dict], unresolved: list[dict]
+    ) -> dict:
+        return {
+            "valuation_status": "unavailable",
+            "valuation_reason": "unbounded_open_position_mark",
+            "valuation_gap_count": len(self.valuation_unavailable_dates),
+            "return_status": "unavailable",
+            "daily_risk_status": "unavailable",
+            "total_return_pct": None,
+            "annualized_return_pct": None,
+            "sharpe_ratio": None,
+            "max_drawdown_pct": None,
+            "volatility_pct": None,
+            "win_rate_pct": None,
+            "avg_holding_days": None,
+            "turnover_rate": None,
+            "gross_traded_notional": round(self.gross_traded_notional, 2),
+            "open_dollar_exposure": None,
+            "open_position_count": len(open_ledger),
+            "open_positions": open_ledger,
+            "unresolved_expired_positions": sum(
+                row["state"].startswith("exit_unresolved") for row in unresolved
+            ),
+            "pending_order_count": len(self.pending_entries),
+            "rejected_order_count": len(self.rejected_orders),
+            "max_concurrent_positions": None,
+            "total_closed_trades": len(self.closed_positions),
+            "sector_concentration": self._sector_concentration(),
+            "spy_return_pct": None,
+            "spy_benchmark_status": "omitted",
+            "spy_benchmark_reason": "portfolio_valuation_unavailable",
+        }
 
-        # Turnover rate (total cost traded / average portfolio value)
-        total_traded = sum(cp["cost"] for cp in self.closed_positions)
-        avg_value = np.mean(values) if len(values) > 0 else initial
-        turnover = total_traded / avg_value if avg_value > 0 else 0.0
+    def _open_ledger(self, prices_df: pd.DataFrame | None, as_of: date) -> list[dict]:
+        if self.positions and prices_df is None:
+            raise ValueError(
+                "prices_df is required to produce the open-position ledger"
+            )
+        ledger = []
+        for pos in self.positions:
+            mark = self._aligned_mark(pos.ticker, prices_df, as_of)
+            liquidation_value = (
+                pos.shares * mark.price * (1 - self.config.exit_slippage_pct)
+                if mark is not None
+                else None
+            )
+            exit_due = (as_of - pos.entry_date).days >= self.config.hold_period_days
+            state = "exit_unresolved" if exit_due else "open"
+            if mark is None:
+                state += "_valuation_unavailable"
+            ledger.append(
+                {
+                    "ticker": pos.ticker,
+                    "signal_date": pos.signal_date,
+                    "entry_date": pos.entry_date,
+                    "shares": pos.shares,
+                    "sector": pos.sector,
+                    "cost": round(pos.cost, 2),
+                    "mark_price": round(mark.price, 4) if mark is not None else None,
+                    "mark_date": mark.date.date() if mark is not None else None,
+                    "staleness_days": mark.staleness_days if mark is not None else None,
+                    "liquidation_value": (
+                        round(liquidation_value, 2)
+                        if liquidation_value is not None
+                        else None
+                    ),
+                    "state": state,
+                }
+            )
+        return ledger
 
-        # Max concurrent positions
-        max_concurrent = max(results["num_positions"]) if not results.empty else 0
-
-        # Sector concentration
-        sector_counts: dict[str, int] = {}
+    def _sector_concentration(self) -> dict[str, float]:
+        notionals: dict[str, float] = {}
         for cp in self.closed_positions:
-            sector_counts[cp["sector"]] = sector_counts.get(cp["sector"], 0) + 1
-        sector_concentration = (
-            {s: c / len(self.closed_positions) * 100 for s, c in sector_counts.items()}
-            if self.closed_positions
+            notionals[cp["sector"]] = (
+                notionals.get(cp["sector"], 0.0) + cp["entry_notional"]
+            )
+        total = sum(notionals.values())
+        return (
+            {sector: value / total * 100 for sector, value in notionals.items()}
+            if total > 0
             else {}
         )
 
-        # SPY comparison
-        spy_return = None
-        if prices_df is not None and "SPY" in prices_df.columns:
-            spy_series = prices_df["SPY"].dropna()
-            start_ts = pd.Timestamp(dates.iloc[0])
-            end_ts = pd.Timestamp(dates.iloc[-1])
-            spy_start = spy_series[spy_series.index <= start_ts]
-            spy_end = spy_series[spy_series.index <= end_ts]
-            if not spy_start.empty and not spy_end.empty:
-                spy_return = (
-                    float(spy_end.iloc[-1]) / float(spy_start.iloc[-1]) - 1
-                ) * 100
-
-        return {
-            "total_return_pct": round(total_return, 2),
-            "annualized_return_pct": round(ann_return, 2),
-            "sharpe_ratio": round(sharpe, 3),
-            "max_drawdown_pct": round(max_drawdown, 2),
-            "win_rate_pct": round(win_rate, 1),
-            "avg_holding_days": round(float(avg_hold), 1),
-            "turnover_rate": round(turnover, 3),
-            "max_concurrent_positions": max_concurrent,
-            "total_closed_trades": len(self.closed_positions),
-            "sector_concentration": sector_concentration,
-            "spy_return_pct": round(spy_return, 2) if spy_return is not None else None,
-        }
+    def _spy_buy_hold(
+        self, prices_df: pd.DataFrame | None, start: date, end: date
+    ) -> tuple[float | None, str | None]:
+        if prices_df is None:
+            return None, "spy_prices_not_supplied"
+        arrays = _price_arrays(prices_df, "SPY")
+        if arrays is None or arrays[0] is None:
+            return None, "spy_prices_unavailable"
+        entry = _aligned_price_on_or_after_arrays(
+            arrays[0],
+            arrays[1],
+            start,
+            max_wait_days=self.config.max_execution_wait_days,
+        )
+        exit_ = _aligned_price_at_or_before_arrays(
+            arrays[0],
+            arrays[1],
+            end,
+            max_staleness_days=self.config.max_price_staleness_days,
+        )
+        if entry is None:
+            return None, "spy_entry_outside_boundary"
+        if exit_ is None:
+            return None, "spy_exit_outside_boundary"
+        if exit_.date < entry.date:
+            return None, "spy_window_inverted"
+        entry_price = entry.price * (1 + self.config.entry_slippage_pct)
+        exit_price = exit_.price * (1 - self.config.exit_slippage_pct)
+        return round((exit_price / entry_price - 1) * 100, 2), None

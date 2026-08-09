@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import pandas as pd
 
 from analyzer.member_ranking.ranking import rank_members
@@ -29,7 +30,7 @@ def _signals(rows: list[tuple[str, str, str, float]], signal_type: str) -> pd.Da
 
 
 class TestLeaveOneOutPrior(unittest.TestCase):
-    def test_purchase_prior_excludes_each_members_episodes(self):
+    def test_purchase_prior_is_common_and_does_not_reverse_perfect_member(self):
         signals = _signals(
             [
                 ("Strong", "S1", "2024-01-01", 10.0),
@@ -45,16 +46,21 @@ class TestLeaveOneOutPrior(unittest.TestCase):
             "member"
         )
 
-        strong_prior = 0.10  # (3 total wins - 3 Strong wins) / (5 - 3), clipped
-        weak_prior = 0.90  # (3 total wins - 0 Weak wins) / (5 - 2), clipped
-        strong_expected = (strong_prior * PRIOR_STRENGTH + 3) / (PRIOR_STRENGTH + 3)
-        weak_expected = (weak_prior * PRIOR_STRENGTH) / (PRIOR_STRENGTH + 2)
+        common_prior = 3 / 5
+        strong_expected = (common_prior * PRIOR_STRENGTH + 3) / (PRIOR_STRENGTH + 3)
+        weak_expected = common_prior * PRIOR_STRENGTH / (PRIOR_STRENGTH + 2)
         self.assertAlmostEqual(
             ranked.loc["Strong", "bayes_win_prob"], strong_expected, places=3
         )
         self.assertAlmostEqual(
             ranked.loc["Weak", "bayes_win_prob"], weak_expected, places=3
         )
+        self.assertGreater(
+            ranked.loc["Strong", "bayes_win_prob"],
+            ranked.loc["Weak", "bayes_win_prob"],
+        )
+        self.assertEqual(ranked["prior_win_prob"].nunique(), 1)
+        self.assertNotIn("posterior_lift", ranked.columns)
 
     def test_single_member_uses_global_prior_fallback(self):
         signals = _signals(
@@ -74,6 +80,87 @@ class TestLeaveOneOutPrior(unittest.TestCase):
         signals = _signals([("Solo", "A", "2024-01-01", 5.0)], "Purchase")
 
         self.assertNotIn("bayes_factor", rank_members(signals).columns)
+
+    def test_identical_evidence_uses_identical_common_prior(self):
+        signals = _signals(
+            [
+                ("A", "A1", "2024-01-01", 4.0),
+                ("B", "B1", "2024-01-01", 4.0),
+                ("Peer", "P1", "2024-01-01", -4.0),
+            ],
+            "Purchase",
+        )
+
+        ranked = rank_members(signals).set_index("member")
+
+        self.assertEqual(
+            ranked.loc["A", "prior_win_prob"], ranked.loc["B", "prior_win_prob"]
+        )
+        self.assertEqual(
+            ranked.loc["A", "bayes_win_prob"], ranked.loc["B", "bayes_win_prob"]
+        )
+
+    def test_purchase_success_is_endpoint_excess_alpha_not_decayed_direction(self):
+        signals = _signals(
+            [
+                ("Mismatch", "A", "2024-01-01", 5.0),
+                ("Positive", "B", "2024-01-01", 2.0),
+            ],
+            "Purchase",
+        )
+        signals.loc[signals["member"] == "Mismatch", "total_spy_alpha_pct"] = -1.0
+
+        ranked = rank_members(signals).set_index("member")
+
+        self.assertEqual(ranked.loc["Mismatch", "prob_up_given_buy"], 0.0)
+        self.assertEqual(ranked.loc["Positive", "prob_up_given_buy"], 1.0)
+
+    def test_all_zero_endpoint_alpha_has_finite_regularized_posteriors(self):
+        signals = _signals(
+            [
+                ("A", "A1", "2024-01-01", 0.0),
+                ("A", "A2", "2024-02-01", 0.0),
+                ("B", "B1", "2024-01-01", 0.0),
+                ("B", "B2", "2024-02-01", 0.0),
+            ],
+            "Purchase",
+        )
+
+        ranked = rank_members(signals)
+
+        columns = [
+            "shrunk_alpha",
+            "shrunk_alpha_std",
+            "alpha_shrinkage",
+            "alpha_effective_information",
+        ]
+        self.assertTrue(np.isfinite(ranked[columns].to_numpy()).all())
+        self.assertTrue((ranked["shrunk_alpha_std"] > 0).all())
+
+    def test_prior_strength_controls_continuous_shrinkage_across_range(self):
+        signals = _signals(
+            [
+                ("Strong", "S1", "2024-01-01", 10.0),
+                ("Strong", "S2", "2024-02-01", 12.0),
+                ("Weak", "W1", "2024-01-01", -10.0),
+                ("Weak", "W2", "2024-02-01", -12.0),
+            ],
+            "Purchase",
+        )
+
+        fits = {
+            strength: rank_members(
+                signals, _bayes_prior_strength=float(strength)
+            ).set_index("member")
+            for strength in (1, 20, 1000)
+        }
+
+        means = [abs(fits[s].loc["Strong", "shrunk_alpha"]) for s in (1, 20, 1000)]
+        shrinkages = [fits[s].loc["Strong", "alpha_shrinkage"] for s in (1, 20, 1000)]
+        self.assertGreater(means[0], means[1])
+        self.assertGreater(means[1], means[2])
+        self.assertLess(shrinkages[0], shrinkages[1])
+        self.assertLess(shrinkages[1], shrinkages[2])
 
     def test_sales_prior_excludes_members_own_episodes_and_output_omits_factor(self):
         signals = _signals(
@@ -110,8 +197,8 @@ class TestLeaveOneOutPrior(unittest.TestCase):
             "member"
         )
 
-        collapsed_peer_prior = 0.5  # One winning episode and one losing episode.
-        expected = (collapsed_peer_prior * PRIOR_STRENGTH + 1) / (PRIOR_STRENGTH + 1)
+        common_prior = 2 / 3  # Target win plus one Peer win in three episodes.
+        expected = (common_prior * PRIOR_STRENGTH + 1) / (PRIOR_STRENGTH + 1)
         self.assertEqual(ranked.loc["Peer", "purchase_trades"], 2)
         self.assertAlmostEqual(
             ranked.loc["Target", "bayes_win_prob"], expected, places=3

@@ -58,7 +58,7 @@ class TestSpyDoubleDivision(unittest.TestCase):
     """
 
     def setUp(self):
-        # Two prices: disclosure day 0 and day 1
+        # Disclosure on day 0; executable window is day 1 through day 2.
         self.entry_prices = pd.DataFrame(
             {
                 "member": ["Alice"],
@@ -70,10 +70,10 @@ class TestSpyDoubleDivision(unittest.TestCase):
         )
         self.prices = pd.DataFrame(
             {
-                "TICK": [100.0, 100.0],  # flat ticker (decayed_return ≈ 0)
-                "SPY": [100.0, 110.0],  # SPY rises 10%
+                "TICK": [99.0, 100.0, 100.0],  # flat over executable window
+                "SPY": [99.0, 100.0, 110.0],  # SPY rises 10% after entry
             },
-            index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+            index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
         )
 
     def test_spy_return_not_double_divided(self):
@@ -127,37 +127,28 @@ class TestHitRateNaN(unittest.TestCase):
         )
 
 
-# ── Bug #4: Kelly NaN fallback ───────────────────────────────────────────────
+# ── Kelly outcome coverage ───────────────────────────────────────────────────
 
 
-class TestKellyNaNFallback(unittest.TestCase):
-    """
-    When all returns in avg_return_pct are positive the losing slice is empty
-    and .mean() returns NaN.  bool(NaN) is True in Python so `not avg_loss`
-    was False, and `NaN <= 0` is also False — the fallback was never reached.
-    NaN propagated through payout_ratio into kelly_fraction, eventually
-    producing an empty portfolio.
-    """
+class TestKellyOutcomeCoverage(unittest.TestCase):
+    """Kelly must abstain when historical loss magnitude is unavailable."""
 
-    def _make_recs_all_positive(self):
-        return pd.DataFrame(
+    def test_all_positive_returns_without_loss_estimate_abstain(self):
+        from analyzer.portfolio.kelly import build_kelly_portfolio, KellyConfig
+
+        recs = pd.DataFrame(
             {
                 "ticker": ["A", "B", "C"],
                 "signal_score": [10.0, 8.0, 6.0],
                 "member": ["m1", "m2", "m3"],
                 "crash_prob": [0.0, 0.0, 0.0],
-                "avg_return_pct": [5.0, 3.0, 1.0],  # all positive → avg_loss=NaN
+                "avg_return_pct": [5.0, 3.0, 1.0],
             }
         )
 
-    def test_all_positive_returns_produces_non_empty_portfolio(self):
-        from analyzer.portfolio.kelly import build_kelly_portfolio, KellyConfig
-
-        recs = self._make_recs_all_positive()
         portfolio = build_kelly_portfolio(recs, KellyConfig())
-        self.assertGreater(
-            len(portfolio), 0, "portfolio is empty; NaN avg_loss fallback not triggered"
-        )
+
+        self.assertTrue(portfolio.empty)
 
 
 # ── Bug #6: Missing price windows should yield NaN (not 0.0) ─────────────────

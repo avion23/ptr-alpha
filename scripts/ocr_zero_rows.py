@@ -15,11 +15,102 @@ import time
 import duckdb
 from pathlib import Path
 
-from scripts.gemini_ocr_common import MODEL, call_gemini, validate_transactions
+from scripts.gemini_ocr_common import (
+    GEMINI_PARSER_VERSION,
+    MODEL,
+    GeminiOutputError as GeminiOutputError,
+    call_gemini,
+    inspect_cached_response,
+    parse_gemini_output,
+    validate_transactions,
+)
 
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress_gemini_manual.json"
 COOLDOWN = 3  # seconds between requests (Lite model allows rapid fire)
+REQUIRED_OCR_SCHEMA_COLUMNS = {
+    "chamber",
+    "source_record_id",
+    "source_row_id",
+    "official_filing_date",
+    "available_date",
+    "notification_date",
+    "amends_source_record_id",
+    "raw_transaction_subtype",
+    "ticker_origin",
+    "raw_ticker",
+    "ticker_candidate",
+    "raw_asset_class",
+    "raw_owner",
+    "raw_asset_description",
+    "ingestion_generation",
+    "artifact_sha256",
+}
+
+OCR_INSERT_COLUMNS = [
+    "doc_id",
+    "member",
+    "ticker",
+    "transaction_date",
+    "disclosure_date",
+    "transaction_type",
+    "amount_raw",
+    "amount_midpoint",
+    "owner_code",
+    "asset_description",
+    "source",
+    "chamber",
+    "source_record_id",
+    "source_row_id",
+    "official_filing_date",
+    "available_date",
+    "notification_date",
+    "amends_source_record_id",
+    "raw_transaction_subtype",
+    "ticker_origin",
+    "raw_ticker",
+    "ticker_candidate",
+    "raw_asset_class",
+    "raw_asset_description",
+    "raw_owner",
+    "ingestion_generation",
+    "artifact_sha256",
+]
+
+
+def validate_ticker_provenance(row):
+    origin = row["ticker_origin"]
+    ticker = row["ticker"]
+    raw_ticker = row["raw_ticker"]
+    candidate = row["ticker_candidate"]
+    if origin == "official":
+        if not ticker or ticker != raw_ticker or candidate is not None:
+            raise ValueError("official ticker provenance is inconsistent")
+        return
+    if origin == "unverified":
+        if ticker is not None or not raw_ticker or candidate != raw_ticker:
+            raise ValueError("unverified ticker provenance is inconsistent")
+        return
+    if origin == "not_reported":
+        if ticker is not None or raw_ticker is not None or candidate is not None:
+            raise ValueError("not-reported ticker provenance is inconsistent")
+        return
+    raise ValueError(f"invalid ticker_origin: {origin}")
+
+
+def require_ocr_schema(conn):
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()
+    }
+    missing = sorted(REQUIRED_OCR_SCHEMA_COLUMNS - existing)
+    if missing:
+        raise RuntimeError(
+            "OCR ingestion requires the provenance schema; missing columns: "
+            + ", ".join(missing)
+        )
+    return existing
+
+
 # Amount range midpoint estimates (for amount_midpoint column)
 AMOUNT_MIDPOINTS = {
     "A": 8000,
@@ -35,24 +126,219 @@ AMOUNT_MIDPOINTS = {
 }
 
 
-def get_zero_row_pdfs():
-    """Get all zero-row PDFs from DB that haven't been OCR'd yet."""
-    conn = duckdb.connect(DB_PATH, read_only=True)
-    rows = conn.execute("""
-        WITH latest AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY parsed_at DESC) as rn
+def get_ocr_work_items(
+    *,
+    db_path: str = DB_PATH,
+    data_dir: str | Path | None = None,
+    year: int | None = None,
+    parser_version: str = GEMINI_PARSER_VERSION,
+    require_schema: bool = True,
+):
+    """Select work from current artifacts, validated cache, schema, and DB rows."""
+    conn = duckdb.connect(db_path, read_only=True)
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()
+    }
+    schema_ready = REQUIRED_OCR_SCHEMA_COLUMNS <= existing_columns
+    if require_schema and not schema_ready:
+        require_ocr_schema(conn)
+    base = Path(data_dir) if data_dir is not None else Path(db_path).parent
+    if not schema_ready:
+        legacy_rows = conn.execute(
+            """
+            WITH deterministic AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY doc_id ORDER BY parsed_at DESC
+                ) AS rn
+                FROM pdf_parse_runs
+                WHERE parser_version NOT LIKE '%gemini%'
+            )
+            SELECT CAST(m.doc_id AS VARCHAR),
+                   CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER)
+            FROM metadata m
+            JOIN deterministic d ON d.doc_id = m.doc_id AND d.rn = 1
+            WHERE m.filing_type = 'P'
+              AND d.status IN ('zero_rows', 'error', 'rejected')
+              AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
+            ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
+            """,
+            [year, year],
+        ).fetchall()
+        conn.close()
+        return [
+            (
+                doc_id,
+                doc_year,
+                str(base / str(doc_year) / "pdfs" / f"{doc_id}.pdf"),
+            )
+            for doc_id, doc_year in legacy_rows
+        ]
+    rows = conn.execute(
+        """
+        WITH deterministic AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY doc_id ORDER BY parsed_at DESC
+            ) AS rn
             FROM pdf_parse_runs
+            WHERE parser_version NOT LIKE '%gemini%'
+        ), current_ocr AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY doc_id ORDER BY parsed_at DESC
+            ) AS rn
+            FROM pdf_parse_runs
+            WHERE parser_version = ?
+        ), tx AS (
+            SELECT doc_id,
+                   COUNT(*) FILTER (
+                       WHERE source = 'gemini_ocr'
+                             AND (chamber = 'House' OR chamber IS NULL)
+                             AND ingestion_generation = ?
+                   ) AS current_ocr_row_count,
+                   COUNT(*) FILTER (
+                       WHERE source = 'gemini_ocr'
+                         AND (chamber = 'House' OR chamber IS NULL)
+                         AND (ingestion_generation IS NULL OR ingestion_generation <> ?)
+                   ) AS stale_ocr_row_count
+            FROM transactions
+            GROUP BY doc_id
         )
-        SELECT l.doc_id, l.year
-        FROM latest l
-        WHERE l.rn = 1 AND l.status IN ('zero_rows', 'error')
-    """).fetchall()
+        SELECT CAST(m.doc_id AS VARCHAR),
+               CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER),
+               o.status,
+               o.raw_row_count,
+               o.transaction_count,
+               COALESCE(tx.current_ocr_row_count, 0),
+               COALESCE(tx.stale_ocr_row_count, 0)
+        FROM metadata m
+        JOIN deterministic d ON d.doc_id = m.doc_id AND d.rn = 1
+        LEFT JOIN current_ocr o ON o.doc_id = m.doc_id AND o.rn = 1
+        LEFT JOIN tx ON tx.doc_id = m.doc_id
+        WHERE m.filing_type = 'P'
+          AND d.status IN ('zero_rows', 'error', 'rejected')
+          AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
+        ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
+        """,
+        [parser_version, parser_version, parser_version, year, year],
+    ).fetchall()
+    cache_dir = str(base / "gemini_cache")
+    unresolved = []
+    for (
+        doc_id,
+        doc_year,
+        status,
+        recorded_raw_count,
+        recorded_count,
+        current_ocr_row_count,
+        stale_ocr_row_count,
+    ) in rows:
+        pdf_path = str(base / str(doc_year) / "pdfs" / f"{doc_id}.pdf")
+        try:
+            cached = inspect_cached_response(
+                doc_id, pdf_path, cache_dir, parser_version
+            )
+        except (OSError, ValueError):
+            cached = None
+        if cached is None or not schema_ready:
+            unresolved.append((doc_id, doc_year, pdf_path))
+            continue
+        parsed_count = len(cached.parsed.transactions)
+        try:
+            ingestion_generation = _resolve_ingestion_generation(
+                conn, doc_id, doc_year, cached.pdf_sha256
+            )
+        except RuntimeError:
+            unresolved.append((doc_id, doc_year, pdf_path))
+            continue
+        bound_run = conn.execute(
+            """
+            SELECT status, raw_row_count, transaction_count
+            FROM pdf_parse_runs
+            WHERE doc_id = ? AND parser_version = ?
+              AND artifact_sha256 = ? AND ingestion_generation = ?
+            ORDER BY parsed_at DESC LIMIT 1
+            """,
+            [
+                doc_id,
+                parser_version,
+                cached.pdf_sha256,
+                ingestion_generation,
+            ],
+        ).fetchone()
+        if bound_run is None:
+            status = None
+            recorded_raw_count = None
+            recorded_count = None
+        else:
+            status, recorded_raw_count, recorded_count = bound_run
+        matching_rows = conn.execute(
+            """
+            SELECT source_row_id, raw_asset_description, raw_transaction_subtype,
+                   transaction_date, notification_date, amount_raw
+            FROM transactions
+            WHERE doc_id = ? AND source = 'gemini_ocr'
+              AND (chamber = 'House' OR chamber IS NULL)
+              AND ingestion_generation = ? AND artifact_sha256 = ?
+            ORDER BY source_row_id
+            """,
+            [doc_id, ingestion_generation, cached.pdf_sha256],
+        ).fetchall()
+        current_ocr_row_count = len(matching_rows)
+        stale_ocr_row_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM transactions
+            WHERE doc_id = ? AND source = 'gemini_ocr'
+              AND (chamber = 'House' OR chamber IS NULL)
+              AND NOT (
+                  ingestion_generation = ? AND artifact_sha256 = ?
+              )
+            """,
+            [doc_id, ingestion_generation, cached.pdf_sha256],
+        ).fetchone()[0]
+        expected_rows = []
+        for source_row_number, transaction in enumerate(
+            cached.parsed.transactions, start=1
+        ):
+            page_number = transaction.get("page_number")
+            source_row_id = (
+                f"{doc_id}:page:{page_number}:row:{source_row_number}"
+                if page_number is not None
+                else f"{doc_id}:row:{source_row_number}"
+            )
+            expected_rows.append(
+                (
+                    source_row_id,
+                    transaction["asset"][:500],
+                    transaction["type"],
+                    datetime.date.fromisoformat(normalize_date(transaction["date"])),
+                    datetime.date.fromisoformat(
+                        normalize_date(transaction["notif_date"])
+                    ),
+                    transaction["amount_letter"],
+                )
+            )
+        success_matches = (
+            status == "success"
+            and recorded_raw_count == cached.parsed.raw_row_count
+            and recorded_count == parsed_count
+            and current_ocr_row_count == parsed_count
+            and stale_ocr_row_count == 0
+            and matching_rows == sorted(expected_rows)
+        )
+        no_txs_matches = (
+            status == "no_txs"
+            and cached.parsed.no_transactions
+            and current_ocr_row_count == 0
+            and stale_ocr_row_count == 0
+        )
+        if not (success_matches or no_txs_matches):
+            unresolved.append((doc_id, doc_year, pdf_path))
     conn.close()
-    return [
-        (d, y, f"data/{y}/pdfs/{d}.pdf")
-        for d, y in rows
-        if os.path.exists(f"data/{y}/pdfs/{d}.pdf")
-    ]
+    return unresolved
+
+
+def get_zero_row_pdfs():
+    """Backward-compatible all-year work selection from current DB state."""
+    return get_ocr_work_items()
 
 
 def load_progress(path: str | Path = PROGRESS_PATH):
@@ -71,85 +357,22 @@ def save_progress(progress, path: str | Path = PROGRESS_PATH):
     os.replace(tmp_path, path)
 
 
+def mark_progress(progress, doc_id, status):
+    """Record one confirmed terminal/current result without stale overlaps."""
+    key = "completed" if status == "success" else status
+    if key not in {"completed", "errors", "no_txs"}:
+        raise ValueError(f"unsupported progress status: {status}")
+    doc_id = str(doc_id)
+    for values in progress.values():
+        while doc_id in values:
+            values.remove(doc_id)
+    progress[key].append(doc_id)
+
+
 def parse_output(output):
-    """Parse Gemini output into structured data."""
-    if not output:
-        return None, []
-
-    member = None
-    transactions = []
-
-    for line in output.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-
-        # Extract MEMBER
-        m = re.match(r"MEMBER:\s*(.+)", line, re.IGNORECASE)
-        if m:
-            member = m.group(1).strip()
-            continue
-
-        # Skip markdown table separators and headers
-        if "|" not in line or "---" in line or "ASSET" in line.upper():
-            continue
-
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 4:
-            continue
-
-        asset = parts[0]
-        tx_type = parts[1] if len(parts) > 1 else ""
-        tx_date = parts[2] if len(parts) > 2 else ""
-        notif_date = parts[3] if len(parts) > 3 else ""
-        amount = parts[4] if len(parts) > 4 else ""
-
-        # Validate
-        if not re.search(r"\d{2}/\d{2}/\d{2}", tx_date):
-            continue
-        if tx_type not in (
-            "Purchase",
-            "Sale",
-            "Exchange",
-            "Partial Sale",
-            "P",
-            "S",
-            "E",
-        ):
-            # Try fuzzy match
-            tx_lower = tx_type.lower()
-            if "purchase" in tx_lower or tx_lower == "p":
-                tx_type = "Purchase"
-            elif "sale" in tx_lower or tx_lower == "s":
-                tx_type = "Sale"
-            elif "exchange" in tx_lower or tx_lower == "e":
-                tx_type = "Exchange"
-            else:
-                continue
-
-        # Normalize Partial Sale to Sale for consistency with TransactionType enum
-        if tx_type == "Partial Sale":
-            tx_type = "Sale"
-
-        # Map amount letter
-        amt_letter = ""
-        amount_clean = amount.strip().upper()
-        if amount_clean and amount_clean[0] in AMOUNT_MIDPOINTS:
-            amt_letter = amount_clean[0]
-        amt_mid = AMOUNT_MIDPOINTS.get(amt_letter)
-
-        transactions.append(
-            {
-                "asset": asset,
-                "type": tx_type,
-                "date": tx_date,
-                "notif_date": notif_date,
-                "amount_letter": amt_letter,
-                "amount_midpoint": amt_mid,
-            }
-        )
-
-    return member, transactions
+    """Parse a schema-validated Gemini response into the legacy tuple API."""
+    parsed = parse_gemini_output(output)
+    return parsed.member, parsed.transactions
 
 
 def normalize_date(date_str):
@@ -806,6 +1029,41 @@ def get_metadata_member(conn, doc_id):
     return " ".join(part for part in row if part).strip() or None
 
 
+def _resolve_ingestion_generation(
+    conn, doc_id: str, year: int, artifact_sha256: str
+) -> str:
+    row = conn.execute(
+        """
+        SELECT artifact.generation_id
+        FROM house_pdf_artifacts AS artifact
+        JOIN house_archive_generations AS generation
+          ON generation.archive_year = artifact.archive_year
+         AND generation.generation_id = artifact.generation_id
+        WHERE artifact.doc_id = ?
+          AND artifact.archive_year = ?
+          AND artifact.artifact_sha256 = ?
+        ORDER BY artifact.acquired_at DESC, artifact.generation_id DESC
+        LIMIT 1
+        """,
+        [str(doc_id), year, artifact_sha256],
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            "OCR artifact is not bound to an acquired House ingestion generation"
+        )
+    return str(row[0])
+
+
+def resolve_ingestion_generation(
+    db_path: str, doc_id: str, year: int, artifact_sha256: str
+) -> str:
+    conn = duckdb.connect(db_path, read_only=True)
+    try:
+        return _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
+    finally:
+        conn.close()
+
+
 def record_parse_run(
     conn,
     doc_id,
@@ -814,14 +1072,17 @@ def record_parse_run(
     raw_count,
     tx_count,
     error_message="",
-    parser_version="v4-gemini-manual",
+    parser_version=GEMINI_PARSER_VERSION,
+    artifact_sha256: str | None = None,
+    ingestion_generation: str | None = None,
 ):
     conn.execute(
         """
         INSERT INTO pdf_parse_runs (
             doc_id, year, parser_version, status, engines_attempted,
-            raw_row_count, transaction_count, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            raw_row_count, transaction_count, error_message,
+            artifact_sha256, ingestion_generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         [
             str(doc_id),
@@ -832,6 +1093,8 @@ def record_parse_run(
             raw_count,
             tx_count,
             error_message[:1000],
+            artifact_sha256,
+            ingestion_generation,
         ],
     )
 
@@ -843,66 +1106,155 @@ def insert_transactions(
     transactions,
     *,
     db_path: str,
-    parser_version: str = "v4-gemini-manual",
+    parser_version: str = GEMINI_PARSER_VERSION,
     raw_count: int | None = None,
+    artifact_sha256: str | None = None,
+    ingestion_generation: str | None = None,
 ):
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
+    require_ocr_schema(conn)
+    if not artifact_sha256 or not ingestion_generation:
+        conn.close()
+        raise RuntimeError(
+            "OCR insertion requires artifact_sha256 and ingestion_generation"
+        )
     filing_date = get_filing_date(conn, doc_id)
+    expected_member = get_metadata_member(conn, doc_id)
     if not transactions:
+        status = "error" if raw_count else "no_txs"
+        message = "semantic_zero_after_raw_rows" if raw_count else ""
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            if status == "no_txs":
+                conn.execute(
+                    "DELETE FROM transactions WHERE source = 'gemini_ocr' "
+                    "AND doc_id = ? AND (chamber = 'House' OR chamber IS NULL)",
+                    [str(doc_id)],
+                )
+            record_parse_run(
+                conn,
+                doc_id,
+                year,
+                status,
+                raw_count or 0,
+                0,
+                message,
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return 0
+
+    input_count = raw_count if raw_count is not None else len(transactions)
+    validated, rejections = validate_transactions(
+        doc_id, member, transactions, filing_date, expected_member
+    )
+    fatal_rejections = {
+        key: value for key, value in rejections.items() if key != "member_mismatch"
+    }
+    if fatal_rejections:
         record_parse_run(
             conn,
             doc_id,
             year,
-            "no_txs",
-            raw_count or 0,
+            "error",
+            input_count,
             0,
+            json.dumps(fatal_rejections, sort_keys=True),
             parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
         )
         conn.close()
         return 0
+    transactions = validated
 
     errors = []
-    rows = []
-    for tx in transactions:
+    rows: list[dict] = []
+    for source_row_number, tx in enumerate(transactions, start=1):
         try:
-            # Convert dates to YYYY-MM-DD format
             tx_date = normalize_date(tx["date"])
-            notif_date = filing_date or normalize_date(tx["notif_date"]) or tx_date
-            ticker = extract_ticker(tx["asset"]) or resolve_ticker(tx["asset"])
-
-            if not tx_date:
-                errors.append(f"bad date: {tx['date']}")
+            notification_date = normalize_date(tx["notif_date"])
+            disclosure_date = filing_date or notification_date or tx_date
+            disclosed_ticker = extract_ticker(tx["asset"])
+            ticker_candidate = None
+            if disclosed_ticker:
+                ticker = disclosed_ticker
+                raw_ticker = disclosed_ticker
+                ticker_origin = "official"
+            else:
+                ticker_candidate = resolve_ticker(tx["asset"])
+                ticker = None
+                raw_ticker = ticker_candidate
+                ticker_origin = "unverified" if ticker_candidate else "not_reported"
+            if not tx_date or not notification_date:
+                errors.append(f"bad date: {tx['date']} / {tx['notif_date']}")
                 continue
 
-            # Normalize type
-            tx_type = tx["type"]
-            if tx_type in ("P",):
-                tx_type = "Purchase"
-            elif tx_type in ("S",):
-                tx_type = "Sale"
-            elif tx_type in ("E",):
-                tx_type = "Exchange"
-
-            rows.append(
-                [
-                    str(doc_id),
-                    tx.get("member") or member or "Unknown",
-                    ticker,
-                    tx_date,
-                    notif_date,
-                    tx_type,
-                    tx["amount_letter"] or "Unknown",
-                    tx["amount_midpoint"],
-                    None,
-                    tx["asset"][:500] if tx.get("asset") else None,
-                    "gemini_ocr",
-                ]
+            values = {
+                "doc_id": str(doc_id),
+                "member": tx.get("member") or member,
+                "ticker": ticker,
+                "transaction_date": tx_date,
+                "disclosure_date": disclosure_date,
+                "transaction_type": tx["type"],
+                "amount_raw": tx["amount_letter"],
+                "amount_midpoint": tx["amount_midpoint"],
+                "owner_code": None,
+                "asset_description": tx["asset"][:500],
+                "source": "gemini_ocr",
+            }
+            page_number = tx.get("page_number")
+            row_identity = (
+                f"{doc_id}:page:{page_number}:row:{source_row_number}"
+                if page_number is not None
+                else f"{doc_id}:row:{source_row_number}"
             )
-        except Exception as e:
-            errors.append(f"{tx.get('asset', '?')}: {e}")
+            authoritative_provenance = {
+                "chamber": "House",
+                "source_record_id": str(doc_id),
+                "source_row_id": row_identity,
+                "official_filing_date": filing_date,
+                "available_date": filing_date,
+                "notification_date": notification_date,
+                "raw_transaction_subtype": tx["type"],
+                "ticker_origin": ticker_origin,
+                "raw_ticker": raw_ticker,
+                "ticker_candidate": ticker_candidate,
+                "raw_asset_class": "Not separately reported",
+                "raw_asset_description": tx["asset"][:500],
+                "ingestion_generation": ingestion_generation,
+                "artifact_sha256": artifact_sha256,
+            }
+            values.update(authoritative_provenance)
+            row = {column: values.get(column) for column in OCR_INSERT_COLUMNS}
+            validate_ticker_provenance(row)
+            rows.append(row)
+        except Exception as exc:
+            errors.append(f"{tx.get('asset', '?')}: {exc}")
     if errors:
-        print(f"  INSERT ERRORS ({len(errors)}): {errors[:3]}", flush=True)
+        message = "; ".join(errors)
+        record_parse_run(
+            conn,
+            doc_id,
+            year,
+            "error",
+            input_count,
+            0,
+            message,
+            parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
+        )
+        conn.close()
+        return 0
     if not rows:
         # If transactions were provided but all failed validation, record as
         # "error" so get_zero_row_pdfs() will retry them; only use "no_txs"
@@ -918,6 +1270,8 @@ def insert_transactions(
             0,
             "; ".join(errors),
             parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
         )
         conn.execute("CHECKPOINT")
         conn.close()
@@ -925,53 +1279,96 @@ def insert_transactions(
 
     count = 0
     committed = False
+    staging_table = "staging_gemini_ocr_transactions"
     try:
-        conn.execute("BEGIN TRANSACTION")
-        conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
+        conn.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        conn.execute(
+            f"CREATE TEMP TABLE {staging_table} AS "
+            "SELECT * FROM transactions WHERE FALSE"
+        )
         for row in rows:
+            columns = list(row)
+            placeholders = ", ".join("?" for _ in columns)
             conn.execute(
-                """
-                INSERT INTO transactions
-                (doc_id, member, ticker, transaction_date, disclosure_date,
-                 transaction_type, amount_raw, amount_midpoint, owner_code, created_at,
-                 asset_description, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-            """,
-                row,
+                f"INSERT INTO {staging_table} ({', '.join(columns)}) "
+                f"VALUES ({placeholders})",
+                [row[column] for column in columns],
             )
-            count += 1
+        columns = OCR_INSERT_COLUMNS
+        conn.execute("BEGIN TRANSACTION")
+        identity_columns = [
+            "source",
+            "chamber",
+            "source_record_id",
+            "source_row_id",
+            "ingestion_generation",
+        ]
+        mutable_columns = [
+            column for column in columns if column not in identity_columns
+        ]
+        identity_join = " AND ".join(
+            f"target.{column} = staged.{column}" for column in identity_columns
+        )
+        updates = ", ".join(f"{column} = staged.{column}" for column in mutable_columns)
+        conn.execute(
+            f"UPDATE transactions AS target SET {updates} "
+            f"FROM {staging_table} AS staged WHERE {identity_join}"
+        )
+        conn.execute(
+            f"INSERT INTO transactions ({', '.join(columns)}) "
+            f"SELECT {', '.join(f'staged.{column}' for column in columns)} "
+            f"FROM {staging_table} AS staged WHERE NOT EXISTS ("
+            f"SELECT 1 FROM transactions AS target WHERE {identity_join})"
+        )
+        stale_identity_join = " AND ".join(
+            f"staged.{column} = target.{column}" for column in identity_columns
+        )
+        conn.execute(
+            "DELETE FROM transactions AS target "
+            "WHERE target.source = 'gemini_ocr' AND target.doc_id = ? "
+            "AND (target.chamber = 'House' OR target.chamber IS NULL) "
+            f"AND NOT EXISTS (SELECT 1 FROM {staging_table} AS staged "
+            f"WHERE {stale_identity_join})",
+            [str(doc_id)],
+        )
+        count = len(rows)
         record_parse_run(
             conn,
             doc_id,
             year,
             "success",
-            raw_count if raw_count is not None else len(transactions),
+            input_count,
             count,
-            "; ".join(errors),
+            "",
             parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
         )
         conn.execute("COMMIT")
         committed = True
         conn.execute("CHECKPOINT")
         return count
-    except Exception as e:
-        # A CHECKPOINT failure after COMMIT must not trigger ROLLBACK (no
-        # active transaction — would mask the original error); the data is
-        # already committed, so only re-raise.
+    except Exception as exc:
         if not committed:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             record_parse_run(
                 conn,
                 doc_id,
                 year,
                 "error",
-                raw_count if raw_count is not None else len(transactions),
+                input_count,
                 0,
-                str(e),
+                str(exc),
                 parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
             )
         raise
     finally:
+        conn.execute(f"DROP TABLE IF EXISTS {staging_table}")
         conn.close()
 
 
@@ -994,12 +1391,8 @@ def main():
 
     pdfs = get_zero_row_pdfs()
     progress = load_progress()
-    completed = set(progress["completed"] + progress["no_txs"])
-
-    remaining = [p for p in pdfs if p[0] not in completed]
-    print(f"Total zero-row PDFs: {len(pdfs)}")
-    print(f"Already processed: {len(completed)}")
-    print(f"Remaining: {len(remaining)}")
+    remaining = pdfs
+    print(f"Current unresolved OCR work: {len(remaining)}")
 
     total_inserted = 0
     for i, (doc_id, year, path) in enumerate(remaining):
@@ -1008,22 +1401,53 @@ def main():
 
         time.sleep(COOLDOWN)
 
-        output, error = call_gemini(path, doc_id=doc_id, refresh=args.refresh)
+        output, error, artifact_metadata = call_gemini(
+            path, doc_id=doc_id, refresh=args.refresh
+        )
+        ingestion_generation = None
+        if artifact_metadata is not None:
+            try:
+                ingestion_generation = resolve_ingestion_generation(
+                    DB_PATH, doc_id, year, artifact_metadata.sha256
+                )
+            except RuntimeError as exc:
+                output, error = None, str(exc)
         if output is None or error:
-            progress["errors"].append(doc_id)
-            save_progress(progress)
             conn = duckdb.connect(DB_PATH)
             try:
-                record_parse_run(conn, doc_id, year, "error", 0, 0, error)
+                record_parse_run(
+                    conn,
+                    doc_id,
+                    year,
+                    "error",
+                    0,
+                    0,
+                    error,
+                    artifact_sha256=(
+                        artifact_metadata.sha256 if artifact_metadata else None
+                    ),
+                    ingestion_generation=ingestion_generation,
+                )
             finally:
                 conn.close()
+            mark_progress(progress, doc_id, "errors")
+            save_progress(progress)
             print(f"  ERROR: {error}", flush=True)
             continue
 
         member, transactions = parse_output(output)
         if not transactions:
-            insert_transactions(doc_id, year, member, [], db_path=DB_PATH)
-            progress["no_txs"].append(doc_id)
+            insert_transactions(
+                doc_id,
+                year,
+                member,
+                [],
+                db_path=DB_PATH,
+                raw_count=0,
+                artifact_sha256=artifact_metadata.sha256,
+                ingestion_generation=ingestion_generation,
+            )
+            mark_progress(progress, doc_id, "no_txs")
             save_progress(progress)
             print("  No transactions found", flush=True)
             continue
@@ -1035,30 +1459,46 @@ def main():
         )
         conn.close()
         print(f"  Validation rejections: {rejections}", flush=True)
-        if rejections.get("row_count_exceeds_cap"):
+        fatal_rejections = {
+            key: value for key, value in rejections.items() if key != "member_mismatch"
+        }
+        if fatal_rejections:
+            status = (
+                "rejected" if "row_count_exceeds_cap" in fatal_rejections else "error"
+            )
+            message = json.dumps(fatal_rejections, sort_keys=True)
             conn = duckdb.connect(DB_PATH)
             try:
                 record_parse_run(
                     conn,
                     doc_id,
                     year,
-                    "rejected",
+                    status,
                     raw_count,
                     0,
-                    "row_count_exceeds_cap",
+                    message,
+                    artifact_sha256=artifact_metadata.sha256,
+                    ingestion_generation=ingestion_generation,
                 )
             finally:
                 conn.close()
-            progress["errors"].append(doc_id)
+            mark_progress(progress, doc_id, "errors")
             save_progress(progress)
-            print(f"  REJECTED: row_count_exceeds_cap ({raw_count})", flush=True)
+            print(f"  {status.upper()}: {message}", flush=True)
             continue
         member = transactions[0].get("member", member) if transactions else member
         inserted = insert_transactions(
-            doc_id, year, member, transactions, db_path=DB_PATH
+            doc_id,
+            year,
+            member,
+            transactions,
+            db_path=DB_PATH,
+            raw_count=raw_count,
+            artifact_sha256=artifact_metadata.sha256,
+            ingestion_generation=ingestion_generation,
         )
         total_inserted += inserted
-        progress["completed" if inserted else "no_txs"].append(doc_id)
+        mark_progress(progress, doc_id, "success" if inserted else "errors")
         save_progress(progress)
         print(f"  Member: {member}", flush=True)
         print(
@@ -1076,88 +1516,130 @@ def main():
 
 
 def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = False):
-    """Process all zero-row PDFs for a specific year."""
+    """Process unresolved deterministic OCR candidates for one year."""
     db_path = os.path.join(data_dir, "congress.duckdb")
     progress_path = Path(data_dir) / "ocr_progress_gemini_manual.json"
-    conn = duckdb.connect(db_path, read_only=True)
-    rows = conn.execute(
-        """
-        WITH latest AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY parsed_at DESC) as rn
-            FROM pdf_parse_runs
-        )
-        SELECT l.doc_id, l.year
-        FROM latest l
-        WHERE l.rn = 1 AND l.status IN ('zero_rows', 'error') AND l.year = ?
-    """,
-        [year],
-    ).fetchall()
-    conn.close()
-
-    pdfs = [
-        (d, y, os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf"))
-        for d, y in rows
-        if os.path.exists(os.path.join(data_dir, str(y), "pdfs", f"{d}.pdf"))
-    ]
-    print(f"Zero-row PDFs for {year}: {len(pdfs)}")
-
+    remaining = get_ocr_work_items(db_path=db_path, data_dir=data_dir, year=year)
+    print(f"Current unresolved OCR work for {year}: {len(remaining)}")
     progress = load_progress(progress_path)
-    completed = set(progress["completed"] + progress["no_txs"])
-    remaining = [p for p in pdfs if p[0] not in completed]
-    print(f"Remaining: {len(remaining)}")
 
     total_inserted = 0
     for i, (doc_id, yr, path) in enumerate(remaining):
         print(f"\n[{i + 1}/{len(remaining)}] {doc_id} ({yr})...", flush=True)
         time.sleep(COOLDOWN)
-        output, error = call_gemini(
+        output, error, artifact_metadata = call_gemini(
             path,
             doc_id=doc_id,
             refresh=refresh,
             cache_dir=os.path.join(data_dir, "gemini_cache"),
+            parser_version=GEMINI_PARSER_VERSION,
         )
-        if output is None or error:
-            progress["errors"].append(doc_id)
-            save_progress(progress, progress_path)
-            conn = duckdb.connect(db_path)
+        ingestion_generation = None
+        if artifact_metadata is not None:
             try:
-                record_parse_run(conn, doc_id, yr, "error", 0, 0, error)
-            finally:
-                conn.close()
-            print(f"  ERROR: {error}", flush=True)
-            continue
-        member, transactions = parse_output(output)
-        if not transactions:
-            insert_transactions(doc_id, yr, member, [], db_path=db_path)
-            progress["no_txs"].append(doc_id)
-            save_progress(progress, progress_path)
-            print("  No transactions found", flush=True)
-            continue
-        raw_count = len(transactions)
-        conn = duckdb.connect(db_path, read_only=True)
-        transactions, rejections = validate_for_insert(
-            conn, doc_id, member, transactions
-        )
-        conn.close()
-        print(f"  Validation rejections: {rejections}", flush=True)
-        if rejections.get("row_count_exceeds_cap"):
+                ingestion_generation = resolve_ingestion_generation(
+                    db_path, doc_id, yr, artifact_metadata.sha256
+                )
+            except RuntimeError as exc:
+                output, error = None, str(exc)
+        if output is None or error:
             conn = duckdb.connect(db_path)
             try:
                 record_parse_run(
-                    conn, doc_id, yr, "rejected", raw_count, 0, "row_count_exceeds_cap"
+                    conn,
+                    doc_id,
+                    yr,
+                    "error",
+                    0,
+                    0,
+                    error,
+                    artifact_sha256=(
+                        artifact_metadata.sha256 if artifact_metadata else None
+                    ),
+                    ingestion_generation=ingestion_generation,
                 )
             finally:
                 conn.close()
-            progress["errors"].append(doc_id)
+            mark_progress(progress, doc_id, "errors")
             save_progress(progress, progress_path)
-            print(f"  REJECTED: row_count_exceeds_cap ({raw_count})", flush=True)
+            print(f"  ERROR: {error}", flush=True)
             continue
-        member = transactions[0].get("member", member) if transactions else member
+
+        member, transactions = parse_output(output)
+        if not transactions:
+            insert_transactions(
+                doc_id,
+                yr,
+                member,
+                [],
+                db_path=db_path,
+                raw_count=0,
+                parser_version=GEMINI_PARSER_VERSION,
+                artifact_sha256=artifact_metadata.sha256,
+                ingestion_generation=ingestion_generation,
+            )
+            mark_progress(progress, doc_id, "no_txs")
+            save_progress(progress, progress_path)
+            print("  No transactions found", flush=True)
+            continue
+
+        raw_count = len(transactions)
+        conn = duckdb.connect(db_path, read_only=True)
+        try:
+            transactions, rejections = validate_for_insert(
+                conn, doc_id, member, transactions
+            )
+        finally:
+            conn.close()
+        print(f"  Validation rejections: {rejections}", flush=True)
+        fatal_rejections = {
+            key: value for key, value in rejections.items() if key != "member_mismatch"
+        }
+        if fatal_rejections:
+            status = (
+                "rejected" if "row_count_exceeds_cap" in fatal_rejections else "error"
+            )
+            message = json.dumps(fatal_rejections, sort_keys=True)
+            conn = duckdb.connect(db_path)
+            try:
+                record_parse_run(
+                    conn,
+                    doc_id,
+                    yr,
+                    status,
+                    raw_count,
+                    0,
+                    message,
+                    parser_version=GEMINI_PARSER_VERSION,
+                    artifact_sha256=artifact_metadata.sha256,
+                    ingestion_generation=ingestion_generation,
+                )
+            finally:
+                conn.close()
+            mark_progress(progress, doc_id, "errors")
+            save_progress(progress, progress_path)
+            print(f"  {status.upper()}: {message}", flush=True)
+            continue
+
+        member = transactions[0]["member"]
         inserted = insert_transactions(
-            doc_id, yr, member, transactions, db_path=db_path
+            doc_id,
+            yr,
+            member,
+            transactions,
+            db_path=db_path,
+            parser_version=GEMINI_PARSER_VERSION,
+            raw_count=raw_count,
+            artifact_sha256=artifact_metadata.sha256,
+            ingestion_generation=ingestion_generation,
         )
+        if inserted <= 0:
+            mark_progress(progress, doc_id, "errors")
+            save_progress(progress, progress_path)
+            print("  ERROR: validated rows were not inserted", flush=True)
+            continue
         total_inserted += inserted
-        progress["completed" if inserted else "no_txs"].append(doc_id)
+        mark_progress(progress, doc_id, "success")
         save_progress(progress, progress_path)
         print(f"  Inserted: {inserted}/{len(transactions)}", flush=True)
 

@@ -1,16 +1,24 @@
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from analyzer.analysis import (
-    backtest_recommendations,
+    backtest_recommendations as _backtest_recommendations,
     evaluate_backtest,
     summarize_backtest,
 )
+from analyzer.backtest.recommend import _candidate_tickers, _filter_equity_rows
 
 from .conftest import DatabaseTestCase
+
+
+def backtest_recommendations(*args, **kwargs):
+    """Run legacy ranking tests with an explicit non-default scoring mode."""
+    kwargs.setdefault("scoring_mode", "shrunk_alpha")
+    return _backtest_recommendations(*args, **kwargs)
 
 
 def _make_signals(rows):
@@ -26,17 +34,31 @@ def _make_signals(rows):
         "spy_alpha_pct": [],
         "total_return_pct": [],
         "total_spy_alpha_pct": [],
+        "instrument_type": [],
+        "ticker_origin": [],
     }
     for row in rows:
+        enriched = {"instrument_type": "stock", "ticker_origin": "official"} | row
         for key in base:
-            base[key].append(row.get(key))
+            base[key].append(enriched.get(key))
     df = pd.DataFrame(base)
     df["disclosure_date"] = pd.to_datetime(df["disclosure_date"])
+    # Synthetic realized labels explicitly record their executable maturity.
+    df["label_window_end"] = [
+        pd.Timestamp(row["disclosure_date"])
+        + pd.Timedelta(days=int(row["horizon_days"]) + 1)
+        for row in rows
+    ]
+    df["window_complete"] = [row.get("window_complete", True) for row in rows]
     return df
 
 
 def _make_transactions(rows):
     df = pd.DataFrame(rows)
+    if "instrument_type" not in df.columns:
+        df["instrument_type"] = "stock"
+    if "ticker_origin" not in df.columns:
+        df["ticker_origin"] = "official"
     df["transaction_date"] = pd.to_datetime(df["transaction_date"])
     df["disclosure_date"] = pd.to_datetime(df["disclosure_date"])
     return df
@@ -111,6 +133,31 @@ class TestBacktestRecommendations(unittest.TestCase):
             ]
         )
 
+    @patch("analyzer.backtest.recommend.score_ticker_by_buyers")
+    def test_default_consensus_cold_start_passes_absolute_as_of(self, score):
+        score.return_value = pd.DataFrame(
+            {
+                "ticker": ["AAPL"],
+                "num_buyers": [2],
+                "rated_buyers": [0],
+                "signal_score": [1.5],
+                "signal_score_raw": [1.5],
+                "scoring_mode": ["consensus"],
+            }
+        )
+        recommendations = _backtest_recommendations(
+            pd.DataFrame(),
+            self.recent_transactions,
+            self.as_of,
+            horizon=90,
+            lookback_days=60,
+            min_buyers=2,
+        )
+        self.assertEqual(recommendations.iloc[0]["scoring_mode"], "consensus")
+        kwargs = score.call_args.kwargs
+        self.assertEqual(kwargs["scoring_mode"], "consensus")
+        self.assertEqual(kwargs["as_of_date"], self.as_of)
+
     def test_produces_recommendations_for_multi_buyer_ticker(self):
         recs = backtest_recommendations(
             self.signals,
@@ -121,6 +168,7 @@ class TestBacktestRecommendations(unittest.TestCase):
             min_buyers=2,
             top_n=10,
             threshold=5.0,
+            scoring_mode="consensus",
         )
         self.assertFalse(recs.empty)
         self.assertEqual(len(recs), 1)
@@ -247,6 +295,7 @@ class TestBacktestRecommendations(unittest.TestCase):
             min_buyers=2,
             top_n=10,
             threshold=5.0,
+            scoring_mode="consensus",
         )
         recs_with_future = backtest_recommendations(
             signals_with_future,
@@ -257,6 +306,7 @@ class TestBacktestRecommendations(unittest.TestCase):
             min_buyers=2,
             top_n=10,
             threshold=5.0,
+            scoring_mode="consensus",
         )
 
         self.assertEqual(
@@ -426,38 +476,29 @@ class TestEvaluateBacktest(unittest.TestCase):
         )
         self.assertTrue(result.empty)
 
-    def test_delisted_ticker_included_at_last_price(self):
-        # Bug 2 regression: tickers with data ending before the exit date
-        # (delisted/suspended) must be included at their last available price,
-        # NOT silently dropped from both numerator and denominator.
+    def test_truncated_ticker_is_unavailable_without_a_delisting_guess(self):
         full_dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
         short_end = pd.Timestamp("2025-01-15")
-        n_full = len(full_dates)
         n_short = len(pd.date_range("2024-12-01", short_end, freq="D"))
-        aapl_vals = [100.0 + i * 0.1 for i in range(n_short)] + [np.nan] * (
-            n_full - n_short
-        )
-        goog_vals = [200.0 - i * 0.05 for i in range(n_short)] + [np.nan] * (
-            n_full - n_short
-        )
-        spy_vals = [400.0 + i * 0.02 for i in range(n_full)]
+        n_full = len(full_dates)
         prices = pd.DataFrame(
-            {"AAPL": aapl_vals, "GOOG": goog_vals, "SPY": spy_vals},
+            {
+                "AAPL": [100.0] * n_short + [np.nan] * (n_full - n_short),
+                "GOOG": [200.0] * n_short + [np.nan] * (n_full - n_short),
+                "SPY": [400.0 + i * 0.02 for i in range(n_full)],
+            },
             index=full_dates,
         )
+
         result = evaluate_backtest(
             self.recommendations, prices, pd.Timestamp("2025-01-01"), horizon=90
         )
-        # Both AAPL/GOOG have data that ends before exit → both included at last price
-        evaluated = result.dropna(subset=["bt_return_pct"])
-        self.assertEqual(
-            len(evaluated), 2, "delisted tickers must be included, not dropped"
-        )
-        self.assertTrue(
-            evaluated["bt_delisted"].all(), "both should be flagged as delisted"
-        )
-        # Coverage counts should be propagated in attrs
-        self.assertEqual(result.attrs.get("n_delisted"), 2)
+
+        self.assertEqual(result["bt_return_pct"].notna().sum(), 0)
+        self.assertTrue((result["bt_coverage"] == "unavailable").all())
+        self.assertFalse(result["bt_delisted"].any())
+        self.assertEqual(result.attrs["n_unavailable"], 2)
+        self.assertEqual(result.attrs["n_delisted"], 0)
 
     def test_missing_entry_price_skips_row(self):
         no_aapl = self.prices.drop(columns=["AAPL"])
@@ -469,59 +510,109 @@ class TestEvaluateBacktest(unittest.TestCase):
 
 
 class TestSummarizeBacktest(unittest.TestCase):
-    def test_groups_by_rank(self):
-        # Bug 4: summary now includes SPY_BH baseline row in addition to
-        # per-rank rows and ALL. len == 4 (rank1, rank2, ALL, SPY_BH).
+    def test_equal_funds_once_per_rebalance_date(self):
         results = pd.DataFrame(
             {
-                "rank": [1, 1, 2, 2],
-                "bt_return_pct": [10.0, -5.0, 20.0, 15.0],
-                "bt_alpha_pct": [5.0, -8.0, 15.0, 10.0],
-                "bt_spy_return_pct": [3.0, 1.0, 4.0, 2.0],
+                "as_of_date": ["2025-01-01", "2025-01-02", "2025-01-02"],
+                "rank": [1, 1, 2],
+                "bt_return_pct": [0.0, 10.0, 20.0],
+                "bt_alpha_pct": [0.0, 5.0, 15.0],
+                "bt_horizon_days": [20, 30, 30],
             }
         )
         summary = summarize_backtest(results)
-        self.assertEqual(len(summary), 4)  # rank1, rank2, ALL, SPY_BH
-        rank1 = summary[summary["rank"] == 1].iloc[0]
-        rank2 = summary[summary["rank"] == 2].iloc[0]
-        self.assertEqual(rank1["count"], 2)
-        self.assertEqual(rank1["win_rate_pct"], 50.0)
-        self.assertAlmostEqual(rank1["avg_return_pct"], 2.5)
-        self.assertEqual(rank2["count"], 2)
-        self.assertEqual(rank2["win_rate_pct"], 100.0)
+        portfolio = summary[summary["rank"] == "PORTFOLIO"].iloc[0]
+        self.assertEqual(portfolio["count"], 2)
+        self.assertEqual(portfolio["recommendation_count"], 3)
+        self.assertEqual(portfolio["avg_return_pct"], 7.5)
+        self.assertEqual(portfolio["avg_alpha_pct"], 5.0)
+        self.assertEqual(portfolio["holding_policy"], "adaptive_20-30d")
 
-    def test_includes_overall_row(self):
+    def test_real_spy_buy_hold_uses_one_start_and_end_trade(self):
         results = pd.DataFrame(
             {
-                "rank": [1, 2],
-                "bt_return_pct": [10.0, -5.0],
-                "bt_alpha_pct": [5.0, -8.0],
+                "as_of_date": ["2025-01-01", "2025-01-02", "2025-01-02"],
+                "bt_exit_date": ["2025-01-03"] * 3,
+                "bt_return_pct": [0.0, 10.0, 20.0],
+                "bt_alpha_pct": [0.0, 5.0, 15.0],
+            }
+        )
+        spy = pd.Series(
+            [100.0, 110.0, 120.0],
+            index=pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03"]),
+        )
+        summary = summarize_backtest(
+            results, spy, entry_slippage_bps=0, exit_slippage_bps=0
+        )
+        spy_row = summary[summary["rank"] == "SPY_BUY_HOLD"].iloc[0]
+        self.assertEqual(spy_row["count"], 1)
+        self.assertEqual(spy_row["avg_return_pct"], 20.0)
+
+    def test_spy_buy_hold_quarantines_unverified_zero_quote(self):
+        results = pd.DataFrame(
+            {
+                "bt_entry_date": ["2025-01-01"],
+                "bt_exit_date": ["2025-01-02"],
+                "bt_return_pct": [0.0],
+                "bt_alpha_pct": [0.0],
+            }
+        )
+        spy = pd.Series(
+            [100.0, 0.0],
+            index=pd.to_datetime(["2025-01-01", "2025-01-02"]),
+        )
+        summary = summarize_backtest(
+            results, spy, entry_slippage_bps=0, exit_slippage_bps=0
+        )
+        self.assertNotIn("SPY_BUY_HOLD", summary["rank"].values)
+        self.assertEqual(summary.attrs["spy_benchmark_status"], "omitted")
+        self.assertEqual(summary.attrs["spy_benchmark_reason"], "spy_exit_nonpositive")
+
+    def test_repeated_spy_windows_are_not_called_buy_hold(self):
+        results = pd.DataFrame(
+            {
+                "as_of_date": ["A", "B", "B", "B", "B", "B"],
+                "bt_return_pct": [0.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+                "bt_alpha_pct": [0.0] * 6,
+                "bt_spy_return_pct": [0.0, 10.0, 10.0, 10.0, 10.0, 10.0],
             }
         )
         summary = summarize_backtest(results)
-        overall = summary[summary["rank"] == "ALL"].iloc[0]
-        self.assertEqual(overall["count"], 2)
-        self.assertEqual(overall["win_rate_pct"], 50.0)
-        self.assertAlmostEqual(overall["avg_return_pct"], 2.5)
+        self.assertNotIn("SPY_BUY_HOLD", summary["rank"].values)
+        portfolio = summary.iloc[0]
+        self.assertEqual(portfolio["avg_return_pct"], 5.0)
 
     def test_empty_results_returns_empty(self):
-        results = pd.DataFrame({"rank": [], "bt_return_pct": [], "bt_alpha_pct": []})
-        summary = summarize_backtest(results)
-        self.assertTrue(summary.empty)
+        results = pd.DataFrame({"bt_return_pct": [], "bt_alpha_pct": []})
+        self.assertTrue(summarize_backtest(results).empty)
 
     def test_all_nan_returns_dropped(self):
-        # Bug 4: summary now includes SPY_BH baseline, so len == 3 (rank1, ALL, SPY_BH).
         results = pd.DataFrame(
-            {
-                "rank": [1, 2],
-                "bt_return_pct": [10.0, None],
-                "bt_alpha_pct": [5.0, None],
-                "bt_spy_return_pct": [3.0, None],
-            }
+            {"bt_return_pct": [10.0, None], "bt_alpha_pct": [5.0, None]}
         )
         summary = summarize_backtest(results)
-        self.assertEqual(len(summary), 3)  # rank1, ALL, SPY_BH (rank2 dropped as NaN)
-        self.assertEqual(summary[summary["rank"] == 1].iloc[0]["count"], 1)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary.iloc[0]["count"], 1)
+
+    def test_spy_buy_hold_omits_unbounded_price_window_with_reason(self):
+        results = pd.DataFrame(
+            {
+                "bt_entry_date": ["2025-01-01"],
+                "bt_exit_date": ["2025-01-31"],
+                "bt_return_pct": [1.0],
+                "bt_alpha_pct": [0.0],
+            }
+        )
+        spy = pd.Series(
+            [100.0, 110.0],
+            index=pd.to_datetime(["2025-01-10", "2025-01-20"]),
+        )
+        summary = summarize_backtest(results, spy)
+        self.assertNotIn("SPY_BUY_HOLD", summary["rank"].values)
+        self.assertEqual(summary.attrs["spy_benchmark_status"], "omitted")
+        self.assertEqual(
+            summary.attrs["spy_benchmark_reason"], "spy_entry_outside_boundary"
+        )
 
 
 class TestBacktestCorrectnessRegressions(unittest.TestCase):
@@ -548,28 +639,19 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
 
     # ---- Bug 1a: default use_dip_entry=False, entry = as_of price
 
-    def test_default_entry_is_as_of_price_not_future_dip(self):
-        """Bug 1a: use_dip_entry defaults to False — entry must be the price at
-        as_of, not a future dip price obtained by looking forward."""
+    def test_default_entry_is_next_session_not_same_close_or_dip_search(self):
         as_of = pd.Timestamp("2025-01-02")
         dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
-        # At as_of the price is 100; one day later it drops to 80 (a big dip).
-        # With use_dip_entry=False the entry must be ~100, not 80.
         prices_arr = [100.0 if d <= as_of else 80.0 for d in dates]
         spy_arr = [400.0 + i * 0.01 for i in range(len(dates))]
         prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
-        recs = self._single_rec()
 
-        result = evaluate_backtest(
-            recs, prices, as_of, horizon=90
-        )  # default use_dip_entry=False
-        self.assertFalse(
-            result.dropna(subset=["bt_return_pct"]).empty, "trade should be evaluated"
-        )
-        # Entry must be the as_of price (100), not the future dip (80)
-        self.assertAlmostEqual(result.iloc[0]["bt_entry_price"], 100.0, places=1)
+        result = evaluate_backtest(self._single_rec(), prices, as_of, horizon=90)
 
-    # ---- Bug 1b: use_dip_entry=True — no fill when no dip; SPY aligned
+        self.assertFalse(result.dropna(subset=["bt_return_pct"]).empty)
+        self.assertEqual(result.iloc[0]["bt_entry_date"], date(2025, 1, 3))
+        self.assertAlmostEqual(result.iloc[0]["bt_entry_price"], 80.0, places=1)
+        self.assertEqual(result.iloc[0]["bt_entry_delay"], 1)
 
     def test_dip_entry_skips_position_when_no_dip_occurs(self):
         """Bug 1b: when use_dip_entry=True and no pullback occurs within
@@ -707,36 +789,26 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         self.assertEqual(result.attrs.get("n_no_price", 0), 1)
         self.assertEqual(result.attrs.get("n_delisted", 0), 0)
 
-    def test_delisted_ticker_uses_last_available_price_and_is_flagged(self):
-        """Bug 2: a ticker whose data ends before the exit date (delisted) must
-        be included at its last available price and flagged bt_delisted=True."""
+    def test_truncated_ticker_does_not_invent_last_quote_return(self):
         as_of = pd.Timestamp("2025-01-01")
-        horizon = 90
-        last_day = pd.Timestamp("2025-01-20")  # data ends 10+ days before exit
         dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
+        last_day = pd.Timestamp("2025-01-20")
         n_alive = len(pd.date_range("2024-12-01", last_day, freq="D"))
-        # AAPL prices: 100 → 110 while alive, then NaN
-        aapl_arr = [100.0 + i * (10.0 / (n_alive - 1)) for i in range(n_alive)] + [
+        aapl_arr = [100.0 + i * 0.1 for i in range(n_alive)] + [
             float("nan")
         ] * (len(dates) - n_alive)
-        spy_arr = [400.0 + i * 0.02 for i in range(len(dates))]
-        prices = self._make_prices(dates, {"AAPL": aapl_arr, "SPY": spy_arr})
-        recs = self._single_rec("AAPL")
-
-        result = evaluate_backtest(recs, prices, as_of, horizon=horizon)
-        valid = result.dropna(subset=["bt_return_pct"])
-        self.assertEqual(len(valid), 1, "delisted ticker must be included")
-        self.assertTrue(valid.iloc[0]["bt_delisted"], "bt_delisted flag must be True")
-        self.assertAlmostEqual(
-            valid.iloc[0]["bt_exit_price"],
-            110.0,
-            places=0,
-            msg="exit must use the last available price",
+        prices = self._make_prices(
+            dates,
+            {"AAPL": aapl_arr, "SPY": [400.0 + i * 0.02 for i in range(len(dates))]},
         )
-        self.assertEqual(result.attrs.get("n_delisted"), 1)
-        self.assertEqual(result.attrs.get("n_no_price"), 0)
 
-    # ---- Bug 3: merge — one output row per recommendation
+        result = evaluate_backtest(self._single_rec("AAPL"), prices, as_of, horizon=90)
+        row = result.iloc[0]
+
+        self.assertTrue(pd.isna(row["bt_return_pct"]))
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertFalse(row["bt_delisted"])
+        self.assertEqual(result.attrs["n_unavailable"], 1)
 
     def test_duplicate_ticker_in_recs_produces_two_rows_not_four(self):
         """Bug 3: two recommendations for the same ticker must produce exactly
@@ -775,29 +847,17 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
 
     # ---- Bug 4: SPY baseline in summary, coverage counts
 
-    def test_summary_includes_spy_baseline_row(self):
-        """Bug 4: summarize_backtest must include a SPY_BH baseline row so
-        callers can compare strategy returns against buy-and-hold SPY."""
+    def test_summary_requires_real_prices_for_spy_buy_hold(self):
         results = pd.DataFrame(
             {
-                "rank": [1, 1, 2],
+                "as_of_date": ["2025-01-01", "2025-01-02", "2025-01-02"],
                 "bt_return_pct": [10.0, -5.0, 20.0],
                 "bt_alpha_pct": [5.0, -8.0, 15.0],
                 "bt_spy_return_pct": [4.0, 2.0, 3.0],
             }
         )
         summary = summarize_backtest(results)
-        self.assertIn(
-            "SPY_BH", summary["rank"].values, "SPY_BH baseline row must be present"
-        )
-        spy_row = summary[summary["rank"] == "SPY_BH"].iloc[0]
-        self.assertEqual(spy_row["count"], 3)
-        # All three SPY returns are positive → win_rate = 100 %
-        self.assertEqual(spy_row["win_rate_pct"], 100.0)
-        self.assertAlmostEqual(
-            spy_row["avg_return_pct"], (4.0 + 2.0 + 3.0) / 3, places=2
-        )
-        self.assertEqual(spy_row["avg_alpha_pct"], 0.0)  # SPY vs itself is zero
+        self.assertNotIn("SPY_BUY_HOLD", summary["rank"].values)
 
     def test_summary_propagates_coverage_counts_from_attrs(self):
         """Bug 4: summarize_backtest must propagate n_no_price and n_delisted
@@ -812,24 +872,22 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         )
         results.attrs["n_no_price"] = 5
         results.attrs["n_delisted"] = 2
+        results.attrs["n_unavailable"] = 3
         summary = summarize_backtest(results)
         self.assertEqual(summary.attrs.get("n_no_price"), 5)
         self.assertEqual(summary.attrs.get("n_delisted"), 2)
+        self.assertEqual(summary.attrs.get("n_unavailable"), 3)
 
     def test_coverage_counts_flow_end_to_end(self):
-        """Integration: evaluate_backtest → summarize_backtest propagates
-        n_no_price and n_delisted end-to-end via .attrs."""
+        """Unavailable outcomes remain distinct from absent entry prices."""
         as_of = pd.Timestamp("2025-01-01")
         dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
         n = len(dates)
-        last_alive = pd.Timestamp("2025-01-20")
-        n_alive = len(pd.date_range("2024-12-01", last_alive, freq="D"))
+        n_alive = len(pd.date_range("2024-12-01", "2025-01-20", freq="D"))
         prices = self._make_prices(
             dates,
             {
-                # GOOG: full data, evaluated normally
                 "GOOG": [200.0 + i * 0.1 for i in range(n)],
-                # AAPL: delisted early (after as_of → counts as n_delisted)
                 "AAPL": [100.0] * n_alive + [float("nan")] * (n - n_alive),
                 "SPY": [400.0 + i * 0.02 for i in range(n)],
             },
@@ -837,23 +895,21 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         recs = pd.DataFrame(
             {
                 "rank": [1, 2, 3],
-                "ticker": ["GOOG", "AAPL", "MSFT"],  # MSFT has no price data
+                "ticker": ["GOOG", "AAPL", "MSFT"],
                 "signal_score": [50.0, 40.0, 30.0],
                 "num_buyers": [3, 2, 2],
             }
         )
+
         ev = evaluate_backtest(recs, prices, as_of, horizon=90)
         summary = summarize_backtest(ev)
-        self.assertEqual(summary.attrs.get("n_no_price"), 1)  # MSFT
-        self.assertEqual(summary.attrs.get("n_delisted"), 1)  # AAPL
 
-    # ---- Finding 2: ticker delisted BEFORE as_of must NOT be included
+        self.assertEqual(summary.attrs.get("n_no_price"), 1)
+        self.assertEqual(summary.attrs.get("n_delisted"), 0)
+        self.assertEqual(ev.attrs.get("n_unavailable"), 1)
 
-    def test_ticker_delisted_before_as_of_is_not_included(self):
-        """Finding 2: if a ticker last traded before as_of_date it was never
-        actionable.  It must NOT be included with bt_delisted=True (which would
-        produce a spurious near-zero return of pure slippage) and must be
-        counted in n_no_price, not n_delisted."""
+    def test_ticker_without_exact_entry_is_unavailable(self):
+        """A stale pre-decision quote cannot establish an executable entry."""
         as_of = pd.Timestamp("2025-01-15")
         # Ticker last traded Dec 31 — 15 days before as_of, within the 30-day
         # entry staleness window so the entry lookup succeeds.  The exit date
@@ -873,92 +929,37 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
             result.dropna(subset=["bt_return_pct"]).empty,
             "ticker delisted before as_of must not be included (not tradeable at rec time)",
         )
-        # Must be counted as n_no_price (untradeable), NOT n_delisted
-        self.assertEqual(
-            result.attrs.get("n_no_price", 0),
-            1,
-            "pre-as_of delisting must be counted in n_no_price",
-        )
-        self.assertEqual(
-            result.attrs.get("n_delisted", 0),
-            0,
-            "pre-as_of delisting must NOT increment n_delisted",
-        )
+        self.assertEqual(result.iloc[0]["bt_coverage"], "unavailable")
+        self.assertEqual(result.attrs.get("n_unavailable", 0), 1)
+        self.assertEqual(result.attrs.get("n_no_price", 0), 0)
+        self.assertEqual(result.attrs.get("n_delisted", 0), 0)
 
     # ---- Finding 1: multi-date concat must preserve summed coverage counts
 
-    def test_multi_date_concat_preserves_coverage_counts(self):
-        """Finding 1: pd.concat drops differing .attrs in pandas 3.x.
-        The pipeline must accumulate per-date counts explicitly so that
-        summarize_backtest sees the correct totals after concatenation."""
-        # Simulate two evaluate_backtest calls (two as_of dates), each with
-        # different coverage counts, then concat and verify summarize sees sum.
+    def test_multi_date_concat_preserves_unavailable_coverage_counts(self):
         dates = pd.date_range("2024-12-01", "2025-09-01", freq="D")
         n = len(dates)
-        last_alive = pd.Timestamp("2025-02-01")
-        n_alive = len(pd.date_range("2024-12-01", last_alive, freq="D"))
-
+        n_alive = len(pd.date_range("2024-12-01", "2025-02-01", freq="D"))
         prices = self._make_prices(
             dates,
             {
                 "AAPL": [100.0 + i * 0.05 for i in range(n)],
-                # GOOG delisted after last_alive
                 "GOOG": [200.0] * n_alive + [float("nan")] * (n - n_alive),
                 "SPY": [400.0 + i * 0.02 for i in range(n)],
             },
         )
-
-        # as_of_1: AAPL OK, MSFT missing (n_no_price=1), GOOG alive (n_delisted=0)
         recs1 = pd.DataFrame(
-            {
-                "rank": [1, 2],
-                "ticker": ["AAPL", "MSFT"],
-                "signal_score": [50.0, 40.0],
-                "num_buyers": [2, 2],
-            }
+            {"rank": [1, 2], "ticker": ["AAPL", "MSFT"], "signal_score": [50.0, 40.0]}
+        )
+        recs2 = pd.DataFrame(
+            {"rank": [1, 2], "ticker": ["AAPL", "GOOG"], "signal_score": [50.0, 40.0]}
         )
         ev1 = evaluate_backtest(recs1, prices, pd.Timestamp("2025-01-01"), horizon=90)
-        self.assertEqual(ev1.attrs.get("n_no_price", 0), 1)  # MSFT
-
-        # as_of_2: AAPL OK, GOOG now delisted during hold (n_delisted=1)
-        recs2 = pd.DataFrame(
-            {
-                "rank": [1, 2],
-                "ticker": ["AAPL", "GOOG"],
-                "signal_score": [50.0, 40.0],
-                "num_buyers": [2, 2],
-            }
-        )
         ev2 = evaluate_backtest(recs2, prices, pd.Timestamp("2025-01-15"), horizon=90)
-        self.assertEqual(ev2.attrs.get("n_delisted", 0), 1)  # GOOG
 
-        # Mimic the pipeline: sum counts, set on combined, then summarize
-        combined = pd.concat(
-            [
-                ev1.dropna(subset=["bt_return_pct"]),
-                ev2.dropna(subset=["bt_return_pct"]),
-            ],
-            ignore_index=True,
-        )
-        # pd.concat drops attrs → combined.attrs is {} — must set manually
-        combined.attrs["n_no_price"] = ev1.attrs.get("n_no_price", 0) + ev2.attrs.get(
-            "n_no_price", 0
-        )
-        combined.attrs["n_delisted"] = ev1.attrs.get("n_delisted", 0) + ev2.attrs.get(
-            "n_delisted", 0
-        )
-
-        summary = summarize_backtest(combined)
-        self.assertEqual(
-            summary.attrs.get("n_no_price"),
-            1,
-            "summed n_no_price must survive concat → summarize",
-        )
-        self.assertEqual(
-            summary.attrs.get("n_delisted"),
-            1,
-            "summed n_delisted must survive concat → summarize",
-        )
+        self.assertEqual(ev1.attrs["n_no_price"], 1)
+        self.assertEqual(ev2.attrs["n_unavailable"], 1)
+        self.assertEqual(ev2.attrs["n_delisted"], 0)
 
 
 class TestDatabaseDateRange(DatabaseTestCase):
@@ -1240,167 +1241,74 @@ class TestTrainingLookbackDays(unittest.TestCase):
         pd.testing.assert_frame_equal(recs_none, recs_default)
 
 
-class TestSoloBuyerSkillGate(unittest.TestCase):
-    """Integration tests for the min_buyers=1 solo-buyer skill gate."""
 
-    def setUp(self):
-        self.as_of = pd.Timestamp("2025-01-01")
-        horizon = 90
-        elapsed_cutoff = self.as_of - pd.Timedelta(days=horizon)
+class TestEquityEligibilityCanaries(unittest.TestCase):
+    def test_options_and_known_non_equities_are_rejected(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["A", "B", "C", "D", "E"],
+                "ticker": ["AMZN", "MATT", "ALLI", "ARLP", "AAPL"],
+                "disclosure_date": pd.to_datetime(["2025-01-14"] * 5),
+                "instrument_type": ["option", "stock", "stock", "stock", "stock"],
+                "asset_description": [
+                    "Amazon (AMZN) [OP]",
+                    "Matthews International Mutual Fund [OT]",
+                    "Alliant Holdings, LP [OL]",
+                    "Alliance Resource Partners (ARLP) [ST]",
+                    "Apple (AAPL) [ST]",
+                ],
+            }
+        )
+        filtered = _filter_equity_rows(rows)
+        self.assertEqual(set(filtered["ticker"]), {"ARLP", "AAPL"})
+        # 20034095/20034670 stale ALLI is also quarantined when descriptions are absent.
+        stale = pd.DataFrame(
+            {
+                "member": ["A", "B"],
+                "ticker": ["ALLI", "AAPL"],
+                "instrument_type": ["stock", "stock"],
+                "ticker_origin": ["official", "official"],
+                "disclosure_date": pd.to_datetime(["2026-03-02", "2026-03-02"]),
+            }
+        )
+        self.assertEqual(_candidate_tickers(stale, 1), ["AAPL"])
 
-        # Training signals for one high-skill member ("Star") with strong wins
-        # so rank_members produces a high posterior_lift (LOO prior for a
-        # 6/6-win sole member is clipped low, so lift ends up ~3.08, clearing
-        # the default 1.0 lift threshold).
-        star_signals = []
-        for i, tk in enumerate(["AAA", "BBB", "CCC", "GGG", "HHH", "III"]):
-            star_signals.append(
-                {
-                    "member": "Star",
-                    "ticker": tk,
-                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=80 - i * 5),
-                    "signal_type": "Purchase",
-                    "horizon_days": 90,
-                    "entry_price": 100.0,
-                    "decayed_return_pct": 25.0 + i,
-                    "peak_potential_pct": 35.0 + i,
-                    "spy_alpha_pct": 20.0 + i,
-                    "total_return_pct": 30.0 + i,
-                    "total_spy_alpha_pct": 22.0 + i,
-                }
-            )
-        dud_signals = []
-        for i, tk in enumerate(["DDD", "EEE", "FFF", "JJJ", "KKK", "LLL"]):
-            dud_signals.append(
-                {
-                    "member": "Dud",
-                    "ticker": tk,
-                    "disclosure_date": elapsed_cutoff - pd.Timedelta(days=55 - i * 3),
-                    "signal_type": "Purchase",
-                    "horizon_days": 90,
-                    "entry_price": 100.0,
-                    "decayed_return_pct": -20.0 - i,
-                    "peak_potential_pct": -10.0 - i,
-                    "spy_alpha_pct": -25.0 - i,
-                    "total_return_pct": -22.0 - i,
-                    "total_spy_alpha_pct": -28.0 - i,
-                }
-            )
-        self.signals = _make_signals(star_signals + dud_signals)
+    def test_unverified_fund_and_missing_metadata_are_ineligible(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["A", "B", "C"],
+                "ticker": ["VFINX", "NOTREAL", "TECH"],
+                "instrument_type": ["stock", "stock", "stock"],
+                "ticker_origin": ["official", None, "official"],
+                "asset_description": [
+                    "Vanguard 500 Index Fund",
+                    None,
+                    "Bio-Techne Corporation Common Stock [ST]",
+                ],
+            }
+        )
+        self.assertEqual(_filter_equity_rows(rows)["ticker"].tolist(), ["TECH"])
 
-    def test_high_skill_solo_buyer_recommended_with_min_buyers_1(self):
-        """A single high-skill buyer should appear when min_buyers=1."""
-        solo_txns = _make_transactions(
-            [
-                {
-                    "member": "Star",
-                    "ticker": "SOLO1",
-                    "transaction_date": "2024-12-10",
-                    "disclosure_date": "2024-12-15",
-                    "transaction_type": "Purchase",
-                },
-            ]
+    def test_aliases_wait_for_date_aware_price_mapping(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["A"],
+                "ticker": ["FB"],
+                "instrument_type": ["stock"],
+                "ticker_origin": ["official"],
+                "asset_description": ["Meta Platforms Common Stock [ST]"],
+                "transaction_date": pd.to_datetime(["2023-01-01"]),
+            }
         )
-        recs = backtest_recommendations(
-            self.signals,
-            solo_txns,
-            self.as_of,
-            horizon=90,
-            lookback_days=60,
-            min_buyers=1,
-            top_n=10,
-            threshold=5.0,
-        )
-        self.assertFalse(recs.empty)
-        self.assertEqual(recs.iloc[0]["ticker"], "SOLO1")
-        self.assertGreater(recs.iloc[0]["signal_score"], 0.0)
+        self.assertEqual(_candidate_tickers(rows, 1), [])
 
-    def test_low_skill_solo_buyer_filtered_with_min_buyers_1(self):
-        """A single low-skill buyer (posterior_lift < 1.0) should be rejected."""
-        solo_txns = _make_transactions(
-            [
-                {
-                    "member": "Dud",
-                    "ticker": "SOLO2",
-                    "transaction_date": "2024-12-10",
-                    "disclosure_date": "2024-12-15",
-                    "transaction_type": "Purchase",
-                },
-            ]
+    def test_unknown_instrument_abstains_when_column_is_present(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["A", "B"],
+                "ticker": ["AAPL", "MSFT"],
+                "instrument_type": [None, "stock"],
+                "ticker_origin": ["official", None],
+            }
         )
-        recs = backtest_recommendations(
-            self.signals,
-            solo_txns,
-            self.as_of,
-            horizon=90,
-            lookback_days=60,
-            min_buyers=1,
-            top_n=10,
-            threshold=5.0,
-        )
-        self.assertTrue(recs.empty)
-
-    def test_min_buyers_2_still_filters_single_buyer(self):
-        """Default min_buyers=2 keeps rejecting single-buyer tickers."""
-        solo_txns = _make_transactions(
-            [
-                {
-                    "member": "Star",
-                    "ticker": "SOLO3",
-                    "transaction_date": "2024-12-10",
-                    "disclosure_date": "2024-12-15",
-                    "transaction_type": "Purchase",
-                },
-            ]
-        )
-        recs = backtest_recommendations(
-            self.signals,
-            solo_txns,
-            self.as_of,
-            horizon=90,
-            lookback_days=60,
-            min_buyers=2,
-            top_n=10,
-            threshold=5.0,
-        )
-        self.assertTrue(recs.empty)
-
-    def test_solo_skill_threshold_passes_through(self):
-        """Raising the threshold filters a borderline-skill solo buyer."""
-        solo_txns = _make_transactions(
-            [
-                {
-                    "member": "Star",
-                    "ticker": "SOLO4",
-                    "transaction_date": "2024-12-10",
-                    "disclosure_date": "2024-12-15",
-                    "transaction_type": "Purchase",
-                },
-            ]
-        )
-        # Default threshold (1.0): Star (posterior_lift ~3.08) passes → recommendation produced.
-        recs_default = backtest_recommendations(
-            self.signals,
-            solo_txns,
-            self.as_of,
-            horizon=90,
-            lookback_days=60,
-            min_buyers=1,
-            top_n=10,
-            threshold=5.0,
-        )
-        self.assertFalse(recs_default.empty)
-
-        # Strict lift threshold (3.5) above Star's posterior_lift: Star rejected.
-        recs_strict = backtest_recommendations(
-            self.signals,
-            solo_txns,
-            self.as_of,
-            horizon=90,
-            lookback_days=60,
-            min_buyers=1,
-            top_n=10,
-            threshold=5.0,
-            solo_buyer_skill_threshold=3.5,
-        )
-        self.assertTrue(recs_strict.empty)
+        self.assertTrue(_filter_equity_rows(rows).empty)

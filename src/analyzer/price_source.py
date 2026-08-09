@@ -3,9 +3,10 @@
 import logging
 import re
 import time
-from datetime import date
+from datetime import date, timedelta
 
 from pathlib import Path
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -130,11 +131,16 @@ class YFinancePriceSource(PriceSource):
                 "No price data could be fetched from yfinance. Data source may be blocked or down."
             )
 
-        new_prices = (
-            data["Close"]
-            if len(fetch_resolved) > 1
-            else data["Close"].to_frame(fetch_resolved[0])
+        new_prices = self._extract_close_prices(data, fetch_resolved)
+        new_prices = self._normalize_price_index(new_prices)
+        new_prices = new_prices.apply(pd.to_numeric, errors="coerce")
+        invalid_mask = new_prices.notna() & (
+            ~np.isfinite(new_prices) | new_prices.le(0)
         )
+        invalid = int(invalid_mask.sum().sum())
+        new_prices = new_prices.mask(invalid_mask)
+        if invalid:
+            logger.warning("Rejected %d non-finite or non-positive fetched prices", int(invalid))
         new_prices = new_prices.dropna(axis=1, how="all")
         new_prices = self._rename_yf_columns(new_prices, raw_to_yf)
 
@@ -158,10 +164,13 @@ class YFinancePriceSource(PriceSource):
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                # yfinance treats ``end`` as exclusive while this public API
+                # and the repository treat it as inclusive.
+                download_end = pd.Timestamp(end) + timedelta(days=1)
                 return yf.download(
                     fetch_resolved,
                     start=start,
-                    end=end,
+                    end=download_end,
                     progress=False,
                     threads=True,
                     auto_adjust=True,
@@ -180,6 +189,41 @@ class YFinancePriceSource(PriceSource):
                         "falling back to cached data"
                     )
                     return pd.DataFrame()
+
+    @staticmethod
+    def _extract_close_prices(
+        data: pd.DataFrame, fetch_resolved: list[str]
+    ) -> pd.DataFrame:
+        """Normalize yfinance Close output for one or many symbols."""
+        try:
+            close = data["Close"]
+        except KeyError as exc:
+            raise DataSourceError(
+                "yfinance response did not contain Close prices"
+            ) from exc
+        if isinstance(close, pd.Series):
+            column = fetch_resolved[0] if len(fetch_resolved) == 1 else str(close.name)
+            return close.to_frame(column)
+        if not isinstance(close, pd.DataFrame):
+            raise DataSourceError("Unsupported yfinance Close response shape")
+        if len(fetch_resolved) == 1 and len(close.columns) == 1:
+            return close.rename(columns={close.columns[0]: fetch_resolved[0]})
+        return close.copy()
+
+    @staticmethod
+    def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:
+        try:
+            index = pd.DatetimeIndex(pd.to_datetime(prices.index))
+        except (TypeError, ValueError) as exc:
+            raise DataSourceError("yfinance returned an invalid date index") from exc
+        if index.tz is not None:
+            index = index.tz_localize(None)
+        index = index.normalize()
+        if index.has_duplicates:
+            raise DataSourceError("yfinance returned duplicate calendar dates")
+        normalized = prices.copy()
+        normalized.index = index
+        return normalized.sort_index()
 
     def _rename_yf_columns(
         self, new_prices: pd.DataFrame, raw_to_yf: dict
@@ -225,6 +269,16 @@ def _validate_and_log_prices(
     prices: pd.DataFrame, all_tickers: list[str]
 ) -> pd.DataFrame:
     """Fail loudly when too many tickers couldn't be fetched (>25%)."""
+    prices = prices.apply(pd.to_numeric, errors="coerce")
+    invalid_mask = prices.notna() & (~np.isfinite(prices) | prices.le(0))
+    if invalid_mask.any().any():
+        logger.warning(
+            "Quarantined %d invalid cached price observations",
+            int(invalid_mask.sum().sum()),
+        )
+        prices = prices.mask(invalid_mask)
+    prices = prices.dropna(axis=1, how="all")
+
     failed_tickers = sorted(set(all_tickers) - set(prices.columns))
     success_count = len([t for t in all_tickers if t in prices.columns])
     success_rate = success_count / len(all_tickers)

@@ -13,6 +13,23 @@ from analyzer._memo import df_memoize
 from analyzer.models import TransactionType
 
 
+def _naive_date_index(values) -> pd.DatetimeIndex:
+    dates = pd.DatetimeIndex(pd.to_datetime(values))
+    if dates.tz is not None:
+        dates = dates.tz_localize(None)
+    return dates.normalize()
+
+
+def _label_maturity_mask(signals_df: pd.DataFrame, as_of_date: pd.Timestamp) -> pd.Series:
+    if "label_window_end" not in signals_df.columns:
+        return pd.Series(False, index=signals_df.index)
+    label_end = _naive_date_index(signals_df["label_window_end"])
+    mask = pd.Series(label_end <= as_of_date, index=signals_df.index)
+    if "window_complete" in signals_df.columns:
+        mask &= signals_df["window_complete"].fillna(False).astype(bool)
+    return mask
+
+
 @df_memoize(copy=False)
 def _filter_training(
     signals_df: pd.DataFrame,
@@ -22,10 +39,12 @@ def _filter_training(
 ) -> pd.DataFrame:
     """Filter signals to the training window. Result is shared (id-stable)."""
     as_of_date = pd.Timestamp(as_of_iso)
-    cutoff = as_of_date - pd.Timedelta(days=horizon)
+    if as_of_date.tz is not None:
+        as_of_date = as_of_date.tz_localize(None)
+    as_of_date = as_of_date.normalize()
     training = signals_df[
         (signals_df["horizon_days"] == horizon)
-        & (signals_df["disclosure_date"] <= cutoff)
+        & _label_maturity_mask(signals_df, as_of_date)
     ].copy()
     # Defense in depth for price datasets that end before the requested
     # horizon.  Such rows are censored observations, not realized outcomes.
@@ -62,10 +81,12 @@ def _filter_ticker_perf(
 ) -> pd.DataFrame:
     """Filter signals to the ticker-performance window. Result is id-stable."""
     as_of_date = pd.Timestamp(as_of_iso)
-    cutoff = as_of_date - pd.Timedelta(days=horizon)
+    if as_of_date.tz is not None:
+        as_of_date = as_of_date.tz_localize(None)
+    as_of_date = as_of_date.normalize()
     result = signals_df[
         (signals_df["horizon_days"] == horizon)
-        & (signals_df["disclosure_date"] <= cutoff)
+        & _label_maturity_mask(signals_df, as_of_date)
     ].copy()
     if "total_spy_alpha_pct" in result.columns:
         result = result[result["total_spy_alpha_pct"].notna()]

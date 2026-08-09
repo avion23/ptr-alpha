@@ -11,7 +11,23 @@ import numpy as np
 import pandas as pd
 
 
-_OPTIONAL_COLS = ("owner_code", "amount_midpoint")
+_OPTIONAL_COLS = (
+    "owner_code",
+    "amount_midpoint",
+    "instrument_type",
+    "strike_price",
+    "expiry_date",
+    "asset_description",
+    "raw_asset_description",
+    "raw_asset_class",
+    "ticker_origin",
+    "source",
+    "source_record_id",
+    "source_row_id",
+    "available_date",
+    "notification_date",
+    "economic_duplicate_candidate",
+)
 
 _FINAL_COLUMNS = [
     "member",
@@ -20,6 +36,9 @@ _FINAL_COLUMNS = [
     "signal_type",
     "horizon_days",
     "entry_price",
+    "label_entry_date",
+    "label_exit_date",
+    "label_window_end",
     "peak_potential_pct",
     "decayed_return_pct",
     "spy_alpha_pct",
@@ -61,7 +80,8 @@ def _compute_derived_arrays(metadata: dict, result_arrays: dict) -> dict:
     r_spy_cum = result_arrays["r_spy_cum"]
     r_spy_wsum = result_arrays["r_spy_wsum"]
 
-    valid_disc = (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
+    complete = result_arrays["r_window_complete"]
+    valid_disc = complete & (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
     # Bug #6: use NaN (not 0.0) for missing price windows so downstream
     # NaN-exclusion in aggregations (dynamic prior, hit rates) handles them.
     total_return = np.full(n, np.nan, dtype=np.float64)
@@ -89,23 +109,23 @@ def _compute_derived_arrays(metadata: dict, result_arrays: dict) -> dict:
 def _compute_peak_potential(metadata: dict, result_arrays: dict) -> np.ndarray:
     """Peak potential % = (peak/trough - entry) * 100, per transaction type.
 
-    Purchases use disclosure price as baseline and max price as upside.
-    Sales use entry price as baseline and min trough as upside.
+    Purchases use the executable next-session price and max price as upside.
+    Sales use the same next-session price and min trough as avoided loss.
     """
     n = len(metadata["disc_ns"])
     r_disc_baseline = result_arrays["r_disc_baseline"]
     r_peak = result_arrays["r_peak"]
     r_trough = result_arrays["r_trough"]
-    entry_prices_arr = metadata["entry_prices_arr"]
     txn_types = metadata["txn_types"]
 
     from analyzer.models import TransactionType
 
-    valid_disc = (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
+    complete = result_arrays["r_window_complete"]
+    valid_disc = complete & (r_disc_baseline > 0) & np.isfinite(r_disc_baseline)
     is_purchase = txn_types == TransactionType.PURCHASE.value
     is_sale = txn_types == TransactionType.SALE.value
     purchase_mask = is_purchase & valid_disc
-    sale_mask = is_sale & (r_trough > 0) & np.isfinite(r_trough)
+    sale_mask = is_sale & valid_disc & (r_trough > 0) & np.isfinite(r_trough)
 
     # Missing and not-yet-mature windows are unknown, not zero-return trades.
     peak_potential = np.full(n, np.nan, dtype=np.float64)
@@ -113,7 +133,7 @@ def _compute_peak_potential(metadata: dict, result_arrays: dict) -> np.ndarray:
         r_peak[purchase_mask] / r_disc_baseline[purchase_mask] - 1
     ) * 100
     peak_potential[sale_mask] = (
-        entry_prices_arr[sale_mask] / r_trough[sale_mask] - 1
+        r_disc_baseline[sale_mask] / r_trough[sale_mask] - 1
     ) * 100
     return peak_potential
 
@@ -126,7 +146,8 @@ def _build_result_data(
     optional_columns: list[str],
     result_arrays: dict,
 ) -> dict:
-    r_decayed_ret = result_arrays["r_decayed_ret"]
+    complete = result_arrays["r_window_complete"]
+    r_decayed_ret = np.where(complete, result_arrays["r_decayed_ret"], np.nan)
     result_data = {
         "member": signals["member"].values,
         "ticker": metadata["ticker_arr"],
@@ -134,6 +155,9 @@ def _build_result_data(
         "signal_type": metadata["txn_types"],
         "horizon_days": metadata["horizon_days_arr"],
         "entry_price": metadata["entry_prices_arr"],
+        "label_entry_date": result_arrays["r_entry_date"],
+        "label_exit_date": result_arrays["r_exit_date"],
+        "label_window_end": result_arrays["r_label_window_end"],
         "peak_potential_pct": peak_potential,
         "decayed_return_pct": r_decayed_ret * 100,
         "spy_alpha_pct": (r_decayed_ret - derived["spy_cum"]) * 100,

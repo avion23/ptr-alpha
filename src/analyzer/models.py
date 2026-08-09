@@ -2,6 +2,27 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 
+class Chamber(StrEnum):
+    HOUSE = "house"
+    SENATE = "senate"
+
+
+class TickerOrigin(StrEnum):
+    OFFICIAL = "official"
+    ASSET_DESCRIPTION = "asset_description"
+    UNVERIFIED = "unverified"
+    NON_EQUITY = "non_equity"
+    INVALID = "invalid"
+    MISSING = "missing"
+
+
+class ReportOutcome(StrEnum):
+    PARSED = "parsed"
+    PAPER_ONLY = "paper_only"
+    UNAVAILABLE = "unavailable"
+    FAILED = "failed"
+
+
 class TransactionType(StrEnum):
     PURCHASE = "Purchase"
     SALE = "Sale"

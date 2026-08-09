@@ -891,7 +891,7 @@ def test_save_requires_complete_report_schema_and_exact_summary_counts():
     del report["raw_row_count"]
     source = _ready_persistence_source(report)
     frame = source._normalize([_raw_trade()])
-    with pytest.raises(SenateEFDError, match="fields missing"):
+    with pytest.raises(SenateEFDError, match="schema mismatch"):
         source.save_to_db(frame)
 
     source = _ready_persistence_source()
@@ -956,7 +956,7 @@ def test_save_requires_transaction_report_and_raw_binding_columns(column):
     source = _ready_persistence_source()
     frame = source._normalize([_raw_trade()]).drop(columns=[column])
 
-    with pytest.raises(SenateEFDError, match="columns missing"):
+    with pytest.raises(SenateEFDError, match="schema mismatch"):
         source.save_to_db(frame)
 
 
@@ -1113,4 +1113,52 @@ def test_save_rejects_three_persisted_derivation_mutations(column, value, error)
     frame.loc[0, column] = value
 
     with pytest.raises(SenateEFDError, match=error):
+        source.save_to_db(frame)
+
+
+def test_save_rejects_unexpected_transaction_and_report_inventory_fields():
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame["unexpected_transaction_field"] = "not allowed"
+    with pytest.raises(SenateEFDError, match="schema mismatch.*unexpected"):
+        source.save_to_db(frame)
+
+    source = _ready_persistence_source(
+        _report_inventory_row(unexpected_report_field="not allowed")
+    )
+    frame = source._normalize([_raw_trade()])
+    with pytest.raises(SenateEFDError, match="schema mismatch.*unexpected"):
+        source.save_to_db(frame)
+
+
+def test_nan_raw_ticker_is_missing_not_literal_nan_ticker():
+    ticker, candidate, origin = SenateEFDSource._resolve_ticker(
+        float("nan"), "Private holding", ""
+    )
+    assert ticker is None
+    assert candidate is None
+    assert origin is TickerOrigin.MISSING
+
+    source = _ready_persistence_source()
+    frame = source._normalize(
+        [
+            _raw_trade(
+                ticker=None,
+                ticker_raw=float("nan"),
+                ticker_candidate=None,
+                ticker_origin=TickerOrigin.MISSING.value,
+                asset_name="Private holding",
+                asset_type="",
+            )
+        ]
+    )
+    assert pd.isna(frame.iloc[0]["raw_ticker"])
+    assert source.save_to_db(frame) == 1
+
+
+def test_save_rejects_inventory_member_with_surrounding_whitespace():
+    source = _ready_persistence_source(_report_inventory_row(member=" Katie Britt "))
+    frame = source._normalize([_raw_trade()])
+
+    with pytest.raises(SenateEFDError, match="member must be nonblank and stripped"):
         source.save_to_db(frame)

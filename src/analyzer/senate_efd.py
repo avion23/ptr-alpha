@@ -530,7 +530,7 @@ class SenateEFDSource(TransactionSource):
     def _resolve_ticker(
         cls, ticker_raw: str, asset_name: str, asset_type: str
     ) -> tuple[str | None, str | None, TickerOrigin]:
-        raw = str(ticker_raw or "").strip().upper()
+        raw = (cls._provenance_text(ticker_raw) or "").upper()
         if raw and raw != "--":
             if not _EQUITY_TICKER_RE.fullmatch(raw):
                 return None, None, TickerOrigin.INVALID
@@ -1228,10 +1228,13 @@ class SenateEFDSource(TransactionSource):
             )
 
         required_columns = set(_NORMALIZED_TRANSACTION_COLUMNS)
-        missing = required_columns - set(df.columns)
-        if missing:
+        actual_columns = set(df.columns)
+        missing = required_columns - actual_columns
+        unexpected = actual_columns - required_columns
+        if missing or unexpected:
             raise SenateEFDError(
-                f"Senate transaction provenance columns missing: {sorted(missing)}"
+                "Senate transaction provenance schema mismatch: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
             )
 
         required_values = [
@@ -1330,11 +1333,14 @@ class SenateEFDSource(TransactionSource):
         outcome_counts = {outcome.value: 0 for outcome in ReportOutcome}
         transaction_counts = df.groupby("source_record_id").size().to_dict()
         for report in self.report_inventory:
-            missing_report_fields = required_report_fields - set(report)
-            if missing_report_fields:
+            actual_report_fields = set(report)
+            missing_report_fields = required_report_fields - actual_report_fields
+            unexpected_report_fields = actual_report_fields - required_report_fields
+            if missing_report_fields or unexpected_report_fields:
                 raise SenateEFDError(
-                    "Senate report inventory fields missing: "
-                    f"{sorted(missing_report_fields)}"
+                    "Senate report inventory schema mismatch: "
+                    f"missing={sorted(missing_report_fields)}, "
+                    f"unexpected={sorted(unexpected_report_fields)}"
                 )
             source_record_id = self._provenance_text(report["source_record_id"])
             if (
@@ -1360,9 +1366,10 @@ class SenateEFDSource(TransactionSource):
                     f"Senate report path/record ID mismatch: {source_record_id}"
                 )
             report_member = self._provenance_text(report["member"])
-            if report_member is None:
+            if report_member is None or report["member"] != report_member:
                 raise SenateEFDError(
-                    f"Senate report member is blank: {source_record_id}"
+                    f"Senate report member must be nonblank and stripped: "
+                    f"{source_record_id}"
                 )
             filing_date = self._parse_date(report["official_filing_date"])
             if not self._dates_are_valid(filing_date, filing_date, filing_date, None):

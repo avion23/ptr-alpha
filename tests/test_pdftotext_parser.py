@@ -144,3 +144,41 @@ def test_wrapped_amount_before_instrument_marker(monkeypatch):
         transaction["asset_description"]
         == "IBM Common Stock (IBM) [ST] [Account: Trust Account]"
     )
+
+
+def test_spouse_dc_over_amount_can_wrap_to_a_later_line(monkeypatch):
+    text = (
+        "  SP U.S. Treasury Note due 05/31/2024 P 05/30/2023 06/02/2023 "
+        "Spouse/DC Over\n"
+        "     [GS]                                      $1,000,000\n"
+        "     F S: New\n"
+    )
+    monkeypatch.setattr(
+        "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
+    )
+
+    transaction = parse_pdf_table(
+        extract_tables_with_pdftotext(Path("disclosure.pdf"))[0]
+    )[0]
+
+    assert transaction["owner_code"] == "SP"
+    assert transaction["ticker"] is None
+    assert transaction["asset_description"] == "U.S. Treasury Note due 05/31/2024 [GS]"
+    assert transaction["amount_raw"] == "Spouse/DC Over $1,000,000"
+    assert transaction["amount_midpoint"] == 1_000_000
+
+
+def test_asset_name_starting_with_id_is_not_treated_as_header(monkeypatch):
+    text = (
+        "  IDACORP, Inc. Common Stock (IDA) P 03/03/2026 04/06/2026 $1,001 - $15,000\n"
+    )
+    monkeypatch.setattr(
+        "analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _path: text
+    )
+
+    transaction = parse_pdf_table(
+        extract_tables_with_pdftotext(Path("disclosure.pdf"))[0]
+    )[0]
+
+    assert transaction["ticker"] == "IDA"
+    assert transaction["transaction_date"] == "03/03/2026"

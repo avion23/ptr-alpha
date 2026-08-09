@@ -147,6 +147,7 @@ def consolidate_transactions(
                     "instrument_type": tx.get("instrument_type", "stock"),
                     "strike_price": tx.get("strike_price"),
                     "expiry_date": tx.get("expiry_date"),
+                    "asset_description": tx.get("asset_description"),
                 }
             )
 

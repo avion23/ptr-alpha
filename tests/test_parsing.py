@@ -24,6 +24,51 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(len(transactions), 1)
         self.assertEqual(transactions[0]["ticker"], "AAPL")
 
+    def test_pdfplumber_flattened_rows_do_not_pollute_following_asset(self):
+        from analyzer.parsing.pdfplumber_parser import (
+            _expand_flattened_transaction_rows,
+        )
+
+        table = [
+            [
+                "ID",
+                "Owner",
+                "Asset",
+                "Transaction Type",
+                "Date",
+                "Notification Date",
+                "Amount",
+            ],
+            [
+                "Abbott Laboratories Common Stock P 06/16/2026 07/02/2026 "
+                "$1,001 - $15,000\n(ABT) [ST]\nF S: New\nS O: Trust Account",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+            ["", "", "F S: New\nS O: Trust Account", "", "", "", ""],
+            [
+                "",
+                "",
+                "Accenture plc Class A Ordinary Shares (ACN) [ST]",
+                "P",
+                "06/16/2026",
+                "07/02/2026",
+                "$1,001 - $15,000",
+            ],
+        ]
+
+        transactions = parse_pdf_table(_expand_flattened_transaction_rows(table))
+
+        self.assertEqual([tx["ticker"] for tx in transactions], ["ABT", "ACN"])
+        self.assertEqual(
+            transactions[1]["asset_description"],
+            "Accenture plc Class A Ordinary Shares (ACN) [ST]",
+        )
+
     def test_clean_text_basic(self):
         self.assertEqual(clean_text("  hello   world  "), "hello world")
         self.assertEqual(clean_text(None), "")
@@ -241,6 +286,7 @@ class TestParsing(unittest.TestCase):
                     "owner_code": "DC",
                     "amount_raw": "$1,001 - $15,000",
                     "amount_midpoint": 8000.5,
+                    "asset_description": "Packaging Corporation of America (PKG)",
                 }
             ]
         }
@@ -257,6 +303,10 @@ class TestParsing(unittest.TestCase):
         self.assertEqual(df.iloc[0]["owner_code"], "DC")
         self.assertEqual(df.iloc[0]["amount_raw"], "$1,001 - $15,000")
         self.assertAlmostEqual(df.iloc[0]["amount_midpoint"], 8000.5)
+        self.assertEqual(
+            df.iloc[0]["asset_description"],
+            "Packaging Corporation of America (PKG)",
+        )
 
     def test_consolidate_transactions_empty(self):
         df = consolidate_transactions({}, {})

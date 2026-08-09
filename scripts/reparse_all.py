@@ -1,7 +1,7 @@
-"""Fast text-layer-only reparse of all cached PDFs.
+"""Reparse all cached PDFs through the production parser selection API.
 
-Skips Docling and tesseract OCR; only uses pdfplumber/camelot/pdftotext.
-Used to recover from DB corruption without re-running slow OCR.
+Docling remains disabled to avoid its multi-gigabyte worker footprint. The
+production cascade still controls text-engine comparison and final OCR fallback.
 """
 
 from __future__ import annotations
@@ -19,38 +19,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from analyzer.database import Database
 from analyzer.models import FilingType
 
-# Import the text-layer engine functions
 from analyzer.datasources import (
-    _try_pdfplumber,
-    _try_camelot_lattice,
-    _try_camelot_stream,
-    _try_pdftotext,
+    HouseTransactionSource,
     _build_member_lookup,
     _filter_existing_pdfs,
     consolidate_transactions,
 )
-from analyzer.datasources import HouseTransactionSource
+from analyzer.parser_cascade import _parse_pdf_worker
 from analyzer.download import preserve_existing_fields
 from analyzer.settings import Settings
 from multiprocessing import Pool
 
 
-def text_only_worker(pdf_path: Path):
-    """Try text-layer engines only, no OCR."""
-    for engine_fn, name in [
-        (_try_pdfplumber, "pdfplumber"),
-        (_try_camelot_lattice, "lattice"),
-        (_try_camelot_stream, "stream"),
-        (_try_pdftotext, "pdftotext"),
-    ]:
-        txs = engine_fn(pdf_path)
-        if txs:
-            return pdf_path, txs, [name]
-    return pdf_path, [], []
-
-
 def parse_year(year: int, db: Database, settings: Settings):
-    """Parse all cached PDFs for a given year using text-layer only."""
+    """Parse all cached PDFs for a year with the production cascade."""
     pdf_dir = Path(settings.data.data_dir) / str(year) / "pdfs"
     if not pdf_dir.exists():
         print(f"  {year}: no pdf dir, skipping")
@@ -74,7 +56,7 @@ def parse_year(year: int, db: Database, settings: Settings):
     t0 = time.time()
 
     with Pool(settings.data.get_workers()) as pool:
-        results = pool.map(text_only_worker, pdf_paths)
+        results = pool.map(_parse_pdf_worker, pdf_paths)
 
     elapsed = time.time() - t0
     success = sum(1 for _, txs, _ in results if txs)

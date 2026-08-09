@@ -44,8 +44,11 @@ _SKIP_EXACT = {"ID", "F", "I", "P", "T", "R", "Cap.", "Gains", "CERTIFY"}
 
 # Transaction type pattern (shared by both regex flavors)
 _TX_TYPE = r"(?:S|P|E)(?:\s*\(partial\))?"
-# Amount pattern (handles split amounts across lines)
-_AMOUNT = r"(?:\$[\d,]+(?:\s*-\s*(?:\$[\d,]+)?)?|[\-]+\$[\d,]+)"
+# Amount pattern (handles split amounts and House's unbounded spouse/DC band).
+_AMOUNT = (
+    r"(?:\$[\d,]+(?:\s*-\s*(?:\$[\d,]+)?)?|[\-]+\$[\d,]+|"
+    r"Spouse/DC\s+Over(?:\s*\$[\d,]+)?)"
+)
 
 _TX_WITH_OWNER = re.compile(
     r"^\s{2,}"
@@ -148,7 +151,15 @@ def _is_skip_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or len(stripped) <= _MAX_SINGLE_LETTER_LEN:
         return True
-    return any(stripped.startswith(s) for s in _SKIP_PREFIXES)
+    for prefix in _SKIP_PREFIXES:
+        if stripped == prefix:
+            return True
+        if not stripped.startswith(prefix):
+            continue
+        remainder = stripped[len(prefix) :]
+        if remainder[:1].isspace() or prefix.endswith((":", ".")):
+            return True
+    return False
 
 
 def _try_match_with_owner(
@@ -183,23 +194,29 @@ def _collect_transaction_continuations(
 ) -> tuple[str, str, int]:
     """Collect wrapped asset, amount, and source-account text for one PTR row."""
     asset, j = _collect_asset_continuation(asset, start, lines)
-    if amount.rstrip().endswith("-"):
+    needs_upper_bound = amount.rstrip().endswith("-")
+    spouse_dc_over = amount.lower().startswith("spouse/dc over") and "$" not in amount
+    if needs_upper_bound or spouse_dc_over:
         embedded_high = re.search(r"\s+(\$[\d,]+)(?=\s|$)", asset)
         if embedded_high:
             amount = f"{amount.rstrip()} {embedded_high.group(1)}"
             asset = (
                 asset[: embedded_high.start()] + asset[embedded_high.end() :]
             ).strip()
+            needs_upper_bound = False
+            spouse_dc_over = False
     account = None
     while j < len(lines):
         line = lines[j]
         if _TX_WITH_OWNER.match(line) or _TX_NO_OWNER.match(line):
             break
         stripped = line.strip()
-        if amount.rstrip().endswith("-"):
+        if needs_upper_bound or spouse_dc_over:
             amount_match = _AMOUNT_CONTINUATION.search(stripped)
             if amount_match:
                 amount = f"{amount.rstrip()} {amount_match.group().strip()}"
+                needs_upper_bound = False
+                spouse_dc_over = False
         account_match = _SOURCE_ACCOUNT.match(stripped)
         if account_match:
             account = account_match.group(1).strip()

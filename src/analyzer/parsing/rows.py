@@ -167,6 +167,9 @@ def _process_with_continuations(
     row: list, next_rows: list[list], indexes: dict[str, int]
 ) -> tuple[dict | None, int]:
     """Process a row and up to three physical continuation rows."""
+    if _is_filing_detail_row(_get_cell(row, indexes.get("asset"))):
+        return None, 0
+
     next_row = next_rows[0] if next_rows else None
     tx, merged = _process_row(row, indexes, next_row)
     if tx or not next_rows:
@@ -192,3 +195,23 @@ def _process_with_continuations(
         if tx and merged:
             return tx, offset + 1
     return None, 0
+
+
+def _is_filing_detail_row(asset_cell: str | None) -> bool:
+    """Identify filing metadata that must not prefix the next asset row."""
+    text = clean_text(asset_cell).upper()
+    if not text:
+        return False
+    return text.startswith(
+        (
+            "FILING STATUS:",
+            "F S:",
+            "SOURCE OF:",
+            "S O:",
+            "SUBHOLDING OF:",
+            "DESCRIPTION:",
+            "D:",
+            "LOCATION:",
+            "L:",
+        )
+    )

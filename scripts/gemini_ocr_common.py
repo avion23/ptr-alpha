@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -51,28 +52,6 @@ For each page with no real transactions, output PAGE followed by exactly NO_TRAN
 Amount ranges: A=$1K-15K, B=$15K-50K, C=$50K-100K, D=$100K-250K, E=$250K-500K, F=$500K-1M, G=$1M-5M, H=$5M-25M, I=$25M-50M, J=over $50M.
 No markdown, no tables, no explanations."""
 PROMPT_SHA256 = hashlib.sha256(PROMPT.encode()).hexdigest()
-KNOWN_DOCUMENT_CANARIES = {
-    "8221322": {
-        "sha256": "26f1ce2fb7823d2e84ea4fbde24514c5c6371b43a828720d50f21b1c8c7ad314",
-        "page_count": 56,
-        "page_min_rows": {2: 18},
-    },
-    "9115808": {
-        "sha256": "05b2fa3becd71c9bb141690130708079407e52a6e169cdacf42a467e09e0bda5",
-        "row_count": 1,
-        "row": ("spdr", "03/31/26", "A"),
-    },
-    "9115813": {
-        "sha256": "737955c7c26c497eda37f4378e1af51409b6231204a82d7ae2c3f25c10e0ae84",
-        "row_count": 9,
-        "row": ("richmond", "04/15/26", "B"),
-    },
-    "9116141": {
-        "sha256": "716cdcc10bd57c400f10d8bb4133eb667931a9699fb1835ed3b7deca010a36a1",
-        "row_count": 134,
-        "row": ("whittier", "05/11/26", "E"),
-    },
-}
 
 
 class GeminiOutputError(ValueError):
@@ -119,8 +98,8 @@ def _normalize_tx_type(value: object) -> str | None:
 
 
 def _is_example(asset: str) -> bool:
-    text = asset.casefold()
-    return "example:" in text or "mega corp" in text
+    normalized = " ".join(asset.casefold().split()).rstrip(".")
+    return normalized == "example: mega corp. common stock"
 
 
 def parse_gemini_output(
@@ -251,48 +230,6 @@ def parse_gemini_output(
     )
 
 
-def validate_known_document(
-    doc_id: str, pdf_digest: str, parsed: ParsedGeminiOutput
-) -> None:
-    canary = KNOWN_DOCUMENT_CANARIES.get(str(doc_id))
-    if canary is None:
-        return
-    if pdf_digest != canary["sha256"]:
-        raise GeminiOutputError(f"known document {doc_id}: artifact hash mismatch")
-    expected_pages = canary.get("page_count")
-    if expected_pages is not None and parsed.page_count != expected_pages:
-        raise GeminiOutputError(
-            f"known document {doc_id}: expected {expected_pages} pages, "
-            f"got {parsed.page_count}"
-        )
-    expected_rows = canary.get("row_count")
-    if expected_rows is not None and len(parsed.transactions) != expected_rows:
-        raise GeminiOutputError(
-            f"known document {doc_id}: expected {expected_rows} rows, "
-            f"got {len(parsed.transactions)}"
-        )
-    for page_number, minimum in canary.get("page_min_rows", {}).items():
-        page_rows = sum(
-            1 for tx in parsed.transactions if tx.get("page_number") == page_number
-        )
-        if page_rows < minimum:
-            raise GeminiOutputError(
-                f"known document {doc_id}: page {page_number} expected at least "
-                f"{minimum} rows, got {page_rows}"
-            )
-    pinned_row = canary.get("row")
-    if pinned_row is None:
-        return
-    asset_fragment, tx_date, amount = pinned_row
-    if not any(
-        asset_fragment in tx["asset"].casefold()
-        and tx["date"] == tx_date
-        and tx["amount_letter"] == amount
-        for tx in parsed.transactions
-    ):
-        raise GeminiOutputError(f"known document {doc_id}: pinned row missing")
-
-
 def cache_path(doc_id: str, cache_dir: str = CACHE_DIR) -> Path:
     safe_doc_id = str(doc_id).replace(os.sep, "_").replace("/", "_").replace("\\", "_")
     return Path(cache_dir) / f"{safe_doc_id}.json"
@@ -323,6 +260,34 @@ def pdf_page_count(pdf_path: str | Path) -> int:
     raise OSError("pdfinfo did not report a positive page count")
 
 
+@dataclass(frozen=True)
+class PdfSnapshot:
+    path: Path
+    sha256: str
+    page_count: int
+
+
+@dataclass(frozen=True)
+class CachedGeminiResponse:
+    output: str
+    parsed: ParsedGeminiOutput
+    pdf_sha256: str
+    pdf_page_count: int
+
+
+@contextmanager
+def snapshot_pdf(pdf_path: str | Path):
+    """Read source bytes once and expose one immutable file to all subprocesses."""
+    source_bytes = Path(pdf_path).read_bytes()
+    digest = hashlib.sha256(source_bytes).hexdigest()
+    with tempfile.TemporaryDirectory(prefix="ptr_ocr_snapshot_") as directory:
+        snapshot_path = Path(directory) / "artifact.pdf"
+        snapshot_path.write_bytes(source_bytes)
+        snapshot_path.chmod(0o444)
+        snapshot = PdfSnapshot(snapshot_path, digest, pdf_page_count(snapshot_path))
+        yield snapshot
+
+
 def _cache_envelope(
     doc_id: str,
     pdf_digest: str,
@@ -343,26 +308,26 @@ def _cache_envelope(
     }
 
 
-def read_cached_response(
+def _read_cached_snapshot(
     doc_id: str,
-    pdf_path: str | Path,
-    cache_dir: str = CACHE_DIR,
-    parser_version: str = GEMINI_PARSER_VERSION,
+    snapshot: PdfSnapshot,
+    cache_dir: str,
+    parser_version: str,
 ) -> str | None:
-    """Return only a complete cache entry bound to this PDF and parser contract."""
     path = cache_path(doc_id, cache_dir)
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
         output = str(envelope.get("output", ""))
-        digest = pdf_sha256(pdf_path)
-        page_count = pdf_page_count(pdf_path)
         expected = _cache_envelope(
-            str(doc_id), digest, page_count, output, parser_version
+            str(doc_id),
+            snapshot.sha256,
+            snapshot.page_count,
+            output,
+            parser_version,
         )
         if envelope != expected:
             return None
-        parsed = parse_gemini_output(output, expected_page_count=page_count)
-        validate_known_document(str(doc_id), digest, parsed)
+        parse_gemini_output(output, expected_page_count=snapshot.page_count)
         return output
     except (
         OSError,
@@ -375,21 +340,47 @@ def read_cached_response(
         return None
 
 
-def write_cached_response(
+def inspect_cached_response(
     doc_id: str,
     pdf_path: str | Path,
-    output: str,
     cache_dir: str = CACHE_DIR,
     parser_version: str = GEMINI_PARSER_VERSION,
+) -> CachedGeminiResponse | None:
+    """Validate cache and return its parser/artifact identity without model I/O."""
+    with snapshot_pdf(pdf_path) as snapshot:
+        output = _read_cached_snapshot(str(doc_id), snapshot, cache_dir, parser_version)
+        if output is None:
+            return None
+        parsed = parse_gemini_output(output, expected_page_count=snapshot.page_count)
+        return CachedGeminiResponse(
+            output, parsed, snapshot.sha256, snapshot.page_count
+        )
+
+
+def read_cached_response(
+    doc_id: str,
+    pdf_path: str | Path,
+    cache_dir: str = CACHE_DIR,
+    parser_version: str = GEMINI_PARSER_VERSION,
+) -> str | None:
+    """Return a valid cache entry bound to one immutable PDF snapshot."""
+    cached = inspect_cached_response(doc_id, pdf_path, cache_dir, parser_version)
+    return cached.output if cached is not None else None
+
+
+def _write_cached_snapshot(
+    doc_id: str,
+    snapshot: PdfSnapshot,
+    output: str,
+    cache_dir: str,
+    parser_version: str,
 ) -> None:
-    """Atomically persist a complete, page-covered response envelope."""
-    digest = pdf_sha256(pdf_path)
-    page_count = pdf_page_count(pdf_path)
-    parsed = parse_gemini_output(output, expected_page_count=page_count)
-    validate_known_document(str(doc_id), digest, parsed)
+    parse_gemini_output(output, expected_page_count=snapshot.page_count)
     path = cache_path(doc_id, cache_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    envelope = _cache_envelope(str(doc_id), digest, page_count, output, parser_version)
+    envelope = _cache_envelope(
+        str(doc_id), snapshot.sha256, snapshot.page_count, output, parser_version
+    )
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -404,6 +395,18 @@ def write_cached_response(
             pass
 
 
+def write_cached_response(
+    doc_id: str,
+    pdf_path: str | Path,
+    output: str,
+    cache_dir: str = CACHE_DIR,
+    parser_version: str = GEMINI_PARSER_VERSION,
+) -> None:
+    """Atomically persist output bound to one immutable PDF snapshot."""
+    with snapshot_pdf(pdf_path) as snapshot:
+        _write_cached_snapshot(str(doc_id), snapshot, output, cache_dir, parser_version)
+
+
 def call_gemini(
     pdf_path: str,
     doc_id: str | None = None,
@@ -412,35 +415,44 @@ def call_gemini(
     timeout: int = 180,
     parser_version: str = GEMINI_PARSER_VERSION,
 ) -> tuple[str | None, str]:
-    """Call Gemini and return only complete, page-covered extraction output."""
+    """Call Gemini against the same immutable bytes used for hash/cache checks."""
     try:
-        digest = pdf_sha256(pdf_path)
-        page_count = pdf_page_count(pdf_path)
-        if doc_id and not refresh:
-            cached = read_cached_response(
-                str(doc_id), pdf_path, cache_dir, parser_version
+        with snapshot_pdf(pdf_path) as snapshot:
+            if doc_id and not refresh:
+                cached = _read_cached_snapshot(
+                    str(doc_id), snapshot, cache_dir, parser_version
+                )
+                if cached is not None:
+                    return cached, ""
+            result = subprocess.run(
+                [
+                    "llm",
+                    "-m",
+                    MODEL,
+                    "-a",
+                    str(snapshot.path),
+                    "-o",
+                    "temperature",
+                    "0",
+                    PROMPT,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
             )
-            if cached is not None:
-                return cached, ""
-        result = subprocess.run(
-            ["llm", "-m", MODEL, "-a", pdf_path, "-o", "temperature", "0", PROMPT],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if result.returncode != 0:
-            return None, result.stderr.strip() or f"llm exited {result.returncode}"
-        try:
-            parsed = parse_gemini_output(result.stdout, expected_page_count=page_count)
+            if result.returncode != 0:
+                return None, result.stderr.strip() or f"llm exited {result.returncode}"
+            try:
+                parse_gemini_output(
+                    result.stdout, expected_page_count=snapshot.page_count
+                )
+            except GeminiOutputError as exc:
+                return None, f"invalid_response: {exc}"
             if doc_id:
-                validate_known_document(str(doc_id), digest, parsed)
-        except GeminiOutputError as exc:
-            return None, f"invalid_response: {exc}"
-        if doc_id:
-            write_cached_response(
-                str(doc_id), pdf_path, result.stdout, cache_dir, parser_version
-            )
-        return result.stdout, ""
+                _write_cached_snapshot(
+                    str(doc_id), snapshot, result.stdout, cache_dir, parser_version
+                )
+            return result.stdout, ""
     except subprocess.TimeoutExpired:
         return None, "llm timed out"
     except Exception as exc:
@@ -487,7 +499,6 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         effective_member = str(expected_member).strip()
         rejections["member_mismatch"] += 1
 
-    seen = set()
     valid = []
     for tx in transactions:
         asset = str(_tx_asset(tx) or "").strip()
@@ -513,11 +524,6 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         if filing and start and end and (parsed_date < start or parsed_date > end):
             rejections["date_out_of_window"] += 1
             continue
-        duplicate_key = (parsed_date, tx_type, amount_letter, asset.casefold())
-        if duplicate_key in seen:
-            rejections["duplicate_collapsed"] += 1
-            continue
-        seen.add(duplicate_key)
         cleaned = dict(tx)
         cleaned.update(
             member=effective_member,

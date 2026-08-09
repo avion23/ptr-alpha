@@ -558,6 +558,59 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertEqual(tables[0][1][0], "Apple (AAPL)")
         self.assertEqual(tables[0][2][0], "Microsoft")
 
+    def test_orientation_failure_preserves_first_pass_rows_as_incomplete(self):
+        from analyzer.parsing.ocr_parser import (
+            OcrIncompleteError,
+            extract_tables_with_ocr,
+        )
+
+        class Image:
+            def close(self):
+                pass
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi: [Image()]
+        pytesseract = ModuleType("pytesseract")
+        pytesseract.image_to_string = lambda image: (
+            "Apple (AAPL) P 01/15/24 $1,001 - $15,000"
+        )
+        pytesseract.image_to_osd = lambda image: (_ for _ in ()).throw(
+            RuntimeError("osd unavailable")
+        )
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            with self.assertRaises(OcrIncompleteError) as raised:
+                extract_tables_with_ocr(Path("orientation.pdf"))
+        self.assertEqual(raised.exception.partial_tables[0][1][0], "Apple (AAPL)")
+
+    def test_zero_and_partial_page_ocr_are_incomplete(self):
+        from analyzer.parsing.ocr_parser import (
+            OcrIncompleteError,
+            extract_tables_with_ocr,
+        )
+
+        class Image:
+            def __init__(self, page):
+                self.page = page
+
+            def close(self):
+                pass
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi: [Image(1), Image(2)]
+        pytesseract = ModuleType("pytesseract")
+        pytesseract.image_to_string = lambda image: (
+            "Apple (AAPL) P 01/15/24 $1,001 - $15,000" if image.page == 1 else ""
+        )
+        pytesseract.image_to_osd = lambda image: "Rotate: 0\n"
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            with self.assertRaisesRegex(OcrIncompleteError, "page 2") as raised:
+                extract_tables_with_ocr(Path("partial.pdf"))
+        self.assertEqual(len(raised.exception.partial_tables[0]), 2)
+
     def test_backend_failure_is_not_true_zero(self):
         from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
 
@@ -603,6 +656,51 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertEqual(len(result), 4)
         self.assertIn("won:pdftotext", engines)
         self.assertTrue(any(item.startswith("row_disagreement:") for item in engines))
+
+    def test_cascade_reconciles_complementary_rows_only_after_complete_ocr(self):
+        from analyzer import parser_cascade
+
+        def tx(asset):
+            return {
+                "transaction_date": "2024-01-01",
+                "transaction_type": "Purchase",
+                "amount_midpoint": 8000,
+                "asset_description": asset,
+            }
+
+        with (
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=[tx("A")]),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[tx("B")]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=[]),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(
+                parser_cascade, "_try_tesseract", return_value=[tx("A"), tx("B")]
+            ),
+        ):
+            _, rows, engines = parser_cascade._parse_pdf_worker(Path("complement.pdf"))
+        self.assertEqual({row["asset_description"] for row in rows}, {"A", "B"})
+        self.assertIn("won:reconciled_complete_ocr", engines)
+
+    def test_duplicate_heavy_engine_does_not_win(self):
+        from analyzer import parser_cascade
+
+        row = {
+            "transaction_date": "2024-01-01",
+            "transaction_type": "Purchase",
+            "amount_midpoint": 8000,
+            "asset_description": "A",
+        }
+        with (
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=[row] * 5),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=[row]),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(parser_cascade, "_try_tesseract", return_value=[row]),
+        ):
+            _, rows, _ = parser_cascade._parse_pdf_worker(Path("duplicates.pdf"))
+        self.assertEqual(rows, [row])
 
     def test_known_real_pdf_hash_and_row_count_canaries(self):
         from analyzer.parser_cascade import _parse_pdf_worker
@@ -650,10 +748,40 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 hashlib.sha256(matches[0].read_bytes()).hexdigest(), expected_hash
             )
 
+        from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
+
+        scan_truth = {
+            "9115808": (1, "spdr", "03/31/26"),
+            "9115813": (9, "richmond", "04/15/26"),
+            "9116141": (134, "whittier", "05/11/26"),
+        }
+        for doc_id, (
+            expected_count,
+            asset_fragment,
+            expected_date,
+        ) in scan_truth.items():
+            pdf = next(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            try:
+                tables = extract_tables_with_ocr(pdf)
+            except OcrBackendError:
+                continue
+            rows = tables[0][1:]
+            self.assertEqual(len(rows), expected_count, doc_id)
+            self.assertTrue(
+                any(
+                    asset_fragment in row[0].casefold() and row[2] == expected_date
+                    for row in rows
+                ),
+                doc_id,
+            )
+
         from scripts.ocr_zero_rows import get_ocr_work_items
 
         database_path = data_dir / "congress.duckdb"
         unresolved = get_ocr_work_items(
-            db_path=str(database_path), data_dir=data_dir, year=2026
+            db_path=str(database_path),
+            data_dir=data_dir,
+            year=2026,
+            require_schema=False,
         )
         self.assertIn("8221322", {doc_id for doc_id, _, _ in unresolved})

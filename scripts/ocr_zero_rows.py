@@ -20,6 +20,7 @@ from scripts.gemini_ocr_common import (
     MODEL,
     GeminiOutputError as GeminiOutputError,
     call_gemini,
+    inspect_cached_response,
     parse_gemini_output,
     pdf_sha256,
     validate_transactions,
@@ -28,6 +29,36 @@ from scripts.gemini_ocr_common import (
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress_gemini_manual.json"
 COOLDOWN = 3  # seconds between requests (Lite model allows rapid fire)
+REQUIRED_OCR_SCHEMA_COLUMNS = {
+    "chamber",
+    "source_record_id",
+    "source_row_id",
+    "official_filing_date",
+    "available_date",
+    "notification_date",
+    "amends_source_record_id",
+    "raw_transaction_subtype",
+    "ticker_origin",
+    "raw_asset_class",
+    "raw_asset_description",
+    "ingestion_generation",
+    "artifact_sha256",
+}
+
+
+def require_ocr_schema(conn):
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()
+    }
+    missing = sorted(REQUIRED_OCR_SCHEMA_COLUMNS - existing)
+    if missing:
+        raise RuntimeError(
+            "OCR ingestion requires the provenance schema; missing columns: "
+            + ", ".join(missing)
+        )
+    return existing
+
+
 # Amount range midpoint estimates (for amount_midpoint column)
 AMOUNT_MIDPOINTS = {
     "A": 8000,
@@ -49,14 +80,16 @@ def get_ocr_work_items(
     data_dir: str | Path | None = None,
     year: int | None = None,
     parser_version: str = GEMINI_PARSER_VERSION,
+    require_schema: bool = True,
 ):
-    """Select unresolved deterministic parse failures from current DB state.
-
-    Progress JSON is deliberately not consulted. A current OCR success is terminal
-    only while its recorded row count still matches current Gemini rows; a current
-    OCR ``no_txs`` is terminal only while the document still has no rows.
-    """
+    """Select work from current artifacts, validated cache, schema, and DB rows."""
     conn = duckdb.connect(db_path, read_only=True)
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()
+    }
+    schema_ready = REQUIRED_OCR_SCHEMA_COLUMNS <= existing_columns
+    if require_schema and not schema_ready:
+        require_ocr_schema(conn)
     rows = conn.execute(
         """
         WITH deterministic AS (
@@ -79,7 +112,12 @@ def get_ocr_work_items(
             GROUP BY doc_id
         )
         SELECT CAST(m.doc_id AS VARCHAR),
-               CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER)
+               CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER),
+               o.status,
+               o.raw_row_count,
+               o.transaction_count,
+               COALESCE(tx.row_count, 0),
+               COALESCE(tx.ocr_row_count, 0)
         FROM metadata m
         JOIN deterministic d ON d.doc_id = m.doc_id AND d.rn = 1
         LEFT JOIN current_ocr o ON o.doc_id = m.doc_id AND o.rn = 1
@@ -87,22 +125,81 @@ def get_ocr_work_items(
         WHERE m.filing_type = 'P'
           AND d.status IN ('zero_rows', 'error', 'rejected')
           AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
-          AND NOT COALESCE((
-              (o.status = 'success'
-               AND o.transaction_count = COALESCE(tx.ocr_row_count, 0))
-              OR
-              (o.status = 'no_txs' AND COALESCE(tx.row_count, 0) = 0)
-          ), FALSE)
         ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
         """,
         [parser_version, year, year],
     ).fetchall()
-    conn.close()
     base = Path(data_dir) if data_dir is not None else Path(db_path).parent
-    return [
-        (doc_id, doc_year, str(base / str(doc_year) / "pdfs" / f"{doc_id}.pdf"))
-        for doc_id, doc_year in rows
-    ]
+    cache_dir = str(base / "gemini_cache")
+    unresolved = []
+    for (
+        doc_id,
+        doc_year,
+        status,
+        recorded_raw_count,
+        recorded_count,
+        row_count,
+        ocr_row_count,
+    ) in rows:
+        pdf_path = str(base / str(doc_year) / "pdfs" / f"{doc_id}.pdf")
+        try:
+            cached = inspect_cached_response(
+                doc_id, pdf_path, cache_dir, parser_version
+            )
+        except (OSError, ValueError):
+            cached = None
+        if cached is None or not schema_ready:
+            unresolved.append((doc_id, doc_year, pdf_path))
+            continue
+        parsed_count = len(cached.parsed.transactions)
+        matching_rows = conn.execute(
+            """
+            SELECT source_row_id, raw_asset_description, raw_transaction_subtype,
+                   transaction_date, notification_date, amount_raw
+            FROM transactions
+            WHERE doc_id = ? AND source = 'gemini_ocr'
+              AND ingestion_generation = ? AND artifact_sha256 = ?
+            ORDER BY source_row_id
+            """,
+            [doc_id, parser_version, cached.pdf_sha256],
+        ).fetchall()
+        expected_rows = []
+        for source_row_number, transaction in enumerate(
+            cached.parsed.transactions, start=1
+        ):
+            page_number = transaction.get("page_number")
+            source_row_id = (
+                f"{doc_id}:page:{page_number}:row:{source_row_number}"
+                if page_number is not None
+                else f"{doc_id}:row:{source_row_number}"
+            )
+            expected_rows.append(
+                (
+                    source_row_id,
+                    transaction["asset"][:500],
+                    transaction["type"],
+                    datetime.date.fromisoformat(normalize_date(transaction["date"])),
+                    datetime.date.fromisoformat(
+                        normalize_date(transaction["notif_date"])
+                    ),
+                    transaction["amount_letter"],
+                )
+            )
+        success_matches = (
+            status == "success"
+            and recorded_raw_count == cached.parsed.raw_row_count
+            and recorded_count == parsed_count
+            and row_count == parsed_count
+            and ocr_row_count == parsed_count
+            and matching_rows == sorted(expected_rows)
+        )
+        no_txs_matches = (
+            status == "no_txs" and cached.parsed.no_transactions and row_count == 0
+        )
+        if not (success_matches or no_txs_matches):
+            unresolved.append((doc_id, doc_year, pdf_path))
+    conn.close()
+    return unresolved
 
 
 def get_zero_row_pdfs():
@@ -841,6 +938,10 @@ def insert_transactions(
 ):
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
+    existing_columns = require_ocr_schema(conn)
+    if not artifact_sha256 and transactions:
+        conn.close()
+        raise RuntimeError("OCR insertion requires artifact_sha256")
     filing_date = get_filing_date(conn, doc_id)
     expected_member = get_metadata_member(conn, doc_id)
     if not transactions:
@@ -864,9 +965,7 @@ def insert_transactions(
         doc_id, member, transactions, filing_date, expected_member
     )
     fatal_rejections = {
-        key: value
-        for key, value in rejections.items()
-        if key not in {"duplicate_collapsed", "member_mismatch"}
+        key: value for key, value in rejections.items() if key != "member_mismatch"
     }
     if fatal_rejections:
         record_parse_run(
@@ -883,12 +982,9 @@ def insert_transactions(
         return 0
     transactions = validated
 
-    existing_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()
-    }
     errors = []
     rows: list[dict] = []
-    for tx in transactions:
+    for source_row_number, tx in enumerate(transactions, start=1):
         try:
             tx_date = normalize_date(tx["date"])
             notification_date = normalize_date(tx["notif_date"])
@@ -911,11 +1007,19 @@ def insert_transactions(
                 "asset_description": tx["asset"][:500],
                 "source": "gemini_ocr",
             }
+            page_number = tx.get("page_number")
+            row_identity = (
+                f"{doc_id}:page:{page_number}:row:{source_row_number}"
+                if page_number is not None
+                else f"{doc_id}:row:{source_row_number}"
+            )
             authoritative_provenance = {
                 "chamber": "House",
                 "source_record_id": str(doc_id),
+                "source_row_id": row_identity,
                 "official_filing_date": filing_date,
                 "notification_date": notification_date,
+                "raw_transaction_subtype": tx["type"],
                 "raw_asset_description": tx["asset"][:500],
                 "ingestion_generation": parser_version,
                 "artifact_sha256": artifact_sha256,
@@ -931,7 +1035,19 @@ def insert_transactions(
         except Exception as exc:
             errors.append(f"{tx.get('asset', '?')}: {exc}")
     if errors:
-        print(f"  INSERT ERRORS ({len(errors)}): {errors[:3]}", flush=True)
+        message = "; ".join(errors)
+        record_parse_run(
+            conn,
+            doc_id,
+            year,
+            "error",
+            input_count,
+            0,
+            message,
+            parser_version=parser_version,
+        )
+        conn.close()
+        return 0
     if not rows:
         # If transactions were provided but all failed validation, record as
         # "error" so get_zero_row_pdfs() will retry them; only use "no_txs"
@@ -956,15 +1072,32 @@ def insert_transactions(
     committed = False
     try:
         conn.execute("BEGIN TRANSACTION")
-        conn.execute("DELETE FROM transactions WHERE doc_id = ?", [str(doc_id)])
         for row in rows:
             columns = list(row)
             placeholders = ", ".join("?" for _ in columns)
+            update_columns = [
+                column
+                for column in columns
+                if column not in {"source_record_id", "source_row_id"}
+            ]
+            updates = ", ".join(
+                f"{column} = excluded.{column}" for column in update_columns
+            )
             conn.execute(
-                f"INSERT INTO transactions ({', '.join(columns)}) VALUES ({placeholders})",
+                f"INSERT INTO transactions ({', '.join(columns)}) "
+                f"VALUES ({placeholders}) "
+                f"ON CONFLICT (source_record_id, source_row_id) "
+                f"DO UPDATE SET {updates}",
                 [row[column] for column in columns],
             )
             count += 1
+        source_row_ids = [row["source_row_id"] for row in rows]
+        retained_placeholders = ", ".join("?" for _ in source_row_ids)
+        conn.execute(
+            f"DELETE FROM transactions WHERE doc_id = ? "
+            f"AND (source_row_id IS NULL OR source_row_id NOT IN ({retained_placeholders}))",
+            [str(doc_id), *source_row_ids],
+        )
         record_parse_run(
             conn,
             doc_id,
@@ -1057,9 +1190,7 @@ def main():
         conn.close()
         print(f"  Validation rejections: {rejections}", flush=True)
         fatal_rejections = {
-            key: value
-            for key, value in rejections.items()
-            if key not in {"duplicate_collapsed", "member_mismatch"}
+            key: value for key, value in rejections.items() if key != "member_mismatch"
         }
         if fatal_rejections:
             status = (
@@ -1159,9 +1290,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             conn.close()
         print(f"  Validation rejections: {rejections}", flush=True)
         fatal_rejections = {
-            key: value
-            for key, value in rejections.items()
-            if key not in {"duplicate_collapsed", "member_mismatch"}
+            key: value for key, value in rejections.items() if key != "member_mismatch"
         }
         if fatal_rejections:
             status = (

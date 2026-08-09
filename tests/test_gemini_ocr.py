@@ -3,10 +3,45 @@ import json
 import queue
 
 import pytest
+import duckdb
 
 from analyzer.database import Database
 from scripts import gemini_ocr_common
 from scripts.ocr_zero_rows import insert_transactions
+
+
+OCR_SCHEMA_COLUMNS = {
+    "chamber": "VARCHAR",
+    "source_record_id": "VARCHAR",
+    "source_row_id": "VARCHAR",
+    "official_filing_date": "DATE",
+    "available_date": "DATE",
+    "notification_date": "DATE",
+    "amends_source_record_id": "VARCHAR",
+    "raw_transaction_subtype": "VARCHAR",
+    "ticker_origin": "VARCHAR",
+    "raw_asset_class": "VARCHAR",
+    "raw_asset_description": "VARCHAR",
+    "ingestion_generation": "VARCHAR",
+    "artifact_sha256": "VARCHAR",
+}
+
+
+def _enable_ocr_schema(connection):
+    for column, column_type in OCR_SCHEMA_COLUMNS.items():
+        connection.execute(
+            f"ALTER TABLE transactions ADD COLUMN IF NOT EXISTS {column} {column_type}"
+        )
+    connection.execute("DROP INDEX IF EXISTS idx_tx_unique_v2")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_unique_source_row "
+        "ON transactions(source_record_id, source_row_id)"
+    )
+
+
+def _insert_transactions(*args, **kwargs):
+    kwargs.setdefault("artifact_sha256", "test-artifact-sha256")
+    return insert_transactions(*args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -47,15 +82,15 @@ def test_validation_date_window_drops_bad_rows():
     assert rejections["date_out_of_window"] == 2
 
 
-def test_validation_duplicate_collapse():
+def test_validation_preserves_repeated_lots_without_source_identity():
     txs = [_tx(), _tx(), _tx(asset="Microsoft Corp. (MSFT)")]
 
     valid, rejections = gemini_ocr_common.validate_transactions(
         "doc-dupe", "Jane Doe", txs, datetime(2024, 1, 20), "Jane Doe"
     )
 
-    assert len(valid) == 2
-    assert rejections["duplicate_collapsed"] == 1
+    assert len(valid) == 3
+    assert "duplicate_collapsed" not in rejections
 
 
 def test_validation_member_mismatch_uses_metadata_name():
@@ -158,6 +193,39 @@ def test_cache_is_invalidated_when_pdf_changes(monkeypatch, tmp_path):
     assert len(calls) == 2
 
 
+def test_call_uses_one_immutable_pdf_snapshot(monkeypatch, tmp_path):
+    pdf = tmp_path / "changing.pdf"
+    original = b"%PDF-original-bytes"
+    pdf.write_bytes(original)
+    attached = []
+
+    def fake_run(args, capture_output, text, timeout):
+        attachment = args[args.index("-a") + 1]
+        attached.append(gemini_ocr_common.Path(attachment).read_bytes())
+        pdf.write_bytes(b"%PDF-mutated-after-snapshot")
+
+        class Result:
+            returncode = 0
+            stdout = (
+                "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+                "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | A"
+            )
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
+    output, error = gemini_ocr_common.call_gemini(
+        str(pdf), doc_id="snapshot", cache_dir=str(tmp_path)
+    )
+    envelope = json.loads((tmp_path / "snapshot.json").read_text())
+    assert output is not None and error == ""
+    assert attached == [original]
+    assert (
+        envelope["pdf_sha256"] == gemini_ocr_common.hashlib.sha256(original).hexdigest()
+    )
+
+
 def test_cache_path_sanitizes_doc_id(tmp_path):
     path = gemini_ocr_common.cache_path("folder/doc\\id", cache_dir=str(tmp_path))
     assert path == tmp_path / "folder_doc_id.json"
@@ -190,6 +258,14 @@ def test_schema_skips_prompt_example_consistently():
     assert parsed.transactions[0]["asset"] == "Apple (AAPL)"
 
 
+def test_example_filter_matches_only_exact_prompt_exemplar():
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Mega Corp Growth Fund | Purchase | 01/15/24 | 01/20/24 | A"
+    )
+    assert [tx["asset"] for tx in parsed.transactions] == ["Mega Corp Growth Fund"]
+
+
 def test_schema_requires_outcome_for_every_pdf_page():
     output = (
         "MEMBER: Jane Doe\nPAGES: 2\nPAGE: 1\n"
@@ -201,87 +277,30 @@ def test_schema_requires_outcome_for_every_pdf_page():
         gemini_ocr_common.parse_gemini_output(output, expected_page_count=2)
 
 
-def test_known_document_canary_rejects_plausible_partial_output():
-    parsed = gemini_ocr_common.parse_gemini_output(
-        "MEMBER: Harold Rogers\nPAGES: 1\nPAGE: 1\n"
-        "SPDR ETF | Purchase | 03/31/26 | 05/08/26 | A",
-        expected_page_count=1,
-    )
-    gemini_ocr_common.validate_known_document(
-        "9115808",
-        gemini_ocr_common.KNOWN_DOCUMENT_CANARIES["9115808"]["sha256"],
-        parsed,
-    )
-    with pytest.raises(gemini_ocr_common.GeminiOutputError, match="expected 9 rows"):
-        gemini_ocr_common.validate_known_document(
-            "9115813",
-            gemini_ocr_common.KNOWN_DOCUMENT_CANARIES["9115813"]["sha256"],
-            parsed,
-        )
+def test_production_validation_has_no_document_id_gates():
+    assert not hasattr(gemini_ocr_common, "KNOWN_DOCUMENT_CANARIES")
+    assert not hasattr(gemini_ocr_common, "validate_known_document")
 
 
-def test_56_page_known_document_cannot_be_accepted_as_no_transactions():
-    canary = gemini_ocr_common.KNOWN_DOCUMENT_CANARIES["8221322"]
-    no_transactions = gemini_ocr_common.ParsedGeminiOutput(
-        "Known Member", [], 0, True, 56, frozenset(range(1, 57))
+def test_insert_fails_clearly_before_provenance_schema_exists(tmp_path):
+    db_path = tmp_path / "legacy.duckdb"
+    db = Database(db_path)
+    db.conn.execute(
+        "INSERT INTO metadata VALUES ('legacy', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
-    with pytest.raises(
-        gemini_ocr_common.GeminiOutputError,
-        match="page 2 expected at least 18 rows",
-    ):
-        gemini_ocr_common.validate_known_document(
-            "8221322", canary["sha256"], no_transactions
-        )
+    db.close()
+    with pytest.raises(RuntimeError, match="requires the provenance schema"):
+        _insert_transactions("legacy", 2024, "Jane Doe", [_tx()], db_path=str(db_path))
+    from scripts.ocr_zero_rows import get_ocr_work_items
 
-    page_two_rows = [
-        {
-            "asset": f"Page two asset {index}",
-            "date": "01/01/26",
-            "amount_letter": "A",
-            "page_number": 2,
-        }
-        for index in range(18)
-    ]
-    covered = gemini_ocr_common.ParsedGeminiOutput(
-        "Known Member",
-        page_two_rows,
-        18,
-        False,
-        56,
-        frozenset(range(1, 57)),
-    )
-    gemini_ocr_common.validate_known_document("8221322", canary["sha256"], covered)
-
-
-@pytest.mark.parametrize("doc_id", ["9115808", "9115813", "9116141"])
-def test_all_pinned_document_canary_counts_and_rows(doc_id):
-    canary = gemini_ocr_common.KNOWN_DOCUMENT_CANARIES[doc_id]
-    fragment, tx_date, amount = canary["row"]
-    transactions = [
-        {
-            "asset": f"Filler asset {index}",
-            "date": "01/01/26",
-            "amount_letter": "A",
-        }
-        for index in range(canary["row_count"] - 1)
-    ]
-    transactions.append(
-        {"asset": fragment.title(), "date": tx_date, "amount_letter": amount}
-    )
-    parsed = gemini_ocr_common.ParsedGeminiOutput(
-        "Known Member",
-        transactions,
-        len(transactions),
-        False,
-        1,
-        frozenset({1}),
-    )
-    gemini_ocr_common.validate_known_document(doc_id, canary["sha256"], parsed)
+    with pytest.raises(RuntimeError, match="requires the provenance schema"):
+        get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path)
 
 
 def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
+    _enable_ocr_schema(db.conn)
     db.conn.execute("""
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('doc-insert', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
@@ -290,11 +309,11 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
 
     txs = [_tx()]
     assert (
-        insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path))
+        _insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path))
         == 1
     )
     assert (
-        insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path))
+        _insert_transactions("doc-insert", 2024, "Jane Doe", txs, db_path=str(db_path))
         == 1
     )
 
@@ -317,24 +336,40 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
     assert parse_runs[-1] == (gemini_ocr_common.GEMINI_PARSER_VERSION, "success", 1, 1)
 
 
+def test_insert_preserves_repeated_lots_with_distinct_source_rows(tmp_path):
+    db_path = tmp_path / "lots.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata VALUES ('lots', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.close()
+    assert (
+        _insert_transactions(
+            "lots", 2024, "Jane Doe", [_tx(), _tx()], db_path=str(db_path)
+        )
+        == 2
+    )
+    con = duckdb.connect(str(db_path))
+    rows = con.execute(
+        "SELECT source_record_id, source_row_id FROM transactions WHERE doc_id='lots' ORDER BY source_row_id"
+    ).fetchall()
+    con.close()
+    assert rows == [("lots", "lots:row:1"), ("lots", "lots:row:2")]
+
+
 def test_insert_transactions_plumbs_authoritative_provenance_when_schema_supports_it(
     tmp_path,
 ):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
-    db.conn.execute("ALTER TABLE transactions ADD COLUMN chamber VARCHAR")
-    db.conn.execute("ALTER TABLE transactions ADD COLUMN source_record_id VARCHAR")
-    db.conn.execute("ALTER TABLE transactions ADD COLUMN official_filing_date DATE")
-    db.conn.execute("ALTER TABLE transactions ADD COLUMN notification_date DATE")
-    db.conn.execute("ALTER TABLE transactions ADD COLUMN raw_asset_description VARCHAR")
-    db.conn.execute("ALTER TABLE transactions ADD COLUMN ingestion_generation VARCHAR")
-    db.conn.execute("ALTER TABLE transactions ADD COLUMN artifact_sha256 VARCHAR")
+    _enable_ocr_schema(db.conn)
     db.conn.execute(
         "INSERT INTO metadata VALUES ('doc-provenance', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
     )
     db.close()
 
-    inserted = insert_transactions(
+    inserted = _insert_transactions(
         "doc-provenance",
         2024,
         "Jane Doe",
@@ -345,12 +380,13 @@ def test_insert_transactions_plumbs_authoritative_provenance_when_schema_support
     assert inserted == 1
     connection = Database(db_path).conn
     row = connection.execute(
-        "SELECT chamber, source_record_id, official_filing_date, notification_date, raw_asset_description, ingestion_generation, artifact_sha256 FROM transactions WHERE doc_id='doc-provenance'"
+        "SELECT chamber, source_record_id, source_row_id, official_filing_date, notification_date, raw_asset_description, ingestion_generation, artifact_sha256 FROM transactions WHERE doc_id='doc-provenance'"
     ).fetchone()
     connection.close()
     assert row == (
         "House",
         "doc-provenance",
+        "doc-provenance:row:1",
         datetime(2024, 1, 20).date(),
         datetime(2024, 1, 20).date(),
         "Apple Inc. (AAPL)",
@@ -362,6 +398,7 @@ def test_insert_transactions_plumbs_authoritative_provenance_when_schema_support
 def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
+    _enable_ocr_schema(db.conn)
     db.conn.execute("""
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('doc-preserve', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
@@ -369,13 +406,13 @@ def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):
     db.conn.close()
 
     assert (
-        insert_transactions(
+        _insert_transactions(
             "doc-preserve", 2024, "Jane Doe", [_tx()], db_path=str(db_path)
         )
         == 1
     )
     assert (
-        insert_transactions("doc-preserve", 2024, "Jane Doe", [], db_path=str(db_path))
+        _insert_transactions("doc-preserve", 2024, "Jane Doe", [], db_path=str(db_path))
         == 0
     )
 
@@ -400,6 +437,7 @@ def test_insert_transactions_empty_list_preserves_existing_rows(tmp_path):
 def test_insert_transactions_all_bad_rows_preserves_existing_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
+    _enable_ocr_schema(db.conn)
     db.conn.execute("""
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('doc-bad', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
@@ -407,12 +445,12 @@ def test_insert_transactions_all_bad_rows_preserves_existing_rows(tmp_path):
     db.conn.close()
 
     assert (
-        insert_transactions("doc-bad", 2024, "Jane Doe", [_tx()], db_path=str(db_path))
+        _insert_transactions("doc-bad", 2024, "Jane Doe", [_tx()], db_path=str(db_path))
         == 1
     )
     bad_txs = [_tx(date="not a date")]
     assert (
-        insert_transactions("doc-bad", 2024, "Jane Doe", bad_txs, db_path=str(db_path))
+        _insert_transactions("doc-bad", 2024, "Jane Doe", bad_txs, db_path=str(db_path))
         == 0
     )
 
@@ -436,6 +474,7 @@ def test_insert_transactions_all_bad_rows_preserves_existing_rows(tmp_path):
 def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
+    _enable_ocr_schema(db.conn)
     db.conn.execute("""
         INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
         VALUES ('doc-mixed', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)
@@ -443,7 +482,7 @@ def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):
     db.conn.close()
 
     assert (
-        insert_transactions(
+        _insert_transactions(
             "doc-mixed",
             2024,
             "Jane Doe",
@@ -457,7 +496,7 @@ def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):
         _tx(asset="Bad Corp. (BAD)", date="bad"),
     ]
     assert (
-        insert_transactions("doc-mixed", 2024, "Jane Doe", txs, db_path=str(db_path))
+        _insert_transactions("doc-mixed", 2024, "Jane Doe", txs, db_path=str(db_path))
         == 0
     )
 
@@ -476,6 +515,55 @@ def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):
 
     assert rows == [("OLD", "Old Inc. (OLD)")]
     assert latest_run == ("error", 2, 0, '{"invalid_transaction_date": 1}')
+
+
+def test_row_construction_failure_aborts_whole_batch_before_delete(
+    monkeypatch, tmp_path
+):
+    from scripts import ocr_zero_rows
+
+    db_path = tmp_path / "congress.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata VALUES ('doc-construction', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.close()
+    assert (
+        _insert_transactions(
+            "doc-construction",
+            2024,
+            "Jane Doe",
+            [_tx(asset="Old Inc. (OLD)")],
+            db_path=str(db_path),
+        )
+        == 1
+    )
+
+    def resolve(asset):
+        if "Break" in asset:
+            raise RuntimeError("alias construction failed")
+        return None
+
+    monkeypatch.setattr(ocr_zero_rows, "resolve_ticker", resolve)
+    result = _insert_transactions(
+        "doc-construction",
+        2024,
+        "Jane Doe",
+        [_tx(asset="New Inc. (NEW)"), _tx(asset="Break Alias")],
+        db_path=str(db_path),
+    )
+    assert result == 0
+    con = Database(db_path).conn
+    assert con.execute(
+        "SELECT asset_description FROM transactions WHERE doc_id='doc-construction'"
+    ).fetchall() == [("Old Inc. (OLD)",)]
+    status, error = con.execute(
+        "SELECT status, error_message FROM pdf_parse_runs WHERE doc_id='doc-construction' ORDER BY parsed_at DESC LIMIT 1"
+    ).fetchone()
+    con.close()
+    assert status == "error"
+    assert "alias construction failed" in error
 
 
 def test_parallel_writer_acknowledges_failure(monkeypatch):
@@ -500,6 +588,7 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
 
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
+    _enable_ocr_schema(db.conn)
     for doc_id in ("retry", "done", "rejected"):
         db.conn.execute(
             "INSERT INTO metadata VALUES (?, 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)",
@@ -513,14 +602,46 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
         "INSERT INTO pdf_parse_runs (doc_id, year, parser_version, status, engines_attempted, raw_row_count, transaction_count) VALUES ('done', 2024, ?, 'success', '', 1, 1)",
         [gemini_ocr_common.GEMINI_PARSER_VERSION],
     )
+    artifact = b"%PDF-terminal-state"
+    pdf_dir = tmp_path / "2024" / "pdfs"
+    pdf_dir.mkdir(parents=True)
+    for doc_id in ("retry", "done", "rejected"):
+        (pdf_dir / f"{doc_id}.pdf").write_bytes(artifact + doc_id.encode())
+    digest = gemini_ocr_common.pdf_sha256(pdf_dir / "done.pdf")
     db.conn.execute(
-        "INSERT INTO transactions (doc_id, member, ticker, transaction_date, disclosure_date, transaction_type, amount_raw, owner_code, source) VALUES ('done', 'Jane Doe', 'AAPL', DATE '2024-01-15', DATE '2024-01-20', 'Purchase', 'A', '', 'gemini_ocr')"
+        """INSERT INTO transactions (
+               doc_id, member, ticker, asset_description, transaction_date,
+               disclosure_date, transaction_type, amount_raw, owner_code, source,
+               source_record_id, source_row_id, ingestion_generation, artifact_sha256,
+               raw_asset_description, raw_transaction_subtype, notification_date
+           ) VALUES (
+               'done', 'Jane Doe', 'AAPL', 'Apple Inc. (AAPL)', DATE '2024-01-15',
+               DATE '2024-01-20', 'Purchase', 'A', '', 'gemini_ocr',
+               'done', 'done:page:1:row:1', ?, ?,
+               'Apple Inc. (AAPL)', 'Purchase', DATE '2024-01-20'
+           )""",
+        [gemini_ocr_common.GEMINI_PARSER_VERSION, digest],
     )
     db.conn.execute(
         "INSERT INTO pdf_parse_runs (doc_id, year, parser_version, status, engines_attempted, raw_row_count, transaction_count) VALUES ('rejected', 2024, ?, 'rejected', '', 301, 0)",
         [gemini_ocr_common.GEMINI_PARSER_VERSION],
     )
     db.close()
+    gemini_ocr_common.write_cached_response(
+        "done",
+        pdf_dir / "done.pdf",
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A",
+        cache_dir=str(tmp_path / "gemini_cache"),
+    )
 
     work = get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024)
     assert [item[0] for item in work] == ["rejected", "retry"]
+
+    connection = duckdb.connect(str(db_path))
+    connection.execute(
+        "UPDATE transactions SET raw_asset_description='tampered' WHERE doc_id='done'"
+    )
+    connection.close()
+    work = get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024)
+    assert [item[0] for item in work] == ["done", "rejected", "retry"]

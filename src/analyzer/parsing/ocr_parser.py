@@ -15,6 +15,14 @@ class OcrBackendError(RuntimeError):
     """The local OCR backend could not execute reliably."""
 
 
+class OcrIncompleteError(OcrBackendError):
+    """OCR ran but did not establish complete page coverage."""
+
+    def __init__(self, message: str, partial_tables: list[list[list[str]]]):
+        super().__init__(message)
+        self.partial_tables = partial_tables
+
+
 def _orient_image(image, pytesseract):
     """Return an upright image when Tesseract detects a rotated scan."""
     try:
@@ -194,22 +202,26 @@ def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
         raise OcrBackendError(f"rasterizer returned no pages for {pdf_path}")
 
     all_rows: list[list[str]] = []
-    page_failures: list[str] = []
-    successful_pages = 0
+    incomplete_pages: list[str] = []
     for page_number, image in enumerate(images, start=1):
         oriented_image = image
+        first_rows: list[list[str]] = []
         try:
             first_text = pytesseract.image_to_string(image)
             first_rows = _parse_ocr_text_to_rows(first_text)
             oriented_image = _orient_image(image, pytesseract)
-            oriented_rows: list[list[str]] = []
+            page_rows = first_rows
             if oriented_image is not image:
                 oriented_text = pytesseract.image_to_string(oriented_image)
                 oriented_rows = _parse_ocr_text_to_rows(oriented_text)
-            all_rows.extend(_reconcile_rows(first_rows, oriented_rows))
-            successful_pages += 1
+                page_rows = _reconcile_rows(first_rows, oriented_rows)
+            all_rows.extend(page_rows)
+            if not page_rows:
+                incomplete_pages.append(f"page {page_number}: no transaction rows")
         except Exception as exc:
-            page_failures.append(f"page {page_number}: {exc}")
+            # Retain diagnosable first-pass rows, but never promote them to success.
+            all_rows.extend(first_rows)
+            incomplete_pages.append(f"page {page_number}: {exc}")
         finally:
             if oriented_image is not image:
                 oriented_close = getattr(oriented_image, "close", None)
@@ -219,17 +231,17 @@ def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
             if callable(image_close):
                 image_close()
 
-    if successful_pages == 0:
-        raise OcrBackendError(
-            f"OCR failed for every page of {pdf_path}: {'; '.join(page_failures)}"
+    table = (
+        [["Asset Name", "Transaction Type", "Transaction Date", "Amount"]] + all_rows
+        if all_rows
+        else []
+    )
+    if incomplete_pages:
+        partial_tables = [table] if table else []
+        raise OcrIncompleteError(
+            f"incomplete OCR for {pdf_path}: {'; '.join(incomplete_pages)}",
+            partial_tables,
         )
-    if page_failures:
-        raise OcrBackendError(
-            f"OCR produced an incomplete document for {pdf_path}: {'; '.join(page_failures)}"
-        )
-    if not all_rows:
-        return []
-    table = [
-        ["Asset Name", "Transaction Type", "Transaction Date", "Amount"]
-    ] + all_rows
+    if not table:
+        raise OcrIncompleteError(f"OCR produced no rows for {pdf_path}", [])
     return [table]

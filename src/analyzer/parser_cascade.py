@@ -50,24 +50,63 @@ def _result_quality(txs: list[dict]) -> float:
     return valid / len(txs)
 
 
-def _semantic_score(transactions: list[dict]) -> tuple[int, int, int, float]:
-    complete = sum(
-        1
-        for tx in transactions
-        if tx.get("transaction_date") and tx.get("transaction_type")
+def _transaction_identity(transaction: dict) -> tuple:
+    fields = (
+        "asset_description",
+        "ticker",
+        "transaction_date",
+        "transaction_type",
+        "amount_raw",
+        "amount_midpoint",
+        "owner_code",
+        "notification_date",
+        "page_number",
+        "source_record_id",
     )
-    with_amount = sum(1 for tx in transactions if tx.get("amount_midpoint"))
-    with_asset = sum(1 for tx in transactions if tx.get("asset_description"))
-    return complete, with_amount, with_asset, _result_quality(transactions)
+    return tuple(
+        str(transaction.get(field) or "").strip().casefold() for field in fields
+    )
 
 
-def _choose_best(candidates, engines_attempted):
+def _candidate_counts(transactions: list[dict]):
+    counts = {}
+    representatives = {}
+    for transaction in transactions:
+        identity = _transaction_identity(transaction)
+        counts[identity] = counts.get(identity, 0) + 1
+        representatives.setdefault(identity, transaction)
+    return counts, representatives
+
+
+def _multiset_subset(left: dict, right: dict) -> bool:
+    return all(count <= right.get(identity, 0) for identity, count in left.items())
+
+
+def _semantic_score(transactions: list[dict]) -> tuple[int, int, int, float]:
+    counts, representatives = _candidate_counts(transactions)
+    unique = list(representatives.values())
+    complete = sum(
+        1 for tx in unique if tx.get("transaction_date") and tx.get("transaction_type")
+    )
+    with_amount = sum(1 for tx in unique if tx.get("amount_midpoint"))
+    with_asset = sum(1 for tx in unique if tx.get("asset_description"))
+    return complete, with_amount, with_asset, _result_quality(unique)
+
+
+def _reconcile_candidates(candidates, engines_attempted):
+    """Merge complementary rows while retaining the maximum observed lot count."""
     if not candidates:
-        return []
-    counts = {name: len(rows) for name, rows in candidates}
-    if len(set(counts.values())) > 1:
-        detail = ",".join(f"{name}={count}" for name, count in counts.items())
+        return [], False
+    counts_by_engine = {name: _candidate_counts(rows)[0] for name, rows in candidates}
+    raw_counts = {name: len(rows) for name, rows in candidates}
+    unique_counts = {name: len(counts) for name, counts in counts_by_engine.items()}
+    if len(set(raw_counts.values())) > 1 or len(set(unique_counts.values())) > 1:
+        detail = ",".join(
+            f"{name}={raw_counts[name]}/{unique_counts[name]}u"
+            for name, _ in candidates
+        )
         engines_attempted.append(f"row_disagreement:{detail}")
+
     engine_preference = {
         "pdftotext": 5,
         "pdfplumber": 4,
@@ -76,16 +115,45 @@ def _choose_best(candidates, engines_attempted):
         "docling": 2,
         "ocr": 1,
     }
-    name, transactions = max(
+    best_name, best_rows = max(
         candidates,
         key=lambda candidate: (
             _semantic_score(candidate[1]),
-            len(candidate[1]),
+            len(counts_by_engine[candidate[0]]),
             engine_preference.get(candidate[0], 0),
         ),
     )
-    engines_attempted.append(f"won:{name}")
-    return transactions
+    best_counts = counts_by_engine[best_name]
+    independently_confirmed = best_name == "pdftotext" and any(
+        name == "stream"
+        and len(rows) == len(best_rows)
+        and _semantic_score(rows) <= _semantic_score(best_rows)
+        for name, rows in candidates
+    )
+    complementary = not independently_confirmed and any(
+        not _multiset_subset(counts, best_counts)
+        for name, counts in counts_by_engine.items()
+        if name != best_name
+    )
+    if independently_confirmed:
+        engines_attempted.append(f"confirmed_count:{len(best_rows)}")
+    if not complementary:
+        engines_attempted.append(f"won:{best_name}")
+        return best_rows, False
+
+    maximum_counts = dict(best_counts)
+    representatives = _candidate_counts(best_rows)[1]
+    for _, rows in candidates:
+        counts, current_representatives = _candidate_counts(rows)
+        for identity, count in counts.items():
+            if identity not in maximum_counts:
+                maximum_counts[identity] = count
+            representatives.setdefault(identity, current_representatives[identity])
+    reconciled = []
+    for identity, count in maximum_counts.items():
+        reconciled.extend([representatives[identity]] * count)
+    engines_attempted.append(f"complementary_rows:{len(reconciled)}")
+    return reconciled, True
 
 
 def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
@@ -105,7 +173,7 @@ def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
 
 
 def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
-    """Compare every successful text engine, then every OCR engine if needed."""
+    """Compare text engines; require complete Tesseract coverage when uncertain."""
     skip_docling = os.environ.get("PTR_SKIP_DOCLING") == "1"
     engines_attempted: list[str] = []
     errors: list[str] = []
@@ -121,12 +189,12 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
         )
         if candidate:
             text_candidates.append(candidate)
-    if text_candidates:
-        return (
-            pdf_path,
-            _choose_best(text_candidates, engines_attempted),
-            engines_attempted,
-        )
+
+    reconciled_text, text_uncertain = _reconcile_candidates(
+        text_candidates, engines_attempted
+    )
+    if reconciled_text and not text_uncertain:
+        return pdf_path, reconciled_text, engines_attempted
 
     ocr_candidates = []
     if not skip_docling:
@@ -135,22 +203,24 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
         )
         if candidate:
             ocr_candidates.append(candidate)
-    candidate = _run_candidate(
+    tesseract_candidate = _run_candidate(
         _try_tesseract, "ocr", pdf_path, engines_attempted, errors
     )
-    if candidate:
-        ocr_candidates.append(candidate)
-    if ocr_candidates:
-        return (
-            pdf_path,
-            _choose_best(ocr_candidates, engines_attempted),
-            engines_attempted,
-        )
-    if errors:
+    if tesseract_candidate:
+        ocr_candidates.append(tesseract_candidate)
+
+    if tesseract_candidate:
+        all_candidates = list(text_candidates) + ocr_candidates
+        reconciled, _ = _reconcile_candidates(all_candidates, engines_attempted)
+        engines_attempted.append("won:reconciled_complete_ocr")
+        return pdf_path, reconciled, engines_attempted
+
+    if reconciled_text or ocr_candidates or errors:
+        detail = "; ".join(errors) or "unconfirmed complementary/parser rows"
         raise ParserCascadeError(
-            f"{pdf_path}: parser backend failures with no recovered rows: {'; '.join(errors)}"
+            f"{pdf_path}: unresolved parser completeness: {detail}"
         )
-    return pdf_path, [], engines_attempted
+    raise ParserCascadeError(f"{pdf_path}: no parser established complete row coverage")
 
 
 def _try_pdfplumber(pdf_path: Path) -> list[dict]:

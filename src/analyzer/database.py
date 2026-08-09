@@ -11,6 +11,7 @@ from analyzer.exceptions import AnalysisError
 from analyzer.metadata_repository import MetadataRepository
 from analyzer.parse_run_repository import ParseRunRepository
 from analyzer.price_repository import PriceRepository
+from analyzer.source_report_repository import SourceReportRepository
 from analyzer.ticker_resolver import TickerResolver
 from analyzer.transaction_repository import TransactionRepository
 
@@ -40,6 +41,7 @@ class Database:
         self._prices = PriceRepository(self.conn)
         self._metadata = MetadataRepository(self.conn)
         self._parse_runs = ParseRunRepository(self.conn)
+        self._source_reports = SourceReportRepository(self.conn)
 
     @property
     def is_read_only(self) -> bool:
@@ -63,11 +65,16 @@ class Database:
     def parse_runs(self) -> ParseRunRepository:
         return self._parse_runs
 
+    @property
+    def source_reports(self) -> SourceReportRepository:
+        return self._source_reports
+
     # -- schema init (stays here) ---------------------------------------------
 
     def _init_schema(self):
         self._init_metadata_table()
         self._init_pdf_tables()
+        self._init_source_reports_table()
         self._init_transactions_table()
         self._init_prices_table()
 
@@ -157,6 +164,24 @@ class Database:
                 transaction_count INTEGER,
                 error_message VARCHAR,
                 parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+    def _init_source_reports_table(self) -> None:
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS source_reports (
+                ingestion_generation VARCHAR NOT NULL,
+                chamber VARCHAR NOT NULL,
+                source_record_id VARCHAR NOT NULL,
+                report_path VARCHAR,
+                member VARCHAR,
+                official_filing_date DATE,
+                outcome VARCHAR NOT NULL CHECK (
+                    outcome IN ('parsed', 'paper_only', 'unavailable', 'failed')
+                ),
+                artifact_sha256 VARCHAR,
+                error_message VARCHAR,
+                UNIQUE (ingestion_generation, chamber, source_record_id)
             )
         """)
 
@@ -308,6 +333,22 @@ class Database:
             transaction_count=transaction_count,
             error_message=error_message,
         )
+
+    def replace_source_reports(
+        self,
+        generation: str,
+        chamber: str,
+        reports_df: pd.DataFrame,
+    ) -> None:
+        self.source_reports.replace_generation(generation, chamber, reports_df)
+
+    def get_source_reports(self, generation: str, chamber: str) -> pd.DataFrame:
+        return self.source_reports.get(generation, chamber)
+
+    def get_source_report_reconciliation(
+        self, generation: str, chamber: str
+    ) -> dict[str, int]:
+        return self.source_reports.reconcile(generation, chamber)
 
     # -- lifecycle ------------------------------------------------------------
 

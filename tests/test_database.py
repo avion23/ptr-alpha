@@ -1,6 +1,7 @@
 import unittest
 from datetime import date, datetime
 
+import duckdb
 import pandas as pd
 
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
@@ -762,6 +763,203 @@ class TestPhantomPurge(DatabaseTestCase):
             "SELECT COUNT(*) FROM transactions"
         ).fetchone()[0]
         self.assertEqual(remaining, 3)
+
+
+class TestSourceReports(DatabaseTestCase):
+    COLUMNS = [
+        "ingestion_generation",
+        "chamber",
+        "source_record_id",
+        "report_path",
+        "member",
+        "official_filing_date",
+        "outcome",
+        "artifact_sha256",
+        "error_message",
+    ]
+
+    @classmethod
+    def reports(cls, *rows):
+        return pd.DataFrame(rows, columns=cls.COLUMNS)
+
+    def test_round_trip_and_reconciliation_retain_zero_transaction_outcomes(self):
+        parsed_sha = "a" * 64
+        reports = self.reports(
+            (
+                "refresh-2026-08-09",
+                "house",
+                "1001",
+                "2026/1001.pdf",
+                "Jane Doe",
+                date(2026, 8, 1),
+                "parsed",
+                parsed_sha,
+                None,
+            ),
+            (
+                "refresh-2026-08-09",
+                "house",
+                "1002",
+                None,
+                "John Doe",
+                date(2026, 8, 2),
+                "paper_only",
+                None,
+                None,
+            ),
+            (
+                "refresh-2026-08-09",
+                "house",
+                "1003",
+                None,
+                "Alex Doe",
+                date(2026, 8, 3),
+                "unavailable",
+                None,
+                "HTTP 404",
+            ),
+        )
+
+        self.db.replace_source_reports("refresh-2026-08-09", "house", reports)
+
+        stored = self.db.get_source_reports("refresh-2026-08-09", "house")
+        self.assertEqual(stored.columns.tolist(), self.COLUMNS)
+        self.assertEqual(stored["source_record_id"].tolist(), ["1001", "1002", "1003"])
+        self.assertEqual(stored.iloc[0]["artifact_sha256"], parsed_sha)
+        self.assertEqual(stored.iloc[0]["outcome"], "parsed")
+        self.assertEqual(stored.iloc[1]["outcome"], "paper_only")
+        self.assertEqual(stored.iloc[2]["outcome"], "unavailable")
+        self.assertEqual(stored.iloc[2]["error_message"], "HTTP 404")
+        self.assertEqual(
+            self.db.get_source_report_reconciliation("refresh-2026-08-09", "house"),
+            {
+                "found": 3,
+                "parsed": 1,
+                "paper_only": 1,
+                "unavailable": 1,
+                "failed": 0,
+            },
+        )
+
+    def test_replacement_is_scoped_to_generation_and_chamber(self):
+        def one(generation, chamber, source_record_id):
+            return self.reports(
+                (
+                    generation,
+                    chamber,
+                    source_record_id,
+                    f"{source_record_id}.pdf",
+                    "Member",
+                    date(2026, 8, 1),
+                    "parsed",
+                    source_record_id[0] * 64,
+                    None,
+                )
+            )
+
+        self.db.replace_source_reports("gen-1", "house", one("gen-1", "house", "a1"))
+        self.db.replace_source_reports("gen-1", "senate", one("gen-1", "senate", "b1"))
+        self.db.replace_source_reports("gen-2", "house", one("gen-2", "house", "c1"))
+
+        self.db.replace_source_reports("gen-1", "house", one("gen-1", "house", "d1"))
+
+        self.assertEqual(
+            self.db.get_source_reports("gen-1", "house")["source_record_id"].tolist(),
+            ["d1"],
+        )
+        self.assertEqual(
+            self.db.get_source_reports("gen-1", "senate")["source_record_id"].tolist(),
+            ["b1"],
+        )
+        self.assertEqual(
+            self.db.get_source_reports("gen-2", "house")["source_record_id"].tolist(),
+            ["c1"],
+        )
+
+    def test_duplicate_source_record_ids_are_rejected_without_replacement(self):
+        original = self.reports(
+            (
+                "gen-1",
+                "house",
+                "original",
+                "original.pdf",
+                "Member",
+                date(2026, 8, 1),
+                "parsed",
+                "a" * 64,
+                None,
+            )
+        )
+        self.db.replace_source_reports("gen-1", "house", original)
+        duplicate = pd.concat(
+            [
+                original.assign(source_record_id="duplicate"),
+                original.assign(source_record_id="duplicate"),
+            ],
+            ignore_index=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate source_record_id"):
+            self.db.replace_source_reports("gen-1", "house", duplicate)
+
+        stored = self.db.get_source_reports("gen-1", "house")
+        self.assertEqual(stored["source_record_id"].tolist(), ["original"])
+
+    def test_failed_or_unclassified_inventory_cannot_commit(self):
+        failed = self.reports(
+            (
+                "gen-1",
+                "house",
+                "failed-report",
+                None,
+                "Member",
+                date(2026, 8, 1),
+                "failed",
+                None,
+                "parser failed",
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "requires failed=0"):
+            self.db.replace_source_reports("gen-1", "house", failed)
+
+        unknown = failed.assign(
+            source_record_id="unknown-report",
+            outcome="not_classified",
+            error_message=None,
+        )
+        with self.assertRaisesRegex(ValueError, "reconciliation failed"):
+            self.db.replace_source_reports("gen-1", "house", unknown)
+
+        self.assertEqual(
+            self.db.get_source_report_reconciliation("gen-1", "house")["found"],
+            0,
+        )
+
+    def test_insert_failure_rolls_back_delete(self):
+        original = self.reports(
+            (
+                "gen-1",
+                "house",
+                "original",
+                "original.pdf",
+                "Member",
+                date(2026, 8, 1),
+                "parsed",
+                "a" * 64,
+                None,
+            )
+        )
+        self.db.replace_source_reports("gen-1", "house", original)
+        invalid = original.assign(
+            source_record_id="replacement",
+            official_filing_date="not-a-date",
+        )
+
+        with self.assertRaises(duckdb.ConversionException):
+            self.db.replace_source_reports("gen-1", "house", invalid)
+
+        stored = self.db.get_source_reports("gen-1", "house")
+        self.assertEqual(stored["source_record_id"].tolist(), ["original"])
 
 
 if __name__ == "__main__":

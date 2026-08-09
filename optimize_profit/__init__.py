@@ -1,21 +1,14 @@
-"""Optimize profit: walk-forward sweep across scoring functions and allocations.
+"""Honest chronological optimization for congressional-trade strategies.
 
-Public API:
-  - SCORING_FUNCTIONS      dict of {name: callable}
-  - run_walk_forward       per-combo walk-forward backtest
-  - precompute_walk_forward_data  per-as_of_date shared precomputation
-  - main                   entry point (run as ``python -m optimize_profit.main``)
-
-The package is split into:
-  - scoring.py       continuous scoring functions
-  - precompute.py    per-as_of_date precomputation
-  - walk_forward.py  walk-forward backtest engine
-  - main.py          sweep driver + reporting
+The package enforces non-overlapping bankroll periods, selects configurations
+before a fixed untouched holdout, records coverage/rejections, and persists
+reproducible run artifacts. A passing holdout is evidence for further paper
+trading, never a guaranteed-profit claim.
 """
 
+from optimize_profit.precompute import precompute_walk_forward_data
 from optimize_profit.scoring import SCORING_FUNCTIONS
 from optimize_profit.walk_forward import run_walk_forward
-from optimize_profit.precompute import precompute_walk_forward_data
 
 __all__ = [
     "SCORING_FUNCTIONS",

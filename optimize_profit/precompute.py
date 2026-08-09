@@ -1,12 +1,6 @@
-"""Per-as_of_date precomputation shared across scoring-function combinations.
+"""Causal per-period inputs shared by optimizer configurations."""
 
-Returns {as_of_iso: {training, member_rankings, recent_trades,
-candidate_tickers_by_min_buyers, ticker_perf_signals, as_of_ts, horizon}}.
-
-This is the expensive part of the sweep — `rank_members` and the signal
-filters are memoized, so once a combo's params match a previous run we
-hit cache instead of recomputing.
-"""
+from __future__ import annotations
 
 import pandas as pd
 
@@ -15,6 +9,8 @@ from analyzer.backtest import (
     _filter_ticker_perf,
     _filter_training,
 )
+from analyzer.exceptions import AnalysisError
+from analyzer.member_names import canonical_member_key
 from analyzer.member_ranking import rank_members
 
 
@@ -29,47 +25,76 @@ def precompute_walk_forward_data(
     min_buyers_list,
     bayes_prior_strength=None,
 ):
-    """Precompute per-as_of_date data shared across all scoring combos.
+    """Return every requested period, including explicit rejection records.
 
-    Returns {as_of_iso: {training, member_rankings, recent_trades, ...}}.
+    Expected data insufficiency is recorded in ``status``/``reason``. Unexpected
+    failures propagate; they are never converted into apparently valid coverage.
     """
-    precomputed = {}
+    del prices_df  # retained in the public signature for compatibility
+    precomputed: dict[str, dict] = {}
 
     for as_of in as_of_dates:
         as_of_ts = pd.Timestamp(as_of)
         as_of_iso = as_of_ts.isoformat()
+        base = {"as_of_ts": as_of_ts, "horizon": horizon}
 
         training = _filter_training_for_period(
-            signals_df, horizon, as_of_iso, training_lookback_days,
+            signals_df, horizon, as_of_iso, training_lookback_days
         )
         if training.empty:
+            precomputed[as_of_iso] = {
+                **base,
+                "status": "rejected",
+                "reason": "empty_training",
+            }
             continue
 
-        member_rankings = _rank_members_for_period(training, horizon, bayes_prior_strength)
-        if member_rankings is None or member_rankings.empty:
+        try:
+            member_rankings = rank_members(
+                training,
+                horizon,
+                5.0,
+                _bayes_prior_strength=bayes_prior_strength,
+            )
+        except AnalysisError as exc:
+            precomputed[as_of_iso] = {
+                **base,
+                "status": "rejected",
+                "reason": "ranking_unavailable",
+                "detail": str(exc),
+            }
+            continue
+        if member_rankings.empty:
+            precomputed[as_of_iso] = {
+                **base,
+                "status": "rejected",
+                "reason": "empty_rankings",
+            }
             continue
 
         recent_trades = _filter_recent_trades_for_period(
-            transactions_df, lookback_days, as_of_iso,
+            transactions_df, lookback_days, as_of_iso
         )
         if recent_trades.empty:
+            precomputed[as_of_iso] = {
+                **base,
+                "status": "rejected",
+                "reason": "empty_recent_trades",
+            }
             continue
 
-        candidate_tickers_by_mb = _candidate_tickers_by_min_buyers(
-            recent_trades, min_buyers_list,
-        )
-        ticker_perf_signals = _filter_ticker_perf_for_period(
-            signals_df, horizon, as_of_iso,
-        )
-
         precomputed[as_of_iso] = {
+            **base,
+            "status": "ready",
             "training": training,
             "member_rankings": member_rankings,
             "recent_trades": recent_trades,
-            "candidate_tickers": candidate_tickers_by_mb,
-            "ticker_perf_signals": ticker_perf_signals,
-            "as_of_ts": as_of_ts,
-            "horizon": horizon,
+            "candidate_tickers": _candidate_tickers_by_min_buyers(
+                recent_trades, min_buyers_list
+            ),
+            "ticker_perf_signals": _filter_ticker_perf_for_period(
+                signals_df, horizon, as_of_iso
+            ),
         }
 
     return precomputed
@@ -78,31 +103,36 @@ def precompute_walk_forward_data(
 def _filter_training_for_period(signals_df, horizon, as_of_iso, training_lookback_days):
     as_of_ts = pd.Timestamp(as_of_iso)
     training_lookback_iso = (
-        (as_of_ts - pd.Timedelta(days=training_lookback_days)).isoformat()
-    )
+        as_of_ts - pd.Timedelta(days=training_lookback_days)
+    ).isoformat()
     return _filter_training(signals_df, horizon, as_of_iso, training_lookback_iso)
-
-
-def _rank_members_for_period(training, horizon, bayes_prior_strength=None):
-    try:
-        return rank_members(training, horizon, 5.0, _bayes_prior_strength=bayes_prior_strength)
-    except Exception:
-        return None
 
 
 def _filter_recent_trades_for_period(transactions_df, lookback_days, as_of_iso):
     return _filter_recent_trades(transactions_df, lookback_days, as_of_iso)
 
 
-def _candidate_tickers_by_min_buyers(recent_trades: pd.DataFrame, min_buyers_list) -> dict:
-    """For each min_buyers threshold, return the list of tickers whose
-    buyer-count meets the threshold. Pre-building all thresholds in one pass
-    avoids repeating the buyer_counts groupby."""
-    buyer_counts = recent_trades.groupby("ticker")["member"].nunique()
+def _candidate_tickers_by_min_buyers(
+    recent_trades: pd.DataFrame, min_buyers_list
+) -> dict:
+    canonical = recent_trades.assign(
+        _member_canonical=recent_trades["member"].map(canonical_member_key)
+    )
+    buyer_counts = canonical.groupby("ticker")["_member_canonical"].nunique()
     return {
-        mb: buyer_counts[buyer_counts >= mb].index.tolist()
-        for mb in min_buyers_list
+        threshold: buyer_counts[buyer_counts >= threshold].index.tolist()
+        for threshold in min_buyers_list
     }
+
+
+# Compatibility helpers retained for callers that import private symbols.
+def _rank_members_for_period(training, horizon, bayes_prior_strength=None):
+    try:
+        return rank_members(
+            training, horizon, 5.0, _bayes_prior_strength=bayes_prior_strength
+        )
+    except AnalysisError:
+        return None
 
 
 def _filter_ticker_perf_for_period(signals_df, horizon, as_of_iso):

@@ -55,11 +55,19 @@ def _normalize_identity_value(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
 
 
+def _normalized_asset_identity(transaction: dict) -> str:
+    ticker = transaction.get("ticker")
+    if ticker:
+        return _normalize_identity_value(ticker)
+    asset = str(transaction.get("asset_description") or "")
+    asset = re.sub(r"\[Account:.*$", "", asset, flags=re.IGNORECASE)
+    asset = re.sub(r"\[[A-Z]{2}\]", "", asset)
+    return _normalize_identity_value(asset)
+
+
 def _transaction_identity(transaction: dict) -> tuple:
     return (
-        _normalize_identity_value(
-            transaction.get("ticker") or transaction.get("asset_description")
-        ),
+        _normalized_asset_identity(transaction),
         _normalize_identity_value(transaction.get("transaction_date")),
         _normalize_identity_value(transaction.get("transaction_type")),
         _normalize_identity_value(
@@ -198,7 +206,7 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     trusted_complete = (
         bool(pdfplumber_counts)
         and bool(pdftotext_counts)
-        and trusted_overlap / sum(pdfplumber_counts.values()) >= 0.8
+        and trusted_overlap / sum(pdfplumber_counts.values()) >= 0.85
     )
     if trusted_complete:
         engines_attempted.append("trusted:pdfplumber_subset_pdftotext")

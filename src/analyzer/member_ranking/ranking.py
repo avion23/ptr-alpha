@@ -15,6 +15,7 @@ from analyzer import signals as _signals
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
+from analyzer.member_ranking.bayes import normal_normal_posteriors
 from analyzer.signals import (
     _apply_quality_filter,
     _collapse_to_episodes,
@@ -105,9 +106,12 @@ def _rank_members_impl(
     avg_spy, avg_total_spy = _spy_alpha_by_member(purchases, grp, idx)
     hit_rates = _hit_rates_by_member(purchases, idx, threshold)
     conviction = _conviction_scores(grp, idx, purchases)
-    shrunk_alpha, shrunk_alpha_std, alpha_shrinkage = _shrunk_alpha_by_member(
-        grp, outcome_col, idx
-    )
+    (
+        shrunk_alpha,
+        shrunk_alpha_std,
+        alpha_shrinkage,
+        alpha_effective_information,
+    ) = _shrunk_alpha_by_member(grp, outcome_col, idx, _bayes_prior_strength)
 
     avg_realized = (
         grp["total_return_pct"].mean().reindex(idx).fillna(0.0)
@@ -126,6 +130,7 @@ def _rank_members_impl(
         shrunk_alpha,
         shrunk_alpha_std,
         alpha_shrinkage,
+        alpha_effective_information,
         avg_realized,
     )
     return _finalize_ranking(result)
@@ -227,57 +232,20 @@ def _conviction_scores(grp, idx, purchases: pd.DataFrame) -> np.ndarray:
     return count_scores * 0.6 + size_scores * 0.4
 
 
-def _shrunk_alpha_by_member(grp, alpha_col: str, idx):
-    """Return a descriptive empirical-Bayes normal-normal member estimate.
-
-    The outcome is endpoint SPY alpha. A common Normal(global_mean, tau_sq)
-    prior and Normal(member_mean, sigma_sq / n) likelihood use the same
-    precisions for posterior mean and variance. Member effects are predictive
-    associations, not causal effects; ticker, sector, and regime confounding
-    remain.
-    """
-    values = grp.obj[alpha_col].dropna().astype(float)
-    member_means = grp[alpha_col].mean().reindex(idx).astype(float)
-    counts = grp[alpha_col].count().reindex(idx).astype(float)
-    global_mean = float(member_means.mean())
-
-    member_sse = (
-        grp[alpha_col]
-        .apply(
-            lambda x: float(
-                (
-                    (x.dropna().astype(float) - x.dropna().astype(float).mean()) ** 2
-                ).sum()
-            )
-        )
-        .reindex(idx)
-        .fillna(0.0)
+def _shrunk_alpha_by_member(grp, alpha_col: str, idx, prior_strength: float):
+    """Return one shared descriptive normal-normal member estimate."""
+    frame = grp.obj[["member", alpha_col]].dropna()
+    fit = normal_normal_posteriors(
+        frame[alpha_col].to_numpy(dtype=float),
+        frame["member"].to_numpy(dtype=object),
+        prior_strength=prior_strength,
+    ).reindex(idx)
+    return (
+        fit["posterior_mean"],
+        fit["posterior_std"],
+        fit["shrinkage"],
+        fit["effective_information"],
     )
-    within_dof = max(int(counts.sum() - len(counts)), 0)
-    if within_dof > 0:
-        sigma_sq = float(member_sse.sum() / within_dof)
-    elif len(values) > 1:
-        sigma_sq = float(values.var(ddof=1))
-    else:
-        sigma_sq = 0.0
-
-    variance_scale = max(float(values.var(ddof=0)) if len(values) else 0.0, 1.0)
-    variance_floor = variance_scale * 1e-8
-    sigma_sq = max(sigma_sq, variance_floor)
-
-    observed_between = float(member_means.var(ddof=1)) if len(member_means) > 1 else 0.0
-    mean_sampling_var = float((sigma_sq / counts.clip(lower=1.0)).mean())
-    tau_sq = max(observed_between - mean_sampling_var, variance_floor)
-
-    data_precision = counts / sigma_sq
-    prior_precision = 1.0 / tau_sq
-    posterior_precision = data_precision + prior_precision
-    posterior_mean = (
-        data_precision * member_means + prior_precision * global_mean
-    ) / posterior_precision
-    posterior_std = np.sqrt(1.0 / posterior_precision)
-    shrinkage = prior_precision / posterior_precision
-    return posterior_mean, posterior_std, shrinkage
 
 
 def _build_ranking_result(
@@ -291,6 +259,7 @@ def _build_ranking_result(
     shrunk_alpha,
     shrunk_alpha_std,
     alpha_shrinkage,
+    alpha_effective_information,
     avg_realized,
 ):
     result = pd.DataFrame(
@@ -317,6 +286,7 @@ def _build_ranking_result(
     result["shrunk_alpha"] = shrunk_alpha.values
     result["shrunk_alpha_std"] = shrunk_alpha_std.values
     result["alpha_shrinkage"] = alpha_shrinkage.values
+    result["alpha_effective_information"] = alpha_effective_information.values
     return result
 
 

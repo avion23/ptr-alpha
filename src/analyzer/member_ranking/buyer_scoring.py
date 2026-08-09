@@ -24,6 +24,7 @@ from analyzer.member_ranking.ranking import rank_members
 from analyzer.member_ranking.lookups import (
     _build_ranking_dicts,
     _get_ticker_purchases,
+    _validate_scoring_mode,
 )
 
 
@@ -31,44 +32,47 @@ from analyzer.member_ranking.lookups import (
 def score_ticker_by_buyers(
     ticker: str,
     transactions_df: pd.DataFrame,
-    signals_df: pd.DataFrame,
+    signals_df: pd.DataFrame | None = None,
     horizon: int = 90,
     threshold: float = 5.0,
     member_rankings: pd.DataFrame | None = None,
     min_buyers: int = 2,
     ticker_perf_signals: pd.DataFrame | None = None,
-    member_skills: dict | None = None,
-    uncertainty_penalty_lambda: float = 0.5,
-    solo_buyer_skill_threshold: float = 1.0,
-    solo_buyer_penalty: float = 0.8,
     _bayes_prior_strength: float | None = None,
     _ranking_dicts: dict | None = None,
     scoring_mode: str = "consensus",
+    as_of_date: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """Score a ticker by its buyer composition. Memoized via @df_memoize.
 
     When ``_ranking_dicts`` is provided (pre-built by the caller), dict
     lookups replace DataFrame linear scans for buyer stats.
     """
-    _validate_inputs(signals_df, transactions_df)
+    _validate_scoring_mode(scoring_mode)
+    _validate_inputs(signals_df, transactions_df, scoring_mode)
 
-    bayes_prior = (
-        _bayes_prior_strength
-        if _bayes_prior_strength is not None
-        else _signals.BAYES_PRIOR_STRENGTH
-    )
-
-    if member_skills is not None:
-        raise AnalysisError(
-            "member_skills are diagnostic only and cannot produce a tradable score"
-        )
-
+    if scoring_mode == "consensus" and as_of_date is None:
+        raise AnalysisError("consensus scoring requires an explicit as_of_date")
+    if scoring_mode == "consensus" and pd.isna(pd.Timestamp(as_of_date)):
+        raise AnalysisError("consensus as_of_date must be a valid timestamp")
     if scoring_mode != "consensus" and member_rankings is None:
+        bayes_prior = (
+            _bayes_prior_strength
+            if _bayes_prior_strength is not None
+            else _signals.BAYES_PRIOR_STRENGTH
+        )
         member_rankings = rank_members(
             signals_df, horizon, threshold, _bayes_prior_strength=bayes_prior
         )
 
     ticker_trades = _get_ticker_purchases(ticker, transactions_df).copy()
+    if scoring_mode == "consensus":
+        disclosure_dates = pd.to_datetime(
+            ticker_trades["disclosure_date"], errors="coerce"
+        )
+        ticker_trades = ticker_trades[
+            disclosure_dates.notna() & (disclosure_dates <= pd.Timestamp(as_of_date))
+        ].copy()
     if ticker_trades.empty:
         return _empty_ticker_result(ticker)
 
@@ -79,26 +83,25 @@ def score_ticker_by_buyers(
     if min_trades < min_buyers:
         return _below_threshold_result(ticker, min_trades, min_buyers)
 
-    # Retained keyword parameters are ignored for call compatibility with the
-    # outer backtest API. Solo buyers are neither admitted nor rejected by a
-    # member posterior, and no arbitrary posterior-based penalty is applied.
-    _ = (solo_buyer_skill_threshold, solo_buyer_penalty, uncertainty_penalty_lambda)
-    apply_solo_penalty = False
-
     buyers = ticker_trades["_member_canonical"].unique()
-    rd = (
-        _ranking_dicts
-        if _ranking_dicts is not None
-        else _build_ranking_dicts(member_rankings, scoring_mode=scoring_mode)
-    )
-    default_mode = "custom" if _ranking_dicts is not None else scoring_mode
-    mode = str(rd.get("mode", default_mode))
-    alpha_dict = rd["alpha"]
-    trades_dict = rd["trades"]
-
-    if mode == "consensus":
-        inputs = _consensus_inputs(buyers, ticker_trades)
+    if scoring_mode == "consensus":
+        alpha_dict = {}
+        inputs = _consensus_inputs(
+            buyers, ticker_trades, as_of_date=pd.Timestamp(as_of_date)
+        )
     else:
+        rd = (
+            _ranking_dicts
+            if _ranking_dicts is not None
+            else _build_ranking_dicts(member_rankings, scoring_mode=scoring_mode)
+        )
+        dict_mode = rd.get("mode")
+        if dict_mode != scoring_mode:
+            raise AnalysisError(
+                "_ranking_dicts must declare the same validated scoring_mode"
+            )
+        alpha_dict = rd["alpha"]
+        trades_dict = rd["trades"]
         fallback = _member_only_inputs(
             ticker,
             buyers,
@@ -111,23 +114,19 @@ def score_ticker_by_buyers(
         if isinstance(fallback, pd.DataFrame):
             return fallback
         inputs = fallback
-    inputs["scoring_mode"] = mode
-
-    return _final_result(
-        ticker,
-        buyers,
-        ticker_trades,
-        inputs,
-        apply_solo_penalty,
-        alpha_dict,
-    )
+    inputs["scoring_mode"] = scoring_mode
+    return _final_result(ticker, buyers, ticker_trades, inputs, alpha_dict)
 
 
-def _validate_inputs(signals_df: pd.DataFrame, transactions_df: pd.DataFrame) -> None:
-    if signals_df.empty:
-        raise AnalysisError("Empty signal dataframe")
+def _validate_inputs(
+    signals_df: pd.DataFrame | None,
+    transactions_df: pd.DataFrame,
+    scoring_mode: str,
+) -> None:
     if transactions_df.empty:
         raise AnalysisError("Empty transactions dataframe")
+    if scoring_mode != "consensus" and (signals_df is None or signals_df.empty):
+        raise AnalysisError("Historical scoring requires a non-empty signal dataframe")
 
 
 def _empty_ticker_result(ticker: str) -> pd.DataFrame:
@@ -155,7 +154,9 @@ def _below_threshold_result(
     )
 
 
-def _consensus_inputs(buyers, ticker_trades: pd.DataFrame) -> dict:
+def _consensus_inputs(
+    buyers, ticker_trades: pd.DataFrame, *, as_of_date: pd.Timestamp
+) -> dict:
     """Build an identity-free distinct-buyer recency score.
 
     Each canonical buyer contributes its most recent disclosure weight. Names,
@@ -163,7 +164,6 @@ def _consensus_inputs(buyers, ticker_trades: pd.DataFrame) -> dict:
     score, so permuting member identities leaves it unchanged.
     """
     member_col = "_member_canonical"
-    latest = pd.to_datetime(ticker_trades["disclosure_date"], errors="coerce").max()
     disclosures = (
         ticker_trades.assign(
             _disclosure=pd.to_datetime(
@@ -174,7 +174,11 @@ def _consensus_inputs(buyers, ticker_trades: pd.DataFrame) -> dict:
         .max()
         .reindex(buyers)
     )
-    days_since = (latest - disclosures).dt.days.fillna(0).clip(lower=0)
+    days_since = (as_of_date - disclosures).dt.days
+    if days_since.isna().any() or (days_since < 0).any():
+        raise AnalysisError(
+            "Consensus disclosures must be known on or before as_of_date"
+        )
     weights = np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.to_numpy(dtype=float))
     score = float(weights.sum())
     return {
@@ -286,7 +290,6 @@ def _final_result(
     buyers,
     ticker_trades,
     inputs,
-    apply_solo_penalty,
     alpha_dict,
 ) -> pd.DataFrame:
     base_signal_score = inputs["base_signal_score"]
@@ -323,8 +326,6 @@ def _final_result(
             "signal_score": [signal_score],
             "signal_score_raw": [signal_score_raw],
             "fallback_source": [inputs.get("scoring_mode", "member_ranked")],
-            "uncertainty_lambda": [0.0],
-            "solo_buyer": [apply_solo_penalty],
             "scoring_mode": [inputs.get("scoring_mode", "custom")],
         }
     )

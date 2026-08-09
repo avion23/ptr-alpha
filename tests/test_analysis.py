@@ -104,9 +104,14 @@ class TestAnalysis(unittest.TestCase):
             }
         )
 
-        score = score_ticker_by_buyers("AAPL", transactions, signals)
+        score = score_ticker_by_buyers(
+            "AAPL",
+            transactions,
+            signals,
+            as_of_date=pd.Timestamp("2024-02-01"),
+        )
 
-        expected_consensus = np.exp(-0.03) + 1.0
+        expected_consensus = np.exp(-0.03 * 29) + np.exp(-0.03 * 28)
         self.assertEqual(
             score.iloc[0]["base_signal_score"], round(expected_consensus, 2)
         )
@@ -449,6 +454,7 @@ class TestAnalysis(unittest.TestCase):
             signals,
             member_rankings=member_rankings,
             min_buyers=3,
+            as_of_date=pd.Timestamp("2024-02-01"),
         )
 
         self.assertEqual(score.iloc[0]["num_buyers"], 2)
@@ -742,7 +748,7 @@ class TestSoloBuyerConsensusScoring(unittest.TestCase):
         signals = pd.DataFrame({"member": ["diagnostic-only"]})
         return transactions, member_rankings, signals
 
-    def test_solo_score_does_not_depend_on_posterior_lift_or_threshold(self):
+    def test_solo_score_does_not_depend_on_member_posterior(self):
         low_tx, low_rankings, signals = self._make_solo_setup(0.1)
         high_tx, high_rankings, _ = self._make_solo_setup(10.0)
 
@@ -752,7 +758,7 @@ class TestSoloBuyerConsensusScoring(unittest.TestCase):
             signals,
             member_rankings=low_rankings,
             min_buyers=1,
-            solo_buyer_skill_threshold=99.0,
+            as_of_date=pd.Timestamp("2024-02-01"),
         )
         high = score_ticker_by_buyers(
             "AVGO",
@@ -760,12 +766,12 @@ class TestSoloBuyerConsensusScoring(unittest.TestCase):
             signals,
             member_rankings=high_rankings,
             min_buyers=1,
-            solo_buyer_skill_threshold=0.0,
+            as_of_date=pd.Timestamp("2024-02-01"),
         )
 
-        self.assertEqual(low.iloc[0]["signal_score"], 1.0)
+        expected = round(np.exp(-0.03 * 29), 2)
+        self.assertEqual(low.iloc[0]["signal_score"], expected)
         self.assertEqual(low.iloc[0]["signal_score"], high.iloc[0]["signal_score"])
-        self.assertFalse(low.iloc[0]["solo_buyer"])
 
     def test_minimum_distinct_buyer_gate_remains(self):
         transactions, rankings, signals = self._make_solo_setup(10.0)
@@ -776,6 +782,7 @@ class TestSoloBuyerConsensusScoring(unittest.TestCase):
             signals,
             member_rankings=rankings,
             min_buyers=2,
+            as_of_date=pd.Timestamp("2024-02-01"),
         )
 
         self.assertEqual(score.iloc[0]["signal_score"], 0.0)

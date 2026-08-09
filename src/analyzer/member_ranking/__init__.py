@@ -14,7 +14,6 @@ Public API:
     - rank_sales(signal_df, horizon=90)
     - _compute_member_stats
     - _get_ticker_purchases
-    - _lookup_buyer_posterior_lift
     - _build_ranking_dicts
     - get_ticker_buyers_with_rankings(...)
   Buyer composition scoring:
@@ -57,7 +56,6 @@ from analyzer.member_ranking.sales import (
 from analyzer.member_ranking.lookups import (
     _build_ranking_dicts,
     _get_ticker_purchases,
-    _lookup_buyer_posterior_lift,
     get_ticker_buyers_with_rankings,
 )
 from analyzer.member_ranking.buyer_scoring import score_ticker_by_buyers
@@ -75,7 +73,6 @@ __all__ = [
     "_rank_members_impl",
     "_compute_member_stats",
     "_get_ticker_purchases",
-    "_lookup_buyer_posterior_lift",
     "_build_ranking_dicts",
     "get_ticker_buyers_with_rankings",
     "score_ticker_by_buyers",

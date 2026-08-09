@@ -19,40 +19,25 @@ from analyzer.member_names import canonical_member_key
 from analyzer.models import TransactionType
 
 
+SUPPORTED_SCORING_MODES = frozenset(
+    {"consensus", "shrunk_alpha", "consistency", "trade_frequency"}
+)
+
+
+def _validate_scoring_mode(scoring_mode: str) -> None:
+    if scoring_mode not in SUPPORTED_SCORING_MODES:
+        supported = ", ".join(sorted(SUPPORTED_SCORING_MODES))
+        raise AnalysisError(
+            f"Unknown scoring_mode {scoring_mode!r}; expected one of: {supported}"
+        )
+
+
 @df_memoize(copy=False)
 def _get_ticker_purchases(ticker: str, transactions_df: pd.DataFrame) -> pd.DataFrame:
     return transactions_df[
         (transactions_df["ticker"] == ticker)
         & (transactions_df["transaction_type"] == TransactionType.PURCHASE.value)
     ]
-
-
-def _lookup_buyer_posterior_lift(
-    member: str,
-    member_rankings: pd.DataFrame | None,
-) -> float | None:
-    """Fetch a member's posterior lift (posterior / prior) from member_rankings.
-
-    Returns None when rankings are missing, the column is absent, the member
-    is unrated, or the value is NaN.
-
-    This is a diagnostic lookup only. Tradable scoring does not use
-    posterior lift because ratios to changing priors are not comparable.
-    """
-    if member_rankings is None or member_rankings.empty:
-        return None
-    if "posterior_lift" not in member_rankings.columns:
-        return None
-    row = member_rankings.loc[member_rankings["member"] == member]
-    if row.empty:
-        canon = canonical_member_key(member)
-        row = member_rankings.loc[
-            member_rankings["member"].apply(canonical_member_key) == canon
-        ]
-    if row.empty:
-        return None
-    val = row["posterior_lift"].iloc[0]
-    return float(val) if pd.notna(val) else None
 
 
 def _build_ranking_dicts(
@@ -73,10 +58,7 @@ def _build_ranking_dicts(
     ``bayesian_quality`` is deliberately unsupported: multiplying a
     probability by a percentage alpha has no calibrated decision meaning.
     """
-    if scoring_mode == "bayesian_quality":
-        raise AnalysisError(
-            "bayesian_quality is unsupported; probability multiplied by alpha has incompatible units"
-        )
+    _validate_scoring_mode(scoring_mode)
     if scoring_mode == "consensus":
         return {
             "alpha": {},
@@ -146,10 +128,7 @@ def _build_ranking_dicts(
 def _compute_alpha_for_scoring_mode(
     valid: pd.DataFrame, alpha_col: str, scoring_mode: str
 ) -> dict:
-    if scoring_mode == "bayesian_quality":
-        raise AnalysisError(
-            "bayesian_quality is unsupported; use consensus or a same-unit score"
-        )
+    _validate_scoring_mode(scoring_mode)
     if scoring_mode == "consistency":
         prob_up = (
             valid["prob_up_given_buy"].fillna(0.5).values
@@ -161,8 +140,10 @@ def _compute_alpha_for_scoring_mode(
     elif scoring_mode == "trade_frequency":
         trades = valid["purchase_trades"].fillna(0).values.astype(float)
         alpha_values = np.log1p(trades)
-    else:  # "shrunk_alpha" (default)
+    elif scoring_mode == "shrunk_alpha":
         alpha_values = valid[alpha_col].astype(float).values
+    else:
+        raise AssertionError(f"Unhandled validated scoring mode: {scoring_mode}")
     return dict(zip(valid["member"], alpha_values))
 
 

@@ -6,7 +6,7 @@ import pandas as pd
 from analyzer.member_skill import (
     MemberSkillPosterior,
     estimate_member_skills,
-    score_members_for_ticker,
+    score_member_posteriors,
 )
 
 
@@ -163,6 +163,10 @@ class TestEstimateMemberSkills(unittest.TestCase):
             ref_date=REF_DATE,
         )
 
+        self.assertLess(
+            old_skills["A"].effective_information,
+            recent_skills["A"].effective_information,
+        )
         self.assertGreater(old_skills["A"].shrinkage, recent_skills["A"].shrinkage)
         self.assertGreater(old_skills["A"].alpha_std, recent_skills["A"].alpha_std)
 
@@ -196,6 +200,7 @@ class TestScoreMembersForTicker(unittest.TestCase):
                 alpha_mean=15.0,
                 alpha_std=2.0,
                 n_episodes=20,
+                effective_information=1.0,
                 shrinkage=0.2,
             ),
             "Bad": MemberSkillPosterior(
@@ -203,11 +208,11 @@ class TestScoreMembersForTicker(unittest.TestCase):
                 alpha_mean=-5.0,
                 alpha_std=5.0,
                 n_episodes=3,
+                effective_information=1.0,
                 shrinkage=0.6,
             ),
         }
-        expected_alpha, uncertainty = score_members_for_ticker(
-            "AAPL",
+        expected_alpha, uncertainty = score_member_posteriors(
             ["Good", "Bad"],
             skills,
         )
@@ -221,11 +226,11 @@ class TestScoreMembersForTicker(unittest.TestCase):
                 alpha_mean=15.0,
                 alpha_std=2.0,
                 n_episodes=20,
+                effective_information=1.0,
                 shrinkage=0.2,
             ),
         }
-        expected_alpha, uncertainty = score_members_for_ticker(
-            "AAPL",
+        expected_alpha, uncertainty = score_member_posteriors(
             ["Unknown"],
             skills,
         )
@@ -238,11 +243,11 @@ class TestScoreMembersForTicker(unittest.TestCase):
                 alpha_mean=10.0,
                 alpha_std=1.0,
                 n_episodes=15,
+                effective_information=1.0,
                 shrinkage=0.25,
             ),
         }
-        expected_alpha, _ = score_members_for_ticker(
-            "AAPL",
+        expected_alpha, _ = score_member_posteriors(
             ["Solo"],
             skills,
         )
@@ -256,6 +261,7 @@ class TestScoreMembersForTicker(unittest.TestCase):
                 alpha_mean=10.0,
                 alpha_std=1.0,
                 n_episodes=30,
+                effective_information=1.0,
                 shrinkage=0.14,
             ),
             "Noisy": MemberSkillPosterior(
@@ -263,11 +269,11 @@ class TestScoreMembersForTicker(unittest.TestCase):
                 alpha_mean=20.0,
                 alpha_std=10.0,
                 n_episodes=3,
+                effective_information=1.0,
                 shrinkage=0.62,
             ),
         }
-        expected_alpha, uncertainty = score_members_for_ticker(
-            "AAPL",
+        expected_alpha, uncertainty = score_member_posteriors(
             ["Precise", "Noisy"],
             skills,
         )
@@ -276,149 +282,21 @@ class TestScoreMembersForTicker(unittest.TestCase):
         self.assertAlmostEqual(uncertainty, np.sqrt(1.0 / 1.01))
 
 
-class TestIntegrationWithAnalysis(unittest.TestCase):
-    def test_score_ticker_by_buyers_with_skills(self):
-        """score_ticker_by_buyers with member_skills parameter."""
-        from analyzer.analysis import score_ticker_by_buyers
-
-        transactions = pd.DataFrame(
-            {
-                "member": ["Alice", "Bob"],
-                "ticker": ["AAPL", "AAPL"],
-                "transaction_date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
-                "disclosure_date": pd.to_datetime(["2024-01-03", "2024-01-04"]),
-                "transaction_type": ["Purchase", "Purchase"],
-            }
-        )
-        signals = pd.DataFrame(
-            {
-                "member": ["Alice", "Bob"],
-                "ticker": ["AAPL", "AAPL"],
-                "signal_type": ["Purchase", "Purchase"],
-                "horizon_days": [90, 90],
-                "decayed_return_pct": [10.0, 5.0],
-                "peak_potential_pct": [12.0, 7.0],
-                "spy_alpha_pct": [10.0, 5.0],
-            }
-        )
-        member_rankings = pd.DataFrame(
-            {
-                "member": ["Alice", "Bob"],
-                "avg_spy_alpha_pct": [10.0, 5.0],
-                "purchase_trades": [10, 5],
-                "bayes_win_prob": [0.65, 0.55],
-            }
-        )
+class TestMemberPosteriorIdentityValidation(unittest.TestCase):
+    def test_duplicate_member_evidence_is_rejected(self):
         skills = {
             "Alice": MemberSkillPosterior(
                 member="Alice",
-                alpha_mean=10.0,
-                alpha_std=2.0,
-                n_episodes=10,
-                shrinkage=0.33,
-            ),
-            "Bob": MemberSkillPosterior(
-                member="Bob",
-                alpha_mean=5.0,
-                alpha_std=4.0,
-                n_episodes=5,
+                alpha_mean=2.0,
+                alpha_std=1.0,
+                n_episodes=3,
+                effective_information=2.0,
                 shrinkage=0.5,
-            ),
-        }
-        from analyzer.exceptions import AnalysisError
-
-        with self.assertRaisesRegex(AnalysisError, "diagnostic only"):
-            score_ticker_by_buyers(
-                "AAPL",
-                transactions,
-                signals,
-                member_rankings=member_rankings,
-                member_skills=skills,
-                uncertainty_penalty_lambda=0.5,
             )
-
-    def test_score_ticker_by_buyers_lambda_zero_no_penalty(self):
-        """lambda=0 gives no uncertainty penalty: base_signal_score == quality_adjusted_avg."""
-        from analyzer.analysis import score_ticker_by_buyers
-
-        transactions = pd.DataFrame(
-            {
-                "member": ["Alice", "Bob"],
-                "ticker": ["AAPL", "AAPL"],
-                "transaction_date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
-                "disclosure_date": pd.to_datetime(["2024-01-03", "2024-01-04"]),
-                "transaction_type": ["Purchase", "Purchase"],
-            }
-        )
-        signals = pd.DataFrame(
-            {
-                "member": ["Alice", "Bob"],
-                "ticker": ["AAPL", "AAPL"],
-                "signal_type": ["Purchase", "Purchase"],
-                "horizon_days": [90, 90],
-                "decayed_return_pct": [10.0, 8.0],
-                "peak_potential_pct": [12.0, 10.0],
-                "spy_alpha_pct": [10.0, 8.0],
-            }
-        )
-        skills = {
-            "Alice": MemberSkillPosterior(
-                member="Alice",
-                alpha_mean=10.0,
-                alpha_std=2.0,
-                n_episodes=10,
-                shrinkage=0.33,
-            ),
-            "Bob": MemberSkillPosterior(
-                member="Bob",
-                alpha_mean=8.0,
-                alpha_std=3.0,
-                n_episodes=5,
-                shrinkage=0.5,
-            ),
         }
-        from analyzer.exceptions import AnalysisError
 
-        with self.assertRaisesRegex(AnalysisError, "diagnostic only"):
-            score_ticker_by_buyers(
-                "AAPL",
-                transactions,
-                signals,
-                member_skills=skills,
-                uncertainty_penalty_lambda=0.0,
-            )
-
-    def test_score_ticker_by_buyers_without_skills_unchanged(self):
-        """Without member_skills, behavior is unchanged."""
-        from analyzer.analysis import score_ticker_by_buyers
-
-        transactions = pd.DataFrame(
-            {
-                "member": ["Alice", "Charlie"],
-                "ticker": ["AAPL", "AAPL"],
-                "transaction_date": pd.to_datetime(["2024-01-01", "2024-01-02"]),
-                "disclosure_date": pd.to_datetime(["2024-01-03", "2024-01-04"]),
-                "transaction_type": ["Purchase", "Purchase"],
-                "owner_code": [None, "DC"],
-                "amount_midpoint": [100000.0, 100000.0],
-            }
-        )
-        signals = pd.DataFrame(
-            {
-                "member": ["Alice", "Charlie"],
-                "ticker": ["AAPL", "AAPL"],
-                "signal_type": ["Purchase", "Purchase"],
-                "horizon_days": [90, 90],
-                "decayed_return_pct": [10.0, 10.0],
-                "peak_potential_pct": [12.0, 12.0],
-                "spy_alpha_pct": [10.0, 10.0],
-            }
-        )
-        score = score_ticker_by_buyers("AAPL", transactions, signals)
-        expected = np.exp(-0.03) + 1.0
-        self.assertAlmostEqual(score.iloc[0]["base_signal_score"], round(expected, 2))
-        self.assertEqual(score.iloc[0]["scoring_mode"], "consensus")
-        self.assertEqual(score.iloc[0]["uncertainty_lambda"], 0.0)
+        with self.assertRaisesRegex(ValueError, "duplicate member identities"):
+            score_member_posteriors(["Alice", "ALICE"], skills)
 
 
 if __name__ == "__main__":

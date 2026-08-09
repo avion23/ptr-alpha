@@ -507,13 +507,9 @@ def analyze_snooping(
     selected_series = pd.Series(
         per_date_returns[selected_trial_id], dtype=float
     ).dropna()
-    release_ready = n_permutations >= 999
-    deployable = bool(
-        release_ready
-        and float(selected_series.mean()) > 0
-        and significant_bonferroni
-        and max_stat_p <= alpha
-    )
+    # This public diagnostic has no access to the production member-identity
+    # runner result and therefore can never authorize deployment.
+    deployable = False
 
     clean = selected_series.to_numpy(dtype=float)
     observed_sharpe = float(row.get("sharpe", 0.0))

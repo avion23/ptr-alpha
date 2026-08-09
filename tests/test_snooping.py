@@ -209,7 +209,7 @@ class TestCoherentSnoopingReport:
         assert report.t_statistic > 0
         assert report.significant_bonferroni is True
         assert report.max_stat_p_value <= 0.05
-        assert report.deployable is True
+        assert report.deployable is False
         assert report.bh_rejected is False  # no false BH claim
 
     def test_requested_config_missing_from_series_fails(self):

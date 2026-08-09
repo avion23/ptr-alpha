@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import math
 from datetime import date
 
@@ -15,12 +17,18 @@ from analyzer.validation import (
     MIN_RELEASE_PERMUTATIONS,
     PRIMARY_METRIC,
     EvaluationAlreadyConsumedError,
+    EvaluationLedgerIntegrityError,
     _backtest_core,
     _build_manifest,
+    _canonical_ledger_path,
     _complete_evaluation,
+    _hash_untracked_path,
+    _member_family_sha256,
+    _member_identity_permutations,
     _phase_end,
     _reserve_evaluation,
     _run_member_identity_control,
+    _validate_ledger,
     newey_west_tstat,
     permute_signal_member_labels,
     run_validation,
@@ -136,15 +144,9 @@ class TestCorrectedSelection:
             series_by_trial=series,
             n_permutations=999,
             permutation_seed=7,
-            member_control={
-                "status": "completed",
-                "n_permutations": 999,
-                "release_ready": True,
-                "max_stat_p_value": 0.001,
-            },
         )
-        assert result["deployable_config"] is not None
-        assert result["deployable_config"]["trial_id"] == 0
+        assert result["deployable_config"] is None
+        assert result["statistical_candidate"]["trial_id"] == 0
         assert result["primary_metric"] == PRIMARY_METRIC
 
     def test_block_permuted_null_does_not_survive(self):
@@ -200,7 +202,29 @@ class TestMemberIdentityGate:
             },
         )
         assert result["deployable_config"] is None
-        assert result["member_identity_control"]["n_permutations"] == 998
+        assert (
+            result["member_identity_control"]["status"] == "invalid_non_runner_control"
+        )
+
+    def test_identity_free_exemption_payload_is_never_accepted(self):
+        series = {0: _series(np.full(180, 2.0))}
+        frame = _selection_frame(series)
+        frame["scoring_mode"] = "identity_free_consensus"
+        result = select_config(
+            frame,
+            series_by_trial=series,
+            n_permutations=999,
+            member_control={
+                "exempt": True,
+                "invariance_proof_sha256": "a" * 64,
+                "release_ready": True,
+                "max_stat_p_value": 0.0,
+            },
+        )
+        assert result["deployable_config"] is None
+        assert (
+            result["member_identity_control"]["status"] == "invalid_non_runner_control"
+        )
 
     def test_production_member_control_runs_full_family_and_records_runtime(
         self, monkeypatch
@@ -213,10 +237,11 @@ class TestMemberIdentityGate:
         calls = []
 
         def fake_sweep(*args, **kwargs):
-            calls.append(kwargs["signals_by_horizon"])
-            return pd.DataFrame(
-                [{"min_sample_ok": True, "nw_tstat": float(len(calls))}]
-            )
+            permuted = kwargs["signals_by_horizon"]
+            calls.append(permuted)
+            labels = permuted[(60, 0.005)]["member"].tolist()
+            statistic = 3.0 if labels == ["A", "B"] else 1.0
+            return pd.DataFrame([{"min_sample_ok": True, "nw_tstat": statistic}])
 
         monkeypatch.setattr("analyzer.validation.sweep_configs", fake_sweep)
         result = _run_member_identity_control(
@@ -231,14 +256,138 @@ class TestMemberIdentityGate:
             date(2022, 1, 1),
             date(2023, 1, 1),
             observed_statistic=2.5,
+            observed_trial_id=0,
+            family_sha256="f" * 64,
             n_permutations=3,
             seed=10,
         )
-        assert len(calls) == 3
-        assert result["status"] == "completed"
-        assert result["n_permutations"] == 3
-        assert result["release_ready"] is False
-        assert result["runtime_seconds"] >= 0
+        assert len(calls) == 2  # exact 2! group: identity and swap
+        assert result.status == "completed"
+        assert result.exact_enumeration is True
+        assert result.permutation_group_size == 2
+        assert result.p_value_resolution == 0.5
+        assert result.max_stat_p_value >= 0.5  # identity is in the null
+        assert result.release_ready is True
+        assert result.runtime_seconds >= 0
+
+    def test_large_group_samples_unique_uniform_permutations(self):
+        members = list("ABCDEFG")  # 7! exceeds exact-enumeration threshold
+        permutations, group_size, exact = _member_identity_permutations(
+            members, 999, seed=8
+        )
+        assert group_size == math.factorial(7)
+        assert exact is False
+        assert len(permutations) == len(set(permutations)) == 999
+        assert all(set(value) == set(members) for value in permutations)
+        assert any(
+            source == target
+            for value in permutations
+            for source, target in zip(members, value)
+        )
+
+    def test_runtime_budget_fails_closed_without_duplicate_draw_claims(
+        self, monkeypatch
+    ):
+        signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.calculate_signal_potential",
+            lambda *args, **kwargs: signal,
+        )
+        monkeypatch.setattr(
+            "analyzer.validation.sweep_configs",
+            lambda *args, **kwargs: pytest.fail("budget must stop before evaluation"),
+        )
+        result = _run_member_identity_control(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {"horizon": [60], "decay_lambda": [0.005]},
+            date(2022, 1, 1),
+            date(2023, 1, 1),
+            observed_statistic=1.0,
+            observed_trial_id=0,
+            family_sha256="f" * 64,
+            n_permutations=999,
+            seed=10,
+            runtime_budget_seconds=0.0,
+        )
+        assert result.status == "infeasible_runtime_budget"
+        assert result.evaluated_permutations == 0
+        assert result.release_ready is False
+        assert result.max_stat_p_value == 1.0
+
+    def test_only_bound_runner_result_can_unlock_deployment(self, monkeypatch):
+        signal = pd.DataFrame({"member": list("ABCDEFG"), "value": np.arange(7.0)})
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.calculate_signal_potential",
+            lambda *args, **kwargs: signal,
+        )
+        monkeypatch.setattr(
+            "analyzer.validation.sweep_configs",
+            lambda *args, **kwargs: pd.DataFrame(
+                [{"min_sample_ok": True, "nw_tstat": 0.0}]
+            ),
+        )
+        series = {0: _series(np.full(180, 2.0))}
+        frame = _selection_frame(series)
+        family_sha256 = _member_family_sha256(frame, series)
+        control = _run_member_identity_control(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {"horizon": [60], "decay_lambda": [0.005]},
+            date(2022, 1, 1),
+            date(2023, 1, 1),
+            observed_statistic=float(frame.iloc[0]["nw_tstat"]),
+            observed_trial_id=0,
+            family_sha256=family_sha256,
+            n_permutations=999,
+            seed=1,
+        )
+        result = select_config(
+            frame,
+            series_by_trial=series,
+            n_permutations=999,
+            member_control=control,
+        )
+        assert control.evaluated_permutations == 999
+        assert control.release_ready is True
+        assert result["deployable_config"] is not None
+
+    def test_runner_result_must_match_exact_family_hash(self, monkeypatch):
+        signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.calculate_signal_potential",
+            lambda *args, **kwargs: signal,
+        )
+        monkeypatch.setattr(
+            "analyzer.validation.sweep_configs",
+            lambda *args, **kwargs: pd.DataFrame(
+                [{"min_sample_ok": True, "nw_tstat": 0.0}]
+            ),
+        )
+        control = _run_member_identity_control(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {"horizon": [60], "decay_lambda": [0.005]},
+            date(2022, 1, 1),
+            date(2023, 1, 1),
+            observed_statistic=100.0,
+            observed_trial_id=0,
+            family_sha256="wrong-family",
+            n_permutations=999,
+            seed=1,
+        )
+        series = {0: _series(np.full(180, 2.0))}
+        result = select_config(
+            _selection_frame(series),
+            series_by_trial=series,
+            n_permutations=999,
+            member_control=control,
+        )
+        assert result["statistical_candidate"] is not None
+        assert result["deployable_config"] is None
 
     def test_short_series_cannot_fall_back_to_asymptotic_reward(self):
         short = {0: _series([2.0, 2.1, 1.9])}
@@ -424,19 +573,65 @@ class TestEvaluationConsumptionLedger:
         )
         assert ledger.exists()
         payload = __import__("json").loads(ledger.read_text())
-        assert payload["evaluations"][0]["status"] == "reserved_consumed"
+        assert payload["events"][0]["status"] == "reserved_consumed"
+        _validate_ledger(payload)
         with pytest.raises(EvaluationAlreadyConsumedError, match="alternate"):
             _reserve_evaluation(
                 ledger,
                 manifest,
                 {"horizon": 90},
                 {"horizon": [90]},
-                date(2024, 1, 1),
-                date(2025, 6, 30),
+                date(2025, 1, 1),
+                date(2025, 12, 31),
             )
         _complete_evaluation(ledger, first, "completed_retrospective")
         payload = __import__("json").loads(ledger.read_text())
-        assert payload["evaluations"][0]["status"] == "completed_retrospective"
+        assert payload["events"][-1]["status"] == "completed_retrospective"
+        assert (
+            payload["events"][-1]["previous_sha256"]
+            == payload["events"][0]["event_sha256"]
+        )
+        _validate_ledger(payload)
+
+    def test_hash_chain_detects_local_tampering(self, tmp_path):
+        ledger = tmp_path / "ledger.json"
+        manifest = {
+            "hashes": {
+                "database_sha256": "a" * 64,
+                "value_snapshot_sha256": "b" * 64,
+            }
+        }
+        _reserve_evaluation(
+            ledger, manifest, {}, {}, date(2024, 1, 1), date(2024, 12, 31)
+        )
+        payload = __import__("json").loads(ledger.read_text())
+        payload["events"][0]["status"] = "rewritten"
+        with pytest.raises(EvaluationLedgerIntegrityError, match="hash"):
+            _validate_ledger(payload)
+        assert "local attacker" in payload["local_tamper_limitation"]
+
+    def test_public_runner_has_only_canonical_ledger_path(self, tmp_path):
+        assert (
+            "evaluation_ledger_path" not in inspect.signature(run_validation).parameters
+        )
+        db_path = tmp_path / "data" / "database.duckdb"
+        assert _canonical_ledger_path(db_path) == (
+            db_path.parent.resolve() / ".ptr-alpha-evaluation-ledger-v2.json"
+        )
+
+    def test_untracked_directory_hash_recurses_into_file_contents(self, tmp_path):
+        directory = tmp_path / "untracked"
+        directory.mkdir()
+        nested = directory / "nested"
+        nested.mkdir()
+        value = nested / "value.txt"
+        value.write_text("first")
+        first = hashlib.sha256()
+        _hash_untracked_path(first, tmp_path, directory)
+        value.write_text("second")
+        second = hashlib.sha256()
+        _hash_untracked_path(second, tmp_path, directory)
+        assert first.hexdigest() != second.hexdigest()
 
 
 class TestMemberPermutationCanary:
@@ -456,12 +651,11 @@ class TestMemberPermutationCanary:
         permuted = permute_signal_member_labels(original, seed=3)
         assert sorted(permuted[(60, 0.005)]["member"].value_counts()) == [1, 1, 2]
         assert permuted[(60, 0.005)]["outcome"].tolist() == [1.0, 2.0, 3.0, 4.0]
-        assert all(
-            changed != source
-            for changed, source in zip(
-                permuted[(60, 0.005)]["member"],
-                original[(60, 0.005)]["member"],
-            )
+        # The full permutation group is valid: fixed points are not excluded.
+        identity = permute_signal_member_labels(original, permutation=("A", "B", "C"))
+        assert (
+            identity[(60, 0.005)]["member"].tolist()
+            == original[(60, 0.005)]["member"].tolist()
         )
         assert original[(60, 0.005)]["member"].tolist() == ["A", "A", "B", "C"]
 

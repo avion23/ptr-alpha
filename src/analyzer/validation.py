@@ -3,8 +3,9 @@
 The validation contract is fail closed:
 * every phase ends early enough for the maximum executable holding to mature;
 * one per-date net-alpha statistic drives inference, correction, selection, and verdict;
-* arbitrary-dependence Bonferroni and synchronized block max-stat gates must pass;
-* fewer than 999 null permutations can never produce a deployable configuration;
+* arbitrary-dependence Bonferroni and moving-block max-stat gates must pass;
+* member identities use exact small-group or unique full-group null draws;
+* incomplete or under-resolved empirical controls fail closed;
 * the post-2025 final phase is locked and is never loaded by this module.
 """
 
@@ -21,7 +22,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, timezone
 from importlib import metadata
 from pathlib import Path
@@ -43,6 +44,29 @@ MIN_RELEASE_PERMUTATIONS = 999
 LOCKED_FINAL_START = date(2026, 1, 1)
 VALIDATION_ENTRY_DELAY_DAYS = 0  # evaluate_backtest(use_dip_entry=False)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
+MEMBER_EXACT_GROUP_LIMIT = 720
+MEMBER_RUNTIME_BUDGET_SECONDS = 300.0
+_MEMBER_CONTROL_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class MemberIdentityControlResult:
+    status: str
+    method: str
+    requested_permutations: int
+    evaluated_permutations: int
+    permutation_group_size: int
+    exact_enumeration: bool
+    sampled_without_replacement: bool
+    p_value_resolution: float
+    max_stat_p_value: float
+    null_max_t_quantile_95: float | None
+    release_ready: bool
+    runtime_seconds: float
+    runtime_budget_seconds: float
+    family_sha256: str
+    observed_trial_id: int
+    _runner_token: object = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,15 +334,12 @@ def newey_west_tstat(alpha_series: pd.Series, lag: int) -> float:
 
 
 def permute_signal_member_labels(
-    signals_by_horizon: dict[tuple[int, float], pd.DataFrame], *, seed: int
+    signals_by_horizon: dict[tuple[int, float], pd.DataFrame],
+    *,
+    seed: int | None = None,
+    permutation: tuple[str, ...] | None = None,
 ) -> dict[tuple[int, float], pd.DataFrame]:
-    """Return a deterministic member-attribution negative-control cache.
-
-    A single bijection is used across horizons so each member's complete
-    historical outcome path is attributed to another disclosed member while
-    row order, dates, tickers, outcomes, and the member-count distribution stay
-    unchanged. The real transaction candidate universe is not mutated.
-    """
+    """Apply one full-group member-label bijection across every horizon."""
     members = sorted(
         {
             str(member)
@@ -329,15 +350,12 @@ def permute_signal_member_labels(
     )
     if len(members) < 2:
         raise ValueError("member-label permutation requires at least two members")
-    rng = np.random.default_rng(seed)
-    permuted = list(rng.permutation(members))
-    for _ in range(100):
-        if all(source != target for source, target in zip(members, permuted)):
-            break
-        permuted = list(rng.permutation(members))
-    else:
-        permuted = members[1:] + members[:1]
-    mapping = dict(zip(members, permuted))
+    if permutation is None:
+        rng = np.random.default_rng(seed)
+        permutation = tuple(str(value) for value in rng.permutation(members))
+    if len(permutation) != len(members) or set(permutation) != set(members):
+        raise ValueError("permutation must be a bijection over every member")
+    mapping = dict(zip(members, permutation))
     output: dict[tuple[int, float], pd.DataFrame] = {}
     for key, frame in signals_by_horizon.items():
         changed = frame.copy()
@@ -346,6 +364,23 @@ def permute_signal_member_labels(
         )
         output[key] = changed
     return output
+
+
+def _member_identity_permutations(
+    members: list[str], requested: int, seed: int
+) -> tuple[list[tuple[str, ...]], int, bool]:
+    """Enumerate small groups; otherwise draw a uniform unique subset."""
+    if requested < 1:
+        raise ValueError("requested member permutations must be positive")
+    group_size = math.factorial(len(members))
+    if group_size <= MEMBER_EXACT_GROUP_LIMIT or requested >= group_size:
+        return list(itertools.permutations(members)), group_size, True
+    target = requested
+    rng = np.random.default_rng(seed)
+    sampled: set[tuple[str, ...]] = set()
+    while len(sampled) < target:
+        sampled.add(tuple(str(value) for value in rng.permutation(members)))
+    return sorted(sampled), group_size, False
 
 
 def sweep_configs(
@@ -423,6 +458,22 @@ def sweep_configs(
     return frame
 
 
+def _member_family_sha256(
+    sweep_df: pd.DataFrame, series_by_trial: dict[int, pd.Series]
+) -> str:
+    digest = hashlib.sha256()
+    ordered = sweep_df.sort_values("trial_id").copy()
+    ordered = ordered.reindex(sorted(ordered.columns), axis=1)
+    digest.update(pd.util.hash_pandas_object(ordered, index=False).to_numpy().tobytes())
+    for trial_id in sorted(series_by_trial):
+        digest.update(str(trial_id).encode())
+        series = pd.Series(series_by_trial[trial_id], dtype=float).sort_index()
+        digest.update(
+            pd.util.hash_pandas_object(series, index=True).to_numpy().tobytes()
+        )
+    return digest.hexdigest()
+
+
 def select_config(
     sweep_df: pd.DataFrame,
     alpha: float = 0.05,
@@ -430,7 +481,7 @@ def select_config(
     series_by_trial: dict[int, pd.Series] | None = None,
     n_permutations: int = 999,
     permutation_seed: int = 0,
-    member_control: dict | None = None,
+    member_control: MemberIdentityControlResult | None = None,
 ) -> dict:
     """Select by bootstrap p-values and require a member-identity control."""
     if not 0 < alpha < 1:
@@ -561,30 +612,42 @@ def select_config(
         statistical_candidate["label"] = "statistical_candidate_requires_member_control"
 
     deployable = None
-    member_summary = member_control or {
-        "status": "not_required_no_statistical_candidate",
-        "release_ready": False,
-        "runtime_seconds": 0.0,
-        "required_before_deployment": True,
-    }
-    if statistical_candidate is not None:
-        mode = str(statistical_candidate.get("scoring_mode", ""))
-        identity_free = mode == "identity_free_consensus"
-        if identity_free:
-            proof = str(member_summary.get("invariance_proof_sha256", ""))
-            member_passes = bool(
-                member_summary.get("exempt")
-                and len(proof) == 64
-                and all(character in "0123456789abcdef" for character in proof.lower())
-            )
-        else:
-            member_passes = bool(
-                member_summary.get("status") == "completed"
-                and int(member_summary.get("n_permutations", 0))
-                >= MIN_RELEASE_PERMUTATIONS
-                and member_summary.get("release_ready") is True
-                and float(member_summary.get("max_stat_p_value", 1.0)) <= alpha
-            )
+    expected_family_sha256 = (
+        _member_family_sha256(sweep_df, source_series)
+        if source_series and complete_series
+        else None
+    )
+    if member_control is None:
+        member_summary = {
+            "status": "not_required_no_statistical_candidate",
+            "release_ready": False,
+            "runtime_seconds": 0.0,
+            "required_before_deployment": True,
+        }
+    elif not isinstance(member_control, MemberIdentityControlResult):
+        member_summary = {
+            "status": "invalid_non_runner_control",
+            "release_ready": False,
+            "required_before_deployment": True,
+        }
+    else:
+        member_summary = {
+            item.name: getattr(member_control, item.name)
+            for item in fields(member_control)
+            if not item.name.startswith("_")
+        }
+    if statistical_candidate is not None and isinstance(
+        member_control, MemberIdentityControlResult
+    ):
+        member_passes = bool(
+            member_control.status == "completed"
+            and member_control.release_ready
+            and member_control._runner_token is _MEMBER_CONTROL_TOKEN
+            and member_control.family_sha256 == expected_family_sha256
+            and member_control.observed_trial_id
+            == int(statistical_candidate["trial_id"])
+            and member_control.max_stat_p_value <= alpha
+        )
         if member_passes:
             deployable = dict(statistical_candidate)
             deployable["label"] = "deployable_train_survivor"
@@ -629,10 +692,13 @@ def _run_member_identity_control(
     end: date,
     *,
     observed_statistic: float,
+    observed_trial_id: int,
+    family_sha256: str,
     n_permutations: int,
     seed: int,
-) -> dict:
-    """Rerun the full family after bijective member-identity permutations."""
+    runtime_budget_seconds: float = MEMBER_RUNTIME_BUDGET_SECONDS,
+) -> MemberIdentityControlResult:
+    """Run a full-family identity null, or fail closed at the runtime budget."""
     started = time.perf_counter()
     signal_cache: dict[tuple[int, float], pd.DataFrame] = {}
     for horizon in {int(value) for value in grid["horizon"]}:
@@ -640,10 +706,27 @@ def _run_member_identity_control(
             signal_cache[(horizon, decay)] = analysis.calculate_signal_potential(
                 entry_prices, prices, [horizon], decay_lambda=decay
             )
-    null_max_statistics = np.empty(n_permutations, dtype=float)
-    for permutation_index in range(n_permutations):
+    members = sorted(
+        {
+            str(member)
+            for frame in signal_cache.values()
+            for member in frame["member"].dropna().unique()
+        }
+    )
+    if len(members) < 2:
+        raise ValueError("member-label permutation requires at least two members")
+    permutations, group_size, exact = _member_identity_permutations(
+        members, n_permutations, seed
+    )
+    null_max_statistics: list[float] = []
+    status = "completed"
+    for identity_permutation in permutations:
+        elapsed = time.perf_counter() - started
+        if elapsed >= runtime_budget_seconds:
+            status = "infeasible_runtime_budget"
+            break
         permuted = permute_signal_member_labels(
-            signal_cache, seed=seed + permutation_index
+            signal_cache, permutation=identity_permutation
         )
         null_frame = sweep_configs(
             all_tx,
@@ -655,24 +738,54 @@ def _run_member_identity_control(
             signals_by_horizon=permuted,
         )
         eligible = null_frame[null_frame["min_sample_ok"]]
-        null_max_statistics[permutation_index] = (
+        null_max_statistics.append(
             float(eligible["nw_tstat"].max()) if not eligible.empty else -math.inf
         )
-    max_stat_p = (1.0 + float(np.sum(null_max_statistics >= observed_statistic))) / (
-        n_permutations + 1.0
+    evaluated = len(null_max_statistics)
+    complete_exact = exact and evaluated == group_size
+    complete_sample = not exact and evaluated == len(permutations)
+    if evaluated == 0:
+        max_stat_p = 1.0
+        quantile = None
+    elif complete_exact:
+        exceedances = int(np.sum(np.asarray(null_max_statistics) >= observed_statistic))
+        # The identity is a group element and reproduces the observed family;
+        # finite-group resolution can therefore never be below 1 / |G|.
+        max_stat_p = float(max(1, exceedances) / group_size)
+        quantile = float(np.quantile(null_max_statistics, 0.95))
+    else:
+        max_stat_p = float(
+            (1.0 + np.sum(np.asarray(null_max_statistics) >= observed_statistic))
+            / (evaluated + 1.0)
+        )
+        quantile = float(np.quantile(null_max_statistics, 0.95))
+    release_ready = bool(
+        status == "completed"
+        and (
+            complete_exact
+            or (complete_sample and evaluated >= MIN_RELEASE_PERMUTATIONS)
+        )
     )
-    return {
-        "status": "completed",
-        "method": "bijective_member_identity_full_family_max_stat",
-        "n_permutations": n_permutations,
-        "minimum_release_permutations": MIN_RELEASE_PERMUTATIONS,
-        "seed_start": seed,
-        "max_stat_p_value": max_stat_p,
-        "null_max_t_quantile_95": float(np.quantile(null_max_statistics, 0.95)),
-        "release_ready": n_permutations >= MIN_RELEASE_PERMUTATIONS,
-        "runtime_seconds": round(time.perf_counter() - started, 3),
-        "identity_free_exemption": False,
-    }
+    return MemberIdentityControlResult(
+        status=status,
+        method="uniform_full_permutation_group_family_max_stat",
+        requested_permutations=n_permutations,
+        evaluated_permutations=evaluated,
+        permutation_group_size=group_size,
+        exact_enumeration=complete_exact,
+        sampled_without_replacement=not exact,
+        p_value_resolution=(
+            1.0 / group_size if complete_exact else 1.0 / (evaluated + 1.0)
+        ),
+        max_stat_p_value=max_stat_p,
+        null_max_t_quantile_95=quantile,
+        release_ready=release_ready,
+        runtime_seconds=round(time.perf_counter() - started, 3),
+        runtime_budget_seconds=runtime_budget_seconds,
+        family_sha256=family_sha256,
+        observed_trial_id=observed_trial_id,
+        _runner_token=_MEMBER_CONTROL_TOKEN,
+    )
 
 
 def _phase_end(
@@ -685,7 +798,15 @@ def _phase_end(
 
 
 class EvaluationAlreadyConsumedError(RuntimeError):
-    """Raised when a value snapshot/window was already reserved or evaluated."""
+    """Raised when a frozen evaluation overlaps a consumed interval."""
+
+
+class EvaluationLedgerIntegrityError(RuntimeError):
+    """Raised when the local append-only ledger hash chain is invalid."""
+
+
+def _canonical_ledger_path(db_path: Path) -> Path:
+    return db_path.resolve().parent / ".ptr-alpha-evaluation-ledger-v2.json"
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -709,6 +830,47 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _empty_ledger() -> dict:
+    return {
+        "schema_version": 2,
+        "integrity": "append_only_sha256_hash_chain",
+        "local_tamper_limitation": (
+            "A local attacker who can rewrite the ledger can recompute the chain; "
+            "external anchoring is not implemented."
+        ),
+        "events": [],
+    }
+
+
+def _validate_ledger(ledger: dict) -> None:
+    if ledger.get("schema_version") != 2 or not isinstance(ledger.get("events"), list):
+        raise EvaluationLedgerIntegrityError("unsupported or malformed ledger")
+    previous = "0" * 64
+    for sequence, event in enumerate(ledger["events"]):
+        payload = {key: value for key, value in event.items() if key != "event_sha256"}
+        if (
+            payload.get("sequence") != sequence
+            or payload.get("previous_sha256") != previous
+        ):
+            raise EvaluationLedgerIntegrityError(
+                "ledger sequence or previous hash is invalid"
+            )
+        expected = _sha256_json(payload)
+        if event.get("event_sha256") != expected:
+            raise EvaluationLedgerIntegrityError("ledger event hash is invalid")
+        previous = expected
+
+
+def _append_ledger_event(ledger: dict, event: dict) -> None:
+    previous = ledger["events"][-1]["event_sha256"] if ledger["events"] else "0" * 64
+    payload = {
+        **event,
+        "sequence": len(ledger["events"]),
+        "previous_sha256": previous,
+    }
+    ledger["events"].append({**payload, "event_sha256": _sha256_json(payload)})
+
+
 def _reserve_evaluation(
     ledger_path: Path,
     manifest: dict,
@@ -717,7 +879,7 @@ def _reserve_evaluation(
     test_start: date,
     test_end: date,
 ) -> str:
-    """Atomically reserve a value-snapshot/window before frozen evaluation."""
+    """Atomically append a reservation before a frozen evaluation."""
     import fcntl
 
     lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
@@ -727,19 +889,20 @@ def _reserve_evaluation(
         ledger = (
             json.loads(ledger_path.read_text())
             if ledger_path.exists()
-            else {"schema_version": 1, "evaluations": []}
+            else _empty_ledger()
         )
+        _validate_ledger(ledger)
+        for event in ledger["events"]:
+            if event.get("event_type") != "reservation":
+                continue
+            prior_start, prior_end = map(date.fromisoformat, event["window"])
+            if test_start <= prior_end and prior_start <= test_end:
+                raise EvaluationAlreadyConsumedError(
+                    "frozen evaluation interval overlaps a consumed reservation; "
+                    "repeats and alternate configs/grids/snapshots are refused"
+                )
         hashes = manifest["hashes"]
         window = [str(test_start), str(test_end)]
-        for record in ledger.get("evaluations", []):
-            # A holdout window stays consumed across database refreshes, value
-            # snapshots, configs, and grids. Provenance remains in the key and
-            # record, but changed inputs never reopen an observed window.
-            if record.get("window") == window:
-                raise EvaluationAlreadyConsumedError(
-                    "frozen evaluation snapshot/window already reserved; "
-                    "repeats and alternate configs/grids are refused"
-                )
         key_payload = {
             "database_sha256": hashes["database_sha256"],
             "value_snapshot_sha256": hashes["value_snapshot_sha256"],
@@ -748,17 +911,19 @@ def _reserve_evaluation(
             "window": window,
         }
         evaluation_key = _sha256_json(key_payload)
-        ledger.setdefault("evaluations", []).append(
+        _append_ledger_event(
+            ledger,
             {
+                "event_type": "reservation",
                 "evaluation_key": evaluation_key,
                 "database_sha256": hashes["database_sha256"],
                 "value_snapshot_sha256": hashes["value_snapshot_sha256"],
                 "config_sha256": _sha256_json(config),
                 "grid_sha256": _sha256_json(grid),
                 "window": window,
-                "reserved_at_utc": datetime.now(timezone.utc).isoformat(),
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
                 "status": "reserved_consumed",
-            }
+            },
         )
         _atomic_write_json(ledger_path, ledger)
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -772,11 +937,23 @@ def _complete_evaluation(ledger_path: Path, evaluation_key: str, status: str) ->
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         ledger = json.loads(ledger_path.read_text())
-        for record in ledger.get("evaluations", []):
-            if record.get("evaluation_key") == evaluation_key:
-                record["status"] = status
-                record["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
-                break
+        _validate_ledger(ledger)
+        reservations = {
+            event["evaluation_key"]
+            for event in ledger["events"]
+            if event.get("event_type") == "reservation"
+        }
+        if evaluation_key not in reservations:
+            raise EvaluationLedgerIntegrityError("completion has no reservation")
+        _append_ledger_event(
+            ledger,
+            {
+                "event_type": "completion",
+                "evaluation_key": evaluation_key,
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                "status": status,
+            },
+        )
         _atomic_write_json(ledger_path, ledger)
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -793,7 +970,6 @@ def run_validation(
     n_permutations: int = 999,
     permutation_seed: int = 0,
     member_permutations: int = 999,
-    evaluation_ledger_path: Path | None = None,
     alpha: float = 0.05,
 ) -> dict:
     """Run purged train selection and, only after survival, one test evaluation."""
@@ -841,11 +1017,7 @@ def run_validation(
             n_permutations=n_permutations,
             permutation_seed=permutation_seed,
             member_permutations=member_permutations,
-            evaluation_ledger_path=(
-                evaluation_ledger_path
-                if evaluation_ledger_path is not None
-                else db_path.parent / "validation_evaluation_ledger.json"
-            ),
+            evaluation_ledger_path=_canonical_ledger_path(db_path),
             alpha=alpha,
             out_path=out_path,
         )
@@ -899,6 +1071,10 @@ def _run_validation_with_db(
             train_start,
             train_effective_end,
             observed_statistic=float(statistical_candidate["nw_tstat"]),
+            observed_trial_id=int(statistical_candidate["trial_id"]),
+            family_sha256=_member_family_sha256(
+                train_df, train_df.attrs["series_by_trial"]
+            ),
             n_permutations=member_permutations,
             seed=permutation_seed + n_permutations,
         )
@@ -1234,8 +1410,11 @@ def _build_manifest(
         "null": {
             "bootstrap_method": "centered_moving_block_bootstrap_max_stat",
             "n_bootstrap": n_permutations,
-            "member_identity_method": "bijective_member_identity_full_family_max_stat",
-            "n_member_permutations": member_permutations,
+            "member_identity_method": "uniform_full_permutation_group_family_max_stat",
+            "requested_member_permutations": member_permutations,
+            "small_group_policy": f"exact_enumeration_at_or_below_{MEMBER_EXACT_GROUP_LIMIT}",
+            "large_group_policy": "unique_uniform_sample_without_replacement",
+            "member_runtime_budget_seconds": MEMBER_RUNTIME_BUDGET_SECONDS,
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "minimum_family_resolution_bootstrap": max(
                 MIN_RELEASE_PERMUTATIONS,
@@ -1259,6 +1438,15 @@ def _build_manifest(
             "dependency_sha256": _sha256_json(dependencies),
         },
         "git": git_state,
+        "evaluation_ledger": {
+            "path": str(_canonical_ledger_path(db_path)),
+            "integrity": "append_only_sha256_hash_chain",
+            "overlap_policy": "any_overlapping_reserved_interval_is_consumed",
+            "local_tamper_limitation": (
+                "A local attacker who can rewrite the ledger can recompute the chain; "
+                "external anchoring is not implemented."
+            ),
+        },
         "dependencies": dependencies,
         "coverage_input": {
             "transactions": len(all_tx),
@@ -1306,6 +1494,21 @@ def _code_hash() -> str:
     return digest.hexdigest()
 
 
+def _hash_untracked_path(digest: "hashlib._Hash", root: Path, path: Path) -> None:
+    paths = [path]
+    if path.is_dir() and not path.is_symlink():
+        paths = sorted(
+            candidate for candidate in path.rglob("*") if not candidate.is_dir()
+        )
+    for candidate in paths:
+        relative = str(candidate.relative_to(root))
+        digest.update(relative.encode(errors="surrogateescape"))
+        if candidate.is_symlink():
+            digest.update(os.readlink(candidate).encode(errors="surrogateescape"))
+        elif candidate.is_file():
+            digest.update(candidate.read_bytes())
+
+
 def _git_state() -> dict:
     """Return revision, dirty state, and a content hash of tracked/untracked diff."""
     root = Path(__file__).resolve().parents[2]
@@ -1338,9 +1541,7 @@ def _git_state() -> dict:
             if entry.startswith(b"?? "):
                 relative = entry[3:].decode(errors="surrogateescape")
                 path = root / relative
-                digest.update(relative.encode(errors="surrogateescape"))
-                if path.is_file():
-                    digest.update(path.read_bytes())
+                _hash_untracked_path(digest, root, path)
         return {
             "revision": revision,
             "dirty": bool(entries),

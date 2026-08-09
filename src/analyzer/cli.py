@@ -1392,7 +1392,7 @@ def validate(
     member_null_samples: int = typer.Option(
         999,
         "--member-null-samples",
-        help="Full-family member-identity permutations (release minimum: 999)",
+        help="Member-identity null draws (exact for small groups; 999 unique for large groups)",
     ),
 ):
     """

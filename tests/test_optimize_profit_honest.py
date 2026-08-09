@@ -603,6 +603,77 @@ def test_reservation_bytes_are_anchored_and_survive_ref_and_ledger_delete(tmp_pa
             main._reserve_final_consumption(lock_sha)
 
 
+def test_dangling_reservation_commit_is_found_by_git_fsck(tmp_path):
+    _init_git_repo(tmp_path)
+    lock_sha = "b" * 64
+    reservation = main._hashed_consumption_event(
+        {
+            "event": "reserved",
+            "lock_sha256": lock_sha,
+            "reservation_id": "dangling-canary",
+            "reserved_at_utc": "2026-08-09T00:00:00+00:00",
+            "git_commit_before_reservation": "canary",
+        },
+        b"",
+    )
+    raw = main._serialize_consumption_event(reservation)
+    blob = (
+        subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],
+            cwd=tmp_path,
+            input=raw,
+            check=True,
+            capture_output=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    data_tree = subprocess.run(
+        ["git", "mktree"],
+        cwd=tmp_path,
+        input=f"100644 blob {blob}\toptimize_profit_final_consumption.jsonl\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    root_tree = subprocess.run(
+        ["git", "mktree"],
+        cwd=tmp_path,
+        input=f"040000 tree {data_tree}\tdata\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    dangling_commit = subprocess.run(
+        ["git", "commit-tree", root_tree],
+        cwd=tmp_path,
+        input="unreferenced reservation canary\n",
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert (
+        subprocess.run(
+            ["git", "branch", "--contains", dangling_commit],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == ""
+    )
+
+    ledger = tmp_path / "data" / "optimize_profit_final_consumption.jsonl"
+    with (
+        patch.object(main, "_repo_root", return_value=tmp_path),
+        patch.object(main, "_canonical_consumption_ledger_path", return_value=ledger),
+    ):
+        assert main._consumption_anchor_commit(lock_sha) is None
+        assert main._repository_has_reservation_object(lock_sha) is True
+        with pytest.raises(RuntimeError, match="reservation object in Git storage"):
+            main._reserve_final_consumption(lock_sha)
+
+
 def test_coordinated_lock_and_seal_tamper_is_rejected_by_git_history(tmp_path):
     _init_git_repo(tmp_path)
     optimize = tmp_path / "optimize_profit"

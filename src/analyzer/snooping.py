@@ -39,8 +39,8 @@ def bonferroni_correction(n_tests: int, alpha: float = 0.05) -> float:
     """
     if n_tests <= 0:
         raise ValueError(f"n_tests must be positive, got {n_tests}")
-    if alpha <= 0:
-        raise ValueError(f"alpha must be positive, got {alpha}")
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be between zero and one, got {alpha}")
     return alpha / n_tests
 
 
@@ -65,8 +65,8 @@ def benjamini_hochberg(
     p = np.asarray(p_values, dtype=float)
     if p.size == 0:
         raise ValueError("p_values must not be empty")
-    if alpha <= 0:
-        raise ValueError(f"alpha must be positive, got {alpha}")
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be between zero and one, got {alpha}")
 
     n = len(p)
     # Sort p-values and track original indices
@@ -91,15 +91,17 @@ def benjamini_hochberg(
 
 
 @dataclass(frozen=True, slots=True)
-class MaxStatPermutationResult:
-    """Dependence-preserving one-sided max-stat permutation output."""
+class MaxStatBootstrapResult:
+    """Centered moving-block bootstrap output for a family of strategies."""
 
+    marginal_p_values: np.ndarray
     adjusted_p_values: np.ndarray
     observed_statistics: np.ndarray
+    null_statistics: np.ndarray
     null_max_statistics: np.ndarray
-    n_permutations: int
-    block_days: int
+    n_bootstrap: int
     seed: int
+    assumptions: tuple[str, ...]
 
 
 def _hac_tstat(values: np.ndarray, lag: int) -> float:
@@ -130,96 +132,98 @@ def _hac_tstat(values: np.ndarray, lag: int) -> float:
     return float(mean / standard_error)
 
 
-def max_stat_block_permutation(
+def max_stat_moving_block_bootstrap(
     series_by_trial: dict[int, pd.Series],
     lags_by_trial: dict[int, int],
+    block_lengths_by_trial: dict[int, int],
     *,
-    n_permutations: int,
-    block_days: int,
+    n_bootstrap: int,
     seed: int,
-) -> MaxStatPermutationResult:
-    """Compute one-sided max-stat p-values with synchronized calendar blocks.
+) -> MaxStatBootstrapResult:
+    """Centered one-sided moving-block bootstrap with a family max statistic.
 
-    One random sign is applied to every observation in a calendar block and to
-    every configuration that has an observation in that block. This preserves
-    serial dependence inside blocks and cross-configuration dependence. The
-    returned p-values include the standard +1 finite-permutation correction.
+    Each trial is centered under its zero-mean null. Shared block-start uniforms
+    are used across trials, preserving local serial order and cross-trial
+    dependence for aligned schedules. Configurations with different frequencies
+    use the same uniforms mapped to their own ordinal schedule. Bonferroni remains
+    the arbitrary-dependence gate; max-stat is an additional empirical gate.
+
+    The bootstrap is refused unless each series contains at least two complete
+    blocks. This prevents an asymptotic p-value from replacing inadequate null
+    support.
     """
     if not series_by_trial:
         raise ValueError("series_by_trial must not be empty")
-    if n_permutations < 1:
-        raise ValueError("n_permutations must be positive")
-    if block_days < 1:
-        raise ValueError("block_days must be positive")
-
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be positive")
     trial_ids = sorted(series_by_trial)
-    normalized: dict[int, pd.Series] = {}
-    all_dates: list[pd.Timestamp] = []
-    for trial_id in trial_ids:
-        series = pd.Series(series_by_trial[trial_id], dtype=float).dropna().sort_index()
-        series.index = pd.DatetimeIndex(series.index)
-        normalized[trial_id] = series
-        all_dates.extend(pd.Timestamp(value) for value in series.index)
-    if not all_dates:
-        raise ValueError("permutation series contain no observations")
-
-    origin = min(all_dates).normalize()
-    block_ids_by_trial = {
-        trial_id: np.asarray(
-            [
-                int((pd.Timestamp(value).normalize() - origin).days // block_days)
-                for value in series.index
-            ],
-            dtype=int,
+    expected = set(trial_ids)
+    if set(lags_by_trial) != expected or set(block_lengths_by_trial) != expected:
+        raise ValueError(
+            "lags and block lengths must match every actual trial_id exactly"
         )
-        for trial_id, series in normalized.items()
-    }
-    block_ids = sorted(
-        {int(block) for blocks in block_ids_by_trial.values() for block in blocks}
-    )
-    block_position = {block: position for position, block in enumerate(block_ids)}
 
-    observed = np.asarray(
-        [
-            _hac_tstat(normalized[trial_id].to_numpy(), lags_by_trial.get(trial_id, 0))
-            for trial_id in trial_ids
-        ],
-        dtype=float,
-    )
+    centered: dict[int, np.ndarray] = {}
+    observed = np.empty(len(trial_ids), dtype=float)
+    blocks_needed = 0
+    for position, trial_id in enumerate(trial_ids):
+        values = pd.Series(series_by_trial[trial_id], dtype=float).dropna().to_numpy()
+        block_length = int(block_lengths_by_trial[trial_id])
+        if block_length < 1:
+            raise ValueError("block lengths must be positive")
+        if len(values) < 2 * block_length:
+            raise ValueError(
+                f"trial {trial_id} has {len(values)} observations; "
+                f"at least {2 * block_length} are required for two blocks"
+            )
+        centered[trial_id] = values - float(values.mean())
+        observed[position] = _hac_tstat(values, lags_by_trial[trial_id])
+        blocks_needed = max(blocks_needed, math.ceil(len(values) / block_length))
+
     rng = np.random.default_rng(seed)
-    null_max = np.empty(n_permutations, dtype=float)
-    for permutation in range(n_permutations):
-        signs = rng.choice(np.asarray([-1.0, 1.0]), size=len(block_ids))
-        maximum = -math.inf
-        for trial_id in trial_ids:
-            trial_signs = np.asarray(
-                [
-                    signs[block_position[int(block)]]
-                    for block in block_ids_by_trial[trial_id]
-                ],
-                dtype=float,
+    shared_uniforms = rng.random((n_bootstrap, blocks_needed))
+    null_statistics = np.empty((n_bootstrap, len(trial_ids)), dtype=float)
+    for bootstrap_index in range(n_bootstrap):
+        for position, trial_id in enumerate(trial_ids):
+            values = centered[trial_id]
+            block_length = int(block_lengths_by_trial[trial_id])
+            n_starts = len(values) - block_length + 1
+            n_blocks = math.ceil(len(values) / block_length)
+            samples = []
+            for uniform in shared_uniforms[bootstrap_index, :n_blocks]:
+                start = min(int(uniform * n_starts), n_starts - 1)
+                samples.append(values[start : start + block_length])
+            bootstrap_values = np.concatenate(samples)[: len(values)]
+            null_statistics[bootstrap_index, position] = _hac_tstat(
+                bootstrap_values, lags_by_trial[trial_id]
             )
-            statistic = _hac_tstat(
-                normalized[trial_id].to_numpy() * trial_signs,
-                lags_by_trial.get(trial_id, 0),
-            )
-            maximum = max(maximum, statistic)
-        null_max[permutation] = maximum
-
+    null_max = np.max(null_statistics, axis=1)
+    marginal = np.asarray(
+        [
+            (1.0 + float(np.sum(null_statistics[:, position] >= statistic)))
+            / (n_bootstrap + 1.0)
+            for position, statistic in enumerate(observed)
+        ]
+    )
     adjusted = np.asarray(
         [
-            (1.0 + float(np.sum(null_max >= statistic))) / (n_permutations + 1.0)
+            (1.0 + float(np.sum(null_max >= statistic))) / (n_bootstrap + 1.0)
             for statistic in observed
-        ],
-        dtype=float,
+        ]
     )
-    return MaxStatPermutationResult(
+    return MaxStatBootstrapResult(
+        marginal_p_values=marginal,
         adjusted_p_values=adjusted,
         observed_statistics=observed,
+        null_statistics=null_statistics,
         null_max_statistics=null_max,
-        n_permutations=n_permutations,
-        block_days=block_days,
+        n_bootstrap=n_bootstrap,
         seed=seed,
+        assumptions=(
+            "per-date net-alpha series is locally stationary within moving blocks",
+            "ordinal schedules with different frequencies share dependence through block-start uniforms",
+            "Bonferroni is the controlling arbitrary-dependence gate",
+        ),
     )
 
 
@@ -410,7 +414,7 @@ class SnoopingReport:
     min_years: float
     max_stat_p_value: float = 1.0
     deployable: bool = False
-    inference_method: str = "return_series_bonferroni_max_stat"
+    inference_method: str = "centered_moving_block_bootstrap_bonferroni_max_stat"
 
     @property
     def significant_bonferroni_any(self) -> bool:
@@ -424,24 +428,45 @@ def analyze_snooping(
     n_tests: int | None = None,
     alpha: float = 0.05,
     *,
-    per_date_returns: pd.Series | dict[int, pd.Series] | None = None,
+    per_date_returns: dict[int, pd.Series] | None = None,
     lags_by_trial: dict[int, int] | None = None,
+    block_lengths_by_trial: dict[int, int] | None = None,
     n_permutations: int = 999,
-    block_days: int = 90,
     seed: int = 0,
 ) -> SnoopingReport:
-    """Analyze one requested configuration from its actual return series.
+    """Analyze one requested configuration from a complete family of returns.
 
-    The former implementation inferred a within-strategy standard error from
-    cross-configuration summary rows. That inference is invalid and is now
-    refused. Callers must supply per-date net-alpha returns. Bonferroni controls
-    family-wise error under arbitrary dependence; synchronized block max-stat
-    permutations provide a second dependence-aware gate.
+    Every family row must carry a unique ``trial_id`` and callers must provide
+    exactly one return series, lag, and block length for each actual ID. Summary
+    rows, lone series, positional guesses, missing IDs, and extra IDs are
+    refused. All rewarded p-values come from the centered moving-block bootstrap.
     """
-    if per_date_returns is None:
-        raise ValueError("per_date_returns is required for coherent snooping inference")
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
     if sweep_results.empty:
         raise ValueError("sweep_results must not be empty")
+    if "trial_id" not in sweep_results.columns:
+        raise ValueError("sweep_results must contain actual trial_id values")
+    trial_ids = [int(value) for value in sweep_results["trial_id"]]
+    if len(set(trial_ids)) != len(trial_ids):
+        raise ValueError("trial_id values must be unique")
+    actual_ids = set(trial_ids)
+    if not isinstance(per_date_returns, dict) or set(per_date_returns) != actual_ids:
+        raise ValueError(
+            "per_date_returns must be a complete dict keyed by actual trial_id"
+        )
+    if not isinstance(lags_by_trial, dict) or set(lags_by_trial) != actual_ids:
+        raise ValueError("lags_by_trial must match every actual trial_id exactly")
+    if (
+        not isinstance(block_lengths_by_trial, dict)
+        or set(block_lengths_by_trial) != actual_ids
+    ):
+        raise ValueError(
+            "block_lengths_by_trial must match every actual trial_id exactly"
+        )
+    trials = len(sweep_results)
+    if n_tests is not None and int(n_tests) != trials:
+        raise ValueError("n_tests must equal the complete supplied family size")
 
     if best_config is None:
         row_position = int(
@@ -458,43 +483,28 @@ def analyze_snooping(
             raise ValueError(f"No matching config found for {best_config}")
         row_position = int(positions[0])
     row = sweep_results.iloc[row_position]
+    selected_trial_id = int(row["trial_id"])
 
-    if isinstance(per_date_returns, dict):
-        series_by_trial = {
+    bootstrap = max_stat_moving_block_bootstrap(
+        {
             int(key): pd.Series(value, dtype=float)
             for key, value in per_date_returns.items()
-        }
-        selected_series = series_by_trial.get(row_position)
-        if selected_series is None:
-            raise ValueError("per_date_returns has no series for the requested config")
-    else:
-        selected_series = pd.Series(per_date_returns, dtype=float)
-        series_by_trial = {row_position: selected_series}
-
-    trials = int(n_tests if n_tests is not None else len(sweep_results))
-    if trials < len(sweep_results):
-        raise ValueError("n_tests cannot be smaller than the sweep result count")
-    lags = dict(lags_by_trial or {})
-    lag = int(lags.get(row_position, 0))
-    statistic = _hac_tstat(selected_series.dropna().to_numpy(), lag)
-    raw_p = (
-        float(stats.norm.sf(statistic))
-        if math.isfinite(statistic)
-        else (0.0 if statistic > 0 else 1.0)
-    )
-    bonferroni_threshold = bonferroni_correction(trials, alpha)
-    significant_bonferroni = raw_p <= bonferroni_threshold
-
-    max_stat = max_stat_block_permutation(
-        series_by_trial,
-        {trial_id: int(lags.get(trial_id, 0)) for trial_id in series_by_trial},
-        n_permutations=n_permutations,
-        block_days=block_days,
+        },
+        {int(key): int(value) for key, value in lags_by_trial.items()},
+        {int(key): int(value) for key, value in block_lengths_by_trial.items()},
+        n_bootstrap=n_permutations,
         seed=seed,
     )
-    trial_ids = sorted(series_by_trial)
-    selected_permutation_position = trial_ids.index(row_position)
-    max_stat_p = float(max_stat.adjusted_p_values[selected_permutation_position])
+    ordered_ids = sorted(actual_ids)
+    selected_position = ordered_ids.index(selected_trial_id)
+    statistic = float(bootstrap.observed_statistics[selected_position])
+    bootstrap_p = float(bootstrap.marginal_p_values[selected_position])
+    max_stat_p = float(bootstrap.adjusted_p_values[selected_position])
+    bonferroni_threshold = bonferroni_correction(trials, alpha)
+    significant_bonferroni = bootstrap_p <= bonferroni_threshold
+    selected_series = pd.Series(
+        per_date_returns[selected_trial_id], dtype=float
+    ).dropna()
     release_ready = n_permutations >= 999
     deployable = bool(
         release_ready
@@ -503,7 +513,7 @@ def analyze_snooping(
         and max_stat_p <= alpha
     )
 
-    clean = selected_series.dropna().to_numpy(dtype=float)
+    clean = selected_series.to_numpy(dtype=float)
     observed_sharpe = float(row.get("sharpe", 0.0))
     skew = float(stats.skew(clean, bias=False)) if len(clean) > 2 else 0.0
     kurtosis = (
@@ -518,7 +528,6 @@ def analyze_snooping(
         skew=skew if math.isfinite(skew) else 0.0,
         kurtosis=kurtosis if math.isfinite(kurtosis) else 3.0,
     )
-
     return SnoopingReport(
         n_tests=trials,
         alpha_slope=float(row.get("alpha_slope", 0.0)),
@@ -527,9 +536,9 @@ def analyze_snooping(
         n_observations=len(clean),
         dates_evaluated=len(clean),
         t_statistic=statistic,
-        p_value_raw=raw_p,
+        p_value_raw=bootstrap_p,
         bonferroni_threshold=bonferroni_threshold,
-        p_value_bonferroni=min(raw_p * trials, 1.0),
+        p_value_bonferroni=min(bootstrap_p * trials, 1.0),
         significant_bonferroni=significant_bonferroni,
         bh_rejected=False,
         bh_adjusted_alpha=bonferroni_threshold,

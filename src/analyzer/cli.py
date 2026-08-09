@@ -1384,16 +1384,28 @@ def validate(
         False, "--full-grid", help="Use full 1296-combo grid (slow)"
     ),
     data_dir: str = typer.Option("data", help="Data directory"),
+    null_samples: int = typer.Option(
+        999,
+        "--null-samples",
+        help="Centered moving-block bootstrap samples (release minimum: 999)",
+    ),
+    member_null_samples: int = typer.Option(
+        999,
+        "--member-null-samples",
+        help="Full-family member-identity permutations (release minimum: 999)",
+    ),
 ):
     """
-    Honest time-split validation with snooping corrections.
+    Purged retrospective validation with dependence-safe corrections.
 
-    Sweeps parameter configurations on the TRAINING window only, applies
-    Benjamini-Hochberg / Bonferroni corrections for multiple comparisons,
-    then evaluates the selected config exactly once on the TEST window.
+    Sweeps configurations on the purged training phase, then requires both
+    Bonferroni and centered moving-block max-stat bootstrap survival plus a
+    full-family member-identity negative control. Fewer than 999 null samples
+    fail closed. The 2024-2025 test phase is previously used retrospective data,
+    not fresh out-of-sample evidence. The post-2025 final phase stays locked.
 
-    Uses Newey-West HAC t-stats to correct for overlapping return windows.
-    Results are written to <data-dir>/validation_results.json.
+    Results are written to <data-dir>/validation_results.json and any frozen
+    evaluation is atomically consumed in the evaluation ledger.
     """
     from analyzer.validation import run_validation
 
@@ -1443,6 +1455,10 @@ def validate(
             "scoring_mode": ["shrunk_alpha", "consistency"],
         }
 
+    if null_samples < 1 or member_null_samples < 1:
+        print("Error: null sample counts must be positive", file=sys.stderr)
+        raise typer.Exit(1)
+
     n_trials = 1
     for v in grid.values():
         n_trials *= len(v)
@@ -1465,6 +1481,8 @@ def validate(
             test_end=ve,
             grid=grid,
             out_path=out_path,
+            n_permutations=null_samples,
+            member_permutations=member_null_samples,
         )
     except Exception:
         logger.exception("Validation failed")

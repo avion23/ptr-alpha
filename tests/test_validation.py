@@ -14,9 +14,13 @@ from analyzer.validation import (
     LOCKED_FINAL_START,
     MIN_RELEASE_PERMUTATIONS,
     PRIMARY_METRIC,
+    EvaluationAlreadyConsumedError,
     _backtest_core,
     _build_manifest,
+    _complete_evaluation,
     _phase_end,
+    _reserve_evaluation,
+    _run_member_identity_control,
     newey_west_tstat,
     permute_signal_member_labels,
     run_validation,
@@ -89,7 +93,6 @@ class TestCorrectedSelection:
             _selection_frame(null),
             series_by_trial=null,
             n_permutations=MIN_RELEASE_PERMUTATIONS,
-            block_days=5,
         )
         assert result["deployable_config"] is None
         assert result["n_survivors"] == 0
@@ -101,11 +104,10 @@ class TestCorrectedSelection:
             _selection_frame(strong),
             series_by_trial=strong,
             n_permutations=99,
-            block_days=1,
         )
         assert result["deployable_config"] is None
-        assert result["failure_reason"] == "insufficient_null_permutations"
-        assert result["permutation"]["release_ready"] is False
+        assert result["failure_reason"] == "insufficient_bootstrap_count"
+        assert result["bootstrap"]["release_ready"] is False
 
     def test_missing_or_incomplete_null_series_fails_closed(self):
         series = {0: _series(np.ones(30)), 1: _series(np.ones(30))}
@@ -114,8 +116,8 @@ class TestCorrectedSelection:
         incomplete = select_config(
             frame, series_by_trial={0: series[0]}, n_permutations=999
         )
-        assert missing["failure_reason"] == "missing_null_series"
-        assert incomplete["failure_reason"] == "incomplete_null_series"
+        assert missing["failure_reason"] == "missing_bootstrap_series"
+        assert incomplete["failure_reason"] == "incomplete_bootstrap_series"
         assert missing["deployable_config"] is None
         assert incomplete["deployable_config"] is None
 
@@ -131,7 +133,12 @@ class TestCorrectedSelection:
             series_by_trial=series,
             n_permutations=999,
             permutation_seed=7,
-            block_days=1,
+            member_control={
+                "status": "completed",
+                "n_permutations": 999,
+                "release_ready": True,
+                "max_stat_p_value": 0.001,
+            },
         )
         assert result["deployable_config"] is not None
         assert result["deployable_config"]["trial_id"] == 0
@@ -145,7 +152,6 @@ class TestCorrectedSelection:
             series_by_trial=null,
             n_permutations=999,
             permutation_seed=11,
-            block_days=5,
         )
         assert result["n_survivors"] == 0
         assert result["deployable_config"] is None
@@ -157,11 +163,89 @@ class TestCorrectedSelection:
         result = select_config(
             frame,
             series_by_trial=null,
-            n_permutations=999,
-            block_days=10,
+            n_permutations=9990,
         )
         assert result["deployable_config"] is None
         assert result["descriptive_best"]["label"] == "descriptive_only_not_deployable"
+
+
+class TestMemberIdentityGate:
+    def test_statistical_candidate_cannot_deploy_without_member_control(self):
+        rng = np.random.default_rng(41)
+        series = {0: _series(2.0 + rng.normal(0, 0.1, 180))}
+        result = select_config(
+            _selection_frame(series),
+            series_by_trial=series,
+            n_permutations=999,
+        )
+        assert result["statistical_candidate"] is not None
+        assert result["deployable_config"] is None
+        assert result["failure_reason"] == "member_identity_control_required_or_failed"
+
+    def test_member_control_below_release_count_fails_closed(self):
+        rng = np.random.default_rng(42)
+        series = {0: _series(2.0 + rng.normal(0, 0.1, 180))}
+        result = select_config(
+            _selection_frame(series),
+            series_by_trial=series,
+            n_permutations=999,
+            member_control={
+                "status": "completed",
+                "n_permutations": 998,
+                "release_ready": False,
+                "max_stat_p_value": 0.001,
+            },
+        )
+        assert result["deployable_config"] is None
+        assert result["member_identity_control"]["n_permutations"] == 998
+
+    def test_production_member_control_runs_full_family_and_records_runtime(
+        self, monkeypatch
+    ):
+        signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.calculate_signal_potential",
+            lambda *args, **kwargs: signal,
+        )
+        calls = []
+
+        def fake_sweep(*args, **kwargs):
+            calls.append(kwargs["signals_by_horizon"])
+            return pd.DataFrame(
+                [{"min_sample_ok": True, "nw_tstat": float(len(calls))}]
+            )
+
+        monkeypatch.setattr("analyzer.validation.sweep_configs", fake_sweep)
+        result = _run_member_identity_control(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {
+                "horizon": [60],
+                "decay_lambda": [0.005],
+                "frequency_days": [30],
+            },
+            date(2022, 1, 1),
+            date(2023, 1, 1),
+            observed_statistic=2.5,
+            n_permutations=3,
+            seed=10,
+        )
+        assert len(calls) == 3
+        assert result["status"] == "completed"
+        assert result["n_permutations"] == 3
+        assert result["release_ready"] is False
+        assert result["runtime_seconds"] >= 0
+
+    def test_short_series_cannot_fall_back_to_asymptotic_reward(self):
+        short = {0: _series([2.0, 2.1, 1.9])}
+        frame = _selection_frame(short)
+        frame["horizon"] = 120
+        frame["frequency_days"] = 30  # block length four; needs eight observations
+        result = select_config(frame, series_by_trial=short, n_permutations=999)
+        assert result["deployable_config"] is None
+        assert result["failure_reason"] == "bootstrap_sample_too_small"
+        assert "at least 8" in result["bootstrap"]["error"]
 
 
 class TestExecutionSupport:
@@ -267,7 +351,10 @@ class TestPurgeAndManifest:
             {"x": [1, 2]}, index=pd.date_range("2024-01-01", periods=2)
         )
         monkeypatch.setattr("analyzer.validation._code_hash", lambda: "c" * 64)
-        monkeypatch.setattr("analyzer.validation._git_revision", lambda: "git-known")
+        monkeypatch.setattr(
+            "analyzer.validation._git_state",
+            lambda: {"revision": "git-known", "dirty": False, "diff_sha256": "d" * 64},
+        )
         manifest = _build_manifest(
             database,
             frame,
@@ -283,17 +370,26 @@ class TestPurgeAndManifest:
             60,
             999,
             7,
+            999,
             0.05,
         )
         assert manifest["phases"]["locked_final"] == {
             "start": "2026-01-01",
             "end": None,
-            "status": "locked_not_loaded_not_evaluated",
+            "status": "locked_not_queried_or_evaluated",
+            "value_rows_queried": False,
+            "whole_database_file_hashed_for_provenance": True,
             "consumed": False,
         }
         assert manifest["phases"]["train"]["outcomes_end_by"] == "2023-12-31"
+        assert (
+            manifest["phases"]["test"]["evidence_class"]
+            == "retrospective_previously_used_not_fresh_oos"
+        )
         assert manifest["hashes"]["code_sha256"] == "c" * 64
         assert manifest["hashes"]["git_revision"] == "git-known"
+        assert manifest["hashes"]["git_diff_sha256"] == "d" * 64
+        assert manifest["git"]["dirty"] is False
         for key in [
             "database_sha256",
             "value_snapshot_sha256",
@@ -302,6 +398,42 @@ class TestPurgeAndManifest:
         ]:
             assert len(manifest["hashes"][key]) == 64
         assert manifest["n_trials"] == 1
+
+
+class TestEvaluationConsumptionLedger:
+    def test_reservation_is_durable_and_refuses_repeat_or_alternate_grid(
+        self, tmp_path
+    ):
+        ledger = tmp_path / "ledger.json"
+        manifest = {
+            "hashes": {
+                "database_sha256": "a" * 64,
+                "value_snapshot_sha256": "b" * 64,
+            }
+        }
+        first = _reserve_evaluation(
+            ledger,
+            manifest,
+            {"horizon": 60},
+            {"horizon": [60]},
+            date(2024, 1, 1),
+            date(2025, 6, 30),
+        )
+        assert ledger.exists()
+        payload = __import__("json").loads(ledger.read_text())
+        assert payload["evaluations"][0]["status"] == "reserved_consumed"
+        with pytest.raises(EvaluationAlreadyConsumedError, match="alternate"):
+            _reserve_evaluation(
+                ledger,
+                manifest,
+                {"horizon": 90},
+                {"horizon": [90]},
+                date(2024, 1, 1),
+                date(2025, 6, 30),
+            )
+        _complete_evaluation(ledger, first, "completed_retrospective")
+        payload = __import__("json").loads(ledger.read_text())
+        assert payload["evaluations"][0]["status"] == "completed_retrospective"
 
 
 class TestMemberPermutationCanary:
@@ -321,9 +453,12 @@ class TestMemberPermutationCanary:
         permuted = permute_signal_member_labels(original, seed=3)
         assert sorted(permuted[(60, 0.005)]["member"].value_counts()) == [1, 1, 2]
         assert permuted[(60, 0.005)]["outcome"].tolist() == [1.0, 2.0, 3.0, 4.0]
-        assert (
-            permuted[(60, 0.005)]["member"].tolist()
-            != original[(60, 0.005)]["member"].tolist()
+        assert all(
+            changed != source
+            for changed, source in zip(
+                permuted[(60, 0.005)]["member"],
+                original[(60, 0.005)]["member"],
+            )
         )
         assert original[(60, 0.005)]["member"].tolist() == ["A", "A", "B", "C"]
 

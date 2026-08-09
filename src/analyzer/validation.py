@@ -16,6 +16,11 @@ import json
 import logging
 import math
 import platform
+import os
+import shutil
+import subprocess
+import tempfile
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from importlib import metadata
@@ -28,7 +33,7 @@ from scipy import stats
 from analyzer import analysis
 from analyzer.exceptions import AnalysisError
 from analyzer.pipeline import BacktestParams
-from analyzer.snooping import bonferroni_correction, max_stat_block_permutation
+from analyzer.snooping import bonferroni_correction, max_stat_moving_block_bootstrap
 
 logger = logging.getLogger(__name__)
 
@@ -326,8 +331,12 @@ def permute_signal_member_labels(
         raise ValueError("member-label permutation requires at least two members")
     rng = np.random.default_rng(seed)
     permuted = list(rng.permutation(members))
-    if all(source == target for source, target in zip(members, permuted)):
-        permuted = permuted[1:] + permuted[:1]
+    for _ in range(100):
+        if all(source != target for source, target in zip(members, permuted)):
+            break
+        permuted = list(rng.permutation(members))
+    else:
+        permuted = members[1:] + members[:1]
     mapping = dict(zip(members, permuted))
     output: dict[tuple[int, float], pd.DataFrame] = {}
     for key, frame in signals_by_horizon.items():
@@ -402,7 +411,7 @@ def sweep_configs(
         row["primary_metric"] = PRIMARY_METRIC
         row["nw_lag"] = lag
         row["nw_tstat"] = statistic
-        row["p_value"] = p_value
+        row["asymptotic_p_value_descriptive"] = p_value
         row["min_sample_ok"] = bool(
             result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
             and result.total_recs >= MIN_RECS_FOR_CANDIDACY
@@ -421,15 +430,28 @@ def select_config(
     series_by_trial: dict[int, pd.Series] | None = None,
     n_permutations: int = 999,
     permutation_seed: int = 0,
-    block_days: int = 90,
+    member_control: dict | None = None,
 ) -> dict:
-    """Select by the corrected primary metric or return no deployable config."""
+    """Select by bootstrap p-values and require a member-identity control."""
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
     if sweep_df.empty:
         raise ValueError("sweep_df must not be empty")
-    required = {"overall_alpha", "overall_return", "p_value", "nw_tstat"}
+    required = {
+        "trial_id",
+        "overall_alpha",
+        "overall_return",
+        "nw_tstat",
+        "nw_lag",
+        "horizon",
+        "frequency_days",
+        "scoring_mode",
+    }
     missing = required - set(sweep_df.columns)
     if missing:
         raise ValueError(f"sweep_df missing required columns: {sorted(missing)}")
+    if sweep_df["trial_id"].duplicated().any():
+        raise ValueError("trial_id values must be unique")
 
     working = sweep_df.copy()
     n_trials = len(working)
@@ -440,57 +462,76 @@ def select_config(
         else np.ones(n_trials, dtype=bool)
     )
     source_series = series_by_trial or sweep_df.attrs.get("series_by_trial")
-    expected_trial_ids = {
-        int(row.get("trial_id", position)) for position, row in working.iterrows()
-    }
+    expected_trial_ids = {int(value) for value in working["trial_id"]}
     supplied_trial_ids = {int(key) for key in source_series} if source_series else set()
-    complete_null_series = expected_trial_ids == supplied_trial_ids
+    complete_series = expected_trial_ids == supplied_trial_ids
+    bootstrap_p = np.ones(n_trials, dtype=float)
     max_stat_p = np.ones(n_trials, dtype=float)
-    null_ready = complete_null_series and n_permutations >= MIN_RELEASE_PERMUTATIONS
-    permutation_summary: dict = {
-        "method": "synchronized_calendar_block_sign_max_stat",
-        "n_permutations": int(n_permutations),
-        "minimum_release_permutations": MIN_RELEASE_PERMUTATIONS,
-        "block_days": int(block_days),
+    bootstrap_error = None
+    bootstrap_summary: dict = {
+        "method": "centered_moving_block_bootstrap_max_stat",
+        "n_bootstrap": int(n_permutations),
+        "minimum_release_bootstrap": MIN_RELEASE_PERMUTATIONS,
         "seed": int(permutation_seed),
-        "release_ready": null_ready,
+        "centered_null": True,
+        "release_ready": False,
     }
-    if source_series and complete_null_series:
-        normalized = {int(key): value for key, value in source_series.items()}
-        lags = {
-            int(row.get("trial_id", position)): int(row.get("nw_lag", 0))
-            for position, row in working.iterrows()
+    if source_series and complete_series:
+        normalized = {
+            int(key): pd.Series(value, dtype=float)
+            for key, value in source_series.items()
         }
-        permutation = max_stat_block_permutation(
-            normalized,
-            lags,
-            n_permutations=n_permutations,
-            block_days=block_days,
-            seed=permutation_seed,
-        )
-        trial_ids = sorted(normalized)
-        adjusted_by_trial = dict(zip(trial_ids, permutation.adjusted_p_values))
-        max_stat_p = np.asarray(
-            [
-                float(adjusted_by_trial.get(int(row.get("trial_id", position)), 1.0))
-                for position, row in working.iterrows()
-            ]
-        )
-        permutation_summary["null_max_t_quantile_95"] = float(
-            np.quantile(permutation.null_max_statistics, 0.95)
-        )
+        lags = {
+            int(row["trial_id"]): int(row["nw_lag"]) for _, row in working.iterrows()
+        }
+        block_lengths = {
+            int(row["trial_id"]): max(
+                1, math.ceil(int(row["horizon"]) / int(row["frequency_days"]))
+            )
+            for _, row in working.iterrows()
+        }
+        try:
+            bootstrap = max_stat_moving_block_bootstrap(
+                normalized,
+                lags,
+                block_lengths,
+                n_bootstrap=n_permutations,
+                seed=permutation_seed,
+            )
+            ordered = sorted(normalized)
+            marginal_by_trial = dict(zip(ordered, bootstrap.marginal_p_values))
+            adjusted_by_trial = dict(zip(ordered, bootstrap.adjusted_p_values))
+            bootstrap_p = np.asarray(
+                [float(marginal_by_trial[int(value)]) for value in working["trial_id"]]
+            )
+            max_stat_p = np.asarray(
+                [float(adjusted_by_trial[int(value)]) for value in working["trial_id"]]
+            )
+            bootstrap_summary.update(
+                release_ready=n_permutations >= MIN_RELEASE_PERMUTATIONS,
+                null_max_t_quantile_95=float(
+                    np.quantile(bootstrap.null_max_statistics, 0.95)
+                ),
+                assumptions=list(bootstrap.assumptions),
+            )
+        except ValueError as exc:
+            bootstrap_error = str(exc)
+            bootstrap_summary["error"] = bootstrap_error
 
-    working["bonferroni_p_value"] = np.minimum(
-        pd.to_numeric(working["p_value"], errors="coerce").fillna(1.0) * n_trials,
-        1.0,
+    bootstrap_ready = bool(
+        complete_series
+        and bootstrap_error is None
+        and n_permutations >= MIN_RELEASE_PERMUTATIONS
     )
+    working["bootstrap_p_value"] = bootstrap_p
+    working["bonferroni_p_value"] = np.minimum(bootstrap_p * n_trials, 1.0)
     working["max_stat_p_value"] = max_stat_p
-    survivor = (
+    statistical_survivor = (
         candidate
-        & null_ready
+        & bootstrap_ready
         & (working["overall_alpha"].to_numpy(dtype=float) > 0)
         & (working["overall_return"].to_numpy(dtype=float) > 0)
-        & (working["p_value"].to_numpy(dtype=float) <= bonferroni_threshold)
+        & (bootstrap_p <= bonferroni_threshold)
         & (max_stat_p <= alpha)
     )
     valid_positions = np.flatnonzero(candidate)
@@ -506,37 +547,125 @@ def select_config(
     descriptive = working.iloc[descriptive_position].to_dict()
     descriptive["label"] = "descriptive_only_not_deployable"
 
-    survivor_positions = np.flatnonzero(survivor)
-    deployable = None
+    survivor_positions = np.flatnonzero(statistical_survivor)
+    statistical_candidate = None
     if len(survivor_positions):
-        survivor_frame = working.iloc[survivor_positions]
-        order = survivor_frame.sort_values(
+        order = working.iloc[survivor_positions].sort_values(
             ["overall_alpha", "nw_tstat"], ascending=False
         )
-        deployable = order.iloc[0].to_dict()
-        deployable["label"] = "deployable_train_survivor"
+        statistical_candidate = order.iloc[0].to_dict()
+        statistical_candidate["label"] = "statistical_candidate_requires_member_control"
+
+    deployable = None
+    member_summary = member_control or {
+        "status": "not_run",
+        "release_ready": False,
+    }
+    if statistical_candidate is not None:
+        mode = str(statistical_candidate.get("scoring_mode", ""))
+        identity_free = mode == "identity_free_consensus"
+        if identity_free:
+            proof = str(member_summary.get("invariance_proof_sha256", ""))
+            member_passes = bool(
+                member_summary.get("exempt")
+                and len(proof) == 64
+                and all(character in "0123456789abcdef" for character in proof.lower())
+            )
+        else:
+            member_passes = bool(
+                member_summary.get("status") == "completed"
+                and int(member_summary.get("n_permutations", 0))
+                >= MIN_RELEASE_PERMUTATIONS
+                and member_summary.get("release_ready") is True
+                and float(member_summary.get("max_stat_p_value", 1.0)) <= alpha
+            )
+        if member_passes:
+            deployable = dict(statistical_candidate)
+            deployable["label"] = "deployable_train_survivor"
 
     if not source_series:
-        reason = "missing_null_series"
-    elif not complete_null_series:
-        reason = "incomplete_null_series"
+        reason = "missing_bootstrap_series"
+    elif not complete_series:
+        reason = "incomplete_bootstrap_series"
+    elif bootstrap_error is not None:
+        reason = "bootstrap_sample_too_small"
     elif n_permutations < MIN_RELEASE_PERMUTATIONS:
-        reason = "insufficient_null_permutations"
-    elif deployable is None:
+        reason = "insufficient_bootstrap_count"
+    elif statistical_candidate is None:
         reason = "no_dependence_safe_survivor"
+    elif deployable is None:
+        reason = "member_identity_control_required_or_failed"
     else:
         reason = None
     return {
         "deployable_config": deployable,
+        "statistical_candidate": statistical_candidate,
         "descriptive_best": descriptive,
         "failure_reason": reason,
         "primary_metric": PRIMARY_METRIC,
         "n_trials": n_trials,
         "n_min_sample_candidates": int(candidate.sum()),
-        "n_survivors": int(survivor.sum()),
+        "n_statistical_survivors": int(statistical_survivor.sum()),
+        "n_survivors": 1 if deployable is not None else 0,
         "bonferroni_threshold": bonferroni_threshold,
         "alpha": alpha,
-        "permutation": permutation_summary,
+        "bootstrap": bootstrap_summary,
+        "member_identity_control": member_summary,
+    }
+
+
+def _run_member_identity_control(
+    all_tx: pd.DataFrame,
+    prices: pd.DataFrame,
+    entry_prices: pd.DataFrame,
+    grid: dict,
+    start: date,
+    end: date,
+    *,
+    observed_statistic: float,
+    n_permutations: int,
+    seed: int,
+) -> dict:
+    """Rerun the full family after bijective member-identity permutations."""
+    started = time.perf_counter()
+    signal_cache: dict[tuple[int, float], pd.DataFrame] = {}
+    for horizon in {int(value) for value in grid["horizon"]}:
+        for decay in {float(value) for value in grid["decay_lambda"]}:
+            signal_cache[(horizon, decay)] = analysis.calculate_signal_potential(
+                entry_prices, prices, [horizon], decay_lambda=decay
+            )
+    null_max_statistics = np.empty(n_permutations, dtype=float)
+    for permutation_index in range(n_permutations):
+        permuted = permute_signal_member_labels(
+            signal_cache, seed=seed + permutation_index
+        )
+        null_frame = sweep_configs(
+            all_tx,
+            prices,
+            entry_prices,
+            grid,
+            start,
+            end,
+            signals_by_horizon=permuted,
+        )
+        eligible = null_frame[null_frame["min_sample_ok"]]
+        null_max_statistics[permutation_index] = (
+            float(eligible["nw_tstat"].max()) if not eligible.empty else -math.inf
+        )
+    max_stat_p = (1.0 + float(np.sum(null_max_statistics >= observed_statistic))) / (
+        n_permutations + 1.0
+    )
+    return {
+        "status": "completed",
+        "method": "bijective_member_identity_full_family_max_stat",
+        "n_permutations": n_permutations,
+        "minimum_release_permutations": MIN_RELEASE_PERMUTATIONS,
+        "seed_start": seed,
+        "max_stat_p_value": max_stat_p,
+        "null_max_t_quantile_95": float(np.quantile(null_max_statistics, 0.95)),
+        "release_ready": n_permutations >= MIN_RELEASE_PERMUTATIONS,
+        "runtime_seconds": round(time.perf_counter() - started, 3),
+        "identity_free_exemption": False,
     }
 
 
@@ -547,6 +676,101 @@ def _phase_end(
         pd.Timestamp(boundary_end)
         - pd.Timedelta(days=max_holding_days + max_entry_delay_days)
     ).date()
+
+
+class EvaluationAlreadyConsumedError(RuntimeError):
+    """Raised when a value snapshot/window was already reserved or evaluated."""
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _reserve_evaluation(
+    ledger_path: Path,
+    manifest: dict,
+    config: dict,
+    grid: dict,
+    test_start: date,
+    test_end: date,
+) -> str:
+    """Atomically reserve a value-snapshot/window before frozen evaluation."""
+    import fcntl
+
+    lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        ledger = (
+            json.loads(ledger_path.read_text())
+            if ledger_path.exists()
+            else {"schema_version": 1, "evaluations": []}
+        )
+        hashes = manifest["hashes"]
+        window = [str(test_start), str(test_end)]
+        for record in ledger.get("evaluations", []):
+            same_snapshot_window = (
+                record.get("database_sha256") == hashes["database_sha256"]
+                and record.get("value_snapshot_sha256")
+                == hashes["value_snapshot_sha256"]
+                and record.get("window") == window
+            )
+            if same_snapshot_window:
+                raise EvaluationAlreadyConsumedError(
+                    "frozen evaluation snapshot/window already reserved; "
+                    "repeats and alternate configs/grids are refused"
+                )
+        key_payload = {
+            "database_sha256": hashes["database_sha256"],
+            "value_snapshot_sha256": hashes["value_snapshot_sha256"],
+            "config": config,
+            "grid": grid,
+            "window": window,
+        }
+        evaluation_key = _sha256_json(key_payload)
+        ledger.setdefault("evaluations", []).append(
+            {
+                "evaluation_key": evaluation_key,
+                "database_sha256": hashes["database_sha256"],
+                "value_snapshot_sha256": hashes["value_snapshot_sha256"],
+                "config_sha256": _sha256_json(config),
+                "grid_sha256": _sha256_json(grid),
+                "window": window,
+                "reserved_at_utc": datetime.now(timezone.utc).isoformat(),
+                "status": "reserved_consumed",
+            }
+        )
+        _atomic_write_json(ledger_path, ledger)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return evaluation_key
+
+
+def _complete_evaluation(ledger_path: Path, evaluation_key: str, status: str) -> None:
+    import fcntl
+
+    lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        ledger = json.loads(ledger_path.read_text())
+        for record in ledger.get("evaluations", []):
+            if record.get("evaluation_key") == evaluation_key:
+                record["status"] = status
+                record["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+                break
+        _atomic_write_json(ledger_path, ledger)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def run_validation(
@@ -560,9 +784,15 @@ def run_validation(
     out_path: Path | None = None,
     n_permutations: int = 999,
     permutation_seed: int = 0,
+    member_permutations: int = 999,
+    evaluation_ledger_path: Path | None = None,
     alpha: float = 0.05,
 ) -> dict:
     """Run purged train selection and, only after survival, one test evaluation."""
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between zero and one")
+    if n_permutations < 1 or member_permutations < 1:
+        raise ValueError("bootstrap and member permutation counts must be positive")
     if train_end < train_start or test_end < test_start:
         raise ValueError("validation window end must be on or after its start")
     if test_start <= train_end:
@@ -602,6 +832,12 @@ def run_validation(
             max_holding=max_holding,
             n_permutations=n_permutations,
             permutation_seed=permutation_seed,
+            member_permutations=member_permutations,
+            evaluation_ledger_path=(
+                evaluation_ledger_path
+                if evaluation_ledger_path is not None
+                else db_path.parent / "validation_evaluation_ledger.json"
+            ),
             alpha=alpha,
             out_path=out_path,
         )
@@ -623,6 +859,8 @@ def _run_validation_with_db(
     max_holding: int,
     n_permutations: int,
     permutation_seed: int,
+    member_permutations: int,
+    evaluation_ledger_path: Path,
     alpha: float,
     out_path: Path | None,
 ) -> dict:
@@ -642,8 +880,27 @@ def _run_validation_with_db(
         alpha,
         n_permutations=n_permutations,
         permutation_seed=permutation_seed,
-        block_days=max_holding,
     )
+    statistical_candidate = selection["statistical_candidate"]
+    if statistical_candidate is not None:
+        member_control = _run_member_identity_control(
+            all_tx,
+            prices,
+            entry_prices,
+            grid,
+            train_start,
+            train_effective_end,
+            observed_statistic=float(statistical_candidate["nw_tstat"]),
+            n_permutations=member_permutations,
+            seed=permutation_seed + n_permutations,
+        )
+        selection = select_config(
+            train_df,
+            alpha,
+            n_permutations=n_permutations,
+            permutation_seed=permutation_seed,
+            member_control=member_control,
+        )
     manifest = _build_manifest(
         db_path,
         all_tx,
@@ -659,6 +916,7 @@ def _run_validation_with_db(
         max_holding,
         n_permutations,
         permutation_seed,
+        member_permutations,
         alpha,
     )
     output = {
@@ -670,7 +928,12 @@ def _run_validation_with_db(
             {
                 key: value
                 for key, value in selection.items()
-                if key not in {"deployable_config", "descriptive_best"}
+                if key
+                not in {
+                    "deployable_config",
+                    "statistical_candidate",
+                    "descriptive_best",
+                }
             }
         ),
         "train": _metrics_from_row(selection["descriptive_best"], "descriptive_only"),
@@ -689,41 +952,79 @@ def _run_validation_with_db(
             [int(config["horizon"])],
             decay_lambda=float(config["decay_lambda"]),
         )
-        train_result, train_series = _run_frozen(
+        train_result, _ = _run_frozen(
             all_tx, prices, signals, config, train_start, train_effective_end
         )
-        test_result, test_series = _run_frozen(
-            all_tx, prices, signals, config, test_start, test_effective_end
+        evaluation_key = _reserve_evaluation(
+            evaluation_ledger_path, manifest, config, grid, test_start, test_end
         )
-        lag = max(
-            0,
-            math.ceil(int(config["horizon"]) / int(config["frequency_days"])) - 1,
-        )
-        train_t, train_p = _statistic_and_p(train_series, lag)
-        test_t, test_p = _statistic_and_p(test_series, lag)
-        test_passes = bool(
-            test_result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
-            and test_result.total_recs >= MIN_RECS_FOR_CANDIDACY
-            and test_result.overall_alpha > 0
-            and test_result.overall_return > 0
-            and test_p <= alpha
-        )
-        output.update(
-            status="validated" if test_passes else "failed_out_of_sample",
-            selected_config=_json_safe(config),
-            train=_window_metrics(
-                train_result, train_t, train_p, "corrected_train_survivor"
-            ),
-            test=_window_metrics(
-                test_result, test_t, test_p, "single_frozen_out_of_sample"
-            ),
-            degradation_ratio=(
-                round(test_result.overall_alpha / train_result.overall_alpha, 4)
-                if train_result.overall_alpha
-                else None
-            ),
-            verdict="robust" if test_passes else "not_robust",
-        )
+        try:
+            test_result, test_series = _run_frozen(
+                all_tx, prices, signals, config, test_start, test_effective_end
+            )
+            lag = max(
+                0,
+                math.ceil(int(config["horizon"]) / int(config["frequency_days"])) - 1,
+            )
+            block_length = max(
+                1, math.ceil(int(config["horizon"]) / int(config["frequency_days"]))
+            )
+            test_t, test_p, test_bootstrap_error = _bootstrap_statistic_and_p(
+                test_series,
+                lag,
+                block_length,
+                n_permutations,
+                permutation_seed + 2 * n_permutations + member_permutations,
+            )
+            test_passes = bool(
+                test_bootstrap_error is None
+                and test_result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
+                and test_result.total_recs >= MIN_RECS_FOR_CANDIDACY
+                and test_result.overall_alpha > 0
+                and test_result.overall_return > 0
+                and test_p <= alpha
+            )
+            output.update(
+                status=(
+                    "retrospective_positive_result"
+                    if test_passes
+                    else "retrospective_failed_result"
+                ),
+                selected_config=_json_safe(config),
+                train=_window_metrics(
+                    train_result,
+                    float(selected["nw_tstat"]),
+                    float(selected["bootstrap_p_value"]),
+                    "corrected_train_survivor",
+                ),
+                test=_window_metrics(
+                    test_result,
+                    test_t,
+                    test_p,
+                    "retrospective_previously_used_not_fresh_oos",
+                ),
+                degradation_ratio=(
+                    round(test_result.overall_alpha / train_result.overall_alpha, 4)
+                    if train_result.overall_alpha
+                    else None
+                ),
+                verdict="not_fresh_oos_evidence",
+                evaluation_ledger={
+                    "path": str(evaluation_ledger_path),
+                    "evaluation_key": evaluation_key,
+                    "status": "consumed_retrospective",
+                },
+            )
+            if test_bootstrap_error is not None:
+                output["test"]["bootstrap_error"] = test_bootstrap_error
+            _complete_evaluation(
+                evaluation_ledger_path, evaluation_key, "completed_retrospective"
+            )
+        except Exception:
+            _complete_evaluation(
+                evaluation_ledger_path, evaluation_key, "failed_consumed"
+            )
+            raise
 
     _print_summary(output)
     if out_path is not None:
@@ -769,14 +1070,28 @@ def _config_from_row(row: dict) -> dict:
     return {key: row[key] for key in keys if key in row}
 
 
-def _statistic_and_p(series: pd.Series, lag: int) -> tuple[float, float]:
-    statistic = newey_west_tstat(series, lag)
-    p_value = (
-        float(stats.norm.sf(statistic))
-        if math.isfinite(statistic)
-        else (0.0 if statistic > 0 else 1.0)
+def _bootstrap_statistic_and_p(
+    series: pd.Series,
+    lag: int,
+    block_length: int,
+    n_bootstrap: int,
+    seed: int,
+) -> tuple[float, float, str | None]:
+    try:
+        result = max_stat_moving_block_bootstrap(
+            {0: series},
+            {0: lag},
+            {0: block_length},
+            n_bootstrap=n_bootstrap,
+            seed=seed,
+        )
+    except ValueError as exc:
+        return newey_west_tstat(series, lag), 1.0, str(exc)
+    return (
+        float(result.observed_statistics[0]),
+        float(result.marginal_p_values[0]),
+        None,
     )
-    return statistic, p_value
 
 
 def _window_metrics(
@@ -815,7 +1130,7 @@ def _metrics_from_row(row: dict, label: str) -> dict:
         "mean_strategy_return": float(row.get("overall_return", 0.0)),
         "mean_spy_return": float(row.get("overall_spy_return", 0.0)),
         "nw_tstat": _finite_or_none(row.get("nw_tstat")),
-        "nw_pval": float(row.get("p_value", 1.0)),
+        "nw_pval": float(row.get("bootstrap_p_value", 1.0)),
         "label": "not_selected_for_deployment",
     }
 
@@ -859,6 +1174,7 @@ def _build_manifest(
     max_holding: int,
     n_permutations: int,
     permutation_seed: int,
+    member_permutations: int,
     alpha: float,
 ) -> dict:
     config_payload = {
@@ -866,6 +1182,7 @@ def _build_manifest(
         "alpha": alpha,
         "n_permutations": n_permutations,
         "permutation_seed": permutation_seed,
+        "member_permutations": member_permutations,
         "primary_metric": PRIMARY_METRIC,
         "max_holding_days": max_holding,
         "max_entry_delay_days": VALIDATION_ENTRY_DELAY_DAYS,
@@ -875,6 +1192,7 @@ def _build_manifest(
         for name in ["numpy", "pandas", "scipy", "duckdb"]
     }
     dependencies["python"] = platform.python_version()
+    git_state = _git_state()
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "phases": {
@@ -887,11 +1205,14 @@ def _build_manifest(
                 "boundary": [str(test_start), str(test_end)],
                 "executable_as_of": [str(test_start), str(test_effective_end)],
                 "outcomes_end_by": str(test_end),
+                "evidence_class": "retrospective_previously_used_not_fresh_oos",
             },
             "locked_final": {
                 "start": str(LOCKED_FINAL_START),
                 "end": None,
-                "status": "locked_not_loaded_not_evaluated",
+                "status": "locked_not_queried_or_evaluated",
+                "value_rows_queried": False,
+                "whole_database_file_hashed_for_provenance": True,
                 "consumed": False,
             },
         },
@@ -903,19 +1224,28 @@ def _build_manifest(
         "trial_grid": _json_safe(grid),
         "n_trials": int(math.prod(len(values) for values in grid.values())),
         "null": {
-            "method": "synchronized_calendar_block_sign_max_stat",
-            "n_permutations": n_permutations,
-            "minimum_release_permutations": MIN_RELEASE_PERMUTATIONS,
+            "bootstrap_method": "centered_moving_block_bootstrap_max_stat",
+            "n_bootstrap": n_permutations,
+            "member_identity_method": "bijective_member_identity_full_family_max_stat",
+            "n_member_permutations": member_permutations,
+            "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "seed": permutation_seed,
+            "assumptions": [
+                "local stationarity within moving blocks",
+                "shared block-start uniforms preserve aligned cross-config dependence",
+                "Bonferroni is the arbitrary-dependence controlling gate",
+            ],
         },
         "hashes": {
             "database_sha256": _sha256_file(db_path),
             "value_snapshot_sha256": _value_snapshot_hash(all_tx, prices, entry_prices),
             "code_sha256": _code_hash(),
             "config_sha256": _sha256_json(config_payload),
-            "git_revision": _git_revision(),
+            "git_revision": git_state["revision"],
+            "git_diff_sha256": git_state["diff_sha256"],
             "dependency_sha256": _sha256_json(dependencies),
         },
+        "git": git_state,
         "dependencies": dependencies,
         "coverage_input": {
             "transactions": len(all_tx),
@@ -963,37 +1293,48 @@ def _code_hash() -> str:
     return digest.hexdigest()
 
 
-def _git_revision() -> str:
-    """Read the worktree Git revision without invoking a subprocess."""
+def _git_state() -> dict:
+    """Return revision, dirty state, and a content hash of tracked/untracked diff."""
     root = Path(__file__).resolve().parents[2]
-    dot_git = root / ".git"
+    git = shutil.which("git")
+    if git is None:
+        return {"revision": "unavailable", "dirty": None, "diff_sha256": "unavailable"}
     try:
-        if dot_git.is_file():
-            git_dir = Path(dot_git.read_text().split(":", 1)[1].strip())
-        else:
-            git_dir = dot_git
-        common_dir_file = git_dir / "commondir"
-        common_dir = (
-            (git_dir / common_dir_file.read_text().strip()).resolve()
-            if common_dir_file.exists()
-            else git_dir
-        )
-        head = (git_dir / "HEAD").read_text().strip()
-        if not head.startswith("ref: "):
-            return head
-        reference = head.removeprefix("ref: ")
-        loose = common_dir / reference
-        if loose.exists():
-            return loose.read_text().strip()
-        packed = common_dir / "packed-refs"
-        for line in packed.read_text().splitlines():
-            if line and not line.startswith(("#", "^")):
-                revision, name = line.split(" ", 1)
-                if name == reference:
-                    return revision
-    except (OSError, IndexError, ValueError):
-        return "unavailable"
-    return "unavailable"
+        revision = subprocess.run(  # nosec B603
+            [git, "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(  # nosec B603
+            [git, "status", "--porcelain", "-z"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        ).stdout
+        diff = subprocess.run(  # nosec B603
+            [git, "diff", "--binary", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        ).stdout
+        digest = hashlib.sha256(diff)
+        entries = [entry for entry in status.split(b"\0") if entry]
+        for entry in sorted(entries):
+            if entry.startswith(b"?? "):
+                relative = entry[3:].decode(errors="surrogateescape")
+                path = root / relative
+                digest.update(relative.encode(errors="surrogateescape"))
+                if path.is_file():
+                    digest.update(path.read_bytes())
+        return {
+            "revision": revision,
+            "dirty": bool(entries),
+            "diff_sha256": digest.hexdigest(),
+        }
+    except (OSError, subprocess.CalledProcessError):
+        return {"revision": "unavailable", "dirty": None, "diff_sha256": "unavailable"}
 
 
 def _sha256_json(value) -> str:

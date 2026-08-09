@@ -82,6 +82,7 @@ def test_database_adds_nullable_cross_source_columns_without_backfill(tmp_path):
     expected_columns = {
         "chamber",
         "source_record_id",
+        "source_row_id",
         "official_filing_date",
         "available_date",
         "notification_date",
@@ -491,6 +492,44 @@ class TestTransactions(DatabaseTestCase):
         ).fetchone()[0]
         self.assertEqual(count, 2)
 
+    def test_source_row_id_preserves_distinct_repeated_lots(self):
+        base = {
+            "doc_id": "repeated-lots",
+            "member": "Jane Doe",
+            "ticker": "AAPL",
+            "transaction_date": date(2024, 4, 1),
+            "disclosure_date": date(2024, 4, 5),
+            "transaction_type": "Purchase",
+            "amount_raw": "$1,001 - $15,000",
+            "asset_description": "Apple Inc",
+            "chamber": "house",
+            "source_record_id": "repeated-lots",
+            "ingestion_generation": "generation-1",
+        }
+        rows = pd.DataFrame(
+            [
+                {**base, "source_row_id": "document-order:000001"},
+                {**base, "source_row_id": "document-order:000002"},
+            ]
+        )
+
+        self.db.upsert_transactions(rows, source="house_pdf")
+        self.db.upsert_transactions(rows, source="house_pdf")
+
+        stored = self.db.conn.execute(
+            """
+            SELECT source_row_id FROM transactions
+            WHERE doc_id = 'repeated-lots' ORDER BY source_row_id
+            """
+        ).fetchall()
+        self.assertEqual(
+            stored,
+            [
+                ("document-order:000001",),
+                ("document-order:000002",),
+            ],
+        )
+
     def test_count_transactions_for_docs_returns_counts_by_doc_id(self):
         df = pd.DataFrame(
             [
@@ -539,6 +578,7 @@ class TestTransactions(DatabaseTestCase):
         fields = {
             "chamber": "house",
             "source_record_id": "20035035",
+            "source_row_id": "official-row-7",
             "official_filing_date": date(2026, 8, 5),
             "available_date": date(2026, 8, 6),
             "notification_date": date(2026, 8, 7),

@@ -142,6 +142,7 @@ class Database:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 chamber VARCHAR,
                 source_record_id VARCHAR,
+                source_row_id VARCHAR,
                 official_filing_date DATE,
                 available_date DATE,
                 notification_date DATE,
@@ -165,6 +166,7 @@ class Database:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_source_row_unique "
             "ON transactions(source, chamber, source_record_id, source_row_id, ingestion_generation)"
         )
+
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_year ON transactions(EXTRACT(YEAR FROM disclosure_date))"
         )

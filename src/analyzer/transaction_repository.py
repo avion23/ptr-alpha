@@ -317,6 +317,7 @@ class TransactionRepository:
             "asset_description",
             "chamber",
             "source_record_id",
+            "source_row_id",
             "official_filing_date",
             "available_date",
             "notification_date",
@@ -335,6 +336,7 @@ class TransactionRepository:
         df["created_at"] = datetime.now()
         df["source"] = source
         df = _normalize_frame(df, deduplicate=True)
+
 
         if df.empty:
             return 0

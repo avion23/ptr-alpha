@@ -5,6 +5,7 @@ import duckdb
 import pandas as pd
 
 from analyzer.database import Database
+from analyzer.senate_efd import SenateEFDSource
 from analyzer.transaction_repository import SOURCE_TRANSACTION_COLUMNS
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
 from .conftest import DatabaseTestCase
@@ -1277,6 +1278,11 @@ class TestSourceReports(DatabaseTestCase):
             ].tolist(),
             ["11111111-1111-4111-8111-111111111111"],
         )
+        senate_rows = SenateEFDSource(
+            data_dir=self.tmp_dir, db=self.db
+        ).get_transactions(2026)
+        self.assertEqual(len(senate_rows), 1)
+        self.assertEqual(set(senate_rows["source"]), {"senate_efd"})
 
     def test_persist_source_refresh_retains_all_zero_transaction_reports(self):
         reports = pd.DataFrame(
@@ -1500,6 +1506,24 @@ class TestSourceReports(DatabaseTestCase):
 
     def test_ticker_origin_matrix_rejects_every_inconsistent_shape(self):
         bad_rows = [
+            {
+                "ticker_origin": "official",
+                "ticker": "AAPL",
+                "ticker_candidate": None,
+                "raw_ticker": None,
+            },
+            {
+                "ticker_origin": "official",
+                "ticker": "AAPL",
+                "ticker_candidate": None,
+                "raw_ticker": "MSFT",
+            },
+            {
+                "ticker_origin": "asset_description",
+                "ticker": "JPM",
+                "ticker_candidate": None,
+                "raw_ticker": None,
+            },
             {"ticker_origin": "official", "ticker": "AAPL", "ticker_candidate": "AAPL"},
             {"ticker_origin": "official", "ticker": "AAPL1", "ticker_candidate": None},
             {
@@ -1599,6 +1623,78 @@ class TestSourceReports(DatabaseTestCase):
         ).fetchone()[0]
         self.assertEqual(index_count, 0)
 
+    def test_source_report_source_column_migrates_and_backfills(self):
+        self.db.close()
+        self.db_path.unlink()
+        conn = duckdb.connect(str(self.db_path))
+        conn.execute("""
+            CREATE TABLE source_reports (
+                ingestion_generation VARCHAR NOT NULL,
+                chamber VARCHAR NOT NULL,
+                source_record_id VARCHAR NOT NULL,
+                report_path VARCHAR,
+                member VARCHAR,
+                official_filing_date DATE,
+                outcome VARCHAR NOT NULL,
+                artifact_sha256 VARCHAR,
+                landing_sha256 VARCHAR,
+                paper_artifact_url VARCHAR,
+                paper_artifact_sha256 VARCHAR,
+                error_message VARCHAR,
+                raw_row_count INTEGER NOT NULL,
+                accepted_row_count INTEGER NOT NULL,
+                rejected_row_count INTEGER NOT NULL,
+                UNIQUE (ingestion_generation, chamber, source_record_id)
+            )
+        """)
+        conn.execute(
+            """
+            INSERT INTO source_reports VALUES (
+                'legacy-gen', 'senate', 'record-1', '/record-1', 'Member',
+                '2026-08-01', 'parsed', ?, ?, NULL, NULL, NULL, 1, 1, 0
+            )
+            """,
+            ["a" * 64, "a" * 64],
+        )
+        conn.close()
+
+        self.db = Database(self.db_path)
+        source_info = next(
+            row
+            for row in self.db.conn.execute(
+                "PRAGMA table_info('source_reports')"
+            ).fetchall()
+            if row[1] == "source"
+        )
+        self.assertTrue(source_info[3])
+        migrated = self.db.get_source_reports("legacy-gen", "legacy", "senate")
+        self.assertEqual(migrated["source"].tolist(), ["legacy"])
+
+        new_source = self.reports(
+            (
+                "legacy-gen",
+                "senate",
+                "record-1",
+                "/record-1",
+                "Member",
+                date(2026, 8, 1),
+                "parsed",
+                "a" * 64,
+                "a" * 64,
+                None,
+                None,
+                None,
+                1,
+                1,
+                0,
+            )
+        )
+        self.db.replace_source_reports("legacy-gen", "senate_efd", "senate", new_source)
+        self.assertEqual(
+            self.db.conn.execute("SELECT COUNT(*) FROM source_reports").fetchone()[0],
+            2,
+        )
+
     def test_unverified_ticker_candidate_is_not_canonical(self):
         reports = pd.DataFrame(
             [
@@ -1626,7 +1722,7 @@ class TestSourceReports(DatabaseTestCase):
             [
                 self.transaction(
                     ticker=None,
-                    raw_ticker="BRK/B",
+                    raw_ticker="--",
                     ticker_candidate="BRK.B",
                     ticker_origin="unverified",
                 )
@@ -1647,7 +1743,7 @@ class TestSourceReports(DatabaseTestCase):
         stored = self.db.conn.execute(
             "SELECT ticker, raw_ticker, ticker_candidate FROM transactions"
         ).fetchone()
-        self.assertEqual(stored, (None, "BRK/B", "BRK.B"))
+        self.assertEqual(stored, (None, "--", "BRK.B"))
 
         with self.assertRaisesRegex(ValueError, "unverified ticker origin"):
             self.db.persist_source_refresh(

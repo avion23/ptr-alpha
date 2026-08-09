@@ -66,12 +66,12 @@ class HouseTransactionSource(TransactionSource):
         return False
 
     def get_transactions(self, year: int) -> pd.DataFrame:
-        if not self.db.transactions_exist(year):
+        if not self.db.transactions_exist(year, source="house_pdf"):
             raise DataSourceError(
                 f"No cached data found for {year}. Run 'ptr-alpha parse --year {year}' first."
             )
 
-        df = self.db.get_transactions(year)
+        df = self.db.get_transactions(year, source="house_pdf")
         logger.info(f"Loaded {len(df)} cached transactions for {year}")
         return df
 

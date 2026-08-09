@@ -193,6 +193,65 @@ class Database:
                 )
             )
         """)
+        source_columns = {
+            row[1]
+            for row in self.conn.execute(
+                "PRAGMA table_info('source_reports')"
+            ).fetchall()
+        }
+        if "source" not in source_columns:
+            self._migrate_source_reports_source_identity()
+
+    def _migrate_source_reports_source_identity(self) -> None:
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute("ALTER TABLE source_reports ADD COLUMN source VARCHAR")
+            self.conn.execute(
+                "UPDATE source_reports SET source = 'legacy' WHERE source IS NULL"
+            )
+            self.conn.execute("""
+                CREATE TABLE source_reports_with_source (
+                    ingestion_generation VARCHAR NOT NULL,
+                    source VARCHAR NOT NULL,
+                    chamber VARCHAR NOT NULL,
+                    source_record_id VARCHAR NOT NULL,
+                    report_path VARCHAR,
+                    member VARCHAR,
+                    official_filing_date DATE,
+                    outcome VARCHAR NOT NULL CHECK (
+                        outcome IN ('parsed', 'paper_only', 'unavailable', 'failed')
+                    ),
+                    artifact_sha256 VARCHAR,
+                    landing_sha256 VARCHAR,
+                    paper_artifact_url VARCHAR,
+                    paper_artifact_sha256 VARCHAR,
+                    error_message VARCHAR,
+                    raw_row_count INTEGER NOT NULL,
+                    accepted_row_count INTEGER NOT NULL,
+                    rejected_row_count INTEGER NOT NULL,
+                    UNIQUE (
+                        ingestion_generation, source, chamber, source_record_id
+                    )
+                )
+            """)
+            self.conn.execute("""
+                INSERT INTO source_reports_with_source
+                SELECT
+                    ingestion_generation, source, chamber, source_record_id,
+                    report_path, member, official_filing_date, outcome,
+                    artifact_sha256, landing_sha256, paper_artifact_url,
+                    paper_artifact_sha256, error_message, raw_row_count,
+                    accepted_row_count, rejected_row_count
+                FROM source_reports
+            """)
+            self.conn.execute("DROP TABLE source_reports")
+            self.conn.execute(
+                "ALTER TABLE source_reports_with_source RENAME TO source_reports"
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def _ensure_transaction_columns(self) -> None:
         existing_columns = {
@@ -291,13 +350,17 @@ class Database:
             self.conn.execute("ROLLBACK")
             raise
 
-    def get_transactions(self, year: int) -> pd.DataFrame:
-        return self.transactions.get_by_year(year)
+    def get_transactions(self, year: int, *, source: str | None = None) -> pd.DataFrame:
+        return self.transactions.get_by_year(year, source=source)
 
     def get_transactions_by_date_range(
-        self, start_date: date, end_date: date
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        source: str | None = None,
     ) -> pd.DataFrame:
-        return self.transactions.get_by_date_range(start_date, end_date)
+        return self.transactions.get_by_date_range(start_date, end_date, source=source)
 
     def delete_transactions_for_doc(self, doc_id: str) -> None:
         self.transactions.delete_for_doc(doc_id)
@@ -308,8 +371,8 @@ class Database:
     def count_transactions_for_docs(self, doc_ids: list[str]) -> dict[str, int]:
         return self.transactions.count_for_docs(doc_ids)
 
-    def transactions_exist(self, year: int) -> bool:
-        return self.transactions.exists(year)
+    def transactions_exist(self, year: int, *, source: str | None = None) -> bool:
+        return self.transactions.exists(year, source=source)
 
     def upsert_prices(self, df: pd.DataFrame) -> None:
         self.prices.upsert(df)
@@ -638,16 +701,32 @@ class Database:
             ticker = row.ticker
             candidate = row.ticker_candidate
             origin = row.ticker_origin
+            raw_ticker = (
+                row.raw_ticker.strip().upper()
+                if isinstance(row.raw_ticker, str) and row.raw_ticker.strip()
+                else None
+            )
             if origin not in allowed_origins:
                 raise ValueError(f"unknown ticker_origin: {origin}")
             if origin == "official":
-                if not is_valid(ticker) or not is_null(candidate):
-                    raise ValueError("official ticker origin has inconsistent values")
+                if (
+                    not is_valid(ticker)
+                    or not is_null(candidate)
+                    or raw_ticker != ticker
+                ):
+                    raise ValueError(
+                        "official ticker origin has inconsistent raw values"
+                    )
                 continue
             if origin == "asset_description":
-                if not is_valid(ticker) or ticker in reserved or not is_null(candidate):
+                if (
+                    not is_valid(ticker)
+                    or ticker in reserved
+                    or not is_null(candidate)
+                    or raw_ticker != "--"
+                ):
                     raise ValueError(
-                        "asset_description ticker origin has inconsistent values"
+                        "asset_description ticker origin has inconsistent raw values"
                     )
                 continue
             if origin == "unverified":
@@ -655,13 +734,20 @@ class Database:
                     not is_null(ticker)
                     or not is_valid(candidate)
                     or candidate in reserved
+                    or raw_ticker not in {None, "--"}
                 ):
-                    raise ValueError("unverified ticker origin has inconsistent values")
+                    raise ValueError(
+                        "unverified ticker origin has inconsistent raw values"
+                    )
                 continue
             if origin in {"non_equity", "missing"}:
-                if not is_null(ticker) or not is_null(candidate):
+                if (
+                    not is_null(ticker)
+                    or not is_null(candidate)
+                    or raw_ticker not in {None, "--"}
+                ):
                     raise ValueError(
-                        f"{origin} ticker origin must not set ticker values"
+                        f"{origin} ticker origin has inconsistent raw values"
                     )
                 continue
 
@@ -674,15 +760,16 @@ class Database:
             ):
                 raise ValueError("invalid ticker origin has a valid ticker candidate")
             if is_null(candidate):
-                raw_ticker = row.raw_ticker
                 if (
-                    not isinstance(raw_ticker, str)
-                    or not raw_ticker.strip()
+                    raw_ticker is None
+                    or raw_ticker == "--"
                     or (is_valid(raw_ticker) and raw_ticker not in reserved)
                 ):
                     raise ValueError(
                         "invalid ticker origin requires a rejected raw ticker"
                     )
+            elif raw_ticker not in {None, "--"}:
+                raise ValueError("invalid inferred candidate contradicts raw_ticker")
 
     # -- lifecycle ------------------------------------------------------------
 

@@ -70,7 +70,7 @@ class CapitolTradesSource(TransactionSource):
 
     def get_transactions(self, year: int) -> pd.DataFrame:
         """TransactionSource interface — returns transactions for a given year."""
-        df = self.db.get_transactions(year)
+        df = self.db.get_transactions(year, source="capitol_trades")
         if df.empty:
             raise CapitolTradesError(
                 f"No cached Capitol Trades data for {year}. "

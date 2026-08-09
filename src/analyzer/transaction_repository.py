@@ -50,15 +50,20 @@ class TransactionRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.conn = conn
 
-    def get_by_year(self, year: int) -> pd.DataFrame:
+    def get_by_year(self, year: int, *, source: str | None = None) -> pd.DataFrame:
+        source_clause = " AND source = ?" if source is not None else ""
+        params: list[object] = [year]
+        if source is not None:
+            params.append(source)
         excluded = self.conn.execute(
-            """
+            f"""
             SELECT COUNT(*) FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND transaction_date IS NOT NULL
               AND transaction_date > disclosure_date
-            """,
-            [year],
+              {source_clause}
+            """,  # nosec B608 -- source_clause is a fixed internal fragment
+            params,
         ).fetchone()[0]
         if excluded > 0:
             logger.debug(
@@ -67,29 +72,40 @@ class TransactionRepository:
                 excluded,
                 year,
             )
-        result = self.conn.execute(
-            """
+        return self.conn.execute(
+            f"""
             SELECT member, ticker, transaction_date, disclosure_date, available_date,
                    transaction_type, owner_code, amount_raw, amount_midpoint,
                    instrument_type, strike_price, expiry_date, source, chamber
             FROM transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
+              {source_clause}
             ORDER BY disclosure_date DESC
-        """,
-            [year],
+            """,  # nosec B608 -- source_clause is a fixed internal fragment
+            params,
         ).fetchdf()
-        return result
 
-    def get_by_date_range(self, start_date: date, end_date: date) -> pd.DataFrame:
+    def get_by_date_range(
+        self,
+        start_date: date,
+        end_date: date,
+        *,
+        source: str | None = None,
+    ) -> pd.DataFrame:
+        source_clause = " AND source = ?" if source is not None else ""
+        params: list[object] = [start_date, end_date]
+        if source is not None:
+            params.append(source)
         excluded = self.conn.execute(
-            """
+            f"""
             SELECT COUNT(*) FROM transactions
             WHERE disclosure_date BETWEEN ? AND ?
               AND transaction_date IS NOT NULL
               AND transaction_date > disclosure_date
-            """,
-            [start_date, end_date],
+              {source_clause}
+            """,  # nosec B608 -- source_clause is a fixed internal fragment
+            params,
         ).fetchone()[0]
         if excluded > 0:
             logger.debug(
@@ -99,19 +115,19 @@ class TransactionRepository:
                 start_date,
                 end_date,
             )
-        result = self.conn.execute(
-            """
+        return self.conn.execute(
+            f"""
             SELECT member, ticker, transaction_date, disclosure_date, available_date,
                    transaction_type, owner_code, amount_raw, amount_midpoint,
                    instrument_type, strike_price, expiry_date, source, chamber
             FROM transactions
             WHERE disclosure_date BETWEEN ? AND ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
+              {source_clause}
             ORDER BY disclosure_date DESC
-        """,
-            [start_date, end_date],
+            """,  # nosec B608 -- source_clause is a fixed internal fragment
+            params,
         ).fetchdf()
-        return result
 
     def upsert(
         self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False
@@ -317,12 +333,21 @@ class TransactionRepository:
         rows = self.conn.execute(query, doc_ids).fetchall()
         return {doc_id: count for doc_id, count in rows}
 
-    def exists(self, year: int) -> bool:
-        count = self.conn.execute(
-            """
-            SELECT COUNT(*) FROM transactions
-            WHERE EXTRACT(YEAR FROM disclosure_date) = ?
-        """,
-            [year],
-        ).fetchone()[0]
-        return count > 0
+    def exists(self, year: int, *, source: str | None = None) -> bool:
+        if source is None:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*) FROM transactions
+                WHERE EXTRACT(YEAR FROM disclosure_date) = ?
+                """,
+                [year],
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """
+                SELECT COUNT(*) FROM transactions
+                WHERE EXTRACT(YEAR FROM disclosure_date) = ? AND source = ?
+                """,
+                [year, source],
+            ).fetchone()
+        return row[0] > 0

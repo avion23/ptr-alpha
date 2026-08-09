@@ -515,6 +515,11 @@ class HouseTransactionSource(TransactionSource):
         )
 
     def parse_cached_pdfs(self, year: int, *, force: bool = False) -> None:
+        ingestion_generation = self.db.get_latest_house_generation(year)
+        if ingestion_generation is None:
+            raise DataSourceError(
+                f"No acquired House generation exists for archive {year}"
+            )
         metadata = self.fetch_metadata(year)
         ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
         pdf_dir = self.data_dir / str(year) / "pdfs"
@@ -527,11 +532,6 @@ class HouseTransactionSource(TransactionSource):
             raise DataSourceError(f"No PDF files found in {pdf_dir}")
 
         if not force:
-            ingestion_generation = self.db.get_latest_house_generation(year)
-            if ingestion_generation is None:
-                raise DataSourceError(
-                    f"No acquired House generation exists for archive {year}"
-                )
             artifact_hashes = {
                 path.stem: sha256
                 for path in pdf_paths
@@ -574,13 +574,16 @@ class HouseTransactionSource(TransactionSource):
         with Pool(self.parallel_workers) as pool:
             results = pool.map(_parse_pdf_worker, pdf_paths)
 
-        self._save_parse_results(year, results, member_lookup)
+        self._save_parse_results(
+            year, results, member_lookup, ingestion_generation
+        )
 
     def _save_parse_results(
         self,
         year: int,
         results: list,
         member_lookup: dict,
+        ingestion_generation: str,
     ) -> None:
         pdf_transactions: dict = {}
         parse_attempts: list[tuple[str, list[str]]] = []
@@ -598,10 +601,6 @@ class HouseTransactionSource(TransactionSource):
         artifact_hashes = {
             path.stem: _validated_pdf_sha256(path) for path in pdf_transactions
         }
-        ingestion_generation = (
-            self.db.get_latest_house_generation(year)
-            or f"legacy-untracked-{year}"
-        )
         if not df.empty:
             df["chamber"] = "house"
             df["ingestion_generation"] = ingestion_generation

@@ -190,7 +190,9 @@ def test_parse_persistence_records_house_provenance_and_artifact_hash(tmp_path):
     }
 
     try:
-        source._save_parse_results(2021, [result], member_lookup)
+        source._save_parse_results(
+            2021, [result], member_lookup, "legacy-untracked-2021"
+        )
         stored = db.get_transactions_for_doc("doc").iloc[0]
         parse_run = db.conn.execute(
             """
@@ -244,6 +246,7 @@ def test_zero_output_parse_preserves_stale_house_and_ocr_rows(tmp_path):
             2021,
             [(pdf_path, [], ["pdfplumber", "pdftotext"])],
             member_lookup,
+            "legacy-untracked-2021",
         )
         rows = db.conn.execute(
             """
@@ -355,7 +358,9 @@ def test_removed_house_rows_remain_until_new_generation_activates(tmp_path):
             artifact_sha256=current_sha,
             ingestion_generation=db.get_latest_house_generation(2021),
         )
-        db.mark_house_generation_parse_complete(2021)
+        db.mark_house_generation_parse_complete(
+            2021, db.get_latest_house_generation(2021)
+        )
         assert db.count_transactions_for_docs(["removed"]) == {}
         assert not old_pdf.exists()
         assert Path(audit[2]).read_bytes() == b"%PDF-removed\n%%EOF"
@@ -403,3 +408,37 @@ def test_second_directory_rename_failure_restores_prior_canonical(tmp_path, monk
     finally:
         source.close()
         db.close()
+
+
+
+def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypatch):
+    source, db = _source(tmp_path)
+    pdf_path = tmp_path / "2021" / "pdfs" / "bound.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_path.write_bytes(b"%PDF-bound\n%%EOF")
+    source.fetch_metadata = MagicMock(return_value=_metadata("bound"))
+    source.db.get_latest_house_generation = MagicMock(return_value="captured-g1")
+    source._save_parse_results = MagicMock()
+
+    class FakePool:
+        def __init__(self, _workers):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def map(self, _worker, paths):
+            return [(path, [], ["pdfplumber"]) for path in paths]
+
+    monkeypatch.setattr("analyzer.download.Pool", FakePool)
+    try:
+        source.parse_cached_pdfs(2021, force=True)
+    finally:
+        source.close()
+        db.close()
+
+    assert source.db.get_latest_house_generation.call_count == 1
+    assert source._save_parse_results.call_args.args[-1] == "captured-g1"

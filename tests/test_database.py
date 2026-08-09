@@ -577,7 +577,7 @@ class TestTransactions(DatabaseTestCase):
             )["ticker"].tolist(),
             ["OLD"],
         )
-        self.db.mark_house_generation_parse_complete(2024)
+        self.db.mark_house_generation_parse_complete(2024, "g2")
         self.assertEqual(
             self.db.get_transactions_for_doc("generation-doc")["ticker"].tolist(),
             ["NEW"],
@@ -608,6 +608,17 @@ class TestTransactions(DatabaseTestCase):
                 archive_year, generation_id, metadata_sha256,
                 metadata_count, ptr_count, parse_status
             ) VALUES (2024, 'g1', 'metadata-1', 1, 1, 'complete')
+            """
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO house_generation_metadata (
+                archive_year, generation_id, doc_id, first_name, last_name,
+                filing_date, filing_type, fetched_at
+            ) VALUES (
+                2024, 'g1', 'same-hash', 'Jane', 'Doe',
+                '2024-01-03', 'P', '2024-01-04'
+            )
             """
         )
         self.db.conn.execute(
@@ -658,7 +669,7 @@ class TestTransactions(DatabaseTestCase):
             quarantined_artifacts=[],
         )
 
-        self.assertEqual(self.db.get_unresolved_house_doc_ids(2024), [])
+        self.assertEqual(self.db.get_unresolved_house_doc_ids(2024, "g2"), [])
         self.assertEqual(
             self.db.conn.execute(
                 """
@@ -668,9 +679,48 @@ class TestTransactions(DatabaseTestCase):
             ).fetchall(),
             [("g1",), ("g2",)],
         )
-        self.db.mark_house_generation_parse_complete(2024)
+        self.db.mark_house_generation_parse_complete(2024, "g2")
         canonical = self.db.get_transactions_for_doc("same-hash")
         self.assertEqual(canonical["ticker"].tolist(), ["AAPL"])
+        self.assertEqual(canonical["ingestion_generation"].tolist(), ["g2"])
+
+        changed_metadata = metadata.copy()
+        changed_metadata["first_name"] = "Janet"
+        self.db.promote_house_archive(
+            archive_year=2024,
+            metadata_df=changed_metadata,
+            generation_id="g3",
+            metadata_sha256="metadata-3",
+            metadata_http_status=200,
+            metadata_etag=None,
+            metadata_last_modified=None,
+            artifacts=[{
+                "doc_id": "same-hash",
+                "artifact_sha256": "artifact-sha",
+                "content_length": 100,
+            }],
+            quarantined_artifacts=[],
+        )
+
+        with self.assertRaisesRegex(ValueError, "latest generation changed"):
+            self.db.mark_house_generation_parse_complete(2024, "g2")
+        self.assertEqual(
+            self.db.get_unresolved_house_doc_ids(2024, "g3"),
+            ["same-hash"],
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                """
+                SELECT COUNT(*) FROM transactions
+                WHERE doc_id = 'same-hash' AND ingestion_generation = 'g3'
+                """
+            ).fetchone()[0],
+            0,
+        )
+        with self.assertRaises(ValueError):
+            self.db.mark_house_generation_parse_complete(2024, "g3")
+        canonical = self.db.get_transactions_for_doc("same-hash")
+        self.assertEqual(canonical["member"].tolist(), ["Jane Doe"])
         self.assertEqual(canonical["ingestion_generation"].tolist(), ["g2"])
 
     def test_source_row_id_preserves_distinct_repeated_lots(self):
@@ -1271,11 +1321,8 @@ class TestParseRunsTable(DatabaseTestCase):
             [("gemini_ocr",), ("house_pdf",)],
         )
         self.assertEqual(persisted, ("zero_rows", 0))
-        self.assertEqual(
-            replacement.by_doc_source,
-            {"ocr-doc": {"gemini_ocr": 1, "house_pdf": 1}},
-        )
-        self.assertEqual(replacement.by_doc_total, {"ocr-doc": 2})
+        self.assertEqual(replacement.by_doc_source, {"ocr-doc": {}})
+        self.assertEqual(replacement.by_doc_total, {"ocr-doc": 0})
         self.assertEqual(replacement.total_current_rows, 2)
         self.assertEqual(replacement.total_raw_rows, 2)
 

@@ -1186,17 +1186,18 @@ def refresh(
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 
     for archive_year in archive_years:
-        unresolved = app_ctx.transaction_source.db.get_unresolved_house_doc_ids(
+        generation_id = app_ctx.transaction_source.db.get_latest_house_generation(
             archive_year
+        )
+        if generation_id is None:
+            failed_steps.append(f"missing_house_generation:{archive_year}")
+            continue
+        unresolved = app_ctx.transaction_source.db.get_unresolved_house_doc_ids(
+            archive_year, generation_id
         )
         if not unresolved:
             app_ctx.transaction_source.db.mark_house_generation_parse_complete(
-                archive_year
-            )
-            generation_id = (
-                app_ctx.transaction_source.db.get_latest_house_generation(
-                    archive_year
-                )
+                archive_year, generation_id
             )
             print(
                 f"  House {archive_year} generation={generation_id} "

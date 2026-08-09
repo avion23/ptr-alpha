@@ -133,6 +133,19 @@ class Database:
             )
         """)
         self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS house_generation_metadata (
+                archive_year INTEGER,
+                generation_id VARCHAR,
+                doc_id VARCHAR,
+                first_name VARCHAR,
+                last_name VARCHAR,
+                filing_date TIMESTAMP,
+                filing_type VARCHAR,
+                fetched_at TIMESTAMP,
+                PRIMARY KEY (archive_year, generation_id, doc_id)
+            )
+        """)
+        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS house_pdf_artifacts (
                 archive_year INTEGER,
                 doc_id VARCHAR,
@@ -513,42 +526,46 @@ class Database:
         ).fetchone()
         return str(row[0]) if row else None
 
-    def get_unresolved_house_doc_ids(self, archive_year: int) -> list[str]:
+    def get_unresolved_house_doc_ids(
+        self, archive_year: int, generation_id: str
+    ) -> list[str]:
         rows = self.conn.execute(
             """
-            WITH current_artifacts AS (
-                SELECT doc_id, artifact_sha256, generation_id
-                FROM house_pdf_artifacts
-                WHERE archive_year = ?
-                QUALIFY row_number() OVER (
-                    PARTITION BY doc_id ORDER BY acquired_at DESC, generation_id DESC
-                ) = 1
-            )
             SELECT a.doc_id
-            FROM current_artifacts a
+            FROM house_pdf_artifacts a
             LEFT JOIN pdf_parse_runs p
               ON p.doc_id = a.doc_id
              AND p.artifact_sha256 = a.artifact_sha256
              AND p.ingestion_generation = a.generation_id
              AND p.status IN ('success', 'no_txs')
+            WHERE a.archive_year = ? AND a.generation_id = ?
             GROUP BY a.doc_id
             HAVING COUNT(p.doc_id) = 0
             ORDER BY a.doc_id
             """,
-            [archive_year],
+            [archive_year, generation_id],
         ).fetchall()
         return [str(row[0]) for row in rows]
 
-    def mark_house_generation_parse_complete(self, archive_year: int) -> None:
-        if self.get_unresolved_house_doc_ids(archive_year):
-            raise ValueError(
-                f"House archive {archive_year} still has unresolved artifacts"
-            )
-        generation_id = self.get_latest_house_generation(archive_year)
-        if generation_id is None:
-            return
+    def mark_house_generation_parse_complete(
+        self, archive_year: int, generation_id: str
+    ) -> None:
         self.conn.execute("BEGIN TRANSACTION")
         try:
+            latest_generation = self.get_latest_house_generation(archive_year)
+            if latest_generation != generation_id:
+                raise ValueError(
+                    f"House archive {archive_year} latest generation changed "
+                    f"from {generation_id} to {latest_generation}"
+                )
+            unresolved = self.get_unresolved_house_doc_ids(
+                archive_year, generation_id
+            )
+            if unresolved:
+                raise ValueError(
+                    f"House archive {archive_year} generation {generation_id} "
+                    f"still has {len(unresolved)} unresolved artifacts"
+                )
             self.conn.execute(
                 """
                 UPDATE house_archive_generations SET parse_status = 'complete'
@@ -697,6 +714,27 @@ class Database:
                     int((metadata_df["filing_type"] == "P").sum()),
                 ],
             )
+            generation_metadata_df = metadata_df[
+                [
+                    "doc_id",
+                    "first_name",
+                    "last_name",
+                    "filing_date",
+                    "filing_type",
+                    "fetched_at",
+                ]
+            ].copy()
+            generation_metadata_df["archive_year"] = archive_year
+            generation_metadata_df["generation_id"] = generation_id
+            self.conn.execute("""
+                INSERT INTO house_generation_metadata (
+                    archive_year, generation_id, doc_id, first_name, last_name,
+                    filing_date, filing_type, fetched_at
+                )
+                SELECT archive_year, generation_id, doc_id, first_name, last_name,
+                       filing_date, filing_type, fetched_at
+                FROM generation_metadata_df
+            """)
             for artifact in artifacts:
                 self.conn.execute(
                     """
@@ -745,11 +783,26 @@ class Database:
                       ON new_artifact.doc_id = old_artifact.doc_id
                      AND new_artifact.generation_id = ?
                      AND new_artifact.artifact_sha256 = old_artifact.artifact_sha256
+                    JOIN house_generation_metadata old_metadata
+                      ON old_metadata.doc_id = old_artifact.doc_id
+                     AND old_metadata.archive_year = ?
+                     AND old_metadata.generation_id = ?
+                    JOIN house_generation_metadata new_metadata
+                      ON new_metadata.doc_id = new_artifact.doc_id
+                     AND new_metadata.archive_year = old_metadata.archive_year
+                     AND new_metadata.generation_id = ?
+                     AND new_metadata.first_name IS NOT DISTINCT FROM old_metadata.first_name
+                     AND new_metadata.last_name IS NOT DISTINCT FROM old_metadata.last_name
+                     AND new_metadata.filing_date IS NOT DISTINCT FROM old_metadata.filing_date
+                     AND new_metadata.filing_type IS NOT DISTINCT FROM old_metadata.filing_type
                     WHERE t.source = 'house_pdf'
                       AND t.ingestion_generation = ?
                     """,
                     [
                         generation_id,
+                        previous_generation,
+                        generation_id,
+                        archive_year,
                         previous_generation,
                         generation_id,
                         previous_generation,
@@ -776,10 +829,25 @@ class Database:
                       ON new_artifact.doc_id = old_artifact.doc_id
                      AND new_artifact.generation_id = ?
                      AND new_artifact.artifact_sha256 = old_artifact.artifact_sha256
+                    JOIN house_generation_metadata old_metadata
+                      ON old_metadata.doc_id = old_artifact.doc_id
+                     AND old_metadata.archive_year = ?
+                     AND old_metadata.generation_id = ?
+                    JOIN house_generation_metadata new_metadata
+                      ON new_metadata.doc_id = new_artifact.doc_id
+                     AND new_metadata.archive_year = old_metadata.archive_year
+                     AND new_metadata.generation_id = ?
+                     AND new_metadata.first_name IS NOT DISTINCT FROM old_metadata.first_name
+                     AND new_metadata.last_name IS NOT DISTINCT FROM old_metadata.last_name
+                     AND new_metadata.filing_date IS NOT DISTINCT FROM old_metadata.filing_date
+                     AND new_metadata.filing_type IS NOT DISTINCT FROM old_metadata.filing_type
                     WHERE p.ingestion_generation = ?
                     """,
                     [
                         generation_id,
+                        previous_generation,
+                        generation_id,
+                        archive_year,
                         previous_generation,
                         generation_id,
                         previous_generation,
@@ -871,10 +939,11 @@ class Database:
                 source_rows = self.conn.execute(
                     """
                     SELECT COALESCE(source, '<legacy>'), COUNT(*)
-                    FROM canonical_transactions
-                    WHERE doc_id = ? GROUP BY 1 ORDER BY 1
+                    FROM transactions
+                    WHERE doc_id = ? AND ingestion_generation = ?
+                    GROUP BY 1 ORDER BY 1
                     """,
-                    [doc_id],
+                    [doc_id, ingestion_generation],
                 ).fetchall()
                 counts = {str(row_source): int(count) for row_source, count in source_rows}
                 by_doc_source[doc_id] = counts

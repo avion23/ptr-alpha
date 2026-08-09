@@ -49,6 +49,14 @@ def test_refresh_summary_is_scoped_to_requested_year(tmp_path):
         ),
         source="house_pdf",
     )
+    db.conn.execute(
+        """
+        INSERT INTO house_archive_generations (
+            archive_year, generation_id, metadata_sha256,
+            metadata_count, ptr_count, parse_status
+        ) VALUES (2024, 'test-2024', 'sha', 0, 0, 'incomplete')
+        """
+    )
     ctx = MagicMock()
     ctx.transaction_source.db = db
     ctx.transaction_source.fetch_and_cache_pdfs.return_value = HouseFetchSummary(
@@ -232,6 +240,15 @@ def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
     ctx.transaction_source.db = db
 
     def summary(archive_year, **_kwargs):
+        db.conn.execute(
+            """
+            INSERT INTO house_archive_generations (
+                archive_year, generation_id, metadata_sha256,
+                metadata_count, ptr_count, parse_status
+            ) VALUES (?, ?, 'sha', 0, 0, 'incomplete')
+            """,
+            [archive_year, f"test-{archive_year}"],
+        )
         return HouseFetchSummary(
             archive_year=archive_year,
             metadata_count=1,

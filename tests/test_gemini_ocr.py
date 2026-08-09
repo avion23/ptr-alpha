@@ -753,6 +753,60 @@ def test_work_selection_uses_current_db_not_progress(tmp_path):
         cache_dir=str(tmp_path / "gemini_cache"),
     )
 
+    connection = duckdb.connect(str(db_path))
+    connection.execute(
+        """INSERT INTO transactions (
+               doc_id, member, ticker, transaction_date, disclosure_date,
+               transaction_type, amount_raw, source, chamber, source_record_id,
+               source_row_id, ingestion_generation, artifact_sha256
+           ) VALUES (
+               'done', 'Jane Doe', 'OLD', DATE '2024-01-01', DATE '2024-01-20',
+               'Purchase', 'A', 'gemini_ocr', 'House', 'done',
+               'old-v4-row', 'v4-gemini', 'old-sha'
+           )"""
+    )
+    connection.execute(
+        """INSERT INTO transactions (
+               doc_id, member, ticker, transaction_date, disclosure_date,
+               transaction_type, amount_raw, source, chamber, source_record_id,
+               source_row_id, ingestion_generation, artifact_sha256
+           ) VALUES
+               ('done', 'Jane Doe', 'NULLGEN', DATE '2024-01-02', DATE '2024-01-20',
+                'Purchase', 'A', 'gemini_ocr', 'House', 'done', 'old-null-row', NULL, 'old-sha'),
+               ('done', 'Jane Doe', 'CAP', DATE '2024-01-03', DATE '2024-01-20',
+                'Purchase', 'A', 'capitol_trades', 'House', 'done', 'cap-row', 'v1', 'cap-sha')
+        """
+    )
+    connection.close()
+    work = get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024)
+    assert [item[0] for item in work] == ["done", "rejected", "retry"]
+
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A"
+    )
+    assert (
+        _insert_transactions(
+            "done",
+            2024,
+            parsed.member,
+            parsed.transactions,
+            db_path=str(db_path),
+            artifact_sha256=digest,
+        )
+        == 1
+    )
+    connection = duckdb.connect(str(db_path))
+    counts = connection.execute(
+        "SELECT source, ingestion_generation, COUNT(*) FROM transactions "
+        "WHERE source_record_id='done' GROUP BY source, ingestion_generation "
+        "ORDER BY source, ingestion_generation"
+    ).fetchall()
+    connection.close()
+    assert counts == [
+        ("capitol_trades", "v1", 1),
+        ("gemini_ocr", gemini_ocr_common.GEMINI_PARSER_VERSION, 1),
+    ]
     work = get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024)
     assert [item[0] for item in work] == ["rejected", "retry"]
 

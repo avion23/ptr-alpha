@@ -56,10 +56,13 @@ def _normalize_identity_value(value) -> str:
 
 
 def _normalized_asset_identity(transaction: dict) -> str:
+    asset = str(transaction.get("asset_description") or "")
+    reported_tickers = re.findall(r"\(([A-Z][A-Z0-9.\-/]{0,9})\)", asset)
+    if reported_tickers:
+        return _normalize_identity_value(reported_tickers[-1])
     ticker = transaction.get("ticker")
     if ticker:
         return _normalize_identity_value(ticker)
-    asset = str(transaction.get("asset_description") or "")
     asset = re.sub(r"\[Account:.*$", "", asset, flags=re.IGNORECASE)
     asset = re.sub(r"\[[A-Z]{2}\]", "", asset)
     return _normalize_identity_value(asset)

@@ -142,6 +142,37 @@ def get_ocr_work_items(
     schema_ready = REQUIRED_OCR_SCHEMA_COLUMNS <= existing_columns
     if require_schema and not schema_ready:
         require_ocr_schema(conn)
+    base = Path(data_dir) if data_dir is not None else Path(db_path).parent
+    if not schema_ready:
+        legacy_rows = conn.execute(
+            """
+            WITH deterministic AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY doc_id ORDER BY parsed_at DESC
+                ) AS rn
+                FROM pdf_parse_runs
+                WHERE parser_version NOT LIKE '%gemini%'
+            )
+            SELECT CAST(m.doc_id AS VARCHAR),
+                   CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER)
+            FROM metadata m
+            JOIN deterministic d ON d.doc_id = m.doc_id AND d.rn = 1
+            WHERE m.filing_type = 'P'
+              AND d.status IN ('zero_rows', 'error', 'rejected')
+              AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
+            ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
+            """,
+            [year, year],
+        ).fetchall()
+        conn.close()
+        return [
+            (
+                doc_id,
+                doc_year,
+                str(base / str(doc_year) / "pdfs" / f"{doc_id}.pdf"),
+            )
+            for doc_id, doc_year in legacy_rows
+        ]
     rows = conn.execute(
         """
         WITH deterministic AS (
@@ -158,8 +189,13 @@ def get_ocr_work_items(
             WHERE parser_version = ?
         ), tx AS (
             SELECT doc_id,
-                   COUNT(*) AS row_count,
-                   COUNT(*) FILTER (WHERE source = 'gemini_ocr') AS ocr_row_count
+                   COUNT(*) FILTER (
+                       WHERE source = 'gemini_ocr' AND ingestion_generation = ?
+                   ) AS current_ocr_row_count,
+                   COUNT(*) FILTER (
+                       WHERE source = 'gemini_ocr'
+                         AND (ingestion_generation IS NULL OR ingestion_generation <> ?)
+                   ) AS stale_ocr_row_count
             FROM transactions
             GROUP BY doc_id
         )
@@ -168,8 +204,8 @@ def get_ocr_work_items(
                o.status,
                o.raw_row_count,
                o.transaction_count,
-               COALESCE(tx.row_count, 0),
-               COALESCE(tx.ocr_row_count, 0)
+               COALESCE(tx.current_ocr_row_count, 0),
+               COALESCE(tx.stale_ocr_row_count, 0)
         FROM metadata m
         JOIN deterministic d ON d.doc_id = m.doc_id AND d.rn = 1
         LEFT JOIN current_ocr o ON o.doc_id = m.doc_id AND o.rn = 1
@@ -179,9 +215,8 @@ def get_ocr_work_items(
           AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
         ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
         """,
-        [parser_version, year, year],
+        [parser_version, parser_version, parser_version, year, year],
     ).fetchall()
-    base = Path(data_dir) if data_dir is not None else Path(db_path).parent
     cache_dir = str(base / "gemini_cache")
     unresolved = []
     for (
@@ -190,8 +225,8 @@ def get_ocr_work_items(
         status,
         recorded_raw_count,
         recorded_count,
-        row_count,
-        ocr_row_count,
+        current_ocr_row_count,
+        stale_ocr_row_count,
     ) in rows:
         pdf_path = str(base / str(doc_year) / "pdfs" / f"{doc_id}.pdf")
         try:
@@ -241,12 +276,15 @@ def get_ocr_work_items(
             status == "success"
             and recorded_raw_count == cached.parsed.raw_row_count
             and recorded_count == parsed_count
-            and row_count == parsed_count
-            and ocr_row_count == parsed_count
+            and current_ocr_row_count == parsed_count
+            and stale_ocr_row_count == 0
             and matching_rows == sorted(expected_rows)
         )
         no_txs_matches = (
-            status == "no_txs" and cached.parsed.no_transactions and row_count == 0
+            status == "no_txs"
+            and cached.parsed.no_transactions
+            and current_ocr_row_count == 0
+            and stale_ocr_row_count == 0
         )
         if not (success_matches or no_txs_matches):
             unresolved.append((doc_id, doc_year, pdf_path))
@@ -1179,11 +1217,10 @@ def insert_transactions(
         )
         conn.execute(
             "DELETE FROM transactions AS target "
-            "WHERE target.source = 'gemini_ocr' AND target.chamber = 'House' "
-            "AND target.source_record_id = ? AND target.ingestion_generation = ? "
+            "WHERE target.source = 'gemini_ocr' AND target.source_record_id = ? "
             f"AND NOT EXISTS (SELECT 1 FROM {staging_table} AS staged "
             f"WHERE {stale_identity_join})",
-            [str(doc_id), parser_version],
+            [str(doc_id)],
         )
         count = len(rows)
         record_parse_run(

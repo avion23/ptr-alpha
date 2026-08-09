@@ -731,18 +731,20 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 "asset_description": f"Asset {index}",
             }
 
-        first = [tx(index) for index in range(17)]
-        second = [tx(index) for index in range(17, 20)]
+        shared = [tx(index) for index in range(17)]
+        first = shared + [tx(index) for index in range(17, 20)]
+        second = shared + [tx(index) for index in range(20, 23)]
+        corroborated = [tx(index) for index in range(23)]
         with (
             patch.object(parser_cascade, "_try_pdfplumber", return_value=first),
             patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
             patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
             patch.object(parser_cascade, "_try_pdftotext", return_value=second),
             patch.object(parser_cascade, "_try_docling", return_value=[]),
-            patch.object(parser_cascade, "_try_tesseract", return_value=first + second),
+            patch.object(parser_cascade, "_try_tesseract", return_value=corroborated),
         ):
             _, rows, engines = parser_cascade._parse_pdf_worker(Path("17-plus-3.pdf"))
-        self.assertEqual(len(rows), 20)
+        self.assertEqual(len(rows), 23)
         self.assertIn("won:reconciled_complete_ocr", engines)
 
     def test_reconciliation_preserves_maximum_source_lot_multiplicity(self):
@@ -793,13 +795,8 @@ class TestLocalOcrCanaries(unittest.TestCase):
             self.assertEqual(
                 hashlib.sha256(pdf.read_bytes()).hexdigest(), expected_hash
             )
-            from analyzer.parser_cascade import ParserCascadeError
-
-            try:
-                with patch.dict(os.environ, {"PTR_SKIP_DOCLING": "1"}):
-                    _, rows, engines = _parse_pdf_worker(pdf)
-            except ParserCascadeError:
-                continue
+            with patch.dict(os.environ, {"PTR_SKIP_DOCLING": "1"}):
+                _, rows, engines = _parse_pdf_worker(pdf)
             self.assertEqual(len(rows), expected_count, (doc_id, engines))
             self.assertIn("won:pdftotext", engines)
 

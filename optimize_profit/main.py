@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib.metadata
 import itertools
@@ -11,6 +12,7 @@ import os
 import platform
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,14 +36,36 @@ from optimize_profit.scoring import (
     make_shuffled_scorer,
     score_constant,
 )
-from optimize_profit.walk_forward import run_walk_forward
+from optimize_profit.walk_forward import (
+    _build_custom_ranking_dicts,
+    _portfolio_return,
+    _portfolio_weights,
+    _score_candidates,
+    run_walk_forward,
+)
 
 TX_START = pd.Timestamp("2021-10-07")
 SELECTION_START = pd.Timestamp("2022-01-01")
 RETROSPECTIVE_START = pd.Timestamp("2024-07-01")
 RETROSPECTIVE_END = pd.Timestamp("2025-06-30")
-FINAL_TEST_START = pd.Timestamp("2026-01-01")
-FINAL_TEST_END = pd.Timestamp("2026-06-30")
+FINAL_TEST_START = pd.Timestamp("2026-10-01")
+FINAL_TEST_END = pd.Timestamp("2028-07-01")
+FINAL_TEST_DATES = pd.DatetimeIndex(
+    pd.to_datetime(
+        (
+            "2026-10-01",
+            "2027-01-01",
+            "2027-04-01",
+            "2027-07-01",
+            "2027-10-01",
+            "2028-01-01",
+            "2028-04-01",
+            "2028-07-01",
+        )
+    )
+)
+EXPECTED_FINAL_LOCK_SHA256: str | None = None
+FINAL_LOCK_COMMIT: str | None = None
 HORIZON = 90
 REBALANCE_DAYS = HORIZON
 LOOKBACK_DAYS = 60
@@ -588,7 +612,9 @@ def _persist_artifacts(**kwargs) -> Path:
     config_json = json.dumps(kwargs["config"], sort_keys=True, separators=(",", ":"))
     source_hashes, source_aggregate = _source_hashes()
     git_state = _git_state()
-    _, _, final_dates = _phase_dates()
+    repository_lock_path = _canonical_final_lock_path()
+    repository_lock = json.loads(repository_lock_path.read_text())
+    repository_lock_sha = _sha256_file(repository_lock_path)
     selected = kwargs["selected"]
     manifest = {
         "run_id": run_id,
@@ -621,16 +647,16 @@ def _persist_artifacts(**kwargs) -> Path:
             key: _json_value(kwargs["retrospective_run"][key]) for key in METRIC_KEYS
         },
         "final_test": {
-            "status": "locked_not_evaluated",
-            "start": FINAL_TEST_START.date().isoformat(),
-            "end": FINAL_TEST_END.date().isoformat(),
-            "scheduled_as_of_dates": [date.date().isoformat() for date in final_dates],
-            "required_price_through": (
-                pd.Timestamp(final_dates.max()) + pd.Timedelta(days=HORIZON)
-            )
-            .date()
-            .isoformat(),
-            "horizon_days": HORIZON,
+            "status": "repository_lock_not_evaluated",
+            "repository_lock": str(repository_lock_path.relative_to(_repo_root())),
+            "repository_lock_sha256": repository_lock_sha,
+            "start": repository_lock["test_start"],
+            "end": repository_lock["test_end"],
+            "scheduled_as_of_dates": repository_lock["decision_dates"],
+            "required_price_through": repository_lock["required_price_through"],
+            "horizon_days": repository_lock["horizon_days"],
+            "analytics_queried": False,
+            "database_whole_file_hashed": True,
             "consumed": False,
         },
         "config": kwargs["config"],
@@ -672,81 +698,404 @@ def _benchmark_rows(kwargs) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def evaluate_locked_final(manifest_path: Path, db_path: Path) -> Path:
-    """Consume a locked future test once; never called by retrospective runs."""
-    manifest_path = manifest_path.resolve()
-    manifest = json.loads(manifest_path.read_text())
-    final = manifest["final_test"]
-    if final["status"] != "locked_not_evaluated" or final.get("consumed"):
-        raise RuntimeError("Final test manifest is not locked and unconsumed")
-    current_hashes, current_aggregate = _source_hashes()
-    if current_aggregate != manifest["source_aggregate_sha256"]:
-        raise RuntimeError("Source hash differs from the locked manifest")
-    if current_hashes != manifest["source_sha256"]:
-        raise RuntimeError("Source file set differs from the locked manifest")
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
-    output = manifest_path.parent / "final_evaluation.json"
-    if output.exists():
-        raise RuntimeError("Locked final test was already consumed")
 
-    final_dates = pd.DatetimeIndex(pd.to_datetime(final["scheduled_as_of_dates"]))
-    required_price_through = pd.Timestamp(final["required_price_through"])
-    with Database(db_path, read_only=True) as db:
-        entry_prices, transactions, prices = _load_data_range(
-            db, pd.Timestamp(final["end"]), required_price_through
+def _canonical_final_lock_path() -> Path:
+    return _repo_root() / "optimize_profit" / "final_lock.json"
+
+
+def _canonical_consumption_ledger_path() -> Path:
+    return _repo_root() / "data" / "optimize_profit_final_consumption.jsonl"
+
+
+def _canonical_json_sha256(value) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    raise TypeError(f"Cannot JSON encode {type(value).__name__}")
+
+
+def _load_and_verify_repository_lock(requested_path: Path) -> tuple[dict, str]:
+    canonical = _canonical_final_lock_path().resolve()
+    if requested_path.resolve() != canonical:
+        raise RuntimeError(f"Only repository lock {canonical} is accepted")
+    lock_sha = _sha256_file(canonical)
+    if EXPECTED_FINAL_LOCK_SHA256 is None or FINAL_LOCK_COMMIT is None:
+        raise RuntimeError("Final lock verifier constants are not sealed")
+    if lock_sha != EXPECTED_FINAL_LOCK_SHA256:
+        raise RuntimeError("Repository final lock SHA-256 mismatch")
+    lock = json.loads(canonical.read_text())
+    if _canonical_json_sha256(lock["locked_config"]) != lock["config_sha256"]:
+        raise RuntimeError("Locked strategy config hash mismatch")
+    current_sources, aggregate = _analytic_source_hashes()
+    if current_sources != lock["analytic_source_sha256"]:
+        raise RuntimeError("Analytic source files differ from the final lock")
+    if aggregate != lock["analytic_source_aggregate_sha256"]:
+        raise RuntimeError("Analytic source aggregate differs from the final lock")
+    current_runtime = _locked_runtime_fingerprint()
+    if current_runtime != lock["runtime_fingerprint"]:
+        raise RuntimeError("Runtime or dependency versions differ from the final lock")
+    git = _git_state()
+    if git["dirty"]:
+        raise RuntimeError("Final evaluation requires a clean worktree")
+    descendant = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", FINAL_LOCK_COMMIT, git["commit"]],
+        check=False,
+    )
+    if descendant.returncode != 0:
+        raise RuntimeError("Current commit is not a descendant of the lock commit")
+    return lock, lock_sha
+
+
+def _reserve_final_consumption(lock_sha: str) -> str:
+    """Atomically append an irreversible reservation before any DB access."""
+    ledger = _canonical_consumption_ledger_path()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    reservation_id = str(uuid.uuid4())
+    with ledger.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        events = [json.loads(line) for line in handle if line.strip()]
+        if any(event.get("lock_sha256") == lock_sha for event in events):
+            raise RuntimeError(
+                "Locked final test already has a consumption reservation"
+            )
+        event = {
+            "event": "reserved",
+            "lock_sha256": lock_sha,
+            "reservation_id": reservation_id,
+            "reserved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "git_commit": _git_state()["commit"],
+        }
+        handle.seek(0, os.SEEK_END)
+        handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return reservation_id
+
+
+def _append_consumption_event(
+    lock_sha: str, reservation_id: str, event_name: str, payload: dict
+) -> None:
+    ledger = _canonical_consumption_ledger_path()
+    with ledger.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        events = [json.loads(line) for line in handle if line.strip()]
+        reserved = any(
+            event.get("event") == "reserved"
+            and event.get("lock_sha256") == lock_sha
+            and event.get("reservation_id") == reservation_id
+            for event in events
         )
-    if prices.empty or pd.Timestamp(
-        prices.index.max()
-    ) < required_price_through - pd.Timedelta(days=7):
-        raise RuntimeError(
-            f"Final price data does not reach required horizon {required_price_through.date()}"
+        if not reserved:
+            raise RuntimeError("Final consumption reservation is missing")
+        event = {
+            "event": event_name,
+            "lock_sha256": lock_sha,
+            "reservation_id": reservation_id,
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
+        handle.seek(0, os.SEEK_END)
+        handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def evaluate_locked_final(lock_path: Path, db_path: Path) -> Path:
+    """Consume the repository final lock exactly once after all outcomes mature."""
+    lock, lock_sha = _load_and_verify_repository_lock(lock_path)
+    maturity = pd.Timestamp(lock["required_price_through"])
+    if pd.Timestamp.now(tz="UTC").tz_localize(None).normalize() < maturity:
+        raise RuntimeError(f"Final outcomes are immature until {maturity.date()}")
+
+    reservation_id = _reserve_final_consumption(lock_sha)
+    runtime = _runtime_manifest()
+    try:
+        db_sha = _sha256_file(db_path)
+        final_dates = pd.DatetimeIndex(pd.to_datetime(lock["decision_dates"]))
+        with Database(db_path, read_only=True) as db:
+            entry_prices, transactions, prices = _load_data_range(
+                db, pd.Timestamp(lock["test_end"]), maturity
+            )
+        if prices.empty or pd.Timestamp(prices.index.max()) < maturity - pd.Timedelta(
+            days=7
+        ):
+            raise RuntimeError(
+                f"Final price data does not reach exact maturity {maturity.date()}"
+            )
+        chosen = lock["locked_config"]
+        decay = float(chosen["decay_lambda"])
+        signals = analysis.calculate_signal_potential(
+            entry_prices, prices, [HORIZON], decay_lambda=decay
         )
-    chosen = manifest["locked_config"]
-    decay = float(chosen["decay_lambda"])
-    signals = analysis.calculate_signal_potential(
-        entry_prices, prices, [HORIZON], decay_lambda=decay
+        precomputed = precompute_walk_forward_data(
+            signals,
+            transactions,
+            prices,
+            final_dates,
+            HORIZON,
+            lookback_days=LOOKBACK_DAYS,
+            training_lookback_days=TRAINING_LOOKBACK_DAYS,
+            min_buyers_list=PARAM_GRID["min_buyers"],
+        )
+        family = _run_strict_final_family(
+            entry_prices, transactions, prices, precomputed, chosen, lock
+        )
+        result = _final_claim_result(lock, lock_sha, db_sha, runtime, family)
+        result["reservation_id"] = reservation_id
+        result["consumption_ledger"] = str(_canonical_consumption_ledger_path())
+        output = _repo_root() / "data" / "optimize_profit_final_result.json"
+        if output.exists():
+            raise RuntimeError("Canonical final result already exists")
+        with output.open("x") as handle:
+            json.dump(result, handle, indent=2, sort_keys=True, default=_json_default)
+            handle.write("\n")
+        _append_consumption_event(
+            lock_sha,
+            reservation_id,
+            "completed",
+            {"result_sha256": _sha256_file(output), "verdict": result["verdict"]},
+        )
+        return output
+    except Exception as exc:
+        _append_consumption_event(
+            lock_sha,
+            reservation_id,
+            "failed",
+            {"error_type": type(exc).__name__, "error": str(exc)},
+        )
+        raise
+
+
+def _run_strict_final_family(
+    entry_prices, transactions, prices, precomputed, params, lock
+) -> dict:
+    base = SCORING_FUNCTIONS[params["scoring_fn"]]
+    strategy = _run_strict_final(precomputed, prices, base, params)
+    constant = _run_strict_final(precomputed, prices, score_constant, params)
+    null_metrics = []
+    for seed in range(int(lock["final_null_permutations"])):
+        scorer = make_shuffled_scorer(base, seed)
+        null_metrics.append(_run_strict_final(precomputed, prices, scorer, params))
+    _assert_identical_support("strict_final", [strategy, constant, *null_metrics])
+    null_sharpes = np.asarray([run["alpha_sharpe"] for run in null_metrics])
+    empirical_p = (1 + int((null_sharpes >= strategy["alpha_sharpe"]).sum())) / (
+        1 + len(null_sharpes)
     )
-    precomputed = precompute_walk_forward_data(
-        signals,
-        transactions,
-        prices,
-        final_dates,
-        HORIZON,
-        lookback_days=LOOKBACK_DAYS,
-        training_lookback_days=TRAINING_LOOKBACK_DAYS,
-        min_buyers_list=PARAM_GRID["min_buyers"],
+    return {
+        "strategy": strategy,
+        "constant": constant,
+        "null_alpha_sharpes": null_sharpes.tolist(),
+        "null_empirical_p_value": empirical_p,
+        "null_permutations": len(null_sharpes),
+    }
+
+
+def _run_strict_final(precomputed: dict, prices: pd.DataFrame, scorer, params) -> dict:
+    all_returns = []
+    position_rows = []
+    top_n = int(params["top_n"])
+    min_buyers = int(params["min_buyers"])
+    for data in precomputed.values():
+        if data.get("status") != "ready":
+            raise RuntimeError(
+                f"Final scheduled period {data['as_of_ts'].date()} is not ready: "
+                f"{data.get('reason')}"
+            )
+        ranking_dicts = _build_custom_ranking_dicts(data["member_rankings"], scorer)
+        candidates = data["candidate_tickers"].get(min_buyers, [])
+        scored, _ = _score_candidates(
+            candidates,
+            data["recent_trades"],
+            data["training"],
+            data["horizon"],
+            5.0,
+            data["member_rankings"],
+            min_buyers,
+            data["ticker_perf_signals"],
+            ranking_dicts,
+        )
+        selected = (
+            pd.DataFrame(scored)
+            .sort_values("signal_score", ascending=False)
+            .head(top_n)
+            .reset_index(drop=True)
+        )
+        if len(selected) != top_n:
+            raise RuntimeError(
+                f"Final period {data['as_of_ts'].date()} has {len(selected)}/{top_n} positions"
+            )
+        weights = _portfolio_weights(
+            selected["signal_score"].to_numpy(), str(params["allocation"])
+        )
+        ticker_returns, spy_return, endpoints = _strict_endpoint_returns(
+            selected["ticker"].astype(str).tolist(),
+            prices,
+            data["as_of_ts"],
+            int(data["horizon"]),
+        )
+        portfolio_return = _portfolio_return(ticker_returns, weights) * 100
+        all_returns.append(
+            {
+                "as_of_date": data["as_of_ts"].date().isoformat(),
+                "portfolio_return_pct": portfolio_return,
+                "spy_return_pct": spy_return,
+                "n_positions": top_n,
+            }
+        )
+        for ticker, ticker_return, weight in zip(
+            selected["ticker"], ticker_returns, weights
+        ):
+            position_rows.append(
+                {
+                    "as_of_date": data["as_of_ts"].date().isoformat(),
+                    "ticker": str(ticker),
+                    "weight": float(weight),
+                    "return_pct": float(ticker_return),
+                    **endpoints,
+                }
+            )
+    metrics = summarize_walk_forward(all_returns, periods_per_year=365.0 / HORIZON)
+    support = [row["as_of_date"] for row in all_returns]
+    return {
+        **metrics,
+        "period_results": all_returns,
+        "position_results": position_rows,
+        "requested_periods": len(precomputed),
+        "coverage_pct": 100.0,
+        "support_dates": support,
+        "support_sha256": hashlib.sha256("|".join(support).encode()).hexdigest(),
+    }
+
+
+def _strict_endpoint_returns(tickers, prices, as_of, horizon):
+    spy = prices["SPY"].dropna()
+    entry_target = pd.Timestamp(as_of)
+    exit_target = entry_target + pd.Timedelta(days=horizon)
+    entry_candidates = spy.index[spy.index >= entry_target]
+    exit_candidates = spy.index[spy.index >= exit_target]
+    if entry_candidates.empty or exit_candidates.empty:
+        raise RuntimeError(f"SPY endpoints unavailable for {entry_target.date()}")
+    entry_date = pd.Timestamp(entry_candidates[0])
+    exit_date = pd.Timestamp(exit_candidates[0])
+    if entry_date > entry_target + pd.Timedelta(days=7):
+        raise RuntimeError(f"SPY entry endpoint too late for {entry_target.date()}")
+    if exit_date > exit_target + pd.Timedelta(days=7):
+        raise RuntimeError(f"SPY exit endpoint too late for {exit_target.date()}")
+    if entry_date not in spy.index or exit_date not in spy.index:
+        raise RuntimeError("Exact SPY endpoint coverage is missing")
+    spy_entry = float(spy.loc[entry_date])
+    spy_exit = float(spy.loc[exit_date])
+    spy_return = (spy_exit * 0.999 / (spy_entry * 1.001) - 1) * 100
+
+    returns = []
+    for ticker in tickers:
+        if ticker not in prices.columns:
+            raise RuntimeError(f"Final ticker {ticker} has no price column")
+        series = prices[ticker]
+        if entry_date not in series.index or exit_date not in series.index:
+            raise RuntimeError(f"Final ticker {ticker} lacks exact endpoint dates")
+        entry = series.loc[entry_date]
+        exit_price = series.loc[exit_date]
+        if pd.isna(entry) or pd.isna(exit_price) or entry <= 0 or exit_price <= 0:
+            raise RuntimeError(f"Final ticker {ticker} has invalid endpoint prices")
+        returns.append((float(exit_price) * 0.999 / (float(entry) * 1.001) - 1) * 100)
+    return (
+        np.asarray(returns),
+        spy_return,
+        {
+            "entry_date": entry_date.date().isoformat(),
+            "exit_date": exit_date.date().isoformat(),
+            "spy_entry_price": spy_entry,
+            "spy_exit_price": spy_exit,
+        },
     )
-    strategy = _run_config(entry_prices, transactions, prices, precomputed, chosen)
-    passive = _run_passive_benchmark(prices, precomputed)
-    _assert_identical_support("locked_final_test", [strategy, passive])
-    final_passed = bool(
-        manifest["retrospective_gates_passed"]
-        and strategy["mean_alpha_pct"] > 0
-        and strategy["total_return_pct"] > passive["total_return_pct"]
-        and _alpha_p_value(strategy["period_results"]) <= 0.10
-    )
-    final_periods_path = manifest_path.parent / "final_periods.csv"
-    if final_periods_path.exists():
-        raise RuntimeError("Locked final period artifact already exists")
-    pd.DataFrame(strategy["period_results"]).to_csv(final_periods_path, index=False)
-    result = {
-        "locked_manifest_sha256": _sha256_file(manifest_path),
-        "final_periods_sha256": _sha256_file(final_periods_path),
+
+
+def _final_claim_result(lock, lock_sha, db_sha, runtime, family) -> dict:
+    strategy = family["strategy"]
+    constant = family["constant"]
+    gates = {
+        "adequate_observations": strategy["n_periods"]
+        >= int(lock["minimum_final_observations"]),
+        "pre_final_bonferroni_gate": bool(
+            lock["pre_final_evidence"]["bonferroni_passed"]
+        ),
+        "pre_final_permutation_gate": float(
+            lock["pre_final_evidence"]["empirical_p_value"]
+        )
+        <= 0.01,
+        "positive_final_alpha": strategy["mean_alpha_pct"] > 0,
+        "positive_return_vs_spy": strategy["total_return_pct"]
+        > strategy["spy_total_return_pct"],
+        "beats_final_constant": strategy["alpha_sharpe"] > constant["alpha_sharpe"],
+        "final_null_gate": family["null_empirical_p_value"] <= 0.05,
+        "final_alpha_inference": _alpha_p_value(strategy["period_results"]) <= 0.05,
+        "exact_period_support": strategy["n_periods"] == strategy["requested_periods"],
+        "exact_position_count": all(
+            row["n_positions"] == int(lock["locked_config"]["top_n"])
+            for row in strategy["period_results"]
+        ),
+    }
+    return {
+        "lock_sha256": lock_sha,
         "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "final_db_sha256": _sha256_file(db_path),
-        "source_aggregate_sha256": current_aggregate,
-        "support_sha256": strategy["support_sha256"],
+        "db_whole_file_sha256": db_sha,
+        "runtime": runtime,
+        "git": _git_state(),
         "strategy_metrics": {key: strategy[key] for key in METRIC_KEYS},
-        "passive_metrics": {key: passive[key] for key in METRIC_KEYS},
-        "alpha_p_value": _alpha_p_value(strategy["period_results"]),
+        "constant_metrics": {key: constant[key] for key in METRIC_KEYS},
+        "strategy_period_results": strategy["period_results"],
+        "strategy_position_results": strategy["position_results"],
+        "final_null_permutations": family["null_permutations"],
+        "final_null_empirical_p_value": family["null_empirical_p_value"],
+        "final_alpha_p_value": _alpha_p_value(strategy["period_results"]),
+        "claim_gates": gates,
         "verdict": "final_out_of_sample_gates_passed"
-        if final_passed
+        if all(gates.values())
         else "no_validated_profit_claim",
     }
-    with output.open("x") as handle:
-        json.dump(result, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    return output
+
+
+def _analytic_source_hashes() -> tuple[dict[str, str], str]:
+    repo = _repo_root()
+    paths = sorted((repo / "src" / "analyzer").rglob("*.py"))
+    paths += [
+        repo / "optimize_profit" / name
+        for name in (
+            "__init__.py",
+            "metrics.py",
+            "precompute.py",
+            "scoring.py",
+            "walk_forward.py",
+        )
+    ]
+    hashes = {str(path.relative_to(repo)): _sha256_file(path) for path in paths}
+    aggregate = hashlib.sha256(
+        "".join(f"{name}:{digest}\n" for name, digest in hashes.items()).encode()
+    ).hexdigest()
+    return hashes, aggregate
+
+
+def _locked_runtime_fingerprint() -> dict:
+    runtime = _runtime_manifest()
+    return {
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "dependencies": runtime["dependencies"],
+    }
 
 
 def _manifest_config(db_path: Path) -> dict:

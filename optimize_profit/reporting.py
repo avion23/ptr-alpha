@@ -51,7 +51,10 @@ def print_verdict(robust: bool, reasons: list[str], artifact_dir, final_start) -
     else:
         for reason in reasons:
             print(f"  - {reason}")
-    print(f"Locked final test starts {final_start}; it was not read or evaluated.")
+    print(
+        f"Locked final test starts {final_start}; its rows were not analytically queried."
+    )
+    print("The database file was read only to compute its whole-file SHA-256.")
     print(f"Artifacts: {artifact_dir}")
 
 

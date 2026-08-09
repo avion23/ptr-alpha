@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -323,9 +324,11 @@ def test_manifest_labels_reused_history_and_locks_unconsumed_final(tmp_path):
 
     assert manifest["phase_labels"]["validation"].startswith("retrospective")
     assert "untouched" not in json.dumps(manifest).lower()
-    assert manifest["final_test"]["status"] == "locked_not_evaluated"
+    assert manifest["final_test"]["status"] == "repository_lock_not_evaluated"
     assert manifest["final_test"]["consumed"] is False
-    assert manifest["final_test"]["start"] == "2026-01-01"
+    assert manifest["final_test"]["start"] == "2026-10-01"
+    assert manifest["final_test"]["analytics_queried"] is False
+    assert manifest["final_test"]["database_whole_file_hashed"] is True
     assert manifest["source_aggregate_sha256"]
     assert any(key.startswith("src/analyzer/") for key in manifest["source_sha256"])
     assert any(key.startswith("optimize_profit/") for key in manifest["source_sha256"])
@@ -335,3 +338,134 @@ def test_manifest_labels_reused_history_and_locks_unconsumed_final(tmp_path):
     assert manifest["retrospective_db_sha256"]
     assert manifest["artifact_sha256"]
     assert not (artifact / "final_evaluation.json").exists()
+
+
+def test_repository_final_lock_has_eight_post_precommit_mature_observations():
+    lock_path = main._canonical_final_lock_path()
+    lock = json.loads(lock_path.read_text())
+    dates = pd.DatetimeIndex(pd.to_datetime(lock["decision_dates"]))
+
+    assert len(dates) >= 8
+    assert dates.is_unique
+    assert dates.min() > pd.Timestamp("2026-08-09")
+    assert (dates[1:] - dates[:-1]).min() >= pd.Timedelta(days=main.HORIZON)
+    assert dates.max() + pd.Timedelta(days=main.HORIZON) == pd.Timestamp(
+        lock["required_price_through"]
+    )
+    assert lock["minimum_final_observations"] >= 8
+    assert lock["final_null_permutations"] >= 999
+
+
+def test_final_lock_tamper_and_noncanonical_path_fail_closed(tmp_path):
+    canonical = main._canonical_final_lock_path()
+    original_sha = main._sha256_file(canonical)
+    tampered = json.loads(canonical.read_text())
+    tampered["locked_config"]["top_n"] = 5
+    path = tmp_path / "final_lock.json"
+    path.write_text(json.dumps(tampered))
+
+    with pytest.raises(RuntimeError, match="Only repository lock"):
+        main._load_and_verify_repository_lock(path)
+    with (
+        patch.object(main, "_canonical_final_lock_path", return_value=path),
+        patch.object(main, "EXPECTED_FINAL_LOCK_SHA256", original_sha),
+        patch.object(main, "FINAL_LOCK_COMMIT", "canary"),
+    ):
+        with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+            main._load_and_verify_repository_lock(path)
+
+
+def test_final_runtime_mismatch_fails_before_git_or_database():
+    lock_path = main._canonical_final_lock_path()
+    lock_sha = main._sha256_file(lock_path)
+    lock = json.loads(lock_path.read_text())
+    wrong_runtime = {**lock["runtime_fingerprint"], "python_version": "0.0"}
+    with (
+        patch.object(main, "EXPECTED_FINAL_LOCK_SHA256", lock_sha),
+        patch.object(main, "FINAL_LOCK_COMMIT", "canary"),
+        patch.object(main, "_locked_runtime_fingerprint", return_value=wrong_runtime),
+    ):
+        with pytest.raises(RuntimeError, match="Runtime or dependency"):
+            main._load_and_verify_repository_lock(lock_path)
+
+
+def test_final_maturity_fails_before_consumption_reservation():
+    lock = json.loads(main._canonical_final_lock_path().read_text())
+    with (
+        patch.object(
+            main, "_load_and_verify_repository_lock", return_value=(lock, "sha")
+        ),
+        patch.object(main, "_reserve_final_consumption") as reserve,
+    ):
+        with pytest.raises(RuntimeError, match="immature"):
+            main.evaluate_locked_final(
+                main._canonical_final_lock_path(), Path("missing")
+            )
+    reserve.assert_not_called()
+
+
+def test_final_endpoint_coverage_requires_each_ticker_and_spy_exactly():
+    index = pd.DatetimeIndex(["2029-01-02", "2029-04-02"])
+    complete = pd.DataFrame({"SPY": [100.0, 110.0], "AAA": [50.0, 55.0]}, index=index)
+    returns, spy_return, endpoints = main._strict_endpoint_returns(
+        ["AAA"], complete, pd.Timestamp("2029-01-01"), 90
+    )
+    assert len(returns) == 1
+    assert spy_return > 0
+    assert endpoints["entry_date"] == "2029-01-02"
+
+    missing = complete.copy()
+    missing.loc[pd.Timestamp("2029-04-02"), "AAA"] = float("nan")
+    with pytest.raises(RuntimeError, match="invalid endpoint prices"):
+        main._strict_endpoint_returns(["AAA"], missing, pd.Timestamp("2029-01-01"), 90)
+
+
+def test_append_only_consumption_reservation_is_atomic_and_irreversible(tmp_path):
+    ledger = tmp_path / "consumption.jsonl"
+    with patch.object(main, "_canonical_consumption_ledger_path", return_value=ledger):
+        reservation = main._reserve_final_consumption("lock-sha")
+        with pytest.raises(RuntimeError, match="already has"):
+            main._reserve_final_consumption("lock-sha")
+        main._append_consumption_event(
+            "lock-sha", reservation, "failed", {"error": "canary"}
+        )
+
+    events = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert [event["event"] for event in events] == ["reserved", "failed"]
+    assert all(event["reservation_id"] == reservation for event in events)
+
+
+def test_final_claim_requires_power_null_constant_and_multiplicity_gates():
+    lock = json.loads(main._canonical_final_lock_path().read_text())
+    periods = [
+        {
+            "as_of_date": "2027-01-01",
+            "portfolio_return_pct": 2.0,
+            "spy_return_pct": 1.0,
+            "n_positions": 3,
+        }
+    ] * 7
+    strategy = {
+        **_metric_run(tuple(str(i) for i in range(7))),
+        "n_periods": 7,
+        "requested_periods": 7,
+        "mean_alpha_pct": 1.0,
+        "total_return_pct": 10.0,
+        "spy_total_return_pct": 5.0,
+        "alpha_sharpe": 1.0,
+        "period_results": periods,
+        "position_results": [],
+    }
+    constant = {**strategy, "alpha_sharpe": 0.0}
+    family = {
+        "strategy": strategy,
+        "constant": constant,
+        "null_permutations": 999,
+        "null_empirical_p_value": 0.01,
+    }
+    result = main._final_claim_result(lock, "sha", "db", {"python": "canary"}, family)
+
+    assert result["claim_gates"]["adequate_observations"] is False
+    assert result["claim_gates"]["pre_final_bonferroni_gate"] is False
+    assert result["verdict"] == "no_validated_profit_claim"
+    assert result["runtime"] == {"python": "canary"}

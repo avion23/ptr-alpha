@@ -732,13 +732,10 @@ def _reserve_evaluation(
         hashes = manifest["hashes"]
         window = [str(test_start), str(test_end)]
         for record in ledger.get("evaluations", []):
-            same_snapshot_window = (
-                record.get("database_sha256") == hashes["database_sha256"]
-                and record.get("value_snapshot_sha256")
-                == hashes["value_snapshot_sha256"]
-                and record.get("window") == window
-            )
-            if same_snapshot_window:
+            # A holdout window stays consumed across database refreshes, value
+            # snapshots, configs, and grids. Provenance remains in the key and
+            # record, but changed inputs never reopen an observed window.
+            if record.get("window") == window:
                 raise EvaluationAlreadyConsumedError(
                     "frozen evaluation snapshot/window already reserved; "
                     "repeats and alternate configs/grids are refused"

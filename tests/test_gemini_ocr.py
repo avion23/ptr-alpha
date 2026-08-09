@@ -220,6 +220,39 @@ def test_known_document_canary_rejects_plausible_partial_output():
         )
 
 
+def test_56_page_known_document_cannot_be_accepted_as_no_transactions():
+    canary = gemini_ocr_common.KNOWN_DOCUMENT_CANARIES["8221322"]
+    no_transactions = gemini_ocr_common.ParsedGeminiOutput(
+        "Known Member", [], 0, True, 56, frozenset(range(1, 57))
+    )
+    with pytest.raises(
+        gemini_ocr_common.GeminiOutputError,
+        match="page 2 expected at least 18 rows",
+    ):
+        gemini_ocr_common.validate_known_document(
+            "8221322", canary["sha256"], no_transactions
+        )
+
+    page_two_rows = [
+        {
+            "asset": f"Page two asset {index}",
+            "date": "01/01/26",
+            "amount_letter": "A",
+            "page_number": 2,
+        }
+        for index in range(18)
+    ]
+    covered = gemini_ocr_common.ParsedGeminiOutput(
+        "Known Member",
+        page_two_rows,
+        18,
+        False,
+        56,
+        frozenset(range(1, 57)),
+    )
+    gemini_ocr_common.validate_known_document("8221322", canary["sha256"], covered)
+
+
 @pytest.mark.parametrize("doc_id", ["9115808", "9115813", "9116141"])
 def test_all_pinned_document_canary_counts_and_rows(doc_id):
     canary = gemini_ocr_common.KNOWN_DOCUMENT_CANARIES[doc_id]

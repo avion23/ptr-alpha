@@ -638,6 +638,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             self.assertIn("won:pdftotext", engines)
 
         scan_hashes = {
+            "8221322": "26f1ce2fb7823d2e84ea4fbde24514c5c6371b43a828720d50f21b1c8c7ad314",
             "9115808": "05b2fa3becd71c9bb141690130708079407e52a6e169cdacf42a467e09e0bda5",
             "9115813": "737955c7c26c497eda37f4378e1af51409b6231204a82d7ae2c3f25c10e0ae84",
             "9116141": "716cdcc10bd57c400f10d8bb4133eb667931a9699fb1835ed3b7deca010a36a1",
@@ -648,3 +649,11 @@ class TestLocalOcrCanaries(unittest.TestCase):
             self.assertEqual(
                 hashlib.sha256(matches[0].read_bytes()).hexdigest(), expected_hash
             )
+
+        from scripts.ocr_zero_rows import get_ocr_work_items
+
+        database_path = data_dir / "congress.duckdb"
+        unresolved = get_ocr_work_items(
+            db_path=str(database_path), data_dir=data_dir, year=2026
+        )
+        self.assertIn("8221322", {doc_id for doc_id, _, _ in unresolved})

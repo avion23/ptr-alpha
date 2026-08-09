@@ -52,6 +52,11 @@ Amount ranges: A=$1K-15K, B=$15K-50K, C=$50K-100K, D=$100K-250K, E=$250K-500K, F
 No markdown, no tables, no explanations."""
 PROMPT_SHA256 = hashlib.sha256(PROMPT.encode()).hexdigest()
 KNOWN_DOCUMENT_CANARIES = {
+    "8221322": {
+        "sha256": "26f1ce2fb7823d2e84ea4fbde24514c5c6371b43a828720d50f21b1c8c7ad314",
+        "page_count": 56,
+        "page_min_rows": {2: 18},
+    },
     "9115808": {
         "sha256": "05b2fa3becd71c9bb141690130708079407e52a6e169cdacf42a467e09e0bda5",
         "row_count": 1,
@@ -254,12 +259,31 @@ def validate_known_document(
         return
     if pdf_digest != canary["sha256"]:
         raise GeminiOutputError(f"known document {doc_id}: artifact hash mismatch")
-    if len(parsed.transactions) != canary["row_count"]:
+    expected_pages = canary.get("page_count")
+    if expected_pages is not None and parsed.page_count != expected_pages:
         raise GeminiOutputError(
-            f"known document {doc_id}: expected {canary['row_count']} rows, "
+            f"known document {doc_id}: expected {expected_pages} pages, "
+            f"got {parsed.page_count}"
+        )
+    expected_rows = canary.get("row_count")
+    if expected_rows is not None and len(parsed.transactions) != expected_rows:
+        raise GeminiOutputError(
+            f"known document {doc_id}: expected {expected_rows} rows, "
             f"got {len(parsed.transactions)}"
         )
-    asset_fragment, tx_date, amount = canary["row"]
+    for page_number, minimum in canary.get("page_min_rows", {}).items():
+        page_rows = sum(
+            1 for tx in parsed.transactions if tx.get("page_number") == page_number
+        )
+        if page_rows < minimum:
+            raise GeminiOutputError(
+                f"known document {doc_id}: page {page_number} expected at least "
+                f"{minimum} rows, got {page_rows}"
+            )
+    pinned_row = canary.get("row")
+    if pinned_row is None:
+        return
+    asset_fragment, tx_date, amount = pinned_row
     if not any(
         asset_fragment in tx["asset"].casefold()
         and tx["date"] == tx_date

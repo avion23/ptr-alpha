@@ -53,6 +53,7 @@ class TickerAnalysisParams:
     year: int
     horizon: int = 90
     threshold: float = 5.0
+    as_of_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,19 +234,61 @@ def run_sales_pipeline(
     )
 
 
+def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
+    """Display known buyers without joining identity-based performance history."""
+    purchases = trades[
+        (trades["ticker"] == ticker)
+        & (trades["transaction_type"] == TransactionType.PURCHASE.value)
+        & trades["member"].notna()
+    ].copy()
+    if purchases.empty:
+        return pd.DataFrame(
+            columns=[
+                "member",
+                "num_purchases",
+                "transaction_date",
+                "disclosure_date",
+            ]
+        )
+    return (
+        purchases.groupby("member", sort=True)
+        .agg(
+            num_purchases=("ticker", "size"),
+            transaction_date=("transaction_date", list),
+            disclosure_date=("disclosure_date", list),
+        )
+        .reset_index()
+    )
+
+
 @pipeline_step
 def run_ticker_analysis(
     params: TickerAnalysisParams, transaction_source, price_source
 ) -> DataResult:
+    analysis_as_of = pd.Timestamp(
+        params.as_of_date or min(date.today(), date(params.year, 12, 31))
+    ).normalize()
+    if analysis_as_of.year != params.year:
+        raise DataSourceError("year must match the ticker analysis as-of date year")
+
     trades, prices, signals = prepare_analysis_data(
         transaction_source, price_source, params.year, (params.horizon,)
     )
+    disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
+    known_trades = trades[
+        disclosure_dates.notna() & (disclosure_dates <= analysis_as_of)
+    ].copy()
 
-    buyers = analysis.get_ticker_buyers_with_rankings(
-        params.ticker, trades, signals, params.horizon, params.threshold
-    )
+    buyers = _consensus_buyers_table(params.ticker, known_trades)
     score = analysis.score_ticker_by_buyers(
-        params.ticker, trades, signals, params.horizon, params.threshold
+        params.ticker,
+        known_trades,
+        signals,
+        horizon=params.horizon,
+        threshold=params.threshold,
+        member_rankings=None,
+        scoring_mode="consensus",
+        as_of_date=analysis_as_of,
     )
 
     return DataResult(
@@ -308,19 +351,17 @@ def run_recent_ticker_scoring(
         "Found %d tickers with %d+ buyers", len(multi_buyer_tickers), params.min_buyers
     )
 
-    member_rankings = analysis.rank_members(
-        signals, params.horizons[0], params.threshold
-    )
-
     scores = [
         analysis.score_ticker_by_buyers(
             ticker,
             recent_trades,
             signals,
-            params.horizons[0],
-            params.threshold,
-            member_rankings,
-            params.min_buyers,
+            horizon=params.horizons[0],
+            threshold=params.threshold,
+            member_rankings=None,
+            min_buyers=params.min_buyers,
+            scoring_mode="consensus",
+            as_of_date=as_of_date,
         )
         for ticker in multi_buyer_tickers
     ]

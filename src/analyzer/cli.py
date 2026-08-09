@@ -204,6 +204,7 @@ def _run_ticker_mode(
     year: int,
     horizons: list[int],
     threshold: float,
+    as_of_date: date | None,
     output: str,
 ) -> None:
     """Handle --ticker analysis mode."""
@@ -218,7 +219,11 @@ def _run_ticker_mode(
             file=sys.stderr,
         )
     params = TickerAnalysisParams(
-        ticker=ticker, year=year, horizon=horizons[0], threshold=threshold
+        ticker=ticker,
+        year=year,
+        horizon=horizons[0],
+        threshold=threshold,
+        as_of_date=as_of_date,
     )
     result = run_ticker_analysis(
         params,
@@ -369,7 +374,7 @@ def analyze(
     ),
     as_of: str | None = typer.Option(
         None,
-        help="Live ticker scoring date (YYYY-MM-DD; defaults to today)",
+        help="Analysis cutoff date (YYYY-MM-DD; defaults to today)",
     ),
     sectors: bool = typer.Option(
         False,
@@ -409,7 +414,9 @@ def analyze(
     _check_data_freshness(app_ctx)
 
     if ticker:
-        _run_ticker_mode(app_ctx, mode, ticker, year, horizons, threshold, output)
+        _run_ticker_mode(
+            app_ctx, mode, ticker, year, horizons, threshold, as_of_date, output
+        )
     elif mode == "tickers":
         _run_tickers_mode(
             app_ctx,

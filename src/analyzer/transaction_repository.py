@@ -50,11 +50,32 @@ class TransactionRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.conn = conn
 
-    def get_by_year(self, year: int, *, source: str | None = None) -> pd.DataFrame:
-        source_clause = " AND source = ?" if source is not None else ""
-        params: list[object] = [year]
+    @staticmethod
+    def _source_filter(
+        *, source: str | None, sources: tuple[str, ...] | None
+    ) -> tuple[str, list[str]]:
+        if source is not None and sources is not None:
+            raise ValueError("source and sources are mutually exclusive")
         if source is not None:
-            params.append(source)
+            return " AND source = ?", [source]
+        if sources is None:
+            return "", []
+        if not sources:
+            raise ValueError("sources must not be empty")
+        placeholders = ", ".join("?" for _ in sources)
+        return f" AND source IN ({placeholders})", list(sources)  # nosec B608
+
+    def get_by_year(
+        self,
+        year: int,
+        *,
+        source: str | None = None,
+        sources: tuple[str, ...] | None = None,
+    ) -> pd.DataFrame:
+        source_clause, source_params = self._source_filter(
+            source=source, sources=sources
+        )
+        params: list[object] = [year, *source_params]
         excluded = self.conn.execute(
             f"""
             SELECT COUNT(*) FROM transactions
@@ -92,11 +113,12 @@ class TransactionRepository:
         end_date: date,
         *,
         source: str | None = None,
+        sources: tuple[str, ...] | None = None,
     ) -> pd.DataFrame:
-        source_clause = " AND source = ?" if source is not None else ""
-        params: list[object] = [start_date, end_date]
-        if source is not None:
-            params.append(source)
+        source_clause, source_params = self._source_filter(
+            source=source, sources=sources
+        )
+        params: list[object] = [start_date, end_date, *source_params]
         excluded = self.conn.execute(
             f"""
             SELECT COUNT(*) FROM transactions
@@ -333,21 +355,21 @@ class TransactionRepository:
         rows = self.conn.execute(query, doc_ids).fetchall()
         return {doc_id: count for doc_id, count in rows}
 
-    def exists(self, year: int, *, source: str | None = None) -> bool:
-        if source is None:
-            row = self.conn.execute(
-                """
-                SELECT COUNT(*) FROM transactions
-                WHERE EXTRACT(YEAR FROM disclosure_date) = ?
-                """,
-                [year],
-            ).fetchone()
-        else:
-            row = self.conn.execute(
-                """
-                SELECT COUNT(*) FROM transactions
-                WHERE EXTRACT(YEAR FROM disclosure_date) = ? AND source = ?
-                """,
-                [year, source],
-            ).fetchone()
+    def exists(
+        self,
+        year: int,
+        *,
+        source: str | None = None,
+        sources: tuple[str, ...] | None = None,
+    ) -> bool:
+        source_clause, source_params = self._source_filter(
+            source=source, sources=sources
+        )
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) FROM transactions
+            WHERE EXTRACT(YEAR FROM disclosure_date) = ? {source_clause}
+            """,  # nosec B608 -- source_clause is a fixed internal fragment
+            [year, *source_params],
+        ).fetchone()
         return row[0] > 0

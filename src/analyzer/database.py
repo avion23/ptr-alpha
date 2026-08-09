@@ -350,8 +350,14 @@ class Database:
             self.conn.execute("ROLLBACK")
             raise
 
-    def get_transactions(self, year: int, *, source: str | None = None) -> pd.DataFrame:
-        return self.transactions.get_by_year(year, source=source)
+    def get_transactions(
+        self,
+        year: int,
+        *,
+        source: str | None = None,
+        sources: tuple[str, ...] | None = None,
+    ) -> pd.DataFrame:
+        return self.transactions.get_by_year(year, source=source, sources=sources)
 
     def get_transactions_by_date_range(
         self,
@@ -359,8 +365,11 @@ class Database:
         end_date: date,
         *,
         source: str | None = None,
+        sources: tuple[str, ...] | None = None,
     ) -> pd.DataFrame:
-        return self.transactions.get_by_date_range(start_date, end_date, source=source)
+        return self.transactions.get_by_date_range(
+            start_date, end_date, source=source, sources=sources
+        )
 
     def delete_transactions_for_doc(self, doc_id: str) -> None:
         self.transactions.delete_for_doc(doc_id)
@@ -371,8 +380,14 @@ class Database:
     def count_transactions_for_docs(self, doc_ids: list[str]) -> dict[str, int]:
         return self.transactions.count_for_docs(doc_ids)
 
-    def transactions_exist(self, year: int, *, source: str | None = None) -> bool:
-        return self.transactions.exists(year, source=source)
+    def transactions_exist(
+        self,
+        year: int,
+        *,
+        source: str | None = None,
+        sources: tuple[str, ...] | None = None,
+    ) -> bool:
+        return self.transactions.exists(year, source=source, sources=sources)
 
     def upsert_prices(self, df: pd.DataFrame) -> None:
         self.prices.upsert(df)
@@ -723,7 +738,7 @@ class Database:
                     not is_valid(ticker)
                     or ticker in reserved
                     or not is_null(candidate)
-                    or raw_ticker != "--"
+                    or raw_ticker not in {None, "--"}
                 ):
                     raise ValueError(
                         "asset_description ticker origin has inconsistent raw values"

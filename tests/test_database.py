@@ -5,6 +5,7 @@ import duckdb
 import pandas as pd
 
 from analyzer.database import Database
+from analyzer.download import HouseTransactionSource
 from analyzer.senate_efd import SenateEFDSource
 from analyzer.transaction_repository import SOURCE_TRANSACTION_COLUMNS
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
@@ -1522,7 +1523,7 @@ class TestSourceReports(DatabaseTestCase):
                 "ticker_origin": "asset_description",
                 "ticker": "JPM",
                 "ticker_candidate": None,
-                "raw_ticker": None,
+                "raw_ticker": "AAPL",
             },
             {"ticker_origin": "official", "ticker": "AAPL", "ticker_candidate": "AAPL"},
             {"ticker_origin": "official", "ticker": "AAPL1", "ticker_candidate": None},
@@ -1542,6 +1543,19 @@ class TestSourceReports(DatabaseTestCase):
             {"ticker_origin": "invalid", "ticker": None, "ticker_candidate": "AAPL"},
             {"ticker_origin": "unknown", "ticker": None, "ticker_candidate": None},
         ]
+        valid_asset_description = pd.DataFrame(
+            [
+                self.transaction(
+                    ticker_origin="asset_description",
+                    ticker="JPM",
+                    ticker_candidate=None,
+                    raw_ticker=None,
+                )
+            ],
+            columns=SOURCE_TRANSACTION_COLUMNS,
+        )
+        self.db._validate_ticker_origin_matrix(valid_asset_description)
+
         for overrides in bad_rows:
             row = self.transaction(**overrides)
             frame = pd.DataFrame([row], columns=SOURCE_TRANSACTION_COLUMNS)
@@ -1622,6 +1636,29 @@ class TestSourceReports(DatabaseTestCase):
             """
         ).fetchone()[0]
         self.assertEqual(index_count, 0)
+
+    def test_house_adapter_reads_pdf_and_gemini_sources_only(self):
+        self.db.conn.executemany(
+            """
+            INSERT INTO transactions (
+                doc_id, member, ticker, transaction_date, disclosure_date,
+                transaction_type, source
+            ) VALUES (?, 'Member', 'AAPL', '2026-01-01', '2026-01-02',
+                      'Purchase', ?)
+            """,
+            [
+                ("house-pdf", "house_pdf"),
+                ("house-ocr", "gemini_ocr"),
+                ("senate", "senate_efd"),
+            ],
+        )
+        source = object.__new__(HouseTransactionSource)
+        source.db = self.db
+
+        rows = source.get_transactions(2026)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(set(rows["source"]), {"house_pdf", "gemini_ocr"})
 
     def test_source_report_source_column_migrates_and_backfills(self):
         self.db.close()

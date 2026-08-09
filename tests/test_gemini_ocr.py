@@ -701,6 +701,51 @@ def test_parallel_writer_acknowledges_failure(monkeypatch):
     assert str(error) == "boom"
 
 
+def test_semantic_zero_error_preserves_prior_ocr_rows(tmp_path):
+    db_path = tmp_path / "error-preserves.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata VALUES ('error-preserves', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.conn.execute(
+        """INSERT INTO transactions (
+               doc_id, member, ticker, transaction_date, disclosure_date,
+               transaction_type, amount_raw, source, chamber, source_record_id,
+               source_row_id, ingestion_generation, artifact_sha256
+           ) VALUES (
+               'error-preserves', 'Jane Doe', 'OLD', DATE '2024-01-01', DATE '2024-01-20',
+               'Purchase', 'A', 'gemini_ocr', NULL, NULL, 'legacy', NULL, 'old-sha'
+           )"""
+    )
+    db.close()
+
+    for _ in range(2):
+        assert (
+            _insert_transactions(
+                "error-preserves",
+                2024,
+                "Jane Doe",
+                [],
+                db_path=str(db_path),
+                raw_count=3,
+            )
+            == 0
+        )
+    connection = duckdb.connect(str(db_path))
+    rows = connection.execute(
+        "SELECT ticker FROM transactions WHERE doc_id='error-preserves'"
+    ).fetchall()
+    latest = connection.execute(
+        "SELECT status, raw_row_count, transaction_count, error_message "
+        "FROM pdf_parse_runs WHERE doc_id='error-preserves' "
+        "ORDER BY parsed_at DESC LIMIT 1"
+    ).fetchone()
+    connection.close()
+    assert rows == [("OLD",)]
+    assert latest == ("error", 3, 0, "semantic_zero_after_raw_rows")
+
+
 def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
     from scripts.ocr_zero_rows import get_ocr_work_items
 
@@ -723,7 +768,9 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
                ('no-txs', 'Jane Doe', 'OLD', DATE '2024-01-01', DATE '2024-01-20',
                 'Purchase', 'A', 'gemini_ocr', NULL, NULL, 'legacy-null', NULL, 'old-sha'),
                ('no-txs', 'Jane Doe', 'CAP', DATE '2024-01-02', DATE '2024-01-20',
-                'Purchase', 'A', 'capitol_trades', 'House', 'no-txs', 'cap', 'v1', 'cap-sha')
+                'Purchase', 'A', 'capitol_trades', 'House', 'no-txs', 'cap', 'v1', 'cap-sha'),
+               ('no-txs', 'Jane Doe', 'SEN', DATE '2024-01-03', DATE '2024-01-20',
+                'Purchase', 'A', 'gemini_ocr', 'Senate', 'no-txs', 'sen', 'old', 'sen-sha')
         """
     )
     db.close()
@@ -752,14 +799,15 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
     )
     connection = duckdb.connect(str(db_path))
     rows = connection.execute(
-        "SELECT source, COUNT(*) FROM transactions WHERE doc_id='no-txs' GROUP BY source"
+        "SELECT source, COUNT(*) FROM transactions WHERE doc_id='no-txs' "
+        "GROUP BY source ORDER BY source"
     ).fetchall()
     latest = connection.execute(
         "SELECT status, raw_row_count, transaction_count FROM pdf_parse_runs "
         "WHERE doc_id='no-txs' ORDER BY parsed_at DESC LIMIT 1"
     ).fetchone()
     connection.close()
-    assert rows == [("capitol_trades", 1)]
+    assert rows == [("capitol_trades", 1), ("gemini_ocr", 1)]
     assert latest == ("no_txs", 0, 0)
     assert get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path, year=2024) == []
 

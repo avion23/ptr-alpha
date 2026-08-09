@@ -190,10 +190,13 @@ def get_ocr_work_items(
         ), tx AS (
             SELECT doc_id,
                    COUNT(*) FILTER (
-                       WHERE source = 'gemini_ocr' AND ingestion_generation = ?
+                       WHERE source = 'gemini_ocr'
+                             AND (chamber = 'House' OR chamber IS NULL)
+                             AND ingestion_generation = ?
                    ) AS current_ocr_row_count,
                    COUNT(*) FILTER (
                        WHERE source = 'gemini_ocr'
+                         AND (chamber = 'House' OR chamber IS NULL)
                          AND (ingestion_generation IS NULL OR ingestion_generation <> ?)
                    ) AS stale_ocr_row_count
             FROM transactions
@@ -245,6 +248,7 @@ def get_ocr_work_items(
                    transaction_date, notification_date, amount_raw
             FROM transactions
             WHERE doc_id = ? AND source = 'gemini_ocr'
+              AND (chamber = 'House' OR chamber IS NULL)
               AND ingestion_generation = ? AND artifact_sha256 = ?
             ORDER BY source_row_id
             """,
@@ -1039,11 +1043,12 @@ def insert_transactions(
         message = "semantic_zero_after_raw_rows" if raw_count else ""
         conn.execute("BEGIN TRANSACTION")
         try:
-            conn.execute(
-                "DELETE FROM transactions WHERE source = 'gemini_ocr' "
-                "AND doc_id = ? AND (chamber = 'House' OR chamber IS NULL)",
-                [str(doc_id)],
-            )
+            if status == "no_txs":
+                conn.execute(
+                    "DELETE FROM transactions WHERE source = 'gemini_ocr' "
+                    "AND doc_id = ? AND (chamber = 'House' OR chamber IS NULL)",
+                    [str(doc_id)],
+                )
             record_parse_run(
                 conn,
                 doc_id,

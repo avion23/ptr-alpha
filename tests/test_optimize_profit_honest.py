@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -189,7 +190,11 @@ def test_phase_embargo_precommits_future_final_without_consuming_it():
     selection, retrospective, final = main._phase_dates()
 
     assert retrospective.min() == main.RETROSPECTIVE_START
-    assert final.min() == main.FINAL_TEST_START
+    lock = json.loads(main._canonical_final_lock_path().read_text())
+    assert (
+        final.tolist()
+        == pd.DatetimeIndex(pd.to_datetime(lock["decision_dates"])).tolist()
+    )
     assert selection.max() + pd.Timedelta(days=main.HORIZON) <= retrospective.min()
     assert retrospective.max() + pd.Timedelta(days=main.HORIZON) <= final.min()
     assert final.min() > main.RETROSPECTIVE_END
@@ -328,7 +333,9 @@ def test_manifest_labels_reused_history_and_locks_unconsumed_final(tmp_path):
     assert "untouched" not in json.dumps(manifest).lower()
     assert manifest["final_test"]["status"] == "repository_lock_not_evaluated"
     assert manifest["final_test"]["consumed"] is False
+    lock = json.loads(main._canonical_final_lock_path().read_text())
     assert manifest["final_test"]["start"] == "2026-10-01"
+    assert manifest["final_test"]["scheduled_as_of_dates"] == lock["decision_dates"]
     assert manifest["final_test"]["analytics_queried"] is False
     assert manifest["final_test"]["database_whole_file_hashed"] is True
     assert manifest["source_aggregate_sha256"]
@@ -370,8 +377,15 @@ def test_final_lock_tamper_and_noncanonical_path_fail_closed(tmp_path):
         main._load_and_verify_repository_lock(path)
     with (
         patch.object(main, "_canonical_final_lock_path", return_value=path),
-        patch.object(main, "EXPECTED_FINAL_LOCK_SHA256", original_sha),
-        patch.object(main, "FINAL_LOCK_COMMIT", "canary"),
+        patch.object(
+            main,
+            "_load_final_seal",
+            return_value={
+                "schema_version": 1,
+                "lock_sha256": original_sha,
+                "lock_commit": "canary",
+            },
+        ),
     ):
         with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
             main._load_and_verify_repository_lock(path)
@@ -383,11 +397,21 @@ def test_final_runtime_mismatch_fails_before_git_or_database():
     lock = json.loads(lock_path.read_text())
     wrong_runtime = {**lock["runtime_fingerprint"], "python_version": "0.0"}
     with (
-        patch.object(main, "EXPECTED_FINAL_LOCK_SHA256", lock_sha),
-        patch.object(main, "FINAL_LOCK_COMMIT", "canary"),
+        patch.object(
+            main,
+            "_load_final_seal",
+            return_value={
+                "schema_version": 1,
+                "lock_sha256": lock_sha,
+                "lock_commit": "canary",
+            },
+        ),
         patch.object(main, "_locked_runtime_fingerprint", return_value=wrong_runtime),
+        patch.object(main, "_lock_blob_sha256", return_value=lock_sha),
     ):
-        with pytest.raises(RuntimeError, match="Runtime or dependency"):
+        with pytest.raises(
+            RuntimeError, match="Runtime, platform, architecture, BLAS, or dependencies"
+        ):
             main._load_and_verify_repository_lock(lock_path)
 
 
@@ -445,6 +469,8 @@ def test_append_only_consumption_reservation_is_atomic_and_irreversible(tmp_path
     with (
         patch.object(main, "_canonical_consumption_ledger_path", return_value=ledger),
         patch.object(main, "_git_state", return_value={"commit": "canary"}),
+        patch.object(main, "_consumption_anchor_commit", return_value=None),
+        patch.object(main, "_commit_consumption_anchor"),
         ThreadPoolExecutor(max_workers=2) as pool,
     ):
         outcomes = list(pool.map(lambda _: attempt_reservation(), range(2)))
@@ -496,8 +522,102 @@ def test_final_claim_requires_power_null_constant_and_multiplicity_gates():
     assert result["runtime"] == {"python": "canary"}
 
 
-def test_verifier_hardcodes_repository_lock_sha_and_ancestor():
-    assert main.EXPECTED_FINAL_LOCK_SHA256 == main._sha256_file(
-        main._canonical_final_lock_path()
+def test_sealed_source_includes_exact_main_and_semantic_constants():
+    lock = json.loads(main._canonical_final_lock_path().read_text())
+    sources, aggregate = main._source_hashes()
+
+    assert lock["sealed_source_sha256"] == sources
+    assert lock["sealed_source_sha256"]["optimize_profit/main.py"] == main._sha256_file(
+        main._repo_root() / "optimize_profit" / "main.py"
     )
-    assert main.FINAL_LOCK_COMMIT == "fb83710e4f615ff0e6a676f0fa661c337211daaa"
+    assert lock["sealed_source_aggregate_sha256"] == aggregate
+    assert lock["semantic_constants"] == main._semantic_constants()
+    assert lock["runtime_fingerprint"] == main._locked_runtime_fingerprint()
+
+
+def _init_git_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Canary"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "canary@example.test"], cwd=path, check=True
+    )
+    (path / "base.txt").write_text("base\n")
+    subprocess.run(["git", "add", "base.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=path, check=True)
+
+
+def test_consumption_reservation_is_git_committed_and_ref_survives_unlink(tmp_path):
+    _init_git_repo(tmp_path)
+    ledger = tmp_path / "data" / "optimize_profit_final_consumption.jsonl"
+    with (
+        patch.object(main, "_repo_root", return_value=tmp_path),
+        patch.object(main, "_canonical_consumption_ledger_path", return_value=ledger),
+    ):
+        reservation = main._reserve_final_consumption("a" * 64)
+        anchor = main._consumption_anchor_commit("a" * 64)
+        assert (
+            anchor
+            == subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=tmp_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        assert main._git_state()["dirty"] is False
+        event = json.loads(ledger.read_text().splitlines()[0])
+        assert event["reservation_id"] == reservation
+        assert event["previous_event_sha256"] == "0" * 64
+        ledger.unlink()
+        assert main._consumption_anchor_commit("a" * 64) == anchor
+
+
+def test_coordinated_lock_and_seal_tamper_is_rejected_by_git_history(tmp_path):
+    _init_git_repo(tmp_path)
+    optimize = tmp_path / "optimize_profit"
+    optimize.mkdir()
+    lock_path = optimize / "final_lock.json"
+    seal_path = optimize / "final_lock.sha256"
+    lock_path.write_text("{}\n")
+    subprocess.run(
+        ["git", "add", str(lock_path.relative_to(tmp_path))], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "commit", "-qm", "lock"], cwd=tmp_path, check=True)
+    lock_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    seal_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "lock_sha256": main._sha256_file(lock_path),
+                "lock_commit": lock_commit,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    subprocess.run(
+        ["git", "add", str(seal_path.relative_to(tmp_path))], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "commit", "-qm", "seal"], cwd=tmp_path, check=True)
+    with (
+        patch.object(main, "_repo_root", return_value=tmp_path),
+        patch.object(main, "_canonical_final_seal_path", return_value=seal_path),
+    ):
+        assert main._load_final_seal()["lock_commit"] == lock_commit
+        lock_path.write_text('{"tampered":true}\n')
+        tampered = json.loads(seal_path.read_text())
+        tampered["lock_sha256"] = main._sha256_file(lock_path)
+        seal_path.write_text(json.dumps(tampered, sort_keys=True) + "\n")
+        subprocess.run(["git", "add", "optimize_profit"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "coordinated tamper"], cwd=tmp_path, check=True
+        )
+        with pytest.raises(RuntimeError, match="added once and never modified"):
+            main._load_final_seal()

@@ -1,9 +1,142 @@
 {
-  "analytic_source_aggregate_sha256": "dd7a426fe9518dcdb60672ac7fbb541ec341b7f902cf1366fb5f8763811bd4fe",
-  "analytic_source_sha256": {
-    "optimize_profit/__init__.py": "f3e44555e76296751baefab2bb918effc111e3ed7a333f905289dc9e69784000",
+  "claim_gates": {
+    "final_alpha_p_max": 0.05,
+    "final_null_p_max": 0.05,
+    "pre_final_permutation_p_max": 0.01
+  },
+  "config_sha256": "ab54ce36e98ba76520ee1d40623a10cbccef9d7086ae856f0cbb8dcb5465ce9c",
+  "consumption": {
+    "anchor": "append-only SHA-256 event chain; each event and result is committed to Git; refs/optimize-profit/final-consumption/<lock-sha> advances atomically and survives branch reset or ledger unlink",
+    "canonical_ledger": "data/optimize_profit_final_consumption.jsonl",
+    "canonical_result": "data/optimize_profit_final_result.json",
+    "maximum_evaluations": 1,
+    "reservation": "Git-committed and ref-anchored before any database hash, open, or analytic query"
+  },
+  "db_access_statement": "Retrospective runs may read the DB whole file to hash it but do not analytically query locked final-period rows.",
+  "decision_dates": [
+    "2026-10-01",
+    "2027-01-01",
+    "2027-04-01",
+    "2027-07-01",
+    "2027-10-01",
+    "2028-01-01",
+    "2028-04-01",
+    "2028-07-01"
+  ],
+  "endpoint_policy": {
+    "entry": "first SPY trading date on/after decision within 7 calendar days",
+    "exit": "first SPY trading date on/after decision+horizon within 7 calendar days",
+    "missing_data": "fail final evaluation; no stale, delisted fallback, skip, or cash substitution",
+    "round_trip_slippage_bps": 20,
+    "ticker_and_spy": "all selected ticker and SPY values must exist exactly on common endpoints"
+  },
+  "final_null_permutations": 999,
+  "horizon_days": 90,
+  "lock_id": "ptr-alpha-final-2026q4-2028q3-v2",
+  "locked_at_utc": "2026-08-09T18:50:00Z",
+  "locked_config": {
+    "allocation": "signal",
+    "decay_lambda": 0.003,
+    "min_buyers": 2,
+    "scoring_fn": "sharpe",
+    "top_n": 3
+  },
+  "minimum_final_observations": 8,
+  "pre_final_evidence": {
+    "bonferroni_passed": false,
+    "empirical_p_value": 0.028,
+    "phase": "retrospective_validation_reused_history",
+    "profit_claim_allowed": false,
+    "retrospective_alpha_sharpe": 0.61,
+    "retrospective_spy_return_pct": 21.85,
+    "retrospective_strategy_return_pct": 39.09,
+    "selection_empirical_permutation_p_value": 0.028,
+    "selection_trials": 408
+  },
+  "precommit_cutoff_date": "2026-08-09",
+  "required_price_through": "2028-09-29",
+  "runtime_fingerprint": {
+    "blas": {
+      "detection method": "system",
+      "found": true,
+      "include directory": "unknown",
+      "lib directory": "unknown",
+      "name": "accelerate",
+      "openblas configuration": "unknown",
+      "pc file directory": "unknown",
+      "version": "unknown"
+    },
+    "dependencies": {
+      "duckdb": "1.4.4",
+      "numpy": "2.4.6",
+      "pandas": "3.0.1",
+      "pydantic": "2.12.5",
+      "requests": null,
+      "scipy": "1.17.1",
+      "yfinance": "1.2.0"
+    },
+    "lapack": {
+      "detection method": "system",
+      "found": true,
+      "include directory": "unknown",
+      "lib directory": "unknown",
+      "name": "accelerate",
+      "openblas configuration": "unknown",
+      "pc file directory": "unknown",
+      "version": "unknown"
+    },
+    "numpy_machine": {
+      "build": {
+        "cpu": "aarch64",
+        "endian": "little",
+        "family": "aarch64",
+        "system": "darwin"
+      },
+      "host": {
+        "cpu": "aarch64",
+        "endian": "little",
+        "family": "aarch64",
+        "system": "darwin"
+      }
+    },
+    "platform": {
+      "architecture": [
+        "64bit",
+        "Mach-O"
+      ],
+      "byteorder": "little",
+      "machine": "arm64",
+      "processor": "arm",
+      "release": "25.5.0",
+      "system": "Darwin",
+      "version": "Darwin Kernel Version 25.5.0: Tue Jun  9 22:28:34 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T6041"
+    },
+    "python_implementation": "CPython",
+    "python_version": "3.14.6",
+    "simd": {
+      "baseline": [
+        "NEON",
+        "NEON_FP16",
+        "NEON_VFPV4",
+        "ASIMD"
+      ],
+      "found": [
+        "ASIMDHP",
+        "ASIMDDP"
+      ],
+      "not found": [
+        "ASIMDFHM"
+      ]
+    }
+  },
+  "schema_version": 2,
+  "sealed_source_aggregate_sha256": "b4e18c3ae02b66cf52dcad115c83dfc5de4bc234a00161611bbf772079443fac",
+  "sealed_source_sha256": {
+    "optimize_profit/__init__.py": "f8e8c376aeddc23faae31d18ebdaa12c45ff5c5a87f111ef99312a10358cb0f9",
+    "optimize_profit/main.py": "eb9eb50e118ff8c848e014be5e567de97046bb3ad9fa295253836e5f4323ceaf",
     "optimize_profit/metrics.py": "dea238f90df2f6966703c5cedc6e6722e49b1e476f7cff8ace31480e0bd29c6e",
     "optimize_profit/precompute.py": "cc2055061a838416d67243a596e3707b59db888f8518f95afb22497bb6392db0",
+    "optimize_profit/reporting.py": "ba235faef7300aef6172a2789018a52f62032791ce9005dc15be95debd07893a",
     "optimize_profit/scoring.py": "c06209ed8d65317b4e4ee92ada6a6114c5beef7226d3dddae80c5b3350c2852a",
     "optimize_profit/walk_forward.py": "500c893b32ddeedfae1a5ea394786767fa0aea3496a368a83ca0591f92661bb1",
     "src/analyzer/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -75,71 +208,88 @@
     "src/analyzer/transaction_repository.py": "05f3aa122ba639a92fa395b5ea0cebb9d8aa623f7e7295c752f75e78c6972350",
     "src/analyzer/validation.py": "81880664e94bbb4a25f16ad95f781450561a954d53646edee3088a17a8ab6f86"
   },
-  "config_sha256": "ab54ce36e98ba76520ee1d40623a10cbccef9d7086ae856f0cbb8dcb5465ce9c",
-  "consumption": {
-    "canonical_ledger": "data/optimize_profit_final_consumption.jsonl",
-    "maximum_evaluations": 1,
-    "reservation": "append-only flock reservation before any DB hash/open/query"
-  },
-  "db_access_statement": "Retrospective runs may read the DB whole file to hash it but do not analytically query locked final-period rows.",
-  "decision_dates": [
-    "2026-10-01",
-    "2027-01-01",
-    "2027-04-01",
-    "2027-07-01",
-    "2027-10-01",
-    "2028-01-01",
-    "2028-04-01",
-    "2028-07-01"
-  ],
-  "endpoint_policy": {
-    "entry": "first SPY trading date on/after decision within 7 calendar days",
-    "exit": "first SPY trading date on/after decision+horizon within 7 calendar days",
-    "missing_data": "fail final evaluation; no stale, delisted fallback, skip, or cash substitution",
-    "round_trip_slippage_bps": 20,
-    "ticker_and_spy": "all selected ticker and SPY values must exist exactly on common endpoints"
-  },
-  "final_alpha_p_max": 0.05,
-  "final_null_empirical_p_max": 0.05,
-  "final_null_permutations": 999,
-  "horizon_days": 90,
-  "lock_id": "ptr-alpha-final-2026q4-2028q3-v1",
-  "locked_at_utc": "2026-08-09T18:10:00Z",
-  "locked_config": {
-    "allocation": "signal",
-    "decay_lambda": 0.003,
-    "min_buyers": 2,
-    "scoring_fn": "sharpe",
-    "top_n": 3
-  },
-  "minimum_final_observations": 8,
-  "pre_final_evidence": {
-    "bonferroni_passed": false,
-    "empirical_p_value": 0.028,
-    "phase": "retrospective_validation_reused_history",
-    "profit_claim_allowed": false,
-    "retrospective_alpha_sharpe": 0.61,
-    "retrospective_spy_return_pct": 21.85,
-    "retrospective_strategy_return_pct": 39.09,
-    "selection_empirical_permutation_p_value": 0.028,
-    "selection_trials": 408
-  },
-  "precommit_cutoff_date": "2026-08-09",
-  "required_price_through": "2028-09-29",
-  "runtime_fingerprint": {
-    "dependencies": {
-      "duckdb": "1.4.4",
-      "numpy": "2.4.6",
-      "pandas": "3.0.1",
-      "pydantic": "2.12.5",
-      "requests": null,
-      "scipy": "1.17.1",
-      "yfinance": "1.2.0"
+  "semantic_constants": {
+    "buy_slippage_factor": 1.001,
+    "dependencies": [
+      "pandas",
+      "numpy",
+      "scipy",
+      "duckdb",
+      "pydantic",
+      "requests",
+      "yfinance"
+    ],
+    "endpoint_max_delay_days": 7,
+    "final_alpha": 0.05,
+    "final_null_alpha": 0.05,
+    "horizon_days": 90,
+    "lookback_days": 60,
+    "metric_keys": [
+      "total_return_pct",
+      "spy_total_return_pct",
+      "excess_total_return_pct",
+      "mean_alpha_pct",
+      "sharpe",
+      "alpha_sharpe",
+      "terminal_observation_drawdown_pct",
+      "win_rate_pct",
+      "n_periods",
+      "n_cash_periods",
+      "avg_positions",
+      "requested_periods",
+      "coverage_pct",
+      "support_sha256"
+    ],
+    "minimum_null_permutations": 999,
+    "parameter_grid": {
+      "allocation": [
+        "equal",
+        "signal"
+      ],
+      "decay_lambda": [
+        0.003,
+        0.005
+      ],
+      "min_buyers": [
+        1,
+        2,
+        3
+      ],
+      "scoring_fn": [
+        "shrunk_alpha",
+        "inverted_alpha",
+        "trade_frequency",
+        "consistency",
+        "bayesian_quality",
+        "neg_bayesian_quality",
+        "smooth_trade_thresh",
+        "softplus_quality",
+        "sharpe",
+        "recency_consistency",
+        "consistency_sharpe",
+        "consistency_bayes",
+        "conviction_consistency",
+        "recency_bayes",
+        "volume_consistency",
+        "alpha_consistency",
+        "meta_ensemble"
+      ],
+      "top_n": [
+        3,
+        5
+      ]
     },
-    "python_implementation": "CPython",
-    "python_version": "3.14.6"
+    "rebalance_days": 90,
+    "retrospective_alpha": 0.1,
+    "retrospective_end": "2025-06-30",
+    "retrospective_start": "2024-07-01",
+    "selection_empirical_alpha": 0.01,
+    "selection_family_alpha": 0.05,
+    "selection_start": "2022-01-01",
+    "sell_slippage_factor": 0.999,
+    "training_lookback_days": 365,
+    "tx_start": "2021-10-07"
   },
-  "schema_version": 1,
   "test_end": "2028-07-01",
   "test_start": "2026-10-01"
 }

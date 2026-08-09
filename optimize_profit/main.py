@@ -48,31 +48,19 @@ TX_START = pd.Timestamp("2021-10-07")
 SELECTION_START = pd.Timestamp("2022-01-01")
 RETROSPECTIVE_START = pd.Timestamp("2024-07-01")
 RETROSPECTIVE_END = pd.Timestamp("2025-06-30")
-FINAL_TEST_START = pd.Timestamp("2026-10-01")
-FINAL_TEST_END = pd.Timestamp("2028-07-01")
-FINAL_TEST_DATES = pd.DatetimeIndex(
-    pd.to_datetime(
-        (
-            "2026-10-01",
-            "2027-01-01",
-            "2027-04-01",
-            "2027-07-01",
-            "2027-10-01",
-            "2028-01-01",
-            "2028-04-01",
-            "2028-07-01",
-        )
-    )
-)
-EXPECTED_FINAL_LOCK_SHA256: str | None = (
-    "b36850601d3a28cdd0dd3e6ddb3b3554fde1ac79d3a9683e512b1abeccf094a1"
-)
-FINAL_LOCK_COMMIT: str | None = "fb83710e4f615ff0e6a676f0fa661c337211daaa"
 HORIZON = 90
 REBALANCE_DAYS = HORIZON
 LOOKBACK_DAYS = 60
 TRAINING_LOOKBACK_DAYS = 365
 MIN_NULL_PERMUTATIONS = 999
+SELECTION_FAMILY_ALPHA = 0.05
+SELECTION_EMPIRICAL_ALPHA = 0.01
+RETROSPECTIVE_ALPHA = 0.10
+FINAL_NULL_ALPHA = 0.05
+FINAL_ALPHA = 0.05
+ENDPOINT_MAX_DELAY_DAYS = 7
+BUY_SLIPPAGE_FACTOR = 1.001
+SELL_SLIPPAGE_FACTOR = 0.999
 NULL_PERMUTATIONS = int(
     os.environ.get("OPTIMIZE_PROFIT_NULL_PERMUTATIONS", MIN_NULL_PERMUTATIONS)
 )
@@ -133,7 +121,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def run_retrospective(db_path: Path, output_root: Path) -> Path:
     config = _manifest_config(db_path)
-    selection_dates, retrospective_dates, _ = _phase_dates()
+    selection_dates, retrospective_dates, final_dates = _phase_dates()
     retrospective_price_end = RETROSPECTIVE_END + pd.Timedelta(days=HORIZON + 7)
 
     with Database(db_path, read_only=True) as db:
@@ -252,7 +240,7 @@ def run_retrospective(db_path: Path, output_root: Path) -> Path:
 
     print_selection(selected, len(trials_df), null_empirical_p)
     print_retrospective(retrospective_run, retrospective_spy, retrospective_constant)
-    print_verdict(retrospective_passed, reasons, artifact_dir, FINAL_TEST_START.date())
+    print_verdict(retrospective_passed, reasons, artifact_dir, final_dates.min().date())
     return artifact_dir
 
 
@@ -264,7 +252,8 @@ def _phase_dates() -> tuple[pd.DatetimeIndex, pd.DatetimeIndex, pd.DatetimeIndex
     retrospective = pd.date_range(
         RETROSPECTIVE_START, RETROSPECTIVE_END, freq=f"{REBALANCE_DAYS}D"
     )
-    final = pd.date_range(FINAL_TEST_START, FINAL_TEST_END, freq=f"{REBALANCE_DAYS}D")
+    lock = _read_repository_lock()
+    final = pd.DatetimeIndex(pd.to_datetime(lock["decision_dates"]))
     _assert_phase_embargo(selection, retrospective, "selection", "retrospective")
     _assert_phase_embargo(retrospective, final, "retrospective", "final_test")
     return selection, retrospective, final
@@ -361,7 +350,7 @@ def _run_selection_sweep(entry_prices, transactions, prices, selection_sets):
             for rejection in run["rejection_ledger"]
         )
     trials = pd.DataFrame(rows)
-    threshold = 0.05 / len(trials)
+    threshold = SELECTION_FAMILY_ALPHA / len(trials)
     trials["bonferroni_threshold"] = threshold
     trials["bonferroni_significant"] = trials["alpha_p_value"] <= threshold
     return trials, all_periods, all_rejections
@@ -566,7 +555,7 @@ def _assess_retrospective(
         reasons.append(
             f"Only {NULL_PERMUTATIONS} null permutations; result is diagnostic only"
         )
-    if null_empirical_p > 0.01:
+    if null_empirical_p > SELECTION_EMPIRICAL_ALPHA:
         reasons.append("Selection empirical permutation p-value exceeds 0.01")
     if retrospective["mean_alpha_pct"] <= 0:
         reasons.append("Retrospective mean opportunity alpha is not positive")
@@ -577,7 +566,7 @@ def _assess_retrospective(
     shuffled = null_df[null_df["phase"] == "retrospective_validation"]["alpha_sharpe"]
     if not shuffled.empty and retrospective["alpha_sharpe"] <= shuffled.quantile(0.99):
         reasons.append("Frozen strategy did not exceed the 99th percentile null scorer")
-    if _alpha_p_value(retrospective["period_results"]) > 0.10:
+    if _alpha_p_value(retrospective["period_results"]) > RETROSPECTIVE_ALPHA:
         reasons.append("Retrospective one-sided alpha p-value exceeds 0.10")
     return not reasons, reasons
 
@@ -632,7 +621,7 @@ def _persist_artifacts(**kwargs) -> Path:
         "family_gate": {
             "method": "bonferroni",
             "n_trials": len(kwargs["trials_df"]),
-            "threshold": 0.05 / len(kwargs["trials_df"]),
+            "threshold": SELECTION_FAMILY_ALPHA / len(kwargs["trials_df"]),
             "passed": kwargs["family_gate_passed"],
         },
         "null_test": {
@@ -708,6 +697,14 @@ def _canonical_final_lock_path() -> Path:
     return _repo_root() / "optimize_profit" / "final_lock.json"
 
 
+def _canonical_final_seal_path() -> Path:
+    return _repo_root() / "optimize_profit" / "final_lock.sha256"
+
+
+def _read_repository_lock() -> dict:
+    return json.loads(_canonical_final_lock_path().read_text())
+
+
 def _canonical_consumption_ledger_path() -> Path:
     return _repo_root() / "data" / "optimize_profit_final_consumption.jsonl"
 
@@ -725,40 +722,171 @@ def _json_default(value):
     raise TypeError(f"Cannot JSON encode {type(value).__name__}")
 
 
+def _load_final_seal() -> dict:
+    seal_path = _canonical_final_seal_path()
+    if not seal_path.exists():
+        raise RuntimeError("Repository final lock is not sealed")
+    seal = json.loads(seal_path.read_text())
+    if set(seal) != {"lock_commit", "lock_sha256", "schema_version"}:
+        raise RuntimeError("Final lock seal has unexpected fields")
+    repo = _repo_root()
+    history = subprocess.run(
+        ["git", "log", "--format=%H", "--", str(seal_path.relative_to(repo))],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    if len(history) != 1:
+        raise RuntimeError("Final lock seal must be added once and never modified")
+    sealed_blob = subprocess.run(
+        ["git", "show", f"{history[0]}:{seal_path.relative_to(repo)}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if sealed_blob != seal_path.read_text():
+        raise RuntimeError(
+            "Working final lock seal differs from its immutable Git blob"
+        )
+    return seal
+
+
+def _lock_blob_sha256(lock_commit: str, path: Path) -> str:
+    blob = subprocess.run(
+        ["git", "show", f"{lock_commit}:{path.relative_to(_repo_root())}"],
+        cwd=_repo_root(),
+        check=True,
+        capture_output=True,
+    ).stdout
+    return hashlib.sha256(blob).hexdigest()
+
+
 def _load_and_verify_repository_lock(requested_path: Path) -> tuple[dict, str]:
     canonical = _canonical_final_lock_path().resolve()
     if requested_path.resolve() != canonical:
         raise RuntimeError(f"Only repository lock {canonical} is accepted")
+    seal = _load_final_seal()
     lock_sha = _sha256_file(canonical)
-    if EXPECTED_FINAL_LOCK_SHA256 is None or FINAL_LOCK_COMMIT is None:
-        raise RuntimeError("Final lock verifier constants are not sealed")
-    if lock_sha != EXPECTED_FINAL_LOCK_SHA256:
+    if lock_sha != seal["lock_sha256"]:
         raise RuntimeError("Repository final lock SHA-256 mismatch")
+    repo = _repo_root()
+    if _lock_blob_sha256(seal["lock_commit"], canonical) != lock_sha:
+        raise RuntimeError("Final lock differs from the blob in its creation commit")
     lock = json.loads(canonical.read_text())
     if _canonical_json_sha256(lock["locked_config"]) != lock["config_sha256"]:
         raise RuntimeError("Locked strategy config hash mismatch")
-    current_sources, aggregate = _analytic_source_hashes()
-    if current_sources != lock["analytic_source_sha256"]:
-        raise RuntimeError("Analytic source files differ from the final lock")
-    if aggregate != lock["analytic_source_aggregate_sha256"]:
-        raise RuntimeError("Analytic source aggregate differs from the final lock")
-    current_runtime = _locked_runtime_fingerprint()
-    if current_runtime != lock["runtime_fingerprint"]:
-        raise RuntimeError("Runtime or dependency versions differ from the final lock")
+    current_sources, aggregate = _source_hashes()
+    if current_sources != lock["sealed_source_sha256"]:
+        raise RuntimeError(
+            "Current source, including the verifier, differs from the lock"
+        )
+    if aggregate != lock["sealed_source_aggregate_sha256"]:
+        raise RuntimeError("Current source aggregate differs from the lock")
+    if _semantic_constants() != lock["semantic_constants"]:
+        raise RuntimeError("Semantic constants differ from the final lock")
+    if _locked_runtime_fingerprint() != lock["runtime_fingerprint"]:
+        raise RuntimeError(
+            "Runtime, platform, architecture, BLAS, or dependencies differ"
+        )
     git = _git_state()
     if git["dirty"]:
         raise RuntimeError("Final evaluation requires a clean worktree")
-    descendant = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", FINAL_LOCK_COMMIT, git["commit"]],
-        check=False,
-    )
-    if descendant.returncode != 0:
-        raise RuntimeError("Current commit is not a descendant of the lock commit")
+    for ancestor in (seal["lock_commit"],):
+        descendant = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, git["commit"]],
+            cwd=repo,
+            check=False,
+        )
+        if descendant.returncode != 0:
+            raise RuntimeError("Current commit is not a descendant of the lock commit")
     return lock, lock_sha
 
 
+def _consumption_ref(lock_sha: str) -> str:
+    return f"refs/optimize-profit/final-consumption/{lock_sha}"
+
+
+def _consumption_anchor_commit(lock_sha: str) -> str | None:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", _consumption_ref(lock_sha)],
+        cwd=_repo_root(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _hashed_consumption_event(payload: dict, previous_hash: str) -> dict:
+    event = {**payload, "previous_event_sha256": previous_hash}
+    event["event_sha256"] = _canonical_json_sha256(event)
+    return event
+
+
+def _validate_consumption_chain(events: list[dict]) -> None:
+    previous = "0" * 64
+    for event in events:
+        claimed = event.get("event_sha256")
+        payload = {key: value for key, value in event.items() if key != "event_sha256"}
+        if event.get("previous_event_sha256") != previous:
+            raise RuntimeError("Final consumption ledger hash chain is broken")
+        if _canonical_json_sha256(payload) != claimed:
+            raise RuntimeError("Final consumption event hash is invalid")
+        previous = claimed
+
+
+def _commit_consumption_anchor(
+    lock_sha: str, event: dict, extra_paths: tuple[Path, ...] = ()
+) -> None:
+    repo = _repo_root()
+    ledger = _canonical_consumption_ledger_path()
+    previous_anchor = _consumption_anchor_commit(lock_sha)
+    paths = (ledger, *extra_paths)
+    relative_paths = [str(path.resolve().relative_to(repo.resolve())) for path in paths]
+    subprocess.run(
+        ["git", "add", "--force", "--", *relative_paths], cwd=repo, check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            f"final-test: {event['event']} {event['event_sha256']}",
+            "--",
+            *relative_paths,
+        ],
+        cwd=repo,
+        check=True,
+    )
+    commit = _git_state()["commit"]
+    old = previous_anchor or "0" * 40
+    updated = subprocess.run(
+        ["git", "update-ref", _consumption_ref(lock_sha), commit, old],
+        cwd=repo,
+        check=False,
+    )
+    if updated.returncode != 0:
+        raise RuntimeError("Could not atomically advance final consumption Git anchor")
+    state = _git_state()
+    if state["dirty"]:
+        raise RuntimeError("Consumption event commit did not leave a clean worktree")
+    committed = subprocess.run(
+        ["git", "show", f"{commit}:{relative_paths[0]}"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    ).stdout
+    if hashlib.sha256(committed).hexdigest() != _sha256_file(ledger):
+        raise RuntimeError("Committed consumption ledger differs from working ledger")
+
+
 def _reserve_final_consumption(lock_sha: str) -> str:
-    """Atomically append an irreversible reservation before any DB access."""
+    """Atomically append and Git-anchor reservation before any DB access."""
+    if _consumption_anchor_commit(lock_sha) is not None:
+        raise RuntimeError("Locked final test already has a durable consumption anchor")
     ledger = _canonical_consumption_ledger_path()
     ledger.parent.mkdir(parents=True, exist_ok=True)
     reservation_id = str(uuid.uuid4())
@@ -766,33 +894,43 @@ def _reserve_final_consumption(lock_sha: str) -> str:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         handle.seek(0)
         events = [json.loads(line) for line in handle if line.strip()]
-        if any(event.get("lock_sha256") == lock_sha for event in events):
+        _validate_consumption_chain(events)
+        if events or _consumption_anchor_commit(lock_sha) is not None:
             raise RuntimeError(
                 "Locked final test already has a consumption reservation"
             )
-        event = {
-            "event": "reserved",
-            "lock_sha256": lock_sha,
-            "reservation_id": reservation_id,
-            "reserved_at_utc": datetime.now(timezone.utc).isoformat(),
-            "git_commit": _git_state()["commit"],
-        }
+        event = _hashed_consumption_event(
+            {
+                "event": "reserved",
+                "lock_sha256": lock_sha,
+                "reservation_id": reservation_id,
+                "reserved_at_utc": datetime.now(timezone.utc).isoformat(),
+                "git_commit_before_reservation": _git_state()["commit"],
+            },
+            "0" * 64,
+        )
         handle.seek(0, os.SEEK_END)
         handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+        _commit_consumption_anchor(lock_sha, event)
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     return reservation_id
 
 
 def _append_consumption_event(
-    lock_sha: str, reservation_id: str, event_name: str, payload: dict
+    lock_sha: str,
+    reservation_id: str,
+    event_name: str,
+    payload: dict,
+    extra_paths: tuple[Path, ...] = (),
 ) -> None:
     ledger = _canonical_consumption_ledger_path()
     with ledger.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         handle.seek(0)
         events = [json.loads(line) for line in handle if line.strip()]
+        _validate_consumption_chain(events)
         reserved = any(
             event.get("event") == "reserved"
             and event.get("lock_sha256") == lock_sha
@@ -801,17 +939,21 @@ def _append_consumption_event(
         )
         if not reserved:
             raise RuntimeError("Final consumption reservation is missing")
-        event = {
-            "event": event_name,
-            "lock_sha256": lock_sha,
-            "reservation_id": reservation_id,
-            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
-            **payload,
-        }
+        event = _hashed_consumption_event(
+            {
+                "event": event_name,
+                "lock_sha256": lock_sha,
+                "reservation_id": reservation_id,
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                **payload,
+            },
+            events[-1]["event_sha256"],
+        )
         handle.seek(0, os.SEEK_END)
         handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+        _commit_consumption_anchor(lock_sha, event, extra_paths)
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
@@ -874,6 +1016,7 @@ def evaluate_locked_final(lock_path: Path, db_path: Path) -> Path:
             reservation_id,
             "completed",
             {"result_sha256": _sha256_file(output), "verdict": result["verdict"]},
+            extra_paths=(output,),
         )
         return output
     except Exception as exc:
@@ -997,15 +1140,17 @@ def _strict_endpoint_returns(tickers, prices, as_of, horizon):
         raise RuntimeError(f"SPY endpoints unavailable for {entry_target.date()}")
     entry_date = pd.Timestamp(entry_candidates[0])
     exit_date = pd.Timestamp(exit_candidates[0])
-    if entry_date > entry_target + pd.Timedelta(days=7):
+    if entry_date > entry_target + pd.Timedelta(days=ENDPOINT_MAX_DELAY_DAYS):
         raise RuntimeError(f"SPY entry endpoint too late for {entry_target.date()}")
-    if exit_date > exit_target + pd.Timedelta(days=7):
+    if exit_date > exit_target + pd.Timedelta(days=ENDPOINT_MAX_DELAY_DAYS):
         raise RuntimeError(f"SPY exit endpoint too late for {exit_target.date()}")
     if entry_date not in spy.index or exit_date not in spy.index:
         raise RuntimeError("Exact SPY endpoint coverage is missing")
     spy_entry = float(spy.loc[entry_date])
     spy_exit = float(spy.loc[exit_date])
-    spy_return = (spy_exit * 0.999 / (spy_entry * 1.001) - 1) * 100
+    spy_return = (
+        spy_exit * SELL_SLIPPAGE_FACTOR / (spy_entry * BUY_SLIPPAGE_FACTOR) - 1
+    ) * 100
 
     returns = []
     endpoint_rows = []
@@ -1019,7 +1164,15 @@ def _strict_endpoint_returns(tickers, prices, as_of, horizon):
         exit_price = series.loc[exit_date]
         if pd.isna(entry) or pd.isna(exit_price) or entry <= 0 or exit_price <= 0:
             raise RuntimeError(f"Final ticker {ticker} has invalid endpoint prices")
-        returns.append((float(exit_price) * 0.999 / (float(entry) * 1.001) - 1) * 100)
+        returns.append(
+            (
+                float(exit_price)
+                * SELL_SLIPPAGE_FACTOR
+                / (float(entry) * BUY_SLIPPAGE_FACTOR)
+                - 1
+            )
+            * 100
+        )
         endpoint_rows.append(
             {
                 "entry_date": entry_date.date().isoformat(),
@@ -1045,13 +1198,15 @@ def _final_claim_result(lock, lock_sha, db_sha, runtime, family) -> dict:
         "pre_final_permutation_gate": float(
             lock["pre_final_evidence"]["empirical_p_value"]
         )
-        <= 0.01,
+        <= lock["claim_gates"]["pre_final_permutation_p_max"],
         "positive_final_alpha": strategy["mean_alpha_pct"] > 0,
         "positive_return_vs_spy": strategy["total_return_pct"]
         > strategy["spy_total_return_pct"],
         "beats_final_constant": strategy["alpha_sharpe"] > constant["alpha_sharpe"],
-        "final_null_gate": family["null_empirical_p_value"] <= 0.05,
-        "final_alpha_inference": _alpha_p_value(strategy["period_results"]) <= 0.05,
+        "final_null_gate": family["null_empirical_p_value"]
+        <= lock["claim_gates"]["final_null_p_max"],
+        "final_alpha_inference": _alpha_p_value(strategy["period_results"])
+        <= lock["claim_gates"]["final_alpha_p_max"],
         "exact_period_support": strategy["n_periods"] == strategy["requested_periods"],
         "exact_position_count": all(
             row["n_positions"] == int(lock["locked_config"]["top_n"])
@@ -1064,10 +1219,8 @@ def _final_claim_result(lock, lock_sha, db_sha, runtime, family) -> dict:
         "evaluated_at_utc": datetime.now(timezone.utc).isoformat(),
         "db_whole_file_sha256": db_sha,
         "locked_config_sha256": lock["config_sha256"],
-        "locked_analytic_source_sha256": lock["analytic_source_sha256"],
-        "locked_analytic_source_aggregate_sha256": lock[
-            "analytic_source_aggregate_sha256"
-        ],
+        "locked_source_sha256": lock["sealed_source_sha256"],
+        "locked_source_aggregate_sha256": lock["sealed_source_aggregate_sha256"],
         "evaluation_source_sha256": current_sources,
         "evaluation_source_aggregate_sha256": current_source_aggregate,
         "runtime": runtime,
@@ -1087,32 +1240,53 @@ def _final_claim_result(lock, lock_sha, db_sha, runtime, family) -> dict:
     }
 
 
-def _analytic_source_hashes() -> tuple[dict[str, str], str]:
-    repo = _repo_root()
-    paths = sorted((repo / "src" / "analyzer").rglob("*.py"))
-    paths += [
-        repo / "optimize_profit" / name
-        for name in (
-            "__init__.py",
-            "metrics.py",
-            "precompute.py",
-            "scoring.py",
-            "walk_forward.py",
-        )
-    ]
-    hashes = {str(path.relative_to(repo)): _sha256_file(path) for path in paths}
-    aggregate = hashlib.sha256(
-        "".join(f"{name}:{digest}\n" for name, digest in hashes.items()).encode()
-    ).hexdigest()
-    return hashes, aggregate
+def _semantic_constants() -> dict:
+    return {
+        "tx_start": TX_START.date().isoformat(),
+        "selection_start": SELECTION_START.date().isoformat(),
+        "retrospective_start": RETROSPECTIVE_START.date().isoformat(),
+        "retrospective_end": RETROSPECTIVE_END.date().isoformat(),
+        "horizon_days": HORIZON,
+        "rebalance_days": REBALANCE_DAYS,
+        "lookback_days": LOOKBACK_DAYS,
+        "training_lookback_days": TRAINING_LOOKBACK_DAYS,
+        "minimum_null_permutations": MIN_NULL_PERMUTATIONS,
+        "selection_family_alpha": SELECTION_FAMILY_ALPHA,
+        "selection_empirical_alpha": SELECTION_EMPIRICAL_ALPHA,
+        "retrospective_alpha": RETROSPECTIVE_ALPHA,
+        "final_null_alpha": FINAL_NULL_ALPHA,
+        "final_alpha": FINAL_ALPHA,
+        "endpoint_max_delay_days": ENDPOINT_MAX_DELAY_DAYS,
+        "buy_slippage_factor": BUY_SLIPPAGE_FACTOR,
+        "sell_slippage_factor": SELL_SLIPPAGE_FACTOR,
+        "parameter_grid": {key: list(value) for key, value in PARAM_GRID.items()},
+        "metric_keys": list(METRIC_KEYS),
+        "dependencies": list(DEPENDENCIES),
+    }
 
 
 def _locked_runtime_fingerprint() -> dict:
+    import numpy.__config__ as numpy_config
+
     runtime = _runtime_manifest()
+    config = numpy_config.CONFIG
     return {
         "python_implementation": platform.python_implementation(),
         "python_version": platform.python_version(),
         "dependencies": runtime["dependencies"],
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "architecture": list(platform.architecture()),
+            "byteorder": sys.byteorder,
+        },
+        "numpy_machine": config.get("Machine Information"),
+        "blas": config.get("Build Dependencies", {}).get("blas"),
+        "lapack": config.get("Build Dependencies", {}).get("lapack"),
+        "simd": config.get("SIMD Extensions"),
     }
 
 
@@ -1164,10 +1338,15 @@ def _runtime_manifest() -> dict:
 
 def _git_state() -> dict:
     commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ["git", "rev-parse", "HEAD"],
+        cwd=_repo_root(),
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     status = subprocess.run(
         ["git", "status", "--porcelain=v1"],
+        cwd=_repo_root(),
         check=True,
         capture_output=True,
         text=True,

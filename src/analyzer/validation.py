@@ -644,7 +644,8 @@ def select_config(
         "status": "not_required_no_statistical_candidate",
         "release_ready": False,
         "runtime_seconds": 0.0,
-        "required_before_deployment": True,
+        "gating": False,
+        "diagnostic_record": "not_needed_without_statistical_candidate",
         "authorization_source": "canonical_hash_chained_ledger_only",
     }
 
@@ -1058,6 +1059,7 @@ def _authorize_member_control_from_ledger(
         result["member_identity_control"] = {
             "status": "missing_canonical_ledger_control",
             "release_ready": False,
+            "gating": False,
             "authorization_source": "canonical_hash_chained_ledger_only",
         }
         return result

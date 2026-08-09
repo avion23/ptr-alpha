@@ -262,6 +262,9 @@ def test_refresh_accounts_for_parsed_and_verified_paper_reports(monkeypatch):
                 outcome=ReportOutcome.PAPER_ONLY,
                 landing_sha256="b" * 64,
                 paper_artifact_sha256="c" * 64,
+                paper_artifact_url=(
+                    "https://efdsearch.senate.gov/media/paper-filings/report.pdf"
+                ),
             ),
         ]
     )
@@ -287,6 +290,10 @@ def test_refresh_accounts_for_parsed_and_verified_paper_reports(monkeypatch):
     assert result.iloc[0]["artifact_sha256"] == "a" * 64
     assert source.report_inventory[1]["landing_sha256"] == "b" * 64
     assert source.report_inventory[1]["paper_artifact_sha256"] == "c" * 64
+    assert (
+        source.report_inventory[1]["paper_artifact_url"]
+        == "https://efdsearch.senate.gov/media/paper-filings/report.pdf"
+    )
 
 
 def test_unavailable_report_is_inventoried_but_refresh_is_incomplete(monkeypatch):
@@ -408,7 +415,7 @@ def test_paper_only_requires_allowlisted_fetched_pdf_and_separate_hashes():
     assert result.outcome is ReportOutcome.PAPER_ONLY
     assert result.landing_sha256 == hashlib.sha256(html.encode()).hexdigest()
     assert result.paper_artifact_sha256 == hashlib.sha256(pdf).hexdigest()
-    assert not hasattr(result, "paper_artifact_url")
+    assert result.paper_artifact_url == paper_url
 
 
 def test_source_supplied_debt_word_tickers_are_preserved_but_inference_is_guarded():
@@ -537,6 +544,7 @@ def test_paper_artifact_rejects_external_bad_or_redirected_content(
     result = source._fetch_report_transactions(KATIE_REPORT_PATH)
     assert result.outcome is ReportOutcome.FAILED
     assert result.paper_artifact_sha256 is None
+    assert result.paper_artifact_url is None
 
 
 @pytest.mark.parametrize(
@@ -685,6 +693,7 @@ def test_save_calls_atomic_refresh_persistence_with_inventory_and_rows():
         {
             "chamber": "senate",
             "source_record_id": KATIE_REPORT_ID,
+            "official_filing_date": pd.Timestamp("2026-01-29"),
             "artifact_sha256": "a" * 64,
             "landing_sha256": "a" * 64,
             "paper_artifact_sha256": None,
@@ -720,6 +729,7 @@ def test_save_rejects_duplicate_source_row_identity_and_incomplete_refresh():
         {
             "chamber": "senate",
             "source_record_id": KATIE_REPORT_ID,
+            "official_filing_date": pd.Timestamp("2026-01-29"),
             "artifact_sha256": "a" * 64,
             "landing_sha256": "a" * 64,
             "paper_artifact_sha256": None,
@@ -732,6 +742,23 @@ def test_save_rejects_duplicate_source_row_identity_and_incomplete_refresh():
 
     with pytest.raises(SenateEFDError, match="must be unique"):
         source.save_to_db(duplicated)
+
+    invalid_date = frame.copy()
+    invalid_date.loc[0, "available_date"] = pd.NaT
+    with pytest.raises(SenateEFDError, match="provenance values are incomplete"):
+        source.save_to_db(invalid_date)
+
+    invalid_chronology = frame.copy()
+    invalid_chronology.loc[0, "transaction_date"] = pd.Timestamp("2026-01-30")
+    with pytest.raises(SenateEFDError, match="dates are incomplete or invalid"):
+        source.save_to_db(invalid_chronology)
+
+    source.last_refresh_summary = SenateRefreshSummary(
+        found=2, parsed=2, paper_only=0, unavailable=0, failed=0
+    )
+    source.report_inventory = source.report_inventory * 2
+    with pytest.raises(SenateEFDError, match="Duplicate Senate report inventory ID"):
+        source.save_to_db(frame)
 
     source.last_refresh_summary = SenateRefreshSummary(
         found=1, parsed=0, paper_only=0, unavailable=1, failed=0

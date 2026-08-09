@@ -99,6 +99,7 @@ class SenateReportFetchResult:
     transactions: tuple[dict, ...] = ()
     landing_sha256: str | None = None
     paper_artifact_sha256: str | None = None
+    paper_artifact_url: str | None = None
     error_message: str | None = None
 
     @property
@@ -478,42 +479,51 @@ class SenateEFDSource(TransactionSource):
         )
 
     @staticmethod
+    def _is_allowlisted_paper_url(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            parsed_port = parsed.port
+        except (TypeError, ValueError):
+            return False
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "efdsearch.senate.gov"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed_port in {None, 443}
+            and (
+                parsed.path.startswith("/media/")
+                or parsed.path.startswith("/search/view/paper/")
+                or parsed.path.startswith("/search/view/paper-filing/")
+            )
+        )
+
+    @staticmethod
     def _paper_artifact_url(soup: BeautifulSoup) -> str | None:
         for link in soup.find_all("a", href=True):
             href = str(link.get("href") or "").strip()
             if not _PAPER_ARTIFACT_RE.search(href):
                 continue
             absolute = urljoin(EFD_BASE, href)
-            try:
-                parsed = urlparse(absolute)
-                parsed_port = parsed.port
-            except ValueError:
-                continue
-            if (
-                parsed.scheme == "https"
-                and parsed.hostname == "efdsearch.senate.gov"
-                and parsed.username is None
-                and parsed.password is None
-                and parsed_port in {None, 443}
-                and (
-                    parsed.path.startswith("/media/")
-                    or parsed.path.startswith("/search/view/paper/")
-                    or parsed.path.startswith("/search/view/paper-filing/")
-                )
-            ):
+            if SenateEFDSource._is_allowlisted_paper_url(absolute):
                 return absolute
         return None
 
-    def _fetch_paper_artifact(self, paper_url: str) -> tuple[str | None, str | None]:
+    def _fetch_paper_artifact(
+        self, paper_url: str
+    ) -> tuple[str | None, str | None, str | None]:
         response = self._request_with_retry("GET", paper_url)
-        if not self._official_url_matches(response.url, paper_url):
-            return None, "paper artifact redirected outside its official path"
+        final_url = str(response.url)
+        if not self._official_url_matches(final_url, paper_url):
+            return None, None, "paper artifact redirected outside its official path"
+        if not self._is_allowlisted_paper_url(final_url):
+            return None, None, "paper artifact final URL is not allowlisted"
         if response.status_code != 200:
-            return None, f"paper artifact returned HTTP {response.status_code}"
+            return None, None, f"paper artifact returned HTTP {response.status_code}"
         content = response.content
         if not content.startswith(b"%PDF-"):
-            return None, "paper artifact response is not a PDF"
-        return hashlib.sha256(content).hexdigest(), None
+            return None, None, "paper artifact response is not a PDF"
+        return hashlib.sha256(content).hexdigest(), final_url, None
 
     def _fetch_report_transactions(self, report_path: str) -> SenateReportFetchResult:
         """GET one PTR detail and return a classified, hashed parse result."""
@@ -571,7 +581,9 @@ class SenateEFDSource(TransactionSource):
                         "allowlisted paper artifact link"
                     ),
                 )
-            paper_sha256, paper_error = self._fetch_paper_artifact(paper_artifact_url)
+            paper_sha256, final_paper_url, paper_error = self._fetch_paper_artifact(
+                paper_artifact_url
+            )
             if paper_error:
                 return SenateReportFetchResult(
                     outcome=ReportOutcome.FAILED,
@@ -582,6 +594,7 @@ class SenateEFDSource(TransactionSource):
                 outcome=ReportOutcome.PAPER_ONLY,
                 landing_sha256=landing_sha256,
                 paper_artifact_sha256=paper_sha256,
+                paper_artifact_url=final_paper_url,
             )
 
         thead = table.find("thead")
@@ -749,6 +762,7 @@ class SenateEFDSource(TransactionSource):
                         outcome=ReportOutcome.FAILED,
                         landing_sha256=result.landing_sha256,
                         paper_artifact_sha256=result.paper_artifact_sha256,
+                        paper_artifact_url=result.paper_artifact_url,
                         error_message=str(exc),
                     )
                 else:
@@ -767,6 +781,7 @@ class SenateEFDSource(TransactionSource):
                     "artifact_sha256": result.transaction_artifact_sha256,
                     "landing_sha256": result.landing_sha256,
                     "paper_artifact_sha256": result.paper_artifact_sha256,
+                    "paper_artifact_url": result.paper_artifact_url,
                     "error_message": result.error_message,
                     "raw_row_count": raw_row_count,
                     "accepted_row_count": accepted_row_count,
@@ -1078,6 +1093,9 @@ class SenateEFDSource(TransactionSource):
             "chamber",
             "source_record_id",
             "source_row_id",
+            "ticker",
+            "ticker_candidate",
+            "transaction_date",
             "official_filing_date",
             "available_date",
             "notification_date",
@@ -1125,6 +1143,23 @@ class SenateEFDSource(TransactionSource):
             raise SenateEFDError(
                 "Senate source_record_id/source_row_id values must be unique"
             )
+        for row in df[
+            [
+                "transaction_date",
+                "official_filing_date",
+                "available_date",
+                "notification_date",
+            ]
+        ].itertuples(index=False):
+            if not self._dates_are_valid(
+                self._parse_date(row.transaction_date),
+                self._parse_date(row.official_filing_date),
+                self._parse_date(row.available_date),
+                self._parse_date(row.notification_date),
+            ):
+                raise SenateEFDError(
+                    "Senate transaction dates are incomplete or invalid"
+                )
         if (
             not df.empty
             and (
@@ -1145,9 +1180,18 @@ class SenateEFDSource(TransactionSource):
 
         report_hashes: dict[str, str | None] = {}
         for report in self.report_inventory:
-            source_record_id = report.get("source_record_id")
+            source_record_id = str(report.get("source_record_id") or "").strip()
             if not source_record_id:
                 raise SenateEFDError("Senate report inventory has no source_record_id")
+            if source_record_id in report_hashes:
+                raise SenateEFDError(
+                    f"Duplicate Senate report inventory ID: {source_record_id}"
+                )
+            filing_date = self._parse_date(report.get("official_filing_date"))
+            if not self._dates_are_valid(filing_date, filing_date, filing_date, None):
+                raise SenateEFDError(
+                    f"Senate report filing date is invalid: {source_record_id}"
+                )
             if (
                 report.get("chamber") != Chamber.SENATE.value
                 or report.get("ingestion_generation") != self.ingestion_generation
@@ -1166,15 +1210,16 @@ class SenateEFDSource(TransactionSource):
                 raise SenateEFDError(
                     f"Senate report landing hash missing: {source_record_id}"
                 )
-            if outcome == ReportOutcome.PAPER_ONLY.value and not paper_sha256:
-                raise SenateEFDError(
-                    f"Senate paper artifact hash missing: {source_record_id}"
+            if outcome == ReportOutcome.PAPER_ONLY.value and (
+                not paper_sha256
+                or not self._is_allowlisted_paper_url(
+                    str(report.get("paper_artifact_url") or "")
                 )
-            previous = report_hashes.setdefault(source_record_id, artifact_sha256)
-            if previous != artifact_sha256:
+            ):
                 raise SenateEFDError(
-                    f"Conflicting artifact hashes for Senate report {source_record_id}"
+                    f"Senate paper artifact provenance missing: {source_record_id}"
                 )
+            report_hashes[source_record_id] = artifact_sha256
 
         for row in (
             df[["source_record_id", "artifact_sha256"]]

@@ -1,8 +1,8 @@
 """Fail-closed Capitol Trades reconciliation client.
 
-Capitol Trades is a third-party aggregate, not an official disclosure source.  This
+Capitol Trades is a third-party aggregate, not an official disclosure source. This
 module fetches and normalizes its records only for reconciliation against official
-House and Senate data.  It deliberately refuses to write canonical transactions.
+House and Senate data. It deliberately refuses canonical transaction reads/writes.
 """
 
 from __future__ import annotations
@@ -11,8 +11,9 @@ import hashlib
 import json
 import logging
 import math
+import os
+import tempfile
 import time
-from collections import Counter
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,7 @@ _REQUIRED_TRADE_FIELDS = frozenset(
 )
 _SOURCE_ID_FIELDS = ("id", "trade_id", "transaction_id")
 _INTERNAL_PREFIX = "_capitol_"
+_NULL_FILING_IDS = frozenset({"", "none", "null", "nan", "<null>"})
 
 
 class CapitolTradesError(Exception):
@@ -65,19 +67,27 @@ class CapitolTradesError(Exception):
 
 
 class CapitolTradesSource(TransactionSource):
-    """Read third-party trades for reconciliation; never persist them as canonical."""
+    """Read third-party trades for reconciliation; never persist canonical rows."""
 
     def __init__(
         self,
         data_dir: str | Path = "data",
         read_only: bool = True,
         db: Any | None = None,
+        *,
+        generation: str,
     ):
-        # These attributes remain for caller compatibility.  Reconciliation does
-        # not create a data directory, open a database, or mutate caller-owned DBs.
+        if not isinstance(generation, str) or not generation.strip():
+            raise CapitolTradesError(
+                "A non-empty reconciliation generation is required"
+            )
+        # Retained for caller compatibility. Reconciliation does not create a data
+        # directory, open a database, or mutate caller-owned database handles.
         self.data_dir = Path(data_dir)
         self.read_only = read_only
         self.db = db
+        self.generation = generation.strip()
+        self.last_page_artifacts: list[dict[str, Any]] = []
         self.session = requests.Session()
         self.session.headers["Accept"] = "application/json"
 
@@ -159,13 +169,76 @@ class CapitolTradesSource(TransactionSource):
         df = self.fetch_all_trades(start_date, end_date, chamber)
         return self.save_to_db(df)
 
+    def write_reconciliation_artifact(
+        self, df: pd.DataFrame, output: str | Path
+    ) -> Path:
+        """Atomically write a manifest bound to validated raw response-page bytes."""
+        output = Path(output)
+        if output.exists():
+            raise CapitolTradesError(
+                f"Refusing to overwrite reconciliation artifact: {output}"
+            )
+        if not output.parent.exists():
+            raise CapitolTradesError(
+                f"Reconciliation artifact parent directory does not exist: {output.parent}"
+            )
+        if not self.last_page_artifacts:
+            raise CapitolTradesError(
+                "Cannot write artifact without a complete validated API fetch"
+            )
+        if not df.empty:
+            generations = set(df["ingestion_generation"].dropna().astype(str))
+            if generations != {self.generation}:
+                raise CapitolTradesError(
+                    "Reconciliation rows do not match the requested ingestion generation"
+                )
+
+        records = json.loads(df.to_json(orient="records", date_format="iso"))
+        manifest = {
+            "schema_version": 1,
+            "artifact_type": "capitol_trades_reconciliation",
+            "reconciliation_only": True,
+            "source": "capitol_trades",
+            "ingestion_generation": self.generation,
+            "record_count": len(records),
+            "pages": self.last_page_artifacts,
+            "records": records,
+        }
+        payload = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=output.parent,
+                prefix=f".{output.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary.write(payload)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_name = temporary.name
+            try:
+                os.link(temporary_name, output)
+            except FileExistsError as exc:
+                raise CapitolTradesError(
+                    f"Refusing to overwrite reconciliation artifact: {output}"
+                ) from exc
+        finally:
+            if temporary_name is not None:
+                Path(temporary_name).unlink(missing_ok=True)
+        return output
+
     def _paginate(self, url: str) -> list[dict]:
         """Fetch an exact, stable result set or fail without returning partial data."""
         all_trades: list[dict] = []
-        page_fingerprints: set[str] = set()
+        page_body_hashes: set[str] = set()
         source_record_ids: set[str] = set()
-        artifact_occurrences: Counter[str] = Counter()
+        no_id_fingerprints: set[str] = set()
+        page_artifacts: list[dict[str, Any]] = []
         expected_metadata: tuple[int, int, int] | None = None
+        self.last_page_artifacts = []
         page = 1
 
         while True:
@@ -173,7 +246,14 @@ class CapitolTradesSource(TransactionSource):
             try:
                 response = self.session.get(url, params=params, timeout=30)
                 response.raise_for_status()
+                raw_body = response.content
+                if not isinstance(raw_body, bytes) or not raw_body:
+                    raise CapitolTradesError(
+                        f"API response page {page} has no raw response bytes"
+                    )
                 data = response.json()
+            except CapitolTradesError:
+                raise
             except (requests.RequestException, ValueError) as exc:
                 raise CapitolTradesError(f"API request failed: {exc}") from exc
 
@@ -184,15 +264,25 @@ class CapitolTradesSource(TransactionSource):
                 expected_metadata = metadata
             total, pages, _ = metadata
 
-            page_fingerprint = self._artifact_sha256(trades)
-            if trades and page_fingerprint in page_fingerprints:
+            page_body_sha256 = hashlib.sha256(raw_body).hexdigest()
+            if page_body_sha256 in page_body_hashes:
                 raise CapitolTradesError(
-                    f"Pagination repeated page content at page {page}; refusing partial data"
+                    f"Pagination repeated raw page bytes at page {page}"
                 )
-            page_fingerprints.add(page_fingerprint)
+            page_body_hashes.add(page_body_sha256)
+            page_artifacts.append(
+                {
+                    "page": page,
+                    "endpoint": url,
+                    "parameters": params,
+                    "artifact_sha256": page_body_sha256,
+                    "response_bytes": len(raw_body),
+                }
+            )
 
             for position, trade in enumerate(trades, start=1):
                 source_record_id = self._raw_source_record_id(trade)
+                record_fingerprint = self._trade_fingerprint(trade)
                 if source_record_id is not None:
                     if source_record_id in source_record_ids:
                         raise CapitolTradesError(
@@ -200,9 +290,14 @@ class CapitolTradesSource(TransactionSource):
                             f"{source_record_id!r} at page {page}"
                         )
                     source_record_ids.add(source_record_id)
+                elif record_fingerprint in no_id_fingerprints:
+                    raise CapitolTradesError(
+                        "Ambiguous duplicate Capitol record without a stable source ID "
+                        f"at page {page} position {position}"
+                    )
+                else:
+                    no_id_fingerprints.add(record_fingerprint)
 
-                artifact_sha256 = self._trade_artifact_sha256(trade)
-                artifact_occurrences[artifact_sha256] += 1
                 annotated = dict(trade)
                 annotated.update(
                     {
@@ -210,8 +305,8 @@ class CapitolTradesSource(TransactionSource):
                         "_capitol_params": json.dumps(params, sort_keys=True),
                         "_capitol_page": page,
                         "_capitol_position": position,
-                        "_capitol_artifact_sha256": artifact_sha256,
-                        "_capitol_occurrence": artifact_occurrences[artifact_sha256],
+                        "_capitol_artifact_sha256": page_body_sha256,
+                        "_capitol_record_fingerprint": record_fingerprint,
                     }
                 )
                 all_trades.append(annotated)
@@ -235,6 +330,7 @@ class CapitolTradesSource(TransactionSource):
             raise CapitolTradesError(
                 f"Incomplete API response: expected {total} records, received {len(all_trades)}"
             )
+        self.last_page_artifacts = page_artifacts
         return all_trades
 
     def _validate_page(
@@ -390,19 +486,34 @@ class CapitolTradesSource(TransactionSource):
         if not trades:
             return pd.DataFrame(columns=columns)
 
-        artifact_occurrences: Counter[str] = Counter()
+        source_record_ids: set[str] = set()
+        no_id_fingerprints: set[str] = set()
         rows = []
         for index, trade in enumerate(trades):
             self._validate_trade_schema(
                 trade, page=trade.get("_capitol_page", 1), index=index
             )
-            artifact_sha256 = trade.get(
-                "_capitol_artifact_sha256"
-            ) or self._trade_artifact_sha256(trade)
-            occurrence = trade.get("_capitol_occurrence")
-            if occurrence is None:
-                artifact_occurrences[artifact_sha256] += 1
-                occurrence = artifact_occurrences[artifact_sha256]
+            artifact_sha256 = trade.get("_capitol_artifact_sha256")
+            if not self._is_sha256(artifact_sha256):
+                raise CapitolTradesError(
+                    "Normalized records require the SHA-256 of exact raw response-page bytes"
+                )
+            record_fingerprint = trade.get(
+                "_capitol_record_fingerprint"
+            ) or self._trade_fingerprint(trade)
+            source_record_id = self._raw_source_record_id(trade)
+            if source_record_id is not None:
+                if source_record_id in source_record_ids:
+                    raise CapitolTradesError(
+                        f"Duplicate source record ID {source_record_id!r} during normalization"
+                    )
+                source_record_ids.add(source_record_id)
+            elif record_fingerprint in no_id_fingerprints:
+                raise CapitolTradesError(
+                    "Ambiguous duplicate Capitol record without a stable source ID"
+                )
+            else:
+                no_id_fingerprints.add(record_fingerprint)
 
             amount_min = trade.get("amount_min")
             amount_max = trade.get("amount_max")
@@ -412,23 +523,21 @@ class CapitolTradesSource(TransactionSource):
 
             raw_tx_type = trade["transaction_type"].strip()
             tx_type = TX_TYPE_MAP.get(raw_tx_type.lower(), raw_tx_type.title())
-            source_record_id = self._raw_source_record_id(trade)
             chamber = trade["chamber"].lower()
-            raw_doc_id = trade.get("doc_id")
-            source_filing_id = str(raw_doc_id) if raw_doc_id is not None else None
+            source_filing_id = self._normalize_filing_id(trade.get("doc_id"))
             doc_id = source_filing_id or self._synthetic_doc_id(
                 chamber=chamber,
                 source_record_id=source_record_id,
-                artifact_sha256=artifact_sha256,
-                occurrence=int(occurrence),
+                record_fingerprint=record_fingerprint,
             )
             disclosure_date = self._parse_date(trade["disclosure_date"])
             asset_name = trade.get("asset_name")
+            ticker = self._normalize_nullable_text(trade.get("ticker"))
             rows.append(
                 {
                     "doc_id": doc_id,
                     "member": trade["politician_name"].strip(),
-                    "ticker": trade.get("ticker"),
+                    "ticker": ticker,
                     "transaction_date": self._parse_date(trade["transaction_date"]),
                     "disclosure_date": disclosure_date,
                     "transaction_type": tx_type,
@@ -443,19 +552,16 @@ class CapitolTradesSource(TransactionSource):
                     "asset_description": asset_name,
                     "chamber": chamber,
                     "source_record_id": source_record_id,
-                    # Capitol Trades is not an official source. Preserve its raw
-                    # disclosure_date above, but do not manufacture official dates.
+                    # This aggregator cannot establish official availability dates.
                     "official_filing_date": None,
                     "available_date": None,
                     "notification_date": None,
                     "amends_source_record_id": None,
                     "raw_transaction_subtype": raw_tx_type,
-                    "ticker_origin": "capitol_trades_api"
-                    if trade.get("ticker")
-                    else None,
+                    "ticker_origin": "source_reported" if ticker is not None else None,
                     "raw_asset_class": trade.get("asset_type"),
                     "raw_asset_description": asset_name,
-                    "ingestion_generation": None,
+                    "ingestion_generation": self.generation,
                     "artifact_sha256": artifact_sha256,
                     "state": trade.get("state"),
                     "party": trade.get("party"),
@@ -509,12 +615,12 @@ class CapitolTradesSource(TransactionSource):
             raise CapitolTradesError(
                 f"API schema error: source record IDs must be strings or integers: {present!r}"
             )
-        values = {str(value) for _, value in present}
+        values = {str(value).strip() for _, value in present}
         if len(values) != 1:
             raise CapitolTradesError(
                 f"API schema error: conflicting source record IDs {present!r}"
             )
-        value = next(iter(values)).strip()
+        value = next(iter(values))
         if not value:
             raise CapitolTradesError(
                 "API schema error: source record ID must be non-empty"
@@ -522,32 +628,50 @@ class CapitolTradesSource(TransactionSource):
         return value
 
     @classmethod
-    def _trade_artifact_sha256(cls, trade: dict) -> str:
+    def _trade_fingerprint(cls, trade: dict) -> str:
         raw = {k: v for k, v in trade.items() if not k.startswith(_INTERNAL_PREFIX)}
-        return cls._artifact_sha256(raw)
-
-    @staticmethod
-    def _artifact_sha256(value: Any) -> str:
         payload = json.dumps(
-            value, sort_keys=True, separators=(",", ":"), default=str
+            raw, sort_keys=True, separators=(",", ":"), default=str
         ).encode()
         return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _is_sha256(value: Any) -> bool:
+        if not isinstance(value, str) or len(value) != 64:
+            return False
+        return all(character in "0123456789abcdef" for character in value)
+
+    @staticmethod
+    def _normalize_filing_id(value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if normalized.casefold() in _NULL_FILING_IDS:
+            return None
+        return normalized
+
+    @staticmethod
+    def _normalize_nullable_text(value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
     @staticmethod
     def _synthetic_doc_id(
         *,
         chamber: str,
         source_record_id: str | None,
-        artifact_sha256: str,
-        occurrence: int,
+        record_fingerprint: str,
     ) -> str:
         stable_identity = (
             f"source-id:{source_record_id}"
             if source_record_id is not None
-            else f"artifact:{artifact_sha256}:occurrence:{occurrence}"
+            else f"record-fingerprint:{record_fingerprint}"
         )
-        components = f"{chamber}|{stable_identity}"
-        digest = hashlib.sha256(components.encode()).hexdigest()[:20]
+        digest = hashlib.sha256(f"{chamber}|{stable_identity}".encode()).hexdigest()[
+            :20
+        ]
         return f"ct-{chamber}-{digest}"
 
     @staticmethod

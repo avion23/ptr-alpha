@@ -1,9 +1,10 @@
-"""Fetch Capitol Trades records for reconciliation only.
+"""Fetch a fail-closed Capitol Trades reconciliation artifact.
 
-The core client owns pagination and validation.  This script never writes the
-third-party aggregate into the canonical congressional transaction database.
+The core client owns pagination, validation, normalization, and manifest writing.
+This script never writes third-party rows into the canonical transaction database.
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -14,17 +15,27 @@ import pandas as pd
 from analyzer.capitol_trades import BASE_URL, CapitolTradesSource
 
 
-def fetch_all_trades() -> pd.DataFrame:
-    """Return a fail-closed, normalized reconciliation frame via the core client."""
-    with CapitolTradesSource(data_dir="data", read_only=True) as source:
-        return source.fetch_all_trades()
+def fetch_all_trades(*, generation: str, output: str | Path) -> pd.DataFrame:
+    """Fetch through the core client and require a reconciliation manifest output."""
+    with CapitolTradesSource(
+        data_dir="data", read_only=True, generation=generation
+    ) as source:
+        df = source.fetch_all_trades()
+        source.write_reconciliation_artifact(df, output)
+        return df
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Fetch Capitol Trades for reconciliation only"
+    )
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--generation", required=True)
+    args = parser.parse_args(argv)
+
     print("=== Capitol Trades Reconciliation Fetcher ===")
     print(f"Fetching from {BASE_URL}; canonical database writes are disabled.\n")
-
-    df = fetch_all_trades()
+    df = fetch_all_trades(generation=args.generation, output=args.output)
     print(f"Validated {len(df)} reconciliation records")
     if not df.empty:
         print(f"Unique members:  {df['member'].nunique()}")
@@ -36,10 +47,8 @@ def main() -> None:
         print("Chambers:")
         for chamber, count in df["chamber"].value_counts().items():
             print(f"  {chamber}: {count}")
-        print("Transaction types:")
-        for tx_type, count in df["transaction_type"].value_counts().items():
-            print(f"  {tx_type}: {count}")
-    print("\nReconciliation only: no canonical transactions were saved.")
+    print(f"\nReconciliation artifact: {args.output}")
+    print("No canonical transactions were saved.")
 
 
 if __name__ == "__main__":

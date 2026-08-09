@@ -938,20 +938,19 @@ def refresh(
         False, "--gemini-ocr", help="Use Gemini LLM OCR for zero-row PDFs"
     ),
     skip_capitol: bool = typer.Option(
-        False, "--skip-capitol", help="Skip Capitol Trades API fetch"
+        False,
+        "--skip-capitol",
+        help="Explicitly skip third-party reconciliation notice",
     ),
     refresh_metadata: bool = typer.Option(
         False, "--refresh-metadata", help="Force refresh House Clerk metadata"
     ),
 ):
     """
-    Full pipeline refresh: fetch House PDFs + parse + Capitol Trades API.
+    Official House refresh: fetch PDFs, parse, and optionally run Gemini OCR.
 
-    This is the single command to keep the database up to date. It runs:
-      1. Fetch House Clerk metadata and download new PTR PDFs
-      2. Parse all cached PDFs into transactions
-      3. Fetch Capitol Trades API (backup source for any missed filings)
-      4. Optionally run Gemini OCR on zero-row PDFs
+    Capitol Trades is third-party reconciliation data and is explicitly excluded
+    from canonical refresh. Use `fetch-capitol` with an output manifest separately.
     """
     app_ctx = get_context(ctx, data_dir, read_only=False)
 
@@ -983,26 +982,14 @@ def refresh(
         failed_steps.append("parse")
         logger.warning(f"PDF parse failed: {e}")
 
-    # Step 3: Capitol Trades API
-    if not skip_capitol:
-        print("[3/4] Fetching Capitol Trades API...")
-        from analyzer.capitol_trades import CapitolTradesSource
-
-        capitol = CapitolTradesSource(
-            data_dir=app_ctx.settings.data.data_dir,
-            read_only=False,
-            db=app_ctx.transaction_source.db,
-        )
-        try:
-            capitol_count = capitol.fetch_and_save_all()
-            print(f"  Capitol Trades: {capitol_count} transactions upserted")
-        except Exception as e:
-            failed_steps.append("capitol")
-            logger.warning(f"Capitol Trades fetch failed: {e}")
-        finally:
-            capitol.close()
+    # Step 3: Third-party reconciliation is never part of official refresh.
+    if skip_capitol:
+        print("[3/4] Skipping Capitol Trades reconciliation (--skip-capitol)")
     else:
-        print("[3/4] Skipping Capitol Trades API (--skip-capitol)")
+        print(
+            "[3/4] Excluding Capitol Trades from official refresh "
+            "(use fetch-capitol --output ... --generation ... for reconciliation)"
+        )
 
     # Step 4: Gemini OCR (optional)
     if use_gemini_ocr:
@@ -1061,19 +1048,25 @@ def refresh(
 def fetch_capitol(
     ctx: typer.Context,
     politician: str | None = typer.Option(
-        None, help="Fetch trades for a specific politician"
+        None, help="Fetch reconciliation records for one politician"
     ),
-    all: bool = typer.Option(False, "--all", help="Fetch all recent trades"),
+    all: bool = typer.Option(False, "--all", help="Fetch all reconciliation records"),
     chamber: str | None = typer.Option(None, help="Filter by chamber (house/senate)"),
     start: str | None = typer.Option(None, help="Start date filter (YYYY-MM-DD)"),
     end: str | None = typer.Option(None, help="End date filter (YYYY-MM-DD)"),
-    data_dir: str = typer.Option("data", help="Data directory"),
+    output: Path = typer.Option(..., "--output", help="New reconciliation manifest"),
+    generation: str = typer.Option(
+        ..., "--generation", help="Non-empty ingestion run generation"
+    ),
+    data_dir: str = typer.Option("data", help="Data directory (never written)"),
 ):
-    """Fetch congressional trades from Capitol Trades API (backup data source)."""
-    from analyzer.capitol_trades import CapitolTradesSource
+    """Fetch a Capitol Trades reconciliation artifact; never save canonical rows."""
+    from analyzer.capitol_trades import CapitolTradesError, CapitolTradesSource
 
-    if not politician and not all:
-        print("Error: specify --politician NAME or --all", file=sys.stderr)
+    if bool(politician) == all:
+        print(
+            "Error: specify exactly one of --politician NAME or --all", file=sys.stderr
+        )
         raise typer.Exit(1)
 
     try:
@@ -1082,18 +1075,28 @@ def fetch_capitol(
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
         raise typer.Exit(1)
+    if start_date is not None and end_date is not None and end_date < start_date:
+        print("Error: --end must be on or after --start", file=sys.stderr)
+        raise typer.Exit(1)
 
-    capitol = CapitolTradesSource(data_dir=data_dir, read_only=False)
     try:
-        if politician:
-            count = capitol.fetch_and_save_politician(politician, start_date, end_date)
-            print(f"Saved {count} trades for {politician}")
-        else:
-            count = capitol.fetch_and_save_all(start_date, end_date, chamber)
-            print(f"Saved {count} trades from Capitol Trades API")
-    finally:
-        capitol.close()
+        capitol = CapitolTradesSource(
+            data_dir=data_dir, read_only=True, generation=generation
+        )
+        try:
+            if politician:
+                df = capitol.fetch_trades(politician, start_date, end_date)
+            else:
+                df = capitol.fetch_all_trades(start_date, end_date, chamber)
+            capitol.write_reconciliation_artifact(df, output)
+        finally:
+            capitol.close()
+    except CapitolTradesError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
 
+    print(f"Wrote {len(df)} reconciliation records to {output}")
+    print("No canonical transactions were saved.")
     raise typer.Exit(0)
 
 

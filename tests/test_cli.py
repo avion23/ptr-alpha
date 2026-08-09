@@ -1,8 +1,11 @@
 """Smoke tests for analyzer.cli module."""
 
 import unittest
-from unittest.mock import patch, MagicMock
+from datetime import date
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
+import pandas as pd
 from typer.testing import CliRunner
 
 from analyzer.cli import app
@@ -90,6 +93,64 @@ class TestCliApp(unittest.TestCase):
                 )
                 self.assertEqual(result.exit_code, 1, result.output)
                 context.assert_not_called()
+
+    def test_fetch_capitol_requires_artifact_and_generation(self):
+        with patch("analyzer.capitol_trades.CapitolTradesSource") as source:
+            result = self.runner.invoke(app, ["fetch-capitol", "--all"])
+        self.assertNotEqual(result.exit_code, 0)
+        source.assert_not_called()
+
+    def test_fetch_capitol_writes_reconciliation_artifact_without_database_save(self):
+        frame = pd.DataFrame([{"member": "Test", "ticker": "AAPL"}])
+        capitol = MagicMock()
+        capitol.fetch_all_trades.return_value = frame
+        with patch(
+            "analyzer.capitol_trades.CapitolTradesSource", return_value=capitol
+        ) as source:
+            result = self.runner.invoke(
+                app,
+                [
+                    "fetch-capitol",
+                    "--all",
+                    "--output",
+                    "capitol.json",
+                    "--generation",
+                    "run-1",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        source.assert_called_once_with(
+            data_dir="data", read_only=True, generation="run-1"
+        )
+        capitol.fetch_all_trades.assert_called_once_with(None, None, None)
+        capitol.write_reconciliation_artifact.assert_called_once_with(
+            frame, Path("capitol.json")
+        )
+        capitol.save_to_db.assert_not_called()
+        self.assertIn("No canonical transactions were saved", result.output)
+
+    def test_official_refresh_never_constructs_capitol_source(self):
+        mock_ctx = MagicMock()
+        fetchone = mock_ctx.transaction_source.db.conn.execute.return_value.fetchone
+        fetchone.side_effect = [(10,), (10,), (date(2026, 8, 1), date(2026, 8, 2), 0)]
+        with (
+            patch("analyzer.cli.get_context", return_value=mock_ctx),
+            patch(
+                "analyzer.cli.run_fetch_pipeline",
+                return_value=StepResult(success=True),
+            ),
+            patch(
+                "analyzer.cli.run_parse_pipeline",
+                return_value=StepResult(success=True),
+            ),
+            patch("analyzer.capitol_trades.CapitolTradesSource") as capitol,
+        ):
+            result = self.runner.invoke(app, ["refresh", "--year", "2026"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        capitol.assert_not_called()
+        self.assertIn("Excluding Capitol Trades from official refresh", result.output)
 
     def test_parse_fails_when_pipeline_fails_even_if_ocr_inserts_rows(self):
         mock_ctx = MagicMock()

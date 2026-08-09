@@ -10,16 +10,19 @@ from analyzer import signals as _signals
 from analyzer.analysis import TransactionType, _collapse_to_episodes
 
 
+_OUTCOME_COL = "total_spy_alpha_pct"
+
+
 @dataclass
 class MemberSkillPosterior:
+    """Descriptive, noncausal posterior association for one member."""
+
     member: str
-    alpha_mean: float  # posterior mean
-    alpha_std: float  # posterior std
-    n_episodes: int  # number of fully-elapsed episodes
-    shrinkage: float  # how much pulled toward global mean
-    sector_skills: dict[str, float] = field(
-        default_factory=dict
-    )  # sector-specific skill
+    alpha_mean: float
+    alpha_std: float
+    n_episodes: int
+    shrinkage: float
+    ticker_skills: dict[str, float] = field(default_factory=dict)
 
 
 def _recency_weight(
@@ -27,11 +30,52 @@ def _recency_weight(
     ref_date: pd.Timestamp,
     half_life_days: int,
 ) -> float:
-    """Exponential decay weight based on days since disclosure."""
-    days_ago = (ref_date - disclosure_date).days
-    if days_ago < 0:
-        days_ago = 0
+    """Exponential power-likelihood weight based on days since disclosure."""
+    if half_life_days <= 0:
+        raise ValueError("recency_half_life_days must be positive")
+    days_ago = max((ref_date - disclosure_date).days, 0)
     return exp(-days_ago * log(2) / half_life_days)
+
+
+def _eligible_signals(
+    signals_df: pd.DataFrame,
+    horizon: int,
+    ref_date: pd.Timestamp,
+) -> pd.DataFrame:
+    if _OUTCOME_COL not in signals_df.columns:
+        raise ValueError(
+            "Member skill requires endpoint SPY alpha; total_spy_alpha_pct is missing"
+        )
+    eligible = signals_df[
+        (signals_df["horizon_days"] == horizon)
+        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
+        & (signals_df["disclosure_date"] <= ref_date - pd.Timedelta(days=horizon))
+        & signals_df[_OUTCOME_COL].notna()
+    ].copy()
+    if "window_complete" in eligible.columns:
+        eligible = eligible[eligible["window_complete"].fillna(False).astype(bool)]
+    return eligible
+
+
+def _weighted_member_rows(
+    signals_df: pd.DataFrame,
+    horizon: int,
+    ref_date: pd.Timestamp,
+    recency_half_life_days: int,
+) -> pd.DataFrame:
+    if recency_half_life_days <= 0:
+        raise ValueError("recency_half_life_days must be positive")
+    eligible = _eligible_signals(signals_df, horizon, ref_date)
+    if eligible.empty:
+        return eligible
+    collapsed = _collapse_to_episodes(eligible)
+    days_ago = (ref_date - pd.to_datetime(collapsed["disclosure_date"])).dt.days
+    collapsed["_weight_vals"] = np.exp(
+        -days_ago.clip(lower=0).to_numpy(dtype=float)
+        * np.log(2)
+        / recency_half_life_days
+    )
+    return collapsed
 
 
 def _compute_member_raw_alphas(
@@ -40,93 +84,55 @@ def _compute_member_raw_alphas(
     ref_date: pd.Timestamp,
     recency_half_life_days: int,
 ) -> dict[str, tuple[float, float, int, float]]:
-    """Compute recency-weighted alpha per member.
-
-    Returns {member: (weighted_alpha, weight_sum, n_episodes, weight_sq_sum)}.
-    """
-    eligible = signals_df[
-        (signals_df["horizon_days"] == horizon)
-        & (signals_df["signal_type"] == TransactionType.PURCHASE.value)
-        & (signals_df["disclosure_date"] <= ref_date - pd.Timedelta(days=horizon))
-        & (signals_df["spy_alpha_pct"].notna())
-    ].copy()
-
-    if eligible.empty:
+    """Return weighted endpoint alpha, weight sum, episode count, squared-weight sum."""
+    collapsed = _weighted_member_rows(
+        signals_df, horizon, ref_date, recency_half_life_days
+    )
+    if collapsed.empty:
         return {}
 
-    collapsed = _collapse_to_episodes(eligible)
-
-    # Vectorized recency weight computation (no iterrows)
-    days_ago = (ref_date - pd.to_datetime(collapsed["disclosure_date"])).dt.days
-    days_ago = days_ago.clip(lower=0)
-    weights = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
-
-    collapsed["_weight_vals"] = weights
-    collapsed["_weight_sq_vals"] = weights**2
-    collapsed["_alpha_weighted"] = collapsed["spy_alpha_pct"].values * weights
-
+    collapsed["_weight_sq_vals"] = collapsed["_weight_vals"] ** 2
+    collapsed["_alpha_weighted"] = collapsed[_OUTCOME_COL].to_numpy(
+        dtype=float
+    ) * collapsed["_weight_vals"].to_numpy(dtype=float)
     grp = collapsed.groupby("member")
     weight_sums = grp["_weight_vals"].sum()
     weight_sq_sums = grp["_weight_sq_vals"].sum()
     alpha_sums = grp["_alpha_weighted"].sum()
     n_episodes = grp.size()
 
-    # Filter groups with weight_sum > 0
-    valid = weight_sums > 0
     result: dict[str, tuple[float, float, int, float]] = {}
-    for member in weight_sums.index[valid]:
-        w = float(weight_sums[member])
+    for member in weight_sums.index[weight_sums > 0]:
+        weight_sum = float(weight_sums[member])
         result[member] = (
-            float(alpha_sums[member]) / w,
-            w,
+            float(alpha_sums[member]) / weight_sum,
+            weight_sum,
             int(n_episodes[member]),
             float(weight_sq_sums[member]),
         )
     return result
 
 
-def _compute_member_sector_skills_from_group(
+def _compute_member_ticker_skills_from_group(
     member_signals: pd.DataFrame,
     horizon: int,
     ref_date: pd.Timestamp,
     recency_half_life_days: int,
 ) -> dict[str, float]:
-    """Compute sector-specific skill from a pre-filtered member group.
-
-    Same logic as _compute_member_sector_skills but assumes the caller has
-    already filtered by member. Avoids repeated full-table boolean masks.
-    """
+    """Return descriptive endpoint-alpha means keyed by ticker."""
     if member_signals.empty:
         return {}
-
-    filtered = member_signals[
-        (member_signals["horizon_days"] == horizon)
-        & (member_signals["signal_type"] == TransactionType.PURCHASE.value)
-        & (member_signals["disclosure_date"] <= ref_date - pd.Timedelta(days=horizon))
-        & (member_signals["spy_alpha_pct"].notna())
-    ]
-
-    if filtered.empty:
+    collapsed = _weighted_member_rows(
+        member_signals, horizon, ref_date, recency_half_life_days
+    )
+    if collapsed.empty:
         return {}
-
-    days_ago = (ref_date - pd.to_datetime(filtered["disclosure_date"])).dt.days
-    days_ago = days_ago.clip(lower=0)
-    weight = np.exp(-days_ago.values * np.log(2) / recency_half_life_days)
-    alpha_weighted = filtered["spy_alpha_pct"].values * weight
-
-    weight_sums = (
-        pd.Series(weight, index=filtered.index).groupby(filtered["ticker"]).sum()
-    )
-    alpha_sums = (
-        pd.Series(alpha_weighted, index=filtered.index)
-        .groupby(filtered["ticker"])
-        .sum()
-    )
-
-    valid = weight_sums > 0
+    weighted = collapsed[_OUTCOME_COL] * collapsed["_weight_vals"]
+    weight_sums = collapsed["_weight_vals"].groupby(collapsed["ticker"]).sum()
+    alpha_sums = weighted.groupby(collapsed["ticker"]).sum()
     return {
-        t: float(alpha_sums[t]) / float(weight_sums[t])
-        for t in weight_sums.index[valid]
+        ticker: float(alpha_sums[ticker] / weight_sums[ticker])
+        for ticker in weight_sums.index[weight_sums > 0]
     }
 
 
@@ -138,124 +144,92 @@ def estimate_member_skills(
     horizon: int = 90,
     ref_date: pd.Timestamp | None = None,
 ) -> dict[str, MemberSkillPosterior]:
-    """Estimate Bayesian posterior skill for each member.
+    """Estimate descriptive normal-normal member associations.
 
-    Uses empirical Bayes:
-    1. Compute per-member historical alpha (weighted by recency)
-    2. Compute global mean and variance of member alphas
-    3. Shrink each member's estimate toward global mean
-
-    Args:
-        signals_df: Historical signal data with columns including
-            member, ticker, disclosure_date, signal_type, horizon_days,
-            spy_alpha_pct.
-        min_episodes: Minimum episodes required to include a member.
-        prior_strength: Strength of the prior (pseudo-observations).
-            Defaults to BAYES_PRIOR_STRENGTH (20) for consistency with
-            member_ranking module.
-        recency_half_life_days: Half-life for recency weighting in days.
-        horizon: Horizon in days to filter signals.
-        ref_date: Reference date for recency weighting. MUST be provided
-            for backtesting to avoid look-ahead bias. Defaults to now()
-            only for live analysis.
-
-    Returns:
-        Mapping of member name to MemberSkillPosterior.
+    Endpoint excess alpha is modeled with a common Normal prior. Recency
+    weights are power-likelihood information weights, so uniformly older data
+    have less information. Posterior means and variances use the same data and
+    prior precisions. These associations are not causal member skill: ticker,
+    sector, co-buyer, and market-regime confounding remain. Production trading
+    must not consume them until time-blocked validation supports that use.
     """
     if signals_df.empty:
         return {}
-
+    if min_episodes < 1:
+        raise ValueError("min_episodes must be positive")
     if prior_strength is None:
-        prior_strength = (
-            _signals.BAYES_PRIOR_STRENGTH
-        )  # 20, unified with member_ranking
+        prior_strength = float(_signals.BAYES_PRIOR_STRENGTH)
+    if prior_strength <= 0:
+        raise ValueError("prior_strength must be positive")
+    if recency_half_life_days <= 0:
+        raise ValueError("recency_half_life_days must be positive")
     if ref_date is None:
         ref_date = pd.Timestamp.now()
+
+    collapsed = _weighted_member_rows(
+        signals_df, horizon, ref_date, recency_half_life_days
+    )
+    if collapsed.empty:
+        return {}
     raw = _compute_member_raw_alphas(
         signals_df, horizon, ref_date, recency_half_life_days
     )
-
-    if not raw:
+    qualifying = {
+        member: values for member, values in raw.items() if values[2] >= min_episodes
+    }
+    if not qualifying:
         return {}
 
-    # Filter members with enough episodes
-    qualifying = {
-        m: (alpha, w, n, w_sq)
-        for m, (alpha, w, n, w_sq) in raw.items()
-        if n >= min_episodes
-    }
+    member_means = np.array([values[0] for values in qualifying.values()], dtype=float)
+    global_mean = float(member_means.mean())
 
-    if not qualifying:
-        # Fall back: use all members with at least 1 episode
-        qualifying = raw
+    pooled_sse = 0.0
+    pooled_dof = 0.0
+    member_groups = {member: group for member, group in collapsed.groupby("member")}
+    for member, (raw_alpha, weight_sum, _, weight_sq_sum) in qualifying.items():
+        group = member_groups[member]
+        weights = group["_weight_vals"].to_numpy(dtype=float)
+        residuals = group[_OUTCOME_COL].to_numpy(dtype=float) - raw_alpha
+        pooled_sse += float(np.dot(weights, residuals**2))
+        pooled_dof += max(weight_sum - weight_sq_sum / weight_sum, 0.0)
 
-    # Global parameters from qualifying members
-    alphas = np.array([v[0] for v in qualifying.values()])
-    global_mean = float(np.mean(alphas))
-    global_var = float(np.var(alphas)) if len(alphas) > 1 else 0.0
+    observed_between = (
+        float(np.var(member_means, ddof=1)) if len(member_means) > 1 else 0.0
+    )
+    within_var = pooled_sse / pooled_dof if pooled_dof > 0 else observed_between
+    all_values = collapsed[_OUTCOME_COL].to_numpy(dtype=float)
+    variance_scale = max(float(np.var(all_values)), 1.0)
+    variance_floor = variance_scale * 1e-8
+    within_var = max(float(within_var), variance_floor)
+
+    # Keep the common prior fixed under a uniform rescaling of recency
+    # information. Otherwise making every observation older can collapse the
+    # estimated between-member variance and create false certainty.
+    tau_sq = max(observed_between, variance_floor)
+    prior_precision = float(prior_strength) / tau_sq
 
     posteriors: dict[str, MemberSkillPosterior] = {}
-    # Pre-group signals_df by member to avoid repeated full-table scans
-    member_groups: dict[str, pd.DataFrame] = {}
-    for m in qualifying:
-        if m not in member_groups:
-            member_groups[m] = signals_df[signals_df["member"] == m]
-
-    pooled_residual_sum = 0.0
-    pooled_weight_sum = 0.0
-    for member, (raw_alpha, _, _, _) in qualifying.items():
-        member_signals = member_groups[member]
-        eligible = member_signals[
-            (member_signals["horizon_days"] == horizon)
-            & (member_signals["signal_type"] == TransactionType.PURCHASE.value)
-            & (
-                member_signals["disclosure_date"]
-                <= ref_date - pd.Timedelta(days=horizon)
-            )
-            & (member_signals["spy_alpha_pct"].notna())
-        ].copy()
-        collapsed = _collapse_to_episodes(eligible)
-        days_ago = (ref_date - pd.to_datetime(collapsed["disclosure_date"])).dt.days
-        weights = np.exp(
-            -days_ago.clip(lower=0).values * np.log(2) / recency_half_life_days
-        )
-        residuals = collapsed["spy_alpha_pct"].to_numpy() - raw_alpha
-        pooled_residual_sum += float(np.dot(weights, residuals**2))
-        pooled_weight_sum += float(weights.sum())
-
-    residual_dof = pooled_weight_sum - len(qualifying)
-    within_var = pooled_residual_sum / residual_dof if residual_dof > 0 else global_var
-    if not np.isfinite(within_var) or within_var < 0:
-        within_var = global_var
-
-    variance_floor = 1e-12
-    for member, (raw_alpha, weight_sum, n, weight_sq_sum) in qualifying.items():
-        if weight_sum > 0 and weight_sq_sum > 0:
-            effective_n = weight_sum**2 / weight_sq_sum
-        else:
-            effective_n = float(n)
-
-        shrinkage = prior_strength / (effective_n + prior_strength)
-        posterior_mean = (1 - shrinkage) * raw_alpha + shrinkage * global_mean
-        sigma_sq = max(within_var, variance_floor)
-        tau_sq = max(global_var, variance_floor)
-        posterior_var = 1.0 / (effective_n / sigma_sq + 1.0 / tau_sq)
-        posterior_std = sqrt(max(posterior_var, variance_floor**2))
-
-        member_signals = member_groups.get(member, pd.DataFrame())
-        sector_skills = _compute_member_sector_skills_from_group(
-            member_signals, horizon, ref_date, recency_half_life_days
-        )
-
+    for member, (raw_alpha, weight_sum, n, _) in qualifying.items():
+        data_precision = weight_sum / within_var
+        posterior_precision = data_precision + prior_precision
+        posterior_mean = (
+            data_precision * raw_alpha + prior_precision * global_mean
+        ) / posterior_precision
+        posterior_std = sqrt(1.0 / posterior_precision)
+        shrinkage = prior_precision / posterior_precision
         posteriors[member] = MemberSkillPosterior(
             member=member,
-            alpha_mean=posterior_mean,
-            alpha_std=posterior_std,
+            alpha_mean=float(posterior_mean),
+            alpha_std=float(posterior_std),
             n_episodes=n,
-            shrinkage=shrinkage,
-            sector_skills=sector_skills,
+            shrinkage=float(shrinkage),
+            ticker_skills=_compute_member_ticker_skills_from_group(
+                member_groups[member],
+                horizon,
+                ref_date,
+                recency_half_life_days,
+            ),
         )
-
     return posteriors
 
 
@@ -263,44 +237,25 @@ def score_members_for_ticker(
     ticker: str,
     members_bought: list[str],
     skills: dict[str, MemberSkillPosterior],
-    n_bootstrap: int = 1000,
 ) -> tuple[float, float]:
-    """Score a ticker based on buying members' skills.
+    """Combine independent diagnostic member posteriors by precision.
 
-    Returns (expected_alpha, uncertainty).
-    Uses posterior predictive: samples from each member's posterior,
-    combines via weighted average (weights = inverse uncertainty).
+    Returns a descriptive `(mean, standard_error)` pair. The calculation is
+    not ticker-conditioned and must not be used as a tradable score. `ticker`
+    identifies the candidate for callers and must be non-empty.
     """
-    relevant = [s for s in members_bought if s in skills]
-    if not relevant:
+    if not ticker:
+        raise ValueError("ticker must be non-empty")
+    posteriors = [skills[member] for member in members_bought if member in skills]
+    if not posteriors:
         return (0.0, 1.0)
 
-    posteriors = [skills[m] for m in relevant]
-
-    # Weight by inverse uncertainty (1/std), floor at small epsilon
-    weights = []
-    for p in posteriors:
-        w = 1.0 / max(p.alpha_std, 1e-6)
-        weights.append(w)
-    weight_arr = np.array(weights)
-    weight_sum = weight_arr.sum()
-    if weight_sum == 0:
-        return (0.0, 1.0)
-    weight_arr = weight_arr / weight_sum
-
-    # Expected alpha = weighted mean of posterior means
-    means = np.array([p.alpha_mean for p in posteriors])
-    expected_alpha = float(np.dot(weight_arr, means))
-
-    # Uncertainty via bootstrap (vectorized — no per-iteration loop)
-    rng = np.random.default_rng(42)
-    # Generate all samples at once: shape (n_bootstrap, n_posteriors)
-    means_arr = np.array([p.alpha_mean for p in posteriors])
-    stds_arr = np.array([max(p.alpha_std, 1e-6) for p in posteriors])
-    all_samples = rng.normal(
-        means_arr[None, :], stds_arr[None, :], size=(n_bootstrap, len(posteriors))
+    variances = np.array(
+        [max(posterior.alpha_std**2, 1e-12) for posterior in posteriors], dtype=float
     )
-    bootstrap_alphas = all_samples @ weight_arr
-
-    uncertainty = float(np.std(bootstrap_alphas))
-    return (expected_alpha, uncertainty)
+    precisions = 1.0 / variances
+    normalized = precisions / precisions.sum()
+    means = np.array([posterior.alpha_mean for posterior in posteriors], dtype=float)
+    expected_alpha = float(np.dot(normalized, means))
+    uncertainty = sqrt(1.0 / float(precisions.sum()))
+    return expected_alpha, uncertainty

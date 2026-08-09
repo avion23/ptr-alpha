@@ -36,9 +36,8 @@ def _lookup_buyer_posterior_lift(
     Returns None when rankings are missing, the column is absent, the member
     is unrated, or the value is NaN.
 
-    `posterior_lift` is the prior-invariant skill statistic; unlike
-    `bayes_win_prob` it stays comparable across members even when each
-    member's prior is estimated leave-one-out.
+    This is a diagnostic lookup only. Tradable scoring does not use
+    posterior lift because ratios to changing priors are not comparable.
     """
     if member_rankings is None or member_rankings.empty:
         return None
@@ -58,7 +57,7 @@ def _lookup_buyer_posterior_lift(
 
 def _build_ranking_dicts(
     member_rankings: pd.DataFrame | None,
-    scoring_mode: str = "shrunk_alpha",
+    scoring_mode: str = "consensus",
 ) -> dict:
     """Pre-build O(1) lookup dicts from member_rankings DataFrame.
 
@@ -66,13 +65,34 @@ def _build_ranking_dicts(
     Avoids repeated DataFrame linear scans in the per-ticker scoring loop.
 
     scoring_mode controls how member scores are computed:
-      - "shrunk_alpha": Bayesian-shrunk historical SPY alpha (default)
-      - "consistency": prob_up * log(1 + trades) — continuous, differentiable
-      - "bayesian_quality": bayes_win_prob * shrunk_alpha
+      - "consensus": identity-free distinct-buyer/recency score (safe default)
+      - "shrunk_alpha": descriptive normal-normal historical endpoint alpha
+      - "consistency": endpoint-alpha win rate * log(1 + trades)
       - "trade_frequency": log(1 + trades)
+
+    ``bayesian_quality`` is deliberately unsupported: multiplying a
+    probability by a percentage alpha has no calibrated decision meaning.
     """
+    if scoring_mode == "bayesian_quality":
+        raise AnalysisError(
+            "bayesian_quality is unsupported; probability multiplied by alpha has incompatible units"
+        )
+    if scoring_mode == "consensus":
+        return {
+            "alpha": {},
+            "trades": {},
+            "prob": {},
+            "has_shrunk": False,
+            "mode": "consensus",
+        }
     if member_rankings is None or member_rankings.empty:
-        return {"alpha": {}, "trades": {}, "prob": {}, "has_shrunk": False}
+        return {
+            "alpha": {},
+            "trades": {},
+            "prob": {},
+            "has_shrunk": False,
+            "mode": scoring_mode,
+        }
 
     has_shrunk = "shrunk_alpha" in member_rankings.columns
     alpha_col = "shrunk_alpha" if has_shrunk else "avg_spy_alpha_pct"
@@ -119,12 +139,17 @@ def _build_ranking_dicts(
         "trades": trades_dict,
         "prob": prob,
         "has_shrunk": has_shrunk,
+        "mode": scoring_mode,
     }
 
 
 def _compute_alpha_for_scoring_mode(
     valid: pd.DataFrame, alpha_col: str, scoring_mode: str
 ) -> dict:
+    if scoring_mode == "bayesian_quality":
+        raise AnalysisError(
+            "bayesian_quality is unsupported; use consensus or a same-unit score"
+        )
     if scoring_mode == "consistency":
         prob_up = (
             valid["prob_up_given_buy"].fillna(0.5).values
@@ -133,14 +158,6 @@ def _compute_alpha_for_scoring_mode(
         )
         trades = valid["purchase_trades"].fillna(0).values.astype(float)
         alpha_values = prob_up * np.log1p(trades)
-    elif scoring_mode == "bayesian_quality":
-        bayes = (
-            valid["bayes_win_prob"].fillna(0.5).values
-            if "bayes_win_prob" in valid.columns
-            else np.full(len(valid), 0.5)
-        )
-        raw_alpha = valid[alpha_col].fillna(0.0).values.astype(float)
-        alpha_values = bayes * raw_alpha
     elif scoring_mode == "trade_frequency":
         trades = valid["purchase_trades"].fillna(0).values.astype(float)
         alpha_values = np.log1p(trades)

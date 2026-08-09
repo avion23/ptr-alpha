@@ -1,10 +1,10 @@
 """Score a ticker by its buyer composition.
 
-`score_ticker_by_buyers` combines member rankings with a ticker's actual
-buyers to produce a single signal score. Supports four scoring modes
-(shrunk_alpha, consistency, bayesian_quality, trade_frequency), solo-buyer
-skill gates, member-skill overrides, recency weighting, and a fallback to
-ticker-history alpha when no rated buyers are found.
+`score_ticker_by_buyers` combines a ticker's disclosed buyers into a signal.
+The safe default is an identity-free consensus score based only on distinct
+recent buyers and recency. Historical member effects are descriptive,
+noncausal opt-ins; Bayesian probability-times-alpha and solo posterior gates
+are not tradable scores.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from analyzer.member_ranking.ranking import rank_members
 from analyzer.member_ranking.lookups import (
     _build_ranking_dicts,
     _get_ticker_purchases,
-    _lookup_buyer_posterior_lift,
 )
 
 
@@ -44,6 +43,7 @@ def score_ticker_by_buyers(
     solo_buyer_penalty: float = 0.8,
     _bayes_prior_strength: float | None = None,
     _ranking_dicts: dict | None = None,
+    scoring_mode: str = "consensus",
 ) -> pd.DataFrame:
     """Score a ticker by its buyer composition. Memoized via @df_memoize.
 
@@ -58,7 +58,12 @@ def score_ticker_by_buyers(
         else _signals.BAYES_PRIOR_STRENGTH
     )
 
-    if member_rankings is None:
+    if member_skills is not None:
+        raise AnalysisError(
+            "member_skills are diagnostic only and cannot produce a tradable score"
+        )
+
+    if scoring_mode != "consensus" and member_rankings is None:
         member_rankings = rank_members(
             signals_df, horizon, threshold, _bayes_prior_strength=bayes_prior
         )
@@ -74,47 +79,25 @@ def score_ticker_by_buyers(
     if min_trades < min_buyers:
         return _below_threshold_result(ticker, min_trades, min_buyers)
 
-    solo_gate = _solo_buyer_gate(
-        ticker,
-        ticker_trades,
-        member_rankings,
-        min_buyers,
-        min_trades,
-        solo_buyer_skill_threshold,
-    )
-    if isinstance(solo_gate, pd.DataFrame):
-        return solo_gate
-    apply_solo_penalty = solo_gate
+    # Retained keyword parameters are ignored for call compatibility with the
+    # outer backtest API. Solo buyers are neither admitted nor rejected by a
+    # member posterior, and no arbitrary posterior-based penalty is applied.
+    _ = (solo_buyer_skill_threshold, solo_buyer_penalty, uncertainty_penalty_lambda)
+    apply_solo_penalty = False
 
     buyers = ticker_trades["_member_canonical"].unique()
-    if member_skills:
-        member_skills = member_skills | {
-            canonical_member_key(member): skill
-            for member, skill in member_skills.items()
-            if canonical_member_key(member) not in member_skills
-        }
-    use_skills = (
-        member_rankings is not None
-        and member_skills is not None
-        and len(member_skills) > 0
-    )
     rd = (
         _ranking_dicts
         if _ranking_dicts is not None
-        else _build_ranking_dicts(member_rankings)
+        else _build_ranking_dicts(member_rankings, scoring_mode=scoring_mode)
     )
+    default_mode = "custom" if _ranking_dicts is not None else scoring_mode
+    mode = str(rd.get("mode", default_mode))
     alpha_dict = rd["alpha"]
     trades_dict = rd["trades"]
 
-    if use_skills:
-        inputs = _skill_inputs(
-            ticker,
-            buyers,
-            member_skills,
-            alpha_dict,
-            trades_dict,
-            uncertainty_penalty_lambda,
-        )
+    if mode == "consensus":
+        inputs = _consensus_inputs(buyers, ticker_trades)
     else:
         fallback = _member_only_inputs(
             ticker,
@@ -128,6 +111,7 @@ def score_ticker_by_buyers(
         if isinstance(fallback, pd.DataFrame):
             return fallback
         inputs = fallback
+    inputs["scoring_mode"] = mode
 
     return _final_result(
         ticker,
@@ -135,11 +119,7 @@ def score_ticker_by_buyers(
         ticker_trades,
         inputs,
         apply_solo_penalty,
-        solo_buyer_penalty,
-        use_skills,
-        uncertainty_penalty_lambda,
         alpha_dict,
-        member_skills,
     )
 
 
@@ -175,88 +155,36 @@ def _below_threshold_result(
     )
 
 
-def _solo_buyer_gate(
-    ticker,
-    ticker_trades,
-    member_rankings,
-    min_buyers,
-    min_trades,
-    solo_buyer_skill_threshold,
-):
-    """Returns True to apply penalty, False to skip, or a DataFrame to short-circuit."""
-    if not (min_buyers == 1 and min_trades == 1 and solo_buyer_skill_threshold > 0):
-        return False
-    sole_buyer = str(ticker_trades["member"].iloc[0])
-    # The gate compares posterior_lift (posterior / leave-one-out peer prior),
-    # not the absolute bayes_win_prob. Each member's prior is estimated
-    # leave-one-out, so bayes_win_prob is no longer comparable across members
-    # against a fixed threshold; posterior_lift is the prior-invariant skill
-    # statistic (a lift above 1.0 means the buyer beats their peer prior).
-    lift = _lookup_buyer_posterior_lift(sole_buyer, member_rankings)
-    if lift is None or lift < solo_buyer_skill_threshold:
-        result = pd.DataFrame(
-            {
-                "ticker": [ticker],
-                "num_buyers": [min_trades],
-                "signal_score": [0.0],
-                "signal_score_raw": [0.0],
-                "note": [
-                    f"Solo buyer '{sole_buyer}' below skill threshold "
-                    f"({solo_buyer_skill_threshold})"
-                ],
-            }
+def _consensus_inputs(buyers, ticker_trades: pd.DataFrame) -> dict:
+    """Build an identity-free distinct-buyer recency score.
+
+    Each canonical buyer contributes its most recent disclosure weight. Names,
+    historical returns, trade counts, and member posteriors do not enter the
+    score, so permuting member identities leaves it unchanged.
+    """
+    member_col = "_member_canonical"
+    latest = pd.to_datetime(ticker_trades["disclosure_date"], errors="coerce").max()
+    disclosures = (
+        ticker_trades.assign(
+            _disclosure=pd.to_datetime(
+                ticker_trades["disclosure_date"], errors="coerce"
+            )
         )
-        return result
-    return True
-
-
-def _skill_inputs(
-    ticker, buyers, member_skills, alpha_dict, trades_dict, uncertainty_penalty_lambda
-):
-    from analyzer.member_skill import score_members_for_ticker
-
-    skill_score, skill_uncertainty = score_members_for_ticker(
-        ticker, list(buyers), member_skills
+        .groupby(member_col)["_disclosure"]
+        .max()
+        .reindex(buyers)
     )
-    skill_buyers = [m for m in buyers if m in member_skills]
-
-    rated_buyers_list = [m for m in buyers if m in alpha_dict]
-    if rated_buyers_list:
-        best_rank = max(alpha_dict[m] for m in rated_buyers_list)
-        total_trades = sum(trades_dict.get(m, 0) for m in rated_buyers_list)
-        rated_buyers = len(rated_buyers_list)
-    else:
-        best_rank = skill_score
-        total_trades = len(skill_buyers)
-        rated_buyers = len(skill_buyers)
-
-    quality_adjusted_avg = _skill_weighted_alpha(
-        skill_buyers, member_skills, skill_score
-    )
-    base_signal_score = (
-        quality_adjusted_avg - uncertainty_penalty_lambda * skill_uncertainty
-    )
-
+    days_since = (latest - disclosures).dt.days.fillna(0).clip(lower=0)
+    weights = np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.to_numpy(dtype=float))
+    score = float(weights.sum())
     return {
-        "base_signal_score": base_signal_score,
-        "rated_buyers_list": rated_buyers_list,
-        "best_rank": best_rank,
-        "total_trades": total_trades,
-        "rated_buyers": rated_buyers,
-        "quality_adjusted_avg": quality_adjusted_avg,
+        "base_signal_score": score,
+        "rated_buyers_list": list(buyers),
+        "best_rank": 1.0,
+        "total_trades": len(buyers),
+        "rated_buyers": len(buyers),
+        "quality_adjusted_avg": score,
     }
-
-
-def _skill_weighted_alpha(skill_buyers, member_skills, skill_score: float) -> float:
-    if not skill_buyers:
-        return skill_score
-    skill_posteriors = [member_skills[m] for m in skill_buyers]
-    inv_stds = np.array([1.0 / max(s.alpha_std, 1e-6) for s in skill_posteriors])
-    inv_std_sum = inv_stds.sum()
-    if inv_std_sum <= 0:
-        return skill_score
-    weights = inv_stds / inv_std_sum
-    return float(np.dot(weights, np.array([s.alpha_mean for s in skill_posteriors])))
 
 
 def _member_only_inputs(
@@ -359,11 +287,7 @@ def _final_result(
     ticker_trades,
     inputs,
     apply_solo_penalty,
-    solo_buyer_penalty,
-    use_skills,
-    uncertainty_penalty_lambda,
     alpha_dict,
-    member_skills,
 ) -> pd.DataFrame:
     base_signal_score = inputs["base_signal_score"]
     rated_buyers_list = inputs["rated_buyers_list"]
@@ -376,13 +300,9 @@ def _final_result(
     owner_factor = _owner_score_factor(ticker_trades)
 
     signal_score_raw = base_signal_score
-    if apply_solo_penalty:
-        signal_score_raw *= solo_buyer_penalty
     signal_score = round(signal_score_raw, 2)
 
-    top_buyers = _top_buyers_for_label(
-        buyers, rated_buyers_list, alpha_dict, member_skills
-    )
+    top_buyers = _top_buyers_for_label(buyers, rated_buyers_list, alpha_dict)
     buyer_label = _buyer_label(len(top_buyers), len(buyers))
 
     return pd.DataFrame(
@@ -402,20 +322,22 @@ def _final_result(
             "owner_factor": [round(owner_factor, 3)],
             "signal_score": [signal_score],
             "signal_score_raw": [signal_score_raw],
-            "fallback_source": ["member_ranked"],
-            "uncertainty_lambda": [uncertainty_penalty_lambda if use_skills else 0.0],
+            "fallback_source": [inputs.get("scoring_mode", "member_ranked")],
+            "uncertainty_lambda": [0.0],
             "solo_buyer": [apply_solo_penalty],
+            "scoring_mode": [inputs.get("scoring_mode", "custom")],
         }
     )
 
 
-def _top_buyers_for_label(buyers, rated_buyers_list, alpha_dict, member_skills) -> list:
-    if rated_buyers_list:
-        return sorted(
-            rated_buyers_list, key=lambda m: alpha_dict.get(m, 0), reverse=True
-        )[:3]
-    skill_members = [m for m in buyers if m in (member_skills or {})]
-    return skill_members[:3] if skill_members else list(buyers[:3])
+def _top_buyers_for_label(buyers, rated_buyers_list, alpha_dict) -> list:
+    if not rated_buyers_list:
+        return list(buyers[:3])
+    if not alpha_dict:
+        return list(rated_buyers_list[:3])
+    return sorted(rated_buyers_list, key=lambda m: alpha_dict.get(m, 0), reverse=True)[
+        :3
+    ]
 
 
 def _buyer_label(num_top: int, num_buyers: int) -> str:

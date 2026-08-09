@@ -83,7 +83,7 @@ class TestEstimateMemberSkills(unittest.TestCase):
         global_mean = np.mean(alphas)
         for member, skill in skills.items():
             if member == "A":
-                raw_alpha = np.mean([20.0, 22.0, 18.0])
+                raw_alpha = np.mean([21.0, 23.0, 19.0])
                 low, high = min(global_mean, raw_alpha), max(global_mean, raw_alpha)
                 self.assertGreaterEqual(skill.alpha_mean, low - 0.1)
                 self.assertLessEqual(skill.alpha_mean, high + 0.1)
@@ -126,6 +126,7 @@ class TestEstimateMemberSkills(unittest.TestCase):
                         "signal_type": "Purchase",
                         "horizon_days": HORIZON,
                         "spy_alpha_pct": alpha,
+                        "total_spy_alpha_pct": alpha,
                     }
                 )
 
@@ -141,6 +142,29 @@ class TestEstimateMemberSkills(unittest.TestCase):
         self.assertEqual(skills["OLD"].n_episodes, skills["RECENT"].n_episodes)
         self.assertGreater(skills["OLD"].alpha_std, skills["RECENT"].alpha_std)
         self.assertGreater(skills["OLD"].shrinkage, skills["RECENT"].shrinkage)
+
+    def test_uniform_recency_scaling_reduces_effective_information(self):
+        recent = _make_signals({"A": [8.0, 10.0, 12.0], "B": [-2.0, 0.0, 2.0]})
+        old = recent.copy()
+        old["disclosure_date"] = old["disclosure_date"] - pd.Timedelta(days=730)
+
+        recent_skills = estimate_member_skills(
+            recent,
+            prior_strength=1.0,
+            recency_half_life_days=100,
+            horizon=HORIZON,
+            ref_date=REF_DATE,
+        )
+        old_skills = estimate_member_skills(
+            old,
+            prior_strength=1.0,
+            recency_half_life_days=100,
+            horizon=HORIZON,
+            ref_date=REF_DATE,
+        )
+
+        self.assertGreater(old_skills["A"].shrinkage, recent_skills["A"].shrinkage)
+        self.assertGreater(old_skills["A"].alpha_std, recent_skills["A"].alpha_std)
 
     def test_global_mean_member_has_nonzero_finite_posterior_std(self):
         signals = _make_signals(
@@ -242,12 +266,14 @@ class TestScoreMembersForTicker(unittest.TestCase):
                 shrinkage=0.62,
             ),
         }
-        expected_alpha, _ = score_members_for_ticker(
+        expected_alpha, uncertainty = score_members_for_ticker(
             "AAPL",
             ["Precise", "Noisy"],
             skills,
         )
-        self.assertLess(expected_alpha, 15.0)
+        expected = (10.0 / 1.0**2 + 20.0 / 10.0**2) / (1.0 / 1.0**2 + 1.0 / 10.0**2)
+        self.assertAlmostEqual(expected_alpha, expected)
+        self.assertAlmostEqual(uncertainty, np.sqrt(1.0 / 1.01))
 
 
 class TestIntegrationWithAnalysis(unittest.TestCase):
@@ -299,16 +325,17 @@ class TestIntegrationWithAnalysis(unittest.TestCase):
                 shrinkage=0.5,
             ),
         }
-        score = score_ticker_by_buyers(
-            "AAPL",
-            transactions,
-            signals,
-            member_rankings=member_rankings,
-            member_skills=skills,
-            uncertainty_penalty_lambda=0.5,
-        )
-        self.assertIn("uncertainty_lambda", score.columns)
-        self.assertEqual(score.iloc[0]["uncertainty_lambda"], 0.5)
+        from analyzer.exceptions import AnalysisError
+
+        with self.assertRaisesRegex(AnalysisError, "diagnostic only"):
+            score_ticker_by_buyers(
+                "AAPL",
+                transactions,
+                signals,
+                member_rankings=member_rankings,
+                member_skills=skills,
+                uncertainty_penalty_lambda=0.5,
+            )
 
     def test_score_ticker_by_buyers_lambda_zero_no_penalty(self):
         """lambda=0 gives no uncertainty penalty: base_signal_score == quality_adjusted_avg."""
@@ -350,21 +377,16 @@ class TestIntegrationWithAnalysis(unittest.TestCase):
                 shrinkage=0.5,
             ),
         }
-        score = score_ticker_by_buyers(
-            "AAPL",
-            transactions,
-            signals,
-            member_skills=skills,
-            uncertainty_penalty_lambda=0.0,
-        )
-        # With lambda=0, base_signal_score should equal quality_adjusted_avg
-        # (weighted mean of posterior means by inverse uncertainty)
-        inv_stds = np.array([1.0 / 2.0, 1.0 / 3.0])
-        weights = inv_stds / inv_stds.sum()
-        expected_qa = float(np.dot(weights, np.array([10.0, 8.0])))
-        self.assertAlmostEqual(
-            score.iloc[0]["base_signal_score"], round(expected_qa, 2), places=1
-        )
+        from analyzer.exceptions import AnalysisError
+
+        with self.assertRaisesRegex(AnalysisError, "diagnostic only"):
+            score_ticker_by_buyers(
+                "AAPL",
+                transactions,
+                signals,
+                member_skills=skills,
+                uncertainty_penalty_lambda=0.0,
+            )
 
     def test_score_ticker_by_buyers_without_skills_unchanged(self):
         """Without member_skills, behavior is unchanged."""
@@ -393,7 +415,9 @@ class TestIntegrationWithAnalysis(unittest.TestCase):
             }
         )
         score = score_ticker_by_buyers("AAPL", transactions, signals)
-        self.assertEqual(score.iloc[0]["base_signal_score"], 10.0)
+        expected = np.exp(-0.03) + 1.0
+        self.assertAlmostEqual(score.iloc[0]["base_signal_score"], round(expected, 2))
+        self.assertEqual(score.iloc[0]["scoring_mode"], "consensus")
         self.assertEqual(score.iloc[0]["uncertainty_lambda"], 0.0)
 
 

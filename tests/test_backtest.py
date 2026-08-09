@@ -121,6 +121,7 @@ class TestBacktestRecommendations(unittest.TestCase):
             min_buyers=2,
             top_n=10,
             threshold=5.0,
+            scoring_mode="consensus",
         )
         self.assertFalse(recs.empty)
         self.assertEqual(len(recs), 1)
@@ -247,6 +248,7 @@ class TestBacktestRecommendations(unittest.TestCase):
             min_buyers=2,
             top_n=10,
             threshold=5.0,
+            scoring_mode="consensus",
         )
         recs_with_future = backtest_recommendations(
             signals_with_future,
@@ -257,6 +259,7 @@ class TestBacktestRecommendations(unittest.TestCase):
             min_buyers=2,
             top_n=10,
             threshold=5.0,
+            scoring_mode="consensus",
         )
 
         self.assertEqual(
@@ -1365,8 +1368,8 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         )
         self.assertTrue(recs.empty)
 
-    def test_solo_skill_threshold_passes_through(self):
-        """Raising the threshold filters a borderline-skill solo buyer."""
+    def test_solo_skill_threshold_does_not_change_tradable_score(self):
+        """Legacy posterior thresholds do not gate a tradable solo score."""
         solo_txns = _make_transactions(
             [
                 {
@@ -1391,7 +1394,7 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
         )
         self.assertFalse(recs_default.empty)
 
-        # Strict lift threshold (3.5) above Star's posterior_lift: Star rejected.
+        # A legacy posterior threshold must not alter the tradable score.
         recs_strict = backtest_recommendations(
             self.signals,
             solo_txns,
@@ -1403,4 +1406,7 @@ class TestSoloBuyerSkillGate(unittest.TestCase):
             threshold=5.0,
             solo_buyer_skill_threshold=3.5,
         )
-        self.assertTrue(recs_strict.empty)
+        self.assertFalse(recs_strict.empty)
+        self.assertEqual(
+            recs_default.iloc[0]["signal_score"], recs_strict.iloc[0]["signal_score"]
+        )

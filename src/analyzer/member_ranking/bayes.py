@@ -16,6 +16,12 @@ def bayesian_win_probability(
     prior_strength: float | None = None,
 ) -> float:
     ps = prior_strength if prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
+    if wins < 0 or losses < 0:
+        raise ValueError("wins and losses must be non-negative")
+    if not 0 < market_prior < 1:
+        raise ValueError("market_prior must be strictly between zero and one")
+    if ps <= 0:
+        raise ValueError("prior_strength must be positive")
     alpha = market_prior * ps
     beta = (1 - market_prior) * ps
     return (alpha + wins) / (alpha + beta + wins + losses)

@@ -11,6 +11,8 @@ from analyzer.senate_efd import (
     SenateRefreshSummary,
     SenateReportFetchResult,
     SenateRowValidationError,
+    _DERIVATION_COLUMNS,
+    _NORMALIZED_TRANSACTION_COLUMNS,
 )
 
 
@@ -806,6 +808,7 @@ def test_save_accepts_every_valid_ticker_provenance_matrix_case(
             "ticker_candidate",
             "ticker_origin",
             "raw_ticker",
+            "asset_description",
             "raw_asset_description",
             "raw_asset_class",
             "instrument_type",
@@ -815,6 +818,7 @@ def test_save_accepts_every_valid_ticker_provenance_matrix_case(
         candidate,
         origin,
         raw_ticker,
+        description,
         description,
         asset_class,
         source._normalize_instrument_type(asset_class),
@@ -1009,15 +1013,28 @@ def test_save_rederives_exact_ticker_triple_from_raw_fields(mutation):
             "ticker_candidate",
             "ticker_origin",
             "raw_ticker",
+            "asset_description",
             "raw_asset_description",
             "raw_asset_class",
             "instrument_type",
         ],
-    ] = [None, "ACME", "unverified", "--", "Acme Holdings (ACME)", "", "unknown"]
+    ] = [
+        None,
+        "ACME",
+        "unverified",
+        "--",
+        "Acme Holdings (ACME)",
+        "Acme Holdings (ACME)",
+        "",
+        "unknown",
+    ]
     if mutation == "raw_ticker":
         frame.loc[0, "raw_ticker"] = "MSFT"
     elif mutation == "description":
-        frame.loc[0, "raw_asset_description"] = "Beta Holdings (BETA)"
+        frame.loc[0, ["asset_description", "raw_asset_description"]] = [
+            "Beta Holdings (BETA)",
+            "Beta Holdings (BETA)",
+        ]
     else:
         frame.loc[0, "raw_asset_class"] = "Stock"
         frame.loc[0, "instrument_type"] = "stock"
@@ -1037,6 +1054,60 @@ def test_save_rederives_exact_ticker_triple_from_raw_fields(mutation):
 def test_save_rejects_owner_amount_and_asset_raw_binding_mutations(
     column, value, error
 ):
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[0, column] = value
+
+    with pytest.raises(SenateEFDError, match=error):
+        source.save_to_db(frame)
+
+
+def test_normalized_persisted_column_derivation_checklist_is_exhaustive():
+    frame = _source()._normalize([_raw_trade()])
+    assert set(frame.columns) == set(_NORMALIZED_TRANSACTION_COLUMNS)
+    assert len(_DERIVATION_COLUMNS) == len(set(_DERIVATION_COLUMNS))
+    assert set(_DERIVATION_COLUMNS) == set(_NORMALIZED_TRANSACTION_COLUMNS)
+
+
+@pytest.mark.parametrize(
+    "report_path",
+    [
+        f"https://efdsearch.senate.gov{KATIE_REPORT_PATH}",
+        f"{KATIE_REPORT_PATH}?download=1",
+        f"{KATIE_REPORT_PATH}#fragment",
+        f"/search/view/ptr/../ptr/{KATIE_REPORT_ID}/",
+        f"/search/view/ptr/{KATIE_REPORT_ID}",
+        f" {KATIE_REPORT_PATH}",
+    ],
+)
+def test_save_rejects_noncanonical_or_external_report_paths(report_path):
+    source = _ready_persistence_source(_report_inventory_row(report_path=report_path))
+    frame = source._normalize([_raw_trade()])
+
+    with pytest.raises(SenateEFDError, match="path/record ID mismatch"):
+        source.save_to_db(frame)
+
+
+def test_save_rejects_external_transaction_report_path():
+    source = _ready_persistence_source()
+    frame = source._normalize([_raw_trade()])
+    frame.loc[0, "source_report_path"] = (
+        f"https://efdsearch.senate.gov{KATIE_REPORT_PATH}"
+    )
+
+    with pytest.raises(SenateEFDError, match="report path mismatch"):
+        source.save_to_db(frame)
+
+
+@pytest.mark.parametrize(
+    "column,value,error",
+    [
+        ("asset_description", "Different description", "asset description mismatch"),
+        ("member_key", "WRONG MEMBER", "member key mismatch"),
+        ("chamber_member_key", "house:KATIE BRITT", "member key mismatch"),
+    ],
+)
+def test_save_rejects_three_persisted_derivation_mutations(column, value, error):
     source = _ready_persistence_source()
     frame = source._normalize([_raw_trade()])
     frame.loc[0, column] = value

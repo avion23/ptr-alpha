@@ -89,6 +89,97 @@ _NON_EQUITY_RE = re.compile(
 _RESERVED_INFERRED_TICKERS = frozenset(
     {"COUPON", "BOND", "BONDS", "NOTE", "NOTES", "STOCK", "TICKER"}
 )
+_CANONICAL_PTR_PATH_RE = re.compile(
+    r"^/search/view/ptr/"
+    r"(?P<source_record_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})/$"
+)
+_NORMALIZED_TRANSACTION_COLUMNS = (
+    "doc_id",
+    "chamber",
+    "source_record_id",
+    "source_row_id",
+    "source_report_path",
+    "member",
+    "member_key",
+    "chamber_member_key",
+    "ticker",
+    "raw_ticker",
+    "ticker_candidate",
+    "ticker_origin",
+    "transaction_date",
+    "disclosure_date",
+    "official_filing_date",
+    "available_date",
+    "notification_date",
+    "transaction_type",
+    "raw_transaction_subtype",
+    "owner_code",
+    "raw_owner",
+    "amount_raw",
+    "amount_midpoint",
+    "instrument_type",
+    "raw_asset_class",
+    "strike_price",
+    "expiry_date",
+    "asset_description",
+    "raw_asset_description",
+    "amends_source_record_id",
+    "ingestion_generation",
+    "artifact_sha256",
+)
+_PERSISTED_COLUMN_DERIVATIONS = {
+    "report_binding": frozenset(
+        {
+            "doc_id",
+            "chamber",
+            "source_record_id",
+            "source_report_path",
+            "member",
+            "member_key",
+            "chamber_member_key",
+            "disclosure_date",
+            "official_filing_date",
+            "available_date",
+            "ingestion_generation",
+            "artifact_sha256",
+        }
+    ),
+    "official_row": frozenset(
+        {
+            "source_row_id",
+            "raw_ticker",
+            "transaction_date",
+            "notification_date",
+            "raw_transaction_subtype",
+            "raw_owner",
+            "amount_raw",
+            "raw_asset_class",
+            "raw_asset_description",
+        }
+    ),
+    "raw_derivation": frozenset(
+        {
+            "ticker",
+            "ticker_candidate",
+            "ticker_origin",
+            "transaction_type",
+            "owner_code",
+            "amount_midpoint",
+            "instrument_type",
+            "asset_description",
+        }
+    ),
+    "unsupported_nullable": frozenset(
+        {"strike_price", "expiry_date", "amends_source_record_id"}
+    ),
+}
+_DERIVATION_COLUMNS = [
+    column for columns in _PERSISTED_COLUMN_DERIVATIONS.values() for column in columns
+]
+assert len(_DERIVATION_COLUMNS) == len(set(_DERIVATION_COLUMNS))
+assert set(_DERIVATION_COLUMNS) == set(_NORMALIZED_TRANSACTION_COLUMNS)
+
 _PAPER_ARTIFACT_RE = re.compile(
     r"(?:/search/view/(?:paper|paper-filing)/|\.pdf(?:$|[?#]))", re.I
 )
@@ -873,40 +964,7 @@ class SenateEFDSource(TransactionSource):
         return transaction_date <= notification_date <= official_filing_date
 
     def _normalize(self, trades: list[dict]) -> pd.DataFrame:
-        columns = [
-            "doc_id",
-            "chamber",
-            "source_record_id",
-            "source_row_id",
-            "source_report_path",
-            "member",
-            "member_key",
-            "chamber_member_key",
-            "ticker",
-            "raw_ticker",
-            "ticker_candidate",
-            "ticker_origin",
-            "transaction_date",
-            "disclosure_date",
-            "official_filing_date",
-            "available_date",
-            "notification_date",
-            "transaction_type",
-            "raw_transaction_subtype",
-            "owner_code",
-            "raw_owner",
-            "amount_raw",
-            "amount_midpoint",
-            "instrument_type",
-            "raw_asset_class",
-            "strike_price",
-            "expiry_date",
-            "asset_description",
-            "raw_asset_description",
-            "amends_source_record_id",
-            "ingestion_generation",
-            "artifact_sha256",
-        ]
+        columns = list(_NORMALIZED_TRANSACTION_COLUMNS)
         if not trades:
             return pd.DataFrame(columns=columns)
 
@@ -1169,35 +1227,7 @@ class SenateEFDSource(TransactionSource):
                 "Senate report inventory count does not match refresh summary"
             )
 
-        required_columns = {
-            "doc_id",
-            "chamber",
-            "source_record_id",
-            "source_report_path",
-            "member",
-            "source_row_id",
-            "ticker",
-            "raw_ticker",
-            "ticker_candidate",
-            "transaction_date",
-            "disclosure_date",
-            "transaction_type",
-            "official_filing_date",
-            "available_date",
-            "notification_date",
-            "amends_source_record_id",
-            "raw_transaction_subtype",
-            "owner_code",
-            "raw_owner",
-            "amount_raw",
-            "amount_midpoint",
-            "instrument_type",
-            "ticker_origin",
-            "raw_asset_class",
-            "raw_asset_description",
-            "ingestion_generation",
-            "artifact_sha256",
-        }
+        required_columns = set(_NORMALIZED_TRANSACTION_COLUMNS)
         missing = required_columns - set(df.columns)
         if missing:
             raise SenateEFDError(
@@ -1307,16 +1337,25 @@ class SenateEFDSource(TransactionSource):
                     f"{sorted(missing_report_fields)}"
                 )
             source_record_id = self._provenance_text(report["source_record_id"])
-            if source_record_id is None:
+            if (
+                source_record_id is None
+                or report["source_record_id"] != source_record_id
+            ):
                 raise SenateEFDError("Senate report inventory has no source_record_id")
             if source_record_id in report_hashes:
                 raise SenateEFDError(
                     f"Duplicate Senate report inventory ID: {source_record_id}"
                 )
             report_path = self._provenance_text(report["report_path"])
-            if report_path is None:
-                raise SenateEFDError(f"Senate report path is blank: {source_record_id}")
-            if self._path_to_source_record_id(report_path) != source_record_id:
+            if report_path is None or report["report_path"] != report_path:
+                raise SenateEFDError(
+                    f"Senate report path/record ID mismatch: {source_record_id}"
+                )
+            path_match = _CANONICAL_PTR_PATH_RE.fullmatch(report_path)
+            if (
+                path_match is None
+                or path_match.group("source_record_id") != source_record_id
+            ):
                 raise SenateEFDError(
                     f"Senate report path/record ID mismatch: {source_record_id}"
                 )
@@ -1455,6 +1494,8 @@ class SenateEFDSource(TransactionSource):
             "source_record_id",
             "source_report_path",
             "member",
+            "member_key",
+            "chamber_member_key",
             "transaction_date",
             "disclosure_date",
             "official_filing_date",
@@ -1465,8 +1506,12 @@ class SenateEFDSource(TransactionSource):
             "raw_ticker",
             "ticker_candidate",
             "ticker_origin",
+            "asset_description",
             "raw_asset_description",
             "raw_asset_class",
+            "strike_price",
+            "expiry_date",
+            "amends_source_record_id",
             "owner_code",
             "raw_owner",
             "amount_raw",
@@ -1494,6 +1539,14 @@ class SenateEFDSource(TransactionSource):
                 raise SenateEFDError(
                     f"Senate transaction member mismatch: {source_record_id}"
                 )
+            if row.member_key != canonical_member_key(
+                row.member
+            ) or row.chamber_member_key != chamber_scoped_member_key(
+                row.member, Chamber.SENATE.value
+            ):
+                raise SenateEFDError(
+                    f"Senate transaction member key mismatch: {source_record_id}"
+                )
             if row.source_report_path != report_path:
                 raise SenateEFDError(
                     f"Senate transaction report path mismatch: {source_record_id}"
@@ -1508,6 +1561,21 @@ class SenateEFDSource(TransactionSource):
                     f"Senate transaction filing date binding mismatch: {source_record_id}"
                 )
 
+            if row.asset_description != row.raw_asset_description:
+                raise SenateEFDError(
+                    f"Senate transaction asset description mismatch: {source_record_id}"
+                )
+            if any(
+                self._provenance_text(value) is not None
+                for value in (
+                    row.strike_price,
+                    row.expiry_date,
+                    row.amends_source_record_id,
+                )
+            ):
+                raise SenateEFDError(
+                    f"Unsupported Senate derived value is nonnull: {source_record_id}"
+                )
             resolved_ticker, resolved_candidate, resolved_origin = self._resolve_ticker(
                 row.raw_ticker,
                 self._provenance_text(row.raw_asset_description) or "",

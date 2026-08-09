@@ -5,20 +5,27 @@ from __future__ import annotations
 import hashlib
 import inspect
 import math
-from dataclasses import replace
 from datetime import date
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from analyzer.cli import _validation_grid
+from analyzer.exceptions import AnalysisError
 from analyzer.pipeline import BacktestParams
+from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_SCORER_PROVENANCE,
+    score_ticker_by_buyers,
+)
+from analyzer.member_ranking.lookups import _compute_alpha_for_scoring_mode
 from analyzer.validation import (
     LOCKED_FINAL_START,
     MIN_RELEASE_PERMUTATIONS,
     PRIMARY_METRIC,
     EvaluationAlreadyConsumedError,
     EvaluationLedgerIntegrityError,
+    _authorize_member_control_from_ledger,
     _backtest_core,
     _build_manifest,
     _canonical_ledger_path,
@@ -66,6 +73,7 @@ def _selection_frame(
                 "decay_lambda": 0.005,
                 "bayes_prior_strength": 20.0,
                 "scoring_mode": "consensus",
+                "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
                 "total_recs": 100,
                 "dates_evaluated": len(values),
                 "overall_alpha": float(values.mean()),
@@ -194,24 +202,15 @@ class TestMemberIdentityGate:
         assert result["deployable_config"] is None
         assert result["failure_reason"] == "member_identity_control_required_or_failed"
 
-    def test_member_control_below_release_count_fails_closed(self):
-        rng = np.random.default_rng(42)
-        series = {0: _series(2.0 + rng.normal(0, 0.1, 180))}
-        result = select_config(
-            _selection_frame(series),
-            series_by_trial=series,
-            n_permutations=999,
-            member_control={
-                "status": "completed",
-                "n_permutations": 998,
-                "release_ready": False,
-                "max_stat_p_value": 0.001,
-            },
-        )
-        assert result["deployable_config"] is None
-        assert (
-            result["member_identity_control"]["status"] == "invalid_non_runner_control"
-        )
+    def test_caller_supplied_member_control_is_rejected(self):
+        series = {0: _series(np.full(180, 2.0))}
+        with pytest.raises(TypeError, match="unexpected keyword"):
+            select_config(
+                _selection_frame(series),
+                series_by_trial=series,
+                n_permutations=999,
+                member_control={"release_ready": True},
+            )
 
     def test_descriptive_scoring_modes_are_never_deployment_candidates(self):
         series = {0: _series(np.full(180, 2.0))}
@@ -223,26 +222,16 @@ class TestMemberIdentityGate:
 
     def test_identity_free_exemption_payload_is_never_accepted(self):
         series = {0: _series(np.full(180, 2.0))}
-        frame = _selection_frame(series)
-        frame["scoring_mode"] = "identity_free_consensus"
-        result = select_config(
-            frame,
-            series_by_trial=series,
-            n_permutations=999,
-            member_control={
-                "exempt": True,
-                "invariance_proof_sha256": "a" * 64,
-                "release_ready": True,
-                "max_stat_p_value": 0.0,
-            },
-        )
-        assert result["deployable_config"] is None
-        assert (
-            result["member_identity_control"]["status"] == "invalid_non_runner_control"
-        )
+        with pytest.raises(TypeError, match="unexpected keyword"):
+            select_config(
+                _selection_frame(series),
+                series_by_trial=series,
+                n_permutations=999,
+                member_control={"exempt": True},
+            )
 
     def test_production_member_control_derives_executed_family_and_statistic(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
         signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
         monkeypatch.setattr(
@@ -272,6 +261,7 @@ class TestMemberIdentityGate:
             date(2022, 1, 1),
             date(2023, 1, 1),
             observed_trial_id=0,
+            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
             n_permutations=3,
             seed=10,
         )
@@ -301,7 +291,7 @@ class TestMemberIdentityGate:
         )
 
     def test_runtime_budget_fails_closed_without_duplicate_draw_claims(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
         signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
         monkeypatch.setattr(
@@ -321,6 +311,7 @@ class TestMemberIdentityGate:
             date(2022, 1, 1),
             date(2023, 1, 1),
             observed_trial_id=0,
+            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
             n_permutations=999,
             seed=10,
             runtime_budget_seconds=0.0,
@@ -330,7 +321,9 @@ class TestMemberIdentityGate:
         assert result.release_ready is False
         assert result.max_stat_p_value == 1.0
 
-    def test_only_bound_unedited_runner_result_can_unlock_deployment(self, monkeypatch):
+    def test_only_canonical_ledger_result_can_unlock_deployment(
+        self, monkeypatch, tmp_path
+    ):
         signal = pd.DataFrame({"member": list("ABCDEFG"), "value": np.arange(7.0)})
         monkeypatch.setattr(
             "analyzer.validation.analysis.calculate_signal_potential",
@@ -358,27 +351,27 @@ class TestMemberIdentityGate:
             date(2022, 1, 1),
             date(2023, 1, 1),
             observed_trial_id=0,
+            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
             n_permutations=999,
             seed=1,
         )
-        result = select_config(baseline, n_permutations=999, member_control=control)
+        selection = select_config(baseline, n_permutations=999)
+        result = _authorize_member_control_from_ledger(
+            selection,
+            baseline,
+            0.05,
+            tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
+        )
         assert control.evaluated_permutations == 999
         assert control.release_ready is True
         assert result["deployable_config"] is not None
 
-        edited = replace(control, max_stat_p_value=0.0)
-        edited_result = select_config(
-            baseline, n_permutations=999, member_control=edited
-        )
-        assert edited_result["deployable_config"] is None
+        with pytest.raises(TypeError, match="unexpected keyword"):
+            select_config(baseline, n_permutations=999, member_control=control)
 
-        statistic_edited = replace(control, observed_statistic=0.0)
-        statistic_result = select_config(
-            baseline, n_permutations=999, member_control=statistic_edited
-        )
-        assert statistic_result["deployable_config"] is None
-
-    def test_runner_result_must_match_exact_executed_family(self, monkeypatch):
+    def test_runner_result_must_match_exact_executed_family(
+        self, monkeypatch, tmp_path
+    ):
         signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
         monkeypatch.setattr(
             "analyzer.validation.analysis.calculate_signal_potential",
@@ -389,7 +382,7 @@ class TestMemberIdentityGate:
         monkeypatch.setattr(
             "analyzer.validation.sweep_configs", lambda *args, **kwargs: executed
         )
-        control = _run_member_identity_control(
+        _run_member_identity_control(
             pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
@@ -397,12 +390,19 @@ class TestMemberIdentityGate:
             date(2022, 1, 1),
             date(2023, 1, 1),
             observed_trial_id=0,
+            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
             n_permutations=999,
             seed=1,
         )
         changed_series = {0: _series(np.full(180, 3.0))}
         changed = _with_series(_selection_frame(changed_series), changed_series)
-        result = select_config(changed, n_permutations=999, member_control=control)
+        selection = select_config(changed, n_permutations=999)
+        result = _authorize_member_control_from_ledger(
+            selection,
+            changed,
+            0.05,
+            tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
+        )
         assert result["statistical_candidate"] is not None
         assert result["deployable_config"] is None
 
@@ -415,6 +415,89 @@ class TestMemberIdentityGate:
         assert result["deployable_config"] is None
         assert result["failure_reason"] == "bootstrap_sample_too_small"
         assert "at least 8" in result["bootstrap"]["error"]
+
+
+class TestConsensusProductionScoring:
+    def test_consensus_is_distinct_from_member_alpha_and_rejects_alpha_path(self):
+        transactions = pd.DataFrame(
+            {
+                "member": ["Alice", "Bob"],
+                "ticker": ["AAPL", "AAPL"],
+                "disclosure_date": pd.to_datetime(["2024-05-10", "2024-05-12"]),
+                "transaction_type": ["Purchase", "Purchase"],
+            }
+        )
+        as_of = pd.Timestamp("2024-05-20")
+        consensus = score_ticker_by_buyers(
+            "AAPL", transactions, min_buyers=1, as_of_date=as_of
+        )
+        ranking_dicts = {
+            "mode": "shrunk_alpha",
+            "alpha": {"ALICE": 10.0, "BOB": 20.0},
+            "trades": {"ALICE": 5, "BOB": 5},
+            "prob": {},
+            "has_shrunk": True,
+        }
+        descriptive = score_ticker_by_buyers(
+            "AAPL",
+            transactions,
+            signals_df=pd.DataFrame({"value": [1.0]}),
+            member_rankings=pd.DataFrame({"value": [1.0]}),
+            min_buyers=1,
+            _ranking_dicts=ranking_dicts,
+            scoring_mode="shrunk_alpha",
+            as_of_date=as_of,
+        )
+        assert (
+            consensus.iloc[0]["signal_score_raw"]
+            != descriptive.iloc[0]["signal_score_raw"]
+        )
+        assert consensus.iloc[0]["scorer_provenance"] == CONSENSUS_SCORER_PROVENANCE
+        with pytest.raises(AnalysisError, match="identity-free"):
+            _compute_alpha_for_scoring_mode(
+                pd.DataFrame(
+                    {
+                        "member": ["Alice"],
+                        "shrunk_alpha": [1.0],
+                        "purchase_trades": [1],
+                    }
+                ),
+                "shrunk_alpha",
+                "consensus",
+            )
+
+    def test_member_relabeling_control_cannot_deploy_consensus(
+        self, monkeypatch, tmp_path
+    ):
+        signal = pd.DataFrame({"member": list("ABCDEFG"), "value": np.arange(7.0)})
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.calculate_signal_potential",
+            lambda *args, **kwargs: signal,
+        )
+        series = {0: _series(np.full(180, 2.0))}
+        baseline = _with_series(_selection_frame(series), series)
+        monkeypatch.setattr(
+            "analyzer.validation.sweep_configs", lambda *args, **kwargs: baseline
+        )
+        ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
+        control = _run_member_identity_control(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            pd.DataFrame(),
+            {"horizon": [60], "decay_lambda": [0.005]},
+            date(2022, 1, 1),
+            date(2023, 1, 1),
+            observed_trial_id=0,
+            ledger_path=ledger,
+            n_permutations=999,
+            seed=4,
+        )
+        selection = select_config(baseline, n_permutations=999)
+        authorized = _authorize_member_control_from_ledger(
+            selection, baseline, 0.05, ledger
+        )
+        assert control.max_stat_p_value == 1.0
+        assert authorized["deployable_config"] is None
 
 
 class TestExecutionSupport:
@@ -436,6 +519,7 @@ class TestExecutionSupport:
                         "ticker": "AAA",
                         "signal_score": 3.0,
                         "optimal_horizon": 120,
+                        "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
                     }
                 ]
             )
@@ -725,6 +809,12 @@ class TestMemberPermutationCanary:
             == original[(60, 0.005)]["member"].tolist()
         )
         assert original[(60, 0.005)]["member"].tolist() == ["A", "A", "B", "C"]
+
+
+def test_cli_validation_grid_counts_are_exact():
+    assert math.prod(len(values) for values in _validation_grid(False).values()) == 18
+    assert math.prod(len(values) for values in _validation_grid(True).values()) == 648
+    assert _validation_grid(False)["scoring_mode"] == ["consensus"]
 
 
 def test_legacy_sweep_refuses_winner_claims(capsys):

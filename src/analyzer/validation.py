@@ -12,7 +12,6 @@ The validation contract is fail closed:
 from __future__ import annotations
 
 import hashlib
-import hmac
 import itertools
 import json
 import logging
@@ -23,7 +22,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from importlib import metadata
 from pathlib import Path
@@ -35,6 +34,7 @@ from scipy import stats
 from analyzer import analysis
 from analyzer.exceptions import AnalysisError
 from analyzer.pipeline import BacktestParams
+from analyzer.member_ranking.buyer_scoring import CONSENSUS_SCORER_PROVENANCE
 from analyzer.snooping import bonferroni_correction, max_stat_moving_block_bootstrap
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,6 @@ VALIDATION_ENTRY_DELAY_DAYS = 0  # evaluate_backtest(use_dip_entry=False)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
 MEMBER_EXACT_GROUP_LIMIT = 720
 MEMBER_RUNTIME_BUDGET_SECONDS = 300.0
-_MEMBER_CONTROL_HMAC_KEY = os.urandom(32)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +67,6 @@ class MemberIdentityControlResult:
     family_sha256: str
     observed_trial_id: int
     observed_statistic: float
-    integrity_hmac_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +79,7 @@ class SweepResult:
     decay_lambda: float
     bayes_prior_strength: float
     scoring_mode: str = "consensus"
+    scorer_provenance: str = ""
     total_recs: int = 0
     dates_evaluated: int = 0
     scheduled_dates: int = 0
@@ -182,6 +181,16 @@ def _backtest_core(
                 scoring_mode=scoring_mode,
                 bayes_prior_strength=bayes_prior_strength,
             )
+            if scoring_mode == "consensus" and not recommendations.empty:
+                provenance = set(
+                    recommendations.get(
+                        "scorer_provenance", pd.Series(dtype=str)
+                    ).dropna()
+                )
+                if provenance != {CONSENSUS_SCORER_PROVENANCE}:
+                    raise AnalysisError(
+                        "consensus recommendations lack executed-scorer provenance"
+                    )
         except (AnalysisError, KeyError) as exc:
             failures.append((as_of_ts, exc))
             recommendations = pd.DataFrame()
@@ -268,6 +277,13 @@ def _backtest_core(
         decay_lambda=decay_lambda,
         bayes_prior_strength=bayes_prior_strength,
         scoring_mode=scoring_mode,
+        scorer_provenance=(
+            CONSENSUS_SCORER_PROVENANCE
+            if scoring_mode == "consensus" and total_recommendations > 0
+            else "descriptive_member_skill_v1"
+            if scoring_mode != "consensus"
+            else ""
+        ),
         total_recs=total_recommendations,
         dates_evaluated=supported,
         scheduled_dates=scheduled,
@@ -476,28 +492,6 @@ def _member_family_sha256(
     return digest.hexdigest()
 
 
-def _member_control_hmac(payload: dict) -> str:
-    serialized = json.dumps(
-        _json_safe(payload), sort_keys=True, separators=(",", ":")
-    ).encode()
-    return hmac.new(_MEMBER_CONTROL_HMAC_KEY, serialized, hashlib.sha256).hexdigest()
-
-
-def _member_control_payload(result: MemberIdentityControlResult) -> dict:
-    return {
-        item.name: getattr(result, item.name)
-        for item in fields(result)
-        if item.name != "integrity_hmac_sha256"
-    }
-
-
-def _valid_member_control_integrity(result: MemberIdentityControlResult) -> bool:
-    return hmac.compare_digest(
-        result.integrity_hmac_sha256,
-        _member_control_hmac(_member_control_payload(result)),
-    )
-
-
 def select_config(
     sweep_df: pd.DataFrame,
     alpha: float = 0.05,
@@ -505,7 +499,6 @@ def select_config(
     series_by_trial: dict[int, pd.Series] | None = None,
     n_permutations: int = 999,
     permutation_seed: int = 0,
-    member_control: MemberIdentityControlResult | None = None,
 ) -> dict:
     """Select by bootstrap p-values and require a member-identity control."""
     if not 0 < alpha < 1:
@@ -521,6 +514,7 @@ def select_config(
         "horizon",
         "frequency_days",
         "scoring_mode",
+        "scorer_provenance",
     }
     missing = required - set(sweep_df.columns)
     if missing:
@@ -537,6 +531,12 @@ def select_config(
         else np.ones(n_trials, dtype=bool)
     )
     candidate &= working["scoring_mode"].astype(str).eq("consensus").to_numpy()
+    candidate &= (
+        working["scorer_provenance"]
+        .astype(str)
+        .eq(CONSENSUS_SCORER_PROVENANCE)
+        .to_numpy()
+    )
     source_series = series_by_trial or sweep_df.attrs.get("series_by_trial")
     expected_trial_ids = {int(value) for value in working["trial_id"]}
     supplied_trial_ids = {int(key) for key in source_series} if source_series else set()
@@ -637,47 +637,13 @@ def select_config(
         statistical_candidate["label"] = "statistical_candidate_requires_member_control"
 
     deployable = None
-    expected_family_sha256 = (
-        _member_family_sha256(sweep_df, source_series)
-        if source_series and complete_series
-        else None
-    )
-    if member_control is None:
-        member_summary = {
-            "status": "not_required_no_statistical_candidate",
-            "release_ready": False,
-            "runtime_seconds": 0.0,
-            "required_before_deployment": True,
-        }
-    elif not isinstance(member_control, MemberIdentityControlResult):
-        member_summary = {
-            "status": "invalid_non_runner_control",
-            "release_ready": False,
-            "required_before_deployment": True,
-        }
-    else:
-        member_summary = {
-            item.name: getattr(member_control, item.name)
-            for item in fields(member_control)
-            if not item.name.startswith("_")
-        }
-    if statistical_candidate is not None and isinstance(
-        member_control, MemberIdentityControlResult
-    ):
-        member_passes = bool(
-            member_control.status == "completed"
-            and member_control.release_ready
-            and _valid_member_control_integrity(member_control)
-            and member_control.family_sha256 == expected_family_sha256
-            and member_control.observed_trial_id
-            == int(statistical_candidate["trial_id"])
-            and member_control.observed_statistic
-            == float(statistical_candidate["nw_tstat"])
-            and member_control.max_stat_p_value <= alpha
-        )
-        if member_passes:
-            deployable = dict(statistical_candidate)
-            deployable["label"] = "deployable_train_survivor"
+    member_summary = {
+        "status": "not_required_no_statistical_candidate",
+        "release_ready": False,
+        "runtime_seconds": 0.0,
+        "required_before_deployment": True,
+        "authorization_source": "canonical_hash_chained_ledger_only",
+    }
 
     if not source_series:
         reason = "missing_bootstrap_series"
@@ -725,6 +691,7 @@ def _run_member_identity_control(
     end: date,
     *,
     observed_trial_id: int,
+    ledger_path: Path,
     n_permutations: int,
     seed: int,
     runtime_budget_seconds: float = MEMBER_RUNTIME_BUDGET_SECONDS,
@@ -843,9 +810,9 @@ def _run_member_identity_control(
         "observed_trial_id": observed_trial_id,
         "observed_statistic": observed_statistic,
     }
-    return MemberIdentityControlResult(
-        **payload, integrity_hmac_sha256=_member_control_hmac(payload)
-    )
+    result = MemberIdentityControlResult(**payload)
+    _record_member_control(ledger_path, result)
+    return result
 
 
 def _phase_end(
@@ -951,6 +918,107 @@ def _refuse_legacy_ledger(ledger_path: Path) -> None:
         "legacy validation_evaluation_ledger.json exists; archive or migrate it "
         "explicitly before validation"
     )
+
+
+def _record_member_control(
+    ledger_path: Path, result: MemberIdentityControlResult
+) -> None:
+    import fcntl
+
+    _refuse_legacy_ledger(ledger_path)
+    lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        ledger = (
+            json.loads(ledger_path.read_text())
+            if ledger_path.exists()
+            else _empty_ledger()
+        )
+        _validate_ledger(ledger)
+        _append_ledger_event(
+            ledger,
+            {
+                "event_type": "member_identity_control",
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                "control": asdict(result),
+            },
+        )
+        _atomic_write_json(ledger_path, ledger)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _read_member_control(
+    ledger_path: Path,
+    family_sha256: str,
+    observed_trial_id: int,
+    observed_statistic: float,
+) -> dict | None:
+    import fcntl
+
+    _refuse_legacy_ledger(ledger_path)
+    if not ledger_path.exists():
+        return None
+    lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+        ledger = json.loads(ledger_path.read_text())
+        _validate_ledger(ledger)
+        for event in reversed(ledger["events"]):
+            if event.get("event_type") != "member_identity_control":
+                continue
+            control = event.get("control", {})
+            if (
+                control.get("family_sha256") == family_sha256
+                and int(control.get("observed_trial_id", -1)) == observed_trial_id
+                and float(control.get("observed_statistic", math.nan))
+                == observed_statistic
+            ):
+                return control
+        return None
+
+
+def _authorize_member_control_from_ledger(
+    selection: dict,
+    sweep_df: pd.DataFrame,
+    alpha: float,
+    ledger_path: Path,
+) -> dict:
+    result = dict(selection)
+    statistical_candidate = result.get("statistical_candidate")
+    if statistical_candidate is None:
+        return result
+    series_by_trial = sweep_df.attrs.get("series_by_trial")
+    if not isinstance(series_by_trial, dict):
+        return result
+    family_sha256 = _member_family_sha256(sweep_df, series_by_trial)
+    control = _read_member_control(
+        ledger_path,
+        family_sha256,
+        int(statistical_candidate["trial_id"]),
+        float(statistical_candidate["nw_tstat"]),
+    )
+    if control is None:
+        result["member_identity_control"] = {
+            "status": "missing_canonical_ledger_control",
+            "release_ready": False,
+            "authorization_source": "canonical_hash_chained_ledger_only",
+        }
+        return result
+    result["member_identity_control"] = control
+    passes = bool(
+        control.get("status") == "completed"
+        and control.get("release_ready") is True
+        and float(control.get("max_stat_p_value", 1.0)) <= alpha
+    )
+    if not passes:
+        return result
+    deployable = dict(statistical_candidate)
+    deployable["label"] = "deployable_train_survivor"
+    result["deployable_config"] = deployable
+    result["failure_reason"] = None
+    result["n_survivors"] = 1
+    return result
 
 
 def _reserve_evaluation(
@@ -1146,7 +1214,7 @@ def _run_validation_with_db(
     )
     statistical_candidate = selection["statistical_candidate"]
     if statistical_candidate is not None:
-        member_control = _run_member_identity_control(
+        _run_member_identity_control(
             all_tx,
             prices,
             entry_prices,
@@ -1154,6 +1222,7 @@ def _run_validation_with_db(
             train_start,
             train_effective_end,
             observed_trial_id=int(statistical_candidate["trial_id"]),
+            ledger_path=evaluation_ledger_path,
             n_permutations=member_permutations,
             seed=permutation_seed + n_permutations,
         )
@@ -1162,7 +1231,9 @@ def _run_validation_with_db(
             alpha,
             n_permutations=n_permutations,
             permutation_seed=permutation_seed,
-            member_control=member_control,
+        )
+        selection = _authorize_member_control_from_ledger(
+            selection, train_df, alpha, evaluation_ledger_path
         )
     manifest = _build_manifest(
         db_path,
@@ -1495,7 +1566,7 @@ def _build_manifest(
             "large_group_policy": "unique_uniform_sample_without_replacement",
             "member_runtime_budget_seconds": MEMBER_RUNTIME_BUDGET_SECONDS,
             "member_control_integrity": (
-                "process_local_hmac_sha256_over_executed_family_hash_trial_and_statistic"
+                "canonical_append_only_hash_chain_bound_to_executed_family_trial_statistic"
             ),
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "minimum_family_resolution_bootstrap": max(

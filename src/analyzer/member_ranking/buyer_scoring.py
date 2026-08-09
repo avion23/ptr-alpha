@@ -27,6 +27,8 @@ from analyzer.member_ranking.lookups import (
     _validate_scoring_mode,
 )
 
+CONSENSUS_SCORER_PROVENANCE = "identity_free_distinct_buyer_recency_v1"
+
 
 @df_memoize(copy=False)
 def score_ticker_by_buyers(
@@ -327,6 +329,11 @@ def _final_result(
             "signal_score_raw": [signal_score_raw],
             "fallback_source": [inputs.get("scoring_mode", "member_ranked")],
             "scoring_mode": [inputs.get("scoring_mode", "custom")],
+            "scorer_provenance": [
+                CONSENSUS_SCORER_PROVENANCE
+                if inputs.get("scoring_mode") == "consensus"
+                else "descriptive_member_skill_v1"
+            ],
         }
     )
 

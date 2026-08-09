@@ -1369,6 +1369,30 @@ def fetch_senate_efd(
     raise typer.Exit(0)
 
 
+def _validation_grid(full_grid: bool) -> dict[str, list]:
+    if full_grid:
+        return {
+            "horizon": [60, 90, 120],
+            "frequency_days": [30, 90],
+            "training_lookback_days": [180, 365],
+            "min_buyers": [2, 3, 5],
+            "top_n": [3, 5],
+            "decay_lambda": [0.001, 0.005, 0.02],
+            "bayes_prior_strength": [5, 20, 50],
+            "scoring_mode": ["consensus"],
+        }
+    return {
+        "horizon": [60, 90, 120],
+        "frequency_days": [30],
+        "training_lookback_days": [365],
+        "min_buyers": [2, 3, 5],
+        "top_n": [3, 5],
+        "decay_lambda": [0.005],
+        "bayes_prior_strength": [20],
+        "scoring_mode": ["consensus"],
+    }
+
+
 @app.command()
 def validate(
     ctx: typer.Context,
@@ -1381,7 +1405,7 @@ def validate(
     test_start: str = typer.Option("2024-01-01", help="Test window start (YYYY-MM-DD)"),
     test_end: str = typer.Option("2025-06-30", help="Test window end (YYYY-MM-DD)"),
     full_grid: bool = typer.Option(
-        False, "--full-grid", help="Use full 1296-combo grid (slow)"
+        False, "--full-grid", help="Use full 648-combo grid (slow)"
     ),
     data_dir: str = typer.Option("data", help="Data directory"),
     null_samples: int = typer.Option(
@@ -1433,29 +1457,7 @@ def validate(
         )
         raise typer.Exit(1)
 
-    if full_grid:
-        grid = {
-            "horizon": [60, 90, 120],
-            "frequency_days": [30, 90],
-            "training_lookback_days": [180, 365],
-            "min_buyers": [2, 3, 5],
-            "top_n": [3, 5],
-            "decay_lambda": [0.001, 0.005, 0.02],
-            "bayes_prior_strength": [5, 20, 50],
-            "scoring_mode": ["consensus"],
-        }
-    else:
-        # Default ~36-combo grid: 3*3*2*2 combinations
-        grid = {
-            "horizon": [60, 90, 120],
-            "frequency_days": [30],
-            "training_lookback_days": [365],
-            "min_buyers": [2, 3, 5],
-            "top_n": [3, 5],
-            "decay_lambda": [0.005],
-            "bayes_prior_strength": [20],
-            "scoring_mode": ["consensus"],
-        }
+    grid = _validation_grid(full_grid)
 
     if null_samples < 1 or member_null_samples < 1:
         print("Error: null sample counts must be positive", file=sys.stderr)

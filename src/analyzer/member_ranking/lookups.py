@@ -129,6 +129,10 @@ def _compute_alpha_for_scoring_mode(
     valid: pd.DataFrame, alpha_col: str, scoring_mode: str
 ) -> dict:
     _validate_scoring_mode(scoring_mode)
+    if scoring_mode == "consensus":
+        raise AnalysisError(
+            "consensus is identity-free and has no member-alpha scoring path"
+        )
     if scoring_mode == "consistency":
         prob_up = (
             valid["prob_up_given_buy"].fillna(0.5).values

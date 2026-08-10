@@ -167,7 +167,7 @@ class TestRevisionCheck:
         assert not ok
 
 
-def _env(root, revision="6226675f36a5b7db060efa2d8ec9eedb50432dcb", db_sha="deadbeef"):
+def _env(root, revision=vb.EXPECTED_REVISION, db_sha="deadbeef"):
     return vb.EnvCheck(
         root=Path(root),
         primary=Path(root),
@@ -184,8 +184,8 @@ def _manifest(**overrides):
     manifest = {
         "schema_version": 1,
         "git": {
-            "base_revision": "6226675f36a5b7db060efa2d8ec9eedb50432dcb",
-            "revision": "6226675f36a5b7db060efa2d8ec9eedb50432dcb",
+            "base_revision": vb.EXPECTED_REVISION,
+            "revision": vb.EXPECTED_REVISION,
             "branch": "main",
             "tree_clean": True,
         },
@@ -342,7 +342,7 @@ class TestRecord:
             vb, "check_environment",
             lambda root, primary, er, edb, override: (
                 _env(tmp_path),
-                ["revision mismatch: HEAD=xyz expected=6226675"],
+                ["revision mismatch: HEAD=xyz expected=a1829c1"],
             ),
         )
         manifest_path = tmp_path / "golden.json"

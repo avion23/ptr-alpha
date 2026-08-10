@@ -1,0 +1,66 @@
+{
+  "artifacts": {
+    "report_inventory.jsonl": {
+      "bytes": 42942,
+      "file": "report_inventory.jsonl",
+      "sha256": "96a2c46d6d7bb6803826393d5cef8905246a6d5dd2da81b025159ccf1af60b30"
+    },
+    "transactions.jsonl": {
+      "bytes": 602628,
+      "file": "transactions.jsonl",
+      "sha256": "f5af2b1f2609c084c5c16b47d28bf8234d8d3622270dc6c908baec73115ab8db"
+    }
+  },
+  "canaries": {
+    "failures": [
+      "KATIE BRITT: no report listed in sweep window",
+      "RICK SCOTT: no parsed report with accepted_row_count 12; counts=[6]"
+    ],
+    "passed": false,
+    "results": {
+      "KATIE BRITT": {
+        "accepted_row_counts": [],
+        "canary_matches": [],
+        "member_key": "KATIE BRITT",
+        "outcomes": [],
+        "parsed_reports": 0,
+        "reports_found": 0
+      },
+      "RICK SCOTT": {
+        "accepted_row_counts": [
+          6
+        ],
+        "canary_matches": [],
+        "member_key": "RICK SCOTT",
+        "outcomes": [
+          "parsed"
+        ],
+        "parsed_reports": 1,
+        "reports_found": 1
+      }
+    }
+  },
+  "created_at": "2026-08-10T04:47:34.532610+00:00",
+  "generation": "gen-live-20260809/window-2021-2025/chunk-2025",
+  "outcome_counts": {
+    "failed": 0,
+    "paper_only": 0,
+    "parsed": 66,
+    "unavailable": 0
+  },
+  "quarantine": null,
+  "reports_found": 66,
+  "source": "senate_efd",
+  "status": "complete",
+  "summary": {
+    "failed": 0,
+    "found": 66,
+    "paper_only": 0,
+    "parsed": 66,
+    "unavailable": 0
+  },
+  "window": {
+    "end_date": "2025-06-30",
+    "start_date": "2025-01-01"
+  }
+}

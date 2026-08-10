@@ -14,6 +14,8 @@ once on the full Series instead of per-signal groupby shifts.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
@@ -24,6 +26,8 @@ from analyzer.ticker_resolver import TickerResolver
 from analyzer.signals import constants as _constants
 from analyzer.signals.assembly import assemble_result_dataframe
 from analyzer.signals.prices import _price_arrays
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_ticker_signals(
@@ -273,14 +277,54 @@ def _validate_inputs(entry_prices_df: pd.DataFrame, prices_df: pd.DataFrame) -> 
 
 
 def _resolve_tickers(signals: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataFrame:
+    """Resolve each row's raw ticker to its contemporaneous price symbol.
+
+    Rename aliases (FB -> META, SQ -> XYZ, BLL -> BALL) map to different price
+    series depending on the transaction date, so resolution is per-row using
+    the transaction_date carried by entry prices. A rename alias without a
+    transaction date fails explicit unverified and is dropped rather than
+    silently priced under the raw symbol.
+    """
     resolver = TickerResolver()
+    rename_aliases = resolver.RENAME_MAP
     price_tickers = set(prices_df.columns)
-    raw_tickers = signals["ticker"].unique()
-    for raw in raw_tickers:
-        if raw not in price_tickers and raw != "SPY":
-            resolved = resolver.resolve(raw)
-            if resolved.price_symbol in price_tickers:
-                signals.loc[signals["ticker"] == raw, "ticker"] = resolved.price_symbol
+    has_tx_date = "transaction_date" in signals.columns
+    tx_dates = signals["transaction_date"] if has_tx_date else None
+
+    keep_indices: list[int] = []
+    resolved: list[object] = []
+    for i in range(len(signals)):
+        raw = signals["ticker"].iloc[i]
+        if raw is None or pd.isna(raw):
+            keep_indices.append(i)
+            resolved.append(raw)
+            continue
+        normalized = str(raw).strip().upper()
+        is_alias = normalized in rename_aliases
+        if not is_alias and raw in price_tickers:
+            # Prices stored under the raw ticker (class shares, pass-throughs)
+            # are authoritative; the resolved symbol would miss the column.
+            keep_indices.append(i)
+            resolved.append(raw)
+            continue
+        tx_date = None
+        if tx_dates is not None:
+            candidate = tx_dates.iloc[i]
+            if candidate is not None and not pd.isna(candidate):
+                tx_date = candidate
+        resolution = resolver.resolve(raw, tx_date)
+        if is_alias and resolution.status == "unverified":
+            logger.warning(
+                "Dropping %s transaction without entry-price resolution: "
+                "rename alias requires a transaction date (unverified without it)",
+                raw,
+            )
+            continue
+        keep_indices.append(i)
+        resolved.append(resolution.price_symbol)
+
+    signals = signals.iloc[keep_indices].copy()
+    signals["ticker"] = resolved
     if signals.empty:
         raise AnalysisError("No valid price matches found for transactions")
     return signals

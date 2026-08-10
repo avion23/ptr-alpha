@@ -143,7 +143,7 @@ class PriceRepository:
               AND date BETWEEN ? AND ?
               AND close > 0
               AND isfinite(close)
-            ORDER BY date
+            ORDER BY date, ticker
         """,
             [tickers, start_date, end_date],
         ).fetchdf()
@@ -276,40 +276,85 @@ class PriceRepository:
 
         if resolver is None:
             resolver = TickerResolver()
-        resolutions = resolver.resolve_batch(tickers)
+
+        # Rename aliases (FB -> META, SQ -> XYZ, BLL -> BALL) map to different
+        # price symbols depending on when the trade happened, so resolution is
+        # per (ticker, transaction_date) pair, never per raw ticker alone.
+        pairs = self.conn.execute(
+            """
+            SELECT DISTINCT ticker, transaction_date
+            FROM canonical_transactions
+            WHERE ticker IN (SELECT UNNEST(?))
+              AND disclosure_date BETWEEN ? AND ?
+            """,
+            [tickers, start_date, end_date],
+        ).fetchdf()
+
+        if pairs.empty:
+            return pd.DataFrame()
+
+        alias_tickers = sorted(resolver.RENAME_MAP)
+        map_raw: list[str] = []
+        map_tx_date: list[object] = []
+        map_resolved: list[str] = []
         expanded_tickers: list[str] = []
         seen: set[str] = set()
-        ticker_map_entries: list[tuple[str, str]] = []
-        map_seen: set[str] = set()
-        for raw in tickers:
-            if raw not in seen:
-                seen.add(raw)
-                expanded_tickers.append(raw)
-            resolved = resolutions[raw].price_symbol
-            if raw not in map_seen:
-                map_seen.add(raw)
-                ticker_map_entries.append((raw, resolved))
-            if resolved not in seen:
-                seen.add(resolved)
-                expanded_tickers.append(resolved)
+        unresolved_alias_rows = 0
+        for _, pair in pairs.iterrows():
+            raw = pair["ticker"]
+            tx_date = pair["transaction_date"]
+            if tx_date is None or pd.isna(tx_date):
+                tx_date = None
+            normalized = str(raw).strip().upper()
+            if normalized in alias_tickers and tx_date is None:
+                # No-date alias calls fail explicit unverified: never price a
+                # rename alias under the raw symbol without a transaction date.
+                unresolved_alias_rows += 1
+                continue
+            resolved = resolver.resolve(raw, tx_date).price_symbol
+            map_raw.append(raw)
+            map_tx_date.append(tx_date)
+            map_resolved.append(resolved)
+            for t in (raw, resolved):
+                if t not in seen:
+                    seen.add(t)
+                    expanded_tickers.append(t)
 
-        raw_tickers = [raw for raw, _ in ticker_map_entries]
-        resolved_tickers = [resolved for _, resolved in ticker_map_entries]
+        if unresolved_alias_rows:
+            logger.warning(
+                "Excluded %d transactions for rename aliases without "
+                "transaction_date: alias resolution is unverified without it",
+                unresolved_alias_rows,
+            )
+
+        if not map_raw:
+            # Every matching transaction was an excluded no-date alias; the
+            # empty UNNEST arrays would also break DuckDB type inference.
+            return pd.DataFrame()
 
         result = self.conn.execute(
             """
-            WITH ticker_map(raw, resolved) AS (
-                SELECT UNNEST(?), UNNEST(?)
+            WITH ticker_map(raw, tx_date, resolved) AS (
+                SELECT UNNEST(?), UNNEST(?), UNNEST(?)
             ),
             resolved_tickers AS (
                 SELECT t.*, COALESCE(tm.resolved, t.ticker) AS resolved_ticker
                 FROM canonical_transactions t
-                LEFT JOIN ticker_map tm ON t.ticker = tm.raw
+                LEFT JOIN ticker_map tm
+                  ON t.ticker = tm.raw
+                 AND t.transaction_date IS NOT DISTINCT FROM tm.tx_date
             )
-            SELECT r.member, r.ticker, r.disclosure_date, r.transaction_type,
-                   r.owner_code, r.amount_midpoint, r.instrument_type, r.strike_price, r.expiry_date,
-                   COALESCE(p_res.close, p_raw.close) AS entry_price,
-                   COALESCE(p_res.date, p_raw.date) AS entry_price_date
+            SELECT r.member, r.ticker, r.transaction_date, r.disclosure_date,
+                   r.transaction_type, r.owner_code, r.amount_midpoint,
+                   r.instrument_type, r.strike_price, r.expiry_date,
+                   CASE WHEN UPPER(r.ticker) IN (SELECT UNNEST(?))
+                        THEN p_res.close
+                        ELSE COALESCE(p_res.close, p_raw.close)
+                   END AS entry_price,
+                   CASE WHEN UPPER(r.ticker) IN (SELECT UNNEST(?))
+                        THEN p_res.date
+                        ELSE COALESCE(p_res.date, p_raw.date)
+                   END AS entry_price_date
             FROM resolved_tickers r
             ASOF LEFT JOIN prices p_res
               ON r.resolved_ticker = p_res.ticker
@@ -323,10 +368,28 @@ class PriceRepository:
               AND isfinite(p_raw.close)
             WHERE r.ticker IN (SELECT UNNEST(?))
               AND r.disclosure_date BETWEEN ? AND ?
+              AND NOT (UPPER(r.ticker) IN (SELECT UNNEST(?))
+                       AND r.transaction_date IS NULL)
               AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)
-              AND COALESCE(p_res.close, p_raw.close) IS NOT NULL
+              AND CASE WHEN UPPER(r.ticker) IN (SELECT UNNEST(?))
+                       THEN p_res.close
+                       ELSE COALESCE(p_res.close, p_raw.close)
+                  END IS NOT NULL
+            ORDER BY r.ticker, r.transaction_date, r.disclosure_date,
+                     r.member, r.transaction_type, r.owner_code, r.id
         """,
-            [raw_tickers, resolved_tickers, expanded_tickers, start_date, end_date],
+            [
+                map_raw,
+                map_tx_date,
+                map_resolved,
+                alias_tickers,
+                alias_tickers,
+                expanded_tickers,
+                start_date,
+                end_date,
+                alias_tickers,
+                alias_tickers,
+            ],
         ).fetchdf()
 
         if not result.empty:

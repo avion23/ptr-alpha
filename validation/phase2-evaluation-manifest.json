@@ -1,0 +1,119 @@
+{
+  "config": {
+    "alpha": 0.05,
+    "grid": {
+      "bayes_prior_strength": [
+        20
+      ],
+      "decay_lambda": [
+        0.005
+      ],
+      "frequency_days": [
+        30
+      ],
+      "horizon": [
+        60,
+        90,
+        120
+      ],
+      "min_buyers": [
+        2,
+        3,
+        5
+      ],
+      "scoring_mode": [
+        "consensus"
+      ],
+      "top_n": [
+        3,
+        5
+      ],
+      "training_lookback_days": [
+        365
+      ]
+    },
+    "n_permutations": 999,
+    "permutation_seed": 0,
+    "phases": {
+      "locked_final": {
+        "consumed": false,
+        "start": "2026-01-01",
+        "status": "locked_not_queried_or_evaluated"
+      },
+      "test": {
+        "boundary": [
+          "2024-01-01",
+          "2025-06-30"
+        ],
+        "evidence_class": "retrospective_previously_used_not_fresh_oos",
+        "status": "retrospective_diagnostics_only"
+      },
+      "train": {
+        "boundary": [
+          "2022-01-01",
+          "2023-12-31"
+        ],
+        "outcomes_end_by": "2023-12-31"
+      }
+    },
+    "portfolio": {
+      "benchmark": "real SPY prices from the staged database",
+      "capital_constrained": true,
+      "entry_slippage_pct": 0.001,
+      "exit_slippage_pct": 0.001,
+      "hold_period_days": 120,
+      "initial_capital": 20000.0,
+      "max_execution_wait_days": 7,
+      "max_position_pct": 0.25,
+      "max_positions": 5,
+      "max_price_staleness_days": 5,
+      "max_sector_pct": 1.0,
+      "min_signal_score": 0.0,
+      "rebalance_freq_days": 30,
+      "sector_policy": "deterministic_static_equity_mapping_no_live_calls; sector concentration is not a frozen gate",
+      "valuation_gap_policy": "risk metrics abstain (None) on any valuation gap; no fictional zero mark"
+    },
+    "primary_metric": "mean_per_date_net_alpha",
+    "scoring_modes": [
+      "consensus"
+    ]
+  },
+  "data_hashes_recorded_at_evaluation": true,
+  "dependencies": {
+    "duckdb": "1.4.4",
+    "numpy": "2.4.6",
+    "pandas": "3.0.1",
+    "python": "3.14.6",
+    "scipy": "1.17.1"
+  },
+  "evaluation": {
+    "exactly_once": {
+      "ledger_path": "<staged-db-dir>/.ptr-alpha-evaluation-ledger-v2.json",
+      "mechanism": "canonical append-only ledger refuses any overlapping reservation (repeats and alternate configs/grids/windows)"
+    },
+    "runner": "python3 scripts/frozen_validation.py evaluate --db <staged congress.duckdb> --out <report.json>",
+    "staged_db": {
+      "producer": "luna-rebuild (.worktrees/luna-rebuild)",
+      "status": "awaiting_staging_confirmation_and_root_authorization"
+    }
+  },
+  "evidence_class": "retrospective_previously_used_not_fresh_oos",
+  "freeze_policy": "Regenerate only with scripts/frozen_validation.py freeze; a new freeze is a new manifest commit. The staged database evaluation is reserved exactly once in the ledger next to the database.",
+  "hashes": {
+    "code_sha256": "c0fb671bc255f8e72511ea30d300afff4a7316569b1d4a04dd69fefd919c522c",
+    "config_sha256": "1cfd73887d12a4acfeb6e92290914f46a06bff282ca9bfe521a5e79765596f04",
+    "database_sha256": null,
+    "dependency_sha256": "350f32a8097262d9852e9b1954cbe2d9a5f8a8fd06b8aa00a0a81f014806f967",
+    "git_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "git_dirty": false,
+    "git_revision": "70b9ec327f27fe1df10cfd8480f7f70e39844df9",
+    "harness_sha256": "0d8874e08a68cc92202c9358e5c218a9515c38f619db54078e4226d73a16618e",
+    "value_snapshot_sha256": null
+  },
+  "purpose": "Frozen capital-constrained validation manifest for the rebuilt staged congress.duckdb; evaluated exactly once via the canonical append-only ledger.",
+  "schema_version": 1,
+  "verdict_policy": {
+    "claim_rule": "No profitability or fresh-OOS claim is emitted unless every frozen gate passes; retrospective evidence alone never establishes profitability.",
+    "top_level_verdict": "not_established"
+  }
+}

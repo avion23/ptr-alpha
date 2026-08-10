@@ -1,0 +1,32 @@
+{
+  "artifact_sha256": "05b2fa3becd71c9bb141690130708079407e52a6e169cdacf42a467e09e0bda5",
+  "canary": {
+    "actual": {
+      "asset_fragment": "fat [ \\spdr [example mega st etf com. ste conmonsiock oil x dorel jf asa ae iii a ee inl tt! eee lie",
+      "row_count": 1,
+      "transaction_date": "03/31/26"
+    },
+    "detail": "",
+    "doc_id": "9115808",
+    "expected": {
+      "asset_fragment": "spdr",
+      "row_count": 1,
+      "transaction_date": "03/31/26"
+    },
+    "passed": true
+  },
+  "covered_pages": [
+    1
+  ],
+  "doc_id": "9115808",
+  "engine": "local_tesseract",
+  "extracted_at": "2026-08-10T00:44:46-03:00",
+  "page_count": 1,
+  "parser_version": "1.0.0",
+  "reasons": [],
+  "row_count": 1,
+  "rows_file": "rows/9115808.jsonl",
+  "rows_file_sha256": "6057ffa0716038d0b5701c4f676984deee31196589f0bce79ab6dd0159d894b6",
+  "status": "resolved",
+  "uncovered_pages": []
+}

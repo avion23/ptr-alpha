@@ -269,6 +269,17 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
             artifact_hashes=artifact_hashes,
             ingestion_generation=ingestion_generation,
         )
+        terminal = db.conn.execute(
+            """
+            SELECT doc_id FROM pdf_parse_runs
+            WHERE year = ? AND parser_version = ?
+              AND ingestion_generation = ?
+              AND artifact_sha256 IS NOT NULL
+              AND status IN ('success', 'no_txs', 'zero_rows', 'error')
+            """,
+            [year, _PARSE_VERSION, ingestion_generation],
+        ).fetchall()
+        cached |= {str(row[0]) for row in terminal}
         if cached:
             keep_mask = (
                 existing_docs["DocID"].astype(str).map(lambda d: d not in cached).to_numpy()
@@ -746,16 +757,28 @@ def verify(args) -> None:
         ).fetchall()
         _check(checks, "source_row_id_distinct_per_doc", not dup_row_ids, f"dups={dup_row_ids[:10]}")
 
-        # 5. source_reports equation per source
-        eq = db.source_reports.reconcile(manifest["generation"], "senate_efd", "senate")
-        expected = eq["found"] == (
-            eq["parsed"] + eq["paper_only"] + eq["unavailable"] + eq["failed"]
-        ) and eq["failed"] == 0 and eq["unavailable"] == 0
+        # 5. source_reports equation per source (senate uses its own generation)
+        senate_gens = [
+            str(row[0])
+            for row in db.conn.execute(
+                "SELECT DISTINCT ingestion_generation FROM source_reports WHERE source='senate_efd'"
+            ).fetchall()
+        ]
+        senate_eq_ok = True
+        senate_eq_detail = "no senate source_reports"
+        for senate_gen in senate_gens:
+            eq = db.source_reports.reconcile(senate_gen, "senate_efd", "senate")
+            ok = eq["found"] == (
+                eq["parsed"] + eq["paper_only"] + eq["unavailable"] + eq["failed"]
+            ) and eq["failed"] == 0 and eq["unavailable"] == 0
+            senate_eq_ok = senate_eq_ok and ok
+            senate_eq_detail = f"gen={senate_gen} reconcile={eq}"
+        eq = db.source_reports.reconcile(senate_gens[0] if senate_gens else manifest["generation"], "senate_efd", "senate")
         _check(
             checks,
             "report_equation_senate_efd",
-            expected,
-            f"reconcile={eq}",
+            senate_eq_ok,
+            senate_eq_detail,
         )
         for year in HOUSE_YEARS:
             house = manifest.get("house", {}).get(str(year))
@@ -930,6 +953,127 @@ def verify(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# Sibling track consumption
+# --------------------------------------------------------------------------
+
+SIBLING_TRACKS = ("senate", "ocr", "prices", "capitol", "metadata-audit", "invariants")
+
+
+def _sibling_dir(track: str, generation: str) -> Path:
+    return _REPO_ROOT / "data" / ".staging" / track / generation
+
+
+def _verify_artifact_files(manifest: dict, base: Path) -> dict:
+    """Verify every artifact path in a sibling manifest against its sha256."""
+    results = {"files_checked": 0, "mismatches": []}
+    if not isinstance(manifest, dict):
+        return results
+    artifacts = manifest.get("artifacts") or manifest.get("files") or {}
+    if not isinstance(artifacts, dict):
+        return results
+    for name, meta in artifacts.items():
+        if isinstance(meta, str):
+            expected_sha = meta
+            path = base / name
+        elif isinstance(meta, dict):
+            expected_sha = meta.get("sha256")
+            path = base / (meta.get("path") or name)
+        else:
+            continue
+        if not expected_sha or not isinstance(expected_sha, str):
+            continue
+        if not path.exists():
+            results["mismatches"].append(f"{name}: missing")
+            continue
+        actual = _sha256_file(path)
+        results["files_checked"] += 1
+        if actual != expected_sha:
+            results["mismatches"].append(f"{name}: sha {actual[:16]} != {expected_sha[:16]}")
+    return results
+
+
+def consume(args) -> None:
+    staging = Path(args.staging)
+    manifest = _load_manifest(staging)
+    generation = manifest["generation"]
+    db = Database(staging / "congress.duckdb", read_only=False)
+    try:
+        tracks = {}
+        for track in SIBLING_TRACKS:
+            sdir = _sibling_dir(track, generation)
+            if not sdir.exists():
+                tracks[track] = {"status": "absent"}
+                print(f"consume {track}: ABSENT ({sdir})")
+                continue
+            mpath = sdir / "manifest.json"
+            if not mpath.exists():
+                tracks[track] = {"status": "unverified", "reason": "no manifest.json"}
+                print(f"consume {track}: UNVERIFIED (no manifest.json in {sdir})")
+                continue
+            track_manifest = json.loads(mpath.read_text())
+            verification = _verify_artifact_files(track_manifest, sdir)
+            tracks[track] = {
+                "status": "present",
+                "path": str(sdir),
+                "manifest": track_manifest,
+                "verification": verification,
+            }
+            if verification["mismatches"]:
+                tracks[track]["status"] = "mismatch"
+                print(
+                    f"consume {track}: MISMATCH "
+                    f"({len(verification['mismatches'])} file(s))"
+                )
+            else:
+                print(
+                    f"consume {track}: PRESENT verified "
+                    f"({verification['files_checked']} files)"
+                )
+        manifest["consume"] = tracks
+        _save_manifest(staging, manifest)
+    finally:
+        db.close()
+
+
+def house_activate(args) -> None:
+    """Re-check completeness after OCR consumption; activate complete years."""
+    import pandas as pd  # noqa: PLC0415
+
+    staging = Path(args.staging)
+    manifest = _load_manifest(staging)
+    db = Database(staging / "congress.duckdb", read_only=False)
+    try:
+        for year in HOUSE_YEARS:
+            house = manifest.get("house", {}).get(str(year))
+            if house is None:
+                continue
+            gen = house["generation_id"]
+            if house.get("parse_status") == "complete" and not args.force:
+                continue
+            unresolved = db.get_unresolved_house_doc_ids(year, gen)
+            house["unresolved_doc_ids"] = unresolved
+            house["resolved_doc_count"] = house["ptr_count"] - len(unresolved)
+            if unresolved:
+                house["parse_status"] = "incomplete"
+                print(
+                    f"house-activate {year}: INCOMPLETE — {len(unresolved)} unresolved"
+                )
+            else:
+                rows = _house_inventory_rows(db, year, gen, staging)
+                reports_df = pd.DataFrame(rows)
+                db.source_reports.replace_generation(
+                    gen, "house_pdf", "house", reports_df
+                )
+                db.mark_house_generation_parse_complete(year, gen)
+                house["parse_status"] = "complete"
+                house["source_report_rows"] = len(rows)
+                print(f"house-activate {year}: COMPLETE — {len(rows)} inventory rows")
+            _save_manifest(staging, manifest)
+    finally:
+        db.close()
+
+
+# --------------------------------------------------------------------------
 # Manifest + verdict
 # --------------------------------------------------------------------------
 
@@ -1099,6 +1243,8 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("senate")
     sub.add_parser("prices")
+    sub.add_parser("consume")
+    sub.add_parser("house-activate")
     sub.add_parser("verify")
     sub.add_parser("finalize")
 
@@ -1115,6 +1261,8 @@ def main(argv: list[str] | None = None) -> None:
         "house-parse": house_parse,
         "senate": senate,
         "prices": prices,
+        "consume": consume,
+        "house-activate": house_activate,
         "verify": verify,
         "finalize": finalize,
     }

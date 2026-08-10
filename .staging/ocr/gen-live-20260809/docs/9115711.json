@@ -1,0 +1,28 @@
+{
+  "artifact_sha256": "42d8eda1c952b16aa21f1293a8f7f34592441c0757eac9a1650bbc8c95d7e564",
+  "canary": {
+    "actual": null,
+    "detail": "",
+    "doc_id": "9115711",
+    "expected": null,
+    "passed": null
+  },
+  "covered_pages": [
+    1
+  ],
+  "doc_id": "9115711",
+  "engine": "local_tesseract",
+  "extracted_at": "2026-08-10T00:44:46-03:00",
+  "page_count": 1,
+  "parser_version": "1.0.0",
+  "reasons": [
+    "page 1: reports no transactions",
+    "no transaction rows recovered",
+    "filing reports no transactions (nothing-to-report pages: 1)"
+  ],
+  "row_count": 0,
+  "rows_file": "rows/9115711.jsonl",
+  "rows_file_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "status": "no_transactions",
+  "uncovered_pages": []
+}

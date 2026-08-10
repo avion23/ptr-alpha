@@ -1,0 +1,278 @@
+{
+  "canary": {
+    "8221322": {
+      "actual": "unresolved",
+      "detail": "",
+      "doc_id": "8221322",
+      "expected": "unresolved",
+      "passed": true
+    },
+    "9115808": {
+      "actual": {
+        "asset_fragment": "fat [ \\spdr [example mega st etf com. ste conmonsiock oil x dorel jf asa ae iii a ee inl tt! eee lie",
+        "row_count": 1,
+        "transaction_date": "03/31/26"
+      },
+      "detail": "",
+      "doc_id": "9115808",
+      "expected": {
+        "asset_fragment": "spdr",
+        "row_count": 1,
+        "transaction_date": "03/31/26"
+      },
+      "passed": true
+    },
+    "9115813": {
+      "actual": {
+        "asset_fragment": "richmond va sra",
+        "row_count": 9,
+        "transaction_date": "04/08/26"
+      },
+      "detail": "",
+      "doc_id": "9115813",
+      "expected": {
+        "asset_fragment": "richmond",
+        "row_count": 9,
+        "transaction_date": "04/15/26"
+      },
+      "passed": true
+    },
+    "9116141": {
+      "actual": {
+        "asset_fragment": "whittier calif un high sch dist go",
+        "row_count": 134,
+        "transaction_date": "05/11/26"
+      },
+      "detail": "",
+      "doc_id": "9116141",
+      "expected": {
+        "asset_fragment": "whittier",
+        "row_count": 134,
+        "transaction_date": "05/11/26"
+      },
+      "passed": true
+    }
+  },
+  "created_at": "2026-08-10T00:44:46-03:00",
+  "data_dir": "/Users/avion/Documents.nosync/projects/insider-trading/data",
+  "doc_count": 33,
+  "engine": "local_tesseract",
+  "generation": "gen-live-20260809",
+  "render_dpi": 300,
+  "resolved": {
+    "8221321": {
+      "pages_covered": 2,
+      "row_count": 9
+    },
+    "8221326": {
+      "pages_covered": 3,
+      "row_count": 51
+    },
+    "8221358": {
+      "pages_covered": 41,
+      "row_count": 621
+    },
+    "8221359": {
+      "pages_covered": 5,
+      "row_count": 123
+    },
+    "8221360": {
+      "pages_covered": 5,
+      "row_count": 20
+    },
+    "9115704": {
+      "pages_covered": 2,
+      "row_count": 7
+    },
+    "9115726": {
+      "pages_covered": 43,
+      "row_count": 580
+    },
+    "9115728": {
+      "pages_covered": 5,
+      "row_count": 99
+    },
+    "9115808": {
+      "pages_covered": 1,
+      "row_count": 1
+    },
+    "9115809": {
+      "pages_covered": 2,
+      "row_count": 3
+    },
+    "9115811": {
+      "pages_covered": 1,
+      "row_count": 1
+    },
+    "9115812": {
+      "pages_covered": 2,
+      "row_count": 10
+    },
+    "9115813": {
+      "pages_covered": 2,
+      "row_count": 9
+    },
+    "9115814": {
+      "pages_covered": 2,
+      "row_count": 8
+    },
+    "9115815": {
+      "pages_covered": 2,
+      "row_count": 10
+    },
+    "9115816": {
+      "pages_covered": 1,
+      "row_count": 3
+    },
+    "9115820": {
+      "pages_covered": 4,
+      "row_count": 86
+    },
+    "9115821": {
+      "pages_covered": 2,
+      "row_count": 11
+    },
+    "9115822": {
+      "pages_covered": 30,
+      "row_count": 382
+    },
+    "9116141": {
+      "pages_covered": 6,
+      "row_count": 134
+    },
+    "9116142": {
+      "pages_covered": 41,
+      "row_count": 613
+    },
+    "9116206": {
+      "pages_covered": 32,
+      "row_count": 451
+    },
+    "9116211": {
+      "pages_covered": 6,
+      "row_count": 141
+    },
+    "9116212": {
+      "pages_covered": 1,
+      "row_count": 2
+    },
+    "9116218": {
+      "pages_covered": 1,
+      "row_count": 1
+    }
+  },
+  "resolved_count": 25,
+  "script": "scripts/scan_ocr.py",
+  "script_version": "1.0.0",
+  "staged_files_sha256": {
+    "docs/8221321.json": "0c5da640a04be6b8e12b63c0716dd726a29f65d608a08314facc226177895471",
+    "docs/8221322.json": "79786989e35d7daca361ea3f36c7e1f2f917d4e102e812422658f5acc7d8dd93",
+    "docs/8221326.json": "4cabb417a0b7e4892d76cf0b78557f0b8085db10c1b5a84eeb53016ea9090e45",
+    "docs/8221332.json": "3c6355a5e655ccfd12fdc10742a6e4005245c28fa430ada9b87be0aa939716e7",
+    "docs/8221358.json": "4ada9c2b7d18f5993a58c4886cb226168b643a1a90663b7a99ec5a48c7f38e00",
+    "docs/8221359.json": "a8289e18615bd4f596606a238a8a115389f2989b49c4187b59745dd9a8d61e5c",
+    "docs/8221360.json": "845368fbec461a1662c8e631c7d51416825c2af1fc1e100cb84f0eca6ef69aa4",
+    "docs/9115704.json": "37f64e0574d7797f8066eaceec769886493ab649b911a017263bff65ec7aa562",
+    "docs/9115711.json": "519ce2a57e1b004d67c0274104b08d6efa6798a7140d5993462bb3d00ef159bf",
+    "docs/9115726.json": "246515f1ba7dc583eaa48604855ab74100c18b3cf5f4d2f186978b22c1dbc52e",
+    "docs/9115728.json": "747294712e4f0403c0ec9d7b01b47694271b61867653b3a1cbf04684f871aac1",
+    "docs/9115762.json": "09cea7c5ce6d92e6cd167bb5f548d3366ac7b9730ea55f25486d6b7505ef5978",
+    "docs/9115808.json": "7fa548aba44e61c3f03c5ca1d65cc82ff77b975dbd3ca01245b09e023c061bb3",
+    "docs/9115809.json": "1e72ffc347a7d946e9326fb9c1959bdf4408167514c49fd17d312e97617a8ff4",
+    "docs/9115811.json": "a7c5ebc30bb4c18718c4a9900d5dafadb419f601993432f8692b91710ed37b66",
+    "docs/9115812.json": "275b94ed9c6860f7b10bef34b2cfd4788a9bb5a1904b400de50467aa3e733d1c",
+    "docs/9115813.json": "f99506c5abb49170ad9e2b15e9f6ed11938a8ad3cf40d747624eca6fd0f86398",
+    "docs/9115814.json": "5690f3aa1dbf41cf8aeb626b745fee26103437b3a3e7062eaee562bec292a7bb",
+    "docs/9115815.json": "b9e8370c8f47fa0210a376af931a608bbe42a8b24aad364d0f5c58d53f4cacff",
+    "docs/9115816.json": "a8cbe00d648da8a85dbdc29343d8f1e23c0dc176a292a68f735259c03e370c2e",
+    "docs/9115820.json": "4ac0eadd7dda5466804a42fe0584b22cf627b04ec092b1b3b6328d5b7ff86a52",
+    "docs/9115821.json": "ad10847b9fe3f40fcd2ddf0515441e1c5ec47ae2277c287131eea0209a632bb5",
+    "docs/9115822.json": "b3a447c775c50dfad755734ee96aaeb76f6bd9455b22820d04944712440d038f",
+    "docs/9115901.json": "ad631a01da70b293bc940ae2172aee73a8f082fa3ed84a5bc76af4212745a8c5",
+    "docs/9116141.json": "b582479cf9654e3b2c9c7c0b52b26dbffbeee9bf7d71a1257c525342b956571c",
+    "docs/9116142.json": "c129ae3e1e9b4a19a039a28939e903817b4ca0ce0835ff9eaba870c3258e7615",
+    "docs/9116146.json": "7af0cf9bea251814bbe923e4ba830ca053145edab1bc324c4c927bde0dc203c0",
+    "docs/9116197.json": "e7b0fa891c485528dc65bc9417f800c945a16bf619d4ebe5e84dd5bd5e5b9e8c",
+    "docs/9116206.json": "1fc8ee90c022fd16513efc85e2503b00a30a34dde7511c7ce8eb2c39acacbc23",
+    "docs/9116211.json": "6fafb2b0f429c38a950a07e32db5c0457f6cbe4bdd70842dcf76cf4ebc48e31f",
+    "docs/9116212.json": "7e4844b2ad9dabb257ec51ba11e46ab16ec854f43123e061ed63a8228b81ca1a",
+    "docs/9116217.json": "6eeefc3bb038534ff8f67b91ade37ed03e2e90e11b7b76832181f695ad52d7bb",
+    "docs/9116218.json": "6a94845368c596af4db7e96d5e315f7f4d771e71123c79a7556529e6a5498c03",
+    "rows/8221321.jsonl": "7b3fd45de2f5164c35bec3c8e0174ffd6200a024cfc4d7ae151f01cefded2243",
+    "rows/8221322.jsonl": "820a17d8d8896f7448cf61e9cceba058d04d14fd4649afe249be315ca4e7a1ac",
+    "rows/8221326.jsonl": "d78ab0fa2359ef637f0661b059582465c81191449908f39b89701af929bcbbbc",
+    "rows/8221332.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rows/8221358.jsonl": "94111b75851b6a42720dcfa71004c01431a57eefc1926057e09aa624ec13b78a",
+    "rows/8221359.jsonl": "619c6bb6b23ee5fc2a65642891796e941200ee11d24676c0c2049e43279a93d2",
+    "rows/8221360.jsonl": "95a49fd80cd59880d09d426173104f1e4e39e57b786727276ab58e4e470c7e9f",
+    "rows/9115704.jsonl": "3fbd38315bddbbb5350987b62b83bd46301a4a9ec53732d1d738a57959d092aa",
+    "rows/9115711.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rows/9115726.jsonl": "db76947ffe7530e1168a1a7a76059c0ead64e872414a21488a839da7a261a204",
+    "rows/9115728.jsonl": "27da9c4e77c2998fd43fa4949d8d27817a42373324a109397d802990dd2a8354",
+    "rows/9115762.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rows/9115808.jsonl": "6057ffa0716038d0b5701c4f676984deee31196589f0bce79ab6dd0159d894b6",
+    "rows/9115809.jsonl": "05267646e9f12d7c4370592e03a818f8e6d09827ff3e369d3e5767259789b614",
+    "rows/9115811.jsonl": "b426702668ef0e7dff9b31a8fce1658a444f438ea96b981154210baa2e00dab6",
+    "rows/9115812.jsonl": "f94ae3a09956642926b98f15de3bde1ff1b234e7e5bb0f4a7b880171c8b5960e",
+    "rows/9115813.jsonl": "1dccaee70b473ac04624522f3318ff2199eb2218038f8c20ca49552531a21d3a",
+    "rows/9115814.jsonl": "947d4782e832f29e67a45f7a8bae4c5e0641ef302c686d43b08fc1cd4179c99f",
+    "rows/9115815.jsonl": "524529d464130a6cfbfeb24573a6ef34066e4284592ce5eb6992c5915c8c20a5",
+    "rows/9115816.jsonl": "74e4cd1f9f1b4bcfd151b2272519ddcee0041e179bdb60d686cfaf5e151d3557",
+    "rows/9115820.jsonl": "d27bb407fc499ac23d3a0d28ee4ca8afe70b6291513a9dc14b5756be8aa318f8",
+    "rows/9115821.jsonl": "35f2e7137e942bca4990442a94c3c827b1d66beec886de0794179a59ec317a54",
+    "rows/9115822.jsonl": "7a365c9e12d68b3058a5300e59977aa9bf0c39b0d63c3ac1c636472b80934a80",
+    "rows/9115901.jsonl": "0fa5a755ae659db6ff7582e812a2bd646745f041eb7208938eac00f4400e75b9",
+    "rows/9116141.jsonl": "bf09be5a56935788e6ffdd503c19ebcc07ee75da2a8e03054fce5bc5bef1f64d",
+    "rows/9116142.jsonl": "0ca7bd06b941b595679416244a4391d53ddfcb9d39b332f49f0d93f91373927c",
+    "rows/9116146.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rows/9116197.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rows/9116206.jsonl": "2770f286c5e639e0af8bbd81cdd969f4910875342f812b72cb3a8d672b42f1dd",
+    "rows/9116211.jsonl": "4c5f9cfbeccfe961ca939e4cfbdb709c88078e82418916249262d81d56f70775",
+    "rows/9116212.jsonl": "edbdb02d4235e51ef9e811c81a3980ceb31ebc11dfa567a95bb0d7e9193b9506",
+    "rows/9116217.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rows/9116218.jsonl": "4003c1c88f5bf71068efb56558201206e449c3678f068756b68140605dfe8935"
+  },
+  "tesseract_version": "tesseract 5.5.3",
+  "total_rows": 4344,
+  "unresolved": {
+    "8221322": [
+      "page 1: no transaction rows",
+      "pages without transaction rows: 1"
+    ],
+    "8221332": [
+      "page 1: reports no transactions",
+      "no transaction rows recovered",
+      "filing reports no transactions (nothing-to-report pages: 1)"
+    ],
+    "9115711": [
+      "page 1: reports no transactions",
+      "no transaction rows recovered",
+      "filing reports no transactions (nothing-to-report pages: 1)"
+    ],
+    "9115762": [
+      "page 1: reports no transactions",
+      "no transaction rows recovered",
+      "filing reports no transactions (nothing-to-report pages: 1)"
+    ],
+    "9115901": [
+      "page 2: no transaction rows",
+      "pages without transaction rows: 2"
+    ],
+    "9116146": [
+      "page 1: reports no transactions",
+      "no transaction rows recovered",
+      "filing reports no transactions (nothing-to-report pages: 1)"
+    ],
+    "9116197": [
+      "page 1: no transaction rows",
+      "page 2: no transaction rows",
+      "no transaction rows recovered"
+    ],
+    "9116217": [
+      "page 1: cover page (no transaction rows)",
+      "no transaction rows recovered"
+    ]
+  },
+  "unresolved_count": 8,
+  "year": 2026
+}

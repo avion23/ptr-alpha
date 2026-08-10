@@ -1,0 +1,37 @@
+{
+  "artifact_sha256": "716cdcc10bd57c400f10d8bb4133eb667931a9699fb1835ed3b7deca010a36a1",
+  "canary": {
+    "actual": {
+      "asset_fragment": "whittier calif un high sch dist go",
+      "row_count": 134,
+      "transaction_date": "05/11/26"
+    },
+    "detail": "",
+    "doc_id": "9116141",
+    "expected": {
+      "asset_fragment": "whittier",
+      "row_count": 134,
+      "transaction_date": "05/11/26"
+    },
+    "passed": true
+  },
+  "covered_pages": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "doc_id": "9116141",
+  "engine": "local_tesseract",
+  "extracted_at": "2026-08-10T00:44:46-03:00",
+  "page_count": 6,
+  "parser_version": "1.0.0",
+  "reasons": [],
+  "row_count": 134,
+  "rows_file": "rows/9116141.jsonl",
+  "rows_file_sha256": "bf09be5a56935788e6ffdd503c19ebcc07ee75da2a8e03054fce5bc5bef1f64d",
+  "status": "resolved",
+  "uncovered_pages": []
+}

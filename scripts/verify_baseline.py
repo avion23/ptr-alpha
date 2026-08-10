@@ -7,8 +7,10 @@ real database hash). `--verify` gates the current tree against that
 manifest; any drift fails the gate with exit code 1.
 
 Environment invariants enforced in both modes:
-  * HEAD sits on the frozen revision 6226675f36a5b7db060efa2d8ec9eedb50432dcb
-    (or differs from it only by the baseline tooling files themselves).
+  * HEAD sits on the frozen revision a1829c1c397dd4fa25caff2e20a254d657b7cd4c
+    (the phase-2 integration merge of the 12 accepted luna-* branches,
+     superseding the 6226675f36a5b7db060efa2d8ec9eedb50432dcb pin by design;
+     or differs from it only by the baseline tooling files themselves).
   * The working tree is clean before and after the suite run (main stays
     clean at the frozen revision).
   * data/congress.duckdb SHA-256 is unchanged
@@ -37,7 +39,7 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 
-EXPECTED_REVISION = "6226675f36a5b7db060efa2d8ec9eedb50432dcb"
+EXPECTED_REVISION = "a1829c1c397dd4fa25caff2e20a254d657b7cd4c"
 EXPECTED_DB_SHA256 = "9ec6be9263dc30aab07585d0110d2daf8568a14e4244f39d07c5b2bc130d476d"
 
 MANIFEST_REL_PATH = Path("tests/baseline/golden_manifest.json")

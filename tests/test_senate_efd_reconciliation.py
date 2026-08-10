@@ -1,5 +1,8 @@
 from datetime import date
 import hashlib
+import json
+import os
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -1202,3 +1205,82 @@ def test_get_transactions_filters_cache_to_senate_source():
 
     assert calls == [(2026, "senate_efd")]
     assert result.iloc[0]["source"] == "senate_efd"
+
+
+def test_katie_and_rick_real_artifact_hashed_canaries():
+    """Pin the live eFD landing artifacts for Katie Britt and Rick Scott.
+
+    Runs only when PTR_OCR_CANARY_DATA points at a corpus containing a staged
+    Senate generation under ``.staging/senate/<generation>/`` (the layout the
+    staged rebuild produces for sibling tracks). Absent corpus or generation
+    skips cleanly; a staged generation must match the pinned artifact hashes,
+    report accounting, and transaction row identities exactly.
+    """
+    data_dir_value = os.environ.get("PTR_OCR_CANARY_DATA")
+    if not data_dir_value:
+        pytest.skip("set PTR_OCR_CANARY_DATA to run local corpus canaries")
+    data_dir = Path(data_dir_value)
+    inventories = sorted(data_dir.glob(".staging/senate/*/report_inventory.jsonl"))
+    if not inventories:
+        pytest.skip("staged senate corpus is absent")
+    generation = inventories[-1].parent
+    inventory = [
+        json.loads(line) for line in (generation / "report_inventory.jsonl").open()
+    ]
+    transactions = [
+        json.loads(line) for line in (generation / "transactions.jsonl").open()
+    ]
+
+    katie_report_id = "37900303-65bf-467d-962b-76555d510b28"
+    rick_report_id = "d20def77-73a7-44e0-8be0-b9b05492deed"
+    pinned = {
+        katie_report_id: {
+            "hash": "e12d1400f5a8556d905ad5d1edc0b215770b856d605d01c254355171def6297b",
+            "member": "Katie Britt",
+            "official_filing_date": "2026-01-29T00:00:00",
+            "raw_row_count": 1,
+            "accepted_row_count": 1,
+        },
+        rick_report_id: {
+            "hash": "114d871e6f7400596ee58f10286a9a9e468363da987fd0076bd7e1979a678f3b",
+            "member": "Rick Scott",
+            "official_filing_date": "2026-08-03T00:00:00",
+            "raw_row_count": 12,
+            "accepted_row_count": 12,
+        },
+    }
+    by_report_id = {row["source_record_id"]: row for row in inventory}
+    for report_id, expected in pinned.items():
+        assert report_id in by_report_id, report_id
+        row = by_report_id[report_id]
+        assert row["outcome"] == "parsed"
+        assert row["artifact_sha256"] == expected["hash"]
+        assert row["landing_sha256"] == expected["hash"]
+        assert row["member"] == expected["member"]
+        assert row["official_filing_date"] == expected["official_filing_date"]
+        assert row["raw_row_count"] == expected["raw_row_count"]
+        assert row["accepted_row_count"] == expected["accepted_row_count"]
+        assert row["rejected_row_count"] == 0
+
+    katie_transactions = [
+        tx for tx in transactions if tx["source_record_id"] == katie_report_id
+    ]
+    assert [tx["source_row_id"] for tx in katie_transactions] == ["official:1"]
+    katie_tx = katie_transactions[0]
+    assert katie_tx["ticker"] == "JPM"
+    assert katie_tx["transaction_date"] == "2026-01-28T00:00:00"
+    assert katie_tx["transaction_type"] == "Sale"
+    assert katie_tx["artifact_sha256"] == pinned[katie_report_id]["hash"]
+
+    rick_transactions = [
+        tx for tx in transactions if tx["source_record_id"] == rick_report_id
+    ]
+    assert sorted(
+        int(tx["source_row_id"].split(":")[1]) for tx in rick_transactions
+    ) == list(range(1, 13))
+    assert len(rick_transactions) == 12
+    assert all(tx["ticker"] is None for tx in rick_transactions)
+    assert all(
+        tx["artifact_sha256"] == pinned[rick_report_id]["hash"]
+        for tx in rick_transactions
+    )

@@ -694,7 +694,6 @@ class TestParsing(unittest.TestCase):
                 ("PANW", "stock", None, None),
                 ("TEM", "option", None, None),
                 ("VST", "option", None, None),
-
             ],
         )
         self.assertEqual(
@@ -707,7 +706,6 @@ class TestParsing(unittest.TestCase):
                 ("NOK", "stock"),
                 ("NOK", "stock"),
             ],
-
         )
         self.assertIn("BRK.B", {row["ticker"] for row in berkshire_rows})
         self.assertNotIn("ALLI", {row["ticker"] for row in arlp_rows})
@@ -1012,9 +1010,20 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 "b486c612866c86738cc2810f34aaa1613c20e537daac4d5a467ee02da889f96d",
                 15,
             ),
+            "20034894": (
+                "608b5187192c389d67a0bc033458d4fac3215194821982049102a5bab2a2df9b",
+                3,
+            ),
+            "20033756": (
+                "201da6a72d810e03cfd2137475cc632998291d6430e52c92ee8be3f9ff1b18d8",
+                9,
+            ),
         }
+        parsed_rows = {}
         for doc_id, (expected_hash, expected_count) in expected.items():
             matches = list(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            if not matches:
+                self.skipTest(f"corpus fixture {doc_id}.pdf is absent")
             self.assertEqual(len(matches), 1, doc_id)
             pdf = matches[0]
             self.assertEqual(
@@ -1024,6 +1033,30 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 _, rows, engines = _parse_pdf_worker(pdf)
             self.assertEqual(len(rows), expected_count, (doc_id, engines))
             self.assertIn("won:pdftotext", engines)
+            parsed_rows[doc_id] = rows
+
+        row_id_truth = {
+            "20034894": [
+                "pdftotext:l17",
+                "pdftotext:l23",
+                "pdftotext:l29",
+            ],
+            "20033756": [
+                "pdftotext:l17",
+                "pdftotext:l23",
+                "pdftotext:l29",
+                "pdftotext:l35",
+                "pdftotext:l41",
+                "pdftotext:l48",
+                "pdftotext:l56",
+                "pdftotext:l62",
+                "pdftotext:l68",
+            ],
+        }
+        for doc_id, expected_ids in row_id_truth.items():
+            self.assertEqual(
+                [row["source_row_id"] for row in parsed_rows[doc_id]], expected_ids
+            )
 
         scan_hashes = {
             "8221322": "26f1ce2fb7823d2e84ea4fbde24514c5c6371b43a828720d50f21b1c8c7ad314",
@@ -1033,6 +1066,8 @@ class TestLocalOcrCanaries(unittest.TestCase):
         }
         for doc_id, expected_hash in scan_hashes.items():
             matches = list(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            if not matches:
+                self.skipTest(f"corpus fixture {doc_id}.pdf is absent")
             self.assertEqual(len(matches), 1, doc_id)
             self.assertEqual(
                 hashlib.sha256(matches[0].read_bytes()).hexdigest(), expected_hash
@@ -1050,7 +1085,10 @@ class TestLocalOcrCanaries(unittest.TestCase):
             asset_fragment,
             expected_date,
         ) in scan_truth.items():
-            pdf = next(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            matches = list(data_dir.glob(f"*/pdfs/{doc_id}.pdf"))
+            if not matches:
+                self.skipTest(f"corpus fixture {doc_id}.pdf is absent")
+            pdf = matches[0]
             try:
                 tables = extract_tables_with_ocr(pdf)
             except OcrBackendError:
@@ -1068,6 +1106,8 @@ class TestLocalOcrCanaries(unittest.TestCase):
         from scripts.ocr_zero_rows import get_ocr_work_items
 
         database_path = data_dir / "congress.duckdb"
+        if not database_path.exists():
+            self.skipTest("corpus database congress.duckdb is absent")
         unresolved = get_ocr_work_items(
             db_path=str(database_path),
             data_dir=data_dir,

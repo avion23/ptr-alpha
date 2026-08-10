@@ -2,9 +2,25 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_trade_date(trade_date):
+    """Coerce a date-like transaction date to ``datetime.date``.
+
+    pandas Timestamps arrive from repository reads; NaT and other invalid
+    values mean no date is known and must not silently compare as a date.
+    """
+    if trade_date is None:
+        return None
+    if isinstance(trade_date, date) and not isinstance(trade_date, datetime):
+        return trade_date
+    try:
+        return trade_date.date()
+    except (AttributeError, ValueError, TypeError):
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +118,7 @@ class TickerResolver:
                 notes="Empty ticker",
             )
 
+        trade_date = _normalize_trade_date(trade_date)
         normalized = raw_ticker.strip().upper()
         if (
             normalized in self.QUARANTINED_TICKERS

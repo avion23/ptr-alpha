@@ -1087,6 +1087,164 @@ class TestGetEntryPrices(DatabaseTestCase):
         self.assertIsNotNone(result.iloc[0]["entry_price"])
 
 
+
+    def test_rename_alias_entry_price_resolves_per_transaction_date(self):
+        # FB renamed to META on 2022-06-09: the same raw ticker must price on
+        # the FB series before and the META series after that date.
+        dates = pd.to_datetime(["2022-05-10", "2022-06-10"])
+        self.db.upsert_prices(
+            pd.DataFrame(
+                {"FB": [100.0, 101.0], "META": [200.0, 201.0]},
+                index=dates,
+            )
+        )
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-fb-pre",
+                    "member": "Alice",
+                    "ticker": "FB",
+                    "transaction_date": date(2022, 5, 1),
+                    "disclosure_date": date(2022, 5, 10),
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "doc_id": "doc-fb-post",
+                    "member": "Bob",
+                    "ticker": "FB",
+                    "transaction_date": date(2022, 6, 9),
+                    "disclosure_date": date(2022, 6, 10),
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
+        self.db.upsert_transactions(tx, source="house_pdf")
+
+        result = self.db.get_entry_prices(
+            ["FB"], date(2022, 5, 1), date(2022, 6, 10)
+        )
+        self.assertEqual(len(result), 2)
+        self.assertIn("transaction_date", result.columns)
+        by_member = result.set_index("member")
+        self.assertAlmostEqual(by_member.loc["Alice", "entry_price"], 100.0)
+        self.assertAlmostEqual(by_member.loc["Bob", "entry_price"], 201.0)
+        self.assertEqual(set(result["ticker"]), {"FB"})
+
+    def test_rename_alias_without_transaction_date_fails_unverified(self):
+        # No-date alias calls fail explicit unverified: never price under the
+        # raw symbol when the transaction date is unknown.
+        dates = pd.to_datetime(["2022-06-10"])
+        self.db.upsert_prices(
+            pd.DataFrame({"FB": [100.0], "META": [200.0]}, index=dates)
+        )
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-fb-nodate",
+                    "member": "Alice",
+                    "ticker": "FB",
+                    "transaction_date": None,
+                    "disclosure_date": date(2022, 6, 10),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
+        self.db.upsert_transactions(tx, source="house_pdf")
+
+        result = self.db.get_entry_prices(
+            ["FB"], date(2022, 6, 1), date(2022, 6, 10)
+        )
+        self.assertTrue(result.empty)
+
+    def test_post_rename_transaction_never_falls_back_to_raw_symbol(self):
+        # META prices are absent, only stale FB prices exist. A post-rename FB
+        # transaction must fail rather than silently price on the FB series.
+        dates = pd.to_datetime(["2022-06-10"])
+        self.db.upsert_prices(pd.DataFrame({"FB": [100.0]}, index=dates))
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-fb-post",
+                    "member": "Bob",
+                    "ticker": "FB",
+                    "transaction_date": date(2022, 6, 9),
+                    "disclosure_date": date(2022, 6, 10),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
+        self.db.upsert_transactions(tx, source="house_pdf")
+
+        result = self.db.get_entry_prices(
+            ["FB"], date(2022, 6, 1), date(2022, 6, 10)
+        )
+        self.assertTrue(result.empty)
+
+    def test_brkb_class_share_entry_price_canary(self):
+        # BRKB resolves to the BRK-B class share; entry price must come from
+        # the BRK-B series.
+        dates = pd.to_datetime(["2024-01-03"])
+        self.db.upsert_prices(pd.DataFrame({"BRK-B": [350.0]}, index=dates))
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-brkb",
+                    "member": "Alice",
+                    "ticker": "BRKB",
+                    "transaction_date": date(2024, 1, 2),
+                    "disclosure_date": date(2024, 1, 3),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
+        self.db.upsert_transactions(tx, source="house_pdf")
+
+        result = self.db.get_entry_prices(
+            ["BRKB"], date(2024, 1, 1), date(2024, 1, 5)
+        )
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result.iloc[0]["entry_price"], 350.0)
+
+    def test_sq_rename_alias_entry_price_resolves_per_transaction_date(self):
+        # SQ renamed to XYZ on 2025-01-21.
+        dates = pd.to_datetime(["2025-01-20", "2025-01-22"])
+        self.db.upsert_prices(
+            pd.DataFrame(
+                {"SQ": [50.0, 51.0], "XYZ": [70.0, 71.0]},
+                index=dates,
+            )
+        )
+        tx = pd.DataFrame(
+            [
+                {
+                    "doc_id": "doc-sq-pre",
+                    "member": "Alice",
+                    "ticker": "SQ",
+                    "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 20),
+                    "transaction_type": "Purchase",
+                },
+                {
+                    "doc_id": "doc-sq-post",
+                    "member": "Bob",
+                    "ticker": "SQ",
+                    "transaction_date": date(2025, 1, 21),
+                    "disclosure_date": date(2025, 1, 22),
+                    "transaction_type": "Purchase",
+                },
+            ]
+        )
+        self.db.upsert_transactions(tx, source="house_pdf")
+
+        result = self.db.get_entry_prices(
+            ["SQ"], date(2025, 1, 10), date(2025, 1, 22)
+        )
+        self.assertEqual(len(result), 2)
+        by_member = result.set_index("member")
+        self.assertAlmostEqual(by_member.loc["Alice", "entry_price"], 50.0)
+        self.assertAlmostEqual(by_member.loc["Bob", "entry_price"], 71.0)
+
+
 class TestDeleteTransactionsForDoc(DatabaseTestCase):
     def test_delete_removes_only_that_docs_rows(self):
         df = pd.DataFrame(

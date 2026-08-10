@@ -1,0 +1,86 @@
+{
+  "artifacts": {
+    "report_inventory.jsonl": {
+      "bytes": 65154,
+      "file": "report_inventory.jsonl",
+      "sha256": "343a54ddf57b2049328a7d62e44a500c2ef9b3c00c35464395581787b79a9e35"
+    },
+    "transactions.jsonl": {
+      "bytes": 1474168,
+      "file": "transactions.jsonl",
+      "sha256": "883087d6181c1839865b845d97b877a858a0142c04e21bc9a56814e7a97925be"
+    }
+  },
+  "canaries": {
+    "failures": [
+      "RICK SCOTT: no parsed report with accepted_row_count 12; counts=[1, 2, 3, 4, 7, 16]"
+    ],
+    "passed": false,
+    "results": {
+      "KATIE BRITT": {
+        "accepted_row_counts": [
+          1,
+          1
+        ],
+        "canary_matches": [
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2023-09-18T00:00:00",
+            "source_record_id": "026ff795-7e4d-446b-aff2-8d01be09e318"
+          },
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2023-12-15T00:00:00",
+            "source_record_id": "56e94501-503d-480f-96f0-354febac789e"
+          }
+        ],
+        "member_key": "KATIE BRITT",
+        "outcomes": [
+          "parsed"
+        ],
+        "parsed_reports": 2,
+        "reports_found": 2
+      },
+      "RICK SCOTT": {
+        "accepted_row_counts": [
+          1,
+          2,
+          3,
+          4,
+          7,
+          16
+        ],
+        "canary_matches": [],
+        "member_key": "RICK SCOTT",
+        "outcomes": [
+          "parsed"
+        ],
+        "parsed_reports": 6,
+        "reports_found": 6
+      }
+    }
+  },
+  "created_at": "2026-08-10T04:45:57.736972+00:00",
+  "generation": "gen-live-20260809/window-2021-2025/chunk-2023",
+  "outcome_counts": {
+    "failed": 0,
+    "paper_only": 0,
+    "parsed": 100,
+    "unavailable": 0
+  },
+  "quarantine": null,
+  "reports_found": 100,
+  "source": "senate_efd",
+  "status": "complete",
+  "summary": {
+    "failed": 0,
+    "found": 100,
+    "paper_only": 0,
+    "parsed": 100,
+    "unavailable": 0
+  },
+  "window": {
+    "end_date": "2023-12-31",
+    "start_date": "2023-01-01"
+  }
+}

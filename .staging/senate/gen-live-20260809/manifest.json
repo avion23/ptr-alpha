@@ -1,0 +1,87 @@
+{
+  "artifacts": {
+    "report_inventory.jsonl": {
+      "bytes": 102738,
+      "file": "report_inventory.jsonl",
+      "sha256": "b1ca26c0eacce5e8ef2f4f04aa79b2e28317c192a8bb6dac82ec6d07ea853030"
+    },
+    "transactions.jsonl": {
+      "bytes": 2331157,
+      "file": "transactions.jsonl",
+      "sha256": "7f8a82e2f126bf2e4a1b7e1438f19c898889886816a2e3ee7bace45a83e6e710"
+    }
+  },
+  "canaries": {
+    "failures": [],
+    "passed": true,
+    "results": {
+      "KATIE BRITT": {
+        "accepted_row_counts": [
+          1,
+          22
+        ],
+        "canary_matches": [
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2026-01-29T00:00:00",
+            "source_record_id": "37900303-65bf-467d-962b-76555d510b28"
+          }
+        ],
+        "member_key": "KATIE BRITT",
+        "outcomes": [
+          "parsed"
+        ],
+        "parsed_reports": 2,
+        "reports_found": 2
+      },
+      "RICK SCOTT": {
+        "accepted_row_counts": [
+          1,
+          1,
+          3,
+          5,
+          9,
+          12,
+          13,
+          17
+        ],
+        "canary_matches": [
+          {
+            "accepted_row_count": 12,
+            "official_filing_date": "2026-08-03T00:00:00",
+            "source_record_id": "d20def77-73a7-44e0-8be0-b9b05492deed"
+          }
+        ],
+        "member_key": "RICK SCOTT",
+        "outcomes": [
+          "parsed"
+        ],
+        "parsed_reports": 8,
+        "reports_found": 8
+      }
+    }
+  },
+  "created_at": "2026-08-10T01:59:36.592876+00:00",
+  "generation": "gen-live-20260809",
+  "outcome_counts": {
+    "failed": 0,
+    "paper_only": 0,
+    "parsed": 165,
+    "unavailable": 0
+  },
+  "quarantine": null,
+  "reports_found": 165,
+  "source": "senate_efd",
+  "status": "complete",
+  "summary": {
+    "failed": 0,
+    "found": 165,
+    "paper_only": 0,
+    "parsed": 165,
+    "unavailable": 0
+  },
+  "window": {
+    "end_date": "2026-08-09",
+    "start_date": "2025-08-09"
+  }
+}

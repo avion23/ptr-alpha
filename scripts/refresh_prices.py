@@ -18,7 +18,12 @@ Enforcements:
   more than ``--max-staleness-days`` is reported as stale, so downstream
   consumers treat it as unavailable for recent windows;
 * read-only against temp DBs: the source DB is opened read-only and the
-  refresh refuses to run against an existing output DB (use ``--force``).
+  refresh refuses to run against an existing output DB (use ``--force``);
+* unavailable recovery: when the price source's fail-closed gate rejects a
+  batch (e.g. a cluster of delisted assets without yfinance history), the
+  already-persisted tickers are kept and only the missing ones are retried
+  individually; assets that still yield no price data in the window are
+  recorded as ``unavailable`` in the report instead of aborting the refresh.
 
 The script writes a JSON report (``--report``) and nothing else; snapshot the
 temp DB with ``scripts/snapshot_prices.py`` to produce a value-hashed manifest.
@@ -40,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import pandas as pd
 
 from analyzer.database import Database
+from analyzer.exceptions import DataSourceError
 from analyzer.price_repository import (
     nyse_sessions,
     previous_nyse_session,
@@ -74,6 +80,7 @@ class RefreshReport:
     excluded_assets: dict[str, list[str]]
     resolved_tickers: int
     unresolved_tickers: list[str]
+    unavailable_tickers: list[str]
     price_rows: int
     rejected_observations: int
     first_date: str
@@ -93,6 +100,7 @@ class RefreshReport:
             "excluded_assets": self.excluded_assets,
             "resolved_tickers": self.resolved_tickers,
             "unresolved_tickers": self.unresolved_tickers,
+            "unavailable_tickers": self.unavailable_tickers,
             "price_rows": self.price_rows,
             "rejected_observations": self.rejected_observations,
             "first_date": self.first_date,
@@ -198,6 +206,17 @@ def _source_tickers(source_db: Path) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def _persisted_tickers(db: Database, start: date, end: date) -> set[str]:
+    rows = db.conn.execute(
+        """
+        SELECT DISTINCT ticker FROM prices
+        WHERE date BETWEEN ? AND ? AND close > 0 AND isfinite(close)
+        """,
+        [start, end],
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def refresh_prices(
     source_db: Path,
     temp_db: Path,
@@ -254,9 +273,25 @@ def refresh_prices(
     try:
         price_source = YFinancePriceSource(settings, read_only=False, db=db)
         try:
-            matrix = price_source.get_prices(eligible, start, end)
+            try:
+                price_source.get_prices(eligible, start, end)
+            except DataSourceError:
+                # The batch fetch persisted every ticker it could. Only the
+                # genuinely unresolvable assets remain missing; retry each one
+                # individually so transient failures are recovered instead of
+                # aborting the refresh over a cluster of delisted assets.
+                for ticker in sorted(set(eligible) - _persisted_tickers(db, start, end)):
+                    try:
+                        price_source.get_prices([ticker], start, end)
+                    except DataSourceError:
+                        pass
         finally:
             price_source.close()
+        # Assets with no price history in the window (including those whose
+        # empty download was masked by the cached benchmark column) are
+        # recorded explicitly as unavailable.
+        unavailable = sorted(set(eligible) - _persisted_tickers(db, start, end))
+        matrix = db.get_prices(eligible, start, end)
         rejected = _verify_persisted_prices(db, start, end)
         stale = _compute_staleness(db, end, max_staleness_days)
     finally:
@@ -280,6 +315,7 @@ def refresh_prices(
         excluded_assets=excluded,
         resolved_tickers=len(resolved),
         unresolved_tickers=unresolved,
+        unavailable_tickers=unavailable,
         price_rows=int(matrix.notna().sum().sum()),
         rejected_observations=rejected,
         first_date=first_date,
@@ -327,6 +363,12 @@ def main(argv: list[str] | None = None) -> int:
             "  unresolved: "
             + ", ".join(report.unresolved_tickers[:20])
             + ("..." if len(report.unresolved_tickers) > 20 else "")
+        )
+    if report.unavailable_tickers:
+        print(
+            "  unavailable (no price history in window): "
+            + ", ".join(report.unavailable_tickers[:20])
+            + ("..." if len(report.unavailable_tickers) > 20 else "")
         )
     if report.stale_tickers:
         print(

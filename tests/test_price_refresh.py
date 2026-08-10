@@ -232,6 +232,58 @@ class RefreshPipelineTests(unittest.TestCase):
         self.assertNotIn("AAPL", report.stale_tickers)
 
 
+    def test_refresh_recovers_batch_gate_failure_and_records_unavailable(self):
+        # Monolithic batch covers only AAPL+SPY -> 2/4 success trips the 75%
+        # gate; per-ticker recovery then prices MSFT and records ZZZ as
+        # unavailable (no price history in window).
+        self._seed_transactions(["AAPL", "MSFT", "ZZZ"])
+        dates = _nyse_dates("2024-01-02", "2024-01-05")
+
+        def call_dependent(self_, fetch_resolved, start, end):
+            if fetch_resolved == ["MSFT"]:
+                return pd.DataFrame(
+                    {("Close", "MSFT"): [200.0, 201.0, 202.0, 203.0]},
+                    index=dates,
+                )
+            if fetch_resolved == ["ZZZ"]:
+                return pd.DataFrame()  # genuinely no data
+            return pd.DataFrame(
+                {
+                    ("Close", "AAPL"): [100.0, 101.0, 102.0, 103.0],
+                    ("Close", "SPY"): [400.0, 401.0, 402.0, 403.0],
+                },
+                index=dates,
+            )
+
+        original = YFinancePriceSource._download_yfinance
+        YFinancePriceSource._download_yfinance = call_dependent
+        self.db.close()
+        try:
+            report = refresh_prices.refresh_prices(
+                self.source_db,
+                self.temp_db,
+                start=date(2024, 1, 2),
+                end=date(2024, 1, 5),
+            )
+        finally:
+            YFinancePriceSource._download_yfinance = original
+        self.assertEqual(report.resolved_tickers, 3)  # AAPL, MSFT, SPY
+        self.assertIn("AAPL", report.eligible_assets)
+        self.assertIn("MSFT", report.eligible_assets)
+        self.assertIn("ZZZ", report.unavailable_tickers)
+        self.assertIn("ZZZ", report.unresolved_tickers)
+        check = Database(self.temp_db, read_only=True)
+        try:
+            count = check.conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+            tickers = {
+                row[0]
+                for row in check.conn.execute("SELECT DISTINCT ticker FROM prices").fetchall()
+            }
+        finally:
+            check.close()
+        self.assertEqual(count, 12)  # AAPL(4) + MSFT(4) + SPY(4)
+        self.assertEqual(tickers, {"AAPL", "MSFT", "SPY"})
+
 class SnapshotManifestTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

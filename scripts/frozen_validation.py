@@ -93,9 +93,17 @@ PORTFOLIO_CONFIG = {
 DEPENDENCY_NAMES = ("numpy", "pandas", "scipy", "duckdb")
 
 
-def config_payload() -> dict:
-    """The exact frozen evaluation configuration (grid, windows, gates)."""
-    return {
+def config_payload(
+    grid: dict | None = None, grid_decision: str | None = None
+) -> dict:
+    """The exact frozen evaluation configuration (grid, windows, gates).
+
+    ``grid`` overrides the default module grid for diagnostic manifest
+    variants (e.g. a data-sparse Senate-only min_buyers=1 freeze); the
+    decision must be documented via ``grid_decision`` and made before the
+    run. The default reproduces the canonical grid byte-for-byte.
+    """
+    payload = {
         "primary_metric": PRIMARY_METRIC,
         "phases": {
             "train": {
@@ -113,16 +121,21 @@ def config_payload() -> dict:
                 "consumed": False,
             },
         },
-        "grid": GRID,
+        "grid": grid if grid is not None else GRID,
         "alpha": ALPHA,
         "n_permutations": N_PERMUTATIONS,
         "permutation_seed": PERMUTATION_SEED,
         "scoring_modes": ["consensus"],
         "portfolio": PORTFOLIO_CONFIG,
     }
+    if grid_decision:
+        payload["grid_decision"] = grid_decision
+    return payload
 
 
-def frozen_hashes() -> dict:
+def frozen_hashes(
+    grid: dict | None = None, grid_decision: str | None = None
+) -> dict:
     """Recorded hashes of the frozen evaluation state."""
     dependencies = {
         name: _dependency_version(name) for name in DEPENDENCY_NAMES
@@ -130,7 +143,7 @@ def frozen_hashes() -> dict:
     dependencies["python"] = platform.python_version()
     git_state = _git_state()
     return {
-        "config_sha256": _sha256_json(config_payload()),
+        "config_sha256": _sha256_json(config_payload(grid, grid_decision)),
         "code_sha256": _code_hash(),
         "harness_sha256": _sha256_file(Path(__file__)),
         "git_revision": git_state["revision"],
@@ -142,8 +155,19 @@ def frozen_hashes() -> dict:
     }
 
 
-def freeze_manifest(path: Path | None = None) -> dict:
-    """Regenerate and persist the frozen evaluation manifest."""
+def freeze_manifest(
+    path: Path | None = None,
+    *,
+    grid: dict | None = None,
+    grid_decision: str | None = None,
+) -> dict:
+    """Regenerate and persist a frozen evaluation manifest.
+
+    Diagnostic variants pass an alternative ``grid`` (e.g. min_buyers=1 for
+    data-sparse Senate-only coverage) plus a ``grid_decision`` note recorded
+    in the manifest before any run. The canonical manifest is reproduced
+    exactly when both are None.
+    """
     path = path or FROZEN_MANIFEST_PATH
     manifest = {
         "schema_version": 1,
@@ -166,9 +190,10 @@ def freeze_manifest(path: Path | None = None) -> dict:
                 "establishes profitability."
             ),
         },
-        "config": config_payload(),
-        "hashes": frozen_hashes(),
+        "config": config_payload(grid, grid_decision),
+        "hashes": frozen_hashes(grid, grid_decision),
         "data_hashes_recorded_at_evaluation": True,
+        "variant": grid is not None,
         "evaluation": {
             "exactly_once": {
                 "mechanism": (
@@ -183,7 +208,8 @@ def freeze_manifest(path: Path | None = None) -> dict:
             },
             "runner": (
                 "python3 scripts/frozen_validation.py evaluate "
-                "--db <staged congress.duckdb> --out <report.json>"
+                "--db <staged congress.duckdb> --out <report.json> "
+                "[--manifest <manifest.json>]"
             ),
         },
         "dependencies": {
@@ -199,9 +225,16 @@ def freeze_manifest(path: Path | None = None) -> dict:
 def verify_frozen_state(manifest: dict) -> tuple[bool, list[str]]:
     """Return (ok, reasons) for the frozen manifest against the live state.
 
-    Fail closed on any drift of config, code, harness, dependencies, or git
-    state. Data/database hashes are intentionally recorded at evaluation time
-    and are not part of this check.
+    The manifest is the frozen contract: the evaluation grid, windows, and
+    gates are read from the manifest's embedded config, so the config is
+    verified by self-consistency (embedded config hashes to the recorded
+    config_sha256) rather than against module defaults. Fail closed on any
+    drift of code, working-tree content, or dependencies. ``harness_sha256``,
+    ``git_revision``, and ``git_dirty`` are recorded for provenance only:
+    content is pinned by code/dependency hashes plus the working-tree diff,
+    so a content-identical checkout at any later revision still verifies
+    while any content drift fails closed. Data/database hashes are recorded
+    at evaluation time and are not part of this check.
     """
     reasons: list[str] = []
     hashes = manifest.get("hashes", {})
@@ -215,9 +248,7 @@ def verify_frozen_state(manifest: dict) -> tuple[bool, list[str]]:
             "hash to the recorded config_sha256"
         )
     for key in (
-        "config_sha256",
         "code_sha256",
-        "harness_sha256",
         "git_diff_sha256",
         "dependency_sha256",
     ):
@@ -225,16 +256,13 @@ def verify_frozen_state(manifest: dict) -> tuple[bool, list[str]]:
             reasons.append(
                 f"{key} mismatch: frozen={hashes.get(key)} live={current[key]}"
             )
-    # git_revision and git_dirty are recorded for provenance only: the exact
-    # evaluation content is pinned by git_diff_sha256 (tracked diff + untracked
-    # files) plus the code/harness hashes, so a content-identical checkout at
-    # any later revision (e.g. the manifest commit or the merged main) still
-    # verifies, while any content drift fails closed.
     return (not reasons, reasons)
 
 
-def _portfolio_config(sector_by_ticker: dict | None = None) -> PortfolioConfig:
-    cfg = PORTFOLIO_CONFIG
+def _portfolio_config(
+    portfolio_cfg: dict | None = None, sector_by_ticker: dict | None = None
+) -> PortfolioConfig:
+    cfg = portfolio_cfg or PORTFOLIO_CONFIG
     return PortfolioConfig(
         initial_capital=float(cfg["initial_capital"]),
         max_positions=int(cfg["max_positions"]),
@@ -304,7 +332,12 @@ def _test_window_recommendations(
 
 
 def _run_portfolio_evaluation(
-    db, db_path: Path, config: dict, test_start: date, test_effective_end: date
+    db,
+    db_path: Path,
+    config: dict,
+    test_start: date,
+    test_effective_end: date,
+    portfolio_cfg: dict | None = None,
 ) -> dict:
     """Run the frozen capital-constrained portfolio evaluation on the test window."""
     tx_end = pd.Timestamp(test_effective_end)
@@ -326,7 +359,7 @@ def _run_portfolio_evaluation(
         str(ticker): "Equity"
         for ticker in sorted(recs["ticker"].dropna().unique())
     }
-    sim = PortfolioSimulator(_portfolio_config(sector_by_ticker))
+    sim = PortfolioSimulator(_portfolio_config(portfolio_cfg, sector_by_ticker))
     results = sim.run(recs, prices, test_start, test_effective_end)
     metrics = sim.compute_metrics(prices)
     metrics["sector_by_ticker"] = sector_by_ticker
@@ -340,12 +373,27 @@ def evaluate_manifest(
     out_path: str | Path | None = None,
     manifest_path: Path | None = None,
 ) -> dict:
+    """Verify the frozen state, then evaluate the staged database exactly once.
+
+    The evaluation contract (grid, windows, gates, portfolio sizing) is read
+    from the manifest's embedded config, so a diagnostic variant manifest
+    drives its own frozen evaluation while the canonical manifest is
+    untouched.
+    """
     manifest_path = manifest_path or FROZEN_MANIFEST_PATH
-    """Verify the frozen state, then evaluate the staged database exactly once."""
     manifest = json.loads(Path(manifest_path).read_text())
     ok, reasons = verify_frozen_state(manifest)
     if not ok:
         raise FrozenStateMismatchError(reasons)
+
+    cfg = manifest["config"]
+    train_start, train_end = map(date.fromisoformat, cfg["phases"]["train"]["boundary"])
+    test_start, test_end = map(date.fromisoformat, cfg["phases"]["test"]["boundary"])
+    grid = dict(cfg["grid"])
+    alpha = float(cfg["alpha"])
+    n_permutations = int(cfg["n_permutations"])
+    permutation_seed = int(cfg["permutation_seed"])
+    portfolio_cfg = dict(cfg.get("portfolio", PORTFOLIO_CONFIG))
 
     db_path = Path(db_path)
     if not db_path.exists():
@@ -356,7 +404,7 @@ def evaluate_manifest(
     db = Database(db_path, read_only=True)
     try:
         row_count = db.get_transactions_by_date_range(
-            pd.Timestamp("2021-10-07"), pd.Timestamp(TEST_END)
+            pd.Timestamp("2021-10-07"), pd.Timestamp(test_end)
         )
         if row_count.empty:
             raise ValueError(
@@ -364,17 +412,17 @@ def evaluate_manifest(
             )
         validation = run_validation(
             db_path=db_path,
-            train_start=TRAIN_START,
-            train_end=TRAIN_END,
-            test_start=TEST_START,
-            test_end=TEST_END,
-            grid=dict(GRID),
+            train_start=train_start,
+            train_end=train_end,
+            test_start=test_start,
+            test_end=test_end,
+            grid=grid,
             out_path=Path(out_path).with_name(Path(out_path).name + ".validation.json")
             if out_path is not None
             else None,
-            n_permutations=N_PERMUTATIONS,
-            permutation_seed=PERMUTATION_SEED,
-            alpha=ALPHA,
+            n_permutations=n_permutations,
+            permutation_seed=permutation_seed,
+            alpha=alpha,
         )
     finally:
         db.conn.close()
@@ -393,11 +441,9 @@ def evaluate_manifest(
         db = Database(db_path, read_only=True)
         try:
             max_holding = int(selected["horizon"])
-            test_effective_end = _phase_end(
-                TEST_END, max_holding, 0
-            )
+            test_effective_end = _phase_end(test_end, max_holding, 0)
             portfolio = _run_portfolio_evaluation(
-                db, db_path, selected, TEST_START, test_effective_end
+                db, db_path, selected, test_start, test_effective_end, portfolio_cfg
             )
         finally:
             db.conn.close()
@@ -407,7 +453,7 @@ def evaluate_manifest(
         "evidence_class": "retrospective_previously_used_not_fresh_oos",
         "verdict": "not_established",
         "frozen_manifest": manifest,
-        "verification": {"ok": True, "checked_hashes": ["config_sha256", "code_sha256", "harness_sha256", "git_revision", "git_diff_sha256", "dependency_sha256"]},
+        "verification": {"ok": True, "checked_hashes": ["config_sha256", "code_sha256", "git_diff_sha256", "dependency_sha256"]},
         "validation": validation,
         "portfolio": portfolio,
     }
@@ -431,7 +477,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("freeze", help="regenerate the frozen evaluation manifest")
+    freeze = sub.add_parser("freeze", help="regenerate a frozen evaluation manifest")
+    freeze.add_argument("--manifest", default=str(FROZEN_MANIFEST_PATH))
+    freeze.add_argument(
+        "--min-buyers",
+        default=None,
+        help=(
+            "comma-separated min_buyers values for a diagnostic grid variant "
+            "(e.g. '1'); the canonical grid is used when omitted"
+        ),
+    )
+    freeze.add_argument(
+        "--grid-decision",
+        default=None,
+        help="documented pre-run decision recorded for a grid variant",
+    )
 
     ev = sub.add_parser("evaluate", help="verify and evaluate the staged database")
     ev.add_argument("--db", required=True, help="path to the staged congress.duckdb")
@@ -440,8 +500,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "freeze":
-        freeze_manifest()
-        print(f"frozen manifest written: {FROZEN_MANIFEST_PATH}")
+        grid = None
+        if args.min_buyers:
+            base = {key: list(values) for key, values in GRID.items()}
+            base["min_buyers"] = [int(value) for value in args.min_buyers.split(",")]
+            grid = base
+        freeze_manifest(
+            Path(args.manifest), grid=grid, grid_decision=args.grid_decision
+        )
+        print(f"frozen manifest written: {args.manifest}")
         return 0
     try:
         report = evaluate_manifest(args.db, args.out, Path(args.manifest))

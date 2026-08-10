@@ -255,7 +255,7 @@ class TransactionRepository:
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
               {source_clause}
-            ORDER BY disclosure_date DESC
+            ORDER BY disclosure_date DESC, id DESC
             """,  # nosec B608 -- source_clause is a fixed internal fragment
             params,
         ).fetchdf()
@@ -306,7 +306,7 @@ class TransactionRepository:
             WHERE disclosure_date BETWEEN ? AND ?
               AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
               {source_clause}
-            ORDER BY disclosure_date DESC
+            ORDER BY disclosure_date DESC, id DESC
             """,  # nosec B608 -- source_clause is a fixed internal fragment
             params,
         ).fetchdf()

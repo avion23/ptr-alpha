@@ -143,7 +143,7 @@ class PriceRepository:
               AND date BETWEEN ? AND ?
               AND close > 0
               AND isfinite(close)
-            ORDER BY date
+            ORDER BY date, ticker
         """,
             [tickers, start_date, end_date],
         ).fetchdf()
@@ -325,6 +325,8 @@ class PriceRepository:
               AND r.disclosure_date BETWEEN ? AND ?
               AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)
               AND COALESCE(p_res.close, p_raw.close) IS NOT NULL
+            ORDER BY r.ticker, r.transaction_date, r.disclosure_date,
+                     r.member, r.transaction_type, r.owner_code, r.id
         """,
             [raw_tickers, resolved_tickers, expanded_tickers, start_date, end_date],
         ).fetchdf()

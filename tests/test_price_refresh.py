@@ -486,6 +486,104 @@ class SnapshotManifestTests(unittest.TestCase):
         )
         self.assertEqual(rc_bad, 1)
 
+class DeterminismCanaryTests(unittest.TestCase):
+    """value_snapshot_sha256 must be reproducible run-to-run: the entry-price,
+    price, and transaction reads all carry deterministic ORDER BYs so row order
+    (and the hash over it) cannot flip between runs."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db_path = self.tmp / "canary.duckdb"
+        self.db = Database(self.db_path)
+
+    def tearDown(self):
+        try:
+            self.db.conn.execute("SELECT 1")
+            self.db.close()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp)
+
+    def _seed(self):
+        # Same-ticker/same-disclosure-date ties stress the tie-breaker ORDER BY.
+        rows = [
+            ("doc-a", "Jane Doe", "AAPL", date(2024, 1, 3), date(2024, 1, 5),
+             "Purchase", "DC", "$1,001 - $15,000", 8000.5, "stock"),
+            ("doc-b", "Jane Doe", "AAPL", date(2024, 1, 3), date(2024, 1, 5),
+             "Purchase", "DC", "$1,001 - $15,000", 8000.5, "stock"),
+            ("doc-c", "John Doe", "MSFT", date(2024, 1, 2), date(2024, 1, 4),
+             "Sale", "SP", "$50,001 - $100,000", 75000.0, "stock"),
+        ]
+        for doc, member, ticker, td, dd, tt, owner, amt_raw, mid, inst in rows:
+            self.db.conn.execute(
+                "INSERT INTO transactions (doc_id, member, ticker, transaction_date, "
+                "disclosure_date, transaction_type, owner_code, amount_raw, "
+                "amount_midpoint, instrument_type, source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [doc, member, ticker, td, dd, tt, owner, amt_raw, mid, inst, "house_pdf"],
+            )
+        dates = _nyse_dates("2024-01-01", "2024-01-10")
+        prices = pd.DataFrame(
+            {
+                "AAPL": [150.0 + i for i in range(len(dates))],
+                "MSFT": [300.0 + i for i in range(len(dates))],
+                "SPY": [400.0 + i for i in range(len(dates))],
+            },
+            index=dates,
+        )
+        self.db.upsert_prices(prices)
+
+    def _value_snapshot(self):
+        from analyzer.validation import _value_snapshot_hash
+
+        db = Database(self.db_path, read_only=True)
+        try:
+            all_tx = db.get_transactions_by_date_range(date(2024, 1, 1), date(2024, 1, 31))
+            tickers = sorted(set(all_tx["ticker"].dropna().astype(str)) | {"SPY"})
+            prices = db.get_prices(tickers, date(2024, 1, 1), date(2024, 1, 31))
+            entry_prices = db.get_entry_prices(tickers, date(2024, 1, 1), date(2024, 1, 31))
+            return _value_snapshot_hash(all_tx, prices, entry_prices), (
+                all_tx,
+                prices,
+                entry_prices,
+            )
+        finally:
+            db.close()
+
+    def test_value_snapshot_hash_identical_across_runs(self):
+        self._seed()
+        self.db.close()
+        first_hash, first_frames = self._value_snapshot()
+        second_hash, second_frames = self._value_snapshot()
+        self.assertEqual(first_hash, second_hash)
+        self.assertEqual(len(first_hash), 64)
+        for name, first, second in zip(
+            ("all_tx", "prices", "entry_prices"), first_frames, second_frames
+        ):
+            pd.testing.assert_frame_equal(first, second, obj=name)
+        # Same-date ties must come out in id order, not insertion/scan order.
+        entry = first_frames[2]
+        self.assertEqual(list(entry["ticker"]), ["AAPL", "AAPL", "MSFT"])
+
+    def test_price_snapshot_manifest_hash_identical_across_runs(self):
+        self._seed()
+        self.db.close()
+        first = snapshot_prices.build_manifest(
+            self.db_path,
+            start=date(2024, 1, 2),
+            end=date(2024, 1, 5),
+            generation="gen-canary",
+            out_dir=self.tmp / "out1",
+        )
+        second = snapshot_prices.build_manifest(
+            self.db_path,
+            start=date(2024, 1, 2),
+            end=date(2024, 1, 5),
+            generation="gen-canary",
+            out_dir=self.tmp / "out2",
+        )
+        self.assertEqual(first["data_hash"], second["data_hash"])
+        self.assertEqual(first["value_hash"], second["value_hash"])
+
 
 if __name__ == "__main__":
     unittest.main()

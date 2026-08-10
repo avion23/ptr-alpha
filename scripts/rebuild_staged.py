@@ -1022,45 +1022,276 @@ def _verify_artifact_files(manifest: dict, base: Path) -> dict:
     return results
 
 
+def _sibling_search_dirs(track: str, generation: str) -> list[Path]:
+    """Locate a sibling track's artifact dir in any sibling worktree."""
+    candidates = [
+        _REPO_ROOT / "data" / ".staging" / track / generation,
+        _REPO_ROOT / ".staging" / track / generation,
+    ]
+    worktrees_root = _REPO_ROOT.parents[0]
+    if worktrees_root.name == ".worktrees":
+        for worktree in sorted(worktrees_root.iterdir()):
+            if not worktree.is_dir() or worktree.name == "luna-rebuild":
+                continue
+            candidates.append(worktree / ".staging" / track / generation)
+            candidates.append(worktree / "data" / ".staging" / track / generation)
+    return candidates
+
+
+def _coerce_sibling_frame(frame, *, count_columns, date_columns, text_columns):
+    """Normalize string-encoded sibling frames ('None' -> None, counts -> int)."""
+    import pandas as pd  # noqa: PLC0415
+
+    frame = frame.copy()
+    for column in frame.columns:
+        if column in count_columns:
+            numeric = pd.to_numeric(frame[column], errors="coerce")
+            if numeric.isna().any():
+                raise ValueError(
+                    f"sibling frame column {column!r} has non-numeric/missing values"
+                )
+            frame[column] = numeric.astype("int64")
+        elif column in date_columns:
+            frame[column] = pd.to_datetime(frame[column], errors="coerce")
+        elif column in text_columns:
+            frame[column] = frame[column].map(
+                lambda value: None
+                if value is None or pd.isna(value)
+                else str(value).strip() or None
+            )
+    return frame
+
+
+def _ingest_senate(track_dir: Path, track_manifest: dict, db: Database) -> dict:
+    """Persist a verified senate sweep via Database.persist_source_refresh."""
+    import pandas as pd  # noqa: PLC0415
+
+    generation = track_manifest["generation"]
+    tx = pd.read_json(track_dir / "transactions.jsonl", lines=True)
+    inv = pd.read_json(track_dir / "report_inventory.jsonl", lines=True)
+    count_cols = ["raw_row_count", "accepted_row_count", "rejected_row_count"]
+    date_cols = ["official_filing_date", "available_date", "disclosure_date",
+                 "transaction_date", "notification_date", "filing_date"]
+    text_cols = [
+        "amends_source_record_id", "artifact_sha256", "asset_description",
+        "chamber", "chamber_member_key", "doc_id", "expiry_date",
+        "ingestion_generation", "instrument_type", "member", "member_key",
+        "owner_code", "raw_asset_class", "raw_asset_description", "raw_owner",
+        "raw_ticker", "raw_transaction_subtype", "source_record_id",
+        "source_report_path", "source_row_id", "strike_price", "ticker",
+        "ticker_candidate", "ticker_origin", "transaction_type",
+        "landing_sha256", "paper_artifact_sha256", "paper_artifact_url",
+        "error_message", "outcome", "report_path", "source",
+    ]
+    tx = _coerce_sibling_frame(tx, count_columns=[], date_columns=date_cols, text_columns=text_cols)
+    inv = _coerce_sibling_frame(inv, count_columns=count_cols, date_columns=date_cols, text_columns=text_cols)
+    tx["ingestion_generation"] = generation
+    inv["ingestion_generation"] = generation
+    inserted = db.persist_source_refresh(
+        transactions=tx,
+        reports=inv,
+        source="senate_efd",
+        chamber="senate",
+        ingestion_generation=generation,
+    )
+    return {
+        "inserted_transactions": inserted,
+        "reports": len(inv),
+        "transactions_frame_rows": len(tx),
+        "summary": track_manifest.get("summary") or track_manifest.get("outcome_counts"),
+        "canaries": track_manifest.get("canaries"),
+        "window": track_manifest.get("window"),
+    }
+
+
+def _ingest_prices(track_dir: Path, track_manifest: dict, db: Database, staging: Path) -> dict:
+    """Upsert a verified price refresh into the staged DB and snapshot it."""
+    import pandas as pd  # noqa: PLC0415
+
+    from analyzer.price_snapshot import create_snapshot, save_snapshot  # noqa: PLC0415
+
+    duckdb_file = track_dir / "refresh.duckdb"
+    if not duckdb_file.exists():
+        raise FileNotFoundError(f"price refresh duckdb missing: {duckdb_file}")
+    import duckdb as _duckdb  # noqa: PLC0415
+
+    src_conn = _duckdb.connect(str(duckdb_file), read_only=True)
+    try:
+        tables = [
+            r[0]
+            for r in src_conn.execute(
+                "SELECT table_name FROM information_schema.tables ORDER BY 1"
+            ).fetchall()
+        ]
+        if "prices" not in tables:
+            raise ValueError(f"price refresh duckdb has no prices table: {tables}")
+        prices = src_conn.execute(
+            "SELECT ticker, date, close FROM prices WHERE close > 0 AND isfinite(close)"
+        ).fetchdf()
+    finally:
+        src_conn.close()
+    if prices.empty:
+        raise ValueError("price refresh duckdb contains no price rows")
+    db.upsert_prices(prices)
+    tickers = sorted(prices["ticker"].unique())
+    start = pd.Timestamp(prices["date"].min()).date()
+    end = pd.Timestamp(prices["date"].max()).date()
+    snapshot = create_snapshot(db, tickers, start, end)
+    snapshot_path = staging / "price_snapshot.json"
+    save_snapshot(snapshot, snapshot_path)
+    return {
+        "upserted_rows": len(prices),
+        "tickers": len(tickers),
+        "range": f"{start}..{end}",
+        "snapshot_path": str(snapshot_path),
+        "snapshot_id": snapshot.snapshot_id,
+        "value_hash": snapshot.value_hash,
+        "resolved_tickers": snapshot.resolved_tickers,
+        "requested_tickers": snapshot.requested_tickers,
+        "unresolved_tickers": list(snapshot.unresolved_tickers),
+    }
+
+
+def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database, staging: Path) -> dict:
+    """Ingest verified local-OCR rows for unresolved House scans."""
+    import pandas as pd  # noqa: PLC0415
+
+    rows_files = [f for f in sorted(track_dir.iterdir()) if f.suffix == ".jsonl"]
+    unresolved_file = track_dir / "unresolved.json"
+    unresolved: list[str] = []
+    if unresolved_file.exists():
+        payload = json.loads(unresolved_file.read_text())
+        unresolved = list(payload.get("doc_ids", payload if isinstance(payload, list) else []))
+    if not rows_files:
+        return {"rows_files": [], "unresolved_docs": unresolved, "ingested_docs": []}
+    parser_version = str(track_manifest.get("parser_version") or "v4-local-ocr")
+    total_ingested = 0
+    ingested_docs: list[str] = []
+    for rows_file in rows_files:
+        rows = pd.read_json(rows_file, lines=True)
+        if rows.empty:
+            continue
+        # group rows by the year their doc belongs to
+        year_of = {}
+        for doc_id in rows["doc_id"].astype(str).unique():
+            row = db.conn.execute(
+                "SELECT archive_year FROM house_generation_metadata WHERE doc_id=? LIMIT 1",
+                [doc_id],
+            ).fetchone()
+            year_of[doc_id] = int(row[0]) if row else None
+        rows["_year"] = rows["doc_id"].astype(str).map(year_of)
+        for year, frame in rows.groupby("_year"):
+            if year is None:
+                continue
+            gen = db.get_latest_house_generation(int(year))
+            if gen is None:
+                raise RuntimeError(f"ocr ingest: no house generation for year {year}")
+            frame = frame.drop(columns=["_year"])
+            frame["chamber"] = "house"
+            frame["ingestion_generation"] = gen
+            frame["source_record_id"] = frame["doc_id"].astype(str)
+            frame["official_filing_date"] = frame["disclosure_date"]
+            frame["artifact_sha256"] = frame["doc_id"].astype(str).map(
+                lambda d: db.conn.execute(
+                    "SELECT artifact_sha256 FROM house_pdf_artifacts WHERE archive_year=? AND generation_id=? AND doc_id=?",
+                    [int(year), gen, d],
+                ).fetchone()[0]
+            )
+            attempted = frame["doc_id"].astype(str).unique().tolist()
+            counts = frame["doc_id"].astype(str).value_counts().to_dict()
+            parse_runs = [
+                dict(
+                    doc_id=doc_id,
+                    year=int(year),
+                    parser_version=parser_version,
+                    status="success" if counts.get(doc_id, 0) else "no_txs",
+                    engines_attempted="local-ocr",
+                    raw_row_count=counts.get(doc_id, 0),
+                    transaction_count=0,
+                    artifact_sha256=frame.loc[
+                        frame["doc_id"].astype(str) == doc_id, "artifact_sha256"
+                    ].iloc[0],
+                    ingestion_generation=gen,
+                )
+                for doc_id in attempted
+            ]
+            persisted = db.replace_transactions_for_docs(
+                frame,
+                source="house_pdf",
+                attempted_doc_ids=attempted,
+                ingestion_generation=gen,
+                replacement_doc_ids=attempted,
+                parse_runs=parse_runs,
+            )
+            total_ingested += sum(persisted.by_doc_total.values())
+            ingested_docs.extend(attempted)
+    return {
+        "rows_files": [f.name for f in rows_files],
+        "unresolved_docs": unresolved,
+        "ingested_docs": ingested_docs,
+        "ingested_rows": total_ingested,
+        "parser_version": parser_version,
+    }
+
+
 def consume(args) -> None:
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     generation = manifest["generation"]
     db = Database(staging / "congress.duckdb", read_only=False)
     try:
-        tracks = {}
+        tracks = manifest.setdefault("consume", {})
         for track in SIBLING_TRACKS:
-            sdir = _sibling_dir(track, generation)
-            if not sdir.exists():
-                tracks[track] = {"status": "absent"}
-                print(f"consume {track}: ABSENT ({sdir})")
+            entry = tracks.get(track, {})
+            if entry.get("status") in ("ingested", "quarantined") and not args.force:
+                print(f"consume {track}: skipped (already {entry['status']})")
                 continue
-            mpath = sdir / "manifest.json"
+            track_dir = None
+            for candidate in _sibling_search_dirs(track, generation):
+                if candidate.exists():
+                    track_dir = candidate
+                    break
+            if track_dir is None:
+                tracks[track] = {"status": "absent"}
+                print(f"consume {track}: ABSENT")
+                continue
+            mpath = track_dir / "manifest.json"
             if not mpath.exists():
-                tracks[track] = {"status": "unverified", "reason": "no manifest.json"}
-                print(f"consume {track}: UNVERIFIED (no manifest.json in {sdir})")
+                tracks[track] = {"status": "unverified", "path": str(track_dir), "reason": "no manifest.json"}
+                print(f"consume {track}: UNVERIFIED (no manifest.json)")
                 continue
             track_manifest = json.loads(mpath.read_text())
-            verification = _verify_artifact_files(track_manifest, sdir)
-            tracks[track] = {
+            verification = _verify_artifact_files(track_manifest, track_dir)
+            entry = {
                 "status": "present",
-                "path": str(sdir),
-                "manifest": track_manifest,
+                "path": str(track_dir),
                 "verification": verification,
             }
             if verification["mismatches"]:
-                tracks[track]["status"] = "mismatch"
-                print(
-                    f"consume {track}: MISMATCH "
-                    f"({len(verification['mismatches'])} file(s))"
-                )
-            else:
-                print(
-                    f"consume {track}: PRESENT verified "
-                    f"({verification['files_checked']} files)"
-                )
-        manifest["consume"] = tracks
-        _save_manifest(staging, manifest)
+                entry["status"] = "mismatch"
+                tracks[track] = entry
+                print(f"consume {track}: MISMATCH — {verification['mismatches']}")
+                continue
+            try:
+                if track == "senate":
+                    entry["ingest"] = _ingest_senate(track_dir, track_manifest, db)
+                    entry["status"] = "ingested"
+                elif track == "prices":
+                    entry["ingest"] = _ingest_prices(track_dir, track_manifest, db, staging)
+                    entry["status"] = "ingested"
+                elif track == "ocr":
+                    entry["ingest"] = _ingest_ocr(track_dir, track_manifest, db, staging)
+                    entry["status"] = "ingested"
+                else:
+                    entry["status"] = "recorded"
+                    entry["manifest"] = track_manifest
+            except Exception as exc:  # noqa: BLE001 -- quarantine boundary
+                entry["status"] = "quarantined"
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+                print(f"consume {track}: QUARANTINED ({exc})")
+            tracks[track] = entry
+            print(f"consume {track}: {entry['status']}")
+            _save_manifest(staging, manifest)
     finally:
         db.close()
 

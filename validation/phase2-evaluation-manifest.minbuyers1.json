@@ -103,9 +103,9 @@
     "config_sha256": "d59e0a688d8f093af6d5cb71cc6b7a6bcd0cc8ee7c09a71b94e303e746ccfc76",
     "database_sha256": null,
     "dependency_sha256": "350f32a8097262d9852e9b1954cbe2d9a5f8a8fd06b8aa00a0a81f014806f967",
-    "git_diff_sha256": "2da5dcb6694b03fd98ede8ff93e60a6beaa2da085d492fbfe60ed4e8e4cefbe8",
-    "git_dirty": true,
-    "git_revision": "c68b8182e8dccb3d8d5f7f779152fb2628aa7e4a",
+    "git_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "git_dirty": false,
+    "git_revision": "44f110107e7a54e767d520e69a9c93b4b54a0cc9",
     "harness_sha256": "7cdb7c440ad6b25a6679d2b041bfb2b62dc25b7e807f270724887a741195b1a3",
     "value_snapshot_sha256": null
   },

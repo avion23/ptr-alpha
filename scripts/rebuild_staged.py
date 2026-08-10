@@ -998,9 +998,22 @@ def _verify_artifact_files(manifest: dict, base: Path) -> dict:
     results = {"files_checked": 0, "mismatches": []}
     if not isinstance(manifest, dict):
         return results
-    artifacts = manifest.get("artifacts") or manifest.get("files") or {}
+    artifacts = (
+        manifest.get("artifacts")
+        or manifest.get("files")
+        or manifest.get("staged_files_sha256")
+        or {}
+    )
     if not isinstance(artifacts, dict):
         return results
+    if manifest.get("staged_files_sha256") and not (
+        manifest.get("artifacts") or manifest.get("files")
+    ):
+        # staged_files_sha256 maps relative path -> sha256 string.
+        artifacts = {
+            name: {"path": name, "sha256": value}
+            for name, value in artifacts.items()
+        }
     for name, meta in artifacts.items():
         if isinstance(meta, str):
             expected_sha = meta
@@ -1153,83 +1166,134 @@ def _ingest_prices(track_dir: Path, track_manifest: dict, db: Database, staging:
 
 
 def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database, staging: Path) -> dict:
-    """Ingest verified local-OCR rows for unresolved House scans."""
+    """Ingest verified local-OCR rows for unresolved House scans.
+
+    Fail-closed guards: docs the track marked unresolved are never ingested
+    (8221322 stays quarantined); rows with unparseable dates or transaction
+    dates after the filing date are dropped with exact per-doc reporting.
+    """
     import pandas as pd  # noqa: PLC0415
 
-    rows_files = [f for f in sorted(track_dir.iterdir()) if f.suffix == ".jsonl"]
-    unresolved_file = track_dir / "unresolved.json"
-    unresolved: list[str] = []
-    if unresolved_file.exists():
-        payload = json.loads(unresolved_file.read_text())
-        unresolved = list(payload.get("doc_ids", payload if isinstance(payload, list) else []))
+    rows_files = sorted(track_dir.glob("rows/*.jsonl"))
+    track_unresolved = sorted((track_manifest.get("unresolved") or {}).keys())
     if not rows_files:
-        return {"rows_files": [], "unresolved_docs": unresolved, "ingested_docs": []}
-    parser_version = str(track_manifest.get("parser_version") or "v4-local-ocr")
+        return {"rows_files": [], "track_unresolved": track_unresolved, "ingested_docs": []}
+    parser_version = str(
+        track_manifest.get("parser_version")
+        or f"v4-{track_manifest.get('engine', 'local-ocr')}"
+    )
     total_ingested = 0
     ingested_docs: list[str] = []
+    skipped_already_resolved: list[str] = []
+    skipped_track_unresolved: list[str] = []
+    dropped_rows: list[dict] = []
     for rows_file in rows_files:
         rows = pd.read_json(rows_file, lines=True)
+        file_doc_id = rows_file.stem
         if rows.empty:
+            if file_doc_id in track_unresolved:
+                skipped_track_unresolved.append(file_doc_id)
             continue
-        # group rows by the year their doc belongs to
-        year_of = {}
-        for doc_id in rows["doc_id"].astype(str).unique():
-            row = db.conn.execute(
-                "SELECT archive_year FROM house_generation_metadata WHERE doc_id=? LIMIT 1",
-                [doc_id],
-            ).fetchone()
-            year_of[doc_id] = int(row[0]) if row else None
-        rows["_year"] = rows["doc_id"].astype(str).map(year_of)
-        for year, frame in rows.groupby("_year"):
-            if year is None:
-                continue
-            gen = db.get_latest_house_generation(int(year))
-            if gen is None:
-                raise RuntimeError(f"ocr ingest: no house generation for year {year}")
-            frame = frame.drop(columns=["_year"])
-            frame["chamber"] = "house"
-            frame["ingestion_generation"] = gen
-            frame["source_record_id"] = frame["doc_id"].astype(str)
-            frame["official_filing_date"] = frame["disclosure_date"]
-            frame["artifact_sha256"] = frame["doc_id"].astype(str).map(
-                lambda d: db.conn.execute(
-                    "SELECT artifact_sha256 FROM house_pdf_artifacts WHERE archive_year=? AND generation_id=? AND doc_id=?",
-                    [int(year), gen, d],
-                ).fetchone()[0]
+        doc_id = rows["doc_id"].astype(str).iloc[0]
+        if doc_id in track_unresolved:
+            skipped_track_unresolved.append(doc_id)
+            continue
+        meta = db.conn.execute(
+            """
+            SELECT m.archive_year, g.generation_id,
+                   m.first_name, m.last_name, m.filing_date,
+                   a.artifact_sha256
+            FROM house_generation_metadata m
+            JOIN house_archive_generations g
+              ON g.archive_year = m.archive_year
+             AND g.generation_id = m.generation_id
+            JOIN house_pdf_artifacts a
+              ON a.archive_year = m.archive_year
+             AND a.generation_id = m.generation_id
+             AND a.doc_id = m.doc_id
+            WHERE m.doc_id = ? AND m.archive_year = ?
+            LIMIT 1
+            """,
+            [doc_id, int(track_manifest.get("year") or 2026)],
+        ).fetchone()
+        if meta is None:
+            raise RuntimeError(f"ocr ingest: no staged house metadata for {doc_id}")
+        archive_year, gen, first, last, filing_date, artifact_sha = meta
+        resolved = db.conn.execute(
+            """
+            SELECT COUNT(*) FROM pdf_parse_runs
+            WHERE doc_id = ? AND ingestion_generation = ?
+              AND status IN ('success', 'no_txs')
+            """,
+            [doc_id, gen],
+        ).fetchone()[0]
+        if resolved:
+            skipped_already_resolved.append(doc_id)
+            continue
+        filing_ts = pd.to_datetime(filing_date)
+        frame = rows[rows["doc_id"].astype(str) == doc_id].copy()
+        frame["transaction_date"] = pd.to_datetime(
+            frame["transaction_date"], errors="coerce"
+        )
+        valid_mask = frame["transaction_date"].notna() & (
+            frame["transaction_date"] <= filing_ts
+        )
+        n_dropped = int((~valid_mask).sum())
+        if n_dropped:
+            dropped_rows.append(
+                {
+                    "doc_id": doc_id,
+                    "dropped": n_dropped,
+                    "reasons": sorted(
+                        str(value)
+                        for value in frame.loc[~valid_mask, "transaction_date"].fillna("unparseable").unique()
+                    ),
+                }
             )
-            attempted = frame["doc_id"].astype(str).unique().tolist()
-            counts = frame["doc_id"].astype(str).value_counts().to_dict()
-            parse_runs = [
-                dict(
-                    doc_id=doc_id,
-                    year=int(year),
-                    parser_version=parser_version,
-                    status="success" if counts.get(doc_id, 0) else "no_txs",
-                    engines_attempted="local-ocr",
-                    raw_row_count=counts.get(doc_id, 0),
-                    transaction_count=0,
-                    artifact_sha256=frame.loc[
-                        frame["doc_id"].astype(str) == doc_id, "artifact_sha256"
-                    ].iloc[0],
-                    ingestion_generation=gen,
-                )
-                for doc_id in attempted
-            ]
-            persisted = db.replace_transactions_for_docs(
-                frame,
-                source="house_pdf",
-                attempted_doc_ids=attempted,
+        frame = frame.loc[valid_mask].copy()
+        if frame.empty:
+            continue
+        frame["chamber"] = "house"
+        frame["ingestion_generation"] = gen
+        frame["source_record_id"] = doc_id
+        frame["member"] = f"{first} {last}".strip()
+        frame["disclosure_date"] = filing_ts
+        frame["official_filing_date"] = filing_ts
+        frame["artifact_sha256"] = artifact_sha
+        frame["source_report_path"] = f"{archive_year}/pdfs/{doc_id}.pdf"
+        attempted = [doc_id]
+        count = len(frame)
+        parse_runs = [
+            dict(
+                doc_id=doc_id,
+                year=int(archive_year),
+                parser_version=parser_version,
+                status="success",
+                engines_attempted=f"local_tesseract:rows:{count}",
+                raw_row_count=count,
+                transaction_count=0,
+                artifact_sha256=artifact_sha,
                 ingestion_generation=gen,
-                replacement_doc_ids=attempted,
-                parse_runs=parse_runs,
             )
-            total_ingested += sum(persisted.by_doc_total.values())
-            ingested_docs.extend(attempted)
+        ]
+        persisted = db.replace_transactions_for_docs(
+            frame,
+            source="house_pdf",
+            attempted_doc_ids=attempted,
+            ingestion_generation=gen,
+            replacement_doc_ids=attempted,
+            parse_runs=parse_runs,
+        )
+        total_ingested += sum(persisted.by_doc_total.values())
+        ingested_docs.append(doc_id)
     return {
         "rows_files": [f.name for f in rows_files],
-        "unresolved_docs": unresolved,
-        "ingested_docs": ingested_docs,
+        "track_unresolved": track_unresolved,
+        "skipped_track_unresolved": skipped_track_unresolved,
+        "skipped_already_resolved": skipped_already_resolved,
+        "ingested_docs": sorted(ingested_docs),
         "ingested_rows": total_ingested,
+        "dropped_rows": dropped_rows,
         "parser_version": parser_version,
     }
 

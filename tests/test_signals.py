@@ -159,6 +159,104 @@ class TestCalculateSignalPotential(unittest.TestCase):
         self.assertEqual(row["ticker_origin"], "official")
 
 
+class TestRenameAliasPerTransactionDateResolution(unittest.TestCase):
+    """Canaries: rename aliases resolve per transaction date in signals."""
+
+    def setUp(self):
+        self.dates = pd.date_range("2022-05-01", "2022-08-01", freq="D")
+        self.prices_df = pd.DataFrame(
+            {
+                "FB": 100.0 + np.arange(len(self.dates)),
+                "META": 200.0 + 2 * np.arange(len(self.dates)),
+                "SPY": 400.0 + np.arange(len(self.dates)),
+            },
+            index=self.dates,
+        )
+
+    def _entry(self, rows):
+        return pd.DataFrame(
+            {
+                "member": [r[0] for r in rows],
+                "ticker": [r[1] for r in rows],
+                "disclosure_date": pd.to_datetime([r[2] for r in rows]),
+                "transaction_type": [r[3] for r in rows],
+                "transaction_date": pd.to_datetime([r[4] for r in rows]),
+                "entry_price": [r[5] for r in rows],
+            }
+        )
+
+    def test_fb_resolves_to_fb_before_rename_and_meta_after(self):
+        from analyzer.price_repository import (
+            next_nyse_session,
+            previous_nyse_session,
+        )
+
+        def expected_return(ticker, disclosure):
+            entry = next_nyse_session(pd.Timestamp(disclosure))
+            end = previous_nyse_session(entry + pd.Timedelta(days=30))
+            window = self.prices_df.loc[entry:end, ticker]
+            return (window.iloc[-1] / window.iloc[0] - 1) * 100
+
+        entries = self._entry(
+            [
+                # Pre-rename FB trade disclosed before 2022-06-09.
+                ("Alice", "FB", "2022-05-10", "Purchase", "2022-05-01", 110.0),
+                # Post-rename FB trade: must price on the META series.
+                ("Bob", "FB", "2022-06-10", "Purchase", "2022-06-09", 220.0),
+            ]
+        )
+        result = calculate_signal_potential(entries, self.prices_df, [30])
+
+        self.assertEqual(len(result), 2)
+        by_member = result.set_index("member")
+        self.assertEqual(by_member.loc["Alice", "ticker"], "FB")
+        self.assertEqual(by_member.loc["Bob", "ticker"], "META")
+        self.assertAlmostEqual(
+            by_member.loc["Alice", "total_return_pct"],
+            expected_return("FB", "2022-05-10"),
+        )
+        self.assertAlmostEqual(
+            by_member.loc["Bob", "total_return_pct"],
+            expected_return("META", "2022-06-10"),
+        )
+
+    def test_no_date_rename_alias_fails_unverified_and_is_dropped(self):
+        entries = self._entry(
+            [
+                ("Alice", "FB", "2022-06-10", "Purchase", "2022-06-09", 220.0),
+                # NaT transaction_date: alias resolution is unverified, the
+                # row must be dropped rather than priced under the raw symbol.
+                ("Carol", "FB", "2022-06-10", "Purchase", pd.NaT, 220.0),
+            ]
+        )
+        result = calculate_signal_potential(entries, self.prices_df, [30])
+        # The no-date FB row is dropped, the dated FB row survives.
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["member"], "Alice")
+        self.assertEqual(result.iloc[0]["ticker"], "META")
+
+    def test_brkb_class_share_resolves_to_brk_b_column(self):
+        dates = pd.date_range("2024-01-01", "2024-03-01", freq="D")
+        prices = pd.DataFrame(
+            {"BRK-B": 350.0 + np.arange(len(dates)), "SPY": 400.0},
+            index=dates,
+        )
+        entries = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["BRKB"],
+                "disclosure_date": pd.to_datetime(["2024-01-10"]),
+                "transaction_type": ["Purchase"],
+                "transaction_date": pd.to_datetime(["2024-01-09"]),
+                "entry_price": [350.0],
+            }
+        )
+        result = calculate_signal_potential(entries, prices, [30])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["ticker"], "BRK-B")
+        self.assertTrue(bool(result.iloc[0]["window_complete"]))
+
+
 class TestGetTopSignals(unittest.TestCase):
     def _make_signals(self) -> pd.DataFrame:
         return pd.DataFrame(

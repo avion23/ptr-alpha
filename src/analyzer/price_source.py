@@ -55,7 +55,11 @@ class YFinancePriceSource(PriceSource):
         clean_tickers = _clean_tickers(tickers)
         all_tickers = sorted(
             list(
-                set(t for t in clean_tickers if _VALID_TICKER_RE.match(str(t)))
+                set(
+                    t
+                    for t in _expand_rename_aliases(clean_tickers)
+                    if _VALID_TICKER_RE.match(str(t))
+                )
                 | {"SPY"}
             )
         )
@@ -248,6 +252,28 @@ class YFinancePriceSource(PriceSource):
 def _clean_tickers(tickers: list[str]) -> list[str]:
     """Filter out NaN/None/empty/garbage tickers from the input list."""
     return [t for t in tickers if t and str(t).strip() and str(t) != "nan"]
+
+
+def _expand_rename_aliases(tickers: list[str]) -> set[str]:
+    """Expand rename aliases into both temporal price symbols.
+
+    A no-date resolver call on a rename alias (FB) is explicit unverified: the
+    contemporaneous symbol depends on the transaction date, which a price
+    acquisition window does not carry. Fetch both the pre-rename and
+    post-rename symbols (FB and META) so per-transaction-date entry-price
+    resolution can find its series; never silently guess one symbol.
+    """
+    resolver = TickerResolver()
+    expanded: set[str] = set()
+    for t in tickers:
+        normalized = str(t).strip().upper()
+        if normalized in resolver.RENAME_MAP:
+            new_symbol, _ = resolver.RENAME_MAP[normalized]
+            expanded.add(t)
+            expanded.add(new_symbol)
+        else:
+            expanded.add(t)
+    return expanded
 
 
 def _resolve_tickers(all_tickers: list[str]) -> tuple[dict, dict]:

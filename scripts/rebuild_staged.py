@@ -727,6 +727,100 @@ def prices(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# Senate frozen-window ingest
+# --------------------------------------------------------------------------
+
+def ingest_senate_window(args) -> None:
+    """Hash-verify and ingest a frozen Senate eFD window via persist_source_refresh.
+
+    The window artifact (sibling senate sweep track) contains
+    transactions.jsonl + report_inventory.jsonl with SHAs in its manifest.
+    This atomically replaces the senate_efd source/chamber state.
+    """
+    import pandas as pd  # noqa: PLC0415
+
+    staging = Path(args.staging)
+    manifest = _load_manifest(staging)
+    if manifest.get("senate_window", {}).get("status") == "ingested" and not args.force:
+        print("senate-window: skipped (already ingested)")
+        return
+    window_dir = Path(args.window_dir) if args.window_dir else None
+    if window_dir is None:
+        senate_track = _sibling_search_dirs("senate", manifest["generation"])
+        candidates = []
+        for base in senate_track:
+            if base.exists():
+                candidates.extend(sorted(base.glob("window-*")))
+        if not candidates:
+            raise SystemExit("no senate window dir found (--window-dir or sibling track)")
+        window_dir = candidates[-1]
+    mpath = window_dir / "manifest.json"
+    if not mpath.exists():
+        raise SystemExit(f"window manifest not found: {mpath}")
+    window_manifest = json.loads(mpath.read_text())
+    verification = _verify_artifact_files(window_manifest, window_dir)
+    if verification["mismatches"]:
+        raise SystemExit(
+            f"senate window hash mismatch: {verification['mismatches']}"
+        )
+    tx = pd.read_json(window_dir / "transactions.jsonl", lines=True)
+    inv = pd.read_json(window_dir / "report_inventory.jsonl", lines=True)
+    count_cols = ["raw_row_count", "accepted_row_count", "rejected_row_count"]
+    date_cols = ["official_filing_date", "available_date", "disclosure_date",
+                 "transaction_date", "notification_date", "filing_date"]
+    text_cols = [
+        "amends_source_record_id", "artifact_sha256", "asset_description",
+        "chamber", "chamber_member_key", "doc_id", "expiry_date",
+        "ingestion_generation", "instrument_type", "member", "member_key",
+        "owner_code", "raw_asset_class", "raw_asset_description", "raw_owner",
+        "raw_ticker", "raw_transaction_subtype", "source_record_id",
+        "source_report_path", "source_row_id", "strike_price", "ticker",
+        "ticker_candidate", "ticker_origin", "transaction_type",
+        "landing_sha256", "paper_artifact_sha256", "paper_artifact_url",
+        "error_message", "outcome", "report_path", "source",
+    ]
+    generation = window_manifest["generation"]
+    tx = _coerce_sibling_frame(tx, count_columns=[], date_columns=date_cols, text_columns=text_cols)
+    inv = _coerce_sibling_frame(inv, count_columns=count_cols, date_columns=date_cols, text_columns=text_cols)
+    tx["ingestion_generation"] = generation
+    inv["ingestion_generation"] = generation
+    db = Database(staging / "congress.duckdb", read_only=False)
+    try:
+        inserted = db.persist_source_refresh(
+            transactions=tx,
+            reports=inv,
+            source="senate_efd",
+            chamber="senate",
+            ingestion_generation=generation,
+        )
+        record = {
+            "status": "ingested",
+            "path": str(window_dir),
+            "generation": generation,
+            "window": window_manifest.get("window"),
+            "summary": window_manifest.get("summary"),
+            "outcome_counts": window_manifest.get("outcome_counts"),
+            "canaries": window_manifest.get("canaries"),
+            "inserted_transactions": inserted,
+            "verification": verification,
+            "replaced_previous_sweep": bool(
+                manifest.get("consume", {}).get("senate", {}).get("status")
+                == "ingested"
+            ),
+        }
+        manifest["senate_window"] = record
+        _save_manifest(staging, manifest)
+        print(
+            f"senate-window: INGESTED gen={generation} "
+            f"reports={record['summary'].get('found')} "
+            f"transactions={inserted} (replaced prior sweep: "
+            f"{record['replaced_previous_sweep']})"
+        )
+    finally:
+        db.close()
+
+
+# --------------------------------------------------------------------------
 # Verification
 # --------------------------------------------------------------------------
 
@@ -933,7 +1027,8 @@ def verify(args) -> None:
             f"({capitol.get('error', 'no artifact staged')})",
         )
         senate_summary = (
-            manifest.get("senate", {}).get("summary")
+            manifest.get("senate_window", {}).get("summary")
+            or manifest.get("senate", {}).get("summary")
             or consume_tracks.get("senate", {}).get("ingest", {}).get("summary")
             or {}
         )
@@ -1776,19 +1871,30 @@ def finalize(args) -> None:
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     house = manifest.get("house", {})
-    senate = manifest.get("senate", {}) or {
-        "status": "consumed",
-        "start_date": "2025-08-09",
-        "end_date": "2026-08-09",
-        "summary": manifest.get("consume", {})
-        .get("senate", {})
-        .get("ingest", {})
-        .get("summary", {}),
-        "inserted_transactions": manifest.get("consume", {})
-        .get("senate", {})
-        .get("ingest", {})
-        .get("inserted_transactions", 0),
-    }
+    senate_window = manifest.get("senate_window")
+    if senate_window and senate_window.get("status") == "ingested":
+        senate = {
+            "status": "consumed",
+            "start_date": senate_window.get("window", {}).get("start_date"),
+            "end_date": senate_window.get("window", {}).get("end_date"),
+            "summary": senate_window.get("summary"),
+            "inserted_transactions": senate_window.get("inserted_transactions"),
+            "generation": senate_window.get("generation"),
+        }
+    else:
+        senate = manifest.get("senate", {}) or {
+            "status": "consumed",
+            "start_date": "2025-08-09",
+            "end_date": "2026-08-09",
+            "summary": manifest.get("consume", {})
+            .get("senate", {})
+            .get("ingest", {})
+            .get("summary", {}),
+            "inserted_transactions": manifest.get("consume", {})
+            .get("senate", {})
+            .get("ingest", {})
+            .get("inserted_transactions", 0),
+        }
     prices = manifest.get("prices", {})
     verify = manifest.get("verify", {})
 
@@ -1881,7 +1987,7 @@ def finalize(args) -> None:
         summary = senate.get("summary") or {}
         if senate.get("status") in ("persisted", "consumed"):
             lines.append(
-                f"  persisted (consumed sibling sweep): found={summary.get('found')} "
+                f"  persisted (frozen window {senate.get('generation', '')}): found={summary.get('found')} "
                 f"parsed={summary.get('parsed')} "
                 f"paper_only={summary.get('paper_only')} unavailable={summary.get('unavailable')} "
                 f"failed={summary.get('failed')}; transactions={senate.get('inserted_transactions')}"
@@ -1982,6 +2088,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("prices")
     sub.add_parser("consume")
     sub.add_parser("repair-audit-gaps")
+    p_window = sub.add_parser("ingest-senate-window")
+    p_window.add_argument("--window-dir")
     sub.add_parser("house-activate")
     sub.add_parser("verify")
     sub.add_parser("finalize")
@@ -2001,6 +2109,7 @@ def main(argv: list[str] | None = None) -> None:
         "prices": prices,
         "consume": consume,
         "repair-audit-gaps": repair_audit_gaps,
+        "ingest-senate-window": ingest_senate_window,
         "house-activate": house_activate,
         "verify": verify,
         "finalize": finalize,

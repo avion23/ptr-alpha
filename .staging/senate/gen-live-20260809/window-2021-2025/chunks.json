@@ -1,0 +1,36 @@
+{
+  "chunks": [
+    "chunk-2021",
+    "chunk-2022",
+    "chunk-2023",
+    "chunk-2024",
+    "chunk-2025"
+  ],
+  "manifests": [
+    {
+      "chunk": "chunk-2021",
+      "file": "chunk-2021/manifest.json",
+      "sha256": "265dce45c1121ab5514550cc727bceda39a24f944c19b20a0fdbfb2ca762a8d6"
+    },
+    {
+      "chunk": "chunk-2022",
+      "file": "chunk-2022/manifest.json",
+      "sha256": "42e186a3bd149b36a23588899c2985b694c67598cb2e182b723b9edc228f4f2e"
+    },
+    {
+      "chunk": "chunk-2023",
+      "file": "chunk-2023/manifest.json",
+      "sha256": "5e7da13a9f226cf6f378ba4af718f365fbd72074aa8929acecec968d343ccedc"
+    },
+    {
+      "chunk": "chunk-2024",
+      "file": "chunk-2024/manifest.json",
+      "sha256": "f1db8d387725e007454b5ceec48fcc1e8f83d9091dcd93dfcf82db100f88da27"
+    },
+    {
+      "chunk": "chunk-2025",
+      "file": "chunk-2025/manifest.json",
+      "sha256": "75393e13623b9fe5d5eacaf61592d4ee80e781fb1ea6d2260310fd87ba7c29a8"
+    }
+  ]
+}

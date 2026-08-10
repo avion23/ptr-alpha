@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 
 import pandas as pd
 import pytest
@@ -436,3 +437,141 @@ def test_stage_paper_artifacts_fails_closed_on_sha_mismatch(tmp_path):
     ]
     with pytest.raises(SenateSweepError, match="SHA mismatch"):
         stage_paper_artifacts(FakeSource(), inventory, tmp_path / "papers")
+
+
+def test_verify_canaries_any_requires_parsed_report_per_member():
+    from scripts.senate_sweep import _CANARY_EXPECTED_ANY
+
+    inventory = [
+        _inventory_row(accepted_row_count=22),
+        _inventory_row(
+            source_record_id=SCOTT_REPORT_ID,
+            report_path=SCOTT_REPORT_PATH,
+            member="Rick Scott",
+            accepted_row_count=17,
+        ),
+    ]
+    result = verify_canaries(inventory, expected=_CANARY_EXPECTED_ANY)
+    assert result["passed"] is True
+    assert result["results"]["KATIE BRITT"]["parsed_reports"] == 1
+    assert result["results"]["RICK SCOTT"]["parsed_reports"] == 1
+
+
+def test_verify_canaries_any_fails_when_member_missing():
+    from scripts.senate_sweep import _CANARY_EXPECTED_ANY
+
+    inventory = [_inventory_row(accepted_row_count=1)]
+    result = verify_canaries(inventory, expected=_CANARY_EXPECTED_ANY)
+    assert result["passed"] is False
+    assert any("RICK SCOTT" in failure for failure in result["failures"])
+
+
+def _synthetic_chunk(tmp_path, name, rows, tx_rows, window, quarantine=None):
+    chunk = tmp_path / name
+    chunk.mkdir(parents=True)
+    from scripts.senate_sweep import write_inventory_jsonl, write_manifest
+
+    write_inventory_jsonl(rows, chunk / "report_inventory.jsonl")
+    tx_file = chunk / "transactions.jsonl"
+    tx_file.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in tx_rows))
+    write_manifest(
+        chunk,
+        generation=name,
+        start_date=window[0],
+        end_date=window[1],
+        inventory=rows,
+        summary={
+            "found": len(rows),
+            "parsed": sum(1 for r in rows if r["outcome"] == "parsed"),
+            "paper_only": 0,
+            "unavailable": 0,
+            "failed": 0,
+        },
+        transactions_file=tx_file,
+        papers=[],
+        canaries={"results": {}, "failures": [], "passed": True},
+        quarantine=quarantine,
+    )
+    return chunk
+
+
+def test_merge_window_combines_chunks_and_verifies_canaries(tmp_path):
+    from scripts.senate_sweep import merge_window
+
+    d = tmp_path / "window"
+    d.mkdir()
+    row1 = _inventory_row()  # Britt parsed, 1 tx
+    row2 = _inventory_row(
+        source_record_id=SCOTT_REPORT_ID,
+        report_path=SCOTT_REPORT_PATH,
+        member="Rick Scott",
+        accepted_row_count=12,
+        official_filing_date=pd.Timestamp("2024-03-15"),
+    )
+    row3 = _inventory_row(
+        source_record_id="ffffffff-1111-2222-3333-444444444444",
+        report_path="/search/view/ptr/ffffffff-1111-2222-3333-444444444444/",
+        member="Thomas Tuberville",
+        accepted_row_count=3,
+        official_filing_date=pd.Timestamp("2023-06-01"),
+    )
+    _synthetic_chunk(
+        d, "chunk-2023", [row3], [], (date(2023, 1, 1), date(2023, 12, 31))
+    )
+    _synthetic_chunk(
+        d,
+        "chunk-2024",
+        [row1, row2],
+        [],
+        (date(2024, 1, 1), date(2024, 12, 31)),
+    )
+    exit_code = merge_window(d)
+    assert exit_code == 0
+    manifest = json.loads((d / "manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    assert manifest["summary"]["found"] == 3
+    assert manifest["summary"]["parsed"] == 3
+    assert manifest["window"] == {
+        "start_date": "2023-01-01",
+        "end_date": "2024-12-31",
+    }
+    assert manifest["canaries"]["passed"] is True
+    merged_inv = [
+        json.loads(line)
+        for line in (d / "report_inventory.jsonl").read_text().splitlines()
+    ]
+    assert len(merged_inv) == 3
+    assert "chunk-2023" in json.loads((d / "chunks.json").read_text())["chunks"]
+
+
+def test_merge_window_dedupes_and_quarantines_when_chunk_quarantined(tmp_path):
+    from scripts.senate_sweep import merge_window
+
+    d = tmp_path / "window2"
+    d.mkdir()
+    dup = _inventory_row()
+    dup["official_filing_date"] = pd.Timestamp("2024-01-05")
+    _synthetic_chunk(
+        d,
+        "chunk-2024a",
+        [dup],
+        [],
+        (date(2024, 1, 1), date(2024, 12, 31)),
+    )
+    _synthetic_chunk(
+        d,
+        "chunk-2024b",
+        [dict(dup)],  # same report_path -> dedupe
+        [],
+        (date(2024, 1, 1), date(2024, 12, 31)),
+        quarantine={
+            "error": "Senate refresh incomplete",
+            "missing": {"unavailable": 1, "failed": 0},
+        },
+    )
+    exit_code = merge_window(d)
+    assert exit_code == 2
+    manifest = json.loads((d / "manifest.json").read_text())
+    assert manifest["status"] == "quarantined"
+    assert manifest["summary"]["found"] == 1  # deduped
+    assert manifest["quarantine"]["missing"]["unavailable"] == 1

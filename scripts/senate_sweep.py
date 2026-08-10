@@ -56,6 +56,12 @@ _CANARY_EXPECTED = {
     "KATIE BRITT": {"accepted_row_count": 1},
     "RICK SCOTT": {"accepted_row_count": 12},
 }
+# Frozen-window contract: both members must have at least one parsed report
+# in the window; the exact 1/12 counts belong to the 2026 live canary filings.
+_CANARY_EXPECTED_ANY = {
+    "KATIE BRITT": None,
+    "RICK SCOTT": None,
+}
 
 
 class SenateSweepError(Exception):
@@ -226,13 +232,17 @@ def stage_paper_artifacts(
     return staged
 
 
-def verify_canaries(inventory: list[dict]) -> dict:
-    """Verify Katie Britt and Rick Scott live canaries classify parsed.
+def verify_canaries(inventory: list[dict], expected: dict | None = None) -> dict:
+    """Verify Katie Britt and Rick Scott canaries classify parsed.
 
-    A member may file multiple PTRs in the sweep window; each canary passes
-    when at least one of that member's reports classifies ``parsed`` with the
-    expected accepted row count (Britt 1, Scott 12).
+    ``expected`` maps canonical member key to either an ``accepted_row_count``
+    (at least one parsed report must match exactly) or ``None`` (at least one
+    parsed report must exist; the exact 1/12 counts belong to the 2026 live
+    canary filings, absent from the frozen 2021-2025 window).  Defaults to the
+    live-window expectations.
     """
+    if expected is None:
+        expected = _CANARY_EXPECTED
     by_member: dict[str, list[dict]] = {}
     for row in inventory:
         key = canonical_member_key(row.get("member") or "")
@@ -240,13 +250,16 @@ def verify_canaries(inventory: list[dict]) -> dict:
 
     results: dict[str, dict] = {}
     failures: list[str] = []
-    for key, expected in sorted(_CANARY_EXPECTED.items()):
+    for key, spec in sorted(expected.items()):
+        expected_count = None if spec is None else spec["accepted_row_count"]
         rows = by_member.get(key, [])
         parsed_rows = [r for r in rows if r["outcome"] == ReportOutcome.PARSED.value]
-        expected_count = expected["accepted_row_count"]
-        matching = [
-            r for r in parsed_rows if int(r["accepted_row_count"]) == expected_count
-        ]
+        if expected_count is None:
+            matching = parsed_rows
+        else:
+            matching = [
+                r for r in parsed_rows if int(r["accepted_row_count"]) == expected_count
+            ]
         result = {
             "member_key": key,
             "reports_found": len(rows),
@@ -267,10 +280,13 @@ def verify_canaries(inventory: list[dict]) -> dict:
         if not rows:
             failures.append(f"{key}: no report listed in sweep window")
         elif not matching:
-            failures.append(
-                f"{key}: no parsed report with accepted_row_count "
-                f"{expected_count}; counts={result['accepted_row_counts']}"
-            )
+            if expected_count is None:
+                failures.append(f"{key}: no parsed report in sweep window")
+            else:
+                failures.append(
+                    f"{key}: no parsed report with accepted_row_count "
+                    f"{expected_count}; counts={result['accepted_row_counts']}"
+                )
         results[key] = result
     return {"results": results, "failures": failures, "passed": not failures}
 
@@ -348,6 +364,7 @@ def run_sweep(
     staging_root: Path,
     start_date: date,
     end_date: date,
+    canary_expect: str = "exact",
 ) -> int:
     generation_dir = staging_root / generation
     papers_dir = generation_dir / "papers"
@@ -433,7 +450,11 @@ def run_sweep(
     # Stage paper-only PDFs, byte-verified against the accepted SHA.
     papers = stage_paper_artifacts(source, inventory, papers_dir)
 
-    canaries = verify_canaries(inventory)
+    if canary_expect == "any":
+        canary_expected = _CANARY_EXPECTED_ANY
+    else:
+        canary_expected = _CANARY_EXPECTED
+    canaries = verify_canaries(inventory, expected=canary_expected)
     manifest_path = write_manifest(
         generation_dir,
         generation=generation,
@@ -464,6 +485,9 @@ def run_sweep(
         )
         print("sweep QUARANTINED — see quarantine.json for exact missing counts")
         return 2
+    if canary_expect == "none":
+        print("sweep COMPLETE — canary results recorded (no gate)")
+        return 0
     if not canaries["passed"]:
         print("sweep COMPLETE but canary verification FAILED:")
         for failure in canaries["failures"]:
@@ -475,6 +499,179 @@ def run_sweep(
 
 def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
+
+
+def merge_window(window_dir: Path) -> int:
+    """Consolidate ``chunk-*`` subdirectory sweeps into one window staging.
+
+    The frozen 2021-2025 window is fetched per calendar-year chunk; this
+    merges chunk inventories, normalized transactions and paper artifacts into
+    the window directory with a combined manifest, per-chunk references, and
+    window-level canary verification (Britt/Scott at least one parsed report).
+    Any quarantined chunk keeps the window quarantined with exact missing
+    counts.
+    """
+    if not window_dir.is_dir():
+        raise SenateSweepError(f"merge window directory not found: {window_dir}")
+    chunks = sorted(window_dir.glob("chunk-*"))
+    if not chunks:
+        raise SenateSweepError(f"no chunk-* subdirectories under {window_dir}")
+
+    inventory: list[dict] = []
+    transactions: list[dict] = []
+    papers: list[dict] = []
+    chunk_manifests: list[dict] = []
+    quarantines: list[dict] = []
+    seen_paths: set[str] = set()
+    seen_rows: set[tuple] = set()
+    window_start: date | None = None
+    window_end: date | None = None
+
+    for chunk_dir in chunks:
+        manifest_path = chunk_dir / "manifest.json"
+        if not manifest_path.is_file():
+            raise SenateSweepError(f"chunk {chunk_dir.name} missing manifest.json")
+        chunk_manifest = json.loads(manifest_path.read_text())
+        chunk_manifests.append(chunk_manifest)
+        chunk_start = date.fromisoformat(chunk_manifest["window"]["start_date"])
+        chunk_end = date.fromisoformat(chunk_manifest["window"]["end_date"])
+        window_start = (
+            chunk_start
+            if window_start is None or chunk_start < window_start
+            else window_start
+        )
+        window_end = (
+            chunk_end if window_end is None or chunk_end > window_end else window_end
+        )
+        if chunk_manifest.get("status") == "quarantined":
+            quarantines.append(
+                {
+                    "chunk": chunk_dir.name,
+                    **chunk_manifest.get("quarantine", {}),
+                }
+            )
+
+        inv_path = chunk_dir / "report_inventory.jsonl"
+        for line in inv_path.read_text().splitlines():
+            row = json.loads(line)
+            if row["report_path"] in seen_paths:
+                continue
+            seen_paths.add(row["report_path"])
+            inventory.append(row)
+
+        tx_path = chunk_dir / "transactions.jsonl"
+        for line in tx_path.read_text().splitlines():
+            row = json.loads(line)
+            key = (row["source_record_id"], row["source_row_id"])
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            transactions.append(row)
+
+        papers_dir = chunk_dir / "papers"
+        if papers_dir.is_dir():
+            for pdf in sorted(papers_dir.glob("*.pdf")):
+                target = window_dir / "papers" / pdf.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    target.write_bytes(pdf.read_bytes())
+                elif target.read_bytes() != pdf.read_bytes():
+                    raise SenateSweepError(
+                        f"paper artifact collision for {pdf.name} across chunks"
+                    )
+                papers.append(
+                    {
+                        "source_record_id": pdf.stem,
+                        "file": f"papers/{pdf.name}",
+                        "sha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
+                        "bytes": pdf.stat().st_size,
+                    }
+                )
+
+    inventory.sort(key=lambda r: str(r.get("official_filing_date", "")))
+    transactions.sort(
+        key=lambda r: (
+            str(r.get("source_record_id", "")),
+            str(r.get("source_row_id", "")),
+        )
+    )
+    window_dir.mkdir(parents=True, exist_ok=True)
+    write_inventory_jsonl(inventory, window_dir / "report_inventory.jsonl")
+    tx_file = window_dir / "transactions.jsonl"
+    with tx_file.open("w", encoding="utf-8") as handle:
+        for row in transactions:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+    summary = {
+        "found": len(inventory),
+        "parsed": sum(1 for r in inventory if r["outcome"] == "parsed"),
+        "paper_only": sum(1 for r in inventory if r["outcome"] == "paper_only"),
+        "unavailable": sum(1 for r in inventory if r["outcome"] == "unavailable"),
+        "failed": sum(1 for r in inventory if r["outcome"] == "failed"),
+    }
+    canaries = verify_canaries(inventory, expected=_CANARY_EXPECTED_ANY)
+    quarantine = None
+    if quarantines:
+        quarantine = {
+            "error": "one or more chunks quarantined",
+            "missing": {
+                "unavailable": sum(
+                    q.get("missing", {}).get("unavailable") or 0 for q in quarantines
+                ),
+                "failed": sum(
+                    q.get("missing", {}).get("failed") or 0 for q in quarantines
+                ),
+            },
+            "chunks": quarantines,
+        }
+
+    write_manifest(
+        window_dir,
+        generation=window_dir.name,
+        start_date=window_start or date.today(),
+        end_date=window_end or date.today(),
+        inventory=inventory,
+        summary=summary,
+        transactions_file=tx_file,
+        papers=papers,
+        canaries=canaries,
+        quarantine=quarantine,
+    )
+    (window_dir / "chunks.json").write_text(
+        json.dumps(
+            {
+                "chunks": [c.name for c in chunks],
+                "manifests": [
+                    {
+                        "chunk": c.name,
+                        "file": c.relative_to(window_dir).as_posix() + "/manifest.json",
+                        "sha256": sha256_file(c / "manifest.json")[0],
+                    }
+                    for c in chunks
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    print(
+        f"merge {window_dir.name}: found={summary['found']} parsed={summary['parsed']} "
+        f"paper_only={summary['paper_only']} unavailable={summary['unavailable']} "
+        f"failed={summary['failed']} transactions={len(transactions)}"
+    )
+    for key, result in canaries["results"].items():
+        print(f"canary {key}: {result}")
+    if quarantine is not None:
+        print("window QUARANTINED — see manifest quarantine for exact missing counts")
+        return 2
+    if not canaries["passed"]:
+        print("merge COMPLETE but canary verification FAILED:")
+        for failure in canaries["failures"]:
+            print(f"  {failure}")
+        return 2
+    print("merge COMPLETE — all window canaries passed")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -498,7 +695,34 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Sweep end date YYYY-MM-DD (default: today)",
     )
+    parser.add_argument(
+        "--canary-expect",
+        choices=("exact", "any", "none"),
+        default="exact",
+        help=(
+            "exact: Britt=1/Scott=12 parsed row counts gate the run (live "
+            "canaries); any: at least one parsed report per canary member "
+            "gates (frozen window); none: record canary results, no gate "
+            "(per-chunk runs)"
+        ),
+    )
+    parser.add_argument(
+        "--merge-window",
+        default=None,
+        help=(
+            "Consolidate chunk-* subdirectories under this window generation "
+            "into a single inventory/transactions/manifest (relative to "
+            "--staging-root)"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.merge_window:
+        try:
+            return merge_window(args.staging_root / args.merge_window)
+        except SenateSweepError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
     end_date = _parse_date(args.end) if args.end else date.today()
     if args.start:
@@ -513,7 +737,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        return run_sweep(args.generation, args.staging_root, start_date, end_date)
+        return run_sweep(
+            args.generation,
+            args.staging_root,
+            start_date,
+            end_date,
+            canary_expect=args.canary_expect,
+        )
     except SenateSweepError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

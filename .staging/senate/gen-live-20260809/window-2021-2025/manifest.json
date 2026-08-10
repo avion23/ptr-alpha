@@ -1,0 +1,271 @@
+{
+  "artifacts": {
+    "report_inventory.jsonl": {
+      "bytes": 328131,
+      "file": "report_inventory.jsonl",
+      "sha256": "765b639749c176565f84f75f2ef4794fe7c0b58b2d3f4d359c5e3cf862ec1c95"
+    },
+    "transactions.jsonl": {
+      "bytes": 5835481,
+      "file": "transactions.jsonl",
+      "sha256": "c69070e98548fb5d2dd03a028dd4c2bf838732c23d65797bdab242f218ea43fc"
+    }
+  },
+  "canaries": {
+    "failures": [],
+    "passed": true,
+    "results": {
+      "KATIE BRITT": {
+        "accepted_row_counts": [
+          1,
+          1,
+          1
+        ],
+        "canary_matches": [
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2023-09-18T00:00:00",
+            "source_record_id": "026ff795-7e4d-446b-aff2-8d01be09e318"
+          },
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2023-12-15T00:00:00",
+            "source_record_id": "56e94501-503d-480f-96f0-354febac789e"
+          },
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2024-07-29T00:00:00",
+            "source_record_id": "15b456b6-a016-42dd-abdd-4bec977f69c0"
+          }
+        ],
+        "member_key": "KATIE BRITT",
+        "outcomes": [
+          "parsed"
+        ],
+        "parsed_reports": 3,
+        "reports_found": 3
+      },
+      "RICK SCOTT": {
+        "accepted_row_counts": [
+          1,
+          1,
+          1,
+          1,
+          2,
+          2,
+          2,
+          3,
+          3,
+          3,
+          3,
+          4,
+          4,
+          4,
+          5,
+          5,
+          5,
+          5,
+          6,
+          6,
+          7,
+          8,
+          8,
+          9,
+          9,
+          11,
+          13,
+          16,
+          17,
+          18,
+          18
+        ],
+        "canary_matches": [
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2021-01-12T00:00:00",
+            "source_record_id": "fe83be59-4d6a-4ade-8163-a12b214d71ab"
+          },
+          {
+            "accepted_row_count": 2,
+            "official_filing_date": "2021-04-23T00:00:00",
+            "source_record_id": "d5f6be77-a2f6-49c5-8f4d-e299ffae70db"
+          },
+          {
+            "accepted_row_count": 4,
+            "official_filing_date": "2021-06-24T00:00:00",
+            "source_record_id": "5f219f13-10ce-46c2-a637-99c206a39eaf"
+          },
+          {
+            "accepted_row_count": 5,
+            "official_filing_date": "2021-10-28T00:00:00",
+            "source_record_id": "d6b9057a-9de9-4ec1-a210-31683309ded2"
+          },
+          {
+            "accepted_row_count": 3,
+            "official_filing_date": "2021-11-19T00:00:00",
+            "source_record_id": "16198565-5608-4bb4-837b-4b8a02e9a050"
+          },
+          {
+            "accepted_row_count": 9,
+            "official_filing_date": "2022-01-07T00:00:00",
+            "source_record_id": "9c5c1a62-11f3-4542-887a-8012c8f35640"
+          },
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2022-02-04T00:00:00",
+            "source_record_id": "a324cfce-d7dd-4f8c-9903-2829ab6e90df"
+          },
+          {
+            "accepted_row_count": 5,
+            "official_filing_date": "2022-03-25T00:00:00",
+            "source_record_id": "3f548fd9-50f8-47a3-826a-17d562db6065"
+          },
+          {
+            "accepted_row_count": 3,
+            "official_filing_date": "2022-05-05T00:00:00",
+            "source_record_id": "5409750e-79c5-48c6-9015-b3d7523c2f18"
+          },
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2022-06-16T00:00:00",
+            "source_record_id": "8ddf0001-ba8d-4c25-b970-556e8d44149c"
+          },
+          {
+            "accepted_row_count": 5,
+            "official_filing_date": "2022-08-15T00:00:00",
+            "source_record_id": "8ac1ad57-0e4e-4c79-bccb-0d9145d7461b"
+          },
+          {
+            "accepted_row_count": 3,
+            "official_filing_date": "2022-10-28T00:00:00",
+            "source_record_id": "b353bbdc-ec37-4048-a7a9-9b4c94a58c7a"
+          },
+          {
+            "accepted_row_count": 18,
+            "official_filing_date": "2022-11-23T00:00:00",
+            "source_record_id": "e96754b3-3ded-4636-94c2-dc9b0500f289"
+          },
+          {
+            "accepted_row_count": 8,
+            "official_filing_date": "2022-12-23T00:00:00",
+            "source_record_id": "a878d31a-cc7f-4402-aea8-e2ad2847ab4c"
+          },
+          {
+            "accepted_row_count": 7,
+            "official_filing_date": "2023-01-19T00:00:00",
+            "source_record_id": "6b92f351-93e8-446a-a4d9-435bd9693d47"
+          },
+          {
+            "accepted_row_count": 2,
+            "official_filing_date": "2023-02-24T00:00:00",
+            "source_record_id": "dfde0f14-54a7-4191-bd4e-05e7e40d175c"
+          },
+          {
+            "accepted_row_count": 1,
+            "official_filing_date": "2023-03-23T00:00:00",
+            "source_record_id": "83de647b-ddf0-49c3-bd56-8b32f23c0e78"
+          },
+          {
+            "accepted_row_count": 4,
+            "official_filing_date": "2023-05-11T00:00:00",
+            "source_record_id": "7fc6c207-7c6f-4d05-aae6-1f5b2f661252"
+          },
+          {
+            "accepted_row_count": 3,
+            "official_filing_date": "2023-09-15T00:00:00",
+            "source_record_id": "3fbf28e0-d8fa-4f01-a605-eca8e912dde8"
+          },
+          {
+            "accepted_row_count": 16,
+            "official_filing_date": "2023-12-10T00:00:00",
+            "source_record_id": "f23ecd4c-3174-4fba-90ae-a9a825b4a22f"
+          },
+          {
+            "accepted_row_count": 4,
+            "official_filing_date": "2024-01-19T00:00:00",
+            "source_record_id": "68e19861-e82e-4994-966f-a48ff53e73f3"
+          },
+          {
+            "accepted_row_count": 17,
+            "official_filing_date": "2024-03-15T00:00:00",
+            "source_record_id": "43a6c37c-44f6-4749-9232-1e9725258b41"
+          },
+          {
+            "accepted_row_count": 18,
+            "official_filing_date": "2024-04-12T00:00:00",
+            "source_record_id": "173139f7-fce3-4058-8b88-94dcbb7be692"
+          },
+          {
+            "accepted_row_count": 13,
+            "official_filing_date": "2024-05-10T00:00:00",
+            "source_record_id": "a33e00ac-46fe-4e2f-b8ed-d8be0e4ebe33"
+          },
+          {
+            "accepted_row_count": 8,
+            "official_filing_date": "2024-06-09T00:00:00",
+            "source_record_id": "88c3e137-fe24-42c9-a65e-1370f6d2ca6f"
+          },
+          {
+            "accepted_row_count": 5,
+            "official_filing_date": "2024-07-06T00:00:00",
+            "source_record_id": "909566de-2b97-434a-aff2-decc117f92e7"
+          },
+          {
+            "accepted_row_count": 11,
+            "official_filing_date": "2024-08-13T00:00:00",
+            "source_record_id": "73a99931-0e4a-4ca0-bf62-305fc0386998"
+          },
+          {
+            "accepted_row_count": 6,
+            "official_filing_date": "2024-10-23T00:00:00",
+            "source_record_id": "a7daa704-b0e4-4069-8ee4-d2dd854a4d33"
+          },
+          {
+            "accepted_row_count": 2,
+            "official_filing_date": "2024-11-20T00:00:00",
+            "source_record_id": "b16a2be7-815a-4451-a4a7-dce671fb5e8d"
+          },
+          {
+            "accepted_row_count": 9,
+            "official_filing_date": "2024-12-20T00:00:00",
+            "source_record_id": "d9c3a185-c62f-410b-96b7-ae662334ee39"
+          },
+          {
+            "accepted_row_count": 6,
+            "official_filing_date": "2025-03-03T00:00:00",
+            "source_record_id": "379b806a-8e3a-40ff-b363-bd95b247bc38"
+          }
+        ],
+        "member_key": "RICK SCOTT",
+        "outcomes": [
+          "parsed"
+        ],
+        "parsed_reports": 31,
+        "reports_found": 31
+      }
+    }
+  },
+  "created_at": "2026-08-10T04:48:53.285077+00:00",
+  "generation": "window-2021-2025",
+  "outcome_counts": {
+    "failed": 0,
+    "paper_only": 0,
+    "parsed": 504,
+    "unavailable": 0
+  },
+  "quarantine": null,
+  "reports_found": 504,
+  "source": "senate_efd",
+  "status": "complete",
+  "summary": {
+    "failed": 0,
+    "found": 504,
+    "paper_only": 0,
+    "parsed": 504,
+    "unavailable": 0
+  },
+  "window": {
+    "end_date": "2025-06-30",
+    "start_date": "2021-01-01"
+  }
+}

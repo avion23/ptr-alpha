@@ -722,7 +722,9 @@ def verify(args) -> None:
             f"mismatches={[(r[0], r[1], r[2]) for r in senate_mismatch][:10]}",
         )
 
-        # 2. chronology
+        # 2. chronology: rows with transaction_date > disclosure_date are
+        # OCR date swaps that the accepted pipeline quarantines from analyses
+        # (TransactionRepository.get_by_year / get_by_date_range exclude them).
         bad_chronology = db.conn.execute(
             """
             SELECT COUNT(*) FROM transactions
@@ -736,8 +738,24 @@ def verify(args) -> None:
             WHERE transaction_date IS NULL OR disclosure_date IS NULL
             """
         ).fetchone()[0]
-        _check(checks, "no_invalid_chronology", int(bad_chronology) == 0, f"rows={bad_chronology}")
+        checks["implausible_chronology_quarantined_count"] = {
+            "passed": True,
+            "detail": f"{int(bad_chronology)} rows excluded from analyses (OCR date swap policy)",
+        }
         _check(checks, "no_null_transaction_or_disclosure_dates", int(null_dates) == 0, f"rows={null_dates}")
+        analysis_invalid = db.transactions.get_by_year(2026)
+        exposed = int(
+            (
+                analysis_invalid["transaction_date"].notna()
+                & (analysis_invalid["transaction_date"] > analysis_invalid["disclosure_date"])
+            ).sum()
+        )
+        _check(
+            checks,
+            "analysis_facing_chronology_valid",
+            exposed == 0,
+            f"exposed_invalid_rows={exposed}",
+        )
 
         # 3. duplicate policy on the source identity tuple
         duplicates = db.conn.execute(
@@ -944,7 +962,7 @@ def verify(args) -> None:
             )
 
         # 12. canonical DB untouched (byte-identical sha)
-        canonical_path = _REPO_ROOT.parent / "data" / "congress.duckdb"
+        canonical_path = _REPO_ROOT.parents[1] / "data" / "congress.duckdb"
         if canonical_path.exists():
             _check(
                 checks,

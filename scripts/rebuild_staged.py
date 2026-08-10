@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import date
@@ -384,10 +385,10 @@ def _house_inventory_rows(db: Database, year: int, gen: str, staging: Path) -> l
         """
         SELECT doc_id, status, raw_row_count, transaction_count, error_message
         FROM pdf_parse_runs
-        WHERE year = ? AND ingestion_generation = ? AND parser_version = ?
+        WHERE year = ? AND ingestion_generation = ?
         ORDER BY doc_id
         """,
-        [year, gen, _PARSE_VERSION],
+        [year, gen],
     ).fetchall()
     metadata = db.conn.execute(
         """
@@ -456,6 +457,12 @@ def house_parse(args) -> None:
                 print(f"house-parse {year}: skipped (already complete)")
                 continue
             result = _parse_house_year_tolerant(staging, db, year)
+            previous_result = house.get("parse_result") or {}
+            if result.get("attempted", 0) == 0 and previous_result:
+                # Resumable skip: keep the original outcome telemetry.
+                merged = dict(previous_result)
+                merged["skipped_cached"] = result.get("skipped_cached", 0) + previous_result.get("skipped_cached", 0)
+                result = merged
             unresolved = db.get_unresolved_house_doc_ids(year, gen)
             house["unresolved_doc_ids"] = unresolved
             house["resolved_doc_count"] = house["ptr_count"] - len(unresolved)
@@ -683,10 +690,9 @@ def verify(args) -> None:
                           AND t.source = 'house_pdf'
                           AND t.ingestion_generation = p.ingestion_generation) AS actual
                 FROM pdf_parse_runs p
-                WHERE p.parser_version = ? AND p.status = 'success'
+                WHERE p.status = 'success'
             ) WHERE transaction_count != actual
             """,
-            [_PARSE_VERSION],
         ).fetchall()
         _check(
             checks,
@@ -823,22 +829,28 @@ def verify(args) -> None:
                     )
         manifest["verify"] = {"incomplete_years": incomplete_years}
 
-        # 7. canonical view: complete years visible, incomplete years hidden
+        # 7. canonical view: complete generations visible, incomplete hidden
         complete_years = [y for y in HOUSE_YEARS if y not in incomplete_years]
         canonical_count = db.conn.execute(
             "SELECT COUNT(*) FROM canonical_transactions"
         ).fetchone()[0]
-        raw_house_count = db.conn.execute(
-            "SELECT COUNT(*) FROM transactions WHERE source = 'house_pdf'"
-        ).fetchone()[0]
         senate_count = db.conn.execute(
             "SELECT COUNT(*) FROM transactions WHERE source = 'senate_efd'"
         ).fetchone()[0]
+        visible_house = db.conn.execute(
+            """
+            SELECT COUNT(*) FROM transactions t
+            JOIN house_archive_generations g
+              ON g.generation_id = t.ingestion_generation
+             AND g.archive_year = EXTRACT(YEAR FROM t.disclosure_date)::INTEGER
+            WHERE t.source = 'house_pdf' AND g.parse_status = 'complete'
+            """
+        ).fetchone()[0]
         _check(
             checks,
-            "canonical_house_only_complete_years",
-            canonical_count == raw_house_count + senate_count,
-            f"canonical={canonical_count} raw_house={raw_house_count} senate={senate_count}",
+            "canonical_house_only_complete_generations",
+            canonical_count == visible_house + senate_count,
+            f"canonical={canonical_count} visible_house={visible_house} senate={senate_count}",
         )
 
         # 8. pinned canary artifact hashes in the staged corpus
@@ -1108,6 +1120,31 @@ def finalize(args) -> None:
         for year, entry in house.items()
         if entry.get("unresolved_doc_ids")
     }
+    classification = {}
+    for year, doc_ids in unresolved.items():
+        text_layer = 0
+        for doc_id in doc_ids:
+            pdf = staging / str(year) / "pdfs" / f"{doc_id}.pdf"
+            if not pdf.exists():
+                continue
+            try:
+                probe = subprocess.run(  # noqa: S603
+                    ["pdftotext", "-l", "1", str(pdf), "-"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                if probe.stdout.strip():
+                    text_layer += 1
+            except Exception:  # noqa: BLE001 -- classification is best-effort
+                continue
+        classification[str(year)] = {
+            "unresolved": len(doc_ids),
+            "with_text_layer": text_layer,
+            "image_only": len(doc_ids) - text_layer,
+        }
+    manifest["unresolved_classification"] = classification
     complete_years = sorted(
         int(year) for year, entry in house.items()
         if entry.get("parse_status") == "complete"

@@ -4,17 +4,17 @@
     "sha256": "9ec6be9263dc30aab07585d0110d2daf8568a14e4244f39d07c5b2bc130d476d"
   },
   "git": {
-    "base_revision": "6226675f36a5b7db060efa2d8ec9eedb50432dcb",
-    "branch": "audit/luna-canary-baseline-20260809",
-    "revision": "104ea8168fbdd11125202013d7957162f38752e8",
+    "base_revision": "a1829c1c397dd4fa25caff2e20a254d657b7cd4c",
+    "branch": "audit/luna-phase2-integration-20260809",
+    "revision": "83beed6138b55bebcfef116c18ca6189eb148877",
     "tree_clean": true
   },
-  "recorded_at": "2026-08-10T04:24:00+00:00",
+  "recorded_at": "2026-08-10T05:49:25+00:00",
   "schema_version": 1,
   "suite": {
     "canaries": {
       "tests/test_integration.py::TestIntegration::test_end_to_end_house_analysis": {
-        "duration_s": 0.099,
+        "duration_s": 0.108,
         "status": "passed"
       },
       "tests/test_parsing.py::TestParsing::test_real_option_canary_parses_strike_and_two_digit_expiry": {
@@ -22,11 +22,11 @@
         "status": "passed"
       },
       "tests/test_parsing.py::TestParsing::test_real_pdf_safety_canaries": {
-        "duration_s": 2.786,
+        "duration_s": 2.707,
         "status": "passed"
       },
       "tests/test_senate_efd_reconciliation.py::test_katie_britt_jpm_canary_preserves_provenance_and_normalizes_sale": {
-        "duration_s": 0.001,
+        "duration_s": 0.002,
         "status": "passed"
       },
       "tests/test_senate_efd_reconciliation.py::test_rick_scott_coupon_canary_is_non_equity_not_a_ticker": {
@@ -34,7 +34,7 @@
         "status": "passed"
       },
       "tests/test_validation.py::TestCorrectedSelection::test_all_zero_canary_has_no_deployable_config": {
-        "duration_s": 0.012,
+        "duration_s": 0.011,
         "status": "passed"
       },
       "tests/test_validation.py::TestMemberPermutationCanary::test_member_label_permutation_is_bijective_and_preserves_values": {
@@ -47,16 +47,16 @@
       }
     },
     "counts": {
-      "collected": 790,
+      "collected": 951,
       "errors": 0,
       "failed": 0,
-      "passed": 787,
-      "skipped": 3,
+      "passed": 944,
+      "skipped": 7,
       "subtests_passed": 79
     },
     "duration_range_s": [
-      18.369,
-      18.725
+      47.707,
+      47.796
     ],
     "duration_tolerance": 0.25
   }

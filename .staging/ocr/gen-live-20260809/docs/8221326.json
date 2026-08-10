@@ -1,0 +1,26 @@
+{
+  "artifact_sha256": "adbb2422df7a789bed852b5b6a319be744eea57b55802c17df8ecddd522b8a87",
+  "canary": {
+    "actual": null,
+    "detail": "",
+    "doc_id": "8221326",
+    "expected": null,
+    "passed": null
+  },
+  "covered_pages": [
+    1,
+    2,
+    3
+  ],
+  "doc_id": "8221326",
+  "engine": "local_tesseract",
+  "extracted_at": "2026-08-10T00:44:46-03:00",
+  "page_count": 3,
+  "parser_version": "1.0.0",
+  "reasons": [],
+  "row_count": 51,
+  "rows_file": "rows/8221326.jsonl",
+  "rows_file_sha256": "d78ab0fa2359ef637f0661b059582465c81191449908f39b89701af929bcbbbc",
+  "status": "resolved",
+  "uncovered_pages": []
+}

@@ -1,0 +1,33 @@
+{
+  "artifact_sha256": "737955c7c26c497eda37f4378e1af51409b6231204a82d7ae2c3f25c10e0ae84",
+  "canary": {
+    "actual": {
+      "asset_fragment": "richmond va sra",
+      "row_count": 9,
+      "transaction_date": "04/08/26"
+    },
+    "detail": "",
+    "doc_id": "9115813",
+    "expected": {
+      "asset_fragment": "richmond",
+      "row_count": 9,
+      "transaction_date": "04/15/26"
+    },
+    "passed": true
+  },
+  "covered_pages": [
+    1,
+    2
+  ],
+  "doc_id": "9115813",
+  "engine": "local_tesseract",
+  "extracted_at": "2026-08-10T00:44:46-03:00",
+  "page_count": 2,
+  "parser_version": "1.0.0",
+  "reasons": [],
+  "row_count": 9,
+  "rows_file": "rows/9115813.jsonl",
+  "rows_file_sha256": "1dccaee70b473ac04624522f3318ff2199eb2218038f8c20ca49552531a21d3a",
+  "status": "resolved",
+  "uncovered_pages": []
+}

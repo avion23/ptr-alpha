@@ -43,6 +43,60 @@ class TestEnvTunables(unittest.TestCase):
 
 
 
+class TestNoTxsPolicy(unittest.TestCase):
+    """Terminal no_txs requires nothing-to-report evidence on EVERY page;
+    cover-only documents stay unresolved (fail-closed)."""
+
+    def test_all_nothing_to_report_is_no_txs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            ocr.stage_document(
+                out,
+                {
+                    "doc_id": "x1", "year": 2015, "status": "no_txs",
+                    "artifact_sha256": "s", "page_count": 2,
+                    "covered_pages": [1, 2], "uncovered_pages": [],
+                    "row_count": 0, "rows": [],
+                    "reasons": ["page 1: reports no transactions",
+                                "page 2: reports no transactions",
+                                "filing reports no transactions (nothing-to-report pages: 2/2)"],
+                    "engines": ["docling", "tesseract"], "canary": None,
+                    "elapsed_s": 1.0,
+                },
+            )
+            ocr.write_manifest(out, kind="sweep", data_dir="/tmp/d")
+            mf = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(mf["no_txs_count"], 1)
+            self.assertIn("x1", mf["no_txs"])
+
+    def test_cover_only_doc_is_not_no_txs(self):
+        # A doc whose only evidence is cover-classified pages must not be
+        # terminal no_txs; simulate the envelope a cover-only doc would have
+        # produced under the fixed rule: status unresolved with the reason.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            ocr.stage_document(
+                out,
+                {
+                    "doc_id": "x2", "year": 2015, "status": "unresolved",
+                    "artifact_sha256": "s", "page_count": 1,
+                    "covered_pages": [], "uncovered_pages": [1],
+                    "row_count": 0, "rows": [],
+                    "reasons": ["page 1: cover page (no transaction rows)",
+                                "zero transactions unconfirmed: all pages cover-classified (filer block only, no readable rows)"],
+                    "engines": ["docling", "tesseract"], "canary": None,
+                    "elapsed_s": 1.0,
+                },
+            )
+            ocr.write_manifest(out, kind="sweep", data_dir="/tmp/d")
+            mf = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(mf["no_txs_count"], 0)
+            self.assertEqual(mf["unresolved_count"], 1)
+            self.assertIn("x2", mf["unresolved"])
+
+
+
+
 class TestNormalizeIsoDate(unittest.TestCase):
     def test_slash_and_dash_separators(self):
         self.assertEqual(ocr._normalize_iso_date("3-31-26"), "2026-03-31")

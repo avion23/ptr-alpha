@@ -732,20 +732,37 @@ def process_document(
     if not ordered and cascade_rows:
         ordered = cascade_rows
     if not ordered and not uncovered:
-        # Docling/tesseract agree the document has no transactions.
-        if no_tx_pages or cover_pages:
+        # Zero rows on every page.  Terminal no_txs requires explicit
+        # nothing-to-report evidence on EVERY page; cover-classified pages
+        # (filer block only) are NOT zero-transaction evidence — a faint
+        # one-page PTR that OCR cannot read looks exactly like a cover page
+        # (82 of the staged 2015 no_txs docs were Gemini-resolved), so a
+        # cover-only document stays unresolved (fail-closed, left for
+        # Gemini/review) instead of being retired.
+        all_no_tx = bool(no_tx_pages) and not cover_pages and (
+            len(no_tx_pages) == page_count
+        )
+        if all_no_tx:
             result["status"] = "no_txs"
-            result["covered_pages"] = sorted(
-                set(no_tx_pages) | set(cover_pages)
-            )
+            result["covered_pages"] = sorted(no_tx_pages)
             result["uncovered_pages"] = []
             result["reasons"].extend(sorted(page_notes))
             result["reasons"].append(
                 "filing reports no transactions "
-                f"(nothing-to-report/cover pages: {len(no_tx_pages) + len(cover_pages)}/{page_count})"
+                f"(nothing-to-report pages: {len(no_tx_pages)}/{page_count})"
             )
             result["elapsed_s"] = round(time.time() - started, 2)
             return result
+        if cover_pages and not no_tx_pages:
+            result["reasons"].append(
+                "zero transactions unconfirmed: all pages cover-classified "
+                "(filer block only, no readable rows)"
+            )
+        elif cover_pages:
+            result["reasons"].append(
+                "zero transactions unconfirmed: cover pages present without "
+                "nothing-to-report evidence on every page"
+            )
         uncovered = list(range(1, page_count + 1))
 
     valid_rows, rejections = _local_validate(ordered)

@@ -1143,7 +1143,11 @@ def run_sweep(args) -> int:
     for result in _run_pool(items, args.workers):
         results.append(result)
         completed += 1
+        # Incremental staging: every doc is durably staged as it completes so
+        # progress survives crashes and --skip-staged resumes exactly.
+        stage_document(out_root, result)
         if completed % 10 == 0 or completed == len(items):
+            write_manifest(out_root, kind="sweep", data_dir=args.data_dir)
             resolved = sum(1 for r in results if r["status"] == "resolved")
             no_txs = sum(1 for r in results if r["status"] == "no_txs")
             rows = sum(r["row_count"] for r in results)
@@ -1155,8 +1159,6 @@ def run_sweep(args) -> int:
                 f"rows={rows} elapsed={elapsed:.0f}s eta={remaining/3600:.1f}h",
                 flush=True,
             )
-    for result in results:
-        stage_document(out_root, result)
     write_manifest(out_root, kind="sweep", data_dir=args.data_dir)
 
     resolved = sum(1 for r in results if r["status"] == "resolved")

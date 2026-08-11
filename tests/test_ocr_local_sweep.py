@@ -552,5 +552,128 @@ class TestOldFormDoclingDataframe(unittest.TestCase):
         )
 
 
+
+class TestRunPoolStreaming(unittest.TestCase):
+    """_run_pool must stream per-doc results (imap_unordered), never hold
+    them until batch end like pool.map (which stalled staging on slow
+    stragglers)."""
+
+    def test_imap_unordered_streams_results(self):
+        class FakePool:
+            def __init__(self, workers):
+                self.workers = workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def imap_unordered(self, fn, items):
+                for item in items:
+                    yield fn(item)
+
+            def map(self, fn, items):  # pragma: no cover -- must not be used
+                raise AssertionError("pool.map would stage only at batch end")
+
+        original_pool = ocr.Pool
+        ocr.Pool = FakePool
+        try:
+            items = [
+                ("d1", 2015, "p1.pdf", {}),
+                ("d2", 2015, "p2.pdf", {}),
+                ("d3", 2015, "p3.pdf", {}),
+            ]
+            got = list(ocr._run_pool(items, 2))
+            self.assertEqual([r["doc_id"] for r in got], ["d1", "d2", "d3"])
+        finally:
+            ocr.Pool = original_pool
+
+
+class TestRunSweepIncrementalStaging(unittest.TestCase):
+    """run_sweep stages every doc the moment its result streams in, not at
+    batch end (durable incremental progress)."""
+
+    def test_per_doc_staging_happens_before_next_result(self):
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        staged_calls = []
+
+        def fake_process_one(item):
+            doc_id, year, pdf, meta = item
+            return {
+                "doc_id": doc_id,
+                "year": year,
+                "status": "resolved" if doc_id != "d2" else "unresolved",
+                "row_count": 1,
+                "reasons": [],
+                "rows": [{"asset_description": "X (TICK)", "transaction_date": "01/02/2015"}],
+                "canary": None,
+            }
+
+        class FakeStreamPool:
+            def __init__(self, workers):
+                self.workers = workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def imap_unordered(self, fn, items):
+                for item in items:
+                    yield fn(item)
+                    # The caller must have staged this doc before asking for
+                    # the next result -- i.e. staging is incremental, not
+                    # deferred to batch end.
+                    doc_id = item[0]
+                    if doc_id not in [c[0] for c in staged_calls]:
+                        raise AssertionError(
+                            f"doc {doc_id} not staged before next result was pulled"
+                        )
+
+            def map(self, fn, items):  # pragma: no cover
+                raise AssertionError("pool.map must not be used")
+
+        original_pool = ocr.Pool
+        original_process_one = ocr._process_one
+        original_load_input = ocr.load_input_list
+        original_load_meta = ocr.load_metadata
+        original_stage = ocr.stage_document
+        original_manifest = ocr.write_manifest
+        ocr.Pool = FakeStreamPool
+        ocr._process_one = fake_process_one
+        ocr.load_input_list = lambda manifest, data_dir: [
+            ("d1", 2015, "p1.pdf"), ("d2", 2015, "p2.pdf"), ("d3", 2015, "p3.pdf"),
+        ]
+        ocr.load_metadata = lambda db: {}
+        ocr.stage_document = lambda out, result: staged_calls.append(
+            (result["doc_id"], out)
+        )
+        ocr.write_manifest = lambda *a, **kw: None
+        try:
+            import tempfile  # noqa: PLC0415
+
+            with tempfile.TemporaryDirectory() as tmp:
+                args = SimpleNamespace(
+                    out=tmp, merge_only=False, data_dir="/tmp/data",
+                    db="/tmp/congress.duckdb", manifest="/tmp/manifest.json",
+                    years=None, workers=2, skip_staged=False, max_docs=None,
+                )
+                rc = ocr.run_sweep(args)
+                self.assertEqual(rc, 0)
+                self.assertEqual(
+                    [c[0] for c in staged_calls], ["d1", "d2", "d3"]
+                )
+        finally:
+            ocr.Pool = original_pool
+            ocr._process_one = original_process_one
+            ocr.load_input_list = original_load_input
+            ocr.load_metadata = original_load_meta
+            ocr.stage_document = original_stage
+            ocr.write_manifest = original_manifest
+
+
 if __name__ == "__main__":
     unittest.main()

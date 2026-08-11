@@ -102,7 +102,7 @@ ENGINE = "local_docling_tesseract"
 PARSER_VERSION = "v1-local-docling-tesseract"
 SOURCE = "local_ocr"
 CHAMBER = "house"
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 
 # Tunable hyperparameters (env-overridable so sibling workers can tune/run
 # the same sweep against the same staging root; defaults are the values the
@@ -1269,16 +1269,21 @@ def staged_docs(out_root: str | Path) -> set[str]:
     return staged
 
 
-def _run_pool(items, workers: int) -> list[dict]:
-    """Run the worker pool; a worker death (e.g. OOM kill) aborts the batch.
+def _run_pool(items, workers: int):
+    """Stream per-doc results as workers finish them (imap_unordered).
 
-    Completed documents were already staged incrementally by the caller, so
-    an abort here only wastes the in-flight documents; the next watchdog
-    cycle resumes exactly with --skip-staged.
+    pool.map would hold every result until the whole batch finishes, so
+    staging (done by the caller for each yielded result) only happened at
+    batch end and a slow straggler stalled all completed work.  Yielding
+    from imap_unordered lets the caller stage each doc atomically the
+    moment it completes: durable incremental progress, no straggler stall.
+    A worker death (e.g. OOM kill) aborts the stream; completed documents
+    were already staged, so the next cycle resumes exactly with
+    --skip-staged.
     """
     try:
         with Pool(workers) as pool:
-            return pool.map(_process_one, items)
+            yield from pool.imap_unordered(_process_one, items)
     except (BrokenPipeError, EOFError, ConnectionResetError) as exc:
         print(
             f"SWEEP pool aborted: {exc.__class__.__name__}: {exc} "

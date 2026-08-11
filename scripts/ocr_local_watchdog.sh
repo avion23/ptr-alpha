@@ -35,6 +35,9 @@ for CYCLE in $(seq 1 $MAX_CYCLES); do
   done
   $PY scripts/ocr_local_sweep.py sweep --merge-only --out "$OUT" \
     --data-dir "$DATA" --db "$DB" --manifest "$MANIFEST" >> "$LOG" 2>&1
+  # Reconcile no_txs evidence on the shared root (older sweep instances stage
+  # cover-classified docs as no_txs; those must stay unresolved fail-closed).
+  $PY scripts/ocr_local_reclassify_no_txs.py --out "$OUT" >> "$LOG" 2>&1
   STAGED=$(ls "$OUT/docs/" 2>/dev/null | wc -l | tr -d " ")
   echo "=== cycle $CYCLE staged=$STAGED/$TARGET $(date +%H:%M:%S) ===" | tee -a "$LOG"
   if [ "$STAGED" -ge "$TARGET" ]; then

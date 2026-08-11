@@ -1089,8 +1089,22 @@ def staged_docs(out_root: str | Path) -> set[str]:
 
 
 def _run_pool(items, workers: int) -> list[dict]:
-    with Pool(workers) as pool:
-        return pool.map(_process_one, items)
+    """Run the worker pool; a worker death (e.g. OOM kill) aborts the batch.
+
+    Completed documents were already staged incrementally by the caller, so
+    an abort here only wastes the in-flight documents; the next watchdog
+    cycle resumes exactly with --skip-staged.
+    """
+    try:
+        with Pool(workers) as pool:
+            return pool.map(_process_one, items)
+    except (BrokenPipeError, EOFError, ConnectionResetError) as exc:
+        print(
+            f"SWEEP pool aborted: {exc.__class__.__name__}: {exc} "
+            "(worker process died; staged docs are durable, resume with --skip-staged)",
+            flush=True,
+        )
+        raise
 
 
 def _process_one(item) -> dict:

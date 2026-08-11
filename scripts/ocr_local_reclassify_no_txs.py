@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Reclassify staged no_txs envelopes that lack nothing-to-report evidence.
+
+The v1 no_txs rule treated cover-classified pages (filer block only) as
+zero-transaction evidence; 82 of the first 120 staged 2015 no_txs docs were
+Gemini-resolved one-page PTRs that local OCR simply could not read.  The
+fixed rule (commit bf8cebe) requires explicit nothing-to-report evidence on
+EVERY page for terminal no_txs.
+
+This pass rewrites already-staged envelopes (rows are empty for no_txs, so
+only docs/<doc>.json changes), then reassembles manifest.json.  Safe to
+re-run; only touches no_txs docs.
+
+Usage:
+    python scripts/ocr_local_reclassify_no_txs.py --out .staging/ocr2-local/gen-live-20260810
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.ocr_local_sweep import write_manifest  # noqa: E402
+
+REASON_NOTHING = "reports no transactions"
+REASON_COVER = "cover page (no transaction rows)"
+
+
+def reclassify_no_txs(out_root: str | Path) -> dict:
+    out_root = Path(out_root)
+    docs_dir = out_root / "docs"
+    demoted = []
+    kept = []
+    for envelope_path in sorted(docs_dir.glob("*.json")):
+        envelope = json.loads(envelope_path.read_text())
+        if envelope.get("status") != "no_txs":
+            continue
+        doc_id = envelope["doc_id"]
+        page_count = int(envelope.get("page_count") or 0)
+        reasons = envelope.get("reasons") or []
+        nothing_pages = sum(
+            1 for r in reasons if REASON_NOTHING in r
+        )
+        cover_pages = sum(1 for r in reasons if REASON_COVER in r)
+        all_nothing = nothing_pages == page_count and cover_pages == 0 and page_count > 0
+        if all_nothing:
+            kept.append(doc_id)
+            continue
+        envelope["status"] = "unresolved"
+        envelope["uncovered_pages"] = list(range(1, page_count + 1))
+        envelope["covered_pages"] = []
+        if "reclassified" not in envelope.get("reasons", []):
+            envelope.setdefault("reasons", []).append(
+                "reclassified: cover pages are not zero-transaction evidence "
+                f"(nothing-to-report {nothing_pages}/{page_count}, cover {cover_pages})"
+            )
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{doc_id}.", dir=str(docs_dir))
+        try:
+            with __import__("os").fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(envelope, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                __import__("os").fsync(handle.fileno())
+            __import__("os").replace(tmp_name, envelope_path)
+        finally:
+            try:
+                __import__("os").unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+        demoted.append(doc_id)
+    write_manifest(out_root, kind="sweep", data_dir=out_root)
+    return {"demoted": demoted, "kept": kept}
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", required=True, help="shared staging root")
+    args = parser.parse_args(argv)
+    result = reclassify_no_txs(args.out)
+    print(f"reclassify: demoted {len(result['demoted'])} -> unresolved; kept {len(result['kept'])} no_txs")
+    if result["demoted"]:
+        print("demoted sample:", result["demoted"][:10])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

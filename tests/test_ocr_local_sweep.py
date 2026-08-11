@@ -361,6 +361,102 @@ class TestStagingManifest(unittest.TestCase):
             self.assertTrue((out / "docs" / "9115808.json").exists())
 
 
+class TestDoclingDataframeMapping(unittest.TestCase):
+    """Old-form PTR column layout -> tx dicts via Docling structured tables.
+
+    Guards the mapping that fixes the 2015-2020 scans the markdown text
+    path cannot read (20002501 et al.): ticker from the Asset parenthetical,
+    transaction type from the P/S/E letter (merged account residue
+    tolerated), transaction/notification dates, and the amount range.
+    """
+
+    @staticmethod
+    def _df(data):
+        import pandas as pd  # noqa: PLC0415
+
+        return pd.DataFrame(
+            data,
+            columns=[
+                "iD", "owner", "asset", "transaction type",
+                "Date", "notification Date", "amount",
+            ],
+        )
+
+    def test_old_form_rows_mapped(self):
+        df = self._df(
+            [
+                ["", "", "Cerner Corporation (CERN) F IlINg S TaTuS : New",
+                 "P aCCoUNTS", "02/3/2015", "02/5/2015", "$1,001 - $15,000"],
+                ["", "", "Fossil group, Inc. (FoSL) F IlINg S TaTuS : New",
+                 "aCCoUNTS", "01/27/2015", "02/5/2015", "$1,001 - $15,000"],
+            ]
+        )
+        rows = ocr._dataframe_rows(df, 1)
+        self.assertEqual(len(rows), 2)
+        first = rows[0]
+        self.assertEqual(first["asset_description"], "Cerner Corporation (CERN)")
+        self.assertEqual(first["transaction_type"], "Purchase")
+        self.assertEqual(first["transaction_date"], "02/3/2015")
+        self.assertEqual(first["notification_date"], "02/5/2015")
+        self.assertEqual(first["amount_midpoint"], 8000.5)
+        self.assertEqual(first["page_number"], 1)
+        # OCR dropped the type letter on the second row -> NULL type, kept.
+        self.assertIsNone(rows[1]["transaction_type"])
+        self.assertEqual(rows[1]["asset_description"], "Fossil group, Inc. (FoSL)")
+
+    def test_checkbox_layout_rejected(self):
+        # 2026-style grid: distinct per-column type/amount headers, no
+        # parenthetical tickers or dollar cells -> must map to nothing so
+        # the tesseract fallback (which produces the pinned canaries)
+        # keeps running.
+        import pandas as pd  # noqa: PLC0415
+
+        df = pd.DataFrame(
+            [
+                ["", "FULL ASSET NAME", "Type of transaction.Purchase",
+                 "Type of transaction.Sale", "Date of Transaction",
+                 "Date Notified of Transaction", "Amount of Transaction.B"],
+                ["×", "North TX WY Auth Rev BE/R Municipal Bond",
+                 "×", "", "4/9/2026", "4/29/2026", ""],
+                ["×", "Kentucky ST PPTY & BLDG SVC REV BE/R Municipal",
+                 "", "×", "4/9/2026", "4/29/2026", "×"],
+            ]
+        )
+        self.assertEqual(ocr._dataframe_rows(df, 2), [])
+
+    def test_degenerate_table_rejected(self):
+        import pandas as pd  # noqa: PLC0415
+
+        self.assertEqual(ocr._dataframe_rows(pd.DataFrame([["h"]], columns=["x"]), 1), [])
+        self.assertEqual(ocr._dataframe_rows(pd.DataFrame(), 1), [])
+
+    def test_letter_type_without_parenthetical_ticker_maps(self):
+        # 20002425-style row: no parenthetical ticker but a P/S/E type
+        # letter and dollar range -> old-form evidence, must map (the
+        # Gemini ground truth for 20002425 is Sale/2014-12-19/G).
+        df = self._df(
+            [
+                ["", "sP", "CaMPR Partners limited", "s", "12/19/2014",
+                 "12/22/2014", "$1,000,001 - $5,000,000"],
+            ]
+        )
+        rows = ocr._dataframe_rows(df, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["transaction_type"], "Sale")
+        self.assertEqual(rows[0]["transaction_date"], "12/19/2014")
+        self.assertEqual(rows[0]["amount_midpoint"], 3000000.5)
+        self.assertEqual(rows[0]["notification_date"], "12/22/2014")
+
+    def test_residue_only_row_dropped(self):
+        df = self._df(
+            [
+                ["", "", "F IlINg S TaTuS : New D ESCRIPTIoN : note text",
+                 "S", "12/19/2014", "12/22/2014", "$1,000,001 - $5,000,000"],
+            ]
+        )
+        self.assertEqual(ocr._dataframe_rows(df, 1), [])
+
+
 class TestDoclingMarkdownParsing(unittest.TestCase):
     def test_pipe_table_parsing_with_residue(self):
         md = (
@@ -408,6 +504,52 @@ class TestRealCanaries(unittest.TestCase):
             )
             self.assertEqual(result["status"], "resolved", doc_id)
             self.assertFalse(result["uncovered_pages"], doc_id)
+
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PTR_OCR_CANARY_DATA"),
+    reason="set PTR_OCR_CANARY_DATA (staged gen dir) to run real canaries",
+)
+class TestOldFormDoclingDataframe(unittest.TestCase):
+    """Pinned scenario: old-form column-layout page read via Docling's
+    structured dataframe.
+
+    Real 20002501.pdf (2015 House PTR, scans/old form) has 7 transactions
+    on page 1 that the markdown text path cannot read (0 rows pre-fix:
+    the merged account text in the Transaction Type cell defeats
+    _extract_transaction_type).  Docling's structured table maps them with
+    ticker from the Asset parenthetical, type, dates and amount range; the
+    page must yield >=5 rows carrying ticker + transaction date + amount.
+    """
+
+    DATA_DIR = os.environ.get("PTR_OCR_CANARY_DATA", "")
+
+    def test_old_form_page_yields_five_plus_rows(self):
+        pdf = Path(self.DATA_DIR) / "2015" / "pdfs" / "20002501.pdf"
+        self.assertTrue(pdf.exists(), f"missing {pdf}")
+        pages, err = ocr.docling_pages(pdf)
+        self.assertIsNone(err)
+        rows = [tx for page in pages for tx in page["rows"]]
+        self.assertGreaterEqual(
+            len(rows), 5,
+            f"20002501 old-form rows from Docling dataframe: {len(rows)}",
+        )
+        complete = [
+            tx for tx in rows
+            if ocr.extract_ticker(tx["asset_description"])
+            and ocr._normalize_iso_date(tx.get("transaction_date"))
+            and tx.get("amount_midpoint")
+        ]
+        self.assertGreaterEqual(
+            len(complete), 5,
+            f"rows with ticker+date+amount: {len(complete)} of {len(rows)}",
+        )
+        # every mapped row must carry the parenthetical ticker the task's
+        # mapping is built on (CERN/FOSL/JEC/PCP/SLH/TCBI)
+        self.assertTrue(
+            all(ocr.extract_ticker(tx["asset_description"]) for tx in rows)
+        )
 
 
 if __name__ == "__main__":

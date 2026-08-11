@@ -14,9 +14,13 @@ cascade, scripts/reparse_all.py + src/analyzer/parser_cascade.py):
         (effective 600 dpi);
     (2) Docling OCR (extract_tables_with_docling semantics; runs in-process
         under the /opt/homebrew/bin/python3.14 env where docling 2.x is
-        installed; PTR_SKIP_DOCLING is left unset).  Markdown is exported
-        with a form-feed page-break placeholder so every table is attributed
-        to its 1-based PDF page;
+        installed; PTR_SKIP_DOCLING is left unset).  Per page, Docling's
+        structured table (TableItem.export_to_dataframe()) is the primary
+        source, mapped through the old-form PTR column layout (ticker from
+        the Asset parenthetical, transaction type, transaction/notification
+        dates, amount range); the markdown text path is used only for pages
+        Docling reports no table (markdown is still exported with a
+        form-feed page-break placeholder so segments map 1:1 to PDF pages);
     (3) preprocessed Tesseract fallback per uncovered page: scan_ocr's
         accepted dpi-pinned + no-pHYs extraction variants first (these are
         the variants the pinned 2026 canaries were derived from), then the
@@ -98,7 +102,7 @@ ENGINE = "local_docling_tesseract"
 PARSER_VERSION = "v1-local-docling-tesseract"
 SOURCE = "local_ocr"
 CHAMBER = "house"
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 
 # Tunable hyperparameters (env-overridable so sibling workers can tune/run
 # the same sweep against the same staging root; defaults are the values the
@@ -156,6 +160,9 @@ from scripts.scan_ocr import (  # noqa: E402
 )
 from scripts.ocr_zero_rows import extract_ticker, resolve_ticker  # noqa: E402
 from analyzer.parsing import (  # noqa: E402
+    _extract_amount_midpoint,
+    _extract_date,
+    _extract_transaction_type,
     _parse_docling_markdown,
     _parse_markdown_tables,
     parse_pdf_table,
@@ -217,6 +224,136 @@ def _strip_filing_residue(asset: str) -> str:
     if not match:
         return asset
     return asset[: match.start()].strip(" -|")
+
+
+# --------------------------------------------------------------------------
+# Docling structured-table mapping (old-form PTR column layout)
+# --------------------------------------------------------------------------
+
+_HEADER_NORM_RE = re.compile(r"[^a-z0-9]+")
+_TICKER_CELL_RE = re.compile(r"\([A-Za-z][A-Za-z0-9.\-]{0,5}\)")
+# Repeated-header rows docling sometimes leaves inside the data ("FULL ASSET
+# NAME Provide full name, not ticker symbol") must not map as transactions.
+_HEADER_LIKE_ASSET_RE = re.compile(
+    r"asset\s*name|provide\s*full\s*name|not\s*ticker\s*symbol",
+    re.IGNORECASE,
+)
+_DOLLAR_CELL_RE = re.compile(r"\$[\d,]+")
+_STRICT_DATE_CELL_RE = re.compile(
+    r"\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}"
+)
+
+
+def _extract_tx_type_cell(cell: str | None) -> str | None:
+    """Transaction type from a type cell, tolerating the merged account
+    residue of the old forms ("P aCCoUNTS", "S INVESTMENT aCCoUNTS"): the
+    leading P/S/E letter is the type and the account text is discarded."""
+    tx_type = _extract_transaction_type(cell)
+    if tx_type:
+        return tx_type
+    raw = str(cell or "").strip()
+    first_token = raw.split(" ", 1)[0]
+    if first_token and first_token != raw:
+        return _extract_transaction_type(first_token)
+    return None
+
+
+def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
+    """Map one Docling structured-table dataframe to PTR tx dicts.
+
+    Accepts only the old-form column layout (Asset with parenthetical
+    ticker, Transaction Type, Transaction Date, Notification Date, Amount
+    range).  Returns [] for any other layout -- checkbox-style 2026 grids
+    (distinct per-column type/amount headers, no parenthetical tickers or
+    dollar ranges in the cells) and degenerate tables -- so the page stays
+    uncovered and the tesseract/cascade fallbacks reproduce the pre-fix
+    behaviour byte for byte (the pinned 2026 canaries are all produced by
+    tesseract and must not regress).
+    """
+    headers = [_HEADER_NORM_RE.sub("", str(column).casefold()) for column in dataframe.columns]
+    if not len(dataframe):  # degenerate empty table
+        return []
+    asset_cols = [i for i, h in enumerate(headers) if "asset" in h]
+    type_cols = [i for i, h in enumerate(headers) if "type" in h]
+    amount_cols = [i for i, h in enumerate(headers) if "amount" in h]
+    date_cols = [
+        i for i, h in enumerate(headers)
+        if "date" in h and "notification" not in h
+    ]
+    if not asset_cols or not type_cols or not amount_cols or not date_cols:
+        return []
+    # Checkbox layouts carry distinct per-column headers (Purchase/Sale/
+    # Exchange, lettered amount ranges) -- reject so the pinned canaries
+    # keep their tesseract-produced rows.
+    if len({headers[i] for i in type_cols}) > 1:
+        return []
+    if len({headers[i] for i in amount_cols}) > 1:
+        return []
+    asset_col = asset_cols[0]
+    type_col = type_cols[0]
+    amount_col = amount_cols[0]
+    date_col = next((i for i in date_cols if i != type_col), None)
+    if date_col is None:
+        return []
+    notif_cols = [i for i, h in enumerate(headers) if "notification" in h]
+    notif_col = notif_cols[0] if notif_cols else None
+
+    # Data gate: only map pages whose rows carry the old-form evidence --
+    # (>=1 parenthetical ticker OR >=1 P/S/E type letter) AND >=1 dollar
+    # range AND >=1 strict date.  This is what separates old-form scans
+    # (parenthetical tickers, lettered types, dollar ranges) from
+    # checkbox-style 2026 grids (x-marks only).  Docling dataframes carry
+    # the header in .columns, so row 0 is the first data row and must be
+    # scanned too.
+    seen_ticker = seen_letter = seen_dollar = seen_date = False
+    for row_index in range(len(dataframe)):
+        asset = _strip_filing_residue(str(dataframe.iat[row_index, asset_col] or ""))
+        if _TICKER_CELL_RE.search(asset):
+            seen_ticker = True
+        if _extract_tx_type_cell(str(dataframe.iat[row_index, type_col] or "")):
+            seen_letter = True
+        if _DOLLAR_CELL_RE.search(str(dataframe.iat[row_index, amount_col] or "")):
+            seen_dollar = True
+        if _STRICT_DATE_CELL_RE.search(str(dataframe.iat[row_index, date_col] or "")):
+            seen_date = True
+        if (seen_ticker or seen_letter) and seen_dollar and seen_date:
+            break
+    if not ((seen_ticker or seen_letter) and seen_dollar and seen_date):
+        return []
+
+    rows: list[dict] = []
+    for row_index in range(len(dataframe)):
+        asset_raw = str(dataframe.iat[row_index, asset_col] or "")
+        if _HEADER_LIKE_ASSET_RE.search(asset_raw):
+            continue  # stray repeated header row inside the data
+        asset = _strip_filing_residue(asset_raw)
+        if not asset:
+            continue
+        asset = re.sub(r"\s+", " ", asset).strip()[:500]
+        amount_raw, amount_midpoint = _extract_amount_midpoint(
+            str(dataframe.iat[row_index, amount_col] or "")
+        )
+        notif_raw = (
+            str(dataframe.iat[row_index, notif_col] or "")
+            if notif_col is not None
+            else ""
+        )
+        rows.append({
+            "asset_description": asset,
+            "transaction_type": _extract_tx_type_cell(
+                str(dataframe.iat[row_index, type_col] or "")
+            ),
+            "transaction_date": _extract_date(
+                str(dataframe.iat[row_index, date_col] or "")
+            ),
+            "notification_date": _extract_date(notif_raw),
+            "notification_date_raw": notif_raw,
+            "owner_code": None,
+            "amount_raw": amount_raw,
+            "amount_midpoint": amount_midpoint,
+            "page_number": page_number,
+        })
+    return rows
 
 # --------------------------------------------------------------------------
 # PDF / image helpers
@@ -286,15 +423,23 @@ _CONVERTER = None
 def docling_pages(pdf_path: str | Path) -> tuple[list[dict], str | None]:
     """Docling OCR, one table-row set per 1-based PDF page.
 
-    Uses the installed docling (python3.14 env) in-process and exports
-    markdown with a form-feed page-break placeholder so segments map 1:1 to
-    PDF pages.  Returns ``(pages, error)`` where each page dict is
+    Primary source per page is Docling's structured table
+    (``TableItem.export_to_dataframe()``) mapped through the old-form PTR
+    column layout (Asset with parenthetical ticker, Transaction Type,
+    transaction/notification dates, amount range).  The markdown text path
+    is kept ONLY for pages Docling reports no table; pages whose structured
+    table is not the old-form layout (checkbox-style 2026 grids, degenerate
+    tables) yield no docling rows and the existing tesseract/cascade
+    fallbacks take over unchanged, exactly as before.
+
+    Returns ``(pages, error)`` where each page dict is
     ``{"page": int, "rows": [tx dict], "text": str}``.
     """
     try:
         result = _docling_converter().convert(str(pdf_path))
         document = result.document
         markdown = document.export_to_markdown(page_break_placeholder="\f")
+        doc_tables = list(document.tables or [])
     except Exception as exc:  # noqa: BLE001 -- fail-closed boundary
         return [], f"docling:{type(exc).__name__}:{exc}"
 
@@ -308,18 +453,37 @@ def docling_pages(pdf_path: str | Path) -> tuple[list[dict], str | None]:
         ]
         text = " ".join(text_lines).casefold()
         rows: list[dict] = []
-        tables = _parse_docling_markdown(segment) or _parse_markdown_tables(segment)
-        for table in tables:
-            for tx in parse_pdf_table(table):
-                asset = _strip_filing_residue(
-                    str(tx.get("asset_description") or "").strip()
-                )
-                if not asset:
+        page_tables = [
+            table
+            for table in doc_tables
+            if page_number in {item.page_no for item in table.prov}
+        ]
+        if page_tables:
+            # Structured-dataframe path (primary): only the old-form layout
+            # maps; everything else returns [] so the page stays uncovered
+            # and tesseract/cascade handle it exactly as before the fix.
+            for table in page_tables:
+                try:
+                    dataframe = table.export_to_dataframe(doc=document)
+                except Exception:  # noqa: BLE001 -- per-table fail-closed
                     continue
-                tx["asset_description"] = asset
-                tx["page_number"] = page_number
-                tx["_engine"] = "docling"
-                rows.append(tx)
+                for tx in _dataframe_rows(dataframe, page_number):
+                    tx["_engine"] = "docling"
+                    rows.append(tx)
+        else:
+            # Docling reports no table on this page -> markdown text path.
+            tables = _parse_docling_markdown(segment) or _parse_markdown_tables(segment)
+            for table in tables:
+                for tx in parse_pdf_table(table):
+                    asset = _strip_filing_residue(
+                        str(tx.get("asset_description") or "").strip()
+                    )
+                    if not asset:
+                        continue
+                    tx["asset_description"] = asset
+                    tx["page_number"] = page_number
+                    tx["_engine"] = "docling"
+                    rows.append(tx)
         pages.append({"page": page_number, "rows": rows, "text": text})
     return pages, None
 
@@ -534,8 +698,8 @@ def build_row(
         "transaction_type": tx_type,
         "transaction_date": tx_date,
         "transaction_date_raw": str(tx.get("transaction_date") or ""),
-        "notification_date": None,
-        "notification_date_raw": None,
+        "notification_date": _normalize_iso_date(tx.get("notification_date")),
+        "notification_date_raw": str(tx.get("notification_date_raw") or ""),
         "amount_raw": amount_raw,
         "amount_midpoint": amount_midpoint,
         "owner_code": tx.get("owner_code"),

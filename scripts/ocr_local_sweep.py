@@ -58,6 +58,14 @@ any doc they cover: 9115808=1 row/1 page, 9115813=9 rows/2 pages,
 9116141=134 rows/6 pages, 8221322=56 pages with >=18 rows on page 2.  A
 missed canary exits nonzero (explicit fail-closed).
 
+Tunable hyperparameters (env, read at import; defaults are the canary-
+validated values): OCR2_RENDER_DPI (300), OCR2_PREPROCESS_SCALE (2.0),
+OCR2_PREPROCESS_MEDIAN (3), OCR2_PREPROCESS_AUTOCONTRAST (1),
+OCR2_DOCLING_ENABLED (1), OCR2_CASCADE_ENABLED (1), OCR2_TESSERACT_PSM (3),
+OCR2_TESSERACT_PSM_SPARSE (11), OCR2_WORKERS (3).  Sibling workers may join
+the same staging root: per-doc writes are atomic and --skip-staged replays
+only the remainder.
+
 The real DB and main checkout are never written.  The rebuild2 staged
 generation (gen-live-20260809) is read only.
 
@@ -85,10 +93,56 @@ from datetime import date, datetime, timedelta
 from multiprocessing import Pool
 from pathlib import Path
 
+GENERATION = "gen-live-20260810"
+ENGINE = "local_docling_tesseract"
+PARSER_VERSION = "v1-local-docling-tesseract"
+SOURCE = "local_ocr"
+CHAMBER = "house"
+SCRIPT_VERSION = "1.1.0"
+
+# Tunable hyperparameters (env-overridable so sibling workers can tune/run
+# the same sweep against the same staging root; defaults are the values the
+# pinned canaries were validated with).
+RENDER_DPI = int(os.environ.get("OCR2_RENDER_DPI", "300"))
+PREPROCESS_SCALE = float(os.environ.get("OCR2_PREPROCESS_SCALE", "2.0"))
+PREPROCESS_MEDIAN = int(os.environ.get("OCR2_PREPROCESS_MEDIAN", "3"))
+PREPROCESS_AUTOCONTRAST = int(os.environ.get("OCR2_PREPROCESS_AUTOCONTRAST", "1"))
+DOCLING_ENABLED = os.environ.get("OCR2_DOCLING_ENABLED", "1") != "0"
+CASCADE_ENABLED = os.environ.get("OCR2_CASCADE_ENABLED", "1") != "0"
+TESSERACT_PSM = int(os.environ.get("OCR2_TESSERACT_PSM", "3"))
+TESSERACT_PSM_SPARSE = int(os.environ.get("OCR2_TESSERACT_PSM_SPARSE", "11"))
+DOCLING_TIMEOUT_S = 900
+CASCADE_TIMEOUT_S = 900
+DEFAULT_WORKERS = int(os.environ.get("OCR2_WORKERS", "3"))  # docling ~2GB/proc; 2-4
+
+# Gemini-sweep ground truth for the pinned 2026 House scans.
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for _entry in (str(REPO_ROOT), str(REPO_ROOT / "src")):
     if _entry not in sys.path:
         sys.path.insert(0, _entry)
+
+# Tesseract segmentation-mode override for scan_ocr's extraction helpers
+# (extract_page_rows resolves module globals at call time, so replacing the
+# imported names lets siblings tune PSM without touching shared code).
+def _psm_wrapper(fn, psm):
+    def wrapped(image_path, psm_arg=None, **kwargs):
+        return fn(image_path, psm=psm, **kwargs)
+    return wrapped
+
+import scripts.scan_ocr as _scan_ocr  # noqa: E402
+
+if TESSERACT_PSM != 3 or TESSERACT_PSM_SPARSE != 11:
+    _scan_ocr.tesseract_plain_lines = _psm_wrapper(
+        _scan_ocr.tesseract_plain_lines, TESSERACT_PSM
+    )
+    _scan_ocr.tesseract_lines = _psm_wrapper(
+        _scan_ocr.tesseract_lines, TESSERACT_PSM
+    )
+    _scan_ocr.tesseract_words = _psm_wrapper(
+        _scan_ocr.tesseract_words, TESSERACT_PSM
+    )
 
 from scripts.scan_ocr import (  # noqa: E402
     OcrRow,
@@ -111,19 +165,6 @@ from analyzer.parser_cascade import (  # noqa: E402
     _parse_pdf_worker,
 )
 
-GENERATION = "gen-live-20260810"
-ENGINE = "local_docling_tesseract"
-PARSER_VERSION = "v1-local-docling-tesseract"
-SOURCE = "local_ocr"
-CHAMBER = "house"
-SCRIPT_VERSION = "1.0.0"
-RENDER_DPI = 300
-PREPROCESS_SCALE = 2.0  # effective 600 dpi for the preprocessed variant
-DOCLING_TIMEOUT_S = 900
-CASCADE_TIMEOUT_S = 900
-DEFAULT_WORKERS = 3  # docling workers use ~2GB each; keep 2-4
-
-# Gemini-sweep ground truth for the pinned 2026 House scans.
 PINNED_CANARIES = {
     "9115808": {"rows": 1, "pages": 1, "page2_min": None},
     "9115813": {"rows": 9, "pages": 2, "page2_min": None},
@@ -216,14 +257,17 @@ def preprocess_image(image) -> "object":
     from PIL import Image, ImageFilter, ImageOps  # noqa: PLC0415
 
     img = image.convert("L")
-    img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.MedianFilter(size=3))
-    width, height = img.size
-    scaled = img.resize(
-        (int(width * PREPROCESS_SCALE), int(height * PREPROCESS_SCALE)),
-        Image.LANCZOS,
-    )
-    return scaled
+    if PREPROCESS_AUTOCONTRAST:
+        img = ImageOps.autocontrast(img)
+    if PREPROCESS_MEDIAN > 1:
+        img = img.filter(ImageFilter.MedianFilter(size=PREPROCESS_MEDIAN))
+    if PREPROCESS_SCALE > 1:
+        width, height = img.size
+        img = img.resize(
+            (int(width * PREPROCESS_SCALE), int(height * PREPROCESS_SCALE)),
+            Image.LANCZOS,
+        )
+    return img
 
 
 def _docling_converter():
@@ -569,7 +613,12 @@ def process_document(
     expected_member = (metadata or {}).get("member")
 
     # Step 1+2: image preprocessing + Docling (page-attributed rows).
-    docling_pages_result, docling_error = docling_pages(pdf_path)
+    docling_pages_result: list[dict] = []
+    docling_error: str | None = None
+    if DOCLING_ENABLED:
+        docling_pages_result, docling_error = docling_pages(pdf_path)
+    else:
+        docling_error = "docling disabled (OCR2_DOCLING_ENABLED=0)"
     if docling_error:
         result["reasons"].append(docling_error)
     result["engines"].append("docling")
@@ -660,7 +709,7 @@ def process_document(
     # Step 4: deterministic text-layer retry with the accepted cascade.
     text_layer = pdf_text_layer(pdf_path)
     cascade_rows: list[dict] = []
-    if uncovered and text_layer.strip():
+    if uncovered and text_layer.strip() and CASCADE_ENABLED:
         result["engines"].append("cascade")
         try:
             _, cascade_rows, _ = _parse_pdf_worker(pdf_path)
@@ -672,7 +721,7 @@ def process_document(
             result["engines"].append("cascade_rows")
             for tx in cascade_rows:
                 tx.setdefault("page_number", None)
-    elif uncovered and not text_layer.strip():
+    elif uncovered and not text_layer.strip() and CASCADE_ENABLED:
         result["reasons"].append("cascade skipped: no extractable text layer")
 
     # Assemble rows: per-page rows win (page attribution); cascade rows are

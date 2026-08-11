@@ -29,6 +29,20 @@ if str(ROOT / "src") not in sys.path:
 from scripts import ocr_local_sweep as ocr  # noqa: E402
 
 
+class TestEnvTunables(unittest.TestCase):
+    def test_env_overrides_parsed(self):
+        """Constants are env-driven; defaults match the canary-validated set."""
+        self.assertEqual(ocr.RENDER_DPI, 300)
+        self.assertEqual(ocr.PREPROCESS_SCALE, 2.0)
+        self.assertEqual(ocr.PREPROCESS_MEDIAN, 3)
+        self.assertTrue(ocr.DOCLING_ENABLED)
+        self.assertTrue(ocr.CASCADE_ENABLED)
+        self.assertEqual(ocr.TESSERACT_PSM, 3)
+        self.assertEqual(ocr.DEFAULT_WORKERS, 3)
+
+
+
+
 class TestNormalizeIsoDate(unittest.TestCase):
     def test_slash_and_dash_separators(self):
         self.assertEqual(ocr._normalize_iso_date("3-31-26"), "2026-03-31")

@@ -275,6 +275,93 @@ def _asset_from_type_cell(type_raw: str, tx_type: str | None) -> str:
             asset = asset[:-1]
     return asset.strip(" -|")
 
+# Instruction boilerplate printed inside the old-form table region ("Provide
+# full name, not ticker symbol", the Example asset line, the Purchase/Sale/
+# Exchange and (MM/DD/YY) column labels, the "ACTION TRANS- ..." labels).
+# Rows whose cells carry this text are form instruction, never transactions
+# and never the column header; the header labels themselves (FULL ASSET
+# NAME, TYPE OF TRANSACTION, DATE OF TRANSACTION, AMOUNT OF TRANSACTION)
+# are deliberately not listed so a real header row can still be derived.
+_INSTRUCTION_CELL_RE = re.compile(
+    r"provide\s*\w*\s*name|not\s*tick\w*|examp\w*\s*:|"
+    r"purch\w*s\w*\s*(?:sale|exchange)|"
+    r"\(?\s*mm\s*/\s*dd\s*/\s*yy\s*\)?|\(?\s*m\w?dd[^)]*\)?|"
+    r"action\s*trans",
+    re.IGNORECASE,
+)
+# Old-form PTR layouts as Docling emits them row-wise: the 7-field layout
+# (ID/Owner/Asset/Type/Date/Notification/Amount) and the minimal 5-field
+# layout (Asset/Type/Date/Notification/Amount).  The positional fallback for
+# schema-mismatch tables maps these widths only; any other width stays
+# rejected (no over-eager fallback).
+_OLD_FORM_COLUMNS_7 = (
+    "ID", "Owner", "Asset", "Transaction Type", "Date",
+    "Notification Date", "Amount",
+)
+_OLD_FORM_COLUMNS_5 = (
+    "Asset", "Transaction Type", "Date", "Notification Date", "Amount",
+)
+
+
+def _schema_columns(
+    headers: list[str],
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    """PTR-schema column indices from header names (asset/type/amount/date)."""
+    asset_cols = [i for i, h in enumerate(headers) if "asset" in h]
+    type_cols = [i for i, h in enumerate(headers) if "type" in h]
+    amount_cols = [i for i, h in enumerate(headers) if "amount" in h]
+    date_cols = [
+        i for i, h in enumerate(headers)
+        if "date" in h and "notification" not in h
+    ]
+    return asset_cols, type_cols, amount_cols, date_cols
+
+
+def _row_has_instruction(dataframe, row_index: int) -> bool:
+    """True when any cell of the row carries form instruction boilerplate."""
+    return any(
+        _INSTRUCTION_CELL_RE.search(str(dataframe.iat[row_index, j] or ""))
+        for j in range(dataframe.shape[1])
+    )
+
+
+def _derive_old_form_columns(
+    dataframe,
+) -> tuple[int | None, list[str] | None]:
+    """Recover the old-form PTR columns when the detected header row fails
+    schema match.
+
+    Returns ``(header_row, header_names)``: the index of the first row whose
+    cell values carry the PTR schema column names (asset/type/date/amount),
+    skipping instruction-boilerplate rows, plus those cell values as the new
+    header names; or ``(None, names)`` for the positional old-form layout
+    (7-field ID/Owner/Asset/... or 5-field Asset/...); or ``(None, None)``
+    when the table carries no recoverable old-form schema.
+    """
+    for row_index in range(len(dataframe)):
+        if _row_has_instruction(dataframe, row_index):
+            continue
+        cells = [
+            str(dataframe.iat[row_index, j] or "")
+            for j in range(dataframe.shape[1])
+        ]
+        normalized = [
+            _HEADER_NORM_RE.sub("", cell.casefold()) for cell in cells
+        ]
+        if (
+            any("asset" in h for h in normalized)
+            and any("type" in h for h in normalized)
+            and any("date" in h and "notification" not in h for h in normalized)
+            and any("amount" in h for h in normalized)
+        ):
+            return row_index, cells
+    ncols = dataframe.shape[1]
+    if ncols == len(_OLD_FORM_COLUMNS_7):
+        return None, list(_OLD_FORM_COLUMNS_7)
+    if ncols == len(_OLD_FORM_COLUMNS_5):
+        return None, list(_OLD_FORM_COLUMNS_5)
+    return None, None
+
 
 def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
     """Map one Docling structured-table dataframe to PTR tx dicts.
@@ -297,15 +384,29 @@ def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
     headers = [_HEADER_NORM_RE.sub("", str(column).casefold()) for column in dataframe.columns]
     if not len(dataframe):  # degenerate empty table
         return []
-    asset_cols = [i for i, h in enumerate(headers) if "asset" in h]
-    type_cols = [i for i, h in enumerate(headers) if "type" in h]
-    amount_cols = [i for i, h in enumerate(headers) if "amount" in h]
-    date_cols = [
-        i for i, h in enumerate(headers)
-        if "date" in h and "notification" not in h
-    ]
-    if not asset_cols or not type_cols or not amount_cols or not date_cols:
-        return []
+    asset_cols, type_cols, amount_cols, date_cols = _schema_columns(headers)
+    # Header fallback: Docling sometimes assigns a data/instruction row as
+    # the table header (schema-mismatch scans: the "Provide full name, not
+    # ticker symbol" instruction line lands in header position).  Recover
+    # the old-form layout: skip instruction-boilerplate rows, derive the
+    # header from the first following row whose cell values carry the PTR
+    # schema column names (asset/type/date/amount), else map the old-form
+    # layout positionally.  Tables with no recoverable schema stay rejected
+    # so the tesseract/cascade fallbacks reproduce the pre-fix behaviour.
+    fallback = False
+    fallback_header_row: int | None = None
+    if not (asset_cols and type_cols and amount_cols and date_cols):
+        fallback = True
+        fallback_header_row, header_names = _derive_old_form_columns(dataframe)
+        if header_names is None:
+            return []
+        headers = [
+            _HEADER_NORM_RE.sub("", str(header).casefold())
+            for header in header_names
+        ]
+        asset_cols, type_cols, amount_cols, date_cols = _schema_columns(headers)
+        if not (asset_cols and type_cols and amount_cols and date_cols):
+            return []
     # Checkbox layouts carry distinct per-column headers (Purchase/Sale/
     # Exchange, lettered amount ranges) -- reject so the pinned canaries
     # keep their tesseract-produced rows.
@@ -338,6 +439,13 @@ def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
     # checkbox-style grids and 1xN degenerate shells out.
     rows: list[dict] = []
     for row_index in range(len(dataframe)):
+        if fallback:
+            # Rows at/below a derived header are header region, never data;
+            # instruction-boilerplate rows are never transactions.
+            if fallback_header_row is not None and row_index <= fallback_header_row:
+                continue
+            if _row_has_instruction(dataframe, row_index):
+                continue
         asset_raw = str(dataframe.iat[row_index, asset_col] or "")
         if _HEADER_LIKE_ASSET_RE.search(asset_raw):
             continue  # stray repeated header row inside the data

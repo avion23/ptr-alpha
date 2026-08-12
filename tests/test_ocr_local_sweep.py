@@ -904,3 +904,99 @@ class TestRunSweepIncrementalStaging(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeaderFallbackDoclingDataframe(unittest.TestCase):
+    """Pinned scenario: a table whose header row carries the old-form
+    instruction line ("Provide full name, not ticker symbol" + Example
+    asset) instead of real column names.
+
+    Docling emits this instruction row as the header on old-form scans
+    (legend-block tables).  The fallback must skip instruction rows and
+    derive the header from the first following row carrying the PTR schema
+    names (asset/type/date/amount) so the data rows below map.  Uses a
+    synthetic dataframe mirroring the real emitted layout: the instruction
+    header row, a schema header row, then transaction data.
+    """
+
+    def test_instruction_header_with_data_below_maps_rows(self):
+        import pandas as pd
+        df = pd.DataFrame(
+            [
+                ["Example:Mega Corp.Common Stock", "Purchase/Sale/Exchange", "(MM/DD/YY)", ""],
+                ["FULL ASSET NAME", "TYPE OF TRANSACTION", "DATE OF TRANSACTION", "AMOUNT OF TRANSACTION"],
+                ["Cerner Corporation (CERN)", "Purchase", "02/3/2015", "$1,001 - $15,000"],
+                ["Fossil Group (FOSL)", "Sale", "01/27/2015", "$1,001 - $15,000"],
+            ],
+            columns=["0", "1", "2", "3"],
+        )
+        rows = ocr._dataframe_rows(df, 1)
+        self.assertGreaterEqual(len(rows), 2, f"mapped rows: {len(rows)}")
+        tickers = [ocr.extract_ticker(r["asset_description"]) for r in rows]
+        self.assertIn("CERN", tickers)
+        self.assertIn("FOSL", tickers)
+
+    def test_legend_only_table_still_rejects(self):
+        """A legend/instruction block (no data rows) must not map: the
+        positional fallback widths do not match and no schema row exists,
+        so _derive_old_form_columns returns None and the table yields []."""
+        import pandas as pd
+        df = pd.DataFrame(
+            [
+                ["Law F.sm", "Example:Mega Corp.Common Stock", "Provide full name, not ticker symbol.", "", "FULL ASSET NAME"],
+                ["", "", "Purchase Sale Exchange", "", "ACTION TRANS- TYPEOF"],
+                ["1-3-15", "02/05/015", "(MM/DD/YY)", "", "ACTION TRANS- OF DATE"],
+                ["", "", "$1,001. $15,000", "A", "AMOUNTOFTRANSACTION"],
+            ],
+            columns=["0", "1", "2", "3", "4"],
+        )
+        rows = ocr._dataframe_rows(df, 1)
+        self.assertEqual(rows, [])
+class TestDeriveOldFormColumns(unittest.TestCase):
+    """Unit: header recovery skips instruction rows, derives from the first
+    schema-matching row, falls back positionally for old-form widths, and
+    rejects tables with no recoverable schema (no over-eager fallback)."""
+
+    def _df(self, rows, columns):
+        import pandas as pd
+        return pd.DataFrame(rows, columns=columns)
+
+    def test_skips_instruction_row_derives_schema_header(self):
+        df = self._df(
+            [
+                ["Example:Mega Corp.Common Stock", "Purchase/Sale/Exchange", "(MM/DD/YY)", ""],
+                ["FULL ASSET NAME", "TYPE OF TRANSACTION", "DATE OF TRANSACTION", "AMOUNT OF TRANSACTION"],
+                ["Cerner Corporation (CERN)", "Purchase", "02/3/2015", "$1,001 - $15,000"],
+            ],
+            columns=["0", "1", "2", "3"],
+        )
+        header_row, names = ocr._derive_old_form_columns(df)
+        self.assertEqual(header_row, 1)
+        self.assertIn("asset", " ".join(names).casefold())
+
+    def test_positional_seven_field_fallback(self):
+        df = self._df(
+            [["CERN", "", "Cerner (CERN)", "P", "02/3/2015", "02/5/2015", "$1,001 - $15,000"]],
+            columns=["0", "1", "2", "3", "4", "5", "6"],
+        )
+        header_row, names = ocr._derive_old_form_columns(df)
+        self.assertIsNone(header_row)
+        self.assertEqual(len(names), 7)
+
+    def test_positional_five_field_fallback(self):
+        df = self._df(
+            [["Cerner (CERN)", "P", "02/3/2015", "02/5/2015", "$1,001 - $15,000"]],
+            columns=["0", "1", "2", "3", "4"],
+        )
+        header_row, names = ocr._derive_old_form_columns(df)
+        self.assertIsNone(header_row)
+        self.assertEqual(len(names), 5)
+
+    def test_no_schema_rejects(self):
+        df = self._df(
+            [["Purchase", "Sale", "Exchange"], ["1", "9", "134"]],
+            columns=["0", "1", "2"],
+        )
+        header_row, names = ocr._derive_old_form_columns(df)
+        self.assertIsNone(header_row)
+        self.assertIsNone(names)

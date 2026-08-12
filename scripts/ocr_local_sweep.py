@@ -238,10 +238,15 @@ _HEADER_LIKE_ASSET_RE = re.compile(
     r"asset\s*name|provide\s*full\s*name|not\s*ticker\s*symbol",
     re.IGNORECASE,
 )
-_DOLLAR_CELL_RE = re.compile(r"\$[\d,]+")
 _STRICT_DATE_CELL_RE = re.compile(
     r"\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}"
 )
+# Standalone P/S/E letter anywhere in a type cell.  Docling merges the type
+# letter mid-cell on some scans ("C (ua) P", "Verizon Communications Inc.
+# (VZ) P F IlINg s TATus : New") where the leading-letter extractor only
+# sees account/company text; the relaxed row-evidence bar uses this as the
+# P/S/E letter evidence.
+_TYPE_LETTER_CELL_RE = re.compile(r"(?<![a-z])[pse](?![a-z])", re.IGNORECASE)
 
 
 def _extract_tx_type_cell(cell: str | None) -> str | None:
@@ -258,6 +263,19 @@ def _extract_tx_type_cell(cell: str | None) -> str | None:
     return None
 
 
+def _asset_from_type_cell(type_raw: str, tx_type: str | None) -> str:
+    """Asset description from a type cell whose asset text Docling merged
+    in (20007778 p3: "Verizon Communications Inc. (VZ) P F IlINg s TATus :
+    New" with an empty Owner Asset cell).  Returns '' when nothing usable
+    survives."""
+    asset = _strip_filing_residue(type_raw)
+    if tx_type:
+        letter = tx_type[:1].casefold()
+        if asset.casefold().rstrip().endswith(letter):
+            asset = asset[:-1]
+    return asset.strip(" -|")
+
+
 def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
     """Map one Docling structured-table dataframe to PTR tx dicts.
 
@@ -269,6 +287,12 @@ def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
     uncovered and the tesseract/cascade fallbacks reproduce the pre-fix
     behaviour byte for byte (the pinned 2026 canaries are all produced by
     tesseract and must not regress).
+
+    Rows of a schema-matching table map under a relaxed per-row evidence
+    bar -- (parenthetical ticker in the asset OR P/S/E type letter) AND a
+    strict transaction date -- instead of the pre-fix table-wide
+    ticker-or-letter AND dollar AND strict-date gate; rows whose evidence
+    is merged into a neighbouring cell still map (20006695, 20007778 p3).
     """
     headers = [_HEADER_NORM_RE.sub("", str(column).casefold()) for column in dataframe.columns]
     if not len(dataframe):  # degenerate empty table
@@ -298,37 +322,47 @@ def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
     notif_cols = [i for i, h in enumerate(headers) if "notification" in h]
     notif_col = notif_cols[0] if notif_cols else None
 
-    # Data gate: only map pages whose rows carry the old-form evidence --
-    # (>=1 parenthetical ticker OR >=1 P/S/E type letter) AND >=1 dollar
-    # range AND >=1 strict date.  This is what separates old-form scans
-    # (parenthetical tickers, lettered types, dollar ranges) from
-    # checkbox-style 2026 grids (x-marks only).  Docling dataframes carry
-    # the header in .columns, so row 0 is the first data row and must be
-    # scanned too.
-    seen_ticker = seen_letter = seen_dollar = seen_date = False
-    for row_index in range(len(dataframe)):
-        asset = _strip_filing_residue(str(dataframe.iat[row_index, asset_col] or ""))
-        if _TICKER_CELL_RE.search(asset):
-            seen_ticker = True
-        if _extract_tx_type_cell(str(dataframe.iat[row_index, type_col] or "")):
-            seen_letter = True
-        if _DOLLAR_CELL_RE.search(str(dataframe.iat[row_index, amount_col] or "")):
-            seen_dollar = True
-        if _STRICT_DATE_CELL_RE.search(str(dataframe.iat[row_index, date_col] or "")):
-            seen_date = True
-        if (seen_ticker or seen_letter) and seen_dollar and seen_date:
-            break
-    if not ((seen_ticker or seen_letter) and seen_dollar and seen_date):
-        return []
-
+    # Relaxed row-evidence bar for schema-matching tables: a row maps when
+    # it carries (a parenthetical ticker in the asset cell OR a P/S/E type
+    # letter) AND a strict transaction date.  The pre-fix gate demanded
+    # ticker-or-letter AND dollar AND strict date across the whole table,
+    # which rejected genuine old-form transactions whose evidence classes
+    # Docling merges or mangles (20006695: type cell merged to "C (ua) P"
+    # beside a 1-digit-day date; 20007778 p3: asset text merged into the
+    # type cell).  Requiring the strict date (not the dollar range) keeps
+    # checkbox-style 2026 grid header rows -- lettered "PURCHASE/SALE" and
+    # dollar-range cells but only "(MM/DD/YY)" placeholders -- rejected on
+    # the real 9116141 scan, so those pages stay on the tesseract fallback.
+    # Header-less/mismatched tables never reach this loop: the schema gate
+    # above is the full bar and the column-set requirement that keeps
+    # checkbox-style grids and 1xN degenerate shells out.
     rows: list[dict] = []
     for row_index in range(len(dataframe)):
         asset_raw = str(dataframe.iat[row_index, asset_col] or "")
         if _HEADER_LIKE_ASSET_RE.search(asset_raw):
             continue  # stray repeated header row inside the data
         asset = _strip_filing_residue(asset_raw)
-        if not asset:
+        type_raw = str(dataframe.iat[row_index, type_col] or "")
+        tx_type = _extract_tx_type_cell(type_raw)
+        if not tx_type:
+            letter = _TYPE_LETTER_CELL_RE.search(type_raw)
+            if letter:
+                tx_type = _extract_transaction_type(letter.group(0))
+        row_ticker = bool(_TICKER_CELL_RE.search(asset))
+        row_date = bool(
+            _STRICT_DATE_CELL_RE.search(
+                str(dataframe.iat[row_index, date_col] or "")
+            )
+        )
+        if not ((row_ticker or tx_type) and row_date):
             continue
+        if not asset:
+            # Docling merged the asset text into the type cell (20007778
+            # p3): recover the asset once the residue and the trailing
+            # type letter are removed.
+            asset = _asset_from_type_cell(type_raw, tx_type)
+            if not asset:
+                continue
         asset = re.sub(r"\s+", " ", asset).strip()[:500]
         amount_raw, amount_midpoint = _extract_amount_midpoint(
             str(dataframe.iat[row_index, amount_col] or "")
@@ -340,9 +374,7 @@ def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
         )
         rows.append({
             "asset_description": asset,
-            "transaction_type": _extract_tx_type_cell(
-                str(dataframe.iat[row_index, type_col] or "")
-            ),
+            "transaction_type": tx_type,
             "transaction_date": _extract_date(
                 str(dataframe.iat[row_index, date_col] or "")
             ),

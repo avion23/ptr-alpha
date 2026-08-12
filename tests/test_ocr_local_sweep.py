@@ -447,6 +447,101 @@ class TestDoclingDataframeMapping(unittest.TestCase):
         self.assertEqual(rows[0]["amount_midpoint"], 3000000.5)
         self.assertEqual(rows[0]["notification_date"], "12/22/2014")
 
+    def test_merged_type_cell_weak_evidence_maps(self):
+        # 20006695-style: Docling merged the P/S/E letter mid-cell ("C (ua)
+        # P") and the strict date sits in the second type/date column; the
+        # row passes the relaxed bar (letter AND date/dollar) even though
+        # the pre-fix gate demanded ticker-or-letter AND dollar AND strict
+        # date across the table (0 rows before the fix).
+        import pandas as pd  # noqa: PLC0415
+
+        df = pd.DataFrame(
+            [
+                ["", "under armour, Inc. Class", "C (ua) P", "02/7/2017",
+                 "02/7/2017", "$1,001 - $15,000"],
+                ["", "", "F IlINg s TaTus : New", "", "", ""],
+            ],
+            columns=[
+                "iD", "owner asset", "transaction type Date",
+                "transaction type Date", "notification Date", "amount",
+            ],
+        )
+        rows = ocr._dataframe_rows(df, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["asset_description"], "under armour, Inc. Class")
+        self.assertEqual(rows[0]["transaction_type"], "Purchase")
+        self.assertEqual(rows[0]["transaction_date"], "02/7/2017")
+        self.assertEqual(rows[0]["amount_midpoint"], 8000.5)
+
+    def test_asset_merged_into_type_cell_maps(self):
+        # 20007778 p3-style: the Owner Asset cell is empty and the asset
+        # text + P/S/E letter were merged into the Transaction Type cell;
+        # the relaxed bar maps the row and recovers the asset from the type
+        # cell (asset fallback; empty-asset rows stayed 0 before the fix).
+        import pandas as pd  # noqa: PLC0415
+
+        df = pd.DataFrame(
+            [
+                ["", "", "Verizon Communications Inc. (VZ) P F IlINg s TATus : New",
+                 "06/12/2017", "07/12/2017", "$1,001 - $15,000"],
+                ["", "", "Wal-Mart stores, Inc. (WMT) P F IlINg s TATus : New",
+                 "06/12/2017", "07/12/2017", "$1,001 - $15,000"],
+            ],
+            columns=[
+                "ID", "Owner Asset", "Transaction Type", "Date",
+                "Notification Date", "Amount",
+            ],
+        )
+        rows = ocr._dataframe_rows(df, 3)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            rows[0]["asset_description"], "Verizon Communications Inc. (VZ)"
+        )
+        self.assertEqual(rows[0]["transaction_type"], "Purchase")
+        self.assertEqual(rows[0]["transaction_date"], "06/12/2017")
+        self.assertEqual(rows[0]["amount_midpoint"], 8000.5)
+        self.assertEqual(
+            rows[1]["asset_description"], "Wal-Mart stores, Inc. (WMT)"
+        )
+
+    def test_merged_cell_without_date_or_dollar_still_dropped(self):
+        # Residue-only type cell ("F IlINg s TaTus : New") carries a
+        # standalone 's' letter but neither date nor dollar -> the relaxed
+        # bar (letter AND date-or-dollar) still drops it.
+        import pandas as pd  # noqa: PLC0415
+
+        df = pd.DataFrame(
+            [
+                ["", "", "F IlINg s TaTus : New", "", "", ""],
+            ],
+            columns=[
+                "ID", "Owner Asset", "Transaction Type", "Date",
+                "Notification Date", "Amount",
+            ],
+        )
+        self.assertEqual(ocr._dataframe_rows(df, 1), [])
+
+    def test_letter_and_dollar_without_strict_date_dropped(self):
+        # 2026 checkbox-grid header row (real 9116141 p2): lettered
+        # PURCHASE/SALE/EXCHANGE headers and dollar-range cells but only a
+        # "(MM/DD/YY)" date placeholder -> the relaxed bar still requires a
+        # strict date, so the header row never maps and the page stays on
+        # the tesseract fallback (9116141 canary = 134 tesseract rows).
+        import pandas as pd  # noqa: PLC0415
+
+        df = pd.DataFrame(
+            [
+                ["", "", "PURCHASE", "SALE", "EXCHANGE", "(MM/DD/YY)",
+                 "(MM/DD/YY)", "$1,000-$15,000", "$15,001-$50,000"],
+            ],
+            columns=[
+                "iD", "owner", "asset", "transaction type",
+                "transaction type", "Date", "notification Date", "amount",
+                "amount",
+            ],
+        )
+        self.assertEqual(ocr._dataframe_rows(df, 2), [])
+
     def test_residue_only_row_dropped(self):
         df = self._df(
             [
@@ -551,6 +646,63 @@ class TestOldFormDoclingDataframe(unittest.TestCase):
             all(ocr.extract_ticker(tx["asset_description"]) for tx in rows)
         )
 
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PTR_OCR_CANARY_DATA"),
+    reason="set PTR_OCR_CANARY_DATA (staged gen dir) to run real canaries",
+)
+class TestConsumerGapDoclingDataframe(unittest.TestCase):
+    """Pinned scenario: consumer-gap docs whose schema-matching tables the
+    pre-fix three-part evidence gate rejected (ticker-or-letter AND dollar
+    AND strict date across the table) but whose rows carry weaker per-row
+    evidence.
+
+    20006695 p1: type cell merged to "C (ua) P", date "02/7/2017" -- P/S/E
+    letter + date + dollar -> its single Under Armour transaction must map.
+    20007778 p3: asset text merged into the type cell
+    ("Verizon Communications Inc. (VZ) P ...") with an empty Owner Asset
+    cell -- letter + date + dollar -> both page-3 purchases must map.
+    """
+
+    DATA_DIR = os.environ.get("PTR_OCR_CANARY_DATA", "")
+
+    def test_20006695_single_row_maps(self):
+        pdf = Path(self.DATA_DIR) / "2017" / "pdfs" / "20006695.pdf"
+        self.assertTrue(pdf.exists(), f"missing {pdf}")
+        pages, err = ocr.docling_pages(pdf)
+        self.assertIsNone(err)
+        rows = [tx for page in pages for tx in page["rows"]]
+        self.assertEqual(
+            len(rows), 1,
+            f"20006695 rows from Docling dataframe: {len(rows)}",
+        )
+        self.assertEqual(rows[0]["asset_description"], "under armour, Inc. Class")
+        self.assertEqual(rows[0]["transaction_type"], "Purchase")
+        self.assertEqual(rows[0]["transaction_date"], "02/7/2017")
+        self.assertEqual(rows[0]["amount_midpoint"], 8000.5)
+
+    def test_20007778_page3_rows_map(self):
+        pdf = Path(self.DATA_DIR) / "2017" / "pdfs" / "20007778.pdf"
+        self.assertTrue(pdf.exists(), f"missing {pdf}")
+        pages, err = ocr.docling_pages(pdf)
+        self.assertIsNone(err)
+        by_page = {page["page"]: page["rows"] for page in pages}
+        self.assertEqual(
+            len(by_page[3]), 2,
+            f"20007778 page 3 rows from Docling dataframe: {len(by_page[3])}",
+        )
+        self.assertEqual(
+            by_page[3][0]["asset_description"], "Verizon Communications Inc. (VZ)"
+        )
+        self.assertEqual(by_page[3][1]["asset_description"], "Wal-Mart stores, Inc. (WMT)")
+        self.assertTrue(
+            all(
+                tx["transaction_type"] == "Purchase"
+                and tx["transaction_date"] == "06/12/2017"
+                for tx in by_page[3]
+            )
+        )
 
 
 class TestRunPoolStreaming(unittest.TestCase):

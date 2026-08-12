@@ -266,6 +266,35 @@ class TestEmptyPageClassification(unittest.TestCase):
         u, _n, _c, _notes = self._classify(lines)
         self.assertEqual(u, [1])
 
+    def test_certification_page_accepted(self):
+        # Real 20016481 page 62 OCR (docling probe, casefolded): the
+        # trailing certification/signature page has no transaction table
+        # and no filer_block markers, so it used to fall to uncovered.
+        lines = [
+            "## certification and signature g f e d c b",
+            "i certify that the statements i have made on the attached",
+            "periodic transaction report are true, complete, and correct",
+            "to the best of my knowledge and belief.",
+            "digitally signed: hon. donna shalala , 04/27/2020",
+        ]
+        u, _n, covers, _notes = self._classify(lines)
+        self.assertEqual(covers, [1])
+        self.assertEqual(u, [])
+
+    def test_cert_page_with_row_like_content_stays_uncovered(self):
+        # A page carrying BOTH certification text and unparsed transaction
+        # rows (the 20007778/20017648 trailing-page shape: cert block plus
+        # a table that failed to map) must fail closed, never be accepted
+        # as a transaction-free certification page.
+        lines = [
+            "## certification and signature g f e d c b",
+            "i certify that the statements i have made on the attached",
+            "periodic transaction report are true, complete, and correct",
+            "SP] Verizon Communications Inc. (VZ) FILING STATUS: New",
+        ]
+        u, _n, _c, _notes = self._classify(lines)
+        self.assertEqual(u, [1])
+
     def test_unrecognized_page_fails_closed(self):
         u, _n, _c, _notes = self._classify(["some garbage text"])
         self.assertEqual(u, [1])
@@ -600,6 +629,52 @@ class TestRealCanaries(unittest.TestCase):
             self.assertEqual(result["status"], "resolved", doc_id)
             self.assertFalse(result["uncovered_pages"], doc_id)
 
+
+@pytest.mark.skipif(
+    not os.environ.get("PTR_OCR_CANARY_DATA"),
+    reason="set PTR_OCR_CANARY_DATA (staged gen dir) to run real canaries",
+)
+class TestCertificationPageGate(unittest.TestCase):
+    """Pinned scenario: 20016481's trailing "CERTIFICATION AND SIGNATURE"
+    page (62 of 62) carries no transaction rows, but classify_empty_page has
+    no gate for it (its filer_block markers need "office telephone"/"member
+    of the u.s. house", which cert pages lack), so the sweep kept the whole
+    doc unresolved despite 582 mapped rows across pages 1-61.  The
+    certification-page gate must accept the real page (uncovered stays
+    empty) and the full pipeline must stage rows and resolve the doc."""
+
+    DATA_DIR = os.environ.get("PTR_OCR_CANARY_DATA", "")
+    DB = os.environ.get("PTR_OCR_CANARY_DB", "")
+
+    def test_real_cert_page_accepts_and_resolves(self):
+        pdf = Path(self.DATA_DIR) / "2020" / "pdfs" / "20016481.pdf"
+        self.assertTrue(pdf.exists(), f"missing {pdf}")
+        pages, err = ocr.docling_pages(pdf)
+        self.assertIsNone(err)
+        cert = pages[-1]
+        self.assertEqual(cert["page"], 62)
+        self.assertFalse(cert["rows"], "cert page must not map rows")
+        uncovered, no_tx, covers, notes = [], [], [], []
+        ocr.classify_empty_page(
+            cert["page"],
+            cert["text"],
+            ocr._plain_lines_from_text(cert["text"]),
+            uncovered=uncovered,
+            no_tx_pages=no_tx,
+            cover_pages=covers,
+            notes=notes,
+        )
+        self.assertEqual(uncovered, [])
+        self.assertEqual(covers, [62])
+        # Full pipeline: the doc must stage rows and resolve (previously
+        # "page 62: no transaction rows" kept it unresolved).
+        metadata = ocr.load_metadata(self.DB)
+        result = ocr.process_document(
+            "20016481", 2020, pdf, metadata.get("20016481", {})
+        )
+        self.assertEqual(result["status"], "resolved", result["reasons"])
+        self.assertFalse(result["uncovered_pages"])
+        self.assertGreaterEqual(result["row_count"], 500)
 
 
 @pytest.mark.skipif(

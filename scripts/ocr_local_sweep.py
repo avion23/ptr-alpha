@@ -640,8 +640,9 @@ def classify_empty_page(
     notes: list[str],
 ) -> None:
     """nothing-to-report -> no_tx; form header + filer block -> cover;
-    otherwise uncovered (fail-closed)."""
-    text = page_text
+    certification/signature page -> cover; otherwise uncovered
+    (fail-closed)."""
+    text = page_text.casefold()
     nothing = "nothing to report" in text
     has_form_header = (
         "periodic transaction report" in text or "united states house" in text
@@ -650,6 +651,19 @@ def classify_empty_page(
         "office telephone" in text
         or "member of the u.s. house" in text
         or "please see the attached" in text
+    )
+    # Trailing "CERTIFICATION AND SIGNATURE" page: the filer certifies the
+    # attached report; the form carries no transactions there by
+    # construction, so it is legitimately transaction-free.  Markers cover
+    # the House e-filing block plus older/alternate form wording; the
+    # row-like-content guard keeps pages that DO carry transaction rows
+    # (e.g. a trailing table that failed to map) uncovered (fail-closed).
+    cert_page = (
+        ("certification" in text and "signature" in text)
+        or "under penalty of perjury" in text
+        or "truthfulness" in text
+        or "the information contained herein is true" in text
+        or "digitally signed" in text
     )
     if nothing:
         no_tx_pages.append(page_number)
@@ -662,6 +676,13 @@ def classify_empty_page(
     ):
         cover_pages.append(page_number)
         notes.append(f"page {page_number}: cover page (no transaction rows)")
+        return
+    if cert_page and not _page_has_row_like_content(page_lines):
+        cover_pages.append(page_number)
+        notes.append(
+            f"page {page_number}: certification/signature page "
+            "(no transaction rows)"
+        )
         return
     uncovered.append(page_number)
     notes.append(f"page {page_number}: no transaction rows")

@@ -1,4 +1,5 @@
 import os
+import re
 import unittest
 import hashlib
 import sys
@@ -764,10 +765,12 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 pass
 
         pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi: [Image("original")]
+        pdf2image.convert_from_path = lambda path, dpi, timeout=None: [
+            Image("original")
+        ]
         pytesseract = ModuleType("pytesseract")
-        pytesseract.image_to_osd = lambda image: "Rotate: 90\n"
-        pytesseract.image_to_string = lambda image: (
+        pytesseract.image_to_osd = lambda image, timeout=None: "Rotate: 90\n"
+        pytesseract.image_to_string = lambda image, timeout=None: (
             "Apple (AAPL) P 01/15/24 $1,001 - $15,000"
             if image.name == "original"
             else "Microsoft P 01/16/24 $15,001 - $50,000"
@@ -792,12 +795,12 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 pass
 
         pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi: [Image()]
+        pdf2image.convert_from_path = lambda path, dpi, timeout=None: [Image()]
         pytesseract = ModuleType("pytesseract")
-        pytesseract.image_to_string = lambda image: (
+        pytesseract.image_to_string = lambda image, timeout=None: (
             "Apple (AAPL) P 01/15/24 $1,001 - $15,000"
         )
-        pytesseract.image_to_osd = lambda image: (_ for _ in ()).throw(
+        pytesseract.image_to_osd = lambda image, timeout=None: (_ for _ in ()).throw(
             RuntimeError("osd unavailable")
         )
         with patch.dict(
@@ -821,12 +824,15 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 pass
 
         pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi: [Image(1), Image(2)]
+        pdf2image.convert_from_path = lambda path, dpi, timeout=None: [
+            Image(1),
+            Image(2),
+        ]
         pytesseract = ModuleType("pytesseract")
-        pytesseract.image_to_string = lambda image: (
+        pytesseract.image_to_string = lambda image, timeout=None: (
             "Apple (AAPL) P 01/15/24 $1,001 - $15,000" if image.page == 1 else ""
         )
-        pytesseract.image_to_osd = lambda image: "Rotate: 0\n"
+        pytesseract.image_to_osd = lambda image, timeout=None: "Rotate: 0\n"
         with patch.dict(
             sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
         ):
@@ -838,15 +844,94 @@ class TestLocalOcrCanaries(unittest.TestCase):
         from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
 
         pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi: (_ for _ in ()).throw(
-            ValueError("corrupt")
-        )
+        pdf2image.convert_from_path = lambda path, dpi, timeout=None: (
+            _ for _ in ()
+        ).throw(ValueError("corrupt"))
         pytesseract = ModuleType("pytesseract")
         with patch.dict(
             sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
         ):
             with self.assertRaisesRegex(OcrBackendError, "failed to rasterize"):
                 extract_tables_with_ocr(Path("corrupt.pdf"))
+
+    def test_tesseract_timeout_is_recorded_as_incomplete_not_hang(self):
+        from analyzer.parsing.ocr_parser import (
+            OcrIncompleteError,
+            extract_tables_with_ocr,
+        )
+
+        class Image:
+            def close(self):
+                pass
+
+        rasterize_timeouts = []
+        call_timeouts = []
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi, timeout=None: (
+            rasterize_timeouts.append(timeout) or [Image()]
+        )
+        pytesseract = ModuleType("pytesseract")
+
+        def timed_out(image, timeout=None):
+            call_timeouts.append(timeout)
+            raise RuntimeError("Tesseract process timeout")
+
+        pytesseract.image_to_string = timed_out
+        with patch.dict(
+            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+        ):
+            with self.assertRaisesRegex(OcrIncompleteError, "page 1"):
+                extract_tables_with_ocr(Path("slow.pdf"))
+
+        self.assertEqual(rasterize_timeouts, [120])
+        self.assertEqual(call_timeouts, [90])
+
+    def test_ocr_document_deadline_skips_remaining_pages(self):
+        from analyzer.parsing import ocr_parser
+        from analyzer.parsing.ocr_parser import (
+            OcrIncompleteError,
+            extract_tables_with_ocr,
+        )
+
+        class Image:
+            def __init__(self, page):
+                self.page = page
+
+            def close(self):
+                pass
+
+        clock = {"now": 0.0}
+
+        def fake_monotonic():
+            return clock["now"]
+
+        def fake_to_string(image, timeout=None):
+            clock["now"] += 400.0
+            return f"Apple (AAPL) P 01/15/24 $1,001 - $15,000 p{image.page}"
+
+        pdf2image = ModuleType("pdf2image")
+        pdf2image.convert_from_path = lambda path, dpi, timeout=None: [
+            Image(n) for n in range(1, 6)
+        ]
+        pytesseract = ModuleType("pytesseract")
+        pytesseract.image_to_string = fake_to_string
+        pytesseract.image_to_osd = lambda image, timeout=None: "Rotate: 0\n"
+
+        with (
+            patch.dict(
+                sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+            ),
+            patch.object(ocr_parser.time, "monotonic", fake_monotonic),
+        ):
+            with self.assertRaisesRegex(OcrIncompleteError, "deadline") as raised:
+                extract_tables_with_ocr(Path("slow.pdf"))
+
+        message = str(raised.exception)
+        self.assertIn("deadline exceeded", message)
+        pages_reported = re.findall(r"page (\d+): ocr deadline exceeded", message)
+        self.assertEqual(pages_reported, ["3", "4", "5"])
+        self.assertEqual(len(raised.exception.partial_tables[0]), 3)
 
     def test_cascade_compares_all_text_engines_and_prefers_complete_trusted_tie(self):
         from analyzer import parser_cascade

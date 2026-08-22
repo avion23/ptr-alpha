@@ -693,22 +693,30 @@ class HouseTransactionSource(TransactionSource):
 # ── Helpers ──
 
 
+_PARSE_FAILURE_PREFIX = "__parse_failed__:"
+
+
 def _tolerant_parse_pdf_worker(pdf_path: Path):
-    """Run the accepted cascade; convert per-PDF failures into error results
-    so one bad document cannot discard the whole year's batch."""
+    """Run the accepted cascade; convert per-PDF failures into sentinel results
+    so one bad document cannot discard the whole year's batch.
+
+    The cascade itself appends transient ``error:<engine>`` entries inside
+    successful results, so whole-doc failures must use a dedicated prefix that
+    never collides with those.
+    """
     try:
         return _parse_pdf_worker(pdf_path)
     except ParserCascadeError as exc:
-        return pdf_path, [], [f"error:{exc}"]
+        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{exc}"]
     except Exception as exc:  # noqa: BLE001 -- per-PDF quarantine boundary
-        return pdf_path, [], [f"error:{type(exc).__name__}:{exc}"]
+        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{type(exc).__name__}:{exc}"]
 
 
 def _engine_error_detail(engines_attempted: list[str]) -> str | None:
     """Return the quarantine detail when a tolerant worker reported failure."""
     for engine in engines_attempted:
-        if engine.startswith("error:"):
-            return engine[len("error:") :]
+        if engine.startswith(_PARSE_FAILURE_PREFIX):
+            return engine[len(_PARSE_FAILURE_PREFIX) :]
     return None
 
 

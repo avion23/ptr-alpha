@@ -73,7 +73,7 @@ MAX_DATE = date.today() + timedelta(days=1)
 TERMINAL_STATUSES = ("success", "no_txs")
 
 # Sources produced by the deterministic parser cascade vs the Gemini OCR path.
-DETERMINISTIC_PARSER_FAMILIES = ("v4-deterministic",)
+DETERMINISTIC_PARSER_FAMILIES = ("v5-deterministic",)
 OCR_PARSER_FAMILIES = ("v5-gemini-validated",)
 
 _ECONOMIC_KEY = [

@@ -430,9 +430,6 @@ def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypat
         def __exit__(self, *_args):
             return False
 
-        def imap_unordered(self, _worker, paths):
-            return iter((path, [], ["pdfplumber"]) for path in paths)
-
         def map(self, _worker, paths):
             return [(path, [], ["pdfplumber"]) for path in paths]
 
@@ -501,6 +498,66 @@ def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
     ]
     assert failure_warnings, "expected a warning naming the failed doc_id"
     assert any("1/2" in record.getMessage() for record in failure_warnings)
+
+
+def test_engine_error_detail_only_flags_dedicated_sentinel():
+    from analyzer.download import _engine_error_detail
+
+    transient = ["pdfplumber", "error:lattice", "won:pdftotext"]
+    assert _engine_error_detail(transient) is None
+    sentinel = ["__parse_failed__:ParserCascadeError:boom"]
+    assert _engine_error_detail(sentinel) == "ParserCascadeError:boom"
+
+
+def test_parse_cached_pdfs_saves_docs_with_transient_engine_errors(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+
+    from analyzer import download as download_module
+
+    source, db = _source(tmp_path)
+    pdf_dir = tmp_path / "2021" / "pdfs"
+    pdf_dir.mkdir(parents=True)
+    (pdf_dir / "mixedone.pdf").write_bytes(b"%PDF-mixedone\n%%EOF")
+    source.fetch_metadata = MagicMock(return_value=_metadata("mixedone"))
+    source.db.get_latest_house_generation = MagicMock(return_value="captured-g1")
+    source._save_parse_results = MagicMock()
+
+    def fake_worker(path):
+        return path, [], ["lattice", "error:lattice", "won:pdftotext"]
+
+    monkeypatch.setattr(download_module, "_parse_pdf_worker", fake_worker)
+
+    class FakePool:
+        def __init__(self, _workers):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def map(self, worker, paths):
+            return [worker(path) for path in paths]
+
+    monkeypatch.setattr(download_module, "Pool", FakePool)
+    try:
+        with caplog.at_level(logging.WARNING, logger="analyzer.download"):
+            source.parse_cached_pdfs(2021, force=True)
+    finally:
+        source.close()
+        db.close()
+
+    results = source._save_parse_results.call_args.args[1]
+    assert [pdf_path.stem for pdf_path, _tx, _engines in results] == ["mixedone"]
+    exclusion_warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "Excluding" in record.getMessage()
+    ]
+    assert not exclusion_warnings, "transient engine errors must not quarantine a doc"
 
 
 

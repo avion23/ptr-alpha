@@ -5,6 +5,8 @@ import hashlib
 import logging
 import os
 import shutil
+import signal
+import threading
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -694,6 +696,21 @@ class HouseTransactionSource(TransactionSource):
 
 
 _PARSE_FAILURE_PREFIX = "__parse_failed__:"
+_PARSE_DOC_BUDGET_SECONDS = 300
+
+
+class ParseBudgetExceeded(RuntimeError):
+    """Raised by the SIGALRM watchdog when one PDF exceeds its parse budget."""
+
+
+def _skip_stems_from_env(raw: str | None) -> frozenset[str]:
+    """Parse a comma-separated PTR_SKIP_DOCS value into doc-id stems."""
+    return frozenset(
+        stem.strip() for stem in (raw or "").split(",") if stem.strip()
+    )
+
+
+_PTR_SKIP_DOCS = _skip_stems_from_env(os.environ.get("PTR_SKIP_DOCS"))
 
 
 def _tolerant_parse_pdf_worker(pdf_path: Path):
@@ -703,13 +720,48 @@ def _tolerant_parse_pdf_worker(pdf_path: Path):
     The cascade itself appends transient ``error:<engine>`` entries inside
     successful results, so whole-doc failures must use a dedicated prefix that
     never collides with those.
+
+    In the process MAIN thread (where pool workers land under spawn), the
+    cascade call is additionally bounded by a SIGALRM wall-clock budget so a
+    wedged engine cannot stall one document forever. Where SIGALRM is
+    unavailable (non-main thread, platforms without setitimer) the parse runs
+    unguarded.
     """
+    if pdf_path.stem in _PTR_SKIP_DOCS:
+        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}skipped via PTR_SKIP_DOCS"]
+
+    use_watchdog = (
+        threading.current_thread() is threading.main_thread()
+        and hasattr(signal, "setitimer")
+    )
+    prior_handler = None
     try:
-        return _parse_pdf_worker(pdf_path)
-    except ParserCascadeError as exc:
-        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{exc}"]
-    except Exception as exc:  # noqa: BLE001 -- per-PDF quarantine boundary
-        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{type(exc).__name__}:{exc}"]
+        if use_watchdog:
+            prior_handler = signal.getsignal(signal.SIGALRM)
+
+            def _raise_budget_exceeded(_signum, _frame):
+                raise ParseBudgetExceeded(
+                    f"parse budget {_PARSE_DOC_BUDGET_SECONDS}s exceeded"
+                )
+
+            signal.signal(signal.SIGALRM, _raise_budget_exceeded)
+            signal.setitimer(signal.ITIMER_REAL, _PARSE_DOC_BUDGET_SECONDS)
+        try:
+            return _parse_pdf_worker(pdf_path)
+        except ParseBudgetExceeded:
+            detail = f"parse budget {_PARSE_DOC_BUDGET_SECONDS}s exceeded"
+            return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{detail}"]
+        except ParserCascadeError as exc:
+            return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{exc}"]
+        except Exception as exc:  # noqa: BLE001 -- per-PDF quarantine boundary
+            return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{type(exc).__name__}:{exc}"]
+    finally:
+        if use_watchdog:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(
+                signal.SIGALRM,
+                prior_handler if prior_handler is not None else signal.SIG_DFL,
+            )
 
 
 def _engine_error_detail(engines_attempted: list[str]) -> str | None:

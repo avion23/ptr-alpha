@@ -1,5 +1,6 @@
 import hashlib
 import os
+import signal
 import zipfile
 from contextlib import nullcontext
 from datetime import date, datetime
@@ -622,8 +623,8 @@ def test_house_get_transactions_rejects_ineligible_house_only_year(tmp_path):
                 "doc_id": "invalid-house-only",
                 "member": "Jane Doe",
                 "ticker": "BAD",
-                "transaction_date": date(2024, 1, 4),
-                "disclosure_date": date(2024, 1, 3),
+                "transaction_date": date(2021, 1, 4),
+                "disclosure_date": date(2021, 1, 3),
                 "transaction_type": "Purchase",
             }]
         ),
@@ -631,8 +632,121 @@ def test_house_get_transactions_rejects_ineligible_house_only_year(tmp_path):
     )
 
     try:
-        with pytest.raises(DataSourceError, match="No cached data found for 2024"):
-            source.get_transactions(2024)
+        with pytest.raises(DataSourceError, match="No cached data found for 2021"):
+            source.get_transactions(2021)
     finally:
         source.close()
         db.close()
+
+
+def test_parse_budget_exceeded_is_runtime_error():
+    from analyzer.download import ParseBudgetExceeded
+
+    assert issubclass(ParseBudgetExceeded, RuntimeError)
+
+
+def test_skip_stems_from_env_parses_comma_separated_values():
+    from analyzer.download import _skip_stems_from_env
+
+    assert _skip_stems_from_env("20004297, 20012345,,  20099888 ") == frozenset(
+        {"20004297", "20012345", "20099888"}
+    )
+    assert _skip_stems_from_env(None) == frozenset()
+    assert _skip_stems_from_env("") == frozenset()
+
+
+def test_tolerant_parse_watchdog_budget_fires_and_restores_state(
+    tmp_path, monkeypatch
+):
+    import time as time_module
+
+    from analyzer import download as download_module
+
+    pdf_path = tmp_path / "slow.pdf"
+    pdf_path.write_bytes(b"%PDF-slow\n%%EOF")
+    prior_handler = signal.getsignal(signal.SIGALRM)
+    monkeypatch.setattr(download_module, "_PARSE_DOC_BUDGET_SECONDS", 0.05)
+
+    def slow_worker(_path):
+        time_module.sleep(0.5)
+        return _path, [], ["pdfplumber"]
+
+    monkeypatch.setattr(download_module, "_parse_pdf_worker", slow_worker)
+
+    start = time_module.monotonic()
+    result = download_module._tolerant_parse_pdf_worker(pdf_path)
+    elapsed = time_module.monotonic() - start
+
+    out_path, transactions, engines = result
+    assert out_path == pdf_path
+    assert transactions == []
+    assert engines == [
+        f"__parse_failed__:parse budget "
+        f"{download_module._PARSE_DOC_BUDGET_SECONDS}s exceeded"
+    ]
+    assert elapsed < 0.4, f"watchdog did not interrupt the slow worker ({elapsed}s)"
+    assert signal.getsignal(signal.SIGALRM) is prior_handler
+    assert signal.setitimer(signal.ITIMER_REAL, 0) == (0.0, 0.0)
+
+
+def test_tolerant_parse_watchdog_absent_outside_main_thread(tmp_path, monkeypatch):
+    import threading
+    import time as time_module
+
+    from analyzer import download as download_module
+
+    pdf_path = tmp_path / "threaded.pdf"
+    pdf_path.write_bytes(b"%PDF-threaded\n%%EOF")
+    monkeypatch.setattr(download_module, "_PARSE_DOC_BUDGET_SECONDS", 0.01)
+    outcome = {}
+
+    def slow_worker(path):
+        time_module.sleep(0.1)
+        return path, [], ["pdfplumber", "won:pdfplumber"]
+
+    monkeypatch.setattr(download_module, "_parse_pdf_worker", slow_worker)
+
+    def run():
+        outcome["result"] = download_module._tolerant_parse_pdf_worker(pdf_path)
+        outcome["handler"] = signal.getsignal(signal.SIGALRM)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    out_path, transactions, engines = outcome["result"]
+    assert out_path == pdf_path
+    assert transactions == []
+    assert engines == ["pdfplumber", "won:pdfplumber"]
+    assert outcome["handler"] == signal.SIG_DFL
+
+
+def test_tolerant_parse_skips_docs_via_ptr_skip_docs(tmp_path, monkeypatch):
+    from analyzer import download as download_module
+
+    skipped_path = tmp_path / "20004297.pdf"
+    normal_path = tmp_path / "20011111.pdf"
+    monkeypatch.setattr(download_module, "_PTR_SKIP_DOCS", frozenset({"20004297"}))
+
+    def explode_if_called(_path):
+        raise AssertionError("_parse_pdf_worker must not run for skipped docs")
+
+    monkeypatch.setattr(download_module, "_parse_pdf_worker", explode_if_called)
+
+    out_path, transactions, engines = download_module._tolerant_parse_pdf_worker(
+        skipped_path
+    )
+    assert out_path == skipped_path
+    assert transactions == []
+    assert engines == ["__parse_failed__:skipped via PTR_SKIP_DOCS"]
+
+    monkeypatch.setattr(
+        download_module,
+        "_parse_pdf_worker",
+        lambda path: (path, [], ["won:pdfplumber"]),
+    )
+    out_path, transactions, engines = download_module._tolerant_parse_pdf_worker(
+        normal_path
+    )
+    assert engines == ["won:pdfplumber"]

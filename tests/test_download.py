@@ -209,7 +209,7 @@ def test_parse_persistence_records_house_provenance_and_artifact_hash(tmp_path):
     assert stored["ingestion_generation"] == "legacy-untracked-2021"
     assert stored["official_filing_date"].date() == date(2021, 1, 3)
     assert stored["artifact_sha256"] == hashlib.sha256(pdf_bytes).hexdigest()
-    assert parse_run == ("v4-deterministic", "success", 1, 1)
+    assert parse_run == ("v5-deterministic", "success", 1, 1)
 
 
 
@@ -258,7 +258,7 @@ def test_zero_output_parse_preserves_stale_house_and_ocr_rows(tmp_path):
             """
             SELECT status, raw_row_count, transaction_count
             FROM pdf_parse_runs
-            WHERE doc_id = 'zero' AND parser_version = 'v4-deterministic'
+            WHERE doc_id = 'zero' AND parser_version = 'v5-deterministic'
             """
         ).fetchone()
     finally:
@@ -430,6 +430,9 @@ def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypat
         def __exit__(self, *_args):
             return False
 
+        def imap_unordered(self, _worker, paths):
+            return iter((path, [], ["pdfplumber"]) for path in paths)
+
         def map(self, _worker, paths):
             return [(path, [], ["pdfplumber"]) for path in paths]
 
@@ -442,6 +445,62 @@ def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypat
 
     assert source.db.get_latest_house_generation.call_count == 1
     assert source._save_parse_results.call_args.args[-1] == "captured-g1"
+
+
+def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
+    tmp_path, monkeypatch, caplog
+):
+    import logging
+
+    from analyzer import download as download_module
+    from analyzer.parser_cascade import ParserCascadeError
+
+    source, db = _source(tmp_path)
+    pdf_dir = tmp_path / "2021" / "pdfs"
+    pdf_dir.mkdir(parents=True)
+    for stem in ("goodone", "badone"):
+        (pdf_dir / f"{stem}.pdf").write_bytes(b"%PDF-" + stem.encode() + b"\n%%EOF")
+    source.fetch_metadata = MagicMock(return_value=_metadata("goodone", "badone"))
+    source.db.get_latest_house_generation = MagicMock(return_value="captured-g1")
+    source._save_parse_results = MagicMock()
+
+    def fake_worker(path):
+        if path.stem == "badone":
+            raise ParserCascadeError(f"{path}: unresolved parser completeness: boom")
+        return path, [], ["pdfplumber", "won:pdfplumber"]
+
+    monkeypatch.setattr(download_module, "_parse_pdf_worker", fake_worker)
+
+    class FakePool:
+        def __init__(self, _workers):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def map(self, worker, paths):
+            return [worker(path) for path in paths]
+
+    monkeypatch.setattr(download_module, "Pool", FakePool)
+    try:
+        with caplog.at_level(logging.WARNING, logger="analyzer.download"):
+            source.parse_cached_pdfs(2021, force=True)
+    finally:
+        source.close()
+        db.close()
+
+    results = source._save_parse_results.call_args.args[1]
+    assert [pdf_path.stem for pdf_path, _tx, _engines in results] == ["goodone"]
+    failure_warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "badone" in record.getMessage()
+    ]
+    assert failure_warnings, "expected a warning naming the failed doc_id"
+    assert any("1/2" in record.getMessage() for record in failure_warnings)
 
 
 

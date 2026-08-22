@@ -198,13 +198,14 @@ def _reconcile_rows(*row_sets: list[list[str]]) -> list[list[str]]:
 def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
     try:
         from pdf2image import convert_from_path
+        from pdf2image.exceptions import PDFPopplerTimeoutError
         import pytesseract
     except ImportError as exc:
         raise OcrBackendError(f"OCR dependencies unavailable: {exc}") from exc
 
     try:
         images = convert_from_path(str(pdf_path), dpi=200, timeout=_RASTERIZE_TIMEOUT)
-    except Exception as exc:
+    except (OSError, ValueError, PDFPopplerTimeoutError) as exc:
         raise OcrBackendError(f"failed to rasterize {pdf_path}: {exc}") from exc
     if not images:
         raise OcrBackendError(f"rasterizer returned no pages for {pdf_path}")

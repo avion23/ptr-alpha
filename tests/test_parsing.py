@@ -738,6 +738,17 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def _pdf2image_stub(convert_from_path):
+    """Build a pdf2image module double including the exceptions submodule
+    that ocr_parser imports PDFPopplerTimeoutError from."""
+    pdf2image = ModuleType("pdf2image")
+    pdf2image.convert_from_path = convert_from_path
+    exceptions = ModuleType("pdf2image.exceptions")
+    exceptions.PDFPopplerTimeoutError = type("PDFPopplerTimeoutError", (Exception,), {})
+    pdf2image.exceptions = exceptions
+    return pdf2image, exceptions
+
+
 class TestLocalOcrCanaries(unittest.TestCase):
     def test_tickerless_legacy_two_digit_year(self):
         from analyzer.parsing.ocr_parser import _parse_ocr_text_to_rows
@@ -764,10 +775,9 @@ class TestLocalOcrCanaries(unittest.TestCase):
             def close(self):
                 pass
 
-        pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi, timeout=None: [
-            Image("original")
-        ]
+        pdf2image, pdf2image_exceptions = _pdf2image_stub(
+            lambda path, dpi, timeout=None: [Image("original")]
+        )
         pytesseract = ModuleType("pytesseract")
         pytesseract.image_to_osd = lambda image, timeout=None: "Rotate: 90\n"
         pytesseract.image_to_string = lambda image, timeout=None: (
@@ -776,7 +786,12 @@ class TestLocalOcrCanaries(unittest.TestCase):
             else "Microsoft P 01/16/24 $15,001 - $50,000"
         )
         with patch.dict(
-            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+            sys.modules,
+            {
+                "pdf2image": pdf2image,
+                "pdf2image.exceptions": pdf2image_exceptions,
+                "pytesseract": pytesseract,
+            },
         ):
             tables = extract_tables_with_ocr(Path("canary.pdf"))
 
@@ -794,8 +809,9 @@ class TestLocalOcrCanaries(unittest.TestCase):
             def close(self):
                 pass
 
-        pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi, timeout=None: [Image()]
+        pdf2image, pdf2image_exceptions = _pdf2image_stub(
+            lambda path, dpi, timeout=None: [Image()]
+        )
         pytesseract = ModuleType("pytesseract")
         pytesseract.image_to_string = lambda image, timeout=None: (
             "Apple (AAPL) P 01/15/24 $1,001 - $15,000"
@@ -804,7 +820,12 @@ class TestLocalOcrCanaries(unittest.TestCase):
             RuntimeError("osd unavailable")
         )
         with patch.dict(
-            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+            sys.modules,
+            {
+                "pdf2image": pdf2image,
+                "pdf2image.exceptions": pdf2image_exceptions,
+                "pytesseract": pytesseract,
+            },
         ):
             with self.assertRaises(OcrIncompleteError) as raised:
                 extract_tables_with_ocr(Path("orientation.pdf"))
@@ -823,18 +844,24 @@ class TestLocalOcrCanaries(unittest.TestCase):
             def close(self):
                 pass
 
-        pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi, timeout=None: [
-            Image(1),
-            Image(2),
-        ]
+        pdf2image, pdf2image_exceptions = _pdf2image_stub(
+            lambda path, dpi, timeout=None: [
+                Image(1),
+                Image(2),
+            ]
+        )
         pytesseract = ModuleType("pytesseract")
         pytesseract.image_to_string = lambda image, timeout=None: (
             "Apple (AAPL) P 01/15/24 $1,001 - $15,000" if image.page == 1 else ""
         )
         pytesseract.image_to_osd = lambda image, timeout=None: "Rotate: 0\n"
         with patch.dict(
-            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+            sys.modules,
+            {
+                "pdf2image": pdf2image,
+                "pdf2image.exceptions": pdf2image_exceptions,
+                "pytesseract": pytesseract,
+            },
         ):
             with self.assertRaisesRegex(OcrIncompleteError, "page 2") as raised:
                 extract_tables_with_ocr(Path("partial.pdf"))
@@ -843,13 +870,17 @@ class TestLocalOcrCanaries(unittest.TestCase):
     def test_backend_failure_is_not_true_zero(self):
         from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
 
-        pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi, timeout=None: (
-            _ for _ in ()
-        ).throw(ValueError("corrupt"))
+        pdf2image, pdf2image_exceptions = _pdf2image_stub(
+            lambda path, dpi, timeout=None: (_ for _ in ()).throw(ValueError("corrupt"))
+        )
         pytesseract = ModuleType("pytesseract")
         with patch.dict(
-            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+            sys.modules,
+            {
+                "pdf2image": pdf2image,
+                "pdf2image.exceptions": pdf2image_exceptions,
+                "pytesseract": pytesseract,
+            },
         ):
             with self.assertRaisesRegex(OcrBackendError, "failed to rasterize"):
                 extract_tables_with_ocr(Path("corrupt.pdf"))
@@ -867,9 +898,10 @@ class TestLocalOcrCanaries(unittest.TestCase):
         rasterize_timeouts = []
         call_timeouts = []
 
-        pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi, timeout=None: (
-            rasterize_timeouts.append(timeout) or [Image()]
+        pdf2image, pdf2image_exceptions = _pdf2image_stub(
+            lambda path, dpi, timeout=None: (
+                rasterize_timeouts.append(timeout) or [Image()]
+            )
         )
         pytesseract = ModuleType("pytesseract")
 
@@ -879,7 +911,12 @@ class TestLocalOcrCanaries(unittest.TestCase):
 
         pytesseract.image_to_string = timed_out
         with patch.dict(
-            sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+            sys.modules,
+            {
+                "pdf2image": pdf2image,
+                "pdf2image.exceptions": pdf2image_exceptions,
+                "pytesseract": pytesseract,
+            },
         ):
             with self.assertRaisesRegex(OcrIncompleteError, "page 1"):
                 extract_tables_with_ocr(Path("slow.pdf"))
@@ -910,17 +947,21 @@ class TestLocalOcrCanaries(unittest.TestCase):
             clock["now"] += 400.0
             return f"Apple (AAPL) P 01/15/24 $1,001 - $15,000 p{image.page}"
 
-        pdf2image = ModuleType("pdf2image")
-        pdf2image.convert_from_path = lambda path, dpi, timeout=None: [
-            Image(n) for n in range(1, 6)
-        ]
+        pdf2image, pdf2image_exceptions = _pdf2image_stub(
+            lambda path, dpi, timeout=None: [Image(n) for n in range(1, 6)]
+        )
         pytesseract = ModuleType("pytesseract")
         pytesseract.image_to_string = fake_to_string
         pytesseract.image_to_osd = lambda image, timeout=None: "Rotate: 0\n"
 
         with (
             patch.dict(
-                sys.modules, {"pdf2image": pdf2image, "pytesseract": pytesseract}
+                sys.modules,
+                {
+                    "pdf2image": pdf2image,
+                    "pdf2image.exceptions": pdf2image_exceptions,
+                    "pytesseract": pytesseract,
+                },
             ),
             patch.object(ocr_parser.time, "monotonic", fake_monotonic),
         ):
@@ -1074,6 +1115,71 @@ class TestLocalOcrCanaries(unittest.TestCase):
         ):
             _, rows, _ = parser_cascade._parse_pdf_worker(Path("duplicates.pdf"))
         self.assertEqual(rows, [row] * 5)
+
+    def test_ocr_rasterizer_timeout_maps_to_backend_error(self):
+        from pdf2image.exceptions import PDFPopplerTimeoutError
+
+        from analyzer.parsing import ocr_parser
+
+        def fake_convert(*_args, **_kwargs):
+            raise PDFPopplerTimeoutError("pdftoppm timed out")
+
+        with patch("pdf2image.convert_from_path", fake_convert):
+            with self.assertRaises(ocr_parser.OcrBackendError):
+                ocr_parser.extract_tables_with_ocr(Path("9116267.pdf"))
+
+    def test_ocr_rasterizer_unexpected_type_error_propagates_loudly(self):
+        from analyzer.parsing import ocr_parser
+
+        def fake_convert(*_args, **_kwargs):
+            raise TypeError("unexpected keyword argument")
+
+        with patch("pdf2image.convert_from_path", fake_convert):
+            with self.assertRaises(TypeError):
+                ocr_parser.extract_tables_with_ocr(Path("9116267.pdf"))
+
+    def test_docling_timeout_kills_process_group_and_propagates(self):
+        import signal
+        import subprocess
+
+        from analyzer.parsing import docling_parser
+
+        killed = {}
+
+        class FakeProcess:
+            pid = 4242
+
+            @staticmethod
+            def communicate(timeout=None):
+                raise subprocess.TimeoutExpired(cmd="docling", timeout=timeout)
+
+            @staticmethod
+            def wait(timeout=None):
+                return -signal.SIGKILL
+
+        def fake_popen(_cmd, **kwargs):
+            assert kwargs.get("start_new_session") is True
+            assert kwargs.get("stdout") == subprocess.PIPE
+            return FakeProcess()
+
+        with (
+            patch.object(
+                docling_parser.shutil, "which", return_value="/usr/local/bin/uvx"
+            ),
+            patch.object(docling_parser.subprocess, "Popen", fake_popen),
+            patch.object(docling_parser.os, "getpgid", side_effect=lambda pid: pid),
+            patch.object(
+                docling_parser.os,
+                "killpg",
+                side_effect=lambda pgid, sig: killed.update(pgid=pgid, sig=sig),
+            ),
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                docling_parser.extract_tables_with_docling(
+                    Path("9116267.pdf"), timeout=300
+                )
+
+        self.assertEqual(killed, {"pgid": 4242, "sig": signal.SIGKILL})
 
     def test_known_real_pdf_hash_and_row_count_canaries(self):
         from analyzer.parser_cascade import _parse_pdf_worker

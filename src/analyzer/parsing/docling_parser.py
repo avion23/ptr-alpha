@@ -9,8 +9,10 @@ parsers below.
 """
 
 import logging
+import os
 import re
 import shutil
+import signal
 import subprocess  # nosec B404
 import tempfile
 from pathlib import Path
@@ -76,24 +78,39 @@ def _build_docling_cmd(pdf_path: Path) -> list[str] | None:
 
 def _run_docling(full_cmd: list[str], pdf_path: Path, timeout: int) -> str | None:
     try:
-        result = subprocess.run(  # nosec B603
+        # start_new_session gives uvx its own process group so that a timeout
+        # can SIGKILL its docling grandchildren too; orphaned grandchildren
+        # otherwise hold our captured stdout/stderr write-ends open and stall
+        # the calling pool worker past the deadline.
+        process = subprocess.Popen(  # nosec B603
             full_cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             errors="replace",
-            timeout=timeout,
+            start_new_session=True,
         )
-        if result.returncode != 0:
-            logger.debug(
-                f"docling failed for {pdf_path}: rc={result.returncode}, stderr tail={result.stderr[-300:]}"
-            )
-            return None
-    except subprocess.TimeoutExpired as e:
-        logger.debug(f"docling timed out for {pdf_path}: {e}")
-        return None
     except OSError as e:
         # FileNotFoundError (uvx/docling missing), PermissionError, etc.
         logger.debug(f"docling failed to spawn for {pdf_path}: {e}")
+        return None
+
+    try:
+        _stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(process.pid)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.debug(f"docling pid {process.pid} survived group kill")
+        logger.debug(f"docling timed out for {pdf_path} after {timeout}s")
+        raise
+
+    if process.returncode != 0:
+        logger.debug(
+            f"docling failed for {pdf_path}: rc={process.returncode}, "
+            f"stderr tail={stderr[-300:]}"
+        )
         return None
 
     # Docling emits <stem>.md and <stem>.json in the output dir
@@ -101,6 +118,14 @@ def _run_docling(full_cmd: list[str], pdf_path: Path, timeout: int) -> str | Non
     if not md_files:
         return None
     return md_files[0].read_text(encoding="utf-8", errors="ignore")
+
+
+def _kill_process_group(pid: int) -> None:
+    """Best-effort SIGKILL of the child's whole process group."""
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except OSError as e:
+        logger.debug(f"could not kill process group of pid {pid}: {e}")
 
 
 def _parse_markdown_tables(text: str) -> list[list[list[str]]]:

@@ -27,10 +27,14 @@ from analyzer.parsing import (
     consolidate_transactions,
     normalize_house_metadata,
 )
-from analyzer.parser_cascade import _is_valid_pdf, _parse_pdf_worker
+from analyzer.parser_cascade import (
+    ParserCascadeError,
+    _is_valid_pdf,
+    _parse_pdf_worker,
+)
 
 logger = logging.getLogger(__name__)
-_PARSE_VERSION = "v4-deterministic"
+_PARSE_VERSION = "v5-deterministic"
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,12 +577,27 @@ class HouseTransactionSource(TransactionSource):
         member_lookup = _build_member_lookup(existing_docs)
         logger.info(f"Parsing {len(pdf_paths)} PDFs for {year}")
 
+        results: list = []
+        failed_docs: list[str] = []
         with Pool(self.parallel_workers) as pool:
-            results = pool.map(_parse_pdf_worker, pdf_paths)
+            parsed = pool.map(_tolerant_parse_pdf_worker, pdf_paths)
+        for pdf_path, transactions, engines_attempted in parsed:
+            error_detail = _engine_error_detail(engines_attempted)
+            if error_detail is None:
+                results.append((pdf_path, transactions, engines_attempted))
+            else:
+                failed_docs.append(f"{pdf_path.stem} ({error_detail})")
 
-        self._save_parse_results(
-            year, results, member_lookup, ingestion_generation
-        )
+        if failed_docs:
+            logger.warning(
+                "Excluding %d/%d unparseable PDFs for %d from save: %s",
+                len(failed_docs),
+                len(pdf_paths),
+                year,
+                "; ".join(failed_docs),
+            )
+
+        self._save_parse_results(year, results, member_lookup, ingestion_generation)
 
     def _save_parse_results(
         self,
@@ -672,6 +691,33 @@ class HouseTransactionSource(TransactionSource):
 
 
 # ── Helpers ──
+
+
+_PARSE_FAILURE_PREFIX = "__parse_failed__:"
+
+
+def _tolerant_parse_pdf_worker(pdf_path: Path):
+    """Run the accepted cascade; convert per-PDF failures into sentinel results
+    so one bad document cannot discard the whole year's batch.
+
+    The cascade itself appends transient ``error:<engine>`` entries inside
+    successful results, so whole-doc failures must use a dedicated prefix that
+    never collides with those.
+    """
+    try:
+        return _parse_pdf_worker(pdf_path)
+    except ParserCascadeError as exc:
+        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{exc}"]
+    except Exception as exc:  # noqa: BLE001 -- per-PDF quarantine boundary
+        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{type(exc).__name__}:{exc}"]
+
+
+def _engine_error_detail(engines_attempted: list[str]) -> str | None:
+    """Return the quarantine detail when a tolerant worker reported failure."""
+    for engine in engines_attempted:
+        if engine.startswith(_PARSE_FAILURE_PREFIX):
+            return engine[len(_PARSE_FAILURE_PREFIX) :]
+    return None
 
 
 def _valid_pdf_bytes(content: bytes) -> bool:

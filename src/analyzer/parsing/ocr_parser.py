@@ -6,9 +6,17 @@ extracts ticker / tx-type / date / amount rows from the resulting plaintext.
 """
 
 import re
+import time
 from pathlib import Path
 
 from analyzer.models import TransactionType
+
+# Bound every external OCR subprocess so one pathological PDF cannot stall a
+# refresh worker indefinitely (observed: pool worker blocked for 50+ minutes
+# at ~0 CPU waiting on an unbounded poppler/tesseract child).
+_OCR_CALL_TIMEOUT = 90
+_RASTERIZE_TIMEOUT = 120
+_OCR_DOCUMENT_BUDGET = 600
 
 
 class OcrBackendError(RuntimeError):
@@ -26,7 +34,7 @@ class OcrIncompleteError(OcrBackendError):
 def _orient_image(image, pytesseract):
     """Return an upright image when Tesseract detects a rotated scan."""
     try:
-        osd = pytesseract.image_to_osd(image)
+        osd = pytesseract.image_to_osd(image, timeout=_OCR_CALL_TIMEOUT)
         match = re.search(r"^Rotate:\s*(90|180|270)\s*$", osd, re.MULTILINE)
         if not match:
             return image
@@ -190,29 +198,39 @@ def _reconcile_rows(*row_sets: list[list[str]]) -> list[list[str]]:
 def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
     try:
         from pdf2image import convert_from_path
+        from pdf2image.exceptions import PDFPopplerTimeoutError
         import pytesseract
     except ImportError as exc:
         raise OcrBackendError(f"OCR dependencies unavailable: {exc}") from exc
 
     try:
-        images = convert_from_path(str(pdf_path), dpi=200)
-    except (OSError, ValueError) as exc:
+        images = convert_from_path(str(pdf_path), dpi=200, timeout=_RASTERIZE_TIMEOUT)
+    except (OSError, ValueError, PDFPopplerTimeoutError) as exc:
         raise OcrBackendError(f"failed to rasterize {pdf_path}: {exc}") from exc
     if not images:
         raise OcrBackendError(f"rasterizer returned no pages for {pdf_path}")
 
     all_rows: list[list[str]] = []
     incomplete_pages: list[str] = []
+    started_at = time.monotonic()
     for page_number, image in enumerate(images, start=1):
+        if time.monotonic() - started_at > _OCR_DOCUMENT_BUDGET:
+            incomplete_pages.extend(
+                f"page {n}: ocr deadline exceeded"
+                for n in range(page_number, len(images) + 1)
+            )
+            break
         oriented_image = image
         first_rows: list[list[str]] = []
         try:
-            first_text = pytesseract.image_to_string(image)
+            first_text = pytesseract.image_to_string(image, timeout=_OCR_CALL_TIMEOUT)
             first_rows = _parse_ocr_text_to_rows(first_text)
             oriented_image = _orient_image(image, pytesseract)
             page_rows = first_rows
             if oriented_image is not image:
-                oriented_text = pytesseract.image_to_string(oriented_image)
+                oriented_text = pytesseract.image_to_string(
+                    oriented_image, timeout=_OCR_CALL_TIMEOUT
+                )
                 oriented_rows = _parse_ocr_text_to_rows(oriented_text)
                 page_rows = _reconcile_rows(first_rows, oriented_rows)
             all_rows.extend(page_rows)

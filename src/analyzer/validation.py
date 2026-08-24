@@ -2006,7 +2006,7 @@ def _run_validation_with_db(
                 else ["SPY"]
             )
             prices = db.get_prices(tickers, tx_start, price_end)
-            entry_prices = db.get_entry_prices(tickers, tx_start, price_end)
+            db.get_entry_prices(tickers, tx_start, price_end)
             test_result, test_series = _run_frozen(
                 all_tx, prices, signals, config, test_start, test_effective_end
             )

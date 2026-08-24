@@ -10,15 +10,28 @@ from analyzer.exceptions import AnalysisError
 from analyzer.member_ranking.buyer_scoring import score_ticker_by_buyers
 
 
-def _transactions(names=("Alice", "Bob", "Carol")) -> pd.DataFrame:
+def _transactions(
+    names=("Alice", "Bob", "Carol"),
+    ticker="AAPL",
+    disclosure_dates=None,
+    transaction_types=None,
+) -> pd.DataFrame:
+    names = list(names)
+    disclosure_dates = (
+        disclosure_dates
+        or [
+            "2024-05-10",
+            "2024-05-12",
+            "2024-05-14",
+        ][: len(names)]
+    )
+    transaction_types = transaction_types or ["Purchase"] * len(names)
     return pd.DataFrame(
         {
-            "member": list(names),
-            "ticker": ["AAPL"] * len(names),
-            "disclosure_date": pd.to_datetime(
-                ["2024-05-10", "2024-05-12", "2024-05-14"][: len(names)]
-            ),
-            "transaction_type": ["Purchase"] * len(names),
+            "member": names,
+            "ticker": [ticker] * len(names),
+            "disclosure_date": pd.to_datetime(disclosure_dates),
+            "transaction_type": transaction_types,
         }
     )
 
@@ -69,6 +82,151 @@ def test_consensus_uses_absolute_age_from_explicit_as_of_date():
     assert late.iloc[0]["signal_score_raw"] == pytest.approx(
         early.iloc[0]["signal_score_raw"] * np.exp(-0.03 * 30)
     )
+
+
+def test_consensus_excludes_blank_canonical_member_identities_before_counting():
+    result = score_ticker_by_buyers(
+        "AAPL",
+        _transactions(("Alice", "  ", "\t")),
+        as_of_date=pd.Timestamp("2024-05-20"),
+        min_buyers=2,
+    )
+
+    assert result.iloc[0]["num_buyers"] == 1
+    assert "minimum buyer threshold" in result.iloc[0]["note"]
+
+
+@pytest.mark.parametrize("ticker", ["", "   ", "NOT_A_TICKER", "CASH", "BOND", "SP"])
+def test_consensus_rejects_invalid_or_non_equity_tickers(ticker):
+    with pytest.raises(AnalysisError, match="ticker|Ticker"):
+        score_ticker_by_buyers(
+            ticker,
+            _transactions(ticker=ticker),
+            as_of_date=pd.Timestamp("2024-05-20"),
+            min_buyers=1,
+        )
+
+
+def test_consensus_excludes_sales_before_counting_buyers():
+    result = score_ticker_by_buyers(
+        "AAPL",
+        _transactions(
+            ("Alice", "Bob", "Carol"),
+            transaction_types=["Purchase", "Sale", "Purchase"],
+        ),
+        as_of_date=pd.Timestamp("2024-05-20"),
+        min_buyers=1,
+    )
+
+    assert result.iloc[0]["num_buyers"] == 2
+    assert result.iloc[0]["total_buyer_trades"] == 2
+    assert "BOB" not in result.iloc[0]["buyers"]
+
+
+def test_consensus_excludes_non_equity_provenance_rows_before_counting():
+    transactions = _transactions(("Alice", "Bob", "Carol"))
+    transactions["ticker_origin"] = ["official", "non_equity", "official"]
+
+    result = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=pd.Timestamp("2024-05-20"), min_buyers=1
+    )
+
+    assert result.iloc[0]["num_buyers"] == 2
+    assert result.iloc[0]["total_buyer_trades"] == 2
+
+
+def test_consensus_excludes_option_instrument_rows_before_counting():
+    transactions = _transactions(("Alice", "Option Buyer", "Carol"))
+    transactions["instrument_type"] = ["stock", "call", "put"]
+
+    result = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=pd.Timestamp("2024-05-20"), min_buyers=1
+    )
+
+    assert result.iloc[0]["num_buyers"] == 1
+    assert result.iloc[0]["total_buyer_trades"] == 1
+
+
+def test_consensus_excludes_future_disclosures_before_counting_buyers():
+    result = score_ticker_by_buyers(
+        "AAPL",
+        _transactions(
+            ("Alice", "Bob", "Carol"),
+            disclosure_dates=["2024-05-10", "2024-05-12", "2024-05-21"],
+        ),
+        as_of_date=pd.Timestamp("2024-05-20"),
+        min_buyers=1,
+    )
+
+    assert result.iloc[0]["num_buyers"] == 2
+    assert result.iloc[0]["total_buyer_trades"] == 2
+
+
+@pytest.mark.parametrize(
+    ("requested_ticker", "stored_ticker"),
+    [("AAPL", "AAPL"), ("brk.b", "BRK.B"), ("BRK", "BRK.B"), ("FB", "FB")],
+)
+def test_consensus_accepts_valid_symbols_and_resolver_aliases(
+    requested_ticker, stored_ticker
+):
+    result = score_ticker_by_buyers(
+        requested_ticker,
+        _transactions(ticker=stored_ticker),
+        as_of_date=pd.Timestamp("2024-05-20"),
+        min_buyers=1,
+    )
+
+    assert result.iloc[0]["num_buyers"] == 3
+    assert result.iloc[0]["scoring_mode"] == "consensus"
+
+
+def test_historical_modes_remain_descriptive_without_consensus_cutoff():
+    transactions = _transactions(
+        ("Alice", "Bob"),
+        disclosure_dates=["2024-05-10", "2025-05-12"],
+    )
+    rankings = pd.DataFrame(
+        {
+            "member": ["ALICE", "BOB"],
+            "shrunk_alpha": [10.0, 20.0],
+            "purchase_trades": [2, 3],
+        }
+    )
+
+    result = score_ticker_by_buyers(
+        "AAPL",
+        transactions,
+        signals_df=pd.DataFrame({"member": ["training"]}),
+        member_rankings=rankings,
+        scoring_mode="shrunk_alpha",
+        min_buyers=1,
+    )
+
+    assert result.iloc[0]["num_buyers"] == 2
+    assert result.iloc[0]["scoring_mode"] == "shrunk_alpha"
+
+
+def test_historical_modes_keep_exact_ticker_and_member_lookup_behavior():
+    transactions = _transactions(("Alice", " "), ticker="aapl")
+    rankings = pd.DataFrame(
+        {
+            "member": ["ALICE"],
+            "shrunk_alpha": [10.0],
+            "purchase_trades": [2],
+        }
+    )
+
+    result = score_ticker_by_buyers(
+        "aapl",
+        transactions,
+        signals_df=pd.DataFrame({"member": ["training"]}),
+        member_rankings=rankings,
+        scoring_mode="shrunk_alpha",
+        min_buyers=1,
+    )
+
+    assert result.iloc[0]["ticker"] == "aapl"
+    assert result.iloc[0]["num_buyers"] == 2
 
 
 def test_scoring_mode_typo_and_probability_times_alpha_are_rejected():

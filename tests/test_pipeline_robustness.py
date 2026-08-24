@@ -141,8 +141,8 @@ def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     as_of = date(2025, 6, 1)
     with (
         patch(
-            "analyzer.pipeline.prepare_live_analysis_data",
-            return_value=(_consensus_test_trades(), pd.DataFrame(), pd.DataFrame()),
+            "analyzer.pipeline.prepare_live_consensus_data",
+            return_value=_consensus_test_trades(),
         ),
         patch(
             "analyzer.pipeline.analysis.rank_members",
@@ -171,6 +171,88 @@ def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     assert scored["num_buyers"] == 2
     assert scored["scoring_mode"] == "consensus"
     assert scored["signal_score_raw"] > 0
+
+
+def test_recent_ticker_scoring_consensus_is_transaction_only():
+    as_of = date(2025, 6, 1)
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = (
+        _consensus_test_trades()
+    )
+    price_source = MagicMock()
+    with (
+        patch(
+            "analyzer.pipeline.analysis.calculate_signal_potential",
+            side_effect=AssertionError("live consensus must not build labels"),
+        ),
+        patch(
+            "analyzer.pipeline.analysis.rank_members",
+            side_effect=AssertionError("live consensus must not rank history"),
+        ),
+        patch(
+            "analyzer.member_ranking.buyer_scoring.rank_members",
+            side_effect=AssertionError("live consensus must not rank history"),
+        ),
+    ):
+        result = run_recent_ticker_scoring(
+            transaction_source,
+            price_source,
+            TickerScoringParams(
+                year=2025,
+                horizons=(90,),
+                as_of_date=as_of,
+                days_back=28,
+                min_buyers=2,
+                top_n=1,
+                training_lookback_days=365,
+            ),
+        )
+
+    assert result.success
+    assert result.data["result"]["ticker"].tolist() == ["AAPL"]
+    assert result.data["top_n"] == 1
+    assert result.data["days_back"] == 28
+    assert result.data["min_buyers"] == 2
+    assert result.data["as_of_date"] == as_of
+    transaction_source.db.get_transactions_by_date_range.assert_called_once_with(
+        pd.Timestamp("2024-03-03"),
+        pd.Timestamp(as_of),
+    )
+    price_source.get_prices.assert_not_called()
+    transaction_source.db.get_entry_prices.assert_not_called()
+
+
+def test_recent_ticker_scoring_filters_rejected_symbols_before_candidate_gate():
+    as_of = date(2025, 6, 1)
+    rejected = pd.DataFrame(
+        {
+            "member": ["Invalid Buyer One", "Invalid Buyer Two"],
+            "ticker": ["SP", "SP"],
+            "transaction_date": pd.to_datetime(["2025-05-26", "2025-05-27"]),
+            "disclosure_date": pd.to_datetime(["2025-05-28", "2025-05-29"]),
+            "transaction_type": ["Purchase", "Purchase"],
+        }
+    )
+    trades = pd.concat([_consensus_test_trades(), rejected], ignore_index=True)
+
+    with patch(
+        "analyzer.pipeline.prepare_live_consensus_data",
+        return_value=trades,
+    ):
+        result = run_recent_ticker_scoring(
+            MagicMock(),
+            MagicMock(),
+            TickerScoringParams(
+                year=2025,
+                horizons=(90,),
+                as_of_date=as_of,
+                days_back=28,
+                min_buyers=2,
+            ),
+        )
+
+    assert result.success
+    assert result.data["result"]["ticker"].tolist() == ["AAPL"]
 
 
 def test_cli_as_of_reaches_single_ticker_analysis_params():
@@ -209,6 +291,7 @@ def test_cli_as_of_reaches_single_ticker_analysis_params():
     assert len(captured) == 1
     assert captured[0].as_of_date == date(2025, 6, 1)
 
+
 def test_refresh_stops_before_parse_and_backup_when_house_fetch_is_incomplete(
     tmp_path,
 ):
@@ -233,7 +316,6 @@ def test_refresh_stops_before_parse_and_backup_when_house_fetch_is_incomplete(
     assert "missing 1: 2002 (HTTP 503)" in result.output
     parse_pipeline.assert_not_called()
     capitol_source.assert_not_called()
-
 
 
 def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
@@ -276,7 +358,10 @@ def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
         db.close()
 
     assert result.exit_code == 0, result.output
-    fetched_years = [call.args[0] for call in ctx.transaction_source.fetch_and_cache_pdfs.call_args_list]
+    fetched_years = [
+        call.args[0]
+        for call in ctx.transaction_source.fetch_and_cache_pdfs.call_args_list
+    ]
     parsed_years = [call.args[1] for call in parse_pipeline.call_args_list]
     assert fetched_years == list(range(2015, date.today().year + 1))
     assert parsed_years == fetched_years
@@ -358,3 +443,90 @@ def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):
     assert "SPY_BUY_HOLD" in summary["rank"].tolist()
     assert summary.attrs["spy_benchmark_status"] == "available"
     assert summary.attrs["spy_benchmark_reason"] is None
+
+
+def test_backtest_pipeline_keeps_supported_no_recommendation_dates_as_cash(tmp_path):
+    transactions = pd.DataFrame(
+        {
+            "member": ["Alice"],
+            "ticker": ["AAPL"],
+            "transaction_date": pd.to_datetime(["2024-12-01"]),
+            "disclosure_date": pd.to_datetime(["2024-12-02"]),
+            "transaction_type": ["Purchase"],
+        }
+    )
+    index = pd.date_range("2024-11-01", "2025-01-20", freq="D")
+    prices = pd.DataFrame(
+        {
+            "AAPL": range(100, 100 + len(index)),
+            "SPY": range(400, 400 + len(index)),
+        },
+        index=index,
+    )
+    evaluated = pd.DataFrame(
+        {
+            "rank": [1],
+            "ticker": ["AAPL"],
+            "bt_return_pct": [10.0],
+            "bt_alpha_pct": [5.0],
+            "bt_raw_return_pct": [10.0],
+            "bt_entry_date": [date(2025, 1, 3)],
+            "bt_exit_date": [date(2025, 1, 10)],
+            "bt_leverage": [1.0],
+        }
+    )
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = transactions
+    price_source = MagicMock()
+    price_source.get_prices.return_value = prices
+
+    with (
+        patch("analyzer.pipeline.create_snapshot", return_value=MagicMock()),
+        patch("analyzer.pipeline.save_snapshot"),
+        patch(
+            "analyzer.pipeline._entry_prices_from_matrix",
+            return_value=pd.DataFrame({"entry_price": [100.0]}),
+        ),
+        patch(
+            "analyzer.pipeline.analysis.calculate_signal_potential",
+            return_value=pd.DataFrame({"member": ["Alice"]}),
+        ),
+        patch(
+            "analyzer.pipeline.analysis.backtest_recommendations",
+            side_effect=[pd.DataFrame({"ticker": ["AAPL"]}), pd.DataFrame()],
+        ),
+        patch("analyzer.pipeline.analysis.evaluate_backtest", return_value=evaluated),
+        patch("analyzer.pipeline._benchmark_return", side_effect=[4.0, 5.0]),
+    ):
+        result = run_backtest_pipeline(
+            BacktestParams(
+                start_date=date(2025, 1, 2),
+                end_date=date(2025, 1, 3),
+                horizon=7,
+                frequency_days=1,
+            ),
+            transaction_source,
+            price_source,
+            data_dir=tmp_path,
+        )
+
+    assert result.success
+    assert result.data["evaluable_dates"] == 2
+    assert result.data["total_as_of_dates"] == 2
+
+    combined = result.data["combined"]
+    assert set(combined["as_of_date"]) == {date(2025, 1, 2), date(2025, 1, 3)}
+    cash = combined[combined["status"] == "cash"].iloc[0]
+    assert cash["recommendation_count"] == 0
+    assert cash["bt_return_pct"] == 0.0
+    assert cash["spy_return_pct"] == 5.0
+    assert cash["net_alpha_pct"] == -5.0
+
+    observations = result.data["date_observations"]
+    assert len(observations) == 2
+    no_trade = observations[observations["status"] == "cash"].iloc[0]
+    assert no_trade["recommendation_count"] == 0
+    assert no_trade["strategy_return_pct"] == 0.0
+    assert no_trade["net_alpha_pct"] == -5.0
+    portfolio = result.data["summary"]
+    assert portfolio.loc[portfolio["rank"] == "PORTFOLIO", "count"].iloc[0] == 2

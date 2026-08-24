@@ -23,8 +23,8 @@ def bayesian_win_probability(
         raise ValueError("wins and losses must be non-negative")
     if not 0 < market_prior < 1:
         raise ValueError("market_prior must be strictly between zero and one")
-    if ps <= 0:
-        raise ValueError("prior_strength must be positive")
+    if ps <= 0 or not np.isfinite(ps):
+        raise ValueError("prior_strength must be positive and finite")
     alpha = market_prior * ps
     beta = (1 - market_prior) * ps
     return (alpha + wins) / (alpha + beta + wins + losses)
@@ -43,6 +43,11 @@ def normal_normal_posteriors(
     changes information, not the estimated population. ``information_weights``
     are power-likelihood weights: each group's effective information is their
     sum. Returned member effects are descriptive associations, not causal.
+
+    The between-group variance is the non-negative method-of-moments estimate.
+    When the observed spread of group means is fully explained by sampling
+    noise, the model therefore approaches complete pooling instead of imposing
+    an artificial lower bound equal to one observation's residual variance.
     """
     values = np.asarray(outcomes, dtype=float)
     labels = np.asarray(groups, dtype=object)
@@ -101,7 +106,6 @@ def normal_normal_posteriors(
     variance_floor = max(
         (np.finfo(float).eps * magnitude) ** 2,
         1.0 / np.finfo(float).max,
-
     )
     within_var = max(within_var, variance_floor)
 
@@ -112,11 +116,11 @@ def normal_normal_posteriors(
     )
     mean_sampling_var = float((within_var / group_counts).mean())
     moment_between_var = observed_between - mean_sampling_var
-    # Regularize an unresolved population variance to one observation's noise.
-    # Prior strength is then applied explicitly as precision below, so it
-    # controls shrinkage for every finite between-variance estimate.
-    between_var = max(moment_between_var, within_var, variance_floor)
-
+    # A variance component may legitimately be unresolved at zero. Keeping only
+    # a representability floor yields full pooling in that case; forcing it to
+    # at least within_var would manufacture heterogeneity and under-shrink noisy
+    # member histories.
+    between_var = max(moment_between_var, variance_floor)
 
     weighted_sum = (frame["outcome"] * frame["weight"]).groupby(frame["group"]).sum()
     information = frame.groupby("group", sort=False)["weight"].sum()
@@ -133,13 +137,11 @@ def normal_normal_posteriors(
     posterior_mean = (1.0 - shrinkage) * weighted_means + shrinkage * global_mean
     posterior_var = (within_var / denominator) * between_var
 
-
     return pd.DataFrame(
         {
             "posterior_mean": posterior_mean,
             "posterior_std": np.sqrt(posterior_var),
             "shrinkage": shrinkage,
-
             "effective_information": information,
             "global_mean": global_mean,
             "within_var": within_var,

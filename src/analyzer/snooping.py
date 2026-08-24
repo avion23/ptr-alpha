@@ -1,13 +1,15 @@
-"""Data snooping corrections for multiple hypothesis testing.
+"""Dependence-aware corrections for strategy search and backtest selection.
 
-Corrects for the multiple comparisons problem when running parameter sweeps.
-With 648 tested combinations, some will show spurious alpha by chance.
+The production gate is deliberately conservative:
 
-References:
-- Bonferroni: Bonferroni (1936)
-- Benjamini-Hochberg: Benjamini & Hochberg (1995)
-- Deflated Sharpe Ratio: Bailey & López de Prado (2014)
-- Minimum Backtest Length: Bailey & López de Prado (2012)
+* marginal bootstrap p-values are Bonferroni-corrected over the full family;
+* max-stat resampling is synchronized only for trials with identical calendar
+  support; and
+* support groups are combined with another Bonferroni bound rather than by
+  pretending that ordinal observations from different calendars are aligned.
+
+This module contains statistical primitives only. It does not authorize a
+strategy for deployment; the validation ledger owns that decision.
 """
 
 from __future__ import annotations
@@ -21,22 +23,7 @@ from scipy import stats
 
 
 def bonferroni_correction(n_tests: int, alpha: float = 0.05) -> float:
-    """Compute the Bonferroni-corrected significance threshold.
-
-    The Bonferroni correction controls the family-wise error rate (FWER)
-    by dividing the significance level by the number of tests.
-
-    Args:
-        n_tests: Number of hypotheses tested.
-        alpha: Desired family-wise significance level (default 0.05).
-
-    Returns:
-        Adjusted p-value threshold. A result is significant if
-        p < threshold.
-
-    Raises:
-        ValueError: If n_tests <= 0 or alpha <= 0.
-    """
+    """Return the per-test threshold controlling family-wise error."""
     if n_tests <= 0:
         raise ValueError(f"n_tests must be positive, got {n_tests}")
     if not 0 < alpha < 1:
@@ -47,52 +34,29 @@ def bonferroni_correction(n_tests: int, alpha: float = 0.05) -> float:
 def benjamini_hochberg(
     p_values: list[float] | np.ndarray, alpha: float = 0.05
 ) -> np.ndarray:
-    """Apply the Benjamini-Hochberg procedure to control the false discovery rate.
-
-    Controls FDR at level `alpha` rather than FWER, making it more powerful
-    than Bonferroni when many tests are conducted.
-
-    Args:
-        p_values: Array of p-values from the hypothesis tests.
-        alpha: Desired false discovery rate (default 0.05).
-
-    Returns:
-        Boolean array indicating which hypotheses are rejected.
-
-    Raises:
-        ValueError: If p_values is empty or alpha <= 0.
-    """
+    """Apply the Benjamini-Hochberg false-discovery-rate procedure."""
     p = np.asarray(p_values, dtype=float)
     if p.size == 0:
         raise ValueError("p_values must not be empty")
     if not 0 < alpha < 1:
         raise ValueError(f"alpha must be between zero and one, got {alpha}")
+    if not np.isfinite(p).all() or np.any((p < 0) | (p > 1)):
+        raise ValueError("p_values must be finite probabilities")
 
-    n = len(p)
-    # Sort p-values and track original indices
     sorted_indices = np.argsort(p)
     sorted_p = p[sorted_indices]
-
-    # BH critical values: (rank / n) * alpha
-    ranks = np.arange(1, n + 1)
-    critical_values = ranks / n * alpha
-
-    # Find the largest rank where p <= critical value
+    critical_values = np.arange(1, len(p) + 1) / len(p) * alpha
     below = sorted_p <= critical_values
-    if not below.any():
-        return np.zeros(n, dtype=bool)
-
-    max_rank = np.max(np.where(below)[0]) + 1  # 1-indexed
-
-    # Reject all hypotheses with rank <= max_rank
-    rejected = np.zeros(n, dtype=bool)
-    rejected[sorted_indices[:max_rank]] = True
+    rejected = np.zeros(len(p), dtype=bool)
+    if below.any():
+        last = int(np.flatnonzero(below)[-1])
+        rejected[sorted_indices[: last + 1]] = True
     return rejected
 
 
 @dataclass(frozen=True, slots=True)
 class MaxStatBootstrapResult:
-    """Centered moving-block bootstrap output for a family of strategies."""
+    """Centered circular-block bootstrap output for one strategy family."""
 
     marginal_p_values: np.ndarray
     adjusted_p_values: np.ndarray
@@ -102,10 +66,11 @@ class MaxStatBootstrapResult:
     n_bootstrap: int
     seed: int
     assumptions: tuple[str, ...]
+    support_group_count: int = 1
 
 
 def _hac_tstat(values: np.ndarray, lag: int) -> float:
-    """HAC t-statistic used internally to avoid a validation import cycle."""
+    """Bartlett-kernel HAC t-statistic for a sample mean."""
     x = np.asarray(values, dtype=float)
     x = x[np.isfinite(x)]
     n = len(x)
@@ -132,6 +97,49 @@ def _hac_tstat(values: np.ndarray, lag: int) -> float:
     return float(mean / standard_error)
 
 
+def _normalize_series(value: pd.Series, trial_id: int) -> pd.Series:
+    series = pd.Series(value, dtype=float).dropna().sort_index()
+    if series.empty:
+        raise ValueError(f"trial {trial_id} has no finite observations")
+    if not series.index.is_unique:
+        raise ValueError(f"trial {trial_id} calendar index must be unique")
+    if not np.isfinite(series.to_numpy(dtype=float)).all():
+        raise ValueError(f"trial {trial_id} contains non-finite observations")
+    return series
+
+
+def _calendar_support_groups(
+    series_by_trial: dict[int, pd.Series],
+) -> tuple[dict[int, pd.Series], list[list[int]]]:
+    """Partition trials by exact post-NaN calendar support."""
+    normalized = {
+        int(trial_id): _normalize_series(value, int(trial_id))
+        for trial_id, value in series_by_trial.items()
+    }
+    groups: list[list[int]] = []
+    for trial_id in sorted(normalized):
+        for group in groups:
+            if normalized[trial_id].index.equals(normalized[group[0]].index):
+                group.append(trial_id)
+                break
+        else:
+            groups.append([trial_id])
+    return normalized, groups
+
+
+def _circular_block_sample(
+    centered: np.ndarray,
+    starts: np.ndarray,
+    block_length: int,
+) -> np.ndarray:
+    """Sample one fixed-length circular moving-block path."""
+    n = len(centered)
+    n_blocks = math.ceil(n / block_length)
+    offsets = np.arange(block_length)
+    blocks = [centered[(int(start) + offsets) % n] for start in starts[:n_blocks]]
+    return np.concatenate(blocks)[:n]
+
+
 def max_stat_moving_block_bootstrap(
     series_by_trial: dict[int, pd.Series],
     lags_by_trial: dict[int, int],
@@ -140,77 +148,95 @@ def max_stat_moving_block_bootstrap(
     n_bootstrap: int,
     seed: int,
 ) -> MaxStatBootstrapResult:
-    """Centered one-sided moving-block bootstrap with a family max statistic.
+    """Run a centered, calendar-aware, one-sided family bootstrap.
 
-    Each trial is centered under its zero-mean null. Shared block-start uniforms
-    are used across trials, preserving local serial order and cross-trial
-    dependence for aligned schedules. Configurations with different frequencies
-    use the same uniforms mapped to their own ordinal schedule. Bonferroni remains
-    the arbitrary-dependence gate; max-stat is an additional empirical gate.
+    Trials sharing exactly the same calendar index are resampled jointly with
+    common circular block starts. This preserves observed contemporaneous and
+    serial dependence within that support group. Trials on different calendars
+    are never paired by ordinal row number; their groupwise max-stat p-values
+    are combined with a Bonferroni bound across support groups.
 
-    The bootstrap is refused unless each series contains at least two complete
-    blocks. This prevents an asymptotic p-value from replacing inadequate null
-    support.
+    Each trial must contain at least two complete blocks. Marginal p-values are
+    returned for the separate full-family Bonferroni gate used by validation.
     """
     if not series_by_trial:
         raise ValueError("series_by_trial must not be empty")
     if n_bootstrap < 1:
         raise ValueError("n_bootstrap must be positive")
-    trial_ids = sorted(series_by_trial)
+
+    trial_ids = sorted(int(value) for value in series_by_trial)
     expected = set(trial_ids)
     if set(lags_by_trial) != expected or set(block_lengths_by_trial) != expected:
         raise ValueError(
             "lags and block lengths must match every actual trial_id exactly"
         )
 
-    centered: dict[int, np.ndarray] = {}
+    normalized, support_groups = _calendar_support_groups(series_by_trial)
+    position_by_trial = {
+        trial_id: position for position, trial_id in enumerate(trial_ids)
+    }
     observed = np.empty(len(trial_ids), dtype=float)
-    blocks_needed = 0
-    for position, trial_id in enumerate(trial_ids):
-        values = pd.Series(series_by_trial[trial_id], dtype=float).dropna().to_numpy()
-        block_length = int(block_lengths_by_trial[trial_id])
-        if block_length < 1:
-            raise ValueError("block lengths must be positive")
-        if len(values) < 2 * block_length:
-            raise ValueError(
-                f"trial {trial_id} has {len(values)} observations; "
-                f"at least {2 * block_length} are required for two blocks"
-            )
-        centered[trial_id] = values - float(values.mean())
-        observed[position] = _hac_tstat(values, lags_by_trial[trial_id])
-        blocks_needed = max(blocks_needed, math.ceil(len(values) / block_length))
-
-    rng = np.random.default_rng(seed)
-    shared_uniforms = rng.random((n_bootstrap, blocks_needed))
     null_statistics = np.empty((n_bootstrap, len(trial_ids)), dtype=float)
-    for bootstrap_index in range(n_bootstrap):
-        for position, trial_id in enumerate(trial_ids):
-            values = centered[trial_id]
+    marginal = np.empty(len(trial_ids), dtype=float)
+    group_adjusted = np.empty(len(trial_ids), dtype=float)
+    group_null_maxima: list[np.ndarray] = []
+    rng = np.random.default_rng(seed)
+
+    for group in support_groups:
+        n = len(normalized[group[0]])
+        max_blocks = 0
+        centered: dict[int, np.ndarray] = {}
+        for trial_id in group:
             block_length = int(block_lengths_by_trial[trial_id])
-            n_starts = len(values) - block_length + 1
-            n_blocks = math.ceil(len(values) / block_length)
-            samples = []
-            for uniform in shared_uniforms[bootstrap_index, :n_blocks]:
-                start = min(int(uniform * n_starts), n_starts - 1)
-                samples.append(values[start : start + block_length])
-            bootstrap_values = np.concatenate(samples)[: len(values)]
-            null_statistics[bootstrap_index, position] = _hac_tstat(
-                bootstrap_values, lags_by_trial[trial_id]
+            if block_length < 1:
+                raise ValueError("block lengths must be positive")
+            if n < 2 * block_length:
+                raise ValueError(
+                    f"trial {trial_id} has {n} observations; "
+                    f"at least {2 * block_length} are required for two blocks"
+                )
+            values = normalized[trial_id].to_numpy(dtype=float)
+            centered[trial_id] = values - float(values.mean())
+            observed[position_by_trial[trial_id]] = _hac_tstat(
+                values, int(lags_by_trial[trial_id])
             )
-    null_max = np.max(null_statistics, axis=1)
-    marginal = np.asarray(
-        [
-            (1.0 + float(np.sum(null_statistics[:, position] >= statistic)))
-            / (n_bootstrap + 1.0)
-            for position, statistic in enumerate(observed)
-        ]
-    )
-    adjusted = np.asarray(
-        [
-            (1.0 + float(np.sum(null_max >= statistic))) / (n_bootstrap + 1.0)
-            for statistic in observed
-        ]
-    )
+            max_blocks = max(max_blocks, math.ceil(n / block_length))
+
+        # Common integer starts mean the same calendar date starts every block
+        # for every trial in this support group. Circular blocks avoid an edge
+        # rule that would otherwise differ when block lengths differ.
+        starts = rng.integers(0, n, size=(n_bootstrap, max_blocks))
+        group_positions = [position_by_trial[trial_id] for trial_id in group]
+        for bootstrap_index in range(n_bootstrap):
+            for trial_id in group:
+                position = position_by_trial[trial_id]
+                sampled = _circular_block_sample(
+                    centered[trial_id],
+                    starts[bootstrap_index],
+                    int(block_lengths_by_trial[trial_id]),
+                )
+                null_statistics[bootstrap_index, position] = _hac_tstat(
+                    sampled, int(lags_by_trial[trial_id])
+                )
+
+        group_null = np.max(null_statistics[:, group_positions], axis=1)
+        group_null_maxima.append(group_null)
+        for trial_id in group:
+            position = position_by_trial[trial_id]
+            statistic = observed[position]
+            marginal[position] = (
+                1.0
+                + float(np.sum(null_statistics[:, position] >= statistic))
+            ) / (n_bootstrap + 1.0)
+            group_adjusted[position] = (
+                1.0 + float(np.sum(group_null >= statistic))
+            ) / (n_bootstrap + 1.0)
+
+    support_group_count = len(support_groups)
+    adjusted = np.minimum(group_adjusted * support_group_count, 1.0)
+    # Diagnostic only. Formal cross-group control is the Bonferroni factor above;
+    # no unobserved dependence is invented between different calendar supports.
+    null_max = np.max(np.vstack(group_null_maxima), axis=0)
     return MaxStatBootstrapResult(
         marginal_p_values=marginal,
         adjusted_p_values=adjusted,
@@ -220,10 +246,13 @@ def max_stat_moving_block_bootstrap(
         n_bootstrap=n_bootstrap,
         seed=seed,
         assumptions=(
-            "per-date net-alpha series is locally stationary within moving blocks",
-            "ordinal schedules with different frequencies share dependence through block-start uniforms",
-            "Bonferroni is the controlling arbitrary-dependence gate",
+            "per-date net-alpha series is locally stationary within circular blocks",
+            "block starts are synchronized only inside exact calendar-support groups",
+            "support-group max-stat p-values use Bonferroni control across calendars",
+            "the full-family marginal Bonferroni gate remains the "
+            "arbitrary-dependence control",
         ),
+        support_group_count=support_group_count,
     )
 
 
@@ -234,50 +263,19 @@ def deflated_sharpe_ratio(
     skew: float = 0.0,
     kurtosis: float = 3.0,
 ) -> float:
-    """Compute the Deflated Sharpe Ratio (DSR).
-
-    Adjusts the observed Sharpe ratio for the number of strategies tried,
-    the non-normality of returns, and the estimation error.
-
-    Based on Bailey & López de Prado (2014), "The Deflated Sharpe Ratio".
-
-    Args:
-        observed_sharpe: The Sharpe ratio of the best strategy found.
-        n_trials: Number of strategies/parameter combinations tested.
-        n_observations: Number of independent observations used to compute
-            the Sharpe ratio.
-        skew: Skewness of the returns distribution.
-        kurtosis: Total kurtosis of the returns distribution (default 3.0
-            for normal distribution; internally converted to excess kurtosis).
-
-    Returns:
-        The Deflated Sharpe Ratio (probability that the Sharpe ratio is
-        not due to chance). Values close to 1.0 indicate genuine alpha.
-    """
+    """Return the descriptive probability used by the legacy DSR report."""
     if n_trials <= 0:
         raise ValueError(f"n_trials must be positive, got {n_trials}")
     if n_observations <= 0:
         raise ValueError(f"n_observations must be positive, got {n_observations}")
-
-    # Expected max Sharpe under null (no skill), assuming iid normal returns.
-    # E[max(SR)] ≈ sqrt(2 * ln(n)) for large n, with corrections for
-    # finite samples and non-normality.
     e_max_sr = _expected_max_sharpe(n_trials, n_observations, skew, kurtosis)
-
-    # Standard error of the Sharpe ratio under the null.
-    # The expression under the sqrt can go negative with extreme skew;
-    # clamp to zero in that case (the SE floor is then 0).
     se_sq = (
         1 - skew * observed_sharpe + (kurtosis - 1) / 4 * observed_sharpe**2
     ) / n_observations
     se = math.sqrt(max(se_sq, 0.0))
-
     if se == 0:
         return 1.0 if observed_sharpe >= e_max_sr else 0.0
-
-    # DSR = probability that a standard normal exceeds the deflated z-score.
-    z = (observed_sharpe - e_max_sr) / se
-    return float(stats.norm.cdf(z))
+    return float(stats.norm.cdf((observed_sharpe - e_max_sr) / se))
 
 
 def _expected_max_sharpe(
@@ -286,29 +284,16 @@ def _expected_max_sharpe(
     skew: float = 0.0,
     kurtosis: float = 3.0,
 ) -> float:
-    """Expected maximum Sharpe ratio under the null hypothesis.
-
-    Uses the approximation from Bailey & López de Prado (2014):
-        E[max(SR)] ≈ sqrt(2 * ln(n)) * (1 - γ/(2*ln(n)))
-                      + skew/(6*sqrt(n_obs)) * ... (higher-order terms)
-
-    where γ ≈ 0.5772 is the Euler-Mascheroni constant.
-    """
     if n_trials == 1:
         return 0.0
-    gamma = 0.5772156649015329  # Euler-Mascheroni constant
-
-    # Base term: expected max of n iid standard normals
+    gamma = 0.5772156649015329
     base = math.sqrt(2 * math.log(n_trials)) - (
         gamma / (2 * math.sqrt(2 * math.log(n_trials)))
     )
-
-    # Adjust for non-normality (skew and excess kurtosis)
     excess_kurt = kurtosis - 3.0
     adjustment = skew / (6 * math.sqrt(n_observations)) + excess_kurt / (
         24 * n_observations
     )
-
     return base + adjustment
 
 
@@ -317,47 +302,14 @@ def min_backtest_length(
     sigma: float = 1.0,
     alpha: float = 0.05,
 ) -> float:
-    """Compute the minimum number of years of data needed for significance.
-
-    Given an observed Sharpe ratio, how many years of data do we need
-    for the result to be statistically significant at level `alpha`?
-
-    Uses the formula: T >= (z_alpha * sigma / mu)^2
-    where mu = sharpe * sigma / sqrt(T), solving for T.
-
-    More precisely, for a t-test with T observations:
-        T >= (t_alpha * sigma / mu)^2
-
-    Args:
-        sharpe: Observed annualized Sharpe ratio.
-        sigma: Standard deviation of annual returns (default 1.0).
-        alpha: Desired significance level (default 0.05).
-
-    Returns:
-        Minimum number of years of data required.
-    """
+    """Return the minimum number of annualized Sharpe periods for a z-test."""
+    del sigma  # retained in the public signature for compatibility
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
     if sharpe <= 0:
-        return float("inf")  # Cannot achieve significance with non-positive Sharpe
-
-    # z_alpha for one-sided test (we want to show positive alpha)
+        return float("inf")
     z_alpha = stats.norm.ppf(1 - alpha)
-
-    # For a Sharpe ratio: SR = mu / sigma * sqrt(T)
-    # mu = SR * sigma / sqrt(T)
-    # t-stat = mu / (sigma / sqrt(T)) = SR * sqrt(T)
-    # We need SR * sqrt(T) >= z_alpha
-    # Therefore: T >= (z_alpha / SR)^2
-    t_min = (z_alpha / sharpe) ** 2
-
-    # Convert from observations to years (assuming monthly observations
-    # as a reasonable default for financial data; 12 obs/year).
-    # But actually, we should express this in terms of the observation
-    # frequency. Since we don't know, we return observations and let
-    # the caller convert. However, the task asks for years, so we
-    # assume the Sharpe is annualized and the formula gives years directly.
-    return t_min
+    return float((z_alpha / sharpe) ** 2)
 
 
 def alpha_ttest(
@@ -365,31 +317,23 @@ def alpha_ttest(
     std_alpha: float,
     n_observations: int,
 ) -> tuple[float, float]:
-    """Compute the t-statistic and p-value for the mean alpha.
-
-    Args:
-        mean_alpha: Sample mean of the alpha (e.g., alpha_slope or overall_alpha).
-        std_alpha: Sample standard deviation of the alpha.
-        n_observations: Number of independent observations.
-
-    Returns:
-        Tuple of (t-statistic, two-sided p-value).
-    """
+    """Return a conventional two-sided t-test for a sample mean."""
     if n_observations <= 1:
         return 0.0, 1.0
     se = std_alpha / math.sqrt(n_observations)
     if se == 0:
-        return (
-            float("inf") if mean_alpha > 0 else float("-inf") if mean_alpha < 0 else 0.0
-        ), 1.0
-    t_stat = mean_alpha / se
-    p_value = 2 * (1 - stats.t.cdf(abs(t_stat), df=n_observations - 1))
-    return float(t_stat), float(p_value)
+        statistic = (
+            math.inf if mean_alpha > 0 else -math.inf if mean_alpha < 0 else 0.0
+        )
+        return statistic, 1.0
+    statistic = mean_alpha / se
+    p_value = 2 * (1 - stats.t.cdf(abs(statistic), df=n_observations - 1))
+    return float(statistic), float(p_value)
 
 
 @dataclass(frozen=True, slots=True)
 class SnoopingReport:
-    """Results of data snooping analysis for a single strategy configuration."""
+    """Dependence-aware diagnostics for one selected configuration."""
 
     n_tests: int
     alpha_slope: float
@@ -397,30 +341,24 @@ class SnoopingReport:
     sharpe: float
     n_observations: int
     dates_evaluated: int
-
-    # T-test results
     t_statistic: float
     p_value_raw: float
-
-    # Corrections
     bonferroni_threshold: float
     p_value_bonferroni: float
     significant_bonferroni: bool
-
     bh_rejected: bool
     bh_adjusted_alpha: float
-
     dsr: float
     significant_dsr: bool
-
     min_years: float
     max_stat_p_value: float = 1.0
     deployable: bool = False
-    inference_method: str = "centered_moving_block_bootstrap_bonferroni_max_stat"
+    inference_method: str = (
+        "calendar_grouped_circular_block_bootstrap_bonferroni_max_stat"
+    )
 
     @property
     def significant_bonferroni_any(self) -> bool:
-        """Is the result still significant after Bonferroni correction?"""
         return self.p_value_raw < self.bonferroni_threshold
 
 
@@ -436,13 +374,7 @@ def analyze_snooping(
     n_permutations: int = 999,
     seed: int = 0,
 ) -> SnoopingReport:
-    """Analyze one requested configuration from a complete family of returns.
-
-    Every family row must carry a unique ``trial_id`` and callers must provide
-    exactly one return series, lag, and block length for each actual ID. Summary
-    rows, lone series, positional guesses, missing IDs, and extra IDs are
-    refused. All rewarded p-values come from the centered moving-block bootstrap.
-    """
+    """Analyze one requested configuration from a complete trial family."""
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
     if sweep_results.empty:
@@ -507,9 +439,6 @@ def analyze_snooping(
     selected_series = pd.Series(
         per_date_returns[selected_trial_id], dtype=float
     ).dropna()
-    # This public diagnostic has no access to the production member-identity
-    # runner result and therefore can never authorize deployment.
-    deployable = False
 
     clean = selected_series.to_numpy(dtype=float)
     observed_sharpe = float(row.get("sharpe", 0.0))
@@ -544,5 +473,5 @@ def analyze_snooping(
         significant_dsr=dsr > 0.95,
         min_years=min_backtest_length(observed_sharpe, alpha=alpha),
         max_stat_p_value=max_stat_p,
-        deployable=deployable,
+        deployable=False,
     )

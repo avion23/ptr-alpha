@@ -28,8 +28,12 @@ pip install ".[dev]"
 1. **Data Collection**: Downloads official House PTR PDFs and can ingest Capitol Trades API records as a backup source
 2. **Parsing**: Extracts transaction rows through a deterministic PDF parser cascade, with optional Gemini OCR for zero-row PDFs
 3. **Signal Generation**: Calculates trading signal potential across configurable time horizons using exponential decay weighting
-4. **Performance Analysis**: Ranks members by hit rate, SPY alpha, Bayesian win probability, and Sharpe ratio
-5. **Ticker Scoring**: Identifies tickers with multiple congressional buyers weighted by historical member performance, position size, and ownership type
+4. **Performance Analysis**: Produces descriptive member rankings from hit rate, SPY alpha, Bayesian win probability, and partially pooled alpha
+5. **Ticker Scoring**: The production default ranks recent multi-buyer setups using identity-free distinct-buyer recency; historical member-skill modes are diagnostics only
+
+The first-principles problem definition, experiment contract, model roadmap, and
+rules for grid, hill-climbing, and Bayesian search are documented in
+[`docs/trading-prediction-architecture.md`](docs/trading-prediction-architecture.md).
 
 Live ticker scoring uses the current date (or explicit `--as-of`) for its
 lookback, excludes future-dated disclosures and non-positive scores, and trains
@@ -83,7 +87,7 @@ src/analyzer/
 ├── sector_data.py             # Sector data loading and analysis
 ├── settings.py                # Pydantic settings for data paths and parser behavior
 ├── signal_features.py         # Feature engineering for signals
-├── snooping.py                # Multiple-comparison corrections and HAC statistics
+├── snooping.py                # Family correction and calendar-aware block bootstrap
 ├── ticker_resolver.py         # Ticker cleaning and symbol resolution
 ├── transaction_repository.py  # Transaction CRUD operations
 └── validation.py              # Honest time-split calibration and evaluation
@@ -143,7 +147,7 @@ Portfolio win rate, average holding period, and turnover are reported as `N/A` w
 - Transactions carry a `source` provenance column (`house_pdf`, `capitol_trades`, or `gemini_ocr`); old pre-migration rows may have `NULL` source.
 - Inspect `pdf_parse_runs` after every parse. A zero-row result is not proof that a filing has
   no trades, and parser success does not prove every row or field was extracted correctly.
-- `ptr-alpha validate` purges each phase by the maximum executable holding period and uses one per-date net-alpha objective. Production selection uses only the fold-safe `consensus` scorer with each fold's explicit as-of timestamp; member-skill modes are descriptive diagnostics and cannot be deployment candidates. Deployment fails closed unless Bonferroni and a centered moving-block max-stat bootstrap pass. Consensus is identity-invariant and has no member-identity hypothesis; this is recorded as a diagnostic, not used as a gate. Identity-dependent member-skill modes are descriptive and cannot deploy. Frozen evaluations are atomically consumed in a canonical, overlap-refusing SHA-256 hash-chain ledger; a prior `validation_evaluation_ledger.json` must be explicitly migrated or archived before evaluation. The chain detects accidental/local edits but cannot prevent a local attacker with write access from recomputing it because no external anchor exists. The 2024-2025 phase is retrospective, not fresh OOS evidence; the post-2025 final phase is locked and not queried or evaluated. Forward-return labels remain missing until SPY prices reach the full requested horizon; partial windows are never shortened into apparently mature returns.
+- `ptr-alpha validate` purges each phase by the maximum executable holding period and uses one per-date net-alpha objective. Production selection uses only the fold-safe `consensus` scorer with each fold's explicit as-of timestamp; member-skill modes are descriptive diagnostics and cannot be deployment candidates. Deployment fails closed unless Bonferroni and a centered, calendar-aware block max-stat bootstrap pass. Consensus is identity-invariant and has no member-identity hypothesis; this is recorded as a diagnostic, not used as a gate. Identity-dependent member-skill modes are descriptive and cannot deploy. Frozen evaluations are atomically consumed in a canonical, overlap-refusing SHA-256 hash-chain ledger; a prior `validation_evaluation_ledger.json` must be explicitly migrated or archived before evaluation. The chain detects accidental/local edits but cannot prevent a local attacker with write access from recomputing it because no external anchor exists. The 2024-2025 phase is retrospective, not fresh OOS evidence; the post-2025 final phase is locked and not queried or evaluated. Forward-return labels remain missing until SPY prices reach the full requested horizon; partial windows are never shortened into apparently mature returns.
 - Recent ticker output includes only positive model scores. A positive score is a model ranking, not evidence of statistically significant alpha or individualized investment advice. As of 2026-07, no validated configuration shows statistically significant alpha.
 
 ## Tests

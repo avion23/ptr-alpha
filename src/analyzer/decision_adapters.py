@@ -36,6 +36,7 @@ from analyzer.decision_contracts import (
 _REALIZED_PREFIX = "bt_"
 _DECISION_INDEX = "_decision_index"
 _DECISION_EVENT_ID = "_decision_event_id"
+_EVENT_ID_NAMESPACE = "forecast"
 
 # These fields are model inputs or diagnostics, not realized outcomes.  In
 # particular, signal_score is represented only by Forecast.ranking_score.
@@ -175,6 +176,40 @@ def _assert_common_forecast_context(forecasts: Sequence[Forecast]) -> None:
         raise ValueError("forecasts must share as_of and horizon_days")
 
 
+def _assert_unique_forecast_event_ids(
+    forecasts: Sequence[Forecast], context: str = "forecasts"
+) -> None:
+    event_ids = [forecast.event_id for forecast in forecasts]
+    if len(set(event_ids)) != len(event_ids):
+        raise ValueError(f"{context} must contain unique event_ids")
+
+
+def _assert_unique_forecast_tickers(
+    forecasts: Sequence[Forecast], context: str = "forecasts"
+) -> None:
+    tickers = [forecast.ticker for forecast in forecasts if forecast.ticker]
+    if len(set(tickers)) != len(tickers):
+        raise ValueError(f"{context} must not contain duplicate tickers")
+
+
+def _assert_requested_forecast_context(
+    forecasts: Sequence[Forecast],
+    *,
+    as_of_date: DateLike | None,
+    horizon: int | None,
+) -> None:
+    """Reject an evaluator context that differs from the decision context."""
+    values = tuple(forecasts)
+    if not values:
+        return
+    first = values[0]
+    if as_of_date is not None and pd.Timestamp(as_of_date) != pd.Timestamp(first.as_of):
+        raise ValueError("as_of_date must match forecast as_of")
+    resolved_horizon = _positive_int(horizon, "horizon")
+    if resolved_horizon is not None and resolved_horizon != first.horizon_days:
+        raise ValueError("horizon must match forecast horizon_days")
+
+
 def _provenance_from_row(row: Mapping[str, object]) -> Provenance:
     return Provenance(
         source=_text(row.get("source")),
@@ -200,16 +235,34 @@ def _metadata_from_row(row: Mapping[str, object]) -> tuple[tuple[str, MetadataVa
 def _event_id_from_row(
     row: Mapping[str, object], ticker: str, as_of: DateLike, row_index: int
 ) -> str:
+    """Build a stable, source-namespaced identifier for one forecast row."""
+
+    def component(value: object) -> str:
+        text = str(value)
+        return f"{len(text)}:{text}"
+
     explicit = _text(row.get("event_id"))
     if explicit:
-        return explicit
+        return f"{_EVENT_ID_NAMESPACE}:explicit:{component(explicit)}"
     provenance = _provenance_from_row(row)
+    source = provenance.source or "unknown"
     if provenance.source_row_id:
-        return provenance.source_row_id
+        record = provenance.source_record_id or "unknown"
+        return (
+            f"{_EVENT_ID_NAMESPACE}:source:{component(source)}:record:"
+            f"{component(record)}:row:{component(provenance.source_row_id)}"
+        )
     if provenance.source_record_id:
-        return provenance.source_record_id
+        return (
+            f"{_EVENT_ID_NAMESPACE}:source:{component(source)}:record:"
+            f"{component(provenance.source_record_id)}:ticker:{component(ticker)}:"
+            f"row:{row_index}"
+        )
     timestamp = pd.Timestamp(as_of).isoformat()
-    return f"{ticker}:{timestamp}:{row_index}"
+    return (
+        f"{_EVENT_ID_NAMESPACE}:source:{component(source)}:ticker:{component(ticker)}:"
+        f"as_of:{component(timestamp)}:row:{row_index}"
+    )
 
 
 def _recommendation_to_forecast(
@@ -302,6 +355,8 @@ def recommendations_to_forecasts(
         for row_index, row in enumerate(recommendations.to_dict(orient="records"))
     )
     _assert_common_forecast_context(forecasts)
+    _assert_unique_forecast_event_ids(forecasts, "recommendations")
+    _assert_unique_forecast_tickers(forecasts, "recommendations")
     return forecasts
 
 
@@ -430,6 +485,8 @@ class TopNPolicy:
         if state is not None and not isinstance(state, PortfolioState):
             raise TypeError("state must be a PortfolioState")
         _assert_common_forecast_context(values)
+        _assert_unique_forecast_event_ids(values, "policy forecasts")
+        _assert_unique_forecast_tickers(values, "policy forecasts")
         if values and market is not None and market.as_of != values[0].as_of:
             raise ValueError("market as_of must match forecast as_of")
 
@@ -510,6 +567,13 @@ def _decision_forecasts(
         if not all(isinstance(forecast, Forecast) for forecast in values):
             raise TypeError("decision must contain only Forecast values")
     _assert_common_forecast_context(values)
+    _assert_unique_forecast_event_ids(values, "decision forecasts")
+    _assert_unique_forecast_tickers(values, "decision forecasts")
+    _assert_requested_forecast_context(
+        values,
+        as_of_date=as_of_date,
+        horizon=horizon,
+    )
     return values
 
 
@@ -519,8 +583,10 @@ def _recommendation_frame(forecasts: Sequence[Forecast]) -> pd.DataFrame:
             "ticker": forecast.ticker,
             "instrument_type": forecast.instrument_type or "stock",
             "amount_midpoint": forecast.amount_midpoint,
-            "optimal_horizon": forecast.optimal_horizon_days
-            or forecast.horizon_days,
+            # The evaluator's horizon is part of the decision context.  Do
+            # not let an optional ranking diagnostic change the evidence
+            # horizon underneath the typed Forecast.
+            "optimal_horizon": forecast.horizon_days,
             _DECISION_INDEX: index,
             _DECISION_EVENT_ID: forecast.event_id,
         }
@@ -605,16 +671,25 @@ def _evidence_from_row(
     if reported_ticker is not None and reported_ticker != forecast.ticker:
         raise ValueError("evaluator changed the decision ticker")
 
-    horizon = _positive_int(row.get("bt_horizon_days"), "bt_horizon_days")
-    if horizon is None:
-        horizon = _positive_int(row.get("optimal_horizon"), "optimal_horizon")
-    if horizon is None:
-        horizon = forecast.horizon_days
+    for column in ("bt_as_of", "as_of_date", "as_of"):
+        if column not in row:
+            continue
+        reported_as_of = _date_like(row.get(column))
+        if reported_as_of is not None and pd.Timestamp(reported_as_of) != pd.Timestamp(
+            forecast.as_of
+        ):
+            raise ValueError("evaluator evidence as_of disagrees with forecast as_of")
+
+    reported_horizon = _positive_int(row.get("bt_horizon_days"), "bt_horizon_days")
+    if reported_horizon is None:
+        reported_horizon = _positive_int(row.get("optimal_horizon"), "optimal_horizon")
+    if reported_horizon is not None and reported_horizon != forecast.horizon_days:
+        raise ValueError("evaluator evidence horizon disagrees with forecast horizon_days")
     return Evidence(
         event_id=forecast.event_id,
         ticker=forecast.ticker,
         as_of=as_of_date,
-        horizon_days=horizon,
+        horizon_days=forecast.horizon_days,
         realized_return_pct=_optional_row_value(row, "bt_return_pct"),
         realized_alpha_pct=_optional_row_value(row, "bt_alpha_pct"),
         benchmark_return_pct=_optional_row_value(row, "bt_spy_return_pct"),
@@ -667,6 +742,11 @@ class BacktestEvidenceAdapter:
         resolved_horizon = _positive_int(horizon, "horizon")
         if resolved_horizon is None:
             resolved_horizon = forecasts[0].horizon_days
+        _assert_requested_forecast_context(
+            forecasts,
+            as_of_date=resolved_as_of,
+            horizon=resolved_horizon,
+        )
         recommendations = _recommendation_frame(forecasts)
         evaluated = self.evaluator(
             recommendations,
@@ -695,6 +775,12 @@ class BacktestEvidenceAdapter:
         if not forecasts:
             if as_of_date is None and isinstance(decision, TargetPortfolio):
                 as_of_date = decision.as_of
+            elif (
+                isinstance(decision, TargetPortfolio)
+                and as_of_date is not None
+                and pd.Timestamp(as_of_date) != pd.Timestamp(decision.as_of)
+            ):
+                raise ValueError("as_of_date must match target portfolio as_of")
             if as_of_date is None:
                 raise ValueError("an as_of_date is required for an empty evidence report")
             resolved_horizon = _positive_int(horizon, "horizon")
@@ -716,6 +802,11 @@ class BacktestEvidenceAdapter:
         resolved_horizon = _positive_int(horizon, "horizon")
         if resolved_horizon is None:
             resolved_horizon = forecasts[0].horizon_days
+        _assert_requested_forecast_context(
+            forecasts,
+            as_of_date=resolved_as_of,
+            horizon=resolved_horizon,
+        )
         evaluated = self.evaluate_dataframe(
             decision,
             prices_df,

@@ -86,6 +86,57 @@ class TestDecisionContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bt_return_pct"):
             recommendations_to_forecasts(recommendations, AS_OF, 30)
 
+    def test_provenance_availability_cannot_follow_decision_as_of(self):
+        future = date(2025, 1, 3)
+        with self.assertRaisesRegex(ValueError, "on or before"):
+            _forecast(
+                "event-future",
+                "AAA",
+                provenance=Provenance(available_date=future),
+            )
+        with self.assertRaisesRegex(ValueError, "on or before"):
+            Evidence(
+                "event-future",
+                "AAA",
+                AS_OF,
+                30,
+                provenance=Provenance(available_date=future),
+            )
+
+    def test_recommendation_event_ids_are_namespaced_and_unique(self):
+        recommendations = pd.DataFrame(
+            {
+                "ticker": ["AAA"],
+                "signal_score": [1.0],
+                "event_id": ["legacy-event"],
+            }
+        )
+        (forecast,) = recommendations_to_forecasts(recommendations, AS_OF, 30)
+        self.assertTrue(forecast.event_id.startswith("forecast:"))
+        self.assertNotEqual(forecast.event_id, "legacy-event")
+
+        duplicate_ids = pd.DataFrame(
+            {
+                "ticker": ["AAA", "BBB"],
+                "signal_score": [1.0, 0.5],
+                "event_id": ["same-event", "same-event"],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "unique event_ids"):
+            recommendations_to_forecasts(duplicate_ids, AS_OF, 30)
+
+    def test_recommendations_and_policy_reject_duplicate_tickers(self):
+        recommendations = pd.DataFrame(
+            {"ticker": ["AAA", "AAA"], "signal_score": [2.0, 1.0]}
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate tickers"):
+            recommendations_to_forecasts(recommendations, AS_OF, 30)
+
+        with self.assertRaisesRegex(ValueError, "duplicate tickers"):
+            TopNPolicy().allocate(
+                [_forecast("event-a", "AAA", 2.0), _forecast("event-b", "AAA", 1.0)]
+            )
+
     def test_recommendations_require_one_common_as_of_and_horizon(self):
         mixed_as_of = pd.DataFrame(
             {
@@ -261,6 +312,47 @@ class TestDecisionContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sum to one"):
             TargetPortfolio(AS_OF, positions=(position,), cash_weight=0.0)
 
+        complete = TargetPortfolio(AS_OF, positions=(position,), cash_weight=0.5)
+        self.assertEqual(complete.positions[0].weight, 0.5)
+        with self.assertRaisesRegex(ValueError, "sum to one"):
+            TargetPortfolio(AS_OF, positions=(position,), cash_weight=0.6)
+
+    def test_target_portfolio_rejects_duplicate_tickers_and_event_ids(self):
+        first = _forecast("event-a", "AAA", 2.0)
+        second_ticker = _forecast("event-b", "AAA", 1.0)
+        positions = tuple(
+            TargetPosition(
+                event_id=item.event_id,
+                ticker=item.ticker,
+                weight=0.5,
+                rank=rank,
+                as_of=item.as_of,
+                horizon_days=item.horizon_days,
+                forecast=item,
+                provenance=item.provenance,
+            )
+            for rank, item in enumerate((first, second_ticker), start=1)
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate tickers"):
+            TargetPortfolio(AS_OF, positions=positions, cash_weight=0.0)
+
+        second_event = _forecast("event-a", "BBB", 1.0)
+        positions = tuple(
+            TargetPosition(
+                event_id=item.event_id,
+                ticker=item.ticker,
+                weight=0.5,
+                rank=rank,
+                as_of=item.as_of,
+                horizon_days=item.horizon_days,
+                forecast=item,
+                provenance=item.provenance,
+            )
+            for rank, item in enumerate((first, second_event), start=1)
+        )
+        with self.assertRaisesRegex(ValueError, "unique event_ids"):
+            TargetPortfolio(AS_OF, positions=positions, cash_weight=0.0)
+
     def test_policy_rejects_mixed_context_and_market_date_mismatch(self):
         first = _forecast("event-a", "AAA", 2.0)
         second = Forecast(
@@ -309,6 +401,59 @@ class TestDecisionContracts(unittest.TestCase):
         later = Evidence("event-b", "BBB", date(2025, 1, 3), 30)
         with self.assertRaisesRegex(ValueError, "report as_of"):
             EvidenceReport(AS_OF, 30, evidence=(evidence, later))
+
+    def test_evidence_report_requires_common_horizon_and_unique_event_ids(self):
+        evidence = Evidence("event-a", "AAA", AS_OF, 30)
+        later_horizon = Evidence("event-b", "BBB", AS_OF, 60)
+        with self.assertRaisesRegex(ValueError, "report horizon_days"):
+            EvidenceReport(AS_OF, 30, evidence=(evidence, later_horizon))
+
+        duplicate = Evidence("event-a", "BBB", AS_OF, 30)
+        with self.assertRaisesRegex(ValueError, "unique event_ids"):
+            EvidenceReport(AS_OF, 30, evidence=(evidence, duplicate))
+
+    def test_evidence_adapter_requires_requested_context_to_match_forecasts(self):
+        forecasts = (_forecast("event-a", "AAA", 2.0),)
+        adapter = BacktestEvidenceAdapter(evaluator=lambda *args: pd.DataFrame())
+        with self.assertRaisesRegex(ValueError, "as_of_date must match"):
+            adapter.evaluate_report(
+                forecasts,
+                pd.DataFrame(),
+                as_of_date=date(2025, 1, 3),
+                horizon=30,
+            )
+        with self.assertRaisesRegex(ValueError, "horizon must match"):
+            adapter.evaluate_report(
+                forecasts,
+                pd.DataFrame(),
+                as_of_date=AS_OF,
+                horizon=60,
+            )
+
+    def test_evidence_adapter_rejects_evaluator_date_or_horizon_drift(self):
+        forecasts = (_forecast("event-a", "AAA", 2.0),)
+
+        def date_drifting_evaluator(recommendations, prices, as_of, horizon, **kwargs):
+            result = recommendations.iloc[[0]].copy()
+            result["bt_as_of"] = [date(2025, 1, 3)]
+            return result
+
+        with self.assertRaisesRegex(ValueError, "evidence as_of disagrees"):
+            BacktestEvidenceAdapter(evaluator=date_drifting_evaluator).evaluate_report(
+                forecasts, pd.DataFrame(), AS_OF, 30
+            )
+
+        def horizon_drifting_evaluator(
+            recommendations, prices, as_of, horizon, **kwargs
+        ):
+            result = recommendations.iloc[[0]].copy()
+            result["bt_horizon_days"] = [60]
+            return result
+
+        with self.assertRaisesRegex(ValueError, "evidence horizon disagrees"):
+            BacktestEvidenceAdapter(
+                evaluator=horizon_drifting_evaluator
+            ).evaluate_report(forecasts, pd.DataFrame(), AS_OF, 30)
 
 
 if __name__ == "__main__":

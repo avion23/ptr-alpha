@@ -158,6 +158,24 @@ def _freeze_metadata(value: Mapping[str, MetadataValue] | Metadata) -> Metadata:
     return tuple(frozen)
 
 
+def _assert_provenance_available_by(
+    provenance: "Provenance", as_of: datetime, owner: str
+) -> None:
+    """Reject decisions that use information unavailable at their as-of date."""
+    if provenance.available_date is None:
+        return
+    try:
+        available_after_as_of = provenance.available_date > as_of
+    except TypeError as exc:
+        raise ValueError(
+            f"{owner} provenance available_date and as_of must use comparable timezones"
+        ) from exc
+    if available_after_as_of:
+        raise ValueError(
+            f"{owner} provenance available_date must be on or before as_of"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Provenance:
     """Observable source identity retained across decision-layer adapters."""
@@ -237,7 +255,8 @@ class Forecast:
                 self.optimal_horizon_days, "optimal_horizon_days"
             ),
         )
-        object.__setattr__(self, "as_of", _as_datetime(self.as_of))
+        as_of = _as_datetime(self.as_of)
+        object.__setattr__(self, "as_of", as_of)
         object.__setattr__(
             self,
             "expected_net_alpha",
@@ -274,6 +293,7 @@ class Forecast:
         )
         if not isinstance(self.provenance, Provenance):
             raise TypeError("provenance must be a Provenance")
+        _assert_provenance_available_by(self.provenance, as_of, "forecast")
         object.__setattr__(self, "instrument_type", _optional_string(self.instrument_type, "instrument_type"))
         object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
 
@@ -405,6 +425,9 @@ class TargetPortfolio:
             tickers = [position.ticker for position in positions]
             if len(set(tickers)) != len(tickers):
                 raise ValueError("target positions must not contain duplicate tickers")
+            event_ids = [position.event_id for position in positions]
+            if len(set(event_ids)) != len(event_ids):
+                raise ValueError("target positions must contain unique event_ids")
         cash_weight = _finite_number(self.cash_weight, "cash_weight")
         if not 0.0 <= cash_weight <= 1.0:
             raise ValueError("cash_weight must be between zero and one")
@@ -458,7 +481,8 @@ class Evidence:
             "unavailable_reason",
             _optional_string(self.unavailable_reason, "unavailable_reason"),
         )
-        object.__setattr__(self, "as_of", _as_datetime(self.as_of))
+        as_of = _as_datetime(self.as_of)
+        object.__setattr__(self, "as_of", as_of)
         for field_name in (
             "realized_return_pct",
             "realized_alpha_pct",
@@ -480,6 +504,7 @@ class Evidence:
         object.__setattr__(self, "delisted", _strict_bool(self.delisted, "delisted"))
         if not isinstance(self.provenance, Provenance):
             raise TypeError("evidence provenance must be a Provenance")
+        _assert_provenance_available_by(self.provenance, as_of, "evidence")
 
     @property
     def realized_net_return(self) -> float | None:
@@ -515,6 +540,11 @@ class EvidenceReport:
             raise TypeError("evidence must contain only Evidence values")
         if any(item.as_of != self.as_of for item in self.evidence):
             raise ValueError("evidence items must share the report as_of")
+        if any(item.horizon_days != self.horizon_days for item in self.evidence):
+            raise ValueError("evidence items must share the report horizon_days")
+        event_ids = [item.event_id for item in self.evidence]
+        if len(set(event_ids)) != len(event_ids):
+            raise ValueError("evidence items must contain unique event_ids")
         for field_name in ("n_no_price", "n_delisted", "n_unavailable"):
             object.__setattr__(
                 self,

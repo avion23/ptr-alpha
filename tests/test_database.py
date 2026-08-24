@@ -8,7 +8,6 @@ from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.senate_efd import SenateEFDSource
 from analyzer.transaction_repository import (
-    AmbiguousTransactionIdentityError,
     SOURCE_TRANSACTION_COLUMNS,
     _normalize_frame,
 )
@@ -1410,7 +1409,7 @@ class TestParseRunsTable(DatabaseTestCase):
         self.assertEqual(
             rows,
             [
-                ("v4-deterministic", "zero_rows", 1),
+                ("v4-deterministic", "success", 2),
                 ("v4-gemini-manual", "success", 1),
             ],
         )

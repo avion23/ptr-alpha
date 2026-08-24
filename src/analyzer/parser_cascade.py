@@ -28,6 +28,10 @@ class ParserBackendError(RuntimeError):
         self.cause = cause
 
 
+class ParseBudgetExceeded(RuntimeError):
+    """The watchdog stopped a document before the cascade could finish."""
+
+
 class ParserCascadeError(RuntimeError):
     """No rows were recovered and at least one backend failed."""
 
@@ -106,6 +110,23 @@ def _semantic_score(transactions: list[dict]) -> tuple[int, int, int, float]:
     return complete, with_amount, with_asset, _result_quality(unique)
 
 
+def _find_parse_budget(exc: BaseException) -> ParseBudgetExceeded | None:
+    """Find a watchdog exception retained by one or more backend wrappers."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ParseBudgetExceeded):
+            return current
+        cause = getattr(current, "cause", None)
+        if not isinstance(cause, BaseException):
+            cause = current.__cause__
+        if not isinstance(cause, BaseException):
+            cause = current.__context__
+        current = cause
+    return None
+
+
 def _reconcile_candidates(candidates, engines_attempted):
     """Merge complementary rows while retaining the maximum observed lot count."""
     if not candidates:
@@ -164,7 +185,12 @@ def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
     engines_attempted.append(engine_name)
     try:
         transactions = engine_fn(pdf_path)
+    except ParseBudgetExceeded:
+        raise
     except ParserBackendError as exc:
+        budget = _find_parse_budget(exc)
+        if budget is not None:
+            raise budget from exc
         errors.append(str(exc))
         engines_attempted.append(f"error:{engine_name}")
         return None
@@ -247,6 +273,8 @@ def _try_pdfplumber(pdf_path: Path) -> list[dict]:
     PDFs natively; returns 0 on scanned images."""
     try:
         pp_tables = extract_tables_with_pdfplumber(pdf_path)
+    except ParseBudgetExceeded:
+        raise
     except Exception as e:
         raise ParserBackendError("pdfplumber", e) from e
     if not pp_tables:
@@ -263,6 +291,8 @@ def _try_camelot_lattice(pdf_path: Path) -> list[dict]:
     case we re-parse each cell as OCR text."""
     try:
         tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
+    except ParseBudgetExceeded:
+        raise
     except Exception as e:
         raise ParserBackendError("lattice", e) from e
     txs: list[dict] = []
@@ -293,6 +323,8 @@ def _try_camelot_stream(pdf_path: Path) -> list[dict]:
     the first one that yields transactions (Fix 2: don't just scan table[0])."""
     try:
         tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="stream")
+    except ParseBudgetExceeded:
+        raise
     except Exception as e:
         raise ParserBackendError("stream", e) from e
     transactions: list[dict] = []
@@ -305,6 +337,8 @@ def _try_pdftotext(pdf_path: Path) -> list[dict]:
     """Handles encrypted PDFs where camelot/pdfplumber return nothing."""
     try:
         pdftext_tables = extract_tables_with_pdftotext(pdf_path)
+    except ParseBudgetExceeded:
+        raise
     except Exception as e:
         raise ParserBackendError("pdftotext", e) from e
     for table in pdftext_tables:
@@ -324,6 +358,8 @@ def _try_docling(pdf_path: Path) -> list[dict]:
     """
     try:
         docling_tables = extract_tables_with_docling(pdf_path)
+    except ParseBudgetExceeded:
+        raise
     except Exception as e:
         raise ParserBackendError("docling", e) from e
     for table in docling_tables:
@@ -338,6 +374,8 @@ def _try_tesseract(pdf_path: Path) -> list[dict]:
     is unavailable."""
     try:
         ocr_tables = extract_tables_with_ocr(pdf_path)
+    except ParseBudgetExceeded:
+        raise
     except Exception as e:
         raise ParserBackendError("ocr", e) from e
     txs: list[dict] = []

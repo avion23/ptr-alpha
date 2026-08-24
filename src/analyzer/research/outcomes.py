@@ -12,10 +12,12 @@ Future rows in a price or factor panel consequently cannot change an already
 constructed outcome (provided the event's exit date is fixed or its first
 available endpoint is unchanged).
 
-Factor inputs are daily *simple returns* by default.  They are converted to
-log returns for fitting so that a multi-day factor contribution and the asset
-outcome are additive.  ``factor_returns_are_log=True`` is available for data
-sets that already store log returns.
+Factor inputs are daily *simple returns* by default.  Their unit must be
+declared as ``factor_return_unit='simple'`` or ``'log'`` (the legacy boolean
+``factor_returns_are_log`` remains supported as an unambiguous alias).  Inputs
+are converted to log returns for fitting so that a multi-day factor
+contribution and the asset outcome are additive.  Every result records both
+the declared input unit and the internal/output units.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ class FactorFitMetadata:
     residual_std_log: float | None
     fit_is_pre_entry: bool
     model: str = "point_in_time_ols_log_return_v2"
+    factor_input_return_unit: str = "simple"
     factor_return_unit: str = "log"
     asset_return_unit: str = "log"
 
@@ -77,6 +80,24 @@ def _date_index(frame: pd.DataFrame | pd.Series, *, name: str) -> pd.DatetimeInd
         raise ValueError(f"{name} index must be sorted in ascending date order")
     if not index.is_unique:
         raise ValueError(f"{name} index contains duplicate dates")
+    return index
+
+
+def _calendar_index(
+    values: Iterable[object], *, name: str
+) -> pd.DatetimeIndex:
+    """Normalize an explicit expected factor calendar."""
+    try:
+        index = pd.DatetimeIndex(pd.to_datetime(list(values), errors="coerce", utc=True))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} contains an invalid date") from exc
+    index = index.tz_localize(None)
+    if index.isna().any():
+        raise ValueError(f"{name} contains a missing date")
+    if not index.is_monotonic_increasing:
+        raise ValueError(f"{name} must be sorted in ascending date order")
+    if not index.is_unique:
+        raise ValueError(f"{name} contains duplicate dates")
     return index
 
 
@@ -124,7 +145,7 @@ def _as_factor_returns(
     *,
     prices: pd.DataFrame,
     spy_ticker: str,
-    factor_returns_are_log: bool,
+    factor_return_unit: str,
 ) -> pd.DataFrame:
     """Normalize the factor panel and guarantee that SPY is a factor."""
     if factor_returns is None:
@@ -135,7 +156,6 @@ def _as_factor_returns(
         result = cast(
             pd.DataFrame, spy.pct_change(fill_method=None).to_frame(name=spy_ticker)
         )
-        factor_returns_are_log = False
     else:
         if not isinstance(factor_returns, pd.DataFrame) or factor_returns.empty:
             raise ValueError("factor_returns must be a non-empty DataFrame")
@@ -158,7 +178,7 @@ def _as_factor_returns(
                     fill_method=None
                 ),
             )
-            if factor_returns_are_log:
+            if factor_return_unit == "log":
                 spy = cast(
                     pd.Series,
                     _column(prices, spy_ticker)
@@ -173,7 +193,7 @@ def _as_factor_returns(
     values = result.to_numpy(dtype=float)
     if not np.isfinite(values[~np.isnan(values)]).all():
         raise ValueError("factor_returns contains an infinite value")
-    if factor_returns_are_log:
+    if factor_return_unit == "log":
         log_returns = cast(pd.DataFrame, result.astype(float))
     else:
         if bool((result <= -1.0).any().any()):
@@ -187,6 +207,31 @@ def _as_factor_returns(
     if spy_ticker not in log_returns.columns:
         raise ValueError(f"factor_returns does not contain required {spy_ticker} factor")
     return log_returns
+
+
+def _resolve_factor_return_unit(
+    factor_returns: pd.DataFrame | None,
+    *,
+    factor_returns_are_log: bool | None,
+    factor_return_unit: str | None,
+) -> str:
+    """Resolve the public unit declaration and reject contradictory flags."""
+    declared = None if factor_return_unit is None else str(factor_return_unit).strip().lower()
+    if declared not in {None, "simple", "log"}:
+        raise ValueError("factor_return_unit must be either 'simple' or 'log'")
+    legacy = None
+    if factor_returns_are_log is not None:
+        legacy = "log" if bool(factor_returns_are_log) else "simple"
+    if declared is not None and legacy is not None and declared != legacy:
+        raise ValueError(
+            "factor_return_unit conflicts with factor_returns_are_log"
+        )
+    resolved = declared or legacy or "simple"
+    if factor_returns is None and resolved == "log":
+        raise ValueError(
+            "price-derived SPY factors are simple returns; do not declare log units"
+        )
+    return resolved
 
 
 _FACTOR_LEAKAGE_TOKENS = (
@@ -266,6 +311,7 @@ def _ols_factor_fit(
     entry_date: pd.Timestamp,
     factor_columns: tuple[str, ...],
     min_observations: int,
+    factor_input_return_unit: str,
 ) -> FactorFitMetadata | None:
     # Strictly less-than is deliberate.  The return at entry_date can only be
     # known after the entry close and is not a public pre-entry observation.
@@ -292,6 +338,7 @@ def _ols_factor_fit(
         intercept=float(coefficients[0]),
         residual_std_log=residual_std,
         fit_is_pre_entry=bool((joined.index < entry_date).all()),
+        factor_input_return_unit=factor_input_return_unit,
         factor_return_unit="log",
         asset_return_unit="log",
     )
@@ -320,6 +367,11 @@ def _empty_event_result(event_id: str, requested_entry: pd.Timestamp, status: st
         "factor_return_unit": "log",
         "asset_return_unit": "log",
         "outcome_return_unit": "simple",
+        "factor_expected_return_unit": "simple",
+        "factor_residual_return_unit": "simple",
+        "factor_calendar_complete": False,
+        "factor_calendar_expected_rows": 0,
+        "factor_calendar_observed_rows": 0,
         "factor_fit_start_date": pd.NaT,
         "factor_fit_end_date": pd.NaT,
         "factor_fit_n_observations": 0,
@@ -346,7 +398,9 @@ def compute_spy_factor_residual_outcomes(
     exit_date_column: str | None = None,
     horizon_days: int = 90,
     min_factor_observations: int = 20,
-    factor_returns_are_log: bool = False,
+    factor_returns_are_log: bool | None = None,
+    factor_return_unit: str | None = None,
+    factor_calendar: Iterable[object] | None = None,
     label_as_of: object | None = None,
 ) -> pd.DataFrame:
     """Build point-in-time SPY/factor-residual labels for event rows.
@@ -361,9 +415,15 @@ def compute_spy_factor_residual_outcomes(
         Positive close-price panel with one ticker per column.  It must contain
         ``spy_ticker`` and every event ticker.
     factor_returns:
-        Optional daily factor-return panel.  Values are simple returns unless
-        ``factor_returns_are_log`` is true.  SPY is added from ``prices`` when
-        it is not already present.
+        Optional daily factor-return panel.  Values must be declared with
+        ``factor_return_unit`` (``'simple'`` or ``'log'``); the legacy
+        ``factor_returns_are_log`` flag is accepted as an alias.  SPY is added
+        from ``prices`` when it is not already present.
+    factor_calendar:
+        Optional sorted, unique expected factor calendar.  When supplied,
+        every date in the holding period must have every selected factor.  If
+        omitted, the price panel's observed dates are the required endpoint
+        calendar; all factor rows in the interval are still accumulated.
     label_as_of:
         Optional information cutoff.  Outcomes whose endpoint is after this
         date are returned with ``label_status='future_label_rejected'`` and no
@@ -409,11 +469,16 @@ def compute_spy_factor_residual_outcomes(
             raise ValueError(f"event id column {event_id_column!r} is missing")
         event_id_column = None
 
+    factor_input_unit = _resolve_factor_return_unit(
+        factor_returns,
+        factor_returns_are_log=factor_returns_are_log,
+        factor_return_unit=factor_return_unit,
+    )
     factor_panel = _as_factor_returns(
         factor_returns,
         prices=prices_panel,
         spy_ticker=spy_ticker,
-        factor_returns_are_log=factor_returns_are_log,
+        factor_return_unit=factor_input_unit,
     )
     if factor_columns is None:
         selected_factors = tuple(str(column) for column in factor_panel.columns)
@@ -441,9 +506,10 @@ def compute_spy_factor_residual_outcomes(
         if label_as_of is not None
         else None
     )
-    factor_input_unit = (
-        "simple_price_derived" if factor_returns is None
-        else ("log" if factor_returns_are_log else "simple")
+    expected_factor_calendar = (
+        _calendar_index(factor_calendar, name="factor_calendar")
+        if factor_calendar is not None
+        else None
     )
 
     seen_ids: set[str] = set()
@@ -511,7 +577,7 @@ def compute_spy_factor_residual_outcomes(
         base["entry_date"] = entry_date
         base["outcome_date"] = outcome_date
         base["outcome_available_date"] = outcome_date
-        if label_cutoff is not None and outcome_date > label_cutoff:
+        if label_cutoff is not None and outcome_date >= label_cutoff:
             base["label_status"] = "future_label_rejected"
             output.append(base)
             continue
@@ -533,6 +599,7 @@ def compute_spy_factor_residual_outcomes(
             entry_date=entry_date,
             factor_columns=selected_factors,
             min_observations=min_factor_observations,
+            factor_input_return_unit=factor_input_unit,
         )
         if fit is None:
             base["label_status"] = "insufficient_pre_entry_history"
@@ -542,19 +609,42 @@ def compute_spy_factor_residual_outcomes(
         future_dates = pd.DatetimeIndex(
             price_dates[(price_dates > entry_date) & (price_dates <= outcome_date)]
         )
-        # Sum every daily factor observation in the holding period, not just
-        # sparse price endpoints.  Requiring all observed asset endpoint dates
-        # to exist in the factor panel still catches a missing daily factor row
-        # for the normal daily-price case without making sparse price panels
-        # discard intermediate factor information.
-        future_factors = factor_panel.loc[
+        factor_window = factor_panel.loc[
             (factor_panel.index > entry_date) & (factor_panel.index <= outcome_date),
             list(selected_factors),
         ]
-        endpoint_coverage = bool(future_dates.isin(factor_panel.index).all())
+        required_dates = (
+            expected_factor_calendar[
+                (expected_factor_calendar > entry_date)
+                & (expected_factor_calendar <= outcome_date)
+            ]
+            if expected_factor_calendar is not None
+            else future_dates
+        )
+        required_factors = factor_panel.reindex(
+            required_dates, columns=list(selected_factors)
+        )
+        required_observed = required_factors.notna().all(axis=1)
+        calendar_complete = bool(
+            len(required_dates) > 0
+            and len(required_observed) == len(required_dates)
+            and bool(required_observed.all())
+            and np.isfinite(required_factors.to_numpy(dtype=float)).all()
+        )
+        # Sum every daily factor observation in the holding period, not just
+        # sparse price endpoints.  The required calendar check prevents a
+        # dense price panel from silently accepting an interior missing factor
+        # date; callers with a sparse price panel can provide an explicit
+        # ``factor_calendar`` to retain the same fail-closed guarantee.
+        future_factors = (
+            required_factors if expected_factor_calendar is not None else factor_window
+        )
+        base["factor_calendar_complete"] = calendar_complete
+        base["factor_calendar_expected_rows"] = len(required_dates)
+        base["factor_calendar_observed_rows"] = int(required_observed.sum())
         if (
             future_factors.empty
-            or not endpoint_coverage
+            or not calendar_complete
             or not np.isfinite(future_factors.to_numpy(dtype=float)).all()
         ):
             base["label_status"] = "future_factor_data_unavailable"
@@ -586,6 +676,8 @@ def compute_spy_factor_residual_outcomes(
                 "factor_residual_return_pct": residual_return * 100.0,
                 "factor_residual_std_log": fit.residual_std_log,
                 "factor_input_return_unit": factor_input_unit,
+                "factor_expected_return_unit": "simple",
+                "factor_residual_return_unit": "simple",
                 "factor_fit_start_date": fit.fit_start_date,
                 "factor_fit_end_date": fit.fit_end_date,
                 "factor_fit_n_observations": fit.n_observations,

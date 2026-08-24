@@ -14,11 +14,12 @@ repeatable comparison for future research:
   than a stochastic forest.
 
 Both models have the same safety boundary.  A fit is local to a supplied
-cutoff, labels are admitted only when their availability date is at or before
-that cutoff, duplicate events are rejected, and names that look like realized
-or future outcomes cannot be used as features.  Non-local rows are excluded
-and counted in provenance; ``strict_future=True`` turns that exclusion into a
-hard error for callers that prefer fail-closed fold construction.
+cutoff, labels are admitted only when their availability date is strictly
+before that cutoff, duplicate events are rejected, and names that look like
+realized or future outcomes cannot be used as features.  Non-local rows are
+excluded and counted in provenance; ``strict_future=True`` turns that
+exclusion into a hard error for callers that prefer fail-closed fold
+construction.
 """
 
 from __future__ import annotations
@@ -62,6 +63,9 @@ class ResearchModelProvenance:
     label_available_column: str | None = None
     strict_future: bool = False
     uncertainty_semantics: str = "predictive_standard_deviation"
+    uncertainty_horizon_days: int | None = None
+    training_data_hash: str = "unavailable"
+    model_parameter_hash: str = "unavailable"
 
     def __post_init__(self) -> None:
         if not self.research_only or self.deployment_authorized:
@@ -79,16 +83,36 @@ class ResearchModelProvenance:
         if fit_cutoff.tzinfo is not None:
             fit_cutoff = fit_cutoff.tz_convert("UTC").tz_localize(None)
         object.__setattr__(self, "fit_cutoff", cast(pd.Timestamp, fit_cutoff))
-        if self.uncertainty_semantics != "predictive_standard_deviation":
+        if not self.uncertainty_semantics.startswith(
+            "predictive_standard_deviation"
+        ):
             raise ValueError(
                 "research baseline uncertainty must use predictive standard deviation"
             )
+        if self.uncertainty_horizon_days is not None and (
+            self.uncertainty_horizon_days <= 0
+        ):
+            raise ValueError("uncertainty_horizon_days must be positive")
 
     @property
     def provenance_id(self) -> str:
         """Return a stable id that does not depend on object identity."""
-        encoded = json.dumps(self.as_dict(include_id=False), sort_keys=True).encode()
-        return sha256(encoded).hexdigest()
+        return _sha256_payload(self.as_dict(include_id=False))
+
+    @property
+    def provenance_hash(self) -> str:
+        """Alias for the complete provenance digest used in model outputs."""
+        return self.provenance_id
+
+    @property
+    def training_data_sha256(self) -> str:
+        """Compatibility spelling for the training-data digest."""
+        return self.training_data_hash
+
+    @property
+    def model_parameter_sha256(self) -> str:
+        """Compatibility spelling for the fitted-parameter digest."""
+        return self.model_parameter_hash
 
     def as_dict(self, *, include_id: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -112,10 +136,83 @@ class ResearchModelProvenance:
             "label_available_column": self.label_available_column,
             "strict_future": self.strict_future,
             "uncertainty_semantics": self.uncertainty_semantics,
+            "uncertainty_horizon_days": self.uncertainty_horizon_days,
+            "training_data_hash": self.training_data_hash,
+            "model_parameter_hash": self.model_parameter_hash,
         }
         if include_id:
             result["provenance_id"] = self.provenance_id
+            result["provenance_hash"] = self.provenance_hash
         return result
+
+
+def _json_safe(value: object) -> object:
+    """Convert numpy/pandas values to deterministic JSON-compatible values."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        if not np.isfinite(number):
+            return None
+        return number
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+        return value.isoformat()
+    if value is pd.NaT:
+        return None
+    if isinstance(value, np.ndarray):
+        return [_json_safe(item) for item in value.tolist()]
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe(item)
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _sha256_payload(value: object) -> str:
+    encoded = json.dumps(
+        _json_safe(value), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _frame_sha256(frame: pd.DataFrame) -> str:
+    """Hash the exact normalized rows and schema used to construct a fold."""
+    digest = sha256()
+    digest.update(
+        json.dumps(
+            {
+                "columns": [str(column) for column in frame.columns],
+                "dtypes": [str(dtype) for dtype in frame.dtypes],
+                "shape": [int(frame.shape[0]), int(frame.shape[1])],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    try:
+        row_hashes = pd.util.hash_pandas_object(frame, index=True)
+        digest.update(row_hashes.to_numpy(dtype=np.uint64).tobytes())
+    except (TypeError, ValueError):
+        # Object columns containing an unusual extension value are uncommon,
+        # but their string representation is still preferable to an absent
+        # audit hash.
+        rows = [
+            [_json_safe(value) for value in row]
+            for row in frame.itertuples(index=True, name=None)
+        ]
+        digest.update(
+            json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+    return digest.hexdigest()
+
+
+def _uncertainty_semantics(horizon_days: int) -> str:
+    return f"predictive_standard_deviation_for_{int(horizon_days)}_day_horizon"
 
 
 def _column(frame: pd.DataFrame, name: str) -> pd.Series:
@@ -300,6 +397,18 @@ class _PreparedTraining:
     rejected_future_events: int
     rejected_future_labels: int
     rejected_missing_labels: int
+    training_data_hash: str
+
+
+def _validate_group_columns(columns: Sequence[str]) -> tuple[str, ...]:
+    """Normalize group names and reject duplicate grouping dimensions."""
+    normalized = tuple(str(value).strip() for value in columns)
+    if any(not value for value in normalized):
+        raise ValueError("group_columns must not contain empty names")
+    folded = tuple(value.casefold() for value in normalized)
+    if len(set(folded)) != len(folded):
+        raise ValueError("group_columns must contain unique dimensions")
+    return normalized
 
 
 def _resolve_label_availability(
@@ -432,13 +541,20 @@ def _prepare_training(
         # A fit without an explicit fold boundary is still finite and
         # reproducible, but callers should prefer an explicit cutoff.
         fit_cutoff = _as_timestamp(
-            _column(frame, time_column).max(), name="derived cutoff"
+            max(
+                _column(frame, time_column).max(),
+                cast(pd.Timestamp, availability.max()),
+            ),
+            name="derived cutoff",
         ) + pd.Timedelta(nanoseconds=1)
     else:
         fit_cutoff = _as_timestamp(cutoff, name="cutoff")
 
     future_events = frame[time_column] >= fit_cutoff
-    future_labels = frame["__label_available_date"] > fit_cutoff
+    # A row observed exactly at the fold boundary is not part of the fold.
+    # This strict inequality is intentional: the boundary represents the
+    # start of the next information set, not an inclusive observation date.
+    future_labels = frame["__label_available_date"] >= fit_cutoff
     if strict_future and (future_events | future_labels).any():
         raise ValueError(
             "training data contains an event or label that is not known at the fold cutoff"
@@ -490,6 +606,7 @@ def _prepare_training(
         rejected_future_events=rejected_future_events,
         rejected_future_labels=rejected_future_labels,
         rejected_missing_labels=rejected_missing_labels,
+        training_data_hash=_frame_sha256(frame),
     )
 
 
@@ -499,6 +616,20 @@ def _clean_category(value: object) -> str:
         return "__UNKNOWN__"
     text = str(value).strip()
     return text if text else "__UNKNOWN__"
+
+
+def _check_prediction_horizon(frame: pd.DataFrame, horizon_days: int) -> None:
+    """Reject query rows whose declared label horizon differs from the fit."""
+    if "horizon_days" not in frame.columns:
+        return
+    values = pd.to_numeric(_column(frame, "horizon_days"), errors="coerce")
+    if values.isna().any() or (values <= 0).any():
+        raise ValueError("prediction horizon_days must be positive integers")
+    if not np.all(values.to_numpy(dtype=float) == float(horizon_days)):
+        raise ValueError(
+            "prediction horizon_days must match the fitted model horizon "
+            f"({horizon_days})"
+        )
 
 
 class _ResearchOnlyMixin:
@@ -525,6 +656,25 @@ class _EffectTable:
     variances: Mapping[Any, float]
     counts: Mapping[Any, float]
     between_var: float
+
+
+def _effect_payload(effect: _EffectTable) -> dict[str, object]:
+    """Serialize an effect table without relying on heterogeneous dict keys."""
+    return {
+        "means": sorted(
+            ((repr(key), float(value)) for key, value in effect.means.items()),
+            key=lambda item: item[0],
+        ),
+        "variances": sorted(
+            ((repr(key), float(value)) for key, value in effect.variances.items()),
+            key=lambda item: item[0],
+        ),
+        "counts": sorted(
+            ((repr(key), float(value)) for key, value in effect.counts.items()),
+            key=lambda item: item[0],
+        ),
+        "between_var": float(effect.between_var),
+    }
 
 
 def _group_keys(frame: pd.DataFrame, columns: Sequence[str]) -> list[Any]:
@@ -668,9 +818,7 @@ class DynamicHierarchicalBaseline(_ResearchOnlyMixin):
             raise ValueError("feature_regularization must be positive and finite")
         self.label_column = label_column
         self.time_column = time_column
-        self.group_columns = tuple(str(value) for value in group_columns)
-        if len(set(self.group_columns)) != len(self.group_columns):
-            raise ValueError("group_columns must be unique")
+        self.group_columns = _validate_group_columns(group_columns)
         self.event_id_column = event_id_column
         self.horizon_days = int(horizon_days)
         self.prior_strength = float(prior_strength)
@@ -835,9 +983,29 @@ class DynamicHierarchicalBaseline(_ResearchOnlyMixin):
             ("feature_regularization", repr(self.feature_regularization)),
             ("strict_future", repr(self.strict_future)),
         )
+        self._model_parameter_hash = _sha256_payload(
+            {
+                "model_name": "dynamic_hierarchical_baseline",
+                "model_version": "3",
+                "hyperparameters": hyperparameters,
+                "global_mean": self._global_mean,
+                "time_effect": _effect_payload(self._time_effect),
+                "effects": {
+                    column: _effect_payload(effect)
+                    for column, effect in sorted(self._effects.items())
+                },
+                "interaction_effect": _effect_payload(self._interaction_effect),
+                "feature_columns": self._feature_columns,
+                "feature_medians": self._feature_medians,
+                "feature_scales": self._feature_scales,
+                "feature_coefficients": self._feature_coefficients,
+                "feature_covariance": self._feature_covariance,
+                "noise_variance": self._noise_variance,
+            }
+        )
         self.provenance = ResearchModelProvenance(
             model_name="dynamic_hierarchical_baseline",
-            model_version="2",
+            model_version="3",
             fit_cutoff=prepared.cutoff,
             fit_rows=len(frame),
             rejected_future_event_rows=prepared.rejected_future_events,
@@ -854,13 +1022,17 @@ class DynamicHierarchicalBaseline(_ResearchOnlyMixin):
                 "empirical-Bayes partial pooling",
                 "unseen groups use the population prior",
                 "effect variances use an independent additive approximation",
-                "prediction_std is a predictive standard deviation",
+                "prediction_std is predictive standard deviation for the fitted horizon",
                 "research-only; no deployment authorization",
             ),
             time_column=self.time_column,
             event_id_column=self.event_id_column,
             label_available_column=self.label_available_column,
             strict_future=self.strict_future,
+            uncertainty_semantics=_uncertainty_semantics(self.horizon_days),
+            uncertainty_horizon_days=self.horizon_days,
+            training_data_hash=prepared.training_data_hash,
+            model_parameter_hash=self._model_parameter_hash,
         )
         self._fitted = True
 
@@ -896,6 +1068,7 @@ class DynamicHierarchicalBaseline(_ResearchOnlyMixin):
         frame[self.time_column] = _datetime_series(
             _column(frame, self.time_column), name=self.time_column
         )
+        _check_prediction_horizon(frame, self.horizon_days)
         _reject_leakage_columns(
             frame.columns, label_column=self.label_column, context="prediction data"
         )
@@ -1002,8 +1175,14 @@ class DynamicHierarchicalBaseline(_ResearchOnlyMixin):
                 "observed_group_count": seen_group_count,
                 "pooling_status": group_status,
                 "uncertainty_semantics": self.provenance.uncertainty_semantics,
+                "uncertainty_horizon_days": self.provenance.uncertainty_horizon_days,
+                "uncertainty_target": self.label_column,
+                "horizon_days": self.horizon_days,
                 "model_name": self.provenance.model_name,
                 "model_provenance_id": self.provenance.provenance_id,
+                "model_provenance_hash": self.provenance.provenance_hash,
+                "training_data_hash": self.provenance.training_data_hash,
+                "model_parameter_hash": self.provenance.model_parameter_hash,
                 "research_only": True,
                 "deployment_authorized": False,
             },
@@ -1154,9 +1333,7 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
         self.label_column = label_column
         self.time_column = time_column
         self.event_id_column = event_id_column
-        self.group_columns = tuple(str(value) for value in group_columns)
-        if len(set(self.group_columns)) != len(self.group_columns):
-            raise ValueError("group_columns must be unique")
+        self.group_columns = _validate_group_columns(group_columns)
         self.horizon_days = int(horizon_days)
         self.alpha = float(alpha)
         self.max_bins = int(max_bins)
@@ -1239,9 +1416,36 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
             float(np.dot(residual, residual) / degrees), _variance_floor(y)
         )
         self._feature_columns = prepared.feature_columns
+        self._model_parameter_hash = _sha256_payload(
+            {
+                "model_name": "deterministic_regularized_tabular_baseline",
+                "model_version": "3",
+                "hyperparameters": {
+                    "alpha": self.alpha,
+                    "horizon_days": self.horizon_days,
+                    "max_bins": self.max_bins,
+                    "min_samples_leaf": self.min_samples_leaf,
+                    "strict_future": self.strict_future,
+                    "seed": self.seed,
+                },
+                "feature_columns": self._feature_columns,
+                "numeric_specs": {
+                    column: {
+                        "median": spec.median,
+                        "scale": spec.scale,
+                        "thresholds": spec.thresholds,
+                    }
+                    for column, spec in sorted(self._encoder.numeric.items())
+                },
+                "categorical_levels": self._encoder.categorical,
+                "coefficients": self._coefficients,
+                "precision": self._precision,
+                "noise_variance": self._noise_variance,
+            }
+        )
         self.provenance = ResearchModelProvenance(
             model_name="deterministic_regularized_tabular_baseline",
-            model_version="2",
+            model_version="3",
             fit_cutoff=prepared.cutoff,
             fit_rows=len(frame),
             rejected_future_event_rows=prepared.rejected_future_events,
@@ -1263,13 +1467,17 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
                 "ridge regularization",
                 "deterministic quantile threshold basis",
                 "unseen categories map to the intercept (pooled)",
-                "prediction_std is a predictive standard deviation",
+                "prediction_std is predictive standard deviation for the fitted horizon",
                 "research-only; no deployment authorization",
             ),
             time_column=self.time_column,
             event_id_column=self.event_id_column,
             label_available_column=self.label_available_column,
             strict_future=self.strict_future,
+            uncertainty_semantics=_uncertainty_semantics(self.horizon_days),
+            uncertainty_horizon_days=self.horizon_days,
+            training_data_hash=prepared.training_data_hash,
+            model_parameter_hash=self._model_parameter_hash,
         )
         self._fitted = True
 
@@ -1284,6 +1492,7 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
         frame[self.time_column] = _datetime_series(
             _column(frame, self.time_column), name=self.time_column
         )
+        _check_prediction_horizon(frame, self.horizon_days)
         _reject_leakage_columns(
             frame.columns, label_column=self.label_column, context="prediction data"
         )
@@ -1332,8 +1541,14 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
                 "probability_positive": _normal_probability_positive(means, std),
                 "pooling_status": self._encoder.pooling_status(frame),
                 "uncertainty_semantics": self.provenance.uncertainty_semantics,
+                "uncertainty_horizon_days": self.provenance.uncertainty_horizon_days,
+                "uncertainty_target": self.label_column,
+                "horizon_days": self.horizon_days,
                 "model_name": self.provenance.model_name,
                 "model_provenance_id": self.provenance.provenance_id,
+                "model_provenance_hash": self.provenance.provenance_hash,
+                "training_data_hash": self.provenance.training_data_hash,
+                "model_parameter_hash": self.provenance.model_parameter_hash,
                 "research_only": True,
                 "deployment_authorized": False,
             },

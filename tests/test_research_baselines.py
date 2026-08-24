@@ -129,6 +129,30 @@ class PointInTimeOutcomeTests(unittest.TestCase):
             places=12,
         )
 
+    def test_factor_unit_declaration_is_explicit_and_conflicts_are_rejected(self):
+        events, prices, factors = _factor_fixture()
+        result = compute_spy_factor_residual_outcomes(
+            events,
+            prices,
+            factor_returns=factors,
+            factor_columns=["SPY"],
+            factor_return_unit="simple",
+            min_factor_observations=3,
+        ).iloc[0]
+        self.assertEqual(result["factor_input_return_unit"], "simple")
+        self.assertEqual(result["factor_return_unit"], "log")
+        self.assertEqual(result["asset_return_unit"], "log")
+        self.assertEqual(result["outcome_return_unit"], "simple")
+        with self.assertRaises(ValueError):
+            compute_spy_factor_residual_outcomes(
+                events,
+                prices,
+                factor_returns=factors,
+                factor_return_unit="simple",
+                factor_returns_are_log=True,
+                min_factor_observations=3,
+            )
+
     def test_incomplete_future_factor_path_is_not_labeled(self):
         events, prices, factors = _factor_fixture()
         incomplete = factors.drop(index=factors.index[7])
@@ -141,6 +165,39 @@ class PointInTimeOutcomeTests(unittest.TestCase):
         ).iloc[0]
         self.assertEqual(result["label_status"], "future_factor_data_unavailable")
         self.assertTrue(pd.isna(result["factor_residual_return"]))
+
+    def test_interior_factor_calendar_gap_is_not_labeled(self):
+        events, prices, factors = _factor_fixture()
+        incomplete = factors.drop(index=factors.index[6])
+        result = compute_spy_factor_residual_outcomes(
+            events,
+            prices,
+            factor_returns=incomplete,
+            factor_columns=["SPY"],
+            min_factor_observations=3,
+        ).iloc[0]
+        self.assertEqual(result["label_status"], "future_factor_data_unavailable")
+        self.assertFalse(bool(result["factor_calendar_complete"]))
+        self.assertEqual(int(result["factor_calendar_expected_rows"]), 2)
+        self.assertEqual(int(result["factor_calendar_observed_rows"]), 1)
+
+    def test_explicit_factor_calendar_catches_gaps_in_sparse_price_panels(self):
+        events, prices, factors = _factor_fixture()
+        dates = prices.index
+        sparse_prices = pd.concat([prices.loc[: dates[5]], prices.loc[[dates[7]]]])
+        incomplete = factors.drop(index=factors.index[6])
+        result = compute_spy_factor_residual_outcomes(
+            events,
+            sparse_prices,
+            factor_returns=incomplete,
+            factor_columns=["SPY"],
+            factor_calendar=dates,
+            min_factor_observations=3,
+        ).iloc[0]
+        self.assertEqual(result["label_status"], "future_factor_data_unavailable")
+        self.assertFalse(bool(result["factor_calendar_complete"]))
+        self.assertEqual(int(result["factor_calendar_expected_rows"]), 2)
+        self.assertEqual(int(result["factor_calendar_observed_rows"]), 1)
 
     def test_outcome_factor_schema_rejects_realized_factor_names(self):
         events, prices, factors = _factor_fixture()
@@ -176,6 +233,17 @@ class PointInTimeOutcomeTests(unittest.TestCase):
             float(dense["factor_expected_return"]),
             places=12,
         )
+
+    def test_label_cutoff_is_strictly_before_cutoff(self):
+        events, prices, factors = _factor_fixture()
+        result = compute_spy_factor_residual_outcomes(
+            events,
+            prices,
+            factor_returns=factors,
+            min_factor_observations=3,
+            label_as_of=prices.index[7],
+        ).iloc[0]
+        self.assertEqual(result["label_status"], "future_label_rejected")
 
 
 def _training_fixture() -> pd.DataFrame:
@@ -296,12 +364,102 @@ class BaselineSafetyTests(unittest.TestCase):
 
         self.assertEqual(
             prediction["uncertainty_semantics"],
-            "predictive_standard_deviation",
+            "predictive_standard_deviation_for_1_day_horizon",
         )
         self.assertLess(float(prediction["lower_95"]), float(prediction["upper_95"]))
         self.assertEqual(model.provenance.as_dict()["fit_cutoff"], "2024-01-10T00:00:00")
         self.assertEqual(model.provenance.as_dict()["time_column"], "entry_date")
         self.assertEqual(model.provenance.as_dict()["strict_future"], False)
+
+    def test_provenance_records_normalized_training_and_fitted_parameters(self):
+        training = _training_fixture()
+        first = DynamicHierarchicalBaseline(
+            horizon_days=1, min_time_observations=10, feature_columns=()
+        ).fit(training, cutoff="2024-01-10")
+        second = DynamicHierarchicalBaseline(
+            horizon_days=1, min_time_observations=10, feature_columns=()
+        ).fit(training.sample(frac=1.0, random_state=7), cutoff="2024-01-10")
+
+        provenance = first.provenance.as_dict()
+        self.assertNotEqual(provenance["training_data_hash"], "unavailable")
+        self.assertNotEqual(provenance["model_parameter_hash"], "unavailable")
+        self.assertEqual(
+            provenance["training_data_hash"],
+            second.provenance.training_data_hash,
+        )
+        self.assertEqual(
+            provenance["model_parameter_hash"],
+            second.provenance.model_parameter_hash,
+        )
+        self.assertEqual(
+            first.provenance.provenance_hash,
+            provenance["provenance_id"],
+        )
+
+        prediction = first.predict(
+            pd.DataFrame(
+                {
+                    "event_id": ["q1"],
+                    "entry_date": ["2024-01-11"],
+                    "member": ["A"],
+                    "sector": ["Tech"],
+                }
+            )
+        ).iloc[0]
+        self.assertEqual(prediction["training_data_hash"], provenance["training_data_hash"])
+        self.assertEqual(prediction["model_parameter_hash"], provenance["model_parameter_hash"])
+
+    def test_prediction_uncertainty_is_tied_to_fitted_horizon(self):
+        training = _training_fixture()
+        model = DynamicHierarchicalBaseline(
+            horizon_days=2, min_time_observations=10, feature_columns=()
+        ).fit(training, cutoff="2024-01-10")
+        self.assertEqual(model.provenance.uncertainty_horizon_days, 2)
+        query = pd.DataFrame(
+            {
+                "event_id": ["q1"],
+                "entry_date": ["2024-01-11"],
+                "member": ["A"],
+                "sector": ["Tech"],
+                "horizon_days": [2],
+            }
+        )
+        prediction = model.predict(query).iloc[0]
+        self.assertEqual(prediction["horizon_days"], 2)
+        self.assertEqual(prediction["uncertainty_horizon_days"], 2)
+        self.assertEqual(
+            prediction["uncertainty_target"], "factor_residual_return"
+        )
+        with self.assertRaises(ValueError):
+            model.predict(query.assign(horizon_days=1))
+
+    def test_cutoff_is_strict_for_events_and_label_availability(self):
+        training = _training_fixture()
+        boundary = training.iloc[[0]].copy()
+        boundary["event_id"] = "boundary"
+        boundary["label_available_date"] = "2024-01-10"
+        combined = pd.concat([training, boundary], ignore_index=True)
+
+        model = DynamicHierarchicalBaseline(
+            horizon_days=1, min_time_observations=10, feature_columns=()
+        ).fit(combined, cutoff="2024-01-10")
+        self.assertEqual(model.provenance.rejected_future_label_rows, 1)
+        self.assertEqual(model.provenance.fit_rows, len(training))
+        with self.assertRaises(ValueError):
+            DynamicHierarchicalBaseline(
+                horizon_days=1,
+                min_time_observations=10,
+                feature_columns=(),
+                strict_future=True,
+            ).fit(combined, cutoff="2024-01-10")
+
+    def test_group_dimensions_are_unique_after_normalization(self):
+        for baseline in (
+            DynamicHierarchicalBaseline,
+            DeterministicRegularizedTabularBaseline,
+        ):
+            with self.assertRaises(ValueError):
+                baseline(group_columns=("member", " MEMBER "))
 
     def test_prediction_realized_columns_are_rejected(self):
         training = _training_fixture()

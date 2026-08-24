@@ -20,20 +20,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any, TypeVar
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 
-NumberLike = TypeVar("NumberLike")
-
-
 def _validated_bps(value: object, field_name: str) -> float:
     """Return a finite basis-point value in the executable range."""
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         raise TypeError(f"{field_name} must be a real number")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError(f"{field_name} must be a real number") from exc
     if not np.isfinite(converted):
         raise ValueError(f"{field_name} must be finite")
     # A sell-side multiplier of zero or less is not an executable positive
@@ -90,24 +90,29 @@ class ExecutionCosts:
 
     @staticmethod
     def _resolve_alias(
-        canonical: float,
-        *aliases: tuple[str, float | None],
+        canonical: object,
+        *aliases: tuple[str, object | None],
         field_name: str,
     ) -> float:
-        supplied = [(name, value) for name, value in aliases if value is not None]
+        # Validate every value before comparing aliases.  Converting aliases
+        # to float first would turn ``True`` into 1 bp and would let a string
+        # pass whenever an alias was supplied.
+        canonical_value = _validated_bps(canonical, field_name)
+        supplied = [
+            (name, _validated_bps(value, name))
+            for name, value in aliases
+            if value is not None
+        ]
         if not supplied:
-            return canonical
+            return canonical_value
         for name, value in supplied:
-            if value is None:  # pragma: no cover - filtered above
-                continue
-            if canonical != 0.0 and float(canonical) != float(value):
+            if canonical_value != 0.0 and canonical_value != value:
                 raise ValueError(f"{field_name} and {name} disagree")
         first = supplied[0][1]
-        assert first is not None
-        if any(float(value) != float(first) for _, value in supplied[1:]):
+        if any(value != first for _, value in supplied[1:]):
             names = ", ".join(name for name, _ in supplied)
             raise ValueError(f"execution-cost aliases disagree: {names}")
-        return float(first)
+        return first
 
     @property
     def entry_bps(self) -> float:
@@ -169,7 +174,7 @@ def _as_numeric(
     """Convert a scalar/array-like value while retaining the public shape."""
     try:
         array = np.asarray(value, dtype=float)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise TypeError(f"{name} must contain numeric returns") from exc
     if np.any(np.isinf(array)):
         raise ValueError(f"{name} must be finite or NaN")
@@ -184,15 +189,43 @@ def _restore_type(original: Any, result: np.ndarray | float) -> Any:
     result_array = np.asarray(result, dtype=float)
     if np.isscalar(original) and result_array.ndim == 0:
         return float(result_array)
-    if isinstance(original, pd.Series):
+    if (
+        isinstance(original, pd.Series)
+        and result_array.ndim == 1
+        and len(result_array) == len(original.index)
+    ):
         return pd.Series(result_array, index=original.index, name=original.name)
-    if isinstance(original, pd.Index):
+    if (
+        isinstance(original, pd.Index)
+        and result_array.ndim == 1
+        and len(result_array) == len(original)
+    ):
         return pd.Index(result_array, name=original.name)
     if np.isscalar(original):
         return result_array
     if isinstance(original, np.ndarray):
         return result_array
     return result_array
+
+
+def _broadcast_template(*values: Any) -> Any:
+    """Choose a public container for a broadcast result.
+
+    A scalar gross return paired with a Series alpha (or a scalar entry price
+    paired with a Series of exit prices) must retain the vector's index.  A
+    non-scalar result with no pandas operand is intentionally returned as an
+    ndarray.
+    """
+    for value in values:
+        if isinstance(value, pd.Series):
+            return value
+    for value in values:
+        if isinstance(value, pd.Index):
+            return value
+    for value in values:
+        if not np.isscalar(value):
+            return value
+    return values[0]
 
 
 def executable_return(
@@ -252,9 +285,9 @@ def executable_return_from_prices(
         / (broadcast_entry * costs.entry_multiplier)
         - 1.0
     )
-    # The entry argument determines scalar-vs-array restoration.  Broadcasting
-    # still permits a scalar entry against an endpoint array.
-    template = entry_price if not np.isscalar(entry_price) else exit_price
+    # Broadcasting still permits a scalar entry against an endpoint vector;
+    # use whichever endpoint carries the public vector/index type.
+    template = _broadcast_template(entry_price, exit_price)
     return _restore_type(template, result)
 
 
@@ -279,7 +312,9 @@ def executable_alpha_pct(
     net = np.asarray(executable_return_pct(gross, costs), dtype=float)
     benchmark = gross - alpha
     result = np.where(finite, net - benchmark, np.nan)
-    return _restore_type(gross_original, result)
+    return _restore_type(
+        _broadcast_template(gross_return_pct, gross_alpha_pct), result
+    )
 
 
 # Descriptive aliases keep the formula discoverable without introducing a

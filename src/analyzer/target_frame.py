@@ -103,9 +103,10 @@ def mature_label_mask(
 
     ``window_complete=False`` and missing completion markers are never treated
     as zero-return labels.  When a maturity date exists it must be non-missing;
-    with an ``as_of`` cutoff it must also be on or before that cutoff.  A frame
-    without a maturity column can still be used for already-materialized test
-    fixtures, unless ``require_maturity_date`` is requested.
+    with an ``as_of`` cutoff it must also be on or before that cutoff.  A cutoff
+    without a maturity column is rejected rather than allowing unknown rows to
+    enter a historical target set.  A frame without a maturity column can
+    still be used for already-materialized fixtures when no cutoff is given.
     """
     if not isinstance(labels, pd.DataFrame):
         raise TypeError("labels must be a pandas DataFrame")
@@ -130,20 +131,24 @@ def mature_label_mask(
         elif require_maturity_date:
             raise ValueError(f"completion column {complete_column!r} is missing")
 
+    # A cutoff is meaningful only when the frame carries the metadata needed
+    # to prove that each label was available by that date.  Do not silently
+    # treat a compact frame with no maturity column as historical and mature.
+    require_maturity = require_maturity_date or cutoff is not None
     maturity = _resolve_column(
         labels,
         maturity_column,
         _MATURITY_CANDIDATES,
         role="label maturity",
-        required=require_maturity_date or maturity_column is not None,
+        required=require_maturity or maturity_column is not None,
     )
     if maturity is not None:
         dates = _as_naive_datetime(cast(pd.Series, labels[maturity]), name=maturity)
         mask &= dates.notna()
         if cutoff is not None:
             mask &= dates <= cutoff
-    elif cutoff is not None and require_maturity_date:
-        raise ValueError("a maturity date is required when require_maturity_date=True")
+    elif cutoff is not None:
+        raise ValueError("a maturity date is required when an as_of cutoff is set")
     return mask
 
 
@@ -262,7 +267,8 @@ def build_target_frame(
         role="gross alpha",
         required=False,
     )
-    assert return_column is not None
+    if return_column is None:  # pragma: no cover - required resolution above
+        raise ValueError("a gross return column is required")
 
     numeric_return, valid_return = _finite_numeric(
         cast(pd.Series, frame[return_column]), name=return_column
@@ -281,12 +287,13 @@ def build_target_frame(
         as_of=as_of,
         maturity_column=maturity_column,
         complete_column=complete_column,
-        # Existing signals always expose label_window_end.  Requiring it when
-        # it is actually present prevents an accidental "complete" fixture
-        # from bypassing a known missing maturity date, while retaining support
-        # for compact already-labeled fixtures without that column.
+        # Existing signals expose label_window_end.  Any explicit cutoff also
+        # requires maturity metadata; otherwise the caller cannot establish
+        # that the target was known at the requested historical date.
         require_maturity_date=(
             maturity_column is not None
+            or as_of_date is not None
+            or as_of is not None
             or any(column in frame.columns for column in _MATURITY_CANDIDATES)
         ),
     )

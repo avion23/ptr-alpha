@@ -54,6 +54,7 @@ CONFIG_FILES = [
     "config.toml",
     "pyproject.toml",
 ]
+PARQUET_ENGINE = "pyarrow"
 
 
 def file_sha256(path: Path) -> str:
@@ -102,6 +103,17 @@ def _snapshot_end_date(end: date | None) -> date:
     if end is not None:
         return end
     return previous_nyse_session(date.today()).date()
+
+
+def _write_prices_parquet(prices: pd.DataFrame, path: Path) -> None:
+    """Write the staged price artifact with the project's required engine."""
+    try:
+        prices.to_parquet(path, engine=PARQUET_ENGINE, index=False)
+    except ImportError as exc:
+        raise RuntimeError(
+            "snapshot generation requires the pyarrow Parquet engine; "
+            "install the project dependencies before retrying"
+        ) from exc
 
 
 def build_manifest(
@@ -155,12 +167,12 @@ def build_manifest(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = out_dir / "snapshot.json"
-    save_snapshot(snapshot, snapshot_path)
     if rows.empty:
         prices_long = pd.DataFrame(columns=["ticker", "date", "close"])
     else:
         prices_long = rows
-    prices_long.to_parquet(out_dir / "prices.parquet", index=False)
+    _write_prices_parquet(prices_long, out_dir / "prices.parquet")
+    save_snapshot(snapshot, snapshot_path)
 
     code_digests, code_hash = hash_files(code_files or CODE_FILES)
     config_digests, config_hash = hash_files(config_files or CONFIG_FILES)
@@ -220,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=args.out,
             max_staleness_days=args.max_staleness_days,
         )
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
         print(f"snapshot failed: {exc}", file=sys.stderr)
         return 1
 

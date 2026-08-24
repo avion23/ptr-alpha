@@ -46,8 +46,10 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from analyzer.database import Database  # noqa: E402
 from analyzer.download import (  # noqa: E402
+    _PARSE_FAILURE_PREFIX,
     _PARSE_VERSION,
     _build_member_lookup,
+    _engine_error_detail,
     _filter_existing_pdfs,
     _validated_pdf_sha256,
     preserve_existing_fields,
@@ -239,13 +241,17 @@ def _house_source(staging: Path):
 
 
 def _tolerant_parse_worker(pdf_path: Path):
-    """Run the accepted cascade; convert unresolved PDFs into error results."""
+    """Run the cascade and sentinel-wrap failures without hiding fallback rows.
+
+    ``error:<engine>`` entries are transient cascade diagnostics; only the
+    dedicated ``__parse_failed__:`` marker denotes a whole-document failure.
+    """
     try:
         return _parse_pdf_worker(pdf_path)
     except ParserCascadeError as exc:
-        return pdf_path, [], [f"error:{exc}"]
+        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{exc}"]
     except Exception as exc:  # noqa: BLE001 -- per-PDF quarantine boundary
-        return pdf_path, [], [f"error:{type(exc).__name__}:{exc}"]
+        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{type(exc).__name__}:{exc}"]
 
 
 def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
@@ -307,14 +313,18 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
             doc_id = pdf_path.stem
             pdf_transactions[pdf_path] = transactions
             raw_counts[doc_id] = len(transactions)
-            error_message = None
-            error_engines = []
-            for engine in engines_attempted:
-                if engine.startswith("error:"):
-                    error_message = engine[len("error:"):]
-                else:
-                    error_engines.append(engine)
-            parse_attempts.append((doc_id, error_engines, error_message))
+            error_message = _engine_error_detail(engines_attempted)
+            parse_attempts.append(
+                (
+                    doc_id,
+                    [
+                        engine
+                        for engine in engines_attempted
+                        if not engine.startswith(_PARSE_FAILURE_PREFIX)
+                    ],
+                    error_message,
+                )
+            )
 
         df = consolidate_transactions(pdf_transactions, member_lookup)
         transaction_counts = (
@@ -829,10 +839,6 @@ def _check(checks: dict, name: str, condition: bool, detail: str = "") -> None:
 
 
 def verify(args) -> None:
-    import pandas as pd  # noqa: PLC0415
-
-    from analyzer.senate_efd import SenateRefreshSummary  # noqa: PLC0415
-
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     checks: dict = {}
@@ -1057,7 +1063,6 @@ def verify(args) -> None:
         }
 
         # 7. canonical view: complete generations visible, incomplete hidden
-        complete_years = [y for y in HOUSE_YEARS if y not in incomplete_years]
         canonical_count = db.conn.execute(
             "SELECT COUNT(*) FROM canonical_transactions"
         ).fetchone()[0]
@@ -1959,7 +1964,7 @@ def finalize(args) -> None:
     )
 
     lines = [
-        f"STAGED AUTHORITATIVE CONGRESSIONAL DATABASE REBUILD — VERDICT",
+        "STAGED AUTHORITATIVE CONGRESSIONAL DATABASE REBUILD — VERDICT",
         f"Generation: {manifest['generation']}",
         f"Created: {manifest['created_at']}  Git SHA: {manifest['git_sha']}",
         "",

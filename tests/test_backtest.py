@@ -476,6 +476,23 @@ class TestEvaluateBacktest(unittest.TestCase):
         )
         self.assertTrue(result.empty)
 
+    def test_empty_recommendations_are_independent_and_schema_stable(self):
+        recommendations = self.recommendations.iloc[0:0].copy()
+        result = evaluate_backtest(
+            recommendations, self.prices, pd.Timestamp("2025-01-01"), 90
+        )
+        populated = evaluate_backtest(
+            self.recommendations, self.prices, pd.Timestamp("2025-01-01"), 90
+        )
+
+        self.assertIsNot(result, recommendations)
+        self.assertListEqual(list(result.columns), list(populated.columns))
+        result["caller_mutation"] = pd.Series(dtype=object)
+        self.assertNotIn("caller_mutation", recommendations.columns)
+        self.assertEqual(result.attrs["n_no_price"], 0)
+        self.assertEqual(result.attrs["n_delisted"], 0)
+        self.assertEqual(result.attrs["n_unavailable"], 0)
+
     def test_truncated_ticker_is_unavailable_without_a_delisting_guess(self):
         full_dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
         short_end = pd.Timestamp("2025-01-15")

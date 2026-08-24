@@ -689,6 +689,32 @@ def test_tolerant_parse_watchdog_budget_fires_and_restores_state(
     assert signal.setitimer(signal.ITIMER_REAL, 0) == (0.0, 0.0)
 
 
+def test_tolerant_worker_keeps_backend_timeout_as_parse_failure(tmp_path, monkeypatch):
+    from analyzer import download as download_module
+    from analyzer import parser_cascade
+
+    pdf_path = tmp_path / "backend-timeout.pdf"
+    pdf_path.write_bytes(b"%PDF-backend-timeout\n%%EOF")
+
+    def raise_timeout(_path):
+        raise parser_cascade.ParseBudgetExceeded("backend timeout")
+
+    monkeypatch.setattr(
+        parser_cascade, "extract_tables_with_pdfplumber", raise_timeout
+    )
+
+    out_path, transactions, engines = download_module._tolerant_parse_pdf_worker(
+        pdf_path
+    )
+
+    assert out_path == pdf_path
+    assert transactions == []
+    assert engines == [
+        f"__parse_failed__:parse budget "
+        f"{download_module._PARSE_DOC_BUDGET_SECONDS}s exceeded"
+    ]
+
+
 def test_tolerant_parse_watchdog_absent_outside_main_thread(tmp_path, monkeypatch):
     import threading
     import time as time_module

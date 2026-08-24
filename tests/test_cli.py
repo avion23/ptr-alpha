@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 from typer.testing import CliRunner
 
-from analyzer.cli import _check_data_freshness, _load_sector_map, app
+from analyzer.cli import _CURRENT_YEAR, _check_data_freshness, _load_sector_map, app
 from analyzer.exceptions import StepResult
 
 
@@ -20,6 +20,18 @@ class TestCliApp(unittest.TestCase):
     def test_analyze_invalid_mode(self):
         result = self.runner.invoke(app, ["analyze", "--mode", "invalid_mode"])
         self.assertNotEqual(result.exit_code, 0)
+
+    def test_analyze_defaults_to_current_year(self):
+        context = MagicMock()
+        with (
+            patch("analyzer.cli.get_context", return_value=context),
+            patch("analyzer.cli._check_data_freshness"),
+            patch("analyzer.cli._run_analysis_mode") as run_analysis,
+        ):
+            result = self.runner.invoke(app, ["analyze"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run_analysis.call_args.args[1], _CURRENT_YEAR)
 
     def test_analyze_rejects_invalid_numeric_and_output_options_before_db_open(self):
         cases = [

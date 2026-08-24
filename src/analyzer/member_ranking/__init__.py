@@ -2,7 +2,7 @@
 
 Public API:
   Bayesian helpers:
-    - bayesian_win_probability(wins, losses, market_prior=0.55)
+    - bayesian_win_probability(wins, losses, market_prior=0.50)
   Score factors:
     - _size_score_factor
     - _owner_score_factor

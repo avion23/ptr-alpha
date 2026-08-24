@@ -359,7 +359,7 @@ def _run_analysis_mode(
 @app.command()
 def analyze(
     ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to process"),
+    year: int = typer.Option(_CURRENT_YEAR, help="Year to process"),
     mode: str = typer.Option(
         "ranks",
         help="Output mode: ranks | signals | member | sales | tickers",

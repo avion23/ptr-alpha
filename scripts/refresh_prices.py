@@ -159,7 +159,9 @@ def select_eligible_assets(
         eligible.append(token)
     if include_benchmark and BENCHMARK_TICKER not in eligible:
         eligible.append(BENCHMARK_TICKER)
-    return sorted(eligible), {reason: sorted(tokens) for reason, tokens in excluded.items()}
+    return sorted(eligible), {
+        reason: sorted(tokens) for reason, tokens in excluded.items()
+    }
 
 
 def _verify_persisted_prices(db: Database, start: date, end: date) -> int:
@@ -177,9 +179,7 @@ def _verify_persisted_prices(db: Database, start: date, end: date) -> int:
     return int(row[0]) if row is not None else 0
 
 
-def _compute_staleness(
-    db: Database, end: date, max_staleness_days: int
-) -> list[str]:
+def _compute_staleness(db: Database, end: date, max_staleness_days: int) -> list[str]:
     """Tickers whose last close predates the window end by more than the
     staleness budget. Stale means unavailable for recent windows."""
     rows = db.conn.execute(
@@ -191,9 +191,7 @@ def _compute_staleness(
         str(ticker)
         for ticker, last_date in rows
         if last_date is not None
-        and (
-            end - cast(pd.Timestamp, pd.Timestamp(last_date)).date()
-        ).days
+        and (end - cast(pd.Timestamp, pd.Timestamp(last_date)).date()).days
         > max_staleness_days
     ]
     return sorted(stale)
@@ -284,7 +282,9 @@ def refresh_prices(
                 # genuinely unresolvable assets remain missing; retry each one
                 # individually so transient failures are recovered instead of
                 # aborting the refresh over a cluster of delisted assets.
-                for ticker in sorted(set(eligible) - _persisted_tickers(db, start, end)):
+                for ticker in sorted(
+                    set(eligible) - _persisted_tickers(db, start, end)
+                ):
                     with contextlib.suppress(DataSourceError):
                         price_source.get_prices([ticker], start, end)
         finally:
@@ -302,11 +302,11 @@ def refresh_prices(
     resolved = [t for t in eligible if t in matrix.columns]
     unresolved = sorted(set(eligible) - set(matrix.columns))
     first_date = (
-        str(cast(pd.Timestamp, matrix.index.min()).date())
-        if not matrix.empty
-        else ""
+        str(cast(pd.Timestamp, matrix.index.min()).date()) if not matrix.empty else ""
     )
-    last_date = str(cast(pd.Timestamp, matrix.index.max()).date()) if not matrix.empty else ""
+    last_date = (
+        str(cast(pd.Timestamp, matrix.index.max()).date()) if not matrix.empty else ""
+    )
 
     return RefreshReport(
         generation="",
@@ -334,13 +334,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Refresh eligible asset prices into a throwaway temp database"
     )
-    parser.add_argument("--source-db", required=True, type=Path, help="read-only transactions source DB")
-    parser.add_argument("--db", required=True, type=Path, help="temp output DB (must not exist)")
+    parser.add_argument(
+        "--source-db", required=True, type=Path, help="read-only transactions source DB"
+    )
+    parser.add_argument(
+        "--db", required=True, type=Path, help="temp output DB (must not exist)"
+    )
     parser.add_argument("--start", type=date.fromisoformat, default=DEFAULT_PRICE_START)
-    parser.add_argument("--end", type=date.fromisoformat, default=None, help="defaults to the latest completed NYSE session")
-    parser.add_argument("--max-staleness-days", type=int, default=DEFAULT_MAX_STALENESS_DAYS)
-    parser.add_argument("--report", type=Path, default=None, help="write the JSON refresh report here")
-    parser.add_argument("--force", action="store_true", help="overwrite an existing temp DB")
+    parser.add_argument(
+        "--end",
+        type=date.fromisoformat,
+        default=None,
+        help="defaults to the latest completed NYSE session",
+    )
+    parser.add_argument(
+        "--max-staleness-days", type=int, default=DEFAULT_MAX_STALENESS_DAYS
+    )
+    parser.add_argument(
+        "--report", type=Path, default=None, help="write the JSON refresh report here"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="overwrite an existing temp DB"
+    )
     args = parser.parse_args(argv)
 
     try:

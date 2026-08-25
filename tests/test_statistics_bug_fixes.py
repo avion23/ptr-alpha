@@ -17,28 +17,6 @@ import unittest
 import pandas as pd
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _make_signal_df_with_nan(**override) -> pd.DataFrame:
-    """Minimal purchase signal DataFrame; override any column with NaN."""
-    base = {
-        "member": ["Alice", "Alice"],
-        "ticker": ["AAPL", "AAPL"],
-        "signal_type": ["Purchase", "Purchase"],
-        "horizon_days": [90, 90],
-        "decayed_return_pct": [5.0, float("nan")],
-        "peak_potential_pct": [8.0, float("nan")],
-        "spy_alpha_pct": [4.0, float("nan")],
-        "total_return_pct": [6.0, float("nan")],
-        "total_spy_alpha_pct": [3.0, float("nan")],
-        "entry_price": [100.0, 100.0],
-        "disclosure_date": pd.to_datetime(["2024-01-01", "2024-02-01"]),
-    }
-    base.update(override)
-    return pd.DataFrame(base)
-
-
 # ── Bug #1: SPY double-division ───────────────────────────────────────────────
 
 

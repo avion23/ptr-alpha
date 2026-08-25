@@ -341,13 +341,6 @@ def _score_one_ticker(
     as_of_for_features,
     ticker_recent,
 ) -> dict | None:
-    score_kwargs = {
-        "ticker_perf_signals": ticker_perf_signals,
-        "_bayes_prior_strength": bayes,
-        "scoring_mode": scoring_mode,
-        "as_of_date": as_of_date,
-        "_ranking_dicts": _ranking_dicts,
-    }
     score_df = score_ticker_by_buyers(
         ticker,
         recent_trades,

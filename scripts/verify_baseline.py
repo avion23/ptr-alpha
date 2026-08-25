@@ -31,9 +31,8 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -530,7 +529,7 @@ def cmd_record(args: argparse.Namespace, root: Path, primary: Path) -> int:
 
     manifest = build_manifest(env, results, args.duration_tolerance)
     write_manifest(manifest_path, manifest)
-    print(f"== golden manifest recorded ==")
+    print("== golden manifest recorded ==")
     print(f"  path:          {manifest_path}")
     print(f"  base revision: {manifest['git']['base_revision']}")
     print(f"  revision:      {manifest['git']['revision']}")
@@ -630,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
         "--manifest",
         type=Path,
         default=None,
-        help=f"golden manifest path (default <repo>/tests/baseline/golden_manifest.json)",
+        help="golden manifest path (default <repo>/tests/baseline/golden_manifest.json)",
     )
     parser.add_argument("--db-path", type=Path, default=None, help="path to data/congress.duckdb")
     parser.add_argument(

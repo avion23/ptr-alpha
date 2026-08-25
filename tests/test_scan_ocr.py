@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from scripts import scan_ocr as so
+from scripts import scan_ocr as so  # noqa: E402
 
 
 class TestDateNormalization(unittest.TestCase):
@@ -54,9 +54,9 @@ class TestRowParsing(unittest.TestCase):
             "SP WHITTIER CALIF UN HIGH SCH DIST GO x 05/11/2026 6/5/2026 X",
         ]
         rows = [
-            so._parse_row_line(l, page_number=1, row_index=i + 1)
-            for i, l in enumerate(lines)
-            if not so._EXAMPLE_RE.search(l)
+            so._parse_row_line(line, page_number=1, row_index=i + 1)
+            for i, line in enumerate(lines)
+            if not so._EXAMPLE_RE.search(line)
         ]
         self.assertEqual(len(rows), 1)
 

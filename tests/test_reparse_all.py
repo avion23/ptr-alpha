@@ -19,10 +19,12 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     pdf_dir.mkdir(parents=True)
     success_path = pdf_dir / "success.pdf"
     zero_path = pdf_dir / "ambiguous-zero.pdf"
+    shortfall_path = pdf_dir / "consolidation-shortfall.pdf"
     success_path.write_bytes(b"%PDF-success-generation")
     zero_path.write_bytes(b"%PDF-zero-generation")
+    shortfall_path.write_bytes(b"%PDF-shortfall-generation")
 
-    metadata = pd.DataFrame({"FilingType": ["P", "P"]})
+    metadata = pd.DataFrame({"FilingType": ["P", "P", "P"]})
 
     class FakeSource:
         def __init__(self, _settings):
@@ -48,8 +50,27 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
         }
     ]
     results = [
-        (success_path, transactions, ["pdfplumber", "won:pdfplumber"]),
-        (zero_path, [], ["pdfplumber", "pdftotext", "ocr"]),
+        (success_path, transactions, ["pdfplumber", "won:pdfplumber"], None),
+        (zero_path, [], ["pdfplumber", "pdftotext", "ocr"], None),
+        (
+            shortfall_path,
+            [
+                {
+                    "ticker": "TLSA",
+                    "transaction_type": "Sale",
+                    # OCR garbage date: consolidation must drop the row.
+                    "transaction_date": "38/88/1988",
+                    "owner_code": None,
+                    "amount_raw": "$501 - $15,000",
+                    "amount_midpoint": 7000.0,
+                    "instrument_type": "stock",
+                    "asset_description": "Tesla, Inc.",
+                    "source_row_id": "ocr:p2:l9",
+                }
+            ],
+            ["ocr", "won:reconciled_complete_ocr"],
+            None,
+        ),
     ]
 
     class FakePool:
@@ -63,13 +84,13 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
             return False
 
         def map(self, worker, paths):
-            assert worker is reparse_all._parse_pdf_worker
-            assert paths == [success_path, zero_path]
+            assert worker is reparse_all._resilient_worker
+            assert paths == [success_path, zero_path, shortfall_path]
             return results
 
     class FakeDatabase:
         def __init__(self):
-            self.replacement = None
+            self.replacement: tuple[pd.DataFrame, dict] | None = None
 
         def get_latest_house_generation(self, archive_year):
             assert archive_year == 2026
@@ -86,7 +107,10 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     monkeypatch.setattr(
         reparse_all,
         "_filter_existing_pdfs",
-        lambda _ptrs, _pdf_dir: ([success_path, zero_path], pd.DataFrame()),
+        lambda _ptrs, _pdf_dir: (
+            [success_path, zero_path, shortfall_path],
+            pd.DataFrame(),
+        ),
     )
     monkeypatch.setattr(
         reparse_all,
@@ -102,6 +126,11 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
                 "Last": "Candidate",
                 "FilingDate": pd.Timestamp("2026-07-16"),
             },
+            "consolidation-shortfall": {
+                "First": "Partial",
+                "Last": "Parse",
+                "FilingDate": pd.Timestamp("2026-07-16"),
+            },
         },
     )
     monkeypatch.setattr(reparse_all, "Pool", FakePool)
@@ -115,16 +144,21 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
         },
     )
 
-    persisted = reparse_all.parse_year(2026, db, settings)
+    persisted = reparse_all.parse_year(2026, db, settings)  # type: ignore[arg-type]
 
     assert persisted == 1
+    assert db.replacement is not None
     stored_df, kwargs = db.replacement
     assert stored_df["doc_id"].tolist() == ["success"]
     assert stored_df["ingestion_generation"].tolist() == ["acquired-generation-2026"]
     assert stored_df["artifact_sha256"].tolist() == [
         hashlib.sha256(success_path.read_bytes()).hexdigest()
     ]
-    assert kwargs["attempted_doc_ids"] == ["success", "ambiguous-zero"]
+    assert kwargs["attempted_doc_ids"] == [
+        "success",
+        "ambiguous-zero",
+        "consolidation-shortfall",
+    ]
     assert kwargs["replacement_doc_ids"] == ["success"]
     assert kwargs["ingestion_generation"] == "acquired-generation-2026"
     parse_runs = {run["doc_id"]: run for run in kwargs["parse_runs"]}
@@ -138,6 +172,14 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     )
     assert parse_runs["success"]["status"] == "success"
     assert parse_runs["ambiguous-zero"]["status"] == "zero_rows"
+    assert parse_runs["consolidation-shortfall"]["status"] == "error"
+    assert parse_runs["consolidation-shortfall"]["raw_row_count"] == 1
+    assert parse_runs["consolidation-shortfall"]["error_message"].startswith(
+        "consolidation kept 0/1"
+    )
+    assert all(run["error_message"] is None for run in (
+        parse_runs["success"], parse_runs["ambiguous-zero"]
+    ))
     assert all(
         run["ingestion_generation"] == "acquired-generation-2026"
         for run in parse_runs.values()

@@ -238,32 +238,28 @@ def _persisted_house_generation_counts(
     """Query actual House counts for the targeted acquired generation."""
     if not doc_ids:
         return {}
-    placeholders = ", ".join("?" for _ in doc_ids)
     rows = db.conn.execute(
-        # pi-lens-ignore: S608
-        f"""
+        """
         SELECT doc_id, COUNT(*)
         FROM transactions
-        WHERE doc_id IN ({placeholders})
+        WHERE doc_id IN (SELECT UNNEST(CAST(? AS VARCHAR[])))
           AND source = 'house_pdf'
           AND ingestion_generation = ?
         GROUP BY doc_id
-        """,  # nosec B608 -- placeholders only; values remain bound
-        [*doc_ids, ingestion_generation],
+        """,
+        [doc_ids, ingestion_generation],
     ).fetchall()
-    return {str(doc_id): int(count) for doc_id, count in rows}
+    return {str(doc_id): count for doc_id, count in rows}
 
 
 if __name__ == "__main__":
     settings = Settings()
     db = Database(Path(settings.data.data_dir) / "congress.duckdb")
 
-    years = (
-        # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-        [int(y) for y in sys.argv[1:]]
-        if len(sys.argv) > 1
-        else [2021, 2022, 2023, 2024, 2025, 2026]
-    )
+    try:
+        years = [int(y) for y in sys.argv[1:]]
+    except ValueError as exc:
+        raise SystemExit(f"usage: reparse_all.py [year ...]: {exc}") from exc
     total = 0
     t0 = time.time()
     for year in years:

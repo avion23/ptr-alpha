@@ -177,7 +177,7 @@ def _verify_persisted_prices(db: Database, start: date, end: date) -> int:
         [start, end],
     ).fetchone()
     # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-    return int(row[0]) if row is not None else 0
+    return row[0] if row is not None else 0
 
 
 def _compute_staleness(db: Database, end: date, max_staleness_days: int) -> list[str]:
@@ -308,6 +308,12 @@ def refresh_prices(
     last_date = (
         str(cast(pd.Timestamp, matrix.index.max()).date()) if not matrix.empty else ""
     )
+    # np.int64 -> python int for the JSON-serializable report; fail closed on
+    # any non-integer total rather than emitting a corrupted report.
+    try:
+        price_rows_total = int(matrix.notna().sum().sum())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("non-integer price row total from price matrix") from exc
 
     return RefreshReport(
         generation="",
@@ -321,7 +327,7 @@ def refresh_prices(
         resolved_tickers=len(resolved),
         unresolved_tickers=unresolved,
         unavailable_tickers=unavailable,
-        price_rows=int(matrix.notna().sum().sum()),
+        price_rows=price_rows_total,
         rejected_observations=rejected,
         first_date=first_date,
         last_date=last_date,

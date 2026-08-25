@@ -140,11 +140,11 @@ class YFinancePriceSource:
         invalid_mask = new_prices.notna() & (
             ~np.isfinite(new_prices) | new_prices.le(0)
         )
-        invalid = int(invalid_mask.sum().sum())
+        invalid = invalid_mask.sum().sum()
         new_prices = new_prices.mask(invalid_mask)
         if invalid:
             logger.warning(
-                "Rejected %d non-finite or non-positive fetched prices", int(invalid)
+                "Rejected %d non-finite or non-positive fetched prices", invalid
             )
         new_prices = new_prices.dropna(axis=1, how="all")
         new_prices = _as_frame(new_prices)
@@ -300,8 +300,7 @@ def _validate_and_log_prices(
     if invalid_mask.any().any():
         logger.warning(
             "Quarantined %d invalid cached price observations",
-            # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
-            int(invalid_mask.sum().sum()),
+            invalid_mask.sum().sum(),
         )
         prices = prices.mask(invalid_mask)
     prices = prices.dropna(axis=1, how="all")

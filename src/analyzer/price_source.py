@@ -4,12 +4,13 @@ import logging
 import re
 import time
 from datetime import date, timedelta
-
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from analyzer._price_index import _normalize_price_index
 from analyzer.database import Database
 from analyzer.exceptions import DataSourceError
 from analyzer.settings import Settings
@@ -215,18 +216,12 @@ class YFinancePriceSource:
 
     @staticmethod
     def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:
-        try:
-            index = pd.DatetimeIndex(pd.to_datetime(prices.index))
-        except (TypeError, ValueError) as exc:
-            raise DataSourceError("yfinance returned an invalid date index") from exc
-        if index.tz is not None:
-            index = index.tz_localize(None)
-        index = index.normalize()
-        if index.has_duplicates:
-            raise DataSourceError("yfinance returned duplicate calendar dates")
-        normalized = prices.copy()
-        normalized.index = index
-        return normalized.sort_index()
+        return _normalize_price_index(
+            prices,
+            invalid_error=DataSourceError,
+            duplicate_error=DataSourceError,
+            duplicate_message="yfinance returned duplicate calendar dates",
+        )
 
     def _rename_yf_columns(
         self, new_prices: pd.DataFrame, raw_to_yf: dict

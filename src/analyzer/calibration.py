@@ -451,7 +451,7 @@ def _fit_arrays(
 
 
 def fit_affine_calibration(
-    data: pd.DataFrame,
+    data: pd.DataFrame | Sequence[float] | pd.Series | np.ndarray,
     targets: Sequence[float] | pd.Series | np.ndarray | None = None,
     *,
     prediction_column: str = "prediction",

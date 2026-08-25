@@ -477,7 +477,6 @@ def house_parse(args) -> None:
             if house is None:
                 print(f"house-parse {year}: skipped (not fetched)")
                 continue
-            gen = house["generation_id"]
             if house.get("parse_status") == "complete" and not args.force:
                 print(f"house-parse {year}: skipped (already complete)")
                 continue

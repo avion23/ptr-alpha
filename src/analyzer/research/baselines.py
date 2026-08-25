@@ -53,7 +53,6 @@ class ResearchModelProvenance:
     label_column: str
     feature_columns: tuple[str, ...]
     group_columns: tuple[str, ...]
-    seed: int | None
     hyperparameters: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     assumptions: tuple[str, ...] = field(default_factory=tuple)
     research_only: bool = True
@@ -126,7 +125,6 @@ class ResearchModelProvenance:
             "label_column": self.label_column,
             "feature_columns": list(self.feature_columns),
             "group_columns": list(self.group_columns),
-            "seed": self.seed,
             "hyperparameters": dict(self.hyperparameters),
             "assumptions": list(self.assumptions),
             "research_only": self.research_only,
@@ -635,7 +633,6 @@ def _check_prediction_horizon(frame: pd.DataFrame, horizon_days: int) -> None:
 class _ResearchOnlyMixin:
     research_only = True
     deployment_authorized = False
-    can_deploy = False
 
     def authorize_deployment(self, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
@@ -1014,7 +1011,6 @@ class DynamicHierarchicalBaseline(_ResearchOnlyMixin):
             label_column=self.label_column,
             feature_columns=self._feature_columns,
             group_columns=prepared.group_columns,
-            seed=None,
             hyperparameters=hyperparameters,
             assumptions=(
                 "strict pre-cutoff fold labels",
@@ -1322,7 +1318,6 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
         feature_columns: Sequence[str] | None = None,
         label_available_column: str | None = None,
         strict_future: bool = False,
-        seed: int | None = 0,
     ) -> None:
         if alpha <= 0 or not np.isfinite(alpha):
             raise ValueError("alpha must be positive and finite")
@@ -1345,7 +1340,6 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
         )
         self.label_available_column = label_available_column
         self.strict_future = bool(strict_future)
-        self.seed = seed
         self._fitted = False
 
     def fit(
@@ -1426,7 +1420,6 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
                     "max_bins": self.max_bins,
                     "min_samples_leaf": self.min_samples_leaf,
                     "strict_future": self.strict_future,
-                    "seed": self.seed,
                 },
                 "feature_columns": self._feature_columns,
                 "numeric_specs": {
@@ -1454,7 +1447,6 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
             label_column=self.label_column,
             feature_columns=self._feature_columns,
             group_columns=prepared.group_columns,
-            seed=self.seed,
             hyperparameters=(
                 ("alpha", repr(self.alpha)),
                 ("horizon_days", repr(self.horizon_days)),
@@ -1563,17 +1555,9 @@ class DeterministicRegularizedTabularBaseline(_ResearchOnlyMixin):
         return [f"row-{position}" for position in range(len(frame))]
 
 
-# Short aliases are useful in notebooks and keep the public name independent
-# of the implementation detail that the nonlinear basis is tree-like.
-DeterministicTabularBaseline = DeterministicRegularizedTabularBaseline
-RegularizedTabularBaseline = DeterministicRegularizedTabularBaseline
-
-
 __all__ = [
     "DeterministicRegularizedTabularBaseline",
-    "DeterministicTabularBaseline",
     "DynamicHierarchicalBaseline",
-    "RegularizedTabularBaseline",
     "ResearchModelProvenance",
     "ResearchOnlyError",
 ]

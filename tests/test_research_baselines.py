@@ -333,6 +333,7 @@ class BaselineSafetyTests(unittest.TestCase):
         model = DynamicHierarchicalBaseline()
         self.assertFalse(model.deployment_authorized)
         self.assertTrue(model.research_only)
+        self.assertFalse(hasattr(model, "can_deploy"))
         with self.assertRaises(ResearchOnlyError):
             model.authorize_deployment()
 

@@ -7,28 +7,20 @@ discover from a flat ``analyzer`` namespace.
 
 from analyzer.research.baselines import (
     DeterministicRegularizedTabularBaseline,
-    DeterministicTabularBaseline,
     DynamicHierarchicalBaseline,
-    RegularizedTabularBaseline,
     ResearchModelProvenance,
     ResearchOnlyError,
 )
 from analyzer.research.outcomes import (
     FactorFitMetadata,
-    build_spy_factor_residual_outcomes,
     compute_spy_factor_residual_outcomes,
-    point_in_time_spy_factor_residual_outcomes,
 )
 
 __all__ = [
     "DeterministicRegularizedTabularBaseline",
-    "DeterministicTabularBaseline",
     "DynamicHierarchicalBaseline",
     "FactorFitMetadata",
-    "RegularizedTabularBaseline",
     "ResearchModelProvenance",
     "ResearchOnlyError",
-    "build_spy_factor_residual_outcomes",
     "compute_spy_factor_residual_outcomes",
-    "point_in_time_spy_factor_residual_outcomes",
 ]

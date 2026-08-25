@@ -711,15 +711,7 @@ def compute_spy_factor_residual_outcomes(
     return result
 
 
-# Names kept deliberately descriptive.  The aliases make the helper easy to
-# find without creating a second implementation or a production integration.
-build_spy_factor_residual_outcomes = compute_spy_factor_residual_outcomes
-point_in_time_spy_factor_residual_outcomes = compute_spy_factor_residual_outcomes
-
-
 __all__ = [
     "FactorFitMetadata",
-    "build_spy_factor_residual_outcomes",
     "compute_spy_factor_residual_outcomes",
-    "point_in_time_spy_factor_residual_outcomes",
 ]

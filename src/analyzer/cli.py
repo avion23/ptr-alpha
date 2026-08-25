@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date
@@ -1178,20 +1180,40 @@ def refresh(
 
     if use_gemini_ocr:
         print("[4/4] Running Gemini OCR on zero-row PDFs...")
-        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-
+        # The OCR helper opens its own duckdb handles; DuckDB rejects a same-
+        # file second connection with a different configuration inside this
+        # process, so isolate each pass in a child interpreter.
+        repo_root = Path(__file__).resolve().parents[2]
         for archive_year in archive_years:
+            ocr_code = (
+                "import sys;"
+                f"sys.path.insert(0, {str(repo_root)!r});"
+                "from scripts.ocr_zero_rows import run_gemini_ocr_for_year;"
+                f"run_gemini_ocr_for_year({archive_year}, data_dir={app_ctx.settings.data.data_dir!r})"
+            )
             try:
-                ocr_inserted = run_gemini_ocr_for_year(
-                    archive_year,
-                    data_dir=app_ctx.settings.data.data_dir,
+                proc = subprocess.run(
+                    [sys.executable, "-c", ocr_code],
+                    text=True,
+                    capture_output=True,
+                    timeout=7200,
                 )
-                print(
-                    f"  Gemini OCR {archive_year}: {ocr_inserted} transactions inserted"
-                )
-            except Exception as exc:
+            except subprocess.TimeoutExpired:
                 failed_steps.append(f"gemini_ocr:{archive_year}")
-                logger.warning("Gemini OCR failed for %d: %s", archive_year, exc)
+                logger.warning("Gemini OCR timed out for %d", archive_year)
+                continue
+            if proc.returncode != 0:
+                failed_steps.append(f"gemini_ocr:{archive_year}")
+                logger.warning(
+                    "Gemini OCR failed for %d (exit %d): %s",
+                    archive_year,
+                    proc.returncode,
+                    (proc.stderr or proc.stdout)[-500:],
+                )
+                continue
+            match = re.search(r"Total inserted:\s*(\d+)", proc.stdout)
+            inserted = match.group(1) if match else "unknown"
+            print(f"  Gemini OCR {archive_year}: {inserted} transactions inserted")
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 

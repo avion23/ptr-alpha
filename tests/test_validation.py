@@ -32,13 +32,10 @@ from analyzer.validation import (
     _canonical_ledger_path,
     _complete_evaluation,
     _hash_untracked_path,
-    _member_family_sha256,
-    _member_identity_permutations,
     _phase_end,
     _record_member_control,
     _reserve_evaluation,
     _run_identity_invariant_control,
-    _run_member_identity_control,
     _run_validation_with_db,
     _validate_ledger,
     newey_west_tstat,
@@ -237,97 +234,6 @@ class TestMemberIdentityGate:
                 n_permutations=999,
                 member_control={"exempt": True},
             )
-
-    def test_production_member_control_derives_executed_family_and_statistic(
-        self, monkeypatch, tmp_path
-    ):
-        signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
-        monkeypatch.setattr(
-            "analyzer.validation.analysis.calculate_signal_potential",
-            lambda *args, **kwargs: signal,
-        )
-        series = {0: _series(np.full(20, 3.0))}
-        baseline = _with_series(_selection_frame(series), series)
-        calls = []
-
-        def fake_sweep(*args, **kwargs):
-            permuted = kwargs["signals_by_horizon"]
-            calls.append(permuted)
-            labels = permuted[(60, 0.005)]["member"].tolist()
-            result = baseline.copy()
-            if labels != ["A", "B"]:
-                result["nw_tstat"] = 0.0
-            result.attrs["series_by_trial"] = series
-            return result
-
-        monkeypatch.setattr("analyzer.validation.sweep_configs", fake_sweep)
-        result = _run_member_identity_control(
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            {"horizon": [60], "decay_lambda": [0.005]},
-            date(2022, 1, 1),
-            date(2023, 1, 1),
-            observed_trial_id=0,
-            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-            n_permutations=3,
-            seed=10,
-        )
-        assert len(calls) == 2  # baseline plus swap; identity reuses baseline
-        assert result.status == "completed"
-        assert result.exact_enumeration is True
-        assert result.permutation_group_size == 2
-        assert result.p_value_resolution == 0.5
-        assert result.max_stat_p_value >= 0.5
-        assert result.observed_statistic == baseline.iloc[0]["nw_tstat"]
-        assert result.family_sha256 == _member_family_sha256(baseline, series)
-        assert result.release_ready is True
-
-    def test_large_group_samples_unique_uniform_permutations(self):
-        members = list("ABCDEFG")
-        permutations, group_size, exact = _member_identity_permutations(
-            members, 999, seed=8
-        )
-        assert group_size == math.factorial(7)
-        assert exact is False
-        assert len(permutations) == len(set(permutations)) == 999
-        assert all(set(value) == set(members) for value in permutations)
-        assert any(
-            source == target
-            for value in permutations
-            for source, target in zip(members, value)
-        )
-
-    def test_runtime_budget_fails_closed_without_duplicate_draw_claims(
-        self, monkeypatch, tmp_path
-    ):
-        signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
-        monkeypatch.setattr(
-            "analyzer.validation.analysis.calculate_signal_potential",
-            lambda *args, **kwargs: signal,
-        )
-        series = {0: _series(np.ones(20))}
-        baseline = _with_series(_selection_frame(series), series)
-        monkeypatch.setattr(
-            "analyzer.validation.sweep_configs", lambda *args, **kwargs: baseline
-        )
-        result = _run_member_identity_control(
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            {"horizon": [60], "decay_lambda": [0.005]},
-            date(2022, 1, 1),
-            date(2023, 1, 1),
-            observed_trial_id=0,
-            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-            n_permutations=999,
-            seed=10,
-            runtime_budget_seconds=0.0,
-        )
-        assert result.status == "infeasible_runtime_budget"
-        assert result.evaluated_permutations == 0
-        assert result.release_ready is False
-        assert result.max_stat_p_value == 1.0
 
     def test_forged_identity_audit_records_are_ignored_for_deployment(self, tmp_path):
         series = {0: _series(np.full(180, 2.0))}
@@ -936,14 +842,3 @@ def test_cli_validation_grid_counts_are_exact():
     assert math.prod(len(values) for values in _validation_grid(False).values()) == 18
     assert math.prod(len(values) for values in _validation_grid(True).values()) == 648
     assert _validation_grid(False)["scoring_mode"] == ["consensus"]
-
-
-def test_legacy_sweep_refuses_winner_claims(capsys):
-    import sweep
-
-    with pytest.raises(SystemExit) as exc:
-        sweep.main()
-    assert exc.value.code == 2
-    error = capsys.readouterr().err
-    assert "disabled" in error
-    assert "no in-sample winner" in error

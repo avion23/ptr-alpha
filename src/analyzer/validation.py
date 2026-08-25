@@ -13,7 +13,6 @@ The validation contract is fail closed:
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import logging
 import math
@@ -22,7 +21,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
@@ -52,8 +50,6 @@ MIN_RELEASE_PERMUTATIONS = 999
 LOCKED_FINAL_START = date(2026, 1, 1)
 VALIDATION_ENTRY_DELAY_DAYS = 0  # evaluate_backtest(use_dip_entry=False)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
-MEMBER_EXACT_GROUP_LIMIT = 720
-MEMBER_RUNTIME_BUDGET_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,27 +379,6 @@ def _backtest_core(
     return result, per_date
 
 
-def run_single_backtest(
-    all_transactions: pd.DataFrame,
-    prices: pd.DataFrame,
-    params: BacktestParams,
-    signals: pd.DataFrame,
-    bayes_prior_strength: float,
-    decay_lambda: float,
-    scoring_mode: str = "consensus",
-) -> SweepResult:
-    result, _ = _backtest_core(
-        all_transactions,
-        prices,
-        params,
-        signals,
-        bayes_prior_strength,
-        decay_lambda,
-        scoring_mode,
-    )
-    return result
-
-
 def newey_west_tstat(alpha_series: pd.Series, lag: int) -> float:
     """Bartlett-kernel HAC t-statistic for the per-date net-alpha mean."""
     x = np.asarray(pd.Series(alpha_series).dropna(), dtype=float)
@@ -462,23 +437,6 @@ def permute_signal_member_labels(
         )
         output[key] = changed
     return output
-
-
-def _member_identity_permutations(
-    members: list[str], requested: int, seed: int
-) -> tuple[list[tuple[str, ...]], int, bool]:
-    """Enumerate small groups; otherwise draw a uniform unique subset."""
-    if requested < 1:
-        raise ValueError("requested member permutations must be positive")
-    group_size = math.factorial(len(members))
-    if group_size <= MEMBER_EXACT_GROUP_LIMIT or requested >= group_size:
-        return list(itertools.permutations(members)), group_size, True
-    target = requested
-    rng = np.random.default_rng(seed)
-    sampled: set[tuple[str, ...]] = set()
-    while len(sampled) < target:
-        sampled.add(tuple(str(value) for value in rng.permutation(members)))
-    return sorted(sampled), group_size, False
 
 
 def sweep_configs(
@@ -1192,12 +1150,6 @@ def select_config(
     }
 
 
-def _empirical_upper_quantile(values: list[float], probability: float) -> float:
-    ordered = np.sort(np.asarray(values, dtype=float))
-    index = max(0, math.ceil(probability * len(ordered)) - 1)
-    return float(ordered[index])
-
-
 def _run_identity_invariant_control(
     sweep_df: pd.DataFrame,
     observed_trial_id: int,
@@ -1246,148 +1198,6 @@ def _run_identity_invariant_control(
         observed_trial_id=observed_trial_id,
         observed_statistic=float(row["nw_tstat"]),
     )
-    _record_member_control(ledger_path, result)
-    return result
-
-
-def _run_member_identity_control(
-    all_tx: pd.DataFrame,
-    prices: pd.DataFrame,
-    entry_prices: pd.DataFrame,
-    grid: dict,
-    start: date,
-    end: date,
-    *,
-    observed_trial_id: int,
-    ledger_path: Path,
-    n_permutations: int,
-    seed: int,
-    runtime_budget_seconds: float = MEMBER_RUNTIME_BUDGET_SECONDS,
-) -> MemberIdentityControlResult:
-    """Execute and fingerprint the actual family, then run its identity null."""
-    started = time.perf_counter()
-    signal_cache: dict[tuple[int, float], pd.DataFrame] = {}
-    for horizon in {int(value) for value in grid["horizon"]}:
-        for decay in {float(value) for value in grid["decay_lambda"]}:
-            signal_cache[(horizon, decay)] = analysis.calculate_signal_potential(
-                entry_prices, prices, [horizon], decay_lambda=decay
-            )
-    baseline_frame = sweep_configs(
-        all_tx,
-        prices,
-        entry_prices,
-        grid,
-        start,
-        end,
-        signals_by_horizon=signal_cache,
-    )
-    family_complete, family_details = _family_integrity(baseline_frame)
-    if not family_complete:
-        raise ValueError(
-            "executed member-control family is incomplete: "
-            f"{family_details.get('reason', 'invalid family')}"
-        )
-    if _trial_failure_mask(baseline_frame).any():
-        raise ValueError("executed member-control family contains failed trials")
-    baseline_series = baseline_frame.attrs.get("series_by_trial")
-    expected_ids = {int(value) for value in baseline_frame["trial_id"]}
-    if not isinstance(baseline_series, dict) or set(baseline_series) != expected_ids:
-        raise ValueError("executed member-control family lacks complete trial series")
-    selected = baseline_frame[baseline_frame["trial_id"] == observed_trial_id]
-    if len(selected) != 1:
-        raise ValueError("observed trial_id is not unique in executed family")
-    observed_statistic = float(selected.iloc[0]["nw_tstat"])
-    family_sha256 = _family_sha256_for_sweep(baseline_frame, baseline_series)
-    baseline_eligible = baseline_frame[baseline_frame["min_sample_ok"]]
-    baseline_max = (
-        float(baseline_eligible["nw_tstat"].max())
-        if not baseline_eligible.empty
-        else -math.inf
-    )
-
-    members = sorted(
-        {
-            str(member)
-            for frame in signal_cache.values()
-            for member in frame["member"].dropna().unique()
-        }
-    )
-    if len(members) < 2:
-        raise ValueError("member-label permutation requires at least two members")
-    permutations, group_size, exact = _member_identity_permutations(
-        members, n_permutations, seed
-    )
-    null_max_statistics: list[float] = []
-    status = "completed"
-    identity = tuple(members)
-    for identity_permutation in permutations:
-        if time.perf_counter() - started >= runtime_budget_seconds:
-            status = "infeasible_runtime_budget"
-            break
-        if identity_permutation == identity:
-            null_max_statistics.append(baseline_max)
-            continue
-        permuted = permute_signal_member_labels(
-            signal_cache, permutation=identity_permutation
-        )
-        null_frame = sweep_configs(
-            all_tx,
-            prices,
-            entry_prices,
-            grid,
-            start,
-            end,
-            signals_by_horizon=permuted,
-        )
-        eligible = null_frame[null_frame["min_sample_ok"]]
-        null_max_statistics.append(
-            float(eligible["nw_tstat"].max()) if not eligible.empty else -math.inf
-        )
-    evaluated = len(null_max_statistics)
-    complete_exact = exact and evaluated == group_size
-    complete_sample = not exact and evaluated == len(permutations)
-    if evaluated == 0:
-        max_stat_p = 1.0
-        quantile = None
-    elif complete_exact:
-        exceedances = int(np.sum(np.asarray(null_max_statistics) >= observed_statistic))
-        max_stat_p = float(max(1, exceedances) / group_size)
-        quantile = _empirical_upper_quantile(null_max_statistics, 0.95)
-    else:
-        max_stat_p = float(
-            (1.0 + np.sum(np.asarray(null_max_statistics) >= observed_statistic))
-            / (evaluated + 1.0)
-        )
-        quantile = _empirical_upper_quantile(null_max_statistics, 0.95)
-    release_ready = bool(
-        status == "completed"
-        and (
-            complete_exact
-            or (complete_sample and evaluated >= MIN_RELEASE_PERMUTATIONS)
-        )
-    )
-    payload = {
-        "status": status,
-        "gating": False,
-        "method": "uniform_full_permutation_group_family_max_stat",
-        "requested_permutations": n_permutations,
-        "evaluated_permutations": evaluated,
-        "permutation_group_size": group_size,
-        "exact_enumeration": complete_exact,
-        "sampled_without_replacement": not exact,
-        "p_value_resolution": (
-            1.0 / group_size if complete_exact else 1.0 / (evaluated + 1.0)
-        ),
-        "max_stat_p_value": max_stat_p,
-        "null_max_t_quantile_95": quantile,
-        "release_ready": release_ready,
-        "runtime_seconds": round(time.perf_counter() - started, 3),
-        "runtime_budget_seconds": runtime_budget_seconds,
-        "family_sha256": family_sha256,
-        "observed_trial_id": observed_trial_id,
-        "observed_statistic": observed_statistic,
-    }
-    result = MemberIdentityControlResult(**payload)
     _record_member_control(ledger_path, result)
     return result
 
@@ -2209,25 +2019,6 @@ def _finite_or_none(value):
     return numeric if math.isfinite(numeric) else None
 
 
-def _spy_mean_return(
-    prices: pd.DataFrame,
-    start: date,
-    end: date,
-    horizon: int,
-    frequency_days: int = 30,
-) -> float | None:
-    """Mean executable SPY return on exactly the requested calendar support."""
-    returns = [
-        _benchmark_return(prices, pd.Timestamp(as_of), horizon)
-        for as_of in pd.date_range(start, end, freq=f"{frequency_days}D")
-    ]
-    if not returns or any(
-        value is None or not math.isfinite(float(value)) for value in returns
-    ):
-        return None
-    return round(float(np.mean(returns)), 4)
-
-
 def _build_manifest(
     db_path: Path,
     all_tx: pd.DataFrame,
@@ -2361,11 +2152,8 @@ def _dependency_version(name: str) -> str:
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _value_snapshot_hash(*frames: pd.DataFrame) -> str:
@@ -2380,7 +2168,7 @@ def _value_snapshot_hash(*frames: pd.DataFrame) -> str:
 
 def _code_hash() -> str:
     root = Path(__file__).resolve().parents[2]
-    paths = sorted((root / "src" / "analyzer").rglob("*.py")) + [root / "sweep.py"]
+    paths = sorted((root / "src" / "analyzer").rglob("*.py"))
     digest = hashlib.sha256()
     for path in paths:
         digest.update(str(path.relative_to(root)).encode())

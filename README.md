@@ -106,7 +106,6 @@ scripts/
 ├── reparse_all.py           # Reparse cached PDFs
 └── run_kelly_backtest.py    # Kelly-sizing backtest helper
 
-sweep.py                     # Parameter sweep using analyzer.validation
 ```
 
 Modules follow a layered design: `cli.py` handles presentation and formatting, `pipeline.py` contains pure computation returning `DataResult`, repository modules (`transaction_repository`, `price_repository`, `metadata_repository`, `parse_run_repository`) encapsulate database access behind the `database.py` facade, and `exceptions.py` defines the `StepResult` and `DataResult[T]` types used throughout for error propagation.

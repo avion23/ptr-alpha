@@ -385,14 +385,20 @@ def _resolve_column(
 
 
 def _complete_mask(frame: pd.DataFrame, complete_column: str | None) -> pd.Series:
-    if complete_column is None:
-        return pd.Series(True, index=frame.index, dtype=bool)
-    if complete_column not in frame.columns:
+    status_columns = [
+        column
+        for column in (complete_column, "target_available", "window_complete")
+        if column is not None and column in frame.columns
+    ]
+    if not status_columns:
         # A target column with no explicit status is accepted for compact
-        # fixtures.  If a status exists, false/missing is always respected.
+        # legacy fixtures.
         return pd.Series(True, index=frame.index, dtype=bool)
-    values = cast(pd.Series, frame[complete_column])
-    return cast(pd.Series, values.eq(True).fillna(False))
+    mask = pd.Series(True, index=frame.index, dtype=bool)
+    for column in status_columns:
+        values = cast(pd.Series, frame[column])
+        mask &= values.eq(True).fillna(False)
+    return mask
 
 
 def _fit_arrays(

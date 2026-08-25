@@ -280,6 +280,10 @@ def build_target_frame(
         numeric_alpha, valid_alpha = _finite_numeric(
             cast(pd.Series, frame[alpha_column]), name=alpha_column
         )
+        if alpha_column == "total_spy_alpha":
+            numeric_alpha *= 100.0
+    if return_column == "total_return":
+        numeric_return *= 100.0
 
     mature = mature_label_mask(
         frame,

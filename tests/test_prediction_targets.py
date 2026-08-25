@@ -87,6 +87,19 @@ def test_negative_returns_and_alpha_are_valid_targets():
     )
 
 
+def test_target_frame_converts_decimal_fallback_labels_only():
+    costs = ExecutionCosts(entry_bps=10, exit_bps=20)
+    labels = pd.DataFrame({"total_return": [0.10], "total_spy_alpha": [0.04]})
+
+    result = build_target_frame(labels, costs)
+
+    expected_net = executable_return_pct(10.0, costs)
+    assert result.loc[0, "net_return_pct"] == pytest.approx(expected_net)
+    assert result.loc[0, "net_alpha_pct"] == pytest.approx(
+        executable_alpha_pct(10.0, 4.0, costs)
+    )
+
+
 def test_broadcast_results_restore_vector_container_and_index():
     prices = pd.Series([110.0, 90.0], index=["a", "b"], name="exit")
     price_result = executable_return_from_prices(100.0, prices)
@@ -230,6 +243,21 @@ def test_affine_calibration_reports_uncertainty_and_probability_positive():
     )
     assert predicted.loc[0, "probability_positive"] < 0.5
     assert predicted.loc[1, "probability_positive"] > 0.5
+
+
+def test_calibration_honors_present_status_columns_and_compact_fixtures():
+    compact = pd.DataFrame(
+        {"prediction": [0.0, 1.0, 2.0], "net_return_pct": [0.0, 1.0, 2.0]}
+    )
+    assert fit_affine_calibration(compact).n_observations == 3
+
+    statuses = compact.reindex(range(7)).assign(
+        prediction=np.arange(7, dtype=float),
+        net_return_pct=np.arange(7, dtype=float),
+        target_available=[True, False, True, True, True, pd.NA, True],
+        window_complete=[True, True, False, True, True, True, pd.NA],
+    )
+    assert fit_affine_calibration(statuses).n_observations == 3
 
 
 def test_future_rows_cannot_change_target_or_calibration_before_cutoff():

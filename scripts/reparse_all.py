@@ -32,8 +32,25 @@ from analyzer.datasources import (
 )
 from analyzer.download import preserve_existing_fields
 from analyzer.models import FilingType
-from analyzer.parser_cascade import _parse_pdf_worker
+from analyzer.parser_cascade import (
+    ParserCascadeError,
+    _parse_pdf_worker,
+)
 from analyzer.settings import Settings
+
+
+def _resilient_worker(
+    pdf_path: Path,
+) -> tuple[Path, list[dict], list[str], str | None]:
+    """Isolate per-document failures so one unreadable PDF cannot abort the
+    whole batch. Errors are recorded as parse-run rows; prior House rows for
+    those documents stay preserved because they never enter
+    ``replacement_doc_ids``."""
+    try:
+        pdf_path_out, txs, engines = _parse_pdf_worker(pdf_path)
+        return pdf_path_out, txs, engines, None
+    except (ParserCascadeError, OSError) as exc:
+        return pdf_path, [], [], f"{type(exc).__name__}: {exc}"
 
 
 def parse_year(year: int, db: Database, settings: Settings):
@@ -61,21 +78,27 @@ def parse_year(year: int, db: Database, settings: Settings):
     t0 = time.time()
 
     with Pool(settings.data.get_workers()) as pool:
-        results = pool.map(_parse_pdf_worker, pdf_paths)
+        results = pool.map(_resilient_worker, pdf_paths)
 
     elapsed = time.time() - t0
-    success = sum(1 for _, txs, _ in results if txs)
-    zero = sum(1 for _, txs, _ in results if not txs)
-    print(f"  {year}: {success} with rows, {zero} zero-rows in {elapsed:.1f}s")
+    errors = [(path, err) for path, _, _, err in results if err]
+    success = sum(1 for _, txs, _, err in results if txs and not err)
+    zero = sum(1 for _, txs, _, err in results if not txs and not err)
+    print(
+        f"  {year}: {success} with rows, {zero} zero-rows, {len(errors)} errors "
+        f"in {elapsed:.1f}s"
+    )
+    for path, err in errors[:10]:
+        print(f"    error {path.name}: {err}")
 
-    pdf_transactions = {pdf_path: txs for pdf_path, txs, _ in results}
-    emitted_counts = {pdf_path.stem: len(txs) for pdf_path, txs, _ in results}
+    pdf_transactions = {pdf_path: txs for pdf_path, txs, _, _ in results}
+    emitted_counts = {pdf_path.stem: len(txs) for pdf_path, txs, _, _ in results}
     attempted_doc_ids = list(emitted_counts)
     replacement_doc_ids = [
         doc_id for doc_id, emitted in emitted_counts.items() if emitted > 0
     ]
     artifact_hashes = {
-        pdf_path.stem: _artifact_sha256(pdf_path) for pdf_path, _, _ in results
+        pdf_path.stem: _artifact_sha256(pdf_path) for pdf_path, _, _, _ in results
     }
     ingestion_generation = (
         db.get_latest_house_generation(year) or f"legacy-untracked-{year}"
@@ -101,16 +124,19 @@ def parse_year(year: int, db: Database, settings: Settings):
             "doc_id": pdf_path.stem,
             "year": year,
             "parser_version": "v3-reparse",
-            "status": "success" if transactions else "zero_rows",
+            "status": "success"
+            if transactions
+            else ("error" if error else "zero_rows"),
             "engines_attempted": ",".join(engines_attempted)
-            if engines_attempted
+            if engines_attempted and not error
             else "production-cascade-failed",
             "raw_row_count": len(transactions),
             "transaction_count": 0,
+            "error_message": error,
             "artifact_sha256": artifact_hashes[pdf_path.stem],
             "ingestion_generation": ingestion_generation,
         }
-        for pdf_path, transactions, engines_attempted in results
+        for pdf_path, transactions, engines_attempted, error in results
     ]
 
     # Empty deterministic results are ambiguous: record the attempt, but do not
@@ -203,6 +229,7 @@ if __name__ == "__main__":
     db = Database(Path(settings.data.data_dir) / "congress.duckdb")
 
     years = (
+        # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
         [int(y) for y in sys.argv[1:]]
         if len(sys.argv) > 1
         else [2021, 2022, 2023, 2024, 2025, 2026]

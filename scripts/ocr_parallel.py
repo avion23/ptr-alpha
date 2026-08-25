@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 import queue
 import threading
 import time
@@ -19,41 +18,18 @@ from scripts.gemini_ocr_common import (
 from scripts.ocr_zero_rows import (
     get_filing_date,
     get_metadata_member,
-    get_ocr_work_items,
+    get_zero_row_pdfs,
     insert_transactions,
+    load_progress,
     mark_progress,
     record_parse_run,
     resolve_ingestion_generation,
+    save_progress,
 )
 
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress.json"
 MAX_WORKERS = 15
-
-
-def get_zero_row_pdfs():
-    return get_ocr_work_items(db_path=DB_PATH, data_dir=os.path.dirname(DB_PATH))
-
-
-def load_progress():
-    if os.path.exists(PROGRESS_PATH):
-        with open(PROGRESS_PATH) as handle:
-            return json.load(handle)
-    return {"completed": [], "errors": [], "no_txs": []}
-
-
-def save_progress(progress):
-    temporary = PROGRESS_PATH + ".tmp"
-    with open(temporary, "w") as handle:
-        json.dump(progress, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, PROGRESS_PATH)
-
-
-def parse_output(output):
-    parsed = parse_gemini_output(output)
-    return parsed.member, parsed.transactions
 
 
 write_q: queue.Queue = queue.Queue()
@@ -263,7 +239,7 @@ def main():
     )
     args = parser.parse_args()
 
-    progress = load_progress()
+    progress = load_progress(PROGRESS_PATH)
     pending = get_zero_row_pdfs()
     print(f"Current unresolved work: {len(pending)} (parallelism: {MAX_WORKERS})")
     if not pending:
@@ -298,7 +274,7 @@ def main():
                     else "errors"
                 )
                 mark_progress(progress, result_doc, progress_status)
-                save_progress(progress)
+                save_progress(progress, PROGRESS_PATH)
                 elapsed = time.time() - started
                 print(
                     f"  [{completed}/{len(pending)}] {result_doc} ({year}) "

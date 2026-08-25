@@ -116,7 +116,7 @@ class YFinancePriceSource:
         incomplete tickers.
         """
         fetch_tickers = missing_tickers if missing_tickers else all_tickers
-        fetch_resolved = sorted(set(raw_to_yf.get(t, t) for t in fetch_tickers))
+        fetch_resolved = sorted({raw_to_yf.get(t, t) for t in fetch_tickers})
 
         logger.info(
             f"Fetching price data for {len(fetch_resolved)} tickers using yfinance"
@@ -147,6 +147,7 @@ class YFinancePriceSource:
                 "Rejected %d non-finite or non-positive fetched prices", int(invalid)
             )
         new_prices = new_prices.dropna(axis=1, how="all")
+        new_prices = _as_frame(new_prices)
         new_prices = self._rename_yf_columns(new_prices, raw_to_yf)
 
         if self.db.is_read_only:
@@ -172,7 +173,7 @@ class YFinancePriceSource:
                 # yfinance treats ``end`` as exclusive while this public API
                 # and the repository treat it as inclusive.
                 download_end = pd.Timestamp(end) + timedelta(days=1)
-                return yf.download(
+                data = yf.download(
                     fetch_resolved,
                     start=start,
                     end=download_end,
@@ -180,6 +181,9 @@ class YFinancePriceSource:
                     threads=True,
                     auto_adjust=True,
                 )
+                if not isinstance(data, pd.DataFrame):
+                    raise DataSourceError("yfinance returned no downloadable frame")
+                return data
             except Exception as e:
                 if attempt < max_retries - 1:
                     delay = 2 ** (attempt + 1)
@@ -194,6 +198,7 @@ class YFinancePriceSource:
                         "falling back to cached data"
                     )
                     return pd.DataFrame()
+        raise DataSourceError("yfinance download retries exhausted")
 
     @staticmethod
     def _extract_close_prices(
@@ -212,7 +217,7 @@ class YFinancePriceSource:
         if not isinstance(close, pd.DataFrame):
             raise DataSourceError("Unsupported yfinance Close response shape")
         if len(fetch_resolved) == 1 and len(close.columns) == 1:
-            return close.rename(columns={close.columns[0]: fetch_resolved[0]})
+            return close.rename(columns={str(close.columns[0]): fetch_resolved[0]})
         return close.copy()
 
     @staticmethod
@@ -290,7 +295,7 @@ def _validate_and_log_prices(
     prices: pd.DataFrame, all_tickers: list[str]
 ) -> pd.DataFrame:
     """Fail loudly when too many tickers couldn't be fetched (>25%)."""
-    prices = prices.apply(pd.to_numeric, errors="coerce")
+    prices = _as_frame(prices.apply(pd.to_numeric, errors="coerce"))
     invalid_mask = prices.notna() & (~np.isfinite(prices) | prices.le(0))
     if invalid_mask.any().any():
         logger.warning(
@@ -320,5 +325,17 @@ def _validate_and_log_prices(
         f"Successfully fetched prices for {success_count}/{len(all_tickers)} "
         f"tickers ({success_rate * 100:.1f}% success)"
     )
-    available_tickers = [t for t in all_tickers if t in prices.columns]
-    return prices[available_tickers].dropna(axis=1, how="all")
+    return _select_columns(prices, all_tickers)
+
+
+def _select_columns(prices: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    """Column-select in ticker order and drop all-empty columns."""
+    available = [t for t in tickers if t in prices.columns]
+    return _as_frame(prices[available]).dropna(axis=1, how="all")
+
+
+def _as_frame(value: object) -> pd.DataFrame:
+    """Narrow pandas ``apply`` results that stubs type as a union."""
+    if not isinstance(value, pd.DataFrame):
+        raise DataSourceError("unexpected price-table shape")
+    return value

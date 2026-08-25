@@ -5,6 +5,7 @@ production cascade still controls text-engine comparison and final OCR fallback.
 """
 
 from __future__ import annotations
+
 import hashlib
 import os
 import sys
@@ -17,19 +18,22 @@ os.environ["PTR_SKIP_DOCLING"] = "1"
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from analyzer.database import Database
-from analyzer.models import FilingType
+from multiprocessing import Pool
+from typing import cast
 
+import pandas as pd
+
+from analyzer.database import Database
 from analyzer.datasources import (
     HouseTransactionSource,
     _build_member_lookup,
     _filter_existing_pdfs,
     consolidate_transactions,
 )
-from analyzer.parser_cascade import _parse_pdf_worker
 from analyzer.download import preserve_existing_fields
+from analyzer.models import FilingType
+from analyzer.parser_cascade import _parse_pdf_worker
 from analyzer.settings import Settings
-from multiprocessing import Pool
 
 
 def parse_year(year: int, db: Database, settings: Settings):
@@ -44,7 +48,7 @@ def parse_year(year: int, db: Database, settings: Settings):
     metadata = src.fetch_metadata(year)
     src.close()
 
-    ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
+    ptrs = cast(pd.DataFrame, metadata[metadata["FilingType"] == FilingType.PTR.value])
     pdf_paths, existing_docs = _filter_existing_pdfs(ptrs, pdf_dir)
     if not pdf_paths:
         print(f"  {year}: no PDFs found")
@@ -91,21 +95,21 @@ def parse_year(year: int, db: Database, settings: Settings):
     df = preserve_existing_fields(df, db)
     if not df.empty:
         df["ingestion_generation"] = ingestion_generation
-        df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
+        df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes.get)
     parse_runs = [
-        dict(
-            doc_id=pdf_path.stem,
-            year=year,
-            parser_version="v3-reparse",
-            status="success" if transactions else "zero_rows",
-            engines_attempted=",".join(engines_attempted)
+        {
+            "doc_id": pdf_path.stem,
+            "year": year,
+            "parser_version": "v3-reparse",
+            "status": "success" if transactions else "zero_rows",
+            "engines_attempted": ",".join(engines_attempted)
             if engines_attempted
             else "production-cascade-failed",
-            raw_row_count=len(transactions),
-            transaction_count=0,
-            artifact_sha256=artifact_hashes[pdf_path.stem],
-            ingestion_generation=ingestion_generation,
-        )
+            "raw_row_count": len(transactions),
+            "transaction_count": 0,
+            "artifact_sha256": artifact_hashes[pdf_path.stem],
+            "ingestion_generation": ingestion_generation,
+        }
         for pdf_path, transactions, engines_attempted in results
     ]
 

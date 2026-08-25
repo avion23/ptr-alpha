@@ -32,6 +32,7 @@ temp DB with ``scripts/snapshot_prices.py`` to produce a value-hashed manifest.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import re
@@ -39,6 +40,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -117,13 +119,11 @@ def refresh_end_date(today: date | None = None) -> date:
     return previous_nyse_session(today or date.today()).date()
 
 
-def _clean_asset(token: str) -> str | None:
-    if token is None:
+def _clean_asset(value: object) -> str | None:
+    asset = str(value).strip().upper() if value is not None else ""
+    if not asset or asset == "NAN":
         return None
-    token = str(token).strip().upper()
-    if not token or token == "NAN":
-        return None
-    return token
+    return asset
 
 
 def select_eligible_assets(
@@ -166,15 +166,15 @@ def _verify_persisted_prices(db: Database, start: date, end: date) -> int:
     """Return the number of non-finite/non-positive rows in the temp DB within
     the refresh window. The price repository quarantines those on upsert, so a
     healthy refresh reports zero."""
-    rows = db.conn.execute(
+    row = db.conn.execute(
         """
         SELECT COUNT(*) FROM prices
         WHERE date BETWEEN ? AND ?
           AND (close <= 0 OR NOT isfinite(close))
         """,
         [start, end],
-    ).fetchone()[0]
-    return int(rows)
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 def _compute_staleness(
@@ -190,7 +190,11 @@ def _compute_staleness(
     stale = [
         str(ticker)
         for ticker, last_date in rows
-        if last_date is not None and (end - pd.Timestamp(last_date).date()).days > max_staleness_days
+        if last_date is not None
+        and (
+            end - cast(pd.Timestamp, pd.Timestamp(last_date)).date()
+        ).days
+        > max_staleness_days
     ]
     return sorted(stale)
 
@@ -241,7 +245,7 @@ def refresh_prices(
     if pd.Timestamp(end) not in expected_sessions:
         raise ValueError(
             f"refresh end {end} is not a completed NYSE session; "
-            f"latest completed session is {expected_sessions[-1].date()}"
+            f"latest completed session is {cast(pd.Timestamp, expected_sessions[-1]).date()}"
         )
     if max_staleness_days < 0:
         raise ValueError("max_staleness_days must be non-negative")
@@ -281,10 +285,8 @@ def refresh_prices(
                 # individually so transient failures are recovered instead of
                 # aborting the refresh over a cluster of delisted assets.
                 for ticker in sorted(set(eligible) - _persisted_tickers(db, start, end)):
-                    try:
+                    with contextlib.suppress(DataSourceError):
                         price_source.get_prices([ticker], start, end)
-                    except DataSourceError:
-                        pass
         finally:
             price_source.close()
         # Assets with no price history in the window (including those whose
@@ -300,9 +302,11 @@ def refresh_prices(
     resolved = [t for t in eligible if t in matrix.columns]
     unresolved = sorted(set(eligible) - set(matrix.columns))
     first_date = (
-        str(matrix.index.min().date()) if not matrix.empty else ""
+        str(cast(pd.Timestamp, matrix.index.min()).date())
+        if not matrix.empty
+        else ""
     )
-    last_date = str(matrix.index.max().date()) if not matrix.empty else ""
+    last_date = str(cast(pd.Timestamp, matrix.index.max()).date()) if not matrix.empty else ""
 
     return RefreshReport(
         generation="",

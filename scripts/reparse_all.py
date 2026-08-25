@@ -107,11 +107,32 @@ def parse_year(year: int, db: Database, settings: Settings):
     consolidated_counts = (
         df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
     )
-    _verify_persisted_counts(
-        year,
-        {doc_id: emitted_counts[doc_id] for doc_id in replacement_doc_ids},
-        consolidated_counts,
-    )
+    # Documents whose parsed rows failed consolidation (e.g. uncoercible
+    # dates) must never partially replace prior House rows: exclude them
+    # from the replacement set, record an error run, and keep their
+    # existing rows intact.
+    drop_reasons = {
+        doc_id: (
+            f"consolidation kept {consolidated_counts.get(doc_id, 0)}/"
+            f"{emitted_counts[doc_id]} parsed row(s); invalid dates or missing member metadata"
+        )
+        for doc_id in replacement_doc_ids
+        if consolidated_counts.get(doc_id, 0) < emitted_counts[doc_id]
+    }
+    if drop_reasons:
+        print(
+            f"  {year}: consolidation shortfalls in {len(drop_reasons)} "
+            "document(s), preserving prior rows: "
+            + ", ".join(sorted(drop_reasons)[:10])
+        )
+        replacement_doc_ids = [
+            doc_id for doc_id in replacement_doc_ids if doc_id not in drop_reasons
+        ]
+        if not df.empty and replacement_doc_ids:
+            df = cast(
+                pd.DataFrame,
+                df[df["doc_id"].astype(str).isin(replacement_doc_ids)].copy(),
+            )
 
     # Carry forward previously-resolved ticker/amount before the delete+reinsert
     # so a weaker parse does not clobber good data already in the DB.
@@ -119,25 +140,33 @@ def parse_year(year: int, db: Database, settings: Settings):
     if not df.empty:
         df["ingestion_generation"] = ingestion_generation
         df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes.get)
-    parse_runs = [
-        {
-            "doc_id": pdf_path.stem,
-            "year": year,
-            "parser_version": "v3-reparse",
-            "status": "success"
-            if transactions
-            else ("error" if error else "zero_rows"),
-            "engines_attempted": ",".join(engines_attempted)
-            if engines_attempted and not error
-            else "production-cascade-failed",
-            "raw_row_count": len(transactions),
-            "transaction_count": 0,
-            "error_message": error,
-            "artifact_sha256": artifact_hashes[pdf_path.stem],
-            "ingestion_generation": ingestion_generation,
-        }
-        for pdf_path, transactions, engines_attempted, error in results
-    ]
+    parse_runs = []
+    for pdf_path, transactions, engines_attempted, error in results:
+        doc_id = pdf_path.stem
+        if doc_id in drop_reasons:
+            status = "error"
+        elif transactions:
+            status = "success"
+        elif error:
+            status = "error"
+        else:
+            status = "zero_rows"
+        parse_runs.append(
+            {
+                "doc_id": doc_id,
+                "year": year,
+                "parser_version": "v3-reparse",
+                "status": status,
+                "engines_attempted": ",".join(engines_attempted)
+                if engines_attempted and not error
+                else "production-cascade-failed",
+                "raw_row_count": len(transactions),
+                "transaction_count": 0,
+                "error_message": error or drop_reasons.get(doc_id),
+                "artifact_sha256": artifact_hashes[doc_id],
+                "ingestion_generation": ingestion_generation,
+            }
+        )
 
     # Empty deterministic results are ambiguous: record the attempt, but do not
     # replace prior House rows. Only nonzero successes (or a future explicit
@@ -211,6 +240,7 @@ def _persisted_house_generation_counts(
         return {}
     placeholders = ", ".join("?" for _ in doc_ids)
     rows = db.conn.execute(
+        # pi-lens-ignore: S608
         f"""
         SELECT doc_id, COUNT(*)
         FROM transactions

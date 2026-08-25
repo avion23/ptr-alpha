@@ -176,6 +176,7 @@ def _verify_persisted_prices(db: Database, start: date, end: date) -> int:
         """,
         [start, end],
     ).fetchone()
+    # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
     return int(row[0]) if row is not None else 0
 
 

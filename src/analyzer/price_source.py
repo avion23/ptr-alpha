@@ -300,6 +300,7 @@ def _validate_and_log_prices(
     if invalid_mask.any().any():
         logger.warning(
             "Quarantined %d invalid cached price observations",
+            # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
             int(invalid_mask.sum().sum()),
         )
         prices = prices.mask(invalid_mask)

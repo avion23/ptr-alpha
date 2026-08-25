@@ -80,8 +80,7 @@ class YFinancePriceSource:
 
         if not missing_tickers and not missing_dates:
             logger.info(f"Using fully cached prices for {len(all_tickers)} tickers")
-            available_tickers = [t for t in all_tickers if t in cached_prices.columns]
-            return cached_prices[available_tickers].dropna(axis=1, how="all")
+            return _select_columns(cached_prices, all_tickers)
 
         return self._fetch_and_merge_prices(
             all_tickers,
@@ -144,7 +143,9 @@ class YFinancePriceSource:
         invalid = int(invalid_mask.sum().sum())
         new_prices = new_prices.mask(invalid_mask)
         if invalid:
-            logger.warning("Rejected %d non-finite or non-positive fetched prices", int(invalid))
+            logger.warning(
+                "Rejected %d non-finite or non-positive fetched prices", int(invalid)
+            )
         new_prices = new_prices.dropna(axis=1, how="all")
         new_prices = self._rename_yf_columns(new_prices, raw_to_yf)
 

@@ -95,6 +95,18 @@ class TestDecisionContracts(unittest.TestCase):
                 provenance=Provenance(available_date=future),
             )
         with self.assertRaisesRegex(ValueError, "on or before"):
+            _forecast(
+                "event-notified-future",
+                "AAA",
+                provenance=Provenance(notification_date=future),
+            )
+        with self.assertRaisesRegex(ValueError, "on or before"):
+            recommendations_to_forecasts(
+                pd.DataFrame({"ticker": ["AAA"], "available_at": [future]}),
+                AS_OF,
+                30,
+            )
+        with self.assertRaisesRegex(ValueError, "on or before"):
             Evidence(
                 "event-future",
                 "AAA",
@@ -222,13 +234,49 @@ class TestDecisionContracts(unittest.TestCase):
 
         def unsafe_evaluator(recommendations, prices, as_of, horizon, **kwargs):
             return pd.DataFrame(
-                {"ticker": ["BBB"], "bt_return_pct": [4.0], "bt_coverage": ["complete"]}
+                {
+                    "ticker": ["BBB", "AAA"],
+                    "bt_return_pct": [4.0, 5.0],
+                    "bt_coverage": ["complete", "complete"],
+                }
             )
 
         with self.assertRaisesRegex(ValueError, "safely aligned"):
             BacktestEvidenceAdapter(evaluator=unsafe_evaluator).evaluate_report(
                 forecasts, pd.DataFrame(), AS_OF, 30
             )
+
+    def test_evidence_alignment_accepts_explicit_event_identity(self):
+        forecasts = (_forecast("event-a", "AAA", 2.0), _forecast("event-b", "BBB", 1.0))
+
+        def identity_evaluator(recommendations, prices, as_of, horizon, **kwargs):
+            result = recommendations.iloc[[1, 0]].copy()
+            result = result.drop(columns=["_decision_index"])
+            result["bt_return_pct"] = [4.0, 5.0]
+            result["bt_coverage"] = "complete"
+            return result
+
+        report = BacktestEvidenceAdapter(evaluator=identity_evaluator).evaluate_report(
+            forecasts, pd.DataFrame(), AS_OF, 30
+        )
+
+        self.assertEqual(
+            [item.realized_return_pct for item in report.evidence], [5.0, 4.0]
+        )
+
+    def test_evidence_counters_reject_invalid_values(self):
+        forecasts = (_forecast("event-a", "AAA", 2.0),)
+
+        for invalid in (-1, 1.5, "not-a-number", None):
+            def evaluator(recommendations, prices, as_of, horizon, **kwargs):
+                result = recommendations.iloc[[0]].copy()
+                result.attrs["n_no_price"] = invalid
+                return result
+
+            with self.subTest(invalid=invalid), self.assertRaises((TypeError, ValueError)):
+                BacktestEvidenceAdapter(evaluator=evaluator).evaluate_report(
+                    forecasts, pd.DataFrame(), AS_OF, 30
+                )
 
     def test_realized_decision_frame_is_rejected_by_evidence_adapter(self):
         decision_frame = pd.DataFrame(
@@ -453,6 +501,18 @@ class TestDecisionContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence horizon disagrees"):
             BacktestEvidenceAdapter(
                 evaluator=horizon_drifting_evaluator
+            ).evaluate_report(forecasts, pd.DataFrame(), AS_OF, 30)
+
+        def provenance_drifting_evaluator(
+            recommendations, prices, as_of, horizon, **kwargs
+        ):
+            result = recommendations.iloc[[0]].copy()
+            result["notification_date"] = [date(2025, 1, 3)]
+            return result
+
+        with self.assertRaisesRegex(ValueError, "notification_date"):
+            BacktestEvidenceAdapter(
+                evaluator=provenance_drifting_evaluator
             ).evaluate_report(forecasts, pd.DataFrame(), AS_OF, 30)
 
 

@@ -162,18 +162,21 @@ def _assert_provenance_available_by(
     provenance: "Provenance", as_of: datetime, owner: str
 ) -> None:
     """Reject decisions that use information unavailable at their as-of date."""
-    if provenance.available_date is None:
-        return
-    try:
-        available_after_as_of = provenance.available_date > as_of
-    except TypeError as exc:
-        raise ValueError(
-            f"{owner} provenance available_date and as_of must use comparable timezones"
-        ) from exc
-    if available_after_as_of:
-        raise ValueError(
-            f"{owner} provenance available_date must be on or before as_of"
-        )
+    for field_name in ("available_date", "notification_date"):
+        available_at = getattr(provenance, field_name)
+        if available_at is None:
+            continue
+        try:
+            available_after_as_of = available_at > as_of
+        except TypeError as exc:
+            raise ValueError(
+                f"{owner} provenance {field_name} and as_of must use comparable "
+                "timezones"
+            ) from exc
+        if available_after_as_of:
+            raise ValueError(
+                f"{owner} provenance {field_name} must be on or before as_of"
+            )
 
 
 @dataclass(frozen=True, slots=True)

@@ -211,12 +211,18 @@ def _assert_requested_forecast_context(
 
 
 def _provenance_from_row(row: Mapping[str, object]) -> Provenance:
+    available_date = _resolve_alias(
+        _date_like(row.get("available_date")),
+        _date_like(row.get("available_at")),
+        "available_date",
+        "available_at",
+    )
     return Provenance(
         source=_text(row.get("source")),
         source_record_id=_text(row.get("source_record_id")),
         source_row_id=_text(row.get("source_row_id")),
         ticker_origin=_text(row.get("ticker_origin")),
-        available_date=_date_like(row.get("available_date")),
+        available_date=available_date,
         notification_date=_date_like(row.get("notification_date")),
     )
 
@@ -625,14 +631,14 @@ def _decision_index(value: object) -> int:
 
 def _counter(value: object) -> int:
     number = _number(value)
-    if number is None or number < 0:
-        return 0
+    if number is None:
+        raise ValueError("evaluator counter must be a non-negative integer")
     try:
         converted = int(number)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    if number != converted:
-        return 0
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("evaluator counter must be a non-negative integer") from exc
+    if number != converted or converted < 0:
+        raise ValueError("evaluator counter must be a non-negative integer")
     return converted
 
 
@@ -679,6 +685,17 @@ def _evidence_from_row(
             forecast.as_of
         ):
             raise ValueError("evaluator evidence as_of disagrees with forecast as_of")
+
+    for column in ("available_date", "available_at", "notification_date"):
+        if column not in row:
+            continue
+        reported_context = _date_like(row.get(column))
+        if reported_context is not None and pd.Timestamp(reported_context) > pd.Timestamp(
+            forecast.as_of
+        ):
+            raise ValueError(
+                f"evaluator evidence {column} is after forecast as_of"
+            )
 
     reported_horizon = _positive_int(row.get("bt_horizon_days"), "bt_horizon_days")
     if reported_horizon is None:
@@ -816,20 +833,26 @@ class BacktestEvidenceAdapter:
         )
 
         has_decision_index = _DECISION_INDEX in evaluated.columns
-        if not has_decision_index and len(evaluated) not in (0, len(forecasts)):
+        has_decision_event_id = _DECISION_EVENT_ID in evaluated.columns
+        if not evaluated.empty and not has_decision_index and not has_decision_event_id:
             raise ValueError(
                 "evaluator output without decision indices cannot be safely aligned"
             )
 
         by_index = dict(enumerate(forecasts))
+        by_event_id = {forecast.event_id: index for index, forecast in by_index.items()}
         evidence_by_index: dict[int, Evidence] = {}
-        for output_position, (_, series) in enumerate(evaluated.iterrows()):
+        for _, series in evaluated.iterrows():
             row = series.to_dict()
-            index = (
-                _decision_index(row.get(_DECISION_INDEX))
-                if has_decision_index
-                else output_position
-            )
+            if has_decision_index:
+                index = _decision_index(row.get(_DECISION_INDEX))
+            else:
+                event_id = _text(row.get(_DECISION_EVENT_ID))
+                if event_id is None:
+                    raise ValueError("evaluator returned a missing decision event_id")
+                if event_id not in by_event_id:
+                    raise ValueError(f"evaluator returned unknown decision event_id {event_id}")
+                index = by_event_id[event_id]
             if index not in by_index:
                 raise ValueError(f"evaluator returned unknown decision index {index}")
             if index in evidence_by_index:

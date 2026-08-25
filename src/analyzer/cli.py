@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from datetime import date
@@ -32,6 +33,9 @@ from analyzer.settings import Settings
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 logger = logging.getLogger(__name__)
+# Bulk CLI parsing never shells out to Docling (multi-GB model workers per
+# zero-row PDF); scripts that want it opt in by unsetting this.
+os.environ.setdefault("PTR_SKIP_DOCLING", "1")
 _CURRENT_YEAR = date.today().year
 _HOUSE_PTR_FIRST_ARCHIVE_YEAR = 2015
 _HOUSE_LEGACY_FIRST_ARCHIVE_YEAR = 2008
@@ -1124,9 +1128,7 @@ def refresh(
             summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
                 archive_year,
                 refresh_metadata=(
-                    all_years
-                    or refresh_metadata
-                    or archive_year == date.today().year
+                    all_years or refresh_metadata or archive_year == date.today().year
                 ),
             )
             summaries.append(summary)
@@ -1153,9 +1155,7 @@ def refresh(
     for archive_year in archive_years:
         try:
             if force_full_reparse:
-                app_ctx.transaction_source.parse_cached_pdfs(
-                    archive_year, force=True
-                )
+                app_ctx.transaction_source.parse_cached_pdfs(archive_year, force=True)
             else:
                 parse_result = run_parse_pipeline(
                     app_ctx.transaction_source, archive_year
@@ -1187,8 +1187,7 @@ def refresh(
                     data_dir=app_ctx.settings.data.data_dir,
                 )
                 print(
-                    f"  Gemini OCR {archive_year}: "
-                    f"{ocr_inserted} transactions inserted"
+                    f"  Gemini OCR {archive_year}: {ocr_inserted} transactions inserted"
                 )
             except Exception as exc:
                 failed_steps.append(f"gemini_ocr:{archive_year}")
@@ -1371,9 +1370,7 @@ def fetch_senate_efd(
         raise typer.Exit(1)
 
     ingestion_generation = (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-        + "-"
-        + uuid4().hex[:12]
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid4().hex[:12]
     )
     src = SenateEFDSource(
         data_dir=data_dir,

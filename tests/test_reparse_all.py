@@ -177,9 +177,10 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     assert parse_runs["consolidation-shortfall"]["error_message"].startswith(
         "consolidation kept 0/1"
     )
-    assert all(run["error_message"] is None for run in (
-        parse_runs["success"], parse_runs["ambiguous-zero"]
-    ))
+    assert all(
+        run["error_message"] is None
+        for run in (parse_runs["success"], parse_runs["ambiguous-zero"])
+    )
     assert all(
         run["ingestion_generation"] == "acquired-generation-2026"
         for run in parse_runs.values()

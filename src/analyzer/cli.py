@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
 
 import json
-import sys
 import logging
+import sys
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from dataclasses import dataclass
+from typing import cast
+
 import pandas as pd
 import typer
 
-from analyzer.pipeline import (
-    run_parse_pipeline,
-    run_analysis_pipeline,
-    run_sales_pipeline,
-    run_ticker_analysis,
-    run_recent_ticker_scoring,
-    run_backtest_pipeline,
-    AnalysisParams,
-    TickerAnalysisParams,
-    TickerScoringParams,
-    BacktestParams,
-)
-from analyzer.price_snapshot import create_snapshot, save_snapshot
-from analyzer.exceptions import AnalyzerError
-from analyzer.settings import Settings
 from analyzer.database import Database
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
+from analyzer.exceptions import AnalyzerError
 from analyzer.models import AnalysisMode
+from analyzer.pipeline import (
+    AnalysisParams,
+    BacktestParams,
+    TickerAnalysisParams,
+    TickerScoringParams,
+    run_analysis_pipeline,
+    run_backtest_pipeline,
+    run_parse_pipeline,
+    run_recent_ticker_scoring,
+    run_sales_pipeline,
+    run_ticker_analysis,
+)
+from analyzer.price_snapshot import create_snapshot, save_snapshot
+from analyzer.settings import Settings
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 logger = logging.getLogger(__name__)
@@ -186,9 +188,10 @@ def _validate_output(output: str) -> None:
 def _check_data_freshness(app_ctx: AppContext) -> None:
     """Warn if transaction data looks stale."""
     try:
-        _max_date = app_ctx.transaction_source.db.conn.execute(
+        _row = app_ctx.transaction_source.db.conn.execute(
             "SELECT MAX(disclosure_date) FROM canonical_transactions"
-        ).fetchone()[0]
+        ).fetchone()
+        _max_date = _row[0] if _row is not None else None
         if _max_date:
             _age = (date.today() - _max_date).days
             if _age > 30:
@@ -412,7 +415,7 @@ def analyze(
         as_of_date = date.fromisoformat(as_of) if as_of else None
     except ValueError:
         print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     app_ctx = get_context(ctx, data_dir, read_only=False)
     _check_data_freshness(app_ctx)
 
@@ -573,7 +576,7 @@ def backtest(
         end_date = date.fromisoformat(end)
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     if end_date < start_date:
         print("Error: --end must be on or after --start", file=sys.stderr)
@@ -728,12 +731,13 @@ def portfolio(
         sector_by_ticker = _load_sector_map(sector_map)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
-    from analyzer.portfolio_sim import PortfolioSimulator, PortfolioConfig
     from datetime import timedelta
+
+    from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
 
     tx_start = start_date - timedelta(days=training_lookback_days + horizon + 30)
     all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(
@@ -839,7 +843,7 @@ def _parse_sim_dates(start: str, end: str) -> tuple[date, date]:
         end_date = date.fromisoformat(end)
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     if end_date < start_date:
         print("Error: --end must be on or after --start", file=sys.stderr)
@@ -868,6 +872,7 @@ def _load_portfolio_inputs(
     Errors with `typer.Exit(1)` if any input is missing.
     """
     from datetime import timedelta
+
     from analyzer import analysis
 
     price_end_sim = end_date + timedelta(days=horizon + 10)
@@ -894,10 +899,11 @@ def _load_portfolio_inputs(
     as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency_days}D")
     all_recs = []
     for as_of in as_of_dates:
+        # date_range never yields NaT; narrow the stubs' union explicitly.
         recs = analysis.backtest_recommendations(
             signals,
             all_transactions,
-            pd.Timestamp(as_of),
+            cast(pd.Timestamp, pd.Timestamp(as_of)),
             horizon=horizon,
             lookback_days=lookback_days,
             min_buyers=min_buyers,
@@ -1292,7 +1298,7 @@ def fetch_capitol(
         end_date = date.fromisoformat(end) if end else None
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     if start_date is not None and end_date is not None and end_date < start_date:
         print("Error: --end must be on or after --start", file=sys.stderr)
         raise typer.Exit(1)
@@ -1311,7 +1317,7 @@ def fetch_capitol(
             capitol.close()
     except CapitolTradesError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     print(f"Wrote {len(df)} reconciliation records to {output}")
     print("No canonical transactions were saved.")
@@ -1339,7 +1345,9 @@ def fetch_senate_efd(
     Loads into an isolated data directory so chamber separation is exact.
     Then run: ptr-alpha analyze --year <YYYY> --data-dir data/senate
     """
-    from datetime import timedelta
+    from datetime import datetime, timedelta, timezone
+    from uuid import uuid4
+
     from analyzer.senate_efd import SenateEFDSource
 
     try:
@@ -1356,13 +1364,22 @@ def fetch_senate_efd(
             )
     except ValueError:
         print("Error: dates must be YYYY-MM-DD and lookback > 0", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     if start_date > end_date:
         print("Error: --start must be on or before --end", file=sys.stderr)
         raise typer.Exit(1)
 
-    src = SenateEFDSource(data_dir=data_dir, read_only=False)
+    ingestion_generation = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        + "-"
+        + uuid4().hex[:12]
+    )
+    src = SenateEFDSource(
+        data_dir=data_dir,
+        read_only=False,
+        ingestion_generation=ingestion_generation,
+    )
     try:
         count = src.fetch_and_save_all(start_date, end_date)
         print(
@@ -1442,7 +1459,7 @@ def validate(
         ve = date.fromisoformat(test_end)
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     if te < ts:
         print("Error: --train-end must be on or after --train-start", file=sys.stderr)
@@ -1489,7 +1506,7 @@ def validate(
         )
     except Exception:
         logger.exception("Validation failed")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     raise typer.Exit(0)
 
 
@@ -1498,14 +1515,14 @@ def main():
         app()
     except AnalyzerError as e:
         print(f"Error: {e}", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     except KeyboardInterrupt:
         print("\nOperation cancelled by user", file=sys.stderr)
-        raise typer.Exit(130)
+        raise typer.Exit(130) from None
     except Exception as e:
         logger = logging.getLogger(__name__)
         logger.exception(f"Unexpected error: {e}")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
 
 if __name__ == "__main__":

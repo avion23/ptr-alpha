@@ -112,18 +112,6 @@ def _ordered_grid(
     return tuple(normalized)
 
 
-def canonical_grid(
-    grid: Mapping[str, Iterable[Any]],
-    *,
-    parameter_order: Sequence[str] | None = None,
-) -> tuple[tuple[str, tuple[Any, ...]], ...]:
-    """Return the detached ordered grid representation used for hashing."""
-    return _ordered_grid(grid, parameter_order=parameter_order)
-
-
-canonicalize_grid = canonical_grid
-
-
 @dataclass(frozen=True, slots=True)
 class GridTrial:
     """One deterministic configuration and its stable specification hash."""
@@ -276,48 +264,11 @@ def trial_spec_sha256(
     )
 
 
-def enumerate_trials(
-    grid: Mapping[str, Iterable[Any]],
-    *,
-    parameter_order: Sequence[str] | None = None,
-) -> tuple[GridTrial, ...]:
-    return build_family(grid, parameter_order=parameter_order).trials
-
-
-def enumerate_grid(
-    grid: Mapping[str, Iterable[Any]],
-    *,
-    parameter_order: Sequence[str] | None = None,
-) -> tuple[dict[str, Any], ...]:
-    """Return scalar rows compatible with validation sweep records."""
-    return tuple(
-        {"trial_id": trial.trial_id, **dict(trial.config)}
-        for trial in enumerate_trials(grid, parameter_order=parameter_order)
-    )
-
-
-def family_sha256(
-    grid: Mapping[str, Iterable[Any]] | GridFamily,
-    *,
-    parameter_order: Sequence[str] | None = None,
-) -> str:
-    if isinstance(grid, GridFamily):
-        if parameter_order is not None:
-            raise ValueError("parameter_order is not valid for a GridFamily")
-        return grid.family_sha256
-    return build_family(grid, parameter_order=parameter_order).family_sha256
-
-
 __all__ = [
     "FAMILY_PROVENANCE",
     "FAMILY_SCHEMA_VERSION",
     "GridFamily",
     "GridTrial",
     "build_family",
-    "canonical_grid",
-    "canonicalize_grid",
-    "enumerate_grid",
-    "enumerate_trials",
-    "family_sha256",
     "trial_spec_sha256",
 ]

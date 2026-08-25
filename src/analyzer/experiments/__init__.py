@@ -5,11 +5,6 @@ from .family import (
     GridFamily,
     GridTrial,
     build_family,
-    canonical_grid,
-    canonicalize_grid,
-    enumerate_grid,
-    enumerate_trials,
-    family_sha256,
     trial_spec_sha256,
 )
 
@@ -18,10 +13,5 @@ __all__ = [
     "GridFamily",
     "GridTrial",
     "build_family",
-    "canonical_grid",
-    "canonicalize_grid",
-    "enumerate_grid",
-    "enumerate_trials",
-    "family_sha256",
     "trial_spec_sha256",
 ]

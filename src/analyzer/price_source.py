@@ -12,7 +12,6 @@ import yfinance as yf
 
 from analyzer.database import Database
 from analyzer.exceptions import DataSourceError
-from analyzer.interfaces import PriceSource
 from analyzer.settings import Settings
 from analyzer.ticker_resolver import TickerResolver
 
@@ -24,7 +23,7 @@ _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 # ── YFinancePriceSource: yfinance-backed price fetcher with cache merge ──
 
 
-class YFinancePriceSource(PriceSource):
+class YFinancePriceSource:
     def __init__(
         self, settings: Settings, read_only: bool = False, db: Database | None = None
     ):

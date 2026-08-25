@@ -15,7 +15,7 @@ dependencies = [
     "requests",
     "requests-cache",
     "yfinance",
-    "camelot-py[cv]",
+    "camelot-py",
     "pdfplumber>=0.11",
     "pytesseract",
     "pdf2image",

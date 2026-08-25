@@ -28,6 +28,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from analyzer._price_index import _normalize_price_index
 from analyzer.backtest.prices import _find_dip_entry_arrays
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals import _price_arrays
@@ -73,7 +74,7 @@ def evaluate_backtest(
         result.attrs["n_unavailable"] = 0
         return result
 
-    prices_df = _normalize_price_frame(prices_df)
+    prices_df = _normalize_price_index(prices_df, invalid_error=ValueError)
     as_of_date = _normalize_date(as_of_date)
     entry_mult, exit_mult = _slippage_multipliers(entry_slippage_bps, exit_slippage_bps)
 
@@ -319,21 +320,6 @@ def _normalize_date(value) -> pd.Timestamp:
     if timestamp.tz is not None:
         timestamp = timestamp.tz_localize(None)
     return timestamp.normalize()
-
-
-def _normalize_price_frame(prices: pd.DataFrame) -> pd.DataFrame:
-    try:
-        index = pd.DatetimeIndex(pd.to_datetime(prices.index))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Price index must contain valid dates") from exc
-    if index.tz is not None:
-        index = index.tz_localize(None)
-    index = index.normalize()
-    if index.has_duplicates:
-        raise ValueError("Price index contains duplicate calendar dates")
-    normalized = prices.copy()
-    normalized.index = index
-    return normalized.sort_index()
 
 
 def _price_at_exact_ns(idx_ns, vals, target_ns):

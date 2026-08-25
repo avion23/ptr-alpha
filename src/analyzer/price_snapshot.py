@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from analyzer._price_index import _normalize_price_index
+
 
 def _get_git_sha() -> str:
     try:
@@ -91,18 +93,6 @@ def _compute_ticker_coverage(
         "days": days,
         "gaps": gaps,
     }
-
-
-def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:
-    index = pd.DatetimeIndex(pd.to_datetime(prices.index))
-    if index.tz is not None:
-        index = index.tz_localize(None)
-    index = index.normalize()
-    if index.has_duplicates:
-        raise ValueError("Price index contains duplicate calendar dates")
-    normalized = prices.copy()
-    normalized.index = index
-    return normalized.sort_index()
 
 
 def _hash_price_values(prices: pd.DataFrame) -> str:

@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
 from analyzer.models import AnalysisMode, TransactionType
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
@@ -209,13 +210,6 @@ def prepare_live_consensus_data(
     if trades.empty:
         raise DataSourceError("No valid tickers found through as-of date")
     return trades
-
-
-@pipeline_step
-def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
-    transaction_source.fetch_and_cache_pdfs(year)
-    logger.info("Successfully fetched PDFs for %d", year)
-    return DataResult(success=True, data=None)
 
 
 @pipeline_step
@@ -448,15 +442,11 @@ def _entry_prices_from_matrix(
     if transactions.empty or prices.empty:
         return pd.DataFrame()
 
-    index = pd.DatetimeIndex(pd.to_datetime(prices.index))
-    if index.tz is not None:
-        index = index.tz_localize(None)
-    index = index.normalize()
-    if index.has_duplicates:
-        raise DataSourceError("Price matrix contains duplicate calendar dates")
-    matrix = prices.copy()
-    matrix.index = index
-    matrix = matrix.sort_index()
+    matrix = _normalize_price_index(
+        prices,
+        duplicate_error=DataSourceError,
+        duplicate_message="Price matrix contains duplicate calendar dates",
+    )
 
     eligible = transactions[
         transactions["ticker"].notna()

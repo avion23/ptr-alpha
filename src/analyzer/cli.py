@@ -16,7 +16,7 @@ import typer
 
 from analyzer.database import Database
 from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
-from analyzer.exceptions import AnalyzerError
+from analyzer.exceptions import AnalyzerError, DataSourceError
 from analyzer.models import AnalysisMode
 from analyzer.pipeline import (
     AnalysisParams,
@@ -494,6 +494,29 @@ def fetch(
     raise typer.Exit(0)
 
 
+def _activate_house_generation(transaction_source, year: int) -> None:
+    """Verify all artifacts parsed and activate the latest generation.
+
+    Raises DataSourceError when no generation exists or artifacts remain
+    unresolved, leaving the generation incomplete and new rows hidden
+    from canonical reads.
+    """
+    generation_id = transaction_source.db.get_latest_house_generation(year)
+    if generation_id is None:
+        raise DataSourceError(
+            f"No acquired House generation exists for archive {year}"
+        )
+    unresolved = transaction_source.db.get_unresolved_house_doc_ids(
+        year, generation_id
+    )
+    if unresolved:
+        raise DataSourceError(
+            f"House archive {year} generation {generation_id} has "
+            f"{len(unresolved)} unresolved artifacts"
+        )
+    transaction_source.db.mark_house_generation_parse_complete(year, generation_id)
+
+
 @app.command()
 def parse(
     ctx: typer.Context,
@@ -516,6 +539,7 @@ def parse(
     try:
         if force_full_reparse:
             app_ctx.transaction_source.parse_cached_pdfs(year, force=True)
+            _activate_house_generation(app_ctx.transaction_source, year)
             parse_success = True
         else:
             result = run_parse_pipeline(app_ctx.transaction_source, year)
@@ -529,6 +553,12 @@ def parse(
         ocr_inserted = run_gemini_ocr_for_year(
             year, data_dir=app_ctx.settings.data.data_dir
         )
+    if use_gemini_ocr and ocr_inserted > 0 and not parse_success:
+        try:
+            _activate_house_generation(app_ctx.transaction_source, year)
+            parse_success = True
+        except Exception:
+            logger.exception("Post-OCR generation activation failed")
     if not parse_success and use_gemini_ocr and ocr_inserted > 0:
         logger.warning(
             "Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted

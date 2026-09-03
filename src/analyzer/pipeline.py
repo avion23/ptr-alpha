@@ -771,6 +771,35 @@ def run_backtest_pipeline(
                 )
             )
             continue
+        if len(valid_evaluated) != len(recs):
+            # Fail-closed: an incomplete funded basket cannot reallocate
+            # ex-post capital to measurable outcomes. Hold cash; report
+            # survivors nowhere for this date.
+            date_observations.append(
+                _date_observation(
+                    as_of_ts,
+                    benchmark_return,
+                    0.0,
+                    len(recs),
+                    len(valid_evaluated),
+                    status="cash",
+                    reason="incomplete_basket",
+                )
+            )
+            all_results.append(
+                pd.DataFrame(
+                    [
+                        _cash_observation(
+                            as_of_ts,
+                            benchmark_return,
+                            params.horizon,
+                            recommendation_count=len(recs),
+                            reason="incomplete_basket",
+                        )
+                    ]
+                )
+            )
+            continue
 
         strategy_return = float(
             pd.to_numeric(valid_evaluated["bt_return_pct"], errors="coerce").mean()

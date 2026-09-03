@@ -563,7 +563,8 @@ class TestTransactions(DatabaseTestCase):
         self.db.upsert_prices(
             pd.DataFrame(
                 {"OLD": [10.0], "NEW": [20.0]},
-                index=pd.to_datetime(["2024-01-03"]),
+                # Executable entry is next session after Jan3 disclosure.
+                index=pd.to_datetime(["2024-01-04"]),
             )
         )
         self.assertEqual(
@@ -958,16 +959,16 @@ class TestGetEntryPrices(DatabaseTestCase):
 
         result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 10))
         self.assertEqual(len(result), 1)
-        disclosure_jan5 = pd.Timestamp("2024-01-05")
-        idx_5 = list(dates).index(disclosure_jan5)
-        expected_price = aapl_prices[idx_5]
+        # Executable entry is the next NYSE session after disclosure:
+        # Fri 2024-01-05 -> Mon 2024-01-08.
+        expected_price = aapl_prices[list(dates).index(pd.Timestamp("2024-01-08"))]
         self.assertAlmostEqual(result.iloc[0]["entry_price"], expected_price)
         self.assertEqual(result.iloc[0]["owner_code"], "DC")
         self.assertAlmostEqual(result.iloc[0]["amount_midpoint"], 8000.5)
 
     def test_asof_join_returns_prior_price_when_no_exact_match(self):
-        dates = pd.bdate_range("2024-01-01", "2024-01-04")
-        aapl_prices = [150.0, 151.0, 152.0, 153.0]
+        dates = pd.bdate_range("2024-01-01", "2024-01-08")
+        aapl_prices = [150.0 + i for i in range(len(dates))]
         prices = pd.DataFrame({"AAPL": aapl_prices}, index=dates)
         self.db.upsert_prices(prices)
 
@@ -987,7 +988,11 @@ class TestGetEntryPrices(DatabaseTestCase):
 
         result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 10))
         self.assertEqual(len(result), 1)
-        self.assertAlmostEqual(result.iloc[0]["entry_price"], 153.0)
+        # Sun 2024-01-07 -> Mon 2024-01-08 executable entry.
+        self.assertAlmostEqual(
+            result.iloc[0]["entry_price"],
+            aapl_prices[list(dates).index(pd.Timestamp("2024-01-08"))],
+        )
 
     def test_get_entry_prices_empty_tickers(self):
         result = self.db.get_entry_prices([], date(2024, 1, 1), date(2024, 1, 10))
@@ -1089,8 +1094,10 @@ class TestGetEntryPrices(DatabaseTestCase):
 
     def test_rename_alias_entry_price_resolves_per_transaction_date(self):
         # FB renamed to META on 2022-06-09: the same raw ticker must price on
-        # the FB series before and the META series after that date.
-        dates = pd.to_datetime(["2022-05-10", "2022-06-10"])
+        # the FB series before and the META series after that date. Entries
+        # are the next NYSE session after disclosure (May10->May11,
+        # Jun10->Jun13).
+        dates = pd.to_datetime(["2022-05-11", "2022-06-13"])
         self.db.upsert_prices(
             pd.DataFrame(
                 {"FB": [100.0, 101.0], "META": [200.0, 201.0]},
@@ -1181,9 +1188,9 @@ class TestGetEntryPrices(DatabaseTestCase):
 
     def test_brkb_class_share_entry_price_canary(self):
         # BRKB resolves to the BRK-B class share; entry price must come from
-        # the BRK-B series.
-        dates = pd.to_datetime(["2024-01-03"])
-        self.db.upsert_prices(pd.DataFrame({"BRK-B": [350.0]}, index=dates))
+        # the BRK-B series at the next session (Jan3->Jan4).
+        dates = pd.to_datetime(["2024-01-03", "2024-01-04"])
+        self.db.upsert_prices(pd.DataFrame({"BRK-B": [350.0, 351.0]}, index=dates))
         tx = pd.DataFrame(
             [
                 {
@@ -1202,11 +1209,12 @@ class TestGetEntryPrices(DatabaseTestCase):
             ["BRKB"], date(2024, 1, 1), date(2024, 1, 5)
         )
         self.assertEqual(len(result), 1)
-        self.assertAlmostEqual(result.iloc[0]["entry_price"], 350.0)
+        self.assertAlmostEqual(result.iloc[0]["entry_price"], 351.0)
 
     def test_sq_rename_alias_entry_price_resolves_per_transaction_date(self):
-        # SQ renamed to XYZ on 2025-01-21.
-        dates = pd.to_datetime(["2025-01-20", "2025-01-22"])
+        # SQ renamed to XYZ on 2025-01-21. Entries are next sessions
+        # (Jan20->Jan21, Jan22->Jan23).
+        dates = pd.to_datetime(["2025-01-21", "2025-01-23"])
         self.db.upsert_prices(
             pd.DataFrame(
                 {"SQ": [50.0, 51.0], "XYZ": [70.0, 71.0]},

@@ -30,7 +30,8 @@ def _get_horizon_data(
 def _apply_quality_filter(signals_df: pd.DataFrame) -> pd.DataFrame:
     if "entry_price" not in signals_df.columns:
         return signals_df
-    return signals_df[signals_df["entry_price"] >= MIN_ENTRY_PRICE]
+    entry = signals_df["entry_price"]
+    return signals_df[entry.notna() & (entry >= MIN_ENTRY_PRICE)]
 
 
 def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:

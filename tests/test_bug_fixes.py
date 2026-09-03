@@ -148,7 +148,8 @@ class TestEntryPriceRawTickerFallback(DatabaseTestCase):
 
         result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 5))
         self.assertFalse(result.empty)
-        self.assertAlmostEqual(result.iloc[0]["entry_price"], 181.0)
+        # Executable entry is next NYSE session: Jan2->Jan3 = 182.0.
+        self.assertAlmostEqual(result.iloc[0]["entry_price"], 182.0)
 
 
 # ---------------------------------------------------------------------------

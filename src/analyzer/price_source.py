@@ -80,7 +80,7 @@ class YFinancePriceSource:
 
         if not missing_tickers and not missing_dates:
             logger.info(f"Using fully cached prices for {len(all_tickers)} tickers")
-            return _select_columns(cached_prices, all_tickers)
+            return _validate_and_log_prices(cached_prices, all_tickers)
 
         return self._fetch_and_merge_prices(
             all_tickers,
@@ -126,10 +126,7 @@ class YFinancePriceSource:
         if data.empty:
             if not cached_prices.empty:
                 logger.warning("yfinance failed, using cached data")
-                available_tickers = [
-                    t for t in all_tickers if t in cached_prices.columns
-                ]
-                return cached_prices[available_tickers].dropna(axis=1, how="all")
+                return _validate_and_log_prices(cached_prices, all_tickers)
             raise DataSourceError(
                 "No price data could be fetched from yfinance. Data source may be blocked or down."
             )

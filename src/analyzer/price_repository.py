@@ -344,37 +344,16 @@ class PriceRepository:
                   ON t.ticker = tm.raw
                  AND t.transaction_date IS NOT DISTINCT FROM tm.tx_date
             )
-            SELECT r.member, r.ticker, r.transaction_date, r.disclosure_date,
-                   r.transaction_type, r.owner_code, r.amount_midpoint,
-                   r.instrument_type, r.strike_price, r.expiry_date,
-                   CASE WHEN UPPER(r.ticker) IN (SELECT UNNEST(?))
-                        THEN p_res.close
-                        ELSE COALESCE(p_res.close, p_raw.close)
-                   END AS entry_price,
-                   CASE WHEN UPPER(r.ticker) IN (SELECT UNNEST(?))
-                        THEN p_res.date
-                        ELSE COALESCE(p_res.date, p_raw.date)
-                   END AS entry_price_date
+            SELECT r.member, r.ticker, r.resolved_ticker, r.transaction_date,
+                   r.disclosure_date, r.transaction_type, r.owner_code,
+                   r.amount_midpoint, r.instrument_type, r.strike_price,
+                   r.expiry_date
             FROM resolved_tickers r
-            ASOF LEFT JOIN prices p_res
-              ON r.resolved_ticker = p_res.ticker
-              AND p_res.date <= r.disclosure_date
-              AND p_res.close > 0
-              AND isfinite(p_res.close)
-            ASOF LEFT JOIN prices p_raw
-              ON r.ticker = p_raw.ticker
-              AND p_raw.date <= r.disclosure_date
-              AND p_raw.close > 0
-              AND isfinite(p_raw.close)
             WHERE r.ticker IN (SELECT UNNEST(?))
               AND r.disclosure_date BETWEEN ? AND ?
               AND NOT (UPPER(r.ticker) IN (SELECT UNNEST(?))
                        AND r.transaction_date IS NULL)
               AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)
-              AND CASE WHEN UPPER(r.ticker) IN (SELECT UNNEST(?))
-                       THEN p_res.close
-                       ELSE COALESCE(p_res.close, p_raw.close)
-                  END IS NOT NULL
             ORDER BY r.ticker, r.transaction_date, r.disclosure_date,
                      r.member, r.transaction_type, r.owner_code, r.id
         """,
@@ -382,24 +361,129 @@ class PriceRepository:
                 map_raw,
                 map_tx_date,
                 map_resolved,
-                alias_tickers,
-                alias_tickers,
                 expanded_tickers,
                 start_date,
                 end_date,
                 alias_tickers,
-                alias_tickers,
             ],
         ).fetchdf()
 
-        if not result.empty:
-            result["entry_price_date"] = pd.to_datetime(result["entry_price_date"])
-            if max_staleness_days is not None:
-                result["disclosure_date"] = pd.to_datetime(result["disclosure_date"])
-                staleness = (
-                    result["disclosure_date"] - result["entry_price_date"]
-                ).dt.days
-                result = result[staleness <= max_staleness_days]
-            result = result.drop(columns=["entry_price_date"])
+        if result.empty:
+            return result.drop(
+                columns=[c for c in ("resolved_ticker",) if c in result.columns]
+            )
 
-        return result
+        return self._resolve_next_session_entries(
+            result, expanded_tickers, alias_tickers, max_staleness_days
+        )
+
+    def _resolve_next_session_entries(
+        self,
+        result: pd.DataFrame,
+        expanded_tickers: list[str],
+        alias_tickers: list[str],
+        max_staleness_days: int | None,
+    ) -> pd.DataFrame:
+        """Replace candidate rows with executable next-session entry prices.
+
+        Outcomes enter on the next expected NYSE session after disclosure
+        (see signals core). The entry price is the exact close on that
+        session for the resolved ticker — never the last close on or before
+        disclosure. Rows without an exact next-session quote have no
+        executable entry and are dropped, matching _entry_prices_from_matrix.
+        """
+        if result.empty:
+            return result.drop(
+                columns=[
+                    c
+                    for c in ("resolved_ticker", "entry_price_date")
+                    if c in result.columns
+                ]
+            )
+
+        result = result.copy()
+        result["disclosure_date"] = pd.to_datetime(result["disclosure_date"])
+        result["entry_price_date"] = pd.to_datetime(
+            [next_nyse_session(d) for d in result["disclosure_date"]]
+        )
+
+        min_entry = result["entry_price_date"].min()
+        max_entry = result["entry_price_date"].max()
+        price_rows = self.conn.execute(
+            """
+            SELECT ticker, date, close
+            FROM prices
+            WHERE ticker IN (SELECT UNNEST(?))
+              AND date BETWEEN ? AND ?
+              AND close > 0
+              AND isfinite(close)
+        """,
+            [expanded_tickers, min_entry.date(), max_entry.date()],
+        ).fetchdf()
+
+        if price_rows.empty:
+            empty = result.iloc[0:0].copy()
+            empty["entry_price"] = pd.Series(dtype=float)
+            return empty.drop(
+                columns=[
+                    c
+                    for c in ("resolved_ticker", "entry_price_date")
+                    if c in empty.columns
+                ]
+            )
+
+        price_rows["date"] = pd.to_datetime(price_rows["date"]).dt.normalize()
+        lookup = {
+            (str(t), pd.Timestamp(d).normalize()): float(c)
+            for t, d, c in zip(
+                price_rows["ticker"], price_rows["date"], price_rows["close"]
+            )
+            if pd.notna(c)
+        }
+
+        alias_set = {str(t).strip().upper() for t in alias_tickers}
+        entry_dates = pd.to_datetime(result["entry_price_date"]).dt.normalize()
+        entry_prices: list[float | None] = []
+        for (_, row), entry_date in zip(result.iterrows(), entry_dates):
+            raw = row["ticker"]
+            resolved = row["resolved_ticker"]
+            if pd.isna(resolved):
+                resolved = raw
+            if str(raw).strip().upper() in alias_set:
+                candidates = [resolved]
+            elif str(resolved) == str(raw):
+                candidates = [resolved]
+            else:
+                candidates = [resolved, raw]
+            price: float | None = None
+            entry_key = pd.Timestamp(entry_date).normalize()
+            for cand in candidates:
+                hit = lookup.get((str(cand), entry_key))
+                if hit is not None:
+                    price = hit
+                    break
+            entry_prices.append(price)
+
+        result["entry_price"] = entry_prices
+        result = result[result["entry_price"].notna()]
+        if result.empty:
+            return result.drop(
+                columns=[
+                    c
+                    for c in ("resolved_ticker", "entry_price_date")
+                    if c in result.columns
+                ]
+            )
+
+        if max_staleness_days is not None:
+            staleness = (
+                result["disclosure_date"] - result["entry_price_date"]
+            ).dt.days
+            result = result[staleness <= max_staleness_days]
+        return result.drop(
+            columns=[
+                c
+                for c in ("resolved_ticker", "entry_price_date")
+                if c in result.columns
+            ]
+        )

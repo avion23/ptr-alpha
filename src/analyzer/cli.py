@@ -517,6 +517,92 @@ def _activate_house_generation(transaction_source, year: int) -> None:
     transaction_source.db.mark_house_generation_parse_complete(year, generation_id)
 
 
+def _release_parent_db_for_ocr(app_ctx: AppContext) -> Path | None:
+    """Checkpoint and close parent DuckDB handles so OCR can open the file.
+
+    Returns the database path when a real parent handle was released, else
+    None (test doubles hold no file lock). Both sources share one handle via
+    get_context; close each distinct real handle once.
+    """
+    owners = (
+        getattr(app_ctx, "transaction_source", None),
+        getattr(app_ctx, "price_source", None),
+    )
+    seen: list = []
+    for owner in owners:
+        db = getattr(owner, "db", None)
+        if isinstance(db, Database) and not any(db is prior for prior in seen):
+            seen.append(db)
+    if not seen:
+        return None
+    db_path = Path(seen[0].db_path)
+    for db in seen:
+        try:
+            db.conn.execute("CHECKPOINT")
+        except Exception:
+            logger.debug("Pre-OCR checkpoint failed", exc_info=True)
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Pre-OCR parent close failed", exc_info=True)
+    return db_path
+
+
+def _reacquire_parent_db_after_ocr(
+    app_ctx: AppContext, db_path: Path | None
+) -> None:
+    """Reopen the parent handle after isolated OCR finishes."""
+    if db_path is None:
+        return
+    fresh: Database | None = None
+    for owner in (
+        getattr(app_ctx, "transaction_source", None),
+        getattr(app_ctx, "price_source", None),
+    ):
+        if owner is None:
+            continue
+        if not isinstance(getattr(owner, "db", None), Database):
+            continue
+        if fresh is None:
+            fresh = Database(db_path, read_only=False)
+        owner.db = fresh
+
+
+def _run_gemini_ocr_year_subprocess(
+    data_dir: str | Path, year: int, *, timeout: int = 7200
+) -> tuple[int, str | None]:
+    """Run one year's OCR in a child interpreter without the parent lock.
+
+    Returns (inserted, failure_reason|None). The child prints
+    ``Total inserted: N`` on success, matching the standalone entrypoint
+    pattern; the parent holds no DuckDB handle while it runs.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    ocr_code = (
+        "import sys;"
+        f"sys.path.insert(0, {str(repo_root)!r});"
+        "from scripts.ocr_zero_rows import run_gemini_ocr_for_year;"
+        f"inserted = run_gemini_ocr_for_year({int(year)}, data_dir={str(data_dir)!r});"
+        "print(f'Total inserted: {inserted}')"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", ocr_code],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 0, "timeout"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout)[-500:]
+        return 0, f"exit {proc.returncode}: {detail}"
+    match = re.search(r"Total inserted:\s*(\d+)", proc.stdout)
+    if match is None:
+        return 0, f"missing Total inserted in output: {(proc.stdout or '')[-500:]}"
+    return int(match.group(1)), None
+
+
 @app.command()
 def parse(
     ctx: typer.Context,
@@ -548,11 +634,18 @@ def parse(
         logger.exception("Parse pipeline failed")
     ocr_inserted = 0
     if use_gemini_ocr:
-        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-
-        ocr_inserted = run_gemini_ocr_for_year(
-            year, data_dir=app_ctx.settings.data.data_dir
-        )
+        db_path = _release_parent_db_for_ocr(app_ctx)
+        try:
+            ocr_inserted, ocr_error = _run_gemini_ocr_year_subprocess(
+                app_ctx.settings.data.data_dir, year
+            )
+            if ocr_error is not None:
+                logger.warning("Gemini OCR failed for %d: %s", year, ocr_error)
+                ocr_inserted = 0
+            else:
+                print(f"  Gemini OCR {year}: {ocr_inserted} transactions inserted")
+        finally:
+            _reacquire_parent_db_after_ocr(app_ctx, db_path)
     if use_gemini_ocr and ocr_inserted > 0 and not parse_success:
         try:
             _activate_house_generation(app_ctx.transaction_source, year)
@@ -1210,40 +1303,27 @@ def refresh(
 
     if use_gemini_ocr:
         print("[4/4] Running Gemini OCR on zero-row PDFs...")
-        # The OCR helper opens its own duckdb handles; DuckDB rejects a same-
-        # file second connection with a different configuration inside this
-        # process, so isolate each pass in a child interpreter.
-        repo_root = Path(__file__).resolve().parents[2]
-        for archive_year in archive_years:
-            ocr_code = (
-                "import sys;"
-                f"sys.path.insert(0, {str(repo_root)!r});"
-                "from scripts.ocr_zero_rows import run_gemini_ocr_for_year;"
-                f"run_gemini_ocr_for_year({archive_year}, data_dir={app_ctx.settings.data.data_dir!r})"
-            )
-            try:
-                proc = subprocess.run(
-                    [sys.executable, "-c", ocr_code],
-                    text=True,
-                    capture_output=True,
-                    timeout=7200,
+        # The OCR helper opens its own DuckDB handles. A held parent handle
+        # causes a same-process ConnectionException (different config) or a
+        # child-process lock conflict, so release it and reuse the isolated-
+        # subprocess pattern of the standalone entrypoint for every year.
+        db_path = _release_parent_db_for_ocr(app_ctx)
+        try:
+            for archive_year in archive_years:
+                inserted, ocr_error = _run_gemini_ocr_year_subprocess(
+                    app_ctx.settings.data.data_dir, archive_year
                 )
-            except subprocess.TimeoutExpired:
-                failed_steps.append(f"gemini_ocr:{archive_year}")
-                logger.warning("Gemini OCR timed out for %d", archive_year)
-                continue
-            if proc.returncode != 0:
-                failed_steps.append(f"gemini_ocr:{archive_year}")
-                logger.warning(
-                    "Gemini OCR failed for %d (exit %d): %s",
-                    archive_year,
-                    proc.returncode,
-                    (proc.stderr or proc.stdout)[-500:],
+                if ocr_error is not None:
+                    failed_steps.append(f"gemini_ocr:{archive_year}")
+                    logger.warning(
+                        "Gemini OCR failed for %d: %s", archive_year, ocr_error
+                    )
+                    continue
+                print(
+                    f"  Gemini OCR {archive_year}: {inserted} transactions inserted"
                 )
-                continue
-            match = re.search(r"Total inserted:\s*(\d+)", proc.stdout)
-            inserted = match.group(1) if match else "unknown"
-            print(f"  Gemini OCR {archive_year}: {inserted} transactions inserted")
+        finally:
+            _reacquire_parent_db_after_ocr(app_ctx, db_path)
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 

@@ -268,7 +268,10 @@ class TestCliApp(unittest.TestCase):
                 "analyzer.cli.run_parse_pipeline",
                 return_value=StepResult(success=False),
             ),
-            patch("scripts.ocr_zero_rows.run_gemini_ocr_for_year", return_value=3),
+            patch(
+                "analyzer.cli._run_gemini_ocr_year_subprocess",
+                return_value=(3, None),
+            ),
         ):
             result = self.runner.invoke(app, ["parse", "--gemini-ocr"])
 

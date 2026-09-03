@@ -86,6 +86,18 @@ def test_validation_date_window_drops_bad_rows():
     assert rejections["date_out_of_window"] == 2
 
 
+def test_validation_accepts_spouse_dc_over_1m_column_k():
+    txs = [_tx(amount="K")]
+
+    valid, rejections = gemini_ocr_common.validate_transactions(
+        "doc-k", "Jane Doe", txs, datetime(2024, 1, 20), "Jane Doe"
+    )
+
+    assert [tx["amount_letter"] for tx in valid] == ["K"]
+    assert [tx["amount_midpoint"] for tx in valid] == [1000000]
+    assert rejections == {}
+
+
 def test_validation_preserves_repeated_lots_without_source_identity():
     txs = [_tx(), _tx(), _tx(asset="Microsoft Corp. (MSFT)")]
 
@@ -277,6 +289,15 @@ def test_cache_path_sanitizes_doc_id(tmp_path):
 def test_schema_rejects_malformed_outputs(bad_output):
     with pytest.raises(gemini_ocr_common.GeminiOutputError):
         gemini_ocr_common.parse_gemini_output(bad_output)
+
+
+def test_schema_accepts_spouse_dc_over_1m_column_k():
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Northern Fund | Purchase | 01/15/24 | 01/20/24 | K"
+    )
+    assert [tx["amount_letter"] for tx in parsed.transactions] == ["K"]
+    assert [tx["amount_midpoint"] for tx in parsed.transactions] == [1000000]
 
 
 def test_schema_skips_prompt_example_consistently():

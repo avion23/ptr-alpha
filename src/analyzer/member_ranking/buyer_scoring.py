@@ -17,7 +17,6 @@ from analyzer import signals as _signals
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
-from analyzer.member_ranking.factors import _owner_score_factor, _size_score_factor
 from analyzer.member_ranking.lookups import (
     _build_ranking_dicts,
     _get_ticker_purchases,
@@ -174,7 +173,7 @@ def score_ticker_by_buyers(
             return fallback
         inputs = fallback
     inputs["scoring_mode"] = scoring_mode
-    return _final_result(ticker, buyers, ticker_trades, inputs, alpha_dict)
+    return _final_result(ticker, buyers, inputs, alpha_dict)
 
 
 def _validate_ticker(ticker: str) -> str:
@@ -252,10 +251,21 @@ def _get_consensus_ticker_purchases(
 
 def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
     """Return valid purchase rows with resolver and member identities attached."""
-    if transactions_df.empty:
-        return transactions_df.copy()
+    required = {"transaction_type", "transaction_date", "disclosure_date"}
+    if transactions_df.empty or not required.issubset(transactions_df.columns):
+        return transactions_df.iloc[0:0].copy()
     purchases = transactions_df[
         transactions_df["transaction_type"] == TransactionType.PURCHASE.value
+    ].copy()
+    if purchases.empty:
+        return purchases
+
+    transaction_dates = pd.to_datetime(purchases["transaction_date"], errors="coerce")
+    disclosure_dates = pd.to_datetime(purchases["disclosure_date"], errors="coerce")
+    purchases = purchases.loc[
+        transaction_dates.notna()
+        & disclosure_dates.notna()
+        & (transaction_dates <= disclosure_dates)
     ].copy()
     if purchases.empty:
         return purchases
@@ -492,6 +502,16 @@ def _consensus_inputs(
         raise AnalysisError(
             "Consensus disclosures must be known on or before as_of_date"
         )
+    transaction_dates = pd.to_datetime(
+        ticker_trades["transaction_date"], errors="coerce"
+    )
+    row_disclosures = pd.to_datetime(
+        ticker_trades["disclosure_date"], errors="coerce"
+    )
+    disclosure_lag_days = (row_disclosures - transaction_dates).dt.days
+    if disclosure_lag_days.isna().any() or (disclosure_lag_days < 0).any():
+        raise AnalysisError("Consensus purchases require valid public chronology")
+
     score = float(len(buyers))
     return {
         "base_signal_score": score,
@@ -500,6 +520,10 @@ def _consensus_inputs(
         "total_trades": len(buyers),
         "rated_buyers": len(buyers),
         "quality_adjusted_avg": score,
+        "max_trade_to_disclosure_days": int(disclosure_lag_days.max()),
+        "median_trade_to_disclosure_days": float(disclosure_lag_days.median()),
+        "oldest_transaction_date": transaction_dates.min().date(),
+        "latest_disclosure_date": row_disclosures.max().date(),
     }
 
 
@@ -568,52 +592,49 @@ def _ticker_history_fallback(ticker, buyers, signals_df, ticker_perf_signals):
 def _final_result(
     ticker,
     buyers,
-    ticker_trades,
     inputs,
     alpha_dict,
 ) -> pd.DataFrame:
     base_signal_score = inputs["base_signal_score"]
     rated_buyers_list = inputs["rated_buyers_list"]
-    best_rank = inputs["best_rank"]
-    total_trades = inputs["total_trades"]
-    rated_buyers = inputs["rated_buyers"]
-    quality_adjusted_avg = inputs["quality_adjusted_avg"]
-
-    size_factor = _size_score_factor(ticker_trades)
-    owner_factor = _owner_score_factor(ticker_trades)
-
     signal_score_raw = base_signal_score
-    signal_score = round(signal_score_raw, 2)
-
+    scoring_mode = inputs.get("scoring_mode", "custom")
     top_buyers = _top_buyers_for_label(buyers, rated_buyers_list, alpha_dict)
-    buyer_label = _buyer_label(len(top_buyers), len(buyers))
 
-    return pd.DataFrame(
-        {
-            "ticker": [ticker],
-            "num_buyers": [len(buyers)],
-            "rated_buyers": [rated_buyers],
-            "buyer_label": [buyer_label],
-            "buyers": [", ".join(top_buyers)],
-            "avg_buyer_performance": [round(quality_adjusted_avg, 2)],
-            "best_buyer_performance": [round(best_rank, 2)],
-            "total_buyer_trades": [int(total_trades)],
-            "convergence_factor": [1.0],
-            "ticker_perf_factor": [round(1.0, 3)],
-            "base_signal_score": [round(base_signal_score, 2)],
-            "size_factor": [round(size_factor, 3)],
-            "owner_factor": [round(owner_factor, 3)],
-            "signal_score": [signal_score],
-            "signal_score_raw": [signal_score_raw],
-            "fallback_source": [inputs.get("scoring_mode", "member_ranked")],
-            "scoring_mode": [inputs.get("scoring_mode", "custom")],
-            "scorer_provenance": [
-                CONSENSUS_SCORER_PROVENANCE
-                if inputs.get("scoring_mode") == "consensus"
-                else "descriptive_member_skill_v1"
+    result = {
+        "ticker": [ticker],
+        "num_buyers": [len(buyers)],
+        "buyers": [", ".join(top_buyers)],
+        "base_signal_score": [round(base_signal_score, 2)],
+        "signal_score": [round(signal_score_raw, 2)],
+        "signal_score_raw": [signal_score_raw],
+        "fallback_source": [scoring_mode if scoring_mode != "custom" else "member_ranked"],
+        "scoring_mode": [scoring_mode],
+        "scorer_provenance": [
+            CONSENSUS_SCORER_PROVENANCE
+            if scoring_mode == "consensus"
+            else "descriptive_member_skill_v1"
+        ],
+    }
+    if scoring_mode == "consensus":
+        result.update(
+            max_trade_to_disclosure_days=[inputs["max_trade_to_disclosure_days"]],
+            median_trade_to_disclosure_days=[
+                inputs["median_trade_to_disclosure_days"]
             ],
-        }
+            oldest_transaction_date=[inputs["oldest_transaction_date"]],
+            latest_disclosure_date=[inputs["latest_disclosure_date"]],
+        )
+        return pd.DataFrame(result)
+
+    result.update(
+        rated_buyers=[inputs["rated_buyers"]],
+        buyer_label=[_buyer_label(len(top_buyers), len(buyers))],
+        avg_buyer_performance=[round(inputs["quality_adjusted_avg"], 2)],
+        best_buyer_performance=[round(inputs["best_rank"], 2)],
+        total_buyer_trades=[int(inputs["total_trades"])],
     )
+    return pd.DataFrame(result)
 
 
 def _top_buyers_for_label(buyers, rated_buyers_list, alpha_dict) -> list:

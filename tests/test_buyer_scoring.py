@@ -13,6 +13,7 @@ def _transactions(
     names=("Alice", "Bob", "Carol"),
     ticker="AAPL",
     disclosure_dates=None,
+    transaction_dates=None,
     transaction_types=None,
 ) -> pd.DataFrame:
     names = list(names)
@@ -24,11 +25,13 @@ def _transactions(
             "2024-05-14",
         ][: len(names)]
     )
+    transaction_dates = transaction_dates or disclosure_dates
     transaction_types = transaction_types or ["Purchase"] * len(names)
     return pd.DataFrame(
         {
             "member": names,
             "ticker": [ticker] * len(names),
+            "transaction_date": pd.to_datetime(transaction_dates),
             "disclosure_date": pd.to_datetime(disclosure_dates),
             "transaction_type": transaction_types,
         }
@@ -60,6 +63,43 @@ def test_consensus_score_is_invariant_to_member_identity_shuffle():
 
     assert original.iloc[0]["signal_score_raw"] == permuted.iloc[0]["signal_score_raw"]
     assert original.iloc[0]["num_buyers"] == permuted.iloc[0]["num_buyers"] == 3
+
+
+def test_consensus_reports_long_filing_lag_without_penalizing_score():
+    transactions = _transactions(
+        ("Alice", "Bob"),
+        disclosure_dates=["2024-05-10", "2024-05-12"],
+        transaction_dates=["2024-01-01", "2024-05-11"],
+    )
+    result = score_ticker_by_buyers(
+        "AAPL",
+        transactions,
+        as_of_date=pd.Timestamp("2024-05-20"),
+        min_buyers=1,
+    )
+
+    assert result.iloc[0]["signal_score_raw"] == 2.0
+    assert result.iloc[0]["max_trade_to_disclosure_days"] == 130
+    assert result.iloc[0]["median_trade_to_disclosure_days"] == 65.5
+    assert result.iloc[0]["oldest_transaction_date"] == pd.Timestamp("2024-01-01").date()
+
+
+def test_consensus_excludes_impossible_or_missing_trade_chronology():
+    transactions = _transactions(
+        ("Valid", "After Disclosure", "Missing"),
+        disclosure_dates=["2024-05-10", "2024-05-10", "2024-05-10"],
+        transaction_dates=["2024-05-01", "2024-05-11", None],
+    )
+    result = score_ticker_by_buyers(
+        "AAPL",
+        transactions,
+        as_of_date=pd.Timestamp("2024-05-20"),
+        min_buyers=1,
+    )
+
+    assert result.iloc[0]["num_buyers"] == 1
+    assert result.iloc[0]["buyers"] == "VALID"
+    assert result.iloc[0]["max_trade_to_disclosure_days"] == 9
 
 
 def test_consensus_has_no_hidden_age_decay_inside_candidate_window():
@@ -116,7 +156,7 @@ def test_consensus_excludes_sales_before_counting_buyers():
     )
 
     assert result.iloc[0]["num_buyers"] == 2
-    assert result.iloc[0]["total_buyer_trades"] == 2
+    assert "total_buyer_trades" not in result.columns
     assert "BOB" not in result.iloc[0]["buyers"]
 
 
@@ -129,7 +169,6 @@ def test_consensus_excludes_non_equity_provenance_rows_before_counting():
     )
 
     assert result.iloc[0]["num_buyers"] == 2
-    assert result.iloc[0]["total_buyer_trades"] == 2
 
 
 def test_consensus_excludes_option_instrument_rows_before_counting():
@@ -141,7 +180,6 @@ def test_consensus_excludes_option_instrument_rows_before_counting():
     )
 
     assert result.iloc[0]["num_buyers"] == 1
-    assert result.iloc[0]["total_buyer_trades"] == 1
 
 
 def test_consensus_excludes_future_disclosures_before_counting_buyers():
@@ -156,7 +194,6 @@ def test_consensus_excludes_future_disclosures_before_counting_buyers():
     )
 
     assert result.iloc[0]["num_buyers"] == 2
-    assert result.iloc[0]["total_buyer_trades"] == 2
 
 
 @pytest.mark.parametrize(

@@ -16,15 +16,9 @@ import hashlib
 import json
 import logging
 import math
-import platform
-import os
-import shutil
-import subprocess
-import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
-from importlib import metadata
 from pathlib import Path
 
 import numpy as np
@@ -1188,9 +1182,8 @@ def select_config(
 def _run_identity_invariant_control(
     sweep_df: pd.DataFrame,
     observed_trial_id: int,
-    ledger_path: Path,
 ) -> MemberIdentityControlResult:
-    """Record that consensus has no member-identity hypothesis to test."""
+    """Describe the identity-invariant consensus contract for one trial."""
     family_complete, family_details = _family_integrity(sweep_df)
     if not family_complete:
         raise ValueError(
@@ -1233,7 +1226,6 @@ def _run_identity_invariant_control(
         observed_trial_id=observed_trial_id,
         observed_statistic=float(row["nw_tstat"]),
     )
-    _record_member_control(ledger_path, result)
     return result
 
 
@@ -1249,394 +1241,6 @@ def _phase_end(boundary_end: date, max_holding_days: int) -> date:
         if exit_date <= boundary:
             return candidate.date()
         candidate -= pd.Timedelta(days=1)
-
-
-class EvaluationAlreadyConsumedError(RuntimeError):
-    """Raised when a frozen evaluation overlaps a consumed interval."""
-
-
-class EvaluationLedgerIntegrityError(RuntimeError):
-    """Raised when the local append-only ledger hash chain is invalid."""
-
-
-_TERMINAL_EVALUATION_STATUSES = frozenset(
-    {"completed_retrospective", "failed_consumed"}
-)
-
-
-def _canonical_ledger_path(db_path: Path) -> Path:
-    return db_path.resolve().parent / ".ptr-alpha-evaluation-ledger-v2.json"
-
-
-def _atomic_write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _empty_ledger() -> dict:
-    return {
-        "schema_version": 2,
-        "integrity": "append_only_sha256_hash_chain",
-        "local_tamper_limitation": (
-            "A local attacker who can rewrite the ledger can recompute the chain; "
-            "external anchoring is not implemented."
-        ),
-        "events": [],
-    }
-
-
-def _validate_ledger(ledger: dict) -> None:
-    if ledger.get("schema_version") != 2 or not isinstance(ledger.get("events"), list):
-        raise EvaluationLedgerIntegrityError("unsupported or malformed ledger")
-    previous = "0" * 64
-    reservations: dict[str, dict] = {}
-    terminal_keys: set[str] = set()
-    for sequence, event in enumerate(ledger["events"]):
-        if not isinstance(event, dict):
-            raise EvaluationLedgerIntegrityError("ledger event is not an object")
-        payload = {key: value for key, value in event.items() if key != "event_sha256"}
-        if (
-            payload.get("sequence") != sequence
-            or payload.get("previous_sha256") != previous
-        ):
-            raise EvaluationLedgerIntegrityError(
-                "ledger sequence or previous hash is invalid"
-            )
-        expected = _sha256_json(payload)
-        if event.get("event_sha256") != expected:
-            raise EvaluationLedgerIntegrityError("ledger event hash is invalid")
-        event_type = event.get("event_type")
-        if event_type == "reservation":
-            evaluation_key = event.get("evaluation_key")
-            family_values = {
-                value
-                for value in (
-                    event.get("family_sha256"),
-                    event.get("family_hash"),
-                )
-                if value is not None
-            }
-            if not isinstance(evaluation_key, str) or not evaluation_key:
-                raise EvaluationLedgerIntegrityError(
-                    "reservation identity is invalid"
-                )
-            if evaluation_key in reservations:
-                raise EvaluationLedgerIntegrityError(
-                    "evaluation has more than one reservation"
-                )
-            if any(
-                not isinstance(value, str)
-                or len(value) != 64
-                or any(character not in "0123456789abcdef" for character in value)
-                for value in family_values
-            ) or len(family_values) > 1:
-                raise EvaluationLedgerIntegrityError("reservation family hash is invalid")
-            # A reservation without a family hash is an older v2 ledger event.
-            # It remains readable, but all newly-created reservations are
-            # family-bound below.
-            reservations[evaluation_key] = event
-        elif event_type == "completion":
-            evaluation_key = event.get("evaluation_key")
-            status = event.get("status")
-            if evaluation_key not in reservations:
-                raise EvaluationLedgerIntegrityError(
-                    "completion has no reservation"
-                )
-            reservation = reservations[evaluation_key]
-            legacy_reservation = not (
-                reservation.get("family_sha256") or reservation.get("family_hash")
-            )
-            if status not in _TERMINAL_EVALUATION_STATUSES and not (
-                legacy_reservation and isinstance(status, str) and status
-            ):
-                raise EvaluationLedgerIntegrityError(
-                    "completion status is not terminal"
-                )
-            if evaluation_key in terminal_keys:
-                raise EvaluationLedgerIntegrityError(
-                    "evaluation has more than one terminal ledger event"
-                )
-            reservation_family = reservation.get("family_sha256") or reservation.get(
-                "family_hash"
-            )
-            completion_family = event.get("family_sha256") or event.get("family_hash")
-            if reservation_family is None:
-                if completion_family is not None:
-                    raise EvaluationLedgerIntegrityError(
-                        "legacy completion unexpectedly declares a family hash"
-                    )
-            elif completion_family != reservation_family:
-                raise EvaluationLedgerIntegrityError(
-                    "completion family hash does not match reservation"
-                )
-            terminal_keys.add(evaluation_key)
-        previous = expected
-
-
-def _append_ledger_event(ledger: dict, event: dict) -> None:
-    previous = ledger["events"][-1]["event_sha256"] if ledger["events"] else "0" * 64
-    payload = {
-        **event,
-        "sequence": len(ledger["events"]),
-        "previous_sha256": previous,
-    }
-    ledger["events"].append({**payload, "event_sha256": _sha256_json(payload)})
-
-
-def _refuse_legacy_ledger(ledger_path: Path) -> None:
-    legacy_path = ledger_path.parent / "validation_evaluation_ledger.json"
-    if not legacy_path.exists():
-        return
-    try:
-        legacy = json.loads(legacy_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise EvaluationLedgerIntegrityError(
-            "legacy validation_evaluation_ledger.json exists but is unreadable; "
-            "archive or migrate it explicitly before validation"
-        ) from exc
-    if legacy.get("evaluations"):
-        raise EvaluationLedgerIntegrityError(
-            "legacy validation_evaluation_ledger.json contains consumed evaluations; "
-            "archive or migrate it explicitly before validation"
-        )
-    raise EvaluationLedgerIntegrityError(
-        "legacy validation_evaluation_ledger.json exists; archive or migrate it "
-        "explicitly before validation"
-    )
-
-
-def _record_member_control(
-    ledger_path: Path, result: MemberIdentityControlResult
-) -> None:
-    """Append a non-gating identity diagnostic audit event."""
-    import fcntl
-
-    if result.gating:
-        raise TypeError("identity diagnostics must declare gating=False")
-    _refuse_legacy_ledger(ledger_path)
-    lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        ledger = (
-            json.loads(ledger_path.read_text())
-            if ledger_path.exists()
-            else _empty_ledger()
-        )
-        _validate_ledger(ledger)
-        _append_ledger_event(
-            ledger,
-            {
-                "event_type": "member_identity_control",
-                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
-                "control": asdict(result),
-            },
-        )
-        _atomic_write_json(ledger_path, ledger)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-
-def _reserve_evaluation(
-    ledger_path: Path,
-    manifest: dict,
-    config: dict,
-    grid: dict,
-    test_start: date,
-    test_end: date,
-) -> str:
-    """Atomically append a reservation before a frozen evaluation."""
-    import fcntl
-
-    # Check the pre-family legacy path first.  This preserves the old
-    # archive/migration refusal even when a caller has no modern grid.
-    _refuse_legacy_ledger(ledger_path)
-    family = build_family(_effective_validation_grid(grid)) if grid else None
-    recorded_family = manifest.get("family")
-    recorded_hashes = manifest.get("hashes", {})
-    recorded_hashes = recorded_hashes if isinstance(recorded_hashes, dict) else {}
-    declared_family_hashes = {
-        value
-        for value in (
-            recorded_family.get("family_sha256")
-            if isinstance(recorded_family, dict)
-            else None,
-            recorded_family.get("family_hash")
-            if isinstance(recorded_family, dict)
-            else None,
-            recorded_hashes.get("family_sha256"),
-        )
-        if value is not None
-    }
-    if family is not None and declared_family_hashes and declared_family_hashes != {
-        family.family_sha256
-    }:
-        raise EvaluationLedgerIntegrityError(
-            "manifest family hash does not match the declared evaluation grid"
-        )
-    if isinstance(recorded_family, dict):
-        declared_size = recorded_family.get("family_size")
-        if (
-            family is not None
-            and declared_size is not None
-            and int(declared_size) != family.family_size
-        ):
-            raise EvaluationLedgerIntegrityError(
-                "manifest family size does not match the declared evaluation grid"
-            )
-    normalized_grid = (
-        _canonical_config({name: list(values) for name, values in family.grid})
-        if family is not None
-        else _json_safe(grid)
-    )
-    normalized_config = _canonical_config(config)
-    if (
-        family is not None
-        and "lookback_days" in family.parameter_order
-        and "lookback_days" not in normalized_config
-    ):
-        normalized_config["lookback_days"] = CONSENSUS_LOOKBACK_DAYS
-    if family is not None and not any(
-        _config_identity(trial.config) == _config_identity(normalized_config)
-        for trial in family.trials
-    ):
-        raise EvaluationLedgerIntegrityError(
-            "reserved configuration is not a member of the declared family"
-        )
-    lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        ledger = (
-            json.loads(ledger_path.read_text())
-            if ledger_path.exists()
-            else _empty_ledger()
-        )
-        _validate_ledger(ledger)
-        for event in ledger["events"]:
-            if event.get("event_type") != "reservation":
-                continue
-            prior_start, prior_end = map(date.fromisoformat, event["window"])
-            if test_start <= prior_end and prior_start <= test_end:
-                raise EvaluationAlreadyConsumedError(
-                    "frozen evaluation interval overlaps a consumed reservation; "
-                    "repeats and alternate configs/grids/snapshots are refused"
-                )
-        hashes = manifest["hashes"]
-        window = [str(test_start), str(test_end)]
-        key_payload = {
-            "database_sha256": hashes["database_sha256"],
-            "value_snapshot_sha256": hashes["value_snapshot_sha256"],
-            "config": normalized_config,
-            "grid": normalized_grid,
-            "window": window,
-        }
-        if family is not None:
-            key_payload["family_sha256"] = family.family_sha256
-        evaluation_key = _sha256_json(key_payload)
-        if any(
-            event.get("evaluation_key") == evaluation_key
-            for event in ledger["events"]
-            if event.get("event_type") == "reservation"
-        ):
-            raise EvaluationAlreadyConsumedError(
-                "evaluation key is already reserved and consumed"
-            )
-        reservation = {
-            "event_type": "reservation",
-            "evaluation_key": evaluation_key,
-            "database_sha256": hashes["database_sha256"],
-            "value_snapshot_sha256": hashes["value_snapshot_sha256"],
-            "config_sha256": _sha256_json(normalized_config),
-            "grid_sha256": _sha256_json(normalized_grid),
-            "window": window,
-            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
-            "status": "reserved_consumed",
-        }
-        if family is not None:
-            reservation.update(
-                family_sha256=family.family_sha256,
-                family_hash=family.family_sha256,
-                family_size=family.family_size,
-                family_provenance=family.provenance,
-            )
-        _append_ledger_event(ledger, reservation)
-        _atomic_write_json(ledger_path, ledger)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-        return evaluation_key
-
-
-def _complete_evaluation(
-    ledger_path: Path,
-    evaluation_key: str,
-    status: str,
-    family_sha256: str | None = None,
-) -> None:
-    import fcntl
-
-    lock_path = ledger_path.with_suffix(f"{ledger_path.suffix}.lock")
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            ledger = json.loads(ledger_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            raise EvaluationLedgerIntegrityError(
-                "evaluation ledger is missing or unreadable"
-            ) from exc
-        _validate_ledger(ledger)
-        reservations = {
-            event["evaluation_key"]: event
-            for event in ledger["events"]
-            if event.get("event_type") == "reservation"
-        }
-        if evaluation_key not in reservations:
-            raise EvaluationLedgerIntegrityError("completion has no reservation")
-        reservation = reservations[evaluation_key]
-        reservation_family = reservation.get("family_sha256") or reservation.get(
-            "family_hash"
-        )
-        if status not in _TERMINAL_EVALUATION_STATUSES and not (
-            reservation_family is None and status == "completed"
-        ):
-            raise ValueError(f"unsupported terminal evaluation status: {status}")
-        if family_sha256 is not None and family_sha256 != reservation_family:
-            raise EvaluationLedgerIntegrityError(
-                "completion family hash does not match reservation"
-            )
-        if any(
-            event.get("event_type") == "completion"
-            and event.get("evaluation_key") == evaluation_key
-            for event in ledger["events"]
-        ):
-            raise EvaluationLedgerIntegrityError(
-                "evaluation already has a terminal ledger event"
-            )
-        completion = {
-            "event_type": "completion",
-            "evaluation_key": evaluation_key,
-            "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
-            "status": status,
-        }
-        if reservation_family is not None:
-            completion["family_sha256"] = reservation_family
-        _append_ledger_event(ledger, completion)
-        _atomic_write_json(ledger_path, ledger)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def run_validation(
@@ -1694,7 +1298,6 @@ def run_validation(
             max_holding=max_holding,
             n_permutations=n_permutations,
             permutation_seed=permutation_seed,
-            evaluation_ledger_path=_canonical_ledger_path(db_path),
             alpha=alpha,
             out_path=out_path,
         )
@@ -1716,7 +1319,6 @@ def _run_validation_with_db(
     max_holding: int,
     n_permutations: int,
     permutation_seed: int,
-    evaluation_ledger_path: Path,
     alpha: float,
     out_path: Path | None,
 ) -> dict:
@@ -1780,11 +1382,9 @@ def _run_validation_with_db(
         identity_diagnostic = _run_identity_invariant_control(
             train_df,
             int(statistical_candidate["trial_id"]),
-            evaluation_ledger_path,
         )
         selection["member_identity_control"] = asdict(identity_diagnostic)
     manifest = _build_manifest(
-        db_path,
         train_tx,
         train_prices,
         train_entry_prices,
@@ -1876,107 +1476,80 @@ def _run_validation_with_db(
                     json.dumps(output, indent=2, sort_keys=True, default=str)
                 )
             return output
-        evaluation_key = _reserve_evaluation(
-            evaluation_ledger_path, manifest, config, grid, test_start, test_end
+        tx_end = pd.Timestamp(test_effective_end)
+        test_tx_start = pd.Timestamp(test_start) - pd.Timedelta(
+            days=int(config.get("lookback_days", CONSENSUS_LOOKBACK_DAYS))
         )
-        try:
-            # The reservation is deliberately written before any query that can
-            # load test-window transactions or values.  A failed read remains a
-            # consumed reservation and is recorded as a terminal failure below.
-            tx_end = pd.Timestamp(test_effective_end)
-            test_tx_start = pd.Timestamp(test_start) - pd.Timedelta(
-                days=int(config.get("lookback_days", CONSENSUS_LOOKBACK_DAYS))
-            )
-            price_start = next_nyse_session(pd.Timestamp(test_start))
-            price_end = pd.Timestamp(test_end)
-            all_tx = db.get_transactions_by_date_range(test_tx_start, tx_end)
-            tickers = (
-                sorted(set(_get_consensus_price_tickers(all_tx)) | {"SPY"})
-                if mode == "consensus"
-                else sorted(set(all_tx["ticker"].dropna().astype(str)) | {"SPY"})
-                if "ticker" in all_tx.columns
-                else ["SPY"]
-            )
-            prices = db.get_prices(tickers, price_start, price_end)
-            test_result, test_series = _run_frozen(
-                all_tx, prices, signals, config, test_start, test_effective_end
-            )
-            lag = max(
-                0,
-                math.ceil(int(config["horizon"]) / int(config["frequency_days"])) - 1,
-            )
-            block_length = max(
-                1, math.ceil(int(config["horizon"]) / int(config["frequency_days"]))
-            )
-            test_t, test_p, test_bootstrap_error = _bootstrap_statistic_and_p(
-                test_series,
-                lag,
-                block_length,
-                n_permutations,
-                permutation_seed + 3 * n_permutations,
-            )
-            test_completed_without_failures = bool(
-                test_result.status == "completed"
-                and test_result.failure_count == 0
-                and not test_result.failure_records
-            )
-            test_passes = bool(
-                test_completed_without_failures
-                and test_bootstrap_error is None
-                and test_result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
-                and test_result.total_recs >= MIN_RECS_FOR_CANDIDACY
-                and test_result.overall_alpha > 0
-                and test_result.overall_return > 0
-                and test_p <= alpha
-            )
-            output.update(
-                status=(
-                    "retrospective_positive_result"
-                    if test_passes
-                    else "retrospective_failed_result"
-                ),
-                selected_config=_json_safe(config),
-                train=_window_metrics(
-                    train_result,
-                    float(selected["nw_tstat"]),
-                    float(selected["bootstrap_p_value"]),
-                    "corrected_train_survivor",
-                ),
-                test=_window_metrics(
-                    test_result,
-                    test_t,
-                    test_p,
-                    "retrospective_previously_used_not_fresh_oos",
-                ),
-                degradation_ratio=(
-                    round(test_result.overall_alpha / train_result.overall_alpha, 4)
-                    if train_result.overall_alpha
-                    else None
-                ),
-                verdict="not_fresh_oos_evidence",
-                evaluation_ledger={
-                    "path": str(evaluation_ledger_path),
-                    "evaluation_key": evaluation_key,
-                    "status": "consumed_retrospective",
-                },
-            )
-            if test_bootstrap_error is not None:
-                output["test"]["bootstrap_error"] = test_bootstrap_error
-        except Exception:
-            _complete_evaluation(
-                evaluation_ledger_path, evaluation_key, "failed_consumed"
-            )
-            raise
-        _complete_evaluation(
-            evaluation_ledger_path,
-            evaluation_key,
-            (
-                "completed_retrospective"
-                if test_completed_without_failures
-                else "failed_consumed"
+        price_start = next_nyse_session(pd.Timestamp(test_start))
+        price_end = pd.Timestamp(test_end)
+        all_tx = db.get_transactions_by_date_range(test_tx_start, tx_end)
+        tickers = (
+            sorted(set(_get_consensus_price_tickers(all_tx)) | {"SPY"})
+            if mode == "consensus"
+            else sorted(set(all_tx["ticker"].dropna().astype(str)) | {"SPY"})
+            if "ticker" in all_tx.columns
+            else ["SPY"]
+        )
+        prices = db.get_prices(tickers, price_start, price_end)
+        test_result, test_series = _run_frozen(
+            all_tx, prices, signals, config, test_start, test_effective_end
+        )
+        lag = max(
+            0,
+            math.ceil(int(config["horizon"]) / int(config["frequency_days"])) - 1,
+        )
+        block_length = max(
+            1, math.ceil(int(config["horizon"]) / int(config["frequency_days"]))
+        )
+        test_t, test_p, test_bootstrap_error = _bootstrap_statistic_and_p(
+            test_series,
+            lag,
+            block_length,
+            n_permutations,
+            permutation_seed + 3 * n_permutations,
+        )
+        test_completed_without_failures = bool(
+            test_result.status == "completed"
+            and test_result.failure_count == 0
+            and not test_result.failure_records
+        )
+        test_passes = bool(
+            test_completed_without_failures
+            and test_bootstrap_error is None
+            and test_result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
+            and test_result.total_recs >= MIN_RECS_FOR_CANDIDACY
+            and test_result.overall_alpha > 0
+            and test_result.overall_return > 0
+            and test_p <= alpha
+        )
+        output.update(
+            status=(
+                "retrospective_positive_result"
+                if test_passes
+                else "retrospective_failed_result"
             ),
-            manifest["family"]["family_sha256"],
+            selected_config=_json_safe(config),
+            train=_window_metrics(
+                train_result,
+                float(selected["nw_tstat"]),
+                float(selected["bootstrap_p_value"]),
+                "corrected_train_survivor",
+            ),
+            test=_window_metrics(
+                test_result,
+                test_t,
+                test_p,
+                "retrospective_previously_used_not_fresh_oos",
+            ),
+            degradation_ratio=(
+                round(test_result.overall_alpha / train_result.overall_alpha, 4)
+                if train_result.overall_alpha
+                else None
+            ),
+            verdict="not_fresh_oos_evidence",
         )
+        if test_bootstrap_error is not None:
+            output["test"]["bootstrap_error"] = test_bootstrap_error
 
     _print_summary(output)
     if out_path is not None:
@@ -2108,7 +1681,6 @@ def _finite_or_none(value):
 
 
 def _build_manifest(
-    db_path: Path,
     all_tx: pd.DataFrame,
     prices: pd.DataFrame,
     entry_prices: pd.DataFrame,
@@ -2127,23 +1699,6 @@ def _build_manifest(
     effective_grid = _effective_validation_grid(grid)
     family = build_family(effective_grid)
     family_metadata = family.metadata()
-    config_payload = {
-        "grid": effective_grid,
-        "family_sha256": family.family_sha256,
-        "family_size": family.family_size,
-        "family_provenance": family.provenance,
-        "alpha": alpha,
-        "n_permutations": n_permutations,
-        "permutation_seed": permutation_seed,
-        "primary_metric": PRIMARY_METRIC,
-        "max_holding_days": max_holding,
-    }
-    dependencies = {
-        name: _dependency_version(name)
-        for name in ["numpy", "pandas", "scipy", "duckdb"]
-    }
-    dependencies["python"] = platform.python_version()
-    git_state = _git_state()
     return {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "phases": {
@@ -2163,7 +1718,6 @@ def _build_manifest(
                 "end": None,
                 "status": "locked_not_queried_or_evaluated",
                 "value_rows_queried": False,
-                "whole_database_file_hashed_for_provenance": True,
                 "consumed": False,
             },
         },
@@ -2183,9 +1737,6 @@ def _build_manifest(
                 "consensus_is_identity_invariant_no_member_identity_hypothesis"
             ),
             "identity_dependent_modes": "descriptive_non_deployable",
-            "member_control_integrity": (
-                "audit_only_canonical_hash_chain_event_not_authorization"
-            ),
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "minimum_family_resolution_bootstrap": max(
                 MIN_RELEASE_PERMUTATIONS,
@@ -2198,30 +1749,6 @@ def _build_manifest(
                 "Bonferroni is the arbitrary-dependence controlling gate",
             ],
         },
-        "hashes": {
-            "database_sha256": _sha256_file(db_path),
-            "value_snapshot_sha256": _value_snapshot_hash(all_tx, prices, entry_prices),
-            "code_sha256": _code_hash(),
-            "config_sha256": _sha256_json(config_payload),
-            "family_sha256": family.family_sha256,
-            "git_revision": git_state["revision"],
-            "git_diff_sha256": git_state["diff_sha256"],
-            "dependency_sha256": _sha256_json(dependencies),
-        },
-        "git": git_state,
-        "evaluation_ledger": {
-            "path": str(_canonical_ledger_path(db_path)),
-            "integrity": "append_only_sha256_hash_chain",
-            "overlap_policy": "any_overlapping_reserved_interval_is_consumed",
-            "legacy_v1_policy": (
-                "validation_evaluation_ledger.json must be explicitly archived or migrated"
-            ),
-            "local_tamper_limitation": (
-                "A local attacker who can rewrite the ledger can recompute the chain; "
-                "external anchoring is not implemented."
-            ),
-        },
-        "dependencies": dependencies,
         "coverage_input": {
             "transactions": len(all_tx),
             "price_rows": len(prices),
@@ -2233,18 +1760,6 @@ def _build_manifest(
     }
 
 
-def _dependency_version(name: str) -> str:
-    try:
-        return metadata.version(name)
-    except metadata.PackageNotFoundError:
-        return "not-installed"
-
-
-def _sha256_file(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
 def _value_snapshot_hash(*frames: pd.DataFrame) -> str:
     digest = hashlib.sha256()
     for frame in frames:
@@ -2253,75 +1768,6 @@ def _value_snapshot_hash(*frames: pd.DataFrame) -> str:
             pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes()
         )
     return digest.hexdigest()
-
-
-def _code_hash() -> str:
-    root = Path(__file__).resolve().parents[2]
-    paths = sorted((root / "src" / "analyzer").rglob("*.py"))
-    digest = hashlib.sha256()
-    for path in paths:
-        digest.update(str(path.relative_to(root)).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def _hash_untracked_path(digest: "hashlib._Hash", root: Path, path: Path) -> None:
-    paths = [path]
-    if path.is_dir() and not path.is_symlink():
-        paths = sorted(
-            candidate
-            for candidate in path.rglob("*")
-            if candidate.is_symlink() or not candidate.is_dir()
-        )
-    for candidate in paths:
-        relative = str(candidate.relative_to(root))
-        digest.update(relative.encode(errors="surrogateescape"))
-        if candidate.is_symlink():
-            digest.update(os.readlink(candidate).encode(errors="surrogateescape"))
-        elif candidate.is_file():
-            digest.update(candidate.read_bytes())
-
-
-def _git_state() -> dict:
-    """Return revision, dirty state, and a content hash of tracked/untracked diff."""
-    root = Path(__file__).resolve().parents[2]
-    git = shutil.which("git")
-    if git is None:
-        return {"revision": "unavailable", "dirty": None, "diff_sha256": "unavailable"}
-    try:
-        revision = subprocess.run(  # nosec B603
-            [git, "rev-parse", "HEAD"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        status = subprocess.run(  # nosec B603
-            [git, "status", "--porcelain", "-z"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-        ).stdout
-        diff = subprocess.run(  # nosec B603
-            [git, "diff", "--binary", "HEAD"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-        ).stdout
-        digest = hashlib.sha256(diff)
-        entries = [entry for entry in status.split(b"\0") if entry]
-        for entry in sorted(entries):
-            if entry.startswith(b"?? "):
-                relative = entry[3:].decode(errors="surrogateescape")
-                path = root / relative
-                _hash_untracked_path(digest, root, path)
-        return {
-            "revision": revision,
-            "dirty": bool(entries),
-            "diff_sha256": digest.hexdigest(),
-        }
-    except (OSError, subprocess.CalledProcessError):
-        return {"revision": "unavailable", "dirty": None, "diff_sha256": "unavailable"}
 
 
 def _sha256_json(value) -> str:

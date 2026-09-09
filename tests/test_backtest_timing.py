@@ -68,6 +68,30 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-07").date())
         self.assertEqual(row["bt_raw_return_pct"], round((240 / 230 - 1) * 100, 2))
 
+    def test_declared_horizon_ignores_legacy_optimal_horizon_column(self):
+        as_of = pd.Timestamp("2025-01-03")
+        dates = pd.bdate_range("2025-01-03", "2025-02-10")
+        prices = pd.DataFrame(
+            {
+                "AAPL": np.arange(len(dates), dtype=float) + 100.0,
+                "SPY": np.arange(len(dates), dtype=float) + 400.0,
+            },
+            index=dates,
+        )
+
+        row = evaluate_backtest(
+            pd.DataFrame({"ticker": ["AAPL"], "optimal_horizon": [30]}),
+            prices,
+            as_of,
+            horizon=1,
+            entry_slippage_bps=0,
+            exit_slippage_bps=0,
+        ).iloc[0]
+
+        self.assertEqual(row["bt_horizon_days"], 1)
+        self.assertEqual(row["bt_entry_date"], pd.Timestamp("2025-01-06").date())
+        self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-07").date())
+
     def test_dip_entry_keeps_future_fill_timing(self):
         dates = pd.date_range("2025-01-02", "2025-01-10", freq="B")
         prices = pd.DataFrame(

@@ -268,7 +268,6 @@ class PriceRepository:
         tickers: list[str],
         start_date: date,
         end_date: date,
-        max_staleness_days: int = 30,
         resolver: TickerResolver | None = None,
     ) -> pd.DataFrame:
         if not tickers:
@@ -374,7 +373,7 @@ class PriceRepository:
             )
 
         return self._resolve_next_session_entries(
-            result, expanded_tickers, alias_tickers, max_staleness_days
+            result, expanded_tickers, alias_tickers
         )
 
     def _resolve_next_session_entries(
@@ -382,7 +381,6 @@ class PriceRepository:
         result: pd.DataFrame,
         expanded_tickers: list[str],
         alias_tickers: list[str],
-        max_staleness_days: int | None,
     ) -> pd.DataFrame:
         """Replace candidate rows with executable next-session entry prices.
 
@@ -475,11 +473,6 @@ class PriceRepository:
                 ]
             )
 
-        if max_staleness_days is not None:
-            staleness = (
-                result["disclosure_date"] - result["entry_price_date"]
-            ).dt.days
-            result = result[staleness <= max_staleness_days]
         return result.drop(
             columns=[
                 c

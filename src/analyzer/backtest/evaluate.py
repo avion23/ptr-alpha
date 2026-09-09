@@ -1,8 +1,9 @@
-"""Evaluate backtest recommendations: simulate entry/exit prices and SPY alpha.
+"""Evaluate backtest recommendations at an explicit fixed holding horizon.
 
-For each row in `recommendations`, simulates the buy at the (dip-aware)
-entry price and sell at the optimal-horizon exit price, then computes the
-return, SPY alpha, and options leverage.
+For each row in ``recommendations``, enter on the next expected NYSE session,
+exit on the expected NYSE session on or before ``entry + horizon``, and compare
+the security with SPY on those same endpoints. Missing exact quotes remain
+unavailable rather than being replaced with stale prices.
 
 Heavy preprocessing (SPY benchmark, per-ticker price caches, slippage
 multipliers) is hoisted out of the per-row loop.
@@ -34,8 +35,6 @@ from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals import _price_arrays
 
 NS_PER_DAY = 86_400_000_000_000
-_ENTRY_STALENESS_DAYS = 7
-
 _EMPTY_BT_COLS = [
     "bt_entry_price",
     "bt_entry_date",
@@ -60,7 +59,6 @@ def evaluate_backtest(
     prices_df: pd.DataFrame,
     as_of_date: pd.Timestamp,
     horizon: int,
-    max_staleness_days: int | None = 30,
     entry_slippage_bps: float = 10.0,
     exit_slippage_bps: float = 10.0,
     use_dip_entry: bool = False,  # Bug 1a: was True; False = honest baseline
@@ -78,21 +76,13 @@ def evaluate_backtest(
     as_of_date = _normalize_date(as_of_date)
     entry_mult, exit_mult = _slippage_multipliers(entry_slippage_bps, exit_slippage_bps)
 
-    horizons = (
-        recommendations["optimal_horizon"].values
-        if "optimal_horizon" in recommendations.columns
-        else None
-    )
-
     spy_arrs = _price_arrays(prices_df, "SPY")
     spy_ns, spy_vals = (
         spy_arrs if spy_arrs and spy_arrs[0] is not None else (None, None)
     )
 
     tickers = recommendations["ticker"].tolist()
-    ticker_horizons = (
-        [int(h) for h in horizons] if horizons is not None else [horizon] * len(tickers)
-    )
+    ticker_horizons = [horizon] * len(tickers)
 
     price_cache = {t: _price_arrays(prices_df, t) for t in tickers}
 
@@ -128,7 +118,6 @@ def evaluate_backtest(
             use_dip_entry,
             pullback_pct,
             max_wait_days,
-            max_staleness_days,
             inst_type_arr[i] if inst_type_arr is not None else "stock",
             amount_arr[i] if amount_arr is not None else None,
         )
@@ -212,7 +201,6 @@ def _evaluate_one_recommendation(
     use_dip_entry,
     pullback_pct,
     max_wait_days,
-    max_staleness_days,
     inst_type_val,
     amount_val,
 ) -> dict | None:
@@ -231,7 +219,6 @@ def _evaluate_one_recommendation(
         as_of_date,
         pullback_pct,
         max_wait_days,
-        max_staleness_days,
     )
     if not entry or entry_date_ns is None:
         if use_dip_entry:
@@ -399,7 +386,6 @@ def _resolve_entry(
     as_of_date,
     pullback_pct,
     max_wait_days,
-    max_staleness_days,
 ):
     """Return a fill strictly after the decision date."""
     as_of_ns = pd.Timestamp(as_of_date).value
@@ -416,13 +402,8 @@ def _resolve_entry(
         entry_date_ns = as_of_ns + entry_delay * NS_PER_DAY
         return entry, entry_delay, entry_date_ns
 
-    max_delay = _ENTRY_STALENESS_DAYS
-    if max_staleness_days is not None:
-        max_delay = min(max_delay, max_staleness_days)
     entry_date_ns = next_nyse_session(pd.Timestamp(as_of_ns)).value
     delay = int((entry_date_ns - as_of_ns) // NS_PER_DAY)
-    if delay > max_delay:
-        return None, 0, None
     pos = int(np.searchsorted(idx_ns, entry_date_ns, side="left"))
     if pos >= len(idx_ns) or int(idx_ns[pos]) != entry_date_ns:
         return None, 0, None

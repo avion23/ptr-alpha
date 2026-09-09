@@ -29,6 +29,8 @@ from analyzer.signals import TICKER_PERF_MIN_TRADES
 from analyzer.ticker_resolver import TickerResolver
 
 CONSENSUS_SCORER_PROVENANCE = "identity_free_distinct_buyer_count_v2"
+CONSENSUS_LOOKBACK_DAYS = 28
+CONSENSUS_MIN_BUYERS = 3
 
 _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,2})?$")
 _TICKER_RESOLVER = TickerResolver()
@@ -250,6 +252,8 @@ def _get_consensus_ticker_purchases(
 
 def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
     """Return valid purchase rows with resolver and member identities attached."""
+    if transactions_df.empty:
+        return transactions_df.copy()
     purchases = transactions_df[
         transactions_df["transaction_type"] == TransactionType.PURCHASE.value
     ].copy()

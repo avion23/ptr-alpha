@@ -32,6 +32,7 @@ from analyzer.validation import (
     _canonical_ledger_path,
     _complete_evaluation,
     _hash_untracked_path,
+    _effective_validation_grid,
     _phase_end,
     _record_member_control,
     _reserve_evaluation,
@@ -374,7 +375,7 @@ class TestExecutionSupport:
                 result["bt_spy_return_pct"] = 1.0
                 result["bt_alpha_pct"] = 0.0
             else:
-                assert "optimal_horizon" not in result.columns
+                assert result["optimal_horizon"].iloc[0] == 120
                 assert horizon == 60
                 result["bt_return_pct"] = 2.0
                 result["bt_spy_return_pct"] = 1.0
@@ -552,15 +553,18 @@ class TestFailureFamilies:
             lambda *args, **kwargs: reserve_calls.append(args) or "unexpected",
         )
 
+        transaction_queries = []
+
         class EmptyDb:
             def get_transactions_by_date_range(self, *args):
+                transaction_queries.append(args)
                 return pd.DataFrame({"ticker": pd.Series(dtype=str)})
 
             def get_prices(self, *args):
                 return pd.DataFrame()
 
             def get_entry_prices(self, *args):
-                return pd.DataFrame()
+                raise AssertionError("consensus validation must not read entry prices")
 
         database = tmp_path / "db.duckdb"
         database.write_bytes(b"db")
@@ -584,6 +588,9 @@ class TestFailureFamilies:
         assert output["selected_config"] is None
         assert output["correction"]["failure_reason"] == "family_trial_failure"
         assert reserve_calls == []
+        assert transaction_queries == [
+            (pd.Timestamp("2021-12-04"), pd.Timestamp("2022-12-01"))
+        ]
 
 
 class TestCanonicalFamilyMetadata:
@@ -608,9 +615,8 @@ class TestCanonicalFamilyMetadata:
 
 
 class TestPurgeAndManifest:
-    def test_purge_uses_max_executable_holding(self):
-        assert _phase_end(date(2023, 12, 31), 120, 0) == date(2023, 9, 2)
-        assert _phase_end(date(2023, 12, 31), 120, 10) == date(2023, 8, 23)
+    def test_purge_uses_exact_next_session_execution_window(self):
+        assert _phase_end(date(2023, 12, 31), 120) == date(2023, 8, 31)
 
     def test_locked_final_phase_is_rejected_before_database_open(self, tmp_path):
         with pytest.raises(ValueError, match="locked final phase"):
@@ -840,5 +846,35 @@ class TestMemberPermutationCanary:
 
 def test_cli_validation_grid_counts_are_exact():
     assert math.prod(len(values) for values in _validation_grid(False).values()) == 18
-    assert math.prod(len(values) for values in _validation_grid(True).values()) == 648
+    assert math.prod(len(values) for values in _validation_grid(True).values()) == 36
     assert _validation_grid(False)["scoring_mode"] == ["consensus"]
+    assert _validation_grid(False)["lookback_days"] == [28]
+    assert "training_lookback_days" not in _validation_grid(True)
+    assert "decay_lambda" not in _validation_grid(True)
+    assert "bayes_prior_strength" not in _validation_grid(True)
+
+
+def test_consensus_family_discards_nonoperative_dimensions():
+    effective = _effective_validation_grid(
+        {
+            "horizon": [60],
+            "frequency_days": [30],
+            "lookback_days": [28],
+            "training_lookback_days": [180, 365],
+            "min_buyers": [3],
+            "top_n": [5],
+            "threshold": [1.0, 5.0],
+            "decay_lambda": [0.001, 0.02],
+            "bayes_prior_strength": [5, 50],
+            "scoring_mode": ["consensus"],
+        }
+    )
+
+    assert effective == {
+        "horizon": [60],
+        "frequency_days": [30],
+        "lookback_days": [28],
+        "min_buyers": [3],
+        "top_n": [5],
+        "scoring_mode": ["consensus"],
+    }

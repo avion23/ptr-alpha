@@ -39,7 +39,12 @@ from analyzer.experiments.family import (
 )
 from analyzer.exceptions import AnalysisError
 from analyzer.pipeline import BacktestParams
-from analyzer.member_ranking.buyer_scoring import CONSENSUS_SCORER_PROVENANCE
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_LOOKBACK_DAYS,
+    CONSENSUS_SCORER_PROVENANCE,
+    _get_consensus_price_tickers,
+)
 from analyzer.snooping import bonferroni_correction, max_stat_moving_block_bootstrap
 
 logger = logging.getLogger(__name__)
@@ -48,8 +53,32 @@ MIN_DATES_FOR_CANDIDACY = 8
 MIN_RECS_FOR_CANDIDACY = 20
 MIN_RELEASE_PERMUTATIONS = 999
 LOCKED_FINAL_START = date(2026, 1, 1)
-VALIDATION_ENTRY_DELAY_DAYS = 0  # evaluate_backtest(use_dip_entry=False)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
+_CONSENSUS_IRRELEVANT_GRID_PARAMETERS = frozenset(
+    {"training_lookback_days", "threshold", "decay_lambda", "bayes_prior_strength"}
+)
+
+
+def _effective_validation_grid(grid: Mapping[str, object]) -> dict[str, object]:
+    """Remove declared dimensions that cannot affect a consensus trial."""
+    if not grid:
+        return dict(grid)
+    scoring_modes = grid.get("scoring_mode", ("consensus",))
+    if isinstance(scoring_modes, str):
+        modes = {scoring_modes}
+    else:
+        modes = {str(value) for value in scoring_modes}
+    if modes != {"consensus"}:
+        return dict(grid)
+    effective = {
+        str(name): values
+        for name, values in grid.items()
+        if name not in _CONSENSUS_IRRELEVANT_GRID_PARAMETERS
+    }
+    # The candidate window is part of the executed strategy identity even for
+    # older/internal callers that omitted it from their declared grid.
+    effective.setdefault("lookback_days", (CONSENSUS_LOOKBACK_DAYS,))
+    return effective
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +106,7 @@ class MemberIdentityControlResult:
 class SweepResult:
     horizon: int
     frequency_days: int
+    lookback_days: int
     training_lookback_days: int
     min_buyers: int
     top_n: int
@@ -116,6 +146,7 @@ def _empty_result(
     return SweepResult(
         horizon=params.horizon,
         frequency_days=params.frequency_days,
+        lookback_days=params.lookback_days,
         training_lookback_days=params.training_lookback_days,
         min_buyers=params.min_buyers,
         top_n=params.top_n,
@@ -174,9 +205,8 @@ def _backtest_core(
 
     The support is the scheduled rebalance calendar for which the identical SPY
     benchmark is executable. A date with no executable strategy trade earns a
-    zero cash return; it is not silently dropped. Validation removes the
-    data-dependent ``optimal_horizon`` column so the declared horizon is the
-    actual maximum holding used for both strategy and benchmark.
+    zero cash return; it is not silently dropped. The declared horizon is the
+    actual holding used for both strategy and benchmark.
     """
     empty = _empty_result(params, bayes_prior_strength, decay_lambda, scoring_mode)
     as_of_dates = pd.date_range(
@@ -243,12 +273,9 @@ def _backtest_core(
         strategy_return = 0.0
         traded = False
         if not recommendations.empty:
-            frozen_recommendations = recommendations.drop(
-                columns=["optimal_horizon"], errors="ignore"
-            )
             try:
                 evaluated = analysis.evaluate_backtest(
-                    frozen_recommendations, prices, as_of_ts, params.horizon
+                    recommendations, prices, as_of_ts, params.horizon
                 )
                 if not isinstance(evaluated, pd.DataFrame):
                     raise TypeError("evaluation must return a DataFrame")
@@ -342,6 +369,7 @@ def _backtest_core(
     result = SweepResult(
         horizon=params.horizon,
         frequency_days=params.frequency_days,
+        lookback_days=params.lookback_days,
         training_lookback_days=params.training_lookback_days,
         min_buyers=params.min_buyers,
         top_n=params.top_n,
@@ -451,17 +479,24 @@ def sweep_configs(
     """Evaluate every configuration on one already-purged phase."""
     if end < start:
         raise ValueError("purged sweep phase has no executable dates")
-    family = build_family(grid)
+    family = build_family(_effective_validation_grid(grid))
     canonical_values = dict(family.grid)
-    horizons = {int(value) for value in canonical_values.get("horizon", (60,))}
-    decays = {float(value) for value in canonical_values.get("decay_lambda", (0.005,))}
+    scoring_modes = {
+        str(value) for value in canonical_values.get("scoring_mode", ("consensus",))
+    }
+    needs_historical_signals = any(mode != "consensus" for mode in scoring_modes)
     signal_cache = dict(signals_by_horizon or {})
-    for horizon in horizons:
-        for decay in decays:
-            if (horizon, decay) not in signal_cache:
-                signal_cache[(horizon, decay)] = analysis.calculate_signal_potential(
-                    entry_prices, prices, [horizon], decay_lambda=decay
-                )
+    if needs_historical_signals:
+        horizons = {int(value) for value in canonical_values.get("horizon", (60,))}
+        decays = {
+            float(value) for value in canonical_values.get("decay_lambda", (0.005,))
+        }
+        for horizon in horizons:
+            for decay in decays:
+                if (horizon, decay) not in signal_cache:
+                    signal_cache[(horizon, decay)] = analysis.calculate_signal_potential(
+                        entry_prices, prices, [horizon], decay_lambda=decay
+                    )
 
     rows: list[dict] = []
     series_by_trial: dict[int, pd.Series] = {}
@@ -471,39 +506,39 @@ def sweep_configs(
         horizon = int(values["horizon"])
         frequency = int(values.get("frequency_days", 30))
         lag = max(0, math.ceil(horizon / frequency) - 1)
+        mode = str(values.get("scoring_mode", "consensus"))
         params = BacktestParams(
             start_date=start,
             end_date=end,
             horizon=horizon,
-            lookback_days=60,
+            lookback_days=int(values.get("lookback_days", CONSENSUS_LOOKBACK_DAYS)),
             training_lookback_days=int(values.get("training_lookback_days", 365)),
             min_buyers=int(values["min_buyers"]),
             top_n=int(values["top_n"]),
             threshold=float(values.get("threshold", 5.0)),
             frequency_days=frequency,
         )
-        decay = float(values["decay_lambda"])
+        decay = float(values.get("decay_lambda", 0.005))
+        bayes = float(values.get("bayes_prior_strength", 20.0))
+        trial_signals = (
+            pd.DataFrame() if mode == "consensus" else signal_cache[(horizon, decay)]
+        )
         try:
             result, per_date = _backtest_core(
                 all_tx,
                 prices,
                 params,
-                signal_cache[(horizon, decay)],
-                bayes_prior_strength=float(values["bayes_prior_strength"]),
+                trial_signals,
+                bayes_prior_strength=bayes,
                 decay_lambda=decay,
-                scoring_mode=str(values.get("scoring_mode", "consensus")),
+                scoring_mode=mode,
             )
         except Exception as exc:  # fail closed: preserve a failed trial row
             failure = _operation_failure(
                 "trial", pd.Timestamp(start), "trial_exception", exc
             )
             result = replace(
-                _empty_result(
-                    params,
-                    float(values["bayes_prior_strength"]),
-                    decay,
-                    str(values.get("scoring_mode", "consensus")),
-                ),
+                _empty_result(params, bayes, decay, mode),
                 status="failed",
                 failure_reason="trial_exception",
                 failure_count=1,
@@ -779,6 +814,7 @@ def _family_metadata_for_sweep(sweep_df: pd.DataFrame) -> dict:
         for column in (
             "horizon",
             "frequency_days",
+            "lookback_days",
             "training_lookback_days",
             "min_buyers",
             "top_n",
@@ -1201,13 +1237,18 @@ def _run_identity_invariant_control(
     return result
 
 
-def _phase_end(
-    boundary_end: date, max_holding_days: int, max_entry_delay_days: int
-) -> date:
-    return (
-        pd.Timestamp(boundary_end)
-        - pd.Timedelta(days=max_holding_days + max_entry_delay_days)
-    ).date()
+def _phase_end(boundary_end: date, max_holding_days: int) -> date:
+    """Return the latest as-of whose exact execution window matures by boundary."""
+    boundary = pd.Timestamp(boundary_end).normalize()
+    candidate = boundary - pd.Timedelta(days=max_holding_days)
+    while True:
+        entry = next_nyse_session(candidate)
+        exit_date = previous_nyse_session(
+            entry + pd.Timedelta(days=max_holding_days)
+        )
+        if exit_date <= boundary:
+            return candidate.date()
+        candidate -= pd.Timedelta(days=1)
 
 
 class EvaluationAlreadyConsumedError(RuntimeError):
@@ -1425,7 +1466,7 @@ def _reserve_evaluation(
     # Check the pre-family legacy path first.  This preserves the old
     # archive/migration refusal even when a caller has no modern grid.
     _refuse_legacy_ledger(ledger_path)
-    family = build_family(grid) if grid else None
+    family = build_family(_effective_validation_grid(grid)) if grid else None
     recorded_family = manifest.get("family")
     recorded_hashes = manifest.get("hashes", {})
     recorded_hashes = recorded_hashes if isinstance(recorded_hashes, dict) else {}
@@ -1464,6 +1505,12 @@ def _reserve_evaluation(
         else _json_safe(grid)
     )
     normalized_config = _canonical_config(config)
+    if (
+        family is not None
+        and "lookback_days" in family.parameter_order
+        and "lookback_days" not in normalized_config
+    ):
+        normalized_config["lookback_days"] = CONSENSUS_LOOKBACK_DAYS
     if family is not None and not any(
         _config_identity(trial.config) == _config_identity(normalized_config)
         for trial in family.trials
@@ -1624,10 +1671,8 @@ def run_validation(
     if any(value < 1 for value in horizons):
         raise ValueError("validation horizons must be positive")
     max_holding = max(horizons)
-    train_effective_end = _phase_end(
-        train_end, max_holding, VALIDATION_ENTRY_DELAY_DAYS
-    )
-    test_effective_end = _phase_end(test_end, max_holding, VALIDATION_ENTRY_DELAY_DAYS)
+    train_effective_end = _phase_end(train_end, max_holding)
+    test_effective_end = _phase_end(test_end, max_holding)
     if train_effective_end < train_start or test_effective_end < test_start:
         raise ValueError("phase is too short after executable holding-period purge")
 
@@ -1675,18 +1720,45 @@ def _run_validation_with_db(
     alpha: float,
     out_path: Path | None,
 ) -> dict:
-    tx_start = pd.Timestamp("2021-10-07")
+    effective_grid = _effective_validation_grid(grid)
+    scoring_modes = {
+        str(value) for value in effective_grid.get("scoring_mode", ("consensus",))
+    }
+    consensus_only = scoring_modes == {"consensus"}
+    max_lookback = max(
+        int(value)
+        for value in effective_grid.get("lookback_days", (CONSENSUS_LOOKBACK_DAYS,))
+    )
+    history_days = max_lookback
+    if not consensus_only:
+        history_days = max(
+            history_days,
+            max(int(value) for value in grid.get("training_lookback_days", (365,))),
+        )
+
+    tx_start = pd.Timestamp(train_start) - pd.Timedelta(days=history_days)
     train_tx_end = pd.Timestamp(train_effective_end)
     train_price_end = pd.Timestamp(train_end)
     train_tx = db.get_transactions_by_date_range(tx_start, train_tx_end)
     train_tickers = (
-        sorted(set(train_tx["ticker"].dropna().astype(str)) | {"SPY"})
+        sorted(set(_get_consensus_price_tickers(train_tx)) | {"SPY"})
+        if consensus_only
+        else sorted(set(train_tx["ticker"].dropna().astype(str)) | {"SPY"})
         if "ticker" in train_tx.columns
         else ["SPY"]
     )
-    train_prices = db.get_prices(train_tickers, tx_start, train_price_end)
-    train_entry_prices = db.get_entry_prices(
-        train_tickers, tx_start, train_price_end
+    train_price_start = (
+        next_nyse_session(pd.Timestamp(train_start))
+        if consensus_only
+        else next_nyse_session(tx_start)
+    )
+    train_prices = db.get_prices(
+        train_tickers, train_price_start, train_price_end
+    )
+    train_entry_prices = (
+        pd.DataFrame()
+        if consensus_only
+        else db.get_entry_prices(train_tickers, tx_start, train_tx_end)
     )
 
     train_df = sweep_configs(
@@ -1759,11 +1831,16 @@ def _run_validation_with_db(
     selected = selection["deployable_config"]
     if selected is not None:
         config = _config_from_row(selected)
-        signals = analysis.calculate_signal_potential(
-            train_entry_prices,
-            train_prices,
-            [int(config["horizon"])],
-            decay_lambda=float(config["decay_lambda"]),
+        mode = str(config.get("scoring_mode", "consensus"))
+        signals = (
+            pd.DataFrame()
+            if mode == "consensus"
+            else analysis.calculate_signal_potential(
+                train_entry_prices,
+                train_prices,
+                [int(config["horizon"])],
+                decay_lambda=float(config.get("decay_lambda", 0.005)),
+            )
         )
         train_result, _ = _run_frozen(
             train_tx,
@@ -1807,15 +1884,20 @@ def _run_validation_with_db(
             # load test-window transactions or values.  A failed read remains a
             # consumed reservation and is recorded as a terminal failure below.
             tx_end = pd.Timestamp(test_effective_end)
+            test_tx_start = pd.Timestamp(test_start) - pd.Timedelta(
+                days=int(config.get("lookback_days", CONSENSUS_LOOKBACK_DAYS))
+            )
+            price_start = next_nyse_session(pd.Timestamp(test_start))
             price_end = pd.Timestamp(test_end)
-            all_tx = db.get_transactions_by_date_range(tx_start, tx_end)
+            all_tx = db.get_transactions_by_date_range(test_tx_start, tx_end)
             tickers = (
-                sorted(set(all_tx["ticker"].dropna().astype(str)) | {"SPY"})
+                sorted(set(_get_consensus_price_tickers(all_tx)) | {"SPY"})
+                if mode == "consensus"
+                else sorted(set(all_tx["ticker"].dropna().astype(str)) | {"SPY"})
                 if "ticker" in all_tx.columns
                 else ["SPY"]
             )
-            prices = db.get_prices(tickers, tx_start, price_end)
-            db.get_entry_prices(tickers, tx_start, price_end)
+            prices = db.get_prices(tickers, price_start, price_end)
             test_result, test_series = _run_frozen(
                 all_tx, prices, signals, config, test_start, test_effective_end
             )
@@ -1904,12 +1986,13 @@ def _run_validation_with_db(
 
 
 def _run_frozen(all_tx, prices, signals, config, start: date, end: date):
+    mode = str(config.get("scoring_mode", "consensus"))
     params = BacktestParams(
         start_date=start,
         end_date=end,
         horizon=int(config["horizon"]),
-        lookback_days=60,
-        training_lookback_days=int(config["training_lookback_days"]),
+        lookback_days=int(config.get("lookback_days", CONSENSUS_LOOKBACK_DAYS)),
+        training_lookback_days=int(config.get("training_lookback_days", 365)),
         min_buyers=int(config["min_buyers"]),
         top_n=int(config["top_n"]),
         threshold=float(config.get("threshold", 5.0)),
@@ -1919,10 +2002,10 @@ def _run_frozen(all_tx, prices, signals, config, start: date, end: date):
         all_tx,
         prices,
         params,
-        signals,
-        float(config["bayes_prior_strength"]),
-        float(config["decay_lambda"]),
-        str(config.get("scoring_mode", "consensus")),
+        pd.DataFrame() if mode == "consensus" else signals,
+        float(config.get("bayes_prior_strength", 20.0)),
+        float(config.get("decay_lambda", 0.005)),
+        mode,
     )
 
 
@@ -1930,14 +2013,20 @@ def _config_from_row(row: dict) -> dict:
     keys = [
         "horizon",
         "frequency_days",
-        "training_lookback_days",
+        "lookback_days",
         "min_buyers",
         "top_n",
-        "threshold",
-        "decay_lambda",
-        "bayes_prior_strength",
         "scoring_mode",
     ]
+    if str(row.get("scoring_mode", "consensus")) != "consensus":
+        keys.extend(
+            [
+                "training_lookback_days",
+                "threshold",
+                "decay_lambda",
+                "bayes_prior_strength",
+            ]
+        )
     return {key: row[key] for key in keys if key in row}
 
 
@@ -2035,10 +2124,11 @@ def _build_manifest(
     permutation_seed: int,
     alpha: float,
 ) -> dict:
-    family = build_family(grid)
+    effective_grid = _effective_validation_grid(grid)
+    family = build_family(effective_grid)
     family_metadata = family.metadata()
     config_payload = {
-        "grid": grid,
+        "grid": effective_grid,
         "family_sha256": family.family_sha256,
         "family_size": family.family_size,
         "family_provenance": family.provenance,
@@ -2047,7 +2137,6 @@ def _build_manifest(
         "permutation_seed": permutation_seed,
         "primary_metric": PRIMARY_METRIC,
         "max_holding_days": max_holding,
-        "max_entry_delay_days": VALIDATION_ENTRY_DELAY_DAYS,
     }
     dependencies = {
         name: _dependency_version(name)
@@ -2079,11 +2168,12 @@ def _build_manifest(
             },
         },
         "purge": {
-            "max_executable_entry_delay_days": VALIDATION_ENTRY_DELAY_DAYS,
+            "rule": "exact_next_nyse_entry_and_fixed_horizon_exit",
             "max_possible_holding_days": max_holding,
-            "calendar_purge_days": max_holding + VALIDATION_ENTRY_DELAY_DAYS,
+            "train_calendar_purge_days": (train_end - train_effective_end).days,
+            "test_calendar_purge_days": (test_end - test_effective_end).days,
         },
-        "trial_grid": _json_safe(grid),
+        "trial_grid": _json_safe(effective_grid),
         "n_trials": family.family_size,
         "family": family_metadata,
         "null": {

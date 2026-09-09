@@ -49,7 +49,12 @@ class Database:
                 self.conn = duckdb.connect(str(self.db_path))
         except duckdb.Error as e:
             raise DatabaseError(f"Failed to open database at {self.db_path}: {e}")
-        if not read_only:
+        if read_only:
+            # Shadow any persisted legacy definition without mutating the file.
+            # This keeps read-only analysis on the current canonical-source
+            # contract before the next write-side schema initialization.
+            self._init_canonical_transactions_view()
+        else:
             self._init_schema()
         self._transactions = TransactionRepository(self.conn)
         self._prices = PriceRepository(self.conn)
@@ -252,47 +257,50 @@ class Database:
         )
 
     def _init_canonical_transactions_view(self) -> None:
-        self.conn.execute("""
-            CREATE OR REPLACE VIEW canonical_transactions AS
+        view_kind = "TEMP VIEW" if self._read_only else "VIEW"
+        self.conn.execute(f"""
+            CREATE OR REPLACE {view_kind} canonical_transactions AS
             SELECT t.* FROM transactions t
-            WHERE (
-                    t.source IS NOT NULL
-                    AND t.source NOT IN ('house_pdf', 'gemini_ocr')
-                  )
-               OR t.ingestion_generation = (
-                    SELECT active.generation_id
-                    FROM house_archive_generations own
-                    JOIN house_archive_generations active
-                      ON active.archive_year = own.archive_year
-                    WHERE own.generation_id = t.ingestion_generation
-                      AND active.parse_status = 'complete'
-                    ORDER BY active.promoted_at DESC, active.generation_id DESC
-                    LIMIT 1
-               )
+            WHERE t.source = 'senate_efd'
                OR (
-                    t.ingestion_generation IS NOT NULL
-                    AND NOT EXISTS (
-                        SELECT 1 FROM house_archive_generations g
-                        WHERE g.generation_id = t.ingestion_generation
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM metadata m
-                        JOIN house_archive_generations g
-                          ON g.archive_year = m.archive_year
-                        WHERE m.doc_id = t.doc_id
-                          AND g.parse_status = 'complete'
-                    )
-               )
-               OR (
-                    t.ingestion_generation IS NULL
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM metadata m
-                        JOIN house_archive_generations g
-                          ON g.archive_year = m.archive_year
-                        WHERE m.doc_id = t.doc_id
-                          AND g.parse_status = 'complete'
+                    (t.source IS NULL OR t.source IN ('house_pdf', 'gemini_ocr'))
+                    AND (
+                        t.ingestion_generation = (
+                            SELECT active.generation_id
+                            FROM house_archive_generations own
+                            JOIN house_archive_generations active
+                              ON active.archive_year = own.archive_year
+                            WHERE own.generation_id = t.ingestion_generation
+                              AND active.parse_status = 'complete'
+                            ORDER BY active.promoted_at DESC, active.generation_id DESC
+                            LIMIT 1
+                        )
+                        OR (
+                            t.ingestion_generation IS NOT NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM house_archive_generations g
+                                WHERE g.generation_id = t.ingestion_generation
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM metadata m
+                                JOIN house_archive_generations g
+                                  ON g.archive_year = m.archive_year
+                                WHERE m.doc_id = t.doc_id
+                                  AND g.parse_status = 'complete'
+                            )
+                        )
+                        OR (
+                            t.ingestion_generation IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM metadata m
+                                JOIN house_archive_generations g
+                                  ON g.archive_year = m.archive_year
+                                WHERE m.doc_id = t.doc_id
+                                  AND g.parse_status = 'complete'
+                            )
+                        )
                     )
                )
         """)

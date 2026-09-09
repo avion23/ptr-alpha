@@ -346,7 +346,7 @@ def test_cli_as_of_reaches_single_ticker_analysis_params():
 
     with (
         patch("analyzer.cli.get_context", return_value=MagicMock()),
-        patch("analyzer.cli._check_data_freshness"),
+        patch("analyzer.cli._warn_live_ticker_coverage"),
         patch("analyzer.cli.run_ticker_analysis", side_effect=fake_run),
     ):
         result = CliRunner().invoke(

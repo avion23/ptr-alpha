@@ -59,6 +59,45 @@ def test_database_keeps_legacy_archive_year_unknown_and_nonauthoritative(tmp_pat
         db.close()
 
 
+def test_read_only_database_shadows_legacy_canonical_view(tmp_path):
+    db_path = tmp_path / "legacy-view.duckdb"
+    db = Database(db_path)
+    rows = pd.DataFrame(
+        [
+            {
+                "doc_id": "official",
+                "member": "Jane Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 1, 1),
+                "disclosure_date": date(2024, 1, 2),
+                "transaction_type": "Purchase",
+            }
+        ]
+    )
+    db.upsert_transactions(rows, source="house_pdf")
+    db.upsert_transactions(rows.assign(doc_id="external"), source="capitol_trades")
+    db.conn.execute(
+        "CREATE OR REPLACE VIEW canonical_transactions AS SELECT * FROM transactions"
+    )
+    db.close()
+
+    read_only = Database(db_path, read_only=True)
+    try:
+        assert set(read_only.get_transactions(2024)["source"]) == {"house_pdf"}
+    finally:
+        read_only.close()
+
+    # The safety view is connection-local: read-only analysis does not rewrite
+    # a persisted legacy database merely by opening it.
+    raw = duckdb.connect(str(db_path), read_only=True)
+    try:
+        assert raw.execute(
+            "SELECT COUNT(*) FROM canonical_transactions WHERE source='capitol_trades'"
+        ).fetchone()[0] == 1
+    finally:
+        raw.close()
+
+
 def test_database_adds_nullable_cross_source_columns_without_backfill(tmp_path):
     db_path = tmp_path / "legacy-transactions.duckdb"
     connection = duckdb.connect(str(db_path))
@@ -484,6 +523,38 @@ class TestTransactions(DatabaseTestCase):
         self.assertEqual(
             rows, [("house_pdf", "Apple Inc"), ("capitol_trades", "Apple Inc updated")]
         )
+
+    def test_canonical_view_excludes_external_reconciliation_rows(self):
+        base = pd.DataFrame(
+            [
+                {
+                    "doc_id": "canonical-source",
+                    "member": "Jane Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": date(2024, 4, 1),
+                    "disclosure_date": date(2024, 4, 5),
+                    "transaction_type": "Purchase",
+                }
+            ]
+        )
+        self.db.upsert_transactions(base, source="house_pdf")
+        self.db.upsert_transactions(base.assign(doc_id="senate-source"), source="senate_efd")
+        self.db.upsert_transactions(
+            base.assign(doc_id="external-source"), source="capitol_trades"
+        )
+
+        stored_sources = {
+            row[0]
+            for row in self.db.conn.execute(
+                "SELECT DISTINCT source FROM transactions"
+            ).fetchall()
+        }
+        canonical_sources = set(self.db.get_transactions(2024)["source"])
+
+        self.assertEqual(
+            stored_sources, {"house_pdf", "senate_efd", "capitol_trades"}
+        )
+        self.assertEqual(canonical_sources, {"house_pdf", "senate_efd"})
 
     def test_upsert_without_artifact_identity_preserves_repeated_lots(self):
         df = pd.DataFrame(

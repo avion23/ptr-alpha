@@ -1035,6 +1035,58 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertIn("won:pdftotext", engines)
         self.assertTrue(any(item.startswith("row_disagreement:") for item in engines))
 
+    def test_trusted_text_pair_does_not_hide_camelot_complement(self):
+        from analyzer import parser_cascade
+
+        def tx(asset):
+            return {
+                "transaction_date": "2024-01-01",
+                "transaction_type": "Purchase",
+                "amount_midpoint": 8000,
+                "asset_description": asset,
+            }
+
+        with (
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=[tx("A")]),
+            patch.object(
+                parser_cascade, "_try_camelot_lattice", return_value=[tx("B")]
+            ),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=[tx("A")]),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(
+                parser_cascade, "_try_tesseract", return_value=[tx("A"), tx("B")]
+            ),
+        ):
+            _, rows, engines = parser_cascade._parse_pdf_worker(Path("complement.pdf"))
+
+        self.assertEqual({row["asset_description"] for row in rows}, {"A", "B"})
+        self.assertIn("won:reconciled_complete_ocr", engines)
+
+    def test_nonempty_but_incomplete_ocr_does_not_authorize_text_union(self):
+        from analyzer import parser_cascade
+
+        def tx(asset):
+            return {
+                "transaction_date": "2024-01-01",
+                "transaction_type": "Purchase",
+                "amount_midpoint": 8000,
+                "asset_description": asset,
+            }
+
+        with (
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=[tx("A")]),
+            patch.object(
+                parser_cascade, "_try_camelot_lattice", return_value=[tx("B")]
+            ),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=[tx("A")]),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(parser_cascade, "_try_tesseract", return_value=[tx("A")]),
+        ):
+            with self.assertRaises(parser_cascade.ParserCascadeError):
+                parser_cascade._parse_pdf_worker(Path("incomplete-ocr.pdf"))
+
     def test_cascade_reconciles_complementary_rows_only_after_complete_ocr(self):
         from analyzer import parser_cascade
 

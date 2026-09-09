@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.matched_control import (
+    _forward_alpha,
     find_matched_controls,
     run_matched_control_backtest,
 )
@@ -172,6 +173,36 @@ class TestFindMatchedControlsMatching(unittest.TestCase):
             self.assertIn(c, ["LV1", "LV2"], f"Expected low-vol control, got {c}")
 
 
+class TestMatchedControlOutcomeTiming(unittest.TestCase):
+    def test_forward_alpha_uses_next_session_and_common_spy_endpoints(self):
+        prices = pd.DataFrame(
+            {
+                "AAPL": [100.0, 200.0, 220.0],
+                "SPY": [400.0, 500.0, 550.0],
+            },
+            index=pd.to_datetime(["2025-01-03", "2025-01-06", "2025-01-07"]),
+        )
+
+        alpha = _forward_alpha(prices, "AAPL", pd.Timestamp("2025-01-03"), 1)
+
+        # Entry is Monday Jan 6, not Friday Jan 3. Both AAPL and SPY return
+        # 10% through Tuesday Jan 7, so alpha is zero.
+        self.assertAlmostEqual(alpha, 0.0, places=10)
+
+    def test_forward_alpha_is_unavailable_without_exact_benchmark_quote(self):
+        prices = pd.DataFrame(
+            {
+                "AAPL": [200.0, 220.0],
+                "SPY": [500.0, np.nan],
+            },
+            index=pd.to_datetime(["2025-01-06", "2025-01-07"]),
+        )
+
+        self.assertIsNone(
+            _forward_alpha(prices, "AAPL", pd.Timestamp("2025-01-03"), 1)
+        )
+
+
 class TestRunMatchedControlBacktest(unittest.TestCase):
     def setUp(self):
         # Build a minimal but complete dataset
@@ -301,8 +332,6 @@ class TestRunMatchedControlBacktest(unittest.TestCase):
             n_controls=3,
             min_buyers=2,
             lookback_days=60,
-            threshold=5.0,
-            training_lookback_days=365,
         )
         if not result.empty:
             for _, row in result.iterrows():

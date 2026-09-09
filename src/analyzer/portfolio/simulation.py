@@ -11,6 +11,10 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_LOOKBACK_DAYS,
+    CONSENSUS_MIN_BUYERS,
+)
 from analyzer.portfolio.kelly import (
     REQUIRED_SIZING_COLUMNS,
     KellyConfig,
@@ -34,8 +38,8 @@ def build_portfolios_from_backtest(
     prices_df: pd.DataFrame,
     as_of_dates: pd.DatetimeIndex | list,
     horizon: int = 60,
-    lookback_days: int = 30,
-    min_buyers: int = 2,
+    lookback_days: int = CONSENSUS_LOOKBACK_DAYS,
+    min_buyers: int = CONSENSUS_MIN_BUYERS,
     top_n: int = 5,
     threshold: float = 5.0,
     training_lookback_days: int | None = None,

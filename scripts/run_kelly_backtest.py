@@ -12,15 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pandas as pd
 
-from analyzer import analysis
 from analyzer.download import HouseTransactionSource
+from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_LOOKBACK_DAYS,
+    CONSENSUS_MIN_BUYERS,
+    _get_consensus_price_tickers,
+)
 from analyzer.portfolio import (
     KellyConfig,
     build_portfolios_from_backtest,
     compute_portfolio_metrics,
     simulate_portfolio_returns,
 )
+from analyzer.price_repository import next_nyse_session
 from analyzer.settings import Settings
+from analyzer.validation import _phase_end
 
 
 def main() -> int:
@@ -48,36 +54,25 @@ def main() -> int:
 def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
     horizon = 60
     frequency = 30
-    min_buyers = 2
+    min_buyers = CONSENSUS_MIN_BUYERS
     top_n = 5
-    training_lookback_days = 365
     start_date = date(2022, 1, 1)
-    end_date = date(2025, 12, 31)
+    outcome_boundary = date(2025, 12, 31)
+    last_as_of = _phase_end(outcome_boundary, horizon)
     capital = 100_000.0
 
-    tx_start = start_date - timedelta(days=training_lookback_days + horizon + 30)
-    tx_end = end_date
+    tx_start = start_date - timedelta(days=CONSENSUS_LOOKBACK_DAYS)
     print("Loading transactions...")
-    transactions = tx_source.db.get_transactions_by_date_range(tx_start, tx_end)
-    if "ticker" in transactions.columns:
-        transactions["ticker"] = transactions["ticker"].astype(str)
+    transactions = tx_source.db.get_transactions_by_date_range(tx_start, last_as_of)
     print(f"  {len(transactions)} transactions")
 
-    price_end = end_date + timedelta(days=horizon + 40)
-    tickers = sorted(
-        {str(t) for t in transactions["ticker"].dropna().unique()} | {"SPY"}
-    )
-    prices = tx_source.db.get_prices(tickers, tx_start, price_end)
+    tickers = sorted(set(_get_consensus_price_tickers(transactions)) | {"SPY"})
+    price_start = next_nyse_session(start_date)
+    prices = tx_source.db.get_prices(tickers, price_start, outcome_boundary)
     prices = prices.dropna(axis=1, how="all")
     print(f"  {prices.shape[1]} price series, {len(prices)} dates")
 
-    entry_prices = tx_source.db.get_entry_prices(tickers, tx_start, price_end)
-    if not entry_prices.empty and "ticker" in entry_prices.columns:
-        entry_prices["ticker"] = entry_prices["ticker"].astype(str)
-    signals = analysis.calculate_signal_potential(entry_prices, prices, [horizon])
-    print(f"  {len(signals)} signals")
-
-    as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency}D")
+    as_of_dates = pd.date_range(start_date, last_as_of, freq=f"{frequency}D")
     config = KellyConfig(
         capital=capital,
         max_ticker_pct=0.20,
@@ -87,16 +82,14 @@ def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
         crash_guard=False,
     )
     targets = build_portfolios_from_backtest(
-        signals,
+        pd.DataFrame(),
         transactions,
         prices,
         as_of_dates,
         horizon=horizon,
-        lookback_days=30,
+        lookback_days=CONSENSUS_LOOKBACK_DAYS,
         min_buyers=min_buyers,
         top_n=top_n,
-        threshold=5.0,
-        training_lookback_days=training_lookback_days,
         config=config,
         sizing_inputs_df=sizing_inputs,
     )

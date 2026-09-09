@@ -1269,6 +1269,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
             {
                 "member": ["Alice", "Bob", "Carol", "Dan", "Eve"],
                 "ticker": ["AMZN", "MATT", "ALLI", "ARLP", "AAPL"],
+                "transaction_date": pd.to_datetime(["2025-01-10"] * 5),
                 "disclosure_date": pd.to_datetime(["2025-01-14"] * 5),
                 "instrument_type": ["option", "stock", "stock", "stock", "stock"],
                 "transaction_type": ["Purchase"] * 5,
@@ -1293,6 +1294,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "instrument_type": ["stock", "stock"],
                 "ticker_origin": ["official", "official"],
                 "transaction_type": ["Purchase", "Purchase"],
+                "transaction_date": pd.to_datetime(["2026-03-01", "2026-03-01"]),
                 "disclosure_date": pd.to_datetime(["2026-03-02", "2026-03-02"]),
             }
         )
@@ -1329,6 +1331,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "transaction_type": ["Purchase", "Purchase"],
                 "economic_duplicate_candidate": [True, True],
                 "transaction_date": pd.to_datetime(["2026-07-01", "2026-07-01"]),
+                "disclosure_date": pd.to_datetime(["2026-07-02", "2026-07-02"]),
             }
         )
         self.assertEqual(
@@ -1368,6 +1371,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "asset_description": ["Meta Platforms Common Stock [ST]"],
                 "transaction_type": ["Purchase"],
                 "transaction_date": pd.to_datetime(["2022-06-01"]),
+                "disclosure_date": pd.to_datetime(["2022-06-08"]),
             }
         )
         self.assertEqual(

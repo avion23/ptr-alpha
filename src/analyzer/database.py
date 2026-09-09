@@ -263,7 +263,7 @@ class Database:
             SELECT t.* FROM transactions t
             WHERE t.source = 'senate_efd'
                OR (
-                    (t.source IS NULL OR t.source IN ('house_pdf', 'gemini_ocr'))
+                    t.source IN ('house_pdf', 'gemini_ocr')
                     AND (
                         t.ingestion_generation = (
                             SELECT active.generation_id

@@ -78,7 +78,7 @@ class TestAnalysis(unittest.TestCase):
         self.assertFalse(signals["peak_potential_pct"].isna().any())
         self.assertTrue((signals["entry_price"] > 0).all())
 
-    def test_score_ticker_by_buyers_reports_metadata_diagnostics_without_adjustment(
+    def test_score_ticker_by_buyers_reports_filing_lag_without_noop_factors(
         self,
     ):
         transactions = pd.DataFrame(
@@ -113,8 +113,18 @@ class TestAnalysis(unittest.TestCase):
 
         self.assertEqual(score.iloc[0]["base_signal_score"], 2.0)
         self.assertEqual(score.iloc[0]["scoring_mode"], "consensus")
-        self.assertGreater(score.iloc[0]["size_factor"], 1.0)
-        self.assertLess(score.iloc[0]["owner_factor"], 1.0)
+        self.assertEqual(score.iloc[0]["max_trade_to_disclosure_days"], 2)
+        self.assertEqual(score.iloc[0]["median_trade_to_disclosure_days"], 2.0)
+        for obsolete in (
+            "size_factor",
+            "owner_factor",
+            "convergence_factor",
+            "ticker_perf_factor",
+            "avg_buyer_performance",
+            "best_buyer_performance",
+            "total_buyer_trades",
+        ):
+            self.assertNotIn(obsolete, score.columns)
         self.assertAlmostEqual(
             score.iloc[0]["signal_score_raw"],
             score.iloc[0]["base_signal_score"],

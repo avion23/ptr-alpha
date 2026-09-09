@@ -262,6 +262,7 @@ class TestConsensusProductionScoring:
             {
                 "member": ["Alice", "Bob"],
                 "ticker": ["AAPL", "AAPL"],
+                "transaction_date": pd.to_datetime(["2024-05-09", "2024-05-11"]),
                 "disclosure_date": pd.to_datetime(["2024-05-10", "2024-05-12"]),
                 "transaction_type": ["Purchase", "Purchase"],
             }

@@ -76,6 +76,8 @@ def test_read_only_database_shadows_legacy_canonical_view(tmp_path):
     )
     db.upsert_transactions(rows, source="house_pdf")
     db.upsert_transactions(rows.assign(doc_id="external"), source="capitol_trades")
+    db.upsert_transactions(rows.assign(doc_id="unknown"), source="house_pdf")
+    db.conn.execute("UPDATE transactions SET source=NULL WHERE doc_id='unknown'")
     db.conn.execute(
         "CREATE OR REPLACE VIEW canonical_transactions AS SELECT * FROM transactions"
     )
@@ -83,7 +85,9 @@ def test_read_only_database_shadows_legacy_canonical_view(tmp_path):
 
     read_only = Database(db_path, read_only=True)
     try:
-        assert set(read_only.get_transactions(2024)["source"]) == {"house_pdf"}
+        transactions = read_only.get_transactions(2024)
+        assert set(transactions["source"]) == {"house_pdf"}
+        assert transactions["doc_id"].tolist() == ["official"]
     finally:
         read_only.close()
 

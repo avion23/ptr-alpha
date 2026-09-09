@@ -249,7 +249,13 @@ def _warn_live_ticker_coverage(app_ctx: AppContext, days_back: int) -> None:
 def _consensus_score_display(score: pd.DataFrame) -> pd.DataFrame:
     columns = [
         column
-        for column in ("ticker", "num_buyers", "buyers", "signal_score")
+        for column in (
+            "ticker",
+            "num_buyers",
+            "buyers",
+            "signal_score",
+            "max_trade_to_disclosure_days",
+        )
         if column in score.columns
     ]
     return score[columns]

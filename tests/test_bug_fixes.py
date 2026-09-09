@@ -485,6 +485,17 @@ class TestPriceAcquisitionCorrectness(DatabaseTestCase):
         )
         self.assertTrue(entries.empty)
 
+    def test_bush_market_closure_is_not_reported_missing(self):
+        dates = pd.DatetimeIndex(["2018-12-04", "2018-12-06"])
+        self.db.upsert_prices(pd.DataFrame({"SPY": [275.0, 276.0]}, index=dates))
+
+        missing_tickers, missing_dates = self.db.get_missing_price_data(
+            ["SPY"], date(2018, 12, 4), date(2018, 12, 6)
+        )
+
+        self.assertEqual(missing_tickers, [])
+        self.assertEqual(missing_dates, [])
+
     def test_carter_market_closure_is_not_reported_missing(self):
         dates = pd.DatetimeIndex(["2025-01-08", "2025-01-10"])
         self.db.upsert_prices(pd.DataFrame({"SPY": [500.0, 501.0]}, index=dates))

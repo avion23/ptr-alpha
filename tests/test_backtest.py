@@ -13,6 +13,7 @@ from analyzer.analysis import (
 from analyzer.member_ranking.buyer_scoring import (
     _filter_equity_rows,
     _get_consensus_candidate_tickers,
+    _get_consensus_price_tickers,
 )
 
 from .conftest import DatabaseTestCase
@@ -1380,6 +1381,28 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 rows, 1, as_of_date=pd.Timestamp("2022-06-10")
             ),
             ["META"],
+        )
+
+    def test_price_universe_uses_canonical_symbols_and_both_rename_sides(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["Alice Smith", "Bob Jones", "Carol Reed"],
+                "ticker": ["BRKB", "BRK.B", "FB"],
+                "instrument_type": ["stock", "stock", "stock"],
+                "source": ["house_pdf", "house_pdf", "house_pdf"],
+                "transaction_type": ["Purchase", "Purchase", "Purchase"],
+                "transaction_date": pd.to_datetime(
+                    ["2025-01-02", "2025-01-03", "2023-01-02"]
+                ),
+                "disclosure_date": pd.to_datetime(
+                    ["2025-01-04", "2025-01-05", "2023-01-03"]
+                ),
+            }
+        )
+
+        self.assertEqual(
+            _get_consensus_price_tickers(rows),
+            ["BRK-B", "FB", "META"],
         )
 
     def test_equivalent_ticker_spellings_share_one_candidate_identity(self):

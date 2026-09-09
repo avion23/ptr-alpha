@@ -353,13 +353,21 @@ def _get_consensus_candidate_tickers(
 
 
 def _get_consensus_price_tickers(transactions_df: pd.DataFrame) -> list[str]:
-    """Return every price symbol family needed to evaluate eligible purchases."""
+    """Return the price symbols needed to evaluate eligible purchases.
+
+    Class-share and pseudo-ticker spellings collapse to their resolved price
+    symbol. Rename aliases retain both temporal symbols because a disclosure
+    can arrive after the rename for a transaction executed before it.
+    """
     purchases = _prepare_consensus_purchases(transactions_df)
     if purchases.empty:
         return []
-    symbols: set[str] = set()
-    for resolved_symbol in purchases["_resolved_symbol"].dropna().astype(str).unique():
-        symbols.update(_ticker_family_symbols(resolved_symbol))
+    symbols = set(purchases["_resolved_symbol"].dropna().astype(str))
+    for symbol in tuple(symbols):
+        family = _ticker_family_symbols(symbol)
+        for alias, (renamed, _) in _TICKER_RESOLVER.RENAME_MAP.items():
+            if alias in family:
+                symbols.update({alias, renamed})
     return sorted(symbols)
 
 

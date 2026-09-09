@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.exceptions import AnalysisError
-from analyzer.price_repository import nyse_sessions
+from analyzer.price_repository import next_nyse_session, nyse_sessions
 from analyzer.ticker_resolver import TickerResolver
 
 from analyzer.signals import constants as _constants
@@ -381,15 +381,16 @@ def _extract_metadata_arrays(signals: pd.DataFrame) -> dict:
 
 
 def _label_session_array(metadata: dict) -> np.ndarray:
-    """Build the NYSE calendar once for every label in this batch."""
+    """Build exactly the NYSE sessions needed by every label in this batch."""
     disc_ns = metadata["disc_ns"]
     end_ns = metadata["end_ns"]
     if len(disc_ns) == 0:
         return np.array([], dtype=np.int64)
     start = pd.Timestamp(int(disc_ns.min()))
-    # Entry is after disclosure, so the requested horizon can end a few days
-    # after disclosure+horizon when weekends or holidays intervene.
-    end = pd.Timestamp(int(end_ns.max())) + pd.Timedelta(days=14)
+    max_disc_ns = int(disc_ns.max())
+    horizon_ns = int(np.max(end_ns - disc_ns))
+    last_entry = next_nyse_session(pd.Timestamp(max_disc_ns))
+    end = last_entry + pd.Timedelta(horizon_ns, unit="ns")
     return nyse_sessions(start, end).as_unit("ns").asi8
 
 

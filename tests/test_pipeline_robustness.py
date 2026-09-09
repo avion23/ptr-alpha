@@ -194,6 +194,7 @@ def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     ):
         result = run_recent_ticker_scoring(
             transaction_source,
+            MagicMock(),
             TickerScoringParams(
                 year=2025,
                 as_of_date=as_of,

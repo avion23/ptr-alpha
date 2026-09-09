@@ -59,7 +59,7 @@ The canonical DuckDB contains several kinds of data:
 
 `canonical_transactions` exposes the active complete House generation plus canonical non-House sources. Normal reads exclude rows whose transaction date is after their disclosure date because those are usually OCR/date-order errors.
 
-Capitol Trades is useful for **reconciliation**, but `fetch-capitol` does not write canonical transactions. Official House and Senate sources remain authoritative.
+Capitol Trades is useful for **reconciliation**, but `fetch-capitol` does not write canonical transactions. Official House and Senate sources remain authoritative and are stored together in the canonical DuckDB; `source` and `chamber` keep their refresh boundaries separate.
 
 ## How a stock is evaluated now
 

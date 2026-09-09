@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
 
-from analyzer.member_ranking.bayes import normal_normal_posteriors
+from analyzer.member_ranking.bayes import (
+    bayesian_win_probability,
+    normal_normal_posteriors,
+)
 from analyzer.signals.filters import _collapse_to_episodes
 
 
@@ -52,6 +55,10 @@ def test_episode_does_not_chain_past_fourteen_days():
 
     assert len(collapsed) == 2
     assert collapsed["episode_count"].tolist() == [2, 1]
+
+
+def test_bayesian_win_probability_defaults_to_neutral_market_prior():
+    assert bayesian_win_probability(0, 0) == 0.5
 
 
 def test_normal_normal_fit_is_scale_equivariant_at_one_millionth():

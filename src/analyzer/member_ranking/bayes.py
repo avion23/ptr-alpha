@@ -15,7 +15,7 @@ from analyzer import signals as _signals
 def bayesian_win_probability(
     wins: int,
     losses: int,
-    market_prior: float = 0.55,
+    market_prior: float = 0.50,
     prior_strength: float | None = None,
 ) -> float:
     ps = prior_strength if prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH

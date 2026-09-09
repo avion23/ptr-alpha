@@ -229,50 +229,6 @@ def build_prior(
 # ---------------------------------------------------------------------------
 
 
-def compute_entry_value(
-    historical_return_curves: list[np.ndarray],
-    rho: float = 0.000137,
-    default_theta: float = 0.05,
-    default_mu: float = 0.0,
-) -> tuple[float, float, float]:
-    """
-    Estimate entry value V(0) from historical return curves for a ticker.
-
-    Returns (V0, mu, theta).
-    V0 = mu * theta / (rho * (theta + rho))
-    """
-    if not historical_return_curves:
-        return (
-            default_mu * default_theta / (rho * (default_theta + rho)),
-            default_mu,
-            default_theta,
-        )
-
-    thetas = []
-    mus = []
-
-    for curve in historical_return_curves:
-        c = np.asarray(curve, dtype=np.float64)
-        if len(c) < 3:
-            continue
-        ou = fit_ou(c)
-        if 0.001 < ou.theta < 5.0:
-            thetas.append(ou.theta)
-            mus.append(ou.mu)
-
-    if not mus:
-        return (
-            default_mu * default_theta / (rho * (default_theta + rho)),
-            default_mu,
-            default_theta,
-        )
-
-    mu = float(np.mean(mus))
-    theta = float(np.median(thetas))
-    v0 = mu * theta / (rho * (theta + rho))
-    return v0, mu, theta
-
-
 def compute_entry_value_and_horizon(
     historical_return_curves: list[np.ndarray],
     rho: float = 0.000137,
@@ -320,46 +276,6 @@ def compute_entry_value_and_horizon(
         optimal = max(min_horizon, min(max_horizon, optimal))
 
     return v0, mu, theta, optimal
-
-
-# ---------------------------------------------------------------------------
-# Optimal horizon from OU half-life
-# ---------------------------------------------------------------------------
-
-
-def compute_optimal_horizon(
-    historical_return_curves: list[np.ndarray],
-    min_horizon: int = 20,
-    max_horizon: int = 120,
-    default_horizon: int = 60,
-) -> int:
-    """Estimate optimal holding period from OU half-life.
-
-    Uses 2 * half-life as the optimal exit (captures ~75% of mean reversion).
-    Clamped to [min_horizon, max_horizon].
-    """
-    if not historical_return_curves:
-        return default_horizon
-
-    thetas = []
-    for curve in historical_return_curves:
-        c = np.asarray(curve, dtype=np.float64)
-        if len(c) < 3:
-            continue
-        ou = fit_ou(c)
-        if 0.001 < ou.theta < 5.0:
-            thetas.append(ou.theta)
-
-    if not thetas:
-        return default_horizon
-
-    median_theta = float(np.median(thetas))
-    if median_theta < 1e-6:
-        return max_horizon
-
-    half_life = np.log(2) / median_theta
-    optimal = int(2 * half_life)  # 2 half-lives captures ~75% of reversion
-    return max(min_horizon, min(max_horizon, optimal))
 
 
 # ---------------------------------------------------------------------------

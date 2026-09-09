@@ -798,7 +798,7 @@ class Database:
                      AND new_metadata.last_name IS NOT DISTINCT FROM old_metadata.last_name
                      AND new_metadata.filing_date IS NOT DISTINCT FROM old_metadata.filing_date
                      AND new_metadata.filing_type IS NOT DISTINCT FROM old_metadata.filing_type
-                    WHERE t.source = 'house_pdf'
+                    WHERE t.source IN ('house_pdf', 'gemini_ocr')
                       AND t.ingestion_generation = ?
                     """,
                     [

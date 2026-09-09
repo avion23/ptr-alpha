@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
+from functools import partial
 
 import pandas as pd
 import pytest
@@ -17,7 +18,7 @@ from analyzer.senate_efd import (
     SenateEFDSource,
     SenateReportFetchResult,
 )
-from analyzer.models import ReportOutcome, TickerOrigin
+from analyzer.models import ReportOutcome
 from scripts.senate_sweep import (
     GENERATION,
     inventory_records,
@@ -28,6 +29,7 @@ from scripts.senate_sweep import (
     write_manifest,
     write_transactions_jsonl,
 )
+from .conftest import make_raw_trade
 
 KATIE_REPORT_ID = "37900303-65bf-467d-962b-76555d510b28"
 KATIE_REPORT_PATH = f"/search/view/ptr/{KATIE_REPORT_ID}/"
@@ -57,36 +59,7 @@ def _inventory_row(**overrides):
     return row
 
 
-def _raw_trade(**overrides):
-    trade = {
-        "doc_id": KATIE_REPORT_ID,
-        "source_record_id": KATIE_REPORT_ID,
-        "source_row_id": "official:1",
-        "source_report_path": KATIE_REPORT_PATH,
-        "senator": "Katie Britt",
-        "filed_date": pd.Timestamp("2026-01-29"),
-        "official_filing_date": pd.Timestamp("2026-01-29"),
-        "available_date": pd.Timestamp("2026-01-29"),
-        "notification_date": "01/29/2026",
-        "amends_source_record_id": None,
-        "ticker": "JPM",
-        "ticker_raw": "JPM",
-        "ticker_candidate": None,
-        "ticker_origin": TickerOrigin.OFFICIAL.value,
-        "transaction_date": "01/28/2026",
-        "type": "Sale (Full)",
-        "transaction_subtype_raw": "Sale (Full)",
-        "owner": "SP",
-        "owner_raw": "Spouse",
-        "amount_range": "$1,001 - $15,000",
-        "amount_range_raw": "$1,001 - $15,000",
-        "asset_name": "JPMorgan Chase & Co. Common Stock",
-        "asset_type": "Stock",
-        "ingestion_generation": GENERATION,
-        "artifact_sha256": "a" * 64,
-    }
-    trade.update(overrides)
-    return trade
+_raw_trade = partial(make_raw_trade, GENERATION)
 
 
 def test_inventory_records_serialize_timestamps_as_iso_strings():

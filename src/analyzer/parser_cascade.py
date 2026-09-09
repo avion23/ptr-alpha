@@ -29,6 +29,10 @@ class ParserBackendError(RuntimeError):
         self.cause = cause
 
 
+class ParseBudgetExceeded(RuntimeError):
+    """The watchdog stopped a document before the cascade could finish."""
+
+
 class ParserCascadeError(RuntimeError):
     """No rows were recovered and at least one backend failed."""
 
@@ -97,7 +101,7 @@ def _multiset_subset(left: dict, right: dict) -> bool:
 
 
 def _semantic_score(transactions: list[dict]) -> tuple[int, int, int, float]:
-    counts, representatives = _candidate_counts(transactions)
+    representatives = _candidate_counts(transactions)[1]
     unique = list(representatives.values())
     complete = sum(
         1 for tx in unique if tx.get("transaction_date") and tx.get("transaction_type")
@@ -107,10 +111,27 @@ def _semantic_score(transactions: list[dict]) -> tuple[int, int, int, float]:
     return complete, with_amount, with_asset, _result_quality(unique)
 
 
+def _find_parse_budget(exc: BaseException) -> ParseBudgetExceeded | None:
+    """Find a watchdog exception retained by one or more backend wrappers."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ParseBudgetExceeded):
+            return current
+        cause = getattr(current, "cause", None)
+        if not isinstance(cause, BaseException):
+            cause = current.__cause__
+        if not isinstance(cause, BaseException):
+            cause = current.__context__
+        current = cause
+    return None
+
+
 def _reconcile_candidates(candidates, engines_attempted):
     """Merge complementary rows while retaining the maximum observed lot count."""
     if not candidates:
-        return [], False
+        return []
     counts_by_engine = {name: _candidate_counts(rows)[0] for name, rows in candidates}
     raw_counts = {name: len(rows) for name, rows in candidates}
     unique_counts = {name: len(counts) for name, counts in counts_by_engine.items()}
@@ -145,7 +166,7 @@ def _reconcile_candidates(candidates, engines_attempted):
     )
     if not complementary:
         engines_attempted.append(f"won:{best_name}")
-        return best_rows, False
+        return best_rows
 
     maximum_counts = dict(best_counts)
     representatives = _candidate_counts(best_rows)[1]
@@ -158,7 +179,16 @@ def _reconcile_candidates(candidates, engines_attempted):
     for identity, count in maximum_counts.items():
         reconciled.extend([representatives[identity]] * count)
     engines_attempted.append(f"complementary_rows:{len(reconciled)}")
-    return reconciled, True
+    return reconciled
+
+
+def _call_parser_backend(engine_name, backend, *args, **kwargs):
+    try:
+        return backend(*args, **kwargs)
+    except ParseBudgetExceeded:
+        raise
+    except Exception as exc:
+        raise ParserBackendError(engine_name, exc) from exc
 
 
 def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
@@ -166,7 +196,12 @@ def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
     started = time.monotonic()
     try:
         transactions = engine_fn(pdf_path)
+    except ParseBudgetExceeded:
+        raise
     except ParserBackendError as exc:
+        budget = _find_parse_budget(exc)
+        if budget is not None:
+            raise budget from exc
         elapsed = time.monotonic() - started
         errors.append(str(exc))
         engines_attempted.append(f"error:{engine_name}")
@@ -215,9 +250,7 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
         if candidate:
             text_candidates.append(candidate)
 
-    reconciled_text, text_uncertain = _reconcile_candidates(
-        text_candidates, engines_attempted
-    )
+    reconciled_text = _reconcile_candidates(text_candidates, engines_attempted)
     trusted = {name: rows for name, rows in text_candidates}
     pdfplumber_counts = _candidate_counts(trusted.get("pdfplumber", []))[0]
     pdftotext_counts = _candidate_counts(trusted.get("pdftotext", []))[0]
@@ -251,7 +284,7 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
 
     if tesseract_candidate:
         all_candidates = list(text_candidates) + ocr_candidates
-        reconciled, _ = _reconcile_candidates(all_candidates, engines_attempted)
+        reconciled = _reconcile_candidates(all_candidates, engines_attempted)
         engines_attempted.append("won:reconciled_complete_ocr")
         return pdf_path, reconciled, engines_attempted
 
@@ -266,10 +299,9 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
 def _try_pdfplumber(pdf_path: Path) -> list[dict]:
     """Benchmark winner for text-based PDFs (0.075s avg). Handles encrypted
     PDFs natively; returns 0 on scanned images."""
-    try:
-        pp_tables = extract_tables_with_pdfplumber(pdf_path)
-    except Exception as e:
-        raise ParserBackendError("pdfplumber", e) from e
+    pp_tables = _call_parser_backend(
+        "pdfplumber", extract_tables_with_pdfplumber, pdf_path
+    )
     if not pp_tables:
         return []
     txs: list[dict] = []
@@ -282,10 +314,9 @@ def _try_camelot_lattice(pdf_path: Path) -> list[dict]:
     """Previous primary parser; keeps PDFs with ruling lines. Lattice
     sometimes collapses to 1-column when null bytes are present — in that
     case we re-parse each cell as OCR text."""
-    try:
-        tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="lattice")
-    except Exception as e:
-        raise ParserBackendError("lattice", e) from e
+    tables = _call_parser_backend(
+        "lattice", camelot.read_pdf, str(pdf_path), pages="all", flavor="lattice"
+    )
     txs: list[dict] = []
     for table in tables:
         data = table.data
@@ -310,12 +341,10 @@ def _try_camelot_lattice(pdf_path: Path) -> list[dict]:
 
 
 def _try_camelot_stream(pdf_path: Path) -> list[dict]:
-    """Fallback for unrulled tables. Try ALL detected tables and stop at
-    the first one that yields transactions (Fix 2: don't just scan table[0])."""
-    try:
-        tables = camelot.read_pdf(str(pdf_path), pages="all", flavor="stream")
-    except Exception as e:
-        raise ParserBackendError("stream", e) from e
+    """Fallback for unrulled tables; aggregate all detected tables."""
+    tables = _call_parser_backend(
+        "stream", camelot.read_pdf, str(pdf_path), pages="all", flavor="stream"
+    )
     transactions: list[dict] = []
     for table in tables:
         transactions.extend(parse_pdf_table(table.data))
@@ -323,11 +352,10 @@ def _try_camelot_stream(pdf_path: Path) -> list[dict]:
 
 
 def _try_pdftotext(pdf_path: Path) -> list[dict]:
-    """Extract every pdftotext table instead of stopping at the first match."""
-    try:
-        pdftext_tables = extract_tables_with_pdftotext(pdf_path)
-    except Exception as e:
-        raise ParserBackendError("pdftotext", e) from e
+    """Extract and aggregate every pdftotext table."""
+    pdftext_tables = _call_parser_backend(
+        "pdftotext", extract_tables_with_pdftotext, pdf_path
+    )
     transactions: list[dict] = []
     for table in pdftext_tables:
         transactions.extend(parse_pdf_table(table))
@@ -340,10 +368,9 @@ def _try_docling(pdf_path: Path) -> list[dict]:
     Docling is expensive (roughly 13-300s and about 2 GB per process), so bulk
     runs may set ``PTR_SKIP_DOCLING=1`` and handle stragglers separately.
     """
-    try:
-        docling_tables = extract_tables_with_docling(pdf_path)
-    except Exception as e:
-        raise ParserBackendError("docling", e) from e
+    docling_tables = _call_parser_backend(
+        "docling", extract_tables_with_docling, pdf_path
+    )
     transactions: list[dict] = []
     for table in docling_tables:
         transactions.extend(parse_pdf_table(table))
@@ -353,10 +380,7 @@ def _try_docling(pdf_path: Path) -> list[dict]:
 def _try_tesseract(pdf_path: Path) -> list[dict]:
     """Last-resort OCR. Kept for backward compatibility when docling/uvx
     is unavailable."""
-    try:
-        ocr_tables = extract_tables_with_ocr(pdf_path)
-    except Exception as e:
-        raise ParserBackendError("ocr", e) from e
+    ocr_tables = _call_parser_backend("ocr", extract_tables_with_ocr, pdf_path)
     txs: list[dict] = []
     for table in ocr_tables:
         txs.extend(parse_pdf_table(table))

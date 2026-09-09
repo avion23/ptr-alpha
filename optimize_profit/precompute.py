@@ -72,7 +72,7 @@ def precompute_walk_forward_data(
             }
             continue
 
-        recent_trades = _filter_recent_trades_for_period(
+        recent_trades = _filter_recent_trades(
             transactions_df, lookback_days, as_of_iso
         )
         if recent_trades.empty:
@@ -92,9 +92,7 @@ def precompute_walk_forward_data(
             "candidate_tickers": _candidate_tickers_by_min_buyers(
                 recent_trades, min_buyers_list
             ),
-            "ticker_perf_signals": _filter_ticker_perf_for_period(
-                signals_df, horizon, as_of_iso
-            ),
+            "ticker_perf_signals": _filter_ticker_perf(signals_df, horizon, as_of_iso),
         }
 
     return precomputed
@@ -106,10 +104,6 @@ def _filter_training_for_period(signals_df, horizon, as_of_iso, training_lookbac
         as_of_ts - pd.Timedelta(days=training_lookback_days)
     ).isoformat()
     return _filter_training(signals_df, horizon, as_of_iso, training_lookback_iso)
-
-
-def _filter_recent_trades_for_period(transactions_df, lookback_days, as_of_iso):
-    return _filter_recent_trades(transactions_df, lookback_days, as_of_iso)
 
 
 def _candidate_tickers_by_min_buyers(
@@ -133,7 +127,3 @@ def _rank_members_for_period(training, horizon, bayes_prior_strength=None):
         )
     except AnalysisError:
         return None
-
-
-def _filter_ticker_perf_for_period(signals_df, horizon, as_of_iso):
-    return _filter_ticker_perf(signals_df, horizon, as_of_iso)

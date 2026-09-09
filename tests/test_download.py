@@ -501,6 +501,128 @@ def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
     assert any("1/2" in record.getMessage() for record in failure_warnings)
 
 
+def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
+    tmp_path, monkeypatch
+):
+    from analyzer import download as download_module
+    from analyzer.parser_cascade import ParserCascadeError
+    from scripts.audit_generation import (
+        check_house_generation_activation,
+        check_parse_counts_match_persisted,
+    )
+
+    source, db = _source(tmp_path)
+    generation = "captured-g1"
+    pdf_path = tmp_path / "2021" / "pdfs" / "stable.pdf"
+    pdf_path.parent.mkdir(parents=True)
+    pdf_bytes = b"%PDF-stable\n%%EOF"
+    pdf_path.write_bytes(pdf_bytes)
+    artifact_sha = hashlib.sha256(pdf_bytes).hexdigest()
+    source.fetch_metadata = MagicMock(return_value=_metadata("stable"))
+    source.db.get_latest_house_generation = MagicMock(return_value=generation)
+
+    metadata, _ = _acquired("stable")
+    db.replace_metadata(2021, metadata)
+    db.conn.execute(
+        """
+        INSERT INTO house_archive_generations (
+            archive_year, generation_id, metadata_sha256,
+            metadata_count, ptr_count, parse_status
+        ) VALUES (2021, ?, 'metadata-sha', 1, 1, 'complete')
+        """,
+        [generation],
+    )
+    db.conn.execute(
+        """
+        INSERT INTO house_pdf_artifacts (
+            archive_year, doc_id, generation_id, artifact_sha256, http_status
+        ) VALUES (2021, 'stable', ?, ?, 200)
+        """,
+        [generation, artifact_sha],
+    )
+    db.upsert_transactions(
+        pd.DataFrame(
+            [{
+                "doc_id": "stable",
+                "member": "First Last",
+                "ticker": "AAPL",
+                "transaction_date": date(2021, 1, 2),
+                "disclosure_date": date(2021, 1, 3),
+                "transaction_type": "Purchase",
+                "chamber": "house",
+                "source_record_id": "stable",
+                "source_row_id": "stable:r1",
+                "ingestion_generation": generation,
+                "artifact_sha256": artifact_sha,
+            }]
+        ),
+        source="house_pdf",
+    )
+    db.upsert_parse_run(
+        doc_id="stable",
+        year=2021,
+        parser_version="v5-deterministic",
+        status="success",
+        engines_attempted="pdfplumber",
+        raw_row_count=1,
+        transaction_count=1,
+        artifact_sha256=artifact_sha,
+        ingestion_generation=generation,
+    )
+
+    def failed_worker(path):
+        raise ParserCascadeError(f"{path}: unresolved parser completeness: boom")
+
+    monkeypatch.setattr(download_module, "_parse_pdf_worker", failed_worker)
+
+    class FakePool:
+        def __init__(self, _workers):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def map(self, worker, paths):
+            return [worker(path) for path in paths]
+
+    monkeypatch.setattr(download_module, "Pool", FakePool)
+    try:
+        source.parse_cached_pdfs(2021, force=True)
+        runs = db.conn.execute(
+            """
+            SELECT status, transaction_count
+            FROM pdf_parse_runs
+            WHERE doc_id = 'stable'
+              AND parser_version = 'v5-deterministic'
+              AND artifact_sha256 = ?
+              AND ingestion_generation = ?
+            """,
+            [artifact_sha, generation],
+        ).fetchall()
+        rows = db.conn.execute(
+            """
+            SELECT ticker, ingestion_generation, artifact_sha256
+            FROM canonical_transactions
+            WHERE doc_id = 'stable'
+            """
+        ).fetchall()
+        unresolved = db.get_unresolved_house_doc_ids(2021, generation)
+        parse_audit = check_parse_counts_match_persisted(db.conn)
+        generation_audit = check_house_generation_activation(db.conn)
+    finally:
+        source.close()
+        db.close()
+
+    assert runs == [("success", 1)]
+    assert rows == [("AAPL", generation, artifact_sha)]
+    assert unresolved == []
+    assert parse_audit.passed, parse_audit.violations
+    assert generation_audit.passed, generation_audit.violations
+
+
 def test_engine_error_detail_only_flags_dedicated_sentinel():
     from analyzer.download import _engine_error_detail
 
@@ -687,6 +809,32 @@ def test_tolerant_parse_watchdog_budget_fires_and_restores_state(
     assert elapsed < 0.4, f"watchdog did not interrupt the slow worker ({elapsed}s)"
     assert signal.getsignal(signal.SIGALRM) is prior_handler
     assert signal.setitimer(signal.ITIMER_REAL, 0) == (0.0, 0.0)
+
+
+def test_tolerant_worker_keeps_backend_timeout_as_parse_failure(tmp_path, monkeypatch):
+    from analyzer import download as download_module
+    from analyzer import parser_cascade
+
+    pdf_path = tmp_path / "backend-timeout.pdf"
+    pdf_path.write_bytes(b"%PDF-backend-timeout\n%%EOF")
+
+    def raise_timeout(_path):
+        raise parser_cascade.ParseBudgetExceeded("backend timeout")
+
+    monkeypatch.setattr(
+        parser_cascade, "extract_tables_with_pdfplumber", raise_timeout
+    )
+
+    out_path, transactions, engines = download_module._tolerant_parse_pdf_worker(
+        pdf_path
+    )
+
+    assert out_path == pdf_path
+    assert transactions == []
+    assert engines == [
+        f"__parse_failed__:parse budget "
+        f"{download_module._PARSE_DOC_BUDGET_SECONDS}s exceeded"
+    ]
 
 
 def test_tolerant_parse_watchdog_absent_outside_main_thread(tmp_path, monkeypatch):

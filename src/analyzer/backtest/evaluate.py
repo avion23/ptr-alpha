@@ -28,6 +28,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from analyzer._price_index import _normalize_price_index
 from analyzer.backtest.prices import _find_dip_entry_arrays
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals import _price_arrays
@@ -45,6 +46,7 @@ _EMPTY_BT_COLS = [
     "bt_leverage",
     "bt_spy_return_pct",
     "bt_alpha_pct",
+    "bt_horizon_days",
     "bt_entry_delay",
     "bt_delisted",
     "bt_coverage",
@@ -66,9 +68,13 @@ def evaluate_backtest(
     max_wait_days: int = 10,
 ) -> pd.DataFrame:
     if recommendations.empty:
-        return recommendations
+        result = _empty_eval_joined(recommendations)
+        result.attrs["n_no_price"] = 0
+        result.attrs["n_delisted"] = 0
+        result.attrs["n_unavailable"] = 0
+        return result
 
-    prices_df = _normalize_price_frame(prices_df)
+    prices_df = _normalize_price_index(prices_df, invalid_error=ValueError)
     as_of_date = _normalize_date(as_of_date)
     entry_mult, exit_mult = _slippage_multipliers(entry_slippage_bps, exit_slippage_bps)
 
@@ -127,6 +133,10 @@ def evaluate_backtest(
             amount_arr[i] if amount_arr is not None else None,
         )
         if row is not None:
+            # Keep the evaluation schema identical when every resolved row is
+            # unavailable. Complete rows get this from _bt_row; unavailable
+            # rows deliberately do not need to duplicate its arguments.
+            row["bt_horizon_days"] = t_horizon
             if row.get("bt_coverage") == "unavailable":
                 n_unavailable += 1
             if row.get("bt_delisted"):
@@ -152,6 +162,12 @@ def evaluate_backtest(
         on="_bt_idx",
         how="left",
     ).drop(columns=["_bt_idx"])
+    result = result.reindex(
+        columns=[
+            *recommendations.columns,
+            *[col for col in _EMPTY_BT_COLS if col not in recommendations.columns],
+        ]
+    )
 
     result.attrs["n_no_price"] = n_no_price
     result.attrs["n_delisted"] = n_delisted
@@ -176,8 +192,8 @@ def _extract_recommendation_arrays(recommendations: pd.DataFrame) -> tuple:
 
 
 def _empty_eval_joined(recommendations: pd.DataFrame) -> pd.DataFrame:
-    """Return the original recommendations frame with empty bt_* columns."""
-    recommendations = recommendations.copy()
+    """Return an independent, schema-compatible empty evaluation frame."""
+    recommendations = recommendations.copy(deep=True)
     for col in _EMPTY_BT_COLS:
         recommendations[col] = None
     return recommendations
@@ -304,21 +320,6 @@ def _normalize_date(value) -> pd.Timestamp:
     if timestamp.tz is not None:
         timestamp = timestamp.tz_localize(None)
     return timestamp.normalize()
-
-
-def _normalize_price_frame(prices: pd.DataFrame) -> pd.DataFrame:
-    try:
-        index = pd.DatetimeIndex(pd.to_datetime(prices.index))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Price index must contain valid dates") from exc
-    if index.tz is not None:
-        index = index.tz_localize(None)
-    index = index.normalize()
-    if index.has_duplicates:
-        raise ValueError("Price index contains duplicate calendar dates")
-    normalized = prices.copy()
-    normalized.index = index
-    return normalized.sort_index()
 
 
 def _price_at_exact_ns(idx_ns, vals, target_ns):

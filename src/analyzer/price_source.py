@@ -5,15 +5,15 @@ import re
 import time
 from collections import Counter
 from datetime import date, timedelta
-
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from analyzer._price_index import _normalize_price_index
 from analyzer.database import Database
 from analyzer.exceptions import DataSourceError
-from analyzer.interfaces import PriceSource
 from analyzer.settings import Settings
 from analyzer.ticker_resolver import TickerResolver
 
@@ -25,7 +25,7 @@ _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 # ── YFinancePriceSource: yfinance-backed price fetcher with cache merge ──
 
 
-class YFinancePriceSource(PriceSource):
+class YFinancePriceSource:
     def __init__(
         self, settings: Settings, read_only: bool = False, db: Database | None = None
     ):
@@ -81,8 +81,7 @@ class YFinancePriceSource(PriceSource):
 
         if not missing_tickers and not missing_dates:
             logger.info(f"Using fully cached prices for {len(all_tickers)} tickers")
-            available_tickers = [t for t in all_tickers if t in cached_prices.columns]
-            return cached_prices[available_tickers].dropna(axis=1, how="all")
+            return _validate_and_log_prices(cached_prices, all_tickers)
 
         return self._fetch_and_merge_prices(
             all_tickers,
@@ -118,7 +117,7 @@ class YFinancePriceSource(PriceSource):
         incomplete tickers.
         """
         fetch_tickers = missing_tickers if missing_tickers else all_tickers
-        fetch_resolved = sorted(set(raw_to_yf.get(t, t) for t in fetch_tickers))
+        fetch_resolved = sorted({raw_to_yf.get(t, t) for t in fetch_tickers})
 
         logger.info(
             f"Fetching price data for {len(fetch_resolved)} tickers using yfinance"
@@ -128,10 +127,7 @@ class YFinancePriceSource(PriceSource):
         if data.empty:
             if not cached_prices.empty:
                 logger.warning("yfinance failed, using cached data")
-                available_tickers = [
-                    t for t in all_tickers if t in cached_prices.columns
-                ]
-                return cached_prices[available_tickers].dropna(axis=1, how="all")
+                return _validate_and_log_prices(cached_prices, all_tickers)
             raise DataSourceError(
                 "No price data could be fetched from yfinance. Data source may be blocked or down."
             )
@@ -142,11 +138,14 @@ class YFinancePriceSource(PriceSource):
         invalid_mask = new_prices.notna() & (
             ~np.isfinite(new_prices) | new_prices.le(0)
         )
-        invalid = int(invalid_mask.sum().sum())
+        invalid = invalid_mask.sum().sum()
         new_prices = new_prices.mask(invalid_mask)
         if invalid:
-            logger.warning("Rejected %d non-finite or non-positive fetched prices", int(invalid))
+            logger.warning(
+                "Rejected %d non-finite or non-positive fetched prices", invalid
+            )
         new_prices = new_prices.dropna(axis=1, how="all")
+        new_prices = _as_frame(new_prices)
         new_prices = self._rename_yf_columns(new_prices, raw_to_yf)
 
         if self.db.is_read_only:
@@ -172,7 +171,7 @@ class YFinancePriceSource(PriceSource):
                 # yfinance treats ``end`` as exclusive while this public API
                 # and the repository treat it as inclusive.
                 download_end = pd.Timestamp(end) + timedelta(days=1)
-                return yf.download(
+                data = yf.download(
                     fetch_resolved,
                     start=start,
                     end=download_end,
@@ -180,6 +179,9 @@ class YFinancePriceSource(PriceSource):
                     threads=True,
                     auto_adjust=True,
                 )
+                if not isinstance(data, pd.DataFrame):
+                    raise DataSourceError("yfinance returned no downloadable frame")
+                return data
             except Exception as e:
                 if attempt < max_retries - 1:
                     delay = 2 ** (attempt + 1)
@@ -194,6 +196,7 @@ class YFinancePriceSource(PriceSource):
                         "falling back to cached data"
                     )
                     return pd.DataFrame()
+        raise DataSourceError("yfinance download retries exhausted")
 
     @staticmethod
     def _extract_close_prices(
@@ -212,23 +215,17 @@ class YFinancePriceSource(PriceSource):
         if not isinstance(close, pd.DataFrame):
             raise DataSourceError("Unsupported yfinance Close response shape")
         if len(fetch_resolved) == 1 and len(close.columns) == 1:
-            return close.rename(columns={close.columns[0]: fetch_resolved[0]})
+            return close.rename(columns={str(close.columns[0]): fetch_resolved[0]})
         return close.copy()
 
     @staticmethod
     def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:
-        try:
-            index = pd.DatetimeIndex(pd.to_datetime(prices.index))
-        except (TypeError, ValueError) as exc:
-            raise DataSourceError("yfinance returned an invalid date index") from exc
-        if index.tz is not None:
-            index = index.tz_localize(None)
-        index = index.normalize()
-        if index.has_duplicates:
-            raise DataSourceError("yfinance returned duplicate calendar dates")
-        normalized = prices.copy()
-        normalized.index = index
-        return normalized.sort_index()
+        return _normalize_price_index(
+            prices,
+            invalid_error=DataSourceError,
+            duplicate_error=DataSourceError,
+            duplicate_message="yfinance returned duplicate calendar dates",
+        )
 
     def _rename_yf_columns(
         self, new_prices: pd.DataFrame, raw_to_yf: dict
@@ -314,12 +311,12 @@ def _validate_and_log_prices(
     prices: pd.DataFrame, all_tickers: list[str]
 ) -> pd.DataFrame:
     """Fail loudly when too many tickers couldn't be fetched (>25%)."""
-    prices = prices.apply(pd.to_numeric, errors="coerce")
+    prices = _as_frame(prices.apply(pd.to_numeric, errors="coerce"))
     invalid_mask = prices.notna() & (~np.isfinite(prices) | prices.le(0))
     if invalid_mask.any().any():
         logger.warning(
             "Quarantined %d invalid cached price observations",
-            int(invalid_mask.sum().sum()),
+            invalid_mask.sum().sum(),
         )
         prices = prices.mask(invalid_mask)
     prices = prices.dropna(axis=1, how="all")
@@ -344,5 +341,17 @@ def _validate_and_log_prices(
         f"Successfully fetched prices for {success_count}/{len(all_tickers)} "
         f"tickers ({success_rate * 100:.1f}% success)"
     )
-    available_tickers = [t for t in all_tickers if t in prices.columns]
-    return prices[available_tickers].dropna(axis=1, how="all")
+    return _select_columns(prices, all_tickers)
+
+
+def _select_columns(prices: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    """Column-select in ticker order and drop all-empty columns."""
+    available = [t for t in tickers if t in prices.columns]
+    return _as_frame(prices[available]).dropna(axis=1, how="all")
+
+
+def _as_frame(value: object) -> pd.DataFrame:
+    """Narrow pandas ``apply`` results that stubs type as a union."""
+    if not isinstance(value, pd.DataFrame):
+        raise DataSourceError("unexpected price-table shape")
+    return value

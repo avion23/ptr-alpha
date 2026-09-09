@@ -9,24 +9,67 @@ are not tradable scores.
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from analyzer import signals as _signals
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
-from analyzer.models import TransactionType
-from analyzer.signals import TICKER_PERF_MIN_TRADES
-
 from analyzer.member_ranking.factors import _owner_score_factor, _size_score_factor
-from analyzer.member_ranking.ranking import rank_members
 from analyzer.member_ranking.lookups import (
     _build_ranking_dicts,
     _get_ticker_purchases,
     _validate_scoring_mode,
 )
+from analyzer.member_ranking.ranking import rank_members
+from analyzer.models import TransactionType
+from analyzer.signals import TICKER_PERF_MIN_TRADES
+from analyzer.ticker_resolver import TickerResolver
 
 CONSENSUS_SCORER_PROVENANCE = "identity_free_distinct_buyer_count_v2"
+
+_VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z]{1,2})?$")
+_TICKER_RESOLVER = TickerResolver()
+_REJECTED_TICKER_STATUSES = frozenset({"unresolved", "quarantined", "acquired"})
+_NON_EQUITY_TICKERS = frozenset(
+    {
+        "BOND",
+        "BONDS",
+        "CASH",
+        "COUPON",
+        "FUND",
+        "NOTE",
+        "NOTES",
+        "STOCK",
+        "TICKER",
+    }
+)
+_NON_EQUITY_INSTRUMENTS = frozenset(
+    {
+        "bond",
+        "bonds",
+        "call",
+        "cash",
+        "fund",
+        "mutual fund",
+        "note",
+        "notes",
+        "option",
+        "put",
+        "stock option",
+        "treasury",
+    }
+)
+_REJECTED_TICKER_ORIGINS = frozenset({"invalid", "missing", "non_equity"})
+_OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
+_UNSUPPORTED_ASSET_RE = re.compile(
+    r"\b(?:mutual fund|index fund|exchange-traded fund|money market|treasury|"
+    r"government securit|corporate bond|municipal bond|real estate|cryptocurrency|"
+    r"private equity|limited partnership)\b",
+    re.IGNORECASE,
+)
 
 
 @df_memoize(copy=False)
@@ -66,20 +109,33 @@ def score_ticker_by_buyers(
             signals_df, horizon, threshold, _bayes_prior_strength=bayes_prior
         )
 
-    ticker_trades = _get_ticker_purchases(ticker, transactions_df).copy()
     if scoring_mode == "consensus":
+        normalized_ticker = _validate_ticker(ticker)
+        ticker_trades = _get_consensus_ticker_purchases(
+            normalized_ticker, transactions_df
+        )
         disclosure_dates = pd.to_datetime(
             ticker_trades["disclosure_date"], errors="coerce"
         )
         ticker_trades = ticker_trades[
             disclosure_dates.notna() & (disclosure_dates <= pd.Timestamp(as_of_date))
         ].copy()
+    else:
+        ticker_trades = _get_ticker_purchases(ticker, transactions_df).copy()
     if ticker_trades.empty:
         return _empty_ticker_result(ticker)
 
-    ticker_trades["_member_canonical"] = ticker_trades["member"].map(
-        canonical_member_key
+    canonicalizer = (
+        _canonical_member_or_blank
+        if scoring_mode == "consensus"
+        else canonical_member_key
     )
+    ticker_trades["_member_canonical"] = ticker_trades["member"].map(canonicalizer)
+    if scoring_mode == "consensus":
+        ticker_trades = ticker_trades[ticker_trades["_member_canonical"].ne("")].copy()
+        if ticker_trades.empty:
+            return _empty_ticker_result(ticker)
+
     min_trades = ticker_trades["_member_canonical"].nunique()
     if min_trades < min_buyers:
         return _below_threshold_result(ticker, min_trades, min_buyers)
@@ -117,6 +173,206 @@ def score_ticker_by_buyers(
         inputs = fallback
     inputs["scoring_mode"] = scoring_mode
     return _final_result(ticker, buyers, ticker_trades, inputs, alpha_dict)
+
+
+def _validate_ticker(ticker: str) -> str:
+    normalized = _normalize_ticker_text(ticker)
+    if normalized is None or not _VALID_TICKER_RE.fullmatch(normalized):
+        raise AnalysisError(f"Invalid equity ticker for scoring: {ticker!r}")
+    if normalized in _NON_EQUITY_TICKERS:
+        raise AnalysisError(f"Non-equity ticker cannot be scored: {ticker!r}")
+
+    resolution = _TICKER_RESOLVER.resolve(normalized)
+    # Ordinary source symbols (for example AAPL) are intentionally returned
+    # as ``unverified`` by the resolver because it has no exchange-wide symbol
+    # registry. Syntax-valid pass-through symbols remain usable; only its
+    # explicit invalid/quarantine states are rejected here.
+    if resolution.status in _REJECTED_TICKER_STATUSES:
+        raise AnalysisError(
+            f"Ticker {ticker!r} is not an eligible equity symbol: {resolution.notes}"
+        )
+    return normalized
+
+
+def _normalize_ticker_text(value) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            return None
+    normalized = str(value).strip().upper()
+    if not normalized or normalized in {"NAN", "NAT", "NONE", "<NA>"}:
+        return None
+    return normalized
+
+
+def _ticker_family_symbols(ticker: str) -> set[str]:
+    """Return resolver-normalized symbols that identify the same equity."""
+    resolution = _TICKER_RESOLVER.resolve(ticker)
+    symbols = {resolution.price_symbol}
+
+    for alias, (renamed, _) in _TICKER_RESOLVER.RENAME_MAP.items():
+        if ticker in {alias, renamed} or resolution.price_symbol in {alias, renamed}:
+            symbols.update({alias, renamed})
+
+    for mapping in (
+        _TICKER_RESOLVER.CLASS_SHARE_MAP,
+        _TICKER_RESOLVER.PSEUDO_TICKER_MAP,
+    ):
+        for alias, mapped in mapping.items():
+            if ticker in {alias, mapped} or resolution.price_symbol == mapped:
+                symbols.update({alias, mapped})
+    return symbols
+
+
+def _get_consensus_ticker_purchases(
+    ticker: str, transactions_df: pd.DataFrame
+) -> pd.DataFrame:
+    """Select purchases for a resolver-normalized equity identity.
+
+    Consensus is live-facing and must not let source aliases, malformed rows,
+    or non-equity provenance turn into buyer counts. Historical modes retain
+    their existing exact-ticker lookup because their member effects are only
+    descriptive.
+    """
+    purchases = _prepare_consensus_purchases(transactions_df)
+    if purchases.empty:
+        return purchases
+
+    family_symbols = _ticker_family_symbols(ticker)
+    return purchases.loc[purchases["_resolved_symbol"].isin(list(family_symbols))].drop(
+        columns=["_resolved_symbol", "_member_canonical"]
+    )
+
+
+def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
+    """Return valid purchase rows with resolver and member identities attached."""
+    purchases = transactions_df[
+        transactions_df["transaction_type"] == TransactionType.PURCHASE.value
+    ].copy()
+    if purchases.empty:
+        return purchases
+
+    resolved_symbols = []
+    canonical_members = []
+    for _, row in purchases.iterrows():
+        if not _equity_transaction_row(row):
+            resolved_symbols.append(None)
+        else:
+            ticker = _normalize_ticker_text(row.get("ticker"))
+            date_field = (
+                "disclosure_date"
+                if ticker in _TICKER_RESOLVER.LISTING_START_MAP
+                else "transaction_date"
+            )
+            reference_date = _transaction_date(row.get(date_field))
+            resolved_symbols.append(
+                _resolved_ticker_symbol(row.get("ticker"), reference_date)
+            )
+        canonical_members.append(_canonical_member_or_blank(row.get("member")))
+
+    purchases["_resolved_symbol"] = resolved_symbols
+    purchases["_member_canonical"] = canonical_members
+    return purchases.loc[
+        purchases["_resolved_symbol"].notna() & purchases["_member_canonical"].ne("")
+    ].copy()
+
+
+def _get_consensus_candidate_tickers(
+    transactions_df: pd.DataFrame, min_buyers: int
+) -> list[str]:
+    """Return live candidate labels whose filtered buyer count meets the gate."""
+    purchases = _prepare_consensus_purchases(transactions_df)
+    if purchases.empty:
+        return []
+
+    buyer_sets = purchases.groupby("_resolved_symbol")["_member_canonical"].agg(set)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    raw_tickers = transactions_df.loc[
+        transactions_df["transaction_type"] == TransactionType.PURCHASE.value,
+        "ticker",
+    ]
+    for raw_ticker in raw_tickers.dropna().unique():
+        if not isinstance(raw_ticker, str):
+            continue
+        normalized = _normalize_ticker_text(raw_ticker)
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            normalized = _validate_ticker(normalized)
+        except AnalysisError:
+            continue
+        family_symbols = _ticker_family_symbols(normalized)
+        buyers: set[str] = set()
+        for symbol in family_symbols:
+            buyers.update(buyer_sets.get(symbol, set()))
+        if len(buyers) >= min_buyers:
+            candidates.append(raw_ticker)
+    return candidates
+
+
+def _resolved_ticker_symbol(value, trade_date=None) -> str | None:
+    normalized = _normalize_ticker_text(value)
+    if normalized is None or not _VALID_TICKER_RE.fullmatch(normalized):
+        return None
+    if normalized in _NON_EQUITY_TICKERS:
+        return None
+    resolution = _TICKER_RESOLVER.resolve(normalized, trade_date)
+    if resolution.status in _REJECTED_TICKER_STATUSES or resolution.status in {
+        "date_required",
+        "pre_listing",
+    }:
+        return None
+    return resolution.price_symbol
+
+
+def _transaction_date(value):
+    if value is None:
+        return None
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return pd.Timestamp(parsed).date()
+
+
+def _equity_transaction_row(row: pd.Series) -> bool:
+    origin = _normalize_ticker_text(row.get("ticker_origin"))
+    if origin is not None and origin.lower() in _REJECTED_TICKER_ORIGINS:
+        return False
+
+    source = _normalize_ticker_text(row.get("source"))
+    if source is not None and source.lower() not in _OFFICIAL_SOURCES:
+        return False
+
+    description = " ".join(
+        str(value)
+        for value in (row.get("asset_description"), row.get("raw_asset_description"))
+        if value is not None and not pd.isna(value)
+    )
+    if _UNSUPPORTED_ASSET_RE.search(description):
+        return False
+
+    instrument = _normalize_ticker_text(row.get("instrument_type"))
+    return instrument is None or instrument.lower() not in _NON_EQUITY_INSTRUMENTS
+
+
+def _filter_equity_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """Keep rows accepted by the consensus equity/provenance boundary."""
+    if rows.empty:
+        return rows
+    mask = rows.apply(_equity_transaction_row, axis=1)
+    return rows.loc[mask].copy()
+
+
+def _canonical_member_or_blank(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    return canonical_member_key(value)
 
 
 def _validate_inputs(
@@ -165,15 +421,12 @@ def _consensus_inputs(
     score, so permuting member identities leaves it unchanged.
     """
     member_col = "_member_canonical"
+    with_disclosures = ticker_trades.copy()
+    with_disclosures["_disclosure"] = pd.to_datetime(
+        with_disclosures["disclosure_date"], errors="coerce"
+    )
     disclosures = (
-        ticker_trades.assign(
-            _disclosure=pd.to_datetime(
-                ticker_trades["disclosure_date"], errors="coerce"
-            )
-        )
-        .groupby(member_col)["_disclosure"]
-        .max()
-        .reindex(buyers)
+        with_disclosures.groupby(member_col)["_disclosure"].max().reindex(buyers)
     )
     days_since = (as_of_date - disclosures).dt.days
     if days_since.isna().any() or (days_since < 0).any():

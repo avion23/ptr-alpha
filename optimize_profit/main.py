@@ -1462,11 +1462,8 @@ def _git_state() -> dict:
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    with open(path, "rb") as artifact:
+        return hashlib.file_digest(artifact, "sha256").hexdigest()
 
 
 def _json_value(value):

@@ -10,7 +10,10 @@ from analyzer.analysis import (
     evaluate_backtest,
     summarize_backtest,
 )
-from analyzer.candidates import candidate_tickers, filter_equity_rows
+from analyzer.member_ranking.buyer_scoring import (
+    _filter_equity_rows,
+    _get_consensus_candidate_tickers,
+)
 
 from .conftest import DatabaseTestCase
 
@@ -475,6 +478,23 @@ class TestEvaluateBacktest(unittest.TestCase):
             pd.DataFrame(), self.prices, pd.Timestamp("2025-01-01"), 90
         )
         self.assertTrue(result.empty)
+
+    def test_empty_recommendations_are_independent_and_schema_stable(self):
+        recommendations = self.recommendations.iloc[0:0].copy()
+        result = evaluate_backtest(
+            recommendations, self.prices, pd.Timestamp("2025-01-01"), 90
+        )
+        populated = evaluate_backtest(
+            self.recommendations, self.prices, pd.Timestamp("2025-01-01"), 90
+        )
+
+        self.assertIsNot(result, recommendations)
+        self.assertListEqual(list(result.columns), list(populated.columns))
+        result["caller_mutation"] = pd.Series(dtype=object)
+        self.assertNotIn("caller_mutation", recommendations.columns)
+        self.assertEqual(result.attrs["n_no_price"], 0)
+        self.assertEqual(result.attrs["n_delisted"], 0)
+        self.assertEqual(result.attrs["n_unavailable"], 0)
 
     def test_truncated_ticker_is_unavailable_without_a_delisting_guess(self):
         full_dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
@@ -1246,10 +1266,11 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
     def test_options_and_known_non_equities_are_rejected(self):
         rows = pd.DataFrame(
             {
-                "member": ["A", "B", "C", "D", "E"],
+                "member": ["Alice", "Bob", "Carol", "Dan", "Eve"],
                 "ticker": ["AMZN", "MATT", "ALLI", "ARLP", "AAPL"],
                 "disclosure_date": pd.to_datetime(["2025-01-14"] * 5),
                 "instrument_type": ["option", "stock", "stock", "stock", "stock"],
+                "transaction_type": ["Purchase"] * 5,
                 "asset_description": [
                     "Amazon (AMZN) [OP]",
                     "Matthews International Mutual Fund [OT]",
@@ -1259,19 +1280,20 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 ],
             }
         )
-        filtered = filter_equity_rows(rows)
-        self.assertEqual(set(filtered["ticker"]), {"ARLP", "AAPL"})
+        candidates = _get_consensus_candidate_tickers(rows, 1)
+        self.assertEqual(set(candidates), {"ARLP", "AAPL"})
         # 20034095/20034670 stale ALLI is also quarantined when descriptions are absent.
         stale = pd.DataFrame(
             {
-                "member": ["A", "B"],
+                "member": ["Alice", "Bob"],
                 "ticker": ["ALLI", "AAPL"],
                 "instrument_type": ["stock", "stock"],
                 "ticker_origin": ["official", "official"],
+                "transaction_type": ["Purchase", "Purchase"],
                 "disclosure_date": pd.to_datetime(["2026-03-02", "2026-03-02"]),
             }
         )
-        self.assertEqual(candidate_tickers(stale, 1), ["AAPL"])
+        self.assertEqual(_get_consensus_candidate_tickers(stale, 1), ["AAPL"])
 
     def test_equity_filter_rejects_explicit_funds_but_leaves_ticker_resolution_separate(self):
         rows = pd.DataFrame(
@@ -1287,12 +1309,12 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 ],
             }
         )
-        self.assertEqual(filter_equity_rows(rows)["ticker"].tolist(), ["NOTREAL", "TECH"])
+        self.assertEqual(_filter_equity_rows(rows)["ticker"].tolist(), ["NOTREAL", "TECH"])
 
     def test_official_source_allows_normalized_stock_without_ticker_origin(self):
         rows = pd.DataFrame(
             {
-                "member": ["A", "A"],
+                "member": ["Alice", "Alice"],
                 "ticker": ["AAPL", "AAPL"],
                 "instrument_type": ["stock", "stock"],
                 "source": ["house_pdf", "house_pdf"],
@@ -1301,7 +1323,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "transaction_date": pd.to_datetime(["2026-07-01", "2026-07-01"]),
             }
         )
-        self.assertEqual(candidate_tickers(rows, 1), ["AAPL"])
+        self.assertEqual(_get_consensus_candidate_tickers(rows, 1), ["AAPL"])
 
     def test_reused_symbol_counts_only_post_listing_buyers(self):
         rows = pd.DataFrame(
@@ -1315,23 +1337,24 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "disclosure_date": pd.to_datetime(["2026-06-11", "2026-06-12"]),
             }
         )
-        self.assertEqual(candidate_tickers(rows, 2), [])
-        self.assertEqual(candidate_tickers(rows, 1), ["SPCX"])
+        self.assertEqual(_get_consensus_candidate_tickers(rows, 2), [])
+        self.assertEqual(_get_consensus_candidate_tickers(rows, 1), ["SPCX"])
 
     def test_aliases_wait_for_date_aware_price_mapping(self):
         rows = pd.DataFrame(
             {
-                "member": ["A"],
+                "member": ["Alice"],
                 "ticker": ["FB"],
                 "instrument_type": ["stock"],
                 "ticker_origin": ["official"],
                 "asset_description": ["Meta Platforms Common Stock [ST]"],
+                "transaction_type": ["Purchase"],
                 "transaction_date": pd.to_datetime(["2023-01-01"]),
             }
         )
-        self.assertEqual(candidate_tickers(rows, 1), [])
+        self.assertEqual(_get_consensus_candidate_tickers(rows, 1), ["FB"])
 
-    def test_unknown_instrument_abstains_but_normalized_stock_does_not_need_extra_metadata(self):
+    def test_missing_instrument_metadata_is_allowed_without_explicit_non_equity_evidence(self):
         rows = pd.DataFrame(
             {
                 "member": ["A", "B"],
@@ -1340,4 +1363,4 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "ticker_origin": ["official", None],
             }
         )
-        self.assertEqual(filter_equity_rows(rows)["ticker"].tolist(), ["MSFT"])
+        self.assertEqual(_filter_equity_rows(rows)["ticker"].tolist(), ["AAPL", "MSFT"])

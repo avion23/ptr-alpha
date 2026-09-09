@@ -14,6 +14,9 @@ from analyzer.member_ranking import score_ticker_by_buyers
 from optimize_profit.metrics import summarize_walk_forward
 
 
+_CUSTOM_SCORING_MODE = "shrunk_alpha"
+
+
 def _score_candidates(
     candidate_tickers,
     recent_trades,
@@ -37,17 +40,31 @@ def _score_candidates(
             member_rankings,
             min_buyers,
             ticker_perf_signals=ticker_perf_signals,
-            solo_buyer_skill_threshold=0.0,
             _ranking_dicts=custom_ranking_dicts,
+            scoring_mode=_CUSTOM_SCORING_MODE,
         )
         if score_df.empty:
             rejections.append(
                 {"stage": "candidate", "ticker": ticker, "reason": "empty_score"}
             )
             continue
+        if "fallback_source" in score_df:
+            fallback_source = str(score_df["fallback_source"].iloc[0])
+            if fallback_source != _CUSTOM_SCORING_MODE:
+                rejections.append(
+                    {
+                        "stage": "candidate",
+                        "ticker": ticker,
+                        "reason": "unexpected_fallback_source",
+                        "fallback_source": fallback_source,
+                    }
+                )
+                continue
         score = float(score_df["signal_score"].iloc[0])
         if not np.isfinite(score) or score <= 0:
-            reason = score_df.get("note", pd.Series(["non_positive_score"])).iloc[0]
+            reason = (
+                score_df["note"].iloc[0] if "note" in score_df else "non_positive_score"
+            )
             rejections.append(
                 {
                     "stage": "candidate",
@@ -260,6 +277,7 @@ def _build_custom_ranking_dicts(member_rankings, scoring_fn) -> dict:
         "trades": trades,
         "prob": probability,
         "has_shrunk": True,
+        "mode": _CUSTOM_SCORING_MODE,
     }
 
 

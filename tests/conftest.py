@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 import pandas as pd
 
 from analyzer.database import Database
+from analyzer.models import TickerOrigin
 
 
 def make_entry_prices(transactions_df, prices_df):
@@ -43,6 +44,40 @@ def make_entry_prices(transactions_df, prices_df):
         .rename(columns={"price": "entry_price"})
         .reset_index(drop=True)
     )
+
+
+def make_raw_trade(ingestion_generation, **overrides):
+    report_id = "37900303-65bf-467d-962b-76555d510b28"
+    report_path = f"/search/view/ptr/{report_id}/"
+    trade = {
+        "doc_id": report_id,
+        "source_record_id": report_id,
+        "source_row_id": "official:1",
+        "source_report_path": report_path,
+        "senator": "Katie Britt",
+        "filed_date": pd.Timestamp("2026-01-29"),
+        "official_filing_date": pd.Timestamp("2026-01-29"),
+        "available_date": pd.Timestamp("2026-01-29"),
+        "notification_date": "01/29/2026",
+        "amends_source_record_id": None,
+        "ticker": "JPM",
+        "ticker_raw": "JPM",
+        "ticker_candidate": None,
+        "ticker_origin": TickerOrigin.OFFICIAL.value,
+        "transaction_date": "01/28/2026",
+        "type": "Sale (Full)",
+        "transaction_subtype_raw": "Sale (Full)",
+        "owner": "SP",
+        "owner_raw": "Spouse",
+        "amount_range": "$1,001 - $15,000",
+        "amount_range_raw": "$1,001 - $15,000",
+        "asset_name": "JPMorgan Chase & Co. Common Stock",
+        "asset_type": "Stock",
+        "ingestion_generation": ingestion_generation,
+        "artifact_sha256": "a" * 64,
+    }
+    trade.update(overrides)
+    return trade
 
 
 class DatabaseTestCase(unittest.TestCase):

@@ -74,6 +74,7 @@ def test_custom_ranking_dicts_add_canonical_member_aliases():
         _ranking(), lambda frame: dict(zip(frame["member"], [9.0, 2.0, 1.0]))
     )
 
+    assert lookups["mode"] == "shrunk_alpha"
     assert lookups["alpha"][canonical_member_key("Nancy P. Pelosi")] == 9.0
     assert lookups["trades"][canonical_member_key("John Q. Public")] == 4
     assert lookups["prob"][canonical_member_key("Alice Example")] == 0.4
@@ -158,6 +159,93 @@ def test_candidate_failures_propagate_instead_of_being_swallowed():
                 pd.DataFrame(),
                 {"alpha": {}, "trades": {}, "prob": {}},
             )
+
+
+def test_unmocked_candidate_scoring_uses_causal_custom_historical_path():
+    recent_trades = pd.DataFrame(
+        {
+            "ticker": ["AAA", "AAA"],
+            "transaction_type": ["Purchase", "Purchase"],
+            "member": ["Nancy P. Pelosi", "John Q. Public"],
+            "disclosure_date": pd.to_datetime(["2024-06-01", "2024-06-15"]),
+        }
+    )
+    training = pd.DataFrame(
+        {
+            "ticker": ["HISTORICAL_ONLY"],
+            "disclosure_date": pd.to_datetime(["2024-05-01"]),
+        }
+    )
+    ranking = _ranking()
+    custom = _build_custom_ranking_dicts(ranking, score_constant)
+
+    scored, rejections = _score_candidates(
+        ["AAA"],
+        recent_trades,
+        training,
+        90,
+        5.0,
+        ranking,
+        2,
+        pd.DataFrame(),
+        custom,
+    )
+
+    assert rejections == []
+    assert len(scored) == 1
+    assert scored[0]["ticker"] == "AAA"
+    assert scored[0]["scoring_mode"] == "shrunk_alpha"
+    assert scored[0]["fallback_source"] == "shrunk_alpha"
+    assert scored[0]["signal_score"] == 1.0
+
+
+def test_unmocked_candidate_scoring_rejects_ticker_history_fallback():
+    recent_trades = pd.DataFrame(
+        {
+            "ticker": ["AAA"],
+            "transaction_type": ["Purchase"],
+            "member": ["Unranked Buyer"],
+            "disclosure_date": pd.to_datetime(["2024-06-15"]),
+        }
+    )
+    training = pd.DataFrame(
+        {
+            "ticker": ["HISTORICAL_ONLY"],
+            "disclosure_date": pd.to_datetime(["2024-05-01"]),
+        }
+    )
+    ticker_perf_signals = pd.DataFrame(
+        {
+            "ticker": ["AAA", "AAA", "AAA"],
+            "signal_type": ["Purchase", "Purchase", "Purchase"],
+            "total_spy_alpha_pct": [4.0, 5.0, 6.0],
+            "window_complete": [True, True, True],
+        }
+    )
+    ranking = _ranking()
+    custom = _build_custom_ranking_dicts(ranking, score_constant)
+
+    scored, rejections = _score_candidates(
+        ["AAA"],
+        recent_trades,
+        training,
+        90,
+        5.0,
+        ranking,
+        1,
+        ticker_perf_signals,
+        custom,
+    )
+
+    assert scored == []
+    assert rejections == [
+        {
+            "stage": "candidate",
+            "ticker": "AAA",
+            "reason": "unexpected_fallback_source",
+            "fallback_source": "ticker_hist(3)",
+        }
+    ]
 
 
 def test_each_decay_is_passed_to_signal_computation():

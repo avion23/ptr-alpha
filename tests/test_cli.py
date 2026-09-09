@@ -1,16 +1,16 @@
 """Smoke tests for analyzer.cli module."""
 
-import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 from typer.testing import CliRunner
 
-from analyzer.cli import _check_data_freshness, _load_sector_map, app
+from analyzer.cli import _CURRENT_YEAR, _check_data_freshness, _load_sector_map, app
 from analyzer.exceptions import StepResult
 
 
@@ -21,6 +21,18 @@ class TestCliApp(unittest.TestCase):
     def test_analyze_invalid_mode(self):
         result = self.runner.invoke(app, ["analyze", "--mode", "invalid_mode"])
         self.assertNotEqual(result.exit_code, 0)
+
+    def test_analyze_defaults_to_current_year(self):
+        context = MagicMock()
+        with (
+            patch("analyzer.cli.get_context", return_value=context),
+            patch("analyzer.cli._check_data_freshness"),
+            patch("analyzer.cli._run_analysis_mode") as run_analysis,
+        ):
+            result = self.runner.invoke(app, ["analyze"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run_analysis.call_args.args[1], _CURRENT_YEAR)
 
     def test_analyze_rejects_invalid_numeric_and_output_options_before_db_open(self):
         cases = [
@@ -187,14 +199,16 @@ class TestCliApp(unittest.TestCase):
         context.assert_not_called()
 
     def test_sector_map_loader_validates_deterministic_json(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sectors = Path(tmp) / "sectors.json"
-            sectors.write_text('{"AAPL": "Technology"}')
-            self.assertEqual(_load_sector_map(str(sectors)), {"AAPL": "Technology"})
-            bad = Path(tmp) / "bad.json"
-            bad.write_text('{"AAPL": ""}')
+        with TemporaryDirectory() as temp_dir:
+            sectors_path = Path(temp_dir) / "sectors.json"
+            sectors_path.write_text('{"AAPL": "Technology"}')
+            self.assertEqual(
+                _load_sector_map(str(sectors_path)), {"AAPL": "Technology"}
+            )
+            bad_path = Path(temp_dir) / "bad.json"
+            bad_path.write_text('{"AAPL": ""}')
             with self.assertRaisesRegex(ValueError, "blank ticker or sector"):
-                _load_sector_map(str(bad))
+                _load_sector_map(str(bad_path))
 
     def test_portfolio_fails_before_simulation_when_sector_ticker_missing(self):
         mock_ctx = MagicMock()
@@ -208,9 +222,9 @@ class TestCliApp(unittest.TestCase):
                 "as_of_date": [pd.Timestamp("2024-01-01")],
             }
         )
-        with tempfile.TemporaryDirectory() as tmp:
-            sectors = Path(tmp) / "sectors.json"
-            sectors.write_text('{"A": "Technology"}')
+        with TemporaryDirectory() as temp_dir:
+            sectors_path = Path(temp_dir) / "sectors.json"
+            sectors_path.write_text('{"A": "Technology"}')
             with (
                 patch("analyzer.cli.get_context", return_value=mock_ctx),
                 patch(
@@ -228,7 +242,7 @@ class TestCliApp(unittest.TestCase):
                         "--end",
                         "2024-02-01",
                         "--sector-map",
-                        str(sectors),
+                        str(sectors_path),
                     ],
                 )
         self.assertEqual(result.exit_code, 1, result.output)
@@ -246,7 +260,10 @@ class TestCliApp(unittest.TestCase):
                 "analyzer.cli.run_parse_pipeline",
                 return_value=StepResult(success=False),
             ),
-            patch("scripts.ocr_zero_rows.run_gemini_ocr_for_year", return_value=3),
+            patch(
+                "analyzer.cli._run_gemini_ocr_year_subprocess",
+                return_value=(3, None),
+            ),
         ):
             result = self.runner.invoke(app, ["parse", "--gemini-ocr"])
 
@@ -309,13 +326,21 @@ def test_data_freshness_reads_only_canonical_scope(capsys):
 
 
 def test_reconcile_blotter_reads_only_canonical_scope(monkeypatch):
-    from scripts import reconcile_blotter
+    with TemporaryDirectory() as temp_dir:
+        data_dir = Path(temp_dir) / "data"
+        data_dir.mkdir()
+        (data_dir / "congress.duckdb").touch()
+        monkeypatch.chdir(temp_dir)
 
-    connection = MagicMock()
-    connection.execute.return_value.fetchall.return_value = []
-    monkeypatch.setattr(reconcile_blotter.duckdb, "connect", lambda *a, **k: connection)
+        from scripts import reconcile_blotter
 
-    assert reconcile_blotter.get_congressional("AAPL") == []
-    query = connection.execute.call_args.args[0]
-    assert "canonical_transactions" in query
-    connection.close.assert_called_once()
+        connection = MagicMock()
+        connection.execute.return_value.fetchall.return_value = []
+        monkeypatch.setattr(
+            reconcile_blotter.duckdb, "connect", lambda *a, **k: connection
+        )
+
+        assert reconcile_blotter.get_congressional("AAPL") == []
+        query = connection.execute.call_args.args[0]
+        assert "canonical_transactions" in query
+        connection.close.assert_called_once()

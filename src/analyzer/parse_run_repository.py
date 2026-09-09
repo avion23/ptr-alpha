@@ -3,6 +3,19 @@ from __future__ import annotations
 import duckdb
 
 
+_TERMINAL_STATUSES = ("success", "no_txs")
+_TERMINAL_STATUS_PREDICATE = (
+    "status IN (" + ", ".join(f"'{status}'" for status in _TERMINAL_STATUSES) + ")"
+)
+_IDENTITY_PREDICATE = (
+    "doc_id = ? AND parser_version = ? "
+    "AND (artifact_sha256 = ? "
+    "OR (artifact_sha256 IS NULL AND ? IS NULL)) "
+    "AND (ingestion_generation = ? "
+    "OR (ingestion_generation IS NULL AND ? IS NULL))"
+)
+
+
 class ParseRunRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.conn = conn
@@ -22,32 +35,65 @@ class ParseRunRepository:
         ingestion_generation: str | None = None,
         _in_transaction: bool = False,
     ) -> None:
+        identity_params = [
+            doc_id,
+            parser_version,
+            artifact_sha256,
+            artifact_sha256,
+            ingestion_generation,
+            ingestion_generation,
+        ]
         if not _in_transaction:
             self.conn.execute("BEGIN TRANSACTION")
         try:
+            # A failed reparse must not erase the last terminal provenance for
+            # the same immutable artifact and generation.  The transaction
+            # rows are deliberately left untouched when a parse attempt
+            # fails, so replacing a prior success with ``error`` would leave
+            # persisted rows with no terminal run to bind them to.  A later
+            # terminal attempt is still allowed to replace a prior failure.
+            if status not in _TERMINAL_STATUSES:
+                terminal = self.conn.execute(
+                    f"""
+                    SELECT 1 FROM pdf_parse_runs
+                    WHERE {_IDENTITY_PREDICATE}
+                      AND {_TERMINAL_STATUS_PREDICATE}
+                    LIMIT 1
+                    """,
+                    identity_params,
+                ).fetchone()
+                if terminal:
+                    # Keep the historical one-row-per-identity shape even if
+                    # a legacy database already contains duplicate terminal
+                    # rows.  The newest terminal row is the one retained.
+                    self.conn.execute(
+                        f"""
+                        DELETE FROM pdf_parse_runs
+                        USING (
+                            SELECT rowid
+                            FROM pdf_parse_runs
+                            WHERE {_IDENTITY_PREDICATE}
+                              AND {_TERMINAL_STATUS_PREDICATE}
+                            QUALIFY row_number() OVER (
+                                ORDER BY parsed_at DESC NULLS LAST, rowid DESC
+                            ) > 1
+                        ) AS duplicates
+                        WHERE pdf_parse_runs.rowid = duplicates.rowid
+                        """,
+                        identity_params,
+                    )
+                    if not _in_transaction:
+                        self.conn.execute("COMMIT")
+                    return
+
             # Replace only this parser + artifact fingerprint. Prior artifact
             # generations and OCR provenance remain auditable.
             self.conn.execute(
-                """
+                f"""
                 DELETE FROM pdf_parse_runs
-                WHERE doc_id = ? AND parser_version = ?
-                  AND (
-                    artifact_sha256 = ?
-                    OR (artifact_sha256 IS NULL AND ? IS NULL)
-                  )
-                  AND (
-                    ingestion_generation = ?
-                    OR (ingestion_generation IS NULL AND ? IS NULL)
-                  )
+                WHERE {_IDENTITY_PREDICATE}
                 """,
-                [
-                    doc_id,
-                    parser_version,
-                    artifact_sha256,
-                    artifact_sha256,
-                    ingestion_generation,
-                    ingestion_generation,
-                ],
+                identity_params,
             )
             self.conn.execute(
                 """
@@ -87,11 +133,11 @@ class ParseRunRepository:
     ) -> set[str]:
         """Return terminal runs only when parser and artifact bytes match."""
         rows = self.conn.execute(
-            """
+            f"""
             SELECT doc_id, artifact_sha256 FROM pdf_parse_runs
             WHERE year = ? AND parser_version = ?
               AND ingestion_generation = ?
-              AND status IN ('success', 'no_txs')
+              AND {_TERMINAL_STATUS_PREDICATE}
             """,
             [year, parser_version, ingestion_generation],
         ).fetchall()

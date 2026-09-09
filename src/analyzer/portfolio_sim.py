@@ -76,7 +76,12 @@ class PortfolioValuationUnavailable(RuntimeError):
 class PortfolioSimulator:
     def __init__(self, config: PortfolioConfig):
         self.config = config
-        self.cash = config.initial_capital
+
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        """Start a run with fresh ledgers and accounting accumulators."""
+        self.cash = self.config.initial_capital
         self.positions: list[PortfolioPosition] = []
         self.pending_entries: list[PendingEntry] = []
         self.closed_positions: list[dict] = []
@@ -100,6 +105,7 @@ class PortfolioSimulator:
         if self.config.rebalance_freq_days < 1:
             raise ValueError("rebalance_freq_days must be positive")
 
+        self._reset_state()
         self._simulation_end_date = end_date
         recs = recommendations.copy()
         has_as_of = "as_of_date" in recs.columns

@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -354,6 +355,18 @@ class SnapshotManifestTests(unittest.TestCase):
         parquet = pd.read_parquet(self.out / "prices.parquet")
         self.assertEqual(len(parquet), 8)
         self.assertEqual(set(parquet.columns), {"ticker", "date", "close"})
+
+    def test_snapshot_reports_missing_parquet_engine(self):
+        self._seed()
+        self._close_db()
+        with patch.object(
+            pd.DataFrame,
+            "to_parquet",
+            side_effect=ImportError("pyarrow is unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "pyarrow Parquet engine"):
+                self._manifest()
+        self.assertFalse((self.out / "snapshot.json").exists())
 
     def test_data_hash_changes_when_prices_change(self):
         first = self._manifest()

@@ -8,15 +8,30 @@ import logging
 import numpy as np
 import pandas as pd
 
+from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
-from analyzer.candidates import candidate_tickers, eligible_candidate_rows
-from analyzer.models import AnalysisMode, TransactionType
-from analyzer.price_repository import next_nyse_session
+from analyzer.models import AnalysisMode
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
 from analyzer.ticker_resolver import TickerResolver
 from analyzer import analysis
+from analyzer.member_ranking.buyer_scoring import (
+    _get_consensus_candidate_tickers,
+    _get_consensus_ticker_purchases,
+)
 
 logger = logging.getLogger(__name__)
+
+_OFFICIAL_TRANSACTION_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
+
+
+def _analysis_transactions(transaction_source, year: int) -> pd.DataFrame:
+    """Read canonical official/legacy rows without chamber-specific filtering."""
+    trades = transaction_source.db.get_transactions(year)
+    if trades.empty or "source" not in trades.columns:
+        return trades
+    source = trades["source"]
+    return trades[source.isna() | source.isin(_OFFICIAL_TRANSACTION_SOURCES)].copy()
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,8 +96,8 @@ def pipeline_step(func):
 def prepare_analysis_data(
     transaction_source, price_source, year: int, horizons: tuple[int, ...]
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    trades = transaction_source.get_transactions(year)
-    logger.info("Loaded %d transactions for %d", len(trades), year)
+    trades = _analysis_transactions(transaction_source, year)
+    logger.info("Loaded %d canonical official transactions for %d", len(trades), year)
 
     if len(trades) == 0:
         raise DataSourceError("No trading data found")
@@ -119,9 +134,113 @@ def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
     return DataResult(success=True, data=None)
 
 
+def prepare_live_analysis_data(
+    transaction_source,
+    price_source,
+    horizons: tuple[int, ...],
+    as_of_date: pd.Timestamp,
+    training_lookback_days: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build live features from historical data available by ``as_of_date``."""
+    history_start = as_of_date - timedelta(days=training_lookback_days + max(horizons))
+    trades = transaction_source.db.get_transactions_by_date_range(
+        history_start,
+        as_of_date,
+    )
+    if trades.empty:
+        raise DataSourceError("No trading data found through as-of date")
+
+    disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
+    trades = trades[
+        trades["ticker"].notna()
+        & disclosure_dates.notna()
+        & (disclosure_dates <= as_of_date)
+    ].copy()
+    if trades.empty:
+        raise DataSourceError("No valid tickers found through as-of date")
+
+    price_start = history_start - timedelta(days=30)
+    prices = price_source.get_prices(
+        trades["ticker"].unique(),
+        price_start,
+        as_of_date,
+    )
+    entry_prices = transaction_source.db.get_entry_prices(
+        trades["ticker"].unique().tolist(),
+        price_start,
+        as_of_date,
+    )
+    signals = analysis.calculate_signal_potential(entry_prices, prices, horizons)
+
+    # Outcomes before the training boundary are needed only to cover their
+    # forward horizon; they must not influence member ranking themselves.
+    training_start = as_of_date - timedelta(days=training_lookback_days)
+    signal_dates = pd.to_datetime(signals["disclosure_date"], errors="coerce")
+    signals = signals[
+        (signal_dates >= training_start) & (signal_dates <= as_of_date)
+    ].copy()
+    return trades, prices, signals
+
+
+def prepare_live_consensus_data(
+    transaction_source,
+    as_of_date: pd.Timestamp,
+    days_back: int,
+    *,
+    history_lookback_days: int | None = None,
+) -> pd.DataFrame:
+    """Load only the public transactions needed for live consensus.
+
+    Consensus scoring is a transaction-count decision and does not use forward
+    price labels.  Keeping this path separate from
+    :func:`prepare_live_analysis_data` prevents a live recommendation from
+    acquiring prices (and therefore building labels) that it never consumes.
+    The date filtering is repeated after the repository query so mocked or
+    alternate transaction sources cannot make future disclosures visible.
+    """
+    as_of = pd.Timestamp(as_of_date).normalize()
+    query_lookback = (
+        history_lookback_days if history_lookback_days is not None else days_back
+    )
+    history_start = as_of - timedelta(days=query_lookback)
+    trades = transaction_source.db.get_transactions_by_date_range(history_start, as_of)
+    if trades.empty:
+        raise DataSourceError("No trading data found through as-of date")
+
+    disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
+    lower_bound = (
+        as_of - timedelta(days=days_back)
+        if history_lookback_days is None
+        else history_start
+    )
+    trades = trades[
+        trades["ticker"].notna()
+        & disclosure_dates.notna()
+        & (disclosure_dates >= lower_bound)
+        & (disclosure_dates <= as_of)
+    ].copy()
+    if trades.empty:
+        raise DataSourceError("No valid tickers found through as-of date")
+    return trades
+
+
 @pipeline_step
 def run_parse_pipeline(transaction_source, year: int) -> DataResult:
     transaction_source.parse_cached_pdfs(year)
+    generation_id = transaction_source.db.get_latest_house_generation(year)
+    if generation_id is None:
+        raise DataSourceError(
+            f"No acquired House generation exists for archive {year}"
+        )
+    unresolved = transaction_source.db.get_unresolved_house_doc_ids(
+        year, generation_id
+    )
+    if unresolved:
+        raise DataSourceError(
+            f"House archive {year} generation {generation_id} has "
+            f"{len(unresolved)} unresolved artifacts"
+        )
+    transaction_source.db.mark_house_generation_parse_complete(year, generation_id)
     logger.info("Successfully parsed PDFs for %d", year)
     return DataResult(success=True, data=None)
 
@@ -178,12 +297,10 @@ def run_sales_pipeline(
 
 
 def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
-    """Display known buyers without joining identity-based performance history."""
-    purchases = trades[
-        (trades["ticker"] == ticker)
-        & (trades["transaction_type"] == TransactionType.PURCHASE.value)
-        & trades["member"].notna()
-    ].copy()
+    """Display the same eligible buyers consumed by consensus scoring."""
+    purchases = _get_consensus_ticker_purchases(ticker, trades)
+    if "member" in purchases.columns:
+        purchases = purchases[purchases["member"].notna()].copy()
     if purchases.empty:
         return pd.DataFrame(
             columns=[
@@ -216,7 +333,7 @@ def run_ticker_analysis(
     if analysis_as_of.year != params.year:
         raise DataSourceError("year must match the ticker analysis as-of date year")
 
-    trades = transaction_source.get_transactions(params.year)
+    trades = _analysis_transactions(transaction_source, params.year)
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
     cutoff = analysis_as_of - timedelta(days=params.days_back)
     known_trades = trades[
@@ -224,7 +341,6 @@ def run_ticker_analysis(
         & (disclosure_dates >= cutoff)
         & (disclosure_dates <= analysis_as_of)
     ].copy()
-    known_trades = eligible_candidate_rows(known_trades)
 
     buyers = _consensus_buyers_table(params.ticker, known_trades)
     score = analysis.score_ticker_by_buyers(
@@ -257,22 +373,19 @@ def run_recent_ticker_scoring(
     if as_of_date.year != params.year:
         raise DataSourceError("year must match the as-of date year")
 
-    cutoff_date = as_of_date - timedelta(days=params.days_back)
-    recent_trades = transaction_source.db.get_transactions_by_date_range(
-        cutoff_date.date(), as_of_date.date()
+    recent_trades = prepare_live_consensus_data(
+        transaction_source, as_of_date, params.days_back
     )
-    raw_count = len(recent_trades)
-    recent_trades = eligible_candidate_rows(recent_trades)
     logger.info(
-        "Loaded %d disclosures from %s through %s; %d are eligible purchase rows",
-        raw_count,
-        cutoff_date.date(),
-        as_of_date.date(),
+        "Loaded %d disclosures from the last %d days",
         len(recent_trades),
+        params.days_back,
     )
 
-    tickers = candidate_tickers(recent_trades, params.min_buyers)
-    logger.info("Found %d tickers with %d+ distinct buyers", len(tickers), params.min_buyers)
+    tickers = _get_consensus_candidate_tickers(recent_trades, params.min_buyers)
+    logger.info(
+        "Found %d tickers with %d+ distinct buyers", len(tickers), params.min_buyers
+    )
 
     scores = [
         analysis.score_ticker_by_buyers(
@@ -327,15 +440,11 @@ def _entry_prices_from_matrix(
     if transactions.empty or prices.empty:
         return pd.DataFrame()
 
-    index = pd.DatetimeIndex(pd.to_datetime(prices.index))
-    if index.tz is not None:
-        index = index.tz_localize(None)
-    index = index.normalize()
-    if index.has_duplicates:
-        raise DataSourceError("Price matrix contains duplicate calendar dates")
-    matrix = prices.copy()
-    matrix.index = index
-    matrix = matrix.sort_index()
+    matrix = _normalize_price_index(
+        prices,
+        duplicate_error=DataSourceError,
+        duplicate_message="Price matrix contains duplicate calendar dates",
+    )
 
     eligible = transactions[
         transactions["ticker"].notna()
@@ -383,6 +492,131 @@ def _entry_prices_from_matrix(
     return pd.DataFrame(rows)
 
 
+def _benchmark_return(
+    prices: pd.DataFrame, as_of_date: pd.Timestamp, horizon: int
+) -> float | None:
+    """Return the executable SPY return for one scheduled backtest date.
+
+    Route benchmark calculations through the production evaluator so entry,
+    exit, session alignment, and slippage remain identical to recommendation
+    evaluation.  The direct import is only a compatibility fallback for
+    callers that replace the analysis facade in tests or integrations and
+    return a frame without the benchmark column.
+    """
+    recommendation = pd.DataFrame(
+        [
+            {
+                "rank": 1,
+                "ticker": "SPY",
+                "signal_score": 1.0,
+                "instrument_type": "stock",
+            }
+        ]
+    )
+    try:
+        evaluated = analysis.evaluate_backtest(
+            recommendation, prices, as_of_date, horizon
+        )
+    except (AnalyzerError, KeyError):
+        return None
+
+    value = _benchmark_value(evaluated)
+    if value is not None:
+        return value
+
+    # ``analysis.evaluate_backtest`` is a facade re-export.  Bypass a facade
+    # replacement only when it did not return the shared benchmark field; the
+    # normal production path above remains the single source of arithmetic.
+    try:
+        from analyzer.backtest.evaluate import evaluate_backtest
+
+        evaluated = evaluate_backtest(recommendation, prices, as_of_date, horizon)
+    except (AnalyzerError, KeyError, TypeError, ValueError):
+        return None
+    return _benchmark_value(evaluated)
+
+
+def _benchmark_value(evaluated: pd.DataFrame) -> float | None:
+    if evaluated.empty or "bt_spy_return_pct" not in evaluated.columns:
+        return None
+    value = evaluated["bt_spy_return_pct"].iloc[0]
+    return float(value) if pd.notna(value) else None
+
+
+def _cash_observation(
+    as_of_date: pd.Timestamp,
+    benchmark_return: float,
+    horizon: int,
+    *,
+    recommendation_count: int = 0,
+    reason: str = "no_recommendations",
+) -> dict:
+    """Build a zero-return observation for supported dates without a trade."""
+    entry_date = next_nyse_session(as_of_date)
+    exit_date = previous_nyse_session(entry_date + timedelta(days=horizon))
+    return {
+        "as_of_date": as_of_date.date(),
+        "rank": None,
+        "ticker": None,
+        "num_buyers": 0,
+        "signal_score": 0.0,
+        "recommendation_count": recommendation_count,
+        "evaluable_recommendation_count": 0,
+        "status": "cash",
+        "reason": reason,
+        "benchmark_status": "available",
+        "benchmark_supported": True,
+        "cash_observation": True,
+        "traded": False,
+        "strategy_return_pct": 0.0,
+        "portfolio_return_pct": 0.0,
+        "spy_return_pct": benchmark_return,
+        "net_alpha_pct": -benchmark_return,
+        "bt_entry_date": entry_date.date(),
+        "bt_exit_date": exit_date.date(),
+        "bt_entry_price": np.nan,
+        "bt_exit_price": np.nan,
+        "bt_raw_return_pct": 0.0,
+        "bt_return_pct": 0.0,
+        "bt_leverage": 1.0,
+        "bt_spy_return_pct": benchmark_return,
+        "bt_alpha_pct": -benchmark_return,
+        "bt_horizon_days": horizon,
+        "bt_entry_delay": (entry_date - as_of_date).days,
+        "bt_delisted": False,
+        "bt_coverage": "cash",
+        "bt_unavailable_reason": None,
+        "bt_stale_exit": False,
+    }
+
+
+def _date_observation(
+    as_of_date: pd.Timestamp,
+    benchmark_return: float,
+    strategy_return: float,
+    recommendation_count: int,
+    evaluable_recommendation_count: int,
+    *,
+    status: str,
+    reason: str | None = None,
+) -> dict:
+    """Build the one-row-per-supported-date backtest accounting record."""
+    return {
+        "as_of_date": as_of_date.date(),
+        "strategy_return_pct": strategy_return,
+        "portfolio_return_pct": strategy_return,
+        "spy_return_pct": benchmark_return,
+        "net_alpha_pct": strategy_return - benchmark_return,
+        "recommendation_count": recommendation_count,
+        "evaluable_recommendation_count": evaluable_recommendation_count,
+        "status": status,
+        "reason": reason,
+        "benchmark_status": "available",
+        "benchmark_supported": True,
+        "traded": status == "invested",
+    }
+
+
 @pipeline_step
 def run_backtest_pipeline(
     params: BacktestParams,
@@ -402,7 +636,9 @@ def run_backtest_pipeline(
 
     price_start = params.start_date
     price_end = params.end_date + timedelta(days=params.horizon + 10)
-    all_tickers = sorted(set(candidate_tickers(all_transactions, 1)) | {"SPY"})
+    all_tickers = sorted(
+        set(_get_consensus_candidate_tickers(all_transactions, 1)) | {"SPY"}
+    )
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)
 
@@ -428,6 +664,7 @@ def run_backtest_pipeline(
     )
 
     all_results = []
+    date_observations = []
     # Finding 1 fix: accumulate per-date attrs counts explicitly because
     # pd.concat of DataFrames with differing .attrs yields attrs={} in
     # pandas 3.x.  We sum here and set them on the combined frame.
@@ -436,6 +673,14 @@ def run_backtest_pipeline(
     total_unavailable = 0
     for as_of in as_of_dates:
         as_of_ts = pd.Timestamp(as_of)
+
+        # A scheduled date belongs to the backtest support only when the same
+        # executable SPY window used by recommendation evaluation exists.
+        # Unsupported benchmark dates remain excluded; supported no-trade dates
+        # are represented explicitly as cash below.
+        benchmark_return = _benchmark_return(prices, as_of_ts, params.horizon)
+        if benchmark_return is None:
+            continue
 
         recs = analysis.backtest_recommendations(
             signals,
@@ -448,15 +693,111 @@ def run_backtest_pipeline(
         )
 
         if recs.empty:
+            date_observations.append(
+                _date_observation(
+                    as_of_ts,
+                    benchmark_return,
+                    0.0,
+                    0,
+                    0,
+                    status="cash",
+                    reason="no_recommendations",
+                )
+            )
+            all_results.append(
+                pd.DataFrame(
+                    [_cash_observation(as_of_ts, benchmark_return, params.horizon)]
+                )
+            )
             continue
 
         evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
         total_no_price += evaluated.attrs.get("n_no_price", 0)
         total_delisted += evaluated.attrs.get("n_delisted", 0)
         total_unavailable += evaluated.attrs.get("n_unavailable", 0)
-        evaluated = evaluated.dropna(subset=["bt_return_pct"])
-        evaluated.insert(0, "as_of_date", as_of_ts.date())
-        all_results.append(evaluated)
+        valid_evaluated = evaluated.dropna(subset=["bt_return_pct"]).copy()
+        if valid_evaluated.empty:
+            date_observations.append(
+                _date_observation(
+                    as_of_ts,
+                    benchmark_return,
+                    0.0,
+                    len(recs),
+                    0,
+                    status="cash",
+                    reason="no_evaluable_recommendations",
+                )
+            )
+            all_results.append(
+                pd.DataFrame(
+                    [
+                        _cash_observation(
+                            as_of_ts,
+                            benchmark_return,
+                            params.horizon,
+                            recommendation_count=len(recs),
+                            reason="no_evaluable_recommendations",
+                        )
+                    ]
+                )
+            )
+            continue
+        if len(valid_evaluated) != len(recs):
+            # Fail-closed: an incomplete funded basket cannot reallocate
+            # ex-post capital to measurable outcomes. Hold cash; report
+            # survivors nowhere for this date.
+            date_observations.append(
+                _date_observation(
+                    as_of_ts,
+                    benchmark_return,
+                    0.0,
+                    len(recs),
+                    len(valid_evaluated),
+                    status="cash",
+                    reason="incomplete_basket",
+                )
+            )
+            all_results.append(
+                pd.DataFrame(
+                    [
+                        _cash_observation(
+                            as_of_ts,
+                            benchmark_return,
+                            params.horizon,
+                            recommendation_count=len(recs),
+                            reason="incomplete_basket",
+                        )
+                    ]
+                )
+            )
+            continue
+
+        strategy_return = float(
+            pd.to_numeric(valid_evaluated["bt_return_pct"], errors="coerce").mean()
+        )
+        date_observations.append(
+            _date_observation(
+                as_of_ts,
+                benchmark_return,
+                strategy_return,
+                len(recs),
+                len(valid_evaluated),
+                status="invested",
+            )
+        )
+        valid_evaluated.insert(0, "as_of_date", as_of_ts.date())
+        valid_evaluated["recommendation_count"] = len(recs)
+        valid_evaluated["status"] = "invested"
+        valid_evaluated["reason"] = None
+        valid_evaluated["benchmark_status"] = "available"
+        valid_evaluated["benchmark_supported"] = True
+        valid_evaluated["cash_observation"] = False
+        valid_evaluated["traded"] = True
+        valid_evaluated["strategy_return_pct"] = strategy_return
+        valid_evaluated["portfolio_return_pct"] = strategy_return
+        valid_evaluated["spy_return_pct"] = benchmark_return
+        valid_evaluated["net_alpha_pct"] = strategy_return - benchmark_return
+        all_results.append(valid_evaluated)
 
     if not all_results:
         return DataResult(
@@ -467,6 +808,7 @@ def run_backtest_pipeline(
                 "snapshot": snapshot,
                 "evaluable_dates": 0,
                 "total_as_of_dates": len(as_of_dates),
+                "date_observations": pd.DataFrame(),
             },
         )
 
@@ -480,15 +822,24 @@ def run_backtest_pipeline(
     spy_prices = prices["SPY"] if "SPY" in prices.columns else None
     summary = analysis.summarize_backtest(combined, spy_prices)
 
-    valid_returns = combined.dropna(subset=["bt_return_pct"])
-    evaluable_dates = (
-        valid_returns["as_of_date"].nunique() if not valid_returns.empty else 0
-    )
-    total_as_of_dates = len(
-        pd.date_range(
-            params.start_date, params.end_date, freq=f"{params.frequency_days}D"
+    observations = pd.DataFrame(date_observations)
+    if not observations.empty:
+        summary.attrs["benchmark_supported_dates"] = len(observations)
+        summary.attrs["no_recommendation_dates"] = int(
+            (observations["status"] == "cash").sum()
         )
-    )
+        summary.attrs["mean_net_alpha_pct"] = round(
+            float(observations["net_alpha_pct"].mean()), 2
+        )
+        portfolio_rows = summary[summary["rank"] == "PORTFOLIO"]
+        if not portfolio_rows.empty:
+            portfolio_index = portfolio_rows.index[0]
+            summary.loc[portfolio_index, "count"] = len(observations)
+            summary.loc[portfolio_index, "recommendation_count"] = int(
+                observations["evaluable_recommendation_count"].sum()
+            )
+    evaluable_dates = len(observations)
+    total_as_of_dates = len(as_of_dates)
 
     return DataResult(
         success=True,
@@ -498,5 +849,6 @@ def run_backtest_pipeline(
             "snapshot": snapshot,
             "evaluable_dates": evaluable_dates,
             "total_as_of_dates": total_as_of_dates,
+            "date_observations": observations,
         },
     )

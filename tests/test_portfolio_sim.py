@@ -77,6 +77,47 @@ class TestPositionEntry(unittest.TestCase):
         max_value = cfg.initial_capital * cfg.max_position_pct
         self.assertLessEqual(pos.cost, max_value + 1.0)
 
+    def test_repeated_runs_reset_mutable_state(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+            hold_period_days=2,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
+        )
+        prices = _make_prices(["A"], "2024-01-01", "2024-01-10")
+        recommendations = _make_recs(["A"], "2024-01-01")
+        sim = PortfolioSimulator(cfg)
+
+        first = sim.run(recommendations, prices, date(2024, 1, 1), date(2024, 1, 10))
+        first_closed = list(sim.closed_positions)
+        first_gross = sim.gross_traded_notional
+        second = sim.run(recommendations, prices, date(2024, 1, 1), date(2024, 1, 10))
+
+        pd.testing.assert_frame_equal(first, second)
+        self.assertEqual(sim.closed_positions, first_closed)
+        self.assertEqual(sim.gross_traded_notional, first_gross)
+        self.assertEqual(len(sim.snapshots), len(first))
+
+    def test_run_does_not_mutate_recommendations(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            max_position_pct=1.0,
+            max_sector_pct=1.0,
+        )
+        prices = _make_prices(["A"], "2024-01-01", "2024-01-03")
+        recommendations = _make_recs(["A"], "2024-01-01")
+        original = recommendations.copy(deep=True)
+
+        PortfolioSimulator(cfg).run(
+            recommendations, prices, date(2024, 1, 1), date(2024, 1, 3)
+        )
+
+        pd.testing.assert_frame_equal(recommendations, original)
+
 
 class TestSectorConstraint(unittest.TestCase):
     def test_sector_constraint_respected(self):

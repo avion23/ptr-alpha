@@ -32,6 +32,7 @@ temp DB with ``scripts/snapshot_prices.py`` to produce a value-hashed manifest.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import re
@@ -39,6 +40,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -117,13 +119,11 @@ def refresh_end_date(today: date | None = None) -> date:
     return previous_nyse_session(today or date.today()).date()
 
 
-def _clean_asset(token: str) -> str | None:
-    if token is None:
+def _clean_asset(value: object) -> str | None:
+    asset = str(value).strip().upper() if value is not None else ""
+    if not asset or asset == "NAN":
         return None
-    token = str(token).strip().upper()
-    if not token or token == "NAN":
-        return None
-    return token
+    return asset
 
 
 def select_eligible_assets(
@@ -159,27 +159,28 @@ def select_eligible_assets(
         eligible.append(token)
     if include_benchmark and BENCHMARK_TICKER not in eligible:
         eligible.append(BENCHMARK_TICKER)
-    return sorted(eligible), {reason: sorted(tokens) for reason, tokens in excluded.items()}
+    return sorted(eligible), {
+        reason: sorted(tokens) for reason, tokens in excluded.items()
+    }
 
 
 def _verify_persisted_prices(db: Database, start: date, end: date) -> int:
     """Return the number of non-finite/non-positive rows in the temp DB within
     the refresh window. The price repository quarantines those on upsert, so a
     healthy refresh reports zero."""
-    rows = db.conn.execute(
+    row = db.conn.execute(
         """
         SELECT COUNT(*) FROM prices
         WHERE date BETWEEN ? AND ?
           AND (close <= 0 OR NOT isfinite(close))
         """,
         [start, end],
-    ).fetchone()[0]
-    return int(rows)
+    ).fetchone()
+    # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
+    return row[0] if row is not None else 0
 
 
-def _compute_staleness(
-    db: Database, end: date, max_staleness_days: int
-) -> list[str]:
+def _compute_staleness(db: Database, end: date, max_staleness_days: int) -> list[str]:
     """Tickers whose last close predates the window end by more than the
     staleness budget. Stale means unavailable for recent windows."""
     rows = db.conn.execute(
@@ -190,7 +191,9 @@ def _compute_staleness(
     stale = [
         str(ticker)
         for ticker, last_date in rows
-        if last_date is not None and (end - pd.Timestamp(last_date).date()).days > max_staleness_days
+        if last_date is not None
+        and (end - cast(pd.Timestamp, pd.Timestamp(last_date)).date()).days
+        > max_staleness_days
     ]
     return sorted(stale)
 
@@ -241,7 +244,7 @@ def refresh_prices(
     if pd.Timestamp(end) not in expected_sessions:
         raise ValueError(
             f"refresh end {end} is not a completed NYSE session; "
-            f"latest completed session is {expected_sessions[-1].date()}"
+            f"latest completed session is {cast(pd.Timestamp, expected_sessions[-1]).date()}"
         )
     if max_staleness_days < 0:
         raise ValueError("max_staleness_days must be non-negative")
@@ -280,11 +283,11 @@ def refresh_prices(
                 # genuinely unresolvable assets remain missing; retry each one
                 # individually so transient failures are recovered instead of
                 # aborting the refresh over a cluster of delisted assets.
-                for ticker in sorted(set(eligible) - _persisted_tickers(db, start, end)):
-                    try:
+                for ticker in sorted(
+                    set(eligible) - _persisted_tickers(db, start, end)
+                ):
+                    with contextlib.suppress(DataSourceError):
                         price_source.get_prices([ticker], start, end)
-                    except DataSourceError:
-                        pass
         finally:
             price_source.close()
         # Assets with no price history in the window (including those whose
@@ -300,9 +303,17 @@ def refresh_prices(
     resolved = [t for t in eligible if t in matrix.columns]
     unresolved = sorted(set(eligible) - set(matrix.columns))
     first_date = (
-        str(matrix.index.min().date()) if not matrix.empty else ""
+        str(cast(pd.Timestamp, matrix.index.min()).date()) if not matrix.empty else ""
     )
-    last_date = str(matrix.index.max().date()) if not matrix.empty else ""
+    last_date = (
+        str(cast(pd.Timestamp, matrix.index.max()).date()) if not matrix.empty else ""
+    )
+    # np.int64 -> python int for the JSON-serializable report; fail closed on
+    # any non-integer total rather than emitting a corrupted report.
+    try:
+        price_rows_total = int(matrix.notna().sum().sum())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("non-integer price row total from price matrix") from exc
 
     return RefreshReport(
         generation="",
@@ -316,7 +327,7 @@ def refresh_prices(
         resolved_tickers=len(resolved),
         unresolved_tickers=unresolved,
         unavailable_tickers=unavailable,
-        price_rows=int(matrix.notna().sum().sum()),
+        price_rows=price_rows_total,
         rejected_observations=rejected,
         first_date=first_date,
         last_date=last_date,
@@ -330,13 +341,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Refresh eligible asset prices into a throwaway temp database"
     )
-    parser.add_argument("--source-db", required=True, type=Path, help="read-only transactions source DB")
-    parser.add_argument("--db", required=True, type=Path, help="temp output DB (must not exist)")
+    parser.add_argument(
+        "--source-db", required=True, type=Path, help="read-only transactions source DB"
+    )
+    parser.add_argument(
+        "--db", required=True, type=Path, help="temp output DB (must not exist)"
+    )
     parser.add_argument("--start", type=date.fromisoformat, default=DEFAULT_PRICE_START)
-    parser.add_argument("--end", type=date.fromisoformat, default=None, help="defaults to the latest completed NYSE session")
-    parser.add_argument("--max-staleness-days", type=int, default=DEFAULT_MAX_STALENESS_DAYS)
-    parser.add_argument("--report", type=Path, default=None, help="write the JSON refresh report here")
-    parser.add_argument("--force", action="store_true", help="overwrite an existing temp DB")
+    parser.add_argument(
+        "--end",
+        type=date.fromisoformat,
+        default=None,
+        help="defaults to the latest completed NYSE session",
+    )
+    parser.add_argument(
+        "--max-staleness-days", type=int, default=DEFAULT_MAX_STALENESS_DAYS
+    )
+    parser.add_argument(
+        "--report", type=Path, default=None, help="write the JSON refresh report here"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="overwrite an existing temp DB"
+    )
     args = parser.parse_args(argv)
 
     try:

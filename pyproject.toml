@@ -9,12 +9,13 @@ description = "Congressional PTR disclosure analysis tool"
 requires-python = ">=3.11"
 dependencies = [
     "pandas",
+    "pyarrow",
     "numpy",
     "scipy",
     "requests",
     "requests-cache",
     "yfinance",
-    "camelot-py[cv]",
+    "camelot-py",
     "pdfplumber>=0.11",
     "pytesseract",
     "pdf2image",

@@ -21,15 +21,34 @@ def summarize_backtest(
     buy/hold return can be computed from a supplied price series over the full
     bounded period. Repeated per-recommendation SPY windows are never relabeled
     as buy-and-hold.
+
+    Causal missing-outcome policy: capital is committed equally per rebalance
+    date ex ante. A funded basket is complete only when every recommendation
+    on that date has a measurable bt_return_pct. Incomplete baskets contribute
+    no funded period return and are never reweighted to survivors. Rows without
+    an attributable as_of_date are incomplete for the same reason.
     """
     n_no_price = results.attrs.get("n_no_price", 0)
     n_delisted = results.attrs.get("n_delisted", 0)
     n_unavailable = results.attrs.get("n_unavailable", 0)
-    valid = results.dropna(subset=["bt_return_pct"]).copy()
+    complete, n_incomplete_periods, n_incomplete_rows = _complete_funded_frame(
+        results
+    )
+    valid = complete.dropna(subset=["bt_return_pct"]).copy()
     if valid.empty:
-        summary = _with_coverage(pd.DataFrame(), n_no_price, n_delisted, n_unavailable)
+        summary = _with_coverage(
+            pd.DataFrame(),
+            n_no_price,
+            n_delisted,
+            n_unavailable,
+            n_incomplete_periods,
+            n_incomplete_rows,
+        )
         summary.attrs["spy_benchmark_status"] = "omitted"
-        summary.attrs["spy_benchmark_reason"] = "no_valid_returns"
+        if n_incomplete_periods > 0:
+            summary.attrs["spy_benchmark_reason"] = "incomplete_basket"
+        else:
+            summary.attrs["spy_benchmark_reason"] = "no_valid_returns"
         return summary
 
     periods = _funded_period_returns(valid)
@@ -73,12 +92,52 @@ def summarize_backtest(
             }
         )
 
-    summary = _with_coverage(pd.DataFrame(rows), n_no_price, n_delisted, n_unavailable)
+    summary = _with_coverage(
+        pd.DataFrame(rows),
+        n_no_price,
+        n_delisted,
+        n_unavailable,
+        n_incomplete_periods,
+        n_incomplete_rows,
+    )
     summary.attrs["spy_benchmark_status"] = (
         "available" if spy_return is not None else "omitted"
     )
     summary.attrs["spy_benchmark_reason"] = benchmark_reason
     return summary
+
+
+def _complete_funded_frame(
+    results: pd.DataFrame,
+) -> tuple[pd.DataFrame, int, int]:
+    """Split funded rows into complete baskets and incomplete-basket counts.
+
+    A basket is one rebalance date (as_of_date) when present, else one row.
+    Incomplete baskets hold at least one missing bt_return_pct or a missing
+    date key. Callers must average only the complete frame.
+    """
+    if results.empty:
+        return results.iloc[0:0].copy(), 0, 0
+    if "bt_return_pct" not in results.columns:
+        return results.iloc[0:0].copy(), 0, len(results)
+    measurable = pd.to_numeric(results["bt_return_pct"], errors="coerce").notna()
+    if "as_of_date" not in results.columns:
+        incomplete = ~measurable
+        return (
+            results.loc[measurable].copy(),
+            int(incomplete.sum()),
+            int(incomplete.sum()),
+        )
+    dated = results["as_of_date"].notna()
+    n_undated = int((~dated).sum())
+    incomplete_dates = set(results.loc[dated & ~measurable, "as_of_date"].tolist())
+    if not incomplete_dates and n_undated == 0:
+        return results.loc[dated & measurable].copy(), 0, 0
+    complete_mask = dated & measurable & ~results["as_of_date"].isin(incomplete_dates)
+    complete = results.loc[complete_mask].copy()
+    incomplete_rows = int((~complete_mask).sum())
+    n_incomplete_periods = len(incomplete_dates) + (1 if n_undated > 0 else 0)
+    return complete, n_incomplete_periods, incomplete_rows
 
 
 def _funded_period_returns(valid: pd.DataFrame) -> pd.DataFrame:
@@ -212,8 +271,12 @@ def _with_coverage(
     n_no_price: int,
     n_delisted: int,
     n_unavailable: int,
+    n_incomplete_periods: int = 0,
+    n_incomplete_rows: int = 0,
 ) -> pd.DataFrame:
     summary.attrs["n_no_price"] = n_no_price
     summary.attrs["n_delisted"] = n_delisted
     summary.attrs["n_unavailable"] = n_unavailable
+    summary.attrs["n_incomplete_periods"] = n_incomplete_periods
+    summary.attrs["n_incomplete_rows"] = n_incomplete_rows
     return summary

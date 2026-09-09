@@ -108,7 +108,7 @@ def build_fixture_db(
                 )
                 doc += 1
         day += timedelta(days=21)
-    db.upsert_transactions(pd.DataFrame(rows), source="senate")
+    db.upsert_transactions(pd.DataFrame(rows), source="senate_efd")
     db.close()
     return db_path
 

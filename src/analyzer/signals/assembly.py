@@ -148,13 +148,18 @@ def _build_result_data(
 ) -> dict:
     complete = result_arrays["r_window_complete"]
     r_decayed_ret = np.where(complete, result_arrays["r_decayed_ret"], np.nan)
+    # Displayed entry is the executable next-session baseline used for
+    # outcomes (core sets r_disc_baseline at the next NYSE session entry),
+    # never the stale repo input. Missing entries stay NaN so the quality
+    # gate drops them.
+    executable_entry = np.asarray(result_arrays["r_disc_baseline"], dtype=np.float64)
     result_data = {
         "member": signals["member"].values,
         "ticker": metadata["ticker_arr"],
         "disclosure_date": signals["disclosure_date"].values,
         "signal_type": metadata["txn_types"],
         "horizon_days": metadata["horizon_days_arr"],
-        "entry_price": metadata["entry_prices_arr"],
+        "entry_price": executable_entry,
         "label_entry_date": result_arrays["r_entry_date"],
         "label_exit_date": result_arrays["r_exit_date"],
         "label_window_end": result_arrays["r_label_window_end"],

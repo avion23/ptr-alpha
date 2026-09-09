@@ -38,6 +38,7 @@ AMOUNT_MIDPOINTS = {
     "H": 15000000,
     "I": 37500000,
     "J": 50000000,
+    "K": 1000000,
 }
 
 PROMPT = """This is a US House Periodic Transaction Report (PTR). The first data row may be an EXAMPLE labeled "Example: Mega Corp. Common Stock"; skip it. Extract every real transaction from every page.

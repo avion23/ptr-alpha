@@ -1,37 +1,45 @@
 #!/usr/bin/env python3
 
 import json
-import sys
 import logging
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from dataclasses import dataclass
+from typing import cast
+
 import pandas as pd
 import typer
 
-from analyzer.pipeline import (
-    run_parse_pipeline,
-    run_analysis_pipeline,
-    run_sales_pipeline,
-    run_ticker_analysis,
-    run_recent_ticker_scoring,
-    run_backtest_pipeline,
-    AnalysisParams,
-    TickerAnalysisParams,
-    TickerScoringParams,
-    BacktestParams,
-)
-from analyzer.price_snapshot import create_snapshot, save_snapshot
-from analyzer.candidates import candidate_tickers
-from analyzer.exceptions import AnalyzerError
-from analyzer.settings import Settings
+from analyzer.member_ranking.buyer_scoring import _get_consensus_candidate_tickers
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
-from analyzer.price_source import YFinancePriceSource
+from analyzer.exceptions import AnalyzerError, DataSourceError
 from analyzer.models import AnalysisMode
+from analyzer.pipeline import (
+    AnalysisParams,
+    BacktestParams,
+    TickerAnalysisParams,
+    TickerScoringParams,
+    run_analysis_pipeline,
+    run_backtest_pipeline,
+    run_parse_pipeline,
+    run_recent_ticker_scoring,
+    run_sales_pipeline,
+    run_ticker_analysis,
+)
+from analyzer.price_snapshot import create_snapshot, save_snapshot
+from analyzer.price_source import YFinancePriceSource
+from analyzer.settings import Settings
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 logger = logging.getLogger(__name__)
+# Bulk CLI parsing never shells out to Docling (multi-GB model workers per
+# zero-row PDF); scripts that want it opt in by unsetting this.
+os.environ.setdefault("PTR_SKIP_DOCLING", "1")
 _CURRENT_YEAR = date.today().year
 _HOUSE_PTR_FIRST_ARCHIVE_YEAR = 2015
 _HOUSE_LEGACY_FIRST_ARCHIVE_YEAR = 2008
@@ -194,9 +202,10 @@ def _validate_output(output: str) -> None:
 def _check_data_freshness(app_ctx: AppContext) -> None:
     """Warn if transaction data looks stale."""
     try:
-        _max_date = app_ctx.transaction_source.db.conn.execute(
+        _row = app_ctx.transaction_source.db.conn.execute(
             "SELECT MAX(disclosure_date) FROM canonical_transactions"
-        ).fetchone()[0]
+        ).fetchone()
+        _max_date = _row[0] if _row is not None else None
         if _max_date:
             _age = (date.today() - _max_date).days
             if _age > 30:
@@ -362,7 +371,7 @@ def _run_analysis_mode(
 @app.command()
 def analyze(
     ctx: typer.Context,
-    year: int = typer.Option(2025, help="Year to process"),
+    year: int = typer.Option(_CURRENT_YEAR, help="Year to process"),
     mode: str = typer.Option(
         "ranks",
         help="Output mode: ranks | signals | member | sales | tickers",
@@ -410,7 +419,7 @@ def analyze(
         as_of_date = date.fromisoformat(as_of) if as_of else None
     except ValueError:
         print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     app_ctx = get_context(ctx, data_dir, read_only=True)
     _check_data_freshness(app_ctx)
 
@@ -480,6 +489,115 @@ def fetch(
     raise typer.Exit(0)
 
 
+def _activate_house_generation(transaction_source, year: int) -> None:
+    """Verify all artifacts parsed and activate the latest generation.
+
+    Raises DataSourceError when no generation exists or artifacts remain
+    unresolved, leaving the generation incomplete and new rows hidden
+    from canonical reads.
+    """
+    generation_id = transaction_source.db.get_latest_house_generation(year)
+    if generation_id is None:
+        raise DataSourceError(
+            f"No acquired House generation exists for archive {year}"
+        )
+    unresolved = transaction_source.db.get_unresolved_house_doc_ids(
+        year, generation_id
+    )
+    if unresolved:
+        raise DataSourceError(
+            f"House archive {year} generation {generation_id} has "
+            f"{len(unresolved)} unresolved artifacts"
+        )
+    transaction_source.db.mark_house_generation_parse_complete(year, generation_id)
+
+
+def _release_parent_db_for_ocr(app_ctx: AppContext) -> Path | None:
+    """Checkpoint and close parent DuckDB handles so OCR can open the file.
+
+    Returns the database path when a real parent handle was released, else
+    None (test doubles hold no file lock). Both sources share one handle via
+    get_context; close each distinct real handle once.
+    """
+    owners = (
+        getattr(app_ctx, "transaction_source", None),
+        getattr(app_ctx, "price_source", None),
+    )
+    seen: list = []
+    for owner in owners:
+        db = getattr(owner, "db", None)
+        if isinstance(db, Database) and not any(db is prior for prior in seen):
+            seen.append(db)
+    if not seen:
+        return None
+    db_path = Path(seen[0].db_path)
+    for db in seen:
+        try:
+            db.conn.execute("CHECKPOINT")
+        except Exception:
+            logger.debug("Pre-OCR checkpoint failed", exc_info=True)
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Pre-OCR parent close failed", exc_info=True)
+    return db_path
+
+
+def _reacquire_parent_db_after_ocr(
+    app_ctx: AppContext, db_path: Path | None
+) -> None:
+    """Reopen the parent handle after isolated OCR finishes."""
+    if db_path is None:
+        return
+    fresh: Database | None = None
+    for owner in (
+        getattr(app_ctx, "transaction_source", None),
+        getattr(app_ctx, "price_source", None),
+    ):
+        if owner is None:
+            continue
+        if not isinstance(getattr(owner, "db", None), Database):
+            continue
+        if fresh is None:
+            fresh = Database(db_path, read_only=False)
+        owner.db = fresh
+
+
+def _run_gemini_ocr_year_subprocess(
+    data_dir: str | Path, year: int, *, timeout: int = 7200
+) -> tuple[int, str | None]:
+    """Run one year's OCR in a child interpreter without the parent lock.
+
+    Returns (inserted, failure_reason|None). The child prints
+    ``Total inserted: N`` on success, matching the standalone entrypoint
+    pattern; the parent holds no DuckDB handle while it runs.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    ocr_code = (
+        "import sys;"
+        f"sys.path.insert(0, {str(repo_root)!r});"
+        "from scripts.ocr_zero_rows import run_gemini_ocr_for_year;"
+        f"inserted = run_gemini_ocr_for_year({int(year)}, data_dir={str(data_dir)!r});"
+        "print(f'Total inserted: {inserted}')"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", ocr_code],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 0, "timeout"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout)[-500:]
+        return 0, f"exit {proc.returncode}: {detail}"
+    match = re.search(r"Total inserted:\s*(\d+)", proc.stdout)
+    if match is None:
+        return 0, f"missing Total inserted in output: {(proc.stdout or '')[-500:]}"
+    return int(match.group(1)), None
+
+
 @app.command()
 def parse(
     ctx: typer.Context,
@@ -502,6 +620,7 @@ def parse(
     try:
         if force_full_reparse:
             app_ctx.transaction_source.parse_cached_pdfs(year, force=True)
+            _activate_house_generation(app_ctx.transaction_source, year)
             parse_success = True
         else:
             result = run_parse_pipeline(app_ctx.transaction_source, year)
@@ -510,11 +629,24 @@ def parse(
         logger.exception("Parse pipeline failed")
     ocr_inserted = 0
     if use_gemini_ocr:
-        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-
-        ocr_inserted = run_gemini_ocr_for_year(
-            year, data_dir=app_ctx.settings.data.data_dir
-        )
+        db_path = _release_parent_db_for_ocr(app_ctx)
+        try:
+            ocr_inserted, ocr_error = _run_gemini_ocr_year_subprocess(
+                app_ctx.settings.data.data_dir, year
+            )
+            if ocr_error is not None:
+                logger.warning("Gemini OCR failed for %d: %s", year, ocr_error)
+                ocr_inserted = 0
+            else:
+                print(f"  Gemini OCR {year}: {ocr_inserted} transactions inserted")
+        finally:
+            _reacquire_parent_db_after_ocr(app_ctx, db_path)
+    if use_gemini_ocr and ocr_inserted > 0 and not parse_success:
+        try:
+            _activate_house_generation(app_ctx.transaction_source, year)
+            parse_success = True
+        except Exception:
+            logger.exception("Post-OCR generation activation failed")
     if not parse_success and use_gemini_ocr and ocr_inserted > 0:
         logger.warning(
             "Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted
@@ -560,7 +692,7 @@ def backtest(
         end_date = date.fromisoformat(end)
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     if end_date < start_date:
         print("Error: --end must be on or after --start", file=sys.stderr)
@@ -635,12 +767,22 @@ def backtest(
                 detail = f" ({benchmark_reason})" if benchmark_reason else ""
                 print(f"SPY buy/hold benchmark: {benchmark_status}{detail}")
 
-            valid_returns = combined.dropna(subset=["bt_return_pct"])
+            observations = data.get("date_observations", pd.DataFrame())
+            recommendations = (
+                int(observations["recommendation_count"].sum())
+                if "recommendation_count" in observations.columns
+                else 0
+            )
+            evaluable = (
+                int(observations["evaluable_recommendation_count"].sum())
+                if "evaluable_recommendation_count" in observations.columns
+                else 0
+            )
             print(
                 f"\nDates evaluated: {data.get('evaluable_dates', 0)}/{data.get('total_as_of_dates', 0)}"
             )
             print(
-                f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}"
+                f"Recommendations issued: {recommendations}; individually evaluable: {evaluable}"
             )
         else:
             print("\n=== No backtest results produced ===")
@@ -698,12 +840,13 @@ def portfolio(
         sector_by_ticker = _load_sector_map(sector_map)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
-    from analyzer.portfolio_sim import PortfolioSimulator, PortfolioConfig
     from datetime import timedelta
+
+    from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
 
     tx_start = start_date - timedelta(days=lookback_days)
     all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(
@@ -805,7 +948,7 @@ def _parse_sim_dates(start: str, end: str) -> tuple[date, date]:
         end_date = date.fromisoformat(end)
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     if end_date < start_date:
         print("Error: --end must be on or after --start", file=sys.stderr)
@@ -827,7 +970,9 @@ def _load_portfolio_inputs(
     """Load execution prices and consensus recommendations."""
     from analyzer import analysis
 
-    all_tickers = sorted(set(candidate_tickers(all_transactions, 1)) | {"SPY"})
+    all_tickers = sorted(
+        set(_get_consensus_candidate_tickers(all_transactions, 1)) | {"SPY"}
+    )
     prices = app_ctx.transaction_source.db.get_prices(
         all_tickers, start_date, end_date
     )
@@ -838,10 +983,11 @@ def _load_portfolio_inputs(
     as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency_days}D")
     all_recs = []
     for as_of in as_of_dates:
+        # date_range never yields NaT; narrow the stubs' union explicitly.
         recs = analysis.backtest_recommendations(
             pd.DataFrame(),
             all_transactions,
-            pd.Timestamp(as_of),
+            cast(pd.Timestamp, pd.Timestamp(as_of)),
             lookback_days=lookback_days,
             min_buyers=min_buyers,
             top_n=top_n,
@@ -1058,9 +1204,7 @@ def refresh(
             summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
                 archive_year,
                 refresh_metadata=(
-                    all_years
-                    or refresh_metadata
-                    or archive_year == date.today().year
+                    all_years or refresh_metadata or archive_year == date.today().year
                 ),
             )
             summaries.append(summary)
@@ -1087,9 +1231,7 @@ def refresh(
     for archive_year in archive_years:
         try:
             if force_full_reparse:
-                app_ctx.transaction_source.parse_cached_pdfs(
-                    archive_year, force=True
-                )
+                app_ctx.transaction_source.parse_cached_pdfs(archive_year, force=True)
             else:
                 parse_result = run_parse_pipeline(
                     app_ctx.transaction_source, archive_year
@@ -1112,21 +1254,27 @@ def refresh(
 
     if use_gemini_ocr:
         print("[4/4] Running Gemini OCR on zero-row PDFs...")
-        from scripts.ocr_zero_rows import run_gemini_ocr_for_year
-
-        for archive_year in archive_years:
-            try:
-                ocr_inserted = run_gemini_ocr_for_year(
-                    archive_year,
-                    data_dir=app_ctx.settings.data.data_dir,
+        # The OCR helper opens its own DuckDB handles. A held parent handle
+        # causes a same-process ConnectionException (different config) or a
+        # child-process lock conflict, so release it and reuse the isolated-
+        # subprocess pattern of the standalone entrypoint for every year.
+        db_path = _release_parent_db_for_ocr(app_ctx)
+        try:
+            for archive_year in archive_years:
+                inserted, ocr_error = _run_gemini_ocr_year_subprocess(
+                    app_ctx.settings.data.data_dir, archive_year
                 )
+                if ocr_error is not None:
+                    failed_steps.append(f"gemini_ocr:{archive_year}")
+                    logger.warning(
+                        "Gemini OCR failed for %d: %s", archive_year, ocr_error
+                    )
+                    continue
                 print(
-                    f"  Gemini OCR {archive_year}: "
-                    f"{ocr_inserted} transactions inserted"
+                    f"  Gemini OCR {archive_year}: {inserted} transactions inserted"
                 )
-            except Exception as exc:
-                failed_steps.append(f"gemini_ocr:{archive_year}")
-                logger.warning("Gemini OCR failed for %d: %s", archive_year, exc)
+        finally:
+            _reacquire_parent_db_after_ocr(app_ctx, db_path)
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 
@@ -1232,7 +1380,7 @@ def fetch_capitol(
         end_date = date.fromisoformat(end) if end else None
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     if start_date is not None and end_date is not None and end_date < start_date:
         print("Error: --end must be on or after --start", file=sys.stderr)
         raise typer.Exit(1)
@@ -1251,7 +1399,7 @@ def fetch_capitol(
             capitol.close()
     except CapitolTradesError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     print(f"Wrote {len(df)} reconciliation records to {output}")
     print("No canonical transactions were saved.")
@@ -1271,15 +1419,17 @@ def fetch_senate_efd(
         None, help="If set, look back N days from end (overrides --start)"
     ),
     data_dir: str = typer.Option(
-        "data/senate", help="Data directory (default: isolated senate DB)"
+        "data", help="Data directory for the canonical congressional database"
     ),
 ):
     """Fetch Senate PTR trades from efdsearch.senate.gov (official source).
 
-    Loads into an isolated data directory so chamber separation is exact.
-    Then run: ptr-alpha analyze --year <YYYY> --data-dir data/senate
+    Senate rows are persisted in the canonical congressional DuckDB; source and
+    chamber identity keep Senate refreshes isolated from House rows.
     """
-    from datetime import timedelta
+    from datetime import datetime, timedelta, timezone
+    from uuid import uuid4
+
     from analyzer.senate_efd import SenateEFDSource
 
     try:
@@ -1296,13 +1446,20 @@ def fetch_senate_efd(
             )
     except ValueError:
         print("Error: dates must be YYYY-MM-DD and lookback > 0", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     if start_date > end_date:
         print("Error: --start must be on or before --end", file=sys.stderr)
         raise typer.Exit(1)
 
-    src = SenateEFDSource(data_dir=data_dir, read_only=False)
+    ingestion_generation = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid4().hex[:12]
+    )
+    src = SenateEFDSource(
+        data_dir=data_dir,
+        read_only=False,
+        ingestion_generation=ingestion_generation,
+    )
     try:
         count = src.fetch_and_save_all(start_date, end_date)
         print(
@@ -1382,7 +1539,7 @@ def validate(
         ve = date.fromisoformat(test_end)
     except ValueError:
         print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     if te < ts:
         print("Error: --train-end must be on or after --train-start", file=sys.stderr)
@@ -1429,7 +1586,7 @@ def validate(
         )
     except Exception:
         logger.exception("Validation failed")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     raise typer.Exit(0)
 
 
@@ -1438,14 +1595,14 @@ def main():
         app()
     except AnalyzerError as e:
         print(f"Error: {e}", file=sys.stderr)
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     except KeyboardInterrupt:
         print("\nOperation cancelled by user", file=sys.stderr)
-        raise typer.Exit(130)
+        raise typer.Exit(130) from None
     except Exception as e:
         logger = logging.getLogger(__name__)
         logger.exception(f"Unexpected error: {e}")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
 
 if __name__ == "__main__":

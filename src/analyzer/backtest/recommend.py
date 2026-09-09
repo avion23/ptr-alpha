@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import pandas as pd
 
-from analyzer.candidates import candidate_tickers, eligible_candidate_rows, filter_equity_rows
 from analyzer.backtest.filters import (
     _filter_recent_trades,
     _filter_ticker_perf,
@@ -22,6 +21,10 @@ from analyzer.member_ranking import (
     _build_ranking_dicts,
     rank_members,
     score_ticker_by_buyers,
+)
+from analyzer.member_ranking.buyer_scoring import (
+    _filter_equity_rows,
+    _get_consensus_candidate_tickers,
 )
 
 
@@ -52,7 +55,8 @@ def backtest_recommendations(
     )
 
     is_consensus = scoring_mode == "consensus"
-    signals_df = filter_equity_rows(signals_df)
+    if not is_consensus:
+        signals_df = _filter_equity_rows(signals_df)
     if not is_consensus and signals_df.empty:
         return pd.DataFrame()
     training = (
@@ -69,13 +73,14 @@ def backtest_recommendations(
         return pd.DataFrame()
 
     recent_trades = _filter_recent_trades(transactions_df, lookback_days, as_of_iso)
-    recent_trades = eligible_candidate_rows(recent_trades)
     if recent_trades.empty:
         return pd.DataFrame()
 
-    candidates = candidate_tickers(recent_trades, min_buyers)
+    candidates = _get_consensus_candidate_tickers(recent_trades, min_buyers)
     if not candidates:
         return pd.DataFrame()
+    if not is_consensus:
+        recent_trades = _filter_equity_rows(recent_trades)
 
     return _score_and_rank(
         signals_df,

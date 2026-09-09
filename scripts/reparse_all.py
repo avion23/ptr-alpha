@@ -5,6 +5,7 @@ production cascade still controls text-engine comparison and final OCR fallback.
 """
 
 from __future__ import annotations
+
 import hashlib
 import os
 import sys
@@ -17,19 +18,36 @@ os.environ["PTR_SKIP_DOCLING"] = "1"
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from analyzer.database import Database
-from analyzer.models import FilingType
+from multiprocessing import Pool
+from typing import cast
 
+import pandas as pd
+
+from analyzer.database import Database
 from analyzer.download import (
     HouseTransactionSource,
     _build_member_lookup,
     _filter_existing_pdfs,
     preserve_existing_fields,
 )
+from analyzer.models import FilingType
 from analyzer.parsing import consolidate_transactions
-from analyzer.parser_cascade import _parse_pdf_worker
+from analyzer.parser_cascade import ParserCascadeError, _parse_pdf_worker
 from analyzer.settings import Settings
-from multiprocessing import Pool
+
+
+def _resilient_worker(
+    pdf_path: Path,
+) -> tuple[Path, list[dict], list[str], str | None]:
+    """Isolate per-document failures so one unreadable PDF cannot abort the
+    whole batch. Errors are recorded as parse-run rows; prior House rows for
+    those documents stay preserved because they never enter
+    ``replacement_doc_ids``."""
+    try:
+        pdf_path_out, txs, engines = _parse_pdf_worker(pdf_path)
+        return pdf_path_out, txs, engines, None
+    except (ParserCascadeError, OSError) as exc:
+        return pdf_path, [], [], f"{type(exc).__name__}: {exc}"
 
 
 def parse_year(year: int, db: Database, settings: Settings):
@@ -44,7 +62,7 @@ def parse_year(year: int, db: Database, settings: Settings):
     metadata = src.fetch_metadata(year)
     src.close()
 
-    ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
+    ptrs = cast(pd.DataFrame, metadata[metadata["FilingType"] == FilingType.PTR.value])
     pdf_paths, existing_docs = _filter_existing_pdfs(ptrs, pdf_dir)
     if not pdf_paths:
         print(f"  {year}: no PDFs found")
@@ -57,21 +75,27 @@ def parse_year(year: int, db: Database, settings: Settings):
     t0 = time.time()
 
     with Pool(settings.data.get_workers()) as pool:
-        results = pool.map(_parse_pdf_worker, pdf_paths)
+        results = pool.map(_resilient_worker, pdf_paths)
 
     elapsed = time.time() - t0
-    success = sum(1 for _, txs, _ in results if txs)
-    zero = sum(1 for _, txs, _ in results if not txs)
-    print(f"  {year}: {success} with rows, {zero} zero-rows in {elapsed:.1f}s")
+    errors = [(path, err) for path, _, _, err in results if err]
+    success = sum(1 for _, txs, _, err in results if txs and not err)
+    zero = sum(1 for _, txs, _, err in results if not txs and not err)
+    print(
+        f"  {year}: {success} with rows, {zero} zero-rows, {len(errors)} errors "
+        f"in {elapsed:.1f}s"
+    )
+    for path, err in errors[:10]:
+        print(f"    error {path.name}: {err}")
 
-    pdf_transactions = {pdf_path: txs for pdf_path, txs, _ in results}
-    emitted_counts = {pdf_path.stem: len(txs) for pdf_path, txs, _ in results}
+    pdf_transactions = {pdf_path: txs for pdf_path, txs, _, _ in results}
+    emitted_counts = {pdf_path.stem: len(txs) for pdf_path, txs, _, _ in results}
     attempted_doc_ids = list(emitted_counts)
     replacement_doc_ids = [
         doc_id for doc_id, emitted in emitted_counts.items() if emitted > 0
     ]
     artifact_hashes = {
-        pdf_path.stem: _artifact_sha256(pdf_path) for pdf_path, _, _ in results
+        pdf_path.stem: _artifact_sha256(pdf_path) for pdf_path, _, _, _ in results
     }
     ingestion_generation = (
         db.get_latest_house_generation(year) or f"legacy-untracked-{year}"
@@ -80,34 +104,66 @@ def parse_year(year: int, db: Database, settings: Settings):
     consolidated_counts = (
         df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
     )
-    _verify_persisted_counts(
-        year,
-        {doc_id: emitted_counts[doc_id] for doc_id in replacement_doc_ids},
-        consolidated_counts,
-    )
+    # Documents whose parsed rows failed consolidation (e.g. uncoercible
+    # dates) must never partially replace prior House rows: exclude them
+    # from the replacement set, record an error run, and keep their
+    # existing rows intact.
+    drop_reasons = {
+        doc_id: (
+            f"consolidation kept {consolidated_counts.get(doc_id, 0)}/"
+            f"{emitted_counts[doc_id]} parsed row(s); invalid dates or missing member metadata"
+        )
+        for doc_id in replacement_doc_ids
+        if consolidated_counts.get(doc_id, 0) < emitted_counts[doc_id]
+    }
+    if drop_reasons:
+        print(
+            f"  {year}: consolidation shortfalls in {len(drop_reasons)} "
+            "document(s), preserving prior rows: "
+            + ", ".join(sorted(drop_reasons)[:10])
+        )
+        replacement_doc_ids = [
+            doc_id for doc_id in replacement_doc_ids if doc_id not in drop_reasons
+        ]
+        if not df.empty and replacement_doc_ids:
+            df = cast(
+                pd.DataFrame,
+                df[df["doc_id"].astype(str).isin(replacement_doc_ids)].copy(),
+            )
 
     # Carry forward previously-resolved ticker/amount before the delete+reinsert
     # so a weaker parse does not clobber good data already in the DB.
     df = preserve_existing_fields(df, db)
     if not df.empty:
         df["ingestion_generation"] = ingestion_generation
-        df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
-    parse_runs = [
-        dict(
-            doc_id=pdf_path.stem,
-            year=year,
-            parser_version="v3-reparse",
-            status="success" if transactions else "zero_rows",
-            engines_attempted=",".join(engines_attempted)
-            if engines_attempted
-            else "production-cascade-failed",
-            raw_row_count=len(transactions),
-            transaction_count=0,
-            artifact_sha256=artifact_hashes[pdf_path.stem],
-            ingestion_generation=ingestion_generation,
+        df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes.get)
+    parse_runs = []
+    for pdf_path, transactions, engines_attempted, error in results:
+        doc_id = pdf_path.stem
+        if doc_id in drop_reasons:
+            status = "error"
+        elif transactions:
+            status = "success"
+        elif error:
+            status = "error"
+        else:
+            status = "zero_rows"
+        parse_runs.append(
+            {
+                "doc_id": doc_id,
+                "year": year,
+                "parser_version": "v3-reparse",
+                "status": status,
+                "engines_attempted": ",".join(engines_attempted)
+                if engines_attempted and not error
+                else "production-cascade-failed",
+                "raw_row_count": len(transactions),
+                "transaction_count": 0,
+                "error_message": error or drop_reasons.get(doc_id),
+                "artifact_sha256": artifact_hashes[doc_id],
+                "ingestion_generation": ingestion_generation,
+            }
         )
-        for pdf_path, transactions, engines_attempted in results
-    ]
 
     # Empty deterministic results are ambiguous: record the attempt, but do not
     # replace prior House rows. Only nonzero successes (or a future explicit
@@ -179,30 +235,28 @@ def _persisted_house_generation_counts(
     """Query actual House counts for the targeted acquired generation."""
     if not doc_ids:
         return {}
-    placeholders = ", ".join("?" for _ in doc_ids)
     rows = db.conn.execute(
-        f"""
+        """
         SELECT doc_id, COUNT(*)
         FROM transactions
-        WHERE doc_id IN ({placeholders})
+        WHERE doc_id IN (SELECT UNNEST(CAST(? AS VARCHAR[])))
           AND source = 'house_pdf'
           AND ingestion_generation = ?
         GROUP BY doc_id
-        """,  # nosec B608 -- placeholders only; values remain bound
-        [*doc_ids, ingestion_generation],
+        """,
+        [doc_ids, ingestion_generation],
     ).fetchall()
-    return {str(doc_id): int(count) for doc_id, count in rows}
+    return {str(doc_id): count for doc_id, count in rows}
 
 
 if __name__ == "__main__":
     settings = Settings()
     db = Database(Path(settings.data.data_dir) / "congress.duckdb")
 
-    years = (
-        [int(y) for y in sys.argv[1:]]
-        if len(sys.argv) > 1
-        else [2021, 2022, 2023, 2024, 2025, 2026]
-    )
+    try:
+        years = [int(y) for y in sys.argv[1:]]
+    except ValueError as exc:
+        raise SystemExit(f"usage: reparse_all.py [year ...]: {exc}") from exc
     total = 0
     t0 = time.time()
     for year in years:

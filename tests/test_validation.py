@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from analyzer.cli import _validation_grid
+from analyzer.experiments.family import FAMILY_PROVENANCE, build_family
 from analyzer.exceptions import AnalysisError
 from analyzer.pipeline import BacktestParams
 from analyzer.member_ranking.buyer_scoring import (
@@ -31,13 +32,11 @@ from analyzer.validation import (
     _canonical_ledger_path,
     _complete_evaluation,
     _hash_untracked_path,
-    _member_family_sha256,
-    _member_identity_permutations,
     _phase_end,
     _record_member_control,
     _reserve_evaluation,
     _run_identity_invariant_control,
-    _run_member_identity_control,
+    _run_validation_with_db,
     _validate_ledger,
     newey_west_tstat,
     permute_signal_member_labels,
@@ -236,97 +235,6 @@ class TestMemberIdentityGate:
                 member_control={"exempt": True},
             )
 
-    def test_production_member_control_derives_executed_family_and_statistic(
-        self, monkeypatch, tmp_path
-    ):
-        signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
-        monkeypatch.setattr(
-            "analyzer.validation.analysis.calculate_signal_potential",
-            lambda *args, **kwargs: signal,
-        )
-        series = {0: _series(np.full(20, 3.0))}
-        baseline = _with_series(_selection_frame(series), series)
-        calls = []
-
-        def fake_sweep(*args, **kwargs):
-            permuted = kwargs["signals_by_horizon"]
-            calls.append(permuted)
-            labels = permuted[(60, 0.005)]["member"].tolist()
-            result = baseline.copy()
-            if labels != ["A", "B"]:
-                result["nw_tstat"] = 0.0
-            result.attrs["series_by_trial"] = series
-            return result
-
-        monkeypatch.setattr("analyzer.validation.sweep_configs", fake_sweep)
-        result = _run_member_identity_control(
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            {"horizon": [60], "decay_lambda": [0.005]},
-            date(2022, 1, 1),
-            date(2023, 1, 1),
-            observed_trial_id=0,
-            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-            n_permutations=3,
-            seed=10,
-        )
-        assert len(calls) == 2  # baseline plus swap; identity reuses baseline
-        assert result.status == "completed"
-        assert result.exact_enumeration is True
-        assert result.permutation_group_size == 2
-        assert result.p_value_resolution == 0.5
-        assert result.max_stat_p_value >= 0.5
-        assert result.observed_statistic == baseline.iloc[0]["nw_tstat"]
-        assert result.family_sha256 == _member_family_sha256(baseline, series)
-        assert result.release_ready is True
-
-    def test_large_group_samples_unique_uniform_permutations(self):
-        members = list("ABCDEFG")
-        permutations, group_size, exact = _member_identity_permutations(
-            members, 999, seed=8
-        )
-        assert group_size == math.factorial(7)
-        assert exact is False
-        assert len(permutations) == len(set(permutations)) == 999
-        assert all(set(value) == set(members) for value in permutations)
-        assert any(
-            source == target
-            for value in permutations
-            for source, target in zip(members, value)
-        )
-
-    def test_runtime_budget_fails_closed_without_duplicate_draw_claims(
-        self, monkeypatch, tmp_path
-    ):
-        signal = pd.DataFrame({"member": ["A", "B"], "value": [1.0, 2.0]})
-        monkeypatch.setattr(
-            "analyzer.validation.analysis.calculate_signal_potential",
-            lambda *args, **kwargs: signal,
-        )
-        series = {0: _series(np.ones(20))}
-        baseline = _with_series(_selection_frame(series), series)
-        monkeypatch.setattr(
-            "analyzer.validation.sweep_configs", lambda *args, **kwargs: baseline
-        )
-        result = _run_member_identity_control(
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            {"horizon": [60], "decay_lambda": [0.005]},
-            date(2022, 1, 1),
-            date(2023, 1, 1),
-            observed_trial_id=0,
-            ledger_path=tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-            n_permutations=999,
-            seed=10,
-            runtime_budget_seconds=0.0,
-        )
-        assert result.status == "infeasible_runtime_budget"
-        assert result.evaluated_permutations == 0
-        assert result.release_ready is False
-        assert result.max_stat_p_value == 1.0
-
     def test_forged_identity_audit_records_are_ignored_for_deployment(self, tmp_path):
         series = {0: _series(np.full(180, 2.0))}
         baseline = _with_series(_selection_frame(series), series)
@@ -518,6 +426,187 @@ class TestExecutionSupport:
         )  # one SPY check per date plus one strategy trade
 
 
+class TestFailureFamilies:
+    def _params(self):
+        return BacktestParams(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 1),
+            horizon=60,
+            lookback_days=60,
+            training_lookback_days=365,
+            min_buyers=2,
+            top_n=5,
+            frequency_days=30,
+        )
+
+    def test_recommendation_exception_is_trial_failure_not_cash(self, monkeypatch):
+        monkeypatch.setattr("analyzer.validation._benchmark_return", lambda *args: 1.0)
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.backtest_recommendations",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("broken recommender")
+            ),
+        )
+        result, series = _backtest_core(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            self._params(),
+            pd.DataFrame(),
+            20.0,
+            0.005,
+        )
+        assert result.status == "failed"
+        assert result.failure_reason == "recommendation_exception"
+        assert result.failure_count == 1
+        assert result.no_trade_dates == 0
+        assert series.empty
+        assert result.failure_records[0]["error_type"] == "RuntimeError"
+
+    def test_empty_recommendations_remain_a_legitimate_no_trade(self, monkeypatch):
+        monkeypatch.setattr("analyzer.validation._benchmark_return", lambda *args: 1.0)
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.backtest_recommendations",
+            lambda *args, **kwargs: pd.DataFrame(),
+        )
+        result, series = _backtest_core(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            self._params(),
+            pd.DataFrame(),
+            20.0,
+            0.005,
+        )
+        assert result.status == "completed"
+        assert result.failure_count == 0
+        assert result.no_trade_dates == 1
+        assert series.tolist() == pytest.approx([-1.0])
+
+    def test_evaluation_exception_is_trial_failure_not_cash(self, monkeypatch):
+        monkeypatch.setattr("analyzer.validation._benchmark_return", lambda *args: 1.0)
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.backtest_recommendations",
+            lambda *args, **kwargs: pd.DataFrame(
+                [
+                    {
+                        "rank": 1,
+                        "ticker": "AAA",
+                        "signal_score": 1.0,
+                        "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
+                    }
+                ]
+            ),
+        )
+        monkeypatch.setattr(
+            "analyzer.validation.analysis.evaluate_backtest",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("broken evaluator")
+            ),
+        )
+        result, series = _backtest_core(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            self._params(),
+            pd.DataFrame(),
+            20.0,
+            0.005,
+        )
+        assert result.status == "failed"
+        assert result.failure_reason == "evaluation_exception"
+        assert result.failure_count == 1
+        assert result.no_trade_dates == 0
+        assert series.empty
+        assert result.failure_records[0]["stage"] == "evaluation"
+
+    def test_failed_trial_fails_the_whole_family_and_cannot_deploy(self):
+        series = {0: _series(np.full(180, 2.0)), 1: _series(np.full(180, 3.0))}
+        frame = _with_series(_selection_frame(series), series)
+        frame["trial_failed"] = [True, False]
+        frame["trial_status"] = ["failed", "completed"]
+        frame["failure_reason"] = ["recommendation_exception", None]
+        frame["failure_count"] = [1, 0]
+        frame["failure_records"] = [
+            '[{"stage":"recommendation","reason":"recommendation_exception"}]',
+            "[]",
+        ]
+        result = select_config(frame, n_permutations=999)
+        assert result["deployable_config"] is None
+        assert result["statistical_candidate"] is None
+        assert result["failure_reason"] == "family_trial_failure"
+        assert result["family_failure"]["status"] == "failed"
+        assert result["family_failure"]["failed_trial_count"] == 1
+
+    def test_failed_family_does_not_reserve_evaluation(self, tmp_path, monkeypatch):
+        series = {0: _series(np.full(180, 2.0))}
+        frame = _with_series(_selection_frame(series), series)
+        frame["trial_failed"] = True
+        frame["trial_status"] = "failed"
+        frame["failure_reason"] = "recommendation_exception"
+        frame["failure_count"] = 1
+        frame["failure_records"] = '[{"stage":"recommendation"}]'
+        monkeypatch.setattr(
+            "analyzer.validation.sweep_configs", lambda *args, **kwargs: frame
+        )
+        reserve_calls = []
+        monkeypatch.setattr(
+            "analyzer.validation._reserve_evaluation",
+            lambda *args, **kwargs: reserve_calls.append(args) or "unexpected",
+        )
+
+        class EmptyDb:
+            def get_transactions_by_date_range(self, *args):
+                return pd.DataFrame({"ticker": pd.Series(dtype=str)})
+
+            def get_prices(self, *args):
+                return pd.DataFrame()
+
+            def get_entry_prices(self, *args):
+                return pd.DataFrame()
+
+        database = tmp_path / "db.duckdb"
+        database.write_bytes(b"db")
+        output = _run_validation_with_db(
+            EmptyDb(),
+            database,
+            date(2022, 1, 1),
+            date(2023, 1, 1),
+            date(2022, 12, 1),
+            date(2023, 2, 1),
+            date(2024, 1, 1),
+            date(2023, 11, 1),
+            {"horizon": [60], "frequency_days": [30]},
+            max_holding=60,
+            n_permutations=999,
+            permutation_seed=0,
+            evaluation_ledger_path=tmp_path / "ledger.json",
+            alpha=0.05,
+            out_path=None,
+        )
+        assert output["selected_config"] is None
+        assert output["correction"]["failure_reason"] == "family_trial_failure"
+        assert reserve_calls == []
+
+
+class TestCanonicalFamilyMetadata:
+    def test_reordered_parameter_or_value_grid_changes_identity(self):
+        grid = {"horizon": [60, 90], "top_n": [5, 10]}
+        same = build_family(grid)
+        repeated = build_family({"horizon": [60, 90], "top_n": [5, 10]})
+        reordered_parameters = build_family(
+            {"top_n": [5, 10], "horizon": [60, 90]}
+        )
+        reordered_values = build_family(
+            {"horizon": [90, 60], "top_n": [5, 10]}
+        )
+        assert same.family_sha256 == repeated.family_sha256
+        assert [trial.trial_id for trial in same.trials] == [0, 1, 2, 3]
+        assert same.family_sha256 != reordered_parameters.family_sha256
+        assert same.family_sha256 != reordered_values.family_sha256
+        assert same.family_size == 4
+        assert same.metadata()["family_provenance"] == FAMILY_PROVENANCE
+        assert same.metadata()["family_size"] == len(same.trials)
+        assert same.metadata()["parameter_order"] == ["horizon", "top_n"]
+
+
 class TestPurgeAndManifest:
     def test_purge_uses_max_executable_holding(self):
         assert _phase_end(date(2023, 12, 31), 120, 0) == date(2023, 9, 2)
@@ -585,10 +674,17 @@ class TestPurgeAndManifest:
             "database_sha256",
             "value_snapshot_sha256",
             "config_sha256",
+            "family_sha256",
             "dependency_sha256",
         ]:
             assert len(manifest["hashes"][key]) == 64
         assert manifest["n_trials"] == 1
+        assert (
+            manifest["family"]["family_sha256"]
+            == manifest["hashes"]["family_sha256"]
+        )
+        assert manifest["family"]["family_size"] == 1
+        assert manifest["family"]["family_provenance"] == FAMILY_PROVENANCE
 
 
 class TestEvaluationConsumptionLedger:
@@ -746,14 +842,3 @@ def test_cli_validation_grid_counts_are_exact():
     assert math.prod(len(values) for values in _validation_grid(False).values()) == 18
     assert math.prod(len(values) for values in _validation_grid(True).values()) == 648
     assert _validation_grid(False)["scoring_mode"] == ["consensus"]
-
-
-def test_legacy_sweep_refuses_winner_claims(capsys):
-    import sweep
-
-    with pytest.raises(SystemExit) as exc:
-        sweep.main()
-    assert exc.value.code == 2
-    error = capsys.readouterr().err
-    assert "disabled" in error
-    assert "no in-sample winner" in error

@@ -46,18 +46,24 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from analyzer.database import Database  # noqa: E402
 from analyzer.download import (  # noqa: E402
+    _PARSE_FAILURE_PREFIX,
     _PARSE_VERSION,
     _build_member_lookup,
+    _engine_error_detail,
     _filter_existing_pdfs,
+    _tolerant_parse_pdf_worker as _production_tolerant_parse_worker,
     _validated_pdf_sha256,
     preserve_existing_fields,
 )
 from analyzer.models import FilingType, ReportOutcome  # noqa: E402
-from analyzer.parser_cascade import _parse_pdf_worker, ParserCascadeError  # noqa: E402
+from analyzer import parser_cascade as _parser_cascade  # noqa: E402
 from analyzer.parsing import consolidate_transactions  # noqa: E402
 from analyzer.price_repository import previous_nyse_session  # noqa: E402
 from analyzer.price_snapshot import create_snapshot, save_snapshot  # noqa: E402
 from analyzer.settings import DataSettings, Settings  # noqa: E402
+
+_parse_pdf_worker = _parser_cascade._parse_pdf_worker
+ParserCascadeError = _parser_cascade.ParserCascadeError
 
 HOUSE_YEARS = list(range(2015, 2027))
 SENATE_START = date(2024, 1, 1)
@@ -78,11 +84,8 @@ PINNED_SCAN_HASHES = {
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _staging_root() -> Path:
@@ -239,13 +242,8 @@ def _house_source(staging: Path):
 
 
 def _tolerant_parse_worker(pdf_path: Path):
-    """Run the accepted cascade; convert unresolved PDFs into error results."""
-    try:
-        return _parse_pdf_worker(pdf_path)
-    except ParserCascadeError as exc:
-        return pdf_path, [], [f"error:{exc}"]
-    except Exception as exc:  # noqa: BLE001 -- per-PDF quarantine boundary
-        return pdf_path, [], [f"error:{type(exc).__name__}:{exc}"]
+    """Use the production worker while retaining the script's test hook."""
+    return _production_tolerant_parse_worker(pdf_path, _parse_pdf_worker)
 
 
 def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
@@ -307,14 +305,18 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
             doc_id = pdf_path.stem
             pdf_transactions[pdf_path] = transactions
             raw_counts[doc_id] = len(transactions)
-            error_message = None
-            error_engines = []
-            for engine in engines_attempted:
-                if engine.startswith("error:"):
-                    error_message = engine[len("error:"):]
-                else:
-                    error_engines.append(engine)
-            parse_attempts.append((doc_id, error_engines, error_message))
+            error_message = _engine_error_detail(engines_attempted)
+            parse_attempts.append(
+                (
+                    doc_id,
+                    [
+                        engine
+                        for engine in engines_attempted
+                        if not engine.startswith(_PARSE_FAILURE_PREFIX)
+                    ],
+                    error_message,
+                )
+            )
 
         df = consolidate_transactions(pdf_transactions, member_lookup)
         transaction_counts = (
@@ -380,11 +382,11 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
         src.close()
 
 
-def _house_inventory_rows(db: Database, year: int, gen: str, staging: Path) -> list[dict]:
+def _house_inventory_rows(db: Database, year: int, gen: str) -> list[dict]:
     """Build the per-generation source_reports inventory (parsed docs only)."""
     runs = db.conn.execute(
         """
-        SELECT doc_id, status, raw_row_count, transaction_count, error_message
+        SELECT doc_id, status, transaction_count, error_message
         FROM pdf_parse_runs
         WHERE year = ? AND ingestion_generation = ?
         ORDER BY doc_id
@@ -408,7 +410,7 @@ def _house_inventory_rows(db: Database, year: int, gen: str, staging: Path) -> l
         ).fetchall()
     }
     rows = []
-    for doc_id, status, raw, accepted, error_message in runs:
+    for doc_id, status, accepted, error_message in runs:
         if status != "success":
             continue
         first, last, filing_date = meta_by_id.get(str(doc_id), (None, None, None))
@@ -440,9 +442,31 @@ def _house_inventory_rows(db: Database, year: int, gen: str, staging: Path) -> l
     return rows
 
 
-def house_parse(args) -> None:
+def _refresh_house_completion(
+    db: Database, house: dict, year: int
+) -> tuple[list[str], int | None]:
+    """Refresh one House generation's unresolved state and activation."""
     import pandas as pd  # noqa: PLC0415
 
+    generation = house["generation_id"]
+    unresolved = db.get_unresolved_house_doc_ids(year, generation)
+    house["unresolved_doc_ids"] = unresolved
+    house["resolved_doc_count"] = house["ptr_count"] - len(unresolved)
+    if unresolved:
+        house["parse_status"] = "incomplete"
+        return unresolved, None
+
+    rows = _house_inventory_rows(db, year, generation)
+    db.source_reports.replace_generation(
+        generation, "house_pdf", "house", pd.DataFrame(rows)
+    )
+    db.mark_house_generation_parse_complete(year, generation)
+    house["parse_status"] = "complete"
+    house["source_report_rows"] = len(rows)
+    return unresolved, len(rows)
+
+
+def house_parse(args) -> None:
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     years = [int(y) for y in args.years] if args.years else HOUSE_YEARS
@@ -453,7 +477,6 @@ def house_parse(args) -> None:
             if house is None:
                 print(f"house-parse {year}: skipped (not fetched)")
                 continue
-            gen = house["generation_id"]
             if house.get("parse_status") == "complete" and not args.force:
                 print(f"house-parse {year}: skipped (already complete)")
                 continue
@@ -464,26 +487,15 @@ def house_parse(args) -> None:
                 merged = dict(previous_result)
                 merged["skipped_cached"] = result.get("skipped_cached", 0) + previous_result.get("skipped_cached", 0)
                 result = merged
-            unresolved = db.get_unresolved_house_doc_ids(year, gen)
-            house["unresolved_doc_ids"] = unresolved
-            house["resolved_doc_count"] = house["ptr_count"] - len(unresolved)
             house["parse_result"] = result
+            unresolved, report_count = _refresh_house_completion(db, house, year)
             if unresolved:
-                house["parse_status"] = "incomplete"
                 print(
                     f"house-parse {year}: INCOMPLETE — {len(unresolved)} unresolved "
                     f"({', '.join(unresolved[:10])}{'...' if len(unresolved) > 10 else ''})"
                 )
             else:
-                rows = _house_inventory_rows(db, year, gen, staging)
-                reports_df = pd.DataFrame(rows)
-                db.source_reports.replace_generation(
-                    gen, "house_pdf", "house", reports_df
-                )
-                db.mark_house_generation_parse_complete(year, gen)
-                house["parse_status"] = "complete"
-                house["source_report_rows"] = len(rows)
-                print(f"house-parse {year}: COMPLETE — {len(rows)} inventory rows persisted")
+                print(f"house-parse {year}: COMPLETE — {report_count} inventory rows persisted")
             _save_manifest(staging, manifest)
     finally:
         db.close()
@@ -737,8 +749,6 @@ def ingest_senate_window(args) -> None:
     transactions.jsonl + report_inventory.jsonl with SHAs in its manifest.
     This atomically replaces the senate_efd source/chamber state.
     """
-    import pandas as pd  # noqa: PLC0415
-
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     if manifest.get("senate_window", {}).get("status") == "ingested" and not args.force:
@@ -763,36 +773,10 @@ def ingest_senate_window(args) -> None:
         raise SystemExit(
             f"senate window hash mismatch: {verification['mismatches']}"
         )
-    tx = pd.read_json(window_dir / "transactions.jsonl", lines=True)
-    inv = pd.read_json(window_dir / "report_inventory.jsonl", lines=True)
-    count_cols = ["raw_row_count", "accepted_row_count", "rejected_row_count"]
-    date_cols = ["official_filing_date", "available_date", "disclosure_date",
-                 "transaction_date", "notification_date", "filing_date"]
-    text_cols = [
-        "amends_source_record_id", "artifact_sha256", "asset_description",
-        "chamber", "chamber_member_key", "doc_id", "expiry_date",
-        "ingestion_generation", "instrument_type", "member", "member_key",
-        "owner_code", "raw_asset_class", "raw_asset_description", "raw_owner",
-        "raw_ticker", "raw_transaction_subtype", "source_record_id",
-        "source_report_path", "source_row_id", "strike_price", "ticker",
-        "ticker_candidate", "ticker_origin", "transaction_type",
-        "landing_sha256", "paper_artifact_sha256", "paper_artifact_url",
-        "error_message", "outcome", "report_path", "source",
-    ]
-    generation = window_manifest["generation"]
-    tx = _coerce_sibling_frame(tx, count_columns=[], date_columns=date_cols, text_columns=text_cols)
-    inv = _coerce_sibling_frame(inv, count_columns=count_cols, date_columns=date_cols, text_columns=text_cols)
-    tx["ingestion_generation"] = generation
-    inv["ingestion_generation"] = generation
     db = Database(staging / "congress.duckdb", read_only=False)
     try:
-        inserted = db.persist_source_refresh(
-            transactions=tx,
-            reports=inv,
-            source="senate_efd",
-            chamber="senate",
-            ingestion_generation=generation,
-        )
+        ingest = _ingest_senate(window_dir, window_manifest, db)
+        generation = window_manifest["generation"]
         record = {
             "status": "ingested",
             "path": str(window_dir),
@@ -801,7 +785,7 @@ def ingest_senate_window(args) -> None:
             "summary": window_manifest.get("summary"),
             "outcome_counts": window_manifest.get("outcome_counts"),
             "canaries": window_manifest.get("canaries"),
-            "inserted_transactions": inserted,
+            "inserted_transactions": ingest["inserted_transactions"],
             "verification": verification,
             "replaced_previous_sweep": bool(
                 manifest.get("consume", {}).get("senate", {}).get("status")
@@ -813,7 +797,7 @@ def ingest_senate_window(args) -> None:
         print(
             f"senate-window: INGESTED gen={generation} "
             f"reports={record['summary'].get('found')} "
-            f"transactions={inserted} (replaced prior sweep: "
+            f"transactions={record['inserted_transactions']} (replaced prior sweep: "
             f"{record['replaced_previous_sweep']})"
         )
     finally:
@@ -1415,10 +1399,6 @@ def repair_audit_gaps(args) -> None:
 SIBLING_TRACKS = ("senate", "ocr", "prices", "capitol", "metadata-audit", "invariants")
 
 
-def _sibling_dir(track: str, generation: str) -> Path:
-    return _REPO_ROOT / "data" / ".staging" / track / generation
-
-
 def _verify_artifact_files(manifest: dict, base: Path) -> dict:
     """Verify every artifact path in a sibling manifest against its sha256."""
     results = {"files_checked": 0, "mismatches": []}
@@ -1553,7 +1533,7 @@ def _ingest_senate(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     }
 
 
-def _ingest_prices(track_dir: Path, track_manifest: dict, db: Database, staging: Path) -> dict:
+def _ingest_prices(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     """Upsert a value-verified price refresh into the staged DB."""
     import pandas as pd  # noqa: PLC0415
 
@@ -1610,7 +1590,7 @@ def _ingest_prices(track_dir: Path, track_manifest: dict, db: Database, staging:
     }
 
 
-def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database, staging: Path) -> dict:
+def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     """Ingest verified local-OCR rows for unresolved House scans.
 
     Fail-closed guards: docs the track marked unresolved are never ingested
@@ -1801,10 +1781,10 @@ def consume(args) -> None:
                     entry["ingest"] = _ingest_senate(track_dir, track_manifest, db)
                     entry["status"] = "ingested"
                 elif track == "prices":
-                    entry["ingest"] = _ingest_prices(track_dir, track_manifest, db, staging)
+                    entry["ingest"] = _ingest_prices(track_dir, track_manifest, db)
                     entry["status"] = "ingested"
                 elif track == "ocr":
-                    entry["ingest"] = _ingest_ocr(track_dir, track_manifest, db, staging)
+                    entry["ingest"] = _ingest_ocr(track_dir, track_manifest, db)
                     entry["status"] = "ingested"
                 else:
                     entry["status"] = "recorded"
@@ -1822,8 +1802,6 @@ def consume(args) -> None:
 
 def house_activate(args) -> None:
     """Re-check completeness after OCR consumption; activate complete years."""
-    import pandas as pd  # noqa: PLC0415
-
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     db = Database(staging / "congress.duckdb", read_only=False)
@@ -1832,27 +1810,15 @@ def house_activate(args) -> None:
             house = manifest.get("house", {}).get(str(year))
             if house is None:
                 continue
-            gen = house["generation_id"]
             if house.get("parse_status") == "complete" and not args.force:
                 continue
-            unresolved = db.get_unresolved_house_doc_ids(year, gen)
-            house["unresolved_doc_ids"] = unresolved
-            house["resolved_doc_count"] = house["ptr_count"] - len(unresolved)
+            unresolved, report_count = _refresh_house_completion(db, house, year)
             if unresolved:
-                house["parse_status"] = "incomplete"
                 print(
                     f"house-activate {year}: INCOMPLETE — {len(unresolved)} unresolved"
                 )
             else:
-                rows = _house_inventory_rows(db, year, gen, staging)
-                reports_df = pd.DataFrame(rows)
-                db.source_reports.replace_generation(
-                    gen, "house_pdf", "house", reports_df
-                )
-                db.mark_house_generation_parse_complete(year, gen)
-                house["parse_status"] = "complete"
-                house["source_report_rows"] = len(rows)
-                print(f"house-activate {year}: COMPLETE — {len(rows)} inventory rows")
+                print(f"house-activate {year}: COMPLETE — {report_count} inventory rows")
             _save_manifest(staging, manifest)
     finally:
         db.close()

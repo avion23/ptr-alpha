@@ -15,8 +15,8 @@ Stages (order is a hard contract):
              production cascade, run Gemini OCR on zero-row PDFs, and
              activate the archive generation only when nothing is unresolved.
 2. senate  - ``ptr-alpha fetch-senate-efd --start <S> --end <E>
-             --data-dir <STAGING>/senate``: official eFD sweep into an
-             isolated senate DB (chamber separation is exact).
+             --data-dir <STAGING>``: official eFD sweep into the same staged
+             canonical DB; source/chamber identity keeps Senate rows isolated.
 3. capitol - ``ptr-alpha fetch-capitol --all --output <STAGING>/capitol_recon.json
              --generation <GEN> --data-dir <STAGING>``: third-party
              reconciliation artifact; canonical rows are never written.
@@ -142,7 +142,7 @@ def build_senate_commands(ctx: Context) -> list[list[str]]:
             "--end",
             ctx.senate_end.isoformat(),
             "--data-dir",
-            str(ctx.staging_dir / "senate"),
+            str(ctx.staging_dir),
         ]
     ]
 
@@ -227,12 +227,7 @@ def _build_invariants_commands(ctx: Context) -> list[list[str]]:
             sys.executable,
             str(_REPO_ROOT / "scripts" / "purge_phantom_rows.py"),
             str(ctx.staging_dir / "congress.duckdb"),
-        ],
-        [
-            sys.executable,
-            str(_REPO_ROOT / "scripts" / "purge_phantom_rows.py"),
-            str(ctx.staging_dir / "senate" / "congress.duckdb"),
-        ],
+        ]
     ]
 
 
@@ -254,21 +249,14 @@ def _stage_artifact_paths(stage_id: str, ctx: Context) -> list[Path]:
     if stage_id == "house":
         return sorted(staging.glob(f"{ctx.house_year}/pdfs/*.pdf"))
     if stage_id == "senate":
-        senate_dir = staging / "senate"
-        if not senate_dir.exists():
-            return []
-        return sorted(
-            p
-            for p in senate_dir.rglob("*")
-            if p.is_file() and p.suffix not in (".tmp", ".wal")
-        )
+        return [staging / "congress.duckdb"]
     if stage_id == "capitol":
         return [staging / "capitol_recon.json"]
     if stage_id == "prices":
         return [staging / "price_snapshot.json"]
     if stage_id == "invariants":
-        dbs = [staging / "congress.duckdb", staging / "senate" / "congress.duckdb"]
-        return [p for p in dbs if p.exists()]
+        db = staging / "congress.duckdb"
+        return [db] if db.exists() else []
     if stage_id == "validation":
         paths = [staging / "validation_results.json"]
         ledger = staging / ".ptr-alpha-evaluation-ledger-v2.json"
@@ -336,7 +324,6 @@ def _db_checks(ctx: Context, checks: dict) -> None:
     from analyzer.database import Database
 
     main_db = ctx.staging_dir / "congress.duckdb"
-    senate_db = ctx.staging_dir / "senate" / "congress.duckdb"
 
     def audit(db_path: Path, label: str, is_main: bool) -> None:
         if not db_path.exists():
@@ -356,8 +343,7 @@ def _db_checks(ctx: Context, checks: dict) -> None:
             def check(name: str, ok: bool, detail: str) -> None:
                 checks[f"{label}_{name}"] = {"passed": bool(ok), "detail": detail}
 
-            # House-generation checks apply only to the main (house) staging
-            # DB; the isolated senate DB legitimately has no house generations.
+            # House-generation checks apply to the combined staged database.
             if is_main:
                 # Parse-run counts must equal persisted rows per generation.
                 rows = conn.execute(
@@ -522,22 +508,18 @@ def _db_checks(ctx: Context, checks: dict) -> None:
             db.close()
 
     audit(main_db, "main", is_main=True)
-    audit(senate_db, "senate", is_main=False)
 
 
 def run_invariants_audit(ctx: Context) -> dict:
     checks: dict = {}
-    for db_path in (
-        ctx.staging_dir / "congress.duckdb",
-        ctx.staging_dir / "senate" / "congress.duckdb",
-    ):
-        if db_path.exists():
-            _run_phantom_check(ctx, db_path, checks)
-        else:
-            checks[f"phantom_rows_{db_path.parent.name or 'staging'}"] = {
-                "passed": False,
-                "detail": f"missing: {db_path}",
-            }
+    db_path = ctx.staging_dir / "congress.duckdb"
+    if db_path.exists():
+        _run_phantom_check(ctx, db_path, checks)
+    else:
+        checks[f"phantom_rows_{db_path.parent.name or 'staging'}"] = {
+            "passed": False,
+            "detail": f"missing: {db_path}",
+        }
     _db_checks(ctx, checks)
     return {
         "all_passed": bool(checks) and all(c["passed"] for c in checks.values()),

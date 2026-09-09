@@ -17,6 +17,8 @@
   exponential recency coefficient and backtest-only crash/lag multipliers were removed.
 - Live ticker analysis no longer requires historical price/outcome construction. Single-
   ticker and multi-ticker analysis use the same disclosure window and buyer threshold.
+- Senate eFD refreshes now use the same canonical DuckDB as House data; source/chamber
+  identity provides the separation instead of a second database.
 - CLI backtests now evaluate the declared fixed horizon; adaptive OU holding periods are
   no longer injected into production replay. Portfolio simulation no longer exposes
   unused horizon/training/threshold knobs.

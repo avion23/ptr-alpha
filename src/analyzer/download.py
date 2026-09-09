@@ -30,6 +30,7 @@ from analyzer.parsing import (
     normalize_house_metadata,
 )
 from analyzer.parser_cascade import (
+    ParseBudgetExceeded,
     ParserCascadeError,
     _is_valid_pdf,
     _parse_pdf_worker,
@@ -580,7 +581,7 @@ class HouseTransactionSource(TransactionSource):
         logger.info(f"Parsing {len(pdf_paths)} PDFs for {year}")
 
         results: list = []
-        failed_docs: list[str] = []
+        failed_results: list[tuple[Path, list[dict], list[str]]] = []
         with Pool(self.parallel_workers) as pool:
             parsed = pool.map(_tolerant_parse_pdf_worker, pdf_paths)
         for pdf_path, transactions, engines_attempted in parsed:
@@ -588,18 +589,50 @@ class HouseTransactionSource(TransactionSource):
             if error_detail is None:
                 results.append((pdf_path, transactions, engines_attempted))
             else:
-                failed_docs.append(f"{pdf_path.stem} ({error_detail})")
+                failed_results.append((pdf_path, transactions, engines_attempted))
 
-        if failed_docs:
+        if failed_results:
             logger.warning(
                 "Excluding %d/%d unparseable PDFs for %d from save: %s",
-                len(failed_docs),
+                len(failed_results),
                 len(pdf_paths),
                 year,
-                "; ".join(failed_docs),
+                "; ".join(
+                    f"{pdf_path.stem} ({_engine_error_detail(engines_attempted)})"
+                    for pdf_path, _transactions, engines_attempted in failed_results
+                ),
             )
+            self._save_failed_parse_runs(year, failed_results, ingestion_generation)
 
         self._save_parse_results(year, results, member_lookup, ingestion_generation)
+
+    def _save_failed_parse_runs(
+        self,
+        year: int,
+        failed_results: list[tuple[Path, list[dict], list[str]]],
+        ingestion_generation: str,
+    ) -> None:
+        """Record failed documents without replacing their transaction rows.
+
+        A failure is useful audit telemetry, but it is not a reason to delete
+        rows from the last successful parse of the same artifact.  The parse
+        run repository therefore keeps an existing terminal run for that
+        identity when this method retries a document.
+        """
+        for pdf_path, _transactions, engines_attempted in failed_results:
+            detail = _engine_error_detail(engines_attempted) or "parse failed"
+            self.db.upsert_parse_run(
+                doc_id=pdf_path.stem,
+                year=year,
+                parser_version=_PARSE_VERSION,
+                status="error",
+                engines_attempted=",".join(engines_attempted),
+                raw_row_count=0,
+                transaction_count=0,
+                error_message=detail,
+                artifact_sha256=_validated_pdf_sha256(pdf_path),
+                ingestion_generation=ingestion_generation,
+            )
 
     def _save_parse_results(
         self,
@@ -699,10 +732,6 @@ _PARSE_FAILURE_PREFIX = "__parse_failed__:"
 _PARSE_DOC_BUDGET_SECONDS = 300
 
 
-class ParseBudgetExceeded(RuntimeError):
-    """Raised by the SIGALRM watchdog when one PDF exceeds its parse budget."""
-
-
 def _skip_stems_from_env(raw: str | None) -> frozenset[str]:
     """Parse a comma-separated PTR_SKIP_DOCS value into doc-id stems."""
     return frozenset(
@@ -713,7 +742,7 @@ def _skip_stems_from_env(raw: str | None) -> frozenset[str]:
 _PTR_SKIP_DOCS = _skip_stems_from_env(os.environ.get("PTR_SKIP_DOCS"))
 
 
-def _tolerant_parse_pdf_worker(pdf_path: Path):
+def _tolerant_parse_pdf_worker(pdf_path: Path, parse_worker=None):
     """Run the accepted cascade; convert per-PDF failures into sentinel results
     so one bad document cannot discard the whole year's batch.
 
@@ -730,6 +759,7 @@ def _tolerant_parse_pdf_worker(pdf_path: Path):
     if pdf_path.stem in _PTR_SKIP_DOCS:
         return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}skipped via PTR_SKIP_DOCS"]
 
+    worker = _parse_pdf_worker if parse_worker is None else parse_worker
     use_watchdog = (
         threading.current_thread() is threading.main_thread()
         and hasattr(signal, "setitimer")
@@ -747,7 +777,7 @@ def _tolerant_parse_pdf_worker(pdf_path: Path):
             signal.signal(signal.SIGALRM, _raise_budget_exceeded)
             signal.setitimer(signal.ITIMER_REAL, _PARSE_DOC_BUDGET_SECONDS)
         try:
-            return _parse_pdf_worker(pdf_path)
+            return worker(pdf_path)
         except ParseBudgetExceeded:
             detail = f"parse budget {_PARSE_DOC_BUDGET_SECONDS}s exceeded"
             return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{detail}"]

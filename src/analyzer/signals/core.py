@@ -83,6 +83,7 @@ def _compute_ticker_signals(
         if entry_pos >= len(dates_ns) or int(dates_ns[entry_pos]) != entry_date_ns:
             continue
         r_entry_date[idx] = np.datetime64(entry_date_ns, "ns")
+        r_disc_baseline[idx] = float(vals[entry_pos])
 
         intended_end_ns = entry_date_ns + horizon_ns
         r_label_window_end[idx] = np.datetime64(intended_end_ns, "ns")

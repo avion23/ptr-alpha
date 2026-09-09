@@ -1,46 +1,29 @@
-"""Frozen, exactly-once, capital-constrained validation of a staged database.
+"""Predeclared retrospective validation for a staged congressional-trading database.
 
-This module owns the frozen evaluation contract for the rebuilt staged
-``congress.duckdb`` produced by the luna-rebuild sibling worktree:
-
-* ``freeze``  - regenerate ``validation/phase2-evaluation-manifest.json`` and
-  record the config/code/git/dependency hashes of the exact evaluation state.
-* ``evaluate`` - verify the frozen state still matches the live environment
-  (fail closed on any drift), then run the purged retrospective validation and
-  the capital-constrained portfolio evaluation of the selected consensus
-  configuration exactly once. Exactly-once is enforced by the canonical
-  append-only evaluation ledger, which refuses any overlapping reservation.
-
-No profitability claim is ever emitted: the test window is labeled
-``retrospective_previously_used_not_fresh_oos``, the verdict is capped at
-``not_fresh_oos_evidence`` and the top-level report verdict is
-``not_established`` unless every frozen gate passes.
+The ``freeze`` command writes the experiment configuration that will be used by
+``evaluate``. The manifest is input, not authorization: evaluation does not
+depend on code hashes, dependency fingerprints, filesystem locks, or an
+exactly-once receipt. Statistical family controls and the locked post-2025
+holdout boundary remain enforced by :mod:`analyzer.validation`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import platform
 import sys
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
-from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
-from analyzer.validation import (
-    LOCKED_FINAL_START,
-    PRIMARY_METRIC,
-    EvaluationAlreadyConsumedError,
-    _code_hash,
-    _dependency_version,
-    _git_state,
-    _phase_end,
-    _sha256_file,
-    _sha256_json,
-    run_validation,
+from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_LOOKBACK_DAYS,
+    _get_consensus_price_tickers,
 )
+from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
+from analyzer.price_repository import next_nyse_session
+from analyzer.validation import LOCKED_FINAL_START, PRIMARY_METRIC, _phase_end, run_validation
 
 FROZEN_MANIFEST_PATH = (
     Path(__file__).resolve().parents[1] / "validation" / "phase2-evaluation-manifest.json"
@@ -51,16 +34,12 @@ TRAIN_END = date(2023, 12, 31)
 TEST_START = date(2024, 1, 1)
 TEST_END = date(2025, 6, 30)
 
-# The fast consensus-only CLI grid (18 trials); the frozen evaluation always
-# uses this exact grid so the rebuilt database is consumed exactly once.
 GRID = {
     "horizon": [60, 90, 120],
     "frequency_days": [30],
-    "training_lookback_days": [365],
+    "lookback_days": [CONSENSUS_LOOKBACK_DAYS],
     "min_buyers": [2, 3, 5],
     "top_n": [3, 5],
-    "decay_lambda": [0.005],
-    "bayes_prior_strength": [20],
     "scoring_mode": ["consensus"],
 }
 ALPHA = 0.05
@@ -68,7 +47,6 @@ N_PERMUTATIONS = 999
 PERMUTATION_SEED = 0
 
 PORTFOLIO_CONFIG = {
-    "capital_constrained": True,
     "initial_capital": 20000.0,
     "max_positions": 5,
     "max_position_pct": 0.25,
@@ -80,29 +58,17 @@ PORTFOLIO_CONFIG = {
     "min_signal_score": 0.0,
     "max_price_staleness_days": 5,
     "max_execution_wait_days": 7,
-    "sector_policy": (
-        "deterministic_static_equity_mapping_no_live_calls; "
-        "sector concentration is not a frozen gate"
-    ),
-    "valuation_gap_policy": (
-        "risk metrics abstain (None) on any valuation gap; no fictional zero mark"
-    ),
-    "benchmark": "real SPY prices from the staged database",
 }
 
-DEPENDENCY_NAMES = ("numpy", "pandas", "scipy", "duckdb")
+
+class FrozenManifestError(ValueError):
+    """Raised when a predeclared validation manifest is malformed."""
 
 
 def config_payload(
     grid: dict | None = None, grid_decision: str | None = None
 ) -> dict:
-    """The exact frozen evaluation configuration (grid, windows, gates).
-
-    ``grid`` overrides the default module grid for diagnostic manifest
-    variants (e.g. a data-sparse Senate-only min_buyers=1 freeze); the
-    decision must be documented via ``grid_decision`` and made before the
-    run. The default reproduces the canonical grid byte-for-byte.
-    """
+    """Return the complete predeclared experiment configuration."""
     payload = {
         "primary_metric": PRIMARY_METRIC,
         "phases": {
@@ -133,130 +99,54 @@ def config_payload(
     return payload
 
 
-def frozen_hashes(
-    grid: dict | None = None, grid_decision: str | None = None
-) -> dict:
-    """Recorded hashes of the frozen evaluation state."""
-    dependencies = {
-        name: _dependency_version(name) for name in DEPENDENCY_NAMES
-    }
-    dependencies["python"] = platform.python_version()
-    git_state = _git_state()
-    return {
-        "config_sha256": _sha256_json(config_payload(grid, grid_decision)),
-        "code_sha256": _code_hash(),
-        "harness_sha256": _sha256_file(Path(__file__)),
-        "git_revision": git_state["revision"],
-        "git_diff_sha256": git_state["diff_sha256"],
-        "git_dirty": git_state["dirty"],
-        "dependency_sha256": _sha256_json(dependencies),
-        "database_sha256": None,
-        "value_snapshot_sha256": None,
-    }
-
-
 def freeze_manifest(
     path: Path | None = None,
     *,
     grid: dict | None = None,
     grid_decision: str | None = None,
 ) -> dict:
-    """Regenerate and persist a frozen evaluation manifest.
-
-    Diagnostic variants pass an alternative ``grid`` (e.g. min_buyers=1 for
-    data-sparse Senate-only coverage) plus a ``grid_decision`` note recorded
-    in the manifest before any run. The canonical manifest is reproduced
-    exactly when both are None.
-    """
+    """Write a predeclared validation configuration."""
     path = path or FROZEN_MANIFEST_PATH
     manifest = {
-        "schema_version": 1,
-        "purpose": (
-            "Frozen capital-constrained validation manifest for the rebuilt "
-            "staged congress.duckdb; evaluated exactly once via the canonical "
-            "append-only ledger."
-        ),
-        "freeze_policy": (
-            "Regenerate only with scripts/frozen_validation.py freeze; a new "
-            "freeze is a new manifest commit. The staged database evaluation "
-            "is reserved exactly once in the ledger next to the database."
-        ),
+        "schema_version": 2,
+        "purpose": "Predeclared retrospective validation configuration",
         "evidence_class": "retrospective_previously_used_not_fresh_oos",
-        "verdict_policy": {
-            "top_level_verdict": "not_established",
-            "claim_rule": (
-                "No profitability or fresh-OOS claim is emitted unless every "
-                "frozen gate passes; retrospective evidence alone never "
-                "establishes profitability."
-            ),
-        },
         "config": config_payload(grid, grid_decision),
-        "hashes": frozen_hashes(grid, grid_decision),
-        "data_hashes_recorded_at_evaluation": True,
-        "variant": grid is not None,
-        "evaluation": {
-            "exactly_once": {
-                "mechanism": (
-                    "canonical append-only ledger refuses any overlapping "
-                    "reservation (repeats and alternate configs/grids/windows)"
-                ),
-                "ledger_path": "<staged-db-dir>/.ptr-alpha-evaluation-ledger-v2.json",
-            },
-            "staged_db": {
-                "producer": "luna-rebuild (.worktrees/luna-rebuild)",
-                "status": "awaiting_staging_confirmation_and_root_authorization",
-            },
-            "runner": (
-                "python3 scripts/frozen_validation.py evaluate "
-                "--db <staged congress.duckdb> --out <report.json> "
-                "[--manifest <manifest.json>]"
-            ),
-        },
-        "dependencies": {
-            name: _dependency_version(name) for name in DEPENDENCY_NAMES
-        },
     }
-    manifest["dependencies"]["python"] = platform.python_version()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest
 
 
-def verify_frozen_state(manifest: dict) -> tuple[bool, list[str]]:
-    """Return (ok, reasons) for the frozen manifest against the live state.
-
-    The manifest is the frozen contract: the evaluation grid, windows, and
-    gates are read from the manifest's embedded config, so the config is
-    verified by self-consistency (embedded config hashes to the recorded
-    config_sha256) rather than against module defaults. Fail closed on any
-    drift of code, working-tree content, or dependencies. ``harness_sha256``,
-    ``git_revision``, and ``git_dirty`` are recorded for provenance only:
-    content is pinned by code/dependency hashes plus the working-tree diff,
-    so a content-identical checkout at any later revision still verifies
-    while any content drift fails closed. Data/database hashes are recorded
-    at evaluation time and are not part of this check.
-    """
-    reasons: list[str] = []
-    hashes = manifest.get("hashes", {})
-    current = frozen_hashes()
-    # Self-consistency: the hash of the manifest's embedded config must equal
-    # the config hash the manifest records (tampering with either is caught).
-    embedded_config_hash = _sha256_json(manifest.get("config", {}))
-    if hashes.get("config_sha256") != embedded_config_hash:
-        reasons.append(
-            "config_sha256 self-consistency mismatch: embedded config does not "
-            "hash to the recorded config_sha256"
+def _manifest_config(manifest: dict) -> dict:
+    """Validate and return the experiment config embedded in a manifest."""
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
+        raise FrozenManifestError("unsupported validation manifest schema")
+    config = manifest.get("config")
+    if not isinstance(config, dict):
+        raise FrozenManifestError("validation manifest is missing config")
+    phases = config.get("phases")
+    grid = config.get("grid")
+    if not isinstance(phases, dict) or not isinstance(grid, dict):
+        raise FrozenManifestError("validation manifest requires phases and grid")
+    if grid.get("scoring_mode", ["consensus"]) != ["consensus"]:
+        raise FrozenManifestError("frozen validation supports consensus scoring only")
+    if not grid.get("horizon") or not grid.get("min_buyers") or not grid.get("top_n"):
+        raise FrozenManifestError("validation grid is missing required parameters")
+    try:
+        train_start, train_end = map(
+            date.fromisoformat, phases["train"]["boundary"]
         )
-    for key in (
-        "code_sha256",
-        "git_diff_sha256",
-        "dependency_sha256",
-    ):
-        if hashes.get(key) != current[key]:
-            reasons.append(
-                f"{key} mismatch: frozen={hashes.get(key)} live={current[key]}"
-            )
-    return (not reasons, reasons)
+        test_start, test_end = map(date.fromisoformat, phases["test"]["boundary"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FrozenManifestError("validation phase boundaries are invalid") from exc
+    if train_end < train_start or test_end < test_start or test_start <= train_end:
+        raise FrozenManifestError("validation phase boundaries overlap or run backwards")
+    if test_end >= LOCKED_FINAL_START:
+        raise FrozenManifestError(
+            f"test window enters locked final phase starting {LOCKED_FINAL_START}"
+        )
+    return config
 
 
 def _portfolio_config(
@@ -281,49 +171,33 @@ def _portfolio_config(
 
 def _test_window_recommendations(
     all_tx: pd.DataFrame,
-    prices: pd.DataFrame,
-    entry_prices: pd.DataFrame,
     config: dict,
     test_start: date,
     test_effective_end: date,
 ) -> pd.DataFrame:
-    """Collect the consensus recommendations of the frozen test window.
+    """Collect the exact consensus recommendations used by validation."""
+    from analyzer.backtest.recommend import backtest_recommendations
 
-    Mirrors the validation pipeline's recommendation loop (same signal inputs,
-    same frozen config) so the capital-constrained evaluation consumes exactly
-    the recommendations the frozen retrospective evaluation sees.
-    """
-    from analyzer import analysis
-
-    horizon = int(config["horizon"])
-    signals = analysis.calculate_signal_potential(
-        entry_prices,
-        prices,
-        [horizon],
-        decay_lambda=float(config["decay_lambda"]),
-    )
     rows: list[pd.DataFrame] = []
     frequency_days = int(config.get("frequency_days", 30))
+    lookback_days = int(config.get("lookback_days", CONSENSUS_LOOKBACK_DAYS))
     for as_of in pd.date_range(
         test_start, test_effective_end, freq=f"{frequency_days}D"
     ):
-        recs = analysis.backtest_recommendations(
-            signals,
+        recs = backtest_recommendations(
+            pd.DataFrame(),
             all_tx,
-            as_of_date=as_of,
-            horizon=horizon,
-            lookback_days=60,
+            as_of_date=pd.Timestamp(as_of),
+            horizon=int(config["horizon"]),
+            lookback_days=lookback_days,
             min_buyers=int(config["min_buyers"]),
             top_n=int(config["top_n"]),
-            threshold=float(config.get("threshold", 5.0)),
-            training_lookback_days=int(config["training_lookback_days"]),
             scoring_mode="consensus",
-            bayes_prior_strength=float(config["bayes_prior_strength"]),
         )
         if recs.empty:
             continue
-        recs = recs.drop(columns=["optimal_horizon"], errors="ignore")
-        recs["as_of_date"] = as_of
+        recs = recs.copy()
+        recs["as_of_date"] = pd.Timestamp(as_of)
         rows.append(recs)
     if not rows:
         return pd.DataFrame()
@@ -332,34 +206,36 @@ def _test_window_recommendations(
 
 def _run_portfolio_evaluation(
     db,
-    db_path: Path,
     config: dict,
     test_start: date,
     test_effective_end: date,
+    test_end: date,
     portfolio_cfg: dict | None = None,
 ) -> dict:
-    """Run the frozen capital-constrained portfolio evaluation on the test window."""
-    tx_end = pd.Timestamp(test_effective_end)
-    price_end = pd.Timestamp(TEST_END)
-    all_tx = db.get_transactions_by_date_range(
-        pd.Timestamp("2021-10-07"), tx_end
-    )
-    tickers = sorted(set(all_tx["ticker"].dropna().astype(str)) | {"SPY"})
-    prices = db.get_prices(tickers, pd.Timestamp("2021-10-07"), price_end)
-    entry_prices = db.get_entry_prices(tickers, pd.Timestamp("2021-10-07"), price_end)
+    """Run a capital-constrained portfolio on the selected test recommendations."""
+    lookback_days = int(config.get("lookback_days", CONSENSUS_LOOKBACK_DAYS))
+    tx_start = pd.Timestamp(test_start) - pd.Timedelta(days=lookback_days)
+    all_tx = db.get_transactions_by_date_range(tx_start, pd.Timestamp(test_effective_end))
+    if all_tx.empty:
+        return {"status": "not_run_no_test_window_transactions"}
 
     recs = _test_window_recommendations(
-        all_tx, prices, entry_prices, config, test_start, test_effective_end
+        all_tx, config, test_start, test_effective_end
     )
     if recs.empty:
         return {"status": "not_run_no_test_window_recommendations"}
 
+    tickers = sorted(set(_get_consensus_price_tickers(all_tx)) | {"SPY"})
+    price_start = next_nyse_session(pd.Timestamp(test_start))
+    prices = db.get_prices(tickers, price_start, pd.Timestamp(test_end))
+    if prices.empty:
+        return {"status": "not_run_no_test_window_prices"}
+
     sector_by_ticker = {
-        str(ticker): "Equity"
-        for ticker in sorted(recs["ticker"].dropna().unique())
+        str(ticker): "Equity" for ticker in sorted(recs["ticker"].dropna().unique())
     }
     sim = PortfolioSimulator(_portfolio_config(portfolio_cfg, sector_by_ticker))
-    results = sim.run(recs, prices, test_start, test_effective_end)
+    results = sim.run(recs, prices, test_start, test_end)
     metrics = sim.compute_metrics(prices)
     metrics["sector_by_ticker"] = sector_by_ticker
     metrics["recommendation_count"] = int(len(recs))
@@ -372,22 +248,16 @@ def evaluate_manifest(
     out_path: str | Path | None = None,
     manifest_path: Path | None = None,
 ) -> dict:
-    """Verify the frozen state, then evaluate the staged database exactly once.
-
-    The evaluation contract (grid, windows, gates, portfolio sizing) is read
-    from the manifest's embedded config, so a diagnostic variant manifest
-    drives its own frozen evaluation while the canonical manifest is
-    untouched.
-    """
+    """Evaluate a staged database under the predeclared manifest configuration."""
     manifest_path = manifest_path or FROZEN_MANIFEST_PATH
     manifest = json.loads(Path(manifest_path).read_text())
-    ok, reasons = verify_frozen_state(manifest)
-    if not ok:
-        raise FrozenStateMismatchError(reasons)
-
-    cfg = manifest["config"]
-    train_start, train_end = map(date.fromisoformat, cfg["phases"]["train"]["boundary"])
-    test_start, test_end = map(date.fromisoformat, cfg["phases"]["test"]["boundary"])
+    cfg = _manifest_config(manifest)
+    train_start, train_end = map(
+        date.fromisoformat, cfg["phases"]["train"]["boundary"]
+    )
+    test_start, test_end = map(
+        date.fromisoformat, cfg["phases"]["test"]["boundary"]
+    )
     grid = dict(cfg["grid"])
     alpha = float(cfg["alpha"])
     n_permutations = int(cfg["n_permutations"])
@@ -400,99 +270,93 @@ def evaluate_manifest(
 
     from analyzer.database import Database
 
+    max_lookback = max(
+        int(value) for value in grid.get("lookback_days", [CONSENSUS_LOOKBACK_DAYS])
+    )
     db = Database(db_path, read_only=True)
     try:
-        row_count = db.get_transactions_by_date_range(
-            pd.Timestamp("2021-10-07"), pd.Timestamp(test_end)
+        available = db.get_transactions_by_date_range(
+            pd.Timestamp(train_start) - pd.Timedelta(days=max_lookback),
+            pd.Timestamp(test_end),
         )
-        if row_count.empty:
+        if available.empty:
             raise ValueError(
-                f"staged database {db_path} has no transactions in the frozen window"
+                f"staged database {db_path} has no transactions in the validation window"
             )
-        validation = run_validation(
-            db_path=db_path,
-            train_start=train_start,
-            train_end=train_end,
-            test_start=test_start,
-            test_end=test_end,
-            grid=grid,
-            out_path=Path(out_path).with_name(Path(out_path).name + ".validation.json")
-            if out_path is not None
-            else None,
-            n_permutations=n_permutations,
-            permutation_seed=permutation_seed,
-            alpha=alpha,
-        )
     finally:
-        db.conn.close()
+        db.close()
 
-    portfolio: dict
+    validation = run_validation(
+        db_path=db_path,
+        train_start=train_start,
+        train_end=train_end,
+        test_start=test_start,
+        test_end=test_end,
+        grid=grid,
+        out_path=Path(out_path).with_name(Path(out_path).name + ".validation.json")
+        if out_path is not None
+        else None,
+        n_permutations=n_permutations,
+        permutation_seed=permutation_seed,
+        alpha=alpha,
+    )
+
     selected = validation.get("selected_config")
     if selected is None:
         portfolio = {
             "status": "not_run_no_deployable_config",
-            "reason": (
-                "capital-constrained portfolio evaluation requires a corrected "
-                "train survivor"
-            ),
+            "reason": "portfolio evaluation requires a corrected train survivor",
         }
     else:
         db = Database(db_path, read_only=True)
         try:
-            max_holding = int(selected["horizon"])
-            test_effective_end = _phase_end(test_end, max_holding, 0)
+            test_effective_end = _phase_end(test_end, int(selected["horizon"]))
             portfolio = _run_portfolio_evaluation(
-                db, db_path, selected, test_start, test_effective_end, portfolio_cfg
+                db,
+                selected,
+                test_start,
+                test_effective_end,
+                test_end,
+                portfolio_cfg,
             )
         finally:
-            db.conn.close()
+            db.close()
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "evidence_class": "retrospective_previously_used_not_fresh_oos",
         "verdict": "not_established",
-        "frozen_manifest": manifest,
-        "verification": {"ok": True, "checked_hashes": ["config_sha256", "code_sha256", "git_diff_sha256", "dependency_sha256"]},
+        "predeclared_manifest": manifest,
         "validation": validation,
         "portfolio": portfolio,
     }
     if out_path is not None:
-        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(out_path).write_text(
-            json.dumps(report, indent=2, sort_keys=True, default=str) + "\n"
-        )
+        path = Path(out_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")
     return report
-
-
-class FrozenStateMismatchError(RuntimeError):
-    def __init__(self, reasons: list[str]):
-        self.reasons = reasons
-        super().__init__("frozen manifest verification failed: " + "; ".join(reasons))
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Frozen exactly-once validation of the rebuilt staged database"
+        description="Predeclared retrospective validation of a staged database"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    freeze = sub.add_parser("freeze", help="regenerate a frozen evaluation manifest")
+    freeze = sub.add_parser("freeze", help="write a predeclared evaluation manifest")
     freeze.add_argument("--manifest", default=str(FROZEN_MANIFEST_PATH))
     freeze.add_argument(
         "--min-buyers",
         default=None,
-        help=(
-            "comma-separated min_buyers values for a diagnostic grid variant "
-            "(e.g. '1'); the canonical grid is used when omitted"
-        ),
+        help="comma-separated min_buyers values for a predeclared grid variant",
     )
     freeze.add_argument(
         "--grid-decision",
         default=None,
-        help="documented pre-run decision recorded for a grid variant",
+        help="reason recorded with a predeclared grid variant",
     )
 
-    ev = sub.add_parser("evaluate", help="verify and evaluate the staged database")
+    ev = sub.add_parser("evaluate", help="evaluate the staged database")
     ev.add_argument("--db", required=True, help="path to the staged congress.duckdb")
     ev.add_argument("--out", required=True, help="report JSON output path")
     ev.add_argument("--manifest", default=str(FROZEN_MANIFEST_PATH))
@@ -507,20 +371,19 @@ def main(argv: list[str] | None = None) -> int:
         freeze_manifest(
             Path(args.manifest), grid=grid, grid_decision=args.grid_decision
         )
-        print(f"frozen manifest written: {args.manifest}")
+        print(f"predeclared manifest written: {args.manifest}")
         return 0
+
     try:
         report = evaluate_manifest(args.db, args.out, Path(args.manifest))
-    except FrozenStateMismatchError as exc:
-        print("frozen state mismatch; evaluation refused:", file=sys.stderr)
-        for reason in exc.reasons:
-            print(f"  - {reason}", file=sys.stderr)
+    except FrozenManifestError as exc:
+        print(f"invalid validation manifest: {exc}", file=sys.stderr)
         return 2
-    except EvaluationAlreadyConsumedError as exc:
-        print(f"evaluation already consumed: {exc}", file=sys.stderr)
-        return 3
     print(f"report written: {args.out}")
-    print(f"verdict: {report['verdict']} | validation status: {report['validation']['status']}")
+    print(
+        f"verdict: {report['verdict']} | "
+        f"validation status: {report['validation']['status']}"
+    )
     return 0
 
 

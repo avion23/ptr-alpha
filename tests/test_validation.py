@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import math
 from dataclasses import replace
@@ -25,20 +24,12 @@ from analyzer.validation import (
     LOCKED_FINAL_START,
     MIN_RELEASE_PERMUTATIONS,
     PRIMARY_METRIC,
-    EvaluationAlreadyConsumedError,
-    EvaluationLedgerIntegrityError,
     _backtest_core,
     _build_manifest,
-    _canonical_ledger_path,
-    _complete_evaluation,
-    _hash_untracked_path,
     _effective_validation_grid,
     _phase_end,
-    _record_member_control,
-    _reserve_evaluation,
     _run_identity_invariant_control,
     _run_validation_with_db,
-    _validate_ledger,
     newey_west_tstat,
     permute_signal_member_labels,
     run_validation,
@@ -236,27 +227,21 @@ class TestMemberIdentityGate:
                 member_control={"exempt": True},
             )
 
-    def test_forged_identity_audit_records_are_ignored_for_deployment(self, tmp_path):
+    def test_forged_identity_diagnostic_cannot_change_deployment(self):
         series = {0: _series(np.full(180, 2.0))}
         baseline = _with_series(_selection_frame(series), series)
         selection_before = select_config(baseline, n_permutations=999)
         assert selection_before["deployable_config"] is not None
 
-        ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
-        control = _run_identity_invariant_control(baseline, 0, ledger)
+        control = _run_identity_invariant_control(baseline, 0)
         forged = replace(
             control, method="forged_significant_relabel_test", max_stat_p_value=0.0
         )
-        _record_member_control(tmp_path / "forged-ledger.json", forged)
         selection_after = select_config(baseline, n_permutations=999)
         assert (
             selection_after["deployable_config"]
             == selection_before["deployable_config"]
         )
-
-        gating_forge = replace(forged, gating=True)
-        with pytest.raises(TypeError, match="gating=False"):
-            _record_member_control(tmp_path / "gating-forged-ledger.json", gating_forge)
         with pytest.raises(TypeError, match="unexpected keyword"):
             select_config(baseline, n_permutations=999, member_control=forged)
 
@@ -320,16 +305,13 @@ class TestConsensusProductionScoring:
                 "consensus",
             )
 
-    def test_consensus_records_non_gating_identity_invariance_diagnostic(
-        self, tmp_path
-    ):
+    def test_consensus_reports_non_gating_identity_invariance_diagnostic(self):
         series = {0: _series(np.full(180, 2.0))}
         baseline = _with_series(_selection_frame(series), series)
         selection = select_config(baseline, n_permutations=999)
         assert selection["deployable_config"] is not None
 
-        ledger = tmp_path / ".ptr-alpha-evaluation-ledger-v2.json"
-        control = _run_identity_invariant_control(baseline, 0, ledger)
+        control = _run_identity_invariant_control(baseline, 0)
         assert control.status == "identity_invariant"
         assert control.method == "identity_invariant_by_consensus_scorer_contract_v1"
         assert control.gating is False
@@ -536,7 +518,7 @@ class TestFailureFamilies:
         assert result["family_failure"]["status"] == "failed"
         assert result["family_failure"]["failed_trial_count"] == 1
 
-    def test_failed_family_does_not_reserve_evaluation(self, tmp_path, monkeypatch):
+    def test_failed_family_stops_before_test_window(self, tmp_path, monkeypatch):
         series = {0: _series(np.full(180, 2.0))}
         frame = _with_series(_selection_frame(series), series)
         frame["trial_failed"] = True
@@ -547,12 +529,6 @@ class TestFailureFamilies:
         monkeypatch.setattr(
             "analyzer.validation.sweep_configs", lambda *args, **kwargs: frame
         )
-        reserve_calls = []
-        monkeypatch.setattr(
-            "analyzer.validation._reserve_evaluation",
-            lambda *args, **kwargs: reserve_calls.append(args) or "unexpected",
-        )
-
         transaction_queries = []
 
         class EmptyDb:
@@ -581,13 +557,11 @@ class TestFailureFamilies:
             max_holding=60,
             n_permutations=999,
             permutation_seed=0,
-            evaluation_ledger_path=tmp_path / "ledger.json",
             alpha=0.05,
             out_path=None,
         )
         assert output["selected_config"] is None
         assert output["correction"]["failure_reason"] == "family_trial_failure"
-        assert reserve_calls == []
         assert transaction_queries == [
             (pd.Timestamp("2021-12-04"), pd.Timestamp("2022-12-01"))
         ]
@@ -629,21 +603,11 @@ class TestPurgeAndManifest:
                 {"horizon": [60]},
             )
 
-    def test_manifest_hashes_and_locks_final_without_consuming_it(
-        self, tmp_path, monkeypatch
-    ):
-        database = tmp_path / "db.duckdb"
-        database.write_bytes(b"known database bytes")
+    def test_manifest_records_statistical_evidence_without_execution_receipts(self):
         frame = pd.DataFrame(
             {"x": [1, 2]}, index=pd.date_range("2024-01-01", periods=2)
         )
-        monkeypatch.setattr("analyzer.validation._code_hash", lambda: "c" * 64)
-        monkeypatch.setattr(
-            "analyzer.validation._git_state",
-            lambda: {"revision": "git-known", "dirty": False, "diff_sha256": "d" * 64},
-        )
         manifest = _build_manifest(
-            database,
             frame,
             frame,
             frame,
@@ -664,7 +628,6 @@ class TestPurgeAndManifest:
             "end": None,
             "status": "locked_not_queried_or_evaluated",
             "value_rows_queried": False,
-            "whole_database_file_hashed_for_provenance": True,
             "consumed": False,
         }
         assert manifest["phases"]["train"]["outcomes_end_by"] == "2023-12-31"
@@ -672,150 +635,14 @@ class TestPurgeAndManifest:
             manifest["phases"]["test"]["evidence_class"]
             == "retrospective_previously_used_not_fresh_oos"
         )
-        assert manifest["hashes"]["code_sha256"] == "c" * 64
-        assert manifest["hashes"]["git_revision"] == "git-known"
-        assert manifest["hashes"]["git_diff_sha256"] == "d" * 64
-        assert manifest["git"]["dirty"] is False
-        for key in [
-            "database_sha256",
-            "value_snapshot_sha256",
-            "config_sha256",
-            "family_sha256",
-            "dependency_sha256",
-        ]:
-            assert len(manifest["hashes"][key]) == 64
         assert manifest["n_trials"] == 1
-        assert (
-            manifest["family"]["family_sha256"]
-            == manifest["hashes"]["family_sha256"]
-        )
         assert manifest["family"]["family_size"] == 1
         assert manifest["family"]["family_provenance"] == FAMILY_PROVENANCE
-
-
-class TestEvaluationConsumptionLedger:
-    def test_reservation_is_durable_and_refuses_repeat_or_alternate_grid(
-        self, tmp_path
-    ):
-        ledger = tmp_path / "ledger.json"
-        manifest = {
-            "hashes": {
-                "database_sha256": "a" * 64,
-                "value_snapshot_sha256": "b" * 64,
-            }
-        }
-        first = _reserve_evaluation(
-            ledger,
-            manifest,
-            {"horizon": 60},
-            {"horizon": [60]},
-            date(2024, 1, 1),
-            date(2025, 6, 30),
-        )
-        assert ledger.exists()
-        payload = __import__("json").loads(ledger.read_text())
-        assert payload["events"][0]["status"] == "reserved_consumed"
-        _validate_ledger(payload)
-        with pytest.raises(EvaluationAlreadyConsumedError, match="alternate"):
-            _reserve_evaluation(
-                ledger,
-                manifest,
-                {"horizon": 90},
-                {"horizon": [90]},
-                date(2025, 1, 1),
-                date(2025, 12, 31),
-            )
-        _complete_evaluation(ledger, first, "completed_retrospective")
-        payload = __import__("json").loads(ledger.read_text())
-        assert payload["events"][-1]["status"] == "completed_retrospective"
-        assert (
-            payload["events"][-1]["previous_sha256"]
-            == payload["events"][0]["event_sha256"]
-        )
-        _validate_ledger(payload)
-
-    def test_prior_v1_ledger_requires_explicit_archive_or_migration(self, tmp_path):
-        legacy = tmp_path / "validation_evaluation_ledger.json"
-        legacy.write_text(
-            __import__("json").dumps(
-                {
-                    "schema_version": 1,
-                    "evaluations": [{"window": ["2024-01-01", "2025-06-30"]}],
-                }
-            )
-        )
-        manifest = {
-            "hashes": {
-                "database_sha256": "a" * 64,
-                "value_snapshot_sha256": "b" * 64,
-            }
-        }
-        with pytest.raises(EvaluationLedgerIntegrityError, match="archive or migrate"):
-            _reserve_evaluation(
-                tmp_path / ".ptr-alpha-evaluation-ledger-v2.json",
-                manifest,
-                {},
-                {},
-                date(2024, 1, 1),
-                date(2025, 6, 30),
-            )
-
-    def test_hash_chain_detects_local_tampering(self, tmp_path):
-        ledger = tmp_path / "ledger.json"
-        manifest = {
-            "hashes": {
-                "database_sha256": "a" * 64,
-                "value_snapshot_sha256": "b" * 64,
-            }
-        }
-        _reserve_evaluation(
-            ledger, manifest, {}, {}, date(2024, 1, 1), date(2024, 12, 31)
-        )
-        payload = __import__("json").loads(ledger.read_text())
-        payload["events"][0]["status"] = "rewritten"
-        with pytest.raises(EvaluationLedgerIntegrityError, match="hash"):
-            _validate_ledger(payload)
-        assert "local attacker" in payload["local_tamper_limitation"]
-
-    def test_public_runner_has_only_canonical_ledger_path(self, tmp_path):
-        assert (
-            "evaluation_ledger_path" not in inspect.signature(run_validation).parameters
-        )
-        db_path = tmp_path / "data" / "database.duckdb"
-        assert _canonical_ledger_path(db_path) == (
-            db_path.parent.resolve() / ".ptr-alpha-evaluation-ledger-v2.json"
-        )
-
-    def test_untracked_directory_hash_recurses_into_file_contents(self, tmp_path):
-        directory = tmp_path / "untracked"
-        directory.mkdir()
-        nested = directory / "nested"
-        nested.mkdir()
-        value = nested / "value.txt"
-        value.write_text("first")
-        first = hashlib.sha256()
-        _hash_untracked_path(first, tmp_path, directory)
-        value.write_text("second")
-        second = hashlib.sha256()
-        _hash_untracked_path(second, tmp_path, directory)
-        assert first.hexdigest() != second.hexdigest()
-
-    def test_untracked_hash_records_nested_directory_symlinks(self, tmp_path):
-        directory = tmp_path / "untracked"
-        directory.mkdir()
-        first_target = tmp_path / "first-target"
-        second_target = tmp_path / "second-target"
-        first_target.mkdir()
-        second_target.mkdir()
-        link = directory / "nested-link"
-        link.symlink_to(first_target, target_is_directory=True)
-        first = hashlib.sha256()
-        _hash_untracked_path(first, tmp_path, directory)
-        link.unlink()
-        link.symlink_to(second_target, target_is_directory=True)
-        second = hashlib.sha256()
-        _hash_untracked_path(second, tmp_path, directory)
-        assert first.hexdigest() != second.hexdigest()
+        assert manifest["coverage_input"]["transactions"] == 2
+        assert "hashes" not in manifest
+        assert "git" not in manifest
+        assert "dependencies" not in manifest
+        assert "evaluation_ledger" not in manifest
 
 
 class TestMemberPermutationCanary:

@@ -8,18 +8,15 @@ validation contract under test:
   support (no date is silently dropped);
 * one per-date net-alpha statistic drives inference, correction, selection,
   and verdict;
-* no-survivor sweeps fail closed (descriptive-only, no fallback, no
-  reservation written);
-* consensus is identity-invariant and its control is recorded non-gating
-  (gating=False) in the canonical ledger;
-* the canonical ledger refuses overlapping evaluations exactly once;
+* no-survivor sweeps fail closed (descriptive-only, no fallback);
+* consensus is identity-invariant and its control is non-gating;
+* retrospective evaluations are repeatable and require no bookkeeping file;
 * the test window is labeled retrospective diagnostics only and the locked
   final phase is never queried or consumed.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -30,11 +27,8 @@ import pytest
 from analyzer.database import Database
 from analyzer.member_ranking.buyer_scoring import CONSENSUS_SCORER_PROVENANCE
 from analyzer.validation import (
-    EvaluationAlreadyConsumedError,
     PRIMARY_METRIC,
     _benchmark_return,
-    _canonical_ledger_path,
-    _validate_ledger,
     run_validation,
 )
 
@@ -283,15 +277,10 @@ class TestNoSurvivorFailClosed:
         assert out["train"]["label"] == "not_selected_for_deployment"
         assert out["correction"]["failure_reason"] == "no_dependence_safe_survivor"
         assert out["correction"]["n_statistical_survivors"] == 0
-        # A no-survivor sweep never writes a consumption reservation.
-        ledger_path = _canonical_ledger_path(db_path)
-        if ledger_path.exists():
-            ledger = json.loads(ledger_path.read_text())
-            assert [e["event_type"] for e in ledger["events"]] == []
 
 
 class TestConsensusIdentityInvariance:
-    def test_consensus_identity_control_is_recorded_non_gating(self, tmp_path):
+    def test_consensus_identity_control_is_non_gating(self, tmp_path):
         db_path = build_fixture_db(tmp_path)
         out = run_fixture_validation(db_path)
         assert out["status"] == "retrospective_positive_result"
@@ -301,16 +290,6 @@ class TestConsensusIdentityInvariance:
         assert control["status"] == "identity_invariant"
         assert control["method"].startswith("identity_invariant_by_consensus_scorer_contract")
         assert control["requested_permutations"] == 0
-
-        ledger = json.loads(_canonical_ledger_path(db_path).read_text())
-        events = {e["event_type"] for e in ledger["events"]}
-        assert {"member_identity_control", "reservation", "completion"} <= events
-        identity = next(
-            e for e in ledger["events"] if e["event_type"] == "member_identity_control"
-        )
-        assert identity["control"]["gating"] is False
-        assert identity["control"]["status"] == "identity_invariant"
-        _validate_ledger(ledger)
 
     def test_member_label_permutation_is_invariant_for_consensus(self, tmp_path):
         """Swapping member identities must not change the per-date alpha series."""
@@ -348,42 +327,18 @@ class TestConsensusIdentityInvariance:
         assert float(base_series.mean()) > 0
 
 
-class TestLedgerOverlapRefusal:
-    def test_overlapping_evaluation_is_refused_exactly_once(self, tmp_path):
+class TestRetrospectiveRepeatability:
+    def test_repeated_evaluation_recomputes_same_result_without_bookkeeping(self, tmp_path):
         db_path = build_fixture_db(tmp_path)
         first = run_fixture_validation(db_path)
-        assert first["status"] == "retrospective_positive_result"
-        ledger = json.loads(_canonical_ledger_path(db_path).read_text())
-        assert [e["event_type"] for e in ledger["events"]] == [
-            "member_identity_control",
-            "reservation",
-            "completion",
-        ]
-        _validate_ledger(ledger)
+        second = run_fixture_validation(db_path)
 
-        with pytest.raises(EvaluationAlreadyConsumedError, match="overlaps a consumed"):
-            run_fixture_validation(db_path)
-        # The refused repeat never reserves again: the chain stays valid, the
-        # evaluation key is unchanged, and no second reservation/completion
-        # event exists (only a non-gating diagnostic may be appended).
-        after = json.loads(_canonical_ledger_path(db_path).read_text())
-        _validate_ledger(after)
-        reservations = [
-            e for e in after["events"] if e["event_type"] == "reservation"
-        ]
-        completions = [
-            e for e in after["events"] if e["event_type"] == "completion"
-        ]
-        assert len(reservations) == 1
-        assert len(completions) == 1
-        assert (
-            reservations[0]["evaluation_key"]
-            == first["evaluation_ledger"]["evaluation_key"]
-        )
-        assert (
-            completions[0]["evaluation_key"]
-            == first["evaluation_ledger"]["evaluation_key"]
-        )
+        assert first["status"] == "retrospective_positive_result"
+        assert second["status"] == first["status"]
+        assert second["selected_config"] == first["selected_config"]
+        assert second["train"] == first["train"]
+        assert second["test"] == first["test"]
+        assert not (tmp_path / ".ptr-alpha-evaluation-ledger-v2.json").exists()
 
 
 class TestRetrospectiveNotFinalWording:
@@ -415,4 +370,4 @@ class TestRetrospectiveNotFinalWording:
                 if "fresh_oos" in lowered:
                     assert "not_fresh_oos" in lowered, f"{key} claims fresh OOS"
         assert out["degradation_ratio"] is not None
-        assert "retrospective" in out["evaluation_ledger"]["status"]
+        assert "evaluation_ledger" not in out

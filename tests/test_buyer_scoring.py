@@ -1,6 +1,5 @@
 import inspect
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -31,8 +30,7 @@ def test_consensus_cold_start_needs_no_rankings_or_signal_history():
         min_buyers=1,
     )
 
-    expected = np.exp(-0.03 * 10)
-    assert result.iloc[0]["signal_score_raw"] == pytest.approx(expected)
+    assert result.iloc[0]["signal_score_raw"] == 1.0
     assert result.iloc[0]["scoring_mode"] == "consensus"
 
 
@@ -51,7 +49,7 @@ def test_consensus_score_is_invariant_to_member_identity_shuffle():
     assert original.iloc[0]["num_buyers"] == permuted.iloc[0]["num_buyers"] == 3
 
 
-def test_consensus_uses_absolute_age_from_explicit_as_of_date():
+def test_consensus_has_no_hidden_age_decay_inside_candidate_window():
     transactions = _transactions(("Alice", "Bob"))
     early = score_ticker_by_buyers(
         "AAPL",
@@ -66,9 +64,8 @@ def test_consensus_uses_absolute_age_from_explicit_as_of_date():
         min_buyers=1,
     )
 
-    assert late.iloc[0]["signal_score_raw"] == pytest.approx(
-        early.iloc[0]["signal_score_raw"] * np.exp(-0.03 * 30)
-    )
+    assert early.iloc[0]["signal_score_raw"] == 2.0
+    assert late.iloc[0]["signal_score_raw"] == 2.0
 
 
 def test_scoring_mode_typo_and_probability_times_alpha_are_rejected():

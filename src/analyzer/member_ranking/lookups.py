@@ -50,7 +50,7 @@ def _build_ranking_dicts(
     Avoids repeated DataFrame linear scans in the per-ticker scoring loop.
 
     scoring_mode controls how member scores are computed:
-      - "consensus": identity-free distinct-buyer/recency score (safe default)
+      - "consensus": identity-free distinct recent-buyer count (safe default)
       - "shrunk_alpha": descriptive normal-normal historical endpoint alpha
       - "consistency": endpoint-alpha win rate * log(1 + trades)
       - "trade_frequency": log(1 + trades)

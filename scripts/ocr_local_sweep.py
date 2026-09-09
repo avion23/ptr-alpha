@@ -93,7 +93,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from multiprocessing import Pool
 from pathlib import Path
 
@@ -150,13 +150,10 @@ if TESSERACT_PSM != 3 or TESSERACT_PSM_SPARSE != 11:
 
 from scripts.scan_ocr import (  # noqa: E402
     OcrRow,
-    _EXAMPLE_RE,
-    _classify_type,
     _merge_page_results,
     extract_page_rows,
     pdf_page_count,
     sha256_file,
-    tesseract_plain_lines,
 )
 from scripts.ocr_zero_rows import extract_ticker, resolve_ticker  # noqa: E402
 from analyzer.parsing import (  # noqa: E402

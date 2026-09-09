@@ -611,7 +611,7 @@ def prices(args) -> None:
     import re  # noqa: PLC0415
     import time  # noqa: PLC0415
 
-    from analyzer.datasources import YFinancePriceSource  # noqa: PLC0415
+    from analyzer.price_source import YFinancePriceSource  # noqa: PLC0415
 
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
@@ -829,10 +829,6 @@ def _check(checks: dict, name: str, condition: bool, detail: str = "") -> None:
 
 
 def verify(args) -> None:
-    import pandas as pd  # noqa: PLC0415
-
-    from analyzer.senate_efd import SenateRefreshSummary  # noqa: PLC0415
-
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     checks: dict = {}
@@ -1057,7 +1053,6 @@ def verify(args) -> None:
         }
 
         # 7. canonical view: complete generations visible, incomplete hidden
-        complete_years = [y for y in HOUSE_YEARS if y not in incomplete_years]
         canonical_count = db.conn.execute(
             "SELECT COUNT(*) FROM canonical_transactions"
         ).fetchone()[0]
@@ -1959,7 +1954,7 @@ def finalize(args) -> None:
     )
 
     lines = [
-        f"STAGED AUTHORITATIVE CONGRESSIONAL DATABASE REBUILD — VERDICT",
+        "STAGED AUTHORITATIVE CONGRESSIONAL DATABASE REBUILD — VERDICT",
         f"Generation: {manifest['generation']}",
         f"Created: {manifest['created_at']}  Git SHA: {manifest['git_sha']}",
         "",

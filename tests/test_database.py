@@ -8,7 +8,6 @@ from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.senate_efd import SenateEFDSource
 from analyzer.transaction_repository import (
-    AmbiguousTransactionIdentityError,
     SOURCE_TRANSACTION_COLUMNS,
     _normalize_frame,
 )

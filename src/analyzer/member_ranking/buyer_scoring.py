@@ -1,15 +1,14 @@
 """Score a ticker by its buyer composition.
 
 `score_ticker_by_buyers` combines a ticker's disclosed buyers into a signal.
-The safe default is an identity-free consensus score based only on distinct
-recent buyers and recency. Historical member effects are descriptive,
+The safe default is an identity-free consensus score equal to the number of
+distinct recent buyers. Historical member effects are descriptive,
 noncausal opt-ins; Bayesian probability-times-alpha and solo posterior gates
 are not tradable scores.
 """
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from analyzer import signals as _signals
@@ -27,7 +26,7 @@ from analyzer.member_ranking.lookups import (
     _validate_scoring_mode,
 )
 
-CONSENSUS_SCORER_PROVENANCE = "identity_free_distinct_buyer_recency_v1"
+CONSENSUS_SCORER_PROVENANCE = "identity_free_distinct_buyer_count_v2"
 
 
 @df_memoize(copy=False)
@@ -125,7 +124,7 @@ def _validate_inputs(
     transactions_df: pd.DataFrame,
     scoring_mode: str,
 ) -> None:
-    if transactions_df.empty:
+    if transactions_df.empty and scoring_mode != "consensus":
         raise AnalysisError("Empty transactions dataframe")
     if scoring_mode != "consensus" and (signals_df is None or signals_df.empty):
         raise AnalysisError("Historical scoring requires a non-empty signal dataframe")
@@ -159,9 +158,9 @@ def _below_threshold_result(
 def _consensus_inputs(
     buyers, ticker_trades: pd.DataFrame, *, as_of_date: pd.Timestamp
 ) -> dict:
-    """Build an identity-free distinct-buyer recency score.
+    """Build an identity-free distinct-buyer count.
 
-    Each canonical buyer contributes its most recent disclosure weight. Names,
+    Candidate selection already applies the public disclosure window. Names,
     historical returns, trade counts, and member posteriors do not enter the
     score, so permuting member identities leaves it unchanged.
     """
@@ -181,8 +180,7 @@ def _consensus_inputs(
         raise AnalysisError(
             "Consensus disclosures must be known on or before as_of_date"
         )
-    weights = np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.to_numpy(dtype=float))
-    score = float(weights.sum())
+    score = float(len(buyers))
     return {
         "base_signal_score": score,
         "rated_buyers_list": list(buyers),
@@ -210,14 +208,8 @@ def _member_only_inputs(
     total_trades = sum(trades_dict.get(m, 0) for m in rated_buyers_list)
     rated_buyers = len(rated_buyers_list)
 
-    confidence_weights = _recency_weights(ticker_trades, rated_buyers_list)
-    alpha_values = np.array([alpha_dict[m] for m in rated_buyers_list])
-    confidence_weight_sum = confidence_weights.sum()
-    quality_adjusted_avg = (
-        (alpha_values * confidence_weights).sum() / confidence_weight_sum
-        if confidence_weight_sum > 0
-        else 0
-    )
+    alpha_values = [alpha_dict[m] for m in rated_buyers_list]
+    quality_adjusted_avg = sum(alpha_values) / len(alpha_values)
 
     return {
         "base_signal_score": quality_adjusted_avg,
@@ -259,32 +251,6 @@ def _ticker_history_fallback(ticker, buyers, signals_df, ticker_perf_signals):
             "fallback_source": [fallback_source],
         }
     )
-
-
-def _recency_weights(ticker_trades: pd.DataFrame, rated_buyers_list) -> np.ndarray:
-    n_rated = len(rated_buyers_list)
-    if n_rated == 0 or "disclosure_date" not in ticker_trades.columns:
-        return np.ones(n_rated, dtype=float)
-    member_col = (
-        "_member_canonical"
-        if "_member_canonical" in ticker_trades.columns
-        else "member"
-    )
-    rated_ticker_trades = ticker_trades[
-        ticker_trades[member_col].isin(rated_buyers_list)
-    ]
-    if rated_ticker_trades.empty:
-        return np.ones(n_rated, dtype=float)
-    latest_disclosure = rated_ticker_trades["disclosure_date"].max()
-    member_disclosures = rated_ticker_trades.groupby(member_col)[
-        "disclosure_date"
-    ].max()
-    days_since = (
-        (latest_disclosure - member_disclosures.reindex(rated_buyers_list))
-        .dt.days.fillna(0)
-        .clip(lower=0)
-    )
-    return np.exp(-_signals.BUYER_RECENCY_DECAY * days_since.values)
 
 
 def _final_result(

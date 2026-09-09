@@ -5,7 +5,8 @@ import numpy as np
 from pathlib import Path
 from analyzer.settings import Settings, DataSettings
 from analyzer.pipeline import run_analysis_pipeline, AnalysisParams
-from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
+from analyzer.download import HouseTransactionSource
+from analyzer.price_source import YFinancePriceSource
 from analyzer.database import Database
 from analyzer.models import AnalysisMode
 

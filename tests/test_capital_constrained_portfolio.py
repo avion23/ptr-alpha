@@ -82,7 +82,7 @@ def _fixture_recommendations(db_path: Path) -> pd.DataFrame:
     for as_of in pd.date_range(PORT_START, PORT_END, freq="30D"):
         recs = analysis.backtest_recommendations(
             signals, all_tx, as_of_date=as_of, horizon=60, lookback_days=60,
-            min_buyers=2, top_n=5, threshold=5.0, prices_df=prices,
+            min_buyers=2, top_n=5, threshold=5.0,
             training_lookback_days=365, scoring_mode="consensus",
             bayes_prior_strength=20.0,
         )

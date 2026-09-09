@@ -19,13 +19,8 @@ working after the split.
 # Constants
 from analyzer.signals.constants import (
     BAYES_PRIOR_STRENGTH,
-    BUYER_RECENCY_DECAY,
-    CONVICTION_WEIGHT_ALPHA,
-    CONVICTION_WEIGHT_REALIZED,
     DECAY_LAMBDA,
-    MAX_DISCLOSURE_METADATA_ADJUSTMENT,
     MIN_ENTRY_PRICE,
-    POSITION_SIZE_BASELINE,
     TICKER_PERF_MIN_TRADES,
     _NS_PER_DAY,
 )
@@ -66,14 +61,9 @@ from analyzer.signals.core import (
 
 __all__ = [
     "DECAY_LAMBDA",
-    "POSITION_SIZE_BASELINE",
-    "MAX_DISCLOSURE_METADATA_ADJUSTMENT",
     "BAYES_PRIOR_STRENGTH",
-    "BUYER_RECENCY_DECAY",
     "TICKER_PERF_MIN_TRADES",
     "MIN_ENTRY_PRICE",
-    "CONVICTION_WEIGHT_ALPHA",
-    "CONVICTION_WEIGHT_REALIZED",
     "_NS_PER_DAY",
     "_clear_price_index_cache",
     "_price_arrays",

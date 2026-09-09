@@ -292,7 +292,6 @@ def run_matched_control_backtest(
             min_buyers=min_buyers,
             top_n=top_n,
             threshold=threshold,
-            prices_df=prices_df,
             training_lookback_days=training_lookback_days,
         )
 

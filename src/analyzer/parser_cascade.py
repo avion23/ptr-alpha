@@ -3,6 +3,7 @@
 import os
 import re
 import logging
+import time
 from pathlib import Path
 
 import camelot
@@ -162,15 +163,35 @@ def _reconcile_candidates(candidates, engines_attempted):
 
 def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
     engines_attempted.append(engine_name)
+    started = time.monotonic()
     try:
         transactions = engine_fn(pdf_path)
     except ParserBackendError as exc:
+        elapsed = time.monotonic() - started
         errors.append(str(exc))
         engines_attempted.append(f"error:{engine_name}")
+        logger.debug(
+            "Parser %s failed for %s after %.3fs: %s",
+            engine_name,
+            pdf_path.name,
+            elapsed,
+            exc,
+        )
         return None
+
+    elapsed = time.monotonic() - started
+    quality = _result_quality(transactions)
+    logger.debug(
+        "Parser %s completed %s in %.3fs: rows=%d quality=%.3f",
+        engine_name,
+        pdf_path.name,
+        elapsed,
+        len(transactions),
+        quality,
+    )
     if transactions:
         engines_attempted.append(
-            f"candidate:{engine_name}:{len(transactions)}:{_result_quality(transactions):.3f}"
+            f"candidate:{engine_name}:{len(transactions)}:{quality:.3f}"
         )
         return engine_name, transactions
     return None
@@ -302,35 +323,31 @@ def _try_camelot_stream(pdf_path: Path) -> list[dict]:
 
 
 def _try_pdftotext(pdf_path: Path) -> list[dict]:
-    """Handles encrypted PDFs where camelot/pdfplumber return nothing."""
+    """Extract every pdftotext table instead of stopping at the first match."""
     try:
         pdftext_tables = extract_tables_with_pdftotext(pdf_path)
     except Exception as e:
         raise ParserBackendError("pdftotext", e) from e
+    transactions: list[dict] = []
     for table in pdftext_tables:
-        txs = parse_pdf_table(table)
-        if txs:
-            return txs
-    return []
+        transactions.extend(parse_pdf_table(table))
+    return transactions
 
 
 def _try_docling(pdf_path: Path) -> list[dict]:
-    """OCR fallback for SCANNED IMAGE PDFs (no text layer). Slow (13-300s)
-    but only runs when all text-layer parsers return nothing.
+    """Extract every Docling table from a scanned PDF.
 
-    Skip when PTR_SKIP_DOCLING=1 (set during the bulk first pass; stragglers
-    are re-parsed with Docling in a second pass using reduced worker count
-    to avoid OOM — each Docling proc uses ~2GB).
+    Docling is expensive (roughly 13-300s and about 2 GB per process), so bulk
+    runs may set ``PTR_SKIP_DOCLING=1`` and handle stragglers separately.
     """
     try:
         docling_tables = extract_tables_with_docling(pdf_path)
     except Exception as e:
         raise ParserBackendError("docling", e) from e
+    transactions: list[dict] = []
     for table in docling_tables:
-        txs = parse_pdf_table(table)
-        if txs:
-            return txs
-    return []
+        transactions.extend(parse_pdf_table(table))
+    return transactions
 
 
 def _try_tesseract(pdf_path: Path) -> list[dict]:

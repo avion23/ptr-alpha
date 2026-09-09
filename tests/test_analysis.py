@@ -111,10 +111,7 @@ class TestAnalysis(unittest.TestCase):
             as_of_date=pd.Timestamp("2024-02-01"),
         )
 
-        expected_consensus = np.exp(-0.03 * 29) + np.exp(-0.03 * 28)
-        self.assertEqual(
-            score.iloc[0]["base_signal_score"], round(expected_consensus, 2)
-        )
+        self.assertEqual(score.iloc[0]["base_signal_score"], 2.0)
         self.assertEqual(score.iloc[0]["scoring_mode"], "consensus")
         self.assertGreater(score.iloc[0]["size_factor"], 1.0)
         self.assertLess(score.iloc[0]["owner_factor"], 1.0)
@@ -346,20 +343,16 @@ class TestAnalysis(unittest.TestCase):
             scoring_mode="shrunk_alpha",
         )
 
-        # New: recency-only weights (no sqrt-trades, no bayes_win_prob multiplication)
-        # Alice disclosed 2024-01-01, Charlie 2024-01-02 → latest = Jan 2
-        # Alice: 1 day since latest, Charlie: 0 days since
-        alice_weight = np.exp(-0.03 * 1)
-        charlie_weight = np.exp(-0.03 * 0)  # = 1.0
-        quality_weighted_sum = 10.0 * alice_weight + 20.0 * charlie_weight
-        quality_adjusted_avg = quality_weighted_sum / (alice_weight + charlie_weight)
+        # Historical diagnostics give each rated buyer one vote. Trade count,
+        # disclosure age, and a second Bayesian weight must not multiply the effect.
+        quality_adjusted_avg = (10.0 + 20.0) / 2
         self.assertEqual(score.iloc[0]["num_buyers"], 3)
         self.assertEqual(score.iloc[0]["rated_buyers"], 2)
         self.assertEqual(
             score.iloc[0]["base_signal_score"], round(quality_adjusted_avg, 2)
         )
 
-    def test_score_ticker_by_buyers_uses_recency_weights_not_trade_count(self):
+    def test_score_ticker_by_buyers_uses_equal_buyer_weights_not_trade_count(self):
         transactions = pd.DataFrame(
             {
                 "member": ["Focused", "NoiseBot"],
@@ -397,12 +390,9 @@ class TestAnalysis(unittest.TestCase):
             scoring_mode="shrunk_alpha",
         )
 
-        # With recency-only weights, avg_buyer_performance is a recency-weighted
-        # average of avg_spy_alpha_pct. Focused disclosed Jan 1 (1 day old),
-        # NoiseBot Jan 2 (0 days old). No sqrt-trades or bayes_win_prob weighting.
-        focused_w = np.exp(-0.03 * 1)
-        noisebot_w = np.exp(-0.03 * 0)
-        expected_avg = (18.0 * focused_w + 3.0 * noisebot_w) / (focused_w + noisebot_w)
+        # Trade count and posterior win probability do not reweight the member
+        # diagnostic. Each rated buyer contributes one member effect.
+        expected_avg = (18.0 + 3.0) / 2
         self.assertAlmostEqual(
             score.iloc[0]["avg_buyer_performance"], round(expected_avg, 2)
         )
@@ -769,8 +759,7 @@ class TestSoloBuyerConsensusScoring(unittest.TestCase):
             as_of_date=pd.Timestamp("2024-02-01"),
         )
 
-        expected = round(np.exp(-0.03 * 29), 2)
-        self.assertEqual(low.iloc[0]["signal_score"], expected)
+        self.assertEqual(low.iloc[0]["signal_score"], 1.0)
         self.assertEqual(low.iloc[0]["signal_score"], high.iloc[0]["signal_score"])
 
     def test_minimum_distinct_buyer_gate_remains(self):

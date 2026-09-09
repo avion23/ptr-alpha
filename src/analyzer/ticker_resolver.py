@@ -47,6 +47,13 @@ class TickerResolver:
         "CELG": ("BMY", "2019-11-20"),
     }
 
+    # Symbols known to have been reused by another security. A congressional
+    # filing can name the future symbol before public trading begins, so price
+    # history must not be borrowed from the previous security using that symbol.
+    LISTING_START_MAP: dict[str, str] = {
+        "SPCX": "2026-06-12",
+    }
+
     CLASS_SHARE_MAP: dict[str, str] = {
         "BRK": "BRK-B",
         "BRKB": "BRK-B",
@@ -103,11 +110,12 @@ class TickerResolver:
         """Resolve a raw ticker to a yfinance symbol.
 
         Resolution order:
-        1. Class-share dot-to-hyphen mapping
-        2. True rename mapping (with date-based validity check)
-        3. Acquisition mapping (always evaluate under original symbol)
-        4. Pseudo-ticker parser artifact mapping
-        5. Pass through as-is (already valid)
+        1. Date-gated listing/reused-symbol mapping
+        2. Class-share dot-to-hyphen mapping
+        3. True rename mapping (with date-based validity check)
+        4. Acquisition mapping (always evaluate under original symbol)
+        5. Pseudo-ticker parser artifact mapping
+        6. Pass through as-is (already valid)
         """
         if not raw_ticker:
             return TickerResolution(
@@ -132,7 +140,35 @@ class TickerResolver:
                 notes=f"Ambiguous parser token is not eligible for equity strategies: {normalized}",
             )
 
-        # 1. Class-share mapping
+        # 1. Date-gated listing for reused symbols.
+        if normalized in self.LISTING_START_MAP:
+            listing_date_str = self.LISTING_START_MAP[normalized]
+            listing_date = date.fromisoformat(listing_date_str)
+            if trade_date is None:
+                return TickerResolution(
+                    raw_ticker=raw_ticker,
+                    price_symbol=normalized,
+                    status="date_required",
+                    confidence=0.0,
+                    notes=f"Ticker {normalized} requires a reference date; listing began {listing_date_str}",
+                )
+            if trade_date < listing_date:
+                return TickerResolution(
+                    raw_ticker=raw_ticker,
+                    price_symbol=normalized,
+                    status="pre_listing",
+                    confidence=0.0,
+                    notes=f"Ticker {normalized} is not price-eligible before {listing_date_str}",
+                )
+            return TickerResolution(
+                raw_ticker=raw_ticker,
+                price_symbol=normalized,
+                status="listed_from_date",
+                confidence=1.0,
+                notes=f"Ticker {normalized} listing verified from {listing_date_str}",
+            )
+
+        # 2. Class-share mapping
         if normalized in self.CLASS_SHARE_MAP:
             mapped = self.CLASS_SHARE_MAP[normalized]
             return TickerResolution(
@@ -143,7 +179,7 @@ class TickerResolver:
                 notes=f"Class-share variant: {normalized} -> {mapped}",
             )
 
-        # 2. True rename mapping
+        # 3. True rename mapping
         if normalized in self.RENAME_MAP:
             new_symbol, effective_date_str = self.RENAME_MAP[normalized]
             effective_date = date.fromisoformat(effective_date_str)
@@ -179,7 +215,7 @@ class TickerResolver:
                 ),
             )
 
-        # 3. Acquisition mapping. Never substitute the acquirer's equity.
+        # 4. Acquisition mapping. Never substitute the acquirer's equity.
         if normalized in self.ACQUISITION_MAP:
             acquirer, acquisition_date_str = self.ACQUISITION_MAP[normalized]
             acquisition_date = date.fromisoformat(acquisition_date_str)
@@ -204,7 +240,7 @@ class TickerResolver:
                 ),
             )
 
-        # 4. Pseudo-ticker mapping (pdftotext parser artifacts)
+        # 5. Pseudo-ticker mapping (pdftotext parser artifacts)
         if normalized in self.PSEUDO_TICKER_MAP:
             mapped = self.PSEUDO_TICKER_MAP[normalized]
             return TickerResolution(
@@ -215,7 +251,7 @@ class TickerResolver:
                 notes=f"Pseudo-ticker {normalized} -> {mapped}",
             )
 
-        # 5. Pass through, but do not claim that syntax proves a listed equity.
+        # 6. Pass through, but do not claim that syntax proves a listed equity.
         return TickerResolution(
             raw_ticker=raw_ticker,
             price_symbol=normalized,
@@ -234,6 +270,7 @@ class TickerResolver:
         """
         resolution = self.resolve(raw_ticker, trade_date)
         return resolution.confidence > 0 and resolution.status in {
+            "listed_from_date",
             "class_share",
             "renamed",
             "pre_rename",

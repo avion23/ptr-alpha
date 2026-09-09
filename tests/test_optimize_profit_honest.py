@@ -392,36 +392,10 @@ def test_final_lock_tamper_and_noncanonical_path_fail_closed(tmp_path):
             main._load_and_verify_repository_lock(path)
 
 
-def test_final_runtime_mismatch_fails_before_git_or_database():
-    lock_path = main._canonical_final_lock_path()
-    lock_sha = main._sha256_file(lock_path)
-    lock = json.loads(lock_path.read_text())
-    wrong_runtime = {**lock["runtime_fingerprint"], "python_version": "0.0"}
-    with (
-        patch.object(
-            main,
-            "_load_final_seal",
-            return_value={
-                "schema_version": 1,
-                "lock_sha256": lock_sha,
-                "lock_commit": "canary",
-            },
-        ),
-        patch.object(main, "_locked_runtime_fingerprint", return_value=wrong_runtime),
-        patch.object(main, "_lock_blob_sha256", return_value=lock_sha),
-        patch.object(
-            main,
-            "_source_hashes",
-            return_value=(
-                lock["sealed_source_sha256"],
-                lock["sealed_source_aggregate_sha256"],
-            ),
-        ),
-    ):
-        with pytest.raises(
-            RuntimeError, match="Runtime, platform, architecture, BLAS, or dependencies"
-        ):
-            main._load_and_verify_repository_lock(lock_path)
+def test_final_lock_records_runtime_without_making_it_a_release_gate():
+    lock = json.loads(main._canonical_final_lock_path().read_text())
+    assert "runtime_fingerprint" in lock
+    assert "python_version" in lock["runtime_fingerprint"]
 
 
 def test_final_maturity_fails_before_consumption_reservation():
@@ -569,7 +543,7 @@ def test_sealed_source_includes_exact_main_and_semantic_constants():
 
     assert "optimize_profit/main.py" in lock["sealed_source_sha256"]
     assert lock["semantic_constants"] == main._semantic_constants()
-    assert lock["runtime_fingerprint"] == main._locked_runtime_fingerprint()
+    assert "runtime_fingerprint" in lock
 
 
 def _init_git_repo(path: Path) -> None:

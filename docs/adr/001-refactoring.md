@@ -1,5 +1,8 @@
 # ADR-001: Codebase Refactoring — Frozen Dataclasses, Repository Pattern, Module Split, Result Types
 
+> Historical decision record. File/line counts, compatibility choices, and test
+> totals describe the repository at the decision date, not the current tree.
+
 ## Status
 
 Accepted

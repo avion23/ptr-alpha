@@ -644,8 +644,16 @@ class TestParsing(unittest.TestCase):
             ),
             None,
         )
-        if data_root is None:
-            self.skipTest("real disclosure artifacts are not available")
+        required = [
+            Path("2025/pdfs/20026590.pdf"),
+            Path("2026/pdfs/20034694.pdf"),
+            Path("2026/pdfs/20034348.pdf"),
+            Path("2026/pdfs/20034095.pdf"),
+            Path("2026/pdfs/20034670.pdf"),
+            Path("2025/pdfs/20030630.pdf"),
+        ]
+        if data_root is None or any(not (data_root / path).is_file() for path in required):
+            self.skipTest("real disclosure canary artifacts are not available")
 
         previous = os.environ.get("PTR_SKIP_DOCLING")
         os.environ["PTR_SKIP_DOCLING"] = "1"
@@ -973,6 +981,27 @@ class TestLocalOcrCanaries(unittest.TestCase):
         pages_reported = re.findall(r"page (\d+): ocr deadline exceeded", message)
         self.assertEqual(pages_reported, ["3", "4", "5"])
         self.assertEqual(len(raised.exception.partial_tables[0]), 3)
+
+    def test_text_backends_collect_rows_from_every_table(self):
+        from analyzer import parser_cascade
+
+        tables = [["first"], ["second"]]
+
+        def parse(table):
+            return [{"asset_description": table[0]}]
+
+        for backend, extractor_name in (
+            (parser_cascade._try_pdftotext, "extract_tables_with_pdftotext"),
+            (parser_cascade._try_docling, "extract_tables_with_docling"),
+        ):
+            with (
+                patch.object(parser_cascade, extractor_name, return_value=tables),
+                patch.object(parser_cascade, "parse_pdf_table", side_effect=parse),
+            ):
+                rows = backend(Path("multi-table.pdf"))
+            self.assertEqual(
+                [row["asset_description"] for row in rows], ["first", "second"]
+            )
 
     def test_cascade_compares_all_text_engines_and_prefers_complete_trusted_tie(self):
         from analyzer import parser_cascade

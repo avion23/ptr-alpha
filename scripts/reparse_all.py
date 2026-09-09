@@ -20,14 +20,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from analyzer.database import Database
 from analyzer.models import FilingType
 
-from analyzer.datasources import (
+from analyzer.download import (
     HouseTransactionSource,
     _build_member_lookup,
     _filter_existing_pdfs,
-    consolidate_transactions,
+    preserve_existing_fields,
 )
+from analyzer.parsing import consolidate_transactions
 from analyzer.parser_cascade import _parse_pdf_worker
-from analyzer.download import preserve_existing_fields
 from analyzer.settings import Settings
 from multiprocessing import Pool
 

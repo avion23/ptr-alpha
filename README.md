@@ -1,157 +1,227 @@
 # PTR Alpha
 
-Analyze congressional Periodic Transaction Report (PTR) disclosures to identify trading patterns and performance signals.
+PTR Alpha analyzes **public congressional financial disclosures**. It ingests official House and Senate records, normalizes disclosed transactions, joins market prices for retrospective analysis, and evaluates a simple public-time trading rule without using information that was private at the decision time.
 
-## Prerequisites
+The production recommendation rule is deliberately small: **recent distinct congressional buyers of the same public equity**. Member-performance models are descriptive research tools, not deployment gates.
 
-Python 3.11+ and system libraries for PDF parsing:
+## What the project is for
 
-```bash
-# macOS
-brew install tesseract poppler ghostscript
+At public time `t`, a congressional trade may already be days or weeks old:
 
-# Ubuntu/Debian
-sudo apt-get install tesseract-ocr poppler-utils ghostscript
+```text
+private transaction date ---- filing delay ----> public disclosure date t
+                                             decision information starts here
 ```
 
-## Install
+PTR Alpha asks two separate questions:
 
-```bash
-pip install .
+1. **What is publicly actionable now?** Find recent public-equity purchases disclosed by multiple distinct members.
+2. **What happened historically?** Measure executable next-session returns, SPY-relative outcomes, member-level descriptive statistics, portfolio behavior, and statistical validation.
 
-# With dev dependencies
-pip install ".[dev]"
+The system must never backdate knowledge to the private transaction date.
+
+## Project parts
+
+| Part | Purpose |
+| --- | --- |
+| `src/analyzer/download.py` | House metadata/PDF acquisition and parse orchestration |
+| `src/analyzer/senate_efd.py` | Official Senate eFD ingestion |
+| `src/analyzer/parser_cascade.py`, `src/analyzer/parsing/` | Deterministic PDF/table/OCR extraction |
+| `src/analyzer/database.py`, `*_repository.py` | DuckDB persistence, canonical views, generations, provenance, prices, parse reports |
+| `src/analyzer/candidates.py` | Shared public-equity candidate universe for live analysis and replay |
+| `src/analyzer/member_ranking/` | Descriptive member statistics and historical diagnostic scorers |
+| `src/analyzer/signals/` | Historical forward-return label construction and signal reports |
+| `src/analyzer/backtest/` | Point-in-time recommendation replay and fixed-horizon evaluation |
+| `src/analyzer/portfolio/`, `portfolio_sim.py` | Capital-constrained portfolio simulation and Kelly research helpers |
+| `src/analyzer/validation.py`, `snooping.py` | Purged retrospective validation and multiple-testing controls |
+| `src/analyzer/capitol_trades.py` | Capitol Trades reconciliation input; not an official canonical source |
+| `member_profitability/` | Separate descriptive member-profitability research workflow |
+| `optimize_profit/` | Older locked optimization/research workflow; not the production authority |
+| `scripts/` | Audits, reparsing, OCR, staging, reconciliation, refresh, and operational tools |
+| `tests/` | Unit, integration, statistical-invariant, parser, database, replay, and CLI checks |
+| `docs/` | Current architecture/parsing docs plus explicitly historical audit/review evidence |
+
+## Data model
+
+The canonical DuckDB contains several kinds of data:
+
+| Data | Examples |
+| --- | --- |
+| Filing metadata | document ID, archive year, member name, filing date/type |
+| Raw-source identity | chamber, source, source record/row IDs, ingestion generation, artifact SHA-256 |
+| Transactions | member, ticker, private transaction date, public disclosure/availability dates, purchase/sale, owner, disclosed amount interval/midpoint, instrument type, option fields, raw asset text |
+| House generation state | metadata generations, PDF artifacts, quarantine records, parse completion state |
+| Parser telemetry | parser version, attempted engines, raw extracted row count, persisted row count, errors |
+| Senate source reports | parsed/paper-only/unavailable/failed reports and row accounting |
+| Market data | daily adjusted close by ticker/date |
+| Derived research data | forward returns, SPY alpha, member rankings, backtests, portfolio results, validation artifacts |
+| OCR cache | optional validated Gemini OCR responses for unresolved House PDFs |
+
+`canonical_transactions` exposes the active complete House generation plus canonical non-House sources. Normal reads exclude rows whose transaction date is after their disclosure date because those are usually OCR/date-order errors.
+
+Capitol Trades is useful for **reconciliation**, but `fetch-capitol` does not write canonical transactions. Official House and Senate sources remain authoritative.
+
+## How a stock is evaluated now
+
+The live scorer provenance is `identity_free_distinct_buyer_count_v2`.
+
+For an `as_of` date:
+
+1. Read disclosures in `[as_of - days_back, as_of]`.
+2. Keep purchases only.
+3. Keep normalized stocks; reject explicit options/funds/bonds/private assets and quarantined ticker artifacts.
+4. Trust ordinary ticker identity only when it comes from canonical official-source provenance or an explicit resolver mapping. Reused symbols are date-gated so a filing cannot borrow another security's historical prices; for listing gates, the public disclosure date controls eligibility.
+5. Canonicalize member names and count **distinct buyers** per ticker.
+6. Require at least `min_buyers`.
+7. Set
+
+```text
+signal_score = number_of_distinct_recent_buyers
 ```
 
-## Approach
+8. Sort by score descending, then ticker ascending for deterministic ties.
 
-1. **Data Collection**: Downloads official House PTR PDFs and can ingest Capitol Trades API records as a backup source
-2. **Parsing**: Extracts transaction rows through a deterministic PDF parser cascade, with optional Gemini OCR for zero-row PDFs
-3. **Signal Generation**: Calculates trading signal potential across configurable time horizons using exponential decay weighting
-4. **Performance Analysis**: Produces descriptive member rankings from hit rate, SPY alpha, Bayesian win probability, and partially pooled alpha
-5. **Ticker Scoring**: The production default ranks recent multi-buyer setups using identity-free distinct-buyer recency; historical member-skill modes are diagnostics only
+There is no hidden member-skill multiplier, trade-size multiplier, owner multiplier, crash-hazard model, price-history requirement, or second exponential-recency coefficient in the production score.
 
-The first-principles problem definition, experiment contract, model roadmap, and
-rules for grid, hill-climbing, and Bayesian search are documented in
-[`docs/trading-prediction-architecture.md`](docs/trading-prediction-architecture.md).
+### Delayed filings
 
-Live ticker scoring uses the current date (or explicit `--as-of`) for its
-lookback, excludes future-dated disclosures and non-positive scores, and trains
-member rankings over `--training-lookback-days` only on forward
-return windows whose full horizon is covered by available price data. A 180-day
-row observed after fewer than 180 days is marked `window_complete=False` and is
-not treated as a completed 180-day outcome.
-Console buy-candidate lists contain positive scores only; ticker deep dives
-print an explicit `BUY CANDIDATE` or `NO BUY` verdict.
+A delayed filing is still actionable when it becomes public. The score uses **disclosure time**, not the private trade date. A lucrative old trade disclosed today therefore enters today's candidate window; filing delay does not separately penalize or reject it.
 
-House ingestion documentation is split by purpose:
+The hard limitation is freshness of the local disclosure database. If the most recent stored disclosure is old, the program warns that the data must be refreshed.
 
-- [`docs/house-data-parsing.md`](docs/house-data-parsing.md) describes data flow, parser
-  selection, persistence boundaries, and operational queries.
-- [`docs/house-ingestion-error-catalog.md`](docs/house-ingestion-error-catalog.md) is the
-  complete potential-error and mitigation register.
-- [`docs/HOUSE_PARSER_AUDIT.md`](docs/HOUSE_PARSER_AUDIT.md) records the dated, non-destructive
-  full local-corpus parser run and every zero-row document observed in that run.
+## How a member is evaluated
 
-## Architecture
+Member ranking is **descriptive research**, not the live trading rule.
 
-```
-src/analyzer/
-├── backtest/                  # Recommendations, evaluation, prices, filters, curves, summaries, OU parameters
-├── member_ranking/            # Bayesian scoring, decay weighting, ranking, factors, buyer scoring, sales, lookups
-├── parsing/                   # pdfplumber/pdftotext/docling/OCR parsers plus row, cell, column, and metadata helpers
-├── portfolio/                 # Kelly sizing, portfolio simulation, and portfolio metrics
-├── signals/                   # Core signal generation, assembly, filters, prices, constants, and top-signal helpers
-├── analysis.py                # Analysis output assembly for ranks, signals, members, sales, and tickers
-├── capitol_trades.py          # Capitol Trades API ingestion
-├── cli.py                     # Typer CLI; all formatting and display logic
-├── database.py                # DuckDB facade delegating to repository modules
-├── datasources.py             # Backward-compatible re-exports (parser_cascade, download, price_source)
-├── download.py                # House PTR PDF download and caching
-├── exceptions.py              # Exception hierarchy, StepResult, DataResult types
-├── interfaces.py              # Source protocol interfaces
-├── matched_control.py         # Matched-control return comparisons
-├── member_skill.py            # Member skill and profitability helpers
-├── member_names.py            # Member name normalization helpers
-├── metadata_repository.py     # Metadata CRUD operations
-├── models.py                  # Data models and enums
-├── options.py                 # Option-contract parsing helpers
-├── parse_run_repository.py    # Parse run tracking
-├── parser_cascade.py          # Deterministic PDF parser cascade
-├── pipeline.py                # Fetch, parse, analysis, and backtest orchestration (returns DataResult)
-├── portfolio_sim.py           # Portfolio simulator used by the CLI
-├── price_repository.py        # Price data CRUD operations
-├── price_snapshot.py          # Price snapshot manifests for reproducible backtests
-├── price_source.py            # Price data sourcing with yfinance and cache
-├── return_process.py          # Return process statistics
-├── sector_data.py             # Sector data loading and analysis
-├── settings.py                # Pydantic settings for data paths and parser behavior
-├── signal_features.py         # Feature engineering for signals
-├── snooping.py                # Family correction and calendar-aware block bootstrap
-├── ticker_resolver.py         # Ticker cleaning and symbol resolution
-├── transaction_repository.py  # Transaction CRUD operations
-└── validation.py              # Honest time-split calibration and evaluation
+For completed purchase episodes at a chosen horizon, PTR Alpha reports:
+
+- number of purchase episodes;
+- endpoint return and SPY-relative endpoint alpha;
+- hit rates;
+- a Beta-binomial descriptive positive-alpha probability;
+- an empirical normal-normal partially pooled alpha estimate;
+- posterior standard deviation and shrinkage diagnostics;
+- additional display diagnostics such as trade-count/size conviction.
+
+The ranking is sorted by `shrunk_alpha`.
+
+This member model is not causal. Committee membership, information access, sector exposure, market regime, ticker concentration, and disclosure-selection effects are not controlled sufficiently to interpret the member effect as skill.
+
+## Return math and first-principles boundary
+
+Historical executable labels use public disclosure time:
+
+```text
+entry session = first expected NYSE session after disclosure date
+intended end  = entry session + horizon calendar days
+exit session  = expected NYSE session on or before intended end
+
+stock_return = P_exit / P_entry - 1
+spy_return   = SPY_exit / SPY_entry - 1
+spy_alpha    = stock_return - spy_return
 ```
 
-```
-scripts/
-├── backfill_tickers.py      # Backfill missing ticker symbols
-├── cleanup_tickers.py       # Clean and normalize ticker symbols
-├── download_missing_pdfs.py # Download missing House PTR PDFs
-├── fetch_capitol_trades.py  # Fetch congressional trades from Capitol Trades API
-├── gemini_ocr_common.py     # Shared Gemini OCR cache and validation helpers
-├── ocr_parallel.py          # Parallel Gemini OCR runner
-├── ocr_zero_rows.py         # Gemini OCR for PDFs with no parsed rows
-├── purge_phantom_rows.py    # Remove historical duplicate transaction rows
-├── reparse_all.py           # Reparse cached PDFs
-└── run_kelly_backtest.py    # Kelly-sizing backtest helper
+A label is complete only when the exact expected entry/exit sessions exist for both the stock and SPY. Immature or missing endpoints remain missing; they are not converted to zero or shortened horizons.
 
-sweep.py                     # Parameter sweep using analyzer.validation
-```
+The fixed-horizon CLI backtest now evaluates exactly `--horizon`. It does not replace that horizon with an Ornstein-Uhlenbeck-derived holding period.
 
-Modules follow a layered design: `cli.py` handles presentation and formatting, `pipeline.py` contains pure computation returning `DataResult`, repository modules (`transaction_repository`, `price_repository`, `metadata_repository`, `parse_run_repository`) encapsulate database access behind the `database.py` facade, and `exceptions.py` defines the `StepResult` and `DataResult[T]` types used throughout for error propagation.
+### What is mathematically solid
+
+- availability begins at public disclosure time;
+- next-session entry avoids same-day hindsight execution;
+- stock and SPY use the same executable endpoints;
+- incomplete forward windows remain censored/missing;
+- consensus scoring is identity-invariant and uses no future outcomes;
+- backtest and live candidate selection share the same equity/buyer rule.
+
+### What remains heuristic research
+
+- `DECAY_LAMBDA` for the historical decay-weighted return diagnostic;
+- the member Beta prior strength and clipping;
+- the empirical member hierarchy and its assumptions;
+- the 14-day member episode collapse used by member ranking;
+- portfolio concentration, sector, slippage, and holding-policy defaults;
+- validation family/search choices.
+
+These must not be described as laws of the data-generating process. The current production candidate score avoids them.
+
+## Parsing: cheap vs expensive
+
+### Cheap parsing
+
+Text-layer extraction is relatively cheap and deterministic:
+
+1. pdfplumber
+2. Camelot lattice
+3. Camelot stream
+4. `pdftotext`
+
+All text engines are compared. `pdftotext` and Docling aggregate transactions from **all** returned tables instead of stopping at the first non-empty table. Parser debug logs include per-engine row count, quality, and elapsed time.
+
+When pdfplumber and pdftotext agree by multiset containment, the more complete trusted result can return without OCR.
+
+### Expensive parsing
+
+OCR is expensive because it rasterizes pages and/or runs large external processes:
+
+5. Docling OCR, unless explicitly disabled for a bounded bulk pass
+6. Tesseract OCR
+7. Optional Gemini OCR recovery for unresolved documents
+
+When text engines disagree, deterministic parsing requires complete OCR corroboration or fails the document closed. Per-document watchdogs and subprocess timeouts prevent one malformed PDF from stalling a year-long run.
+
+See [`docs/house-data-parsing.md`](docs/house-data-parsing.md) for the exact current flow and [`docs/house-ingestion-error-catalog.md`](docs/house-ingestion-error-catalog.md) for residual risks.
 
 ## CLI
 
-| Command | Description |
+```bash
+pip install .
+# development
+pip install ".[dev]"
+```
+
+Common commands:
+
+| Command | Purpose |
 | --- | --- |
-| `ptr-alpha fetch --year 2026` | Download House Clerk PTR PDFs for a year. |
-| `ptr-alpha parse --year 2026` | Parse cached PDFs into DuckDB. |
-| `ptr-alpha parse --year 2026 --gemini-ocr` | After deterministic parsing, run Gemini OCR for zero-row PDFs; results are validated and cached. |
-| `ptr-alpha analyze --year 2026 --mode ranks` | Rank members by trading performance. |
-| `ptr-alpha analyze --year 2026 --mode signals` | Show top individual trade signals. |
-| `ptr-alpha analyze --year 2026 --mode sales` | Rank members by sale/loss-avoidance performance. |
-| `ptr-alpha analyze --year 2026 --mode tickers` | Score recent multi-buyer ticker setups. |
-| `ptr-alpha analyze --year 2026 --mode member --member "Nancy Pelosi"` | Show signals for one member. |
-| `ptr-alpha analyze --year 2026 --ticker NVDA` | Deep-dive one ticker. |
-| `ptr-alpha backtest --start 2024-01-01 --end 2024-12-31` | Run a rolling, no-lookahead recommendation backtest. |
-| `ptr-alpha portfolio --start 2024-01-01 --end 2024-12-31` | Simulate portfolio-level execution with overlapping positions and constraints. |
-| `ptr-alpha snapshot` | Write a reproducible price snapshot manifest. |
-| `ptr-alpha refresh --year 2026` | Fetch House PDFs, parse cached PDFs, fetch Capitol Trades, and optionally run Gemini OCR. |
-| `ptr-alpha refresh --year 2026 --gemini-ocr` | Include Gemini OCR in the full refresh pipeline. |
-| `ptr-alpha fetch-capitol --all` | Fetch recent Capitol Trades API records. |
-| `ptr-alpha validate --train-start 2022-01-01 --train-end 2023-12-31 --test-start 2024-01-01 --test-end 2025-06-30` | Run purged, corrected retrospective validation; 2024-2025 is previously used and is not fresh OOS evidence. |
-| `ptr-alpha validate --full-grid` | Run the larger validation parameter grid. |
+| `ptr-alpha fetch --year 2026` | Acquire/reconcile official House archive PDFs |
+| `ptr-alpha parse --year 2026` | Parse cached House PDFs into a generation |
+| `ptr-alpha parse --year 2026 --gemini-ocr` | Add optional Gemini recovery for unresolved PDFs |
+| `ptr-alpha refresh --year 2026` | Official House fetch + parse refresh |
+| `ptr-alpha fetch-senate-efd ...` | Fetch official Senate eFD records |
+| `ptr-alpha fetch-capitol --all --output capitol.json --generation run-id` | Write Capitol Trades reconciliation artifact only |
+| `ptr-alpha analyze --year 2026 --mode tickers` | Current multi-buyer candidates |
+| `ptr-alpha analyze --year 2026 --ticker SPCX` | One ticker using the same `--days-back`/`--min-buyers` live rule |
+| `ptr-alpha analyze --year 2025 --mode ranks` | Descriptive member rankings |
+| `ptr-alpha analyze --year 2025 --mode signals` | Historical top purchase outcomes |
+| `ptr-alpha analyze --year 2025 --mode sales` | Historical sale/loss-avoidance ranking |
+| `ptr-alpha backtest --start 2024-01-01 --end 2025-12-31` | Fixed-horizon public-time replay |
+| `ptr-alpha portfolio --start 2024-01-01 --end 2025-12-31 --sector-map sectors.json` | Shared-cash portfolio simulation |
+| `ptr-alpha snapshot` | Explicitly write a reproducible price snapshot |
+| `ptr-alpha validate ...` | Purged retrospective research validation |
 
-Analysis modes accept `--horizons`, `--threshold`, `--top-n`, and `--output csv` where supported. `--top-n` limits rank output as well as signal output. Ticker scoring also accepts `--days-back`, `--min-buyers`, `--training-lookback-days`, and `--as-of`. Optional network-backed sector enrichment is disabled unless `--sectors` is supplied. Counts, horizons, lookback windows, and simulation capital must be greater than zero; invalid values fail before the database is opened.
+`analyze`, `backtest`, `portfolio`, and `snapshot` open the canonical database read-only. Fetch/parse/refresh are the mutating paths.
 
-Portfolio win rate, average holding period, and turnover are reported as `N/A` when the simulation ends with no closed trades. Open positions still contribute to final marked-to-market value, but they cannot produce closed-trade statistics.
+## Validation status
 
-## Data & caveats
+A positive live score means only that multiple distinct members disclosed recent purchases of the same equity. It is not statistical proof of abnormal future return.
 
-- The House Clerk publishes only a filing index; the PTR PDFs must be downloaded and parsed.
-- Parsing uses a deterministic parser cascade with an optional Gemini OCR fallback. Gemini OCR output is validated and cached under `data/gemini_cache/`.
-- A successful metadata refresh replaces that year's metadata atomically. Parsed rows are
-  replaced atomically only for documents that produced consolidated rows; zero-row documents
-  retain existing rows and emit a stale-row warning when applicable.
-- Transactions carry a `source` provenance column (`house_pdf`, `capitol_trades`, or `gemini_ocr`); old pre-migration rows may have `NULL` source.
-- Inspect `pdf_parse_runs` after every parse. A zero-row result is not proof that a filing has
-  no trades, and parser success does not prove every row or field was extracted correctly.
-- `ptr-alpha validate` purges each phase by the maximum executable holding period and uses one per-date net-alpha objective. Production selection uses only the fold-safe `consensus` scorer with each fold's explicit as-of timestamp; member-skill modes are descriptive diagnostics and cannot be deployment candidates. Deployment fails closed unless Bonferroni and a centered, calendar-aware block max-stat bootstrap pass. Consensus is identity-invariant and has no member-identity hypothesis; this is recorded as a diagnostic, not used as a gate. Identity-dependent member-skill modes are descriptive and cannot deploy. Frozen evaluations are atomically consumed in a canonical, overlap-refusing SHA-256 hash-chain ledger; a prior `validation_evaluation_ledger.json` must be explicitly migrated or archived before evaluation. The chain detects accidental/local edits but cannot prevent a local attacker with write access from recomputing it because no external anchor exists. The 2024-2025 phase is retrospective, not fresh OOS evidence; the post-2025 final phase is locked and not queried or evaluated. Forward-return labels remain missing until SPY prices reach the full requested horizon; partial windows are never shortened into apparently mature returns.
-- Recent ticker output includes only positive model scores. A positive score is a model ranking, not evidence of statistically significant alpha or individualized investment advice. As of 2026-07, no validated configuration shows statistically significant alpha.
+The repository's retrospective validation machinery uses scheduled no-trade support, purging/embargoes, SPY-relative net outcomes, and family-wise controls. Historical member-skill modes are diagnostics and cannot authorize deployment. The older `optimize_profit/` workflow remains a separate research artifact; its exact-machine runtime fingerprint is no longer treated as a correctness gate.
+
+No existing retrospective result should be relabeled as fresh out-of-sample evidence after changing the scorer or implementation. A scorer change requires a new predeclared evaluation.
+
+## Documentation
+
+- [`docs/trading-prediction-architecture.md`](docs/trading-prediction-architecture.md): first-principles prediction/evaluation architecture and remaining research roadmap.
+- [`docs/house-data-parsing.md`](docs/house-data-parsing.md): current House parser and persistence behavior.
+- [`docs/house-ingestion-error-catalog.md`](docs/house-ingestion-error-catalog.md): current ingestion risk register.
+- [`docs/HOUSE_PARSER_AUDIT.md`](docs/HOUSE_PARSER_AUDIT.md): dated historical corpus audit; evidence, not current architecture.
+- [`docs/adr/001-refactoring.md`](docs/adr/001-refactoring.md): historical refactoring decision record.
+- `docs/reviews/`: archived adversarial-review evidence. It is not current product documentation; current behavior is defined by code, tests, README, and the three current docs above.
 
 ## Tests
 
 ```bash
 PYTHONPATH=$PWD/src python3 -m pytest -q
+python3 -m ruff check .
 ```

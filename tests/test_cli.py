@@ -1,5 +1,6 @@
 """Smoke tests for analyzer.cli module."""
 
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -40,7 +41,6 @@ class TestCliApp(unittest.TestCase):
         for option in (
             "--horizon",
             "--lookback-days",
-            "--training-lookback-days",
             "--min-buyers",
             "--top-n",
             "--frequency-days",
@@ -66,9 +66,7 @@ class TestCliApp(unittest.TestCase):
 
     def test_portfolio_rejects_nonpositive_constraints_before_db_open(self):
         for option in (
-            "--horizon",
             "--lookback-days",
-            "--training-lookback-days",
             "--min-buyers",
             "--top-n",
             "--frequency-days",
@@ -189,12 +187,14 @@ class TestCliApp(unittest.TestCase):
         context.assert_not_called()
 
     def test_sector_map_loader_validates_deterministic_json(self):
-        with self.runner.isolated_filesystem():
-            Path("sectors.json").write_text('{"AAPL": "Technology"}')
-            self.assertEqual(_load_sector_map("sectors.json"), {"AAPL": "Technology"})
-            Path("bad.json").write_text('{"AAPL": ""}')
+        with tempfile.TemporaryDirectory() as tmp:
+            sectors = Path(tmp) / "sectors.json"
+            sectors.write_text('{"AAPL": "Technology"}')
+            self.assertEqual(_load_sector_map(str(sectors)), {"AAPL": "Technology"})
+            bad = Path(tmp) / "bad.json"
+            bad.write_text('{"AAPL": ""}')
             with self.assertRaisesRegex(ValueError, "blank ticker or sector"):
-                _load_sector_map("bad.json")
+                _load_sector_map(str(bad))
 
     def test_portfolio_fails_before_simulation_when_sector_ticker_missing(self):
         mock_ctx = MagicMock()
@@ -208,18 +208,14 @@ class TestCliApp(unittest.TestCase):
                 "as_of_date": [pd.Timestamp("2024-01-01")],
             }
         )
-        with self.runner.isolated_filesystem():
-            Path("sectors.json").write_text('{"A": "Technology"}')
+        with tempfile.TemporaryDirectory() as tmp:
+            sectors = Path(tmp) / "sectors.json"
+            sectors.write_text('{"A": "Technology"}')
             with (
                 patch("analyzer.cli.get_context", return_value=mock_ctx),
                 patch(
                     "analyzer.cli._load_portfolio_inputs",
-                    return_value=(
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                        recommendations,
-                    ),
+                    return_value=(pd.DataFrame(), recommendations),
                 ),
                 patch("analyzer.portfolio_sim.PortfolioSimulator") as simulator,
             ):
@@ -232,7 +228,7 @@ class TestCliApp(unittest.TestCase):
                         "--end",
                         "2024-02-01",
                         "--sector-map",
-                        "sectors.json",
+                        str(sectors),
                     ],
                 )
         self.assertEqual(result.exit_code, 1, result.output)

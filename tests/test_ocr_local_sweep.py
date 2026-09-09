@@ -10,7 +10,6 @@ Real canaries (PTR_OCR_CANARY_DATA) run the full pipeline over the pinned
 tests/test_scan_ocr.py.
 """
 
-import hashlib
 import json
 import os
 import sys
@@ -612,8 +611,6 @@ class TestRealCanaries(unittest.TestCase):
     MANIFEST = os.environ.get("PTR_OCR_CANARY_MANIFEST", "")
 
     def test_pinned_docs_resolve_with_canary_truth(self):
-        import time  # noqa: PLC0415
-
         metadata = ocr.load_metadata(self.DB)
         for doc_id in ["9115808", "9115813", "9116141", "8221322"]:
             pdf = Path(self.DATA_DIR) / "2026" / "pdfs" / f"{doc_id}.pdf"

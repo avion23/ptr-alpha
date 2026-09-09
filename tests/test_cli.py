@@ -11,7 +11,12 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 from typer.testing import CliRunner
 
-from analyzer.cli import _CURRENT_YEAR, _check_data_freshness, _load_sector_map, app
+from analyzer.cli import (
+    _CURRENT_YEAR,
+    _load_sector_map,
+    _warn_live_ticker_coverage,
+    app,
+)
 from analyzer.exceptions import StepResult
 
 
@@ -27,13 +32,14 @@ class TestCliApp(unittest.TestCase):
         context = MagicMock()
         with (
             patch("analyzer.cli.get_context", return_value=context),
-            patch("analyzer.cli._check_data_freshness"),
+            patch("analyzer.cli._warn_live_ticker_coverage") as coverage_warning,
             patch("analyzer.cli._run_analysis_mode") as run_analysis,
         ):
             result = self.runner.invoke(app, ["analyze"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(run_analysis.call_args.args[1], _CURRENT_YEAR)
+        coverage_warning.assert_not_called()
 
     def test_analyze_rejects_invalid_numeric_and_output_options_before_db_open(self):
         cases = [
@@ -309,20 +315,34 @@ if __name__ == "__main__":
 
 
 
-def test_data_freshness_reads_only_canonical_scope(capsys):
+def test_live_ticker_coverage_reads_only_canonical_scope(capsys):
     connection = MagicMock()
-    connection.execute.return_value.fetchone.return_value = (date.today(),)
+    connection.execute.return_value.fetchall.return_value = [("House", date.today())]
     context = SimpleNamespace(
-        transaction_source=SimpleNamespace(
-            db=SimpleNamespace(conn=connection)
-        )
+        transaction_source=SimpleNamespace(db=SimpleNamespace(conn=connection))
     )
 
-    _check_data_freshness(context)
+    _warn_live_ticker_coverage(context, 28)
 
     query = connection.execute.call_args.args[0]
     assert "canonical_transactions" in query
+    assert "capitol_trades" not in query
     assert "WARNING" not in capsys.readouterr().err
+
+
+def test_live_ticker_coverage_warns_when_strategy_window_has_no_disclosures(capsys):
+    connection = MagicMock()
+    latest = date.today() - pd.Timedelta(days=29)
+    connection.execute.return_value.fetchall.return_value = [("House", latest)]
+    context = SimpleNamespace(
+        transaction_source=SimpleNamespace(db=SimpleNamespace(conn=connection))
+    )
+
+    _warn_live_ticker_coverage(context, 28)
+
+    warning = capsys.readouterr().err
+    assert "House has no stored disclosure in the 28-day candidate window" in warning
+    assert str(latest) in warning
 
 
 

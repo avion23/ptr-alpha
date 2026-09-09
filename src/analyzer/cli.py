@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -203,22 +203,47 @@ def _validate_output(output: str) -> None:
         raise typer.Exit(1)
 
 
-def _check_data_freshness(app_ctx: AppContext) -> None:
-    """Warn if transaction data looks stale."""
+def _warn_live_ticker_coverage(app_ctx: AppContext, days_back: int) -> None:
+    """Report chambers with no stored disclosure in the live candidate window."""
+    as_of = date.today()
+    window_start = as_of - timedelta(days=days_back)
     try:
-        _row = app_ctx.transaction_source.db.conn.execute(
-            "SELECT MAX(disclosure_date) FROM canonical_transactions"
-        ).fetchone()
-        _max_date = _row[0] if _row is not None else None
-        if _max_date:
-            _age = (date.today() - _max_date).days
-            if _age > 30:
-                print(
-                    f"WARNING: Data is {_age} days old (latest: {_max_date}). Run 'ptr-alpha refresh' first.",
-                    file=sys.stderr,
-                )
+        rows = app_ctx.transaction_source.db.conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN source = 'senate_efd'
+                      OR LOWER(COALESCE(chamber, '')) = 'senate'
+                    THEN 'Senate'
+                    ELSE 'House'
+                END AS chamber_group,
+                MAX(disclosure_date) AS latest_disclosure
+            FROM canonical_transactions
+            WHERE disclosure_date <= ?
+            GROUP BY chamber_group
+            ORDER BY chamber_group
+            """,
+            [as_of],
+        ).fetchall()
+        if not rows:
+            print(
+                "WARNING: No canonical congressional disclosures are stored for "
+                f"the live window ending {as_of}. Run 'ptr-alpha refresh' first.",
+                file=sys.stderr,
+            )
+            return
+        for chamber, latest in rows:
+            if latest is None or latest >= window_start:
+                continue
+            age = (as_of - latest).days
+            print(
+                f"WARNING: {chamber} has no stored disclosure in the {days_back}-day "
+                f"candidate window {window_start} through {as_of}; latest is {latest} "
+                f"({age} days ago). Refresh before treating an empty result as current.",
+                file=sys.stderr,
+            )
     except Exception:
-        logger.debug("Freshness check failed", exc_info=True)
+        logger.debug("Live ticker coverage check failed", exc_info=True)
 
 
 def _consensus_score_display(score: pd.DataFrame) -> pd.DataFrame:
@@ -431,7 +456,12 @@ def analyze(
         print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
         raise typer.Exit(1) from None
     app_ctx = get_context(ctx, data_dir, read_only=True)
-    _check_data_freshness(app_ctx)
+    if (
+        as_of_date is None
+        and year == date.today().year
+        and (ticker is not None or mode == "tickers")
+    ):
+        _warn_live_ticker_coverage(app_ctx, days_back)
 
     if ticker:
         _run_ticker_mode(

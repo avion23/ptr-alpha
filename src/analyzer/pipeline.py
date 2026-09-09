@@ -27,16 +27,9 @@ from analyzer.member_ranking.buyer_scoring import (
 
 logger = logging.getLogger(__name__)
 
-_OFFICIAL_TRANSACTION_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
-
-
 def _analysis_transactions(transaction_source, year: int) -> pd.DataFrame:
-    """Read canonical official/legacy rows without chamber-specific filtering."""
-    trades = transaction_source.db.get_transactions(year)
-    if trades.empty or "source" not in trades.columns:
-        return trades
-    source = trades["source"]
-    return trades[source.isna() | source.isin(_OFFICIAL_TRANSACTION_SOURCES)].copy()
+    """Read the database's canonical congressional transaction view."""
+    return transaction_source.db.get_transactions(year)
 
 
 @dataclass(frozen=True, slots=True)

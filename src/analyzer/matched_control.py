@@ -9,6 +9,11 @@ import numpy as np
 import pandas as pd
 
 from analyzer import analysis
+from analyzer.backtest.evaluate import evaluate_backtest
+from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_LOOKBACK_DAYS,
+    CONSENSUS_MIN_BUYERS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -216,33 +221,20 @@ def _forward_alpha(
     ticker: str,
     as_of_date: pd.Timestamp,
     horizon: int,
-    spy_start: float | None = None,
 ) -> float | None:
-    """Compute forward alpha (return - SPY return) for a ticker."""
-    from analyzer.analysis import _price_at_or_before, _price_on_or_before
-
-    entry = _price_at_or_before(prices_df, ticker, as_of_date, max_staleness_days=30)
-    exit_price = _price_on_or_before(
-        prices_df, ticker, as_of_date + pd.Timedelta(days=horizon)
+    """Return exact next-session SPY-relative alpha for one equity."""
+    evaluated = evaluate_backtest(
+        pd.DataFrame({"ticker": [ticker], "instrument_type": ["stock"]}),
+        prices_df,
+        as_of_date,
+        horizon,
+        entry_slippage_bps=0.0,
+        exit_slippage_bps=0.0,
     )
-    if not entry or not exit_price:
+    if evaluated.empty or "bt_alpha_pct" not in evaluated.columns:
         return None
-
-    return_pct = (exit_price / entry - 1) * 100
-
-    if spy_start is None:
-        spy_start = _price_at_or_before(
-            prices_df, "SPY", as_of_date, max_staleness_days=30
-        )
-    spy_exit = _price_on_or_before(
-        prices_df, "SPY", as_of_date + pd.Timedelta(days=horizon)
-    )
-    if spy_start and spy_exit:
-        spy_return = (spy_exit / spy_start - 1) * 100
-    else:
-        spy_return = 0.0
-
-    return return_pct - spy_return
+    value = pd.to_numeric(evaluated["bt_alpha_pct"], errors="coerce").iloc[0]
+    return float(value) if pd.notna(value) and np.isfinite(value) else None
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +252,8 @@ def run_matched_control_backtest(
     top_n: int = 5,
     frequency_days: int = 14,
     n_controls: int = 10,
-    min_buyers: int = 2,
-    lookback_days: int = 60,
-    threshold: float = 5.0,
-    training_lookback_days: int = 365,
+    min_buyers: int = CONSENSUS_MIN_BUYERS,
+    lookback_days: int = CONSENSUS_LOOKBACK_DAYS,
 ) -> pd.DataFrame:
     """Run backtest with matched controls for each recommendation.
 
@@ -291,25 +281,17 @@ def run_matched_control_backtest(
             lookback_days=lookback_days,
             min_buyers=min_buyers,
             top_n=top_n,
-            threshold=threshold,
-            training_lookback_days=training_lookback_days,
         )
 
         if recs.empty:
             continue
-
-        spy_start = analysis._price_at_or_before(
-            prices_df, "SPY", as_of_ts, max_staleness_days=30
-        )
 
         for _, rec in recs.iterrows():
             ticker = rec["ticker"]
             rank = rec.get("rank", 0)
 
             # Treatment alpha
-            treat_alpha = _forward_alpha(
-                prices_df, ticker, as_of_ts, horizon, spy_start
-            )
+            treat_alpha = _forward_alpha(prices_df, ticker, as_of_ts, horizon)
             if treat_alpha is None:
                 continue
 
@@ -327,7 +309,7 @@ def run_matched_control_backtest(
             # Compute control alphas
             control_alphas = []
             for ctrl in controls:
-                alpha = _forward_alpha(prices_df, ctrl, as_of_ts, horizon, spy_start)
+                alpha = _forward_alpha(prices_df, ctrl, as_of_ts, horizon)
                 if alpha is not None:
                     control_alphas.append(alpha)
 

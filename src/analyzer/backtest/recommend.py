@@ -23,6 +23,8 @@ from analyzer.member_ranking import (
     score_ticker_by_buyers,
 )
 from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_LOOKBACK_DAYS,
+    CONSENSUS_MIN_BUYERS,
     _filter_equity_rows,
     _get_consensus_candidate_tickers,
 )
@@ -33,19 +35,20 @@ def backtest_recommendations(
     transactions_df: pd.DataFrame,
     as_of_date: pd.Timestamp,
     horizon: int = 90,
-    lookback_days: int = 60,
-    min_buyers: int = 2,
+    lookback_days: int = CONSENSUS_LOOKBACK_DAYS,
+    min_buyers: int = CONSENSUS_MIN_BUYERS,
     top_n: int = 10,
     threshold: float = 5.0,
     training_lookback_days: int | None = None,
     scoring_mode: str = "consensus",
     bayes_prior_strength: float | None = None,
 ) -> pd.DataFrame:
-    if bayes_prior_strength is None:
+    is_consensus = scoring_mode == "consensus"
+    bayes = bayes_prior_strength
+    if not is_consensus and bayes is None:
         from analyzer.signals import BAYES_PRIOR_STRENGTH
 
-        bayes_prior_strength = BAYES_PRIOR_STRENGTH
-    bayes = bayes_prior_strength
+        bayes = BAYES_PRIOR_STRENGTH
 
     as_of_iso = as_of_date.isoformat()
     training_lookback_iso = (
@@ -54,7 +57,6 @@ def backtest_recommendations(
         else None
     )
 
-    is_consensus = scoring_mode == "consensus"
     if not is_consensus:
         signals_df = _filter_equity_rows(signals_df)
     if not is_consensus and signals_df.empty:

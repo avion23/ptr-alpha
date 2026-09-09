@@ -3,6 +3,7 @@
 import logging
 import re
 import time
+from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -247,8 +248,24 @@ class YFinancePriceSource:
 
 
 def _clean_tickers(tickers: list[str]) -> list[str]:
-    """Filter out NaN/None/empty/garbage tickers from the input list."""
-    return [t for t in tickers if t and str(t).strip() and str(t) != "nan"]
+    """Filter empty values and known parser-token quarantines."""
+    resolver = TickerResolver()
+    clean: list[str] = []
+    quarantined: list[str] = []
+    for ticker in tickers:
+        if not ticker or not str(ticker).strip() or str(ticker) == "nan":
+            continue
+        if resolver.resolve(str(ticker)).status == "quarantined":
+            quarantined.append(str(ticker).strip().upper())
+            continue
+        clean.append(ticker)
+    if quarantined:
+        logger.debug(
+            "Excluded %d quarantined ticker tokens from price fetch: %s",
+            len(quarantined),
+            ", ".join(sorted(set(quarantined))),
+        )
+    return clean
 
 
 def _expand_rename_aliases(tickers: list[str]) -> set[str]:
@@ -282,9 +299,11 @@ def _resolve_tickers(all_tickers: list[str]) -> tuple[dict, dict]:
     for raw, sym in raw_to_yf.items():
         if sym not in yf_to_raw:
             yf_to_raw[sym] = raw
-    for r in resolutions.values():
-        if r.status != "valid":
-            logger.info(f"Ticker resolution: {r.notes}")
+    status_counts = Counter(r.status for r in resolutions.values())
+    logger.debug("Ticker resolution summary: %s", dict(sorted(status_counts.items())))
+    for resolution in resolutions.values():
+        if resolution.status not in {"unverified", "class_share"}:
+            logger.debug("Ticker resolution: %s", resolution.notes)
     return raw_to_yf, yf_to_raw
 
 

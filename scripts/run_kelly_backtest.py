@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pandas as pd
 
 from analyzer import analysis
-from analyzer.datasources import HouseTransactionSource
+from analyzer.download import HouseTransactionSource
 from analyzer.portfolio import (
     KellyConfig,
     build_portfolios_from_backtest,

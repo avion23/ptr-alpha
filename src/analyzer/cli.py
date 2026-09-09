@@ -14,9 +14,11 @@ from typing import cast
 import pandas as pd
 import typer
 
+from analyzer.candidates import candidate_tickers
 from analyzer.database import Database
-from analyzer.datasources import HouseTransactionSource, YFinancePriceSource
+from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
+from analyzer.price_source import YFinancePriceSource
 from analyzer.models import AnalysisMode
 from analyzer.pipeline import (
     AnalysisParams,
@@ -56,8 +58,14 @@ class AppContext:
 def setup_logging(verbose):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    logging.getLogger("analyzer").setLevel(level)
+    logging.getLogger("scripts").setLevel(level)
+    # yfinance prints one ERROR per bad symbol; price_source already emits one
+    # bounded failure summary with the affected ticker count/sample.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 
 def get_context(ctx, data_dir=None, read_only=False):
@@ -209,13 +217,22 @@ def _check_data_freshness(app_ctx: AppContext) -> None:
         logger.debug("Freshness check failed", exc_info=True)
 
 
+def _consensus_score_display(score: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        column
+        for column in ("ticker", "num_buyers", "buyers", "signal_score")
+        if column in score.columns
+    ]
+    return score[columns]
+
+
 def _run_ticker_mode(
     app_ctx: AppContext,
     mode: str,
     ticker: str,
     year: int,
-    horizons: list[int],
-    threshold: float,
+    days_back: int,
+    min_buyers: int,
     as_of_date: date | None,
     output: str,
 ) -> None:
@@ -233,20 +250,16 @@ def _run_ticker_mode(
     params = TickerAnalysisParams(
         ticker=ticker,
         year=year,
-        horizon=horizons[0],
-        threshold=threshold,
+        days_back=days_back,
+        min_buyers=min_buyers,
         as_of_date=as_of_date,
     )
-    result = run_ticker_analysis(
-        params,
-        app_ctx.transaction_source,
-        app_ctx.price_source,
-    )
+    result = run_ticker_analysis(params, app_ctx.transaction_source)
     if result.success and hasattr(result, "data") and result.data:
         print(f"\n=== Buyers of {result.data['ticker']} ===")
         print(result.data["buyers"].to_string(index=False))
         print("\n=== Signal Score ===")
-        print(result.data["score"].to_string(index=False))
+        print(_consensus_score_display(result.data["score"]).to_string(index=False))
         score = result.data["score"]["signal_score"].iloc[0]
         verdict = "BUY CANDIDATE" if score > 0 else "NO BUY"
         print(f"\nRecommendation: {verdict} (score {score:.2f})")
@@ -256,13 +269,10 @@ def _run_ticker_mode(
 def _run_tickers_mode(
     app_ctx: AppContext,
     year: int,
-    horizons: list[int],
-    threshold: float,
     days_back: int,
     min_buyers: int,
     top_n: int,
     output: str,
-    training_lookback_days: int,
     as_of_date: date | None,
 ) -> None:
     """Handle --mode tickers."""
@@ -273,26 +283,19 @@ def _run_tickers_mode(
         )
     params = TickerScoringParams(
         year=year,
-        horizons=tuple(horizons),
-        threshold=threshold,
         days_back=days_back,
         min_buyers=min_buyers,
         top_n=top_n,
-        training_lookback_days=training_lookback_days,
         as_of_date=as_of_date,
     )
-    result = run_recent_ticker_scoring(
-        app_ctx.transaction_source,
-        app_ctx.price_source,
-        params,
-    )
+    result = run_recent_ticker_scoring(app_ctx.transaction_source, params)
     if result.success and hasattr(result, "data") and result.data:
         data = result.data
         if not data["result"].empty:
             print(
                 f"\n=== Current Buy Candidates as of {data['as_of_date']} (Last {data['days_back']} Days, {data['min_buyers']}+ Buyers) ==="
             )
-            print(data["result"].to_string(index=False))
+            print(_consensus_score_display(data["result"]).to_string(index=False))
         else:
             print(f"\nNo positive buy candidates as of {data['as_of_date']}.")
     raise typer.Exit(0 if result.success else 1)
@@ -380,10 +383,6 @@ def analyze(
     days_back: int = typer.Option(28, help="Days back for ticker scoring"),
     min_buyers: int = typer.Option(3, help="Minimum buyers for ticker scoring"),
     top_n: int = typer.Option(20, help="Number of results to show"),
-    training_lookback_days: int = typer.Option(
-        1095,
-        help="Historical days used to train live ticker rankings",
-    ),
     as_of: str | None = typer.Option(
         None,
         help="Analysis cutoff date (YYYY-MM-DD; defaults to today)",
@@ -411,7 +410,6 @@ def analyze(
         days_back=days_back,
         min_buyers=min_buyers,
         top_n=top_n,
-        training_lookback_days=training_lookback_days,
     )
     if not horizons or any(horizon <= 0 for horizon in horizons):
         print("Error: --horizons values must be greater than zero", file=sys.stderr)
@@ -422,24 +420,21 @@ def analyze(
     except ValueError:
         print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
         raise typer.Exit(1) from None
-    app_ctx = get_context(ctx, data_dir, read_only=False)
+    app_ctx = get_context(ctx, data_dir, read_only=True)
     _check_data_freshness(app_ctx)
 
     if ticker:
         _run_ticker_mode(
-            app_ctx, mode, ticker, year, horizons, threshold, as_of_date, output
+            app_ctx, mode, ticker, year, days_back, min_buyers, as_of_date, output
         )
     elif mode == "tickers":
         _run_tickers_mode(
             app_ctx,
             year,
-            horizons,
-            threshold,
             days_back,
             min_buyers,
             top_n,
             output,
-            training_lookback_days,
             as_of_date,
         )
     elif mode == "sales":
@@ -671,18 +666,11 @@ def backtest(
         _BACKTEST_DEFAULTS["lookback_days"],
         help="Candidate purchase lookback window in days",
     ),
-    training_lookback_days: int = typer.Option(
-        _BACKTEST_DEFAULTS["training_lookback_days"],
-        help="Training data lookback window in days",
-    ),
     min_buyers: int = typer.Option(
         _BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"
     ),
     top_n: int = typer.Option(
         _BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"
-    ),
-    threshold: float = typer.Option(
-        _BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"
     ),
     frequency_days: int = typer.Option(
         _BACKTEST_DEFAULTS["frequency_days"], help="Days between rolling backtest dates"
@@ -696,9 +684,8 @@ def backtest(
     --start and --end (stepped by --frequency-days), then evaluates the
     forward returns of those picks over --horizon days.
 
-    Uses only data that would have been available at each as-of date
-    (no lookahead). Member rankings are built from fully-elapsed signal
-    windows only.
+    Uses only disclosures public at each as-of date and enters on the next
+    NYSE session. The declared --horizon is the evaluation holding horizon.
     """
     try:
         start_date = date.fromisoformat(start)
@@ -714,7 +701,6 @@ def backtest(
     _validate_positive_options(
         horizon=horizon,
         lookback_days=lookback_days,
-        training_lookback_days=training_lookback_days,
         min_buyers=min_buyers,
         top_n=top_n,
         frequency_days=frequency_days,
@@ -726,15 +712,12 @@ def backtest(
         end_date=end_date,
         horizon=horizon,
         lookback_days=lookback_days,
-        training_lookback_days=training_lookback_days,
         min_buyers=min_buyers,
         top_n=top_n,
-        threshold=threshold,
         frequency_days=frequency_days,
     )
-    resolved_data_dir = Path(app_ctx.settings.data.data_dir)
     result = run_backtest_pipeline(
-        params, app_ctx.transaction_source, app_ctx.price_source, resolved_data_dir
+        params, app_ctx.transaction_source, app_ctx.price_source
     )
     if result.success and hasattr(result, "data") and result.data:
         data = result.data
@@ -761,7 +744,6 @@ def backtest(
                 "ticker",
                 "num_buyers",
                 "signal_score",
-                "ou_entry_value",
                 "bt_entry_price",
                 "bt_exit_price",
                 "bt_return_pct",
@@ -802,25 +784,15 @@ def portfolio(
     ctx: typer.Context,
     start: str = typer.Option(..., help="Simulation start date (YYYY-MM-DD)"),
     end: str = typer.Option(..., help="Simulation end date (YYYY-MM-DD)"),
-    horizon: int = typer.Option(
-        _BACKTEST_DEFAULTS["horizon"], help="Forward return horizon in days"
-    ),
     lookback_days: int = typer.Option(
         _BACKTEST_DEFAULTS["lookback_days"],
         help="Candidate purchase lookback window in days",
-    ),
-    training_lookback_days: int = typer.Option(
-        _BACKTEST_DEFAULTS["training_lookback_days"],
-        help="Training data lookback window in days",
     ),
     min_buyers: int = typer.Option(
         _BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"
     ),
     top_n: int = typer.Option(
         _BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"
-    ),
-    threshold: float = typer.Option(
-        _BACKTEST_DEFAULTS["threshold"], help="Hit rate threshold percentage"
     ),
     # Intentionally bi-weekly (not the backtest's 30d step): rebalance cadence
     # for the portfolio sim, independent of the sweep-calibrated backtest.
@@ -845,9 +817,7 @@ def portfolio(
     start_date, end_date = _parse_sim_dates(start, end)
 
     _validate_positive_options(
-        horizon=horizon,
         lookback_days=lookback_days,
-        training_lookback_days=training_lookback_days,
         min_buyers=min_buyers,
         top_n=top_n,
         frequency_days=frequency_days,
@@ -868,7 +838,7 @@ def portfolio(
 
     from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
 
-    tx_start = start_date - timedelta(days=training_lookback_days + horizon + 30)
+    tx_start = start_date - timedelta(days=lookback_days)
     all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(
         tx_start, end_date
     )
@@ -876,17 +846,13 @@ def portfolio(
         print("Error: no transactions found for portfolio simulation", file=sys.stderr)
         raise typer.Exit(1)
 
-    prices, entry_prices, signals, recommendations = _load_portfolio_inputs(
+    prices, recommendations = _load_portfolio_inputs(
         app_ctx,
         all_transactions,
-        tx_start,
         end_date,
-        horizon,
         lookback_days,
-        training_lookback_days,
         min_buyers,
         top_n,
-        threshold,
         frequency_days,
         start_date,
     )
@@ -984,67 +950,41 @@ def _parse_sim_dates(start: str, end: str) -> tuple[date, date]:
 def _load_portfolio_inputs(
     app_ctx,
     all_transactions,
-    tx_start,
     end_date,
-    horizon,
     lookback_days,
-    training_lookback_days,
     min_buyers,
     top_n,
-    threshold,
     frequency_days,
     start_date,
 ):
-    """Load prices + entry_prices + signals + walk-forward recommendations.
-
-    Returns (prices_df, entry_prices_df, signals_df, recommendations_df).
-    Errors with `typer.Exit(1)` if any input is missing.
-    """
-    from datetime import timedelta
-
+    """Load execution prices and consensus recommendations."""
     from analyzer import analysis
 
-    price_end_sim = end_date + timedelta(days=horizon + 10)
-    raw_tickers = all_transactions["ticker"].dropna().unique().tolist()
-    all_tickers = sorted(
-        {t for t in raw_tickers if isinstance(t, str) and t.strip()} | {"SPY"}
-    )
+    all_tickers = sorted(set(candidate_tickers(all_transactions, 1)) | {"SPY"})
     prices = app_ctx.transaction_source.db.get_prices(
-        all_tickers, tx_start, price_end_sim
+        all_tickers, start_date, end_date
     )
     if prices.empty:
         print("Error: no price data available", file=sys.stderr)
         raise typer.Exit(1)
-
-    entry_prices = app_ctx.transaction_source.db.get_entry_prices(
-        all_tickers, tx_start, price_end_sim
-    )
-    if entry_prices.empty:
-        print("Error: no entry prices computed", file=sys.stderr)
-        raise typer.Exit(1)
-
-    signals = analysis.calculate_signal_potential(entry_prices, prices, [horizon])
 
     as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency_days}D")
     all_recs = []
     for as_of in as_of_dates:
         # date_range never yields NaT; narrow the stubs' union explicitly.
         recs = analysis.backtest_recommendations(
-            signals,
+            pd.DataFrame(),
             all_transactions,
             cast(pd.Timestamp, pd.Timestamp(as_of)),
-            horizon=horizon,
             lookback_days=lookback_days,
             min_buyers=min_buyers,
             top_n=top_n,
-            threshold=threshold,
-            prices_df=prices,
-            training_lookback_days=training_lookback_days,
         )
-        if not recs.empty:
-            recs = recs.copy()
-            recs["as_of_date"] = as_of
-            all_recs.append(recs)
+        if recs.empty:
+            continue
+        recs = recs.copy()
+        recs["as_of_date"] = as_of
+        all_recs.append(recs)
 
     if not all_recs:
         print("No recommendations produced for any backtest date", file=sys.stderr)
@@ -1054,8 +994,7 @@ def _load_portfolio_inputs(
     print(
         f"Collected {len(recommendations)} recommendations across {len(as_of_dates)} dates"
     )
-
-    return prices, entry_prices, signals, recommendations
+    return prices, recommendations
 
 
 def _print_portfolio_results(

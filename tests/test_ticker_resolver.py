@@ -55,6 +55,18 @@ class TestTickerResolver(unittest.TestCase):
             self.assertEqual(result.status, "unverified")
             self.assertEqual(result.confidence, 0.0)
 
+    def test_reused_spcx_symbol_is_listing_date_aware(self):
+        missing = self.resolver.resolve("SPCX")
+        before = self.resolver.resolve("SPCX", date(2026, 6, 11))
+        listed = self.resolver.resolve("SPCX", date(2026, 6, 12))
+
+        self.assertEqual(missing.status, "date_required")
+        self.assertEqual(before.status, "pre_listing")
+        self.assertEqual(listed.status, "listed_from_date")
+        self.assertFalse(self.resolver.is_strategy_eligible("SPCX"))
+        self.assertFalse(self.resolver.is_strategy_eligible("SPCX", date(2026, 6, 11)))
+        self.assertTrue(self.resolver.is_strategy_eligible("SPCX", date(2026, 6, 12)))
+
     def test_acquisition_is_date_aware_and_never_maps_acquirer(self):
         missing_date = self.resolver.resolve("ATVI")
         before = self.resolver.resolve("ATVI", date(2023, 10, 12))

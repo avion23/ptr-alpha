@@ -104,6 +104,9 @@ def _consensus_test_trades() -> pd.DataFrame:
                 ["2025-05-20", "2025-05-25", "2025-06-05"]
             ),
             "transaction_type": ["Purchase", "Purchase", "Purchase"],
+            "instrument_type": ["stock", "stock", "stock"],
+            "raw_asset_class": ["ST", "ST", "ST"],
+            "ticker_origin": ["official", "official", "official"],
         }
     )
 
@@ -124,10 +127,13 @@ def test_ticker_analysis_uses_real_consensus_at_explicit_cutoff():
             side_effect=AssertionError("scorer must not rank member history"),
         ),
     ):
+        transaction_source = MagicMock()
+        transaction_source.get_transactions.return_value = _consensus_test_trades()
         result = run_ticker_analysis(
-            TickerAnalysisParams(ticker="AAPL", year=2025, as_of_date=as_of),
-            MagicMock(),
-            MagicMock(),
+            TickerAnalysisParams(
+                ticker="AAPL", year=2025, min_buyers=2, as_of_date=as_of
+            ),
+            transaction_source,
         )
 
     assert result.success
@@ -137,8 +143,41 @@ def test_ticker_analysis_uses_real_consensus_at_explicit_cutoff():
     assert result.data["score"].iloc[0]["signal_score_raw"] > 0
 
 
+def test_single_ticker_rejects_prelisting_reused_symbol_rows():
+    rows = pd.DataFrame(
+        {
+            "member": ["Early Buyer"],
+            "ticker": ["SPCX"],
+            "transaction_date": pd.to_datetime(["2026-06-11"]),
+            "disclosure_date": pd.to_datetime(["2026-06-11"]),
+            "transaction_type": ["Purchase"],
+            "instrument_type": ["stock"],
+            "source": ["house_pdf"],
+        }
+    )
+    transaction_source = MagicMock()
+    transaction_source.get_transactions.return_value = rows
+
+    result = run_ticker_analysis(
+        TickerAnalysisParams(
+            ticker="SPCX",
+            year=2026,
+            days_back=28,
+            min_buyers=1,
+            as_of_date=date(2026, 6, 11),
+        ),
+        transaction_source,
+    )
+
+    assert result.success
+    assert result.data["buyers"].empty
+    assert result.data["score"].iloc[0]["signal_score"] == 0.0
+
+
 def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     as_of = date(2025, 6, 1)
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = _consensus_test_trades()
     with (
         patch(
             "analyzer.pipeline.prepare_live_consensus_data",
@@ -154,11 +193,9 @@ def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
         ),
     ):
         result = run_recent_ticker_scoring(
-            MagicMock(),
-            MagicMock(),
+            transaction_source,
             TickerScoringParams(
                 year=2025,
-                horizons=(90,),
                 as_of_date=as_of,
                 days_back=28,
                 min_buyers=2,
@@ -258,7 +295,7 @@ def test_recent_ticker_scoring_filters_rejected_symbols_before_candidate_gate():
 def test_cli_as_of_reaches_single_ticker_analysis_params():
     captured = []
 
-    def fake_run(params, transaction_source, price_source):
+    def fake_run(params, transaction_source):
         captured.append(params)
         return DataResult(
             success=True,
@@ -408,15 +445,6 @@ def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):
 
     with (
         patch("analyzer.pipeline.create_snapshot", return_value=MagicMock()),
-        patch("analyzer.pipeline.save_snapshot"),
-        patch(
-            "analyzer.pipeline._entry_prices_from_matrix",
-            return_value=pd.DataFrame({"entry_price": [100.0]}),
-        ),
-        patch(
-            "analyzer.pipeline.analysis.calculate_signal_potential",
-            return_value=pd.DataFrame({"member": ["Alice"]}),
-        ),
         patch(
             "analyzer.pipeline.analysis.backtest_recommendations",
             return_value=pd.DataFrame({"ticker": ["AAPL"]}),
@@ -435,7 +463,6 @@ def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):
             ),
             transaction_source,
             price_source,
-            data_dir=tmp_path,
         )
 
     assert result.success

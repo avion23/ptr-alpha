@@ -1,5 +1,6 @@
 """Smoke tests for analyzer.cli module."""
 
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -53,7 +54,6 @@ class TestCliApp(unittest.TestCase):
         for option in (
             "--horizon",
             "--lookback-days",
-            "--training-lookback-days",
             "--min-buyers",
             "--top-n",
             "--frequency-days",
@@ -79,9 +79,7 @@ class TestCliApp(unittest.TestCase):
 
     def test_portfolio_rejects_nonpositive_constraints_before_db_open(self):
         for option in (
-            "--horizon",
             "--lookback-days",
-            "--training-lookback-days",
             "--min-buyers",
             "--top-n",
             "--frequency-days",
@@ -232,12 +230,7 @@ class TestCliApp(unittest.TestCase):
                 patch("analyzer.cli.get_context", return_value=mock_ctx),
                 patch(
                     "analyzer.cli._load_portfolio_inputs",
-                    return_value=(
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                        recommendations,
-                    ),
+                    return_value=(pd.DataFrame(), recommendations),
                 ),
                 patch("analyzer.portfolio_sim.PortfolioSimulator") as simulator,
             ):

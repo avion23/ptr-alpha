@@ -1,5 +1,10 @@
 # House parser corpus audit (2026-07-10)
 
+> Historical evidence only. The parser cascade has changed since this run: current
+> code compares all text engines, aggregates all returned tables, records timing,
+> and requires OCR corroboration for unresolved disagreement. Do not use the
+> winning-engine counts below as a description of current control flow.
+
 ## Scope and command
 
 This is a non-destructive parser-only audit of every locally cached House PDF. It did not fetch metadata or PDFs and did not write to `data/` or the database. The production `_parse_pdf_worker` cascade was invoked in an 8-process pool with Docling disabled, matching the bulk first-pass mode documented by the parser:

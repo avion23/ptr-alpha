@@ -64,7 +64,6 @@ def build_portfolios_from_backtest(
             min_buyers=min_buyers,
             top_n=top_n,
             threshold=threshold,
-            prices_df=prices_df,
             training_lookback_days=training_lookback_days,
         )
         enriched = _attach_sizing_inputs(recs, sizing, as_of)

@@ -4,14 +4,13 @@ from datetime import date, timedelta
 from dataclasses import dataclass
 from functools import wraps
 import logging
-import re
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
+from analyzer.candidates import candidate_tickers, eligible_candidate_rows
 from analyzer.models import AnalysisMode, TransactionType
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot, save_snapshot
@@ -20,8 +19,6 @@ from analyzer import analysis
 from analyzer.member_ranking.buyer_scoring import _get_consensus_candidate_tickers
 
 logger = logging.getLogger(__name__)
-
-_VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,12 +36,9 @@ class AnalysisParams:
 @dataclass(frozen=True, slots=True)
 class TickerScoringParams:
     year: int
-    horizons: tuple[int, ...]
-    threshold: float = 5.0
     days_back: int = 28
     min_buyers: int = 3
     top_n: int = 15
-    training_lookback_days: int = 1095
     as_of_date: date | None = None
 
 
@@ -52,8 +46,8 @@ class TickerScoringParams:
 class TickerAnalysisParams:
     ticker: str
     year: int
-    horizon: int = 90
-    threshold: float = 5.0
+    days_back: int = 28
+    min_buyers: int = 3
     as_of_date: date | None = None
 
 
@@ -61,11 +55,9 @@ class TickerAnalysisParams:
 class BacktestParams:
     start_date: date
     end_date: date
-    # Optimal defaults from pdfplumber-era sweep (sharpe=1.41, alpha=+1.92%,
-    # DD=-9.89%, win=65.6%). min_buyers=3 is the single biggest driver: crowd
-    # consensus filters out idiosyncratic single-member picks.
     horizon: int = 60
-    lookback_days: int = 60
+    # Match the live ticker candidate window. The evaluation horizon is separate.
+    lookback_days: int = 28
     training_lookback_days: int = 365
     min_buyers: int = 3
     top_n: int = 5
@@ -213,6 +205,13 @@ def prepare_live_consensus_data(
 
 
 @pipeline_step
+def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
+    transaction_source.fetch_and_cache_pdfs(year)
+    logger.info("Successfully fetched PDFs for %d", year)
+    return DataResult(success=True, data=None)
+
+
+@pipeline_step
 def run_parse_pipeline(transaction_source, year: int) -> DataResult:
     transaction_source.parse_cached_pdfs(year)
     generation_id = transaction_source.db.get_latest_house_generation(year)
@@ -313,30 +312,32 @@ def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
 
 @pipeline_step
 def run_ticker_analysis(
-    params: TickerAnalysisParams, transaction_source, price_source
+    params: TickerAnalysisParams, transaction_source
 ) -> DataResult:
+    if params.days_back < 1 or params.min_buyers < 1:
+        raise DataSourceError("days_back and min_buyers must be positive")
     analysis_as_of = pd.Timestamp(
         params.as_of_date or min(date.today(), date(params.year, 12, 31))
     ).normalize()
     if analysis_as_of.year != params.year:
         raise DataSourceError("year must match the ticker analysis as-of date year")
 
-    trades, prices, signals = prepare_analysis_data(
-        transaction_source, price_source, params.year, (params.horizon,)
-    )
+    trades = transaction_source.get_transactions(params.year)
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
+    cutoff = analysis_as_of - timedelta(days=params.days_back)
     known_trades = trades[
-        disclosure_dates.notna() & (disclosure_dates <= analysis_as_of)
+        disclosure_dates.notna()
+        & (disclosure_dates >= cutoff)
+        & (disclosure_dates <= analysis_as_of)
     ].copy()
+    known_trades = eligible_candidate_rows(known_trades)
 
     buyers = _consensus_buyers_table(params.ticker, known_trades)
     score = analysis.score_ticker_by_buyers(
         params.ticker,
         known_trades,
-        signals,
-        horizon=params.horizon,
-        threshold=params.threshold,
         member_rankings=None,
+        min_buyers=params.min_buyers,
         scoring_mode="consensus",
         as_of_date=analysis_as_of,
     )
@@ -353,15 +354,10 @@ def run_ticker_analysis(
 
 @pipeline_step
 def run_recent_ticker_scoring(
-    transaction_source, price_source, params: TickerScoringParams
+    transaction_source, params: TickerScoringParams
 ) -> DataResult:
     if params.days_back < 1:
         raise DataSourceError("days_back must be at least 1")
-    if not params.horizons or any(horizon < 1 for horizon in params.horizons):
-        raise DataSourceError("horizons must contain positive days")
-
-    if params.training_lookback_days < 1:
-        raise DataSourceError("training_lookback_days must be at least 1")
 
     as_of_date = pd.Timestamp(params.as_of_date or date.today()).normalize()
     if as_of_date.year != params.year:
@@ -370,52 +366,41 @@ def run_recent_ticker_scoring(
         transaction_source,
         as_of_date,
         params.days_back,
-        history_lookback_days=params.training_lookback_days + max(params.horizons),
     )
     # Consensus is deliberately transaction-only.  Keep an empty signal frame
     # for the scorer's stable public call shape, but do not fetch prices or
     # calculate forward labels for a live recommendation.
     signals = pd.DataFrame()
     cutoff_date = as_of_date - timedelta(days=params.days_back)
-    disclosure_dates = pd.to_datetime(trades["disclosure_date"])
-    recent_trades = trades[
-        (disclosure_dates >= cutoff_date) & (disclosure_dates <= as_of_date)
-    ]
+    recent_trades = transaction_source.db.get_transactions_by_date_range(
+        cutoff_date.date(), as_of_date.date()
+    )
+    raw_count = len(recent_trades)
+    recent_trades = eligible_candidate_rows(recent_trades)
     logger.info(
-        "Analyzing %d transactions from last %d days",
+        "Loaded %d disclosures from %s through %s; %d are eligible purchase rows",
+        raw_count,
+        cutoff_date.date(),
+        as_of_date.date(),
         len(recent_trades),
-        params.days_back,
     )
 
-    multi_buyer_tickers = _get_consensus_candidate_tickers(
-        recent_trades, params.min_buyers
-    )
-
-    logger.info(
-        "Found %d tickers with %d+ buyers", len(multi_buyer_tickers), params.min_buyers
-    )
+    tickers = candidate_tickers(recent_trades, params.min_buyers)
+    logger.info("Found %d tickers with %d+ distinct buyers", len(tickers), params.min_buyers)
 
     scores = [
         analysis.score_ticker_by_buyers(
             ticker,
             recent_trades,
-            signals,
-            horizon=params.horizons[0],
-            threshold=params.threshold,
             member_rankings=None,
             min_buyers=params.min_buyers,
             scoring_mode="consensus",
             as_of_date=as_of_date,
         )
-        for ticker in multi_buyer_tickers
+        for ticker in tickers
     ]
 
     if not scores:
-        logger.warning(
-            "No tickers found with %d+ buyers in last %d days",
-            params.min_buyers,
-            params.days_back,
-        )
         return DataResult(
             success=True,
             data={
@@ -428,15 +413,15 @@ def run_recent_ticker_scoring(
         )
 
     result = pd.concat(scores, ignore_index=True)
-    # This interface presents buy candidates, so rejected/negative scores must
-    # not leak into the displayed recommendations merely to fill top_n.
     if "signal_score_raw" not in result.columns:
         result = result.iloc[0:0]
     else:
         result = result[
             pd.to_numeric(result["signal_score_raw"], errors="coerce").fillna(0) > 0
         ]
-    result = result.sort_values("signal_score", ascending=False).head(params.top_n)
+    result = result.sort_values(
+        ["signal_score", "ticker"], ascending=[False, True]
+    ).head(params.top_n)
     return DataResult(
         success=True,
         data={
@@ -638,11 +623,8 @@ def run_backtest_pipeline(
     params: BacktestParams,
     transaction_source,
     price_source,
-    data_dir: Path = Path("data"),
 ) -> DataResult:
-    tx_start = params.start_date - timedelta(
-        days=params.training_lookback_days + params.horizon + 30
-    )
+    tx_start = params.start_date - timedelta(days=params.lookback_days)
     tx_end = params.end_date
 
     all_transactions = transaction_source.db.get_transactions_by_date_range(
@@ -653,13 +635,9 @@ def run_backtest_pipeline(
 
     logger.info("Loaded %d transactions for backtest window", len(all_transactions))
 
-    price_start = tx_start
+    price_start = params.start_date
     price_end = params.end_date + timedelta(days=params.horizon + 10)
-    all_tickers = all_transactions["ticker"].unique().tolist()
-    all_tickers = [t for t in all_tickers if t and str(t).strip() and str(t) != "nan"]
-    # Filter out non-stock tickers (OCR garbage)
-    all_tickers = [t for t in all_tickers if _VALID_TICKER_RE.match(str(t))]
-    all_tickers = sorted(set(all_tickers) | {"SPY"})
+    all_tickers = sorted(set(candidate_tickers(all_transactions, 1)) | {"SPY"})
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)
 
@@ -676,14 +654,9 @@ def run_backtest_pipeline(
         prices=prices,
     )
 
-    entry_prices = _entry_prices_from_matrix(all_transactions, prices)
-    if entry_prices.empty:
-        raise DataSourceError("No entry prices could be computed")
-
-    signals = analysis.calculate_signal_potential(
-        entry_prices, prices, [params.horizon]
-    )
-    logger.info("Computed %d signals for backtest", len(signals))
+    # Consensus replay is a public-disclosure rule. Historical outcome labels
+    # are evaluation data, not decision inputs, so do not build them here.
+    signals = pd.DataFrame()
 
     as_of_dates = pd.date_range(
         params.start_date, params.end_date, freq=f"{params.frequency_days}D"
@@ -716,9 +689,6 @@ def run_backtest_pipeline(
             lookback_days=params.lookback_days,
             min_buyers=params.min_buyers,
             top_n=params.top_n,
-            threshold=params.threshold,
-            prices_df=prices,
-            training_lookback_days=params.training_lookback_days,
         )
 
         if recs.empty:
@@ -869,11 +839,6 @@ def run_backtest_pipeline(
             )
     evaluable_dates = len(observations)
     total_as_of_dates = len(as_of_dates)
-
-    # Save snapshot alongside backtest results
-    snapshot_path = data_dir / "price_snapshot.json"
-    save_snapshot(snapshot, snapshot_path)
-    logger.info("Price snapshot saved to %s", snapshot_path)
 
     return DataResult(
         success=True,

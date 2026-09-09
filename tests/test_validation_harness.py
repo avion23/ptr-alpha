@@ -257,7 +257,7 @@ class TestIdenticalSpySupportAndPerDateAlpha:
         spy = _benchmark_return(prices, as_of, 60)
         recs = analysis.backtest_recommendations(
             signals, all_tx, as_of_date=as_of, horizon=60, lookback_days=60,
-            min_buyers=2, top_n=5, threshold=5.0, prices_df=prices,
+            min_buyers=2, top_n=5, threshold=5.0,
             training_lookback_days=365, scoring_mode="consensus",
             bayes_prior_strength=20.0,
         ).drop(columns=["optimal_horizon"], errors="ignore")

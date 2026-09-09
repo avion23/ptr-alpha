@@ -386,8 +386,8 @@ class SenateEFDSource(TransactionSource):
         if self._session is not None:
             try:
                 self._session.close()
-            except Exception:  # noqa: B110  # nosec B110
-                pass
+            except Exception as exc:  # noqa: BLE001 - best-effort network cleanup
+                logger.debug("Failed to close prior eFD session: %s", exc)
         session = cffi_requests.Session(impersonate=BROWSER_IMPERSONATE)
         self._session = session
         resp = session.get(f"{EFD_BASE}/search/", timeout=REQUEST_TIMEOUT)

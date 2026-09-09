@@ -20,11 +20,11 @@ used stronger assumptions than the data justify.
 ## 1. Current system at a high level
 
 ```text
-Official House filings          Capitol Trades fallback
+Official House filings          Official Senate eFD
           |                              |
           +---------- ingestion --------+
                          |
-                 parser cascade / OCR
+                 parser cascade / normalization
                          |
             canonical transaction records
                          |
@@ -49,12 +49,12 @@ The major components are:
 
 | Component | Responsibility | Primary modules |
 | --- | --- | --- |
-| Ingestion | Download disclosures and optional external records | `download.py`, `capitol_trades.py` |
+| Ingestion | Download official House/Senate disclosures; create external reconciliation artifacts separately | `download.py`, `senate_efd.py`, `capitol_trades.py` |
 | Parsing | Convert heterogeneous PDFs into normalized rows | `parser_cascade.py`, `parsing/` |
 | Persistence | Store transactions, prices, metadata, parse runs, and provenance | `database.py`, repository modules |
 | Point-in-time data | Build entry prices, feature histories, and completed forward outcomes | `price_snapshot.py`, `signals/`, `pipeline.py` |
 | Descriptive member analysis | Estimate hit rates, alpha, and partially pooled member effects | `member_ranking/` |
-| Candidate generation | Score recent multi-buyer ticker events | `member_ranking/buyer_scoring.py` |
+| Candidate generation | Build the shared public-equity universe and count recent distinct buyers | `candidates.py`, `member_ranking/buyer_scoring.py` |
 | Replay | Generate recommendations and evaluate realizable historical outcomes | `backtest/`, `portfolio/`, `portfolio_sim.py` |
 | Statistical validation | Purge horizons, preserve scheduled support, correct search, and consume evaluations once | `validation.py`, `snooping.py` |
 | Retrospective optimization | A second locked selection/retrospective/final workflow | `optimize_profit/` |
@@ -172,7 +172,9 @@ The following properties should be preserved:
 - the primary statistic is one per-date net-alpha series rather than a mixture
   of incompatible metrics;
 - production selection is fail-closed when no corrected survivor exists;
-- the consensus scorer is identity-invariant by construction;
+- the production consensus scorer is identity-invariant and equals distinct recent buyer count;
+- live analysis and replay share the same candidate universe and deterministic tie-break;
+- the CLI backtest evaluates its declared fixed horizon rather than an adaptive OU horizon;
 - member-skill modes are descriptive and cannot authorize deployment;
 - retrospective history is labeled as reused history, not fresh evidence;
 - final evaluation is locked and consumed through an auditable ledger.
@@ -341,9 +343,10 @@ producer of `TrialSpec` records.
 
 ### Layer 0: identity-free consensus baseline
 
-Keep the current distinct-buyer recency score. It is cheap, deterministic,
-interpretable, invariant to member-name permutation, and an excellent canary.
-Every more complex model must beat it on identical support after costs.
+Keep the current distinct-buyer count inside one explicit public-disclosure
+lookback window. It is cheap, deterministic, interpretable, invariant to member-name
+permutation, and has no second hidden recency-decay coefficient. Every more complex
+model must beat it on identical support after costs.
 
 ### Layer 1: dynamic hierarchical model
 

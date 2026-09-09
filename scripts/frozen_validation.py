@@ -316,7 +316,6 @@ def _test_window_recommendations(
             min_buyers=int(config["min_buyers"]),
             top_n=int(config["top_n"]),
             threshold=float(config.get("threshold", 5.0)),
-            prices_df=prices,
             training_lookback_days=int(config["training_lookback_days"]),
             scoring_mode="consensus",
             bayes_prior_strength=float(config["bayes_prior_strength"]),

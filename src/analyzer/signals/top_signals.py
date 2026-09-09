@@ -1,9 +1,8 @@
 """Top signals: highest-conviction purchase signals and per-member signals.
 
-`get_top_signals` returns the global top N by composite score (alpha +
-realized return). `get_member_signals` returns the top N for a single
-member. Both apply the quality filter and use the conviction score
-weights from `constants.py`.
+`get_top_signals` returns the global top N by endpoint SPY alpha.
+`get_member_signals` returns the top N for a single member. Both apply
+the same quality filter before ranking.
 """
 
 from __future__ import annotations
@@ -13,12 +12,12 @@ import pandas as pd
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
 
-from analyzer.signals.constants import (
-    CONVICTION_WEIGHT_ALPHA,
-    CONVICTION_WEIGHT_REALIZED,
-    MIN_ENTRY_PRICE,
+from analyzer.signals.constants import MIN_ENTRY_PRICE
+from analyzer.signals.filters import (
+    _apply_quality_filter,
+    _collapse_to_episodes,
+    _get_horizon_data,
 )
-from analyzer.signals.filters import _apply_quality_filter, _get_horizon_data
 
 
 _TOP_COLS = [
@@ -55,7 +54,7 @@ def _get_top_signals(
             f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})"
         )
 
-    top_data = top_data.copy()
+    top_data = _collapse_to_episodes(top_data, max_gap_days=0)
     top_data["signal_score"] = _compute_conviction_score(top_data)
     top_data = top_data[top_data["signal_score"] > 0]
     return top_data.nlargest(top_n, "signal_score")[_TOP_COLS]
@@ -87,7 +86,7 @@ def _get_member_signals(
     if purchases.empty:
         raise AnalysisError(f"No signals survived quality filter for {member}")
 
-    purchases = purchases.copy()
+    purchases = _collapse_to_episodes(purchases, max_gap_days=0)
     purchases["signal_score"] = _compute_conviction_score(purchases)
     return purchases.nlargest(top_n, "signal_score")[_MEMBER_TOP_COLS]
 
@@ -112,8 +111,5 @@ def get_member_signals(
 
 
 def _compute_conviction_score(df: pd.DataFrame) -> pd.Series:
-    """Composite score = total_spy_alpha * ALPHA + total_return * REALIZED."""
-    return (
-        df["total_spy_alpha_pct"].fillna(0) * CONVICTION_WEIGHT_ALPHA
-        + df["total_return_pct"].fillna(0) * CONVICTION_WEIGHT_REALIZED
-    )
+    """Use endpoint SPY alpha directly; do not double-count stock return."""
+    return df["total_spy_alpha_pct"].fillna(0)

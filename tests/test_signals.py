@@ -294,6 +294,15 @@ class TestGetTopSignals(unittest.TestCase):
 
         self.assertTrue(get_top_signals(signals, horizon=90, top_n=3).empty)
 
+    def test_collapses_same_member_ticker_disclosure_duplicates(self):
+        signals = self._make_signals().iloc[[0]].copy()
+        signals = pd.concat([signals, signals], ignore_index=True)
+
+        top = get_top_signals(signals, horizon=90, top_n=5)
+
+        self.assertEqual(len(top), 1)
+        self.assertEqual(top.iloc[0]["ticker"], "AAPL")
+
 
 if __name__ == "__main__":
     unittest.main()

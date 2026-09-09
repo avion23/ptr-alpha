@@ -60,8 +60,6 @@ def _find_db() -> Path:
     raise SystemExit("Could not locate data/congress.duckdb")
 
 
-DB_PATH = _find_db()
-
 # transaction_type values treated as congressional BUYS (purchase-type).
 BUY_TYPES = {"purchase"}
 
@@ -144,7 +142,9 @@ def get_current_price(ticker: str):
         return None, None
 
 
-def get_congressional(ticker: str):
+def get_congressional(
+    ticker: str, db_path: Path = Path("data/congress.duckdb")
+):
     """Return congressional transactions for ticker, de-duplicated (issue M4).
 
     The canonical transaction scope can contain legacy duplicate-row groups
@@ -152,7 +152,7 @@ def get_congressional(ticker: str):
     (member, ticker, transaction_date, transaction_type, disclosure_date) so
     that n_buys and match tests are not inflated.
     """
-    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    conn = duckdb.connect(str(db_path), read_only=True)
     try:
         rows = conn.execute(
             """
@@ -210,7 +210,8 @@ def main() -> int:
         print(f"error: {csv_path} not found", file=sys.stderr)
         return 1
 
-    print(f"DB:        {DB_PATH}")
+    db_path = _find_db()
+    print(f"DB:        {db_path}")
     print(f"Blotter:   {csv_path}")
     print(
         f"Proxy win: congressional Purchase within {MATCH_WINDOW_DAYS} days "
@@ -346,7 +347,7 @@ def main() -> int:
             price_failures.append(sym)
 
         # --- congressional (de-duplicated) ----------------------------------
-        rows = get_congressional(sym)
+        rows = get_congressional(sym, db_path)
         total_tx = len(rows)
         buys = [r for r in rows if str(r[4]).strip().lower() in BUY_TYPES]
         n_buys = len(buys)
@@ -644,7 +645,7 @@ def main() -> int:
     # --- write JSON ----------------------------------------------------------
     out = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "db_path": str(DB_PATH),
+        "db_path": str(db_path),
         "match_window_days": MATCH_WINDOW_DAYS,
         "report_windows": REPORT_WINDOWS,
         "recommendation_label": "congressional_buy_within_60d",

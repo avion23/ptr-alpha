@@ -10,14 +10,9 @@ from analyzer.models import AnalysisMode, TransactionType  # noqa: F401 — re-e
 
 from analyzer.signals import (  # noqa: F401
     DECAY_LAMBDA,
-    POSITION_SIZE_BASELINE,
-    MAX_DISCLOSURE_METADATA_ADJUSTMENT,
     BAYES_PRIOR_STRENGTH,
-    BUYER_RECENCY_DECAY,
     TICKER_PERF_MIN_TRADES,
     MIN_ENTRY_PRICE,
-    CONVICTION_WEIGHT_ALPHA,
-    CONVICTION_WEIGHT_REALIZED,
     _price_at_or_before,
     _price_at_or_near,
     _price_on_or_before,

@@ -24,14 +24,14 @@ from typing import cast
 import pandas as pd
 
 from analyzer.database import Database
-from analyzer.datasources import (
+from analyzer.download import (
     HouseTransactionSource,
     _build_member_lookup,
     _filter_existing_pdfs,
-    consolidate_transactions,
+    preserve_existing_fields,
 )
-from analyzer.download import preserve_existing_fields
 from analyzer.models import FilingType
+from analyzer.parsing import consolidate_transactions
 from analyzer.parser_cascade import (
     ParserCascadeError,
     _parse_pdf_worker,

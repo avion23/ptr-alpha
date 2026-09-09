@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.exceptions import AnalysisError
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.price_repository import nyse_sessions
 from analyzer.ticker_resolver import TickerResolver
 
 from analyzer.signals import constants as _constants
@@ -34,6 +34,7 @@ def _compute_ticker_signals(
     t_indices: np.ndarray,
     t_disc_ns: np.ndarray,
     t_end_ns: np.ndarray,
+    session_ns: np.ndarray,
     dates_ns: np.ndarray,
     vals: np.ndarray,
     spy_dates_ns: np.ndarray | None,
@@ -74,7 +75,10 @@ def _compute_ticker_signals(
         # The execution convention is explicit: enter on the next expected
         # NYSE session after the dated decision, then hold for the full calendar
         # horizon and exit on the expected NYSE session on or before that end.
-        entry_date_ns = next_nyse_session(pd.Timestamp(disc_ns)).value
+        session_pos = int(np.searchsorted(session_ns, disc_ns, side="right"))
+        if session_pos >= len(session_ns):
+            continue
+        entry_date_ns = int(session_ns[session_pos])
         entry_pos = int(np.searchsorted(dates_ns, entry_date_ns, side="left"))
         if entry_pos >= len(dates_ns) or int(dates_ns[entry_pos]) != entry_date_ns:
             continue
@@ -85,7 +89,12 @@ def _compute_ticker_signals(
         r_label_window_end[idx] = np.datetime64(intended_end_ns, "ns")
         if intended_end_ns > today_ns:
             continue
-        exit_date_ns = previous_nyse_session(pd.Timestamp(intended_end_ns)).value
+        exit_session_pos = int(
+            np.searchsorted(session_ns, intended_end_ns, side="right") - 1
+        )
+        if exit_session_pos < 0:
+            continue
+        exit_date_ns = int(session_ns[exit_session_pos])
         exit_pos = int(np.searchsorted(dates_ns, exit_date_ns, side="left"))
         if exit_pos >= len(dates_ns) or int(dates_ns[exit_pos]) != exit_date_ns:
             continue
@@ -222,6 +231,7 @@ def calculate_signal_potential(
     n = len(signals)
 
     metadata = _extract_metadata_arrays(signals)
+    session_ns = _label_session_array(metadata)
     spy_dates_ns, spy_vals, spy_log_ret = _precompute_spy_log_returns(prices_df)
     result_arrays = _allocate_result_arrays(n)
 
@@ -230,6 +240,7 @@ def calculate_signal_potential(
         metadata,
         prices_df,
         decay_lambda,
+        session_ns,
         spy_dates_ns,
         spy_vals,
         spy_log_ret,
@@ -369,6 +380,19 @@ def _extract_metadata_arrays(signals: pd.DataFrame) -> dict:
     }
 
 
+def _label_session_array(metadata: dict) -> np.ndarray:
+    """Build the NYSE calendar once for every label in this batch."""
+    disc_ns = metadata["disc_ns"]
+    end_ns = metadata["end_ns"]
+    if len(disc_ns) == 0:
+        return np.array([], dtype=np.int64)
+    start = pd.Timestamp(int(disc_ns.min()))
+    # Entry is after disclosure, so the requested horizon can end a few days
+    # after disclosure+horizon when weekends or holidays intervene.
+    end = pd.Timestamp(int(end_ns.max())) + pd.Timedelta(days=14)
+    return nyse_sessions(start, end).as_unit("ns").asi8
+
+
 def _precompute_spy_log_returns(prices_df: pd.DataFrame) -> tuple:
     """Pre-compute SPY data once (vectorized log returns)."""
     spy_arrs = _price_arrays(prices_df, "SPY")
@@ -411,6 +435,7 @@ def _compute_all_ticker_signals(
     metadata,
     prices_df,
     decay_lambda,
+    session_ns,
     spy_dates_ns,
     spy_vals,
     spy_log_ret,
@@ -435,6 +460,7 @@ def _compute_all_ticker_signals(
             t_indices,
             metadata["disc_ns"][t_indices],
             metadata["end_ns"][t_indices],
+            session_ns,
             dates_ns,
             vals,
             spy_dates_ns,

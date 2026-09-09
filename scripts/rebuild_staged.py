@@ -623,7 +623,7 @@ def prices(args) -> None:
     import re  # noqa: PLC0415
     import time  # noqa: PLC0415
 
-    from analyzer.datasources import YFinancePriceSource  # noqa: PLC0415
+    from analyzer.price_source import YFinancePriceSource  # noqa: PLC0415
 
     staging = Path(args.staging)
     manifest = _load_manifest(staging)

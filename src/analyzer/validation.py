@@ -216,7 +216,6 @@ def _backtest_core(
                 min_buyers=params.min_buyers,
                 top_n=params.top_n,
                 threshold=params.threshold,
-                prices_df=prices,
                 training_lookback_days=params.training_lookback_days,
                 scoring_mode=scoring_mode,
                 bayes_prior_strength=bayes_prior_strength,

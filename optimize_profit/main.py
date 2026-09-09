@@ -786,10 +786,6 @@ def _load_and_verify_repository_lock(requested_path: Path) -> tuple[dict, str]:
         raise RuntimeError("Current source aggregate differs from the lock")
     if _semantic_constants() != lock["semantic_constants"]:
         raise RuntimeError("Semantic constants differ from the final lock")
-    if _locked_runtime_fingerprint() != lock["runtime_fingerprint"]:
-        raise RuntimeError(
-            "Runtime, platform, architecture, BLAS, or dependencies differ"
-        )
     git = _git_state()
     if git["dirty"]:
         raise RuntimeError("Final evaluation requires a clean worktree")

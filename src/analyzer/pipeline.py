@@ -506,14 +506,7 @@ def _entry_prices_from_matrix(
 def _benchmark_return(
     prices: pd.DataFrame, as_of_date: pd.Timestamp, horizon: int
 ) -> float | None:
-    """Return the executable SPY return for one scheduled backtest date.
-
-    Route benchmark calculations through the production evaluator so entry,
-    exit, session alignment, and slippage remain identical to recommendation
-    evaluation.  The direct import is only a compatibility fallback for
-    callers that replace the analysis facade in tests or integrations and
-    return a frame without the benchmark column.
-    """
+    """Return the executable SPY return for one scheduled backtest date."""
     recommendation = pd.DataFrame(
         [
             {
@@ -528,20 +521,6 @@ def _benchmark_return(
         evaluated = analysis.evaluate_backtest(
             recommendation, prices, as_of_date, horizon
         )
-    except (AnalyzerError, KeyError):
-        return None
-
-    value = _benchmark_value(evaluated)
-    if value is not None:
-        return value
-
-    # ``analysis.evaluate_backtest`` is a facade re-export.  Bypass a facade
-    # replacement only when it did not return the shared benchmark field; the
-    # normal production path above remains the single source of arithmetic.
-    try:
-        from analyzer.backtest.evaluate import evaluate_backtest
-
-        evaluated = evaluate_backtest(recommendation, prices, as_of_date, horizon)
     except (AnalyzerError, KeyError, TypeError, ValueError):
         return None
     return _benchmark_value(evaluated)

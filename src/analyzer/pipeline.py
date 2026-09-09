@@ -16,6 +16,8 @@ from analyzer.price_snapshot import create_snapshot
 from analyzer.ticker_resolver import TickerResolver
 from analyzer import analysis
 from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_LOOKBACK_DAYS,
+    CONSENSUS_MIN_BUYERS,
     _get_consensus_candidate_tickers,
     _get_consensus_price_tickers,
     _get_consensus_ticker_purchases,
@@ -51,8 +53,8 @@ class AnalysisParams:
 @dataclass(frozen=True, slots=True)
 class TickerScoringParams:
     year: int
-    days_back: int = 28
-    min_buyers: int = 3
+    days_back: int = CONSENSUS_LOOKBACK_DAYS
+    min_buyers: int = CONSENSUS_MIN_BUYERS
     top_n: int = 15
     as_of_date: date | None = None
 
@@ -61,8 +63,8 @@ class TickerScoringParams:
 class TickerAnalysisParams:
     ticker: str
     year: int
-    days_back: int = 28
-    min_buyers: int = 3
+    days_back: int = CONSENSUS_LOOKBACK_DAYS
+    min_buyers: int = CONSENSUS_MIN_BUYERS
     as_of_date: date | None = None
 
 
@@ -72,11 +74,11 @@ class BacktestParams:
     end_date: date
     horizon: int = 60
     # Match the live ticker candidate window. The evaluation horizon is separate.
-    lookback_days: int = 28
+    lookback_days: int = CONSENSUS_LOOKBACK_DAYS
     # Research validation uses these only for explicit historical scoring modes.
     # The production consensus replay does not consume member-training knobs.
     training_lookback_days: int = 365
-    min_buyers: int = 3
+    min_buyers: int = CONSENSUS_MIN_BUYERS
     top_n: int = 5
     threshold: float = 5.0
     frequency_days: int = 30

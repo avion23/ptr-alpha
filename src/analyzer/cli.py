@@ -14,7 +14,11 @@ from typing import cast
 import pandas as pd
 import typer
 
-from analyzer.member_ranking.buyer_scoring import _get_consensus_price_tickers
+from analyzer.member_ranking.buyer_scoring import (
+    CONSENSUS_LOOKBACK_DAYS,
+    CONSENSUS_MIN_BUYERS,
+    _get_consensus_price_tickers,
+)
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
@@ -380,8 +384,12 @@ def analyze(
     ticker: str | None = typer.Option(None, help="Analyze specific ticker"),
     horizons: list[int] = typer.Option([90], help="Time horizons in days"),
     threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
-    days_back: int = typer.Option(28, help="Days back for ticker scoring"),
-    min_buyers: int = typer.Option(3, help="Minimum buyers for ticker scoring"),
+    days_back: int = typer.Option(
+        CONSENSUS_LOOKBACK_DAYS, help="Days back for ticker scoring"
+    ),
+    min_buyers: int = typer.Option(
+        CONSENSUS_MIN_BUYERS, help="Minimum buyers for ticker scoring"
+    ),
     top_n: int = typer.Option(20, help="Number of results to show"),
     as_of: str | None = typer.Option(
         None,
@@ -1470,27 +1478,16 @@ def fetch_senate_efd(
 
 
 def _validation_grid(full_grid: bool) -> dict[str, list]:
-    if full_grid:
-        return {
-            "horizon": [60, 90, 120],
-            "frequency_days": [30, 90],
-            "training_lookback_days": [180, 365],
-            "min_buyers": [2, 3, 5],
-            "top_n": [3, 5],
-            "decay_lambda": [0.001, 0.005, 0.02],
-            "bayes_prior_strength": [5, 20, 50],
-            "scoring_mode": ["consensus"],
-        }
-    return {
+    """Return only parameters that can change the production consensus rule."""
+    grid = {
         "horizon": [60, 90, 120],
-        "frequency_days": [30],
-        "training_lookback_days": [365],
+        "frequency_days": [30, 90] if full_grid else [30],
+        "lookback_days": [CONSENSUS_LOOKBACK_DAYS],
         "min_buyers": [2, 3, 5],
         "top_n": [3, 5],
-        "decay_lambda": [0.005],
-        "bayes_prior_strength": [20],
         "scoring_mode": ["consensus"],
     }
+    return grid
 
 
 @app.command()
@@ -1505,7 +1502,7 @@ def validate(
     test_start: str = typer.Option("2024-01-01", help="Test window start (YYYY-MM-DD)"),
     test_end: str = typer.Option("2025-06-30", help="Test window end (YYYY-MM-DD)"),
     full_grid: bool = typer.Option(
-        False, "--full-grid", help="Use full 648-combo grid (slow)"
+        False, "--full-grid", help="Use full 36-combo consensus grid"
     ),
     data_dir: str = typer.Option("data", help="Data directory"),
     null_samples: int = typer.Option(

@@ -68,7 +68,14 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
         Holiday("Christmas Day", month=12, day=25, observance=nearest_workday),
         # One-off full-session closures are not covered by recurring holiday
         # rules. Keep them explicit so a valid cache is not treated as missing
-        # and repeatedly downloaded.
+        # and entries do not target a day when the exchange was closed.
+        Holiday(
+            "National Day of Mourning for George H.W. Bush",
+            month=12,
+            day=5,
+            start_date="2018-12-05",
+            end_date="2018-12-05",
+        ),
         Holiday(
             "National Day of Mourning for Jimmy Carter",
             month=1,

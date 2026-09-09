@@ -276,18 +276,15 @@ def refresh_prices(
     try:
         price_source = YFinancePriceSource(settings, read_only=False, db=db)
         try:
-            try:
+            # A batch can legitimately return only a subset of symbols. Keep
+            # every valid observation, then retry only the unresolved symbols
+            # individually so one delisted/bad ticker cannot define the batch
+            # outcome through an arbitrary success-rate threshold.
+            with contextlib.suppress(DataSourceError):
                 price_source.get_prices(eligible, start, end)
-            except DataSourceError:
-                # The batch fetch persisted every ticker it could. Only the
-                # genuinely unresolvable assets remain missing; retry each one
-                # individually so transient failures are recovered instead of
-                # aborting the refresh over a cluster of delisted assets.
-                for ticker in sorted(
-                    set(eligible) - _persisted_tickers(db, start, end)
-                ):
-                    with contextlib.suppress(DataSourceError):
-                        price_source.get_prices([ticker], start, end)
+            for ticker in sorted(set(eligible) - _persisted_tickers(db, start, end)):
+                with contextlib.suppress(DataSourceError):
+                    price_source.get_prices([ticker], start, end)
         finally:
             price_source.close()
         # Assets with no price history in the window (including those whose

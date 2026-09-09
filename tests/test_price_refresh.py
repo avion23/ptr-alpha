@@ -233,10 +233,10 @@ class RefreshPipelineTests(unittest.TestCase):
         self.assertNotIn("AAPL", report.stale_tickers)
 
 
-    def test_refresh_recovers_batch_gate_failure_and_records_unavailable(self):
-        # Monolithic batch covers only AAPL+SPY -> 2/4 success trips the 75%
-        # gate; per-ticker recovery then prices MSFT and records ZZZ as
-        # unavailable (no price history in window).
+    def test_refresh_retries_partial_batch_and_records_unavailable(self):
+        # Monolithic batch covers only AAPL+SPY. Explicit per-ticker recovery
+        # then prices MSFT and records ZZZ as unavailable (no price history in
+        # the window), without relying on a batch success-rate exception.
         self._seed_transactions(["AAPL", "MSFT", "ZZZ"])
         dates = _nyse_dates("2024-01-02", "2024-01-05")
 

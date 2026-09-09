@@ -310,7 +310,7 @@ def _resolve_tickers(all_tickers: list[str]) -> tuple[dict, dict]:
 def _validate_and_log_prices(
     prices: pd.DataFrame, all_tickers: list[str]
 ) -> pd.DataFrame:
-    """Fail loudly when too many tickers couldn't be fetched (>25%)."""
+    """Quarantine invalid observations and report unresolved tickers."""
     prices = _as_frame(prices.apply(pd.to_numeric, errors="coerce"))
     invalid_mask = prices.notna() & (~np.isfinite(prices) | prices.le(0))
     if invalid_mask.any().any():
@@ -325,11 +325,6 @@ def _validate_and_log_prices(
     success_count = len([t for t in all_tickers if t in prices.columns])
     success_rate = success_count / len(all_tickers)
 
-    if success_rate < 0.75:
-        raise DataSourceError(
-            f"Price fetch failure rate too high: {(1 - success_rate) * 100:.1f}% failed "
-            f"({len(failed_tickers)}/{len(all_tickers)}). Analysis would be unreliable."
-        )
     if failed_tickers:
         logger.warning(
             f"Failed to fetch price data for {len(failed_tickers)} tickers: "

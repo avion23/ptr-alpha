@@ -128,7 +128,7 @@ def test_ticker_analysis_uses_real_consensus_at_explicit_cutoff():
         ),
     ):
         transaction_source = MagicMock()
-        transaction_source.get_transactions.return_value = _consensus_test_trades()
+        transaction_source.db.get_transactions.return_value = _consensus_test_trades()
         result = run_ticker_analysis(
             TickerAnalysisParams(
                 ticker="AAPL", year=2025, min_buyers=2, as_of_date=as_of
@@ -156,7 +156,7 @@ def test_single_ticker_rejects_prelisting_reused_symbol_rows():
         }
     )
     transaction_source = MagicMock()
-    transaction_source.get_transactions.return_value = rows
+    transaction_source.db.get_transactions.return_value = rows
 
     result = run_ticker_analysis(
         TickerAnalysisParams(

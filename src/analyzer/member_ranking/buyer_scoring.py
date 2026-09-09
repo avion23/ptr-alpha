@@ -63,6 +63,13 @@ _NON_EQUITY_INSTRUMENTS = frozenset(
     }
 )
 _REJECTED_TICKER_ORIGINS = frozenset({"invalid", "missing", "non_equity"})
+_OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
+_UNSUPPORTED_ASSET_RE = re.compile(
+    r"\b(?:mutual fund|index fund|exchange-traded fund|money market|treasury|"
+    r"government securit|corporate bond|municipal bond|real estate|cryptocurrency|"
+    r"private equity|limited partnership)\b",
+    re.IGNORECASE,
+)
 
 
 @df_memoize(copy=False)
@@ -255,9 +262,15 @@ def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
         if not _equity_transaction_row(row):
             resolved_symbols.append(None)
         else:
-            trade_date = _transaction_date(row.get("transaction_date"))
+            ticker = _normalize_ticker_text(row.get("ticker"))
+            date_field = (
+                "disclosure_date"
+                if ticker in _TICKER_RESOLVER.LISTING_START_MAP
+                else "transaction_date"
+            )
+            reference_date = _transaction_date(row.get(date_field))
             resolved_symbols.append(
-                _resolved_ticker_symbol(row.get("ticker"), trade_date)
+                _resolved_ticker_symbol(row.get("ticker"), reference_date)
             )
         canonical_members.append(_canonical_member_or_blank(row.get("member")))
 
@@ -268,39 +281,86 @@ def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
     ].copy()
 
 
+def _resolve_consensus_ticker(ticker: str, as_of_date: pd.Timestamp) -> str:
+    """Return the tradable symbol for one equity identity at decision time."""
+    normalized = _validate_ticker(ticker)
+    decision_date = _transaction_date(as_of_date)
+    if decision_date is None:
+        raise AnalysisError("Consensus ticker resolution requires a valid as-of date")
+
+    family_symbols = _ticker_family_symbols(normalized)
+    # Rename aliases are the only families whose tradable symbol changes over
+    # time. Resolve the old alias at decision time so pre-rename replays trade
+    # the old symbol and later/delayed filings trade the renamed symbol.
+    for alias in _TICKER_RESOLVER.RENAME_MAP:
+        if alias in family_symbols:
+            resolution = _TICKER_RESOLVER.resolve(alias, decision_date)
+            if resolution.status in _REJECTED_TICKER_STATUSES or resolution.status in {
+                "date_required",
+                "pre_listing",
+            }:
+                raise AnalysisError(
+                    f"Ticker {ticker!r} is not tradable at {decision_date}: "
+                    f"{resolution.notes}"
+                )
+            return resolution.price_symbol
+
+    resolution = _TICKER_RESOLVER.resolve(normalized, decision_date)
+    if resolution.status in _REJECTED_TICKER_STATUSES or resolution.status in {
+        "date_required",
+        "pre_listing",
+    }:
+        raise AnalysisError(
+            f"Ticker {ticker!r} is not tradable at {decision_date}: {resolution.notes}"
+        )
+    return resolution.price_symbol
+
+
 def _get_consensus_candidate_tickers(
-    transactions_df: pd.DataFrame, min_buyers: int
+    transactions_df: pd.DataFrame,
+    min_buyers: int,
+    *,
+    as_of_date: pd.Timestamp,
 ) -> list[str]:
-    """Return live candidate labels whose filtered buyer count meets the gate."""
+    """Return one decision-time symbol per equity identity meeting the buyer gate."""
     purchases = _prepare_consensus_purchases(transactions_df)
     if purchases.empty:
         return []
 
-    buyer_sets = purchases.groupby("_resolved_symbol")["_member_canonical"].agg(set)
-    candidates: list[str] = []
-    seen: set[str] = set()
-    raw_tickers = transactions_df.loc[
-        transactions_df["transaction_type"] == TransactionType.PURCHASE.value,
-        "ticker",
-    ]
-    for raw_ticker in raw_tickers.dropna().unique():
-        if not isinstance(raw_ticker, str):
+    families: dict[frozenset[str], pd.DataFrame] = {}
+    for resolved_symbol in purchases["_resolved_symbol"].dropna().astype(str).unique():
+        family = frozenset(_ticker_family_symbols(resolved_symbol))
+        if family not in families:
+            families[family] = purchases[
+                purchases["_resolved_symbol"].isin(family)
+            ]
+
+    candidates: set[str] = set()
+    for family, family_rows in families.items():
+        if family_rows["_member_canonical"].nunique() < min_buyers:
             continue
-        normalized = _normalize_ticker_text(raw_ticker)
-        if normalized is None or normalized in seen:
-            continue
-        seen.add(normalized)
         try:
-            normalized = _validate_ticker(normalized)
+            seed = next(
+                alias for alias in _TICKER_RESOLVER.RENAME_MAP if alias in family
+            )
+        except StopIteration:
+            seed = sorted(family)[0]
+        try:
+            candidates.add(_resolve_consensus_ticker(seed, as_of_date))
         except AnalysisError:
             continue
-        family_symbols = _ticker_family_symbols(normalized)
-        buyers: set[str] = set()
-        for symbol in family_symbols:
-            buyers.update(buyer_sets.get(symbol, set()))
-        if len(buyers) >= min_buyers:
-            candidates.append(raw_ticker)
-    return candidates
+    return sorted(candidates)
+
+
+def _get_consensus_price_tickers(transactions_df: pd.DataFrame) -> list[str]:
+    """Return every price symbol family needed to evaluate eligible purchases."""
+    purchases = _prepare_consensus_purchases(transactions_df)
+    if purchases.empty:
+        return []
+    symbols: set[str] = set()
+    for resolved_symbol in purchases["_resolved_symbol"].dropna().astype(str).unique():
+        symbols.update(_ticker_family_symbols(resolved_symbol))
+    return sorted(symbols)
 
 
 def _resolved_ticker_symbol(value, trade_date=None) -> str | None:
@@ -310,7 +370,10 @@ def _resolved_ticker_symbol(value, trade_date=None) -> str | None:
     if normalized in _NON_EQUITY_TICKERS:
         return None
     resolution = _TICKER_RESOLVER.resolve(normalized, trade_date)
-    if resolution.status in _REJECTED_TICKER_STATUSES:
+    if resolution.status in _REJECTED_TICKER_STATUSES or resolution.status in {
+        "date_required",
+        "pre_listing",
+    }:
         return None
     return resolution.price_symbol
 
@@ -329,8 +392,28 @@ def _equity_transaction_row(row: pd.Series) -> bool:
     if origin is not None and origin.lower() in _REJECTED_TICKER_ORIGINS:
         return False
 
+    source = _normalize_ticker_text(row.get("source"))
+    if source is not None and source.lower() not in _OFFICIAL_SOURCES:
+        return False
+
+    description = " ".join(
+        str(value)
+        for value in (row.get("asset_description"), row.get("raw_asset_description"))
+        if value is not None and not pd.isna(value)
+    )
+    if _UNSUPPORTED_ASSET_RE.search(description):
+        return False
+
     instrument = _normalize_ticker_text(row.get("instrument_type"))
     return instrument is None or instrument.lower() not in _NON_EQUITY_INSTRUMENTS
+
+
+def _filter_equity_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """Keep rows accepted by the consensus equity/provenance boundary."""
+    if rows.empty:
+        return rows
+    mask = rows.apply(_equity_transaction_row, axis=1)
+    return rows.loc[mask].copy()
 
 
 def _canonical_member_or_blank(value) -> str:

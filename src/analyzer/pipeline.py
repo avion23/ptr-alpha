@@ -1,25 +1,40 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from pathlib import Path
 from dataclasses import dataclass
 from functools import wraps
 import logging
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
-from analyzer.candidates import candidate_tickers, eligible_candidate_rows
-from analyzer.models import AnalysisMode, TransactionType
+from analyzer.models import AnalysisMode
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer.ticker_resolver import TickerResolver
 from analyzer import analysis
-from analyzer.member_ranking.buyer_scoring import _get_consensus_candidate_tickers
+from analyzer.member_ranking.buyer_scoring import (
+    _get_consensus_candidate_tickers,
+    _get_consensus_price_tickers,
+    _get_consensus_ticker_purchases,
+    _resolve_consensus_ticker,
+)
 
 logger = logging.getLogger(__name__)
+
+_OFFICIAL_TRANSACTION_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
+
+
+def _analysis_transactions(transaction_source, year: int) -> pd.DataFrame:
+    """Read canonical official/legacy rows without chamber-specific filtering."""
+    trades = transaction_source.db.get_transactions(year)
+    if trades.empty or "source" not in trades.columns:
+        return trades
+    source = trades["source"]
+    return trades[source.isna() | source.isin(_OFFICIAL_TRANSACTION_SOURCES)].copy()
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,8 +102,8 @@ def pipeline_step(func):
 def prepare_analysis_data(
     transaction_source, price_source, year: int, horizons: tuple[int, ...]
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    trades = transaction_source.get_transactions(year)
-    logger.info("Loaded %d transactions for %d", len(trades), year)
+    trades = _analysis_transactions(transaction_source, year)
+    logger.info("Loaded %d canonical official transactions for %d", len(trades), year)
 
     if len(trades) == 0:
         raise DataSourceError("No trading data found")
@@ -116,6 +131,13 @@ def prepare_analysis_data(
     logger.info("Calculated %d signals", len(signals))
 
     return trades, prices, signals
+
+
+@pipeline_step
+def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
+    transaction_source.fetch_and_cache_pdfs(year)
+    logger.info("Successfully fetched PDFs for %d", year)
+    return DataResult(success=True, data=None)
 
 
 def prepare_live_analysis_data(
@@ -209,13 +231,6 @@ def prepare_live_consensus_data(
 
 
 @pipeline_step
-def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
-    transaction_source.fetch_and_cache_pdfs(year)
-    logger.info("Successfully fetched PDFs for %d", year)
-    return DataResult(success=True, data=None)
-
-
-@pipeline_step
 def run_parse_pipeline(transaction_source, year: int) -> DataResult:
     transaction_source.parse_cached_pdfs(year)
     generation_id = transaction_source.db.get_latest_house_generation(year)
@@ -288,12 +303,10 @@ def run_sales_pipeline(
 
 
 def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
-    """Display known buyers without joining identity-based performance history."""
-    purchases = trades[
-        (trades["ticker"] == ticker)
-        & (trades["transaction_type"] == TransactionType.PURCHASE.value)
-        & trades["member"].notna()
-    ].copy()
+    """Display the same eligible buyers consumed by consensus scoring."""
+    purchases = _get_consensus_ticker_purchases(ticker, trades)
+    if "member" in purchases.columns:
+        purchases = purchases[purchases["member"].notna()].copy()
     if purchases.empty:
         return pd.DataFrame(
             columns=[
@@ -326,7 +339,7 @@ def run_ticker_analysis(
     if analysis_as_of.year != params.year:
         raise DataSourceError("year must match the ticker analysis as-of date year")
 
-    trades = transaction_source.get_transactions(params.year)
+    trades = _analysis_transactions(transaction_source, params.year)
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
     cutoff = analysis_as_of - timedelta(days=params.days_back)
     known_trades = trades[
@@ -334,11 +347,21 @@ def run_ticker_analysis(
         & (disclosure_dates >= cutoff)
         & (disclosure_dates <= analysis_as_of)
     ].copy()
-    known_trades = eligible_candidate_rows(known_trades)
 
-    buyers = _consensus_buyers_table(params.ticker, known_trades)
+    try:
+        resolved_ticker = _resolve_consensus_ticker(params.ticker, analysis_as_of)
+    except AnalyzerError:
+        resolution = TickerResolver().resolve(params.ticker, analysis_as_of.date())
+        if resolution.status != "pre_listing":
+            raise
+        # An explicit query before a symbol's listing is a valid zero-signal
+        # question, not a pipeline error. Candidate discovery still excludes
+        # the symbol because no eligible purchase row resolves at this cutoff.
+        resolved_ticker = str(params.ticker).strip().upper()
+
+    buyers = _consensus_buyers_table(resolved_ticker, known_trades)
     score = analysis.score_ticker_by_buyers(
-        params.ticker,
+        resolved_ticker,
         known_trades,
         member_rankings=None,
         min_buyers=params.min_buyers,
@@ -351,7 +374,7 @@ def run_ticker_analysis(
         data={
             "buyers": buyers,
             "score": score,
-            "ticker": params.ticker,
+            "ticker": resolved_ticker,
         },
     )
 
@@ -371,39 +394,40 @@ def run_recent_ticker_scoring(
     as_of_date = pd.Timestamp(params.as_of_date or date.today()).normalize()
     if as_of_date.year != params.year:
         raise DataSourceError("year must match the as-of date year")
+
     trades = prepare_live_consensus_data(
         transaction_source,
         as_of_date,
         params.days_back,
         history_lookback_days=params.training_lookback_days + max(params.horizons),
     )
-    # Consensus is deliberately transaction-only.  Keep an empty signal frame
-    # for the scorer's stable public call shape, but do not fetch prices or
-    # calculate forward labels for a live recommendation.
-    signals = pd.DataFrame()
+    # Consensus is deliberately transaction-only: no prices, no forward labels.
     cutoff_date = as_of_date - timedelta(days=params.days_back)
     disclosure_dates = pd.to_datetime(trades["disclosure_date"])
     recent_trades = trades[
         (disclosure_dates >= cutoff_date) & (disclosure_dates <= as_of_date)
     ]
-    recent_trades = eligible_candidate_rows(recent_trades)
     logger.info(
-        "Loaded %d disclosures through %s; %d are eligible purchase rows",
+        "Loaded %d disclosures through %s; %d in the last %d days",
         len(trades),
         as_of_date.date(),
         len(recent_trades),
+        params.days_back,
     )
 
-    tickers = candidate_tickers(recent_trades, params.min_buyers)
-    logger.info("Found %d tickers with %d+ distinct buyers", len(tickers), params.min_buyers)
+    tickers = _get_consensus_candidate_tickers(
+        recent_trades,
+        params.min_buyers,
+        as_of_date=as_of_date,
+    )
+    logger.info(
+        "Found %d tickers with %d+ distinct buyers", len(tickers), params.min_buyers
+    )
 
     scores = [
         analysis.score_ticker_by_buyers(
             ticker,
             recent_trades,
-            signals,
-            horizon=params.horizons[0],
-            threshold=params.threshold,
             member_rankings=None,
             min_buyers=params.min_buyers,
             scoring_mode="consensus",
@@ -650,7 +674,7 @@ def run_backtest_pipeline(
 
     price_start = params.start_date
     price_end = params.end_date + timedelta(days=params.horizon + 10)
-    all_tickers = sorted(set(candidate_tickers(all_transactions, 1)) | {"SPY"})
+    all_tickers = sorted(set(_get_consensus_price_tickers(all_transactions)) | {"SPY"})
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)
 

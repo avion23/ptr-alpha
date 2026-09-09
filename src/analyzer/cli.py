@@ -14,11 +14,10 @@ from typing import cast
 import pandas as pd
 import typer
 
-from analyzer.candidates import candidate_tickers
+from analyzer.member_ranking.buyer_scoring import _get_consensus_price_tickers
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
-from analyzer.price_source import YFinancePriceSource
 from analyzer.models import AnalysisMode
 from analyzer.pipeline import (
     AnalysisParams,
@@ -33,6 +32,7 @@ from analyzer.pipeline import (
     run_ticker_analysis,
 )
 from analyzer.price_snapshot import create_snapshot, save_snapshot
+from analyzer.price_source import YFinancePriceSource
 from analyzer.settings import Settings
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
@@ -772,12 +772,22 @@ def backtest(
                 detail = f" ({benchmark_reason})" if benchmark_reason else ""
                 print(f"SPY buy/hold benchmark: {benchmark_status}{detail}")
 
-            valid_returns = combined.dropna(subset=["bt_return_pct"])
+            observations = data.get("date_observations", pd.DataFrame())
+            recommendations = (
+                int(observations["recommendation_count"].sum())
+                if "recommendation_count" in observations.columns
+                else 0
+            )
+            evaluable = (
+                int(observations["evaluable_recommendation_count"].sum())
+                if "evaluable_recommendation_count" in observations.columns
+                else 0
+            )
             print(
                 f"\nDates evaluated: {data.get('evaluable_dates', 0)}/{data.get('total_as_of_dates', 0)}"
             )
             print(
-                f"Total recommendations: {len(combined)}, with measurable returns: {len(valid_returns)}"
+                f"Recommendations issued: {recommendations}; individually evaluable: {evaluable}"
             )
         else:
             print("\n=== No backtest results produced ===")
@@ -965,7 +975,7 @@ def _load_portfolio_inputs(
     """Load execution prices and consensus recommendations."""
     from analyzer import analysis
 
-    all_tickers = sorted(set(candidate_tickers(all_transactions, 1)) | {"SPY"})
+    all_tickers = sorted(set(_get_consensus_price_tickers(all_transactions)) | {"SPY"})
     prices = app_ctx.transaction_source.db.get_prices(
         all_tickers, start_date, end_date
     )
@@ -1412,13 +1422,13 @@ def fetch_senate_efd(
         None, help="If set, look back N days from end (overrides --start)"
     ),
     data_dir: str = typer.Option(
-        "data/senate", help="Data directory (default: isolated senate DB)"
+        "data", help="Data directory for the canonical congressional database"
     ),
 ):
     """Fetch Senate PTR trades from efdsearch.senate.gov (official source).
 
-    Loads into an isolated data directory so chamber separation is exact.
-    Then run: ptr-alpha analyze --year <YYYY> --data-dir data/senate
+    Senate rows are persisted in the canonical congressional DuckDB; source and
+    chamber identity keep Senate refreshes isolated from House rows.
     """
     from datetime import datetime, timedelta, timezone
     from uuid import uuid4

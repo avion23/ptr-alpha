@@ -1280,7 +1280,9 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 ],
             }
         )
-        candidates = _get_consensus_candidate_tickers(rows, 1)
+        candidates = _get_consensus_candidate_tickers(
+            rows, 1, as_of_date=pd.Timestamp("2025-01-14")
+        )
         self.assertEqual(set(candidates), {"ARLP", "AAPL"})
         # 20034095/20034670 stale ALLI is also quarantined when descriptions are absent.
         stale = pd.DataFrame(
@@ -1293,7 +1295,12 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "disclosure_date": pd.to_datetime(["2026-03-02", "2026-03-02"]),
             }
         )
-        self.assertEqual(_get_consensus_candidate_tickers(stale, 1), ["AAPL"])
+        self.assertEqual(
+            _get_consensus_candidate_tickers(
+                stale, 1, as_of_date=pd.Timestamp("2026-03-02")
+            ),
+            ["AAPL"],
+        )
 
     def test_equity_filter_rejects_explicit_funds_but_leaves_ticker_resolution_separate(self):
         rows = pd.DataFrame(
@@ -1323,7 +1330,12 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "transaction_date": pd.to_datetime(["2026-07-01", "2026-07-01"]),
             }
         )
-        self.assertEqual(_get_consensus_candidate_tickers(rows, 1), ["AAPL"])
+        self.assertEqual(
+            _get_consensus_candidate_tickers(
+                rows, 1, as_of_date=pd.Timestamp("2026-07-02")
+            ),
+            ["AAPL"],
+        )
 
     def test_reused_symbol_counts_only_post_listing_buyers(self):
         rows = pd.DataFrame(
@@ -1337,22 +1349,91 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 "disclosure_date": pd.to_datetime(["2026-06-11", "2026-06-12"]),
             }
         )
-        self.assertEqual(_get_consensus_candidate_tickers(rows, 2), [])
-        self.assertEqual(_get_consensus_candidate_tickers(rows, 1), ["SPCX"])
+        as_of = pd.Timestamp("2026-06-12")
+        self.assertEqual(
+            _get_consensus_candidate_tickers(rows, 2, as_of_date=as_of), []
+        )
+        self.assertEqual(
+            _get_consensus_candidate_tickers(rows, 1, as_of_date=as_of), ["SPCX"]
+        )
 
-    def test_aliases_wait_for_date_aware_price_mapping(self):
+    def test_rename_alias_resolves_to_symbol_tradable_at_decision_time(self):
         rows = pd.DataFrame(
             {
-                "member": ["Alice"],
+                "member": ["Alice Smith"],
                 "ticker": ["FB"],
                 "instrument_type": ["stock"],
                 "ticker_origin": ["official"],
                 "asset_description": ["Meta Platforms Common Stock [ST]"],
                 "transaction_type": ["Purchase"],
-                "transaction_date": pd.to_datetime(["2023-01-01"]),
+                "transaction_date": pd.to_datetime(["2022-06-01"]),
             }
         )
-        self.assertEqual(_get_consensus_candidate_tickers(rows, 1), ["FB"])
+        self.assertEqual(
+            _get_consensus_candidate_tickers(
+                rows, 1, as_of_date=pd.Timestamp("2022-06-08")
+            ),
+            ["FB"],
+        )
+        self.assertEqual(
+            _get_consensus_candidate_tickers(
+                rows, 1, as_of_date=pd.Timestamp("2022-06-10")
+            ),
+            ["META"],
+        )
+
+    def test_equivalent_ticker_spellings_share_one_candidate_identity(self):
+        rows = pd.DataFrame(
+            {
+                "member": ["Alice Smith", "Bob Jones"],
+                "ticker": ["BRKB", "BRK.B"],
+                "instrument_type": ["stock", "stock"],
+                "source": ["house_pdf", "house_pdf"],
+                "transaction_type": ["Purchase", "Purchase"],
+                "transaction_date": pd.to_datetime(["2025-01-02", "2025-01-03"]),
+                "disclosure_date": pd.to_datetime(["2025-01-04", "2025-01-05"]),
+            }
+        )
+        self.assertEqual(
+            _get_consensus_candidate_tickers(
+                rows, 2, as_of_date=pd.Timestamp("2025-01-05")
+            ),
+            ["BRK-B"],
+        )
+
+    def test_consensus_backtest_prices_post_rename_alias_under_current_symbol(self):
+        transactions = _make_transactions(
+            [
+                {
+                    "member": "Alice Smith",
+                    "ticker": "FB",
+                    "transaction_date": "2023-01-01",
+                    "disclosure_date": "2023-01-03",
+                    "transaction_type": "Purchase",
+                    "source": "house_pdf",
+                }
+            ]
+        )
+        as_of = pd.Timestamp("2023-01-03")
+        recs = _backtest_recommendations(
+            pd.DataFrame(),
+            transactions,
+            as_of,
+            horizon=2,
+            lookback_days=28,
+            min_buyers=1,
+            top_n=5,
+        )
+        self.assertEqual(recs["ticker"].tolist(), ["META"])
+
+        prices = pd.DataFrame(
+            {"META": [100.0, 102.0], "SPY": [100.0, 101.0]},
+            index=pd.to_datetime(["2023-01-04", "2023-01-06"]),
+        )
+        evaluated = evaluate_backtest(recs, prices, as_of, horizon=2)
+        self.assertEqual(evaluated.iloc[0]["bt_coverage"], "complete")
+        self.assertEqual(evaluated.iloc[0]["bt_entry_date"], date(2023, 1, 4))
+        self.assertEqual(evaluated.iloc[0]["bt_exit_date"], date(2023, 1, 6))
 
     def test_missing_instrument_metadata_is_allowed_without_explicit_non_equity_evidence(self):
         rows = pd.DataFrame(

@@ -281,39 +281,86 @@ def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
     ].copy()
 
 
+def _resolve_consensus_ticker(ticker: str, as_of_date: pd.Timestamp) -> str:
+    """Return the tradable symbol for one equity identity at decision time."""
+    normalized = _validate_ticker(ticker)
+    decision_date = _transaction_date(as_of_date)
+    if decision_date is None:
+        raise AnalysisError("Consensus ticker resolution requires a valid as-of date")
+
+    family_symbols = _ticker_family_symbols(normalized)
+    # Rename aliases are the only families whose tradable symbol changes over
+    # time. Resolve the old alias at decision time so pre-rename replays trade
+    # the old symbol and later/delayed filings trade the renamed symbol.
+    for alias in _TICKER_RESOLVER.RENAME_MAP:
+        if alias in family_symbols:
+            resolution = _TICKER_RESOLVER.resolve(alias, decision_date)
+            if resolution.status in _REJECTED_TICKER_STATUSES or resolution.status in {
+                "date_required",
+                "pre_listing",
+            }:
+                raise AnalysisError(
+                    f"Ticker {ticker!r} is not tradable at {decision_date}: "
+                    f"{resolution.notes}"
+                )
+            return resolution.price_symbol
+
+    resolution = _TICKER_RESOLVER.resolve(normalized, decision_date)
+    if resolution.status in _REJECTED_TICKER_STATUSES or resolution.status in {
+        "date_required",
+        "pre_listing",
+    }:
+        raise AnalysisError(
+            f"Ticker {ticker!r} is not tradable at {decision_date}: {resolution.notes}"
+        )
+    return resolution.price_symbol
+
+
 def _get_consensus_candidate_tickers(
-    transactions_df: pd.DataFrame, min_buyers: int
+    transactions_df: pd.DataFrame,
+    min_buyers: int,
+    *,
+    as_of_date: pd.Timestamp,
 ) -> list[str]:
-    """Return live candidate labels whose filtered buyer count meets the gate."""
+    """Return one decision-time symbol per equity identity meeting the buyer gate."""
     purchases = _prepare_consensus_purchases(transactions_df)
     if purchases.empty:
         return []
 
-    buyer_sets = purchases.groupby("_resolved_symbol")["_member_canonical"].agg(set)
-    candidates: list[str] = []
-    seen: set[str] = set()
-    raw_tickers = transactions_df.loc[
-        transactions_df["transaction_type"] == TransactionType.PURCHASE.value,
-        "ticker",
-    ]
-    for raw_ticker in raw_tickers.dropna().unique():
-        if not isinstance(raw_ticker, str):
+    families: dict[frozenset[str], pd.DataFrame] = {}
+    for resolved_symbol in purchases["_resolved_symbol"].dropna().astype(str).unique():
+        family = frozenset(_ticker_family_symbols(resolved_symbol))
+        if family not in families:
+            families[family] = purchases[
+                purchases["_resolved_symbol"].isin(family)
+            ]
+
+    candidates: set[str] = set()
+    for family, family_rows in families.items():
+        if family_rows["_member_canonical"].nunique() < min_buyers:
             continue
-        normalized = _normalize_ticker_text(raw_ticker)
-        if normalized is None or normalized in seen:
-            continue
-        seen.add(normalized)
         try:
-            normalized = _validate_ticker(normalized)
+            seed = next(
+                alias for alias in _TICKER_RESOLVER.RENAME_MAP if alias in family
+            )
+        except StopIteration:
+            seed = sorted(family)[0]
+        try:
+            candidates.add(_resolve_consensus_ticker(seed, as_of_date))
         except AnalysisError:
             continue
-        family_symbols = _ticker_family_symbols(normalized)
-        buyers: set[str] = set()
-        for symbol in family_symbols:
-            buyers.update(buyer_sets.get(symbol, set()))
-        if len(buyers) >= min_buyers:
-            candidates.append(raw_ticker)
-    return candidates
+    return sorted(candidates)
+
+
+def _get_consensus_price_tickers(transactions_df: pd.DataFrame) -> list[str]:
+    """Return every price symbol family needed to evaluate eligible purchases."""
+    purchases = _prepare_consensus_purchases(transactions_df)
+    if purchases.empty:
+        return []
+    symbols: set[str] = set()
+    for resolved_symbol in purchases["_resolved_symbol"].dropna().astype(str).unique():
+        symbols.update(_ticker_family_symbols(resolved_symbol))
+    return sorted(symbols)
 
 
 def _resolved_ticker_symbol(value, trade_date=None) -> str | None:

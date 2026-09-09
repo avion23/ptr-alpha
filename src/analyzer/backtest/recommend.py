@@ -76,7 +76,11 @@ def backtest_recommendations(
     if recent_trades.empty:
         return pd.DataFrame()
 
-    candidates = _get_consensus_candidate_tickers(recent_trades, min_buyers)
+    candidates = _get_consensus_candidate_tickers(
+        recent_trades,
+        min_buyers,
+        as_of_date=as_of_date,
+    )
     if not candidates:
         return pd.DataFrame()
     if not is_consensus:
@@ -123,7 +127,9 @@ def _score_and_rank(
     bayes,
 ) -> pd.DataFrame:
     _ranking_dicts = _build_ranking_dicts(member_rankings, scoring_mode=scoring_mode)
-    metadata_maps = _build_metadata_maps(recent_trades)
+    metadata_maps = (
+        {} if scoring_mode == "consensus" else _build_metadata_maps(recent_trades)
+    )
 
     ticker_perf_signals = (
         pd.DataFrame()
@@ -170,10 +176,15 @@ def _score_and_rank(
     )
     result.insert(0, "rank", range(1, len(result) + 1))
 
-    # Preserve only unambiguous per-ticker metadata. Options never reach this
-    # point: without actual contract prices the strategy abstains.
-    for column, values in metadata_maps.items():
-        result[column] = result["ticker"].map(values)
+    if scoring_mode == "consensus":
+        # The consensus eligibility boundary already rejects explicit
+        # non-equities. Keep replay pricing on that exact semantic contract
+        # rather than trying to copy one arbitrary source row's metadata onto
+        # a multi-buyer equity identity.
+        result["instrument_type"] = "stock"
+    else:
+        for column, values in metadata_maps.items():
+            result[column] = result["ticker"].map(values)
 
     return result
 

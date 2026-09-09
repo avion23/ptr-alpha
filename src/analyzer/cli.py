@@ -14,7 +14,7 @@ from typing import cast
 import pandas as pd
 import typer
 
-from analyzer.member_ranking.buyer_scoring import _get_consensus_candidate_tickers
+from analyzer.member_ranking.buyer_scoring import _get_consensus_price_tickers
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
@@ -970,9 +970,7 @@ def _load_portfolio_inputs(
     """Load execution prices and consensus recommendations."""
     from analyzer import analysis
 
-    all_tickers = sorted(
-        set(_get_consensus_candidate_tickers(all_transactions, 1)) | {"SPY"}
-    )
+    all_tickers = sorted(set(_get_consensus_price_tickers(all_transactions)) | {"SPY"})
     prices = app_ctx.transaction_source.db.get_prices(
         all_tickers, start_date, end_date
     )

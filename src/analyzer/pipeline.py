@@ -17,7 +17,9 @@ from analyzer.ticker_resolver import TickerResolver
 from analyzer import analysis
 from analyzer.member_ranking.buyer_scoring import (
     _get_consensus_candidate_tickers,
+    _get_consensus_price_tickers,
     _get_consensus_ticker_purchases,
+    _resolve_consensus_ticker,
 )
 
 logger = logging.getLogger(__name__)
@@ -342,9 +344,20 @@ def run_ticker_analysis(
         & (disclosure_dates <= analysis_as_of)
     ].copy()
 
-    buyers = _consensus_buyers_table(params.ticker, known_trades)
+    try:
+        resolved_ticker = _resolve_consensus_ticker(params.ticker, analysis_as_of)
+    except AnalyzerError:
+        resolution = TickerResolver().resolve(params.ticker, analysis_as_of.date())
+        if resolution.status != "pre_listing":
+            raise
+        # An explicit query before a symbol's listing is a valid zero-signal
+        # question, not a pipeline error. Candidate discovery still excludes
+        # the symbol because no eligible purchase row resolves at this cutoff.
+        resolved_ticker = str(params.ticker).strip().upper()
+
+    buyers = _consensus_buyers_table(resolved_ticker, known_trades)
     score = analysis.score_ticker_by_buyers(
-        params.ticker,
+        resolved_ticker,
         known_trades,
         member_rankings=None,
         min_buyers=params.min_buyers,
@@ -357,7 +370,7 @@ def run_ticker_analysis(
         data={
             "buyers": buyers,
             "score": score,
-            "ticker": params.ticker,
+            "ticker": resolved_ticker,
         },
     )
 
@@ -382,7 +395,11 @@ def run_recent_ticker_scoring(
         params.days_back,
     )
 
-    tickers = _get_consensus_candidate_tickers(recent_trades, params.min_buyers)
+    tickers = _get_consensus_candidate_tickers(
+        recent_trades,
+        params.min_buyers,
+        as_of_date=as_of_date,
+    )
     logger.info(
         "Found %d tickers with %d+ distinct buyers", len(tickers), params.min_buyers
     )
@@ -636,9 +653,7 @@ def run_backtest_pipeline(
 
     price_start = params.start_date
     price_end = params.end_date + timedelta(days=params.horizon + 10)
-    all_tickers = sorted(
-        set(_get_consensus_candidate_tickers(all_transactions, 1)) | {"SPY"}
-    )
+    all_tickers = sorted(set(_get_consensus_price_tickers(all_transactions)) | {"SPY"})
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)
 

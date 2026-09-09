@@ -45,8 +45,6 @@ from analyzer.member_ranking import (  # noqa: F401
 )
 
 from analyzer.backtest import (  # noqa: F401
-    _compute_ticker_entry_value,
-    _compute_ticker_optimal_horizon,
     backtest_recommendations,
     evaluate_backtest,
     summarize_backtest,

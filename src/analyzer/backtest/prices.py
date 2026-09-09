@@ -184,10 +184,3 @@ def _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=Non
         if staleness_ns > max_staleness_days * NS_PER_DAY:
             return None
     return float(vals[pos])
-
-
-def _price_on_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=5):
-    """Backward-compatible scalar on-or-before lookup."""
-    return _price_at_or_before_arrays(
-        idx_ns, vals, target_date, max_staleness_days=max_staleness_days
-    )

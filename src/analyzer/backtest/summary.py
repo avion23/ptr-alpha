@@ -167,7 +167,7 @@ def _funded_period_returns(valid: pd.DataFrame) -> pd.DataFrame:
 
 
 def _holding_policy(valid: pd.DataFrame) -> tuple[str, float | None]:
-    for col in ("bt_holding_days", "bt_horizon_days", "optimal_horizon"):
+    for col in ("bt_holding_days", "bt_horizon_days"):
         if col not in valid.columns:
             continue
         horizons = pd.to_numeric(valid[col], errors="coerce").dropna()

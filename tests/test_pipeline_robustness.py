@@ -471,6 +471,7 @@ def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):
             "bt_return_pct": [10.0],
             "bt_alpha_pct": [5.0],
             "bt_raw_return_pct": [10.0],
+            "bt_spy_return_pct": [4.0],
             "bt_entry_date": [date(2025, 1, 3)],
             "bt_exit_date": [date(2025, 1, 10)],
             "bt_leverage": [1.0],

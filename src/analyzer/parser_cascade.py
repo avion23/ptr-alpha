@@ -100,6 +100,15 @@ def _multiset_subset(left: dict, right: dict) -> bool:
     return all(count <= right.get(identity, 0) for identity, count in left.items())
 
 
+def _candidate_covers_all(candidate_rows: list[dict], candidates) -> bool:
+    """Return whether one candidate covers every observed row multiplicity."""
+    candidate_counts = _candidate_counts(candidate_rows)[0]
+    return all(
+        _multiset_subset(_candidate_counts(rows)[0], candidate_counts)
+        for _, rows in candidates
+    )
+
+
 def _semantic_score(transactions: list[dict]) -> tuple[int, int, int, float]:
     representatives = _candidate_counts(transactions)[1]
     unique = list(representatives.values())
@@ -142,20 +151,11 @@ def _reconcile_candidates(candidates, engines_attempted):
         )
         engines_attempted.append(f"row_disagreement:{detail}")
 
-    engine_preference = {
-        "pdftotext": 5,
-        "pdfplumber": 4,
-        "lattice": 3,
-        "stream": 2,
-        "docling": 2,
-        "ocr": 1,
-    }
     best_name, best_rows = max(
         candidates,
         key=lambda candidate: (
             _semantic_score(candidate[1]),
             len(counts_by_engine[candidate[0]]),
-            engine_preference.get(candidate[0], 0),
         ),
     )
     best_counts = counts_by_engine[best_name]
@@ -260,11 +260,15 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     pdftotext_subset = bool(pdftotext_counts) and _multiset_subset(
         pdftotext_counts, pdfplumber_counts
     )
-    if pdfplumber_subset:
+    if pdfplumber_subset and _candidate_covers_all(
+        trusted["pdftotext"], text_candidates
+    ):
         engines_attempted.append("trusted:pdfplumber_subset_pdftotext")
         engines_attempted.append("won:pdftotext")
         return pdf_path, trusted["pdftotext"], engines_attempted
-    if pdftotext_subset:
+    if pdftotext_subset and _candidate_covers_all(
+        trusted["pdfplumber"], text_candidates
+    ):
         engines_attempted.append("trusted:pdftotext_subset_pdfplumber")
         engines_attempted.append("won:pdfplumber")
         return pdf_path, trusted["pdfplumber"], engines_attempted
@@ -283,10 +287,15 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
         ocr_candidates.append(tesseract_candidate)
 
     if tesseract_candidate:
-        all_candidates = list(text_candidates) + ocr_candidates
-        reconciled = _reconcile_candidates(all_candidates, engines_attempted)
-        engines_attempted.append("won:reconciled_complete_ocr")
-        return pdf_path, reconciled, engines_attempted
+        prior_candidates = list(text_candidates) + [
+            candidate for candidate in ocr_candidates if candidate[0] != "ocr"
+        ]
+        if _candidate_covers_all(tesseract_candidate[1], prior_candidates):
+            all_candidates = list(text_candidates) + ocr_candidates
+            reconciled = _reconcile_candidates(all_candidates, engines_attempted)
+            engines_attempted.append("won:reconciled_complete_ocr")
+            return pdf_path, reconciled, engines_attempted
+        engines_attempted.append("ocr_incomplete_for_observed_rows")
 
     if reconciled_text or ocr_candidates or errors:
         detail = "; ".join(errors) or "unconfirmed complementary/parser rows"

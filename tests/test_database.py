@@ -1035,9 +1035,9 @@ class TestGetEntryPrices(DatabaseTestCase):
         result = self.db.get_entry_prices(["AAPL"], date(2024, 1, 1), date(2024, 1, 10))
         self.assertEqual(len(result), 1)
 
-    def test_get_entry_prices_filters_stale_prices(self):
-        # Transaction disclosure is 2024-06-01, last price before that is 2024-01-05
-        # That's ~147 days stale — should be filtered with max_staleness_days=30
+    def test_get_entry_prices_rejects_missing_exact_next_session_price(self):
+        # Historical prices exist, but there is no exact next-session quote
+        # after the 2024-06-01 disclosure. Entry must remain unavailable.
         early_prices = pd.bdate_range("2024-01-01", "2024-01-10")
         early_price_data = pd.DataFrame(
             {"AAPL": [100.0 + i for i in range(len(early_prices))]}, index=early_prices
@@ -1059,11 +1059,11 @@ class TestGetEntryPrices(DatabaseTestCase):
         self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
-            ["AAPL"], date(2024, 6, 1), date(2024, 6, 1), max_staleness_days=30
+            ["AAPL"], date(2024, 6, 1), date(2024, 6, 1)
         )
         self.assertTrue(result.empty)
 
-    def test_get_entry_prices_keeps_fresh_prices(self):
+    def test_get_entry_prices_keeps_exact_next_session_price(self):
         dates = pd.bdate_range("2024-01-01", "2024-01-31")
         price_data = pd.DataFrame(
             {"AAPL": [100.0 + i for i in range(len(dates))]}, index=dates
@@ -1085,7 +1085,7 @@ class TestGetEntryPrices(DatabaseTestCase):
         self.db.upsert_transactions(tx, source="house_pdf")
 
         result = self.db.get_entry_prices(
-            ["AAPL"], date(2024, 1, 28), date(2024, 1, 28), max_staleness_days=30
+            ["AAPL"], date(2024, 1, 28), date(2024, 1, 28)
         )
         self.assertEqual(len(result), 1)
         self.assertIsNotNone(result.iloc[0]["entry_price"])

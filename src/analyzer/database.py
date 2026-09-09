@@ -1055,14 +1055,12 @@ class Database:
         tickers: list[str],
         start_date: date,
         end_date: date,
-        max_staleness_days: int = 30,
         resolver: TickerResolver | None = None,
     ) -> pd.DataFrame:
         return self.prices.get_entry_prices(
             tickers,
             start_date,
             end_date,
-            max_staleness_days=max_staleness_days,
             resolver=resolver,
         )
 

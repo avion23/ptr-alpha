@@ -12,7 +12,7 @@ from analyzer.backtest.prices import (
     _next_tradable_price_arrays,
 )
 from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
-from analyzer.pipeline import _entry_prices_from_matrix
+from analyzer.pipeline import _entry_prices_from_matrix, _execution_price_window
 from analyzer.price_source import _validate_and_log_prices
 from analyzer.signals import _price_arrays
 
@@ -298,6 +298,16 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertEqual(row["label_entry_date"], pd.Timestamp("2024-01-09"))
         self.assertAlmostEqual(row["peak_potential_pct"], (200 / 150 - 1) * 100)
 
+    def test_execution_price_window_uses_exact_session_rule(self):
+        start, end = _execution_price_window(
+            pd.Timestamp("2025-01-03"),
+            pd.Timestamp("2025-01-03"),
+            1,
+        )
+
+        self.assertEqual(start, pd.Timestamp("2025-01-06").date())
+        self.assertEqual(end, pd.Timestamp("2025-01-07").date())
+
     def test_fresh_matrix_constructs_entry_without_database_cache(self):
         transactions = pd.DataFrame(
             {
@@ -318,6 +328,26 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries.iloc[0]["entry_price"], 999.0)
         self.assertEqual(entries.iloc[0]["entry_price_date"], pd.Timestamp("2024-01-03"))
+
+    def test_matrix_entry_prices_rename_alias_by_transaction_date(self):
+        transactions = pd.DataFrame(
+            {
+                "member": ["Alice Smith"],
+                "ticker": ["FB"],
+                "transaction_date": [pd.Timestamp("2023-01-02")],
+                "disclosure_date": [pd.Timestamp("2023-01-03")],
+                "transaction_type": ["Purchase"],
+            }
+        )
+        prices = pd.DataFrame(
+            {"FB": [50.0], "META": [100.0], "SPY": [400.0]},
+            index=pd.DatetimeIndex(["2023-01-04"]),
+        )
+
+        entries = _entry_prices_from_matrix(transactions, prices)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries.iloc[0]["entry_price"], 100.0)
 
     def test_six_day_early_quote_is_unavailable(self):
         dates = pd.bdate_range("2025-01-02", "2025-01-14")

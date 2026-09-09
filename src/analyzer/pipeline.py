@@ -77,6 +77,8 @@ class BacktestParams:
     horizon: int = 60
     # Match the live ticker candidate window. The evaluation horizon is separate.
     lookback_days: int = 28
+    # Research validation uses these only for explicit historical scoring modes.
+    # The production consensus replay does not consume member-training knobs.
     training_lookback_days: int = 365
     min_buyers: int = 3
     top_n: int = 5
@@ -99,6 +101,18 @@ def pipeline_step(func):
     return wrapper
 
 
+def _execution_price_window(
+    first_decision_date,
+    last_decision_date,
+    horizon: int,
+) -> tuple[date, date]:
+    """Return the exact price dates needed by the execution convention."""
+    first_entry = next_nyse_session(first_decision_date)
+    last_entry = next_nyse_session(last_decision_date)
+    last_exit = previous_nyse_session(last_entry + timedelta(days=horizon))
+    return first_entry.date(), last_exit.date()
+
+
 def prepare_analysis_data(
     transaction_source, price_source, year: int, horizons: tuple[int, ...]
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -115,16 +129,22 @@ def prepare_analysis_data(
     if trades.empty:
         raise DataSourceError("No valid tickers found in transaction data")
 
-    start_date = trades["disclosure_date"].min() - timedelta(days=30)
-    end_date = trades["disclosure_date"].max() + timedelta(days=max(horizons) + 10)
+    first_disclosure = pd.Timestamp(trades["disclosure_date"].min()).normalize()
+    last_disclosure = pd.Timestamp(trades["disclosure_date"].max()).normalize()
+    price_start, price_end = _execution_price_window(
+        first_disclosure,
+        last_disclosure,
+        max(horizons),
+    )
 
-    prices = price_source.get_prices(trades["ticker"].unique(), start_date, end_date)
+    prices = price_source.get_prices(
+        trades["ticker"].unique(), price_start, price_end
+    )
     logger.info("Fetched price data for %d tickers", len(prices.columns))
 
-    all_tickers = trades["ticker"].unique().tolist()
-    entry_prices = transaction_source.db.get_entry_prices(
-        all_tickers, start_date, end_date
-    )
+    # Use the exact acquired matrix. In read-only analysis the price source may
+    # fetch observations that are intentionally not written back to DuckDB.
+    entry_prices = _entry_prices_from_matrix(trades, prices)
     logger.info("Computed entry prices for %d transactions", len(entry_prices))
 
     signals = analysis.calculate_signal_potential(entry_prices, prices, horizons)
@@ -140,89 +160,30 @@ def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
     return DataResult(success=True, data=None)
 
 
-def prepare_live_analysis_data(
-    transaction_source,
-    price_source,
-    horizons: tuple[int, ...],
-    as_of_date: pd.Timestamp,
-    training_lookback_days: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Build live features from historical data available by ``as_of_date``."""
-    history_start = as_of_date - timedelta(days=training_lookback_days + max(horizons))
-    trades = transaction_source.db.get_transactions_by_date_range(
-        history_start,
-        as_of_date,
-    )
-    if trades.empty:
-        raise DataSourceError("No trading data found through as-of date")
-
-    disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
-    trades = trades[
-        trades["ticker"].notna()
-        & disclosure_dates.notna()
-        & (disclosure_dates <= as_of_date)
-    ].copy()
-    if trades.empty:
-        raise DataSourceError("No valid tickers found through as-of date")
-
-    price_start = history_start - timedelta(days=30)
-    prices = price_source.get_prices(
-        trades["ticker"].unique(),
-        price_start,
-        as_of_date,
-    )
-    entry_prices = transaction_source.db.get_entry_prices(
-        trades["ticker"].unique().tolist(),
-        price_start,
-        as_of_date,
-    )
-    signals = analysis.calculate_signal_potential(entry_prices, prices, horizons)
-
-    # Outcomes before the training boundary are needed only to cover their
-    # forward horizon; they must not influence member ranking themselves.
-    training_start = as_of_date - timedelta(days=training_lookback_days)
-    signal_dates = pd.to_datetime(signals["disclosure_date"], errors="coerce")
-    signals = signals[
-        (signal_dates >= training_start) & (signal_dates <= as_of_date)
-    ].copy()
-    return trades, prices, signals
-
-
 def prepare_live_consensus_data(
     transaction_source,
     as_of_date: pd.Timestamp,
     days_back: int,
-    *,
-    history_lookback_days: int | None = None,
 ) -> pd.DataFrame:
     """Load only the public transactions needed for live consensus.
 
     Consensus scoring is a transaction-count decision and does not use forward
-    price labels.  Keeping this path separate from
-    :func:`prepare_live_analysis_data` prevents a live recommendation from
-    acquiring prices (and therefore building labels) that it never consumes.
+    price labels. Keeping this path separate from historical outcome analysis
+    prevents a live recommendation from acquiring data that it never consumes.
     The date filtering is repeated after the repository query so mocked or
     alternate transaction sources cannot make future disclosures visible.
     """
     as_of = pd.Timestamp(as_of_date).normalize()
-    query_lookback = (
-        history_lookback_days if history_lookback_days is not None else days_back
-    )
-    history_start = as_of - timedelta(days=query_lookback)
+    history_start = as_of - timedelta(days=days_back)
     trades = transaction_source.db.get_transactions_by_date_range(history_start, as_of)
     if trades.empty:
         raise DataSourceError("No trading data found through as-of date")
 
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
-    lower_bound = (
-        as_of - timedelta(days=days_back)
-        if history_lookback_days is None
-        else history_start
-    )
     trades = trades[
         trades["ticker"].notna()
         & disclosure_dates.notna()
-        & (disclosure_dates >= lower_bound)
+        & (disclosure_dates >= history_start)
         & (disclosure_dates <= as_of)
     ].copy()
     if trades.empty:
@@ -501,15 +462,33 @@ def _entry_prices_from_matrix(
     price_columns = set(matrix.columns)
     rows = []
     for _, transaction in eligible.iterrows():
-        raw_ticker = str(transaction["ticker"])
-        price_ticker = raw_ticker
-        if price_ticker not in price_columns:
-            resolved = resolver.resolve(raw_ticker).price_symbol
-            if resolved not in price_columns:
-                continue
-            price_ticker = resolved
-
+        raw_ticker = str(transaction["ticker"]).strip().upper()
         disclosure = pd.Timestamp(transaction["disclosure_date"])
+        transaction_date = transaction.get("transaction_date")
+        if transaction_date is not None and not pd.isna(transaction_date):
+            transaction_date = pd.Timestamp(transaction_date).date()
+        else:
+            transaction_date = None
+
+        if raw_ticker in resolver.LISTING_START_MAP:
+            listing_resolution = resolver.resolve(raw_ticker, disclosure.date())
+            if listing_resolution.status == "pre_listing":
+                continue
+
+        if raw_ticker in resolver.RENAME_MAP:
+            if transaction_date is None:
+                continue
+            price_ticker = resolver.resolve(raw_ticker, transaction_date).price_symbol
+            if price_ticker not in price_columns:
+                continue
+        else:
+            price_ticker = raw_ticker
+            if price_ticker not in price_columns:
+                resolved = resolver.resolve(raw_ticker, transaction_date).price_symbol
+                if resolved not in price_columns:
+                    continue
+                price_ticker = resolved
+
         if disclosure.tz is not None:
             disclosure = disclosure.tz_localize(None)
         entry_date = next_nyse_session(disclosure)
@@ -672,8 +651,14 @@ def run_backtest_pipeline(
 
     logger.info("Loaded %d transactions for backtest window", len(all_transactions))
 
-    price_start = params.start_date
-    price_end = params.end_date + timedelta(days=params.horizon + 10)
+    as_of_dates = pd.date_range(
+        params.start_date, params.end_date, freq=f"{params.frequency_days}D"
+    )
+    price_start, price_end = _execution_price_window(
+        as_of_dates[0],
+        as_of_dates[-1],
+        params.horizon,
+    )
     all_tickers = sorted(set(_get_consensus_price_tickers(all_transactions)) | {"SPY"})
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)
@@ -694,10 +679,6 @@ def run_backtest_pipeline(
     # Consensus replay is a public-disclosure rule. Historical outcome labels
     # are evaluation data, not decision inputs, so do not build them here.
     signals = pd.DataFrame()
-
-    as_of_dates = pd.date_range(
-        params.start_date, params.end_date, freq=f"{params.frequency_days}D"
-    )
 
     all_results = []
     date_observations = []

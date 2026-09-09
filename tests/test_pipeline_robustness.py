@@ -12,6 +12,7 @@ from analyzer.pipeline import (
     BacktestParams,
     TickerAnalysisParams,
     TickerScoringParams,
+    prepare_analysis_data,
     run_backtest_pipeline,
     run_recent_ticker_scoring,
     run_ticker_analysis,
@@ -109,6 +110,50 @@ def _consensus_test_trades() -> pd.DataFrame:
             "ticker_origin": ["official", "official", "official"],
         }
     )
+
+
+def test_historical_analysis_uses_exact_acquired_price_matrix():
+    trades = pd.DataFrame(
+        {
+            "member": ["Alice Smith"],
+            "ticker": ["AAPL"],
+            "transaction_date": pd.to_datetime(["2025-01-02"]),
+            "disclosure_date": pd.to_datetime(["2025-01-02"]),
+            "transaction_type": ["Purchase"],
+            "source": ["house_pdf"],
+        }
+    )
+    prices = pd.DataFrame(
+        {
+            "AAPL": [100.0, 105.0],
+            "SPY": [400.0, 404.0],
+        },
+        index=pd.to_datetime(["2025-01-03", "2025-01-06"]),
+    )
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions.return_value = trades
+    transaction_source.db.get_entry_prices.side_effect = AssertionError(
+        "historical analysis must use the acquired matrix, not cache state"
+    )
+    price_source = MagicMock()
+    price_source.get_prices.return_value = prices
+
+    _, returned_prices, signals = prepare_analysis_data(
+        transaction_source,
+        price_source,
+        2025,
+        (3,),
+    )
+
+    pd.testing.assert_frame_equal(returned_prices, prices)
+    assert len(signals) == 1
+    assert signals.iloc[0]["entry_price"] == 100.0
+    price_source.get_prices.assert_called_once_with(
+        trades["ticker"].unique(),
+        date(2025, 1, 3),
+        date(2025, 1, 6),
+    )
+    transaction_source.db.get_entry_prices.assert_not_called()
 
 
 def test_ticker_analysis_uses_real_consensus_at_explicit_cutoff():

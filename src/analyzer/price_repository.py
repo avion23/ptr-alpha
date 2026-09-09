@@ -18,6 +18,7 @@ from pandas.tseries.holiday import (
     USThanksgivingDay,
     nearest_workday,
 )
+from pandas.tseries.offsets import CustomBusinessDay
 
 from analyzer.ticker_resolver import TickerResolver
 
@@ -79,6 +80,7 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
 
 
 _NYSE_HOLIDAYS = _NYSEHolidayCalendar()
+_NYSE_BUSINESS_DAY = CustomBusinessDay(calendar=_NYSE_HOLIDAYS)
 
 
 def _normalize_session_date(value) -> pd.Timestamp:
@@ -102,10 +104,7 @@ def nyse_sessions(start, end) -> pd.DatetimeIndex:
 @lru_cache(maxsize=8192)
 def _next_nyse_session_ns(day_ns: int) -> int:
     day_ts = pd.Timestamp(day_ns)
-    sessions = nyse_sessions(day_ts + pd.Timedelta(days=1), day_ts + pd.Timedelta(days=14))
-    if sessions.empty:
-        raise ValueError(f"No NYSE session found after {day_ts.date()}")
-    return pd.Timestamp(sessions[0]).value
+    return pd.Timestamp(day_ts + _NYSE_BUSINESS_DAY).value
 
 
 def next_nyse_session(day) -> pd.Timestamp:
@@ -116,10 +115,7 @@ def next_nyse_session(day) -> pd.Timestamp:
 @lru_cache(maxsize=8192)
 def _previous_nyse_session_ns(day_ns: int) -> int:
     day_ts = pd.Timestamp(day_ns)
-    sessions = nyse_sessions(day_ts - pd.Timedelta(days=14), day_ts)
-    if sessions.empty:
-        raise ValueError(f"No NYSE session found on or before {day_ts.date()}")
-    return pd.Timestamp(sessions[-1]).value
+    return pd.Timestamp(_NYSE_BUSINESS_DAY.rollback(day_ts)).value
 
 
 def previous_nyse_session(day) -> pd.Timestamp:
@@ -226,15 +222,6 @@ class PriceRepository:
         existing_tickers = set(existing["ticker"].unique())
         missing_tickers = [t for t in tickers if t not in existing_tickers]
 
-        start_cutoff = pd.Timestamp(start_date) + pd.Timedelta(days=7)
-        ticker_starts = existing.groupby("ticker")["date"].min()
-        insufficient: list[str] = []
-        for t in tickers:
-            if t in ticker_starts.index:
-                val = ticker_starts.loc[t]
-                if pd.notna(val) and pd.Timestamp(val) > start_cutoff:
-                    insufficient.append(t)
-
         existing["date"] = pd.to_datetime(existing["date"])
         required_dates_set = set(required_dates)
         per_ticker_dates = existing.groupby("ticker")["date"].apply(set)
@@ -248,7 +235,7 @@ class PriceRepository:
 
             ticker_dates = per_ticker_dates[ticker]
             gaps = required_dates_set - ticker_dates
-            if gaps or ticker in insufficient:
+            if gaps:
                 tickers_with_gaps.append(ticker)
                 gap_dates.update(gaps)
 

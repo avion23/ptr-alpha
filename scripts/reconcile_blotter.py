@@ -8,14 +8,12 @@ Usage:
 Outputs a text table to stdout, a plain-language summary, and writes a
 structured JSON result to scripts/blotter_reconcile_output.json.
 
-IMPORTANT (honesty note):
-    This script does NOT invoke the program's real recommendation engine
-    (src/analyzer/signals / the `analyze` backtest). The flag produced here,
-    `congressional_buy_within_60d`, is a FACTUAL PROXY: it is "Y" when at least
-    one congressional Purchase appears in the raw transactions table within 60
-    days before the user's earliest Buy-To-Open for that ticker. It is NOT a
-    verdict from the program's conviction/quality-filter engine. Treat it as a
-    coincidence proxy only.
+IMPORTANT:
+    This script does NOT invoke the production consensus recommendation rule.
+    The flag `congressional_buy_within_60d` is only a factual proximity check:
+    it is "Y" when at least one canonical congressional purchase was disclosed
+    within 60 days before the user's earliest Buy-To-Open for that ticker. It
+    does not count distinct buyers or apply the production 28-day/3-buyer rule.
 """
 
 from __future__ import annotations
@@ -219,15 +217,10 @@ def main() -> int:
     )
     print("=" * 80)
     print(
-        "HONESTY NOTE: 'congressional_buy_within_60d' is a FACTUAL PROXY "
-        "(raw congressional"
+        "NOTE: 'congressional_buy_within_60d' is a factual proximity check, "
+        "not the production consensus score."
     )
-    print(
-        "buy timing), NOT the program's recommendation engine output. The real engine"
-    )
-    print(
-        "(src/analyzer/signals backtest / conviction+quality filter) was NOT invoked."
-    )
+    print("The 28-day distinct-buyer production rule is not invoked by this script.")
     print("=" * 80)
 
     # --- parse blotter -------------------------------------------------------
@@ -577,10 +570,8 @@ def main() -> int:
         "RECOMMENDATION LABEL USED: 'congressional_buy_within_60d' — a FACTUAL PROXY."
     )
     print("It is 'Y' when >=1 congressional Purchase occurred within 60 INCLUSIVE days")
-    print(
-        "before the user's earliest BTO. It is NOT a program recommendation; the real"
-    )
-    print("engine (signals backtest / conviction+quality filter) was NOT invoked here.")
+    print("before the user's earliest BTO. It is not a production recommendation.")
+    print("The 28-day distinct-buyer consensus scorer was not invoked here.")
     print(
         "'Exp@60' = expected match probability by chance (Poisson base-rate), judge a"
     )
@@ -650,11 +641,10 @@ def main() -> int:
         "report_windows": REPORT_WINDOWS,
         "recommendation_label": "congressional_buy_within_60d",
         "recommendation_note": (
-            "FACTUAL PROXY only: 'Y' if >=1 congressional Purchase within the "
-            f"{MATCH_WINDOW_DAYS}-day inclusive window before the user's earliest "
-            "BTO. NOT the program's recommendation engine output; the real engine "
-            "(src/analyzer/signals backtest / conviction+quality filter) was NOT "
-            "invoked."
+            "Factual proximity check only: 'Y' if >=1 canonical congressional "
+            f"Purchase falls in the {MATCH_WINDOW_DAYS}-day inclusive window before "
+            "the user's earliest BTO. The 28-day distinct-buyer production consensus "
+            "scorer is not invoked."
         ),
         "price_failures": price_failures,
         "warnings": warnings_list,

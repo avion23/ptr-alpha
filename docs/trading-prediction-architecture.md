@@ -1,582 +1,275 @@
-# Trading prediction architecture and validation
+# Trading prediction architecture
 
 ## Status
 
-This document is the architectural contract for predictive work in PTR Alpha.
-It separates four things that must not be conflated:
+This document describes the current PTR Alpha decision and evaluation architecture. Historical audit transcripts under `docs/reviews/` and old ADRs are evidence about past states; they are not current product authority.
 
-1. reconstructing what the market could have known at a historical instant;
-2. estimating a conditional distribution of future net returns;
-3. converting that distribution into a portfolio decision; and
-4. deciding whether the complete research process produced evidence that can be
-   used outside the sample.
+PTR Alpha has one production decision rule: count distinct canonical congressional buyers of the same eligible public equity inside a public-disclosure lookback window. Member statistics are descriptive research and do not authorize recommendations.
 
-The current repository is strongest at point-in-time replay and fail-closed
-validation. Its production rule is deliberately small: count distinct recent
-buyers of the same public equity, then replay that rule on identical execution
-semantics. Production-strategy evidence has one implementation in
-`analyzer.validation`; the older parallel optimization/locking engine was
-removed because it duplicated that authority and could drift from the live rule.
+## 1. Information boundary
 
-## 1. Current system at a high level
+A congressional transaction becomes usable only when the disclosure is public.
 
 ```text
-Official House filings          Official Senate eFD
-          |                              |
-          +---------- ingestion --------+
-                         |
-                 parser cascade / normalization
-                         |
-            canonical transaction records
-                         |
-                 DuckDB repositories
-                         |
-       +-----------------+------------------+
-       |                                    |
-point-in-time labels/features       operational analysis
-       |                                    |
-member ranking + ticker scoring       CLI / reports
-       |
-walk-forward backtest
-       |
-portfolio simulation
-       |
-multiple-testing correction
-       |
-locked retrospective/final evaluation
+private transaction date ---- filing delay ----> public disclosure date
+                                             decision information starts here
 ```
 
-The major components are:
+The private transaction date describes when the member traded. It cannot make a later filing visible earlier. Delayed filings therefore remain actionable when they first become public.
 
-| Component | Responsibility | Primary modules |
-| --- | --- | --- |
-| Ingestion | Download official House/Senate disclosures; create external reconciliation artifacts separately | `download.py`, `senate_efd.py`, `capitol_trades.py` |
-| Parsing | Convert heterogeneous PDFs into normalized rows | `parser_cascade.py`, `parsing/` |
-| Persistence | Store transactions, prices, metadata, parse runs, and provenance | `database.py`, repository modules |
-| Point-in-time data | Build entry prices, feature histories, and completed forward outcomes | `price_snapshot.py`, `signals/`, `pipeline.py` |
-| Descriptive member analysis | Estimate hit rates, alpha, and partially pooled member effects | `member_ranking/` |
-| Candidate generation | Build the shared public-equity universe and count recent distinct buyers | `member_ranking/buyer_scoring.py` |
-| Replay | Generate recommendations and evaluate realizable historical outcomes | `backtest/`, `portfolio/`, `portfolio_sim.py` |
-| Statistical validation | Purge horizons, preserve scheduled support, and correct the declared consensus-strategy family | `validation.py`, `snooping.py` |
-| Presentation | User input and formatting only | `cli.py`, reporting modules |
-
-## 2. The problem from first principles
-
-At public time `t`, PTR Alpha observes a delayed and lossy disclosure event:
+Every live or historical decision must satisfy:
 
 ```text
-private execution time ---- disclosure delay ----> public filing time t
-       unknown to us                                 tradable information set
+disclosure_date <= decision_date
 ```
 
-The trading problem is:
+Rows with impossible chronology, such as a transaction date after its disclosure date, are excluded from normal decision paths.
+
+## 2. Execution graph
 
 ```text
-Given only information public by t,
-estimate the distribution of executable net return over horizon h,
-then choose a capital-constrained action that maximizes predeclared utility.
+CLI
+ |
+ +-- fetch / refresh House
+ |     -> House metadata + PDFs
+ |     -> parser cascade
+ |     -> staged generation
+ |     -> canonical activation when complete
+ |
+ +-- fetch Senate eFD
+ |     -> official report inventory
+ |     -> normalized Senate transactions
+ |
+ +-- analyze --mode tickers / --ticker
+ |     -> canonical transactions, read-only
+ |     -> public disclosure window
+ |     -> eligible equity identity
+ |     -> distinct canonical buyers
+ |     -> consensus score
+ |
+ +-- analyze --mode ranks / signals / member
+ |     -> canonical transactions, read-only
+ |     -> market prices
+ |     -> executable historical labels
+ |     -> descriptive reports
+ |
+ +-- backtest / portfolio / validate
+       -> canonical transactions, read-only
+       -> same consensus candidate rule
+       -> exact NYSE execution endpoints
+       -> retrospective outcomes / statistics
 ```
 
-A useful mathematical boundary is:
+The main code boundaries are:
 
-```text
-Forecast:
-    p(r_net | public_snapshot_t, horizon_h)
-
-Policy:
-    action_t = pi(forecast, prices_t, costs_t, risk_state_t, capital_t)
-
-Evaluation:
-    utility(action_t, realized_r_net)
-```
-
-This is **not primarily a member leaderboard problem**. Member identity is one
-possible feature. The deployable object is a forecast for a public event and a
-policy acting on that forecast.
-
-The observations have difficult structure:
-
-- disclosures are delayed and occasionally corrected;
-- transaction values are intervals, not exact amounts;
-- labels mature after long and overlapping horizons;
-- the same member, ticker, sector, and date create dependent observations;
-- member histories are sparse and highly unequal in size;
-- market regimes and legislative relationships change;
-- parser failures and symbol resolution create measurement error;
-- trying many features, horizons, scorers, and policies creates a strategy
-  family even when the trials were chosen manually.
-
-No algorithm removes these constraints. More model capacity can make selection
-bias worse when the effective sample is small.
-
-## 3. Known computer-science and statistical formulations
-
-The problem is a composition of solved problem classes, not one novel monolith.
-
-### 3.1 Event sourcing and point-in-time feature stores
-
-A historical replay must reconstruct the exact public information set. This is
-an event-sourcing problem with bitemporal semantics:
-
-```text
-valid time       = when the underlying trade occurred
-knowledge time   = when the record became publicly observable
-```
-
-Trading features must be indexed by knowledge time. Corrections must create a
-new observable event rather than rewriting what an earlier replay supposedly
-knew.
-
-### 3.2 Delayed supervised forecasting
-
-Outcomes arrive after a horizon. This is supervised learning with delayed
-feedback and censoring. Rows whose horizon has not completed are unlabeled, not
-negative and not shorter-horizon substitutes.
-
-Because PTR Alpha does not control which congressional trades are disclosed and
-its actions do not materially change the data-generating process, reinforcement
-learning is unnecessary. A probabilistic forecaster plus a separate decision
-policy is smaller, easier to test, and statistically more efficient.
-
-### 3.3 Hierarchical panel estimation
-
-Member, ticker, sector, and time effects form a sparse panel. Partial pooling is
-the standard solution: noisy entities shrink toward a population or subgroup
-mean, while repeated evidence permits separation. A static normal-normal model
-is a reasonable baseline; a dynamic multilevel model is the natural extension.
-
-### 3.4 Forecast comparison under data snooping
-
-Searching configurations and then reporting the winner is multiple hypothesis
-testing. The search algorithm changes computational efficiency, not the need
-for an untouched outer evaluation. Reality Check, Superior Predictive Ability,
-step-down procedures, model-confidence sets, block bootstrap, and explicit
-family-wise bounds are established solutions.
-
-### 3.5 Decision theory and portfolio construction
-
-A high predicted return is not yet a trade. Costs, uncertainty, correlation,
-turnover, exposure, concentration, and available capital belong in a policy
-layer. The forecast should not silently encode one portfolio construction rule.
-
-## 4. What the repository already gets right
-
-The following properties should be preserved:
-
-- public disclosure time, not private transaction time, drives availability;
-- incomplete forward windows remain missing;
-- recommendation replay calls production analysis code rather than a separate
-  approximation;
-- no-trade dates remain in scheduled support as cash observations;
-- strategy and benchmark use identical dates;
-- the primary statistic is one per-date net-alpha series rather than a mixture
-  of incompatible metrics;
-- production selection is fail-closed when no corrected survivor exists;
-- the production consensus scorer is identity-invariant and equals distinct recent buyer count;
-- live analysis and replay share the same candidate universe and deterministic tie-break;
-- the CLI backtest evaluates its declared fixed horizon rather than an adaptive OU horizon;
-- member-skill modes are descriptive and cannot authorize deployment;
-- retrospective history is labeled as reused history, not fresh evidence;
-- validation refuses any requested test window that enters the reserved post-2025 holdout; reused 2024-2025 history stays labeled retrospective.
-
-These are more valuable than replacing grid search with a fashionable optimizer.
-
-## 5. Principles that have been violated
-
-### 5.1 One experiment, one canonical harness
-
-An earlier repository state had two selection/evidence engines: the current
-`analyzer.validation` path and a separate optimization/locking workflow. That
-created divergent definitions of return, support, costs, significance, and the
-effective number of tried strategies. The duplicate engine is now removed.
-
-`analyzer.validation` is the sole production-strategy evidence authority.
-Research additions must call or extend that engine rather than recreate
-selection, support checks, inference, or final-phase rules elsewhere.
-
-### 5.2 Search is not evidence
-
-Hill climbing, Bayesian optimization, random search, grid search, and manual
-iteration all optimize a noisy historical criterion. None validates the chosen
-configuration. Every observed trial, failed run, early-stopped run, and
-human-directed follow-up belongs to the effective research family.
-
-For the current small, mostly categorical grid, exhaustive search is preferable:
-it is transparent, reproducible, and cheap. Bayesian optimization becomes useful
-only when the trial space is materially larger or each inner evaluation is
-expensive. It must remain inside the training phase.
-
-### 5.3 Partial pooling must permit complete pooling
-
-The previous empirical normal-normal helper forced estimated between-member
-variance to be at least the within-member residual variance. That manufactures
-population heterogeneity when the observed spread of member means is explainable
-by sampling noise. The consequence is too little shrinkage of sparse member
-histories. The corrected estimator clips the method-of-moments variance at a
-numerical floor only.
-
-This does not make member alpha causal or deployable. It makes the descriptive
-baseline internally coherent.
-
-### 5.4 Resampling must preserve actual support
-
-The previous max-stat bootstrap synchronized trials through shared ordinal
-uniforms even when their observation calendars differed. Row 12 of a 30-day
-schedule is not necessarily contemporaneous with row 12 of a 60-day schedule.
-The corrected bootstrap now:
-
-1. groups trials by exact post-missing-value calendar support;
-2. uses common circular block starts only inside a support group; and
-3. applies a conservative Bonferroni bound across different support groups.
-
-The arbitrary-dependence marginal Bonferroni gate remains controlling.
-
-### 5.5 A benchmark is not a risk model
-
-SPY-relative return removes one market component but does not isolate the event
-signal. Congressional portfolios can load on technology, size, momentum,
-volatility, and sector regimes. A member who repeatedly buys a concentrated
-factor is not necessarily demonstrating stock-selection skill.
-
-The prediction target should be an executable return net of costs and, for
-research diagnostics, residualized against predeclared market/sector/factor
-controls. Raw return, SPY alpha, and factor-residual alpha should be retained as
-separate fields rather than substituted after results are known.
-
-### 5.6 Endpoint labels throw away information
-
-A binary `outperformed / did not outperform` label discards magnitude and makes
-results threshold-dependent. The primary model should forecast a continuous net
-return distribution. `P(net alpha > 0)` and downside probabilities are derived
-outputs. Binary classification remains useful as a secondary calibrated view.
-
-## 6. Target architecture
-
-```text
-                    immutable data plane
-
-RawDocument -> ParseObservation -> CanonicalDisclosureEvent
-                                      |
-                                      v
-                            PointInTimeSnapshot
-                            /                 \
-                    FeatureFrame          MaturedLabelFrame
-                            \                 /
-                             TrainingDataset
-
-                    pure prediction plane
-
-TrainingDataset -> ForecastModel.fit() -> FrozenForecastModel
-PointInTimeSnapshot ------------------> ForecastFrame
-
-                    imperative decision plane
-
-ForecastFrame + prices + costs + risk state -> Policy -> TargetPortfolio
-TargetPortfolio + execution assumptions     -> Replay / live adapter
-
-                    independent evidence plane
-
-ExperimentSpec -> InnerSearch -> FrozenCandidate -> OuterEvaluation
-      |               |                |                 |
-      +---------- append-only TrialLedger --------------+
-                                      |
-                               LockedFinalEvaluation
-```
-
-### 6.1 Minimal interfaces
-
-The architectural boundary should be small and typed:
-
-```python
-@dataclass(frozen=True, slots=True)
-class Forecast:
-    event_id: str
-    as_of: datetime
-    horizon_days: int
-    expected_net_alpha: float
-    net_alpha_std: float
-    probability_positive: float
-    model_id: str
-    feature_snapshot_sha256: str
-
-class ForecastModel(Protocol):
-    def fit(self, dataset: TrainingDataset) -> FrozenForecastModel: ...
-
-class FrozenForecastModel(Protocol):
-    def predict(self, snapshot: PointInTimeSnapshot) -> tuple[Forecast, ...]: ...
-
-class Policy(Protocol):
-    def allocate(
-        self,
-        forecasts: tuple[Forecast, ...],
-        market: MarketSnapshot,
-        state: PortfolioState,
-    ) -> TargetPortfolio: ...
-```
-
-Models do not query a database, fetch prices, print, size positions, or know the
-final test period. The shell supplies immutable snapshots. This is the
-functional-core / imperative-shell boundary.
-
-### 6.2 Canonical experiment specification
-
-Every search should have one explicit experiment specification containing only
-inputs that can change the result:
-
-- public-time data scope and feature schema version;
-- label and executable-entry/exit definition;
-- model or strategy family and parameter domain;
-- optimizer, seed, and maximum trial budget when an optimizer is used;
-- train/validation/holdout windows and embargoes;
-- transaction-cost and portfolio assumptions;
-- one primary selection utility;
-- null controls and release thresholds.
-
-Hashes, lock files, receipts, and environment fingerprints may identify an
-artifact for debugging, but they do not authorize evaluation or establish
-correctness. Every tried configuration that can affect model selection belongs
-to the statistical family whether it came from a grid, an optimizer, or a
-manual experiment.
-
-## 7. Recommended prediction stack
-
-### Layer 0: identity-free consensus baseline
-
-Keep the current distinct-buyer count inside one explicit public-disclosure
-lookback window. It is cheap, deterministic, interpretable, invariant to member-name
-permutation, and has no second hidden recency-decay coefficient. Every more complex
-model must beat it on identical support after costs.
-
-### Layer 1: dynamic hierarchical model
-
-Use a robust multilevel return model as the primary member-aware baseline:
-
-```text
-net_alpha_i = time_effect_t
-            + sector_effect[s_i, t]
-            + member_effect[m_i, t]
-            + member_sector_effect[m_i, s_i]
-            + observable_event_features_i * beta
-            + StudentT_noise_i
-```
-
-Recommended properties:
-
-- member and member-sector effects are partially pooled;
-- member effects evolve slowly through a random walk or discount factor;
-- residuals are heavy-tailed;
-- same-date and same-ticker observations are clustered in evaluation;
-- missing or immature outcomes never enter the likelihood;
-- posterior uncertainty is exported with the mean;
-- the model is fitted independently in every walk-forward fold.
-
-Do not rank by posterior mean alone. A policy can use expected net alpha,
-probability of positive net alpha, and a downside-aware lower bound.
-
-### Layer 2: regularized tabular nonlinear model
-
-For the present data scale, add one strong tree baseline before deep learning:
-XGBoost, LightGBM, CatBoost, or a dependency-light histogram gradient booster.
-Use continuous net alpha or a distributional objective, with fold-local
-calibration for any probabilities.
-
-Candidate public-time features:
-
-- number of distinct recent buyers and concentration;
-- recency and disclosure lag;
-- transaction-value interval features, not a false exact amount;
-- owner and instrument type;
-- repeat-buy and cross-member episode structure;
-- ticker, sector, and factor state known at filing time;
-- momentum, volatility, liquidity, and gap since prior disclosure;
-- committee, lobbying, campaign-finance, and district-industry links only after
-  a bitemporal provenance layer exists.
-
-The model should consume member posterior summaries as fold-local features only,
-never full-history rankings.
-
-### Layer 3: out-of-fold ensemble
-
-Combine consensus, hierarchical, and tree forecasts only from outer-training
-out-of-fold predictions. A simple non-negative linear stack is preferable to a
-large meta-model. The stack is another family member and must be recorded before
-the outer evaluation.
-
-### Layer 4: temporal graph model, research only
-
-The relational problem is naturally a temporal heterogeneous graph. A 2026
-preprint applies a latency-aware Temporal Graph Network to congressional trades,
-lobbying, campaign finance, and geographic links. It is relevant research, but
-its reported AUROC is roughly random and its XGBoost baseline has slightly
-higher AUROC at the stated long horizons; the graph model mainly improves F1.
-That is not yet evidence of tradable economic value.
-
-A graph model belongs after the bitemporal relationship data, strong tabular
-baselines, probability calibration, and economic replay exist. It should be a
-plugin implementing the same `ForecastModel` interface, not a new pipeline.
-
-## 8. How to use hill climbing and Bayesian optimization correctly
-
-### Hill climbing
-
-Hill climbing is a poor default here because the objective is noisy,
-non-convex, categorical, and path-dependent. It can be useful for a strictly
-local sensitivity check around a frozen configuration, but not for proving the
-configuration is good.
-
-### Bayesian optimization
-
-Bayesian optimization is appropriate when:
-
-- one fold-complete trial is expensive;
-- the domain has several continuous dimensions;
-- the budget is fixed in advance; and
-- the optimizer sees only inner-training results.
-
-It must not see the retrospective or final phase. Acquisition-function choices,
-optimizer seeds, restarts, and human restarts are trial-family decisions.
-
-### Multi-fidelity methods
-
-Hyperband/BOHB-style pruning is risky for trading backtests because early time
-windows are not generally monotone proxies for full-history performance. If
-used, resource must mean a predeclared prefix or number of folds; pruned trials
-remain part of the declared search family; and surviving configurations are
-rerun at full budget before selection.
-
-### Preferred order for this repository
-
-```text
-small discrete family  -> exhaustive grid
-larger sparse family   -> seeded random/TPE search
-expensive continuous   -> Bayesian optimization
-all cases              -> same outer walk-forward evaluation and family correction
-```
-
-## 9. Validation protocol
-
-```text
-outer fold k
-
-past only ------------------------------------------------------ future
-| inner fit/search | purge/embargo | outer score |
-                                      ^ optimizer never sees this
-```
-
-Required protocol:
-
-1. Predeclare the point-in-time data scope, feature schema, label, costs,
-   primary utility, and trial budget.
-2. Run optimizer trials only inside the outer-training window.
-3. Refit the selected configuration from scratch on allowed outer-training data.
-4. Score one scheduled per-date series on the outer fold.
-5. Aggregate outer-fold predictions and economic results.
-6. Apply block/dependence-aware family correction to the complete search.
-7. Compare against cash, SPY, consensus, and shuffled/no-information canaries on
-   identical support.
-8. Evaluate an untouched final period only when it is genuinely untouched;
-   never relabel reused history as fresh evidence.
-
-For comparing a large model family, Hansen's Superior Predictive Ability test or
-a step-down/model-confidence-set procedure is a less blunt research diagnostic
-than Bonferroni. Bonferroni should remain the fail-safe release gate until the
-more powerful procedure is implemented and tested against adversarial canaries.
-
-Metrics must be separated by purpose:
-
-| Purpose | Metrics |
+| Area | Authority |
 | --- | --- |
-| Probability quality | log loss, Brier score, calibration slope/intercept |
-| Distribution quality | CRPS or pinball losses, interval coverage |
-| Ranking | rank correlation, precision at a predeclared capacity |
-| Economics | net alpha, utility, turnover, drawdown, exposure, capacity |
-| Evidence | corrected p-value, null percentile, support and trial counts |
+| House ingestion | `src/analyzer/download.py` |
+| Senate ingestion | `src/analyzer/senate_efd.py` |
+| Parser cascade | `src/analyzer/parser_cascade.py`, `src/analyzer/parsing/` |
+| Persistence | `src/analyzer/database.py` and repository modules |
+| Production equity/buyer rule | `src/analyzer/member_ranking/buyer_scoring.py` |
+| Replay recommendation generation | `src/analyzer/backtest/recommend.py` |
+| Historical label construction | `src/analyzer/signals/`, `src/analyzer/backtest/evaluate.py` |
+| Descriptive member ranking | `src/analyzer/member_ranking/ranking.py` |
+| Portfolio execution | `src/analyzer/portfolio/`, `src/analyzer/portfolio_sim.py` |
+| Statistical validation | `src/analyzer/validation.py`, `src/analyzer/snooping.py` |
+| CLI | `src/analyzer/cli.py` |
 
-A single predeclared economic utility chooses the model. The rest are diagnostics.
+There is no second production optimization engine, member-scoring engine, adaptive OU holding-period engine, forecast-model framework, or exact-machine certification gate.
 
-## 10. Testability
+## 3. Canonical data model
 
-Every proposed boundary is directly testable.
+Official House and Senate records share the canonical database model. Source and chamber provenance preserve their independent refresh boundaries.
 
-### Unit and property tests
+`canonical_transactions` is the decision-facing transaction view. It excludes reconciliation-only Capitol Trades rows. Capitol Trades artifacts may be used to compare source evidence but are not an official canonical transaction source.
 
-- adding future rows cannot change an earlier snapshot or forecast;
-- permuting member labels leaves the consensus model unchanged;
-- duplicating one disclosure cannot create another distinct buyer;
-- scaling all return observations scales posterior means and standard deviations
-  but not shrinkage;
-- when between-member spread is explainable by noise, partial pooling approaches
-  complete pooling;
-- shifted calendars are not treated as contemporaneous bootstrap support;
-- forecast and policy functions are deterministic for a frozen snapshot and seed.
+House ingestion uses generation state so incomplete or failed refreshes do not replace a prior complete generation. Read-only database opens can shadow stale persisted canonical-view definitions without mutating the live database.
 
-### Leakage canaries
+Important transaction provenance includes source/chamber identity, source record/row identity, ingestion generation, artifact identity, raw asset evidence, transaction type, instrument type, ticker provenance, private transaction date, and public disclosure date.
 
-- inject an impossibly predictive future-only feature and assert the feature
-  builder refuses or the point-in-time join leaves it missing;
-- move disclosure timestamps after the decision time and assert predictions do
-  not use those rows;
-- truncate price history before label maturity and assert the outcome is missing;
-- rename all members and assert identity-free production output is unchanged.
+## 4. Production stock evaluation
 
-### Statistical canaries
+Production scorer provenance:
 
-- all-zero alpha must never deploy;
-- shuffled event-to-outcome alignment must fail;
-- a synthetic planted effect must be detected at adequate sample size;
-- unsupported block lengths and duplicate calendar observations must fail closed;
-- adding null strategies to the family cannot improve corrected significance.
+```text
+identity_free_distinct_buyer_count_v2
+```
 
-### Integration tests
+Defaults:
 
-One synthetic DuckDB fixture should drive the real ingestion-independent path:
-point-in-time snapshot, feature generation, model fit, forecast, policy, and
-replay. No duplicate implementation of production formulas is allowed in tests.
+```text
+lookback_days = 28
+min_buyers    = 3
+signal_score  = distinct recent buyer count
+```
 
-## 11. Prioritized implementation plan
+For decision date `t`:
 
-### P0: preserve evidence integrity
+1. Read disclosures in `[t - lookback_days, t]`.
+2. Keep purchases only.
+3. Reject rows with invalid public chronology.
+4. Reject explicit options, funds, bonds, cash-like/non-equity instruments, private assets, and quarantined ticker artifacts.
+5. Use official canonical provenance or an explicit resolver mapping for ticker identity.
+6. Canonicalize ticker aliases/class shares/renames to one economic security.
+7. Resolve the symbol tradable on the decision date. A delayed pre-rename transaction disclosed after a rename enters the post-rename tradable symbol.
+8. Canonicalize member identity and count distinct buyers.
+9. Require `min_buyers`.
+10. Set `signal_score` to the distinct-buyer count.
+11. Sort score descending, then ticker ascending.
 
-- Keep the corrected calendar-aware bootstrap and empirical member hierarchy.
-- Keep one documented verification command and run it before every direct
-  update of `main`.
-- Keep result-changing strategy parameters explicit and reject inert search
-  dimensions instead of recording them as extra trials.
+No member skill, price history, trade size, owner field, filing-delay penalty, recency coefficient, confidence factor, crash model, Bayesian prior, or blended quality score enters production scoring.
 
-### P1: preserve single experiment authority
+An empty eligible window is a successful no-signal result. It is distinct from a stale/missing-data warning.
 
-Keep `validation.py` as the single engine for production-strategy evidence and
-keep `analyzer.experiments.family` only for deterministic family identity. Do
-not add a second selection, locking, support, or inference implementation.
+## 5. Ticker identity
 
-### P2: establish forecast and policy protocols
+Ticker text is not sufficient by itself when symbols are aliases, renamed, reused, acquired, or parser artifacts.
 
-When a probabilistic forecast is actually added, put it behind `ForecastModel`
-and keep allocation in `Policy`. Do not add adapters merely to preserve obsolete
-internal interfaces; preserve the observable decision contract that remains
-supported.
+Current rules include:
 
-### P3: add dynamic hierarchy and tree baseline
+- class-share aliases collapse to the same economic security;
+- verified parser pseudo-tickers map only where filing evidence establishes the intended public equity;
+- quarantined ambiguous tokens are rejected;
+- renamed symbols form one economic family, with the tradable symbol selected at public decision time;
+- reused symbols are date-gated so a filing cannot borrow price history from an earlier security that used the same ticker;
+- acquired securities do not silently substitute the acquirer's equity.
 
-Implement both against the same immutable `TrainingDataset`. Predeclare a small
-search family and compare out-of-fold forecasts, not in-sample member rankings.
+Price acquisition may need both sides of a rename because historical decisions can occur on either side of the effective date. Entry selection still chooses only the symbol tradable at that disclosure-time decision.
 
-### P4: enrich relationships
+## 6. Descriptive member analysis
 
-Add point-in-time committee, lobbying, donation, and district-industry edges.
-First expose them to the tree model. Attempt a temporal graph model only when the
-simpler model proves those features add stable outer-fold value.
+Member ranking is not part of recommendation generation.
 
-## 12. References
+At a chosen horizon, the maintained member statistic uses completed purchase outcomes only. One observation is one member/ticker/disclosure-date/horizon purchase episode. Duplicate rows for the same public event collapse without trade-size weighting.
 
-- Cawley, G. C. and Talbot, N. L. C. (2010), [On Over-fitting in Model Selection and Subsequent Selection Bias in Performance Evaluation](https://www.jmlr.org/papers/v11/cawley10a.html).
-- Bailey, D. H. et al. (2015), [The Probability of Backtest Overfitting](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2326253).
-- Hansen, P. R. (2005), [A Test for Superior Predictive Ability](https://doi.org/10.1198/073500105000000063).
-- Gneiting, T. and Raftery, A. E. (2007), [Strictly Proper Scoring Rules, Prediction, and Estimation](https://doi.org/10.1198/016214506000001437).
-- Snoek, J., Larochelle, H., and Adams, R. P. (2012), [Practical Bayesian Optimization of Machine Learning Algorithms](https://proceedings.neurips.cc/paper/2012/hash/05311655a15b75fab86956663e1819cd-Abstract.html).
-- Li, L. et al. (2018), [Hyperband](https://www.jmlr.org/papers/v18/16-558.html).
-- Falkner, S., Klein, A., and Hutter, F. (2018), [BOHB](https://proceedings.mlr.press/v80/falkner18a.html).
-- Gu, S., Kelly, B., and Xiu, D. (2020), [Empirical Asset Pricing via Machine Learning](https://doi.org/10.1093/rfs/hhaa009).
-- Grinsztajn, L., Oyallon, E., and Varoquaux, G. (2022), [Why do tree-based models still outperform deep learning on typical tabular data?](https://proceedings.neurips.cc/paper_files/paper/2022/hash/0378c7692da36807bdec87ab043cdadc-Abstract-Datasets_and_Benchmarks.html).
-- Rossi, E. et al. (2020), [Temporal Graph Networks for Deep Learning on Dynamic Graphs](https://arxiv.org/abs/2006.10637).
-- Roodman, B. P. et al. (2026), [Detecting Information Channels in Congressional Trading via Temporal Graph Learning](https://arxiv.org/abs/2602.05514).
+Reported fields are based on exact executable endpoints:
+
+- `purchase_episodes`;
+- mean stock return;
+- mean SPY return on identical support;
+- mean SPY alpha;
+- observed positive-return rate;
+- observed positive-alpha rate;
+- empirical normal-normal partially pooled alpha mean;
+- posterior standard deviation;
+- shrinkage.
+
+The empirical hierarchy has no user-configurable prior strength, recency weight, conviction score, member-specific decay coefficient, trade-size weight, owner multiplier, or pseudo-count probability. The ranking orders `shrunk_alpha_pct` descending, then member name for deterministic ties.
+
+These estimates remain descriptive associations. They do not control sufficiently for sector exposure, market regime, committee relationships, ticker concentration, or disclosure-selection effects and must not be described as causal skill.
+
+Historical signal reports may still expose path-oriented diagnostics such as peak potential or the existing decay-weighted return calculation. Those fields do not enter production stock selection or member ranking.
+
+## 7. Return and execution math
+
+Historical executable outcomes use the same public-time boundary as live decisions.
+
+```text
+entry = first expected NYSE session after disclosure
+intended_exit_target = entry + horizon calendar days
+exit  = expected NYSE session on or before intended_exit_target
+
+stock_return = P_exit / P_entry - 1
+spy_return   = SPY_exit / SPY_entry - 1
+alpha        = stock_return - spy_return
+```
+
+Required endpoint prices must exist on the expected sessions and be positive and finite. Missing entry, stock exit, or benchmark endpoint means the outcome is unavailable. The evaluator does not shift to a convenient later quote, use stale prior pricing as an invented endpoint, or shorten the declared horizon.
+
+The fixed-horizon CLI backtest uses the requested horizon. Old adaptive holding-period research has been removed.
+
+A funded basket is fail-closed: if required constituents cannot be evaluated, the replay does not reallocate their capital ex post to surviving names. Supported scheduled dates with no trade remain explicit cash observations with strategy return 0 and the same benchmark support.
+
+## 8. Portfolio semantics
+
+Portfolio code uses shared capital and explicit position accounting. Overlapping positions cannot reuse the same bankroll while still open.
+
+Portfolio assumptions such as initial capital, maximum positions, rebalance cadence, holding period, and declared slippage are research/policy settings. They do not change the production candidate score.
+
+Open positions and unresolved exits remain explicit in portfolio accounting rather than being silently marked with an invented terminal value.
+
+## 9. Validation
+
+`src/analyzer/validation.py` is the single production-strategy evidence engine.
+
+Validation evaluates the actual consensus family. Result-changing family dimensions are limited to declared decision/evaluation parameters such as horizon, scheduled frequency, lookback window, buyer threshold, and top-N where supported by the experiment specification.
+
+The validation path preserves these rules:
+
+- public-time recommendation replay;
+- next-session entry and exact fixed-horizon exit semantics;
+- purge/embargo between training and evaluation support;
+- one scheduled per-date strategy series with explicit cash dates;
+- identical benchmark support;
+- Newey-West/HAC statistics where declared;
+- moving-block bootstrap with support-aware dependence handling;
+- family-wise correction across the declared strategy family;
+- fail-closed minimum resampling/sample-support requirements;
+- identity-invariance diagnostics for the consensus scorer;
+- retrospective wording for previously explored history;
+- rejection of evaluation windows that enter the reserved final holdout.
+
+Hashes and manifests may identify evidence. They do not authorize execution, make a result correct, or consume a one-shot right to evaluate. Exact-machine fingerprints, filesystem locks, consumption ledgers, and frozen database-hash gates are not correctness mechanisms.
+
+## 10. Parsing and ingestion
+
+House parsing starts with cheap deterministic text/table extraction and escalates only when additional evidence is needed.
+
+Current deterministic/text engines include pdfplumber, Camelot lattice/stream, and `pdftotext`. Returned tables/pages are aggregated rather than accepting the first non-empty table. OCR paths include Docling/Tesseract and optional Gemini recovery for unresolved filings.
+
+When text engines disagree, reconciliation is evidence-based and fails closed if disagreement cannot be resolved. Parser telemetry records attempted engines, row counts, and failure reasons.
+
+Official row identity, raw fields, instrument evidence, ticker provenance, amendment/generation identity, and artifact identity are preserved for persistence/reconciliation. Transaction replacement and generation activation must not expose a partial new filing set as canonical success.
+
+See `docs/house-data-parsing.md` for the current House parser flow and `docs/house-ingestion-error-catalog.md` for known ingestion risks.
+
+## 11. Failure and logging semantics
+
+Operational code should prefer one bounded summary over one warning/error per row or ticker. Detailed provenance belongs at debug level unless an operator can act on it.
+
+Important user-visible states are distinct:
+
+- success with positive candidates;
+- success with no signal;
+- stale/missing source warning;
+- incomplete/unavailable historical outcome;
+- parser/ingestion failure;
+- validation with no deployable configuration.
+
+Broad exception handling must not silently change implementations or convert partial output into success when completeness is required.
+
+## 12. Interface scope
+
+The current product has no graphical frontend. User-facing surfaces are Typer CLI output and generated text/CSV/JSON artifacts.
+
+CLI/report style should stay compact and utilitarian:
+
+- precise field names;
+- deterministic ordering;
+- minimal headings;
+- no decorative badges or prose;
+- explicit warning/error/no-signal distinctions;
+- no production-sounding score names for descriptive research metrics.
+
+Impeccable is installed and initialized for durable product context, but graphical audit/polish workflows are not applicable until a real graphical surface exists. Do not create a frontend merely to satisfy design tooling.
+
+## 13. Data freshness limitation
+
+A correct scorer can still be operating on stale local data. Live candidate output is current only to the latest successfully ingested official House and Senate disclosures in the local canonical database.
+
+Live analysis warns when a chamber has no disclosure inside the candidate window. A no-signal result should not be interpreted as current if source freshness is stale or missing.
+
+## 14. Non-authorities
+
+The following are intentionally not current product authorities:
+
+- `docs/reviews/` adversarial-review transcripts;
+- historical ADR text describing removed modules;
+- Capitol Trades reconciliation artifacts;
+- deleted `optimize_profit/` and `member_profitability/` research stacks;
+- deleted prediction/decision-adapter research frameworks;
+- deleted adaptive OU holding-period research;
+- deleted exact-revision/database-hash baseline certification tooling.
+
+Current behavior is defined by maintained source, tests, README, this architecture document, and the current parsing/data-quality docs.

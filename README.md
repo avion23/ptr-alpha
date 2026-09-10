@@ -94,14 +94,14 @@ Member ranking is **descriptive research**, not the live trading rule.
 For completed purchase episodes at a chosen horizon, PTR Alpha reports:
 
 - number of purchase episodes;
-- endpoint return and SPY-relative endpoint alpha;
-- hit rates;
-- a Beta-binomial descriptive positive-alpha probability;
+- mean endpoint stock return;
+- mean SPY return on identical support;
+- mean endpoint SPY alpha;
+- observed positive-return and positive-alpha rates;
 - an empirical normal-normal partially pooled alpha estimate;
-- posterior standard deviation and shrinkage diagnostics;
-- additional display diagnostics such as trade-count/size conviction.
+- posterior standard deviation and shrinkage.
 
-The ranking is sorted by `shrunk_alpha`.
+An episode is one member/ticker/disclosure-date/horizon purchase event; duplicate rows for the same public event collapse without trade-size weighting. The ranking is sorted by `shrunk_alpha_pct`, then member name for deterministic ties.
 
 This member model is not causal. Committee membership, information access, sector exposure, market regime, ticker concentration, and disclosure-selection effects are not controlled sufficiently to interpret the member effect as skill.
 
@@ -134,9 +134,8 @@ The fixed-horizon CLI backtest now evaluates exactly `--horizon`. It does not re
 
 ### What remains heuristic research
 
-- `DECAY_LAMBDA` for the historical decay-weighted return diagnostic;
+- `DECAY_LAMBDA` for the historical path-weighted return diagnostic shown by signal analysis, not member ranking or production scoring;
 - the empirical member hierarchy and its distributional assumptions;
-- the 14-day member episode collapse used by member ranking;
 - portfolio rebalance cadence, holding period, maximum position count, and any explicitly declared slippage assumption;
 - validation family choices such as horizon, buyer threshold, and top-N.
 
@@ -190,8 +189,7 @@ Common commands:
 | `ptr-alpha analyze --year 2026 --mode tickers` | Current multi-buyer candidates |
 | `ptr-alpha analyze --year 2026 --ticker SPCX` | One ticker using the same `--days-back`/`--min-buyers` live rule |
 | `ptr-alpha analyze --year 2025 --mode ranks` | Descriptive member rankings |
-| `ptr-alpha analyze --year 2025 --mode signals` | Historical top purchase outcomes |
-| `ptr-alpha analyze --year 2025 --mode sales` | Historical sale/loss-avoidance ranking |
+| `ptr-alpha analyze --year 2025 --mode signals` | Historical purchase outcomes ranked by endpoint SPY alpha |
 | `ptr-alpha backtest --start 2024-01-01 --end 2025-12-31` | Fixed-horizon public-time replay |
 | `ptr-alpha portfolio --start 2024-01-01 --end 2025-12-31` | Shared-cash equal-slot portfolio simulation; optional slippage is declared in basis points |
 | `ptr-alpha snapshot` | Explicitly write a reproducible price snapshot |
@@ -203,7 +201,7 @@ Common commands:
 
 A positive live score means only that multiple distinct members disclosed recent purchases of the same equity. It is not statistical proof of abnormal future return.
 
-The repository's retrospective validation machinery evaluates only the production consensus rule. It uses scheduled no-trade support, exact holding-period purging, SPY-relative net outcomes, and family-wise controls. Historical member-skill modes remain separate descriptive research. `analyzer.validation` is the single authority for production-strategy evidence; the older parallel optimization/locking engine was removed rather than maintained as a second implementation.
+The repository's retrospective validation machinery evaluates only the production consensus rule. It uses scheduled no-trade support, exact holding-period purging, SPY-relative net outcomes, and family-wise controls. Descriptive member ranking is separate from recommendation generation and cannot authorize deployment. `analyzer.validation` is the single authority for production-strategy evidence; older parallel optimization/locking and member-scoring engines were removed rather than maintained as alternate implementations.
 
 No existing retrospective result should be relabeled as fresh out-of-sample evidence after changing the scorer or implementation. A scorer change requires a new predeclared evaluation.
 

@@ -35,7 +35,6 @@ The system must never backdate knowledge to the private transaction date.
 | `src/analyzer/portfolio/`, `portfolio_sim.py` | Shared-cash equal-slot portfolio simulation and Kelly research helpers |
 | `src/analyzer/validation.py`, `snooping.py` | Purged retrospective validation and multiple-testing controls |
 | `src/analyzer/capitol_trades.py` | Capitol Trades reconciliation input; not an official canonical source |
-| `member_profitability/` | Separate descriptive member-profitability research workflow |
 | `scripts/` | Audits, reparsing, OCR, staging, reconciliation, refresh, and operational tools |
 | `tests/` | Unit, integration, statistical-invariant, parser, database, replay, and CLI checks |
 | `docs/` | Current architecture/parsing docs plus explicitly historical audit/review evidence |

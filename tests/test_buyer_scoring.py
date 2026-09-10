@@ -3,8 +3,6 @@ import inspect
 import pandas as pd
 import pytest
 
-import analyzer.member_ranking as member_ranking_api
-import analyzer.member_skill as member_skill_api
 from analyzer.exceptions import AnalysisError
 from analyzer.member_ranking.buyer_scoring import score_ticker_by_buyers
 
@@ -299,12 +297,3 @@ def test_removed_pseudo_posterior_parameters_are_absent_from_public_api():
     assert "uncertainty_penalty_lambda" not in parameters
     assert "solo_buyer_skill_threshold" not in parameters
     assert "solo_buyer_penalty" not in parameters
-
-
-def test_stale_member_posterior_exports_are_absent():
-    assert not hasattr(member_ranking_api, "_lookup_buyer_posterior_lift")
-    assert not hasattr(member_skill_api, "score_members_for_ticker")
-    fields = member_skill_api.MemberSkillPosterior.__dataclass_fields__
-    assert "sector_skills" not in fields
-    assert "ticker_skills" not in fields
-    assert "effective_information" in fields

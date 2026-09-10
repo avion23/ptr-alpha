@@ -80,7 +80,7 @@ def score_ticker_by_buyers(
     horizon: int = 90,
     threshold: float = 5.0,
     member_rankings: pd.DataFrame | None = None,
-    min_buyers: int = 2,
+    min_buyers: int = CONSENSUS_MIN_BUYERS,
     ticker_perf_signals: pd.DataFrame | None = None,
     _ranking_dicts: dict | None = None,
     scoring_mode: str = "consensus",

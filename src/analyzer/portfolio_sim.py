@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Mapping
 
 import numpy as np
 import pandas as pd
@@ -14,8 +13,8 @@ from analyzer.backtest.prices import (
     AlignedPrice,
     _aligned_price_at_or_before_arrays,
     _aligned_price_on_or_after_arrays,
-    _next_tradable_price_arrays,
 )
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals import _price_arrays
 
 logger = logging.getLogger(__name__)
@@ -25,16 +24,10 @@ logger = logging.getLogger(__name__)
 class PortfolioConfig:
     initial_capital: float = 20000.0
     max_positions: int = 5
-    max_position_pct: float = 0.25
-    max_sector_pct: float = 0.40
     rebalance_freq_days: int = 14
     hold_period_days: int = 120
-    entry_slippage_pct: float = 0.001
-    exit_slippage_pct: float = 0.001
-    min_signal_score: float = 0.0
-    max_price_staleness_days: int = 5
-    max_execution_wait_days: int = 7
-    sector_by_ticker: Mapping[str, str] = field(default_factory=dict)
+    entry_slippage_pct: float = 0.0
+    exit_slippage_pct: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +39,6 @@ class PortfolioPosition:
     shares: int
     cost: float
     entry_notional: float
-    sector: str
     signal_score: float
     rank: int
 
@@ -104,6 +96,16 @@ class PortfolioSimulator:
             raise ValueError("end_date must be on or after start_date")
         if self.config.rebalance_freq_days < 1:
             raise ValueError("rebalance_freq_days must be positive")
+        if self.config.max_positions < 1:
+            raise ValueError("max_positions must be positive")
+        if self.config.initial_capital <= 0:
+            raise ValueError("initial_capital must be positive")
+        for name, value in (
+            ("entry_slippage_pct", self.config.entry_slippage_pct),
+            ("exit_slippage_pct", self.config.exit_slippage_pct),
+        ):
+            if not 0 <= value < 1:
+                raise ValueError(f"{name} must be in [0, 1)")
 
         self._reset_state()
         self._simulation_end_date = end_date
@@ -148,9 +150,6 @@ class PortfolioSimulator:
             if key in self._scheduled_signals:
                 continue
             self._scheduled_signals.add(key)
-            if float(rec.get("signal_score", 0)) < self.config.min_signal_score:
-                self._reject(ticker, signal_date, "signal_below_minimum")
-                continue
             if any(p.ticker == ticker for p in self.positions) or any(
                 p.recommendation["ticker"] == ticker for p in self.pending_entries
             ):
@@ -161,11 +160,12 @@ class PortfolioSimulator:
             if arrays is None or arrays[0] is None:
                 self._reject(ticker, signal_date, "no_price_history")
                 continue
-            execution = _next_tradable_price_arrays(
+            expected_entry = next_nyse_session(signal_date)
+            execution = _aligned_price_on_or_after_arrays(
                 arrays[0],
                 arrays[1],
-                signal_date,
-                max_wait_days=self.config.max_execution_wait_days,
+                expected_entry,
+                max_wait_days=0,
             )
             if execution is None:
                 self._reject(ticker, signal_date, "no_next_tradable_session")
@@ -211,20 +211,11 @@ class PortfolioSimulator:
             self._reject(ticker, execution_date, "invalid_entry_price")
             return
 
-        sector = self._get_sector(ticker, rec)
         total_value = self._total_value(prices_df, execution_date)
-        target_pct = min(1.0 / self.config.max_positions, self.config.max_position_pct)
-        target_value = total_value * target_pct
-
-        sector_exposure = self._sector_exposure(prices_df, execution_date)
-        current_sector_value = sector_exposure.get(sector, 0.0) * total_value
-        sector_room = total_value * self.config.max_sector_pct - current_sector_value
-        if sector_room <= 0:
-            self._reject(ticker, execution_date, "sector_limit")
-            return
+        target_value = total_value / self.config.max_positions
 
         entry_price = raw_price * (1 + self.config.entry_slippage_pct)
-        invest_amount = min(target_value, self.cash, sector_room)
+        invest_amount = min(target_value, self.cash)
         if invest_amount < entry_price:
             self._reject(ticker, execution_date, "insufficient_cash")
             return
@@ -246,7 +237,6 @@ class PortfolioSimulator:
                 shares=shares,
                 cost=cost,
                 entry_notional=raw_notional,
-                sector=sector,
                 signal_score=float(rec.get("signal_score", 0)),
                 rank=int(rec.get("rank", 0)),
             )
@@ -255,18 +245,19 @@ class PortfolioSimulator:
     def _try_exit_expired(self, prices_df: pd.DataFrame, current: date) -> None:
         for pos in list(self.positions):
             target = pos.entry_date + timedelta(days=self.config.hold_period_days)
-            if current < target:
+            expected_exit = previous_nyse_session(target)
+            if current < expected_exit.date():
                 continue
             arrays = _price_arrays(prices_df, pos.ticker)
             if arrays is None or arrays[0] is None:
                 continue
-            execution = _aligned_price_on_or_after_arrays(
+            execution = _aligned_price_at_or_before_arrays(
                 arrays[0],
                 arrays[1],
-                target,
-                max_wait_days=None,
+                expected_exit,
+                max_staleness_days=0,
             )
-            if execution is None or execution.date.date() > current:
+            if execution is None:
                 continue
             self._try_exit(pos, execution)
 
@@ -296,7 +287,6 @@ class PortfolioSimulator:
                 "exit_notional": raw_notional,
                 "pnl": proceeds - pos.cost,
                 "return_pct": (exit_price / pos.entry_price - 1) * 100,
-                "sector": pos.sector,
                 "signal_score": pos.signal_score,
                 "rank": pos.rank,
                 "holding_days": (execution.date.date() - pos.entry_date).days,
@@ -304,29 +294,18 @@ class PortfolioSimulator:
         )
         self.positions = [p for p in self.positions if p is not pos]
 
-    def _get_sector(self, ticker: str, rec: pd.Series | None = None) -> str:
-        """Resolve only deterministic stored sector data; never make live calls."""
-        sector = rec.get("sector") if rec is not None and "sector" in rec else None
-        if sector is None or pd.isna(sector) or not str(sector).strip():
-            sector = self.config.sector_by_ticker.get(ticker)
-        if sector is None or not str(sector).strip():
-            raise ValueError(
-                f"Missing stored sector for {ticker}; provide recommendation.sector "
-                "or PortfolioConfig.sector_by_ticker"
-            )
-        return str(sector)
-
     def _aligned_mark(
         self, ticker: str, prices_df: pd.DataFrame, as_of: date
     ) -> AlignedPrice | None:
         arrays = _price_arrays(prices_df, ticker)
         if arrays is None or arrays[0] is None:
             return None
+        expected_mark = previous_nyse_session(as_of)
         return _aligned_price_at_or_before_arrays(
             arrays[0],
             arrays[1],
-            as_of,
-            max_staleness_days=self.config.max_price_staleness_days,
+            expected_mark,
+            max_staleness_days=0,
         )
 
     def _position_value(
@@ -339,23 +318,6 @@ class PortfolioSimulator:
             )
         # Mark at executable liquidation value so final equity includes exit cost.
         return pos.shares * mark.price * (1 - self.config.exit_slippage_pct)
-
-    def _sector_exposure(
-        self, prices_df: pd.DataFrame, as_of: date
-    ) -> dict[str, float]:
-        if not self.positions:
-            return {}
-        values: dict[str, float] = {}
-        for pos in self.positions:
-            values[pos.sector] = values.get(pos.sector, 0.0) + self._position_value(
-                pos, prices_df, as_of
-            )
-        total = self._total_value(prices_df, as_of)
-        return (
-            {sector: value / total for sector, value in values.items()}
-            if total > 0
-            else {}
-        )
 
     def _total_value(self, prices_df: pd.DataFrame, as_of: date) -> float:
         return self.cash + sum(
@@ -414,7 +376,12 @@ class PortfolioSimulator:
             else date.today()
         )
         open_ledger = self._open_ledger(prices_df, end_date)
-        unresolved = [row for row in open_ledger if row["liquidation_value"] is None]
+        unresolved = [
+            row
+            for row in open_ledger
+            if row["liquidation_value"] is None
+            or row["state"].startswith("exit_unresolved")
+        ]
         if unresolved:
             return self._unavailable_metrics(open_ledger, unresolved)
         if results.empty:
@@ -496,7 +463,6 @@ class PortfolioSimulator:
             "rejected_order_count": len(self.rejected_orders),
             "max_concurrent_positions": int(results["num_positions"].max()),
             "total_closed_trades": closed_count,
-            "sector_concentration": self._sector_concentration(),
             "spy_return_pct": spy_return,
             "spy_benchmark_status": "available"
             if spy_return is not None
@@ -532,7 +498,6 @@ class PortfolioSimulator:
             "rejected_order_count": len(self.rejected_orders),
             "max_concurrent_positions": None,
             "total_closed_trades": len(self.closed_positions),
-            "sector_concentration": self._sector_concentration(),
             "spy_return_pct": None,
             "spy_benchmark_status": "omitted",
             "spy_benchmark_reason": "portfolio_valuation_unavailable",
@@ -551,7 +516,10 @@ class PortfolioSimulator:
                 if mark is not None
                 else None
             )
-            exit_due = (as_of - pos.entry_date).days >= self.config.hold_period_days
+            expected_exit = previous_nyse_session(
+                pos.entry_date + timedelta(days=self.config.hold_period_days)
+            ).date()
+            exit_due = as_of >= expected_exit
             state = "exit_unresolved" if exit_due else "open"
             if mark is None:
                 state += "_valuation_unavailable"
@@ -561,7 +529,6 @@ class PortfolioSimulator:
                     "signal_date": pos.signal_date,
                     "entry_date": pos.entry_date,
                     "shares": pos.shares,
-                    "sector": pos.sector,
                     "cost": round(pos.cost, 2),
                     "mark_price": round(mark.price, 4) if mark is not None else None,
                     "mark_date": mark.date.date() if mark is not None else None,
@@ -576,19 +543,6 @@ class PortfolioSimulator:
             )
         return ledger
 
-    def _sector_concentration(self) -> dict[str, float]:
-        notionals: dict[str, float] = {}
-        for cp in self.closed_positions:
-            notionals[cp["sector"]] = (
-                notionals.get(cp["sector"], 0.0) + cp["entry_notional"]
-            )
-        total = sum(notionals.values())
-        return (
-            {sector: value / total * 100 for sector, value in notionals.items()}
-            if total > 0
-            else {}
-        )
-
     def _spy_buy_hold(
         self, prices_df: pd.DataFrame | None, start: date, end: date
     ) -> tuple[float | None, str | None]:
@@ -597,17 +551,19 @@ class PortfolioSimulator:
         arrays = _price_arrays(prices_df, "SPY")
         if arrays is None or arrays[0] is None:
             return None, "spy_prices_unavailable"
+        expected_entry = next_nyse_session(pd.Timestamp(start) - pd.Timedelta(days=1))
+        expected_exit = previous_nyse_session(end)
         entry = _aligned_price_on_or_after_arrays(
             arrays[0],
             arrays[1],
-            start,
-            max_wait_days=self.config.max_execution_wait_days,
+            expected_entry,
+            max_wait_days=0,
         )
         exit_ = _aligned_price_at_or_before_arrays(
             arrays[0],
             arrays[1],
-            end,
-            max_staleness_days=self.config.max_price_staleness_days,
+            expected_exit,
+            max_staleness_days=0,
         )
         if entry is None:
             return None, "spy_entry_outside_boundary"

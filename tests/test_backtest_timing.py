@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 
 from analyzer.analysis import calculate_signal_potential, evaluate_backtest
-from analyzer.backtest.filters import _filter_ticker_perf, _filter_training
 from analyzer.backtest.prices import _aligned_price_at_or_before_arrays
 from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
 from analyzer.pipeline import _entry_prices_from_matrix, _execution_price_window
@@ -250,25 +249,6 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertTrue(np.isnan(row["bt_return_pct"]))
         self.assertEqual(row["bt_coverage"], "unavailable")
         self.assertTrue(row["bt_stale_exit"])
-
-    def test_training_maturity_uses_actual_label_window_end(self):
-        signals = pd.DataFrame(
-            {
-                "horizon_days": [30],
-                "disclosure_date": [pd.Timestamp("2024-01-01")],
-                "label_window_end": [pd.Timestamp("2024-02-05")],
-                "window_complete": [True],
-                "total_spy_alpha_pct": [1.0],
-            }
-        )
-
-        early = _filter_training(signals, 30, "2024-02-01", None)
-        mature = _filter_training(signals, 30, "2024-02-06", None)
-        ticker_early = _filter_ticker_perf(signals, 30, "2024-02-01")
-
-        self.assertTrue(early.empty)
-        self.assertTrue(ticker_early.empty)
-        self.assertEqual(len(mature), 1)
 
     def test_sale_peak_uses_executable_next_session_basis(self):
         dates = pd.bdate_range("2024-01-08", "2024-01-12")

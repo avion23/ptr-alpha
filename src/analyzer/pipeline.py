@@ -35,8 +35,6 @@ def _analysis_transactions(transaction_source, year: int) -> pd.DataFrame:
 class AnalysisParams:
     year: int
     horizons: tuple[int, ...]
-    threshold: float
-    source: str = "house"
     member_filter: str | None = None
     top_n: int | None = None
     mode: AnalysisMode = AnalysisMode.MEMBER_RANKINGS
@@ -211,7 +209,6 @@ def run_analysis_pipeline(
         params.member_filter,
         params.horizons[0],
         params.top_n,
-        params.threshold,
     )
     logger.info("Generated analysis table with %d rows", len(table))
 
@@ -227,23 +224,6 @@ def run_analysis_pipeline(
             "sector_results": sector_results,
             "member_filter": params.member_filter,
             "mode": params.mode,
-        },
-    )
-
-
-@pipeline_step
-def run_sales_pipeline(
-    year: int, horizons: tuple[int, ...], top_n: int, transaction_source, price_source
-) -> DataResult:
-    trades, prices, signals = prepare_analysis_data(
-        transaction_source, price_source, year, horizons
-    )
-    result = analysis.rank_sales(signals, horizons[0])
-    result = result.head(top_n)
-    return DataResult(
-        success=True,
-        data={
-            "table": result,
         },
     )
 
@@ -309,9 +289,7 @@ def run_ticker_analysis(
     score = analysis.score_ticker_by_buyers(
         resolved_ticker,
         known_trades,
-        member_rankings=None,
         min_buyers=params.min_buyers,
-        scoring_mode="consensus",
         as_of_date=analysis_as_of,
     )
 
@@ -358,9 +336,7 @@ def run_recent_ticker_scoring(
         analysis.score_ticker_by_buyers(
             ticker,
             recent_trades,
-            member_rankings=None,
             min_buyers=params.min_buyers,
-            scoring_mode="consensus",
             as_of_date=as_of_date,
         )
         for ticker in tickers
@@ -379,12 +355,7 @@ def run_recent_ticker_scoring(
         )
 
     result = pd.concat(scores, ignore_index=True)
-    if "signal_score_raw" not in result.columns:
-        result = result.iloc[0:0]
-    else:
-        result = result[
-            pd.to_numeric(result["signal_score_raw"], errors="coerce").fillna(0) > 0
-        ]
+    result = result[pd.to_numeric(result["signal_score"], errors="coerce").fillna(0) > 0]
     result = result.sort_values(
         ["signal_score", "ticker"], ascending=[False, True]
     ).head(params.top_n)
@@ -612,10 +583,6 @@ def run_backtest_pipeline(
         prices=prices,
     )
 
-    # Consensus replay is a public-disclosure rule. Historical outcome labels
-    # are evaluation data, not decision inputs, so do not build them here.
-    signals = pd.DataFrame()
-
     all_results = []
     date_observations = []
     # Finding 1 fix: accumulate per-date attrs counts explicitly because
@@ -636,10 +603,8 @@ def run_backtest_pipeline(
             continue
 
         recs = analysis.backtest_recommendations(
-            signals,
             all_transactions,
             as_of_ts,
-            horizon=params.horizon,
             lookback_days=params.lookback_days,
             min_buyers=params.min_buyers,
             top_n=params.top_n,

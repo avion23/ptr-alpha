@@ -1,17 +1,8 @@
-"""Module-level constants for the signals pipeline.
-
-These are module defaults read by ``calculate_signal_potential`` and other
-signal functions. Research sweeps pass ``DECAY_LAMBDA`` explicitly instead of
-changing the module default. The remaining constants are immutable.
-"""
+"""Numerical defaults for retrospective signal diagnostics."""
 
 from typing import Final
 
-# Decay weight per day for the midpoint-weighted return
+# Midpoint-weighted log-return decay. This is retrospective diagnostic math;
+# it does not enter the production consensus score or member ranking.
 DECAY_LAMBDA: float = 0.005
-# Minimum trades for a ticker to qualify for the ticker-history prior
-TICKER_PERF_MIN_TRADES: Final[int] = 3
-
-# Minimum entry price (USD) — signals with entry_price below this are dropped
-MIN_ENTRY_PRICE: Final[float] = 3.0
-_NS_PER_DAY: Final[int] = 86_400_000_000_000  # nanoseconds in a day
+_NS_PER_DAY: Final[int] = 86_400_000_000_000

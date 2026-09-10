@@ -2,8 +2,6 @@
 
 Bug summary:
   #1 SPY double-division in assembly.py (high)
-  #2 NaN-as-loss in dynamic prior in filters.py (medium)
-  #3 NaN-as-miss in hit rates in ranking.py and sales.py (medium)
   #4 Kelly NaN fallback not triggered when avg_loss=NaN (high)
   #5 Sweep objective alpha_slope sign-inversion in sweep.py (critical)
   #6 Missing price windows default to 0.0 instead of NaN (medium)
@@ -71,37 +69,6 @@ class TestSpyDoubleDivision(unittest.TestCase):
             places=3,
             msg=f"decayed_spy_return_pct={dsr:.4f} expected≈{expected:.4f}; "
             "double-division bug may not be fixed",
-        )
-
-
-# ── Bug #3: NaN-as-miss in hit rates ────────────────────────────────────────
-
-
-class TestHitRateNaN(unittest.TestCase):
-    """
-    ranking._hit_rates_by_member used (total_return_pct > 0).mean() on the
-    raw DataFrame including NaN rows.  NaN > 0 is False, so NaN observations
-    were counted as misses in both numerator and denominator.
-
-    Example: Alice with returns [5.0, NaN] → old: 1/2 = 50%, fix: 1/1 = 100%.
-    """
-
-    def test_peak_hit_rate_excludes_nan(self):
-        from analyzer.member_ranking.ranking import _hit_rates_by_member
-
-        purchases = pd.DataFrame(
-            {
-                "member": ["Alice", "Alice"],
-                "peak_potential_pct": [10.0, float("nan")],
-                "total_return_pct": [6.0, float("nan")],
-                "entry_price": [100.0, 100.0],
-                "disclosure_date": pd.to_datetime(["2024-01-01", "2024-02-01"]),
-            }
-        )
-        idx = pd.Index(["Alice"])
-        peak, _ = _hit_rates_by_member(purchases, idx, threshold=5.0)
-        self.assertAlmostEqual(
-            peak.loc["Alice"], 100.0, places=5, msg="peak_hit_rate counted NaN as miss"
         )
 
 

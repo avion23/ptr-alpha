@@ -1,11 +1,4 @@
-"""Score a ticker by its buyer composition.
-
-`score_ticker_by_buyers` combines a ticker's disclosed buyers into a signal.
-The safe default is an identity-free consensus score equal to the number of
-distinct recent buyers. Historical member effects are descriptive,
-noncausal opt-ins; Bayesian probability-times-alpha and solo posterior gates
-are not tradable scores.
-"""
+"""Production consensus scoring from public congressional disclosures."""
 
 from __future__ import annotations
 
@@ -16,14 +9,7 @@ import pandas as pd
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
-from analyzer.member_ranking.lookups import (
-    _build_ranking_dicts,
-    _get_ticker_purchases,
-    _validate_scoring_mode,
-)
-from analyzer.member_ranking.ranking import rank_members
 from analyzer.models import TransactionType
-from analyzer.signals import TICKER_PERF_MIN_TRADES
 from analyzer.ticker_resolver import TickerResolver
 
 CONSENSUS_SCORER_PROVENANCE = "identity_free_distinct_buyer_count_v2"
@@ -76,95 +62,44 @@ _UNSUPPORTED_ASSET_RE = re.compile(
 def score_ticker_by_buyers(
     ticker: str,
     transactions_df: pd.DataFrame,
-    signals_df: pd.DataFrame | None = None,
-    horizon: int = 90,
-    threshold: float = 5.0,
-    member_rankings: pd.DataFrame | None = None,
     min_buyers: int = CONSENSUS_MIN_BUYERS,
-    ticker_perf_signals: pd.DataFrame | None = None,
-    _ranking_dicts: dict | None = None,
-    scoring_mode: str = "consensus",
-    as_of_date: pd.Timestamp | None = None,
+    *,
+    as_of_date: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Score a ticker by its buyer composition. Memoized via @df_memoize.
-
-    When ``_ranking_dicts`` is provided (pre-built by the caller), dict
-    lookups replace DataFrame linear scans for buyer stats.
-    """
-    _validate_scoring_mode(scoring_mode)
-    _validate_inputs(signals_df, transactions_df, scoring_mode)
-
-    if scoring_mode == "consensus" and as_of_date is None:
-        raise AnalysisError("consensus scoring requires an explicit as_of_date")
-    if scoring_mode == "consensus" and pd.isna(pd.Timestamp(as_of_date)):
+    """Return the identity-free distinct-buyer production score."""
+    as_of = pd.Timestamp(as_of_date)
+    if pd.isna(as_of):
         raise AnalysisError("consensus as_of_date must be a valid timestamp")
-    if scoring_mode != "consensus" and member_rankings is None:
-        member_rankings = rank_members(signals_df, horizon, threshold)
 
-    if scoring_mode == "consensus":
-        normalized_ticker = _validate_ticker(ticker)
-        ticker_trades = _get_consensus_ticker_purchases(
-            normalized_ticker, transactions_df
-        )
-        disclosure_dates = pd.to_datetime(
-            ticker_trades["disclosure_date"], errors="coerce"
-        )
-        ticker_trades = ticker_trades[
-            disclosure_dates.notna() & (disclosure_dates <= pd.Timestamp(as_of_date))
-        ].copy()
-    else:
-        ticker_trades = _get_ticker_purchases(ticker, transactions_df).copy()
+    normalized_ticker = _validate_ticker(ticker)
+    ticker_trades = _get_consensus_ticker_purchases(normalized_ticker, transactions_df)
     if ticker_trades.empty:
-        return _empty_ticker_result(ticker)
+        return _empty_ticker_result(normalized_ticker)
 
-    canonicalizer = (
+    disclosure_dates = pd.to_datetime(ticker_trades["disclosure_date"], errors="coerce")
+    ticker_trades = ticker_trades[
+        disclosure_dates.notna() & (disclosure_dates <= as_of)
+    ].copy()
+    if ticker_trades.empty:
+        return _empty_ticker_result(normalized_ticker)
+
+    ticker_trades["_member_canonical"] = ticker_trades["member"].map(
         _canonical_member_or_blank
-        if scoring_mode == "consensus"
-        else canonical_member_key
     )
-    ticker_trades["_member_canonical"] = ticker_trades["member"].map(canonicalizer)
-    if scoring_mode == "consensus":
-        ticker_trades = ticker_trades[ticker_trades["_member_canonical"].ne("")].copy()
-        if ticker_trades.empty:
-            return _empty_ticker_result(ticker)
+    ticker_trades = ticker_trades[ticker_trades["_member_canonical"].ne("")].copy()
+    if ticker_trades.empty:
+        return _empty_ticker_result(normalized_ticker)
 
-    min_trades = ticker_trades["_member_canonical"].nunique()
-    if min_trades < min_buyers:
-        return _below_threshold_result(ticker, min_trades, min_buyers)
+    buyers = sorted(ticker_trades["_member_canonical"].unique())
+    if len(buyers) < min_buyers:
+        return _below_threshold_result(normalized_ticker, len(buyers), min_buyers)
 
-    buyers = ticker_trades["_member_canonical"].unique()
-    if scoring_mode == "consensus":
-        alpha_dict = {}
-        inputs = _consensus_inputs(
-            buyers, ticker_trades, as_of_date=pd.Timestamp(as_of_date)
-        )
-    else:
-        rd = (
-            _ranking_dicts
-            if _ranking_dicts is not None
-            else _build_ranking_dicts(member_rankings, scoring_mode=scoring_mode)
-        )
-        dict_mode = rd.get("mode")
-        if dict_mode != scoring_mode:
-            raise AnalysisError(
-                "_ranking_dicts must declare the same validated scoring_mode"
-            )
-        alpha_dict = rd["alpha"]
-        trades_dict = rd["trades"]
-        fallback = _member_only_inputs(
-            ticker,
-            buyers,
-            alpha_dict,
-            trades_dict,
-            ticker_trades,
-            signals_df,
-            ticker_perf_signals,
-        )
-        if isinstance(fallback, pd.DataFrame):
-            return fallback
-        inputs = fallback
-    inputs["scoring_mode"] = scoring_mode
-    return _final_result(ticker, buyers, inputs, alpha_dict)
+    return _consensus_result(
+        normalized_ticker,
+        buyers,
+        ticker_trades,
+        as_of_date=as_of,
+    )
 
 
 def _validate_ticker(ticker: str) -> str:
@@ -439,24 +374,13 @@ def _canonical_member_or_blank(value) -> str:
     return canonical_member_key(value)
 
 
-def _validate_inputs(
-    signals_df: pd.DataFrame | None,
-    transactions_df: pd.DataFrame,
-    scoring_mode: str,
-) -> None:
-    if transactions_df.empty and scoring_mode != "consensus":
-        raise AnalysisError("Empty transactions dataframe")
-    if scoring_mode != "consensus" and (signals_df is None or signals_df.empty):
-        raise AnalysisError("Historical scoring requires a non-empty signal dataframe")
-
-
 def _empty_ticker_result(ticker: str) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "ticker": [ticker],
             "num_buyers": [0],
             "signal_score": [0.0],
-            "signal_score_raw": [0.0],
+            "scorer_provenance": [CONSENSUS_SCORER_PROVENANCE],
         }
     )
 
@@ -469,178 +393,50 @@ def _below_threshold_result(
             "ticker": [ticker],
             "num_buyers": [min_trades],
             "signal_score": [0.0],
-            "signal_score_raw": [0.0],
+            "scorer_provenance": [CONSENSUS_SCORER_PROVENANCE],
             "note": [f"Below minimum buyer threshold ({min_buyers})"],
         }
     )
 
 
-def _consensus_inputs(
-    buyers, ticker_trades: pd.DataFrame, *, as_of_date: pd.Timestamp
-) -> dict:
-    """Build an identity-free distinct-buyer count.
-
-    Candidate selection already applies the public disclosure window. Names,
-    historical returns, trade counts, and member posteriors do not enter the
-    score, so permuting member identities leaves it unchanged.
-    """
-    member_col = "_member_canonical"
+def _consensus_result(
+    ticker: str,
+    buyers: list[str],
+    ticker_trades: pd.DataFrame,
+    *,
+    as_of_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Build the identity-free distinct-buyer production result."""
     with_disclosures = ticker_trades.copy()
     with_disclosures["_disclosure"] = pd.to_datetime(
         with_disclosures["disclosure_date"], errors="coerce"
     )
     disclosures = (
-        with_disclosures.groupby(member_col)["_disclosure"].max().reindex(buyers)
+        with_disclosures.groupby("_member_canonical")["_disclosure"]
+        .max()
+        .reindex(buyers)
     )
     days_since = (as_of_date - disclosures).dt.days
     if days_since.isna().any() or (days_since < 0).any():
-        raise AnalysisError(
-            "Consensus disclosures must be known on or before as_of_date"
-        )
-    transaction_dates = pd.to_datetime(
-        ticker_trades["transaction_date"], errors="coerce"
-    )
-    row_disclosures = pd.to_datetime(
-        ticker_trades["disclosure_date"], errors="coerce"
-    )
+        raise AnalysisError("Consensus disclosures must be known on or before as_of_date")
+
+    transaction_dates = pd.to_datetime(ticker_trades["transaction_date"], errors="coerce")
+    row_disclosures = pd.to_datetime(ticker_trades["disclosure_date"], errors="coerce")
     disclosure_lag_days = (row_disclosures - transaction_dates).dt.days
     if disclosure_lag_days.isna().any() or (disclosure_lag_days < 0).any():
         raise AnalysisError("Consensus purchases require valid public chronology")
 
     score = float(len(buyers))
-    return {
-        "base_signal_score": score,
-        "rated_buyers_list": list(buyers),
-        "best_rank": 1.0,
-        "total_trades": len(buyers),
-        "rated_buyers": len(buyers),
-        "quality_adjusted_avg": score,
-        "max_trade_to_disclosure_days": int(disclosure_lag_days.max()),
-        "median_trade_to_disclosure_days": float(disclosure_lag_days.median()),
-        "oldest_transaction_date": transaction_dates.min().date(),
-        "latest_disclosure_date": row_disclosures.max().date(),
-    }
-
-
-def _member_only_inputs(
-    ticker,
-    buyers,
-    alpha_dict,
-    trades_dict,
-    ticker_trades,
-    signals_df,
-    ticker_perf_signals,
-):
-    rated_buyers_list = [m for m in buyers if m in alpha_dict]
-    if not rated_buyers_list:
-        return _ticker_history_fallback(ticker, buyers, signals_df, ticker_perf_signals)
-
-    best_rank = max(alpha_dict[m] for m in rated_buyers_list)
-    total_trades = sum(trades_dict.get(m, 0) for m in rated_buyers_list)
-    rated_buyers = len(rated_buyers_list)
-
-    alpha_values = [alpha_dict[m] for m in rated_buyers_list]
-    quality_adjusted_avg = sum(alpha_values) / len(alpha_values)
-
-    return {
-        "base_signal_score": quality_adjusted_avg,
-        "rated_buyers_list": rated_buyers_list,
-        "best_rank": best_rank,
-        "total_trades": total_trades,
-        "rated_buyers": rated_buyers,
-        "quality_adjusted_avg": quality_adjusted_avg,
-    }
-
-
-def _ticker_history_fallback(ticker, buyers, signals_df, ticker_perf_signals):
-    fallback_score = 0.0
-    fallback_source = "none"
-    perf_signals = (
-        ticker_perf_signals if ticker_perf_signals is not None else signals_df
-    )
-    if not perf_signals.empty and "ticker" in perf_signals.columns:
-        ticker_hist = perf_signals[
-            (perf_signals["ticker"] == ticker)
-            & (perf_signals["signal_type"] == TransactionType.PURCHASE.value)
-            & (perf_signals["total_spy_alpha_pct"].notna())
-        ]
-        if "window_complete" in ticker_hist.columns:
-            ticker_hist = ticker_hist[
-                ticker_hist["window_complete"].fillna(False).astype(bool)
-            ]
-        if len(ticker_hist) >= TICKER_PERF_MIN_TRADES:
-            fallback_score = float(ticker_hist["total_spy_alpha_pct"].mean())
-            fallback_source = f"ticker_hist({len(ticker_hist)})"
-
     return pd.DataFrame(
         {
             "ticker": [ticker],
             "num_buyers": [len(buyers)],
             "buyers": [", ".join(buyers[:3])],
-            "signal_score": [round(fallback_score, 2)],
-            "signal_score_raw": [fallback_score],
-            "fallback_source": [fallback_source],
+            "signal_score": [score],
+            "scorer_provenance": [CONSENSUS_SCORER_PROVENANCE],
+            "max_trade_to_disclosure_days": [int(disclosure_lag_days.max())],
+            "median_trade_to_disclosure_days": [float(disclosure_lag_days.median())],
+            "oldest_transaction_date": [transaction_dates.min().date()],
+            "latest_disclosure_date": [row_disclosures.max().date()],
         }
     )
-
-
-def _final_result(
-    ticker,
-    buyers,
-    inputs,
-    alpha_dict,
-) -> pd.DataFrame:
-    base_signal_score = inputs["base_signal_score"]
-    rated_buyers_list = inputs["rated_buyers_list"]
-    signal_score_raw = base_signal_score
-    scoring_mode = inputs.get("scoring_mode", "custom")
-    top_buyers = _top_buyers_for_label(buyers, rated_buyers_list, alpha_dict)
-
-    result = {
-        "ticker": [ticker],
-        "num_buyers": [len(buyers)],
-        "buyers": [", ".join(top_buyers)],
-        "base_signal_score": [round(base_signal_score, 2)],
-        "signal_score": [round(signal_score_raw, 2)],
-        "signal_score_raw": [signal_score_raw],
-        "fallback_source": [scoring_mode if scoring_mode != "custom" else "member_ranked"],
-        "scoring_mode": [scoring_mode],
-        "scorer_provenance": [
-            CONSENSUS_SCORER_PROVENANCE
-            if scoring_mode == "consensus"
-            else "descriptive_member_skill_v1"
-        ],
-    }
-    if scoring_mode == "consensus":
-        result.update(
-            max_trade_to_disclosure_days=[inputs["max_trade_to_disclosure_days"]],
-            median_trade_to_disclosure_days=[
-                inputs["median_trade_to_disclosure_days"]
-            ],
-            oldest_transaction_date=[inputs["oldest_transaction_date"]],
-            latest_disclosure_date=[inputs["latest_disclosure_date"]],
-        )
-        return pd.DataFrame(result)
-
-    result.update(
-        rated_buyers=[inputs["rated_buyers"]],
-        buyer_label=[_buyer_label(len(top_buyers), len(buyers))],
-        avg_buyer_performance=[round(inputs["quality_adjusted_avg"], 2)],
-        best_buyer_performance=[round(inputs["best_rank"], 2)],
-        total_buyer_trades=[int(inputs["total_trades"])],
-    )
-    return pd.DataFrame(result)
-
-
-def _top_buyers_for_label(buyers, rated_buyers_list, alpha_dict) -> list:
-    if not rated_buyers_list:
-        return list(buyers[:3])
-    if not alpha_dict:
-        return list(rated_buyers_list[:3])
-    return sorted(rated_buyers_list, key=lambda m: alpha_dict.get(m, 0), reverse=True)[
-        :3
-    ]
-
-
-def _buyer_label(num_top: int, num_buyers: int) -> str:
-    return f"Top {num_top} of {num_buyers}" if num_buyers > 3 else f"{num_buyers}"

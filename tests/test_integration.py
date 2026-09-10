@@ -54,10 +54,8 @@ class TestIntegration(unittest.TestCase):
         price_source = YFinancePriceSource(self.settings)
 
         params = AnalysisParams(
-            source="house",
             year=2024,
-            horizons=[90],
-            threshold=5.0,
+            horizons=(90,),
             top_n=10,
         )
 
@@ -71,10 +69,8 @@ class TestIntegration(unittest.TestCase):
         price_source = YFinancePriceSource(self.settings)
 
         params = AnalysisParams(
-            source="house",
             year=2024,
-            horizons=[30, 90],
-            threshold=5.0,
+            horizons=(30, 90),
             member_filter="Alice Smith",
             mode=AnalysisMode.MEMBER_SIGNALS,
             top_n=5,

@@ -247,7 +247,7 @@ def calculate_signal_potential(
         result_arrays,
     )
 
-    return _assemble_result_dataframe(signals, metadata, result_arrays)
+    return assemble_result_dataframe(signals, metadata, result_arrays)
 
 
 # ── Pipeline helpers (private) ──────────────────────────────────────────
@@ -472,55 +472,3 @@ def _compute_all_ticker_signals(
             result_arrays["r_exit_date"],
             result_arrays["r_label_window_end"],
         )
-
-
-def _assemble_result_dataframe(
-    signals: pd.DataFrame, metadata: dict, result_arrays: dict
-) -> pd.DataFrame:
-    """Backward-compat thin wrapper that delegates to ``assembly.py``."""
-    return assemble_result_dataframe(signals, metadata, result_arrays)
-
-
-def compute_signal_potential_with_member_decay(
-    entry_prices_df: pd.DataFrame,
-    prices_df: pd.DataFrame,
-    horizons: list[int] | None = None,
-    member_decay_map: dict[str, float] | None = None,
-) -> pd.DataFrame:
-    """Compute signal potential with per-member decay rates.
-
-    If member_decay_map is provided, each member's trades use their
-    personal decay lambda instead of the global default.
-    """
-    if horizons is None:
-        horizons = [30, 60, 90, 180]
-    if member_decay_map is None or not member_decay_map:
-        return calculate_signal_potential(entry_prices_df, prices_df, horizons)
-
-    all_members = entry_prices_df["member"].unique()
-    default_members = [m for m in all_members if m not in member_decay_map]
-    custom_members = [m for m in all_members if m in member_decay_map]
-
-    results = []
-    if default_members:
-        default_df = entry_prices_df[entry_prices_df["member"].isin(default_members)]
-        if not default_df.empty:
-            results.append(calculate_signal_potential(default_df, prices_df, horizons))
-
-    for member in custom_members:
-        member_df = entry_prices_df[entry_prices_df["member"] == member]
-        if member_df.empty:
-            continue
-        member_lambda = member_decay_map[member]
-        member_signals = calculate_signal_potential(
-            member_df,
-            prices_df,
-            horizons,
-            decay_lambda=member_lambda,
-        )
-        results.append(member_signals)
-
-    if not results:
-        return pd.DataFrame()
-
-    return pd.concat(results, ignore_index=True)

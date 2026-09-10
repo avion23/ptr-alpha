@@ -1,9 +1,4 @@
-"""Top signals: highest-conviction purchase signals and per-member signals.
-
-`get_top_signals` returns the global top N by endpoint SPY alpha.
-`get_member_signals` returns the top N for a single member. Both apply
-the same quality filter before ranking.
-"""
+"""Descriptive historical purchase outcomes."""
 
 from __future__ import annotations
 
@@ -11,53 +6,43 @@ import pandas as pd
 
 from analyzer.exceptions import AnalysisError
 from analyzer.models import TransactionType
-
-from analyzer.signals.constants import MIN_ENTRY_PRICE
-from analyzer.signals.filters import (
-    _apply_quality_filter,
-    _collapse_to_episodes,
-    _get_horizon_data,
-)
+from analyzer.signals.filters import _collapse_to_episodes, _get_horizon_data
 
 
 _TOP_COLS = [
     "member",
     "ticker",
     "disclosure_date",
-    "spy_alpha_pct",
-    "peak_potential_pct",
     "total_return_pct",
     "total_spy_alpha_pct",
-    "signal_score",
 ]
 _MEMBER_TOP_COLS = [
     "ticker",
     "disclosure_date",
-    "spy_alpha_pct",
-    "peak_potential_pct",
     "total_return_pct",
     "total_spy_alpha_pct",
-    "signal_score",
 ]
+
+
+def _completed_purchases(signals_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    purchases = _get_horizon_data(
+        signals_df, horizon, TransactionType.PURCHASE.value
+    ).copy()
+    if purchases.empty:
+        raise AnalysisError(f"No completed purchase signals found for horizon {horizon}")
+    if "total_spy_alpha_pct" not in purchases.columns:
+        raise AnalysisError("Historical purchase outcomes require endpoint SPY alpha")
+    purchases = _collapse_to_episodes(purchases)
+    return purchases[purchases["total_spy_alpha_pct"].notna()].copy()
 
 
 def _get_top_signals(
     signals_df: pd.DataFrame, horizon: int = 90, top_n: int = 15
 ) -> pd.DataFrame:
-    top_data = _get_horizon_data(signals_df, horizon, TransactionType.PURCHASE.value)
-    if top_data.empty:
-        raise AnalysisError(f"No purchase signals found for horizon {horizon}")
-
-    top_data = _apply_quality_filter(top_data)
-    if top_data.empty:
-        raise AnalysisError(
-            f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})"
-        )
-
-    top_data = _collapse_to_episodes(top_data, max_gap_days=0)
-    top_data["signal_score"] = _compute_conviction_score(top_data)
-    top_data = top_data[top_data["signal_score"] > 0]
-    return top_data.nlargest(top_n, "signal_score")[_TOP_COLS]
+    purchases = _completed_purchases(signals_df, horizon)
+    if purchases.empty:
+        raise AnalysisError("No complete endpoint purchase outcomes found")
+    return purchases.nlargest(top_n, "total_spy_alpha_pct")[_TOP_COLS]
 
 
 def _get_member_signals(
@@ -66,29 +51,13 @@ def _get_member_signals(
     horizon: int = 90,
     top_n: int = 5,
 ) -> pd.DataFrame:
-    member_data = _get_horizon_data(signals_df, horizon)
-    member_data = member_data[member_data["member"] == member]
-
-    if member_data.empty:
-        raise AnalysisError(
-            f"No signals found for member {member} at horizon {horizon}"
-        )
-
-    purchases = member_data[
-        member_data["signal_type"] == TransactionType.PURCHASE.value
-    ]
+    purchases = _completed_purchases(signals_df, horizon)
+    purchases = purchases[purchases["member"] == member]
     if purchases.empty:
         raise AnalysisError(
-            f"No purchase signals for member {member} at horizon {horizon}"
+            f"No complete purchase outcomes for member {member} at horizon {horizon}"
         )
-
-    purchases = _apply_quality_filter(purchases)
-    if purchases.empty:
-        raise AnalysisError(f"No signals survived quality filter for {member}")
-
-    purchases = _collapse_to_episodes(purchases, max_gap_days=0)
-    purchases["signal_score"] = _compute_conviction_score(purchases)
-    return purchases.nlargest(top_n, "signal_score")[_MEMBER_TOP_COLS]
+    return purchases.nlargest(top_n, "total_spy_alpha_pct")[_MEMBER_TOP_COLS]
 
 
 def get_top_signals(
@@ -108,8 +77,3 @@ def get_member_signals(
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")
     return _get_member_signals(signal_df, member, horizon, top_n)
-
-
-def _compute_conviction_score(df: pd.DataFrame) -> pd.Series:
-    """Use endpoint SPY alpha directly; do not double-count stock return."""
-    return df["total_spy_alpha_pct"].fillna(0)

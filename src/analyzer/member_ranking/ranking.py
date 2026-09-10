@@ -1,238 +1,71 @@
-"""Descriptive member ranking from completed purchase outcomes."""
+"""Descriptive member ranking from completed public purchase episodes."""
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
-from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
-from analyzer.models import TransactionType
 from analyzer.member_ranking.bayes import normal_normal_posteriors
-from analyzer.signals import (
-    MIN_ENTRY_PRICE,
-    _apply_quality_filter,
-    _collapse_to_episodes,
-    _get_horizon_data,
-)
+from analyzer.models import TransactionType
+from analyzer.signals.filters import _collapse_to_episodes, _get_horizon_data
 
 
-def rank_members(
-    signal_df: pd.DataFrame,
-    horizon: int = 90,
-    threshold: float = 5.0,
-) -> pd.DataFrame:
-    """Rank members by empirically pooled endpoint SPY alpha."""
+def rank_members(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
+    """Rank members by partially pooled endpoint SPY alpha.
+
+    Each observation is one completed member/ticker/disclosure-date episode.
+    Returns and hit rates use the exact executable endpoint labels; transaction
+    size, owner, path-dependent peak return, decay weights, and pseudo-counts do
+    not enter the member statistic.
+    """
     if signal_df.empty:
         raise AnalysisError("Empty signals dataframe")
-    return _rank_members_impl(signal_df, horizon, threshold)
 
-
-@df_memoize(copy=False)
-def _prepare_member_data(
-    signal_df: pd.DataFrame,
-    horizon: int,
-) -> pd.DataFrame:
-    """Prepare completed, quality-filtered purchase episodes."""
-    purchases = _get_horizon_data(signal_df, horizon, TransactionType.PURCHASE.value)
+    purchases = _get_horizon_data(
+        signal_df, horizon, TransactionType.PURCHASE.value
+    ).copy()
     if purchases.empty:
-        raise AnalysisError(f"No purchase signals found for horizon {horizon}")
+        raise AnalysisError(f"No completed purchase signals found for horizon {horizon}")
 
-    purchases = _apply_quality_filter(purchases)
-    if purchases.empty:
+    required = {"member", "ticker", "disclosure_date", "total_return_pct", "total_spy_alpha_pct"}
+    missing = required - set(purchases.columns)
+    if missing:
         raise AnalysisError(
-            f"No signals survived quality filter (min price ${MIN_ENTRY_PRICE})"
+            f"Member ranking requires endpoint outcome columns: {sorted(missing)}"
         )
 
-    return _collapse_to_episodes(purchases)
-
-
-@df_memoize(copy=False)
-def _rank_members_impl(
-    signal_df: pd.DataFrame,
-    horizon: int,
-    threshold: float,
-) -> pd.DataFrame:
-    purchases = _prepare_member_data(signal_df, horizon)
-
-    outcome_col = "total_spy_alpha_pct"
-    if outcome_col not in purchases.columns:
-        raise AnalysisError(
-            "Member ranking requires endpoint SPY alpha; total_spy_alpha_pct is missing"
-        )
-    purchases = purchases[purchases[outcome_col].notna()].copy()
+    purchases = _collapse_to_episodes(purchases)
+    purchases = purchases.dropna(subset=["member", "total_return_pct", "total_spy_alpha_pct"])
     if purchases.empty:
-        raise AnalysisError("No complete endpoint SPY-alpha outcomes found")
+        raise AnalysisError("No complete endpoint purchase outcomes found")
 
-    grp = purchases.groupby("member")
-    ret_agg = _aggregate_returns(grp, outcome_col)
-    if ret_agg.empty:
-        return pd.DataFrame()
+    grouped = purchases.groupby("member", sort=True)
+    episode_count = grouped.size().astype(int)
+    avg_return = grouped["total_return_pct"].mean()
+    avg_alpha = grouped["total_spy_alpha_pct"].mean()
+    avg_spy_return = avg_return - avg_alpha
+    positive_return_rate = grouped["total_return_pct"].apply(lambda values: float((values > 0).mean()))
+    positive_alpha_rate = grouped["total_spy_alpha_pct"].apply(lambda values: float((values > 0).mean()))
 
-    idx = ret_agg.index
-    n = ret_agg["ret_nonnan"].astype(int)
-    wins = _wins_by_member(purchases, idx, outcome_col)
-    stats = _compute_observed_stats(n, wins, ret_agg)
-    avg_spy, avg_total_spy = _spy_alpha_by_member(purchases, grp, idx)
-    hit_rates = _hit_rates_by_member(purchases, idx, threshold)
-    (
-        shrunk_alpha,
-        shrunk_alpha_std,
-        alpha_shrinkage,
-        alpha_effective_information,
-    ) = _shrunk_alpha_by_member(grp, outcome_col, idx)
-
-    avg_realized = (
-        grp["total_return_pct"].mean().reindex(idx).fillna(0.0)
-        if "total_return_pct" in purchases.columns
-        else pd.Series(0.0, index=idx)
-    )
-
-    result = _build_ranking_result(
-        idx,
-        ret_agg,
-        stats,
-        avg_spy,
-        avg_total_spy,
-        hit_rates,
-        shrunk_alpha,
-        shrunk_alpha_std,
-        alpha_shrinkage,
-        alpha_effective_information,
-        avg_realized,
-    )
-    return _finalize_ranking(result)
-
-
-def _aggregate_returns(grp, outcome_col: str) -> pd.DataFrame:
-    diagnostic_col = (
-        "decayed_return_pct" if "decayed_return_pct" in grp.obj.columns else outcome_col
-    )
-    ret_agg = grp[diagnostic_col].agg(
-        ret_nonnan="count",
-        median_ret="median",
-        mean_ret="mean",
-        std_ret="std",
-    )
-    ret_agg["ret_nonnan"] = grp[outcome_col].count().reindex(ret_agg.index)
-    ret_agg = ret_agg[ret_agg["ret_nonnan"] > 0]
-    if not ret_agg.empty:
-        ret_agg["std_ret"] = ret_agg["std_ret"].fillna(0.0)
-    return ret_agg
-
-
-def _wins_by_member(purchases: pd.DataFrame, idx, outcome_col: str) -> pd.Series:
-    """Count profitable endpoint excess-alpha episodes per member."""
-    return (
-        (purchases[outcome_col] > 0)
-        .groupby(purchases["member"])
-        .sum()
-        .reindex(idx, fill_value=0)
-        .astype(int)
-    )
-
-
-def _compute_observed_stats(n, wins, ret_agg: pd.DataFrame):
-    n_vals = n.values.astype(float)
-    wins_f = wins.values.astype(float)
-    sharpe = np.where(
-        ret_agg["std_ret"] > 0, ret_agg["mean_ret"] / ret_agg["std_ret"], 0.0
-    )
-    return {"sharpe": sharpe, "prob_up": wins_f / n_vals}
-
-
-def _spy_alpha_by_member(purchases: pd.DataFrame, grp, idx):
-    avg_spy = grp["spy_alpha_pct"].mean().reindex(idx).fillna(0.0)
-    if "total_spy_alpha_pct" in purchases.columns:
-        avg_total_spy = grp["total_spy_alpha_pct"].mean().reindex(idx)
-        avg_total_spy = avg_total_spy.fillna(avg_spy)
-    else:
-        avg_total_spy = avg_spy.copy()
-    return avg_spy, avg_total_spy
-
-
-def _hit_rates_by_member(purchases: pd.DataFrame, idx, threshold: float | None):
-    """Returns (peak_hits_series, realized_hits_series_or_None), or None when
-    threshold is None. realized_hits is None when total_return_pct isn't
-    available, so callers can distinguish the two."""
-    if threshold is None:
-        return None
-    # Bug #3: (NaN > threshold) evaluates to False in pandas, so NaN rows
-    # were counted as misses in both numerator and denominator.  Restrict to
-    # non-NaN rows before computing per-member means.
-    valid_peak = purchases[purchases["peak_potential_pct"].notna()]
-    peak_hits = (valid_peak["peak_potential_pct"] > threshold).groupby(
-        valid_peak["member"]
-    ).mean().reindex(idx) * 100
-    realized_hits = None
-    if "total_return_pct" in purchases.columns:
-        # Bug #3: same NaN-as-miss problem for realized returns.
-        valid_ret = purchases[purchases["total_return_pct"].notna()]
-        realized_hits = (valid_ret["total_return_pct"] > 0).groupby(
-            valid_ret["member"]
-        ).mean().reindex(idx) * 100
-    return peak_hits, realized_hits
-
-
-def _shrunk_alpha_by_member(grp, alpha_col: str, idx):
-    """Return one empirical normal-normal member estimate."""
-    frame = grp.obj[["member", alpha_col]].dropna()
     fit = normal_normal_posteriors(
-        frame[alpha_col].to_numpy(dtype=float),
-        frame["member"].to_numpy(dtype=object),
-    ).reindex(idx)
-    return (
-        fit["posterior_mean"],
-        fit["posterior_std"],
-        fit["shrinkage"],
-        fit["effective_information"],
-    )
+        purchases["total_spy_alpha_pct"].to_numpy(dtype=float),
+        purchases["member"].to_numpy(dtype=object),
+    ).reindex(episode_count.index)
 
-
-def _build_ranking_result(
-    idx,
-    ret_agg,
-    stats,
-    avg_spy,
-    avg_total_spy,
-    hit_rates,
-    shrunk_alpha,
-    shrunk_alpha_std,
-    alpha_shrinkage,
-    alpha_effective_information,
-    avg_realized,
-):
     result = pd.DataFrame(
         {
-            "member": idx,
-            "median_return_pct": np.round(ret_agg["median_ret"].values, 2),
-            "mean_return_pct": np.round(ret_agg["mean_ret"].values, 2),
-            "trades": ret_agg["ret_nonnan"].astype(int).values,
-            "sharpe_ratio": np.round(stats["sharpe"], 3),
-            "prob_up": np.round(stats["prob_up"], 3),
-            "avg_return_pct": np.round(avg_realized.values, 2),
-            "avg_spy_alpha_pct": np.round(avg_spy.values, 2),
-            "avg_total_spy_alpha_pct": np.round(avg_total_spy.values, 2),
+            "member": episode_count.index,
+            "purchase_episodes": episode_count.to_numpy(),
+            "avg_return_pct": avg_return.to_numpy(dtype=float),
+            "avg_spy_return_pct": avg_spy_return.to_numpy(dtype=float),
+            "avg_spy_alpha_pct": avg_alpha.to_numpy(dtype=float),
+            "positive_return_rate": positive_return_rate.to_numpy(dtype=float),
+            "positive_alpha_rate": positive_alpha_rate.to_numpy(dtype=float),
+            "shrunk_alpha_pct": fit["posterior_mean"].to_numpy(dtype=float),
+            "shrunk_alpha_std_pct": fit["posterior_std"].to_numpy(dtype=float),
+            "alpha_shrinkage": fit["shrinkage"].to_numpy(dtype=float),
         }
     )
-    if hit_rates is not None:
-        peak_hits, realized_hits = hit_rates
-        result["peak_hit_rate_pct"] = np.round(peak_hits.values, 2)
-        if realized_hits is not None:
-            result["realized_hit_rate_pct"] = np.round(realized_hits.values, 2)
-    result["shrunk_alpha"] = shrunk_alpha.values
-    result["shrunk_alpha_std"] = shrunk_alpha_std.values
-    result["alpha_shrinkage"] = alpha_shrinkage.values
-    result["alpha_effective_information"] = alpha_effective_information.values
-    return result
-
-
-def _finalize_ranking(result: pd.DataFrame) -> pd.DataFrame:
-    return result.rename(
-        columns={
-            "mean_return_pct": "avg_decay_return_pct",
-            "median_return_pct": "median_decay_return_pct",
-            "trades": "purchase_trades",
-            "prob_up": "prob_up_given_buy",
-        }
-    ).sort_values("shrunk_alpha", ascending=False)
+    return result.sort_values(
+        ["shrunk_alpha_pct", "member"], ascending=[False, True]
+    ).reset_index(drop=True)

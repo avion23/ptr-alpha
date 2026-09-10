@@ -175,10 +175,8 @@ def _test_window_recommendations(
         test_start, test_effective_end, freq=f"{frequency_days}D"
     ):
         recs = backtest_recommendations(
-            pd.DataFrame(),
             all_tx,
             as_of_date=pd.Timestamp(as_of),
-            horizon=int(config["horizon"]),
             lookback_days=lookback_days,
             min_buyers=int(config["min_buyers"]),
             top_n=int(config["top_n"]),

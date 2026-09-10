@@ -1,19 +1,8 @@
-"""Filters, episode collapsing, and dynamic-prior estimation.
-
-`_get_horizon_data` and `_apply_quality_filter` are cheap per-call filters.
-`_collapse_to_episodes` aggregates same-member/same-ticker signals within a
-14-day window into one row. `_compute_dynamic_prior` returns a clipped global
-up-rate for consumers that need one shared prior.
-"""
+"""Completed-horizon filtering and public-event episode deduplication."""
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
-
-from analyzer.models import TransactionType
-
-from analyzer.signals.constants import MIN_ENTRY_PRICE
 
 
 def _get_horizon_data(
@@ -21,154 +10,34 @@ def _get_horizon_data(
 ) -> pd.DataFrame:
     mask = signals_df["horizon_days"] == horizon
     if transaction_type is not None:
-        mask = mask & (signals_df["signal_type"] == transaction_type)
+        mask &= signals_df["signal_type"] == transaction_type
     if "window_complete" in signals_df.columns:
-        mask = mask & signals_df["window_complete"].fillna(False).astype(bool)
+        mask &= signals_df["window_complete"].fillna(False).astype(bool)
     return signals_df.loc[mask]
 
 
-def _apply_quality_filter(signals_df: pd.DataFrame) -> pd.DataFrame:
-    if "entry_price" not in signals_df.columns:
-        return signals_df
-    entry = signals_df["entry_price"]
-    return signals_df[entry.notna() & (entry >= MIN_ENTRY_PRICE)]
+def _collapse_to_episodes(signals_df: pd.DataFrame) -> pd.DataFrame:
+    """Keep one observation per public member/ticker/disclosure event.
 
-
-def _compute_dynamic_prior(signals_df: pd.DataFrame, horizon: int) -> float:
-    horizon_signals = _get_horizon_data(
-        signals_df, horizon, TransactionType.PURCHASE.value
-    )
-    if horizon_signals.empty:
-        return 0.50
-    # Bug #2: NaN decayed_return_pct was previously treated as a loss because
-    # (NaN > 0) evaluates to False in pandas.  Exclude NaN from both the
-    # numerator (wins) and denominator (total) so missing price windows do not
-    # bias the market-wide up-rate.
-    valid = horizon_signals["decayed_return_pct"].dropna()
-    if len(valid) == 0:
-        return 0.50
-    up_prob = (valid > 0).mean()
-    return float(np.clip(up_prob, 0.10, 0.90))
-
-
-def _assign_episode_ids(group_sorted: pd.DataFrame, max_gap_days: int) -> np.ndarray:
-    dates = pd.to_datetime(group_sorted["disclosure_date"])
-    if len(dates) <= 1:
-        return np.zeros(len(dates), dtype=np.int64)
-    episode_ids = np.zeros(len(dates), dtype=np.int64)
-    episode_id = 0
-    episode_start = dates.iloc[0]
-    for position in range(1, len(dates)):
-        if (dates.iloc[position] - episode_start).days > max_gap_days:
-            episode_id += 1
-            episode_start = dates.iloc[position]
-        episode_ids[position] = episode_id
-    return episode_ids
-
-
-def _collapse_to_episodes(
-    signals_df: pd.DataFrame, max_gap_days: int = 14
-) -> pd.DataFrame:
-    """Collapse same-member/same-ticker/same-horizon/same-type signals that
-    fall within `max_gap_days` of an episode's start into a weighted-average
-    row. Used by `rank_members`/`_compute_member_stats` to deduplicate
-    rapid-fire buy/sell activity into discrete trading episodes."""
+    Multiple source rows made public for the same member, ticker, date, horizon,
+    and transaction type are one observable episode. Rows on different public
+    dates remain separate observations; no arbitrary calendar-gap or trade-size
+    weighting is applied.
+    """
     if signals_df.empty:
         return signals_df
 
-    group_cols = ["member", "ticker", "horizon_days", "signal_type"]
-    if not all(c in signals_df.columns for c in group_cols):
+    keys = ["member", "ticker", "disclosure_date", "horizon_days", "signal_type"]
+    if not all(column in signals_df.columns for column in keys):
         return signals_df
 
-    if "disclosure_date" not in signals_df.columns:
-        return signals_df
-
-    df = signals_df.sort_values(group_cols + ["disclosure_date"]).reset_index(drop=True)
-    df = _assign_episode_column(df, group_cols, max_gap_days)
-    df = _add_weight_column(df)
-
-    existing_avg_cols = _get_existing_avg_cols(df)
-    df = _add_weighted_columns(df, existing_avg_cols)
-
-    return _aggregate_episodes(df, group_cols, existing_avg_cols, signals_df.columns)
-
-
-def _assign_episode_column(
-    df: pd.DataFrame, group_cols: list[str], max_gap_days: int
-) -> pd.DataFrame:
-    episode_ids = np.zeros(len(df), dtype=np.int64)
-    for positions in df.groupby(group_cols, sort=False).indices.values():
-        episode_ids[positions] = _assign_episode_ids(df.iloc[positions], max_gap_days)
-    df["_episode_id"] = episode_ids
-    return df
-
-
-def _add_weight_column(df: pd.DataFrame) -> pd.DataFrame:
-    if "amount_midpoint" in df.columns:
-        weights = pd.to_numeric(df["amount_midpoint"], errors="coerce")
-        df["_weight"] = weights.fillna(1.0).astype(float)
-    else:
-        df["_weight"] = 1.0
-    return df
-
-
-def _get_existing_avg_cols(df: pd.DataFrame) -> list[str]:
-    avg_cols = [
-        "decayed_return_pct",
-        "spy_alpha_pct",
-        "total_return_pct",
-        "total_spy_alpha_pct",
-        "peak_potential_pct",
-    ]
-    return [c for c in avg_cols if c in df.columns]
-
-
-def _add_weighted_columns(
-    df: pd.DataFrame, existing_avg_cols: list[str]
-) -> pd.DataFrame:
-    for col in existing_avg_cols:
-        values = pd.to_numeric(df[col], errors="coerce")
-        non_nan = values.notna()
-        df[f"_wp_{col}"] = np.where(non_nan, values * df["_weight"], 0.0)
-        df[f"_ws_{col}"] = np.where(non_nan, df["_weight"], 0.0)
-    return df
-
-
-def _aggregate_episodes(
-    df: pd.DataFrame,
-    group_cols: list[str],
-    existing_avg_cols: list[str],
-    orig_df_columns: pd.Index,
-) -> pd.DataFrame:
-    episode_key = group_cols + ["_episode_id"]
-    agg_dict: dict = {
-        "episode_count": ("_weight", "count"),
-        "_weight_sum": ("_weight", "sum"),
-    }
-    for col, func in {
-        "disclosure_date": "min",
-        "entry_price": "first",
-        "amount_midpoint": "sum",
-    }.items():
-        if col in df.columns:
-            agg_dict[col] = (col, func)
-    if "owner_code" in df.columns:
-        # "first" instead of mode — O(N log N) per-group mode dominates cost.
-        # Within episodes (same member/ticker, ≤14d gap), owner_code is
-        # effectively constant, so first() is equivalent.
-        agg_dict["owner_code"] = ("owner_code", "first")
-    for col in existing_avg_cols:
-        agg_dict[col] = (f"_wp_{col}", "sum")
-        agg_dict[f"_ws_{col}"] = (f"_ws_{col}", "sum")
-
-    collapsed = df.groupby(episode_key, sort=False).agg(**agg_dict).reset_index()
-
-    for col in existing_avg_cols:
-        ws = collapsed[f"_ws_{col}"]
-        collapsed[col] = np.where(ws > 0, collapsed[col] / ws, np.nan)
-        collapsed = collapsed.drop(columns=[f"_ws_{col}"])
-
-    collapsed = collapsed.drop(columns=["_weight_sum", "_episode_id"])
-
-    orig_cols = [c for c in orig_df_columns if c in collapsed.columns]
-    return collapsed[orig_cols + ["episode_count"]]
+    frame = signals_df.copy()
+    frame["disclosure_date"] = pd.to_datetime(
+        frame["disclosure_date"], errors="coerce"
+    ).dt.normalize()
+    grouped = frame.groupby(keys, dropna=False, sort=False)
+    counts = grouped["ticker"].transform("size")
+    first = grouped.cumcount().eq(0)
+    result = frame.loc[first].copy()
+    result["episode_count"] = counts.loc[first].to_numpy(dtype=int)
+    return result.reset_index(drop=True)

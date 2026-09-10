@@ -214,10 +214,8 @@ def _backtest_core(
             continue
         try:
             recommendations = analysis.backtest_recommendations(
-                pd.DataFrame(),
                 all_transactions,
                 as_of_date=as_of_ts,
-                horizon=params.horizon,
                 lookback_days=params.lookback_days,
                 min_buyers=params.min_buyers,
                 top_n=params.top_n,

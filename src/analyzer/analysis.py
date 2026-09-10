@@ -1,4 +1,4 @@
-"""Analysis facade — re-exports from focused modules for backward compatibility."""
+"""Analysis entry points shared by the CLI and replay pipeline."""
 
 from __future__ import annotations
 
@@ -6,51 +6,23 @@ import logging
 
 import pandas as pd
 
-from analyzer.models import AnalysisMode, TransactionType  # noqa: F401 — re-exported for backward compat
-
-from analyzer.signals import (  # noqa: F401
-    DECAY_LAMBDA,
-    TICKER_PERF_MIN_TRADES,
-    MIN_ENTRY_PRICE,
-    _price_at_or_before,
-    _price_at_or_near,
-    _price_on_or_before,
-    _get_horizon_data,
-    _apply_quality_filter,
-    _compute_dynamic_prior,
-    _assign_episode_ids,
-    _collapse_to_episodes,
-    _get_top_signals,
-    _get_member_signals,
-    calculate_signal_potential,
-    compute_signal_potential_with_member_decay,
-    get_top_signals,
-    get_member_signals,
-)
-
-from analyzer.member_ranking import (  # noqa: F401
-    bayesian_win_probability,
-    _size_score_factor,
-    _owner_score_factor,
-    _conviction_score,
-    _compute_member_stats,
-    _build_ranking_dicts,
-    rank_members,
-    rank_sales,
-    score_ticker_by_buyers,
-    get_ticker_buyers_with_rankings,
-    estimate_member_decay_lambda,
-    get_member_decay_map,
-)
-
-from analyzer.backtest import (  # noqa: F401
+from analyzer.backtest import (
     backtest_recommendations,
     evaluate_backtest,
     summarize_backtest,
 )
-
-from analyzer.sector_data import load_sector_data
 from analyzer.exceptions import AnalysisError
+from analyzer.member_ranking.buyer_scoring import score_ticker_by_buyers
+from analyzer.member_ranking.ranking import rank_members
+from analyzer.models import AnalysisMode, TransactionType
+from analyzer.sector_data import load_sector_data
+from analyzer.signals import (
+    _get_member_signals,
+    _get_top_signals,
+    calculate_signal_potential,
+    get_member_signals,
+    get_top_signals,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,44 +36,45 @@ def analyze_by_sector(
         return None
 
     sig_with_sector = signals.merge(sectors, on="ticker", how="left")
-
     results = []
     for sector in sectors["sector"].unique():
-        sector_purchases = sig_with_sector[
+        purchases = sig_with_sector[
             (sig_with_sector["sector"] == sector)
             & (sig_with_sector["signal_type"] == TransactionType.PURCHASE.value)
         ]
-        if len(sector_purchases) < 3:
+        if len(purchases) < 3:
             continue
         try:
-            ranked = rank_members(sector_purchases, horizons[0])
-            if not ranked.empty:
-                results.append(
-                    {
-                        "sector": sector,
-                        "top_member": ranked.iloc[0]["member"],
-                        "top_member_alpha": ranked.iloc[0]["avg_spy_alpha_pct"],
-                        "num_trades": len(sector_purchases),
-                        "num_members": sector_purchases["member"].nunique(),
-                    }
-                )
-        except AnalysisError as e:
-            logger.debug("Skipping sector %s: %s", sector, e)
+            ranked = rank_members(purchases, horizons[0])
+        except AnalysisError as exc:
+            logger.debug("Skipping sector %s: %s", sector, exc)
             continue
+        if ranked.empty:
+            continue
+        results.append(
+            {
+                "sector": sector,
+                "top_member": ranked.iloc[0]["member"],
+                "top_member_alpha_pct": ranked.iloc[0]["avg_spy_alpha_pct"],
+                "num_purchase_rows": len(purchases),
+                "num_members": purchases["member"].nunique(),
+            }
+        )
 
     if not results:
         return None
-    return pd.DataFrame(results).sort_values("top_member_alpha", ascending=False)
+    return pd.DataFrame(results).sort_values(
+        ["top_member_alpha_pct", "sector"], ascending=[False, True]
+    )
 
 
 def get_analysis_table(
-    signals_df,
+    signals_df: pd.DataFrame,
     mode: AnalysisMode,
     member_filter: str | None,
-    horizon,
-    top_n,
-    threshold,
-):
+    horizon: int,
+    top_n: int | None,
+) -> pd.DataFrame:
     match mode:
         case AnalysisMode.MEMBER_SIGNALS:
             if member_filter is None:
@@ -110,6 +83,20 @@ def get_analysis_table(
         case AnalysisMode.TOP_SIGNALS:
             return _get_top_signals(signals_df, horizon, top_n or 15)
         case AnalysisMode.MEMBER_RANKINGS:
-            return rank_members(signals_df, horizon, threshold).head(top_n)
+            return rank_members(signals_df, horizon).head(top_n)
         case _:
             raise ValueError(f"Unsupported analysis mode: {mode}")
+
+
+__all__ = [
+    "analyze_by_sector",
+    "backtest_recommendations",
+    "calculate_signal_potential",
+    "evaluate_backtest",
+    "get_analysis_table",
+    "get_member_signals",
+    "get_top_signals",
+    "rank_members",
+    "score_ticker_by_buyers",
+    "summarize_backtest",
+]

@@ -44,8 +44,7 @@ def test_consensus_cold_start_needs_no_rankings_or_signal_history():
         min_buyers=1,
     )
 
-    assert result.iloc[0]["signal_score_raw"] == 1.0
-    assert result.iloc[0]["scoring_mode"] == "consensus"
+    assert result.iloc[0]["signal_score"] == 1.0
 
 
 def test_consensus_score_is_invariant_to_member_identity_shuffle():
@@ -59,7 +58,7 @@ def test_consensus_score_is_invariant_to_member_identity_shuffle():
     )
     permuted = score_ticker_by_buyers("AAPL", shuffled, as_of_date=as_of, min_buyers=1)
 
-    assert original.iloc[0]["signal_score_raw"] == permuted.iloc[0]["signal_score_raw"]
+    assert original.iloc[0]["signal_score"] == permuted.iloc[0]["signal_score"]
     assert original.iloc[0]["num_buyers"] == permuted.iloc[0]["num_buyers"] == 3
 
 
@@ -76,7 +75,7 @@ def test_consensus_reports_long_filing_lag_without_penalizing_score():
         min_buyers=1,
     )
 
-    assert result.iloc[0]["signal_score_raw"] == 2.0
+    assert result.iloc[0]["signal_score"] == 2.0
     assert result.iloc[0]["max_trade_to_disclosure_days"] == 130
     assert result.iloc[0]["median_trade_to_disclosure_days"] == 65.5
     assert result.iloc[0]["oldest_transaction_date"] == pd.Timestamp("2024-01-01").date()
@@ -115,8 +114,8 @@ def test_consensus_has_no_hidden_age_decay_inside_candidate_window():
         min_buyers=1,
     )
 
-    assert early.iloc[0]["signal_score_raw"] == 2.0
-    assert late.iloc[0]["signal_score_raw"] == 2.0
+    assert early.iloc[0]["signal_score"] == 2.0
+    assert late.iloc[0]["signal_score"] == 2.0
 
 
 def test_consensus_excludes_blank_canonical_member_identities_before_counting():
@@ -227,73 +226,21 @@ def test_consensus_accepts_valid_symbols_and_resolver_aliases(
     )
 
     assert result.iloc[0]["num_buyers"] == 3
-    assert result.iloc[0]["scoring_mode"] == "consensus"
 
 
-def test_historical_modes_remain_descriptive_without_consensus_cutoff():
-    transactions = _transactions(
-        ("Alice", "Bob"),
-        disclosure_dates=["2024-05-10", "2025-05-12"],
-    )
-    rankings = pd.DataFrame(
-        {
-            "member": ["ALICE", "BOB"],
-            "shrunk_alpha": [10.0, 20.0],
-            "purchase_trades": [2, 3],
-        }
-    )
-
-    result = score_ticker_by_buyers(
-        "AAPL",
-        transactions,
-        signals_df=pd.DataFrame({"member": ["training"]}),
-        member_rankings=rankings,
-        scoring_mode="shrunk_alpha",
-        min_buyers=1,
-    )
-
-    assert result.iloc[0]["num_buyers"] == 2
-    assert result.iloc[0]["scoring_mode"] == "shrunk_alpha"
-
-
-def test_historical_modes_keep_exact_ticker_and_member_lookup_behavior():
-    transactions = _transactions(("Alice", " "), ticker="aapl")
-    rankings = pd.DataFrame(
-        {
-            "member": ["ALICE"],
-            "shrunk_alpha": [10.0],
-            "purchase_trades": [2],
-        }
-    )
-
-    result = score_ticker_by_buyers(
-        "aapl",
-        transactions,
-        signals_df=pd.DataFrame({"member": ["training"]}),
-        member_rankings=rankings,
-        scoring_mode="shrunk_alpha",
-        min_buyers=1,
-    )
-
-    assert result.iloc[0]["ticker"] == "aapl"
-    assert result.iloc[0]["num_buyers"] == 2
-
-
-def test_scoring_mode_typo_and_probability_times_alpha_are_rejected():
-    transactions = _transactions(("Alice", "Bob"))
-    for invalid in ("consensuz", "bayesian_quality"):
-        with pytest.raises(AnalysisError, match="Unknown scoring_mode"):
-            score_ticker_by_buyers(
-                "AAPL",
-                transactions,
-                as_of_date=pd.Timestamp("2024-05-20"),
-                scoring_mode=invalid,
-            )
-
-
-def test_removed_pseudo_posterior_parameters_are_absent_from_public_api():
+def test_removed_historical_scoring_parameters_are_absent_from_public_api():
     parameters = inspect.signature(score_ticker_by_buyers).parameters
-    assert "member_skills" not in parameters
-    assert "uncertainty_penalty_lambda" not in parameters
-    assert "solo_buyer_skill_threshold" not in parameters
-    assert "solo_buyer_penalty" not in parameters
+    for removed in (
+        "signals_df",
+        "horizon",
+        "threshold",
+        "member_rankings",
+        "ticker_perf_signals",
+        "_ranking_dicts",
+        "scoring_mode",
+        "member_skills",
+        "uncertainty_penalty_lambda",
+        "solo_buyer_skill_threshold",
+        "solo_buyer_penalty",
+    ):
+        assert removed not in parameters

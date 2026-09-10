@@ -82,11 +82,8 @@ def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
         crash_guard=False,
     )
     targets = build_portfolios_from_backtest(
-        pd.DataFrame(),
         transactions,
-        prices,
         as_of_dates,
-        horizon=horizon,
         lookback_days=CONSENSUS_LOOKBACK_DAYS,
         min_buyers=min_buyers,
         top_n=top_n,

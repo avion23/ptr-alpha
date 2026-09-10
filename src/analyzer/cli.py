@@ -31,7 +31,6 @@ from analyzer.pipeline import (
     run_backtest_pipeline,
     run_parse_pipeline,
     run_recent_ticker_scoring,
-    run_sales_pipeline,
     run_ticker_analysis,
 )
 from analyzer.price_snapshot import create_snapshot, save_snapshot
@@ -106,32 +105,21 @@ def _save_results(
                 "member",
                 "ticker",
                 "disclosure_date",
-                "spy_alpha_pct",
-                "peak_potential_pct",
                 "total_return_pct",
                 "total_spy_alpha_pct",
-                "signal_score",
-            ]
-        case AnalysisMode.SALE_RANKINGS:
-            display_cols = [
-                "member",
-                "avg_loss_avoided_pct",
-                "median_loss_avoided_pct",
-                "sale_trades",
-                "prob_up_given_sell",
-                "sharpe_ratio",
-                "avg_spy_alpha_pct",
             ]
         case AnalysisMode.MEMBER_RANKINGS:
             display_cols = [
                 "member",
-                "shrunk_alpha",
-                "shrunk_alpha_std",
+                "shrunk_alpha_pct",
+                "shrunk_alpha_std_pct",
                 "alpha_shrinkage",
-                "avg_total_spy_alpha_pct",
-                "prob_up_given_buy",
-                "peak_hit_rate_pct",
-                "purchase_trades",
+                "avg_spy_alpha_pct",
+                "avg_return_pct",
+                "avg_spy_return_pct",
+                "positive_alpha_rate",
+                "positive_return_rate",
+                "purchase_episodes",
             ]
         case _:
             display_cols = list(table.columns)
@@ -146,8 +134,6 @@ def _save_results(
                 filename = f"{member_filter.replace(' ', '_').lower()}_signals.csv"
             case AnalysisMode.TOP_SIGNALS:
                 filename = "top_signals.csv"
-            case AnalysisMode.SALE_RANKINGS:
-                filename = "sale_rankings.csv"
             case AnalysisMode.MEMBER_RANKINGS:
                 filename = "member_rankings.csv"
 
@@ -171,18 +157,13 @@ def main_callback(
 
 def _validate_mode(mode: str, member: str | None, ticker: str | None) -> None:
     """Validate mode/member/ticker combinations. Exits on error."""
-    valid_modes = {"ranks", "signals", "member", "sales", "tickers"}
+    valid_modes = {"ranks", "signals", "member", "tickers"}
     if mode not in valid_modes:
         print(f"Error: --mode must be one of {sorted(valid_modes)}", file=sys.stderr)
         raise typer.Exit(1)
     if mode == "member" and member is None and ticker is None:
         print("Error: --mode member requires --member NAME", file=sys.stderr)
         raise typer.Exit(1)
-    if mode == "sales" and member is not None:
-        print(
-            "WARNING: --member flag is ignored for --mode sales (sales rankings are aggregate).",
-            file=sys.stderr,
-        )
 
 
 def _validate_positive_options(**options: int | float) -> None:
@@ -335,30 +316,10 @@ def _run_tickers_mode(
     raise typer.Exit(0 if result.success else 1)
 
 
-def _run_sales_mode(
-    app_ctx: AppContext,
-    year: int,
-    horizons: list[int],
-    top_n: int,
-    output: str,
-) -> None:
-    """Handle --mode sales."""
-    data_path = Path(app_ctx.settings.data.data_dir)
-    result = run_sales_pipeline(
-        year, tuple(horizons), top_n, app_ctx.transaction_source, app_ctx.price_source
-    )
-    if result.success and hasattr(result, "data") and result.data:
-        _save_results(
-            result.data["table"], output, AnalysisMode.SALE_RANKINGS, None, data_path
-        )
-    raise typer.Exit(0 if result.success else 1)
-
-
 def _run_analysis_mode(
     app_ctx: AppContext,
     year: int,
     horizons: list[int],
-    threshold: float,
     member: str | None,
     top_n: int,
     mode: str,
@@ -375,7 +336,6 @@ def _run_analysis_mode(
     params = AnalysisParams(
         year=year,
         horizons=tuple(horizons),
-        threshold=threshold,
         member_filter=member,
         top_n=top_n,
         mode=analysis_mode,
@@ -408,12 +368,11 @@ def analyze(
     year: int = typer.Option(_CURRENT_YEAR, help="Year to process"),
     mode: str = typer.Option(
         "ranks",
-        help="Output mode: ranks | signals | member | sales | tickers",
+        help="Output mode: ranks | signals | member | tickers",
     ),
     member: str | None = typer.Option(None, help="Filter to specific member"),
     ticker: str | None = typer.Option(None, help="Analyze specific ticker"),
     horizons: list[int] = typer.Option([90], help="Time horizons in days"),
-    threshold: float = typer.Option(5.0, help="Hit rate threshold percentage"),
     days_back: int = typer.Option(
         CONSENSUS_LOOKBACK_DAYS, help="Days back for ticker scoring"
     ),
@@ -436,11 +395,10 @@ def analyze(
     """
     Unified analysis command. Use --mode to select output type:
 
-      ranks    - Rank members by trading performance (default)
-      signals  - Show top trading signals
-      member   - Show signals for specific member (use --member)
-      sales    - Rank members by loss avoidance (sale performance)
-      tickers  - Score multi-buyer tickers from recent period
+      ranks    - Descriptive member purchase outcomes (default)
+      signals  - Show top historical purchase outcomes
+      member   - Show historical purchase outcomes for one member
+      tickers  - Score current multi-buyer equity candidates
     """
     _validate_mode(mode, member, ticker)
     _validate_positive_options(
@@ -480,14 +438,11 @@ def analyze(
             output,
             as_of_date,
         )
-    elif mode == "sales":
-        _run_sales_mode(app_ctx, year, horizons, top_n, output)
     else:
         _run_analysis_mode(
             app_ctx,
             year,
             horizons,
-            threshold,
             member,
             top_n,
             mode,
@@ -975,7 +930,6 @@ def _load_portfolio_inputs(
     for as_of in as_of_dates:
         # date_range never yields NaT; narrow the stubs' union explicitly.
         recs = analysis.backtest_recommendations(
-            pd.DataFrame(),
             all_transactions,
             cast(pd.Timestamp, pd.Timestamp(as_of)),
             lookback_days=lookback_days,

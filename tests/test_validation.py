@@ -12,13 +12,11 @@ import pytest
 
 from analyzer.cli import _validation_grid
 from analyzer.experiments.family import FAMILY_PROVENANCE, build_family
-from analyzer.exceptions import AnalysisError
 from analyzer.pipeline import BacktestParams
 from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_SCORER_PROVENANCE,
     score_ticker_by_buyers,
 )
-from analyzer.member_ranking.lookups import _compute_alpha_for_scoring_mode
 from analyzer.validation import (
     LOCKED_FINAL_START,
     MIN_RELEASE_PERMUTATIONS,
@@ -255,54 +253,29 @@ class TestMemberIdentityGate:
 
 
 class TestConsensusProductionScoring:
-    def test_consensus_is_distinct_from_member_alpha_and_rejects_alpha_path(self):
+    def test_consensus_score_is_exact_distinct_buyer_count(self):
         transactions = pd.DataFrame(
             {
-                "member": ["Alice", "Bob"],
-                "ticker": ["AAPL", "AAPL"],
-                "transaction_date": pd.to_datetime(["2024-05-09", "2024-05-11"]),
-                "disclosure_date": pd.to_datetime(["2024-05-10", "2024-05-12"]),
-                "transaction_type": ["Purchase", "Purchase"],
+                "member": ["Alice", "Bob", "Alice"],
+                "ticker": ["AAPL", "AAPL", "AAPL"],
+                "transaction_date": pd.to_datetime(
+                    ["2024-05-09", "2024-05-11", "2024-05-12"]
+                ),
+                "disclosure_date": pd.to_datetime(
+                    ["2024-05-10", "2024-05-12", "2024-05-13"]
+                ),
+                "transaction_type": ["Purchase", "Purchase", "Purchase"],
             }
         )
-        as_of = pd.Timestamp("2024-05-20")
         consensus = score_ticker_by_buyers(
-            "AAPL", transactions, min_buyers=1, as_of_date=as_of
-        )
-        ranking_dicts = {
-            "mode": "shrunk_alpha",
-            "alpha": {"ALICE": 10.0, "BOB": 20.0},
-            "trades": {"ALICE": 5, "BOB": 5},
-            "prob": {},
-            "has_shrunk": True,
-        }
-        descriptive = score_ticker_by_buyers(
             "AAPL",
             transactions,
-            signals_df=pd.DataFrame({"value": [1.0]}),
-            member_rankings=pd.DataFrame({"value": [1.0]}),
             min_buyers=1,
-            _ranking_dicts=ranking_dicts,
-            scoring_mode="shrunk_alpha",
-            as_of_date=as_of,
+            as_of_date=pd.Timestamp("2024-05-20"),
         )
-        assert (
-            consensus.iloc[0]["signal_score_raw"]
-            != descriptive.iloc[0]["signal_score_raw"]
-        )
+        assert consensus.iloc[0]["signal_score"] == 2.0
+        assert consensus.iloc[0]["num_buyers"] == 2
         assert consensus.iloc[0]["scorer_provenance"] == CONSENSUS_SCORER_PROVENANCE
-        with pytest.raises(AnalysisError, match="identity-free"):
-            _compute_alpha_for_scoring_mode(
-                pd.DataFrame(
-                    {
-                        "member": ["Alice"],
-                        "shrunk_alpha": [1.0],
-                        "purchase_trades": [1],
-                    }
-                ),
-                "shrunk_alpha",
-                "consensus",
-            )
 
     def test_consensus_reports_non_gating_identity_invariance_diagnostic(self):
         series = {0: _series(np.full(180, 2.0))}
@@ -329,8 +302,7 @@ class TestExecutionSupport:
         evaluation_calls = []
 
         def fake_recommendations(*args, **kwargs):
-            assert len(args) == 2
-            assert "scoring_mode" not in kwargs
+            assert len(args) == 1
             as_of = pd.Timestamp(kwargs["as_of_date"])
             if as_of.day != 16:
                 return pd.DataFrame()

@@ -223,10 +223,8 @@ class TestIdenticalSpySupportAndPerDateAlpha:
         as_of = pd.Timestamp("2022-01-01")
         spy = _benchmark_return(prices, as_of, 60)
         recs = analysis.backtest_recommendations(
-            pd.DataFrame(),
             all_tx,
             as_of_date=as_of,
-            horizon=60,
             lookback_days=28,
             min_buyers=2,
             top_n=5,

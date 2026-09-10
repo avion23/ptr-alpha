@@ -158,19 +158,9 @@ def test_historical_analysis_uses_exact_acquired_price_matrix():
 
 def test_ticker_analysis_uses_real_consensus_at_explicit_cutoff():
     as_of = date(2025, 6, 1)
-    with (
-        patch(
-            "analyzer.pipeline.prepare_analysis_data",
-            return_value=(_consensus_test_trades(), pd.DataFrame(), pd.DataFrame()),
-        ),
-        patch(
-            "analyzer.pipeline.analysis.rank_members",
-            side_effect=AssertionError("pipeline must not rank member history"),
-        ),
-        patch(
-            "analyzer.member_ranking.buyer_scoring.rank_members",
-            side_effect=AssertionError("scorer must not rank member history"),
-        ),
+    with patch(
+        "analyzer.pipeline.prepare_analysis_data",
+        return_value=(_consensus_test_trades(), pd.DataFrame(), pd.DataFrame()),
     ):
         transaction_source = MagicMock()
         transaction_source.db.get_transactions.return_value = _consensus_test_trades()
@@ -184,8 +174,7 @@ def test_ticker_analysis_uses_real_consensus_at_explicit_cutoff():
     assert result.success
     assert result.data["buyers"]["member"].tolist() == ["Alice", "Carol"]
     assert result.data["score"].iloc[0]["num_buyers"] == 2
-    assert result.data["score"].iloc[0]["scoring_mode"] == "consensus"
-    assert result.data["score"].iloc[0]["signal_score_raw"] > 0
+    assert result.data["score"].iloc[0]["signal_score"] == 2.0
 
 
 def test_single_ticker_rejects_prelisting_reused_symbol_rows():
@@ -241,19 +230,9 @@ def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     as_of = date(2025, 6, 1)
     transaction_source = MagicMock()
     transaction_source.db.get_transactions_by_date_range.return_value = _consensus_test_trades()
-    with (
-        patch(
-            "analyzer.pipeline.prepare_live_consensus_data",
-            return_value=_consensus_test_trades(),
-        ),
-        patch(
-            "analyzer.pipeline.analysis.rank_members",
-            side_effect=AssertionError("pipeline must not rank member history"),
-        ),
-        patch(
-            "analyzer.member_ranking.buyer_scoring.rank_members",
-            side_effect=AssertionError("scorer must not rank member history"),
-        ),
+    with patch(
+        "analyzer.pipeline.prepare_live_consensus_data",
+        return_value=_consensus_test_trades(),
     ):
         result = run_recent_ticker_scoring(
             transaction_source,
@@ -269,8 +248,7 @@ def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     scored = result.data["result"].iloc[0]
     assert scored["ticker"] == "AAPL"
     assert scored["num_buyers"] == 2
-    assert scored["scoring_mode"] == "consensus"
-    assert scored["signal_score_raw"] > 0
+    assert scored["signal_score"] == 2.0
 
 
 def test_recent_ticker_scoring_consensus_is_transaction_only():
@@ -279,19 +257,9 @@ def test_recent_ticker_scoring_consensus_is_transaction_only():
     transaction_source.db.get_transactions_by_date_range.return_value = (
         _consensus_test_trades()
     )
-    with (
-        patch(
-            "analyzer.pipeline.analysis.calculate_signal_potential",
-            side_effect=AssertionError("live consensus must not build labels"),
-        ),
-        patch(
-            "analyzer.pipeline.analysis.rank_members",
-            side_effect=AssertionError("live consensus must not rank history"),
-        ),
-        patch(
-            "analyzer.member_ranking.buyer_scoring.rank_members",
-            side_effect=AssertionError("live consensus must not rank history"),
-        ),
+    with patch(
+        "analyzer.pipeline.analysis.calculate_signal_potential",
+        side_effect=AssertionError("live consensus must not build labels"),
     ):
         result = run_recent_ticker_scoring(
             transaction_source,

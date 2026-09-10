@@ -33,16 +33,11 @@ class _Position:
 
 
 def build_portfolios_from_backtest(
-    signals_df: pd.DataFrame,
     transactions_df: pd.DataFrame,
-    prices_df: pd.DataFrame,
     as_of_dates: pd.DatetimeIndex | list,
-    horizon: int = 60,
     lookback_days: int = CONSENSUS_LOOKBACK_DAYS,
     min_buyers: int = CONSENSUS_MIN_BUYERS,
     top_n: int = 5,
-    threshold: float = 5.0,
-    training_lookback_days: int | None = None,
     config: KellyConfig | None = None,
     sizing_inputs_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
@@ -60,15 +55,11 @@ def build_portfolios_from_backtest(
     all_portfolios: list[pd.DataFrame] = []
     for as_of in as_of_dates:
         recs = backtest_recommendations(
-            signals_df,
             transactions_df,
             pd.Timestamp(as_of),
-            horizon=horizon,
             lookback_days=lookback_days,
             min_buyers=min_buyers,
             top_n=top_n,
-            threshold=threshold,
-            training_lookback_days=training_lookback_days,
         )
         enriched = _attach_sizing_inputs(recs, sizing, as_of)
         portfolio = build_kelly_portfolio(enriched, config)

@@ -322,9 +322,7 @@ def _run_tickers_mode(
         top_n=top_n,
         as_of_date=as_of_date,
     )
-    result = run_recent_ticker_scoring(
-        app_ctx.transaction_source, app_ctx.price_source, params
-    )
+    result = run_recent_ticker_scoring(app_ctx.transaction_source, params)
     if result.success and hasattr(result, "data") and result.data:
         data = result.data
         if not data["result"].empty:
@@ -762,10 +760,7 @@ def backtest(
         frequency_days=frequency_days,
     )
     result = run_backtest_pipeline(
-        params,
-        app_ctx.transaction_source,
-        app_ctx.price_source,
-        data_dir=Path(app_ctx.settings.data.data_dir),
+        params, app_ctx.transaction_source, app_ctx.price_source
     )
     if result.success and hasattr(result, "data") and result.data:
         data = result.data

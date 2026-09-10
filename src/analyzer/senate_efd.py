@@ -10,8 +10,8 @@ on the strength of their TLS/HTTP2 fingerprint. We therefore use
 fingerprint and is accepted. The Django app also requires a CSRF agreement
 handshake before the search endpoint will respond.
 
-Senate filings are loaded into an isolated data directory (e.g. ``data/senate``)
-so chamber separation is exact without a schema change on the main database.
+Senate filings use the same canonical DuckDB as House filings. Source and chamber
+columns keep refresh replacement and analysis scopes exact inside one database.
 
 Known limitation: efdsearch exposes no authoritative amendment/supersession
 pointer. Every official report row is preserved under its own source record;

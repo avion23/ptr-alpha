@@ -87,7 +87,7 @@ class TestStageOrderingAndCommands(unittest.TestCase):
                     "--end",
                     "2024-01-01",
                     "--data-dir",
-                    str(staging / "senate"),
+                    str(staging),
                 ]
             ],
         )
@@ -137,12 +137,7 @@ class TestStageOrderingAndCommands(unittest.TestCase):
                     sys.executable,
                     str(go_live._REPO_ROOT / "scripts" / "purge_phantom_rows.py"),
                     str(staging / "congress.duckdb"),
-                ],
-                [
-                    sys.executable,
-                    str(go_live._REPO_ROOT / "scripts" / "purge_phantom_rows.py"),
-                    str(staging / "senate" / "congress.duckdb"),
-                ],
+                ]
             ],
         )
         self.assertEqual(
@@ -215,7 +210,6 @@ class TestOrderingAndGating(unittest.TestCase):
                 "fetch-capitol",
                 "analyze",
                 "snapshot",
-                "purge_phantom_rows.py",
                 "purge_phantom_rows.py",
                 "validate",
             ],
@@ -429,12 +423,7 @@ class TestInvariantsAudit(unittest.TestCase):
         db.close()
 
     def test_invariants_pass_on_clean_db(self):
-        from analyzer.database import Database
-
         self._seed_db(self.staging / "congress.duckdb")
-        # Senate DB is not produced by the house stage; create an empty one so
-        # the senate side of the audit has something to open.
-        Database(self.staging / "senate" / "congress.duckdb").close()
         audit = go_live.run_invariants_audit(self.ctx)
         self.assertTrue(audit["all_passed"], audit)
 

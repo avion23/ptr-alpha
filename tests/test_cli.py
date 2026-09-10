@@ -1,6 +1,5 @@
 """Smoke tests for analyzer.cli module."""
 
-import tempfile
 import unittest
 from datetime import date
 from pathlib import Path

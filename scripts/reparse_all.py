@@ -32,10 +32,7 @@ from analyzer.download import (
 )
 from analyzer.models import FilingType
 from analyzer.parsing import consolidate_transactions
-from analyzer.parser_cascade import (
-    ParserCascadeError,
-    _parse_pdf_worker,
-)
+from analyzer.parser_cascade import ParserCascadeError, _parse_pdf_worker
 from analyzer.settings import Settings
 
 

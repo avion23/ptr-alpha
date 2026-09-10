@@ -257,7 +257,6 @@ def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     ):
         result = run_recent_ticker_scoring(
             transaction_source,
-            MagicMock(),
             TickerScoringParams(
                 year=2025,
                 as_of_date=as_of,
@@ -280,7 +279,6 @@ def test_recent_ticker_scoring_consensus_is_transaction_only():
     transaction_source.db.get_transactions_by_date_range.return_value = (
         _consensus_test_trades()
     )
-    price_source = MagicMock()
     with (
         patch(
             "analyzer.pipeline.analysis.calculate_signal_potential",
@@ -297,15 +295,12 @@ def test_recent_ticker_scoring_consensus_is_transaction_only():
     ):
         result = run_recent_ticker_scoring(
             transaction_source,
-            price_source,
             TickerScoringParams(
                 year=2025,
-                horizons=(90,),
                 as_of_date=as_of,
                 days_back=28,
                 min_buyers=2,
                 top_n=1,
-                training_lookback_days=365,
             ),
         )
 
@@ -316,10 +311,9 @@ def test_recent_ticker_scoring_consensus_is_transaction_only():
     assert result.data["min_buyers"] == 2
     assert result.data["as_of_date"] == as_of
     transaction_source.db.get_transactions_by_date_range.assert_called_once_with(
-        pd.Timestamp("2024-03-03"),
+        pd.Timestamp("2025-05-04"),
         pd.Timestamp(as_of),
     )
-    price_source.get_prices.assert_not_called()
     transaction_source.db.get_entry_prices.assert_not_called()
 
 
@@ -342,10 +336,8 @@ def test_recent_ticker_scoring_filters_rejected_symbols_before_candidate_gate():
     ):
         result = run_recent_ticker_scoring(
             MagicMock(),
-            MagicMock(),
             TickerScoringParams(
                 year=2025,
-                horizons=(90,),
                 as_of_date=as_of,
                 days_back=28,
                 min_buyers=2,
@@ -574,15 +566,6 @@ def test_backtest_pipeline_keeps_supported_no_recommendation_dates_as_cash(tmp_p
 
     with (
         patch("analyzer.pipeline.create_snapshot", return_value=MagicMock()),
-        patch("analyzer.pipeline.save_snapshot"),
-        patch(
-            "analyzer.pipeline._entry_prices_from_matrix",
-            return_value=pd.DataFrame({"entry_price": [100.0]}),
-        ),
-        patch(
-            "analyzer.pipeline.analysis.calculate_signal_potential",
-            return_value=pd.DataFrame({"member": ["Alice"]}),
-        ),
         patch(
             "analyzer.pipeline.analysis.backtest_recommendations",
             side_effect=[pd.DataFrame({"ticker": ["AAPL"]}), pd.DataFrame()],
@@ -599,7 +582,6 @@ def test_backtest_pipeline_keeps_supported_no_recommendation_dates_as_cash(tmp_p
             ),
             transaction_source,
             price_source,
-            data_dir=tmp_path,
         )
 
     assert result.success

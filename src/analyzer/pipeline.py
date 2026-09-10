@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from pathlib import Path
 from dataclasses import dataclass
 from functools import wraps
 import logging
@@ -13,7 +12,7 @@ from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
 from analyzer.models import AnalysisMode
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
-from analyzer.price_snapshot import create_snapshot, save_snapshot
+from analyzer.price_snapshot import create_snapshot
 from analyzer.ticker_resolver import TickerResolver
 from analyzer import analysis
 from analyzer.member_ranking.buyer_scoring import (
@@ -47,12 +46,9 @@ class AnalysisParams:
 @dataclass(frozen=True, slots=True)
 class TickerScoringParams:
     year: int
-    horizons: tuple[int, ...] = (90,)
-    threshold: float = 5.0
     days_back: int = CONSENSUS_LOOKBACK_DAYS
     min_buyers: int = CONSENSUS_MIN_BUYERS
     top_n: int = 15
-    training_lookback_days: int = 1095
     as_of_date: date | None = None
 
 
@@ -331,36 +327,20 @@ def run_ticker_analysis(
 
 @pipeline_step
 def run_recent_ticker_scoring(
-    transaction_source, price_source, params: TickerScoringParams
+    transaction_source, params: TickerScoringParams
 ) -> DataResult:
     if params.days_back < 1:
         raise DataSourceError("days_back must be at least 1")
-    if not params.horizons or any(horizon < 1 for horizon in params.horizons):
-        raise DataSourceError("horizons must contain positive days")
-
-    if params.training_lookback_days < 1:
-        raise DataSourceError("training_lookback_days must be at least 1")
 
     as_of_date = pd.Timestamp(params.as_of_date or date.today()).normalize()
     if as_of_date.year != params.year:
         raise DataSourceError("year must match the as-of date year")
 
-    trades = prepare_live_consensus_data(
-        transaction_source,
-        as_of_date,
-        params.days_back,
-        history_lookback_days=params.training_lookback_days + max(params.horizons),
+    recent_trades = prepare_live_consensus_data(
+        transaction_source, as_of_date, params.days_back
     )
-    # Consensus is deliberately transaction-only: no prices, no forward labels.
-    cutoff_date = as_of_date - timedelta(days=params.days_back)
-    disclosure_dates = pd.to_datetime(trades["disclosure_date"])
-    recent_trades = trades[
-        (disclosure_dates >= cutoff_date) & (disclosure_dates <= as_of_date)
-    ]
     logger.info(
-        "Loaded %d disclosures through %s; %d in the last %d days",
-        len(trades),
-        as_of_date.date(),
+        "Loaded %d disclosures from the last %d days",
         len(recent_trades),
         params.days_back,
     )
@@ -606,7 +586,6 @@ def run_backtest_pipeline(
     params: BacktestParams,
     transaction_source,
     price_source,
-    data_dir: Path | None = None,
 ) -> DataResult:
     tx_start = params.start_date - timedelta(days=params.lookback_days)
     tx_end = params.end_date
@@ -825,12 +804,6 @@ def run_backtest_pipeline(
             )
     evaluable_dates = len(observations)
     total_as_of_dates = len(as_of_dates)
-
-    # Save snapshot alongside backtest results when a destination is given.
-    if data_dir is not None:
-        snapshot_path = data_dir / "price_snapshot.json"
-        save_snapshot(snapshot, snapshot_path)
-        logger.info("Price snapshot saved to %s", snapshot_path)
 
     return DataResult(
         success=True,

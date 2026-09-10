@@ -350,8 +350,7 @@ def _try_camelot_lattice(pdf_path: Path) -> list[dict]:
 
 
 def _try_camelot_stream(pdf_path: Path) -> list[dict]:
-    """Fallback for unrulled tables. Try ALL detected tables and stop at
-    the first one that yields transactions (Fix 2: don't just scan table[0])."""
+    """Fallback for unrulled tables; aggregate all detected tables."""
     tables = _call_parser_backend(
         "stream", camelot.read_pdf, str(pdf_path), pages="all", flavor="stream"
     )
@@ -362,7 +361,7 @@ def _try_camelot_stream(pdf_path: Path) -> list[dict]:
 
 
 def _try_pdftotext(pdf_path: Path) -> list[dict]:
-    """Handles encrypted PDFs where camelot/pdfplumber return nothing."""
+    """Extract and aggregate every pdftotext table."""
     pdftext_tables = _call_parser_backend(
         "pdftotext", extract_tables_with_pdftotext, pdf_path
     )

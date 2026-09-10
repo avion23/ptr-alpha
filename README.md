@@ -28,15 +28,15 @@ The system must never backdate knowledge to the private transaction date.
 | `src/analyzer/senate_efd.py` | Official Senate eFD ingestion |
 | `src/analyzer/parser_cascade.py`, `src/analyzer/parsing/` | Deterministic PDF/table/OCR extraction |
 | `src/analyzer/database.py`, `*_repository.py` | DuckDB persistence, canonical views, generations, provenance, prices, parse reports |
-| `src/analyzer/candidates.py` | Shared public-equity candidate universe for live analysis and replay |
+| `src/analyzer/member_ranking/buyer_scoring.py` | Shared public-equity candidate universe and distinct-buyer scorer for live analysis and replay |
 | `src/analyzer/member_ranking/` | Descriptive member statistics and historical diagnostic scorers |
 | `src/analyzer/signals/` | Historical forward-return label construction and signal reports |
 | `src/analyzer/backtest/` | Point-in-time recommendation replay and fixed-horizon evaluation |
-| `src/analyzer/portfolio/`, `portfolio_sim.py` | Capital-constrained portfolio simulation and Kelly research helpers |
+| `src/analyzer/portfolio/`, `portfolio_sim.py` | Shared-cash equal-slot portfolio simulation and Kelly research helpers |
 | `src/analyzer/validation.py`, `snooping.py` | Purged retrospective validation and multiple-testing controls |
 | `src/analyzer/capitol_trades.py` | Capitol Trades reconciliation input; not an official canonical source |
 | `member_profitability/` | Separate descriptive member-profitability research workflow |
-| `optimize_profit/` | Older locked optimization/research workflow; not the production authority |
+| `optimize_profit/` | Older optimization/research workflow; not the production authority |
 | `scripts/` | Audits, reparsing, OCR, staging, reconciliation, refresh, and operational tools |
 | `tests/` | Unit, integration, statistical-invariant, parser, database, replay, and CLI checks |
 | `docs/` | Current architecture/parsing docs plus explicitly historical audit/review evidence |
@@ -137,11 +137,10 @@ The fixed-horizon CLI backtest now evaluates exactly `--horizon`. It does not re
 ### What remains heuristic research
 
 - `DECAY_LAMBDA` for the historical decay-weighted return diagnostic;
-- the member Beta prior strength and clipping;
-- the empirical member hierarchy and its assumptions;
+- the empirical member hierarchy and its distributional assumptions;
 - the 14-day member episode collapse used by member ranking;
-- portfolio concentration, sector, slippage, and holding-policy defaults;
-- validation family/search choices.
+- portfolio rebalance cadence, holding period, maximum position count, and any explicitly declared slippage assumption;
+- validation family choices such as horizon, buyer threshold, and top-N.
 
 These must not be described as laws of the data-generating process. The current production candidate score avoids them.
 
@@ -196,7 +195,7 @@ Common commands:
 | `ptr-alpha analyze --year 2025 --mode signals` | Historical top purchase outcomes |
 | `ptr-alpha analyze --year 2025 --mode sales` | Historical sale/loss-avoidance ranking |
 | `ptr-alpha backtest --start 2024-01-01 --end 2025-12-31` | Fixed-horizon public-time replay |
-| `ptr-alpha portfolio --start 2024-01-01 --end 2025-12-31 --sector-map sectors.json` | Shared-cash portfolio simulation |
+| `ptr-alpha portfolio --start 2024-01-01 --end 2025-12-31` | Shared-cash equal-slot portfolio simulation; optional slippage is declared in basis points |
 | `ptr-alpha snapshot` | Explicitly write a reproducible price snapshot |
 | `ptr-alpha validate ...` | Purged retrospective research validation |
 
@@ -206,7 +205,7 @@ Common commands:
 
 A positive live score means only that multiple distinct members disclosed recent purchases of the same equity. It is not statistical proof of abnormal future return.
 
-The repository's retrospective validation machinery uses scheduled no-trade support, purging/embargoes, SPY-relative net outcomes, and family-wise controls. Historical member-skill modes are diagnostics and cannot authorize deployment. The older `optimize_profit/` workflow remains a separate research artifact; its exact-machine runtime fingerprint is no longer treated as a correctness gate.
+The repository's retrospective validation machinery evaluates only the production consensus rule. It uses scheduled no-trade support, exact holding-period purging, SPY-relative net outcomes, and family-wise controls. Historical member-skill modes remain separate descriptive research. The older `optimize_profit/` workflow remains a separate research artifact and is not a production authority.
 
 No existing retrospective result should be relabeled as fresh out-of-sample evidence after changing the scorer or implementation. A scorer change requires a new predeclared evaluation.
 

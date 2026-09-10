@@ -46,7 +46,9 @@ class TestFreeze:
             == "retrospective_previously_used_not_fresh_oos"
         )
         config = manifest["config"]
-        assert config["phases"]["locked_final"]["consumed"] is False
+        assert config["phases"]["locked_final"]["status"] == (
+            "locked_not_queried_or_evaluated"
+        )
         assert config["phases"]["test"]["status"] == "retrospective_diagnostics_only"
         assert config["grid"]["lookback_days"] == [CONSENSUS_LOOKBACK_DAYS]
         assert "scoring_mode" not in config["grid"]

@@ -607,7 +607,6 @@ class TestPurgeAndManifest:
             "end": None,
             "status": "locked_not_queried_or_evaluated",
             "value_rows_queried": False,
-            "consumed": False,
         }
         assert manifest["phases"]["train"]["outcomes_end_by"] == "2023-12-31"
         assert (

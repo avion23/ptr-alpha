@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from analyzer.backtest import (
+from analyzer.backtest.filters import (
     _filter_recent_trades,
     _filter_ticker_perf,
     _filter_training,
@@ -23,7 +23,6 @@ def precompute_walk_forward_data(
     lookback_days,
     training_lookback_days,
     min_buyers_list,
-    bayes_prior_strength=None,
 ):
     """Return every requested period, including explicit rejection records.
 
@@ -50,12 +49,7 @@ def precompute_walk_forward_data(
             continue
 
         try:
-            member_rankings = rank_members(
-                training,
-                horizon,
-                5.0,
-                _bayes_prior_strength=bayes_prior_strength,
-            )
+            member_rankings = rank_members(training, horizon, 5.0)
         except AnalysisError as exc:
             precomputed[as_of_iso] = {
                 **base,
@@ -117,13 +111,3 @@ def _candidate_tickers_by_min_buyers(
         threshold: buyer_counts[buyer_counts >= threshold].index.tolist()
         for threshold in min_buyers_list
     }
-
-
-# Compatibility helpers retained for callers that import private symbols.
-def _rank_members_for_period(training, horizon, bayes_prior_strength=None):
-    try:
-        return rank_members(
-            training, horizon, 5.0, _bayes_prior_strength=bayes_prior_strength
-        )
-    except AnalysisError:
-        return None

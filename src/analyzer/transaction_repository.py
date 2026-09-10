@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import logging
 import re
 from datetime import date, datetime
 
 import duckdb
 import pandas as pd
-
-
-logger = logging.getLogger(__name__)
 
 
 class AmbiguousTransactionIdentityError(ValueError):
@@ -229,31 +225,12 @@ class TransactionRepository:
             source=source, sources=sources
         )
         params: list[object] = [year, *source_params]
-        excluded = self.conn.execute(
-            f"""
-
-            SELECT COUNT(*) FROM canonical_transactions
-            WHERE EXTRACT(YEAR FROM disclosure_date) = ?
-              AND transaction_date IS NOT NULL
-              AND transaction_date > disclosure_date
-              {source_clause}
-            """,  # nosec B608 -- source_clause is a fixed internal fragment
-            params,
-        ).fetchone()[0]
-        if excluded > 0:
-            logger.debug(
-                "Excluding %d transactions with transaction_date > disclosure_date "
-                "(likely OCR date swap) for year %d",
-                excluded,
-                year,
-            )
         result = self.conn.execute(
             f"""
             SELECT *
             FROM canonical_transactions
 
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
-              AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
               {source_clause}
             ORDER BY disclosure_date DESC, id DESC
             """,  # nosec B608 -- source_clause is a fixed internal fragment
@@ -279,32 +256,12 @@ class TransactionRepository:
         )
         params: list[object] = [start_date, end_date, *source_params]
 
-        excluded = self.conn.execute(
-            f"""
-
-            SELECT COUNT(*) FROM canonical_transactions
-            WHERE disclosure_date BETWEEN ? AND ?
-              AND transaction_date IS NOT NULL
-              AND transaction_date > disclosure_date
-              {source_clause}
-            """,  # nosec B608 -- source_clause is a fixed internal fragment
-            params,
-        ).fetchone()[0]
-        if excluded > 0:
-            logger.debug(
-                "Excluding %d transactions with transaction_date > disclosure_date "
-                "(likely OCR date swap) for date range %s to %s",
-                excluded,
-                start_date,
-                end_date,
-            )
         result = self.conn.execute(
             f"""
             SELECT *
             FROM canonical_transactions
 
             WHERE disclosure_date BETWEEN ? AND ?
-              AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
               {source_clause}
             ORDER BY disclosure_date DESC, id DESC
             """,  # nosec B608 -- source_clause is a fixed internal fragment
@@ -558,7 +515,6 @@ class TransactionRepository:
             SELECT COUNT(*) FROM canonical_transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               AND source IN ('house_pdf', 'gemini_ocr')
-              AND (transaction_date IS NULL OR transaction_date <= disclosure_date)
             """,
             [year],
         ).fetchone()[0]

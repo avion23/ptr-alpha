@@ -261,8 +261,9 @@ class Database:
         self.conn.execute(f"""
             CREATE OR REPLACE {view_kind} canonical_transactions AS
             SELECT t.* FROM transactions t
-            WHERE t.source = 'senate_efd'
-               OR (
+            WHERE (
+                    t.source = 'senate_efd'
+                    OR (
                     t.source IN ('house_pdf', 'gemini_ocr')
                     AND (
                         t.ingestion_generation = (
@@ -303,6 +304,12 @@ class Database:
                         )
                     )
                )
+              )
+              AND (
+                  t.transaction_date IS NULL
+                  OR t.disclosure_date IS NULL
+                  OR t.transaction_date <= t.disclosure_date
+              )
         """)
 
     def _init_prices_table(self) -> None:

@@ -1256,11 +1256,17 @@ def refresh(
                     WHERE transaction_date IS NULL OR transaction_date <= disclosure_date
                 ),
                 MAX(disclosure_date),
-                COUNT(*) FILTER (WHERE transaction_date > disclosure_date)
+                (
+                    SELECT COUNT(*)
+                    FROM transactions raw
+                    WHERE raw.source IN ('house_pdf', 'gemini_ocr', 'senate_efd')
+                      AND EXTRACT(YEAR FROM raw.disclosure_date) = ?
+                      AND raw.transaction_date > raw.disclosure_date
+                )
             FROM canonical_transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
             """,
-            [summary_year],
+            [summary_year, summary_year],
         ).fetchone()
     )
 

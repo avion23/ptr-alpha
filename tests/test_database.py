@@ -77,6 +77,14 @@ def test_read_only_database_shadows_legacy_canonical_view(tmp_path):
     db.upsert_transactions(rows, source="house_pdf")
     db.upsert_transactions(rows.assign(doc_id="external"), source="capitol_trades")
     db.upsert_transactions(rows.assign(doc_id="unknown"), source="house_pdf")
+    db.upsert_transactions(
+        rows.assign(
+            doc_id="bad-chronology",
+            transaction_date=date(2024, 1, 3),
+            disclosure_date=date(2024, 1, 2),
+        ),
+        source="house_pdf",
+    )
     db.conn.execute("UPDATE transactions SET source=NULL WHERE doc_id='unknown'")
     db.conn.execute(
         "CREATE OR REPLACE VIEW canonical_transactions AS SELECT * FROM transactions"
@@ -97,6 +105,9 @@ def test_read_only_database_shadows_legacy_canonical_view(tmp_path):
     try:
         assert raw.execute(
             "SELECT COUNT(*) FROM canonical_transactions WHERE source='capitol_trades'"
+        ).fetchone()[0] == 1
+        assert raw.execute(
+            "SELECT COUNT(*) FROM canonical_transactions WHERE transaction_date > disclosure_date"
         ).fetchone()[0] == 1
     finally:
         raw.close()

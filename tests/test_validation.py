@@ -386,7 +386,6 @@ class TestExecutionSupport:
             pd.DataFrame({"SPY": [1.0]}),
             params,
             pd.DataFrame(),
-            20,
             0.005,
         )
         assert list(primary) == pytest.approx([-1.0, 1.0, -1.0])
@@ -436,7 +435,6 @@ class TestFailureFamilies:
             pd.DataFrame(),
             self._params(),
             pd.DataFrame(),
-            20.0,
             0.005,
         )
         assert result.status == "failed"
@@ -457,7 +455,6 @@ class TestFailureFamilies:
             pd.DataFrame(),
             self._params(),
             pd.DataFrame(),
-            20.0,
             0.005,
         )
         assert result.status == "completed"
@@ -491,7 +488,6 @@ class TestFailureFamilies:
             pd.DataFrame(),
             self._params(),
             pd.DataFrame(),
-            20.0,
             0.005,
         )
         assert result.status == "failed"

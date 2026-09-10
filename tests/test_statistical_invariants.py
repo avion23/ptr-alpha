@@ -24,7 +24,6 @@ def test_normal_normal_fully_pools_when_between_spread_is_sampling_noise():
     fit = normal_normal_posteriors(
         [0.0, 2.0, 1.0, 3.0],
         ["A", "A", "B", "B"],
-        prior_strength=1.0,
     )
 
     assert (fit["between_var"] < fit["within_var"]).all()
@@ -38,7 +37,6 @@ def test_normal_normal_preserves_clear_between_member_separation():
     fit = normal_normal_posteriors(
         [0.0, 2.0, 10.0, 12.0],
         ["A", "A", "B", "B"],
-        prior_strength=1.0,
     )
 
     assert (fit["between_var"] > fit["within_var"]).all()

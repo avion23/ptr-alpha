@@ -41,15 +41,8 @@ def backtest_recommendations(
     threshold: float = 5.0,
     training_lookback_days: int | None = None,
     scoring_mode: str = "consensus",
-    bayes_prior_strength: float | None = None,
 ) -> pd.DataFrame:
     is_consensus = scoring_mode == "consensus"
-    bayes = bayes_prior_strength
-    if not is_consensus and bayes is None:
-        from analyzer.signals import BAYES_PRIOR_STRENGTH
-
-        bayes = BAYES_PRIOR_STRENGTH
-
     as_of_iso = as_of_date.isoformat()
     training_lookback_iso = (
         (as_of_date - pd.Timedelta(days=training_lookback_days)).isoformat()
@@ -69,7 +62,7 @@ def backtest_recommendations(
     member_rankings = (
         pd.DataFrame()
         if is_consensus
-        else _build_member_rankings(training, horizon, threshold, bayes)
+        else _build_member_rankings(training, horizon, threshold)
     )
     if not is_consensus and (member_rankings is None or member_rankings.empty):
         return pd.DataFrame()
@@ -100,15 +93,14 @@ def backtest_recommendations(
         min_buyers,
         top_n,
         scoring_mode,
-        bayes,
     )
 
 
-def _build_member_rankings(training, horizon, threshold, bayes):
+def _build_member_rankings(training, horizon, threshold):
     if training.empty:
         return None
     try:
-        return rank_members(training, horizon, threshold, _bayes_prior_strength=bayes)
+        return rank_members(training, horizon, threshold)
     except AnalysisError:
         return None
 
@@ -126,7 +118,6 @@ def _score_and_rank(
     min_buyers,
     top_n,
     scoring_mode,
-    bayes,
 ) -> pd.DataFrame:
     _ranking_dicts = _build_ranking_dicts(member_rankings, scoring_mode=scoring_mode)
     metadata_maps = (
@@ -149,7 +140,6 @@ def _score_and_rank(
             horizon=horizon,
             threshold=threshold,
             min_buyers=min_buyers,
-            bayes=bayes,
             scoring_mode=scoring_mode,
             _ranking_dicts=_ranking_dicts,
             signals_df=signals_df,
@@ -229,7 +219,6 @@ def _score_one_ticker(
     horizon,
     threshold,
     min_buyers,
-    bayes,
     scoring_mode,
     _ranking_dicts,
     signals_df,
@@ -244,7 +233,6 @@ def _score_one_ticker(
         member_rankings,
         min_buyers,
         ticker_perf_signals=ticker_perf_signals,
-        _bayes_prior_strength=bayes,
         _ranking_dicts=_ranking_dicts,
         scoring_mode=scoring_mode,
         as_of_date=as_of_date,

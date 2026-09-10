@@ -3,9 +3,7 @@
 `rank_sales` collapses sale signals into per-member loss-avoidance stats.
 The path differs from `rank_members` (purchase side) in that sale returns
 are inverted (good member = small loss or gain), and the implementation
-uses a per-group row-by-row `_compute_member_stats` loop rather than the
-vectorized path. Each member is shrunk toward a prior computed from the
-other members' collapsed sale episodes.
+uses a per-group row-by-row `_compute_member_stats` loop.
 """
 
 from __future__ import annotations
@@ -20,13 +18,11 @@ from analyzer.signals import (
     _get_horizon_data,
 )
 
-from analyzer.member_ranking.bayes import bayesian_win_probability
 
 
 def _compute_member_stats(
     member: str,
     grp: pd.DataFrame,
-    base_prior: float,
     threshold: float | None = None,
     invert_returns: bool = False,
 ) -> dict | None:
@@ -42,10 +38,7 @@ def _compute_member_stats(
     sharpe = (mean_ret / std_ret) if std_ret > 0 else 0.0
 
     wins = int((rets > 0).sum())
-    losses = int(len(rets) - wins)
     p_up = wins / len(rets)
-    bayes_win_prob = bayesian_win_probability(wins, losses, base_prior)
-    posterior_lift = bayes_win_prob / base_prior
 
     avg_spy_alpha, avg_total_spy_alpha = _alpha_stats(grp, invert_returns)
 
@@ -56,8 +49,6 @@ def _compute_member_stats(
         "trades": len(rets),
         "sharpe_ratio": round(sharpe, 3),
         "prob_up": round(p_up, 3),
-        "bayes_win_prob": round(bayes_win_prob, 3),
-        "posterior_lift": round(posterior_lift, 3),
         "avg_spy_alpha_pct": round(avg_spy_alpha, 2),
         "avg_total_spy_alpha_pct": round(avg_total_spy_alpha, 2),
     }
@@ -111,24 +102,9 @@ def rank_sales(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
         raise AnalysisError(f"No sale signals found for horizon {horizon}")
 
     sales = _collapse_to_episodes(sales)
-    valid_sale_returns = sales["decayed_return_pct"].dropna()
-    total_n = len(valid_sale_returns)
-    total_wins = int((valid_sale_returns < 0).sum())
-    global_prior = float(np.clip(total_wins / total_n, 0.10, 0.90)) if total_n else 0.50
-
     member_stats = []
     for member, sale_grp in sales.groupby("member"):
-        member_returns = sale_grp["decayed_return_pct"].dropna()
-        member_n = len(member_returns)
-        peer_n = total_n - member_n
-        if peer_n > 0:
-            member_wins = int((member_returns < 0).sum())
-            member_prior = float(
-                np.clip((total_wins - member_wins) / peer_n, 0.10, 0.90)
-            )
-        else:
-            member_prior = global_prior
-        row = _compute_member_stats(member, sale_grp, member_prior, invert_returns=True)
+        row = _compute_member_stats(member, sale_grp, invert_returns=True)
         if row is not None:
             member_stats.append(row)
 

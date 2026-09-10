@@ -46,7 +46,7 @@ def _build_ranking_dicts(
 ) -> dict:
     """Pre-build O(1) lookup dicts from member_rankings DataFrame.
 
-    Returns {"alpha": {member: float}, "trades": {member: int}, "prob": {member: float}}.
+    Returns alpha and trade-count maps keyed by member identity.
     Avoids repeated DataFrame linear scans in the per-ticker scoring loop.
 
     scoring_mode controls how member scores are computed:
@@ -63,7 +63,6 @@ def _build_ranking_dicts(
         return {
             "alpha": {},
             "trades": {},
-            "prob": {},
             "has_shrunk": False,
             "mode": "consensus",
         }
@@ -71,7 +70,6 @@ def _build_ranking_dicts(
         return {
             "alpha": {},
             "trades": {},
-            "prob": {},
             "has_shrunk": False,
             "mode": scoring_mode,
         }
@@ -80,8 +78,6 @@ def _build_ranking_dicts(
     alpha_col = "shrunk_alpha" if has_shrunk else "avg_spy_alpha_pct"
 
     cols = ["member", alpha_col, "purchase_trades"]
-    if "bayes_win_prob" in member_rankings.columns:
-        cols.append("bayes_win_prob")
     if "prob_up_given_buy" in member_rankings.columns:
         cols.append("prob_up_given_buy")
     valid = member_rankings[cols].dropna(subset=["member"])
@@ -90,12 +86,6 @@ def _build_ranking_dicts(
     trades_dict = dict(
         zip(valid["member"], valid["purchase_trades"].fillna(0).astype(int))
     )
-    prob = (
-        dict(zip(valid["member"], valid["bayes_win_prob"].fillna(0.5).astype(float)))
-        if "bayes_win_prob" in valid.columns
-        else {}
-    )
-
     # Fix 7: add canonical-key aliases to all lookup dicts so any name variant
     # (e.g. 'MICHAEL MCCAUL' vs 'MICHAEL T. MCCAUL') resolves to the same entry.
     # Collision note: when two genuinely different members collapse to the same
@@ -114,12 +104,10 @@ def _build_ranking_dicts(
 
     _add_canonical_aliases(alpha)
     _add_canonical_aliases(trades_dict)
-    _add_canonical_aliases(prob)
 
     return {
         "alpha": alpha,
         "trades": trades_dict,
-        "prob": prob,
         "has_shrunk": has_shrunk,
         "mode": scoring_mode,
     }

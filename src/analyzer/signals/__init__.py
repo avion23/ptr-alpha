@@ -6,7 +6,7 @@ lookups via the `_price_arrays` index. Pre-computes SPY log returns
 once on the full Series instead of per-signal groupby shifts.
 
 The package is split into:
-  - constants.py     module-level constants (decay, priors, weights)
+  - constants.py     module-level numerical and research defaults
   - prices.py        O(log N) price lookups + per-DataFrame cache
   - filters.py       horizon/quality/episode filters + dynamic prior
   - top_signals.py   get_top_signals / get_member_signals
@@ -18,7 +18,6 @@ working after the split.
 
 # Constants
 from analyzer.signals.constants import (
-    BAYES_PRIOR_STRENGTH,
     DECAY_LAMBDA,
     MIN_ENTRY_PRICE,
     TICKER_PERF_MIN_TRADES,
@@ -61,7 +60,6 @@ from analyzer.signals.core import (
 
 __all__ = [
     "DECAY_LAMBDA",
-    "BAYES_PRIOR_STRENGTH",
     "TICKER_PERF_MIN_TRADES",
     "MIN_ENTRY_PRICE",
     "_NS_PER_DAY",

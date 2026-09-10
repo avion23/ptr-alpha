@@ -57,15 +57,16 @@ def test_episode_does_not_chain_past_fourteen_days():
     assert collapsed["episode_count"].tolist() == [2, 1]
 
 
-def test_bayesian_win_probability_defaults_to_neutral_market_prior():
+def test_bayesian_win_probability_jeffreys_prior_is_neutral_without_data():
     assert bayesian_win_probability(0, 0) == 0.5
+    assert bayesian_win_probability(3, 0) == 3.5 / 4.0
 
 
 def test_normal_normal_fit_is_scale_equivariant_at_one_millionth():
     outcomes = np.array([1.0, 2.0, -1.0, 0.0])
     groups = np.array(["A", "A", "B", "B"])
-    base = normal_normal_posteriors(outcomes, groups, prior_strength=2.0)
-    scaled = normal_normal_posteriors(outcomes * 1e-6, groups, prior_strength=2.0)
+    base = normal_normal_posteriors(outcomes, groups)
+    scaled = normal_normal_posteriors(outcomes * 1e-6, groups)
 
     np.testing.assert_allclose(
         scaled["posterior_mean"], base["posterior_mean"] * 1e-6, rtol=1e-12

@@ -1,33 +1,16 @@
-"""Bayesian math helpers for member ranking.
-
-Reads the module global `BAYES_PRIOR_STRENGTH` from `analyzer.signals` unless
-a prior strength is supplied per call.
-"""
+"""Statistical helpers for descriptive member ranking."""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from analyzer import signals as _signals
 
-
-def bayesian_win_probability(
-    wins: int,
-    losses: int,
-    market_prior: float = 0.50,
-    prior_strength: float | None = None,
-) -> float:
-    ps = prior_strength if prior_strength is not None else _signals.BAYES_PRIOR_STRENGTH
+def bayesian_win_probability(wins: int, losses: int) -> float:
+    """Return the Bernoulli posterior mean under Jeffreys' Beta(1/2, 1/2) prior."""
     if wins < 0 or losses < 0:
         raise ValueError("wins and losses must be non-negative")
-    if not 0 < market_prior < 1:
-        raise ValueError("market_prior must be strictly between zero and one")
-    if ps <= 0 or not np.isfinite(ps):
-        raise ValueError("prior_strength must be positive and finite")
-    alpha = market_prior * ps
-    beta = (1 - market_prior) * ps
-    return (alpha + wins) / (alpha + beta + wins + losses)
+    return (wins + 0.5) / (wins + losses + 1.0)
 
 
 def normal_normal_posteriors(
@@ -35,7 +18,6 @@ def normal_normal_posteriors(
     groups,
     *,
     information_weights=None,
-    prior_strength: float = 1.0,
 ) -> pd.DataFrame:
     """Fit one scale-equivariant empirical normal-normal model.
 
@@ -69,8 +51,6 @@ def normal_normal_posteriors(
         raise ValueError("outcomes must be finite")
     if pd.isna(labels).any():
         raise ValueError("groups must be non-null")
-    if prior_strength <= 0 or not np.isfinite(prior_strength):
-        raise ValueError("prior_strength must be positive and finite")
 
     if information_weights is None:
         weights = np.ones(len(values), dtype=float)
@@ -132,8 +112,8 @@ def normal_normal_posteriors(
     # Work in the variance domain instead of forming precision reciprocals.
     # This remains finite for exact-zero data at the representable variance
     # floor and is algebraically identical to normal-normal precision updates.
-    denominator = information * between_var + prior_strength * within_var
-    shrinkage = prior_strength * within_var / denominator
+    denominator = information * between_var + within_var
+    shrinkage = within_var / denominator
     posterior_mean = (1.0 - shrinkage) * weighted_means + shrinkage * global_mean
     posterior_var = (within_var / denominator) * between_var
 

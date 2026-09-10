@@ -220,11 +220,9 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(r30.iloc[0]["sale_trades"], 1)
         self.assertEqual(r90.iloc[0]["sale_trades"], 1)
 
-    def test_bayesian_win_probability_formula(self):
-        posterior = bayesian_win_probability(0, 3, 0.55)
-        expected = (0.55 * 20) / (20 + 3)
-
-        self.assertAlmostEqual(posterior, expected)
+    def test_bayesian_win_probability_uses_jeffreys_prior(self):
+        posterior = bayesian_win_probability(0, 3)
+        self.assertAlmostEqual(posterior, 0.5 / 4.0)
 
     def test_get_top_signals_basic(self):
         signals = calculate_signal_potential(
@@ -518,7 +516,7 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(rankings.iloc[0]["avg_loss_avoided_pct"], 10.0)
         self.assertEqual(rankings.iloc[0]["avg_spy_alpha_pct"], 5.0)
 
-    def test_rank_sales_prior_uses_sale_episode_loss_rate(self):
+    def test_rank_sales_reports_observed_sale_episode_loss_rate(self):
         signals = pd.DataFrame(
             {
                 "member": ["Alice", "Bob", "Carol", "Dave", "Buyer"],
@@ -534,13 +532,10 @@ class TestAnalysis(unittest.TestCase):
         rankings = rank_sales(signals, horizon=90)
         alice = rankings.set_index("member").loc["Alice"]
 
-        # LOO sale prior: peers are Bob/Carol/Dave (Buyer is a purchase).
-        # Peers have 2 sale wins out of 3 episodes → prior 2/3.
-        expected_prior = 2 / 3
-        expected_posterior = (expected_prior * 20 + 1) / 21
-        self.assertAlmostEqual(alice["bayes_win_prob"], round(expected_posterior, 3))
+        self.assertEqual(alice["prob_up_given_sell"], 1.0)
+        self.assertNotIn("bayes_win_prob", rankings.columns)
 
-    def test_rank_sales_prior_uses_collapsed_episode_loss_rate(self):
+    def test_rank_sales_observed_rate_uses_collapsed_episodes(self):
         # Alice has 3 AAPL sales within 14 days (disclosure_date present) so they
         # collapse into one episode.  Other members/tickers form separate episodes.
         # The sale_prior is computed from collapsed episodes, not raw rows.
@@ -576,11 +571,8 @@ class TestAnalysis(unittest.TestCase):
         alice = rankings.set_index("member").loc["Alice"]
 
         # Alice's inverted return = -(-7.0) = 7.0 > 0 → 1 win, 0 losses.
-        # LOO sale prior from peer episodes (Bob +5.0 is a loss, Carol -10.0 is
-        # a win): 1 win out of 2 peers → prior 0.5.
-        expected_prior = 0.5
-        expected_bayes = (expected_prior * 20 + 1) / 21
-        self.assertAlmostEqual(alice["bayes_win_prob"], round(expected_bayes, 3))
+        self.assertEqual(alice["prob_up_given_sell"], 1.0)
+        self.assertNotIn("bayes_win_prob", rankings.columns)
         # sale_trades = 1 (one collapsed episode for Alice)
         self.assertEqual(alice["sale_trades"], 1)
 

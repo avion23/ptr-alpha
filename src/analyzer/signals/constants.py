@@ -1,17 +1,14 @@
 """Module-level constants for the signals pipeline.
 
 These are module defaults read by ``calculate_signal_potential`` and other
-signal functions. Parameter sweeps pass ``DECAY_LAMBDA`` and
-``BAYES_PRIOR_STRENGTH`` values explicitly instead of changing these defaults.
-The remaining constants are immutable and declared ``Final``.
+signal functions. Research sweeps pass ``DECAY_LAMBDA`` explicitly instead of
+changing the module default. The remaining constants are immutable.
 """
 
 from typing import Final
 
 # Decay weight per day for the midpoint-weighted return
 DECAY_LAMBDA: float = 0.005
-# Prior strength for Bayesian shrinkage (alpha+beta pseudo-counts)
-BAYES_PRIOR_STRENGTH: float = 20.0
 # Minimum trades for a ticker to qualify for the ticker-history prior
 TICKER_PERF_MIN_TRADES: Final[int] = 3
 

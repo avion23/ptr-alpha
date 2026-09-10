@@ -158,29 +158,3 @@ def _aligned_price_on_or_after_arrays(
             return AlignedPrice(price, quote_date, wait_days)
         pos += 1
     return None
-
-
-def _next_tradable_price_arrays(
-    idx_ns, vals, signal_date, max_wait_days: int | None = 7
-) -> AlignedPrice | None:
-    """Return the first valid session strictly after an end-of-day signal."""
-    return _aligned_price_on_or_after_arrays(
-        idx_ns,
-        vals,
-        signal_date,
-        strictly_after=True,
-        max_wait_days=max_wait_days,
-    )
-
-
-def _price_at_or_before_arrays(idx_ns, vals, target_date, max_staleness_days=None):
-    """Legacy scalar lookup; aligned execution callers use the strict helpers."""
-    target = pd.Timestamp(target_date).value
-    pos = int(np.searchsorted(idx_ns, target, side="right")) - 1
-    if pos < 0:
-        return None
-    if max_staleness_days is not None:
-        staleness_ns = target - int(idx_ns[pos])
-        if staleness_ns > max_staleness_days * NS_PER_DAY:
-            return None
-    return float(vals[pos])

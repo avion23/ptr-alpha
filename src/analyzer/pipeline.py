@@ -433,30 +433,19 @@ def _entry_prices_from_matrix(
     for _, transaction in eligible.iterrows():
         raw_ticker = str(transaction["ticker"]).strip().upper()
         disclosure = pd.Timestamp(transaction["disclosure_date"])
-        transaction_date = transaction.get("transaction_date")
-        if transaction_date is not None and not pd.isna(transaction_date):
-            transaction_date = pd.Timestamp(transaction_date).date()
-        else:
-            transaction_date = None
+        resolution = resolver.resolve(raw_ticker, disclosure.date())
+        if resolution.status in {"acquired", "date_required", "pre_listing"}:
+            continue
 
-        if raw_ticker in resolver.LISTING_START_MAP:
-            listing_resolution = resolver.resolve(raw_ticker, disclosure.date())
-            if listing_resolution.status == "pre_listing":
+        price_ticker = resolution.price_symbol
+        if price_ticker not in price_columns:
+            # PriceSource stores some date-invariant aliases under their raw
+            # disclosure spelling. Rename aliases are different: after the
+            # rename, falling back to the old symbol would evaluate a security
+            # that was no longer tradable at the public decision time.
+            if raw_ticker in resolver.RENAME_MAP or raw_ticker not in price_columns:
                 continue
-
-        if raw_ticker in resolver.RENAME_MAP:
-            if transaction_date is None:
-                continue
-            price_ticker = resolver.resolve(raw_ticker, transaction_date).price_symbol
-            if price_ticker not in price_columns:
-                continue
-        else:
             price_ticker = raw_ticker
-            if price_ticker not in price_columns:
-                resolved = resolver.resolve(raw_ticker, transaction_date).price_symbol
-                if resolved not in price_columns:
-                    continue
-                price_ticker = resolved
 
         if disclosure.tz is not None:
             disclosure = disclosure.tz_localize(None)

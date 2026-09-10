@@ -1167,11 +1167,11 @@ class TestGetEntryPrices(DatabaseTestCase):
 
 
 
-    def test_rename_alias_entry_price_resolves_per_transaction_date(self):
-        # FB renamed to META on 2022-06-09: the same raw ticker must price on
-        # the FB series before and the META series after that date. Entries
-        # are the next NYSE session after disclosure (May10->May11,
-        # Jun10->Jun13).
+    def test_rename_alias_entry_price_resolves_per_disclosure_date(self):
+        # FB renamed to META on 2022-06-09. Execution identity is determined
+        # when the filing becomes public, so a delayed pre-rename transaction
+        # disclosed afterward must enter META. Entries are the next NYSE
+        # session after disclosure (May10->May11, Jun10->Jun13).
         dates = pd.to_datetime(["2022-05-11", "2022-06-13"])
         self.db.upsert_prices(
             pd.DataFrame(
@@ -1193,7 +1193,7 @@ class TestGetEntryPrices(DatabaseTestCase):
                     "doc_id": "doc-fb-post",
                     "member": "Bob",
                     "ticker": "FB",
-                    "transaction_date": date(2022, 6, 9),
+                    "transaction_date": date(2022, 6, 1),
                     "disclosure_date": date(2022, 6, 10),
                     "transaction_type": "Purchase",
                 },
@@ -1211,10 +1211,10 @@ class TestGetEntryPrices(DatabaseTestCase):
         self.assertAlmostEqual(by_member.loc["Bob", "entry_price"], 201.0)
         self.assertEqual(set(result["ticker"]), {"FB"})
 
-    def test_rename_alias_without_transaction_date_fails_unverified(self):
-        # No-date alias calls fail explicit unverified: never price under the
-        # raw symbol when the transaction date is unknown.
-        dates = pd.to_datetime(["2022-06-10"])
+    def test_rename_alias_without_transaction_date_uses_public_symbol(self):
+        # Entry identity does not depend on private transaction time. A legacy
+        # row without it can still resolve the market symbol from disclosure.
+        dates = pd.to_datetime(["2022-06-13"])
         self.db.upsert_prices(
             pd.DataFrame({"FB": [100.0], "META": [200.0]}, index=dates)
         )
@@ -1235,7 +1235,8 @@ class TestGetEntryPrices(DatabaseTestCase):
         result = self.db.get_entry_prices(
             ["FB"], date(2022, 6, 1), date(2022, 6, 10)
         )
-        self.assertTrue(result.empty)
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result.iloc[0]["entry_price"], 200.0)
 
     def test_post_rename_transaction_never_falls_back_to_raw_symbol(self):
         # META prices are absent, only stale FB prices exist. A post-rename FB
@@ -1286,9 +1287,9 @@ class TestGetEntryPrices(DatabaseTestCase):
         self.assertEqual(len(result), 1)
         self.assertAlmostEqual(result.iloc[0]["entry_price"], 351.0)
 
-    def test_sq_rename_alias_entry_price_resolves_per_transaction_date(self):
+    def test_sq_rename_alias_entry_price_resolves_per_disclosure_date(self):
         # SQ renamed to XYZ on 2025-01-21. Entries are next sessions
-        # (Jan20->Jan21, Jan22->Jan23).
+        # (Jan20->Jan21, Jan22->Jan23); the later filing is delayed.
         dates = pd.to_datetime(["2025-01-21", "2025-01-23"])
         self.db.upsert_prices(
             pd.DataFrame(
@@ -1310,7 +1311,7 @@ class TestGetEntryPrices(DatabaseTestCase):
                     "doc_id": "doc-sq-post",
                     "member": "Bob",
                     "ticker": "SQ",
-                    "transaction_date": date(2025, 1, 21),
+                    "transaction_date": date(2025, 1, 10),
                     "disclosure_date": date(2025, 1, 22),
                     "transaction_type": "Purchase",
                 },

@@ -329,19 +329,21 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertEqual(entries.iloc[0]["entry_price"], 999.0)
         self.assertEqual(entries.iloc[0]["entry_price_date"], pd.Timestamp("2024-01-03"))
 
-    def test_matrix_entry_prices_rename_alias_by_transaction_date(self):
+    def test_matrix_entry_prices_rename_alias_by_disclosure_date(self):
         transactions = pd.DataFrame(
             {
                 "member": ["Alice Smith"],
                 "ticker": ["FB"],
-                "transaction_date": [pd.Timestamp("2023-01-02")],
-                "disclosure_date": [pd.Timestamp("2023-01-03")],
+                # The private trade predates the rename, but the filing became
+                # public after it. Execution must use META, not stale FB.
+                "transaction_date": [pd.Timestamp("2022-06-01")],
+                "disclosure_date": [pd.Timestamp("2022-06-10")],
                 "transaction_type": ["Purchase"],
             }
         )
         prices = pd.DataFrame(
             {"FB": [50.0], "META": [100.0], "SPY": [400.0]},
-            index=pd.DatetimeIndex(["2023-01-04"]),
+            index=pd.DatetimeIndex(["2022-06-13"]),
         )
 
         entries = _entry_prices_from_matrix(transactions, prices)

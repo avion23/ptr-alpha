@@ -289,19 +289,16 @@ def _validate_inputs(entry_prices_df: pd.DataFrame, prices_df: pd.DataFrame) -> 
 
 
 def _resolve_tickers(signals: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataFrame:
-    """Resolve each row's raw ticker to its contemporaneous price symbol.
+    """Resolve each row to the symbol tradable when the filing was public.
 
-    Rename aliases (FB -> META, SQ -> XYZ, BLL -> BALL) map to different price
-    series depending on the transaction date, so resolution is per-row using
-    the transaction_date carried by entry prices. A rename alias without a
-    transaction date fails explicit unverified and is dropped rather than
-    silently priced under the raw symbol.
+    Rename aliases (FB -> META, SQ -> XYZ, BLL -> BALL) change with market
+    time, but the actionable boundary is disclosure time, not the private
+    transaction date. A delayed filing therefore uses the symbol tradable on
+    its disclosure date.
     """
     resolver = TickerResolver()
     rename_aliases = resolver.RENAME_MAP
     price_tickers = set(prices_df.columns)
-    has_tx_date = "transaction_date" in signals.columns
-    tx_dates = signals["transaction_date"] if has_tx_date else None
 
     keep_indices: list[int] = []
     resolved: list[object] = []
@@ -319,18 +316,11 @@ def _resolve_tickers(signals: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataF
             keep_indices.append(i)
             resolved.append(raw)
             continue
-        tx_date = None
-        if tx_dates is not None:
-            candidate = tx_dates.iloc[i]
-            if candidate is not None and not pd.isna(candidate):
-                tx_date = candidate
-        resolution = resolver.resolve(raw, tx_date)
-        if is_alias and resolution.status == "unverified":
-            logger.warning(
-                "Dropping %s transaction without entry-price resolution: "
-                "rename alias requires a transaction date (unverified without it)",
-                raw,
-            )
+        disclosure = pd.Timestamp(signals["disclosure_date"].iloc[i])
+        resolution = resolver.resolve(raw, disclosure.date())
+        if resolution.status in {"acquired", "date_required", "pre_listing"}:
+            continue
+        if is_alias and resolution.price_symbol not in price_tickers:
             continue
         keep_indices.append(i)
         resolved.append(resolution.price_symbol)

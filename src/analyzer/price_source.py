@@ -271,11 +271,10 @@ def _clean_tickers(tickers: list[str]) -> list[str]:
 def _expand_rename_aliases(tickers: list[str]) -> set[str]:
     """Expand rename aliases into both temporal price symbols.
 
-    A no-date resolver call on a rename alias (FB) is explicit unverified: the
-    contemporaneous symbol depends on the transaction date, which a price
-    acquisition window does not carry. Fetch both the pre-rename and
-    post-rename symbols (FB and META) so per-transaction-date entry-price
-    resolution can find its series; never silently guess one symbol.
+    A price acquisition window spans many disclosure dates, so a rename alias
+    can require both its pre-rename and post-rename market symbols. Fetch both
+    series and let per-row entry-price resolution choose the symbol tradable at
+    public disclosure time.
     """
     resolver = TickerResolver()
     expanded: set[str] = set()

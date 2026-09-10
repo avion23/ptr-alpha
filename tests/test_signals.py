@@ -159,8 +159,8 @@ class TestCalculateSignalPotential(unittest.TestCase):
         self.assertEqual(row["ticker_origin"], "official")
 
 
-class TestRenameAliasPerTransactionDateResolution(unittest.TestCase):
-    """Canaries: rename aliases resolve per transaction date in signals."""
+class TestRenameAliasPerDisclosureDateResolution(unittest.TestCase):
+    """Canaries: rename aliases resolve at the public disclosure boundary."""
 
     def setUp(self):
         self.dates = pd.date_range("2022-05-01", "2022-08-01", freq="D")
@@ -201,8 +201,9 @@ class TestRenameAliasPerTransactionDateResolution(unittest.TestCase):
             [
                 # Pre-rename FB trade disclosed before 2022-06-09.
                 ("Alice", "FB", "2022-05-10", "Purchase", "2022-05-01", 110.0),
-                # Post-rename FB trade: must price on the META series.
-                ("Bob", "FB", "2022-06-10", "Purchase", "2022-06-09", 220.0),
+                # Delayed pre-rename trade disclosed after the rename: the
+                # market can only execute META when the filing becomes public.
+                ("Bob", "FB", "2022-06-10", "Purchase", "2022-06-01", 220.0),
             ]
         )
         result = calculate_signal_potential(entries, self.prices_df, [30])
@@ -220,20 +221,19 @@ class TestRenameAliasPerTransactionDateResolution(unittest.TestCase):
             expected_return("META", "2022-06-10"),
         )
 
-    def test_no_date_rename_alias_fails_unverified_and_is_dropped(self):
+    def test_rename_alias_does_not_need_private_transaction_date_for_entry_symbol(self):
         entries = self._entry(
             [
                 ("Alice", "FB", "2022-06-10", "Purchase", "2022-06-09", 220.0),
-                # NaT transaction_date: alias resolution is unverified, the
-                # row must be dropped rather than priced under the raw symbol.
+                # Public execution identity is known from disclosure time even
+                # when an old stored row has no private transaction date.
                 ("Carol", "FB", "2022-06-10", "Purchase", pd.NaT, 220.0),
             ]
         )
         result = calculate_signal_potential(entries, self.prices_df, [30])
-        # The no-date FB row is dropped, the dated FB row survives.
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result.iloc[0]["member"], "Alice")
-        self.assertEqual(result.iloc[0]["ticker"], "META")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(set(result["member"]), {"Alice", "Carol"})
+        self.assertEqual(set(result["ticker"]), {"META"})
 
     def test_brkb_class_share_resolves_to_brk_b_column(self):
         dates = pd.date_range("2024-01-01", "2024-03-01", freq="D")

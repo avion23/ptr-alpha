@@ -270,12 +270,12 @@ class PriceRepository:
         if resolver is None:
             resolver = TickerResolver()
 
-        # Rename aliases (FB -> META, SQ -> XYZ, BLL -> BALL) map to different
-        # price symbols depending on when the trade happened, so resolution is
-        # per (ticker, transaction_date) pair, never per raw ticker alone.
+        # Entry identity is resolved at the public decision boundary. Rename
+        # aliases therefore vary by disclosure date, not by the private
+        # transaction date that was unavailable to the market at execution.
         pairs = self.conn.execute(
             """
-            SELECT DISTINCT ticker, transaction_date
+            SELECT DISTINCT ticker, disclosure_date
             FROM canonical_transactions
             WHERE ticker IN (SELECT UNNEST(?))
               AND disclosure_date BETWEEN ? AND ?
@@ -288,46 +288,31 @@ class PriceRepository:
 
         alias_tickers = sorted(resolver.RENAME_MAP)
         map_raw: list[str] = []
-        map_tx_date: list[object] = []
+        map_disclosure_date: list[object] = []
         map_resolved: list[str] = []
         expanded_tickers: list[str] = []
         seen: set[str] = set()
-        unresolved_alias_rows = 0
         for _, pair in pairs.iterrows():
             raw = pair["ticker"]
-            tx_date = pair["transaction_date"]
-            if tx_date is None or pd.isna(tx_date):
-                tx_date = None
-            normalized = str(raw).strip().upper()
-            if normalized in alias_tickers and tx_date is None:
-                # No-date alias calls fail explicit unverified: never price a
-                # rename alias under the raw symbol without a transaction date.
-                unresolved_alias_rows += 1
+            disclosure_date = pair["disclosure_date"]
+            resolution = resolver.resolve(raw, disclosure_date)
+            if resolution.status in {"acquired", "date_required", "pre_listing"}:
                 continue
-            resolved = resolver.resolve(raw, tx_date).price_symbol
+            resolved = resolution.price_symbol
             map_raw.append(raw)
-            map_tx_date.append(tx_date)
+            map_disclosure_date.append(disclosure_date)
             map_resolved.append(resolved)
             for t in (raw, resolved):
                 if t not in seen:
                     seen.add(t)
                     expanded_tickers.append(t)
 
-        if unresolved_alias_rows:
-            logger.warning(
-                "Excluded %d transactions for rename aliases without "
-                "transaction_date: alias resolution is unverified without it",
-                unresolved_alias_rows,
-            )
-
         if not map_raw:
-            # Every matching transaction was an excluded no-date alias; the
-            # empty UNNEST arrays would also break DuckDB type inference.
             return pd.DataFrame()
 
         result = self.conn.execute(
             """
-            WITH ticker_map(raw, tx_date, resolved) AS (
+            WITH ticker_map(raw, disclosure_date, resolved) AS (
                 SELECT UNNEST(?), UNNEST(?), UNNEST(?)
             ),
             resolved_tickers AS (
@@ -335,7 +320,7 @@ class PriceRepository:
                 FROM canonical_transactions t
                 LEFT JOIN ticker_map tm
                   ON t.ticker = tm.raw
-                 AND t.transaction_date IS NOT DISTINCT FROM tm.tx_date
+                 AND t.disclosure_date IS NOT DISTINCT FROM tm.disclosure_date
             )
             SELECT r.member, r.ticker, r.resolved_ticker, r.transaction_date,
                    r.disclosure_date, r.transaction_type, r.owner_code,
@@ -344,20 +329,17 @@ class PriceRepository:
             FROM resolved_tickers r
             WHERE r.ticker IN (SELECT UNNEST(?))
               AND r.disclosure_date BETWEEN ? AND ?
-              AND NOT (UPPER(r.ticker) IN (SELECT UNNEST(?))
-                       AND r.transaction_date IS NULL)
               AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)
             ORDER BY r.ticker, r.transaction_date, r.disclosure_date,
                      r.member, r.transaction_type, r.owner_code, r.id
         """,
             [
                 map_raw,
-                map_tx_date,
+                map_disclosure_date,
                 map_resolved,
                 expanded_tickers,
                 start_date,
                 end_date,
-                alias_tickers,
             ],
         ).fetchdf()
 

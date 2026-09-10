@@ -547,19 +547,11 @@ def _family_integrity(sweep_df: pd.DataFrame) -> tuple[bool, dict]:
 
     recorded = sweep_df.attrs.get("family")
     if not isinstance(recorded, dict) or not recorded.get("family_sha256"):
-        expected_ids = tuple(range(len(actual_ids)))
-        if len(set(actual_ids)) != len(actual_ids) or set(actual_ids) != set(
-            expected_ids
-        ):
-            return False, {
-                "status": "partial",
-                "reason": "trial_ids_are_not_contiguous",
-                "expected_trial_ids": list(expected_ids),
-                "actual_trial_ids": list(actual_ids),
-                "missing_trial_ids": sorted(set(expected_ids) - set(actual_ids)),
-                "unexpected_trial_ids": sorted(set(actual_ids) - set(expected_ids)),
-            }
-        return True, {"status": "complete", "provenance": "legacy_frame"}
+        return False, {
+            "status": "invalid",
+            "reason": "family_metadata_missing",
+            "actual_trial_ids": list(actual_ids),
+        }
 
     try:
         raw_family_size = recorded["family_size"]
@@ -687,60 +679,27 @@ def _family_integrity(sweep_df: pd.DataFrame) -> tuple[bool, dict]:
 
 
 def _family_metadata_for_sweep(sweep_df: pd.DataFrame) -> dict:
-    """Return canonical family metadata, including a legacy-frame fallback."""
+    """Return the family metadata declared by the sweep producer."""
     recorded = sweep_df.attrs.get("family")
-    if isinstance(recorded, dict) and recorded.get("family_sha256"):
-        metadata = dict(recorded)
-        metadata.setdefault("family_hash", metadata["family_sha256"])
-        metadata.setdefault(
-            "family_provenance", metadata.get("provenance", FAMILY_PROVENANCE)
-        )
-        metadata.setdefault("family_size", len(sweep_df))
-        return metadata
+    if not isinstance(recorded, dict) or not recorded.get("family_sha256"):
+        return {
+            "schema_version": None,
+            "provenance": "missing",
+            "family_provenance": "missing",
+            "family_sha256": None,
+            "family_hash": None,
+            "family_size": len(sweep_df),
+            "parameter_order": [],
+            "trial_ids": [_canonical_config(value) for value in sweep_df["trial_id"]],
+        }
 
-    configuration_columns = [
-        column
-        for column in (
-            "horizon",
-            "frequency_days",
-            "lookback_days",
-            "min_buyers",
-            "top_n",
-        )
-        if column in sweep_df.columns
-    ]
-    parsed_ids = [_strict_trial_id(value) for value in sweep_df["trial_id"]]
-    if all(value is not None for value in parsed_ids):
-        ordered = sweep_df.assign(_validated_trial_id=parsed_ids).sort_values(
-            "_validated_trial_id", kind="mergesort"
-        )
-    else:
-        ordered = sweep_df
-    payload = {
-        "provenance": "legacy_sweep_frame_identity_v1",
-        "parameter_order": configuration_columns,
-        "trials": [
-            {
-                "trial_id": _canonical_config(row["trial_id"]),
-                "config": {
-                    column: _canonical_config(row[column])
-                    for column in configuration_columns
-                },
-            }
-            for _, row in ordered.iterrows()
-        ],
-    }
-    digest = _sha256_json(payload)
-    return {
-        "schema_version": 1,
-        "provenance": payload["provenance"],
-        "family_provenance": payload["provenance"],
-        "family_sha256": digest,
-        "family_hash": digest,
-        "family_size": len(sweep_df),
-        "parameter_order": configuration_columns,
-        "trial_ids": [_canonical_config(value) for value in ordered["trial_id"]],
-    }
+    metadata = dict(recorded)
+    metadata.setdefault("family_hash", metadata["family_sha256"])
+    metadata.setdefault(
+        "family_provenance", metadata.get("provenance", FAMILY_PROVENANCE)
+    )
+    metadata.setdefault("family_size", len(sweep_df))
+    return metadata
 
 
 def _trial_failure_mask(sweep_df: pd.DataFrame) -> np.ndarray:

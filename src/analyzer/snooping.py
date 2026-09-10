@@ -300,11 +300,9 @@ def _expected_max_sharpe(
 
 def min_backtest_length(
     sharpe: float,
-    sigma: float = 1.0,
     alpha: float = 0.05,
 ) -> float:
     """Return the minimum number of annualized Sharpe periods for a z-test."""
-    del sigma  # retained in the public signature for compatibility
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
     if sharpe <= 0:

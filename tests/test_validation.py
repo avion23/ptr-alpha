@@ -40,25 +40,43 @@ def _series(values, start="2020-01-01"):
 
 
 def _selection_frame(
-    series_by_trial: dict[int, pd.Series], slopes=None
+    series_by_trial: dict[int, pd.Series],
+    slopes=None,
+    *,
+    horizon: int = 60,
+    frequency_days: int = 30,
 ) -> pd.DataFrame:
+    trial_ids = list(series_by_trial)
+    if trial_ids != list(range(len(trial_ids))):
+        raise ValueError("test trial ids must be contiguous from zero")
+    family = build_family(
+        {
+            "horizon": [horizon],
+            "frequency_days": [frequency_days],
+            "lookback_days": [28],
+            "min_buyers": [2],
+            "top_n": [5],
+            "test_variant": trial_ids,
+        }
+    )
     rows = []
     slopes = slopes or [0.0] * len(series_by_trial)
-    for trial_id, values in series_by_trial.items():
+    for trial in family.trials:
+        trial_id = trial.trial_id
+        values = series_by_trial[trial_id]
         statistic = newey_west_tstat(values, lag=0)
         p_value = (
             float(__import__("scipy").stats.norm.sf(statistic))
             if math.isfinite(statistic)
             else (0.0 if statistic > 0 else 1.0)
         )
+        config = dict(trial.config)
         rows.append(
             {
                 "trial_id": trial_id,
-                "horizon": 60,
-                "frequency_days": 30,
-                "lookback_days": 28,
-                "min_buyers": 2,
-                "top_n": 5,
+                **config,
+                "trial_config": config,
+                "trial_spec_sha256": trial.trial_sha256,
                 "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
                 "total_recs": 100,
                 "dates_evaluated": len(values),
@@ -71,7 +89,9 @@ def _selection_frame(
                 "min_sample_ok": True,
             }
         )
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    frame.attrs["family"] = family.metadata()
+    return frame
 
 
 def _with_series(frame: pd.DataFrame, series: dict[int, pd.Series]) -> pd.DataFrame:
@@ -243,9 +263,7 @@ class TestMemberIdentityGate:
 
     def test_short_series_cannot_fall_back_to_asymptotic_reward(self):
         short = {0: _series([2.0, 2.1, 1.9])}
-        frame = _selection_frame(short)
-        frame["horizon"] = 120
-        frame["frequency_days"] = 30  # block length four; needs eight observations
+        frame = _selection_frame(short, horizon=120, frequency_days=30)
         result = select_config(frame, series_by_trial=short, n_permutations=999)
         assert result["deployable_config"] is None
         assert result["failure_reason"] == "bootstrap_sample_too_small"
@@ -520,6 +538,22 @@ class TestFailureFamilies:
 
 
 class TestCanonicalFamilyMetadata:
+    def test_missing_family_metadata_fails_closed(self):
+        series = {0: _series(np.full(180, 2.0))}
+        frame = _selection_frame(series)
+        frame.attrs.clear()
+
+        result = select_config(
+            frame,
+            series_by_trial=series,
+            n_permutations=999,
+        )
+
+        assert result["deployable_config"] is None
+        assert result["failure_reason"] == "invalid_family"
+        assert result["family_integrity"]["reason"] == "family_metadata_missing"
+        assert result["family_sha256"] is None
+
     def test_reordered_parameter_or_value_grid_changes_identity(self):
         grid = {"horizon": [60, 90], "top_n": [5, 10]}
         same = build_family(grid)

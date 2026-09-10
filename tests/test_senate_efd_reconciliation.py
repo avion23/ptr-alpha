@@ -116,6 +116,10 @@ def test_rick_scott_coupon_canary_is_non_equity_not_a_ticker():
     assert SenateEFDSource._normalize_instrument_type("Municipal Bond") == "bond"
 
 
+def test_stock_option_asset_class_is_not_normalized_as_stock():
+    assert SenateEFDSource._normalize_instrument_type("Stock Option") == "option"
+
+
 def test_report_html_preserves_raw_fields_and_artifact_hash():
     html = """
     <html><head><title>eFD: Print Periodic Transaction Report</title></head><body>

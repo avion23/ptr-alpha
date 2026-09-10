@@ -36,6 +36,7 @@ from analyzer.pipeline import BacktestParams
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_LOOKBACK_DAYS,
+    CONSENSUS_MIN_BUYERS,
     CONSENSUS_SCORER_PROVENANCE,
     _get_consensus_price_tickers,
 )
@@ -48,30 +49,25 @@ MIN_RECS_FOR_CANDIDACY = 20
 MIN_RELEASE_PERMUTATIONS = 999
 LOCKED_FINAL_START = date(2026, 1, 1)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
-_CONSENSUS_IRRELEVANT_GRID_PARAMETERS = frozenset(
-    {"training_lookback_days", "threshold", "decay_lambda", "bayes_prior_strength"}
+_VALIDATION_GRID_PARAMETERS = frozenset(
+    {"horizon", "frequency_days", "lookback_days", "min_buyers", "top_n"}
 )
 
 
 def _effective_validation_grid(grid: Mapping[str, object]) -> dict[str, object]:
-    """Remove declared dimensions that cannot affect a consensus trial."""
+    """Return the complete consensus strategy family and reject inert knobs."""
     if not grid:
-        return dict(grid)
-    scoring_modes = grid.get("scoring_mode", ("consensus",))
-    if isinstance(scoring_modes, str):
-        modes = {scoring_modes}
-    else:
-        modes = {str(value) for value in scoring_modes}
-    if modes != {"consensus"}:
-        return dict(grid)
-    effective = {
-        str(name): values
-        for name, values in grid.items()
-        if name not in _CONSENSUS_IRRELEVANT_GRID_PARAMETERS
-    }
-    # The candidate window is part of the executed strategy identity even for
-    # older/internal callers that omitted it from their declared grid.
+        raise ValueError("validation grid must not be empty")
+    unknown = set(grid) - _VALIDATION_GRID_PARAMETERS
+    if unknown:
+        raise ValueError(
+            f"validation grid has unsupported parameter(s): {sorted(unknown)}"
+        )
+    effective = {str(name): values for name, values in grid.items()}
+    effective.setdefault("frequency_days", (30,))
     effective.setdefault("lookback_days", (CONSENSUS_LOOKBACK_DAYS,))
+    effective.setdefault("min_buyers", (CONSENSUS_MIN_BUYERS,))
+    effective.setdefault("top_n", (5,))
     return effective
 
 
@@ -101,11 +97,8 @@ class SweepResult:
     horizon: int
     frequency_days: int
     lookback_days: int
-    training_lookback_days: int
     min_buyers: int
     top_n: int
-    decay_lambda: float
-    scoring_mode: str = "consensus"
     scorer_provenance: str = ""
     total_recs: int = 0
     dates_evaluated: int = 0
@@ -128,9 +121,7 @@ class SweepResult:
     failure_records: tuple[dict[str, str], ...] = ()
 
 
-def _empty_result(
-    params: BacktestParams, decay: float, mode: str
-) -> SweepResult:
+def _empty_result(params: BacktestParams) -> SweepResult:
     scheduled = len(
         pd.date_range(
             params.start_date, params.end_date, freq=f"{params.frequency_days}D"
@@ -140,11 +131,8 @@ def _empty_result(
         horizon=params.horizon,
         frequency_days=params.frequency_days,
         lookback_days=params.lookback_days,
-        training_lookback_days=params.training_lookback_days,
         min_buyers=params.min_buyers,
         top_n=params.top_n,
-        decay_lambda=decay,
-        scoring_mode=mode,
         scheduled_dates=scheduled,
     )
 
@@ -188,9 +176,6 @@ def _backtest_core(
     all_transactions: pd.DataFrame,
     prices: pd.DataFrame,
     params: BacktestParams,
-    signals: pd.DataFrame,
-    decay_lambda: float,
-    scoring_mode: str = "consensus",
 ) -> tuple[SweepResult, pd.Series]:
     """Run one configuration and return its summary and primary alpha series.
 
@@ -199,7 +184,7 @@ def _backtest_core(
     zero cash return; it is not silently dropped. The declared horizon is the
     actual holding used for both strategy and benchmark.
     """
-    empty = _empty_result(params, decay_lambda, scoring_mode)
+    empty = _empty_result(params)
     as_of_dates = pd.date_range(
         params.start_date, params.end_date, freq=f"{params.frequency_days}D"
     )
@@ -229,20 +214,17 @@ def _backtest_core(
             continue
         try:
             recommendations = analysis.backtest_recommendations(
-                signals,
+                pd.DataFrame(),
                 all_transactions,
                 as_of_date=as_of_ts,
                 horizon=params.horizon,
                 lookback_days=params.lookback_days,
                 min_buyers=params.min_buyers,
                 top_n=params.top_n,
-                threshold=params.threshold,
-                training_lookback_days=params.training_lookback_days,
-                scoring_mode=scoring_mode,
             )
             if not isinstance(recommendations, pd.DataFrame):
                 raise TypeError("recommendations must be returned as a DataFrame")
-            if scoring_mode == "consensus" and not recommendations.empty:
+            if not recommendations.empty:
                 provenance = set(
                     recommendations.get(
                         "scorer_provenance", pd.Series(dtype=str)
@@ -360,17 +342,10 @@ def _backtest_core(
         horizon=params.horizon,
         frequency_days=params.frequency_days,
         lookback_days=params.lookback_days,
-        training_lookback_days=params.training_lookback_days,
         min_buyers=params.min_buyers,
         top_n=params.top_n,
-        decay_lambda=decay_lambda,
-        scoring_mode=scoring_mode,
         scorer_provenance=(
-            CONSENSUS_SCORER_PROVENANCE
-            if scoring_mode == "consensus" and total_recommendations > 0
-            else "descriptive_member_skill_v1"
-            if scoring_mode != "consensus"
-            else ""
+            CONSENSUS_SCORER_PROVENANCE if total_recommendations > 0 else ""
         ),
         total_recs=total_recommendations,
         dates_evaluated=supported,
@@ -422,70 +397,17 @@ def newey_west_tstat(alpha_series: pd.Series, lag: int) -> float:
     return float(mean / standard_error)
 
 
-def permute_signal_member_labels(
-    signals_by_horizon: dict[tuple[int, float], pd.DataFrame],
-    *,
-    seed: int | None = None,
-    permutation: tuple[str, ...] | None = None,
-) -> dict[tuple[int, float], pd.DataFrame]:
-    """Apply one full-group member-label bijection across every horizon."""
-    members = sorted(
-        {
-            str(member)
-            for frame in signals_by_horizon.values()
-            if "member" in frame.columns
-            for member in frame["member"].dropna().unique()
-        }
-    )
-    if len(members) < 2:
-        raise ValueError("member-label permutation requires at least two members")
-    if permutation is None:
-        rng = np.random.default_rng(seed)
-        permutation = tuple(str(value) for value in rng.permutation(members))
-    if len(permutation) != len(members) or set(permutation) != set(members):
-        raise ValueError("permutation must be a bijection over every member")
-    mapping = dict(zip(members, permutation))
-    output: dict[tuple[int, float], pd.DataFrame] = {}
-    for key, frame in signals_by_horizon.items():
-        changed = frame.copy()
-        changed["member"] = changed["member"].map(
-            lambda value: mapping.get(str(value), value) if pd.notna(value) else value
-        )
-        output[key] = changed
-    return output
-
-
 def sweep_configs(
     all_tx: pd.DataFrame,
     prices: pd.DataFrame,
-    entry_prices: pd.DataFrame,
     grid: dict,
     start: date,
     end: date,
-    *,
-    signals_by_horizon: dict[tuple[int, float], pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
-    """Evaluate every configuration on one already-purged phase."""
+    """Evaluate every consensus configuration on one already-purged phase."""
     if end < start:
         raise ValueError("purged sweep phase has no executable dates")
     family = build_family(_effective_validation_grid(grid))
-    canonical_values = dict(family.grid)
-    scoring_modes = {
-        str(value) for value in canonical_values.get("scoring_mode", ("consensus",))
-    }
-    needs_historical_signals = any(mode != "consensus" for mode in scoring_modes)
-    signal_cache = dict(signals_by_horizon or {})
-    if needs_historical_signals:
-        horizons = {int(value) for value in canonical_values.get("horizon", (60,))}
-        decays = {
-            float(value) for value in canonical_values.get("decay_lambda", (0.005,))
-        }
-        for horizon in horizons:
-            for decay in decays:
-                if (horizon, decay) not in signal_cache:
-                    signal_cache[(horizon, decay)] = analysis.calculate_signal_potential(
-                        entry_prices, prices, [horizon], decay_lambda=decay
-                    )
 
     rows: list[dict] = []
     series_by_trial: dict[int, pd.Series] = {}
@@ -493,39 +415,25 @@ def sweep_configs(
         trial_id = trial.trial_id
         values = dict(trial.config)
         horizon = int(values["horizon"])
-        frequency = int(values.get("frequency_days", 30))
+        frequency = int(values["frequency_days"])
         lag = max(0, math.ceil(horizon / frequency) - 1)
-        mode = str(values.get("scoring_mode", "consensus"))
         params = BacktestParams(
             start_date=start,
             end_date=end,
             horizon=horizon,
-            lookback_days=int(values.get("lookback_days", CONSENSUS_LOOKBACK_DAYS)),
-            training_lookback_days=int(values.get("training_lookback_days", 365)),
+            lookback_days=int(values["lookback_days"]),
             min_buyers=int(values["min_buyers"]),
             top_n=int(values["top_n"]),
-            threshold=float(values.get("threshold", 5.0)),
             frequency_days=frequency,
         )
-        decay = float(values.get("decay_lambda", 0.005))
-        trial_signals = (
-            pd.DataFrame() if mode == "consensus" else signal_cache[(horizon, decay)]
-        )
         try:
-            result, per_date = _backtest_core(
-                all_tx,
-                prices,
-                params,
-                trial_signals,
-                decay_lambda=decay,
-                scoring_mode=mode,
-            )
+            result, per_date = _backtest_core(all_tx, prices, params)
         except Exception as exc:  # fail closed: preserve a failed trial row
             failure = _operation_failure(
                 "trial", pd.Timestamp(start), "trial_exception", exc
             )
             result = replace(
-                _empty_result(params, decay, mode),
+                _empty_result(params),
                 status="failed",
                 failure_reason="trial_exception",
                 failure_count=1,
@@ -539,12 +447,8 @@ def sweep_configs(
             else (0.0 if statistic > 0 else 1.0)
         )
         row = asdict(result)
-        # Preserve structured failure details for JSON/report consumers.
         row["failure_records"] = _json_safe(result.failure_records)
         row["trial_id"] = trial_id
-        # Keep the complete declared configuration beside every result row.
-        # The scalar result fields are convenient for reports, while this
-        # detached mapping is the value that family-integrity checks compare.
         row.update(_json_safe(values))
         row["trial_config"] = _json_safe(values)
         row["trial_status"] = result.status
@@ -802,12 +706,8 @@ def _family_metadata_for_sweep(sweep_df: pd.DataFrame) -> dict:
             "horizon",
             "frequency_days",
             "lookback_days",
-            "training_lookback_days",
             "min_buyers",
             "top_n",
-            "decay_lambda",
-            "scoring_mode",
-            "threshold",
         )
         if column in sweep_df.columns
     ]
@@ -899,7 +799,7 @@ def select_config(
     n_permutations: int = 999,
     permutation_seed: int = 0,
 ) -> dict:
-    """Select consensus by statistical-family gates; authorization stays ledger-only."""
+    """Select a consensus configuration by statistical-family gates."""
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
     if sweep_df.empty:
@@ -912,7 +812,6 @@ def select_config(
         "nw_lag",
         "horizon",
         "frequency_days",
-        "scoring_mode",
         "scorer_provenance",
     }
     missing = required - set(sweep_df.columns)
@@ -932,7 +831,6 @@ def select_config(
         if "min_sample_ok" in working.columns
         else np.ones(n_trials, dtype=bool)
     )
-    candidate &= working["scoring_mode"].astype(str).eq("consensus").to_numpy()
     candidate &= (
         working["scorer_provenance"]
         .astype(str)
@@ -1192,10 +1090,7 @@ def _run_identity_invariant_control(
     if len(selected) != 1:
         raise ValueError("observed trial_id is not unique in consensus family")
     row = selected.iloc[0]
-    if (
-        str(row["scoring_mode"]) != "consensus"
-        or str(row["scorer_provenance"]) != CONSENSUS_SCORER_PROVENANCE
-    ):
+    if str(row["scorer_provenance"]) != CONSENSUS_SCORER_PROVENANCE:
         raise ValueError(
             "identity-invariant control requires executed consensus provenance"
         )
@@ -1315,51 +1210,20 @@ def _run_validation_with_db(
     out_path: Path | None,
 ) -> dict:
     effective_grid = _effective_validation_grid(grid)
-    scoring_modes = {
-        str(value) for value in effective_grid.get("scoring_mode", ("consensus",))
-    }
-    consensus_only = scoring_modes == {"consensus"}
-    max_lookback = max(
-        int(value)
-        for value in effective_grid.get("lookback_days", (CONSENSUS_LOOKBACK_DAYS,))
-    )
-    history_days = max_lookback
-    if not consensus_only:
-        history_days = max(
-            history_days,
-            max(int(value) for value in grid.get("training_lookback_days", (365,))),
-        )
-
-    tx_start = pd.Timestamp(train_start) - pd.Timedelta(days=history_days)
+    max_lookback = max(int(value) for value in effective_grid["lookback_days"])
+    tx_start = pd.Timestamp(train_start) - pd.Timedelta(days=max_lookback)
     train_tx_end = pd.Timestamp(train_effective_end)
     train_price_end = pd.Timestamp(train_end)
     train_tx = db.get_transactions_by_date_range(tx_start, train_tx_end)
-    train_tickers = (
-        sorted(set(_get_consensus_price_tickers(train_tx)) | {"SPY"})
-        if consensus_only
-        else sorted(set(train_tx["ticker"].dropna().astype(str)) | {"SPY"})
-        if "ticker" in train_tx.columns
-        else ["SPY"]
-    )
-    train_price_start = (
-        next_nyse_session(pd.Timestamp(train_start))
-        if consensus_only
-        else next_nyse_session(tx_start)
-    )
+    train_tickers = sorted(set(_get_consensus_price_tickers(train_tx)) | {"SPY"})
+    train_price_start = next_nyse_session(pd.Timestamp(train_start))
     train_prices = db.get_prices(
         train_tickers, train_price_start, train_price_end
     )
-    train_entry_prices = (
-        pd.DataFrame()
-        if consensus_only
-        else db.get_entry_prices(train_tickers, tx_start, train_tx_end)
-    )
-
     train_df = sweep_configs(
         train_tx,
         train_prices,
-        train_entry_prices,
-        grid,
+        effective_grid,
         train_start,
         train_effective_end,
     )
@@ -1379,8 +1243,7 @@ def _run_validation_with_db(
     manifest = _build_manifest(
         train_tx,
         train_prices,
-        train_entry_prices,
-        grid,
+        effective_grid,
         train_start,
         train_end,
         train_effective_end,
@@ -1423,21 +1286,9 @@ def _run_validation_with_db(
     selected = selection["deployable_config"]
     if selected is not None:
         config = _config_from_row(selected)
-        mode = str(config.get("scoring_mode", "consensus"))
-        signals = (
-            pd.DataFrame()
-            if mode == "consensus"
-            else analysis.calculate_signal_potential(
-                train_entry_prices,
-                train_prices,
-                [int(config["horizon"])],
-                decay_lambda=float(config.get("decay_lambda", 0.005)),
-            )
-        )
         train_result, _ = _run_frozen(
             train_tx,
             train_prices,
-            signals,
             config,
             train_start,
             train_effective_end,
@@ -1475,16 +1326,10 @@ def _run_validation_with_db(
         price_start = next_nyse_session(pd.Timestamp(test_start))
         price_end = pd.Timestamp(test_end)
         all_tx = db.get_transactions_by_date_range(test_tx_start, tx_end)
-        tickers = (
-            sorted(set(_get_consensus_price_tickers(all_tx)) | {"SPY"})
-            if mode == "consensus"
-            else sorted(set(all_tx["ticker"].dropna().astype(str)) | {"SPY"})
-            if "ticker" in all_tx.columns
-            else ["SPY"]
-        )
+        tickers = sorted(set(_get_consensus_price_tickers(all_tx)) | {"SPY"})
         prices = db.get_prices(tickers, price_start, price_end)
         test_result, test_series = _run_frozen(
-            all_tx, prices, signals, config, test_start, test_effective_end
+            all_tx, prices, config, test_start, test_effective_end
         )
         lag = max(
             0,
@@ -1550,47 +1395,22 @@ def _run_validation_with_db(
     return output
 
 
-def _run_frozen(all_tx, prices, signals, config, start: date, end: date):
-    mode = str(config.get("scoring_mode", "consensus"))
+def _run_frozen(all_tx, prices, config, start: date, end: date):
     params = BacktestParams(
         start_date=start,
         end_date=end,
         horizon=int(config["horizon"]),
-        lookback_days=int(config.get("lookback_days", CONSENSUS_LOOKBACK_DAYS)),
-        training_lookback_days=int(config.get("training_lookback_days", 365)),
+        lookback_days=int(config["lookback_days"]),
         min_buyers=int(config["min_buyers"]),
         top_n=int(config["top_n"]),
-        threshold=float(config.get("threshold", 5.0)),
         frequency_days=int(config["frequency_days"]),
     )
-    return _backtest_core(
-        all_tx,
-        prices,
-        params,
-        pd.DataFrame() if mode == "consensus" else signals,
-        float(config.get("decay_lambda", 0.005)),
-        mode,
-    )
+    return _backtest_core(all_tx, prices, params)
 
 
 def _config_from_row(row: dict) -> dict:
-    keys = [
-        "horizon",
-        "frequency_days",
-        "lookback_days",
-        "min_buyers",
-        "top_n",
-        "scoring_mode",
-    ]
-    if str(row.get("scoring_mode", "consensus")) != "consensus":
-        keys.extend(
-            [
-                "training_lookback_days",
-                "threshold",
-                "decay_lambda",
-            ]
-        )
-    return {key: row[key] for key in keys if key in row}
+    keys = ["horizon", "frequency_days", "lookback_days", "min_buyers", "top_n"]
+    return {key: row[key] for key in keys}
 
 
 def _bootstrap_statistic_and_p(
@@ -1673,7 +1493,6 @@ def _finite_or_none(value):
 def _build_manifest(
     all_tx: pd.DataFrame,
     prices: pd.DataFrame,
-    entry_prices: pd.DataFrame,
     grid: dict,
     train_start: date,
     train_end: date,
@@ -1726,7 +1545,6 @@ def _build_manifest(
             "member_identity_policy": (
                 "consensus_is_identity_invariant_no_member_identity_hypothesis"
             ),
-            "identity_dependent_modes": "descriptive_non_deployable",
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "minimum_family_resolution_bootstrap": max(
                 MIN_RELEASE_PERMUTATIONS,
@@ -1743,7 +1561,6 @@ def _build_manifest(
             "transactions": len(all_tx),
             "price_rows": len(prices),
             "price_columns": len(prices.columns),
-            "entry_price_rows": len(entry_prices),
             "price_start": str(prices.index.min()) if not prices.empty else None,
             "price_end": str(prices.index.max()) if not prices.empty else None,
         },

@@ -63,31 +63,21 @@ def _fixture_recommendations(db_path: Path) -> pd.DataFrame:
         all_tx = db.get_transactions_by_date_range(
             pd.Timestamp("2021-10-07"), pd.Timestamp(PORT_END)
         )
-        prices = db.get_prices(
-            ["SPY", *TICKERS],
-            pd.Timestamp("2021-10-07"),
-            pd.Timestamp("2025-01-20"),
-        )
-        entry_prices = db.get_entry_prices(
-            ["SPY", *TICKERS],
-            pd.Timestamp("2021-10-07"),
-            pd.Timestamp("2025-01-20"),
-        )
     finally:
         db.conn.close()
-    signals = analysis.calculate_signal_potential(
-        entry_prices, prices, [60], decay_lambda=0.005
-    )
     rows = []
     for as_of in pd.date_range(PORT_START, PORT_END, freq="30D"):
         recs = analysis.backtest_recommendations(
-            signals, all_tx, as_of_date=as_of, horizon=60, lookback_days=60,
-            min_buyers=2, top_n=5, threshold=5.0,
-            training_lookback_days=365, scoring_mode="consensus",
+            pd.DataFrame(),
+            all_tx,
+            as_of_date=as_of,
+            horizon=60,
+            lookback_days=28,
+            min_buyers=2,
+            top_n=5,
         )
         if recs.empty:
             continue
-        recs = recs.drop(columns=["optimal_horizon"], errors="ignore")
         recs["as_of_date"] = as_of
         rows.append(recs)
     if not rows:
@@ -365,25 +355,20 @@ class TestNullCanaries:
                 pd.Timestamp("2021-10-07"),
                 pd.Timestamp("2023-06-30"),
             )
-            entry_prices = db.get_entry_prices(
-                ["SPY", *TICKERS],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
-            )
             all_tx = db.get_transactions_by_date_range(
                 pd.Timestamp("2021-10-07"), pd.Timestamp("2023-05-01")
             )
         finally:
             db.conn.close()
 
-        base = sweep_configs(all_tx, prices, entry_prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
+        base = sweep_configs(all_tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
         base_series = base.attrs["series_by_trial"][0]
         selection = select_config(base, 0.05, n_permutations=999, permutation_seed=0)
         assert selection["n_statistical_survivors"] == 1
 
         null_prices = _block_permute_prices(prices, ticker_blocks=False, seed=42)
         null = sweep_configs(
-            all_tx, null_prices, entry_prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
+            all_tx, null_prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
         )
         null_series = null.attrs["series_by_trial"][0]
         assert not base_series.equals(null_series)
@@ -405,23 +390,18 @@ class TestNullCanaries:
                 pd.Timestamp("2021-10-07"),
                 pd.Timestamp("2023-06-30"),
             )
-            entry_prices = db.get_entry_prices(
-                ["SPY", *TICKERS],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
-            )
             all_tx = db.get_transactions_by_date_range(
                 pd.Timestamp("2021-10-07"), pd.Timestamp("2023-05-01")
             )
         finally:
             db.conn.close()
 
-        base = sweep_configs(all_tx, prices, entry_prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
+        base = sweep_configs(all_tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
         base_series = base.attrs["series_by_trial"][0]
 
         null_prices = _block_permute_prices(prices, ticker_blocks=True, seed=11)
         null = sweep_configs(
-            all_tx, null_prices, entry_prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
+            all_tx, null_prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
         )
         null_series = null.attrs["series_by_trial"][0]
         assert not base_series.equals(null_series)
@@ -442,18 +422,13 @@ class TestNullCanaries:
                 pd.Timestamp("2021-10-07"),
                 pd.Timestamp("2023-06-30"),
             )
-            entry_prices = db.get_entry_prices(
-                ["SPY", *TICKERS],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
-            )
             all_tx = db.get_transactions_by_date_range(
                 pd.Timestamp("2021-10-07"), pd.Timestamp("2023-05-01")
             )
         finally:
             db.conn.close()
 
-        base = sweep_configs(all_tx, prices, entry_prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
+        base = sweep_configs(all_tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
         base_series = base.attrs["series_by_trial"][0]
         for shuffle in (
             {"ALICE": "BOB", "BOB": "CAROL", "CAROL": "ALICE"},
@@ -462,6 +437,6 @@ class TestNullCanaries:
             tx = all_tx.copy()
             tx["member"] = tx["member"].map(shuffle)
             permuted = sweep_configs(
-                tx, prices, entry_prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
+                tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
             )
             assert permuted.attrs["series_by_trial"][0].equals(base_series)

@@ -72,12 +72,8 @@ class BacktestParams:
     horizon: int = 60
     # Match the live ticker candidate window. The evaluation horizon is separate.
     lookback_days: int = CONSENSUS_LOOKBACK_DAYS
-    # Research validation uses these only for explicit historical scoring modes.
-    # The production consensus replay does not consume member-training knobs.
-    training_lookback_days: int = 365
     min_buyers: int = CONSENSUS_MIN_BUYERS
     top_n: int = 5
-    threshold: float = 5.0
     frequency_days: int = 30
 
 

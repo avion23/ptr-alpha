@@ -36,12 +36,9 @@ MEMBERS = ["ALICE", "BOB", "CAROL"]
 GRID = {
     "horizon": [60],
     "frequency_days": [30],
-    "training_lookback_days": [365],
+    "lookback_days": [28],
     "min_buyers": [2],
     "top_n": [5],
-    "decay_lambda": [0.005],
-    "bayes_prior_strength": [20],
-    "scoring_mode": ["consensus"],
 }
 TRAIN_START = date(2022, 1, 1)
 TRAIN_END = date(2023, 6, 30)
@@ -150,38 +147,26 @@ class TestNoTradeCashReturns:
 
         # Reconstruct the per-date series with the same calendar and verify a
         # no-trade date contributes exactly -(SPY return): zero cash return.
-        from analyzer import analysis
         from analyzer.pipeline import BacktestParams
         from analyzer.validation import _backtest_core
 
         db = Database(db_path, read_only=True)
         try:
             all_tx = db.get_transactions_by_date_range(
-                pd.Timestamp("2021-10-07"), pd.Timestamp("2023-05-01")
-            )
-            entry_prices = db.get_entry_prices(
-                ["SPY", "AAA", "BBB", "CCC"],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
+                pd.Timestamp("2021-12-04"), pd.Timestamp("2023-05-01")
             )
         finally:
             db.conn.close()
-        signals = analysis.calculate_signal_potential(
-            entry_prices, prices, [60], decay_lambda=0.005
-        )
         params = BacktestParams(
             start_date=date(2022, 1, 1),
             end_date=date(2023, 5, 1),
             horizon=60,
-            lookback_days=60,
-            training_lookback_days=365,
+            lookback_days=28,
             min_buyers=2,
             top_n=5,
             frequency_days=30,
         )
-        _, per_date = _backtest_core(
-            all_tx, prices, params, signals, 0.005, "consensus"
-        )
+        _, per_date = _backtest_core(all_tx, prices, params)
         no_trade_dates = [
             as_of
             for as_of in pd.date_range("2022-01-01", "2023-05-01", freq="30D")
@@ -211,12 +196,7 @@ class TestIdenticalSpySupportAndPerDateAlpha:
         db = Database(db_path, read_only=True)
         try:
             all_tx = db.get_transactions_by_date_range(
-                pd.Timestamp("2021-10-07"), pd.Timestamp("2023-05-01")
-            )
-            entry_prices = db.get_entry_prices(
-                ["SPY", "AAA", "BBB", "CCC"],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
+                pd.Timestamp("2021-12-04"), pd.Timestamp("2023-05-01")
             )
         finally:
             db.conn.close()
@@ -224,36 +204,33 @@ class TestIdenticalSpySupportAndPerDateAlpha:
         from analyzer.pipeline import BacktestParams
         from analyzer.validation import _backtest_core
 
-        signals = analysis.calculate_signal_potential(
-            entry_prices, prices, [60], decay_lambda=0.005
-        )
         params = BacktestParams(
             start_date=date(2022, 1, 1),
             end_date=date(2023, 5, 1),
             horizon=60,
-            lookback_days=60,
-            training_lookback_days=365,
+            lookback_days=28,
             min_buyers=2,
             top_n=5,
             frequency_days=30,
         )
-        result, per_date = _backtest_core(
-            all_tx, prices, params, signals, 0.005, "consensus"
-        )
+        result, per_date = _backtest_core(all_tx, prices, params)
         assert len(per_date) == train["dates_evaluated"]
         assert result.overall_alpha == pytest.approx(float(per_date.mean()), abs=1e-4)
         assert result.overall_alpha > 0
-        assert result.scoring_mode == "consensus"
         assert result.scorer_provenance == CONSENSUS_SCORER_PROVENANCE
 
         # Spot-check one date: alpha == strategy return - SPY return exactly.
         as_of = pd.Timestamp("2022-01-01")
         spy = _benchmark_return(prices, as_of, 60)
         recs = analysis.backtest_recommendations(
-            signals, all_tx, as_of_date=as_of, horizon=60, lookback_days=60,
-            min_buyers=2, top_n=5, threshold=5.0,
-            training_lookback_days=365, scoring_mode="consensus",
-        ).drop(columns=["optimal_horizon"], errors="ignore")
+            pd.DataFrame(),
+            all_tx,
+            as_of_date=as_of,
+            horizon=60,
+            lookback_days=28,
+            min_buyers=2,
+            top_n=5,
+        )
         evaluated = analysis.evaluate_backtest(recs, prices, as_of, 60)
         strategy_return = float(
             pd.to_numeric(evaluated["bt_return_pct"], errors="coerce")
@@ -283,7 +260,13 @@ class TestConsensusIdentityInvariance:
         db_path = build_fixture_db(tmp_path)
         out = run_fixture_validation(db_path)
         assert out["status"] == "retrospective_positive_result"
-        assert out["selected_config"]["scoring_mode"] == "consensus"
+        assert set(out["selected_config"]) == {
+            "horizon",
+            "frequency_days",
+            "lookback_days",
+            "min_buyers",
+            "top_n",
+        }
         control = out["correction"]["member_identity_control"]
         assert control["gating"] is False
         assert control["status"] == "identity_invariant"
@@ -303,22 +286,17 @@ class TestConsensusIdentityInvariance:
                 pd.Timestamp("2021-10-07"),
                 pd.Timestamp("2023-06-30"),
             )
-            entry_prices = db.get_entry_prices(
-                ["SPY", "AAA", "BBB", "CCC"],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
-            )
         finally:
             db.conn.close()
 
         from analyzer.validation import sweep_configs
 
-        base = sweep_configs(all_tx, prices, entry_prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
+        base = sweep_configs(all_tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
         shuffled = all_tx.copy()
         swap = {"ALICE": "BOB", "BOB": "CAROL", "CAROL": "ALICE"}
         shuffled["member"] = shuffled["member"].map(swap)
         permuted = sweep_configs(
-            shuffled, prices, entry_prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
+            shuffled, prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
         )
         base_series = base.attrs["series_by_trial"][0]
         permuted_series = permuted.attrs["series_by_trial"][0]

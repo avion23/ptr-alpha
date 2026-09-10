@@ -30,7 +30,6 @@ def _single_trial_grid() -> dict[str, list]:
         "lookback_days": [CONSENSUS_LOOKBACK_DAYS],
         "min_buyers": [2],
         "top_n": [5],
-        "scoring_mode": ["consensus"],
     }
 
 
@@ -49,8 +48,8 @@ class TestFreeze:
         config = manifest["config"]
         assert config["phases"]["locked_final"]["consumed"] is False
         assert config["phases"]["test"]["status"] == "retrospective_diagnostics_only"
-        assert config["grid"]["scoring_mode"] == ["consensus"]
         assert config["grid"]["lookback_days"] == [CONSENSUS_LOOKBACK_DAYS]
+        assert "scoring_mode" not in config["grid"]
         for irrelevant in (
             "training_lookback_days",
             "decay_lambda",

@@ -36,7 +36,6 @@ The system must never backdate knowledge to the private transaction date.
 | `src/analyzer/validation.py`, `snooping.py` | Purged retrospective validation and multiple-testing controls |
 | `src/analyzer/capitol_trades.py` | Capitol Trades reconciliation input; not an official canonical source |
 | `member_profitability/` | Separate descriptive member-profitability research workflow |
-| `optimize_profit/` | Older optimization/research workflow; not the production authority |
 | `scripts/` | Audits, reparsing, OCR, staging, reconciliation, refresh, and operational tools |
 | `tests/` | Unit, integration, statistical-invariant, parser, database, replay, and CLI checks |
 | `docs/` | Current architecture/parsing docs plus explicitly historical audit/review evidence |
@@ -205,7 +204,7 @@ Common commands:
 
 A positive live score means only that multiple distinct members disclosed recent purchases of the same equity. It is not statistical proof of abnormal future return.
 
-The repository's retrospective validation machinery evaluates only the production consensus rule. It uses scheduled no-trade support, exact holding-period purging, SPY-relative net outcomes, and family-wise controls. Historical member-skill modes remain separate descriptive research. The older `optimize_profit/` workflow remains a separate research artifact and is not a production authority.
+The repository's retrospective validation machinery evaluates only the production consensus rule. It uses scheduled no-trade support, exact holding-period purging, SPY-relative net outcomes, and family-wise controls. Historical member-skill modes remain separate descriptive research. `analyzer.validation` is the single authority for production-strategy evidence; the older parallel optimization/locking engine was removed rather than maintained as a second implementation.
 
 No existing retrospective result should be relabeled as fresh out-of-sample evidence after changing the scorer or implementation. A scorer change requires a new predeclared evaluation.
 

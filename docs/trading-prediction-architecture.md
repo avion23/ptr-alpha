@@ -14,9 +14,9 @@ It separates four things that must not be conflated:
 The current repository is strongest at point-in-time replay and fail-closed
 validation. Its production rule is deliberately small: count distinct recent
 buyers of the same public equity, then replay that rule on identical execution
-semantics. The main remaining architectural weakness is the separate
-`optimize_profit/` research engine, which duplicates parts of validation and can
-drift from the production rule.
+semantics. Production-strategy evidence has one implementation in
+`analyzer.validation`; the older parallel optimization/locking engine was
+removed because it duplicated that authority and could drift from the live rule.
 
 ## 1. Current system at a high level
 
@@ -58,7 +58,6 @@ The major components are:
 | Candidate generation | Build the shared public-equity universe and count recent distinct buyers | `member_ranking/buyer_scoring.py` |
 | Replay | Generate recommendations and evaluate realizable historical outcomes | `backtest/`, `portfolio/`, `portfolio_sim.py` |
 | Statistical validation | Purge horizons, preserve scheduled support, and correct the declared consensus-strategy family | `validation.py`, `snooping.py` |
-| Retrospective optimization | A second locked selection/retrospective/final workflow | `optimize_profit/` |
 | Presentation | User input and formatting only | `cli.py`, reporting modules |
 
 ## 2. The problem from first principles
@@ -186,17 +185,14 @@ These are more valuable than replacing grid search with a fashionable optimizer.
 
 ### 5.1 One experiment, one canonical harness
 
-`analyzer.validation` and `optimize_profit` both implement selection,
-retrospective evaluation, null diagnostics, support checks, manifests, and final
-locking. Even when each is individually careful, two authorities create:
+An earlier repository state had two selection/evidence engines: the current
+`analyzer.validation` path and a separate optimization/locking workflow. That
+created divergent definitions of return, support, costs, significance, and the
+effective number of tried strategies. The duplicate engine is now removed.
 
-- divergent definitions of return, support, costs, and significance;
-- an ambiguous total number of tried strategies;
-- duplicated bug fixes;
-- a path for choosing whichever report looks better.
-
-The repository needs one experiment engine and multiple declarative experiment
-specifications, not multiple engines.
+`analyzer.validation` is the sole production-strategy evidence authority.
+Research additions must call or extend that engine rather than recreate
+selection, support checks, inference, or final-phase rules elsewhere.
 
 ### 5.2 Search is not evidence
 
@@ -547,12 +543,11 @@ replay. No duplicate implementation of production formulas is allowed in tests.
 - Keep result-changing strategy parameters explicit and reject inert search
   dimensions instead of recording them as extra trials.
 
-### P1: remove duplicate experiment authority
+### P1: preserve single experiment authority
 
 Keep `validation.py` as the single engine for production-strategy evidence and
-keep `analyzer.experiments.family` only for deterministic family identity.
-Convert `optimize_profit` into a thin research/reporting caller of that engine or
-remove it; do not maintain a second selection and inference implementation.
+keep `analyzer.experiments.family` only for deterministic family identity. Do
+not add a second selection, locking, support, or inference implementation.
 
 ### P2: establish forecast and policy protocols
 

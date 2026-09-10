@@ -9,7 +9,8 @@ The production gate is deliberately conservative:
   pretending that ordinal observations from different calendars are aligned.
 
 This module contains statistical primitives only. It does not authorize a
-strategy for deployment; the validation ledger owns that decision.
+strategy for deployment; the validation result is determined by the declared
+family, observed support, and corrected statistical evidence.
 """
 
 from __future__ import annotations

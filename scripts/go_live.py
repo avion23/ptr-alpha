@@ -31,8 +31,8 @@ Stages (order is a hard contract):
              checks run inline against the merged schema.
 6. validation - ``ptr-alpha validate --train-start 2022-01-01 --train-end
              2023-12-31 --test-start 2024-01-01 --test-end 2025-06-30
-             --data-dir <STAGING>``: purged retrospective harness with the
-             canonical append-only evaluation ledger.
+             --data-dir <STAGING>``: purged retrospective harness using the
+             canonical consensus validation engine.
 
 The generation manifest (<STAGING>/<GENERATION>/manifest.json) records every
 stage's exact command, exit code, duration, produced-artifact SHA-256 hashes,
@@ -258,11 +258,7 @@ def _stage_artifact_paths(stage_id: str, ctx: Context) -> list[Path]:
         db = staging / "congress.duckdb"
         return [db] if db.exists() else []
     if stage_id == "validation":
-        paths = [staging / "validation_results.json"]
-        ledger = staging / ".ptr-alpha-evaluation-ledger-v2.json"
-        if ledger.exists():
-            paths.append(ledger)
-        return paths
+        return [staging / "validation_results.json"]
     return []
 
 

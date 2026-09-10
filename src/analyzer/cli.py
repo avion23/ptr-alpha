@@ -1498,8 +1498,9 @@ def validate(
     2024-2025 test phase is retrospective, not fresh out-of-sample evidence. The
     post-2025 final phase stays locked.
 
-    Results are written to <data-dir>/validation_results.json and any frozen
-    evaluation is atomically consumed in the evaluation ledger.
+    Results are written to <data-dir>/validation_results.json. Statistical
+    evidence is determined by the declared family and observed outcomes, not by
+    hashes, locks, receipts, or an execution ledger.
     """
     from analyzer.validation import run_validation
 

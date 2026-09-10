@@ -317,7 +317,10 @@ if __name__ == "__main__":
 
 def test_live_ticker_coverage_reads_only_canonical_scope(capsys):
     connection = MagicMock()
-    connection.execute.return_value.fetchall.return_value = [("House", date.today())]
+    connection.execute.return_value.fetchall.return_value = [
+        ("House", date.today()),
+        ("Senate", date.today()),
+    ]
     context = SimpleNamespace(
         transaction_source=SimpleNamespace(db=SimpleNamespace(conn=connection))
     )
@@ -328,6 +331,20 @@ def test_live_ticker_coverage_reads_only_canonical_scope(capsys):
     assert "canonical_transactions" in query
     assert "capitol_trades" not in query
     assert "WARNING" not in capsys.readouterr().err
+
+
+def test_live_ticker_coverage_warns_when_chamber_is_missing(capsys):
+    connection = MagicMock()
+    connection.execute.return_value.fetchall.return_value = [("House", date.today())]
+    context = SimpleNamespace(
+        transaction_source=SimpleNamespace(db=SimpleNamespace(conn=connection))
+    )
+
+    _warn_live_ticker_coverage(context, 28)
+
+    warning = capsys.readouterr().err
+    assert "Senate has no canonical disclosures in the unified database" in warning
+    assert "House" not in warning
 
 
 def test_live_ticker_coverage_warns_when_strategy_window_has_no_disclosures(capsys):

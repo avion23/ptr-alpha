@@ -172,7 +172,7 @@ def prepare_live_consensus_data(
     history_start = as_of - timedelta(days=days_back)
     trades = transaction_source.db.get_transactions_by_date_range(history_start, as_of)
     if trades.empty:
-        raise DataSourceError("No trading data found through as-of date")
+        return trades.copy()
 
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
     trades = trades[
@@ -181,8 +181,6 @@ def prepare_live_consensus_data(
         & (disclosure_dates >= history_start)
         & (disclosure_dates <= as_of)
     ].copy()
-    if trades.empty:
-        raise DataSourceError("No valid tickers found through as-of date")
     return trades
 
 

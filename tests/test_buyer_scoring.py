@@ -182,6 +182,24 @@ def test_consensus_excludes_option_instrument_rows_before_counting():
     assert result.iloc[0]["num_buyers"] == 1
 
 
+def test_consensus_rejects_misclassified_stock_option_from_raw_evidence():
+    transactions = _transactions(("Stock Buyer", "Class Option", "Legacy Option"))
+    transactions["instrument_type"] = ["stock", "stock", "stock"]
+    transactions["raw_asset_class"] = ["Stock", "Stock Option", None]
+    transactions["asset_description"] = [
+        "Apple Inc Common Stock",
+        "Apple Inc Common Stock",
+        "Apple Inc Common StockOption Type: PutStrike price:$145.00",
+    ]
+
+    result = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=pd.Timestamp("2024-05-20"), min_buyers=1
+    )
+
+    assert result.iloc[0]["num_buyers"] == 1
+    assert result.iloc[0]["buyers"] == "STOCK BUYER"
+
+
 def test_consensus_excludes_future_disclosures_before_counting_buyers():
     result = score_ticker_by_buyers(
         "AAPL",

@@ -67,7 +67,7 @@ _OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
 _UNSUPPORTED_ASSET_RE = re.compile(
     r"\b(?:mutual fund|index fund|exchange-traded fund|money market|treasury|"
     r"government securit|corporate bond|municipal bond|real estate|cryptocurrency|"
-    r"private equity|limited partnership)\b",
+    r"private equity|limited partnership|stock\s*option|option\s*type)\b",
     re.IGNORECASE,
 )
 
@@ -411,7 +411,11 @@ def _equity_transaction_row(row: pd.Series) -> bool:
 
     description = " ".join(
         str(value)
-        for value in (row.get("asset_description"), row.get("raw_asset_description"))
+        for value in (
+            row.get("raw_asset_class"),
+            row.get("asset_description"),
+            row.get("raw_asset_description"),
+        )
         if value is not None and not pd.isna(value)
     )
     if _UNSUPPORTED_ASSET_RE.search(description):

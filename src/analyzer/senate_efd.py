@@ -1122,6 +1122,8 @@ class SenateEFDSource(TransactionSource):
             return "call"
         if "put" in lower:
             return "put"
+        if "option" in lower:
+            return "option"
         if "fund" in lower or "etf" in lower:
             return "fund"
         if "stock" in lower or "equity" in lower:

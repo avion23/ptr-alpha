@@ -41,16 +41,10 @@ def _portfolio_config(**overrides) -> PortfolioConfig:
     values = dict(
         initial_capital=20000.0,
         max_positions=5,
-        max_position_pct=0.25,
-        max_sector_pct=0.60,
         rebalance_freq_days=30,
         hold_period_days=120,
         entry_slippage_pct=0.001,
         exit_slippage_pct=0.001,
-        min_signal_score=0.0,
-        max_price_staleness_days=5,
-        max_execution_wait_days=7,
-        sector_by_ticker={ticker: "Tech" for ticker in TICKERS},
     )
     values.update(overrides)
     return PortfolioConfig(**values)

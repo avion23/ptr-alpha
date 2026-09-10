@@ -10,12 +10,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 from typer.testing import CliRunner
 
-from analyzer.cli import (
-    _CURRENT_YEAR,
-    _load_sector_map,
-    _warn_live_ticker_coverage,
-    app,
-)
+from analyzer.cli import _CURRENT_YEAR, _warn_live_ticker_coverage, app
 from analyzer.exceptions import StepResult
 
 
@@ -111,6 +106,31 @@ class TestCliApp(unittest.TestCase):
                 self.assertEqual(result.exit_code, 1, result.output)
                 context.assert_not_called()
 
+    def test_portfolio_rejects_invalid_slippage_before_db_open(self):
+        for option, value in (
+            ("--entry-slippage-bps", "-1"),
+            ("--exit-slippage-bps", "10000"),
+        ):
+            with (
+                self.subTest(option=option),
+                patch("analyzer.cli.get_context") as context,
+            ):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "portfolio",
+                        "--start",
+                        "2024-01-01",
+                        "--end",
+                        "2024-02-01",
+                        option,
+                        value,
+                    ],
+                )
+                self.assertEqual(result.exit_code, 1, result.output)
+                self.assertIn("must be in [0, 10000)", result.output)
+                context.assert_not_called()
+
     def test_fetch_capitol_requires_artifact_and_generation(self):
         with patch("analyzer.capitol_trades.CapitolTradesSource") as source:
             result = self.runner.invoke(app, ["fetch-capitol", "--all"])
@@ -188,38 +208,13 @@ class TestCliApp(unittest.TestCase):
         capitol.assert_not_called()
         self.assertIn("Excluding Capitol Trades from official refresh", result.output)
 
-    def test_portfolio_requires_sector_map_before_db_open(self):
-        with patch("analyzer.cli.get_context") as context:
-            result = self.runner.invoke(
-                app,
-                [
-                    "portfolio",
-                    "--start",
-                    "2024-01-01",
-                    "--end",
-                    "2024-02-01",
-                ],
-            )
-        self.assertEqual(result.exit_code, 1, result.output)
-        self.assertIn("--sector-map is required", result.output)
-        context.assert_not_called()
-
-    def test_sector_map_loader_validates_deterministic_json(self):
-        with TemporaryDirectory() as temp_dir:
-            sectors_path = Path(temp_dir) / "sectors.json"
-            sectors_path.write_text('{"AAPL": "Technology"}')
-            self.assertEqual(
-                _load_sector_map(str(sectors_path)), {"AAPL": "Technology"}
-            )
-            bad_path = Path(temp_dir) / "bad.json"
-            bad_path.write_text('{"AAPL": ""}')
-            with self.assertRaisesRegex(ValueError, "blank ticker or sector"):
-                _load_sector_map(str(bad_path))
-
-    def test_portfolio_fails_before_simulation_when_sector_ticker_missing(self):
+    def test_portfolio_reaches_simulator_without_sector_metadata(self):
         mock_ctx = MagicMock()
         mock_ctx.transaction_source.db.get_transactions_by_date_range.return_value = (
             pd.DataFrame({"ticker": ["B"]})
+        )
+        prices = pd.DataFrame(
+            {"B": [100.0]}, index=pd.to_datetime(["2024-01-02"])
         )
         recommendations = pd.DataFrame(
             {
@@ -228,32 +223,42 @@ class TestCliApp(unittest.TestCase):
                 "as_of_date": [pd.Timestamp("2024-01-01")],
             }
         )
-        with TemporaryDirectory() as temp_dir:
-            sectors_path = Path(temp_dir) / "sectors.json"
-            sectors_path.write_text('{"A": "Technology"}')
-            with (
-                patch("analyzer.cli.get_context", return_value=mock_ctx),
-                patch(
-                    "analyzer.cli._load_portfolio_inputs",
-                    return_value=(pd.DataFrame(), recommendations),
-                ),
-                patch("analyzer.portfolio_sim.PortfolioSimulator") as simulator,
-            ):
-                result = self.runner.invoke(
-                    app,
-                    [
-                        "portfolio",
-                        "--start",
-                        "2024-01-01",
-                        "--end",
-                        "2024-02-01",
-                        "--sector-map",
-                        str(sectors_path),
-                    ],
-                )
-        self.assertEqual(result.exit_code, 1, result.output)
-        self.assertIn("sector map is missing 1 recommended ticker", result.output)
-        simulator.assert_not_called()
+        simulator = MagicMock()
+        simulator.run.return_value = pd.DataFrame()
+        simulator.compute_metrics.return_value = {}
+        with (
+            patch("analyzer.cli.get_context", return_value=mock_ctx),
+            patch(
+                "analyzer.cli._load_portfolio_inputs",
+                return_value=(prices, recommendations),
+            ),
+            patch(
+                "analyzer.portfolio_sim.PortfolioSimulator",
+                return_value=simulator,
+            ) as simulator_type,
+        ):
+            result = self.runner.invoke(
+                app,
+                [
+                    "portfolio",
+                    "--start",
+                    "2024-01-01",
+                    "--end",
+                    "2024-02-01",
+                    "--entry-slippage-bps",
+                    "12.5",
+                    "--exit-slippage-bps",
+                    "20",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        simulator_type.assert_called_once()
+        config = simulator_type.call_args.args[0]
+        self.assertFalse(hasattr(config, "max_sector_pct"))
+        self.assertFalse(hasattr(config, "sector_by_ticker"))
+        self.assertEqual(config.entry_slippage_pct, 0.00125)
+        self.assertEqual(config.exit_slippage_pct, 0.002)
 
 
     def test_parse_fails_when_pipeline_fails_even_if_ocr_inserts_rows(self):

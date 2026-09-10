@@ -54,15 +54,10 @@ PERMUTATION_SEED = 0
 PORTFOLIO_CONFIG = {
     "initial_capital": 20000.0,
     "max_positions": 5,
-    "max_position_pct": 0.25,
-    "max_sector_pct": 1.0,
     "rebalance_freq_days": 30,
     "hold_period_days": 120,
     "entry_slippage_pct": 0.001,
     "exit_slippage_pct": 0.001,
-    "min_signal_score": 0.0,
-    "max_price_staleness_days": 5,
-    "max_execution_wait_days": 7,
 }
 
 
@@ -153,23 +148,15 @@ def _manifest_config(manifest: dict) -> dict:
     return config
 
 
-def _portfolio_config(
-    portfolio_cfg: dict | None = None, sector_by_ticker: dict | None = None
-) -> PortfolioConfig:
+def _portfolio_config(portfolio_cfg: dict | None = None) -> PortfolioConfig:
     cfg = portfolio_cfg or PORTFOLIO_CONFIG
     return PortfolioConfig(
         initial_capital=float(cfg["initial_capital"]),
         max_positions=int(cfg["max_positions"]),
-        max_position_pct=float(cfg["max_position_pct"]),
-        max_sector_pct=float(cfg["max_sector_pct"]),
         rebalance_freq_days=int(cfg["rebalance_freq_days"]),
         hold_period_days=int(cfg["hold_period_days"]),
         entry_slippage_pct=float(cfg["entry_slippage_pct"]),
         exit_slippage_pct=float(cfg["exit_slippage_pct"]),
-        min_signal_score=float(cfg["min_signal_score"]),
-        max_price_staleness_days=int(cfg["max_price_staleness_days"]),
-        max_execution_wait_days=int(cfg["max_execution_wait_days"]),
-        sector_by_ticker=sector_by_ticker or {},
     )
 
 
@@ -234,13 +221,9 @@ def _run_portfolio_evaluation(
     if prices.empty:
         return {"status": "not_run_no_test_window_prices"}
 
-    sector_by_ticker = {
-        str(ticker): "Equity" for ticker in sorted(recs["ticker"].dropna().unique())
-    }
-    sim = PortfolioSimulator(_portfolio_config(portfolio_cfg, sector_by_ticker))
+    sim = PortfolioSimulator(_portfolio_config(portfolio_cfg))
     results = sim.run(recs, prices, test_start, test_end)
     metrics = sim.compute_metrics(prices)
-    metrics["sector_by_ticker"] = sector_by_ticker
     metrics["recommendation_count"] = int(len(recs))
     metrics["snapshot_count"] = int(len(results))
     return {"status": "completed", "metrics": metrics}

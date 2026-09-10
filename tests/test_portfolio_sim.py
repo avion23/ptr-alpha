@@ -2,7 +2,6 @@
 
 import unittest
 from datetime import date
-from unittest.mock import patch
 
 import pandas as pd
 
@@ -41,8 +40,7 @@ def _make_recs(tickers, as_of_date, scores=None):
 
 
 class TestPositionEntry(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_respects_max_positions(self, _mock_sector):
+    def test_respects_max_positions(self):
         cfg = PortfolioConfig(
             initial_capital=100000,
             max_positions=2,
@@ -56,12 +54,10 @@ class TestPositionEntry(unittest.TestCase):
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
         self.assertLessEqual(len(sim.positions), 2)
 
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_position_sizing_respects_max_position_pct(self, _mock_sector):
+    def test_position_sizing_uses_equal_slot_fraction(self):
         cfg = PortfolioConfig(
             initial_capital=10000,
             max_positions=10,
-            max_position_pct=0.25,
             hold_period_days=365,
             entry_slippage_pct=0.0,
             exit_slippage_pct=0.0,
@@ -74,15 +70,12 @@ class TestPositionEntry(unittest.TestCase):
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
         self.assertEqual(len(sim.positions), 1)
         pos = sim.positions[0]
-        max_value = cfg.initial_capital * cfg.max_position_pct
-        self.assertLessEqual(pos.cost, max_value + 1.0)
+        self.assertEqual(pos.cost, cfg.initial_capital / cfg.max_positions)
 
     def test_repeated_runs_reset_mutable_state(self):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
             hold_period_days=2,
             entry_slippage_pct=0.0,
             exit_slippage_pct=0.0,
@@ -105,8 +98,6 @@ class TestPositionEntry(unittest.TestCase):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
         )
         prices = _make_prices(["A"], "2024-01-01", "2024-01-03")
         recommendations = _make_recs(["A"], "2024-01-01")
@@ -119,47 +110,8 @@ class TestPositionEntry(unittest.TestCase):
         pd.testing.assert_frame_equal(recommendations, original)
 
 
-class TestSectorConstraint(unittest.TestCase):
-    def test_sector_constraint_respected(self):
-        cfg = PortfolioConfig(
-            initial_capital=100000,
-            max_positions=10,
-            max_sector_pct=0.40,
-            hold_period_days=365,
-            entry_slippage_pct=0.0,
-            exit_slippage_pct=0.0,
-        )
-        sim = PortfolioSimulator(cfg)
-
-        sector_map = {"A": "Tech", "B": "Tech", "C": "Tech", "D": "Finance"}
-        with patch.object(
-            sim,
-            "_get_sector",
-            side_effect=lambda t, rec=None: sector_map.get(t, "Unknown"),
-        ):
-            prices = _make_prices(
-                ["A", "B", "C", "D"],
-                "2024-01-01",
-                "2024-01-10",
-                base_prices={"A": 100, "B": 100, "C": 100, "D": 100},
-            )
-            recs = _make_recs(
-                ["A", "B", "C", "D"], "2024-01-01", scores=[40, 30, 20, 10]
-            )
-            sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
-
-        # At least one tech should be excluded due to sector cap
-        tech_count = sum(1 for p in sim.positions if p.sector == "Tech")
-        total = len(sim.positions)
-        if total > 0:
-            tech_pct = tech_count / cfg.max_positions
-            # Sector exposure should not exceed limit
-            self.assertLessEqual(tech_pct, cfg.max_sector_pct + 0.01)
-
-
 class TestExitAfterHoldPeriod(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_exit_after_hold_period(self, _mock_sector):
+    def test_exit_after_hold_period(self):
         cfg = PortfolioConfig(
             initial_capital=20000,
             max_positions=5,
@@ -182,8 +134,7 @@ class TestExitAfterHoldPeriod(unittest.TestCase):
 
 
 class TestCashFlows(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_cash_decreases_on_entry(self, _mock_sector):
+    def test_cash_decreases_on_entry(self):
         cfg = PortfolioConfig(
             initial_capital=10000,
             max_positions=5,
@@ -200,8 +151,7 @@ class TestCashFlows(unittest.TestCase):
         sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
         self.assertLess(sim.cash, initial_cash)
 
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_cash_increases_on_exit(self, _mock_sector):
+    def test_cash_increases_on_exit(self):
         cfg = PortfolioConfig(
             initial_capital=10000,
             max_positions=5,
@@ -223,8 +173,7 @@ class TestCashFlows(unittest.TestCase):
 
 
 class TestSlippage(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_entry_slippage_applied(self, _mock_sector):
+    def test_entry_slippage_applied(self):
         cfg_no_slip = PortfolioConfig(
             initial_capital=10000,
             max_positions=5,
@@ -259,8 +208,7 @@ class TestSlippage(unittest.TestCase):
             sim_slip.positions[0].entry_price, sim_no.positions[0].entry_price
         )
 
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_exit_slippage_applied(self, _mock_sector):
+    def test_exit_slippage_applied(self):
         cfg = PortfolioConfig(
             initial_capital=10000,
             max_positions=5,
@@ -281,8 +229,7 @@ class TestSlippage(unittest.TestCase):
 
 
 class TestSharpeRatio(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_sharpe_ratio_computed(self, _mock_sector):
+    def test_sharpe_ratio_computed(self):
         cfg = PortfolioConfig(
             initial_capital=20000,
             max_positions=5,
@@ -307,8 +254,7 @@ class TestSharpeRatio(unittest.TestCase):
 
 
 class TestComputeMetrics(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_spy_comparison_present(self, _mock_sector):
+    def test_spy_comparison_present(self):
         cfg = PortfolioConfig(
             initial_capital=20000,
             max_positions=5,
@@ -331,8 +277,7 @@ class TestComputeMetrics(unittest.TestCase):
 
 
 class TestOverlappingPositions(unittest.TestCase):
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_overlapping_positions_tracked(self, _mock_sector):
+    def test_overlapping_positions_tracked(self):
         cfg = PortfolioConfig(
             initial_capital=100000,
             max_positions=5,
@@ -364,8 +309,7 @@ class TestDrawdownFromInitialCapital(unittest.TestCase):
     """Regression: max_drawdown must anchor to initial_capital, not just
     to the first snapshot's post-trade value."""
 
-    @patch.object(PortfolioSimulator, "_get_sector", return_value="Technology")
-    def test_drawdown_captures_first_period_loss(self, _mock_sector):
+    def test_drawdown_captures_first_period_loss(self):
         cfg = PortfolioConfig(
             initial_capital=10000,
             max_positions=1,
@@ -390,7 +334,7 @@ class TestDrawdownFromInitialCapital(unittest.TestCase):
         # The pre-fix code reported 0% drawdown because the peak only tracked
         # post-entry equity; anchoring to initial capital captures the first
         # snapshot drawdown caused by entry slippage.
-        self.assertAlmostEqual(metrics["max_drawdown_pct"], -0.24, places=2)
+        self.assertAlmostEqual(metrics["max_drawdown_pct"], -0.99, places=2)
 
 
 class TestCausalExecutionScenarios(unittest.TestCase):
@@ -398,8 +342,6 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
             entry_slippage_pct=0.0,
             exit_slippage_pct=0.0,
         )
@@ -413,8 +355,8 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         self.assertEqual(sim.positions[0].entry_date, date(2024, 1, 8))
         self.assertEqual(sim.positions[0].entry_price, 120.0)
 
-    def test_stale_or_missing_next_session_is_rejected(self):
-        cfg = PortfolioConfig(max_execution_wait_days=3)
+    def test_missing_exact_next_session_is_rejected(self):
+        cfg = PortfolioConfig()
         prices = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-05"]))
         sim = PortfolioSimulator(cfg)
         sim.run(
@@ -426,12 +368,34 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         self.assertFalse(sim.positions)
         self.assertEqual(sim.rejected_orders[0]["reason"], "no_next_tradable_session")
 
+    def test_weekend_horizon_exits_on_prior_nyse_session(self):
+        cfg = PortfolioConfig(
+            initial_capital=1000,
+            max_positions=1,
+            hold_period_days=5,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=0.0,
+        )
+        prices = pd.DataFrame(
+            {"A": [100.0, 101.0, 102.0, 103.0, 104.0]},
+            index=pd.to_datetime(
+                ["2024-01-08", "2024-01-09", "2024-01-10", "2024-01-11", "2024-01-12"]
+            ),
+        )
+        sim = PortfolioSimulator(cfg)
+        sim.run(
+            _make_recs(["A"], "2024-01-07"),
+            prices,
+            date(2024, 1, 7),
+            date(2024, 1, 14),
+        )
+        self.assertEqual(sim.closed_positions[0]["entry_date"], date(2024, 1, 8))
+        self.assertEqual(sim.closed_positions[0]["exit_date"], date(2024, 1, 12))
+
     def test_hand_ledger_shared_cash_and_gross_turnover(self):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
             hold_period_days=2,
             entry_slippage_pct=0.0,
             exit_slippage_pct=0.0,
@@ -459,8 +423,6 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
             hold_period_days=30,
             entry_slippage_pct=0.0,
             exit_slippage_pct=0.10,
@@ -478,21 +440,18 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         self.assertEqual(metrics["open_positions"][0]["liquidation_value"], 900.0)
         self.assertEqual(metrics["total_return_pct"], -10.0)
 
-    def test_missing_stored_sector_fails_loudly(self):
+    def test_sector_metadata_is_not_required(self):
         cfg = PortfolioConfig()
         prices = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-02"]))
         recs = _make_recs(["A"], "2024-01-01").drop(columns=["sector"])
-        with self.assertRaisesRegex(ValueError, "Missing stored sector"):
-            PortfolioSimulator(cfg).run(
-                recs, prices, date(2024, 1, 1), date(2024, 1, 2)
-            )
+        sim = PortfolioSimulator(cfg)
+        sim.run(recs, prices, date(2024, 1, 1), date(2024, 1, 2))
+        self.assertEqual([position.ticker for position in sim.positions], ["A"])
 
     def test_recommendations_off_rebalance_cadence_are_not_traded(self):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=2,
-            max_position_pct=0.5,
-            max_sector_pct=1.0,
             rebalance_freq_days=2,
         )
         recs = pd.concat(
@@ -511,8 +470,6 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
             hold_period_days=1,
             entry_slippage_pct=0.0,
             exit_slippage_pct=0.0,
@@ -534,14 +491,11 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         self.assertIsNone(metrics["total_return_pct"])
         self.assertIsNone(metrics["open_positions"][0]["mark_price"])
 
-    def test_expired_position_exits_first_quote_after_suspension(self):
+    def test_missing_exact_exit_session_does_not_shift_trade_later(self):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
             hold_period_days=1,
-            max_price_staleness_days=2,
             entry_slippage_pct=0.0,
             exit_slippage_pct=0.0,
         )
@@ -556,31 +510,18 @@ class TestCausalExecutionScenarios(unittest.TestCase):
             date(2024, 1, 1),
             date(2024, 1, 10),
         )
-        self.assertEqual(sim.closed_positions[0]["exit_date"], date(2024, 1, 10))
-        self.assertEqual(sim.closed_positions[0]["exit_price"], 80.0)
-        self.assertGreater(len(sim.valuation_unavailable_dates), 0)
+        self.assertEqual(sim.closed_positions, [])
         metrics = sim.compute_metrics(prices)
-        self.assertEqual(metrics["valuation_status"], "available")
-        self.assertEqual(
-            metrics["return_status"], "terminal_observed_after_valuation_gaps"
-        )
-        self.assertEqual(
-            metrics["daily_risk_status"],
-            "unavailable_nonconsecutive_valuations",
-        )
-        self.assertEqual(metrics["total_return_pct"], -20.0)
-        self.assertIsNone(metrics["sharpe_ratio"])
-        self.assertIsNone(metrics["max_drawdown_pct"])
-        self.assertIsNone(metrics["volatility_pct"])
+        self.assertEqual(metrics["valuation_status"], "unavailable")
+        self.assertEqual(metrics["valuation_reason"], "unbounded_open_position_mark")
+        self.assertIsNone(metrics["total_return_pct"])
+        self.assertEqual(metrics["unresolved_expired_positions"], 1)
 
-    def test_unresolved_stale_final_mark_abstains_from_return(self):
+    def test_unresolved_final_mark_abstains_from_return(self):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
             hold_period_days=1,
-            max_price_staleness_days=1,
             entry_slippage_pct=0.0,
             exit_slippage_pct=0.0,
         )
@@ -609,8 +550,6 @@ class TestCausalExecutionScenarios(unittest.TestCase):
         cfg = PortfolioConfig(
             initial_capital=1000,
             max_positions=1,
-            max_position_pct=1.0,
-            max_sector_pct=1.0,
         )
         prices = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-02"]))
         sim = PortfolioSimulator(cfg)

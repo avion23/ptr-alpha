@@ -281,18 +281,24 @@ class TestGetTopSignals(unittest.TestCase):
             }
         )
 
-    def test_returns_top_n_sorted_by_score(self):
+    def test_returns_top_n_sorted_by_endpoint_spy_alpha(self):
         signals = self._make_signals()
         top = get_top_signals(signals, horizon=90, top_n=2)
+
         self.assertEqual(len(top), 2)
-        self.assertIn("signal_score", top.columns)
+        self.assertEqual(top["member"].tolist(), ["Bob", "Alice"])
+        self.assertEqual(top["total_spy_alpha_pct"].tolist(), [3.5, 2.0])
+        self.assertNotIn("signal_score", top.columns)
 
-    def test_excludes_non_positive_scores_from_top_signals(self):
+    def test_negative_endpoint_outcomes_remain_descriptive_results(self):
         signals = self._make_signals()
-        signals.loc[:, "total_return_pct"] = -10.0
-        signals.loc[:, "total_spy_alpha_pct"] = -10.0
+        signals.loc[:, "total_return_pct"] = [-10.0, -20.0, -30.0]
+        signals.loc[:, "total_spy_alpha_pct"] = [-3.0, -1.0, -2.0]
 
-        self.assertTrue(get_top_signals(signals, horizon=90, top_n=3).empty)
+        top = get_top_signals(signals, horizon=90, top_n=3)
+
+        self.assertEqual(top["member"].tolist(), ["Bob", "Charlie", "Alice"])
+        self.assertEqual(top["total_spy_alpha_pct"].tolist(), [-1.0, -2.0, -3.0])
 
     def test_collapses_same_member_ticker_disclosure_duplicates(self):
         signals = self._make_signals().iloc[[0]].copy()

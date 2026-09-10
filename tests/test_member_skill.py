@@ -56,8 +56,6 @@ class TestEstimateMemberSkills(unittest.TestCase):
         skills = estimate_member_skills(
             signals,
             min_episodes=1,
-            prior_strength=5.0,
-            recency_half_life_days=365,
             horizon=HORIZON,
             ref_date=REF_DATE,
         )
@@ -73,8 +71,6 @@ class TestEstimateMemberSkills(unittest.TestCase):
         skills = estimate_member_skills(
             signals,
             min_episodes=1,
-            prior_strength=5.0,
-            recency_half_life_days=365,
             horizon=HORIZON,
             ref_date=REF_DATE,
         )
@@ -100,75 +96,34 @@ class TestEstimateMemberSkills(unittest.TestCase):
         skills = estimate_member_skills(
             signals,
             min_episodes=1,
-            prior_strength=5.0,
-            recency_half_life_days=365,
             horizon=HORIZON,
             ref_date=REF_DATE,
         )
 
         self.assertGreater(skills["ONE"].alpha_std, skills["TEN"].alpha_std)
 
-    def test_effective_n_increases_uncertainty_and_shrinkage_for_old_trades(self):
-        rows = []
-        recent_days_ago = [100 + 20 * i for i in range(10)]
-        old_days_ago = [100] + [500 + 50 * i for i in range(9)]
-        for member, days_ago_values, center in (
-            ("RECENT", recent_days_ago, 0.0),
-            ("OLD", old_days_ago, 20.0),
-        ):
-            for i, days_ago in enumerate(days_ago_values):
-                alpha = center + (-1.0 if i % 2 == 0 else 1.0)
-                rows.append(
-                    {
-                        "member": member,
-                        "ticker": f"T{i % 3}",
-                        "disclosure_date": REF_DATE - pd.Timedelta(days=days_ago),
-                        "signal_type": "Purchase",
-                        "horizon_days": HORIZON,
-                        "spy_alpha_pct": alpha,
-                        "total_spy_alpha_pct": alpha,
-                    }
-                )
-
-        skills = estimate_member_skills(
-            pd.DataFrame(rows),
-            min_episodes=1,
-            prior_strength=5.0,
-            recency_half_life_days=100,
-            horizon=HORIZON,
-            ref_date=REF_DATE,
-        )
-
-        self.assertEqual(skills["OLD"].n_episodes, skills["RECENT"].n_episodes)
-        self.assertGreater(skills["OLD"].alpha_std, skills["RECENT"].alpha_std)
-        self.assertGreater(skills["OLD"].shrinkage, skills["RECENT"].shrinkage)
-
-    def test_uniform_recency_scaling_reduces_effective_information(self):
+    def test_episode_age_does_not_change_information_weight(self):
         recent = _make_signals({"A": [8.0, 10.0, 12.0], "B": [-2.0, 0.0, 2.0]})
         old = recent.copy()
         old["disclosure_date"] = old["disclosure_date"] - pd.Timedelta(days=730)
 
         recent_skills = estimate_member_skills(
             recent,
-            prior_strength=1.0,
-            recency_half_life_days=100,
             horizon=HORIZON,
             ref_date=REF_DATE,
         )
         old_skills = estimate_member_skills(
             old,
-            prior_strength=1.0,
-            recency_half_life_days=100,
             horizon=HORIZON,
             ref_date=REF_DATE,
         )
 
-        self.assertLess(
+        self.assertEqual(
             old_skills["A"].effective_information,
             recent_skills["A"].effective_information,
         )
-        self.assertGreater(old_skills["A"].shrinkage, recent_skills["A"].shrinkage)
-        self.assertGreater(old_skills["A"].alpha_std, recent_skills["A"].alpha_std)
+        self.assertEqual(old_skills["A"].shrinkage, recent_skills["A"].shrinkage)
+        self.assertEqual(old_skills["A"].alpha_std, recent_skills["A"].alpha_std)
 
     def test_global_mean_member_has_nonzero_finite_posterior_std(self):
         signals = _make_signals(
@@ -182,8 +137,6 @@ class TestEstimateMemberSkills(unittest.TestCase):
         skills = estimate_member_skills(
             signals,
             min_episodes=1,
-            prior_strength=5.0,
-            recency_half_life_days=365,
             horizon=HORIZON,
             ref_date=REF_DATE,
         )

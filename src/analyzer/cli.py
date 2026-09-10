@@ -119,21 +119,19 @@ def _save_results(
                 "avg_loss_avoided_pct",
                 "median_loss_avoided_pct",
                 "sale_trades",
+                "prob_up_given_sell",
                 "sharpe_ratio",
-                "bayes_win_prob",
-                "posterior_lift",
                 "avg_spy_alpha_pct",
             ]
         case AnalysisMode.MEMBER_RANKINGS:
             display_cols = [
                 "member",
+                "shrunk_alpha",
+                "shrunk_alpha_std",
+                "alpha_shrinkage",
                 "avg_total_spy_alpha_pct",
-                "avg_spy_alpha_pct",
-                "bayes_win_prob",
-                "posterior_lift",
+                "prob_up_given_buy",
                 "peak_hit_rate_pct",
-                "sharpe_ratio",
-                "conviction_score",
                 "purchase_trades",
             ]
         case _:

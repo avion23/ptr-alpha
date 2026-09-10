@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, log, sqrt
+from math import sqrt
 
 import numpy as np
 import pandas as pd
 
-from analyzer import signals as _signals
 from analyzer.analysis import TransactionType, _collapse_to_episodes
 from analyzer.member_names import canonical_member_key
 from analyzer.member_ranking.bayes import normal_normal_posteriors
@@ -27,27 +26,12 @@ class MemberSkillPosterior:
     shrinkage: float
 
 
-def _recency_weight(
-    disclosure_date: pd.Timestamp,
-    ref_date: pd.Timestamp,
-    half_life_days: int,
-) -> float:
-    """Exponential power-likelihood weight based on days since disclosure."""
-    if half_life_days <= 0:
-        raise ValueError("recency_half_life_days must be positive")
-    days_ago = max((ref_date - disclosure_date).days, 0)
-    return exp(-days_ago * log(2) / half_life_days)
-
-
-def _weighted_member_rows(
+def _member_rows(
     signals_df: pd.DataFrame,
     *,
     horizon: int,
     ref_date: pd.Timestamp,
-    recency_half_life_days: int,
 ) -> pd.DataFrame:
-    if recency_half_life_days <= 0:
-        raise ValueError("recency_half_life_days must be positive")
     if _OUTCOME_COL not in signals_df.columns:
         raise ValueError(
             "Member skill requires endpoint SPY alpha; total_spy_alpha_pct is missing"
@@ -63,14 +47,7 @@ def _weighted_member_rows(
     if eligible.empty:
         return eligible
 
-    collapsed = _collapse_to_episodes(eligible)
-    days_ago = (ref_date - pd.to_datetime(collapsed["disclosure_date"])).dt.days
-    collapsed["_information_weight"] = np.exp(
-        -days_ago.clip(lower=0).to_numpy(dtype=float)
-        * np.log(2)
-        / recency_half_life_days
-    )
-    return collapsed
+    return _collapse_to_episodes(eligible)
 
 
 def estimate_member_skills(
@@ -78,31 +55,23 @@ def estimate_member_skills(
     *,
     ref_date: pd.Timestamp,
     min_episodes: int = 1,
-    prior_strength: float | None = None,
-    recency_half_life_days: int = 365,
     horizon: int = 90,
 ) -> dict[str, MemberSkillPosterior]:
     """Estimate descriptive normal-normal member associations.
 
-    Endpoint excess alpha is modeled by the same common normal-normal fit used
-    by member ranking. Recency weights scale effective information. Effects are
-    predictive associations, not causal skill, and production trading rejects
-    them until time-blocked validation supports their use.
+    Endpoint excess alpha is modeled by the same empirical normal-normal fit
+    used by member ranking. Each completed episode contributes one observation.
+    Effects are predictive associations, not causal skill.
     """
     if signals_df.empty:
         return {}
     if min_episodes < 1:
         raise ValueError("min_episodes must be positive")
-    if prior_strength is None:
-        prior_strength = float(_signals.BAYES_PRIOR_STRENGTH)
-    if prior_strength <= 0:
-        raise ValueError("prior_strength must be positive")
 
-    collapsed = _weighted_member_rows(
+    collapsed = _member_rows(
         signals_df,
         horizon=horizon,
         ref_date=pd.Timestamp(ref_date),
-        recency_half_life_days=recency_half_life_days,
     )
     if collapsed.empty:
         return {}
@@ -116,8 +85,6 @@ def estimate_member_skills(
     fit = normal_normal_posteriors(
         collapsed[_OUTCOME_COL].to_numpy(dtype=float),
         collapsed["member"].to_numpy(dtype=object),
-        information_weights=collapsed["_information_weight"].to_numpy(dtype=float),
-        prior_strength=float(prior_strength),
     )
     return {
         member: MemberSkillPosterior(

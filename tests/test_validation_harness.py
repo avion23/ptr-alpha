@@ -180,7 +180,7 @@ class TestNoTradeCashReturns:
             frequency_days=30,
         )
         _, per_date = _backtest_core(
-            all_tx, prices, params, signals, 20.0, 0.005, "consensus"
+            all_tx, prices, params, signals, 0.005, "consensus"
         )
         no_trade_dates = [
             as_of
@@ -238,7 +238,7 @@ class TestIdenticalSpySupportAndPerDateAlpha:
             frequency_days=30,
         )
         result, per_date = _backtest_core(
-            all_tx, prices, params, signals, 20.0, 0.005, "consensus"
+            all_tx, prices, params, signals, 0.005, "consensus"
         )
         assert len(per_date) == train["dates_evaluated"]
         assert result.overall_alpha == pytest.approx(float(per_date.mean()), abs=1e-4)
@@ -253,7 +253,6 @@ class TestIdenticalSpySupportAndPerDateAlpha:
             signals, all_tx, as_of_date=as_of, horizon=60, lookback_days=60,
             min_buyers=2, top_n=5, threshold=5.0,
             training_lookback_days=365, scoring_mode="consensus",
-            bayes_prior_strength=20.0,
         ).drop(columns=["optimal_horizon"], errors="ignore")
         evaluated = analysis.evaluate_backtest(recs, prices, as_of, 60)
         strategy_return = float(

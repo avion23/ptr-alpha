@@ -10,7 +10,6 @@ from analyzer.models import AnalysisMode, TransactionType  # noqa: F401 — re-e
 
 from analyzer.signals import (  # noqa: F401
     DECAY_LAMBDA,
-    BAYES_PRIOR_STRENGTH,
     TICKER_PERF_MIN_TRADES,
     MIN_ENTRY_PRICE,
     _price_at_or_before,

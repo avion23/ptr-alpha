@@ -105,7 +105,6 @@ class SweepResult:
     min_buyers: int
     top_n: int
     decay_lambda: float
-    bayes_prior_strength: float
     scoring_mode: str = "consensus"
     scorer_provenance: str = ""
     total_recs: int = 0
@@ -130,7 +129,7 @@ class SweepResult:
 
 
 def _empty_result(
-    params: BacktestParams, bayes: float, decay: float, mode: str
+    params: BacktestParams, decay: float, mode: str
 ) -> SweepResult:
     scheduled = len(
         pd.date_range(
@@ -145,7 +144,6 @@ def _empty_result(
         min_buyers=params.min_buyers,
         top_n=params.top_n,
         decay_lambda=decay,
-        bayes_prior_strength=bayes,
         scoring_mode=mode,
         scheduled_dates=scheduled,
     )
@@ -191,7 +189,6 @@ def _backtest_core(
     prices: pd.DataFrame,
     params: BacktestParams,
     signals: pd.DataFrame,
-    bayes_prior_strength: float,
     decay_lambda: float,
     scoring_mode: str = "consensus",
 ) -> tuple[SweepResult, pd.Series]:
@@ -202,7 +199,7 @@ def _backtest_core(
     zero cash return; it is not silently dropped. The declared horizon is the
     actual holding used for both strategy and benchmark.
     """
-    empty = _empty_result(params, bayes_prior_strength, decay_lambda, scoring_mode)
+    empty = _empty_result(params, decay_lambda, scoring_mode)
     as_of_dates = pd.date_range(
         params.start_date, params.end_date, freq=f"{params.frequency_days}D"
     )
@@ -242,7 +239,6 @@ def _backtest_core(
                 threshold=params.threshold,
                 training_lookback_days=params.training_lookback_days,
                 scoring_mode=scoring_mode,
-                bayes_prior_strength=bayes_prior_strength,
             )
             if not isinstance(recommendations, pd.DataFrame):
                 raise TypeError("recommendations must be returned as a DataFrame")
@@ -368,7 +364,6 @@ def _backtest_core(
         min_buyers=params.min_buyers,
         top_n=params.top_n,
         decay_lambda=decay_lambda,
-        bayes_prior_strength=bayes_prior_strength,
         scoring_mode=scoring_mode,
         scorer_provenance=(
             CONSENSUS_SCORER_PROVENANCE
@@ -513,7 +508,6 @@ def sweep_configs(
             frequency_days=frequency,
         )
         decay = float(values.get("decay_lambda", 0.005))
-        bayes = float(values.get("bayes_prior_strength", 20.0))
         trial_signals = (
             pd.DataFrame() if mode == "consensus" else signal_cache[(horizon, decay)]
         )
@@ -523,7 +517,6 @@ def sweep_configs(
                 prices,
                 params,
                 trial_signals,
-                bayes_prior_strength=bayes,
                 decay_lambda=decay,
                 scoring_mode=mode,
             )
@@ -532,7 +525,7 @@ def sweep_configs(
                 "trial", pd.Timestamp(start), "trial_exception", exc
             )
             result = replace(
-                _empty_result(params, bayes, decay, mode),
+                _empty_result(params, decay, mode),
                 status="failed",
                 failure_reason="trial_exception",
                 failure_count=1,
@@ -813,7 +806,6 @@ def _family_metadata_for_sweep(sweep_df: pd.DataFrame) -> dict:
             "min_buyers",
             "top_n",
             "decay_lambda",
-            "bayes_prior_strength",
             "scoring_mode",
             "threshold",
         )
@@ -1576,7 +1568,6 @@ def _run_frozen(all_tx, prices, signals, config, start: date, end: date):
         prices,
         params,
         pd.DataFrame() if mode == "consensus" else signals,
-        float(config.get("bayes_prior_strength", 20.0)),
         float(config.get("decay_lambda", 0.005)),
         mode,
     )
@@ -1597,7 +1588,6 @@ def _config_from_row(row: dict) -> dict:
                 "training_lookback_days",
                 "threshold",
                 "decay_lambda",
-                "bayes_prior_strength",
             ]
         )
     return {key: row[key] for key in keys if key in row}

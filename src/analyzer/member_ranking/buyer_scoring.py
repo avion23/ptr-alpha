@@ -13,7 +13,6 @@ import re
 
 import pandas as pd
 
-from analyzer import signals as _signals
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
@@ -83,7 +82,6 @@ def score_ticker_by_buyers(
     member_rankings: pd.DataFrame | None = None,
     min_buyers: int = 2,
     ticker_perf_signals: pd.DataFrame | None = None,
-    _bayes_prior_strength: float | None = None,
     _ranking_dicts: dict | None = None,
     scoring_mode: str = "consensus",
     as_of_date: pd.Timestamp | None = None,
@@ -101,14 +99,7 @@ def score_ticker_by_buyers(
     if scoring_mode == "consensus" and pd.isna(pd.Timestamp(as_of_date)):
         raise AnalysisError("consensus as_of_date must be a valid timestamp")
     if scoring_mode != "consensus" and member_rankings is None:
-        bayes_prior = (
-            _bayes_prior_strength
-            if _bayes_prior_strength is not None
-            else _signals.BAYES_PRIOR_STRENGTH
-        )
-        member_rankings = rank_members(
-            signals_df, horizon, threshold, _bayes_prior_strength=bayes_prior
-        )
+        member_rankings = rank_members(signals_df, horizon, threshold)
 
     if scoring_mode == "consensus":
         normalized_ticker = _validate_ticker(ticker)

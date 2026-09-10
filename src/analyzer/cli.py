@@ -223,15 +223,17 @@ def _warn_live_ticker_coverage(app_ctx: AppContext, days_back: int) -> None:
             """,
             [as_of],
         ).fetchall()
-        if not rows:
-            print(
-                "WARNING: No canonical congressional disclosures are stored for "
-                f"the live window ending {as_of}. Run 'ptr-alpha refresh' first.",
-                file=sys.stderr,
-            )
-            return
-        for chamber, latest in rows:
-            if latest is None or latest >= window_start:
+        latest_by_chamber = {str(chamber): latest for chamber, latest in rows}
+        for chamber in ("House", "Senate"):
+            latest = latest_by_chamber.get(chamber)
+            if latest is None:
+                print(
+                    f"WARNING: {chamber} has no canonical disclosures in the unified "
+                    "database. Refresh before treating an empty result as current.",
+                    file=sys.stderr,
+                )
+                continue
+            if latest >= window_start:
                 continue
             age = (as_of - latest).days
             print(

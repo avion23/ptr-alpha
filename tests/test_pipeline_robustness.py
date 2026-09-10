@@ -219,6 +219,24 @@ def test_single_ticker_rejects_prelisting_reused_symbol_rows():
     assert result.data["score"].iloc[0]["signal_score"] == 0.0
 
 
+def test_recent_ticker_scoring_empty_window_is_successful_no_signal():
+    as_of = date(2025, 6, 1)
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = pd.DataFrame()
+
+    result = run_recent_ticker_scoring(
+        transaction_source,
+        TickerScoringParams(year=2025, as_of_date=as_of),
+    )
+
+    assert result.success
+    assert result.data["result"].empty
+    assert result.data["as_of_date"] == as_of
+    transaction_source.db.get_transactions_by_date_range.assert_called_once_with(
+        pd.Timestamp("2025-05-04"), pd.Timestamp(as_of)
+    )
+
+
 def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     as_of = date(2025, 6, 1)
     transaction_source = MagicMock()

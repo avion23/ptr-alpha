@@ -80,7 +80,7 @@ There is no second production optimization engine, member-scoring engine, adapti
 
 ## 3. Canonical data model
 
-Official House and Senate records share the canonical database model. Source and chamber provenance preserve their independent refresh boundaries.
+Official House and Senate records share the canonical database model. Source and chamber provenance preserve their independent refresh boundaries. A selected database is self-contained: readers do not automatically union a sibling legacy `data/senate/congress.duckdb`, so old split datasets must be refreshed into the selected `--data-dir` before unified analysis.
 
 `canonical_transactions` is the decision-facing transaction view. It excludes reconciliation-only Capitol Trades rows. Capitol Trades artifacts may be used to compare source evidence but are not an official canonical transaction source.
 

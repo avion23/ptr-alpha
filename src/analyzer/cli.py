@@ -1521,7 +1521,6 @@ def _validation_grid(full_grid: bool) -> dict[str, list]:
         "lookback_days": [CONSENSUS_LOOKBACK_DAYS],
         "min_buyers": [2, 3, 5],
         "top_n": [3, 5],
-        "scoring_mode": ["consensus"],
     }
     return grid
 

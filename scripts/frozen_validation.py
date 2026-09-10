@@ -23,7 +23,13 @@ from analyzer.member_ranking.buyer_scoring import (
 )
 from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
 from analyzer.price_repository import next_nyse_session
-from analyzer.validation import LOCKED_FINAL_START, PRIMARY_METRIC, _phase_end, run_validation
+from analyzer.validation import (
+    LOCKED_FINAL_START,
+    PRIMARY_METRIC,
+    _effective_validation_grid,
+    _phase_end,
+    run_validation,
+)
 
 FROZEN_MANIFEST_PATH = (
     Path(__file__).resolve().parents[1] / "validation" / "phase2-evaluation-manifest.json"
@@ -40,7 +46,6 @@ GRID = {
     "lookback_days": [CONSENSUS_LOOKBACK_DAYS],
     "min_buyers": [2, 3, 5],
     "top_n": [3, 5],
-    "scoring_mode": ["consensus"],
 }
 ALPHA = 0.05
 N_PERMUTATIONS = 999
@@ -91,7 +96,6 @@ def config_payload(
         "alpha": ALPHA,
         "n_permutations": N_PERMUTATIONS,
         "permutation_seed": PERMUTATION_SEED,
-        "scoring_modes": ["consensus"],
         "portfolio": PORTFOLIO_CONFIG,
     }
     if grid_decision:
@@ -129,10 +133,10 @@ def _manifest_config(manifest: dict) -> dict:
     grid = config.get("grid")
     if not isinstance(phases, dict) or not isinstance(grid, dict):
         raise FrozenManifestError("validation manifest requires phases and grid")
-    if grid.get("scoring_mode", ["consensus"]) != ["consensus"]:
-        raise FrozenManifestError("frozen validation supports consensus scoring only")
-    if not grid.get("horizon") or not grid.get("min_buyers") or not grid.get("top_n"):
-        raise FrozenManifestError("validation grid is missing required parameters")
+    try:
+        config["grid"] = _effective_validation_grid(grid)
+    except ValueError as exc:
+        raise FrozenManifestError(str(exc)) from exc
     try:
         train_start, train_end = map(
             date.fromisoformat, phases["train"]["boundary"]
@@ -192,7 +196,6 @@ def _test_window_recommendations(
             lookback_days=lookback_days,
             min_buyers=int(config["min_buyers"]),
             top_n=int(config["top_n"]),
-            scoring_mode="consensus",
         )
         if recs.empty:
             continue

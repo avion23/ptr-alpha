@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 from dataclasses import replace
 from datetime import date
@@ -31,7 +30,6 @@ from analyzer.validation import (
     _run_identity_invariant_control,
     _run_validation_with_db,
     newey_west_tstat,
-    permute_signal_member_labels,
     run_validation,
     select_config,
 )
@@ -60,12 +58,9 @@ def _selection_frame(
                 "trial_id": trial_id,
                 "horizon": 60,
                 "frequency_days": 30,
-                "training_lookback_days": 365,
+                "lookback_days": 28,
                 "min_buyers": 2,
                 "top_n": 5,
-                "decay_lambda": 0.005,
-                "bayes_prior_strength": 20.0,
-                "scoring_mode": "consensus",
                 "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
                 "total_recs": 100,
                 "dates_evaluated": len(values),
@@ -209,13 +204,16 @@ class TestMemberIdentityGate:
                 member_control={"release_ready": True},
             )
 
-    def test_descriptive_scoring_modes_are_never_deployment_candidates(self):
-        series = {0: _series(np.full(180, 2.0))}
-        frame = _selection_frame(series)
-        frame["scoring_mode"] = "shrunk_alpha"
-        result = select_config(frame, series_by_trial=series, n_permutations=999)
-        assert result["statistical_candidate"] is None
-        assert result["deployable_config"] is None
+    def test_validation_grid_rejects_identity_dependent_scoring_mode(self):
+        with pytest.raises(ValueError, match="unsupported parameter"):
+            _effective_validation_grid(
+                {
+                    "horizon": [60],
+                    "min_buyers": [3],
+                    "top_n": [5],
+                    "scoring_mode": ["shrunk_alpha"],
+                }
+            )
 
     def test_identity_free_exemption_payload_is_never_accepted(self):
         series = {0: _series(np.full(180, 2.0))}
@@ -332,7 +330,7 @@ class TestExecutionSupport:
 
         def fake_recommendations(*args, **kwargs):
             assert len(args) == 2
-            assert kwargs["scoring_mode"] == "consensus"
+            assert "scoring_mode" not in kwargs
             as_of = pd.Timestamp(kwargs["as_of_date"])
             if as_of.day != 16:
                 return pd.DataFrame()
@@ -377,7 +375,6 @@ class TestExecutionSupport:
             end_date=date(2024, 1, 31),
             horizon=60,
             frequency_days=15,
-            training_lookback_days=365,
             min_buyers=2,
             top_n=3,
         )
@@ -385,15 +382,8 @@ class TestExecutionSupport:
             pd.DataFrame(),
             pd.DataFrame({"SPY": [1.0]}),
             params,
-            pd.DataFrame(),
-            0.005,
         )
         assert list(primary) == pytest.approx([-1.0, 1.0, -1.0])
-        assert result.scoring_mode == "consensus"
-        assert (
-            inspect.signature(_backtest_core).parameters["scoring_mode"].default
-            == "consensus"
-        )
         assert result.scheduled_dates == 3
         assert result.benchmark_dates == 3
         assert result.dates_evaluated == 3
@@ -416,7 +406,6 @@ class TestFailureFamilies:
             end_date=date(2024, 1, 1),
             horizon=60,
             lookback_days=60,
-            training_lookback_days=365,
             min_buyers=2,
             top_n=5,
             frequency_days=30,
@@ -434,8 +423,6 @@ class TestFailureFamilies:
             pd.DataFrame(),
             pd.DataFrame(),
             self._params(),
-            pd.DataFrame(),
-            0.005,
         )
         assert result.status == "failed"
         assert result.failure_reason == "recommendation_exception"
@@ -454,8 +441,6 @@ class TestFailureFamilies:
             pd.DataFrame(),
             pd.DataFrame(),
             self._params(),
-            pd.DataFrame(),
-            0.005,
         )
         assert result.status == "completed"
         assert result.failure_count == 0
@@ -487,8 +472,6 @@ class TestFailureFamilies:
             pd.DataFrame(),
             pd.DataFrame(),
             self._params(),
-            pd.DataFrame(),
-            0.005,
         )
         assert result.status == "failed"
         assert result.failure_reason == "evaluation_exception"
@@ -607,7 +590,6 @@ class TestPurgeAndManifest:
         manifest = _build_manifest(
             frame,
             frame,
-            frame,
             {"horizon": [60], "frequency_days": [30]},
             date(2022, 1, 1),
             date(2023, 12, 31),
@@ -642,63 +624,33 @@ class TestPurgeAndManifest:
         assert "evaluation_ledger" not in manifest
 
 
-class TestMemberPermutationCanary:
-    def test_member_label_permutation_is_bijective_and_preserves_values(self):
-        original = {
-            (60, 0.005): pd.DataFrame(
-                {
-                    "member": ["A", "A", "B", "C"],
-                    "ticker": ["X", "Y", "Z", "Q"],
-                    "outcome": [1.0, 2.0, 3.0, 4.0],
-                }
-            ),
-            (90, 0.005): pd.DataFrame(
-                {"member": ["A", "B", "C"], "outcome": [5.0, 6.0, 7.0]}
-            ),
-        }
-        permuted = permute_signal_member_labels(original, seed=3)
-        assert sorted(permuted[(60, 0.005)]["member"].value_counts()) == [1, 1, 2]
-        assert permuted[(60, 0.005)]["outcome"].tolist() == [1.0, 2.0, 3.0, 4.0]
-        # The full permutation group is valid: fixed points are not excluded.
-        identity = permute_signal_member_labels(original, permutation=("A", "B", "C"))
-        assert (
-            identity[(60, 0.005)]["member"].tolist()
-            == original[(60, 0.005)]["member"].tolist()
-        )
-        assert original[(60, 0.005)]["member"].tolist() == ["A", "A", "B", "C"]
-
-
 def test_cli_validation_grid_counts_are_exact():
     assert math.prod(len(values) for values in _validation_grid(False).values()) == 18
     assert math.prod(len(values) for values in _validation_grid(True).values()) == 36
-    assert _validation_grid(False)["scoring_mode"] == ["consensus"]
     assert _validation_grid(False)["lookback_days"] == [28]
+    assert "scoring_mode" not in _validation_grid(False)
     assert "training_lookback_days" not in _validation_grid(True)
     assert "decay_lambda" not in _validation_grid(True)
     assert "bayes_prior_strength" not in _validation_grid(True)
 
 
-def test_consensus_family_discards_nonoperative_dimensions():
-    effective = _effective_validation_grid(
-        {
-            "horizon": [60],
-            "frequency_days": [30],
-            "lookback_days": [28],
-            "training_lookback_days": [180, 365],
-            "min_buyers": [3],
-            "top_n": [5],
-            "threshold": [1.0, 5.0],
-            "decay_lambda": [0.001, 0.02],
-            "bayes_prior_strength": [5, 50],
-            "scoring_mode": ["consensus"],
-        }
-    )
+def test_consensus_family_rejects_nonoperative_dimensions():
+    for parameter in (
+        "training_lookback_days",
+        "threshold",
+        "decay_lambda",
+        "bayes_prior_strength",
+        "scoring_mode",
+    ):
+        with pytest.raises(ValueError, match="unsupported parameter"):
+            _effective_validation_grid({"horizon": [60], parameter: [1]})
 
-    assert effective == {
+
+def test_consensus_family_materializes_strategy_defaults():
+    assert _effective_validation_grid({"horizon": [60]}) == {
         "horizon": [60],
-        "frequency_days": [30],
-        "lookback_days": [28],
-        "min_buyers": [3],
-        "top_n": [5],
-        "scoring_mode": ["consensus"],
+        "frequency_days": (30,),
+        "lookback_days": (28,),
+        "min_buyers": (3,),
+        "top_n": (5,),
     }

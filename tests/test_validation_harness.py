@@ -335,7 +335,6 @@ class TestRetrospectiveNotFinalWording:
         )
         locked = manifest["phases"]["locked_final"]
         assert locked["status"] == "locked_not_queried_or_evaluated"
-        assert locked["consumed"] is False
         assert locked["value_rows_queried"] is False
 
         # No profitability wording may appear in any status/verdict; any

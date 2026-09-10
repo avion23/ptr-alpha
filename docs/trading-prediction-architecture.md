@@ -12,10 +12,11 @@ It separates four things that must not be conflated:
    used outside the sample.
 
 The current repository is strongest at point-in-time replay and fail-closed
-validation. Its main weakness is not a missing optimizer or a missing neural
-network. It is that prediction experiments are spread across more than one
-harness, while member effects and strategy-family dependence have historically
-used stronger assumptions than the data justify.
+validation. Its production rule is deliberately small: count distinct recent
+buyers of the same public equity, then replay that rule on identical execution
+semantics. The main remaining architectural weakness is the separate
+`optimize_profit/` research engine, which duplicates parts of validation and can
+drift from the production rule.
 
 ## 1. Current system at a high level
 
@@ -54,9 +55,9 @@ The major components are:
 | Persistence | Store transactions, prices, metadata, parse runs, and provenance | `database.py`, repository modules |
 | Point-in-time data | Build entry prices, feature histories, and completed forward outcomes | `price_snapshot.py`, `signals/`, `pipeline.py` |
 | Descriptive member analysis | Estimate hit rates, alpha, and partially pooled member effects | `member_ranking/` |
-| Candidate generation | Build the shared public-equity universe and count recent distinct buyers | `candidates.py`, `member_ranking/buyer_scoring.py` |
+| Candidate generation | Build the shared public-equity universe and count recent distinct buyers | `member_ranking/buyer_scoring.py` |
 | Replay | Generate recommendations and evaluate realizable historical outcomes | `backtest/`, `portfolio/`, `portfolio_sim.py` |
-| Statistical validation | Purge horizons, preserve scheduled support, correct search, and consume evaluations once | `validation.py`, `snooping.py` |
+| Statistical validation | Purge horizons, preserve scheduled support, and correct the declared consensus-strategy family | `validation.py`, `snooping.py` |
 | Retrospective optimization | A second locked selection/retrospective/final workflow | `optimize_profit/` |
 | Presentation | User input and formatting only | `cli.py`, reporting modules |
 
@@ -177,7 +178,7 @@ The following properties should be preserved:
 - the CLI backtest evaluates its declared fixed horizon rather than an adaptive OU horizon;
 - member-skill modes are descriptive and cannot authorize deployment;
 - retrospective history is labeled as reused history, not fresh evidence;
-- final evaluation is locked and consumed through an auditable ledger.
+- validation refuses any requested test window that enters the reserved post-2025 holdout; reused 2024-2025 history stays labeled retrospective.
 
 These are more valuable than replacing grid search with a fashionable optimizer.
 
@@ -323,21 +324,23 @@ functional-core / imperative-shell boundary.
 
 ### 6.2 Canonical experiment specification
 
-Every search should be represented by one immutable `ExperimentSpec` containing:
+Every search should have one explicit experiment specification containing only
+inputs that can change the result:
 
-- data snapshot and source hashes;
-- public-time feature schema version;
-- label and executable-entry definition;
-- model family and hyperparameter domain;
-- optimizer, seed, and maximum trial budget;
-- all train/validation/final windows and embargoes;
-- transaction-cost and portfolio policy version;
+- public-time data scope and feature schema version;
+- label and executable-entry/exit definition;
+- model or strategy family and parameter domain;
+- optimizer, seed, and maximum trial budget when an optimizer is used;
+- train/validation/holdout windows and embargoes;
+- transaction-cost and portfolio assumptions;
 - one primary selection utility;
 - null controls and release thresholds.
 
-The trial ledger must record suggested, started, failed, pruned, completed, and
-manually added configurations. A Bayesian optimizer is then only an alternate
-producer of `TrialSpec` records.
+Hashes, lock files, receipts, and environment fingerprints may identify an
+artifact for debugging, but they do not authorize evaluation or establish
+correctness. Every tried configuration that can affect model selection belongs
+to the statistical family whether it came from a grid, an optimizer, or a
+manual experiment.
 
 ## 7. Recommended prediction stack
 
@@ -442,8 +445,8 @@ optimizer seeds, restarts, and human restarts are trial-family decisions.
 Hyperband/BOHB-style pruning is risky for trading backtests because early time
 windows are not generally monotone proxies for full-history performance. If
 used, resource must mean a predeclared prefix or number of folds; pruned trials
-stay in the ledger; and surviving configurations are rerun at full budget before
-selection.
+remain part of the declared search family; and surviving configurations are
+rerun at full budget before selection.
 
 ### Preferred order for this repository
 
@@ -451,7 +454,7 @@ selection.
 small discrete family  -> exhaustive grid
 larger sparse family   -> seeded random/TPE search
 expensive continuous   -> Bayesian optimization
-all cases              -> same outer walk-forward evaluation and family ledger
+all cases              -> same outer walk-forward evaluation and family correction
 ```
 
 ## 9. Validation protocol
@@ -466,8 +469,8 @@ past only ------------------------------------------------------ future
 
 Required protocol:
 
-1. Freeze the data snapshot, feature schema, label, costs, primary utility, and
-   trial budget.
+1. Predeclare the point-in-time data scope, feature schema, label, costs,
+   primary utility, and trial budget.
 2. Run optimizer trials only inside the outer-training window.
 3. Refit the selected configuration from scratch on allowed outer-training data.
 4. Score one scheduled per-date series on the outer fold.
@@ -475,7 +478,8 @@ Required protocol:
 6. Apply block/dependence-aware family correction to the complete search.
 7. Compare against cash, SPY, consensus, and shuffled/no-information canaries on
    identical support.
-8. Lock one candidate and consume the final period once.
+8. Evaluate an untouched final period only when it is genuinely untouched;
+   never relabel reused history as fresh evidence.
 
 For comparing a large model family, Hansen's Superior Predictive Ability test or
 a step-down/model-confidence-set procedure is a less blunt research diagnostic
@@ -530,40 +534,32 @@ Every proposed boundary is directly testable.
 ### Integration tests
 
 One synthetic DuckDB fixture should drive the real ingestion-independent path:
-point-in-time snapshot, feature generation, model fit, forecast, policy, replay,
-and ledger. No duplicate implementation of production formulas is allowed in
-tests.
+point-in-time snapshot, feature generation, model fit, forecast, policy, and
+replay. No duplicate implementation of production formulas is allowed in tests.
 
 ## 11. Prioritized implementation plan
 
 ### P0: preserve evidence integrity
 
-- Keep the corrected calendar-aware bootstrap and empirical-Bayes variance.
+- Keep the corrected calendar-aware bootstrap and empirical member hierarchy.
 - Keep one documented verification command and run it before every direct
   update of `main`.
-- Make every future model/search change add a trial-ledger schema migration or
-  explicitly prove that no schema change is required.
+- Keep result-changing strategy parameters explicit and reject inert search
+  dimensions instead of recording them as extra trials.
 
 ### P1: remove duplicate experiment authority
 
-Extract one package, for example `analyzer.experiments`, containing:
-
-```text
-spec.py       immutable ExperimentSpec / TrialSpec
-search.py     grid, random, Bayesian trial producers
-runner.py     canonical fold execution
-inference.py  family correction and model comparison
-ledger.py     append-only manifests and final consumption
-```
-
-Migrate `validation.py` first. Convert `optimize_profit` into an experiment spec
-and reporting command, then delete its duplicate statistical engine.
+Keep `validation.py` as the single engine for production-strategy evidence and
+keep `analyzer.experiments.family` only for deterministic family identity.
+Convert `optimize_profit` into a thin research/reporting caller of that engine or
+remove it; do not maintain a second selection and inference implementation.
 
 ### P2: establish forecast and policy protocols
 
-Wrap the current consensus scorer behind `ForecastModel`; move allocation and
-portfolio constraints behind `Policy`. Preserve current output byte-for-byte in
-an adapter test before adding models.
+When a probabilistic forecast is actually added, put it behind `ForecastModel`
+and keep allocation in `Policy`. Do not add adapters merely to preserve obsolete
+internal interfaces; preserve the observable decision contract that remains
+supported.
 
 ### P3: add dynamic hierarchy and tree baseline
 

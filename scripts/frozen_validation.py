@@ -84,7 +84,6 @@ def config_payload(
             "locked_final": {
                 "start": str(LOCKED_FINAL_START),
                 "status": "locked_not_queried_or_evaluated",
-                "consumed": False,
             },
         },
         "grid": grid if grid is not None else GRID,

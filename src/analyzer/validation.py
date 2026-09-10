@@ -4,8 +4,8 @@ The validation contract is fail closed:
 * every phase ends early enough for the maximum executable holding to mature;
 * one per-date net-alpha statistic drives inference, correction, selection, and verdict;
 * arbitrary-dependence Bonferroni and moving-block max-stat gates must pass;
+* validation accepts only the production consensus scorer;
 * consensus is identity-invariant and has no member-identity hypothesis;
-* identity-dependent scoring modes are nondeployable diagnostics;
 * incomplete or under-resolved statistical-family controls fail closed;
 * the post-2025 final phase is locked and is never loaded by this module.
 """
@@ -1527,7 +1527,6 @@ def _build_manifest(
                 "end": None,
                 "status": "locked_not_queried_or_evaluated",
                 "value_rows_queried": False,
-                "consumed": False,
             },
         },
         "purge": {

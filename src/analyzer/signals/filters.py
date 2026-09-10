@@ -105,7 +105,8 @@ def _assign_episode_column(
 
 def _add_weight_column(df: pd.DataFrame) -> pd.DataFrame:
     if "amount_midpoint" in df.columns:
-        df["_weight"] = df["amount_midpoint"].fillna(1.0)
+        weights = pd.to_numeric(df["amount_midpoint"], errors="coerce")
+        df["_weight"] = weights.fillna(1.0).astype(float)
     else:
         df["_weight"] = 1.0
     return df
@@ -126,8 +127,9 @@ def _add_weighted_columns(
     df: pd.DataFrame, existing_avg_cols: list[str]
 ) -> pd.DataFrame:
     for col in existing_avg_cols:
-        non_nan = df[col].notna()
-        df[f"_wp_{col}"] = np.where(non_nan, df[col] * df["_weight"], 0.0)
+        values = pd.to_numeric(df[col], errors="coerce")
+        non_nan = values.notna()
+        df[f"_wp_{col}"] = np.where(non_nan, values * df["_weight"], 0.0)
         df[f"_ws_{col}"] = np.where(non_nan, df["_weight"], 0.0)
     return df
 

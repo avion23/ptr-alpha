@@ -108,6 +108,7 @@ class TestAnalysis(unittest.TestCase):
             "AAPL",
             transactions,
             signals,
+            min_buyers=2,
             as_of_date=pd.Timestamp("2024-02-01"),
         )
 
@@ -395,6 +396,7 @@ class TestAnalysis(unittest.TestCase):
             transactions,
             signals,
             member_rankings=member_rankings,
+            min_buyers=2,
             scoring_mode="shrunk_alpha",
         )
 

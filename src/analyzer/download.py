@@ -580,31 +580,42 @@ class HouseTransactionSource(TransactionSource):
         member_lookup = _build_member_lookup(existing_docs)
         logger.info(f"Parsing {len(pdf_paths)} PDFs for {year}")
 
-        results: list = []
-        failed_results: list[tuple[Path, list[dict], list[str]]] = []
+        # Persist bounded batches so an interrupted large archive can resume
+        # from terminal parse runs instead of discarding a whole year's work.
+        batch_size = max(16, self.parallel_workers * 4)
         with Pool(self.parallel_workers) as pool:
-            parsed = pool.map(_tolerant_parse_pdf_worker, pdf_paths)
-        for pdf_path, transactions, engines_attempted in parsed:
-            error_detail = _engine_error_detail(engines_attempted)
-            if error_detail is None:
-                results.append((pdf_path, transactions, engines_attempted))
-            else:
-                failed_results.append((pdf_path, transactions, engines_attempted))
+            for offset in range(0, len(pdf_paths), batch_size):
+                batch_paths = pdf_paths[offset : offset + batch_size]
+                parsed = pool.map(_tolerant_parse_pdf_worker, batch_paths)
+                results: list = []
+                failed_results: list[tuple[Path, list[dict], list[str]]] = []
+                for pdf_path, transactions, engines_attempted in parsed:
+                    error_detail = _engine_error_detail(engines_attempted)
+                    if error_detail is None:
+                        results.append((pdf_path, transactions, engines_attempted))
+                    else:
+                        failed_results.append(
+                            (pdf_path, transactions, engines_attempted)
+                        )
 
-        if failed_results:
-            logger.warning(
-                "Excluding %d/%d unparseable PDFs for %d from save: %s",
-                len(failed_results),
-                len(pdf_paths),
-                year,
-                "; ".join(
-                    f"{pdf_path.stem} ({_engine_error_detail(engines_attempted)})"
-                    for pdf_path, _transactions, engines_attempted in failed_results
-                ),
-            )
-            self._save_failed_parse_runs(year, failed_results, ingestion_generation)
+                if failed_results:
+                    logger.warning(
+                        "Excluding %d/%d unparseable PDFs for %d from batch save: %s",
+                        len(failed_results),
+                        len(batch_paths),
+                        year,
+                        "; ".join(
+                            f"{pdf_path.stem} ({_engine_error_detail(engines_attempted)})"
+                            for pdf_path, _transactions, engines_attempted in failed_results
+                        ),
+                    )
+                    self._save_failed_parse_runs(
+                        year, failed_results, ingestion_generation
+                    )
 
-        self._save_parse_results(year, results, member_lookup, ingestion_generation)
+                self._save_parse_results(
+                    year, results, member_lookup, ingestion_generation
+                )
 
     def _save_failed_parse_runs(
         self,

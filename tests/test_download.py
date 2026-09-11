@@ -445,6 +445,50 @@ def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypat
     assert source._save_parse_results.call_args.args[-1] == "captured-g1"
 
 
+def test_parse_cached_pdfs_persists_large_year_in_resumable_batches(
+    tmp_path, monkeypatch
+):
+    source, db = _source(tmp_path)
+    pdf_dir = tmp_path / "2021" / "pdfs"
+    pdf_dir.mkdir(parents=True)
+    stems = [f"doc{i:02d}" for i in range(17)]
+    for stem in stems:
+        (pdf_dir / f"{stem}.pdf").write_bytes(
+            b"%PDF-" + stem.encode() + b"\n%%EOF"
+        )
+    source.fetch_metadata = MagicMock(return_value=_metadata(*stems))
+    source.db.get_latest_house_generation = MagicMock(return_value="captured-g1")
+    source._save_parse_results = MagicMock()
+    source._save_failed_parse_runs = MagicMock()
+
+    class FakePool:
+        def __init__(self, _workers):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def map(self, _worker, paths):
+            return [(path, [], ["pdfplumber"]) for path in paths]
+
+    monkeypatch.setattr("analyzer.download.Pool", FakePool)
+    try:
+        source.parse_cached_pdfs(2021, force=True)
+    finally:
+        source.close()
+        db.close()
+
+    assert source._save_parse_results.call_count == 2
+    first_batch = source._save_parse_results.call_args_list[0].args[1]
+    second_batch = source._save_parse_results.call_args_list[1].args[1]
+    assert len(first_batch) == 16
+    assert len(second_batch) == 1
+    assert source._save_failed_parse_runs.call_count == 0
+
+
 def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
     tmp_path, monkeypatch, caplog
 ):

@@ -233,6 +233,96 @@ def _tolerant_parse_worker(pdf_path: Path):
     return _production_tolerant_parse_worker(pdf_path, _parse_pdf_worker)
 
 
+def _persist_house_parse_batch(
+    db: Database,
+    *,
+    year: int,
+    ingestion_generation: str,
+    member_lookup: dict,
+    artifact_hashes: dict[str, str],
+    results: list,
+) -> dict:
+    """Persist one bounded House parse batch and return aggregate telemetry."""
+    pdf_transactions: dict = {}
+    raw_counts: dict[str, int] = {}
+    parse_attempts: list[tuple[str, list[str], str | None]] = []
+    for pdf_path, transactions, engines_attempted in results:
+        doc_id = pdf_path.stem
+        pdf_transactions[pdf_path] = transactions
+        raw_counts[doc_id] = len(transactions)
+        error_message = _engine_error_detail(engines_attempted)
+        parse_attempts.append(
+            (
+                doc_id,
+                [
+                    engine
+                    for engine in engines_attempted
+                    if not engine.startswith(_PARSE_FAILURE_PREFIX)
+                ],
+                error_message,
+            )
+        )
+
+    df = consolidate_transactions(pdf_transactions, member_lookup)
+    transaction_counts = (
+        df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
+    )
+    if not df.empty:
+        df["chamber"] = "house"
+        df["ingestion_generation"] = ingestion_generation
+        df["source_record_id"] = df["doc_id"].astype(str)
+        df["official_filing_date"] = df["disclosure_date"]
+        df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
+        if "asset_description" in df.columns:
+            df["raw_asset_description"] = df["asset_description"]
+    df = preserve_existing_fields(df, db)
+
+    parse_runs = []
+    for doc_id, engines_attempted, error_message in parse_attempts:
+        count = transaction_counts.get(doc_id, 0)
+        if error_message is not None:
+            status = "error"
+        elif count:
+            status = "success"
+        else:
+            status = "zero_rows"
+        parse_runs.append(
+            dict(
+                doc_id=doc_id,
+                year=year,
+                parser_version=_PARSE_VERSION,
+                status=status,
+                engines_attempted=",".join(engines_attempted) or "cascade-failed",
+                raw_row_count=raw_counts.get(doc_id, 0),
+                transaction_count=0,
+                error_message=error_message,
+                artifact_sha256=artifact_hashes.get(doc_id),
+                ingestion_generation=ingestion_generation,
+            )
+        )
+
+    attempted_doc_ids = [doc_id for doc_id, _, _ in parse_attempts]
+    replacement_doc_ids = (
+        df["doc_id"].astype(str).unique().tolist() if not df.empty else []
+    )
+    persisted = db.replace_transactions_for_docs(
+        df,
+        source="house_pdf",
+        attempted_doc_ids=attempted_doc_ids,
+        ingestion_generation=ingestion_generation,
+        replacement_doc_ids=replacement_doc_ids,
+        parse_runs=parse_runs,
+    )
+    by_status: dict[str, int] = {}
+    for run in parse_runs:
+        by_status[run["status"]] = by_status.get(run["status"], 0) + 1
+    return {
+        "attempted": len(parse_attempts),
+        "parse_run_statuses": by_status,
+        "persisted_transactions": sum(persisted.by_doc_total.values()),
+    }
+
+
 def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
     """Mirror HouseTransactionSource.parse_cached_pdfs with per-PDF quarantine."""
     src = _house_source(staging)
@@ -282,87 +372,33 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
 
         member_lookup = _build_member_lookup(existing_docs)
         settings = _settings_for(staging)
-        with Pool(settings.data.get_workers()) as pool:
-            results = pool.map(_tolerant_parse_worker, pdf_paths)
-
-        pdf_transactions: dict = {}
-        raw_counts: dict[str, int] = {}
-        parse_attempts: list[tuple[str, list[str], str | None]] = []
-        for pdf_path, transactions, engines_attempted in results:
-            doc_id = pdf_path.stem
-            pdf_transactions[pdf_path] = transactions
-            raw_counts[doc_id] = len(transactions)
-            error_message = _engine_error_detail(engines_attempted)
-            parse_attempts.append(
-                (
-                    doc_id,
-                    [
-                        engine
-                        for engine in engines_attempted
-                        if not engine.startswith(_PARSE_FAILURE_PREFIX)
-                    ],
-                    error_message,
-                )
-            )
-
-        df = consolidate_transactions(pdf_transactions, member_lookup)
-        transaction_counts = (
-            df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
-        )
-        if not df.empty:
-            df["chamber"] = "house"
-            df["ingestion_generation"] = ingestion_generation
-            df["source_record_id"] = df["doc_id"].astype(str)
-            df["official_filing_date"] = df["disclosure_date"]
-            df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
-            if "asset_description" in df.columns:
-                df["raw_asset_description"] = df["asset_description"]
-        df = preserve_existing_fields(df, db)
-
-        parse_runs = []
-        for doc_id, engines_attempted, error_message in parse_attempts:
-            count = transaction_counts.get(doc_id, 0)
-            if error_message is not None:
-                status = "error"
-            elif count:
-                status = "success"
-            else:
-                status = "zero_rows"
-            parse_runs.append(
-                dict(
-                    doc_id=doc_id,
-                    year=year,
-                    parser_version=_PARSE_VERSION,
-                    status=status,
-                    engines_attempted=",".join(engines_attempted) or "cascade-failed",
-                    raw_row_count=raw_counts.get(doc_id, 0),
-                    transaction_count=0,
-                    error_message=error_message,
-                    artifact_sha256=artifact_hashes.get(doc_id),
-                    ingestion_generation=ingestion_generation,
-                )
-            )
-
-        attempted_doc_ids = [doc_id for doc_id, _, _ in parse_attempts]
-        replacement_doc_ids = (
-            df["doc_id"].astype(str).unique().tolist() if not df.empty else []
-        )
-        persisted = db.replace_transactions_for_docs(
-            df,
-            source="house_pdf",
-            attempted_doc_ids=attempted_doc_ids,
-            ingestion_generation=ingestion_generation,
-            replacement_doc_ids=replacement_doc_ids,
-            parse_runs=parse_runs,
-        )
+        workers = settings.data.get_workers()
+        batch_size = max(16, workers * 4)
+        attempted = 0
+        persisted_transactions = 0
         by_status: dict[str, int] = {}
-        for run in parse_runs:
-            by_status[run["status"]] = by_status.get(run["status"], 0) + 1
+        with Pool(workers) as pool:
+            for offset in range(0, len(pdf_paths), batch_size):
+                batch_paths = pdf_paths[offset : offset + batch_size]
+                results = pool.map(_tolerant_parse_worker, batch_paths)
+                batch = _persist_house_parse_batch(
+                    db,
+                    year=year,
+                    ingestion_generation=ingestion_generation,
+                    member_lookup=member_lookup,
+                    artifact_hashes=artifact_hashes,
+                    results=results,
+                )
+                attempted += int(batch["attempted"])
+                persisted_transactions += int(batch["persisted_transactions"])
+                for status, count in batch["parse_run_statuses"].items():
+                    by_status[status] = by_status.get(status, 0) + int(count)
+
         return {
-            "attempted": len(parse_attempts),
+            "attempted": attempted,
             "skipped_cached": len(cached),
             "parse_run_statuses": by_status,
-            "persisted_transactions": sum(persisted.by_doc_total.values()),
+            "persisted_transactions": persisted_transactions,
             "ingestion_generation": ingestion_generation,
         }
     finally:

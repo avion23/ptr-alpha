@@ -23,6 +23,13 @@ class ReportOutcome(StrEnum):
     FAILED = "failed"
 
 
+class SourceCoverageState(StrEnum):
+    UNKNOWN = "unknown"
+    IN_WINDOW = "in_window"
+    OUTSIDE_WINDOW = "outside_window"
+    MISSING = "missing"
+
+
 class TransactionType(StrEnum):
     PURCHASE = "Purchase"
     SALE = "Sale"

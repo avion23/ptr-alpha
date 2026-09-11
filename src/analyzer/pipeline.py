@@ -10,7 +10,7 @@ import pandas as pd
 
 from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
-from analyzer.models import AnalysisMode
+from analyzer.models import AnalysisMode, SourceCoverageState
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
 from analyzer.ticker_resolver import TickerResolver
@@ -143,6 +143,73 @@ def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
     transaction_source.fetch_and_cache_pdfs(year)
     logger.info("Successfully fetched PDFs for %d", year)
     return DataResult(success=True, data=None)
+
+
+def source_freshness_metrics(
+    transaction_source,
+    as_of_date: pd.Timestamp,
+    window_days: int = CONSENSUS_LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    """Return per-chamber disclosure-window coverage metrics.
+
+    This is a monitoring signal, not a trading feature. It reports whether the
+    selected canonical database contains House and Senate disclosures inside
+    the candidate window without changing consensus scoring when a chamber is
+    quiet or stale.
+    """
+    if window_days < 1:
+        raise ValueError("window_days must be positive")
+    as_of = pd.Timestamp(as_of_date).normalize()
+    window_start = as_of - pd.Timedelta(days=window_days)
+    rows = transaction_source.db.conn.execute(
+        """
+        SELECT
+            CASE
+                WHEN source = 'senate_efd'
+                  OR LOWER(COALESCE(chamber, '')) = 'senate'
+                THEN 'Senate'
+                ELSE 'House'
+            END AS chamber_group,
+            MAX(disclosure_date) AS latest_disclosure,
+            COUNT(*) FILTER (
+                WHERE disclosure_date >= ? AND disclosure_date <= ?
+            ) AS recent_disclosures
+        FROM canonical_transactions
+        WHERE disclosure_date <= ?
+          AND source IN ('house_pdf', 'gemini_ocr', 'senate_efd')
+        GROUP BY chamber_group
+        ORDER BY chamber_group
+        """,
+        [window_start.date(), as_of.date(), as_of.date()],
+    ).fetchall()
+    by_chamber = {
+        str(chamber): (latest, int(recent or 0))
+        for chamber, latest, recent in rows
+    }
+    metrics: list[dict] = []
+    for chamber in ("House", "Senate"):
+        latest, recent = by_chamber.get(chamber, (None, 0))
+        if latest is None:
+            state = SourceCoverageState.MISSING
+            age_days = None
+        else:
+            age_days = int((as_of.date() - latest).days)
+            state = (
+                SourceCoverageState.IN_WINDOW
+                if recent > 0
+                else SourceCoverageState.OUTSIDE_WINDOW
+            )
+        metrics.append(
+            {
+                "chamber": chamber,
+                "latest_disclosure_date": latest,
+                "latest_disclosure_age_days": age_days,
+                "candidate_window_days": window_days,
+                "recent_disclosures": recent,
+                "coverage_state": state.value,
+            }
+        )
+    return pd.DataFrame(metrics)
 
 
 def prepare_live_consensus_data(

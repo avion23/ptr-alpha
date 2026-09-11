@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import cast
 
@@ -32,6 +32,7 @@ from analyzer.pipeline import (
     run_parse_pipeline,
     run_recent_ticker_scoring,
     run_ticker_analysis,
+    source_freshness_metrics,
 )
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer.price_source import YFinancePriceSource
@@ -182,48 +183,85 @@ def _validate_output(output: str) -> None:
 
 
 def _warn_live_ticker_coverage(app_ctx: AppContext, days_back: int) -> None:
-    """Report chambers with no stored disclosure in the live candidate window."""
+    """Report candidate-window coverage metrics without gating BUY scoring."""
     as_of = date.today()
-    window_start = as_of - timedelta(days=days_back)
     try:
-        rows = app_ctx.transaction_source.db.conn.execute(
-            """
-            SELECT
-                CASE
-                    WHEN source = 'senate_efd'
-                      OR LOWER(COALESCE(chamber, '')) = 'senate'
-                    THEN 'Senate'
-                    ELSE 'House'
-                END AS chamber_group,
-                MAX(disclosure_date) AS latest_disclosure
-            FROM canonical_transactions
-            WHERE disclosure_date <= ?
-            GROUP BY chamber_group
-            ORDER BY chamber_group
-            """,
-            [as_of],
-        ).fetchall()
-        latest_by_chamber = {str(chamber): latest for chamber, latest in rows}
-        for chamber in ("House", "Senate"):
-            latest = latest_by_chamber.get(chamber)
-            if latest is None:
-                print(
-                    f"WARNING: {chamber} has no canonical disclosures in the unified "
-                    "database. Refresh before treating an empty result as current.",
-                    file=sys.stderr,
-                )
-                continue
-            if latest >= window_start:
-                continue
-            age = (as_of - latest).days
+        metrics = source_freshness_metrics(
+            app_ctx.transaction_source,
+            pd.Timestamp(as_of),
+            days_back,
+        )
+    except Exception as exc:
+        print(
+            f"WARNING: source freshness metric unavailable: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return
+
+    for row in metrics.itertuples(index=False):
+        if row.coverage_state == "in_window":
+            continue
+        if row.coverage_state == "missing":
             print(
-                f"WARNING: {chamber} has no stored disclosure in the {days_back}-day "
-                f"candidate window {window_start} through {as_of}; latest is {latest} "
-                f"({age} days ago). Refresh before treating an empty result as current.",
+                f"WARNING: {row.chamber} has no canonical disclosures in the unified "
+                "database. Refresh before treating an empty result as current.",
                 file=sys.stderr,
             )
-    except Exception:
-        logger.debug("Live ticker coverage check failed", exc_info=True)
+            continue
+        print(
+            f"WARNING: {row.chamber} has no stored disclosure in the {days_back}-day "
+            f"candidate window ending {as_of}; latest is {row.latest_disclosure_date} "
+            f"({row.latest_disclosure_age_days} days ago). This is a coverage metric, "
+            "not a trading-score input.",
+            file=sys.stderr,
+        )
+
+
+@app.command()
+def health(
+    ctx: typer.Context,
+    as_of: str | None = typer.Option(
+        None, help="Coverage cutoff date (YYYY-MM-DD; defaults to today)"
+    ),
+    window_days: int = typer.Option(
+        CONSENSUS_LOOKBACK_DAYS,
+        "--window-days",
+        help="Candidate-window length used by the coverage metric",
+    ),
+    data_dir: str = typer.Option("data", help="Data directory"),
+):
+    """Report House/Senate candidate-window coverage for monitoring.
+
+    This command does not change or authorize BUY signals. A nonzero exit means
+    at least one chamber is missing or has no disclosure inside the requested
+    window, which should trigger a refresh/investigation in operations.
+    """
+    if window_days < 1:
+        print("Error: --window-days must be greater than zero", file=sys.stderr)
+        raise typer.Exit(1)
+    try:
+        cutoff = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError:
+        print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
+        raise typer.Exit(1) from None
+
+    app_ctx = get_context(ctx, data_dir, read_only=True)
+    try:
+        metrics = source_freshness_metrics(
+            app_ctx.transaction_source,
+            pd.Timestamp(cutoff),
+            window_days,
+        )
+    except Exception as exc:
+        print(
+            f"Error: source freshness metric failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1) from None
+
+    print(metrics.to_string(index=False))
+    healthy = bool((metrics["coverage_state"] == "in_window").all())
+    raise typer.Exit(0 if healthy else 1)
 
 
 def _consensus_score_display(score: pd.DataFrame) -> pd.DataFrame:

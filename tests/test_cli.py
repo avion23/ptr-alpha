@@ -50,6 +50,70 @@ class TestCliApp(unittest.TestCase):
                 self.assertIn("Error:", result.output)
                 context.assert_not_called()
 
+    def test_health_reports_metrics_and_succeeds_when_both_chambers_are_in_window(self):
+        metrics = pd.DataFrame(
+            [
+                {
+                    "chamber": "House",
+                    "latest_disclosure_date": date(2026, 9, 10),
+                    "latest_disclosure_age_days": 1,
+                    "candidate_window_days": 28,
+                    "recent_disclosures": 4,
+                    "coverage_state": "in_window",
+                },
+                {
+                    "chamber": "Senate",
+                    "latest_disclosure_date": date(2026, 9, 9),
+                    "latest_disclosure_age_days": 2,
+                    "candidate_window_days": 28,
+                    "recent_disclosures": 3,
+                    "coverage_state": "in_window",
+                },
+            ]
+        )
+        with (
+            patch("analyzer.cli.get_context", return_value=MagicMock()),
+            patch("analyzer.cli.source_freshness_metrics", return_value=metrics),
+        ):
+            result = self.runner.invoke(
+                app, ["health", "--as-of", "2026-09-11", "--window-days", "28"]
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("House", result.output)
+        self.assertIn("Senate", result.output)
+        self.assertIn("in_window", result.output)
+
+    def test_health_fails_monitoring_when_a_chamber_is_outside_window(self):
+        metrics = pd.DataFrame(
+            [
+                {
+                    "chamber": "House",
+                    "latest_disclosure_date": date(2026, 8, 3),
+                    "latest_disclosure_age_days": 39,
+                    "candidate_window_days": 28,
+                    "recent_disclosures": 0,
+                    "coverage_state": "outside_window",
+                },
+                {
+                    "chamber": "Senate",
+                    "latest_disclosure_date": date(2026, 9, 9),
+                    "latest_disclosure_age_days": 2,
+                    "candidate_window_days": 28,
+                    "recent_disclosures": 3,
+                    "coverage_state": "in_window",
+                },
+            ]
+        )
+        with (
+            patch("analyzer.cli.get_context", return_value=MagicMock()),
+            patch("analyzer.cli.source_freshness_metrics", return_value=metrics),
+        ):
+            result = self.runner.invoke(app, ["health", "--as-of", "2026-09-11"])
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("outside_window", result.output)
+
     def test_backtest_rejects_nonpositive_windows_before_db_open(self):
         for option in (
             "--horizon",
@@ -322,8 +386,8 @@ if __name__ == "__main__":
 def test_live_ticker_coverage_reads_only_canonical_scope(capsys):
     connection = MagicMock()
     connection.execute.return_value.fetchall.return_value = [
-        ("House", date.today()),
-        ("Senate", date.today()),
+        ("House", date.today(), 1),
+        ("Senate", date.today(), 1),
     ]
     context = SimpleNamespace(
         transaction_source=SimpleNamespace(db=SimpleNamespace(conn=connection))
@@ -339,7 +403,7 @@ def test_live_ticker_coverage_reads_only_canonical_scope(capsys):
 
 def test_live_ticker_coverage_warns_when_chamber_is_missing(capsys):
     connection = MagicMock()
-    connection.execute.return_value.fetchall.return_value = [("House", date.today())]
+    connection.execute.return_value.fetchall.return_value = [("House", date.today(), 1)]
     context = SimpleNamespace(
         transaction_source=SimpleNamespace(db=SimpleNamespace(conn=connection))
     )
@@ -354,7 +418,7 @@ def test_live_ticker_coverage_warns_when_chamber_is_missing(capsys):
 def test_live_ticker_coverage_warns_when_strategy_window_has_no_disclosures(capsys):
     connection = MagicMock()
     latest = date.today() - pd.Timedelta(days=29)
-    connection.execute.return_value.fetchall.return_value = [("House", latest)]
+    connection.execute.return_value.fetchall.return_value = [("House", latest, 0)]
     context = SimpleNamespace(
         transaction_source=SimpleNamespace(db=SimpleNamespace(conn=connection))
     )

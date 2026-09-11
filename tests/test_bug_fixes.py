@@ -418,15 +418,16 @@ class TestPriceAcquisitionCorrectness(DatabaseTestCase):
         self.assertEqual(result.index.max(), pd.Timestamp("2025-01-03"))
         self.assertEqual(result.loc[pd.Timestamp("2025-01-03"), "SPY"], 401.0)
 
-    def test_rename_alias_expands_to_both_temporal_symbols(self):
-        # A no-date acquisition call cannot pick one symbol for FB; both the
-        # pre-rename (FB) and post-rename (META) series must be fetched so
-        # per-transaction-date resolution can find its column.
+    def test_rename_alias_materializes_historical_symbol_from_provider_series(self):
+        # Yahoo retains the full FB/META history under META only. Fetch one
+        # provider series, then expose it under both market-symbol aliases so
+        # disclosure-time resolution can select FB before the rename and META
+        # afterward without pretending the provider still serves FB.
         source = YFinancePriceSource(Settings(), db=self.db)
         captured = {}
-        columns = pd.MultiIndex.from_product([["Close"], ["FB", "META", "SPY"]])
+        columns = pd.MultiIndex.from_product([["Close"], ["META", "SPY"]])
         response = pd.DataFrame(
-            [[100.0, 200.0, 400.0], [101.0, 201.0, 401.0]],
+            [[200.0, 400.0], [201.0, 401.0]],
             index=pd.DatetimeIndex(["2022-05-02", "2022-05-03"]),
             columns=columns,
         )
@@ -438,11 +439,14 @@ class TestPriceAcquisitionCorrectness(DatabaseTestCase):
         with patch("analyzer.price_source.yf.download", side_effect=download):
             result = source.get_prices(["FB"], date(2022, 5, 1), date(2022, 5, 3))
 
-        self.assertIn("FB", captured["symbols"])
+        self.assertNotIn("FB", captured["symbols"])
         self.assertIn("META", captured["symbols"])
         self.assertIn("FB", result.columns)
         self.assertIn("META", result.columns)
         self.assertIn("SPY", result.columns)
+        pd.testing.assert_series_equal(
+            result["FB"], result["META"], check_names=False
+        )
 
     def test_repository_quarantines_nonfinite_and_nonpositive_prices(self):
         dates = pd.DatetimeIndex(["2025-01-02", "2025-01-03", "2025-01-06"])

@@ -230,18 +230,19 @@ class YFinancePriceSource:
     def _rename_yf_columns(
         self, new_prices: pd.DataFrame, raw_to_yf: dict
     ) -> pd.DataFrame:
-        """Rename yf-symbol columns back to their raw tickers so downstream
-        consumers see consistent identifiers across sources."""
-        yf_to_raws: dict[str, list[str]] = {}
-        for raw, sym in raw_to_yf.items():
-            yf_to_raws.setdefault(sym, []).append(raw)
-        # Only rename when a yf symbol maps to exactly one raw ticker (avoid collision).
-        rename_map = {
-            sym: raws[0]
-            for sym, raws in yf_to_raws.items()
-            if sym in new_prices.columns and len(raws) == 1
-        }
-        return new_prices.rename(columns=rename_map)
+        """Expose provider prices under every requested market-symbol alias.
+
+        Data providers commonly retain a renamed security's full history only
+        under its current symbol. The decision layer still needs the symbol that
+        was tradable when the filing became public. Materialize both column
+        names from the one provider series; row-level temporal resolution still
+        decides which market symbol is eligible on a given disclosure date.
+        """
+        result = new_prices.copy()
+        for raw, provider_symbol in raw_to_yf.items():
+            if provider_symbol in new_prices.columns:
+                result[raw] = new_prices[provider_symbol]
+        return result
 
 
 # ── Helpers ──
@@ -290,10 +291,22 @@ def _expand_rename_aliases(tickers: list[str]) -> set[str]:
 
 
 def _resolve_tickers(all_tickers: list[str]) -> tuple[dict, dict]:
-    """Build (raw -> yf, yf -> raw) mapping via TickerResolver."""
+    """Build raw-market-symbol -> provider-symbol mappings.
+
+    Rename aliases use the current provider symbol because Yahoo no longer
+    serves historical data under symbols such as FB or SQ. This is a provider
+    addressing choice only; TickerResolver still controls the tradable symbol
+    at each disclosure date.
+    """
     resolver = TickerResolver()
     resolutions = resolver.resolve_batch(all_tickers)
-    raw_to_yf = {r.raw_ticker: r.price_symbol for r in resolutions.values()}
+    raw_to_yf: dict[str, str] = {}
+    for raw, resolution in resolutions.items():
+        normalized = str(raw).strip().upper()
+        if normalized in resolver.RENAME_MAP:
+            raw_to_yf[raw] = resolver.RENAME_MAP[normalized][0]
+        else:
+            raw_to_yf[raw] = resolution.price_symbol
     yf_to_raw: dict[str, str] = {}
     for raw, sym in raw_to_yf.items():
         if sym not in yf_to_raw:

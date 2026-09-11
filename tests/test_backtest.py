@@ -521,9 +521,8 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
 
     # ---- Bug 2: survivorship — delisted ticker included at last price
 
-    def test_no_price_at_all_is_skipped_and_counted(self):
-        """Bug 2: a ticker with no price data at all (column absent) must be
-        skipped and counted in n_no_price, not n_delisted."""
+    def test_no_price_at_all_is_explicitly_unavailable_and_counted(self):
+        """A ticker with no price series must preserve an explicit unavailable row."""
         as_of = pd.Timestamp("2025-01-01")
         dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
         spy_arr = [400.0 + i * 0.01 for i in range(len(dates))]
@@ -532,11 +531,12 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         recs = self._single_rec("AAPL")
 
         result = evaluate_backtest(recs, prices, as_of, horizon=90)
-        self.assertTrue(
-            result.dropna(subset=["bt_return_pct"]).empty,
-            "no-price ticker must be skipped",
-        )
+        row = result.iloc[0]
+        self.assertTrue(pd.isna(row["bt_return_pct"]))
+        self.assertEqual(row["bt_coverage"], "unavailable")
+        self.assertEqual(row["bt_unavailable_reason"], "no_price_series")
         self.assertEqual(result.attrs.get("n_no_price", 0), 1)
+        self.assertEqual(result.attrs.get("n_unavailable", 0), 1)
         self.assertEqual(result.attrs.get("n_delisted", 0), 0)
 
     def test_truncated_ticker_does_not_invent_last_quote_return(self):

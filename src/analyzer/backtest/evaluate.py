@@ -103,6 +103,18 @@ def evaluate_backtest(
         cached = price_cache.get(ticker)
         if cached is None or (isinstance(cached, tuple) and cached[0] is None):
             n_no_price += 1
+            n_unavailable += 1
+            expected_entry_ns = next_nyse_session(as_of_date).value
+            rows.append(
+                _unavailable_no_entry_row(
+                    ticker,
+                    i,
+                    expected_entry_ns,
+                    inst_type_arr[i] if inst_type_arr is not None else "stock",
+                    amount_arr[i] if amount_arr is not None else None,
+                    reason="no_price_series",
+                )
+            )
             continue
 
         row = _evaluate_one_recommendation(

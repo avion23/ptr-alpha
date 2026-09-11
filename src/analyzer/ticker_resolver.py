@@ -18,9 +18,15 @@ def _normalize_trade_date(trade_date):
     if isinstance(trade_date, date) and not isinstance(trade_date, datetime):
         return trade_date
     try:
-        return trade_date.date()
+        normalized = trade_date.date()
     except (AttributeError, ValueError, TypeError):
         return None
+    # ``pandas.NaT`` is both a ``date`` and ``datetime`` and its ``date()``
+    # method returns itself.  Accept only a real calendar date so invalid
+    # sentinels remain an explicit missing reference date.
+    if isinstance(normalized, date) and not isinstance(normalized, datetime):
+        return normalized
+    return None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,6 +1,8 @@
 import unittest
 from datetime import date
 
+import pandas as pd
+
 from analyzer.ticker_resolver import TickerResolver
 
 
@@ -29,6 +31,16 @@ class TestTickerResolver(unittest.TestCase):
         self.assertEqual(result.price_symbol, "FB")
         self.assertEqual(result.status, "unverified")
         self.assertFalse(self.resolver.is_strategy_eligible("FB"))
+
+    def test_nat_reference_date_is_treated_as_missing(self):
+        for ticker, expected_status in (
+            ("FB", "unverified"),
+            ("ATVI", "date_required"),
+            ("SPCX", "date_required"),
+        ):
+            with self.subTest(ticker=ticker):
+                result = self.resolver.resolve(ticker, pd.NaT)
+                self.assertEqual(result.status, expected_status)
 
     def test_fb_uses_contemporaneous_symbol(self):
         before = self.resolver.resolve("FB", date(2022, 6, 8))

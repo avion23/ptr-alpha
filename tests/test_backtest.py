@@ -387,7 +387,7 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
             }
         )
 
-    # ---- Bug 1a: default use_dip_entry=False, entry = as_of price
+    # ---- Fixed entry timing
 
     def test_default_entry_is_next_session_not_same_close_or_dip_search(self):
         as_of = pd.Timestamp("2025-01-02")
@@ -402,122 +402,6 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         self.assertEqual(result.iloc[0]["bt_entry_date"], date(2025, 1, 3))
         self.assertAlmostEqual(result.iloc[0]["bt_entry_price"], 80.0, places=1)
         self.assertEqual(result.iloc[0]["bt_entry_delay"], 1)
-
-    def test_dip_entry_skips_position_when_no_dip_occurs(self):
-        """Bug 1b: when use_dip_entry=True and no pullback occurs within
-        max_wait_days, the position must NOT be taken (no fallback fill)."""
-        as_of = pd.Timestamp("2025-01-02")
-        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
-        # Price rises monotonically — no 5% pullback will occur
-        prices_arr = [100.0 + i * 0.3 for i in range(len(dates))]
-        spy_arr = [400.0 + i * 0.01 for i in range(len(dates))]
-        prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
-        recs = self._single_rec()
-
-        result = evaluate_backtest(
-            recs,
-            prices,
-            as_of,
-            horizon=90,
-            use_dip_entry=True,
-            pullback_pct=0.05,
-            max_wait_days=10,
-        )
-        # No dip → position not taken → bt_return_pct is NaN
-        self.assertTrue(
-            result.dropna(subset=["bt_return_pct"]).empty,
-            "no dip → position must not be taken (no fallback fill)",
-        )
-
-    def test_spy_window_aligned_with_dip_entry_date(self):
-        """Bug 1b: when use_dip_entry=True the SPY return must cover the same
-        calendar window as the position [dip_date, dip_date + horizon], not
-        the shifted [as_of, as_of + horizon] window."""
-        as_of = pd.Timestamp("2025-01-01")
-        horizon = 30
-        # Dip occurs on Jan 6 (5 calendar days after Jan 1).
-        dip_date = pd.Timestamp("2025-01-06")
-        dates = pd.date_range("2024-12-01", "2025-06-01", freq="D")
-        prices_arr = [100.0 if d < dip_date else 94.0 for d in dates]  # 6% drop
-        # Make SPY non-flat so the two windows give different returns.
-        spy_arr = [400.0 + i * 0.5 for i in range(len(dates))]
-        prices = self._make_prices(dates, {"AAPL": prices_arr, "SPY": spy_arr})
-        recs = self._single_rec()
-
-        result_dip = evaluate_backtest(
-            recs,
-            prices,
-            as_of,
-            horizon=horizon,
-            use_dip_entry=True,
-            pullback_pct=0.05,
-            max_wait_days=10,
-        )
-        valid = result_dip.dropna(subset=["bt_return_pct"])
-        # Finding 4 fix: assertFalse instead of skipTest so regressions are visible.
-        self.assertFalse(
-            valid.empty, "dip should have been triggered by the 6% price drop on Jan 6"
-        )
-
-        # entry_delay should be 5 calendar days (Jan 1 → Jan 6)
-        self.assertEqual(valid.iloc[0]["bt_entry_delay"], 5)
-
-        # SPY return in the dip window must differ from the as_of window
-        # because SPY rises 0.5/day and 5 days of shift matters.
-        spy_from_as_of = round(
-            (
-                spy_arr[dates.get_loc(as_of + pd.Timedelta(days=horizon))]
-                / spy_arr[dates.get_loc(as_of)]
-                - 1
-            )
-            * 100,
-            2,
-        )
-        spy_from_dip = valid.iloc[0]["bt_spy_return_pct"]
-        # The two windows must be different (SPY is non-flat)
-        self.assertNotAlmostEqual(
-            spy_from_dip,
-            spy_from_as_of,
-            places=1,
-            msg="SPY return in dip window must differ from as_of window when entry is delayed",
-        )
-
-    # ---- Bug 1c: calendar-day delay, not array-row count
-
-    def test_dip_entry_delay_uses_calendar_days_not_trading_rows(self):
-        """Bug 1c: entry_delay must be calendar days, not the array-row offset.
-        A dip on Monday after a Friday as_of spans 3 calendar days but only
-        1 trading row (no weekend rows in the price array)."""
-        as_of = pd.Timestamp("2025-01-03")  # Friday
-        dip_date = pd.Timestamp("2025-01-06")  # Monday: 3 calendar days, 1 trading row
-        # Use only business-day prices so the array index gap is 1 but calendar gap is 3
-        bdays = pd.date_range("2024-12-02", "2025-06-01", freq="B")
-        prices_arr = [90.0 if d >= dip_date else 100.0 for d in bdays]  # 10% drop
-        spy_arr = [400.0 + i * 0.1 for i in range(len(bdays))]
-        prices = self._make_prices(bdays, {"AAPL": prices_arr, "SPY": spy_arr})
-        recs = self._single_rec()
-
-        result = evaluate_backtest(
-            recs,
-            prices,
-            as_of,
-            horizon=90,
-            use_dip_entry=True,
-            pullback_pct=0.05,
-            max_wait_days=10,
-        )
-        valid = result.dropna(subset=["bt_return_pct"])
-        self.assertFalse(
-            valid.empty, "dip should have been triggered by the 10% price drop on Jan 6"
-        )
-        entry_delay = valid.iloc[0]["bt_entry_delay"]
-        # Old buggy code: would return 1 (array-row index hits[0])
-        # Correct code:   must return 3 (calendar days Jan 3 → Jan 6)
-        self.assertEqual(
-            entry_delay,
-            3,
-            "entry_delay must be calendar days (3), not trading-row count (1)",
-        )
 
     # ---- Bug 2: survivorship — delisted ticker included at last price
 
@@ -535,6 +419,7 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
         self.assertTrue(pd.isna(row["bt_return_pct"]))
         self.assertEqual(row["bt_coverage"], "unavailable")
         self.assertEqual(row["bt_unavailable_reason"], "no_price_series")
+        self.assertEqual(row["bt_horizon_days"], 90)
         self.assertEqual(result.attrs.get("n_no_price", 0), 1)
         self.assertEqual(result.attrs.get("n_unavailable", 0), 1)
         self.assertEqual(result.attrs.get("n_delisted", 0), 0)
@@ -656,7 +541,9 @@ class TestBacktestCorrectnessRegressions(unittest.TestCase):
 
         self.assertEqual(summary.attrs.get("n_no_price"), 1)
         self.assertEqual(summary.attrs.get("n_delisted"), 0)
-        self.assertEqual(ev.attrs.get("n_unavailable"), 1)
+        # ``n_no_price`` is a subset of unavailable evaluations, and both
+        # counters remain visible for diagnostics.
+        self.assertEqual(ev.attrs.get("n_unavailable"), 2)
 
     def test_ticker_without_exact_entry_is_unavailable(self):
         """A stale pre-decision quote cannot establish an executable entry."""

@@ -134,6 +134,7 @@ class YFinancePriceSource:
 
         new_prices = self._extract_close_prices(data, fetch_resolved)
         new_prices = self._normalize_price_index(new_prices)
+        new_prices = _clip_price_window(new_prices, start, end)
         new_prices = new_prices.apply(pd.to_numeric, errors="coerce")
         invalid_mask = new_prices.notna() & (
             ~np.isfinite(new_prices) | new_prices.le(0)
@@ -249,17 +250,20 @@ class YFinancePriceSource:
 
 
 def _clean_tickers(tickers: list[str]) -> list[str]:
-    """Filter empty values and known parser-token quarantines."""
+    """Normalize symbols and filter empty values and parser-token quarantines."""
     resolver = TickerResolver()
     clean: list[str] = []
     quarantined: list[str] = []
     for ticker in tickers:
-        if not ticker or not str(ticker).strip() or str(ticker) == "nan":
+        if isinstance(ticker, bool):
             continue
-        if resolver.resolve(str(ticker)).status == "quarantined":
-            quarantined.append(str(ticker).strip().upper())
+        normalized = str(ticker).strip().upper() if ticker is not None else ""
+        if not normalized or normalized == "NAN":
             continue
-        clean.append(ticker)
+        if resolver.resolve(normalized).status == "quarantined":
+            quarantined.append(normalized)
+            continue
+        clean.append(normalized)
     if quarantined:
         logger.debug(
             "Excluded %d quarantined ticker tokens from price fetch: %s",
@@ -267,6 +271,19 @@ def _clean_tickers(tickers: list[str]) -> list[str]:
             ", ".join(sorted(set(quarantined))),
         )
     return clean
+
+
+def _clip_price_window(
+    prices: pd.DataFrame, start: date, end: date
+) -> pd.DataFrame:
+    """Keep fetched observations inside the inclusive requested window."""
+    start_ts = pd.Timestamp(start).normalize()
+    end_ts = pd.Timestamp(end).normalize()
+    if start_ts.tz is not None:
+        start_ts = start_ts.tz_localize(None)
+    if end_ts.tz is not None:
+        end_ts = end_ts.tz_localize(None)
+    return prices.loc[(prices.index >= start_ts) & (prices.index <= end_ts)]
 
 
 def _expand_rename_aliases(tickers: list[str]) -> set[str]:

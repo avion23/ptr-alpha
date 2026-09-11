@@ -8,11 +8,10 @@ unavailable rather than being replaced with stale prices.
 Heavy preprocessing (SPY benchmark, per-ticker price caches, slippage
 multipliers) is hoisted out of the per-row loop.
 
-Bug fixes applied here (see prices.py for Bug 1b/1c low-level fixes):
+Bug fixes applied here:
 
-  Timing — The ordinary baseline enters on the first session strictly after
-           the decision. Dip orders also require a future fill and never fall
-           back after observing that no dip occurred.
+  Timing — Entry occurs on the first expected NYSE session strictly after the
+           decision.
 
   Coverage — Entry occurs on the first tradable session after the decision.
              Security and SPY returns use identical entry/exit dates. Missing
@@ -30,7 +29,6 @@ import numpy as np
 import pandas as pd
 
 from analyzer._price_index import _normalize_price_index
-from analyzer.backtest.prices import _find_dip_entry_arrays
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals import _price_arrays
 
@@ -61,9 +59,6 @@ def evaluate_backtest(
     horizon: int,
     entry_slippage_bps: float = 10.0,
     exit_slippage_bps: float = 10.0,
-    use_dip_entry: bool = False,  # Bug 1a: was True; False = honest baseline
-    pullback_pct: float = 0.05,
-    max_wait_days: int = 10,
 ) -> pd.DataFrame:
     if recommendations.empty:
         result = _empty_eval_joined(recommendations)
@@ -105,16 +100,16 @@ def evaluate_backtest(
             n_no_price += 1
             n_unavailable += 1
             expected_entry_ns = next_nyse_session(as_of_date).value
-            rows.append(
-                _unavailable_no_entry_row(
-                    ticker,
-                    i,
-                    expected_entry_ns,
-                    inst_type_arr[i] if inst_type_arr is not None else "stock",
-                    amount_arr[i] if amount_arr is not None else None,
-                    reason="no_price_series",
-                )
+            row = _unavailable_no_entry_row(
+                ticker,
+                i,
+                expected_entry_ns,
+                inst_type_arr[i] if inst_type_arr is not None else "stock",
+                amount_arr[i] if amount_arr is not None else None,
+                reason="no_price_series",
             )
+            row["bt_horizon_days"] = t_horizon
+            rows.append(row)
             continue
 
         row = _evaluate_one_recommendation(
@@ -127,9 +122,6 @@ def evaluate_backtest(
             exit_mult,
             spy_ns,
             spy_vals,
-            use_dip_entry,
-            pullback_pct,
-            max_wait_days,
             inst_type_arr[i] if inst_type_arr is not None else "stock",
             amount_arr[i] if amount_arr is not None else None,
         )
@@ -210,9 +202,6 @@ def _evaluate_one_recommendation(
     exit_mult,
     spy_ns,
     spy_vals,
-    use_dip_entry,
-    pullback_pct,
-    max_wait_days,
     inst_type_val,
     amount_val,
 ) -> dict | None:
@@ -225,16 +214,11 @@ def _evaluate_one_recommendation(
     )
     amount = amount_val if amount_val is not None else None
     entry, entry_delay, entry_date_ns = _resolve_entry(
-        use_dip_entry,
         idx_ns,
         vals,
         as_of_date,
-        pullback_pct,
-        max_wait_days,
     )
     if not entry or entry_date_ns is None:
-        if use_dip_entry:
-            return None
         expected_entry_ns = next_nyse_session(as_of_date).value
         return _unavailable_no_entry_row(
             ticker, row_idx, expected_entry_ns, inst_type, amount
@@ -392,28 +376,12 @@ def _unavailable_bt_row(
 
 
 def _resolve_entry(
-    use_dip_entry,
     idx_ns,
     vals,
     as_of_date,
-    pullback_pct,
-    max_wait_days,
 ):
     """Return a fill strictly after the decision date."""
     as_of_ns = pd.Timestamp(as_of_date).value
-    if use_dip_entry:
-        entry, entry_delay = _find_dip_entry_arrays(
-            idx_ns,
-            vals,
-            as_of_date,
-            pullback_pct,
-            max_wait_days,
-        )
-        if entry <= 0 or entry_delay <= 0:
-            return None, 0, None
-        entry_date_ns = as_of_ns + entry_delay * NS_PER_DAY
-        return entry, entry_delay, entry_date_ns
-
     entry_date_ns = next_nyse_session(pd.Timestamp(as_of_ns)).value
     delay = int((entry_date_ns - as_of_ns) // NS_PER_DAY)
     pos = int(np.searchsorted(idx_ns, entry_date_ns, side="left"))

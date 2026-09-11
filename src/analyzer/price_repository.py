@@ -318,7 +318,7 @@ class PriceRepository:
             resolved_tickers AS (
                 SELECT t.*, COALESCE(tm.resolved, t.ticker) AS resolved_ticker
                 FROM canonical_transactions t
-                LEFT JOIN ticker_map tm
+                JOIN ticker_map tm
                   ON t.ticker = tm.raw
                  AND t.disclosure_date IS NOT DISTINCT FROM tm.disclosure_date
             )
@@ -327,8 +327,7 @@ class PriceRepository:
                    r.amount_midpoint, r.instrument_type, r.strike_price,
                    r.expiry_date
             FROM resolved_tickers r
-            WHERE r.ticker IN (SELECT UNNEST(?))
-              AND r.disclosure_date BETWEEN ? AND ?
+            WHERE r.disclosure_date BETWEEN ? AND ?
               AND (r.transaction_date IS NULL OR r.transaction_date <= r.disclosure_date)
             ORDER BY r.ticker, r.transaction_date, r.disclosure_date,
                      r.member, r.transaction_type, r.owner_code, r.id
@@ -337,7 +336,6 @@ class PriceRepository:
                 map_raw,
                 map_disclosure_date,
                 map_resolved,
-                expanded_tickers,
                 start_date,
                 end_date,
             ],

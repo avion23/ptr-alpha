@@ -118,9 +118,12 @@ def _complete_funded_frame(
     """
     if results.empty:
         return results.iloc[0:0].copy(), 0, 0
-    if "bt_return_pct" not in results.columns:
-        return results.iloc[0:0].copy(), 0, len(results)
-    measurable = pd.to_numeric(results["bt_return_pct"], errors="coerce").notna()
+    if "bt_return_pct" not in results.columns or "bt_alpha_pct" not in results.columns:
+        return results.iloc[0:0].copy(), 1, len(results)
+    measurable = (
+        pd.to_numeric(results["bt_return_pct"], errors="coerce").notna()
+        & pd.to_numeric(results["bt_alpha_pct"], errors="coerce").notna()
+    )
     if "as_of_date" not in results.columns:
         incomplete = ~measurable
         return (
@@ -153,7 +156,9 @@ def _funded_period_returns(valid: pd.DataFrame) -> pd.DataFrame:
         return pd.Series(fallback, index=frame.index, dtype=float)
 
     frame["_return"] = numeric("bt_return_pct")
-    frame["_alpha"] = numeric("bt_alpha_pct")
+    frame["_alpha"] = pd.to_numeric(frame["bt_alpha_pct"], errors="coerce")
+    if frame["_alpha"].isna().any():
+        raise ValueError("funded rows require measurable bt_alpha_pct")
     frame["_raw_return"] = numeric("bt_raw_return_pct", np.nan).fillna(frame["_return"])
     return (
         frame.groupby(period_key, sort=True)

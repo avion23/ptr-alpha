@@ -344,6 +344,20 @@ class TestSummarizeBacktest(unittest.TestCase):
         self.assertEqual(len(summary), 1)
         self.assertEqual(summary.iloc[0]["count"], 1)
 
+    def test_missing_alpha_is_incomplete_not_synthetic_zero(self):
+        results = pd.DataFrame(
+            {
+                "as_of_date": ["2025-01-01"],
+                "bt_return_pct": [10.0],
+            }
+        )
+
+        summary = summarize_backtest(results)
+
+        self.assertTrue(summary.empty)
+        self.assertEqual(summary.attrs["n_incomplete_periods"], 1)
+        self.assertEqual(summary.attrs["n_incomplete_rows"], 1)
+
     def test_spy_buy_hold_omits_unbounded_price_window_with_reason(self):
         results = pd.DataFrame(
             {

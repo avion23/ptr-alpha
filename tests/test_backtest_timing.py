@@ -63,6 +63,23 @@ class TestBacktestTiming(unittest.TestCase):
         self.assertEqual(row["bt_exit_date"], pd.Timestamp("2025-01-07").date())
         self.assertEqual(row["bt_raw_return_pct"], round((240 / 230 - 1) * 100, 2))
 
+    def test_nonpositive_horizon_is_rejected_at_evaluator_boundary(self):
+        prices = pd.DataFrame(
+            {"AAPL": [100.0], "SPY": [400.0]},
+            index=pd.DatetimeIndex(["2025-01-06"]),
+        )
+        recommendations = pd.DataFrame({"ticker": ["AAPL"]})
+
+        for horizon in (0, -1):
+            with self.subTest(horizon=horizon):
+                with self.assertRaisesRegex(ValueError, "horizon must be positive"):
+                    evaluate_backtest(
+                        recommendations,
+                        prices,
+                        pd.Timestamp("2025-01-03"),
+                        horizon=horizon,
+                    )
+
     def test_declared_horizon_ignores_legacy_optimal_horizon_column(self):
         as_of = pd.Timestamp("2025-01-03")
         dates = pd.bdate_range("2025-01-03", "2025-02-10")

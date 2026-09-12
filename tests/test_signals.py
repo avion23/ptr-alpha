@@ -83,7 +83,7 @@ class TestCalculateSignalPotential(unittest.TestCase):
 
         self.assertFalse(bool(result.iloc[0]["window_complete"]))
 
-    def test_absolute_return_window_can_complete_without_spy(self):
+    def test_window_is_unavailable_without_spy_exact_endpoints(self):
         prices = self.prices_df[["AAPL"]]
         result = calculate_signal_potential(
             self.entry_prices.iloc[[0]],
@@ -91,8 +91,8 @@ class TestCalculateSignalPotential(unittest.TestCase):
             [90],
         )
 
-        self.assertTrue(bool(result.iloc[0]["window_complete"]))
-        self.assertTrue(np.isfinite(result.iloc[0]["total_return_pct"]))
+        self.assertFalse(bool(result.iloc[0]["window_complete"]))
+        self.assertTrue(np.isnan(result.iloc[0]["total_return_pct"]))
         self.assertTrue(np.isnan(result.iloc[0]["total_spy_alpha_pct"]))
 
     def test_explodes_across_horizons(self):
@@ -234,6 +234,25 @@ class TestRenameAliasPerDisclosureDateResolution(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual(set(result["member"]), {"Alice", "Carol"})
         self.assertEqual(set(result["ticker"]), {"META"})
+
+    def test_post_acquisition_raw_price_column_cannot_bypass_identity_filter(self):
+        dates = pd.date_range("2024-01-01", "2024-03-01", freq="D")
+        prices = pd.DataFrame(
+            {"ATVI": 95.0, "SPY": 400.0},
+            index=dates,
+        )
+        entries = pd.DataFrame(
+            {
+                "member": ["Alice"],
+                "ticker": ["ATVI"],
+                "disclosure_date": pd.to_datetime(["2024-01-10"]),
+                "transaction_type": ["Purchase"],
+                "entry_price": [95.0],
+            }
+        )
+
+        with self.assertRaisesRegex(Exception, "No valid price matches"):
+            calculate_signal_potential(entries, prices, [30])
 
     def test_brkb_class_share_resolves_to_brk_b_column(self):
         dates = pd.date_range("2024-01-01", "2024-03-01", freq="D")

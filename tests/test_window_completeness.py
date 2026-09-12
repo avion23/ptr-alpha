@@ -157,6 +157,32 @@ def test_missing_spy_on_security_endpoint_makes_label_unavailable():
     assert np.isnan(row["total_spy_alpha_pct"])
 
 
+def test_nonpositive_exact_endpoint_does_not_complete_label():
+    disclosure = pd.Timestamp("2024-01-02")
+    entry = next_nyse_session(disclosure)
+    exit_date = previous_nyse_session(entry + pd.Timedelta(days=2))
+    dates = pd.date_range(disclosure, exit_date, freq="D")
+    aapl = pd.Series(100.0, index=dates)
+    spy = pd.Series(400.0, index=dates)
+    aapl.loc[exit_date] = 0.0
+    prices = pd.DataFrame({"AAPL": aapl, "SPY": spy}, index=dates)
+    entries = pd.DataFrame(
+        {
+            "member": ["Alice"],
+            "ticker": ["AAPL"],
+            "disclosure_date": [disclosure],
+            "transaction_type": ["Purchase"],
+            "entry_price": [100.0],
+        }
+    )
+
+    row = calculate_signal_potential(entries, prices, horizons=[2]).iloc[0]
+
+    assert not bool(row["window_complete"])
+    assert np.isnan(row["total_return_pct"])
+    assert np.isnan(row["total_spy_alpha_pct"])
+
+
 def test_six_day_early_security_exit_does_not_complete_label():
     disclosure = pd.Timestamp("2025-01-02")
     dates = pd.bdate_range("2025-01-02", "2025-01-14")

@@ -60,6 +60,8 @@ def evaluate_backtest(
     entry_slippage_bps: float = 10.0,
     exit_slippage_bps: float = 10.0,
 ) -> pd.DataFrame:
+    if int(horizon) < 1:
+        raise ValueError("horizon must be positive")
     if recommendations.empty:
         result = _empty_eval_joined(recommendations)
         result.attrs["n_no_price"] = 0

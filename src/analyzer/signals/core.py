@@ -82,8 +82,11 @@ def _compute_ticker_signals(
         entry_pos = int(np.searchsorted(dates_ns, entry_date_ns, side="left"))
         if entry_pos >= len(dates_ns) or int(dates_ns[entry_pos]) != entry_date_ns:
             continue
+        entry_value = float(vals[entry_pos])
+        if not np.isfinite(entry_value) or entry_value <= 0:
+            continue
         r_entry_date[idx] = np.datetime64(entry_date_ns, "ns")
-        r_disc_baseline[idx] = float(vals[entry_pos])
+        r_disc_baseline[idx] = entry_value
 
         intended_end_ns = entry_date_ns + horizon_ns
         r_label_window_end[idx] = np.datetime64(intended_end_ns, "ns")
@@ -98,23 +101,42 @@ def _compute_ticker_signals(
         exit_pos = int(np.searchsorted(dates_ns, exit_date_ns, side="left"))
         if exit_pos >= len(dates_ns) or int(dates_ns[exit_pos]) != exit_date_ns:
             continue
+        exit_value = float(vals[exit_pos])
+        if not np.isfinite(exit_value) or exit_value <= 0:
+            continue
         r_exit_date[idx] = np.datetime64(exit_date_ns, "ns")
 
         # Benchmark prices must exist on the security's actual entry and exit
         # sessions. Independent nearest-date lookups create phantom alpha.
-        if has_benchmark:
-            spy_entry_pos = int(np.searchsorted(spy_dates_ns, entry_date_ns, side="left"))
-            spy_exit_pos = int(np.searchsorted(spy_dates_ns, exit_date_ns, side="left"))
-            if (
-                spy_entry_pos >= len(spy_dates_ns)
-                or int(spy_dates_ns[spy_entry_pos]) != entry_date_ns
-                or spy_exit_pos >= len(spy_dates_ns)
-                or int(spy_dates_ns[spy_exit_pos]) != exit_date_ns
-            ):
-                continue
+        if not has_benchmark:
+            continue
+        spy_entry_pos = int(np.searchsorted(spy_dates_ns, entry_date_ns, side="left"))
+        spy_exit_pos = int(np.searchsorted(spy_dates_ns, exit_date_ns, side="left"))
+        if (
+            spy_entry_pos >= len(spy_dates_ns)
+            or int(spy_dates_ns[spy_entry_pos]) != entry_date_ns
+            or spy_exit_pos >= len(spy_dates_ns)
+            or int(spy_dates_ns[spy_exit_pos]) != exit_date_ns
+        ):
+            continue
+        spy_entry_value = float(spy_vals[spy_entry_pos])
+        spy_exit_value = float(spy_vals[spy_exit_pos])
+        if (
+            not np.isfinite(spy_entry_value)
+            or spy_entry_value <= 0
+            or not np.isfinite(spy_exit_value)
+            or spy_exit_value <= 0
+        ):
+            continue
+
+        w_vals = vals[entry_pos : exit_pos + 1]
+        if not np.isfinite(w_vals).all() or np.any(w_vals <= 0):
+            continue
+        spy_window = spy_vals[spy_entry_pos : spy_exit_pos + 1]
+        if not np.isfinite(spy_window).all() or np.any(spy_window <= 0):
+            continue
 
         r_window_complete[idx] = True
-        w_vals = vals[entry_pos : exit_pos + 1]
         w_dates = dates_ns[entry_pos : exit_pos + 1]
         n_w = len(w_vals)
 
@@ -310,15 +332,15 @@ def _resolve_tickers(signals: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataF
             continue
         normalized = str(raw).strip().upper()
         is_alias = normalized in rename_aliases
-        if not is_alias and raw in price_tickers:
-            # Prices stored under the raw ticker (class shares, pass-throughs)
-            # are authoritative; the resolved symbol would miss the column.
-            keep_indices.append(i)
-            resolved.append(raw)
-            continue
         disclosure = pd.Timestamp(signals["disclosure_date"].iloc[i])
         resolution = resolver.resolve(raw, disclosure.date())
-        if resolution.status in {"acquired", "date_required", "pre_listing"}:
+        if resolution.status in {
+            "acquired",
+            "date_required",
+            "pre_listing",
+            "quarantined",
+            "unresolved",
+        }:
             continue
         if is_alias and resolution.price_symbol not in price_tickers:
             continue

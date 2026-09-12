@@ -151,8 +151,7 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
             return False
 
         def map(self, worker, paths, chunksize=1):
-            assert chunksize == 1
-            return [worker(path) for path in paths]
+            raise AssertionError("readiness preflight must not gate parsing")
 
         def imap_unordered(self, worker, paths, chunksize=1):
             assert chunksize == 1
@@ -198,10 +197,14 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         ),
     )
     monkeypatch.setattr(rebuild_staged, "Pool", FakePool)
+
+    def fail_readiness_probe(_path):
+        raise AssertionError("readiness probe must not run before parsing")
+
     monkeypatch.setattr(
         rebuild_staged,
         "_primary_text_engines_reconcile",
-        lambda path: path == fallback_path,
+        fail_readiness_probe,
     )
     monkeypatch.setattr(rebuild_staged, "_parse_pdf_worker", fake_parser)
     monkeypatch.setattr(rebuild_staged, "consolidate_transactions", fake_consolidate)
@@ -229,6 +232,140 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
     assert parse_runs["failed"]["status"] == "error"
     assert parse_runs["failed"]["error_message"] == "unresolved parser completeness"
     assert parse_runs["failed"]["engines_attempted"] == "cascade-failed"
+
+
+def test_house_parse_persists_batches_before_all_results_without_readiness_preflight(
+    monkeypatch, tmp_path
+):
+    from scripts import rebuild_staged
+
+    sizes = {
+        "a-heavy": 100,
+        "z-fast1": 1,
+        "z-fast2": 2,
+        "z-fast3": 3,
+        "z-fast4": 4,
+        "a-retry": 0,
+    }
+    paths = [tmp_path / f"{stem}.pdf" for stem in sizes]
+    for path, size in zip(paths, sizes.values()):
+        path.write_bytes(b"x" * size)
+    existing_docs = pd.DataFrame({"DocID": [path.stem for path in paths]})
+
+    source = SimpleNamespace(
+        fetch_metadata=lambda _year: pd.DataFrame(
+            {
+                "DocID": [path.stem for path in paths],
+                "FilingType": ["P"] * len(paths),
+            }
+        ),
+        close=lambda: None,
+    )
+    db = SimpleNamespace(
+        conn=SimpleNamespace(
+            execute=lambda sql, *_args: SimpleNamespace(
+                fetchall=lambda: (
+                    [("a-retry",)] if "SELECT DISTINCT doc_id" in sql else []
+                )
+            )
+        ),
+        parse_runs=SimpleNamespace(
+            get_cached_doc_ids=lambda **_kwargs: set()
+        ),
+        get_latest_house_generation=lambda _year: "generation",
+    )
+
+    requested = []
+    persisted = []
+
+    class FakePool:
+        def __init__(self, _workers):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def map(self, *_args, **_kwargs):
+            raise AssertionError("readiness preflight must not gate parsing")
+
+        def imap_unordered(self, worker, items, chunksize=1):
+            assert chunksize == 1
+            for path in items:
+                yield worker(path)
+
+    def fake_worker(path):
+        requested.append(path.stem)
+        if len(requested) == 5:
+            assert persisted == [["z-fast1", "z-fast2", "z-fast3", "z-fast4"]]
+        return path, [{"doc_id": path.stem}], ["pdfplumber"]
+
+    def fake_persist(_db, **kwargs):
+        batch = [path.stem for path, *_ in kwargs["results"]]
+        persisted.append(batch)
+        count = len(batch)
+        return {
+            "attempted": count,
+            "parse_run_statuses": {"success": count},
+            "persisted_transactions": count,
+        }
+
+    monkeypatch.setattr(rebuild_staged, "_house_source", lambda _staging: source)
+    monkeypatch.setattr(
+        rebuild_staged,
+        "_filter_existing_pdfs",
+        lambda _ptrs, _pdf_dir: (paths, existing_docs),
+    )
+    monkeypatch.setattr(rebuild_staged, "_build_member_lookup", lambda _docs: {})
+    monkeypatch.setattr(
+        rebuild_staged,
+        "_settings_for",
+        lambda _staging: SimpleNamespace(
+            data=SimpleNamespace(get_workers=lambda: 1)
+        ),
+    )
+    monkeypatch.setattr(rebuild_staged, "Pool", FakePool)
+    monkeypatch.setattr(rebuild_staged, "_tolerant_parse_worker", fake_worker)
+    monkeypatch.setattr(rebuild_staged, "_persist_house_parse_batch", fake_persist)
+
+    def fail_parser_preflight(_path):
+        raise AssertionError("parser preflight must not run before parsing")
+
+    monkeypatch.setattr(
+        rebuild_staged._parser_cascade, "_try_pdfplumber", fail_parser_preflight
+    )
+    monkeypatch.setattr(
+        rebuild_staged._parser_cascade, "_try_pdftotext", fail_parser_preflight
+    )
+
+    def fail_readiness_probe(_path):
+        raise AssertionError("readiness probe must not run before parsing")
+
+    monkeypatch.setattr(
+        rebuild_staged,
+        "_primary_text_engines_reconcile",
+        fail_readiness_probe,
+    )
+
+    result = rebuild_staged._parse_house_year_tolerant(
+        tmp_path, cast(rebuild_staged.Database, db), 2026
+    )
+
+    assert requested == [
+        "z-fast1",
+        "z-fast2",
+        "z-fast3",
+        "z-fast4",
+        "a-heavy",
+        "a-retry",
+    ]
+    assert persisted == [
+        ["z-fast1", "z-fast2", "z-fast3", "z-fast4"],
+        ["a-heavy", "a-retry"],
+    ]
+    assert result["attempted"] == 6
 
 
 def _seed_house_inventory_database(tmp_path):

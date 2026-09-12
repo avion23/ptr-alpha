@@ -271,6 +271,19 @@ def _tolerant_parse_worker(pdf_path: Path):
     return _production_tolerant_parse_worker(pdf_path, _parse_pdf_worker)
 
 
+def _pdf_size_hint(pdf_path: Path) -> int:
+    """Return a bounded local-artifact size hint for parse scheduling.
+
+    A file stat is metadata-only: it does not invoke a parser or read the PDF
+    body.  Missing or transiently inaccessible artifacts sort last rather than
+    preventing the parse stream from starting.
+    """
+    try:
+        return max(0, int(pdf_path.stat().st_size))
+    except OSError:
+        return sys.maxsize
+
+
 def _primary_text_engines_reconcile(pdf_path: Path) -> bool:
     """Predict a cheap text-cascade success for scheduling only.
 
@@ -449,6 +462,18 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
                 [year, ingestion_generation],
             ).fetchall()
         }
+        order = sorted(
+            range(len(pdf_paths)),
+            key=lambda index: (
+                pdf_paths[index].stem in previously_attempted,
+                _pdf_size_hint(pdf_paths[index]),
+                pdf_paths[index].stem,
+            ),
+        )
+        pdf_paths = [pdf_paths[index] for index in order]
+        existing_docs = existing_docs.iloc[order].reset_index(drop=True)
+        member_lookup = _build_member_lookup(existing_docs)
+
         settings = _settings_for(staging)
         workers = settings.data.get_workers()
         persist_batch_size = max(4, workers)
@@ -475,20 +500,6 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
 
         completed: list = []
         with Pool(workers) as pool:
-            primary_text_ready = pool.map(
-                _primary_text_engines_reconcile, pdf_paths, chunksize=1
-            )
-            order = sorted(
-                range(len(pdf_paths)),
-                key=lambda index: (
-                    pdf_paths[index].stem in previously_attempted,
-                    not primary_text_ready[index],
-                    pdf_paths[index].stem,
-                ),
-            )
-            pdf_paths = [pdf_paths[index] for index in order]
-            existing_docs = existing_docs.iloc[order].reset_index(drop=True)
-            member_lookup = _build_member_lookup(existing_docs)
             for result in pool.imap_unordered(
                 _tolerant_parse_worker, pdf_paths, chunksize=1
             ):

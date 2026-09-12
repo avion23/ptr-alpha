@@ -272,16 +272,16 @@ def _tolerant_parse_worker(pdf_path: Path):
 
 
 def _pdf_size_hint(pdf_path: Path) -> int:
-    """Return a bounded local-artifact size hint for parse scheduling.
+    """Return a local-artifact size hint for parse scheduling.
 
     A file stat is metadata-only: it does not invoke a parser or read the PDF
-    body.  Missing or transiently inaccessible artifacts sort last rather than
-    preventing the parse stream from starting.
+    body. Missing or transiently inaccessible artifacts return ``-1`` so they
+    sort after every readable artifact.
     """
     try:
         return max(0, int(pdf_path.stat().st_size))
     except OSError:
-        return sys.maxsize
+        return -1
 
 
 def _primary_text_engines_reconcile(pdf_path: Path) -> bool:
@@ -466,7 +466,7 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
             range(len(pdf_paths)),
             key=lambda index: (
                 pdf_paths[index].stem in previously_attempted,
-                _pdf_size_hint(pdf_paths[index]),
+                -_pdf_size_hint(pdf_paths[index]),
                 pdf_paths[index].stem,
             ),
         )

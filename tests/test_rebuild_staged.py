@@ -240,12 +240,12 @@ def test_house_parse_persists_batches_before_all_results_without_readiness_prefl
     from scripts import rebuild_staged
 
     sizes = {
-        "a-heavy": 100,
-        "z-fast1": 1,
-        "z-fast2": 2,
-        "z-fast3": 3,
-        "z-fast4": 4,
-        "a-retry": 0,
+        "a-small-scan": 1,
+        "z-fast1": 400,
+        "z-fast2": 300,
+        "z-fast3": 200,
+        "z-fast4": 150,
+        "a-retry": 1000,
     }
     paths = [tmp_path / f"{stem}.pdf" for stem in sizes]
     for path, size in zip(paths, sizes.values()):
@@ -358,12 +358,12 @@ def test_house_parse_persists_batches_before_all_results_without_readiness_prefl
         "z-fast2",
         "z-fast3",
         "z-fast4",
-        "a-heavy",
+        "a-small-scan",
         "a-retry",
     ]
     assert persisted == [
         ["z-fast1", "z-fast2", "z-fast3", "z-fast4"],
-        ["a-heavy", "a-retry"],
+        ["a-small-scan", "a-retry"],
     ]
     assert result["attempted"] == 6
 

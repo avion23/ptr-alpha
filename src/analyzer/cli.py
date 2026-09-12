@@ -411,12 +411,6 @@ def analyze(
     member: str | None = typer.Option(None, help="Filter to specific member"),
     ticker: str | None = typer.Option(None, help="Analyze specific ticker"),
     horizons: list[int] = typer.Option([90], help="Time horizons in days"),
-    days_back: int = typer.Option(
-        CONSENSUS_LOOKBACK_DAYS, help="Days back for ticker scoring"
-    ),
-    min_buyers: int = typer.Option(
-        CONSENSUS_MIN_BUYERS, help="Minimum buyers for ticker scoring"
-    ),
     top_n: int = typer.Option(20, help="Number of results to show"),
     as_of: str | None = typer.Option(
         None,
@@ -439,12 +433,7 @@ def analyze(
       tickers  - Score current multi-buyer equity candidates
     """
     _validate_mode(mode, member, ticker)
-    _validate_positive_options(
-        year=year,
-        days_back=days_back,
-        min_buyers=min_buyers,
-        top_n=top_n,
-    )
+    _validate_positive_options(year=year, top_n=top_n)
     if not horizons or any(horizon <= 0 for horizon in horizons):
         print("Error: --horizons values must be greater than zero", file=sys.stderr)
         raise typer.Exit(1)
@@ -460,18 +449,25 @@ def analyze(
         and year == date.today().year
         and (ticker is not None or mode == "tickers")
     ):
-        _warn_live_ticker_coverage(app_ctx, days_back)
+        _warn_live_ticker_coverage(app_ctx, CONSENSUS_LOOKBACK_DAYS)
 
     if ticker:
         _run_ticker_mode(
-            app_ctx, mode, ticker, year, days_back, min_buyers, as_of_date, output
+            app_ctx,
+            mode,
+            ticker,
+            year,
+            CONSENSUS_LOOKBACK_DAYS,
+            CONSENSUS_MIN_BUYERS,
+            as_of_date,
+            output,
         )
     elif mode == "tickers":
         _run_tickers_mode(
             app_ctx,
             year,
-            days_back,
-            min_buyers,
+            CONSENSUS_LOOKBACK_DAYS,
+            CONSENSUS_MIN_BUYERS,
             top_n,
             output,
             as_of_date,
@@ -698,13 +694,6 @@ def backtest(
     horizon: int = typer.Option(
         _BACKTEST_DEFAULTS["horizon"], help="Forward return horizon in days"
     ),
-    lookback_days: int = typer.Option(
-        _BACKTEST_DEFAULTS["lookback_days"],
-        help="Candidate purchase lookback window in days",
-    ),
-    min_buyers: int = typer.Option(
-        _BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"
-    ),
     top_n: int = typer.Option(
         _BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"
     ),
@@ -736,8 +725,6 @@ def backtest(
 
     _validate_positive_options(
         horizon=horizon,
-        lookback_days=lookback_days,
-        min_buyers=min_buyers,
         top_n=top_n,
         frequency_days=frequency_days,
     )
@@ -747,8 +734,8 @@ def backtest(
         start_date=start_date,
         end_date=end_date,
         horizon=horizon,
-        lookback_days=lookback_days,
-        min_buyers=min_buyers,
+        lookback_days=CONSENSUS_LOOKBACK_DAYS,
+        min_buyers=CONSENSUS_MIN_BUYERS,
         top_n=top_n,
         frequency_days=frequency_days,
     )
@@ -830,13 +817,6 @@ def portfolio(
     ctx: typer.Context,
     start: str = typer.Option(..., help="Simulation start date (YYYY-MM-DD)"),
     end: str = typer.Option(..., help="Simulation end date (YYYY-MM-DD)"),
-    lookback_days: int = typer.Option(
-        _BACKTEST_DEFAULTS["lookback_days"],
-        help="Candidate purchase lookback window in days",
-    ),
-    min_buyers: int = typer.Option(
-        _BACKTEST_DEFAULTS["min_buyers"], help="Minimum buyers for a candidate ticker"
-    ),
     top_n: int = typer.Option(
         _BACKTEST_DEFAULTS["top_n"], help="Top N recommendations per backtest date"
     ),
@@ -863,8 +843,6 @@ def portfolio(
     start_date, end_date = _parse_sim_dates(start, end)
 
     _validate_positive_options(
-        lookback_days=lookback_days,
-        min_buyers=min_buyers,
         top_n=top_n,
         frequency_days=frequency_days,
         initial_capital=initial_capital,
@@ -885,7 +863,7 @@ def portfolio(
 
     from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
 
-    tx_start = start_date - timedelta(days=lookback_days)
+    tx_start = start_date - timedelta(days=CONSENSUS_LOOKBACK_DAYS)
     all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(
         tx_start, end_date
     )
@@ -897,8 +875,8 @@ def portfolio(
         app_ctx,
         all_transactions,
         end_date,
-        lookback_days,
-        min_buyers,
+        CONSENSUS_LOOKBACK_DAYS,
+        CONSENSUS_MIN_BUYERS,
         top_n,
         frequency_days,
         start_date,

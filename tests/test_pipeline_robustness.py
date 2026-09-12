@@ -97,18 +97,18 @@ def test_refresh_summary_is_scoped_to_requested_year(tmp_path):
 def _consensus_test_trades() -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "member": ["Alice", "Carol", "Future Bob"],
-            "ticker": ["AAPL", "AAPL", "AAPL"],
+            "member": ["Alice", "Bob", "Carol", "Future Bob"],
+            "ticker": ["AAPL", "AAPL", "AAPL", "AAPL"],
             "transaction_date": pd.to_datetime(
-                ["2025-05-19", "2025-05-24", "2025-06-04"]
+                ["2025-05-19", "2025-05-21", "2025-05-24", "2025-06-04"]
             ),
             "disclosure_date": pd.to_datetime(
-                ["2025-05-20", "2025-05-25", "2025-06-05"]
+                ["2025-05-20", "2025-05-22", "2025-05-25", "2025-06-05"]
             ),
-            "transaction_type": ["Purchase", "Purchase", "Purchase"],
-            "instrument_type": ["stock", "stock", "stock"],
-            "raw_asset_class": ["ST", "ST", "ST"],
-            "ticker_origin": ["official", "official", "official"],
+            "transaction_type": ["Purchase", "Purchase", "Purchase", "Purchase"],
+            "instrument_type": ["stock", "stock", "stock", "stock"],
+            "raw_asset_class": ["ST", "ST", "ST", "ST"],
+            "ticker_origin": ["official", "official", "official", "official"],
         }
     )
 
@@ -159,23 +159,82 @@ def test_historical_analysis_uses_exact_acquired_price_matrix():
 
 def test_ticker_analysis_uses_real_consensus_at_explicit_cutoff():
     as_of = date(2025, 6, 1)
-    with patch(
-        "analyzer.pipeline.prepare_analysis_data",
-        return_value=(_consensus_test_trades(), pd.DataFrame(), pd.DataFrame()),
-    ):
-        transaction_source = MagicMock()
-        transaction_source.db.get_transactions.return_value = _consensus_test_trades()
-        result = run_ticker_analysis(
-            TickerAnalysisParams(
-                ticker="AAPL", year=2025, min_buyers=2, as_of_date=as_of
-            ),
-            transaction_source,
-        )
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = (
+        _consensus_test_trades()
+    )
+    result = run_ticker_analysis(
+        TickerAnalysisParams(ticker="AAPL", year=2025, as_of_date=as_of),
+        transaction_source,
+    )
 
     assert result.success
-    assert result.data["buyers"]["member"].tolist() == ["Alice", "Carol"]
-    assert result.data["score"].iloc[0]["num_buyers"] == 2
-    assert result.data["score"].iloc[0]["signal_score"] == 2.0
+    assert result.data["buyers"]["member"].tolist() == ["Alice", "Bob", "Carol"]
+    assert result.data["score"].iloc[0]["num_buyers"] == 3
+    assert result.data["score"].iloc[0]["signal_score"] == 3.0
+
+
+def test_ticker_analysis_uses_prior_year_disclosures_inside_fixed_window():
+    as_of = date(2025, 1, 5)
+    rows = pd.DataFrame(
+        {
+            "member": ["Alice", "Bob", "Carol"],
+            "ticker": ["AAPL", "AAPL", "AAPL"],
+            "transaction_date": pd.to_datetime(
+                ["2024-12-20", "2024-12-21", "2024-12-22"]
+            ),
+            "disclosure_date": pd.to_datetime(
+                ["2024-12-21", "2024-12-22", "2024-12-23"]
+            ),
+            "transaction_type": ["Purchase", "Purchase", "Purchase"],
+            "instrument_type": ["stock", "stock", "stock"],
+            "source": ["house_pdf", "house_pdf", "house_pdf"],
+        }
+    )
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = rows
+
+    result = run_ticker_analysis(
+        TickerAnalysisParams(ticker="AAPL", year=2025, as_of_date=as_of),
+        transaction_source,
+    )
+
+    assert result.success
+    assert result.data["score"].iloc[0]["signal_score"] == 3.0
+    transaction_source.db.get_transactions_by_date_range.assert_called_once_with(
+        pd.Timestamp("2024-12-08"), pd.Timestamp("2025-01-05")
+    )
+
+
+def test_ticker_analysis_rejects_production_policy_override():
+    result = run_ticker_analysis(
+        TickerAnalysisParams(
+            ticker="AAPL",
+            year=2025,
+            days_back=7,
+            min_buyers=1,
+            as_of_date=date(2025, 6, 1),
+        ),
+        MagicMock(),
+    )
+    assert not result.success
+    assert isinstance(result.error, DataSourceError)
+    assert "days_back=28 and min_buyers=3" in str(result.error)
+
+
+def test_recent_ticker_scoring_rejects_production_policy_override():
+    result = run_recent_ticker_scoring(
+        MagicMock(),
+        TickerScoringParams(
+            year=2025,
+            days_back=7,
+            min_buyers=1,
+            as_of_date=date(2025, 6, 1),
+        ),
+    )
+    assert not result.success
+    assert isinstance(result.error, DataSourceError)
+    assert "days_back=28 and min_buyers=3" in str(result.error)
 
 
 def test_single_ticker_rejects_prelisting_reused_symbol_rows():
@@ -191,14 +250,12 @@ def test_single_ticker_rejects_prelisting_reused_symbol_rows():
         }
     )
     transaction_source = MagicMock()
-    transaction_source.db.get_transactions.return_value = rows
+    transaction_source.db.get_transactions_by_date_range.return_value = rows
 
     result = run_ticker_analysis(
         TickerAnalysisParams(
             ticker="SPCX",
             year=2026,
-            days_back=28,
-            min_buyers=1,
             as_of_date=date(2026, 6, 11),
         ),
         transaction_source,
@@ -237,19 +294,14 @@ def test_recent_ticker_scoring_uses_real_consensus_without_rankings():
     ):
         result = run_recent_ticker_scoring(
             transaction_source,
-            TickerScoringParams(
-                year=2025,
-                as_of_date=as_of,
-                days_back=28,
-                min_buyers=2,
-            ),
+            TickerScoringParams(year=2025, as_of_date=as_of),
         )
 
     assert result.success
     scored = result.data["result"].iloc[0]
     assert scored["ticker"] == "AAPL"
-    assert scored["num_buyers"] == 2
-    assert scored["signal_score"] == 2.0
+    assert scored["num_buyers"] == 3
+    assert scored["signal_score"] == 3.0
 
 
 def test_recent_ticker_scoring_consensus_is_transaction_only():
@@ -267,8 +319,6 @@ def test_recent_ticker_scoring_consensus_is_transaction_only():
             TickerScoringParams(
                 year=2025,
                 as_of_date=as_of,
-                days_back=28,
-                min_buyers=2,
                 top_n=1,
             ),
         )
@@ -277,7 +327,7 @@ def test_recent_ticker_scoring_consensus_is_transaction_only():
     assert result.data["result"]["ticker"].tolist() == ["AAPL"]
     assert result.data["top_n"] == 1
     assert result.data["days_back"] == 28
-    assert result.data["min_buyers"] == 2
+    assert result.data["min_buyers"] == 3
     assert result.data["as_of_date"] == as_of
     transaction_source.db.get_transactions_by_date_range.assert_called_once_with(
         pd.Timestamp("2025-05-04"),
@@ -305,12 +355,7 @@ def test_recent_ticker_scoring_filters_rejected_symbols_before_candidate_gate():
     ):
         result = run_recent_ticker_scoring(
             MagicMock(),
-            TickerScoringParams(
-                year=2025,
-                as_of_date=as_of,
-                days_back=28,
-                min_buyers=2,
-            ),
+            TickerScoringParams(year=2025, as_of_date=as_of),
         )
 
     assert result.success
@@ -496,6 +541,22 @@ def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):
     assert "SPY_BUY_HOLD" in summary["rank"].tolist()
     assert summary.attrs["spy_benchmark_status"] == "available"
     assert summary.attrs["spy_benchmark_reason"] is None
+
+
+def test_backtest_pipeline_rejects_production_policy_override():
+    result = run_backtest_pipeline(
+        BacktestParams(
+            start_date=date(2025, 1, 1),
+            end_date=date(2025, 2, 1),
+            lookback_days=7,
+            min_buyers=1,
+        ),
+        MagicMock(),
+        MagicMock(),
+    )
+    assert not result.success
+    assert isinstance(result.error, DataSourceError)
+    assert "lookback_days=28 and min_buyers=3" in str(result.error)
 
 
 def test_backtest_pipeline_keeps_supported_no_recommendation_dates_as_cash(tmp_path):

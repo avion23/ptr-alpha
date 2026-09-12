@@ -57,7 +57,8 @@ def _selection_frame(
     for trial in family.trials:
         trial_id = trial.trial_id
         values = series_by_trial[trial_id]
-        statistic = newey_west_tstat(values, lag=0)
+        expected_lag = max(0, math.ceil(horizon / frequency_days) - 1)
+        statistic = newey_west_tstat(values, lag=expected_lag)
         p_value = (
             float(__import__("scipy").stats.norm.sf(statistic))
             if math.isfinite(statistic)
@@ -78,7 +79,7 @@ def _selection_frame(
                 "overall_alpha": float(values.mean()),
                 "overall_return": max(float(values.mean()), 0.0),
                 "alpha_slope": slopes[trial_id],
-                "nw_lag": 0,
+                "nw_lag": expected_lag,
                 "nw_tstat": statistic,
                 "p_value": p_value,
                 "min_sample_ok": True,
@@ -195,17 +196,23 @@ class TestCorrectedSelection:
 
 
 class TestValidationPolicy:
-    def test_backtest_rejects_policy_override(self):
+    @pytest.mark.parametrize(
+        ("lookback_days", "min_buyers"),
+        [(27, 3), (28, 2), (28.9, 3), (28, 3.9)],
+    )
+    def test_backtest_rejects_policy_override(self, lookback_days, min_buyers):
         params = BacktestParams(
             start_date=date(2024, 1, 1),
             end_date=date(2024, 1, 1),
             horizon=60,
-            lookback_days=27,
-            min_buyers=3,
+            lookback_days=lookback_days,
+            min_buyers=min_buyers,
             top_n=5,
             frequency_days=30,
         )
-        with pytest.raises(ValueError, match="lookback_days=28 and min_buyers=3"):
+        with pytest.raises(
+            ValueError, match="integer lookback_days=28 and min_buyers=3"
+        ):
             _backtest_core(pd.DataFrame(), pd.DataFrame(), params)
 
     def test_net_alpha_survivor_does_not_require_positive_overall_return(self):
@@ -258,6 +265,39 @@ class TestValidationPolicy:
         result = select_config(frame, series_by_trial=series, n_permutations=999)
         assert result["failure_reason"] == "invalid_family"
         assert result["family_integrity"]["parameter"] == "scorer_provenance"
+
+    def test_family_rejects_missing_policy_columns(self):
+        series = {0: _series(np.full(180, 2.0))}
+        for column in ("lookback_days", "min_buyers", "min_sample_ok"):
+            frame = _selection_frame(series).drop(columns=[column])
+            with pytest.raises(ValueError, match="missing required columns"):
+                select_config(frame, series_by_trial=series, n_permutations=999)
+
+    def test_family_rejects_wrong_family_provenance(self):
+        series = {0: _series(np.full(180, 2.0))}
+        frame = _selection_frame(series)
+        frame.attrs["family"] = dict(frame.attrs["family"])
+        frame.attrs["family"]["family_provenance"] = "legacy"
+        frame.attrs["family"]["provenance"] = "legacy"
+        result = select_config(frame, series_by_trial=series, n_permutations=999)
+        assert result["failure_reason"] == "invalid_family"
+        assert result["family_integrity"]["reason"] == "family_provenance_mismatch"
+
+    def test_family_rejects_falsified_hac_lag(self):
+        series = {0: _series(np.full(180, 2.0))}
+        frame = _selection_frame(series, horizon=60, frequency_days=30)
+        frame.loc[0, "nw_lag"] = 0
+        result = select_config(frame, series_by_trial=series, n_permutations=999)
+        assert result["failure_reason"] == "invalid_family"
+        assert result["family_integrity"]["reason"] == "nw_lag_mismatch"
+        assert result["family_integrity"]["expected_nw_lag"] == 1
+
+    def test_explicit_empty_bootstrap_series_does_not_fall_back_to_attrs(self):
+        series = {0: _series(np.full(180, 2.0))}
+        frame = _with_series(_selection_frame(series), series)
+        result = select_config(frame, series_by_trial={}, n_permutations=999)
+        assert result["statistical_survivors"] == []
+        assert result["failure_reason"] == "missing_bootstrap_series"
 
     def test_short_series_cannot_fall_back_to_asymptotic_reward(self):
         short = {0: _series([2.0, 2.1, 1.9])}
@@ -521,7 +561,7 @@ class TestFailureFamilies:
             alpha=0.05,
             out_path=None,
         )
-        assert output["status"] == "completed"
+        assert output["status"] == "failed"
         assert output["support_status"] == "not_supported"
         assert output["train"]["status"] == "failed"
         assert output["test"]["status"] == "failed"
@@ -571,8 +611,11 @@ class TestCanonicalFamilyMetadata:
 
 
 class TestPurgeAndManifest:
-    def test_purge_uses_exact_next_session_execution_window(self):
+    def test_purge_uses_latest_exact_next_session_execution_window(self):
         assert _phase_end(date(2023, 12, 31), 120) == date(2023, 8, 31)
+        assert _phase_end(date(2023, 1, 6), 2) == date(2023, 1, 5)
+        assert _phase_end(date(2020, 1, 3), 60) == date(2019, 11, 5)
+        assert _phase_end(date(2020, 1, 17), 60) == date(2019, 11, 20)
 
     def test_manifest_records_statistical_evidence_without_execution_receipts(self):
         frame = pd.DataFrame(
@@ -635,7 +678,20 @@ def test_consensus_family_rejects_nonoperative_dimensions():
 
 def test_consensus_family_materializes_strategy_defaults():
     assert _effective_validation_grid({"horizon": [60]}) == {
-        "horizon": [60],
+        "horizon": (60,),
         "frequency_days": (30,),
         "top_n": (5,),
     }
+
+
+@pytest.mark.parametrize(
+    "grid",
+    [
+        {"horizon": [60.5]},
+        {"horizon": [60], "frequency_days": [0]},
+        {"horizon": [60], "top_n": [-1]},
+    ],
+)
+def test_validation_grid_rejects_nonpositive_or_noninteger_sensitivities(grid):
+    with pytest.raises(ValueError, match="positive integers"):
+        _effective_validation_grid(grid)

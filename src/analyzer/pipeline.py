@@ -10,6 +10,7 @@ import pandas as pd
 
 from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
+from analyzer.member_names import canonical_member_key
 from analyzer.models import AnalysisMode, SourceCoverageState
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
@@ -296,7 +297,7 @@ def run_analysis_pipeline(
 
 
 def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
-    """Display the same eligible buyers consumed by consensus scoring."""
+    """Display one row per canonical buyer consumed by consensus scoring."""
     purchases = _get_consensus_ticker_purchases(ticker, trades)
     if "member" in purchases.columns:
         purchases = purchases[purchases["member"].notna()].copy()
@@ -309,14 +310,20 @@ def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
                 "disclosure_date",
             ]
         )
+    purchases["_member_canonical"] = purchases["member"].map(canonical_member_key)
+    purchases = purchases[purchases["_member_canonical"].astype(bool)].copy()
+    purchases = purchases.sort_values(
+        ["_member_canonical", "member", "disclosure_date"], kind="mergesort"
+    )
     return (
-        purchases.groupby("member", sort=True)
+        purchases.groupby("_member_canonical", sort=True)
         .agg(
+            member=("member", "first"),
             num_purchases=("ticker", "size"),
             transaction_date=("transaction_date", list),
             disclosure_date=("disclosure_date", list),
         )
-        .reset_index()
+        .reset_index(drop=True)
     )
 
 
@@ -324,22 +331,22 @@ def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
 def run_ticker_analysis(
     params: TickerAnalysisParams, transaction_source
 ) -> DataResult:
-    if params.days_back < 1 or params.min_buyers < 1:
-        raise DataSourceError("days_back and min_buyers must be positive")
+    if (
+        params.days_back != CONSENSUS_LOOKBACK_DAYS
+        or params.min_buyers != CONSENSUS_MIN_BUYERS
+    ):
+        raise DataSourceError(
+            "production ticker analysis requires days_back=28 and min_buyers=3"
+        )
     analysis_as_of = pd.Timestamp(
         params.as_of_date or min(date.today(), date(params.year, 12, 31))
     ).normalize()
     if analysis_as_of.year != params.year:
         raise DataSourceError("year must match the ticker analysis as-of date year")
 
-    trades = _analysis_transactions(transaction_source, params.year)
-    disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
-    cutoff = analysis_as_of - timedelta(days=params.days_back)
-    known_trades = trades[
-        disclosure_dates.notna()
-        & (disclosure_dates >= cutoff)
-        & (disclosure_dates <= analysis_as_of)
-    ].copy()
+    known_trades = prepare_live_consensus_data(
+        transaction_source, analysis_as_of, CONSENSUS_LOOKBACK_DAYS
+    )
 
     try:
         resolved_ticker = _resolve_consensus_ticker(params.ticker, analysis_as_of)
@@ -374,8 +381,13 @@ def run_ticker_analysis(
 def run_recent_ticker_scoring(
     transaction_source, params: TickerScoringParams
 ) -> DataResult:
-    if params.days_back < 1:
-        raise DataSourceError("days_back must be at least 1")
+    if (
+        params.days_back != CONSENSUS_LOOKBACK_DAYS
+        or params.min_buyers != CONSENSUS_MIN_BUYERS
+    ):
+        raise DataSourceError(
+            "production ticker scoring requires days_back=28 and min_buyers=3"
+        )
 
     as_of_date = pd.Timestamp(params.as_of_date or date.today()).normalize()
     if as_of_date.year != params.year:
@@ -615,7 +627,14 @@ def run_backtest_pipeline(
     transaction_source,
     price_source,
 ) -> DataResult:
-    tx_start = params.start_date - timedelta(days=params.lookback_days)
+    if (
+        params.lookback_days != CONSENSUS_LOOKBACK_DAYS
+        or params.min_buyers != CONSENSUS_MIN_BUYERS
+    ):
+        raise DataSourceError(
+            "production replay requires lookback_days=28 and min_buyers=3"
+        )
+    tx_start = params.start_date - timedelta(days=CONSENSUS_LOOKBACK_DAYS)
     tx_end = params.end_date
 
     all_transactions = transaction_source.db.get_transactions_by_date_range(
@@ -665,8 +684,8 @@ def run_backtest_pipeline(
         recs = analysis.backtest_recommendations(
             all_transactions,
             as_of_ts,
-            lookback_days=params.lookback_days,
-            min_buyers=params.min_buyers,
+            lookback_days=CONSENSUS_LOOKBACK_DAYS,
+            min_buyers=CONSENSUS_MIN_BUYERS,
             top_n=params.top_n,
         )
         benchmark_return = _benchmark_return(prices, as_of_ts, params.horizon)

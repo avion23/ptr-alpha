@@ -38,8 +38,6 @@ class TestCliApp(unittest.TestCase):
     def test_analyze_rejects_invalid_numeric_and_output_options_before_db_open(self):
         cases = [
             ["--horizons", "0"],
-            ["--days-back", "0"],
-            ["--min-buyers", "0"],
             ["--top-n", "0"],
             ["--output", "json"],
         ]
@@ -117,8 +115,6 @@ class TestCliApp(unittest.TestCase):
     def test_backtest_rejects_nonpositive_windows_before_db_open(self):
         for option in (
             "--horizon",
-            "--lookback-days",
-            "--min-buyers",
             "--top-n",
             "--frequency-days",
         ):
@@ -143,8 +139,6 @@ class TestCliApp(unittest.TestCase):
 
     def test_portfolio_rejects_nonpositive_constraints_before_db_open(self):
         for option in (
-            "--lookback-days",
-            "--min-buyers",
             "--top-n",
             "--frequency-days",
             "--initial-capital",
@@ -168,6 +162,64 @@ class TestCliApp(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(result.exit_code, 1, result.output)
+                context.assert_not_called()
+
+    def test_production_policy_knobs_are_not_cli_options(self):
+        commands = [
+            ("analyze", ["--days-back", "7"]),
+            ("analyze", ["--min-buyers", "1"]),
+            (
+                "backtest",
+                [
+                    "--start",
+                    "2024-01-01",
+                    "--end",
+                    "2024-02-01",
+                    "--lookback-days",
+                    "7",
+                ],
+            ),
+            (
+                "backtest",
+                [
+                    "--start",
+                    "2024-01-01",
+                    "--end",
+                    "2024-02-01",
+                    "--min-buyers",
+                    "1",
+                ],
+            ),
+            (
+                "portfolio",
+                [
+                    "--start",
+                    "2024-01-01",
+                    "--end",
+                    "2024-02-01",
+                    "--lookback-days",
+                    "7",
+                ],
+            ),
+            (
+                "portfolio",
+                [
+                    "--start",
+                    "2024-01-01",
+                    "--end",
+                    "2024-02-01",
+                    "--min-buyers",
+                    "1",
+                ],
+            ),
+        ]
+        for command, args in commands:
+            with self.subTest(command=command, args=args), patch(
+                "analyzer.cli.get_context"
+            ) as context:
+                result = self.runner.invoke(app, [command, *args])
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn("No such option", result.output)
                 context.assert_not_called()
 
     def test_portfolio_rejects_invalid_slippage_before_db_open(self):

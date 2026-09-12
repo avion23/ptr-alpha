@@ -53,8 +53,8 @@ PRIMARY_METRIC = "mean_per_date_net_alpha"
 _VALIDATION_GRID_PARAMETERS = frozenset({"horizon", "frequency_days", "top_n"})
 
 
-def _effective_validation_grid(grid: Mapping[str, object]) -> dict[str, object]:
-    """Return the sensitivity family and reject production-policy knobs."""
+def _effective_validation_grid(grid: Mapping[str, object]) -> dict[str, tuple[int, ...]]:
+    """Return validated positive-integer evaluation sensitivities only."""
     if not isinstance(grid, Mapping) or not grid:
         raise ValueError("validation grid must not be empty")
     unknown = set(grid) - _VALIDATION_GRID_PARAMETERS
@@ -65,7 +65,28 @@ def _effective_validation_grid(grid: Mapping[str, object]) -> dict[str, object]:
     effective = {str(name): values for name, values in grid.items()}
     effective.setdefault("frequency_days", (30,))
     effective.setdefault("top_n", (5,))
-    return effective
+    normalized: dict[str, tuple[int, ...]] = {}
+    for name, values in effective.items():
+        if isinstance(values, (str, bytes)):
+            raise TypeError(f"validation {name} values must be an iterable of integers")
+        try:
+            materialized = tuple(values)
+        except TypeError as exc:
+            raise TypeError(
+                f"validation {name} values must be an iterable of integers"
+            ) from exc
+        if not materialized:
+            raise ValueError(f"validation {name} values must not be empty")
+        parsed: list[int] = []
+        for value in materialized:
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"validation {name} values must be positive integers")
+            integer = int(value)
+            if integer < 1:
+                raise ValueError(f"validation {name} values must be positive integers")
+            parsed.append(integer)
+        normalized[name] = tuple(parsed)
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +96,7 @@ class SweepResult:
     lookback_days: int
     min_buyers: int
     top_n: int
-    scorer_provenance: str = ""
+    scorer_provenance: str = CONSENSUS_SCORER_PROVENANCE
     total_recs: int = 0
     dates_evaluated: int = 0
     scheduled_dates: int = 0
@@ -161,10 +182,14 @@ def _backtest_core(
     actual holding used for both strategy and benchmark.
     """
     if (
-        int(params.lookback_days) != CONSENSUS_LOOKBACK_DAYS
+        isinstance(params.lookback_days, bool)
+        or not isinstance(params.lookback_days, (int, np.integer))
+        or int(params.lookback_days) != CONSENSUS_LOOKBACK_DAYS
+        or isinstance(params.min_buyers, bool)
+        or not isinstance(params.min_buyers, (int, np.integer))
         or int(params.min_buyers) != CONSENSUS_MIN_BUYERS
     ):
-        raise ValueError("validation requires lookback_days=28 and min_buyers=3")
+        raise ValueError("validation requires integer lookback_days=28 and min_buyers=3")
     empty = _empty_result(params)
     as_of_dates = pd.date_range(
         params.start_date, params.end_date, freq=f"{params.frequency_days}D"
@@ -218,7 +243,12 @@ def _backtest_core(
                         "consensus recommendations lack production scorer fields: "
                         f"{sorted(missing_policy_columns)}"
                     )
-                provenance = set(recommendations["scorer_provenance"].dropna())
+                provenance_values = recommendations["scorer_provenance"]
+                if provenance_values.isna().any():
+                    raise AnalysisError(
+                        "consensus recommendations have missing scorer provenance"
+                    )
+                provenance = set(provenance_values.astype(str))
                 if provenance != {CONSENSUS_SCORER_PROVENANCE}:
                     raise AnalysisError(
                         "consensus recommendations lack executed-scorer provenance"
@@ -356,9 +386,7 @@ def _backtest_core(
         lookback_days=params.lookback_days,
         min_buyers=params.min_buyers,
         top_n=params.top_n,
-        scorer_provenance=(
-            CONSENSUS_SCORER_PROVENANCE if total_recommendations > 0 else ""
-        ),
+        scorer_provenance=CONSENSUS_SCORER_PROVENANCE,
         total_recs=total_recommendations,
         dates_evaluated=supported,
         scheduled_dates=scheduled,
@@ -611,16 +639,30 @@ def _family_integrity(sweep_df: pd.DataFrame) -> tuple[bool, dict]:
         ("lookback_days", CONSENSUS_LOOKBACK_DAYS),
         ("min_buyers", CONSENSUS_MIN_BUYERS),
     ):
-        if column in sweep_df.columns:
-            values = pd.to_numeric(sweep_df[column], errors="coerce")
-            if values.isna().any() or not values.eq(expected).all():
-                details.update(
-                    status="invalid",
-                    reason="production_policy_mismatch",
-                    parameter=column,
-                    expected=expected,
-                )
-                return False, details
+        if column not in sweep_df.columns:
+            details.update(
+                status="invalid",
+                reason="production_policy_column_missing",
+                parameter=column,
+                expected=expected,
+            )
+            return False, details
+        values = pd.to_numeric(sweep_df[column], errors="coerce")
+        if values.isna().any() or not values.eq(expected).all():
+            details.update(
+                status="invalid",
+                reason="production_policy_mismatch",
+                parameter=column,
+                expected=expected,
+            )
+            return False, details
+    if recorded.get("family_provenance", recorded.get("provenance")) != FAMILY_PROVENANCE:
+        details.update(
+            status="invalid",
+            reason="family_provenance_mismatch",
+            expected=FAMILY_PROVENANCE,
+        )
+        return False, details
     if not sweep_df["scorer_provenance"].eq(CONSENSUS_SCORER_PROVENANCE).all():
         details.update(
             status="invalid",
@@ -673,6 +715,27 @@ def _family_integrity(sweep_df: pd.DataFrame) -> tuple[bool, dict]:
                     parameter=parameter,
                 )
                 return False, details
+        expected_lag = max(
+            0,
+            math.ceil(
+                int(expected_config["horizon"])
+                / int(expected_config["frequency_days"])
+            )
+            - 1,
+        )
+        actual_lag = row.get("nw_lag")
+        if (
+            isinstance(actual_lag, bool)
+            or not isinstance(actual_lag, (int, np.integer))
+            or int(actual_lag) != expected_lag
+        ):
+            details.update(
+                status="invalid",
+                reason="nw_lag_mismatch",
+                trial_id=trial_id,
+                expected_nw_lag=expected_lag,
+            )
+            return False, details
         actual_spec = row["trial_spec_sha256"]
         expected_spec = expected_specs[trial_id]
         actual_spec_from_config = trial_spec_sha256(
@@ -782,6 +845,9 @@ def select_config(
         "nw_lag",
         "horizon",
         "frequency_days",
+        "lookback_days",
+        "min_buyers",
+        "min_sample_ok",
         "scorer_provenance",
     }
     missing = required - set(sweep_df.columns)
@@ -796,11 +862,7 @@ def select_config(
     family_failed = bool(len(failed_positions))
     family_failures = _family_failure_records(working, failed_positions)
     bonferroni_threshold = bonferroni_correction(n_trials, alpha)
-    candidate = (
-        working["min_sample_ok"].fillna(False).astype(bool).to_numpy(copy=True)
-        if "min_sample_ok" in working.columns
-        else np.ones(n_trials, dtype=bool)
-    )
+    candidate = working["min_sample_ok"].fillna(False).astype(bool).to_numpy(copy=True)
     candidate &= (
         working["scorer_provenance"]
         .astype(str)
@@ -809,7 +871,11 @@ def select_config(
     )
     candidate &= ~failed_trial_mask
     candidate &= family_complete
-    source_series = series_by_trial or sweep_df.attrs.get("series_by_trial")
+    source_series = (
+        sweep_df.attrs.get("series_by_trial")
+        if series_by_trial is None
+        else series_by_trial
+    )
     expected_trial_ids = {
         value
         for value in (_strict_trial_id(item) for item in working["trial_id"])
@@ -1015,7 +1081,7 @@ def select_config(
 def _phase_end(boundary_end: date, max_holding_days: int) -> date:
     """Return the latest as-of whose exact execution window matures by boundary."""
     boundary = pd.Timestamp(boundary_end).normalize()
-    candidate = boundary - pd.Timedelta(days=max_holding_days)
+    candidate = boundary
     while True:
         entry = next_nyse_session(candidate)
         exit_date = previous_nyse_session(
@@ -1051,12 +1117,7 @@ def run_validation(
     effective_grid = _effective_validation_grid(grid)
     if not effective_grid.get("horizon"):
         raise ValueError("validation grid must include at least one horizon")
-    try:
-        horizons = [int(value) for value in effective_grid["horizon"]]
-    except (TypeError, ValueError) as exc:
-        raise ValueError("validation horizons must be integers") from exc
-    if any(value < 1 for value in horizons):
-        raise ValueError("validation horizons must be positive")
+    horizons = list(effective_grid["horizon"])
     max_holding = max(horizons)
     train_effective_end = _phase_end(train_end, max_holding)
     test_effective_end = _phase_end(test_end, max_holding)
@@ -1173,7 +1234,11 @@ def _run_validation_with_db(
         or test_selection["statistical_survivors"]
     )
     output = {
-        "status": "completed",
+        "status": (
+            "failed"
+            if train_report["status"] == "failed" or test_report["status"] == "failed"
+            else "completed"
+        ),
         "primary_metric": PRIMARY_METRIC,
         "family": manifest["family"],
         "family_sha256": manifest["family"]["family_sha256"],

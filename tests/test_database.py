@@ -620,6 +620,35 @@ class TestTransactions(DatabaseTestCase):
                 """,
                 [generation, status],
             )
+        self.db.conn.execute(
+            """
+            INSERT INTO house_generation_metadata (
+                archive_year, generation_id, doc_id, first_name, last_name,
+                filing_date, filing_type, fetched_at
+            ) VALUES (
+                2024, 'g2', 'generation-doc', 'Jane', 'Doe',
+                '2024-01-03', 'P', '2024-01-04'
+            )
+            """
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO house_pdf_artifacts (
+                archive_year, doc_id, generation_id, artifact_sha256
+            ) VALUES (2024, 'generation-doc', 'g2', 'artifact-g2')
+            """
+        )
+        self.db.upsert_parse_run(
+            doc_id="generation-doc",
+            year=2024,
+            parser_version="v4-deterministic",
+            status="success",
+            engines_attempted="pdfplumber",
+            raw_row_count=1,
+            transaction_count=1,
+            artifact_sha256="artifact-g2",
+            ingestion_generation="g2",
+        )
         base = {
             "doc_id": "generation-doc",
             "member": "Jane Doe",
@@ -674,6 +703,60 @@ class TestTransactions(DatabaseTestCase):
             )["ticker"].tolist(),
             ["NEW"],
         )
+
+    def test_house_activation_refuses_partial_artifact_inventory(self):
+        self.db.conn.execute(
+            """
+            INSERT INTO house_archive_generations (
+                archive_year, generation_id, metadata_sha256,
+                metadata_count, ptr_count, parse_status
+            ) VALUES (2024, 'g-partial', 'sha', 2, 2, 'incomplete')
+            """
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO house_generation_metadata (
+                archive_year, generation_id, doc_id, first_name, last_name,
+                filing_date, filing_type, fetched_at
+            ) VALUES
+                (2024, 'g-partial', 'present-doc', 'Jane', 'Doe',
+                 '2024-01-03', 'P', '2024-01-04'),
+                (2024, 'g-partial', 'missing-doc', 'John', 'Doe',
+                 '2024-01-03', 'P', '2024-01-04')
+            """
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO house_pdf_artifacts (
+                archive_year, doc_id, generation_id, artifact_sha256
+            ) VALUES (2024, 'present-doc', 'g-partial', 'artifact-present')
+            """
+        )
+        self.db.upsert_parse_run(
+            doc_id="present-doc",
+            year=2024,
+            parser_version="v4-deterministic",
+            status="success",
+            engines_attempted="pdfplumber",
+            raw_row_count=1,
+            transaction_count=1,
+            artifact_sha256="artifact-present",
+            ingestion_generation="g-partial",
+        )
+
+        self.assertEqual(
+            self.db.get_unresolved_house_doc_ids(2024, "g-partial"),
+            ["missing-doc"],
+        )
+        with self.assertRaisesRegex(ValueError, "artifact inventory"):
+            self.db.mark_house_generation_parse_complete(2024, "g-partial")
+        status = self.db.conn.execute(
+            """
+            SELECT parse_status FROM house_archive_generations
+            WHERE archive_year = 2024 AND generation_id = 'g-partial'
+            """
+        ).fetchone()[0]
+        self.assertEqual(status, "incomplete")
 
     def test_same_hash_generation_materializes_rows_and_parse_provenance(self):
         metadata = pd.DataFrame(

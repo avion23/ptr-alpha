@@ -547,19 +547,25 @@ class Database:
     def get_unresolved_house_doc_ids(
         self, archive_year: int, generation_id: str
     ) -> list[str]:
+        """Return every authoritative PTR lacking an acquired, terminal artifact."""
         rows = self.conn.execute(
             """
-            SELECT a.doc_id
-            FROM house_pdf_artifacts a
+            SELECT m.doc_id
+            FROM house_generation_metadata m
+            LEFT JOIN house_pdf_artifacts a
+              ON a.archive_year = m.archive_year
+             AND a.generation_id = m.generation_id
+             AND a.doc_id = m.doc_id
             LEFT JOIN pdf_parse_runs p
               ON p.doc_id = a.doc_id
              AND p.artifact_sha256 = a.artifact_sha256
              AND p.ingestion_generation = a.generation_id
              AND p.status IN ('success', 'no_txs')
-            WHERE a.archive_year = ? AND a.generation_id = ?
-            GROUP BY a.doc_id
-            HAVING COUNT(p.doc_id) = 0
-            ORDER BY a.doc_id
+            WHERE m.archive_year = ? AND m.generation_id = ?
+              AND m.filing_type = 'P'
+            GROUP BY m.doc_id
+            HAVING COUNT(a.doc_id) = 0 OR COUNT(p.doc_id) = 0
+            ORDER BY m.doc_id
             """,
             [archive_year, generation_id],
         ).fetchall()
@@ -575,6 +581,52 @@ class Database:
                 raise ValueError(
                     f"House archive {archive_year} latest generation changed "
                     f"from {generation_id} to {latest_generation}"
+                )
+            scope = self.conn.execute(
+                """
+                SELECT
+                    g.ptr_count,
+                    (SELECT COUNT(*)
+                     FROM house_generation_metadata m
+                     WHERE m.archive_year = g.archive_year
+                       AND m.generation_id = g.generation_id
+                       AND m.filing_type = 'P') AS metadata_ptr_count,
+                    (SELECT COUNT(*)
+                     FROM house_pdf_artifacts a
+                     WHERE a.archive_year = g.archive_year
+                       AND a.generation_id = g.generation_id) AS artifact_count,
+                    (SELECT COUNT(*)
+                     FROM house_pdf_artifacts a
+                     LEFT JOIN house_generation_metadata m
+                       ON m.archive_year = a.archive_year
+                      AND m.generation_id = a.generation_id
+                      AND m.doc_id = a.doc_id
+                      AND m.filing_type = 'P'
+                     WHERE a.archive_year = g.archive_year
+                       AND a.generation_id = g.generation_id
+                       AND m.doc_id IS NULL) AS unexpected_artifact_count
+                FROM house_archive_generations g
+                WHERE g.archive_year = ? AND g.generation_id = ?
+                """,
+                [archive_year, generation_id],
+            ).fetchone()
+            if scope is None:
+                raise ValueError(
+                    f"House archive {archive_year} generation {generation_id} is absent"
+                )
+            ptr_count, metadata_ptr_count, artifact_count, unexpected_count = map(
+                int, scope
+            )
+            if not (
+                ptr_count == metadata_ptr_count == artifact_count
+                and unexpected_count == 0
+            ):
+                raise ValueError(
+                    f"House archive {archive_year} generation {generation_id} "
+                    "artifact inventory does not match authoritative PTR scope: "
+                    f"ptr_count={ptr_count} metadata_ptr_count={metadata_ptr_count} "
+                    f"artifact_count={artifact_count} "
+                    f"unexpected_artifacts={unexpected_count}"
                 )
             unresolved = self.get_unresolved_house_doc_ids(
                 archive_year, generation_id

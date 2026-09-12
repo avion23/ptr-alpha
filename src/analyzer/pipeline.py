@@ -590,8 +590,9 @@ def _date_observation(
     *,
     status: str,
     reason: str | None = None,
+    benchmark_status: str = "available",
 ) -> dict:
-    """Build the one-row-per-supported-date backtest accounting record."""
+    """Build the one-row-per-evaluated-date backtest accounting record."""
     return {
         "as_of_date": as_of_date.date(),
         "strategy_return_pct": strategy_return,
@@ -602,8 +603,8 @@ def _date_observation(
         "evaluable_recommendation_count": evaluable_recommendation_count,
         "status": status,
         "reason": reason,
-        "benchmark_status": "available",
-        "benchmark_supported": True,
+        "benchmark_status": benchmark_status,
+        "benchmark_supported": benchmark_status == "available",
         "traded": status == "invested",
     }
 
@@ -661,14 +662,6 @@ def run_backtest_pipeline(
     for as_of in as_of_dates:
         as_of_ts = pd.Timestamp(as_of)
 
-        # A scheduled date belongs to the backtest support only when the same
-        # executable SPY window used by recommendation evaluation exists.
-        # Unsupported benchmark dates remain excluded; supported no-trade dates
-        # are represented explicitly as cash below.
-        benchmark_return = _benchmark_return(prices, as_of_ts, params.horizon)
-        if benchmark_return is None:
-            continue
-
         recs = analysis.backtest_recommendations(
             all_transactions,
             as_of_ts,
@@ -676,113 +669,81 @@ def run_backtest_pipeline(
             min_buyers=params.min_buyers,
             top_n=params.top_n,
         )
+        benchmark_return = _benchmark_return(prices, as_of_ts, params.horizon)
+        benchmark_supported = benchmark_return is not None and pd.notna(benchmark_return)
+        benchmark_status = "available" if benchmark_supported else "unavailable"
+        benchmark_value = benchmark_return if benchmark_supported else np.nan
 
         if recs.empty:
+            if not benchmark_supported:
+                continue
             date_observations.append(
                 _date_observation(
                     as_of_ts,
-                    benchmark_return,
+                    benchmark_value,
                     0.0,
                     0,
                     0,
                     status="cash",
                     reason="no_recommendations",
+                    benchmark_status=benchmark_status,
                 )
             )
             all_results.append(
                 pd.DataFrame(
-                    [_cash_observation(as_of_ts, benchmark_return, params.horizon)]
+                    [_cash_observation(as_of_ts, benchmark_value, params.horizon)]
                 )
             )
             continue
 
         evaluated = analysis.evaluate_backtest(recs, prices, as_of_ts, params.horizon)
+        evaluated = evaluated.copy()
         total_no_price += evaluated.attrs.get("n_no_price", 0)
         total_delisted += evaluated.attrs.get("n_delisted", 0)
         total_unavailable += evaluated.attrs.get("n_unavailable", 0)
         valid_evaluated = evaluated.dropna(subset=["bt_return_pct"]).copy()
-        if valid_evaluated.empty:
-            date_observations.append(
-                _date_observation(
-                    as_of_ts,
-                    benchmark_return,
-                    0.0,
-                    len(recs),
-                    0,
-                    status="cash",
-                    reason="no_evaluable_recommendations",
-                )
+        basket_funded = benchmark_supported and len(valid_evaluated) == len(recs)
+        status = "invested" if basket_funded else "unavailable"
+        if basket_funded:
+            reason = None
+        elif not benchmark_supported:
+            reason = "benchmark_unavailable"
+        elif valid_evaluated.empty:
+            reason = "no_evaluable_recommendations"
+        else:
+            reason = "incomplete_basket"
+        strategy_return = (
+            float(
+                pd.to_numeric(valid_evaluated["bt_return_pct"], errors="coerce").mean()
             )
-            all_results.append(
-                pd.DataFrame(
-                    [
-                        _cash_observation(
-                            as_of_ts,
-                            benchmark_return,
-                            params.horizon,
-                            recommendation_count=len(recs),
-                            reason="no_evaluable_recommendations",
-                        )
-                    ]
-                )
-            )
-            continue
-        if len(valid_evaluated) != len(recs):
-            # Fail-closed: an incomplete funded basket cannot reallocate
-            # ex-post capital to measurable outcomes. Hold cash; report
-            # survivors nowhere for this date.
-            date_observations.append(
-                _date_observation(
-                    as_of_ts,
-                    benchmark_return,
-                    0.0,
-                    len(recs),
-                    len(valid_evaluated),
-                    status="cash",
-                    reason="incomplete_basket",
-                )
-            )
-            all_results.append(
-                pd.DataFrame(
-                    [
-                        _cash_observation(
-                            as_of_ts,
-                            benchmark_return,
-                            params.horizon,
-                            recommendation_count=len(recs),
-                            reason="incomplete_basket",
-                        )
-                    ]
-                )
-            )
-            continue
-
-        strategy_return = float(
-            pd.to_numeric(valid_evaluated["bt_return_pct"], errors="coerce").mean()
+            if basket_funded
+            else np.nan
         )
         date_observations.append(
             _date_observation(
                 as_of_ts,
-                benchmark_return,
+                benchmark_value,
                 strategy_return,
                 len(recs),
                 len(valid_evaluated),
-                status="invested",
+                status=status,
+                reason=reason,
+                benchmark_status=benchmark_status,
             )
         )
-        valid_evaluated.insert(0, "as_of_date", as_of_ts.date())
-        valid_evaluated["recommendation_count"] = len(recs)
-        valid_evaluated["status"] = "invested"
-        valid_evaluated["reason"] = None
-        valid_evaluated["benchmark_status"] = "available"
-        valid_evaluated["benchmark_supported"] = True
-        valid_evaluated["cash_observation"] = False
-        valid_evaluated["traded"] = True
-        valid_evaluated["strategy_return_pct"] = strategy_return
-        valid_evaluated["portfolio_return_pct"] = strategy_return
-        valid_evaluated["spy_return_pct"] = benchmark_return
-        valid_evaluated["net_alpha_pct"] = strategy_return - benchmark_return
-        all_results.append(valid_evaluated)
+        evaluated.insert(0, "as_of_date", as_of_ts.date())
+        evaluated["recommendation_count"] = len(recs)
+        evaluated["status"] = status
+        evaluated["reason"] = reason
+        evaluated["benchmark_status"] = benchmark_status
+        evaluated["benchmark_supported"] = benchmark_supported
+        evaluated["cash_observation"] = False
+        evaluated["traded"] = basket_funded
+        evaluated["strategy_return_pct"] = strategy_return
+        evaluated["portfolio_return_pct"] = strategy_return
+        evaluated["spy_return_pct"] = benchmark_value
+        evaluated["net_alpha_pct"] = strategy_return - benchmark_value
+        all_results.append(evaluated)
 
     if not all_results:
         return DataResult(
@@ -809,19 +770,29 @@ def run_backtest_pipeline(
 
     observations = pd.DataFrame(date_observations)
     if not observations.empty:
-        summary.attrs["benchmark_supported_dates"] = len(observations)
+        summary.attrs["benchmark_supported_dates"] = int(
+            (observations["benchmark_status"] == "available").sum()
+        )
         summary.attrs["no_recommendation_dates"] = int(
             (observations["status"] == "cash").sum()
         )
+        funded_observations = observations[
+            observations["status"].isin(("cash", "invested"))
+        ]
+        # Average cash/invested observations; unavailable dates have no funded return.
         summary.attrs["mean_net_alpha_pct"] = round(
-            float(observations["net_alpha_pct"].mean()), 2
+            float(funded_observations["net_alpha_pct"].mean()), 2
         )
-        portfolio_rows = summary[summary["rank"] == "PORTFOLIO"]
+        portfolio_rows = (
+            summary[summary["rank"] == "PORTFOLIO"]
+            if "rank" in summary.columns
+            else pd.DataFrame()
+        )
         if not portfolio_rows.empty:
             portfolio_index = portfolio_rows.index[0]
-            summary.loc[portfolio_index, "count"] = len(observations)
+            summary.loc[portfolio_index, "count"] = len(funded_observations)
             summary.loc[portfolio_index, "recommendation_count"] = int(
-                observations["evaluable_recommendation_count"].sum()
+                funded_observations["evaluable_recommendation_count"].sum()
             )
     evaluable_dates = len(observations)
     total_as_of_dates = len(as_of_dates)

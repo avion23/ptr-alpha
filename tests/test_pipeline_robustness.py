@@ -1,6 +1,7 @@
 from datetime import date
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 from typer.testing import CliRunner
 
@@ -572,3 +573,178 @@ def test_backtest_pipeline_keeps_supported_no_recommendation_dates_as_cash(tmp_p
     assert no_trade["net_alpha_pct"] == -5.0
     portfolio = result.data["summary"]
     assert portfolio.loc[portfolio["rank"] == "PORTFOLIO", "count"].iloc[0] == 2
+
+
+def test_backtest_pipeline_keeps_unavailable_basket_rows_without_cash_reallocation():
+    transactions = pd.DataFrame(
+        {
+            "member": ["Alice"],
+            "ticker": ["AAPL"],
+            "transaction_date": pd.to_datetime(["2024-12-01"]),
+            "disclosure_date": pd.to_datetime(["2024-12-02"]),
+            "transaction_type": ["Purchase"],
+        }
+    )
+    index = pd.date_range("2024-11-01", "2025-01-20", freq="D")
+    prices = pd.DataFrame(
+        {
+            "AAPL": range(100, 100 + len(index)),
+            "SPY": range(400, 400 + len(index)),
+        },
+        index=index,
+    )
+    funded = pd.DataFrame(
+        {
+            "rank": [1],
+            "ticker": ["AAPL"],
+            "bt_return_pct": [10.0],
+            "bt_alpha_pct": [5.0],
+            "bt_raw_return_pct": [10.0],
+            "bt_spy_return_pct": [4.0],
+            "bt_entry_date": [date(2025, 1, 3)],
+            "bt_exit_date": [date(2025, 1, 10)],
+            "bt_leverage": [1.0],
+        }
+    )
+    incomplete = pd.concat(
+        [
+            funded,
+            funded.assign(
+                rank=2,
+                ticker="MSFT",
+                bt_return_pct=np.nan,
+                bt_alpha_pct=np.nan,
+                bt_raw_return_pct=np.nan,
+                bt_spy_return_pct=np.nan,
+            ),
+        ],
+        ignore_index=True,
+    )
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = transactions
+    price_source = MagicMock()
+    price_source.get_prices.return_value = prices
+
+    with (
+        patch("analyzer.pipeline.create_snapshot", return_value=MagicMock()),
+        patch(
+            "analyzer.pipeline.analysis.backtest_recommendations",
+            side_effect=[
+                pd.DataFrame({"ticker": ["AAPL"]}),
+                pd.DataFrame({"ticker": ["AAPL", "MSFT"]}),
+            ],
+        ),
+        patch(
+            "analyzer.pipeline.analysis.evaluate_backtest",
+            side_effect=[funded, incomplete],
+        ),
+        patch("analyzer.pipeline._benchmark_return", side_effect=[4.0, 5.0]),
+        patch(
+            "analyzer.pipeline._cash_observation",
+            side_effect=AssertionError("unavailable baskets must not become cash"),
+        ),
+    ):
+        result = run_backtest_pipeline(
+            BacktestParams(
+                start_date=date(2025, 1, 2),
+                end_date=date(2025, 1, 3),
+                horizon=7,
+                frequency_days=1,
+            ),
+            transaction_source,
+            price_source,
+        )
+
+    assert result.success
+    combined = result.data["combined"]
+    unavailable = combined[combined["as_of_date"] == date(2025, 1, 3)]
+    assert len(unavailable) == 2
+    assert set(unavailable["status"]) == {"unavailable"}
+    assert not unavailable["cash_observation"].any()
+    assert set(unavailable["benchmark_status"]) == {"available"}
+    assert unavailable["strategy_return_pct"].isna().all()
+
+    observations = result.data["date_observations"]
+    assert observations["status"].tolist() == ["invested", "unavailable"]
+    assert observations.iloc[1]["evaluable_recommendation_count"] == 1
+    summary = result.data["summary"]
+    assert summary.attrs["benchmark_supported_dates"] == 2
+    assert summary.attrs["mean_net_alpha_pct"] == 6.0
+    portfolio = summary[summary["rank"] == "PORTFOLIO"].iloc[0]
+    assert portfolio["count"] == 1
+    assert portfolio["recommendation_count"] == 1
+
+
+def test_backtest_pipeline_marks_unavailable_benchmark_with_nan_values():
+    transactions = pd.DataFrame(
+        {
+            "member": ["Alice"],
+            "ticker": ["AAPL"],
+            "transaction_date": pd.to_datetime(["2024-12-01"]),
+            "disclosure_date": pd.to_datetime(["2024-12-02"]),
+            "transaction_type": ["Purchase"],
+        }
+    )
+    index = pd.date_range("2024-11-01", "2025-01-20", freq="D")
+    prices = pd.DataFrame(
+        {
+            "AAPL": range(100, 100 + len(index)),
+            "SPY": range(400, 400 + len(index)),
+        },
+        index=index,
+    )
+    evaluated = pd.DataFrame(
+        {
+            "rank": [1],
+            "ticker": ["AAPL"],
+            "bt_return_pct": [np.nan],
+            "bt_alpha_pct": [np.nan],
+            "bt_raw_return_pct": [np.nan],
+            "bt_spy_return_pct": [np.nan],
+            "bt_entry_date": [date(2025, 1, 3)],
+            "bt_exit_date": [date(2025, 1, 10)],
+            "bt_leverage": [1.0],
+        }
+    )
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions_by_date_range.return_value = transactions
+    price_source = MagicMock()
+    price_source.get_prices.return_value = prices
+
+    with (
+        patch("analyzer.pipeline.create_snapshot", return_value=MagicMock()),
+        patch(
+            "analyzer.pipeline.analysis.backtest_recommendations",
+            return_value=pd.DataFrame({"ticker": ["AAPL"]}),
+        ),
+        patch(
+            "analyzer.pipeline.analysis.evaluate_backtest",
+            return_value=evaluated,
+        ) as evaluate,
+        patch("analyzer.pipeline._benchmark_return", return_value=None),
+        patch(
+            "analyzer.pipeline._cash_observation",
+            side_effect=AssertionError("unavailable benchmarks must not become cash"),
+        ),
+    ):
+        result = run_backtest_pipeline(
+            BacktestParams(
+                start_date=date(2025, 1, 2),
+                end_date=date(2025, 1, 2),
+                horizon=7,
+                frequency_days=1,
+            ),
+            transaction_source,
+            price_source,
+        )
+
+    assert result.success
+    evaluate.assert_called_once()
+    combined = result.data["combined"].iloc[0]
+    assert combined["status"] == "unavailable"
+    assert combined["benchmark_status"] == "unavailable"
+    assert not combined["benchmark_supported"]
+    assert pd.isna(combined["spy_return_pct"])
+    assert pd.isna(combined["strategy_return_pct"])
+    assert pd.isna(combined["net_alpha_pct"])
+    assert result.data["summary"].attrs["benchmark_supported_dates"] == 0

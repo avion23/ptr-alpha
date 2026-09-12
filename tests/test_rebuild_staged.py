@@ -403,3 +403,104 @@ def test_refresh_house_completion_replaces_each_source_inventory(tmp_path):
         }
     finally:
         db.close()
+
+
+def _seed_semantically_stale_generation_database(tmp_path):
+    from analyzer.database import Database
+
+    db = Database(tmp_path / "canonical-semantic.duckdb")
+    generations = [
+        ("g1", "artifact-g1", "2026-07-01 00:00:00", None),
+        ("g2", "artifact-g2", "2026-07-02 00:00:00", date(2026, 1, 1)),
+    ]
+    for generation, artifact_sha, promoted_at, notification_date in generations:
+        db.conn.execute(
+            """
+            INSERT INTO house_archive_generations (
+                archive_year, generation_id, metadata_sha256,
+                metadata_count, ptr_count, parse_status, promoted_at
+            ) VALUES (2026, ?, 'metadata', 1, 1, 'complete', ?)
+            """,
+            [generation, promoted_at],
+        )
+        db.conn.execute(
+            """
+            INSERT INTO house_generation_metadata (
+                archive_year, generation_id, doc_id, first_name, last_name,
+                filing_date, filing_type, fetched_at
+            ) VALUES (
+                2026, ?, 'semantic-doc', 'Jane', 'Doe',
+                '2026-01-03', 'P', '2026-01-04'
+            )
+            """,
+            [generation],
+        )
+        db.conn.execute(
+            """
+            INSERT INTO house_pdf_artifacts (
+                archive_year, doc_id, generation_id, artifact_sha256
+            ) VALUES (2026, 'semantic-doc', ?, ?)
+            """,
+            [generation, artifact_sha],
+        )
+        db.upsert_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "doc_id": "semantic-doc",
+                        "member": "Jane Doe",
+                        "ticker": "OLD" if generation == "g1" else "NEW",
+                        "transaction_date": date(2026, 1, 2),
+                        "disclosure_date": date(2026, 1, 3),
+                        "notification_date": notification_date,
+                        "transaction_type": "Purchase",
+                        "chamber": "house",
+                        "source_record_id": "semantic-doc",
+                        "source_row_id": f"{generation}:r1",
+                        "official_filing_date": date(2026, 1, 3),
+                        "ingestion_generation": generation,
+                        "artifact_sha256": artifact_sha,
+                    }
+                ]
+            ),
+            source="house_pdf",
+        )
+        db.upsert_parse_run(
+            doc_id="semantic-doc",
+            year=2026,
+            parser_version="v4-deterministic",
+            status="success",
+            engines_attempted="pdfplumber",
+            raw_row_count=1,
+            transaction_count=1,
+            artifact_sha256=artifact_sha,
+            ingestion_generation=generation,
+        )
+    return db
+
+
+def test_canonical_view_check_uses_latest_semantically_accepted_generation(tmp_path):
+    from scripts import rebuild_staged
+
+    db = _seed_semantically_stale_generation_database(tmp_path)
+    try:
+        assert rebuild_staged._latest_accepted_house_generations(db) == {2026: "g1"}
+        assert rebuild_staged._canonical_view_diff_counts(db) == (0, 0)
+
+        db.conn.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW canonical_transactions AS
+            SELECT * FROM transactions
+            """
+        )
+        assert rebuild_staged._canonical_view_diff_counts(db) == (1, 0)
+
+        db.conn.execute(
+            """
+            CREATE OR REPLACE TEMP VIEW canonical_transactions AS
+            SELECT * FROM transactions WHERE FALSE
+            """
+        )
+        assert rebuild_staged._canonical_view_diff_counts(db) == (0, 1)
+    finally:
+        db.close()

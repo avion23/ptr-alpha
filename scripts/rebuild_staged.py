@@ -1270,6 +1270,90 @@ def _check(checks: dict, name: str, condition: bool, detail: str = "") -> None:
     checks[name] = {"passed": bool(condition), "detail": detail}
 
 
+def _latest_accepted_house_generations(db: Database) -> dict[int, str]:
+    """Return the latest complete House generation with no unresolved docs.
+
+    ``canonical_transactions`` applies this semantic acceptance predicate
+    before selecting one generation per archive year. Reuse the database's
+    authoritative unresolved-document helper here instead of copying that
+    predicate into staged verification.
+    """
+    rows = db.conn.execute(
+        """
+        SELECT archive_year, generation_id
+        FROM house_archive_generations
+        WHERE parse_status = 'complete'
+        ORDER BY archive_year, promoted_at DESC, generation_id DESC
+        """
+    ).fetchall()
+    accepted: dict[int, str] = {}
+    for archive_year, generation_id in rows:
+        if archive_year is None or generation_id is None:
+            continue
+        archive_year = int(archive_year)
+        generation_id = str(generation_id)
+        if archive_year in accepted:
+            continue
+        if not db.get_unresolved_house_doc_ids(archive_year, generation_id):
+            accepted[archive_year] = generation_id
+    return accepted
+
+
+def _canonical_view_diff_counts(db: Database) -> tuple[int, int]:
+    """Return canonical transaction IDs outside and missing from expectations."""
+    accepted_house_generations = _latest_accepted_house_generations(db)
+    if accepted_house_generations:
+        generation_values = ", ".join(
+            "(?, ?)" for _ in accepted_house_generations
+        )
+        generation_params = [
+            value
+            for archive_year, generation_id in accepted_house_generations.items()
+            for value in (archive_year, generation_id)
+        ]
+        accepted_generations_cte = "VALUES " + generation_values
+    else:
+        generation_params = []
+        accepted_generations_cte = (
+            "SELECT CAST(NULL AS INTEGER) AS archive_year, "
+            "CAST(NULL AS VARCHAR) AS generation_id WHERE FALSE"
+        )
+    canonical_extra, canonical_missing = db.conn.execute(
+        f"""
+        WITH accepted_house_generations(archive_year, generation_id) AS (
+            {accepted_generations_cte}
+        ), expected AS (
+            SELECT t.id FROM transactions t
+            WHERE (t.source = 'senate_efd' AND t.chamber = 'senate')
+               OR (
+                   t.source IN ('house_pdf', 'gemini_ocr')
+                   AND EXISTS (
+                       SELECT 1
+                       FROM house_archive_generations generation
+                       JOIN accepted_house_generations accepted
+                         ON accepted.archive_year = generation.archive_year
+                        AND accepted.generation_id = generation.generation_id
+                       WHERE generation.generation_id = t.ingestion_generation
+                   )
+               )
+        ), canonical_extra AS (
+            SELECT id FROM canonical_transactions
+            EXCEPT
+            SELECT id FROM expected
+        ), canonical_missing AS (
+            SELECT id FROM expected
+            EXCEPT
+            SELECT id FROM canonical_transactions
+        )
+        SELECT
+            (SELECT COUNT(*) FROM canonical_extra),
+            (SELECT COUNT(*) FROM canonical_missing)
+        """,
+        generation_params,
+    ).fetchone()
+    return int(canonical_extra), int(canonical_missing)
+
+
 def verify(args) -> None:
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
@@ -1835,61 +1919,10 @@ def verify(args) -> None:
         )
 
         # 7. The canonical view must contain exactly the active Senate rows
-        # plus rows from the latest complete House generation for each year.
-        canonical_extra = db.conn.execute(
-            """
-            SELECT COUNT(*) FROM (
-                SELECT id FROM canonical_transactions
-                EXCEPT
-                SELECT t.id FROM transactions t
-                WHERE (t.source = 'senate_efd' AND t.chamber = 'senate')
-                   OR (
-                       t.source IN ('house_pdf', 'gemini_ocr')
-                       AND EXISTS (
-                           SELECT 1
-                           FROM house_archive_generations g
-                           WHERE g.generation_id = t.ingestion_generation
-                             AND g.parse_status = 'complete'
-                             AND g.generation_id = (
-                                 SELECT active.generation_id
-                                 FROM house_archive_generations active
-                                 WHERE active.archive_year = g.archive_year
-                                   AND active.parse_status = 'complete'
-                                 ORDER BY active.promoted_at DESC, active.generation_id DESC
-                                 LIMIT 1
-                             )
-                       )
-                   )
-            )
-            """
-        ).fetchone()[0]
-        canonical_missing = db.conn.execute(
-            """
-            SELECT COUNT(*) FROM (
-                SELECT t.id FROM transactions t
-                WHERE (t.source = 'senate_efd' AND t.chamber = 'senate')
-                   OR (
-                       t.source IN ('house_pdf', 'gemini_ocr')
-                       AND EXISTS (
-                           SELECT 1
-                           FROM house_archive_generations g
-                           WHERE g.generation_id = t.ingestion_generation
-                             AND g.parse_status = 'complete'
-                             AND g.generation_id = (
-                                 SELECT active.generation_id
-                                 FROM house_archive_generations active
-                                 WHERE active.archive_year = g.archive_year
-                                   AND active.parse_status = 'complete'
-                                 ORDER BY active.promoted_at DESC, active.generation_id DESC
-                                 LIMIT 1
-                             )
-                       )
-                   )
-                EXCEPT
-                SELECT id FROM canonical_transactions
-            )
-            """
-        ).fetchone()[0]
+        # plus rows from the latest semantically accepted House generation for
+        # each year. ``get_unresolved_house_doc_ids`` is the same acceptance
+        # predicate used by Database._init_canonical_transactions_view.
+        canonical_extra, canonical_missing = _canonical_view_diff_counts(db)
         _check(
             checks,
             "canonical_view_complete_generations_only",

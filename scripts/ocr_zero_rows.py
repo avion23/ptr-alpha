@@ -1357,6 +1357,10 @@ def insert_transactions(
                       transaction_date IS NULL
                       OR disclosure_date IS NULL
                       OR transaction_date > disclosure_date
+                      OR (
+                          notification_date IS NOT NULL
+                          AND notification_date < transaction_date
+                      )
                       OR chamber IS NULL OR TRIM(chamber) = ''
                       OR source_record_id IS NULL OR TRIM(source_record_id) = ''
                       OR source_row_id IS NULL OR TRIM(source_row_id) = ''

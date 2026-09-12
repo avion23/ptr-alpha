@@ -524,6 +524,90 @@ def test_validated_ocr_replaces_semantically_invalid_deterministic_rows(tmp_path
     ]
 
 
+@pytest.mark.parametrize(
+    ("notification_date", "expected_sources", "expected_deterministic_status"),
+    [
+        (datetime(2024, 1, 14), ["gemini_ocr"], "invalidated"),
+        (datetime(2024, 1, 15), ["gemini_ocr", "house_pdf"], "success"),
+    ],
+)
+def test_supersession_checks_house_notification_chronology(
+    notification_date,
+    expected_sources,
+    expected_deterministic_status,
+    tmp_path,
+):
+    db_path = tmp_path / "notification-chronology.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) "
+        "VALUES ('notification-chronology', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.upsert_transactions(
+        pd.DataFrame(
+            [
+                {
+                    "doc_id": "notification-chronology",
+                    "member": "Jane Doe",
+                    "ticker": "AAPL",
+                    "transaction_date": datetime(2024, 1, 15),
+                    "disclosure_date": datetime(2024, 1, 20),
+                    "notification_date": notification_date,
+                    "transaction_type": "Purchase",
+                    "chamber": "house",
+                    "source_record_id": "notification-chronology",
+                    "source_row_id": "pdftotext:r1",
+                    "official_filing_date": datetime(2024, 1, 20),
+                    "ingestion_generation": "test-house-generation",
+                    "artifact_sha256": "test-artifact-sha256",
+                }
+            ]
+        ),
+        source="house_pdf",
+    )
+    db.upsert_parse_run(
+        doc_id="notification-chronology",
+        year=2024,
+        parser_version="v5-deterministic",
+        status="success",
+        engines_attempted="pdftotext",
+        raw_row_count=1,
+        transaction_count=1,
+        artifact_sha256="test-artifact-sha256",
+        ingestion_generation="test-house-generation",
+    )
+    db.close()
+
+    assert (
+        _insert_transactions(
+            "notification-chronology",
+            2024,
+            "Jane Doe",
+            [_tx()],
+            db_path=str(db_path),
+        )
+        == 1
+    )
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    rows = con.execute(
+        "SELECT source FROM transactions "
+        "WHERE doc_id='notification-chronology' ORDER BY source"
+    ).fetchall()
+    deterministic_run = con.execute(
+        "SELECT status, transaction_count FROM pdf_parse_runs "
+        "WHERE doc_id='notification-chronology' AND parser_version='v5-deterministic'"
+    ).fetchone()
+    con.close()
+
+    assert [source for (source,) in rows] == expected_sources
+    assert deterministic_run == (
+        expected_deterministic_status,
+        0 if expected_deterministic_status == "invalidated" else 1,
+    )
+
+
 def test_insert_preserves_repeated_lots_with_distinct_source_rows(tmp_path):
     db_path = tmp_path / "lots.duckdb"
     db = Database(db_path)

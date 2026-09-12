@@ -87,6 +87,18 @@ def _strict_date(value: object) -> date | None:
     return None
 
 
+def _is_missing_notification_date(value: object) -> bool:
+    if value is None:
+        return True
+    return str(value).strip().casefold() in {
+        "",
+        "n/a",
+        "na",
+        "none",
+        "not applicable",
+    }
+
+
 def _normalize_tx_type(value: object) -> str | None:
     text = str(value or "").strip().lower()
     if text in {"p", "purchase"}:
@@ -190,7 +202,10 @@ def parse_gemini_output(
             raise GeminiOutputError(f"line {line_number}: invalid transaction type")
         if _strict_date(tx_date_raw) is None:
             raise GeminiOutputError(f"line {line_number}: invalid transaction date")
-        if _strict_date(notification_date_raw) is None:
+        notification_date = _strict_date(notification_date_raw)
+        if notification_date is None and not _is_missing_notification_date(
+            notification_date_raw
+        ):
             raise GeminiOutputError(f"line {line_number}: invalid notification date")
         amount_letter = amount_raw.upper()
         if amount_letter not in AMOUNT_MIDPOINTS:
@@ -200,7 +215,11 @@ def parse_gemini_output(
                 "asset": asset,
                 "type": tx_type,
                 "date": tx_date_raw,
-                "notif_date": notification_date_raw,
+                "notif_date": (
+                    None
+                    if _is_missing_notification_date(notification_date_raw)
+                    else notification_date_raw
+                ),
                 "amount_letter": amount_letter,
                 "amount_midpoint": AMOUNT_MIDPOINTS[amount_letter],
                 "page_number": current_page,
@@ -212,22 +231,36 @@ def parse_gemini_output(
         raise GeminiOutputError("missing member")
     if declared_page_count is None:
         raise GeminiOutputError("missing PAGES")
-    if expected_page_count is not None and declared_page_count != expected_page_count:
-        raise GeminiOutputError(
-            f"page count mismatch: response={declared_page_count}, pdf={expected_page_count}"
-        )
     covered_pages = page_has_rows | page_has_no_transactions
-    expected_pages = set(range(1, declared_page_count + 1))
-    if covered_pages != expected_pages:
-        missing = sorted(expected_pages - covered_pages)
+    effective_page_count = declared_page_count
+    if expected_page_count is not None:
+        if declared_page_count < expected_page_count:
+            raise GeminiOutputError(
+                f"page count mismatch: response={declared_page_count}, pdf={expected_page_count}"
+            )
+        if declared_page_count > expected_page_count:
+            reported_extra_pages = {
+                page for page in declared_pages if page > expected_page_count
+            }
+            if (reported_extra_pages & page_has_rows) or not reported_extra_pages.issubset(
+                page_has_no_transactions
+            ):
+                raise GeminiOutputError(
+                    f"page count mismatch: response={declared_page_count}, pdf={expected_page_count}"
+                )
+            effective_page_count = expected_page_count
+    expected_pages = set(range(1, effective_page_count + 1))
+    actual_covered_pages = covered_pages & expected_pages
+    if actual_covered_pages != expected_pages:
+        missing = sorted(expected_pages - actual_covered_pages)
         raise GeminiOutputError(f"missing page outcomes: {missing}")
     return ParsedGeminiOutput(
         member,
         transactions,
         raw_row_count,
         not transactions,
-        declared_page_count,
-        frozenset(covered_pages),
+        effective_page_count,
+        frozenset(actual_covered_pages),
     )
 
 
@@ -533,8 +566,11 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         if parsed_date is None:
             rejections["invalid_transaction_date"] += 1
             continue
-        notification_date = _strict_date(_tx_notification_date(tx))
-        if notification_date is None:
+        notification_raw = _tx_notification_date(tx)
+        notification_date = _strict_date(notification_raw)
+        if notification_date is None and not _is_missing_notification_date(
+            notification_raw
+        ):
             rejections["invalid_notification_date"] += 1
             continue
         amount_letter = str(_tx_amount(tx) or "").strip().upper()

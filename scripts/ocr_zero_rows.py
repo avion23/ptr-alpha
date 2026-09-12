@@ -1182,7 +1182,7 @@ def insert_transactions(
     for source_row_number, tx in enumerate(transactions, start=1):
         try:
             tx_date = normalize_date(tx["date"])
-            notification_date = normalize_date(tx["notif_date"])
+            notification_date = normalize_date(tx.get("notif_date"))
             disclosure_date = filing_date or notification_date or tx_date
             disclosed_ticker = extract_ticker(tx["asset"])
             ticker_candidate = None
@@ -1195,8 +1195,8 @@ def insert_transactions(
                 ticker = None
                 raw_ticker = ticker_candidate
                 ticker_origin = "unverified" if ticker_candidate else "not_reported"
-            if not tx_date or not notification_date:
-                errors.append(f"bad date: {tx['date']} / {tx['notif_date']}")
+            if not tx_date:
+                errors.append(f"bad transaction date: {tx['date']}")
                 continue
 
             values = {

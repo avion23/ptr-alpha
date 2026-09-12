@@ -291,6 +291,55 @@ def test_schema_rejects_malformed_outputs(bad_output):
         gemini_ocr_common.parse_gemini_output(bad_output)
 
 
+def test_schema_accepts_explicit_missing_notification_date():
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Apple (AAPL) | Purchase | 01/15/24 | N/A | A"
+    )
+
+    assert parsed.transactions[0]["notif_date"] is None
+    valid, rejections = gemini_ocr_common.validate_transactions(
+        "doc-na", "Jane Doe", parsed.transactions, datetime(2024, 1, 20), "Jane Doe"
+    )
+    assert len(valid) == 1
+    assert rejections == {}
+
+
+def test_schema_accepts_trailing_hallucinated_empty_page_only():
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 2\nPAGE: 1\n"
+        "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
+        "PAGE: 2\nNO_TRANSACTIONS",
+        expected_page_count=1,
+    )
+
+    assert parsed.page_count == 1
+    assert parsed.covered_pages == frozenset({1})
+    assert len(parsed.transactions) == 1
+
+
+def test_schema_accepts_inflated_page_header_when_real_pages_are_complete():
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 3\nPAGE: 1\n"
+        "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | A",
+        expected_page_count=1,
+    )
+
+    assert parsed.page_count == 1
+    assert parsed.covered_pages == frozenset({1})
+    assert len(parsed.transactions) == 1
+
+
+def test_schema_rejects_transaction_on_hallucinated_extra_page():
+    output = (
+        "MEMBER: Jane Doe\nPAGES: 2\nPAGE: 1\n"
+        "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
+        "PAGE: 2\nMicrosoft (MSFT) | Purchase | 01/16/24 | 01/20/24 | A"
+    )
+    with pytest.raises(gemini_ocr_common.GeminiOutputError, match="page count mismatch"):
+        gemini_ocr_common.parse_gemini_output(output, expected_page_count=1)
+
+
 def test_schema_accepts_spouse_dc_over_1m_column_k():
     parsed = gemini_ocr_common.parse_gemini_output(
         "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"

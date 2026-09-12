@@ -752,39 +752,49 @@ def _refresh_house_completion(
     import pandas as pd  # noqa: PLC0415
 
     generation = house["generation_id"]
-    unresolved = db.get_unresolved_house_doc_ids(year, generation)
-    house["unresolved_doc_ids"] = unresolved
-    house["resolved_doc_count"] = house["ptr_count"] - len(unresolved)
-    if unresolved:
-        house["parse_status"] = "incomplete"
-        return unresolved, None
-
-    rows = _house_inventory_rows(db, year, generation)
-    rows_by_source = {
-        source: [
-            {column: row[column] for column in SOURCE_REPORT_INPUT_COLUMNS}
-            for row in rows
-            if row["source"] == source
-        ]
-        for source in ("house_pdf", "gemini_ocr")
-    }
     db.conn.execute("BEGIN TRANSACTION")
     try:
-        for source, source_rows in rows_by_source.items():
-            db.source_reports.replace_generation(
-                generation,
-                source,
-                "house",
-                pd.DataFrame(source_rows, columns=SOURCE_REPORT_INPUT_COLUMNS),
-                _in_transaction=True,
+        unresolved = db.get_unresolved_house_doc_ids(year, generation)
+        house["unresolved_doc_ids"] = unresolved
+        house["resolved_doc_count"] = house["ptr_count"] - len(unresolved)
+        if unresolved:
+            db.conn.execute(
+                """
+                UPDATE house_archive_generations
+                SET parse_status = 'incomplete'
+                WHERE archive_year = ? AND generation_id = ?
+                """,
+                [year, generation],
             )
-        db.mark_house_generation_parse_complete(
-            year, generation, _in_transaction=True
-        )
+        else:
+            rows = _house_inventory_rows(db, year, generation)
+            rows_by_source = {
+                source: [
+                    {column: row[column] for column in SOURCE_REPORT_INPUT_COLUMNS}
+                    for row in rows
+                    if row["source"] == source
+                ]
+                for source in ("house_pdf", "gemini_ocr")
+            }
+            for source, source_rows in rows_by_source.items():
+                db.source_reports.replace_generation(
+                    generation,
+                    source,
+                    "house",
+                    pd.DataFrame(source_rows, columns=SOURCE_REPORT_INPUT_COLUMNS),
+                    _in_transaction=True,
+                )
+            db.mark_house_generation_parse_complete(
+                year, generation, _in_transaction=True
+            )
         db.conn.execute("COMMIT")
     except Exception:
         db.conn.execute("ROLLBACK")
         raise
+
+    if unresolved:
+        house["parse_status"] = "incomplete"
+        return unresolved, None
     house["parse_status"] = "complete"
     house["source_report_rows"] = len(rows)
     return unresolved, len(rows)

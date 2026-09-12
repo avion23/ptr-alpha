@@ -518,6 +518,12 @@ def test_refresh_house_completion_replaces_each_source_inventory(tmp_path):
         assert unresolved == []
         assert report_count == 3
         assert house["parse_status"] == "complete"
+        assert db.conn.execute(
+            """
+            SELECT parse_status FROM house_archive_generations
+            WHERE archive_year = 2026 AND generation_id = 'house-generation'
+            """
+        ).fetchone()[0] == "complete"
         assert db.source_reports.reconcile(
             "house-generation", "house_pdf", "house"
         ) == {
@@ -639,5 +645,46 @@ def test_canonical_view_check_uses_latest_semantically_accepted_generation(tmp_p
             """
         )
         assert rebuild_staged._canonical_view_diff_counts(db) == (0, 1)
+    finally:
+        db.close()
+
+
+def test_refresh_house_completion_demotes_db_generation_on_unresolved_doc(tmp_path):
+    from scripts import rebuild_staged
+
+    db = _seed_house_inventory_database(tmp_path)
+    try:
+        db.conn.execute(
+            """
+            UPDATE house_archive_generations
+            SET parse_status = 'complete'
+            WHERE archive_year = 2026 AND generation_id = 'house-generation'
+            """
+        )
+        db.conn.execute(
+            """
+            UPDATE transactions
+            SET notification_date = '2025-12-31'
+            WHERE doc_id = 'ocr' AND ingestion_generation = 'house-generation'
+            """
+        )
+        house = {
+            "generation_id": "house-generation",
+            "ptr_count": 3,
+            "parse_status": "complete",
+        }
+        unresolved, report_count = rebuild_staged._refresh_house_completion(
+            db, house, 2026
+        )
+
+        assert unresolved == ["ocr"]
+        assert report_count is None
+        assert house["parse_status"] == "incomplete"
+        assert db.conn.execute(
+            """
+            SELECT parse_status FROM house_archive_generations
+            WHERE archive_year = 2026 AND generation_id = 'house-generation'
+            """
+        ).fetchone()[0] == "incomplete"
     finally:
         db.close()

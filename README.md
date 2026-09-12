@@ -137,7 +137,7 @@ The fixed-horizon CLI backtest now evaluates exactly `--horizon`. It does not re
 - `DECAY_LAMBDA` for the historical path-weighted return diagnostic shown by signal analysis, not member ranking or production scoring;
 - the empirical member hierarchy and its distributional assumptions;
 - portfolio rebalance cadence, holding period, maximum position count, and any explicitly declared slippage assumption;
-- validation family choices such as horizon, buyer threshold, and top-N.
+- validation sensitivity results such as horizon, top-N, and rebalance cadence; the production lookback and buyer minimum stay fixed.
 
 These must not be described as laws of the data-generating process. The current production candidate score avoids them.
 
@@ -201,9 +201,7 @@ Common commands:
 
 A positive live score means only that multiple distinct members disclosed recent purchases of the same equity. It is not statistical proof of abnormal future return.
 
-The repository's retrospective validation machinery evaluates only the production consensus rule. It uses scheduled no-trade support, exact holding-period purging, SPY-relative net outcomes, and family-wise controls. Descriptive member ranking is separate from recommendation generation and cannot authorize deployment. `analyzer.validation` is the single authority for production-strategy evidence; older parallel optimization/locking and member-scoring engines were removed rather than maintained as alternate implementations.
-
-No existing retrospective result should be relabeled as fresh out-of-sample evidence after changing the scorer or implementation. A scorer change requires a new predeclared evaluation.
+The repository's retrospective validation machinery evaluates the fixed production consensus rule: a 28-calendar-day disclosure window, at least three canonical buyers, and a score equal to the distinct-buyer count. It reports all statistically supported results across declared sensitivity families such as horizon, top-N, and rebalance cadence. It uses scheduled no-trade support, exact holding-period purging, SPY-relative net outcomes, and family-wise controls. Descriptive member ranking is separate from recommendation generation. Validation is evidence only; it does not select or authorize a production change. Older parallel optimization and member-scoring engines were removed rather than maintained as alternate implementations.
 
 ## Documentation
 

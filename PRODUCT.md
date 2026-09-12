@@ -16,7 +16,7 @@ PTR Alpha is for engineers and quantitative researchers evaluating public congre
 
 PTR Alpha ingests official House and Senate disclosures, normalizes them into one canonical DuckDB model, produces current consensus buy candidates, and retrospectively evaluates the same production decision rule under executable market-session semantics.
 
-The production rule is intentionally small. Within a 28-calendar-day public-disclosure window, count distinct canonical congressional buyers of the same eligible public equity. The default minimum is three buyers and `signal_score` is exactly the distinct-buyer count.
+The production rule is intentionally small. Within a fixed 28-calendar-day public-disclosure window, count distinct canonical congressional buyers of the same eligible public equity. The fixed minimum is three buyers and `signal_score` is exactly the distinct-buyer count.
 
 Member analysis is descriptive research only. It cannot authorize production recommendations.
 
@@ -39,8 +39,8 @@ Live analysis, replay, and validation share one production consensus rule rather
 ## Capabilities and Constraints
 
 - Public disclosure time is the information boundary.
-- Default consensus window: 28 calendar days.
-- Default consensus minimum: 3 distinct canonical buyers.
+- Fixed consensus window: 28 calendar days.
+- Fixed consensus minimum: 3 distinct canonical buyers.
 - Production scorer provenance: `identity_free_distinct_buyer_count_v2`.
 - `signal_score = distinct recent buyer count`.
 - Explicit options, funds, bonds, private assets, and quarantined ticker artifacts are excluded.
@@ -49,7 +49,7 @@ Live analysis, replay, and validation share one production consensus rule rather
 - Fixed-horizon exit is the expected NYSE session on or before entry plus the declared calendar-day horizon.
 - Missing required price endpoints remain unavailable rather than using stale or padded fallback pricing.
 - Scheduled no-trade dates represent cash return 0 when benchmark support exists.
-- Validation evaluates only the production consensus family and keeps retrospective evidence distinct from any reserved final holdout.
+- Validation evaluates the fixed production consensus rule and reports all statistically supported sensitivity results. Horizon, top-N, and rebalance cadence are evaluation sensitivities; the 28-day lookback and three-buyer minimum stay fixed.
 - Hashes may identify artifacts but do not authorize execution or establish correctness.
 - Live data freshness depends on the latest successfully ingested local House and Senate disclosures.
 

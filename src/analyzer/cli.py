@@ -1453,12 +1453,10 @@ def fetch_senate_efd(
 
 
 def _validation_grid(full_grid: bool) -> dict[str, list]:
-    """Return only parameters that can change the production consensus rule."""
+    """Return only evaluation sensitivities for the fixed BUY policy."""
     grid = {
         "horizon": [60, 90, 120],
         "frequency_days": [30, 90] if full_grid else [30],
-        "lookback_days": [CONSENSUS_LOOKBACK_DAYS],
-        "min_buyers": [2, 3, 5],
         "top_n": [3, 5],
     }
     return grid
@@ -1476,7 +1474,7 @@ def validate(
     test_start: str = typer.Option("2024-01-01", help="Test window start (YYYY-MM-DD)"),
     test_end: str = typer.Option("2025-06-30", help="Test window end (YYYY-MM-DD)"),
     full_grid: bool = typer.Option(
-        False, "--full-grid", help="Use full 36-combo consensus grid"
+        False, "--full-grid", help="Evaluate the full 12-combo sensitivity grid"
     ),
     data_dir: str = typer.Option("data", help="Data directory"),
     null_samples: int = typer.Option(
@@ -1486,19 +1484,19 @@ def validate(
     ),
 ):
     """
-    Purged retrospective validation with dependence-safe corrections.
+    Purged validation of the fixed production BUY policy with dependence-safe
+    corrections.
 
-    Sweeps configurations on the purged training phase, then requires both
-    Bonferroni and centered moving-block max-stat bootstrap survival. Production
-    selection uses only identity-invariant consensus scoring with each fold's
-    explicit as-of timestamp; member-identity modes are nondeployable diagnostics.
-    Consensus has no member-identity hypothesis. Under-resolved nulls fail closed. The
-    2024-2025 test phase is retrospective, not fresh out-of-sample evidence. The
-    post-2025 final phase stays locked.
+    The ``identity_free_distinct_buyer_count_v2`` scorer, 28-day disclosure
+    window, and minimum three canonical buyers are fixed production inputs. The
+    family varies only evaluation sensitivities: holding horizon, rebalance
+    frequency, and top-N. Bonferroni and centered moving-block max-stat
+    bootstrap controls remain in force. Results report statistical support for
+    every sensitivity; validation does not authorize a different live BUY rule.
 
     Results are written to <data-dir>/validation_results.json. Statistical
-    evidence is determined by the declared family and observed outcomes, not by
-    hashes, locks, receipts, or an execution ledger.
+    evidence is determined by the declared sensitivity family and observed
+    outcomes.
     """
     from analyzer.validation import run_validation
 

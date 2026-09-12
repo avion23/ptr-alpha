@@ -96,7 +96,7 @@ Production scorer provenance:
 identity_free_distinct_buyer_count_v2
 ```
 
-Defaults:
+Fixed production inputs:
 
 ```text
 lookback_days = 28
@@ -191,9 +191,9 @@ Open positions and unresolved exits remain explicit in portfolio accounting rath
 
 ## 9. Validation
 
-`src/analyzer/validation.py` is the single production-strategy evidence engine.
+`src/analyzer/validation.py` computes statistical evidence for the production strategy.
 
-Validation evaluates the actual consensus family. Result-changing family dimensions are limited to declared decision/evaluation parameters such as horizon, scheduled frequency, lookback window, buyer threshold, and top-N where supported by the experiment specification.
+Validation evaluates the fixed production consensus rule and reports all statistically supported sensitivity results. The 28-calendar-day disclosure window and three-buyer minimum are fixed production inputs, not validation parameters. Declared evaluation sensitivities may include horizon, top-N, and scheduled rebalance cadence.
 
 The validation path preserves these rules:
 
@@ -206,11 +206,10 @@ The validation path preserves these rules:
 - moving-block bootstrap with support-aware dependence handling;
 - family-wise correction across the declared strategy family;
 - fail-closed minimum resampling/sample-support requirements;
-- identity-invariance diagnostics for the consensus scorer;
-- retrospective wording for previously explored history;
-- rejection of evaluation windows that enter the reserved final holdout.
+- executed scorer provenance and fixed-policy checks;
+- explicit reporting of the evaluated sensitivity family and statistical support.
 
-Hashes and manifests may identify evidence. They do not authorize execution, make a result correct, or consume a one-shot right to evaluate. Exact-machine fingerprints, filesystem locks, consumption ledgers, and frozen database-hash gates are not correctness mechanisms.
+Hashes and manifests identify evidence only. They do not authorize production changes or establish correctness.
 
 ## 10. Parsing and ingestion
 
@@ -235,7 +234,6 @@ Important user-visible states are distinct:
 - stale/missing source warning;
 - incomplete/unavailable historical outcome;
 - parser/ingestion failure;
-- validation with no deployable configuration.
 
 Broad exception handling must not silently change implementations or convert partial output into success when completeness is required.
 

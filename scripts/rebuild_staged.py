@@ -357,8 +357,12 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
         if not pdf_paths:
             raise RuntimeError(f"house-parse {year}: no PDF files found in {pdf_dir}")
 
+        # PDFs failing validation carry no trustworthy hash and must never
+        # cache-hit; they stay retryable and fail closed via unresolved docs.
         artifact_hashes = {
-            path.stem: _validated_pdf_sha256(path) for path in pdf_paths
+            path.stem: sha
+            for path in pdf_paths
+            if (sha := _validated_pdf_sha256(path)) is not None
         }
         cached = db.parse_runs.get_cached_doc_ids(
             year=year,
@@ -589,6 +593,7 @@ def senate(args) -> None:
             return
         inserted = src.save_to_db(df)
         summary = src.last_refresh_summary
+        assert summary is not None  # save_to_db raises without a complete summary
         record = {
             "status": "persisted",
             "start_date": str(SENATE_START),

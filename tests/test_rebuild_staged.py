@@ -1,9 +1,41 @@
 """Regression tests for the staged rebuild parser boundary."""
 
+import json
 from types import SimpleNamespace
 from typing import cast
 
 import pandas as pd
+import pytest
+
+
+def test_senate_ingest_rejects_generation_provenance_rewrite(tmp_path):
+    from scripts import rebuild_staged
+
+    (tmp_path / "transactions.jsonl").write_text(
+        json.dumps({"ingestion_generation": "wrong-generation"}) + "\n"
+    )
+    (tmp_path / "report_inventory.jsonl").write_text(
+        json.dumps(
+            {
+                "ingestion_generation": "manifest-generation",
+                "raw_row_count": 0,
+                "accepted_row_count": 0,
+                "rejected_row_count": 0,
+            }
+        )
+        + "\n"
+    )
+
+    class FakeDatabase:
+        def persist_source_refresh(self, **_kwargs):
+            raise AssertionError("mismatched provenance must fail before persistence")
+
+    with pytest.raises(ValueError, match="generation provenance mismatch"):
+        rebuild_staged._ingest_senate(
+            tmp_path,
+            {"generation": "manifest-generation"},
+            cast(rebuild_staged.Database, FakeDatabase()),
+        )
 
 
 def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(

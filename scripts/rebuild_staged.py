@@ -1923,8 +1923,23 @@ def _ingest_senate(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     ]
     tx = _coerce_sibling_frame(tx, count_columns=[], date_columns=date_cols, text_columns=text_cols)
     inv = _coerce_sibling_frame(inv, count_columns=count_cols, date_columns=date_cols, text_columns=text_cols)
-    tx["ingestion_generation"] = generation
-    inv["ingestion_generation"] = generation
+    for label, frame in (("transactions", tx), ("report inventory", inv)):
+        if "ingestion_generation" not in frame.columns:
+            raise ValueError(f"senate {label} lacks ingestion_generation provenance")
+        generations = {
+            str(value).strip()
+            for value in frame["ingestion_generation"].dropna().tolist()
+            if str(value).strip()
+        }
+        null_generation_rows = int(frame["ingestion_generation"].isna().sum())
+        if len(frame) and (
+            generations != {generation} or null_generation_rows != 0
+        ):
+            raise ValueError(
+                f"senate {label} generation provenance mismatch: "
+                f"manifest={generation!r} rows={sorted(generations)!r} "
+                f"null_rows={null_generation_rows}"
+            )
     inserted = db.persist_source_refresh(
         transactions=tx,
         reports=inv,

@@ -174,6 +174,31 @@ def build_staged_db(db_path: Path) -> Database:
             ],
         )
 
+    # Keep the parsed Senate report internally reconciled as well.  The
+    # source-report audit now checks accepted counts against persisted rows.
+    for n in (1, 2, 3):
+        conn.execute(
+            """
+            INSERT INTO transactions (
+                doc_id, member, ticker, transaction_date, disclosure_date,
+                transaction_type, owner_code, amount_raw, amount_midpoint,
+                instrument_type, asset_description, source, chamber,
+                source_record_id, source_row_id, official_filing_date,
+                ingestion_generation, artifact_sha256
+            ) VALUES (?, 'Senator One', ?, ?, '2026-08-01', 'Purchase', '',
+                      '$1,001 - $15,000', 8000.0, 'stock', 'Senate Corp',
+                      'senate_efd', 'Senate', 's1', ?, '2026-08-01',
+                      'senate-gen-1', ?)
+            """,
+            [
+                "s1",
+                f"SEN{n}",
+                date(2026, 7, n),
+                f"s1:r{n}",
+                "a" * 64,
+            ],
+        )
+
     for doc_id, count in HOUSE_ROW_COUNTS.items():
         year = 2025 if doc_id == "10000002" else 2026
         generation = "gen-2025-a" if year == 2025 else "gen-2026-b"
@@ -234,6 +259,63 @@ def build_staged_db(db_path: Path) -> Database:
         ]
     )
     db.replace_source_reports("senate-gen-1", "senate_efd", "Senate", reports)
+
+    def house_reports(generation, specs):
+        return pd.DataFrame(
+            [
+                {
+                    "ingestion_generation": generation,
+                    "chamber": "house",
+                    "source_record_id": doc_id,
+                    "report_path": f"{year}/pdfs/{doc_id}.pdf",
+                    "member": member,
+                    "official_filing_date": date.fromisoformat(disc_date),
+                    "outcome": "parsed",
+                    "artifact_sha256": artifact_shas[doc_id],
+                    "landing_sha256": artifact_shas[doc_id],
+                    "paper_artifact_url": None,
+                    "paper_artifact_sha256": None,
+                    "error_message": None,
+                    "raw_row_count": count,
+                    "accepted_row_count": count,
+                    "rejected_row_count": 0,
+                }
+                for doc_id, year, member, disc_date, count in specs
+            ]
+        )
+
+    db.replace_source_reports(
+        "gen-2026-b",
+        "house_pdf",
+        "house",
+        house_reports(
+            "gen-2026-b",
+            [
+                ("20030977", 2026, "Alice Adams", "2026-03-01", 224),
+                ("20033737", 2026, "Bob Baker", "2026-03-02", 16),
+                ("20033921", 2026, "Carol Clark", "2026-03-03", 15),
+                ("10000001", 2026, "Dan Davis", "2026-03-04", 3),
+            ],
+        ),
+    )
+    db.replace_source_reports(
+        "gen-2026-b",
+        "gemini_ocr",
+        "house",
+        house_reports(
+            "gen-2026-b",
+            [("10000003", 2026, "Frank Fox", "2026-03-05", 2)],
+        ),
+    )
+    db.replace_source_reports(
+        "gen-2025-a",
+        "house_pdf",
+        "house",
+        house_reports(
+            "gen-2025-a",
+            [("10000002", 2025, "Eve Evans", "2025-06-01", 2)],
+        ),
+    )
     return db
 
 
@@ -517,9 +599,194 @@ def test_source_report_row_reconciliation_is_reported(tmp_path):
     assert any("outcome=parsed raw=5 accepted=3" in v for v in check.violations)
 
 
+def test_paper_only_provenance_is_audited(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    def fn(conn):
+        conn.execute(
+            """
+            UPDATE source_reports
+            SET paper_artifact_url = 'https://evil.test/paper.pdf',
+                paper_artifact_sha256 = NULL
+            WHERE source_record_id = 's2'
+            """
+        )
+
+    _mutate(db_path, fn)
+    check = _result(_audit(db_path), "source_reports_equation")
+    assert any("invalid Senate paper provenance" in v for v in check.violations)
+
+
+def _convert_house_doc_to_no_txs(conn, doc_id="10000001"):
+    conn.execute(
+        "DELETE FROM transactions WHERE doc_id = ? AND source IN ('house_pdf', 'gemini_ocr')",
+        [doc_id],
+    )
+    conn.execute(
+        """
+        UPDATE pdf_parse_runs
+        SET status = 'no_txs', raw_row_count = 0, transaction_count = 0
+        WHERE doc_id = ?
+        """,
+        [doc_id],
+    )
+    conn.execute(
+        """
+        UPDATE source_reports
+        SET outcome = 'no_txs', raw_row_count = 0,
+            accepted_row_count = 0, rejected_row_count = 0
+        WHERE source = 'house_pdf' AND chamber = 'house'
+          AND source_record_id = ?
+        """,
+        [doc_id],
+    )
+
+
+def test_house_no_txs_report_is_counted_and_passes(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    _mutate(db_path, _convert_house_doc_to_no_txs)
+    results = _audit(db_path)
+    assert all(result.passed for result in results), [
+        (result.name, result.violations) for result in results if not result.passed
+    ]
+    check = _result(results, "source_reports_equation")
+    assert check.passed
+
+
+def test_missing_house_no_txs_report_is_reported_against_artifacts(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    def fn(conn):
+        _convert_house_doc_to_no_txs(conn)
+        conn.execute(
+            """
+            DELETE FROM source_reports
+            WHERE source = 'house_pdf' AND chamber = 'house'
+              AND source_record_id = '10000001'
+            """
+        )
+
+    _mutate(db_path, fn)
+    check = _result(_audit(db_path), "house_generation_activation")
+    assert any(
+        "authoritative artifact(s) lack a matching House source report" in v
+        for v in check.violations
+    )
+
+
+def test_house_report_must_preserve_gemini_transaction_source(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    def fn(conn):
+        conn.execute(
+            """
+            UPDATE source_reports
+            SET source = 'house_pdf'
+            WHERE source_record_id = '10000003'
+              AND ingestion_generation = 'gen-2026-b'
+            """
+        )
+
+    _mutate(db_path, fn)
+    check = _result(_audit(db_path), "source_reports_equation")
+    assert any(
+        "10000003" in violation and "persisted=0" in violation
+        for violation in check.violations
+    )
+    assert any("no matching source report" in violation for violation in check.violations)
+
+
+def test_house_no_txs_report_must_match_terminal_parser_source(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    def fn(conn):
+        conn.execute(
+            """
+            DELETE FROM transactions
+            WHERE doc_id = '10000003'
+              AND source IN ('house_pdf', 'gemini_ocr')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE pdf_parse_runs
+            SET status = 'no_txs', raw_row_count = 0, transaction_count = 0
+            WHERE doc_id = '10000003'
+              AND ingestion_generation = 'gen-2026-b'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE source_reports
+            SET source = 'house_pdf', outcome = 'no_txs',
+                raw_row_count = 0, accepted_row_count = 0,
+                rejected_row_count = 0
+            WHERE source_record_id = '10000003'
+              AND ingestion_generation = 'gen-2026-b'
+            """
+        )
+
+    _mutate(db_path, fn)
+    check = _result(_audit(db_path), "house_generation_activation")
+    assert any("parser/report binding mismatch" in v for v in check.violations)
+
+
+def test_no_txs_report_with_rows_fails_closed(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    def fn(conn):
+        _convert_house_doc_to_no_txs(conn)
+        conn.execute(
+            """
+            UPDATE source_reports
+            SET raw_row_count = 1, accepted_row_count = 1
+            WHERE source = 'house_pdf' AND chamber = 'house'
+              AND source_record_id = '10000001'
+            """
+        )
+
+    _mutate(db_path, fn)
+    check = _result(_audit(db_path), "source_reports_equation")
+    assert any("outcome=no_txs raw=1 accepted=1" in v for v in check.violations)
+
+
+def test_no_txs_parse_run_requires_zero_raw_rows(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    def fn(conn):
+        _convert_house_doc_to_no_txs(conn)
+        conn.execute(
+            """
+            UPDATE pdf_parse_runs
+            SET raw_row_count = 1
+            WHERE doc_id = '10000001'
+              AND ingestion_generation = 'gen-2026-b'
+            """
+        )
+
+    _mutate(db_path, fn)
+    check = _result(_audit(db_path), "parse_counts_match_persisted")
+    assert any("status='no_txs'" in v for v in check.violations)
+
+
 def test_source_report_equation_violation_on_legacy_schema(tmp_path):
     # A pre-existing table without the outcome CHECK constraint can hold an
-    # outcome outside the four-way partition; the audit must fail closed.
+    # outcome outside the five-way partition; the audit must fail closed.
     db_path = tmp_path / "legacy.duckdb"
     conn = duckdb.connect(str(db_path))
     conn.execute(

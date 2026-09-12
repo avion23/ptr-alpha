@@ -174,6 +174,83 @@ def test_database_adds_nullable_cross_source_columns_without_backfill(tmp_path):
     assert legacy_values == (None,) * len(expected_columns)
 
 
+def test_database_migrates_legacy_source_report_outcome_check(tmp_path):
+    """Opening a writable legacy database must admit the no_txs outcome."""
+    db_path = tmp_path / "legacy-source-reports.duckdb"
+    connection = duckdb.connect(str(db_path))
+    connection.execute(
+        """
+        CREATE TABLE source_reports (
+            ingestion_generation VARCHAR NOT NULL,
+            source VARCHAR NOT NULL,
+            chamber VARCHAR NOT NULL,
+            source_record_id VARCHAR NOT NULL,
+            report_path VARCHAR,
+            member VARCHAR,
+            official_filing_date DATE,
+            outcome VARCHAR NOT NULL CHECK (
+                outcome IN ('parsed', 'paper_only', 'unavailable', 'failed')
+            ),
+            artifact_sha256 VARCHAR,
+            landing_sha256 VARCHAR,
+            paper_artifact_url VARCHAR,
+            paper_artifact_sha256 VARCHAR,
+            error_message VARCHAR,
+            raw_row_count INTEGER NOT NULL,
+            accepted_row_count INTEGER NOT NULL,
+            rejected_row_count INTEGER NOT NULL,
+            UNIQUE (ingestion_generation, source, chamber, source_record_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO source_reports VALUES (
+            'legacy-gen', 'house_pdf', 'house', 'legacy-1',
+            '2026/legacy-1.pdf', 'Legacy Member', '2026-08-01', 'parsed',
+            ?, ?, NULL, NULL, NULL, 1, 1, 0
+        )
+        """,
+        ["a" * 64, "a" * 64],
+    )
+    connection.close()
+
+    db = Database(db_path)
+    try:
+        # The old row must survive the table rebuild, and the new value must
+        # satisfy the migrated CHECK constraint.
+        db.conn.execute(
+            """
+            INSERT INTO source_reports (
+                ingestion_generation, source, chamber, source_record_id,
+                report_path, member, official_filing_date, outcome,
+                artifact_sha256, landing_sha256, paper_artifact_url,
+                paper_artifact_sha256, error_message, raw_row_count,
+                accepted_row_count, rejected_row_count
+            ) VALUES (
+                'legacy-gen', 'gemini_ocr', 'house', 'legacy-2',
+                '2026/legacy-2.pdf', 'OCR Member', '2026-08-02', 'no_txs',
+                ?, ?, NULL, NULL, NULL, 0, 0, 0
+            )
+            """,
+            ["b" * 64, "b" * 64],
+        )
+        rows = db.conn.execute(
+            """
+            SELECT source, source_record_id, outcome
+            FROM source_reports
+            ORDER BY source_record_id
+            """
+        ).fetchall()
+    finally:
+        db.close()
+
+    assert rows == [
+        ("house_pdf", "legacy-1", "parsed"),
+        ("gemini_ocr", "legacy-2", "no_txs"),
+    ]
+
+
 class TestMetadata(DatabaseTestCase):
     def test_replace_metadata_is_atomic_and_removes_stale_rows(self):
         old = pd.DataFrame(
@@ -2053,11 +2130,11 @@ class TestSourceReports(DatabaseTestCase):
                 "2026/1002.pdf",
                 "John Doe",
                 date(2026, 8, 2),
-                "paper_only",
+                "no_txs",
                 "b" * 64,
                 "b" * 64,
-                "https://efdsearch.senate.gov/media/1002.pdf",
-                "b" * 64,
+                None,
+                None,
                 None,
                 0,
                 0,
@@ -2095,10 +2172,10 @@ class TestSourceReports(DatabaseTestCase):
         self.assertEqual(stored["source_record_id"].tolist(), ["1001", "1002", "1003"])
         self.assertEqual(stored.iloc[0]["artifact_sha256"], parsed_sha)
         self.assertEqual(stored.iloc[0]["outcome"], "parsed")
-        self.assertEqual(stored.iloc[1]["outcome"], "paper_only")
+        self.assertEqual(stored.iloc[1]["outcome"], "no_txs")
         self.assertEqual(stored.iloc[2]["outcome"], "parsed")
         self.assertEqual(stored.iloc[0]["landing_sha256"], parsed_sha)
-        self.assertEqual(stored.iloc[1]["paper_artifact_sha256"], "b" * 64)
+        self.assertIsNone(stored.iloc[1]["paper_artifact_sha256"])
         self.assertEqual(
             self.db.get_source_report_reconciliation(
                 "refresh-2026-08-09", "house_pdf", "house"
@@ -2106,7 +2183,8 @@ class TestSourceReports(DatabaseTestCase):
             {
                 "found": 3,
                 "parsed": 2,
-                "paper_only": 1,
+                "no_txs": 1,
+                "paper_only": 0,
                 "unavailable": 0,
                 "failed": 0,
             },
@@ -2525,6 +2603,7 @@ class TestSourceReports(DatabaseTestCase):
             {
                 "found": 1,
                 "parsed": 0,
+                "no_txs": 0,
                 "paper_only": 1,
                 "unavailable": 0,
                 "failed": 0,
@@ -2799,6 +2878,62 @@ class TestSourceReports(DatabaseTestCase):
                 "senate_efd",
                 "senate",
                 parsed.assign(paper_artifact_sha256="c" * 64),
+            )
+
+    def test_no_txs_requires_zero_rows_matching_hashes_and_no_paper_fields(self):
+        no_txs = self.reports(
+            (
+                "gen-1",
+                "house",
+                "empty",
+                "/empty.pdf",
+                "Member",
+                date(2026, 8, 1),
+                "no_txs",
+                "a" * 64,
+                "a" * 64,
+                None,
+                None,
+                None,
+                0,
+                0,
+                0,
+            )
+        )
+        self.db.replace_source_reports("gen-1", "house_pdf", "house", no_txs)
+        stored = self.db.get_source_reports("gen-1", "house_pdf", "house")
+        self.assertEqual(stored.iloc[0]["outcome"], "no_txs")
+        self.assertEqual(stored.iloc[0]["artifact_sha256"], "a" * 64)
+        self.assertEqual(stored.iloc[0]["landing_sha256"], "a" * 64)
+        self.assertIsNone(stored.iloc[0]["paper_artifact_url"])
+        self.assertIsNone(stored.iloc[0]["paper_artifact_sha256"])
+
+        with self.assertRaisesRegex(
+            ValueError, "no_txs reports require all row counts"
+        ):
+            self.db.replace_source_reports(
+                "gen-1",
+                "house_pdf",
+                "house",
+                no_txs.assign(raw_row_count=1),
+            )
+        with self.assertRaisesRegex(
+            ValueError, "no_txs reports require artifact_sha256"
+        ):
+            self.db.replace_source_reports(
+                "gen-1",
+                "house_pdf",
+                "house",
+                no_txs.assign(landing_sha256="b" * 64),
+            )
+        with self.assertRaisesRegex(
+            ValueError, "non-paper reports must not set paper artifact"
+        ):
+            self.db.replace_source_reports(
+                "gen-1",
+                "house_pdf",
+                "house",
+                no_txs.assign(paper_artifact_url="https://evil.test/paper.pdf"),
             )
 
     def test_initialization_drops_legacy_v3_unique_index(self):

@@ -614,6 +614,18 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
         artifact_sha256=artifact_sha,
         ingestion_generation=generation,
     )
+    db.conn.execute(
+        """
+        INSERT INTO source_reports (
+            ingestion_generation, source, chamber, source_record_id,
+            report_path, member, official_filing_date, outcome,
+            artifact_sha256, landing_sha256, error_message,
+            raw_row_count, accepted_row_count, rejected_row_count
+        ) VALUES (?, 'house_pdf', 'house', 'stable', '2021/pdfs/stable.pdf',
+                  'First Last', '2022-01-04', 'parsed', ?, ?, NULL, 1, 1, 0)
+        """,
+        [generation, artifact_sha, artifact_sha],
+    )
 
     def failed_worker(path):
         raise ParserCascadeError(f"{path}: unresolved parser completeness: boom")

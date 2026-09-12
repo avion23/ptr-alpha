@@ -369,7 +369,9 @@ class Database:
                 member VARCHAR,
                 official_filing_date DATE,
                 outcome VARCHAR NOT NULL CHECK (
-                    outcome IN ('parsed', 'paper_only', 'unavailable', 'failed')
+                    outcome IN (
+                        'parsed', 'no_txs', 'paper_only', 'unavailable', 'failed'
+                    )
                 ),
                 artifact_sha256 VARCHAR,
                 landing_sha256 VARCHAR,
@@ -392,6 +394,7 @@ class Database:
         }
         if "source" not in source_columns:
             self._migrate_source_reports_source_identity()
+        self._migrate_source_reports_outcome_constraint()
 
     def _migrate_source_reports_source_identity(self) -> None:
         self.conn.execute("BEGIN TRANSACTION")
@@ -410,7 +413,9 @@ class Database:
                     member VARCHAR,
                     official_filing_date DATE,
                     outcome VARCHAR NOT NULL CHECK (
-                        outcome IN ('parsed', 'paper_only', 'unavailable', 'failed')
+                        outcome IN (
+                            'parsed', 'no_txs', 'paper_only', 'unavailable', 'failed'
+                        )
                     ),
                     artifact_sha256 VARCHAR,
                     landing_sha256 VARCHAR,
@@ -438,6 +443,66 @@ class Database:
             self.conn.execute("DROP TABLE source_reports")
             self.conn.execute(
                 "ALTER TABLE source_reports_with_source RENAME TO source_reports"
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def _migrate_source_reports_outcome_constraint(self) -> None:
+        """Rebuild source_reports when its outcome CHECK lacks ``no_txs``."""
+        checks = self.conn.execute(
+            """
+            SELECT expression
+            FROM duckdb_constraints()
+            WHERE table_name = 'source_reports' AND constraint_type = 'CHECK'
+            """
+        ).fetchall()
+        if any("no_txs" in str(expression).lower() for (expression,) in checks):
+            return
+
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute("""
+                CREATE TABLE source_reports_with_outcome (
+                    ingestion_generation VARCHAR NOT NULL,
+                    source VARCHAR NOT NULL,
+                    chamber VARCHAR NOT NULL,
+                    source_record_id VARCHAR NOT NULL,
+                    report_path VARCHAR,
+                    member VARCHAR,
+                    official_filing_date DATE,
+                    outcome VARCHAR NOT NULL CHECK (
+                        outcome IN (
+                            'parsed', 'no_txs', 'paper_only', 'unavailable', 'failed'
+                        )
+                    ),
+                    artifact_sha256 VARCHAR,
+                    landing_sha256 VARCHAR,
+                    paper_artifact_url VARCHAR,
+                    paper_artifact_sha256 VARCHAR,
+                    error_message VARCHAR,
+                    raw_row_count INTEGER NOT NULL,
+                    accepted_row_count INTEGER NOT NULL,
+                    rejected_row_count INTEGER NOT NULL,
+                    UNIQUE (
+                        ingestion_generation, source, chamber, source_record_id
+                    )
+                )
+            """)
+            self.conn.execute("""
+                INSERT INTO source_reports_with_outcome
+                SELECT
+                    ingestion_generation, source, chamber, source_record_id,
+                    report_path, member, official_filing_date, outcome,
+                    artifact_sha256, landing_sha256, paper_artifact_url,
+                    paper_artifact_sha256, error_message, raw_row_count,
+                    accepted_row_count, rejected_row_count
+                FROM source_reports
+            """)
+            self.conn.execute("DROP TABLE source_reports")
+            self.conn.execute(
+                "ALTER TABLE source_reports_with_outcome RENAME TO source_reports"
             )
             self.conn.execute("COMMIT")
         except Exception:
@@ -619,9 +684,14 @@ class Database:
         return [str(row[0]) for row in rows]
 
     def mark_house_generation_parse_complete(
-        self, archive_year: int, generation_id: str
+        self,
+        archive_year: int,
+        generation_id: str,
+        *,
+        _in_transaction: bool = False,
     ) -> None:
-        self.conn.execute("BEGIN TRANSACTION")
+        if not _in_transaction:
+            self.conn.execute("BEGIN TRANSACTION")
         try:
             latest_generation = self.get_latest_house_generation(archive_year)
             if latest_generation != generation_id:
@@ -703,9 +773,11 @@ class Database:
                 """,
                 [archive_year, generation_id, generation_id],
             )
-            self.conn.execute("COMMIT")
+            if not _in_transaction:
+                self.conn.execute("COMMIT")
         except Exception:
-            self.conn.execute("ROLLBACK")
+            if not _in_transaction:
+                self.conn.execute("ROLLBACK")
             raise
 
     def promote_house_archive(

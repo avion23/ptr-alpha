@@ -229,3 +229,177 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
     assert parse_runs["failed"]["status"] == "error"
     assert parse_runs["failed"]["error_message"] == "unresolved parser completeness"
     assert parse_runs["failed"]["engines_attempted"] == "cascade-failed"
+
+
+def _seed_house_inventory_database(tmp_path):
+    from analyzer.database import Database
+
+    db = Database(tmp_path / "house-inventory.duckdb")
+    db.conn.execute(
+        """
+        INSERT INTO house_archive_generations (
+            archive_year, generation_id, metadata_count, ptr_count
+        ) VALUES (2026, 'house-generation', 3, 3)
+        """
+    )
+    db.conn.executemany(
+        """
+        INSERT INTO house_generation_metadata (
+            archive_year, generation_id, doc_id, first_name, last_name,
+            filing_date, filing_type
+        ) VALUES (2026, 'house-generation', ?, ?, ?, '2026-01-03', 'P')
+        """,
+        [("deterministic", "Jane", "Doe"), ("ocr", "John", "Doe"), ("empty", "Alex", "Doe")],
+    )
+    db.conn.executemany(
+        """
+        INSERT INTO house_pdf_artifacts (
+            archive_year, generation_id, doc_id, artifact_sha256
+        ) VALUES (2026, 'house-generation', ?, ?)
+        """,
+        [("deterministic", "a" * 64), ("ocr", "b" * 64), ("empty", "c" * 64)],
+    )
+    db.conn.execute(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, source, chamber, source_record_id, source_row_id,
+            official_filing_date, ingestion_generation, artifact_sha256
+        ) VALUES (
+            'deterministic', 'Jane Doe', 'AAPL', '2026-01-01', '2026-01-03',
+            'Purchase', 'house_pdf', 'house', 'deterministic', 'pdf:r1',
+            '2026-01-03', 'house-generation', ?
+        )
+        """,
+        ["a" * 64],
+    )
+    db.conn.execute(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, source, chamber, source_record_id, source_row_id,
+            official_filing_date, ingestion_generation, artifact_sha256
+        ) VALUES (
+            'ocr', 'John Doe', 'MSFT', '2026-01-01', '2026-01-03',
+            'Purchase', 'gemini_ocr', 'House', 'ocr', 'ocr:r1',
+            '2026-01-03', 'house-generation', ?
+        )
+        """,
+        ["b" * 64],
+    )
+    db.upsert_parse_run(
+        "deterministic", 2026, "v5-deterministic", "success", "pdf", 1, 1,
+        artifact_sha256="a" * 64, ingestion_generation="house-generation",
+    )
+    db.upsert_parse_run(
+        "ocr", 2026, "v5-gemini-validated", "success", "ocr", 1, 1,
+        artifact_sha256="b" * 64, ingestion_generation="house-generation",
+    )
+    db.upsert_parse_run(
+        "empty", 2026, "v5-deterministic", "no_txs", "pdf", 0, 0,
+        artifact_sha256="c" * 64, ingestion_generation="house-generation",
+    )
+    return db
+
+
+def test_house_inventory_rows_include_mixed_sources_and_no_txs(tmp_path):
+    from scripts import rebuild_staged
+
+    db = _seed_house_inventory_database(tmp_path)
+    try:
+        rows = rebuild_staged._house_inventory_rows(
+            db, 2026, "house-generation"
+        )
+    finally:
+        db.close()
+
+    assert [row["source_record_id"] for row in rows] == [
+        "deterministic", "empty", "ocr"
+    ]
+    by_id = {row["source_record_id"]: row for row in rows}
+    assert by_id["deterministic"]["source"] == "house_pdf"
+    assert by_id["deterministic"]["outcome"] == "parsed"
+    assert by_id["ocr"]["source"] == "gemini_ocr"
+    assert by_id["ocr"]["outcome"] == "parsed"
+    assert by_id["empty"]["source"] == "house_pdf"
+    assert by_id["empty"]["outcome"] == "no_txs"
+    assert by_id["empty"]["accepted_row_count"] == 0
+
+
+def test_house_inventory_rows_reject_ambiguous_terminal_runs(tmp_path):
+    from scripts import rebuild_staged
+
+    db = _seed_house_inventory_database(tmp_path)
+    try:
+        db.upsert_parse_run(
+            "ocr", 2026, "v5-gemini-alt", "success", "pdf", 1, 1,
+            artifact_sha256="b" * 64, ingestion_generation="house-generation",
+        )
+        with pytest.raises(RuntimeError, match="ambiguous terminal parse runs"):
+            rebuild_staged._house_inventory_rows(db, 2026, "house-generation")
+    finally:
+        db.close()
+
+
+def test_house_inventory_rows_reject_stale_source_bindings(tmp_path):
+    from scripts import rebuild_staged
+
+    db = _seed_house_inventory_database(tmp_path)
+    try:
+        db.conn.execute(
+            """
+            INSERT INTO transactions (
+                doc_id, member, ticker, transaction_date, disclosure_date,
+                transaction_type, source, chamber, source_record_id, source_row_id,
+                official_filing_date, ingestion_generation, artifact_sha256
+            ) VALUES (
+                'ocr', 'John Doe', 'TSLA', '2026-01-01', '2026-01-03',
+                'Purchase', 'house_pdf', 'house', 'ocr', 'stale:r1',
+                '2026-01-03', 'house-generation', ?
+            )
+            """,
+            ["b" * 64],
+        )
+        with pytest.raises(RuntimeError, match="stale source/artifact bindings"):
+            rebuild_staged._house_inventory_rows(db, 2026, "house-generation")
+    finally:
+        db.close()
+
+
+def test_refresh_house_completion_replaces_each_source_inventory(tmp_path):
+    from scripts import rebuild_staged
+
+    db = _seed_house_inventory_database(tmp_path)
+    try:
+        house = {
+            "generation_id": "house-generation",
+            "ptr_count": 3,
+        }
+        unresolved, report_count = rebuild_staged._refresh_house_completion(
+            db, house, 2026
+        )
+        assert unresolved == []
+        assert report_count == 3
+        assert house["parse_status"] == "complete"
+        assert db.source_reports.reconcile(
+            "house-generation", "house_pdf", "house"
+        ) == {
+            "found": 2,
+            "parsed": 1,
+            "no_txs": 1,
+            "paper_only": 0,
+            "unavailable": 0,
+            "failed": 0,
+        }
+        assert db.source_reports.reconcile(
+            "house-generation", "gemini_ocr", "house"
+        ) == {
+            "found": 1,
+            "parsed": 1,
+            "no_txs": 0,
+            "paper_only": 0,
+            "unavailable": 0,
+            "failed": 0,
+        }
+    finally:
+        db.close()

@@ -59,12 +59,17 @@ from analyzer.download import (  # noqa: E402
     _validated_pdf_sha256,
     preserve_existing_fields,
 )
-from analyzer.models import FilingType, ReportOutcome  # noqa: E402
+from analyzer.models import FilingType  # noqa: E402
 from analyzer import parser_cascade as _parser_cascade  # noqa: E402
 from analyzer.parsing import consolidate_transactions  # noqa: E402
 from analyzer.price_repository import previous_nyse_session  # noqa: E402
 from analyzer.price_snapshot import create_snapshot, save_snapshot  # noqa: E402
 from analyzer.settings import DataSettings, Settings  # noqa: E402
+from analyzer.source_report_repository import (  # noqa: E402
+    SOURCE_REPORT_INPUT_COLUMNS,
+    SourceReportOutcome,
+    _is_official_paper_url,
+)
 
 _parse_pdf_worker = _parser_cascade._parse_pdf_worker
 ParserCascadeError = _parser_cascade.ParserCascadeError
@@ -505,59 +510,224 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
 
 
 def _house_inventory_rows(db: Database, year: int, gen: str) -> list[dict]:
-    """Build the per-generation source_reports inventory (parsed docs only)."""
-    runs = db.conn.execute(
-        """
-        SELECT doc_id, status, transaction_count, error_message
-        FROM pdf_parse_runs
-        WHERE year = ? AND ingestion_generation = ?
-        ORDER BY doc_id
-        """,
-        [year, gen],
-    ).fetchall()
+    """Build source-report rows for every authoritative House PTR artifact.
+
+    A House document can be accepted by either the deterministic parser or the
+    validated Gemini OCR fallback.  The parser family is part of the accepted
+    provenance, so the report source must match the transaction source.  Only
+    one artifact-bound terminal run may authorize each PTR; ambiguous or
+    inconsistent runs fail closed instead of silently choosing a fallback.
+    """
     metadata = db.conn.execute(
         """
         SELECT doc_id, first_name, last_name, filing_date
         FROM house_generation_metadata
         WHERE archive_year = ? AND generation_id = ?
+          AND filing_type = 'P'
+        ORDER BY doc_id
         """,
         [year, gen],
     ).fetchall()
-    meta_by_id = {str(doc_id): (first, last, filing_date) for doc_id, first, last, filing_date in metadata}
-    artifacts = {
-        str(doc_id): artifact_sha256
-        for doc_id, artifact_sha256 in db.conn.execute(
-            "SELECT doc_id, artifact_sha256 FROM house_pdf_artifacts WHERE archive_year=? AND generation_id=?",
-            [year, gen],
-        ).fetchall()
-    }
-    rows = []
-    for doc_id, status, accepted, error_message in runs:
-        if status != "success":
-            continue
-        first, last, filing_date = meta_by_id.get(str(doc_id), (None, None, None))
-        member = f"{first} {last}".strip() if first or last else None
-        if member is None or filing_date is None:
+    meta_by_id: dict[str, tuple[object, object, object]] = {}
+    for doc_id, first, last, filing_date in metadata:
+        key = str(doc_id)
+        if key in meta_by_id:
+            raise RuntimeError(f"house inventory {year}/{key}: duplicate member metadata")
+        meta_by_id[key] = (first, last, filing_date)
+
+    artifact_rows = db.conn.execute(
+        """
+        SELECT doc_id, artifact_sha256
+        FROM house_pdf_artifacts
+        WHERE archive_year = ? AND generation_id = ?
+        ORDER BY doc_id
+        """,
+        [year, gen],
+    ).fetchall()
+    artifacts: dict[str, str] = {}
+    for doc_id, artifact_sha256 in artifact_rows:
+        key = str(doc_id)
+        if key in artifacts:
+            raise RuntimeError(f"house inventory {year}/{key}: duplicate artifact")
+        if not isinstance(artifact_sha256, str) or re.fullmatch(
+            r"[0-9a-f]{64}", artifact_sha256
+        ) is None:
+            raise RuntimeError(f"house inventory {year}/{key}: missing or invalid artifact sha")
+        artifacts[key] = artifact_sha256
+
+    expected_ids = set(meta_by_id)
+    artifact_ids = set(artifacts)
+    missing_artifacts = sorted(expected_ids - artifact_ids)
+    if missing_artifacts:
+        raise RuntimeError(
+            f"house inventory {year}: missing artifact(s): "
+            + ", ".join(missing_artifacts[:10])
+        )
+    unexpected_artifacts = sorted(artifact_ids - expected_ids)
+    if unexpected_artifacts:
+        raise RuntimeError(
+            f"house inventory {year}: artifact(s) outside PTR scope: "
+            + ", ".join(unexpected_artifacts[:10])
+        )
+
+    runs = db.conn.execute(
+        """
+        SELECT doc_id, parser_version, status, raw_row_count,
+               transaction_count, error_message, artifact_sha256
+        FROM pdf_parse_runs
+        WHERE year = ? AND ingestion_generation = ?
+          AND status IN ('success', 'no_txs')
+        ORDER BY doc_id, parsed_at DESC NULLS LAST, parser_version
+        """,
+        [year, gen],
+    ).fetchall()
+    runs_by_doc: dict[str, list[tuple]] = {}
+    for run in runs:
+        doc_id = str(run[0])
+        if doc_id in expected_ids:
+            runs_by_doc.setdefault(doc_id, []).append(run)
+
+    transaction_rows = db.conn.execute(
+        """
+        SELECT doc_id, source, artifact_sha256, COUNT(*) AS row_count,
+               COUNT(*) FILTER (
+                   WHERE source_record_id IS DISTINCT FROM doc_id
+               ) AS bad_record_ids,
+               COUNT(*) FILTER (
+                   WHERE chamber IS NULL OR LOWER(TRIM(chamber)) <> 'house'
+               ) AS bad_chambers
+        FROM transactions
+        WHERE ingestion_generation = ?
+        GROUP BY doc_id, source, artifact_sha256
+        """,
+        [gen],
+    ).fetchall()
+    tx_counts: dict[tuple[str, str, str | None], tuple[int, int, int]] = {}
+    tx_keys_by_doc: dict[str, set[tuple[str, str | None]]] = {}
+    for (
+        doc_id,
+        source,
+        artifact_sha256,
+        row_count,
+        bad_record_ids,
+        bad_chambers,
+    ) in transaction_rows:
+        doc_key = str(doc_id)
+        source_key = str(source)
+        tx_counts[(doc_key, source_key, artifact_sha256)] = (
+            int(row_count),
+            int(bad_record_ids),
+            int(bad_chambers),
+        )
+        if doc_key in expected_ids:
+            tx_keys_by_doc.setdefault(doc_key, set()).add(
+                (source_key, artifact_sha256)
+            )
+
+    rows: list[dict] = []
+    for doc_id in sorted(expected_ids):
+        first, last, filing_date = meta_by_id[doc_id]
+        name_parts = [
+            str(value).strip()
+            for value in (first, last)
+            if value is not None
+            and str(value).strip()
+            and str(value).strip().lower() not in {"nan", "nat", "none"}
+        ]
+        member = " ".join(name_parts)
+        if not member or str(filing_date).strip().lower() in {"", "nat", "nan", "none"}:
             raise RuntimeError(f"house inventory {year}/{doc_id}: missing member metadata")
-        sha = artifacts.get(str(doc_id))
-        if sha is None:
-            raise RuntimeError(f"house inventory {year}/{doc_id}: missing artifact sha")
+
+        artifact_sha = artifacts[doc_id]
+        candidates: list[tuple[str, str, int, int, str | None]] = []
+        for (
+            run_doc_id,
+            parser_version,
+            status,
+            raw_count,
+            transaction_count,
+            error_message,
+            run_artifact_sha,
+        ) in runs_by_doc.get(doc_id, []):
+            if run_artifact_sha != artifact_sha:
+                continue
+            if not isinstance(parser_version, str) or not parser_version.strip():
+                raise RuntimeError(
+                    f"house inventory {year}/{doc_id}: terminal run has no parser version"
+                )
+            source = (
+                "gemini_ocr"
+                if "gemini" in parser_version.lower()
+                else "house_pdf"
+            )
+            try:
+                raw = int(raw_count)
+                accepted = int(transaction_count)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    f"house inventory {year}/{doc_id}: terminal run has invalid row counts"
+                ) from None
+            actual, bad_record_ids, bad_chambers = tx_counts.get(
+                (doc_id, source, artifact_sha), (0, 0, 0)
+            )
+            if bad_record_ids or bad_chambers:
+                raise RuntimeError(
+                    f"house inventory {year}/{doc_id}: persisted rows have invalid House identity"
+                )
+            if status == "success":
+                if raw <= 0 or accepted != raw or actual != accepted:
+                    raise RuntimeError(
+                        f"house inventory {year}/{doc_id}: parsed row count mismatch "
+                        f"raw={raw} run={accepted} persisted={actual} source={source}"
+                    )
+                outcome = SourceReportOutcome.PARSED.value
+            elif status == SourceReportOutcome.NO_TXS.value:
+                if raw != 0 or accepted != 0 or actual != 0:
+                    raise RuntimeError(
+                        f"house inventory {year}/{doc_id}: no_txs row count mismatch "
+                        f"raw={raw} run={accepted} persisted={actual} source={source}"
+                    )
+                outcome = SourceReportOutcome.NO_TXS.value
+            else:
+                raise RuntimeError(
+                    f"house inventory {year}/{doc_id}: unsupported terminal status {status!r}"
+                )
+            candidates.append((source, outcome, raw, accepted, error_message))
+
+        if len(candidates) != 1:
+            if not candidates:
+                raise RuntimeError(
+                    f"house inventory {year}/{doc_id}: no artifact-bound terminal parse run"
+                )
+            raise RuntimeError(
+                f"house inventory {year}/{doc_id}: ambiguous terminal parse runs"
+            )
+        source, outcome, raw_count, accepted_count, error_message = candidates[0]
+        stale_transaction_keys = sorted(
+            tx_keys_by_doc.get(doc_id, set()) - {(source, artifact_sha)}
+        )
+        if stale_transaction_keys:
+            raise RuntimeError(
+                f"house inventory {year}/{doc_id}: persisted rows have stale "
+                f"source/artifact bindings: {stale_transaction_keys}"
+            )
         rows.append(
             {
+                "source": source,
                 "ingestion_generation": gen,
                 "chamber": "house",
-                "source_record_id": str(doc_id),
+                "source_record_id": doc_id,
                 "report_path": f"{year}/pdfs/{doc_id}.pdf",
                 "member": member,
                 "official_filing_date": filing_date,
-                "outcome": ReportOutcome.PARSED.value,
-                "artifact_sha256": sha,
-                "landing_sha256": sha,
+                "outcome": outcome,
+                "artifact_sha256": artifact_sha,
+                "landing_sha256": artifact_sha,
                 "paper_artifact_url": None,
                 "paper_artifact_sha256": None,
                 "error_message": error_message,
-                "raw_row_count": int(accepted),
-                "accepted_row_count": int(accepted),
+                "raw_row_count": raw_count,
+                "accepted_row_count": accepted_count,
                 "rejected_row_count": 0,
             }
         )
@@ -579,13 +749,178 @@ def _refresh_house_completion(
         return unresolved, None
 
     rows = _house_inventory_rows(db, year, generation)
-    db.source_reports.replace_generation(
-        generation, "house_pdf", "house", pd.DataFrame(rows)
-    )
-    db.mark_house_generation_parse_complete(year, generation)
+    rows_by_source = {
+        source: [
+            {column: row[column] for column in SOURCE_REPORT_INPUT_COLUMNS}
+            for row in rows
+            if row["source"] == source
+        ]
+        for source in ("house_pdf", "gemini_ocr")
+    }
+    db.conn.execute("BEGIN TRANSACTION")
+    try:
+        for source, source_rows in rows_by_source.items():
+            db.source_reports.replace_generation(
+                generation,
+                source,
+                "house",
+                pd.DataFrame(source_rows, columns=SOURCE_REPORT_INPUT_COLUMNS),
+                _in_transaction=True,
+            )
+        db.mark_house_generation_parse_complete(
+            year, generation, _in_transaction=True
+        )
+        db.conn.execute("COMMIT")
+    except Exception:
+        db.conn.execute("ROLLBACK")
+        raise
     house["parse_status"] = "complete"
     house["source_report_rows"] = len(rows)
     return unresolved, len(rows)
+
+
+def _house_source_report_binding_violations(
+    db: Database, year: int, generation: str
+) -> list[str]:
+    """Return report/parser binding violations for one complete House generation."""
+    artifact_rows = db.conn.execute(
+        """
+        SELECT doc_id, artifact_sha256
+        FROM house_pdf_artifacts
+        WHERE archive_year = ? AND generation_id = ?
+        ORDER BY doc_id
+        """,
+        [year, generation],
+    ).fetchall()
+    terminal_runs = db.conn.execute(
+        """
+        SELECT doc_id, parser_version, status, artifact_sha256
+        FROM pdf_parse_runs
+        WHERE ingestion_generation = ?
+          AND status IN ('success', 'no_txs')
+        """,
+        [generation],
+    ).fetchall()
+    reports = db.conn.execute(
+        """
+        SELECT source, source_record_id, outcome, artifact_sha256
+        FROM source_reports
+        WHERE ingestion_generation = ?
+          AND source IN ('house_pdf', 'gemini_ocr')
+          AND LOWER(chamber) = 'house'
+        """,
+        [generation],
+    ).fetchall()
+
+    runs_by_artifact: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for doc_id, parser_version, status, artifact_sha in terminal_runs:
+        if (
+            doc_id is None
+            or artifact_sha is None
+            or not isinstance(parser_version, str)
+            or not parser_version.strip()
+        ):
+            continue
+        source = "gemini_ocr" if "gemini" in parser_version.lower() else "house_pdf"
+        outcome = "parsed" if status == "success" else "no_txs"
+        runs_by_artifact.setdefault((str(doc_id), str(artifact_sha)), []).append(
+            (source, outcome)
+        )
+
+    reports_by_artifact: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for source, record_id, outcome, artifact_sha in reports:
+        if record_id is None or artifact_sha is None:
+            continue
+        reports_by_artifact.setdefault((str(record_id), str(artifact_sha)), []).append(
+            (str(source), str(outcome))
+        )
+
+    violations: list[str] = []
+    for doc_id, artifact_sha in artifact_rows:
+        key = (str(doc_id), str(artifact_sha))
+        run_bindings = runs_by_artifact.get(key, [])
+        report_bindings = reports_by_artifact.get(key, [])
+        if len(run_bindings) != 1:
+            violations.append(
+                f"artifact {doc_id} has {len(run_bindings)} matching "
+                "terminal parser run(s)"
+            )
+        if len(report_bindings) != 1:
+            violations.append(
+                f"artifact {doc_id} has {len(report_bindings)} matching "
+                "House source report(s)"
+            )
+        if len(run_bindings) == 1 and len(report_bindings) == 1:
+            if run_bindings[0] != report_bindings[0]:
+                violations.append(
+                    f"artifact {doc_id} parser/report binding mismatch: "
+                    f"run={run_bindings[0]} report={report_bindings[0]}"
+                )
+    return violations
+
+
+def _source_report_provenance_violations(
+    db: Database, generation: str
+) -> list[str]:
+    """Return semantic provenance violations for reports in one generation."""
+    reports = db.conn.execute(
+        """
+        SELECT source, chamber, source_record_id, outcome,
+               artifact_sha256, landing_sha256, paper_artifact_url,
+               paper_artifact_sha256
+        FROM source_reports
+        WHERE ingestion_generation = ?
+        ORDER BY source, source_record_id
+        """,
+        [generation],
+    ).fetchall()
+    violations: list[str] = []
+    for (
+        source,
+        chamber,
+        record_id,
+        outcome,
+        artifact,
+        landing,
+        paper_url,
+        paper_sha,
+    ) in reports:
+        identity = f"source={source} chamber={chamber} gen={generation} {record_id}"
+        nonpaper_hashes_valid = (
+            isinstance(artifact, str)
+            and re.fullmatch(r"[0-9a-f]{64}", artifact) is not None
+            and isinstance(landing, str)
+            and re.fullmatch(r"[0-9a-f]{64}", landing) is not None
+            and artifact == landing
+        )
+        if outcome in ("parsed", "no_txs") and not nonpaper_hashes_valid:
+            violations.append(
+                f"{identity}: {outcome} report has invalid artifact provenance"
+            )
+        if outcome in ("parsed", "no_txs") and (
+            paper_url is not None or paper_sha is not None
+        ):
+            violations.append(
+                f"{identity}: {outcome} report sets paper artifact fields"
+            )
+        if outcome == "no_txs" and (
+            not isinstance(chamber, str) or chamber.strip().lower() != "house"
+        ):
+            violations.append(f"{identity}: no_txs report is not a House report")
+        if outcome == "paper_only":
+            paper_valid = (
+                isinstance(chamber, str)
+                and chamber.strip().lower() == "senate"
+                and nonpaper_hashes_valid
+                and isinstance(paper_sha, str)
+                and re.fullmatch(r"[0-9a-f]{64}", paper_sha) is not None
+                and _is_official_paper_url(paper_url)
+            )
+            if not paper_valid:
+                violations.append(
+                    f"{identity}: paper_only report has invalid Senate paper provenance"
+                )
+    return violations
 
 
 def house_parse(args) -> None:
@@ -1102,13 +1437,23 @@ def verify(args) -> None:
                       AND t.ingestion_generation = p.ingestion_generation
                       AND t.artifact_sha256 IS NOT DISTINCT FROM p.artifact_sha256) AS actual
             FROM pdf_parse_runs p
-            WHERE p.status = 'success'
-              AND COALESCE(p.transaction_count, -1) != (
-                  SELECT COUNT(*) FROM transactions t
-                  WHERE t.doc_id = p.doc_id
-                    AND t.source IN ('house_pdf', 'gemini_ocr')
-                    AND t.ingestion_generation = p.ingestion_generation
-                    AND t.artifact_sha256 IS NOT DISTINCT FROM p.artifact_sha256
+            WHERE p.status IN ('success', 'no_txs')
+              AND (
+                  COALESCE(p.transaction_count, -1) != (
+                      SELECT COUNT(*) FROM transactions t
+                      WHERE t.doc_id = p.doc_id
+                        AND t.source IN ('house_pdf', 'gemini_ocr')
+                        AND t.ingestion_generation = p.ingestion_generation
+                        AND t.artifact_sha256 IS NOT DISTINCT FROM p.artifact_sha256
+                  )
+                  OR (p.status = 'success' AND (
+                      COALESCE(p.raw_row_count, 0) <= 0
+                      OR COALESCE(p.transaction_count, 0) <= 0
+                  ))
+                  OR (p.status = 'no_txs' AND (
+                      COALESCE(p.raw_row_count, -1) != 0
+                      OR COALESCE(p.transaction_count, -1) != 0
+                  ))
               )
             """,
         ).fetchall()
@@ -1126,6 +1471,7 @@ def verify(args) -> None:
             SELECT ingestion_generation, source, chamber,
                    COUNT(*) AS found,
                    COUNT(*) FILTER (WHERE outcome = 'parsed') AS parsed,
+                   COUNT(*) FILTER (WHERE outcome = 'no_txs') AS no_txs,
                    COUNT(*) FILTER (WHERE outcome = 'paper_only') AS paper_only,
                    COUNT(*) FILTER (WHERE outcome = 'unavailable') AS unavailable,
                    COUNT(*) FILTER (WHERE outcome = 'failed') AS failed
@@ -1136,17 +1482,22 @@ def verify(args) -> None:
         ).fetchall()
         bad_report_groups = [
             row for row in report_groups
-            if row[3] != row[4] + row[5] + row[6] + row[7]
+            if row[3] != row[4] + row[5] + row[6] + row[7] + row[8]
         ]
         bad_report_counts = db.conn.execute(
             """
             SELECT ingestion_generation, source, chamber, source_record_id,
                    outcome, raw_row_count, accepted_row_count, rejected_row_count
             FROM source_reports
-            WHERE raw_row_count < 0 OR accepted_row_count < 0 OR rejected_row_count < 0
+            WHERE raw_row_count IS NULL OR accepted_row_count IS NULL
+               OR rejected_row_count IS NULL
+               OR raw_row_count < 0 OR accepted_row_count < 0 OR rejected_row_count < 0
                OR raw_row_count != accepted_row_count + rejected_row_count
                OR (outcome = 'parsed' AND (accepted_row_count <= 0
                                            OR raw_row_count != accepted_row_count
+                                           OR rejected_row_count != 0))
+               OR (outcome = 'no_txs' AND (raw_row_count != 0
+                                           OR accepted_row_count != 0
                                            OR rejected_row_count != 0))
                OR (outcome = 'paper_only' AND (raw_row_count != 0
                                                OR accepted_row_count != 0
@@ -1163,8 +1514,9 @@ def verify(args) -> None:
             LEFT JOIN transactions t
               ON t.ingestion_generation = r.ingestion_generation
              AND t.source = r.source
-             AND t.chamber = r.chamber
+             AND LOWER(t.chamber) = LOWER(r.chamber)
              AND t.source_record_id = r.source_record_id
+             AND t.artifact_sha256 IS NOT DISTINCT FROM r.artifact_sha256
             GROUP BY 1, 2, 3, 4, 5
             HAVING r.accepted_row_count != COUNT(t.id)
             ORDER BY 1, 4
@@ -1250,11 +1602,28 @@ def verify(args) -> None:
             generation = house.get("generation_id")
             if not isinstance(generation, str) or not generation:
                 continue
-            reconcile = db.source_reports.reconcile(generation, "house_pdf", "house")
+            source_reconciliations = {
+                source: db.source_reports.reconcile(generation, source, "house")
+                for source in ("house_pdf", "gemini_ocr")
+            }
+            reconcile = {
+                name: sum(part[name] for part in source_reconciliations.values())
+                for name in next(iter(source_reconciliations.values()))
+            }
+            artifact_count = int(
+                db.conn.execute(
+                    """
+                    SELECT COUNT(*) FROM house_pdf_artifacts
+                    WHERE archive_year = ? AND generation_id = ?
+                    """,
+                    [year, generation],
+                ).fetchone()[0]
+            )
             expected = (
-                reconcile["found"] > 0
+                reconcile["found"] == artifact_count
                 and reconcile["found"] == (
                     reconcile["parsed"]
+                    + reconcile["no_txs"]
                     + reconcile["paper_only"]
                     + reconcile["unavailable"]
                     + reconcile["failed"]
@@ -1262,11 +1631,20 @@ def verify(args) -> None:
                 and reconcile["failed"] == 0
                 and reconcile["unavailable"] == 0
             )
+            binding_violations = _house_source_report_binding_violations(
+                db, year, generation
+            )
+            provenance_violations = _source_report_provenance_violations(
+                db, generation
+            )
+            expected = expected and not binding_violations and not provenance_violations
             _check(
                 checks,
                 f"house_{year}_source_report_reconciliation",
                 expected,
-                f"reconcile={reconcile}",
+                f"reconcile={reconcile} artifacts={artifact_count} "
+                f"bindings={binding_violations[:10]} "
+                f"provenance={provenance_violations[:10]}",
             )
         # 6. Senate completeness is read from the active local source state.
         # A frozen Senate window is equivalent to a persisted refresh once its
@@ -1337,7 +1715,14 @@ def verify(args) -> None:
         else:
             senate_reconcile = {
                 name: 0
-                for name in ("found", "parsed", "paper_only", "unavailable", "failed")
+                for name in (
+                    "found",
+                    "parsed",
+                    "no_txs",
+                    "paper_only",
+                    "unavailable",
+                    "failed",
+                )
             }
         _check(
             checks,
@@ -1345,16 +1730,24 @@ def verify(args) -> None:
             senate_reconcile["found"] > 0,
             f"generation={intended_senate_generation!r} reconcile={senate_reconcile}",
         )
+        senate_provenance_violations = (
+            _source_report_provenance_violations(db, intended_senate_generation)
+            if isinstance(intended_senate_generation, str)
+            and intended_senate_generation.strip()
+            else []
+        )
         _check(
             checks,
             "senate_report_reconciliation",
-            senate_reconcile["found"] == (
+            not senate_provenance_violations
+            and senate_reconcile["found"] == (
                 senate_reconcile["parsed"]
+                + senate_reconcile["no_txs"]
                 + senate_reconcile["paper_only"]
                 + senate_reconcile["unavailable"]
                 + senate_reconcile["failed"]
             ),
-            str(senate_reconcile),
+            f"{senate_reconcile} provenance={senate_provenance_violations[:10]}",
         )
         _check(
             checks,
@@ -1416,12 +1809,22 @@ def verify(args) -> None:
         )
         declared_summary = senate.get("summary")
         if isinstance(declared_summary, dict) and declared_summary:
-            summary_fields = ("found", "parsed", "paper_only", "unavailable", "failed")
+            # Senate manifests use the Senate-specific ReportOutcome
+            # contract, which has no no_txs value. Keep no_txs in the
+            # database equation (it must remain zero) without requiring the
+            # manifest to invent a field it never emits.
+            summary_fields = (
+                "found",
+                "parsed",
+                "paper_only",
+                "unavailable",
+                "failed",
+            )
             summary_ok = all(
                 field in declared_summary
                 and declared_summary[field] == senate_reconcile[field]
                 for field in summary_fields
-            )
+            ) and senate_reconcile["no_txs"] == 0
         else:
             summary_ok = True
         _check(

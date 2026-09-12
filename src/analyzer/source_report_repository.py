@@ -35,6 +35,7 @@ def _is_official_paper_url(value: object) -> bool:
 
 class SourceReportOutcome(StrEnum):
     PARSED = "parsed"
+    NO_TXS = "no_txs"
     PAPER_ONLY = "paper_only"
     UNAVAILABLE = "unavailable"
     FAILED = "failed"
@@ -213,6 +214,7 @@ class SourceReportRepository:
             SELECT
                 COUNT(*) AS found,
                 COUNT(*) FILTER (WHERE outcome = 'parsed') AS parsed,
+                COUNT(*) FILTER (WHERE outcome = 'no_txs') AS no_txs,
                 COUNT(*) FILTER (WHERE outcome = 'paper_only') AS paper_only,
                 COUNT(*) FILTER (WHERE outcome = 'unavailable') AS unavailable,
                 COUNT(*) FILTER (WHERE outcome = 'failed') AS failed
@@ -221,7 +223,7 @@ class SourceReportRepository:
             """,
             [generation, source, chamber],
         ).fetchone()
-        names = ("found", "parsed", "paper_only", "unavailable", "failed")
+        names = ("found", "parsed", "no_txs", "paper_only", "unavailable", "failed")
         return dict(zip(names, (int(value) for value in row), strict=True))
 
     @staticmethod
@@ -328,7 +330,33 @@ class SourceReportRepository:
                 "parsed reports require artifact_sha256 equal to landing_sha256"
             )
 
+        no_txs = reports_df["outcome"].eq(SourceReportOutcome.NO_TXS.value)
+        invalid_no_txs_chamber = no_txs & ~reports_df["chamber"].map(
+            lambda value: isinstance(value, str) and value.strip().lower() == "house"
+        )
+        if invalid_no_txs_chamber.any():
+            raise ValueError("no_txs reports require chamber=house")
+        invalid_no_txs_counts = no_txs & numeric_counts[count_columns].ne(0).any(
+            axis=1
+        )
+        if invalid_no_txs_counts.any():
+            raise ValueError("no_txs reports require all row counts to equal zero")
+        no_txs_hash_invalid = no_txs & (
+            reports_df["artifact_sha256"].isna()
+            | reports_df["landing_sha256"].isna()
+            | reports_df["artifact_sha256"].ne(reports_df["landing_sha256"])
+        )
+        if no_txs_hash_invalid.any():
+            raise ValueError(
+                "no_txs reports require artifact_sha256 equal to landing_sha256"
+            )
+
         paper_only = reports_df["outcome"].eq(SourceReportOutcome.PAPER_ONLY.value)
+        invalid_paper_chamber = paper_only & ~reports_df["chamber"].map(
+            lambda value: isinstance(value, str) and value.strip().lower() == "senate"
+        )
+        if invalid_paper_chamber.any():
+            raise ValueError("paper_only reports require chamber=senate")
         invalid_paper_counts = paper_only & numeric_counts[count_columns].ne(0).any(
             axis=1
         )
@@ -360,6 +388,7 @@ class SourceReportRepository:
 
         classified = (
             parsed
+            | no_txs
             | paper_only
             | reports_df["outcome"].isin(
                 [
@@ -385,10 +414,11 @@ class SourceReportRepository:
         counts = reports_df["outcome"].value_counts().to_dict()
         found = len(reports_df)
         parsed = int(counts.get(SourceReportOutcome.PARSED.value, 0))
+        no_txs = int(counts.get(SourceReportOutcome.NO_TXS.value, 0))
         paper_only = int(counts.get(SourceReportOutcome.PAPER_ONLY.value, 0))
         unavailable = int(counts.get(SourceReportOutcome.UNAVAILABLE.value, 0))
         failed = int(counts.get(SourceReportOutcome.FAILED.value, 0))
-        classified = parsed + paper_only + unavailable + failed
+        classified = parsed + no_txs + paper_only + unavailable + failed
         if found != classified:
             valid_outcomes = tuple(outcome.value for outcome in SourceReportOutcome)
             unknown = sorted(
@@ -399,13 +429,15 @@ class SourceReportRepository:
             )
             raise ValueError(
                 "source report reconciliation failed: "
-                f"found={found}, parsed={parsed}, paper_only={paper_only}, "
+                f"found={found}, parsed={parsed}, no_txs={no_txs}, "
+                f"paper_only={paper_only}, "
                 f"unavailable={unavailable}, failed={failed}, unknown={unknown}"
             )
         if failed or unavailable:
             raise ValueError(
                 "source report replacement requires unavailable=0 and failed=0; "
-                f"found={found}, parsed={parsed}, paper_only={paper_only}, "
+                f"found={found}, parsed={parsed}, no_txs={no_txs}, "
+                f"paper_only={paper_only}, "
                 f"unavailable={unavailable}, failed={failed}"
             )
 

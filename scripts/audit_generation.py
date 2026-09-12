@@ -23,18 +23,21 @@ Checks (each violation is reported exactly, and the process exits nonzero):
       (economic_duplicate_candidate) exactly as the production read path
       computes them.
   C5  source_reports equation         per (ingestion_generation, source,
-      chamber): found == parsed + paper_only + unavailable + failed, and each
-      report's row counts reconcile (parsed: raw==accepted>0, rejected=0;
-      paper_only: all zero; others: raw==accepted+rejected).
+      chamber): found == parsed + no_txs + paper_only + unavailable + failed,
+      and each report's row counts reconcile (parsed: raw==accepted>0,
+      rejected=0; no_txs/paper_only: all zero; others:
+      raw==accepted+rejected). Accepted rows must reconcile to transactions
+      under the same source identity.
   C6  completeness                    a source_reports group is complete only
       when failed == 0 AND unavailable == 0.
   C7  pinned PDF canaries             20030977 -> 224, 20033737 -> 16,
       20033921 -> 15 persisted rows.
   C8  scans fail-closed / House       a House generation is activated
       (parse_status='complete') only with zero unresolved artifacts (every
-      artifact has a terminal success/no_txs run bound to it); canonical
-      House/OCR rows must come from the latest complete generation of their
-      archive year; persisted House/OCR rows must be artifact-bound.
+      artifact has a terminal success/no_txs run bound to it and exactly one
+      source report); canonical House/OCR rows must come from the latest
+      complete generation of their archive year; persisted House/OCR rows must
+      be artifact-bound.
   C9  chronology / date-domain        dates within [1900-01-01, today+1];
       canonical rows must carry transaction_date and disclosure_date; when both
       are present disclosure_date must be >= transaction_date; producer-
@@ -49,10 +52,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import duckdb
 
@@ -114,6 +119,28 @@ def _run_source_for_parser(parser_version: str | None) -> str | None:
     if "gemini" in lowered:
         return "gemini_ocr"
     return "house_pdf"
+
+
+def _is_official_paper_url(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "efdsearch.senate.gov"
+        and parsed.username is None
+        and parsed.password is None
+        and port in (None, 443)
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path.startswith(
+            ("/media/", "/search/view/paper/", "/search/view/paper-filing/")
+        )
+    )
 
 
 def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
@@ -197,6 +224,25 @@ def check_parse_counts_match_persisted(
                 result.violations.append(
                     f"{doc_id} ({parser_version}, {generation}): "
                     f"run.transaction_count={tx_count} but persisted={persisted}"
+                )
+            if status == "success" and (
+                raw_count is None
+                or raw_count <= 0
+                or tx_count is None
+                or tx_count <= 0
+            ):
+                result.violations.append(
+                    f"{doc_id} ({parser_version}, {generation}): "
+                    "status='success' requires positive raw_row_count and "
+                    "transaction_count"
+                )
+            if status == "no_txs" and (
+                raw_count != 0 or tx_count != 0
+            ):
+                result.violations.append(
+                    f"{doc_id} ({parser_version}, {generation}): "
+                    f"status='no_txs' but raw_row_count={raw_count} "
+                    f"transaction_count={tx_count}"
                 )
         elif status in ("zero_rows", "error", "failed", "rejected"):
             if tx_count != 0:
@@ -475,16 +521,22 @@ def check_duplicate_policy(conn: duckdb.DuckDBPyConnection) -> CheckResult:
 def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult:
     result = CheckResult(
         "source_reports_equation",
-        "found == parsed + paper_only + unavailable + failed per group",
+        "found == parsed + no_txs + paper_only + unavailable + failed per group",
     )
     if not _table_exists(conn, "source_reports"):
         result.info.append("source_reports table missing; nothing to audit")
         return result
+    transactions_available = _table_exists(conn, "transactions")
+    if not transactions_available:
+        result.violations.append(
+            "transactions table missing; source-report row reconciliation is unavailable"
+        )
     groups = conn.execute(
         """
         SELECT ingestion_generation, source, chamber,
                COUNT(*) AS found,
                COUNT(*) FILTER (WHERE outcome = 'parsed') AS parsed,
+               COUNT(*) FILTER (WHERE outcome = 'no_txs') AS no_txs,
                COUNT(*) FILTER (WHERE outcome = 'paper_only') AS paper_only,
                COUNT(*) FILTER (WHERE outcome = 'unavailable') AS unavailable,
                COUNT(*) FILTER (WHERE outcome = 'failed') AS failed
@@ -495,12 +547,23 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
     ).fetchall()
     if not groups:
         result.info.append("no source_reports groups present")
-    for generation, source, chamber, found, parsed, paper, unavail, failed in groups:
-        classified = parsed + paper + unavail + failed
+    for (
+        generation,
+        source,
+        chamber,
+        found,
+        parsed,
+        no_txs,
+        paper,
+        unavail,
+        failed,
+    ) in groups:
+        classified = parsed + no_txs + paper + unavail + failed
         if found != classified:
             result.violations.append(
                 f"source={source} chamber={chamber} gen={generation}: "
-                f"found={found} != parsed={parsed}+paper_only={paper}+"
+                f"found={found} != parsed={parsed}+no_txs={no_txs}+"
+                f"paper_only={paper}+"
                 f"unavailable={unavail}+failed={failed} ({classified})"
             )
 
@@ -510,10 +573,16 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
         SELECT ingestion_generation, source, chamber, source_record_id, outcome,
                raw_row_count, accepted_row_count, rejected_row_count
         FROM source_reports
-        WHERE outcome = 'parsed'
+        WHERE raw_row_count IS NULL
+           OR accepted_row_count IS NULL
+           OR rejected_row_count IS NULL
+           OR outcome = 'parsed'
           AND NOT (raw_row_count = accepted_row_count
                    AND accepted_row_count > 0
                    AND rejected_row_count = 0)
+           OR outcome = 'no_txs'
+          AND NOT (raw_row_count = 0 AND accepted_row_count = 0
+                  AND rejected_row_count = 0)
            OR outcome = 'paper_only'
           AND NOT (raw_row_count = 0 AND accepted_row_count = 0
                    AND rejected_row_count = 0)
@@ -529,6 +598,232 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
             f"{record_id}: outcome={outcome} raw={raw} accepted={accepted} "
             f"rejected={rejected}"
         )
+
+    invalid_no_txs_provenance = conn.execute(
+        """
+        SELECT ingestion_generation, source, chamber, source_record_id,
+               artifact_sha256, landing_sha256
+        FROM source_reports
+        WHERE outcome = 'no_txs'
+          AND (
+              COALESCE(lower(chamber), '') <> 'house'
+              OR
+              artifact_sha256 IS NULL
+              OR landing_sha256 IS NULL
+              OR artifact_sha256 IS DISTINCT FROM landing_sha256
+              OR NOT regexp_full_match(artifact_sha256, '[0-9a-f]{64}')
+              OR NOT regexp_full_match(landing_sha256, '[0-9a-f]{64}')
+          )
+        ORDER BY ingestion_generation, source, source_record_id
+        LIMIT 25
+        """
+    ).fetchall()
+    for generation, source, chamber, record_id, artifact, landing in (
+        invalid_no_txs_provenance
+    ):
+        result.violations.append(
+            f"source={source} chamber={chamber} gen={generation} "
+            f"{record_id}: no_txs report has invalid House provenance "
+            f"(artifact={artifact!r}, landing={landing!r})"
+        )
+
+    invalid_parsed_provenance = conn.execute(
+        """
+        SELECT ingestion_generation, source, chamber, source_record_id,
+               artifact_sha256, landing_sha256
+        FROM source_reports
+        WHERE outcome = 'parsed'
+          AND (
+              artifact_sha256 IS NULL
+              OR landing_sha256 IS NULL
+              OR artifact_sha256 IS DISTINCT FROM landing_sha256
+              OR NOT regexp_full_match(artifact_sha256, '[0-9a-f]{64}')
+              OR NOT regexp_full_match(landing_sha256, '[0-9a-f]{64}')
+          )
+        ORDER BY ingestion_generation, source, source_record_id
+        LIMIT 25
+        """
+    ).fetchall()
+    for generation, source, chamber, record_id, artifact, landing in (
+        invalid_parsed_provenance
+    ):
+        result.violations.append(
+            f"source={source} chamber={chamber} gen={generation} "
+            f"{record_id}: parsed report has invalid artifact provenance "
+            f"(artifact={artifact!r}, landing={landing!r})"
+        )
+
+    invalid_nonpaper_fields = conn.execute(
+        """
+        SELECT ingestion_generation, source, chamber, source_record_id, outcome
+        FROM source_reports
+        WHERE outcome <> 'paper_only'
+          AND (paper_artifact_url IS NOT NULL OR paper_artifact_sha256 IS NOT NULL)
+        ORDER BY ingestion_generation, source, source_record_id
+        LIMIT 25
+        """
+    ).fetchall()
+    for generation, source, chamber, record_id, outcome in invalid_nonpaper_fields:
+        result.violations.append(
+            f"source={source} chamber={chamber} gen={generation} "
+            f"{record_id}: outcome={outcome} sets paper artifact fields"
+        )
+
+    paper_reports = conn.execute(
+        """
+        SELECT ingestion_generation, source, chamber, source_record_id,
+               artifact_sha256, landing_sha256, paper_artifact_url,
+               paper_artifact_sha256
+        FROM source_reports
+        WHERE outcome = 'paper_only'
+        ORDER BY ingestion_generation, source, source_record_id
+        LIMIT 25
+        """
+    ).fetchall()
+    for (
+        generation,
+        source,
+        chamber,
+        record_id,
+        artifact,
+        landing,
+        paper_url,
+        paper_sha,
+    ) in paper_reports:
+        invalid_scope = (
+            not isinstance(chamber, str) or chamber.strip().lower() != "senate"
+        )
+        invalid_hashes = (
+            not isinstance(artifact, str)
+            or re.fullmatch(r"[0-9a-f]{64}", artifact) is None
+            or not isinstance(landing, str)
+            or re.fullmatch(r"[0-9a-f]{64}", landing) is None
+            or artifact != landing
+            or not isinstance(paper_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", paper_sha) is None
+        )
+        if invalid_scope or invalid_hashes or not _is_official_paper_url(paper_url):
+            result.violations.append(
+                f"source={source} chamber={chamber} gen={generation} "
+                f"{record_id}: paper_only report has invalid Senate paper "
+                f"provenance (artifact={artifact!r}, landing={landing!r}, "
+                f"paper_sha={paper_sha!r}, paper_url={paper_url!r})"
+            )
+
+    if not transactions_available:
+        return result
+
+    # A report's accepted count must bind to rows from the same source,
+    # chamber, generation, and source record.  A House OCR parse is therefore
+    # not allowed to reconcile against a report accidentally stored as
+    # ``house_pdf`` (or vice versa).
+    report_row_mismatches = conn.execute(
+        """
+        SELECT r.ingestion_generation, r.source, r.chamber,
+               r.source_record_id, r.outcome, r.accepted_row_count,
+               COUNT(t.id) AS actual
+        FROM source_reports r
+        LEFT JOIN transactions t
+          ON t.ingestion_generation = r.ingestion_generation
+         AND t.source = r.source
+         AND lower(t.chamber) = lower(r.chamber)
+         AND t.source_record_id = r.source_record_id
+         AND t.artifact_sha256 IS NOT DISTINCT FROM r.artifact_sha256
+        GROUP BY 1, 2, 3, 4, 5, 6
+        HAVING r.accepted_row_count != COUNT(t.id)
+        ORDER BY 1, 2, 3, 4
+        LIMIT 25
+        """
+    ).fetchall()
+    for generation, source, chamber, record_id, outcome, accepted, actual in (
+        report_row_mismatches
+    ):
+        result.violations.append(
+            f"source={source} chamber={chamber} gen={generation} "
+            f"{record_id}: outcome={outcome} accepted={accepted} "
+            f"persisted={actual}"
+        )
+    if report_row_mismatches:
+        total = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT r.ingestion_generation, r.source, r.chamber,
+                           r.source_record_id
+                    FROM source_reports r
+                    LEFT JOIN transactions t
+                      ON t.ingestion_generation = r.ingestion_generation
+                     AND t.source = r.source
+                     AND lower(t.chamber) = lower(r.chamber)
+                     AND t.source_record_id = r.source_record_id
+                     AND t.artifact_sha256 IS NOT DISTINCT FROM r.artifact_sha256
+                    GROUP BY 1, 2, 3, 4, r.accepted_row_count
+                    HAVING r.accepted_row_count != COUNT(t.id)
+                )
+                """
+            ).fetchone()[0]
+        )
+        if total > len(report_row_mismatches):
+            result.violations.append(
+                f"...and {total - len(report_row_mismatches)} more "
+                "source-report row mismatch(es)"
+            )
+
+    # Conversely, every canonical House/OCR transaction must have a matching
+    # report row.  This catches an inventory accidentally emitted under the
+    # wrong source even when that report advertises accepted_row_count=0.
+    orphan_transactions = conn.execute(
+        """
+        SELECT t.source, t.chamber, t.ingestion_generation,
+               t.source_record_id, COUNT(*) AS rows
+        FROM transactions t
+        LEFT JOIN source_reports r
+          ON r.ingestion_generation = t.ingestion_generation
+         AND r.source = t.source
+         AND lower(r.chamber) = lower(t.chamber)
+         AND r.source_record_id = t.source_record_id
+         AND r.artifact_sha256 IS NOT DISTINCT FROM t.artifact_sha256
+        WHERE t.source IN ('house_pdf', 'gemini_ocr')
+          AND r.source_record_id IS NULL
+        GROUP BY 1, 2, 3, 4
+        ORDER BY 1, 2, 3, 4
+        LIMIT 25
+        """
+    ).fetchall()
+    for source, chamber, generation, record_id, rows in orphan_transactions:
+        result.violations.append(
+            f"source={source} chamber={chamber} gen={generation} "
+            f"{record_id}: {rows} persisted transaction row(s) have no "
+            "matching source report"
+        )
+    if orphan_transactions:
+        total = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT t.source, t.chamber, t.ingestion_generation,
+                           t.source_record_id
+                    FROM transactions t
+                    LEFT JOIN source_reports r
+                      ON r.ingestion_generation = t.ingestion_generation
+                     AND r.source = t.source
+                     AND lower(r.chamber) = lower(t.chamber)
+                     AND r.source_record_id = t.source_record_id
+                     AND r.artifact_sha256 IS NOT DISTINCT FROM t.artifact_sha256
+                    WHERE t.source IN ('house_pdf', 'gemini_ocr')
+                      AND r.source_record_id IS NULL
+                    GROUP BY 1, 2, 3, 4
+                )
+                """
+            ).fetchone()[0]
+        )
+        if total > len(orphan_transactions):
+            result.violations.append(
+                f"...and {total - len(orphan_transactions)} more "
+                "transaction source-report orphan group(s)"
+            )
     return result
 
 
@@ -606,7 +901,8 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
     result = CheckResult(
         "house_generation_activation",
         "complete generations have zero unresolved artifacts; canonical rows "
-        "come from the latest complete generation",
+        "come from the latest complete generation and every artifact has one "
+        "matching House source report",
     )
     if not _table_exists(conn, "house_archive_generations"):
         result.info.append("house_archive_generations table missing; nothing to audit")
@@ -615,6 +911,8 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
         result.violations.append("house_pdf_artifacts table missing")
     if not _table_exists(conn, "pdf_parse_runs"):
         result.violations.append("pdf_parse_runs table missing")
+    if not _table_exists(conn, "source_reports"):
+        result.violations.append("source_reports table missing")
     if result.violations:
         return result
 
@@ -651,6 +949,190 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
                 f"archive {archive_year} generation {generation_id} correctly "
                 f"incomplete ({len(unresolved)} unresolved artifact(s))"
             )
+
+        # A complete House generation must have one source-report row for
+        # every authoritative artifact, including terminal no_txs documents.
+        # Match the artifact digest as well as the document ID so a report
+        # cannot silently bind to a different downloaded document.
+        if parse_status == "complete":
+            artifact_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM house_pdf_artifacts
+                    WHERE archive_year = ? AND generation_id = ?
+                    """,
+                    [archive_year, generation_id],
+                ).fetchone()[0]
+            )
+            report_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM source_reports
+                    WHERE ingestion_generation = ?
+                      AND source IN ('house_pdf', 'gemini_ocr')
+                      AND lower(chamber) = 'house'
+                    """,
+                    [generation_id],
+                ).fetchone()[0]
+            )
+            if report_count != artifact_count:
+                result.violations.append(
+                    f"archive {archive_year} generation {generation_id}: "
+                    f"source_reports={report_count} but authoritative "
+                    f"artifacts={artifact_count}"
+                )
+
+            missing_reports = conn.execute(
+                """
+                SELECT a.doc_id
+                FROM house_pdf_artifacts a
+                LEFT JOIN source_reports r
+                  ON r.ingestion_generation = a.generation_id
+                 AND r.source IN ('house_pdf', 'gemini_ocr')
+                 AND lower(r.chamber) = 'house'
+                 AND r.source_record_id = a.doc_id
+                 AND r.artifact_sha256 IS NOT DISTINCT FROM a.artifact_sha256
+                WHERE a.archive_year = ? AND a.generation_id = ?
+                  AND r.source_record_id IS NULL
+                ORDER BY a.doc_id
+                LIMIT 25
+                """,
+                [archive_year, generation_id],
+            ).fetchall()
+            if missing_reports:
+                preview = ", ".join(str(row[0]) for row in missing_reports)
+                result.violations.append(
+                    f"archive {archive_year} generation {generation_id}: "
+                    f"{len(missing_reports)} authoritative artifact(s) lack "
+                    f"a matching House source report: {preview}"
+                )
+
+            extra_reports = conn.execute(
+                """
+                SELECT r.source, r.source_record_id, r.artifact_sha256
+                FROM source_reports r
+                LEFT JOIN house_pdf_artifacts a
+                  ON a.generation_id = r.ingestion_generation
+                 AND a.doc_id = r.source_record_id
+                 AND a.artifact_sha256 IS NOT DISTINCT FROM r.artifact_sha256
+                WHERE r.ingestion_generation = ?
+                  AND r.source IN ('house_pdf', 'gemini_ocr')
+                  AND lower(r.chamber) = 'house'
+                  AND a.doc_id IS NULL
+                ORDER BY r.source, r.source_record_id
+                LIMIT 25
+                """,
+                [generation_id],
+            ).fetchall()
+            if extra_reports:
+                preview = ", ".join(
+                    f"{source}:{record_id}" for source, record_id, _sha in extra_reports
+                )
+                result.violations.append(
+                    f"archive {archive_year} generation {generation_id}: "
+                    f"{len(extra_reports)} House source report(s) lack a "
+                    f"matching authoritative artifact: {preview}"
+                )
+
+            duplicate_reports = conn.execute(
+                """
+                SELECT source_record_id, COUNT(*) AS n
+                FROM source_reports
+                WHERE ingestion_generation = ?
+                  AND source IN ('house_pdf', 'gemini_ocr')
+                  AND lower(chamber) = 'house'
+                GROUP BY source_record_id
+                HAVING COUNT(*) > 1
+                ORDER BY source_record_id
+                LIMIT 25
+                """,
+                [generation_id],
+            ).fetchall()
+            if duplicate_reports:
+                preview = ", ".join(
+                    f"{record_id}({count})" for record_id, count in duplicate_reports
+                )
+                result.violations.append(
+                    f"archive {archive_year} generation {generation_id}: "
+                    f"duplicate House source reports: {preview}"
+                )
+
+            # Every authoritative artifact must have exactly one terminal
+            # parser run and one report with the same source family and
+            # semantic outcome. Count/doc/artifact coverage alone cannot
+            # detect a zero-row report moved between House parser sources.
+            artifact_rows = conn.execute(
+                """
+                SELECT doc_id, artifact_sha256
+                FROM house_pdf_artifacts
+                WHERE archive_year = ? AND generation_id = ?
+                ORDER BY doc_id
+                """,
+                [archive_year, generation_id],
+            ).fetchall()
+            terminal_runs = conn.execute(
+                """
+                SELECT doc_id, parser_version, status, artifact_sha256
+                FROM pdf_parse_runs
+                WHERE ingestion_generation = ?
+                  AND status IN ('success', 'no_txs')
+                """,
+                [generation_id],
+            ).fetchall()
+            reports = conn.execute(
+                """
+                SELECT source, source_record_id, outcome, artifact_sha256
+                FROM source_reports
+                WHERE ingestion_generation = ?
+                  AND source IN ('house_pdf', 'gemini_ocr')
+                  AND lower(chamber) = 'house'
+                """,
+                [generation_id],
+            ).fetchall()
+            runs_by_artifact: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            for doc_id, parser_version, status, artifact_sha in terminal_runs:
+                if doc_id is None or artifact_sha is None:
+                    continue
+                source = _run_source_for_parser(parser_version)
+                if source is None:
+                    continue
+                outcome = "parsed" if status == "success" else "no_txs"
+                runs_by_artifact.setdefault(
+                    (str(doc_id), str(artifact_sha)), []
+                ).append((source, outcome))
+            reports_by_artifact: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            for source, record_id, outcome, artifact_sha in reports:
+                if record_id is None or artifact_sha is None:
+                    continue
+                reports_by_artifact.setdefault(
+                    (str(record_id), str(artifact_sha)), []
+                ).append((str(source), str(outcome)))
+            for doc_id, artifact_sha in artifact_rows:
+                key = (str(doc_id), str(artifact_sha))
+                run_bindings = runs_by_artifact.get(key, [])
+                report_bindings = reports_by_artifact.get(key, [])
+                if len(run_bindings) != 1:
+                    result.violations.append(
+                        f"archive {archive_year} generation {generation_id}: "
+                        f"artifact {doc_id} has {len(run_bindings)} matching "
+                        "terminal parser run(s)"
+                    )
+                if len(report_bindings) != 1:
+                    result.violations.append(
+                        f"archive {archive_year} generation {generation_id}: "
+                        f"artifact {doc_id} has {len(report_bindings)} matching "
+                        "House source report(s)"
+                    )
+                if len(run_bindings) == 1 and len(report_bindings) == 1:
+                    if run_bindings[0] != report_bindings[0]:
+                        result.violations.append(
+                            f"archive {archive_year} generation {generation_id}: "
+                            f"artifact {doc_id} parser/report binding mismatch: "
+                            f"run={run_bindings[0]} report={report_bindings[0]}"
+                        )
+
 
     # House/OCR rows persisted under a generation must be artifact-bound to a
     # terminal run of the matching parser family.

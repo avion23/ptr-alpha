@@ -97,6 +97,7 @@ class TestPerformance(unittest.TestCase):
             {
                 "AAPL": [100] + [100 + i * 0.5 for i in range(1, len(dates))],
                 "GOOGL": [2000] + [2000 - i * 2 for i in range(1, len(dates))],
+                "SPY": [400 + i * 0.25 for i in range(len(dates))],
             },
             index=dates,
         )

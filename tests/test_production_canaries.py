@@ -77,7 +77,7 @@ def test_house_spcx_canary():
         "2026-07-05"
     )
     source = MagicMock()
-    source.db.get_transactions.return_value = outside_window
+    source.db.get_transactions_by_date_range.return_value = outside_window
     no_buy = run_ticker_analysis(
         TickerAnalysisParams(
             ticker="SPCX",
@@ -139,8 +139,6 @@ def test_senate_cvx_canary():
         source,
         TickerScoringParams(
             year=2026,
-            days_back=28,
-            min_buyers=2,
             as_of_date=as_of,
         ),
     )

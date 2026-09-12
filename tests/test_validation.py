@@ -611,9 +611,10 @@ class TestPurgeAndManifest:
 
 
 def test_cli_validation_grid_counts_are_exact():
-    assert math.prod(len(values) for values in _validation_grid(False).values()) == 18
-    assert math.prod(len(values) for values in _validation_grid(True).values()) == 36
-    assert _validation_grid(False)["lookback_days"] == [28]
+    assert math.prod(len(values) for values in _validation_grid(False).values()) == 6
+    assert math.prod(len(values) for values in _validation_grid(True).values()) == 12
+    assert "lookback_days" not in _validation_grid(False)
+    assert "min_buyers" not in _validation_grid(False)
     assert "scoring_mode" not in _validation_grid(False)
     assert "training_lookback_days" not in _validation_grid(True)
     assert "decay_lambda" not in _validation_grid(True)

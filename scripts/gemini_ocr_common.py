@@ -12,7 +12,7 @@ import tempfile
 from contextlib import contextmanager
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -509,8 +509,6 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
     rejections = defaultdict(int)
     raw_count = len(transactions)
     filing = _strict_date(filing_date)
-    start = filing - timedelta(days=400) if filing else None
-    end = filing + timedelta(days=7) if filing else None
     if not str(member or "").strip() and not str(expected_member or "").strip():
         return [], {"invalid_member": raw_count or 1}
 
@@ -543,7 +541,7 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         if amount_letter not in AMOUNT_MIDPOINTS:
             rejections["invalid_amount"] += 1
             continue
-        if filing and start and end and (parsed_date < start or parsed_date > end):
+        if filing and parsed_date > filing:
             rejections["date_out_of_window"] += 1
             continue
         cleaned = dict(tx)

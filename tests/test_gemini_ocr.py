@@ -75,15 +75,15 @@ def test_validation_has_no_fixed_row_cap_for_large_real_filings():
     assert "row_count_exceeds_cap" not in rejections
 
 
-def test_validation_date_window_drops_bad_rows():
+def test_validation_accepts_delayed_filings_and_rejects_post_filing_trades():
     txs = [_tx(date="01/15/24"), _tx(date="01/01/22"), _tx(date="02/10/24")]
 
     valid, rejections = gemini_ocr_common.validate_transactions(
         "doc-date", "Jane Doe", txs, datetime(2024, 1, 20), "Jane Doe"
     )
 
-    assert [tx["date"] for tx in valid] == ["01/15/24"]
-    assert rejections["date_out_of_window"] == 2
+    assert [tx["date"] for tx in valid] == ["01/15/24", "01/01/22"]
+    assert rejections["date_out_of_window"] == 1
 
 
 def test_validation_accepts_spouse_dc_over_1m_column_k():

@@ -351,7 +351,6 @@ class SnoopingReport:
     significant_dsr: bool
     min_years: float
     max_stat_p_value: float = 1.0
-    deployable: bool = False
     inference_method: str = (
         "calendar_grouped_circular_block_bootstrap_bonferroni_max_stat"
     )
@@ -472,5 +471,4 @@ def analyze_snooping(
         significant_dsr=dsr > 0.95,
         min_years=min_backtest_length(observed_sharpe, alpha=alpha),
         max_stat_p_value=max_stat_p,
-        deployable=False,
     )

@@ -8,8 +8,8 @@ database is the explicit ``--db`` path (a fresh temp DB).
 
 Enforcements:
 * exact NYSE sessions: the window end defaults to the latest completed NYSE
-  session (``previous_nyse_session(today)``) and an explicit ``--end`` must be
-  a session in the NYSE calendar;
+  session (``previous_nyse_session(today - timedelta(days=1))``) and an
+  explicit ``--end`` must be a session in the NYSE calendar;
 * nonpositive quarantine: non-finite, zero, and negative closes are rejected
   before persistence and the persisted temp DB is re-verified afterwards;
 * ticker/asset eligibility: only syntax-valid, non-quarantined, non-suspicious,
@@ -38,7 +38,7 @@ import logging
 import re
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -114,9 +114,9 @@ class RefreshReport:
 
 
 def refresh_end_date(today: date | None = None) -> date:
-    """Latest completed market session: the most recent NYSE session on or
-    before today. A weekend or market holiday never yields a "today" end."""
-    return previous_nyse_session(today or date.today()).date()
+    """Return the latest completed NYSE session before the supplied day."""
+    reference_day = (today or date.today()) - timedelta(days=1)
+    return previous_nyse_session(reference_day).date()
 
 
 def _clean_asset(value: object) -> str | None:

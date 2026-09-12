@@ -26,7 +26,7 @@ import argparse
 import hashlib
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -102,7 +102,7 @@ def _stale_tickers(coverage_by_ticker: dict, end: date, max_staleness_days: int)
 def _snapshot_end_date(end: date | None) -> date:
     if end is not None:
         return end
-    return previous_nyse_session(date.today()).date()
+    return previous_nyse_session(date.today() - timedelta(days=1)).date()
 
 
 def _write_prices_parquet(prices: pd.DataFrame, path: Path) -> None:

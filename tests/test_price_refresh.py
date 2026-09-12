@@ -97,11 +97,32 @@ class EndDateTests(unittest.TestCase):
             date(2025, 12, 31),
         )
 
-    def test_session_day_is_kept(self):
+    def test_session_day_rolls_back_to_latest_completed_session(self):
         self.assertEqual(
             refresh_prices.refresh_end_date(date(2026, 8, 7)),
-            date(2026, 8, 7),
+            date(2026, 8, 6),
         )
+
+    def test_snapshot_default_rolls_back_across_calendar_boundaries(self):
+        cases = (
+            # Friday NYSE session: do not include the in-progress session.
+            (date(2026, 8, 7), date(2026, 8, 6)),
+            # Weekend: use the prior Friday session.
+            (date(2026, 8, 9), date(2026, 8, 7)),
+            # New Year's Day holiday: use the prior year's final session.
+            (date(2026, 1, 1), date(2025, 12, 31)),
+        )
+        for today, expected in cases:
+            with self.subTest(today=today):
+                with patch.object(snapshot_prices, "date") as mocked_date:
+                    mocked_date.today.return_value = today
+                    self.assertEqual(
+                        snapshot_prices._snapshot_end_date(None), expected
+                    )
+
+    def test_snapshot_explicit_end_is_unchanged(self):
+        explicit = date(2026, 8, 7)
+        self.assertEqual(snapshot_prices._snapshot_end_date(explicit), explicit)
 
 
 class RefreshPipelineTests(unittest.TestCase):

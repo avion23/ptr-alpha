@@ -61,11 +61,16 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
             pass
 
     class FakeQuery:
+        def __init__(self, rows=()):
+            self.rows = list(rows)
+
         def fetchall(self):
-            return []
+            return self.rows
 
     class FakeConnection:
-        def execute(self, *_args):
+        def execute(self, sql, *_args):
+            if "SELECT DISTINCT doc_id" in sql:
+                return FakeQuery([("failed",)])
             return FakeQuery()
 
     class FakeParseRuns:
@@ -96,8 +101,10 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         def __exit__(self, *_args):
             return False
 
-        def map(self, worker, paths):
-            return [worker(path) for path in paths]
+        def imap_unordered(self, worker, paths, chunksize=1):
+            assert chunksize == 1
+            for path in paths:
+                yield worker(path)
 
     fallback_rows = [
         {
@@ -123,8 +130,8 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         rebuild_staged,
         "_filter_existing_pdfs",
         lambda _ptrs, _pdf_dir: (
-            [fallback_path, failed_path],
-            pd.DataFrame({"DocID": ["fallback", "failed"]}),
+            [failed_path, fallback_path],
+            pd.DataFrame({"DocID": ["failed", "fallback"]}),
         ),
     )
     monkeypatch.setattr(rebuild_staged, "_build_member_lookup", lambda _docs: {})

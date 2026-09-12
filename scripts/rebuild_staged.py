@@ -383,29 +383,69 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
         if not pdf_paths:
             return {"attempted": 0, "skipped_cached": len(cached)}
 
+        # Do not let a few repeatedly expensive OCR failures starve documents
+        # that have never been attempted. Terminal successes/no_txs were
+        # removed above; push all remaining previously attempted nonterminal
+        # docs to the end while preserving deterministic doc-id order within
+        # each group. A later resumable invocation will retry them after making
+        # forward progress on unseen artifacts.
+        previously_attempted = {
+            str(row[0])
+            for row in db.conn.execute(
+                """
+                SELECT DISTINCT doc_id
+                FROM pdf_parse_runs
+                WHERE year = ? AND ingestion_generation = ?
+                  AND status NOT IN ('success', 'no_txs')
+                """,
+                [year, ingestion_generation],
+            ).fetchall()
+        }
+        order = sorted(
+            range(len(pdf_paths)),
+            key=lambda index: (
+                pdf_paths[index].stem in previously_attempted,
+                pdf_paths[index].stem,
+            ),
+        )
+        pdf_paths = [pdf_paths[index] for index in order]
+        existing_docs = existing_docs.iloc[order].reset_index(drop=True)
+
         member_lookup = _build_member_lookup(existing_docs)
         settings = _settings_for(staging)
         workers = settings.data.get_workers()
-        batch_size = max(16, workers * 4)
+        persist_batch_size = max(4, workers)
         attempted = 0
         persisted_transactions = 0
         by_status: dict[str, int] = {}
+
+        def persist_completed(results: list) -> None:
+            nonlocal attempted, persisted_transactions
+            if not results:
+                return
+            batch = _persist_house_parse_batch(
+                db,
+                year=year,
+                ingestion_generation=ingestion_generation,
+                member_lookup=member_lookup,
+                artifact_hashes=artifact_hashes,
+                results=results,
+            )
+            attempted += int(batch["attempted"])
+            persisted_transactions += int(batch["persisted_transactions"])
+            for status, count in batch["parse_run_statuses"].items():
+                by_status[status] = by_status.get(status, 0) + int(count)
+
+        completed: list = []
         with Pool(workers) as pool:
-            for offset in range(0, len(pdf_paths), batch_size):
-                batch_paths = pdf_paths[offset : offset + batch_size]
-                results = pool.map(_tolerant_parse_worker, batch_paths)
-                batch = _persist_house_parse_batch(
-                    db,
-                    year=year,
-                    ingestion_generation=ingestion_generation,
-                    member_lookup=member_lookup,
-                    artifact_hashes=artifact_hashes,
-                    results=results,
-                )
-                attempted += int(batch["attempted"])
-                persisted_transactions += int(batch["persisted_transactions"])
-                for status, count in batch["parse_run_statuses"].items():
-                    by_status[status] = by_status.get(status, 0) + int(count)
+            for result in pool.imap_unordered(
+                _tolerant_parse_worker, pdf_paths, chunksize=1
+            ):
+                completed.append(result)
+                if len(completed) >= persist_batch_size:
+                    persist_completed(completed)
+                    completed = []
+            persist_completed(completed)
 
         return {
             "attempted": attempted,

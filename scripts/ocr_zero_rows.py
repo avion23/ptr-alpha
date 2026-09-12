@@ -15,6 +15,7 @@ import time
 import duckdb
 from pathlib import Path
 
+from analyzer.database import Database
 from scripts.gemini_ocr_common import (
     GEMINI_PARSER_VERSION,
     MODEL,
@@ -144,6 +145,37 @@ def get_ocr_work_items(
     if require_schema and not schema_ready:
         require_ocr_schema(conn)
     base = Path(data_dir) if data_dir is not None else Path(db_path).parent
+    if schema_ready and year is not None:
+        conn.close()
+        db = Database(db_path, read_only=True)
+        try:
+            generation = db.get_latest_house_generation(year)
+            scoped_ptrs = 0
+            if generation is not None:
+                scoped_ptrs = int(
+                    db.conn.execute(
+                        """
+                        SELECT COUNT(*) FROM house_generation_metadata
+                        WHERE archive_year = ? AND generation_id = ?
+                          AND filing_type = 'P'
+                        """,
+                        [year, generation],
+                    ).fetchone()[0]
+                )
+            if generation is not None and scoped_ptrs > 0:
+                unresolved = db.get_unresolved_house_doc_ids(year, generation)
+                return [
+                    (
+                        doc_id,
+                        year,
+                        str(base / str(year) / "pdfs" / f"{doc_id}.pdf"),
+                    )
+                    for doc_id in unresolved
+                ]
+        finally:
+            db.close()
+        conn = duckdb.connect(db_path, read_only=True)
+
     if not schema_ready:
         legacy_rows = conn.execute(
             """
@@ -1077,6 +1109,21 @@ def record_parse_run(
     artifact_sha256: str | None = None,
     ingestion_generation: str | None = None,
 ):
+    identity = [
+        str(doc_id),
+        parser_version,
+        artifact_sha256,
+        ingestion_generation,
+    ]
+    conn.execute(
+        """
+        DELETE FROM pdf_parse_runs
+        WHERE doc_id = ? AND parser_version = ?
+          AND artifact_sha256 IS NOT DISTINCT FROM ?
+          AND ingestion_generation IS NOT DISTINCT FROM ?
+        """,
+        identity,
+    )
     conn.execute(
         """
         INSERT INTO pdf_parse_runs (
@@ -1084,7 +1131,7 @@ def record_parse_run(
             raw_row_count, transaction_count, error_message,
             artifact_sha256, ingestion_generation
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
+        """,
         [
             str(doc_id),
             year,
@@ -1297,6 +1344,52 @@ def insert_transactions(
             )
         columns = OCR_INSERT_COLUMNS
         conn.execute("BEGIN TRANSACTION")
+        invalid_house_rows = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM transactions
+                WHERE source = 'house_pdf'
+                  AND doc_id = ?
+                  AND ingestion_generation = ?
+                  AND artifact_sha256 = ?
+                  AND (
+                      transaction_date IS NULL
+                      OR disclosure_date IS NULL
+                      OR transaction_date > disclosure_date
+                      OR chamber IS NULL OR TRIM(chamber) = ''
+                      OR source_record_id IS NULL OR TRIM(source_record_id) = ''
+                      OR source_row_id IS NULL OR TRIM(source_row_id) = ''
+                      OR official_filing_date IS NULL
+                  )
+                """,
+                [str(doc_id), ingestion_generation, artifact_sha256],
+            ).fetchone()[0]
+        )
+        if invalid_house_rows:
+            conn.execute(
+                """
+                DELETE FROM transactions
+                WHERE source = 'house_pdf'
+                  AND doc_id = ?
+                  AND ingestion_generation = ?
+                  AND artifact_sha256 = ?
+                """,
+                [str(doc_id), ingestion_generation, artifact_sha256],
+            )
+            conn.execute(
+                """
+                UPDATE pdf_parse_runs
+                SET status = 'invalidated', transaction_count = 0,
+                    error_message = 'superseded by validated gemini_ocr fallback after semantic validation failure'
+                WHERE doc_id = ?
+                  AND ingestion_generation = ?
+                  AND artifact_sha256 = ?
+                  AND LOWER(COALESCE(parser_version, '')) NOT LIKE '%gemini%'
+                  AND status IN ('success', 'no_txs')
+                """,
+                [str(doc_id), ingestion_generation, artifact_sha256],
+            )
         identity_columns = [
             "source",
             "chamber",

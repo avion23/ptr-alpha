@@ -580,6 +580,9 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         if filing and parsed_date > filing:
             rejections["date_out_of_window"] += 1
             continue
+        if notification_date is not None and notification_date < parsed_date:
+            rejections["notification_before_transaction"] += 1
+            continue
         cleaned = dict(tx)
         cleaned.update(
             member=effective_member,

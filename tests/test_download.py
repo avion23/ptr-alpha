@@ -178,6 +178,7 @@ def test_parse_persistence_records_house_provenance_and_artifact_hash(tmp_path):
                 "strike_price": None,
                 "expiry_date": None,
                 "asset_description": "Apple Inc.",
+                "source_row_id": "pdfplumber:r1",
             }
         ],
         ["pdfplumber", "won:pdfplumber"],

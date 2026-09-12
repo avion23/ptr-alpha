@@ -4,6 +4,7 @@ import queue
 
 import pytest
 import duckdb
+import pandas as pd
 
 from analyzer.database import Database
 from scripts import gemini_ocr_common
@@ -84,6 +85,18 @@ def test_validation_accepts_delayed_filings_and_rejects_post_filing_trades():
 
     assert [tx["date"] for tx in valid] == ["01/15/24", "01/01/22"]
     assert rejections["date_out_of_window"] == 1
+
+
+def test_validation_rejects_notification_before_transaction():
+    tx = _tx(date="01/15/24")
+    tx["notif_date"] = "01/14/24"
+
+    valid, rejections = gemini_ocr_common.validate_transactions(
+        "doc-notification", "Jane Doe", [tx], datetime(2024, 1, 20), "Jane Doe"
+    )
+
+    assert valid == []
+    assert rejections == {"notification_before_transaction": 1}
 
 
 def test_validation_accepts_spouse_dc_over_1m_column_k():
@@ -439,8 +452,76 @@ def test_insert_transactions_sets_source_and_is_idempotent(tmp_path):
     con.close()
 
     assert rows == [("Jane Doe", "AAPL", "Apple Inc. (AAPL)", "gemini_ocr")]
-    assert len(parse_runs) == 2
-    assert parse_runs[-1] == (gemini_ocr_common.GEMINI_PARSER_VERSION, "success", 1, 1)
+    assert parse_runs == [
+        (gemini_ocr_common.GEMINI_PARSER_VERSION, "success", 1, 1)
+    ]
+
+
+def test_validated_ocr_replaces_semantically_invalid_deterministic_rows(tmp_path):
+    db_path = tmp_path / "replace-invalid.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) "
+        "VALUES ('replace-invalid', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.upsert_transactions(
+        pd.DataFrame([{
+            "doc_id": "replace-invalid",
+            "member": "Jane Doe",
+            "ticker": "AAPL",
+            "transaction_date": datetime(2024, 1, 21),
+            "disclosure_date": datetime(2024, 1, 20),
+            "transaction_type": "Purchase",
+            "chamber": "house",
+            "source_record_id": "replace-invalid",
+            "source_row_id": "pdftotext:r1",
+            "official_filing_date": datetime(2024, 1, 20),
+            "ingestion_generation": "test-house-generation",
+            "artifact_sha256": "test-artifact-sha256",
+        }]),
+        source="house_pdf",
+    )
+    db.upsert_parse_run(
+        doc_id="replace-invalid",
+        year=2024,
+        parser_version="v5-deterministic",
+        status="success",
+        engines_attempted="pdftotext",
+        raw_row_count=1,
+        transaction_count=1,
+        artifact_sha256="test-artifact-sha256",
+        ingestion_generation="test-house-generation",
+    )
+    db.close()
+
+    assert (
+        _insert_transactions(
+            "replace-invalid",
+            2024,
+            "Jane Doe",
+            [_tx()],
+            db_path=str(db_path),
+        )
+        == 1
+    )
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    rows = con.execute(
+        "SELECT source, transaction_date FROM transactions "
+        "WHERE doc_id='replace-invalid' ORDER BY source"
+    ).fetchall()
+    runs = con.execute(
+        "SELECT parser_version, status, transaction_count FROM pdf_parse_runs "
+        "WHERE doc_id='replace-invalid' ORDER BY parser_version"
+    ).fetchall()
+    con.close()
+
+    assert rows == [("gemini_ocr", datetime(2024, 1, 15).date())]
+    assert runs == [
+        ("v5-deterministic", "invalidated", 0),
+        (gemini_ocr_common.GEMINI_PARSER_VERSION, "success", 1),
+    ]
 
 
 def test_insert_preserves_repeated_lots_with_distinct_source_rows(tmp_path):

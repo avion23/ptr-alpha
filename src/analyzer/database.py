@@ -556,15 +556,62 @@ class Database:
               ON a.archive_year = m.archive_year
              AND a.generation_id = m.generation_id
              AND a.doc_id = m.doc_id
-            LEFT JOIN pdf_parse_runs p
-              ON p.doc_id = a.doc_id
-             AND p.artifact_sha256 = a.artifact_sha256
-             AND p.ingestion_generation = a.generation_id
-             AND p.status IN ('success', 'no_txs')
             WHERE m.archive_year = ? AND m.generation_id = ?
               AND m.filing_type = 'P'
-            GROUP BY m.doc_id
-            HAVING COUNT(a.doc_id) = 0 OR COUNT(p.doc_id) = 0
+              AND (
+                a.doc_id IS NULL
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM pdf_parse_runs p
+                    WHERE p.doc_id = a.doc_id
+                      AND p.artifact_sha256 = a.artifact_sha256
+                      AND p.ingestion_generation = a.generation_id
+                      AND p.status IN ('success', 'no_txs')
+                      AND COALESCE(p.transaction_count, 0) = (
+                          SELECT COUNT(*)
+                          FROM transactions t
+                          WHERE t.doc_id = a.doc_id
+                            AND t.artifact_sha256 = a.artifact_sha256
+                            AND t.ingestion_generation = a.generation_id
+                            AND t.source = CASE
+                                WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                                THEN 'gemini_ocr'
+                                ELSE 'house_pdf'
+                            END
+                      )
+                      AND (
+                          p.status = 'no_txs'
+                          OR (
+                              COALESCE(p.transaction_count, 0) > 0
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM transactions t
+                                  WHERE t.doc_id = a.doc_id
+                                    AND t.artifact_sha256 = a.artifact_sha256
+                                    AND t.ingestion_generation = a.generation_id
+                                    AND t.source = CASE
+                                        WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                                        THEN 'gemini_ocr'
+                                        ELSE 'house_pdf'
+                                    END
+                                    AND (
+                                        t.transaction_date IS NULL
+                                        OR t.disclosure_date IS NULL
+                                        OR t.transaction_date > t.disclosure_date
+                                        OR (
+                                            t.notification_date IS NOT NULL
+                                            AND t.notification_date < t.transaction_date
+                                        )
+                                        OR t.chamber IS NULL OR TRIM(t.chamber) = ''
+                                        OR t.source_record_id IS NULL OR TRIM(t.source_record_id) = ''
+                                        OR t.source_row_id IS NULL OR TRIM(t.source_row_id) = ''
+                                        OR t.official_filing_date IS NULL
+                                    )
+                              )
+                          )
+                      )
+                )
+              )
             ORDER BY m.doc_id
             """,
             [archive_year, generation_id],

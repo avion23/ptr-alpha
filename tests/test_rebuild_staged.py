@@ -1,11 +1,23 @@
 """Regression tests for the staged rebuild parser boundary."""
 
 import json
+from datetime import date
 from types import SimpleNamespace
 from typing import cast
 
 import pandas as pd
 import pytest
+
+
+def test_required_house_scope_matches_production_inputs_not_full_archive():
+    from scripts import rebuild_staged
+
+    required = set(rebuild_staged.REQUIRED_HOUSE_YEARS)
+    assert set(range(2021, 2026)).issubset(required)
+    assert date.today().year in required
+    assert max(2015, date.today().year - 1) in required
+    assert 2015 not in required
+    assert required.issubset(set(rebuild_staged.HOUSE_YEARS))
 
 
 def test_senate_ingest_rejects_generation_provenance_rewrite(tmp_path):
@@ -150,7 +162,9 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
     fallback_rows = [
         {
             "doc_id": "fallback",
+            "transaction_date": pd.Timestamp("2026-06-20"),
             "disclosure_date": pd.Timestamp("2026-06-26"),
+            "source_row_id": "pdftotext:r1",
             "asset_description": "Apple Inc. (AAPL)",
         }
     ]

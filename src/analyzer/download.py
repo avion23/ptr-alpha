@@ -40,6 +40,39 @@ logger = logging.getLogger(__name__)
 _PARSE_VERSION = "v5-deterministic"
 
 
+def _invalid_consolidated_house_docs(df: pd.DataFrame) -> dict[str, list[str]]:
+    """Return document-level semantic failures that must fail closed.
+
+    A deterministic parser result is terminal only when every persisted row has
+    executable chronology and stable source-row identity. One bad row invalidates
+    the document outcome; callers must not silently drop it and mark the PDF
+    successful.
+    """
+    if df.empty:
+        return {}
+    required = {"doc_id", "transaction_date", "disclosure_date", "source_row_id"}
+    missing = required - set(df.columns)
+    if missing:
+        return {"<batch>": [f"missing columns: {sorted(missing)}"]}
+
+    failures: dict[str, set[str]] = {}
+
+    def add(mask: pd.Series, reason: str) -> None:
+        for doc_id in df.loc[mask, "doc_id"].astype(str).unique():
+            failures.setdefault(doc_id, set()).add(reason)
+
+    tx_date = pd.to_datetime(df["transaction_date"], errors="coerce")
+    disclosure = pd.to_datetime(df["disclosure_date"], errors="coerce")
+    add(tx_date.isna() | disclosure.isna(), "missing chronology date")
+    add(tx_date.notna() & disclosure.notna() & (tx_date > disclosure), "transaction after disclosure")
+    source_row = df["source_row_id"]
+    add(
+        source_row.isna() | source_row.map(lambda value: not str(value).strip() if pd.notna(value) else True),
+        "missing source_row_id",
+    )
+    return {doc_id: sorted(reasons) for doc_id, reasons in failures.items()}
+
+
 @dataclass(frozen=True, slots=True)
 class HouseFetchSummary:
     archive_year: int
@@ -662,6 +695,15 @@ class HouseTransactionSource(TransactionSource):
             parse_attempts.append((doc_id, engines_attempted))
 
         df = consolidate_transactions(pdf_transactions, member_lookup)
+        invalid_docs = _invalid_consolidated_house_docs(df)
+        batch_failure = invalid_docs.pop("<batch>", None)
+        if batch_failure:
+            invalid_docs = {
+                doc_id: batch_failure
+                for doc_id, _engines in parse_attempts
+            }
+        if invalid_docs and not df.empty:
+            df = df[~df["doc_id"].astype(str).isin(invalid_docs)].copy()
         transaction_counts = (
             df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
         )
@@ -681,12 +723,21 @@ class HouseTransactionSource(TransactionSource):
                 doc_id=doc_id,
                 year=year,
                 parser_version=_PARSE_VERSION,
-                status="success" if transaction_counts.get(doc_id, 0) else "zero_rows",
+                status=(
+                    "error"
+                    if doc_id in invalid_docs
+                    else "success"
+                    if transaction_counts.get(doc_id, 0)
+                    else "zero_rows"
+                ),
                 engines_attempted=",".join(engines_attempted),
                 raw_row_count=raw_transaction_counts.get(doc_id, 0),
                 # Database.replace_transactions_for_docs overwrites this with
                 # the actual persisted count inside the replacement transaction.
                 transaction_count=0,
+                error_message=(
+                    "; ".join(invalid_docs[doc_id]) if doc_id in invalid_docs else None
+                ),
                 artifact_sha256=artifact_hashes.get(doc_id),
                 ingestion_generation=ingestion_generation,
             )

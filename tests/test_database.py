@@ -655,13 +655,22 @@ class TestTransactions(DatabaseTestCase):
             "transaction_date": date(2024, 1, 2),
             "disclosure_date": date(2024, 1, 3),
             "transaction_type": "Purchase",
+            "chamber": "house",
+            "source_record_id": "generation-doc",
+            "source_row_id": "pdfplumber:r1",
+            "official_filing_date": date(2024, 1, 3),
         }
         self.db.upsert_transactions(
             pd.DataFrame([{**base, "ticker": "OLD", "ingestion_generation": "g1"}]),
             source="house_pdf",
         )
         self.db.upsert_transactions(
-            pd.DataFrame([{**base, "ticker": "NEW", "ingestion_generation": "g2"}]),
+            pd.DataFrame([{
+                **base,
+                "ticker": "NEW",
+                "ingestion_generation": "g2",
+                "artifact_sha256": "artifact-g2",
+            }]),
             source="house_pdf",
         )
         self.db.upsert_transactions(
@@ -743,6 +752,23 @@ class TestTransactions(DatabaseTestCase):
             artifact_sha256="artifact-present",
             ingestion_generation="g-partial",
         )
+        self.db.upsert_transactions(
+            pd.DataFrame([{
+                "doc_id": "present-doc",
+                "member": "Jane Doe",
+                "ticker": "AAPL",
+                "transaction_date": date(2024, 1, 2),
+                "disclosure_date": date(2024, 1, 3),
+                "transaction_type": "Purchase",
+                "chamber": "house",
+                "source_record_id": "present-doc",
+                "source_row_id": "pdfplumber:r1",
+                "official_filing_date": date(2024, 1, 3),
+                "ingestion_generation": "g-partial",
+                "artifact_sha256": "artifact-present",
+            }]),
+            source="house_pdf",
+        )
 
         self.assertEqual(
             self.db.get_unresolved_house_doc_ids(2024, "g-partial"),
@@ -805,6 +831,10 @@ class TestTransactions(DatabaseTestCase):
                 "transaction_date": date(2024, 1, 2),
                 "disclosure_date": date(2024, 1, 3),
                 "transaction_type": "Purchase",
+                "chamber": "house",
+                "source_record_id": "same-hash",
+                "source_row_id": "pdfplumber:r1",
+                "official_filing_date": date(2024, 1, 3),
                 "ingestion_generation": "g1",
                 "artifact_sha256": "artifact-sha",
             }]),

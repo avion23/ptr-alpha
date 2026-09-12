@@ -54,6 +54,7 @@ from analyzer.download import (  # noqa: E402
     _build_member_lookup,
     _engine_error_detail,
     _filter_existing_pdfs,
+    _invalid_consolidated_house_docs,
     _tolerant_parse_pdf_worker as _production_tolerant_parse_worker,
     _validated_pdf_sha256,
     preserve_existing_fields,
@@ -69,6 +70,18 @@ _parse_pdf_worker = _parser_cascade._parse_pdf_worker
 ParserCascadeError = _parser_cascade.ParserCascadeError
 
 HOUSE_YEARS = list(range(2015, date.today().year + 1))
+# Production requires a complete current House generation. Historical House
+# completeness is required only for the years consumed by the fixed validation
+# window, plus the immediately prior year needed by a cross-year 28-day live
+# disclosure window. Older archives may remain staged/incomplete without
+# blocking promotion because they are not production inputs.
+VALIDATION_HOUSE_YEARS = tuple(range(2021, 2026))
+REQUIRED_HOUSE_YEARS = tuple(
+    sorted(
+        set(VALIDATION_HOUSE_YEARS)
+        | {max(2015, date.today().year - 1), date.today().year}
+    )
+)
 SENATE_START = date(2024, 1, 1)
 PRICE_START = date(2014, 1, 1)
 
@@ -305,6 +318,12 @@ def _persist_house_parse_batch(
         )
 
     df = consolidate_transactions(pdf_transactions, member_lookup)
+    invalid_docs = _invalid_consolidated_house_docs(df)
+    batch_failure = invalid_docs.pop("<batch>", None)
+    if batch_failure:
+        invalid_docs = {doc_id: batch_failure for doc_id, _, _ in parse_attempts}
+    if invalid_docs and not df.empty:
+        df = df[~df["doc_id"].astype(str).isin(invalid_docs)].copy()
     transaction_counts = (
         df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
     )
@@ -323,6 +342,9 @@ def _persist_house_parse_batch(
         count = transaction_counts.get(doc_id, 0)
         if error_message is not None:
             status = "error"
+        elif doc_id in invalid_docs:
+            status = "error"
+            error_message = "; ".join(invalid_docs[doc_id])
         elif count:
             status = "success"
         else:
@@ -939,10 +961,11 @@ def verify(args) -> None:
             checks,
             "rebuild_scope_present",
             isinstance(scope, dict)
-            and scope_years == list(HOUSE_YEARS)
+            and isinstance(scope_years, list)
+            and set(REQUIRED_HOUSE_YEARS).issubset(set(scope_years))
             and bool(scope.get("senate_start"))
             and bool(scope.get("price_start")),
-            f"scope={scope}",
+            f"scope={scope} required_house_years={list(REQUIRED_HOUSE_YEARS)}",
         )
         house_manifest = manifest.get("house")
         try:
@@ -954,14 +977,15 @@ def verify(args) -> None:
         _check(
             checks,
             "house_scope_declared",
-            declared_house_years == set(HOUSE_YEARS),
-            f"declared={sorted(declared_house_years)} expected={HOUSE_YEARS}",
+            set(REQUIRED_HOUSE_YEARS).issubset(declared_house_years),
+            f"declared={sorted(declared_house_years)} required={list(REQUIRED_HOUSE_YEARS)}",
         )
 
-        # House completeness is bound to the declared generation and the
-        # artifact-level terminal predicate in
-        # Database.get_unresolved_house_doc_ids.
-        for year in HOUSE_YEARS:
+        # Current House completeness and the historical years actually consumed
+        # by production validation are bound to the declared generation and the
+        # artifact-level terminal predicate in Database.get_unresolved_house_doc_ids.
+        # Older staged archives are diagnostics only and cannot block promotion.
+        for year in REQUIRED_HOUSE_YEARS:
             entry = (
                 house_manifest.get(str(year))
                 if isinstance(house_manifest, dict)
@@ -1213,9 +1237,9 @@ def verify(args) -> None:
             f"missing={missing_identity[:10]}",
         )
 
-        # 5. House source reports are checked for each declared complete
+        # 5. House source reports are checked for each required complete
         # generation; an incomplete generation cannot authorize its inventory.
-        for year in HOUSE_YEARS:
+        for year in REQUIRED_HOUSE_YEARS:
             house = (
                 house_manifest.get(str(year))
                 if isinstance(house_manifest, dict)
@@ -2499,6 +2523,7 @@ def _bootstrap(args) -> None:
         "git_sha": _git_sha(),
         "scope": {
             "house_years": HOUSE_YEARS,
+            "required_house_years": list(REQUIRED_HOUSE_YEARS),
             "senate_start": str(SENATE_START),
             "price_start": str(PRICE_START),
         },

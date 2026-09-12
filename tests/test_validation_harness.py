@@ -6,13 +6,10 @@ validation contract under test:
 
 * no-trade dates earn a zero cash return and keep identical SPY benchmark
   support (no date is silently dropped);
-* one per-date net-alpha statistic drives inference, correction, selection,
-  and verdict;
-* no-survivor sweeps fail closed (descriptive-only, no fallback);
-* consensus is identity-invariant and its control is non-gating;
-* retrospective evaluations are repeatable and require no bookkeeping file;
-* the test window is labeled retrospective diagnostics only and the locked
-  final phase is never queried or consumed.
+* one per-date net-alpha statistic drives inference and family correction;
+* no-survivor sweeps report unsupported sensitivities without a fallback;
+* every declared sensitivity is reported on both purged phases;
+* repeated evaluations are deterministic.
 """
 
 from __future__ import annotations
@@ -36,8 +33,6 @@ MEMBERS = ["ALICE", "BOB", "CAROL"]
 GRID = {
     "horizon": [60],
     "frequency_days": [30],
-    "lookback_days": [28],
-    "min_buyers": [2],
     "top_n": [5],
 }
 TRAIN_START = date(2022, 1, 1)
@@ -140,10 +135,11 @@ class TestNoTradeCashReturns:
         prices = _load_prices(db_path)
         out = run_fixture_validation(db_path)
         train = out["train"]
-        assert train["status"] == "descriptive_only"
-        assert train["no_trade_dates"] >= 2
-        assert train["dates_evaluated"] == train["scheduled_dates"]
-        assert train["benchmark_dates"] == train["scheduled_dates"]
+        assert train["status"] == "not_supported"
+        train_best = train["descriptive_best"]
+        assert train_best["no_trade_dates"] >= 2
+        assert train_best["dates_evaluated"] == train_best["scheduled_dates"]
+        assert train_best["benchmark_dates"] == train_best["scheduled_dates"]
 
         # Reconstruct the per-date series with the same calendar and verify a
         # no-trade date contributes exactly -(SPY return): zero cash return.
@@ -162,7 +158,7 @@ class TestNoTradeCashReturns:
             end_date=date(2023, 5, 1),
             horizon=60,
             lookback_days=28,
-            min_buyers=2,
+            min_buyers=3,
             top_n=5,
             frequency_days=30,
         )
@@ -185,10 +181,11 @@ class TestIdenticalSpySupportAndPerDateAlpha:
         db_path = build_fixture_db(tmp_path)
         out = run_fixture_validation(db_path)
         train = out["train"]
-        assert train["dates_evaluated"] == train["scheduled_dates"]
-        assert train["benchmark_dates"] == train["scheduled_dates"]
-        assert train["coverage_pct"] == 100.0
-        assert train["no_trade_dates"] == 0
+        train_best = train["descriptive_best"]
+        assert train_best["dates_evaluated"] == train_best["scheduled_dates"]
+        assert train_best["benchmark_dates"] == train_best["scheduled_dates"]
+        assert train_best["coverage_pct"] == 100.0
+        assert train_best["no_trade_dates"] == 0
         assert out["primary_metric"] == PRIMARY_METRIC == "mean_per_date_net_alpha"
 
         # The primary statistic is the mean of the per-date net-alpha series.
@@ -209,12 +206,12 @@ class TestIdenticalSpySupportAndPerDateAlpha:
             end_date=date(2023, 5, 1),
             horizon=60,
             lookback_days=28,
-            min_buyers=2,
+            min_buyers=3,
             top_n=5,
             frequency_days=30,
         )
         result, per_date = _backtest_core(all_tx, prices, params)
-        assert len(per_date) == train["dates_evaluated"]
+        assert len(per_date) == train_best["dates_evaluated"]
         assert result.overall_alpha == pytest.approx(float(per_date.mean()), abs=1e-4)
         assert result.overall_alpha > 0
         assert result.scorer_provenance == CONSENSUS_SCORER_PROVENANCE
@@ -226,7 +223,7 @@ class TestIdenticalSpySupportAndPerDateAlpha:
             all_tx,
             as_of_date=as_of,
             lookback_days=28,
-            min_buyers=2,
+            min_buyers=3,
             top_n=5,
         )
         evaluated = analysis.evaluate_backtest(recs, prices, as_of, 60)
@@ -240,36 +237,36 @@ class TestIdenticalSpySupportAndPerDateAlpha:
 
 
 class TestNoSurvivorFailClosed:
-    def test_flat_market_has_no_survivor_and_no_fallback(self, tmp_path):
+    def test_flat_market_has_no_supported_sensitivity_and_no_fallback(self, tmp_path):
         db_path = build_fixture_db(tmp_path, drift=0.0)
         out = run_fixture_validation(db_path)
-        assert out["status"] == "no_deployable_config"
-        assert out["verdict"] == "not_robust"
-        assert out["selected_config"] is None
-        assert out["test"]["status"] == "not_run_without_corrected_train_survivor"
-        assert out["train"]["status"] == "descriptive_only"
-        assert out["train"]["label"] == "not_selected_for_deployment"
-        assert out["correction"]["failure_reason"] == "no_dependence_safe_survivor"
-        assert out["correction"]["n_statistical_survivors"] == 0
+        assert out["status"] == "completed"
+        assert out["support_status"] == "not_supported"
+        assert out["train"]["status"] == "not_supported"
+        assert out["test"]["status"] == "not_supported"
+        assert out["train"]["failure_reason"] == "no_dependence_safe_survivor"
+        assert out["test"]["failure_reason"] == "no_dependence_safe_survivor"
+        assert out["supported_sensitivities"] == {"train": [], "test": []}
 
 
-class TestConsensusIdentityInvariance:
-    def test_consensus_identity_control_is_non_gating(self, tmp_path):
+class TestConsensusPolicy:
+    def test_fixed_policy_is_reported_without_selection_authority(self, tmp_path):
         db_path = build_fixture_db(tmp_path)
         out = run_fixture_validation(db_path)
-        assert out["status"] == "retrospective_positive_result"
-        assert set(out["selected_config"]) == {
-            "horizon",
-            "frequency_days",
-            "lookback_days",
-            "min_buyers",
-            "top_n",
+        assert out["status"] == "completed"
+        assert out["support_status"] == "supported"
+        assert out["production_policy"] == {
+            "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
+            "lookback_days": 28,
+            "min_buyers": 3,
+            "score": "signal_score=distinct_canonical_buyer_count",
+            "time_basis": "public_disclosure_time",
+            "delayed_filings_actionable": True,
+            "ticker_identity": "decision_time",
+            "eligible_assets": "public_equities_only",
         }
-        control = out["correction"]["member_identity_control"]
-        assert control["gating"] is False
-        assert control["status"] == "identity_invariant"
-        assert control["method"].startswith("identity_invariant_by_consensus_scorer_contract")
-        assert control["requested_permutations"] == 0
+        assert len(out["train"]["sensitivity_results"]) == 1
+        assert len(out["test"]["sensitivity_results"]) == 1
 
     def test_member_label_permutation_is_invariant_for_consensus(self, tmp_path):
         """Swapping member identities must not change the per-date alpha series."""
@@ -302,46 +299,13 @@ class TestConsensusIdentityInvariance:
         assert float(base_series.mean()) > 0
 
 
-class TestRetrospectiveRepeatability:
-    def test_repeated_evaluation_recomputes_same_result_without_bookkeeping(self, tmp_path):
+class TestRepeatability:
+    def test_repeated_evaluation_recomputes_same_result(self, tmp_path):
         db_path = build_fixture_db(tmp_path)
         first = run_fixture_validation(db_path)
         second = run_fixture_validation(db_path)
 
-        assert first["status"] == "retrospective_positive_result"
+        assert first["status"] == "completed"
         assert second["status"] == first["status"]
-        assert second["selected_config"] == first["selected_config"]
         assert second["train"] == first["train"]
         assert second["test"] == first["test"]
-        assert not (tmp_path / ".ptr-alpha-evaluation-ledger-v2.json").exists()
-
-
-class TestRetrospectiveNotFinalWording:
-    def test_test_window_is_retrospective_only_and_locked_final_untouched(self, tmp_path):
-        db_path = build_fixture_db(tmp_path)
-        out = run_fixture_validation(db_path)
-        assert out["status"] == "retrospective_positive_result"
-        assert out["verdict"] == "not_fresh_oos_evidence"
-        assert (
-            out["test"]["status"]
-            == "retrospective_previously_used_not_fresh_oos"
-        )
-        manifest = out["manifest"]
-        assert (
-            manifest["phases"]["test"]["evidence_class"]
-            == "retrospective_previously_used_not_fresh_oos"
-        )
-        locked = manifest["phases"]["locked_final"]
-        assert locked["status"] == "locked_not_queried_or_evaluated"
-        assert locked["value_rows_queried"] is False
-
-        # No profitability wording may appear in any status/verdict; any
-        # fresh-OOS mention must be an explicit denial (not_fresh_oos_*).
-        for key, value in out.items():
-            if isinstance(value, str):
-                lowered = value.lower()
-                assert "profit" not in lowered, f"{key} claims profitability"
-                if "fresh_oos" in lowered:
-                    assert "not_fresh_oos" in lowered, f"{key} claims fresh OOS"
-        assert out["degradation_ratio"] is not None
-        assert "evaluation_ledger" not in out

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 from datetime import date
 
 import numpy as np
@@ -18,17 +17,14 @@ from analyzer.member_ranking.buyer_scoring import (
     score_ticker_by_buyers,
 )
 from analyzer.validation import (
-    LOCKED_FINAL_START,
     MIN_RELEASE_PERMUTATIONS,
     PRIMARY_METRIC,
     _backtest_core,
     _build_manifest,
     _effective_validation_grid,
     _phase_end,
-    _run_identity_invariant_control,
     _run_validation_with_db,
     newey_west_tstat,
-    run_validation,
     select_config,
 )
 
@@ -53,10 +49,7 @@ def _selection_frame(
         {
             "horizon": [horizon],
             "frequency_days": [frequency_days],
-            "lookback_days": [28],
-            "min_buyers": [2],
-            "top_n": [5],
-            "test_variant": trial_ids,
+            "top_n": list(range(5, 5 + len(trial_ids))),
         }
     )
     rows = []
@@ -75,6 +68,8 @@ def _selection_frame(
             {
                 "trial_id": trial_id,
                 **config,
+                "lookback_days": 28,
+                "min_buyers": 3,
                 "trial_config": config,
                 "trial_spec_sha256": trial.trial_sha256,
                 "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
@@ -116,15 +111,15 @@ class TestNeweyWest:
 
 
 class TestCorrectedSelection:
-    def test_all_zero_canary_has_no_deployable_config(self):
+    def test_all_zero_canary_has_no_supported_sensitivity(self):
         null = {0: _series(np.zeros(60))}
         result = select_config(
             _selection_frame(null),
             series_by_trial=null,
             n_permutations=MIN_RELEASE_PERMUTATIONS,
         )
-        assert result["deployable_config"] is None
-        assert result["n_survivors"] == 0
+        assert result["statistical_survivors"] == []
+        assert result["n_statistical_survivors"] == 0
         assert result["failure_reason"] == "no_dependence_safe_survivor"
 
     def test_insufficient_null_count_fails_closed(self):
@@ -134,7 +129,7 @@ class TestCorrectedSelection:
             series_by_trial=strong,
             n_permutations=99,
         )
-        assert result["deployable_config"] is None
+        assert result["statistical_survivors"] == []
         assert (
             result["failure_reason"]
             == "insufficient_bootstrap_count_or_family_resolution"
@@ -150,10 +145,10 @@ class TestCorrectedSelection:
         )
         assert missing["failure_reason"] == "missing_bootstrap_series"
         assert incomplete["failure_reason"] == "incomplete_bootstrap_series"
-        assert missing["deployable_config"] is None
-        assert incomplete["deployable_config"] is None
+        assert missing["statistical_survivors"] == []
+        assert incomplete["statistical_survivors"] == []
 
-    def test_primary_mean_selects_not_rank_slope(self):
+    def test_primary_mean_reports_supported_sensitivities_not_rank_slope(self):
         rng = np.random.default_rng(4)
         series = {
             0: _series(2.0 + rng.normal(0, 0.2, 180)),
@@ -166,8 +161,9 @@ class TestCorrectedSelection:
             n_permutations=999,
             permutation_seed=7,
         )
-        assert result["deployable_config"] is not None
-        assert result["deployable_config"]["trial_id"] == 0
+        assert [row["trial_id"] for row in result["statistical_survivors"]] == [0, 1]
+        assert [row["trial_id"] for row in result["sensitivity_results"]] == [0, 1]
+        assert all(row["statistical_support"] for row in result["sensitivity_results"])
         assert result["primary_metric"] == PRIMARY_METRIC
 
     def test_block_permuted_null_does_not_survive(self):
@@ -179,10 +175,10 @@ class TestCorrectedSelection:
             n_permutations=999,
             permutation_seed=11,
         )
-        assert result["n_survivors"] == 0
-        assert result["deployable_config"] is None
+        assert result["n_statistical_survivors"] == 0
+        assert result["statistical_survivors"] == []
 
-    def test_no_survivor_is_descriptive_only_not_a_fallback(self):
+    def test_no_survivor_reports_descriptive_best_without_fallback(self):
         rng = np.random.default_rng(9)
         null = {
             0: _series(rng.normal(-2, 1, 80)),
@@ -194,78 +190,80 @@ class TestCorrectedSelection:
             series_by_trial=null,
             n_permutations=9990,
         )
-        assert result["deployable_config"] is None
-        assert result["descriptive_best"]["label"] == "descriptive_only_not_deployable"
+        assert result["statistical_survivors"] == []
+        assert result["descriptive_best"]["label"] == "descriptive_best"
 
 
-class TestMemberIdentityGate:
-    def test_consensus_statistical_survivor_deploys_without_identity_record(self):
+class TestValidationPolicy:
+    def test_backtest_rejects_policy_override(self):
+        params = BacktestParams(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 1),
+            horizon=60,
+            lookback_days=27,
+            min_buyers=3,
+            top_n=5,
+            frequency_days=30,
+        )
+        with pytest.raises(ValueError, match="lookback_days=28 and min_buyers=3"):
+            _backtest_core(pd.DataFrame(), pd.DataFrame(), params)
+
+    def test_net_alpha_survivor_does_not_require_positive_overall_return(self):
         rng = np.random.default_rng(41)
         series = {0: _series(2.0 + rng.normal(0, 0.1, 180))}
+        frame = _selection_frame(series)
+        frame["overall_return"] = -100.0
         result = select_config(
-            _selection_frame(series),
+            frame,
             series_by_trial=series,
             n_permutations=999,
         )
-        assert result["statistical_candidate"] is not None
-        assert result["deployable_config"] is not None
+        assert len(result["statistical_survivors"]) == 1
         assert result["failure_reason"] is None
-        assert result["member_identity_control"]["gating"] is False
+        assert result["statistical_survivors"][0]["label"] == (
+            "statistically_supported_sensitivity"
+        )
+        assert len(result["sensitivity_results"]) == 1
+        assert result["sensitivity_results"][0]["statistical_support"] is True
 
-    def test_caller_supplied_member_control_is_rejected(self):
-        series = {0: _series(np.full(180, 2.0))}
-        with pytest.raises(TypeError, match="unexpected keyword"):
-            select_config(
-                _selection_frame(series),
-                series_by_trial=series,
-                n_permutations=999,
-                member_control={"release_ready": True},
-            )
-
-    def test_validation_grid_rejects_identity_dependent_scoring_mode(self):
+    def test_validation_grid_rejects_policy_parameters(self):
         with pytest.raises(ValueError, match="unsupported parameter"):
             _effective_validation_grid(
                 {
                     "horizon": [60],
-                    "min_buyers": [3],
                     "top_n": [5],
                     "scoring_mode": ["shrunk_alpha"],
                 }
             )
 
-    def test_identity_free_exemption_payload_is_never_accepted(self):
+    def test_family_rejects_policy_parameter_metadata(self):
         series = {0: _series(np.full(180, 2.0))}
-        with pytest.raises(TypeError, match="unexpected keyword"):
-            select_config(
-                _selection_frame(series),
-                series_by_trial=series,
-                n_permutations=999,
-                member_control={"exempt": True},
-            )
+        frame = _selection_frame(series)
+        family = build_family(
+            {"horizon": [60], "frequency_days": [30], "top_n": [5]}
+        )
+        metadata = family.metadata()
+        metadata["parameter_order"] = ["horizon", "min_buyers"]
+        frame.attrs["family"] = metadata
+        result = select_config(frame, series_by_trial=series, n_permutations=999)
+        assert result["failure_reason"] == "invalid_family"
+        assert result["family_integrity"]["reason"] == (
+            "production_policy_parameter_in_family"
+        )
 
-    def test_forged_identity_diagnostic_cannot_change_deployment(self):
+    def test_family_rejects_scorer_provenance_variation(self):
         series = {0: _series(np.full(180, 2.0))}
-        baseline = _with_series(_selection_frame(series), series)
-        selection_before = select_config(baseline, n_permutations=999)
-        assert selection_before["deployable_config"] is not None
-
-        control = _run_identity_invariant_control(baseline, 0)
-        forged = replace(
-            control, method="forged_significant_relabel_test", max_stat_p_value=0.0
-        )
-        selection_after = select_config(baseline, n_permutations=999)
-        assert (
-            selection_after["deployable_config"]
-            == selection_before["deployable_config"]
-        )
-        with pytest.raises(TypeError, match="unexpected keyword"):
-            select_config(baseline, n_permutations=999, member_control=forged)
+        frame = _selection_frame(series)
+        frame.loc[0, "scorer_provenance"] = "legacy_scorer"
+        result = select_config(frame, series_by_trial=series, n_permutations=999)
+        assert result["failure_reason"] == "invalid_family"
+        assert result["family_integrity"]["parameter"] == "scorer_provenance"
 
     def test_short_series_cannot_fall_back_to_asymptotic_reward(self):
         short = {0: _series([2.0, 2.1, 1.9])}
         frame = _selection_frame(short, horizon=120, frequency_days=30)
         result = select_config(frame, series_by_trial=short, n_permutations=999)
-        assert result["deployable_config"] is None
+        assert result["statistical_survivors"] == []
         assert result["failure_reason"] == "bootstrap_sample_too_small"
         assert "at least 8" in result["bootstrap"]["error"]
 
@@ -274,43 +272,33 @@ class TestConsensusProductionScoring:
     def test_consensus_score_is_exact_distinct_buyer_count(self):
         transactions = pd.DataFrame(
             {
-                "member": ["Alice", "Bob", "Alice"],
-                "ticker": ["AAPL", "AAPL", "AAPL"],
+                "member": ["Alice", "Bob", "Carol", "Alice"],
+                "ticker": ["AAPL", "AAPL", "AAPL", "AAPL"],
                 "transaction_date": pd.to_datetime(
-                    ["2024-05-09", "2024-05-11", "2024-05-12"]
+                    ["2024-05-09", "2024-05-11", "2024-05-12", "2024-05-13"]
                 ),
                 "disclosure_date": pd.to_datetime(
-                    ["2024-05-10", "2024-05-12", "2024-05-13"]
+                    ["2024-05-10", "2024-05-12", "2024-05-13", "2024-05-14"]
                 ),
-                "transaction_type": ["Purchase", "Purchase", "Purchase"],
+                "transaction_type": ["Purchase", "Purchase", "Purchase", "Purchase"],
             }
         )
         consensus = score_ticker_by_buyers(
             "AAPL",
             transactions,
-            min_buyers=1,
+            min_buyers=3,
             as_of_date=pd.Timestamp("2024-05-20"),
         )
-        assert consensus.iloc[0]["signal_score"] == 2.0
-        assert consensus.iloc[0]["num_buyers"] == 2
+        assert consensus.iloc[0]["signal_score"] == 3.0
+        assert consensus.iloc[0]["num_buyers"] == 3
         assert consensus.iloc[0]["scorer_provenance"] == CONSENSUS_SCORER_PROVENANCE
 
-    def test_consensus_reports_non_gating_identity_invariance_diagnostic(self):
-        series = {0: _series(np.full(180, 2.0))}
-        baseline = _with_series(_selection_frame(series), series)
-        selection = select_config(baseline, n_permutations=999)
-        assert selection["deployable_config"] is not None
-
-        control = _run_identity_invariant_control(baseline, 0)
-        assert control.status == "identity_invariant"
-        assert control.method == "identity_invariant_by_consensus_scorer_contract_v1"
-        assert control.gating is False
-        assert control.evaluated_permutations == 0
-        assert control.max_stat_p_value == 1.0
-        assert (
-            select_config(baseline, n_permutations=999)["deployable_config"]
-            == selection["deployable_config"]
-        )
+    def test_consensus_grid_has_no_policy_sensitivities(self):
+        assert set(_effective_validation_grid({"horizon": [60]})) == {
+            "horizon",
+            "frequency_days",
+            "top_n",
+        }
 
 
 class TestExecutionSupport:
@@ -330,6 +318,8 @@ class TestExecutionSupport:
                         "rank": 1,
                         "ticker": "AAA",
                         "signal_score": 3.0,
+                        "num_buyers": 3,
+                        "instrument_type": "stock",
                         "optimal_horizon": 120,
                         "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
                     }
@@ -365,7 +355,7 @@ class TestExecutionSupport:
             end_date=date(2024, 1, 31),
             horizon=60,
             frequency_days=15,
-            min_buyers=2,
+            min_buyers=3,
             top_n=3,
         )
         result, primary = _backtest_core(
@@ -395,8 +385,8 @@ class TestFailureFamilies:
             start_date=date(2024, 1, 1),
             end_date=date(2024, 1, 1),
             horizon=60,
-            lookback_days=60,
-            min_buyers=2,
+            lookback_days=28,
+            min_buyers=3,
             top_n=5,
             frequency_days=30,
         )
@@ -446,7 +436,9 @@ class TestFailureFamilies:
                     {
                         "rank": 1,
                         "ticker": "AAA",
-                        "signal_score": 1.0,
+                        "signal_score": 3.0,
+                        "num_buyers": 3,
+                        "instrument_type": "stock",
                         "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
                     }
                 ]
@@ -470,7 +462,7 @@ class TestFailureFamilies:
         assert series.empty
         assert result.failure_records[0]["stage"] == "evaluation"
 
-    def test_failed_trial_fails_the_whole_family_and_cannot_deploy(self):
+    def test_failed_trial_fails_the_whole_family(self):
         series = {0: _series(np.full(180, 2.0)), 1: _series(np.full(180, 3.0))}
         frame = _with_series(_selection_frame(series), series)
         frame["trial_failed"] = [True, False]
@@ -482,8 +474,7 @@ class TestFailureFamilies:
             "[]",
         ]
         result = select_config(frame, n_permutations=999)
-        assert result["deployable_config"] is None
-        assert result["statistical_candidate"] is None
+        assert result["statistical_survivors"] == []
         assert result["failure_reason"] == "family_trial_failure"
         assert result["family_failure"]["status"] == "failed"
         assert result["family_failure"]["failed_trial_count"] == 1
@@ -530,10 +521,15 @@ class TestFailureFamilies:
             alpha=0.05,
             out_path=None,
         )
-        assert output["selected_config"] is None
-        assert output["correction"]["failure_reason"] == "family_trial_failure"
+        assert output["status"] == "completed"
+        assert output["support_status"] == "not_supported"
+        assert output["train"]["status"] == "failed"
+        assert output["test"]["status"] == "failed"
+        assert output["correction"]["train"]["failure_reason"] == "family_trial_failure"
+        assert output["correction"]["test"]["failure_reason"] == "family_trial_failure"
         assert transaction_queries == [
-            (pd.Timestamp("2021-12-04"), pd.Timestamp("2022-12-01"))
+            (pd.Timestamp("2021-12-04"), pd.Timestamp("2022-12-01")),
+            (pd.Timestamp("2023-01-04"), pd.Timestamp("2023-11-01")),
         ]
 
 
@@ -549,7 +545,7 @@ class TestCanonicalFamilyMetadata:
             n_permutations=999,
         )
 
-        assert result["deployable_config"] is None
+        assert result["statistical_survivors"] == []
         assert result["failure_reason"] == "invalid_family"
         assert result["family_integrity"]["reason"] == "family_metadata_missing"
         assert result["family_sha256"] is None
@@ -578,17 +574,6 @@ class TestPurgeAndManifest:
     def test_purge_uses_exact_next_session_execution_window(self):
         assert _phase_end(date(2023, 12, 31), 120) == date(2023, 8, 31)
 
-    def test_locked_final_phase_is_rejected_before_database_open(self, tmp_path):
-        with pytest.raises(ValueError, match="locked final phase"):
-            run_validation(
-                tmp_path / "missing.duckdb",
-                date(2022, 1, 1),
-                date(2023, 12, 31),
-                date(2024, 1, 1),
-                LOCKED_FINAL_START,
-                {"horizon": [60]},
-            )
-
     def test_manifest_records_statistical_evidence_without_execution_receipts(self):
         frame = pd.DataFrame(
             {"x": [1, 2]}, index=pd.date_range("2024-01-01", periods=2)
@@ -608,25 +593,21 @@ class TestPurgeAndManifest:
             7,
             0.05,
         )
-        assert manifest["phases"]["locked_final"] == {
-            "start": "2026-01-01",
-            "end": None,
-            "status": "locked_not_queried_or_evaluated",
-            "value_rows_queried": False,
-        }
         assert manifest["phases"]["train"]["outcomes_end_by"] == "2023-12-31"
-        assert (
-            manifest["phases"]["test"]["evidence_class"]
-            == "retrospective_previously_used_not_fresh_oos"
-        )
         assert manifest["n_trials"] == 1
         assert manifest["family"]["family_size"] == 1
         assert manifest["family"]["family_provenance"] == FAMILY_PROVENANCE
         assert manifest["coverage_input"]["transactions"] == 2
+        assert manifest["production_policy"]["lookback_days"] == 28
+        assert manifest["production_policy"]["min_buyers"] == 3
+        assert (
+            manifest["production_policy"]["scorer_provenance"]
+            == CONSENSUS_SCORER_PROVENANCE
+        )
         assert "hashes" not in manifest
         assert "git" not in manifest
         assert "dependencies" not in manifest
-        assert "evaluation_ledger" not in manifest
+        assert set(manifest["phases"]) == {"train", "test"}
 
 
 def test_cli_validation_grid_counts_are_exact():
@@ -655,7 +636,5 @@ def test_consensus_family_materializes_strategy_defaults():
     assert _effective_validation_grid({"horizon": [60]}) == {
         "horizon": [60],
         "frequency_days": (30,),
-        "lookback_days": (28,),
-        "min_buyers": (3,),
         "top_n": (5,),
     }

@@ -1,13 +1,15 @@
-"""Purged nested validation for PTR Alpha strategies.
+"""Purged validation for the fixed production consensus strategy.
 
 The validation contract is fail closed:
 * every phase ends early enough for the maximum executable holding to mature;
-* one per-date net-alpha statistic drives inference, correction, selection, and verdict;
+* one per-date net-alpha statistic drives inference and family correction;
 * arbitrary-dependence Bonferroni and moving-block max-stat gates must pass;
-* validation accepts only the production consensus scorer;
-* consensus is identity-invariant and has no member-identity hypothesis;
+* validation executes only the production consensus scorer and its fixed BUY
+  policy;
+* horizon, rebalance frequency, and top-N are evaluation sensitivities only;
 * incomplete or under-resolved statistical-family controls fail closed;
-* the post-2025 final phase is locked and is never loaded by this module.
+* delayed disclosures, ticker identity, and asset eligibility remain part of the
+  production scorer contract.
 """
 
 from __future__ import annotations
@@ -47,16 +49,13 @@ logger = logging.getLogger(__name__)
 MIN_DATES_FOR_CANDIDACY = 8
 MIN_RECS_FOR_CANDIDACY = 20
 MIN_RELEASE_PERMUTATIONS = 999
-LOCKED_FINAL_START = date(2026, 1, 1)
 PRIMARY_METRIC = "mean_per_date_net_alpha"
-_VALIDATION_GRID_PARAMETERS = frozenset(
-    {"horizon", "frequency_days", "lookback_days", "min_buyers", "top_n"}
-)
+_VALIDATION_GRID_PARAMETERS = frozenset({"horizon", "frequency_days", "top_n"})
 
 
 def _effective_validation_grid(grid: Mapping[str, object]) -> dict[str, object]:
-    """Return the complete consensus strategy family and reject inert knobs."""
-    if not grid:
+    """Return the sensitivity family and reject production-policy knobs."""
+    if not isinstance(grid, Mapping) or not grid:
         raise ValueError("validation grid must not be empty")
     unknown = set(grid) - _VALIDATION_GRID_PARAMETERS
     if unknown:
@@ -65,31 +64,8 @@ def _effective_validation_grid(grid: Mapping[str, object]) -> dict[str, object]:
         )
     effective = {str(name): values for name, values in grid.items()}
     effective.setdefault("frequency_days", (30,))
-    effective.setdefault("lookback_days", (CONSENSUS_LOOKBACK_DAYS,))
-    effective.setdefault("min_buyers", (CONSENSUS_MIN_BUYERS,))
     effective.setdefault("top_n", (5,))
     return effective
-
-
-@dataclass(frozen=True, slots=True)
-class MemberIdentityControlResult:
-    status: str
-    gating: bool
-    method: str
-    requested_permutations: int
-    evaluated_permutations: int
-    permutation_group_size: int
-    exact_enumeration: bool
-    sampled_without_replacement: bool
-    p_value_resolution: float
-    max_stat_p_value: float
-    null_max_t_quantile_95: float | None
-    release_ready: bool
-    runtime_seconds: float
-    runtime_budget_seconds: float
-    family_sha256: str
-    observed_trial_id: int
-    observed_statistic: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +160,11 @@ def _backtest_core(
     zero cash return; it is not silently dropped. The declared horizon is the
     actual holding used for both strategy and benchmark.
     """
+    if (
+        int(params.lookback_days) != CONSENSUS_LOOKBACK_DAYS
+        or int(params.min_buyers) != CONSENSUS_MIN_BUYERS
+    ):
+        raise ValueError("validation requires lookback_days=28 and min_buyers=3")
     empty = _empty_result(params)
     as_of_dates = pd.date_range(
         params.start_date, params.end_date, freq=f"{params.frequency_days}D"
@@ -223,14 +204,47 @@ def _backtest_core(
             if not isinstance(recommendations, pd.DataFrame):
                 raise TypeError("recommendations must be returned as a DataFrame")
             if not recommendations.empty:
-                provenance = set(
-                    recommendations.get(
-                        "scorer_provenance", pd.Series(dtype=str)
-                    ).dropna()
+                required_policy_columns = {
+                    "scorer_provenance",
+                    "signal_score",
+                    "num_buyers",
+                    "instrument_type",
+                }
+                missing_policy_columns = required_policy_columns - set(
+                    recommendations.columns
                 )
+                if missing_policy_columns:
+                    raise AnalysisError(
+                        "consensus recommendations lack production scorer fields: "
+                        f"{sorted(missing_policy_columns)}"
+                    )
+                provenance = set(recommendations["scorer_provenance"].dropna())
                 if provenance != {CONSENSUS_SCORER_PROVENANCE}:
                     raise AnalysisError(
                         "consensus recommendations lack executed-scorer provenance"
+                    )
+                scores = pd.to_numeric(
+                    recommendations["signal_score"], errors="coerce"
+                )
+                buyers = pd.to_numeric(
+                    recommendations["num_buyers"], errors="coerce"
+                )
+                if (
+                    scores.isna().any()
+                    or buyers.isna().any()
+                    or not np.isfinite(scores).all()
+                    or not np.isfinite(buyers).all()
+                    or not np.equal(buyers, np.floor(buyers)).all()
+                    or buyers.lt(CONSENSUS_MIN_BUYERS).any()
+                    or not np.array_equal(scores.to_numpy(), buyers.to_numpy())
+                ):
+                    raise AnalysisError(
+                        "consensus score must equal the distinct-buyer count"
+                    )
+                instruments = recommendations["instrument_type"].astype(str).str.lower()
+                if instruments.ne("stock").any():
+                    raise AnalysisError(
+                        "consensus recommendations must contain public equities only"
                     )
         except Exception as exc:  # fail closed: never convert an exception to cash
             failures.append(
@@ -419,8 +433,8 @@ def sweep_configs(
             start_date=start,
             end_date=end,
             horizon=horizon,
-            lookback_days=int(values["lookback_days"]),
-            min_buyers=int(values["min_buyers"]),
+            lookback_days=CONSENSUS_LOOKBACK_DAYS,
+            min_buyers=CONSENSUS_MIN_BUYERS,
             top_n=int(values["top_n"]),
             frequency_days=frequency,
         )
@@ -469,39 +483,6 @@ def sweep_configs(
     frame.attrs["family_size"] = family.family_size
     frame.attrs["family_provenance"] = family.provenance
     return frame
-
-
-def _member_family_sha256(
-    sweep_df: pd.DataFrame, series_by_trial: dict[int, pd.Series]
-) -> str:
-    digest = hashlib.sha256()
-    ordered = sweep_df.sort_values("trial_id").copy()
-    ordered = ordered.reindex(sorted(ordered.columns), axis=1)
-    for column in ordered.columns:
-        ordered[column] = ordered[column].map(
-            lambda value: (
-                json.dumps(_json_safe(value), sort_keys=True)
-                if isinstance(value, (dict, list, tuple))
-                else value
-            )
-        )
-    digest.update(pd.util.hash_pandas_object(ordered, index=False).to_numpy().tobytes())
-    for trial_id in sorted(series_by_trial):
-        digest.update(str(trial_id).encode())
-        series = pd.Series(series_by_trial[trial_id], dtype=float).sort_index()
-        digest.update(
-            pd.util.hash_pandas_object(series, index=True).to_numpy().tobytes()
-        )
-    return digest.hexdigest()
-
-
-def _family_sha256_for_sweep(
-    sweep_df: pd.DataFrame, series_by_trial: dict[int, pd.Series]
-) -> str:
-    recorded = sweep_df.attrs.get("family")
-    if isinstance(recorded, dict) and recorded.get("family_sha256"):
-        return str(recorded["family_sha256"])
-    return _member_family_sha256(sweep_df, series_by_trial)
 
 
 def _strict_trial_id(value) -> int | None:
@@ -598,6 +579,16 @@ def _family_integrity(sweep_df: pd.DataFrame) -> tuple[bool, dict]:
     if not isinstance(ordered_grid, list) or not isinstance(parameter_order, list):
         details.update(status="invalid", reason="family_grid_metadata_missing")
         return False, details
+    unsupported_parameters = sorted(
+        set(parameter_order) - _VALIDATION_GRID_PARAMETERS
+    )
+    if unsupported_parameters:
+        details.update(
+            status="invalid",
+            reason="production_policy_parameter_in_family",
+            unsupported_parameters=unsupported_parameters,
+        )
+        return False, details
     try:
         rebuilt_grid = {
             str(item["parameter"]): item["values"] for item in ordered_grid
@@ -615,6 +606,28 @@ def _family_integrity(sweep_df: pd.DataFrame) -> tuple[bool, dict]:
         trial.trial_sha256 for trial in rebuilt.trials
     ]:
         details.update(status="invalid", reason="trial_spec_metadata_mismatch")
+        return False, details
+    for column, expected in (
+        ("lookback_days", CONSENSUS_LOOKBACK_DAYS),
+        ("min_buyers", CONSENSUS_MIN_BUYERS),
+    ):
+        if column in sweep_df.columns:
+            values = pd.to_numeric(sweep_df[column], errors="coerce")
+            if values.isna().any() or not values.eq(expected).all():
+                details.update(
+                    status="invalid",
+                    reason="production_policy_mismatch",
+                    parameter=column,
+                    expected=expected,
+                )
+                return False, details
+    if not sweep_df["scorer_provenance"].eq(CONSENSUS_SCORER_PROVENANCE).all():
+        details.update(
+            status="invalid",
+            reason="production_policy_mismatch",
+            parameter="scorer_provenance",
+            expected=CONSENSUS_SCORER_PROVENANCE,
+        )
         return False, details
     required_columns = {"trial_spec_sha256", "trial_config", *parameter_order}
     missing_columns = sorted(required_columns - set(sweep_df.columns))
@@ -756,7 +769,7 @@ def select_config(
     n_permutations: int = 999,
     permutation_seed: int = 0,
 ) -> dict:
-    """Select a consensus configuration by statistical-family gates."""
+    """Evaluate statistical support for every declared sensitivity."""
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
     if sweep_df.empty:
@@ -885,16 +898,12 @@ def select_config(
     overall_alpha = pd.to_numeric(working["overall_alpha"], errors="coerce").to_numpy(
         dtype=float
     )
-    overall_return = pd.to_numeric(working["overall_return"], errors="coerce").to_numpy(
-        dtype=float
-    )
-    finite_metrics = np.isfinite(overall_alpha) & np.isfinite(overall_return)
+    # Net alpha is the statistic; overall return is not a deployment gate.
     statistical_survivor = (
         candidate
         & bootstrap_ready
-        & finite_metrics
+        & np.isfinite(overall_alpha)
         & (overall_alpha > 0)
-        & (overall_return > 0)
         & (bootstrap_p <= bonferroni_threshold)
         & (max_stat_p <= alpha)
     )
@@ -931,47 +940,16 @@ def select_config(
     else:
         descriptive_position = 0
     descriptive = working.iloc[descriptive_position].to_dict()
-    descriptive["label"] = "descriptive_only_not_deployable"
+    descriptive["label"] = "descriptive_best"
 
+    # Preserve every corrected survivor. Validation reports sensitivity support;
+    # it never ranks one sensitivity as a live configuration.
     survivor_positions = np.flatnonzero(statistical_survivor)
-    statistical_candidate = None
-    if len(survivor_positions):
-        order = working.iloc[survivor_positions].copy()
-        order["_alpha_order"] = pd.to_numeric(
-            order["overall_alpha"], errors="coerce"
-        )
-        order["_tstat_order"] = pd.to_numeric(order["nw_tstat"], errors="coerce").fillna(
-            -math.inf
-        )
-        order["_trial_id_order"] = [
-            _strict_trial_id(value) for value in order["trial_id"]
-        ]
-        order["_trial_id_order"] = order["_trial_id_order"].fillna(
-            np.iinfo(np.int64).max
-        )
-        order = order.sort_values(
-            ["_alpha_order", "_tstat_order", "_trial_id_order"],
-            ascending=[False, False, True],
-            kind="mergesort",
-        )
-        statistical_candidate = order.iloc[0].to_dict()
-        for key in ("_alpha_order", "_tstat_order", "_trial_id_order"):
-            statistical_candidate.pop(key, None)
-        statistical_candidate["label"] = "statistical_family_survivor"
-
-    deployable = None
-    if statistical_candidate is not None:
-        deployable = dict(statistical_candidate)
-        deployable["label"] = "deployable_statistical_family_survivor"
-    member_summary = {
-        "status": (
-            "audit_pending"
-            if statistical_candidate is not None
-            else "not_needed_no_statistical_candidate"
-        ),
-        "gating": False,
-        "diagnostic_only": True,
-    }
+    statistical_survivors = []
+    for position in survivor_positions:
+        survivor = working.iloc[int(position)].to_dict()
+        survivor["label"] = "statistically_supported_sensitivity"
+        statistical_survivors.append(survivor)
 
     if not family_complete:
         reason = (
@@ -989,24 +967,32 @@ def select_config(
         reason = "bootstrap_sample_too_small"
     elif n_permutations < minimum_resolution_bootstrap:
         reason = "insufficient_bootstrap_count_or_family_resolution"
-    elif statistical_candidate is None:
+    elif not statistical_survivors:
         reason = "no_dependence_safe_survivor"
     else:
         reason = None
+    sensitivity_results = []
+    for position, (_, row) in enumerate(working.iterrows()):
+        result = row.to_dict()
+        result["statistical_support"] = bool(statistical_survivor[position])
+        result["label"] = (
+            "statistically_supported_sensitivity"
+            if result["statistical_support"]
+            else "sensitivity_result"
+        )
+        sensitivity_results.append(result)
     return {
-        "deployable_config": deployable,
-        "statistical_candidate": statistical_candidate,
+        "statistical_survivors": statistical_survivors,
+        "sensitivity_results": sensitivity_results,
         "descriptive_best": descriptive,
         "failure_reason": reason,
         "primary_metric": PRIMARY_METRIC,
         "n_trials": n_trials,
         "n_min_sample_candidates": int(candidate.sum()),
         "n_statistical_survivors": int(statistical_survivor.sum()),
-        "n_survivors": 1 if deployable is not None else 0,
         "bonferroni_threshold": bonferroni_threshold,
         "alpha": alpha,
         "bootstrap": bootstrap_summary,
-        "member_identity_control": member_summary,
         "family": family,
         "family_sha256": family["family_sha256"],
         "family_size": int(family["family_size"]),
@@ -1024,53 +1010,6 @@ def select_config(
             "trials": family_failures,
         },
     }
-
-
-def _run_identity_invariant_control(
-    sweep_df: pd.DataFrame,
-    observed_trial_id: int,
-) -> MemberIdentityControlResult:
-    """Describe the identity-invariant consensus contract for one trial."""
-    family_complete, family_details = _family_integrity(sweep_df)
-    if not family_complete:
-        raise ValueError(
-            "identity-invariant control requires a complete family: "
-            f"{family_details.get('reason', 'invalid family')}"
-        )
-    if _trial_failure_mask(sweep_df).any():
-        raise ValueError("identity-invariant control requires completed trials")
-    series_by_trial = sweep_df.attrs.get("series_by_trial")
-    expected_ids = {int(value) for value in sweep_df["trial_id"]}
-    if not isinstance(series_by_trial, dict) or set(series_by_trial) != expected_ids:
-        raise ValueError("identity-invariant family lacks complete trial series")
-    selected = sweep_df[sweep_df["trial_id"] == observed_trial_id]
-    if len(selected) != 1:
-        raise ValueError("observed trial_id is not unique in consensus family")
-    row = selected.iloc[0]
-    if str(row["scorer_provenance"]) != CONSENSUS_SCORER_PROVENANCE:
-        raise ValueError(
-            "identity-invariant control requires executed consensus provenance"
-        )
-    result = MemberIdentityControlResult(
-        status="identity_invariant",
-        gating=False,
-        method="identity_invariant_by_consensus_scorer_contract_v1",
-        requested_permutations=0,
-        evaluated_permutations=0,
-        permutation_group_size=1,
-        exact_enumeration=True,
-        sampled_without_replacement=False,
-        p_value_resolution=1.0,
-        max_stat_p_value=1.0,
-        null_max_t_quantile_95=None,
-        release_ready=True,
-        runtime_seconds=0.0,
-        runtime_budget_seconds=0.0,
-        family_sha256=_family_sha256_for_sweep(sweep_df, series_by_trial),
-        observed_trial_id=observed_trial_id,
-        observed_statistic=float(row["nw_tstat"]),
-    )
-    return result
 
 
 def _phase_end(boundary_end: date, max_holding_days: int) -> date:
@@ -1100,7 +1039,7 @@ def run_validation(
     permutation_seed: int = 0,
     alpha: float = 0.05,
 ) -> dict:
-    """Run purged train selection and, only after survival, one test evaluation."""
+    """Run purged fixed-policy sensitivity evaluation on both phases."""
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
     if n_permutations < 1:
@@ -1109,13 +1048,13 @@ def run_validation(
         raise ValueError("validation window end must be on or after its start")
     if test_start <= train_end:
         raise ValueError("test window must start after the training window ends")
-    if test_end >= LOCKED_FINAL_START:
-        raise ValueError(
-            f"test window enters locked final phase starting {LOCKED_FINAL_START}"
-        )
-    if not grid or not grid.get("horizon"):
+    effective_grid = _effective_validation_grid(grid)
+    if not effective_grid.get("horizon"):
         raise ValueError("validation grid must include at least one horizon")
-    horizons = [int(value) for value in grid["horizon"]]
+    try:
+        horizons = [int(value) for value in effective_grid["horizon"]]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("validation horizons must be integers") from exc
     if any(value < 1 for value in horizons):
         raise ValueError("validation horizons must be positive")
     max_holding = max(horizons)
@@ -1138,7 +1077,7 @@ def run_validation(
             test_start,
             test_end,
             test_effective_end,
-            grid,
+            effective_grid,
             max_holding=max_holding,
             n_permutations=n_permutations,
             permutation_seed=permutation_seed,
@@ -1167,15 +1106,17 @@ def _run_validation_with_db(
     out_path: Path | None,
 ) -> dict:
     effective_grid = _effective_validation_grid(grid)
-    max_lookback = max(int(value) for value in effective_grid["lookback_days"])
-    tx_start = pd.Timestamp(train_start) - pd.Timedelta(days=max_lookback)
-    train_tx_end = pd.Timestamp(train_effective_end)
-    train_price_end = pd.Timestamp(train_end)
-    train_tx = db.get_transactions_by_date_range(tx_start, train_tx_end)
+    max_lookback = CONSENSUS_LOOKBACK_DAYS
+
+    train_tx = db.get_transactions_by_date_range(
+        pd.Timestamp(train_start) - pd.Timedelta(days=max_lookback),
+        pd.Timestamp(train_effective_end),
+    )
     train_tickers = sorted(set(_get_consensus_price_tickers(train_tx)) | {"SPY"})
-    train_price_start = next_nyse_session(pd.Timestamp(train_start))
     train_prices = db.get_prices(
-        train_tickers, train_price_start, train_price_end
+        train_tickers,
+        next_nyse_session(pd.Timestamp(train_start)),
+        pd.Timestamp(train_end),
     )
     train_df = sweep_configs(
         train_tx,
@@ -1184,19 +1125,32 @@ def _run_validation_with_db(
         train_start,
         train_effective_end,
     )
-    selection = select_config(
+    train_selection = select_config(
         train_df,
         alpha,
         n_permutations=n_permutations,
         permutation_seed=permutation_seed,
     )
-    statistical_candidate = selection["statistical_candidate"]
-    if statistical_candidate is not None:
-        identity_diagnostic = _run_identity_invariant_control(
-            train_df,
-            int(statistical_candidate["trial_id"]),
-        )
-        selection["member_identity_control"] = asdict(identity_diagnostic)
+
+    test_tx = db.get_transactions_by_date_range(
+        pd.Timestamp(test_start) - pd.Timedelta(days=max_lookback),
+        pd.Timestamp(test_effective_end),
+    )
+    test_tickers = sorted(set(_get_consensus_price_tickers(test_tx)) | {"SPY"})
+    test_prices = db.get_prices(
+        test_tickers,
+        next_nyse_session(pd.Timestamp(test_start)),
+        pd.Timestamp(test_end),
+    )
+    test_df = sweep_configs(
+        test_tx, test_prices, effective_grid, test_start, test_effective_end
+    )
+    test_selection = select_config(
+        test_df,
+        alpha,
+        n_permutations=n_permutations,
+        permutation_seed=permutation_seed + 3 * n_permutations,
+    )
     manifest = _build_manifest(
         train_tx,
         train_prices,
@@ -1212,138 +1166,33 @@ def _run_validation_with_db(
         permutation_seed,
         alpha,
     )
+    train_report = _phase_report(train_selection)
+    test_report = _phase_report(test_selection)
+    supported = bool(
+        train_selection["statistical_survivors"]
+        or test_selection["statistical_survivors"]
+    )
     output = {
-        "status": "no_deployable_config",
+        "status": "completed",
         "primary_metric": PRIMARY_METRIC,
         "family": manifest["family"],
         "family_sha256": manifest["family"]["family_sha256"],
         "family_size": manifest["family"]["family_size"],
         "family_provenance": manifest["family"]["family_provenance"],
-        "selected_config": None,
-        "descriptive_train_best": _json_safe(selection["descriptive_best"]),
-        "correction": _json_safe(
-            {
-                key: value
-                for key, value in selection.items()
-                if key
-                not in {
-                    "deployable_config",
-                    "statistical_candidate",
-                    "descriptive_best",
-                }
-            }
-        ),
-        "train": _metrics_from_row(selection["descriptive_best"], "descriptive_only"),
-        "test": {"status": "not_run_without_corrected_train_survivor"},
-        "degradation_ratio": None,
-        "verdict": "not_robust",
+        "production_policy": _production_policy(),
+        "train": train_report,
+        "test": test_report,
+        "correction": {
+            "train": train_report["correction"],
+            "test": test_report["correction"],
+        },
+        "supported_sensitivities": {
+            "train": train_report["supported_sensitivities"],
+            "test": test_report["supported_sensitivities"],
+        },
+        "support_status": "supported" if supported else "not_supported",
         "manifest": manifest,
     }
-
-    selected = selection["deployable_config"]
-    if selected is not None:
-        config = _config_from_row(selected)
-        train_result, _ = _run_frozen(
-            train_tx,
-            train_prices,
-            config,
-            train_start,
-            train_effective_end,
-        )
-        if (
-            train_result.status != "completed"
-            or train_result.failure_count
-            or train_result.failure_records
-        ):
-            output["correction"]["failure_reason"] = "selected_train_trial_failure"
-            output["correction"]["selected_train_trial_failure"] = _json_safe(
-                {
-                    "failure_reason": train_result.failure_reason,
-                    "failure_count": train_result.failure_count,
-                    "failure_records": train_result.failure_records,
-                }
-            )
-            output["train"] = _window_metrics(
-                train_result,
-                float(selected["nw_tstat"]),
-                float(selected["bootstrap_p_value"]),
-                "failed_train_trial",
-            )
-            _print_summary(output)
-            if out_path is not None:
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(
-                    json.dumps(output, indent=2, sort_keys=True, default=str)
-                )
-            return output
-        tx_end = pd.Timestamp(test_effective_end)
-        test_tx_start = pd.Timestamp(test_start) - pd.Timedelta(
-            days=int(config.get("lookback_days", CONSENSUS_LOOKBACK_DAYS))
-        )
-        price_start = next_nyse_session(pd.Timestamp(test_start))
-        price_end = pd.Timestamp(test_end)
-        all_tx = db.get_transactions_by_date_range(test_tx_start, tx_end)
-        tickers = sorted(set(_get_consensus_price_tickers(all_tx)) | {"SPY"})
-        prices = db.get_prices(tickers, price_start, price_end)
-        test_result, test_series = _run_frozen(
-            all_tx, prices, config, test_start, test_effective_end
-        )
-        lag = max(
-            0,
-            math.ceil(int(config["horizon"]) / int(config["frequency_days"])) - 1,
-        )
-        block_length = max(
-            1, math.ceil(int(config["horizon"]) / int(config["frequency_days"]))
-        )
-        test_t, test_p, test_bootstrap_error = _bootstrap_statistic_and_p(
-            test_series,
-            lag,
-            block_length,
-            n_permutations,
-            permutation_seed + 3 * n_permutations,
-        )
-        test_completed_without_failures = bool(
-            test_result.status == "completed"
-            and test_result.failure_count == 0
-            and not test_result.failure_records
-        )
-        test_passes = bool(
-            test_completed_without_failures
-            and test_bootstrap_error is None
-            and test_result.dates_evaluated >= MIN_DATES_FOR_CANDIDACY
-            and test_result.total_recs >= MIN_RECS_FOR_CANDIDACY
-            and test_result.overall_alpha > 0
-            and test_result.overall_return > 0
-            and test_p <= alpha
-        )
-        output.update(
-            status=(
-                "retrospective_positive_result"
-                if test_passes
-                else "retrospective_failed_result"
-            ),
-            selected_config=_json_safe(config),
-            train=_window_metrics(
-                train_result,
-                float(selected["nw_tstat"]),
-                float(selected["bootstrap_p_value"]),
-                "corrected_train_survivor",
-            ),
-            test=_window_metrics(
-                test_result,
-                test_t,
-                test_p,
-                "retrospective_previously_used_not_fresh_oos",
-            ),
-            degradation_ratio=(
-                round(test_result.overall_alpha / train_result.overall_alpha, 4)
-                if train_result.overall_alpha
-                else None
-            ),
-            verdict="not_fresh_oos_evidence",
-        )
-        if test_bootstrap_error is not None:
-            output["test"]["bootstrap_error"] = test_bootstrap_error
 
     _print_summary(output)
     if out_path is not None:
@@ -1352,99 +1201,60 @@ def _run_validation_with_db(
     return output
 
 
-def _run_frozen(all_tx, prices, config, start: date, end: date):
-    params = BacktestParams(
-        start_date=start,
-        end_date=end,
-        horizon=int(config["horizon"]),
-        lookback_days=int(config["lookback_days"]),
-        min_buyers=int(config["min_buyers"]),
-        top_n=int(config["top_n"]),
-        frequency_days=int(config["frequency_days"]),
-    )
-    return _backtest_core(all_tx, prices, params)
-
-
-def _config_from_row(row: dict) -> dict:
-    keys = ["horizon", "frequency_days", "lookback_days", "min_buyers", "top_n"]
-    return {key: row[key] for key in keys}
-
-
-def _bootstrap_statistic_and_p(
-    series: pd.Series,
-    lag: int,
-    block_length: int,
-    n_bootstrap: int,
-    seed: int,
-) -> tuple[float, float, str | None]:
-    try:
-        result = max_stat_moving_block_bootstrap(
-            {0: series},
-            {0: lag},
-            {0: block_length},
-            n_bootstrap=n_bootstrap,
-            seed=seed,
-        )
-    except ValueError as exc:
-        return newey_west_tstat(series, lag), 1.0, str(exc)
-    return (
-        float(result.observed_statistics[0]),
-        float(result.marginal_p_values[0]),
-        None,
-    )
-
-
-def _window_metrics(
-    result: SweepResult, statistic: float, p_value: float, label: str
-) -> dict:
+def _production_policy() -> dict[str, object]:
+    """Return the immutable BUY policy used by every validation trial."""
     return {
-        "status": label,
-        "result_status": result.status,
-        "failure_reason": result.failure_reason,
-        "failure_count": result.failure_count,
-        "failure_records": _json_safe(result.failure_records),
-        "N": result.total_recs,
-        "dates_evaluated": result.dates_evaluated,
-        "scheduled_dates": result.scheduled_dates,
-        "benchmark_dates": result.benchmark_dates,
-        "no_trade_dates": result.no_trade_dates,
-        "coverage_pct": result.coverage_pct,
-        "mean_net_alpha": result.overall_alpha,
-        "mean_strategy_return": result.overall_return,
-        "mean_spy_return": result.overall_spy_return,
-        "win_rate": result.win_rate,
-        "nw_tstat": round(statistic, 6) if math.isfinite(statistic) else None,
-        "nw_pval": round(p_value, 8),
-        "rank1_alpha_descriptive": result.rank1_alpha,
-        "rank5_alpha_descriptive": result.rank5_alpha,
-        "rank_slope_descriptive": result.alpha_slope,
+        "scorer_provenance": CONSENSUS_SCORER_PROVENANCE,
+        "lookback_days": CONSENSUS_LOOKBACK_DAYS,
+        "min_buyers": CONSENSUS_MIN_BUYERS,
+        "score": "signal_score=distinct_canonical_buyer_count",
+        "time_basis": "public_disclosure_time",
+        "delayed_filings_actionable": True,
+        "ticker_identity": "decision_time",
+        "eligible_assets": "public_equities_only",
     }
 
 
-def _metrics_from_row(row: dict, label: str) -> dict:
-    return {
-        "status": label,
-        "N": int(row.get("total_recs", 0)),
-        "dates_evaluated": int(row.get("dates_evaluated", 0)),
-        "scheduled_dates": int(row.get("scheduled_dates", 0)),
-        "benchmark_dates": int(row.get("benchmark_dates", 0)),
-        "no_trade_dates": int(row.get("no_trade_dates", 0)),
-        "coverage_pct": float(row.get("coverage_pct", 0.0)),
-        "mean_net_alpha": float(row.get("overall_alpha", 0.0)),
-        "mean_strategy_return": float(row.get("overall_return", 0.0)),
-        "mean_spy_return": float(row.get("overall_spy_return", 0.0)),
-        "nw_tstat": _finite_or_none(row.get("nw_tstat")),
-        "nw_pval": float(row.get("bootstrap_p_value", 1.0)),
-        "label": "not_selected_for_deployment",
+def _selection_correction(selection: dict) -> dict:
+    """Return correction metadata without duplicating sensitivity rows."""
+    return _json_safe(
+        {
+            key: value
+            for key, value in selection.items()
+            if key not in {"statistical_survivors", "sensitivity_results", "descriptive_best"}
+        }
+    )
+
+
+def _phase_report(selection: dict) -> dict:
+    """Serialize every sensitivity result and its corrected support subset."""
+    failure_reason = selection.get("failure_reason")
+    failure_reasons = {
+        "invalid_family",
+        "partial_family",
+        "family_trial_failure",
+        "missing_bootstrap_series",
+        "incomplete_bootstrap_series",
+        "bootstrap_sample_too_small",
+        "insufficient_bootstrap_count_or_family_resolution",
     }
-
-
-def _finite_or_none(value):
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    return numeric if math.isfinite(numeric) else None
+    if selection["statistical_survivors"]:
+        status = "supported"
+    elif failure_reason in failure_reasons:
+        status = "failed"
+    else:
+        status = "not_supported"
+    return {
+        "status": status,
+        "failure_reason": failure_reason,
+        "sensitivity_results": _json_safe(selection["sensitivity_results"]),
+        "supported_sensitivities": _json_safe(selection["statistical_survivors"]),
+        "descriptive_best": _json_safe(selection["descriptive_best"]),
+        "correction": _selection_correction(selection),
+        "family_size": int(selection["family_size"]),
+        "family_sha256": selection["family_sha256"],
+        "family_provenance": selection["family_provenance"],
+    }
 
 
 def _build_manifest(
@@ -1477,13 +1287,6 @@ def _build_manifest(
                 "boundary": [str(test_start), str(test_end)],
                 "executable_as_of": [str(test_start), str(test_effective_end)],
                 "outcomes_end_by": str(test_end),
-                "evidence_class": "retrospective_previously_used_not_fresh_oos",
-            },
-            "locked_final": {
-                "start": str(LOCKED_FINAL_START),
-                "end": None,
-                "status": "locked_not_queried_or_evaluated",
-                "value_rows_queried": False,
             },
         },
         "purge": {
@@ -1493,14 +1296,12 @@ def _build_manifest(
             "test_calendar_purge_days": (test_end - test_effective_end).days,
         },
         "trial_grid": _json_safe(effective_grid),
+        "production_policy": _production_policy(),
         "n_trials": family.family_size,
         "family": family_metadata,
         "null": {
             "bootstrap_method": "centered_moving_block_bootstrap_max_stat",
             "n_bootstrap": n_permutations,
-            "member_identity_policy": (
-                "consensus_is_identity_invariant_no_member_identity_hypothesis"
-            ),
             "minimum_release_count": MIN_RELEASE_PERMUTATIONS,
             "minimum_family_resolution_bootstrap": max(
                 MIN_RELEASE_PERMUTATIONS,
@@ -1559,9 +1360,12 @@ def _json_safe(value):
 def _print_summary(output: dict) -> None:
     logger.info("Validation status: %s", output["status"])
     logger.info("Primary metric: %s", output["primary_metric"])
-    logger.info("Verdict: %s", output["verdict"])
-    if output["selected_config"] is None:
-        logger.warning(
-            "No deployable configuration: %s",
-            output["correction"].get("failure_reason"),
-        )
+    logger.info("Support status: %s", output["support_status"])
+    for phase in ("train", "test"):
+        report = output.get(phase, {})
+        if report.get("status") != "supported":
+            logger.warning(
+                "%s phase has no statistically supported sensitivity: %s",
+                phase,
+                report.get("failure_reason"),
+            )

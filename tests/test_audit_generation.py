@@ -19,6 +19,7 @@ from analyzer.database import Database
 from scripts.audit_generation import (
     PINNED_CANARY_COUNTS,
     audit_database,
+    check_house_generation_activation,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,7 +95,9 @@ def build_staged_db(db_path: Path) -> Database:
     db.upsert_metadata(metadata)
 
     generations = [
-        (2026, "gen-2026-a", "complete", "2026-07-01 00:00:00"),
+        # Older metadata-only state remains incomplete until its artifacts
+        # and parse outcomes are materialized.
+        (2026, "gen-2026-a", "incomplete", "2026-07-01 00:00:00"),
         (2026, "gen-2026-b", "complete", "2026-07-02 00:00:00"),
         (2025, "gen-2025-a", "complete", "2026-07-01 00:00:00"),
     ]
@@ -934,6 +937,118 @@ def test_incomplete_generation_is_informational_not_a_violation(tmp_path):
     )
 
 
+def test_audit_uses_latest_semantically_accepted_generation(tmp_path):
+    db_path = tmp_path / "semantic-fallback.duckdb"
+    db = Database(db_path)
+    metadata = pd.DataFrame(
+        [{
+            "doc_id": "semantic-doc",
+            "archive_year": 2024,
+            "first_name": "Jane",
+            "last_name": "Doe",
+            "filing_date": datetime(2024, 1, 3),
+            "filing_type": "P",
+            "fetched_at": datetime(2024, 1, 4),
+        }]
+    )
+    db.upsert_metadata(metadata)
+    generations = [
+        ("g1", "a" * 64, "2024-07-01 00:00:00", None),
+        ("g2", "b" * 64, "2024-07-02 00:00:00", date(2024, 1, 1)),
+    ]
+    for generation, artifact_sha, promoted_at, notification_date in generations:
+        db.conn.execute(
+            """
+            INSERT INTO house_archive_generations (
+                archive_year, generation_id, metadata_sha256,
+                metadata_count, ptr_count, parse_status, promoted_at
+            ) VALUES (2024, ?, 'metadata', 1, 1, 'complete', ?)
+            """,
+            [generation, promoted_at],
+        )
+        db.conn.execute(
+            """
+            INSERT INTO house_generation_metadata (
+                archive_year, generation_id, doc_id, first_name, last_name,
+                filing_date, filing_type, fetched_at
+            ) VALUES (2024, ?, 'semantic-doc', 'Jane', 'Doe',
+                      '2024-01-03', 'P', '2024-01-04')
+            """,
+            [generation],
+        )
+        db.conn.execute(
+            """
+            INSERT INTO house_pdf_artifacts (
+                archive_year, doc_id, generation_id, artifact_sha256
+            ) VALUES (2024, 'semantic-doc', ?, ?)
+            """,
+            [generation, artifact_sha],
+        )
+        db.upsert_transactions(
+            pd.DataFrame([{
+                "doc_id": "semantic-doc",
+                "member": "Jane Doe",
+                "ticker": "OLD" if generation == "g1" else "NEW",
+                "transaction_date": date(2024, 1, 2),
+                "disclosure_date": date(2024, 1, 3),
+                "notification_date": notification_date,
+                "transaction_type": "Purchase",
+                "chamber": "house",
+                "source_record_id": "semantic-doc",
+                "source_row_id": f"{generation}:r1",
+                "official_filing_date": date(2024, 1, 3),
+                "ingestion_generation": generation,
+                "artifact_sha256": artifact_sha,
+            }]),
+            source="house_pdf",
+        )
+        db.upsert_parse_run(
+            doc_id="semantic-doc",
+            year=2024,
+            parser_version="v4-deterministic",
+            status="success",
+            engines_attempted="pdfplumber",
+            raw_row_count=1,
+            transaction_count=1,
+            artifact_sha256=artifact_sha,
+            ingestion_generation=generation,
+        )
+        db.replace_source_reports(
+            generation,
+            "house_pdf",
+            "house",
+            pd.DataFrame([{
+                "ingestion_generation": generation,
+                "chamber": "house",
+                "source_record_id": "semantic-doc",
+                "report_path": f"{generation}.pdf",
+                "member": "Jane Doe",
+                "official_filing_date": date(2024, 1, 3),
+                "outcome": "parsed",
+                "artifact_sha256": artifact_sha,
+                "landing_sha256": artifact_sha,
+                "paper_artifact_url": None,
+                "paper_artifact_sha256": None,
+                "error_message": None,
+                "raw_row_count": 1,
+                "accepted_row_count": 1,
+                "rejected_row_count": 0,
+            }]),
+        )
+    db.close()
+
+    conn = duckdb.connect(str(db_path), read_only=True)
+    try:
+        check = check_house_generation_activation(conn)
+    finally:
+        conn.close()
+    assert any(
+        "g2 marked 'complete' but has 1 unresolved artifact(s): semantic-doc" in v
+        for v in check.violations
+    )
+    assert not any("canonical rows bound to generation" in v for v in check.violations)
+
+
 def test_unbound_persisted_house_row_is_reported(tmp_path):
     db_path = tmp_path / "stage.duckdb"
     db = build_staged_db(db_path)
@@ -986,7 +1101,7 @@ def test_canonical_null_date_is_reported(tmp_path):
     def fn(conn):
         conn.execute(
             "UPDATE transactions SET disclosure_date = NULL "
-            "WHERE doc_id = '10000001' AND source_row_id = '10000001:r1'"
+            "WHERE doc_id = 's1' AND source_row_id = 's1:r1'"
         )
 
     _mutate(db_path, fn)

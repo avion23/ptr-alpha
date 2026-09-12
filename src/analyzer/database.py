@@ -260,6 +260,91 @@ class Database:
         view_kind = "TEMP VIEW" if self._read_only else "VIEW"
         self.conn.execute(f"""
             CREATE OR REPLACE {view_kind} canonical_transactions AS
+            WITH accepted_house_generations AS (
+                SELECT candidate.archive_year,
+                       candidate.generation_id,
+                       candidate.promoted_at
+                FROM house_archive_generations candidate
+                WHERE candidate.parse_status = 'complete'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM house_generation_metadata scope
+                      LEFT JOIN house_pdf_artifacts artifact
+                        ON artifact.archive_year = scope.archive_year
+                       AND artifact.generation_id = scope.generation_id
+                       AND artifact.doc_id = scope.doc_id
+                      WHERE scope.archive_year = candidate.archive_year
+                        AND scope.generation_id = candidate.generation_id
+                        AND scope.filing_type = 'P'
+                        AND (
+                            artifact.doc_id IS NULL
+                            OR NOT EXISTS (
+                                SELECT 1
+                                FROM pdf_parse_runs parse_run
+                                WHERE parse_run.doc_id = artifact.doc_id
+                                  AND parse_run.artifact_sha256 = artifact.artifact_sha256
+                                  AND parse_run.ingestion_generation = artifact.generation_id
+                                  AND parse_run.status IN ('success', 'no_txs')
+                                  AND COALESCE(parse_run.transaction_count, 0) = (
+                                      SELECT COUNT(*)
+                                      FROM transactions tx_count
+                                      WHERE tx_count.doc_id = artifact.doc_id
+                                        AND tx_count.artifact_sha256 = artifact.artifact_sha256
+                                        AND tx_count.ingestion_generation = artifact.generation_id
+                                        AND tx_count.source = CASE
+                                            WHEN LOWER(COALESCE(parse_run.parser_version, ''))
+                                                 LIKE '%gemini%'
+                                            THEN 'gemini_ocr'
+                                            ELSE 'house_pdf'
+                                        END
+                                  )
+                                  AND (
+                                      parse_run.status = 'no_txs'
+                                      OR (
+                                          COALESCE(parse_run.transaction_count, 0) > 0
+                                          AND NOT EXISTS (
+                                              SELECT 1
+                                              FROM transactions tx_invalid
+                                              WHERE tx_invalid.doc_id = artifact.doc_id
+                                                AND tx_invalid.artifact_sha256 = artifact.artifact_sha256
+                                                AND tx_invalid.ingestion_generation = artifact.generation_id
+                                                AND tx_invalid.source = CASE
+                                                    WHEN LOWER(COALESCE(parse_run.parser_version, ''))
+                                                         LIKE '%gemini%'
+                                                    THEN 'gemini_ocr'
+                                                    ELSE 'house_pdf'
+                                                END
+                                                AND (
+                                                    tx_invalid.transaction_date IS NULL
+                                                    OR tx_invalid.disclosure_date IS NULL
+                                                    OR tx_invalid.transaction_date > tx_invalid.disclosure_date
+                                                    OR (
+                                                        tx_invalid.notification_date IS NOT NULL
+                                                        AND tx_invalid.notification_date < tx_invalid.transaction_date
+                                                    )
+                                                    OR tx_invalid.chamber IS NULL
+                                                    OR TRIM(tx_invalid.chamber) = ''
+                                                    OR tx_invalid.source_record_id IS NULL
+                                                    OR TRIM(tx_invalid.source_record_id) = ''
+                                                    OR tx_invalid.source_row_id IS NULL
+                                                    OR TRIM(tx_invalid.source_row_id) = ''
+                                                    OR tx_invalid.official_filing_date IS NULL
+                                                )
+                                          )
+                                      )
+                                  )
+                            )
+                        )
+                  )
+            ),
+            latest_accepted_house_generations AS (
+                SELECT archive_year, generation_id, promoted_at
+                FROM accepted_house_generations
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY archive_year
+                    ORDER BY promoted_at DESC, generation_id DESC
+                ) = 1
+            )
             SELECT t.* FROM transactions t
             WHERE (
                     t.source = 'senate_efd'
@@ -269,10 +354,9 @@ class Database:
                         t.ingestion_generation = (
                             SELECT active.generation_id
                             FROM house_archive_generations own
-                            JOIN house_archive_generations active
+                            JOIN latest_accepted_house_generations active
                               ON active.archive_year = own.archive_year
                             WHERE own.generation_id = t.ingestion_generation
-                              AND active.parse_status = 'complete'
                             ORDER BY active.promoted_at DESC, active.generation_id DESC
                             LIMIT 1
                         )

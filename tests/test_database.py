@@ -790,6 +790,122 @@ class TestTransactions(DatabaseTestCase):
             ["NEW"],
         )
 
+    def test_canonical_reader_rejects_semantically_incomplete_complete_generation(self):
+        metadata = pd.DataFrame(
+            [{
+                "doc_id": "semantic-doc",
+                "archive_year": 2024,
+                "first_name": "Jane",
+                "last_name": "Doe",
+                "filing_date": datetime(2024, 1, 3),
+                "filing_type": "P",
+                "fetched_at": datetime(2024, 1, 4),
+            }]
+        )
+        self.db.upsert_metadata(metadata)
+        generations = [
+            ("g1", "artifact-g1", "2024-07-01 00:00:00"),
+            ("g2", "artifact-g2", "2024-07-02 00:00:00"),
+        ]
+        for generation, artifact_sha, promoted_at in generations:
+            self.db.conn.execute(
+                """
+                INSERT INTO house_archive_generations (
+                    archive_year, generation_id, metadata_sha256,
+                    metadata_count, ptr_count, parse_status, promoted_at
+                ) VALUES (2024, ?, 'sha', 1, 1, 'complete', ?)
+                """,
+                [generation, promoted_at],
+            )
+            self.db.conn.execute(
+                """
+                INSERT INTO house_generation_metadata (
+                    archive_year, generation_id, doc_id, first_name, last_name,
+                    filing_date, filing_type, fetched_at
+                ) VALUES (
+                    2024, ?, 'semantic-doc', 'Jane', 'Doe',
+                    '2024-01-03', 'P', '2024-01-04'
+                )
+                """,
+                [generation],
+            )
+            self.db.conn.execute(
+                """
+                INSERT INTO house_pdf_artifacts (
+                    archive_year, doc_id, generation_id, artifact_sha256
+                ) VALUES (2024, 'semantic-doc', ?, ?)
+                """,
+                [generation, artifact_sha],
+            )
+
+        base = {
+            "doc_id": "semantic-doc",
+            "member": "Jane Doe",
+            "transaction_date": date(2024, 1, 2),
+            "disclosure_date": date(2024, 1, 3),
+            "transaction_type": "Purchase",
+            "chamber": "house",
+            "source_record_id": "semantic-doc",
+            "source_row_id": "semantic-doc:r1",
+            "official_filing_date": date(2024, 1, 3),
+        }
+        self.db.upsert_transactions(
+            pd.DataFrame([{
+                **base,
+                "ticker": "OLD",
+                "ingestion_generation": "g1",
+                "artifact_sha256": "artifact-g1",
+            }]),
+            source="house_pdf",
+        )
+        self.db.upsert_transactions(
+            pd.DataFrame([{
+                **base,
+                "ticker": "NEW",
+                "notification_date": date(2024, 1, 1),
+                "ingestion_generation": "g2",
+                "artifact_sha256": "artifact-g2",
+            }]),
+            source="house_pdf",
+        )
+        for generation, artifact_sha in (
+            ("g1", "artifact-g1"),
+            ("g2", "artifact-g2"),
+        ):
+            self.db.upsert_parse_run(
+                doc_id="semantic-doc",
+                year=2024,
+                parser_version="v4-deterministic",
+                status="success",
+                engines_attempted="pdfplumber",
+                raw_row_count=1,
+                transaction_count=1,
+                artifact_sha256=artifact_sha,
+                ingestion_generation=generation,
+            )
+
+        self.assertEqual(self.db.get_unresolved_house_doc_ids(2024, "g1"), [])
+        self.assertEqual(
+            self.db.get_unresolved_house_doc_ids(2024, "g2"), ["semantic-doc"]
+        )
+        self.assertEqual(
+            self.db.get_transactions_for_doc("semantic-doc")["ticker"].tolist(),
+            ["OLD"],
+        )
+
+        self.db.conn.execute(
+            """
+            UPDATE transactions
+            SET notification_date = NULL
+            WHERE doc_id = 'semantic-doc' AND ingestion_generation = 'g2'
+            """
+        )
+        self.assertEqual(self.db.get_unresolved_house_doc_ids(2024, "g2"), [])
+        self.assertEqual(
+            self.db.get_transactions_for_doc("semantic-doc")["ticker"].tolist(),
+            ["NEW"],
+        )
+
     def test_house_activation_refuses_partial_artifact_inventory(self):
         self.db.conn.execute(
             """

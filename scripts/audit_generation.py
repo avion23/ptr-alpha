@@ -36,8 +36,8 @@ Checks (each violation is reported exactly, and the process exits nonzero):
       (parse_status='complete') only with zero unresolved artifacts (every
       artifact has a terminal success/no_txs run bound to it and exactly one
       source report); canonical House/OCR rows must come from the latest
-      complete generation of their archive year; persisted House/OCR rows must
-      be artifact-bound.
+      semantically accepted complete generation of their archive year;
+      persisted House/OCR rows must be artifact-bound.
   C9  chronology / date-domain        dates within [1900-01-01, today+1];
       canonical rows must carry transaction_date and disclosure_date; when both
       are present disclosure_date must be >= transaction_date; producer-
@@ -897,11 +897,92 @@ def check_canary_counts(conn: duckdb.DuckDBPyConnection) -> CheckResult:
 
 
 # ── C8 ────────────────────────────────────────────────────────────────────────
+def _get_unresolved_house_doc_ids(
+    conn: duckdb.DuckDBPyConnection,
+    archive_year: int,
+    generation_id: str,
+) -> list[str]:
+    """Apply the same authoritative House completeness contract as Database."""
+    rows = conn.execute(
+        """
+        SELECT scope.doc_id
+        FROM house_generation_metadata scope
+        LEFT JOIN house_pdf_artifacts artifact
+          ON artifact.archive_year = scope.archive_year
+         AND artifact.generation_id = scope.generation_id
+         AND artifact.doc_id = scope.doc_id
+        WHERE scope.archive_year = ? AND scope.generation_id = ?
+          AND scope.filing_type = 'P'
+          AND (
+            artifact.doc_id IS NULL
+            OR NOT EXISTS (
+                SELECT 1
+                FROM pdf_parse_runs parse_run
+                WHERE parse_run.doc_id = artifact.doc_id
+                  AND parse_run.artifact_sha256 = artifact.artifact_sha256
+                  AND parse_run.ingestion_generation = artifact.generation_id
+                  AND parse_run.status IN ('success', 'no_txs')
+                  AND COALESCE(parse_run.transaction_count, 0) = (
+                      SELECT COUNT(*)
+                      FROM transactions tx_count
+                      WHERE tx_count.doc_id = artifact.doc_id
+                        AND tx_count.artifact_sha256 = artifact.artifact_sha256
+                        AND tx_count.ingestion_generation = artifact.generation_id
+                        AND tx_count.source = CASE
+                            WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
+                            THEN 'gemini_ocr'
+                            ELSE 'house_pdf'
+                        END
+                  )
+                  AND (
+                      parse_run.status = 'no_txs'
+                      OR (
+                          COALESCE(parse_run.transaction_count, 0) > 0
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM transactions tx_invalid
+                              WHERE tx_invalid.doc_id = artifact.doc_id
+                                AND tx_invalid.artifact_sha256 = artifact.artifact_sha256
+                                AND tx_invalid.ingestion_generation = artifact.generation_id
+                                AND tx_invalid.source = CASE
+                                    WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
+                                    THEN 'gemini_ocr'
+                                    ELSE 'house_pdf'
+                                END
+                                AND (
+                                    tx_invalid.transaction_date IS NULL
+                                    OR tx_invalid.disclosure_date IS NULL
+                                    OR tx_invalid.transaction_date > tx_invalid.disclosure_date
+                                    OR (
+                                        tx_invalid.notification_date IS NOT NULL
+                                        AND tx_invalid.notification_date < tx_invalid.transaction_date
+                                    )
+                                    OR tx_invalid.chamber IS NULL
+                                    OR TRIM(tx_invalid.chamber) = ''
+                                    OR tx_invalid.source_record_id IS NULL
+                                    OR TRIM(tx_invalid.source_record_id) = ''
+                                    OR tx_invalid.source_row_id IS NULL
+                                    OR TRIM(tx_invalid.source_row_id) = ''
+                                    OR tx_invalid.official_filing_date IS NULL
+                                )
+                          )
+                      )
+                  )
+            )
+          )
+        ORDER BY scope.doc_id
+        """,
+        [archive_year, generation_id],
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckResult:
     result = CheckResult(
         "house_generation_activation",
         "complete generations have zero unresolved artifacts; canonical rows "
-        "come from the latest complete generation and every artifact has one "
+        "come from the latest semantically accepted complete generation and "
+        "every artifact has one "
         "matching House source report",
     )
     if not _table_exists(conn, "house_archive_generations"):
@@ -909,6 +990,8 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
         return result
     if not _table_exists(conn, "house_pdf_artifacts"):
         result.violations.append("house_pdf_artifacts table missing")
+    if not _table_exists(conn, "house_generation_metadata"):
+        result.violations.append("house_generation_metadata table missing")
     if not _table_exists(conn, "pdf_parse_runs"):
         result.violations.append("pdf_parse_runs table missing")
     if not _table_exists(conn, "source_reports"):
@@ -917,11 +1000,16 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
         return result
 
     generations = conn.execute(
-        "SELECT archive_year, generation_id, parse_status "
-        "FROM house_archive_generations ORDER BY archive_year, generation_id"
+        "SELECT archive_year, generation_id, parse_status, promoted_at "
+        "FROM house_archive_generations "
+        "ORDER BY archive_year, promoted_at ASC NULLS FIRST, generation_id"
     ).fetchall()
-    for archive_year, generation_id, parse_status in generations:
-        unresolved = conn.execute(
+    latest_accepted: dict[int, str] = {}
+    for archive_year, generation_id, parse_status, _promoted_at in generations:
+        semantic_unresolved = _get_unresolved_house_doc_ids(
+            conn, archive_year, generation_id
+        )
+        artifact_unresolved = conn.execute(
             """
             SELECT a.doc_id
             FROM house_pdf_artifacts a
@@ -937,8 +1025,14 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
             """,
             [archive_year, generation_id],
         ).fetchall()
+        unresolved = sorted(
+            {
+                *semantic_unresolved,
+                *(str(row[0]) for row in artifact_unresolved),
+            }
+        )
         if parse_status == "complete" and unresolved:
-            doc_ids = ", ".join(str(row[0]) for row in unresolved[:10])
+            doc_ids = ", ".join(unresolved[:10])
             result.violations.append(
                 f"archive {archive_year} generation {generation_id} marked "
                 f"'complete' but has {len(unresolved)} unresolved artifact(s): "
@@ -949,6 +1043,11 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
                 f"archive {archive_year} generation {generation_id} correctly "
                 f"incomplete ({len(unresolved)} unresolved artifact(s))"
             )
+        elif parse_status == "complete" and not semantic_unresolved:
+            # The view uses this same semantic predicate before choosing the
+            # latest generation, so an invalid newer marker cannot shadow an
+            # earlier accepted generation.
+            latest_accepted[archive_year] = str(generation_id)
 
         # A complete House generation must have one source-report row for
         # every authoritative artifact, including terminal no_txs documents.
@@ -1175,7 +1274,8 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
             f"to a terminal run: {preview}"
         )
 
-    # Canonical House/OCR rows must come from the latest complete generation.
+    # Canonical House/OCR rows must come from the latest semantically accepted
+    # complete generation.
     if not _view_exists(conn, "canonical_transactions"):
         result.violations.append("canonical_transactions view missing")
         return result
@@ -1192,22 +1292,14 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
         """
     ).fetchall()
     for doc_id, source, generation, archive_year in canonical_house:
-        latest_complete = conn.execute(
-            """
-            SELECT generation_id FROM house_archive_generations
-            WHERE archive_year = ? AND parse_status = 'complete'
-            ORDER BY promoted_at DESC, generation_id DESC
-            LIMIT 1
-            """,
-            [archive_year],
-        ).fetchone()
+        latest_complete = latest_accepted.get(archive_year)
         if latest_complete is None:
             continue
-        if generation != latest_complete[0]:
+        if generation != latest_complete:
             result.violations.append(
                 f"{doc_id} ({source}): canonical rows bound to generation "
-                f"{generation!r}, but archive {archive_year} latest complete "
-                f"generation is {latest_complete[0]!r}"
+                f"{generation!r}, but archive {archive_year} latest accepted "
+                f"complete generation is {latest_complete!r}"
             )
     return result
 

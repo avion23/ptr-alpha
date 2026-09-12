@@ -38,6 +38,43 @@ def test_senate_ingest_rejects_generation_provenance_rewrite(tmp_path):
         )
 
 
+def test_primary_text_preflight_only_prioritizes_reconcilable_candidates(monkeypatch):
+    from scripts import rebuild_staged
+
+    row = {
+        "asset_description": "Apple Inc. (AAPL)",
+        "transaction_type": "Purchase",
+        "transaction_date": pd.Timestamp("2026-01-02"),
+        "amount_raw": "$1,001 - $15,000",
+        "owner_code": "JT",
+        "notification_date": pd.Timestamp("2026-01-03"),
+    }
+    monkeypatch.setattr(
+        rebuild_staged._parser_cascade,
+        "_try_pdfplumber",
+        lambda _path: [row],
+    )
+    monkeypatch.setattr(
+        rebuild_staged._parser_cascade,
+        "_try_pdftotext",
+        lambda _path: [dict(row)],
+    )
+    assert rebuild_staged._primary_text_engines_reconcile(
+        rebuild_staged.Path("matching.pdf")
+    )
+
+    conflicting = dict(row)
+    conflicting["transaction_date"] = pd.Timestamp("2026-01-04")
+    monkeypatch.setattr(
+        rebuild_staged._parser_cascade,
+        "_try_pdftotext",
+        lambda _path: [conflicting],
+    )
+    assert not rebuild_staged._primary_text_engines_reconcile(
+        rebuild_staged.Path("conflicting.pdf")
+    )
+
+
 def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
     monkeypatch, tmp_path
 ):
@@ -101,6 +138,10 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         def __exit__(self, *_args):
             return False
 
+        def map(self, worker, paths, chunksize=1):
+            assert chunksize == 1
+            return [worker(path) for path in paths]
+
         def imap_unordered(self, worker, paths, chunksize=1):
             assert chunksize == 1
             for path in paths:
@@ -143,6 +184,11 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         ),
     )
     monkeypatch.setattr(rebuild_staged, "Pool", FakePool)
+    monkeypatch.setattr(
+        rebuild_staged,
+        "_primary_text_engines_reconcile",
+        lambda path: path == fallback_path,
+    )
     monkeypatch.setattr(rebuild_staged, "_parse_pdf_worker", fake_parser)
     monkeypatch.setattr(rebuild_staged, "consolidate_transactions", fake_consolidate)
     monkeypatch.setattr(

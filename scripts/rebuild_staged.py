@@ -253,6 +253,27 @@ def _tolerant_parse_worker(pdf_path: Path):
     return _production_tolerant_parse_worker(pdf_path, _parse_pdf_worker)
 
 
+def _primary_text_engines_reconcile(pdf_path: Path) -> bool:
+    """Predict a cheap text-cascade success for scheduling only.
+
+    This does not authorize a parse result. The full production cascade still
+    runs afterward. It only moves PDFs whose pdfplumber/pdftotext identities
+    already form a multiset subset relation ahead of uncertain/OCR-heavy PDFs.
+    """
+    try:
+        pdfplumber_rows = _parser_cascade._try_pdfplumber(pdf_path)
+        pdftotext_rows = _parser_cascade._try_pdftotext(pdf_path)
+    except Exception:  # noqa: BLE001 -- scheduling hint must never block parsing
+        return False
+    if not pdfplumber_rows or not pdftotext_rows:
+        return False
+    pdfplumber_counts = _parser_cascade._candidate_counts(pdfplumber_rows)[0]
+    pdftotext_counts = _parser_cascade._candidate_counts(pdftotext_rows)[0]
+    return _parser_cascade._multiset_subset(
+        pdfplumber_counts, pdftotext_counts
+    ) or _parser_cascade._multiset_subset(pdftotext_counts, pdfplumber_counts)
+
+
 def _persist_house_parse_batch(
     db: Database,
     *,
@@ -401,17 +422,6 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
                 [year, ingestion_generation],
             ).fetchall()
         }
-        order = sorted(
-            range(len(pdf_paths)),
-            key=lambda index: (
-                pdf_paths[index].stem in previously_attempted,
-                pdf_paths[index].stem,
-            ),
-        )
-        pdf_paths = [pdf_paths[index] for index in order]
-        existing_docs = existing_docs.iloc[order].reset_index(drop=True)
-
-        member_lookup = _build_member_lookup(existing_docs)
         settings = _settings_for(staging)
         workers = settings.data.get_workers()
         persist_batch_size = max(4, workers)
@@ -438,6 +448,20 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
 
         completed: list = []
         with Pool(workers) as pool:
+            primary_text_ready = pool.map(
+                _primary_text_engines_reconcile, pdf_paths, chunksize=1
+            )
+            order = sorted(
+                range(len(pdf_paths)),
+                key=lambda index: (
+                    pdf_paths[index].stem in previously_attempted,
+                    not primary_text_ready[index],
+                    pdf_paths[index].stem,
+                ),
+            )
+            pdf_paths = [pdf_paths[index] for index in order]
+            existing_docs = existing_docs.iloc[order].reset_index(drop=True)
+            member_lookup = _build_member_lookup(existing_docs)
             for result in pool.imap_unordered(
                 _tolerant_parse_worker, pdf_paths, chunksize=1
             ):

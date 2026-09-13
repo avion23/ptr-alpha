@@ -22,9 +22,6 @@ from scripts.gemini_ocr_common import (
 )
 from scripts.ocr_zero_rows import (
     _record_failed_ocr_attempt,
-    _resolve_ingestion_generation,
-    get_filing_date,
-    get_metadata_member,
     get_ocr_work_items,
     insert_transactions,
     load_progress,
@@ -146,7 +143,15 @@ def process_one(
     parser_version=GEMINI_PARSER_VERSION,
     model=MODEL,
 ):
-    doc_id, year, pdf_path = item
+    (
+        doc_id,
+        year,
+        pdf_path,
+        ingestion_generation,
+        expected_artifact_sha256,
+        filing_date,
+        expected_member,
+    ) = item
     output, error, artifact_metadata = call_gemini(
         pdf_path,
         doc_id=doc_id,
@@ -156,21 +161,15 @@ def process_one(
         parser_version=parser_version,
         model=model,
     )
-    ingestion_generation = None
-    filing_date = None
-    expected_member = None
-    if artifact_metadata is not None:
-        connection = duckdb.connect(DB_PATH)
-        try:
-            ingestion_generation = _resolve_ingestion_generation(
-                connection, doc_id, year, artifact_metadata.sha256
-            )
-            filing_date = get_filing_date(connection, doc_id)
-            expected_member = get_metadata_member(connection, doc_id)
-        except RuntimeError as exc:
-            output, error = None, str(exc)
-        finally:
-            connection.close()
+    if (
+        artifact_metadata is not None
+        and artifact_metadata.sha256 != expected_artifact_sha256
+    ):
+        output = None
+        error = (
+            "OCR artifact hash changed after work selection: "
+            f"expected={expected_artifact_sha256} actual={artifact_metadata.sha256}"
+        )
     if output is None or error:
         _record_failure(
             doc_id,
@@ -178,7 +177,7 @@ def process_one(
             "error",
             0,
             error,
-            artifact_sha256=(artifact_metadata.sha256 if artifact_metadata else None),
+            artifact_sha256=expected_artifact_sha256,
             ingestion_generation=ingestion_generation,
             parser_version=parser_version,
             model=model,
@@ -198,7 +197,7 @@ def process_one(
                 "member": parsed.member,
                 "transactions": [],
                 "raw_count": 0,
-                "artifact_sha256": artifact_metadata.sha256,
+                "artifact_sha256": expected_artifact_sha256,
                 "ingestion_generation": ingestion_generation,
                 "parser_version": parser_version,
                 "model": model,
@@ -227,7 +226,7 @@ def process_one(
             status,
             parsed.raw_row_count,
             message,
-            artifact_sha256=artifact_metadata.sha256,
+            artifact_sha256=expected_artifact_sha256,
             ingestion_generation=ingestion_generation,
             parser_version=parser_version,
             model=model,
@@ -240,7 +239,7 @@ def process_one(
             "error",
             parsed.raw_row_count,
             "semantic_zero_after_raw_rows",
-            artifact_sha256=artifact_metadata.sha256,
+            artifact_sha256=expected_artifact_sha256,
             ingestion_generation=ingestion_generation,
             parser_version=parser_version,
             model=model,
@@ -256,7 +255,7 @@ def process_one(
             "member": member,
             "transactions": transactions,
             "raw_count": parsed.raw_row_count,
-            "artifact_sha256": artifact_metadata.sha256,
+            "artifact_sha256": expected_artifact_sha256,
             "ingestion_generation": ingestion_generation,
             "parser_version": parser_version,
             "model": model,
@@ -266,12 +265,65 @@ def process_one(
 
 
 def _page_count_hint(item) -> tuple[int, int, str]:
-    doc_id, year, pdf_path = item
+    doc_id, year, pdf_path = item[:3]
     try:
         pages = pdf_page_count(pdf_path)
     except Exception:
         pages = 10**9
     return int(year), pages, str(doc_id)
+
+
+def _bind_work_items(pending):
+    """Bind unresolved PDFs to one immutable staged generation before threading."""
+    connection = duckdb.connect(DB_PATH)
+    try:
+        bound = []
+        for doc_id, year, pdf_path in pending:
+            row = connection.execute(
+                """
+                SELECT a.generation_id, a.artifact_sha256,
+                       m.filing_date, m.first_name, m.last_name
+                FROM house_pdf_artifacts a
+                JOIN house_generation_metadata m
+                  ON m.archive_year = a.archive_year
+                 AND m.generation_id = a.generation_id
+                 AND m.doc_id = a.doc_id
+                JOIN house_archive_generations g
+                  ON g.archive_year = a.archive_year
+                 AND g.generation_id = a.generation_id
+                WHERE a.archive_year = ? AND a.doc_id = ?
+                  AND m.filing_type = 'P'
+                ORDER BY g.promoted_at DESC, a.generation_id DESC
+                LIMIT 1
+                """,
+                [int(year), str(doc_id)],
+            ).fetchone()
+            if row is None or not row[0] or not row[1]:
+                raise RuntimeError(
+                    f"House OCR work item lacks generation/artifact binding: {year}/{doc_id}"
+                )
+            generation, artifact_sha256, filing_date, first_name, last_name = row
+            member = " ".join(
+                str(part).strip() for part in (first_name, last_name) if part
+            ).strip()
+            if not member:
+                raise RuntimeError(
+                    f"House OCR work item lacks member metadata: {year}/{doc_id}"
+                )
+            bound.append(
+                (
+                    str(doc_id),
+                    int(year),
+                    str(pdf_path),
+                    str(generation),
+                    str(artifact_sha256),
+                    filing_date,
+                    member,
+                )
+            )
+        return bound
+    finally:
+        connection.close()
 
 
 def main():
@@ -325,6 +377,7 @@ def main():
     pending = sorted(dict.fromkeys(pending), key=_page_count_hint)
     if args.max_docs is not None:
         pending = pending[: max(0, int(args.max_docs))]
+    pending = _bind_work_items(pending)
     print(
         f"Current unresolved work: {len(pending)} (parallelism: {MAX_WORKERS}, "
         f"model={args.model}, parser={args.parser_version})"
@@ -352,7 +405,7 @@ def main():
                 for item in pending
             }
             for future in as_completed(futures):
-                doc_id, year, _ = futures[future]
+                doc_id, year, *_ = futures[future]
                 try:
                     result_doc, _, status, inserted, _ = future.result()
                 except Exception as exc:

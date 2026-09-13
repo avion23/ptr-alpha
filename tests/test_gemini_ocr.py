@@ -218,6 +218,34 @@ def test_cache_identity_includes_explicit_model_and_parser(monkeypatch, tmp_path
     assert envelope["parser_version"] == gemini_ocr_common.GEMINI_35_PARSER_VERSION
 
 
+def test_non_gemini_model_omits_temperature_option(monkeypatch, tmp_path):
+    pdf = tmp_path / "sample.pdf"
+    pdf.write_bytes(b"%PDF-canary")
+    calls = []
+
+    def fake_run(args, capture_output, text, timeout):
+        calls.append(args)
+
+        class Result:
+            returncode = 0
+            stdout = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
+    output, error, _ = gemini_ocr_common.call_gemini(
+        str(pdf),
+        model="gpt-5.6-sol",
+        parser_version="v7-gpt-5.6-sol",
+        cache_dir=str(tmp_path),
+    )
+
+    assert output is not None
+    assert error == ""
+    assert "temperature" not in calls[0]
+
+
 def test_cache_is_invalidated_when_pdf_changes(monkeypatch, tmp_path):
     pdf = tmp_path / "sample.pdf"
     pdf.write_bytes(b"%PDF-first")

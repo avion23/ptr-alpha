@@ -491,18 +491,12 @@ def call_gemini(
                 )
                 if cached is not None:
                     return cached, "", metadata
+            command = ["llm", "-m", model, "-a", str(snapshot.path)]
+            if model.startswith("gemini/"):
+                command.extend(["-o", "temperature", "0"])
+            command.append(PROMPT)
             result = subprocess.run(
-                [
-                    "llm",
-                    "-m",
-                    model,
-                    "-a",
-                    str(snapshot.path),
-                    "-o",
-                    "temperature",
-                    "0",
-                    PROMPT,
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=timeout,

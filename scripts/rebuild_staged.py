@@ -422,30 +422,32 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
             raise RuntimeError(f"house-parse {year}: no PDF files found in {pdf_dir}")
 
         # PDFs failing validation carry no trustworthy hash and must never
-        # cache-hit; they stay retryable and fail closed via unresolved docs.
+        # become terminal. Selection is semantic rather than parser-version
+        # specific so a validated Gemini/no_txs result is not redundantly sent
+        # back through the deterministic cascade.
         artifact_hashes = {
             path.stem: sha
             for path in pdf_paths
             if (sha := _validated_pdf_sha256(path)) is not None
         }
-        cached = db.parse_runs.get_cached_doc_ids(
-            year=year,
-            parser_version=_PARSE_VERSION,
-            artifact_hashes=artifact_hashes,
-            ingestion_generation=ingestion_generation,
+        unresolved_doc_ids = set(
+            db.get_unresolved_house_doc_ids(year, ingestion_generation)
         )
-        if cached:
-            keep_mask = (
-                existing_docs["DocID"].astype(str).map(lambda d: d not in cached).to_numpy()
-            )
-            pdf_paths = [p for p, keep in zip(pdf_paths, keep_mask) if keep]
-            existing_docs = (
-                existing_docs[keep_mask]
-                if len(keep_mask)
-                else existing_docs.iloc[0:0]
-            )
+        keep_mask = (
+            existing_docs["DocID"]
+            .astype(str)
+            .map(lambda doc_id: doc_id in unresolved_doc_ids)
+            .to_numpy()
+        )
+        skipped_terminal = len(pdf_paths) - int(keep_mask.sum())
+        pdf_paths = [path for path, keep in zip(pdf_paths, keep_mask) if keep]
+        existing_docs = (
+            existing_docs[keep_mask]
+            if len(keep_mask)
+            else existing_docs.iloc[0:0]
+        )
         if not pdf_paths:
-            return {"attempted": 0, "skipped_cached": len(cached)}
+            return {"attempted": 0, "skipped_cached": skipped_terminal}
 
         # Terminal successes/no_txs were removed above. Previously attempted
         # nonterminal documents have already failed the full cascade, so do not
@@ -531,7 +533,7 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
 
         return {
             "attempted": attempted,
-            "skipped_cached": len(cached),
+            "skipped_cached": skipped_terminal,
             "parse_run_statuses": by_status,
             "persisted_transactions": persisted_transactions,
             "ingestion_generation": ingestion_generation,

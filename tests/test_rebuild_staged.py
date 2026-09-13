@@ -141,6 +141,11 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
             assert year == 2026
             return "generation-2026"
 
+        def get_unresolved_house_doc_ids(self, year, generation):
+            assert year == 2026
+            assert generation == "generation-2026"
+            return ["fallback", "failed"]
+
         def replace_transactions_for_docs(self, dataframe, **kwargs):
             self.replacements.append((dataframe.copy(), kwargs))
             by_doc_total = {
@@ -260,7 +265,7 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
 ):
     from scripts import rebuild_staged
 
-    stems = ["fast2", "defer", "retry", "fast1"]
+    stems = ["fast2", "defer", "retry", "fast1", "terminal"]
     paths = [tmp_path / f"{stem}.pdf" for stem in stems]
     for path in paths:
         path.write_bytes(b"%PDF-test\n%%EOF")
@@ -285,6 +290,9 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
         ),
         parse_runs=SimpleNamespace(get_cached_doc_ids=lambda **_kwargs: set()),
         get_latest_house_generation=lambda _year: "generation",
+        get_unresolved_house_doc_ids=lambda _year, _generation: [
+            "fast2", "defer", "retry", "fast1"
+        ],
     )
 
     text_requested = []
@@ -341,7 +349,13 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
         ),
     )
     monkeypatch.setattr(rebuild_staged, "Pool", FakePool)
-    page_counts = {"fast2": 1, "retry": 1, "fast1": 2, "defer": 3}
+    page_counts = {
+        "fast2": 1,
+        "retry": 1,
+        "terminal": 1,
+        "fast1": 2,
+        "defer": 3,
+    }
     monkeypatch.setattr(
         rebuild_staged,
         "_pdf_page_count_hint",

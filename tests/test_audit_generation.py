@@ -641,6 +641,27 @@ def test_paper_only_provenance_is_audited(tmp_path):
     assert any("invalid Senate paper provenance" in v for v in check.violations)
 
 
+def test_incomplete_house_generation_does_not_require_final_source_reports(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    def fn(conn):
+        conn.execute(
+            "UPDATE house_archive_generations SET parse_status = 'incomplete' "
+            "WHERE archive_year = 2025 AND generation_id = 'gen-2025-a'"
+        )
+        conn.execute(
+            "DELETE FROM source_reports "
+            "WHERE ingestion_generation = 'gen-2025-a' "
+            "AND source IN ('house_pdf', 'gemini_ocr')"
+        )
+
+    _mutate(db_path, fn)
+    check = _result(_audit(db_path), "source_reports_equation")
+    assert check.passed, check.violations
+
+
 def _convert_house_doc_to_no_txs(conn, doc_id="10000001"):
     conn.execute(
         "DELETE FROM transactions WHERE doc_id = ? AND source IN ('house_pdf', 'gemini_ocr')",

@@ -777,7 +777,7 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
         """
         SELECT t.source, t.chamber, t.ingestion_generation,
                t.source_record_id, COUNT(*) AS rows
-        FROM transactions t
+        FROM canonical_transactions t
         LEFT JOIN source_reports r
           ON r.ingestion_generation = t.ingestion_generation
          AND r.source = t.source
@@ -805,7 +805,7 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
                 FROM (
                     SELECT t.source, t.chamber, t.ingestion_generation,
                            t.source_record_id
-                    FROM transactions t
+                    FROM canonical_transactions t
                     LEFT JOIN source_reports r
                       ON r.ingestion_generation = t.ingestion_generation
                      AND r.source = t.source

@@ -1107,6 +1107,7 @@ def _ingest_cached_gemini_year(
                 artifact_sha256=artifact_sha256,
                 ingestion_generation=generation,
                 engine_model=model,
+                checkpoint=False,
             )
             expected_count = len(validated)
             run = db.conn.execute(

@@ -1204,6 +1204,7 @@ def insert_transactions(
     artifact_sha256: str | None = None,
     ingestion_generation: str | None = None,
     engine_model: str = MODEL,
+    checkpoint: bool = True,
 ):
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
@@ -1379,7 +1380,8 @@ def insert_transactions(
                 ingestion_generation=ingestion_generation,
                 engines_attempted=engine_model,
             )
-        conn.execute("CHECKPOINT")
+        if checkpoint:
+            conn.execute("CHECKPOINT")
         conn.close()
         return 0
 
@@ -1503,7 +1505,8 @@ def insert_transactions(
         )
         conn.execute("COMMIT")
         committed = True
-        conn.execute("CHECKPOINT")
+        if checkpoint:
+            conn.execute("CHECKPOINT")
         return count
     except Exception as exc:
         if not committed:

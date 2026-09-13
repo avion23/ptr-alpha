@@ -274,6 +274,31 @@ def _tolerant_parse_worker(pdf_path: Path):
 _TEXT_PASS_BUDGET_SECONDS = 30
 
 
+def _pdf_page_count_hint(pdf_path: Path) -> int:
+    """Return a cheap page-count scheduling hint; unreadable PDFs sort last."""
+    try:
+        probe = subprocess.run(  # noqa: S603
+            ["pdfinfo", str(pdf_path)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return sys.maxsize
+    if probe.returncode != 0:
+        return sys.maxsize
+    for line in probe.stdout.splitlines():
+        if not line.startswith("Pages:"):
+            continue
+        try:
+            pages = int(line.split(":", 1)[1].strip())
+        except ValueError:
+            return sys.maxsize
+        return pages if pages > 0 else sys.maxsize
+    return sys.maxsize
+
+
 def _tolerant_text_parse_worker(pdf_path: Path):
     """Bound the trusted-text pass and defer every uncertain result to OCR."""
     return _production_tolerant_parse_worker(
@@ -439,7 +464,13 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
                 [year, ingestion_generation],
             ).fetchall()
         }
-        order = sorted(range(len(pdf_paths)), key=lambda index: pdf_paths[index].stem)
+        order = sorted(
+            range(len(pdf_paths)),
+            key=lambda index: (
+                _pdf_page_count_hint(pdf_paths[index]),
+                pdf_paths[index].stem,
+            ),
+        )
         pdf_paths = [pdf_paths[index] for index in order]
         existing_docs = existing_docs.iloc[order].reset_index(drop=True)
         member_lookup = _build_member_lookup(existing_docs)

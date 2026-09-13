@@ -341,6 +341,12 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
         ),
     )
     monkeypatch.setattr(rebuild_staged, "Pool", FakePool)
+    page_counts = {"fast2": 1, "retry": 1, "fast1": 2, "defer": 3}
+    monkeypatch.setattr(
+        rebuild_staged,
+        "_pdf_page_count_hint",
+        lambda path: page_counts[path.stem],
+    )
     monkeypatch.setattr(rebuild_staged, "_tolerant_text_parse_worker", fake_text_worker)
     monkeypatch.setattr(rebuild_staged, "_tolerant_parse_worker", fake_full_worker)
     monkeypatch.setattr(rebuild_staged, "_persist_house_parse_batch", fake_persist)
@@ -349,9 +355,9 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
         tmp_path, cast(rebuild_staged.Database, db), 2026
     )
 
-    assert text_requested == ["defer", "fast1", "fast2"]
+    assert text_requested == ["fast2", "fast1", "defer"]
     assert full_requested == ["defer", "retry"]
-    assert persisted == [["fast1", "fast2"], ["defer"], ["retry"]]
+    assert persisted == [["fast2", "fast1"], ["defer"], ["retry"]]
     assert result["attempted"] == 4
 
 

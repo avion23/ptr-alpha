@@ -425,10 +425,10 @@ def parse_output(output):
 
 
 def normalize_date(date_str):
-    """Convert MM/DD/YY or MM/DD/YYYY to YYYY-MM-DD for DuckDB."""
+    """Convert strict MM/DD[/YY] or MM-DD[-YY] dates to YYYY-MM-DD."""
     if not date_str:
         return None
-    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", date_str.strip())
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", date_str.strip())
     if not m:
         return None
     month, day, year = m.groups()

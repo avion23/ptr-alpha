@@ -8,7 +8,7 @@ import pandas as pd
 
 from analyzer.database import Database
 from scripts import gemini_ocr_common
-from scripts.ocr_zero_rows import insert_transactions
+from scripts.ocr_zero_rows import insert_transactions, normalize_date
 
 
 OCR_SCHEMA_COLUMNS = {
@@ -63,6 +63,12 @@ def _tx(asset="Apple Inc. (AAPL)", date="01/15/24", tx_type="Purchase", amount="
         "amount_letter": amount,
         "amount_midpoint": 8000,
     }
+
+
+def test_normalize_date_accepts_slash_and_hyphen_formats():
+    assert normalize_date("1/5/24") == "2024-01-05"
+    assert normalize_date("01-05-2024") == "2024-01-05"
+    assert normalize_date("2024-01-05") is None
 
 
 def test_validation_has_no_fixed_row_cap_for_large_real_filings():

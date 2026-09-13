@@ -390,6 +390,16 @@ def test_cli_exit_zero_with_json_output(tmp_path):
     }
 
 
+def test_audit_parser_source_recognizes_validated_non_gemini_llm_backends():
+    from scripts.audit_generation import _run_source_for_parser
+
+    assert _run_source_for_parser(
+        "v9-ling-3.0-flash-vl", "openrouter/inclusionai/ling-3.0-flash-vl:free"
+    ) == "gemini_ocr"
+    assert _run_source_for_parser("v7-gpt-5.6-sol", "gpt-5.6-sol") == "gemini_ocr"
+    assert _run_source_for_parser("v4-deterministic", "pdfplumber") == "house_pdf"
+
+
 def test_cli_missing_database_exits_two(tmp_path):
     env = {"PYTHONPATH": str(ROOT / "src")}
     completed = subprocess.run(

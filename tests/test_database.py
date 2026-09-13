@@ -906,6 +906,71 @@ class TestTransactions(DatabaseTestCase):
             ["NEW"],
         )
 
+    def test_house_semantic_acceptance_treats_validated_ling_as_ocr_source(self):
+        generation = "g-ling"
+        artifact_sha = "artifact-ling"
+        self.db.conn.execute(
+            """
+            INSERT INTO house_archive_generations (
+                archive_year, generation_id, metadata_sha256,
+                metadata_count, ptr_count, parse_status
+            ) VALUES (2024, ?, 'sha', 1, 1, 'incomplete')
+            """,
+            [generation],
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO house_generation_metadata (
+                archive_year, generation_id, doc_id, first_name, last_name,
+                filing_date, filing_type, fetched_at
+            ) VALUES (2024, ?, 'ling-doc', 'Jane', 'Doe',
+                      '2024-01-03', 'P', '2024-01-04')
+            """,
+            [generation],
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO house_pdf_artifacts (
+                archive_year, doc_id, generation_id, artifact_sha256
+            ) VALUES (2024, 'ling-doc', ?, ?)
+            """,
+            [generation, artifact_sha],
+        )
+        self.db.upsert_transactions(
+            pd.DataFrame(
+                [
+                    {
+                        "doc_id": "ling-doc",
+                        "member": "Jane Doe",
+                        "ticker": "AAPL",
+                        "transaction_date": date(2024, 1, 2),
+                        "disclosure_date": date(2024, 1, 3),
+                        "transaction_type": "Purchase",
+                        "chamber": "House",
+                        "source_record_id": "ling-doc",
+                        "source_row_id": "ling-doc:page:1:row:1",
+                        "official_filing_date": date(2024, 1, 3),
+                        "ingestion_generation": generation,
+                        "artifact_sha256": artifact_sha,
+                    }
+                ]
+            ),
+            source="gemini_ocr",
+        )
+        self.db.upsert_parse_run(
+            doc_id="ling-doc",
+            year=2024,
+            parser_version="v9-ling-3.0-flash-vl",
+            status="success",
+            engines_attempted="openrouter/inclusionai/ling-3.0-flash-vl:free",
+            raw_row_count=1,
+            transaction_count=1,
+            artifact_sha256=artifact_sha,
+            ingestion_generation=generation,
+        )
+
+        self.assertEqual(self.db.get_unresolved_house_doc_ids(2024, generation), [])
+
     def test_house_activation_refuses_partial_artifact_inventory(self):
         self.db.conn.execute(
             """

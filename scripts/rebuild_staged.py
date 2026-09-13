@@ -308,6 +308,19 @@ def _tolerant_text_parse_worker(pdf_path: Path):
     )
 
 
+def _house_parse_source(
+    parser_version: str | None, engines_attempted: str | None = None
+) -> str:
+    """Map deterministic vs validated LLM OCR parser provenance to a source."""
+    provenance = " ".join(
+        value.casefold()
+        for value in (parser_version, engines_attempted)
+        if isinstance(value, str)
+    )
+    llm_markers = ("gemini", "ling", "gpt", "openrouter/")
+    return "gemini_ocr" if any(marker in provenance for marker in llm_markers) else "house_pdf"
+
+
 def _persist_house_parse_batch(
     db: Database,
     *,
@@ -605,7 +618,7 @@ def _house_inventory_rows(db: Database, year: int, gen: str) -> list[dict]:
 
     runs = db.conn.execute(
         """
-        SELECT doc_id, parser_version, status, raw_row_count,
+        SELECT doc_id, parser_version, engines_attempted, status, raw_row_count,
                transaction_count, error_message, artifact_sha256
         FROM pdf_parse_runs
         WHERE year = ? AND ingestion_generation = ?
@@ -676,6 +689,7 @@ def _house_inventory_rows(db: Database, year: int, gen: str) -> list[dict]:
         for (
             run_doc_id,
             parser_version,
+            engines_attempted,
             status,
             raw_count,
             transaction_count,
@@ -688,11 +702,7 @@ def _house_inventory_rows(db: Database, year: int, gen: str) -> list[dict]:
                 raise RuntimeError(
                     f"house inventory {year}/{doc_id}: terminal run has no parser version"
                 )
-            source = (
-                "gemini_ocr"
-                if "gemini" in parser_version.lower()
-                else "house_pdf"
-            )
+            source = _house_parse_source(parser_version, engines_attempted)
             try:
                 raw = int(raw_count)
                 accepted = int(transaction_count)
@@ -850,7 +860,7 @@ def _house_source_report_binding_violations(
     ).fetchall()
     terminal_runs = db.conn.execute(
         """
-        SELECT doc_id, parser_version, status, artifact_sha256
+        SELECT doc_id, parser_version, engines_attempted, status, artifact_sha256
         FROM pdf_parse_runs
         WHERE ingestion_generation = ?
           AND status IN ('success', 'no_txs')
@@ -869,7 +879,7 @@ def _house_source_report_binding_violations(
     ).fetchall()
 
     runs_by_artifact: dict[tuple[str, str], list[tuple[str, str]]] = {}
-    for doc_id, parser_version, status, artifact_sha in terminal_runs:
+    for doc_id, parser_version, engines_attempted, status, artifact_sha in terminal_runs:
         if (
             doc_id is None
             or artifact_sha is None
@@ -877,7 +887,7 @@ def _house_source_report_binding_violations(
             or not parser_version.strip()
         ):
             continue
-        source = "gemini_ocr" if "gemini" in parser_version.lower() else "house_pdf"
+        source = _house_parse_source(parser_version, engines_attempted)
         outcome = "parsed" if status == "success" else "no_txs"
         runs_by_artifact.setdefault((str(doc_id), str(artifact_sha)), []).append(
             (source, outcome)
@@ -2435,14 +2445,20 @@ def repair_audit_gaps(args) -> None:
                     AND p.status = 'success'
                     AND t.source = CASE
                         WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%ling%'
+                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%gpt%'
+                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%openrouter%'
+                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini/%'
+                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
+                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
                         THEN 'gemini_ocr'
                         ELSE 'house_pdf'
                     END
               )
         """)
         # 2b. Update terminal parse-run counts against the source family that
-        # parser version actually owns. Gemini runs reconcile with gemini_ocr;
-        # deterministic runs reconcile with house_pdf.
+        # parser version actually owns. Validated LLM OCR runs reconcile with
+        # gemini_ocr; deterministic runs reconcile with house_pdf.
         db.conn.execute("""
             UPDATE pdf_parse_runs p
             SET transaction_count = (
@@ -2450,6 +2466,12 @@ def repair_audit_gaps(args) -> None:
                 WHERE t.doc_id = p.doc_id
                   AND t.source = CASE
                       WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                        OR LOWER(COALESCE(p.parser_version, '')) LIKE '%ling%'
+                        OR LOWER(COALESCE(p.parser_version, '')) LIKE '%gpt%'
+                        OR LOWER(COALESCE(p.parser_version, '')) LIKE '%openrouter%'
+                        OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini/%'
+                        OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
+                        OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
                       THEN 'gemini_ocr'
                       ELSE 'house_pdf'
                   END
@@ -2459,7 +2481,7 @@ def repair_audit_gaps(args) -> None:
             WHERE p.status = 'success'
         """)
         # 2c. Successes whose own source rows were fully quarantined become
-        # unresolved zero_rows. This is source-family aware so valid Gemini
+        # unresolved zero_rows. This is source-family aware so valid LLM OCR
         # rows cannot be demoted merely because no house_pdf rows exist.
         db.conn.execute("""
             UPDATE pdf_parse_runs p
@@ -2471,6 +2493,12 @@ def repair_audit_gaps(args) -> None:
                 WHERE t.doc_id = p.doc_id
                   AND t.source = CASE
                       WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                        OR LOWER(COALESCE(p.parser_version, '')) LIKE '%ling%'
+                        OR LOWER(COALESCE(p.parser_version, '')) LIKE '%gpt%'
+                        OR LOWER(COALESCE(p.parser_version, '')) LIKE '%openrouter%'
+                        OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini/%'
+                        OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
+                        OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
                       THEN 'gemini_ocr'
                       ELSE 'house_pdf'
                   END

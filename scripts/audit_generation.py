@@ -112,11 +112,17 @@ class CheckResult:
         return not self.violations
 
 
-def _run_source_for_parser(parser_version: str | None) -> str | None:
-    if not parser_version:
+def _run_source_for_parser(
+    parser_version: str | None, engines_attempted: str | None = None
+) -> str | None:
+    if not parser_version and not engines_attempted:
         return None
-    lowered = str(parser_version).lower()
-    if "gemini" in lowered:
+    provenance = " ".join(
+        str(value).casefold()
+        for value in (parser_version, engines_attempted)
+        if value
+    )
+    if any(marker in provenance for marker in ("gemini", "ling", "gpt", "openrouter/")):
         return "gemini_ocr"
     return "house_pdf"
 
@@ -181,8 +187,8 @@ def check_parse_counts_match_persisted(
 
     runs = conn.execute(
         """
-        SELECT doc_id, parser_version, status, raw_row_count, transaction_count,
-               artifact_sha256, ingestion_generation
+        SELECT doc_id, parser_version, engines_attempted, status, raw_row_count,
+               transaction_count, artifact_sha256, ingestion_generation
         FROM pdf_parse_runs
         WHERE ingestion_generation IS NOT NULL
           AND artifact_sha256 IS NOT NULL
@@ -200,8 +206,17 @@ def check_parse_counts_match_persisted(
             f"skipped {skipped} legacy parse run(s) without generation/artifact binding"
         )
 
-    for doc_id, parser_version, status, raw_count, tx_count, sha, generation in runs:
-        source = _run_source_for_parser(parser_version)
+    for (
+        doc_id,
+        parser_version,
+        engines_attempted,
+        status,
+        raw_count,
+        tx_count,
+        sha,
+        generation,
+    ) in runs:
+        source = _run_source_for_parser(parser_version, engines_attempted)
         if source is None:
             result.violations.append(
                 f"{doc_id}: unrecognized parser_version {parser_version!r}"
@@ -930,6 +945,12 @@ def _get_unresolved_house_doc_ids(
                         AND tx_count.ingestion_generation = artifact.generation_id
                         AND tx_count.source = CASE
                             WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
+                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%ling%'
+                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gpt%'
+                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%openrouter%'
+                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini/%'
+                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'openrouter/%'
+                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gpt-%'
                             THEN 'gemini_ocr'
                             ELSE 'house_pdf'
                         END
@@ -946,6 +967,12 @@ def _get_unresolved_house_doc_ids(
                                 AND tx_invalid.ingestion_generation = artifact.generation_id
                                 AND tx_invalid.source = CASE
                                     WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
+                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%ling%'
+                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gpt%'
+                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%openrouter%'
+                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini/%'
+                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'openrouter/%'
+                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gpt-%'
                                     THEN 'gemini_ocr'
                                     ELSE 'house_pdf'
                                 END
@@ -1173,7 +1200,7 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
             ).fetchall()
             terminal_runs = conn.execute(
                 """
-                SELECT doc_id, parser_version, status, artifact_sha256
+                SELECT doc_id, parser_version, engines_attempted, status, artifact_sha256
                 FROM pdf_parse_runs
                 WHERE ingestion_generation = ?
                   AND status IN ('success', 'no_txs')
@@ -1191,10 +1218,10 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
                 [generation_id],
             ).fetchall()
             runs_by_artifact: dict[tuple[str, str], list[tuple[str, str]]] = {}
-            for doc_id, parser_version, status, artifact_sha in terminal_runs:
+            for doc_id, parser_version, engines_attempted, status, artifact_sha in terminal_runs:
                 if doc_id is None or artifact_sha is None:
                     continue
-                source = _run_source_for_parser(parser_version)
+                source = _run_source_for_parser(parser_version, engines_attempted)
                 if source is None:
                     continue
                 outcome = "parsed" if status == "success" else "no_txs"
@@ -1248,21 +1275,20 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
     ).fetchall()
     unbound = []
     for doc_id, source, generation, sha in rows:
-        family = (
-            "NOT LIKE '%gemini%'"
-            if source == "house_pdf"
-            else "LIKE '%gemini%'"
-        )
-        bound = conn.execute(
-            f"""
-            SELECT COUNT(*) FROM pdf_parse_runs
+        runs = conn.execute(
+            """
+            SELECT parser_version, engines_attempted, status
+            FROM pdf_parse_runs
             WHERE doc_id = ? AND ingestion_generation = ?
               AND artifact_sha256 = ?
-              AND parser_version {family}
               AND status IN ('success', 'no_txs')
             """,
             [doc_id, generation, sha],
-        ).fetchone()[0]
+        ).fetchall()
+        bound = any(
+            _run_source_for_parser(parser_version, engines_attempted) == source
+            for parser_version, engines_attempted, _status in runs
+        )
         if not bound:
             unbound.append((doc_id, source, generation))
     if unbound:

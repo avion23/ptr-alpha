@@ -292,8 +292,13 @@ class Database:
                                         AND tx_count.artifact_sha256 = artifact.artifact_sha256
                                         AND tx_count.ingestion_generation = artifact.generation_id
                                         AND tx_count.source = CASE
-                                            WHEN LOWER(COALESCE(parse_run.parser_version, ''))
-                                                 LIKE '%gemini%'
+                                            WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
+                                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%ling%'
+                                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gpt%'
+                                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%openrouter%'
+                                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini/%'
+                                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'openrouter/%'
+                                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gpt-%'
                                             THEN 'gemini_ocr'
                                             ELSE 'house_pdf'
                                         END
@@ -309,8 +314,13 @@ class Database:
                                                 AND tx_invalid.artifact_sha256 = artifact.artifact_sha256
                                                 AND tx_invalid.ingestion_generation = artifact.generation_id
                                                 AND tx_invalid.source = CASE
-                                                    WHEN LOWER(COALESCE(parse_run.parser_version, ''))
-                                                         LIKE '%gemini%'
+                                                    WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
+                                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%ling%'
+                                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gpt%'
+                                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%openrouter%'
+                                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini/%'
+                                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'openrouter/%'
+                                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gpt-%'
                                                     THEN 'gemini_ocr'
                                                     ELSE 'house_pdf'
                                                 END
@@ -724,6 +734,12 @@ class Database:
                             AND t.ingestion_generation = a.generation_id
                             AND t.source = CASE
                                 WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                                  OR LOWER(COALESCE(p.parser_version, '')) LIKE '%ling%'
+                                  OR LOWER(COALESCE(p.parser_version, '')) LIKE '%gpt%'
+                                  OR LOWER(COALESCE(p.parser_version, '')) LIKE '%openrouter%'
+                                  OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini/%'
+                                  OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
+                                  OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
                                 THEN 'gemini_ocr'
                                 ELSE 'house_pdf'
                             END
@@ -740,6 +756,12 @@ class Database:
                                     AND t.ingestion_generation = a.generation_id
                                     AND t.source = CASE
                                         WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%ling%'
+                                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%gpt%'
+                                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%openrouter%'
+                                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini/%'
+                                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
+                                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
                                         THEN 'gemini_ocr'
                                         ELSE 'house_pdf'
                                     END

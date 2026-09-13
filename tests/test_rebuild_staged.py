@@ -9,6 +9,20 @@ import pandas as pd
 import pytest
 
 
+def test_house_parse_source_recognizes_all_validated_llm_backends():
+    from scripts import rebuild_staged
+
+    assert rebuild_staged._house_parse_source(
+        "v9-ling-3.0-flash-vl", "openrouter/inclusionai/ling-3.0-flash-vl:free"
+    ) == "gemini_ocr"
+    assert rebuild_staged._house_parse_source(
+        "v7-gpt-5.6-sol", "gpt-5.6-sol"
+    ) == "gemini_ocr"
+    assert rebuild_staged._house_parse_source(
+        "v4-deterministic", "pdfplumber"
+    ) == "house_pdf"
+
+
 def test_required_house_scope_matches_production_inputs_not_full_archive():
     from scripts import rebuild_staged
 

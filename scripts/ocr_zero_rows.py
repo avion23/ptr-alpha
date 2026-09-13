@@ -184,7 +184,15 @@ def get_ocr_work_items(
                     PARTITION BY doc_id ORDER BY parsed_at DESC
                 ) AS rn
                 FROM pdf_parse_runs
-                WHERE parser_version NOT LIKE '%gemini%'
+                WHERE NOT (
+                    LOWER(COALESCE(parser_version, '')) LIKE '%gemini%'
+                    OR LOWER(COALESCE(parser_version, '')) LIKE '%ling%'
+                    OR LOWER(COALESCE(parser_version, '')) LIKE '%gpt%'
+                    OR LOWER(COALESCE(parser_version, '')) LIKE '%openrouter%'
+                    OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini/%'
+                    OR LOWER(COALESCE(engines_attempted, '')) LIKE 'openrouter/%'
+                    OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%'
+                )
             )
             SELECT CAST(m.doc_id AS VARCHAR),
                    CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER)
@@ -213,7 +221,15 @@ def get_ocr_work_items(
                 PARTITION BY doc_id ORDER BY parsed_at DESC
             ) AS rn
             FROM pdf_parse_runs
-            WHERE parser_version NOT LIKE '%gemini%'
+            WHERE NOT (
+                LOWER(COALESCE(parser_version, '')) LIKE '%gemini%'
+                OR LOWER(COALESCE(parser_version, '')) LIKE '%ling%'
+                OR LOWER(COALESCE(parser_version, '')) LIKE '%gpt%'
+                OR LOWER(COALESCE(parser_version, '')) LIKE '%openrouter%'
+                OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini/%'
+                OR LOWER(COALESCE(engines_attempted, '')) LIKE 'openrouter/%'
+                OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%'
+            )
         ), current_ocr AS (
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY doc_id ORDER BY parsed_at DESC
@@ -1449,7 +1465,15 @@ def insert_transactions(
                 WHERE doc_id = ?
                   AND ingestion_generation = ?
                   AND artifact_sha256 = ?
-                  AND LOWER(COALESCE(parser_version, '')) NOT LIKE '%gemini%'
+                  AND NOT (
+                      LOWER(COALESCE(parser_version, '')) LIKE '%gemini%'
+                      OR LOWER(COALESCE(parser_version, '')) LIKE '%ling%'
+                      OR LOWER(COALESCE(parser_version, '')) LIKE '%gpt%'
+                      OR LOWER(COALESCE(parser_version, '')) LIKE '%openrouter%'
+                      OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini/%'
+                      OR LOWER(COALESCE(engines_attempted, '')) LIKE 'openrouter/%'
+                      OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%'
+                  )
                   AND status IN ('success', 'no_txs')
                 """,
                 [str(doc_id), ingestion_generation, artifact_sha256],

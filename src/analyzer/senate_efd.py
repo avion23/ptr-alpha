@@ -47,7 +47,7 @@ from analyzer.parsing.cells import (
 logger = logging.getLogger(__name__)
 
 EFD_BASE = "https://efdsearch.senate.gov"
-BROWSER_IMPERSONATE = "chrome124"
+BROWSER_IMPERSONATE = "chrome142"
 REQUEST_TIMEOUT = 30
 SEARCH_PAGE_SIZE = 100
 SEARCH_PAGE_DELAY = 0.3

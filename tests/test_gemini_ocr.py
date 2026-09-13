@@ -184,6 +184,40 @@ def test_call_gemini_ignores_partial_cache_file(monkeypatch, tmp_path):
     assert envelope["parser_version"] == gemini_ocr_common.GEMINI_PARSER_VERSION
 
 
+def test_cache_identity_includes_explicit_model_and_parser(monkeypatch, tmp_path):
+    pdf = tmp_path / "sample.pdf"
+    pdf.write_bytes(b"%PDF-canary")
+    calls = []
+
+    def fake_run(args, capture_output, text, timeout):
+        calls.append(args)
+
+        class Result:
+            returncode = 0
+            stdout = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
+    kwargs = {
+        "doc_id": "doc-model",
+        "cache_dir": str(tmp_path),
+        "model": gemini_ocr_common.GEMINI_35_MODEL,
+        "parser_version": gemini_ocr_common.GEMINI_35_PARSER_VERSION,
+    }
+    first, error, _ = gemini_ocr_common.call_gemini(str(pdf), **kwargs)
+    cached, cached_error, _ = gemini_ocr_common.call_gemini(str(pdf), **kwargs)
+
+    assert first == cached
+    assert error == cached_error == ""
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("-m") + 1] == gemini_ocr_common.GEMINI_35_MODEL
+    envelope = json.loads((tmp_path / "doc-model.json").read_text())
+    assert envelope["model"] == gemini_ocr_common.GEMINI_35_MODEL
+    assert envelope["parser_version"] == gemini_ocr_common.GEMINI_35_PARSER_VERSION
+
+
 def test_cache_is_invalidated_when_pdf_changes(monkeypatch, tmp_path):
     pdf = tmp_path / "sample.pdf"
     pdf.write_bytes(b"%PDF-first")

@@ -24,6 +24,8 @@ from analyzer.member_names import canonical_member_key
 
 MODEL = "gemini/gemini-3.1-flash-lite"
 GEMINI_PARSER_VERSION = "v5-gemini-validated"
+GEMINI_35_MODEL = "gemini/gemini-3.5-flash"
+GEMINI_35_PARSER_VERSION = "v6-gemini-3.5-flash"
 CACHE_ENVELOPE_VERSION = 1
 OUTPUT_SCHEMA_VERSION = 3
 CACHE_DIR = "data/gemini_cache"
@@ -339,6 +341,7 @@ def _cache_envelope(
     page_count: int,
     output: str,
     parser_version: str,
+    model: str = MODEL,
 ) -> dict:
     return {
         "cache_envelope_version": CACHE_ENVELOPE_VERSION,
@@ -346,7 +349,7 @@ def _cache_envelope(
         "doc_id": str(doc_id),
         "pdf_sha256": pdf_digest,
         "pdf_page_count": page_count,
-        "model": MODEL,
+        "model": model,
         "prompt_sha256": PROMPT_SHA256,
         "parser_version": parser_version,
         "output": output,
@@ -358,6 +361,7 @@ def _read_cached_snapshot(
     snapshot: PdfSnapshot,
     cache_dir: str,
     parser_version: str,
+    model: str = MODEL,
 ) -> str | None:
     path = cache_path(doc_id, cache_dir)
     try:
@@ -369,6 +373,7 @@ def _read_cached_snapshot(
             snapshot.page_count,
             output,
             parser_version,
+            model,
         )
         if envelope != expected:
             return None
@@ -390,10 +395,13 @@ def inspect_cached_response(
     pdf_path: str | Path,
     cache_dir: str = CACHE_DIR,
     parser_version: str = GEMINI_PARSER_VERSION,
+    model: str = MODEL,
 ) -> CachedGeminiResponse | None:
     """Validate cache and return its parser/artifact identity without model I/O."""
     with snapshot_pdf(pdf_path) as snapshot:
-        output = _read_cached_snapshot(str(doc_id), snapshot, cache_dir, parser_version)
+        output = _read_cached_snapshot(
+            str(doc_id), snapshot, cache_dir, parser_version, model
+        )
         if output is None:
             return None
         parsed = parse_gemini_output(output, expected_page_count=snapshot.page_count)
@@ -407,9 +415,12 @@ def read_cached_response(
     pdf_path: str | Path,
     cache_dir: str = CACHE_DIR,
     parser_version: str = GEMINI_PARSER_VERSION,
+    model: str = MODEL,
 ) -> str | None:
     """Return a valid cache entry bound to one immutable PDF snapshot."""
-    cached = inspect_cached_response(doc_id, pdf_path, cache_dir, parser_version)
+    cached = inspect_cached_response(
+        doc_id, pdf_path, cache_dir, parser_version, model
+    )
     return cached.output if cached is not None else None
 
 
@@ -419,12 +430,13 @@ def _write_cached_snapshot(
     output: str,
     cache_dir: str,
     parser_version: str,
+    model: str = MODEL,
 ) -> None:
     parse_gemini_output(output, expected_page_count=snapshot.page_count)
     path = cache_path(doc_id, cache_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     envelope = _cache_envelope(
-        str(doc_id), snapshot.sha256, snapshot.page_count, output, parser_version
+        str(doc_id), snapshot.sha256, snapshot.page_count, output, parser_version, model
     )
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -446,10 +458,13 @@ def write_cached_response(
     output: str,
     cache_dir: str = CACHE_DIR,
     parser_version: str = GEMINI_PARSER_VERSION,
+    model: str = MODEL,
 ) -> None:
     """Atomically persist output bound to one immutable PDF snapshot."""
     with snapshot_pdf(pdf_path) as snapshot:
-        _write_cached_snapshot(str(doc_id), snapshot, output, cache_dir, parser_version)
+        _write_cached_snapshot(
+            str(doc_id), snapshot, output, cache_dir, parser_version, model
+        )
 
 
 def call_gemini(
@@ -459,6 +474,7 @@ def call_gemini(
     cache_dir: str = CACHE_DIR,
     timeout: int = 180,
     parser_version: str = GEMINI_PARSER_VERSION,
+    model: str = MODEL,
 ) -> tuple[str | None, str, ArtifactMetadata | None]:
     """Call Gemini against the same immutable bytes used for hash/cache checks."""
     try:
@@ -471,7 +487,7 @@ def call_gemini(
             )
             if doc_id and not refresh:
                 cached = _read_cached_snapshot(
-                    str(doc_id), snapshot, cache_dir, parser_version
+                    str(doc_id), snapshot, cache_dir, parser_version, model
                 )
                 if cached is not None:
                     return cached, "", metadata
@@ -479,7 +495,7 @@ def call_gemini(
                 [
                     "llm",
                     "-m",
-                    MODEL,
+                    model,
                     "-a",
                     str(snapshot.path),
                     "-o",
@@ -505,7 +521,7 @@ def call_gemini(
                 return None, f"invalid_response: {exc}", metadata
             if doc_id:
                 _write_cached_snapshot(
-                    str(doc_id), snapshot, result.stdout, cache_dir, parser_version
+                    str(doc_id), snapshot, result.stdout, cache_dir, parser_version, model
                 )
             return result.stdout, "", metadata
     except subprocess.TimeoutExpired:

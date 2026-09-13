@@ -6,23 +6,28 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import duckdb
 
 from scripts.gemini_ocr_common import (
+    GEMINI_35_MODEL,
+    GEMINI_35_PARSER_VERSION,
     GEMINI_PARSER_VERSION,
+    MODEL,
     call_gemini,
     parse_gemini_output,
+    pdf_page_count,
     validate_transactions,
 )
 from scripts.ocr_zero_rows import (
+    _record_failed_ocr_attempt,
     get_filing_date,
     get_metadata_member,
-    get_zero_row_pdfs,
+    get_ocr_work_items,
     insert_transactions,
     load_progress,
     mark_progress,
-    record_parse_run,
     resolve_ingestion_generation,
     save_progress,
 )
@@ -37,20 +42,21 @@ SENTINEL = object()
 
 
 def _write_item(item):
+    parser_version = item.get("parser_version", GEMINI_PARSER_VERSION)
+    model = item.get("model", MODEL)
     if item["status"] in {"error", "rejected"}:
         connection = duckdb.connect(DB_PATH)
         try:
-            record_parse_run(
+            _record_failed_ocr_attempt(
                 connection,
                 item["doc_id"],
                 item["year"],
-                item["status"],
                 item["raw_count"],
-                0,
                 item.get("error", ""),
-                parser_version=GEMINI_PARSER_VERSION,
+                parser_version=parser_version,
                 artifact_sha256=item.get("artifact_sha256"),
                 ingestion_generation=item.get("ingestion_generation"),
+                engine_model=model,
             )
         finally:
             connection.close()
@@ -62,10 +68,12 @@ def _write_item(item):
         item["member"],
         item["transactions"],
         db_path=DB_PATH,
-        parser_version=GEMINI_PARSER_VERSION,
+        parser_version=parser_version,
         raw_count=item["raw_count"],
         artifact_sha256=item.get("artifact_sha256"),
         ingestion_generation=item.get("ingestion_generation"),
+        engine_model=model,
+        checkpoint=False,
     )
     if item["status"] == "success" and inserted <= 0:
         raise RuntimeError("validated OCR rows were not inserted")
@@ -112,6 +120,8 @@ def _record_failure(
     *,
     artifact_sha256=None,
     ingestion_generation=None,
+    parser_version=GEMINI_PARSER_VERSION,
+    model=MODEL,
 ):
     _acknowledged_write(
         {
@@ -122,18 +132,29 @@ def _record_failure(
             "error": str(error)[:1000],
             "artifact_sha256": artifact_sha256,
             "ingestion_generation": ingestion_generation,
+            "parser_version": parser_version,
+            "model": model,
         }
     )
 
 
-def process_one(item, refresh=False):
+def process_one(
+    item,
+    refresh=False,
+    *,
+    cache_dir=None,
+    parser_version=GEMINI_PARSER_VERSION,
+    model=MODEL,
+):
     doc_id, year, pdf_path = item
     output, error, artifact_metadata = call_gemini(
         pdf_path,
         doc_id=doc_id,
         refresh=refresh,
-        timeout=90,
-        parser_version=GEMINI_PARSER_VERSION,
+        cache_dir=cache_dir or str(Path(DB_PATH).parent / "gemini_cache"),
+        timeout=120,
+        parser_version=parser_version,
+        model=model,
     )
     ingestion_generation = None
     if artifact_metadata is not None:
@@ -152,10 +173,15 @@ def process_one(item, refresh=False):
             error,
             artifact_sha256=(artifact_metadata.sha256 if artifact_metadata else None),
             ingestion_generation=ingestion_generation,
+            parser_version=parser_version,
+            model=model,
         )
         return doc_id, year, "error", 0, error
 
-    parsed = parse_gemini_output(output)
+    parsed = parse_gemini_output(
+        output,
+        expected_page_count=(artifact_metadata.page_count if artifact_metadata else None),
+    )
     if parsed.no_transactions:
         _acknowledged_write(
             {
@@ -167,6 +193,8 @@ def process_one(item, refresh=False):
                 "raw_count": 0,
                 "artifact_sha256": artifact_metadata.sha256,
                 "ingestion_generation": ingestion_generation,
+                "parser_version": parser_version,
+                "model": model,
             }
         )
         return doc_id, year, "no_txs", 0, []
@@ -200,6 +228,8 @@ def process_one(item, refresh=False):
             message,
             artifact_sha256=artifact_metadata.sha256,
             ingestion_generation=ingestion_generation,
+            parser_version=parser_version,
+            model=model,
         )
         return doc_id, year, status, 0, fatal_rejections
     if not transactions:
@@ -211,6 +241,8 @@ def process_one(item, refresh=False):
             "semantic_zero_after_raw_rows",
             artifact_sha256=artifact_metadata.sha256,
             ingestion_generation=ingestion_generation,
+            parser_version=parser_version,
+            model=model,
         )
         return doc_id, year, "error", 0, {"semantic_zero_after_raw_rows": 1}
 
@@ -225,23 +257,77 @@ def process_one(item, refresh=False):
             "raw_count": parsed.raw_row_count,
             "artifact_sha256": artifact_metadata.sha256,
             "ingestion_generation": ingestion_generation,
+            "parser_version": parser_version,
+            "model": model,
         }
     )
     return doc_id, year, "success", inserted, transactions
 
 
+def _page_count_hint(item) -> tuple[int, int, str]:
+    doc_id, year, pdf_path = item
+    try:
+        pages = pdf_page_count(pdf_path)
+    except Exception:
+        pages = 10**9
+    return int(year), pages, str(doc_id)
+
+
 def main():
+    global DB_PATH, PROGRESS_PATH, MAX_WORKERS
+
     parser = argparse.ArgumentParser(
         description="Parallel Gemini OCR for unresolved PDFs"
     )
     parser.add_argument(
         "--refresh", action="store_true", help="Ignore cached responses"
     )
+    parser.add_argument("--db", default=DB_PATH, help="target staged DuckDB")
+    parser.add_argument(
+        "--data-dir", default="data", help="directory containing <year>/pdfs"
+    )
+    parser.add_argument("--cache-dir", default=None)
+    parser.add_argument("--progress", default=None)
+    parser.add_argument("--years", nargs="+", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS)
+    parser.add_argument("--max-docs", type=int, default=None)
+    parser.add_argument("--model", default=GEMINI_35_MODEL)
+    parser.add_argument("--parser-version", default=GEMINI_35_PARSER_VERSION)
     args = parser.parse_args()
 
+    DB_PATH = str(args.db)
+    MAX_WORKERS = max(1, int(args.workers))
+    data_dir = Path(args.data_dir)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else data_dir / "gemini_cache"
+    PROGRESS_PATH = str(
+        Path(args.progress) if args.progress else data_dir / "ocr_progress_parallel.json"
+    )
+
     progress = load_progress(PROGRESS_PATH)
-    pending = get_zero_row_pdfs()
-    print(f"Current unresolved work: {len(pending)} (parallelism: {MAX_WORKERS})")
+    if args.years:
+        pending = []
+        for year in args.years:
+            pending.extend(
+                get_ocr_work_items(
+                    db_path=DB_PATH,
+                    data_dir=data_dir,
+                    year=int(year),
+                    parser_version=args.parser_version,
+                )
+            )
+    else:
+        pending = get_ocr_work_items(
+            db_path=DB_PATH,
+            data_dir=data_dir,
+            parser_version=args.parser_version,
+        )
+    pending = sorted(dict.fromkeys(pending), key=_page_count_hint)
+    if args.max_docs is not None:
+        pending = pending[: max(0, int(args.max_docs))]
+    print(
+        f"Current unresolved work: {len(pending)} (parallelism: {MAX_WORKERS}, "
+        f"model={args.model}, parser={args.parser_version})"
+    )
     if not pending:
         return
 
@@ -254,7 +340,15 @@ def main():
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = {
-                pool.submit(process_one, item, args.refresh): item for item in pending
+                pool.submit(
+                    process_one,
+                    item,
+                    args.refresh,
+                    cache_dir=str(cache_dir),
+                    parser_version=args.parser_version,
+                    model=args.model,
+                ): item
+                for item in pending
             }
             for future in as_completed(futures):
                 doc_id, year, _ = futures[future]

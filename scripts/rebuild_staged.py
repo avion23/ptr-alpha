@@ -968,6 +968,187 @@ def house_parse(args) -> None:
         db.close()
 
 
+def _ingest_cached_gemini_year(
+    staging: Path, db: Database, year: int, cache_dir: Path
+) -> dict:
+    """Ingest only already-cached Gemini output bound to the exact staged PDF."""
+    from scripts.gemini_ocr_common import (  # noqa: PLC0415
+        CACHE_ENVELOPE_VERSION,
+        OUTPUT_SCHEMA_VERSION,
+        PROMPT_SHA256,
+        parse_gemini_output,
+        pdf_page_count,
+        validate_transactions,
+    )
+    from scripts.ocr_zero_rows import insert_transactions  # noqa: PLC0415
+
+    generation = db.get_latest_house_generation(year)
+    if generation is None:
+        raise RuntimeError(f"cached Gemini ingest {year}: no acquired generation")
+    unresolved = db.get_unresolved_house_doc_ids(year, generation)
+    artifacts = {
+        str(doc_id): str(artifact_sha256)
+        for doc_id, artifact_sha256 in db.conn.execute(
+            """
+            SELECT doc_id, artifact_sha256
+            FROM house_pdf_artifacts
+            WHERE archive_year = ? AND generation_id = ?
+            """,
+            [year, generation],
+        ).fetchall()
+    }
+    accepted: list[dict] = []
+    rejected: list[dict] = []
+    missing: list[str] = []
+    for doc_id in unresolved:
+        cache_path = cache_dir / f"{doc_id}.json"
+        if not cache_path.is_file():
+            missing.append(doc_id)
+            continue
+        try:
+            envelope = json.loads(cache_path.read_text())
+            pdf_path = staging / str(year) / "pdfs" / f"{doc_id}.pdf"
+            artifact_sha256 = artifacts.get(doc_id)
+            if not artifact_sha256 or _sha256_file(pdf_path) != artifact_sha256:
+                raise ValueError("staged PDF hash does not match acquired artifact")
+            if envelope.get("cache_envelope_version") != CACHE_ENVELOPE_VERSION:
+                raise ValueError("cache envelope version mismatch")
+            if envelope.get("output_schema_version") != OUTPUT_SCHEMA_VERSION:
+                raise ValueError("cache output schema version mismatch")
+            if envelope.get("prompt_sha256") != PROMPT_SHA256:
+                raise ValueError("cache prompt identity mismatch")
+            if str(envelope.get("doc_id")) != doc_id:
+                raise ValueError("cache document identity mismatch")
+            if envelope.get("pdf_sha256") != artifact_sha256:
+                raise ValueError("cache PDF hash mismatch")
+            page_count = pdf_page_count(pdf_path)
+            if int(envelope.get("pdf_page_count") or 0) != page_count:
+                raise ValueError("cache PDF page-count mismatch")
+            parser_version = str(envelope.get("parser_version") or "").strip()
+            model = str(envelope.get("model") or "").strip()
+            if not parser_version or not model:
+                raise ValueError("cache lacks parser/model identity")
+            parsed = parse_gemini_output(
+                envelope.get("output"), expected_page_count=page_count
+            )
+            metadata = db.conn.execute(
+                """
+                SELECT filing_date, first_name, last_name
+                FROM house_generation_metadata
+                WHERE archive_year = ? AND generation_id = ?
+                  AND doc_id = ? AND filing_type = 'P'
+                """,
+                [year, generation, doc_id],
+            ).fetchone()
+            if metadata is None:
+                raise ValueError("cache document lacks generation metadata")
+            filing_date, first_name, last_name = metadata
+            expected_member = " ".join(
+                str(part).strip() for part in (first_name, last_name) if part
+            ).strip()
+            validated, rejections = validate_transactions(
+                doc_id,
+                parsed.member,
+                parsed.transactions,
+                filing_date,
+                expected_member,
+            )
+            fatal_rejections = {
+                key: value
+                for key, value in rejections.items()
+                if key != "member_mismatch"
+            }
+            if fatal_rejections:
+                raise ValueError(
+                    "semantic validation failed: "
+                    + json.dumps(fatal_rejections, sort_keys=True)
+                )
+            inserted = insert_transactions(
+                doc_id,
+                year,
+                parsed.member,
+                validated,
+                db_path=str(staging / "congress.duckdb"),
+                parser_version=parser_version,
+                raw_count=parsed.raw_row_count,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=generation,
+                engine_model=model,
+            )
+            expected_count = len(validated)
+            run = db.conn.execute(
+                """
+                SELECT status, transaction_count, engines_attempted
+                FROM pdf_parse_runs
+                WHERE doc_id = ? AND parser_version = ?
+                  AND artifact_sha256 = ? AND ingestion_generation = ?
+                ORDER BY parsed_at DESC LIMIT 1
+                """,
+                [doc_id, parser_version, artifact_sha256, generation],
+            ).fetchone()
+            expected_status = "no_txs" if expected_count == 0 else "success"
+            if run is None or run[0] != expected_status or int(run[1]) != expected_count:
+                raise RuntimeError(
+                    f"cache persistence mismatch: expected {expected_status}/{expected_count}, got {run}"
+                )
+            if str(run[2]) != model:
+                raise RuntimeError("cache parser/model provenance mismatch after persistence")
+            accepted.append(
+                {
+                    "doc_id": doc_id,
+                    "parser_version": parser_version,
+                    "model": model,
+                    "transactions": expected_count,
+                    "inserted": int(inserted),
+                    "member_mismatch": int(rejections.get("member_mismatch", 0)),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 -- one bad cache must stay unresolved
+            rejected.append(
+                {
+                    "doc_id": doc_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return {
+        "year": year,
+        "generation": generation,
+        "unresolved_before": len(unresolved),
+        "accepted": accepted,
+        "rejected": rejected,
+        "missing_cache": missing,
+    }
+
+
+def house_cache_ocr(args) -> None:
+    """Consume immutable, schema-validated Gemini caches without model I/O."""
+    staging = Path(args.staging)
+    manifest = _load_manifest(staging)
+    years = [int(y) for y in args.years] if args.years else list(REQUIRED_HOUSE_YEARS)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else _REPO_ROOT / "data" / "gemini_cache"
+    db = Database(staging / "congress.duckdb", read_only=False)
+    try:
+        records = manifest.setdefault("house_cache_ocr", {})
+        for year in years:
+            house = manifest.get("house", {}).get(str(year))
+            if house is None:
+                print(f"house-cache-ocr {year}: skipped (not fetched)")
+                continue
+            result = _ingest_cached_gemini_year(staging, db, year, cache_dir)
+            unresolved, report_count = _refresh_house_completion(db, house, year)
+            result["unresolved_after"] = len(unresolved)
+            result["source_report_rows"] = report_count
+            records[str(year)] = result
+            _save_manifest(staging, manifest)
+            print(
+                f"house-cache-ocr {year}: accepted={len(result['accepted'])} "
+                f"rejected={len(result['rejected'])} missing={len(result['missing_cache'])} "
+                f"unresolved={len(unresolved)}"
+            )
+    finally:
+        db.close()
+
+
 # --------------------------------------------------------------------------
 # Senate
 # --------------------------------------------------------------------------
@@ -3004,6 +3185,10 @@ def main(argv: list[str] | None = None) -> None:
     p_parse = sub.add_parser("house-parse")
     p_parse.add_argument("--years", nargs="+", type=int)
 
+    p_cache_ocr = sub.add_parser("house-cache-ocr")
+    p_cache_ocr.add_argument("--years", nargs="+", type=int)
+    p_cache_ocr.add_argument("--cache-dir")
+
     sub.add_parser("senate")
     sub.add_parser("prices")
     sub.add_parser("consume")
@@ -3027,6 +3212,7 @@ def main(argv: list[str] | None = None) -> None:
     handlers = {
         "house-fetch": house_fetch,
         "house-parse": house_parse,
+        "house-cache-ocr": house_cache_ocr,
         "senate": senate,
         "prices": prices,
         "consume": consume,

@@ -1108,6 +1108,7 @@ def record_parse_run(
     parser_version=GEMINI_PARSER_VERSION,
     artifact_sha256: str | None = None,
     ingestion_generation: str | None = None,
+    engines_attempted: str = MODEL,
 ):
     identity = [
         str(doc_id),
@@ -1137,7 +1138,7 @@ def record_parse_run(
             year,
             parser_version,
             status,
-            MODEL,
+            engines_attempted,
             raw_count,
             tx_count,
             error_message[:1000],
@@ -1158,6 +1159,7 @@ def insert_transactions(
     raw_count: int | None = None,
     artifact_sha256: str | None = None,
     ingestion_generation: str | None = None,
+    engine_model: str = MODEL,
 ):
     """Insert transactions into DB. Returns count inserted."""
     conn = duckdb.connect(db_path)
@@ -1191,6 +1193,7 @@ def insert_transactions(
                 parser_version=parser_version,
                 artifact_sha256=artifact_sha256,
                 ingestion_generation=ingestion_generation,
+                engines_attempted=engine_model,
             )
             conn.execute("COMMIT")
         except Exception:
@@ -1219,6 +1222,7 @@ def insert_transactions(
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
+            engines_attempted=engine_model,
         )
         conn.close()
         return 0
@@ -1300,6 +1304,7 @@ def insert_transactions(
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
+            engines_attempted=engine_model,
         )
         conn.close()
         return 0
@@ -1320,6 +1325,7 @@ def insert_transactions(
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
+            engines_attempted=engine_model,
         )
         conn.execute("CHECKPOINT")
         conn.close()
@@ -1441,6 +1447,7 @@ def insert_transactions(
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
+            engines_attempted=engine_model,
         )
         conn.execute("COMMIT")
         committed = True
@@ -1463,6 +1470,7 @@ def insert_transactions(
                 parser_version=parser_version,
                 artifact_sha256=artifact_sha256,
                 ingestion_generation=ingestion_generation,
+                engines_attempted=engine_model,
             )
         raise
     finally:

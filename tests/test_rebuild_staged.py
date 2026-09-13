@@ -355,6 +355,102 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
     assert result["attempted"] == 4
 
 
+def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identity(
+    monkeypatch, tmp_path
+):
+    from analyzer.database import Database
+    from scripts import gemini_ocr_common, rebuild_staged
+
+    staging = tmp_path / "stage"
+    pdf_dir = staging / "2024" / "pdfs"
+    cache_dir = tmp_path / "cache"
+    pdf_dir.mkdir(parents=True)
+    cache_dir.mkdir()
+    pdf_path = pdf_dir / "cache-doc.pdf"
+    pdf_path.write_bytes(b"%PDF-test-cache\n%%EOF")
+    artifact_sha = rebuild_staged._sha256_file(pdf_path)
+
+    db = Database(staging / "congress.duckdb")
+    db.conn.execute(
+        """
+        INSERT INTO house_archive_generations (
+            archive_year, generation_id, metadata_count, ptr_count, parse_status
+        ) VALUES (2024, 'cache-generation', 1, 1, 'incomplete')
+        """
+    )
+    db.conn.execute(
+        """
+        INSERT INTO metadata (
+            doc_id, archive_year, first_name, last_name,
+            filing_date, filing_type, fetched_at
+        ) VALUES (
+            'cache-doc', 2024, 'Jane', 'Doe',
+            '2024-01-20', 'P', CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.conn.execute(
+        """
+        INSERT INTO house_generation_metadata (
+            archive_year, generation_id, doc_id, first_name, last_name,
+            filing_date, filing_type, fetched_at
+        ) VALUES (
+            2024, 'cache-generation', 'cache-doc', 'Jane', 'Doe',
+            '2024-01-20', 'P', CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.conn.execute(
+        """
+        INSERT INTO house_pdf_artifacts (
+            archive_year, doc_id, generation_id, artifact_sha256
+        ) VALUES (2024, 'cache-doc', 'cache-generation', ?)
+        """,
+        [artifact_sha],
+    )
+    envelope = {
+        "cache_envelope_version": gemini_ocr_common.CACHE_ENVELOPE_VERSION,
+        "output_schema_version": gemini_ocr_common.OUTPUT_SCHEMA_VERSION,
+        "doc_id": "cache-doc",
+        "pdf_sha256": artifact_sha,
+        "pdf_page_count": 1,
+        "model": "gemini/test-model",
+        "prompt_sha256": gemini_ocr_common.PROMPT_SHA256,
+        "parser_version": "v-test-gemini",
+        "output": (
+            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+            "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/16/24 | A\n"
+        ),
+    }
+    (cache_dir / "cache-doc.json").write_text(json.dumps(envelope))
+    monkeypatch.setattr(gemini_ocr_common, "pdf_page_count", lambda _path: 1)
+
+    try:
+        result = rebuild_staged._ingest_cached_gemini_year(
+            staging, db, 2024, cache_dir
+        )
+        assert [row["doc_id"] for row in result["accepted"]] == ["cache-doc"]
+        assert result["rejected"] == []
+        assert db.conn.execute(
+            """
+            SELECT source, ticker, transaction_type, ingestion_generation
+            FROM transactions WHERE doc_id = 'cache-doc'
+            """
+        ).fetchall() == [
+            ("gemini_ocr", "AAPL", "Purchase", "cache-generation")
+        ]
+        assert db.conn.execute(
+            """
+            SELECT parser_version, engines_attempted, status, transaction_count
+            FROM pdf_parse_runs WHERE doc_id = 'cache-doc'
+            """
+        ).fetchall() == [
+            ("v-test-gemini", "gemini/test-model", "success", 1)
+        ]
+    finally:
+        db.close()
+
+
 def _seed_house_inventory_database(tmp_path):
     from analyzer.database import Database
 

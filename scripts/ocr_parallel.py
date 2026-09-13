@@ -22,13 +22,13 @@ from scripts.gemini_ocr_common import (
 )
 from scripts.ocr_zero_rows import (
     _record_failed_ocr_attempt,
+    _resolve_ingestion_generation,
     get_filing_date,
     get_metadata_member,
     get_ocr_work_items,
     insert_transactions,
     load_progress,
     mark_progress,
-    resolve_ingestion_generation,
     save_progress,
 )
 
@@ -157,13 +157,20 @@ def process_one(
         model=model,
     )
     ingestion_generation = None
+    filing_date = None
+    expected_member = None
     if artifact_metadata is not None:
+        connection = duckdb.connect(DB_PATH)
         try:
-            ingestion_generation = resolve_ingestion_generation(
-                DB_PATH, doc_id, year, artifact_metadata.sha256
+            ingestion_generation = _resolve_ingestion_generation(
+                connection, doc_id, year, artifact_metadata.sha256
             )
+            filing_date = get_filing_date(connection, doc_id)
+            expected_member = get_metadata_member(connection, doc_id)
         except RuntimeError as exc:
             output, error = None, str(exc)
+        finally:
+            connection.close()
     if output is None or error:
         _record_failure(
             doc_id,
@@ -199,12 +206,6 @@ def process_one(
         )
         return doc_id, year, "no_txs", 0, []
 
-    connection = duckdb.connect(DB_PATH, read_only=True)
-    try:
-        filing_date = get_filing_date(connection, doc_id)
-        expected_member = get_metadata_member(connection, doc_id)
-    finally:
-        connection.close()
     transactions, rejections = validate_transactions(
         doc_id,
         parsed.member,

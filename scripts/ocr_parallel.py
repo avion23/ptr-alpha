@@ -32,10 +32,27 @@ from scripts.ocr_zero_rows import (
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress.json"
 MAX_WORKERS = 15
+REQUEST_INTERVAL_SECONDS = 0.0
+_REQUEST_SLOT_LOCK = threading.Lock()
+_NEXT_REQUEST_AT = 0.0
 
 
 write_q: queue.Queue = queue.Queue()
 SENTINEL = object()
+
+
+def _wait_for_request_slot() -> None:
+    """Pace model-call starts so free-tier RPM limits are not thrashed."""
+    global _NEXT_REQUEST_AT
+    if REQUEST_INTERVAL_SECONDS <= 0:
+        return
+    with _REQUEST_SLOT_LOCK:
+        now = time.monotonic()
+        delay = max(0.0, _NEXT_REQUEST_AT - now)
+        if delay:
+            time.sleep(delay)
+        now = time.monotonic()
+        _NEXT_REQUEST_AT = now + REQUEST_INTERVAL_SECONDS
 
 
 def _write_item(item):
@@ -152,6 +169,7 @@ def process_one(
         filing_date,
         expected_member,
     ) = item
+    _wait_for_request_slot()
     output, error, artifact_metadata = call_gemini(
         pdf_path,
         doc_id=doc_id,
@@ -327,7 +345,7 @@ def _bind_work_items(pending):
 
 
 def main():
-    global DB_PATH, PROGRESS_PATH, MAX_WORKERS
+    global DB_PATH, PROGRESS_PATH, MAX_WORKERS, REQUEST_INTERVAL_SECONDS
 
     parser = argparse.ArgumentParser(
         description="Parallel Gemini OCR for unresolved PDFs"
@@ -343,6 +361,12 @@ def main():
     parser.add_argument("--progress", default=None)
     parser.add_argument("--years", nargs="+", type=int, default=None)
     parser.add_argument("--workers", type=int, default=MAX_WORKERS)
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=0.0,
+        help="minimum seconds between model-call starts across all workers",
+    )
     parser.add_argument("--max-docs", type=int, default=None)
     parser.add_argument("--model", default=GEMINI_35_MODEL)
     parser.add_argument("--parser-version", default=GEMINI_35_PARSER_VERSION)
@@ -350,6 +374,7 @@ def main():
 
     DB_PATH = str(args.db)
     MAX_WORKERS = max(1, int(args.workers))
+    REQUEST_INTERVAL_SECONDS = max(0.0, float(args.request_interval))
     data_dir = Path(args.data_dir)
     cache_dir = Path(args.cache_dir) if args.cache_dir else data_dir / "gemini_cache"
     PROGRESS_PATH = str(

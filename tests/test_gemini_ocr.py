@@ -1009,6 +1009,31 @@ def test_row_construction_failure_retires_current_artifact_rows(
     assert "alias construction failed" in error
 
 
+def test_parallel_request_limiter_paces_model_call_starts(monkeypatch):
+    from scripts import ocr_parallel
+
+    clock = [100.0]
+    sleeps = []
+
+    def fake_monotonic():
+        return clock[0]
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(ocr_parallel, "REQUEST_INTERVAL_SECONDS", 3.0)
+    monkeypatch.setattr(ocr_parallel, "_NEXT_REQUEST_AT", 0.0)
+    monkeypatch.setattr(ocr_parallel.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(ocr_parallel.time, "sleep", fake_sleep)
+
+    ocr_parallel._wait_for_request_slot()
+    ocr_parallel._wait_for_request_slot()
+
+    assert sleeps == [3.0]
+    assert ocr_parallel._NEXT_REQUEST_AT == 106.0
+
+
 def test_parallel_writer_acknowledges_failure(monkeypatch):
     from scripts import ocr_parallel
 

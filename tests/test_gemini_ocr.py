@@ -366,6 +366,27 @@ def test_schema_rejects_malformed_outputs(bad_output):
         gemini_ocr_common.parse_gemini_output(bad_output)
 
 
+def test_schema_accepts_unpadded_but_unambiguous_dates():
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Apple (AAPL) | Purchase | 1/5/24 | 1/20/24 | A"
+    )
+    assert parsed.transactions[0]["date"] == "1/5/24"
+    assert parsed.transactions[0]["notif_date"] == "1/20/24"
+
+
+def test_schema_uses_final_member_block_after_reasoning():
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "Thinking Process:\n"
+        "MEMBER: Draft Wrong\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS\n"
+        "More reasoning after the draft.\n"
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Apple (AAPL) | Purchase | 10/9/24 | 10/9/24 | A"
+    )
+    assert parsed.member == "Jane Doe"
+    assert len(parsed.transactions) == 1
+
+
 def test_schema_accepts_explicit_missing_notification_date():
     parsed = gemini_ocr_common.parse_gemini_output(
         "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"

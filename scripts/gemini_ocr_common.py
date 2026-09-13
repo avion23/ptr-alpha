@@ -6,11 +6,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -79,14 +80,20 @@ def _strict_date(value: object) -> date | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
-    for fmt in ("%m/%d/%y", "%m/%d/%Y", "%m-%d-%y", "%m-%d-%Y"):
-        try:
-            parsed = datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-        if parsed.strftime(fmt) == text:
-            return parsed.date()
-    return None
+    match = re.fullmatch(r"\d{1,2}([/-])\d{1,2}\1\d{2}(?:\d{2})?", text)
+    if match is None:
+        return None
+    separator = match.group(1)
+    year_token = text.rsplit(separator, 1)[1]
+    fmt = (
+        f"%m{separator}%d{separator}%Y"
+        if len(year_token) == 4
+        else f"%m{separator}%d{separator}%y"
+    )
+    try:
+        return datetime.strptime(text, fmt).date()
+    except ValueError:
+        return None
 
 
 def _is_missing_notification_date(value: object) -> bool:
@@ -123,6 +130,18 @@ def parse_gemini_output(
     """Parse a complete response and require an outcome for every PDF page."""
     if not isinstance(output, str) or not output.strip():
         raise GeminiOutputError("empty_response")
+
+    # Attachment-capable models may emit reasoning before the requested
+    # schema. Parse only the final MEMBER block; that block still must satisfy
+    # the complete page/date/type/amount contract below.
+    raw_lines = output.splitlines()
+    member_starts = [
+        index
+        for index, line in enumerate(raw_lines)
+        if line.strip().upper().startswith("MEMBER:")
+    ]
+    if member_starts:
+        output = "\n".join(raw_lines[member_starts[-1] :])
 
     member: str | None = None
     declared_page_count: int | None = None

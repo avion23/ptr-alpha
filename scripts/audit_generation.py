@@ -244,7 +244,7 @@ def check_parse_counts_match_persisted(
                     f"status='no_txs' but raw_row_count={raw_count} "
                     f"transaction_count={tx_count}"
                 )
-        elif status in ("zero_rows", "error", "failed", "rejected"):
+        elif status in ("zero_rows", "error", "failed", "rejected", "invalidated"):
             if tx_count != 0:
                 result.violations.append(
                     f"{doc_id} ({parser_version}, {generation}): "

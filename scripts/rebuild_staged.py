@@ -780,6 +780,19 @@ def _refresh_house_completion(
         house["unresolved_doc_ids"] = unresolved
         house["resolved_doc_count"] = house["ptr_count"] - len(unresolved)
         if unresolved:
+            # Incomplete generations are not authoritative inventories. Clear
+            # any stale report rows left by an earlier provisional activation;
+            # inventories are rebuilt atomically only after every artifact is
+            # semantically terminal again.
+            empty_reports = pd.DataFrame(columns=SOURCE_REPORT_INPUT_COLUMNS)
+            for source in ("house_pdf", "gemini_ocr"):
+                db.source_reports.replace_generation(
+                    generation,
+                    source,
+                    "house",
+                    empty_reports,
+                    _in_transaction=True,
+                )
             db.conn.execute(
                 """
                 UPDATE house_archive_generations

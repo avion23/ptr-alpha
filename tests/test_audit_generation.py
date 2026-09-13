@@ -449,6 +449,25 @@ def test_failed_parse_never_leaves_rows(tmp_path):
     assert any("scans must fail closed" in v for v in check.violations)
 
 
+def test_invalidated_parse_status_is_nonterminal_and_requires_zero_rows(tmp_path):
+    db_path = tmp_path / "stage.duckdb"
+    db = build_staged_db(db_path)
+    db.close()
+
+    def fn(conn):
+        conn.execute(
+            "DELETE FROM transactions WHERE doc_id = '10000001' AND source = 'house_pdf'"
+        )
+        conn.execute(
+            "UPDATE pdf_parse_runs SET status = 'invalidated', transaction_count = 0 "
+            "WHERE doc_id = '10000001' AND parser_version = 'v4-deterministic'"
+        )
+
+    _mutate(db_path, fn)
+    check = _result(_audit(db_path), "parse_counts_match_persisted")
+    assert not any("10000001" in violation for violation in check.violations)
+
+
 def test_unknown_parse_status_is_reported(tmp_path):
     db_path = tmp_path / "stage.duckdb"
     db = build_staged_db(db_path)

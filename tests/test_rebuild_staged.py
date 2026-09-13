@@ -859,13 +859,21 @@ def test_refresh_house_completion_demotes_db_generation_on_unresolved_doc(tmp_pa
 
     db = _seed_house_inventory_database(tmp_path)
     try:
-        db.conn.execute(
-            """
-            UPDATE house_archive_generations
-            SET parse_status = 'complete'
-            WHERE archive_year = 2026 AND generation_id = 'house-generation'
-            """
+        initial_house = {
+            "generation_id": "house-generation",
+            "ptr_count": 3,
+        }
+        initial_unresolved, initial_report_count = rebuild_staged._refresh_house_completion(
+            db, initial_house, 2026
         )
+        assert initial_unresolved == []
+        assert initial_report_count == 3
+        assert db.source_reports.reconcile(
+            "house-generation", "house_pdf", "house"
+        )["found"] == 2
+        assert db.source_reports.reconcile(
+            "house-generation", "gemini_ocr", "house"
+        )["found"] == 1
         db.conn.execute(
             """
             UPDATE transactions
@@ -891,5 +899,11 @@ def test_refresh_house_completion_demotes_db_generation_on_unresolved_doc(tmp_pa
             WHERE archive_year = 2026 AND generation_id = 'house-generation'
             """
         ).fetchone()[0] == "incomplete"
+        assert db.source_reports.reconcile(
+            "house-generation", "house_pdf", "house"
+        )["found"] == 0
+        assert db.source_reports.reconcile(
+            "house-generation", "gemini_ocr", "house"
+        )["found"] == 0
     finally:
         db.close()

@@ -515,7 +515,7 @@ def _extract_owner_code(owner_cell: str | None) -> str | None:
     owner = clean_text(owner_cell).upper()
     if not owner:
         return None
-    if owner.startswith("DEPENDENT"):
+    if owner.startswith("DEPENDENT") or owner.startswith("CHILD"):
         return "DC"
     if owner.startswith("SPOUSE"):
         return "SP"

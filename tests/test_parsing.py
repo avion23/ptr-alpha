@@ -487,12 +487,14 @@ class TestParsing(unittest.TestCase):
             ["Apple Inc (AAPL)", "Spouse", "Purchase", "2024-01-01"],
             ["Microsoft Corp (MSFT)", "Joint", "Sale", "2024-01-02"],
             ["Ford Motor Co (F)", "Self", "Purchase", "2024-01-03"],
+            ["NVIDIA Corp (NVDA)", "Child", "Purchase", "2024-01-04"],
         ]
         transactions = parse_pdf_table(table)
-        self.assertEqual(len(transactions), 3)
+        self.assertEqual(len(transactions), 4)
         self.assertEqual(transactions[0]["owner_code"], "SP")
         self.assertEqual(transactions[1]["owner_code"], "J")
         self.assertEqual(transactions[2]["owner_code"], "S")
+        self.assertEqual(transactions[3]["owner_code"], "DC")
         self.assertEqual(transactions[2]["ticker"], "F")
 
     def test_parse_pdf_table_header_not_in_row_0(self):

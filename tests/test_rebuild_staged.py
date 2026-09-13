@@ -50,7 +50,7 @@ def test_senate_ingest_rejects_generation_provenance_rewrite(tmp_path):
         )
 
 
-def test_primary_text_preflight_only_prioritizes_reconcilable_candidates(monkeypatch):
+def test_text_only_pass_accepts_only_text_proven_complete_coverage(monkeypatch):
     from scripts import rebuild_staged
 
     row = {
@@ -62,18 +62,22 @@ def test_primary_text_preflight_only_prioritizes_reconcilable_candidates(monkeyp
         "notification_date": pd.Timestamp("2026-01-03"),
     }
     monkeypatch.setattr(
-        rebuild_staged._parser_cascade,
-        "_try_pdfplumber",
-        lambda _path: [row],
+        rebuild_staged._parser_cascade, "_try_pdfplumber", lambda _path: [row]
     )
     monkeypatch.setattr(
-        rebuild_staged._parser_cascade,
-        "_try_pdftotext",
-        lambda _path: [dict(row)],
+        rebuild_staged._parser_cascade, "_try_camelot_lattice", lambda _path: []
     )
-    assert rebuild_staged._primary_text_engines_reconcile(
+    monkeypatch.setattr(
+        rebuild_staged._parser_cascade, "_try_camelot_stream", lambda _path: []
+    )
+    monkeypatch.setattr(
+        rebuild_staged._parser_cascade, "_try_pdftotext", lambda _path: [dict(row)]
+    )
+    _, rows, engines = rebuild_staged._parser_cascade._parse_text_only_worker(
         rebuild_staged.Path("matching.pdf")
     )
+    assert rows == [row]
+    assert "won:pdftotext" in engines
 
     conflicting = dict(row)
     conflicting["transaction_date"] = pd.Timestamp("2026-01-04")
@@ -82,9 +86,10 @@ def test_primary_text_preflight_only_prioritizes_reconcilable_candidates(monkeyp
         "_try_pdftotext",
         lambda _path: [conflicting],
     )
-    assert not rebuild_staged._primary_text_engines_reconcile(
-        rebuild_staged.Path("conflicting.pdf")
-    )
+    with pytest.raises(rebuild_staged.ParserCascadeError):
+        rebuild_staged._parser_cascade._parse_text_only_worker(
+            rebuild_staged.Path("conflicting.pdf")
+        )
 
 
 def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
@@ -130,15 +135,21 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         def __init__(self):
             self.conn = FakeConnection()
             self.parse_runs = FakeParseRuns()
-            self.replacement = None
+            self.replacements = []
 
         def get_latest_house_generation(self, year):
             assert year == 2026
             return "generation-2026"
 
         def replace_transactions_for_docs(self, dataframe, **kwargs):
-            self.replacement = (dataframe.copy(), kwargs)
-            return SimpleNamespace(by_doc_total={"fallback": 1, "failed": 0})
+            self.replacements.append((dataframe.copy(), kwargs))
+            by_doc_total = {
+                doc_id: int((dataframe.get("doc_id") == doc_id).sum())
+                if "doc_id" in dataframe
+                else 0
+                for doc_id in kwargs["attempted_doc_ids"]
+            }
+            return SimpleNamespace(by_doc_total=by_doc_total)
 
     class FakePool:
         def __init__(self, _workers):
@@ -174,9 +185,11 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         raise rebuild_staged.ParserCascadeError("unresolved parser completeness")
 
     def fake_consolidate(pdf_transactions, _member_lookup):
-        assert pdf_transactions[fallback_path] == fallback_rows
-        assert pdf_transactions[failed_path] == []
-        return pd.DataFrame(fallback_rows)
+        if fallback_path in pdf_transactions:
+            assert pdf_transactions[fallback_path] == fallback_rows
+            return pd.DataFrame(fallback_rows)
+        assert pdf_transactions == {failed_path: []}
+        return pd.DataFrame()
 
     fake_database = FakeDatabase()
     monkeypatch.setattr(rebuild_staged, "_house_source", lambda _staging: FakeSource())
@@ -197,14 +210,14 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         ),
     )
     monkeypatch.setattr(rebuild_staged, "Pool", FakePool)
-
-    def fail_readiness_probe(_path):
-        raise AssertionError("readiness probe must not run before parsing")
-
     monkeypatch.setattr(
         rebuild_staged,
-        "_primary_text_engines_reconcile",
-        fail_readiness_probe,
+        "_tolerant_text_parse_worker",
+        lambda path: (
+            path,
+            [],
+            ["__parse_failed__:text engines did not prove complete coverage"],
+        ),
     )
     monkeypatch.setattr(rebuild_staged, "_parse_pdf_worker", fake_parser)
     monkeypatch.setattr(rebuild_staged, "consolidate_transactions", fake_consolidate)
@@ -217,13 +230,21 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
     )
 
     assert result["parse_run_statuses"] == {"success": 1, "error": 1}
-    assert fake_database.replacement is not None
-    stored_df, kwargs = fake_database.replacement
+    assert len(fake_database.replacements) == 2
+    stored_df, fallback_kwargs = fake_database.replacements[0]
     assert stored_df["doc_id"].tolist() == ["fallback"]
-    assert kwargs["attempted_doc_ids"] == ["fallback", "failed"]
-    assert kwargs["replacement_doc_ids"] == ["fallback"]
+    assert fallback_kwargs["attempted_doc_ids"] == ["fallback"]
+    assert fallback_kwargs["replacement_doc_ids"] == ["fallback"]
+    failed_df, failed_kwargs = fake_database.replacements[1]
+    assert failed_df.empty
+    assert failed_kwargs["attempted_doc_ids"] == ["failed"]
+    assert failed_kwargs["replacement_doc_ids"] == []
 
-    parse_runs = {run["doc_id"]: run for run in kwargs["parse_runs"]}
+    parse_runs = {
+        run["doc_id"]: run
+        for _, kwargs in fake_database.replacements
+        for run in kwargs["parse_runs"]
+    }
     assert parse_runs["fallback"]["status"] == "success"
     assert parse_runs["fallback"]["error_message"] is None
     assert parse_runs["fallback"]["engines_attempted"] == (
@@ -234,22 +255,15 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
     assert parse_runs["failed"]["engines_attempted"] == "cascade-failed"
 
 
-def test_house_parse_persists_batches_before_all_results_without_readiness_preflight(
+def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_immediately(
     monkeypatch, tmp_path
 ):
     from scripts import rebuild_staged
 
-    sizes = {
-        "a-small-scan": 1,
-        "z-fast1": 400,
-        "z-fast2": 300,
-        "z-fast3": 200,
-        "z-fast4": 150,
-        "a-retry": 1000,
-    }
-    paths = [tmp_path / f"{stem}.pdf" for stem in sizes]
-    for path, size in zip(paths, sizes.values()):
-        path.write_bytes(b"x" * size)
+    stems = ["fast2", "defer", "retry", "fast1"]
+    paths = [tmp_path / f"{stem}.pdf" for stem in stems]
+    for path in paths:
+        path.write_bytes(b"%PDF-test\n%%EOF")
     existing_docs = pd.DataFrame({"DocID": [path.stem for path in paths]})
 
     source = SimpleNamespace(
@@ -265,17 +279,16 @@ def test_house_parse_persists_batches_before_all_results_without_readiness_prefl
         conn=SimpleNamespace(
             execute=lambda sql, *_args: SimpleNamespace(
                 fetchall=lambda: (
-                    [("a-retry",)] if "SELECT DISTINCT doc_id" in sql else []
+                    [("retry",)] if "SELECT DISTINCT doc_id" in sql else []
                 )
             )
         ),
-        parse_runs=SimpleNamespace(
-            get_cached_doc_ids=lambda **_kwargs: set()
-        ),
+        parse_runs=SimpleNamespace(get_cached_doc_ids=lambda **_kwargs: set()),
         get_latest_house_generation=lambda _year: "generation",
     )
 
-    requested = []
+    text_requested = []
+    full_requested = []
     persisted = []
 
     class FakePool:
@@ -288,19 +301,20 @@ def test_house_parse_persists_batches_before_all_results_without_readiness_prefl
         def __exit__(self, *_args):
             return False
 
-        def map(self, *_args, **_kwargs):
-            raise AssertionError("readiness preflight must not gate parsing")
-
         def imap_unordered(self, worker, items, chunksize=1):
             assert chunksize == 1
             for path in items:
                 yield worker(path)
 
-    def fake_worker(path):
-        requested.append(path.stem)
-        if len(requested) == 5:
-            assert persisted == [["z-fast1", "z-fast2", "z-fast3", "z-fast4"]]
-        return path, [{"doc_id": path.stem}], ["pdfplumber"]
+    def fake_text_worker(path):
+        text_requested.append(path.stem)
+        if path.stem == "defer":
+            return path, [], ["__parse_failed__:text pass deferred"]
+        return path, [{"doc_id": path.stem}], ["won:pdftotext"]
+
+    def fake_full_worker(path):
+        full_requested.append(path.stem)
+        return path, [{"doc_id": path.stem}], ["won:reconciled_complete_ocr"]
 
     def fake_persist(_db, **kwargs):
         batch = [path.stem for path, *_ in kwargs["results"]]
@@ -323,49 +337,22 @@ def test_house_parse_persists_batches_before_all_results_without_readiness_prefl
         rebuild_staged,
         "_settings_for",
         lambda _staging: SimpleNamespace(
-            data=SimpleNamespace(get_workers=lambda: 1)
+            data=SimpleNamespace(get_workers=lambda: 2)
         ),
     )
     monkeypatch.setattr(rebuild_staged, "Pool", FakePool)
-    monkeypatch.setattr(rebuild_staged, "_tolerant_parse_worker", fake_worker)
+    monkeypatch.setattr(rebuild_staged, "_tolerant_text_parse_worker", fake_text_worker)
+    monkeypatch.setattr(rebuild_staged, "_tolerant_parse_worker", fake_full_worker)
     monkeypatch.setattr(rebuild_staged, "_persist_house_parse_batch", fake_persist)
-
-    def fail_parser_preflight(_path):
-        raise AssertionError("parser preflight must not run before parsing")
-
-    monkeypatch.setattr(
-        rebuild_staged._parser_cascade, "_try_pdfplumber", fail_parser_preflight
-    )
-    monkeypatch.setattr(
-        rebuild_staged._parser_cascade, "_try_pdftotext", fail_parser_preflight
-    )
-
-    def fail_readiness_probe(_path):
-        raise AssertionError("readiness probe must not run before parsing")
-
-    monkeypatch.setattr(
-        rebuild_staged,
-        "_primary_text_engines_reconcile",
-        fail_readiness_probe,
-    )
 
     result = rebuild_staged._parse_house_year_tolerant(
         tmp_path, cast(rebuild_staged.Database, db), 2026
     )
 
-    assert requested == [
-        "z-fast1",
-        "z-fast2",
-        "z-fast3",
-        "z-fast4",
-        "a-small-scan",
-        "a-retry",
-    ]
-    assert persisted == [
-        ["z-fast1", "z-fast2", "z-fast3", "z-fast4"],
-        ["a-small-scan", "a-retry"],
-    ]
-    assert result["attempted"] == 6
+    assert text_requested == ["defer", "fast1", "fast2"]
+    assert full_requested == ["defer", "retry"]
+    assert persisted == [["fast1", "fast2"], ["defer"], ["retry"]]
+    assert result["attempted"] == 4
 
 
 def _seed_house_inventory_database(tmp_path):

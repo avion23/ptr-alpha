@@ -232,12 +232,19 @@ def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
     return None
 
 
-def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
-    """Compare text engines; require complete Tesseract coverage when uncertain."""
-    skip_docling = os.environ.get("PTR_SKIP_DOCLING") == "1"
+def _run_text_engines(
+    pdf_path: Path,
+) -> tuple[
+    tuple[Path, list[dict], list[str]] | None,
+    list[tuple[str, list[dict]]],
+    list[dict],
+    list[str],
+    list[str],
+]:
+    """Run every text engine and return a trusted result when they prove coverage."""
     engines_attempted: list[str] = []
     errors: list[str] = []
-    text_candidates = []
+    text_candidates: list[tuple[str, list[dict]]] = []
     for engine_fn, engine_name in [
         (_try_pdfplumber, "pdfplumber"),
         (_try_camelot_lattice, "lattice"),
@@ -265,13 +272,38 @@ def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     ):
         engines_attempted.append("trusted:pdfplumber_subset_pdftotext")
         engines_attempted.append("won:pdftotext")
-        return pdf_path, trusted["pdftotext"], engines_attempted
+        result = pdf_path, trusted["pdftotext"], engines_attempted
+        return result, text_candidates, reconciled_text, engines_attempted, errors
     if pdftotext_subset and _candidate_covers_all(
         trusted["pdfplumber"], text_candidates
     ):
         engines_attempted.append("trusted:pdftotext_subset_pdfplumber")
         engines_attempted.append("won:pdfplumber")
-        return pdf_path, trusted["pdfplumber"], engines_attempted
+        result = pdf_path, trusted["pdfplumber"], engines_attempted
+        return result, text_candidates, reconciled_text, engines_attempted, errors
+    return None, text_candidates, reconciled_text, engines_attempted, errors
+
+
+def _parse_text_only_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
+    """Return only text-proven results; defer uncertain documents to OCR."""
+    result, *_ = _run_text_engines(pdf_path)
+    if result is not None:
+        return result
+    raise ParserCascadeError(f"{pdf_path}: text engines did not prove complete coverage")
+
+
+def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
+    """Compare text engines; require complete Tesseract coverage when uncertain."""
+    skip_docling = os.environ.get("PTR_SKIP_DOCLING") == "1"
+    (
+        trusted_result,
+        text_candidates,
+        reconciled_text,
+        engines_attempted,
+        errors,
+    ) = _run_text_engines(pdf_path)
+    if trusted_result is not None:
+        return trusted_result
 
     ocr_candidates = []
     if not skip_docling:

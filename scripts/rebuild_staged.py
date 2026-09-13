@@ -271,38 +271,16 @@ def _tolerant_parse_worker(pdf_path: Path):
     return _production_tolerant_parse_worker(pdf_path, _parse_pdf_worker)
 
 
-def _pdf_size_hint(pdf_path: Path) -> int:
-    """Return a local-artifact size hint for parse scheduling.
-
-    A file stat is metadata-only: it does not invoke a parser or read the PDF
-    body. Missing or transiently inaccessible artifacts return ``-1`` so they
-    sort after every readable artifact.
-    """
-    try:
-        return max(0, int(pdf_path.stat().st_size))
-    except OSError:
-        return -1
+_TEXT_PASS_BUDGET_SECONDS = 30
 
 
-def _primary_text_engines_reconcile(pdf_path: Path) -> bool:
-    """Predict a cheap text-cascade success for scheduling only.
-
-    This does not authorize a parse result. The full production cascade still
-    runs afterward. It only moves PDFs whose pdfplumber/pdftotext identities
-    already form a multiset subset relation ahead of uncertain/OCR-heavy PDFs.
-    """
-    try:
-        pdfplumber_rows = _parser_cascade._try_pdfplumber(pdf_path)
-        pdftotext_rows = _parser_cascade._try_pdftotext(pdf_path)
-    except Exception:  # noqa: BLE001 -- scheduling hint must never block parsing
-        return False
-    if not pdfplumber_rows or not pdftotext_rows:
-        return False
-    pdfplumber_counts = _parser_cascade._candidate_counts(pdfplumber_rows)[0]
-    pdftotext_counts = _parser_cascade._candidate_counts(pdftotext_rows)[0]
-    return _parser_cascade._multiset_subset(
-        pdfplumber_counts, pdftotext_counts
-    ) or _parser_cascade._multiset_subset(pdftotext_counts, pdfplumber_counts)
+def _tolerant_text_parse_worker(pdf_path: Path):
+    """Bound the trusted-text pass and defer every uncertain result to OCR."""
+    return _production_tolerant_parse_worker(
+        pdf_path,
+        _parser_cascade._parse_text_only_worker,
+        budget_seconds=_TEXT_PASS_BUDGET_SECONDS,
+    )
 
 
 def _persist_house_parse_batch(
@@ -444,12 +422,11 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
         if not pdf_paths:
             return {"attempted": 0, "skipped_cached": len(cached)}
 
-        # Do not let a few repeatedly expensive OCR failures starve documents
-        # that have never been attempted. Terminal successes/no_txs were
-        # removed above; push all remaining previously attempted nonterminal
-        # docs to the end while preserving deterministic doc-id order within
-        # each group. A later resumable invocation will retry them after making
-        # forward progress on unseen artifacts.
+        # Terminal successes/no_txs were removed above. Previously attempted
+        # nonterminal documents have already failed the full cascade, so do not
+        # spend the bounded text pass on them again. Every unseen document gets
+        # a short text-only chance before any OCR-capable work starts. This
+        # prevents a few long OCR tails from starving text-resolvable filings.
         previously_attempted = {
             str(row[0])
             for row in db.conn.execute(
@@ -462,21 +439,20 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
                 [year, ingestion_generation],
             ).fetchall()
         }
-        order = sorted(
-            range(len(pdf_paths)),
-            key=lambda index: (
-                pdf_paths[index].stem in previously_attempted,
-                -_pdf_size_hint(pdf_paths[index]),
-                pdf_paths[index].stem,
-            ),
-        )
+        order = sorted(range(len(pdf_paths)), key=lambda index: pdf_paths[index].stem)
         pdf_paths = [pdf_paths[index] for index in order]
         existing_docs = existing_docs.iloc[order].reset_index(drop=True)
         member_lookup = _build_member_lookup(existing_docs)
+        unseen_paths = [
+            path for path in pdf_paths if path.stem not in previously_attempted
+        ]
+        retry_paths = [
+            path for path in pdf_paths if path.stem in previously_attempted
+        ]
 
         settings = _settings_for(staging)
         workers = settings.data.get_workers()
-        persist_batch_size = max(4, workers)
+        persist_batch_size = max(1, workers)
         attempted = 0
         persisted_transactions = 0
         by_status: dict[str, int] = {}
@@ -499,15 +475,28 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
                 by_status[status] = by_status.get(status, 0) + int(count)
 
         completed: list = []
+        deferred_paths: list[Path] = []
         with Pool(workers) as pool:
             for result in pool.imap_unordered(
-                _tolerant_parse_worker, pdf_paths, chunksize=1
+                _tolerant_text_parse_worker, unseen_paths, chunksize=1
             ):
+                if _engine_error_detail(result[2]) is not None:
+                    deferred_paths.append(result[0])
+                    continue
                 completed.append(result)
                 if len(completed) >= persist_batch_size:
                     persist_completed(completed)
                     completed = []
             persist_completed(completed)
+
+            # Unseen documents that need OCR run before old retries. Each
+            # expensive result is committed immediately so interruption cannot
+            # discard a completed OCR/parser attempt.
+            full_cascade_paths = deferred_paths + retry_paths
+            for result in pool.imap_unordered(
+                _tolerant_parse_worker, full_cascade_paths, chunksize=1
+            ):
+                persist_completed([result])
 
         return {
             "attempted": attempted,

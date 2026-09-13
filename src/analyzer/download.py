@@ -804,7 +804,12 @@ def _skip_stems_from_env(raw: str | None) -> frozenset[str]:
 _PTR_SKIP_DOCS = _skip_stems_from_env(os.environ.get("PTR_SKIP_DOCS"))
 
 
-def _tolerant_parse_pdf_worker(pdf_path: Path, parse_worker=None):
+def _tolerant_parse_pdf_worker(
+    pdf_path: Path,
+    parse_worker=None,
+    *,
+    budget_seconds: float | None = None,
+):
     """Run the accepted cascade; convert per-PDF failures into sentinel results
     so one bad document cannot discard the whole year's batch.
 
@@ -822,6 +827,8 @@ def _tolerant_parse_pdf_worker(pdf_path: Path, parse_worker=None):
         return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}skipped via PTR_SKIP_DOCS"]
 
     worker = _parse_pdf_worker if parse_worker is None else parse_worker
+    if budget_seconds is None:
+        budget_seconds = _PARSE_DOC_BUDGET_SECONDS
     use_watchdog = (
         threading.current_thread() is threading.main_thread()
         and hasattr(signal, "setitimer")
@@ -832,16 +839,14 @@ def _tolerant_parse_pdf_worker(pdf_path: Path, parse_worker=None):
             prior_handler = signal.getsignal(signal.SIGALRM)
 
             def _raise_budget_exceeded(_signum, _frame):
-                raise ParseBudgetExceeded(
-                    f"parse budget {_PARSE_DOC_BUDGET_SECONDS}s exceeded"
-                )
+                raise ParseBudgetExceeded(f"parse budget {budget_seconds}s exceeded")
 
             signal.signal(signal.SIGALRM, _raise_budget_exceeded)
-            signal.setitimer(signal.ITIMER_REAL, _PARSE_DOC_BUDGET_SECONDS)
+            signal.setitimer(signal.ITIMER_REAL, budget_seconds)
         try:
             return worker(pdf_path)
         except ParseBudgetExceeded:
-            detail = f"parse budget {_PARSE_DOC_BUDGET_SECONDS}s exceeded"
+            detail = f"parse budget {budget_seconds}s exceeded"
             return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{detail}"]
         except ParserCascadeError as exc:
             return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{exc}"]

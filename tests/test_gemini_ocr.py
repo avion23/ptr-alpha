@@ -788,7 +788,7 @@ def test_insert_transactions_empty_list_retires_existing_ocr_rows(tmp_path):
     assert latest_run == ("no_txs", 0, 0)
 
 
-def test_insert_transactions_all_bad_rows_preserves_existing_rows(tmp_path):
+def test_insert_transactions_all_bad_rows_retires_current_artifact_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -821,11 +821,11 @@ def test_insert_transactions_all_bad_rows_preserves_existing_rows(tmp_path):
     """).fetchone()
     con.close()
 
-    assert rows == [("AAPL", "Apple Inc. (AAPL)")]
+    assert rows == []
     assert latest_run == ("error", 1, 0, '{"invalid_transaction_date": 1}')
 
 
-def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):
+def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
@@ -867,11 +867,11 @@ def test_insert_transactions_mixed_batch_replaces_with_valid_rows(tmp_path):
     """).fetchone()
     con.close()
 
-    assert rows == [("OLD", "Old Inc. (OLD)")]
+    assert rows == []
     assert latest_run == ("error", 2, 0, '{"invalid_transaction_date": 1}')
 
 
-def test_row_construction_failure_aborts_whole_batch_before_delete(
+def test_row_construction_failure_retires_current_artifact_rows(
     monkeypatch, tmp_path
 ):
     from scripts import ocr_zero_rows
@@ -911,7 +911,7 @@ def test_row_construction_failure_aborts_whole_batch_before_delete(
     con = Database(db_path).conn
     assert con.execute(
         "SELECT asset_description FROM transactions WHERE doc_id='doc-construction'"
-    ).fetchall() == [("Old Inc. (OLD)",)]
+    ).fetchall() == []
     status, error = con.execute(
         "SELECT status, error_message FROM pdf_parse_runs WHERE doc_id='doc-construction' ORDER BY parsed_at DESC LIMIT 1"
     ).fetchone()
@@ -980,6 +980,55 @@ def test_semantic_zero_error_preserves_prior_ocr_rows(tmp_path):
     connection.close()
     assert rows == [("OLD",)]
     assert latest == ("error", 3, 0, "semantic_zero_after_raw_rows")
+
+
+def test_failed_exact_artifact_revalidation_retires_current_ocr_rows(tmp_path):
+    db_path = tmp_path / "failed-revalidation.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute(
+        "INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at) "
+        "VALUES ('failed-revalidation', 'Jane', 'Doe', TIMESTAMP '2024-01-20', 'P', CURRENT_TIMESTAMP)"
+    )
+    db.conn.execute(
+        """INSERT INTO transactions (
+               doc_id, member, ticker, transaction_date, disclosure_date,
+               transaction_type, amount_raw, source, chamber, source_record_id,
+               source_row_id, official_filing_date, available_date,
+               notification_date, ingestion_generation, artifact_sha256
+           ) VALUES (
+               'failed-revalidation', 'Jane Doe', 'AAPL', DATE '2024-01-15', DATE '2024-01-20',
+               'Purchase', 'A', 'gemini_ocr', 'House', 'failed-revalidation',
+               'failed-revalidation:old', DATE '2024-01-20', DATE '2024-01-20',
+               DATE '2024-01-20', 'test-house-generation', 'test-artifact-sha256'
+           )"""
+    )
+    db.close()
+
+    rejected = _tx()
+    rejected["notif_date"] = "01/14/24"
+    assert (
+        _insert_transactions(
+            "failed-revalidation",
+            2024,
+            "Jane Doe",
+            [rejected],
+            db_path=str(db_path),
+        )
+        == 0
+    )
+
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM transactions WHERE doc_id='failed-revalidation'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT status, transaction_count, error_message FROM pdf_parse_runs "
+            "WHERE doc_id='failed-revalidation' ORDER BY parsed_at DESC LIMIT 1"
+        ).fetchone() == ("error", 0, '{"notification_before_transaction": 1}')
+    finally:
+        connection.close()
 
 
 def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):

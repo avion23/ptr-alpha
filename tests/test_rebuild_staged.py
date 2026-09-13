@@ -471,6 +471,108 @@ def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identi
         db.close()
 
 
+def test_repair_audit_gaps_reconciles_parser_source_family_and_retires_orphan_rows(tmp_path):
+    from analyzer.database import Database
+    from scripts import rebuild_staged
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "manifest.json").write_text(
+        json.dumps(
+            {
+                "generation": "test-generation",
+                "house": {
+                    "2024": {
+                        "generation_id": "house-generation",
+                        "ptr_count": 2,
+                    }
+                },
+            }
+        )
+    )
+    db = Database(staging / "congress.duckdb")
+    db.conn.execute(
+        """
+        INSERT INTO house_archive_generations (
+            archive_year, generation_id, metadata_count, ptr_count, parse_status
+        ) VALUES (2024, 'house-generation', 2, 2, 'incomplete')
+        """
+    )
+    db.conn.executemany(
+        """
+        INSERT INTO house_generation_metadata (
+            archive_year, generation_id, doc_id, first_name, last_name,
+            filing_date, filing_type
+        ) VALUES (2024, 'house-generation', ?, 'Jane', 'Doe', '2024-01-20', 'P')
+        """,
+        [("gemini-good",), ("gemini-error",)],
+    )
+    db.conn.executemany(
+        """
+        INSERT INTO house_pdf_artifacts (
+            archive_year, generation_id, doc_id, artifact_sha256
+        ) VALUES (2024, 'house-generation', ?, ?)
+        """,
+        [("gemini-good", "a" * 64), ("gemini-error", "b" * 64)],
+    )
+    db.conn.executemany(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, source, chamber, source_record_id, source_row_id,
+            official_filing_date, ingestion_generation, artifact_sha256
+        ) VALUES (?, 'Jane Doe', 'AAPL', '2024-01-15', '2024-01-20',
+                  'Purchase', 'gemini_ocr', 'House', ?, ?, '2024-01-20',
+                  'house-generation', ?)
+        """,
+        [
+            ("gemini-good", "gemini-good", "gemini-good:r1", "a" * 64),
+            ("gemini-error", "gemini-error", "gemini-error:r1", "b" * 64),
+        ],
+    )
+    db.upsert_parse_run(
+        "gemini-good",
+        2024,
+        "v5-gemini-validated",
+        "success",
+        "gemini/model",
+        1,
+        1,
+        artifact_sha256="a" * 64,
+        ingestion_generation="house-generation",
+    )
+    db.upsert_parse_run(
+        "gemini-error",
+        2024,
+        "v5-gemini-validated",
+        "error",
+        "gemini/model",
+        1,
+        0,
+        error_message="failed semantic validation",
+        artifact_sha256="b" * 64,
+        ingestion_generation="house-generation",
+    )
+    db.close()
+
+    rebuild_staged.repair_audit_gaps(SimpleNamespace(staging=str(staging)))
+
+    db = Database(staging / "congress.duckdb", read_only=True)
+    try:
+        assert db.conn.execute(
+            "SELECT status, transaction_count FROM pdf_parse_runs "
+            "WHERE doc_id='gemini-good'"
+        ).fetchone() == ("success", 1)
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE doc_id='gemini-good'"
+        ).fetchone()[0] == 1
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE doc_id='gemini-error'"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
 def _seed_house_inventory_database(tmp_path):
     from analyzer.database import Database
 

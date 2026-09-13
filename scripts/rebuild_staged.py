@@ -2405,18 +2405,48 @@ def repair_audit_gaps(args) -> None:
                 """,
                 [today_plus],
             )
-        # 2a. update parse-run counts to post-quarantine persisted counts
+        # 2a. Retire source rows that have no matching artifact-bound success
+        # run. Error/rejected/invalidated attempts must never leave stale rows
+        # that can later be mistaken for terminal parse evidence.
+        db.conn.execute("""
+            DELETE FROM transactions t
+            WHERE t.source IN ('house_pdf', 'gemini_ocr')
+              AND t.ingestion_generation IS NOT NULL
+              AND t.artifact_sha256 IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pdf_parse_runs p
+                  WHERE p.doc_id = t.doc_id
+                    AND p.ingestion_generation = t.ingestion_generation
+                    AND p.artifact_sha256 = t.artifact_sha256
+                    AND p.status = 'success'
+                    AND t.source = CASE
+                        WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                        THEN 'gemini_ocr'
+                        ELSE 'house_pdf'
+                    END
+              )
+        """)
+        # 2b. Update terminal parse-run counts against the source family that
+        # parser version actually owns. Gemini runs reconcile with gemini_ocr;
+        # deterministic runs reconcile with house_pdf.
         db.conn.execute("""
             UPDATE pdf_parse_runs p
             SET transaction_count = (
                 SELECT COUNT(*) FROM transactions t
                 WHERE t.doc_id = p.doc_id
-                  AND t.source = 'house_pdf'
+                  AND t.source = CASE
+                      WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                      THEN 'gemini_ocr'
+                      ELSE 'house_pdf'
+                  END
                   AND t.ingestion_generation = p.ingestion_generation
+                  AND t.artifact_sha256 = p.artifact_sha256
             )
             WHERE p.status = 'success'
         """)
-        # 2b. docs that dropped to zero rows become unresolved (zero_rows)
+        # 2c. Successes whose own source rows were fully quarantined become
+        # unresolved zero_rows. This is source-family aware so valid Gemini
+        # rows cannot be demoted merely because no house_pdf rows exist.
         db.conn.execute("""
             UPDATE pdf_parse_runs p
             SET status = 'zero_rows', transaction_count = 0,
@@ -2425,11 +2455,16 @@ def repair_audit_gaps(args) -> None:
               AND NOT EXISTS (
                 SELECT 1 FROM transactions t
                 WHERE t.doc_id = p.doc_id
-                  AND t.source = 'house_pdf'
+                  AND t.source = CASE
+                      WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
+                      THEN 'gemini_ocr'
+                      ELSE 'house_pdf'
+                  END
                   AND t.ingestion_generation = p.ingestion_generation
+                  AND t.artifact_sha256 = p.artifact_sha256
               )
         """)
-        # 2c. keep only the terminal run per (doc, generation) when one exists
+        # 2d. keep only the terminal run per (doc, generation) when one exists
         db.conn.execute("""
             DELETE FROM pdf_parse_runs p
             USING pdf_parse_runs terminal

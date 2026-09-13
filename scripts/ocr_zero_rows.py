@@ -1148,6 +1148,50 @@ def record_parse_run(
     )
 
 
+def _record_failed_ocr_attempt(
+    conn,
+    doc_id,
+    year,
+    raw_count,
+    error_message,
+    *,
+    parser_version: str = GEMINI_PARSER_VERSION,
+    artifact_sha256: str | None = None,
+    ingestion_generation: str | None = None,
+    engine_model: str = MODEL,
+) -> None:
+    """Record a failed OCR attempt and retire rows for that exact artifact."""
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        if artifact_sha256 and ingestion_generation:
+            conn.execute(
+                """
+                DELETE FROM transactions
+                WHERE source = 'gemini_ocr' AND doc_id = ?
+                  AND (chamber = 'House' OR chamber IS NULL)
+                  AND ingestion_generation = ? AND artifact_sha256 = ?
+                """,
+                [str(doc_id), ingestion_generation, artifact_sha256],
+            )
+        record_parse_run(
+            conn,
+            doc_id,
+            year,
+            "error",
+            raw_count,
+            0,
+            error_message,
+            parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
+            engines_attempted=engine_model,
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def insert_transactions(
     doc_id,
     year,
@@ -1211,18 +1255,16 @@ def insert_transactions(
         key: value for key, value in rejections.items() if key != "member_mismatch"
     }
     if fatal_rejections:
-        record_parse_run(
+        _record_failed_ocr_attempt(
             conn,
             doc_id,
             year,
-            "error",
             input_count,
-            0,
             json.dumps(fatal_rejections, sort_keys=True),
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
-            engines_attempted=engine_model,
+            engine_model=engine_model,
         )
         conn.close()
         return 0
@@ -1293,18 +1335,16 @@ def insert_transactions(
             errors.append(f"{tx.get('asset', '?')}: {exc}")
     if errors:
         message = "; ".join(errors)
-        record_parse_run(
+        _record_failed_ocr_attempt(
             conn,
             doc_id,
             year,
-            "error",
             input_count,
-            0,
             message,
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
-            engines_attempted=engine_model,
+            engine_model=engine_model,
         )
         conn.close()
         return 0
@@ -1313,20 +1353,32 @@ def insert_transactions(
         # "error" so get_zero_row_pdfs() will retry them; only use "no_txs"
         # when the caller passed an empty list (nothing to retry).
         input_count = raw_count if raw_count is not None else len(transactions)
-        status = "no_txs" if input_count == 0 else "error"
-        record_parse_run(
-            conn,
-            doc_id,
-            year,
-            status,
-            input_count,
-            0,
-            "; ".join(errors),
-            parser_version=parser_version,
-            artifact_sha256=artifact_sha256,
-            ingestion_generation=ingestion_generation,
-            engines_attempted=engine_model,
-        )
+        if input_count:
+            _record_failed_ocr_attempt(
+                conn,
+                doc_id,
+                year,
+                input_count,
+                "; ".join(errors),
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+                engine_model=engine_model,
+            )
+        else:
+            record_parse_run(
+                conn,
+                doc_id,
+                year,
+                "no_txs",
+                0,
+                0,
+                "",
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+                engines_attempted=engine_model,
+            )
         conn.execute("CHECKPOINT")
         conn.close()
         return 0
@@ -1521,12 +1573,10 @@ def main():
         if output is None or error:
             conn = duckdb.connect(DB_PATH)
             try:
-                record_parse_run(
+                _record_failed_ocr_attempt(
                     conn,
                     doc_id,
                     year,
-                    "error",
-                    0,
                     0,
                     error,
                     artifact_sha256=(
@@ -1651,12 +1701,10 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
         if output is None or error:
             conn = duckdb.connect(db_path)
             try:
-                record_parse_run(
+                _record_failed_ocr_attempt(
                     conn,
                     doc_id,
                     yr,
-                    "error",
-                    0,
                     0,
                     error,
                     artifact_sha256=(

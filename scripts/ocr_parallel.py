@@ -291,6 +291,13 @@ def _page_count_hint(item) -> tuple[int, int, str]:
     return int(year), pages, str(doc_id)
 
 
+def _filter_requested_doc_ids(pending, requested_doc_ids):
+    if not requested_doc_ids:
+        return pending
+    requested = {str(doc_id) for doc_id in requested_doc_ids}
+    return [item for item in pending if str(item[0]) in requested]
+
+
 def _bind_work_items(pending):
     """Bind unresolved PDFs to one immutable staged generation before threading."""
     connection = duckdb.connect(DB_PATH)
@@ -360,6 +367,12 @@ def main():
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--progress", default=None)
     parser.add_argument("--years", nargs="+", type=int, default=None)
+    parser.add_argument(
+        "--doc-ids",
+        nargs="+",
+        default=None,
+        help="process only these unresolved House document IDs",
+    )
     parser.add_argument("--workers", type=int, default=MAX_WORKERS)
     parser.add_argument(
         "--request-interval",
@@ -399,6 +412,7 @@ def main():
             data_dir=data_dir,
             parser_version=args.parser_version,
         )
+    pending = _filter_requested_doc_ids(pending, args.doc_ids)
     pending = sorted(dict.fromkeys(pending), key=_page_count_hint)
     if args.max_docs is not None:
         pending = pending[: max(0, int(args.max_docs))]

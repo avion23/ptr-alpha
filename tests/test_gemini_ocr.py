@@ -1034,6 +1034,22 @@ def test_parallel_request_limiter_paces_model_call_starts(monkeypatch):
     assert ocr_parallel._NEXT_REQUEST_AT == 106.0
 
 
+def test_parallel_doc_id_filter_keeps_only_requested_unresolved_items():
+    from scripts import ocr_parallel
+
+    pending = [
+        ("a", 2025, "/tmp/a.pdf"),
+        ("b", 2025, "/tmp/b.pdf"),
+        ("c", 2026, "/tmp/c.pdf"),
+    ]
+
+    assert ocr_parallel._filter_requested_doc_ids(pending, None) == pending
+    assert ocr_parallel._filter_requested_doc_ids(pending, ["c", "a"]) == [
+        pending[0],
+        pending[2],
+    ]
+
+
 def test_parallel_writer_acknowledges_failure(monkeypatch):
     from scripts import ocr_parallel
 

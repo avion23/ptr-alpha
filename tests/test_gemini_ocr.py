@@ -1034,6 +1034,35 @@ def test_parallel_request_limiter_paces_model_call_starts(monkeypatch):
     assert ocr_parallel._NEXT_REQUEST_AT == 106.0
 
 
+def test_parallel_process_uses_configured_model_timeout(monkeypatch):
+    from scripts import ocr_parallel
+
+    captured = {}
+
+    def fake_call_gemini(*args, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return None, "boom", None
+
+    monkeypatch.setattr(ocr_parallel, "MODEL_TIMEOUT_SECONDS", 240)
+    monkeypatch.setattr(ocr_parallel, "call_gemini", fake_call_gemini)
+    monkeypatch.setattr(ocr_parallel, "_record_failure", lambda *args, **kwargs: None)
+
+    result = ocr_parallel.process_one(
+        (
+            "doc",
+            2025,
+            "/tmp/doc.pdf",
+            "generation",
+            "artifact-sha",
+            datetime(2025, 1, 20),
+            "Jane Doe",
+        )
+    )
+
+    assert captured["timeout"] == 240
+    assert result[:4] == ("doc", 2025, "error", 0)
+
+
 def test_parallel_doc_id_filter_keeps_only_requested_unresolved_items():
     from scripts import ocr_parallel
 

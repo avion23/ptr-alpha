@@ -33,6 +33,7 @@ DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress.json"
 MAX_WORKERS = 15
 REQUEST_INTERVAL_SECONDS = 0.0
+MODEL_TIMEOUT_SECONDS = 120
 _REQUEST_SLOT_LOCK = threading.Lock()
 _NEXT_REQUEST_AT = 0.0
 
@@ -175,7 +176,7 @@ def process_one(
         doc_id=doc_id,
         refresh=refresh,
         cache_dir=cache_dir or str(Path(DB_PATH).parent / "gemini_cache"),
-        timeout=120,
+        timeout=MODEL_TIMEOUT_SECONDS,
         parser_version=parser_version,
         model=model,
     )
@@ -352,7 +353,7 @@ def _bind_work_items(pending):
 
 
 def main():
-    global DB_PATH, PROGRESS_PATH, MAX_WORKERS, REQUEST_INTERVAL_SECONDS
+    global DB_PATH, PROGRESS_PATH, MAX_WORKERS, REQUEST_INTERVAL_SECONDS, MODEL_TIMEOUT_SECONDS
 
     parser = argparse.ArgumentParser(
         description="Parallel Gemini OCR for unresolved PDFs"
@@ -380,6 +381,12 @@ def main():
         default=0.0,
         help="minimum seconds between model-call starts across all workers",
     )
+    parser.add_argument(
+        "--model-timeout",
+        type=int,
+        default=MODEL_TIMEOUT_SECONDS,
+        help="seconds allowed for each llm model call",
+    )
     parser.add_argument("--max-docs", type=int, default=None)
     parser.add_argument("--model", default=GEMINI_35_MODEL)
     parser.add_argument("--parser-version", default=GEMINI_35_PARSER_VERSION)
@@ -388,6 +395,7 @@ def main():
     DB_PATH = str(args.db)
     MAX_WORKERS = max(1, int(args.workers))
     REQUEST_INTERVAL_SECONDS = max(0.0, float(args.request_interval))
+    MODEL_TIMEOUT_SECONDS = max(1, int(args.model_timeout))
     data_dir = Path(args.data_dir)
     cache_dir = Path(args.cache_dir) if args.cache_dir else data_dir / "gemini_cache"
     PROGRESS_PATH = str(

@@ -224,6 +224,38 @@ def test_cache_identity_includes_explicit_model_and_parser(monkeypatch, tmp_path
     assert envelope["parser_version"] == gemini_ocr_common.GEMINI_35_PARSER_VERSION
 
 
+def test_gemini_call_forwards_thinking_and_output_budget(monkeypatch, tmp_path):
+    pdf = tmp_path / "sample.pdf"
+    pdf.write_bytes(b"%PDF-canary")
+    calls = []
+
+    def fake_run(args, capture_output, text, timeout):
+        calls.append(args)
+
+        class Result:
+            returncode = 0
+            stdout = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(gemini_ocr_common.subprocess, "run", fake_run)
+    output, error, _ = gemini_ocr_common.call_gemini(
+        str(pdf),
+        model="gemini/gemini-3-flash-preview",
+        parser_version="v-test-minimal-thinking",
+        cache_dir=str(tmp_path),
+        thinking_level="minimal",
+        max_output_tokens=65536,
+    )
+
+    assert output is not None
+    assert error == ""
+    command = calls[0]
+    assert command[command.index("thinking_level") + 1] == "minimal"
+    assert command[command.index("max_output_tokens") + 1] == "65536"
+
+
 def test_non_gemini_model_omits_temperature_option(monkeypatch, tmp_path):
     pdf = tmp_path / "sample.pdf"
     pdf.write_bytes(b"%PDF-canary")
@@ -1041,9 +1073,13 @@ def test_parallel_process_uses_configured_model_timeout(monkeypatch):
 
     def fake_call_gemini(*args, **kwargs):
         captured["timeout"] = kwargs["timeout"]
+        captured["thinking_level"] = kwargs["thinking_level"]
+        captured["max_output_tokens"] = kwargs["max_output_tokens"]
         return None, "boom", None
 
     monkeypatch.setattr(ocr_parallel, "MODEL_TIMEOUT_SECONDS", 240)
+    monkeypatch.setattr(ocr_parallel, "MODEL_THINKING_LEVEL", "minimal")
+    monkeypatch.setattr(ocr_parallel, "MODEL_MAX_OUTPUT_TOKENS", 65536)
     monkeypatch.setattr(ocr_parallel, "call_gemini", fake_call_gemini)
     monkeypatch.setattr(ocr_parallel, "_record_failure", lambda *args, **kwargs: None)
 
@@ -1059,7 +1095,11 @@ def test_parallel_process_uses_configured_model_timeout(monkeypatch):
         )
     )
 
-    assert captured["timeout"] == 240
+    assert captured == {
+        "timeout": 240,
+        "thinking_level": "minimal",
+        "max_output_tokens": 65536,
+    }
     assert result[:4] == ("doc", 2025, "error", 0)
 
 

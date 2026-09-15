@@ -494,6 +494,8 @@ def call_gemini(
     timeout: int = 180,
     parser_version: str = GEMINI_PARSER_VERSION,
     model: str = MODEL,
+    thinking_level: str | None = None,
+    max_output_tokens: int | None = None,
 ) -> tuple[str | None, str, ArtifactMetadata | None]:
     """Call Gemini against the same immutable bytes used for hash/cache checks."""
     try:
@@ -513,6 +515,12 @@ def call_gemini(
             command = ["llm", "-m", model, "-a", str(snapshot.path)]
             if model.startswith("gemini/"):
                 command.extend(["-o", "temperature", "0"])
+                if thinking_level:
+                    command.extend(["-o", "thinking_level", thinking_level])
+                if max_output_tokens is not None:
+                    command.extend(
+                        ["-o", "max_output_tokens", str(int(max_output_tokens))]
+                    )
             command.append(PROMPT)
             result = subprocess.run(
                 command,

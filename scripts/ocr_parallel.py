@@ -34,6 +34,8 @@ PROGRESS_PATH = "data/ocr_progress.json"
 MAX_WORKERS = 15
 REQUEST_INTERVAL_SECONDS = 0.0
 MODEL_TIMEOUT_SECONDS = 120
+MODEL_THINKING_LEVEL: str | None = None
+MODEL_MAX_OUTPUT_TOKENS: int | None = None
 _REQUEST_SLOT_LOCK = threading.Lock()
 _NEXT_REQUEST_AT = 0.0
 
@@ -179,6 +181,8 @@ def process_one(
         timeout=MODEL_TIMEOUT_SECONDS,
         parser_version=parser_version,
         model=model,
+        thinking_level=MODEL_THINKING_LEVEL,
+        max_output_tokens=MODEL_MAX_OUTPUT_TOKENS,
     )
     if (
         artifact_metadata is not None
@@ -353,7 +357,8 @@ def _bind_work_items(pending):
 
 
 def main():
-    global DB_PATH, PROGRESS_PATH, MAX_WORKERS, REQUEST_INTERVAL_SECONDS, MODEL_TIMEOUT_SECONDS
+    global DB_PATH, PROGRESS_PATH, MAX_WORKERS, REQUEST_INTERVAL_SECONDS
+    global MODEL_TIMEOUT_SECONDS, MODEL_THINKING_LEVEL, MODEL_MAX_OUTPUT_TOKENS
 
     parser = argparse.ArgumentParser(
         description="Parallel Gemini OCR for unresolved PDFs"
@@ -387,6 +392,18 @@ def main():
         default=MODEL_TIMEOUT_SECONDS,
         help="seconds allowed for each llm model call",
     )
+    parser.add_argument(
+        "--thinking-level",
+        choices=("minimal", "low", "medium", "high"),
+        default=None,
+        help="Gemini thinking level; use minimal for large extraction-only PDFs",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="Gemini maximum candidate output tokens",
+    )
     parser.add_argument("--max-docs", type=int, default=None)
     parser.add_argument("--model", default=GEMINI_35_MODEL)
     parser.add_argument("--parser-version", default=GEMINI_35_PARSER_VERSION)
@@ -396,6 +413,12 @@ def main():
     MAX_WORKERS = max(1, int(args.workers))
     REQUEST_INTERVAL_SECONDS = max(0.0, float(args.request_interval))
     MODEL_TIMEOUT_SECONDS = max(1, int(args.model_timeout))
+    MODEL_THINKING_LEVEL = args.thinking_level
+    MODEL_MAX_OUTPUT_TOKENS = (
+        max(1, int(args.max_output_tokens))
+        if args.max_output_tokens is not None
+        else None
+    )
     data_dir = Path(args.data_dir)
     cache_dir = Path(args.cache_dir) if args.cache_dir else data_dir / "gemini_cache"
     PROGRESS_PATH = str(

@@ -12,6 +12,8 @@ def _normalize_price_index(
 ) -> pd.DataFrame:
     try:
         index = pd.DatetimeIndex(pd.to_datetime(prices.index))
+        if index.hasnans:
+            raise ValueError("Price index must contain valid dates")
     except (TypeError, ValueError) as exc:
         if invalid_error is None:
             raise

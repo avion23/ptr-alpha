@@ -9,10 +9,7 @@ PortfolioSimulator. These canaries pin the frozen harness contract:
 * exact next-session execution: end-of-day signals never execute same-day;
 * no overlap compounding: a held/pending ticker is never re-entered;
 * valuation gaps abstain from risk metrics (no fictional zero mark);
-* the benchmark is the real SPY column from the same price frame;
-* null canaries: ticker/date block permutations destroy the temporal
-  association and fail closed, while member-label shuffles are invariant
-  for consensus.
+* the benchmark is the real SPY column from the same price frame.
 """
 
 from __future__ import annotations
@@ -27,14 +24,74 @@ import pytest
 from analyzer import analysis
 from analyzer.database import Database
 from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
-from analyzer.validation import sweep_configs, select_config
-
-from tests.test_validation_harness import build_fixture_db, GRID
 
 MEMBERS = ["ALICE", "BOB", "CAROL"]
 TICKERS = ["AAA", "BBB", "CCC"]
 PORT_START = date(2023, 7, 1)
 PORT_END = date(2024, 11, 1)
+
+GRID = {
+    "horizon": [60],
+    "frequency_days": [30],
+    "top_n": [5],
+}
+
+
+def build_fixture_db(
+    tmp_path: Path,
+    *,
+    drift: float = 0.001,
+    spy_drift: float = 0.0,
+    tickers: tuple[str, ...] = ("AAA", "BBB", "CCC"),
+    tx_start: date = date(2021, 11, 1),
+    tx_end: date = date(2024, 10, 20),
+    price_end: str = "2025-01-20",
+) -> Path:
+    """Build a temp DuckDB whose consensus strategy trades on schedule.
+
+    Every member buys every ticker on a staggered cadence, so on each
+    scheduled rebalance at least two members have a recent disclosure for
+    each ticker. Tickers rise monotonically while SPY is flat.
+    """
+    db_path = tmp_path / "fixture.duckdb"
+    db = Database(db_path)
+    dates = pd.bdate_range("2021-10-01", price_end)
+    n = len(dates)
+    prices = {"SPY": 100.0 * np.cumprod(1 + spy_drift * np.ones(n))}
+    for ticker in tickers:
+        prices[ticker] = 100.0 * np.cumprod(1 + drift * np.ones(n))
+    db.upsert_prices(pd.DataFrame(prices, index=dates))
+
+    rows = []
+    doc = 0
+    day = tx_start
+    while day <= tx_end:
+        for i, member in enumerate(MEMBERS):
+            buy_date = day + timedelta(days=7 * i)
+            if buy_date > tx_end:
+                continue
+            for ticker in tickers:
+                rows.append(
+                    {
+                        "doc_id": f"doc-{doc:06d}",
+                        "member": member,
+                        "ticker": ticker,
+                        "transaction_date": buy_date,
+                        "disclosure_date": buy_date,
+                        "transaction_type": "Purchase",
+                        "owner_code": "DC",
+                        "amount_midpoint": 50000.0,
+                        "instrument_type": "stock",
+                        "asset_description": "[ST] Common Stock",
+                        "ticker_origin": "official",
+                        "amount_raw": "$50,001 - $100,000",
+                    }
+                )
+                doc += 1
+        day += timedelta(days=21)
+    db.upsert_transactions(pd.DataFrame(rows), source="senate_efd")
+    db.close()
+    return db_path
 
 
 def _portfolio_config(**overrides) -> PortfolioConfig:
@@ -291,144 +348,3 @@ class TestValuationGapAndBenchmark:
             exit_price * (1 - 0.001) / (entry_price * (1 + 0.001)) - 1
         ) * 100
         assert metrics["spy_return_pct"] == pytest.approx(round(expected, 2), abs=1e-9)
-
-
-def _block_permute_prices(
-    prices: pd.DataFrame, *, ticker_blocks: bool, seed: int, block_days: int = 30
-) -> pd.DataFrame:
-    """Permute price cells in (ticker x date) blocks to destroy the signal.
-
-    With ``ticker_blocks=False`` each ticker's own path is permuted in time
-    blocks (date-block null). With ``ticker_blocks=True`` the assignment of
-    price paths to ticker identities is permuted across time blocks as well
-    (ticker x date block null). The calendar stays continuous; SPY is never
-    permuted.
-    """
-    rng = np.random.default_rng(seed)
-    dates = prices.index
-    tickers = [c for c in prices.columns if c != "SPY"]
-    blocks = [dates[i : i + block_days] for i in range(0, len(dates), block_days)]
-    arrays = {col: prices[col].to_numpy() for col in tickers}
-    out = prices.copy()
-    if ticker_blocks:
-        # Joint permutation of (date-block, ticker) cells: the association of
-        # price paths to ticker identities is broken in time blocks.
-        cells = [(bi, col) for bi in range(len(blocks)) for col in tickers]
-        perm = rng.permutation(len(cells))
-        for k, (bi, col) in enumerate(cells):
-            src_bi, src_col = cells[perm[k]]
-            vals = arrays[src_col][src_bi * block_days : (src_bi + 1) * block_days]
-            out.loc[blocks[bi], col] = np.resize(vals, len(blocks[bi]))
-    else:
-        # Date-block null: each ticker's own path is permuted in time blocks.
-        for col in tickers:
-            values = arrays[col]
-            block_values = [
-                values[i * block_days : (i + 1) * block_days]
-                for i in range(len(blocks))
-            ]
-            source_order = rng.permutation(len(blocks))
-            for target_bi, source_bi in enumerate(source_order):
-                out.loc[blocks[target_bi], col] = np.resize(
-                    block_values[source_bi], len(blocks[target_bi])
-                )
-    return out
-
-
-class TestNullCanaries:
-    def test_date_block_permutation_null_fails_closed_despite_positive_mean(
-        self, tmp_path
-    ):
-        db_path = build_fixture_db(tmp_path)
-        db = Database(db_path, read_only=True)
-        try:
-            prices = db.get_prices(
-                ["SPY", *TICKERS],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
-            )
-            all_tx = db.get_transactions_by_date_range(
-                pd.Timestamp("2021-10-07"), pd.Timestamp("2023-05-01")
-            )
-        finally:
-            db.conn.close()
-
-        base = sweep_configs(all_tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
-        base_series = base.attrs["series_by_trial"][0]
-        selection = select_config(base, 0.05, n_permutations=999, permutation_seed=0)
-        assert selection["n_statistical_survivors"] == 1
-
-        null_prices = _block_permute_prices(prices, ticker_blocks=False, seed=42)
-        null = sweep_configs(
-            all_tx, null_prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
-        )
-        null_series = null.attrs["series_by_trial"][0]
-        assert not base_series.equals(null_series)
-        # The block null preserves the mean but destroys the temporal
-        # dependence; the dependence-aware gate must refuse it.
-        assert null.iloc[0]["overall_alpha"] > 0
-        selection_null = select_config(
-            null, 0.05, n_permutations=999, permutation_seed=0
-        )
-        assert selection_null["n_statistical_survivors"] == 0
-        assert selection_null["failure_reason"] == "no_dependence_safe_survivor"
-
-    def test_ticker_date_block_permutation_null_fails_closed(self, tmp_path):
-        db_path = build_fixture_db(tmp_path)
-        db = Database(db_path, read_only=True)
-        try:
-            prices = db.get_prices(
-                ["SPY", *TICKERS],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
-            )
-            all_tx = db.get_transactions_by_date_range(
-                pd.Timestamp("2021-10-07"), pd.Timestamp("2023-05-01")
-            )
-        finally:
-            db.conn.close()
-
-        base = sweep_configs(all_tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
-        base_series = base.attrs["series_by_trial"][0]
-
-        null_prices = _block_permute_prices(prices, ticker_blocks=True, seed=11)
-        null = sweep_configs(
-            all_tx, null_prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
-        )
-        null_series = null.attrs["series_by_trial"][0]
-        assert not base_series.equals(null_series)
-        selection_null = select_config(
-            null, 0.05, n_permutations=999, permutation_seed=0
-        )
-        assert selection_null["n_statistical_survivors"] == 0
-        assert selection_null["failure_reason"] == "no_dependence_safe_survivor"
-
-    def test_member_label_shuffle_is_invariant_for_consensus(self, tmp_path):
-        """Consensus has no member-identity hypothesis: shuffling member
-        labels leaves the per-date net-alpha series exactly unchanged."""
-        db_path = build_fixture_db(tmp_path)
-        db = Database(db_path, read_only=True)
-        try:
-            prices = db.get_prices(
-                ["SPY", *TICKERS],
-                pd.Timestamp("2021-10-07"),
-                pd.Timestamp("2023-06-30"),
-            )
-            all_tx = db.get_transactions_by_date_range(
-                pd.Timestamp("2021-10-07"), pd.Timestamp("2023-05-01")
-            )
-        finally:
-            db.conn.close()
-
-        base = sweep_configs(all_tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1))
-        base_series = base.attrs["series_by_trial"][0]
-        for shuffle in (
-            {"ALICE": "BOB", "BOB": "CAROL", "CAROL": "ALICE"},
-            {"ALICE": "CAROL", "BOB": "ALICE", "CAROL": "BOB"},
-        ):
-            tx = all_tx.copy()
-            tx["member"] = tx["member"].map(shuffle)
-            permuted = sweep_configs(
-                tx, prices, GRID, date(2022, 1, 1), date(2023, 5, 1)
-            )
-            assert permuted.attrs["series_by_trial"][0].equals(base_series)

@@ -53,7 +53,7 @@ CLI
  |     -> executable historical labels
  |     -> descriptive reports
  |
- +-- backtest / portfolio / validate
+ +-- backtest / portfolio
        -> canonical transactions, read-only
        -> same consensus candidate rule
        -> exact NYSE execution endpoints
@@ -73,7 +73,6 @@ The main code boundaries are:
 | Historical label construction | `src/analyzer/signals/`, `src/analyzer/backtest/evaluate.py` |
 | Descriptive member ranking | `src/analyzer/member_ranking/ranking.py` |
 | Portfolio execution | `src/analyzer/portfolio/`, `src/analyzer/portfolio_sim.py` |
-| Statistical validation | `src/analyzer/validation.py`, `src/analyzer/snooping.py` |
 | CLI | `src/analyzer/cli.py` |
 
 There is no second production optimization engine, member-scoring engine, adaptive OU holding-period engine, forecast-model framework, or exact-machine certification gate.
@@ -189,29 +188,7 @@ Portfolio assumptions such as initial capital, maximum positions, rebalance cade
 
 Open positions and unresolved exits remain explicit in portfolio accounting rather than being silently marked with an invented terminal value.
 
-## 9. Validation
-
-`src/analyzer/validation.py` computes statistical evidence for the production strategy.
-
-Validation evaluates the fixed production consensus rule and reports all statistically supported sensitivity results. The 28-calendar-day disclosure window and three-buyer minimum are fixed production inputs, not validation parameters. Declared evaluation sensitivities may include horizon, top-N, and scheduled rebalance cadence.
-
-The validation path preserves these rules:
-
-- public-time recommendation replay;
-- next-session entry and exact fixed-horizon exit semantics;
-- purge/embargo between training and evaluation support;
-- one scheduled per-date strategy series with explicit cash dates;
-- identical benchmark support;
-- Newey-West/HAC statistics where declared;
-- moving-block bootstrap with support-aware dependence handling;
-- family-wise correction across the declared strategy family;
-- fail-closed minimum resampling/sample-support requirements;
-- executed scorer provenance and fixed-policy checks;
-- explicit reporting of the evaluated sensitivity family and statistical support.
-
-Hashes and manifests identify evidence only. They do not authorize production changes or establish correctness.
-
-## 10. Parsing and ingestion
+## 9. Parsing and ingestion
 
 House parsing starts with cheap deterministic text/table extraction and escalates only when additional evidence is needed.
 
@@ -223,7 +200,7 @@ Official row identity, raw fields, instrument evidence, ticker provenance, amend
 
 See `docs/house-data-parsing.md` for the current House parser flow and `docs/house-ingestion-error-catalog.md` for known ingestion risks.
 
-## 11. Failure and logging semantics
+## 10. Failure and logging semantics
 
 Operational code should prefer one bounded summary over one warning/error per row or ticker. Detailed provenance belongs at debug level unless an operator can act on it.
 
@@ -237,7 +214,7 @@ Important user-visible states are distinct:
 
 Broad exception handling must not silently change implementations or convert partial output into success when completeness is required.
 
-## 12. Interface scope
+## 11. Interface scope
 
 The current product has no graphical frontend. User-facing surfaces are Typer CLI output and generated text/CSV/JSON artifacts.
 
@@ -252,13 +229,13 @@ CLI/report style should stay compact and utilitarian:
 
 Impeccable is installed and initialized for durable product context, but graphical audit/polish workflows are not applicable until a real graphical surface exists. Do not create a frontend merely to satisfy design tooling.
 
-## 13. Data freshness limitation
+## 12. Data freshness limitation
 
 A correct scorer can still be operating on stale local data. Live candidate output is current only to the latest successfully ingested official House and Senate disclosures in the local canonical database.
 
 Live analysis warns when a chamber has no disclosure inside the candidate window. A no-signal result should not be interpreted as current if source freshness is stale or missing.
 
-## 14. Non-authorities
+## 13. Non-authorities
 
 The following are intentionally not current product authorities:
 

@@ -62,7 +62,7 @@ The product name is PTR Alpha. User-facing copy and engineering interfaces shoul
 - Official-source House and Senate ingestion code and provenance in `src/analyzer/`.
 - Canonical DuckDB schema and repository code.
 - Current production scorer in `src/analyzer/member_ranking/buyer_scoring.py`.
-- Replay and validation in `src/analyzer/backtest/` and `src/analyzer/validation.py`.
+- Replay in `src/analyzer/backtest/`.
 - Parser behavior documented in `docs/house-data-parsing.md`.
 - Historical audit evidence under `docs/HOUSE_PARSER_AUDIT.md` and `docs/reviews/`; those are evidence, not current authority.
 - Automated regression and integration tests under `tests/`.

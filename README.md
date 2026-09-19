@@ -33,10 +33,9 @@ The system must never backdate knowledge to the private transaction date.
 | `src/analyzer/signals/` | Historical forward-return label construction and signal reports |
 | `src/analyzer/backtest/` | Point-in-time recommendation replay and fixed-horizon evaluation |
 | `src/analyzer/portfolio/`, `portfolio_sim.py` | Shared-cash equal-slot portfolio simulation and Kelly research helpers |
-| `src/analyzer/validation.py`, `snooping.py` | Purged retrospective validation and multiple-testing controls |
 | `src/analyzer/capitol_trades.py` | Capitol Trades reconciliation input; not an official canonical source |
 | `scripts/` | Audits, reparsing, OCR, staging, reconciliation, refresh, and operational tools |
-| `tests/` | Unit, integration, statistical-invariant, parser, database, replay, and CLI checks |
+| `tests/` | Unit, integration, parser, database, replay, and CLI checks |
 | `docs/` | Current architecture/parsing docs plus explicitly historical audit/review evidence |
 
 ## Data model
@@ -193,7 +192,6 @@ Common commands:
 | `ptr-alpha backtest --start 2024-01-01 --end 2025-12-31` | Fixed-horizon public-time replay |
 | `ptr-alpha portfolio --start 2024-01-01 --end 2025-12-31` | Shared-cash equal-slot portfolio simulation; optional slippage is declared in basis points |
 | `ptr-alpha snapshot` | Explicitly write a reproducible price snapshot |
-| `ptr-alpha validate ...` | Purged retrospective research validation |
 
 `analyze`, `backtest`, `portfolio`, and `snapshot` open the canonical database read-only. Fetch/parse/refresh are the mutating paths.
 
@@ -201,7 +199,7 @@ Common commands:
 
 A positive live score means only that multiple distinct members disclosed recent purchases of the same equity. It is not statistical proof of abnormal future return.
 
-The repository's retrospective validation machinery evaluates the fixed production consensus rule: a 28-calendar-day disclosure window, at least three canonical buyers, and a score equal to the distinct-buyer count. It reports all statistically supported results across declared sensitivity families such as horizon, top-N, and rebalance cadence. It uses scheduled no-trade support, exact holding-period purging, SPY-relative net outcomes, and family-wise controls. Descriptive member ranking is separate from recommendation generation. Validation is evidence only; it does not select or authorize a production change. Older parallel optimization and member-scoring engines were removed rather than maintained as alternate implementations.
+Descriptive member ranking is separate from recommendation generation. Older parallel optimization, member-scoring, and retrospective statistical-validation engines were removed rather than maintained as alternate implementations.
 
 ## Documentation
 

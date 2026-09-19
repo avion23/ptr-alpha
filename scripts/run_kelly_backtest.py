@@ -24,9 +24,22 @@ from analyzer.portfolio import (
     compute_portfolio_metrics,
     simulate_portfolio_returns,
 )
-from analyzer.price_repository import next_nyse_session
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.settings import Settings
-from analyzer.validation import _phase_end
+
+
+def _phase_end(boundary_end: date, max_holding_days: int) -> date:
+    """Return the latest as-of whose exact execution window matures by boundary."""
+    boundary = pd.Timestamp(boundary_end).normalize()
+    candidate = boundary
+    while True:
+        entry = next_nyse_session(candidate)
+        exit_date = previous_nyse_session(
+            entry + pd.Timedelta(days=max_holding_days)
+        )
+        if exit_date <= boundary:
+            return candidate.date()
+        candidate -= pd.Timedelta(days=1)
 
 
 def main() -> int:

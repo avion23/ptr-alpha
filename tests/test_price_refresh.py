@@ -30,6 +30,15 @@ def _nyse_dates(start: str, end: str):
     return nyse_sessions(date.fromisoformat(start), date.fromisoformat(end))
 
 
+def _value_snapshot_hash(*frames: pd.DataFrame) -> str:
+    """Hash frame columns, index labels, and cell values for run comparison."""
+    digest = hashlib.sha256()
+    for frame in frames:
+        digest.update(str(list(frame.columns)).encode())
+        digest.update(frame.to_csv().encode())
+    return digest.hexdigest()
+
+
 def _fake_download(frame: pd.DataFrame):
     """Return a _download_yfinance stand-in yielding the canned Close frame."""
 
@@ -567,8 +576,6 @@ class DeterminismCanaryTests(unittest.TestCase):
         self.db.upsert_prices(prices)
 
     def _value_snapshot(self):
-        from analyzer.validation import _value_snapshot_hash
-
         db = Database(self.db_path, read_only=True)
         try:
             all_tx = db.get_transactions_by_date_range(date(2024, 1, 1), date(2024, 1, 31))

@@ -104,6 +104,8 @@ def _normalize_series(value: pd.Series, trial_id: int) -> pd.Series:
         raise ValueError(f"trial {trial_id} has no finite observations")
     if not series.index.is_unique:
         raise ValueError(f"trial {trial_id} calendar index must be unique")
+    if series.index.hasnans:
+        raise ValueError(f"trial {trial_id} calendar index must not contain missing labels")
     if not np.isfinite(series.to_numpy(dtype=float)).all():
         raise ValueError(f"trial {trial_id} contains non-finite observations")
     return series

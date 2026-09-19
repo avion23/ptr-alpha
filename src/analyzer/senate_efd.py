@@ -177,8 +177,12 @@ _PERSISTED_COLUMN_DERIVATIONS = {
 _DERIVATION_COLUMNS = [
     column for columns in _PERSISTED_COLUMN_DERIVATIONS.values() for column in columns
 ]
-assert len(_DERIVATION_COLUMNS) == len(set(_DERIVATION_COLUMNS))
-assert set(_DERIVATION_COLUMNS) == set(_NORMALIZED_TRANSACTION_COLUMNS)
+if len(_DERIVATION_COLUMNS) != len(set(_DERIVATION_COLUMNS)):
+    raise RuntimeError("Senate persisted column derivations must be unique")
+if set(_DERIVATION_COLUMNS) != set(_NORMALIZED_TRANSACTION_COLUMNS):
+    raise RuntimeError(
+        "Senate persisted column derivations must cover the normalized schema"
+    )
 
 _PAPER_ARTIFACT_RE = re.compile(
     r"(?:/search/view/(?:paper|paper-filing)/|\.pdf(?:$|[?#]))", re.I

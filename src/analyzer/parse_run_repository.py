@@ -4,6 +4,8 @@ import duckdb
 
 
 _TERMINAL_STATUSES = ("success", "no_txs")
+# SQL fragments below contain only code-defined constants and placeholders;
+# caller-supplied identity and cache values are always bound parameters.
 _TERMINAL_STATUS_PREDICATE = (
     "status IN (" + ", ".join(f"'{status}'" for status in _TERMINAL_STATUSES) + ")"
 )
@@ -59,7 +61,7 @@ class ParseRunRepository:
                     WHERE {_IDENTITY_PREDICATE}
                       AND {_TERMINAL_STATUS_PREDICATE}
                     LIMIT 1
-                    """,
+                    """,  # nosec B608
                     identity_params,
                 ).fetchone()
                 if terminal:
@@ -79,7 +81,7 @@ class ParseRunRepository:
                             ) > 1
                         ) AS duplicates
                         WHERE pdf_parse_runs.rowid = duplicates.rowid
-                        """,
+                        """,  # nosec B608
                         identity_params,
                     )
                     if not _in_transaction:
@@ -92,7 +94,7 @@ class ParseRunRepository:
                 f"""
                 DELETE FROM pdf_parse_runs
                 WHERE {_IDENTITY_PREDICATE}
-                """,
+                """,  # nosec B608
                 identity_params,
             )
             self.conn.execute(
@@ -138,7 +140,7 @@ class ParseRunRepository:
             WHERE year = ? AND parser_version = ?
               AND ingestion_generation = ?
               AND {_TERMINAL_STATUS_PREDICATE}
-            """,
+            """,  # nosec B608
             [year, parser_version, ingestion_generation],
         ).fetchall()
         return {

@@ -212,7 +212,7 @@ class TransactionRepository:
         if not sources:
             raise ValueError("sources must not be empty")
         placeholders = ", ".join("?" for _ in sources)
-        return f" AND source IN ({placeholders})", list(sources)  # nosec B608
+        return f" AND source IN ({placeholders})", list(sources)
 
     def get_by_year(
         self,
@@ -225,6 +225,7 @@ class TransactionRepository:
             source=source, sources=sources
         )
         params: list[object] = [year, *source_params]
+        # Only the internal source filter is interpolated; values remain bound.
         result = self.conn.execute(
             f"""
             SELECT *
@@ -233,7 +234,7 @@ class TransactionRepository:
             WHERE EXTRACT(YEAR FROM disclosure_date) = ?
               {source_clause}
             ORDER BY disclosure_date DESC, id DESC
-            """,  # nosec B608 -- source_clause is a fixed internal fragment
+            """,  # nosec B608
             params,
         ).fetchdf()
         return _normalize_frame(result, deduplicate=True)
@@ -256,6 +257,7 @@ class TransactionRepository:
         )
         params: list[object] = [start_date, end_date, *source_params]
 
+        # Only the internal source filter is interpolated; values remain bound.
         result = self.conn.execute(
             f"""
             SELECT *
@@ -264,7 +266,7 @@ class TransactionRepository:
             WHERE disclosure_date BETWEEN ? AND ?
               {source_clause}
             ORDER BY disclosure_date DESC, id DESC
-            """,  # nosec B608 -- source_clause is a fixed internal fragment
+            """,  # nosec B608
             params,
         ).fetchdf()
         return _normalize_frame(result, deduplicate=True)
@@ -323,8 +325,9 @@ class TransactionRepository:
             f"CAST({column} AS {existing_column_types[column]}) AS {column}"
             for column in write_columns
         )
+        # Column names are fixed constants; types come from the database schema.
         self.conn.execute(
-            f"CREATE TEMP TABLE staging_transactions AS SELECT {staging_select} FROM df"  # nosec B608 -- identifiers/types come from the database schema
+            f"CREATE TEMP TABLE staging_transactions AS SELECT {staging_select} FROM df"  # nosec B608
         )
         inserted_count = 0
         try:
@@ -373,10 +376,11 @@ class TransactionRepository:
                     for column in _ARTIFACT_IDENTITY_COLUMNS
 
                 )
+                # All interpolated identifiers are fixed schema constants.
                 self.conn.execute(
                     f"""UPDATE transactions AS t SET {update_sql}
                         FROM filtered_staging_transactions AS s
-                        WHERE {identity_sql}"""  # nosec B608 -- identifiers are fixed schema constants
+                        WHERE {identity_sql}"""  # nosec B608
                 )
                 self.conn.execute(
                     f"""INSERT INTO transactions ({insert_columns_sql})
@@ -384,13 +388,14 @@ class TransactionRepository:
                         FROM filtered_staging_transactions s
                         WHERE NOT EXISTS (
                             SELECT 1 FROM transactions t WHERE {identity_sql}
-                        )"""  # nosec B608 -- identifiers are fixed schema constants
+                        )"""  # nosec B608
                 )
             else:
+                # All interpolated identifiers are fixed schema constants.
                 self.conn.execute(
                     f"""INSERT INTO transactions ({insert_columns_sql})
                         SELECT {insert_columns_sql}
-                        FROM filtered_staging_transactions"""  # nosec B608 -- identifiers are fixed schema constants
+                        FROM filtered_staging_transactions"""  # nosec B608
                 )
 
             count_after = self.conn.execute(
@@ -530,12 +535,13 @@ class TransactionRepository:
         source_clause, source_params = self._source_filter(
             source=source, sources=sources
         )
+        # Only the internal source filter is interpolated; values remain bound.
         row = self.conn.execute(
             f"""
 
             SELECT COUNT(*) FROM canonical_transactions
             WHERE EXTRACT(YEAR FROM disclosure_date) = ? {source_clause}
-            """,  # nosec B608 -- source_clause is a fixed internal fragment
+            """,  # nosec B608
             [year, *source_params],
         ).fetchone()
         return row[0] > 0

@@ -98,8 +98,8 @@ class PortfolioSimulator:
             raise ValueError("rebalance_freq_days must be positive")
         if self.config.max_positions < 1:
             raise ValueError("max_positions must be positive")
-        if self.config.initial_capital <= 0:
-            raise ValueError("initial_capital must be positive")
+        if not np.isfinite(self.config.initial_capital) or self.config.initial_capital <= 0:
+            raise ValueError("initial_capital must be positive and finite")
         for name, value in (
             ("entry_slippage_pct", self.config.entry_slippage_pct),
             ("exit_slippage_pct", self.config.exit_slippage_pct),

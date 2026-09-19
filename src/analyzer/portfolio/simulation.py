@@ -171,10 +171,8 @@ def simulate_portfolio_returns(
     if mark_staleness < 0:
         raise ValueError("max_mark_staleness_days must be non-negative")
     if (
-        entry_slippage_bps < 0
-        or exit_slippage_bps < 0
-        or entry_slippage_bps >= 10_000
-        or exit_slippage_bps >= 10_000
+        not 0 <= entry_slippage_bps < 10_000
+        or not 0 <= exit_slippage_bps < 10_000
     ):
         raise ValueError("slippage must be in [0, 10000) basis points")
 

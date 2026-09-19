@@ -385,6 +385,8 @@ def _read_cached_snapshot(
     path = cache_path(doc_id, cache_dir)
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(envelope, dict):
+            return None
         output = str(envelope.get("output", ""))
         expected = _cache_envelope(
             str(doc_id),

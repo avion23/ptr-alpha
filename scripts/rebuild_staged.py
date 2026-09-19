@@ -2843,8 +2843,8 @@ def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     """Ingest verified local-OCR rows for unresolved House scans.
 
     Fail-closed guards: docs the track marked unresolved are never ingested
-    (8221322 stays quarantined); rows with unparseable dates or transaction
-    dates after the filing date are dropped with exact per-doc reporting.
+    (8221322 stays quarantined); any unparseable or post-filing transaction
+    date rejects the whole document with exact per-doc reporting.
     """
     import pandas as pd  # noqa: PLC0415
 
@@ -2927,6 +2927,8 @@ def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database) -> dict:
                     ),
                 }
             )
+            # A valid subset cannot prove complete document coverage.
+            continue
         frame = frame.loc[valid_mask].copy()
         if frame.empty:
             continue

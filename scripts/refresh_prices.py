@@ -253,6 +253,8 @@ def refresh_prices(
     temp_db = Path(temp_db)
     if not source_db.exists():
         raise FileNotFoundError(f"source database not found: {source_db}")
+    if temp_db.exists() and temp_db.samefile(source_db):
+        raise ValueError("source and output databases must be different files")
     if temp_db.exists() and not force:
         raise FileExistsError(
             f"temp database already exists: {temp_db} (use --force to overwrite)"

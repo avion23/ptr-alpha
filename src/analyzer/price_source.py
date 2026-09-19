@@ -211,13 +211,14 @@ class YFinancePriceSource:
                 "yfinance response did not contain Close prices"
             ) from exc
         if isinstance(close, pd.Series):
-            column = fetch_resolved[0] if len(fetch_resolved) == 1 else str(close.name)
-            return close.to_frame(column)
+            if len(fetch_resolved) != 1:
+                raise DataSourceError("yfinance returned unlabeled multi-symbol Close prices")
+            return close.to_frame(fetch_resolved[0])
         if not isinstance(close, pd.DataFrame):
             raise DataSourceError("Unsupported yfinance Close response shape")
-        if len(fetch_resolved) == 1 and len(close.columns) == 1:
-            return close.rename(columns={str(close.columns[0]): fetch_resolved[0]})
-        return close.copy()
+        # Labeled provider symbols establish identity; never relabel an
+        # unexpected security just because only one symbol was requested.
+        return close.loc[:, close.columns.isin(fetch_resolved)].copy()
 
     @staticmethod
     def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:

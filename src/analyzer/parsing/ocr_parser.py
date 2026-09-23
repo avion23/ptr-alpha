@@ -5,6 +5,7 @@ fails. Rasterizes each page to a 200dpi image, runs tesseract on it, then
 extracts ticker / tx-type / date / amount rows from the resulting plaintext.
 """
 
+import os
 import re
 import time
 from pathlib import Path
@@ -17,6 +18,9 @@ from analyzer.models import TransactionType
 _OCR_CALL_TIMEOUT = 90
 _RASTERIZE_TIMEOUT = 120
 _OCR_DOCUMENT_BUDGET = 600
+# Cap tesseract's OpenMP threads; many parallel OCR workers each spawning one
+# thread per core thrash the scheduler (observed load 20 on 4 cores).
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 
 class OcrBackendError(RuntimeError):
@@ -33,8 +37,15 @@ class OcrIncompleteError(OcrBackendError):
 
 def _orient_image(image, pytesseract):
     """Return an upright image when Tesseract detects a rotated scan."""
+    # OSD needs only a coarse thumbnail; running it on the full 200dpi page
+    # makes it nearly as expensive as the real OCR pass.
     try:
-        osd = pytesseract.image_to_osd(image, timeout=_OCR_CALL_TIMEOUT)
+        thumbnail = image.copy()
+        thumbnail.thumbnail((600, 600))
+    except AttributeError:
+        thumbnail = image
+    try:
+        osd = pytesseract.image_to_osd(thumbnail, timeout=_OCR_CALL_TIMEOUT)
         match = re.search(r"^Rotate:\s*(90|180|270)\s*$", osd, re.MULTILINE)
         if not match:
             return image
@@ -138,9 +149,9 @@ def _tx_type_and_date(rest_clean: str, rest: str) -> tuple[str | None, str | Non
     # a line like "(AAPL) [ST] P 01/15/2024" misses the tx code and the whole
     # row is dropped.
     body = re.sub(r"^(?:\[[^\]]*\]\s*)+", "", rest_clean).lstrip()
-    if body.startswith("P ") or body.startswith("PP "):
+    if body.startswith(("P ", "PP ")):
         tx_type = TransactionType.PURCHASE.value
-    elif body.startswith("S ") or body.startswith("SS "):
+    elif body.startswith(("S ", "SS ")):
         tx_type = TransactionType.SALE.value
     elif body.startswith("E "):
         tx_type = TransactionType.EXCHANGE.value
@@ -197,9 +208,9 @@ def _reconcile_rows(*row_sets: list[list[str]]) -> list[list[str]]:
 
 def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
     try:
+        import pytesseract
         from pdf2image import convert_from_path
         from pdf2image.exceptions import PDFPopplerTimeoutError
-        import pytesseract
     except ImportError as exc:
         raise OcrBackendError(f"OCR dependencies unavailable: {exc}") from exc
 

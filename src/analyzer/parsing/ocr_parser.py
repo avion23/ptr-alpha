@@ -38,10 +38,12 @@ class OcrIncompleteError(OcrBackendError):
 def _orient_image(image, pytesseract):
     """Return an upright image when Tesseract detects a rotated scan."""
     # OSD needs only a coarse thumbnail; running it on the full 200dpi page
-    # makes it nearly as expensive as the real OCR pass.
+    # makes it nearly as expensive as the real OCR pass. 1200px is the floor
+    # where OSD still reads sparse form text (600px fails with 'Too few
+    # characters' and marks pages incomplete).
     try:
         thumbnail = image.copy()
-        thumbnail.thumbnail((600, 600))
+        thumbnail.thumbnail((1200, 1200))
     except AttributeError:
         thumbnail = image
     try:

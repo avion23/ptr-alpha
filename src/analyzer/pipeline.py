@@ -40,6 +40,7 @@ class AnalysisParams:
     top_n: int | None = None
     mode: AnalysisMode = AnalysisMode.MEMBER_RANKINGS
     include_sector_analysis: bool = False
+    as_of_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,10 +101,29 @@ def _execution_price_window(
 
 
 def prepare_analysis_data(
-    transaction_source, price_source, year: int, horizons: tuple[int, ...]
+    transaction_source,
+    price_source,
+    year: int,
+    horizons: tuple[int, ...],
+    as_of_date: date | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     trades = _analysis_transactions(transaction_source, year)
     logger.info("Loaded %d canonical official transactions for %d", len(trades), year)
+
+    if as_of_date is not None:
+        as_of = pd.Timestamp(as_of_date).normalize()
+        disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
+        transaction_dates = pd.to_datetime(trades["transaction_date"], errors="coerce")
+        # Rows with an undated disclosure cannot be proven knowable at as-of.
+        # NaT transaction dates are kept: only dated rows after as-of are cut.
+        keep = (
+            disclosure_dates.notna()
+            & (disclosure_dates <= as_of)
+            & ~(transaction_dates.notna() & (transaction_dates > as_of))
+        )
+        excluded = int((~keep).sum())
+        trades = trades[keep].copy()
+        logger.info("After as-of %s cutoff: excluded %d transactions", as_of.date(), excluded)
 
     if len(trades) == 0:
         raise DataSourceError("No trading data found")
@@ -117,6 +137,12 @@ def prepare_analysis_data(
 
     first_disclosure = pd.Timestamp(trades["disclosure_date"].min()).normalize()
     last_disclosure = pd.Timestamp(trades["disclosure_date"].max()).normalize()
+    # The price window is derived from the post-cutoff disclosures, so an
+    # as-of never widens the fetch for excluded (post-as-of) filings.
+    # Outcome labels for kept disclosures still use forward prices up to the
+    # horizon (full-hindsight descriptive outcomes). A strict "outcome mature
+    # by as-of" cutoff (drop windows with label_exit_date > as-of) is a
+    # follow-up if true as-of knowability of returns is required.
     price_start, price_end = _execution_price_window(
         first_disclosure,
         last_disclosure,
@@ -268,7 +294,11 @@ def run_analysis_pipeline(
     params: AnalysisParams, transaction_source, price_source
 ) -> DataResult:
     trades, prices, signals = prepare_analysis_data(
-        transaction_source, price_source, params.year, params.horizons
+        transaction_source,
+        price_source,
+        params.year,
+        params.horizons,
+        as_of_date=params.as_of_date,
     )
 
     table = analysis.get_analysis_table(

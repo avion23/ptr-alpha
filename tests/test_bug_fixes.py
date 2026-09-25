@@ -307,6 +307,19 @@ class TestCanonicalMemberKey(unittest.TestCase):
         key = canonical_member_key("john doe")
         self.assertEqual(key, key.upper())
 
+    def test_credential_suffixes_stripped(self):
+        from analyzer.member_names import canonical_member_key
+
+        # One person (Rep. Neal Dunn) filed under credentialed + plain variants.
+        self.assertEqual(canonical_member_key("Neal Patrick Dunn MD, FACS"), "NEAL DUNN")
+        self.assertEqual(canonical_member_key("Neal Patrick Dunn, MD, FACS"), "NEAL DUNN")
+        self.assertEqual(canonical_member_key("Neal Patrick MD, Facs Dunn"), "NEAL DUNN")
+        self.assertEqual(canonical_member_key("Neal P. Dunn"), "NEAL DUNN")
+        # Guards: leading initials used as first names and surnames that merely
+        # contain credential letters as substrings must survive.
+        self.assertEqual(canonical_member_key("JD Vance"), "JD VANCE")
+        self.assertEqual(canonical_member_key("John Moody"), "JOHN MOODY")
+
 
 # ---------------------------------------------------------------------------
 # Fix 8 – Negative lag (transaction_date > disclosure_date)

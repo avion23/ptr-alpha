@@ -34,6 +34,40 @@ _HONORIFICS = frozenset(
     }
 )
 
+# Professional credential / degree / fellowship suffixes observed in filing
+# member strings (data shows e.g. 'Neal Patrick Dunn MD, FACS'). Matched as
+# whole tokens only, so surnames merely containing these letters ('MOODY')
+# are never affected. 'DO' is deliberately excluded: it collides with a real
+# surname and has no observed credential use in the data. 'PH' covers dotted
+# 'Ph.D.' (punctuation splitting leaves a 'PH' token; 'D' is already dropped
+# as a single-letter token).
+_CREDENTIALS = frozenset(
+    {
+        "MD",
+        "FACS",
+        "FACP",
+        "FACC",
+        "DDS",
+        "DMD",
+        "PHD",
+        "PH",
+        "EDD",
+        "JD",
+        "RN",
+        "LPN",
+        "CRNA",
+        "DVM",
+        "DPM",
+        "PHARMD",
+        "MBA",
+        "MPH",
+        "MSN",
+        "MSW",
+        "CPA",
+        "ESQ",
+    }
+)
+
 
 def canonical_member_key(name: str) -> str:
     """Return a canonical lookup key for a member name.
@@ -76,6 +110,15 @@ def canonical_member_key(name: str) -> str:
 
     # Step 3: tokenize, drop honorifics and single-letter tokens (middle initials)
     tokens = [t for t in s.split() if t not in _HONORIFICS and len(t) > 1]
+
+    # Step 3b: drop credential/suffix tokens (MD, FACS, ...) after the first
+    # token. Position 0 is never stripped so leading initials used as first
+    # names (e.g. 'JD Vance') survive; matching is whole-token only. Never
+    # collapse below two tokens so a real short surname is not eaten.
+    if len(tokens) > 1:
+        stripped = [tokens[0]] + [t for t in tokens[1:] if t not in _CREDENTIALS]
+        if len(stripped) >= 2:
+            tokens = stripped
 
     if not tokens:
         return ""

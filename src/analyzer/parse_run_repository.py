@@ -4,10 +4,19 @@ import duckdb
 
 
 _TERMINAL_STATUSES = ("success", "no_txs")
+# A deterministic ``zero_rows`` result is ambiguous: it must neither resolve
+# a generation nor authorize a verified ``no_txs`` outcome.  Re-running the
+# same parser over identical bytes cannot yield new rows, though, so it is
+# safe to skip on reparse.  Resolution and upsert protection stay on
+# _TERMINAL_STATUSES; only the reparse cache admits ``zero_rows``.
+_CACHEABLE_STATUSES = ("success", "no_txs", "zero_rows")
 # SQL fragments below contain only code-defined constants and placeholders;
 # caller-supplied identity and cache values are always bound parameters.
 _TERMINAL_STATUS_PREDICATE = (
     "status IN (" + ", ".join(f"'{status}'" for status in _TERMINAL_STATUSES) + ")"
+)
+_CACHEABLE_STATUS_PREDICATE = (
+    "status IN (" + ", ".join(f"'{status}'" for status in _CACHEABLE_STATUSES) + ")"
 )
 _IDENTITY_PREDICATE = (
     "doc_id = ? AND parser_version = ? "
@@ -133,13 +142,19 @@ class ParseRunRepository:
         artifact_hashes: dict[str, str],
         ingestion_generation: str,
     ) -> set[str]:
-        """Return terminal runs only when parser and artifact bytes match."""
+        """Return skippable runs only when parser and artifact bytes match.
+
+        Deterministic ``zero_rows`` outcomes are included: the same parser
+        over identical bytes cannot yield new rows, so reparsing is pure
+        waste.  They stay resolution-non-terminal and OCR-eligible via
+        ``Database.get_unresolved_house_doc_ids``.
+        """
         rows = self.conn.execute(
             f"""
             SELECT doc_id, artifact_sha256 FROM pdf_parse_runs
             WHERE year = ? AND parser_version = ?
               AND ingestion_generation = ?
-              AND {_TERMINAL_STATUS_PREDICATE}
+              AND {_CACHEABLE_STATUS_PREDICATE}
             """,  # nosec B608
             [year, parser_version, ingestion_generation],
         ).fetchall()

@@ -297,9 +297,11 @@ def _run_ticker_mode(
         )
     if output == "csv":
         print(
-            "WARNING: CSV output is not supported for --ticker analysis; using console output.",
+            "Error: --output csv is not supported for --ticker analysis; "
+            "use --output console.",
             file=sys.stderr,
         )
+        raise typer.Exit(1)
     params = TickerAnalysisParams(
         ticker=ticker,
         year=year,
@@ -331,9 +333,11 @@ def _run_tickers_mode(
     """Handle --mode tickers."""
     if output == "csv":
         print(
-            "WARNING: CSV output is not supported for --mode tickers; using console output.",
+            "Error: --output csv is not supported for --mode tickers; "
+            "use --output console.",
             file=sys.stderr,
         )
+        raise typer.Exit(1)
     params = TickerScoringParams(
         year=year,
         days_back=days_back,
@@ -363,6 +367,7 @@ def _run_analysis_mode(
     mode: str,
     output: str,
     sectors: bool,
+    as_of_date: date | None,
 ) -> None:
     """Handle ranks/signals/member modes via run_analysis_pipeline."""
     if member is not None:
@@ -378,6 +383,7 @@ def _run_analysis_mode(
         top_n=top_n,
         mode=analysis_mode,
         include_sector_analysis=sectors,
+        as_of_date=as_of_date,
     )
     data_path = Path(app_ctx.settings.data.data_dir)
     result = run_analysis_pipeline(
@@ -410,7 +416,14 @@ def analyze(
     ),
     member: str | None = typer.Option(None, help="Filter to specific member"),
     ticker: str | None = typer.Option(None, help="Analyze specific ticker"),
-    horizons: list[int] = typer.Option([90], help="Time horizons in days"),
+    horizons: list[int] = typer.Option(
+        [90],
+        help=(
+            "Single time horizon in days: ranks/signals/member rank on this "
+            "horizon only. --mode tickers and --ticker ignore horizons and use "
+            "a fixed 28-day consensus lookback."
+        ),
+    ),
     top_n: int = typer.Option(20, help="Number of results to show"),
     as_of: str | None = typer.Option(
         None,
@@ -421,7 +434,10 @@ def analyze(
         "--sectors",
         help="Fetch optional sector metadata for rank output",
     ),
-    output: str = typer.Option("console", help="Output format: console or csv"),
+    output: str = typer.Option(
+        "console",
+        help="Output format: console or csv (csv is rejected for --mode tickers and --ticker)",
+    ),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """
@@ -437,7 +453,22 @@ def analyze(
     if not horizons or any(horizon <= 0 for horizon in horizons):
         print("Error: --horizons values must be greater than zero", file=sys.stderr)
         raise typer.Exit(1)
+    if len(horizons) > 1:
+        print(
+            "Error: --horizons accepts a single value; ranks/signals/member "
+            f"rank on one horizon only (got {len(horizons)}: {sorted(horizons)}). "
+            "Run once per horizon.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
     _validate_output(output)
+    if output == "csv" and (ticker is not None or mode == "tickers"):
+        print(
+            "Error: --output csv is not supported for --ticker/--mode tickers; "
+            "use --output console",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
     try:
         as_of_date = date.fromisoformat(as_of) if as_of else None
     except ValueError:
@@ -482,6 +513,7 @@ def analyze(
             mode,
             output,
             sectors,
+            as_of_date,
         )
 
 

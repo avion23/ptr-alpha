@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -58,7 +60,24 @@ def normal_normal_posteriors(outcomes, groups) -> pd.DataFrame:
         float(np.var(means.to_numpy(dtype=float), ddof=1)) if len(means) > 1 else 0.0
     )
     mean_sampling_var = float((within_var / counts).mean())
-    between_var = max(observed_between - mean_sampling_var, variance_floor)
+    moment_between_var = observed_between - mean_sampling_var
+    if moment_between_var <= 0:
+        # The observed spread of group means is fully explained by sampling
+        # noise, so the method-of-moments population variance truncates to the
+        # representability floor and every posterior collapses to the global
+        # mean (shrinkage identically 1). Warn so a downstream ranks table is
+        # read as alphabetical ties, not signal.
+        warnings.warn(
+            "Member between-variance is unresolved: observed spread of member "
+            f"means ({observed_between:.6g}) does not exceed mean sampling "
+            f"noise ({mean_sampling_var:.6g}), so empirical pooling collapses "
+            f"every member to the global mean ({global_mean:.6g}); shrunk "
+            f"ranks tie and fall back to alphabetical order "
+            f"(N={len(values)}, groups={len(means)}).",
+            UserWarning,
+            stacklevel=2,
+        )
+    between_var = max(moment_between_var, variance_floor)
 
     denominator = counts * between_var + within_var
     shrinkage = within_var / denominator

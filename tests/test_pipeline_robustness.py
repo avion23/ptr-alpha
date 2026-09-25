@@ -399,6 +399,81 @@ def test_cli_as_of_reaches_single_ticker_analysis_params():
     assert captured[0].as_of_date == date(2025, 6, 1)
 
 
+def test_prepare_analysis_data_as_of_cuts_off_future_rows():
+    as_of = date(2025, 6, 1)
+    trades = pd.DataFrame(
+        {
+            "member": ["Kept", "Future Disclosure", "Future Transaction"],
+            "ticker": ["AAPL", "AAPL", "MSFT"],
+            "transaction_date": pd.to_datetime(
+                ["2025-01-01", "2025-06-04", "2025-06-04"]
+            ),
+            "disclosure_date": pd.to_datetime(
+                ["2025-01-02", "2025-06-05", "2025-05-20"]
+            ),
+            "transaction_type": ["Purchase", "Purchase", "Purchase"],
+            "source": ["house_pdf", "house_pdf", "house_pdf"],
+        }
+    )
+    prices = pd.DataFrame(
+        {
+            "AAPL": [100.0, 105.0],
+            "SPY": [400.0, 404.0],
+        },
+        index=pd.to_datetime(["2025-01-03", "2025-01-06"]),
+    )
+    transaction_source = MagicMock()
+    transaction_source.db.get_transactions.return_value = trades
+    price_source = MagicMock()
+    price_source.get_prices.return_value = prices
+
+    kept, returned_prices, signals = prepare_analysis_data(
+        transaction_source,
+        price_source,
+        2025,
+        (3,),
+        as_of_date=as_of,
+    )
+
+    assert kept["member"].tolist() == ["Kept"]
+    assert signals["member"].tolist() == ["Kept"]
+    pd.testing.assert_frame_equal(returned_prices, prices)
+    # Price window derives from the kept disclosure only, not the cut rows.
+    price_source.get_prices.assert_called_once_with(
+        kept["ticker"].unique(),
+        date(2025, 1, 3),
+        date(2025, 1, 6),
+    )
+
+
+def test_cli_as_of_reaches_historical_analysis_params():
+    captured = {}
+
+    def fake_pipeline(params, transaction_source, price_source):
+        captured["params"] = params
+        return DataResult(success=True, data=None)
+
+    with (
+        patch("analyzer.cli.get_context", return_value=MagicMock()),
+        patch("analyzer.cli.run_analysis_pipeline", side_effect=fake_pipeline),
+    ):
+        result = CliRunner().invoke(
+            app,
+            [
+                "analyze",
+                "--year",
+                "2025",
+                "--mode",
+                "signals",
+                "--as-of",
+                "2025-06-01",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured["params"].as_of_date == date(2025, 6, 1)
+
+
 def test_refresh_stops_before_parse_and_backup_when_house_fetch_is_incomplete(
     tmp_path,
 ):

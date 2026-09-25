@@ -28,6 +28,11 @@ class AnalysisSettings(BaseSettings):
 
 
 class Settings(BaseSettings):
+    """Precedence: init > env (DATA__*) > config.toml > secrets.
+
+    Env must outrank toml so explicit DATA__* overrides are honored.
+    """
+
     model_config = SettingsConfigDict(
         toml_file="config.toml", env_nested_delimiter="__", extra="ignore"
     )
@@ -45,9 +50,10 @@ class Settings(BaseSettings):
         dotenv_settings,
         file_secret_settings,
     ):
+        # Standard pydantic order: env above file so DATA__* beats config.toml.
         return (
             init_settings,
-            TomlConfigSettingsSource(settings_cls),
             env_settings,
+            TomlConfigSettingsSource(settings_cls),
             file_secret_settings,
         )

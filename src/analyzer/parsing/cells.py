@@ -446,7 +446,7 @@ _COMPANY_NAME_TICKER_MAP: dict[str, str] = {
 
 def _resolve_company_name_ticker(asset_cell: str) -> str | None:
     """Match asset description against company names. Longest match wins."""
-    text = asset_cell.lower()
+    text = clean_text(asset_cell).lower()
     best_ticker = None
     best_len = 0
     for name, ticker in _COMPANY_NAME_TICKER_MAP.items():
@@ -454,10 +454,12 @@ def _resolve_company_name_ticker(asset_cell: str) -> str | None:
         # guards regex-based extraction (where single letters are noisy),
         # but a company-name match is a strong signal — blocking valid
         # tickers like "O" (Realty Income) would be a false negative.
-        # Require name boundaries: plain substring matching turns "farm" into
-        # ARM and "blocked" into Block/SQ.
-        pattern = rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])"
-        if len(name) > best_len and re.search(pattern, text):
+        # Accept issuer names and security suffixes, not names within generic assets.
+        pattern = (
+            rf"{re.escape(name)}(?:[\s.,-]*(?:incorporated|inc|corporation|corp|"
+            r"company|co|plc|ltd|common stock|ordinary shares|class [ab]|\[st\]))*[\s.,]*"
+        )
+        if len(name) > best_len and re.fullmatch(pattern, text):
             best_ticker = ticker
             best_len = len(name)
     return best_ticker
@@ -468,6 +470,17 @@ def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
         return None
     raw = tx_type_cell.strip()
     s = raw.lower()
+    directions = [
+        direction
+        for pattern, direction in (
+            (r"\b(?:p|purchase|buy)\b", TransactionType.PURCHASE.value),
+            (r"\b(?:s|sale|sell|sold)\b", TransactionType.SALE.value),
+            (r"\b(?:e|exchange)\b", TransactionType.EXCHANGE.value),
+        )
+        if re.search(pattern, s)
+    ]
+    if len(directions) > 1:
+        return None
     # Handle "(partial)" suffix: "P (partial)", "S (partial)", "Purchase (partial)", etc.
     s_stripped = re.sub(r"\s*\(partial\)\s*$", "", s).strip()
     if s_stripped in ("p", "purchase", "buy"):
@@ -575,6 +588,9 @@ def _extract_instrument_type(asset_cell: str | None) -> str:
     return "stock"
 
 
+_US_CURRENCY = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?(?![\d,.])"
+
+
 def _extract_option_details(asset_cell: str | None) -> dict:
     """Extract explicit strike and expiry terms without inventing a contract."""
     details: dict = {}
@@ -584,22 +600,22 @@ def _extract_option_details(asset_cell: str | None) -> dict:
     option_marker = re.search(r"\[op\]", asset_cell, re.IGNORECASE)
     contract_text = asset_cell[option_marker.end() :] if option_marker else asset_cell
     strike_match = re.search(
-        r"strike\s*(?:price)?(?:\s+of)?[:\s]*\$?(\d+(?:\.\d+)?)",
+        rf"strike\s*(?:price)?(?:\s+of)?[:\s]*\$?({_US_CURRENCY})",
         contract_text,
         re.IGNORECASE,
     )
     if strike_match:
-        details["strike_price"] = float(strike_match.group(1))
+        details["strike_price"] = float(strike_match.group(1).replace(",", ""))
     else:
         strike_fallback = re.search(
-            r"\$(\d+(?:\.\d+)?)\s+(?:exp|strike)", contract_text, re.IGNORECASE
+            rf"\$({_US_CURRENCY})\s+(?:exp|strike)", contract_text, re.IGNORECASE
         )
         if strike_fallback:
-            details["strike_price"] = float(strike_fallback.group(1))
+            details["strike_price"] = float(strike_fallback.group(1).replace(",", ""))
 
     exp_match = re.search(
         r"(?:exp(?:ir(?:e|ation|ing)?)?(?:\s+date)?(?:\s+of)?[:\s]+)"
-        r"(\d{1,2}/\d{1,2}/(?:\d{2}|\d{4}))",
+        r"(\d{1,2}/\d{1,2}/(?:\d{4}|\d{2}))(?!\d)",
         contract_text,
         re.IGNORECASE,
     )
@@ -617,9 +633,12 @@ def _extract_amount_midpoint(
     amount = clean_text(amount_cell)
     if not amount:
         return None, None
+    tokens = re.findall(r"\$([\d.,]+)", amount)
+    if any(not re.fullmatch(_US_CURRENCY, token) for token in tokens):
+        return amount, None
     values = [
         float(value.replace(",", ""))
-        for value in re.findall(r"\$([0-9][0-9,]*)", amount)
+        for value in tokens
     ]
     if not values:
         return amount, None

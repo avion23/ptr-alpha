@@ -32,7 +32,8 @@ def _row(**overrides) -> dict:
         "instrument_type": None,
         "strike_price": None,
         "expiry_date": None,
-        "asset_description": None,
+        "asset_description": "Sample asset",
+        "source_row_id": "pdfplumber:p1:r1",
     }
     row.update(overrides)
     return row
@@ -130,19 +131,33 @@ class TestReparsePreservesTickers(DatabaseTestCase):
             merged.at[0, "ticker"] is None or pd.isna(merged.at[0, "ticker"])
         )
 
-    def test_multiple_existing_rows_any_non_null_ticker_carried(self):
+    def test_multiple_existing_rows_without_verified_identity_stay_blank(self):
         orig = pd.DataFrame(
             [
                 # Two rows share the same identity but only one resolved a ticker.
-                _row(ticker=None, owner_code="DC"),
-                _row(ticker="HOG", owner_code="DC", disclosure_date=date(2024, 3, 16)),
+                _row(ticker=None, owner_code="DC", source_row_id=None),
+                _row(ticker="HOG", owner_code="DC", source_row_id=None, disclosure_date=date(2024, 3, 16)),
             ]
         )
         self.db.upsert_transactions(orig, source="house_pdf")
 
         fresh = pd.DataFrame([_row(ticker=None, owner_code="DC")])
         merged = preserve_existing_fields(fresh, self.db)
-        self.assertEqual(merged.at[0, "ticker"], "HOG")
+        # Agreement on a ticker is not proof that these are the same source row.
+        self.assertTrue(pd.isna(merged.at[0, "ticker"]))
+
+    def test_other_asset_or_owner_or_source_row_cannot_inherit(self):
+        self.db.upsert_transactions(pd.DataFrame([_row(ticker="SMPL")]), source="house_pdf")
+        fresh = pd.DataFrame([
+            _row(ticker=None),
+            _row(ticker=None, asset_description="Other asset"),
+            _row(ticker=None, owner_code="SP"),
+            _row(ticker=None, source_row_id="pdfplumber:p1:r2"),
+            _row(ticker=None, source_row_id=None),
+        ])
+        merged = preserve_existing_fields(fresh, self.db)
+        self.assertEqual(merged.at[0, "ticker"], "SMPL")
+        self.assertTrue(merged.loc[1:, "ticker"].isna().all())
 
     def test_ambiguous_identity_does_not_misassign_ticker(self):
         # Same (member, transaction_date, transaction_type) but two different

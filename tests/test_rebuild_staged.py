@@ -87,6 +87,13 @@ def test_text_only_pass_accepts_only_text_proven_complete_coverage(monkeypatch):
     monkeypatch.setattr(
         rebuild_staged._parser_cascade, "_try_pdftotext", lambda _path: [dict(row)]
     )
+    # Fixture paths are not real PDFs; the page-coverage gate is covered by
+    # cascade regression tests, so pin it here to test engine agreement only.
+    monkeypatch.setattr(
+        rebuild_staged._parser_cascade,
+        "_has_document_text_coverage",
+        lambda _path: True,
+    )
     _, rows, engines = rebuild_staged._parser_cascade._parse_text_only_worker(
         rebuild_staged.Path("matching.pdf")
     )

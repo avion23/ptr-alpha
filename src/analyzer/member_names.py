@@ -4,9 +4,9 @@ Congresspeople appear under multiple name variants in disclosure filings —
 e.g. 'MICHAEL T. MCCAUL', 'MICHAEL MCCAUL', and 'Michael T. McCaul' all
 refer to the same person but split skill histories when used as raw keys.
 
-`canonical_member_key` reduces any name variant to FIRSTNAME LASTNAME (upper,
-no punctuation, no honorifics, no middle name/initial) so that all variants
-of the same person map to one stable key.
+`canonical_member_key` removes credentials but retains middle names and
+initials. Adjacent initials are joined. This is a grouping key, not
+proof of person identity.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ _HONORIFICS = frozenset(
         "MRS",
         "MS",
         "HON",
+        "HONORABLE",
         "REP",
         "SEN",
         "SR",
@@ -39,8 +40,7 @@ _HONORIFICS = frozenset(
 # whole tokens only, so surnames merely containing these letters ('MOODY')
 # are never affected. 'DO' is deliberately excluded: it collides with a real
 # surname and has no observed credential use in the data. 'PH' covers dotted
-# 'Ph.D.' (punctuation splitting leaves a 'PH' token; 'D' is already dropped
-# as a single-letter token).
+# 'Ph.D.' is normalized before punctuation splitting.
 _CREDENTIALS = frozenset(
     {
         "MD",
@@ -64,6 +64,7 @@ _CREDENTIALS = frozenset(
         "MSN",
         "MSW",
         "CPA",
+        "CPC",
         "ESQ",
     }
 )
@@ -78,22 +79,19 @@ def canonical_member_key(name: str) -> str:
        collapse to 'REN ZELLWEGER' because the regex strips non-ASCII letters.
     2. Replace all non-alphanumeric characters (punctuation, dots, commas) with
        spaces so 'T.' and 'T' are both just 'T'.
-    3. Split into tokens and drop honorifics (DR, JR, III, HON, …) and
-       single-letter tokens (middle initials like 'T').
-    4. If two or more tokens remain, return FIRST + LAST (drop all middle tokens).
-       This ensures 'MICHAEL T. MCCAUL', 'MICHAEL MCCAUL', and 'Michael T. McCaul'
-       all collapse to 'MICHAEL MCCAUL'.
+    3. Drop honorifics and credentials, retaining initials.
+    4. Keep all name tokens; join consecutive initials.
 
     Examples::
 
-        canonical_member_key('MICHAEL T. MCCAUL')   # → 'MICHAEL MCCAUL'
-        canonical_member_key('Michael T. McCaul')   # → 'MICHAEL MCCAUL'
+        canonical_member_key('MICHAEL T. MCCAUL')   # → 'MICHAEL T MCCAUL'
+        canonical_member_key('Michael T. McCaul')   # → 'MICHAEL T MCCAUL'
         canonical_member_key('Michael McCaul')      # → 'MICHAEL MCCAUL'
-        canonical_member_key('Diana Lynn Harshbarger') # → 'DIANA HARSHBARGER'
+        canonical_member_key('Diana Lynn Harshbarger') # → 'DIANA LYNN HARSHBARGER'
         canonical_member_key('Diana Harshbarger')   # → 'DIANA HARSHBARGER'
         canonical_member_key('Dr. John Smith Jr.')  # → 'JOHN SMITH'
         canonical_member_key('Renée Zellweger')     # → 'RENEE ZELLWEGER'
-        canonical_member_key('José E. Serrano')     # → 'JOSE SERRANO'
+        canonical_member_key('José E. Serrano')     # → 'JOSE E SERRANO'
     """
     if not name:
         return ""
@@ -106,10 +104,12 @@ def canonical_member_key(name: str) -> str:
     )
 
     # Step 2: replace non-alphanumeric with spaces
+    folded = re.sub(r"\bPH\.D\.", "PHD", folded)
+    folded = re.sub(r"\b(?:[A-Z]\.){2,}", lambda m: m[0].replace(".", ""), folded)
     s = re.sub(r"[^A-Za-z0-9 ]", " ", folded)
 
-    # Step 3: tokenize, drop honorifics and single-letter tokens (middle initials)
-    tokens = [t for t in s.split() if t not in _HONORIFICS and len(t) > 1]
+    # Step 3: tokenize and drop honorifics, retaining middle initials.
+    tokens = [t for t in s.split() if t not in _HONORIFICS]
 
     # Step 3b: drop credential/suffix tokens (MD, FACS, ...) after the first
     # token. Position 0 is never stripped so leading initials used as first
@@ -125,8 +125,8 @@ def canonical_member_key(name: str) -> str:
     if len(tokens) == 1:
         return tokens[0]
 
-    # Step 4: keep only FIRST + LAST
-    return f"{tokens[0]} {tokens[-1]}"
+    # Preserve initials; join adjacent initials, including first names like JD.
+    return re.sub(r"\b(?:[A-Z] ){1,}[A-Z]\b", lambda m: m[0].replace(" ", ""), " ".join(tokens))
 
 
 def chamber_scoped_member_key(name: str, chamber: str) -> str:

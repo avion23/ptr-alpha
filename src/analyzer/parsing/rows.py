@@ -5,6 +5,8 @@ merging. `_process_row` extracts a single transaction dict (or None) from one
 table row using the column index map from `columns.py`.
 """
 
+import re
+
 from analyzer.parsing.cells import (
     _extract_amount_midpoint,
     _extract_date,
@@ -24,29 +26,27 @@ from analyzer.parsing.columns import (
 
 
 def _process_row(
-    row: list, indexes: dict[str, int] | None = None, next_row: list | None = None
-) -> dict | None:
+    row: list, indexes: dict[str, int | None] | None = None, next_row: list | None = None
+) -> tuple[dict | None, bool]:
     try:
         indexes = indexes or {"asset": 0, "type": 1, "date": 2}
         asset_cell = _get_cell(row, indexes.get("asset"))
+        if not clean_text(asset_cell):
+            return None, False
         tx_type_cell = _get_cell(row, indexes.get("type"))
         date_cell = _get_cell(row, indexes.get("date"))
 
         ticker = _extract_ticker(asset_cell)
         tx_type = _extract_transaction_type(tx_type_cell)
         tx_date = _extract_date(date_cell)
-        merged = False
 
-        if not tx_type and not tx_date and next_row:
-            ticker, asset_cell, tx_type_cell, date_cell, tx_type, tx_date = (
-                _try_merge_continuation(row, next_row, indexes, asset_cell)
-            )
-            merged = bool(ticker)
+        if (not tx_type or not tx_date) and next_row:
+            combined = _merge_complementary_row(row, next_row, indexes)
+            if combined is not None:
+                tx, _ = _process_row(combined, indexes)
+                return tx, bool(tx)
 
         if tx_type and tx_date:
-            # Fix 5: when a continuation was merged, amount/owner live in next_row
-            # (the original row only had partial asset text with no transaction fields).
-            amount_owner_row = next_row if merged else None
             return _build_row_dict(
                 row,
                 indexes,
@@ -54,26 +54,24 @@ def _process_row(
                 ticker,
                 tx_type,
                 tx_date,
-                amount_owner_row=amount_owner_row,
-            ), merged
+            ), False
         return None, False
     except IndexError:
         return None, False
 
 
 def _try_merge_continuation(row, next_row, indexes, asset_cell):
-    """Merge a row with the next row when the current row has no ticker/tx/date.
+    """Merge complementary fields without consuming an independent asset.
 
     Returns updated (ticker, asset_cell, tx_type_cell, date_cell, tx_type, tx_date).
     """
-    next_asset = _get_cell(next_row, indexes.get("asset"))
-    merged = f"{asset_cell or ''} {next_asset or ''}".strip()
-    ticker = _extract_ticker(merged)
-    if not ticker:
+    combined = _merge_complementary_row(row, next_row, indexes)
+    if combined is None:
         return None, asset_cell, None, None, None, None
-    asset_cell = merged
-    tx_type_cell = _get_cell(next_row, indexes.get("type"))
-    date_cell = _get_cell(next_row, indexes.get("date"))
+    asset_cell = _get_cell(combined, indexes.get("asset"))
+    ticker = _extract_ticker(asset_cell)
+    tx_type_cell = _get_cell(combined, indexes.get("type"))
+    date_cell = _get_cell(combined, indexes.get("date"))
     return (
         ticker,
         asset_cell,
@@ -84,6 +82,34 @@ def _try_merge_continuation(row, next_row, indexes, asset_cell):
     )
 
 
+def _merge_complementary_row(row, candidate, indexes):
+    asset_index = indexes.get("asset")
+    if asset_index is None:
+        return None
+    asset = clean_text(_get_cell(row, asset_index))
+    suffix = clean_text(_get_cell(candidate, asset_index))
+    if not asset or _is_filing_detail_row(suffix):
+        return None
+    # Only identifiable security suffixes may extend an asset, never another issuer.
+    if suffix and not re.fullmatch(
+        r"(?:Class\s+[AB]\s*)?(?:\([A-Za-z][A-Za-z0-9.\-]{0,5}\))?(?:\s*\[(?:ST|OP)\])?",
+        suffix, re.IGNORECASE,
+    ):
+        return None
+    combined = list(row) + [""] * max(0, len(candidate) - len(row))
+    for index, value in enumerate(candidate):
+        if index == asset_index:
+            continue
+        previous = clean_text(_get_cell(row, index))
+        current = clean_text(value)
+        if previous and current and previous != current:
+            return None
+        if current:
+            combined[index] = value
+    combined[asset_index] = f"{asset} {suffix}".strip()
+    return combined
+
+
 def _build_row_dict(
     row, indexes, asset_cell, ticker, tx_type, tx_date, *, amount_owner_row=None
 ) -> dict:
@@ -91,9 +117,11 @@ def _build_row_dict(
     # (the original row only had partial asset text). Use amount_owner_row when provided.
     source = amount_owner_row if amount_owner_row is not None else row
     amount_cell = _get_cell(source, indexes.get("amount"))
-    # Fallback: if amount column not mapped, search all cells for $ pattern
+    # An unmapped amount must occupy its own cell, outside known columns.
     if amount_cell is None and indexes.get("amount") is None:
-        amount_cell = _find_amount_in_row(source)
+        amount_cell = _find_amount_in_row(
+            [cell for index, cell in enumerate(source) if index not in indexes.values()]
+        )
     amount_raw, amount_midpoint = _extract_amount_midpoint(amount_cell)
     instrument_type = _extract_instrument_type(asset_cell)
     option_details = (
@@ -163,7 +191,7 @@ def _data_start_offset(
     return data_start
 
 
-def _extract_transactions(data_rows: list, indexes: dict[str, int]) -> list[dict]:
+def _extract_transactions(data_rows: list, indexes: dict[str, int | None]) -> list[dict]:
     results: list[dict] = []
     i = 0
     while i < len(data_rows):
@@ -177,37 +205,28 @@ def _extract_transactions(data_rows: list, indexes: dict[str, int]) -> list[dict
 
 
 def _process_with_continuations(
-    row: list, next_rows: list[list], indexes: dict[str, int]
+    row: list, next_rows: list[list], indexes: dict[str, int | None]
 ) -> tuple[dict | None, int]:
     """Process a row and up to three physical continuation rows."""
     if _is_filing_detail_row(_get_cell(row, indexes.get("asset"))):
         return None, 0
 
-    next_row = next_rows[0] if next_rows else None
-    tx, merged = _process_row(row, indexes, next_row)
-    if tx or not next_rows:
-        return tx, int(merged)
-
     combined = list(row)
-    asset_index = indexes.get("asset")
-    if asset_index is None:
-        return None, 0
-
-    for offset, candidate in enumerate(next_rows[:-1], start=1):
-        if _extract_transaction_type(
-            _get_cell(candidate, indexes.get("type"))
-        ) or _extract_date(_get_cell(candidate, indexes.get("date"))):
+    consumed = 0
+    for candidate in next_rows:
+        tx, _ = _process_row(combined, indexes)
+        if tx and any(
+            clean_text(_get_cell(candidate, indexes.get(key)))
+            for key in ("type", "date")
+        ):
             break
-        while len(combined) <= asset_index:
-            combined.append("")
-        combined[asset_index] = (
-            f"{_get_cell(combined, asset_index) or ''} {_get_cell(candidate, asset_index) or ''}".strip()
-        )
-        final_row = next_rows[offset]
-        tx, merged = _process_row(combined, indexes, final_row)
-        if tx and merged:
-            return tx, offset + 1
-    return None, 0
+        merged = _merge_complementary_row(combined, candidate, indexes)
+        if merged is None:
+            break
+        combined = merged
+        consumed += 1
+    tx, _ = _process_row(combined, indexes)
+    return tx, consumed
 
 
 def _is_filing_detail_row(asset_cell: str | None) -> bool:

@@ -156,8 +156,10 @@ def consolidate_transactions(
         return pd.DataFrame()
 
     df = pd.DataFrame(all_transactions)
-    df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
-    df["disclosure_date"] = pd.to_datetime(df["disclosure_date"], errors="coerce")
+    for column in ("transaction_date", "disclosure_date"):
+        df[column] = pd.to_datetime(
+            [pd.to_datetime(value, errors="coerce") for value in df[column]]
+        )
     invalid = df[["transaction_date", "disclosure_date"]].isna().any(axis=1)
     if invalid.any():
         logger.warning(

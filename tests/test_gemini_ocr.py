@@ -46,6 +46,23 @@ def _enable_ocr_schema(connection):
 def _insert_transactions(*args, **kwargs):
     kwargs.setdefault("artifact_sha256", "test-artifact-sha256")
     kwargs.setdefault("ingestion_generation", "test-house-generation")
+    # Each insertion fixture represents an acquired, metadata-bound artifact.
+    conn = duckdb.connect(str(kwargs["db_path"]))
+    doc_id, year = args[:2]
+    generation = kwargs["ingestion_generation"]
+    conn.execute(
+        "INSERT INTO house_archive_generations (archive_year, generation_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        [year, generation],
+    )
+    conn.execute(
+        "INSERT INTO house_pdf_artifacts (archive_year, generation_id, doc_id, artifact_sha256) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        [year, generation, doc_id, kwargs["artifact_sha256"]],
+    )
+    conn.execute(
+        "INSERT INTO house_generation_metadata SELECT ?, ?, doc_id, first_name, last_name, filing_date, filing_type, fetched_at FROM metadata ON CONFLICT DO NOTHING",
+        [year, generation],
+    )
+    conn.close()
     return insert_transactions(*args, **kwargs)
 
 
@@ -128,12 +145,12 @@ def test_validation_preserves_repeated_lots_without_source_identity():
     assert "duplicate_collapsed" not in rejections
 
 
-def test_validation_member_mismatch_uses_metadata_name():
+def test_validation_member_mismatch_is_rejected():
     valid, rejections = gemini_ocr_common.validate_transactions(
         "doc-member", "Injected Junk", [_tx()], datetime(2024, 1, 20), "Jane Q. Doe"
     )
 
-    assert valid[0]["member"] == "Jane Q. Doe"
+    assert valid == []
     assert rejections["member_mismatch"] == 1
 
 
@@ -840,7 +857,7 @@ def test_mixed_ticker_provenance_rows_use_fixed_full_staging_schema(
     )
     db.close()
     monkeypatch.setattr(ocr_zero_rows, "resolve_ticker", lambda asset: "PRIVATE")
-    rows = [_tx(asset="Apple (AAPL)"), _tx(asset="Private Holdings")]
+    rows = [_tx(asset="Apple Ticker: AAPL"), _tx(asset="Private Holdings")]
     assert (
         _insert_transactions(
             "mixed-schema", 2024, "Jane Doe", rows, db_path=str(db_path)
@@ -1318,7 +1335,7 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
 
     assert (
         _insert_transactions(
-            "no-txs", 2024, "Jane Doe", [], db_path=str(db_path), raw_count=0
+            "no-txs", 2024, "Jane Doe", [], db_path=str(db_path), raw_count=0, artifact_sha256=digest
         )
         == 0
     )

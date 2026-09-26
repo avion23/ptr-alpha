@@ -22,6 +22,7 @@ from scripts.gemini_ocr_common import (
     GeminiOutputError as GeminiOutputError,
     call_gemini,
     inspect_cached_response,
+    is_quota_error,
     parse_gemini_output,
     validate_transactions,
 )
@@ -88,6 +89,10 @@ def validate_ticker_provenance(row):
         if not ticker or ticker != raw_ticker or candidate is not None:
             raise ValueError("official ticker provenance is inconsistent")
         return
+    if origin == "asset_description":
+        if not ticker or raw_ticker is not None or candidate is not None:
+            raise ValueError("asset-description ticker provenance is inconsistent")
+        return
     if origin == "unverified":
         if ticker is not None or not raw_ticker or candidate != raw_ticker:
             raise ValueError("unverified ticker provenance is inconsistent")
@@ -145,6 +150,7 @@ def get_ocr_work_items(
     if require_schema and not schema_ready:
         require_ocr_schema(conn)
     base = Path(data_dir) if data_dir is not None else Path(db_path).parent
+    generation_work = []
     if schema_ready and year is not None:
         conn.close()
         db = Database(db_path, read_only=True)
@@ -164,7 +170,7 @@ def get_ocr_work_items(
                 )
             if generation is not None and scoped_ptrs > 0:
                 unresolved = db.get_unresolved_house_doc_ids(year, generation)
-                return [
+                generation_work = [
                     (
                         doc_id,
                         year,
@@ -338,7 +344,8 @@ def get_ocr_work_items(
             WHERE doc_id = ? AND source = 'gemini_ocr'
               AND (chamber = 'House' OR chamber IS NULL)
               AND NOT (
-                  ingestion_generation = ? AND artifact_sha256 = ?
+                  ingestion_generation IS NOT DISTINCT FROM ?
+                  AND artifact_sha256 IS NOT DISTINCT FROM ?
               )
             """,
             [doc_id, ingestion_generation, cached.pdf_sha256],
@@ -361,7 +368,7 @@ def get_ocr_work_items(
                     datetime.date.fromisoformat(normalize_date(transaction["date"])),
                     datetime.date.fromisoformat(
                         normalize_date(transaction["notif_date"])
-                    ),
+                    ) if transaction["notif_date"] is not None else None,
                     transaction["amount_letter"],
                 )
             )
@@ -382,7 +389,7 @@ def get_ocr_work_items(
         if not (success_matches or no_txs_matches):
             unresolved.append((doc_id, doc_year, pdf_path))
     conn.close()
-    return unresolved
+    return sorted(set(unresolved) | set(generation_work))
 
 
 def get_zero_row_pdfs():
@@ -418,9 +425,9 @@ def mark_progress(progress, doc_id, status):
     progress[key].append(doc_id)
 
 
-def parse_output(output):
+def parse_output(output, *, expected_page_count=None):
     """Parse a schema-validated Gemini response into the legacy tuple API."""
-    parsed = parse_gemini_output(output)
+    parsed = parse_gemini_output(output, expected_page_count=expected_page_count)
     return parsed.member, parsed.transactions
 
 
@@ -445,20 +452,25 @@ def normalize_date(date_str):
     return f"{year}-{month_i:02d}-{day_i:02d}"
 
 
-def extract_ticker(asset):
+def extract_ticker(asset, *, explicit_only=False):
     """Extract stock ticker from common House asset formats."""
     if not asset:
         return None
     text = asset.upper()
     patterns = [
-        r"\(([A-Z]{1,5}(?:\.[AB])?)\)",
         r"\bTICKER\s*[:=]\s*([A-Z]{1,5}(?:\.[AB])?)\b",
-        r"\$([A-Z]{1,5}(?:\.[AB])?)\b",
     ]
+    if not explicit_only:
+        patterns.extend([
+            r"\(([A-Z]{1,5}(?:\.[AB])?)\)",
+            r"\$([A-Z]{1,5}(?:\.[AB])?)\b",
+        ])
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            return match.group(1)
+            ticker = match.group(1)
+            if ticker not in {"LLC", "LP", "LLP", "INC", "ETF", "ST", "MF", "OT"}:
+                return ticker
     return None
 
 
@@ -1091,6 +1103,11 @@ def _resolve_ingestion_generation(
         WHERE artifact.doc_id = ?
           AND artifact.archive_year = ?
           AND artifact.artifact_sha256 = ?
+          AND artifact.generation_id = (
+              SELECT generation_id FROM house_archive_generations
+              WHERE archive_year = artifact.archive_year
+              ORDER BY promoted_at DESC, generation_id DESC LIMIT 1
+          )
         ORDER BY artifact.acquired_at DESC, artifact.generation_id DESC
         LIMIT 1
         """,
@@ -1230,11 +1247,49 @@ def insert_transactions(
         raise RuntimeError(
             "OCR insertion requires artifact_sha256 and ingestion_generation"
         )
-    filing_date = get_filing_date(conn, doc_id)
-    expected_member = get_metadata_member(conn, doc_id)
+    try:
+        bound_generation = _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
+        if bound_generation != ingestion_generation:
+            raise RuntimeError("OCR insertion generation does not match the current artifact")
+        metadata = conn.execute(
+            "SELECT filing_date, first_name, last_name FROM house_generation_metadata "
+            "WHERE archive_year = ? AND generation_id = ? AND doc_id = ? AND filing_type = 'P'",
+            [year, ingestion_generation, str(doc_id)],
+        ).fetchone()
+        if metadata is None:
+            raise RuntimeError("OCR insertion requires generation-bound filing metadata")
+        filing_date = metadata[0]
+        expected_member = " ".join(part for part in metadata[1:] if part).strip()
+    except Exception:
+        conn.close()
+        raise
+    _, identity_rejections = validate_transactions(doc_id, member, [], filing_date, expected_member)
+    if identity_rejections:
+        try:
+            _record_failed_ocr_attempt(
+                conn, doc_id, year, raw_count or len(transactions),
+                json.dumps(identity_rejections, sort_keys=True),
+                parser_version=parser_version, artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation, engine_model=engine_model,
+            )
+        finally:
+            conn.close()
+        return 0
     if not transactions:
         status = "error" if raw_count else "no_txs"
         message = "semantic_zero_after_raw_rows" if raw_count else ""
+        if raw_count:
+            try:
+                _record_failed_ocr_attempt(
+                    conn, doc_id, year, raw_count, message,
+                    parser_version=parser_version,
+                    artifact_sha256=artifact_sha256,
+                    ingestion_generation=ingestion_generation,
+                    engine_model=engine_model,
+                )
+            finally:
+                conn.close()
+            return 0
         conn.execute("BEGIN TRANSACTION")
         try:
             if status == "no_txs":
@@ -1268,9 +1323,7 @@ def insert_transactions(
     validated, rejections = validate_transactions(
         doc_id, member, transactions, filing_date, expected_member
     )
-    fatal_rejections = {
-        key: value for key, value in rejections.items() if key != "member_mismatch"
-    }
+    fatal_rejections = rejections
     if fatal_rejections:
         _record_failed_ocr_attempt(
             conn,
@@ -1294,12 +1347,15 @@ def insert_transactions(
             tx_date = normalize_date(tx["date"])
             notification_date = normalize_date(tx.get("notif_date"))
             disclosure_date = filing_date or notification_date or tx_date
-            disclosed_ticker = extract_ticker(tx["asset"])
+            disclosed_ticker = extract_ticker(tx["asset"], explicit_only=True)
             ticker_candidate = None
             if disclosed_ticker:
                 ticker = disclosed_ticker
                 raw_ticker = disclosed_ticker
                 ticker_origin = "official"
+            elif ticker := extract_ticker(tx["asset"]):
+                raw_ticker = None
+                ticker_origin = "asset_description"
             else:
                 ticker_candidate = resolve_ticker(tx["asset"])
                 ticker = None
@@ -1538,18 +1594,16 @@ def insert_transactions(
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
-            record_parse_run(
+            _record_failed_ocr_attempt(
                 conn,
                 doc_id,
                 year,
-                "error",
                 input_count,
-                0,
                 str(exc),
                 parser_version=parser_version,
                 artifact_sha256=artifact_sha256,
                 ingestion_generation=ingestion_generation,
-                engines_attempted=engine_model,
+                engine_model=engine_model,
             )
         raise
     finally:
@@ -1589,6 +1643,9 @@ def main():
         output, error, artifact_metadata = call_gemini(
             path, doc_id=doc_id, refresh=args.refresh
         )
+        if is_quota_error(error):
+            print("  Quota exhausted; stopping batch", flush=True)
+            break
         ingestion_generation = None
         if artifact_metadata is not None:
             try:
@@ -1618,7 +1675,10 @@ def main():
             print(f"  ERROR: {error}", flush=True)
             continue
 
-        member, transactions = parse_output(output)
+        assert artifact_metadata is not None, "successful Gemini response requires artifact metadata"
+        parsed = artifact_metadata.parsed
+        assert parsed is not None, "successful Gemini response requires validated output"
+        member, transactions = parsed.member, parsed.transactions
         if not transactions:
             insert_transactions(
                 doc_id,
@@ -1636,40 +1696,6 @@ def main():
             continue
 
         raw_count = len(transactions)
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        transactions, rejections = validate_for_insert(
-            conn, doc_id, member, transactions
-        )
-        conn.close()
-        print(f"  Validation rejections: {rejections}", flush=True)
-        fatal_rejections = {
-            key: value for key, value in rejections.items() if key != "member_mismatch"
-        }
-        if fatal_rejections:
-            status = (
-                "rejected" if "row_count_exceeds_cap" in fatal_rejections else "error"
-            )
-            message = json.dumps(fatal_rejections, sort_keys=True)
-            conn = duckdb.connect(DB_PATH)
-            try:
-                record_parse_run(
-                    conn,
-                    doc_id,
-                    year,
-                    status,
-                    raw_count,
-                    0,
-                    message,
-                    artifact_sha256=artifact_metadata.sha256,
-                    ingestion_generation=ingestion_generation,
-                )
-            finally:
-                conn.close()
-            mark_progress(progress, doc_id, "errors")
-            save_progress(progress)
-            print(f"  {status.upper()}: {message}", flush=True)
-            continue
-        member = transactions[0].get("member", member) if transactions else member
         inserted = insert_transactions(
             doc_id,
             year,
@@ -1717,6 +1743,9 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             cache_dir=os.path.join(data_dir, "gemini_cache"),
             parser_version=GEMINI_PARSER_VERSION,
         )
+        if is_quota_error(error):
+            print("  Quota exhausted; stopping batch", flush=True)
+            break
         ingestion_generation = None
         if artifact_metadata is not None:
             try:
@@ -1746,7 +1775,10 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             print(f"  ERROR: {error}", flush=True)
             continue
 
-        member, transactions = parse_output(output)
+        assert artifact_metadata is not None, "successful Gemini response requires artifact metadata"
+        parsed = artifact_metadata.parsed
+        assert parsed is not None, "successful Gemini response requires validated output"
+        member, transactions = parsed.member, parsed.transactions
         if not transactions:
             insert_transactions(
                 doc_id,
@@ -1765,44 +1797,6 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             continue
 
         raw_count = len(transactions)
-        conn = duckdb.connect(db_path, read_only=True)
-        try:
-            transactions, rejections = validate_for_insert(
-                conn, doc_id, member, transactions
-            )
-        finally:
-            conn.close()
-        print(f"  Validation rejections: {rejections}", flush=True)
-        fatal_rejections = {
-            key: value for key, value in rejections.items() if key != "member_mismatch"
-        }
-        if fatal_rejections:
-            status = (
-                "rejected" if "row_count_exceeds_cap" in fatal_rejections else "error"
-            )
-            message = json.dumps(fatal_rejections, sort_keys=True)
-            conn = duckdb.connect(db_path)
-            try:
-                record_parse_run(
-                    conn,
-                    doc_id,
-                    yr,
-                    status,
-                    raw_count,
-                    0,
-                    message,
-                    parser_version=GEMINI_PARSER_VERSION,
-                    artifact_sha256=artifact_metadata.sha256,
-                    ingestion_generation=ingestion_generation,
-                )
-            finally:
-                conn.close()
-            mark_progress(progress, doc_id, "errors")
-            save_progress(progress, progress_path)
-            print(f"  {status.upper()}: {message}", flush=True)
-            continue
-
-        member = transactions[0]["member"]
         inserted = insert_transactions(
             doc_id,
             yr,

@@ -613,42 +613,28 @@ class HouseTransactionSource(TransactionSource):
         member_lookup = _build_member_lookup(existing_docs)
         logger.info(f"Parsing {len(pdf_paths)} PDFs for {year}")
 
-        # Persist bounded batches so an interrupted large archive can resume
-        # from terminal parse runs instead of discarding a whole year's work.
+        # Submit bounded batches and checkpoint completions without waiting for
+        # slow siblings, so an interrupted archive can resume from terminal runs.
         batch_size = max(16, self.parallel_workers * 4)
         with Pool(self.parallel_workers) as pool:
             for offset in range(0, len(pdf_paths), batch_size):
                 batch_paths = pdf_paths[offset : offset + batch_size]
-                parsed = pool.map(_tolerant_parse_pdf_worker, batch_paths)
-                results: list = []
-                failed_results: list[tuple[Path, list[dict], list[str]]] = []
+                parsed = pool.imap_unordered(_tolerant_parse_pdf_worker, batch_paths)
                 for pdf_path, transactions, engines_attempted in parsed:
+                    result = (pdf_path, transactions, engines_attempted)
                     error_detail = _engine_error_detail(engines_attempted)
-                    if error_detail is None:
-                        results.append((pdf_path, transactions, engines_attempted))
-                    else:
-                        failed_results.append(
-                            (pdf_path, transactions, engines_attempted)
+                    if error_detail is not None:
+                        logger.warning(
+                            "Excluding unparseable PDF %s: %s", pdf_path.stem, error_detail
                         )
-
-                if failed_results:
-                    logger.warning(
-                        "Excluding %d/%d unparseable PDFs for %d from batch save: %s",
-                        len(failed_results),
-                        len(batch_paths),
-                        year,
-                        "; ".join(
-                            f"{pdf_path.stem} ({_engine_error_detail(engines_attempted)})"
-                            for pdf_path, _transactions, engines_attempted in failed_results
-                        ),
+                        self._save_failed_parse_runs(
+                            year, [result], ingestion_generation
+                        )
+                        continue
+                    # A one-document checkpoint cannot wait behind a slow sibling.
+                    self._save_parse_results(
+                        year, [result], member_lookup, ingestion_generation
                     )
-                    self._save_failed_parse_runs(
-                        year, failed_results, ingestion_generation
-                    )
-
-                self._save_parse_results(
-                    year, results, member_lookup, ingestion_generation
-                )
 
     def _save_failed_parse_runs(
         self,
@@ -702,6 +688,12 @@ class HouseTransactionSource(TransactionSource):
                 doc_id: batch_failure
                 for doc_id, _engines in parse_attempts
             }
+        consolidated_counts = (
+            df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
+        )
+        for doc_id, raw_count in raw_transaction_counts.items():
+            if consolidated_counts.get(doc_id, 0) < raw_count:
+                invalid_docs.setdefault(doc_id, []).append("rows lost during consolidation")
         if invalid_docs and not df.empty:
             df = df[~df["doc_id"].astype(str).isin(invalid_docs)].copy()
         transaction_counts = (
@@ -934,9 +926,8 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
     parse yields a null/empty ``ticker`` (or ``amount_raw``) for a transaction
     that a previous parse had correctly resolved, the good data would be
     overwritten with NULL. This merges the previously-resolved values back into
-    ``df``, matched per ``doc_id`` by ``(member, transaction_date,
-    transaction_type)`` — the transaction identity. Identity fields themselves
-    are never modified.
+    ``df``, matched per document by source row, asset, owner, and transaction
+    identity. Missing source-row identity cannot authorize carry-forward.
 
     Behaviour:
     * new ticker null/empty/blank     -> keep existing ticker if present
@@ -959,8 +950,13 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
 
         lookup: dict[tuple, dict] = {}
         for _, er in existing.iterrows():
+            if _is_blank(er.get("source_row_id")):
+                continue
             key = _identity_key(
                 er.get("member"), er.get("transaction_date"), er.get("transaction_type")
+            ) + tuple(
+                None if _is_blank(er.get(c)) else er.get(c)
+                for c in ("source_row_id", "asset_description", "owner_code")
             )
             slot = lookup.setdefault(key, {"tickers": set(), "amounts": set()})
             if not _is_blank(er.get("ticker")):
@@ -969,10 +965,16 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
                 slot["amounts"].add(er["amount_raw"])
 
         for idx in df.index[df["doc_id"] == doc_id]:
+            row = df.loc[idx]
+            if _is_blank(row.get("source_row_id")):
+                continue
             key = _identity_key(
                 df.at[idx, "member"],
                 df.at[idx, "transaction_date"],
                 df.at[idx, "transaction_type"],
+            ) + tuple(
+                None if _is_blank(row.get(c)) else row.get(c)
+                for c in ("source_row_id", "asset_description", "owner_code")
             )
             slot = lookup.get(key)
             if slot is None:

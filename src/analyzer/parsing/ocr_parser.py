@@ -8,6 +8,7 @@ extracts ticker / tx-type / date / amount rows from the resulting plaintext.
 import os
 import re
 import time
+from collections import Counter
 from pathlib import Path
 
 from analyzer.models import TransactionType
@@ -18,9 +19,6 @@ from analyzer.models import TransactionType
 _OCR_CALL_TIMEOUT = 90
 _RASTERIZE_TIMEOUT = 120
 _OCR_DOCUMENT_BUDGET = 600
-# Cap tesseract's OpenMP threads; many parallel OCR workers each spawning one
-# thread per core thrash the scheduler (observed load 20 on 4 cores).
-os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 
 class OcrBackendError(RuntimeError):
@@ -59,7 +57,7 @@ def _orient_image(image, pytesseract):
 
 
 def _date_pattern() -> str:
-    return r"(?:\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})|\d{4}-\d{2}-\d{2})"
+    return r"(?:\d{1,2}/\d{1,2}/(?:\d{4}|\d{2})|\d{4}-\d{2}-\d{2})\b"
 
 
 def _parse_tickerless_inline(stripped: str, amount_str: str | None):
@@ -82,66 +80,54 @@ def _parse_tickerless_inline(stripped: str, amount_str: str | None):
 
 def _parse_ocr_text_to_rows(text: str) -> list[list[str]]:
     rows: list[list[str]] = []
-    pending_tx: dict | None = None
+    pending_asset: str | None = None
+    pending_fields = ""
 
-    for raw_line in text.strip().splitlines():
+    for raw_line in [*text.splitlines(), ""]:
         stripped = raw_line.strip()
-        if not stripped:
-            continue
         ticker_match = re.search(r"\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)", stripped)
         amount_match = re.search(r"\$[\d,]+\s*-\s*\$[\d,]+", stripped)
         amount_str = amount_match.group(0) if amount_match else None
+        inline_row = (
+            _parse_tickerless_inline(stripped, amount_str) if not ticker_match else None
+        )
+        is_field = re.match(r"^(?:[PSE]{1,2}\b|\d|\$|\[)", stripped)
+        if not stripped or ticker_match or inline_row or not is_field:
+            if pending_asset:
+                row = _row_from_fields(pending_asset, pending_fields)
+                if row is not None:
+                    rows.append(row)
+            pending_asset = None
+            pending_fields = ""
+
+        if not stripped or stripped.casefold() in {"cover page", "certification"}:
+            continue
 
         if ticker_match:
-            row, pending_tx = _handle_ticker_line(
-                stripped, ticker_match, amount_str, pending_tx
-            )
-            if row is not None:
-                rows.append(row)
+            pending_asset = stripped[: ticker_match.end()].strip()
+            pending_fields = stripped[ticker_match.end() :].strip()
             continue
 
-        inline_row = _parse_tickerless_inline(stripped, amount_str)
         if inline_row is not None:
             rows.append(inline_row)
-            pending_tx = None
             continue
-        if pending_tx and not re.search(_date_pattern(), stripped):
-            rows.append(
-                [
-                    stripped,
-                    pending_tx["tx_type"],
-                    pending_tx["date_str"],
-                    pending_tx.get("amount") or "",
-                ]
-            )
-            pending_tx = None
+        if not is_field:
+            pending_asset = stripped
             continue
-        pending_tx = _handle_continuation_line(stripped, amount_str)
+        if pending_asset is None:
+            continue
+        pending_fields = f"{pending_fields} {stripped}".strip()
 
     return rows
 
 
-def _handle_ticker_line(
-    stripped: str,
-    ticker_match: re.Match,
-    amount_str: str | None,
-    pending_tx: dict | None,
-):
-    asset_name = stripped[: ticker_match.end()].strip()
-    rest = stripped[ticker_match.end() :].strip()
+def _row_from_fields(asset_name: str, rest: str):
     rest_clean = re.sub(r"\s+", " ", rest).strip().upper()
-
+    amount = re.search(r"\$[\d,]+\s*-\s*\$[\d,]+", rest)
     tx_type, date_str = _tx_type_and_date(rest_clean, rest)
     if tx_type and date_str:
-        return [asset_name, tx_type, date_str, amount_str or ""], None
-    if pending_tx:
-        return [
-            asset_name,
-            pending_tx["tx_type"],
-            pending_tx["date_str"],
-            pending_tx.get("amount") or "",
-        ], None
-    return None, None
+        return [asset_name, tx_type, date_str, amount.group(0) if amount else ""]
+    return None
 
 
 def _tx_type_and_date(rest_clean: str, rest: str) -> tuple[str | None, str | None]:
@@ -163,52 +149,42 @@ def _tx_type_and_date(rest_clean: str, rest: str) -> tuple[str | None, str | Non
     return tx_type, date_match.group(0) if date_match else None
 
 
-def _handle_continuation_line(stripped: str, amount_str: str | None) -> dict | None:
-    rest_clean = re.sub(r"\s+", " ", stripped).upper()
-
-    has_s = (
-        " S " in rest_clean
-        or rest_clean.startswith("S ")
-        or re.search(r"[A-Z0-9]S\s+\d", rest_clean)
-    )
-    has_p = (
-        " P " in rest_clean
-        or rest_clean.startswith("P ")
-        or re.search(r"[A-Z0-9]P\s+\d", rest_clean)
-    )
-
-    if has_s and not has_p:
-        tx_type = TransactionType.SALE.value
-    elif has_p:
-        tx_type = TransactionType.PURCHASE.value
-    else:
-        tx_type = None
-
-    if tx_type is None:
-        return None
-
-    date_match = re.search(_date_pattern(), stripped)
-    if not date_match:
-        return None
-    return {"tx_type": tx_type, "date_str": date_match.group(0), "amount": amount_str}
-
-
 def _reconcile_rows(*row_sets: list[list[str]]) -> list[list[str]]:
     reconciled: list[list[str]] = []
-    seen = set()
+    seen = Counter()
     for rows in row_sets:
+        counts = Counter()
         for row in rows:
             key = tuple(
                 re.sub(r"\s+", " ", str(cell)).strip().casefold() for cell in row
             )
-            if key in seen:
+            counts[key] += 1
+            if counts[key] <= seen[key]:
                 continue
-            seen.add(key)
             reconciled.append(row)
+        seen |= counts
     return reconciled
 
 
+def _confirmed_nontransaction_page(text: str, image) -> bool:
+    if not text.strip():
+        # Empty OCR is not evidence of a blank scan. Check the pixels too.
+        if not hasattr(image, "convert"):
+            return False
+        with image.convert("L") as gray:
+            return gray.getextrema()[0] >= 250
+    if re.search(
+        r"\$|\b(?:asset|transaction date|transaction type)\b|^\s*[PSE]\b",
+        text,
+        re.I | re.M,
+    ):
+        return False
+    return bool(re.search(r"(?im)^\s*(?:cover page|certification)\s*$", text))
+
+
 def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
+    # Enforce the cap at execution time, including when workers inherit it.
+    os.environ["OMP_THREAD_LIMIT"] = "1"
     try:
         import pytesseract
         from pdf2image import convert_from_path
@@ -226,38 +202,46 @@ def extract_tables_with_ocr(pdf_path: Path) -> list[list[list[str]]]:
     all_rows: list[list[str]] = []
     incomplete_pages: list[str] = []
     started_at = time.monotonic()
-    for page_number, image in enumerate(images, start=1):
-        if time.monotonic() - started_at > _OCR_DOCUMENT_BUDGET:
-            incomplete_pages.extend(
-                f"page {n}: ocr deadline exceeded"
-                for n in range(page_number, len(images) + 1)
-            )
-            break
-        oriented_image = image
-        first_rows: list[list[str]] = []
-        try:
-            first_text = pytesseract.image_to_string(image, timeout=_OCR_CALL_TIMEOUT)
-            first_rows = _parse_ocr_text_to_rows(first_text)
-            oriented_image = _orient_image(image, pytesseract)
-            page_rows = first_rows
-            if oriented_image is not image:
-                oriented_text = pytesseract.image_to_string(
-                    oriented_image, timeout=_OCR_CALL_TIMEOUT
+    try:
+        for page_number, image in enumerate(images, start=1):
+            if time.monotonic() - started_at > _OCR_DOCUMENT_BUDGET:
+                incomplete_pages.extend(
+                    f"page {n}: ocr deadline exceeded"
+                    for n in range(page_number, len(images) + 1)
                 )
-                oriented_rows = _parse_ocr_text_to_rows(oriented_text)
-                page_rows = _reconcile_rows(first_rows, oriented_rows)
-            all_rows.extend(page_rows)
-            if not page_rows:
-                incomplete_pages.append(f"page {page_number}: no transaction rows")
-        except Exception as exc:
-            # Retain diagnosable first-pass rows, but never promote them to success.
-            all_rows.extend(first_rows)
-            incomplete_pages.append(f"page {page_number}: {exc}")
-        finally:
-            if oriented_image is not image:
-                oriented_close = getattr(oriented_image, "close", None)
-                if callable(oriented_close):
-                    oriented_close()
+                break
+            oriented_image = image
+            first_rows: list[list[str]] = []
+            try:
+                first_text = pytesseract.image_to_string(image, timeout=_OCR_CALL_TIMEOUT)
+                first_rows = _parse_ocr_text_to_rows(first_text)
+                if not first_rows and _confirmed_nontransaction_page(first_text, image):
+                    continue
+                oriented_image = _orient_image(image, pytesseract)
+                page_rows = first_rows
+                oriented_text = first_text
+                if oriented_image is not image:
+                    oriented_text = pytesseract.image_to_string(
+                        oriented_image, timeout=_OCR_CALL_TIMEOUT
+                    )
+                    oriented_rows = _parse_ocr_text_to_rows(oriented_text)
+                    page_rows = _reconcile_rows(first_rows, oriented_rows)
+                all_rows.extend(page_rows)
+                if not page_rows and not _confirmed_nontransaction_page(
+                    oriented_text, oriented_image
+                ):
+                    incomplete_pages.append(f"page {page_number}: no transaction rows")
+            except Exception as exc:
+                # Retain diagnosable first-pass rows, but never promote them to success.
+                all_rows.extend(first_rows)
+                incomplete_pages.append(f"page {page_number}: {exc}")
+            finally:
+                if oriented_image is not image:
+                    oriented_close = getattr(oriented_image, "close", None)
+                    if callable(oriented_close):
+                        oriented_close()
+    finally:
+        for image in images:
             image_close = getattr(image, "close", None)
             if callable(image_close):
                 image_close()

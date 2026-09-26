@@ -45,13 +45,13 @@ def extract_tables_with_docling(
         if text is None:
             return []
 
-        # For scanned PDFs, Docling renders transactions as markdown lists
-        # (each tx spans 3-5 lines). The list parser handles this format;
-        # the pipe-table parser is a fallback for cleaner digital PDFs.
-        tables = _parse_docling_markdown(text)
-        if not tables:
-            tables = _parse_markdown_tables(text)
-        return tables
+        # A document can mix both formats. Keep pipe source lines out of the
+        # list parser so each source row is parsed exactly once.
+        list_text = "\n".join(
+            "" if line.lstrip().startswith("|") else line
+            for line in text.splitlines()
+        )
+        return _parse_docling_markdown(list_text) + _parse_markdown_tables(text)
 
 
 def _build_docling_cmd(pdf_path: Path) -> list[str] | None:
@@ -221,8 +221,13 @@ def _scan_forward_for_tx(lines, i, ticker_re, tx_code_re, date_amount_re):
         lookahead = lines[j].strip()
         if not lookahead:
             continue
-        # Stop if we hit the next ticker line
-        if ticker_re.search(lookahead) and re.search(r"\([A-Z]{1,6}\)", lookahead):
+        # Stop at every new asset, including tickerless list items.
+        if (
+            ticker_re.search(lookahead)
+            or re.search(r"\[[A-Z]+\]", lookahead)
+            or (re.match(r"^[-·*]\s+\S", lookahead) and not tx_code_re.match(lookahead))
+            or (re.match(r"^[A-Za-z]", lookahead) and not tx_code_re.match(lookahead))
+        ):
             break
 
         # Check for tx code (standalone P/S/E)

@@ -113,16 +113,16 @@ def _run_pdftotext(pdf_path: Path) -> str | None:
             errors="replace",
             timeout=_PDFTOTEXT_TIMEOUT,
         )
-        if result.returncode != 0 or not result.stdout.strip():
+        result.check_returncode()
+        if not result.stdout.strip():
             return None
     except OSError as e:
-        # FileNotFoundError (binary missing), PermissionError, and other
-        # OS-level errors should not crash the parse pipeline.
+        # Preserve execution failures for the cascade's typed backend wrapper.
         logger.debug(f"pdftotext failed for {pdf_path}: {e}")
-        return None
+        raise
     except subprocess.TimeoutExpired as e:
         logger.debug(f"pdftotext timed out for {pdf_path}: {e}")
-        return None
+        raise
     return result.stdout
 
 
@@ -163,6 +163,8 @@ def _parse_pdftotext_lines(
 
 def _is_skip_line(line: str) -> bool:
     stripped = line.strip()
+    if re.fullmatch(r"\([A-Z][A-Z0-9.\-/]{0,9}\)|\[[A-Z]{2}\]", stripped):
+        return False
     if not stripped or len(stripped) <= _MAX_SINGLE_LETTER_LEN:
         return True
     for prefix in _SKIP_PREFIXES:

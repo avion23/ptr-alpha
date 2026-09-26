@@ -30,7 +30,7 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
         import pdfplumber
     except ImportError as e:
         logger.debug(f"pdfplumber not available: {e}")
-        return []
+        raise
 
     tables_out: list[list[list[str]]] = []
     layout_rows: list[list[str]] = []
@@ -58,23 +58,39 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
                         )
     except Exception as e:
         logger.debug(f"pdfplumber failed for {pdf_path}: {e}")
-        return []
+        raise
 
-    table_row_count = sum(len(parse_pdf_table(table)) for table in tables_out)
-    if layout_rows and len(layout_rows) >= table_row_count:
-        return [
-            [
-                [
-                    "Asset Name",
-                    "Owner",
-                    "Transaction Type",
-                    "Transaction Date",
-                    "Amount",
-                    "Source Row ID",
-                ]
-            ]
-            + layout_rows
-        ]
+    if not layout_rows:
+        return tables_out
+
+    from analyzer.parser_cascade import (
+        _candidate_counts,
+        _multiset_subset,
+        _transaction_identity,
+    )
+
+    header = [
+        "Asset Name", "Owner", "Transaction Type", "Transaction Date",
+        "Amount", "Source Row ID",
+    ]
+    layout_transactions = parse_pdf_table([header] + layout_rows)
+    table_transactions = [tx for table in tables_out for tx in parse_pdf_table(table)]
+    table_counts = _candidate_counts(table_transactions)[0]
+    layout_counts = _candidate_counts(layout_transactions)[0]
+    if _multiset_subset(table_counts, layout_counts):
+        return [[header] + layout_rows]
+
+    # Keep table-only evidence and add only unmatched validated layout lots.
+    unmatched_sources = set()
+    for transaction in layout_transactions:
+        identity = _transaction_identity(transaction)
+        if table_counts.get(identity, 0):
+            table_counts[identity] -= 1
+            continue
+        unmatched_sources.add(transaction["source_row_id"])
+    complementary = [row for row in layout_rows if row[-1] in unmatched_sources]
+    if complementary:
+        tables_out.append([header] + complementary)
     return tables_out
 
 
@@ -137,7 +153,10 @@ def _expand_flattened_transaction_rows(table: list[list[str]]) -> list[list[str]
             expanded.append(row)
             continue
 
-        parsed = _parse_pdftotext_lines(populated[0].splitlines())
+        # Cleaning removes the indentation required by the owner-code pattern.
+        parsed = _parse_pdftotext_lines(
+            ["  " + line for line in populated[0].splitlines()]
+        )
         if not parsed:
             expanded.append(row)
             continue

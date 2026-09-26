@@ -10,9 +10,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 
@@ -329,6 +330,7 @@ class ArtifactMetadata:
     page_count: int
     byte_count: int
     source_path: str
+    parsed: ParsedGeminiOutput | None = None
 
 
 @dataclass(frozen=True)
@@ -381,7 +383,7 @@ def _read_cached_snapshot(
     cache_dir: str,
     parser_version: str,
     model: str = MODEL,
-) -> str | None:
+) -> CachedGeminiResponse | None:
     path = cache_path(doc_id, cache_dir)
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
@@ -398,8 +400,8 @@ def _read_cached_snapshot(
         )
         if envelope != expected:
             return None
-        parse_gemini_output(output, expected_page_count=snapshot.page_count)
-        return output
+        parsed = parse_gemini_output(output, expected_page_count=snapshot.page_count)
+        return CachedGeminiResponse(output, parsed, snapshot.sha256, snapshot.page_count)
     except (
         OSError,
         UnicodeError,
@@ -420,14 +422,8 @@ def inspect_cached_response(
 ) -> CachedGeminiResponse | None:
     """Validate cache and return its parser/artifact identity without model I/O."""
     with snapshot_pdf(pdf_path) as snapshot:
-        output = _read_cached_snapshot(
+        return _read_cached_snapshot(
             str(doc_id), snapshot, cache_dir, parser_version, model
-        )
-        if output is None:
-            return None
-        parsed = parse_gemini_output(output, expected_page_count=snapshot.page_count)
-        return CachedGeminiResponse(
-            output, parsed, snapshot.sha256, snapshot.page_count
         )
 
 
@@ -453,7 +449,6 @@ def _write_cached_snapshot(
     parser_version: str,
     model: str = MODEL,
 ) -> None:
-    parse_gemini_output(output, expected_page_count=snapshot.page_count)
     path = cache_path(doc_id, cache_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     envelope = _cache_envelope(
@@ -483,9 +478,14 @@ def write_cached_response(
 ) -> None:
     """Atomically persist output bound to one immutable PDF snapshot."""
     with snapshot_pdf(pdf_path) as snapshot:
+        parse_gemini_output(output, expected_page_count=snapshot.page_count)
         _write_cached_snapshot(
             str(doc_id), snapshot, output, cache_dir, parser_version, model
         )
+
+
+def is_quota_error(error: str) -> bool:
+    return bool(re.search(r"\b429\b|RESOURCE_EXHAUSTED|quota exceeded|rate limit", error, re.I))
 
 
 def call_gemini(
@@ -500,6 +500,7 @@ def call_gemini(
     max_output_tokens: int | None = None,
 ) -> tuple[str | None, str, ArtifactMetadata | None]:
     """Call Gemini against the same immutable bytes used for hash/cache checks."""
+    metadata = None
     try:
         with snapshot_pdf(pdf_path) as snapshot:
             metadata = ArtifactMetadata(
@@ -513,7 +514,7 @@ def call_gemini(
                     str(doc_id), snapshot, cache_dir, parser_version, model
                 )
                 if cached is not None:
-                    return cached, "", metadata
+                    return cached.output, "", replace(metadata, parsed=cached.parsed)
             command = ["llm", "-m", model, "-a", str(snapshot.path)]
             if model.startswith("gemini/"):
                 command.extend(["-o", "temperature", "0"])
@@ -524,12 +525,13 @@ def call_gemini(
                         ["-o", "max_output_tokens", str(int(max_output_tokens))]
                     )
             command.append(PROMPT)
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            for attempt in range(3):
+                result = subprocess.run(
+                    command, capture_output=True, text=True, timeout=timeout,
+                )
+                if result.returncode == 0 or not is_quota_error(result.stderr) or attempt == 2:
+                    break
+                time.sleep(30 * 2**attempt)
             if result.returncode != 0:
                 return (
                     None,
@@ -537,7 +539,7 @@ def call_gemini(
                     metadata,
                 )
             try:
-                parse_gemini_output(
+                parsed = parse_gemini_output(
                     result.stdout, expected_page_count=snapshot.page_count
                 )
             except GeminiOutputError as exc:
@@ -546,11 +548,11 @@ def call_gemini(
                 _write_cached_snapshot(
                     str(doc_id), snapshot, result.stdout, cache_dir, parser_version, model
                 )
-            return result.stdout, "", metadata
+            return result.stdout, "", replace(metadata, parsed=parsed)
     except subprocess.TimeoutExpired:
-        return None, "llm timed out", None
+        return None, "llm timed out", metadata
     except Exception as exc:
-        return None, str(exc), None
+        return None, str(exc), metadata
 
 
 def _tx_date(tx: dict):
@@ -588,8 +590,7 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
     if expected_member and canonical_member_key(member or "") != canonical_member_key(
         expected_member
     ):
-        effective_member = str(expected_member).strip()
-        rejections["member_mismatch"] += 1
+        return [], {"member_mismatch": raw_count or 1}
 
     valid = []
     for tx in transactions:

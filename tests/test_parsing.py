@@ -711,9 +711,9 @@ class TestParsing(unittest.TestCase):
             [(row["ticker"], row["instrument_type"]) for row in nokia_rows],
             [
                 ("BAC", "stock"),
-                ("GE", "stock"),
-                ("NOK", "stock"),
-                ("NOK", "stock"),
+                ("GE", "option"),
+                ("NOK", "option"),
+                ("NOK", "option"),
                 ("NOK", "stock"),
                 ("NOK", "stock"),
             ],
@@ -760,6 +760,165 @@ def _pdf2image_stub(convert_from_path):
 
 
 class TestLocalOcrCanaries(unittest.TestCase):
+    def test_regression_1_full_year_and_date_boundary(self):
+        from analyzer.parsing.ocr_parser import _parse_ocr_text_to_rows
+
+        for asset in ("Apple (AAPL)", "Private Fund"):
+            rows = _parse_ocr_text_to_rows(f"{asset} P 01/15/2024 $1-$2")
+            self.assertEqual(rows[0][2], "01/15/2024")
+            self.assertEqual(_parse_ocr_text_to_rows(f"{asset} P 01/15/20245"), [])
+
+    def test_regression_2_split_row_stays_with_preceding_asset(self):
+        from analyzer.parsing.ocr_parser import _parse_ocr_text_to_rows
+
+        rows = _parse_ocr_text_to_rows(
+            "Apple (AAPL)\nP 01/15/24 $1-$2\nMicrosoft (MSFT)\nS 01/16/24 $3-$4"
+        )
+        self.assertEqual(rows, [
+            ["Apple (AAPL)", "Purchase", "01/15/24", "$1-$2"],
+            ["Microsoft (MSFT)", "Sale", "01/16/24", "$3-$4"],
+        ])
+        self.assertEqual(_parse_ocr_text_to_rows("Apple (AAPL)\n\nP 01/15/24"), [])
+        self.assertEqual(_parse_ocr_text_to_rows(
+            "Apple (AAPL)\nP\n01/15/24\n$1-$2\nMicrosoft (MSFT)"
+        ), [["Apple (AAPL)", "Purchase", "01/15/24", "$1-$2"]])
+
+    def test_regression_3_orientation_lot_multiplicity(self):
+        from analyzer.parsing.ocr_parser import _reconcile_rows
+
+        row = ["Apple (AAPL)", "Purchase", "01/15/24", "$1-$2"]
+        self.assertEqual(_reconcile_rows([row, row], [row, row]), [row, row])
+        self.assertEqual(_reconcile_rows([row], [row, row]), [row, row])
+
+    def test_regression_4_confirmed_nontransaction_pages(self):
+        from PIL import Image
+        from analyzer.parsing.ocr_parser import extract_tables_with_ocr
+
+        for text in (
+            "PERIODIC TRANSACTION REPORT\nCover Page",
+            "Certification\nI certify that the statements are true",
+            "",
+        ):
+            with self.subTest(text=text):
+                images = [Image.new("RGB", (20, 20), "white") for _ in range(2)]
+                with (
+                    patch("pdf2image.convert_from_path", return_value=images),
+                    patch(
+                        "pytesseract.image_to_string",
+                        side_effect=["Apple (AAPL) P 01/15/24 $1-$2", text],
+                    ),
+                    patch("pytesseract.image_to_osd", return_value="Rotate: 0\n"),
+                ):
+                    self.assertEqual(len(extract_tables_with_ocr(Path("cover.pdf"))[0]), 2)
+
+    def test_regression_5_inherited_thread_limit(self):
+        from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
+
+        def rasterize(*args, **kwargs):
+            self.assertEqual(os.environ["OMP_THREAD_LIMIT"], "1")
+            return []
+
+        with (
+            patch.dict(os.environ, {"OMP_THREAD_LIMIT": "8"}),
+            patch("pdf2image.convert_from_path", rasterize),
+        ):
+            with self.assertRaises(OcrBackendError):
+                extract_tables_with_ocr(Path("threads.pdf"))
+
+    def test_regression_4_unreadable_trade_page_is_not_a_cover(self):
+        from PIL import Image
+        from analyzer.parsing.ocr_parser import OcrIncompleteError, extract_tables_with_ocr
+
+        for text in ("Certification\nP 01/15/24", ""):
+            with self.subTest(text=text):
+                images = [Image.new("RGB", (20, 20), "black") for _ in range(2)]
+                with (
+                    patch("pdf2image.convert_from_path", return_value=images),
+                    patch(
+                        "pytesseract.image_to_string",
+                        side_effect=["Apple (AAPL) P 01/15/24 $1-$2", text],
+                    ),
+                    patch("pytesseract.image_to_osd", return_value="Rotate: 0\n"),
+                ):
+                    with self.assertRaisesRegex(OcrIncompleteError, "page 2"):
+                        extract_tables_with_ocr(Path("unreadable.pdf"))
+
+    def test_regression_6_deadline_closes_unvisited_pages(self):
+        from unittest.mock import Mock
+        from analyzer.parsing import ocr_parser
+
+        images = [Mock(), Mock()]
+        with (
+            patch("pdf2image.convert_from_path", return_value=images),
+            patch.object(ocr_parser.time, "monotonic", side_effect=[0, 601]),
+        ):
+            with self.assertRaises(ocr_parser.OcrIncompleteError):
+                ocr_parser.extract_tables_with_ocr(Path("deadline.pdf"))
+        for image in images:
+            image.close.assert_called_once_with()
+
+    def test_regression_7_tickerless_asset_stops_docling_lookahead(self):
+        from analyzer.parsing.docling_parser import _parse_docling_markdown
+
+        for asset in ("- Private Fund [ST]", "- Private Fund", "Private Fund"):
+            self.assertEqual(_parse_docling_markdown(
+                f"- Apple (AAPL) [ST]\n{asset}\nP\n01/15/2024 $1-$2"
+            ), [])
+
+    def test_regression_8_mixed_docling_formats(self):
+        from analyzer.parsing import docling_parser
+
+        text = (
+            "- Apple (AAPL) [ST]\nP\n01/15/2024 $1-$2\n\n"
+            "| Asset Name | Transaction Type | Transaction Date | Amount |\n"
+            "|---|---|---|---|\n"
+            "| Microsoft (MSFT) | S | 01/16/2024 | $3-$4 |\n"
+            "| Microsoft (MSFT) | S | 01/16/2024 | $3-$4 |\n"
+        )
+        with (
+            patch.object(docling_parser, "_build_docling_cmd", return_value=["docling"]),
+            patch.object(docling_parser, "_run_docling", return_value=text),
+        ):
+            tables = docling_parser.extract_tables_with_docling(Path("mixed.pdf"))
+        rows = [row for table in tables for row in table[1:]]
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(sum("Microsoft" in row[0] for row in rows), 2)
+
+    def test_regression_9_enabled_scan_canary_propagates_backend_errors(self):
+        import ast
+        import inspect
+        import textwrap
+        from unittest.mock import Mock
+
+        from analyzer.parsing.ocr_parser import OcrBackendError, OcrIncompleteError
+
+        # Execute the scan section of the opted-in canary, without requiring
+        # unrelated digital-PDF fixtures or their hash checks.
+        method = ast.parse(textwrap.dedent(inspect.getsource(
+            self.test_known_real_pdf_hash_and_row_count_canaries
+        ))).body[0]
+        assert isinstance(method, ast.FunctionDef)
+        start = next(
+            i for i, node in enumerate(method.body)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "analyzer.parsing.ocr_parser"
+        )
+        end = next(
+            i for i, node in enumerate(method.body)
+            if isinstance(node, ast.ImportFrom) and node.module == "scripts.ocr_zero_rows"
+        )
+        code = compile(
+            ast.Module(body=method.body[start:end], type_ignores=[]), "scan-canary", "exec"
+        )
+        corpus = Mock()
+        corpus.glob.return_value = [Path("scan.pdf")]
+        for error in (OcrBackendError("unavailable"), OcrIncompleteError("partial", [])):
+            with patch(
+                "analyzer.parsing.ocr_parser.extract_tables_with_ocr", side_effect=error
+            ):
+                with self.assertRaises(OcrBackendError):
+                    exec(code, {"self": self, "data_dir": corpus})
+
     def test_tickerless_legacy_two_digit_year(self):
         from analyzer.parsing.ocr_parser import _parse_ocr_text_to_rows
 
@@ -1020,6 +1179,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             ]
 
         with (
+            patch.object(parser_cascade, "_has_document_text_coverage", return_value=True),
             patch.object(
                 parser_cascade, "_try_pdfplumber", return_value=transactions(2)
             ),
@@ -1189,6 +1349,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             "asset_description": "A",
         }
         with (
+            patch.object(parser_cascade, "_has_document_text_coverage", return_value=True),
             patch.object(parser_cascade, "_try_pdfplumber", return_value=[row] * 5),
             patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
             patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
@@ -1347,7 +1508,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 hashlib.sha256(matches[0].read_bytes()).hexdigest(), expected_hash
             )
 
-        from analyzer.parsing.ocr_parser import OcrBackendError, extract_tables_with_ocr
+        from analyzer.parsing.ocr_parser import extract_tables_with_ocr
 
         scan_truth = {
             "9115808": (1, "spdr", "03/31/26"),
@@ -1363,10 +1524,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             if not matches:
                 self.skipTest(f"corpus fixture {doc_id}.pdf is absent")
             pdf = matches[0]
-            try:
-                tables = extract_tables_with_ocr(pdf)
-            except OcrBackendError:
-                continue
+            tables = extract_tables_with_ocr(pdf)
             rows = tables[0][1:]
             self.assertEqual(len(rows), expected_count, doc_id)
             self.assertTrue(

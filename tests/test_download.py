@@ -435,6 +435,9 @@ def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypat
         def map(self, _worker, paths):
             return [(path, [], ["pdfplumber"]) for path in paths]
 
+        def imap_unordered(self, _worker, paths):
+            return iter([(path, [], ["pdfplumber"]) for path in paths])
+
     monkeypatch.setattr("analyzer.download.Pool", FakePool)
     try:
         source.parse_cached_pdfs(2021, force=True)
@@ -475,6 +478,9 @@ def test_parse_cached_pdfs_persists_large_year_in_resumable_batches(
         def map(self, _worker, paths):
             return [(path, [], ["pdfplumber"]) for path in paths]
 
+        def imap_unordered(self, _worker, paths):
+            return iter([(path, [], ["pdfplumber"]) for path in paths])
+
     monkeypatch.setattr("analyzer.download.Pool", FakePool)
     try:
         source.parse_cached_pdfs(2021, force=True)
@@ -482,11 +488,11 @@ def test_parse_cached_pdfs_persists_large_year_in_resumable_batches(
         source.close()
         db.close()
 
-    assert source._save_parse_results.call_count == 2
-    first_batch = source._save_parse_results.call_args_list[0].args[1]
-    second_batch = source._save_parse_results.call_args_list[1].args[1]
-    assert len(first_batch) == 16
-    assert len(second_batch) == 1
+    # Per-document checkpoints: one save per completed PDF so an interrupted
+    # archive resumes without re-running finished siblings.
+    assert source._save_parse_results.call_count == len(stems)
+    for call in source._save_parse_results.call_args_list:
+        assert len(call.args[1]) == 1
     assert source._save_failed_parse_runs.call_count == 0
 
 
@@ -527,6 +533,9 @@ def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
         def map(self, worker, paths):
             return [worker(path) for path in paths]
 
+        def imap_unordered(self, worker, paths):
+            return iter([worker(path) for path in paths])
+
     monkeypatch.setattr(download_module, "Pool", FakePool)
     try:
         with caplog.at_level(logging.WARNING, logger="analyzer.download"):
@@ -543,7 +552,10 @@ def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
         if record.levelno == logging.WARNING and "badone" in record.getMessage()
     ]
     assert failure_warnings, "expected a warning naming the failed doc_id"
-    assert any("1/2" in record.getMessage() for record in failure_warnings)
+    assert any(
+        "Excluding unparseable PDF" in record.getMessage()
+        for record in failure_warnings
+    )
 
 
 def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
@@ -645,6 +657,9 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
         def map(self, worker, paths):
             return [worker(path) for path in paths]
 
+        def imap_unordered(self, worker, paths):
+            return iter([worker(path) for path in paths])
+
     monkeypatch.setattr(download_module, "Pool", FakePool)
     try:
         source.parse_cached_pdfs(2021, force=True)
@@ -721,6 +736,9 @@ def test_parse_cached_pdfs_saves_docs_with_transient_engine_errors(
 
         def map(self, worker, paths):
             return [worker(path) for path in paths]
+
+        def imap_unordered(self, worker, paths):
+            return iter([worker(path) for path in paths])
 
     monkeypatch.setattr(download_module, "Pool", FakePool)
     try:

@@ -44,7 +44,8 @@ KNOWN_HEADERS = {
 _ASSET_CANDS = {"asset", "assetname", "description", "desc", "desciption"}
 _OWNER_CANDS = {"owner", "ownership", "ownercode", "reportedby"}
 _TYPE_CANDS = {"type", "transactiontype", "txtype", "transaction", "txtype"}
-_DATE_CANDS = {"date", "transactiondate", "txdate", "notifdate", "notificationdate"}
+_DATE_CANDS = {"date", "transactiondate", "txdate"}
+_NOTIFICATION_DATE_CANDS = {"notifdate", "notificationdate"}
 _AMOUNT_CANDS = {
     "amount",
     "transactionamount",
@@ -74,6 +75,8 @@ def _column_index_substring(headers: list[str], candidates: set[str]) -> int | N
     """Like _column_index but matches if any candidate is a substring of the normalized header."""
     for idx, header in enumerate(headers):
         normalized = _normalize_header(header)
+        if candidates == _DATE_CANDS and ("notif" in normalized):
+            continue
         for candidate in candidates:
             if candidate in normalized:
                 return idx
@@ -82,7 +85,7 @@ def _column_index_substring(headers: list[str], candidates: set[str]) -> int | N
 
 def _column_indexes(
     header: list[str], next_row: list[str] | None = None
-) -> dict[str, int]:
+) -> dict[str, int | None]:
     headers = [str(cell) for cell in header]
     indexes = _indexes_from_headers(headers)
     # If core columns are missing, try merging with next row (2-row header case)
@@ -102,7 +105,8 @@ def _column_indexes(
             if indexes[key] is None:
                 indexes[key] = _column_index_substring(merged, cands)
     if indexes["asset"] is None or indexes["type"] is None or indexes["date"] is None:
-        return {"asset": 0, "type": 1, "date": 2}
+        indexes["asset"] = indexes["asset"] if indexes["asset"] is not None else 0
+        indexes["type"] = indexes["type"] if indexes["type"] is not None else 1
     return indexes
 
 
@@ -112,6 +116,7 @@ def _indexes_from_headers(headers: list[str]) -> dict[str, int | None]:
         "owner": _column_index(headers, _OWNER_CANDS),
         "type": _column_index(headers, _TYPE_CANDS),
         "date": _column_index(headers, _DATE_CANDS),
+        "notification_date": _column_index(headers, _NOTIFICATION_DATE_CANDS),
         "amount": _column_index(headers, _AMOUNT_CANDS),
     }
 
@@ -138,12 +143,12 @@ def _get_cell(row: list, index: int | None) -> str | None:
 
 def _find_amount_in_row(row: list) -> str | None:
     """Fallback: scan all cells for a '$X,XXX - $X,XXX' or '$X,XXX' amount pattern."""
-    amount_re = re.compile(r"\$\d[\d,]*(?:\s*-\s*\$\d[\d,]*)?")
+    amount_re = re.compile(r"\$\d[\d,.]*(?:\s*-\s*\$\d[\d,.]*)?")
     for cell in row:
         if cell is None:
             continue
         text = str(cell).strip()
-        match = amount_re.search(text)
+        match = amount_re.fullmatch(text)
         if match:
             return match.group(0)
     return None

@@ -265,7 +265,7 @@ class TestCanonicalMemberKey(unittest.TestCase):
         k1 = canonical_member_key("MICHAEL T. MCCAUL")
         k2 = canonical_member_key("MICHAEL MCCAUL")
         k3 = canonical_member_key("Michael T. McCaul")
-        self.assertEqual(k1, k2)
+        self.assertNotEqual(k1, k2)
         self.assertEqual(k1, k3)
 
     def test_harshbarger_variants_map_to_same_key(self):
@@ -273,7 +273,7 @@ class TestCanonicalMemberKey(unittest.TestCase):
 
         k1 = canonical_member_key("Diana Harshbarger")
         k2 = canonical_member_key("Diana Lynn Harshbarger")
-        self.assertEqual(k1, k2)
+        self.assertNotEqual(k1, k2)
 
     def test_two_different_members_do_not_collide(self):
         from analyzer.member_names import canonical_member_key
@@ -311,10 +311,10 @@ class TestCanonicalMemberKey(unittest.TestCase):
         from analyzer.member_names import canonical_member_key
 
         # One person (Rep. Neal Dunn) filed under credentialed + plain variants.
-        self.assertEqual(canonical_member_key("Neal Patrick Dunn MD, FACS"), "NEAL DUNN")
-        self.assertEqual(canonical_member_key("Neal Patrick Dunn, MD, FACS"), "NEAL DUNN")
-        self.assertEqual(canonical_member_key("Neal Patrick MD, Facs Dunn"), "NEAL DUNN")
-        self.assertEqual(canonical_member_key("Neal P. Dunn"), "NEAL DUNN")
+        self.assertEqual(canonical_member_key("Neal Patrick Dunn MD, FACS"), "NEAL PATRICK DUNN")
+        self.assertEqual(canonical_member_key("Neal Patrick Dunn, MD, FACS"), "NEAL PATRICK DUNN")
+        self.assertEqual(canonical_member_key("Neal Patrick MD, Facs Dunn"), "NEAL PATRICK DUNN")
+        self.assertEqual(canonical_member_key("Neal P. Dunn"), "NEAL P DUNN")
         # Guards: leading initials used as first names and surnames that merely
         # contain credential letters as substrings must survive.
         self.assertEqual(canonical_member_key("JD Vance"), "JD VANCE")

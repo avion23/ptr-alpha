@@ -232,6 +232,17 @@ def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
     return None
 
 
+def _has_document_text_coverage(pdf_path: Path) -> bool:
+    """Text agreement cannot establish coverage of pages without text."""
+    import pdfplumber
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        return bool(pdf.pages) and all(
+            (page.extract_text(layout=True) or "").replace("\x00", "").strip()
+            for page in pdf.pages
+        )
+
+
 def _run_text_engines(
     pdf_path: Path,
 ) -> tuple[
@@ -267,6 +278,21 @@ def _run_text_engines(
     pdftotext_subset = bool(pdftotext_counts) and _multiset_subset(
         pdftotext_counts, pdfplumber_counts
     )
+    if pdfplumber_subset or pdftotext_subset:
+        try:
+            covered = _call_parser_backend(
+                "text_coverage", _has_document_text_coverage, pdf_path
+            )
+        except ParserBackendError as exc:
+            budget = _find_parse_budget(exc)
+            if budget is not None:
+                raise budget from exc
+            errors.append(str(exc))
+            engines_attempted.append("error:text_coverage")
+            covered = False
+        if not covered:
+            engines_attempted.append("text_page_coverage_unconfirmed")
+            return None, text_candidates, reconciled_text, engines_attempted, errors
     if pdfplumber_subset and _candidate_covers_all(
         trusted["pdftotext"], text_candidates
     ):

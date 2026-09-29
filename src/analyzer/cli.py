@@ -1410,6 +1410,11 @@ def follow_member(
     min_cost: float = typer.Option(
         0.0, help="Ignore positions with total cost below this dollar amount"
     ),
+    include_unpromoted: bool = typer.Option(
+        False,
+        "--include-unpromoted",
+        help="Add unvalidated filings from not-yet-promoted House generations",
+    ),
     as_of: str | None = typer.Option(
         None, help="Position date (YYYY-MM-DD). Defaults to today."
     ),
@@ -1444,10 +1449,18 @@ def follow_member(
     db = Database(Path(data_dir) / "congress.duckdb", read_only=True)
     try:
         try:
-            trades = load_member_trades(db, member)
+            trades = load_member_trades(
+                db, member, include_unpromoted=include_unpromoted
+            )
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
             raise typer.Exit(1) from None
+        if include_unpromoted:
+            print(
+                "Warning: unpromoted rows are unvalidated and approximate; "
+                "canonical rows take precedence.",
+                file=sys.stderr,
+            )
         if trades.empty:
             print(f"No canonical transactions for {member!r}")
             raise typer.Exit(0)

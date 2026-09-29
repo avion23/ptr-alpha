@@ -136,6 +136,78 @@ class TestPositions(unittest.TestCase):
         self.assertEqual(list(alerts["ticker"]), ["A"])
         self.assertTrue(discount_alerts(frame.iloc[0:0]).empty)
 
+    def test_open_band_falls_back_to_floor(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 1, 16),
+                    "amount_midpoint": None,
+                    "amount_raw": "$100,001 -",
+                },
+            ]
+        )
+        history = {"T": _prices(["2026-01-16", "2026-09-21"], [166.14, 140.78])}
+        positions = build_positions(trades, history, as_of=date(2026, 9, 21))
+        self.assertEqual(len(positions), 1)
+        row = positions.iloc[0]
+        self.assertAlmostEqual(row["total_cost"], 100001.0, places=2)
+        self.assertEqual(row["floor_sized_lots"], 1)
+        self.assertLess(row["discount_pct"], -10.0)
+
+    def test_unparseable_raw_still_skipped(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 1, 16),
+                    "amount_midpoint": None,
+                    "amount_raw": "garbage",
+                },
+            ]
+        )
+        history = {"T": _prices(["2026-01-16"], [166.14])}
+        self.assertTrue(
+            build_positions(trades, history, as_of=date(2026, 1, 17)).empty
+        )
+
+    def test_unpromoted_loader_adds_deduped_raw(self):
+        import duckdb
+        from types import SimpleNamespace
+
+        from analyzer.positions import load_member_trades
+
+        conn = duckdb.connect()
+        conn.execute(
+            "CREATE TABLE canonical_transactions AS SELECT * FROM "
+            "(VALUES ('M', 'T', 'Purchase', DATE '2025-01-14', DATE '2025-02-01', "
+            "750000.5, '$500,001 - $1,000,000', 'house_pdf', 'g0', 'a0', 'w0')) "
+            "AS v(member, ticker, "
+            "transaction_type, transaction_date, disclosure_date, amount_midpoint, "
+            "amount_raw, source, ingestion_generation, source_record_id, "
+            "source_row_id)"
+        )
+        conn.execute(
+            "CREATE TABLE transactions AS SELECT * FROM "
+            "(VALUES ('M', 'T', 'Purchase', DATE '2026-01-16', DATE '2026-01-23', "
+            "175000.5, '$100,001 - $250,000', 'house_pdf', 'g9', 'a9', 'w9')) "
+            "AS v(member, ticker, transaction_type, transaction_date, "
+            "disclosure_date, amount_midpoint, amount_raw, source, "
+            "ingestion_generation, source_record_id, source_row_id)"
+        )
+        db = SimpleNamespace(conn=conn)
+        canon_only = load_member_trades(db, "M")
+        self.assertEqual(len(canon_only), 1)
+        widened = load_member_trades(db, "M", include_unpromoted=True)
+        self.assertEqual(len(widened), 2)
+        self.assertIn(
+            date(2026, 1, 16), set(pd.to_datetime(widened["transaction_date"]).dt.date)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

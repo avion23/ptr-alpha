@@ -18,6 +18,8 @@ from datetime import date
 
 import pandas as pd
 
+from analyzer.parsing.cells import _extract_amount_midpoint
+
 logger = logging.getLogger(__name__)
 
 _BUY_TYPES = frozenset({"purchase"})
@@ -66,17 +68,38 @@ def build_positions(
         "ticker",
         "transaction_type",
         "transaction_date",
-        "amount_midpoint",
     }
     missing = required - set(trades.columns)
     if missing:
         raise PositionsError(f"trades missing columns: {sorted(missing)}")
+    has_midpoint = "amount_midpoint" in trades.columns
+    has_raw = "amount_raw" in trades.columns
+    if not has_midpoint and not has_raw:
+        raise PositionsError("trades need amount_midpoint or amount_raw for sizing")
 
     lots: dict[tuple[str, str], list] = {}
     first_buy: dict[tuple[str, str], date] = {}
     last_activity: dict[tuple[str, str], date] = {}
+    floor_sized: dict[tuple[str, str], int] = {}
     skipped = 0
     ignored_exchanges = 0
+
+    def _size(row) -> tuple[float | None, bool]:
+        """Dollar size with floor fallback for open-ended bands.
+
+        Returns (size, sized_by_floor). A '$100,001 -' band parses to its
+        $100,001 floor: a conservative lower bound, flagged as such.
+        """
+        midpoint = row.amount_midpoint if has_midpoint else None
+        if midpoint is not None and not pd.isna(midpoint) and float(midpoint) > 0:
+            return float(midpoint), False
+        raw = row.amount_raw if has_raw else None
+        if raw is None or pd.isna(raw):
+            return None, False
+        _, floor = _extract_amount_midpoint(str(raw))
+        if floor is None or floor <= 0:
+            return None, False
+        return float(floor), True
 
     ordered = trades.sort_values("transaction_date", kind="mergesort")
     for row in ordered.itertuples():
@@ -95,20 +118,22 @@ def build_positions(
 
         if kind in _BUY_TYPES:
             entry = _entry_close(history, day)
-            midpoint = row.amount_midpoint
-            if entry is None or pd.isna(midpoint) or float(midpoint) <= 0:
+            size, by_floor = _size(row)
+            if entry is None or size is None:
                 skipped += 1
                 continue
-            shares = float(midpoint) / entry
-            lots.setdefault(key, []).append([shares, float(midpoint)])
+            shares = size / entry
+            lots.setdefault(key, []).append([shares, size])
+            if by_floor:
+                floor_sized[key] = floor_sized.get(key, 0) + 1
             first_buy.setdefault(key, day)
         elif kind in _SELL_TYPES:
             entry = _entry_close(history, day)
-            midpoint = row.amount_midpoint
-            if entry is None or pd.isna(midpoint) or float(midpoint) <= 0:
+            size, _ = _size(row)
+            if entry is None or size is None:
                 skipped += 1
                 continue
-            to_relieve = float(midpoint) / entry
+            to_relieve = size / entry
             queue = lots.setdefault(key, [])
             while to_relieve > 0 and queue:
                 lot_shares, lot_cost = queue[0]
@@ -146,6 +171,7 @@ def build_positions(
                 "discount_pct": (current / basis - 1) * 100,
                 "first_buy": first_buy[key],
                 "last_activity": last_activity[key],
+                "floor_sized_lots": floor_sized.get(key, 0),
             }
         )
 
@@ -165,6 +191,7 @@ def build_positions(
         "discount_pct",
         "first_buy",
         "last_activity",
+        "floor_sized_lots",
     ]
     return pd.DataFrame(records, columns=columns).sort_values(
         "discount_pct", kind="mergesort"
@@ -178,18 +205,60 @@ def discount_alerts(positions: pd.DataFrame, *, threshold_pct: float = -10.0) ->
     return positions.loc[positions["discount_pct"] <= threshold_pct].copy()
 
 
-def load_member_trades(db, member: str) -> pd.DataFrame:
-    """All canonical rows for one member across every year and source."""
-    return db.conn.execute(
+def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> pd.DataFrame:
+    """All canonical rows for one member across every year and source.
+
+    With include_unpromoted, raw filings from not-yet-promoted House
+    generations are added (deduped to one row per economic event, preferring
+    closed bands). Those rows are UNVALIDATED: same filing may parse
+    differently across generations, so amounts are approximate. Canonical
+    rows always win; the flag only widens recency, never scoring.
+    """
+    canonical = db.conn.execute(
         """
         SELECT member, ticker, transaction_type, transaction_date,
-               disclosure_date, amount_midpoint, source
+               disclosure_date, amount_midpoint, amount_raw, source
         FROM canonical_transactions
         WHERE member = ?
-        ORDER BY transaction_date
         """,
         [member],
     ).fetchdf()
+    if not include_unpromoted:
+        return canonical.sort_values("transaction_date", kind="mergesort")
+
+    raw = db.conn.execute(
+        """
+        SELECT member, ticker, transaction_type, transaction_date,
+               disclosure_date, amount_midpoint, amount_raw, source
+        FROM (
+            SELECT t.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY member, ticker, transaction_date,
+                        transaction_type, disclosure_date
+                    ORDER BY amount_midpoint DESC NULLS LAST
+                ) AS rn
+            FROM transactions t
+            WHERE member = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM canonical_transactions c
+                  WHERE c.source IS NOT DISTINCT FROM t.source
+                    AND c.source_record_id IS NOT DISTINCT FROM t.source_record_id
+                    AND c.source_row_id IS NOT DISTINCT FROM t.source_row_id
+                    AND c.ingestion_generation IS NOT DISTINCT FROM t.ingestion_generation
+              )
+        )
+        WHERE rn = 1
+        """,
+        [member],
+    ).fetchdf()
+    combined = pd.concat([canonical, raw], ignore_index=True)
+    logger.warning(
+        "Including %d unvalidated unpromoted rows for %s alongside %d canonical",
+        len(raw),
+        member,
+        len(canonical),
+    )
+    return combined.sort_values("transaction_date", kind="mergesort")
 
 
 def load_price_history(db, ticker: str) -> pd.DataFrame:

@@ -1401,6 +1401,106 @@ def fetch_form4(
 
 
 @app.command()
+def follow_member(
+    ctx: typer.Context,
+    member: str = typer.Option(..., "--member", help="Member name as filed (e.g. 'Nancy Pelosi')"),
+    discount_pct: float = typer.Option(
+        10.0, help="Alert threshold: flag positions this far below cost, in percent"
+    ),
+    min_cost: float = typer.Option(
+        0.0, help="Ignore positions with total cost below this dollar amount"
+    ),
+    as_of: str | None = typer.Option(
+        None, help="Position date (YYYY-MM-DD). Defaults to today."
+    ),
+    data_dir: str = typer.Option(
+        "data", help="Data directory for the canonical database"
+    ),
+):
+    """Show a member's open positions with cost basis vs current price.
+
+    Reconstructs holdings from all canonical filings (buys add implied
+    shares, sells relieve FIFO) and flags positions trading below the
+    member's cost — the follow-through that closed-window scoring misses.
+    """
+    from analyzer.database import Database
+    from analyzer.positions import (
+        PositionsError,
+        build_positions,
+        discount_alerts,
+        load_member_trades,
+        load_price_history,
+    )
+
+    try:
+        as_of_date = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError:
+        print("Error: --as-of must be YYYY-MM-DD", file=sys.stderr)
+        raise typer.Exit(1) from None
+    if discount_pct < 0:
+        print("Error: --discount-pct must be non-negative", file=sys.stderr)
+        raise typer.Exit(1)
+
+    db = Database(Path(data_dir) / "congress.duckdb", read_only=True)
+    try:
+        try:
+            trades = load_member_trades(db, member)
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise typer.Exit(1) from None
+        if trades.empty:
+            print(f"No canonical transactions for {member!r}")
+            raise typer.Exit(0)
+        histories = {}
+        for ticker in trades["ticker"].dropna().unique():
+            histories[str(ticker)] = load_price_history(db, str(ticker))
+        try:
+            positions = build_positions(trades, histories, as_of=as_of_date)
+        except PositionsError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise typer.Exit(1) from None
+    finally:
+        db.close()
+
+    if min_cost > 0:
+        positions = positions.loc[positions["total_cost"] >= min_cost].copy()
+    alerts = discount_alerts(positions, threshold_pct=-abs(discount_pct))
+
+    with pd.option_context("display.width", 200, "display.max_columns", 20):
+        print(f"\n=== Open positions for {member} (as of {as_of_date}) ===")
+        if positions.empty:
+            print("No open positions.")
+        else:
+            show = positions[
+                [
+                    "ticker",
+                    "shares",
+                    "cost_basis",
+                    "current_price",
+                    "discount_pct",
+                    "first_buy",
+                    "last_activity",
+                ]
+            ].copy()
+            show["shares"] = show["shares"].round(1)
+            show["cost_basis"] = show["cost_basis"].round(2)
+            show["current_price"] = show["current_price"].round(2)
+            show["discount_pct"] = show["discount_pct"].round(1)
+            print(show.to_string(index=False))
+        print(f"\n=== On sale (>= {discount_pct:.0f}% below {member} cost) ===")
+        if alerts.empty:
+            print("None.")
+        else:
+            for row in alerts.itertuples():
+                print(
+                    f"{row.ticker}: cost ${row.cost_basis:.2f} -> "
+                    f"${row.current_price:.2f} ({row.discount_pct:.1f}%)"
+                )
+
+    raise typer.Exit(0)
+
+
+@app.command()
 def fetch_13f(
     ctx: typer.Context,
     watchlist: str = typer.Option(

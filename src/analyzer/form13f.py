@@ -70,6 +70,48 @@ _CANDIDATE_COLUMNS = (
 )
 
 
+def _canonical_row(
+    *,
+    manager_name,
+    ticker,
+    event_date,
+    disclosure_date,
+    added_shares,
+    amount_midpoint,
+    issuer,
+    cusip,
+    accession,
+    report_url,
+    ingestion_generation,
+) -> dict:
+    """One canonical 13F row; shared by watchlist and discovery paths."""
+    return {
+        "doc_id": f"13f-{accession}",
+        "member": manager_name,
+        "ticker": ticker,
+        "transaction_date": event_date,
+        "disclosure_date": disclosure_date,
+        "transaction_type": "Purchase",
+        "owner_code": None,
+        "amount_raw": f"{added_shares:,} shares",
+        "amount_midpoint": amount_midpoint,
+        "instrument_type": "Common Stock",
+        "strike_price": None,
+        "expiry_date": None,
+        "created_at": None,
+        "asset_description": issuer,
+        "source": "13f",
+        "source_record_id": accession,
+        "source_row_id": cusip,
+        "source_report_path": report_url,
+        "raw_owner": manager_name,
+        "official_filing_date": disclosure_date,
+        "raw_transaction_subtype": _SHARE_SUBTYPE,
+        "raw_asset_description": issuer,
+        "ingestion_generation": ingestion_generation,
+    }
+
+
 class ThirteenFError(Exception):
     """Raised when a 13F filing cannot be safely used."""
 
@@ -456,33 +498,21 @@ class ThirteenFSource(TransactionSource):
                     raise ThirteenFError(f"Invalid quarter-end price for {ticker}")
 
             rows.append(
-                {
-                    "doc_id": f"13f-{current_filing['accession']}",
-                    "member": manager["name"],
-                    "ticker": ticker,
-                    "transaction_date": quarter_end,
-                    "disclosure_date": disclosure_date,
-                    "transaction_type": "Purchase",
-                    "owner_code": None,
-                    "amount_raw": f"{added_shares:,} shares",
-                    "amount_midpoint": added_shares * price
+                _canonical_row(
+                    manager_name=manager["name"],
+                    ticker=ticker,
+                    event_date=quarter_end,
+                    disclosure_date=disclosure_date,
+                    added_shares=added_shares,
+                    amount_midpoint=added_shares * price
                     if price is not None
                     else None,
-                    "instrument_type": "Common Stock",
-                    "strike_price": None,
-                    "expiry_date": None,
-                    "created_at": None,
-                    "asset_description": issuer,
-                    "source": "13f",
-                    "source_record_id": current_filing["accession"],
-                    "source_row_id": cusip,
-                    "source_report_path": report_url,
-                    "raw_owner": manager["name"],
-                    "official_filing_date": disclosure_date,
-                    "raw_transaction_subtype": _SHARE_SUBTYPE,
-                    "raw_asset_description": issuer,
-                    "ingestion_generation": self.ingestion_generation,
-                }
+                    issuer=issuer,
+                    cusip=cusip,
+                    accession=current_filing["accession"],
+                    report_url=report_url,
+                    ingestion_generation=self.ingestion_generation,
+                )
             )
         return rows
 
@@ -561,35 +591,20 @@ class ThirteenFSource(TransactionSource):
             raise ThirteenFError("ingestion_generation is required for 13F persistence")
         rows = []
         for row in increases.to_dict("records"):
-            added = row.get("added_shares")
             rows.append(
-                {
-                    "doc_id": f"13f-{row.get('accession')}",
-                    "member": row.get("manager"),
-                    "ticker": row.get("ticker"),
-                    "transaction_date": row.get("event_date"),
-                    "disclosure_date": row.get("disclosure_date"),
-                    "transaction_type": "Purchase",
-                    "owner_code": None,
-                    "amount_raw": f"{added:,} shares"
-                    if added is not None
-                    else None,
-                    "amount_midpoint": None,
-                    "instrument_type": "Common Stock",
-                    "strike_price": None,
-                    "expiry_date": None,
-                    "created_at": None,
-                    "asset_description": row.get("raw_asset_description"),
-                    "source": "13f",
-                    "source_record_id": row.get("accession"),
-                    "source_row_id": row.get("cusip"),
-                    "source_report_path": row.get("report_url"),
-                    "raw_owner": row.get("manager"),
-                    "official_filing_date": row.get("disclosure_date"),
-                    "raw_transaction_subtype": _SHARE_SUBTYPE,
-                    "raw_asset_description": row.get("raw_asset_description"),
-                    "ingestion_generation": self.ingestion_generation,
-                }
+                _canonical_row(
+                    manager_name=row.get("manager"),
+                    ticker=row.get("ticker"),
+                    event_date=row.get("event_date"),
+                    disclosure_date=row.get("disclosure_date"),
+                    added_shares=row.get("added_shares") or 0,
+                    amount_midpoint=None,
+                    issuer=row.get("raw_asset_description"),
+                    cusip=row.get("cusip"),
+                    accession=row.get("accession"),
+                    report_url=row.get("report_url"),
+                    ingestion_generation=self.ingestion_generation,
+                )
             )
         canonical = pd.DataFrame(rows, columns=_OUTPUT_COLUMNS)
         return self.save_to_db(canonical)

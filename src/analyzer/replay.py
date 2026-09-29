@@ -126,7 +126,7 @@ def _ticker_candidates(
     return pd.concat(selected, ignore_index=True).drop_duplicates(ignore_index=True)
 
 
-def _current_price(db, ticker: str, as_of: date) -> float | None:
+def _latest_close(db, ticker: str, as_of: date) -> float | None:
     """Last known close on or before as_of; None when unknown."""
     connection = getattr(db, "conn", db)
     row = connection.execute(
@@ -157,7 +157,7 @@ def _score(
         weights[actor_id] = actors.compute_weight(
             str(row.kind), 0, 0.0, str(row.source)
         )
-    current = _current_price(db, ticker, as_of)
+    current = _latest_close(db, ticker, as_of)
     if current is None:
         return None, True, len(weights)
     try:
@@ -193,18 +193,8 @@ def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | No
     90-day returns.
     """
     connection = getattr(db, "conn", db)
-    current = connection.execute(
-        """
-        SELECT close FROM prices
-        WHERE ticker = ? AND date <= ? AND close IS NOT NULL
-        ORDER BY date DESC LIMIT 1
-        """,
-        [ticker, as_of],
-    ).fetchone()
-    if current is None or current[0] is None:
-        return None
-    current_price = float(current[0])
-    if not math.isfinite(current_price) or current_price <= 0:
+    current_price = _latest_close(db, ticker, as_of)
+    if current_price is None:
         return None
     outcome = connection.execute(
         """

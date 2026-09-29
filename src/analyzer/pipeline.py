@@ -24,6 +24,7 @@ from analyzer.member_ranking.buyer_scoring import (
     _resolve_consensus_ticker,
 )
 from analyzer.models import AnalysisMode, SourceCoverageState
+from analyzer.positions import entry_close
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
 from analyzer.ticker_resolver import TickerResolver
@@ -339,29 +340,21 @@ def eligible_events(
             if set(history.columns) >= {"ticker", "date", "close"}:
                 history["date"] = pd.to_datetime(history["date"])
                 for symbol, frame in history.groupby("ticker"):
-                    closes[str(symbol)] = frame.sort_values("date")
+                    closes[str(symbol)] = frame.sort_values("date").set_index("date")
     except Exception:
         closes = {}
 
     def _congress_entry(symbol: str, day) -> float | None:
+        # Point-in-time: only closes known by the decision date may price
+        # an entry. A future bar must leave the reference unknown, never
+        # fill it in hindsight.
         frame = closes.get(str(symbol))
         if frame is None or frame.empty:
             return None
         try:
-            stamp = pd.Timestamp(day)
+            return entry_close(frame, pd.Timestamp(day).date(), decision_date.date())
         except (TypeError, ValueError):
             return None
-        # Point-in-time: only closes known by the decision date may price
-        # an entry. A future bar must leave the reference unknown, never
-        # fill it in hindsight.
-        known = frame.loc[
-            (frame["date"] >= stamp) & (frame["date"] <= decision_date), "close"
-        ]
-        known = known[known.notna()]
-        if known.empty:
-            return None
-        price = float(known.iloc[0])
-        return price if price > 0 else None
 
     rows = []
     for _, purchase in purchases.iterrows():

@@ -41,7 +41,7 @@ def _is_option_row(row, has_instrument: bool) -> bool:
     return False
 
 
-def _entry_close(
+def entry_close(
     prices: pd.DataFrame, day: date, as_of: date | None = None
 ) -> float | None:
     """First close on or after the transaction date.
@@ -166,7 +166,7 @@ def build_positions(
             continue
 
         if kind in _BUY_TYPES:
-            entry = _entry_close(history, day, as_of)
+            entry = entry_close(history, day, as_of)
             size, by_floor = _size(row)
             if entry is None or size is None:
                 skipped += 1
@@ -185,7 +185,7 @@ def build_positions(
                 lots[key] = []
                 first_buy.setdefault(key, day)
                 continue
-            entry = _entry_close(history, day, as_of)
+            entry = entry_close(history, day, as_of)
             size, _ = _size(row)
             if entry is None or size is None:
                 skipped += 1

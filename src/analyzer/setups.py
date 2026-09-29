@@ -59,36 +59,14 @@ def score(
                 )
                 continue
 
-            references = [
-                float(row["entry_ref"])
-                for row in initiators
-                if not _missing(row["entry_ref"])
-            ]
-            if not references:
-                blocked_rows.append(
-                    {
-                        "ticker": ticker,
-                        "actor_id": actor_id,
-                        "reason": "no entry reference",
-                    }
-                )
-                continue
-            if current is None:
-                blocked_rows.append(
-                    {
-                        "ticker": ticker,
-                        "actor_id": actor_id,
-                        "reason": "no current price",
-                    }
-                )
-                continue
-
             usable = []
+            seen_reference = False
             for row in initiators:
                 if _missing(row["entry_ref"]):
                     continue
+                seen_reference = True
                 entry_ref = float(row["entry_ref"])
-                if current > entry_tol * entry_ref:
+                if current is None or current > entry_tol * entry_ref:
                     continue
 
                 as_of = _as_date(row["as_of"])
@@ -114,11 +92,17 @@ def score(
                 usable.append((decay, reason, entry_ref))
 
             if not usable:
+                if not seen_reference:
+                    reason = "no entry reference"
+                elif current is None:
+                    reason = "no current price"
+                else:
+                    reason = "above entry tolerance"
                 blocked_rows.append(
                     {
                         "ticker": ticker,
                         "actor_id": actor_id,
-                        "reason": "above entry tolerance",
+                        "reason": reason,
                     }
                 )
                 continue

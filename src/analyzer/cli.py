@@ -1562,38 +1562,14 @@ def setups(
         print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
         raise typer.Exit(1) from None
 
-    from importlib import import_module
-
     try:
-        positions = import_module("analyzer.positions")
-        events_pipeline = import_module("analyzer.pipeline")
-        setup_scoring = import_module("analyzer.setups")
-        actors = import_module("analyzer.actors")
+        from analyzer.actors import compute_weight
+        from analyzer.pipeline import eligible_events
+        from analyzer.positions import holdings_candidates
+        from analyzer.setups import score as score_setups
     except ImportError as exc:
-        missing = exc.name or str(exc)
-        print(
-            "Error: setups is unavailable; required v2 component "
-            f"{missing} could not be loaded ({exc})",
-            file=sys.stderr,
-        )
+        print(f"Error: setups is unavailable ({exc})", file=sys.stderr)
         raise typer.Exit(1) from None
-
-    required = (
-        (positions, "holdings_candidates", "analyzer.positions.holdings_candidates"),
-        (events_pipeline, "eligible_events", "analyzer.pipeline.eligible_events"),
-        (setup_scoring, "score", "analyzer.setups.score"),
-        (actors, "compute_weight", "analyzer.actors.compute_weight"),
-    )
-    missing = [
-        name for module, attribute, name in required if not hasattr(module, attribute)
-    ]
-    if missing:
-        print(
-            "Error: setups is unavailable; missing required v2 component(s): "
-            + ", ".join(missing),
-            file=sys.stderr,
-        )
-        raise typer.Exit(1)
 
     try:
         db = Database(Path(data_dir) / "congress.duckdb", read_only=True)
@@ -1605,7 +1581,7 @@ def setups(
     try:
         frames = []
         for selected_member in member:
-            frame = positions.holdings_candidates(
+            frame = holdings_candidates(
                 db,
                 selected_member,
                 as_of_date,
@@ -1613,7 +1589,7 @@ def setups(
             )
             if not frame.empty:
                 frames.append(frame)
-        events = events_pipeline.eligible_events(db, as_of_date)
+        events = eligible_events(db, as_of_date)
         frames = [frame for frame in frames if not frame.empty]
         if not events.empty:
             if requested_tickers:
@@ -1667,10 +1643,10 @@ def setups(
         for row in candidates.itertuples():
             actor_id = str(row.actor_id)
             if actor_id not in weights:
-                weights[actor_id] = actors.compute_weight(
+                weights[actor_id] = compute_weight(
                     str(row.kind), 0, 0.0, str(row.source)
                 )
-        ranked, blocked = setup_scoring.score(candidates, weights, current_prices)
+        ranked, blocked = score_setups(candidates, weights, current_prices)
     except typer.Exit:
         raise
     except Exception as exc:

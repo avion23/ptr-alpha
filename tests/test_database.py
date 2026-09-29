@@ -2702,7 +2702,12 @@ class TestSourceReports(DatabaseTestCase):
             WHERE source = 'senate_efd' AND chamber = 'senate'
             """
         ).fetchall()
-        self.assertEqual(replaced_rows, [("table:000003",)])
+        # Additive refresh: the gen-2 row joins history; a narrow refresh
+        # window must never erase rows outside it.
+        self.assertEqual(
+            {row[0] for row in replaced_rows},
+            {"table:000001", "table:000002", "table:000003"},
+        )
         self.assertTrue(
             self.db.get_source_reports("gen-1", "senate_efd", "senate").empty
         )
@@ -2715,7 +2720,7 @@ class TestSourceReports(DatabaseTestCase):
         current_rows = self.db.get_transactions_by_date_range(
             date(2026, 7, 1), date(2026, 7, 31)
         )
-        self.assertEqual(len(current_rows[current_rows["source"].eq("senate_efd")]), 1)
+        self.assertEqual(len(current_rows[current_rows["source"].eq("senate_efd")]), 3)
         self.assertEqual(
             self.db.conn.execute(
                 """
@@ -2734,7 +2739,7 @@ class TestSourceReports(DatabaseTestCase):
         senate_rows = SenateEFDSource(
             data_dir=self.tmp_dir, db=self.db
         ).get_transactions(2026)
-        self.assertEqual(len(senate_rows), 1)
+        self.assertEqual(len(senate_rows), 3)
         self.assertEqual(set(senate_rows["source"]), {"senate_efd"})
 
     def test_persist_source_refresh_retains_all_zero_transaction_reports(self):

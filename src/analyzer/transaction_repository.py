@@ -430,7 +430,14 @@ class TransactionRepository:
         ingestion_generation: str,
         _in_transaction: bool = False,
     ) -> int:
-        """Replace the active source/chamber state without economic-key merging."""
+        """Merge a source refresh additively without economic-key merging.
+
+        Filings are append-only facts: rows missing by
+        (source, chamber, source_record_id, source_row_id) identity are
+        inserted, existing rows are left untouched, and nothing is ever
+        deleted. A narrow refresh window must never erase history outside
+        it (previously a 12-month Senate fetch wiped 11 years).
+        """
         df = df[SOURCE_TRANSACTION_COLUMNS].copy()
         df["created_at"] = datetime.now()
         df["source"] = source
@@ -441,10 +448,9 @@ class TransactionRepository:
         try:
             if not _in_transaction:
                 self.conn.execute("BEGIN TRANSACTION")
-            self.conn.execute(
-                "DELETE FROM transactions WHERE source = ? AND chamber = ?",
-                [source, chamber],
-            )
+            count_before = self.conn.execute(
+                "SELECT COUNT(*) FROM transactions"
+            ).fetchone()[0]
             self.conn.execute("""
                 INSERT INTO transactions (
                     doc_id, member, member_key, chamber_member_key, ticker,
@@ -473,7 +479,14 @@ class TransactionRepository:
                     ticker_candidate, raw_asset_class,
                     raw_asset_description, raw_owner, ingestion_generation,
                     artifact_sha256
-                FROM staging_source_transactions
+                FROM staging_source_transactions s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM transactions t
+                    WHERE t.source IS NOT DISTINCT FROM s.source
+                      AND t.chamber IS NOT DISTINCT FROM s.chamber
+                      AND t.source_record_id IS NOT DISTINCT FROM s.source_record_id
+                      AND t.source_row_id IS NOT DISTINCT FROM s.source_row_id
+                )
             """)
             if not _in_transaction:
                 self.conn.execute("COMMIT")
@@ -485,7 +498,10 @@ class TransactionRepository:
         finally:
             if succeeded or not _in_transaction:
                 self.conn.execute("DROP TABLE IF EXISTS staging_source_transactions")
-        return len(df)
+        count_after = self.conn.execute(
+            "SELECT COUNT(*) FROM transactions"
+        ).fetchone()[0]
+        return count_after - count_before
 
     def get_for_doc(self, doc_id: str) -> pd.DataFrame:
         result = self.conn.execute(

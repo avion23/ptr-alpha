@@ -96,12 +96,14 @@ def test_future_disclosure_never_reaches_scoring(monkeypatch):
 
 def test_future_prices_are_not_used_for_decision(monkeypatch):
     _install_scoring(monkeypatch, _events())
+    horizon_end = date(2024, 2, 9)
     db = _price_db(
         [
             ("ABC", AS_OF, 100.0),
             ("ABC", date(2024, 1, 11), 110.0),
+            ("ABC", horizon_end, 110.0),
             ("SPY", AS_OF, 400.0),
-            ("SPY", date(2024, 1, 11), 404.0),
+            ("SPY", horizon_end, 404.0),
         ]
     )
 
@@ -110,3 +112,19 @@ def test_future_prices_are_not_used_for_decision(monkeypatch):
     assert result.loc[0, "fwd_return_pct"] == pytest.approx(10.0)
     assert result.loc[0, "spy_return_pct"] == pytest.approx(1.0)
     assert result.loc[0, "excess_pct"] == pytest.approx(9.0)
+
+
+def test_immature_horizon_reports_no_outcome(monkeypatch):
+    _install_scoring(monkeypatch, _events())
+    db = _price_db(
+        [
+            ("ABC", AS_OF, 100.0),
+            ("ABC", date(2024, 1, 11), 110.0),
+            ("SPY", AS_OF, 400.0),
+        ]
+    )
+
+    result = replay_module.replay(db, ["ABC"], [AS_OF], members=[], horizon_days=30)
+
+    assert result.loc[0, "fwd_return_pct"] is None
+    assert result.loc[0, "excess_pct"] is None

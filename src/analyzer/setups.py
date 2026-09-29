@@ -83,7 +83,6 @@ def score(
                 )
                 continue
 
-            initiating_sources = {str(row["source"]) for row in initiators}
             usable = []
             for row in initiators:
                 if _missing(row["entry_ref"]):
@@ -94,22 +93,22 @@ def score(
 
                 as_of = _as_date(row["as_of"])
                 disclosure_date = _as_date(row["disclosure_date"])
-                event_date = _as_date(row["event_date"])
                 if disclosure_date > as_of:
                     raise ValueError("disclosure_date must not be after as_of")
                 days_since_disclosure = (as_of - disclosure_date).days
-                position_evidence = (
-                    str(row["source"]) in initiating_sources
-                    and (as_of - event_date).days > 60
-                )
+                # Position evidence persists at full weight; event-only
+                # evidence decays continuously. No cliff: the flag, not an
+                # age threshold, separates the two.
+                position_evidence = bool(row.get("position_evidence", False))
                 decay = (
                     1.0
                     if position_evidence
                     else 0.5 ** (days_since_disclosure / event_half_life_days)
                 )
                 change = current / entry_ref - 1.0
+                estimated = " (est.)" if str(row.get("kind")) == "congress" else ""
                 reason = (
-                    f"{_actor_name(actor_id)} buy @{entry_ref:.2f}, "
+                    f"{_actor_name(actor_id)} buy @{entry_ref:.2f}{estimated}, "
                     f"now {current:.2f} ({change:+.1%})"
                 )
                 usable.append((decay, reason, entry_ref))

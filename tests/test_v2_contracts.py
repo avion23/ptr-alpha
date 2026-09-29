@@ -15,6 +15,7 @@ EXPECTED_CANDIDATE_COLUMNS = {
     "event_date",
     "disclosure_date",
     "corroboration",
+    "position_evidence",
     "as_of",
 }
 EXPECTED_KINDS = {"congress", "officer", "manager"}
@@ -99,6 +100,7 @@ def _seed(source):
                 "disclosure_date": date(2026, 1, 18),
                 "as_of": AS_OF,
                 "corroboration": False,
+                "position_evidence": True,
                 "transaction_type": "Purchase",
                 "amount_midpoint": 10_000.0,
                 "amount_raw": "$10,000",

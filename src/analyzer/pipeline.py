@@ -290,6 +290,7 @@ def eligible_events(
         "event_date",
         "disclosure_date",
         "corroboration",
+        "position_evidence",
         "as_of",
     ]
     decision_date = pd.Timestamp(as_of).normalize()
@@ -350,11 +351,16 @@ def eligible_events(
             stamp = pd.Timestamp(day)
         except (TypeError, ValueError):
             return None
-        later = frame.loc[frame["date"] >= stamp, "close"]
-        later = later[later.notna()]
-        if later.empty:
+        # Point-in-time: only closes known by the decision date may price
+        # an entry. A future bar must leave the reference unknown, never
+        # fill it in hindsight.
+        known = frame.loc[
+            (frame["date"] >= stamp) & (frame["date"] <= decision_date), "close"
+        ]
+        known = known[known.notna()]
+        if known.empty:
             return None
-        price = float(later.iloc[0])
+        price = float(known.iloc[0])
         return price if price > 0 else None
 
     rows = []
@@ -404,6 +410,7 @@ def eligible_events(
                 "event_date": pd.Timestamp(purchase["transaction_date"]).normalize(),
                 "disclosure_date": pd.Timestamp(purchase["disclosure_date"]).normalize(),
                 "corroboration": source == "13f",
+                "position_evidence": False,
                 "as_of": decision_date,
             }
         )

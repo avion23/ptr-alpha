@@ -31,6 +31,8 @@ def _holdings_db(trades, prices):
         "amount_raw",
         "source",
         "instrument_type",
+        "source_record_id",
+        "amends_source_record_id",
     ]
     trade_frame = pd.DataFrame(
         [
@@ -250,6 +252,63 @@ class TestPositions(unittest.TestCase):
         visible = build_positions(trades, history, as_of=date(2026, 9, 21))
         self.assertEqual(len(visible), 1)
 
+    def test_sale_full_clears_position(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                },
+                {
+                    # Filed amount exceeds implied cost: FIFO alone would
+                    # leave phantom shares; Sale Full must clear regardless.
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale Full",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 100.0,
+                },
+            ]
+        )
+        history = {"T": _prices(["2025-01-10", "2025-06-10"], [100.0, 200.0])}
+        self.assertTrue(
+            build_positions(trades, history, as_of=date(2025, 6, 11)).empty
+        )
+
+    def test_amended_row_supersedes_original(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                    "source_record_id": "r1",
+                    "amends_source_record_id": None,
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 20000.0,
+                    "source_record_id": "r2",
+                    "amends_source_record_id": "r1",
+                },
+            ]
+        )
+        history = {"T": _prices(["2025-01-10", "2025-06-10"], [100.0, 100.0])}
+        positions = build_positions(trades, history, as_of=date(2025, 6, 11))
+        self.assertEqual(len(positions), 1)
+        # Only the amendment's $20k counts, not $30k combined.
+        self.assertAlmostEqual(
+            positions.iloc[0]["total_cost"], 20000.0, places=2
+        )
+
     def test_unpromoted_loader_adds_deduped_raw(self):
         import duckdb
         from types import SimpleNamespace
@@ -261,21 +320,21 @@ class TestPositions(unittest.TestCase):
             "CREATE TABLE canonical_transactions AS SELECT * FROM "
             "(VALUES ('M', 'T', 'Purchase', DATE '2025-01-14', DATE '2025-02-01', "
             "750000.5, '$500,001 - $1,000,000', 'house_pdf', 'g0', 'a0', 'w0', "
-            "'option')) "
+            "'option', NULL)) "
             "AS v(member, ticker, "
             "transaction_type, transaction_date, disclosure_date, amount_midpoint, "
             "amount_raw, source, ingestion_generation, source_record_id, "
-            "source_row_id, instrument_type)"
+            "source_row_id, instrument_type, amends_source_record_id)"
         )
         conn.execute(
             "CREATE TABLE transactions AS SELECT * FROM "
             "(VALUES ('M', 'T', 'Purchase', DATE '2026-01-16', DATE '2026-01-23', "
             "175000.5, '$100,001 - $250,000', 'house_pdf', 'g9', 'a9', 'w9', "
-            "'stock')) "
+            "'stock', NULL)) "
             "AS v(member, ticker, transaction_type, transaction_date, "
             "disclosure_date, amount_midpoint, amount_raw, source, "
             "ingestion_generation, source_record_id, source_row_id, "
-            "instrument_type)"
+            "instrument_type, amends_source_record_id)"
         )
         db = SimpleNamespace(conn=conn)
         canon_only = load_member_trades(db, "M")
@@ -328,6 +387,7 @@ class TestPositions(unittest.TestCase):
                 "event_date",
                 "disclosure_date",
                 "corroboration",
+                "position_evidence",
                 "as_of",
             ],
         )

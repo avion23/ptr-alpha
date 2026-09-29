@@ -50,6 +50,19 @@ _NON_EQUITY_INSTRUMENTS = frozenset(
 )
 _REJECTED_TICKER_ORIGINS = frozenset({"invalid", "missing", "non_equity"})
 _OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd", "form4", "13f"})
+_LEGACY_SCORING_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
+
+
+def _legacy_scoring_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """Legacy consensus scores congressional buyers only.
+
+    Officer and manager rows are visible in display tables and scored by
+    the v2 setups path, but the legacy buyer-count score has no skill
+    model for them: three managers must never score 3.0 here.
+    """
+    if rows.empty or "source" not in rows.columns:
+        return rows
+    return rows.loc[rows["source"].isin(_LEGACY_SCORING_SOURCES)].copy()
 _UNSUPPORTED_ASSET_RE = re.compile(
     r"\b(?:mutual fund|index fund|exchange-traded fund|money market|treasury|"
     r"government securit|corporate bond|municipal bond|real estate|cryptocurrency|"
@@ -80,6 +93,7 @@ def score_ticker_by_buyers(
     ticker_trades = ticker_trades[
         disclosure_dates.notna() & (disclosure_dates <= as_of)
     ].copy()
+    ticker_trades = _legacy_scoring_rows(ticker_trades)
     if ticker_trades.empty:
         return _empty_ticker_result(normalized_ticker)
 
@@ -263,7 +277,7 @@ def _get_consensus_candidate_tickers(
     as_of_date: pd.Timestamp,
 ) -> list[str]:
     """Return decision-time symbols with eligible purchases for scoring."""
-    purchases = _prepare_consensus_purchases(transactions_df)
+    purchases = _legacy_scoring_rows(_prepare_consensus_purchases(transactions_df))
     if purchases.empty:
         return []
 

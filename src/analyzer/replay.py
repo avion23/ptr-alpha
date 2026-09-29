@@ -173,11 +173,25 @@ def _score(
         score_value = float(hit.iloc[0]["score"])
     except (TypeError, ValueError) as exc:
         raise ReplayError("analyzer.setups.score must return a numeric score") from exc
-    return score_value if math.isfinite(score_value) else None, False, len(weights)
+    if not math.isfinite(score_value):
+        return None, True, len(weights)
+    n_actors = len(weights)
+    try:
+        n_actors = int(hit.iloc[0].get("n_actors", n_actors))
+    except (TypeError, ValueError):
+        pass
+    # A zero score is a scored-no-edge verdict, which is blocked, not ranked.
+    return score_value, score_value <= 0, n_actors
 
 
 def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | None:
-    """Return from the last known close to the first in-horizon future close."""
+    """Return from the last known close to the last in-horizon close.
+
+    Incomplete horizons stay unknown: if the price history ends before
+    as_of + horizon, there is no matured outcome to report, not a partial
+    one. This keeps validation honest instead of grading 20-day moves as
+    90-day returns.
+    """
     connection = getattr(db, "conn", db)
     current = connection.execute(
         """
@@ -194,16 +208,19 @@ def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | No
         return None
     outcome = connection.execute(
         """
-        SELECT close FROM prices
+        SELECT date, close FROM prices
         WHERE ticker = ? AND date > ? AND date <= ? AND close IS NOT NULL
         ORDER BY date DESC LIMIT 1
         """,
         [ticker, as_of, as_of + timedelta(days=horizon_days)],
-    ).fetchone()
-    if outcome is None or outcome[0] is None:
+    ).fetchall()
+    if not outcome:
         return None
-    outcome_price = float(outcome[0])
+    outcome_date, outcome_price = outcome[0][0], float(outcome[0][1])
     if not math.isfinite(outcome_price) or outcome_price <= 0:
+        return None
+    horizon_end = as_of + timedelta(days=horizon_days)
+    if pd.Timestamp(outcome_date).date() < horizon_end - timedelta(days=7):
         return None
     result = (outcome_price / current_price - 1) * 100
     return result if math.isfinite(result) else None

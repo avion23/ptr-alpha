@@ -41,8 +41,18 @@ def _is_option_row(row, has_instrument: bool) -> bool:
     return False
 
 
-def _entry_close(prices: pd.DataFrame, day: date) -> float | None:
-    closes = prices.loc[prices.index >= pd.Timestamp(day), "close"]
+def _entry_close(
+    prices: pd.DataFrame, day: date, as_of: date | None = None
+) -> float | None:
+    """First close on or after the transaction date.
+
+    Point-in-time: when as_of is given, closes after it are unknown, so a
+    transaction whose entry bar does not exist yet yields None.
+    """
+    frame = prices
+    if as_of is not None:
+        frame = prices.loc[prices.index <= pd.Timestamp(as_of)]
+    closes = frame.loc[frame.index >= pd.Timestamp(day), "close"]
     closes = closes[closes.notna()]
     if closes.empty:
         return None
@@ -115,6 +125,20 @@ def build_positions(
         return float(floor), True
 
     ordered = trades.sort_values("transaction_date", kind="mergesort")
+    if "amends_source_record_id" in trades.columns:
+        superseded = {
+            str(value)
+            for value in trades["amends_source_record_id"].dropna()
+            if str(value).strip()
+        }
+    else:
+        superseded = set()
+    if superseded and "source_record_id" in trades.columns:
+        mask = trades["source_record_id"].astype("string").isin(superseded)
+        dropped = int(mask.sum())
+        if dropped:
+            logger.info("Dropping %d rows superseded by amendments", dropped)
+            ordered = ordered.loc[~mask].copy()
     for row in ordered.itertuples():
         if pd.isna(row.member) or pd.isna(row.ticker):
             skipped += 1
@@ -142,7 +166,7 @@ def build_positions(
             continue
 
         if kind in _BUY_TYPES:
-            entry = _entry_close(history, day)
+            entry = _entry_close(history, day, as_of)
             size, by_floor = _size(row)
             if entry is None or size is None:
                 skipped += 1
@@ -154,7 +178,14 @@ def build_positions(
                 floor_sized[key] = floor_sized.get(key, 0) + 1
             first_buy.setdefault(key, day)
         elif kind in _SELL_TYPES:
-            entry = _entry_close(history, day)
+            if kind == "sale full":
+                # A full sale closes the position regardless of the filed
+                # dollar amount: estimated-amount FIFO can otherwise leave
+                # phantom residual shares behind.
+                lots[key] = []
+                first_buy.setdefault(key, day)
+                continue
+            entry = _entry_close(history, day, as_of)
             size, _ = _size(row)
             if entry is None or size is None:
                 skipped += 1
@@ -253,6 +284,7 @@ def holdings_candidates(
         "event_date",
         "disclosure_date",
         "corroboration",
+        "position_evidence",
         "as_of",
     ]
     source_kinds = {
@@ -310,6 +342,7 @@ def holdings_candidates(
                     "event_date": position.last_activity,
                     "disclosure_date": position.disclosure_date,
                     "corroboration": False,
+                    "position_evidence": True,
                     "as_of": as_of,
                 }
             )
@@ -342,7 +375,7 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
         """
         SELECT member, ticker, transaction_type, transaction_date,
                disclosure_date, amount_midpoint, amount_raw, source,
-               instrument_type
+               instrument_type, source_record_id, amends_source_record_id
         FROM canonical_transactions
         WHERE member = ?
         """,
@@ -355,7 +388,7 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
         """
         SELECT member, ticker, transaction_type, transaction_date,
                disclosure_date, amount_midpoint, amount_raw, source,
-               instrument_type
+               instrument_type, source_record_id, amends_source_record_id
         FROM (
             SELECT t.*,
                 ROW_NUMBER() OVER (

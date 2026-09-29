@@ -1387,29 +1387,31 @@ def fetch_form4(
     )
     try:
         try:
-            if ticker:
-                if sweep_days:
-                    if not hasattr(src, "fetch_and_save_sweep"):
-                        print(
-                            "Error: Form 4 sweep is unavailable; "
-                            "fetch_and_save_sweep is not implemented",
-                            file=sys.stderr,
-                        )
-                        raise typer.Exit(1)
-                    count = src.fetch_and_save_sweep(ticker, sweep_days)
-                else:
-                    count = src.fetch_and_save_ticker(ticker, year)
+            if sweep_days:
+                if not hasattr(src, "fetch_and_save_sweep"):
+                    print(
+                        "Error: Form 4 sweep is unavailable; "
+                        "fetch_and_save_sweep is not implemented",
+                        file=sys.stderr,
+                    )
+                    raise typer.Exit(1)
+                count = src.fetch_and_save_sweep(sweep_days)
+                print(f"Saved {count} new Form 4 purchase rows from {sweep_days}-day sweep")
+            elif ticker:
+                count = src.fetch_and_save_ticker(ticker, year)
+                print(
+                    f"Saved {count} new Form 4 purchase rows for "
+                    f"{ticker.strip().upper()} ({year})"
+                )
             else:
                 print(
-                    "Error: --ticker is required (universe-wide Form 4 scans "
-                    "are not supported)",
+                    "Error: --ticker is required unless --sweep-days is given",
                     file=sys.stderr,
                 )
                 raise typer.Exit(1)
         except Form4Error as exc:
             print(f"Error: {exc}", file=sys.stderr)
             raise typer.Exit(1) from None
-        print(f"Saved {count} new Form 4 purchase rows for {ticker.strip().upper()} ({year})")
     finally:
         src.close()
 
@@ -1739,14 +1741,16 @@ def fetch_13f(
     try:
         try:
             if all_increases:
-                if not hasattr(src, "fetch_all_increases"):
+                if not hasattr(src, "fetch_all_increases") or not hasattr(
+                    src, "save_increases"
+                ):
                     print(
                         "Error: 13F increase discovery is unavailable; "
-                        "fetch_all_increases is not implemented",
+                        "fetch_all_increases/save_increases is not implemented",
                         file=sys.stderr,
                     )
                     raise typer.Exit(1)
-                count = src.save_to_db(src.fetch_all_increases())
+                count = src.save_increases(src.fetch_all_increases())
             else:
                 count = src.fetch_and_save_all()
         except ThirteenFError as exc:

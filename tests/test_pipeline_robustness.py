@@ -366,6 +366,10 @@ def test_recent_ticker_scoring_filters_rejected_symbols_before_candidate_gate():
 
 
 def test_single_officer_purchase_reaches_scoring_candidate():
+    # Legacy consensus stays congressional-only (its buyer-count score has
+    # no officer skill model): a lone officer purchase must NOT become a
+    # legacy candidate. Officers surface through the v2 setups path, which
+    # eligible_events covers (see the mapping test below).
     as_of = date(2025, 6, 1)
     purchase = pd.DataFrame(
         {
@@ -378,33 +382,18 @@ def test_single_officer_purchase_reaches_scoring_candidate():
             "source": ["form4"],
         }
     )
-    source = MagicMock()
-    source.db.get_transactions_by_date_range.return_value = purchase
-
-    candidates = _get_consensus_candidate_tickers(
-        purchase, min_buyers=1, as_of_date=pd.Timestamp(as_of)
+    assert (
+        _get_consensus_candidate_tickers(
+            purchase, min_buyers=1, as_of_date=pd.Timestamp(as_of)
+        )
+        == []
     )
-    assert candidates == ["AAPL"]
 
-    with (
-        patch(
-            "analyzer.pipeline._get_consensus_candidate_tickers",
-            wraps=_get_consensus_candidate_tickers,
-        ) as discover,
-        patch("analyzer.pipeline.analysis.score_ticker_by_buyers") as score,
-    ):
-        score.return_value = pd.DataFrame(
-            {"ticker": ["AAPL"], "signal_score": [0.0]}
-        )
-        result = run_recent_ticker_scoring(
-            source,
-            TickerScoringParams(year=2025, as_of_date=as_of),
-        )
-
-    assert result.success
-    assert discover.call_args.args[1] == 1
-    score.assert_called_once()
-    assert score.call_args.args[0] == "AAPL"
+    congressional = purchase.copy()
+    congressional["source"] = "house_pdf"
+    assert _get_consensus_candidate_tickers(
+        congressional, min_buyers=1, as_of_date=pd.Timestamp(as_of)
+    ) == ["AAPL"]
 
 
 def test_prepare_live_consensus_data_none_loads_history_outside_default_window():
@@ -476,6 +465,7 @@ def test_eligible_events_maps_official_actor_sources_and_entry_reference():
         "event_date",
         "disclosure_date",
         "corroboration",
+        "position_evidence",
         "as_of",
     ]
     assert events["actor_id"].tolist() == [

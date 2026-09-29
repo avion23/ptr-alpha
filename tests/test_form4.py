@@ -259,6 +259,7 @@ def test_candidates_from_sweep_uses_shared_candidate_schema(burke_form4_xml):
         "event_date",
         "disclosure_date",
         "corroboration",
+        "position_evidence",
         "as_of",
     )
     assert rows["ticker"].tolist() == ["VST", "VST"]

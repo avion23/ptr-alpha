@@ -152,6 +152,7 @@ def test_candidates_from_increases_has_shared_schema_and_corroborates():
         "event_date",
         "disclosure_date",
         "corroboration",
+        "position_evidence",
         "as_of",
     ]
     assert candidates["actor_id"].tolist() == [

@@ -18,6 +18,7 @@ def _row(
     disclosure_date=date(2024, 5, 30),
     corroboration=False,
     source="house",
+    position_evidence=False,
 ):
     return {
         "ticker": ticker,
@@ -28,6 +29,7 @@ def _row(
         "event_date": event_date,
         "disclosure_date": disclosure_date,
         "corroboration": corroboration,
+        "position_evidence": position_evidence,
         "as_of": AS_OF,
     }
 
@@ -35,8 +37,8 @@ def _row(
 def test_two_actors_outscore_one_and_corroboration_is_bounded():
     candidates = pd.DataFrame(
         [
-            _row(actor_id="officer:BURKE CEO", event_date=date(2024, 3, 1)),
-            _row(actor_id="congress:PELOSI", event_date=date(2024, 3, 1)),
+            _row(actor_id="officer:BURKE CEO", event_date=date(2024, 3, 1), position_evidence=True),
+            _row(actor_id="congress:PELOSI", event_date=date(2024, 3, 1), position_evidence=True),
             _row(
                 actor_id="manager:FUND A",
                 corroboration=True,
@@ -51,6 +53,7 @@ def test_two_actors_outscore_one_and_corroboration_is_bounded():
                 ticker="MSFT",
                 actor_id="congress:SMITH",
                 event_date=date(2024, 3, 1),
+                position_evidence=True,
             ),
         ]
     )
@@ -123,6 +126,7 @@ def test_reasons_and_decay_are_deterministic():
                 entry_ref=169.11,
                 event_date=date(2024, 3, 1),
                 disclosure_date=date(2024, 3, 1),
+                position_evidence=True,
             ),
         ]
     )
@@ -134,7 +138,7 @@ def test_reasons_and_decay_are_deterministic():
         first.iloc[0]["reasons"]
         == second.iloc[0]["reasons"]
         == [
-            "PELOSI buy @169.11, now 141.02 (-16.6%)",
+            "PELOSI buy @169.11 (est.), now 141.02 (-16.6%)",
             "BURKE CEO buy @135.00, now 141.02 (+4.5%)",
         ]
     )
@@ -154,3 +158,31 @@ def test_fresh_initiation_decays_from_disclosure_date():
     ranked, _ = score(candidates, {"congress:PELOSI": 1.0}, {"AAPL": 100.0})
 
     assert ranked.iloc[0]["score"] == pytest.approx(0.5 ** (1 / 90))
+
+
+def test_no_decay_cliff_between_day_60_and_61():
+    old = pd.DataFrame([_row(event_date=date(2024, 3, 31), disclosure_date=date(2024, 3, 31))])
+    new = pd.DataFrame([_row(event_date=date(2024, 4, 1), disclosure_date=date(2024, 4, 1))])
+    # as_of 2024-06-01: disclosures 62 vs 61 days old; continuous decay
+    # must not jump the way a 60-day position-evidence switch did.
+    s_old, _ = score(old, {"congress:PELOSI": 1.0}, {"AAPL": 100.0})
+    s_new, _ = score(new, {"congress:PELOSI": 1.0}, {"AAPL": 100.0})
+    assert abs(s_old.iloc[0]["score"] - s_new.iloc[0]["score"]) < 0.05
+
+
+def test_position_evidence_holds_full_weight():
+    row = _row(event_date=date(2023, 1, 1), disclosure_date=date(2023, 1, 5))
+    row["position_evidence"] = True
+    ranked, _ = score(
+        pd.DataFrame([row]), {"congress:PELOSI": 1.0}, {"AAPL": 100.0}
+    )
+    assert ranked.iloc[0]["score"] == pytest.approx(1.0)
+
+
+def test_officer_reference_is_not_labeled_estimate():
+    ranked, _ = score(
+        pd.DataFrame([_row(actor_id="officer:BURKE CEO", source="form4")]),
+        {"officer:BURKE CEO": 1.0},
+        {"AAPL": 100.0},
+    )
+    assert "(est.)" not in ranked.iloc[0]["reasons"][0]

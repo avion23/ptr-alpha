@@ -53,6 +53,8 @@ _INCREASE_COLUMNS = (
     "added_shares",
     "raw_asset_description",
     "source",
+    "accession",
+    "report_url",
 )
 _CANDIDATE_COLUMNS = (
     "ticker",
@@ -63,6 +65,7 @@ _CANDIDATE_COLUMNS = (
     "event_date",
     "disclosure_date",
     "corroboration",
+    "position_evidence",
     "as_of",
 )
 
@@ -353,8 +356,10 @@ class ThirteenFSource(TransactionSource):
         filings = _recent_quarters(self._load_submissions(manager["cik"]))
         previous_filing, current_filing = reversed(filings)
         previous, _ = self._load_filing(manager["cik"], previous_filing)
-        current, _ = self._load_filing(manager["cik"], current_filing)
-        return self._position_increases(key, manager, current_filing, current, previous)
+        current, report_url = self._load_filing(manager["cik"], current_filing)
+        return self._position_increases(
+            key, manager, current_filing, current, previous, report_url
+        )
 
     def _position_increases(
         self,
@@ -363,6 +368,7 @@ class ThirteenFSource(TransactionSource):
         current_filing: dict[str, str],
         current: dict[str, dict[str, object]],
         previous: dict[str, dict[str, object]],
+        report_url: str,
     ) -> list[dict]:
         quarter_end = date.fromisoformat(current_filing["report_date"])
         disclosure_date = date.fromisoformat(current_filing["filing_date"])
@@ -396,6 +402,8 @@ class ThirteenFSource(TransactionSource):
                     "added_shares": added_shares,
                     "raw_asset_description": issuer,
                     "source": "13f",
+                    "accession": current_filing["accession"],
+                    "report_url": report_url,
                 }
             )
         return rows
@@ -537,6 +545,55 @@ class ThirteenFSource(TransactionSource):
     def fetch_and_save_all(self) -> int:
         return self.save_to_db(self.fetch_all_trades())
 
+    def save_increases(self, increases: pd.DataFrame) -> int:
+        """Persist discovery-scope increases as canonical rows.
+
+        Discovery frames carry no dollar amounts (no price lookup at this
+        scope), so amount_midpoint stays NULL and downstream sizing treats
+        these rows as corroboration with unknown size. Ticker may be NULL
+        for unmatched issuers; those rows persist for review.
+        """
+        if not set(_INCREASE_COLUMNS) <= set(increases.columns):
+            raise ThirteenFError(
+                "13F increase frame does not match the discovery schema"
+            )
+        if not self.ingestion_generation or not self.ingestion_generation.strip():
+            raise ThirteenFError("ingestion_generation is required for 13F persistence")
+        rows = []
+        for row in increases.to_dict("records"):
+            added = row.get("added_shares")
+            rows.append(
+                {
+                    "doc_id": f"13f-{row.get('accession')}",
+                    "member": row.get("manager"),
+                    "ticker": row.get("ticker"),
+                    "transaction_date": row.get("event_date"),
+                    "disclosure_date": row.get("disclosure_date"),
+                    "transaction_type": "Purchase",
+                    "owner_code": None,
+                    "amount_raw": f"{added:,} shares"
+                    if added is not None
+                    else None,
+                    "amount_midpoint": None,
+                    "instrument_type": "Common Stock",
+                    "strike_price": None,
+                    "expiry_date": None,
+                    "created_at": None,
+                    "asset_description": row.get("raw_asset_description"),
+                    "source": "13f",
+                    "source_record_id": row.get("accession"),
+                    "source_row_id": row.get("cusip"),
+                    "source_report_path": row.get("report_url"),
+                    "raw_owner": row.get("manager"),
+                    "official_filing_date": row.get("disclosure_date"),
+                    "raw_transaction_subtype": _SHARE_SUBTYPE,
+                    "raw_asset_description": row.get("raw_asset_description"),
+                    "ingestion_generation": self.ingestion_generation,
+                }
+            )
+        canonical = pd.DataFrame(rows, columns=_OUTPUT_COLUMNS)
+        return self.save_to_db(canonical)
+
 
 def candidates_from_increases(df: pd.DataFrame) -> pd.DataFrame:
     candidates = pd.DataFrame(index=df.index)
@@ -549,6 +606,7 @@ def candidates_from_increases(df: pd.DataFrame) -> pd.DataFrame:
     candidates["event_date"] = df["event_date"]
     candidates["disclosure_date"] = df["disclosure_date"]
     candidates["corroboration"] = True
+    candidates["position_evidence"] = False
     candidates["as_of"] = pd.Timestamp.now(tz="UTC").normalize()
     return candidates.loc[:, _CANDIDATE_COLUMNS].reset_index(drop=True)
 

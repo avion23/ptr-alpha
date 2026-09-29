@@ -19,6 +19,8 @@ class TestCliSmoke(unittest.TestCase):
             "backtest",
             "refresh",
             "fetch-senate-efd",
+            "fetch-form4",
+            "fetch-13f",
         ):
             self.assertIn(command, result.output)
 
@@ -31,6 +33,8 @@ class TestCliSmoke(unittest.TestCase):
             "backtest",
             "refresh",
             "fetch-senate-efd",
+            "fetch-form4",
+            "fetch-13f",
         ):
             result = runner.invoke(app, [command, "--help"])
             self.assertEqual(result.exit_code, 0, command)

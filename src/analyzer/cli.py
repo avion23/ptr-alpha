@@ -1342,6 +1342,125 @@ def refresh(
 
 
 @app.command()
+def fetch_form4(
+    ctx: typer.Context,
+    ticker: str | None = typer.Option(
+        None, help="Fetch Form 4 open-market purchases for one ticker (e.g. VST)"
+    ),
+    year: int = typer.Option(
+        date.today().year, help="Filing year to scan for Form 4 purchases"
+    ),
+    data_dir: str = typer.Option(
+        "data", help="Data directory for the canonical database"
+    ),
+):
+    """Fetch SEC Form 4 open-market insider purchases (official source).
+
+    Rows persist in the canonical DuckDB with source='form4'; only Table I
+    transaction-code-P purchases are stored, fail-closed on missing fields.
+    """
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from analyzer.form4 import Form4Error, Form4Source
+
+    if ticker is not None and not ticker.strip():
+        print("Error: --ticker must be non-empty", file=sys.stderr)
+        raise typer.Exit(1)
+    if year < 2000 or year > date.today().year + 1:
+        print("Error: --year is out of plausible range", file=sys.stderr)
+        raise typer.Exit(1)
+
+    ingestion_generation = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid4().hex[:12]
+    )
+    src = Form4Source(
+        data_dir=data_dir,
+        read_only=False,
+        ingestion_generation=ingestion_generation,
+    )
+    try:
+        try:
+            if ticker:
+                count = src.fetch_and_save_ticker(ticker, year)
+            else:
+                print(
+                    "Error: --ticker is required (universe-wide Form 4 scans "
+                    "are not supported)",
+                    file=sys.stderr,
+                )
+                raise typer.Exit(1)
+        except Form4Error as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise typer.Exit(1) from None
+        print(f"Saved {count} new Form 4 purchase rows for {ticker.strip().upper()} ({year})")
+    finally:
+        src.close()
+
+    raise typer.Exit(0)
+
+
+@app.command()
+def fetch_13f(
+    ctx: typer.Context,
+    watchlist: str = typer.Option(
+        "VST:VISTRA",
+        help="Comma-separated TICKER:keyword pairs scoping 13F name matching",
+    ),
+    data_dir: str = typer.Option(
+        "data", help="Data directory for the canonical database"
+    ),
+):
+    """Fetch 13F-HR quarter-over-quarter position increases for watchlist managers.
+
+    Rows persist in the canonical DuckDB with source='13f' and subtype
+    INFERRED_POSITION_INCREASE (13F shows positions, not trades).
+    """
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from analyzer.form13f import ThirteenFError, ThirteenFSource
+
+    parsed: dict[str, set[str]] = {}
+    for item in watchlist.split(","):
+        if ":" not in item:
+            print(
+                f"Error: --watchlist items must be TICKER:keyword, got {item!r}",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        symbol, keyword = item.split(":", 1)
+        if not symbol.strip() or not keyword.strip():
+            print(
+                f"Error: --watchlist items must be TICKER:keyword, got {item!r}",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        parsed.setdefault(symbol.strip().upper(), set()).add(keyword.strip())
+
+    ingestion_generation = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid4().hex[:12]
+    )
+    src = ThirteenFSource(
+        watchlist=parsed,
+        data_dir=data_dir,
+        read_only=False,
+        ingestion_generation=ingestion_generation,
+    )
+    try:
+        try:
+            count = src.fetch_and_save_all()
+        except ThirteenFError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise typer.Exit(1) from None
+        print(f"Saved {count} new 13F position-increase rows ({len(parsed)} tickers)")
+    finally:
+        src.close()
+
+    raise typer.Exit(0)
+
+
+@app.command()
 def fetch_capitol(
     ctx: typer.Context,
     politician: str | None = typer.Option(

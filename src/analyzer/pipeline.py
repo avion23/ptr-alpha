@@ -345,16 +345,19 @@ def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
     purchases = purchases.sort_values(
         ["_member_canonical", "member", "disclosure_date"], kind="mergesort"
     )
-    return (
-        purchases.groupby("_member_canonical", sort=True)
-        .agg(
-            member=("member", "first"),
-            num_purchases=("ticker", "size"),
-            transaction_date=("transaction_date", list),
-            disclosure_date=("disclosure_date", list),
-        )
-        .reset_index(drop=True)
+    grouped = purchases.groupby("_member_canonical", sort=True).agg(
+        member=("member", "first"),
+        num_purchases=("ticker", "size"),
+        transaction_date=("transaction_date", list),
+        disclosure_date=("disclosure_date", list),
     )
+    if "source" in purchases.columns:
+        grouped["sources"] = (
+            purchases.groupby("_member_canonical", sort=True)["source"]
+            .agg(lambda values: sorted({str(value) for value in values}))
+            .values
+        )
+    return grouped.reset_index(drop=True)
 
 
 @pipeline_step

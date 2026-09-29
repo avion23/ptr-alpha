@@ -49,7 +49,7 @@ _NON_EQUITY_INSTRUMENTS = frozenset(
     }
 )
 _REJECTED_TICKER_ORIGINS = frozenset({"invalid", "missing", "non_equity"})
-_OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
+_OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd", "form4", "13f"})
 _UNSUPPORTED_ASSET_RE = re.compile(
     r"\b(?:mutual fund|index fund|exchange-traded fund|money market|treasury|"
     r"government securit|corporate bond|municipal bond|real estate|cryptocurrency|"

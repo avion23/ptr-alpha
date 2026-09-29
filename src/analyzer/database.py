@@ -358,6 +358,7 @@ class Database:
             SELECT t.* FROM transactions t
             WHERE (
                     t.source = 'senate_efd'
+                    OR t.source IN ('form4', '13f')
                     OR (
                     t.source IN ('house_pdf', 'gemini_ocr')
                     AND (

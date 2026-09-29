@@ -24,14 +24,24 @@ logger = logging.getLogger(__name__)
 
 _BUY_TYPES = frozenset({"purchase"})
 _SELL_TYPES = frozenset({"sale", "sale full", "sale partial", "partial sale"})
+_OPTION_MARKERS = frozenset({"option", "call", "put", "stock option"})
 
 
 class PositionsError(Exception):
     """Raised when positions cannot be reconstructed safely."""
 
 
+def _is_option_row(row, has_instrument: bool) -> bool:
+    """Positive option evidence only; NULL/unknown instruments stay equity."""
+    if has_instrument:
+        instrument = row.instrument_type
+        if instrument is not None and not pd.isna(instrument):
+            if str(instrument).strip().lower() in _OPTION_MARKERS:
+                return True
+    return False
+
+
 def _entry_close(prices: pd.DataFrame, day: date) -> float | None:
-    """First close on or after the transaction date."""
     closes = prices.loc[prices.index >= pd.Timestamp(day), "close"]
     closes = closes[closes.notna()]
     if closes.empty:
@@ -74,6 +84,8 @@ def build_positions(
         raise PositionsError(f"trades missing columns: {sorted(missing)}")
     has_midpoint = "amount_midpoint" in trades.columns
     has_raw = "amount_raw" in trades.columns
+    has_instrument = "instrument_type" in trades.columns
+    has_disclosure = "disclosure_date" in trades.columns
     if not has_midpoint and not has_raw:
         raise PositionsError("trades need amount_midpoint or amount_raw for sizing")
 
@@ -82,6 +94,7 @@ def build_positions(
     last_activity: dict[tuple[str, str], date] = {}
     floor_sized: dict[tuple[str, str], int] = {}
     skipped = 0
+    skipped_options = 0
     ignored_exchanges = 0
 
     def _size(row) -> tuple[float | None, bool]:
@@ -109,6 +122,18 @@ def build_positions(
         key = (str(row.member), str(row.ticker))
         day = pd.Timestamp(row.transaction_date).date()
         kind = str(row.transaction_type or "").strip().lower()
+        if _is_option_row(row, has_instrument):
+            skipped_options += 1
+            continue
+        if has_disclosure:
+            disclosed = row.disclosure_date
+            if (
+                disclosed is not None
+                and not pd.isna(disclosed)
+                and pd.Timestamp(disclosed).date() > as_of
+            ):
+                skipped += 1
+                continue
         last_activity[key] = day
 
         history = price_history.get(str(row.ticker))
@@ -176,9 +201,10 @@ def build_positions(
         )
 
     logger.info(
-        "Built %d open positions (%d skipped rows, %d exchanges ignored)",
+        "Built %d open positions (%d skipped rows, %d option rows, %d exchanges ignored)",
         len(records),
         skipped,
+        skipped_options,
         ignored_exchanges,
     )
     columns = [
@@ -217,7 +243,8 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
     canonical = db.conn.execute(
         """
         SELECT member, ticker, transaction_type, transaction_date,
-               disclosure_date, amount_midpoint, amount_raw, source
+               disclosure_date, amount_midpoint, amount_raw, source,
+               instrument_type
         FROM canonical_transactions
         WHERE member = ?
         """,
@@ -229,7 +256,8 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
     raw = db.conn.execute(
         """
         SELECT member, ticker, transaction_type, transaction_date,
-               disclosure_date, amount_midpoint, amount_raw, source
+               disclosure_date, amount_midpoint, amount_raw, source,
+               instrument_type
         FROM (
             SELECT t.*,
                 ROW_NUMBER() OVER (

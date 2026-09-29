@@ -175,6 +175,45 @@ class TestPositions(unittest.TestCase):
             build_positions(trades, history, as_of=date(2026, 1, 17)).empty
         )
 
+    def test_option_rows_never_become_stock(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 14),
+                    "amount_midpoint": 750000.5,
+                    "instrument_type": "option",
+                },
+            ]
+        )
+        history = {"T": _prices(["2025-01-14", "2026-09-21"], [169.11, 140.78])}
+        self.assertTrue(
+            build_positions(trades, history, as_of=date(2026, 9, 21)).empty
+        )
+
+    def test_undisclosed_rows_excluded_as_of(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 1, 16),
+                    "disclosure_date": date(2026, 1, 23),
+                    "amount_midpoint": 175000.5,
+                },
+            ]
+        )
+        history = {"T": _prices(["2026-01-16", "2026-09-21"], [166.14, 140.78])}
+        # As of a date before disclosure, the position must not exist yet.
+        self.assertTrue(
+            build_positions(trades, history, as_of=date(2026, 1, 20)).empty
+        )
+        visible = build_positions(trades, history, as_of=date(2026, 9, 21))
+        self.assertEqual(len(visible), 1)
+
     def test_unpromoted_loader_adds_deduped_raw(self):
         import duckdb
         from types import SimpleNamespace
@@ -185,19 +224,22 @@ class TestPositions(unittest.TestCase):
         conn.execute(
             "CREATE TABLE canonical_transactions AS SELECT * FROM "
             "(VALUES ('M', 'T', 'Purchase', DATE '2025-01-14', DATE '2025-02-01', "
-            "750000.5, '$500,001 - $1,000,000', 'house_pdf', 'g0', 'a0', 'w0')) "
+            "750000.5, '$500,001 - $1,000,000', 'house_pdf', 'g0', 'a0', 'w0', "
+            "'option')) "
             "AS v(member, ticker, "
             "transaction_type, transaction_date, disclosure_date, amount_midpoint, "
             "amount_raw, source, ingestion_generation, source_record_id, "
-            "source_row_id)"
+            "source_row_id, instrument_type)"
         )
         conn.execute(
             "CREATE TABLE transactions AS SELECT * FROM "
             "(VALUES ('M', 'T', 'Purchase', DATE '2026-01-16', DATE '2026-01-23', "
-            "175000.5, '$100,001 - $250,000', 'house_pdf', 'g9', 'a9', 'w9')) "
+            "175000.5, '$100,001 - $250,000', 'house_pdf', 'g9', 'a9', 'w9', "
+            "'stock')) "
             "AS v(member, ticker, transaction_type, transaction_date, "
             "disclosure_date, amount_midpoint, amount_raw, source, "
-            "ingestion_generation, source_record_id, source_row_id)"
+            "ingestion_generation, source_record_id, source_row_id, "
+            "instrument_type)"
         )
         db = SimpleNamespace(conn=conn)
         canon_only = load_member_trades(db, "M")

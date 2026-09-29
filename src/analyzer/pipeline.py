@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer import analysis
+from analyzer.actors import actor_id
 from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataResult, DataSourceError, StepResult
 from analyzer.member_names import canonical_member_key
@@ -365,14 +366,8 @@ def eligible_events(
         name = purchase["member"]
         if not isinstance(name, str):
             continue
-        if kind == "congress":
-            key = canonical_member_key(name)
-        else:
-            # Keep this local normalization aligned with analyzer.actors.actor_id.
-            key = name.strip()
-            key = key.upper()
-            key = " ".join(key.split())
-        if not key:
+        actor = actor_id(kind, name)
+        if actor == f"{kind}:":
             continue
 
         entry_ref = None
@@ -396,7 +391,7 @@ def eligible_events(
         rows.append(
             {
                 "ticker": purchase["_resolved_symbol"],
-                "actor_id": f"{kind}:{key}",
+                "actor_id": actor,
                 "kind": kind,
                 "source": source,
                 "entry_ref": entry_ref,

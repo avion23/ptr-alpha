@@ -6,7 +6,6 @@ import logging
 import math
 import os
 import re
-import time
 import xml.etree.ElementTree as ET
 from datetime import date
 from pathlib import Path
@@ -16,20 +15,21 @@ import pandas as pd
 import requests
 
 from analyzer.database import Database
+from analyzer.form4 import (
+    SEC_ARCHIVES_URL,
+    SEC_SUBMISSIONS_URL,
+    _SECClient,
+    _accession_digits,
+)
 from analyzer.interfaces import TransactionSource
 from analyzer.manager_watchlist import WATCHLIST_MANAGERS
 from analyzer.transaction_repository import _BASE_WRITE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
-SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
-SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data"
 SEC_USER_AGENT = os.environ.get(
     "SEC_USER_AGENT", "InsiderTrading 13F research contact admin@example.com"
 )
-REQUEST_INTERVAL_SECONDS = 1 / 8
-MAX_ATTEMPTS = 5
-RETRY_BASE_SECONDS = 1.0
 
 _OUTPUT_PROVENANCE_COLUMNS = (
     "source_record_id",
@@ -193,6 +193,12 @@ def _recent_quarters(submissions: dict) -> list[dict[str, str]]:
             continue
         if not accession:
             continue
+        try:
+            _accession_digits(accession)
+        except ValueError:
+            raise ThirteenFError(
+                f"SEC submissions filing index has invalid accession: {accession!r}"
+            ) from None
         candidate = {
             "report_date": report_date.isoformat(),
             "filing_date": filing_date.isoformat(),
@@ -282,17 +288,14 @@ class ThirteenFSource(TransactionSource):
             cusip.strip().upper(): ticker.strip()
             for cusip, ticker in (ticker_map or {}).items()
         }
-        self._last_request_at = 0.0
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": SEC_USER_AGENT,
-                "Accept": "application/json, application/xml, text/xml",
-            }
+        self._sec = _SECClient(
+            SEC_USER_AGENT,
+            {"Accept": "application/json, application/xml, text/xml"},
         )
+        self.session = self._sec.session
 
     def close(self) -> None:
-        self.session.close()
+        self._sec.close()
         if self._owns_db:
             self.db.close()
 
@@ -307,55 +310,16 @@ class ThirteenFSource(TransactionSource):
         return self.db.get_transactions(year, source="13f")
 
     def _get(self, url: str) -> requests.Response:
-        for attempt in range(MAX_ATTEMPTS):
-            wait = REQUEST_INTERVAL_SECONDS - (time.monotonic() - self._last_request_at)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_request_at = time.monotonic()
-            try:
-                response = self.session.get(url, timeout=30)
-            except requests.RequestException as exc:
-                if attempt == MAX_ATTEMPTS - 1:
-                    raise ThirteenFError(
-                        f"SEC request failed for {url}: {exc}"
-                    ) from exc
-                time.sleep(RETRY_BASE_SECONDS * (2**attempt))
-                continue
-            if response.status_code == 200:
-                return response
-            if response.status_code in {429, 503}:
-                if attempt == MAX_ATTEMPTS - 1:
-                    raise ThirteenFError(
-                        f"SEC rate/service limit for {url}: HTTP {response.status_code} after retries"
-                    )
-                try:
-                    delay = float(response.headers.get("Retry-After", ""))
-                except ValueError:
-                    delay = RETRY_BASE_SECONDS * (2**attempt)
-                time.sleep(max(delay, 0.0))
-                continue
-            raise ThirteenFError(
-                f"SEC request failed for {url}: HTTP {response.status_code}"
-            )
-        raise ThirteenFError(f"SEC request failed for {url}")
+        return self._sec.get(url, ThirteenFError)
 
     def _load_submissions(self, cik: str) -> dict:
-        url = SEC_SUBMISSIONS_URL.format(cik=str(int(cik)).zfill(10))
-        try:
-            data = self._get(url).json()
-        except (ValueError, requests.JSONDecodeError) as exc:
-            raise ThirteenFError(
-                f"Unparseable SEC submissions index for CIK {cik}"
-            ) from exc
-        if not isinstance(data, dict):
-            raise ThirteenFError(f"Invalid SEC submissions index for CIK {cik}")
-        return data
+        return self._sec.submissions(cik, ThirteenFError)
 
     def _load_filing(
         self, cik: str, filing: dict[str, str]
     ) -> tuple[dict[str, dict[str, object]], str]:
         cik_path = str(int(cik))
-        accession_path = filing["accession"].replace("-", "")
+        accession_path = _accession_digits(filing["accession"])
         directory_url = f"{SEC_ARCHIVES_URL}/{cik_path}/{accession_path}"
         index_url = f"{directory_url}/index.json"
         try:

@@ -43,6 +43,7 @@ from analyzer.parsing.cells import (
     _extract_owner_code,
     _extract_ticker,
 )
+from analyzer.transaction_repository import SOURCE_TRANSACTION_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -94,40 +95,7 @@ _CANONICAL_PTR_PATH_RE = re.compile(
     r"(?P<source_record_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})/$"
 )
-_NORMALIZED_TRANSACTION_COLUMNS = (
-    "doc_id",
-    "chamber",
-    "source_record_id",
-    "source_row_id",
-    "source_report_path",
-    "member",
-    "member_key",
-    "chamber_member_key",
-    "ticker",
-    "raw_ticker",
-    "ticker_candidate",
-    "ticker_origin",
-    "transaction_date",
-    "disclosure_date",
-    "official_filing_date",
-    "available_date",
-    "notification_date",
-    "transaction_type",
-    "raw_transaction_subtype",
-    "owner_code",
-    "raw_owner",
-    "amount_raw",
-    "amount_midpoint",
-    "instrument_type",
-    "raw_asset_class",
-    "strike_price",
-    "expiry_date",
-    "asset_description",
-    "raw_asset_description",
-    "amends_source_record_id",
-    "ingestion_generation",
-    "artifact_sha256",
-)
+_NORMALIZED_TRANSACTION_COLUMNS = tuple(SOURCE_TRANSACTION_COLUMNS)
 _PERSISTED_COLUMN_DERIVATIONS = {
     "report_binding": frozenset(
         {

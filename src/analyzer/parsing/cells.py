@@ -9,6 +9,8 @@ import re
 
 from analyzer.models import TransactionType
 
+_PARENTHETICAL_TICKER = r"\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)"
+
 _TICKER_BLACKLIST = {
     # Transaction type letters accidentally captured
     "P",
@@ -61,7 +63,7 @@ def clean_text(text: str | None) -> str:
 def _extract_ticker(asset_cell: str | None) -> str | None:
     if not asset_cell:
         return None
-    ticker_match = re.search(r"\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)", asset_cell)
+    ticker_match = re.search(_PARENTHETICAL_TICKER, asset_cell)
     if ticker_match:
         candidate = ticker_match.group(1).upper()
         if candidate not in _TICKER_BLACKLIST:

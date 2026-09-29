@@ -23,13 +23,14 @@ from analyzer.transaction_repository import _BASE_WRITE_COLUMNS
 logger = logging.getLogger(__name__)
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data"
 SEC_DAILY_INDEX_URL = "https://www.sec.gov/Archives/edgar/daily-index"
 DEFAULT_USER_AGENT = "ptr-alpha research contact@example.com"
 REQUEST_TIMEOUT = 30
 REQUEST_INTERVAL = 1 / 8
 MAX_RETRIES = 5
+RETRY_BASE_SECONDS = 1.0
 _ACCESSION_RE = re.compile(r"\d{10}-\d{2}-\d{6}\Z")
 _XML_BLOCK_RE = re.compile(rb"<XML>\s*(.*?)\s*</XML>", re.IGNORECASE | re.DOTALL)
 _POSITIVE_10B5_RE = re.compile(
@@ -71,6 +72,84 @@ _SWEEP_CANDIDATE_COLUMNS = (
 
 class Form4Error(Exception):
     """Raised when SEC Form 4 data is unavailable or fails validation."""
+
+
+def _accession_digits(accession):
+    accession = str(accession)
+    if not _ACCESSION_RE.fullmatch(accession):
+        raise ValueError(f"Invalid SEC accession: {accession!r}")
+    return accession.replace("-", "")
+
+
+class _SECClient:
+    def __init__(self, user_agent, headers):
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": user_agent, **headers})
+        self._last_request_at = 0.0
+
+    def close(self):
+        self.session.close()
+
+    def get(self, url, error_type):
+        for attempt in range(MAX_RETRIES):
+            delay = REQUEST_INTERVAL - (time.monotonic() - self._last_request_at)
+            if delay > 0:
+                time.sleep(delay)
+            self._last_request_at = time.monotonic()
+            try:
+                response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+            except requests.RequestException as exc:
+                if attempt + 1 == MAX_RETRIES:
+                    raise error_type(f"SEC request failed for {url}: {exc}") from exc
+                time.sleep(RETRY_BASE_SECONDS * (2**attempt))
+                continue
+            if response.status_code in (429, 503):
+                if attempt + 1 == MAX_RETRIES:
+                    raise error_type(
+                        f"SEC rate-limited {url} with HTTP {response.status_code} "
+                        f"after {MAX_RETRIES} attempts"
+                    )
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    backoff = (
+                        float(retry_after)
+                        if retry_after
+                        else RETRY_BASE_SECONDS * (2**attempt)
+                    )
+                except ValueError:
+                    backoff = RETRY_BASE_SECONDS * (2**attempt)
+                logger.warning(
+                    "SEC HTTP %s for %s; retrying in %.1fs",
+                    response.status_code,
+                    url,
+                    backoff,
+                )
+                time.sleep(max(backoff, 0))
+                continue
+            if response.status_code != 200:
+                raise error_type(
+                    f"SEC returned HTTP {response.status_code} for {url}"
+                )
+            final = urlsplit(response.url)
+            expected = urlsplit(url)
+            if final.scheme != "https" or final.hostname != expected.hostname:
+                raise error_type(
+                    f"SEC request redirected outside the official host: {url}"
+                )
+            return response
+        raise error_type(f"SEC retry limit reached for {url}")
+
+    def submissions(self, cik, error_type):
+        url = SEC_SUBMISSIONS_URL.format(cik=str(int(cik)).zfill(10))
+        try:
+            data = self.get(url, error_type).json()
+        except (ValueError, requests.RequestException) as exc:
+            raise error_type(
+                f"SEC submissions index for CIK {cik} is invalid"
+            ) from exc
+        if not isinstance(data, dict):
+            raise error_type(f"SEC submissions index for CIK {cik} is not an object")
+        return data
 
 
 def _local_name(tag: str) -> str:
@@ -320,19 +399,16 @@ class Form4Source(TransactionSource):
             if db is not None
             else Database(self.data_dir / "congress.duckdb", read_only=read_only)
         )
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": os.environ.get("SEC_USER_AGENT") or DEFAULT_USER_AGENT,
-                "Accept-Encoding": "gzip, deflate",
-            }
+        self._sec = _SECClient(
+            os.environ.get("SEC_USER_AGENT") or DEFAULT_USER_AGENT,
+            {"Accept-Encoding": "gzip, deflate"},
         )
+        self.session = self._sec.session
         self.ingestion_generation = ingestion_generation
-        self._last_request_at = 0.0
         self._ticker_map: dict[str, int] | None = None
 
     def close(self) -> None:
-        self.session.close()
+        self._sec.close()
         if self._owns_db:
             self.db.close()
 
@@ -347,42 +423,7 @@ class Form4Source(TransactionSource):
         return self.db.get_transactions(year, source="form4")
 
     def _request(self, url: str) -> requests.Response:
-        for attempt in range(MAX_RETRIES):
-            delay = REQUEST_INTERVAL - (time.monotonic() - self._last_request_at)
-            if delay > 0:
-                time.sleep(delay)
-            try:
-                response = self.session.get(url, timeout=REQUEST_TIMEOUT)
-            except requests.RequestException as exc:
-                raise Form4Error(f"SEC request failed for {url}: {exc}") from exc
-            self._last_request_at = time.monotonic()
-            if response.status_code in (429, 503):
-                if attempt + 1 == MAX_RETRIES:
-                    raise Form4Error(
-                        f"SEC rate-limited {url} with HTTP {response.status_code} "
-                        f"after {MAX_RETRIES} attempts"
-                    )
-                retry_after = response.headers.get("Retry-After")
-                try:
-                    backoff = float(retry_after) if retry_after else 2**attempt
-                except ValueError:
-                    backoff = 2**attempt
-                logger.warning(
-                    "SEC HTTP %s for %s; retrying in %.1fs",
-                    response.status_code,
-                    url,
-                    backoff,
-                )
-                time.sleep(max(0, backoff))
-                continue
-            if response.status_code != 200:
-                raise Form4Error(f"SEC returned HTTP {response.status_code} for {url}")
-            final = urlsplit(response.url)
-            expected = urlsplit(url)
-            if final.scheme != "https" or final.hostname != expected.hostname:
-                raise Form4Error(f"SEC request redirected outside the official host: {url}")
-            return response
-        raise Form4Error(f"SEC retry limit reached for {url}")
+        return self._sec.get(url, Form4Error)
 
     def _load_ticker_map(self) -> dict[str, int]:
         if self._ticker_map is not None:
@@ -411,11 +452,7 @@ class Form4Source(TransactionSource):
         return tickers
 
     def _submissions(self, cik: int) -> list[dict]:
-        url = SEC_SUBMISSIONS_URL.format(cik=cik)
-        try:
-            data = self._request(url).json()
-        except ValueError as exc:
-            raise Form4Error(f"SEC submissions index for CIK {cik} is invalid") from exc
+        data = self._sec.submissions(cik, Form4Error)
         try:
             recent = data["filings"]["recent"]
             columns = (
@@ -434,7 +471,9 @@ class Form4Source(TransactionSource):
         for accession, form, filed, document in records:
             if form not in {"4", "4/A"}:
                 continue
-            if not _ACCESSION_RE.fullmatch(str(accession)):
+            try:
+                _accession_digits(accession)
+            except ValueError:
                 raise Form4Error(f"SEC returned invalid Form 4 accession: {accession!r}")
             try:
                 filing_date = date.fromisoformat(str(filed))
@@ -600,7 +639,7 @@ class Form4Source(TransactionSource):
 
     @staticmethod
     def _archive_url(cik: int, filing: dict) -> str:
-        accession_no_dashes = filing["accession"].replace("-", "")
+        accession_no_dashes = _accession_digits(filing["accession"])
         document = quote(filing["ownership_document"], safe="._-")
         return f"{SEC_ARCHIVES_URL}/{cik}/{accession_no_dashes}/{document}"
 

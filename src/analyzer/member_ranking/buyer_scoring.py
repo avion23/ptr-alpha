@@ -112,7 +112,6 @@ def score_ticker_by_buyers(
         normalized_ticker,
         buyers,
         ticker_trades,
-        as_of_date=as_of,
     )
 
 
@@ -417,28 +416,11 @@ def _consensus_result(
     ticker: str,
     buyers: list[str],
     ticker_trades: pd.DataFrame,
-    *,
-    as_of_date: pd.Timestamp,
 ) -> pd.DataFrame:
     """Build the identity-free distinct-buyer production result."""
-    with_disclosures = ticker_trades.copy()
-    with_disclosures["_disclosure"] = pd.to_datetime(
-        with_disclosures["disclosure_date"], errors="coerce"
-    )
-    disclosures = (
-        with_disclosures.groupby("_member_canonical")["_disclosure"]
-        .max()
-        .reindex(buyers)
-    )
-    days_since = (as_of_date - disclosures).dt.days
-    if days_since.isna().any() or (days_since < 0).any():
-        raise AnalysisError("Consensus disclosures must be known on or before as_of_date")
-
     transaction_dates = pd.to_datetime(ticker_trades["transaction_date"], errors="coerce")
     row_disclosures = pd.to_datetime(ticker_trades["disclosure_date"], errors="coerce")
     disclosure_lag_days = (row_disclosures - transaction_dates).dt.days
-    if disclosure_lag_days.isna().any() or (disclosure_lag_days < 0).any():
-        raise AnalysisError("Consensus purchases require valid public chronology")
 
     score = float(len(buyers))
     return pd.DataFrame(

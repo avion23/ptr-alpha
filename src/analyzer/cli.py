@@ -6,9 +6,10 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 import pandas as pd
 import typer
@@ -51,6 +52,30 @@ _BACKTEST_DEFAULTS = {
 }
 
 
+def _cli_exit(exit_code=0, message=None):
+    if message is not None:
+        print(message, file=sys.stderr)
+    raise typer.Exit(exit_code) from None
+
+
+def _parse_cli_date(value, error_message, default=None):
+    if value is None:
+        return default
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        _cli_exit(1, error_message)
+
+
+def _open_database(data_dir, read_only):
+    return Database(Path(data_dir) / "congress.duckdb", read_only=read_only)
+
+
+def _new_ingestion_generation():
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    return f"{timestamp}-{uuid4().hex[:12]}"
+
+
 @dataclass
 class AppContext:
     settings: Settings
@@ -78,9 +103,7 @@ def get_context(ctx, data_dir=None, read_only=False):
             settings.data.data_dir = data_dir
         # Share a single DuckDB connection across both data sources to avoid
         # two independent Database instances pointing at the same file.
-        shared_db = Database(
-            Path(settings.data.data_dir) / "congress.duckdb", read_only=read_only
-        )
+        shared_db = _open_database(settings.data.data_dir, read_only)
         ctx.obj = AppContext(
             settings=settings,
             transaction_source=HouseTransactionSource(
@@ -160,11 +183,9 @@ def _validate_mode(mode: str, member: str | None, ticker: str | None) -> None:
     """Validate mode/member/ticker combinations. Exits on error."""
     valid_modes = {"ranks", "signals", "member", "tickers"}
     if mode not in valid_modes:
-        print(f"Error: --mode must be one of {sorted(valid_modes)}", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, f"Error: --mode must be one of {sorted(valid_modes)}")
     if mode == "member" and member is None and ticker is None:
-        print("Error: --mode member requires --member NAME", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: --mode member requires --member NAME")
 
 
 def _validate_positive_options(**options: int | float) -> None:
@@ -172,14 +193,12 @@ def _validate_positive_options(**options: int | float) -> None:
     for name, value in options.items():
         if value <= 0:
             option = name.replace("_", "-")
-            print(f"Error: --{option} must be greater than zero", file=sys.stderr)
-            raise typer.Exit(1)
+            _cli_exit(1, f"Error: --{option} must be greater than zero")
 
 
 def _validate_output(output: str) -> None:
     if output not in {"console", "csv"}:
-        print("Error: --output must be one of ['console', 'csv']", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: --output must be one of ['console', 'csv']")
 
 
 def _warn_live_ticker_coverage(app_ctx: AppContext, days_back: int) -> None:
@@ -237,13 +256,10 @@ def health(
     window, which should trigger a refresh/investigation in operations.
     """
     if window_days < 1:
-        print("Error: --window-days must be greater than zero", file=sys.stderr)
-        raise typer.Exit(1)
-    try:
-        cutoff = date.fromisoformat(as_of) if as_of else date.today()
-    except ValueError:
-        print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
-        raise typer.Exit(1) from None
+        _cli_exit(1, "Error: --window-days must be greater than zero")
+    cutoff = _parse_cli_date(
+        as_of or None, "Error: --as-of must use YYYY-MM-DD", date.today()
+    )
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
     try:
@@ -253,15 +269,14 @@ def health(
             window_days,
         )
     except Exception as exc:
-        print(
+        _cli_exit(
+            1,
             f"Error: source freshness metric failed: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
         )
-        raise typer.Exit(1) from None
 
     print(metrics.to_string(index=False))
     healthy = bool((metrics["coverage_state"] == "in_window").all())
-    raise typer.Exit(0 if healthy else 1)
+    _cli_exit(0 if healthy else 1)
 
 
 def _consensus_score_display(score: pd.DataFrame) -> pd.DataFrame:
@@ -296,12 +311,11 @@ def _run_ticker_mode(
             file=sys.stderr,
         )
     if output == "csv":
-        print(
+        _cli_exit(
+            1,
             "Error: --output csv is not supported for --ticker analysis; "
             "use --output console.",
-            file=sys.stderr,
         )
-        raise typer.Exit(1)
     params = TickerAnalysisParams(
         ticker=ticker,
         year=year,
@@ -318,7 +332,7 @@ def _run_ticker_mode(
         score = result.data["score"]["signal_score"].iloc[0]
         verdict = "BUY CANDIDATE" if score > 0 else "NO BUY"
         print(f"\nRecommendation: {verdict} (score {score:.2f})")
-    raise typer.Exit(0 if result.success else 1)
+    _cli_exit(0 if result.success else 1)
 
 
 def _run_tickers_mode(
@@ -332,12 +346,11 @@ def _run_tickers_mode(
 ) -> None:
     """Handle --mode tickers."""
     if output == "csv":
-        print(
+        _cli_exit(
+            1,
             "Error: --output csv is not supported for --mode tickers; "
             "use --output console.",
-            file=sys.stderr,
         )
-        raise typer.Exit(1)
     params = TickerScoringParams(
         year=year,
         days_back=days_back,
@@ -355,7 +368,7 @@ def _run_tickers_mode(
             print(_consensus_score_display(data["result"]).to_string(index=False))
         else:
             print(f"\nNo positive buy candidates as of {data['as_of_date']}.")
-    raise typer.Exit(0 if result.success else 1)
+    _cli_exit(0 if result.success else 1)
 
 
 def _run_analysis_mode(
@@ -403,7 +416,7 @@ def _run_analysis_mode(
         ):
             print("\n=== Sector Analysis ===")
             print(result.data["sector_results"].to_string(index=False))
-    raise typer.Exit(0 if result.success else 1)
+    _cli_exit(0 if result.success else 1)
 
 
 @app.command()
@@ -451,29 +464,24 @@ def analyze(
     _validate_mode(mode, member, ticker)
     _validate_positive_options(year=year, top_n=top_n)
     if not horizons or any(horizon <= 0 for horizon in horizons):
-        print("Error: --horizons values must be greater than zero", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: --horizons values must be greater than zero")
     if len(horizons) > 1:
-        print(
+        _cli_exit(
+            1,
             "Error: --horizons accepts a single value; ranks/signals/member "
             f"rank on one horizon only (got {len(horizons)}: {sorted(horizons)}). "
             "Run once per horizon.",
-            file=sys.stderr,
         )
-        raise typer.Exit(1)
     _validate_output(output)
     if output == "csv" and (ticker is not None or mode == "tickers"):
-        print(
+        _cli_exit(
+            1,
             "Error: --output csv is not supported for --ticker/--mode tickers; "
             "use --output console",
-            file=sys.stderr,
         )
-        raise typer.Exit(1)
-    try:
-        as_of_date = date.fromisoformat(as_of) if as_of else None
-    except ValueError:
-        print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
-        raise typer.Exit(1) from None
+    as_of_date = _parse_cli_date(
+        as_of or None, "Error: --as-of must use YYYY-MM-DD"
+    )
     app_ctx = get_context(ctx, data_dir, read_only=True)
     if (
         as_of_date is None
@@ -547,10 +555,9 @@ def fetch(
         )
     except Exception as exc:
         logger.error("House archive %d fetch failed: %s", year, exc)
-        print(f"House fetch incomplete: {exc}", file=sys.stderr)
-        raise typer.Exit(1) from None
+        _cli_exit(1, f"House fetch incomplete: {exc}")
     _print_house_fetch_summary(summary)
-    raise typer.Exit(0)
+    _cli_exit(0)
 
 
 def _activate_house_generation(transaction_source, year: int) -> None:
@@ -715,7 +722,7 @@ def parse(
         logger.warning(
             "Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted
         )
-    raise typer.Exit(0 if parse_success else 1)
+    _cli_exit(0 if parse_success else 1)
 
 
 @app.command()
@@ -744,16 +751,7 @@ def backtest(
     Uses only disclosures public at each as-of date and enters on the next
     NYSE session. The declared --horizon is the evaluation holding horizon.
     """
-    try:
-        start_date = date.fromisoformat(start)
-        end_date = date.fromisoformat(end)
-    except ValueError:
-        print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1) from None
-
-    if end_date < start_date:
-        print("Error: --end must be on or after --start", file=sys.stderr)
-        raise typer.Exit(1)
+    start_date, end_date = _parse_cli_date_range(start, end)
 
     _validate_positive_options(
         horizon=horizon,
@@ -841,7 +839,7 @@ def backtest(
             )
         else:
             print("\n=== No backtest results produced ===")
-    raise typer.Exit(0 if result.success else 1)
+    _cli_exit(0 if result.success else 1)
 
 
 @app.command()
@@ -872,7 +870,7 @@ def portfolio(
     Unlike the backtest command which evaluates each recommendation independently,
     this simulates one shared cash account across overlapping holding periods.
     """
-    start_date, end_date = _parse_sim_dates(start, end)
+    start_date, end_date = _parse_cli_date_range(start, end)
 
     _validate_positive_options(
         top_n=top_n,
@@ -886,8 +884,7 @@ def portfolio(
         ("exit-slippage-bps", exit_slippage_bps),
     ):
         if not 0 <= value < 10_000:
-            print(f"Error: --{name} must be in [0, 10000)", file=sys.stderr)
-            raise typer.Exit(1)
+            _cli_exit(1, f"Error: --{name} must be in [0, 10000)")
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
@@ -900,8 +897,7 @@ def portfolio(
         tx_start, end_date
     )
     if all_transactions.empty:
-        print("Error: no transactions found for portfolio simulation", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: no transactions found for portfolio simulation")
 
     prices, recommendations = _load_portfolio_inputs(
         app_ctx,
@@ -936,18 +932,13 @@ def portfolio(
         _print_closed_positions(sim.closed_positions)
 
 
-def _parse_sim_dates(start: str, end: str) -> tuple[date, date]:
-    """Parse YYYY-MM-DD CLI date inputs and validate end >= start."""
-    try:
-        start_date = date.fromisoformat(start)
-        end_date = date.fromisoformat(end)
-    except ValueError:
-        print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1) from None
+def _parse_cli_date_range(start, end):
+    """Parse optional YYYY-MM-DD inputs and validate end >= start."""
+    start_date = _parse_cli_date(start, "Error: dates must be in YYYY-MM-DD format")
+    end_date = _parse_cli_date(end, "Error: dates must be in YYYY-MM-DD format")
 
-    if end_date < start_date:
-        print("Error: --end must be on or after --start", file=sys.stderr)
-        raise typer.Exit(1)
+    if start_date is not None and end_date is not None and end_date < start_date:
+        _cli_exit(1, "Error: --end must be on or after --start")
 
     return start_date, end_date
 
@@ -970,8 +961,7 @@ def _load_portfolio_inputs(
         all_tickers, start_date, end_date
     )
     if prices.empty:
-        print("Error: no price data available", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: no price data available")
 
     as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency_days}D")
     all_recs = []
@@ -991,8 +981,7 @@ def _load_portfolio_inputs(
         all_recs.append(recs)
 
     if not all_recs:
-        print("No recommendations produced for any backtest date", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "No recommendations produced for any backtest date")
 
     recommendations = pd.concat(all_recs, ignore_index=True)
     print(
@@ -1087,7 +1076,7 @@ def snapshot(
 
     if not all_tickers:
         print("No price data found in database")
-        raise typer.Exit(1)
+        _cli_exit(1)
 
     date_range = db.conn.execute("SELECT MIN(date), MAX(date) FROM prices").fetchone()
     start_date = date_range[0]
@@ -1109,7 +1098,7 @@ def snapshot(
     print(f"  Price rows:     {snap.price_rows}")
     print(f"  Date range:     {snap.first_date} to {snap.last_date}")
     print(f"  Saved to:       {output}")
-    raise typer.Exit(0)
+    _cli_exit(0)
 
 
 @app.command()
@@ -1198,7 +1187,7 @@ def refresh(
         logger.warning("House PDF fetch failed: %s", exc)
         print(f"House fetch incomplete: {exc}")
         print("FAILED steps: fetch")
-        raise typer.Exit(1) from None
+        _cli_exit(1)
 
     print(
         "  House totals: "
@@ -1337,8 +1326,8 @@ def refresh(
         )
     if failed_steps:
         print(f"FAILED steps: {', '.join(failed_steps)}")
-        raise typer.Exit(1)
-    raise typer.Exit(0)
+        _cli_exit(1)
+    _cli_exit(0)
 
 
 @app.command()
@@ -1362,24 +1351,16 @@ def fetch_form4(
     Rows persist in the canonical DuckDB with source='form4'; only Table I
     transaction-code-P purchases are stored, fail-closed on missing fields.
     """
-    from datetime import datetime, timezone
-    from uuid import uuid4
-
     from analyzer.form4 import Form4Error, Form4Source
 
     if ticker is not None and not ticker.strip():
-        print("Error: --ticker must be non-empty", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: --ticker must be non-empty")
     if year < 2000 or year > date.today().year + 1:
-        print("Error: --year is out of plausible range", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: --year is out of plausible range")
     if sweep_days < 0:
-        print("Error: --sweep-days must be non-negative", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: --sweep-days must be non-negative")
 
-    ingestion_generation = (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid4().hex[:12]
-    )
+    ingestion_generation = _new_ingestion_generation()
     src = Form4Source(
         data_dir=data_dir,
         read_only=False,
@@ -1389,12 +1370,11 @@ def fetch_form4(
         try:
             if sweep_days:
                 if not hasattr(src, "fetch_and_save_sweep"):
-                    print(
+                    _cli_exit(
+                        1,
                         "Error: Form 4 sweep is unavailable; "
                         "fetch_and_save_sweep is not implemented",
-                        file=sys.stderr,
                     )
-                    raise typer.Exit(1)
                 count = src.fetch_and_save_sweep(sweep_days)
                 print(f"Saved {count} new Form 4 purchase rows from {sweep_days}-day sweep")
             elif ticker:
@@ -1404,18 +1384,16 @@ def fetch_form4(
                     f"{ticker.strip().upper()} ({year})"
                 )
             else:
-                print(
+                _cli_exit(
+                    1,
                     "Error: --ticker is required unless --sweep-days is given",
-                    file=sys.stderr,
                 )
-                raise typer.Exit(1)
         except Form4Error as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            raise typer.Exit(1) from None
+            _cli_exit(1, f"Error: {exc}")
     finally:
         src.close()
 
-    raise typer.Exit(0)
+    _cli_exit(0)
 
 
 @app.command()
@@ -1446,7 +1424,6 @@ def follow_member(
     shares, sells relieve FIFO) and flags positions trading below the
     member's cost — the follow-through that closed-window scoring misses.
     """
-    from analyzer.database import Database
     from analyzer.positions import (
         PositionsError,
         build_positions,
@@ -1455,27 +1432,22 @@ def follow_member(
         load_price_history,
     )
 
-    try:
-        as_of_date = date.fromisoformat(as_of) if as_of else date.today()
-    except ValueError:
-        print("Error: --as-of must be YYYY-MM-DD", file=sys.stderr)
-        raise typer.Exit(1) from None
+    as_of_date = _parse_cli_date(
+        as_of or None, "Error: --as-of must be YYYY-MM-DD", date.today()
+    )
     if discount_pct < 0:
-        print("Error: --discount-pct must be non-negative", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: --discount-pct must be non-negative")
     if not member:
-        print("Error: provide at least one --member", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: provide at least one --member")
 
-    db = Database(Path(data_dir) / "congress.duckdb", read_only=True)
+    db = _open_database(data_dir, read_only=True)
     try:
         try:
             trades = load_member_trades(
                 db, member, include_unpromoted=include_unpromoted
             )
         except Exception as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            raise typer.Exit(1) from None
+            _cli_exit(1, f"Error: {exc}")
         if include_unpromoted:
             print(
                 "Warning: unpromoted rows are unvalidated and approximate; "
@@ -1484,15 +1456,14 @@ def follow_member(
             )
         if trades.empty:
             print(f"No canonical transactions for {member!r}")
-            raise typer.Exit(0)
+            _cli_exit(0)
         histories = {}
         for ticker in trades["ticker"].dropna().unique():
             histories[str(ticker)] = load_price_history(db, str(ticker))
         try:
             positions = build_positions(trades, histories, as_of=as_of_date)
         except PositionsError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            raise typer.Exit(1) from None
+            _cli_exit(1, f"Error: {exc}")
     finally:
         db.close()
 
@@ -1531,7 +1502,7 @@ def follow_member(
                     f"${row.current_price:.2f} ({row.discount_pct:.1f}%)"
                 )
 
-    raise typer.Exit(0)
+    _cli_exit(0)
 
 
 @app.command()
@@ -1556,11 +1527,9 @@ def setups(
     (n_matured=0 v1 wiring). Fair region is enforced per actor inside
     scoring: current <= 1.05 x that actor's entry reference.
     """
-    try:
-        as_of_date = date.fromisoformat(as_of) if as_of else date.today()
-    except ValueError:
-        print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
-        raise typer.Exit(1) from None
+    as_of_date = _parse_cli_date(
+        as_of or None, "Error: --as-of must use YYYY-MM-DD", date.today()
+    )
 
     try:
         from analyzer.actors import compute_weight
@@ -1568,14 +1537,12 @@ def setups(
         from analyzer.positions import holdings_candidates
         from analyzer.setups import score as score_setups
     except ImportError as exc:
-        print(f"Error: setups is unavailable ({exc})", file=sys.stderr)
-        raise typer.Exit(1) from None
+        _cli_exit(1, f"Error: setups is unavailable ({exc})")
 
     try:
-        db = Database(Path(data_dir) / "congress.duckdb", read_only=True)
+        db = _open_database(data_dir, read_only=True)
     except Exception as exc:
-        print(f"Error: could not open read-only database: {exc}", file=sys.stderr)
-        raise typer.Exit(1) from None
+        _cli_exit(1, f"Error: could not open read-only database: {exc}")
 
     requested_tickers = {symbol.strip().upper() for symbol in ticker}
     try:
@@ -1614,7 +1581,7 @@ def setups(
                 frames.append(events)
         if not frames:
             print("No candidates.")
-            raise typer.Exit(0)
+            _cli_exit(0)
         candidates = pd.concat(frames, ignore_index=True)
         if requested_tickers:
             candidates = candidates.loc[
@@ -1624,7 +1591,7 @@ def setups(
             ].copy()
         if candidates.empty:
             print("No candidates.")
-            raise typer.Exit(0)
+            _cli_exit(0)
 
         symbols = sorted(
             {str(value).strip().upper() for value in candidates["ticker"].dropna()}
@@ -1650,8 +1617,7 @@ def setups(
     except typer.Exit:
         raise
     except Exception as exc:
-        print(f"Error: setup ranking failed: {exc}", file=sys.stderr)
-        raise typer.Exit(1) from None
+        _cli_exit(1, f"Error: setup ranking failed: {exc}")
     finally:
         db.close()
 
@@ -1659,7 +1625,7 @@ def setups(
     print(ranked.to_string(index=False) if not ranked.empty else "None.")
     print("\n=== Blocked ===")
     print(blocked.to_string(index=False) if not blocked.empty else "None.")
-    raise typer.Exit(0)
+    _cli_exit(0)
 
 
 @app.command()
@@ -1683,31 +1649,24 @@ def fetch_13f(
     Rows persist in the canonical DuckDB with source='13f' and subtype
     INFERRED_POSITION_INCREASE (13F shows positions, not trades).
     """
-    from datetime import datetime, timezone
-    from uuid import uuid4
-
     from analyzer.form13f import ThirteenFError, ThirteenFSource
 
     parsed: dict[str, set[str]] = {}
     for item in watchlist.split(","):
         if ":" not in item:
-            print(
+            _cli_exit(
+                1,
                 f"Error: --watchlist items must be TICKER:keyword, got {item!r}",
-                file=sys.stderr,
             )
-            raise typer.Exit(1)
         symbol, keyword = item.split(":", 1)
         if not symbol.strip() or not keyword.strip():
-            print(
+            _cli_exit(
+                1,
                 f"Error: --watchlist items must be TICKER:keyword, got {item!r}",
-                file=sys.stderr,
             )
-            raise typer.Exit(1)
         parsed.setdefault(symbol.strip().upper(), set()).add(keyword.strip())
 
-    ingestion_generation = (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid4().hex[:12]
-    )
+    ingestion_generation = _new_ingestion_generation()
     src = ThirteenFSource(
         watchlist=parsed,
         data_dir=data_dir,
@@ -1720,23 +1679,21 @@ def fetch_13f(
                 if not hasattr(src, "fetch_all_increases") or not hasattr(
                     src, "save_increases"
                 ):
-                    print(
+                    _cli_exit(
+                        1,
                         "Error: 13F increase discovery is unavailable; "
                         "fetch_all_increases/save_increases is not implemented",
-                        file=sys.stderr,
                     )
-                    raise typer.Exit(1)
                 count = src.save_increases(src.fetch_all_increases())
             else:
                 count = src.fetch_and_save_all()
         except ThirteenFError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            raise typer.Exit(1) from None
+            _cli_exit(1, f"Error: {exc}")
         print(f"Saved {count} new 13F position-increase rows ({len(parsed)} tickers)")
     finally:
         src.close()
 
-    raise typer.Exit(0)
+    _cli_exit(0)
 
 
 @app.command()
@@ -1759,20 +1716,9 @@ def fetch_capitol(
     from analyzer.capitol_trades import CapitolTradesError, CapitolTradesSource
 
     if bool(politician) == all:
-        print(
-            "Error: specify exactly one of --politician NAME or --all", file=sys.stderr
-        )
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: specify exactly one of --politician NAME or --all")
 
-    try:
-        start_date = date.fromisoformat(start) if start else None
-        end_date = date.fromisoformat(end) if end else None
-    except ValueError:
-        print("Error: dates must be in YYYY-MM-DD format", file=sys.stderr)
-        raise typer.Exit(1) from None
-    if start_date is not None and end_date is not None and end_date < start_date:
-        print("Error: --end must be on or after --start", file=sys.stderr)
-        raise typer.Exit(1)
+    start_date, end_date = _parse_cli_date_range(start or None, end or None)
 
     try:
         capitol = CapitolTradesSource(
@@ -1787,12 +1733,11 @@ def fetch_capitol(
         finally:
             capitol.close()
     except CapitolTradesError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise typer.Exit(1) from None
+        _cli_exit(1, f"Error: {exc}")
 
     print(f"Wrote {len(df)} reconciliation records to {output}")
     print("No canonical transactions were saved.")
-    raise typer.Exit(0)
+    _cli_exit(0)
 
 
 @app.command()
@@ -1816,34 +1761,28 @@ def fetch_senate_efd(
     Senate rows are persisted in the canonical congressional DuckDB; source and
     chamber identity keep Senate refreshes isolated from House rows.
     """
-    from datetime import datetime, timedelta, timezone
-    from uuid import uuid4
+    from datetime import timedelta
 
     from analyzer.senate_efd import SenateEFDSource
 
-    try:
-        end_date = date.fromisoformat(end) if end else date.today()
-        if lookback is not None:
-            if lookback <= 0:
-                raise ValueError("lookback must be positive")
-            start_date = end_date - timedelta(days=lookback)
-        else:
-            start_date = (
-                date.fromisoformat(start)
-                if start
-                else end_date.replace(year=end_date.year - 1)
-            )
-    except ValueError:
-        print("Error: dates must be YYYY-MM-DD and lookback > 0", file=sys.stderr)
-        raise typer.Exit(1) from None
+    date_error = "Error: dates must be YYYY-MM-DD and lookback > 0"
+    end_date = _parse_cli_date(end or None, date_error, date.today())
+    if lookback is not None:
+        if lookback <= 0:
+            _cli_exit(1, date_error)
+        start_date = end_date - timedelta(days=lookback)
+    else:
+        start_date = _parse_cli_date(start or None, date_error)
+        if start_date is None:
+            try:
+                start_date = end_date.replace(year=end_date.year - 1)
+            except ValueError:
+                _cli_exit(1, date_error)
 
     if start_date > end_date:
-        print("Error: --start must be on or before --end", file=sys.stderr)
-        raise typer.Exit(1)
+        _cli_exit(1, "Error: --start must be on or before --end")
 
-    ingestion_generation = (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid4().hex[:12]
-    )
+    ingestion_generation = _new_ingestion_generation()
     src = SenateEFDSource(
         data_dir=data_dir,
         read_only=False,
@@ -1857,22 +1796,20 @@ def fetch_senate_efd(
     finally:
         src.close()
 
-    raise typer.Exit(0)
+    _cli_exit(0)
 
 
 def main():
     try:
         app()
     except AnalyzerError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        raise typer.Exit(1) from None
+        _cli_exit(1, f"Error: {e}")
     except KeyboardInterrupt:
-        print("\nOperation cancelled by user", file=sys.stderr)
-        raise typer.Exit(130) from None
+        _cli_exit(130, "\nOperation cancelled by user")
     except Exception as e:
         logger = logging.getLogger(__name__)
         logger.exception(f"Unexpected error: {e}")
-        raise typer.Exit(1) from None
+        _cli_exit(1)
 
 
 if __name__ == "__main__":

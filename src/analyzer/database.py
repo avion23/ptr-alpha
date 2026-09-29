@@ -24,6 +24,42 @@ from analyzer.transaction_repository import (
 
 logger = logging.getLogger(__name__)
 
+_SOURCE_REPORTS_COLUMNS = """
+    ingestion_generation VARCHAR NOT NULL,
+    source VARCHAR NOT NULL,
+    chamber VARCHAR NOT NULL,
+    source_record_id VARCHAR NOT NULL,
+    report_path VARCHAR,
+    member VARCHAR,
+    official_filing_date DATE,
+    outcome VARCHAR NOT NULL CHECK (
+        outcome IN ('parsed', 'no_txs', 'paper_only', 'unavailable', 'failed')
+    ),
+    artifact_sha256 VARCHAR,
+    landing_sha256 VARCHAR,
+    paper_artifact_url VARCHAR,
+    paper_artifact_sha256 VARCHAR,
+    error_message VARCHAR,
+    raw_row_count INTEGER NOT NULL,
+    accepted_row_count INTEGER NOT NULL,
+    rejected_row_count INTEGER NOT NULL,
+    UNIQUE (ingestion_generation, source, chamber, source_record_id)
+"""
+
+_HOUSE_PARSE_SOURCE = """
+    CASE
+        WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
+          OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%ling%'
+          OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gpt%'
+          OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%openrouter%'
+          OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini/%'
+          OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'openrouter/%'
+          OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gpt-%'
+        THEN 'gemini_ocr'
+        ELSE 'house_pdf'
+    END
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class TransactionReplacementCounts:
@@ -291,17 +327,7 @@ class Database:
                                       WHERE tx_count.doc_id = artifact.doc_id
                                         AND tx_count.artifact_sha256 = artifact.artifact_sha256
                                         AND tx_count.ingestion_generation = artifact.generation_id
-                                        AND tx_count.source = CASE
-                                            WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
-                                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%ling%'
-                                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gpt%'
-                                              OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%openrouter%'
-                                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini/%'
-                                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'openrouter/%'
-                                              OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gpt-%'
-                                            THEN 'gemini_ocr'
-                                            ELSE 'house_pdf'
-                                        END
+                                        AND tx_count.source = {_HOUSE_PARSE_SOURCE}
                                   )
                                   AND (
                                       parse_run.status = 'no_txs'
@@ -313,17 +339,7 @@ class Database:
                                               WHERE tx_invalid.doc_id = artifact.doc_id
                                                 AND tx_invalid.artifact_sha256 = artifact.artifact_sha256
                                                 AND tx_invalid.ingestion_generation = artifact.generation_id
-                                                AND tx_invalid.source = CASE
-                                                    WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
-                                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%ling%'
-                                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gpt%'
-                                                      OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%openrouter%'
-                                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini/%'
-                                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'openrouter/%'
-                                                      OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gpt-%'
-                                                    THEN 'gemini_ocr'
-                                                    ELSE 'house_pdf'
-                                                END
+                                                 AND tx_invalid.source = {_HOUSE_PARSE_SOURCE}
                                                 AND (
                                                     tx_invalid.transaction_date IS NULL
                                                     OR tx_invalid.disclosure_date IS NULL
@@ -454,31 +470,9 @@ class Database:
             )
 
     def _init_source_reports_table(self) -> None:
-        self.conn.execute("""
+        self.conn.execute(f"""
             CREATE TABLE IF NOT EXISTS source_reports (
-                ingestion_generation VARCHAR NOT NULL,
-                source VARCHAR NOT NULL,
-                chamber VARCHAR NOT NULL,
-                source_record_id VARCHAR NOT NULL,
-                report_path VARCHAR,
-                member VARCHAR,
-                official_filing_date DATE,
-                outcome VARCHAR NOT NULL CHECK (
-                    outcome IN (
-                        'parsed', 'no_txs', 'paper_only', 'unavailable', 'failed'
-                    )
-                ),
-                artifact_sha256 VARCHAR,
-                landing_sha256 VARCHAR,
-                paper_artifact_url VARCHAR,
-                paper_artifact_sha256 VARCHAR,
-                error_message VARCHAR,
-                raw_row_count INTEGER NOT NULL,
-                accepted_row_count INTEGER NOT NULL,
-                rejected_row_count INTEGER NOT NULL,
-                UNIQUE (
-                    ingestion_generation, source, chamber, source_record_id
-                )
+                {_SOURCE_REPORTS_COLUMNS}
             )
         """)
         source_columns = {
@@ -492,57 +486,7 @@ class Database:
         self._migrate_source_reports_outcome_constraint()
 
     def _migrate_source_reports_source_identity(self) -> None:
-        self.conn.execute("BEGIN TRANSACTION")
-        try:
-            self.conn.execute("ALTER TABLE source_reports ADD COLUMN source VARCHAR")
-            self.conn.execute(
-                "UPDATE source_reports SET source = 'legacy' WHERE source IS NULL"
-            )
-            self.conn.execute("""
-                CREATE TABLE source_reports_with_source (
-                    ingestion_generation VARCHAR NOT NULL,
-                    source VARCHAR NOT NULL,
-                    chamber VARCHAR NOT NULL,
-                    source_record_id VARCHAR NOT NULL,
-                    report_path VARCHAR,
-                    member VARCHAR,
-                    official_filing_date DATE,
-                    outcome VARCHAR NOT NULL CHECK (
-                        outcome IN (
-                            'parsed', 'no_txs', 'paper_only', 'unavailable', 'failed'
-                        )
-                    ),
-                    artifact_sha256 VARCHAR,
-                    landing_sha256 VARCHAR,
-                    paper_artifact_url VARCHAR,
-                    paper_artifact_sha256 VARCHAR,
-                    error_message VARCHAR,
-                    raw_row_count INTEGER NOT NULL,
-                    accepted_row_count INTEGER NOT NULL,
-                    rejected_row_count INTEGER NOT NULL,
-                    UNIQUE (
-                        ingestion_generation, source, chamber, source_record_id
-                    )
-                )
-            """)
-            self.conn.execute("""
-                INSERT INTO source_reports_with_source
-                SELECT
-                    ingestion_generation, source, chamber, source_record_id,
-                    report_path, member, official_filing_date, outcome,
-                    artifact_sha256, landing_sha256, paper_artifact_url,
-                    paper_artifact_sha256, error_message, raw_row_count,
-                    accepted_row_count, rejected_row_count
-                FROM source_reports
-            """)
-            self.conn.execute("DROP TABLE source_reports")
-            self.conn.execute(
-                "ALTER TABLE source_reports_with_source RENAME TO source_reports"
-            )
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+        self._rebuild_source_reports(add_source_identity=True)
 
     def _migrate_source_reports_outcome_constraint(self) -> None:
         """Rebuild source_reports when its outcome CHECK lacks ``no_txs``."""
@@ -556,37 +500,25 @@ class Database:
         if any("no_txs" in str(expression).lower() for (expression,) in checks):
             return
 
+        self._rebuild_source_reports()
+
+    def _rebuild_source_reports(self, add_source_identity: bool = False) -> None:
         self.conn.execute("BEGIN TRANSACTION")
         try:
-            self.conn.execute("""
-                CREATE TABLE source_reports_with_outcome (
-                    ingestion_generation VARCHAR NOT NULL,
-                    source VARCHAR NOT NULL,
-                    chamber VARCHAR NOT NULL,
-                    source_record_id VARCHAR NOT NULL,
-                    report_path VARCHAR,
-                    member VARCHAR,
-                    official_filing_date DATE,
-                    outcome VARCHAR NOT NULL CHECK (
-                        outcome IN (
-                            'parsed', 'no_txs', 'paper_only', 'unavailable', 'failed'
-                        )
-                    ),
-                    artifact_sha256 VARCHAR,
-                    landing_sha256 VARCHAR,
-                    paper_artifact_url VARCHAR,
-                    paper_artifact_sha256 VARCHAR,
-                    error_message VARCHAR,
-                    raw_row_count INTEGER NOT NULL,
-                    accepted_row_count INTEGER NOT NULL,
-                    rejected_row_count INTEGER NOT NULL,
-                    UNIQUE (
-                        ingestion_generation, source, chamber, source_record_id
-                    )
+            if add_source_identity:
+                self.conn.execute(
+                    "ALTER TABLE source_reports ADD COLUMN source VARCHAR"
+                )
+                self.conn.execute(
+                    "UPDATE source_reports SET source = 'legacy' WHERE source IS NULL"
+                )
+            self.conn.execute(f"""
+                CREATE TABLE source_reports_migration (
+                    {_SOURCE_REPORTS_COLUMNS}
                 )
             """)
             self.conn.execute("""
-                INSERT INTO source_reports_with_outcome
+                INSERT INTO source_reports_migration
                 SELECT
                     ingestion_generation, source, chamber, source_record_id,
                     report_path, member, official_filing_date, outcome,
@@ -597,7 +529,7 @@ class Database:
             """)
             self.conn.execute("DROP TABLE source_reports")
             self.conn.execute(
-                "ALTER TABLE source_reports_with_outcome RENAME TO source_reports"
+                "ALTER TABLE source_reports_migration RENAME TO source_reports"
             )
             self.conn.execute("COMMIT")
         except Exception:
@@ -709,7 +641,7 @@ class Database:
     ) -> list[str]:
         """Return every authoritative PTR lacking an acquired, terminal artifact."""
         rows = self.conn.execute(
-            """
+            f"""
             SELECT m.doc_id
             FROM house_generation_metadata m
             LEFT JOIN house_pdf_artifacts a
@@ -722,50 +654,30 @@ class Database:
                 a.doc_id IS NULL
                 OR NOT EXISTS (
                     SELECT 1
-                    FROM pdf_parse_runs p
-                    WHERE p.doc_id = a.doc_id
-                      AND p.artifact_sha256 = a.artifact_sha256
-                      AND p.ingestion_generation = a.generation_id
-                      AND p.status IN ('success', 'no_txs')
-                      AND COALESCE(p.transaction_count, 0) = (
+                    FROM pdf_parse_runs parse_run
+                    WHERE parse_run.doc_id = a.doc_id
+                      AND parse_run.artifact_sha256 = a.artifact_sha256
+                      AND parse_run.ingestion_generation = a.generation_id
+                      AND parse_run.status IN ('success', 'no_txs')
+                      AND COALESCE(parse_run.transaction_count, 0) = (
                           SELECT COUNT(*)
                           FROM transactions t
                           WHERE t.doc_id = a.doc_id
                             AND t.artifact_sha256 = a.artifact_sha256
                             AND t.ingestion_generation = a.generation_id
-                            AND t.source = CASE
-                                WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
-                                  OR LOWER(COALESCE(p.parser_version, '')) LIKE '%ling%'
-                                  OR LOWER(COALESCE(p.parser_version, '')) LIKE '%gpt%'
-                                  OR LOWER(COALESCE(p.parser_version, '')) LIKE '%openrouter%'
-                                  OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini/%'
-                                  OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
-                                  OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
-                                THEN 'gemini_ocr'
-                                ELSE 'house_pdf'
-                            END
+                            AND t.source = {_HOUSE_PARSE_SOURCE}
                       )
                       AND (
-                          p.status = 'no_txs'
-                          OR (
-                              COALESCE(p.transaction_count, 0) > 0
+                        parse_run.status = 'no_txs'
+                        OR (
+                            COALESCE(parse_run.transaction_count, 0) > 0
                               AND NOT EXISTS (
                                   SELECT 1
                                   FROM transactions t
                                   WHERE t.doc_id = a.doc_id
                                     AND t.artifact_sha256 = a.artifact_sha256
                                     AND t.ingestion_generation = a.generation_id
-                                    AND t.source = CASE
-                                        WHEN LOWER(COALESCE(p.parser_version, '')) LIKE '%gemini%'
-                                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%ling%'
-                                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%gpt%'
-                                          OR LOWER(COALESCE(p.parser_version, '')) LIKE '%openrouter%'
-                                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini/%'
-                                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
-                                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
-                                        THEN 'gemini_ocr'
-                                        ELSE 'house_pdf'
-                                    END
+                                    AND t.source = {_HOUSE_PARSE_SOURCE}
                                     AND (
                                         t.transaction_date IS NULL
                                         OR t.disclosure_date IS NULL

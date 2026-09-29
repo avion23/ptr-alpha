@@ -3,7 +3,6 @@ from pydantic import BaseModel
 
 
 class Chamber(StrEnum):
-    HOUSE = "house"
     SENATE = "senate"
 
 

@@ -64,6 +64,7 @@ _SWEEP_CANDIDATE_COLUMNS = (
     "event_date",
     "disclosure_date",
     "corroboration",
+    "position_evidence",
     "as_of",
 )
 
@@ -294,6 +295,7 @@ def candidates_from_sweep(df: pd.DataFrame) -> pd.DataFrame:
                 "event_date": row["transaction_date"],
                 "disclosure_date": row["official_filing_date"],
                 "corroboration": False,
+                "position_evidence": False,
                 "as_of": as_of,
             }
         )

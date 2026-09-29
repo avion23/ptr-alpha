@@ -1,10 +1,15 @@
-from datetime import date
+from datetime import UTC, date, datetime
+from types import SimpleNamespace
 
 import pytest
 
-from analyzer.form4 import Form4Error, parse_form4_xml
+from analyzer.form4 import (
+    Form4Error,
+    Form4Source,
+    candidates_from_sweep,
+    parse_form4_xml,
+)
 from analyzer.transaction_repository import _BASE_WRITE_COLUMNS
-
 
 _EXPECTED_COLUMNS = _BASE_WRITE_COLUMNS + (
     "source_record_id",
@@ -164,3 +169,136 @@ def test_10b5_1_affirmative_footnote_is_detected(burke_form4_xml):
     assert parse(with_footnote)["asset_description"].str.contains(
         "is_10b5_1=true"
     ).all()
+
+
+@pytest.fixture
+def master_index():
+    return b"""Description: SEC master index
+CIK|Company Name|Form Type|Date Filed|Filename
+------------------------------------------------
+320193|Apple Inc.|4|2026-09-29|edgar/data/320193/000032019326000012.txt
+1692819|Vistra Corp.|4/A|2026-09-28|edgar/data/1692819/000169281926000007/xslF345X03/form4.xml
+malformed line
+"""
+
+
+def test_master_index_parser_accepts_form4_and_skips_malformed(master_index):
+    filings = Form4Source._parse_master_index(master_index)
+
+    assert [filing["accession"] for filing in filings] == [
+        "0000320193-26-000012",
+        "0001692819-26-000007",
+    ]
+    assert [filing["filing_date"] for filing in filings] == [
+        date(2026, 9, 29),
+        date(2026, 9, 28),
+    ]
+
+
+def test_sweep_skips_malformed_filing_xml_without_aborting(
+    tmp_path, monkeypatch, burke_form4_xml
+):
+    today = datetime.now(UTC).date()
+    index = (
+        "CIK|Company Name|Form Type|Date Filed|Filename\n"
+        "------------------------------------------------\n"
+        f"1692819|Vistra Corp.|4|{today}|edgar/data/1692819/"
+        "000169281926000012.txt\n"
+        f"1692819|Vistra Corp.|4/A|{today}|edgar/data/1692819/"
+        "000169281926000013.txt\n"
+    ).encode()
+    source = Form4Source(data_dir=tmp_path, db=SimpleNamespace())
+
+    def request(url):
+        if url.endswith(".idx"):
+            return SimpleNamespace(content=index)
+        if url.endswith("000169281926000012.txt"):
+            return SimpleNamespace(content=b"<XML><ownershipDocument></XML>")
+        return SimpleNamespace(content=b"<XML>" + burke_form4_xml + b"</XML>")
+
+    monkeypatch.setattr(source, "_request", request)
+    try:
+        rows = source.sweep_recent(days_back=1)
+    finally:
+        source.close()
+
+    assert len(rows) == 2
+    assert rows["ticker"].tolist() == ["VST", "VST"]
+
+
+def test_sweep_returns_empty_canonical_frame_when_index_has_no_filings(
+    tmp_path, monkeypatch
+):
+    source = Form4Source(data_dir=tmp_path, db=SimpleNamespace())
+    monkeypatch.setattr(
+        source,
+        "_request",
+        lambda url: SimpleNamespace(
+            content=b"CIK|Company Name|Form Type|Date Filed|Filename\n"
+            b"------------------------------------------------\n"
+        ),
+    )
+    try:
+        rows = source.sweep_recent(days_back=1)
+    finally:
+        source.close()
+
+    assert rows.empty
+    assert tuple(rows.columns) == _EXPECTED_COLUMNS
+
+
+def test_candidates_from_sweep_uses_shared_candidate_schema(burke_form4_xml):
+    rows = candidates_from_sweep(parse(burke_form4_xml))
+
+    assert tuple(rows.columns) == (
+        "ticker",
+        "actor_id",
+        "kind",
+        "source",
+        "entry_ref",
+        "event_date",
+        "disclosure_date",
+        "corroboration",
+        "as_of",
+    )
+    assert rows["ticker"].tolist() == ["VST", "VST"]
+    assert rows["actor_id"].tolist() == ["officer:JAMES BURKE"] * 2
+    assert rows["kind"].tolist() == ["officer"] * 2
+    assert rows["source"].tolist() == ["form4"] * 2
+    assert rows["entry_ref"].tolist() == [135.99, 135.25]
+    assert rows["event_date"].tolist() == [date(2026, 8, 31), date(2026, 9, 1)]
+    assert rows["disclosure_date"].tolist() == [date(2026, 9, 2)] * 2
+    assert rows["corroboration"].tolist() == [False, False]
+    assert rows["as_of"].tolist() == [datetime.now(UTC).date()] * 2
+
+
+def test_sweep_filters_out_non_officer_filings(tmp_path, monkeypatch, burke_form4_xml):
+    today = datetime.now(UTC).date()
+    index = (
+        "CIK|Company Name|Form Type|Date Filed|Filename\n"
+        "------------------------------------------------\n"
+        f"1692819|Vistra Corp.|4|{today}|edgar/data/1692819/"
+        "000169281926000014.txt\n"
+    ).encode()
+    non_officer_xml = burke_form4_xml.replace(
+        b"<isOfficer>1</isOfficer>", b"<isOfficer>0</isOfficer>"
+    )
+    source = Form4Source(data_dir=tmp_path, db=SimpleNamespace())
+
+    def request(url):
+        return SimpleNamespace(
+            content=(
+                index
+                if url.endswith(".idx")
+                else b"<XML>" + non_officer_xml + b"</XML>"
+            )
+        )
+
+    monkeypatch.setattr(source, "_request", request)
+    try:
+        rows = source.sweep_recent(days_back=1)
+    finally:
+        source.close()
+
+    assert rows.empty
+    assert tuple(rows.columns) == _EXPECTED_COLUMNS

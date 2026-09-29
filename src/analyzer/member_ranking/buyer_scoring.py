@@ -258,11 +258,11 @@ def _resolve_consensus_ticker(ticker: str, as_of_date: pd.Timestamp) -> str:
 
 def _get_consensus_candidate_tickers(
     transactions_df: pd.DataFrame,
-    min_buyers: int,
+    min_buyers: int = 1,
     *,
     as_of_date: pd.Timestamp,
 ) -> list[str]:
-    """Return one decision-time symbol per equity identity meeting the buyer gate."""
+    """Return decision-time symbols with eligible purchases for scoring."""
     purchases = _prepare_consensus_purchases(transactions_df)
     if purchases.empty:
         return []

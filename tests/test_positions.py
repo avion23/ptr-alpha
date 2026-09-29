@@ -3,12 +3,48 @@ from datetime import date
 
 import pandas as pd
 
-from analyzer.positions import build_positions, discount_alerts, PositionsError
+from analyzer.positions import (
+    PositionsError,
+    build_positions,
+    discount_alerts,
+    holdings_candidates,
+)
 
 
 def _prices(days, closes):
     idx = pd.to_datetime(days)
     return pd.DataFrame({"close": closes}, index=idx)
+
+
+def _holdings_db(trades, prices):
+    import duckdb
+    from types import SimpleNamespace
+
+    conn = duckdb.connect()
+    trade_columns = [
+        "member",
+        "ticker",
+        "transaction_type",
+        "transaction_date",
+        "disclosure_date",
+        "amount_midpoint",
+        "amount_raw",
+        "source",
+        "instrument_type",
+    ]
+    trade_frame = pd.DataFrame(
+        [
+            {column: row.get(column) for column in trade_columns}
+            for row in trades
+        ],
+        columns=trade_columns,
+    )
+    price_frame = pd.DataFrame(prices, columns=["ticker", "date", "close"])
+    conn.register("trade_fixture", trade_frame)
+    conn.register("price_fixture", price_frame)
+    conn.execute("CREATE TABLE canonical_transactions AS SELECT * FROM trade_fixture")
+    conn.execute("CREATE TABLE prices AS SELECT * FROM price_fixture")
+    return SimpleNamespace(conn=conn), conn
 
 
 class TestPositions(unittest.TestCase):
@@ -249,6 +285,151 @@ class TestPositions(unittest.TestCase):
         self.assertIn(
             date(2026, 1, 16), set(pd.to_datetime(widened["transaction_date"]).dt.date)
         )
+
+    def test_holdings_candidates_schema_and_option_filter(self):
+        db, conn = _holdings_db(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 14),
+                    "disclosure_date": date(2025, 1, 20),
+                    "amount_midpoint": 1000.0,
+                    "source": "house_pdf",
+                    "instrument_type": "stock",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 15),
+                    "disclosure_date": date(2025, 1, 20),
+                    "amount_midpoint": 1000000.0,
+                    "source": "house_pdf",
+                    "instrument_type": "option",
+                },
+            ],
+            [("T", date(2025, 1, 14), 100.0), ("T", date(2026, 9, 21), 120.0)],
+        )
+        try:
+            candidates = holdings_candidates(db, "M", date(2026, 9, 21))
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            list(candidates.columns),
+            [
+                "ticker",
+                "actor_id",
+                "kind",
+                "source",
+                "entry_ref",
+                "event_date",
+                "disclosure_date",
+                "corroboration",
+                "as_of",
+            ],
+        )
+        self.assertEqual(len(candidates), 1)
+        row = candidates.iloc[0]
+        self.assertEqual(row["actor_id"], "congress:M")
+        self.assertEqual(row["kind"], "congress")
+        self.assertEqual(row["entry_ref"], 100.0)
+        self.assertFalse(row["corroboration"])
+
+    def test_holdings_candidates_disclosure_cutoff(self):
+        db, conn = _holdings_db(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 1, 16),
+                    "disclosure_date": date(2026, 1, 23),
+                    "amount_midpoint": 1000.0,
+                    "source": "house_pdf",
+                    "instrument_type": "stock",
+                }
+            ],
+            [("T", date(2026, 1, 16), 100.0), ("T", date(2026, 1, 23), 110.0)],
+        )
+        try:
+            before_disclosure = holdings_candidates(db, "M", date(2026, 1, 20))
+            on_disclosure = holdings_candidates(db, "M", date(2026, 1, 23))
+        finally:
+            conn.close()
+
+        self.assertTrue(before_disclosure.empty)
+        self.assertEqual(len(on_disclosure), 1)
+        self.assertEqual(on_disclosure.iloc[0]["disclosure_date"], date(2026, 1, 23))
+
+    def test_holdings_candidates_13f_has_no_entry_reference(self):
+        db, conn = _holdings_db(
+            [
+                {
+                    "member": "Manager M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 14),
+                    "disclosure_date": date(2025, 2, 14),
+                    "amount_midpoint": 1000.0,
+                    "source": "13f",
+                    "instrument_type": "stock",
+                }
+            ],
+            [("T", date(2025, 1, 14), 100.0), ("T", date(2026, 9, 21), 120.0)],
+        )
+        try:
+            candidates = holdings_candidates(db, "Manager M", date(2026, 9, 21))
+        finally:
+            conn.close()
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates.iloc[0]["kind"], "manager")
+        self.assertIsNone(candidates.iloc[0]["entry_ref"])
+
+    def test_holdings_candidates_entry_reference_is_blended_basis(self):
+        db, conn = _holdings_db(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 12),
+                    "amount_midpoint": 2000.0,
+                    "source": "house_pdf",
+                    "instrument_type": "stock",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 12),
+                    "amount_midpoint": 4000.0,
+                    "source": "gemini_ocr",
+                    "instrument_type": "stock",
+                },
+            ],
+            [
+                ("T", date(2025, 1, 10), 100.0),
+                ("T", date(2025, 6, 10), 200.0),
+                ("T", date(2026, 9, 21), 180.0),
+            ],
+        )
+        try:
+            candidates = holdings_candidates(db, "M", date(2026, 9, 21))
+        finally:
+            conn.close()
+
+        self.assertEqual(len(candidates), 1)
+        row = candidates.iloc[0]
+        self.assertAlmostEqual(row["entry_ref"], 150.0)
+        self.assertEqual(row["source"], "gemini_ocr")
+        self.assertEqual(row["event_date"], date(2025, 6, 10))
+        self.assertEqual(row["disclosure_date"], date(2025, 6, 12))
 
 
 if __name__ == "__main__":

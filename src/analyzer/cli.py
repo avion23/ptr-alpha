@@ -1350,6 +1350,9 @@ def fetch_form4(
     year: int = typer.Option(
         date.today().year, help="Filing year to scan for Form 4 purchases"
     ),
+    sweep_days: int = typer.Option(
+        0, "--sweep-days", help="Discover recent Form 4 purchases over this many days"
+    ),
     data_dir: str = typer.Option(
         "data", help="Data directory for the canonical database"
     ),
@@ -1370,6 +1373,9 @@ def fetch_form4(
     if year < 2000 or year > date.today().year + 1:
         print("Error: --year is out of plausible range", file=sys.stderr)
         raise typer.Exit(1)
+    if sweep_days < 0:
+        print("Error: --sweep-days must be non-negative", file=sys.stderr)
+        raise typer.Exit(1)
 
     ingestion_generation = (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid4().hex[:12]
@@ -1382,7 +1388,17 @@ def fetch_form4(
     try:
         try:
             if ticker:
-                count = src.fetch_and_save_ticker(ticker, year)
+                if sweep_days:
+                    if not hasattr(src, "fetch_and_save_sweep"):
+                        print(
+                            "Error: Form 4 sweep is unavailable; "
+                            "fetch_and_save_sweep is not implemented",
+                            file=sys.stderr,
+                        )
+                        raise typer.Exit(1)
+                    count = src.fetch_and_save_sweep(ticker, sweep_days)
+                else:
+                    count = src.fetch_and_save_ticker(ticker, year)
             else:
                 print(
                     "Error: --ticker is required (universe-wide Form 4 scans "
@@ -1444,6 +1460,9 @@ def follow_member(
         raise typer.Exit(1) from None
     if discount_pct < 0:
         print("Error: --discount-pct must be non-negative", file=sys.stderr)
+        raise typer.Exit(1)
+    if not member:
+        print("Error: provide at least one --member", file=sys.stderr)
         raise typer.Exit(1)
 
     db = Database(Path(data_dir) / "congress.duckdb", read_only=True)
@@ -1514,11 +1533,168 @@ def follow_member(
 
 
 @app.command()
+def setups(
+    ctx: typer.Context,
+    member: list[str] = typer.Option([], "--member", help="Member name; repeatable"),
+    ticker: list[str] = typer.Option([], "--ticker", help="Ticker filter; repeatable"),
+    as_of: str | None = typer.Option(
+        None, "--as-of", help="Cutoff date (YYYY-MM-DD; defaults to today)"
+    ),
+    include_unpromoted: bool = typer.Option(
+        False,
+        "--include-unpromoted",
+        help="Include unvalidated filings from unpromoted House generations",
+    ),
+    data_dir: str = typer.Option("data", "--data-dir", help="Data directory"),
+):
+    """Rank cross-source setups with per-actor price discipline.
+
+    Candidates = holdings (per --member, persistent) + purchase events
+    (all official sources, point-in-time). Weights are source priors
+    (n_matured=0 v1 wiring). Fair region is enforced per actor inside
+    scoring: current <= 1.05 x that actor's entry reference.
+    """
+    try:
+        as_of_date = date.fromisoformat(as_of) if as_of else date.today()
+    except ValueError:
+        print("Error: --as-of must use YYYY-MM-DD", file=sys.stderr)
+        raise typer.Exit(1) from None
+
+    from importlib import import_module
+
+    try:
+        positions = import_module("analyzer.positions")
+        events_pipeline = import_module("analyzer.pipeline")
+        setup_scoring = import_module("analyzer.setups")
+        actors = import_module("analyzer.actors")
+    except ImportError as exc:
+        missing = exc.name or str(exc)
+        print(
+            "Error: setups is unavailable; required v2 component "
+            f"{missing} could not be loaded ({exc})",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1) from None
+
+    required = (
+        (positions, "holdings_candidates", "analyzer.positions.holdings_candidates"),
+        (events_pipeline, "eligible_events", "analyzer.pipeline.eligible_events"),
+        (setup_scoring, "score", "analyzer.setups.score"),
+        (actors, "compute_weight", "analyzer.actors.compute_weight"),
+    )
+    missing = [
+        name for module, attribute, name in required if not hasattr(module, attribute)
+    ]
+    if missing:
+        print(
+            "Error: setups is unavailable; missing required v2 component(s): "
+            + ", ".join(missing),
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
+    try:
+        db = Database(Path(data_dir) / "congress.duckdb", read_only=True)
+    except Exception as exc:
+        print(f"Error: could not open read-only database: {exc}", file=sys.stderr)
+        raise typer.Exit(1) from None
+
+    requested_tickers = {symbol.strip().upper() for symbol in ticker}
+    try:
+        frames = []
+        for selected_member in member:
+            frame = positions.holdings_candidates(
+                db,
+                selected_member,
+                as_of_date,
+                include_unpromoted=include_unpromoted,
+            )
+            if not frame.empty:
+                frames.append(frame)
+        events = events_pipeline.eligible_events(db, as_of_date)
+        frames = [frame for frame in frames if not frame.empty]
+        if not events.empty:
+            if requested_tickers:
+                events = events.loc[
+                    events["ticker"].astype("string").str.upper().isin(
+                        requested_tickers
+                    )
+                ].copy()
+            elif frames:
+                held = {
+                    str(value).strip().upper()
+                    for frame in frames
+                    for value in frame["ticker"].dropna()
+                }
+                if held:
+                    events = events.loc[
+                        events["ticker"].astype("string").str.upper().isin(held)
+                    ].copy()
+            else:
+                events = events.iloc[0:0]
+            if not events.empty:
+                frames.append(events)
+        if not frames:
+            print("No candidates.")
+            raise typer.Exit(0)
+        candidates = pd.concat(frames, ignore_index=True)
+        if requested_tickers:
+            candidates = candidates.loc[
+                candidates["ticker"].astype("string").str.upper().isin(
+                    requested_tickers
+                )
+            ].copy()
+        if candidates.empty:
+            print("No candidates.")
+            raise typer.Exit(0)
+
+        symbols = sorted(
+            {str(value).strip().upper() for value in candidates["ticker"].dropna()}
+        )
+        current_prices = {}
+        for symbol in symbols:
+            row = db.conn.execute(
+                "SELECT close FROM prices WHERE ticker = ? AND date <= ? "
+                "ORDER BY date DESC LIMIT 1",
+                [symbol, as_of_date],
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                current_prices[symbol] = float(row[0])
+
+        weights = {}
+        for row in candidates.itertuples():
+            actor_id = str(row.actor_id)
+            if actor_id not in weights:
+                weights[actor_id] = actors.compute_weight(
+                    str(row.kind), 0, 0.0, str(row.source)
+                )
+        ranked, blocked = setup_scoring.score(candidates, weights, current_prices)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        print(f"Error: setup ranking failed: {exc}", file=sys.stderr)
+        raise typer.Exit(1) from None
+    finally:
+        db.close()
+
+    print("=== Ranked setups ===")
+    print(ranked.to_string(index=False) if not ranked.empty else "None.")
+    print("\n=== Blocked ===")
+    print(blocked.to_string(index=False) if not blocked.empty else "None.")
+    raise typer.Exit(0)
+
+
+@app.command()
 def fetch_13f(
     ctx: typer.Context,
     watchlist: str = typer.Option(
         "VST:VISTRA",
         help="Comma-separated TICKER:keyword pairs scoping 13F name matching",
+    ),
+    all_increases: bool = typer.Option(
+        False,
+        "--all-increases",
+        help="Fetch and save all discovered 13F position increases",
     ),
     data_dir: str = typer.Option(
         "data", help="Data directory for the canonical database"
@@ -1562,7 +1738,17 @@ def fetch_13f(
     )
     try:
         try:
-            count = src.fetch_and_save_all()
+            if all_increases:
+                if not hasattr(src, "fetch_all_increases"):
+                    print(
+                        "Error: 13F increase discovery is unavailable; "
+                        "fetch_all_increases is not implemented",
+                        file=sys.stderr,
+                    )
+                    raise typer.Exit(1)
+                count = src.save_to_db(src.fetch_all_increases())
+            else:
+                count = src.fetch_and_save_all()
         except ThirteenFError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             raise typer.Exit(1) from None

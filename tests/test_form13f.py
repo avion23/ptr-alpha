@@ -1,8 +1,14 @@
 from datetime import date
 
+import pandas as pd
 import pytest
 
-from analyzer.form13f import ThirteenFError, ThirteenFSource, _parse_information_table
+from analyzer.form13f import (
+    ThirteenFError,
+    ThirteenFSource,
+    _parse_information_table,
+    candidates_from_increases,
+)
 
 
 @pytest.fixture
@@ -74,3 +80,127 @@ def test_empty_information_table_fails_closed():
         _parse_information_table(
             '<informationTable xmlns="http://www.sec.gov/edgar/document/thirteenf/informationtable" />'
         )
+
+
+def test_fetch_all_increases_keeps_unmatched_and_new_positions(
+    tmp_path, quarter_xmls, monkeypatch
+):
+    source = ThirteenFSource(
+        data_dir=tmp_path / "data",
+        db=object(),
+        watchlist={"VST": {"VISTRA"}},
+        ticker_map={"444444444": "ORION"},
+        managers={"test": {"name": "Test Manager", "cik": "1234567"}},
+    )
+    previous_xml, current_xml = quarter_xmls
+    previous = _parse_information_table(previous_xml)
+    previous["333333333"] = {"issuer": "Nova Labs", "shares": 250}
+    current = _parse_information_table(current_xml)
+    filings = {
+        "filings": {
+            "recent": {
+                "form": ["13F-HR", "13F-HR"],
+                "reportDate": ["2026-03-31", "2026-06-30"],
+                "filingDate": ["2026-05-15", "2026-08-14"],
+                "accessionNumber": ["0001234567-26-000001", "0001234567-26-000002"],
+            }
+        }
+    }
+    monkeypatch.setattr(source, "_load_submissions", lambda cik: filings)
+    monkeypatch.setattr(
+        source,
+        "_load_filing",
+        lambda cik, filing: (
+            previous if filing["report_date"] == "2026-03-31" else current,
+            "unused",
+        ),
+    )
+
+    increases = source.fetch_all_increases()
+
+    assert list(zip(increases["ticker"], increases["added_shares"])) == [
+        ("VST", 50),
+        (None, 50),
+        ("ORION", 400),
+    ]
+    unknown = increases.loc[increases["ticker"].isna()].iloc[0]
+    assert unknown["cusip"] == "333333333"
+    assert unknown["raw_asset_description"] == "Nova Labs"
+    assert increases["event_date"].eq(date(2026, 6, 30)).all()
+    assert increases["disclosure_date"].eq(date(2026, 8, 14)).all()
+    source.close()
+
+
+def test_candidates_from_increases_has_shared_schema_and_corroborates():
+    increases = pd.DataFrame(
+        {
+            "ticker": ["VST", None],
+            "manager_key": ["thiel_macro", "appaloosa"],
+            "event_date": [date(2026, 6, 30), date(2026, 6, 30)],
+            "disclosure_date": [date(2026, 8, 14), date(2026, 8, 14)],
+        }
+    )
+
+    candidates = candidates_from_increases(increases)
+
+    assert list(candidates.columns) == [
+        "ticker",
+        "actor_id",
+        "kind",
+        "source",
+        "entry_ref",
+        "event_date",
+        "disclosure_date",
+        "corroboration",
+        "as_of",
+    ]
+    assert candidates["actor_id"].tolist() == [
+        "manager:thiel_macro",
+        "manager:appaloosa",
+    ]
+    assert candidates["kind"].eq("manager").all()
+    assert candidates["source"].eq("13f").all()
+    assert candidates["entry_ref"].tolist() == [None, None]
+    assert candidates["corroboration"].tolist() == [True, True]
+    assert candidates["ticker"].isna().tolist() == [False, True]
+    assert candidates.loc[1, "ticker"] is None
+    assert candidates["as_of"].dt.tz is not None
+
+
+def test_fetch_all_increases_isolates_manager_failures(tmp_path, monkeypatch, caplog):
+    source = ThirteenFSource(
+        data_dir=tmp_path / "data",
+        db=object(),
+        watchlist={"VST": {"VISTRA"}},
+        managers={
+            "bad": {"name": "Bad Manager", "cik": "1234567"},
+            "good": {"name": "Good Manager", "cik": "7654321"},
+        },
+    )
+
+    def manager_increases(key, manager):
+        if key == "bad":
+            raise ThirteenFError("broken filing")
+        return [
+            {
+                "manager_key": key,
+                "manager": manager["name"],
+                "ticker": "VST",
+                "event_date": date(2026, 6, 30),
+                "disclosure_date": date(2026, 8, 14),
+                "cusip": "111111111",
+                "added_shares": 50,
+                "raw_asset_description": "Vistra Corp",
+                "source": "13f",
+            }
+        ]
+
+    monkeypatch.setattr(source, "_manager_increases", manager_increases)
+    increases = source.fetch_all_increases()
+    assert increases["manager_key"].tolist() == ["good"]
+    assert "Skipping 13F manager bad" in caplog.text
+
+    source.managers = {"bad": {"name": "Bad Manager", "cik": "1234567"}}
+    with pytest.raises(ThirteenFError, match="All 13F managers failed"):
+        source.fetch_all_increases()
+    source.close()

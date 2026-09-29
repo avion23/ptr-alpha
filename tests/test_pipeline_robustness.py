@@ -9,11 +9,14 @@ from analyzer.cli import app
 from analyzer.database import Database
 from analyzer.download import HouseFetchSummary
 from analyzer.exceptions import DataResult, DataSourceError, StepResult
+from analyzer.member_ranking.buyer_scoring import _get_consensus_candidate_tickers
 from analyzer.pipeline import (
     BacktestParams,
     TickerAnalysisParams,
     TickerScoringParams,
+    eligible_events,
     prepare_analysis_data,
+    prepare_live_consensus_data,
     run_backtest_pipeline,
     run_recent_ticker_scoring,
     run_ticker_analysis,
@@ -360,6 +363,130 @@ def test_recent_ticker_scoring_filters_rejected_symbols_before_candidate_gate():
 
     assert result.success
     assert result.data["result"]["ticker"].tolist() == ["AAPL"]
+
+
+def test_single_officer_purchase_reaches_scoring_candidate():
+    as_of = date(2025, 6, 1)
+    purchase = pd.DataFrame(
+        {
+            "member": ["Jane Doe"],
+            "ticker": ["AAPL"],
+            "transaction_date": pd.to_datetime(["2025-05-29"]),
+            "disclosure_date": pd.to_datetime(["2025-05-30"]),
+            "transaction_type": ["Purchase"],
+            "instrument_type": ["Common Stock"],
+            "source": ["form4"],
+        }
+    )
+    source = MagicMock()
+    source.db.get_transactions_by_date_range.return_value = purchase
+
+    candidates = _get_consensus_candidate_tickers(
+        purchase, min_buyers=1, as_of_date=pd.Timestamp(as_of)
+    )
+    assert candidates == ["AAPL"]
+
+    with (
+        patch(
+            "analyzer.pipeline._get_consensus_candidate_tickers",
+            wraps=_get_consensus_candidate_tickers,
+        ) as discover,
+        patch("analyzer.pipeline.analysis.score_ticker_by_buyers") as score,
+    ):
+        score.return_value = pd.DataFrame(
+            {"ticker": ["AAPL"], "signal_score": [0.0]}
+        )
+        result = run_recent_ticker_scoring(
+            source,
+            TickerScoringParams(year=2025, as_of_date=as_of),
+        )
+
+    assert result.success
+    assert discover.call_args.args[1] == 1
+    score.assert_called_once()
+    assert score.call_args.args[0] == "AAPL"
+
+
+def test_prepare_live_consensus_data_none_loads_history_outside_default_window():
+    as_of = pd.Timestamp("2025-06-01")
+    rows = pd.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "disclosure_date": pd.to_datetime(["2020-01-01", "2025-06-02"]),
+        }
+    )
+    source = MagicMock()
+    source.db.get_transactions_by_date_range.return_value = rows
+
+    loaded = prepare_live_consensus_data(source, as_of, days_back=None)
+
+    assert loaded["ticker"].tolist() == ["AAPL"]
+    source.db.get_transactions_by_date_range.assert_called_once_with(
+        date.min, as_of
+    )
+
+
+def test_eligible_events_maps_official_actor_sources_and_entry_reference():
+    as_of = pd.Timestamp("2025-06-01")
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "Jane Doe",
+                "ticker": "AAPL",
+                "transaction_date": pd.Timestamp("2025-05-20"),
+                "disclosure_date": pd.Timestamp("2025-05-30"),
+                "transaction_type": "Purchase",
+                "instrument_type": "Common Stock",
+                "source": "form4",
+                "amount_midpoint": 1500.0,
+                "asset_description": "Common Stock; 10 shares @ $150; is_10b5_1=false",
+            },
+            {
+                "member": "Example Manager",
+                "ticker": "MSFT",
+                "transaction_date": pd.Timestamp("2025-03-31"),
+                "disclosure_date": pd.Timestamp("2025-05-15"),
+                "transaction_type": "Purchase",
+                "instrument_type": "Common Stock",
+                "source": "13f",
+                "amount_midpoint": 100000.0,
+            },
+            {
+                "member": "Jane Doe",
+                "ticker": "GOOG",
+                "transaction_date": pd.Timestamp("2025-05-20"),
+                "disclosure_date": pd.Timestamp("2025-05-30"),
+                "transaction_type": "Purchase",
+                "instrument_type": "stock",
+                "source": "gemini_ocr",
+            },
+        ]
+    )
+    db = MagicMock()
+    db.get_transactions_by_date_range.return_value = trades
+
+    events = eligible_events(db, as_of, days_back=None)
+
+    assert events.columns.tolist() == [
+        "ticker",
+        "actor_id",
+        "kind",
+        "source",
+        "entry_ref",
+        "event_date",
+        "disclosure_date",
+        "corroboration",
+        "as_of",
+    ]
+    assert events["actor_id"].tolist() == [
+        "officer:JANE DOE",
+        "manager:EXAMPLE MANAGER",
+        "congress:JANE DOE",
+    ]
+    assert events["entry_ref"].iloc[0] == 150.0
+    assert pd.isna(events["entry_ref"].iloc[1])
+    assert events["corroboration"].tolist() == [False, True, False]
+    assert events["as_of"].eq(as_of).all()
 
 
 def test_cli_as_of_reaches_single_ticker_analysis_params():

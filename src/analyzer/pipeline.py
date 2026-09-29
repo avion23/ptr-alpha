@@ -1,29 +1,32 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
-from dataclasses import dataclass
-from functools import wraps
 import logging
+import re
+from dataclasses import dataclass
+from datetime import date, timedelta
+from functools import wraps
 
 import numpy as np
 import pandas as pd
 
-from analyzer._price_index import _normalize_price_index
-from analyzer.exceptions import AnalyzerError, DataSourceError, StepResult, DataResult
-from analyzer.member_names import canonical_member_key
-from analyzer.models import AnalysisMode, SourceCoverageState
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
-from analyzer.price_snapshot import create_snapshot
-from analyzer.ticker_resolver import TickerResolver
 from analyzer import analysis
+from analyzer._price_index import _normalize_price_index
+from analyzer.exceptions import AnalyzerError, DataResult, DataSourceError, StepResult
+from analyzer.member_names import canonical_member_key
 from analyzer.member_ranking.buyer_scoring import (
+    _OFFICIAL_SOURCES,
     CONSENSUS_LOOKBACK_DAYS,
     CONSENSUS_MIN_BUYERS,
     _get_consensus_candidate_tickers,
     _get_consensus_price_tickers,
     _get_consensus_ticker_purchases,
+    _prepare_consensus_purchases,
     _resolve_consensus_ticker,
 )
+from analyzer.models import AnalysisMode, SourceCoverageState
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.price_snapshot import create_snapshot
+from analyzer.ticker_resolver import TickerResolver
 
 logger = logging.getLogger(__name__)
 
@@ -242,30 +245,169 @@ def source_freshness_metrics(
 def prepare_live_consensus_data(
     transaction_source,
     as_of_date: pd.Timestamp,
-    days_back: int,
+    *,
+    days_back: int | None = CONSENSUS_LOOKBACK_DAYS,
 ) -> pd.DataFrame:
     """Load only the public transactions needed for live consensus.
 
     Consensus scoring is a transaction-count decision and does not use forward
     price labels. Keeping this path separate from historical outcome analysis
     prevents a live recommendation from acquiring data that it never consumes.
+    Pass ``days_back=None`` to load all eligible disclosure history, for example
+    when reconstructing current holdings.
     The date filtering is repeated after the repository query so mocked or
     alternate transaction sources cannot make future disclosures visible.
     """
     as_of = pd.Timestamp(as_of_date).normalize()
-    history_start = as_of - timedelta(days=days_back)
+    history_start = (
+        as_of - timedelta(days=days_back) if days_back is not None else date.min
+    )
     trades = transaction_source.db.get_transactions_by_date_range(history_start, as_of)
     if trades.empty:
         return trades.copy()
 
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
-    trades = trades[
-        trades["ticker"].notna()
-        & disclosure_dates.notna()
-        & (disclosure_dates >= history_start)
-        & (disclosure_dates <= as_of)
-    ].copy()
+    eligible = trades["ticker"].notna() & disclosure_dates.notna()
+    if days_back is not None:
+        eligible &= disclosure_dates >= history_start
+    trades = trades[eligible & (disclosure_dates <= as_of)].copy()
     return trades
+
+
+def eligible_events(
+    db,
+    as_of: date | pd.Timestamp,
+    *,
+    days_back: int | None = None,
+) -> pd.DataFrame:
+    """Return point-in-time eligible purchase events from official sources."""
+    columns = [
+        "ticker",
+        "actor_id",
+        "kind",
+        "source",
+        "entry_ref",
+        "event_date",
+        "disclosure_date",
+        "corroboration",
+        "as_of",
+    ]
+    decision_date = pd.Timestamp(as_of).normalize()
+    history_start = (
+        decision_date - timedelta(days=days_back)
+        if days_back is not None
+        else date.min
+    )
+    trades = db.get_transactions_by_date_range(history_start, decision_date)
+    if trades.empty or not {"source", "ticker", "disclosure_date"}.issubset(
+        trades.columns
+    ):
+        return pd.DataFrame(columns=columns)
+
+    disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
+    eligible = (
+        trades["source"].isin(_OFFICIAL_SOURCES)
+        & trades["ticker"].notna()
+        & disclosure_dates.notna()
+        & (disclosure_dates <= decision_date)
+    )
+    if days_back is not None:
+        eligible &= disclosure_dates >= history_start
+    purchases = _prepare_consensus_purchases(trades.loc[eligible].copy())
+    if purchases.empty:
+        return pd.DataFrame(columns=columns)
+
+    kinds = {
+        "house_pdf": "congress",
+        "gemini_ocr": "congress",
+        "senate_efd": "congress",
+        "form4": "officer",
+        "13f": "manager",
+    }
+    closes: dict[str, pd.DataFrame] = {}
+    try:
+        symbols = sorted(
+            {str(value) for value in purchases["_resolved_symbol"].dropna().unique()}
+        )
+        connection = getattr(db, "conn", None)
+        if symbols and connection is not None:
+            history = connection.execute(
+                "SELECT ticker, date, close FROM prices WHERE ticker = ANY(?)",
+                [symbols],
+            ).fetchdf()
+            if set(history.columns) >= {"ticker", "date", "close"}:
+                history["date"] = pd.to_datetime(history["date"])
+                for symbol, frame in history.groupby("ticker"):
+                    closes[str(symbol)] = frame.sort_values("date")
+    except Exception:
+        closes = {}
+
+    def _congress_entry(symbol: str, day) -> float | None:
+        frame = closes.get(str(symbol))
+        if frame is None or frame.empty:
+            return None
+        try:
+            stamp = pd.Timestamp(day)
+        except (TypeError, ValueError):
+            return None
+        later = frame.loc[frame["date"] >= stamp, "close"]
+        later = later[later.notna()]
+        if later.empty:
+            return None
+        price = float(later.iloc[0])
+        return price if price > 0 else None
+
+    rows = []
+    for _, purchase in purchases.iterrows():
+        source = purchase["source"]
+        kind = kinds.get(source)
+        if kind is None:
+            continue
+        name = purchase["member"]
+        if not isinstance(name, str):
+            continue
+        if kind == "congress":
+            key = canonical_member_key(name)
+        else:
+            # Keep this local normalization aligned with analyzer.actors.actor_id.
+            key = name.strip()
+            key = key.upper()
+            key = " ".join(key.split())
+        if not key:
+            continue
+
+        entry_ref = None
+        if source == "form4":
+            description = purchase.get("asset_description")
+            amount = pd.to_numeric(purchase.get("amount_midpoint"), errors="coerce")
+            shares_match = (
+                re.search(r"([\d,.]+)\s+shares?\s+@", description, re.IGNORECASE)
+                if isinstance(description, str)
+                else None
+            )
+            if shares_match and pd.notna(amount):
+                shares = float(shares_match.group(1).replace(",", ""))
+                if shares > 0 and np.isfinite(amount):
+                    entry_ref = float(amount) / shares
+        elif kind == "congress":
+            entry_ref = _congress_entry(
+                purchase["_resolved_symbol"], purchase["transaction_date"]
+            )
+
+        rows.append(
+            {
+                "ticker": purchase["_resolved_symbol"],
+                "actor_id": f"{kind}:{key}",
+                "kind": kind,
+                "source": source,
+                "entry_ref": entry_ref,
+                "event_date": pd.Timestamp(purchase["transaction_date"]).normalize(),
+                "disclosure_date": pd.Timestamp(purchase["disclosure_date"]).normalize(),
+                "corroboration": source == "13f",
+                "as_of": decision_date,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
 
 
 @pipeline_step
@@ -378,7 +520,7 @@ def run_ticker_analysis(
         raise DataSourceError("year must match the ticker analysis as-of date year")
 
     known_trades = prepare_live_consensus_data(
-        transaction_source, analysis_as_of, CONSENSUS_LOOKBACK_DAYS
+        transaction_source, analysis_as_of, days_back=CONSENSUS_LOOKBACK_DAYS
     )
 
     try:
@@ -427,7 +569,7 @@ def run_recent_ticker_scoring(
         raise DataSourceError("year must match the as-of date year")
 
     recent_trades = prepare_live_consensus_data(
-        transaction_source, as_of_date, params.days_back
+        transaction_source, as_of_date, days_back=params.days_back
     )
     logger.info(
         "Loaded %d disclosures from the last %d days",
@@ -437,12 +579,10 @@ def run_recent_ticker_scoring(
 
     tickers = _get_consensus_candidate_tickers(
         recent_trades,
-        params.min_buyers,
+        1,
         as_of_date=as_of_date,
     )
-    logger.info(
-        "Found %d tickers with %d+ distinct buyers", len(tickers), params.min_buyers
-    )
+    logger.info("Found %d eligible ticker candidates", len(tickers))
 
     scores = [
         analysis.score_ticker_by_buyers(

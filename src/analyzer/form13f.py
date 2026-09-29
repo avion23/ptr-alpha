@@ -1,4 +1,4 @@
-"""Watchlist-scoped Form 13F position-change source."""
+"""Form 13F position-change source."""
 
 from __future__ import annotations
 
@@ -43,6 +43,28 @@ _OUTPUT_PROVENANCE_COLUMNS = (
 )
 _OUTPUT_COLUMNS = _BASE_WRITE_COLUMNS + _OUTPUT_PROVENANCE_COLUMNS
 _SHARE_SUBTYPE = "INFERRED_POSITION_INCREASE"
+_INCREASE_COLUMNS = (
+    "manager_key",
+    "manager",
+    "ticker",
+    "event_date",
+    "disclosure_date",
+    "cusip",
+    "added_shares",
+    "raw_asset_description",
+    "source",
+)
+_CANDIDATE_COLUMNS = (
+    "ticker",
+    "actor_id",
+    "kind",
+    "source",
+    "entry_ref",
+    "event_date",
+    "disclosure_date",
+    "corroboration",
+    "as_of",
+)
 
 
 class ThirteenFError(Exception):
@@ -147,7 +169,7 @@ def _recent_quarters(submissions: dict) -> list[dict[str, str]]:
 
 
 class ThirteenFSource(TransactionSource):
-    """Compare recent 13F share positions for an explicit ticker watchlist."""
+    """Compare 13F positions against ticker keywords or across all holdings."""
 
     def __init__(
         self,
@@ -159,6 +181,7 @@ class ThirteenFSource(TransactionSource):
         ingestion_generation: str | None = None,
         price_lookup: Callable[[str, date], float | None] | None = None,
         managers: dict[str, dict[str, str]] | None = None,
+        ticker_map: dict[str, str] | None = None,
     ):
         if (
             not isinstance(watchlist, dict)
@@ -199,6 +222,21 @@ class ThirteenFSource(TransactionSource):
         self.managers = WATCHLIST_MANAGERS if managers is None else managers
         if not self.managers:
             raise ThirteenFError("At least one 13F manager is required")
+        if ticker_map is not None and (
+            not isinstance(ticker_map, dict)
+            or any(
+                not isinstance(cusip, str)
+                or not cusip.strip()
+                or not isinstance(ticker, str)
+                or not ticker.strip()
+                for cusip, ticker in ticker_map.items()
+            )
+        ):
+            raise ThirteenFError("ticker_map must map non-empty CUSIPs to tickers")
+        self.ticker_map = {
+            cusip.strip().upper(): ticker.strip()
+            for cusip, ticker in (ticker_map or {}).items()
+        }
         self._last_request_at = 0.0
         self.session = requests.Session()
         self.session.headers.update(
@@ -311,6 +349,57 @@ class ThirteenFSource(TransactionSource):
             manager, current_filing, current, previous, report_url
         )
 
+    def _manager_increases(self, key: str, manager: dict[str, str]) -> list[dict]:
+        filings = _recent_quarters(self._load_submissions(manager["cik"]))
+        previous_filing, current_filing = reversed(filings)
+        previous, _ = self._load_filing(manager["cik"], previous_filing)
+        current, _ = self._load_filing(manager["cik"], current_filing)
+        return self._position_increases(key, manager, current_filing, current, previous)
+
+    def _position_increases(
+        self,
+        manager_key: str,
+        manager: dict[str, str],
+        current_filing: dict[str, str],
+        current: dict[str, dict[str, object]],
+        previous: dict[str, dict[str, object]],
+    ) -> list[dict]:
+        quarter_end = date.fromisoformat(current_filing["report_date"])
+        disclosure_date = date.fromisoformat(current_filing["filing_date"])
+        rows = []
+        for cusip, holding in current.items():
+            shares = int(str(holding["shares"]))
+            added_shares = shares - int(str(previous.get(cusip, {}).get("shares", 0)))
+            if added_shares <= 0:
+                continue
+
+            issuer = str(holding["issuer"])
+            issuer_folded = issuer.casefold()
+            matches = {
+                ticker
+                for ticker, keywords in self.watchlist.items()
+                if any(keyword.casefold() in issuer_folded for keyword in keywords)
+            }
+            ticker = (
+                next(iter(matches))
+                if len(matches) == 1
+                else self.ticker_map.get(cusip.upper())
+            )
+            rows.append(
+                {
+                    "manager_key": manager_key,
+                    "manager": manager["name"],
+                    "ticker": ticker,
+                    "event_date": quarter_end,
+                    "disclosure_date": disclosure_date,
+                    "cusip": cusip,
+                    "added_shares": added_shares,
+                    "raw_asset_description": issuer,
+                    "source": "13f",
+                }
+            )
+        return rows
+
     def _position_changes(
         self,
         manager: dict[str, str],
@@ -409,6 +498,28 @@ class ThirteenFSource(TransactionSource):
             )
         return pd.DataFrame(rows, columns=_OUTPUT_COLUMNS)
 
+    def fetch_all_increases(self) -> pd.DataFrame:
+        rows = []
+        failures = []
+        for key, manager in self.managers.items():
+            try:
+                rows.extend(self._manager_increases(key, manager))
+            except ThirteenFError as exc:
+                failures.append(f"{key}: {exc}")
+                logger.warning("Skipping 13F manager %s: %s", key, exc)
+        if failures:
+            logger.warning(
+                "13F skipped %d of %d managers", len(failures), len(self.managers)
+            )
+        if len(failures) == len(self.managers):
+            raise ThirteenFError("All 13F managers failed; " + "; ".join(failures))
+        increases = pd.DataFrame(rows, columns=_INCREASE_COLUMNS)
+        if rows:
+            increases["ticker"] = pd.Series(
+                [row["ticker"] for row in rows], dtype=object
+            )
+        return increases
+
     def save_to_db(self, transactions: pd.DataFrame) -> int:
         if tuple(transactions.columns) != _OUTPUT_COLUMNS:
             raise ThirteenFError(
@@ -427,4 +538,19 @@ class ThirteenFSource(TransactionSource):
         return self.save_to_db(self.fetch_all_trades())
 
 
-__all__ = ["ThirteenFError", "ThirteenFSource"]
+def candidates_from_increases(df: pd.DataFrame) -> pd.DataFrame:
+    candidates = pd.DataFrame(index=df.index)
+    candidates["ticker"] = df["ticker"].astype(object)
+    candidates.loc[candidates["ticker"].isna(), "ticker"] = None
+    candidates["actor_id"] = "manager:" + df["manager_key"].astype(str)
+    candidates["kind"] = "manager"
+    candidates["source"] = "13f"
+    candidates["entry_ref"] = None
+    candidates["event_date"] = df["event_date"]
+    candidates["disclosure_date"] = df["disclosure_date"]
+    candidates["corroboration"] = True
+    candidates["as_of"] = pd.Timestamp.now(tz="UTC").normalize()
+    return candidates.loc[:, _CANDIDATE_COLUMNS].reset_index(drop=True)
+
+
+__all__ = ["ThirteenFError", "ThirteenFSource", "candidates_from_increases"]

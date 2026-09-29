@@ -125,15 +125,15 @@ def build_positions(
         if _is_option_row(row, has_instrument):
             skipped_options += 1
             continue
-        if has_disclosure:
-            disclosed = row.disclosure_date
-            if (
-                disclosed is not None
-                and not pd.isna(disclosed)
-                and pd.Timestamp(disclosed).date() > as_of
-            ):
-                skipped += 1
-                continue
+        disclosed = row.disclosure_date if has_disclosure else None
+        disclosure_day = (
+            pd.Timestamp(disclosed).date()
+            if disclosed is not None and not pd.isna(disclosed)
+            else day
+        )
+        if disclosure_day > as_of or day > as_of:
+            skipped += 1
+            continue
         last_activity[key] = day
 
         history = price_history.get(str(row.ticker))
@@ -148,7 +148,8 @@ def build_positions(
                 skipped += 1
                 continue
             shares = size / entry
-            lots.setdefault(key, []).append([shares, size])
+            source = row.source if "source" in trades.columns else None
+            lots.setdefault(key, []).append([shares, size, disclosure_day, source])
             if by_floor:
                 floor_sized[key] = floor_sized.get(key, 0) + 1
             first_buy.setdefault(key, day)
@@ -161,13 +162,18 @@ def build_positions(
             to_relieve = size / entry
             queue = lots.setdefault(key, [])
             while to_relieve > 0 and queue:
-                lot_shares, lot_cost = queue[0]
+                lot_shares, lot_cost, lot_disclosure, lot_source = queue[0]
                 if lot_shares <= to_relieve:
                     to_relieve -= lot_shares
                     queue.pop(0)
                 else:
                     fraction = to_relieve / lot_shares
-                    queue[0] = [lot_shares - to_relieve, lot_cost * (1 - fraction)]
+                    queue[0] = [
+                        lot_shares - to_relieve,
+                        lot_cost * (1 - fraction),
+                        lot_disclosure,
+                        lot_source,
+                    ]
                     to_relieve = 0
             first_buy.setdefault(key, day)
         else:
@@ -196,6 +202,8 @@ def build_positions(
                 "discount_pct": (current / basis - 1) * 100,
                 "first_buy": first_buy[key],
                 "last_activity": last_activity[key],
+                "disclosure_date": max(lot[2] for lot in queue),
+                "source": queue[-1][3],
                 "floor_sized_lots": floor_sized.get(key, 0),
             }
         )
@@ -217,11 +225,101 @@ def build_positions(
         "discount_pct",
         "first_buy",
         "last_activity",
+        "disclosure_date",
+        "source",
         "floor_sized_lots",
     ]
     return pd.DataFrame(records, columns=columns).sort_values(
         "discount_pct", kind="mergesort"
     )
+
+
+def holdings_candidates(
+    db, member: str, as_of: date, *, include_unpromoted: bool = False
+) -> pd.DataFrame:
+    """Return open positions as uncorroborated, unexpired setup candidates.
+
+    Lots count only when their disclosure date (or transaction date when
+    missing) is no later than ``as_of``. Position valuation uses the last close
+    on or before ``as_of``; future closes cannot enter a replay. Positions have
+    no age expiry and remain candidates until sales close their lots.
+    """
+    columns = [
+        "ticker",
+        "actor_id",
+        "kind",
+        "source",
+        "entry_ref",
+        "event_date",
+        "disclosure_date",
+        "corroboration",
+        "as_of",
+    ]
+    source_kinds = {
+        "house_pdf": "congress",
+        "gemini_ocr": "congress",
+        "senate_efd": "congress",
+        "form4": "officer",
+        "13f": "manager",
+    }
+
+    try:
+        from analyzer.actors import actor_id
+    except ModuleNotFoundError as exc:
+        if exc.name != "analyzer.actors":
+            raise
+
+        # analyzer.actors is not present in older installs; keep its stable format.
+        def _actor_id(kind, key):
+            return f"{kind}:{key}"
+
+    else:
+        _actor_id = actor_id
+
+    trades = load_member_trades(db, member, include_unpromoted=include_unpromoted)
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+
+    trades = trades.loc[trades["source"].isin(source_kinds)].copy()
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+
+    histories = {
+        str(ticker): load_price_history(db, str(ticker))
+        for ticker in trades["ticker"].dropna().unique()
+    }
+    records = []
+    for actor_kind in ("congress", "officer", "manager"):
+        kind_trades = trades.loc[
+            trades["source"].map(source_kinds).eq(actor_kind)
+        ]
+        if kind_trades.empty:
+            continue
+        positions = build_positions(kind_trades, histories, as_of=as_of)
+        for position in positions.itertuples(index=False):
+            source = position.source
+            records.append(
+                {
+                    "ticker": position.ticker,
+                    "actor_id": _actor_id(actor_kind, member),
+                    "kind": actor_kind,
+                    "source": source,
+                    "entry_ref": (
+                        None if source == "13f" else float(position.cost_basis)
+                    ),
+                    "event_date": position.last_activity,
+                    "disclosure_date": position.disclosure_date,
+                    "corroboration": False,
+                    "as_of": as_of,
+                }
+            )
+
+    result = pd.DataFrame(records, columns=columns)
+    if not result.empty:
+        result["entry_ref"] = pd.Series(
+            [record["entry_ref"] for record in records], dtype=object
+        )
+    return result
 
 
 def discount_alerts(positions: pd.DataFrame, *, threshold_pct: float = -10.0) -> pd.DataFrame:

@@ -7,10 +7,11 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote, urlsplit
+from uuid import uuid4
 
 import pandas as pd
 import requests
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data"
+SEC_DAILY_INDEX_URL = "https://www.sec.gov/Archives/edgar/daily-index"
 DEFAULT_USER_AGENT = "ptr-alpha research contact@example.com"
 REQUEST_TIMEOUT = 30
 REQUEST_INTERVAL = 1 / 8
@@ -42,6 +44,7 @@ _NEGATIVE_10B5_RE = re.compile(
     r"10b5\s*[-‐‑–—]?\s*1.{0,50}\b(?:not|no|without)\b",
     re.IGNORECASE,
 )
+_TRADE_PRICE_RE = re.compile(r"\bshares\s+@\s+\$([0-9]+(?:\.[0-9]+)?)\b")
 _FORM4_COLUMNS = _BASE_WRITE_COLUMNS + (
     "source_record_id",
     "source_row_id",
@@ -51,6 +54,17 @@ _FORM4_COLUMNS = _BASE_WRITE_COLUMNS + (
     "ingestion_generation",
     "raw_transaction_subtype",
     "raw_asset_description",
+)
+_SWEEP_CANDIDATE_COLUMNS = (
+    "ticker",
+    "actor_id",
+    "kind",
+    "source",
+    "entry_ref",
+    "event_date",
+    "disclosure_date",
+    "corroboration",
+    "as_of",
 )
 
 
@@ -235,6 +249,57 @@ def _ownership_xml(content: bytes) -> bytes:
     )
 
 
+def _is_officer_filing(content: bytes) -> bool:
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as exc:
+        raise Form4Error(f"SEC filing is not valid XML: {exc}") from exc
+    if _local_name(root.tag) != "ownershipDocument":
+        raise Form4Error("SEC filing is not an ownership document")
+    owner = next(
+        (node for node in root.iter() if _local_name(node.tag) == "reportingOwner"),
+        None,
+    )
+    if owner is None:
+        return False
+    relationship = _first_element(owner, "reportingOwnerRelationship")
+    if relationship is None:
+        return False
+    return _clean_text(_field_value(relationship, "isOfficer")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "x",
+    }
+
+
+def candidates_from_sweep(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert sweep rows to candidates; analyzer.actors is canonical for this format."""
+    rows = []
+    as_of = datetime.now(UTC).date()
+    for row in df.to_dict("records"):
+        description = str(row.get("raw_asset_description") or "")
+        price = _TRADE_PRICE_RE.search(description)
+        owner = " ".join(str(row.get("raw_owner") or "").split()).upper()
+        ticker = " ".join(str(row.get("ticker") or "").split()).upper()
+        if not price or not owner or not ticker:
+            continue
+        rows.append(
+            {
+                "ticker": ticker,
+                "actor_id": f"officer:{owner}",
+                "kind": "officer",
+                "source": "form4",
+                "entry_ref": float(price.group(1)),
+                "event_date": row["transaction_date"],
+                "disclosure_date": row["official_filing_date"],
+                "corroboration": False,
+                "as_of": as_of,
+            }
+        )
+    return pd.DataFrame(rows, columns=_SWEEP_CANDIDATE_COLUMNS)
+
+
 class Form4Source(TransactionSource):
     """Fetch SEC Form 4 filings and persist Table I open-market purchases."""
 
@@ -396,6 +461,142 @@ class Form4Source(TransactionSource):
         return filings
 
     @staticmethod
+    def _parse_master_index(content: bytes | str) -> list[dict]:
+        text = (
+            content.decode("utf-8-sig", errors="replace")
+            if isinstance(content, bytes)
+            else content
+        )
+        filings = []
+        in_records = False
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if not in_records:
+                if line.strip().startswith("-----"):
+                    in_records = True
+                continue
+            if not line.strip():
+                continue
+            fields = line.split("|")
+            if len(fields) != 5:
+                logger.warning(
+                    "Skipping malformed SEC master index line %d", line_number
+                )
+                continue
+            raw_cik, _, form, raw_filing_date, filename = (
+                field.strip() for field in fields
+            )
+            if form not in {"4", "4/A"}:
+                continue
+            try:
+                if not raw_cik.isdigit():
+                    raise ValueError
+                cik = int(raw_cik)
+                filing_date = date.fromisoformat(raw_filing_date)
+                parts = filename.split("/")
+                if (
+                    len(parts) < 4
+                    or parts[:2] != ["edgar", "data"]
+                    or not parts[2].isdigit()
+                    or int(parts[2]) != cik
+                    or any(
+                        part in {"", ".", ".."} or "\\" in part for part in parts[2:]
+                    )
+                ):
+                    raise ValueError
+                if len(parts) == 4 and re.fullmatch(r"\d{18}\.txt", parts[3]):
+                    accession_digits = parts[3][:-4]
+                elif len(parts) >= 5 and re.fullmatch(r"\d{18}", parts[3]):
+                    accession_digits = parts[3]
+                else:
+                    raise ValueError
+                if not re.fullmatch(r"\d{18}", accession_digits):
+                    raise ValueError
+                if int(accession_digits[:10]) != cik:
+                    raise ValueError
+            except ValueError:
+                logger.warning(
+                    "Skipping malformed SEC master index line %d", line_number
+                )
+                continue
+            filings.append(
+                {
+                    "cik": cik,
+                    "accession": (
+                        f"{accession_digits[:10]}-{accession_digits[10:12]}-"
+                        f"{accession_digits[12:]}"
+                    ),
+                    "filing_date": filing_date,
+                    "ownership_document": f"{accession_digits}.txt",
+                }
+            )
+        return filings
+
+    @staticmethod
+    def _daily_index_url(filing_day: date) -> str:
+        quarter = (filing_day.month - 1) // 3 + 1
+        return (
+            f"{SEC_DAILY_INDEX_URL}/{filing_day.year}/QTR{quarter}/"
+            f"master.{filing_day:%Y%m%d}.idx"
+        )
+
+    def sweep_recent(
+        self, days_back: int = 7, *, limit_filings: int = 500
+    ) -> pd.DataFrame:
+        """Fetch recent officer Form 4 open-market buys across the filing universe."""
+        empty = pd.DataFrame(columns=_FORM4_COLUMNS)
+        if days_back < 1 or limit_filings < 1:
+            return empty
+
+        today = datetime.now(UTC).date()
+        start_date = today - timedelta(days=days_back - 1)
+        filings = []
+        for offset in range(days_back):
+            filing_day = today - timedelta(days=offset)
+            try:
+                content = self._request(self._daily_index_url(filing_day)).content
+            except Form4Error as exc:
+                if "HTTP 404" not in str(exc):
+                    logger.warning(
+                        "Could not fetch SEC daily index for %s: %s", filing_day, exc
+                    )
+                continue
+            filings.extend(self._parse_master_index(content))
+
+        recent = sorted(
+            (
+                filing
+                for filing in filings
+                if start_date <= filing["filing_date"] <= today
+            ),
+            key=lambda filing: filing["filing_date"],
+            reverse=True,
+        )[:limit_filings]
+        rows = []
+        for filing in recent:
+            url = self._archive_url(filing["cik"], filing)
+            try:
+                xml = _ownership_xml(self._request(url).content)
+                if not _is_officer_filing(xml):
+                    continue
+                parsed = parse_form4_xml(
+                    xml,
+                    accession=filing["accession"],
+                    source_report_path=url,
+                    official_filing_date=filing["filing_date"],
+                    ingestion_generation=self.ingestion_generation,
+                )
+                if not parsed.empty:
+                    rows.append(parsed)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping SEC Form 4 filing %s: %s",
+                    filing["accession"],
+                    exc,
+                    exc_info=True,
+                )
+        return pd.concat(rows, ignore_index=True) if rows else empty
+
+    @staticmethod
     def _archive_url(cik: int, filing: dict) -> str:
         accession_no_dashes = filing["accession"].replace("-", "")
         document = quote(filing["ownership_document"], safe="._-")
@@ -519,3 +720,9 @@ class Form4Source(TransactionSource):
         self, year: int, tickers: list[str] | tuple[str, ...] | None = None
     ) -> int:
         return self.save_to_db(self.fetch_all_trades(year, tickers))
+
+    def fetch_and_save_sweep(self, days_back: int = 7, limit_filings: int = 500) -> int:
+        self.ingestion_generation = uuid4().hex
+        return self.save_to_db(
+            self.sweep_recent(days_back, limit_filings=limit_filings)
+        )

@@ -62,6 +62,7 @@ def test_two_actors_outscore_one_and_corroboration_is_bounded():
         candidates,
         {"officer:BURKE CEO": 1.0, "congress:PELOSI": 1.0, "congress:SMITH": 1.0},
         {"AAPL": 100.0, "MSFT": 100.0},
+        watchlist={"manager:FUND A", "manager:FUND B"},
     )
 
     assert ranked.set_index("ticker").loc["AAPL", "score"] == pytest.approx(3.0)
@@ -291,10 +292,48 @@ def test_corroborated_lone_initiator_ranks_but_uncorroborated_does_not():
         ]
     )
     weights = {"officer:BURKE CEO": 0.6}
+    watchlist = {"manager:FUND A"}
 
-    ranked_lone, _ = score(lone, weights, {"AAPL": 100.0})
+    ranked_lone, _ = score(lone, weights, {"AAPL": 100.0}, watchlist=watchlist)
     assert ranked_lone.empty
 
-    ranked_backed, _ = score(backed, weights, {"AAPL": 100.0})
+    ranked_backed, _ = score(backed, weights, {"AAPL": 100.0}, watchlist=watchlist)
     assert len(ranked_backed) == 1
     assert ranked_backed.iloc[0]["actors"] == ["officer:BURKE CEO"]
+
+
+def test_non_watchlist_corroboration_does_not_promote():
+    backed = pd.DataFrame(
+        [
+            _row(
+                actor_id="officer:BURKE CEO",
+                source="form4",
+                event_date=date(2024, 3, 1),
+                position_evidence=True,
+            ),
+            _row(actor_id="manager:RANDOM FUND", corroboration=True, source="13f"),
+        ]
+    )
+    ranked, _ = score(
+        backed,
+        {"officer:BURKE CEO": 0.6},
+        {"AAPL": 100.0},
+        watchlist={"manager:FUND A"},
+    )
+    assert ranked.empty
+
+
+def test_missing_watchlist_means_no_corroboration():
+    backed = pd.DataFrame(
+        [
+            _row(
+                actor_id="officer:BURKE CEO",
+                source="form4",
+                event_date=date(2024, 3, 1),
+                position_evidence=True,
+            ),
+            _row(actor_id="manager:FUND A", corroboration=True, source="13f"),
+        ]
+    )
+    ranked, _ = score(backed, {"officer:BURKE CEO": 0.6}, {"AAPL": 100.0})
+    assert ranked.empty

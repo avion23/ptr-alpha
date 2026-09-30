@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Collection
 
 import pandas as pd
+
+from analyzer.manager_watchlist import normalize_manager_name
 
 _RANKED_COLUMNS = ["ticker", "score", "actors", "n_actors", "current", "reasons"]
 _BLOCKED_COLUMNS = ["ticker", "actor_id", "reason"]
@@ -36,8 +39,14 @@ def score(
     *,
     entry_tol: float = 1.05,
     event_half_life_days: int = 90,
+    watchlist: Collection[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Rank price-eligible initiating actors and report blocked actors."""
+    """Rank price-eligible initiating actors and report blocked actors.
+
+    13F corroboration counts only for curated watchlist managers: pass
+    ``manager_watchlist.watchlist_actor_ids()``. Without a watchlist no
+    corroboration is recognized (fail closed).
+    """
     if entry_tol <= 0 or event_half_life_days <= 0:
         raise ValueError("entry_tol and event_half_life_days must be positive")
 
@@ -71,6 +80,11 @@ def score(
             if row.get("source") != "13f":
                 return False
             if str(row.get("actor_id")) in initiator_ids:
+                return False
+            if watchlist is None:
+                return False
+            actor_name = str(row.get("actor_id")).partition(":")[2]
+            if f"manager:{normalize_manager_name(actor_name)}" not in watchlist:
                 return False
             try:
                 disclosed = _as_date(row["disclosure_date"])

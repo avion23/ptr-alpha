@@ -269,11 +269,11 @@ def test_zts_june_july_results_use_disclosure_dates_and_ignore_later_rows(
     ranked_by_snapshot = {}
     current_snapshot = None
 
-    def capture_score(candidates, weights, current_prices):
+    def capture_score(candidates, weights, current_prices, **kw):
         decision_date = pd.Timestamp(candidates.iloc[0]["as_of"]).date()
         key = (current_snapshot, decision_date)
         captured[key] = (candidates.copy(), current_prices.copy())
-        ranked, blocked = setups.score(candidates, weights, current_prices)
+        ranked, blocked = setups.score(candidates, weights, current_prices, **kw)
         ranked_by_snapshot[key] = (ranked.copy(), blocked.copy())
         return ranked, blocked
 

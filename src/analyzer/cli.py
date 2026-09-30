@@ -1540,6 +1540,7 @@ def setups(
             holdings_candidates,
         )
         from analyzer.member_names import canonical_member_key
+        from analyzer.manager_watchlist import watchlist_actor_ids
         from analyzer.positions import _same_member_variant
         from analyzer.setups import score as score_setups
     except ImportError as exc:
@@ -1553,6 +1554,24 @@ def setups(
     requested_tickers = {symbol.strip().upper() for symbol in ticker}
     try:
         frames = []
+        # One human, one holdings load: drop requested names that denote an
+        # already-requested member (variants, nicknames, middle names).
+        requested: list[str] = []
+        requested_keys: list[str] = []
+        for name in member:
+            try:
+                key = canonical_member_key(name)
+            except (TypeError, ValueError):
+                key = str(name).strip().upper()
+            if key in requested_keys or any(
+                _same_member_variant(key, seen)
+                or _same_member_variant(seen, key)
+                for seen in requested_keys
+            ):
+                continue
+            requested_keys.append(key)
+            requested.append(name)
+        member = requested
         for selected_member in member:
             frame = holdings_candidates(
                 db,
@@ -1672,7 +1691,12 @@ def setups(
                 weights[actor_id] = compute_weight(
                     str(row.kind), 0, 0.0, str(row.source)
                 )
-        ranked, blocked = score_setups(candidates, weights, current_prices)
+        ranked, blocked = score_setups(
+            candidates,
+            weights,
+            current_prices,
+            watchlist=watchlist_actor_ids(),
+        )
     except typer.Exit:
         raise
     except Exception as exc:

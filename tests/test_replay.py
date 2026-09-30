@@ -52,7 +52,7 @@ def _install_scoring(monkeypatch, events):
             SimpleNamespace(
                 compute_weight=lambda kind, n, hits, source: 0.6
             ),
-            SimpleNamespace(score=lambda candidates, weights, prices: (ranked, blocked)),
+            SimpleNamespace(score=lambda candidates, weights, prices, **kw: (ranked, blocked)),
         ),
     )
 

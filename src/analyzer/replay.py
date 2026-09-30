@@ -190,7 +190,14 @@ def _score(
     if current is None:
         return None, True, len(weights)
     try:
-        ranked, blocked = setups.score(candidates, weights, {ticker: current})
+        from analyzer.manager_watchlist import watchlist_actor_ids
+
+        ranked, blocked = setups.score(
+            candidates,
+            weights,
+            {ticker: current},
+            watchlist=watchlist_actor_ids(),
+        )
     except (KeyError, TypeError, IndexError, ValueError) as exc:
         raise ReplayError("analyzer.setups.score violated its return contract") from exc
     hit = ranked.loc[

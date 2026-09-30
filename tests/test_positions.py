@@ -586,6 +586,26 @@ class TestPositions(unittest.TestCase):
         self.assertEqual(row["event_date"], date(2025, 6, 10))
         self.assertEqual(row["disclosure_date"], date(2025, 6, 12))
 
+    def test_dedupe_member_names_unites_variants(self):
+        from analyzer.positions import dedupe_member_names
+
+        self.assertEqual(
+            dedupe_member_names(
+                ["Michael McCaul", "Michael T. McCaul", "Nancy Pelosi"]
+            ),
+            ["Michael McCaul", "Nancy Pelosi"],
+        )
+        self.assertEqual(
+            dedupe_member_names(
+                ["Chuck Fleischmann", "Charles J. Fleischmann"]
+            ),
+            ["Chuck Fleischmann"],
+        )
+        self.assertEqual(
+            dedupe_member_names(["Mike McCaul"], exclude=["Michael T. McCaul"]),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

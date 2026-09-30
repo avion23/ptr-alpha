@@ -543,6 +543,35 @@ def coalesce_actor_variants(events: pd.DataFrame, from_positions: pd.DataFrame) 
     return events
 
 
+def _identity_key(name: str) -> str:
+    try:
+        return canonical_member_key(name)
+    except (TypeError, ValueError):
+        return str(name).strip().upper()
+
+
+def dedupe_member_names(
+    names: list[str], exclude: list[str] | tuple[str, ...] = ()
+) -> list[str]:
+    """Drop names denoting an already-listed (or excluded) human.
+
+    Matches on canonical key first, then the filed-variant rule for
+    nicknames and optional middle names. First spelling wins.
+    """
+    keys = [_identity_key(name) for name in exclude]
+    kept: list[str] = []
+    for name in names:
+        key = _identity_key(name)
+        if key in keys or any(
+            _same_member_variant(key, seen) or _same_member_variant(seen, key)
+            for seen in keys
+        ):
+            continue
+        keys.append(key)
+        kept.append(name)
+    return kept
+
+
 def _member_variants(db, member: str) -> list[str]:
     """All filed name variants for the member.
 

@@ -1536,12 +1536,11 @@ def setups(
         from analyzer.pipeline import eligible_events
         from analyzer.positions import (
             coalesce_actor_variants,
+            dedupe_member_names,
             gate_closed_events,
             holdings_candidates,
         )
-        from analyzer.member_names import canonical_member_key
         from analyzer.manager_watchlist import watchlist_actor_ids
-        from analyzer.positions import _same_member_variant
         from analyzer.setups import score as score_setups
     except ImportError as exc:
         _cli_exit(1, f"Error: setups is unavailable ({exc})")
@@ -1556,22 +1555,7 @@ def setups(
         frames = []
         # One human, one holdings load: drop requested names that denote an
         # already-requested member (variants, nicknames, middle names).
-        requested: list[str] = []
-        requested_keys: list[str] = []
-        for name in member:
-            try:
-                key = canonical_member_key(name)
-            except (TypeError, ValueError):
-                key = str(name).strip().upper()
-            if key in requested_keys or any(
-                _same_member_variant(key, seen)
-                or _same_member_variant(seen, key)
-                for seen in requested_keys
-            ):
-                continue
-            requested_keys.append(key)
-            requested.append(name)
-        member = requested
+        member = dedupe_member_names(list(member))
         for selected_member in member:
             frame = holdings_candidates(
                 db,
@@ -1603,13 +1587,6 @@ def setups(
             else:
                 events = events.iloc[0:0]
             if not events.empty:
-                selected_members = set(member)
-                selected_keys = set()
-                for name in selected_members:
-                    try:
-                        selected_keys.add(canonical_member_key(name))
-                    except (TypeError, ValueError):
-                        selected_keys.add(str(name).strip().upper())
                 event_kinds: dict[str, str] = {}
                 for actor_id in events["actor_id"].dropna():
                     text = str(actor_id)
@@ -1619,23 +1596,14 @@ def setups(
                     if name:
                         event_kinds.setdefault(name, kind)
                 event_tickers = set(events["ticker"].astype("string").str.upper())
-                processed_keys = set(selected_keys)
-                for event_member in sorted(event_kinds):
-                    if event_member in selected_members:
-                        continue
-                    if event_kinds[event_member] != "congress":
-                        continue
-                    try:
-                        event_key = canonical_member_key(event_member)
-                    except (TypeError, ValueError):
-                        event_key = event_member.strip().upper()
-                    if event_key in processed_keys or any(
-                        _same_member_variant(event_key, seen)
-                        or _same_member_variant(seen, event_key)
-                        for seen in processed_keys
-                    ):
-                        continue
-                    processed_keys.add(event_key)
+                congress_names = sorted(
+                    name
+                    for name, kind in event_kinds.items()
+                    if kind == "congress"
+                )
+                for event_member in dedupe_member_names(
+                    congress_names, exclude=list(member)
+                ):
                     frame = holdings_candidates(
                         db,
                         event_member,

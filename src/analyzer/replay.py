@@ -92,35 +92,66 @@ def _ticker_candidates(
     pipeline,
     positions,
 ) -> pd.DataFrame:
-    frames = [
-        (
-            _candidate_frame(
-                pipeline.eligible_events(db, as_of), "pipeline.eligible_events"
-            ),
-            "pipeline.eligible_events",
-        )
-    ]
-    for member in members:
-        frames.append(
-            (
-                _candidate_frame(
-                    positions.holdings_candidates(db, member, as_of),
-                    "positions.holdings_candidates",
-                ),
-                "positions.holdings_candidates",
+    events = _candidate_frame(
+        pipeline.eligible_events(db, as_of), "pipeline.eligible_events"
+    )
+    _check_disclosures(events, as_of, "pipeline.eligible_events")
+    if not events.empty:
+        if "ticker" not in events:
+            raise ReplayError(
+                "pipeline.eligible_events candidates have no ticker column"
             )
-        )
+        if "actor_id" not in events:
+            raise ReplayError(
+                "pipeline.eligible_events candidates have no actor_id column"
+            )
+        events = events.loc[
+            events["ticker"].astype("string").str.upper() == ticker
+        ].copy()
 
+    event_members = set()
+    if not events.empty:
+        event_members = {
+            str(actor_id).split(":", 1)[1]
+            for actor_id in events["actor_id"].dropna().unique()
+            if ":" in str(actor_id) and str(actor_id).split(":", 1)[1]
+        }
     selected = []
-    for frame, piece in frames:
-        _check_disclosures(frame, as_of, piece)
+    open_positions = set()
+    for member in dict.fromkeys([*members, *sorted(event_members)]):
+        frame = _candidate_frame(
+            positions.holdings_candidates(db, member, as_of),
+            "positions.holdings_candidates",
+        )
+        _check_disclosures(frame, as_of, "positions.holdings_candidates")
         if frame.empty:
             continue
         if "ticker" not in frame:
-            raise ReplayError(f"{piece} candidates have no ticker column")
-        matches = frame[frame["ticker"].astype("string").str.upper() == ticker]
+            raise ReplayError(
+                "positions.holdings_candidates candidates have no ticker column"
+            )
+        matches = frame.loc[
+            frame["ticker"].astype("string").str.upper() == ticker
+        ]
         if not matches.empty:
             selected.append(matches)
+            if "position_evidence" in matches and "actor_id" in matches:
+                open_rows = matches.loc[matches["position_evidence"].eq(True)]
+                open_positions.update(
+                    zip(
+                        open_rows["ticker"].astype("string").str.upper(),
+                        open_rows["actor_id"].astype(str),
+                    )
+                )
+
+    if not events.empty:
+        events["blocked_reason"] = None
+        for index, row in events.iterrows():
+            if (ticker, str(row["actor_id"])) not in open_positions:
+                events.at[index, "entry_ref"] = None
+                events.at[index, "blocked_reason"] = "no open position at as_of"
+        selected.append(events)
+
     if not selected:
         return pd.DataFrame(columns=["ticker", "member", "disclosure_date"])
     return pd.concat(selected, ignore_index=True).drop_duplicates(ignore_index=True)
@@ -180,8 +211,9 @@ def _score(
         n_actors = int(hit.iloc[0].get("n_actors", n_actors))
     except (TypeError, ValueError):
         pass
-    # A zero score is a scored-no-edge verdict, which is blocked, not ranked.
-    return score_value, score_value <= 0, n_actors
+    # Ranked membership is decided once, in setups.score via is_ranked;
+    # replay only mirrors it.
+    return score_value, False, n_actors
 
 
 def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | None:

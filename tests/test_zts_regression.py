@@ -11,7 +11,6 @@ JUNE_30 = date(2026, 6, 30)
 JULY_31 = date(2026, 7, 31)
 AUGUST_3 = date(2026, 8, 3)
 SEPTEMBER_4 = date(2026, 9, 4)
-MIN_SETUP_ACTORS = 3
 MEMBERS = [
     "Byron Donalds",
     "Gilbert Cisneros",
@@ -289,22 +288,35 @@ def test_zts_june_july_results_use_disclosure_dates_and_ignore_later_rows(
         for row in event_rows.itertuples():
             event_date = pd.Timestamp(row.event_date).date()
             assert row.entry_ref == REAL_CLOSES[event_date]
-        ranked, _ = ranked_by_snapshot[("after", decision_date)]
-        assert set(ranked.iloc[0]["actors"]) == expected_position_actors[decision_date]
+        ranked, blocked = ranked_by_snapshot[("after", decision_date)]
+        if decision_date == JUNE_30:
+            # One weak actor: visible in blocked, never ranked.
+            assert ranked.empty
+            assert blocked["reason"].tolist() == [
+                "score below ranking floor (1.00)"
+            ]
+        else:
+            assert set(ranked.iloc[0]["actors"]) == expected_position_actors[
+                decision_date
+            ]
 
     june = after.loc[after["as_of"] == JUNE_30].iloc[0]
     assert june["n_actors"] == 1
-    assert june["score"] > 0
-    assert june["n_actors"] < MIN_SETUP_ACTORS
-    june_is_setup = not june["blocked"] and june["n_actors"] >= MIN_SETUP_ACTORS
-    assert not june_is_setup
+    assert june["score"] == 0.0
+    assert bool(june["blocked"])
+    june_ranked, june_blocked = ranked_by_snapshot[("after", JUNE_30)]
+    assert june_ranked.empty
+    assert june_blocked["reason"].tolist() == [
+        "score below ranking floor (1.00)"
+    ]
 
     july = after.loc[after["as_of"] == JULY_31].iloc[0]
     assert july["n_actors"] == 4
-    assert july["score"] > 0
-    assert july["n_actors"] >= MIN_SETUP_ACTORS
-    july_is_setup = not july["blocked"] and july["n_actors"] >= MIN_SETUP_ACTORS
-    assert july_is_setup
+    assert july["score"] == pytest.approx(2.08)
+    assert not bool(july["blocked"])
+    july_ranked, july_blocked = ranked_by_snapshot[("after", JULY_31)]
+    assert july_ranked.iloc[0]["score"] == pytest.approx(2.08)
+    assert july_blocked.empty
 
 
 def test_fully_closed_holder_does_not_contribute():
@@ -344,7 +356,14 @@ def test_fully_closed_holder_does_not_contribute():
 
         candidates = positions.holdings_candidates(db, "Sell-Now Trap", JUNE_30)
         assert candidates.empty
-        ranked, _ = setups.score(candidates, {}, {"ZTS": REAL_CLOSES[JUNE_30]})
-        assert ranked.empty
+        result = replay.replay(
+            db,
+            ["ZTS"],
+            [JUNE_30],
+            horizon_days=90,
+            members=["Sell-Now Trap"],
+        )
+        assert result.iloc[0]["score"] == 0.0
+        assert bool(result.iloc[0]["blocked"])
     finally:
         db.conn.close()

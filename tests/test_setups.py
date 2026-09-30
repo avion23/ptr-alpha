@@ -76,8 +76,7 @@ def test_corroboration_only_has_zero_score_and_is_blocked():
         {"AAPL": 100.0},
     )
 
-    assert ranked.iloc[0]["score"] == 0.0
-    assert ranked.iloc[0]["actors"] == []
+    assert ranked.empty
     assert blocked.to_dict("records") == [
         {
             "ticker": "AAPL",
@@ -94,16 +93,16 @@ def test_over_tolerance_actor_is_blocked_and_not_counted():
         {"AAPL": 106.0},
     )
 
-    assert ranked.iloc[0]["score"] == 0.0
+    assert ranked.empty
     assert blocked.iloc[0]["actor_id"] == "congress:PELOSI"
     assert blocked.iloc[0]["reason"] == "above entry tolerance"
 
 
 def test_missing_weight_defaults_to_zero():
-    ranked, _ = score(pd.DataFrame([_row()]), {}, {"AAPL": 100.0})
+    ranked, blocked = score(pd.DataFrame([_row()]), {}, {"AAPL": 100.0})
 
-    assert ranked.iloc[0]["score"] == 0.0
-    assert ranked.iloc[0]["actors"] == ["congress:PELOSI"]
+    assert ranked.empty
+    assert blocked.iloc[0]["reason"] == "score below ranking floor (1.00)"
 
 
 def test_missing_entry_reference_is_blocked():
@@ -113,7 +112,7 @@ def test_missing_entry_reference_is_blocked():
         {"AAPL": 100.0},
     )
 
-    assert ranked.iloc[0]["score"] == 0.0
+    assert ranked.empty
     assert blocked.iloc[0]["reason"] == "no entry reference"
 
 
@@ -151,23 +150,51 @@ def test_fresh_initiation_decays_from_disclosure_date():
             _row(
                 event_date=date(2024, 5, 31),
                 disclosure_date=date(2024, 5, 31),
-            )
+            ),
+            _row(
+                actor_id="congress:CRUZ",
+                event_date=date(2024, 5, 31),
+                disclosure_date=date(2024, 5, 31),
+            ),
         ]
     )
 
-    ranked, _ = score(candidates, {"congress:PELOSI": 1.0}, {"AAPL": 100.0})
+    ranked, _ = score(
+        candidates,
+        {"congress:PELOSI": 1.0, "congress:CRUZ": 1.0},
+        {"AAPL": 100.0},
+    )
 
-    assert ranked.iloc[0]["score"] == pytest.approx(0.5 ** (1 / 90))
+    assert ranked.iloc[0]["score"] == pytest.approx(2 * 0.5 ** (1 / 90))
 
 
 def test_no_decay_cliff_between_day_60_and_61():
-    old = pd.DataFrame([_row(event_date=date(2024, 3, 31), disclosure_date=date(2024, 3, 31))])
-    new = pd.DataFrame([_row(event_date=date(2024, 4, 1), disclosure_date=date(2024, 4, 1))])
+    old = pd.DataFrame(
+        [
+            _row(event_date=date(2024, 3, 31), disclosure_date=date(2024, 3, 31)),
+            _row(
+                actor_id="congress:CRUZ",
+                event_date=date(2024, 3, 31),
+                disclosure_date=date(2024, 3, 31),
+            ),
+        ]
+    )
+    new = pd.DataFrame(
+        [
+            _row(event_date=date(2024, 4, 1), disclosure_date=date(2024, 4, 1)),
+            _row(
+                actor_id="congress:CRUZ",
+                event_date=date(2024, 4, 1),
+                disclosure_date=date(2024, 4, 1),
+            ),
+        ]
+    )
     # as_of 2024-06-01: disclosures 62 vs 61 days old; continuous decay
     # must not jump the way a 60-day position-evidence switch did.
-    s_old, _ = score(old, {"congress:PELOSI": 1.0}, {"AAPL": 100.0})
-    s_new, _ = score(new, {"congress:PELOSI": 1.0}, {"AAPL": 100.0})
-    assert abs(s_old.iloc[0]["score"] - s_new.iloc[0]["score"]) < 0.05
+    weights = {"congress:PELOSI": 1.0, "congress:CRUZ": 1.0}
+    s_old, _ = score(old, weights, {"AAPL": 100.0})
+    s_new, _ = score(new, weights, {"AAPL": 100.0})
+    assert abs(s_old.iloc[0]["score"] - s_new.iloc[0]["score"]) < 0.1
 
 
 def test_position_evidence_holds_full_weight():
@@ -181,8 +208,13 @@ def test_position_evidence_holds_full_weight():
 
 def test_officer_reference_is_not_labeled_estimate():
     ranked, _ = score(
-        pd.DataFrame([_row(actor_id="officer:BURKE CEO", source="form4")]),
-        {"officer:BURKE CEO": 1.0},
+        pd.DataFrame(
+            [
+                _row(actor_id="officer:BURKE CEO", source="form4"),
+                _row(actor_id="officer:OTHER CEO", source="form4"),
+            ]
+        ),
+        {"officer:BURKE CEO": 1.0, "officer:OTHER CEO": 1.0},
         {"AAPL": 100.0},
     )
-    assert "(est.)" not in ranked.iloc[0]["reasons"][0]
+    assert all("(est.)" not in reason for reason in ranked.iloc[0]["reasons"])

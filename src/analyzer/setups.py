@@ -9,6 +9,21 @@ import pandas as pd
 _RANKED_COLUMNS = ["ticker", "score", "actors", "n_actors", "current", "reasons"]
 _BLOCKED_COLUMNS = ["ticker", "actor_id", "reason"]
 
+_RANKED_FLOOR = 1.0
+_CORROBORATED_FLOOR = 0.25
+
+
+def is_ranked(score_value: float, n_actors: int) -> bool:
+    """A setup ranks when strong alone or corroborated.
+
+    score >= 1.0 is roughly two independent evidence pieces; two or more
+    actors rank at a lower floor. Single weak actors (June-ZTS style)
+    stay visible in blocked, never in ranked.
+    """
+    if score_value >= _RANKED_FLOOR:
+        return True
+    return n_actors >= 2 and score_value > _CORROBORATED_FLOOR
+
 
 def score(
     candidates: pd.DataFrame,
@@ -92,7 +107,18 @@ def score(
                 usable.append((decay, reason, entry_ref))
 
             if not usable:
-                if not seen_reference:
+                blocked_reason = next(
+                    (
+                        row.get("blocked_reason")
+                        for row in initiators
+                        if isinstance(row.get("blocked_reason"), str)
+                        and row.get("blocked_reason").strip()
+                    ),
+                    None,
+                )
+                if blocked_reason:
+                    reason = blocked_reason
+                elif not seen_reference:
                     reason = "no entry reference"
                 elif current is None:
                     reason = "no current price"
@@ -112,11 +138,25 @@ def score(
                 (actor_id, float(weights.get(actor_id, 0.0)) * decay, reason)
             )
 
+        score_value = sum(item[1] for item in accepted) * (
+            1.5 if corroborated else 1.0
+        )
+        if accepted and not is_ranked(score_value, len(accepted)):
+            blocked_rows.extend(
+                {
+                    "ticker": ticker,
+                    "actor_id": actor_id,
+                    "reason": "score below ranking floor (1.00)",
+                }
+                for actor_id, _, _ in accepted
+            )
+            continue
+        if not accepted:
+            continue
         ranked_rows.append(
             {
                 "ticker": ticker,
-                "score": sum(item[1] for item in accepted)
-                * (1.5 if corroborated else 1.0),
+                "score": score_value,
                 "actors": [item[0] for item in accepted],
                 "n_actors": len(accepted),
                 "current": current,

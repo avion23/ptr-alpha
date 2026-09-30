@@ -241,12 +241,13 @@ def test_setup_score_contract():
     )
     result = _invoke(score, corroboration_only)
     assert isinstance(result, tuple) and len(result) == 2
-    ranked, _blocked = result
+    ranked, blocked = result
     assert isinstance(ranked, pd.DataFrame)
     assert {"ticker", "score", "actors", "reasons"} <= set(ranked.columns)
-    candidate = ranked.loc[ranked["ticker"] == "ACME"]
-    assert not candidate.empty
-    assert pd.to_numeric(candidate["score"]).eq(0).all()
+    # Corroboration-only evidence never ranks; it stays visible in blocked.
+    assert ranked.loc[ranked["ticker"] == "ACME"].empty
+    assert isinstance(blocked, pd.DataFrame)
+    assert not blocked.loc[blocked["ticker"] == "ACME"].empty
 
 
 def test_replay_output_contract():

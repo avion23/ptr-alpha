@@ -195,8 +195,9 @@ def _has_unresolvable_instrument(normalized: str) -> bool:
 
 def _without_account_metadata(asset_text: str) -> str:
     return re.sub(
-        r"\s*\[\s*(?:ACCOUNT|CUSTODIAN)\s*:[^\]]*\]"
-        r"|\s+(?:ACCOUNT|CUSTODIAN)\s*[:=].*$",
+        r"\s*\[\s*(?:ACCOUNT|CUSTODIAN)\s*[:=][^\]]*\]"
+        r"|\s*\(\s*(?:ACCOUNT|CUSTODIAN)\s*[:=][^)]*\)"
+        r"|(?:^|\s+)(?:ACCOUNT|CUSTODIAN)\s*[:=].*$",
         "",
         asset_text,
         flags=re.IGNORECASE,

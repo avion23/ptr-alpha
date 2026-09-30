@@ -62,11 +62,26 @@ def test_resolves_curated_company_alias(sec_company_tickers):
 @pytest.mark.parametrize(
     ("description", "expected"),
     [
+        ("Realty Income Corporation Common Stock (O)", "O"),
         (
             "Realty Income Corporation Common Stock (O) "
             "[Account: Joint Brokerage - Bank of America]",
             "O",
         ),
+        (
+            "Realty Income Corporation Common Stock (O) "
+            "Account: Joint Brokerage - Bank of America",
+            "O",
+        ),
+        (
+            "Realty Income Corporation Common Stock (O) "
+            "Custodian=Joint Brokerage - Bank of America",
+            "O",
+        ),
+        ("Private investment [Account = Bank of America]", None),
+        ("Private investment (Account: Bank of America)", None),
+        ("Account: Bank of America", None),
+        ("Zoetis, Inc. Common Stock", "ZTS"),
         ("California municipal Bonds [Account: Bank of America]", None),
         ("Hybrid MTN [Account: Bank of America]", None),
         ("Tesla Growth FD", None),

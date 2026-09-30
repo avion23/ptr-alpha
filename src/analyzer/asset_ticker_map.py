@@ -84,6 +84,8 @@ _UNRESOLVABLE_TERMS = (
     "CASH",
     "BOND",
     "NOTE",
+    "MTN",
+    "FD",
 )
 
 
@@ -160,26 +162,38 @@ def _sec_company_name_index() -> dict[str, frozenset[str]]:
 def _has_unresolvable_instrument(normalized: str) -> bool:
     if normalized == "JT":
         return True
-    padded = f" {normalized} "
-    return any(f" {term} " in padded for term in _UNRESOLVABLE_TERMS)
+    return any(
+        re.search(rf"\b{re.escape(term)}S?\b", normalized)
+        for term in _UNRESOLVABLE_TERMS
+    )
+
+
+def _without_account_metadata(asset_text: str) -> str:
+    return re.sub(
+        r"\s*\[\s*(?:ACCOUNT|CUSTODIAN)\s*:[^\]]*\]"
+        r"|\s+(?:ACCOUNT|CUSTODIAN)\s*[:=].*$",
+        "",
+        asset_text,
+        flags=re.IGNORECASE,
+    )
 
 
 def resolve_asset_ticker(asset_text: str) -> str | None:
     """Resolve an asset description only when its company identity is unique."""
     if not isinstance(asset_text, str) or not asset_text.strip():
         return None
-    normalized = _normalize_company_name(asset_text)
+    normalized = _normalize_company_name(_without_account_metadata(asset_text))
     if not normalized or _has_unresolvable_instrument(normalized):
         return None
 
-    exact = _sec_company_name_index().get(normalized)
-    if exact is not None:
-        return next(iter(exact)) if len(exact) == 1 else None
-
     padded = f" {normalized} "
-    matches = {
+    matches = set()
+    for name, tickers in _sec_company_name_index().items():
+        if f" {name} " in padded:
+            matches.update(tickers)
+    matches.update(
         ticker
         for alias, ticker in _CURATED_ALIASES.items()
         if f" {_normalize_company_name(alias)} " in padded
-    }
+    )
     return next(iter(matches)) if len(matches) == 1 else None

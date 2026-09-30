@@ -14,6 +14,7 @@ def sec_company_tickers(monkeypatch):
         "1": {"cik_str": 2, "ticker": "MSFT", "title": "Microsoft Corporation"},
         "2": {"cik_str": 3, "ticker": "ACME", "title": "Acme Holdings, Inc."},
         "3": {"cik_str": 4, "ticker": "ACM.A", "title": "Acme Holdings Inc."},
+        "4": {"cik_str": 5, "ticker": "O", "title": "Realty Income Corporation"},
     }
     rows = asset_ticker_map._company_rows(fixture)
     monkeypatch.setattr(asset_ticker_map, "_load_sec_company_tickers", lambda: rows)
@@ -54,6 +55,24 @@ def test_resolves_sec_name_from_fixture(sec_company_tickers):
 
 def test_resolves_curated_company_alias(sec_company_tickers):
     assert asset_ticker_map.resolve_asset_ticker("Par Petroleum Corporation") == "PARR"
+
+
+@pytest.mark.parametrize(
+    ("description", "expected"),
+    [
+        (
+            "Realty Income Corporation Common Stock (O) "
+            "[Account: Joint Brokerage - Bank of America]",
+            "O",
+        ),
+        ("California municipal Bonds [Account: Bank of America]", None),
+        ("Hybrid MTN [Account: Bank of America]", None),
+        ("Tesla Growth FD", None),
+        ("Zoetis and Microsoft Corporation", None),
+    ],
+)
+def test_resolves_only_one_held_company(sec_company_tickers, description, expected):
+    assert asset_ticker_map.resolve_asset_ticker(description) == expected
 
 
 def test_ambiguous_sec_name_returns_none(sec_company_tickers):

@@ -23,6 +23,7 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from analyzer.member_names import canonical_member_key
+from analyzer.positions import same_member_identity
 
 MODEL = "gemini/gemini-3.1-flash-lite"
 GEMINI_PARSER_VERSION = "v5-gemini-validated"
@@ -587,8 +588,8 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         return [], {"invalid_member": raw_count or 1}
 
     effective_member = str(member or expected_member).strip()
-    if expected_member and canonical_member_key(member or "") != canonical_member_key(
-        expected_member
+    if expected_member and not same_member_identity(
+        str(member or ""), str(expected_member)
     ):
         return [], {"member_mismatch": raw_count or 1}
 

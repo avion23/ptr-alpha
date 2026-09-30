@@ -1,0 +1,45 @@
+"""Member identity and partial-insert validation for OCR rows."""
+
+from scripts.gemini_ocr_common import validate_transactions
+
+
+def _tx(asset="Vistra Corp. Common Stock (VST) [ST]", date="01/16/2026"):
+    return {
+        "asset": asset,
+        "type": "Purchase",
+        "date": date,
+        "notif_date": "01/23/2026",
+        "amount_letter": "C",
+    }
+
+
+def test_quoted_nickname_metadata_matches_filed_name():
+    valid, rejections = validate_transactions(
+        "9116212",
+        "Charles J Fleischmann",
+        [_tx()],
+        "07/08/2026",
+        'Charles J. "Chuck" Fleischmann',
+    )
+    assert len(valid) == 1
+    assert rejections == {}
+
+
+def test_genuine_member_mismatch_still_rejected():
+    valid, rejections = validate_transactions(
+        "9116212", "Nancy Pelosi", [_tx()], "07/08/2026", "Charles J. Fleischmann"
+    )
+    assert valid == []
+    assert rejections.get("member_mismatch") == 1
+
+
+def test_impossible_date_rejects_only_that_row():
+    valid, rejections = validate_transactions(
+        "20033889",
+        "Steve Cohen",
+        [_tx(), _tx(date="12/26/2026")],
+        "02/09/2026",
+        "Steve Cohen",
+    )
+    assert len(valid) == 1
+    assert rejections.get("date_out_of_window") == 1

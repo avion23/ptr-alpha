@@ -1323,14 +1323,24 @@ def insert_transactions(
     validated, rejections = validate_transactions(
         doc_id, member, transactions, filing_date, expected_member
     )
-    fatal_rejections = rejections
-    if fatal_rejections:
+    # Identity failures are whole-doc fatal (wrong human). Row-level
+    # rejections (impossible dates on individual rows, usually filer typos)
+    # keep the valid rows: one bad row must not hold the filing hostage.
+    identity_fatal = {
+        key: count
+        for key, count in rejections.items()
+        if key in ("member_mismatch", "invalid_member")
+    }
+    row_rejections = {
+        key: count for key, count in rejections.items() if key not in identity_fatal
+    }
+    if identity_fatal or not validated:
         _record_failed_ocr_attempt(
             conn,
             doc_id,
             year,
             input_count,
-            json.dumps(fatal_rejections, sort_keys=True),
+            json.dumps(rejections, sort_keys=True),
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
@@ -1339,6 +1349,11 @@ def insert_transactions(
         conn.close()
         return 0
     transactions = validated
+    partial_note = (
+        f"; row-level rejections kept out: {json.dumps(row_rejections, sort_keys=True)}"
+        if row_rejections
+        else ""
+    )
 
     errors = []
     rows: list[dict] = []
@@ -1577,7 +1592,7 @@ def insert_transactions(
             "success",
             input_count,
             count,
-            "",
+            f"partial insert{partial_note}" if partial_note else "",
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,

@@ -186,6 +186,82 @@ def _scenario(include_later_row):
     return _MemoryDB(transactions, prices)
 
 
+def test_replay_does_not_count_requested_mccaul_variant_twice():
+    db = _MemoryDB(
+        [
+            _trade(
+                "Michael T. McCaul",
+                date(2026, 5, 27),
+                date(2026, 6, 9),
+                "Purchase",
+                8000.0,
+                "A",
+                "gemini_ocr",
+                "mccaul-buy",
+            )
+        ],
+        [("ZTS", day, close) for day, close in REAL_CLOSES.items()],
+    )
+    try:
+        event_only = replay.replay(
+            db, ["ZTS"], [JUNE_30], horizon_days=90, members=[]
+        ).iloc[0]
+        requested_variant = replay.replay(
+            db,
+            ["ZTS"],
+            [JUNE_30],
+            horizon_days=90,
+            members=["Michael McCaul"],
+        ).iloc[0]
+    finally:
+        db.conn.close()
+
+    assert event_only["n_actors"] == 1
+    assert event_only["score"] == 0.0
+    assert requested_variant["n_actors"] == 1
+    assert requested_variant["score"] == event_only["score"]
+    assert bool(requested_variant["blocked"])
+
+
+def test_replay_coalesces_filed_name_variants_from_eligible_events():
+    db = _MemoryDB(
+        [
+            _trade(
+                "Michael T. McCaul",
+                date(2026, 5, 27),
+                date(2026, 6, 9),
+                "Purchase",
+                8000.0,
+                "A",
+                "gemini_ocr",
+                "mccaul-full-buy",
+            ),
+            _trade(
+                "Michael McCaul",
+                date(2026, 6, 2),
+                date(2026, 6, 16),
+                "Purchase",
+                8000.0,
+                "A",
+                "gemini_ocr",
+                "mccaul-short-buy",
+            ),
+        ],
+        [("ZTS", day, close) for day, close in REAL_CLOSES.items()],
+    )
+    try:
+        events = pipeline.eligible_events(db, JUNE_30)
+        result = replay.replay(
+            db, ["ZTS"], [JUNE_30], horizon_days=90, members=[]
+        ).iloc[0]
+    finally:
+        db.conn.close()
+
+    assert events["actor_id"].nunique() == 2
+    assert result["n_actors"] == 1
+    assert bool(result["blocked"])
+
+
 def test_zts_june_july_results_use_disclosure_dates_and_ignore_later_rows(
     monkeypatch,
 ):

@@ -13,16 +13,20 @@ _RANKED_FLOOR = 1.0
 _CORROBORATED_FLOOR = 0.25
 
 
-def is_ranked(score_value: float, n_actors: int) -> bool:
-    """A setup ranks when strong alone or corroborated.
+def is_ranked(score_value: float, n_actors: int, corroborated: bool = False) -> bool:
+    """A setup ranks when strong alone, corroborated across actors, or
+    backed by a watchlisted fund.
 
     score >= 1.0 is roughly two independent evidence pieces; two or more
-    actors rank at a lower floor. Single weak actors (June-ZTS style)
-    stay visible in blocked, never in ranked.
+    initiators rank at a lower floor, as does a lone initiator with
+    watchlist-13F corroboration (officer + skilled fund). Single weak
+    actors (June-ZTS style) stay visible in blocked, never in ranked.
     """
     if score_value >= _RANKED_FLOOR:
         return True
-    return n_actors >= 2 and score_value > _CORROBORATED_FLOOR
+    if score_value <= _CORROBORATED_FLOOR:
+        return False
+    return n_actors >= 2 or corroborated
 
 
 def score(
@@ -138,10 +142,20 @@ def score(
                 (actor_id, float(weights.get(actor_id, 0.0)) * decay, reason)
             )
 
+        blocked_rows.extend(
+            {
+                "ticker": ticker,
+                "actor_id": actor_id,
+                "reason": "no actor weight",
+            }
+            for actor_id, contribution, _ in accepted
+            if contribution == 0
+        )
+        accepted = [item for item in accepted if item[1] != 0]
         score_value = sum(item[1] for item in accepted) * (
             1.5 if corroborated else 1.0
         )
-        if accepted and not is_ranked(score_value, len(accepted)):
+        if accepted and not is_ranked(score_value, len(accepted), corroborated):
             blocked_rows.extend(
                 {
                     "ticker": ticker,

@@ -231,6 +231,27 @@ class TestPositions(unittest.TestCase):
             build_positions(trades, history, as_of=date(2026, 9, 21)).empty
         )
 
+    def test_bracket_op_description_never_becomes_stock(self):
+        # House filings mark options inline as [OP] while instrument_type
+        # stays NULL on some rows (Pelosi VST calls filed as such).
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 14),
+                    "amount_midpoint": 750000.5,
+                    "instrument_type": None,
+                    "asset_description": "Vistra Corp. Common Stock (T) [OP]",
+                },
+            ]
+        )
+        history = {"T": _prices(["2025-01-14", "2026-09-21"], [169.11, 140.78])}
+        self.assertTrue(
+            build_positions(trades, history, as_of=date(2026, 9, 21)).empty
+        )
+
     def test_undisclosed_rows_excluded_as_of(self):
         trades = pd.DataFrame(
             [

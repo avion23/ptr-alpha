@@ -14,6 +14,7 @@ accumulation; exchanges are ignored and reported.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date
 
 import pandas as pd
@@ -33,7 +34,13 @@ class PositionsError(Exception):
 
 
 def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
-    """Remove entry references from purchase events without an open position."""
+    """Remove entry references from purchase events without an open position.
+
+    Only congress events are gated: positions reconstruct congress holdings
+    from filings, while officer (Form 4 buys only, no sales ingested) and
+    manager (13F snapshots) actors have no position ledger to check against.
+    Those kinds fail open here; their evidence is weighted, not gated.
+    """
     if events.empty:
         return events.copy()
 
@@ -49,7 +56,10 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
             )
         )
 
+    kinds = gated["kind"] if "kind" in gated.columns else None
     for index, row in gated.iterrows():
+        if kinds is not None and str(row["kind"]) != "congress":
+            continue
         key = (str(row["ticker"]).upper(), str(row["actor_id"]))
         if key not in open_positions:
             gated.at[index, "entry_ref"] = None
@@ -58,7 +68,18 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
 
 
 def _is_option_row(row, has_instrument: bool) -> bool:
-    """Positive option evidence only; NULL/unknown instruments stay equity."""
+    """Positive option evidence only; NULL/unknown instruments stay equity.
+
+    House filings also mark options inline as ``[OP]`` while leaving
+    instrument_type NULL on some rows; those must not count as shares.
+    ``[ST]`` (stock) is authoritative and never an option.
+    """
+    description = ""
+    value = getattr(row, "asset_description", None)
+    if value is not None and not pd.isna(value):
+        description = str(value)
+    if re.search(r"\[op\]", description, re.IGNORECASE):
+        return True
     if has_instrument:
         instrument = row.instrument_type
         if instrument is not None and not pd.isna(instrument):
@@ -485,6 +506,34 @@ def _member_variants(db, member: str) -> list[str]:
     return seen or [member]
 
 
+_LOADER_COLUMNS = (
+    "member",
+    "ticker",
+    "transaction_type",
+    "transaction_date",
+    "disclosure_date",
+    "amount_midpoint",
+    "amount_raw",
+    "source",
+    "instrument_type",
+    "asset_description",
+    "source_record_id",
+    "amends_source_record_id",
+)
+
+
+def _loader_select(db, table: str) -> str:
+    """Column list for the trades loader, tolerating slim test doubles."""
+    try:
+        actual = {
+            row[1] for row in db.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+    except Exception:
+        return "*"
+    selected = [column for column in _LOADER_COLUMNS if column in actual]
+    return ", ".join(selected) if selected else "*"
+
+
 def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> pd.DataFrame:
     """All canonical rows for one member across every year and source.
 
@@ -495,10 +544,8 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
     rows always win; the flag only widens recency, never scoring.
     """
     canonical = db.conn.execute(
-        """
-        SELECT member, ticker, transaction_type, transaction_date,
-               disclosure_date, amount_midpoint, amount_raw, source,
-               instrument_type, source_record_id, amends_source_record_id
+        f"""
+        SELECT {_loader_select(db, "canonical_transactions")}
         FROM canonical_transactions
         WHERE member IN (SELECT UNNEST(?))
         """,
@@ -508,10 +555,8 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
         return canonical.sort_values("transaction_date", kind="mergesort")
 
     raw = db.conn.execute(
-        """
-        SELECT member, ticker, transaction_type, transaction_date,
-               disclosure_date, amount_midpoint, amount_raw, source,
-               instrument_type, source_record_id, amends_source_record_id
+        f"""
+        SELECT {_loader_select(db, "transactions")}
         FROM (
             SELECT t.*,
                 ROW_NUMBER() OVER (

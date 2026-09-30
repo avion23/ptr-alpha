@@ -102,7 +102,55 @@ def test_missing_weight_defaults_to_zero():
     ranked, blocked = score(pd.DataFrame([_row()]), {}, {"AAPL": 100.0})
 
     assert ranked.empty
-    assert blocked.iloc[0]["reason"] == "score below ranking floor (1.00)"
+    assert blocked.iloc[0]["reason"] == "no actor weight"
+
+
+def test_zero_weight_actor_does_not_corroborate_or_count():
+    candidates = pd.DataFrame(
+        [
+            _row(actor_id="congress:WEAK", position_evidence=True),
+            _row(actor_id="officer:ZERO"),
+            _row(
+                ticker="MSFT",
+                actor_id="officer:STRONG",
+                position_evidence=True,
+            ),
+            _row(ticker="MSFT", actor_id="officer:ZERO"),
+        ]
+    )
+    ranked, blocked = score(
+        candidates,
+        {"congress:WEAK": 0.52, "officer:STRONG": 1.0, "officer:ZERO": 0.0},
+        {"AAPL": 100.0, "MSFT": 100.0},
+    )
+
+    assert ranked.to_dict("records") == [
+        {
+            "ticker": "MSFT",
+            "score": 1.0,
+            "actors": ["officer:STRONG"],
+            "n_actors": 1,
+            "current": 100.0,
+            "reasons": ["STRONG buy @100.00, now 100.00 (+0.0%)"],
+        }
+    ]
+    assert blocked.to_dict("records") == [
+        {
+            "ticker": "AAPL",
+            "actor_id": "officer:ZERO",
+            "reason": "no actor weight",
+        },
+        {
+            "ticker": "AAPL",
+            "actor_id": "congress:WEAK",
+            "reason": "score below ranking floor (1.00)",
+        },
+        {
+            "ticker": "MSFT",
+            "actor_id": "officer:ZERO",
+            "reason": "no actor weight",
+        },
+    ]
 
 
 def test_missing_entry_reference_is_blocked():
@@ -218,3 +266,35 @@ def test_officer_reference_is_not_labeled_estimate():
         {"AAPL": 100.0},
     )
     assert all("(est.)" not in reason for reason in ranked.iloc[0]["reasons"])
+
+
+def test_corroborated_lone_initiator_ranks_but_uncorroborated_does_not():
+    lone = pd.DataFrame(
+        [
+            _row(
+                actor_id="officer:BURKE CEO",
+                source="form4",
+                event_date=date(2024, 3, 1),
+                position_evidence=True,
+            ),
+        ]
+    )
+    backed = pd.DataFrame(
+        [
+            _row(
+                actor_id="officer:BURKE CEO",
+                source="form4",
+                event_date=date(2024, 3, 1),
+                position_evidence=True,
+            ),
+            _row(actor_id="manager:FUND A", corroboration=True, source="13f"),
+        ]
+    )
+    weights = {"officer:BURKE CEO": 0.6}
+
+    ranked_lone, _ = score(lone, weights, {"AAPL": 100.0})
+    assert ranked_lone.empty
+
+    ranked_backed, _ = score(backed, weights, {"AAPL": 100.0})
+    assert len(ranked_backed) == 1
+    assert ranked_backed.iloc[0]["actors"] == ["officer:BURKE CEO"]

@@ -140,3 +140,78 @@ def test_dry_run_reads_temp_database_without_writing_it(monkeypatch, tmp_path):
     assert report["attempted"] == 1
     assert hashlib.sha256(db_path.read_bytes()).digest() == before
     assert json.loads(queue_path.read_text()) == []
+
+
+def test_local_reparse_preserves_amount_owner_and_row_identity(monkeypatch):
+    from scripts import ocr_local_sweep
+
+    recovered_rows = [
+        {
+            "asset_description": "Apple Inc. (AAPL)",
+            "owner_code": "SP",
+            "transaction_type": "Purchase",
+            "transaction_date_raw": "09/01/2026",
+            "notification_date_raw": "09/03/2026",
+            "amount_raw": "B",
+            "amount_midpoint": 32500,
+            "source_row_id": "42:page:1:row:1",
+        },
+        {
+            "asset_description": "Microsoft Corp. (MSFT)",
+            "owner_code": "S",
+            "transaction_type": "Sale",
+            "transaction_date_raw": "09/02/2026",
+            "notification_date_raw": "09/03/2026",
+            "amount_raw": "C",
+            "amount_midpoint": 75000,
+            "source_row_id": "42:page:1:row:2",
+        },
+    ]
+    monkeypatch.setattr(
+        ocr_local_sweep,
+        "process_document",
+        lambda *_args: {
+            "status": "resolved",
+            "rows": recovered_rows,
+            "artifact_sha256": "fixture-sha",
+        },
+    )
+
+    succeeded, _result, transactions = ocr_triage._local_reparse(
+        {"doc_id": "42", "year": 2026, "pdf_path": "42.pdf", "member": "Ada Lovelace"}
+    )
+
+    assert succeeded is True
+    assert [
+        (row["amount_raw"], row["amount_midpoint"], row["owner_code"], row["source_row_id"])
+        for row in transactions
+    ] == [
+        ("B", 32500, "SP", "42:page:1:row:1"),
+        ("C", 75000, "S", "42:page:1:row:2"),
+    ]
+
+
+def test_local_reparse_fails_when_any_recovered_row_is_dropped(monkeypatch):
+    from scripts import ocr_local_sweep
+
+    recovered_rows = [
+        {"asset_description": "Apple", "source_row_id": "42:r1"},
+        {"asset_description": "Microsoft", "source_row_id": "42:r2"},
+    ]
+    monkeypatch.setattr(
+        ocr_local_sweep,
+        "process_document",
+        lambda *_args: {"status": "resolved", "rows": recovered_rows},
+    )
+    parsed_rows = iter(([{"transaction_type": "Purchase"}], []))
+    monkeypatch.setattr(
+        "analyzer.parsing.rows.parse_pdf_table",
+        lambda _table: next(parsed_rows),
+    )
+
+    succeeded, _result, transactions = ocr_triage._local_reparse(
+        {"doc_id": "42", "year": 2026, "pdf_path": "42.pdf", "member": "Ada Lovelace"}
+    )
+
+    assert len(transactions) == 1
+    assert succeeded is False

@@ -138,3 +138,46 @@ def test_json_input_uses_same_exact_match_contract(tmp_path: Path):
 
     assert (report["matched_count"], report["unmatched_count"]) == (1, 0)
     assert manifest["records"][0]["ticker_origin"] == "reconciled_third_party"
+
+
+def test_tickered_canonical_collision_suppresses_untickered_proposal(tmp_path: Path):
+    db_path = tmp_path / "canonical.duckdb"
+    connection = duckdb.connect(str(db_path))
+    connection.execute(
+        """CREATE TABLE canonical_transactions (
+            doc_id VARCHAR, member VARCHAR, transaction_date DATE,
+            amount_raw VARCHAR, ticker VARCHAR
+        )"""
+    )
+    connection.executemany(
+        "INSERT INTO canonical_transactions VALUES (?, ?, ?, ?, ?)",
+        [
+            ("doc", "Member", "2024-01-01", "$25k-$40k", "AAPL"),
+            ("doc", "Member", "2024-01-01", "$25k-$40k", None),
+        ],
+    )
+    connection.close()
+    input_path = tmp_path / "trades.json"
+    input_path.write_text(
+        json.dumps(
+            [
+                {
+                    "member": "Member",
+                    "transaction_date": "2024-01-01",
+                    "ticker": "AAPL",
+                    "amount_band": "$25k-$40k",
+                    "source_doc_id": "doc",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report, manifest = reconcile(
+        db_path, input_path, tmp_path / "report.json", tmp_path / "manifest.json"
+    )
+
+    assert report["canonical_row_count"] == 1
+    assert report["matched_count"] == 0
+    assert report["unmatched"][0]["reason"] == "ambiguous_canonical_key"
+    assert manifest["records"] == []

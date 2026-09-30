@@ -272,28 +272,35 @@ def _local_reparse(item: dict) -> tuple[bool, dict, list[dict]]:
     transactions = []
     header = [
         "Asset Name",
+        "Owner",
         "Transaction Type",
         "Transaction Date",
         "Notification Date",
         "Amount",
     ]
-    for row in result.get("rows", []):
+    recovered_rows = result.get("rows", [])
+    all_rows_survived = bool(recovered_rows)
+    for row in recovered_rows:
         table = [
             header,
             [
                 row.get("asset_description"),
+                row.get("owner_code"),
                 row.get("transaction_type"),
                 row.get("transaction_date_raw"),
                 row.get("notification_date_raw"),
-                None,
+                row.get("amount_raw"),
             ],
         ]
         parsed = parse_pdf_table(table)
+        if len(parsed) != 1:
+            all_rows_survived = False
         for transaction in parsed:
             transaction["source_row_id"] = row.get("source_row_id")
+            transaction["amount_midpoint"] = row.get("amount_midpoint")
             transactions.append(transaction)
     return (
-        result.get("status") == "resolved" and bool(transactions),
+        result.get("status") == "resolved" and all_rows_survived,
         result,
         transactions,
     )

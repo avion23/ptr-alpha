@@ -138,6 +138,16 @@ def score(
                 (actor_id, float(weights.get(actor_id, 0.0)) * decay, reason)
             )
 
+        blocked_rows.extend(
+            {
+                "ticker": ticker,
+                "actor_id": actor_id,
+                "reason": "no actor weight",
+            }
+            for actor_id, contribution, _ in accepted
+            if contribution == 0
+        )
+        accepted = [item for item in accepted if item[1] != 0]
         score_value = sum(item[1] for item in accepted) * (
             1.5 if corroborated else 1.0
         )

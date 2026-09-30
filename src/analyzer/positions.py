@@ -32,6 +32,31 @@ class PositionsError(Exception):
     """Raised when positions cannot be reconstructed safely."""
 
 
+def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
+    """Remove entry references from purchase events without an open position."""
+    if events.empty:
+        return events.copy()
+
+    gated = events.copy()
+    gated["blocked_reason"] = None
+    open_positions = set()
+    if {"ticker", "actor_id", "position_evidence"}.issubset(candidates.columns):
+        open_rows = candidates.loc[candidates["position_evidence"].eq(True)]
+        open_positions.update(
+            zip(
+                open_rows["ticker"].astype("string").str.upper(),
+                open_rows["actor_id"].astype(str),
+            )
+        )
+
+    for index, row in gated.iterrows():
+        key = (str(row["ticker"]).upper(), str(row["actor_id"]))
+        if key not in open_positions:
+            gated.at[index, "entry_ref"] = None
+            gated.at[index, "blocked_reason"] = "no open position at as_of"
+    return gated
+
+
 def _is_option_row(row, has_instrument: bool) -> bool:
     """Positive option evidence only; NULL/unknown instruments stay equity."""
     if has_instrument:

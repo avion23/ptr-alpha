@@ -1534,7 +1534,7 @@ def setups(
     try:
         from analyzer.actors import compute_weight
         from analyzer.pipeline import eligible_events
-        from analyzer.positions import holdings_candidates
+        from analyzer.positions import gate_closed_events, holdings_candidates
         from analyzer.setups import score as score_setups
     except ImportError as exc:
         _cli_exit(1, f"Error: setups is unavailable ({exc})")
@@ -1578,6 +1578,33 @@ def setups(
             else:
                 events = events.iloc[0:0]
             if not events.empty:
+                selected_members = set(member)
+                event_members = {
+                    str(actor_id).split(":", 1)[1]
+                    for actor_id in events["actor_id"].dropna()
+                    if ":" in str(actor_id) and str(actor_id).split(":", 1)[1]
+                }
+                event_tickers = set(events["ticker"].astype("string").str.upper())
+                for event_member in sorted(event_members - selected_members):
+                    frame = holdings_candidates(
+                        db,
+                        event_member,
+                        as_of_date,
+                        include_unpromoted=include_unpromoted,
+                    )
+                    if not frame.empty:
+                        frame = frame.loc[
+                            frame["ticker"]
+                            .astype("string")
+                            .str.upper()
+                            .isin(event_tickers)
+                        ].copy()
+                        if not frame.empty:
+                            frames.append(frame)
+                position_candidates = (
+                    pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                )
+                events = gate_closed_events(events, position_candidates)
                 frames.append(events)
         if not frames:
             print("No candidates.")

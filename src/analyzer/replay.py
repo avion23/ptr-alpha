@@ -117,7 +117,6 @@ def _ticker_candidates(
             if ":" in str(actor_id) and str(actor_id).split(":", 1)[1]
         }
     selected = []
-    open_positions = set()
     for member in dict.fromkeys([*members, *sorted(event_members)]):
         frame = _candidate_frame(
             positions.holdings_candidates(db, member, as_of),
@@ -135,21 +134,12 @@ def _ticker_candidates(
         ]
         if not matches.empty:
             selected.append(matches)
-            if "position_evidence" in matches and "actor_id" in matches:
-                open_rows = matches.loc[matches["position_evidence"].eq(True)]
-                open_positions.update(
-                    zip(
-                        open_rows["ticker"].astype("string").str.upper(),
-                        open_rows["actor_id"].astype(str),
-                    )
-                )
 
     if not events.empty:
-        events["blocked_reason"] = None
-        for index, row in events.iterrows():
-            if (ticker, str(row["actor_id"])) not in open_positions:
-                events.at[index, "entry_ref"] = None
-                events.at[index, "blocked_reason"] = "no open position at as_of"
+        from_positions = (
+            pd.concat(selected, ignore_index=True) if selected else pd.DataFrame()
+        )
+        events = positions.gate_closed_events(events, from_positions)
         selected.append(events)
 
     if not selected:

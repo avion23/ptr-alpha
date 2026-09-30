@@ -4,8 +4,9 @@ from types import SimpleNamespace
 import duckdb
 import pandas as pd
 import pytest
+from typer.testing import CliRunner
 
-from analyzer import actors, pipeline, positions, replay, setups
+from analyzer import actors, cli, pipeline, positions, replay, setups
 
 JUNE_30 = date(2026, 6, 30)
 JULY_31 = date(2026, 7, 31)
@@ -365,5 +366,60 @@ def test_fully_closed_holder_does_not_contribute():
         )
         assert result.iloc[0]["score"] == 0.0
         assert bool(result.iloc[0]["blocked"])
+    finally:
+        db.conn.close()
+
+
+def test_cli_setups_blocks_two_fully_closed_holders(monkeypatch):
+    members = ("Closed Holder One", "Closed Holder Two")
+    transactions = []
+    for member, purchase_day, purchase_disclosure, source_id in (
+        (members[0], date(2026, 6, 2), date(2026, 6, 9), "buy-one"),
+        (members[1], date(2026, 6, 9), date(2026, 6, 16), "buy-two"),
+    ):
+        transactions.extend(
+            [
+                _trade(
+                    member,
+                    purchase_day,
+                    purchase_disclosure,
+                    "Purchase",
+                    8000.5,
+                    "$1,001 - $15,000",
+                    "house_pdf",
+                    source_id,
+                ),
+                _trade(
+                    member,
+                    date(2026, 6, 16),
+                    date(2026, 6, 23),
+                    "Sale Full",
+                    8000.5,
+                    "$1,001 - $15,000",
+                    "house_pdf",
+                    f"sale-{source_id}",
+                ),
+            ]
+        )
+    db = _MemoryDB(
+        transactions,
+        [("ZTS", day, close) for day, close in REAL_CLOSES.items() if day != AUGUST_3],
+    )
+    db.close = lambda: None
+    monkeypatch.setattr(cli, "_open_database", lambda *args, **kwargs: db)
+    try:
+        result = CliRunner().invoke(
+            cli.app,
+            ["setups", "--ticker", "ZTS", "--as-of", "2026-06-30"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "=== Ranked setups ===\nNone." in result.output
+        assert result.output.count("no open position at as_of") == 2
+        replayed = replay.replay(
+            db, ["ZTS"], [JUNE_30], horizon_days=90, members=[]
+        )
+        assert replayed.iloc[0]["score"] == 0.0
+        assert replayed.iloc[0]["n_actors"] == 2
+        assert bool(replayed.iloc[0]["blocked"])
     finally:
         db.conn.close()

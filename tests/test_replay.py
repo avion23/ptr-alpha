@@ -5,7 +5,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from analyzer import replay as replay_module
+from analyzer import positions, replay as replay_module
 
 AS_OF = date(2024, 1, 10)
 
@@ -44,7 +44,8 @@ def _install_scoring(monkeypatch, events):
                     columns=["ticker", "actor_id", "kind", "source", "entry_ref",
                              "event_date", "disclosure_date", "corroboration",
                              "as_of"]
-                )
+                ),
+                gate_closed_events=positions.gate_closed_events,
             ),
             SimpleNamespace(
                 compute_weight=lambda kind, n, hits, source: 0.6

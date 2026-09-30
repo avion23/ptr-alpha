@@ -16,6 +16,8 @@ from importlib import import_module
 
 import pandas as pd
 
+from analyzer.member_names import canonical_member_key
+
 _V1_MEMBERS = (
     "Nancy Pelosi",
     "Mitch McConnell",
@@ -37,6 +39,28 @@ _RESULT_COLUMNS = [
 
 class ReplayError(Exception):
     """Raised when replay cannot enforce or evaluate its point-in-time inputs."""
+
+
+def _same_member_identity(first: str, candidate: str, positions) -> bool:
+    first_key = canonical_member_key(first)
+    candidate_key = canonical_member_key(candidate)
+    # Canonical keys retain middle names; reuse positions' filed-variant rule
+    # for nickname and optional-middle-name matches.
+    return first_key == candidate_key or positions._same_member_variant(
+        first_key, candidate_key
+    )
+
+
+def _same_actor_identity(first: str, candidate: str, positions) -> bool:
+    if first == candidate:
+        return True
+    first_kind, first_separator, first_name = first.partition(":")
+    candidate_kind, candidate_separator, candidate_name = candidate.partition(":")
+    return (
+        first_kind == candidate_kind == "congress"
+        and bool(first_separator and candidate_separator)
+        and _same_member_identity(first_name, candidate_name, positions)
+    )
 
 
 def _load_dependencies():
@@ -118,7 +142,15 @@ def _ticker_candidates(
         }
     selected = []
     open_positions = set()
+    open_position_actors = []
+    processed_members = []
     for member in dict.fromkeys([*members, *sorted(event_members)]):
+        if any(
+            _same_member_identity(previous, member, positions)
+            for previous in processed_members
+        ):
+            continue
+        processed_members.append(member)
         frame = _candidate_frame(
             positions.holdings_candidates(db, member, as_of),
             "positions.holdings_candidates",
@@ -137,17 +169,36 @@ def _ticker_candidates(
             selected.append(matches)
             if "position_evidence" in matches and "actor_id" in matches:
                 open_rows = matches.loc[matches["position_evidence"].eq(True)]
-                open_positions.update(
-                    zip(
-                        open_rows["ticker"].astype("string").str.upper(),
-                        open_rows["actor_id"].astype(str),
-                    )
-                )
+                for position_ticker, actor_id in zip(
+                    open_rows["ticker"].astype("string").str.upper(),
+                    open_rows["actor_id"].astype(str),
+                ):
+                    identity = (position_ticker, actor_id)
+                    open_positions.add(identity)
+                    if identity not in open_position_actors:
+                        open_position_actors.append(identity)
 
     if not events.empty:
         events["blocked_reason"] = None
+        representatives = list(open_position_actors)
         for index, row in events.iterrows():
-            if (ticker, str(row["actor_id"])) not in open_positions:
+            actor_id = str(row["actor_id"])
+            identity = next(
+                (
+                    representative
+                    for representative in representatives
+                    if representative[0] == ticker
+                    and _same_actor_identity(
+                        representative[1], actor_id, positions
+                    )
+                ),
+                None,
+            )
+            if identity is None:
+                identity = (ticker, actor_id)
+                representatives.append(identity)
+            events.at[index, "actor_id"] = identity[1]
+            if identity not in open_positions:
                 events.at[index, "entry_ref"] = None
                 events.at[index, "blocked_reason"] = "no open position at as_of"
         selected.append(events)

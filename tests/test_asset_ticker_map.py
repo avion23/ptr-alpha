@@ -15,6 +15,8 @@ def sec_company_tickers(monkeypatch):
         "2": {"cik_str": 3, "ticker": "ACME", "title": "Acme Holdings, Inc."},
         "3": {"cik_str": 4, "ticker": "ACM.A", "title": "Acme Holdings Inc."},
         "4": {"cik_str": 5, "ticker": "O", "title": "Realty Income Corporation"},
+        "5": {"cik_str": 6, "ticker": "ABCB", "title": "Ameris Bancorp"},
+        "6": {"cik_str": 7, "ticker": "TBBK", "title": "Bancorp"},
     }
     rows = asset_ticker_map._company_rows(fixture)
     monkeypatch.setattr(asset_ticker_map, "_load_sec_company_tickers", lambda: rows)
@@ -26,11 +28,11 @@ def sec_company_tickers(monkeypatch):
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("ZOETIS INC CMN CLASS A", "ZOETIS INC"),
-        ("Acme, Inc. Class B", "ACME INC"),
-        ("Acme Corp. COMMON STOCK", "ACME CORP"),
-        ("Acme LLC CMN", "ACME LLC"),
-        ("Acme Ltd. Class C", "ACME LTD"),
+        ("ZOETIS INC CMN CLASS A", "ZOETIS"),
+        ("Acme, Inc. Class B", "ACME"),
+        ("Acme Corp. COMMON STOCK", "ACME"),
+        ("Acme LLC CMN", "ACME"),
+        ("Acme Ltd. Class C", "ACME"),
         ("Acme Co. Common Stock Class A", "ACME CO"),
     ],
 )
@@ -41,7 +43,7 @@ def test_normalize_company_name_strips_security_suffixes(raw, expected):
 def test_normalize_ampersand_as_and():
     assert (
         asset_ticker_map._normalize_company_name("Air Products & Chemicals, Inc.")
-        == "AIR PRODUCTS AND CHEMICALS INC"
+        == "AIR PRODUCTS AND CHEMICALS"
     )
 
 
@@ -69,6 +71,8 @@ def test_resolves_curated_company_alias(sec_company_tickers):
         ("Hybrid MTN [Account: Bank of America]", None),
         ("Tesla Growth FD", None),
         ("Zoetis and Microsoft Corporation", None),
+        # A generic name nested inside a longer company name is one company.
+        ("Ameris Bancorp - Common Stock", "ABCB"),
     ],
 )
 def test_resolves_only_one_held_company(sec_company_tickers, description, expected):

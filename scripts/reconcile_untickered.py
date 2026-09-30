@@ -106,9 +106,8 @@ def _canonical_rows(db_path: Path) -> list[dict]:
     connection = duckdb.connect(str(db_path), read_only=True)
     try:
         rows = connection.execute(
-            """SELECT doc_id, member, transaction_date, amount_raw
-               FROM canonical_transactions
-               WHERE ticker IS NULL"""
+            """SELECT doc_id, member, transaction_date, amount_raw, ticker
+               FROM canonical_transactions"""
         ).fetchall()
     finally:
         connection.close()
@@ -118,8 +117,9 @@ def _canonical_rows(db_path: Path) -> list[dict]:
             "member": member,
             "transaction_date": transaction_date,
             "amount_band": amount_raw,
+            "ticker": ticker,
         }
-        for doc_id, member, transaction_date, amount_raw in rows
+        for doc_id, member, transaction_date, amount_raw, ticker in rows
     ]
 
 
@@ -159,19 +159,21 @@ def _reconcile(canonical_rows: list[dict], trades: list[dict[str, str]]):
         ].append((index, trade))
 
     canonical_key_counts = defaultdict(int)
-    keys = []
     for row in canonical_rows:
         key = _key(
             row["doc_id"], row["member"], row["transaction_date"], row["amount_band"]
         )
-        keys.append(key)
         if key is not None:
             canonical_key_counts[key] += 1
 
+    untickered_rows = [row for row in canonical_rows if row["ticker"] is None]
     proposed = []
     unmatched = []
     used_trade_indexes = set()
-    for row, key in zip(canonical_rows, keys):
+    for row in untickered_rows:
+        key = _key(
+            row["doc_id"], row["member"], row["transaction_date"], row["amount_band"]
+        )
         if key is None:
             reason = "incomplete_canonical_key"
         elif canonical_key_counts[key] != 1:
@@ -211,7 +213,7 @@ def _reconcile(canonical_rows: list[dict], trades: list[dict[str, str]]):
         "schema_version": 1,
         "report_type": "untickered_reconciliation",
         "reconciliation_only": True,
-        "canonical_row_count": len(canonical_rows),
+        "canonical_row_count": len(untickered_rows),
         "matched_count": len(proposed),
         "unmatched_count": len(unmatched),
         "third_party_row_count": len(trades),

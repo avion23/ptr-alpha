@@ -89,6 +89,27 @@ _UNRESOLVABLE_TERMS = (
 )
 
 
+_ENTITY_SUFFIXES = (
+    "INC",
+    "INCORPORATED",
+    "CORP",
+    "CORPORATION",
+    "COMPANY",
+    "COS",
+    "LLC",
+    "LTD",
+    "LIMITED",
+    "PLC",
+    "HOLDINGS",
+    "HOLDING",
+    "GROUP",
+    "LP",
+    "LLP",
+    "PA",
+    "NA",
+)
+
+
 def _normalize_company_name(value: str) -> str:
     """Normalize punctuation and remove terminal security-class descriptors."""
     normalized = re.sub(r"[^A-Z0-9]+", " ", value.upper().replace("&", " AND ")).strip()
@@ -96,6 +117,10 @@ def _normalize_company_name(value: str) -> str:
         without_suffix = re.sub(
             r"\s+(?:CMN|COMMON STOCK|CLASS [ABC])$", "", normalized
         ).strip()
+        without_suffix = re.sub(r"\s*\([A-Z]\)$", "", without_suffix).strip()
+        tokens = without_suffix.split()
+        if len(tokens) > 1 and tokens[-1] in _ENTITY_SUFFIXES:
+            without_suffix = " ".join(tokens[:-1])
         if without_suffix == normalized:
             return normalized
         normalized = without_suffix
@@ -187,13 +212,29 @@ def resolve_asset_ticker(asset_text: str) -> str | None:
         return None
 
     padded = f" {normalized} "
-    matches = set()
+    spans: list[tuple[int, int, set[str]]] = []
     for name, tickers in _sec_company_name_index().items():
-        if f" {name} " in padded:
-            matches.update(tickers)
-    matches.update(
-        ticker
-        for alias, ticker in _CURATED_ALIASES.items()
-        if f" {_normalize_company_name(alias)} " in padded
-    )
+        needle = f" {name} "
+        start = padded.find(needle)
+        while start != -1:
+            spans.append((start, start + len(needle), set(tickers)))
+            start = padded.find(needle, start + 1)
+    for alias, ticker in _CURATED_ALIASES.items():
+        needle = f" {_normalize_company_name(alias)} "
+        start = padded.find(needle)
+        while start != -1:
+            spans.append((start, start + len(needle), {ticker}))
+            start = padded.find(needle, start + 1)
+    uncovered = [
+        tickers
+        for i, (s, e, tickers) in enumerate(spans)
+        if not any(
+            (os, oe) != (s, e) and os <= s and e <= oe
+            for j, (os, oe, _) in enumerate(spans)
+            if j != i
+        )
+    ]
+    if not uncovered:
+        return None
+    matches = {t for tickers in uncovered for t in tickers}
     return next(iter(matches)) if len(matches) == 1 else None

@@ -309,6 +309,41 @@ class TestPositions(unittest.TestCase):
             positions.iloc[0]["total_cost"], 20000.0, places=2
         )
 
+    def test_member_variants_unite_filed_names(self):
+        import duckdb
+        from types import SimpleNamespace
+
+        from analyzer.positions import _member_variants
+
+        conn = duckdb.connect()
+        conn.execute(
+            "CREATE TABLE transactions AS SELECT * FROM (VALUES "
+            "('Charles J. Fleischmann'), ('Charles J. \"Chuck\" Fleischmann'), "
+            "('Nancy Pelosi')) AS v(member)"
+        )
+        variants = _member_variants(
+            SimpleNamespace(conn=conn), "Charles J. Fleischmann"
+        )
+        self.assertIn("Charles J. Fleischmann", variants)
+        self.assertIn("Charles J. \"Chuck\" Fleischmann", variants)
+        self.assertNotIn("Nancy Pelosi", variants)
+
+    def test_nickname_resolves_to_filed_name(self):
+        import duckdb
+        from types import SimpleNamespace
+
+        from analyzer.positions import _member_variants
+
+        conn = duckdb.connect()
+        conn.execute(
+            "CREATE TABLE transactions AS SELECT * FROM (VALUES "
+            "('Charles J Fleischmann')) AS v(member)"
+        )
+        variants = _member_variants(
+            SimpleNamespace(conn=conn), "Chuck Fleischmann"
+        )
+        self.assertIn("Charles J Fleischmann", variants)
+
     def test_unpromoted_loader_adds_deduped_raw(self):
         import duckdb
         from types import SimpleNamespace

@@ -362,6 +362,68 @@ def discount_alerts(positions: pd.DataFrame, *, threshold_pct: float = -10.0) ->
     return positions.loc[positions["discount_pct"] <= threshold_pct].copy()
 
 
+_NICKNAMES = {
+    "bob": "robert", "bill": "william", "jim": "james", "mike": "michael",
+    "tom": "thomas", "dave": "david", "dan": "daniel", "steve": "steven",
+    "joe": "joseph", "matt": "matthew", "nick": "nicholas", "alex": "alexander",
+    "chris": "christopher", "pat": "patrick", "tim": "timothy",
+    "jeff": "jeffrey", "greg": "gregory", "ron": "ronald", "ken": "kenneth",
+    "larry": "lawrence", "rick": "richard", "chuck": "charles", "ro": "rohit",
+}
+
+
+def _same_person(first: str, candidate: str) -> bool:
+    """Last-name-gated nickname equivalence for filed name variants."""
+    if first == candidate:
+        return True
+    for short, full in _NICKNAMES.items():
+        if {first, candidate} == {short, full}:
+            return True
+    return False
+
+
+def _member_variants(db, member: str) -> list[str]:
+    """All filed name variants for the member.
+
+    Filers appear as 'Charles J. Fleischmann', 'Charles J. "Chuck"
+    Fleischmann', and 'Charles J Fleischmann' across filings; users type
+    'Chuck Fleischmann'. Match on canonical key first, then on
+    last-name plus nickname-equivalent first name. An exact match on any
+    one variant previously dropped the others' positions silently.
+    """
+    from analyzer.member_names import canonical_member_key
+
+    if not isinstance(member, str) or not member.strip():
+        return [member]
+    wanted = canonical_member_key(member).split()
+    try:
+        names = db.conn.execute("SELECT DISTINCT member FROM transactions").fetchall()
+    except Exception:
+        names = []
+    try:
+        names += db.conn.execute(
+            "SELECT DISTINCT member FROM canonical_transactions"
+        ).fetchall()
+    except Exception:
+        pass
+    seen = []
+    for row in names:
+        name = row[0]
+        if name in seen:
+            continue
+        key = canonical_member_key(name).split()
+        if key == wanted:
+            seen.append(name)
+        elif (
+            len(key) > 1
+            and len(wanted) > 1
+            and key[-1] == wanted[-1]
+            and _same_person(key[0].lower(), wanted[0].lower())
+        ):
+            seen.append(name)
+    return seen or [member]
+
+
 def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> pd.DataFrame:
     """All canonical rows for one member across every year and source.
 
@@ -377,9 +439,9 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
                disclosure_date, amount_midpoint, amount_raw, source,
                instrument_type, source_record_id, amends_source_record_id
         FROM canonical_transactions
-        WHERE member = ?
+        WHERE member IN (SELECT UNNEST(?))
         """,
-        [member],
+        [_member_variants(db, member)],
     ).fetchdf()
     if not include_unpromoted:
         return canonical.sort_values("transaction_date", kind="mergesort")
@@ -397,7 +459,7 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
                     ORDER BY amount_midpoint DESC NULLS LAST
                 ) AS rn
             FROM transactions t
-            WHERE member = ?
+            WHERE t.member IN (SELECT UNNEST(?))
               AND NOT EXISTS (
                   SELECT 1 FROM canonical_transactions c
                   WHERE c.source IS NOT DISTINCT FROM t.source
@@ -408,7 +470,7 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
         )
         WHERE rn = 1
         """,
-        [member],
+        [_member_variants(db, member)],
     ).fetchdf()
     combined = pd.concat([canonical, raw], ignore_index=True)
     logger.warning(

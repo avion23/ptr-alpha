@@ -1,53 +1,73 @@
-#!/usr/bin/env python3
-"""Backfill missing tickers for existing transactions using company name matching.
+"""Backfill uniquely resolved company tickers; dry-run unless --apply is set."""
 
-Scans all no-ticker rows, applies _extract_ticker() (which now includes company
-name matching), and updates the ticker column where a match is found.
-"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
 
 import duckdb
-from analyzer.parsing.cells import _extract_ticker
 
-DB_PATH = "data/congress.duckdb"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from analyzer.asset_ticker_map import resolve_asset_ticker
 
 
-def backfill():
-    conn = duckdb.connect(DB_PATH)
-    before = conn.execute(
-        "SELECT COUNT(*) FROM transactions WHERE ticker IS NULL OR ticker = ''"
-    ).fetchone()[0]
-    total = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-    pct_before = before / total * 100 if total > 0 else 0.0
-    print(f"Before: {before}/{total} no-ticker ({pct_before:.1f}%)")
+def backfill_tickers(
+    db_path: str | Path = "data/congress.duckdb", *, apply: bool = False
+) -> tuple[int, int]:
+    """Return (resolved, unresolved) counts; update only ticker and its origin."""
+    connection = duckdb.connect(str(db_path), read_only=not apply)
+    try:
+        rows = connection.execute(
+            """
+            SELECT id, asset_description
+            FROM transactions
+            WHERE ticker IS NULL
+              AND asset_description IS NOT NULL
+              AND trim(asset_description) <> ''
+            """
+        ).fetchall()
+        resolved = [
+            (row_id, ticker)
+            for row_id, description in rows
+            if (ticker := resolve_asset_ticker(description)) is not None
+        ]
+        unresolved = len(rows) - len(resolved)
 
-    rows = conn.execute("""
-        SELECT id, asset_description FROM transactions
-        WHERE (ticker IS NULL OR ticker = '')
-        AND asset_description IS NOT NULL
-        AND asset_description != ''
-    """).fetchall()
-    print(f"Rows with asset_description to check: {len(rows)}")
+        if apply and resolved:
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                connection.executemany(
+                    """
+                    UPDATE transactions
+                    SET ticker = ?, ticker_origin = 'resolved_asset_name'
+                    WHERE id = ? AND ticker IS NULL
+                    """,
+                    [(ticker, row_id) for row_id, ticker in resolved],
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return len(resolved), unresolved
+    finally:
+        connection.close()
 
-    updated = 0
-    for row_id, asset_desc in rows:
-        ticker = _extract_ticker(asset_desc)
-        if ticker:
-            conn.execute(
-                "UPDATE transactions SET ticker = ? WHERE id = ?",
-                [ticker, row_id],
-            )
-            updated += 1
 
-    conn.execute("CHECKPOINT")
-    after = conn.execute(
-        "SELECT COUNT(*) FROM transactions WHERE ticker IS NULL OR ticker = ''"
-    ).fetchone()[0]
-    print(f"Updated: {updated} rows")
-    pct_after = after / total * 100 if total > 0 else 0.0
-    print(f"After: {after}/{total} no-ticker ({pct_after:.1f}%)")
-    print(f"Resolved: {before - after} new tickers")
-    conn.close()
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db-path", default="data/congress.duckdb")
+    parser.add_argument(
+        "--apply", action="store_true", help="write resolved tickers (default: dry-run)"
+    )
+    args = parser.parse_args()
+    resolved, unresolved = backfill_tickers(args.db_path, apply=args.apply)
+    print("Mode: apply" if args.apply else "Mode: dry-run")
+    print(f"Resolved: {resolved}")
+    print(f"Unresolved: {unresolved}")
 
 
 if __name__ == "__main__":
-    backfill()
+    main()

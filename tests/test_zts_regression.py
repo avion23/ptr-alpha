@@ -1,5 +1,4 @@
-from datetime import date, timedelta
-from itertools import pairwise
+from datetime import date
 from types import SimpleNamespace
 
 import duckdb
@@ -8,14 +7,29 @@ import pytest
 
 from analyzer import actors, pipeline, positions, replay, setups
 
-AS_OF = date(2026, 6, 30)
-BEFORE_JUNE = date(2026, 5, 1)
+JUNE_30 = date(2026, 6, 30)
+JULY_31 = date(2026, 7, 31)
+AUGUST_3 = date(2026, 8, 3)
+SEPTEMBER_4 = date(2026, 9, 4)
+MIN_SETUP_ACTORS = 3
 MEMBERS = [
     "Byron Donalds",
     "Gilbert Cisneros",
     "Charles J Fleischmann",
     "Rohit Khanna",
 ]
+
+# Actual ZTS closes from data/congress.duckdb's prices table; only dates used
+# for entry and as-of prices are included, not a generated price curve.
+REAL_CLOSES = {
+    date(2026, 5, 27): 78.9297866821289,
+    date(2026, 6, 2): 75.86117553710938,
+    date(2026, 6, 9): 81.63095092773438,
+    date(2026, 6, 16): 78.78083038330078,
+    date(2026, 6, 30): 71.36254119873047,
+    date(2026, 7, 31): 77.29000091552734,
+    AUGUST_3: 77.0999984741211,
+}
 _TRANSACTION_COLUMNS = (
     "member",
     "ticker",
@@ -56,7 +70,9 @@ class _MemoryDB:
             """
         )
         self.conn.executemany(
-            "INSERT INTO canonical_transactions VALUES (" + ", ".join("?" * 15) + ")",
+            "INSERT INTO canonical_transactions VALUES ("
+            + ", ".join("?" * len(_TRANSACTION_COLUMNS))
+            + ")",
             [
                 tuple(row[column] for column in _TRANSACTION_COLUMNS)
                 for row in transactions
@@ -74,112 +90,116 @@ class _MemoryDB:
         ).fetchdf()
 
 
-def _scenario():
-    dates = pd.date_range("2026-03-02", "2026-06-30", freq="B")
-    close_by_date = {
-        day.date(): 190.0 - index * 0.45 for index, day in enumerate(dates)
+def _trade(
+    member,
+    transaction_date,
+    disclosure_date,
+    transaction_type,
+    amount_midpoint,
+    amount_raw,
+    source,
+    source_record_id,
+):
+    return {
+        "member": member,
+        "ticker": "ZTS",
+        "transaction_type": transaction_type,
+        "transaction_date": transaction_date,
+        "disclosure_date": disclosure_date,
+        "amount_midpoint": amount_midpoint,
+        "amount_raw": amount_raw,
+        "source": source,
+        "instrument_type": None,
+        "source_record_id": source_record_id,
+        "amends_source_record_id": None,
+        "ticker_origin": None,
+        "raw_asset_class": None,
+        "asset_description": "Zoetis Inc. (ZTS)",
+        "raw_asset_description": "Zoetis Inc. (ZTS)",
     }
-    prices = [("ZTS", day, close) for day, close in close_by_date.items()]
 
-    transactions = []
 
-    def add_trade(member, transaction_type, day, disclosure, amount, amount_raw):
-        transactions.append(
-            {
-                "member": member,
-                "ticker": "ZTS",
-                "transaction_type": transaction_type,
-                "transaction_date": day,
-                "disclosure_date": disclosure,
-                "amount_midpoint": amount,
-                "amount_raw": amount_raw,
-                "source": "house_pdf",
-                "instrument_type": None,
-                "source_record_id": f"{member}-{day}-{transaction_type}",
-                "amends_source_record_id": None,
-                "ticker_origin": None,
-                "raw_asset_class": None,
-                "asset_description": None,
-                "raw_asset_description": None,
-            }
-        )
-
-    buys = [
-        (
-            "Byron Donalds",
+def _scenario(include_later_row):
+    transactions = [
+        # Real Rohit Khanna purchase from filing 9116142.
+        _trade(
+            "Rohit Khanna",
+            date(2026, 5, 27),
             date(2026, 6, 9),
-            date(2026, 6, 18),
-            25000,
-            "$15,001 - $50,000",
+            "Purchase",
+            8000.0,
+            "A",
+            "gemini_ocr",
+            "9116142",
         ),
-        (
+        # These three buys were disclosed in July, not June.
+        _trade(
             "Gilbert Cisneros",
             date(2026, 6, 16),
-            date(2026, 6, 23),
-            10000,
+            date(2026, 7, 2),
+            "Purchase",
+            8000.5,
             "$1,001 - $15,000",
+            "house_pdf",
+            "20034906",
         ),
-        (
+        _trade(
             "Charles J Fleischmann",
             date(2026, 6, 9),
-            date(2026, 6, 18),
-            32500,
-            "$15,001 - $50,000",
+            date(2026, 7, 8),
+            "Purchase",
+            75000.0,
+            "C",
+            "gemini_ocr",
+            "9116212",
         ),
-        (
-            "Rohit Khanna",
-            date(2026, 4, 9),
-            date(2026, 4, 24),
-            15000,
-            "$15,001 - $50,000",
-        ),
-        (
-            "Rohit Khanna",
-            date(2026, 5, 12),
-            date(2026, 5, 22),
-            15000,
-            "$15,001 - $50,000",
-        ),
-        (
-            "Rohit Khanna",
+        _trade(
+            "Byron Donalds",
             date(2026, 6, 9),
-            date(2026, 6, 18),
-            15000,
-            "$15,001 - $50,000",
+            date(2026, 7, 15),
+            "Purchase",
+            8000.5,
+            "$1,001 - $15,000",
+            "house_pdf",
+            "20034968",
         ),
     ]
-    for member, day, disclosure, amount, amount_raw in buys:
-        add_trade(member, "Purchase", day, disclosure, amount, amount_raw)
-
-    khanna_buys = [row for row in buys if row[0] == "Rohit Khanna"]
-    khanna_sales = []
-    for member, buy_day, _, amount, amount_raw in khanna_buys:
-        sell_day = buy_day + timedelta(days=20)
-        sell_price = close_by_date[sell_day]
-        buy_price = close_by_date[buy_day]
-        sale_amount = amount / buy_price * sell_price * 1.01
-        add_trade(
-            member,
-            "Sale",
-            sell_day,
-            min(sell_day + timedelta(days=7), AS_OF),
-            sale_amount,
-            amount_raw,
+    prices = [
+        ("ZTS", day, close)
+        for day, close in REAL_CLOSES.items()
+        if include_later_row or day != AUGUST_3
+    ]
+    if include_later_row:
+        # Real Rohit Khanna purchase: 2026-08-03, disclosed 2026-09-04.
+        transactions.append(
+            _trade(
+                "Rohit Khanna",
+                AUGUST_3,
+                SEPTEMBER_4,
+                "Purchase",
+                8000.0,
+                "A",
+                "gemini_ocr",
+                "9116328",
+            )
         )
-        khanna_sales.append(sell_day)
-
-    return _MemoryDB(transactions, prices), close_by_date, khanna_buys, khanna_sales
+    return _MemoryDB(transactions, prices)
 
 
-def test_zts_june_setup_replays_and_respects_point_in_time(monkeypatch):
-    db, close_by_date, khanna_buys, khanna_sales = _scenario()
-    scored_candidates = {}
-    june_actors = {actors.actor_id("congress", member) for member in MEMBERS[:3]}
+def test_zts_june_july_results_use_disclosure_dates_and_ignore_later_rows(
+    monkeypatch,
+):
+    captured = {}
+    ranked_by_snapshot = {}
+    current_snapshot = None
 
     def capture_score(candidates, weights, current_prices):
         decision_date = pd.Timestamp(candidates.iloc[0]["as_of"]).date()
-        scored_candidates[decision_date] = candidates.copy()
-        return setups.score(candidates, weights, current_prices)
+        key = (current_snapshot, decision_date)
+        captured[key] = (candidates.copy(), current_prices.copy())
+        ranked, blocked = setups.score(candidates, weights, current_prices)
+        ranked_by_snapshot[key] = (ranked.copy(), blocked.copy())
+        return ranked, blocked
 
     monkeypatch.setattr(
         replay,
@@ -191,104 +211,140 @@ def test_zts_june_setup_replays_and_respects_point_in_time(monkeypatch):
             SimpleNamespace(score=capture_score),
         ),
     )
-
+    without_later_row = _scenario(include_later_row=False)
+    with_later_row = _scenario(include_later_row=True)
     try:
-        prices = list(close_by_date.values())
-        assert prices[0] > prices[-1]
-        assert all(left > right for left, right in pairwise(prices))
-        assert all(
-            0 < (sale - buy[1]).days <= 30
-            for buy, sale in zip(khanna_buys, khanna_sales)
+        current_snapshot = "before"
+        before = replay.replay(
+            without_later_row,
+            ["ZTS"],
+            [JUNE_30, JULY_31],
+            horizon_days=90,
+            members=MEMBERS,
         )
+        current_snapshot = "after"
+        after = replay.replay(
+            with_later_row,
+            ["ZTS"],
+            [JUNE_30, JULY_31],
+            horizon_days=90,
+            members=MEMBERS,
+        )
+        assert with_later_row.conn.execute(
+            "SELECT close FROM prices WHERE ticker = 'ZTS' AND date = ?",
+            [AUGUST_3],
+        ).fetchone() == (REAL_CLOSES[AUGUST_3],)
+    finally:
+        without_later_row.conn.close()
+        with_later_row.conn.close()
 
-        june_result = replay.replay(
-            db, ["ZTS"], [AS_OF], horizon_days=90, members=MEMBERS
-        ).iloc[0]
-        candidates = scored_candidates[AS_OF]
-        assert june_result["score"] > 0
-        assert june_result["n_actors"] >= 3
-
-        event_rows = candidates.loc[~candidates["position_evidence"]]
-        expected_events = {
-            (actors.actor_id("congress", "Byron Donalds"), date(2026, 6, 9)),
+    # Adding the later purchase and its real close leaves both earlier replays
+    # identical at the result-frame level.
+    pd.testing.assert_frame_equal(before, after)
+    expected_position_actors = {
+        JUNE_30: {actors.actor_id("congress", "Rohit Khanna")},
+        JULY_31: {
+            actors.actor_id("congress", member)
+            for member in MEMBERS
+        },
+    }
+    expected_events = {
+        JUNE_30: {
+            (actors.actor_id("congress", "Rohit Khanna"), date(2026, 5, 27))
+        },
+        JULY_31: {
+            (actors.actor_id("congress", "Rohit Khanna"), date(2026, 5, 27)),
             (actors.actor_id("congress", "Gilbert Cisneros"), date(2026, 6, 16)),
             (
                 actors.actor_id("congress", "Charles J Fleischmann"),
                 date(2026, 6, 9),
             ),
-        }
-        expected_events.update(
-            (actors.actor_id("congress", "Rohit Khanna"), row[1]) for row in khanna_buys
-        )
+            (actors.actor_id("congress", "Byron Donalds"), date(2026, 6, 9)),
+        },
+    }
+    expected_current = {
+        JUNE_30: REAL_CLOSES[JUNE_30],
+        JULY_31: REAL_CLOSES[JULY_31],
+    }
+    for decision_date in (JUNE_30, JULY_31):
+        before_candidates, before_prices = captured[("before", decision_date)]
+        after_candidates, after_prices = captured[("after", decision_date)]
+        pd.testing.assert_frame_equal(before_candidates, after_candidates)
+        assert before_prices == after_prices == {"ZTS": expected_current[decision_date]}
+        disclosures = pd.to_datetime(after_candidates["disclosure_date"]).dt.date
+        assert not (disclosures > decision_date).any()
+        assert not (
+            pd.to_datetime(after_candidates["event_date"]).dt.date == AUGUST_3
+        ).any()
+        assert not (disclosures == SEPTEMBER_4).any()
+
+        position_rows = after_candidates.loc[after_candidates["position_evidence"]]
+        assert set(position_rows["actor_id"]) == expected_position_actors[decision_date]
+        event_rows = after_candidates.loc[~after_candidates["position_evidence"]]
         observed_events = {
             (row.actor_id, pd.Timestamp(row.event_date).date())
             for row in event_rows.itertuples()
         }
-        assert observed_events == expected_events
+        assert observed_events == expected_events[decision_date]
         for row in event_rows.itertuples():
-            day = pd.Timestamp(row.event_date).date()
-            assert row.entry_ref == pytest.approx(close_by_date[day])
+            event_date = pd.Timestamp(row.event_date).date()
+            assert row.entry_ref == REAL_CLOSES[event_date]
+        ranked, _ = ranked_by_snapshot[("after", decision_date)]
+        assert set(ranked.iloc[0]["actors"]) == expected_position_actors[decision_date]
 
-        khanna_id = actors.actor_id("congress", "Rohit Khanna")
-        khanna_rows = event_rows.loc[event_rows["actor_id"] == khanna_id]
-        assert set(pd.to_datetime(khanna_rows["event_date"]).dt.date) == {
-            row[1] for row in khanna_buys
-        }
-        assert not candidates.loc[
-            candidates["actor_id"] == khanna_id, "position_evidence"
-        ].any()
+    june = after.loc[after["as_of"] == JUNE_30].iloc[0]
+    assert june["n_actors"] == 1
+    assert june["score"] > 0
+    assert june["n_actors"] < MIN_SETUP_ACTORS
+    june_is_setup = not june["blocked"] and june["n_actors"] >= MIN_SETUP_ACTORS
+    assert not june_is_setup
 
-        weights = {
-            row.actor_id: actors.compute_weight(str(row.kind), 0, 0.0, str(row.source))
-            for row in candidates.itertuples()
-        }
+    july = after.loc[after["as_of"] == JULY_31].iloc[0]
+    assert july["n_actors"] == 4
+    assert july["score"] > 0
+    assert july["n_actors"] >= MIN_SETUP_ACTORS
+    july_is_setup = not july["blocked"] and july["n_actors"] >= MIN_SETUP_ACTORS
+    assert july_is_setup
 
-        def actor_contribution(actor_id):
-            ranked, _ = setups.score(
-                candidates.loc[candidates["actor_id"] == actor_id],
-                weights,
-                {"ZTS": close_by_date[AS_OF]},
-            )
-            return float(ranked.iloc[0]["score"])
 
-        holder_contribution = actor_contribution(
-            actors.actor_id("congress", "Byron Donalds")
+def test_fully_closed_holder_does_not_contribute():
+    db = _MemoryDB(
+        [
+            _trade(
+                "Sell-Now Trap",
+                date(2026, 6, 2),
+                date(2026, 6, 9),
+                "Purchase",
+                8000.5,
+                "$1,001 - $15,000",
+                "house_pdf",
+                "test-buy",
+            ),
+            _trade(
+                "Sell-Now Trap",
+                date(2026, 6, 16),
+                date(2026, 6, 23),
+                "Sale Full",
+                8000.5,
+                "$1,001 - $15,000",
+                "house_pdf",
+                "test-full-sale",
+            ),
+        ],
+        [("ZTS", day, close) for day, close in REAL_CLOSES.items() if day != AUGUST_3],
+    )
+    try:
+        before_sale = positions.holdings_candidates(
+            db, "Sell-Now Trap", date(2026, 6, 15)
         )
-        churner_contribution = actor_contribution(khanna_id)
-        assert holder_contribution > churner_contribution
-
-        corroboration = pd.DataFrame(
-            [
-                {
-                    "ticker": "ZTS",
-                    "actor_id": "manager:13F ONLY",
-                    "kind": "manager",
-                    "source": "13f",
-                    "entry_ref": None,
-                    "event_date": AS_OF,
-                    "disclosure_date": AS_OF,
-                    "corroboration": True,
-                    "position_evidence": False,
-                    "as_of": AS_OF,
-                }
-            ]
+        assert len(before_sale) == 1
+        assert before_sale.iloc[0]["entry_ref"] == pytest.approx(
+            REAL_CLOSES[date(2026, 6, 2)]
         )
-        corroborated, _ = setups.score(
-            corroboration,
-            {"manager:13F ONLY": 0.6},
-            {"ZTS": close_by_date[AS_OF]},
-        )
-        assert corroborated.iloc[0]["score"] == 0
-        assert corroborated.iloc[0]["n_actors"] == 0
 
-        early_result = replay.replay(
-            db, ["ZTS"], [BEFORE_JUNE], horizon_days=90, members=MEMBERS
-        ).iloc[0]
-        early_candidates = scored_candidates[BEFORE_JUNE]
-        assert not set(early_candidates["actor_id"]) & june_actors
-        assert not (
-            pd.to_datetime(early_candidates["event_date"]).dt.date > BEFORE_JUNE
-        ).any()
-        assert early_result["n_actors"] < 3
+        candidates = positions.holdings_candidates(db, "Sell-Now Trap", JUNE_30)
+        assert candidates.empty
+        ranked, _ = setups.score(candidates, {}, {"ZTS": REAL_CLOSES[JUNE_30]})
+        assert ranked.empty
     finally:
         db.conn.close()

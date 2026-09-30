@@ -320,7 +320,7 @@ class Database:
                                 WHERE parse_run.doc_id = artifact.doc_id
                                   AND parse_run.artifact_sha256 = artifact.artifact_sha256
                                   AND parse_run.ingestion_generation = artifact.generation_id
-                                  AND parse_run.status IN ('success', 'no_txs')
+                                  AND parse_run.status IN ('success', 'no_txs', 'invalid')
                                   AND COALESCE(parse_run.transaction_count, 0) = (
                                       SELECT COUNT(*)
                                       FROM transactions tx_count
@@ -658,7 +658,7 @@ class Database:
                     WHERE parse_run.doc_id = a.doc_id
                       AND parse_run.artifact_sha256 = a.artifact_sha256
                       AND parse_run.ingestion_generation = a.generation_id
-                      AND parse_run.status IN ('success', 'no_txs')
+                      AND parse_run.status IN ('success', 'no_txs', 'invalid')
                       AND COALESCE(parse_run.transaction_count, 0) = (
                           SELECT COUNT(*)
                           FROM transactions t
@@ -701,6 +701,45 @@ class Database:
             [archive_year, generation_id],
         ).fetchall()
         return [str(row[0]) for row in rows]
+
+    def mark_house_doc_invalid(
+        self,
+        doc_id: str,
+        archive_year: int,
+        generation_id: str,
+        reason: str,
+    ) -> None:
+        """Terminally retire a human-reviewed, unfixable filing.
+
+        For PTRs whose extracted rows are impossible as stated (filer date
+        errors confirmed against the scan): no future parse or OCR run can
+        fix them, so they resolve as 'invalid' instead of blocking their
+        generation forever. No rows are inserted; the reason is recorded.
+        """
+        artifact = self.conn.execute(
+            """
+            SELECT artifact_sha256 FROM house_pdf_artifacts
+            WHERE archive_year = ? AND generation_id = ? AND doc_id = ?
+            """,
+            [archive_year, generation_id, str(doc_id)],
+        ).fetchone()
+        self.conn.execute(
+            """
+            INSERT INTO pdf_parse_runs (
+                doc_id, year, parser_version, status, engines_attempted,
+                raw_row_count, transaction_count, error_message,
+                artifact_sha256, ingestion_generation
+            ) VALUES (?, ?, 'manual-review', 'invalid', 'human', 0, 0, ?,
+                      ?, ?)
+            """,
+            [
+                str(doc_id),
+                archive_year,
+                reason,
+                artifact[0] if artifact else None,
+                generation_id,
+            ],
+        )
 
     def mark_house_generation_parse_complete(
         self,

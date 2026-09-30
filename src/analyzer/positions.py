@@ -453,6 +453,7 @@ _NICKNAMES = {
     "chris": "christopher", "pat": "patrick", "tim": "timothy",
     "jeff": "jeffrey", "greg": "gregory", "ron": "ronald", "ken": "kenneth",
     "larry": "lawrence", "rick": "richard", "chuck": "charles", "ro": "rohit",
+    "hal": "harold", "dick": "richard", "ned": "edward", "ted": "theodore",
 }
 
 

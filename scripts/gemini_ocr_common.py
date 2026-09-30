@@ -591,7 +591,17 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
     if expected_member and not same_member_identity(
         str(member or ""), str(expected_member)
     ):
-        return [], {"member_mismatch": raw_count or 1}
+        # Surname-only filings ("Malliotakis"): accept when the single filed
+        # token equals the metadata surname. Scoped to this filing-vs-metadata
+        # check only; never used for cross-filing identity.
+        filed_tokens = canonical_member_key(str(member or "")).split()
+        expected_tokens = canonical_member_key(str(expected_member)).split()
+        if not (
+            len(filed_tokens) == 1
+            and len(expected_tokens) > 1
+            and filed_tokens[0] == expected_tokens[-1]
+        ):
+            return [], {"member_mismatch": raw_count or 1}
 
     valid = []
     for tx in transactions:

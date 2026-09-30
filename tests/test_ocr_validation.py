@@ -43,3 +43,31 @@ def test_impossible_date_rejects_only_that_row():
     )
     assert len(valid) == 1
     assert rejections.get("date_out_of_window") == 1
+
+
+def test_hal_harold_nickname_matches():
+    valid, rejections = validate_transactions(
+        "9115808",
+        "Rep. Hal Rogers",
+        [_tx()],
+        "07/08/2026",
+        "Harold Dallas Rogers",
+    )
+    assert len(valid) == 1
+    assert rejections == {}
+
+
+def test_surname_only_filing_matches_metadata():
+    valid, rejections = validate_transactions(
+        "9116217", "Malliotakis", [_tx()], "07/08/2026", "Nicole Malliotakis"
+    )
+    assert len(valid) == 1
+    assert rejections == {}
+
+
+def test_surname_only_mismatch_still_rejected():
+    valid, rejections = validate_transactions(
+        "9116217", "Smith", [_tx()], "07/08/2026", "Nicole Malliotakis"
+    )
+    assert valid == []
+    assert rejections.get("member_mismatch") == 1

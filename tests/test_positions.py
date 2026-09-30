@@ -328,6 +328,45 @@ class TestPositions(unittest.TestCase):
         self.assertIn("Charles J. \"Chuck\" Fleischmann", variants)
         self.assertNotIn("Nancy Pelosi", variants)
 
+    def test_member_variants_keep_conflicting_middle_initials_separate(self):
+        import duckdb
+        from types import SimpleNamespace
+
+        from analyzer.positions import _member_variants
+
+        conn = duckdb.connect()
+        conn.execute(
+            "CREATE TABLE transactions AS SELECT * FROM (VALUES "
+            "('Mike A. Smith'), ('Michael B. Smith')) AS v(member)"
+        )
+        variants = _member_variants(SimpleNamespace(conn=conn), "Mike A. Smith")
+        self.assertEqual(variants, ["Mike A. Smith"])
+
+    def test_sale_full_closes_position_across_name_variants(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "Chuck Fleischmann",
+                    "ticker": "ZTS",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                },
+                {
+                    "member": "Charles J Fleischmann",
+                    "ticker": "ZTS",
+                    "transaction_type": "Sale Full",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 100.0,
+                },
+            ]
+        )
+        history = {
+            "ZTS": _prices(["2025-01-10", "2025-06-10"], [100.0, 200.0])
+        }
+        positions = build_positions(trades, history, as_of=date(2025, 6, 11))
+        self.assertTrue(positions.empty)
+
     def test_nickname_resolves_to_filed_name(self):
         import duckdb
         from types import SimpleNamespace

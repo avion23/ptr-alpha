@@ -18,6 +18,7 @@ from datetime import date
 
 import pandas as pd
 
+from analyzer.member_names import canonical_member_key
 from analyzer.parsing.cells import _extract_amount_midpoint
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,9 @@ def build_positions(
     first_buy: dict[tuple[str, str], date] = {}
     last_activity: dict[tuple[str, str], date] = {}
     floor_sized: dict[tuple[str, str], int] = {}
+    member_identities: dict[str, list[str]] = {}
+    member_keys: dict[str, str] = {}
+    member_labels: dict[str, str] = {}
     skipped = 0
     skipped_options = 0
     ignored_exchanges = 0
@@ -143,7 +147,26 @@ def build_positions(
         if pd.isna(row.member) or pd.isna(row.ticker):
             skipped += 1
             continue
-        key = (str(row.member), str(row.ticker))
+        member = str(row.member)
+        canonical = canonical_member_key(member)
+        member_key = member_keys.get(canonical)
+        if member_key is None:
+            # ponytail: scan distinct aliases; index by surname if this grows costly.
+            member_key = next(
+                (
+                    identity
+                    for identity, variants in member_identities.items()
+                    if all(
+                        _same_member_variant(canonical, variant)
+                        for variant in variants
+                    )
+                ),
+                canonical,
+            )
+            member_keys[canonical] = member_key
+            member_identities.setdefault(member_key, []).append(canonical)
+            member_labels.setdefault(member_key, member)
+        key = (member_key, str(row.ticker))
         day = pd.Timestamp(row.transaction_date).date()
         kind = str(row.transaction_type or "").strip().lower()
         if _is_option_row(row, has_instrument):
@@ -224,7 +247,7 @@ def build_positions(
         basis = cost / shares
         records.append(
             {
-                "member": key[0],
+                "member": member_labels[key[0]],
                 "ticker": key[1],
                 "shares": shares,
                 "total_cost": cost,
@@ -382,6 +405,25 @@ def _same_person(first: str, candidate: str) -> bool:
     return False
 
 
+def _same_member_variant(first: str, candidate: str) -> bool:
+    """Match filed variants without joining conflicting middle initials."""
+    first_tokens = first.split()
+    candidate_tokens = candidate.split()
+    if len(first_tokens) < 2 or len(candidate_tokens) < 2:
+        return first == candidate
+    if first_tokens[-1] != candidate_tokens[-1]:
+        return False
+    if not _same_person(first_tokens[0].lower(), candidate_tokens[0].lower()):
+        return False
+    first_middle = first_tokens[1][0] if len(first_tokens) > 2 else None
+    candidate_middle = candidate_tokens[1][0] if len(candidate_tokens) > 2 else None
+    return (
+        first_middle is None
+        or candidate_middle is None
+        or first_middle == candidate_middle
+    )
+
+
 def _member_variants(db, member: str) -> list[str]:
     """All filed name variants for the member.
 
@@ -389,13 +431,12 @@ def _member_variants(db, member: str) -> list[str]:
     Fleischmann', and 'Charles J Fleischmann' across filings; users type
     'Chuck Fleischmann'. Match on canonical key first, then on
     last-name plus nickname-equivalent first name. An exact match on any
-    one variant previously dropped the others' positions silently.
+    one variant previously dropped the others' positions silently. Middle
+    initials must agree when both names provide one.
     """
-    from analyzer.member_names import canonical_member_key
-
     if not isinstance(member, str) or not member.strip():
         return [member]
-    wanted = canonical_member_key(member).split()
+    wanted = canonical_member_key(member)
     try:
         names = db.conn.execute("SELECT DISTINCT member FROM transactions").fetchall()
     except Exception:
@@ -411,15 +452,10 @@ def _member_variants(db, member: str) -> list[str]:
         name = row[0]
         if name in seen:
             continue
-        key = canonical_member_key(name).split()
+        key = canonical_member_key(name)
         if key == wanted:
             seen.append(name)
-        elif (
-            len(key) > 1
-            and len(wanted) > 1
-            and key[-1] == wanted[-1]
-            and _same_person(key[0].lower(), wanted[0].lower())
-        ):
+        elif _same_member_variant(key, wanted):
             seen.append(name)
     return seen or [member]
 

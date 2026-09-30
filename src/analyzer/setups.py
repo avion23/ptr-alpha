@@ -92,7 +92,18 @@ def score(
                 usable.append((decay, reason, entry_ref))
 
             if not usable:
-                if not seen_reference:
+                blocked_reason = next(
+                    (
+                        row.get("blocked_reason")
+                        for row in initiators
+                        if isinstance(row.get("blocked_reason"), str)
+                        and row.get("blocked_reason").strip()
+                    ),
+                    None,
+                )
+                if blocked_reason:
+                    reason = blocked_reason
+                elif not seen_reference:
                     reason = "no entry reference"
                 elif current is None:
                     reason = "no current price"
@@ -112,11 +123,22 @@ def score(
                 (actor_id, float(weights.get(actor_id, 0.0)) * decay, reason)
             )
 
+        score_value = sum(item[1] for item in accepted) * (
+            1.5 if corroborated else 1.0
+        )
+        if accepted and score_value < 1.0:
+            blocked_rows.extend(
+                {
+                    "ticker": ticker,
+                    "actor_id": actor_id,
+                    "reason": "score below ranking floor (1.00)",
+                }
+                for actor_id, _, _ in accepted
+            )
         ranked_rows.append(
             {
                 "ticker": ticker,
-                "score": sum(item[1] for item in accepted)
-                * (1.5 if corroborated else 1.0),
+                "score": score_value,
                 "actors": [item[0] for item in accepted],
                 "n_actors": len(accepted),
                 "current": current,

@@ -1534,7 +1534,13 @@ def setups(
     try:
         from analyzer.actors import compute_weight
         from analyzer.pipeline import eligible_events
-        from analyzer.positions import gate_closed_events, holdings_candidates
+        from analyzer.positions import (
+            coalesce_actor_variants,
+            gate_closed_events,
+            holdings_candidates,
+        )
+        from analyzer.member_names import canonical_member_key
+        from analyzer.positions import _same_member_variant
         from analyzer.setups import score as score_setups
     except ImportError as exc:
         _cli_exit(1, f"Error: setups is unavailable ({exc})")
@@ -1579,13 +1585,38 @@ def setups(
                 events = events.iloc[0:0]
             if not events.empty:
                 selected_members = set(member)
-                event_members = {
-                    str(actor_id).split(":", 1)[1]
-                    for actor_id in events["actor_id"].dropna()
-                    if ":" in str(actor_id) and str(actor_id).split(":", 1)[1]
-                }
+                selected_keys = set()
+                for name in selected_members:
+                    try:
+                        selected_keys.add(canonical_member_key(name))
+                    except (TypeError, ValueError):
+                        selected_keys.add(str(name).strip().upper())
+                event_kinds: dict[str, str] = {}
+                for actor_id in events["actor_id"].dropna():
+                    text = str(actor_id)
+                    if ":" not in text:
+                        continue
+                    kind, _, name = text.partition(":")
+                    if name:
+                        event_kinds.setdefault(name, kind)
                 event_tickers = set(events["ticker"].astype("string").str.upper())
-                for event_member in sorted(event_members - selected_members):
+                processed_keys = set(selected_keys)
+                for event_member in sorted(event_kinds):
+                    if event_member in selected_members:
+                        continue
+                    if event_kinds[event_member] != "congress":
+                        continue
+                    try:
+                        event_key = canonical_member_key(event_member)
+                    except (TypeError, ValueError):
+                        event_key = event_member.strip().upper()
+                    if event_key in processed_keys or any(
+                        _same_member_variant(event_key, seen)
+                        or _same_member_variant(seen, event_key)
+                        for seen in processed_keys
+                    ):
+                        continue
+                    processed_keys.add(event_key)
                     frame = holdings_candidates(
                         db,
                         event_member,
@@ -1604,6 +1635,7 @@ def setups(
                 position_candidates = (
                     pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 )
+                events = coalesce_actor_variants(events, position_candidates)
                 events = gate_closed_events(events, position_candidates)
                 frames.append(events)
         if not frames:

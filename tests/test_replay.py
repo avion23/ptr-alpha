@@ -46,6 +46,8 @@ def _install_scoring(monkeypatch, events):
                              "as_of"]
                 ),
                 gate_closed_events=positions.gate_closed_events,
+                coalesce_actor_variants=positions.coalesce_actor_variants,
+                same_member_identity=positions.same_member_identity,
             ),
             SimpleNamespace(
                 compute_weight=lambda kind, n, hits, source: 0.6

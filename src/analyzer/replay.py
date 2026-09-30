@@ -16,8 +16,6 @@ from importlib import import_module
 
 import pandas as pd
 
-from analyzer.member_names import canonical_member_key
-
 _V1_MEMBERS = (
     "Nancy Pelosi",
     "Mitch McConnell",
@@ -39,28 +37,6 @@ _RESULT_COLUMNS = [
 
 class ReplayError(Exception):
     """Raised when replay cannot enforce or evaluate its point-in-time inputs."""
-
-
-def _same_member_identity(first: str, candidate: str, positions) -> bool:
-    first_key = canonical_member_key(first)
-    candidate_key = canonical_member_key(candidate)
-    # Canonical keys retain middle names; reuse positions' filed-variant rule
-    # for nickname and optional-middle-name matches.
-    return first_key == candidate_key or positions._same_member_variant(
-        first_key, candidate_key
-    )
-
-
-def _same_actor_identity(first: str, candidate: str, positions) -> bool:
-    if first == candidate:
-        return True
-    first_kind, first_separator, first_name = first.partition(":")
-    candidate_kind, candidate_separator, candidate_name = candidate.partition(":")
-    return (
-        first_kind == candidate_kind == "congress"
-        and bool(first_separator and candidate_separator)
-        and _same_member_identity(first_name, candidate_name, positions)
-    )
 
 
 def _load_dependencies():
@@ -144,7 +120,7 @@ def _ticker_candidates(
     processed_members = []
     for member in dict.fromkeys([*members, *sorted(event_members)]):
         if any(
-            _same_member_identity(previous, member, positions)
+            positions.same_member_identity(previous, member)
             for previous in processed_members
         ):
             continue
@@ -170,28 +146,7 @@ def _ticker_candidates(
         from_positions = (
             pd.concat(selected, ignore_index=True) if selected else pd.DataFrame()
         )
-        # Coalesce filed-name variants to the open position's actor before
-        # gating, so a variant in events still matches its open position.
-        representatives: list[str] = []
-        if {"actor_id", "position_evidence"}.issubset(from_positions.columns):
-            open_actors = from_positions.loc[
-                from_positions["position_evidence"].eq(True), "actor_id"
-            ].astype(str)
-            representatives = list(dict.fromkeys(open_actors))
-        for index, row in events.iterrows():
-            actor_id = str(row["actor_id"])
-            match = next(
-                (
-                    representative
-                    for representative in representatives
-                    if _same_actor_identity(representative, actor_id, positions)
-                ),
-                None,
-            )
-            if match is None:
-                representatives.append(actor_id)
-                match = actor_id
-            events.at[index, "actor_id"] = match
+        events = positions.coalesce_actor_variants(events, from_positions)
         events = positions.gate_closed_events(events, from_positions)
         selected.append(events)
 

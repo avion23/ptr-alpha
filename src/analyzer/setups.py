@@ -63,7 +63,27 @@ def score(
             current = None
 
         actor_rows = grouped[ticker]
-        corroborated = any(rows["corroborators"] for rows in actor_rows.values())
+        initiator_ids = {
+            actor for actor, rows in actor_rows.items() if rows["initiators"]
+        }
+
+        def _valid_corroborator(row) -> bool:
+            if row.get("source") != "13f":
+                return False
+            if str(row.get("actor_id")) in initiator_ids:
+                return False
+            try:
+                disclosed = _as_date(row["disclosure_date"])
+                decided = _as_date(row["as_of"])
+            except (TypeError, ValueError):
+                return False
+            return disclosed <= decided
+
+        corroborated = any(
+            _valid_corroborator(row)
+            for rows in actor_rows.values()
+            for row in rows["corroborators"]
+        )
         accepted = []
         for actor_id in sorted(actor_rows):
             evidence = actor_rows[actor_id]
@@ -138,9 +158,10 @@ def score(
                 continue
 
             decay, reason, _ = min(usable, key=lambda item: (-item[0], item[1]))
-            accepted.append(
-                (actor_id, float(weights.get(actor_id, 0.0)) * decay, reason)
-            )
+            contribution = float(weights.get(actor_id, 0.0)) * decay
+            if not math.isfinite(contribution) or contribution < 0:
+                contribution = 0.0
+            accepted.append((actor_id, contribution, reason))
 
         blocked_rows.extend(
             {

@@ -58,7 +58,13 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
 
     kinds = gated["kind"] if "kind" in gated.columns else None
     for index, row in gated.iterrows():
-        if kinds is not None and str(row["kind"]) != "congress":
+        # Fail closed: only exact officer/manager kinds are exempt (their
+        # evidence is weighted, never gated). Missing or unknown kinds gate
+        # like congress rather than slipping through.
+        if kinds is not None and str(row["kind"]).strip().lower() in (
+            "officer",
+            "manager",
+        ):
             continue
         key = (str(row["ticker"]).upper(), str(row["actor_id"]))
         if key not in open_positions:
@@ -399,6 +405,13 @@ def holdings_candidates(
         positions = build_positions(kind_trades, histories, as_of=as_of)
         for position in positions.itertuples(index=False):
             source = position.source
+            # Only congress holdings carry entry references and position
+            # evidence: the ledger sees congress buys AND sells. Officer
+            # rows come from buys-only Form 4 ingestion, so a market-close
+            # cost basis here would fabricate the filed purchase price and
+            # grant full (undecayed) weight. Officer rows stay present as
+            # context; their events initiate with filed prices.
+            congress_position = actor_kind == "congress"
             records.append(
                 {
                     "ticker": position.ticker,
@@ -406,12 +419,14 @@ def holdings_candidates(
                     "kind": actor_kind,
                     "source": source,
                     "entry_ref": (
-                        None if source == "13f" else float(position.cost_basis)
+                        float(position.cost_basis)
+                        if congress_position and source != "13f"
+                        else None
                     ),
                     "event_date": position.last_activity,
                     "disclosure_date": position.disclosure_date,
                     "corroboration": False,
-                    "position_evidence": True,
+                    "position_evidence": bool(congress_position),
                     "as_of": as_of,
                 }
             )
@@ -468,6 +483,64 @@ def _same_member_variant(first: str, candidate: str) -> bool:
         or candidate_middle is None
         or first_middle == candidate_middle
     )
+
+
+def same_member_identity(first: str, candidate: str) -> bool:
+    """Whether two filed names denote the same human.
+
+    Canonical keys retain middle names; the filed-variant rule covers
+    nicknames and optional middle names (Chuck <-> Charles J.).
+    """
+    first_key = canonical_member_key(first)
+    candidate_key = canonical_member_key(candidate)
+    return first_key == candidate_key or _same_member_variant(
+        first_key, candidate_key
+    )
+
+
+def same_actor_identity(first: str, candidate: str) -> bool:
+    """Whether two actor_ids denote the same human initiator."""
+    if first == candidate:
+        return True
+    first_kind, _, first_name = first.partition(":")
+    candidate_kind, _, candidate_name = candidate.partition(":")
+    return (
+        first_kind == candidate_kind == "congress"
+        and bool(first_name and candidate_name)
+        and same_member_identity(first_name, candidate_name)
+    )
+
+
+def coalesce_actor_variants(events: pd.DataFrame, from_positions: pd.DataFrame) -> pd.DataFrame:
+    """Rewrite congress event actor_ids to their open-position identity.
+
+    One human filing under two name variants must initiate once. Event
+    actors matching an open position take that position's actor_id; the
+    rest keep their own (first-seen wins within the events frame).
+    """
+    if events.empty or "actor_id" not in events.columns:
+        return events
+    representatives: list[str] = []
+    if {"actor_id", "position_evidence"}.issubset(from_positions.columns):
+        open_actors = from_positions.loc[
+            from_positions["position_evidence"].eq(True), "actor_id"
+        ].astype(str)
+        representatives = list(dict.fromkeys(open_actors))
+    for index, row in events.iterrows():
+        actor_id = str(row["actor_id"])
+        match = next(
+            (
+                representative
+                for representative in representatives
+                if same_actor_identity(representative, actor_id)
+            ),
+            None,
+        )
+        if match is None:
+            representatives.append(actor_id)
+            match = actor_id
+        events.at[index, "actor_id"] = match
+    return events
 
 
 def _member_variants(db, member: str) -> list[str]:

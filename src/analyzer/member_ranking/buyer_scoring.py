@@ -69,6 +69,9 @@ _UNSUPPORTED_ASSET_RE = re.compile(
     r"private equity|limited partnership|stock\s*option|option\s*type)\b",
     re.IGNORECASE,
 )
+# House [OP] marks an option inline; [ST] is authoritative stock and wins.
+_OPTION_BRACKET_RE = re.compile(r"\[op\]", re.IGNORECASE)
+_STOCK_BRACKET_RE = re.compile(r"\[st\]", re.IGNORECASE)
 
 
 @df_memoize(copy=False)
@@ -367,6 +370,10 @@ def _equity_transaction_row(row: pd.Series) -> bool:
         if value is not None and not pd.isna(value)
     )
     if _UNSUPPORTED_ASSET_RE.search(description):
+        return False
+    if _OPTION_BRACKET_RE.search(
+        description
+    ) and not _STOCK_BRACKET_RE.search(description):
         return False
 
     instrument = _normalize_ticker_text(row.get("instrument_type"))

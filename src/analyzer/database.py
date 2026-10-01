@@ -315,13 +315,6 @@ class Database:
                  AND scope.generation_id = artifact.generation_id
                  AND scope.doc_id = artifact.doc_id
                 WHERE (scope.doc_id IS NULL OR scope.filing_type = 'P')
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM house_archive_quarantine removed
-                      WHERE removed.archive_year = artifact.archive_year
-                        AND removed.doc_id = artifact.doc_id
-                        AND removed.reason = 'removed_from_authoritative_archive'
-                  )
                   AND (
                       -- Legacy/synthetic artifacts without scope rows ride on
                       -- generation completeness, as before.
@@ -423,13 +416,6 @@ class Database:
                             )
                             AND NOT EXISTS (
                                 SELECT 1
-                                FROM house_archive_quarantine removed
-                                WHERE removed.doc_id = t.doc_id
-                                  AND removed.reason
-                                      = 'removed_from_authoritative_archive'
-                            )
-                            AND NOT EXISTS (
-                                SELECT 1
                                 FROM metadata m
                                 JOIN house_archive_generations g
                                   ON g.archive_year = m.archive_year
@@ -443,13 +429,6 @@ class Database:
                                 SELECT 1
                                 FROM latest_accepted_house_docs accepted
                                 WHERE accepted.doc_id = t.doc_id
-                            )
-                            AND NOT EXISTS (
-                                SELECT 1
-                                FROM house_archive_quarantine removed
-                                WHERE removed.doc_id = t.doc_id
-                                  AND removed.reason
-                                      = 'removed_from_authoritative_archive'
                             )
                             AND NOT EXISTS (
                                 SELECT 1

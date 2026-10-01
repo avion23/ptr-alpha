@@ -788,6 +788,9 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
     # Conversely, every canonical House/OCR transaction must have a matching
     # report row.  This catches an inventory accidentally emitted under the
     # wrong source even when that report advertises accepted_row_count=0.
+    # Rows from incomplete generations are exempt: their final reports do
+    # not exist yet, and per-document acceptance makes such rows visible
+    # before activation.
     orphan_transactions = conn.execute(
         """
         SELECT t.source, t.chamber, t.ingestion_generation,
@@ -801,6 +804,11 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
          AND r.artifact_sha256 IS NOT DISTINCT FROM t.artifact_sha256
         WHERE t.source IN ('house_pdf', 'gemini_ocr')
           AND r.source_record_id IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM house_archive_generations g
+              WHERE g.generation_id = t.ingestion_generation
+                AND g.parse_status <> 'complete'
+          )
         GROUP BY 1, 2, 3, 4
         ORDER BY 1, 2, 3, 4
         LIMIT 25
@@ -829,6 +837,11 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
                      AND r.artifact_sha256 IS NOT DISTINCT FROM t.artifact_sha256
                     WHERE t.source IN ('house_pdf', 'gemini_ocr')
                       AND r.source_record_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM house_archive_generations g
+                          WHERE g.generation_id = t.ingestion_generation
+                            AND g.parse_status <> 'complete'
+                      )
                     GROUP BY 1, 2, 3, 4
                 )
                 """

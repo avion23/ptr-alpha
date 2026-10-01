@@ -55,6 +55,52 @@ _ARTIFACT_IDENTITY_COLUMNS = (
     "source_row_id",
     "ingestion_generation",
 )
+
+
+def drop_already_stored(db, df, *, source: str):
+    """Drop rows whose filing identity is already persisted.
+
+    Fetch batches stamp fresh ingestion generations, so generation-scoped
+    repository identity cannot dedupe re-fetches. Filing identity
+    (accession + row) is stable across fetches; filter here instead.
+    Database-less test doubles pass through untouched.
+    """
+    import pandas as pd
+
+    conn = getattr(db, "conn", None)
+    execute = getattr(conn, "execute", None)
+    if (
+        df.empty
+        or execute is None
+        or "source_record_id" not in df.columns
+        or "source_row_id" not in df.columns
+    ):
+        return df
+    try:
+        accessions = sorted({str(value) for value in df["source_record_id"].dropna()})
+        if not accessions:
+            return df
+        placeholders = ", ".join("?" for _ in accessions)
+        stored = {
+            (str(record_id), str(row_id))
+            for record_id, row_id in conn.execute(
+                f"SELECT source_record_id, source_row_id FROM transactions "  # nosec B608
+                f"WHERE source = ? AND source_record_id IN ({placeholders})",
+                [source, *accessions],
+            ).fetchall()
+        }
+    except Exception:
+        return df
+    mask = pd.Series(
+        [
+            (str(record_id), str(row_id)) not in stored
+            for record_id, row_id in zip(
+                df["source_record_id"], df["source_row_id"], strict=True
+            )
+        ],
+        index=df.index,
+    )
+    return df.loc[mask].copy()
 _TYPE_MAP = {
     "Sale Full": "Sale",
     "Sale Partial": "Sale",

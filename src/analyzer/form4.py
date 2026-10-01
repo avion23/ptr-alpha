@@ -1,4 +1,4 @@
-"""Official SEC Form 4 source for open-market insider purchases."""
+"""Official SEC Form 4 source for open-market insider trades."""
 
 from __future__ import annotations
 
@@ -213,7 +213,11 @@ def parse_form4_xml(
     official_filing_date: date | str,
     ingestion_generation: str | None = None,
 ) -> pd.DataFrame:
-    """Parse a filing into canonical open-market purchase rows only."""
+    """Parse a filing into canonical open-market purchase and sale rows.
+
+    Sales (code S) feed officer holdings so closed positions stop scoring;
+    only purchases initiate setups downstream.
+    """
     try:
         root = ET.fromstring(content)
     except ET.ParseError as exc:
@@ -249,8 +253,10 @@ def parse_form4_xml(
     is_10b5_1 = _is_10b5_1(root)
     rows: list[dict] = []
     for row_number, trade in enumerate(trades, start=1):
-        if _field_value(trade, "transactionCode").upper() != "P":
+        code = _field_value(trade, "transactionCode").upper()
+        if code not in ("P", "S"):
             continue
+        is_purchase = code == "P"
 
         transaction_date = _field_value(trade, "transactionDate")
         shares_raw = _field_value(trade, "transactionShares")
@@ -268,8 +274,8 @@ def parse_form4_xml(
         ]
         if missing:
             raise Form4Error(
-                f"Form 4 {accession} purchase row {row_number} is missing "
-                + ", ".join(missing)
+                f"Form 4 {accession} {'purchase' if is_purchase else 'sale'} "
+                f"row {row_number} is missing " + ", ".join(missing)
             )
         try:
             parsed_date = date.fromisoformat(transaction_date)
@@ -294,7 +300,7 @@ def parse_form4_xml(
                 "ticker": ticker.upper(),
                 "transaction_date": parsed_date,
                 "disclosure_date": filing_date,
-                "transaction_type": "Purchase",
+                "transaction_type": "Purchase" if is_purchase else "Sale",
                 "owner_code": None,
                 "amount_raw": f"${amount:,.2f}",
                 "amount_midpoint": float(amount),
@@ -310,7 +316,7 @@ def parse_form4_xml(
                 "raw_owner": owner,
                 "official_filing_date": filing_date,
                 "ingestion_generation": ingestion_generation,
-                "raw_transaction_subtype": "P",
+                "raw_transaction_subtype": code,
                 "raw_asset_description": description,
             }
         )
@@ -354,10 +360,12 @@ def _is_officer_filing(content: bytes) -> bool:
 
 
 def candidates_from_sweep(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert sweep rows to candidates; analyzer.actors is canonical for this format."""
+    """Convert sweep purchase rows to candidates; sales never initiate."""
     rows = []
     as_of = datetime.now(UTC).date()
     for row in df.to_dict("records"):
+        if str(row.get("transaction_type") or "").strip().lower() != "purchase":
+            continue
         description = str(row.get("raw_asset_description") or "")
         price = _TRADE_PRICE_RE.search(description)
         owner = " ".join(str(row.get("raw_owner") or "").split()).upper()
@@ -752,6 +760,9 @@ class Form4Source(TransactionSource):
             ]
             if df[required].isna().any().any():
                 raise Form4Error("Form 4 transaction provenance is incomplete")
+            from analyzer.transaction_repository import drop_already_stored
+
+            df = drop_already_stored(self.db, df, source="form4")
         return self.db.upsert_transactions(df, source="form4")
 
     def fetch_and_save_ticker(self, ticker: str, year: int) -> int:

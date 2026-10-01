@@ -98,35 +98,37 @@ def test_only_non_derivative_open_market_purchases_are_emitted(burke_form4_xml):
     rows = parse(burke_form4_xml)
 
     assert tuple(rows.columns) == _EXPECTED_COLUMNS
-    assert len(rows) == 2
-    assert rows["member"].tolist() == ["James Burke", "James Burke"]
-    assert rows["ticker"].tolist() == ["VST", "VST"]
-    assert rows["transaction_date"].tolist() == [date(2026, 8, 31), date(2026, 9, 1)]
+    assert len(rows) == 3
+    assert rows["member"].tolist() == ["James Burke"] * 3
+    assert rows["ticker"].tolist() == ["VST"] * 3
+    assert rows["transaction_date"].tolist() == [
+        date(2026, 8, 31),
+        date(2026, 8, 31),
+        date(2026, 9, 1),
+    ]
     assert rows["amount_midpoint"].tolist() == pytest.approx(
-        [2200 * 135.99, 4465 * 135.25]
+        [2200 * 135.99, 12 * 136.01, 4465 * 135.25]
     )
-    assert rows["transaction_type"].tolist() == ["Purchase", "Purchase"]
-    assert rows["instrument_type"].tolist() == ["Common Stock", "Common Stock"]
-    assert rows["source"].tolist() == ["form4", "form4"]
+    assert rows["transaction_type"].tolist() == ["Purchase", "Sale", "Purchase"]
+    assert rows["instrument_type"].tolist() == ["Common Stock"] * 3
+    assert rows["source"].tolist() == ["form4"] * 3
     assert rows["source_record_id"].tolist() == [
         "0001268406-26-000009",
-        "0001268406-26-000009",
-    ]
+    ] * 3
     assert rows["source_row_id"].tolist() == [
         "nonDerivativeTransaction:000001",
+        "nonDerivativeTransaction:000002",
         "nonDerivativeTransaction:000003",
     ]
     assert rows["source_report_path"].str.contains("000126840626000009").all()
-    assert rows["raw_owner"].tolist() == ["James Burke", "James Burke"]
+    assert rows["raw_owner"].tolist() == ["James Burke"] * 3
     assert rows["official_filing_date"].tolist() == [
         date(2026, 9, 2),
-        date(2026, 9, 2),
-    ]
+    ] * 3
     assert rows["ingestion_generation"].tolist() == [
         "test-generation",
-        "test-generation",
-    ]
-    assert rows["raw_transaction_subtype"].tolist() == ["P", "P"]
+    ] * 3
+    assert rows["raw_transaction_subtype"].tolist() == ["P", "S", "P"]
     assert rows["raw_asset_description"].str.contains("is_10b5_1=false").all()
 
 
@@ -222,8 +224,8 @@ def test_sweep_skips_malformed_filing_xml_without_aborting(
     finally:
         source.close()
 
-    assert len(rows) == 2
-    assert rows["ticker"].tolist() == ["VST", "VST"]
+    assert len(rows) == 3
+    assert rows["ticker"].tolist() == ["VST", "VST", "VST"]
 
 
 def test_sweep_returns_empty_canonical_frame_when_index_has_no_filings(
@@ -303,3 +305,28 @@ def test_sweep_filters_out_non_officer_filings(tmp_path, monkeypatch, burke_form
 
     assert rows.empty
     assert tuple(rows.columns) == _EXPECTED_COLUMNS
+
+
+def test_sale_rows_never_become_candidates(burke_form4_xml):
+    rows = candidates_from_sweep(parse(burke_form4_xml))
+    assert rows["ticker"].tolist() == ["VST", "VST"]
+    assert rows["entry_ref"].tolist() == [135.99, 135.25]
+
+
+def test_refetch_does_not_duplicate_rows(tmp_path, burke_form4_xml):
+    import duckdb
+
+    from analyzer.database import Database
+    from analyzer.transaction_repository import drop_already_stored
+
+    db_path = tmp_path / "dupes.duckdb"
+    db = Database(str(db_path))
+    frame = parse(burke_form4_xml)
+    assert db.upsert_transactions(frame, source="form4") == 3
+    again = frame.copy()
+    again["ingestion_generation"] = "gen-two"
+    assert drop_already_stored(db, again, source="form4").empty
+    assert db.upsert_transactions(
+        drop_already_stored(db, again, source="form4"), source="form4"
+    ) == 0
+    db.close()

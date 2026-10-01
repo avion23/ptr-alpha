@@ -75,7 +75,7 @@ MAX_DATE = date.today() + timedelta(days=1)
 
 # Parse-run statuses that count as a resolved terminal outcome. Anything else
 # (error, rejected, zero_rows, unknown) must fail closed.
-TERMINAL_STATUSES = ("success", "no_txs")
+TERMINAL_STATUSES = ("success", "no_txs", "invalid")
 
 # Sources produced by the deterministic parser cascade vs the Gemini OCR path.
 DETERMINISTIC_PARSER_FAMILIES = ("v5-deterministic",)
@@ -258,6 +258,12 @@ def check_parse_counts_match_persisted(
                     f"{doc_id} ({parser_version}, {generation}): "
                     f"status='no_txs' but raw_row_count={raw_count} "
                     f"transaction_count={tx_count}"
+                )
+            if status == "invalid" and (tx_count != 0):
+                result.violations.append(
+                    f"{doc_id} ({parser_version}, {generation}): "
+                    f"status='invalid' but transaction_count={tx_count} "
+                    "(retired filings must have no rows)"
                 )
         elif status in ("zero_rows", "error", "failed", "rejected", "invalidated"):
             if tx_count != 0:
@@ -949,7 +955,7 @@ def _get_unresolved_house_doc_ids(
                 WHERE parse_run.doc_id = artifact.doc_id
                   AND parse_run.artifact_sha256 = artifact.artifact_sha256
                   AND parse_run.ingestion_generation = artifact.generation_id
-                  AND parse_run.status IN ('success', 'no_txs')
+                  AND parse_run.status IN ('success', 'no_txs', 'invalid')
                   AND COALESCE(parse_run.transaction_count, 0) = (
                       SELECT COUNT(*)
                       FROM transactions tx_count
@@ -970,6 +976,18 @@ def _get_unresolved_house_doc_ids(
                   )
                   AND (
                       parse_run.status = 'no_txs'
+                      OR (
+                          parse_run.status = 'invalid'
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM transactions tx_any
+                              WHERE tx_any.doc_id = artifact.doc_id
+                                AND tx_any.artifact_sha256
+                                    = artifact.artifact_sha256
+                                AND tx_any.ingestion_generation
+                                    = artifact.generation_id
+                          )
+                      )
                       OR (
                           COALESCE(parse_run.transaction_count, 0) > 0
                           AND NOT EXISTS (
@@ -1057,7 +1075,7 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
               ON p.doc_id = a.doc_id
              AND p.artifact_sha256 = a.artifact_sha256
              AND p.ingestion_generation = a.generation_id
-             AND p.status IN ('success', 'no_txs')
+             AND p.status IN ('success', 'no_txs', 'invalid')
             WHERE a.archive_year = ? AND a.generation_id = ?
             GROUP BY a.doc_id
             HAVING COUNT(p.doc_id) = 0
@@ -1294,7 +1312,7 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
             FROM pdf_parse_runs
             WHERE doc_id = ? AND ingestion_generation = ?
               AND artifact_sha256 = ?
-              AND status IN ('success', 'no_txs')
+              AND status IN ('success', 'no_txs', 'invalid')
             """,
             [doc_id, generation, sha],
         ).fetchall()
@@ -1313,33 +1331,44 @@ def check_house_generation_activation(conn: duckdb.DuckDBPyConnection) -> CheckR
             f"to a terminal run: {preview}"
         )
 
-    # Canonical House/OCR rows must come from the latest semantically accepted
-    # complete generation.
+    # Canonical House/OCR rows must each be covered by an acceptable terminal
+    # run for their own artifact. Generations are incremental deltas, so rows
+    # legitimately come from many generations; latestness per document is the
+    # canonical view's job.
     if not _view_exists(conn, "canonical_transactions"):
         result.violations.append("canonical_transactions view missing")
         return result
     if not _table_exists(conn, "metadata"):
         result.info.append("metadata table missing; canonical-source check skipped")
         return result
-    canonical_house = conn.execute(
+    uncovered = conn.execute(
         """
-        SELECT t.doc_id, t.source, t.ingestion_generation, m.archive_year
+        SELECT t.doc_id, t.source, t.ingestion_generation
         FROM canonical_transactions t
-        JOIN metadata m ON m.doc_id = t.doc_id
         WHERE t.source IN ('house_pdf', 'gemini_ocr')
-        ORDER BY t.doc_id
+          AND NOT EXISTS (
+              SELECT 1
+              FROM house_pdf_artifacts a
+              JOIN pdf_parse_runs r
+                ON r.doc_id = a.doc_id
+               AND r.artifact_sha256 = a.artifact_sha256
+               AND r.ingestion_generation = a.generation_id
+              WHERE a.doc_id = t.doc_id
+                AND a.generation_id = t.ingestion_generation
+                AND (a.artifact_sha256 = t.artifact_sha256
+                     OR t.artifact_sha256 IS NULL)
+                AND r.status IN ('success', 'no_txs', 'invalid')
+          )
+        GROUP BY 1, 2, 3
+        ORDER BY 1, 2, 3
+        LIMIT 25
         """
     ).fetchall()
-    for doc_id, source, generation, archive_year in canonical_house:
-        latest_complete = latest_accepted.get(archive_year)
-        if latest_complete is None:
-            continue
-        if generation != latest_complete:
-            result.violations.append(
-                f"{doc_id} ({source}): canonical rows bound to generation "
-                f"{generation!r}, but archive {archive_year} latest accepted "
-                f"complete generation is {latest_complete!r}"
-            )
+    for doc_id, source, generation in uncovered:
+        result.violations.append(
+            f"{doc_id} ({source}): canonical rows bound to generation "
+            f"{generation!r} have no acceptable terminal run"
+        )
     return result
 
 

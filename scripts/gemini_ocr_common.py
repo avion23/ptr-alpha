@@ -611,6 +611,19 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
             and filed_tokens[0] == expected_tokens[-1]
         ):
             return [], {"member_mismatch": raw_count or 1}
+    if expected_member and canonical_member_key(
+        effective_member
+    ) != canonical_member_key(str(expected_member)):
+        # Persist the metadata spelling so variant filings ("Mike McCaul",
+        # "Malliotakis") do not fork a second actor downstream. Identity was
+        # already proven above; this only unifies the stored string.
+        effective_member = re.sub(
+            r"^(?:hon|rep|sen|dr|mr|mrs|ms)\.\s*",
+            "",
+            re.sub(r'"[^"]*"', "", str(expected_member)).strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        effective_member = re.sub(r"\s+", " ", effective_member)
 
     valid = []
     for tx in transactions:

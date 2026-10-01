@@ -304,6 +304,7 @@ class Database:
                 SELECT artifact.archive_year,
                        artifact.generation_id,
                        artifact.doc_id,
+                       artifact.artifact_sha256,
                        generation.promoted_at
                 FROM house_pdf_artifacts artifact
                 JOIN house_archive_generations generation
@@ -343,7 +344,18 @@ class Database:
                         )
                         AND (
                             parse_run.status = 'no_txs'
-                            OR parse_run.status = 'invalid'
+                            OR (
+                                parse_run.status = 'invalid'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM transactions tx_any
+                                    WHERE tx_any.doc_id = artifact.doc_id
+                                      AND tx_any.artifact_sha256
+                                          = artifact.artifact_sha256
+                                      AND tx_any.ingestion_generation
+                                          = artifact.generation_id
+                                )
+                            )
                             OR (
                                 COALESCE(parse_run.transaction_count, 0) > 0
                                 AND NOT EXISTS (
@@ -376,7 +388,7 @@ class Database:
                   )
             ),
             latest_accepted_house_docs AS (
-                SELECT archive_year, doc_id, generation_id
+                SELECT archive_year, doc_id, generation_id, artifact_sha256
                 FROM accepted_house_artifacts
                 QUALIFY ROW_NUMBER() OVER (
                     PARTITION BY archive_year, doc_id
@@ -395,12 +407,26 @@ class Database:
                             FROM latest_accepted_house_docs accepted
                             WHERE accepted.doc_id = t.doc_id
                               AND accepted.generation_id = t.ingestion_generation
+                              AND accepted.artifact_sha256
+                                  IS NOT DISTINCT FROM t.artifact_sha256
                         )
                         OR (
                             t.ingestion_generation IS NOT NULL
                             AND NOT EXISTS (
                                 SELECT 1 FROM house_archive_generations g
                                 WHERE g.generation_id = t.ingestion_generation
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM latest_accepted_house_docs accepted
+                                WHERE accepted.doc_id = t.doc_id
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM house_archive_quarantine removed
+                                WHERE removed.doc_id = t.doc_id
+                                  AND removed.reason
+                                      = 'removed_from_authoritative_archive'
                             )
                             AND NOT EXISTS (
                                 SELECT 1
@@ -413,6 +439,18 @@ class Database:
                         )
                         OR (
                             t.ingestion_generation IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM latest_accepted_house_docs accepted
+                                WHERE accepted.doc_id = t.doc_id
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM house_archive_quarantine removed
+                                WHERE removed.doc_id = t.doc_id
+                                  AND removed.reason
+                                      = 'removed_from_authoritative_archive'
+                            )
                             AND NOT EXISTS (
                                 SELECT 1
                                 FROM metadata m
@@ -678,7 +716,18 @@ class Database:
                       )
                       AND (
                         parse_run.status = 'no_txs'
-                        OR parse_run.status = 'invalid'
+                        OR (
+                            parse_run.status = 'invalid'
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM transactions tx_any
+                                WHERE tx_any.doc_id = a.doc_id
+                                  AND tx_any.artifact_sha256
+                                      = a.artifact_sha256
+                                  AND tx_any.ingestion_generation
+                                      = a.generation_id
+                            )
+                        )
                         OR (
                             COALESCE(parse_run.transaction_count, 0) > 0
                               AND NOT EXISTS (

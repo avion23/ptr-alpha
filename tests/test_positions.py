@@ -606,6 +606,43 @@ class TestPositions(unittest.TestCase):
             [],
         )
 
+    def test_gate_blocks_closed_officer_and_passes_open(self):
+        from analyzer.positions import gate_closed_events
+
+        events = pd.DataFrame(
+            [
+                {
+                    "ticker": "T",
+                    "actor_id": "officer:OPEN CEO",
+                    "kind": "officer",
+                    "entry_ref": 100.0,
+                },
+                {
+                    "ticker": "T",
+                    "actor_id": "officer:SHUT CEO",
+                    "kind": "officer",
+                    "entry_ref": 100.0,
+                },
+            ]
+        )
+        candidates = pd.DataFrame(
+            [
+                {
+                    "ticker": "T",
+                    "actor_id": "officer:OPEN CEO",
+                    "position_evidence": True,
+                },
+            ]
+        )
+        gated = gate_closed_events(events, candidates)
+        self.assertEqual(
+            gated.loc[gated["actor_id"] == "officer:OPEN CEO", "entry_ref"].iloc[0],
+            100.0,
+        )
+        shut = gated.loc[gated["actor_id"] == "officer:SHUT CEO"].iloc[0]
+        self.assertTrue(pd.isna(shut["entry_ref"]))
+        self.assertEqual(shut["blocked_reason"], "no open position at as_of")
+
 
 if __name__ == "__main__":
     unittest.main()

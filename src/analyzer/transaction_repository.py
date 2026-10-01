@@ -63,6 +63,9 @@ def drop_already_stored(db, df, *, source: str):
     Fetch batches stamp fresh ingestion generations, so generation-scoped
     repository identity cannot dedupe re-fetches. Filing identity
     (accession + row) is stable across fetches; filter here instead.
+    Rows without usable identity are dropped: they can neither dedupe nor
+    safely persist (re-fetch would duplicate them). Callers must supply
+    stable ids (form4 validates them; 13F synthesizes them).
     Database-less test doubles pass through untouched.
     """
     import pandas as pd
@@ -76,13 +79,24 @@ def drop_already_stored(db, df, *, source: str):
         or "source_row_id" not in df.columns
     ):
         return df
+    keyed = df.dropna(subset=["source_record_id", "source_row_id"]).copy()
+    record_ids = keyed["source_record_id"].fillna("").astype(str).str.strip()
+    row_ids = keyed["source_row_id"].fillna("").astype(str).str.strip()
+    keyed = keyed[(record_ids.ne("") & row_ids.ne(""))].copy()
+    # Within-batch duplicates (NULL chamber breaks repository identity, so
+    # this is the only dedupe these rows get).
+    keyed = keyed.drop_duplicates(
+        subset=["source_record_id", "source_row_id"], keep="first"
+    )
+    if keyed.empty:
+        return df.iloc[0:0].copy()
     try:
-        accessions = sorted({str(value) for value in df["source_record_id"].dropna()})
-        if not accessions:
-            return df
+        accessions = sorted(
+            {str(value).strip() for value in keyed["source_record_id"] if str(value).strip()}
+        )
         placeholders = ", ".join("?" for _ in accessions)
         stored = {
-            (str(record_id), str(row_id))
+            (str(record_id).strip(), str(row_id).strip())
             for record_id, row_id in conn.execute(
                 f"SELECT source_record_id, source_row_id FROM transactions "  # nosec B608
                 f"WHERE source = ? AND source_record_id IN ({placeholders})",
@@ -91,16 +105,16 @@ def drop_already_stored(db, df, *, source: str):
         }
     except Exception:
         return df
+    keyed_record_ids = keyed["source_record_id"].fillna("").astype(str).str.strip()
+    keyed_row_ids = keyed["source_row_id"].fillna("").astype(str).str.strip()
     mask = pd.Series(
         [
-            (str(record_id), str(row_id)) not in stored
-            for record_id, row_id in zip(
-                df["source_record_id"], df["source_row_id"], strict=True
-            )
+            (record_id, row_id) not in stored
+            for record_id, row_id in zip(keyed_record_ids, keyed_row_ids, strict=True)
         ],
-        index=df.index,
+        index=keyed.index,
     )
-    return df.loc[mask].copy()
+    return keyed.loc[mask].copy()
 _TYPE_MAP = {
     "Sale Full": "Sale",
     "Sale Partial": "Sale",

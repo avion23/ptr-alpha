@@ -36,10 +36,10 @@ class PositionsError(Exception):
 def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
     """Remove entry references from purchase events without an open position.
 
-    Only congress events are gated: positions reconstruct congress holdings
-    from filings, while officer (Form 4 buys only, no sales ingested) and
-    manager (13F snapshots) actors have no position ledger to check against.
-    Those kinds fail open here; their evidence is weighted, not gated.
+    All kinds gate uniformly on reconstructed holdings: congress ledgers see
+    buys and sells, officer ledgers see fetched Form 4 buys and sales. An
+    officer with no observed sales still shows open (fail open); only
+    observed full exits close.
     """
     if events.empty:
         return events.copy()
@@ -56,16 +56,7 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
             )
         )
 
-    kinds = gated["kind"] if "kind" in gated.columns else None
     for index, row in gated.iterrows():
-        # Fail closed: only exact officer/manager kinds are exempt (their
-        # evidence is weighted, never gated). Missing or unknown kinds gate
-        # like congress rather than slipping through.
-        if kinds is not None and str(row["kind"]).strip().lower() in (
-            "officer",
-            "manager",
-        ):
-            continue
         key = (str(row["ticker"]).upper(), str(row["actor_id"]))
         if key not in open_positions:
             gated.at[index, "entry_ref"] = None
@@ -405,12 +396,11 @@ def holdings_candidates(
         positions = build_positions(kind_trades, histories, as_of=as_of)
         for position in positions.itertuples(index=False):
             source = position.source
-            # Only congress holdings carry entry references and position
-            # evidence: the ledger sees congress buys AND sells. Officer
-            # rows come from buys-only Form 4 ingestion, so a market-close
-            # cost basis here would fabricate the filed purchase price and
-            # grant full (undecayed) weight. Officer rows stay present as
-            # context; their events initiate with filed prices.
+            # build_positions emits only net-long positions, so any row here
+            # is open in available history. Only congress rows carry entry
+            # references: officer rows come from buys-and-sales Form 4 flow
+            # whose full history is not guaranteed, so their events initiate
+            # with filed prices instead of a market-close basis here.
             congress_position = actor_kind == "congress"
             records.append(
                 {
@@ -426,7 +416,7 @@ def holdings_candidates(
                     "event_date": position.last_activity,
                     "disclosure_date": position.disclosure_date,
                     "corroboration": False,
-                    "position_evidence": bool(congress_position),
+                    "position_evidence": True,
                     "as_of": as_of,
                 }
             )

@@ -92,3 +92,24 @@ def test_leading_title_stripped_from_member():
     assert len(valid) == 1
     assert valid[0]["member"] == "Nancy Pelosi"
     assert rejections == {}
+
+
+def test_variant_spelling_persists_metadata_form():
+    valid, rejections = validate_transactions(
+        "9116211",
+        "Mike McCaul",
+        [
+            {
+                "asset": "Fidelity Fund",
+                "type": "Purchase",
+                "date": "06/01/2026",
+                "notif_date": "06/20/2026",
+                "amount_letter": "C",
+            }
+        ],
+        "07/08/2026",
+        "Michael T. McCaul",
+    )
+    assert len(valid) == 1
+    assert valid[0]["member"] == "Michael T. McCaul"
+    assert rejections == {}

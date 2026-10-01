@@ -85,6 +85,13 @@ def _canonical_row(
     ingestion_generation,
 ) -> dict:
     """One canonical 13F row; shared by watchlist and discovery paths."""
+    row_id = cusip
+    if row_id is None or (isinstance(row_id, float) and pd.isna(row_id)) or not str(
+        row_id
+    ).strip():
+        # Unmatched issuers have no CUSIP; fall back to a stable composite so
+        # re-fetches dedupe instead of duplicating (or colliding on None).
+        row_id = f"{manager_name}:{ticker or 'NOTICKER'}:{event_date}"
     return {
         "doc_id": f"13f-{accession}",
         "member": manager_name,
@@ -102,7 +109,7 @@ def _canonical_row(
         "asset_description": issuer,
         "source": "13f",
         "source_record_id": accession,
-        "source_row_id": cusip,
+        "source_row_id": row_id,
         "source_report_path": report_url,
         "raw_owner": manager_name,
         "official_filing_date": disclosure_date,

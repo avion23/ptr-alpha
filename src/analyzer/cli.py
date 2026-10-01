@@ -1542,6 +1542,13 @@ def setups(
         )
         from analyzer.manager_watchlist import watchlist_actor_ids
         from analyzer.setups import score as score_setups
+
+        def _congress_holdings(frame):
+            """Congress rows initiate scoring; officer/manager holdings rows
+            exist only for closure gating (their events carry the references)."""
+            if frame.empty or "kind" not in frame.columns:
+                return frame
+            return frame.loc[frame["kind"] == "congress"].copy()
     except ImportError as exc:
         _cli_exit(1, f"Error: setups is unavailable ({exc})")
 
@@ -1553,6 +1560,7 @@ def setups(
     requested_tickers = {symbol.strip().upper() for symbol in ticker}
     try:
         frames = []
+        candidate_frames = []
         # One human, one holdings load: drop requested names that denote an
         # already-requested member (variants, nicknames, middle names).
         member = dedupe_member_names(list(member))
@@ -1565,6 +1573,7 @@ def setups(
             )
             if not frame.empty:
                 frames.append(frame)
+                candidate_frames.append(_congress_holdings(frame))
         events = eligible_events(db, as_of_date)
         frames = [frame for frame in frames if not frame.empty]
         if not events.empty:
@@ -1596,13 +1605,8 @@ def setups(
                     if name:
                         event_kinds.setdefault(name, kind)
                 event_tickers = set(events["ticker"].astype("string").str.upper())
-                congress_names = sorted(
-                    name
-                    for name, kind in event_kinds.items()
-                    if kind == "congress"
-                )
                 for event_member in dedupe_member_names(
-                    congress_names, exclude=list(member)
+                    sorted(event_kinds), exclude=list(member)
                 ):
                     frame = holdings_candidates(
                         db,
@@ -1619,16 +1623,21 @@ def setups(
                         ].copy()
                         if not frame.empty:
                             frames.append(frame)
+                            candidate_frames.append(_congress_holdings(frame))
                 position_candidates = (
                     pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 )
                 events = coalesce_actor_variants(events, position_candidates)
                 events = gate_closed_events(events, position_candidates)
                 frames.append(events)
+                candidate_frames.append(events)
         if not frames:
             print("No candidates.")
             _cli_exit(0)
-        candidates = pd.concat(frames, ignore_index=True)
+        candidates = pd.concat(
+            [frame for frame in candidate_frames if not frame.empty],
+            ignore_index=True,
+        )
         if requested_tickers:
             candidates = candidates.loc[
                 candidates["ticker"].astype("string").str.upper().isin(

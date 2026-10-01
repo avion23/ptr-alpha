@@ -117,6 +117,7 @@ def _ticker_candidates(
             if ":" in str(actor_id) and str(actor_id).split(":", 1)[1]
         }
     selected = []
+    candidate_holdings = []
     processed_members = []
     for member in dict.fromkeys([*members, *sorted(event_members)]):
         if any(
@@ -141,6 +142,14 @@ def _ticker_candidates(
         ]
         if not matches.empty:
             selected.append(matches)
+            # Scoring sees congress holdings (real ledgers) plus all events;
+            # officer/manager holdings exist only for closure gating below.
+            if "kind" in matches.columns:
+                congress_rows = matches.loc[matches["kind"] == "congress"]
+                if not congress_rows.empty:
+                    candidate_holdings.append(congress_rows)
+            else:
+                candidate_holdings.append(matches)
 
     if not events.empty:
         from_positions = (
@@ -149,10 +158,16 @@ def _ticker_candidates(
         events = positions.coalesce_actor_variants(events, from_positions)
         events = positions.gate_closed_events(events, from_positions)
         selected.append(events)
+        candidate_holdings.append(events)
 
     if not selected:
         return pd.DataFrame(columns=["ticker", "member", "disclosure_date"])
-    return pd.concat(selected, ignore_index=True).drop_duplicates(ignore_index=True)
+    scored = (
+        pd.concat(candidate_holdings, ignore_index=True)
+        if candidate_holdings
+        else pd.DataFrame(columns=["ticker", "member", "disclosure_date"])
+    )
+    return scored.drop_duplicates(ignore_index=True)
 
 
 def _latest_close(db, ticker: str, as_of: date) -> float | None:

@@ -588,6 +588,15 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         return [], {"invalid_member": raw_count or 1}
 
     effective_member = str(member or expected_member).strip()
+    # Strip leading titles so filed names match the canonical member strings
+    # ("Hon. Nancy Pelosi" -> "Nancy Pelosi"). Identity matching would unite
+    # them anyway; clean strings keep actor ids stable.
+    effective_member = re.sub(
+        r"^(?:hon|rep|sen|dr|mr|mrs|ms)\.\s*",
+        "",
+        effective_member,
+        flags=re.IGNORECASE,
+    ).strip()
     if expected_member and not same_member_identity(
         str(member or ""), str(expected_member)
     ):

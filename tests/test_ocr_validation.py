@@ -71,3 +71,24 @@ def test_surname_only_mismatch_still_rejected():
     )
     assert valid == []
     assert rejections.get("member_mismatch") == 1
+
+
+def test_leading_title_stripped_from_member():
+    valid, rejections = validate_transactions(
+        "20033725",
+        "Hon. Nancy Pelosi",
+        [
+            {
+                "asset": "Vistra Corp. Common Stock",
+                "type": "Purchase",
+                "date": "01/16/2026",
+                "notif_date": "01/23/2026",
+                "amount_letter": "C",
+            }
+        ],
+        "01/23/2026",
+        "Nancy Pelosi",
+    )
+    assert len(valid) == 1
+    assert valid[0]["member"] == "Nancy Pelosi"
+    assert rejections == {}

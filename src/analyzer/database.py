@@ -296,78 +296,84 @@ class Database:
         view_kind = "TEMP VIEW" if self._read_only else "VIEW"
         self.conn.execute(f"""
             CREATE OR REPLACE {view_kind} canonical_transactions AS
-            WITH accepted_house_generations AS (
-                SELECT candidate.archive_year,
-                       candidate.generation_id,
-                       candidate.promoted_at
-                FROM house_archive_generations candidate
-                WHERE candidate.parse_status = 'complete'
-                  AND NOT EXISTS (
+            WITH accepted_house_artifacts AS (
+                -- Rowset acceptance, not generation acceptance: each filing is
+                -- judged on its own parse runs and row validity. Generations
+                -- stay incremental, so requiring completeness here would hide
+                -- every filing older than the latest refresh.
+                SELECT artifact.archive_year,
+                       artifact.generation_id,
+                       artifact.doc_id,
+                       generation.promoted_at
+                FROM house_pdf_artifacts artifact
+                JOIN house_archive_generations generation
+                  ON generation.archive_year = artifact.archive_year
+                 AND generation.generation_id = artifact.generation_id
+                JOIN house_generation_metadata scope
+                  ON scope.archive_year = artifact.archive_year
+                 AND scope.generation_id = artifact.generation_id
+                 AND scope.doc_id = artifact.doc_id
+                 AND scope.filing_type = 'P'
+                WHERE NOT EXISTS (
                       SELECT 1
-                      FROM house_generation_metadata scope
-                      LEFT JOIN house_pdf_artifacts artifact
-                        ON artifact.archive_year = scope.archive_year
-                       AND artifact.generation_id = scope.generation_id
-                       AND artifact.doc_id = scope.doc_id
-                      WHERE scope.archive_year = candidate.archive_year
-                        AND scope.generation_id = candidate.generation_id
-                        AND scope.filing_type = 'P'
+                      FROM house_archive_quarantine removed
+                      WHERE removed.archive_year = artifact.archive_year
+                        AND removed.doc_id = artifact.doc_id
+                        AND removed.reason = 'removed_from_authoritative_archive'
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM pdf_parse_runs parse_run
+                      WHERE parse_run.doc_id = artifact.doc_id
+                        AND parse_run.artifact_sha256 = artifact.artifact_sha256
+                        AND parse_run.ingestion_generation = artifact.generation_id
+                        AND parse_run.status IN ('success', 'no_txs', 'invalid')
+                        AND COALESCE(parse_run.transaction_count, 0) = (
+                            SELECT COUNT(*)
+                            FROM transactions tx_count
+                            WHERE tx_count.doc_id = artifact.doc_id
+                              AND tx_count.artifact_sha256 = artifact.artifact_sha256
+                              AND tx_count.ingestion_generation = artifact.generation_id
+                              AND tx_count.source = {_HOUSE_PARSE_SOURCE}
+                        )
                         AND (
-                            artifact.doc_id IS NULL
-                            OR NOT EXISTS (
-                                SELECT 1
-                                FROM pdf_parse_runs parse_run
-                                WHERE parse_run.doc_id = artifact.doc_id
-                                  AND parse_run.artifact_sha256 = artifact.artifact_sha256
-                                  AND parse_run.ingestion_generation = artifact.generation_id
-                                  AND parse_run.status IN ('success', 'no_txs', 'invalid')
-                                  AND COALESCE(parse_run.transaction_count, 0) = (
-                                      SELECT COUNT(*)
-                                      FROM transactions tx_count
-                                      WHERE tx_count.doc_id = artifact.doc_id
-                                        AND tx_count.artifact_sha256 = artifact.artifact_sha256
-                                        AND tx_count.ingestion_generation = artifact.generation_id
-                                        AND tx_count.source = {_HOUSE_PARSE_SOURCE}
-                                  )
-                                  AND (
-                                      parse_run.status = 'no_txs'
-                                      OR (
-                                          COALESCE(parse_run.transaction_count, 0) > 0
-                                          AND NOT EXISTS (
-                                              SELECT 1
-                                              FROM transactions tx_invalid
-                                              WHERE tx_invalid.doc_id = artifact.doc_id
-                                                AND tx_invalid.artifact_sha256 = artifact.artifact_sha256
-                                                AND tx_invalid.ingestion_generation = artifact.generation_id
-                                                 AND tx_invalid.source = {_HOUSE_PARSE_SOURCE}
-                                                AND (
-                                                    tx_invalid.transaction_date IS NULL
-                                                    OR tx_invalid.disclosure_date IS NULL
-                                                    OR tx_invalid.transaction_date > tx_invalid.disclosure_date
-                                                    OR (
-                                                        tx_invalid.notification_date IS NOT NULL
-                                                        AND tx_invalid.notification_date < tx_invalid.transaction_date
-                                                    )
-                                                    OR tx_invalid.chamber IS NULL
-                                                    OR TRIM(tx_invalid.chamber) = ''
-                                                    OR tx_invalid.source_record_id IS NULL
-                                                    OR TRIM(tx_invalid.source_record_id) = ''
-                                                    OR tx_invalid.source_row_id IS NULL
-                                                    OR TRIM(tx_invalid.source_row_id) = ''
-                                                    OR tx_invalid.official_filing_date IS NULL
-                                                )
+                            parse_run.status = 'no_txs'
+                            OR parse_run.status = 'invalid'
+                            OR (
+                                COALESCE(parse_run.transaction_count, 0) > 0
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM transactions tx_invalid
+                                    WHERE tx_invalid.doc_id = artifact.doc_id
+                                      AND tx_invalid.artifact_sha256 = artifact.artifact_sha256
+                                      AND tx_invalid.ingestion_generation = artifact.generation_id
+                                       AND tx_invalid.source = {_HOUSE_PARSE_SOURCE}
+                                      AND (
+                                          tx_invalid.transaction_date IS NULL
+                                          OR tx_invalid.disclosure_date IS NULL
+                                          OR tx_invalid.transaction_date > tx_invalid.disclosure_date
+                                          OR (
+                                              tx_invalid.notification_date IS NOT NULL
+                                              AND tx_invalid.notification_date < tx_invalid.transaction_date
                                           )
+                                          OR tx_invalid.chamber IS NULL
+                                          OR TRIM(tx_invalid.chamber) = ''
+                                          OR tx_invalid.source_record_id IS NULL
+                                          OR TRIM(tx_invalid.source_record_id) = ''
+                                          OR tx_invalid.source_row_id IS NULL
+                                          OR TRIM(tx_invalid.source_row_id) = ''
+                                          OR tx_invalid.official_filing_date IS NULL
                                       )
-                                  )
+                                )
                             )
                         )
                   )
             ),
-            latest_accepted_house_generations AS (
-                SELECT archive_year, generation_id, promoted_at
-                FROM accepted_house_generations
+            latest_accepted_house_docs AS (
+                SELECT archive_year, doc_id, generation_id
+                FROM accepted_house_artifacts
                 QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY archive_year
+                    PARTITION BY archive_year, doc_id
                     ORDER BY promoted_at DESC, generation_id DESC
                 ) = 1
             )
@@ -378,14 +384,11 @@ class Database:
                     OR (
                     t.source IN ('house_pdf', 'gemini_ocr')
                     AND (
-                        t.ingestion_generation = (
-                            SELECT active.generation_id
-                            FROM house_archive_generations own
-                            JOIN latest_accepted_house_generations active
-                              ON active.archive_year = own.archive_year
-                            WHERE own.generation_id = t.ingestion_generation
-                            ORDER BY active.promoted_at DESC, active.generation_id DESC
-                            LIMIT 1
+                        EXISTS (
+                            SELECT 1
+                            FROM latest_accepted_house_docs accepted
+                            WHERE accepted.doc_id = t.doc_id
+                              AND accepted.generation_id = t.ingestion_generation
                         )
                         OR (
                             t.ingestion_generation IS NOT NULL
@@ -669,6 +672,7 @@ class Database:
                       )
                       AND (
                         parse_run.status = 'no_txs'
+                        OR parse_run.status = 'invalid'
                         OR (
                             COALESCE(parse_run.transaction_count, 0) > 0
                               AND NOT EXISTS (

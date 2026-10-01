@@ -336,7 +336,10 @@ class Database:
                               AND tx_count.source = {_HOUSE_PARSE_SOURCE}
                         )
                         AND (
-                            parse_run.status = 'no_txs'
+                            (
+                                parse_run.status = 'no_txs'
+                                AND COALESCE(parse_run.transaction_count, 0) = 0
+                            )
                             OR (
                                 parse_run.status = 'invalid'
                                 AND NOT EXISTS (
@@ -416,11 +419,12 @@ class Database:
                             )
                             AND NOT EXISTS (
                                 SELECT 1
-                                FROM metadata m
-                                JOIN house_archive_generations g
-                                  ON g.archive_year = m.archive_year
-                                WHERE m.doc_id = t.doc_id
-                                  AND g.parse_status = 'complete'
+                                FROM house_pdf_artifacts a2
+                                JOIN house_archive_generations g2
+                                  ON g2.archive_year = a2.archive_year
+                                 AND g2.generation_id = a2.generation_id
+                                WHERE a2.doc_id = t.doc_id
+                                  AND g2.parse_status = 'complete'
                             )
                         )
                         OR (
@@ -432,11 +436,12 @@ class Database:
                             )
                             AND NOT EXISTS (
                                 SELECT 1
-                                FROM metadata m
-                                JOIN house_archive_generations g
-                                  ON g.archive_year = m.archive_year
-                                WHERE m.doc_id = t.doc_id
-                                  AND g.parse_status = 'complete'
+                                FROM house_pdf_artifacts a2
+                                JOIN house_archive_generations g2
+                                  ON g2.archive_year = a2.archive_year
+                                 AND g2.generation_id = a2.generation_id
+                                WHERE a2.doc_id = t.doc_id
+                                  AND g2.parse_status = 'complete'
                             )
                         )
                     )
@@ -694,7 +699,10 @@ class Database:
                             AND t.source = {_HOUSE_PARSE_SOURCE}
                       )
                       AND (
-                        parse_run.status = 'no_txs'
+                        (
+                            parse_run.status = 'no_txs'
+                            AND COALESCE(parse_run.transaction_count, 0) = 0
+                        )
                         OR (
                             parse_run.status = 'invalid'
                             AND NOT EXISTS (
@@ -864,7 +872,8 @@ class Database:
                     WHERE archive_year = ? AND generation_id = ?
                       AND reason = 'removed_from_authoritative_archive'
                 )
-                  AND (source = 'house_pdf' OR source IS NULL)
+                  AND (source = 'house_pdf' OR source = 'gemini_ocr'
+                       OR source IS NULL)
                   AND ingestion_generation IS DISTINCT FROM ?
                 """,
                 [archive_year, generation_id, generation_id],

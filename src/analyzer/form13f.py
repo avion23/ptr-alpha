@@ -91,7 +91,11 @@ def _canonical_row(
     ).strip():
         # Unmatched issuers have no CUSIP; fall back to a stable composite so
         # re-fetches dedupe instead of duplicating (or colliding on None).
-        row_id = f"{manager_name}:{ticker or 'NOTICKER'}:{event_date}"
+        # Best effort: identical composites for truly identical rows dedupe
+        # correctly; near-identical review rows may need human eyes.
+        row_id = (
+            f"{issuer}|{ticker or 'NOTICKER'}|{event_date}|{added_shares}"
+        )
     return {
         "doc_id": f"13f-{accession}",
         "member": manager_name,

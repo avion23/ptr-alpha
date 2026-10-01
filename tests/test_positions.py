@@ -643,6 +643,40 @@ class TestPositions(unittest.TestCase):
         self.assertTrue(pd.isna(shut["entry_ref"]))
         self.assertEqual(shut["blocked_reason"], "no open position at as_of")
 
+    def test_filed_share_counts_close_exactly(self):
+        from analyzer.positions import build_positions
+
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 8, 31),
+                    "amount_midpoint": 10000.0,
+                    "instrument_type": "Common Stock",
+                    "asset_description": "Common Stock; 100 shares @ $100.00; is_10b5_1=false",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2026, 9, 15),
+                    "amount_midpoint": 9000.0,
+                    "instrument_type": "Common Stock",
+                    "asset_description": "Common Stock; 100 shares @ $90.00; is_10b5_1=false",
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2026-08-31", "2026-09-15", "2026-09-21"], [100.0, 100.0, 100.0]
+            )
+        }
+        self.assertTrue(
+            build_positions(trades, history, as_of=date(2026, 9, 21)).empty
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

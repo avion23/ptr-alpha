@@ -14,6 +14,7 @@ accumulation; exchanges are ignored and reported.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import date
 
@@ -154,6 +155,34 @@ def build_positions(
     skipped_options = 0
     ignored_exchanges = 0
 
+    _FILED_SHARES_RE = re.compile(
+        r"([\d,.]+)\s+shares?\s+@\s*\$?([\d,.]+)", re.IGNORECASE
+    )
+
+    def _filed_lot(row) -> tuple[float, float] | None:
+        """Exact (shares, price) from filed descriptions like '100 shares @ $100'.
+
+        Form 4 rows state both; using them keeps buy-sell arithmetic exact
+        instead of dividing band dollars by market closes (which leaves
+        phantom shares when prices differ).
+        """
+        if "asset_description" not in trades.columns:
+            return None
+        description = row.asset_description
+        if description is None or pd.isna(description):
+            return None
+        match = _FILED_SHARES_RE.search(str(description))
+        if match is None:
+            return None
+        try:
+            shares = float(match.group(1).replace(",", ""))
+            price = float(match.group(2).replace(",", ""))
+        except ValueError:
+            return None
+        if shares <= 0 or price <= 0 or not math.isfinite(shares + price):
+            return None
+        return shares, price
+
     def _size(row) -> tuple[float | None, bool]:
         """Dollar size with floor fallback for open-ended bands.
 
@@ -232,12 +261,17 @@ def build_positions(
             continue
 
         if kind in _BUY_TYPES:
-            entry = entry_close(history, day, as_of)
-            size, by_floor = _size(row)
-            if entry is None or size is None:
-                skipped += 1
-                continue
-            shares = size / entry
+            filed = _filed_lot(row)
+            if filed is not None:
+                shares, filed_price = filed
+                size, by_floor = shares * filed_price, False
+            else:
+                entry = entry_close(history, day, as_of)
+                size, by_floor = _size(row)
+                if entry is None or size is None:
+                    skipped += 1
+                    continue
+                shares = size / entry
             source = row.source if "source" in trades.columns else None
             lots.setdefault(key, []).append([shares, size, disclosure_day, source])
             if by_floor:
@@ -251,12 +285,16 @@ def build_positions(
                 lots[key] = []
                 first_buy.setdefault(key, day)
                 continue
-            entry = entry_close(history, day, as_of)
-            size, _ = _size(row)
-            if entry is None or size is None:
-                skipped += 1
-                continue
-            to_relieve = size / entry
+            filed = _filed_lot(row)
+            if filed is not None:
+                to_relieve = filed[0]
+            else:
+                entry = entry_close(history, day, as_of)
+                size, _ = _size(row)
+                if entry is None or size is None:
+                    skipped += 1
+                    continue
+                to_relieve = size / entry
             queue = lots.setdefault(key, [])
             while to_relieve > 0 and queue:
                 lot_shares, lot_cost, lot_disclosure, lot_source = queue[0]

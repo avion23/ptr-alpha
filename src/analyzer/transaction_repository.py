@@ -80,41 +80,42 @@ def drop_already_stored(db, df, *, source: str):
     ):
         return df
     keyed = df.dropna(subset=["source_record_id", "source_row_id"]).copy()
-    record_ids = keyed["source_record_id"].fillna("").astype(str).str.strip()
-    row_ids = keyed["source_row_id"].fillna("").astype(str).str.strip()
-    keyed = keyed[(record_ids.ne("") & row_ids.ne(""))].copy()
-    # Within-batch duplicates (NULL chamber breaks repository identity, so
-    # this is the only dedupe these rows get).
-    keyed = keyed.drop_duplicates(
-        subset=["source_record_id", "source_row_id"], keep="first"
+    keyed["_record_key"] = (
+        keyed["source_record_id"].fillna("").astype(str).str.strip().str.lower()
     )
+    keyed["_row_key"] = (
+        keyed["source_row_id"].fillna("").astype(str).str.strip().str.lower()
+    )
+    keyed = keyed[(keyed["_record_key"].ne("") & keyed["_row_key"].ne(""))].copy()
+    # Within-batch duplicates (NULL chamber breaks repository identity, so
+    # this is the only dedupe these rows get). Normalized: 1 vs "1" and
+    # padded variants are the same filing row.
+    keyed = keyed.drop_duplicates(subset=["_record_key", "_row_key"], keep="first")
     if keyed.empty:
         return df.iloc[0:0].copy()
     try:
-        accessions = sorted(
-            {str(value).strip() for value in keyed["source_record_id"] if str(value).strip()}
-        )
+        accessions = sorted(set(keyed["_record_key"]))
         placeholders = ", ".join("?" for _ in accessions)
         stored = {
-            (str(record_id).strip(), str(row_id).strip())
+            (str(record_id).strip().lower(), str(row_id).strip().lower())
             for record_id, row_id in conn.execute(
                 f"SELECT source_record_id, source_row_id FROM transactions "  # nosec B608
-                f"WHERE source = ? AND source_record_id IN ({placeholders})",
+                f"WHERE source = ? AND TRIM(LOWER(source_record_id)) IN ({placeholders})",
                 [source, *accessions],
             ).fetchall()
         }
     except Exception:
         return df
-    keyed_record_ids = keyed["source_record_id"].fillna("").astype(str).str.strip()
-    keyed_row_ids = keyed["source_row_id"].fillna("").astype(str).str.strip()
     mask = pd.Series(
         [
             (record_id, row_id) not in stored
-            for record_id, row_id in zip(keyed_record_ids, keyed_row_ids, strict=True)
+            for record_id, row_id in zip(
+                keyed["_record_key"], keyed["_row_key"], strict=True
+            )
         ],
         index=keyed.index,
     )
-    return keyed.loc[mask].copy()
+    return keyed.loc[mask].drop(columns=["_record_key", "_row_key"]).copy()
 _TYPE_MAP = {
     "Sale Full": "Sale",
     "Sale Partial": "Sale",

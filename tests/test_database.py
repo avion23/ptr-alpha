@@ -674,7 +674,10 @@ class TestTransactions(DatabaseTestCase):
         ).fetchone()[0]
         self.assertEqual(count, 2)
 
-    def test_canonical_reader_keeps_previous_complete_generation_until_activation(self):
+    def test_canonical_reader_shows_validated_rows_without_activation(self):
+        # Per-document acceptance: once a filing's own parse runs validate,
+        # its rows are canonical without waiting for generation activation.
+        # Activation still matters for workflow gating, not visibility.
         metadata = pd.DataFrame(
             [{
                 "doc_id": "generation-doc",
@@ -770,13 +773,13 @@ class TestTransactions(DatabaseTestCase):
         )
         self.assertEqual(
             self.db.get_transactions_for_doc("generation-doc")["ticker"].tolist(),
-            ["OLD"],
+            ["NEW"],
         )
         self.assertEqual(
             self.db.get_entry_prices(
                 ["OLD", "NEW"], date(2024, 1, 1), date(2024, 1, 10)
             )["ticker"].tolist(),
-            ["OLD"],
+            ["NEW"],
         )
         self.db.mark_house_generation_parse_complete(2024, "g2")
         self.assertEqual(

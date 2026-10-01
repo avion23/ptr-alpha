@@ -309,22 +309,27 @@ class Database:
                 JOIN house_archive_generations generation
                   ON generation.archive_year = artifact.archive_year
                  AND generation.generation_id = artifact.generation_id
-                JOIN house_generation_metadata scope
+                LEFT JOIN house_generation_metadata scope
                   ON scope.archive_year = artifact.archive_year
                  AND scope.generation_id = artifact.generation_id
                  AND scope.doc_id = artifact.doc_id
-                 AND scope.filing_type = 'P'
-                WHERE NOT EXISTS (
+                WHERE (scope.doc_id IS NULL OR scope.filing_type = 'P')
+                  AND NOT EXISTS (
                       SELECT 1
                       FROM house_archive_quarantine removed
                       WHERE removed.archive_year = artifact.archive_year
                         AND removed.doc_id = artifact.doc_id
                         AND removed.reason = 'removed_from_authoritative_archive'
                   )
-                  AND EXISTS (
-                      SELECT 1
-                      FROM pdf_parse_runs parse_run
-                      WHERE parse_run.doc_id = artifact.doc_id
+                  AND (
+                      -- Legacy/synthetic artifacts without scope rows ride on
+                      -- generation completeness, as before.
+                      (scope.doc_id IS NULL
+                       AND generation.parse_status = 'complete')
+                      OR EXISTS (
+                          SELECT 1
+                          FROM pdf_parse_runs parse_run
+                          WHERE parse_run.doc_id = artifact.doc_id
                         AND parse_run.artifact_sha256 = artifact.artifact_sha256
                         AND parse_run.ingestion_generation = artifact.generation_id
                         AND parse_run.status IN ('success', 'no_txs', 'invalid')
@@ -367,6 +372,7 @@ class Database:
                                 )
                             )
                         )
+                  )
                   )
             ),
             latest_accepted_house_docs AS (

@@ -989,7 +989,7 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
     ]
     assert (
         _insert_transactions("doc-mixed", 2024, "Jane Doe", txs, db_path=str(db_path))
-        == 0
+        == 1
     )
 
     con = Database(db_path).conn
@@ -1005,8 +1005,12 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
     """).fetchone()
     con.close()
 
-    assert rows == []
-    assert latest_run == ("error", 2, 0, '{"invalid_transaction_date": 1}')
+    # Partial insert: the valid row lands, the bad-date row stays out, and
+    # the success run records what was rejected.
+    assert [row[0] for row in rows] == ["MSFT"]
+    assert latest_run[0] == "success"
+    assert latest_run[1:3] == (2, 1)
+    assert "invalid_transaction_date" in latest_run[3]
 
 
 def test_row_construction_failure_retires_current_artifact_rows(

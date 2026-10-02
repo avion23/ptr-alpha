@@ -169,10 +169,15 @@ See [`docs/house-data-parsing.md`](docs/house-data-parsing.md) for the exact cur
 
 ## CLI
 
+Use system `python3` (Python 3.11+). Never create, activate, or use a venv.
+Skip installation when dependencies are already provisioned. On externally managed
+systems, use provisioned packages rather than bypassing protections. Where
+user-site installation is permitted:
+
 ```bash
-pip install .
+python3 -m pip install --user .
 # development
-pip install ".[dev]"
+python3 -m pip install --user ".[dev]"
 ```
 
 Common commands:

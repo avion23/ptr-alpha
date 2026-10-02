@@ -10,7 +10,7 @@
 This is a non-destructive parser-only audit of every locally cached House PDF. It did not fetch metadata or PDFs and did not write to `data/` or the database. The production `_parse_pdf_worker` cascade was invoked in an 8-process pool with Docling disabled, matching the bulk first-pass mode documented by the parser:
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/audit_house_parser.py \
+PYTHONPATH=src python3 scripts/audit_house_parser.py \
   data /tmp/house_parse_audit.json --workers 8
 ```
 

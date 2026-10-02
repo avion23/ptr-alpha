@@ -699,6 +699,7 @@ def parse(
     except Exception:
         logger.exception("Parse pipeline failed")
     ocr_inserted = 0
+    ocr_error = None
     if use_gemini_ocr:
         db_path = _release_parent_db_for_ocr(app_ctx)
         try:
@@ -712,7 +713,7 @@ def parse(
                 print(f"  Gemini OCR {year}: {ocr_inserted} transactions inserted")
         finally:
             _reacquire_parent_db_after_ocr(app_ctx, db_path)
-    if use_gemini_ocr and ocr_inserted > 0 and not parse_success:
+    if use_gemini_ocr and ocr_error is None and not parse_success:
         try:
             _activate_house_generation(app_ctx.transaction_source, year)
             parse_success = True
@@ -722,7 +723,7 @@ def parse(
         logger.warning(
             "Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted
         )
-    _cli_exit(0 if parse_success else 1)
+    _cli_exit(0 if parse_success and ocr_error is None else 1)
 
 
 @app.command()
@@ -1204,14 +1205,10 @@ def refresh(
     print(f"[2/4] Parsing cached House PDF archives {label}...")
     for archive_year in archive_years:
         try:
-            if force_full_reparse:
-                app_ctx.transaction_source.parse_cached_pdfs(archive_year, force=True)
-            else:
-                parse_result = run_parse_pipeline(
-                    app_ctx.transaction_source, archive_year
-                )
-                if not parse_result.success:
-                    failed_steps.append(f"parse:{archive_year}")
+            # Activation belongs after optional OCR, not in the parse step.
+            app_ctx.transaction_source.parse_cached_pdfs(
+                archive_year, force=force_full_reparse
+            )
         except Exception as exc:
             failed_steps.append(f"parse:{archive_year}")
             logger.warning("PDF parse failed for %d: %s", archive_year, exc)
@@ -1631,13 +1628,11 @@ def setups(
                 events = gate_closed_events(events, position_candidates)
                 frames.append(events)
                 candidate_frames.append(events)
-        if not frames:
+        candidate_frames = [frame for frame in candidate_frames if not frame.empty]
+        if not candidate_frames:
             print("No candidates.")
             _cli_exit(0)
-        candidates = pd.concat(
-            [frame for frame in candidate_frames if not frame.empty],
-            ignore_index=True,
-        )
+        candidates = pd.concat(candidate_frames, ignore_index=True)
         if requested_tickers:
             candidates = candidates.loc[
                 candidates["ticker"].astype("string").str.upper().isin(

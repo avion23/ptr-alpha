@@ -688,14 +688,18 @@ def parse(
     """Parse cached PDFs to database."""
     app_ctx = get_context(ctx, data_dir, read_only=False)
     parse_success = False
+    generation_complete = False
     try:
-        if force_full_reparse:
-            app_ctx.transaction_source.parse_cached_pdfs(year, force=True)
+        result = run_parse_pipeline(
+            app_ctx.transaction_source,
+            year,
+            force=force_full_reparse,
+            activate_generation=False,
+        )
+        parse_success = result.success
+        if parse_success:
             _activate_house_generation(app_ctx.transaction_source, year)
-            parse_success = True
-        else:
-            result = run_parse_pipeline(app_ctx.transaction_source, year)
-            parse_success = result.success
+            generation_complete = True
     except Exception:
         logger.exception("Parse pipeline failed")
     ocr_inserted = 0
@@ -713,17 +717,23 @@ def parse(
                 print(f"  Gemini OCR {year}: {ocr_inserted} transactions inserted")
         finally:
             _reacquire_parent_db_after_ocr(app_ctx, db_path)
-    if use_gemini_ocr and ocr_error is None and not parse_success:
+    # OCR can resolve artifacts, but cannot erase a parse/write failure.
+    if (
+        parse_success
+        and use_gemini_ocr
+        and ocr_error is None
+        and not generation_complete
+    ):
         try:
             _activate_house_generation(app_ctx.transaction_source, year)
-            parse_success = True
+            generation_complete = True
         except Exception:
             logger.exception("Post-OCR generation activation failed")
-    if not parse_success and use_gemini_ocr and ocr_inserted > 0:
+    if not generation_complete and use_gemini_ocr and ocr_inserted > 0:
         logger.warning(
             "Parse pipeline failed but Gemini OCR inserted %s rows", ocr_inserted
         )
-    _cli_exit(0 if parse_success and ocr_error is None else 1)
+    _cli_exit(0 if generation_complete and ocr_error is None else 1)
 
 
 @app.command()
@@ -1206,9 +1216,14 @@ def refresh(
     for archive_year in archive_years:
         try:
             # Activation belongs after optional OCR, not in the parse step.
-            app_ctx.transaction_source.parse_cached_pdfs(
-                archive_year, force=force_full_reparse
+            parse_result = run_parse_pipeline(
+                app_ctx.transaction_source,
+                archive_year,
+                force=force_full_reparse,
+                activate_generation=False,
             )
+            if not parse_result.success:
+                failed_steps.append(f"parse:{archive_year}")
         except Exception as exc:
             failed_steps.append(f"parse:{archive_year}")
             logger.warning("PDF parse failed for %d: %s", archive_year, exc)

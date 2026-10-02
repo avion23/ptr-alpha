@@ -406,22 +406,30 @@ def eligible_events(
 
 
 @pipeline_step
-def run_parse_pipeline(transaction_source, year: int) -> DataResult:
-    transaction_source.parse_cached_pdfs(year)
-    generation_id = transaction_source.db.get_latest_house_generation(year)
-    if generation_id is None:
-        raise DataSourceError(
-            f"No acquired House generation exists for archive {year}"
+def run_parse_pipeline(
+    transaction_source,
+    year: int,
+    *,
+    force: bool = False,
+    activate_generation: bool = True,
+) -> DataResult:
+    """Parse cached PDFs; defer activation when a caller has optional OCR to run."""
+    transaction_source.parse_cached_pdfs(year, force=force)
+    if activate_generation:
+        generation_id = transaction_source.db.get_latest_house_generation(year)
+        if generation_id is None:
+            raise DataSourceError(
+                f"No acquired House generation exists for archive {year}"
+            )
+        unresolved = transaction_source.db.get_unresolved_house_doc_ids(
+            year, generation_id
         )
-    unresolved = transaction_source.db.get_unresolved_house_doc_ids(
-        year, generation_id
-    )
-    if unresolved:
-        raise DataSourceError(
-            f"House archive {year} generation {generation_id} has "
-            f"{len(unresolved)} unresolved artifacts"
-        )
-    transaction_source.db.mark_house_generation_parse_complete(year, generation_id)
+        if unresolved:
+            raise DataSourceError(
+                f"House archive {year} generation {generation_id} has "
+                f"{len(unresolved)} unresolved artifacts"
+            )
+        transaction_source.db.mark_house_generation_parse_complete(year, generation_id)
     logger.info("Successfully parsed PDFs for %d", year)
     return DataResult(success=True, data=None)
 

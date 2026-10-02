@@ -15,8 +15,8 @@ import weakref as _weakref
 import numpy as np
 import pandas as pd
 
+from analyzer._price_index import _normalize_price_index
 from analyzer.signals.constants import _NS_PER_DAY
-
 
 _PRICE_INDEX_DATA: dict[int, dict] = {}
 
@@ -45,9 +45,8 @@ def _price_arrays(prices_df: pd.DataFrame, ticker: str):
     dropping NaNs. Result cached per (prices_df identity, ticker).
 
     Returns None if the ticker has no column or no non-NaN values. Dates are
-    normalized to nanoseconds regardless of the source index's resolution
-    (pandas 3+ defaults to microsecond resolution), so they compare directly
-    against ``pd.Timestamp.value`` (always ns).
+    sorted and normalized to timezone-naive calendar dates in nanoseconds so
+    binary searches compare directly against ``pd.Timestamp.value``.
     """
     by_ticker = _price_index_for_df(prices_df)
     arrs = by_ticker.get(ticker, False)  # False = "not computed yet"
@@ -55,16 +54,11 @@ def _price_arrays(prices_df: pd.DataFrame, ticker: str):
         if ticker not in prices_df.columns:
             arrs = None
         else:
-            s = prices_df[ticker].dropna()
+            s = _normalize_price_index(prices_df[[ticker]])[ticker].dropna()
             if s.empty:
                 arrs = (None, None)
             else:
                 idx = s.index
-                # Normalize to nanoseconds. pandas 3+ exposes ``unit``;
-                # pandas 2.x DatetimeIndex is always ns.
-                unit = getattr(idx, "unit", "ns")
-                if unit != "ns" and hasattr(idx, "as_unit"):
-                    idx = idx.as_unit("ns")
                 arrs = (
                     np.ascontiguousarray(idx.asi8, dtype=np.int64),
                     np.ascontiguousarray(s.values, dtype=np.float64),

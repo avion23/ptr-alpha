@@ -203,15 +203,12 @@ def simulate_portfolio_returns(
         if not signals.empty
         else prices.index.min()
     )
-    last_signal_date = (
-        signals["as_of_date"].max()
-        if not signals.empty
-        else start
-    )
     entry_schedule, price_coverage_skips = _entry_schedule(
         signals, prices, max_execution_delay_days
     )
-    final_target = last_signal_date + pd.Timedelta(
+    last_entry_date = max(entry_schedule) if entry_schedule else start
+    # Both entry and exit can consume their own permitted execution delay.
+    final_target = last_entry_date + pd.Timedelta(
         days=horizon + max_execution_delay_days
     )
     event_dates = prices.index[(prices.index >= start) & (prices.index <= final_target)]
@@ -232,7 +229,6 @@ def simulate_portfolio_returns(
     entry_slip = entry_slippage_bps / 10_000.0
     exit_slip = exit_slippage_bps / 10_000.0
     rows: list[dict] = []
-    last_entry_date = max(entry_schedule) if entry_schedule else event_dates[0]
 
     for current in event_dates:
         for ticker, position in list(positions.items()):

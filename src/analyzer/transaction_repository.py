@@ -391,6 +391,7 @@ class TransactionRepository:
             f"CREATE TEMP TABLE staging_transactions AS SELECT {staging_select} FROM df"  # nosec B608
         )
         inserted_count = 0
+        succeeded = False
         try:
             if not _in_transaction:
                 self.conn.execute("BEGIN TRANSACTION")
@@ -465,6 +466,7 @@ class TransactionRepository:
             inserted_count = count_after - count_before
             if not _in_transaction:
                 self.conn.execute("COMMIT")
+            succeeded = True
         except duckdb.ConstraintException as exc:
             if not _in_transaction:
                 self.conn.execute("ROLLBACK")
@@ -478,8 +480,11 @@ class TransactionRepository:
                 self.conn.execute("ROLLBACK")
             raise
         finally:
-            self.conn.execute("DROP TABLE IF EXISTS filtered_staging_transactions")
-            self.conn.execute("DROP TABLE IF EXISTS staging_transactions")
+            # A failed caller-owned transaction must be rolled back before SQL
+            # cleanup; otherwise cleanup masks the original insertion error.
+            if succeeded or not _in_transaction:
+                self.conn.execute("DROP TABLE IF EXISTS filtered_staging_transactions")
+                self.conn.execute("DROP TABLE IF EXISTS staging_transactions")
         return inserted_count
 
     def replace_source_refresh(

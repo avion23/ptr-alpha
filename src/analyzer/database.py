@@ -353,7 +353,8 @@ class Database:
                                 )
                             )
                             OR (
-                                COALESCE(parse_run.transaction_count, 0) > 0
+                                parse_run.status = 'success'
+                                AND COALESCE(parse_run.transaction_count, 0) > 0
                                 AND NOT EXISTS (
                                     SELECT 1
                                     FROM transactions tx_invalid
@@ -716,7 +717,8 @@ class Database:
                             )
                         )
                         OR (
-                            COALESCE(parse_run.transaction_count, 0) > 0
+                            parse_run.status = 'success'
+                            AND COALESCE(parse_run.transaction_count, 0) > 0
                               AND NOT EXISTS (
                                   SELECT 1
                                   FROM transactions t
@@ -927,7 +929,7 @@ class Database:
                         """
                         SELECT COUNT(*) FROM transactions
                         WHERE doc_id = ?
-                          AND (source = 'house_pdf' OR source IS NULL)
+                          AND (source IN ('house_pdf', 'gemini_ocr') OR source IS NULL)
                         """,
                         [doc_id],
                     ).fetchone()[0]
@@ -941,7 +943,7 @@ class Database:
                     SELECT ?, ?, ?, id, to_json(t), ?
                     FROM transactions t
                     WHERE doc_id = ?
-                      AND (source = 'house_pdf' OR source IS NULL)
+                      AND (source IN ('house_pdf', 'gemini_ocr') OR source IS NULL)
                     """,
                     [
                         archive_year,

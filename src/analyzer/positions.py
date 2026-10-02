@@ -200,17 +200,29 @@ def build_positions(
             return None, False
         return float(floor), True
 
-    ordered = trades.sort_values("transaction_date", kind="mergesort")
-    if "amends_source_record_id" in trades.columns:
+    transaction_dates = pd.to_datetime(trades["transaction_date"], errors="coerce")
+    disclosure_dates = (
+        pd.to_datetime(trades["disclosure_date"], errors="coerce").fillna(transaction_dates)
+        if has_disclosure
+        else transaction_dates
+    )
+    known = (transaction_dates <= pd.Timestamp(as_of)) & (
+        disclosure_dates <= pd.Timestamp(as_of)
+    )
+    skipped += int((~known).sum())
+    # Filter before amendment resolution and alias grouping: future filings
+    # must not remove or change the identity of a currently known lot.
+    ordered = trades.loc[known].sort_values("transaction_date", kind="mergesort")
+    if "amends_source_record_id" in ordered.columns:
         superseded = {
             str(value)
-            for value in trades["amends_source_record_id"].dropna()
+            for value in ordered["amends_source_record_id"].dropna()
             if str(value).strip()
         }
     else:
         superseded = set()
-    if superseded and "source_record_id" in trades.columns:
-        mask = trades["source_record_id"].astype("string").isin(superseded)
+    if superseded and "source_record_id" in ordered.columns:
+        mask = ordered["source_record_id"].astype("string").isin(superseded)
         dropped = int(mask.sum())
         if dropped:
             logger.info("Dropping %d rows superseded by amendments", dropped)
@@ -250,9 +262,6 @@ def build_positions(
             if disclosed is not None and not pd.isna(disclosed)
             else day
         )
-        if disclosure_day > as_of or day > as_of:
-            skipped += 1
-            continue
         last_activity[key] = day
 
         history = price_history.get(str(row.ticker))

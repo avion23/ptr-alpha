@@ -552,30 +552,35 @@ class Form4Source(TransactionSource):
                     )
                 ):
                     raise ValueError
-                if len(parts) == 4 and re.fullmatch(r"\d{18}\.txt", parts[3]):
-                    accession_digits = parts[3][:-4]
+                if len(parts) == 4 and re.fullmatch(
+                    r"(?:\d{10}-\d{2}-\d{6}|\d{18})\.txt", parts[3]
+                ):
+                    accession_digits = parts[3][:-4].replace("-", "")
                 elif len(parts) >= 5 and re.fullmatch(r"\d{18}", parts[3]):
                     accession_digits = parts[3]
                 else:
                     raise ValueError
                 if not re.fullmatch(r"\d{18}", accession_digits):
                     raise ValueError
-                if int(accession_digits[:10]) != cik:
-                    raise ValueError
             except ValueError:
                 logger.warning(
                     "Skipping malformed SEC master index line %d", line_number
                 )
                 continue
+            # The accession prefix identifies the submitter, not necessarily
+            # the issuer CIK used by this index row and archive directory.
+            accession = (
+                f"{accession_digits[:10]}-{accession_digits[10:12]}-"
+                f"{accession_digits[12:]}"
+            )
             filings.append(
                 {
                     "cik": cik,
-                    "accession": (
-                        f"{accession_digits[:10]}-{accession_digits[10:12]}-"
-                        f"{accession_digits[12:]}"
-                    ),
+                    "accession": accession,
                     "filing_date": filing_date,
-                    "ownership_document": f"{accession_digits}.txt",
+                    "ownership_document": (
+                        parts[3] if len(parts) == 4 else f"{accession}.txt"
+                    ),
                 }
             )
         return filings

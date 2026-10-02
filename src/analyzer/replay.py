@@ -2,9 +2,10 @@
 
 Point-in-time discipline is mandatory: candidate disclosures must not be after
 ``as_of``, and decision prices are read only from dates on or before ``as_of``.
-Forward outcomes use the first close after ``as_of`` within the requested
-calendar-day horizon. Actor weights use ``n_matured=0`` priors because replay
-does not fit weights on each historical sample. The default member set is a v1
+Forward outcomes use the last known decision close and the exact NYSE session
+on or before the calendar-day horizon end. Actor weights use ``n_matured=0``
+priors because replay does not fit weights on each historical sample.
+The default member set is a v1
 seed list; pass ``members`` to replay other members.
 """
 
@@ -15,6 +16,8 @@ from datetime import date, timedelta
 from importlib import import_module
 
 import pandas as pd
+
+from analyzer.price_repository import previous_nyse_session
 
 _V1_MEMBERS = (
     "Nancy Pelosi",
@@ -237,32 +240,29 @@ def _score(
 
 
 def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | None:
-    """Return from the last known close to the last in-horizon close.
+    """Return from the last known close to the exact horizon-end session.
 
-    Incomplete horizons stay unknown: if the price history ends before
-    as_of + horizon, there is no matured outcome to report, not a partial
-    one. This keeps validation honest instead of grading 20-day moves as
-    90-day returns.
+    Weekends and exchange holidays roll back to the expected NYSE session;
+    missing that endpoint leaves the outcome unknown, never shortened.
     """
     connection = getattr(db, "conn", db)
     current_price = _latest_close(db, ticker, as_of)
     if current_price is None:
         return None
+    endpoint = previous_nyse_session(as_of + timedelta(days=horizon_days)).date()
+    if endpoint <= as_of:
+        return None
     outcome = connection.execute(
         """
         SELECT date, close FROM prices
-        WHERE ticker = ? AND date > ? AND date <= ? AND close IS NOT NULL
-        ORDER BY date DESC LIMIT 1
+        WHERE ticker = ? AND date = ? AND close IS NOT NULL
         """,
-        [ticker, as_of, as_of + timedelta(days=horizon_days)],
+        [ticker, endpoint],
     ).fetchall()
     if not outcome:
         return None
-    outcome_date, outcome_price = outcome[0][0], float(outcome[0][1])
+    outcome_price = float(outcome[0][1])
     if not math.isfinite(outcome_price) or outcome_price <= 0:
-        return None
-    horizon_end = as_of + timedelta(days=horizon_days)
-    if pd.Timestamp(outcome_date).date() < horizon_end - timedelta(days=7):
         return None
     result = (outcome_price / current_price - 1) * 100
     return result if math.isfinite(result) else None

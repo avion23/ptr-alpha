@@ -975,7 +975,10 @@ def _get_unresolved_house_doc_ids(
                         END
                   )
                   AND (
-                      parse_run.status = 'no_txs'
+                      (
+                          parse_run.status = 'no_txs'
+                          AND COALESCE(parse_run.transaction_count, 0) = 0
+                      )
                       OR (
                           parse_run.status = 'invalid'
                           AND NOT EXISTS (
@@ -989,7 +992,8 @@ def _get_unresolved_house_doc_ids(
                           )
                       )
                       OR (
-                          COALESCE(parse_run.transaction_count, 0) > 0
+                          parse_run.status = 'success'
+                          AND COALESCE(parse_run.transaction_count, 0) > 0
                           AND NOT EXISTS (
                               SELECT 1
                               FROM transactions tx_invalid

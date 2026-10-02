@@ -97,13 +97,15 @@ def _run_docling(full_cmd: list[str], pdf_path: Path, timeout: int) -> str | Non
 
     try:
         _stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException:
+        # The document watchdog can interrupt communicate before its own
+        # timeout. Kill grandchildren too, then reap the child before unwinding.
         _kill_process_group(process.pid)
         try:
-            process.wait(timeout=10)
+            # communicate closes captured pipes and waits for the killed child.
+            process.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             logger.debug(f"docling pid {process.pid} survived group kill")
-        logger.debug(f"docling timed out for {pdf_path} after {timeout}s")
         raise
 
     if process.returncode != 0:

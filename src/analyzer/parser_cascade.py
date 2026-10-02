@@ -169,15 +169,17 @@ def _reconcile_candidates(candidates, engines_attempted):
         return best_rows
 
     maximum_counts = dict(best_counts)
-    representatives = _candidate_counts(best_rows)[1]
+    reconciled = list(best_rows)
     for _, rows in candidates:
-        counts, current_representatives = _candidate_counts(rows)
+        counts = {}
+        for transaction in rows:
+            identity = _transaction_identity(transaction)
+            counts[identity] = counts.get(identity, 0) + 1
+            if counts[identity] > maximum_counts.get(identity, 0):
+                # Keep the observed lot, not copies of its first representative.
+                reconciled.append(transaction)
         for identity, count in counts.items():
             maximum_counts[identity] = max(maximum_counts.get(identity, 0), count)
-            representatives.setdefault(identity, current_representatives[identity])
-    reconciled = []
-    for identity, count in maximum_counts.items():
-        reconciled.extend([representatives[identity]] * count)
     engines_attempted.append(f"complementary_rows:{len(reconciled)}")
     return reconciled
 
@@ -225,6 +227,11 @@ def _run_candidate(engine_fn, engine_name, pdf_path, engines_attempted, errors):
         quality,
     )
     if transactions:
+        # Table/OCR engines without explicit coordinates still have a stable
+        # transaction sequence within this hashed artifact. Keep each lot distinct.
+        for row_number, transaction in enumerate(transactions, start=1):
+            if not transaction.get("source_row_id"):
+                transaction["source_row_id"] = f"{engine_name}:r{row_number}"
         engines_attempted.append(
             f"candidate:{engine_name}:{len(transactions)}:{quality:.3f}"
         )

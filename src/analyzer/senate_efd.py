@@ -423,8 +423,6 @@ class SenateEFDSource(TransactionSource):
         self, start_date: date, end_date: date, reports: dict[str, dict]
     ) -> None:
         start_offset = 0
-        before = len(reports)
-        stale_pages = 0
         while True:
             payload = {
                 "report_types": "[11]",
@@ -454,7 +452,18 @@ class SenateEFDSource(TransactionSource):
                 raise SenateEFDError(
                     f"eFD search returned non-JSON (HTTP {resp.status_code})"
                 ) from e
-            rows = data.get("data", [])
+            if not isinstance(data, dict) or not {"data", "recordsFiltered"}.issubset(data):
+                raise SenateEFDError("eFD search missing rows or pagination total")
+            rows = data["data"]
+            total = data["recordsFiltered"]
+            if (
+                isinstance(total, bool)
+                or not isinstance(total, Integral)
+                or total < 0
+                or not isinstance(rows, list)
+                or len(rows) != min(SEARCH_PAGE_SIZE, max(0, total - start_offset))
+            ):
+                raise SenateEFDError("eFD search returned incomplete pagination data")
             for row in rows:
                 first_name, last_name, display, link_html, filed_date = row[:5]
                 link_m = _LINK_RE.search(str(link_html))
@@ -474,21 +483,8 @@ class SenateEFDSource(TransactionSource):
                     "filed_date": self._parse_date(filed_date),
                 }
             start_offset += SEARCH_PAGE_SIZE
-            if start_offset >= data.get("recordsFiltered", 0):
+            if start_offset >= total:
                 break
-            if len(reports) == before:
-                stale_pages += 1
-                if stale_pages >= 3:
-                    logger.warning(
-                        "eFD window %s..%s pagination stopped after %d stable pages",
-                        start_date,
-                        end_date,
-                        stale_pages,
-                    )
-                    break
-            else:
-                before = len(reports)
-                stale_pages = 0
             time.sleep(SEARCH_PAGE_DELAY)
 
     @staticmethod

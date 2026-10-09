@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 _BUY_TYPES = frozenset({"purchase"})
 _SELL_TYPES = frozenset({"sale", "sale full", "sale partial", "partial sale"})
 _OPTION_MARKERS = frozenset({"option", "call", "put", "stock option"})
+_CONGRESS_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
+# Dollar-band / close-price share estimates can leave small FIFO dust.
+_POSITION_ESTIMATE_TOLERANCE = 0.10
 
 
 class PositionsError(Exception):
@@ -148,6 +151,8 @@ def build_positions(
     first_buy: dict[tuple[str, str], date] = {}
     last_activity: dict[tuple[str, str], date] = {}
     floor_sized: dict[tuple[str, str], int] = {}
+    band_estimates: dict[tuple[str, str], dict[str, float]] = {}
+    ineligible_for_band_tolerance: set[tuple[str, str]] = set()
     member_identities: dict[str, list[str]] = {}
     member_keys: dict[str, str] = {}
     member_labels: dict[str, str] = {}
@@ -253,6 +258,8 @@ def build_positions(
         key = (member_key, str(row.ticker))
         day = pd.Timestamp(row.transaction_date).date()
         kind = str(row.transaction_type or "").strip().lower()
+        source = row.source if "source" in trades.columns else None
+        congress_estimate = isinstance(source, str) and source in _CONGRESS_SOURCES
         if _is_option_row(row, has_instrument):
             skipped_options += 1
             continue
@@ -274,6 +281,8 @@ def build_positions(
             if filed is not None:
                 shares, filed_price = filed
                 size, by_floor = shares * filed_price, False
+                if congress_estimate:
+                    ineligible_for_band_tolerance.add(key)
             else:
                 entry = entry_close(history, day, as_of)
                 size, by_floor = _size(row)
@@ -281,7 +290,20 @@ def build_positions(
                     skipped += 1
                     continue
                 shares = size / entry
-            source = row.source if "source" in trades.columns else None
+                if congress_estimate:
+                    if by_floor:
+                        ineligible_for_band_tolerance.add(key)
+                    else:
+                        estimate = band_estimates.setdefault(
+                            key,
+                            {
+                                "bought_value": 0.0,
+                                "sold_value": 0.0,
+                                "bought_shares": 0.0,
+                            },
+                        )
+                        estimate["bought_value"] += size
+                        estimate["bought_shares"] += shares
             lots.setdefault(key, []).append([shares, size, disclosure_day, source])
             if by_floor:
                 floor_sized[key] = floor_sized.get(key, 0) + 1
@@ -292,18 +314,35 @@ def build_positions(
                 # dollar amount: estimated-amount FIFO can otherwise leave
                 # phantom residual shares behind.
                 lots[key] = []
+                band_estimates.pop(key, None)
+                ineligible_for_band_tolerance.discard(key)
                 first_buy.setdefault(key, day)
                 continue
             filed = _filed_lot(row)
             if filed is not None:
                 to_relieve = filed[0]
+                if congress_estimate:
+                    ineligible_for_band_tolerance.add(key)
             else:
                 entry = entry_close(history, day, as_of)
-                size, _ = _size(row)
+                size, by_floor = _size(row)
                 if entry is None or size is None:
                     skipped += 1
                     continue
                 to_relieve = size / entry
+                if congress_estimate:
+                    if by_floor:
+                        ineligible_for_band_tolerance.add(key)
+                    else:
+                        estimate = band_estimates.setdefault(
+                            key,
+                            {
+                                "bought_value": 0.0,
+                                "sold_value": 0.0,
+                                "bought_shares": 0.0,
+                            },
+                        )
+                        estimate["sold_value"] += size
             queue = lots.setdefault(key, [])
             while to_relieve > 0 and queue:
                 lot_shares, lot_cost, lot_disclosure, lot_source = queue[0]
@@ -326,6 +365,21 @@ def build_positions(
     records = []
     for key, queue in lots.items():
         shares = sum(lot[0] for lot in queue)
+        estimate = band_estimates.get(key)
+        if estimate is not None and key not in ineligible_for_band_tolerance:
+            bought_value = estimate["bought_value"]
+            sold_value = estimate["sold_value"]
+            bought_shares = estimate["bought_shares"]
+            if (
+                bought_value > 0
+                and sold_value >= bought_value * (1 - _POSITION_ESTIMATE_TOLERANCE)
+                and shares <= bought_shares * _POSITION_ESTIMATE_TOLERANCE
+            ):
+                # Midpoint dollars and market-close prices only estimate shares.
+                # Close congressional dust only when both notional and share
+                # totals agree; this leaves material trims open.
+                queue.clear()
+                shares = 0.0
         cost = sum(lot[1] for lot in queue)
         if shares <= 0 or cost <= 0:
             continue

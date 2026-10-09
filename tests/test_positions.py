@@ -677,6 +677,57 @@ class TestPositions(unittest.TestCase):
             build_positions(trades, history, as_of=date(2026, 9, 21)).empty
         )
 
+    def test_equal_band_round_trip_closes_but_one_lot_trim_stays_open(self):
+        db, conn = _holdings_db(
+            [
+                {
+                    "member": member,
+                    "ticker": "ABT",
+                    "transaction_type": transaction_type,
+                    "transaction_date": transaction_date,
+                    "disclosure_date": transaction_date,
+                    "amount_midpoint": amount,
+                    "source": "house_pdf",
+                    "instrument_type": "stock",
+                }
+                for member, transaction_type, transaction_date, amount in [
+                    ("BYRON DONALDS", "Purchase", date(2025, 3, 25), 8000.0),
+                    ("BYRON DONALDS", "Purchase", date(2025, 3, 25), 8000.0),
+                    ("BYRON DONALDS", "Sale", date(2025, 12, 10), 8000.0),
+                    ("BYRON DONALDS", "Sale", date(2025, 12, 11), 8000.0),
+                    ("MARKWAYNE MULLIN", "Purchase", date(2025, 1, 10), 32500.0),
+                    ("MARKWAYNE MULLIN", "Purchase", date(2025, 2, 10), 8000.0),
+                    ("MARKWAYNE MULLIN", "Sale", date(2025, 12, 10), 32500.0),
+                    ("MARKWAYNE MULLIN", "Sale", date(2025, 12, 11), 8000.0),
+                    ("MCCORMICK", "Purchase", date(2025, 1, 10), 32500.0),
+                    ("MCCORMICK", "Purchase", date(2025, 1, 11), 8000.0),
+                    ("MCCORMICK", "Sale Partial", date(2025, 12, 10), 8000.0),
+                ]
+            ],
+            [
+                ("ABT", date(2025, 1, 10), 100.0),
+                ("ABT", date(2025, 1, 11), 100.0),
+                ("ABT", date(2025, 2, 10), 100.0),
+                ("ABT", date(2025, 3, 25), 100.0),
+                ("ABT", date(2025, 12, 10), 105.0),
+                ("ABT", date(2025, 12, 11), 105.0),
+                ("ABT", date(2025, 12, 31), 105.0),
+            ],
+        )
+        try:
+            flat = holdings_candidates(db, "BYRON DONALDS", date(2025, 12, 31))
+            second_flat = holdings_candidates(
+                db, "MARKWAYNE MULLIN", date(2025, 12, 31)
+            )
+            partial = holdings_candidates(db, "MCCORMICK", date(2025, 12, 31))
+        finally:
+            conn.close()
+
+        self.assertTrue(flat.empty)
+        self.assertTrue(second_flat.empty)
+        self.assertEqual(len(partial), 1)
+        self.assertEqual(partial.iloc[0]["actor_id"], "congress:MCCORMICK")
+
 
 if __name__ == "__main__":
     unittest.main()

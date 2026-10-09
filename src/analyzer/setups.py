@@ -91,7 +91,14 @@ def score(
                 decided = _as_date(row["as_of"])
             except (TypeError, ValueError):
                 return False
-            return disclosed <= decided
+            if disclosed > decided:
+                return False
+            # 13F filings are quarterly snapshots, not trades. A position
+            # disclosed two quarters ago says nothing about today (the fund
+            # may have exited since); ancient disclosures must not promote.
+            if (decided - disclosed).days > 180:
+                return False
+            return True
 
         corroborated = any(
             _valid_corroborator(row)

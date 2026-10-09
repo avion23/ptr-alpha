@@ -919,10 +919,20 @@ class Database:
 
         self.conn.execute("BEGIN TRANSACTION")
         try:
-            self.conn.execute(
-                "DELETE FROM metadata WHERE archive_year = ?", [archive_year]
-            )
+            # Upsert first, then delete only genuinely removed docs. A bulk
+            # DELETE + re-INSERT trips a history-dependent DuckDB index
+            # maintenance failure on multi-year refresh runs; the targeted
+            # delete is semantically identical (removed = old - new).
             self.metadata.upsert(metadata_df)
+            if removed_doc_ids:
+                self.conn.execute(
+                    """
+                    DELETE FROM metadata
+                    WHERE archive_year = ?
+                      AND doc_id IN (SELECT UNNEST(?))
+                    """,
+                    [archive_year, removed_doc_ids],
+                )
             for doc_id in removed_doc_ids:
                 removed_count = int(
                     self.conn.execute(

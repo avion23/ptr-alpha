@@ -1184,14 +1184,59 @@ def refresh(
     )
     print(f"[1/4] Fetching and reconciling House PDF archives {label}...")
     summaries = []
+    fetch_failed_years: list[int] = []
+    # Single-year refresh keeps fail-fast: a partial PDF set is not a usable
+    # refresh generation. Multi-year refresh quarantines a twice-failed year
+    # and continues: each archive promotes (and commits) independently, and
+    # DuckDB invalidates the whole shared connection after an index
+    # maintenance failure, so the engine's prescribed recovery (reopen)
+    # runs before the retry.
+    fail_fast = len(archive_years) == 1
     try:
         for archive_year in archive_years:
-            summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
-                archive_year,
-                refresh_metadata=(
-                    all_years or refresh_metadata or archive_year == date.today().year
-                ),
-            )
+            try:
+                summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
+                    archive_year,
+                    refresh_metadata=(
+                        all_years
+                        or refresh_metadata
+                        or archive_year == date.today().year
+                    ),
+                )
+            except Exception as year_exc:
+                if fail_fast:
+                    raise
+                logger.warning(
+                    "House archive %d fetch failed, reopening database: %s",
+                    archive_year,
+                    year_exc,
+                )
+                try:
+                    app_ctx.transaction_source.db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                fresh_db = _open_database(
+                    app_ctx.settings.data.data_dir, False
+                )
+                app_ctx.transaction_source.db = fresh_db
+                app_ctx.price_source.db = fresh_db
+                try:
+                    summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
+                        archive_year,
+                        refresh_metadata=(
+                            all_years
+                            or refresh_metadata
+                            or archive_year == date.today().year
+                        ),
+                    )
+                except Exception as retry_exc:
+                    logger.warning(
+                        "House archive %d failed twice, skipping: %s",
+                        archive_year,
+                        retry_exc,
+                    )
+                    fetch_failed_years.append(archive_year)
+                    continue
             summaries.append(summary)
             _print_house_fetch_summary(summary)
     except Exception as exc:
@@ -1211,6 +1256,11 @@ def refresh(
         f"quarantined PDFs={sum(item.quarantined_pdf_count for item in summaries)}, "
         "generation status=incomplete pending artifact-bound parse/OCR"
     )
+    if fetch_failed_years:
+        print(
+            f" fetch failed years (kept previous generations): "
+            f"{sorted(fetch_failed_years)}"
+        )
 
     print(f"[2/4] Parsing cached House PDF archives {label}...")
     for archive_year in archive_years:

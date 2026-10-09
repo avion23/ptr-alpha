@@ -292,6 +292,41 @@ class HouseTransactionSource(TransactionSource):
             except OSError:
                 logger.warning("Unable to remove temporary PDF %s", tmp_path)
 
+    def _archive_unchanged(
+        self,
+        archive_year: int,
+        doc_ids: list[str],
+        orphan_ids: list[str],
+        expected_hashes: dict[str, str],
+        stage_pdf_dir: Path,
+    ) -> bool:
+        """True when nothing about the archive changed since last promote.
+
+        Re-promoting an identical archive rewrites every metadata row for no
+        reason; on multi-year refresh runs that churn trips a DuckDB index
+        maintenance failure. Skip the promote when the authoritative doc set
+        matches the stored one, no PDFs were orphaned, and every staged PDF
+        is byte-identical to the recorded canonical artifact. Compares doc
+        sets rather than the upstream metadata SHA: the Clerk re-serves
+        byte-different metadata for semantically identical archives.
+        """
+        if orphan_ids:
+            return False
+        try:
+            stored = self.db.get_metadata(archive_year)
+        except Exception:  # noqa: BLE001
+            return False
+        if set(stored["DocID"].astype(str)) != set(doc_ids):
+            return False
+        for doc_id in doc_ids:
+            recorded = expected_hashes.get(doc_id)
+            if not recorded:
+                return False
+            staged = stage_pdf_dir / f"{doc_id}.pdf"
+            if _validated_pdf_sha256(staged) != recorded:
+                return False
+        return True
+
     async def _fetch_and_cache_pdfs_async(
         self,
         archive_year: int,
@@ -427,6 +462,35 @@ class HouseTransactionSource(TransactionSource):
                 else set()
             )
             orphan_ids = sorted(old_pdf_ids - official_doc_ids)
+            if self._archive_unchanged(
+                archive_year, doc_ids, orphan_ids,
+                expected_hashes, stage_pdf_dir,
+            ):
+                logger.info(
+                    "House archive %d unchanged "
+                    "(metadata=%d PTR=%d); skipping promote",
+                    archive_year,
+                    len(metadata_df),
+                    len(doc_ids),
+                )
+                shutil.rmtree(stage_root, ignore_errors=True)
+                return HouseFetchSummary(
+                    archive_year=archive_year,
+                    metadata_count=len(metadata_df),
+                    ptr_count=len(doc_ids),
+                    valid_pdf_count=len(doc_ids),
+                    downloaded_count=sum(
+                        result.status == DownloadStatus.SUCCESS
+                        for result in results
+                    ),
+                    skipped_count=sum(
+                        result.status == DownloadStatus.SKIPPED
+                        for result in results
+                    ),
+                    orphan_pdf_count=0,
+                    generation_id=None,
+                    generation_status="unchanged",
+                )
             backup_pdf_dir = stage_root / "previous-pdfs"
             quarantine_dir = archive_dir / "quarantine" / generation_id
             moved_orphans: list[tuple[Path, Path]] = []

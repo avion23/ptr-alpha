@@ -95,7 +95,10 @@ def entry_close(
     """First close on or after the transaction date.
 
     Point-in-time: when as_of is given, closes after it are unknown, so a
-    transaction whose entry bar does not exist yet yields None.
+    transaction whose entry bar does not exist yet yields None. The forward
+    gap is capped at a week (weekends/holidays): a later bar is a different
+    market, not the transaction price, so it must not manufacture a cost
+    basis (and entry discipline) out of missing data.
     """
     frame = prices
     if as_of is not None:
@@ -103,6 +106,9 @@ def entry_close(
     closes = frame.loc[frame.index >= pd.Timestamp(day), "close"]
     closes = closes[closes.notna()]
     if closes.empty:
+        return None
+    bar_day = closes.index[0].date()
+    if (bar_day - day).days > 7:
         return None
     price = float(closes.iloc[0])
     return price if price > 0 else None

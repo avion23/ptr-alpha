@@ -323,6 +323,32 @@ def test_non_watchlist_corroboration_does_not_promote():
     assert ranked.empty
 
 
+def test_stale_corroboration_does_not_promote():
+    backed = pd.DataFrame(
+        [
+            _row(
+                actor_id="officer:BURKE CEO",
+                source="form4",
+                event_date=date(2024, 3, 1),
+                position_evidence=True,
+            ),
+            _row(
+                actor_id="manager:FUND A",
+                corroboration=True,
+                source="13f",
+                disclosure_date=date(2023, 1, 1),
+            ),
+        ]
+    )
+    ranked, _ = score(
+        backed,
+        {"officer:BURKE CEO": 0.6},
+        {"AAPL": 100.0},
+        watchlist={"manager:FUND A"},
+    )
+    assert ranked.empty
+
+
 def test_missing_watchlist_means_no_corroboration():
     backed = pd.DataFrame(
         [

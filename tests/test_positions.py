@@ -7,6 +7,7 @@ from analyzer.positions import (
     PositionsError,
     build_positions,
     discount_alerts,
+    entry_close,
     holdings_candidates,
 )
 
@@ -47,6 +48,20 @@ def _holdings_db(trades, prices):
     conn.execute("CREATE TABLE canonical_transactions AS SELECT * FROM trade_fixture")
     conn.execute("CREATE TABLE prices AS SELECT * FROM price_fixture")
     return SimpleNamespace(conn=conn), conn
+
+
+class TestEntryClose(unittest.TestCase):
+    def test_weekend_gap_uses_monday_close(self):
+        frame = _prices(
+            [date(2026, 1, 2), date(2026, 1, 5)], [100.0, 101.0]
+        )
+        self.assertEqual(
+            entry_close(frame, date(2026, 1, 3)), 101.0
+        )
+
+    def test_distant_bar_does_not_manufacture_basis(self):
+        frame = _prices([date(2026, 1, 29)], [200.0])
+        self.assertIsNone(entry_close(frame, date(2026, 1, 4)))
 
 
 class TestPositions(unittest.TestCase):

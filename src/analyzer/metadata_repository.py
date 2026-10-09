@@ -42,16 +42,36 @@ class MetadataRepository:
         """)
 
     def replace_archive(self, archive_year: int, df: pd.DataFrame) -> None:
-        """Atomically replace one official House archive."""
+        """Atomically replace one official House archive.
+
+        Upserts the incoming rows, then deletes only docs actually removed
+        from the archive. Semantically identical to bulk DELETE + re-INSERT
+        but avoids tripping a history-dependent DuckDB index maintenance
+        failure on repeated delete/upsert cycles.
+        """
         df = df.copy()
         df["archive_year"] = archive_year
+        new_ids = sorted(set(df["doc_id"].astype(str)))
         self.conn.execute("BEGIN TRANSACTION")
         try:
-            self.conn.execute(
-                "DELETE FROM metadata WHERE archive_year = ?",
-                [archive_year],
-            )
             self.upsert(df)
+            old_ids = {
+                str(row[0])
+                for row in self.conn.execute(
+                    "SELECT doc_id FROM metadata WHERE archive_year = ?",
+                    [archive_year],
+                ).fetchall()
+            }
+            removed = sorted(old_ids - set(new_ids))
+            if removed:
+                self.conn.execute(
+                    """
+                    DELETE FROM metadata
+                    WHERE archive_year = ?
+                      AND doc_id IN (SELECT UNNEST(?))
+                    """,
+                    [archive_year, removed],
+                )
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")

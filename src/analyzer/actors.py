@@ -192,7 +192,9 @@ def load_skill_table(
         last_names = sorted(last_names)
         if not last_names:
             return pd.DataFrame(columns=_SKILL_COLUMNS)
-        name_clause = " OR ".join("UPPER(member) LIKE ?" for _ in last_names)
+        name_clause = " OR ".join(
+            "strip_accents(UPPER(member)) LIKE ?" for _ in last_names
+        )
         member_rows = db.conn.execute(
             "SELECT DISTINCT source, member FROM canonical_transactions "
             "WHERE disclosure_date < ? AND source IN (?, ?, ?, ?) AND ("
@@ -351,14 +353,46 @@ def compute_actor_weights(
 
 
 def _coalesce_actor_ids(events: pd.DataFrame, actor_ids) -> pd.DataFrame:
-    """Map event IDs to candidate representatives with the position identity rule."""
-    from analyzer.positions import coalesce_actor_variants
+    """Coalesce unambiguous name variants without assigning ambiguous short names."""
+    from analyzer.positions import same_actor_identity
 
     representatives = list(dict.fromkeys(map(str, actor_ids)))
-    positions = pd.DataFrame(
-        {"actor_id": representatives, "position_evidence": True}
-    )
-    return coalesce_actor_variants(events.copy().reset_index(drop=True), positions)
+    ambiguous = set()
+    for representative in representatives:
+        matching = [
+            candidate
+            for candidate in representatives
+            if candidate != representative
+            and same_actor_identity(representative, candidate)
+        ]
+        if any(
+            not same_actor_identity(first, second)
+            for index, first in enumerate(matching)
+            for second in matching[index + 1 :]
+        ):
+            ambiguous.add(representative)
+
+    result = events.copy().reset_index(drop=True)
+    for index, value in enumerate(result["actor_id"]):
+        identity = str(value)
+        if identity in ambiguous:
+            result.at[index, "actor_id"] = identity
+            continue
+        matching = [
+            representative
+            for representative in representatives
+            if representative not in ambiguous
+            and same_actor_identity(representative, identity)
+        ]
+        if matching and all(
+            same_actor_identity(first, second)
+            for index, first in enumerate(matching)
+            for second in matching[index + 1 :]
+        ):
+            result.at[index, "actor_id"] = matching[0]
+        else:
+            result.at[index, "actor_id"] = identity
+    return result
 
 
 def _coalesce_candidate_variants(candidates: pd.DataFrame) -> pd.DataFrame:

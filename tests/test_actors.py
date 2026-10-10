@@ -135,7 +135,18 @@ def test_mccaul_skill_follows_middle_initial_name_variant(tmp_path):
         [(ticker, day, close) for (ticker, day), close in prices.items()],
     )
     candidates = pd.DataFrame(
-        [{"actor_id": "congress:MICHAEL MCCAUL", "kind": "congress", "source": "house_pdf"}]
+        [
+            {
+                "actor_id": "congress:MICHAEL MCCAUL",
+                "kind": "congress",
+                "source": "house_pdf",
+            },
+            {
+                "actor_id": "congress:MICHAEL T MCCAUL",
+                "kind": "congress",
+                "source": "house_pdf",
+            },
+        ]
     )
 
     try:
@@ -143,7 +154,124 @@ def test_mccaul_skill_follows_middle_initial_name_variant(tmp_path):
     finally:
         db.close()
 
-    assert weights["congress:MICHAEL MCCAUL"] == SOURCE_PRIORS["house_pdf"]
+    assert weights == {
+        "congress:MICHAEL MCCAUL": SOURCE_PRIORS["house_pdf"],
+        "congress:MICHAEL T MCCAUL": SOURCE_PRIORS["house_pdf"],
+    }
+
+
+def test_conflicting_middle_name_histories_do_not_merge_short_name(tmp_path):
+    from analyzer.actors import weights_for_candidates
+
+    db = Database(tmp_path / "conflicting-members.duckdb")
+    members = {
+        "AAPL": "John A Smith",
+        "MSFT": "John A Smith",
+        "GOOG": "John A Smith",
+        "AMZN": "John B Smith",
+        "META": "John B Smith",
+        "NVDA": "John B Smith",
+    }
+    disclosures = [
+        pd.Timestamp("2023-01-03") + pd.Timedelta(days=day) for day in range(6)
+    ]
+    db.conn.executemany(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, owner_code, amount_raw, amount_midpoint, source
+        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf')
+        """,
+        [
+            (f"smith-{ticker}", members[ticker], ticker, day.date(), day.date())
+            for ticker, day in zip(members, disclosures)
+        ],
+    )
+    prices = {}
+    for (ticker, member), disclosed in zip(members.items(), disclosures):
+        entry = next_nyse_session(disclosed).date()
+        exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).date()
+        prices[(ticker, entry)] = 100.0
+        prices[(ticker, exit_date)] = (
+            120.0 if member == "John A Smith" else 80.0
+        )
+        prices[("SPY", entry)] = 100.0
+        prices[("SPY", exit_date)] = 100.0
+    db.conn.executemany(
+        "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+        [(ticker, day, close) for (ticker, day), close in prices.items()],
+    )
+    candidates = pd.DataFrame(
+        [
+            {
+                "actor_id": actor_id("congress", name),
+                "kind": "congress",
+                "source": "house_pdf",
+            }
+            for name in ("John Smith", "John A Smith", "John B Smith")
+        ]
+    )
+
+    try:
+        weights = weights_for_candidates(db, candidates, pd.Timestamp("2024-05-01"))
+    finally:
+        db.close()
+
+    assert weights == {
+        "congress:JOHN SMITH": pytest.approx(0.26),
+        "congress:JOHN A SMITH": SOURCE_PRIORS["house_pdf"],
+        "congress:JOHN B SMITH": pytest.approx(0.26),
+    }
+
+
+def test_accented_surname_skill_history_is_found(tmp_path):
+    from analyzer.actors import weights_for_candidates
+
+    db = Database(tmp_path / "accented-member.duckdb")
+    disclosures = [
+        pd.Timestamp("2023-01-03") + pd.Timedelta(days=day) for day in range(3)
+    ]
+    tickers = ("AAPL", "MSFT", "GOOG")
+    db.conn.executemany(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, owner_code, amount_raw, amount_midpoint, source
+        ) VALUES (?, 'Nydia Velázquez', ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf')
+        """,
+        [
+            (f"velazquez-{ticker}", ticker, day.date(), day.date())
+            for ticker, day in zip(tickers, disclosures)
+        ],
+    )
+    prices = {}
+    for ticker, disclosed in zip(tickers, disclosures):
+        entry = next_nyse_session(disclosed).date()
+        exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).date()
+        prices[(ticker, entry)] = 100.0
+        prices[(ticker, exit_date)] = 120.0
+        prices[("SPY", entry)] = 100.0
+        prices[("SPY", exit_date)] = 100.0
+    db.conn.executemany(
+        "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+        [(ticker, day, close) for (ticker, day), close in prices.items()],
+    )
+    candidates = pd.DataFrame(
+        [
+            {
+                "actor_id": actor_id("congress", "Nydia Velázquez"),
+                "kind": "congress",
+                "source": "house_pdf",
+            }
+        ]
+    )
+
+    try:
+        weights = weights_for_candidates(db, candidates, pd.Timestamp("2024-05-01"))
+    finally:
+        db.close()
+
+    assert weights["congress:NYDIA VELAZQUEZ"] == SOURCE_PRIORS["house_pdf"]
 
 
 def test_single_actor_skill_history_query_returns_only_matching_rows(tmp_path, monkeypatch):

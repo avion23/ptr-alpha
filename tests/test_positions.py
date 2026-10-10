@@ -26,11 +26,13 @@ def _holdings_db(trades, prices):
         "member",
         "ticker",
         "transaction_type",
+        "raw_transaction_subtype",
         "transaction_date",
         "disclosure_date",
         "amount_midpoint",
         "amount_raw",
         "source",
+        "owner_code",
         "instrument_type",
         "source_record_id",
         "amends_source_record_id",
@@ -65,6 +67,295 @@ class TestEntryClose(unittest.TestCase):
 
 
 class TestPositions(unittest.TestCase):
+    def test_joint_owner_full_sale_matches_j_and_jt_in_both_directions(self):
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11"],
+                [100.0, 100.0, 100.0],
+            )
+        }
+        for purchase_owner, sale_owner in (("J", "JT"), ("JT", "J")):
+            with self.subTest(purchase_owner=purchase_owner, sale_owner=sale_owner):
+                trades = pd.DataFrame(
+                    [
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Purchase",
+                            "transaction_date": date(2025, 1, 10),
+                            "amount_midpoint": 10000.0,
+                            "owner_code": purchase_owner,
+                        },
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Sale",
+                            "raw_transaction_subtype": "Sale (Full)",
+                            "transaction_date": date(2025, 6, 10),
+                            "amount_midpoint": 100.0,
+                            "owner_code": sale_owner,
+                        },
+                    ]
+                )
+
+                self.assertTrue(
+                    build_positions(trades, history, as_of=date(2025, 6, 11)).empty
+                )
+
+    def test_band_dust_cleanup_preserves_other_owners_lot(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 500.0,
+                    "source": "house_pdf",
+                    "owner_code": "SP",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11"],
+                [100.0, 100.0, 100.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 6, 11))
+
+        self.assertEqual(len(positions), 1)
+        self.assertAlmostEqual(positions.iloc[0]["shares"], 5.0)
+        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 500.0)
+
+    def test_ownerless_band_cleanup_preserves_named_exact_lot(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 500.0,
+                    "source": "house_pdf",
+                    "owner_code": "SP",
+                    "asset_description": "5 shares @ $100",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11"],
+                [100.0, 100.0, 100.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 6, 11))
+
+        self.assertEqual(len(positions), 1)
+        self.assertAlmostEqual(positions.iloc[0]["shares"], 5.0)
+        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 500.0)
+
+    def test_ownerless_band_sale_is_attributed_to_relieved_owner(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11"],
+                [100.0, 105.0, 105.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 6, 11))
+
+        self.assertTrue(positions.empty)
+
+    def test_repository_normalized_full_sale_closes_only_disclosed_account(self):
+        from analyzer.transaction_repository import _normalize_frame
+
+        normalized = _normalize_frame(
+            pd.DataFrame(
+                [
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Purchase",
+                        "transaction_date": date(2025, 1, 10),
+                        "disclosure_date": date(2025, 1, 10),
+                        "amount_midpoint": 8000.5,
+                        "source": "senate_efd",
+                        "owner_code": "S",
+                    },
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Purchase",
+                        "transaction_date": date(2025, 1, 10),
+                        "disclosure_date": date(2025, 1, 10),
+                        "amount_midpoint": 10000.0,
+                        "source": "senate_efd",
+                        "owner_code": "SP",
+                    },
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Sale",
+                        "raw_transaction_subtype": "Sale (Full)",
+                        "transaction_date": date(2025, 6, 10),
+                        "disclosure_date": date(2025, 6, 10),
+                        "amount_midpoint": 100.0,
+                        "source": "senate_efd",
+                        "owner_code": "S",
+                    },
+                ]
+            ),
+            deduplicate=False,
+        )
+        self.assertEqual(normalized.iloc[2]["transaction_type"], "Sale")
+        self.assertEqual(normalized.iloc[2]["raw_transaction_subtype"], "Sale (Full)")
+
+        db, conn = _holdings_db(
+            normalized.to_dict("records"),
+            [
+                ("T", date(2025, 1, 10), 100.0),
+                ("T", date(2025, 6, 10), 200.0),
+                ("T", date(2025, 6, 11), 200.0),
+            ],
+        )
+        try:
+            from analyzer.positions import build_positions, load_member_trades
+
+            loaded = load_member_trades(db, "M")
+            self.assertEqual(loaded.iloc[2]["raw_transaction_subtype"], "Sale (Full)")
+            fifo_positions = build_positions(
+                loaded,
+                {
+                    "T": _prices(
+                        ["2025-01-10", "2025-06-10", "2025-06-11"],
+                        [100.0, 200.0, 200.0],
+                    )
+                },
+                as_of=date(2025, 6, 11),
+            )
+            positions = holdings_candidates(db, "M", date(2025, 6, 11))
+        finally:
+            conn.close()
+
+        self.assertEqual(len(positions), 1)
+        self.assertAlmostEqual(fifo_positions.iloc[0]["shares"], 100.0)
+        self.assertAlmostEqual(fifo_positions.iloc[0]["total_cost"], 10000.0)
+        self.assertAlmostEqual(positions.iloc[0]["entry_ref"], 100.0)
+
+    def test_repository_normalized_full_sale_without_owner_closes_all_accounts(self):
+        from analyzer.transaction_repository import _normalize_frame
+
+        normalized = _normalize_frame(
+            pd.DataFrame(
+                [
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Purchase",
+                        "transaction_date": date(2025, 1, 10),
+                        "disclosure_date": date(2025, 1, 10),
+                        "amount_midpoint": 8000.5,
+                        "source": "senate_efd",
+                        "owner_code": "S",
+                    },
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Purchase",
+                        "transaction_date": date(2025, 1, 10),
+                        "disclosure_date": date(2025, 1, 10),
+                        "amount_midpoint": 10000.0,
+                        "source": "senate_efd",
+                        "owner_code": "SP",
+                    },
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Sale Full",
+                        "transaction_date": date(2025, 6, 10),
+                        "disclosure_date": date(2025, 6, 10),
+                        "amount_midpoint": 100.0,
+                        "source": "senate_efd",
+                    },
+                ]
+            ),
+            deduplicate=False,
+        )
+        self.assertEqual(normalized.iloc[2]["transaction_type"], "Sale")
+        self.assertEqual(normalized.iloc[2]["raw_transaction_subtype"], "Sale Full")
+
+        db, conn = _holdings_db(
+            normalized.to_dict("records"),
+            [
+                ("T", date(2025, 1, 10), 100.0),
+                ("T", date(2025, 6, 10), 200.0),
+            ],
+        )
+        try:
+            positions = holdings_candidates(db, "M", date(2025, 6, 11))
+        finally:
+            conn.close()
+
+        self.assertTrue(positions.empty)
+
     def test_multi_lot_fifo_and_discount(self):
         trades = pd.DataFrame(
             [
@@ -742,6 +1033,117 @@ class TestPositions(unittest.TestCase):
         self.assertTrue(second_flat.empty)
         self.assertEqual(len(partial), 1)
         self.assertEqual(partial.iloc[0]["actor_id"], "congress:MCCORMICK")
+
+    def test_repeated_band_cycles_reset_estimates_after_fifo_exhaustion(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": transaction_type,
+                    "transaction_date": transaction_date,
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                }
+                for transaction_type, transaction_date in [
+                    ("Purchase", date(2025, 1, 10)),
+                    ("Sale", date(2025, 6, 10)),
+                    ("Purchase", date(2025, 6, 11)),
+                    ("Sale", date(2025, 6, 12)),
+                ]
+            ]
+        )
+        history = {
+            "T": _prices(
+                [
+                    "2025-01-10",
+                    "2025-06-10",
+                    "2025-06-11",
+                    "2025-06-12",
+                    "2025-06-13",
+                ],
+                [100.0, 50.0, 100.0, 105.0, 105.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 6, 13))
+
+        self.assertTrue(positions.empty)
+
+    def test_ineligible_full_fifo_exits_reset_band_estimates(self):
+        history = {
+            "T": _prices(
+                [
+                    "2025-01-10",
+                    "2025-06-10",
+                    "2025-06-11",
+                    "2025-06-12",
+                    "2025-06-13",
+                ],
+                [100.0, 50.0, 100.0, 105.0, 105.0],
+            )
+        }
+        ineligible_exits = {
+            "floor-only": {
+                "amount_midpoint": None,
+                "amount_raw": "$10,000 -",
+            },
+            "exact-shares": {
+                "asset_description": "Common Stock; 100 shares @ $50.00",
+            },
+        }
+
+        for exit_kind, exit_fields in ineligible_exits.items():
+            with self.subTest(exit_kind=exit_kind):
+                first_exit = {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                }
+                first_exit.update(exit_fields)
+                trades = pd.DataFrame(
+                    [
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Purchase",
+                            "transaction_date": date(2025, 1, 10),
+                            "amount_midpoint": 10000.0,
+                            "source": "house_pdf",
+                            "owner_code": "S",
+                        },
+                        first_exit,
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Purchase",
+                            "transaction_date": date(2025, 6, 11),
+                            "amount_midpoint": 10000.0,
+                            "source": "house_pdf",
+                            "owner_code": "S",
+                        },
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Sale",
+                            "transaction_date": date(2025, 6, 12),
+                            "amount_midpoint": 10000.0,
+                            "source": "house_pdf",
+                            "owner_code": "S",
+                        },
+                    ]
+                )
+
+                positions = build_positions(
+                    trades, history, as_of=date(2025, 6, 13)
+                )
+
+                self.assertTrue(positions.empty)
 
 
 if __name__ == "__main__":

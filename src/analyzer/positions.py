@@ -124,6 +124,25 @@ def _current_close(prices: pd.DataFrame, as_of: date) -> float | None:
     return price if price > 0 else None
 
 
+def _is_full_sale(kind: str, subtype) -> bool:
+    for value in (kind, subtype):
+        if value is None or pd.isna(value):
+            continue
+        normalized = re.sub(r"[^a-z]", "", str(value).lower())
+        if normalized in {"salefull", "fullsale"}:
+            return True
+    return False
+
+
+def _owner_account(value) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    account = str(value).strip().upper()
+    if account in {"J", "JT"}:
+        return "JT"
+    return account or None
+
+
 def build_positions(
     trades: pd.DataFrame,
     price_history: dict[str, pd.DataFrame],
@@ -150,6 +169,7 @@ def build_positions(
     has_raw = "amount_raw" in trades.columns
     has_instrument = "instrument_type" in trades.columns
     has_disclosure = "disclosure_date" in trades.columns
+    has_subtype = "raw_transaction_subtype" in trades.columns
     if not has_midpoint and not has_raw:
         raise PositionsError("trades need amount_midpoint or amount_raw for sizing")
 
@@ -157,8 +177,8 @@ def build_positions(
     first_buy: dict[tuple[str, str], date] = {}
     last_activity: dict[tuple[str, str], date] = {}
     floor_sized: dict[tuple[str, str], int] = {}
-    band_estimates: dict[tuple[str, str], dict[str, float]] = {}
-    ineligible_for_band_tolerance: set[tuple[str, str]] = set()
+    band_estimates: dict[tuple[str, str], dict[str | None, dict[str, float]]] = {}
+    ineligible_for_band_tolerance: set[tuple[tuple[str, str], str | None]] = set()
     member_identities: dict[str, list[str]] = {}
     member_keys: dict[str, str] = {}
     member_labels: dict[str, str] = {}
@@ -264,6 +284,13 @@ def build_positions(
         key = (member_key, str(row.ticker))
         day = pd.Timestamp(row.transaction_date).date()
         kind = str(row.transaction_type or "").strip().lower()
+        full_sale = _is_full_sale(
+            kind, row.raw_transaction_subtype if has_subtype else None
+        )
+        account = _owner_account(
+            row.owner_code if "owner_code" in trades.columns else None
+        )
+        estimate_key = (key, account)
         source = row.source if "source" in trades.columns else None
         congress_estimate = isinstance(source, str) and source in _CONGRESS_SOURCES
         if _is_option_row(row, has_instrument):
@@ -288,7 +315,7 @@ def build_positions(
                 shares, filed_price = filed
                 size, by_floor = shares * filed_price, False
                 if congress_estimate:
-                    ineligible_for_band_tolerance.add(key)
+                    ineligible_for_band_tolerance.add(estimate_key)
             else:
                 entry = entry_close(history, day, as_of)
                 size, by_floor = _size(row)
@@ -298,10 +325,10 @@ def build_positions(
                 shares = size / entry
                 if congress_estimate:
                     if by_floor:
-                        ineligible_for_band_tolerance.add(key)
+                        ineligible_for_band_tolerance.add(estimate_key)
                     else:
-                        estimate = band_estimates.setdefault(
-                            key,
+                        estimate = band_estimates.setdefault(key, {}).setdefault(
+                            account,
                             {
                                 "bought_value": 0.0,
                                 "sold_value": 0.0,
@@ -310,25 +337,48 @@ def build_positions(
                         )
                         estimate["bought_value"] += size
                         estimate["bought_shares"] += shares
-            lots.setdefault(key, []).append([shares, size, disclosure_day, source])
+            lots.setdefault(key, []).append(
+                [shares, size, disclosure_day, source, account]
+            )
             if by_floor:
                 floor_sized[key] = floor_sized.get(key, 0) + 1
             first_buy.setdefault(key, day)
-        elif kind in _SELL_TYPES:
-            if kind == "sale full":
+        elif kind in _SELL_TYPES or full_sale:
+            if full_sale:
                 # A full sale closes the position regardless of the filed
                 # dollar amount: estimated-amount FIFO can otherwise leave
-                # phantom residual shares behind.
-                lots[key] = []
-                band_estimates.pop(key, None)
-                ineligible_for_band_tolerance.discard(key)
+                # phantom residual shares behind. When ownership is disclosed,
+                # close only that account's lots; otherwise close the member's
+                # full position in this ticker.
+                if account is None:
+                    lots[key] = []
+                else:
+                    lots[key] = [lot for lot in lots.get(key, []) if lot[4] != account]
+                if account is None:
+                    band_estimates.pop(key, None)
+                    ineligible_for_band_tolerance.difference_update(
+                        {
+                            candidate
+                            for candidate in ineligible_for_band_tolerance
+                            if candidate[0] == key
+                        }
+                    )
+                else:
+                    estimates = band_estimates.get(key)
+                    if estimates is not None:
+                        estimates.pop(account, None)
+                        if not estimates:
+                            band_estimates.pop(key)
+                    ineligible_for_band_tolerance.discard(estimate_key)
                 first_buy.setdefault(key, day)
                 continue
+            sale_estimate_value = None
+            sale_band_ineligible = False
             filed = _filed_lot(row)
             if filed is not None:
                 to_relieve = filed[0]
                 if congress_estimate:
-                    ineligible_for_band_tolerance.add(key)
+                    sale_band_ineligible = True
             else:
                 entry = entry_close(history, day, as_of)
                 size, by_floor = _size(row)
@@ -338,41 +388,64 @@ def build_positions(
                 to_relieve = size / entry
                 if congress_estimate:
                     if by_floor:
-                        ineligible_for_band_tolerance.add(key)
+                        sale_band_ineligible = True
                     else:
-                        estimate = band_estimates.setdefault(
-                            key,
-                            {
-                                "bought_value": 0.0,
-                                "sold_value": 0.0,
-                                "bought_shares": 0.0,
-                            },
-                        )
-                        estimate["sold_value"] += size
+                        sale_estimate_value = size
             queue = lots.setdefault(key, [])
-            while to_relieve > 0 and queue:
-                lot_shares, lot_cost, lot_disclosure, lot_source = queue[0]
+            sale_shares = to_relieve
+            relieved_by_account: dict[str | None, float] = {}
+            index = 0
+            while to_relieve > 0 and index < len(queue):
+                lot = queue[index]
+                if account is not None and lot[4] != account:
+                    index += 1
+                    continue
+                lot_shares, lot_cost = lot[0], lot[1]
+                relieved_shares = min(lot_shares, to_relieve)
+                relieved_by_account[lot[4]] = (
+                    relieved_by_account.get(lot[4], 0.0) + relieved_shares
+                )
                 if lot_shares <= to_relieve:
                     to_relieve -= lot_shares
-                    queue.pop(0)
+                    queue.pop(index)
                 else:
                     fraction = to_relieve / lot_shares
-                    queue[0] = [
-                        lot_shares - to_relieve,
-                        lot_cost * (1 - fraction),
-                        lot_disclosure,
-                        lot_source,
-                    ]
+                    lot[0] = lot_shares - to_relieve
+                    lot[1] = lot_cost * (1 - fraction)
                     to_relieve = 0
+            if congress_estimate and sale_shares > 0:
+                for relieved_account, relieved_shares in relieved_by_account.items():
+                    relieved_key = (key, relieved_account)
+                    if sale_band_ineligible:
+                        ineligible_for_band_tolerance.add(relieved_key)
+                    else:
+                        estimate = band_estimates.get(key, {}).get(relieved_account)
+                        if estimate is not None and sale_estimate_value is not None:
+                            estimate["sold_value"] += (
+                                sale_estimate_value * relieved_shares / sale_shares
+                            )
+                    if not any(lot[4] == relieved_account for lot in queue):
+                        # These band totals describe one open holding cycle.
+                        # Do not carry clipped sale value into later purchases.
+                        estimates = band_estimates.get(key)
+                        if estimates is not None:
+                            estimates.pop(relieved_account, None)
+                            if not estimates:
+                                band_estimates.pop(key)
+                        ineligible_for_band_tolerance.discard(relieved_key)
             first_buy.setdefault(key, day)
         else:
             ignored_exchanges += 1
 
     records = []
     for key, queue in lots.items():
-        shares = sum(lot[0] for lot in queue)
-        estimate = band_estimates.get(key)
-        if estimate is not None and key not in ineligible_for_band_tolerance:
+        for account, estimate in band_estimates.get(key, {}).items():
+            estimate_key = (key, account)
+            if estimate_key in ineligible_for_band_tolerance:
+                continue
+            shares = sum(
+                lot[0] for lot in queue if lot[4] == account
+            )
             bought_value = estimate["bought_value"]
             sold_value = estimate["sold_value"]
             bought_shares = estimate["bought_shares"]
@@ -384,8 +457,8 @@ def build_positions(
                 # Midpoint dollars and market-close prices only estimate shares.
                 # Close congressional dust only when both notional and share
                 # totals agree; this leaves material trims open.
-                queue.clear()
-                shares = 0.0
+                queue[:] = [lot for lot in queue if lot[4] != account]
+        shares = sum(lot[0] for lot in queue)
         cost = sum(lot[1] for lot in queue)
         if shares <= 0 or cost <= 0:
             continue
@@ -710,11 +783,13 @@ _LOADER_COLUMNS = (
     "member",
     "ticker",
     "transaction_type",
+    "raw_transaction_subtype",
     "transaction_date",
     "disclosure_date",
     "amount_midpoint",
     "amount_raw",
     "source",
+    "owner_code",
     "instrument_type",
     "asset_description",
     "source_record_id",

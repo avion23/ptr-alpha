@@ -8,6 +8,7 @@ and prevents false skill attribution.
 from __future__ import annotations
 
 import math
+import re
 from datetime import date
 
 import pandas as pd
@@ -159,38 +160,61 @@ def compute_skill_table(
     )
 
 
-def _load_exact_actor_members(
+def _load_actor_members(
     db, as_of: date | pd.Timestamp, actor_ids
 ) -> pd.DataFrame:
-    """Return only source/member rows whose normalized actor ID was requested."""
+    """Return requested history rows and congress variants that coalesce to them."""
     cutoff = pd.Timestamp(as_of).normalize()
     if cutoff.date() <= date.min:
-        return pd.DataFrame(columns=["source", "member"])
+        return pd.DataFrame(columns=["source", "member", "actor_id"])
 
     requested = set(map(str, actor_ids))
-    last_names = {
-        tokens[-1]
-        for value in requested
-        if (name := value.partition(":")[2])
-        if (tokens := canonical_member_key(name).split())
-    }
-    if not last_names:
-        return pd.DataFrame(columns=["source", "member"])
+    requested_by_last_name: dict[tuple[str, str], set[str]] = {}
+    for value in requested:
+        kind, separator, name = value.partition(":")
+        if not separator or kind not in _KINDS:
+            continue
+        tokens = actor_id(kind, name).partition(":")[2].split()
+        if tokens:
+            requested_by_last_name.setdefault((kind, tokens[-1]), set()).add(value)
 
-    last_names = sorted(last_names)
-    name_clause = " OR ".join(
-        "strip_accents(UPPER(member)) LIKE ?" for _ in last_names
-    )
+    filters = []
+    parameters: list[object] = [cutoff.date(), *sorted(_SKILL_SOURCES)]
+    for source, kind in _SOURCE_KINDS.items():
+        names = {
+            last_name
+            for requested_kind, last_name in requested_by_last_name
+            if requested_kind == kind
+        }
+        if not names:
+            continue
+        if kind == "congress":
+            # Mirror canonical_member_key's ASCII fold; DuckDB UPPER leaves ß as ẞ.
+            member_key = (
+                "regexp_replace(replace(replace(strip_accents(UPPER(member)), "
+                "'ẞ', 'SS'), 'Ø', ''), '[^A-Z0-9]', '', 'g')"
+            )
+            normalized_names = {
+                re.sub(r"[^A-Z0-9]", "", name) for name in names
+            }
+        else:
+            member_key = "replace(UPPER(member), 'ẞ', 'SS')"
+            normalized_names = names
+        if not normalized_names:
+            continue
+        patterns = " OR ".join(f"{member_key} LIKE ?" for _ in normalized_names)
+        filters.append(f"(source = ? AND ({patterns}))")
+        parameters.append(source)
+        parameters.extend(f"%{name}%" for name in sorted(normalized_names))
+    if not filters:
+        return pd.DataFrame(columns=["source", "member", "actor_id"])
+
     member_rows = db.conn.execute(
         "SELECT DISTINCT source, member FROM canonical_transactions "
         "WHERE disclosure_date < ? AND source IN (?, ?, ?, ?) AND ("
-        + name_clause
+        + " OR ".join(filters)
         + ") AND member IS NOT NULL ORDER BY source, member",
-        [
-            cutoff.date(),
-            *sorted(_SKILL_SOURCES),
-            *(f"%{name}%" for name in last_names),
-        ],
+        parameters,
     ).fetchall()
     members = pd.DataFrame(member_rows, columns=["source", "member"])
     members = members.loc[
@@ -206,7 +230,22 @@ def _load_exact_actor_members(
         ]
     else:
         members["actor_id"] = pd.Series(dtype="object")
-    return members.loc[members["actor_id"].isin(requested), ["source", "member"]]
+    from analyzer.positions import same_actor_identity
+
+    def matches_requested(history_id: str) -> bool:
+        kind, _, name = history_id.partition(":")
+        tokens = name.split()
+        if not tokens:
+            return False
+        candidates = requested_by_last_name.get((kind, tokens[-1]), ())
+        return any(
+            same_actor_identity(candidate, history_id) for candidate in candidates
+        )
+
+    return members.loc[
+        members["actor_id"].map(matches_requested),
+        ["source", "member", "actor_id"],
+    ]
 
 
 def load_skill_table(
@@ -214,7 +253,12 @@ def load_skill_table(
     as_of: date | pd.Timestamp,
     actor_ids: set[str] | None = None,
 ) -> pd.DataFrame:
-    """Load canonical, matured actor outcomes without crossing ``as_of``."""
+    """Load point-in-time outcomes for exact, single-identity matches only.
+
+    Congress history includes every identity that position coalescing would
+    merge. A requested ID is validated only when that history set is exactly
+    the requested ID; compatible variants fail closed.
+    """
     from analyzer.member_ranking.buyer_scoring import _prepare_consensus_purchases
 
     cutoff = pd.Timestamp(as_of).normalize()
@@ -229,7 +273,7 @@ def load_skill_table(
     else:
         if not actor_ids:
             return pd.DataFrame(columns=_SKILL_COLUMNS)
-        selected = _load_exact_actor_members(db, cutoff, actor_ids).drop_duplicates()
+        selected = _load_actor_members(db, cutoff, actor_ids).drop_duplicates()
         source_members = tuple(
             (str(row.source), str(row.member))
             for row in selected.itertuples(index=False)
@@ -294,7 +338,26 @@ def load_skill_table(
         "WHERE ticker = ANY(?) AND date >= ? AND date < ?",
         [price_tickers, min_date, cutoff.date()],
     ).fetchdf()
-    return compute_skill_table(disclosures, prices, cutoff)
+    skill_table = compute_skill_table(disclosures, prices, cutoff)
+    if actor_ids is not None:
+        from analyzer.positions import same_actor_identity
+
+        history_ids = set(selected["actor_id"])
+        requested_ids = set(map(str, actor_ids))
+        exact_single_identity_ids = {
+            requested
+            for requested in requested_ids
+            if {
+                history
+                for history in history_ids
+                if same_actor_identity(requested, history)
+            }
+            == {requested}
+        }
+        skill_table = skill_table.loc[
+            skill_table["actor_id"].isin(exact_single_identity_ids)
+        ]
+    return skill_table
 
 
 def compute_actor_weights(
@@ -352,6 +415,14 @@ def weights_for_candidates(
             )
         )
     )
+    candidate_identities: dict[str, set[str]] = {}
+    for _, row in candidates.iterrows():
+        key = str(row["actor_id"])
+        original = row.get("_pre_coalesced_actor_id", key)
+        if pd.isna(original):
+            original = key
+        candidate_identities.setdefault(key, set()).add(str(original))
+
     skill_table = pd.DataFrame(columns=_SKILL_COLUMNS)
     if actors:
         cutoff = pd.Timestamp(as_of).normalize()
@@ -366,6 +437,13 @@ def weights_for_candidates(
             )
             if skill_table_cache is not None:
                 skill_table_cache[key] = skill_table
+    # A coalesced event keeps its original ID. Skill cannot cross that rewrite.
+    exact_candidates = {
+        actor
+        for actor, identities in candidate_identities.items()
+        if identities == {actor}
+    }
+    skill_table = skill_table.loc[skill_table["actor_id"].isin(exact_candidates)]
     return compute_actor_weights(candidates, skill_table)
 
 

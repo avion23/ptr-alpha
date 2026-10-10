@@ -210,6 +210,109 @@ def test_accented_surname_skill_history_is_found(tmp_path):
     assert weights["congress:NYDIA VELAZQUEZ"] == SOURCE_PRIORS["house_pdf"]
 
 
+@pytest.mark.parametrize(
+    ("member", "kind", "source"),
+    [("SØRENSEN", "congress", "house_pdf"), ("Weiß", "officer", "form4")],
+)
+def test_unicode_actor_id_normalization_matches_history_prefilter(
+    tmp_path, member, kind, source
+):
+    from analyzer.actors import weights_for_candidates
+
+    db = Database(tmp_path / f"unicode-{kind}.duckdb")
+    _insert_positive_skill_history(db, member, source, ("AAPL", "MSFT", "GOOG"))
+    candidates = pd.DataFrame(
+        [{"actor_id": actor_id(kind, member), "kind": kind, "source": source}]
+    )
+
+    try:
+        weights = weights_for_candidates(db, candidates, pd.Timestamp("2024-05-01"))
+    finally:
+        db.close()
+
+    assert weights[actor_id(kind, member)] == SOURCE_PRIORS[source]
+
+
+def test_coalesced_john_andrew_zts_event_does_not_inherit_john_alan_skill(tmp_path):
+    from analyzer import positions
+    from analyzer.actors import weights_for_candidates
+
+    db = Database(tmp_path / "andrew-alan-zts.duckdb")
+    _insert_positive_skill_history(db, "John Alan Smith", "house_pdf", ("ZTS",) * 3)
+    held = pd.DataFrame(
+        [
+            {
+                "ticker": "ZTS",
+                "actor_id": actor_id("congress", "John Alan Smith"),
+                "kind": "congress",
+                "source": "house_pdf",
+                "position_evidence": True,
+            }
+        ]
+    )
+    events = pd.DataFrame(
+        [
+            {
+                "ticker": "ZTS",
+                "actor_id": actor_id("congress", "John Andrew Smith"),
+                "kind": "congress",
+                "source": "house_pdf",
+                "position_evidence": False,
+            }
+        ]
+    )
+
+    try:
+        coalesced = positions.coalesce_actor_variants(events, held)
+        candidates = pd.concat([held, coalesced], ignore_index=True)
+        weights = weights_for_candidates(
+            db, candidates, pd.Timestamp("2024-05-01")
+        )
+    finally:
+        db.close()
+
+    assert coalesced.iloc[0]["actor_id"] == actor_id("congress", "John Alan Smith")
+    assert weights[actor_id("congress", "John Alan Smith")] == pytest.approx(0.26)
+
+
+def _insert_positive_skill_history(db, member, source, tickers):
+    disclosures = [
+        pd.Timestamp("2023-01-03") + pd.Timedelta(days=index)
+        for index in range(len(tickers))
+    ]
+    db.conn.executemany(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, owner_code, amount_raw, amount_midpoint, source
+        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, ?)
+        """,
+        [
+            (
+                f"{source}-{member}-{index}",
+                member,
+                ticker,
+                day.date(),
+                day.date(),
+                source,
+            )
+            for index, (ticker, day) in enumerate(zip(tickers, disclosures))
+        ],
+    )
+    prices = {}
+    for ticker, disclosed in zip(tickers, disclosures):
+        entry = next_nyse_session(disclosed).date()
+        exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).date()
+        prices[(ticker, entry)] = 100.0
+        prices[(ticker, exit_date)] = 120.0
+        prices[("SPY", entry)] = 100.0
+        prices[("SPY", exit_date)] = 110.0
+    db.conn.executemany(
+        "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+        [(ticker, day, close) for (ticker, day), close in prices.items()],
+    )
+
+
 def test_single_actor_skill_history_query_returns_only_matching_rows(tmp_path, monkeypatch):
     from analyzer.actors import load_skill_table
 

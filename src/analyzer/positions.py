@@ -372,11 +372,13 @@ def build_positions(
                     ineligible_for_band_tolerance.discard(estimate_key)
                 first_buy.setdefault(key, day)
                 continue
+            sale_estimate_value = None
+            sale_band_ineligible = False
             filed = _filed_lot(row)
             if filed is not None:
                 to_relieve = filed[0]
                 if congress_estimate:
-                    ineligible_for_band_tolerance.add(estimate_key)
+                    sale_band_ineligible = True
             else:
                 entry = entry_close(history, day, as_of)
                 size, by_floor = _size(row)
@@ -386,18 +388,12 @@ def build_positions(
                 to_relieve = size / entry
                 if congress_estimate:
                     if by_floor:
-                        ineligible_for_band_tolerance.add(estimate_key)
+                        sale_band_ineligible = True
                     else:
-                        estimate = band_estimates.setdefault(key, {}).setdefault(
-                            account,
-                            {
-                                "bought_value": 0.0,
-                                "sold_value": 0.0,
-                                "bought_shares": 0.0,
-                            },
-                        )
-                        estimate["sold_value"] += size
+                        sale_estimate_value = size
             queue = lots.setdefault(key, [])
+            sale_shares = to_relieve
+            relieved_by_account: dict[str | None, float] = {}
             index = 0
             while to_relieve > 0 and index < len(queue):
                 lot = queue[index]
@@ -405,6 +401,10 @@ def build_positions(
                     index += 1
                     continue
                 lot_shares, lot_cost = lot[0], lot[1]
+                relieved_shares = min(lot_shares, to_relieve)
+                relieved_by_account[lot[4]] = (
+                    relieved_by_account.get(lot[4], 0.0) + relieved_shares
+                )
                 if lot_shares <= to_relieve:
                     to_relieve -= lot_shares
                     queue.pop(index)
@@ -413,6 +413,17 @@ def build_positions(
                     lot[0] = lot_shares - to_relieve
                     lot[1] = lot_cost * (1 - fraction)
                     to_relieve = 0
+            if congress_estimate and sale_shares > 0:
+                for relieved_account, relieved_shares in relieved_by_account.items():
+                    relieved_key = (key, relieved_account)
+                    if sale_band_ineligible:
+                        ineligible_for_band_tolerance.add(relieved_key)
+                        continue
+                    estimate = band_estimates.get(key, {}).get(relieved_account)
+                    if estimate is not None and sale_estimate_value is not None:
+                        estimate["sold_value"] += (
+                            sale_estimate_value * relieved_shares / sale_shares
+                        )
             first_buy.setdefault(key, day)
         else:
             ignored_exchanges += 1
@@ -424,7 +435,7 @@ def build_positions(
             if estimate_key in ineligible_for_band_tolerance:
                 continue
             shares = sum(
-                lot[0] for lot in queue if account is None or lot[4] == account
+                lot[0] for lot in queue if lot[4] == account
             )
             bought_value = estimate["bought_value"]
             sold_value = estimate["sold_value"]
@@ -437,10 +448,7 @@ def build_positions(
                 # Midpoint dollars and market-close prices only estimate shares.
                 # Close congressional dust only when both notional and share
                 # totals agree; this leaves material trims open.
-                if account is None:
-                    queue.clear()
-                else:
-                    queue[:] = [lot for lot in queue if lot[4] != account]
+                queue[:] = [lot for lot in queue if lot[4] != account]
         shares = sum(lot[0] for lot in queue)
         cost = sum(lot[1] for lot in queue)
         if shares <= 0 or cost <= 0:

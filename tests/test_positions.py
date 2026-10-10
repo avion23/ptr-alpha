@@ -61,6 +61,10 @@ class TestEntryClose(unittest.TestCase):
             entry_close(frame, date(2026, 1, 3)), 101.0
         )
 
+    def test_nonfinite_entry_close_is_rejected(self):
+        frame = _prices([date(2026, 1, 2)], [float("inf")])
+        self.assertIsNone(entry_close(frame, date(2026, 1, 2)))
+
     def test_distant_bar_does_not_manufacture_basis(self):
         frame = _prices([date(2026, 1, 29)], [200.0])
         self.assertIsNone(entry_close(frame, date(2026, 1, 4)))
@@ -889,7 +893,7 @@ class TestPositions(unittest.TestCase):
         row = candidates.iloc[0]
         self.assertAlmostEqual(row["entry_ref"], 150.0)
         self.assertEqual(row["source"], "gemini_ocr")
-        self.assertEqual(row["event_date"], date(2025, 6, 10))
+        self.assertEqual(row["event_date"], date(2025, 1, 10))
         self.assertEqual(row["disclosure_date"], date(2025, 6, 12))
 
     def test_dedupe_member_names_unites_variants(self):
@@ -922,12 +926,14 @@ class TestPositions(unittest.TestCase):
                     "actor_id": "officer:OPEN CEO",
                     "kind": "officer",
                     "entry_ref": 100.0,
+                    "event_date": date(2025, 1, 1),
                 },
                 {
                     "ticker": "T",
                     "actor_id": "officer:SHUT CEO",
                     "kind": "officer",
                     "entry_ref": 100.0,
+                    "event_date": date(2025, 1, 1),
                 },
             ]
         )
@@ -937,6 +943,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "actor_id": "officer:OPEN CEO",
                     "position_evidence": True,
+                    "event_date": date(2025, 1, 1),
                 },
             ]
         )
@@ -1144,6 +1151,207 @@ class TestPositions(unittest.TestCase):
                 )
 
                 self.assertTrue(positions.empty)
+
+    def test_actor_identity_requires_equal_full_middle_names(self):
+        from analyzer.positions import coalesce_actor_variants, same_actor_identity
+
+        alan = "congress:JOHN ALAN BURRY"
+        andrew = "congress:JOHN ANDREW BURRY"
+        self.assertFalse(same_actor_identity(alan, andrew))
+        events = pd.DataFrame([{"actor_id": andrew}])
+        held = pd.DataFrame([{"actor_id": alan, "position_evidence": True}])
+
+        self.assertEqual(
+            coalesce_actor_variants(events, held).iloc[0]["actor_id"], andrew
+        )
+
+    def test_fractional_share_fifo_closes_float_residual(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10.0,
+                    "asset_description": "0.1 shares @ $100",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 11),
+                    "amount_midpoint": 20.0,
+                    "asset_description": "0.2 shares @ $100",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2025, 1, 12),
+                    "amount_midpoint": 30.0,
+                    "asset_description": "0.3 shares @ $100",
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-01-11", "2025-01-12"],
+                [100.0, 100.0, 100.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 1, 12))
+
+        self.assertTrue(positions.empty)
+
+    def test_explicit_partial_sale_keeps_five_share_remainder(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "raw_transaction_subtype": "Sale (Partial)",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 9500.0,
+                    "source": "house_pdf",
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11"],
+                [100.0, 100.0, 100.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 6, 11))
+
+        self.assertEqual(len(positions), 1)
+        self.assertAlmostEqual(positions.iloc[0]["shares"], 5.0)
+        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 500.0)
+
+    def test_band_dust_closes_before_next_cycle_purchase(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 6, 11),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11", "2025-06-12"],
+                [100.0, 105.0, 200.0, 200.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 6, 12))
+
+        self.assertEqual(len(positions), 1)
+        self.assertAlmostEqual(positions.iloc[0]["shares"], 50.0)
+        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 10000.0)
+        self.assertAlmostEqual(positions.iloc[0]["cost_basis"], 200.0)
+
+    def test_entry_references_only_survive_for_open_position_cycle(self):
+        from analyzer.positions import gate_closed_events
+
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale Full",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 10000.0,
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 6, 11),
+                    "amount_midpoint": 10000.0,
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11", "2025-06-12"],
+                [100.0, 100.0, 50.0, 75.0],
+            )
+        }
+        position = build_positions(trades, history, as_of=date(2025, 6, 12)).iloc[0]
+        events = pd.DataFrame(
+            [
+                {
+                    "ticker": "T",
+                    "actor_id": "congress:M",
+                    "entry_ref": 100.0,
+                    "event_date": date(2025, 1, 10),
+                },
+                {
+                    "ticker": "T",
+                    "actor_id": "congress:M",
+                    "entry_ref": 50.0,
+                    "event_date": date(2025, 6, 11),
+                },
+            ]
+        )
+        candidates = pd.DataFrame(
+            [
+                {
+                    "ticker": "T",
+                    "actor_id": "congress:M",
+                    "position_evidence": True,
+                    "event_date": position["first_buy"],
+                }
+            ]
+        )
+
+        gated = gate_closed_events(events, candidates)
+
+        self.assertTrue(pd.isna(gated.iloc[0]["entry_ref"]))
+        self.assertEqual(gated.iloc[1]["entry_ref"], 50.0)
 
 
 if __name__ == "__main__":

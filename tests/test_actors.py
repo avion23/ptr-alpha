@@ -271,8 +271,10 @@ def test_coalesced_john_andrew_zts_event_does_not_inherit_john_alan_skill(tmp_pa
     finally:
         db.close()
 
-    assert coalesced.iloc[0]["actor_id"] == actor_id("congress", "John Alan Smith")
-    assert weights[actor_id("congress", "John Alan Smith")] == pytest.approx(0.26)
+    assert (
+        coalesced.iloc[0]["actor_id"] == actor_id("congress", "John Andrew Smith")
+        and weights[actor_id("congress", "John Andrew Smith")] == pytest.approx(0.26)
+    )
 
 
 def _insert_positive_skill_history(db, member, source, tickers):

@@ -31,6 +31,7 @@ _OPTION_MARKERS = frozenset({"option", "call", "put", "stock option"})
 _CONGRESS_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
 # Dollar-band / close-price share estimates can leave small FIFO dust.
 _POSITION_ESTIMATE_TOLERANCE = 0.10
+_SHARE_EPSILON = 1e-9
 
 
 class PositionsError(Exception):
@@ -50,19 +51,24 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
 
     gated = events.copy()
     gated["blocked_reason"] = None
-    open_positions = set()
+    open_positions = {}
     if {"ticker", "actor_id", "position_evidence"}.issubset(candidates.columns):
         open_rows = candidates.loc[candidates["position_evidence"].eq(True)]
-        open_positions.update(
-            zip(
-                open_rows["ticker"].astype("string").str.upper(),
-                open_rows["actor_id"].astype(str),
-            )
-        )
+        for _, position in open_rows.iterrows():
+            key = (str(position["ticker"]).upper(), str(position["actor_id"]))
+            open_positions[key] = position.get("event_date")
 
     for index, row in gated.iterrows():
         key = (str(row["ticker"]).upper(), str(row["actor_id"]))
-        if key not in open_positions:
+        position_start = open_positions.get(key)
+        event_date = row.get("event_date")
+        if (
+            position_start is None
+            or pd.isna(position_start)
+            or event_date is None
+            or pd.isna(event_date)
+            or pd.Timestamp(event_date).date() < pd.Timestamp(position_start).date()
+        ):
             gated.at[index, "entry_ref"] = None
             gated.at[index, "blocked_reason"] = "no open position at as_of"
     return gated
@@ -111,7 +117,7 @@ def entry_close(
     if (bar_day - day).days > 7:
         return None
     price = float(closes.iloc[0])
-    return price if price > 0 else None
+    return price if math.isfinite(price) and price > 0 else None
 
 
 def _current_close(prices: pd.DataFrame, as_of: date) -> float | None:
@@ -130,6 +136,16 @@ def _is_full_sale(kind: str, subtype) -> bool:
             continue
         normalized = re.sub(r"[^a-z]", "", str(value).lower())
         if normalized in {"salefull", "fullsale"}:
+            return True
+    return False
+
+
+def _is_partial_sale(kind: str, subtype) -> bool:
+    for value in (kind, subtype):
+        if value is None or pd.isna(value):
+            continue
+        normalized = re.sub(r"[^a-z]", "", str(value).lower())
+        if normalized in {"salepartial", "partialsale"}:
             return True
     return False
 
@@ -174,7 +190,6 @@ def build_positions(
         raise PositionsError("trades need amount_midpoint or amount_raw for sizing")
 
     lots: dict[tuple[str, str], list] = {}
-    first_buy: dict[tuple[str, str], date] = {}
     last_activity: dict[tuple[str, str], date] = {}
     floor_sized: dict[tuple[str, str], int] = {}
     band_estimates: dict[tuple[str, str], dict[str | None, dict[str, float]]] = {}
@@ -287,6 +302,9 @@ def build_positions(
         full_sale = _is_full_sale(
             kind, row.raw_transaction_subtype if has_subtype else None
         )
+        partial_sale = _is_partial_sale(
+            kind, row.raw_transaction_subtype if has_subtype else None
+        )
         account = _owner_account(
             row.owner_code if "owner_code" in trades.columns else None
         )
@@ -338,11 +356,10 @@ def build_positions(
                         estimate["bought_value"] += size
                         estimate["bought_shares"] += shares
             lots.setdefault(key, []).append(
-                [shares, size, disclosure_day, source, account]
+                [shares, size, disclosure_day, source, account, day]
             )
             if by_floor:
                 floor_sized[key] = floor_sized.get(key, 0) + 1
-            first_buy.setdefault(key, day)
         elif kind in _SELL_TYPES or full_sale:
             if full_sale:
                 # A full sale closes the position regardless of the filed
@@ -370,7 +387,6 @@ def build_positions(
                         if not estimates:
                             band_estimates.pop(key)
                     ineligible_for_band_tolerance.discard(estimate_key)
-                first_buy.setdefault(key, day)
                 continue
             sale_estimate_value = None
             sale_band_ineligible = False
@@ -405,14 +421,19 @@ def build_positions(
                 relieved_by_account[lot[4]] = (
                     relieved_by_account.get(lot[4], 0.0) + relieved_shares
                 )
-                if lot_shares <= to_relieve:
-                    to_relieve -= lot_shares
+                if lot_shares <= to_relieve + _SHARE_EPSILON:
+                    to_relieve = max(0.0, to_relieve - lot_shares)
                     queue.pop(index)
                 else:
                     fraction = to_relieve / lot_shares
-                    lot[0] = lot_shares - to_relieve
-                    lot[1] = lot_cost * (1 - fraction)
+                    remaining_shares = lot_shares - to_relieve
+                    if abs(remaining_shares) <= _SHARE_EPSILON:
+                        queue.pop(index)
+                    else:
+                        lot[0] = remaining_shares
+                        lot[1] = lot_cost * (1 - fraction)
                     to_relieve = 0
+            queue[:] = [lot for lot in queue if abs(lot[0]) > _SHARE_EPSILON]
             if congress_estimate and sale_shares > 0:
                 for relieved_account, relieved_shares in relieved_by_account.items():
                     relieved_key = (key, relieved_account)
@@ -425,42 +446,56 @@ def build_positions(
                                 sale_estimate_value * relieved_shares / sale_shares
                             )
                     if not any(lot[4] == relieved_account for lot in queue):
-                        # These band totals describe one open holding cycle.
-                        # Do not carry clipped sale value into later purchases.
                         estimates = band_estimates.get(key)
                         if estimates is not None:
                             estimates.pop(relieved_account, None)
                             if not estimates:
                                 band_estimates.pop(key)
                         ineligible_for_band_tolerance.discard(relieved_key)
-            first_buy.setdefault(key, day)
+            if not partial_sale:
+                for estimate_account, estimate in list(
+                    band_estimates.get(key, {}).items()
+                ):
+                    estimate_key = (key, estimate_account)
+                    if estimate_key in ineligible_for_band_tolerance:
+                        continue
+                    remaining_shares = sum(
+                        lot[0] for lot in queue if lot[4] == estimate_account
+                    )
+                    if (
+                        estimate["bought_value"] > 0
+                        and estimate["sold_value"]
+                        >= estimate["bought_value"]
+                        * (1 - _POSITION_ESTIMATE_TOLERANCE)
+                        and remaining_shares
+                        <= estimate["bought_shares"]
+                        * _POSITION_ESTIMATE_TOLERANCE
+                    ):
+                        queue[:] = [
+                            lot for lot in queue if lot[4] != estimate_account
+                        ]
+                        band_estimates[key].pop(estimate_account)
+                        ineligible_for_band_tolerance.discard(estimate_key)
+                        if not band_estimates[key]:
+                            band_estimates.pop(key)
+            if not queue:
+                band_estimates.pop(key, None)
+                ineligible_for_band_tolerance.difference_update(
+                    {
+                        candidate
+                        for candidate in ineligible_for_band_tolerance
+                        if candidate[0] == key
+                    }
+                )
         else:
             ignored_exchanges += 1
 
     records = []
     for key, queue in lots.items():
-        for account, estimate in band_estimates.get(key, {}).items():
-            estimate_key = (key, account)
-            if estimate_key in ineligible_for_band_tolerance:
-                continue
-            shares = sum(
-                lot[0] for lot in queue if lot[4] == account
-            )
-            bought_value = estimate["bought_value"]
-            sold_value = estimate["sold_value"]
-            bought_shares = estimate["bought_shares"]
-            if (
-                bought_value > 0
-                and sold_value >= bought_value * (1 - _POSITION_ESTIMATE_TOLERANCE)
-                and shares <= bought_shares * _POSITION_ESTIMATE_TOLERANCE
-            ):
-                # Midpoint dollars and market-close prices only estimate shares.
-                # Close congressional dust only when both notional and share
-                # totals agree; this leaves material trims open.
-                queue[:] = [lot for lot in queue if lot[4] != account]
+        queue[:] = [lot for lot in queue if abs(lot[0]) > _SHARE_EPSILON]
         shares = sum(lot[0] for lot in queue)
         cost = sum(lot[1] for lot in queue)
-        if shares <= 0 or cost <= 0:
+        if shares <= _SHARE_EPSILON or cost <= 0:
             continue
         history = price_history[key[1]]
         current = _current_close(history, as_of)
@@ -477,7 +512,7 @@ def build_positions(
                 "cost_basis": basis,
                 "current_price": current,
                 "discount_pct": (current / basis - 1) * 100,
-                "first_buy": first_buy[key],
+                "first_buy": min(lot[5] for lot in queue),
                 "last_activity": last_activity[key],
                 "disclosure_date": max(lot[2] for lot in queue),
                 "source": queue[-1][3],
@@ -593,7 +628,7 @@ def holdings_candidates(
                         if congress_position and source != "13f"
                         else None
                     ),
-                    "event_date": position.last_activity,
+                    "event_date": position.first_buy,
                     "disclosure_date": position.disclosure_date,
                     "corroboration": False,
                     "position_evidence": True,
@@ -678,8 +713,26 @@ def same_actor_identity(first: str, candidate: str) -> bool:
     return (
         first_kind == candidate_kind == "congress"
         and bool(first_name and candidate_name)
-        and same_member_identity(first_name, candidate_name)
+        and _same_actor_member(first_name, candidate_name)
     )
+
+
+def _same_actor_member(first: str, candidate: str) -> bool:
+    first_key = canonical_member_key(first)
+    candidate_key = canonical_member_key(candidate)
+    first_tokens = first_key.split()
+    candidate_tokens = candidate_key.split()
+    if first_key == candidate_key:
+        return True
+    if len(first_tokens) < 2 or len(candidate_tokens) < 2:
+        return False
+    if first_tokens[-1] != candidate_tokens[-1]:
+        return False
+    if not _same_person(first_tokens[0].lower(), candidate_tokens[0].lower()):
+        return False
+    first_middle = first_tokens[1:-1]
+    candidate_middle = candidate_tokens[1:-1]
+    return not first_middle or not candidate_middle or first_middle == candidate_middle
 
 
 def coalesce_actor_variants(events: pd.DataFrame, from_positions: pd.DataFrame) -> pd.DataFrame:

@@ -190,14 +190,25 @@ def _latest_quote(db, ticker: str, as_of: date) -> tuple[float, date] | None:
 
 
 def _score(
-    db, ticker: str, as_of: date, candidates: pd.DataFrame, actors, setups
+    db,
+    ticker: str,
+    as_of: date,
+    candidates: pd.DataFrame,
+    actors,
+    setups,
+    skill_table_cache=None,
 ) -> tuple[object, bool, int]:
     if candidates.empty:
         return None, True, 0
     for column in ("actor_id", "kind", "source"):
         if column not in candidates:
             raise ReplayError(f"Replay candidates have no {column} column")
-    weights = actors.weights_for_candidates(db, candidates, as_of)
+    if skill_table_cache is None:
+        weights = actors.weights_for_candidates(db, candidates, as_of)
+    else:
+        weights = actors.weights_for_candidates(
+            db, candidates, as_of, skill_table_cache=skill_table_cache
+        )
     current_quote = _latest_quote(db, ticker, as_of)
     if current_quote is None:
         return None, True, len(weights)
@@ -280,6 +291,7 @@ def replay(
     *,
     horizon_days: int = 90,
     members: list[str] | None = None,
+    skill_table_cache: dict | None = None,
 ) -> pd.DataFrame:
     """Evaluate live candidates and scoring at each historical as-of date.
 
@@ -290,6 +302,7 @@ def replay(
         raise ValueError("horizon_days must be positive")
     pipeline, positions, actors, setups = _load_dependencies()
     selected_members = list(_V1_MEMBERS if members is None else members)
+    skill_table_cache = {} if skill_table_cache is None else skill_table_cache
     rows = []
     for raw_ticker in tickers:
         ticker = str(raw_ticker).strip().upper()
@@ -301,7 +314,13 @@ def replay(
                 db, ticker, as_of, selected_members, pipeline, positions
             )
             score_value, blocked, n_actors = _score(
-                db, ticker, as_of, candidates, actors, setups
+                db,
+                ticker,
+                as_of,
+                candidates,
+                actors,
+                setups,
+                skill_table_cache,
             )
             fwd_return = _price_return(db, ticker, as_of, horizon_days)
             spy_return = _benchmark_return(db, as_of, horizon_days)

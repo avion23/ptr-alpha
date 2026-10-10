@@ -50,7 +50,7 @@ def _install_scoring(monkeypatch, events):
                 same_member_identity=positions.same_member_identity,
             ),
             SimpleNamespace(
-                weights_for_candidates=lambda db, candidates, as_of: {
+                weights_for_candidates=lambda db, candidates, as_of, **kwargs: {
                     str(actor_id): 0.6
                     for actor_id in candidates["actor_id"].dropna().unique()
                 }

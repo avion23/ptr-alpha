@@ -9,6 +9,8 @@ from analyzer.actors import (
     compute_skill_table,
     compute_weight,
 )
+from analyzer.database import Database
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
 
 
 @pytest.mark.parametrize(
@@ -101,3 +103,125 @@ def test_actor_id_uses_kind_specific_name_normalization():
     assert actor_id("congress", "Dr. Michael T. McCaul Jr.") == "congress:MICHAEL T MCCAUL"
     assert actor_id("officer", "  Jane   DOE ") == "officer:JANE DOE"
     assert actor_id("manager", "  Jane   DOE ") == "manager:JANE DOE"
+
+
+def test_mccaul_skill_follows_middle_initial_name_variant(tmp_path):
+    from analyzer.actors import weights_for_candidates
+
+    db = Database(tmp_path / "mccaul.duckdb")
+    disclosures = [pd.Timestamp("2023-01-03") + pd.Timedelta(days=day) for day in range(3)]
+    db.conn.executemany(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, owner_code, amount_raw, amount_midpoint, source
+        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf')
+        """,
+        [
+            (f"mccaul-{index}", "Michael T. McCaul", ticker, day.date(), day.date())
+            for index, (ticker, day) in enumerate(zip(("AAPL", "MSFT", "GOOG"), disclosures))
+        ],
+    )
+    prices = {}
+    for ticker, disclosed in zip(("AAPL", "MSFT", "GOOG"), disclosures):
+        entry = next_nyse_session(disclosed).date()
+        exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).date()
+        prices[(ticker, entry)] = 100.0
+        prices[(ticker, exit_date)] = 120.0
+        prices[("SPY", entry)] = 100.0
+        prices[("SPY", exit_date)] = 110.0
+    db.conn.executemany(
+        "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+        [(ticker, day, close) for (ticker, day), close in prices.items()],
+    )
+    candidates = pd.DataFrame(
+        [{"actor_id": "congress:MICHAEL MCCAUL", "kind": "congress", "source": "house_pdf"}]
+    )
+
+    try:
+        weights = weights_for_candidates(db, candidates, pd.Timestamp("2024-05-01"))
+    finally:
+        db.close()
+
+    assert weights["congress:MICHAEL MCCAUL"] == SOURCE_PRIORS["house_pdf"]
+
+
+def test_single_actor_skill_history_query_returns_only_matching_rows(tmp_path, monkeypatch):
+    from analyzer.actors import load_skill_table
+
+    db = Database(tmp_path / "bounded-skill-history.duckdb")
+    records = [
+        ("target", "Target Member", "AAPL", "house_pdf"),
+        *[
+            (f"other-{index}", f"Other Member {index}", "MSFT", "house_pdf")
+            for index in range(500)
+        ],
+    ]
+    db.conn.executemany(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, owner_code, amount_raw, amount_midpoint, source
+        ) VALUES (?, ?, ?, DATE '2023-01-01', DATE '2023-01-02',
+                  'Purchase', '', '$1,001 - $15,000', 8000, ?)
+        """,
+        records,
+    )
+    fetched_rows = []
+    get_skill_history = db.transactions.get_skill_history
+
+    def record_query_rows(*args):
+        result = get_skill_history(*args)
+        fetched_rows.append(len(result))
+        return result
+
+    monkeypatch.setattr(db.transactions, "get_skill_history", record_query_rows)
+
+    try:
+        load_skill_table(
+            db,
+            pd.Timestamp("2024-01-01"),
+            {"congress:TARGET MEMBER"},
+        )
+    finally:
+        db.close()
+
+    assert fetched_rows == [1]
+
+
+def test_weight_lookup_cache_reuses_skill_table(monkeypatch):
+    import analyzer.actors as actors
+
+    calls = []
+    monkeypatch.setattr(
+        actors,
+        "load_skill_table",
+        lambda db, as_of, actor_ids: calls.append((as_of, actor_ids))
+        or pd.DataFrame(columns=["actor_id", "n_matured", "mean_excess_pct"]),
+    )
+    candidates = pd.DataFrame(
+        [{"actor_id": "congress:ALICE", "kind": "congress", "source": "house_pdf"}]
+    )
+    cache = {}
+
+    actors.weights_for_candidates("db", candidates, pd.Timestamp("2024-01-01"), skill_table_cache=cache)
+    actors.weights_for_candidates("db", candidates, pd.Timestamp("2024-01-01"), skill_table_cache=cache)
+
+    assert len(calls) == 1
+
+
+def test_zero_prior_actor_skips_skill_history(monkeypatch):
+    import analyzer.actors as actors
+
+    monkeypatch.setattr(
+        actors,
+        "load_skill_table",
+        lambda *_args: pytest.fail("zero-prior 13F actor loaded skill history"),
+    )
+    candidates = pd.DataFrame(
+        [{"actor_id": "manager:ALICE", "kind": "manager", "source": "13f"}]
+    )
+
+    assert actors.weights_for_candidates(None, candidates, pd.Timestamp("2024-01-01")) == {
+        "manager:ALICE": 0.0
+    }

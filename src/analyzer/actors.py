@@ -165,25 +165,84 @@ def load_skill_table(
     cutoff = pd.Timestamp(as_of).normalize()
     if cutoff.date() <= date.min:
         return pd.DataFrame(columns=_SKILL_COLUMNS)
-    trades = db.get_transactions_by_date_range(
-        date.min,
-        (cutoff - pd.Timedelta(days=1)).date(),
-    )
-    if trades.empty:
-        return pd.DataFrame(columns=_SKILL_COLUMNS)
-    trades = trades.loc[trades["source"].isin(_SKILL_SOURCES)].copy()
-    if trades.empty:
-        return pd.DataFrame(columns=_SKILL_COLUMNS)
-    if actor_ids is not None:
-        trades = trades.loc[
-            [
-                isinstance(member, str)
-                and actor_id(_SOURCE_KINDS[source], member) in actor_ids
-                for source, member in zip(trades["source"], trades["member"])
-            ]
-        ].copy()
-        if trades.empty:
+    if actor_ids is None:
+        trades = db.get_transactions_by_date_range(
+            date.min,
+            (cutoff - pd.Timedelta(days=1)).date(),
+            sources=tuple(sorted(_SKILL_SOURCES)),
+        )
+    else:
+        if not actor_ids:
             return pd.DataFrame(columns=_SKILL_COLUMNS)
+        from analyzer.positions import same_actor_identity
+
+        requested = _coalesce_actor_ids(
+            pd.DataFrame({"actor_id": sorted(map(str, actor_ids))}),
+            sorted(map(str, actor_ids)),
+        )
+        representatives = list(dict.fromkeys(requested["actor_id"].astype(str)))
+        last_names = set()
+        for value in representatives:
+            _, separator, name = value.partition(":")
+            if not separator:
+                continue
+            tokens = canonical_member_key(name).split()
+            if tokens:
+                last_names.add(tokens[-1])
+        last_names = sorted(last_names)
+        if not last_names:
+            return pd.DataFrame(columns=_SKILL_COLUMNS)
+        name_clause = " OR ".join("UPPER(member) LIKE ?" for _ in last_names)
+        member_rows = db.conn.execute(
+            "SELECT DISTINCT source, member FROM canonical_transactions "
+            "WHERE disclosure_date < ? AND source IN (?, ?, ?, ?) AND ("
+            + name_clause
+            + ") "
+            "AND member IS NOT NULL ORDER BY source, member",
+            [
+                cutoff.date(),
+                *sorted(_SKILL_SOURCES),
+                *(f"%{name}%" for name in last_names),
+            ],
+        ).fetchall()
+        if not member_rows:
+            return pd.DataFrame(columns=_SKILL_COLUMNS)
+        aliases = pd.DataFrame(member_rows, columns=["source", "member"])
+        aliases = aliases.loc[
+            aliases["source"].isin(_SOURCE_KINDS)
+            & aliases["member"].map(lambda member: isinstance(member, str))
+        ].copy()
+        if aliases.empty:
+            return pd.DataFrame(columns=_SKILL_COLUMNS)
+        aliases["actor_id"] = [
+            actor_id(_SOURCE_KINDS[source], member)
+            for source, member in aliases[["source", "member"]].itertuples(
+                index=False, name=None
+            )
+        ]
+        aliases = aliases.loc[
+            aliases["actor_id"].map(
+                lambda alias: any(
+                    same_actor_identity(representative, alias)
+                    for representative in representatives
+                )
+            )
+        ].copy()
+        if aliases.empty:
+            return pd.DataFrame(columns=_SKILL_COLUMNS)
+        aliases = _coalesce_actor_ids(aliases, representatives)
+        selected = aliases.loc[
+            aliases["actor_id"].isin(representatives), ["source", "member"]
+        ].drop_duplicates()
+        source_members = tuple(
+            (str(row.source), str(row.member))
+            for row in selected.itertuples(index=False)
+        )
+        if not source_members:
+            return pd.DataFrame(columns=_SKILL_COLUMNS)
+        trades = db.transactions.get_skill_history(cutoff.date(), source_members)
+    if trades.empty:
+        return pd.DataFrame(columns=_SKILL_COLUMNS)
 
     purchases = _prepare_consensus_purchases(trades)
     if purchases.empty:
@@ -228,9 +287,15 @@ def load_skill_table(
     if not rows:
         return pd.DataFrame(columns=_SKILL_COLUMNS)
 
-    disclosures = pd.DataFrame(rows).drop_duplicates(
-        ["actor_id", "ticker", "disclosure_date"]
+    disclosures = pd.DataFrame(rows)
+    disclosure_representatives = (
+        representatives
+        if actor_ids is not None
+        else disclosures["actor_id"].dropna().astype(str)
     )
+    disclosures = _coalesce_actor_ids(
+        disclosures, disclosure_representatives
+    ).drop_duplicates(["actor_id", "ticker", "disclosure_date"])
     price_tickers = sorted(set(disclosures["ticker"]) | {"SPY"})
     min_date = min(
         next_nyse_session(day).normalize()
@@ -258,6 +323,7 @@ def compute_actor_weights(
     ):
         raise ValueError("skill_table must have actor_id, n_matured, mean_excess_pct")
 
+    normalized_candidates = _coalesce_candidate_variants(candidates)
     validated = {
         str(row.actor_id)
         for row in skill_table.itertuples(index=False)
@@ -265,22 +331,65 @@ def compute_actor_weights(
         and math.isfinite(float(row.mean_excess_pct))
         and float(row.mean_excess_pct) > 0
     }
-    weights: dict[str, float] = {}
-    for row in candidates.itertuples(index=False):
+    identity_weights: dict[str, float] = {}
+    for row in normalized_candidates.itertuples(index=False):
         key = str(row.actor_id)
-        if key in weights:
+        if key in identity_weights:
             continue
         multiplier = 1.0 if key in validated else UNKNOWN_SKILL_MULTIPLIER
-        weights[key] = compute_weight(str(row.kind), 0, 0.0, str(row.source)) * multiplier
-    return weights
+        identity_weights[key] = (
+            compute_weight(str(row.kind), 0, 0.0, str(row.source)) * multiplier
+        )
+    return {
+        str(original.actor_id): identity_weights[str(normalized.actor_id)]
+        for original, normalized in zip(
+            candidates.itertuples(index=False),
+            normalized_candidates.itertuples(index=False),
+            strict=True,
+        )
+    }
+
+
+def _coalesce_actor_ids(events: pd.DataFrame, actor_ids) -> pd.DataFrame:
+    """Map event IDs to candidate representatives with the position identity rule."""
+    from analyzer.positions import coalesce_actor_variants
+
+    representatives = list(dict.fromkeys(map(str, actor_ids)))
+    positions = pd.DataFrame(
+        {"actor_id": representatives, "position_evidence": True}
+    )
+    return coalesce_actor_variants(events.copy().reset_index(drop=True), positions)
+
+
+def _coalesce_candidate_variants(candidates: pd.DataFrame) -> pd.DataFrame:
+    return _coalesce_actor_ids(candidates, candidates["actor_id"].dropna().astype(str))
 
 
 def weights_for_candidates(
-    db, candidates: pd.DataFrame, as_of: date | pd.Timestamp
+    db,
+    candidates: pd.DataFrame,
+    as_of: date | pd.Timestamp,
+    *,
+    skill_table_cache: dict[tuple[pd.Timestamp, tuple[str, ...]], pd.DataFrame]
+    | None = None,
 ) -> dict[str, float]:
     """Shared point-in-time weight path for live setups and historical replay."""
-    actors = set(candidates["actor_id"].dropna().astype(str))
-    return compute_actor_weights(candidates, load_skill_table(db, as_of, actors))
+    normalized = _coalesce_candidate_variants(candidates)
+    nonzero_prior = normalized["source"].map(
+        lambda source: SOURCE_PRIORS.get(str(source)) is not None
+    )
+    actors = tuple(sorted(set(normalized.loc[nonzero_prior, "actor_id"].astype(str))))
+    skill_table = pd.DataFrame(columns=_SKILL_COLUMNS)
+    if actors:
+        cutoff = pd.Timestamp(as_of).normalize()
+        key = (cutoff, actors)
+        if skill_table_cache is not None and key in skill_table_cache:
+            skill_table = skill_table_cache[key]
+        else:
+            skill_table = load_skill_table(db, cutoff, set(actors))
+            if skill_table_cache is not None:
+                skill_table_cache[key] = skill_table
+    return compute_actor_weights(candidates, skill_table)
 
 
 def age_weight(days_old: int, half_life_days: int = 365) -> float:

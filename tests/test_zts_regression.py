@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from analyzer import actors, cli, pipeline, positions, replay, setups
+from analyzer.transaction_repository import TransactionRepository
 
 JUNE_30 = date(2026, 6, 30)
 JULY_31 = date(2026, 7, 31)
@@ -52,6 +53,7 @@ _TRANSACTION_COLUMNS = (
 class _MemoryDB:
     def __init__(self, transactions, prices):
         self.conn = duckdb.connect(":memory:")
+        self.conn.execute("CREATE SEQUENCE tx_id_seq START 1")
         self.conn.execute(
             "CREATE TABLE prices (ticker VARCHAR, date DATE, close DOUBLE)"
         )
@@ -59,6 +61,7 @@ class _MemoryDB:
         self.conn.execute(
             """
             CREATE TABLE canonical_transactions (
+                id INTEGER DEFAULT nextval('tx_id_seq'),
                 member VARCHAR, ticker VARCHAR, transaction_type VARCHAR,
                 transaction_date DATE, disclosure_date DATE,
                 amount_midpoint DOUBLE, amount_raw VARCHAR, source VARCHAR,
@@ -71,7 +74,9 @@ class _MemoryDB:
         )
         if transactions:
             self.conn.executemany(
-                "INSERT INTO canonical_transactions VALUES ("
+                "INSERT INTO canonical_transactions ("
+                + ", ".join(_TRANSACTION_COLUMNS)
+                + ") VALUES ("
                 + ", ".join("?" * len(_TRANSACTION_COLUMNS))
                 + ")",
                 [
@@ -79,6 +84,7 @@ class _MemoryDB:
                     for row in transactions
                 ],
             )
+        self.transactions = TransactionRepository(self.conn)
 
     def get_transactions_by_date_range(self, start_date, end_date):
         return self.conn.execute(

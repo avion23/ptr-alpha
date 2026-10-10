@@ -138,6 +138,8 @@ def _owner_account(value) -> str | None:
     if value is None or pd.isna(value):
         return None
     account = str(value).strip().upper()
+    if account in {"J", "JT"}:
+        return "JT"
     return account or None
 
 
@@ -175,8 +177,8 @@ def build_positions(
     first_buy: dict[tuple[str, str], date] = {}
     last_activity: dict[tuple[str, str], date] = {}
     floor_sized: dict[tuple[str, str], int] = {}
-    band_estimates: dict[tuple[str, str], dict[str, float]] = {}
-    ineligible_for_band_tolerance: set[tuple[str, str]] = set()
+    band_estimates: dict[tuple[str, str], dict[str | None, dict[str, float]]] = {}
+    ineligible_for_band_tolerance: set[tuple[tuple[str, str], str | None]] = set()
     member_identities: dict[str, list[str]] = {}
     member_keys: dict[str, str] = {}
     member_labels: dict[str, str] = {}
@@ -288,6 +290,7 @@ def build_positions(
         account = _owner_account(
             row.owner_code if "owner_code" in trades.columns else None
         )
+        estimate_key = (key, account)
         source = row.source if "source" in trades.columns else None
         congress_estimate = isinstance(source, str) and source in _CONGRESS_SOURCES
         if _is_option_row(row, has_instrument):
@@ -312,7 +315,7 @@ def build_positions(
                 shares, filed_price = filed
                 size, by_floor = shares * filed_price, False
                 if congress_estimate:
-                    ineligible_for_band_tolerance.add(key)
+                    ineligible_for_band_tolerance.add(estimate_key)
             else:
                 entry = entry_close(history, day, as_of)
                 size, by_floor = _size(row)
@@ -322,10 +325,10 @@ def build_positions(
                 shares = size / entry
                 if congress_estimate:
                     if by_floor:
-                        ineligible_for_band_tolerance.add(key)
+                        ineligible_for_band_tolerance.add(estimate_key)
                     else:
-                        estimate = band_estimates.setdefault(
-                            key,
+                        estimate = band_estimates.setdefault(key, {}).setdefault(
+                            account,
                             {
                                 "bought_value": 0.0,
                                 "sold_value": 0.0,
@@ -351,20 +354,29 @@ def build_positions(
                     lots[key] = []
                 else:
                     lots[key] = [lot for lot in lots.get(key, []) if lot[4] != account]
-                band_estimates.pop(key, None)
-                if lots[key]:
-                    # Aggregate estimates no longer describe the surviving
-                    # account lots, so they cannot safely close their dust.
-                    ineligible_for_band_tolerance.add(key)
+                if account is None:
+                    band_estimates.pop(key, None)
+                    ineligible_for_band_tolerance.difference_update(
+                        {
+                            candidate
+                            for candidate in ineligible_for_band_tolerance
+                            if candidate[0] == key
+                        }
+                    )
                 else:
-                    ineligible_for_band_tolerance.discard(key)
+                    estimates = band_estimates.get(key)
+                    if estimates is not None:
+                        estimates.pop(account, None)
+                        if not estimates:
+                            band_estimates.pop(key)
+                    ineligible_for_band_tolerance.discard(estimate_key)
                 first_buy.setdefault(key, day)
                 continue
             filed = _filed_lot(row)
             if filed is not None:
                 to_relieve = filed[0]
                 if congress_estimate:
-                    ineligible_for_band_tolerance.add(key)
+                    ineligible_for_band_tolerance.add(estimate_key)
             else:
                 entry = entry_close(history, day, as_of)
                 size, by_floor = _size(row)
@@ -374,10 +386,10 @@ def build_positions(
                 to_relieve = size / entry
                 if congress_estimate:
                     if by_floor:
-                        ineligible_for_band_tolerance.add(key)
+                        ineligible_for_band_tolerance.add(estimate_key)
                     else:
-                        estimate = band_estimates.setdefault(
-                            key,
+                        estimate = band_estimates.setdefault(key, {}).setdefault(
+                            account,
                             {
                                 "bought_value": 0.0,
                                 "sold_value": 0.0,
@@ -407,9 +419,13 @@ def build_positions(
 
     records = []
     for key, queue in lots.items():
-        shares = sum(lot[0] for lot in queue)
-        estimate = band_estimates.get(key)
-        if estimate is not None and key not in ineligible_for_band_tolerance:
+        for account, estimate in band_estimates.get(key, {}).items():
+            estimate_key = (key, account)
+            if estimate_key in ineligible_for_band_tolerance:
+                continue
+            shares = sum(
+                lot[0] for lot in queue if account is None or lot[4] == account
+            )
             bought_value = estimate["bought_value"]
             sold_value = estimate["sold_value"]
             bought_shares = estimate["bought_shares"]
@@ -421,8 +437,11 @@ def build_positions(
                 # Midpoint dollars and market-close prices only estimate shares.
                 # Close congressional dust only when both notional and share
                 # totals agree; this leaves material trims open.
-                queue.clear()
-                shares = 0.0
+                if account is None:
+                    queue.clear()
+                else:
+                    queue[:] = [lot for lot in queue if lot[4] != account]
+        shares = sum(lot[0] for lot in queue)
         cost = sum(lot[1] for lot in queue)
         if shares <= 0 or cost <= 0:
             continue

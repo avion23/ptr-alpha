@@ -67,6 +67,86 @@ class TestEntryClose(unittest.TestCase):
 
 
 class TestPositions(unittest.TestCase):
+    def test_joint_owner_full_sale_matches_j_and_jt_in_both_directions(self):
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11"],
+                [100.0, 100.0, 100.0],
+            )
+        }
+        for purchase_owner, sale_owner in (("J", "JT"), ("JT", "J")):
+            with self.subTest(purchase_owner=purchase_owner, sale_owner=sale_owner):
+                trades = pd.DataFrame(
+                    [
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Purchase",
+                            "transaction_date": date(2025, 1, 10),
+                            "amount_midpoint": 10000.0,
+                            "owner_code": purchase_owner,
+                        },
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Sale",
+                            "raw_transaction_subtype": "Sale (Full)",
+                            "transaction_date": date(2025, 6, 10),
+                            "amount_midpoint": 100.0,
+                            "owner_code": sale_owner,
+                        },
+                    ]
+                )
+
+                self.assertTrue(
+                    build_positions(trades, history, as_of=date(2025, 6, 11)).empty
+                )
+
+    def test_band_dust_cleanup_preserves_other_owners_lot(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2025, 1, 10),
+                    "amount_midpoint": 500.0,
+                    "source": "house_pdf",
+                    "owner_code": "SP",
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2025-01-10", "2025-06-10", "2025-06-11"],
+                [100.0, 100.0, 100.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 6, 11))
+
+        self.assertEqual(len(positions), 1)
+        self.assertAlmostEqual(positions.iloc[0]["shares"], 5.0)
+        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 500.0)
+
     def test_repository_normalized_full_sale_closes_only_disclosed_account(self):
         from analyzer.transaction_repository import _normalize_frame
 

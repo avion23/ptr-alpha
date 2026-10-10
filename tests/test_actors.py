@@ -105,7 +105,7 @@ def test_actor_id_uses_kind_specific_name_normalization():
     assert actor_id("manager", "  Jane   DOE ") == "manager:JANE DOE"
 
 
-def test_mccaul_skill_follows_middle_initial_name_variant(tmp_path):
+def test_mccaul_skill_matches_exact_name_variant_only(tmp_path):
     from analyzer.actors import weights_for_candidates
 
     db = Database(tmp_path / "mccaul.duckdb")
@@ -155,87 +155,9 @@ def test_mccaul_skill_follows_middle_initial_name_variant(tmp_path):
         db.close()
 
     assert weights == {
-        "congress:MICHAEL MCCAUL": SOURCE_PRIORS["house_pdf"],
+        "congress:MICHAEL MCCAUL": pytest.approx(0.26),
         "congress:MICHAEL T MCCAUL": SOURCE_PRIORS["house_pdf"],
     }
-
-
-@pytest.mark.parametrize(
-    "candidate_names",
-    [
-        ("John Smith", "John A Smith", "John B Smith"),
-        ("John Smith", "John A Smith"),
-        ("John A Smith", "John Smith"),
-    ],
-)
-def test_conflicting_middle_name_histories_do_not_merge_short_name(
-    tmp_path, candidate_names
-):
-    from analyzer.actors import weights_for_candidates
-
-    db = Database(tmp_path / "conflicting-members.duckdb")
-    members = {
-        "AAPL": "John A Smith",
-        "MSFT": "John A Smith",
-        "GOOG": "John A Smith",
-        "AMZN": "John B Smith",
-        "META": "John B Smith",
-        "NVDA": "John B Smith",
-    }
-    disclosures = [
-        pd.Timestamp("2023-01-03") + pd.Timedelta(days=day) for day in range(6)
-    ]
-    db.conn.executemany(
-        """
-        INSERT INTO transactions (
-            doc_id, member, ticker, transaction_date, disclosure_date,
-            transaction_type, owner_code, amount_raw, amount_midpoint, source
-        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf')
-        """,
-        [
-            (f"smith-{ticker}", members[ticker], ticker, day.date(), day.date())
-            for ticker, day in zip(members, disclosures)
-        ],
-    )
-    prices = {}
-    for (ticker, member), disclosed in zip(members.items(), disclosures):
-        entry = next_nyse_session(disclosed).date()
-        exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).date()
-        prices[(ticker, entry)] = 100.0
-        prices[(ticker, exit_date)] = (
-            120.0 if member == "John A Smith" else 80.0
-        )
-        prices[("SPY", entry)] = 100.0
-        prices[("SPY", exit_date)] = 100.0
-    db.conn.executemany(
-        "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
-        [(ticker, day, close) for (ticker, day), close in prices.items()],
-    )
-    candidates = pd.DataFrame(
-        [
-            {
-                "actor_id": actor_id("congress", name),
-                "kind": "congress",
-                "source": "house_pdf",
-            }
-            for name in candidate_names
-        ]
-    )
-
-    try:
-        weights = weights_for_candidates(db, candidates, pd.Timestamp("2024-05-01"))
-    finally:
-        db.close()
-
-    expected = {
-        actor_id("congress", name): (
-            SOURCE_PRIORS["house_pdf"]
-            if name == "John A Smith"
-            else pytest.approx(0.26)
-        )
-        for name in candidate_names
-    }
-    assert weights == expected
 
 
 def test_accented_surname_skill_history_is_found(tmp_path):
@@ -341,11 +263,6 @@ def test_weight_lookup_cache_reuses_skill_table(monkeypatch):
         lambda db, as_of, actor_ids, **_kwargs: calls.append((as_of, actor_ids))
         or pd.DataFrame(columns=["actor_id", "n_matured", "mean_excess_pct"]),
     )
-    monkeypatch.setattr(
-        actors,
-        "_load_historical_actor_aliases",
-        lambda *_args: pd.DataFrame(columns=["source", "member", "actor_id"]),
-    )
     candidates = pd.DataFrame(
         [{"actor_id": "congress:ALICE", "kind": "congress", "source": "house_pdf"}]
     )
@@ -355,6 +272,28 @@ def test_weight_lookup_cache_reuses_skill_table(monkeypatch):
     actors.weights_for_candidates("db", candidates, pd.Timestamp("2024-01-01"), skill_table_cache=cache)
 
     assert len(calls) == 1
+
+
+def test_filtered_candidates_with_nonconsecutive_index_do_not_crash(monkeypatch):
+    import analyzer.actors as actors
+
+    monkeypatch.setattr(
+        actors,
+        "load_skill_table",
+        lambda *_args: pd.DataFrame(columns=["actor_id", "n_matured", "mean_excess_pct"]),
+    )
+    candidates = pd.DataFrame(
+        [
+            {"actor_id": "manager:ALICE", "kind": "manager", "source": "13f"},
+            {"actor_id": "congress:BOB", "kind": "congress", "source": "house_pdf"},
+        ],
+        index=[4, 9],
+    )
+
+    assert actors.weights_for_candidates(None, candidates, pd.Timestamp("2024-01-01")) == {
+        "manager:ALICE": 0.0,
+        "congress:BOB": pytest.approx(0.26),
+    }
 
 
 def test_zero_prior_actor_skips_skill_history(monkeypatch):

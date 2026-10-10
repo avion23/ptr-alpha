@@ -5,7 +5,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from analyzer import positions, replay as replay_module
+from analyzer import positions, replay as replay_module, setups
 
 AS_OF = date(2024, 1, 10)
 
@@ -115,6 +115,24 @@ def test_future_prices_are_not_used_for_decision(monkeypatch):
     assert result.loc[0, "fwd_return_pct"] == pytest.approx(10.0)
     assert result.loc[0, "spy_return_pct"] == pytest.approx(1.0)
     assert result.loc[0, "excess_pct"] == pytest.approx(9.0)
+
+
+def test_replay_blocks_a_stale_last_quote():
+    decision_date = date(2024, 1, 16)
+    candidates = _events().assign(as_of=decision_date)
+    db = _price_db([("ABC", AS_OF, 100.0)])
+    actors = SimpleNamespace(compute_weight=lambda *_: 1.0)
+
+    try:
+        score, blocked, actor_count = replay_module._score(
+            db, "ABC", decision_date, candidates, actors, setups
+        )
+    finally:
+        db.close()
+
+    assert score == 0.0
+    assert blocked
+    assert actor_count == 1
 
 
 def test_immature_horizon_reports_no_outcome(monkeypatch):

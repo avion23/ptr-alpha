@@ -1714,12 +1714,12 @@ def setups(
         current_prices = {}
         for symbol in symbols:
             row = db.conn.execute(
-                "SELECT close FROM prices WHERE ticker = ? AND date <= ? "
+                "SELECT close, date FROM prices WHERE ticker = ? AND date <= ? "
                 "ORDER BY date DESC LIMIT 1",
                 [symbol, as_of_date],
             ).fetchone()
             if row is not None and row[0] is not None:
-                current_prices[symbol] = float(row[0])
+                current_prices[symbol] = (float(row[0]), row[1])
 
         weights = {}
         for row in candidates.itertuples():

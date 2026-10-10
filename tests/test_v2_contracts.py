@@ -34,7 +34,7 @@ class _QueryResult:
     def fetchone(self):
         if self.frame.empty:
             return None
-        return (100.0,)
+        return (100.0, date(2026, 1, 20))
 
 
 class _FakeDatabase:

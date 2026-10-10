@@ -173,12 +173,12 @@ def _ticker_candidates(
     return scored.drop_duplicates(ignore_index=True)
 
 
-def _latest_close(db, ticker: str, as_of: date) -> float | None:
-    """Last known close on or before as_of; None when unknown."""
+def _latest_quote(db, ticker: str, as_of: date) -> tuple[float, date] | None:
+    """Last known close and its date on or before as_of; None when unknown."""
     connection = getattr(db, "conn", db)
     row = connection.execute(
         """
-        SELECT close FROM prices
+        SELECT close, date FROM prices
         WHERE ticker = ? AND date <= ? AND close IS NOT NULL
         ORDER BY date DESC LIMIT 1
         """,
@@ -187,7 +187,7 @@ def _latest_close(db, ticker: str, as_of: date) -> float | None:
     if row is None or row[0] is None:
         return None
     price = float(row[0])
-    return price if math.isfinite(price) and price > 0 else None
+    return (price, row[1]) if math.isfinite(price) and price > 0 else None
 
 
 def _score(
@@ -204,8 +204,8 @@ def _score(
         weights[actor_id] = actors.compute_weight(
             str(row.kind), 0, 0.0, str(row.source)
         )
-    current = _latest_close(db, ticker, as_of)
-    if current is None:
+    current_quote = _latest_quote(db, ticker, as_of)
+    if current_quote is None:
         return None, True, len(weights)
     try:
         from analyzer.manager_watchlist import watchlist_actor_ids
@@ -213,7 +213,7 @@ def _score(
         ranked, blocked = setups.score(
             candidates,
             weights,
-            {ticker: current},
+            {ticker: current_quote},
             watchlist=watchlist_actor_ids(),
         )
     except (KeyError, TypeError, IndexError, ValueError) as exc:
@@ -246,9 +246,10 @@ def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | No
     missing that endpoint leaves the outcome unknown, never shortened.
     """
     connection = getattr(db, "conn", db)
-    current_price = _latest_close(db, ticker, as_of)
-    if current_price is None:
+    current_quote = _latest_quote(db, ticker, as_of)
+    if current_quote is None:
         return None
+    current_price, _ = current_quote
     endpoint = previous_nyse_session(as_of + timedelta(days=horizon_days)).date()
     if endpoint <= as_of:
         return None

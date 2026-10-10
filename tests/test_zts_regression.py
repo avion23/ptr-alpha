@@ -69,15 +69,16 @@ class _MemoryDB:
             )
             """
         )
-        self.conn.executemany(
-            "INSERT INTO canonical_transactions VALUES ("
-            + ", ".join("?" * len(_TRANSACTION_COLUMNS))
-            + ")",
-            [
-                tuple(row[column] for column in _TRANSACTION_COLUMNS)
-                for row in transactions
-            ],
-        )
+        if transactions:
+            self.conn.executemany(
+                "INSERT INTO canonical_transactions VALUES ("
+                + ", ".join("?" * len(_TRANSACTION_COLUMNS))
+                + ")",
+                [
+                    tuple(row[column] for column in _TRANSACTION_COLUMNS)
+                    for row in transactions
+                ],
+            )
 
     def get_transactions_by_date_range(self, start_date, end_date):
         return self.conn.execute(
@@ -339,8 +340,8 @@ def test_zts_june_july_results_use_disclosure_dates_and_ignore_later_rows(
         },
     }
     expected_current = {
-        JUNE_30: REAL_CLOSES[JUNE_30],
-        JULY_31: REAL_CLOSES[JULY_31],
+        JUNE_30: (REAL_CLOSES[JUNE_30], JUNE_30),
+        JULY_31: (REAL_CLOSES[JULY_31], JULY_31),
     }
     for decision_date in (JUNE_30, JULY_31):
         before_candidates, before_prices = captured[("before", decision_date)]
@@ -499,3 +500,49 @@ def test_cli_setups_blocks_two_fully_closed_holders(monkeypatch):
         assert bool(replayed.iloc[0]["blocked"])
     finally:
         db.conn.close()
+
+
+def test_cli_setups_blocks_stale_last_quote(monkeypatch):
+    decision_date = JULY_31
+    candidates = pd.DataFrame(
+        [
+            {
+                "ticker": "ZTS",
+                "actor_id": "congress:STALE QUOTE",
+                "kind": "congress",
+                "source": "house_pdf",
+                "entry_ref": REAL_CLOSES[date(2026, 5, 27)],
+                "event_date": date(2026, 6, 30),
+                "disclosure_date": decision_date,
+                "as_of": decision_date,
+                "corroboration": False,
+                "position_evidence": False,
+            }
+        ]
+    )
+    db = _MemoryDB(
+        [],
+        [("ZTS", JUNE_30, REAL_CLOSES[JUNE_30])],
+    )
+    db.close = lambda: None
+    monkeypatch.setattr(cli, "_open_database", lambda *args, **kwargs: db)
+    monkeypatch.setattr(pipeline, "eligible_events", lambda *_: candidates)
+    monkeypatch.setattr(positions, "dedupe_member_names", lambda names, **kw: names)
+    monkeypatch.setattr(
+        positions, "holdings_candidates", lambda *args, **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        positions, "coalesce_actor_variants", lambda events, _positions: events
+    )
+    monkeypatch.setattr(
+        positions, "gate_closed_events", lambda events, _positions: events
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["setups", "--ticker", "ZTS", "--as-of", decision_date.isoformat()],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "=== Ranked setups ===\nNone." in result.output
+    assert "stale quote" in result.output

@@ -414,3 +414,157 @@ def test_zero_prior_actor_skips_skill_history(monkeypatch):
     assert actors.weights_for_candidates(None, candidates, pd.Timestamp("2024-01-01")) == {
         "manager:ALICE": 0.0
     }
+
+
+def test_ligature_name_history_uses_full_python_normalized_history(tmp_path):
+    from analyzer.actors import load_skill_table
+
+    db = Database(tmp_path / "ligature-member.duckdb")
+    disclosures = [
+        pd.Timestamp("2023-01-03") + pd.Timedelta(days=index)
+        for index in range(6)
+    ]
+    members = ["John Flower"] * 3 + ["John ﬂower"] * 3
+    tickers = ("AAPL", "MSFT", "GOOG", "AMZN", "META", "NVDA")
+    db.conn.executemany(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, owner_code, amount_raw, amount_midpoint, source
+        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf')
+        """,
+        [
+            (f"ligature-{index}", member, ticker, day.date(), day.date())
+            for index, (member, ticker, day) in enumerate(
+                zip(members, tickers, disclosures)
+            )
+        ],
+    )
+    prices = {}
+    for index, (ticker, disclosed) in enumerate(zip(tickers, disclosures)):
+        entry = next_nyse_session(disclosed).date()
+        exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).date()
+        prices[(ticker, entry)] = 100.0
+        prices[(ticker, exit_date)] = 110.0 if index < 3 else 80.0
+        prices[("SPY", entry)] = 100.0
+        prices[("SPY", exit_date)] = 100.0
+    db.conn.executemany(
+        "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+        [(ticker, day, close) for (ticker, day), close in prices.items()],
+    )
+    requested_id = actor_id("congress", "John Flower")
+    candidates = pd.DataFrame(
+        [{"actor_id": requested_id, "kind": "congress", "source": "house_pdf"}]
+    )
+
+    try:
+        skill_table = load_skill_table(
+            db, pd.Timestamp("2024-05-01"), {requested_id}
+        )
+    finally:
+        db.close()
+
+    assert skill_table.to_dict("records") == [
+        {
+            "actor_id": requested_id,
+            "n_matured": 6,
+            "mean_excess_pct": pytest.approx(-5.0),
+        }
+    ]
+    assert compute_actor_weights(candidates, skill_table)[requested_id] == pytest.approx(
+        0.26
+    )
+
+
+def test_float_residue_zero_mean_does_not_validate_skill():
+    from analyzer.actors import compute_actor_weights
+
+    disclosures = pd.DataFrame(
+        [
+            {
+                "actor_id": "congress:ALICE",
+                "ticker": ticker,
+                "source": "house_pdf",
+                "disclosure_date": pd.Timestamp("2023-01-03") + pd.Timedelta(days=index),
+            }
+            for index, ticker in enumerate(("AAA", "BBB", "CCC"))
+        ]
+    )
+    prices = []
+    for ticker, disclosed, exit_close in zip(
+        disclosures["ticker"],
+        disclosures["disclosure_date"],
+        (110.0, 90.0, 100.0),
+    ):
+        entry = next_nyse_session(disclosed).normalize()
+        exit_date = previous_nyse_session(
+            disclosed + pd.Timedelta(days=90)
+        ).normalize()
+        prices.extend(
+            [
+                (ticker, entry, 100.0),
+                (ticker, exit_date, exit_close),
+                ("SPY", entry, 100.0),
+                ("SPY", exit_date, 100.0),
+            ]
+        )
+    skill_table = compute_skill_table(
+        disclosures,
+        pd.DataFrame(prices, columns=["ticker", "date", "close"]),
+        pd.Timestamp("2024-05-01"),
+    )
+    candidates = pd.DataFrame(
+        [{"actor_id": "congress:ALICE", "kind": "congress", "source": "house_pdf"}]
+    )
+
+    assert abs(skill_table.iloc[0]["mean_excess_pct"]) < 1e-9
+    assert compute_actor_weights(candidates, skill_table)["congress:ALICE"] == pytest.approx(
+        0.26
+    )
+
+
+def test_infinite_benchmark_price_is_excluded_from_skill():
+    from analyzer.actors import compute_actor_weights
+
+    disclosures = pd.DataFrame(
+        [
+            {
+                "actor_id": "congress:ALICE",
+                "ticker": ticker,
+                "source": "house_pdf",
+                "disclosure_date": pd.Timestamp("2023-01-03") + pd.Timedelta(days=index),
+            }
+            for index, ticker in enumerate(("AAA", "BBB", "CCC", "DDD"))
+        ]
+    )
+    prices = []
+    for index, (ticker, disclosed) in enumerate(
+        zip(disclosures["ticker"], disclosures["disclosure_date"])
+    ):
+        entry = next_nyse_session(disclosed).normalize()
+        exit_date = previous_nyse_session(
+            disclosed + pd.Timedelta(days=90)
+        ).normalize()
+        prices.extend(
+            [
+                (ticker, entry, 100.0),
+                (ticker, exit_date, 100.0),
+                ("SPY", entry, float("inf") if index == 0 else 100.0),
+                ("SPY", exit_date, 100.0),
+            ]
+        )
+    skill_table = compute_skill_table(
+        disclosures,
+        pd.DataFrame(prices, columns=["ticker", "date", "close"]),
+        pd.Timestamp("2024-05-01"),
+    )
+    candidates = pd.DataFrame(
+        [{"actor_id": "congress:ALICE", "kind": "congress", "source": "house_pdf"}]
+    )
+
+    assert skill_table.to_dict("records") == [
+        {"actor_id": "congress:ALICE", "n_matured": 3, "mean_excess_pct": 0.0}
+    ]
+    assert compute_actor_weights(candidates, skill_table)["congress:ALICE"] == pytest.approx(
+        0.26
+    )

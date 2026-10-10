@@ -8,7 +8,6 @@ and prevents false skill attribution.
 from __future__ import annotations
 
 import math
-import re
 from datetime import date
 
 import pandas as pd
@@ -100,6 +99,7 @@ def compute_skill_table(
         price_dates.notna()
         & (price_dates < cutoff)
         & price_values.notna()
+        & price_values.map(math.isfinite)
         & price_values.gt(0)
     ].copy()
     eligible_prices["_date"] = price_dates.loc[eligible_prices.index].dt.normalize()
@@ -178,43 +178,22 @@ def _load_actor_members(
         if tokens:
             requested_by_last_name.setdefault((kind, tokens[-1]), set()).add(value)
 
-    filters = []
-    parameters: list[object] = [cutoff.date(), *sorted(_SKILL_SOURCES)]
-    for source, kind in _SOURCE_KINDS.items():
-        names = {
-            last_name
-            for requested_kind, last_name in requested_by_last_name
-            if requested_kind == kind
-        }
-        if not names:
-            continue
-        if kind == "congress":
-            # Mirror canonical_member_key's ASCII fold; DuckDB UPPER leaves ß as ẞ.
-            member_key = (
-                "regexp_replace(replace(replace(strip_accents(UPPER(member)), "
-                "'ẞ', 'SS'), 'Ø', ''), '[^A-Z0-9]', '', 'g')"
-            )
-            normalized_names = {
-                re.sub(r"[^A-Z0-9]", "", name) for name in names
-            }
-        else:
-            member_key = "replace(UPPER(member), 'ẞ', 'SS')"
-            normalized_names = names
-        if not normalized_names:
-            continue
-        patterns = " OR ".join(f"{member_key} LIKE ?" for _ in normalized_names)
-        filters.append(f"(source = ? AND ({patterns}))")
-        parameters.append(source)
-        parameters.extend(f"%{name}%" for name in sorted(normalized_names))
-    if not filters:
+    requested_kinds = {kind for kind, _ in requested_by_last_name}
+    sources = tuple(
+        sorted(
+            source
+            for source, kind in _SOURCE_KINDS.items()
+            if kind in requested_kinds
+        )
+    )
+    if not sources:
         return pd.DataFrame(columns=["source", "member", "actor_id"])
 
     member_rows = db.conn.execute(
         "SELECT DISTINCT source, member FROM canonical_transactions "
-        "WHERE disclosure_date < ? AND source IN (?, ?, ?, ?) AND ("
-        + " OR ".join(filters)
-        + ") AND member IS NOT NULL ORDER BY source, member",
-        parameters,
+        f"WHERE disclosure_date < ? AND source IN ({', '.join('?' for _ in sources)}) "
+        "AND member IS NOT NULL ORDER BY source, member",
+        [cutoff.date(), *sources],
     ).fetchall()
     members = pd.DataFrame(member_rows, columns=["source", "member"])
     members = members.loc[
@@ -380,7 +359,7 @@ def compute_actor_weights(
         for row in skill_table.itertuples(index=False)
         if int(row.n_matured) >= MIN_VALIDATED_SKILL_OBSERVATIONS
         and math.isfinite(float(row.mean_excess_pct))
-        and float(row.mean_excess_pct) > 0
+        and float(row.mean_excess_pct) >= 1e-9
     }
     identity_weights: dict[str, float] = {}
     for row in candidates.itertuples(index=False):

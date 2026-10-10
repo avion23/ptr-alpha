@@ -1034,6 +1034,43 @@ class TestPositions(unittest.TestCase):
         self.assertEqual(len(partial), 1)
         self.assertEqual(partial.iloc[0]["actor_id"], "congress:MCCORMICK")
 
+    def test_repeated_band_cycles_reset_estimates_after_fifo_exhaustion(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": transaction_type,
+                    "transaction_date": transaction_date,
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                }
+                for transaction_type, transaction_date in [
+                    ("Purchase", date(2025, 1, 10)),
+                    ("Sale", date(2025, 6, 10)),
+                    ("Purchase", date(2025, 6, 11)),
+                    ("Sale", date(2025, 6, 12)),
+                ]
+            ]
+        )
+        history = {
+            "T": _prices(
+                [
+                    "2025-01-10",
+                    "2025-06-10",
+                    "2025-06-11",
+                    "2025-06-12",
+                    "2025-06-13",
+                ],
+                [100.0, 50.0, 100.0, 105.0, 105.0],
+            )
+        }
+
+        positions = build_positions(trades, history, as_of=date(2025, 6, 13))
+
+        self.assertTrue(positions.empty)
+
 
 if __name__ == "__main__":
     unittest.main()

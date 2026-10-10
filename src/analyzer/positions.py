@@ -424,6 +424,15 @@ def build_positions(
                         estimate["sold_value"] += (
                             sale_estimate_value * relieved_shares / sale_shares
                         )
+                    if not any(lot[4] == relieved_account for lot in queue):
+                        # These band totals describe one open holding cycle.
+                        # Do not carry clipped sale value into later purchases.
+                        estimates = band_estimates.get(key)
+                        if estimates is not None:
+                            estimates.pop(relieved_account, None)
+                            if not estimates:
+                                band_estimates.pop(key)
+                        ineligible_for_band_tolerance.discard(relieved_key)
             first_buy.setdefault(key, day)
         else:
             ignored_exchanges += 1

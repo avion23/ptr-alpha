@@ -438,3 +438,51 @@ def test_missing_watchlist_means_no_corroboration():
     )
     ranked, _ = score(backed, {"officer:BURKE CEO": 0.6}, {"AAPL": 100.0})
     assert ranked.empty
+
+
+def test_closed_manager_does_not_corroborate_lone_officer():
+    officer = _row(
+        actor_id="officer:BURKE CEO",
+        source="form4",
+        position_evidence=True,
+    )
+    manager = _row(
+        actor_id="manager:FUND A",
+        corroboration=True,
+        source="13f",
+    )
+    manager["blocked_reason"] = "no open position at as_of"
+
+    ranked, blocked = score(
+        pd.DataFrame([officer, manager]),
+        {"officer:BURKE CEO": 0.30},
+        {"AAPL": 100.0},
+        watchlist={"manager:FUND A"},
+    )
+
+    assert ranked.empty
+    assert blocked.set_index("actor_id").loc[
+        "officer:BURKE CEO", "reason"
+    ] == "score below ranking floor (1.00)"
+
+
+@pytest.mark.parametrize(
+    ("entry_ref", "current"),
+    [
+        (0, 100),
+        (-1, 100),
+        (float("inf"), 100),
+        (100, 0),
+        (100, float("inf")),
+        (100, -1),
+        (0, 0),
+    ],
+)
+def test_invalid_price_domains_do_not_rank_or_crash(entry_ref, current):
+    ranked, _ = score(
+        pd.DataFrame([_row(entry_ref=entry_ref, position_evidence=True)]),
+        {"congress:PELOSI": 1.0},
+        {"AAPL": current},
+    )
+
+    assert ranked.empty

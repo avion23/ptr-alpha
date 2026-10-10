@@ -92,9 +92,9 @@ def score(
             current = quote
         try:
             current = float(current) if current is not None else None
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             current = None
-        if current is not None and not math.isfinite(current):
+        if current is not None and (not math.isfinite(current) or current <= 0):
             current = None
 
         actor_rows = grouped[ticker]
@@ -127,6 +127,8 @@ def score(
                 disclosed = _as_date(row["disclosure_date"])
                 decided = _as_date(row["as_of"])
             except (TypeError, ValueError):
+                return False
+            if row.get("blocked_reason") == "no open position at as_of":
                 return False
             if disclosed > decided:
                 return False
@@ -168,7 +170,12 @@ def score(
                 if _missing(row["entry_ref"]):
                     continue
                 seen_reference = True
-                entry_ref = float(row["entry_ref"])
+                try:
+                    entry_ref = float(row["entry_ref"])
+                except (OverflowError, TypeError, ValueError):
+                    continue
+                if not math.isfinite(entry_ref) or entry_ref <= 0:
+                    continue
                 if current is None or current > entry_tol * entry_ref:
                     continue
 

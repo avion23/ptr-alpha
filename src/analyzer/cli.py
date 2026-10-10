@@ -1185,13 +1185,21 @@ def refresh(
     print(f"[1/4] Fetching and reconciling House PDF archives {label}...")
     summaries = []
     fetch_failed_years: list[int] = []
-    # Single-year refresh keeps fail-fast: a partial PDF set is not a usable
-    # refresh generation. Multi-year refresh quarantines a twice-failed year
-    # and continues: each archive promotes (and commits) independently, and
-    # DuckDB invalidates the whole shared connection after an index
-    # maintenance failure, so the engine's prescribed recovery (reopen)
-    # runs before the retry.
+    # Single-year refresh keeps fail-fast; multi-year refresh quarantines a
+    # twice-failed year and continues. DuckDB can invalidate the shared
+    # connection after an index maintenance failure, so reopen after each
+    # failed attempt before retry, the next archive, or parsing.
     fail_fast = len(archive_years) == 1
+
+    def reopen_shared_database() -> None:
+        try:
+            app_ctx.transaction_source.db.close()
+        except Exception:  # noqa: BLE001
+            pass
+        fresh_db = _open_database(app_ctx.settings.data.data_dir, False)
+        app_ctx.transaction_source.db = fresh_db
+        app_ctx.price_source.db = fresh_db
+
     try:
         for archive_year in archive_years:
             try:
@@ -1211,15 +1219,7 @@ def refresh(
                     archive_year,
                     year_exc,
                 )
-                try:
-                    app_ctx.transaction_source.db.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                fresh_db = _open_database(
-                    app_ctx.settings.data.data_dir, False
-                )
-                app_ctx.transaction_source.db = fresh_db
-                app_ctx.price_source.db = fresh_db
+                reopen_shared_database()
                 try:
                     summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
                         archive_year,
@@ -1236,6 +1236,7 @@ def refresh(
                         retry_exc,
                     )
                     fetch_failed_years.append(archive_year)
+                    reopen_shared_database()
                     continue
             summaries.append(summary)
             _print_house_fetch_summary(summary)
@@ -1371,7 +1372,10 @@ def refresh(
 
     canonical_added = canonical_count_after - canonical_count_before
     raw_added = raw_count_after - raw_count_before
-    outcome = "Incomplete." if failed_steps else "Done."
+    failures = failed_steps + [
+        f"fetch:{failed_year}" for failed_year in fetch_failed_years
+    ]
+    outcome = "Incomplete." if failures else "Done."
     print(
         f"\n{outcome} canonical {canonical_count_before} -> "
         f"{canonical_count_after} transactions "
@@ -1386,8 +1390,8 @@ def refresh(
             f"Excluded from analyses: {implausible_date_count} transaction(s) "
             "dated after disclosure"
         )
-    if failed_steps:
-        print(f"FAILED steps: {', '.join(failed_steps)}")
+    if failures:
+        print(f"FAILED steps: {', '.join(failures)}")
         _cli_exit(1)
     _cli_exit(0)
 

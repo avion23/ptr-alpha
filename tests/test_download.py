@@ -130,6 +130,88 @@ def test_current_archive_fetch_forces_fresh_metadata(tmp_path):
     )
 
 
+def test_identical_ptr_refresh_skips_promote_but_metadata_correction_promotes(
+    tmp_path,
+):
+    source, db = _source(tmp_path)
+    provenance = {
+        "metadata_sha256": "metadata-sha",
+        "metadata_http_status": 200,
+        "metadata_etag": None,
+        "metadata_last_modified": None,
+    }
+
+    def archive(first_name, fetched_at):
+        metadata, _ = _acquired("ptr")
+        non_ptr = metadata.iloc[[0]].copy()
+        non_ptr["doc_id"] = "non-ptr"
+        non_ptr["filing_type"] = "F"
+        metadata = pd.concat([metadata, non_ptr], ignore_index=True)
+        metadata.loc[metadata["doc_id"] == "ptr", "first_name"] = first_name
+        metadata["fetched_at"] = pd.Timestamp(fetched_at)
+        return metadata, provenance
+
+    source._acquire_metadata_archive = MagicMock(
+        side_effect=[
+            archive("First", "2021-01-01"),
+            archive("First", "2022-01-01"),
+            archive("Corrected", "2023-01-01"),
+        ]
+    )
+    pdf_bytes = b"%PDF-identical\n%%EOF"
+
+    async def download(_session, doc_id, pdf_path, _url):
+        pdf_path.write_bytes(pdf_bytes)
+        return DownloadResult(doc_id=doc_id, status=DownloadStatus.SUCCESS)
+
+    source._download_pdf_async = download
+    promote = MagicMock(wraps=db.promote_house_archive)
+    db.promote_house_archive = promote
+    try:
+        first = source.fetch_and_cache_pdfs(2021, refresh_metadata=True)
+        unchanged = source.fetch_and_cache_pdfs(2021, refresh_metadata=True)
+        corrected = source.fetch_and_cache_pdfs(2021, refresh_metadata=True)
+        stored = db.get_metadata(2021)
+    finally:
+        source.close()
+        db.close()
+
+    assert first.generation_status == "incomplete"
+    assert unchanged.generation_status == "unchanged"
+    assert corrected.generation_status == "incomplete"
+    assert promote.call_count == 2
+    assert stored.loc[stored["DocID"] == "ptr", "First"].item() == "Corrected"
+
+
+@pytest.mark.parametrize("canonical_state", ["missing", "corrupt"])
+def test_identical_staged_pdf_repairs_invalid_canonical_before_skip(
+    tmp_path, canonical_state
+):
+    source, db = _source(tmp_path)
+    source._acquire_metadata_archive = MagicMock(return_value=_acquired("ptr"))
+    pdf_bytes = b"%PDF-valid-replacement\n%%EOF"
+
+    async def download(_session, doc_id, pdf_path, _url):
+        pdf_path.write_bytes(pdf_bytes)
+        return DownloadResult(doc_id=doc_id, status=DownloadStatus.SUCCESS)
+
+    source._download_pdf_async = download
+    canonical = tmp_path / "2021" / "pdfs" / "ptr.pdf"
+    try:
+        source.fetch_and_cache_pdfs(2021, refresh_metadata=True)
+        if canonical_state == "missing":
+            canonical.unlink()
+        else:
+            canonical.write_bytes(b"%PDF-corrupt")
+
+        summary = source.fetch_and_cache_pdfs(2021, refresh_metadata=True)
+        assert summary.generation_status != "unchanged"
+        assert canonical.read_bytes() == pdf_bytes
+    finally:
+        source.close()
+        db.close()
+
+
 
 def test_forced_metadata_refresh_bypasses_http_cache_and_persists_archive(tmp_path):
     source, db = _source(tmp_path)

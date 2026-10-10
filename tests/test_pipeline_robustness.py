@@ -617,6 +617,82 @@ def test_refresh_stops_before_parse_and_backup_when_house_fetch_is_incomplete(
     capitol_source.assert_not_called()
 
 
+def test_multi_year_refresh_reopens_after_second_fetch_failure_and_exits_incomplete(
+    tmp_path,
+):
+    class FakeDatabase:
+        def __init__(self):
+            self.conn = self
+            self.close = MagicMock()
+            self.mark_house_generation_parse_complete = MagicMock()
+
+        def execute(self, *_args):
+            return self
+
+        def fetchone(self):
+            return (0, 0, 0)
+
+        def get_latest_house_generation(self, _year):
+            return "existing-generation"
+
+        def get_unresolved_house_doc_ids(self, _year, _generation):
+            return []
+
+    first_year = date.today().year - 1
+    years = [first_year, first_year + 1]
+    ctx = MagicMock()
+    databases = [FakeDatabase(), FakeDatabase(), FakeDatabase()]
+    ctx.transaction_source.db = databases[0]
+    ctx.price_source.db = databases[0]
+    ctx.settings.data.data_dir = str(tmp_path)
+    attempts = []
+
+    def fetch(archive_year, **_kwargs):
+        attempts.append((archive_year, ctx.transaction_source.db))
+        if (
+            archive_year == first_year
+            and sum(year == first_year for year, _db in attempts) <= 2
+        ):
+            raise DataSourceError("injected fetch failure")
+        return HouseFetchSummary(
+            archive_year=archive_year,
+            metadata_count=1,
+            ptr_count=1,
+            valid_pdf_count=1,
+            downloaded_count=0,
+            skipped_count=1,
+            orphan_pdf_count=0,
+        )
+
+    ctx.transaction_source.fetch_and_cache_pdfs.side_effect = fetch
+    with (
+        patch("analyzer.cli.get_context", return_value=ctx),
+        patch("analyzer.cli._HOUSE_PTR_FIRST_ARCHIVE_YEAR", first_year),
+        patch("analyzer.cli._open_database", side_effect=databases[1:]) as reopen,
+        patch(
+            "analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)
+        ) as parse_pipeline,
+    ):
+        result = CliRunner().invoke(app, ["refresh", "--all-years", "--skip-capitol"])
+
+    assert result.exit_code == 1, result.output
+    assert (
+        "fetch failed years (kept previous generations): [" + str(first_year)
+        in result.output
+    )
+    assert f"FAILED steps: fetch:{first_year}" in result.output
+    assert [db for _year, db in attempts] == databases
+    assert reopen.call_count == 2
+    assert databases[0].close.call_count == 1
+    assert databases[1].close.call_count == 1
+    assert ctx.transaction_source.db is databases[2]
+    assert ctx.price_source.db is databases[2]
+    assert [call.args[1] for call in parse_pipeline.call_args_list] == years
+    assert all(
+        call.args[0].db is databases[2] for call in parse_pipeline.call_args_list
+    )
+
+
 def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
     db = Database(tmp_path / "full-history.duckdb")
     ctx = MagicMock()

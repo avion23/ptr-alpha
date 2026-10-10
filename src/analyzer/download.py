@@ -295,6 +295,7 @@ class HouseTransactionSource(TransactionSource):
     def _archive_unchanged(
         self,
         archive_year: int,
+        metadata_df: pd.DataFrame,
         doc_ids: list[str],
         orphan_ids: list[str],
         expected_hashes: dict[str, str],
@@ -305,27 +306,77 @@ class HouseTransactionSource(TransactionSource):
         Re-promoting an identical archive rewrites every metadata row for no
         reason; on multi-year refresh runs that churn trips a DuckDB index
         maintenance failure. Skip the promote when the authoritative doc set
-        matches the stored one, no PDFs were orphaned, and every staged PDF
-        is byte-identical to the recorded canonical artifact. Compares doc
-        sets rather than the upstream metadata SHA: the Clerk re-serves
-        byte-different metadata for semantically identical archives.
+        matches the stored PTR scope, the semantic metadata is unchanged, no
+        PDFs were orphaned, and every staged PDF is byte-identical to the
+        recorded canonical artifact. Compares semantic rows rather than the
+        upstream metadata SHA: the Clerk re-serves byte-different metadata for
+        semantically identical archives.
         """
         if orphan_ids:
             return False
         try:
             stored = self.db.get_metadata(archive_year)
-        except Exception:  # noqa: BLE001
-            return False
-        if set(stored["DocID"].astype(str)) != set(doc_ids):
-            return False
-        for doc_id in doc_ids:
-            recorded = expected_hashes.get(doc_id)
-            if not recorded:
+            incoming_ptrs = metadata_df.loc[
+                metadata_df["filing_type"] == FilingType.PTR.value
+            ]
+            stored_ptrs = stored.loc[stored["FilingType"] == FilingType.PTR.value]
+            if (
+                incoming_ptrs["doc_id"].astype(str).duplicated().any()
+                or stored_ptrs["DocID"].astype(str).duplicated().any()
+            ):
                 return False
-            staged = stage_pdf_dir / f"{doc_id}.pdf"
-            if _validated_pdf_sha256(staged) != recorded:
+            if set(incoming_ptrs["doc_id"].astype(str)) != set(doc_ids):
                 return False
-        return True
+            if set(stored_ptrs["DocID"].astype(str)) != set(doc_ids):
+                return False
+
+            def semantic_rows(frame, columns):
+                rows = {}
+                for row in frame[columns].itertuples(index=False, name=None):
+                    doc_id, first_name, last_name, filing_date, filing_type = row
+
+                    def value(item):
+                        if pd.isna(item) or (
+                            isinstance(item, str) and not item.strip()
+                        ):
+                            return None
+                        return str(item)
+
+                    rows[str(doc_id)] = (
+                        value(first_name),
+                        value(last_name),
+                        None
+                        if pd.isna(filing_date)
+                        else pd.Timestamp(filing_date).date(),
+                        value(filing_type),
+                    )
+                return rows
+
+            incoming = semantic_rows(
+                incoming_ptrs,
+                ["doc_id", "first_name", "last_name", "filing_date", "filing_type"],
+            )
+            previous = semantic_rows(
+                stored_ptrs,
+                ["DocID", "First", "Last", "FilingDate", "FilingType"],
+            )
+            if incoming != previous:
+                return False
+
+            for doc_id in doc_ids:
+                recorded = expected_hashes.get(doc_id)
+                if not recorded:
+                    return False
+                staged = stage_pdf_dir / f"{doc_id}.pdf"
+                canonical = self.data_dir / str(archive_year) / "pdfs" / f"{doc_id}.pdf"
+                if (
+                    _validated_pdf_sha256(staged) != recorded
+                    or _validated_pdf_sha256(canonical) != recorded
+                ):
+                    return False
+            return True
+        except Exception:  # noqa: BLE001 -- uncertainty must promote, not skip
+            return False
 
     async def _fetch_and_cache_pdfs_async(
         self,
@@ -463,8 +514,12 @@ class HouseTransactionSource(TransactionSource):
             )
             orphan_ids = sorted(old_pdf_ids - official_doc_ids)
             if self._archive_unchanged(
-                archive_year, doc_ids, orphan_ids,
-                expected_hashes, stage_pdf_dir,
+                archive_year,
+                metadata_df,
+                doc_ids,
+                orphan_ids,
+                expected_hashes,
+                stage_pdf_dir,
             ):
                 logger.info(
                     "House archive %d unchanged "

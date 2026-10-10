@@ -333,9 +333,8 @@ def cmd_run(decision: date, db=None):
                 pd.to_datetime(decision)
                 - pd.to_datetime(init["disclosure_date"])
             ).dt.days.dropna()
-            fresh_actors = set(
-                init.loc[lags.between(0, 30), "actor_id"].astype(str)
-            ) if not lags.empty else set()
+            fresh_frame = init.loc[lags.between(0, 30)] if not lags.empty else init.iloc[0:0]
+            fresh_actors = set(fresh_frame["actor_id"].astype(str))
             entry_eligible = bool((entry_px <= 1.05 * refs.loc[valid_refs]).any())
             rows.append(
                 {

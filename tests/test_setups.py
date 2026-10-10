@@ -99,6 +99,37 @@ def test_over_tolerance_actor_is_blocked_and_not_counted():
     assert blocked.iloc[0]["reason"] == "above entry tolerance"
 
 
+def test_ranked_row_reports_disclosure_freshness():
+    stale = _row(
+        actor_id="congress:OLD",
+        position_evidence=True,
+        disclosure_date=date(2020, 1, 1),
+    )
+    fresh = _row(
+        actor_id="congress:NEW",
+        position_evidence=True,
+        disclosure_date=date(2024, 5, 30),
+    )
+    ranked, _ = score(
+        pd.DataFrame([stale, fresh]),
+        {"congress:OLD": 0.52, "congress:NEW": 0.52},
+        {"AAPL": 100.0},
+    )
+    assert len(ranked) == 1
+    assert ranked.iloc[0]["min_disclosure_lag_days"] == 2
+    assert ranked.iloc[0]["has_fresh_evidence"] == True
+    ranked_stale, _ = score(
+        pd.DataFrame([stale, _row(actor_id="congress:OLD2",
+                                  position_evidence=True,
+                                  disclosure_date=date(2020, 6, 1))]),
+        {"congress:OLD": 0.52, "congress:OLD2": 0.52},
+        {"AAPL": 100.0},
+    )
+    assert len(ranked_stale) == 1
+    assert ranked_stale.iloc[0]["has_fresh_evidence"] == False
+    assert ranked_stale.iloc[0]["min_disclosure_lag_days"] > 90
+
+
 def test_missing_weight_defaults_to_zero():
     ranked, blocked = score(pd.DataFrame([_row()]), {}, {"AAPL": 100.0})
 
@@ -133,6 +164,8 @@ def test_zero_weight_actor_does_not_corroborate_or_count():
             "n_actors": 1,
             "current": 100.0,
             "reasons": ["STRONG buy @100.00, now 100.00 (+0.0%)"],
+            "min_disclosure_lag_days": 2,
+            "has_fresh_evidence": True,
         }
     ]
     assert blocked.to_dict("records") == [

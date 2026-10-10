@@ -10,7 +10,16 @@ import pandas as pd
 
 from analyzer.manager_watchlist import normalize_manager_name
 
-_RANKED_COLUMNS = ["ticker", "score", "actors", "n_actors", "current", "reasons"]
+_RANKED_COLUMNS = [
+    "ticker",
+    "score",
+    "actors",
+    "n_actors",
+    "current",
+    "reasons",
+    "min_disclosure_lag_days",
+    "has_fresh_evidence",
+]
 _BLOCKED_COLUMNS = ["ticker", "actor_id", "reason"]
 
 _RANKED_FLOOR = 1.0
@@ -154,6 +163,7 @@ def score(
 
             usable = []
             seen_reference = False
+            usable_lag = None
             for row in initiators:
                 if _missing(row["entry_ref"]):
                     continue
@@ -183,6 +193,8 @@ def score(
                     f"now {current:.2f} ({change:+.1%})"
                 )
                 usable.append((decay, reason, entry_ref))
+                if usable_lag is None or days_since_disclosure < usable_lag:
+                    usable_lag = days_since_disclosure
 
             if not usable:
                 blocked_reason = next(
@@ -228,7 +240,7 @@ def score(
                     }
                 )
                 continue
-            accepted.append((actor_id, contribution, reason))
+            accepted.append((actor_id, contribution, reason, usable_lag))
 
         score_value = sum(item[1] for item in accepted) * (
             1.5 if corroborated else 1.0
@@ -240,11 +252,13 @@ def score(
                     "actor_id": actor_id,
                     "reason": "score below ranking floor (1.00)",
                 }
-                for actor_id, _, _ in accepted
+                for actor_id, _, _, _ in accepted
             )
             continue
         if not accepted:
             continue
+        lags = [lag for _, _, _, lag in accepted if lag is not None]
+        min_lag = min(lags) if lags else None
         ranked_rows.append(
             {
                 "ticker": ticker,
@@ -253,6 +267,8 @@ def score(
                 "n_actors": len(accepted),
                 "current": current,
                 "reasons": [item[2] for item in accepted],
+                "min_disclosure_lag_days": min_lag,
+                "has_fresh_evidence": min_lag is not None and min_lag <= 90,
             }
         )
 

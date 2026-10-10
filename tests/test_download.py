@@ -183,6 +183,35 @@ def test_identical_ptr_refresh_skips_promote_but_metadata_correction_promotes(
     assert stored.loc[stored["DocID"] == "ptr", "First"].item() == "Corrected"
 
 
+@pytest.mark.parametrize("canonical_state", ["missing", "corrupt"])
+def test_identical_staged_pdf_repairs_invalid_canonical_before_skip(
+    tmp_path, canonical_state
+):
+    source, db = _source(tmp_path)
+    source._acquire_metadata_archive = MagicMock(return_value=_acquired("ptr"))
+    pdf_bytes = b"%PDF-valid-replacement\n%%EOF"
+
+    async def download(_session, doc_id, pdf_path, _url):
+        pdf_path.write_bytes(pdf_bytes)
+        return DownloadResult(doc_id=doc_id, status=DownloadStatus.SUCCESS)
+
+    source._download_pdf_async = download
+    canonical = tmp_path / "2021" / "pdfs" / "ptr.pdf"
+    try:
+        source.fetch_and_cache_pdfs(2021, refresh_metadata=True)
+        if canonical_state == "missing":
+            canonical.unlink()
+        else:
+            canonical.write_bytes(b"%PDF-corrupt")
+
+        summary = source.fetch_and_cache_pdfs(2021, refresh_metadata=True)
+        assert summary.generation_status != "unchanged"
+        assert canonical.read_bytes() == pdf_bytes
+    finally:
+        source.close()
+        db.close()
+
+
 
 def test_forced_metadata_refresh_bypasses_http_cache_and_persists_archive(tmp_path):
     source, db = _source(tmp_path)

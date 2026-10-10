@@ -368,7 +368,11 @@ class HouseTransactionSource(TransactionSource):
                 if not recorded:
                     return False
                 staged = stage_pdf_dir / f"{doc_id}.pdf"
-                if _validated_pdf_sha256(staged) != recorded:
+                canonical = self.data_dir / str(archive_year) / "pdfs" / f"{doc_id}.pdf"
+                if (
+                    _validated_pdf_sha256(staged) != recorded
+                    or _validated_pdf_sha256(canonical) != recorded
+                ):
                     return False
             return True
         except Exception:  # noqa: BLE001 -- uncertainty must promote, not skip

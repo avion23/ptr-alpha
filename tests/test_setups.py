@@ -154,6 +154,48 @@ def test_zero_weight_actor_does_not_corroborate_or_count():
     ]
 
 
+def test_epsilon_contribution_does_not_promote_another_actor():
+    candidates = pd.DataFrame(
+        [
+            _row(actor_id="officer:REAL", position_evidence=True),
+            _row(actor_id="congress:DUST", position_evidence=True),
+        ]
+    )
+
+    ranked, blocked = score(
+        candidates,
+        {"officer:REAL": 0.52, "congress:DUST": 1e-15},
+        {"AAPL": 100.0},
+    )
+
+    assert ranked.empty
+    assert blocked.set_index("actor_id").loc[
+        "congress:DUST", "reason"
+    ] == "below usable evidence floor (0.05)"
+
+
+def test_quote_older_than_five_calendar_days_is_blocked():
+    candidates = pd.DataFrame([_row(position_evidence=True)])
+
+    ranked, blocked = score(
+        candidates,
+        {"congress:PELOSI": 1.0},
+        {"AAPL": (100.0, date(2024, 5, 26))},
+    )
+
+    assert ranked.empty
+    assert blocked.to_dict("records") == [
+        {"ticker": "AAPL", "actor_id": "congress:PELOSI", "reason": "stale quote"}
+    ]
+
+    fresh_ranked, _ = score(
+        candidates,
+        {"congress:PELOSI": 1.0},
+        {"AAPL": (100.0, date(2024, 5, 27))},
+    )
+    assert fresh_ranked.iloc[0]["score"] == pytest.approx(1.0)
+
+
 def test_missing_entry_reference_is_blocked():
     ranked, blocked = score(
         pd.DataFrame([_row(entry_ref=None)]),

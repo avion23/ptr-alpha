@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection
+from datetime import timedelta
 
 import pandas as pd
 
@@ -14,6 +15,7 @@ _BLOCKED_COLUMNS = ["ticker", "actor_id", "reason"]
 
 _RANKED_FLOOR = 1.0
 _CORROBORATED_FLOOR = 0.25
+_MIN_USABLE_CONTRIBUTION = 0.05
 
 
 def is_ranked(score_value: float, n_actors: int, corroborated: bool = False) -> bool:
@@ -35,7 +37,7 @@ def is_ranked(score_value: float, n_actors: int, corroborated: bool = False) -> 
 def score(
     candidates: pd.DataFrame,
     weights: dict[str, float],
-    current_prices: dict[str, float],
+    current_prices: dict[str, float | tuple[float, object]],
     *,
     entry_tol: float = 1.05,
     event_half_life_days: int = 90,
@@ -45,7 +47,9 @@ def score(
 
     13F corroboration counts only for curated watchlist managers: pass
     ``manager_watchlist.watchlist_actor_ids()``. Without a watchlist no
-    corroboration is recognized (fail closed).
+    corroboration is recognized (fail closed). Dated current prices use
+    ``(price, date)``; bare floats retain legacy behavior without freshness
+    validation.
     """
     if entry_tol <= 0 or event_half_life_days <= 0:
         raise ValueError("entry_tol and event_half_life_days must be positive")
@@ -63,7 +67,20 @@ def score(
     ranked_rows = []
     blocked_rows = []
     for ticker in sorted(grouped):
-        current = current_prices.get(ticker)
+        quote = current_prices.get(ticker)
+        quote_date = None
+        stale_quote = False
+        if isinstance(quote, tuple):
+            if len(quote) != 2:
+                current, stale_quote = None, True
+            else:
+                current, raw_quote_date = quote
+                try:
+                    quote_date = _as_date(raw_quote_date)
+                except (TypeError, ValueError):
+                    stale_quote = True
+        else:
+            current = quote
         try:
             current = float(current) if current is not None else None
         except (TypeError, ValueError):
@@ -72,6 +89,17 @@ def score(
             current = None
 
         actor_rows = grouped[ticker]
+        decision_dates = [
+            _as_date(row["as_of"])
+            for rows in actor_rows.values()
+            for row in rows["initiators"]
+        ]
+        if (
+            quote_date is not None
+            and decision_dates
+            and max(decision_dates) - quote_date > timedelta(days=5)
+        ):
+            stale_quote = True
         initiator_ids = {
             actor for actor, rows in actor_rows.items() if rows["initiators"]
         }
@@ -116,6 +144,11 @@ def score(
                         "actor_id": actor_id,
                         "reason": "corroboration only",
                     }
+                )
+                continue
+            if stale_quote:
+                blocked_rows.append(
+                    {"ticker": ticker, "actor_id": actor_id, "reason": "stale quote"}
                 )
                 continue
 
@@ -182,18 +215,21 @@ def score(
             contribution = float(weights.get(actor_id, 0.0)) * decay
             if not math.isfinite(contribution) or contribution < 0:
                 contribution = 0.0
+            if contribution < _MIN_USABLE_CONTRIBUTION:
+                blocked_rows.append(
+                    {
+                        "ticker": ticker,
+                        "actor_id": actor_id,
+                        "reason": (
+                            "no actor weight"
+                            if contribution == 0
+                            else "below usable evidence floor (0.05)"
+                        ),
+                    }
+                )
+                continue
             accepted.append((actor_id, contribution, reason))
 
-        blocked_rows.extend(
-            {
-                "ticker": ticker,
-                "actor_id": actor_id,
-                "reason": "no actor weight",
-            }
-            for actor_id, contribution, _ in accepted
-            if contribution == 0
-        )
-        accepted = [item for item in accepted if item[1] != 0]
         score_value = sum(item[1] for item in accepted) * (
             1.5 if corroborated else 1.0
         )

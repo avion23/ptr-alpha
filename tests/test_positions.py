@@ -1071,6 +1071,80 @@ class TestPositions(unittest.TestCase):
 
         self.assertTrue(positions.empty)
 
+    def test_ineligible_full_fifo_exits_reset_band_estimates(self):
+        history = {
+            "T": _prices(
+                [
+                    "2025-01-10",
+                    "2025-06-10",
+                    "2025-06-11",
+                    "2025-06-12",
+                    "2025-06-13",
+                ],
+                [100.0, 50.0, 100.0, 105.0, 105.0],
+            )
+        }
+        ineligible_exits = {
+            "floor-only": {
+                "amount_midpoint": None,
+                "amount_raw": "$10,000 -",
+            },
+            "exact-shares": {
+                "asset_description": "Common Stock; 100 shares @ $50.00",
+            },
+        }
+
+        for exit_kind, exit_fields in ineligible_exits.items():
+            with self.subTest(exit_kind=exit_kind):
+                first_exit = {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2025, 6, 10),
+                    "amount_midpoint": 10000.0,
+                    "source": "house_pdf",
+                    "owner_code": "S",
+                }
+                first_exit.update(exit_fields)
+                trades = pd.DataFrame(
+                    [
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Purchase",
+                            "transaction_date": date(2025, 1, 10),
+                            "amount_midpoint": 10000.0,
+                            "source": "house_pdf",
+                            "owner_code": "S",
+                        },
+                        first_exit,
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Purchase",
+                            "transaction_date": date(2025, 6, 11),
+                            "amount_midpoint": 10000.0,
+                            "source": "house_pdf",
+                            "owner_code": "S",
+                        },
+                        {
+                            "member": "M",
+                            "ticker": "T",
+                            "transaction_type": "Sale",
+                            "transaction_date": date(2025, 6, 12),
+                            "amount_midpoint": 10000.0,
+                            "source": "house_pdf",
+                            "owner_code": "S",
+                        },
+                    ]
+                )
+
+                positions = build_positions(
+                    trades, history, as_of=date(2025, 6, 13)
+                )
+
+                self.assertTrue(positions.empty)
+
 
 if __name__ == "__main__":
     unittest.main()

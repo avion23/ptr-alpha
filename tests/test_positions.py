@@ -26,11 +26,13 @@ def _holdings_db(trades, prices):
         "member",
         "ticker",
         "transaction_type",
+        "raw_transaction_subtype",
         "transaction_date",
         "disclosure_date",
         "amount_midpoint",
         "amount_raw",
         "source",
+        "owner_code",
         "instrument_type",
         "source_record_id",
         "amends_source_record_id",
@@ -65,6 +67,138 @@ class TestEntryClose(unittest.TestCase):
 
 
 class TestPositions(unittest.TestCase):
+    def test_repository_normalized_full_sale_closes_only_disclosed_account(self):
+        from analyzer.transaction_repository import _normalize_frame
+
+        normalized = _normalize_frame(
+            pd.DataFrame(
+                [
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Purchase",
+                        "transaction_date": date(2025, 1, 10),
+                        "disclosure_date": date(2025, 1, 10),
+                        "amount_midpoint": 8000.5,
+                        "source": "senate_efd",
+                        "owner_code": "S",
+                    },
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Purchase",
+                        "transaction_date": date(2025, 1, 10),
+                        "disclosure_date": date(2025, 1, 10),
+                        "amount_midpoint": 10000.0,
+                        "source": "senate_efd",
+                        "owner_code": "SP",
+                    },
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Sale",
+                        "raw_transaction_subtype": "Sale (Full)",
+                        "transaction_date": date(2025, 6, 10),
+                        "disclosure_date": date(2025, 6, 10),
+                        "amount_midpoint": 100.0,
+                        "source": "senate_efd",
+                        "owner_code": "S",
+                    },
+                ]
+            ),
+            deduplicate=False,
+        )
+        self.assertEqual(normalized.iloc[2]["transaction_type"], "Sale")
+        self.assertEqual(normalized.iloc[2]["raw_transaction_subtype"], "Sale (Full)")
+
+        db, conn = _holdings_db(
+            normalized.to_dict("records"),
+            [
+                ("T", date(2025, 1, 10), 100.0),
+                ("T", date(2025, 6, 10), 200.0),
+                ("T", date(2025, 6, 11), 200.0),
+            ],
+        )
+        try:
+            from analyzer.positions import build_positions, load_member_trades
+
+            loaded = load_member_trades(db, "M")
+            self.assertEqual(loaded.iloc[2]["raw_transaction_subtype"], "Sale (Full)")
+            fifo_positions = build_positions(
+                loaded,
+                {
+                    "T": _prices(
+                        ["2025-01-10", "2025-06-10", "2025-06-11"],
+                        [100.0, 200.0, 200.0],
+                    )
+                },
+                as_of=date(2025, 6, 11),
+            )
+            positions = holdings_candidates(db, "M", date(2025, 6, 11))
+        finally:
+            conn.close()
+
+        self.assertEqual(len(positions), 1)
+        self.assertAlmostEqual(fifo_positions.iloc[0]["shares"], 100.0)
+        self.assertAlmostEqual(fifo_positions.iloc[0]["total_cost"], 10000.0)
+        self.assertAlmostEqual(positions.iloc[0]["entry_ref"], 100.0)
+
+    def test_repository_normalized_full_sale_without_owner_closes_all_accounts(self):
+        from analyzer.transaction_repository import _normalize_frame
+
+        normalized = _normalize_frame(
+            pd.DataFrame(
+                [
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Purchase",
+                        "transaction_date": date(2025, 1, 10),
+                        "disclosure_date": date(2025, 1, 10),
+                        "amount_midpoint": 8000.5,
+                        "source": "senate_efd",
+                        "owner_code": "S",
+                    },
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Purchase",
+                        "transaction_date": date(2025, 1, 10),
+                        "disclosure_date": date(2025, 1, 10),
+                        "amount_midpoint": 10000.0,
+                        "source": "senate_efd",
+                        "owner_code": "SP",
+                    },
+                    {
+                        "member": "M",
+                        "ticker": "T",
+                        "transaction_type": "Sale Full",
+                        "transaction_date": date(2025, 6, 10),
+                        "disclosure_date": date(2025, 6, 10),
+                        "amount_midpoint": 100.0,
+                        "source": "senate_efd",
+                    },
+                ]
+            ),
+            deduplicate=False,
+        )
+        self.assertEqual(normalized.iloc[2]["transaction_type"], "Sale")
+        self.assertEqual(normalized.iloc[2]["raw_transaction_subtype"], "Sale Full")
+
+        db, conn = _holdings_db(
+            normalized.to_dict("records"),
+            [
+                ("T", date(2025, 1, 10), 100.0),
+                ("T", date(2025, 6, 10), 200.0),
+            ],
+        )
+        try:
+            positions = holdings_candidates(db, "M", date(2025, 6, 11))
+        finally:
+            conn.close()
+
+        self.assertTrue(positions.empty)
+
     def test_multi_lot_fifo_and_discount(self):
         trades = pd.DataFrame(
             [

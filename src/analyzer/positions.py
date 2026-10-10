@@ -124,6 +124,23 @@ def _current_close(prices: pd.DataFrame, as_of: date) -> float | None:
     return price if price > 0 else None
 
 
+def _is_full_sale(kind: str, subtype) -> bool:
+    for value in (kind, subtype):
+        if value is None or pd.isna(value):
+            continue
+        normalized = re.sub(r"[^a-z]", "", str(value).lower())
+        if normalized in {"salefull", "fullsale"}:
+            return True
+    return False
+
+
+def _owner_account(value) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    account = str(value).strip().upper()
+    return account or None
+
+
 def build_positions(
     trades: pd.DataFrame,
     price_history: dict[str, pd.DataFrame],
@@ -150,6 +167,7 @@ def build_positions(
     has_raw = "amount_raw" in trades.columns
     has_instrument = "instrument_type" in trades.columns
     has_disclosure = "disclosure_date" in trades.columns
+    has_subtype = "raw_transaction_subtype" in trades.columns
     if not has_midpoint and not has_raw:
         raise PositionsError("trades need amount_midpoint or amount_raw for sizing")
 
@@ -264,6 +282,12 @@ def build_positions(
         key = (member_key, str(row.ticker))
         day = pd.Timestamp(row.transaction_date).date()
         kind = str(row.transaction_type or "").strip().lower()
+        full_sale = _is_full_sale(
+            kind, row.raw_transaction_subtype if has_subtype else None
+        )
+        account = _owner_account(
+            row.owner_code if "owner_code" in trades.columns else None
+        )
         source = row.source if "source" in trades.columns else None
         congress_estimate = isinstance(source, str) and source in _CONGRESS_SOURCES
         if _is_option_row(row, has_instrument):
@@ -310,18 +334,30 @@ def build_positions(
                         )
                         estimate["bought_value"] += size
                         estimate["bought_shares"] += shares
-            lots.setdefault(key, []).append([shares, size, disclosure_day, source])
+            lots.setdefault(key, []).append(
+                [shares, size, disclosure_day, source, account]
+            )
             if by_floor:
                 floor_sized[key] = floor_sized.get(key, 0) + 1
             first_buy.setdefault(key, day)
-        elif kind in _SELL_TYPES:
-            if kind == "sale full":
+        elif kind in _SELL_TYPES or full_sale:
+            if full_sale:
                 # A full sale closes the position regardless of the filed
                 # dollar amount: estimated-amount FIFO can otherwise leave
-                # phantom residual shares behind.
-                lots[key] = []
+                # phantom residual shares behind. When ownership is disclosed,
+                # close only that account's lots; otherwise close the member's
+                # full position in this ticker.
+                if account is None:
+                    lots[key] = []
+                else:
+                    lots[key] = [lot for lot in lots.get(key, []) if lot[4] != account]
                 band_estimates.pop(key, None)
-                ineligible_for_band_tolerance.discard(key)
+                if lots[key]:
+                    # Aggregate estimates no longer describe the surviving
+                    # account lots, so they cannot safely close their dust.
+                    ineligible_for_band_tolerance.add(key)
+                else:
+                    ineligible_for_band_tolerance.discard(key)
                 first_buy.setdefault(key, day)
                 continue
             filed = _filed_lot(row)
@@ -350,19 +386,20 @@ def build_positions(
                         )
                         estimate["sold_value"] += size
             queue = lots.setdefault(key, [])
-            while to_relieve > 0 and queue:
-                lot_shares, lot_cost, lot_disclosure, lot_source = queue[0]
+            index = 0
+            while to_relieve > 0 and index < len(queue):
+                lot = queue[index]
+                if account is not None and lot[4] != account:
+                    index += 1
+                    continue
+                lot_shares, lot_cost = lot[0], lot[1]
                 if lot_shares <= to_relieve:
                     to_relieve -= lot_shares
-                    queue.pop(0)
+                    queue.pop(index)
                 else:
                     fraction = to_relieve / lot_shares
-                    queue[0] = [
-                        lot_shares - to_relieve,
-                        lot_cost * (1 - fraction),
-                        lot_disclosure,
-                        lot_source,
-                    ]
+                    lot[0] = lot_shares - to_relieve
+                    lot[1] = lot_cost * (1 - fraction)
                     to_relieve = 0
             first_buy.setdefault(key, day)
         else:
@@ -710,11 +747,13 @@ _LOADER_COLUMNS = (
     "member",
     "ticker",
     "transaction_type",
+    "raw_transaction_subtype",
     "transaction_date",
     "disclosure_date",
     "amount_midpoint",
     "amount_raw",
     "source",
+    "owner_code",
     "instrument_type",
     "asset_description",
     "source_record_id",

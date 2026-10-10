@@ -3,10 +3,9 @@
 Point-in-time discipline is mandatory: candidate disclosures must not be after
 ``as_of``, and decision prices are read only from dates on or before ``as_of``.
 Forward outcomes use the last known decision close and the exact NYSE session
-on or before the calendar-day horizon end. Actor weights use ``n_matured=0``
-priors because replay does not fit weights on each historical sample.
-The default member set is a v1
-seed list; pass ``members`` to replay other members.
+on or before the calendar-day horizon end. Actor source priors are discounted
+until matured, point-in-time 90-day excess validates positive skill. The
+default member set is a v1 seed list; pass ``members`` to replay other members.
 """
 
 from __future__ import annotations
@@ -48,7 +47,7 @@ def _load_dependencies():
     for name, piece in (
         ("analyzer.pipeline", "pipeline.eligible_events"),
         ("analyzer.positions", "positions.holdings_candidates"),
-        ("analyzer.actors", "actors.compute_weight"),
+        ("analyzer.actors", "actors.weights_for_candidates"),
         ("analyzer.setups", "setups.score"),
     ):
         try:
@@ -198,12 +197,7 @@ def _score(
     for column in ("actor_id", "kind", "source"):
         if column not in candidates:
             raise ReplayError(f"Replay candidates have no {column} column")
-    weights = {}
-    for row in candidates.itertuples():
-        actor_id = str(row.actor_id)
-        weights[actor_id] = actors.compute_weight(
-            str(row.kind), 0, 0.0, str(row.source)
-        )
+    weights = actors.weights_for_candidates(db, candidates, as_of)
     current_quote = _latest_quote(db, ticker, as_of)
     if current_quote is None:
         return None, True, len(weights)
@@ -290,8 +284,7 @@ def replay(
     """Evaluate live candidates and scoring at each historical as-of date.
 
     No disclosure after ``as_of`` or decision price after ``as_of`` is allowed.
-    The default ``members`` are the v1 skilled-member seed list; ``n_matured=0``
-    keeps actor weights at their priors for comparable historical decisions.
+    The default ``members`` are the v1 skilled-member seed list.
     """
     if horizon_days < 1:
         raise ValueError("horizon_days must be positive")

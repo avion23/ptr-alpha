@@ -390,10 +390,10 @@ def test_zts_june_july_results_use_disclosure_dates_and_ignore_later_rows(
 
     july = after.loc[after["as_of"] == JULY_31].iloc[0]
     assert july["n_actors"] == 4
-    assert july["score"] == pytest.approx(2.08)
+    assert july["score"] == pytest.approx(1.04)
     assert not bool(july["blocked"])
     july_ranked, july_blocked = ranked_by_snapshot[("after", JULY_31)]
-    assert july_ranked.iloc[0]["score"] == pytest.approx(2.08)
+    assert july_ranked.iloc[0]["score"] == pytest.approx(1.04)
     assert july_blocked.empty
 
 

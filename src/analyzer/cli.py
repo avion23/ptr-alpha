@@ -14,6 +14,7 @@ from uuid import uuid4
 import pandas as pd
 import typer
 
+from analyzer.actors import weights_for_candidates
 from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_LOOKBACK_DAYS,
     CONSENSUS_MIN_BUYERS,
@@ -1589,16 +1590,16 @@ def setups(
     """Rank cross-source setups with per-actor price discipline.
 
     Candidates = holdings (per --member, persistent) + purchase events
-    (all official sources, point-in-time). Weights are source priors
-    (n_matured=0 v1 wiring). Fair region is enforced per actor inside
-    scoring: current <= 1.05 x that actor's entry reference.
+    (all official sources, point-in-time). Actor priors are discounted until
+    positive 90-day forward excess is validated from matured disclosures.
+    Fair region is enforced per actor inside scoring: current <= 1.05 x that
+    actor's entry reference.
     """
     as_of_date = _parse_cli_date(
         as_of or None, "Error: --as-of must use YYYY-MM-DD", date.today()
     )
 
     try:
-        from analyzer.actors import compute_weight
         from analyzer.pipeline import eligible_events
         from analyzer.positions import (
             coalesce_actor_variants,
@@ -1725,13 +1726,7 @@ def setups(
             if row is not None and row[0] is not None:
                 current_prices[symbol] = (float(row[0]), row[1])
 
-        weights = {}
-        for row in candidates.itertuples():
-            actor_id = str(row.actor_id)
-            if actor_id not in weights:
-                weights[actor_id] = compute_weight(
-                    str(row.kind), 0, 0.0, str(row.source)
-                )
+        weights = weights_for_candidates(db, candidates, as_of_date)
         ranked, blocked = score_setups(
             candidates,
             weights,

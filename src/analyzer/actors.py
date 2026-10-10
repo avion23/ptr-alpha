@@ -154,10 +154,60 @@ def compute_skill_table(
     )
 
 
+def _load_historical_actor_aliases(
+    db, as_of: date | pd.Timestamp, actor_ids
+) -> pd.DataFrame:
+    cutoff = pd.Timestamp(as_of).normalize()
+    if cutoff.date() <= date.min:
+        return pd.DataFrame(columns=["source", "member", "actor_id"])
+
+    last_names = {
+        tokens[-1]
+        for value in map(str, actor_ids)
+        if (name := value.partition(":")[2])
+        if (tokens := canonical_member_key(name).split())
+    }
+    if not last_names:
+        return pd.DataFrame(columns=["source", "member", "actor_id"])
+
+    last_names = sorted(last_names)
+    name_clause = " OR ".join(
+        "strip_accents(UPPER(member)) LIKE ?" for _ in last_names
+    )
+    member_rows = db.conn.execute(
+        "SELECT DISTINCT source, member FROM canonical_transactions "
+        "WHERE disclosure_date < ? AND source IN (?, ?, ?, ?) AND ("
+        + name_clause
+        + ") AND member IS NOT NULL ORDER BY source, member",
+        [
+            cutoff.date(),
+            *sorted(_SKILL_SOURCES),
+            *(f"%{name}%" for name in last_names),
+        ],
+    ).fetchall()
+    aliases = pd.DataFrame(member_rows, columns=["source", "member"])
+    aliases = aliases.loc[
+        aliases["source"].isin(_SOURCE_KINDS)
+        & aliases["member"].map(lambda member: isinstance(member, str))
+    ].copy()
+    if not aliases.empty:
+        aliases["actor_id"] = [
+            actor_id(_SOURCE_KINDS[source], member)
+            for source, member in aliases[["source", "member"]].itertuples(
+                index=False, name=None
+            )
+        ]
+    else:
+        aliases["actor_id"] = pd.Series(dtype="object")
+    return aliases
+
+
 def load_skill_table(
     db,
     as_of: date | pd.Timestamp,
     actor_ids: set[str] | None = None,
+    *,
+    historical_aliases: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Load canonical, matured actor outcomes without crossing ``as_of``."""
     from analyzer.member_ranking.buyer_scoring import _prepare_consensus_purchases
@@ -176,52 +226,21 @@ def load_skill_table(
             return pd.DataFrame(columns=_SKILL_COLUMNS)
         from analyzer.positions import same_actor_identity
 
+        historical_aliases = (
+            _load_historical_actor_aliases(db, cutoff, actor_ids)
+            if historical_aliases is None
+            else historical_aliases
+        )
+        historical_ids = historical_aliases["actor_id"].astype(str)
         requested = _coalesce_actor_ids(
             pd.DataFrame({"actor_id": sorted(map(str, actor_ids))}),
             sorted(map(str, actor_ids)),
+            historical_ids,
         )
         representatives = list(dict.fromkeys(requested["actor_id"].astype(str)))
-        last_names = set()
-        for value in representatives:
-            _, separator, name = value.partition(":")
-            if not separator:
-                continue
-            tokens = canonical_member_key(name).split()
-            if tokens:
-                last_names.add(tokens[-1])
-        last_names = sorted(last_names)
-        if not last_names:
+        if historical_aliases.empty:
             return pd.DataFrame(columns=_SKILL_COLUMNS)
-        name_clause = " OR ".join(
-            "strip_accents(UPPER(member)) LIKE ?" for _ in last_names
-        )
-        member_rows = db.conn.execute(
-            "SELECT DISTINCT source, member FROM canonical_transactions "
-            "WHERE disclosure_date < ? AND source IN (?, ?, ?, ?) AND ("
-            + name_clause
-            + ") "
-            "AND member IS NOT NULL ORDER BY source, member",
-            [
-                cutoff.date(),
-                *sorted(_SKILL_SOURCES),
-                *(f"%{name}%" for name in last_names),
-            ],
-        ).fetchall()
-        if not member_rows:
-            return pd.DataFrame(columns=_SKILL_COLUMNS)
-        aliases = pd.DataFrame(member_rows, columns=["source", "member"])
-        aliases = aliases.loc[
-            aliases["source"].isin(_SOURCE_KINDS)
-            & aliases["member"].map(lambda member: isinstance(member, str))
-        ].copy()
-        if aliases.empty:
-            return pd.DataFrame(columns=_SKILL_COLUMNS)
-        aliases["actor_id"] = [
-            actor_id(_SOURCE_KINDS[source], member)
-            for source, member in aliases[["source", "member"]].itertuples(
-                index=False, name=None
-            )
-        ]
+        aliases = historical_aliases.copy()
         aliases = aliases.loc[
             aliases["actor_id"].map(
                 lambda alias: any(
@@ -232,7 +251,7 @@ def load_skill_table(
         ].copy()
         if aliases.empty:
             return pd.DataFrame(columns=_SKILL_COLUMNS)
-        aliases = _coalesce_actor_ids(aliases, representatives)
+        aliases = _coalesce_actor_ids(aliases, representatives, historical_ids)
         selected = aliases.loc[
             aliases["actor_id"].isin(representatives), ["source", "member"]
         ].drop_duplicates()
@@ -312,7 +331,10 @@ def load_skill_table(
 
 
 def compute_actor_weights(
-    candidates: pd.DataFrame, skill_table: pd.DataFrame
+    candidates: pd.DataFrame,
+    skill_table: pd.DataFrame,
+    *,
+    historical_actor_ids=(),
 ) -> dict[str, float]:
     """Apply validated skill multipliers to the unchanged source priors."""
     required_candidates = {"actor_id", "kind", "source"}
@@ -325,7 +347,9 @@ def compute_actor_weights(
     ):
         raise ValueError("skill_table must have actor_id, n_matured, mean_excess_pct")
 
-    normalized_candidates = _coalesce_candidate_variants(candidates)
+    normalized_candidates = _coalesce_candidate_variants(
+        candidates, historical_actor_ids
+    )
     validated = {
         str(row.actor_id)
         for row in skill_table.itertuples(index=False)
@@ -352,16 +376,21 @@ def compute_actor_weights(
     }
 
 
-def _coalesce_actor_ids(events: pd.DataFrame, actor_ids) -> pd.DataFrame:
+def _coalesce_actor_ids(
+    events: pd.DataFrame, actor_ids, historical_actor_ids=()
+) -> pd.DataFrame:
     """Coalesce unambiguous name variants without assigning ambiguous short names."""
     from analyzer.positions import same_actor_identity
 
     representatives = list(dict.fromkeys(map(str, actor_ids)))
+    identity_context = list(
+        dict.fromkeys((*representatives, *map(str, historical_actor_ids)))
+    )
     ambiguous = set()
     for representative in representatives:
         matching = [
             candidate
-            for candidate in representatives
+            for candidate in identity_context
             if candidate != representative
             and same_actor_identity(representative, candidate)
         ]
@@ -395,8 +424,14 @@ def _coalesce_actor_ids(events: pd.DataFrame, actor_ids) -> pd.DataFrame:
     return result
 
 
-def _coalesce_candidate_variants(candidates: pd.DataFrame) -> pd.DataFrame:
-    return _coalesce_actor_ids(candidates, candidates["actor_id"].dropna().astype(str))
+def _coalesce_candidate_variants(
+    candidates: pd.DataFrame, historical_actor_ids=()
+) -> pd.DataFrame:
+    return _coalesce_actor_ids(
+        candidates,
+        candidates["actor_id"].dropna().astype(str),
+        historical_actor_ids,
+    )
 
 
 def weights_for_candidates(
@@ -408,10 +443,18 @@ def weights_for_candidates(
     | None = None,
 ) -> dict[str, float]:
     """Shared point-in-time weight path for live setups and historical replay."""
-    normalized = _coalesce_candidate_variants(candidates)
-    nonzero_prior = normalized["source"].map(
+    nonzero_prior = candidates["source"].map(
         lambda source: SOURCE_PRIORS.get(str(source)) is not None
     )
+    historical_aliases = pd.DataFrame(columns=["source", "member", "actor_id"])
+    if nonzero_prior.any():
+        historical_aliases = _load_historical_actor_aliases(
+            db,
+            as_of,
+            candidates["actor_id"].dropna().astype(str),
+        )
+    historical_actor_ids = historical_aliases["actor_id"].astype(str)
+    normalized = _coalesce_candidate_variants(candidates, historical_actor_ids)
     actors = tuple(sorted(set(normalized.loc[nonzero_prior, "actor_id"].astype(str))))
     skill_table = pd.DataFrame(columns=_SKILL_COLUMNS)
     if actors:
@@ -420,10 +463,17 @@ def weights_for_candidates(
         if skill_table_cache is not None and key in skill_table_cache:
             skill_table = skill_table_cache[key]
         else:
-            skill_table = load_skill_table(db, cutoff, set(actors))
+            skill_table = load_skill_table(
+                db,
+                cutoff,
+                set(actors),
+                historical_aliases=historical_aliases,
+            )
             if skill_table_cache is not None:
                 skill_table_cache[key] = skill_table
-    return compute_actor_weights(candidates, skill_table)
+    return compute_actor_weights(
+        candidates, skill_table, historical_actor_ids=historical_actor_ids
+    )
 
 
 def age_weight(days_old: int, half_life_days: int = 365) -> float:

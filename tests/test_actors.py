@@ -160,7 +160,17 @@ def test_mccaul_skill_follows_middle_initial_name_variant(tmp_path):
     }
 
 
-def test_conflicting_middle_name_histories_do_not_merge_short_name(tmp_path):
+@pytest.mark.parametrize(
+    "candidate_names",
+    [
+        ("John Smith", "John A Smith", "John B Smith"),
+        ("John Smith", "John A Smith"),
+        ("John A Smith", "John Smith"),
+    ],
+)
+def test_conflicting_middle_name_histories_do_not_merge_short_name(
+    tmp_path, candidate_names
+):
     from analyzer.actors import weights_for_candidates
 
     db = Database(tmp_path / "conflicting-members.duckdb")
@@ -208,7 +218,7 @@ def test_conflicting_middle_name_histories_do_not_merge_short_name(tmp_path):
                 "kind": "congress",
                 "source": "house_pdf",
             }
-            for name in ("John Smith", "John A Smith", "John B Smith")
+            for name in candidate_names
         ]
     )
 
@@ -217,11 +227,15 @@ def test_conflicting_middle_name_histories_do_not_merge_short_name(tmp_path):
     finally:
         db.close()
 
-    assert weights == {
-        "congress:JOHN SMITH": pytest.approx(0.26),
-        "congress:JOHN A SMITH": SOURCE_PRIORS["house_pdf"],
-        "congress:JOHN B SMITH": pytest.approx(0.26),
+    expected = {
+        actor_id("congress", name): (
+            SOURCE_PRIORS["house_pdf"]
+            if name == "John A Smith"
+            else pytest.approx(0.26)
+        )
+        for name in candidate_names
     }
+    assert weights == expected
 
 
 def test_accented_surname_skill_history_is_found(tmp_path):
@@ -324,8 +338,13 @@ def test_weight_lookup_cache_reuses_skill_table(monkeypatch):
     monkeypatch.setattr(
         actors,
         "load_skill_table",
-        lambda db, as_of, actor_ids: calls.append((as_of, actor_ids))
+        lambda db, as_of, actor_ids, **_kwargs: calls.append((as_of, actor_ids))
         or pd.DataFrame(columns=["actor_id", "n_matured", "mean_excess_pct"]),
+    )
+    monkeypatch.setattr(
+        actors,
+        "_load_historical_actor_aliases",
+        lambda *_args: pd.DataFrame(columns=["source", "member", "actor_id"]),
     )
     candidates = pd.DataFrame(
         [{"actor_id": "congress:ALICE", "kind": "congress", "source": "house_pdf"}]

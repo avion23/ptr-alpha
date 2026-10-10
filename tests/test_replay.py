@@ -50,7 +50,10 @@ def _install_scoring(monkeypatch, events):
                 same_member_identity=positions.same_member_identity,
             ),
             SimpleNamespace(
-                compute_weight=lambda kind, n, hits, source: 0.6
+                weights_for_candidates=lambda db, candidates, as_of, **kwargs: {
+                    str(actor_id): 0.6
+                    for actor_id in candidates["actor_id"].dropna().unique()
+                }
             ),
             SimpleNamespace(score=lambda candidates, weights, prices, **kw: (ranked, blocked)),
         ),
@@ -121,7 +124,9 @@ def test_replay_blocks_a_stale_last_quote():
     decision_date = date(2024, 1, 16)
     candidates = _events().assign(as_of=decision_date)
     db = _price_db([("ABC", AS_OF, 100.0)])
-    actors = SimpleNamespace(compute_weight=lambda *_: 1.0)
+    actors = SimpleNamespace(
+        weights_for_candidates=lambda db, candidates, as_of: {"congress:ALICE": 1.0}
+    )
 
     try:
         score, blocked, actor_count = replay_module._score(

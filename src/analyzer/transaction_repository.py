@@ -332,6 +332,27 @@ class TransactionRepository:
         ).fetchdf()
         return _normalize_frame(result, deduplicate=True)
 
+    def get_skill_history(
+        self, before_date: date, source_members: tuple[tuple[str, str], ...]
+    ) -> pd.DataFrame:
+        """Load only pre-cutoff skill rows for the requested source/member pairs."""
+        if not source_members:
+            return pd.DataFrame()
+        pair_clause = " OR ".join(
+            "(source = ? AND member = ?)" for _ in source_members
+        )
+        params: list[object] = [before_date]
+        params.extend(value for pair in source_members for value in pair)
+        result = self.conn.execute(
+            f"""
+            SELECT * FROM canonical_transactions
+            WHERE disclosure_date < ? AND ({pair_clause})
+            ORDER BY disclosure_date DESC, id DESC
+            """,  # nosec B608
+            params,
+        ).fetchdf()
+        return _normalize_frame(result, deduplicate=True)
+
     def upsert(
         self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False
     ) -> int:

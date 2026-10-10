@@ -3,10 +3,9 @@
 Point-in-time discipline is mandatory: candidate disclosures must not be after
 ``as_of``, and decision prices are read only from dates on or before ``as_of``.
 Forward outcomes use the last known decision close and the exact NYSE session
-on or before the calendar-day horizon end. Actor weights use ``n_matured=0``
-priors because replay does not fit weights on each historical sample.
-The default member set is a v1
-seed list; pass ``members`` to replay other members.
+on or before the calendar-day horizon end. Actor source priors are discounted
+until matured, point-in-time 90-day excess validates positive skill. The
+default member set is a v1 seed list; pass ``members`` to replay other members.
 """
 
 from __future__ import annotations
@@ -48,7 +47,7 @@ def _load_dependencies():
     for name, piece in (
         ("analyzer.pipeline", "pipeline.eligible_events"),
         ("analyzer.positions", "positions.holdings_candidates"),
-        ("analyzer.actors", "actors.compute_weight"),
+        ("analyzer.actors", "actors.weights_for_candidates"),
         ("analyzer.setups", "setups.score"),
     ):
         try:
@@ -191,18 +190,24 @@ def _latest_quote(db, ticker: str, as_of: date) -> tuple[float, date] | None:
 
 
 def _score(
-    db, ticker: str, as_of: date, candidates: pd.DataFrame, actors, setups
+    db,
+    ticker: str,
+    as_of: date,
+    candidates: pd.DataFrame,
+    actors,
+    setups,
+    skill_table_cache=None,
 ) -> tuple[object, bool, int]:
     if candidates.empty:
         return None, True, 0
     for column in ("actor_id", "kind", "source"):
         if column not in candidates:
             raise ReplayError(f"Replay candidates have no {column} column")
-    weights = {}
-    for row in candidates.itertuples():
-        actor_id = str(row.actor_id)
-        weights[actor_id] = actors.compute_weight(
-            str(row.kind), 0, 0.0, str(row.source)
+    if skill_table_cache is None:
+        weights = actors.weights_for_candidates(db, candidates, as_of)
+    else:
+        weights = actors.weights_for_candidates(
+            db, candidates, as_of, skill_table_cache=skill_table_cache
         )
     current_quote = _latest_quote(db, ticker, as_of)
     if current_quote is None:
@@ -286,17 +291,18 @@ def replay(
     *,
     horizon_days: int = 90,
     members: list[str] | None = None,
+    skill_table_cache: dict | None = None,
 ) -> pd.DataFrame:
     """Evaluate live candidates and scoring at each historical as-of date.
 
     No disclosure after ``as_of`` or decision price after ``as_of`` is allowed.
-    The default ``members`` are the v1 skilled-member seed list; ``n_matured=0``
-    keeps actor weights at their priors for comparable historical decisions.
+    The default ``members`` are the v1 skilled-member seed list.
     """
     if horizon_days < 1:
         raise ValueError("horizon_days must be positive")
     pipeline, positions, actors, setups = _load_dependencies()
     selected_members = list(_V1_MEMBERS if members is None else members)
+    skill_table_cache = {} if skill_table_cache is None else skill_table_cache
     rows = []
     for raw_ticker in tickers:
         ticker = str(raw_ticker).strip().upper()
@@ -308,7 +314,13 @@ def replay(
                 db, ticker, as_of, selected_members, pipeline, positions
             )
             score_value, blocked, n_actors = _score(
-                db, ticker, as_of, candidates, actors, setups
+                db,
+                ticker,
+                as_of,
+                candidates,
+                actors,
+                setups,
+                skill_table_cache,
             )
             fwd_return = _price_return(db, ticker, as_of, horizon_days)
             spy_return = _benchmark_return(db, as_of, horizon_days)

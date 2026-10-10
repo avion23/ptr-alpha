@@ -691,6 +691,9 @@ def coalesce_actor_variants(events: pd.DataFrame, from_positions: pd.DataFrame) 
     """
     if events.empty or "actor_id" not in events.columns:
         return events
+    if "_pre_coalesced_actor_id" not in events.columns:
+        # Skill validation must retain the identity before shared scoring pools it.
+        events["_pre_coalesced_actor_id"] = events["actor_id"].astype(str)
     representatives: list[str] = []
     if {"actor_id", "position_evidence"}.issubset(from_positions.columns):
         open_actors = from_positions.loc[

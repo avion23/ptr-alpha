@@ -13,6 +13,7 @@ Usage:
   python3 scripts/backtest_assumptions.py skill
   python3 scripts/backtest_assumptions.py run 2023-01-15
   python3 scripts/backtest_assumptions.py analyze
+  python3 scripts/backtest_assumptions.py sweep
   python3 scripts/backtest_assumptions.py full
 Results land in data/backtest_assumptions/.
 """
@@ -50,6 +51,7 @@ OUT_DIR = DATA_DIR / "backtest_assumptions"
 DB_PATH = Path("/home/ubuntu/insider-trading/data/congress.duckdb")
 HORIZON = 90
 MAX_ENTRY_GAP_DAYS = 4
+TOLERANCES = [1.00, 1.03, 1.05, 1.10, 1.30, 1.50, 2.00, math.inf]
 
 DECISIONS = [
     date(2023, 1, 15),
@@ -268,6 +270,7 @@ def cmd_run(decision: date, db=None):
 
         watchlist = watchlist_actor_ids()
         rows = []
+        actor_rows = []
         for i, symbol in enumerate(keep):
             events = events_all.loc[
                 events_all["ticker"].astype("string").str.upper() == symbol
@@ -335,6 +338,29 @@ def cmd_run(decision: date, db=None):
             ).dt.days.dropna()
             fresh_frame = init.loc[lags.between(0, 30)] if not lags.empty else init.iloc[0:0]
             fresh_actors = set(fresh_frame["actor_id"].astype(str))
+            max_valid_ref = float(refs.loc[valid_refs].max())
+            for actor, actor_candidates in init.groupby("actor_id", sort=True):
+                actor_refs = pd.to_numeric(actor_candidates["entry_ref"], errors="coerce")
+                actor_reference = actor_candidates.loc[
+                    actor_refs.idxmax()
+                ]
+                actor_lags = (
+                    pd.to_datetime(decision)
+                    - pd.to_datetime(actor_candidates["disclosure_date"])
+                ).dt.days.dropna()
+                actor_rows.append(
+                    {
+                        "as_of": str(decision),
+                        "ticker": symbol,
+                        "actor_id": str(actor),
+                        "kind": str(actor_reference["kind"]),
+                        "entry_ref": float(actor_reference["entry_ref"]),
+                        "lag_days": int(actor_lags.min()) if not actor_lags.empty else None,
+                        "skilled": str(actor) in skilled,
+                        "hyper": str(actor) in hyper,
+                        "excess": exc,
+                    }
+                )
             entry_eligible = bool((entry_px <= 1.05 * refs.loc[valid_refs]).any())
             rows.append(
                 {
@@ -351,6 +377,7 @@ def cmd_run(decision: date, db=None):
                     "fresh_skilled": bool(fresh_actors & skilled),
                     "min_lag": int(lags.min()) if not lags.empty else None,
                     "entry_px": entry_px,
+                    "max_valid_ref": max_valid_ref,
                     "entry_eligibility": "eligible" if entry_eligible else "ineligible",
                     "entry_eligible": entry_eligible,
                     "fwd": ret,
@@ -366,6 +393,13 @@ def cmd_run(decision: date, db=None):
             if (i + 1) % 50 == 0:
                 print(f"  ... {i + 1}/{len(keep)}", flush=True)
         pd.DataFrame(rows).to_csv(OUT_DIR / f"cohorts_{decision}.csv", index=False)
+        pd.DataFrame(
+            actor_rows,
+            columns=[
+                "as_of", "ticker", "actor_id", "kind", "entry_ref", "lag_days",
+                "skilled", "hyper", "excess",
+            ],
+        ).to_csv(OUT_DIR / f"actors_{decision}.csv", index=False)
         print("wrote", len(rows), "rows", flush=True)
     finally:
         if owns_db:
@@ -460,6 +494,109 @@ def cmd_analyze():
     print(summary.to_string(index=False), flush=True)
 
 
+def sweep_comparison(frame: pd.DataFrame, group: str, outcome: str) -> dict:
+    values = frame[[outcome, "as_of", group]].dropna().rename(
+        columns={outcome: "excess"}
+    )
+    eligible = values.loc[values[group].astype(bool), "excess"].astype(float)
+    ineligible = values.loc[~values[group].astype(bool), "excess"].astype(float)
+    welch = (
+        stats.ttest_ind(eligible, ineligible, equal_var=False).statistic
+        if len(eligible) and len(ineligible)
+        else float("nan")
+    )
+    return {
+        "n_elig": len(eligible),
+        "n_inelig": len(ineligible),
+        "mean_elig": float(eligible.mean()) if len(eligible) else float("nan"),
+        "mean_inelig": float(ineligible.mean()) if len(ineligible) else float("nan"),
+        "hit_rate_elig": float((eligible > 0).mean()) if len(eligible) else float("nan"),
+        "hit_rate_inelig": float((ineligible > 0).mean()) if len(ineligible) else float("nan"),
+        "welch_t": float(welch),
+        "date_clustered_t": clustered_t(values, group),
+    }
+
+
+def cmd_sweep():
+    cohort_files = [OUT_DIR / f"cohorts_{decision}.csv" for decision in DECISIONS]
+    actor_files = [OUT_DIR / f"actors_{decision}.csv" for decision in DECISIONS]
+    missing = [path.name for path in cohort_files + actor_files if not path.exists()]
+    if missing:
+        raise SystemExit(
+            "missing cohort or actor CSVs; run all decision dates first: "
+            + ", ".join(missing)
+        )
+
+    cohorts = pd.concat([pd.read_csv(path) for path in cohort_files], ignore_index=True)
+    actors = pd.concat([pd.read_csv(path) for path in actor_files], ignore_index=True)
+    if actors.duplicated(["as_of", "ticker", "actor_id"]).any():
+        raise SystemExit("actor CSVs contain duplicate decision+ticker+actor rows")
+    actor_means = actors.groupby("actor_id", as_index=False)["excess"].mean()
+    actor_means = actor_means.rename(columns={"excess": "actor_mean"})
+    actors = actors.merge(actor_means, on="actor_id", validate="many_to_one")
+    demeaned = actors.groupby(["as_of", "ticker"], as_index=False).agg(
+        actor_excess=("excess", "first"), actor_mean=("actor_mean", "mean")
+    )
+    if actors.groupby(["as_of", "ticker"])["excess"].nunique().gt(1).any():
+        raise SystemExit("actor rows do not share one ticker-level excess")
+    demeaned["y_demeaned"] = demeaned["actor_excess"] - demeaned["actor_mean"]
+    cohorts["max_valid_ref"] = pd.to_numeric(cohorts["max_valid_ref"], errors="coerce")
+    cohorts = cohorts.merge(
+        demeaned[["as_of", "ticker", "actor_excess", "y_demeaned"]],
+        on=["as_of", "ticker"],
+        how="left",
+        validate="one_to_one",
+    )
+    valid_ref = np.isfinite(cohorts["max_valid_ref"]) & (cohorts["max_valid_ref"] > 0)
+    has_actor_rows = cohorts["actor_excess"].notna()
+    if not np.array_equal(valid_ref.to_numpy(), has_actor_rows.to_numpy()):
+        raise SystemExit("actor CSVs do not cover every cohort with a valid reference")
+    if cohorts.loc[valid_ref, "y_demeaned"].isna().any():
+        raise SystemExit("actor rows do not support within-actor demeaning")
+    if not np.allclose(
+        cohorts.loc[has_actor_rows, "excess"],
+        cohorts.loc[has_actor_rows, "actor_excess"],
+        equal_nan=True,
+    ):
+        raise SystemExit("actor and cohort excess values differ")
+    cohorts = cohorts.drop(columns="actor_excess")
+    cohorts["entry_px"] = pd.to_numeric(cohorts["entry_px"], errors="coerce")
+    ranked = cohorts["ranked"].astype(str).str.lower().eq("true")
+    at_105 = (
+        valid_ref
+        & np.isfinite(cohorts["entry_px"])
+        & (cohorts["entry_px"] <= 1.05 * cohorts["max_valid_ref"])
+    )
+    if not np.array_equal(
+        at_105.to_numpy(),
+        cohorts["entry_eligible"].astype(str).str.lower().eq("true").to_numpy(),
+    ):
+        raise SystemExit("1.05 re-bucketing differs from persisted entry eligibility")
+    rows = []
+    for tolerance in TOLERANCES:
+        cohorts["eligible"] = (
+            valid_ref
+            & np.isfinite(cohorts["entry_px"])
+            & (cohorts["entry_px"] <= tolerance * cohorts["max_valid_ref"])
+        )
+        for sample, selected in (("all", cohorts), ("ranked", cohorts.loc[ranked])):
+            for variant, outcome in (
+                ("raw", "excess"),
+                ("within_actor", "y_demeaned"),
+            ):
+                rows.append(
+                    {
+                        "tolerance": "inf" if math.isinf(tolerance) else f"{tolerance:.2f}",
+                        "sample": sample,
+                        "outcome": variant,
+                        **sweep_comparison(selected, "eligible", outcome),
+                    }
+                )
+    summary = pd.DataFrame(rows)
+    summary.to_csv(OUT_DIR / "sweep.csv", index=False)
+    print(summary.to_string(index=False), flush=True)
+
+
 def cmd_full():
     cmd_skill()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -482,7 +619,9 @@ if __name__ == "__main__":
             cmd_run(date.fromisoformat(sys.argv[2]))
     elif mode == "analyze":
         cmd_analyze()
+    elif mode == "sweep":
+        cmd_sweep()
     elif mode == "full":
         cmd_full()
     else:
-        raise SystemExit("usage: skill | run YYYY-MM-DD | analyze | full")
+        raise SystemExit("usage: skill | run YYYY-MM-DD | analyze | sweep | full")

@@ -204,6 +204,23 @@ def _without_account_metadata(asset_text: str) -> str:
     )
 
 
+def _resolve_abbreviated_company_name(normalized: str) -> str | None:
+    words = normalized.split()
+    if not words or any(len(word) < 4 for word in words):
+        return None
+    matches = {
+        ticker
+        for name, tickers in _sec_company_name_index().items()
+        if len(company_words := name.split()) == len(words)
+        and all(
+            company_word.startswith(word)
+            for word, company_word in zip(words, company_words, strict=True)
+        )
+        for ticker in tickers
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def resolve_asset_ticker(asset_text: str) -> str | None:
     """Resolve an asset description only when its company identity is unique."""
     if not isinstance(asset_text, str) or not asset_text.strip():
@@ -236,6 +253,6 @@ def resolve_asset_ticker(asset_text: str) -> str | None:
         )
     ]
     if not uncovered:
-        return None
+        return _resolve_abbreviated_company_name(normalized)
     matches = {t for tickers in uncovered for t in tickers}
     return next(iter(matches)) if len(matches) == 1 else None

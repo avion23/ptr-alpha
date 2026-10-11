@@ -3,12 +3,32 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from analyzer import asset_ticker_map
 from analyzer.form13f import (
     ThirteenFError,
     ThirteenFSource,
     _parse_information_table,
     candidates_from_increases,
 )
+from analyzer.pipeline import eligible_events
+
+
+@pytest.fixture
+def sec_company_tickers(monkeypatch):
+    rows = asset_ticker_map._company_rows(
+        {
+            "0": {"ticker": "MSFT", "title": "Microsoft Corporation"},
+            "1": {"ticker": "AMZN", "title": "Amazon.com, Inc."},
+            "2": {
+                "ticker": "SPCX",
+                "title": "Space Exploration Technologies Corp.",
+            },
+        }
+    )
+    monkeypatch.setattr(asset_ticker_map, "_load_sec_company_tickers", lambda: rows)
+    asset_ticker_map._sec_company_name_index.cache_clear()
+    yield
+    asset_ticker_map._sec_company_name_index.cache_clear()
 
 
 @pytest.fixture
@@ -82,9 +102,10 @@ def test_empty_information_table_fails_closed():
         )
 
 
-def test_fetch_all_increases_keeps_unmatched_and_new_positions(
+def test_fetch_all_increases_drops_unmatched_and_keeps_mapped_positions(
     tmp_path, quarter_xmls, monkeypatch
 ):
+    monkeypatch.setattr("analyzer.form13f.resolve_asset_ticker", lambda issuer: None)
     source = ThirteenFSource(
         data_dir=tmp_path / "data",
         db=object(),
@@ -120,15 +141,122 @@ def test_fetch_all_increases_keeps_unmatched_and_new_positions(
 
     assert list(zip(increases["ticker"], increases["added_shares"])) == [
         ("VST", 50),
-        (None, 50),
         ("ORION", 400),
     ]
-    unknown = increases.loc[increases["ticker"].isna()].iloc[0]
-    assert unknown["cusip"] == "333333333"
-    assert unknown["raw_asset_description"] == "Nova Labs"
     assert increases["event_date"].eq(date(2026, 6, 30)).all()
     assert increases["disclosure_date"].eq(date(2026, 8, 14)).all()
     source.close()
+
+
+def test_increases_resolve_tickers_drop_unknown_and_dedupe_cusips(
+    tmp_path, sec_company_tickers
+):
+    source = ThirteenFSource(
+        data_dir=tmp_path / "data",
+        db=object(),
+        watchlist={"VST": {"VISTRA"}},
+        managers={"test": {"name": "Test Manager", "cik": "1234567"}},
+    )
+    current = _parse_information_table(
+        """<informationTable>
+        <infoTable><nameOfIssuer>Microsoft Corporation</nameOfIssuer><cusip>594918104</cusip><sshPrnamt>100</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+        <infoTable><nameOfIssuer>Microsoft Corporation</nameOfIssuer><cusip>594918104</cusip><sshPrnamt>50</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+        <infoTable><nameOfIssuer>Amazon.com, Inc.</nameOfIssuer><cusip>023135106</cusip><sshPrnamt>250</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+        <infoTable><nameOfIssuer>Space Exploration Techn Corp</nameOfIssuer><cusip>84615Q103</cusip><sshPrnamt>225</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+        <infoTable><nameOfIssuer>Private Project Holdings</nameOfIssuer><cusip>999999999</cusip><sshPrnamt>75</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+        </informationTable>"""
+    )
+
+    rows = source._position_increases(
+        "test",
+        {"name": "Test Manager"},
+        {
+            "report_date": "2026-06-30",
+            "filing_date": "2026-08-14",
+            "accession": "0001234567-26-000002",
+        },
+        current,
+        {"594918104": {"issuer": "Microsoft Corporation", "shares": 100}},
+        "unused",
+    )
+
+    assert [(row["cusip"], row["ticker"], row["added_shares"]) for row in rows] == [
+        ("594918104", "MSFT", 50),
+        ("023135106", "AMZN", 250),
+        ("84615Q103", "SPCX", 225),
+    ]
+    assert len({row["cusip"] for row in rows}) == len(rows)
+    source.close()
+
+
+def test_eligible_events_resolves_stored_null_13f_tickers(
+    sec_company_tickers,
+):
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "Citadel Advisors LLC",
+                "ticker": None,
+                "raw_asset_description": "Microsoft Corporation",
+                "transaction_date": date(2026, 3, 31),
+                "disclosure_date": date(2026, 5, 15),
+                "transaction_type": "Purchase",
+                "instrument_type": "Common Stock",
+                "source": "13f",
+            },
+            {
+                "member": "Appaloosa LP",
+                "ticker": None,
+                "raw_asset_description": "Amazon.com, Inc.",
+                "transaction_date": date(2026, 3, 31),
+                "disclosure_date": date(2026, 5, 15),
+                "transaction_type": "Purchase",
+                "instrument_type": "Common Stock",
+                "source": "13f",
+            },
+            {
+                "member": "Appaloosa LP",
+                "ticker": None,
+                "raw_asset_description": "Space Exploration Techn Corp",
+                "transaction_date": date(2026, 6, 30),
+                "disclosure_date": date(2026, 8, 14),
+                "transaction_type": "Purchase",
+                "instrument_type": "Common Stock",
+                "source": "13f",
+            },
+            {
+                "member": "Citadel Advisors LLC",
+                "ticker": "ABT",
+                "raw_asset_description": "ABBOTT LABORATORIES",
+                "transaction_date": date(2026, 6, 30),
+                "disclosure_date": date(2026, 9, 2),
+                "transaction_type": "Purchase",
+                "instrument_type": "Common Stock",
+                "source": "13f",
+            },
+            {
+                "member": "Unknown Manager",
+                "ticker": None,
+                "raw_asset_description": "Private Project Holdings",
+                "transaction_date": date(2026, 3, 31),
+                "disclosure_date": date(2026, 5, 15),
+                "transaction_type": "Purchase",
+                "instrument_type": "Common Stock",
+                "source": "13f",
+            },
+        ]
+    )
+
+    class ReadOnlyDB:
+        conn = None
+
+        def get_transactions_by_date_range(self, start, end):
+            return trades.copy()
+
+    events = eligible_events(ReadOnlyDB(), date(2026, 9, 3))
+
+    assert events["ticker"].tolist() == ["MSFT", "AMZN", "SPCX", "ABT"]
+    assert events["corroboration"].tolist() == [True, True, True, True]
 
 
 def test_candidates_from_increases_has_shared_schema_and_corroborates():

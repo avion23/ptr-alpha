@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer import analysis
+from analyzer.asset_ticker_map import resolve_asset_ticker
 from analyzer.actors import actor_id
 from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataResult, DataSourceError, StepResult
@@ -308,6 +309,19 @@ def eligible_events(
         return pd.DataFrame(columns=columns)
 
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
+    unresolved_13f = trades["source"].eq("13f") & trades["ticker"].isna()
+    if unresolved_13f.any() and "raw_asset_description" in trades:
+        descriptions = trades.loc[
+            unresolved_13f, "raw_asset_description"
+        ].dropna().unique()
+        resolved = {
+            description: resolve_asset_ticker(description)
+            for description in descriptions
+        }
+        trades.loc[unresolved_13f, "ticker"] = trades.loc[
+            unresolved_13f, "raw_asset_description"
+        ].map(resolved)
+
     eligible = (
         trades["source"].isin(_OFFICIAL_SOURCES)
         & trades["ticker"].notna()

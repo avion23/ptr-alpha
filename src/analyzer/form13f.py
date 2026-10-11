@@ -14,6 +14,7 @@ from typing import Callable
 import pandas as pd
 import requests
 
+from analyzer.asset_ticker_map import resolve_asset_ticker
 from analyzer.database import Database
 from analyzer.form4 import (
     SEC_ARCHIVES_URL,
@@ -403,11 +404,11 @@ class ThirteenFSource(TransactionSource):
                 for ticker, keywords in self.watchlist.items()
                 if any(keyword.casefold() in issuer_folded for keyword in keywords)
             }
-            ticker = (
-                next(iter(matches))
-                if len(matches) == 1
-                else self.ticker_map.get(cusip.upper())
-            )
+            ticker = self.ticker_map.get(cusip.upper()) or resolve_asset_ticker(issuer)
+            if ticker is None and len(matches) == 1:
+                ticker = next(iter(matches))
+            if ticker is None:
+                continue
             rows.append(
                 {
                     "manager_key": manager_key,
@@ -558,8 +559,7 @@ class ThirteenFSource(TransactionSource):
 
         Discovery frames carry no dollar amounts (no price lookup at this
         scope), so amount_midpoint stays NULL and downstream sizing treats
-        these rows as corroboration with unknown size. Ticker may be NULL
-        for unmatched issuers; those rows persist for review.
+        these rows as corroboration with unknown size.
         """
         if not set(_INCREASE_COLUMNS) <= set(increases.columns):
             raise ThirteenFError(

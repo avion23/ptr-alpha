@@ -102,6 +102,37 @@ def test_cleanup_duplicate_deletion_preserves_old_rowset(tmp_path):
         db.close()
 
 
+@pytest.mark.parametrize("repair", ["cleanup_tickers", "backfill_tickers"])
+def test_partial_ticker_repair_preserves_complete_legacy_rowset(tmp_path, repair):
+    path = tmp_path / "db.duckdb"
+    original = "MICROSOFT CORPORATION" if repair == "cleanup_tickers" else None
+    db = Database(path)
+    row = seed(db, accepted="2026-08-04", created="2026-08-02 12:00:00", ticker=original)
+    db.conn.execute("UPDATE transactions SET asset_description='Microsoft Corporation'")
+    row.update(source_row_id="unchanged", ticker="JPM")
+    db.upsert_transactions(pd.DataFrame([row]), source="house_pdf")
+    db.conn.execute("UPDATE transactions SET created_at='2026-08-02 12:01:00' WHERE source_row_id='unchanged'")
+    db.conn.execute("UPDATE pdf_parse_runs SET transaction_count=2")
+    with db.canonical_as_of(date(2026, 9, 21)):
+        assert db.get_transactions(2026).sort_values("source_row_id").ticker.fillna("NULL").tolist() == [original or "NULL", "JPM"]
+    db.close()
+
+    if repair == "cleanup_tickers":
+        load_script(repair).main(path)
+    else:
+        assert load_script(repair).backfill_tickers(path, apply=True) == (1, 0)
+    db = Database(path)
+    try:
+        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions").fetchone()[0] == 1
+        with db.canonical_as_of(date(2026, 9, 21)):
+            assert db.get_transactions(2026).sort_values("source_row_id").ticker.fillna("NULL").tolist() == [original or "NULL", "JPM"]
+        with db.canonical_as_of(date.today()):
+            assert db.get_transactions(2026).sort_values("source_row_id").ticker.tolist() == ["MSFT", "JPM"]
+        assert db.get_transactions(2026).sort_values("source_row_id").ticker.tolist() == ["MSFT", "JPM"]
+    finally:
+        db.close()
+
+
 def test_bulk_repair_does_not_make_repaired_doc_valid_in_the_past(tmp_path):
     path = tmp_path / "congress.duckdb"
     db = Database(path)

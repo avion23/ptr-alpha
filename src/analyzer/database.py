@@ -341,6 +341,7 @@ class Database:
         acceptance_filter = f"AND parse_run.parsed_at < {boundary}" if boundary else ""
         completion_filter = ""
         prefix = ""
+        legacy_rowsets = ""
         if boundary:
             tables = {r[0] for r in self.conn.execute("SHOW TABLES").fetchall()}
             run_columns = {r[1] for r in self.conn.execute("PRAGMA table_info('pdf_parse_runs')").fetchall()}
@@ -351,16 +352,54 @@ class Database:
             # cannot reuse a previous run's acceptance.
             legacy_watermark = "date_trunc('day', parse_run.parsed_at) + INTERVAL 1 DAY - INTERVAL 1 MICROSECOND"
             if "transaction_versions" in tables:
-                # A recorded retirement bounds legacy acceptance too: never
-                # let transaction-start tolerance authorize its replacement.
+                # Reconstruct the COMPLETE rowset just before its first repair,
+                # not only the retired rows: unchanged rows may be newer than
+                # the repaired row. Still never authorize its replacement.
                 legacy_watermark = f"""LEAST({legacy_watermark}, (
-                    SELECT MAX(history.created_at) FROM transaction_versions history
-                    WHERE history.doc_id = parse_run.doc_id
-                      AND history.ingestion_generation = parse_run.ingestion_generation
-                      AND history.artifact_sha256 = parse_run.artifact_sha256
-                      AND history.source = {_HOUSE_PARSE_SOURCE}
-                      AND history.retired_at > parse_run.parsed_at
-                    GROUP BY history.retired_at ORDER BY history.retired_at LIMIT 1))"""
+                    SELECT legacy.watermark FROM legacy_watermarks legacy
+                    WHERE legacy.doc_id = parse_run.doc_id
+                      AND legacy.ingestion_generation = parse_run.ingestion_generation
+                      AND legacy.artifact_sha256 = parse_run.artifact_sha256
+                      AND legacy.source = {_HOUSE_PARSE_SOURCE}
+                      AND legacy.parsed_at = parse_run.parsed_at))"""
+                legacy_only = "AND parse_run.rowset_created_at IS NULL" if "rowset_created_at" in run_columns else ""
+                # Compute once per run, not once per output row / predicate.
+                legacy_rowsets = f"""legacy_repairs AS (
+                    SELECT parse_run.doc_id, parse_run.ingestion_generation,
+                           parse_run.artifact_sha256, parse_run.parsed_at,
+                           {_HOUSE_PARSE_SOURCE} AS source,
+                           MIN(history.retired_at) AS repaired_at
+                    FROM asof_parse_runs parse_run
+                    JOIN transaction_versions history
+                      ON history.doc_id = parse_run.doc_id
+                     AND history.ingestion_generation = parse_run.ingestion_generation
+                     AND history.artifact_sha256 = parse_run.artifact_sha256
+                     AND history.source = {_HOUSE_PARSE_SOURCE}
+                     AND history.retired_at > parse_run.parsed_at
+                    WHERE parse_run.parsed_at < {boundary} {legacy_only}
+                    GROUP BY ALL),
+                legacy_original_rows AS (
+                    SELECT repair.*, original.id, original.created_at
+                    FROM legacy_repairs repair
+                    JOIN (
+                        SELECT *, TIMESTAMPTZ 'infinity' AS retired_at FROM transactions
+                        UNION ALL SELECT * FROM transaction_versions
+                    ) original
+                      ON original.doc_id = repair.doc_id
+                     AND original.ingestion_generation = repair.ingestion_generation
+                     AND original.artifact_sha256 = repair.artifact_sha256
+                     AND original.source = repair.source
+                     AND original.retired_at >= repair.repaired_at
+                     AND (original.created_at < repair.repaired_at
+                          OR original.retired_at = repair.repaired_at)
+                    QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY repair.doc_id, repair.ingestion_generation,
+                            repair.artifact_sha256, repair.source, repair.parsed_at, original.id
+                        ORDER BY original.retired_at) = 1),
+                legacy_watermarks AS (
+                    SELECT doc_id, ingestion_generation, artifact_sha256, source,
+                           parsed_at, MAX(created_at) AS watermark
+                    FROM legacy_original_rows GROUP BY ALL), """
             watermark = (f"COALESCE(parse_run.rowset_created_at, {legacy_watermark})"
                          if "rowset_created_at" in run_columns else legacy_watermark)
             tx_versions = (" UNION ALL SELECT * EXCLUDE (retired_at) FROM transaction_versions "
@@ -368,7 +407,7 @@ class Database:
             run_versions = (" UNION ALL SELECT * EXCLUDE (retired_at) FROM parse_run_versions "
                             f"WHERE retired_at >= {boundary}" if "parse_run_versions" in tables else "")
             prefix = (f"asof_transactions AS (SELECT * FROM (SELECT * FROM transactions {tx_versions}) versions WHERE created_at < {boundary}), "
-                      f"asof_parse_runs AS (SELECT * FROM pdf_parse_runs {run_versions}), ")
+                      f"asof_parse_runs AS (SELECT * FROM pdf_parse_runs {run_versions}), {legacy_rowsets}")
             if "house_generation_versions" in tables:
                 prefix += f"""asof_generations AS (
                     SELECT * EXCLUDE (retired_at) FROM (

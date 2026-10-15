@@ -17,6 +17,7 @@ from pathlib import Path
 
 from analyzer.database import Database
 from scripts.gemini_ocr_common import (
+    apply_verified_house_corrections,
     GEMINI_PARSER_VERSION,
     MODEL,
     GeminiOutputError as GeminiOutputError,
@@ -1320,6 +1321,9 @@ def insert_transactions(
         return 0
 
     input_count = raw_count if raw_count is not None else len(transactions)
+    transactions = apply_verified_house_corrections(
+        doc_id, artifact_sha256, transactions
+    )
     validated, rejections = validate_transactions(
         doc_id, member, transactions, filing_date, expected_member
     )

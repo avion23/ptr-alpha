@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, timedelta
 from functools import wraps
@@ -302,7 +303,9 @@ def eligible_events(
         if days_back is not None
         else date.min
     )
-    trades = db.get_transactions_by_date_range(history_start, decision_date)
+    scope = db.canonical_as_of(decision_date) if hasattr(db, "canonical_as_of") else nullcontext()
+    with scope:
+        trades = db.get_transactions_by_date_range(history_start, decision_date)
     if trades.empty or not {"source", "ticker", "disclosure_date"}.issubset(
         trades.columns
     ):

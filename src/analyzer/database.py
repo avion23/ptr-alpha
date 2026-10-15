@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -292,8 +293,34 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_tx_member ON transactions(member)"
         )
 
-    def _init_canonical_transactions_view(self) -> None:
-        view_kind = "TEMP VIEW" if self._read_only else "VIEW"
+    @contextmanager
+    def canonical_as_of(self, as_of: date):
+        """Temporarily select House generations promoted by the end of this day.
+
+        Connection-local, nestable, and restored even on failure. Do not share
+        this connection between concurrent historical analyses.
+        """
+        previous = getattr(self, "_canonical_as_of", None)
+        cutoff = pd.Timestamp(as_of).date()
+        self._init_canonical_transactions_view(cutoff, temporary=True)
+        self._canonical_as_of = cutoff
+        try:
+            yield
+        finally:
+            self._init_canonical_transactions_view(previous, temporary=True)
+            self._canonical_as_of = previous
+
+    def _init_canonical_transactions_view(
+        self, as_of: date | None = None, *, temporary: bool = False
+    ) -> None:
+        view_kind = "TEMP VIEW" if self._read_only or temporary else "VIEW"
+        # Dates are inclusive; normalized ISO literals cannot inject SQL.
+        boundary = (
+            f"DATE '{pd.Timestamp(as_of).date().isoformat()}' + INTERVAL 1 DAY"
+            if as_of is not None else None
+        )
+        promotion_filter = f"AND generation.promoted_at < {boundary}" if boundary else ""
+        fallback_filter = f"AND g2.promoted_at < {boundary}" if boundary else ""
         self.conn.execute(f"""
             CREATE OR REPLACE {view_kind} canonical_transactions AS
             WITH accepted_house_artifacts AS (
@@ -315,6 +342,7 @@ class Database:
                  AND scope.generation_id = artifact.generation_id
                  AND scope.doc_id = artifact.doc_id
                 WHERE (scope.doc_id IS NULL OR scope.filing_type = 'P')
+                  {promotion_filter}
                   AND (
                       -- Legacy/synthetic artifacts without scope rows ride on
                       -- generation completeness, as before.
@@ -426,6 +454,7 @@ class Database:
                                  AND g2.generation_id = a2.generation_id
                                 WHERE a2.doc_id = t.doc_id
                                   AND g2.parse_status = 'complete'
+                                  {fallback_filter}
                             )
                         )
                         OR (
@@ -443,6 +472,7 @@ class Database:
                                  AND g2.generation_id = a2.generation_id
                                 WHERE a2.doc_id = t.doc_id
                                   AND g2.parse_status = 'complete'
+                                  {fallback_filter}
                             )
                         )
                     )

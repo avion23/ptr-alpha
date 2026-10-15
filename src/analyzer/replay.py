@@ -11,6 +11,7 @@ default member set is a v1 seed list; pass ``members`` to replay other members.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from datetime import date, timedelta
 from importlib import import_module
 
@@ -310,18 +311,20 @@ def replay(
             raise ValueError("tickers must not contain empty values")
         for raw_as_of in decision_dates:
             as_of = pd.Timestamp(raw_as_of).date()
-            candidates = _ticker_candidates(
-                db, ticker, as_of, selected_members, pipeline, positions
-            )
-            score_value, blocked, n_actors = _score(
-                db,
-                ticker,
-                as_of,
-                candidates,
-                actors,
-                setups,
-                skill_table_cache,
-            )
+            scope = db.canonical_as_of(as_of) if hasattr(db, "canonical_as_of") else nullcontext()
+            with scope:
+                candidates = _ticker_candidates(
+                    db, ticker, as_of, selected_members, pipeline, positions
+                )
+                score_value, blocked, n_actors = _score(
+                    db,
+                    ticker,
+                    as_of,
+                    candidates,
+                    actors,
+                    setups,
+                    skill_table_cache,
+                )
             fwd_return = _price_return(db, ticker, as_of, horizon_days)
             spy_return = _benchmark_return(db, as_of, horizon_days)
             excess = (

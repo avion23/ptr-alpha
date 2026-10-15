@@ -61,6 +61,37 @@ def test_semantic_zero_retires_exact_artifact(stored):
         db.close()
 
 
+@pytest.mark.parametrize("mutation", ["replacement", "no_txs", "error"])
+def test_ocr_mutations_preserve_accepted_historical_rows(stored, mutation):
+    cache_and_insert(stored)
+    path, _, digest = stored
+    db = Database(path)
+    db.conn.execute("UPDATE house_archive_generations SET promoted_at='2024-02-01'")
+    db.conn.execute("UPDATE transactions SET created_at='2024-02-02'")
+    db.conn.execute("UPDATE pdf_parse_runs SET parsed_at='2024-02-03'")
+    with db.canonical_as_of(date(2024, 3, 1)):
+        assert db.get_transactions(2024).ticker.tolist() == ["AAPL"]
+    db.close()
+    if mutation == "replacement":
+        parsed = common.parse_gemini_output(
+            'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nMicrosoft (MSFT) | Purchase | 01/15/24 | 01/20/24 | A')
+        ops.insert_transactions('1', 2024, parsed.member, parsed.transactions,
+                                db_path=str(path), artifact_sha256=digest, ingestion_generation='g')
+    else:
+        ops.insert_transactions('1', 2024, 'Jane Doe', [], raw_count=int(mutation == "error"),
+                                db_path=str(path), artifact_sha256=digest, ingestion_generation='g')
+    db = Database(path)
+    try:
+        with db.canonical_as_of(date(2024, 3, 1)):
+            assert db.get_transactions(2024).ticker.tolist() == ["AAPL"]
+        # Initialization's NULL-owner normalization is now versioned as well;
+        # assert the actual accepted pre-OCR version, not unrelated migrations.
+        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions WHERE created_at='2024-02-02'").fetchone()[0] == 1
+        assert db.conn.execute("SELECT COUNT(*) FROM parse_run_versions").fetchone()[0] >= 1
+    finally:
+        db.close()
+
+
 def test_current_generation_not_latest_artifact_acquisition(stored):
     path, _, digest = stored
     db = Database(path)

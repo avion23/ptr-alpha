@@ -20,6 +20,7 @@ from datetime import date
 
 import pandas as pd
 
+from analyzer.canonical_scope import canonical_decision
 from analyzer.member_names import canonical_member_key
 from analyzer.parsing.cells import _extract_amount_midpoint
 
@@ -557,6 +558,7 @@ def build_positions(
     )
 
 
+@canonical_decision("as_of")
 def holdings_candidates(
     db, member: str, as_of: date, *, include_unpromoted: bool = False
 ) -> pd.DataFrame:

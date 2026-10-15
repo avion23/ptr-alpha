@@ -461,6 +461,10 @@ class TransactionRepository:
                 )
                 # All interpolated identifiers are fixed schema constants.
                 self.conn.execute(
+                    f"INSERT INTO transaction_versions SELECT t.*, CURRENT_TIMESTAMP "
+                    f"FROM transactions t WHERE EXISTS (SELECT 1 FROM filtered_staging_transactions s WHERE {identity_sql})"
+                )
+                self.conn.execute(
                     f"""UPDATE transactions AS t SET {update_sql}
                         FROM filtered_staging_transactions AS s
                         WHERE {identity_sql}"""  # nosec B608
@@ -605,6 +609,7 @@ class TransactionRepository:
         return _normalize_frame(result, deduplicate=True)
 
     def delete_for_doc(self, doc_id: str) -> None:
+        self.conn.execute("INSERT INTO transaction_versions SELECT *, CURRENT_TIMESTAMP FROM transactions WHERE doc_id = ?", [doc_id])
         self.conn.execute("DELETE FROM transactions WHERE doc_id = ?", [doc_id])
 
     def count_for_docs(self, doc_ids: list[str]) -> dict[str, int]:

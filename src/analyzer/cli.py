@@ -15,6 +15,7 @@ import pandas as pd
 import typer
 
 from analyzer.actors import weights_for_candidates
+from analyzer.canonical_scope import decision_history
 from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_LOOKBACK_DAYS,
     CONSENSUS_MIN_BUYERS,
@@ -900,20 +901,11 @@ def portfolio(
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
-    from datetime import timedelta
-
     from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
-
-    tx_start = start_date - timedelta(days=CONSENSUS_LOOKBACK_DAYS)
-    all_transactions = app_ctx.transaction_source.db.get_transactions_by_date_range(
-        tx_start, end_date
-    )
-    if all_transactions.empty:
-        _cli_exit(1, "Error: no transactions found for portfolio simulation")
 
     prices, recommendations = _load_portfolio_inputs(
         app_ctx,
-        all_transactions,
+        None,
         end_date,
         CONSENSUS_LOOKBACK_DAYS,
         CONSENSUS_MIN_BUYERS,
@@ -968,19 +960,25 @@ def _load_portfolio_inputs(
     """Load execution prices and consensus recommendations."""
     from analyzer import analysis
 
-    all_tickers = sorted(set(_get_consensus_price_tickers(all_transactions)) | {"SPY"})
+    as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency_days}D")
+    decision_frames = decision_history(
+        app_ctx.transaction_source.db, start_date - pd.Timedelta(days=lookback_days), as_of_dates,
+        lookback_days=lookback_days,
+    )
+    all_tickers = sorted({"SPY"}.union(*(
+        _get_consensus_price_tickers(frame) for frame in decision_frames
+    )))
     prices = app_ctx.transaction_source.db.get_prices(
         all_tickers, start_date, end_date
     )
     if prices.empty:
         _cli_exit(1, "Error: no price data available")
 
-    as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency_days}D")
     all_recs = []
-    for as_of in as_of_dates:
+    for as_of, decision_transactions in zip(as_of_dates, decision_frames):
         # date_range never yields NaT; narrow the stubs' union explicitly.
         recs = analysis.backtest_recommendations(
-            all_transactions,
+            decision_transactions,
             cast(pd.Timestamp, pd.Timestamp(as_of)),
             lookback_days=lookback_days,
             min_buyers=min_buyers,
@@ -1510,9 +1508,10 @@ def follow_member(
     db = _open_database(data_dir, read_only=True)
     try:
         try:
-            trades = load_member_trades(
-                db, member, include_unpromoted=include_unpromoted
-            )
+            with db.canonical_as_of(as_of_date):
+                trades = load_member_trades(
+                    db, member, include_unpromoted=include_unpromoted
+                )
         except Exception as exc:
             _cli_exit(1, f"Error: {exc}")
         if include_unpromoted:

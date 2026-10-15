@@ -1150,6 +1150,12 @@ def record_parse_run(
         artifact_sha256,
         ingestion_generation,
     ]
+    _archive_rows(
+        conn, "pdf_parse_runs",
+        "doc_id = ? AND parser_version = ? "
+        "AND artifact_sha256 IS NOT DISTINCT FROM ? "
+        "AND ingestion_generation IS NOT DISTINCT FROM ?", identity,
+    )
     conn.execute(
         """
         DELETE FROM pdf_parse_runs
@@ -1164,8 +1170,8 @@ def record_parse_run(
         INSERT INTO pdf_parse_runs (
             doc_id, year, parser_version, status, engines_attempted,
             raw_row_count, transaction_count, error_message,
-            artifact_sha256, ingestion_generation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            artifact_sha256, ingestion_generation, parsed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             str(doc_id),
@@ -1178,7 +1184,35 @@ def record_parse_run(
             error_message[:1000],
             artifact_sha256,
             ingestion_generation,
+            datetime.datetime.now(),
         ],
+    )
+    # New schemas bind acceptance to the exact persisted source rowset rather
+    # than relying on transaction-start versus wall-clock timestamp ordering.
+    columns = {r[1] for r in conn.execute("PRAGMA table_info('pdf_parse_runs')").fetchall()}
+    if "rowset_created_at" in columns:
+        conn.execute(
+            """UPDATE pdf_parse_runs SET rowset_created_at = (
+                SELECT MAX(created_at) FROM transactions WHERE doc_id = ?
+                  AND artifact_sha256 IS NOT DISTINCT FROM ?
+                  AND ingestion_generation IS NOT DISTINCT FROM ? AND source = 'gemini_ocr')
+                WHERE doc_id = ? AND parser_version = ?
+                  AND artifact_sha256 IS NOT DISTINCT FROM ?
+                  AND ingestion_generation IS NOT DISTINCT FROM ?""",
+            [str(doc_id), artifact_sha256, ingestion_generation, *identity],
+        )
+
+
+def _archive_rows(conn, table, predicate, parameters):
+    """Archive exactly the rows a transactional mutation is about to retire."""
+    history = {"transactions": "transaction_versions", "pdf_parse_runs": "parse_run_versions"}[table]
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {history} AS "
+        f"SELECT *, CURRENT_TIMESTAMP AS retired_at FROM {table} WHERE FALSE"
+    )
+    conn.execute(
+        f"INSERT INTO {history} SELECT *, CURRENT_TIMESTAMP FROM {table} WHERE {predicate}",
+        parameters,
     )
 
 
@@ -1198,6 +1232,11 @@ def _record_failed_ocr_attempt(
     conn.execute("BEGIN TRANSACTION")
     try:
         if artifact_sha256 and ingestion_generation:
+            _archive_rows(conn, "transactions",
+                          "source = 'gemini_ocr' AND doc_id = ? "
+                          "AND (chamber = 'House' OR chamber IS NULL) "
+                          "AND ingestion_generation = ? AND artifact_sha256 = ?",
+                          [str(doc_id), ingestion_generation, artifact_sha256])
             conn.execute(
                 """
                 DELETE FROM transactions
@@ -1294,6 +1333,9 @@ def insert_transactions(
         conn.execute("BEGIN TRANSACTION")
         try:
             if status == "no_txs":
+                _archive_rows(conn, "transactions",
+                              "source = 'gemini_ocr' AND doc_id = ? "
+                              "AND (chamber = 'House' OR chamber IS NULL)", [str(doc_id)])
                 conn.execute(
                     "DELETE FROM transactions WHERE source = 'gemini_ocr' "
                     "AND doc_id = ? AND (chamber = 'House' OR chamber IS NULL)",
@@ -1522,6 +1564,22 @@ def insert_transactions(
             ).fetchone()[0]
         )
         if invalid_house_rows:
+            _archive_rows(conn, "transactions",
+                          "source = 'house_pdf' AND doc_id = ? "
+                          "AND ingestion_generation = ? AND artifact_sha256 = ?",
+                          [str(doc_id), ingestion_generation, artifact_sha256])
+            # Only non-OCR terminal runs are invalidated below.
+            _archive_rows(conn, "pdf_parse_runs",
+                          "doc_id = ? AND ingestion_generation = ? AND artifact_sha256 = ? "
+                          "AND NOT (LOWER(COALESCE(parser_version, '')) LIKE '%gemini%' "
+                          "OR LOWER(COALESCE(parser_version, '')) LIKE '%ling%' "
+                          "OR LOWER(COALESCE(parser_version, '')) LIKE '%gpt%' "
+                          "OR LOWER(COALESCE(parser_version, '')) LIKE '%openrouter%' "
+                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini/%' "
+                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'openrouter/%' "
+                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%') "
+                          "AND status IN ('success', 'no_txs')",
+                          [str(doc_id), ingestion_generation, artifact_sha256])
             conn.execute(
                 """
                 DELETE FROM transactions
@@ -1535,7 +1593,7 @@ def insert_transactions(
             conn.execute(
                 """
                 UPDATE pdf_parse_runs
-                SET status = 'invalidated', transaction_count = 0,
+                SET status = 'invalidated', transaction_count = 0, parsed_at = ?,
                     error_message = 'superseded by validated gemini_ocr fallback after semantic validation failure'
                 WHERE doc_id = ?
                   AND ingestion_generation = ?
@@ -1551,7 +1609,7 @@ def insert_transactions(
                   )
                   AND status IN ('success', 'no_txs')
                 """,
-                [str(doc_id), ingestion_generation, artifact_sha256],
+                [datetime.datetime.now(), str(doc_id), ingestion_generation, artifact_sha256],
             )
         identity_columns = [
             "source",
@@ -1567,9 +1625,12 @@ def insert_transactions(
             f"target.{column} = staged.{column}" for column in identity_columns
         )
         updates = ", ".join(f"{column} = staged.{column}" for column in mutable_columns)
+        _archive_rows(conn, "transactions",
+                      f"EXISTS (SELECT 1 FROM {staging_table} AS staged WHERE "
+                      + identity_join.replace("target.", "transactions.") + ")", [])
         conn.execute(
-            f"UPDATE transactions AS target SET {updates} "
-            f"FROM {staging_table} AS staged WHERE {identity_join}"
+            f"UPDATE transactions AS target SET {updates}, created_at = ? "
+            f"FROM {staging_table} AS staged WHERE {identity_join}", [datetime.datetime.now()]
         )
         conn.execute(
             f"INSERT INTO transactions ({', '.join(columns)}) "
@@ -1580,6 +1641,11 @@ def insert_transactions(
         stale_identity_join = " AND ".join(
             f"staged.{column} = target.{column}" for column in identity_columns
         )
+        _archive_rows(conn, "transactions",
+                      "source = 'gemini_ocr' AND doc_id = ? "
+                      "AND (chamber = 'House' OR chamber IS NULL) "
+                      f"AND NOT EXISTS (SELECT 1 FROM {staging_table} AS staged WHERE "
+                      + stale_identity_join.replace("target.", "transactions.") + ")", [str(doc_id)])
         conn.execute(
             "DELETE FROM transactions AS target "
             "WHERE target.source = 'gemini_ocr' AND target.doc_id = ? "

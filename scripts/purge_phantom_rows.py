@@ -10,8 +10,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 import duckdb
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from analyzer.row_history import preserve_repair_history
 
 
 VICTIMS_CTE = """
@@ -59,13 +64,20 @@ def purge_phantom_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
         raise RuntimeError("COUNT(*) query returned no row before purge")
     before = before_row[0]
     deleted = sum(count_phantom_rows(conn).values())
-    conn.execute(
-        VICTIMS_CTE
-        + """
-        DELETE FROM transactions
-        WHERE id IN (SELECT id FROM victims)
-        """
-    )
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        with preserve_repair_history(conn):
+            conn.execute(
+                VICTIMS_CTE
+                + """
+                DELETE FROM transactions
+                WHERE id IN (SELECT id FROM victims)
+                """
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     after_row = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()
     if after_row is None:
         raise RuntimeError("COUNT(*) query returned no row after purge")

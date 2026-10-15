@@ -4,7 +4,14 @@ Distinguishes "matched to None" (explicit NULL) vs "no match" (leave alone).
 """
 
 from __future__ import annotations
+from pathlib import Path
+import sys
+
 import duckdb
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from analyzer.row_history import archive_rows, accept_corrections
 
 # IMPORTANT: do NOT use the parser's _TICKER_BLACKLIST here.
 # That set contains single-letter tokens ('A', 'O', 'X', 'S', 'P', 'E') that
@@ -177,8 +184,8 @@ def is_cash_or_fund(ticker: str) -> bool:
     return any(p in upper for p in CASH_PATTERNS)
 
 
-def main():
-    con = duckdb.connect("data/congress.duckdb")
+def main(db_path="data/congress.duckdb"):
+    con = duckdb.connect(str(db_path))
     in_transaction = False
     try:
         # Get distinct tickers that don't look like proper ticker symbols
@@ -209,6 +216,7 @@ def main():
                     break
 
             if matched_ticker:
+                archive_rows(con, "transactions", "ticker = ?", [orig])
                 # Check for duplicates (ticker-version already exists for same key)
                 duplicates = con.execute(
                     """
@@ -241,7 +249,7 @@ def main():
                 ).fetchone()[0]
                 if remaining > 0:
                     con.execute(
-                        "UPDATE transactions SET ticker=? WHERE ticker=?",
+                        "UPDATE transactions SET ticker=?, created_at=CURRENT_TIMESTAMP WHERE ticker=?",
                         [matched_ticker, orig],
                     )
                     total_updated += remaining
@@ -250,17 +258,19 @@ def main():
 
             # 2. Cash/fund → NULL
             if is_cash_or_fund(orig):
+                archive_rows(con, "transactions", "ticker = ?", [orig])
                 cnt = con.execute(
                     "SELECT COUNT(*) FROM transactions WHERE ticker=?", [orig]
                 ).fetchone()[0]
                 con.execute(
-                    "UPDATE transactions SET ticker=NULL WHERE ticker=?", [orig]
+                    "UPDATE transactions SET ticker=NULL, created_at=CURRENT_TIMESTAMP WHERE ticker=?", [orig]
                 )
                 total_nulled += cnt
                 continue
 
             # 3. No match — LEAVE ALONE (this is the bug-fix)
 
+        accept_corrections(con)
         con.execute("COMMIT")
         in_transaction = False
 

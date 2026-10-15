@@ -12,6 +12,7 @@ from datetime import date
 
 import pandas as pd
 
+from analyzer.canonical_scope import canonical_decision
 from analyzer.member_names import canonical_member_key
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.ticker_resolver import TickerResolver
@@ -227,6 +228,7 @@ def _load_actor_members(
     ]
 
 
+@canonical_decision("as_of")
 def load_skill_table(
     db,
     as_of: date | pd.Timestamp,

@@ -836,18 +836,20 @@ def run_backtest_pipeline(
 
     as_of_dates = pd.date_range(params.start_date, params.end_date, freq=f"{params.frequency_days}D")
     decision_frames = decision_history(transaction_source.db, tx_start, as_of_dates)
-    all_transactions = pd.concat(decision_frames, ignore_index=True)
-    if all_transactions.empty:
+    transaction_count = sum(len(frame) for frame in decision_frames)
+    if not transaction_count:
         raise DataSourceError(f"No transactions found between {tx_start} and {tx_end}")
 
-    logger.info("Loaded %d transactions for backtest window", len(all_transactions))
+    logger.info("Loaded %d decision-window transactions for backtest", transaction_count)
 
     price_start, price_end = _execution_price_window(
         as_of_dates[0],
         as_of_dates[-1],
         params.horizon,
     )
-    all_tickers = sorted(set(_get_consensus_price_tickers(all_transactions)) | {"SPY"})
+    all_tickers = sorted({"SPY"}.union(*(
+        _get_consensus_price_tickers(frame) for frame in decision_frames
+    )))
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)
 

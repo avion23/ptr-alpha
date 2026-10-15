@@ -962,10 +962,12 @@ def _load_portfolio_inputs(
 
     as_of_dates = pd.date_range(start_date, end_date, freq=f"{frequency_days}D")
     decision_frames = decision_history(
-        app_ctx.transaction_source.db, start_date - pd.Timedelta(days=lookback_days), as_of_dates
+        app_ctx.transaction_source.db, start_date - pd.Timedelta(days=lookback_days), as_of_dates,
+        lookback_days=lookback_days,
     )
-    all_transactions = pd.concat(decision_frames, ignore_index=True)
-    all_tickers = sorted(set(_get_consensus_price_tickers(all_transactions)) | {"SPY"})
+    all_tickers = sorted({"SPY"}.union(*(
+        _get_consensus_price_tickers(frame) for frame in decision_frames
+    )))
     prices = app_ctx.transaction_source.db.get_prices(
         all_tickers, start_date, end_date
     )
@@ -1506,9 +1508,10 @@ def follow_member(
     db = _open_database(data_dir, read_only=True)
     try:
         try:
-            trades = load_member_trades(
-                db, member, include_unpromoted=include_unpromoted
-            )
+            with db.canonical_as_of(as_of_date):
+                trades = load_member_trades(
+                    db, member, include_unpromoted=include_unpromoted
+                )
         except Exception as exc:
             _cli_exit(1, f"Error: {exc}")
         if include_unpromoted:

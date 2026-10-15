@@ -55,6 +55,7 @@ PAGE: [page number]
 [asset name] | [Purchase/Sale/Exchange] | [MM/DD/YY] | [MM/DD/YY] | [amount range letter A-J]
 
 For each page with no real transactions, output PAGE followed by exactly NO_TRANSACTIONS. Every PDF page must appear exactly once and must contain transactions or NO_TRANSACTIONS.
+For checkbox forms, read each row's marked box under PURCHASE, SALE, or EXCHANGE; these are separate subcolumns. Never carry the preceding row's direction or notification date forward. Rotate sideways pages before reading the column headers and marks.
 Amount ranges: A=$1K-15K, B=$15K-50K, C=$50K-100K, D=$100K-250K, E=$250K-500K, F=$500K-1M, G=$1M-5M, H=$5M-25M, I=$25M-50M, J=over $50M.
 No markdown, no tables, no explanations."""
 PROMPT_SHA256 = hashlib.sha256(PROMPT.encode()).hexdigest()
@@ -578,6 +579,46 @@ def _tx_notification_date(tx: dict):
     )
 
 
+def apply_verified_house_corrections(doc_id, artifact_sha256, transactions):
+    """Replay visual source verification without changing cached OCR evidence.
+
+    8220049, PDF page 2: the five lower X marks are under PURCHASE,
+    not SALE; Pacer's notification cell reads 11/01/23. The preceding
+    SPDR row is a sale and really says 11/01/30. Match the artifact and
+    row content, not a DB id or a sequence that changes after filtering.
+    """
+    if str(doc_id) != "8220049" or artifact_sha256 != (
+        "d5cc2d68dca7a0e2a2b99ecd632d3af941fe87ac48fbed5b33598e78f692980b"
+    ):
+        return transactions
+    purchases = {
+        "Pacer FDS Tr Pacer US Small Cap",
+        "iShares Tr 10-20 Yr Treas Bd ETF",
+        "Invesco Exchange Traded Fd",
+        "Invesco Actively Managed Exchg Trd Comm",
+        "Global X Fds",
+    }
+    corrected = []
+    for tx in transactions:
+        row = dict(tx)
+        if (
+            tx.get("page_number") == 2
+            and _tx_asset(tx) in purchases
+            and _strict_date(_tx_date(tx)) == date(2023, 10, 20)
+            and _tx_amount(tx) == "A"
+            and _normalize_tx_type(_tx_type(tx)) in {"Sale", "Purchase"}
+        ):
+            row["type"] = "Purchase"
+            if _tx_asset(tx) == "Pacer FDS Tr Pacer US Small Cap":
+                # Also repair already-validated input whose bad date was nulled.
+                row["notif_date"] = "11/01/23"
+                for alias in ("notification_date", "disclosure_date"):
+                    if alias in row:
+                        row[alias] = "11/01/23"
+        corrected.append(row)
+    return corrected
+
+
 def validate_transactions(doc_id, member, transactions, filing_date, expected_member):
     """Validate OCR rows and return ``(valid_transactions, rejection_counts)``."""
     del doc_id
@@ -657,6 +698,17 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
             rejections["notification_before_transaction"] += 1
             continue
         cleaned = dict(tx)
+        # OCR can faithfully copy a filer typo (8220049 has 11/01/30), or
+        # propagate it into adjacent cells. Keep the lot, not an unverifiable
+        # notification claim. Clear aliases too so revalidation is idempotent.
+        if notification_date is not None and (
+            notification_date > date.today()
+            or (filing is not None and notification_date > filing)
+        ):
+            cleaned["notif_date"] = None
+            for alias in ("notification_date", "disclosure_date"):
+                if alias in cleaned:
+                    cleaned[alias] = None
         cleaned.update(
             member=effective_member,
             asset=asset,

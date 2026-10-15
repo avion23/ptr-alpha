@@ -63,7 +63,7 @@ def test_delayed_parse_and_completion_fallback(tmp_path, read_only):
         with db.canonical_as_of(date(2026, 10, 1)):
             assert db.get_transactions(2026).empty
         with db.canonical_as_of(date(2026, 10, 2)):
-            assert len(db.get_transactions(2026)) == 1
+            assert db.get_transactions(2026).empty  # completion is not source acceptance
         db.conn.execute("UPDATE house_archive_generations SET completed_at=NULL")
         with db.canonical_as_of(date(2026, 10, 3)):
             assert db.get_transactions(2026).empty  # no invented completion date
@@ -180,6 +180,21 @@ def test_omitted_dated_consumer_reads_historical_rows(tmp_path, monkeypatch, con
                 return result
             monkeypatch.setattr(positions, "load_member_trades", checked)
             assert positions.holdings_candidates(db, "Jane Doe", cutoff).empty
+        elif consumer == "targeted_skill":
+            # An accepted identity ensures the targeted repository read runs;
+            # the delayed filing for that SAME identity must not be included.
+            seed(db, doc="anchor", accepted="2026-08-04", ticker="AAPL")
+            original = db.transactions.get_skill_history
+            calls = []
+
+            def checked(*args, **kwargs):
+                result = original(*args, **kwargs)
+                calls.append(result.doc_id.tolist())
+                assert result.doc_id.tolist() == ["anchor"]
+                return result
+            monkeypatch.setattr(db.transactions, "get_skill_history", checked)
+            assert actors.load_skill_table(db, cutoff, {actors.actor_id("congress", "Jane Doe")}).empty
+            assert calls == [["anchor"]]
         else:
             original = db.get_transactions_by_date_range
 
@@ -189,9 +204,8 @@ def test_omitted_dated_consumer_reads_historical_rows(tmp_path, monkeypatch, con
                 assert result.empty
                 return result
             monkeypatch.setattr(db, "get_transactions_by_date_range", checked)
-            ids = {"congress:Jane Doe"} if consumer == "targeted_skill" else None
-            assert actors.load_skill_table(db, cutoff, ids).empty
-        assert len(db.get_transactions(2026)) == 1
+            assert actors.load_skill_table(db, cutoff).empty
+        assert len(db.get_transactions(2026)) == (2 if consumer == "targeted_skill" else 1)
     finally:
         db.close()
 
@@ -202,6 +216,65 @@ def load_script(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("ocr_status", ["error", "success"])
+def test_completion_cannot_accept_failed_ocr_source(tmp_path, ocr_status):
+    db = Database(tmp_path / "db.duckdb")
+    try:
+        row = seed(db, accepted="2026-08-04")
+        row.update(ticker="MSFT", source_row_id="ocr-row")
+        db.upsert_transactions(pd.DataFrame([row]), source="gemini_ocr")
+        db.conn.execute("UPDATE transactions SET created_at='2026-08-02' WHERE source='gemini_ocr'")
+        if ocr_status == "success":
+            # A successful run with invalid rows is not acceptable either.
+            db.conn.execute("UPDATE transactions SET official_filing_date=NULL WHERE source='gemini_ocr'")
+        db.parse_runs.upsert(doc_id="delayed", year=2026, parser_version="gemini-v1", status=ocr_status,
+                             engines_attempted="gemini/v1", raw_row_count=1, transaction_count=1,
+                             artifact_sha256="sha", ingestion_generation="delayed")
+        db.conn.execute("UPDATE pdf_parse_runs SET parsed_at='2026-08-04'")
+        db.conn.execute("UPDATE house_archive_generations SET ptr_count=1")
+        with db.canonical_as_of(date(2026, 9, 21)):
+            assert db.get_transactions(2026).ticker.tolist() == ["JPM"]
+        db.mark_house_generation_parse_complete(2026, "delayed")
+        # Reproduce a completion recorded before T, not merely today's stamp.
+        db.conn.execute("UPDATE house_archive_generations SET completed_at='2026-08-05'")
+        with db.canonical_as_of(date(2026, 9, 21)):
+            assert db.get_transactions(2026).ticker.tolist() == ["JPM"]
+    finally:
+        db.close()
+
+
+def test_real_ticker_backfill_preserves_pre_correction_value(tmp_path):
+    path = tmp_path / "db.duckdb"
+    db = Database(path)
+    seed(db, accepted="2026-08-04", ticker=None)
+    db.conn.execute("UPDATE transactions SET asset_description='Microsoft Corporation'")
+    db.close()
+    assert load_script("backfill_tickers").backfill_tickers(path, apply=True) == (1, 0)
+    db = Database(path)
+    try:
+        assert db.get_transactions(2026).ticker.tolist() == ["MSFT"]
+        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions").fetchone()[0] == 1
+        with db.canonical_as_of(date(2026, 9, 21)):
+            rows = db.get_transactions(2026)
+            assert len(rows) == 1 and rows.ticker.isna().all()
+    finally:
+        db.close()
+
+
+def test_follow_member_as_of_excludes_delayed_filing(tmp_path, monkeypatch):
+    from analyzer import cli
+    from typer.testing import CliRunner
+
+    path = tmp_path / "congress.duckdb"
+    db = Database(path)
+    seed(db)
+    db.close()
+    result = CliRunner().invoke(cli.app, ["follow-member", "--member", "Jane Doe",
+                                         "--as-of", "2026-09-21", "--data-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "No canonical transactions" in result.output
 
 
 def test_skill_cutoff_is_disclosure_cutoff_not_acceptance_cutoff(tmp_path, monkeypatch):
@@ -227,8 +300,8 @@ def test_historical_simulators_load_each_decision_not_end_date(tmp_path, monkeyp
     import typer
 
     db = Database(tmp_path / "db.duckdb")
-    seed(db, promoted="2023-04-21", created="2023-04-22", accepted="2023-06-01",
-         disclosure="2023-04-20")
+    seed(db, promoted="2023-04-21", created="2023-04-22", accepted="2023-06-16",
+         disclosure="2023-06-15")
     dates = pd.bdate_range("2022-01-01", "2026-01-01")
     prices = pd.DataFrame({"JPM": 100.0, "SPY": 100.0}, index=dates)
     monkeypatch.setattr(db, "get_prices", lambda *args, **kwargs: prices)
@@ -237,7 +310,8 @@ def test_historical_simulators_load_each_decision_not_end_date(tmp_path, monkeyp
 
     def recommendations(frame, decision, **kwargs):
         decision = pd.Timestamp(decision)
-        assert frame.ticker.tolist() == (["JPM"] if decision >= pd.Timestamp("2023-06-01") else [])
+        visible = pd.Timestamp("2023-06-16") <= decision <= pd.Timestamp("2023-06-15") + pd.Timedelta(days=28)
+        assert frame.ticker.tolist() == (["JPM"] if visible else [])
         calls.append(decision)
         return pd.DataFrame()
 

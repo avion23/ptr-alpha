@@ -327,7 +327,6 @@ class Database:
         fallback_filter = f"AND g2.promoted_at < {boundary}" if boundary else ""
         acceptance_filter = f"AND parse_run.parsed_at < {boundary}" if boundary else ""
         completion_filter = ""
-        completion_acceptance = ""
         prefix = ""
         if boundary:
             tables = {r[0] for r in self.conn.execute("SHOW TABLES").fetchall()}
@@ -341,18 +340,8 @@ class Database:
             completion_filter = "AND FALSE"  # historical fallback must bind the row version too
             fallback_filter += (f" AND g2.completed_at < {boundary}"
                                 if "completed_at" in columns else " AND FALSE")
-            if "completed_at" in columns:
-                completion_acceptance = f"""OR (
-                    generation.parse_status = 'complete'
-                    AND generation.completed_at < {boundary}
-                    AND NOT EXISTS (
-                        SELECT 1 FROM transactions completed_rows
-                        WHERE completed_rows.doc_id = artifact.doc_id
-                          AND completed_rows.ingestion_generation = artifact.generation_id
-                          AND (completed_rows.created_at IS NULL
-                               OR completed_rows.created_at > generation.completed_at)
-                    )
-                )"""
+            # Completion proves only that some acceptable parser exists, not
+            # that every source's rowset was accepted. Require each own run.
             # A run can only authorize the immutable rows actually present at
             # its acceptance time; an old same-count run cannot bless new rows.
             acceptance_filter += f""" AND NOT EXISTS (
@@ -453,7 +442,6 @@ class Database:
                             )
                         )
                   )
-                  {completion_acceptance}
                   )
             ),
             latest_accepted_house_docs AS (
@@ -535,11 +523,6 @@ class Database:
             body = re.sub(r"\bpdf_parse_runs\b", "asof_parse_runs", body)
             body = body.replace("SELECT t.* FROM asof_transactions t\n            WHERE (",
                                 f"SELECT t.* FROM asof_transactions t\n            WHERE t.created_at < {boundary} AND (")
-            row_completion = (f"OR EXISTS (SELECT 1 FROM house_archive_generations g "
-                              f"WHERE g.generation_id = t.ingestion_generation "
-                              f"AND g.parse_status = 'complete' AND g.completed_at < {boundary} "
-                              f"AND g.completed_at >= t.created_at)"
-                              if "completed_at" in columns else "")
             row_acceptance = f"""
               AND (t.source NOT IN ('house_pdf', 'gemini_ocr')
                    OR NOT EXISTS (SELECT 1 FROM house_archive_generations g
@@ -557,8 +540,24 @@ class Database:
                                       AND tx_count.artifact_sha256 = t.artifact_sha256
                                       AND tx_count.source = t.source)
                                 AND parse_run.parsed_at >= t.created_at
-                                AND parse_run.parsed_at < {boundary})
-                   {row_completion})
+                                AND parse_run.parsed_at < {boundary}
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM asof_transactions invalid_row
+                                    WHERE invalid_row.doc_id = t.doc_id
+                                      AND invalid_row.ingestion_generation = t.ingestion_generation
+                                      AND invalid_row.artifact_sha256 = t.artifact_sha256
+                                      AND invalid_row.source = t.source
+                                      AND (invalid_row.created_at IS NULL
+                                           OR invalid_row.created_at > parse_run.parsed_at
+                                           OR invalid_row.transaction_date IS NULL
+                                           OR invalid_row.disclosure_date IS NULL
+                                           OR invalid_row.transaction_date > invalid_row.disclosure_date
+                                           OR invalid_row.notification_date < invalid_row.transaction_date
+                                           OR invalid_row.chamber IS NULL OR TRIM(invalid_row.chamber) = ''
+                                           OR invalid_row.source_record_id IS NULL OR TRIM(invalid_row.source_record_id) = ''
+                                           OR invalid_row.source_row_id IS NULL OR TRIM(invalid_row.source_row_id) = ''
+                                           OR invalid_row.official_filing_date IS NULL)))
+                   )
             """
             body += row_acceptance
             sql = head + "accepted_house_artifacts AS (" + body

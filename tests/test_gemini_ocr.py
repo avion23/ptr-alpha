@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import date, datetime
+from pathlib import Path
 import json
 import queue
 
@@ -122,6 +123,26 @@ def test_validation_rejects_notification_before_transaction():
     assert rejections == {"notification_before_transaction": 1}
 
 
+@pytest.mark.parametrize("notification", ["11/01/30", "11/18/23"])
+def test_validation_nulls_unverifiable_post_filing_notification(notification):
+    tx = _tx(date="10/20/23")
+    tx.update(notif_date=notification, notification_date=notification)
+    valid, rejections = gemini_ocr_common.validate_transactions(
+        "8220049", "Charles J. Fleischmann", [tx],
+        datetime(2023, 11, 17), "Charles J. Fleischmann",
+    )
+    assert rejections == {}
+    assert len(valid) == 1
+    assert valid[0]["notif_date"] is None
+    assert valid[0]["notification_date"] is None
+    assert tx["notif_date"] == notification  # retain the input evidence
+    repeated, _ = gemini_ocr_common.validate_transactions(
+        "8220049", "Charles J. Fleischmann", valid,
+        datetime(2023, 11, 17), "Charles J. Fleischmann",
+    )
+    assert repeated == valid
+
+
 def test_validation_accepts_spouse_dc_over_1m_column_k():
     txs = [_tx(amount="K")]
 
@@ -132,6 +153,75 @@ def test_validation_accepts_spouse_dc_over_1m_column_k():
     assert [tx["amount_letter"] for tx in valid] == ["K"]
     assert [tx["amount_midpoint"] for tx in valid] == [1000000]
     assert rejections == {}
+
+
+def test_validation_nulls_future_notification_without_filing_bound(monkeypatch):
+    class FixedDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 15)
+
+    monkeypatch.setattr(gemini_ocr_common, "date", FixedDate)
+    tx = _tx(date="10/01/26")
+    tx["notif_date"] = "10/16/26"
+    valid, rejections = gemini_ocr_common.validate_transactions(
+        "future", "Jane Doe", [tx], None, "Jane Doe"
+    )
+    assert rejections == {}
+    assert len(valid) == 1
+    assert valid[0]["notif_date"] is None
+    assert tx["notif_date"] == "10/16/26"
+
+
+def test_verified_8220049_corrections_survive_raw_and_validated_reingestion(tmp_path):
+    output = (Path(__file__).parent / "fixtures/8220049-ocr.txt").read_text()
+    parsed = gemini_ocr_common.parse_gemini_output(output, expected_page_count=3)
+    original = json.dumps(parsed.transactions, sort_keys=True)
+    sha = "d5cc2d68dca7a0e2a2b99ecd632d3af941fe87ac48fbed5b33598e78f692980b"
+    db_path = tmp_path / "replay.duckdb"
+    db = Database(db_path)
+    _enable_ocr_schema(db.conn)
+    db.conn.execute("""
+        INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type, fetched_at)
+        VALUES ('8220049', 'Charles J.', 'Fleischmann', TIMESTAMP '2023-11-17', 'P', CURRENT_TIMESTAMP)
+    """)
+    db.conn.close()
+    validated, _ = gemini_ocr_common.validate_transactions(
+        "8220049", parsed.member, parsed.transactions,
+        datetime(2023, 11, 17), parsed.member,
+    )
+    assert validated[6]["notif_date"] is None
+    for txs in (parsed.transactions, parsed.transactions, validated):
+        assert _insert_transactions(
+            "8220049", 2023, parsed.member, txs, db_path=str(db_path),
+            artifact_sha256=sha,
+        ) == 13
+        with duckdb.connect(str(db_path)) as conn:
+            rows = conn.execute("""
+                SELECT source_row_id, transaction_type, notification_date
+                FROM transactions ORDER BY source_row_id
+            """).fetchall()
+        assert len(rows) == 13
+        by_row = {row[0]: row[1:] for row in rows}
+        for number in range(7, 12):
+            assert by_row[f"8220049:page:2:row:{number}"] == (
+                "Purchase", date(2023, 11, 1)
+            )
+        assert by_row["8220049:page:2:row:6"] == ("Sale", None)
+        assert by_row["8220049:page:3:row:12"] == ("Sale", None)
+    assert json.dumps(parsed.transactions, sort_keys=True) == original
+    assert gemini_ocr_common.apply_verified_house_corrections(
+        "8220049", "different-pdf", parsed.transactions
+    ) == parsed.transactions
+    assert gemini_ocr_common.apply_verified_house_corrections(
+        "different-doc", sha, parsed.transactions
+    ) == parsed.transactions
+    # A same-name row with different coordinates/economics is not verified.
+    for change in ({"page_number": 1}, {"date": "10/21/23"}, {"amount_letter": "B"}):
+        changed = dict(parsed.transactions[6], **change)
+        assert gemini_ocr_common.apply_verified_house_corrections(
+            "8220049", sha, [changed]
+        ) == [changed]
 
 
 def test_validation_preserves_repeated_lots_without_source_identity():

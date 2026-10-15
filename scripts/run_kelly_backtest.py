@@ -79,10 +79,11 @@ def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
     print("Loading transactions...")
     as_of_dates = pd.date_range(start_date, last_as_of, freq=f"{frequency}D")
     decision_frames = decision_history(tx_source.db, tx_start, as_of_dates)
-    transactions = pd.concat(decision_frames, ignore_index=True)
-    print(f"  {len(transactions)} transactions")
+    print(f"  {sum(len(frame) for frame in decision_frames)} decision-window transactions")
 
-    tickers = sorted(set(_get_consensus_price_tickers(transactions)) | {"SPY"})
+    tickers = sorted({"SPY"}.union(*(
+        _get_consensus_price_tickers(frame) for frame in decision_frames
+    )))
     price_start = next_nyse_session(start_date)
     prices = tx_source.db.get_prices(tickers, price_start, outcome_boundary)
     prices = prices.dropna(axis=1, how="all")

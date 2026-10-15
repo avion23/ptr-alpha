@@ -2,14 +2,18 @@
 from contextlib import nullcontext
 from functools import wraps
 from inspect import signature
+from datetime import timedelta
+import pandas as pd
 
 
-def decision_history(db, start, decisions):
+def decision_history(db, start, decisions, *, lookback_days=28):
     frames = []
     for decision in decisions:
         scope = db.canonical_as_of(decision) if hasattr(db, "canonical_as_of") else nullcontext()
         with scope:
-            frames.append(db.get_transactions_by_date_range(start, decision))
+            frames.append(db.get_transactions_by_date_range(
+                max(pd.Timestamp(start), pd.Timestamp(decision) - timedelta(days=lookback_days)), decision
+            ))
     return frames
 
 

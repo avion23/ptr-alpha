@@ -48,6 +48,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT))
 
 from analyzer.database import Database  # noqa: E402
+from analyzer.row_history import archive_rows, preserve_repair_history  # noqa: E402
 from analyzer.download import (  # noqa: E402
     _PARSE_FAILURE_PREFIX,
     _PARSE_VERSION,
@@ -803,6 +804,8 @@ def _refresh_house_completion(
                     empty_reports,
                     _in_transaction=True,
                 )
+            archive_rows(db.conn, "house_archive_generations",
+                         "archive_year = ? AND generation_id = ?", [year, generation])
             db.conn.execute(
                 """
                 UPDATE house_archive_generations
@@ -2371,6 +2374,10 @@ def repair_audit_gaps(args) -> None:
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     db = Database(staging / "congress.duckdb", read_only=False)
+    db.conn.execute("BEGIN TRANSACTION")
+    history = preserve_repair_history(db.conn)
+    history.__enter__()
+    committed = False
     try:
         from datetime import timedelta  # noqa: PLC0415
 
@@ -2617,11 +2624,21 @@ def repair_audit_gaps(args) -> None:
                     [gen],
                 ).fetchone()[0]
             )
+        history.__exit__(None, None, None)
+        history = None
+        db.conn.execute("COMMIT")
+        committed = True
         _save_manifest(staging, manifest)
         print(
             f"repair: quarantined {n_invalid} invalid-chronology rows; "
             f"source_row_id backfilled; parse runs reconciled"
         )
+    except Exception:
+        if history is not None:
+            history.__exit__(*sys.exc_info())
+        if not committed:
+            db.conn.execute("ROLLBACK")
+        raise
     finally:
         db.close()
 

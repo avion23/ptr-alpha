@@ -59,6 +59,18 @@ class ParseRunRepository:
         if not _in_transaction:
             self.conn.execute("BEGIN TRANSACTION")
         try:
+            from analyzer.database import _HOUSE_PARSE_SOURCE
+
+            # Bind the run to the source family's actual rowset, independently
+            # of whether parsed_at came from a transaction-start clock.
+            # A one-row relation keeps source classification centralized.
+            rowset_created_at = self.conn.execute(
+                f"""SELECT MAX(t.created_at) FROM transactions t,
+                    (SELECT ? AS parser_version, ? AS engines_attempted) parse_run
+                    WHERE t.doc_id = ? AND t.ingestion_generation = ?
+                      AND t.artifact_sha256 = ? AND t.source = {_HOUSE_PARSE_SOURCE}""",
+                [parser_version, engines_attempted, doc_id, ingestion_generation, artifact_sha256],
+            ).fetchone()[0]
             # A failed reparse must not erase the last terminal provenance for
             # the same immutable artifact and generation.  The transaction
             # rows are deliberately left untouched when a parse attempt
@@ -79,6 +91,16 @@ class ParseRunRepository:
                     # Keep the historical one-row-per-identity shape even if
                     # a legacy database already contains duplicate terminal
                     # rows.  The newest terminal row is the one retained.
+                    self.conn.execute(
+                        f"""INSERT INTO parse_run_versions
+                        SELECT * EXCLUDE (duplicate_rank), CURRENT_TIMESTAMP FROM (
+                            SELECT *, row_number() OVER (
+                                ORDER BY parsed_at DESC NULLS LAST, rowid DESC
+                            ) AS duplicate_rank FROM pdf_parse_runs
+                            WHERE {_IDENTITY_PREDICATE} AND {_TERMINAL_STATUS_PREDICATE}
+                        ) WHERE duplicate_rank > 1""",
+                        identity_params,
+                    )
                     self.conn.execute(
                         f"""
                         DELETE FROM pdf_parse_runs
@@ -118,8 +140,8 @@ class ParseRunRepository:
                 INSERT INTO pdf_parse_runs (
                     doc_id, year, parser_version, status, engines_attempted,
                     raw_row_count, transaction_count, error_message,
-                    artifact_sha256, ingestion_generation, parsed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    artifact_sha256, ingestion_generation, parsed_at, rowset_created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 [
                     doc_id,
@@ -133,6 +155,7 @@ class ParseRunRepository:
                     artifact_sha256,
                     ingestion_generation,
                     datetime.now(),
+                    rowset_created_at,
                 ],
             )
             if not _in_transaction:

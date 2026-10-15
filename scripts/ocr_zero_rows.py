@@ -1187,6 +1187,20 @@ def record_parse_run(
             datetime.datetime.now(),
         ],
     )
+    # New schemas bind acceptance to the exact persisted source rowset rather
+    # than relying on transaction-start versus wall-clock timestamp ordering.
+    columns = {r[1] for r in conn.execute("PRAGMA table_info('pdf_parse_runs')").fetchall()}
+    if "rowset_created_at" in columns:
+        conn.execute(
+            """UPDATE pdf_parse_runs SET rowset_created_at = (
+                SELECT MAX(created_at) FROM transactions WHERE doc_id = ?
+                  AND artifact_sha256 IS NOT DISTINCT FROM ?
+                  AND ingestion_generation IS NOT DISTINCT FROM ? AND source = 'gemini_ocr')
+                WHERE doc_id = ? AND parser_version = ?
+                  AND artifact_sha256 IS NOT DISTINCT FROM ?
+                  AND ingestion_generation IS NOT DISTINCT FROM ?""",
+            [str(doc_id), artifact_sha256, ingestion_generation, *identity],
+        )
 
 
 def _archive_rows(conn, table, predicate, parameters):

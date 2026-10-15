@@ -34,7 +34,7 @@ def seed(db, *, doc="delayed", promoted="2026-08-01", accepted="2026-10-01",
     db.parse_runs.upsert(doc_id=doc, year=year, parser_version="pdftotext", status="success",
                          engines_attempted="pdftotext", raw_row_count=1, transaction_count=1,
                          artifact_sha256="sha", ingestion_generation=doc)
-    db.conn.execute("UPDATE pdf_parse_runs SET parsed_at = ? WHERE doc_id = ?", [accepted, doc])
+    db.conn.execute("UPDATE pdf_parse_runs SET parsed_at = ?, rowset_created_at = NULL WHERE doc_id = ?", [accepted, doc])
     return row
 
 
@@ -50,6 +50,8 @@ def test_delayed_parse_and_completion_fallback(tmp_path, read_only):
         assert len(db.get_transactions(2026)) == 1
         with db.canonical_as_of(date(2026, 9, 21)):
             assert db.get_transactions(2026).empty
+            assert db.count_transactions_for_docs(["delayed"]) == {}
+            assert db.conn.execute("SELECT COUNT(DISTINCT doc_id) FROM canonical_transactions").fetchone()[0] == 0
         with db.canonical_as_of(date(2026, 10, 1)):
             assert len(db.get_transactions(2026)) == 1
     finally:
@@ -256,6 +258,8 @@ def test_real_ticker_backfill_preserves_pre_correction_value(tmp_path):
     try:
         assert db.get_transactions(2026).ticker.tolist() == ["MSFT"]
         assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions").fetchone()[0] == 1
+        with db.canonical_as_of(date.today()):
+            assert db.get_transactions(2026).ticker.tolist() == ["MSFT"]
         with db.canonical_as_of(date(2026, 9, 21)):
             rows = db.get_transactions(2026)
             assert len(rows) == 1 and rows.ticker.isna().all()

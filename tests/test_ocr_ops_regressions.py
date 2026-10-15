@@ -84,7 +84,9 @@ def test_ocr_mutations_preserve_accepted_historical_rows(stored, mutation):
     try:
         with db.canonical_as_of(date(2024, 3, 1)):
             assert db.get_transactions(2024).ticker.tolist() == ["AAPL"]
-        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions").fetchone()[0] == 1
+        # Initialization's NULL-owner normalization is now versioned as well;
+        # assert the actual accepted pre-OCR version, not unrelated migrations.
+        assert db.conn.execute("SELECT COUNT(*) FROM transaction_versions WHERE created_at='2024-02-02'").fetchone()[0] == 1
         assert db.conn.execute("SELECT COUNT(*) FROM parse_run_versions").fetchone()[0] >= 1
     finally:
         db.close()

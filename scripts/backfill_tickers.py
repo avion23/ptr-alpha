@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import sys
 from pathlib import Path
 
@@ -13,6 +12,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from analyzer.asset_ticker_map import resolve_asset_ticker
+from analyzer.row_history import accept_corrections
 
 
 def backfill_tickers(
@@ -53,16 +53,16 @@ def backfill_tickers(
                     row[1] == "created_at"
                     for row in connection.execute("PRAGMA table_info('transactions')").fetchall()
                 )
-                version_time = ", created_at = ?" if has_created_at else ""
+                version_time = ", created_at = CURRENT_TIMESTAMP" if has_created_at else ""
                 connection.executemany(
                     f"""
                     UPDATE transactions
                     SET ticker = ?, ticker_origin = 'resolved_asset_name'{version_time}
                     WHERE id = ? AND ticker IS NULL
                     """,
-                    [(ticker, datetime.now(), row_id) if has_created_at else (ticker, row_id)
-                     for row_id, ticker in resolved],
+                    [(ticker, row_id) for row_id, ticker in resolved],
                 )
+                accept_corrections(connection)
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")

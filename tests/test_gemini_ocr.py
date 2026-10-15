@@ -122,6 +122,26 @@ def test_validation_rejects_notification_before_transaction():
     assert rejections == {"notification_before_transaction": 1}
 
 
+@pytest.mark.parametrize("notification", ["11/01/30", "11/18/23"])
+def test_validation_nulls_unverifiable_post_filing_notification(notification):
+    tx = _tx(date="10/20/23")
+    tx.update(notif_date=notification, notification_date=notification)
+    valid, rejections = gemini_ocr_common.validate_transactions(
+        "8220049", "Charles J. Fleischmann", [tx],
+        datetime(2023, 11, 17), "Charles J. Fleischmann",
+    )
+    assert rejections == {}
+    assert len(valid) == 1
+    assert valid[0]["notif_date"] is None
+    assert valid[0]["notification_date"] is None
+    assert tx["notif_date"] == notification  # retain the input evidence
+    repeated, _ = gemini_ocr_common.validate_transactions(
+        "8220049", "Charles J. Fleischmann", valid,
+        datetime(2023, 11, 17), "Charles J. Fleischmann",
+    )
+    assert repeated == valid
+
+
 def test_validation_accepts_spouse_dc_over_1m_column_k():
     txs = [_tx(amount="K")]
 

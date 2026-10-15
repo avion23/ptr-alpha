@@ -657,6 +657,17 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
             rejections["notification_before_transaction"] += 1
             continue
         cleaned = dict(tx)
+        # OCR can faithfully copy a filer typo (8220049 has 11/01/30), or
+        # propagate it into adjacent cells. Keep the lot, not an unverifiable
+        # notification claim. Clear aliases too so revalidation is idempotent.
+        if notification_date is not None and (
+            notification_date > date.today()
+            or (filing is not None and notification_date > filing)
+        ):
+            cleaned["notif_date"] = None
+            for alias in ("notification_date", "disclosure_date"):
+                if alias in cleaned:
+                    cleaned[alias] = None
         cleaned.update(
             member=effective_member,
             asset=asset,

@@ -4,7 +4,7 @@ import logging
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import duckdb
@@ -235,6 +235,8 @@ class Database:
                 "ALTER TABLE house_archive_generations "
                 "ADD COLUMN parse_status VARCHAR DEFAULT 'incomplete'"
             )
+        if "completed_at" not in generation_columns:
+            self.conn.execute("ALTER TABLE house_archive_generations ADD COLUMN completed_at TIMESTAMP")
 
     def _init_transactions_table(self) -> None:
         self.conn.execute("""
@@ -292,10 +294,12 @@ class Database:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tx_member ON transactions(member)"
         )
+        self.conn.execute("CREATE TABLE IF NOT EXISTS transaction_versions AS "
+                          "SELECT *, CURRENT_TIMESTAMP AS retired_at FROM transactions WHERE FALSE")
 
     @contextmanager
     def canonical_as_of(self, as_of: date):
-        """Temporarily select House generations promoted by the end of this day.
+        """Select rowsets promoted AND accepted by the end of this day.
 
         Connection-local, nestable, and restored even on failure. Do not share
         this connection between concurrent historical analyses.
@@ -321,9 +325,47 @@ class Database:
         )
         promotion_filter = f"AND generation.promoted_at < {boundary}" if boundary else ""
         fallback_filter = f"AND g2.promoted_at < {boundary}" if boundary else ""
-        self.conn.execute(f"""
+        acceptance_filter = f"AND parse_run.parsed_at < {boundary}" if boundary else ""
+        completion_filter = ""
+        completion_acceptance = ""
+        prefix = ""
+        if boundary:
+            tables = {r[0] for r in self.conn.execute("SHOW TABLES").fetchall()}
+            tx_versions = (" UNION ALL SELECT * EXCLUDE (retired_at) FROM transaction_versions "
+                           f"WHERE retired_at >= {boundary}" if "transaction_versions" in tables else "")
+            run_versions = (" UNION ALL SELECT * EXCLUDE (retired_at) FROM parse_run_versions "
+                            f"WHERE retired_at >= {boundary}" if "parse_run_versions" in tables else "")
+            prefix = (f"asof_transactions AS (SELECT * FROM (SELECT * FROM transactions {tx_versions}) versions WHERE created_at < {boundary}), "
+                      f"asof_parse_runs AS (SELECT * FROM pdf_parse_runs {run_versions}), ")
+            columns = {r[1] for r in self.conn.execute("PRAGMA table_info('house_archive_generations')").fetchall()}
+            completion_filter = "AND FALSE"  # historical fallback must bind the row version too
+            fallback_filter += (f" AND g2.completed_at < {boundary}"
+                                if "completed_at" in columns else " AND FALSE")
+            if "completed_at" in columns:
+                completion_acceptance = f"""OR (
+                    generation.parse_status = 'complete'
+                    AND generation.completed_at < {boundary}
+                    AND NOT EXISTS (
+                        SELECT 1 FROM transactions completed_rows
+                        WHERE completed_rows.doc_id = artifact.doc_id
+                          AND completed_rows.ingestion_generation = artifact.generation_id
+                          AND (completed_rows.created_at IS NULL
+                               OR completed_rows.created_at > generation.completed_at)
+                    )
+                )"""
+            # A run can only authorize the immutable rows actually present at
+            # its acceptance time; an old same-count run cannot bless new rows.
+            acceptance_filter += f""" AND NOT EXISTS (
+                SELECT 1 FROM transactions version
+                WHERE version.doc_id = artifact.doc_id
+                  AND version.ingestion_generation = artifact.generation_id
+                  AND version.artifact_sha256 = artifact.artifact_sha256
+                  AND version.source = {_HOUSE_PARSE_SOURCE}
+                  AND (version.created_at IS NULL OR version.created_at > parse_run.parsed_at)
+            )"""
+        sql = f"""
             CREATE OR REPLACE {view_kind} canonical_transactions AS
-            WITH accepted_house_artifacts AS (
+            WITH {prefix} accepted_house_artifacts AS (
                 -- Rowset acceptance, not generation acceptance: each filing is
                 -- judged on its own parse runs and row validity. Generations
                 -- stay incremental, so requiring completeness here would hide
@@ -347,7 +389,7 @@ class Database:
                       -- Legacy/synthetic artifacts without scope rows ride on
                       -- generation completeness, as before.
                       (scope.doc_id IS NULL
-                       AND generation.parse_status = 'complete')
+                       AND generation.parse_status = 'complete' {completion_filter})
                       OR EXISTS (
                           SELECT 1
                           FROM pdf_parse_runs parse_run
@@ -355,6 +397,7 @@ class Database:
                         AND parse_run.artifact_sha256 = artifact.artifact_sha256
                         AND parse_run.ingestion_generation = artifact.generation_id
                         AND parse_run.status IN ('success', 'no_txs', 'invalid')
+                        {acceptance_filter}
                         AND COALESCE(parse_run.transaction_count, 0) = (
                             SELECT COUNT(*)
                             FROM transactions tx_count
@@ -410,6 +453,7 @@ class Database:
                             )
                         )
                   )
+                  {completion_acceptance}
                   )
             ),
             latest_accepted_house_docs AS (
@@ -483,7 +527,42 @@ class Database:
                   OR t.disclosure_date IS NULL
                   OR t.transaction_date <= t.disclosure_date
               )
-        """)
+        """
+        if boundary:
+            # Change only the historical query body, never the live oracle.
+            head, body = sql.split("accepted_house_artifacts AS (", 1)
+            body = re.sub(r"\btransactions\b", "asof_transactions", body)
+            body = re.sub(r"\bpdf_parse_runs\b", "asof_parse_runs", body)
+            body = body.replace("SELECT t.* FROM asof_transactions t\n            WHERE (",
+                                f"SELECT t.* FROM asof_transactions t\n            WHERE t.created_at < {boundary} AND (")
+            row_completion = (f"OR EXISTS (SELECT 1 FROM house_archive_generations g "
+                              f"WHERE g.generation_id = t.ingestion_generation "
+                              f"AND g.parse_status = 'complete' AND g.completed_at < {boundary} "
+                              f"AND g.completed_at >= t.created_at)"
+                              if "completed_at" in columns else "")
+            row_acceptance = f"""
+              AND (t.source NOT IN ('house_pdf', 'gemini_ocr')
+                   OR NOT EXISTS (SELECT 1 FROM house_archive_generations g
+                                  WHERE g.generation_id = t.ingestion_generation)
+                   OR EXISTS (SELECT 1 FROM asof_parse_runs parse_run
+                              WHERE parse_run.doc_id = t.doc_id
+                                AND parse_run.ingestion_generation = t.ingestion_generation
+                                AND parse_run.artifact_sha256 = t.artifact_sha256
+                                AND parse_run.status = 'success'
+                                AND t.source = {_HOUSE_PARSE_SOURCE}
+                                AND parse_run.transaction_count = (
+                                    SELECT COUNT(*) FROM asof_transactions tx_count
+                                    WHERE tx_count.doc_id = t.doc_id
+                                      AND tx_count.ingestion_generation = t.ingestion_generation
+                                      AND tx_count.artifact_sha256 = t.artifact_sha256
+                                      AND tx_count.source = t.source)
+                                AND parse_run.parsed_at >= t.created_at
+                                AND parse_run.parsed_at < {boundary})
+                   {row_completion})
+            """
+            body += row_acceptance
+            sql = head + "accepted_house_artifacts AS (" + body
+        self.conn.execute(sql)
 
     def _init_prices_table(self) -> None:
         self.conn.execute("""
@@ -530,6 +609,8 @@ class Database:
                 "ALTER TABLE pdf_parse_runs "
                 "ADD COLUMN ingestion_generation VARCHAR"
             )
+        self.conn.execute("CREATE TABLE IF NOT EXISTS parse_run_versions AS "
+                          "SELECT *, CURRENT_TIMESTAMP AS retired_at FROM pdf_parse_runs WHERE FALSE")
 
     def _init_source_reports_table(self) -> None:
         self.conn.execute(f"""
@@ -891,10 +972,25 @@ class Database:
                 )
             self.conn.execute(
                 """
-                UPDATE house_archive_generations SET parse_status = 'complete'
+                UPDATE house_archive_generations SET parse_status = 'complete',
+                    completed_at = COALESCE(completed_at, ?)
                 WHERE archive_year = ? AND generation_id = ?
                 """,
-                [archive_year, generation_id],
+                [datetime.now(), archive_year, generation_id],
+            )
+            self.conn.execute(
+                """
+                INSERT INTO transaction_versions
+                SELECT *, CURRENT_TIMESTAMP FROM transactions
+                WHERE doc_id IN (
+                    SELECT doc_id FROM house_archive_quarantine
+                    WHERE archive_year = ? AND generation_id = ?
+                      AND reason = 'removed_from_authoritative_archive'
+                )
+                  AND (source = 'house_pdf' OR source = 'gemini_ocr' OR source IS NULL)
+                  AND ingestion_generation IS DISTINCT FROM ?
+                """,
+                [archive_year, generation_id, generation_id],
             )
             self.conn.execute(
                 """
@@ -1254,6 +1350,13 @@ class Database:
         self.conn.execute("BEGIN TRANSACTION")
         try:
             for doc_id in replacements:
+                predicate = ("doc_id = ? AND source = ? AND ingestion_generation = ?"
+                             if source == "house_pdf" else "doc_id = ? AND source = ?")
+                params = [doc_id, source, ingestion_generation] if source == "house_pdf" else [doc_id, source]
+                self.conn.execute(
+                    f"INSERT INTO transaction_versions SELECT *, CURRENT_TIMESTAMP FROM transactions WHERE {predicate}",
+                    params,
+                )
                 if source == "house_pdf":
                     self.conn.execute(
                         "DELETE FROM transactions "

@@ -65,6 +65,7 @@ def main() -> int:
 
 
 def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
+    from analyzer.canonical_scope import decision_history
     horizon = 60
     frequency = 30
     min_buyers = CONSENSUS_MIN_BUYERS
@@ -76,7 +77,9 @@ def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
 
     tx_start = start_date - timedelta(days=CONSENSUS_LOOKBACK_DAYS)
     print("Loading transactions...")
-    transactions = tx_source.db.get_transactions_by_date_range(tx_start, last_as_of)
+    as_of_dates = pd.date_range(start_date, last_as_of, freq=f"{frequency}D")
+    decision_frames = decision_history(tx_source.db, tx_start, as_of_dates)
+    transactions = pd.concat(decision_frames, ignore_index=True)
     print(f"  {len(transactions)} transactions")
 
     tickers = sorted(set(_get_consensus_price_tickers(transactions)) | {"SPY"})
@@ -85,7 +88,6 @@ def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
     prices = prices.dropna(axis=1, how="all")
     print(f"  {prices.shape[1]} price series, {len(prices)} dates")
 
-    as_of_dates = pd.date_range(start_date, last_as_of, freq=f"{frequency}D")
     config = KellyConfig(
         capital=capital,
         max_ticker_pct=0.20,
@@ -94,15 +96,19 @@ def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
         use_half_kelly=True,
         crash_guard=False,
     )
-    targets = build_portfolios_from_backtest(
-        transactions,
-        as_of_dates,
-        lookback_days=CONSENSUS_LOOKBACK_DAYS,
-        min_buyers=min_buyers,
-        top_n=top_n,
-        config=config,
-        sizing_inputs_df=sizing_inputs,
-    )
+    decision_targets = []
+    for decision, decision_transactions in zip(as_of_dates, decision_frames):
+        with tx_source.db.canonical_as_of(decision):
+            decision_targets.append(build_portfolios_from_backtest(
+                decision_transactions,
+                [decision],
+                lookback_days=CONSENSUS_LOOKBACK_DAYS,
+                min_buyers=min_buyers,
+                top_n=top_n,
+                config=config,
+                sizing_inputs_df=sizing_inputs,
+            ))
+    targets = pd.concat(decision_targets, ignore_index=True) if decision_targets else pd.DataFrame()
     if targets.empty:
         print(
             "Error: no targets had complete, dated member/outcome sizing inputs; "

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import duckdb
 
 
@@ -100,6 +102,11 @@ class ParseRunRepository:
             # Replace only this parser + artifact fingerprint. Prior artifact
             # generations and OCR provenance remain auditable.
             self.conn.execute(
+                f"INSERT INTO parse_run_versions SELECT *, CURRENT_TIMESTAMP "
+                f"FROM pdf_parse_runs WHERE {_IDENTITY_PREDICATE}",
+                identity_params,
+            )
+            self.conn.execute(
                 f"""
                 DELETE FROM pdf_parse_runs
                 WHERE {_IDENTITY_PREDICATE}
@@ -111,8 +118,8 @@ class ParseRunRepository:
                 INSERT INTO pdf_parse_runs (
                     doc_id, year, parser_version, status, engines_attempted,
                     raw_row_count, transaction_count, error_message,
-                    artifact_sha256, ingestion_generation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    artifact_sha256, ingestion_generation, parsed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 [
                     doc_id,
@@ -125,6 +132,7 @@ class ParseRunRepository:
                     error_message,
                     artifact_sha256,
                     ingestion_generation,
+                    datetime.now(),
                 ],
             )
             if not _in_transaction:

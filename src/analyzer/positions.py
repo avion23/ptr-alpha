@@ -20,6 +20,7 @@ from datetime import date
 
 import pandas as pd
 
+from analyzer.canonical_scope import canonical_decision
 from analyzer.member_names import canonical_member_key
 from analyzer.parsing.cells import _extract_amount_midpoint
 
@@ -258,7 +259,18 @@ def build_positions(
     skipped += int((~known).sum())
     # Filter before amendment resolution and alias grouping: future filings
     # must not remove or change the identity of a currently known lot.
-    ordered = trades.loc[known].sort_values("transaction_date", kind="mergesort")
+    # SQL does not guarantee input order. FIFO (especially same-day buys and
+    # full sales) needs a total, repeatable order, not a stable date-only sort.
+    # Filing identity breaks ties where available; economic fields are the
+    # fallback for older/slim inputs. This is not inferred intraday chronology.
+    tie_columns = dict.fromkeys(
+        ("transaction_date", "disclosure_date", "source", "source_record_id",
+         "source_row_id", "owner_code", *_LOADER_COLUMNS)
+    )
+    ordered = trades.loc[known].sort_values(
+        [column for column in tie_columns if column in trades],
+        kind="mergesort", na_position="first",
+    )
     if "amends_source_record_id" in ordered.columns:
         superseded = {
             str(value)
@@ -546,6 +558,7 @@ def build_positions(
     )
 
 
+@canonical_decision("as_of")
 def holdings_candidates(
     db, member: str, as_of: date, *, include_unpromoted: bool = False
 ) -> pd.DataFrame:
@@ -849,6 +862,7 @@ _LOADER_COLUMNS = (
     "instrument_type",
     "asset_description",
     "source_record_id",
+    "source_row_id",
     "amends_source_record_id",
 )
 

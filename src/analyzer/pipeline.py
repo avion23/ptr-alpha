@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer import analysis
+from analyzer.canonical_scope import canonical_decision, decision_history
 from analyzer.asset_ticker_map import resolve_asset_ticker
 from analyzer.actors import actor_id
 from analyzer._price_index import _normalize_price_index
@@ -107,6 +108,7 @@ def _execution_price_window(
     return first_entry.date(), last_exit.date()
 
 
+@canonical_decision("as_of_date")
 def prepare_analysis_data(
     transaction_source,
     price_source,
@@ -179,6 +181,7 @@ def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
     return DataResult(success=True, data=None)
 
 
+@canonical_decision("as_of_date")
 def source_freshness_metrics(
     transaction_source,
     as_of_date: pd.Timestamp,
@@ -246,6 +249,7 @@ def source_freshness_metrics(
     return pd.DataFrame(metrics)
 
 
+@canonical_decision("as_of_date")
 def prepare_live_consensus_data(
     transaction_source,
     as_of_date: pd.Timestamp,
@@ -830,17 +834,14 @@ def run_backtest_pipeline(
     tx_start = params.start_date - timedelta(days=CONSENSUS_LOOKBACK_DAYS)
     tx_end = params.end_date
 
-    all_transactions = transaction_source.db.get_transactions_by_date_range(
-        tx_start, tx_end
-    )
+    as_of_dates = pd.date_range(params.start_date, params.end_date, freq=f"{params.frequency_days}D")
+    decision_frames = decision_history(transaction_source.db, tx_start, as_of_dates)
+    all_transactions = pd.concat(decision_frames, ignore_index=True)
     if all_transactions.empty:
         raise DataSourceError(f"No transactions found between {tx_start} and {tx_end}")
 
     logger.info("Loaded %d transactions for backtest window", len(all_transactions))
 
-    as_of_dates = pd.date_range(
-        params.start_date, params.end_date, freq=f"{params.frequency_days}D"
-    )
     price_start, price_end = _execution_price_window(
         as_of_dates[0],
         as_of_dates[-1],
@@ -871,11 +872,11 @@ def run_backtest_pipeline(
     total_no_price = 0
     total_delisted = 0
     total_unavailable = 0
-    for as_of in as_of_dates:
+    for as_of, decision_transactions in zip(as_of_dates, decision_frames):
         as_of_ts = pd.Timestamp(as_of)
 
         recs = analysis.backtest_recommendations(
-            all_transactions,
+            decision_transactions,
             as_of_ts,
             lookback_days=CONSENSUS_LOOKBACK_DAYS,
             min_buyers=CONSENSUS_MIN_BUYERS,

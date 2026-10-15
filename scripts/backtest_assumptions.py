@@ -175,35 +175,33 @@ def cached_position_inputs():
         positions.load_price_history = load_prices
 
 
+def skill_episodes(db, decision):
+    ev = eligible_events(db, decision)
+    ev = ev[pd.to_datetime(ev["disclosure_date"]) < pd.Timestamp("2023-01-01")]
+    ev = ev.drop_duplicates(["actor_id", "ticker", "disclosure_date"])
+    ev = ev.loc[ev["actor_id"].astype(str).str.startswith("congress:")]
+    episodes = []
+    for r in ev.itertuples():
+        disclosure = pd.to_datetime(r.disclosure_date).date()
+        entry = next_session_close(db, str(r.ticker), disclosure)
+        if not entry:
+            continue
+        exit_date = outcome_exit_date(entry[0])
+        _, _, excess = fwd_excess(db, str(r.ticker), entry[0], entry[1])
+        if excess is not None:
+            episodes.append({"actor": str(r.actor_id), "ticker": str(r.ticker),
+                             "disclosure_date": disclosure, "exit_date": exit_date,
+                             "excess": excess})
+    return episodes
+
+
 def cmd_skill():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     db = Database(DB_PATH, read_only=True)
     try:
-        ev = eligible_events(db, date(2022, 12, 31))
-        ev = ev[pd.to_datetime(ev["disclosure_date"]) < pd.Timestamp("2023-01-01")]
-        ev = ev.drop_duplicates(["actor_id", "ticker", "disclosure_date"])
-        ev = ev.loc[ev["actor_id"].astype(str).str.startswith("congress:")]
-        episodes = []
-        for r in ev.itertuples():
-            disclosure = pd.to_datetime(r.disclosure_date).date()
-            entry = next_session_close(db, str(r.ticker), disclosure)
-            if not entry:
-                continue
-            exit_date = outcome_exit_date(entry[0])
-            _, _, excess = fwd_excess(db, str(r.ticker), entry[0], entry[1])
-            if excess is not None:
-                episodes.append(
-                    {
-                        "actor": str(r.actor_id),
-                        "ticker": str(r.ticker),
-                        "disclosure_date": disclosure,
-                        "exit_date": exit_date,
-                        "excess": excess,
-                    }
-                )
-        print("pre-2023 unique events:", len(ev), "priced outcomes:", len(episodes), flush=True)
         by_decision = {}
         for decision in DECISIONS:
+            episodes = skill_episodes(db, decision)
             matured = [item for item in episodes if item["exit_date"] < decision]
             stats_by_actor = {}
             for item in matured:

@@ -114,8 +114,8 @@ def test_mccaul_skill_matches_exact_name_variant_only(tmp_path):
         """
         INSERT INTO transactions (
             doc_id, member, ticker, transaction_date, disclosure_date,
-            transaction_type, owner_code, amount_raw, amount_midpoint, source
-        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf')
+            transaction_type, owner_code, amount_raw, amount_midpoint, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf', '2023-01-01')
         """,
         [
             (f"mccaul-{index}", "Michael T. McCaul", ticker, day.date(), day.date())
@@ -172,8 +172,8 @@ def test_accented_surname_skill_history_is_found(tmp_path):
         """
         INSERT INTO transactions (
             doc_id, member, ticker, transaction_date, disclosure_date,
-            transaction_type, owner_code, amount_raw, amount_midpoint, source
-        ) VALUES (?, 'Nydia Velázquez', ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf')
+            transaction_type, owner_code, amount_raw, amount_midpoint, source, created_at
+        ) VALUES (?, 'Nydia Velázquez', ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf', '2023-01-01')
         """,
         [
             (f"velazquez-{ticker}", ticker, day.date(), day.date())
@@ -286,8 +286,8 @@ def _insert_positive_skill_history(db, member, source, tickers):
         """
         INSERT INTO transactions (
             doc_id, member, ticker, transaction_date, disclosure_date,
-            transaction_type, owner_code, amount_raw, amount_midpoint, source
-        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, ?)
+            transaction_type, owner_code, amount_raw, amount_midpoint, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, ?, '2023-01-01')
         """,
         [
             (
@@ -330,9 +330,9 @@ def test_single_actor_skill_history_query_returns_only_matching_rows(tmp_path, m
         """
         INSERT INTO transactions (
             doc_id, member, ticker, transaction_date, disclosure_date,
-            transaction_type, owner_code, amount_raw, amount_midpoint, source
+            transaction_type, owner_code, amount_raw, amount_midpoint, source, created_at
         ) VALUES (?, ?, ?, DATE '2023-01-01', DATE '2023-01-02',
-                  'Purchase', '', '$1,001 - $15,000', 8000, ?)
+                  'Purchase', '', '$1,001 - $15,000', 8000, ?, '2023-01-01')
         """,
         records,
     )
@@ -432,8 +432,8 @@ def test_ligature_name_history_uses_full_python_normalized_history(tmp_path):
         """
         INSERT INTO transactions (
             doc_id, member, ticker, transaction_date, disclosure_date,
-            transaction_type, owner_code, amount_raw, amount_midpoint, source
-        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf')
+            transaction_type, owner_code, amount_raw, amount_midpoint, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf', '2023-01-01')
         """,
         [
             (f"ligature-{index}", member, ticker, day.date(), day.date())

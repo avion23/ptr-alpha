@@ -282,6 +282,18 @@ def prepare_live_consensus_data(
     return trades
 
 
+def _row_identity(value):
+    """Canonical identity value for a receipt: the id, or an explicit NULL.
+
+    Missing/blank ids stay None so provenance never invents a stand-in for
+    producers that genuinely have no ids.
+    """
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def eligible_events(
     db,
     as_of: date | pd.Timestamp,
@@ -294,6 +306,8 @@ def eligible_events(
         "actor_id",
         "kind",
         "source",
+        "source_record_id",
+        "source_row_id",
         "entry_ref",
         "event_date",
         "disclosure_date",
@@ -415,6 +429,12 @@ def eligible_events(
                 "actor_id": actor,
                 "kind": kind,
                 "source": source,
+                # Canonical row identity travels with the candidate so the
+                # decision receipt can reconstruct input provenance. Legacy
+                # producers without ids record NULL explicitly, never an
+                # invented stand-in.
+                "source_record_id": _row_identity(purchase.get("source_record_id")),
+                "source_row_id": _row_identity(purchase.get("source_row_id")),
                 "entry_ref": entry_ref,
                 "event_date": pd.Timestamp(purchase["transaction_date"]).normalize(),
                 "disclosure_date": pd.Timestamp(purchase["disclosure_date"]).normalize(),

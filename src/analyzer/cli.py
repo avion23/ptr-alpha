@@ -296,6 +296,20 @@ def _consensus_score_display(score: pd.DataFrame) -> pd.DataFrame:
     return score[columns]
 
 
+def _receipt_data_dir(app_ctx):
+    """Data directory for decision receipts, or None when unresolvable.
+
+    Recording must never invent a write target: when the context carries no
+    real path (mocked smoke contexts), skip recording instead of scattering
+    files relative to the working directory.
+    """
+    data = getattr(getattr(app_ctx, "settings", None), "data", None)
+    data_dir = getattr(data, "data_dir", None)
+    if isinstance(data_dir, (str, Path)) and str(data_dir):
+        return data_dir
+    return None
+
+
 def _run_ticker_mode(
     app_ctx: AppContext,
     mode: str,
@@ -327,6 +341,31 @@ def _run_ticker_mode(
     )
     result = run_ticker_analysis(params, app_ctx.transaction_source)
     if result.success and hasattr(result, "data") and result.data:
+        from analyzer.decision_snapshot import record_ticker_decision_safely
+
+        as_of_date = pd.Timestamp(
+            params.as_of_date or min(date.today(), date(params.year, 12, 31))
+        ).normalize().date()
+        # Same receipt writer as every other production decision boundary;
+        # failures are logged, never raised (never break trading).
+        receipt_dir = _receipt_data_dir(app_ctx)
+        if receipt_dir is not None:
+            record_ticker_decision_safely(
+                receipt_dir,
+                as_of_date,
+                inputs={"buyers": result.data["buyers"]},
+                outputs={
+                    "ticker": result.data["ticker"],
+                    "score": result.data["score"],
+                },
+                scope={
+                    "mode": "ticker",
+                    "ticker": params.ticker,
+                    "year": params.year,
+                    "days_back": params.days_back,
+                    "min_buyers": params.min_buyers,
+                },
+            )
         print(f"\n=== Buyers of {result.data['ticker']} ===")
         print(result.data["buyers"].to_string(index=False))
         print("\n=== Signal Score ===")
@@ -362,6 +401,23 @@ def _run_tickers_mode(
     )
     result = run_recent_ticker_scoring(app_ctx.transaction_source, params)
     if result.success and hasattr(result, "data") and result.data:
+        from analyzer.decision_snapshot import record_ticker_decision_safely
+
+        # Same receipt writer as every other production decision boundary;
+        # failures are logged, never raised (never break trading).
+        receipt_dir = _receipt_data_dir(app_ctx)
+        if receipt_dir is not None:
+            record_ticker_decision_safely(
+                receipt_dir,
+                result.data["as_of_date"],
+                inputs={
+                    "days_back": params.days_back,
+                    "min_buyers": params.min_buyers,
+                    "top_n": params.top_n,
+                },
+                outputs={"result": result.data["result"]},
+                scope={"mode": "tickers", "year": params.year},
+            )
         data = result.data
         if not data["result"].empty:
             print(
@@ -792,7 +848,7 @@ def backtest(
             print("\n=== Price Snapshot ===")
             print(f"  Snapshot ID:  {snapshot.snapshot_id}")
             print(f"  Created:      {snapshot.created_at}")
-            print(f"  Git SHA:      {snapshot.git_sha[:12]}")
+            print(f"  Git SHA:      {(snapshot.git_sha or 'unknown')[:12]}")
             print(f"  yfinance:     {snapshot.yfinance_version}")
             print(
                 f"  Tickers:      {snapshot.resolved_tickers}/{snapshot.requested_tickers} resolved"
@@ -1097,7 +1153,7 @@ def snapshot(
 
     print(f"Snapshot created: {snap.snapshot_id}")
     print(f"  Created at:     {snap.created_at}")
-    print(f"  Git SHA:        {snap.git_sha[:12]}")
+    print(f"  Git SHA:        {(snap.git_sha or 'unknown')[:12]}")
     print(f"  yfinance:       {snap.yfinance_version}")
     print(f"  Python:         {snap.python_version}")
     print(

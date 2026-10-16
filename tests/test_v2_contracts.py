@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 AS_OF = date(2026, 1, 20)
-EXPECTED_CANDIDATE_COLUMNS = {
+_BASE_CANDIDATE_COLUMNS = {
     "ticker",
     "actor_id",
     "kind",
@@ -18,6 +18,10 @@ EXPECTED_CANDIDATE_COLUMNS = {
     "position_evidence",
     "as_of",
 }
+# Provenance identities recorded with the decision receipt: canonical row
+# ids for event rows, contributing lot/filing references for holdings rows.
+EVENT_IDENTITY_COLUMNS = _BASE_CANDIDATE_COLUMNS | {"source_record_id", "source_row_id"}
+HOLDINGS_IDENTITY_COLUMNS = _BASE_CANDIDATE_COLUMNS | {"filing_refs"}
 EXPECTED_KINDS = {"congress", "officer", "manager"}
 
 
@@ -196,22 +200,39 @@ def test_actor_identity_and_source_weight_contract():
 
 
 @pytest.mark.parametrize(
-    ("module_name", "function_name", "source"),
+    ("module_name", "function_name", "source", "expected_columns"),
     [
-        ("analyzer.positions", "holdings_candidates", "holdings"),
-        ("analyzer.pipeline", "eligible_events", "form4"),
-        ("analyzer.form4", "candidates_from_sweep", "form4"),
-        ("analyzer.form13f", "candidates_from_increases", "13f"),
+        (
+            "analyzer.positions",
+            "holdings_candidates",
+            "holdings",
+            HOLDINGS_IDENTITY_COLUMNS,
+        ),
+        ("analyzer.pipeline", "eligible_events", "form4", EVENT_IDENTITY_COLUMNS),
+        (
+            "analyzer.form4",
+            "candidates_from_sweep",
+            "form4",
+            _BASE_CANDIDATE_COLUMNS,
+        ),
+        (
+            "analyzer.form13f",
+            "candidates_from_increases",
+            "13f",
+            _BASE_CANDIDATE_COLUMNS,
+        ),
     ],
 )
-def test_candidate_builder_frame_contract(module_name, function_name, source):
+def test_candidate_builder_frame_contract(
+    module_name, function_name, source, expected_columns
+):
     module = pytest.importorskip(module_name, reason=f"{module_name} module is not integrated")
     function = _present_function(module, function_name)
     result = _invoke(function, _seed(source), source_value=source)
 
     assert isinstance(result, pd.DataFrame)
-    assert len(result.columns) == len(EXPECTED_CANDIDATE_COLUMNS)
-    assert set(result.columns) == EXPECTED_CANDIDATE_COLUMNS
+    assert len(result.columns) == len(expected_columns)
+    assert set(result.columns) == expected_columns
     assert result["kind"].isin(EXPECTED_KINDS).all()
     thirteen_f_rows = result.loc[result["source"] == "13f"]
     if source == "13f":

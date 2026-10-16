@@ -10,6 +10,7 @@ default member set is a v1 seed list; pass ``members`` to replay other members.
 
 from __future__ import annotations
 
+import json
 import math
 from contextlib import nullcontext
 from datetime import date, timedelta
@@ -71,6 +72,25 @@ def _candidate_frame(value, piece: str) -> pd.DataFrame:
     if not isinstance(value, pd.DataFrame):
         raise ReplayError(f"{piece} must return a pandas DataFrame")
     return value.copy()
+
+
+def _canonicalize_provenance(frame: pd.DataFrame) -> pd.DataFrame:
+    """Stringify structured provenance cells (e.g. holdings filing_refs).
+
+    Candidate frames now carry filing-identity lineage as lists of dicts;
+    those cells are unhashable, so drop_duplicates needs a canonical
+    encoding. Scoring never reads these columns; the encoding only keeps
+    dedup semantics identical.
+    """
+    for column in frame.columns:
+        values = frame[column]
+        if values.map(lambda v: isinstance(v, (list, dict))).any():
+            frame[column] = values.map(
+                lambda v: (
+                    json.dumps(v, sort_keys=True) if isinstance(v, (list, dict)) else v
+                )
+            )
+    return frame
 
 
 def _check_disclosures(candidates: pd.DataFrame, as_of: date, piece: str) -> None:
@@ -170,7 +190,7 @@ def _ticker_candidates(
         if candidate_holdings
         else pd.DataFrame(columns=["ticker", "member", "disclosure_date"])
     )
-    return scored.drop_duplicates(ignore_index=True)
+    return _canonicalize_provenance(scored).drop_duplicates(ignore_index=True)
 
 
 def _latest_quote(db, ticker: str, as_of: date) -> tuple[float, date] | None:

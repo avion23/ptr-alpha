@@ -794,6 +794,7 @@ class TestPositions(unittest.TestCase):
                 "corroboration",
                 "position_evidence",
                 "as_of",
+                "filing_refs",
             ],
         )
         self.assertEqual(len(candidates), 1)

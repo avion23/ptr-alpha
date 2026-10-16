@@ -126,6 +126,15 @@ def _clean_asset(value: object) -> str | None:
     return asset
 
 
+# Symbols confirmed dead with no successor listing. Evidence is per-symbol,
+# never a fetch error alone (Yahoo 404s live symbols under throttling, and
+# renamed symbols 404 under the old spelling): EA returns no equity on Yahoo
+# search, quoteSummary 404, and empty period=max history as of 2026-10-16
+# (take-private completed; holders were cashed out). Exclusion skips price
+# fetching only; transactions and rankings are untouched.
+RETIRED_NO_SUCCESSOR_TICKERS = frozenset({"EA"})
+
+
 def select_eligible_assets(
     tickers: list[str], *, include_benchmark: bool = True
 ) -> tuple[list[str], dict[str, list[str]]]:
@@ -156,6 +165,19 @@ def select_eligible_assets(
         if resolver.resolve(token).status == "quarantined":
             excluded.setdefault("quarantined_or_suspicious", []).append(token)
             continue
+        if token in RETIRED_NO_SUCCESSOR_TICKERS:
+            excluded.setdefault("retired_no_successor", []).append(token)
+            continue
+        if token in TickerResolver.RENAME_MAP:
+            # Report-only: the token stays eligible under its filed spelling.
+            # The price source maps it to the successor provider symbol and
+            # materializes BOTH columns, so pre-rename history remains
+            # evaluable under the contemporaneous symbol. Substituting the
+            # successor here would defeat that and freeze the old column.
+            successor = TickerResolver.RENAME_MAP[token][0]
+            excluded.setdefault("renamed_resolves_via_successor", []).append(
+                f"{token}->{successor}"
+            )
         eligible.append(token)
     if include_benchmark and BENCHMARK_TICKER not in eligible:
         eligible.append(BENCHMARK_TICKER)

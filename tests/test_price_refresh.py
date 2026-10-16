@@ -87,6 +87,20 @@ class EligibilityTests(unittest.TestCase):
         eligible, _ = refresh_prices.select_eligible_assets([])
         self.assertEqual(eligible, ["SPY"])
 
+    def test_renamed_symbol_stays_eligible_under_filed_spelling(self):
+        # The price source maps BK to the BNY provider symbol and stores
+        # BOTH columns; substituting here would freeze the BK column.
+        eligible, excluded = refresh_prices.select_eligible_assets(["BK", "MSFT"])
+        self.assertIn("BK", eligible)
+        self.assertIn("MSFT", eligible)
+        self.assertIn("BK->BNY", excluded.get("renamed_resolves_via_successor", []))
+
+    def test_retired_symbol_with_no_successor_is_excluded(self):
+        eligible, excluded = refresh_prices.select_eligible_assets(["EA", "MSFT"])
+        self.assertNotIn("EA", eligible)
+        self.assertIn("MSFT", eligible)
+        self.assertIn("EA", excluded.get("retired_no_successor", []))
+
 
 class EndDateTests(unittest.TestCase):
     def test_weekend_rolls_back_to_friday(self):
@@ -213,6 +227,37 @@ class RefreshPipelineTests(unittest.TestCase):
             check.close()
         self.assertEqual(rows, 0)
         self.assertEqual(msft, 2)  # 0.0 and NaN quarantined; 2 valid rows remain
+
+    def test_rename_alias_materializes_both_columns(self):
+        # BK is fetched via the BNY provider symbol; the temp DB must hold
+        # the series under BOTH spellings so pre-rename history stays
+        # evaluable under the contemporaneous symbol.
+        self._seed_transactions(["BK"])
+        dates = _nyse_dates("2024-01-02", "2024-01-05")
+        frame = pd.DataFrame(
+            {
+                ("Close", "BNY"): [50.0, 51.0, 52.0, 53.0],
+                ("Close", "SPY"): [400.0, 401.0, 402.0, 403.0],
+            },
+            index=dates,
+        )
+        report = self._run(frame)
+        self.assertIn("BK", report.eligible_assets)
+        self.assertIn(
+            "BK->BNY", report.excluded_assets.get("renamed_resolves_via_successor", [])
+        )
+        check = Database(self.temp_db, read_only=True)
+        try:
+            bk = check.conn.execute(
+                "SELECT close FROM prices WHERE ticker = 'BK' ORDER BY date"
+            ).fetchall()
+            bny = check.conn.execute(
+                "SELECT close FROM prices WHERE ticker = 'BNY' ORDER BY date"
+            ).fetchall()
+        finally:
+            check.close()
+        self.assertEqual([row[0] for row in bk], [50.0, 51.0, 52.0, 53.0])
+        self.assertEqual([row[0] for row in bny], [50.0, 51.0, 52.0, 53.0])
 
     def test_refresh_never_touches_canonical_db(self):
         self._seed_transactions(["AAPL"])

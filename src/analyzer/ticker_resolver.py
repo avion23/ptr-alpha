@@ -46,6 +46,12 @@ class TickerResolver:
         "FB": ("META", "2022-06-09"),
         "SQ": ("XYZ", "2025-01-21"),
         "BLL": ("BALL", "2022-11-01"),
+        # BNY Mellon renamed BK -> BNY effective 2026-04-10: BK's last Yahoo
+        # close was 2026-04-09 (13,478-row BNY history is backfilled
+        # continuous to 1973, so the successor covers pre-rename dates too).
+        # Verified 2026-10-16: BK 404s on quoteSummary/history; BNY trades
+        # on NYQ as "The Bank of New York Mellon Corp".
+        "BK": ("BNY", "2026-04-10"),
     }
 
     ACQUISITION_MAP: dict[str, tuple[str, str]] = {

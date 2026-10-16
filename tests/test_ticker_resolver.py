@@ -60,6 +60,12 @@ class TestTickerResolver(unittest.TestCase):
         self.assertEqual(before.price_symbol, "BLL")
         self.assertEqual(after.price_symbol, "BALL")
 
+    def test_bk_uses_ticker_change_date(self):
+        before = self.resolver.resolve("BK", date(2026, 4, 9))
+        after = self.resolver.resolve("BK", date(2026, 4, 10))
+        self.assertEqual((before.price_symbol, before.status), ("BK", "pre_rename"))
+        self.assertEqual((after.price_symbol, after.status), ("BNY", "renamed"))
+
     def test_unknown_symbol_is_not_claimed_verified(self):
         for ticker in ("AAPL", "ZZZZZ"):
             result = self.resolver.resolve(ticker)

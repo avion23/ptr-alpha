@@ -1608,6 +1608,7 @@ def setups(
         )
         from analyzer.manager_watchlist import watchlist_actor_ids
         from analyzer.setups import score as score_setups
+        from analyzer.decision_snapshot import record_decision_safely
 
         def _congress_holdings(frame):
             """Congress rows initiate scoring; officer/manager holdings rows
@@ -1630,6 +1631,8 @@ def setups(
         # One human, one holdings load: drop requested names that denote an
         # already-requested member (variants, nicknames, middle names).
         member = dedupe_member_names(list(member))
+        decision_scope = {"members": member, "tickers": sorted(requested_tickers),
+                          "include_unpromoted": include_unpromoted}
         for selected_member in member:
             frame = holdings_candidates(
                 db,
@@ -1699,6 +1702,8 @@ def setups(
                 candidate_frames.append(events)
         candidate_frames = [frame for frame in candidate_frames if not frame.empty]
         if not candidate_frames:
+            record_decision_safely(data_dir, as_of_date, pd.DataFrame(), {}, {},
+                                   watchlist_actor_ids(), scope=decision_scope)
             print("No candidates.")
             _cli_exit(0)
         candidates = pd.concat(candidate_frames, ignore_index=True)
@@ -1709,6 +1714,8 @@ def setups(
                 )
             ].copy()
         if candidates.empty:
+            record_decision_safely(data_dir, as_of_date, candidates, {}, {},
+                                   watchlist_actor_ids(), scope=decision_scope)
             print("No candidates.")
             _cli_exit(0)
 
@@ -1726,11 +1733,16 @@ def setups(
                 current_prices[symbol] = (float(row[0]), row[1])
 
         weights = weights_for_candidates(db, candidates, as_of_date)
+        decision_watchlist = watchlist_actor_ids()
         ranked, blocked = score_setups(
             candidates,
             weights,
             current_prices,
-            watchlist=watchlist_actor_ids(),
+            watchlist=decision_watchlist,
+        )
+        record_decision_safely(
+            data_dir, as_of_date, candidates, weights, current_prices,
+            decision_watchlist, ranked, blocked, scope=decision_scope,
         )
     except typer.Exit:
         raise

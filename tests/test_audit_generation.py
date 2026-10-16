@@ -13,6 +13,7 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
+import pytest
 
 from analyzer.database import Database
 
@@ -20,10 +21,66 @@ from scripts.audit_generation import (
     PINNED_CANARY_COUNTS,
     audit_database,
     check_house_generation_activation,
+    check_source_row_ids,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIT_SCRIPT = ROOT / "scripts" / "audit_generation.py"
+
+
+@pytest.mark.parametrize(
+    "source", ["house_pdf", "gemini_ocr", "senate_efd", "form4", "13f"]
+)
+def test_c2_detects_null_identity_replays_without_changing_legacy_rows(tmp_path, source):
+    db_path = tmp_path / "null-identity.duckdb"
+    db = Database(db_path)
+    row = pd.DataFrame([{
+        "doc_id": "legacy",
+        "member": "Fixture Member",
+        "ticker": "TEST",
+        "transaction_date": date(2026, 1, 1),
+        "disclosure_date": date(2026, 1, 2),
+        "transaction_type": "Purchase",
+        "owner_code": "",
+        "amount_raw": "",
+        "chamber": "Senate" if source == "senate_efd" else "House",
+        "source_record_id": "legacy",
+        "source_row_id": None,
+        "ingestion_generation": "legacy-generation",
+    }])
+    try:
+        assert db.upsert_transactions(row, source=source) == 1
+        if source in ("house_pdf", "gemini_ocr"):
+            assert any(
+                "blank source_row_id" in v
+                for v in check_source_row_ids(db.conn).violations
+            )
+        # All other index components are populated. NULL alone bypasses both
+        # the repository identity match and DuckDB's unique-index check.
+        assert db.upsert_transactions(row, source=source) == 1
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM canonical_transactions"
+        ).fetchone()[0] == 2
+        before = db.conn.execute("SELECT * FROM transactions ORDER BY id").fetchall()
+    finally:
+        db.close()
+
+    digest = _sha(db_path)
+    conn = duckdb.connect(str(db_path), read_only=True)
+    try:
+        result = check_source_row_ids(conn)
+        assert not result.passed
+        assert any(
+            "row=None" in v and "2 rows share one source_row_id" in v
+            for v in result.violations
+        )
+        assert conn.execute("SELECT * FROM transactions ORDER BY id").fetchall() == before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM canonical_transactions"
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+    assert _sha(db_path) == digest
 
 
 # ── Fixture builder ───────────────────────────────────────────────────────────

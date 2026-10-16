@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime
 
@@ -11,6 +12,7 @@ class AmbiguousTransactionIdentityError(ValueError):
     """Raised when a legacy economic unique key blocks identity-safe storage."""
 
 _PROVENANCE_COLUMNS = (
+    "acceptance_datetime",
     "chamber",
     "member_key",
     "chamber_member_key",
@@ -256,6 +258,23 @@ SOURCE_TRANSACTION_COLUMNS = [
 ]
 
 
+def acceptance_datetime_violations(df: pd.DataFrame) -> pd.Series:
+    """SEC-local clock bounds; allow one day of transaction-date slack.
+
+    Unknown legacy knowledge times are not violations. Report, never repair,
+    inconsistent source timestamps.
+    """
+    if "acceptance_datetime" not in df:
+        return pd.Series(False, index=df.index)
+    accepted = pd.to_datetime(df["acceptance_datetime"])
+    disclosed = pd.to_datetime(df["disclosure_date"])
+    traded = pd.to_datetime(df["transaction_date"])
+    return accepted.notna() & (
+        (accepted > disclosed + pd.Timedelta(days=1))
+        | (accepted < traded - pd.Timedelta(days=1))
+    )
+
+
 class TransactionRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.conn = conn
@@ -387,6 +406,12 @@ class TransactionRepository:
         df["created_at"] = datetime.now()
         df["source"] = source
         df = _normalize_frame(df, deduplicate=True)
+        violations = acceptance_datetime_violations(df)
+        if violations.any():
+            logging.getLogger(__name__).warning(
+                "SEC acceptance datetime invariant violated for %d rows: %s",
+                int(violations.sum()), df.loc[violations, "doc_id"].tolist(),
+            )
 
 
 

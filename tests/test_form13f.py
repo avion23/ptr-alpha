@@ -51,6 +51,50 @@ def quarter_xmls():
     return previous, current
 
 
+@pytest.mark.parametrize("discovery", [False, True])
+def test_fetch_records_acceptance(tmp_path, monkeypatch, quarter_xmls, discovery):
+    from datetime import datetime
+    from analyzer.database import Database
+
+    recent = {
+        "form": ["13F-HR", "13F-HR"],
+        "reportDate": ["2026-06-30", "2026-03-31"],
+        "filingDate": ["2026-08-14", "2026-05-15"],
+        "accessionNumber": ["0001234567-26-000002", "0001234567-26-000001"],
+        "acceptanceDateTime": ["2026-08-14T21:30:00Z", "2026-05-15T20:00:00Z"],
+    }
+    previous, current = map(_parse_information_table, quarter_xmls)
+    with Database(tmp_path / "test.duckdb") as db:
+        source = ThirteenFSource(
+            data_dir=tmp_path, db=db, watchlist={"VST": {"VISTRA"}},
+            managers={"test": {"name": "Test Manager", "cik": "1234567"}},
+            ingestion_generation="test", ticker_map={"111111111": "VST"},
+        )
+        calls = []
+        def submissions(cik):
+            calls.append("submissions")
+            return {"filings": {"recent": recent}}
+        def filing(cik, record):
+            calls.append("filing")
+            return (current if record["report_date"] == "2026-06-30" else previous), "https://example.test/report.xml"
+        monkeypatch.setattr(source, "_load_submissions", submissions)
+        monkeypatch.setattr(source, "_load_filing", filing)
+        try:
+            if discovery:
+                rows = source._manager_increases("test", source.managers["test"])
+                source.save_increases(pd.DataFrame(rows))
+            else:
+                rows = source._manager_transactions(source.managers["test"])
+                from analyzer.form13f import _OUTPUT_COLUMNS
+                source.save_to_db(pd.DataFrame(rows, columns=_OUTPUT_COLUMNS))
+            expected = datetime(2026, 8, 14, 17, 30)
+            assert rows and all(row["acceptance_datetime"] == expected for row in rows)
+            assert db.conn.execute("SELECT DISTINCT acceptance_datetime FROM transactions").fetchall() == [(expected,)]
+            assert calls == ["submissions", "filing", "filing"]
+        finally:
+            source.close()
+
+
 def test_emits_only_watchlist_increases_and_new_positions(tmp_path, quarter_xmls):
     source = ThirteenFSource(
         data_dir=tmp_path / "data",

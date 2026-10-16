@@ -20,6 +20,7 @@ from analyzer.form4 import (
     SEC_SUBMISSIONS_URL,
     _SECClient,
     _accession_digits,
+    _acceptance_datetime,
 )
 from analyzer.interfaces import TransactionSource
 from analyzer.manager_watchlist import WATCHLIST_MANAGERS
@@ -32,6 +33,7 @@ SEC_USER_AGENT = os.environ.get(
 )
 
 _OUTPUT_PROVENANCE_COLUMNS = (
+    "acceptance_datetime",
     "source_record_id",
     "source_row_id",
     "source_report_path",
@@ -44,6 +46,7 @@ _OUTPUT_PROVENANCE_COLUMNS = (
 _OUTPUT_COLUMNS = _BASE_WRITE_COLUMNS + _OUTPUT_PROVENANCE_COLUMNS
 _SHARE_SUBTYPE = "INFERRED_POSITION_INCREASE"
 _INCREASE_COLUMNS = (
+    "acceptance_datetime",
     "manager_key",
     "manager",
     "ticker",
@@ -83,6 +86,7 @@ def _canonical_row(
     accession,
     report_url,
     ingestion_generation,
+    acceptance_datetime=None,
 ) -> dict:
     """One canonical 13F row; shared by watchlist and discovery paths."""
     row_id = cusip
@@ -102,6 +106,7 @@ def _canonical_row(
         "ticker": ticker,
         "transaction_date": event_date,
         "disclosure_date": disclosure_date,
+        "acceptance_datetime": acceptance_datetime,
         "transaction_type": "Purchase",
         "owner_code": None,
         "amount_raw": f"{added_shares:,} shares",
@@ -193,8 +198,11 @@ def _recent_quarters(submissions: dict) -> list[dict[str, str]]:
         )
 
     by_report_date: dict[date, dict[str, str]] = {}
-    rows = zip(*(recent[field] for field in required))
-    for form, report_raw, filed_raw, accession in rows:
+    accepted = recent.get("acceptanceDateTime", [None] * len(recent["form"]))
+    if not isinstance(accepted, list) or len(accepted) != len(recent["form"]):
+        raise ThirteenFError("SEC acceptance timestamp column has a different length")
+    rows = zip(*(recent[field] for field in required), accepted)
+    for form, report_raw, filed_raw, accession, acceptance in rows:
         if form not in {"13F-HR", "13F-HR/A"}:
             continue
         try:
@@ -214,6 +222,7 @@ def _recent_quarters(submissions: dict) -> list[dict[str, str]]:
             "report_date": report_date.isoformat(),
             "filing_date": filing_date.isoformat(),
             "accession": str(accession),
+            "acceptance_datetime": _acceptance_datetime(acceptance),
         }
         previous = by_report_date.get(report_date)
         if previous is None or (candidate["filing_date"], candidate["accession"]) > (
@@ -428,6 +437,7 @@ class ThirteenFSource(TransactionSource):
                     "ticker": ticker,
                     "event_date": quarter_end,
                     "disclosure_date": disclosure_date,
+                    "acceptance_datetime": current_filing.get("acceptance_datetime"),
                     "cusip": cusip,
                     "added_shares": added_shares,
                     "raw_asset_description": issuer,
@@ -500,6 +510,7 @@ class ThirteenFSource(TransactionSource):
                     accession=current_filing["accession"],
                     report_url=report_url,
                     ingestion_generation=self.ingestion_generation,
+                    acceptance_datetime=current_filing.get("acceptance_datetime"),
                 )
             )
         return rows
@@ -573,7 +584,7 @@ class ThirteenFSource(TransactionSource):
         scope), so amount_midpoint stays NULL and downstream sizing treats
         these rows as corroboration with unknown size.
         """
-        if not set(_INCREASE_COLUMNS) <= set(increases.columns):
+        if not (set(_INCREASE_COLUMNS) - {"acceptance_datetime"}) <= set(increases.columns):
             raise ThirteenFError(
                 "13F increase frame does not match the discovery schema"
             )
@@ -594,6 +605,7 @@ class ThirteenFSource(TransactionSource):
                     accession=row.get("accession"),
                     report_url=row.get("report_url"),
                     ingestion_generation=self.ingestion_generation,
+                    acceptance_datetime=row.get("acceptance_datetime"),
                 )
             )
         canonical = pd.DataFrame(rows, columns=_OUTPUT_COLUMNS)

@@ -1,6 +1,7 @@
 """YFinance-backed price fetcher with cache merge."""
 
 import logging
+import math
 import re
 import time
 from collections import Counter
@@ -380,3 +381,57 @@ def _as_frame(value: object) -> pd.DataFrame:
     if not isinstance(value, pd.DataFrame):
         raise DataSourceError("unexpected price-table shape")
     return value
+
+
+def fetch_dividend_events(
+    tickers: list[str], *, sleep_s: float = 0.5
+) -> pd.DataFrame:
+    """Cash dividend ex-dates per ticker from provider corporate actions.
+
+    Full history per ticker (ex-dates years back still contaminate old cost
+    bases at replay). One request per ticker, paced; per-ticker failures are
+    swallowed and logged — a missing row means unknown, never clean, and the
+    scoring gate only fires on known events. Never raises for fetch issues.
+    """
+    rows = []
+    for ticker in sorted({str(t).strip().upper() for t in tickers if str(t).strip()}):
+        try:
+            actions = yf.Ticker(ticker).actions
+            if actions is None or actions.empty or "Dividends" not in actions.columns:
+                continue
+            pays = actions.loc[actions["Dividends"].fillna(0) > 0, "Dividends"]
+            for ex_date, cash in pays.items():
+                day = pd.to_datetime(ex_date, errors="coerce")
+                amount = float(cash)
+                if pd.isna(day) or not math.isfinite(amount) or amount <= 0:
+                    continue
+                rows.append(
+                    {"ticker": ticker, "ex_date": day.date(), "cash_amount": amount}
+                )
+        except Exception as exc:  # noqa: BLE001 - per-ticker fetch isolation
+            logger.warning("Dividend fetch failed for %s: %s", ticker, exc)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+    return pd.DataFrame(rows, columns=["ticker", "ex_date", "cash_amount"])
+
+
+def upsert_dividends(db: Database, events: pd.DataFrame) -> int:
+    """Persist dividend events idempotently; returns rows present afterwards."""
+    if events.empty:
+        return 0
+    clean = events.dropna(subset=["ticker", "ex_date"]).copy()
+    clean["ticker"] = clean["ticker"].astype(str).str.strip().str.upper()
+    clean["ex_date"] = pd.to_datetime(clean["ex_date"], errors="coerce").dt.date
+    clean = clean.dropna(subset=["ex_date"]).drop_duplicates(["ticker", "ex_date"])
+    if clean.empty:
+        return 0
+    db.conn.execute("CREATE TEMP TABLE _div_stage AS SELECT * FROM clean")
+    try:
+        db.conn.execute("""
+            INSERT INTO dividends (ticker, ex_date, cash_amount)
+            SELECT ticker, ex_date, cash_amount FROM _div_stage
+            ON CONFLICT DO NOTHING
+        """)
+    finally:
+        db.conn.execute("DROP TABLE IF EXISTS _div_stage")
+    return db.conn.execute("SELECT COUNT(*) FROM dividends").fetchone()[0]

@@ -52,6 +52,7 @@ def score(
     event_half_life_days: int = 90,
     watchlist: Collection[str] | None = None,
     audit: dict | None = None,
+    ex_dividends: dict[str, list] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Rank price-eligible initiating actors and report blocked actors.
 
@@ -59,7 +60,10 @@ def score(
     ``manager_watchlist.watchlist_actor_ids()``. Without a watchlist no
     corroboration is recognized (fail closed). Dated current prices use
     ``(price, date)``; bare floats retain legacy behavior without freshness
-    validation.
+    validation. ``ex_dividends`` maps ticker -> known ex-dates; a ticker with
+    an ex-div in the 7 calendar days through the decision date is blocked
+    (cum-div cost basis vs ex-div quote is a contaminated comparison).
+    Missing rows mean unknown, never clean: without the map the gate is off.
     """
     if entry_tol <= 0 or event_half_life_days <= 0:
         raise ValueError("entry_tol and event_half_life_days must be positive")
@@ -145,6 +149,28 @@ def score(
             for rows in actor_rows.values()
             for row in rows["corroborators"]
         )
+        if ex_dividends and decision_dates:
+            window_end = max(decision_dates)
+            window_start = window_end - timedelta(days=7)
+            ex_dates = []
+            for raw in ex_dividends.get(ticker, []) or []:
+                try:
+                    ex_dates.append(_as_date(raw))
+                except (TypeError, ValueError):
+                    continue
+            hits = sorted({d for d in ex_dates if window_start < d <= window_end})
+            if hits:
+                reason = f"ex-div window (ex {hits[-1].isoformat()})"
+                for actor_id in sorted(actor_rows):
+                    blocked_rows.append(
+                        {"ticker": ticker, "actor_id": actor_id, "reason": reason}
+                    )
+                if audit is not None:
+                    audit.setdefault(ticker, {}).update(
+                        ex_div_block=hits[-1].isoformat(),
+                        ranking_gate=False,
+                    )
+                continue
         accepted = []
         for actor_id in sorted(actor_rows):
             evidence = actor_rows[actor_id]

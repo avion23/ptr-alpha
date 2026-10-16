@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -1627,6 +1627,29 @@ def follow_member(
     _cli_exit(0)
 
 
+def _ex_div_map(db, symbols: list[str], as_of_date) -> dict | None:
+    """Known ex-dates per ticker inside the 7-day contamination window.
+
+    Returns None when the dividends table is absent (older databases):
+    missing rows mean unknown, never clean, and without the map the gate
+    stays off exactly as before.
+    """
+    if not symbols:
+        return None
+    try:
+        rows = db.conn.execute(
+            "SELECT ticker, ex_date FROM dividends "
+            "WHERE ticker = ANY(?) AND ex_date > ? AND ex_date <= ?",
+            [symbols, as_of_date - timedelta(days=7), as_of_date],
+        ).fetchall()
+    except Exception:
+        return None
+    out: dict[str, list] = {}
+    for ticker, ex_date in rows:
+        out.setdefault(str(ticker).strip().upper(), []).append(ex_date)
+    return out
+
+
 @app.command()
 def setups(
     ctx: typer.Context,
@@ -1822,6 +1845,7 @@ def setups(
             weights,
             current_prices,
             watchlist=decision_watchlist,
+            ex_dividends=_ex_div_map(db, symbols, as_of_date),
         )
         if record:
             record_decision_safely(

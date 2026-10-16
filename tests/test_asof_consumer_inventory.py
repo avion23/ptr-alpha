@@ -58,6 +58,7 @@ EXEMPT = {
     "scripts/reconcile_blotter.py:get_congressional": 1,  # Current blotter reconciliation, no as-of API.
     "scripts/reconcile_untickered.py:_canonical_rows": 1,  # Current untickered reconciliation.
     "scripts/refresh_prices.py:_source_tickers": 1,  # Download universe, not decision selection.
+    "scripts/refresh_prices.py:_recent_active_tickers": 1,  # Dividend-download universe, not decision selection.
     "scripts/reparse_all.py:_persisted_house_generation_counts": 1,  # Ingestion reconciliation.
     "src/analyzer/actors.py:_load_actor_members": 1,  # Caller-owned: scoped load_skill_table; name monitored.
     "src/analyzer/cli.py:refresh": 5,  # Current refresh reporting/coverage only.

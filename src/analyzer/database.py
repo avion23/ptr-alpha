@@ -144,6 +144,7 @@ class Database:
             raise
         self._init_canonical_transactions_view()
         self._init_prices_table()
+        self._init_dividends_table()
 
     def _init_metadata_table(self) -> None:
         self.conn.execute("""
@@ -657,6 +658,25 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_prices_ticker ON prices(ticker)"
         )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_date ON prices(date)")
+
+    def _init_dividends_table(self) -> None:
+        """Cash ex-dividend events for the ex-div entry gate (R9).
+
+        Populated at refresh from provider corporate actions; scoring blocks
+        tickers with an ex-div inside the contamination window. Missing rows
+        mean unknown, never clean — the gate only fires on known events.
+        """
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS dividends (
+                ticker VARCHAR,
+                ex_date DATE,
+                cash_amount DOUBLE,
+                PRIMARY KEY (ticker, ex_date)
+            )
+        """)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dividends_ticker ON dividends(ticker)"
+        )
 
     def _init_pdf_tables(self) -> None:
         self.conn.execute("""

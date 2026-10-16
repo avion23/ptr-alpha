@@ -68,6 +68,31 @@ RESERVED_NON_EQUITY_TOKENS = frozenset(
     {"COUPON", "BOND", "BONDS", "NOTE", "NOTES", "STOCK", "TICKER"}
 )
 BENCHMARK_TICKER = "SPY"
+DIVIDEND_LOOKBACK_DAYS = 90
+
+
+def _recent_active_tickers(
+    source_db: Path, start: date, end: date
+) -> list[str]:
+    """Tickers disclosed near the window: the only ones whose ex-divs can
+    contaminate a decision. Bounded (recent activity, not the universe) so
+    per-ticker corporate-action fetches stay feasible. Empty on any error —
+    dividends are best-effort enrichment, never load-bearing for prices."""
+    try:
+        db = Database(source_db, read_only=True)
+        try:
+            rows = db.conn.execute(
+                "SELECT DISTINCT ticker FROM canonical_transactions "
+                "WHERE disclosure_date >= ? AND disclosure_date <= ? "
+                "AND ticker IS NOT NULL",
+                [start - timedelta(days=DIVIDEND_LOOKBACK_DAYS), end],
+            ).fetchall()
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("Dividend universe unavailable: %s", exc)
+        return []
+    return sorted({str(row[0]).strip().upper() for row in rows if row[0]})
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +115,8 @@ class RefreshReport:
     stale_tickers: list[str]
     source_db: str
     temp_db: str
+    dividend_events: int = 0
+    dividend_tickers_checked: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -110,6 +137,8 @@ class RefreshReport:
             "stale_tickers": self.stale_tickers,
             "source_db": self.source_db,
             "temp_db": self.temp_db,
+            "dividend_events": self.dividend_events,
+            "dividend_tickers_checked": self.dividend_tickers_checked,
         }
 
 
@@ -250,6 +279,7 @@ def refresh_prices(
     end: date | None = None,
     max_staleness_days: int = DEFAULT_MAX_STALENESS_DAYS,
     force: bool = False,
+    skip_dividends: bool = False,
 ) -> RefreshReport:
     """Refresh eligible asset prices into a throwaway temp database.
 
@@ -318,6 +348,28 @@ def refresh_prices(
         matrix = db.get_prices(eligible, start, end)
         rejected = _verify_persisted_prices(db, start, end)
         stale = _compute_staleness(db, end, max_staleness_days)
+        # Ex-div enrichment for the R9 entry gate: best-effort, bounded to
+        # recently-active tickers, never load-bearing for the price refresh.
+        # Per-ticker corporate-action fetches fail silently under throttling;
+        # missing rows mean unknown (gate stays off), never clean.
+        dividend_events = 0
+        dividend_tickers: list[str] = []
+        if not skip_dividends:
+            try:
+                from analyzer.price_source import (
+                    fetch_dividend_events,
+                    upsert_dividends,
+                )
+
+                dividend_tickers = _recent_active_tickers(source_db, start, end)
+                if dividend_tickers:
+                    events = fetch_dividend_events(dividend_tickers)
+                    dividend_events = upsert_dividends(db, events)
+                    logger.info(
+                        "Dividends: %d tickers checked", len(dividend_tickers)
+                    )
+            except Exception as exc:
+                logger.warning("Dividend refresh failed, continuing: %s", exc)
     finally:
         db.close()
 
@@ -355,6 +407,8 @@ def refresh_prices(
         stale_tickers=stale,
         source_db=str(source_db),
         temp_db=str(temp_db),
+        dividend_events=dividend_events,
+        dividend_tickers_checked=len(dividend_tickers),
     )
 
 
@@ -384,6 +438,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force", action="store_true", help="overwrite an existing temp DB"
     )
+    parser.add_argument(
+        "--skip-dividends",
+        action="store_true",
+        help="skip ex-div enrichment (e.g. when the provider throttles)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -394,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
             end=args.end,
             max_staleness_days=args.max_staleness_days,
             force=args.force,
+            skip_dividends=args.skip_dividends,
         )
     except (ValueError, FileNotFoundError, FileExistsError) as exc:
         print(f"refresh failed: {exc}", file=sys.stderr)

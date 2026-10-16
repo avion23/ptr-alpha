@@ -40,8 +40,8 @@ actor counts. Never size by score magnitude.
 | R5 | Quote ≤ 5 calendar days old | stale-quote block, unit-tested | PASS |
 | R6 | Objective + promotion rule stated | this charter | PASS (as of here) |
 | R7 | Skill predicts forward excess | backtest clustered \|t\|≥2 (8 clusters) | FAIL (t=0.81 / 0.55) |
-| R8 | Costs + fill-rate modeled | harness accounts spread/fees/fills | FAIL — 100% fills at next close assumed |
-| R9 | Dividend avoidance | ex-div check in scoring path | FAIL — operator-enforced only |
+| R8 | Costs modeled (spread, fees, fill-rate) | harness accounts spread/fees/fills | PARTIAL — fill existence proven (eligible ⟺ day-1 fill, limit arithmetic on closes); spread as sensitivity only (0–50bps moves nothing: eligible −2.56→−3.06pp, tercile contrast unchanged at −0.35pp) |
+| R9 | Dividend avoidance | ex-div check in scoring path | PARTIAL — gate live in `score()` (7d ticker block, `ex_dividends` map, missing = unknown/off) with `dividends` table + refresh population; live rows pending provider quota (Yahoo throttled 2026-10-16) |
 
 ## Promotion rule (pre-registered)
 

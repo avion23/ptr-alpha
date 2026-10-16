@@ -280,6 +280,94 @@ def test_cli_recording_is_byte_identical_and_failure_is_nonfatal(
     assert enabled.output.encode() == disabled.output.encode()
 
 
+def test_unscoped_setups_keep_the_full_event_universe(
+    tmp_path, monkeypatch, inputs
+):
+    """Regression: with no --ticker/--member, `setups` used to discard every
+    purchase event (cli.py `events.iloc[0:0]`), silently serving an empty
+    ranking that contradicted its docstring ("purchase events, all official
+    sources"). The unscoped universe must survive to scoring."""
+    from analyzer import cli, pipeline, positions
+    from analyzer import manager_watchlist
+
+    candidates, weights, quotes, watchlist = inputs
+    connection = SimpleNamespace(
+        execute=lambda *a: SimpleNamespace(fetchone=lambda: (100.0, DAY))
+    )
+    monkeypatch.setattr(
+        cli,
+        "_open_database",
+        lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
+    )
+    monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
+    monkeypatch.setattr(
+        positions, "holdings_candidates", lambda *a, **kw: pd.DataFrame()
+    )
+    monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
+    monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
+    monkeypatch.setattr(cli, "weights_for_candidates", lambda *a: weights)
+    monkeypatch.setattr(manager_watchlist, "watchlist_actor_ids", lambda: watchlist)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["setups", "--as-of", DAY.isoformat(), "--data-dir", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    receipts_written = _receipts(tmp_path)
+    assert len(receipts_written) == 1
+    manifest = json.loads(receipts_written[0].read_text())
+    # The unscoped universe reached scoring: candidate rows and a ranked
+    # winner are present, and the receipt verifies.
+    assert len(manifest["inputs"]["candidates"]["rows"]) == len(candidates)
+    assert manifest["ranked"] and manifest["ranked"][0]["ticker"] == "AAPL"
+    assert receipts.verify_decision(receipts_written[0])["agreement"]
+
+
+def test_scoped_setups_with_no_holdings_return_empty_not_the_universe(
+    tmp_path, monkeypatch, inputs
+):
+    """Counterpart: an explicitly-scoped request (--member) that resolves to
+    no holdings must return an empty decision, NOT silently expand to the
+    full event universe (a silent-wrong-answer of the same class)."""
+    from analyzer import cli, pipeline, positions
+    from analyzer import manager_watchlist
+
+    candidates, weights, quotes, watchlist = inputs
+    connection = SimpleNamespace(
+        execute=lambda *a: SimpleNamespace(fetchone=lambda: (100.0, DAY))
+    )
+    monkeypatch.setattr(
+        cli,
+        "_open_database",
+        lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
+    )
+    monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
+    monkeypatch.setattr(
+        positions, "holdings_candidates", lambda *a, **kw: pd.DataFrame()
+    )
+    monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
+    monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
+    monkeypatch.setattr(cli, "weights_for_candidates", lambda *a: weights)
+    monkeypatch.setattr(manager_watchlist, "watchlist_actor_ids", lambda: watchlist)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "setups",
+            "--member",
+            "Bogus Member",
+            "--as-of",
+            DAY.isoformat(),
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    manifest = json.loads(_receipts(tmp_path)[0].read_text())
+    assert manifest["ranked"] == []
+    assert manifest["inputs"]["candidates"]["rows"] == []
+
+
 def test_write_failure_logged_without_raising(tmp_path, inputs, monkeypatch, caplog):
     def fail(*a, **kw):
         raise OSError("disk full")

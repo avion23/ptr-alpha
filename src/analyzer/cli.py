@@ -1718,7 +1718,9 @@ def setups(
                     events = events.loc[
                         events["ticker"].astype("string").str.upper().isin(held)
                     ].copy()
-            else:
+            elif member or requested_tickers:
+                # Explicitly scoped, but the scope resolved to no holdings:
+                # return nothing rather than silently expanding to every name.
                 events = events.iloc[0:0]
             if not events.empty:
                 event_kinds: dict[str, str] = {}

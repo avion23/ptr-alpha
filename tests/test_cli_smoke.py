@@ -50,7 +50,8 @@ class TestCliSmoke(unittest.TestCase):
         self.assertIn("--member", help_result.output)
         self.assertIn("--ticker", help_result.output)
 
-        result = runner.invoke(app, ["setups", "--member", "Bogus Member"])
+        result = runner.invoke(app, ["setups", "--member", "Bogus Member",
+                                       "--no-receipt"])
         self.assertEqual(result.exit_code, 0)
         self.assertIn("No candidates.", result.output)
         self.assertNotIn("Traceback", result.output)

@@ -79,6 +79,8 @@ EXEMPT = {
     "src/analyzer/parse_run_repository.py:ParseRunRepository.upsert": 1,  # Ingestion timestamp provenance.
     "src/analyzer/pipeline.py:_analysis_transactions": 1,  # Caller-owned: scoped prepare_analysis_data.
     "src/analyzer/positions.py:_member_variants": 2,  # Caller-owned identity expansion; name monitored.
+    "src/analyzer/positions.py:_distinct_member_names": 2,  # Caller-owned identity expansion, batched _member_variants; name monitored.
+    "src/analyzer/positions.py:holdings_candidates_batch": 2,  # Caller-owned: holdings scope, batched load_member_trades; name monitored.
     "src/analyzer/positions.py:load_member_trades": 4,  # Caller-owned: holdings/follow-member scope; name monitored.
     "src/analyzer/price_repository.py:PriceRepository.get_entry_prices": 2,  # Caller-owned repository loader.
     "src/analyzer/row_history.py:accept_corrections": 2,  # Acceptance-history maintenance itself.

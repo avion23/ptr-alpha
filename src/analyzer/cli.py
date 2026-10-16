@@ -1641,6 +1641,12 @@ def setups(
         help="Include unvalidated filings from unpromoted House generations",
     ),
     data_dir: str = typer.Option("data", "--data-dir", help="Data directory"),
+    record: bool = typer.Option(
+        True,
+        "--receipt/--no-receipt",
+        help="Write an immutable decision receipt (tests use --no-receipt "
+        "so the suite never pollutes the production oracle)",
+    ),
 ):
     """Rank cross-source setups with per-actor price discipline.
 
@@ -1661,6 +1667,7 @@ def setups(
             dedupe_member_names,
             gate_closed_events,
             holdings_candidates,
+            holdings_candidates_batch,
         )
         from analyzer.manager_watchlist import watchlist_actor_ids
         from analyzer.setups import score as score_setups
@@ -1732,25 +1739,28 @@ def setups(
                     if name:
                         event_kinds.setdefault(name, kind)
                 event_tickers = set(events["ticker"].astype("string").str.upper())
-                for event_member in dedupe_member_names(
+                event_members = dedupe_member_names(
                     sorted(event_kinds), exclude=list(member)
-                ):
-                    frame = holdings_candidates(
-                        db,
-                        event_member,
-                        as_of_date,
-                        include_unpromoted=include_unpromoted,
-                    )
+                )
+                batched = holdings_candidates_batch(
+                    db,
+                    event_members,
+                    as_of_date,
+                    include_unpromoted=include_unpromoted,
+                )
+                for event_member in event_members:
+                    frame = batched.get(event_member)
+                    if frame is None or frame.empty:
+                        continue
+                    frame = frame.loc[
+                        frame["ticker"]
+                        .astype("string")
+                        .str.upper()
+                        .isin(event_tickers)
+                    ].copy()
                     if not frame.empty:
-                        frame = frame.loc[
-                            frame["ticker"]
-                            .astype("string")
-                            .str.upper()
-                            .isin(event_tickers)
-                        ].copy()
-                        if not frame.empty:
-                            frames.append(frame)
-                            candidate_frames.append(_congress_holdings(frame))
+                        frames.append(frame)
+                        candidate_frames.append(_congress_holdings(frame))
                 position_candidates = (
                     pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 )
@@ -1760,8 +1770,9 @@ def setups(
                 candidate_frames.append(events)
         candidate_frames = [frame for frame in candidate_frames if not frame.empty]
         if not candidate_frames:
-            record_decision_safely(data_dir, as_of_date, pd.DataFrame(), {}, {},
-                                   watchlist_actor_ids(), scope=decision_scope)
+            if record:
+                record_decision_safely(data_dir, as_of_date, pd.DataFrame(), {}, {},
+                                       watchlist_actor_ids(), scope=decision_scope)
             print("No candidates.")
             _cli_exit(0)
         candidates = pd.concat(candidate_frames, ignore_index=True)
@@ -1772,8 +1783,9 @@ def setups(
                 )
             ].copy()
         if candidates.empty:
-            record_decision_safely(data_dir, as_of_date, candidates, {}, {},
-                                   watchlist_actor_ids(), scope=decision_scope)
+            if record:
+                record_decision_safely(data_dir, as_of_date, candidates, {}, {},
+                                       watchlist_actor_ids(), scope=decision_scope)
             print("No candidates.")
             _cli_exit(0)
 
@@ -1781,14 +1793,27 @@ def setups(
             {str(value).strip().upper() for value in candidates["ticker"].dropna()}
         )
         current_prices = {}
-        for symbol in symbols:
-            row = db.conn.execute(
-                "SELECT close, date FROM prices WHERE ticker = ? AND date <= ? "
-                "ORDER BY date DESC LIMIT 1",
-                [symbol, as_of_date],
-            ).fetchone()
-            if row is not None and row[0] is not None:
-                current_prices[symbol] = (float(row[0]), row[1])
+        if symbols:
+            latest = db.conn.execute(
+                "SELECT ticker, close, date FROM prices WHERE ticker = ANY(?) "
+                "AND date <= ?",
+                [symbols, as_of_date],
+            ).fetchdf()
+            if not latest.empty:
+                latest["date"] = pd.to_datetime(latest["date"])
+                latest = latest.sort_values("date").drop_duplicates(
+                    "ticker", keep="last"
+                )
+                for row in latest.itertuples(index=False):
+                    if row.close is not None and not (
+                        isinstance(row.close, float) and pd.isna(row.close)
+                    ):
+                        current_prices[str(row.ticker).strip().upper()] = (
+                            float(row.close),
+                            row.date.date()
+                            if hasattr(row.date, "date")
+                            else row.date,
+                        )
 
         weights = weights_for_candidates(db, candidates, as_of_date)
         decision_watchlist = watchlist_actor_ids()
@@ -1798,10 +1823,11 @@ def setups(
             current_prices,
             watchlist=decision_watchlist,
         )
-        record_decision_safely(
-            data_dir, as_of_date, candidates, weights, current_prices,
-            decision_watchlist, ranked, blocked, scope=decision_scope,
-        )
+        if record:
+            record_decision_safely(
+                data_dir, as_of_date, candidates, weights, current_prices,
+                decision_watchlist, ranked, blocked, scope=decision_scope,
+            )
     except typer.Exit:
         raise
     except Exception as exc:

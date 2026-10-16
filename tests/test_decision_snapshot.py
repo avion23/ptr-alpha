@@ -234,7 +234,7 @@ def test_cli_recording_is_byte_identical_and_failure_is_nonfatal(
 
     candidates, weights, quotes, watchlist = inputs
     connection = SimpleNamespace(
-        execute=lambda *a: SimpleNamespace(fetchone=lambda: (100.0, DAY))
+        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]))
     )
     monkeypatch.setattr(
         cli,
@@ -244,6 +244,9 @@ def test_cli_recording_is_byte_identical_and_failure_is_nonfatal(
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
     monkeypatch.setattr(
         positions, "holdings_candidates", lambda *a, **kw: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        positions, "holdings_candidates_batch", lambda *a, **kw: {}
     )
     monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
     monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
@@ -292,7 +295,7 @@ def test_unscoped_setups_keep_the_full_event_universe(
 
     candidates, weights, quotes, watchlist = inputs
     connection = SimpleNamespace(
-        execute=lambda *a: SimpleNamespace(fetchone=lambda: (100.0, DAY))
+        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]))
     )
     monkeypatch.setattr(
         cli,
@@ -302,6 +305,9 @@ def test_unscoped_setups_keep_the_full_event_universe(
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
     monkeypatch.setattr(
         positions, "holdings_candidates", lambda *a, **kw: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        positions, "holdings_candidates_batch", lambda *a, **kw: {}
     )
     monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
     monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
@@ -334,7 +340,7 @@ def test_scoped_setups_with_no_holdings_return_empty_not_the_universe(
 
     candidates, weights, quotes, watchlist = inputs
     connection = SimpleNamespace(
-        execute=lambda *a: SimpleNamespace(fetchone=lambda: (100.0, DAY))
+        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]))
     )
     monkeypatch.setattr(
         cli,
@@ -344,6 +350,9 @@ def test_scoped_setups_with_no_holdings_return_empty_not_the_universe(
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
     monkeypatch.setattr(
         positions, "holdings_candidates", lambda *a, **kw: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        positions, "holdings_candidates_batch", lambda *a, **kw: {}
     )
     monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
     monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
@@ -366,6 +375,53 @@ def test_scoped_setups_with_no_holdings_return_empty_not_the_universe(
     manifest = json.loads(_receipts(tmp_path)[0].read_text())
     assert manifest["ranked"] == []
     assert manifest["inputs"]["candidates"]["rows"] == []
+
+
+def test_no_receipt_flag_writes_nothing_but_keeps_output(
+    tmp_path, monkeypatch, inputs
+):
+    """--no-receipt is how the suite avoids polluting the production oracle:
+    byte-identical output, zero receipt files, zero ledger lines."""
+    from analyzer import cli, pipeline, positions
+    from analyzer import manager_watchlist
+
+    candidates, weights, quotes, watchlist = inputs
+    connection = SimpleNamespace(
+        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]))
+    )
+    monkeypatch.setattr(
+        cli,
+        "_open_database",
+        lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
+    )
+    monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
+    monkeypatch.setattr(
+        positions, "holdings_candidates", lambda *a, **kw: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        positions, "holdings_candidates_batch", lambda *a, **kw: {}
+    )
+    monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
+    monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
+    monkeypatch.setattr(cli, "weights_for_candidates", lambda *a: weights)
+    monkeypatch.setattr(manager_watchlist, "watchlist_actor_ids", lambda: watchlist)
+
+    base = [
+        "setups",
+        "--ticker",
+        "AAPL",
+        "--as-of",
+        DAY.isoformat(),
+        "--data-dir",
+        str(tmp_path),
+    ]
+    with_receipt = CliRunner().invoke(cli.app, base)
+    assert with_receipt.exit_code == 0, with_receipt.output
+    assert len(_receipts(tmp_path)) == 1
+    without_receipt = CliRunner().invoke(cli.app, base + ["--no-receipt"])
+    assert without_receipt.exit_code == 0, without_receipt.output
+    assert without_receipt.output == with_receipt.output
+    assert len(_receipts(tmp_path)) == 1  # nothing new written
 
 
 def test_write_failure_logged_without_raising(tmp_path, inputs, monkeypatch, caplog):

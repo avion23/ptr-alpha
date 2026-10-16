@@ -1355,5 +1355,80 @@ class TestPositions(unittest.TestCase):
         self.assertEqual(gated.iloc[1]["entry_ref"], 50.0)
 
 
+def _batch_trades():
+    base = {
+        "transaction_type": "Purchase",
+        "transaction_date": date(2025, 1, 10),
+        "disclosure_date": date(2025, 1, 10),
+        "amount_midpoint": 10000.0,
+        "source": "house_pdf",
+        "owner_code": None,
+        "instrument_type": "stock",
+        "source_record_id": None,
+        "amends_source_record_id": None,
+    }
+    return [
+        dict(base, member="ALICE", ticker="A"),
+        dict(base, member="BOB", ticker="B"),
+        dict(base, member="BOB", ticker="A"),
+    ]
+
+
+def _batch_prices():
+    return [
+        ("A", date(2025, 1, 9), 100.0),
+        ("A", date(2025, 1, 10), 101.0),
+        ("B", date(2025, 1, 9), 50.0),
+        ("B", date(2025, 1, 10), 51.0),
+    ]
+
+
+def test_holdings_batch_matches_single_per_member():
+    from analyzer.positions import holdings_candidates_batch
+
+    db, conn = _holdings_db(_batch_trades(), _batch_prices())
+    try:
+        members = ["ALICE", "BOB", "NOBODY"]
+        batched = holdings_candidates_batch(db, members, date(2025, 6, 11))
+        assert set(batched) == set(members)
+        for member in members:
+            expected = holdings_candidates(db, member, date(2025, 6, 11))
+            assert batched[member].equals(expected), member
+    finally:
+        conn.close()
+
+
+def test_holdings_batch_query_count_is_constant_in_members():
+    from analyzer.positions import holdings_candidates_batch
+
+    class _Spy:
+        def __init__(self, conn):
+            self._conn = conn
+            self.count = 0
+
+        def execute(self, *args, **kwargs):
+            self.count += 1
+            return self._conn.execute(*args, **kwargs)
+
+    db, conn = _holdings_db(_batch_trades(), _batch_prices())
+    try:
+        from types import SimpleNamespace
+
+        spy = _Spy(conn)
+        counting = SimpleNamespace(conn=spy)
+        holdings_candidates_batch(counting, ["ALICE"], date(2025, 6, 11))
+        one = spy.count
+        holdings_candidates_batch(
+            counting, ["ALICE", "BOB", "NOBODY", "ALICE"], date(2025, 6, 11)
+        )
+        many = spy.count - one
+        # One distinct-name scan, one trades load, one prices load (plus
+        # PRAGMA introspection) no matter how many members are requested.
+        assert many == one, (one, many)
+        assert many <= 6, many
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

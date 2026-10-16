@@ -666,6 +666,159 @@ def holdings_candidates(
         str(ticker): load_price_history(db, str(ticker))
         for ticker in trades["ticker"].dropna().unique()
     }
+    return _holdings_records(
+        member, trades, histories, as_of, _actor_id, columns, source_kinds
+    )
+
+
+def holdings_candidates_batch(
+    db, members: list[str], as_of: date, *, include_unpromoted: bool = False
+) -> dict[str, pd.DataFrame]:
+    """Open-position candidates for many members with O(1) DB round-trips.
+
+    Same per-member output as `holdings_candidates`; the distinct-name scan,
+    the trades load, and the price-history load each happen once no matter
+    how many members are requested. The unscoped `setups` path fans out over
+    ~300 event members, where the per-member form costs ~10s each.
+    """
+    columns = [
+        "ticker",
+        "actor_id",
+        "kind",
+        "source",
+        "entry_ref",
+        "event_date",
+        "disclosure_date",
+        "corroboration",
+        "position_evidence",
+        "as_of",
+        "filing_refs",
+    ]
+    source_kinds = {
+        "house_pdf": "congress",
+        "gemini_ocr": "congress",
+        "senate_efd": "congress",
+        "form4": "officer",
+        "13f": "manager",
+    }
+    members = [m for m in dict.fromkeys(members) if isinstance(m, str) and m.strip()]
+    if not members:
+        return {}
+
+    try:
+        from analyzer.actors import actor_id
+    except ModuleNotFoundError as exc:
+        if exc.name != "analyzer.actors":
+            raise
+
+        def _actor_id(kind, key):
+            return f"{kind}:{key}"
+
+    else:
+        _actor_id = actor_id
+
+    all_names = _distinct_member_names(db)
+    variants: dict[str, list[str]] = {}
+    for member in members:
+        wanted = canonical_member_key(member)
+        variants[member] = _variants_for(member, wanted, all_names)
+    universe = sorted({v for vs in variants.values() for v in vs})
+
+    canonical = db.conn.execute(
+        f"""
+        SELECT {_loader_select(db, "canonical_transactions")}
+        FROM canonical_transactions
+        WHERE member = ANY(?)
+        """,
+        [universe],
+    ).fetchdf()
+    by_member: dict[str, pd.DataFrame] = {}
+    if not canonical.empty:
+        for member in members:
+            mine = canonical.loc[canonical["member"].isin(variants[member])].copy()
+            if not mine.empty:
+                mine = mine.sort_values("transaction_date", kind="mergesort")
+            by_member[member] = mine
+    else:
+        by_member = {member: canonical for member in members}
+
+    if include_unpromoted:
+        raw = db.conn.execute(
+            f"""
+            SELECT {_loader_select(db, "transactions")}
+            FROM (
+                SELECT t.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY member, ticker, transaction_date,
+                            transaction_type, disclosure_date
+                        ORDER BY amount_midpoint DESC NULLS LAST
+                    ) AS rn
+                FROM transactions t
+                WHERE t.member = ANY(?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM canonical_transactions c
+                      WHERE c.source IS NOT DISTINCT FROM t.source
+                        AND c.source_record_id IS NOT DISTINCT FROM t.source_record_id
+                        AND c.source_row_id IS NOT DISTINCT FROM t.source_row_id
+                        AND c.ingestion_generation IS NOT DISTINCT FROM t.ingestion_generation
+                  )
+            )
+            WHERE rn = 1
+            """,
+            [universe],
+        ).fetchdf()
+        if not raw.empty:
+            for member in members:
+                mine_raw = raw.loc[raw["member"].isin(variants[member])].copy()
+                if mine_raw.empty:
+                    continue
+                combined = pd.concat([by_member[member], mine_raw], ignore_index=True)
+                by_member[member] = combined.sort_values(
+                    "transaction_date", kind="mergesort"
+                )
+
+    tickers = sorted(
+        {
+            str(t)
+            for frame in by_member.values()
+            if not frame.empty and "ticker" in frame.columns
+            for t in frame["ticker"].dropna().unique()
+        }
+    )
+    histories: dict[str, pd.DataFrame] = {}
+    if tickers:
+        history = db.conn.execute(
+            "SELECT ticker, date, close FROM prices WHERE ticker = ANY(?) "
+            "ORDER BY ticker, date",
+            [tickers],
+        ).fetchdf()
+        if not history.empty:
+            history["date"] = pd.to_datetime(history["date"])
+            for symbol, frame in history.groupby("ticker"):
+                histories[str(symbol)] = frame.sort_values("date").set_index("date")
+    for ticker in tickers:
+        histories.setdefault(ticker, pd.DataFrame())
+
+    out: dict[str, pd.DataFrame] = {}
+    for member in members:
+        trades = by_member[member]
+        if trades.empty:
+            out[member] = pd.DataFrame(columns=columns)
+            continue
+        trades = trades.loc[trades["source"].isin(source_kinds)].copy()
+        if trades.empty:
+            out[member] = pd.DataFrame(columns=columns)
+            continue
+        out[member] = _holdings_records(
+            member, trades, histories, as_of, _actor_id, columns, source_kinds
+        )
+    return out
+
+
+def _holdings_records(
+    member, trades: pd.DataFrame, histories: dict, as_of, _actor_id, columns, source_kinds
+) -> pd.DataFrame:
+    """Shared per-member record builder over preloaded trades+histories."""
     records = []
     for actor_kind in ("congress", "officer", "manager"):
         kind_trades = trades.loc[
@@ -888,9 +1041,14 @@ def _member_variants(db, member: str) -> list[str]:
         ).fetchall()
     except Exception:
         pass
+    all_names = [row[0] for row in names]
+    return _variants_for(member, wanted, all_names)
+
+
+def _variants_for(member: str, wanted: str, all_names: list) -> list[str]:
+    """Match variants against an already-loaded distinct-name list."""
     seen = []
-    for row in names:
-        name = row[0]
+    for name in all_names:
         if name in seen:
             continue
         key = canonical_member_key(name)
@@ -899,6 +1057,21 @@ def _member_variants(db, member: str) -> list[str]:
         elif _same_member_variant(key, wanted):
             seen.append(name)
     return seen or [member]
+
+
+def _distinct_member_names(db) -> list:
+    """All filed member names, loaded once for batched variant matching."""
+    try:
+        names = db.conn.execute("SELECT DISTINCT member FROM transactions").fetchall()
+    except Exception:
+        names = []
+    try:
+        names += db.conn.execute(
+            "SELECT DISTINCT member FROM canonical_transactions"
+        ).fetchall()
+    except Exception:
+        pass
+    return [row[0] for row in names]
 
 
 _LOADER_COLUMNS = (

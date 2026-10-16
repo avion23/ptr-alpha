@@ -772,6 +772,7 @@ class Database:
             for row in self.conn.execute("PRAGMA table_info('transactions')").fetchall()
         }
         required_columns = {
+            "acceptance_datetime": "TIMESTAMP",
             "owner_code": "VARCHAR",
             "amount_raw": "VARCHAR",
             "amount_midpoint": "DOUBLE",
@@ -807,6 +808,16 @@ class Database:
                 self.conn.execute(
                     f"ALTER TABLE transactions ADD COLUMN {column} {column_type}"
                 )
+                tables = {r[0] for r in self.conn.execute("SHOW TABLES").fetchall()}
+                if "transaction_versions" in tables:
+                    self.conn.execute(
+                        f"ALTER TABLE transaction_versions ADD COLUMN {column} {column_type}"
+                    )
+                    # Archives use SELECT *: retired_at must remain last.
+                    self.conn.execute(
+                        "CREATE OR REPLACE TABLE transaction_versions AS "
+                        "SELECT * EXCLUDE (retired_at), retired_at FROM transaction_versions"
+                    )
 
         from analyzer.row_history import archive_rows
 

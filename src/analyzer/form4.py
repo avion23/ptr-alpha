@@ -47,6 +47,7 @@ _NEGATIVE_10B5_RE = re.compile(
 )
 _TRADE_PRICE_RE = re.compile(r"\bshares\s+@\s+\$([0-9]+(?:\.[0-9]+)?)\b")
 _FORM4_COLUMNS = _BASE_WRITE_COLUMNS + (
+    "acceptance_datetime",
     "source_record_id",
     "source_row_id",
     "source_report_path",
@@ -205,6 +206,20 @@ def _is_10b5_1(root: ET.Element) -> bool:
     )
 
 
+def _acceptance_datetime(*, content: bytes = b"") -> datetime | None:
+    """Authoritative submission-header clock, naive SEC Eastern local time.
+
+    Do not convert submissions JSON's discrepant acceptanceDateTime field.
+    Never substitute filingDate or insertion time when the header is absent.
+    """
+    match = re.search(
+        rb"(?:<ACCEPTANCE-DATETIME>|ACCEPTANCE-DATETIME\t)\s*(\d{14})", content
+    )
+    if match:
+        return datetime.strptime(match[1].decode("ascii"), "%Y%m%d%H%M%S")
+    return None
+
+
 def parse_form4_xml(
     content: bytes | str,
     *,
@@ -212,6 +227,7 @@ def parse_form4_xml(
     source_report_path: str,
     official_filing_date: date | str,
     ingestion_generation: str | None = None,
+    acceptance_datetime: datetime | None = None,
 ) -> pd.DataFrame:
     """Parse a filing into canonical open-market purchase and sale rows.
 
@@ -300,6 +316,7 @@ def parse_form4_xml(
                 "ticker": ticker.upper(),
                 "transaction_date": parsed_date,
                 "disclosure_date": filing_date,
+                "acceptance_datetime": acceptance_datetime,
                 "transaction_type": "Purchase" if is_purchase else "Sale",
                 "owner_code": None,
                 "amount_raw": f"${amount:,.2f}",
@@ -629,7 +646,8 @@ class Form4Source(TransactionSource):
         for filing in recent:
             url = self._archive_url(filing["cik"], filing)
             try:
-                xml = _ownership_xml(self._request(url).content)
+                content = self._request(url).content
+                xml = _ownership_xml(content)
                 if not _is_officer_filing(xml):
                     continue
                 parsed = parse_form4_xml(
@@ -637,6 +655,7 @@ class Form4Source(TransactionSource):
                     accession=filing["accession"],
                     source_report_path=url,
                     official_filing_date=filing["filing_date"],
+                    acceptance_datetime=_acceptance_datetime(content=content),
                     ingestion_generation=self.ingestion_generation,
                 )
                 if not parsed.empty:
@@ -680,6 +699,7 @@ class Form4Source(TransactionSource):
             accession=filing["accession"],
             source_report_path=url,
             official_filing_date=filing["filing_date"],
+            acceptance_datetime=_acceptance_datetime(content=response.content),
             ingestion_generation=self.ingestion_generation,
         )
 
@@ -700,6 +720,7 @@ class Form4Source(TransactionSource):
                 accession=filing["accession"],
                 source_report_path=url,
                 official_filing_date=filing["filing_date"],
+                acceptance_datetime=_acceptance_datetime(content=response.content),
                 ingestion_generation=self.ingestion_generation,
             )
             if not parsed.empty:

@@ -1,0 +1,71 @@
+[
+  {
+    "cik": 1692819,
+    "submissions_url": "https://data.sec.gov/submissions/CIK0001692819.json",
+    "header_url": "https://www.sec.gov/Archives/edgar/data/1692819/000126840625000027/0001268406-25-000027.txt",
+    "submission": {
+      "accessionNumber": "0001268406-25-000027",
+      "filingDate": "2025-10-15",
+      "reportDate": "2025-10-10",
+      "acceptanceDateTime": "2025-10-16T05:43:51.000Z",
+      "act": "",
+      "form": "4",
+      "fileNumber": "",
+      "filmNumber": "",
+      "items": "",
+      "core_type": "4",
+      "size": 35223,
+      "isXBRL": 0,
+      "isInlineXBRL": 0,
+      "isXBRLNumeric": null,
+      "primaryDocument": "xslF345X05/wk-form4_1760579028.xml",
+      "primaryDocDescription": "FORM 4"
+    }
+  },
+  {
+    "cik": 1067983,
+    "submissions_url": "https://data.sec.gov/submissions/CIK0001067983.json",
+    "header_url": "https://www.sec.gov/Archives/edgar/data/1067983/000119312526352200/0001193125-26-352200.txt",
+    "submission": {
+      "accessionNumber": "0001193125-26-352200",
+      "filingDate": "2026-08-14",
+      "reportDate": "2026-06-30",
+      "acceptanceDateTime": "2026-08-15T00:05:04.000Z",
+      "act": "34",
+      "form": "13F-HR",
+      "fileNumber": "028-04545",
+      "filmNumber": "261281164",
+      "items": "",
+      "core_type": "13F-HR",
+      "size": 51654,
+      "isXBRL": 0,
+      "isInlineXBRL": 0,
+      "isXBRLNumeric": 0,
+      "primaryDocument": "xslForm13F_X02/primary_doc.xml",
+      "primaryDocDescription": ""
+    }
+  },
+  {
+    "cik": 1067983,
+    "submissions_url": "https://data.sec.gov/submissions/CIK0001067983.json",
+    "header_url": "https://www.sec.gov/Archives/edgar/data/1067983/000119312526054580/0001193125-26-054580.txt",
+    "submission": {
+      "accessionNumber": "0001193125-26-054580",
+      "filingDate": "2026-02-17",
+      "reportDate": "2025-12-31",
+      "acceptanceDateTime": "2026-02-18T02:05:04.000Z",
+      "act": "34",
+      "form": "13F-HR",
+      "fileNumber": "028-04545",
+      "filmNumber": "26640865",
+      "items": "",
+      "core_type": "13F-HR",
+      "size": 62306,
+      "isXBRL": 0,
+      "isInlineXBRL": 0,
+      "isXBRLNumeric": null,
+      "primaryDocument": "xslForm13F_X02/primary_doc.xml",
+      "primaryDocDescription": ""
+    }
+  }
+]

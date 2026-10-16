@@ -1,5 +1,7 @@
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
+from pathlib import Path
+import json
 
 import pytest
 
@@ -12,6 +14,7 @@ from analyzer.form4 import (
 from analyzer.transaction_repository import _BASE_WRITE_COLUMNS
 
 _EXPECTED_COLUMNS = _BASE_WRITE_COLUMNS + (
+    "acceptance_datetime",
     "source_record_id",
     "source_row_id",
     "source_report_path",
@@ -79,6 +82,60 @@ def burke_form4_xml():
     </derivativeTransaction>
   </derivativeTable>
 </ownershipDocument>"""
+
+
+@pytest.mark.parametrize("mode", ["ticker", "accession", "sweep"])
+def test_fetch_records_acceptance_without_extra_requests(tmp_path, monkeypatch, mode):
+    from analyzer.database import Database
+
+    fixtures = Path(__file__).parent / "fixtures/acceptance"
+    record = json.loads((fixtures / "captured.json").read_text())[0]["submission"]
+    accession = "0001268406-25-000027"
+    today = date(2025, 10, 16)
+    expected = datetime(2025, 10, 15, 21, 43, 51)
+    recent = {key: [value] for key, value in record.items()}
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2025, 10, 16, 12, tzinfo=tz)
+    monkeypatch.setattr("analyzer.form4.datetime", Clock)
+    with Database(":memory:") as db:
+        source = Form4Source(data_dir=tmp_path, db=db, ingestion_generation="test")
+        source._ticker_map = {"VST": 1692819}
+        submissions = []
+        def load_submissions(*args):
+            submissions.append(args)
+            return {"filings": {"recent": recent}}
+        monkeypatch.setattr(source._sec, "submissions", load_submissions)
+        requests = []
+        def request(url):
+            requests.append(url)
+            if url.endswith(".idx"):
+                return SimpleNamespace(content=(
+                    "-----\n"
+                    f"1692819|Vistra|4|{today}|edgar/data/1692819/{accession}.txt\n"
+                ).encode())
+            return SimpleNamespace(content=(fixtures / f"{accession}.txt").read_bytes())
+        monkeypatch.setattr(source, "_request", request)
+        try:
+            if mode == "ticker":
+                frame = source.fetch_ticker_trades("VST", today.year)
+            elif mode == "accession":
+                frame = source.fetch_accession("VST", accession)
+            else:
+                frame = source.sweep_recent(days_back=1)
+            assert len(frame) == 6
+            assert frame["acceptance_datetime"].eq(expected).all()
+            assert source.save_to_db(frame) == 6
+            assert db.conn.execute("SELECT DISTINCT acceptance_datetime FROM transactions").fetchall() == [(expected,)]
+            assert db.conn.execute("SELECT DISTINCT DATE(acceptance_datetime) FROM transactions").fetchall() == [(date(2025, 10, 15),)]
+            db.conn.execute("UPDATE transactions SET acceptance_datetime = NULL")
+            assert source.save_to_db(frame) == 0
+            assert db.conn.execute("SELECT DISTINCT acceptance_datetime FROM transactions").fetchall() == [(None,)]
+            assert len(requests) == (2 if mode == "sweep" else 1)
+            assert len(submissions) == (0 if mode == "sweep" else 1)
+        finally:
+            source.close()
 
 
 def parse(content):

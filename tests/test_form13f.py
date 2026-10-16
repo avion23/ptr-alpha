@@ -1,4 +1,7 @@
+import json
 from datetime import date
+from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -100,6 +103,59 @@ def test_empty_information_table_fails_closed():
         _parse_information_table(
             '<informationTable xmlns="http://www.sec.gov/edgar/document/thirteenf/informationtable" />'
         )
+
+
+@pytest.mark.parametrize(
+    "case", ["numeric", "ambiguous", "no_table", "malformed", "too_many"]
+)
+def test_load_filing_identifies_schema_not_filename(
+    tmp_path, quarter_xmls, monkeypatch, case
+):
+    index = json.loads(
+        (Path(__file__).parent / "fixtures/form13f/berkshire-index.json").read_text()
+    )
+    table = quarter_xmls[0].encode()
+    contents = {
+        "53405.xml": table,
+        "primary_doc.xml": b'<edgarSubmission xmlns="http://www.sec.gov/edgar/thirteenffiler" />',
+    }
+    if case == "ambiguous":
+        index["directory"]["item"].append({"name": "infotable.xml"})
+        contents["infotable.xml"] = table
+    elif case == "no_table":
+        contents["53405.xml"] = b"<unrelated><infoTable /></unrelated>"
+    elif case == "malformed":
+        contents["primary_doc.xml"] = b"<broken"
+    elif case == "too_many":
+        index["directory"]["item"].extend({"name": f"{n}.xml"} for n in range(7))
+    calls = []
+
+    def get(url):
+        name = url.rsplit("/", 1)[-1]
+        calls.append(name)
+        return SimpleNamespace(json=lambda: index, content=contents.get(name, b""))
+
+    filing = {"accession": "0001193125-26-226661"}
+    with ThirteenFSource(
+        data_dir=tmp_path, db=object(), watchlist={"VST": {"VISTRA"}}
+    ) as source:
+        monkeypatch.setattr(source, "_get", get)
+        if case == "numeric":
+            holdings, report_url = source._load_filing("1067983", filing)
+            assert holdings == _parse_information_table(table)
+            assert report_url.endswith("/1067983/000119312526226661/53405.xml")
+            assert calls == ["index.json", "53405.xml", "primary_doc.xml"]
+        else:
+            match = {
+                "ambiguous": "2 information-table",
+                "no_table": "0 information-table",
+                "malformed": "Unparseable SEC filing XML",
+                "too_many": "Too many XML files",
+            }[case]
+            with pytest.raises(ThirteenFError, match=match):
+                source._load_filing("1067983", filing)
+            if case == "too_many":
+                assert calls == ["index.json"]
 
 
 def test_fetch_all_increases_drops_unmatched_and_keeps_mapped_positions(

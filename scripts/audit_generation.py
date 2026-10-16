@@ -12,9 +12,10 @@ Checks (each violation is reported exactly, and the process exits nonzero):
       (error/failed/rejected/zero_rows without rows) must not hide persisted
       rows (fail-closed).
   C2  source_row_id integrity         deterministic (house_pdf) and OCR
-      (gemini_ocr) rows must carry a non-blank source_row_id, unique per
-      (source, chamber, source_record_id, source_row_id, ingestion_generation),
-      and the enforcing unique index must exist.
+      (gemini_ocr) rows must carry a non-blank source_row_id. Canonical-source
+      rows must be unique per (source, chamber, source_record_id,
+      source_row_id, ingestion_generation), including NULL-bearing keys;
+      the unique index must also exist (it alone does not enforce NULL keys).
   C3  no transaction after disclosure no row may have transaction_date >
       disclosure_date.
   C4  duplicate policy                exact-identity replays are the only
@@ -295,7 +296,8 @@ def check_source_row_ids(
 ) -> CheckResult:
     result = CheckResult(
         "source_row_id_integrity",
-        "deterministic/OCR rows have non-blank source_row_id, unique per identity",
+        "deterministic/OCR rows have non-blank source_row_id; "
+        "canonical-source identities are unique, including NULLs",
     )
     if not _table_exists(conn, "transactions"):
         result.violations.append("transactions table missing")
@@ -331,13 +333,14 @@ def check_source_row_ids(
                 f"...and {total - len(blank)} more blank source_row_id row(s)"
             )
 
+    # DuckDB's unique index permits repeated keys containing NULL. GROUP BY
+    # deliberately groups NULLs together, including legacy House row ids.
     duplicated = conn.execute(
         """
         SELECT source, chamber, source_record_id, source_row_id,
                ingestion_generation, COUNT(*) AS n
         FROM transactions
-        WHERE source IN ('house_pdf', 'gemini_ocr')
-          AND source_row_id IS NOT NULL AND TRIM(source_row_id) <> ''
+        WHERE source IN ('house_pdf', 'gemini_ocr', 'senate_efd', 'form4', '13f')
         GROUP BY 1, 2, 3, 4, 5
         HAVING COUNT(*) > 1
         ORDER BY 3, 4
@@ -357,8 +360,7 @@ def check_source_row_ids(
                     SELECT source, chamber, source_record_id, source_row_id,
                            ingestion_generation
                     FROM transactions
-                    WHERE source IN ('house_pdf', 'gemini_ocr')
-                      AND source_row_id IS NOT NULL AND TRIM(source_row_id) <> ''
+                    WHERE source IN ('house_pdf', 'gemini_ocr', 'senate_efd', 'form4', '13f')
                     GROUP BY 1, 2, 3, 4, 5
                     HAVING COUNT(*) > 1
                 )

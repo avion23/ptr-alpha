@@ -1,5 +1,7 @@
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
+from pathlib import Path
+import json
 
 import pytest
 
@@ -82,26 +84,22 @@ def burke_form4_xml():
 </ownershipDocument>"""
 
 
-@pytest.mark.parametrize("mode", ["ticker", "accession", "sweep", "ticker-header"])
-def test_fetch_records_acceptance_without_extra_requests(tmp_path, monkeypatch, burke_form4_xml, mode):
+@pytest.mark.parametrize("mode", ["ticker", "accession", "sweep"])
+def test_fetch_records_acceptance_without_extra_requests(tmp_path, monkeypatch, mode):
     from analyzer.database import Database
 
-    accession = "0001692819-26-000007"
-    today = datetime.now(UTC).date()
-    accepted = datetime.combine(today, datetime.min.time()).replace(hour=17)
-    header = f"<ACCEPTANCE-DATETIME>{accepted:%Y%m%d%H%M%S}\n".encode()
-    recent = {
-        "accessionNumber": [accession], "form": ["4"],
-        "filingDate": [today.isoformat()], "primaryDocument": ["form4.xml"],
-        "acceptanceDateTime": [f"{today}T21:00:00Z"],
-    }
-    # Use the header clock for the sweep, and the JSON clock otherwise.
-    from analyzer.form4 import _acceptance_datetime
-    expected = accepted if mode == "sweep" else _acceptance_datetime(recent["acceptanceDateTime"][0])
-    if mode == "ticker-header":
-        recent.pop("acceptanceDateTime")
-        expected = accepted
-    with Database(tmp_path / "test.duckdb") as db:
+    fixtures = Path(__file__).parent / "fixtures/acceptance"
+    record = json.loads((fixtures / "captured.json").read_text())[0]["submission"]
+    accession = "0001268406-25-000027"
+    today = date(2025, 10, 16)
+    expected = datetime(2025, 10, 15, 21, 43, 51)
+    recent = {key: [value] for key, value in record.items()}
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2025, 10, 16, 12, tzinfo=tz)
+    monkeypatch.setattr("analyzer.form4.datetime", Clock)
+    with Database(":memory:") as db:
         source = Form4Source(data_dir=tmp_path, db=db, ingestion_generation="test")
         source._ticker_map = {"VST": 1692819}
         submissions = []
@@ -117,19 +115,23 @@ def test_fetch_records_acceptance_without_extra_requests(tmp_path, monkeypatch, 
                     "-----\n"
                     f"1692819|Vistra|4|{today}|edgar/data/1692819/{accession}.txt\n"
                 ).encode())
-            return SimpleNamespace(content=header + b"<XML>" + burke_form4_xml + b"</XML>")
+            return SimpleNamespace(content=(fixtures / f"{accession}.txt").read_bytes())
         monkeypatch.setattr(source, "_request", request)
         try:
-            if mode in {"ticker", "ticker-header"}:
+            if mode == "ticker":
                 frame = source.fetch_ticker_trades("VST", today.year)
             elif mode == "accession":
                 frame = source.fetch_accession("VST", accession)
             else:
                 frame = source.sweep_recent(days_back=1)
-            assert len(frame) == 3
+            assert len(frame) == 6
             assert frame["acceptance_datetime"].eq(expected).all()
-            assert source.save_to_db(frame) == 3
+            assert source.save_to_db(frame) == 6
             assert db.conn.execute("SELECT DISTINCT acceptance_datetime FROM transactions").fetchall() == [(expected,)]
+            assert db.conn.execute("SELECT DISTINCT DATE(acceptance_datetime) FROM transactions").fetchall() == [(date(2025, 10, 15),)]
+            db.conn.execute("UPDATE transactions SET acceptance_datetime = NULL")
+            assert source.save_to_db(frame) == 0
+            assert db.conn.execute("SELECT DISTINCT acceptance_datetime FROM transactions").fetchall() == [(None,)]
             assert len(requests) == (2 if mode == "sweep" else 1)
             assert len(submissions) == (0 if mode == "sweep" else 1)
         finally:

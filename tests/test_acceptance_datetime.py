@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -40,12 +41,14 @@ def test_init_and_legacy_read_only_migration(tmp_path):
         assert db.conn.execute("SELECT acceptance_datetime FROM transactions").fetchall() == [(None,)]
 
 
-@pytest.mark.parametrize("iso, header, expected", [
-    ("2026-09-02T00:30:00Z", b"<ACCEPTANCE-DATETIME>20260901203000", datetime(2026, 9, 1, 20, 30)),
-    ("2026-01-02T00:30:00Z", b"<ACCEPTANCE-DATETIME>20260101193000", datetime(2026, 1, 1, 19, 30)),
+@pytest.mark.parametrize("accession, expected", [
+    ("0001268406-25-000027", datetime(2025, 10, 15, 21, 43, 51)),
+    ("0001193125-26-352200", datetime(2026, 8, 14, 16, 5, 4)),
+    ("0001193125-26-054580", datetime(2026, 2, 17, 16, 5, 4)),
 ])
-def test_sec_clocks_agree(iso, header, expected):
-    assert _acceptance_datetime(iso) == _acceptance_datetime(content=header) == expected
+def test_captured_header_clock(accession, expected):
+    header = (Path(__file__).parent / "fixtures/acceptance" / f"{accession}.txt").read_bytes()
+    assert _acceptance_datetime(content=header) == expected
     assert _acceptance_datetime(content=header.replace(b"<ACCEPTANCE-DATETIME>", b"ACCEPTANCE-DATETIME\t")) == expected
     assert _acceptance_datetime() is None
 

@@ -12,7 +12,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -207,17 +206,12 @@ def _is_10b5_1(root: ET.Element) -> bool:
     )
 
 
-def _acceptance_datetime(value=None, *, content: bytes = b"") -> datetime | None:
-    """SEC acceptance clock, stored as naive America/New_York TIMESTAMP.
+def _acceptance_datetime(*, content: bytes = b"") -> datetime | None:
+    """Authoritative submission-header clock, naive SEC Eastern local time.
 
-    Submissions JSON uses ISO timestamps (usually UTC); the complete submission
-    header uses SEC local time. Never substitute filingDate or insertion time.
+    Do not convert submissions JSON's discrepant acceptanceDateTime field.
+    Never substitute filingDate or insertion time when the header is absent.
     """
-    if value:
-        accepted = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if accepted.tzinfo is not None:
-            accepted = accepted.astimezone(ZoneInfo("America/New_York"))
-        return accepted.replace(tzinfo=None)
     match = re.search(
         rb"(?:<ACCEPTANCE-DATETIME>|ACCEPTANCE-DATETIME\t)\s*(\d{14})", content
     )
@@ -491,7 +485,6 @@ class Form4Source(TransactionSource):
                 recent["form"],
                 recent["filingDate"],
                 recent["primaryDocument"],
-                recent.get("acceptanceDateTime", [None] * len(recent["form"])),
             )
             records = list(zip(*columns, strict=True))
         except (KeyError, TypeError, ValueError) as exc:
@@ -500,7 +493,7 @@ class Form4Source(TransactionSource):
             ) from exc
 
         filings: list[dict] = []
-        for accession, form, filed, document, accepted in records:
+        for accession, form, filed, document in records:
             if form not in {"4", "4/A"}:
                 continue
             try:
@@ -527,7 +520,6 @@ class Form4Source(TransactionSource):
                 {
                     "accession": str(accession),
                     "filing_date": filing_date,
-                    "acceptance_datetime": _acceptance_datetime(accepted),
                     "primary_document": document,
                     "ownership_document": f"{accession}.txt",
                 }
@@ -707,8 +699,7 @@ class Form4Source(TransactionSource):
             accession=filing["accession"],
             source_report_path=url,
             official_filing_date=filing["filing_date"],
-            acceptance_datetime=filing.get("acceptance_datetime")
-            or _acceptance_datetime(content=response.content),
+            acceptance_datetime=_acceptance_datetime(content=response.content),
             ingestion_generation=self.ingestion_generation,
         )
 
@@ -729,8 +720,7 @@ class Form4Source(TransactionSource):
                 accession=filing["accession"],
                 source_report_path=url,
                 official_filing_date=filing["filing_date"],
-                acceptance_datetime=filing.get("acceptance_datetime")
-                or _acceptance_datetime(content=response.content),
+                acceptance_datetime=_acceptance_datetime(content=response.content),
                 ingestion_generation=self.ingestion_generation,
             )
             if not parsed.empty:

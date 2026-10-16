@@ -52,19 +52,24 @@ def quarter_xmls():
 
 
 @pytest.mark.parametrize("discovery", [False, True])
-def test_fetch_records_acceptance(tmp_path, monkeypatch, quarter_xmls, discovery):
+@pytest.mark.parametrize("sample, expected", [
+    (1, "2026-08-14 16:05:04"),
+    (2, "2026-02-17 16:05:04"),
+])
+def test_fetch_records_acceptance(tmp_path, monkeypatch, quarter_xmls, discovery, sample, expected):
     from datetime import datetime
     from analyzer.database import Database
 
+    fixtures = Path(__file__).parent / "fixtures/acceptance"
+    record = json.loads((fixtures / "captured.json").read_text())[sample]["submission"]
     recent = {
         "form": ["13F-HR", "13F-HR"],
-        "reportDate": ["2026-06-30", "2026-03-31"],
-        "filingDate": ["2026-08-14", "2026-05-15"],
-        "accessionNumber": ["0001234567-26-000002", "0001234567-26-000001"],
-        "acceptanceDateTime": ["2026-08-14T21:30:00Z", "2026-05-15T20:00:00Z"],
+        "reportDate": [record["reportDate"], "2025-09-30"],
+        "filingDate": [record["filingDate"], "2025-11-14"],
+        "accessionNumber": [record["accessionNumber"], "0001234567-25-000001"],
+        "acceptanceDateTime": [record["acceptanceDateTime"], None],
     }
-    previous, current = map(_parse_information_table, quarter_xmls)
-    with Database(tmp_path / "test.duckdb") as db:
+    with Database(":memory:") as db:
         source = ThirteenFSource(
             data_dir=tmp_path, db=db, watchlist={"VST": {"VISTRA"}},
             managers={"test": {"name": "Test Manager", "cik": "1234567"}},
@@ -74,11 +79,15 @@ def test_fetch_records_acceptance(tmp_path, monkeypatch, quarter_xmls, discovery
         def submissions(cik):
             calls.append("submissions")
             return {"filings": {"recent": recent}}
-        def filing(cik, record):
-            calls.append("filing")
-            return (current if record["report_date"] == "2026-06-30" else previous), "https://example.test/report.xml"
+        def get(url):
+            calls.append(url.rsplit("/", 1)[-1])
+            if url.endswith("index.json"):
+                return SimpleNamespace(json=lambda: {"directory": {"item": [{"name": "table.xml"}]}})
+            if url.endswith(".txt"):
+                return SimpleNamespace(content=(fixtures / f"{record['accessionNumber']}.txt").read_bytes())
+            return SimpleNamespace(content=quarter_xmls[int(record["accessionNumber"].replace("-", "") in url)].encode())
         monkeypatch.setattr(source, "_load_submissions", submissions)
-        monkeypatch.setattr(source, "_load_filing", filing)
+        monkeypatch.setattr(source, "_get", get)
         try:
             if discovery:
                 rows = source._manager_increases("test", source.managers["test"])
@@ -87,10 +96,11 @@ def test_fetch_records_acceptance(tmp_path, monkeypatch, quarter_xmls, discovery
                 rows = source._manager_transactions(source.managers["test"])
                 from analyzer.form13f import _OUTPUT_COLUMNS
                 source.save_to_db(pd.DataFrame(rows, columns=_OUTPUT_COLUMNS))
-            expected = datetime(2026, 8, 14, 17, 30)
+            expected = datetime.fromisoformat(expected)
             assert rows and all(row["acceptance_datetime"] == expected for row in rows)
             assert db.conn.execute("SELECT DISTINCT acceptance_datetime FROM transactions").fetchall() == [(expected,)]
-            assert calls == ["submissions", "filing", "filing"]
+            assert db.conn.execute("SELECT DISTINCT DATE(acceptance_datetime) FROM transactions").fetchall() == [(expected.date(),)]
+            assert len(calls) == 7
         finally:
             source.close()
 
@@ -188,7 +198,7 @@ def test_load_filing_identifies_schema_not_filename(
             holdings, report_url = source._load_filing("1067983", filing)
             assert holdings == _parse_information_table(table)
             assert report_url.endswith("/1067983/000119312526226661/53405.xml")
-            assert calls == ["index.json", "53405.xml", "primary_doc.xml"]
+            assert calls == ["index.json", "53405.xml", "primary_doc.xml", "0001193125-26-226661.txt"]
         else:
             match = {
                 "ambiguous": "2 information-table",

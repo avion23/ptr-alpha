@@ -198,11 +198,8 @@ def _recent_quarters(submissions: dict) -> list[dict[str, str]]:
         )
 
     by_report_date: dict[date, dict[str, str]] = {}
-    accepted = recent.get("acceptanceDateTime", [None] * len(recent["form"]))
-    if not isinstance(accepted, list) or len(accepted) != len(recent["form"]):
-        raise ThirteenFError("SEC acceptance timestamp column has a different length")
-    rows = zip(*(recent[field] for field in required), accepted)
-    for form, report_raw, filed_raw, accession, acceptance in rows:
+    rows = zip(*(recent[field] for field in required))
+    for form, report_raw, filed_raw, accession in rows:
         if form not in {"13F-HR", "13F-HR/A"}:
             continue
         try:
@@ -222,7 +219,6 @@ def _recent_quarters(submissions: dict) -> list[dict[str, str]]:
             "report_date": report_date.isoformat(),
             "filing_date": filing_date.isoformat(),
             "accession": str(accession),
-            "acceptance_datetime": _acceptance_datetime(acceptance),
         }
         previous = by_report_date.get(report_date)
         if previous is None or (candidate["filing_date"], candidate["accession"]) > (
@@ -380,6 +376,8 @@ class ThirteenFSource(TransactionSource):
                 f"SEC filing index has {len(info_tables)} information-table XML files: {index_url}"
             )
         report_url, content = info_tables[0]
+        header = self._get(f"{directory_url}/{filing['accession']}.txt").content
+        filing["acceptance_datetime"] = _acceptance_datetime(content=header)
         return _parse_information_table(content), report_url
 
     def _manager_transactions(self, manager: dict[str, str]) -> list[dict]:

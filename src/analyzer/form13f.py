@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-import re
 import xml.etree.ElementTree as ET
 from datetime import date
 from pathlib import Path
@@ -343,23 +342,36 @@ class ThirteenFSource(TransactionSource):
             if isinstance(index, dict)
             else []
         )
-        info_tables = [
+        xml_files = [
             item.get("name", "")
             for item in files
             if isinstance(item, dict)
             and str(item.get("name", "")).lower().endswith(".xml")
-            and any(
-                marker in re.sub(r"[^a-z]", "", str(item.get("name", "")).lower())
-                for marker in ("infotable", "informationtable", "inftbl")
-            )
         ]
+        # SEC index.json types are generic (text.gif), and table filenames can
+        # be numeric (Berkshire's 53405.xml). Identify the XML schema, not names.
+        # Bound discovery rather than guessing when an index is unexpectedly large.
+        if len(xml_files) > 8:
+            raise ThirteenFError(f"Too many XML files to inspect safely: {index_url}")
+        info_tables = []
+        for name in xml_files:
+            report_url = f"{directory_url}/{name}"
+            content = self._get(report_url).content
+            try:
+                root = ET.fromstring(content)
+            except (ET.ParseError, TypeError, ValueError) as exc:
+                raise ThirteenFError(f"Unparseable SEC filing XML: {report_url}") from exc
+            if root.tag == (
+                "{http://www.sec.gov/edgar/document/thirteenf/informationtable}"
+                "informationTable"
+            ):
+                info_tables.append((report_url, content))
         if len(info_tables) != 1:
             raise ThirteenFError(
                 f"SEC filing index has {len(info_tables)} information-table XML files: {index_url}"
             )
-        report_url = f"{directory_url}/{info_tables[0]}"
-        response = self._get(report_url)
-        return _parse_information_table(response.content), report_url
+        report_url, content = info_tables[0]
+        return _parse_information_table(content), report_url
 
     def _manager_transactions(self, manager: dict[str, str]) -> list[dict]:
         filings = _recent_quarters(self._load_submissions(manager["cik"]))

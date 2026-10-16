@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess  # nosec B404
 import sys
 import uuid
@@ -14,17 +15,33 @@ import pandas as pd
 from analyzer._price_index import _normalize_price_index
 
 
-def _get_git_sha() -> str:
+def _get_git_sha() -> str | None:
+    """Revision of the EXECUTING analyzer package, not the process CWD.
+
+    Provenance must identify the code that produced the artifact. Resolving
+    via the process working directory records whatever repo the operator
+    happened to cd into (a reviewer once ran branch code with CWD=main and
+    the receipt recorded main's SHA). Resolve against the package's own
+    checkout instead; fall back to GIT_SHA from the environment; return None
+    (never a guess) when unresolvable so provenance fails closed.
+    """
+    package_root = Path(__file__).resolve().parent
     try:
         result = subprocess.run(  # nosec B603 B607
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-C", str(package_root), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=True,
         )
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return "unknown"
+        sha = result.stdout.strip()
+        if sha:
+            return sha
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        pass
+    env_sha = os.environ.get("GIT_SHA", "").strip()
+    if env_sha:
+        return env_sha
+    return None
 
 
 def _get_yfinance_version() -> str:
@@ -40,7 +57,7 @@ def _get_yfinance_version() -> str:
 class PriceSnapshot:
     snapshot_id: str
     created_at: str
-    git_sha: str
+    git_sha: str | None
     yfinance_version: str
     python_version: str
     requested_tickers: int

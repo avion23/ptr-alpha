@@ -51,6 +51,7 @@ def score(
     entry_tol: float = 1.05,
     event_half_life_days: int = 90,
     watchlist: Collection[str] | None = None,
+    audit: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Rank price-eligible initiating actors and report blocked actors.
 
@@ -230,7 +231,7 @@ def score(
                 )
                 continue
 
-            decay, reason, _ = min(usable, key=lambda item: (-item[0], item[1]))
+            decay, reason, entry_ref = min(usable, key=lambda item: (-item[0], item[1]))
             contribution = float(weights.get(actor_id, 0.0)) * decay
             if not math.isfinite(contribution) or contribution < 0:
                 contribution = 0.0
@@ -248,10 +249,24 @@ def score(
                 )
                 continue
             accepted.append((actor_id, contribution, reason, usable_lag))
+            if audit is not None:
+                audit.setdefault(ticker, {}).setdefault("members", []).append(
+                    {"member": actor_id, "entry_ref": entry_ref,
+                     "weight": float(weights.get(actor_id, 0.0)),
+                     "contribution": contribution}
+                )
 
         score_value = sum(item[1] for item in accepted) * (
             1.5 if corroborated else 1.0
         )
+        if audit is not None:
+            audit.setdefault(ticker, {}).update(
+                corroborated_13f=corroborated,
+                quote_date=str(quote_date) if quote_date else None,
+                quote_value=current,
+                stale_quote=stale_quote,
+                ranking_gate=is_ranked(score_value, len(accepted), corroborated),
+            )
         if accepted and not is_ranked(score_value, len(accepted), corroborated):
             blocked_rows.extend(
                 {

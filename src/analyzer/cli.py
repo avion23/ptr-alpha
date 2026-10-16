@@ -296,6 +296,20 @@ def _consensus_score_display(score: pd.DataFrame) -> pd.DataFrame:
     return score[columns]
 
 
+def _receipt_data_dir(app_ctx):
+    """Data directory for decision receipts, or None when unresolvable.
+
+    Recording must never invent a write target: when the context carries no
+    real path (mocked smoke contexts), skip recording instead of scattering
+    files relative to the working directory.
+    """
+    data = getattr(getattr(app_ctx, "settings", None), "data", None)
+    data_dir = getattr(data, "data_dir", None)
+    if isinstance(data_dir, (str, Path)) and str(data_dir):
+        return data_dir
+    return None
+
+
 def _run_ticker_mode(
     app_ctx: AppContext,
     mode: str,
@@ -327,6 +341,31 @@ def _run_ticker_mode(
     )
     result = run_ticker_analysis(params, app_ctx.transaction_source)
     if result.success and hasattr(result, "data") and result.data:
+        from analyzer.decision_snapshot import record_ticker_decision_safely
+
+        as_of_date = pd.Timestamp(
+            params.as_of_date or min(date.today(), date(params.year, 12, 31))
+        ).normalize().date()
+        # Same receipt writer as every other production decision boundary;
+        # failures are logged, never raised (never break trading).
+        receipt_dir = _receipt_data_dir(app_ctx)
+        if receipt_dir is not None:
+            record_ticker_decision_safely(
+                receipt_dir,
+                as_of_date,
+                inputs={"buyers": result.data["buyers"]},
+                outputs={
+                    "ticker": result.data["ticker"],
+                    "score": result.data["score"],
+                },
+                scope={
+                    "mode": "ticker",
+                    "ticker": params.ticker,
+                    "year": params.year,
+                    "days_back": params.days_back,
+                    "min_buyers": params.min_buyers,
+                },
+            )
         print(f"\n=== Buyers of {result.data['ticker']} ===")
         print(result.data["buyers"].to_string(index=False))
         print("\n=== Signal Score ===")
@@ -362,6 +401,23 @@ def _run_tickers_mode(
     )
     result = run_recent_ticker_scoring(app_ctx.transaction_source, params)
     if result.success and hasattr(result, "data") and result.data:
+        from analyzer.decision_snapshot import record_ticker_decision_safely
+
+        # Same receipt writer as every other production decision boundary;
+        # failures are logged, never raised (never break trading).
+        receipt_dir = _receipt_data_dir(app_ctx)
+        if receipt_dir is not None:
+            record_ticker_decision_safely(
+                receipt_dir,
+                result.data["as_of_date"],
+                inputs={
+                    "days_back": params.days_back,
+                    "min_buyers": params.min_buyers,
+                    "top_n": params.top_n,
+                },
+                outputs={"result": result.data["result"]},
+                scope={"mode": "tickers", "year": params.year},
+            )
         data = result.data
         if not data["result"].empty:
             print(
@@ -792,7 +848,7 @@ def backtest(
             print("\n=== Price Snapshot ===")
             print(f"  Snapshot ID:  {snapshot.snapshot_id}")
             print(f"  Created:      {snapshot.created_at}")
-            print(f"  Git SHA:      {snapshot.git_sha[:12]}")
+            print(f"  Git SHA:      {(snapshot.git_sha or 'unknown')[:12]}")
             print(f"  yfinance:     {snapshot.yfinance_version}")
             print(
                 f"  Tickers:      {snapshot.resolved_tickers}/{snapshot.requested_tickers} resolved"
@@ -1097,7 +1153,7 @@ def snapshot(
 
     print(f"Snapshot created: {snap.snapshot_id}")
     print(f"  Created at:     {snap.created_at}")
-    print(f"  Git SHA:        {snap.git_sha[:12]}")
+    print(f"  Git SHA:        {(snap.git_sha or 'unknown')[:12]}")
     print(f"  yfinance:       {snap.yfinance_version}")
     print(f"  Python:         {snap.python_version}")
     print(
@@ -1608,6 +1664,7 @@ def setups(
         )
         from analyzer.manager_watchlist import watchlist_actor_ids
         from analyzer.setups import score as score_setups
+        from analyzer.decision_snapshot import record_decision_safely
 
         def _congress_holdings(frame):
             """Congress rows initiate scoring; officer/manager holdings rows
@@ -1630,6 +1687,8 @@ def setups(
         # One human, one holdings load: drop requested names that denote an
         # already-requested member (variants, nicknames, middle names).
         member = dedupe_member_names(list(member))
+        decision_scope = {"members": member, "tickers": sorted(requested_tickers),
+                          "include_unpromoted": include_unpromoted}
         for selected_member in member:
             frame = holdings_candidates(
                 db,
@@ -1699,6 +1758,8 @@ def setups(
                 candidate_frames.append(events)
         candidate_frames = [frame for frame in candidate_frames if not frame.empty]
         if not candidate_frames:
+            record_decision_safely(data_dir, as_of_date, pd.DataFrame(), {}, {},
+                                   watchlist_actor_ids(), scope=decision_scope)
             print("No candidates.")
             _cli_exit(0)
         candidates = pd.concat(candidate_frames, ignore_index=True)
@@ -1709,6 +1770,8 @@ def setups(
                 )
             ].copy()
         if candidates.empty:
+            record_decision_safely(data_dir, as_of_date, candidates, {}, {},
+                                   watchlist_actor_ids(), scope=decision_scope)
             print("No candidates.")
             _cli_exit(0)
 
@@ -1726,11 +1789,16 @@ def setups(
                 current_prices[symbol] = (float(row[0]), row[1])
 
         weights = weights_for_candidates(db, candidates, as_of_date)
+        decision_watchlist = watchlist_actor_ids()
         ranked, blocked = score_setups(
             candidates,
             weights,
             current_prices,
-            watchlist=watchlist_actor_ids(),
+            watchlist=decision_watchlist,
+        )
+        record_decision_safely(
+            data_dir, as_of_date, candidates, weights, current_prices,
+            decision_watchlist, ranked, blocked, scope=decision_scope,
         )
     except typer.Exit:
         raise

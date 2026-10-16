@@ -192,6 +192,30 @@ def build_positions(
 
     lots: dict[tuple[str, str], list] = {}
     last_activity: dict[tuple[str, str], date] = {}
+
+    def _filing_ref(row, source) -> dict:
+        """Canonical filing identity of one contributing lot row.
+
+        Lots keep the source_row identity that opened them so a position can
+        name exactly which filings contributed. Producers without ids record
+        NULL explicitly; nothing is invented.
+        """
+
+        def _id(name):
+            if name not in trades.columns:
+                return None
+            value = getattr(row, name, None)
+            if value is None or pd.isna(value):
+                return None
+            text = str(value).strip()
+            return text or None
+
+        return {
+            "source": source if isinstance(source, str) and source else None,
+            "source_record_id": _id("source_record_id"),
+            "source_row_id": _id("source_row_id"),
+        }
+
     floor_sized: dict[tuple[str, str], int] = {}
     band_estimates: dict[tuple[str, str], dict[str | None, dict[str, float]]] = {}
     ineligible_for_band_tolerance: set[tuple[tuple[str, str], str | None]] = set()
@@ -368,7 +392,8 @@ def build_positions(
                         estimate["bought_value"] += size
                         estimate["bought_shares"] += shares
             lots.setdefault(key, []).append(
-                [shares, size, disclosure_day, source, account, day]
+                [shares, size, disclosure_day, source, account, day,
+                 _filing_ref(row, source)]
             )
             if by_floor:
                 floor_sized[key] = floor_sized.get(key, 0) + 1
@@ -529,6 +554,7 @@ def build_positions(
                 "disclosure_date": max(lot[2] for lot in queue),
                 "source": queue[-1][3],
                 "floor_sized_lots": floor_sized.get(key, 0),
+                "filing_refs": _canonical_filing_refs(queue),
             }
         )
 
@@ -552,9 +578,34 @@ def build_positions(
         "disclosure_date",
         "source",
         "floor_sized_lots",
+        "filing_refs",
     ]
     return pd.DataFrame(records, columns=columns).sort_values(
         "discount_pct", kind="mergesort"
+    )
+
+
+def _canonical_filing_refs(queue) -> list[dict]:
+    """Deduplicated, canonically sorted filing identities of surviving lots.
+
+    Every lot names the filing that opened it (source + source_record_id +
+    source_row_id, NULL when the producer has no ids), so replay can
+    reconstruct which filings contributed to a position.
+    """
+    refs: list[dict] = []
+    for lot in queue:
+        ref = lot[6] if len(lot) > 6 else None
+        if not isinstance(ref, dict):
+            ref = {"source": None, "source_record_id": None, "source_row_id": None}
+        if ref not in refs:
+            refs.append(ref)
+    return sorted(
+        refs,
+        key=lambda ref: (
+            str(ref.get("source")),
+            str(ref.get("source_record_id")),
+            str(ref.get("source_row_id")),
+        ),
     )
 
 
@@ -580,6 +631,7 @@ def holdings_candidates(
         "corroboration",
         "position_evidence",
         "as_of",
+        "filing_refs",
     ]
     source_kinds = {
         "house_pdf": "congress",
@@ -646,6 +698,7 @@ def holdings_candidates(
                     "corroboration": False,
                     "position_evidence": True,
                     "as_of": as_of,
+                    "filing_refs": position.filing_refs,
                 }
             )
 

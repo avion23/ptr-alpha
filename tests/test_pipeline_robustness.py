@@ -461,6 +461,8 @@ def test_eligible_events_maps_official_actor_sources_and_entry_reference():
         "actor_id",
         "kind",
         "source",
+        "source_record_id",
+        "source_row_id",
         "entry_ref",
         "event_date",
         "disclosure_date",

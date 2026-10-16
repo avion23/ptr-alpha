@@ -345,7 +345,15 @@ def compute_actor_weights(
     candidates: pd.DataFrame,
     skill_table: pd.DataFrame,
 ) -> dict[str, float]:
-    """Apply validated skill multipliers to the unchanged source priors."""
+    """Apply validated skill multipliers to the unchanged source priors.
+
+    Production reality (first-principles review 2026-10-16): this always calls
+    compute_weight with n_matured=0, so output takes exactly five values —
+    {prior, prior/2} per initiating source plus 0. The Beta-binomial shrinkage
+    path in compute_weight never executes here; scores are actor counts with
+    adjustments, not continuous skill estimates. Wire real n/hits through
+    only with a revalidated backtest, never by silent default change.
+    """
     required_candidates = {"actor_id", "kind", "source"}
     if not required_candidates.issubset(candidates.columns):
         raise ValueError(
@@ -426,8 +434,3 @@ def weights_for_candidates(
     }
     skill_table = skill_table.loc[skill_table["actor_id"].isin(exact_candidates)]
     return compute_actor_weights(candidates, skill_table)
-
-
-def age_weight(days_old: int, half_life_days: int = 365) -> float:
-    """Return exponential episode-age weight for the supplied half-life."""
-    return 0.5 ** (days_old / half_life_days)

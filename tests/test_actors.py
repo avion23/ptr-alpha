@@ -4,7 +4,6 @@ import pandas as pd
 from analyzer.actors import (
     SOURCE_PRIORS,
     actor_id,
-    age_weight,
     compute_actor_weights,
     compute_skill_table,
     compute_weight,
@@ -92,11 +91,6 @@ def test_cli_and_replay_use_the_same_actor_weight_path():
 
     assert cli.weights_for_candidates is weights_for_candidates
     assert replay._load_dependencies()[2].weights_for_candidates is weights_for_candidates
-
-
-def test_age_weight_halves_at_half_life():
-    assert age_weight(365) == 0.5
-    assert age_weight(730, half_life_days=365) == 0.25
 
 
 def test_actor_id_uses_kind_specific_name_normalization():

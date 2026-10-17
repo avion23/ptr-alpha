@@ -163,7 +163,7 @@ def test_zero_weight_actor_does_not_corroborate_or_count():
             "actors": ["officer:STRONG"],
             "n_actors": 1,
             "current": 100.0,
-            "reasons": ["STRONG buy @100.00, now 100.00 (+0.0%)"],
+            "reasons": ["STRONG basis @100.00, now 100.00 (+0.0%)"],
             "min_disclosure_lag_days": 2,
             "has_fresh_evidence": True,
         }
@@ -261,7 +261,7 @@ def test_reasons_and_decay_are_deterministic():
         first.iloc[0]["reasons"]
         == second.iloc[0]["reasons"]
         == [
-            "PELOSI buy @169.11 (est.), now 141.02 (-16.6%)",
+            "PELOSI basis @169.11 (est.), now 141.02 (-16.6%)",
             "BURKE CEO buy @135.00, now 141.02 (+4.5%)",
         ]
     )
@@ -328,6 +328,25 @@ def test_position_evidence_holds_full_weight():
         pd.DataFrame([row]), {"congress:PELOSI": 1.0}, {"AAPL": 100.0}
     )
     assert ranked.iloc[0]["score"] == pytest.approx(1.0)
+
+
+def test_reason_verb_labels_basis_for_positions_and_buy_for_events():
+    """position_evidence rows report the FIFO cost basis, not a trade price."""
+    ranked, _ = score(
+        pd.DataFrame(
+            [
+                _row(actor_id="congress:HOLDING", position_evidence=True),
+                _row(actor_id="officer:EVENT", source="form4"),
+            ]
+        ),
+        {"congress:HOLDING": 1.0, "officer:EVENT": 1.0},
+        {"AAPL": 100.0},
+    )
+
+    assert ranked.iloc[0]["reasons"] == [
+        "HOLDING basis @100.00 (est.), now 100.00 (+0.0%)",
+        "EVENT buy @100.00, now 100.00 (+0.0%)",
+    ]
 
 
 def test_officer_reference_is_not_labeled_estimate():

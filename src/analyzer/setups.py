@@ -222,8 +222,11 @@ def score(
                 )
                 change = current / entry_ref - 1.0
                 estimated = " (est.)" if str(row.get("kind")) == "congress" else ""
+                # position_evidence rows carry the blended FIFO cost basis
+                # (positions.py), not a trade price — label it "basis".
+                verb = "basis" if position_evidence else "buy"
                 reason = (
-                    f"{_actor_name(actor_id)} buy @{entry_ref:.2f}{estimated}, "
+                    f"{_actor_name(actor_id)} {verb} @{entry_ref:.2f}{estimated}, "
                     f"now {current:.2f} ({change:+.1%})"
                 )
                 usable.append((decay, reason, entry_ref))

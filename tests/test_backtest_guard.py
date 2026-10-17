@@ -161,12 +161,13 @@ def test_cmd_run_refuses_degenerate_frame_before_writing_anything(
     try:
         seed_frame(db, tickers=FRAME_TICKERS[:3], accepted=accepted)
         with pytest.raises(SystemExit, match="DEGENERATE FRAME") as excinfo:
-            guard_script.cmd_run(decision, db=db)
+            guard_script.cmd_run(decision, db=db, frame="ingestion")
         assert f"{expected_events} eligible events" in str(excinfo.value)
     finally:
         db.close()
     assert list(out_dir.glob("cohorts_*.csv")) == []
     assert list(out_dir.glob("actors_*.csv")) == []
+    assert list(out_dir.glob("manifest_*.json")) == []
 
 
 def test_cmd_run_invokes_frame_guard_with_computed_counts_before_writes(
@@ -190,13 +191,14 @@ def test_cmd_run_invokes_frame_guard_with_computed_counts_before_writes(
 
         monkeypatch.setattr(guard_script, "check_frame", recording_guard)
         with pytest.raises(GuardPassed):
-            guard_script.cmd_run(decision, db=db)
+            guard_script.cmd_run(decision, db=db, frame="ingestion")
         assert calls == [(75, 25, decision, "ingestion")]
     finally:
         db.close()
-    # Stopped at the guard: no cohort or actor artifact was opened for writing.
+    # Stopped at the guard: no cohort, actor, or manifest artifact was opened.
     assert list(out_dir.glob("cohorts_*.csv")) == []
     assert list(out_dir.glob("actors_*.csv")) == []
+    assert list(out_dir.glob("manifest_*.json")) == []
 
 
 def test_cmd_run_refuses_sealed_block_before_touching_disk(
@@ -214,5 +216,5 @@ def test_cmd_run_refuses_sealed_block_before_touching_disk(
 
     monkeypatch.setattr(guard_script, "date", FrozenDate)
     with pytest.raises(SystemExit, match="SEALED BLOCK"):
-        guard_script.cmd_run(date(2027, 1, 15))
+        guard_script.cmd_run(date(2027, 1, 15), frame="ingestion")
     assert not out_dir.exists()

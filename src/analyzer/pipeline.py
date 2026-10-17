@@ -299,8 +299,17 @@ def eligible_events(
     as_of: date | pd.Timestamp,
     *,
     days_back: int | None = None,
+    frame_scope: date | None = None,
 ) -> pd.DataFrame:
-    """Return point-in-time eligible purchase events from official sources."""
+    """Return point-in-time eligible purchase events from official sources.
+
+    ``frame_scope`` overrides only the canonical ingestion scope (which
+    rowsets the view exposes), never the disclosure filter: the disclosure
+    replay frame passes ``date.today()`` so today's complete database is
+    filtered by ``disclosure_date <= as_of`` instead of the ingestion
+    watermark. The ingestion frame leaves it None and stays byte-compatible
+    with the historical behavior.
+    """
     columns = [
         "ticker",
         "actor_id",
@@ -316,12 +325,17 @@ def eligible_events(
         "as_of",
     ]
     decision_date = pd.Timestamp(as_of).normalize()
+    scope_date = (
+        pd.Timestamp(frame_scope).normalize()
+        if frame_scope is not None
+        else decision_date
+    )
     history_start = (
         decision_date - timedelta(days=days_back)
         if days_back is not None
         else date.min
     )
-    scope = db.canonical_as_of(decision_date) if hasattr(db, "canonical_as_of") else nullcontext()
+    scope = db.canonical_as_of(scope_date) if hasattr(db, "canonical_as_of") else nullcontext()
     with scope:
         trades = db.get_transactions_by_date_range(history_start, decision_date)
     if trades.empty or not {"source", "ticker", "disclosure_date"}.issubset(

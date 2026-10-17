@@ -10,17 +10,24 @@ the NEXT NYSE session close after the decision date (executable, not the
 decision close), and measure 90d forward excess vs SPY from the same entry.
 
 Usage:
-  python3 scripts/backtest_assumptions.py skill
-  python3 scripts/backtest_assumptions.py run 2023-01-15
-  python3 scripts/backtest_assumptions.py analyze
-  python3 scripts/backtest_assumptions.py sweep
-  python3 scripts/backtest_assumptions.py full
+  python3 scripts/backtest_assumptions.py skill --frame {disclosure,ingestion}
+  python3 scripts/backtest_assumptions.py run 2023-01-15 --frame ingestion
+  python3 scripts/backtest_assumptions.py analyze --frame disclosure
+  python3 scripts/backtest_assumptions.py sweep --frame disclosure
+  python3 scripts/backtest_assumptions.py full --frame ingestion
 run refuses sealed walk-forward block dates (unseal >= 2028-11-01) and degenerate frames (<50 events or <20 candidate tickers).
+--frame has no default anywhere: the frame is never implicit again. Ingestion
+replays the live canonical_as_of(decision) scope; disclosure replays today's
+complete database filtered by disclosure_date <= decision. Every artifact
+records the frame that produced it (frame column + manifest_<D>.json).
 Results land in data/backtest_assumptions/.
 """
 
+import argparse
+import hashlib
 import json
 import math
+import subprocess
 import sys
 from contextlib import closing, contextmanager, nullcontext
 from datetime import date, timedelta
@@ -53,6 +60,10 @@ DB_PATH = Path("/home/ubuntu/insider-trading/data/congress.duckdb")
 HORIZON = 90
 MAX_ENTRY_GAP_DAYS = 4
 TOLERANCES = [1.00, 1.03, 1.05, 1.10, 1.30, 1.50, 2.00, math.inf]
+
+# Replay frames (docs/strategy-charter.md, "Replay frames"). Never pooled,
+# never implicit: every command and every artifact names its frame.
+FRAMES = ("disclosure", "ingestion")
 
 MIN_FRAME_EVENTS = 50
 MIN_FRAME_TICKERS = 20
@@ -104,6 +115,21 @@ def check_frame(
         "artifacts. Use a decision date after the database's first ingestion "
         "watermark."
     )
+
+
+def sha256_file(path: Path) -> str:
+    """Chunked sha256 so hashing the live DB does not load it whole."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_sha() -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
 
 
 def next_session_close(db, ticker: str, after: date):
@@ -161,8 +187,11 @@ def fwd_excess(db, ticker: str, entry_date: date, entry_px: float):
     return ret, spy, ret - spy
 
 
-def breadth_by_actor(db, decision: date) -> dict[str, int]:
-    with db.canonical_as_of(decision):
+def breadth_by_actor(
+    db, decision: date, frame_scope: date | None = None
+) -> dict[str, int]:
+    scope_date = frame_scope if frame_scope is not None else decision
+    with db.canonical_as_of(scope_date):
         rows = db.conn.execute(
             "SELECT DISTINCT source, member, ticker FROM canonical_transactions"
             " WHERE disclosure_date <= ? AND member IS NOT NULL AND ticker IS NOT NULL",
@@ -216,8 +245,8 @@ def cached_position_inputs():
         positions.load_price_history = load_prices
 
 
-def skill_episodes(db, decision):
-    ev = eligible_events(db, decision)
+def skill_episodes(db, decision, frame_scope: date | None = None):
+    ev = eligible_events(db, decision, frame_scope=frame_scope)
     ev = ev[pd.to_datetime(ev["disclosure_date"]) < pd.Timestamp("2023-01-01")]
     ev = ev.drop_duplicates(["actor_id", "ticker", "disclosure_date"])
     ev = ev.loc[ev["actor_id"].astype(str).str.startswith("congress:")]
@@ -236,13 +265,18 @@ def skill_episodes(db, decision):
     return episodes
 
 
-def cmd_skill():
+def cmd_skill(*, frame: str):
+    if frame not in FRAMES:
+        raise SystemExit(
+            f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}"
+        )
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     db = Database(DB_PATH, read_only=True)
     try:
         by_decision = {}
         for decision in DECISIONS:
-            episodes = skill_episodes(db, decision)
+            scoped_as_of = date.today() if frame == "disclosure" else decision
+            episodes = skill_episodes(db, decision, frame_scope=scoped_as_of)
             matured = [item for item in episodes if item["exit_date"] < decision]
             stats_by_actor = {}
             for item in matured:
@@ -261,7 +295,7 @@ def cmd_skill():
                 for item in stats_rows
                 if item["mean_excess"] > 3.0
             }
-            breadth = breadth_by_actor(db, decision)
+            breadth = breadth_by_actor(db, decision, frame_scope=scoped_as_of)
             by_decision[str(decision)] = {
                 "labels": sorted(labels),
                 "stats": stats_rows,
@@ -275,19 +309,28 @@ def cmd_skill():
         db.close()
 
 
-def cmd_run(decision: date, db=None):
+def cmd_run(decision: date, db=None, *, frame: str):
     check_sealed(decision)
+    if frame not in FRAMES:
+        raise SystemExit(
+            f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}"
+        )
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     owns_db = db is None
     if owns_db:
         db = Database(DB_PATH, read_only=True)
-    with closing(db) if owns_db else nullcontext(), db.canonical_as_of(decision):
+    # Ingestion frame: the live pipeline's view at end of the decision date.
+    # Disclosure frame: today's complete database, rows filtered by
+    # disclosure <= decision. Both go through the canonical as-of scope;
+    # eligible_events' inner scope must obey the same frame (frame_scope).
+    scoped_as_of = date.today() if frame == "disclosure" else decision
+    with closing(db) if owns_db else nullcontext(), db.canonical_as_of(scoped_as_of):
         skill = json.loads((OUT_DIR / "skill.json").read_text())
         point_in_time = skill["by_decision"][str(decision)]
         skilled = set(point_in_time["labels"])
         breadth = point_in_time["breadth"]
         hyper = {actor for actor, count in breadth.items() if count > 150}
-        events_all = eligible_events(db, decision)
+        events_all = eligible_events(db, decision, frame_scope=scoped_as_of)
         tickers = sorted(
             events_all["ticker"].astype("string").str.upper().unique()
         )
@@ -299,7 +342,7 @@ def cmd_run(decision: date, db=None):
             ]
             if sub["actor_id"].nunique() >= 2:
                 keep.append(t)
-        check_frame(len(events_all), len(keep), decision)
+        check_frame(len(events_all), len(keep), decision, frame)
         print(decision, "tickers:", len(keep), flush=True)
         holdings_cache: dict = {}
 
@@ -327,16 +370,16 @@ def cmd_run(decision: date, db=None):
                     kinds.setdefault(name, kind)
             frames, congress_frames = [], []
             for m in dedupe_member_names(sorted(kinds)):
-                frame = holdings_for(m)
-                if frame.empty:
+                lots = holdings_for(m)
+                if lots.empty:
                     continue
-                frame = frame.loc[
-                    frame["ticker"].astype("string").str.upper() == symbol
+                lots = lots.loc[
+                    lots["ticker"].astype("string").str.upper() == symbol
                 ].copy()
-                if not frame.empty:
-                    frames.append(frame)
+                if not lots.empty:
+                    frames.append(lots)
                     congress_frames.append(
-                        frame.loc[frame["kind"] == "congress"].copy()
+                        lots.loc[lots["kind"] == "congress"].copy()
                     )
             pos = (
                 pd.concat(frames, ignore_index=True)
@@ -434,14 +477,36 @@ def cmd_run(decision: date, db=None):
             )
             if (i + 1) % 50 == 0:
                 print(f"  ... {i + 1}/{len(keep)}", flush=True)
-        pd.DataFrame(rows).to_csv(OUT_DIR / f"cohorts_{decision}.csv", index=False)
-        pd.DataFrame(
+        # frame is a constant column appended LAST: earlier column order is
+        # preserved for diffing against artifacts published before the flag.
+        cohort_frame = pd.DataFrame(rows)
+        cohort_frame["frame"] = frame
+        cohort_frame.to_csv(OUT_DIR / f"cohorts_{decision}.csv", index=False)
+        actor_frame = pd.DataFrame(
             actor_rows,
             columns=[
                 "as_of", "ticker", "actor_id", "kind", "entry_ref", "lag_days",
                 "skilled", "hyper", "excess",
             ],
-        ).to_csv(OUT_DIR / f"actors_{decision}.csv", index=False)
+        )
+        actor_frame["frame"] = frame
+        actor_frame.to_csv(OUT_DIR / f"actors_{decision}.csv", index=False)
+        # Self-describing provenance; NO wall-clock field (determinism I1):
+        # two runs on unchanged inputs must be byte-identical.
+        manifest = {
+            "decision": str(decision),
+            "frame": frame,
+            "scoped_as_of": scoped_as_of.isoformat(),
+            "events": len(events_all),
+            "keep_tickers": len(keep),
+            "rows": len(rows),
+            "db_path": str(db.db_path),
+            "db_sha256": sha256_file(db.db_path),
+            "git_sha": git_sha(),
+        }
+        (OUT_DIR / f"manifest_{decision}.json").write_text(
+            json.dumps(manifest, indent=2) + "\n"
+        )
         print("wrote", len(rows), "rows", flush=True)
 
 
@@ -495,11 +560,38 @@ def compare_groups(
     }
 
 
+def read_panel_csv(path: Path, kind: str) -> tuple[pd.DataFrame, list[str]]:
+    """Read a frame-tagged panel CSV; refuse legacy frame-less artifacts."""
+    panel = pd.read_csv(path)
+    if "frame" not in panel.columns:
+        raise SystemExit(
+            f"{kind} CSV {path.name} has no frame column; regenerate with --frame"
+        )
+    return panel, sorted(set(panel["frame"].dropna().astype(str)))
+
+
+def refuse_mixed_frames(frame_values: dict[str, list[str]]) -> None:
+    """A pooled estimate that mixes frames is invalid regardless of t-stat."""
+    if len(frame_values) > 1:
+        detail = ", ".join(
+            f"{value} <- {', '.join(names)}"
+            for value, names in sorted(frame_values.items())
+        )
+        raise SystemExit(f"mixed frames in panel: {detail}")
+
+
 def cmd_analyze():
     files = [OUT_DIR / f"cohorts_{decision}.csv" for decision in DECISIONS]
-    frames = [pd.read_csv(path) for path in files if path.exists()]
+    frames = []
+    frame_values: dict[str, list[str]] = {}
+    for path in (path for path in files if path.exists()):
+        panel, values = read_panel_csv(path, "cohort")
+        for value in values:
+            frame_values.setdefault(value, []).append(path.name)
+        frames.append(panel)
     if len(frames) != len(DECISIONS):
         raise SystemExit("missing cohort CSVs; run all decision dates first")
+    refuse_mixed_frames(frame_values)
     observations = pd.concat(frames, ignore_index=True)
     eligible = observations.loc[observations["entry_eligible"]]
     comparisons = [
@@ -566,8 +658,20 @@ def cmd_sweep():
             + ", ".join(missing)
         )
 
-    cohorts = pd.concat([pd.read_csv(path) for path in cohort_files], ignore_index=True)
-    actors = pd.concat([pd.read_csv(path) for path in actor_files], ignore_index=True)
+    frame_values: dict[str, list[str]] = {}
+    cohort_frames, actor_frames = [], []
+    for kind, files, sink in (
+        ("cohort", cohort_files, cohort_frames),
+        ("actor", actor_files, actor_frames),
+    ):
+        for path in files:
+            panel, values = read_panel_csv(path, kind)
+            for value in values:
+                frame_values.setdefault(value, []).append(path.name)
+            sink.append(panel)
+    refuse_mixed_frames(frame_values)
+    cohorts = pd.concat(cohort_frames, ignore_index=True)
+    actors = pd.concat(actor_frames, ignore_index=True)
     if actors.duplicated(["as_of", "ticker", "actor_id"]).any():
         raise SystemExit("actor CSVs contain duplicate decision+ticker+actor rows")
     actor_means = actors.groupby("actor_id", as_index=False)["excess"].mean()
@@ -636,31 +740,53 @@ def cmd_sweep():
     print(summary.to_string(index=False), flush=True)
 
 
-def cmd_full():
-    cmd_skill()
+def cmd_full(*, frame: str):
+    cmd_skill(frame=frame)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     db = Database(DB_PATH, read_only=True)
     try:
         with cached_position_inputs():
             for decision in DECISIONS:
-                cmd_run(decision, db)
+                cmd_run(decision, db, frame=frame)
     finally:
         db.close()
     cmd_analyze()
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Chronological backtest of the system's load-bearing assumptions."
+    )
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    for name in ("skill", "analyze", "sweep"):
+        child = subparsers.add_parser(name)
+        _add_frame_flag(child)
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument("decision", type=date.fromisoformat)
+    _add_frame_flag(run_parser)
+    _add_frame_flag(subparsers.add_parser("full"))
+    return parser
+
+
+def _add_frame_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--frame",
+        choices=FRAMES,
+        required=True,
+        help="replay frame; no default, the frame is never implicit",
+    )
+
+
 if __name__ == "__main__":
-    mode = sys.argv[1]
-    if mode == "skill":
-        cmd_skill()
-    elif mode == "run":
+    args = build_parser().parse_args()
+    if args.mode == "skill":
+        cmd_skill(frame=args.frame)
+    elif args.mode == "run":
         with cached_position_inputs():
-            cmd_run(date.fromisoformat(sys.argv[2]))
-    elif mode == "analyze":
+            cmd_run(args.decision, frame=args.frame)
+    elif args.mode == "analyze":
         cmd_analyze()
-    elif mode == "sweep":
+    elif args.mode == "sweep":
         cmd_sweep()
-    elif mode == "full":
-        cmd_full()
-    else:
-        raise SystemExit("usage: skill | run YYYY-MM-DD | analyze | sweep | full")
+    elif args.mode == "full":
+        cmd_full(frame=args.frame)

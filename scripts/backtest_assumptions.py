@@ -15,6 +15,7 @@ Usage:
   python3 scripts/backtest_assumptions.py analyze
   python3 scripts/backtest_assumptions.py sweep
   python3 scripts/backtest_assumptions.py full
+run refuses sealed walk-forward block dates (unseal >= 2028-11-01) and degenerate frames (<50 events or <20 candidate tickers).
 Results land in data/backtest_assumptions/.
 """
 
@@ -53,6 +54,9 @@ HORIZON = 90
 MAX_ENTRY_GAP_DAYS = 4
 TOLERANCES = [1.00, 1.03, 1.05, 1.10, 1.30, 1.50, 2.00, math.inf]
 
+MIN_FRAME_EVENTS = 50
+MIN_FRAME_TICKERS = 20
+
 DECISIONS = [
     date(2023, 1, 15),
     date(2023, 7, 15),
@@ -63,6 +67,43 @@ DECISIONS = [
     date(2026, 1, 15),
     date(2026, 7, 1),
 ]
+
+WALK_FORWARD_BLOCK = (
+    date(2027, 1, 15),
+    date(2027, 7, 15),
+    date(2028, 1, 15),
+    date(2028, 7, 15),
+)
+UNSEAL_AFTER = date(2028, 11, 1)
+
+
+def check_sealed(decision: date, today: date | None = None):
+    """Refuse frozen walk-forward block dates before the unseal date."""
+    if today is None:
+        today = date.today()
+    if decision in WALK_FORWARD_BLOCK and today < UNSEAL_AFTER:
+        raise SystemExit(
+            f"SEALED BLOCK: {decision} is a frozen walk-forward decision date"
+            " defined docs/strategy-charter.md; unseal >= 2028-11-01"
+        )
+
+
+def check_frame(
+    events_count: int,
+    tickers_count: int,
+    decision: date,
+    frame: str = "ingestion",
+):
+    """Refuse degenerate replay frames before any artifact is written."""
+    if events_count >= MIN_FRAME_EVENTS and tickers_count >= MIN_FRAME_TICKERS:
+        return
+    raise SystemExit(
+        f"DEGENERATE FRAME: {decision} {frame} frame has {events_count} "
+        f"eligible events (minimum {MIN_FRAME_EVENTS}) and {tickers_count} "
+        f"candidate tickers (minimum {MIN_FRAME_TICKERS}); refusing to write "
+        "artifacts. Use a decision date after the database's first ingestion "
+        "watermark."
+    )
 
 
 def next_session_close(db, ticker: str, after: date):
@@ -235,6 +276,7 @@ def cmd_skill():
 
 
 def cmd_run(decision: date, db=None):
+    check_sealed(decision)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     owns_db = db is None
     if owns_db:
@@ -257,6 +299,7 @@ def cmd_run(decision: date, db=None):
             ]
             if sub["actor_id"].nunique() >= 2:
                 keep.append(t)
+        check_frame(len(events_all), len(keep), decision)
         print(decision, "tickers:", len(keep), flush=True)
         holdings_cache: dict = {}
 

@@ -45,9 +45,11 @@ class MetadataRepository:
         """Atomically replace one official House archive.
 
         Upserts the incoming rows, then deletes only docs actually removed
-        from the archive. Semantically identical to bulk DELETE + re-INSERT
-        but avoids tripping a history-dependent DuckDB index maintenance
-        failure on repeated delete/upsert cycles.
+        from the archive, rather than a bulk DELETE + re-INSERT. This runs
+        against a metadata table with no archive_year index (see
+        database._init_metadata_table): DuckDB 1.5.5's ART index corrupts
+        under repeated delete/upsert cycles on this table, leaving the index
+        unable to match rows the table still holds.
         """
         df = df.copy()
         df["archive_year"] = archive_year

@@ -163,10 +163,14 @@ class Database:
         }
         if "archive_year" not in columns:
             self.conn.execute("ALTER TABLE metadata ADD COLUMN archive_year INTEGER")
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_metadata_archive_year "
-            "ON metadata(archive_year)"
-        )
+        # No index on archive_year. metadata is ~33k rows (a seq scan is
+        # microseconds), and on DuckDB 1.5.5 the ART index corrupts under the
+        # bulk delete/upsert cycle in MetadataRepository.replace_archive: the
+        # index silently stops matching rows the table still holds, so
+        # `WHERE archive_year = ?` returns fewer rows than `GROUP BY` sees,
+        # and replace_archive then reads a stale id set through the same
+        # index. Dropping it removes the failure class entirely.
+        self.conn.execute("DROP INDEX IF EXISTS idx_metadata_archive_year")
 
     def _init_house_archive_tables(self) -> None:
         self.conn.execute("""

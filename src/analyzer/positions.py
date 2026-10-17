@@ -671,15 +671,18 @@ def holdings_candidates(
     )
 
 
+@canonical_decision("as_of")
 def holdings_candidates_batch(
     db, members: list[str], as_of: date, *, include_unpromoted: bool = False
 ) -> dict[str, pd.DataFrame]:
     """Open-position candidates for many members with O(1) DB round-trips.
 
-    Same per-member output as `holdings_candidates`; the distinct-name scan,
-    the trades load, and the price-history load each happen once no matter
-    how many members are requested. The unscoped `setups` path fans out over
-    ~300 event members, where the per-member form costs ~10s each.
+    Same per-member output as `holdings_candidates`, read under the same
+    canonical as-of scope: rows promoted or accepted after the decision day
+    are excluded. The distinct-name scan, the trades load, and the
+    price-history load each happen once no matter how many members are
+    requested; the `setups` path fans out over ~300 event members, where the
+    per-member form costs ~10s each.
     """
     columns = [
         "ticker",

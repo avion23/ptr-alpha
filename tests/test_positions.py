@@ -1383,6 +1383,93 @@ def _batch_prices():
     ]
 
 
+def _seed_house_doc(db, *, doc, member, ticker, promoted, accepted,
+                    disclosure="2026-01-05", created="2026-01-05"):
+    """One house_pdf filing with explicit promotion/acceptance watermarks.
+
+    Mirrors the promotion fixtures in tests/test_asof_v2.py so the
+    canonical_transactions view reflects real rowset watermarks.
+    """
+    db.conn.execute(
+        "INSERT INTO house_archive_generations "
+        "(archive_year, generation_id, promoted_at) VALUES (?, ?, ?)",
+        [2026, doc, promoted],
+    )
+    db.conn.execute(
+        "INSERT INTO house_generation_metadata "
+        "(archive_year, generation_id, doc_id, filing_type) VALUES (?, ?, ?, 'P')",
+        [2026, doc, doc],
+    )
+    db.conn.execute(
+        "INSERT INTO house_pdf_artifacts "
+        "(archive_year, generation_id, doc_id, artifact_sha256) VALUES (?, ?, ?, 'sha')",
+        [2026, doc, doc],
+    )
+    row = dict(doc_id=doc, member=member, ticker=ticker,
+               transaction_date=disclosure, disclosure_date=disclosure,
+               transaction_type="Purchase", chamber="house", source_record_id=doc,
+               source_row_id="row1", official_filing_date=disclosure,
+               ingestion_generation=doc, artifact_sha256="sha",
+               amount_midpoint=10000.0)
+    db.upsert_transactions(pd.DataFrame([row]), source="house_pdf")
+    db.conn.execute(
+        "UPDATE transactions SET created_at = ? WHERE doc_id = ?", [created, doc]
+    )
+    db.parse_runs.upsert(doc_id=doc, year=2026, parser_version="pdftotext",
+                         status="success", engines_attempted="pdftotext",
+                         raw_row_count=1, transaction_count=1,
+                         artifact_sha256="sha", ingestion_generation=doc)
+    db.conn.execute(
+        "UPDATE pdf_parse_runs SET parsed_at = ?, rowset_created_at = NULL "
+        "WHERE doc_id = ?",
+        [accepted, doc],
+    )
+
+
+def test_holdings_batch_scopes_canonical_read_to_as_of(tmp_path):
+    """The batch form owns the same canonical as-of scope as the per-member form.
+
+    Regression: the batch loader read canonical_transactions unscoped, so a
+    rowset promoted the day AFTER the decision leaked into batched setups
+    while the per-member form excluded it. Both forms must agree exactly,
+    and a post-as_of-promoted row must be excluded from both.
+    """
+    from analyzer.database import Database
+    from analyzer.positions import holdings_candidates_batch
+
+    decision = date(2026, 6, 10)
+    db = Database(tmp_path / "asof.duckdb")
+    try:
+        _seed_house_doc(db, doc="in-scope", member="DANA TESTER", ticker="INSM",
+                        promoted="2026-01-06", accepted="2026-01-07")
+        # Watermarks AFTER the decision day, intraday like a next-morning
+        # promotion: must never enter the decision.
+        _seed_house_doc(db, doc="late", member="DANA TESTER", ticker="LATE",
+                        disclosure="2026-01-06", created="2026-01-06",
+                        promoted="2026-06-11 13:07:00",
+                        accepted="2026-06-11 13:07:00")
+        db.conn.executemany(
+            "INSERT INTO prices VALUES (?, ?, ?)",
+            [("INSM", date(2026, 1, 5), 100.0), ("LATE", date(2026, 1, 6), 90.0)],
+        )
+
+        # The late rowset IS in the unscoped canonical view, so the
+        # exclusions below can only come from the as-of scope itself.
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM canonical_transactions WHERE ticker = 'LATE'"
+        ).fetchone()[0] == 1
+
+        batched = holdings_candidates_batch(db, ["DANA TESTER"], decision)
+        single = holdings_candidates(db, "DANA TESTER", decision)
+        assert batched["DANA TESTER"].equals(single)
+        for frame in (batched["DANA TESTER"], single):
+            assert frame["ticker"].tolist() == ["INSM"]
+            assert frame["entry_ref"].tolist() == [100.0]
+            assert frame["disclosure_date"].tolist() == [date(2026, 1, 5)]
+    finally:
+        db.close()
+
+
 def test_holdings_batch_matches_single_per_member():
     from analyzer.positions import holdings_candidates_batch
 

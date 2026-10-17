@@ -1817,16 +1817,17 @@ def setups(
         )
         current_prices = {}
         if symbols:
+            # (ticker, date) rows are unique in prices, so the window's
+            # row_number picks exactly the row sort_values + drop_duplicates
+            # (keep="last") kept, without materializing full histories.
             latest = db.conn.execute(
                 "SELECT ticker, close, date FROM prices WHERE ticker = ANY(?) "
-                "AND date <= ?",
+                "AND date <= ? "
+                "QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY date DESC) = 1",
                 [symbols, as_of_date],
             ).fetchdf()
             if not latest.empty:
                 latest["date"] = pd.to_datetime(latest["date"])
-                latest = latest.sort_values("date").drop_duplicates(
-                    "ticker", keep="last"
-                )
                 for row in latest.itertuples(index=False):
                     if row.close is not None and not (
                         isinstance(row.close, float) and pd.isna(row.close)

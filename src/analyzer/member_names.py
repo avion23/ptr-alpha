@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from functools import lru_cache
 
 
 # Tokens that are not part of a person's core first/last name and should be
@@ -70,6 +71,7 @@ _CREDENTIALS = frozenset(
 )
 
 
+@lru_cache(maxsize=65536)
 def canonical_member_key(name: str) -> str:
     """Return a canonical lookup key for a member name.
 

@@ -17,6 +17,7 @@ import logging
 import math
 import re
 from datetime import date
+from functools import lru_cache
 
 import pandas as pd
 
@@ -59,19 +60,31 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
             key = (str(position["ticker"]).upper(), str(position["actor_id"]))
             open_positions[key] = position.get("event_date")
 
-    for index, row in gated.iterrows():
-        key = (str(row["ticker"]).upper(), str(row["actor_id"]))
-        position_start = open_positions.get(key)
-        event_date = row.get("event_date")
-        if (
+    # Row-major decisions without per-row Series construction: the mask and
+    # the two masked assignments reproduce the iterrows loop exactly.
+    def _cells(name):
+        if name in gated.columns:
+            return gated[name].tolist()
+        return [None] * len(gated)
+
+    starts = [
+        open_positions.get((str(ticker).upper(), str(actor_id)))
+        for ticker, actor_id in zip(_cells("ticker"), _cells("actor_id"))
+    ]
+    event_dates = _cells("event_date")
+    stale = []
+    for position_start, event_date in zip(starts, event_dates):
+        stale.append(
             position_start is None
             or pd.isna(position_start)
             or event_date is None
             or pd.isna(event_date)
             or pd.Timestamp(event_date).date() < pd.Timestamp(position_start).date()
-        ):
-            gated.at[index, "entry_ref"] = None
-            gated.at[index, "blocked_reason"] = "no open position at as_of"
+        )
+    if any(stale):
+        mask = pd.Series(stale, index=gated.index)
+        gated.loc[mask, "entry_ref"] = None
+        gated.loc[mask, "blocked_reason"] = "no open position at as_of"
     return gated
 
 
@@ -121,6 +134,115 @@ def entry_close(
     return price if math.isfinite(price) and price > 0 else None
 
 
+_CURRENT_MISS = object()
+
+
+class _EntryCloseLookup:
+    """Memoized searchsorted twin of `entry_close` for one fixed as_of.
+
+    Price-history frames are immutable for the lifetime of one positions
+    build, so each (ticker, transaction-day) answer is a pure function of
+    the frame. Sorted date indexes take a searchsorted path that returns
+    exactly the value `entry_close` returns; anything unusual (unsorted,
+    non-datetime, NaT-bearing index) falls back to `entry_close` itself.
+    """
+
+    __slots__ = ("_histories", "_as_of", "_prepared", "_cache", "_stamps", "_current")
+
+    def __init__(self, histories: dict[str, pd.DataFrame], as_of):
+        self._histories = histories
+        self._as_of = None if as_of is None else pd.Timestamp(as_of)
+        self._prepared: dict[str, tuple | None] = {}
+        self._cache: dict[tuple[str, date], float | None] = {}
+        self._stamps: dict[date, pd.Timestamp] = {}
+        self._current: dict[str, float | None] = {}
+
+    def close(self, ticker: str, day: date) -> float | None:
+        key = (ticker, day)
+        try:
+            return self._cache[key]
+        except KeyError:
+            pass
+        result = self._compute(ticker, day)
+        self._cache[key] = result
+        return result
+
+    def _prepared_frame(self, ticker: str):
+        if ticker in self._prepared:
+            return self._prepared[ticker]
+        history = self._histories.get(ticker)
+        prepared = None
+        if (
+            history is not None
+            and not history.empty
+            and isinstance(history.index, pd.DatetimeIndex)
+            and not history.index.hasnans
+            and history.index.is_monotonic_increasing
+            and self._as_of is not None
+        ):
+            truncated = history.loc[history.index <= self._as_of]
+            values = truncated["close"].to_numpy()
+            if values.dtype.kind not in "fiu":
+                prepared = None
+            else:
+                prepared = (truncated.index, values)
+        self._prepared[ticker] = prepared
+        return prepared
+
+    def _compute(self, ticker: str, day: date) -> float | None:
+        prepared = self._prepared_frame(ticker)
+        if prepared is None:
+            return entry_close(self._histories.get(ticker), day, self._as_of)
+        index, values = prepared
+        day_ts = self._stamp(day)
+        position = index.searchsorted(day_ts, side="left")
+        # Monotonic dates: the first bar past the 7-day gap cap can never
+        # price the entry, matching entry_close's bar-day check.
+        while position < len(index):
+            bar_day = index[position].date()
+            if (bar_day - day).days > 7:
+                return None
+            value = values[position]
+            if value == value:  # skip NaN closes exactly like closes.notna()
+                price = float(value)
+                return price if math.isfinite(price) and price > 0 else None
+            position += 1
+        return None
+
+    def _stamp(self, day: date) -> pd.Timestamp:
+        stamp = self._stamps.get(day)
+        if stamp is None:
+            stamp = pd.Timestamp(day)
+            self._stamps[day] = stamp
+        return stamp
+
+    def current(self, ticker: str) -> float | None:
+        """Memoized twin of `_current_close` for the fixed as_of."""
+        cached = self._current.get(ticker, _CURRENT_MISS)
+        if cached is not _CURRENT_MISS:
+            return cached
+        result = self._current_compute(ticker)
+        self._current[ticker] = result
+        return result
+
+    def _current_compute(self, ticker: str) -> float | None:
+        prepared = self._prepared_frame(ticker)
+        if prepared is None:
+            history = self._histories.get(ticker)
+            if history is None or history.empty:
+                return None
+            return _current_close(history, self._as_of)
+        index, values = prepared
+        position = int(index.searchsorted(self._as_of, side="right")) - 1
+        while position >= 0:
+            value = values[position]
+            if value == value:  # skip NaN closes exactly like closes.notna()
+                price = float(value)
+                return price if price > 0 else None
+            position -= 1
+        return None
+
+
 def _current_close(prices: pd.DataFrame, as_of: date) -> float | None:
     """Last close on or before the as-of date."""
     closes = prices.loc[prices.index <= pd.Timestamp(as_of), "close"]
@@ -151,6 +273,12 @@ def _is_partial_sale(kind: str, subtype) -> bool:
     return False
 
 
+# Pure string classification over a tiny value space; the memo turns the
+# per-row re.sub work into a dict lookup without changing any result.
+_is_full_sale = lru_cache(maxsize=4096)(_is_full_sale)
+_is_partial_sale = lru_cache(maxsize=4096)(_is_partial_sale)
+
+
 def _owner_account(value) -> str | None:
     if value is None or pd.isna(value):
         return None
@@ -165,6 +293,8 @@ def build_positions(
     price_history: dict[str, pd.DataFrame],
     *,
     as_of: date,
+    entry_lookup: "_EntryCloseLookup | None" = None,
+    presorted: bool = False,
 ) -> pd.DataFrame:
     """Reconstruct open lots per (member, ticker) with FIFO sale relief.
 
@@ -192,6 +322,8 @@ def build_positions(
 
     lots: dict[tuple[str, str], list] = {}
     last_activity: dict[tuple[str, str], date] = {}
+    if entry_lookup is None:
+        entry_lookup = _EntryCloseLookup(price_history, as_of)
 
     def _filing_ref(row, source) -> dict:
         """Canonical filing identity of one contributing lot row.
@@ -287,14 +419,21 @@ def build_positions(
     # full sales) needs a total, repeatable order, not a stable date-only sort.
     # Filing identity breaks ties where available; economic fields are the
     # fallback for older/slim inputs. This is not inferred intraday chronology.
+    # A caller that already applied this exact stable key order (the batched
+    # loader pre-sorts the shared canonical frame once) may pass
+    # presorted=True: a stable sort of an identically-sorted frame is the
+    # identity, so skipping it cannot reorder anything.
     tie_columns = dict.fromkeys(
         ("transaction_date", "disclosure_date", "source", "source_record_id",
          "source_row_id", "owner_code", *_LOADER_COLUMNS)
     )
-    ordered = trades.loc[known].sort_values(
-        [column for column in tie_columns if column in trades],
-        kind="mergesort", na_position="first",
-    )
+    if presorted:
+        ordered = trades.loc[known]
+    else:
+        ordered = trades.loc[known].sort_values(
+            [column for column in tie_columns if column in trades],
+            kind="mergesort", na_position="first",
+        )
     if "amends_source_record_id" in ordered.columns:
         superseded = {
             str(value)
@@ -371,7 +510,7 @@ def build_positions(
                 if congress_estimate:
                     ineligible_for_band_tolerance.add(estimate_key)
             else:
-                entry = entry_close(history, day, as_of)
+                entry = entry_lookup.close(str(row.ticker), day)
                 size, by_floor = _size(row)
                 if entry is None or size is None:
                     skipped += 1
@@ -433,7 +572,7 @@ def build_positions(
                 if congress_estimate:
                     sale_band_ineligible = True
             else:
-                entry = entry_close(history, day, as_of)
+                entry = entry_lookup.close(str(row.ticker), day)
                 size, by_floor = _size(row)
                 if entry is None or size is None:
                     skipped += 1
@@ -535,7 +674,7 @@ def build_positions(
         if shares <= _SHARE_EPSILON or cost <= 0:
             continue
         history = price_history[key[1]]
-        current = _current_close(history, as_of)
+        current = entry_lookup.current(key[1])
         if current is None:
             skipped += 1
             continue
@@ -737,10 +876,19 @@ def holdings_candidates_batch(
     ).fetchdf()
     by_member: dict[str, pd.DataFrame] = {}
     if not canonical.empty:
+        # One stable sort by build_positions' full tie-key order for the whole
+        # shared frame; every per-member partition inherits it, so the
+        # per-member re-sorts become identities and are skipped.
+        _tie_columns = dict.fromkeys(
+            ("transaction_date", "disclosure_date", "source", "source_record_id",
+             "source_row_id", "owner_code", *_LOADER_COLUMNS)
+        )
+        canonical = canonical.sort_values(
+            [column for column in _tie_columns if column in canonical],
+            kind="mergesort", na_position="first",
+        )
         for member in members:
             mine = canonical.loc[canonical["member"].isin(variants[member])].copy()
-            if not mine.empty:
-                mine = mine.sort_values("transaction_date", kind="mergesort")
             by_member[member] = mine
     else:
         by_member = {member: canonical for member in members}
@@ -797,11 +945,14 @@ def holdings_candidates_batch(
         ).fetchdf()
         if not history.empty:
             history["date"] = pd.to_datetime(history["date"])
-            for symbol, frame in history.groupby("ticker"):
-                histories[str(symbol)] = frame.sort_values("date").set_index("date")
+            # The query's ORDER BY ticker, date leaves every group already in
+            # date order; set_index preserves it, so no per-ticker sort.
+            for symbol, frame in history.groupby("ticker", sort=False):
+                histories[str(symbol)] = frame.set_index("date")
     for ticker in tickers:
         histories.setdefault(ticker, pd.DataFrame())
 
+    entry_lookup = _EntryCloseLookup(histories, as_of)
     out: dict[str, pd.DataFrame] = {}
     for member in members:
         trades = by_member[member]
@@ -813,13 +964,16 @@ def holdings_candidates_batch(
             out[member] = pd.DataFrame(columns=columns)
             continue
         out[member] = _holdings_records(
-            member, trades, histories, as_of, _actor_id, columns, source_kinds
+            member, trades, histories, as_of, _actor_id, columns, source_kinds,
+            entry_lookup=entry_lookup,
+            presorted=not include_unpromoted,
         )
     return out
 
 
 def _holdings_records(
-    member, trades: pd.DataFrame, histories: dict, as_of, _actor_id, columns, source_kinds
+    member, trades: pd.DataFrame, histories: dict, as_of, _actor_id, columns, source_kinds,
+    entry_lookup=None, presorted: bool = False,
 ) -> pd.DataFrame:
     """Shared per-member record builder over preloaded trades+histories."""
     records = []
@@ -829,7 +983,10 @@ def _holdings_records(
         ]
         if kind_trades.empty:
             continue
-        positions = build_positions(kind_trades, histories, as_of=as_of)
+        positions = build_positions(
+            kind_trades, histories, as_of=as_of, entry_lookup=entry_lookup,
+            presorted=presorted,
+        )
         for position in positions.itertuples(index=False):
             source = position.source
             # build_positions emits only net-long positions, so any row here
@@ -975,20 +1132,28 @@ def coalesce_actor_variants(events: pd.DataFrame, from_positions: pd.DataFrame) 
             from_positions["position_evidence"].eq(True), "actor_id"
         ].astype(str)
         representatives = list(dict.fromkeys(open_actors))
-    for index, row in events.iterrows():
-        actor_id = str(row["actor_id"])
+    # Row order only matters through first-seen actor_id uniqueness: once an
+    # actor_id is mapped (or appended), later identical actor_ids scan the
+    # same unchanged prefix of `representatives` and land on the same match.
+    # So resolve the match once per distinct actor_id in first-seen order.
+    mapping: dict[str, str] = {}
+    for actor in events["actor_id"].astype(str):
+        match = mapping.get(actor)
+        if match is not None:
+            continue
         match = next(
             (
                 representative
                 for representative in representatives
-                if same_actor_identity(representative, actor_id)
+                if same_actor_identity(representative, actor)
             ),
             None,
         )
         if match is None:
-            representatives.append(actor_id)
-            match = actor_id
-        events.at[index, "actor_id"] = match
+            representatives.append(actor)
+            match = actor
+        mapping[actor] = match
+    events["actor_id"] = [mapping[value] for value in events["actor_id"].astype(str)]
     return events
 
 

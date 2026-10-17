@@ -49,6 +49,7 @@ _NON_EQUITY_INSTRUMENTS = frozenset(
     }
 )
 _REJECTED_TICKER_ORIGINS = frozenset({"invalid", "missing", "non_equity"})
+_CACHE_MISS = object()
 _OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd", "form4", "13f"})
 _LEGACY_SCORING_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
 
@@ -214,21 +215,61 @@ def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
 
     resolved_symbols = []
     canonical_members = []
-    for _, row in purchases.iterrows():
-        if not _equity_transaction_row(row):
+    # Column-major extraction: same per-row checks as before, without the
+    # Series construction cost of iterrows. Missing columns read as None,
+    # matching Series.get's default.
+    def _column(name):
+        if name in purchases.columns:
+            return purchases[name].tolist()
+        return [None] * len(purchases)
+
+    resolve_cache: dict[tuple[object, object], object] = {}
+    listing_start = _TICKER_RESOLVER.LISTING_START_MAP
+    for (
+        ticker_origin,
+        row_source,
+        raw_asset_class,
+        asset_description,
+        raw_asset_description,
+        instrument_type,
+        ticker_value,
+        member,
+        transaction_day,
+        disclosure_day,
+    ) in zip(
+        _column("ticker_origin"),
+        _column("source"),
+        _column("raw_asset_class"),
+        _column("asset_description"),
+        _column("raw_asset_description"),
+        _column("instrument_type"),
+        _column("ticker"),
+        _column("member"),
+        _column("transaction_date"),
+        _column("disclosure_date"),
+    ):
+        if not _equity_transaction_fields(
+            ticker_origin,
+            row_source,
+            raw_asset_class,
+            asset_description,
+            raw_asset_description,
+            instrument_type,
+        ):
             resolved_symbols.append(None)
         else:
-            ticker = _normalize_ticker_text(row.get("ticker"))
-            date_field = (
-                "disclosure_date"
-                if ticker in _TICKER_RESOLVER.LISTING_START_MAP
-                else "transaction_date"
+            ticker = _normalize_ticker_text(ticker_value)
+            reference_value = (
+                disclosure_day if ticker in listing_start else transaction_day
             )
-            reference_date = _transaction_date(row.get(date_field))
-            resolved_symbols.append(
-                _resolved_ticker_symbol(row.get("ticker"), reference_date)
-            )
-        canonical_members.append(_canonical_member_or_blank(row.get("member")))
+            reference_date = _transaction_date(reference_value)
+            resolution_key = (ticker_value, reference_date)
+            resolved = resolve_cache.get(resolution_key, _CACHE_MISS)
+            if resolved is _CACHE_MISS:
+                resolved = _resolved_ticker_symbol(ticker_value, reference_date)
+                resolve_cache[resolution_key] = resolved
+            resolved_symbols.append(resolved)
+        canonical_members.append(_canonical_member_or_blank(member))
 
     purchases["_resolved_symbol"] = resolved_symbols
     purchases["_member_canonical"] = canonical_members
@@ -351,21 +392,25 @@ def _transaction_date(value):
     return pd.Timestamp(parsed).date()
 
 
-def _equity_transaction_row(row: pd.Series) -> bool:
-    origin = _normalize_ticker_text(row.get("ticker_origin"))
+def _equity_transaction_fields(
+    ticker_origin, source, raw_asset_class, asset_description,
+    raw_asset_description, instrument_type,
+) -> bool:
+    """Scalar core of `_equity_transaction_row` (same checks, same order)."""
+    origin = _normalize_ticker_text(ticker_origin)
     if origin is not None and origin.lower() in _REJECTED_TICKER_ORIGINS:
         return False
 
-    source = _normalize_ticker_text(row.get("source"))
-    if source is not None and source.lower() not in _OFFICIAL_SOURCES:
+    source_text = _normalize_ticker_text(source)
+    if source_text is not None and source_text.lower() not in _OFFICIAL_SOURCES:
         return False
 
     description = " ".join(
         str(value)
         for value in (
-            row.get("raw_asset_class"),
-            row.get("asset_description"),
-            row.get("raw_asset_description"),
+            raw_asset_class,
+            asset_description,
+            raw_asset_description,
         )
         if value is not None and not pd.isna(value)
     )
@@ -376,8 +421,19 @@ def _equity_transaction_row(row: pd.Series) -> bool:
     ) and not _STOCK_BRACKET_RE.search(description):
         return False
 
-    instrument = _normalize_ticker_text(row.get("instrument_type"))
+    instrument = _normalize_ticker_text(instrument_type)
     return instrument is None or instrument.lower() not in _NON_EQUITY_INSTRUMENTS
+
+
+def _equity_transaction_row(row: pd.Series) -> bool:
+    return _equity_transaction_fields(
+        row.get("ticker_origin"),
+        row.get("source"),
+        row.get("raw_asset_class"),
+        row.get("asset_description"),
+        row.get("raw_asset_description"),
+        row.get("instrument_type"),
+    )
 
 
 def _filter_equity_rows(rows: pd.DataFrame) -> pd.DataFrame:

@@ -28,7 +28,7 @@ from analyzer.member_ranking.buyer_scoring import (
     _resolve_consensus_ticker,
 )
 from analyzer.models import AnalysisMode, SourceCoverageState
-from analyzer.positions import entry_close
+from analyzer.positions import entry_close, _EntryCloseLookup
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
 from analyzer.ticker_resolver import TickerResolver
@@ -370,15 +370,20 @@ def eligible_events(
         connection = getattr(db, "conn", None)
         if symbols and connection is not None:
             history = connection.execute(
-                "SELECT ticker, date, close FROM prices WHERE ticker = ANY(?)",
+                "SELECT ticker, date, close FROM prices WHERE ticker = ANY(?) "
+                "ORDER BY ticker, date",
                 [symbols],
             ).fetchdf()
             if set(history.columns) >= {"ticker", "date", "close"}:
                 history["date"] = pd.to_datetime(history["date"])
-                for symbol, frame in history.groupby("ticker"):
-                    closes[str(symbol)] = frame.sort_values("date").set_index("date")
+                # The query's ORDER BY ticker, date leaves every group already
+                # in date order; set_index preserves it, so no per-ticker sort.
+                for symbol, frame in history.groupby("ticker", sort=False):
+                    closes[str(symbol)] = frame.set_index("date")
     except Exception:
         closes = {}
+
+    entry_lookup = _EntryCloseLookup(closes, decision_date.date())
 
     def _congress_entry(symbol: str, day) -> float | None:
         # Point-in-time: only closes known by the decision date may price
@@ -388,61 +393,85 @@ def eligible_events(
         if frame is None or frame.empty:
             return None
         try:
-            return entry_close(frame, pd.Timestamp(day).date(), decision_date.date())
+            return entry_lookup.close(str(symbol), pd.Timestamp(day).date())
         except (TypeError, ValueError):
             return None
 
     rows = []
-    for _, purchase in purchases.iterrows():
-        source = purchase["source"]
-        kind = kinds.get(source)
-        if kind is None:
-            continue
-        name = purchase["member"]
-        if not isinstance(name, str):
-            continue
-        actor = actor_id(kind, name)
-        if actor == f"{kind}:":
-            continue
+    if not purchases.empty:
+        # Column-major extraction: identical per-row decisions without the
+        # Series construction cost of iterrows. Missing optional columns read
+        # as None, matching Series.get's default.
+        def _cell(name):
+            if name in purchases.columns:
+                return purchases[name].tolist()
+            return [None] * len(purchases)
 
-        entry_ref = None
-        if source == "form4":
-            description = purchase.get("asset_description")
-            amount = pd.to_numeric(purchase.get("amount_midpoint"), errors="coerce")
-            shares_match = (
-                re.search(r"([\d,.]+)\s+shares?\s+@", description, re.IGNORECASE)
-                if isinstance(description, str)
-                else None
-            )
-            if shares_match and pd.notna(amount):
-                shares = float(shares_match.group(1).replace(",", ""))
-                if shares > 0 and np.isfinite(amount):
-                    entry_ref = float(amount) / shares
-        elif kind == "congress":
-            entry_ref = _congress_entry(
-                purchase["_resolved_symbol"], purchase["transaction_date"]
-            )
+        for (
+            source,
+            name,
+            symbol,
+            transaction_day,
+            disclosure_day,
+            record_id,
+            row_id,
+            amount_cell,
+            description,
+        ) in zip(
+            _cell("source"),
+            _cell("member"),
+            _cell("_resolved_symbol"),
+            _cell("transaction_date"),
+            _cell("disclosure_date"),
+            _cell("source_record_id"),
+            _cell("source_row_id"),
+            _cell("amount_midpoint"),
+            _cell("asset_description"),
+        ):
+            kind = kinds.get(source)
+            if kind is None:
+                continue
+            if not isinstance(name, str):
+                continue
+            actor = actor_id(kind, name)
+            if actor == f"{kind}:":
+                continue
 
-        rows.append(
-            {
-                "ticker": purchase["_resolved_symbol"],
-                "actor_id": actor,
-                "kind": kind,
-                "source": source,
-                # Canonical row identity travels with the candidate so the
-                # decision receipt can reconstruct input provenance. Legacy
-                # producers without ids record NULL explicitly, never an
-                # invented stand-in.
-                "source_record_id": _row_identity(purchase.get("source_record_id")),
-                "source_row_id": _row_identity(purchase.get("source_row_id")),
-                "entry_ref": entry_ref,
-                "event_date": pd.Timestamp(purchase["transaction_date"]).normalize(),
-                "disclosure_date": pd.Timestamp(purchase["disclosure_date"]).normalize(),
-                "corroboration": source == "13f",
-                "position_evidence": False,
-                "as_of": decision_date,
-            }
-        )
+            entry_ref = None
+            if source == "form4":
+                amount = pd.to_numeric(amount_cell, errors="coerce")
+                shares_match = (
+                    re.search(r"([\d,.]+)\s+shares?\s+@", description, re.IGNORECASE)
+                    if isinstance(description, str)
+                    else None
+                )
+                if shares_match and pd.notna(amount):
+                    shares = float(shares_match.group(1).replace(",", ""))
+                    if shares > 0 and np.isfinite(amount):
+                        entry_ref = float(amount) / shares
+            elif kind == "congress":
+                entry_ref = _congress_entry(symbol, transaction_day)
+
+            rows.append(
+                {
+                    "ticker": symbol,
+                    "actor_id": actor,
+                    "kind": kind,
+                    "source": source,
+                    # Canonical row identity travels with the candidate so the
+                    # decision receipt can reconstruct input provenance. Legacy
+                    # producers without ids record NULL explicitly, never an
+                    # invented stand-in.
+                    "source_record_id": _row_identity(record_id),
+                    "source_row_id": _row_identity(row_id),
+                    "entry_ref": entry_ref,
+                    "event_date": pd.Timestamp(transaction_day).normalize(),
+                    "disclosure_date": pd.Timestamp(disclosure_day).normalize(),
+                    "corroboration": source == "13f",
+                    "position_evidence": False,
+                    "as_of": decision_date,
+                }
+            )
     return pd.DataFrame(rows, columns=columns)
 
 

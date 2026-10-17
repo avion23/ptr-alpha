@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from datetime import date
 
+import numpy as np
 import pandas as pd
 
 from analyzer.canonical_scope import canonical_decision
@@ -100,25 +101,24 @@ def compute_skill_table(
         price_dates.notna()
         & (price_dates < cutoff)
         & price_values.notna()
-        & price_values.map(math.isfinite)
+        & np.isfinite(price_values.to_numpy(dtype="float64"))
         & price_values.gt(0)
     ].copy()
     eligible_prices["_date"] = price_dates.loc[eligible_prices.index].dt.normalize()
     eligible_prices["_close"] = price_values.loc[eligible_prices.index]
-    closes = {
-        (str(ticker).strip().upper(), pd.Timestamp(day)): float(close)
-        for ticker, day, close in eligible_prices[
-            ["ticker", "_date", "_close"]
-        ].itertuples(index=False, name=None)
-    }
 
+    # Pass 1: resolve episodes and the exact price keys they will consult.
     disclosure_dates = pd.to_datetime(disclosures["disclosure_date"], errors="coerce")
-    by_actor: dict[str, list[float]] = {}
+    episodes: list[tuple[str, str, pd.Timestamp, pd.Timestamp]] = []
     seen: set[tuple[str, str, pd.Timestamp]] = set()
-    for (_, row), disclosed in zip(disclosures.iterrows(), disclosure_dates):
-        actor = str(row["actor_id"]).strip()
-        ticker = str(row["ticker"]).strip().upper()
-        source = str(row["source"]).strip().lower()
+    identity_columns = disclosures[["actor_id", "ticker", "source"]]
+    windows_by_disclosure: dict[pd.Timestamp, tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for identity_row, disclosed in zip(
+        identity_columns.itertuples(index=False, name=None), disclosure_dates
+    ):
+        actor = str(identity_row[0]).strip()
+        ticker = str(identity_row[1]).strip().upper()
+        source = str(identity_row[2]).strip().lower()
         if source not in _SKILL_SOURCES or not actor or not ticker:
             continue
         if disclosed is None or pd.isna(disclosed) or disclosed >= cutoff:
@@ -129,12 +129,45 @@ def compute_skill_table(
             continue
         seen.add(key)
 
-        entry = next_nyse_session(disclosed).normalize()
-        exit_date = previous_nyse_session(
-            disclosed + pd.Timedelta(days=SKILL_HORIZON_DAYS)
-        ).normalize()
+        windows = windows_by_disclosure.get(disclosed)
+        if windows is None:
+            entry = next_nyse_session(disclosed).normalize()
+            exit_date = previous_nyse_session(
+                disclosed + pd.Timedelta(days=SKILL_HORIZON_DAYS)
+            ).normalize()
+            windows = (entry, exit_date)
+            windows_by_disclosure[disclosed] = windows
+        entry, exit_date = windows
         if entry >= cutoff or exit_date >= cutoff or exit_date < entry:
             continue
+        episodes.append((actor, ticker, entry, exit_date))
+
+    needed: set[tuple[str, pd.Timestamp]] = set()
+    for _, ticker, entry, exit_date in episodes:
+        needed.add((ticker, entry))
+        needed.add((ticker, exit_date))
+        needed.add(("SPY", entry))
+        needed.add(("SPY", exit_date))
+
+    # Pass 2: price dict holds only consulted pairs. Rows are applied in the
+    # same order as the previous full build, so duplicate ticker/date rows
+    # keep the same last-write-wins value; unconsulted pairs are never read.
+    ticker_key_of: dict[object, str] = {}
+    key_cells = eligible_prices["ticker"].to_numpy()
+    day_cells = pd.DatetimeIndex(eligible_prices["_date"])
+    close_cells = eligible_prices["_close"].to_numpy()
+    closes: dict[tuple[str, pd.Timestamp], float] = {}
+    for raw_ticker, day, close in zip(key_cells, day_cells, close_cells):
+        ticker_key = ticker_key_of.get(raw_ticker)
+        if ticker_key is None:
+            ticker_key = str(raw_ticker).strip().upper()
+            ticker_key_of[raw_ticker] = ticker_key
+        pair = (ticker_key, day)
+        if pair in needed:
+            closes[pair] = float(close)
+
+    by_actor: dict[str, list[float]] = {}
+    for actor, ticker, entry, exit_date in episodes:
         security_entry = closes.get((ticker, entry))
         security_exit = closes.get((ticker, exit_date))
         spy_entry = closes.get(("SPY", entry))
@@ -278,23 +311,39 @@ def load_skill_table(
         "unresolved",
     }
     rows = []
-    for index, purchase in purchases.iterrows():
-        source = str(purchase["source"]).strip().lower()
-        disclosed = disclosure_dates.loc[index]
+    has_member = "member" in purchases.columns
+    has_ticker = "ticker" in purchases.columns
+    member_cells = purchases["member"].tolist() if has_member else [None] * len(purchases)
+    ticker_cells = purchases["ticker"].tolist() if has_ticker else [None] * len(purchases)
+    source_cells = purchases["source"].tolist()
+    resolutions: dict[tuple[str, object], object] = {}
+    sessions: dict[pd.Timestamp, tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for source_raw, member, raw_ticker, disclosed in zip(
+        source_cells, member_cells, ticker_cells, disclosure_dates
+    ):
+        source = str(source_raw).strip().lower()
         if source not in _SOURCE_KINDS or pd.isna(disclosed) or disclosed >= cutoff:
             continue
         disclosed = pd.Timestamp(disclosed).normalize()
-        entry = next_nyse_session(disclosed).normalize()
-        exit_date = previous_nyse_session(
-            disclosed + pd.Timedelta(days=SKILL_HORIZON_DAYS)
-        ).normalize()
+        windows = sessions.get(disclosed)
+        if windows is None:
+            entry = next_nyse_session(disclosed).normalize()
+            exit_date = previous_nyse_session(
+                disclosed + pd.Timedelta(days=SKILL_HORIZON_DAYS)
+            ).normalize()
+            windows = (entry, exit_date)
+            sessions[disclosed] = windows
+        entry, exit_date = windows
         if entry >= cutoff or exit_date >= cutoff or exit_date < entry:
             continue
-        member = purchase.get("member")
-        raw_ticker = purchase.get("ticker")
         if not isinstance(member, str) or not isinstance(raw_ticker, str):
             continue
-        resolution = ticker_resolver.resolve(raw_ticker, disclosed.date())
+        resolve_day = disclosed.date()
+        resolution_key = (raw_ticker, resolve_day)
+        resolution = resolutions.get(resolution_key)
+        if resolution is None:
+            resolution = ticker_resolver.resolve(raw_ticker, resolve_day)
+            resolutions[resolution_key] = resolution
         if resolution.status in rejected_ticker_statuses:
             continue
         rows.append(
@@ -405,13 +454,19 @@ def weights_for_candidates(
         )
     )
     candidate_identities: dict[str, set[str]] = {}
-    for _, row in candidates.iterrows():
-        key = str(row["actor_id"])
-        original = row.get("_pre_coalesced_actor_id", key)
+    # Column-major extraction: same per-row merge into identity sets without
+    # the Series construction cost of iterrows. A missing identity column
+    # reads as the actor key itself, matching Series.get's default.
+    has_pre = "_pre_coalesced_actor_id" in candidates.columns
+    pre_cells = (
+        candidates["_pre_coalesced_actor_id"].tolist() if has_pre else None
+    )
+    for index, key_raw in enumerate(candidates["actor_id"].tolist()):
+        key = str(key_raw)
+        original = pre_cells[index] if pre_cells is not None else key
         if pd.isna(original):
             original = key
         candidate_identities.setdefault(key, set()).add(str(original))
-
     skill_table = pd.DataFrame(columns=_SKILL_COLUMNS)
     if actors:
         cutoff = pd.Timestamp(as_of).normalize()

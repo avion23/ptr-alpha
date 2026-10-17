@@ -100,13 +100,62 @@ def _multiset_subset(left: dict, right: dict) -> bool:
     return all(count <= right.get(identity, 0) for identity, count in left.items())
 
 
+def _pop_exact_identity(remaining: list[dict], identity: tuple) -> dict | None:
+    for index, row in enumerate(remaining):
+        if _transaction_identity(row) == identity:
+            return remaining.pop(index)
+    return None
+
+
+def _pop_truncated_asset_match(
+    remaining: list[dict], observer: dict
+) -> dict | None:
+    """Cover an observation whose asset cell was cut short by the observer.
+
+    camelot's lattice/stream modes end an asset cell at a column boundary, so
+    a wrapped name arrives truncated and with ``ticker=None`` ("Fifth Third
+    Bancorp - Common Stock" instead of "... Common Stock (FITB) [ST]...").
+    ``_normalized_asset_identity`` then falls back to the truncated text and
+    the identity can never equal the winner's, which demoted every
+    wrapped-name filing out of the trusted text path into OCR, where one
+    unconfirmed signature page discarded the entire document.
+
+    This is admitted only when the winner resolved a ticker the observer did
+    not, every non-asset field agrees exactly, and the winner's asset text
+    begins with what the observer captured -- i.e. the observer saw a prefix
+    of a row the winner read in full. A row the winner never reported at all
+    still fails, so a genuine engine disagreement cannot be absorbed.
+    """
+    if observer.get("ticker"):
+        return None
+    observed_asset = _normalize_identity_value(observer.get("asset_description"))
+    if not observed_asset:
+        return None
+    observed_rest = _transaction_identity(observer)[1:]
+    for index, row in enumerate(remaining):
+        if not row.get("ticker"):
+            continue
+        if _transaction_identity(row)[1:] != observed_rest:
+            continue
+        if _normalize_identity_value(row.get("asset_description")).startswith(
+            observed_asset
+        ):
+            return remaining.pop(index)
+    return None
+
+
 def _candidate_covers_all(candidate_rows: list[dict], candidates) -> bool:
     """Return whether one candidate covers every observed row multiplicity."""
-    candidate_counts = _candidate_counts(candidate_rows)[0]
-    return all(
-        _multiset_subset(_candidate_counts(rows)[0], candidate_counts)
-        for _, rows in candidates
-    )
+    for _, observed_rows in candidates:
+        remaining = list(candidate_rows)
+        leftovers = []
+        for row in observed_rows:
+            if _pop_exact_identity(remaining, _transaction_identity(row)) is None:
+                leftovers.append(row)
+        for row in leftovers:
+            if _pop_truncated_asset_match(remaining, row) is None:
+                return False
+    return True
 
 
 def _semantic_score(transactions: list[dict]) -> tuple[int, int, int, float]:

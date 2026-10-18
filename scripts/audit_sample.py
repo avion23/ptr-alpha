@@ -35,6 +35,19 @@ Finding 9 fail-closed semantics (report can never manufacture acceptance):
   pooled rate weighted by staged population counts per year (frozen at
   sample time). Without population weights the pooled rate falls back
   to an explicitly-labelled unweighted-stratum mean.
+* Owner-approved error budget (2026-10-18): transaction-critical fields
+  (transaction_type, transaction_date, ticker/asset identity,
+  amount_letter) must be error-free; asset-description TEXT
+  normalization differences (repeated issuer wording dropped, minor
+  spelling) are COSMETIC — flagged and tracked, not blocking.
+  ``record --severity cosmetic`` classifies a fail as cosmetic; the
+  report's ``budget_met`` counts CRITICAL fails only (the one-sided
+  binomial bound applies to the critical rate) while cosmetic fails
+  stay visible (count + docs). Entries recorded before ``--severity``
+  existed carry no severity and count CRITICAL (conservative); the
+  report prints a note so the operator can re-record reclassified
+  items. Critical dominates: an explicit critical fail is never
+  downgraded by a later cosmetic re-record.
 
 Subcommands:
 
@@ -44,11 +57,13 @@ Subcommands:
     review bundle ``audit-review/`` holding the rendered page PNGs and a
     copy of each staging JSON. Deterministic given the seed and staging
     population.
-* ``record  --doc-id ID --verdict pass|fail --notes "..."`
+* ``record  --doc-id ID --verdict pass|fail [--severity critical|cosmetic] --notes "..."`
     APPEND to the ``audit-results.json`` history and stamp the staging
     record's ``audit`` field (the field ``glm_stage.py promote
     --require-audit-pass`` gates on). A later pass never erases an
-    earlier fail from the population assessment.
+    earlier fail from the population assessment. ``--severity``
+    (default critical) classifies a fail: cosmetic fails are tracked
+    separately and do not block promotion (owner-approved budget).
 * ``report  [--max-rate 0.01] [--ground-truth-dir DIR] [--sample-file P]``
     Material-error accounting over the frozen lot with the one-sided
     exact 95% binomial upper bound. Exit codes: 0 complete + budget met,
@@ -98,7 +113,15 @@ DEFAULT_CONFIDENCE = 0.95
 # Fields the audit workflow itself writes into a staging record. They are
 # excluded from the frozen staged-record sha so that recording a verdict is
 # never misread as recipe drift.
-AUDIT_MUTABLE_FIELDS = frozenset({"audit", "audit_notes", "audited_at_utc"})
+AUDIT_MUTABLE_FIELDS = frozenset(
+    {"audit", "audit_severity", "audit_notes", "audited_at_utc"}
+)
+
+# Owner-approved error budget (2026-10-18): transaction-critical fields
+# (transaction_type, transaction_date, ticker/asset identity, amount_letter)
+# must be error-free; asset-description TEXT normalization differences are
+# COSMETIC — tracked, not blocking. ``budget_met`` counts critical fails only.
+VALID_SEVERITIES = ("critical", "cosmetic")
 
 CAVEAT = (
     "LLM-assisted audit — silver standard; not a substitute for human "
@@ -420,6 +443,7 @@ def record_verdict(
     doc_id: str,
     verdict: str,
     notes: str = "",
+    severity: str = "critical",
 ) -> dict:
     """APPEND an audit result to the history and stamp the staging record.
 
@@ -431,9 +455,17 @@ def record_verdict(
     finding 6): ``glm_stage promote`` requires a pass entry whose identity
     still matches the live record, so a re-stage after the audit forces a
     re-audit instead of inheriting the stale verdict.
+
+    ``severity`` (default ``critical``) classifies a FAIL per the
+    owner-approved error budget: ``cosmetic`` = asset-description TEXT
+    normalization issues only, tracked separately and NOT blocking
+    promotion. It is stored on the entry (and stamped as
+    ``audit_severity``) so the report can split the budget math.
     """
     if verdict not in ("pass", "fail"):
         raise ValueError("verdict must be 'pass' or 'fail'")
+    if severity not in VALID_SEVERITIES:
+        raise ValueError("severity must be 'critical' or 'cosmetic'")
     root = staging_root(data_dir)
 
     found_year = None
@@ -450,6 +482,7 @@ def record_verdict(
                 "parsed_at_utc": record.get("parsed_at_utc"),
             }
             record["audit"] = verdict
+            record["audit_severity"] = severity
             record["audit_notes"] = notes
             _atomic_write_json(path, record)
             found_year = int(year_dir.name)
@@ -458,6 +491,7 @@ def record_verdict(
     entry = {
         "doc_id": str(doc_id),
         "verdict": verdict,
+        "severity": severity,
         "notes": notes,
         "audited_at_utc": audited_at,
         "staged_record_sha256": stable_sha,
@@ -482,7 +516,9 @@ def record_verdict(
 
 def cmd_record(args) -> int:
     try:
-        result = record_verdict(args.data_dir, args.doc_id, args.verdict, args.notes)
+        result = record_verdict(
+            args.data_dir, args.doc_id, args.verdict, args.notes, args.severity
+        )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -492,7 +528,15 @@ def cmd_record(args) -> int:
         if result["staging_year"] is not None
         else "no staging record found (results file updated only)"
     )
-    print(f"Recorded {entry['verdict']} for {entry['doc_id']} ({where})")
+    print(
+        f"Recorded {entry['verdict']} "
+        f"(severity: {entry['severity']}) for {entry['doc_id']} ({where})"
+    )
+    if entry["verdict"] == "fail" and entry["severity"] == "cosmetic":
+        print(
+            "Cosmetic fail: tracked separately; does NOT block promotion "
+            "(owner-approved error budget)."
+        )
     print(
         "History is append-only: an earlier fail remains counted for the "
         "population even after a later pass (doc marked repaired)."
@@ -604,8 +648,53 @@ def _verdict_of(entry) -> str | None:
     return None
 
 
-def _weighted_pooled_rate(strata: list[dict], frame_counts: dict) -> tuple[float, str]:
-    """Population-weighted pooled rate; weights = staged counts per year."""
+def _severity_of(entry) -> str | None:
+    """Explicit 'critical'/'cosmetic' severity, else None (legacy entry).
+
+    Entries recorded before ``record --severity`` existed carry no
+    severity field; they resolve conservatively (critical) in
+    :func:`_doc_fail_severity` unless a later explicit classification
+    exists for the doc.
+    """
+    if not isinstance(entry, dict):
+        return None
+    severity = entry.get("severity")
+    if isinstance(severity, str) and severity.lower() in VALID_SEVERITIES:
+        return severity.lower()
+    return None
+
+
+def _doc_fail_severity(fail_entries: list) -> tuple[str, bool]:
+    """(worst severity, legacy-unclassified?) across a doc's fail entries.
+
+    Owner-approved error budget: critical dominates — a doc with any
+    explicitly-critical fail entry stays critical, so re-recording can
+    never launder a critical fail into a cosmetic one. Entries with no
+    explicit severity count as critical ONLY when no fail entry for the
+    doc carries an explicit severity (the conservative default); a later
+    ``record --severity cosmetic`` reclassification then governs — that
+    is the operator's call, never this tool's.
+    """
+    explicit = [
+        severity
+        for entry in fail_entries
+        if (severity := _severity_of(entry)) is not None
+    ]
+    if any(severity == "critical" for severity in explicit):
+        return "critical", False
+    if "cosmetic" in explicit:
+        return "cosmetic", False
+    return "critical", True
+
+
+def _weighted_pooled_rate(
+    strata: list[dict], frame_counts: dict, rate_key: str = "rate"
+) -> tuple[float, str]:
+    """Population-weighted pooled rate; weights = staged counts per year.
+
+    ``rate_key`` selects which per-stratum rate is pooled (the report
+    pools the CRITICAL rate — the budget-relevant one).
+    """
     weights = {}
     for key, count in frame_counts.items():
         try:
@@ -615,15 +704,15 @@ def _weighted_pooled_rate(strata: list[dict], frame_counts: dict) -> tuple[float
     numerator = 0.0
     denominator = 0.0
     for stratum in strata:
-        if stratum["rate"] is None:
+        if stratum.get(rate_key) is None:
             continue
         weight = weights.get(int(stratum["year"]))
         if weight is None:
             continue
-        numerator += weight * stratum["rate"]
+        numerator += weight * stratum[rate_key]
         denominator += weight
     if denominator <= 0.0:
-        rates = [s["rate"] for s in strata if s["rate"] is not None]
+        rates = [s[rate_key] for s in strata if s.get(rate_key) is not None]
         if not rates:
             return float("nan"), (
                 "unavailable (no resolved strata and no population weights)"
@@ -664,6 +753,20 @@ def build_report(
     the staged multiset and it has been promoted; a missing ground-truth
     file is UNRESOLVED, never clean.
 
+    Owner-approved error budget: ``budget_met``, ``rate`` and
+    ``upper_bound`` are computed over CRITICAL fails only
+    (transaction-critical fields: transaction_type, transaction_date,
+    ticker/asset identity, amount_letter). Cosmetic fails (asset-
+    description TEXT normalization differences, recorded with
+    ``--severity cosmetic``) stay in ``failures``/``failure_count`` and
+    are reported via ``cosmetic_failures``/``cosmetic_failure_count``
+    but never block promotion. Omission/invention findings are critical.
+    Fail entries recorded before ``--severity`` existed count critical
+    (conservative) unless an explicit reclassification exists for the
+    doc; such docs are listed in ``legacy_unclassified_failures`` so the
+    operator can re-record them. Critical dominates: an explicit
+    critical fail is never downgraded by a later cosmetic re-record.
+
     ``state`` is "incomplete" (and ``budget_met`` None — the budget can
     not be computed, the report refuses) whenever any sampled doc is
     unresolved or verdicts exist outside the frozen lot.
@@ -686,6 +789,8 @@ def build_report(
     outside_lot = sorted(set(history) - set(lot_by_id)) if lot is not None else []
 
     failures: list[tuple[str, str]] = []
+    failure_records: list[tuple[str, str, str]] = []  # (doc_id, reason, severity)
+    legacy_unclassified: list[str] = []
     unresolved: list[tuple[str, str]] = []
     clean: list[str] = []
     passed_unpromoted: list[str] = []
@@ -701,7 +806,13 @@ def build_report(
         # 1) STICKY failures first: once recorded, a fail is never erased
         #    (neither by a later pass nor by record drift afterwards).
         if "fail" in verdicts:
-            failures.append((doc_id, "verdict:fail"))
+            fail_entries = [
+                entry for entry, verdict in zip(entries, verdicts) if verdict == "fail"
+            ]
+            severity, legacy = _doc_fail_severity(fail_entries)
+            failure_records.append((doc_id, "verdict:fail", severity))
+            if legacy:
+                legacy_unclassified.append(doc_id)
             last_fail = max(i for i, v in enumerate(verdicts) if v == "fail")
             if any(v == "pass" for v in verdicts[last_fail + 1 :]):
                 repaired.append(doc_id)
@@ -772,20 +883,34 @@ def build_report(
                         "invention: staged rows absent from ground truth "
                         f"{detail['invented']}"
                     )
-                failures.append((doc_id, reason))
+                # Omission/invention findings are transaction-critical:
+                # auto-downgrading a row diff to cosmetic is never this
+                # tool's call (severity comes from the operator's record).
+                failure_records.append((doc_id, reason, "critical"))
                 continue
         if doc_id in promoted_doc_ids:
             clean.append(doc_id)
         else:
             passed_unpromoted.append(doc_id)
 
+    # Owner-approved error budget: the binomial math below counts
+    # CRITICAL fails only; cosmetic fails are tracked, not blocking.
+    failures = [(doc_id, reason) for doc_id, reason, _ in failure_records]
+    critical_failures = [
+        (doc_id, reason) for doc_id, reason, s in failure_records if s == "critical"
+    ]
+    cosmetic_failures = [
+        (doc_id, reason) for doc_id, reason, s in failure_records if s == "cosmetic"
+    ]
     failed_ids = {doc_id for doc_id, _ in failures}
+    critical_ids = {doc_id for doc_id, _ in critical_failures}
     unresolved_ids = {doc_id for doc_id, _ in unresolved}
     audited = len(failures) + len(clean) + len(passed_unpromoted)
     failure_count = len(failures)
-    rate = (failure_count / audited) if audited else float("nan")
+    critical_failure_count = len(critical_failures)
+    rate = (critical_failure_count / audited) if audited else float("nan")
     upper = (
-        binomial_upper_bound(failure_count, audited, confidence)
+        binomial_upper_bound(critical_failure_count, audited, confidence)
         if audited
         else float("nan")
     )
@@ -810,6 +935,7 @@ def build_report(
         for year in sorted(per_year):
             docs = per_year[year]
             stratum_failures = sum(1 for d in docs if d in failed_ids)
+            stratum_critical = sum(1 for d in docs if d in critical_ids)
             stratum_unresolved = sum(1 for d in docs if d in unresolved_ids)
             stratum_clean = sum(1 for d in docs if d in clean)
             stratum_unpromoted = sum(1 for d in docs if d in passed_unpromoted)
@@ -820,6 +946,7 @@ def build_report(
                     "docs": len(docs),
                     "resolved": stratum_resolved,
                     "failures": stratum_failures,
+                    "critical_failures": stratum_critical,
                     "unresolved": stratum_unresolved,
                     "clean": stratum_clean,
                     "passed_unpromoted": stratum_unpromoted,
@@ -828,15 +955,22 @@ def build_report(
                         if stratum_resolved
                         else None
                     ),
+                    "critical_rate": (
+                        (stratum_critical / stratum_resolved)
+                        if stratum_resolved
+                        else None
+                    ),
                 }
             )
         if strata:
             if frame_counts_by_year:
                 pooled_rate, pooling_method = _weighted_pooled_rate(
-                    strata, frame_counts_by_year
+                    strata, frame_counts_by_year, rate_key="critical_rate"
                 )
             else:
-                rates = [s["rate"] for s in strata if s["rate"] is not None]
+                rates = [
+                    s["critical_rate"] for s in strata if s["critical_rate"] is not None
+                ]
                 if rates:
                     pooled_rate = sum(rates) / len(rates)
                 pooling_method = (
@@ -850,6 +984,11 @@ def build_report(
         "audited": audited,
         "failures": failures,
         "failure_count": failure_count,
+        "critical_failures": critical_failures,
+        "critical_failure_count": critical_failure_count,
+        "cosmetic_failures": cosmetic_failures,
+        "cosmetic_failure_count": len(cosmetic_failures),
+        "legacy_unclassified_failures": legacy_unclassified,
         "clean": clean,
         "passed_unpromoted": passed_unpromoted,
         "unresolved": unresolved,
@@ -891,6 +1030,10 @@ def _incomplete_state_payload(reason: str, *, max_rate: float, sample_file: str 
         "lot_size": 0,
         "audited": 0,
         "failure_count": 0,
+        "critical_failures": [],
+        "critical_failure_count": 0,
+        "cosmetic_failures": [],
+        "cosmetic_failure_count": 0,
         "unresolved_count": 0,
         "unresolved": [],
         "repaired_count": 0,
@@ -956,17 +1099,42 @@ def cmd_report(args) -> int:
             "pass-verdict docs are only pixel-checked, not row-checked."
         )
     print(f"Audited (resolved) docs:   {report['audited']} of lot {report['lot_size']}")
+    rate_text = pct(report["rate"]) if report["audited"] else "n/a"
     print(
-        f"Material failures:         {report['failure_count']} "
-        f"(sticky; repaired after fail: {report['repaired_count']})"
+        f"Critical fails: {report['critical_failure_count']} (rate {rate_text}) "
+        f"| cosmetic fails: {report['cosmetic_failure_count']}"
     )
-    for doc_id, reason in report["failures"]:
+    print(
+        "  (owner budget: transaction-critical fields must be error-free; "
+        "asset-description text diffs are cosmetic)"
+    )
+    print(
+        f"  (failures are sticky; repaired after fail: {report['repaired_count']})"
+    )
+    for doc_id, reason in report["critical_failures"]:
         print(f"  FAIL {doc_id}: {reason}")
         if doc_id in report["repaired"]:
             print(
                 f"       {doc_id}: a later pass was recorded (doc repaired) but "
                 "the original failure remains counted"
             )
+    for doc_id, reason in report["cosmetic_failures"]:
+        print(f"  COSMETIC-FAIL {doc_id}: {reason} (tracked; not blocking)")
+        if doc_id in report["repaired"]:
+            print(
+                f"       {doc_id}: a later pass was recorded (doc repaired) but "
+                "the original failure remains counted"
+            )
+    if report["legacy_unclassified_failures"]:
+        print(
+            f"NOTE: {len(report['legacy_unclassified_failures'])} fail(s) predate "
+            "--severity and carry no explicit severity; counted CRITICAL "
+            "(conservative). If a fail is asset-description-text only "
+            "(cosmetic), re-record it: record --doc-id <id> --verdict fail "
+            "--severity cosmetic"
+        )
+        for doc_id in report["legacy_unclassified_failures"]:
+            print(f"  LEGACY-UNCLASSIFIED {doc_id}")
     print(f"Clean (pass+promoted):     {len(report['clean'])}")
     print(f"Passed but not promoted:   {len(report['passed_unpromoted'])}")
     if report["unresolved"]:
@@ -990,24 +1158,30 @@ def cmd_report(args) -> int:
         print(
             f"  stratum {stratum['year']}: docs {stratum['docs']} "
             f"resolved {stratum['resolved']} failures {stratum['failures']} "
+            f"(critical {stratum['critical_failures']}) "
             f"unresolved {stratum['unresolved']} rate {rate_text}"
         )
     if report["strata"]:
         pooled = report["pooled_rate"]
         pooled_text = pct(pooled) if not math.isnan(pooled) else "n/a"
-        print(f"Pooled rate [{report['pooling_method']}]: {pooled_text}")
+        print(f"Pooled critical rate [{report['pooling_method']}]: {pooled_text}")
     if report["state"] == "complete" and report["audited"]:
-        print(f"Material-error rate:       {pct(report['rate'])}")
+        print(f"Critical-error rate:       {pct(report['rate'])}")
         print(
-            f"One-sided exact {report['confidence']:.0%} upper bound: "
-            f"{pct(report['upper_bound'])}"
+            f"One-sided exact {report['confidence']:.0%} upper bound "
+            f"(critical): {pct(report['upper_bound'])}"
         )
         met = report["budget_met"]
         print(
-            f"Owner budget (material-error rate < {pct(report['max_rate'])} "
+            f"Owner budget (critical-error rate < {pct(report['max_rate'])} "
             f"at {report['confidence']:.0%} confidence): "
             f"{'MET' if met else 'NOT MET'}"
         )
+        if met and report["cosmetic_failure_count"]:
+            print(
+                f"Cosmetic fails: {report['cosmetic_failure_count']} — "
+                "tracked, do not block promotion (owner-approved budget)."
+            )
         if not met:
             print(
                 "Canonical promotion of the audited population is not "
@@ -1031,6 +1205,14 @@ def cmd_report(args) -> int:
             "lot_size": report["lot_size"],
             "audited": report["audited"],
             "failure_count": report["failure_count"],
+            "critical_failures": [
+                [d, r] for d, r in report["critical_failures"]
+            ],
+            "critical_failure_count": report["critical_failure_count"],
+            "cosmetic_failures": [
+                [d, r] for d, r in report["cosmetic_failures"]
+            ],
+            "cosmetic_failure_count": report["cosmetic_failure_count"],
             "unresolved_count": report["unresolved_count"],
             "unresolved": [[d, r] for d, r in report["unresolved"]],
             "repaired_count": report["repaired_count"],
@@ -1053,6 +1235,14 @@ def cmd_report(args) -> int:
             "lot_size": report["lot_size"],
             "audited": report["audited"],
             "failure_count": report["failure_count"],
+            "critical_failures": [
+                [d, r] for d, r in report["critical_failures"]
+            ],
+            "critical_failure_count": report["critical_failure_count"],
+            "cosmetic_failures": [
+                [d, r] for d, r in report["cosmetic_failures"]
+            ],
+            "cosmetic_failure_count": report["cosmetic_failure_count"],
             "unresolved_count": 0,
             "unresolved": [],
             "repaired_count": report["repaired_count"],
@@ -1103,10 +1293,22 @@ def main(argv: list[str] | None = None) -> int:
     p_record = subparsers.add_parser("record", help="record one doc's audit verdict")
     p_record.add_argument("--doc-id", required=True)
     p_record.add_argument("--verdict", choices=["pass", "fail"], required=True)
+    p_record.add_argument(
+        "--severity",
+        choices=list(VALID_SEVERITIES),
+        default="critical",
+        help=(
+            "fail classification per the owner-approved error budget "
+            "(default: critical). cosmetic = asset-description TEXT "
+            "normalization issues only; tracked, not blocking promotion."
+        ),
+    )
     p_record.add_argument("--notes", default="")
 
     p_report = subparsers.add_parser(
-        "report", help="material-error rate + binomial budget check (fail-closed)"
+        "report",
+        help="critical-error rate + binomial budget check (fail-closed; "
+        "cosmetic fails tracked, not blocking)",
     )
     p_report.add_argument(
         "--max-rate",

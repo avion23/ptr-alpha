@@ -10,6 +10,9 @@ Reproduces the Astra probes as regression tests:
 * omission detection compares row MULTISETS, not counts.
 * population-weighted pooling math on a known small case.
 * determinism of sampling, freezing, and reporting.
+* owner error budget: cosmetic fails (asset-description text) are
+  tracked but never block promotion; ``budget_met`` counts critical
+  fails only; legacy entries without severity count critical.
 
 Every case runs in temporary directories; ``data/congress.duckdb`` is
 never opened and no model calls are made.
@@ -84,8 +87,12 @@ def pass_entry(doc_id: str, at: str = "t1") -> dict:
     return {"doc_id": doc_id, "verdict": "pass", "notes": "", "audited_at_utc": at}
 
 
-def fail_entry(doc_id: str, at: str = "t1", notes: str = "") -> dict:
-    return {"doc_id": doc_id, "verdict": "fail", "notes": notes, "audited_at_utc": at}
+def fail_entry(doc_id: str, at: str = "t1", notes: str = "", severity: str | None = None) -> dict:
+    """A fail entry; ``severity=None`` simulates a legacy (pre---severity) entry."""
+    entry = {"doc_id": doc_id, "verdict": "fail", "notes": notes, "audited_at_utc": at}
+    if severity is not None:
+        entry["severity"] = severity
+    return entry
 
 
 @pytest.fixture
@@ -635,3 +642,266 @@ def test_identity_bound_entries_keep_report_state_semantics(data_dir):
     assert report["state"] == "complete"
     assert report["clean"] == ["id2"]
     assert report["unresolved_count"] == 0
+
+
+# --------------------------------------------------------------------------
+# owner error budget: transaction-critical vs cosmetic fails
+# --------------------------------------------------------------------------
+
+
+def test_record_severity_defaults_critical_and_validates(data_dir):
+    write_record(data_dir, make_record("r1"))
+    write_record(data_dir, make_record("r2"))
+    audit_sample.record_verdict(data_dir, "r1", "fail", "wrong tx_date")  # default
+    audit_sample.record_verdict(
+        data_dir, "r2", "fail", "issuer wording dropped", severity="cosmetic"
+    )
+    entries = json.loads(
+        (audit_sample.staging_root(data_dir) / "audit-results.json").read_text()
+    )
+    assert entries[0]["severity"] == "critical"  # backward-compatible default
+    assert entries[1]["severity"] == "cosmetic"
+    with pytest.raises(ValueError):
+        audit_sample.record_verdict(data_dir, "r1", "fail", severity="minor")
+
+    # The severity stamp is audit-mutable: it must never read as recipe drift.
+    stamped = json.loads(
+        (audit_sample.staging_root(data_dir) / "2024" / "r2.json").read_text()
+    )
+    assert stamped["audit_severity"] == "cosmetic"
+
+
+def test_severity_stamp_does_not_break_frozen_sha():
+    record = make_record("r3")
+    lot = audit_sample.freeze_lot([(2024, record)], [{"doc_id": "r3", "year": 2024}])
+    stamped = dict(
+        record, audit="fail", audit_severity="cosmetic", audit_notes="x", audited_at_utc="t"
+    )
+    report = audit_sample.build_report(
+        [fail_entry("r3", severity="cosmetic")],
+        {"r3": []},
+        set(),
+        lot=lot,
+        staged_records_by_doc={"r3": stamped},
+    )
+    assert report["state"] == "complete"  # stamping is not drift
+    assert report["cosmetic_failure_count"] == 1
+
+
+def test_cosmetic_only_fail_meets_budget_with_zero_critical_rate():
+    """299 docs, 1 cosmetic fail: critical rate 0 -> bound ~0.997% <= 1%."""
+    results = [fail_entry("c1", severity="cosmetic")]
+    results += [pass_entry(f"p{i}") for i in range(298)]
+    promoted = {f"p{i}" for i in range(298)}
+    report = audit_sample.build_report(results, {}, promoted)
+    assert report["state"] == "complete"
+    assert report["failure_count"] == 1  # still a recorded (sticky) failure
+    assert ("c1", "verdict:fail") in report["failures"]
+    assert report["critical_failure_count"] == 0
+    assert report["cosmetic_failures"] == [("c1", "verdict:fail")]
+    assert report["cosmetic_failure_count"] == 1
+    assert report["rate"] == 0.0  # budget math is critical-only
+    assert report["upper_bound"] <= 0.01
+    assert report["budget_met"] is True  # cosmetic fails do NOT block
+
+
+def test_mixed_severities_budget_reflects_critical_only():
+    """Same n, same total fail count; only the severity flips the budget."""
+
+    def cohort(severity):
+        results = [fail_entry("x1", severity=severity)]
+        results += [pass_entry(f"p{i}") for i in range(399)]
+        return results, {f"p{i}" for i in range(399)}
+
+    results, promoted = cohort("critical")
+    critical_report = audit_sample.build_report(results, {}, promoted)
+    assert critical_report["failure_count"] == 1
+    assert critical_report["critical_failure_count"] == 1
+    assert critical_report["cosmetic_failure_count"] == 0
+    assert critical_report["rate"] == pytest.approx(1 / 400)
+    assert critical_report["budget_met"] is False  # bound(1, 400) ~ 1.3% > 1%
+
+    results, promoted = cohort("cosmetic")
+    cosmetic_report = audit_sample.build_report(results, {}, promoted)
+    assert cosmetic_report["failure_count"] == 1  # total unchanged
+    assert cosmetic_report["critical_failure_count"] == 0
+    assert cosmetic_report["cosmetic_failure_count"] == 1
+    assert cosmetic_report["rate"] == 0.0
+    assert cosmetic_report["budget_met"] is True  # bound(0, 400) ~ 0.75% <= 1%
+
+
+def test_legacy_fail_without_severity_counts_critical_conservatively():
+    report = audit_sample.build_report([fail_entry("L1")], {}, set())
+    assert report["critical_failure_count"] == 1
+    assert report["cosmetic_failure_count"] == 0
+    assert report["legacy_unclassified_failures"] == ["L1"]
+    assert report["budget_met"] is False
+
+
+def test_reclassification_via_rerecord_with_severity_cosmetic():
+    """Operator re-records a legacy fail as cosmetic: the explicit call governs."""
+    results = [fail_entry("L2"), fail_entry("L2", at="t2", severity="cosmetic")]
+    report = audit_sample.build_report(results, {}, set())
+    assert report["failures"] == [("L2", "verdict:fail")]  # still sticky
+    assert report["critical_failure_count"] == 0
+    assert report["cosmetic_failure_count"] == 1
+    assert report["legacy_unclassified_failures"] == []
+    assert report["repaired_count"] == 0  # fail -> fail is not a repair
+
+
+def test_critical_fail_is_never_downgraded_by_later_cosmetic_rerecord():
+    results = [
+        fail_entry("L3", severity="critical"),
+        fail_entry("L3", at="t2", severity="cosmetic"),
+    ]
+    report = audit_sample.build_report(results, {}, set())
+    assert report["critical_failure_count"] == 1
+    assert report["cosmetic_failure_count"] == 0
+    assert report["budget_met"] is False
+
+
+def test_omission_failures_count_critical():
+    """Row-multiset mismatches are transaction-critical; no auto-downgrade."""
+    import tempfile
+
+    staged = [["A", "Purchase", "01/15/24", None, "A"]]
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "o1.json").write_text(
+            json.dumps(
+                {
+                    "rows": [
+                        ["A", "Purchase", "01/15/24", None, "A"],
+                        ["A2", "Sale", "01/16/24", None, "A"],
+                    ]
+                }
+            )
+        )
+        report = audit_sample.build_report(
+            [pass_entry("o1")], {"o1": staged}, {"o1"}, ground_truth_dir=td
+        )
+    assert report["failures"] == [("o1", "omission: ground-truth rows 2 > staged rows 1")]
+    assert report["critical_failure_count"] == 1
+    assert report["cosmetic_failure_count"] == 0
+
+
+def test_cli_report_prints_critical_cosmetic_split(data_dir, capsys):
+    for i in range(3):
+        write_record(data_dir, make_record(f"m{i}"))
+    write_envelope(data_dir, seed=13)
+    root = audit_sample.staging_root(data_dir)
+    (root / "audit-results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "doc_id": "m0",
+                    "verdict": "fail",
+                    "severity": "critical",
+                    "notes": "wrong tx type",
+                    "audited_at_utc": "t",
+                },
+                {
+                    "doc_id": "m1",
+                    "verdict": "fail",
+                    "severity": "cosmetic",
+                    "notes": "issuer wording dropped",
+                    "audited_at_utc": "t",
+                },
+                {"doc_id": "m2", "verdict": "pass", "notes": "", "audited_at_utc": "t"},
+            ]
+        )
+    )
+    (root / "promoted.jsonl").write_text('{"doc_id": "m2"}\n')
+
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])
+    out = capsys.readouterr().out
+    assert rc == 1  # 1 critical fail in 3 -> bound > 1%
+    assert "Critical fails: 1 (rate" in out
+    assert "| cosmetic fails: 1" in out
+    assert "FAIL m0: verdict:fail" in out
+    assert "COSMETIC-FAIL m1" in out
+    assert "tracked; not blocking" in out
+    assert "NOT MET" in out
+
+
+def test_cli_report_legacy_fail_prints_reclassify_note_and_counts_critical(data_dir, capsys):
+    write_record(data_dir, make_record("L9"))
+    write_envelope(data_dir, seed=9)
+    root = audit_sample.staging_root(data_dir)
+    # Legacy entry: written before --severity existed (no severity field).
+    (root / "audit-results.json").write_text(json.dumps([fail_entry("L9")]))
+
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])
+    out = capsys.readouterr().out
+    assert rc == 1  # conservative: 1 critical fail in 1 -> NOT MET
+    assert "counted CRITICAL" in out
+    assert "--severity cosmetic" in out
+    assert "LEGACY-UNCLASSIFIED L9" in out
+    state = json.loads((root / "audit-report-state.json").read_text())
+    assert state["critical_failure_count"] == 1
+    assert state["cosmetic_failure_count"] == 0
+
+
+def test_state_file_gains_critical_failures_and_keeps_v2_contract(data_dir, capsys):
+    write_record(data_dir, make_record("S1"))
+    write_envelope(data_dir, seed=11)
+    audit_sample.record_verdict(
+        data_dir, "S1", "fail", "asset description spacing", severity="cosmetic"
+    )
+
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])
+    assert rc == 1  # complete; 0 critical in 1 -> bound 95% > 1%
+    state = json.loads(
+        (audit_sample.staging_root(data_dir) / "audit-report-state.json").read_text()
+    )
+    # Unchanged audit-report-state-v2 contract keys:
+    for key in (
+        "schema", "state", "reason", "budget_met", "lot_size", "audited",
+        "failure_count", "unresolved_count", "unresolved", "repaired_count",
+        "rate", "upper_bound", "confidence", "max_rate", "pooled_rate",
+        "pooling_method", "sample_file", "caveat", "generated_at_utc",
+    ):
+        assert key in state, key
+    assert state["schema"] == "audit-report-state-v2"  # UNCHANGED
+    assert state["state"] == "complete"
+    assert state["budget_met"] is False
+    assert state["rate"] == 0.0          # budget math is critical-only
+    assert state["upper_bound"] > 0.01
+    assert state["failure_count"] == 1   # total failures keep their meaning
+    # New keys alongside the existing fields:
+    assert state["critical_failures"] == []
+    assert state["critical_failure_count"] == 0
+    assert state["cosmetic_failures"] == [["S1", "verdict:fail"]]
+    assert state["cosmetic_failure_count"] == 1
+
+
+def test_incomplete_state_payload_carries_severity_keys(data_dir, capsys):
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])  # no lot
+    assert rc == 2
+    state = json.loads(
+        (audit_sample.staging_root(data_dir) / "audit-report-state.json").read_text()
+    )
+    assert state["schema"] == "audit-report-state-v2"
+    assert state["critical_failures"] == []
+    assert state["critical_failure_count"] == 0
+    assert state["cosmetic_failures"] == []
+    assert state["cosmetic_failure_count"] == 0
+    assert state["budget_met"] is None
+
+
+def test_cli_record_accepts_severity_flag(data_dir, capsys):
+    write_record(data_dir, make_record("c9"))
+    rc = audit_sample.main(
+        [
+            "--data-dir", str(data_dir), "record",
+            "--doc-id", "c9", "--verdict", "fail",
+            "--severity", "cosmetic", "--notes", "text-only",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "severity: cosmetic" in out
+    assert "does NOT block promotion" in out
+    (entry,) = json.loads(
+        (audit_sample.staging_root(data_dir) / "audit-results.json").read_text()
+    )
+    assert entry["severity"] == "cosmetic"

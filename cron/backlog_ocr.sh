@@ -19,6 +19,22 @@ printf 'ocr backlog start: %s UTC (repo %s @ %s)\n' \
     "$(date -u --iso-8601=seconds)" "$repo" "$git_sha"
 cd "$repo"
 
+# Engine-B dual-read credentials live outside the repo (0600, operator-
+# managed). Missing file means a plain single-engine drain, exactly as
+# before — not an error.
+if [ -f "${HOME}/.config/ptr-backlog/env" ]; then
+    # shellcheck disable=SC1091  # machine-local operator file
+    . "${HOME}/.config/ptr-backlog/env"
+fi
+# Mark the (possibly non-exporting) operator file for the child interpreter.
+export DUAL_READ VISION_B_BASE_URL VISION_B_MODEL VISION_B_TIMEOUT VISION_B_API_KEY
+engine_b="no"
+if [ -n "${VISION_B_BASE_URL:-}" ] && [ -n "${VISION_B_MODEL:-}" ]; then
+    engine_b="yes"
+fi
+printf 'dual-read: DUAL_READ=%s engine_b_configured=%s\n' \
+    "${DUAL_READ:-}" "$engine_b"
+
 timeout 21600 python3 scripts/ocr_zero_rows.py
 ocr_rc=$?
 printf 'ocr backlog done: exit=%d\n' "$ocr_rc"

@@ -34,9 +34,11 @@ An engine-B response that arrives but violates the extraction schema is NOT
 treated as "engine absent" (that would silently reintroduce single-model
 hallucination risk): it is fail-closed into the DISAGREE review inventory.
 
-Wiring is opt-in only: ``DUAL_READ=1`` in the OCR worker
-(``scripts/ocr_zero_rows.run_gemini_ocr_for_year``). The nightly cron and
-``refresh --gemini-ocr`` defaults are unchanged.
+Wiring is opt-in only: ``DUAL_READ=1`` (plus engine-B configuration) in the
+OCR workers — ``scripts/ocr_zero_rows.main`` (the nightly backlog cron, whose
+wrapper sources the operator's engine-B env when present) and
+``run_gemini_ocr_for_year`` (``refresh --gemini-ocr``). Unset (the default)
+keeps every path single-engine.
 """
 
 from __future__ import annotations
@@ -302,14 +304,17 @@ def dual_read(
             text_b = read_b(images)
         else:
             text_b = read_document_with_vision_b(images, config)
-    except VisionBUnavailable:
-        # Engine B absent: fallback to A-only, never an exception.
+    except VisionBUnavailable as exc:
+        # Engine B absent: fallback to A-only, never an exception. The reason
+        # rides along in diff_summary so callers can tell a quota/rate-limit
+        # stop (is_quota_error) from a transient outage.
         return (
             DualDecision(
                 A_ONLY,
                 gemini.GEMINI_PARSER_VERSION,
                 gemini.MODEL,
                 raw_row_count=raw_row_count,
+                diff_summary=str(exc),
                 output=output,
                 metadata=metadata,
             ),

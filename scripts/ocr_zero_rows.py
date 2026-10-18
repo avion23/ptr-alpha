@@ -17,7 +17,10 @@ from pathlib import Path
 
 from analyzer.database import Database
 from analyzer.vision_engines import (
+    A_ONLY,
     DualReadDoc,
+    VisionBConfig,
+    VisionBUnavailable,
     dual_read_enabled,
     run_dual_read_for_doc,
 )
@@ -1715,6 +1718,19 @@ def validate_for_insert(conn, doc_id, member, transactions):
     )
 
 
+def _engine_b_configured() -> bool:
+    """True when an engine-B endpoint is configured for dual read.
+
+    An unusable configuration (e.g. invalid VISION_B_TIMEOUT) degrades to the
+    single-engine drain rather than crashing the nightly batch — the same
+    tolerance dual_read() applies internally via the A_ONLY fallback.
+    """
+    try:
+        return VisionBConfig.from_env() is not None
+    except VisionBUnavailable:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="OCR zero-row House PTR PDFs with Gemini"
@@ -1736,10 +1752,52 @@ def main():
 
         time.sleep(COOLDOWN)
 
-        output, error, artifact_metadata = call_gemini(
-            path, doc_id=doc_id, refresh=args.refresh
-        )
-        if is_quota_error(error):
+        if dual_read_enabled() and _engine_b_configured():
+            # Opt-in dual vision read (DUAL_READ=1 + engine B configured):
+            # engine A (Gemini) is gated against engine B per doc. AGREE and
+            # DISAGREE are persisted or quarantined by the orchestrator
+            # (per-doc commit inside insert_transactions/record_disagreement);
+            # engine-B absence falls through to the unchanged single-engine
+            # path below with A's result, so a DISAGREE never retries forever
+            # (the invalid/validated run row leaves the work list).
+            outcome = run_dual_read_for_doc(
+                DualReadDoc(
+                    str(doc_id),
+                    year,
+                    path,
+                    data_dir=os.path.dirname(DB_PATH) or ".",
+                    db_path=DB_PATH,
+                ),
+                refresh=args.refresh,
+            )
+            total_inserted += outcome.inserted
+            if outcome.handled:
+                mark_progress(progress, doc_id, outcome.progress_key)
+                save_progress(progress)
+                print(
+                    f"  DUAL {outcome.decision.status}: inserted={outcome.inserted}",
+                    flush=True,
+                )
+                continue
+            if outcome.decision.status == A_ONLY and is_quota_error(
+                outcome.decision.diff_summary or ""
+            ):
+                # Engine-B quota stop must end the batch cleanly: continuing
+                # would drain the backlog as ungated A-only rows.
+                print("  Engine B quota exhausted; stopping batch", flush=True)
+                break
+            output, error, artifact_metadata = (
+                outcome.output,
+                outcome.error,
+                outcome.metadata,
+            )
+        else:
+            output, error, artifact_metadata = call_gemini(
+                path, doc_id=doc_id, refresh=args.refresh
+            )
+        # A_ONLY passthrough carries error=None (engine A succeeded); the
+        # single-engine path always has a string here.
+        if is_quota_error(error or ""):
             print("  Quota exhausted; stopping batch", flush=True)
             break
         ingestion_generation = None
@@ -1863,7 +1921,8 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
                 cache_dir=os.path.join(data_dir, "gemini_cache"),
                 parser_version=GEMINI_PARSER_VERSION,
             )
-        if is_quota_error(error):
+        # A_ONLY passthrough carries error=None (engine A succeeded).
+        if is_quota_error(error or ""):
             print("  Quota exhausted; stopping batch", flush=True)
             break
         ingestion_generation = None

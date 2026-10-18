@@ -32,6 +32,8 @@ LOADERS = {
 # Exact exemptions, with reasons. Counts are AST sites, not source line numbers.
 EXEMPT = {
     "scripts/audit_generation.py:_get_unresolved_house_doc_ids": 1,  # Current ingestion audit.
+    "scripts/purge_unaccepted_house_rowsets.py:<module>": 2,  # One-time contamination report (report-only default; reads the leak it measures).
+    "scripts/purge_unaccepted_house_rowsets.py:main": 5,  # One-time contamination cleanup (--apply archives to transaction_versions before delete; FP finding 2 follow-up).
     "scripts/audit_generation.py:check_canary_counts": 1,  # Current canary inventory.
     "scripts/audit_generation.py:check_date_domain": 6,  # Validate stored date domains, not decisions.
     "scripts/audit_generation.py:check_duplicate_policy": 3,  # Current duplicate audit.
@@ -78,6 +80,7 @@ EXEMPT = {
     "src/analyzer/form13f.py:ThirteenFSource.get_transactions": 1,  # Caller-owned source forwarding.
     "src/analyzer/form4.py:Form4Source.get_transactions": 1,  # Caller-owned source forwarding.
     "src/analyzer/freshness.py:form4_freshness": 1,  # Monitoring aggregate: newest form4 disclosure date, not decision selection.
+    "src/analyzer/freshness.py:house_ingestion_freshness": 1,  # Monitoring aggregate: newest House disclosure date, not decision selection.
     "src/analyzer/parse_run_repository.py:ParseRunRepository.upsert": 1,  # Ingestion timestamp provenance.
     "src/analyzer/pipeline.py:_analysis_transactions": 1,  # Caller-owned: scoped prepare_analysis_data.
     "src/analyzer/positions.py:_member_variants": 2,  # Caller-owned identity expansion; name monitored.
@@ -99,6 +102,7 @@ EXEMPT = {
     "src/analyzer/transaction_repository.py:TransactionRepository.upsert": 4,  # Persistence/deduplication.
     "src/analyzer/transaction_repository.py:drop_already_stored": 1,  # Ingestion deduplication.
     "src/analyzer/vision_engines.py:record_disagreement": 1,  # Ingestion retirement of disagreed dual-read rows.
+    "src/analyzer/vision_engines.py:record_unresolved": 1,  # Ingestion retirement of unresolved dual-read docs (engine B absent); mirrors _record_failed_ocr_attempt.
 }
 
 

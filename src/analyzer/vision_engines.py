@@ -24,15 +24,34 @@ Decisions, per document (``docs/reviews/extraction-pipeline-fp-20261018.md``):
   ``invalid``, which the generation-acceptance predicates already treat as a
   reviewed/no-rows terminal state) and both readings are stored as JSON in
   the run's ``error_message`` notes column.
-* ``A_ONLY`` — engine B unconfigured or unavailable (transport failure,
-  timeout, malformed envelope): fall back to A alone under
-  ``v5-gemini-validated`` — byte-for-byte today's behavior, never an error.
+* ``UNRESOLVED`` — engine B unavailable (unconfigured, transport failure,
+  timeout, HTTP error, malformed envelope, quota): the doc goes to the
+  retry/review state (an ``error`` parse run that keeps it on the OCR work
+  list) and NOTHING persists from either side. "Both readers must agree"
+  means B absent is unresolved, never A-only agreement. The only A-only
+  persistence allowed anywhere is the explicit legacy Gemini-only mode
+  (``OCR_ENGINE`` unset/``gemini``). Quota-shaped B failures additionally
+  stop the caller's batch.
 * ``A_ERROR`` — engine A itself failed: the caller's existing failed-attempt
   handling records it.
 
 An engine-B response that arrives but violates the extraction schema is NOT
 treated as "engine absent" (that would silently reintroduce single-model
 hallucination risk): it is fail-closed into the DISAGREE review inventory.
+
+Engine-B client failures are classified (FP review 2026-10-18 finding 7):
+
+* ``TransientVisionBError`` — 5xx, timeout/transport, malformed envelope,
+  and truncated completions (``finish_reason="length"``, rejected as
+  ``TruncatedCompletion``): retriable; ``scripts/glm_stage`` bounds the
+  retries (2, jittered backoff, cached page renders).
+* ``VisionBQuotaError`` — HTTP 429 / Z.AI error code 1302 / quota wording:
+  never retried per-doc; callers stop the batch.
+* ``VisionBAuthError`` (401/403) and other ``VisionBPermanentError`` (400…)
+  — no retry, alert.
+* ``VisionBConfigError`` — missing/invalid configuration: alert, no retry.
+Non-200 response bodies are retained (bounded to 300 chars) inside the
+exception so error classification survives logging.
 
 Wiring is opt-in only: ``DUAL_READ=1`` (plus engine-B configuration) in the
 OCR workers — ``scripts/ocr_zero_rows.main`` (the nightly backlog cron, whose
@@ -61,7 +80,7 @@ from analyzer.vision_agreement import (
 
 DUAL_PARSER_VERSION = "v6-dual-validated"
 DUAL_ENGINES_ATTEMPTED = "gemini+visionb"
-A_ONLY = "A_ONLY"
+UNRESOLVED = "UNRESOLVED"
 A_ERROR = "A_ERROR"
 DUAL_READ_ENV = "DUAL_READ"
 
@@ -71,17 +90,74 @@ VISION_B_API_KEY_ENV = "VISION_B_API_KEY"
 VISION_B_TIMEOUT_ENV = "VISION_B_TIMEOUT"
 DEFAULT_VISION_B_TIMEOUT = 180.0
 PAGE_RENDER_DPI = 200
+SNIPPET_LIMIT = 300  # bounded non-200/partial body retained in exceptions
 
 ReasonSchemaInvalid = "visionb_schema_invalid"
 ReasonRowMismatch = "row_mismatch"
 
 
 class VisionBUnavailable(Exception):
-    """Engine B is absent for this run: transport failure, timeout, or a
+    """Engine B could not produce a usable reading.
 
-    malformed response envelope. Callers fall back to engine A alone — this is
-    never a parse failure and never blocks the pipeline.
+    Base class for every engine-B client failure. On the dual path an absent
+    engine B is UNRESOLVED — the doc is retried/reviewed, never persisted as
+    an A-only agreement.
     """
+
+
+class TransientVisionBError(VisionBUnavailable):
+    """Retriable engine-B failure: 5xx, timeout/transport, malformed
+    envelope, or a truncated completion. ``scripts/glm_stage`` bounds the
+    retries (2, jittered backoff, cached page renders) before recording an
+    error; a later run may safely retry the document."""
+
+
+class TruncatedCompletion(TransientVisionBError):
+    """The endpoint returned ``finish_reason="length"``: the completion was
+    cut off mid-answer. Accepted payloads must be complete — this is a
+    rejection, not a reading."""
+
+
+class VisionBQuotaError(VisionBUnavailable):
+    """Quota/rate-limit exhausted (HTTP 429, Z.AI error code 1302, quota
+    wording). Never retried per-doc; callers stop the batch."""
+
+
+class VisionBPermanentError(VisionBUnavailable):
+    """Non-retriable request defect (HTTP 400/404/413/422...). No retry."""
+
+
+class VisionBAuthError(VisionBPermanentError):
+    """Credentials rejected (HTTP 401/403). No retry; alert the operator."""
+
+
+class VisionBConfigError(VisionBUnavailable):
+    """Missing or invalid engine-B configuration. No retry; alert."""
+
+
+def classify_visionb_error(exc: BaseException) -> str:
+    """One-word machine-readable kind for staging records and alerts."""
+    if isinstance(exc, VisionBQuotaError):
+        return "quota"
+    if isinstance(exc, VisionBAuthError):
+        return "auth"
+    if isinstance(exc, VisionBConfigError):
+        return "config"
+    if isinstance(exc, TruncatedCompletion):
+        return "truncated"
+    if isinstance(exc, TransientVisionBError):
+        return "transient"
+    if isinstance(exc, VisionBPermanentError):
+        return "permanent"
+    return "parse"
+
+
+def _snippet(text: str, limit: int = SNIPPET_LIMIT) -> str:
+    """Collapse whitespace and bound an error body so it stays loggable."""
+    collapsed = " ".join(str(text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 3] + "..."
 
 
 @dataclass(frozen=True)
@@ -107,11 +183,11 @@ class VisionBConfig:
             try:
                 timeout = float(raw_timeout)
             except ValueError as exc:
-                raise VisionBUnavailable(
+                raise VisionBConfigError(
                     f"invalid {VISION_B_TIMEOUT_ENV}: {raw_timeout!r}"
                 ) from exc
             if timeout <= 0:
-                raise VisionBUnavailable(
+                raise VisionBConfigError(
                     f"invalid {VISION_B_TIMEOUT_ENV}: {raw_timeout!r}"
                 )
         api_key = str(source.get(VISION_B_API_KEY_ENV) or "").strip() or None
@@ -140,8 +216,13 @@ def read_document_with_vision_b(
 
     The prompt is the SAME transaction-extraction prompt the Gemini path uses
     (imported, never forked). All pages travel in one chat-completions request
-    so engine B answers for the whole document in the shared schema. Any
-    transport/HTTP/envelope problem raises ``VisionBUnavailable``.
+    so engine B answers for the whole document in the shared schema. Failures
+    raise a classified ``VisionBUnavailable`` subclass: transport/timeout and
+    5xx are ``TransientVisionBError``; 429/1302/quota is
+    ``VisionBQuotaError``; 401/403 is ``VisionBAuthError``; other 4xx is
+    ``VisionBPermanentError``; ``finish_reason="length"`` is rejected as
+    ``TruncatedCompletion``. Non-200 bodies travel (bounded to
+    ``SNIPPET_LIMIT`` chars) inside the exception so classification survives.
     """
     if not page_data_urls:
         raise VisionBUnavailable("visionb requires at least one page image")
@@ -173,19 +254,68 @@ def read_document_with_vision_b(
             url, json=payload, headers=headers, timeout=config.timeout
         )
     except requests.RequestException as exc:
-        raise VisionBUnavailable(f"visionb transport failure: {exc}") from exc
+        raise TransientVisionBError(
+            f"visionb transport failure: {exc}"
+        ) from exc
     if response.status_code != 200:
-        raise VisionBUnavailable(f"visionb http {response.status_code}")
+        raise _classify_http_error(
+            response.status_code, _snippet(_response_body(response))
+        )
     try:
         body = response.json()
-        text = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0]
+        text = choice["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as exc:
-        raise VisionBUnavailable(
+        raise TransientVisionBError(
             f"visionb malformed response envelope: {exc}"
         ) from exc
     if not isinstance(text, str) or not text.strip():
-        raise VisionBUnavailable("visionb empty completion")
+        raise TransientVisionBError("visionb empty completion")
+    finish_reason = (
+        choice.get("finish_reason") if isinstance(choice, dict) else None
+    )
+    if str(finish_reason or "").strip().lower() == "length":
+        raise TruncatedCompletion(
+            "visionb truncated completion (finish_reason=length; rejecting "
+            f"incomplete output): {_snippet(text)}"
+        )
     return text
+
+
+def _response_body(response) -> str:
+    try:
+        return response.text
+    except Exception:  # body unreadable: keep the classification, drop text
+        return ""
+
+
+def _classify_http_error(status_code: int, snippet: str) -> VisionBUnavailable:
+    """Map an HTTP failure onto the transient/stop/alert classification.
+
+    Z.AI signals quota exhaustion with HTTP 429 (optionally body error code
+    1302, "Rate limit reached for requests" per docs.z.ai/api-reference/
+    api-code); 401/403 are credential defects; other 4xx are request
+    defects; 5xx is transient overload.
+    """
+    lowered = snippet.lower()
+    quota_hit = status_code == 429 or "1302" in lowered or (
+        "quota" in lowered
+        or "rate limit" in lowered
+        or "throttl" in lowered
+        or "insufficient balance" in lowered
+        or "arrears" in lowered
+    )
+    if quota_hit:
+        return VisionBQuotaError(
+            f"visionb quota/rate-limit exhausted (http {status_code}): {snippet}"
+        )
+    if status_code in (401, 403):
+        return VisionBAuthError(
+            f"visionb auth rejected (http {status_code}): {snippet}"
+        )
+    if 400 <= status_code < 500:
+        return VisionBPermanentError(f"visionb http {status_code}: {snippet}")
+    return TransientVisionBError(f"visionb http {status_code}: {snippet}")
 
 
 def read_document_with_engine_b(
@@ -212,7 +342,7 @@ def read_document_with_engine_b(
         except VisionBUnavailable:
             config = None
     if config is None:
-        raise VisionBUnavailable(
+        raise VisionBConfigError(
             "visionb is not configured: set VISION_B_BASE_URL and VISION_B_MODEL"
         )
     if page_count is None:
@@ -262,15 +392,17 @@ class DualReadDoc:
 
 @dataclass(frozen=True)
 class DualDecision:
-    """Gate decision plus everything a caller needs to persist or fall back."""
+    """Gate decision plus everything a caller needs to persist or retry."""
 
-    status: str  # AGREE | DISAGREE | A_ONLY | A_ERROR
+    status: str  # AGREE | DISAGREE | UNRESOLVED | A_ERROR
     parser_version: str
     engines_attempted: str
     raw_row_count: int = 0
     diff_summary: str | None = None
     notes_json: str | None = None
-    # Engine-A passthrough for the unchanged single-engine loop path:
+    # Engine-A passthrough for the unchanged single-engine loop path (A_ERROR
+    # only — UNRESOLVED never carries A's output, so no caller can persist an
+    # A-only reading by accident):
     output: str | None = None
     error: str | None = None
     metadata: object | None = None
@@ -289,8 +421,8 @@ def dual_read(
     """Read one document with engine A, gate against engine B, decide.
 
     Returns ``(decision, rows)``. ``rows`` carries the canonical candidate
-    (engine A's reading) for AGREE and the A-only fallback, and is empty for
-    DISAGREE and A errors — nothing persists from either side there. This
+    (engine A's reading) for AGREE only, and is empty for DISAGREE,
+    UNRESOLVED, and A errors — nothing persists from either side there. This
     function performs no writes; persistence lives in
     ``run_dual_read_for_doc`` / the caller.
     """
@@ -319,17 +451,22 @@ def dual_read(
         except VisionBUnavailable:
             config = None
     if config is None and read_b is None:
-        # Engine B unconfigured: identical to current single-engine behavior.
+        # Engine B unconfigured is a config defect, not an agreement: the doc
+        # is UNRESOLVED (retry/review state). A's reading is deliberately not
+        # carried on the decision so no caller can persist it as A-only.
         return (
             DualDecision(
-                A_ONLY,
+                UNRESOLVED,
                 gemini.GEMINI_PARSER_VERSION,
                 gemini.MODEL,
                 raw_row_count=raw_row_count,
-                output=output,
+                diff_summary=(
+                    "visionb is not configured: set VISION_B_BASE_URL and "
+                    "VISION_B_MODEL"
+                ),
                 metadata=metadata,
             ),
-            rows_a,
+            [],
         )
 
     try:
@@ -341,20 +478,21 @@ def dual_read(
         else:
             text_b = read_document_with_vision_b(images, config)
     except VisionBUnavailable as exc:
-        # Engine B absent: fallback to A-only, never an exception. The reason
-        # rides along in diff_summary so callers can tell a quota/rate-limit
-        # stop (is_quota_error) from a transient outage.
+        # Engine B absent (transport failure, timeout, HTTP error, quota,
+        # malformed envelope): UNRESOLVED — never an A-only fallback. The
+        # reason rides along in diff_summary so callers can tell a
+        # quota/rate-limit batch stop (is_quota_error) from a transient
+        # outage or a config/auth defect needing an alert.
         return (
             DualDecision(
-                A_ONLY,
+                UNRESOLVED,
                 gemini.GEMINI_PARSER_VERSION,
                 gemini.MODEL,
                 raw_row_count=raw_row_count,
                 diff_summary=str(exc),
-                output=output,
                 metadata=metadata,
             ),
-            rows_a,
+            [],
         )
 
     try:
@@ -460,9 +598,15 @@ def run_dual_read_for_doc(
 
     AGREE persists through the existing ``insert_transactions`` (same row
     source, validation, and per-doc commit) with the dual parser version and
-    ``gemini+visionb`` engines. DISAGREE records the manual-review inventory
-    run. A_ONLY/A_ERROR are returned unhandled with engine A's result so the
-    caller's existing single-engine code continues unchanged.
+    ``gemini+visionb`` engines; progress is ``completed`` only when the full
+    validated row set committed (partial/rejected outcomes mark ``errors``).
+    DISAGREE records the manual-review inventory run. UNRESOLVED (engine B
+    absent — outage, misconfiguration, quota) persists NOTHING from either
+    side: quota-shaped failures return unhandled so the caller stops the
+    batch, every other absence lands an ``error`` parse run that keeps the
+    doc on the OCR work list for the next run. A_ERROR is returned unhandled
+    with engine A's error so the caller's existing single-engine failure
+    bookkeeping records it.
     """
     decision, rows = dual_read(
         doc,
@@ -472,7 +616,31 @@ def run_dual_read_for_doc(
         read_b=read_b,
         page_images=page_images,
     )
-    if decision.status in (A_ONLY, A_ERROR):
+    if decision.status == UNRESOLVED:
+        if _gemini_common().is_quota_error(decision.diff_summary or ""):
+            # Engine-B quota stop must end the caller's batch cleanly and
+            # persist nothing: continuing would either drain ungated or
+            # hammer a dead quota for every remaining doc.
+            return DualLoopOutcome(
+                False, decision, 0, "errors", metadata=decision.metadata
+            )
+        artifact_sha256 = getattr(decision.metadata, "sha256", None)
+        try:
+            ingestion_generation = _ocr_zero_rows().resolve_ingestion_generation(
+                doc.resolved_db_path, doc.doc_id, doc.year, artifact_sha256
+            )
+        except RuntimeError:
+            ingestion_generation = None
+        record_unresolved(
+            doc,
+            decision,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
+        )
+        return DualLoopOutcome(
+            True, decision, 0, "errors", metadata=decision.metadata
+        )
+    if decision.status == A_ERROR:
         return DualLoopOutcome(
             False,
             decision,
@@ -511,6 +679,7 @@ def run_dual_read_for_doc(
         )
 
     member = getattr(decision.metadata.parsed, "member", None)
+    report: dict = {}
     inserted = ocr.insert_transactions(
         doc.doc_id,
         doc.year,
@@ -522,11 +691,18 @@ def run_dual_read_for_doc(
         ingestion_generation=ingestion_generation,
         parser_version=DUAL_PARSER_VERSION,
         engine_model=DUAL_ENGINES_ATTEMPTED,
+        report=report,
     )
-    if inserted > 0:
-        progress_key = "completed"
-    elif not rows:
+    outcome = ocr.insert_outcome_from_report(
+        report, inserted=inserted, expected=len(rows)
+    )
+    # Never call a partial or rejected output complete: only a full committed
+    # row set counts as completed progress, and a committed no_txs run is
+    # reported as no_txs — never folded into "completed".
+    if outcome.status == "no_txs":
         progress_key = "no_txs"
+    elif outcome.complete:
+        progress_key = "completed"
     else:
         progress_key = "errors"
     return DualLoopOutcome(
@@ -537,6 +713,71 @@ def run_dual_read_for_doc(
         member=member,
         metadata=decision.metadata,
     )
+
+
+def record_unresolved(
+    doc: DualReadDoc,
+    decision: DualDecision,
+    *,
+    artifact_sha256: str | None,
+    ingestion_generation: str | None,
+) -> None:
+    """Land an UNRESOLVED dual read in the retry state.
+
+    Mirrors ``record_disagreement``: retire any gemini_ocr rows bound to this
+    exact artifact/generation (a prior ungated reading is now suspect), then
+    record an ``error`` parse run carrying the engine-B absence reason — the
+    non-terminal state that keeps the doc on the OCR work list so the next
+    run retries it once engine B is back.
+    """
+    import duckdb
+
+    ocr = _ocr_zero_rows()
+    conn = duckdb.connect(doc.resolved_db_path)
+    try:
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            if artifact_sha256 and ingestion_generation:
+                predicate = (
+                    "source = 'gemini_ocr' AND doc_id = ? "
+                    "AND (chamber = 'House' OR chamber IS NULL) "
+                    "AND ingestion_generation = ? AND artifact_sha256 = ?"
+                )
+                parameters = [
+                    str(doc.doc_id),
+                    ingestion_generation,
+                    artifact_sha256,
+                ]
+                ocr._archive_rows(conn, "transactions", predicate, parameters)
+                conn.execute(
+                    """
+                    DELETE FROM transactions
+                    WHERE source = 'gemini_ocr' AND doc_id = ?
+                      AND (chamber = 'House' OR chamber IS NULL)
+                      AND ingestion_generation = ? AND artifact_sha256 = ?
+                    """,
+                    parameters,
+                )
+            ocr.record_parse_run(
+                conn,
+                doc.doc_id,
+                doc.year,
+                "error",
+                decision.raw_row_count,
+                0,
+                f"dual-read unresolved: {decision.diff_summary}"
+                or "dual-read unresolved",
+                parser_version=DUAL_PARSER_VERSION,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+                engines_attempted=DUAL_ENGINES_ATTEMPTED,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
 
 
 def record_disagreement(

@@ -5,7 +5,11 @@ Per ``docs/reviews/glm-engine-fp-review-20261018.md`` §5, GLM-only backlog
 candidates are STAGED: written as one JSON record per document under
 ``data/staging/glm-backlog/<year>/<doc_id>.json`` and explicitly excluded
 from canonical/backtests until an owner-approved pixel audit passes
-(``audit_sample.py``; promotion gate ``--require-audit-pass``).
+(``audit_sample.py``). Audit approval is MANDATORY at the promotion
+boundary: ``promote`` refuses any record without ``audit: "pass"`` unless
+``--force-unaudited`` is passed (loud warning). This is also the only route
+``OCR_ENGINE=visionb`` readings take to canonical — the nightly drain stages
+and never inserts.
 
 Subcommands:
 
@@ -13,13 +17,20 @@ Subcommands:
     Rasterize unread PDFs (pdftoppm -r 150 -png), read them with the GLM
     vision endpoint through the existing ``analyzer.vision_engines`` client
     (shared PROMPT, never forked), parse with ``parse_gemini_output``, and
-    write staging records. Quota exhaustion stops the batch cleanly with
-    exit 0; per-doc failures never kill the batch.
-* ``promote --year Y [--doc-id ID ...] [--require-audit-pass]``
-    Insert staged rows into canonical through the EXISTING
+    write staging records. Transient endpoint failures (5xx, timeout,
+    transport, truncation) are retried in-process (2 retries, jittered
+    backoff, cached page renders) before an error record is written; quota
+    exhaustion stops the batch cleanly with exit 0; auth/config defects
+    alert and stop the batch with exit 1; per-doc failures never kill the
+    batch.
+* ``promote --year Y [--doc-id ID ...] [--force-unaudited]``
+    Insert AUDITED staged rows into canonical through the EXISTING
     ``ocr_zero_rows.insert_transactions`` path (parser_version
     ``v1-glm53-vision``, engines ``visionb``), mirror ``main()``'s parse-run
-    bookkeeping, and delete the staging JSON (promotion = consumed).
+    bookkeeping, and delete the staging JSON (promotion = consumed) only
+    when the FULL staged row set is confirmed committed — a partial or
+    rejected insert keeps the record and stamps the rejection details on
+    it.
 * ``status``
     Per-year staged / promoted / error counts (staged counts need no DB).
 
@@ -35,6 +46,7 @@ import base64
 import datetime
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -57,8 +69,15 @@ from scripts.gemini_ocr_common import (  # noqa: E402
     pdf_sha256,
 )
 from analyzer.vision_engines import (  # noqa: E402
+    TransientVisionBError,
     VisionBConfig,
+    VisionBUnavailable,
+    classify_visionb_error,
     read_document_with_vision_b,
+)
+from scripts.audit_sample import (  # noqa: E402
+    REPORT_STATE_NAME as AUDIT_REPORT_STATE_NAME,
+    REPORT_STATE_SCHEMA as AUDIT_REPORT_STATE_SCHEMA,
 )
 
 GLM_PARSER_VERSION = "v1-glm53-vision"
@@ -68,6 +87,8 @@ AUDIT_RESULTS_NAME = "audit-results.json"
 PROMOTED_JOURNAL_NAME = "promoted.jsonl"
 RENDER_DPI = 150
 CLI_COOLDOWN = 3.0  # seconds between endpoint requests (mirrors ocr_zero_rows)
+MAX_READ_RETRIES = 2  # bounded in-process retries for transient failures
+BACKOFF_BASE_SECONDS = 2.0  # jittered exponential backoff base
 
 
 def staging_root(data_dir: str | Path = "data") -> Path:
@@ -187,14 +208,55 @@ def rasterize_page_data_urls(pdf_path: str | Path, dpi: int = RENDER_DPI) -> lis
         ]
 
 
-def read_document(pdf_path: str | Path, config: VisionBConfig) -> str:
-    """Render pages and read the whole document with the GLM vision endpoint.
+def read_document(
+    pdf_path: str | Path,
+    config: VisionBConfig,
+    *,
+    read_fn=None,
+    page_count: int | None = None,
+    max_retries: int = MAX_READ_RETRIES,
+    backoff_seconds: float = BACKOFF_BASE_SECONDS,
+    sleep_fn=None,
+    jitter_fn=None,
+) -> str:
+    """Render pages once and read the whole document with retries.
 
-    Uses the shared PROMPT via ``read_document_with_vision_b`` (never forked).
-    Transport/HTTP/envelope failures raise ``VisionBUnavailable``.
+    Uses the shared PROMPT via ``read_document_with_vision_b`` (never
+    forked). Transient engine failures (``TransientVisionBError``: 5xx,
+    timeout/transport, malformed envelope, truncated completion) are
+    retried up to ``max_retries`` times with jittered exponential backoff,
+    reusing the SAME rendered page images. Quota errors stop immediately
+    (the batch stops); auth/config/permanent failures are raised untouched
+    (no retry — the same request would fail again).
+
+    ``read_fn(pdf_path, page_count)`` replaces the render+read pair (tests,
+    alternate engines); it gets the same bounded retries.
     """
-    images = rasterize_page_data_urls(pdf_path)
-    return read_document_with_vision_b(images, config)
+    sleep_fn = time.sleep if sleep_fn is None else sleep_fn
+    jitter_fn = random.uniform if jitter_fn is None else jitter_fn
+    renders: list[str] | None = None
+
+    def _attempt() -> str:
+        nonlocal renders
+        if read_fn is not None:
+            pages = (
+                page_count
+                if page_count is not None
+                else pdf_page_count(pdf_path)
+            )
+            return read_fn(pdf_path, pages)
+        if renders is None:
+            renders = rasterize_page_data_urls(pdf_path)
+        return read_document_with_vision_b(renders, config)
+
+    for attempt in range(max_retries + 1):
+        try:
+            return _attempt()
+        except TransientVisionBError:
+            if attempt >= max_retries:
+                raise
+            sleep_fn(backoff_seconds * (2 ** attempt) + jitter_fn(0.0, 1.0))
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 def build_staging_record(
@@ -207,11 +269,10 @@ def build_staging_record(
 ) -> dict:
     """Read one document and build its staging record. Never raises.
 
-    Parse/validation failures become ``parse_status: "error"`` records.
-    Quota exhaustion (429 / quota text) raises nothing either but is
-    reported via ``parse_status: "error"`` plus a quota-shaped ``error`` —
-    the batch loop checks it BEFORE persisting, so quota stops never write
-    a per-doc error record (the doc simply stays unstaged for the next run).
+    Parse/validation failures become ``parse_status: "error"`` records with
+    ``error_kind`` carrying the classified failure (quota/auth/config/
+    truncated/transient/permanent/parse) so the batch loop can distinguish
+    a per-doc defect from a batch-wide stop.
     """
     record = {
         "doc_id": str(doc_id),
@@ -227,6 +288,7 @@ def build_staging_record(
         "raw_output": None,
         "parse_status": "error",
         "error": None,
+        "error_kind": None,
         "audit": None,
     }
     try:
@@ -234,12 +296,11 @@ def build_staging_record(
         page_count = pdf_page_count(pdf_path)
         record["pdf_sha256"] = sha
         record["pages"] = page_count
-        if read_fn is not None:
-            raw_output = read_fn(pdf_path, page_count)
-        else:
-            if config is None:
-                raise RuntimeError("GLM vision endpoint is not configured")
-            raw_output = read_document(pdf_path, config)
+        if config is None and read_fn is None:
+            raise RuntimeError("GLM vision endpoint is not configured")
+        raw_output = read_document(
+            pdf_path, config, read_fn=read_fn, page_count=page_count
+        )
         parsed = parse_gemini_output(raw_output, expected_page_count=page_count)
         record.update(
             member=parsed.member,
@@ -256,10 +317,12 @@ def build_staging_record(
             raw_output=raw_output,
             parse_status="success" if parsed.transactions else "no_txs",
             error=None,
+            error_kind=None,
         )
     except Exception as exc:  # one bad doc must never kill the batch
         record["parse_status"] = "error"
         record["error"] = str(exc) or type(exc).__name__
+        record["error_kind"] = classify_visionb_error(exc)
     return record
 
 
@@ -316,12 +379,17 @@ def stage_batch(
     cooldown: float = 0.0,
     workers: int = 1,
 ) -> dict:
-    """Stage up to ``limit`` docs for ``year``. Quota stop is clean (no raise).
+    """Stage up to ``limit`` docs for ``year``. Never raises for endpoint states.
+
+    Batch-wide stops: quota exhaustion (``quota_stop``, clean, exit 0 — the
+    doc stays unstaged for the next run) and auth/config defects
+    (``fatal_stop``, alerted — every remaining doc would fail the same way).
+    Per-doc failures never kill the batch.
 
     ``workers > 1`` reads docs concurrently (the GLM call is I/O-bound, so
-    threads overlap network latency); quota stop halts new submissions and
-    lets in-flight docs finish. Records are per-doc files, so no ordering or
-    locking beyond the counters is needed.
+    threads overlap network latency); a batch-wide stop halts new
+    submissions and lets in-flight docs finish. Records are per-doc files,
+    so no ordering or locking beyond the counters is needed.
     """
     if config is None and read_fn is None:
         config = VisionBConfig.from_env()
@@ -335,6 +403,7 @@ def stage_batch(
     )
     staged = errors = 0
     quota_stop = False
+    fatal_stop = False
     remaining = 0
 
     def _stage_one(doc_id: str) -> str:
@@ -345,13 +414,28 @@ def stage_batch(
             config,
             read_fn=read_fn,
         )
-        if record["parse_status"] == "error" and is_quota_error(record["error"] or ""):
+        error = record.get("error") or ""
+        if record["parse_status"] == "error" and (
+            record.get("error_kind") == "quota" or is_quota_error(error)
+        ):
             # Quota exhaustion: not a doc defect. Write nothing, stop the
             # batch cleanly; the doc stays unstaged for the next run.
             return "quota"
+        if record["parse_status"] == "error" and record.get("error_kind") in (
+            "auth",
+            "config",
+        ):
+            # Credentials/configuration are batch-wide defects: alert loudly
+            # and stop. Write nothing — the operator must fix the setup.
+            print(
+                f"ALERT: GLM endpoint {record.get('error_kind')} defect: "
+                f"{error}; fix the configuration and re-run",
+                flush=True,
+            )
+            return "fatal"
         write_staging_record(data_dir, record)
         if record["parse_status"] == "error":
-            print(f"  [{doc_id}] ERROR: {record['error']}", flush=True)
+            print(f"  [{doc_id}] ERROR: {error}", flush=True)
             return "error"
         print(
             f"  [{doc_id}] {record['parse_status']} rows={len(record['rows'])}",
@@ -368,6 +452,10 @@ def stage_batch(
                 quota_stop = True
                 remaining = len(candidates) - index
                 break
+            if outcome == "fatal":
+                fatal_stop = True
+                remaining = len(candidates) - index
+                break
             if outcome == "error":
                 errors += 1
             else:
@@ -378,6 +466,7 @@ def stage_batch(
             "staged": staged,
             "errors": errors,
             "quota_stop": quota_stop,
+            "fatal_stop": fatal_stop,
             "remaining": remaining,
         }
 
@@ -398,7 +487,7 @@ def stage_batch(
         if cooldown and index:
             time.sleep(cooldown)
         outcome = _stage_one(doc_id)
-        if outcome == "quota":
+        if outcome in ("quota", "fatal"):
             stop.set()
         return outcome
 
@@ -423,14 +512,17 @@ def stage_batch(
                         errors += 1
                     elif outcome == "staged":
                         staged += 1
-                if outcome == "quota":
-                    quota_stop = True
+                if outcome in ("quota", "fatal"):
                     with lock:
                         remaining = len(candidates) - processed
+                        if outcome == "quota":
+                            quota_stop = True
+                        else:
+                            fatal_stop = True
                     for other in pending:
                         other.cancel()
                     pending = {f for f in pending if not f.cancelled()}
-        if quota_stop:
+        if quota_stop or fatal_stop:
             with lock:
                 remaining = max(remaining, len(candidates) - processed)
     return {
@@ -439,6 +531,7 @@ def stage_batch(
         "staged": staged,
         "errors": errors,
         "quota_stop": quota_stop,
+        "fatal_stop": fatal_stop,
         "remaining": remaining,
     }
 
@@ -469,6 +562,35 @@ def staged_row_to_tx(row) -> dict:
     }
 
 
+def audit_report_state(data_dir: str | Path = "data") -> dict | None:
+    """The landed audit report state (audit_sample.py ``report``), fail-closed.
+
+    Returns the parsed ``audit-report-state.json`` payload, or None when the
+    file is absent, unreadable, malformed, or carries a foreign schema —
+    every one of those must refuse promotion exactly like a missing report,
+    never guess.
+    """
+    path = staging_root(data_dir) / AUDIT_REPORT_STATE_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema") != AUDIT_REPORT_STATE_SCHEMA:
+        return None
+    return payload
+
+
+def audit_report_gate_open(state: dict | None) -> bool:
+    """True only for a COMPLETE report whose material-error budget is met."""
+    return (
+        state is not None
+        and state.get("state") == "complete"
+        and state.get("budget_met") is True
+    )
+
+
 def append_promoted_journal(root: Path, entry: dict) -> None:
     root.mkdir(parents=True, exist_ok=True)
     with (root / PROMOTED_JOURNAL_NAME).open("a", encoding="utf-8") as handle:
@@ -496,17 +618,31 @@ def promote_docs(
     *,
     data_dir: str | Path = "data",
     db_path: str | Path | None = None,
-    require_audit_pass: bool = False,
+    require_audit_pass: bool = True,
+    force_unaudited: bool = False,
     cooldown_note: str | None = None,
 ) -> dict:
-    """Promote staged records into canonical via the EXISTING insert path.
+    """Promote AUDITED staged records into canonical via the insert path.
+
+    Audit approval is MANDATORY at this boundary (FP review finding 1): a
+    record without ``audit == "pass"`` is refused unless
+    ``force_unaudited=True`` (the operator's explicit override, printed
+    with a loud warning). ``require_audit_pass=False`` is refused loudly —
+    there is no permissive default anymore.
 
     ``insert_transactions`` (imported from ``scripts.ocr_zero_rows``) writes
     the transactions AND the pdf_parse_runs record transactionally, exactly
-    as the OCR path does; afterwards this mirrors ``main()``'s remaining
-    bookkeeping (progress file) and deletes the staging JSON — promotion
-    consumes the staging record. Refusals leave the record untouched.
+    as the OCR path does. The staging JSON is deleted — promotion consumes
+    the record — ONLY when the FULL staged row set is confirmed committed
+    (outcome complete: committed, no rejections, count matches). A partial
+    or rejected insert keeps the record and stamps the rejection details on
+    it; a member rejection is never mistaken for a no_txs.
     """
+    if not require_audit_pass:
+        raise ValueError(
+            "audit approval is mandatory: require_audit_pass=False is no "
+            "longer accepted (pass audit:'pass' records or force_unaudited)"
+        )
     from scripts import ocr_zero_rows as ocr  # attribute lookups stay monkeypatchable
 
     db_path = str(db_path or default_db_path(data_dir))
@@ -521,6 +657,45 @@ def promote_docs(
             if yr == int(year)
         ]
 
+    if force_unaudited:
+        print(
+            "WARNING: --force-unaudited: promoting records WITHOUT a "
+            "passing pixel audit. This bypasses the only verified quality "
+            "gate on GLM-only readings; output must not be treated as "
+            "audited.",
+            flush=True,
+        )
+    else:
+        # Report-level gate (finding 9 contract): the pixel audit report
+        # must be COMPLETE with the material-error budget MET before any
+        # audited record promotes. A missing/incomplete/failing report
+        # refuses the whole batch — the per-record audit: pass stamp alone
+        # says nothing about the population.
+        state = audit_report_state(data_dir)
+        if not audit_report_gate_open(state):
+            if doc_ids:
+                if state is None:
+                    print(
+                        "REFUSED: audit report state missing — run "
+                        "audit_sample.py report "
+                        f"({staging_root(data_dir) / AUDIT_REPORT_STATE_NAME})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "REFUSED: audit report state is "
+                        f"{state.get('state')!r} with budget_met="
+                        f"{state.get('budget_met')!r}; canonical promotion "
+                        "must not proceed",
+                        flush=True,
+                    )
+                return {
+                    "year": int(year),
+                    "promoted": 0,
+                    "refused": len(doc_ids),
+                    "failed": 0,
+                }
+
     promoted = refused = failed = 0
     for doc_id in doc_ids:
         record = load_staging_record(data_dir, year, doc_id)
@@ -532,10 +707,11 @@ def promote_docs(
             print(f"  [{doc_id}] refused: staging record is an error record", flush=True)
             refused += 1
             continue
-        if require_audit_pass and record.get("audit") != "pass":
+        if record.get("audit") != "pass" and not force_unaudited:
             print(
-                f"  [{doc_id}] refused: --require-audit-pass and staging "
-                "record lacks audit: pass",
+                f"  [{doc_id}] refused: audit approval is mandatory and the "
+                "staging record lacks audit: pass (run the pixel audit or "
+                "pass --force-unaudited explicitly)",
                 flush=True,
             )
             refused += 1
@@ -560,17 +736,29 @@ def promote_docs(
             ingestion_generation = ocr.resolve_ingestion_generation(
                 db_path, doc_id, year, record["pdf_sha256"]
             )
-            inserted = ocr.insert_transactions(
+            staged_count = len(transactions)
+            report: dict = {}
+            ocr.insert_transactions(
                 doc_id,
                 year,
                 record.get("member"),
                 transactions,
                 db_path=db_path,
                 parser_version=GLM_PARSER_VERSION,
-                raw_count=len(transactions),
+                raw_count=staged_count,
                 artifact_sha256=record["pdf_sha256"],
                 ingestion_generation=ingestion_generation,
                 engine_model=GLM_ENGINES_ATTEMPTED,
+                report=report,
+            )
+            outcome = ocr.insert_outcome_from_report(
+                report,
+                inserted=(
+                    report["outcome"].inserted
+                    if isinstance(report.get("outcome"), ocr.InsertOutcome)
+                    else 0
+                ),
+                expected=staged_count,
             )
         except Exception as exc:
             # duckdb write-lock and generation-binding problems surface
@@ -579,10 +767,10 @@ def promote_docs(
             failed += 1
             continue
 
-        if record.get("parse_status") == "no_txs":
-            ok, progress_key = True, "no_txs"
-        elif inserted > 0:
-            ok, progress_key = True, "completed"
+        if outcome.complete:
+            ok, progress_key = True, (
+                "no_txs" if outcome.status == "no_txs" else "completed"
+            )
         else:
             ok, progress_key = False, "errors"
         # Mirror main()'s run bookkeeping (the parse-run row itself was
@@ -590,9 +778,18 @@ def promote_docs(
         ocr.mark_progress(progress, doc_id, progress_key)
         ocr.save_progress(progress, progress_path)
         if not ok:
+            # Partial or rejected output is never complete: keep the staging
+            # record and stamp the explicit rejection details on it.
+            record["promotion"] = {
+                "outcome": outcome.as_dict(),
+                "at_utc": utc_now_iso(),
+            }
+            write_staging_record(data_dir, record)
             print(
-                f"  [{doc_id}] ERROR: validated rows were not inserted "
-                "(staging record kept)",
+                f"  [{doc_id}] ERROR: insert {outcome.status} "
+                f"(inserted={outcome.inserted}/{outcome.expected} staged rows; "
+                f"rejections={outcome.rejections or outcome.detail}); "
+                "staging record kept and marked",
                 flush=True,
             )
             failed += 1
@@ -603,13 +800,15 @@ def promote_docs(
             {
                 "doc_id": str(doc_id),
                 "year": int(year),
-                "inserted": inserted,
+                "inserted": outcome.inserted,
+                "outcome_status": outcome.status,
+                "unaudited": bool(force_unaudited),
                 "parser_version": GLM_PARSER_VERSION,
                 "promoted_at_utc": utc_now_iso(),
             },
         )
         promoted += 1
-        print(f"  [{doc_id}] promoted: inserted={inserted}", flush=True)
+        print(f"  [{doc_id}] promoted: inserted={outcome.inserted}", flush=True)
 
     return {
         "year": int(year),
@@ -696,7 +895,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     p_promote = subparsers.add_parser(
-        "promote", help="insert staged rows into canonical (consumes the record)"
+        "promote",
+        help=(
+            "insert AUDITED staged rows into canonical (consumes the "
+            "record; audit: pass is mandatory)"
+        ),
     )
     p_promote.add_argument("--year", type=int, required=True)
     p_promote.add_argument(
@@ -708,7 +911,21 @@ def main(argv: list[str] | None = None) -> int:
     p_promote.add_argument(
         "--require-audit-pass",
         action="store_true",
-        help="refuse docs whose staging record lacks audit: pass",
+        default=True,
+        help=(
+            "audit approval is mandatory (default): requires audit: pass on "
+            "each record AND a complete audit report with the budget met "
+            "(audit-report-state.json); accepted for compatibility"
+        ),
+    )
+    p_promote.add_argument(
+        "--force-unaudited",
+        action="store_true",
+        help=(
+            "operator override: promote records WITHOUT audit: pass and "
+            "without a passing audit report (loud warning; output is not "
+            "audited)"
+        ),
     )
     p_promote.add_argument(
         "--db-path", default=None, help="canonical duckdb (default: <data-dir>/congress.duckdb)"
@@ -742,6 +959,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"Quota exhausted; stopping batch cleanly. "
                 f"Remaining unstaged candidates: {result['remaining']}"
             )
+        if result.get("fatal_stop"):
+            print(
+                "ALERT: auth/config defect stopped the batch; fix the GLM "
+                f"endpoint configuration. Remaining candidates: "
+                f"{result['remaining']}"
+            )
+            return 1
         return 0
 
     if args.command == "promote":
@@ -750,7 +974,7 @@ def main(argv: list[str] | None = None) -> int:
             args.doc_id,
             data_dir=data_dir,
             db_path=args.db_path,
-            require_audit_pass=args.require_audit_pass,
+            force_unaudited=args.force_unaudited,
         )
         print(
             f"\n=== PROMOTE DONE year={result['year']} promoted={result['promoted']} "

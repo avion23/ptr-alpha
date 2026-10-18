@@ -11,10 +11,11 @@ import base64
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from analyzer.vision_engines import VisionBUnavailable
+from analyzer.vision_engines import VisionBConfig, VisionBUnavailable
 from scripts import audit_sample, glm_stage
 from scripts import ocr_zero_rows
 from scripts.gemini_ocr_common import PROMPT_SHA256
@@ -75,7 +76,11 @@ def data_dir(tmp_path) -> Path:
 
 @pytest.fixture
 def fake_insert(monkeypatch):
-    """Monkeypatch the canonical insert path + generation resolution."""
+    """Monkeypatch the canonical insert path + generation resolution.
+
+    The fake mirrors the real contract: it fills ``report["outcome"]`` with
+    the explicit committed outcome and returns the committed count.
+    """
     calls = []
 
     def _insert(
@@ -91,6 +96,7 @@ def fake_insert(monkeypatch):
         ingestion_generation,
         engine_model,
         checkpoint=True,
+        report=None,
     ):
         calls.append(
             {
@@ -106,6 +112,13 @@ def fake_insert(monkeypatch):
                 "engine_model": engine_model,
             }
         )
+        if report is not None:
+            report["outcome"] = ocr_zero_rows.InsertOutcome(
+                status="no_txs" if not transactions else "success",
+                inserted=len(transactions),
+                expected=raw_count if raw_count is not None else len(transactions),
+                committed=True,
+            )
         return len(transactions)
 
     monkeypatch.setattr(ocr_zero_rows, "insert_transactions", _insert)
@@ -210,6 +223,184 @@ def test_quota_stop_is_clean_and_reports_remaining(data_dir):
     assert list((data_dir / "staging" / "glm-backlog" / "2024").glob("*.json")) == []
 
 
+# --------------------------------------------------------------------------
+# stage: bounded transient retries + error classification (FP finding 7)
+# --------------------------------------------------------------------------
+
+
+def test_transient_failures_are_retried_with_jittered_backoff(data_dir, monkeypatch):
+    from analyzer.vision_engines import TransientVisionBError
+
+    seed_year(data_dir, 2024, ["r1"])
+    attempts = []
+    sleeps = []
+
+    def flaky_read(pdf_path, page_count):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise TransientVisionBError("visionb http 503: upstream overload")
+        return GLM_OUTPUT_ONE_ROW
+
+    monkeypatch.setattr(
+        glm_stage, "time", SimpleNamespace(sleep=sleeps.append)
+    )
+    monkeypatch.setattr(glm_stage.random, "uniform", lambda a, b: 0.5)
+    result = glm_stage.stage_batch(
+        2024, 10, data_dir=data_dir, read_fn=flaky_read, cooldown=0
+    )
+    assert result["staged"] == 1 and result["errors"] == 0
+    assert len(attempts) == 3  # initial attempt + 2 bounded retries
+    # Jittered exponential backoff: base * 2**attempt + jitter.
+    assert sleeps == [2.0 + 0.5, 4.0 + 0.5]
+    record = glm_stage.load_staging_record(data_dir, 2024, "r1")
+    assert record["parse_status"] == "success"
+
+
+def test_transient_retries_exhaust_into_error_record_and_batch_continues(
+    data_dir, monkeypatch
+):
+    from analyzer.vision_engines import TransientVisionBError
+
+    seed_year(data_dir, 2024, ["x1", "x2"])
+    attempts = []
+    monkeypatch.setattr(glm_stage, "time", SimpleNamespace(sleep=lambda *_: None))
+
+    def down_read(pdf_path, page_count):
+        attempts.append(Path(pdf_path).stem)
+        raise TransientVisionBError("visionb transport failure: refused")
+
+    result = glm_stage.stage_batch(2024, 10, data_dir=data_dir, read_fn=down_read)
+    assert attempts == ["x1"] * 3 + ["x2"] * 3  # each doc retried, batch lived
+    assert result["staged"] == 0 and result["errors"] == 2
+    assert result["quota_stop"] is False and result["fatal_stop"] is False
+    record = glm_stage.load_staging_record(data_dir, 2024, "x1")
+    assert record["parse_status"] == "error"
+    assert record["error_kind"] == "transient"
+
+
+def test_quota_is_never_retried_and_stops_cleanly(data_dir, monkeypatch):
+    from analyzer.vision_engines import VisionBQuotaError
+
+    seed_year(data_dir, 2024, ["q1", "q2"])
+    attempts = []
+
+    def quota_read(pdf_path, page_count):
+        attempts.append(1)
+        raise VisionBQuotaError("visionb quota/rate-limit exhausted (http 429)")
+
+    result = glm_stage.stage_batch(2024, 10, data_dir=data_dir, read_fn=quota_read)
+    assert attempts == [1]  # no retry: a quota stop is not transient
+    assert result["quota_stop"] is True and result["fatal_stop"] is False
+    assert list((data_dir / "staging" / "glm-backlog" / "2024").glob("*.json")) == []
+
+
+def test_auth_defect_alerts_and_stops_batch_without_records(data_dir, monkeypatch, capsys):
+    from analyzer.vision_engines import VisionBAuthError
+
+    seed_year(data_dir, 2024, ["a1", "a2"])
+    attempts = []
+
+    def auth_read(pdf_path, page_count):
+        attempts.append(Path(pdf_path).stem)
+        raise VisionBAuthError(
+            "visionb auth rejected (http 401): {\"error\":{\"code\":1002,"
+            '"message":"invalid api key"}}'
+        )
+
+    result = glm_stage.stage_batch(2024, 10, data_dir=data_dir, read_fn=auth_read)
+    assert attempts == ["a1"]  # no retry: credentials are broken, not busy
+    assert result["fatal_stop"] is True and result["quota_stop"] is False
+    assert list((data_dir / "staging" / "glm-backlog" / "2024").glob("*.json")) == []
+    out = capsys.readouterr().out
+    assert "ALERT" in out and "auth" in out
+
+    # The CLI surfaces the fatal stop as a failure exit, not a silent 0.
+    monkeypatch.setattr(
+        glm_stage,
+        "stage_batch",
+        lambda *a, **k: {
+            "year": 2024,
+            "candidates": 2,
+            "staged": 0,
+            "errors": 0,
+            "quota_stop": False,
+            "fatal_stop": True,
+            "remaining": 2,
+        },
+    )
+    rc = glm_stage.main(["--data-dir", str(data_dir), "stage", "--year", "2024"])
+    assert rc == 1
+    assert "auth/config defect stopped the batch" in capsys.readouterr().out
+
+
+def test_error_records_carry_the_classified_kind(data_dir):
+    from analyzer.vision_engines import (
+        TransientVisionBError,
+        TruncatedCompletion,
+        VisionBConfigError,
+        VisionBPermanentError,
+        VisionBQuotaError,
+    )
+
+    seed_year(data_dir, 2024, ["k1", "k2", "k3", "k4"])
+    cases = {
+        "k1": (TransientVisionBError("visionb http 503"), "transient"),
+        "k2": (TruncatedCompletion("visionb truncated completion"), "truncated"),
+        "k3": (VisionBQuotaError("visionb quota (http 429)"), "quota"),
+        "k4": (VisionBPermanentError("visionb http 400: bad image"), "permanent"),
+    }
+
+    def classified_read(pdf_path, page_count):
+        exc, _ = cases[Path(pdf_path).stem]
+        raise exc
+
+    # build_staging_record never raises: it classifies into error_kind so
+    # the batch loop can tell per-doc defects from batch-wide stops.
+    for doc_id, (_, kind) in cases.items():
+        record = glm_stage.build_staging_record(
+            doc_id, 2024, glm_stage.default_pdf_path(data_dir, 2024, doc_id),
+            None, read_fn=classified_read,
+        )
+        assert record["parse_status"] == "error"
+        assert record["error_kind"] == kind
+    # A schema-level parse failure (not an engine class) is its own kind.
+    record = glm_stage.build_staging_record(
+        "k5", 2024, glm_stage.default_pdf_path(data_dir, 2024, "k5"),
+        None, read_fn=lambda *a: "not the schema",
+    )
+    assert record["error_kind"] == "parse"
+
+
+def test_renders_are_cached_across_transient_retries(data_dir, monkeypatch):
+    from analyzer.vision_engines import TransientVisionBError
+
+    seed_year(data_dir, 2024, ["rc1"])
+    renders = []
+
+    def fake_rasterize(pdf_path, dpi=glm_stage.RENDER_DPI):
+        renders.append(1)
+        return ["data:image/png;base64,QUJD"]
+
+    def transient_then_ok(page_urls, config):
+        assert page_urls == ["data:image/png;base64,QUJD"]
+        if len(renders) == 1 and not getattr(transient_then_ok, "ok", False):
+            transient_then_ok.ok = True
+            raise TransientVisionBError("visionb http 502")
+        return GLM_OUTPUT_ONE_ROW
+
+    monkeypatch.setattr(glm_stage, "rasterize_page_data_urls", fake_rasterize)
+    monkeypatch.setattr(
+        glm_stage, "read_document_with_vision_b", transient_then_ok
+    )
+    monkeypatch.setattr(glm_stage, "time", SimpleNamespace(sleep=lambda *_: None))
+    config = VisionBConfig(base_url="http://127.0.0.1:1", model="stub")
+    record = glm_stage.build_staging_record(
+        "rc1", 2024, glm_stage.default_pdf_path(data_dir, 2024, "rc1"), config
+    )
+    assert record["parse_status"] == "success"
+    assert len(renders) == 1  # one render, reused by the retry
+
+
 def test_check_canonical_skips_successfully_parsed_docs(data_dir, monkeypatch):
     seed_year(data_dir, 2024, ["keep", "parsed"])
     monkeypatch.setattr(
@@ -233,8 +424,35 @@ def stage_one(data_dir, year, doc_id, output):
     )
 
 
+def write_report_state(data_dir, *, state="complete", budget_met=True, schema="audit-report-state-v2", raw=None):
+    """Write the audit-sample report state file (the promote gate input)."""
+    root = glm_stage.staging_root(data_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    if raw is not None:
+        (root / "audit-report-state.json").write_text(raw, encoding="utf-8")
+        return
+    payload = {
+        "schema": schema,
+        "state": state,
+        "reason": None if state == "complete" else "unresolved sampled docs",
+        "budget_met": budget_met,
+    }
+    (root / "audit-report-state.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def stage_one_audited(data_dir, year, doc_id, output):
+    """Stage one doc, stamp the mandatory audit: pass, and land a complete
+    audit report with the budget met (the fully-gated-open world)."""
+    stage_one(data_dir, year, doc_id, output)
+    audit_sample.record_verdict(data_dir, doc_id, "pass", "matches pixels")
+    write_report_state(data_dir)
+    return glm_stage.load_staging_record(data_dir, year, doc_id)
+
+
 def test_promote_consumes_staging_record(data_dir, fake_insert):
-    stage_one(data_dir, 2024, "2001", GLM_OUTPUT_ONE_ROW)
+    stage_one_audited(data_dir, 2024, "2001", GLM_OUTPUT_ONE_ROW)
     sha = glm_stage.pdf_sha256(data_dir / "2024" / "pdfs" / "2001.pdf")
 
     result = glm_stage.promote_docs(2024, ["2001"], data_dir=data_dir)
@@ -270,7 +488,7 @@ def test_promote_consumes_staging_record(data_dir, fake_insert):
 
 
 def test_promote_no_txs_records_and_consumes(data_dir, fake_insert):
-    stage_one(data_dir, 2024, "2002", GLM_OUTPUT_NO_TXS)
+    stage_one_audited(data_dir, 2024, "2002", GLM_OUTPUT_NO_TXS)
     result = glm_stage.promote_docs(2024, ["2002"], data_dir=data_dir)
     assert result["promoted"] == 1
     assert fake_insert[0]["transactions"] == []
@@ -282,25 +500,182 @@ def test_promote_no_txs_records_and_consumes(data_dir, fake_insert):
     assert glm_stage.load_staging_record(data_dir, 2024, "2002") is None
 
 
-def test_promote_require_audit_pass_gate(data_dir, fake_insert):
+def test_promote_audit_approval_is_mandatory(data_dir, fake_insert, capsys):
+    # Per-record gate: with a passing report but no audit stamp on the
+    # record, promotion is refused, the insert path never runs, and the
+    # record stays for the audit.
     stage_one(data_dir, 2024, "2003", GLM_OUTPUT_ONE_ROW)
-    refused = glm_stage.promote_docs(
-        2024, ["2003"], data_dir=data_dir, require_audit_pass=True
-    )
+    write_report_state(data_dir)
+    refused = glm_stage.promote_docs(2024, ["2003"], data_dir=data_dir)
     assert refused["refused"] == 1 and refused["promoted"] == 0
     assert fake_insert == []
     assert glm_stage.load_staging_record(data_dir, 2024, "2003") is not None
+    assert "audit approval is mandatory" in capsys.readouterr().out
 
-    # A passing pixel audit stamps the staging record and opens the gate.
+    # The legacy permissive flag is refused loudly, not silently honored.
+    with pytest.raises(ValueError, match="mandatory"):
+        glm_stage.promote_docs(
+            2024, ["2003"], data_dir=data_dir, require_audit_pass=False
+        )
+
+    # A passing pixel audit stamps the staging record... but promotion
+    # still needs the report-level gate: a missing audit report state
+    # refuses (fail-closed), as do incomplete reports and a blown budget.
     audit_sample.record_verdict(data_dir, "2003", "pass", "matches pixels")
     record = glm_stage.load_staging_record(data_dir, 2024, "2003")
     assert record["audit"] == "pass"
-    promoted = glm_stage.promote_docs(
-        2024, ["2003"], data_dir=data_dir, require_audit_pass=True
-    )
+    (glm_stage.staging_root(data_dir) / "audit-report-state.json").unlink()
+    missing = glm_stage.promote_docs(2024, ["2003"], data_dir=data_dir)
+    assert missing["refused"] == 1 and missing["promoted"] == 0
+    assert "audit report state missing" in capsys.readouterr().out
+    write_report_state(data_dir, state="incomplete", budget_met=None)
+    incomplete = glm_stage.promote_docs(2024, ["2003"], data_dir=data_dir)
+    assert incomplete["refused"] == 1 and incomplete["promoted"] == 0
+    write_report_state(data_dir, state="complete", budget_met=False)
+    budget_blown = glm_stage.promote_docs(2024, ["2003"], data_dir=data_dir)
+    assert budget_blown["refused"] == 1 and budget_blown["promoted"] == 0
+    # Complete report + met budget opens the gate.
+    write_report_state(data_dir)  # complete + budget_met True
+    promoted = glm_stage.promote_docs(2024, ["2003"], data_dir=data_dir)
     assert promoted["promoted"] == 1
     assert len(fake_insert) == 1
     assert glm_stage.load_staging_record(data_dir, 2024, "2003") is None
+
+
+def test_promote_force_unaudited_is_explicit_and_loud(data_dir, fake_insert, capsys):
+    stage_one(data_dir, 2024, "2004", GLM_OUTPUT_ONE_ROW)
+    result = glm_stage.promote_docs(
+        2024, ["2004"], data_dir=data_dir, force_unaudited=True
+    )
+    assert result["promoted"] == 1
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "WITHOUT a passing pixel audit" in out
+    journal = glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir))
+    assert journal[0]["unaudited"] is True
+    assert glm_stage.load_staging_record(data_dir, 2024, "2004") is None
+
+
+def test_promote_refuses_malformed_or_foreign_report_state(data_dir, fake_insert, capsys):
+    stage_one_audited(data_dir, 2024, "2007", GLM_OUTPUT_ONE_ROW)
+    # Malformed JSON is treated like a missing report: refuse, never guess.
+    write_report_state(data_dir, raw="{not json")
+    result = glm_stage.promote_docs(2024, ["2007"], data_dir=data_dir)
+    assert result["refused"] == 1 and result["promoted"] == 0
+    assert fake_insert == []
+    assert "audit report state missing" in capsys.readouterr().out
+    # A foreign schema version is equally untrusted.
+    write_report_state(data_dir, schema="audit-report-state-v1")
+    result = glm_stage.promote_docs(2024, ["2007"], data_dir=data_dir)
+    assert result["refused"] == 1 and result["promoted"] == 0
+    kept = glm_stage.load_staging_record(data_dir, 2024, "2007")
+    assert kept is not None
+    # force_unaudited is the only bypass, and it stays loud.
+    result = glm_stage.promote_docs(
+        2024, ["2007"], data_dir=data_dir, force_unaudited=True
+    )
+    assert result["promoted"] == 1
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "WITHOUT a passing pixel audit" in out
+
+
+def test_promote_report_state_gate_refuses_whole_batch(data_dir, fake_insert, capsys):
+    stage_one_audited(data_dir, 2024, "2008", GLM_OUTPUT_ONE_ROW)
+    stage_one_audited(data_dir, 2024, "2009", GLM_OUTPUT_NO_TXS)
+    (glm_stage.staging_root(data_dir) / "audit-report-state.json").unlink()
+    result = glm_stage.promote_docs(2024, None, data_dir=data_dir)
+    assert result == {"year": 2024, "promoted": 0, "refused": 2, "failed": 0}
+    assert fake_insert == []
+    assert "audit report state missing — run audit_sample.py report" in (
+        capsys.readouterr().out
+    )
+    # Both records survive for the audit.
+    assert glm_stage.load_staging_record(data_dir, 2024, "2008") is not None
+    assert glm_stage.load_staging_record(data_dir, 2024, "2009") is not None
+
+
+def test_promote_partial_insert_keeps_and_marks_record(data_dir, monkeypatch, capsys):
+    stage_one_audited(data_dir, 2024, "2005", GLM_OUTPUT_ONE_ROW)
+    # Simulate a partial insert: 1 of 2 staged rows validated and committed.
+    record = glm_stage.load_staging_record(data_dir, 2024, "2005")
+    record["rows"] = [
+        ["Apple Inc. (AAPL)", "Purchase", "01/15/24", "01/20/24", "A"],
+        ["Microsoft Corp (MSFT)", "Sale", "02/02/24", "02/05/24", "B"],
+    ]
+    record["raw_count"] = 2
+    record["audit"] = "pass"
+    glm_stage.write_staging_record(data_dir, record)
+
+    def partial_insert(*args, **kwargs):
+        report = kwargs.get("report")
+        if report is not None:
+            report["outcome"] = ocr_zero_rows.InsertOutcome(
+                status="partial",
+                inserted=1,
+                expected=2,
+                committed=True,
+                rejections={"impossible_chronology": 1},
+            )
+        return 1
+
+    monkeypatch.setattr(ocr_zero_rows, "insert_transactions", partial_insert)
+    monkeypatch.setattr(
+        ocr_zero_rows,
+        "resolve_ingestion_generation",
+        lambda *a: "gen-1",
+    )
+    result = glm_stage.promote_docs(2024, ["2005"], data_dir=data_dir)
+    assert result["failed"] == 1 and result["promoted"] == 0
+    kept = glm_stage.load_staging_record(data_dir, 2024, "2005")
+    assert kept is not None  # partial output is never consumed as complete
+    assert kept["promotion"]["outcome"]["status"] == "partial"
+    assert kept["promotion"]["outcome"]["inserted"] == 1
+    assert kept["promotion"]["outcome"]["expected"] == 2
+    assert kept["promotion"]["outcome"]["rejections"] == {
+        "impossible_chronology": 1
+    }
+    progress = json.loads(
+        (data_dir / "ocr_progress_gemini_manual.json").read_text()
+    )
+    assert progress["errors"] == ["2005"]
+    assert "partial" in capsys.readouterr().out
+
+
+def test_promote_member_rejection_is_not_no_txs(data_dir, monkeypatch, capsys):
+    stage_one_audited(data_dir, 2024, "2006", GLM_OUTPUT_ONE_ROW)
+    record = glm_stage.load_staging_record(data_dir, 2024, "2006")
+    record["audit"] = "pass"
+    record["rows"] = []
+    record["parse_status"] = "no_txs"
+    glm_stage.write_staging_record(data_dir, record)
+
+    def identity_reject(*args, **kwargs):
+        report = kwargs.get("report")
+        if report is not None:
+            report["outcome"] = ocr_zero_rows.InsertOutcome(
+                status="rejected",
+                inserted=0,
+                expected=0,
+                rejections={"member_mismatch": 1},
+            )
+        return 0
+
+    monkeypatch.setattr(ocr_zero_rows, "insert_transactions", identity_reject)
+    monkeypatch.setattr(
+        ocr_zero_rows,
+        "resolve_ingestion_generation",
+        lambda *a: "gen-1",
+    )
+    result = glm_stage.promote_docs(2024, ["2006"], data_dir=data_dir)
+    assert result["failed"] == 1 and result["promoted"] == 0
+    kept = glm_stage.load_staging_record(data_dir, 2024, "2006")
+    assert kept["promotion"]["outcome"]["status"] == "rejected"
+    assert kept["promotion"]["outcome"]["rejections"] == {"member_mismatch": 1}
+    progress = json.loads(
+        (data_dir / "ocr_progress_gemini_manual.json").read_text()
+    )
+    # The rejection must land in errors, never in the no_txs bucket.
+    assert progress["errors"] == ["2006"]
+    assert progress["no_txs"] == []
 
 
 def test_promote_refuses_error_records_and_sha_drift(data_dir, fake_insert):
@@ -340,7 +715,7 @@ def test_promote_refuses_error_records_and_sha_drift(data_dir, fake_insert):
 
 
 def test_promote_keeps_record_when_insert_rejects(data_dir, monkeypatch):
-    stage_one(data_dir, 2024, "4001", GLM_OUTPUT_ONE_ROW)
+    stage_one_audited(data_dir, 2024, "4001", GLM_OUTPUT_ONE_ROW)
 
     def zero_insert(*args, **kwargs):
         return 0
@@ -374,6 +749,8 @@ def test_staging_status_counts(data_dir, fake_insert):
         return outputs[Path(pdf_path).stem]
 
     glm_stage.stage_batch(2024, 10, data_dir=data_dir, read_fn=half_broken)
+    audit_sample.record_verdict(data_dir, "5001", "pass", "matches pixels")
+    write_report_state(data_dir)
     glm_stage.promote_docs(2024, ["5001"], data_dir=data_dir)
     rows = glm_stage.staging_status(data_dir)
     assert rows == [

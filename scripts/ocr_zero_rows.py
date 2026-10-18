@@ -6,8 +6,11 @@ Gemini auto-rotates PDFs and handles checkbox detection.
 
 Engine modes: DUAL_READ=1 forces the dual-read gate (Gemini gated against
 engine B); otherwise OCR_ENGINE selects — unset/'gemini' (single-engine
-Gemini, the default), 'visionb' (GLM-primary single engine, engine A never
-contacted), or 'dual' (alias of DUAL_READ=1).
+Gemini, the default; the ONLY mode that may persist A-only rows), 'visionb'
+(GLM-primary single engine: reads land as STAGING records under
+data/staging/glm-backlog — canonical ingestion of GLM rows happens ONLY via
+``glm_stage promote`` after a passing audit), or 'dual' (alias of
+DUAL_READ=1).
 """
 
 import argparse
@@ -16,15 +19,16 @@ import json
 import os
 import re
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import duckdb
 from pathlib import Path
 
 from analyzer.database import Database
 from analyzer.vision_engines import (
-    A_ONLY,
+    A_ERROR,
     DualReadDoc,
+    UNRESOLVED,
     VisionBConfig,
     VisionBUnavailable,
     dual_read_enabled,
@@ -50,8 +54,11 @@ PROGRESS_PATH = "data/ocr_progress_gemini_manual.json"
 COOLDOWN = 3  # seconds between requests (Lite model allows rapid fire)
 # Engine-B-primary single-engine drain (OCR_ENGINE=visionb): GLM reads the
 # backlog alone — engine A (Gemini) is never contacted, conserving its free
-# quota for current-era docs. Rows persist through the same gemini_ocr
-# source family, insert path, and validation as the Gemini drain.
+# quota for current-era docs. Readings land as STAGING records
+# (data/staging/glm-backlog, via scripts.glm_stage); canonical ingestion of
+# GLM rows happens ONLY through ``glm_stage promote`` after the pixel audit,
+# and promote inserts through this module's gemini_ocr source family, insert
+# path, and validation.
 GLM_PARSER_VERSION = "v1-glm53-vision"
 GLM_ENGINES_ATTEMPTED = "visionb"
 OCR_ENGINE_ENV = "OCR_ENGINE"
@@ -1297,6 +1304,77 @@ def _record_failed_ocr_attempt(
         raise
 
 
+@dataclass(frozen=True)
+class InsertOutcome:
+    """The explicit committed outcome of one insert_transactions call.
+
+    ``committed`` is true only when a transaction actually COMMITed (rows or
+    a no_txs parse run). ``complete`` is true only when everything the caller
+    handed in was committed with no rejections — a partial insert (row-level
+    rejections kept out) or a member/row rejection is never "complete", so
+    callers cannot mistake partial output for a finished document.
+    """
+
+    status: str  # success | partial | no_txs | rejected | error
+    inserted: int = 0
+    expected: int = 0
+    committed: bool = False
+    rejections: dict | None = None
+    detail: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.committed
+            and self.status in ("success", "no_txs")
+            and self.inserted == self.expected
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "inserted": self.inserted,
+            "expected": self.expected,
+            "committed": self.committed,
+            "rejections": self.rejections,
+            "detail": self.detail,
+        }
+
+
+def insert_outcome_from_report(
+    report: dict | None, *, inserted: int, expected: int
+) -> InsertOutcome:
+    """The InsertOutcome for an insert_transactions call.
+
+    Reads the ``report`` dict the call was given; if the callee ignored it
+    (monkeypatched fakes, older callers), fall back to a conservative
+    outcome derived from the committed count alone: a positive count is a
+    committed but UNVERIFIED full insert only when it matches ``expected``,
+    and zero is an error — never silently "complete".
+    """
+    outcome = (report or {}).get("outcome")
+    if isinstance(outcome, InsertOutcome):
+        return outcome
+    if (report or {}).get("outcome") is not None:
+        return InsertOutcome(
+            status="success" if inserted == expected and inserted else "error",
+            inserted=inserted,
+            expected=expected,
+            committed=bool(inserted),
+        )
+    if expected == 0 and inserted == 0:
+        # Empty input committed nothing by definition; only the callee knows
+        # whether a no_txs run was recorded, so treat it as unverified.
+        return InsertOutcome(status="error", inserted=0, expected=0)
+    if inserted and inserted == expected:
+        return InsertOutcome(
+            status="success", inserted=inserted, expected=expected, committed=True
+        )
+    return InsertOutcome(
+        status="error", inserted=inserted, expected=expected, committed=bool(inserted)
+    )
+
+
 def insert_transactions(
     doc_id,
     year,
@@ -1310,8 +1388,22 @@ def insert_transactions(
     ingestion_generation: str | None = None,
     engine_model: str = MODEL,
     checkpoint: bool = True,
+    report: dict | None = None,
 ):
-    """Insert transactions into DB. Returns count inserted."""
+    """Insert transactions into DB. Returns count inserted.
+
+    ``report`` (optional) receives ``report["outcome"] = InsertOutcome`` —
+    the explicit committed outcome (status, committed count, rejections) so
+    callers can tell a full committed insert from a partial/rejected one
+    without re-deriving it. The int return value stays the committed count
+    for backward compatibility.
+    """
+
+    def _report(outcome: InsertOutcome) -> int:
+        if report is not None:
+            report["outcome"] = outcome
+        return outcome.inserted
+
     conn = duckdb.connect(db_path)
     require_ocr_schema(conn)
     if not artifact_sha256 or not ingestion_generation:
@@ -1319,6 +1411,7 @@ def insert_transactions(
         raise RuntimeError(
             "OCR insertion requires artifact_sha256 and ingestion_generation"
         )
+    input_expected = raw_count if raw_count is not None else len(transactions)
     try:
         bound_generation = _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
         if bound_generation != ingestion_generation:
@@ -1346,7 +1439,15 @@ def insert_transactions(
             )
         finally:
             conn.close()
-        return 0
+        # Member-level rejection: a no_txs-looking zero is NOT a no_txs.
+        return _report(
+            InsertOutcome(
+                status="rejected",
+                inserted=0,
+                expected=input_expected,
+                rejections=dict(identity_rejections),
+            )
+        )
     if not transactions:
         status = "error" if raw_count else "no_txs"
         message = "semantic_zero_after_raw_rows" if raw_count else ""
@@ -1361,7 +1462,14 @@ def insert_transactions(
                 )
             finally:
                 conn.close()
-            return 0
+            return _report(
+                InsertOutcome(
+                    status="rejected",
+                    inserted=0,
+                    expected=input_expected,
+                    detail=message,
+                )
+            )
         conn.execute("BEGIN TRANSACTION")
         try:
             if status == "no_txs":
@@ -1392,7 +1500,11 @@ def insert_transactions(
             raise
         finally:
             conn.close()
-        return 0
+        return _report(
+            InsertOutcome(
+                status="no_txs", inserted=0, expected=0, committed=True
+            )
+        )
 
     input_count = raw_count if raw_count is not None else len(transactions)
     transactions = apply_verified_house_corrections(
@@ -1425,7 +1537,14 @@ def insert_transactions(
             engine_model=engine_model,
         )
         conn.close()
-        return 0
+        return _report(
+            InsertOutcome(
+                status="rejected",
+                inserted=0,
+                expected=input_count,
+                rejections=dict(rejections),
+            )
+        )
     transactions = validated
     partial_note = (
         f"; row-level rejections kept out: {json.dumps(row_rejections, sort_keys=True)}"
@@ -1513,7 +1632,14 @@ def insert_transactions(
             engine_model=engine_model,
         )
         conn.close()
-        return 0
+        return _report(
+            InsertOutcome(
+                status="error",
+                inserted=0,
+                expected=input_count,
+                detail=message,
+            )
+        )
     if not rows:
         # If transactions were provided but all failed validation, record as
         # "error" so get_zero_row_pdfs() will retry them; only use "no_txs"
@@ -1548,7 +1674,14 @@ def insert_transactions(
         if checkpoint:
             conn.execute("CHECKPOINT")
         conn.close()
-        return 0
+        return _report(
+            InsertOutcome(
+                status="no_txs" if not input_count else "error",
+                inserted=0,
+                expected=input_count,
+                committed=not input_count,
+            )
+        )
 
     count = 0
     committed = False
@@ -1708,7 +1841,16 @@ def insert_transactions(
         committed = True
         if checkpoint:
             conn.execute("CHECKPOINT")
-        return count
+        return _report(
+            InsertOutcome(
+                status="partial" if row_rejections else "success",
+                inserted=count,
+                expected=input_count,
+                committed=True,
+                rejections=dict(row_rejections) if row_rejections else None,
+                detail=partial_note.lstrip("; ") or None,
+            )
+        )
     except Exception as exc:
         if not committed:
             try:
@@ -1732,6 +1874,22 @@ def insert_transactions(
         conn.close()
 
 
+def insert_transactions_outcome(doc_id, year, member, transactions, **kwargs):
+    """insert_transactions, returning the explicit committed outcome.
+
+    Same insert path and arguments; the int return value is replaced by the
+    ``InsertOutcome`` so callers never have to guess whether a positive
+    count was the full row set or a partial insert.
+    """
+    report: dict = {}
+    inserted = insert_transactions(
+        doc_id, year, member, transactions, report=report, **kwargs
+    )
+    return insert_outcome_from_report(
+        report, inserted=inserted, expected=kwargs.get("raw_count") if kwargs.get("raw_count") is not None else len(transactions)
+    )
+
+
 def validate_for_insert(conn, doc_id, member, transactions):
     filing_date = get_filing_date(conn, doc_id)
     expected_member = get_metadata_member(conn, doc_id)
@@ -1743,9 +1901,9 @@ def validate_for_insert(conn, doc_id, member, transactions):
 def _engine_b_configured() -> bool:
     """True when an engine-B endpoint is configured for dual read.
 
-    An unusable configuration (e.g. invalid VISION_B_TIMEOUT) degrades to the
-    single-engine drain rather than crashing the nightly batch — the same
-    tolerance dual_read() applies internally via the A_ONLY fallback.
+    Kept for callers that only need a cheap env check; main()'s dual mode
+    now preflights the configuration and alerts/stops on a defect instead of
+    silently degrading to the single-engine drain.
     """
     try:
         return VisionBConfig.from_env() is not None
@@ -1788,10 +1946,13 @@ def call_vision_b(
     Hashes and page-counts the same immutable snapshot bytes the artifact
     binding is checked against, asks engine B once with the shared extraction
     prompt, and validates the completion with the shared parser. No response
-    cache: a persisted success/no_txs parse run is the resume point (the doc
-    leaves the OCR work list), so --refresh is meaningless here. Transport,
-    configuration, and schema failures return (None, error, metadata) — the
-    batch-level quota stop is the caller's is_quota_error check.
+    cache. Programmatic helper only: the OCR_ENGINE=visionb batch drain now
+    routes through ``scripts.glm_stage``'s staging functions (canonical
+    ingestion of GLM rows happens ONLY via ``glm_stage promote``), so the
+    resume point for that drain is the staging record, not a parse run.
+    Transport, configuration, and schema failures return
+    (None, error, metadata) — the batch-level quota stop is the caller's
+    is_quota_error check.
     """
     metadata = None
     try:
@@ -1841,7 +2002,6 @@ def main():
         # GLM-primary mode must fail closed on an unusable engine-B setup:
         # silently draining with engine A would spend the scarce Gemini
         # quota this mode exists to conserve.
-        parser_version, engine_model = GLM_PARSER_VERSION, GLM_ENGINES_ATTEMPTED
         try:
             vision_b_config = VisionBConfig.from_env()
         except VisionBUnavailable as exc:
@@ -1854,11 +2014,39 @@ def main():
                 flush=True,
             )
             return
+    if mode == "dual":
+        # A dual run without a usable engine B would be unresolved for every
+        # doc in the batch: alert (config defect) and stop before spending
+        # engine A on readings nothing may persist.
+        try:
+            dual_config = VisionBConfig.from_env()
+        except VisionBUnavailable as exc:
+            print(
+                f"ALERT: dual read requested but engine B is unusable: {exc}; "
+                "stopping batch",
+                flush=True,
+            )
+            return
+        if dual_config is None:
+            print(
+                "ALERT: dual read requested but VISION_B_BASE_URL/"
+                "VISION_B_MODEL are not configured; stopping batch",
+                flush=True,
+            )
+            return
 
     pdfs = get_zero_row_pdfs()
     progress = load_progress()
     remaining = pdfs
     print(f"Current unresolved OCR work: {len(remaining)}")
+    if mode == "visionb":
+        _run_visionb_staging(remaining, vision_b_config)
+        print("\n=== DONE ===")
+        print(
+            "Total inserted: 0 (visionb mode stages only; canonical "
+            "ingestion of GLM rows happens via glm_stage promote)"
+        )
+        return
 
     total_inserted = 0
     for i, (doc_id, year, path) in enumerate(remaining):
@@ -1867,14 +2055,14 @@ def main():
 
         time.sleep(COOLDOWN)
 
-        if mode == "dual" and _engine_b_configured():
-            # Opt-in dual vision read (DUAL_READ=1 + engine B configured):
-            # engine A (Gemini) is gated against engine B per doc. AGREE and
-            # DISAGREE are persisted or quarantined by the orchestrator
-            # (per-doc commit inside insert_transactions/record_disagreement);
-            # engine-B absence falls through to the unchanged single-engine
-            # path below with A's result, so a DISAGREE never retries forever
-            # (the invalid/validated run row leaves the work list).
+        if mode == "dual":
+            # Opt-in dual vision read (DUAL_READ=1 / OCR_ENGINE=dual, engine
+            # B configured): engine A (Gemini) is gated against engine B per
+            # doc. AGREE and DISAGREE are persisted or quarantined by the
+            # orchestrator (per-doc commit inside insert_transactions/
+            # record_disagreement); engine-B absence is UNRESOLVED — nothing
+            # persists A-only, quota stops the batch, other outages land an
+            # error run that retries the doc next night.
             outcome = run_dual_read_for_doc(
                 DualReadDoc(
                     str(doc_id),
@@ -1894,11 +2082,8 @@ def main():
                     flush=True,
                 )
                 continue
-            if outcome.decision.status == A_ONLY and is_quota_error(
-                outcome.decision.diff_summary or ""
-            ):
-                # Engine-B quota stop must end the batch cleanly: continuing
-                # would drain the backlog as ungated A-only rows.
+            if outcome.decision.status == UNRESOLVED:
+                # Engine-B quota stop (unhandled == nothing persisted).
                 print("  Engine B quota exhausted; stopping batch", flush=True)
                 break
             output, error, artifact_metadata = (
@@ -1906,17 +2091,12 @@ def main():
                 outcome.error,
                 outcome.metadata,
             )
-        elif mode == "visionb":
-            # GLM-primary single-engine read: engine A is never contacted.
-            output, error, artifact_metadata = call_vision_b(
-                path, doc_id=doc_id, config=vision_b_config
-            )
         else:
             output, error, artifact_metadata = call_gemini(
                 path, doc_id=doc_id, refresh=args.refresh
             )
-        # A_ONLY passthrough carries error=None (engine A succeeded); the
-        # single-engine path always has a string here.
+        # A_ERROR passthrough carries error=None only when engine A
+        # succeeded; the single-engine path always has a string here.
         if is_quota_error(error or ""):
             print("  Quota exhausted; stopping batch", flush=True)
             break
@@ -1955,8 +2135,10 @@ def main():
         parsed = artifact_metadata.parsed
         assert parsed is not None, "successful Gemini response requires validated output"
         member, transactions = parsed.member, parsed.transactions
+        report: dict = {}
+        insert_outcome = None
         if not transactions:
-            insert_transactions(
+            insert_outcome = insert_transactions_outcome(
                 doc_id,
                 year,
                 member,
@@ -1968,13 +2150,24 @@ def main():
                 artifact_sha256=artifact_metadata.sha256,
                 ingestion_generation=ingestion_generation,
             )
-            mark_progress(progress, doc_id, "no_txs")
-            save_progress(progress)
-            print("  No transactions found", flush=True)
+            # A member rejection is not a no_txs: only a committed no_txs
+            # run may close the doc as "no transactions found".
+            if insert_outcome.complete:
+                mark_progress(progress, doc_id, "no_txs")
+                save_progress(progress)
+                print("  No transactions found", flush=True)
+            else:
+                mark_progress(progress, doc_id, "errors")
+                save_progress(progress)
+                print(
+                    "  ERROR: no-transaction run not committed "
+                    f"({insert_outcome.status})",
+                    flush=True,
+                )
             continue
 
         raw_count = len(transactions)
-        inserted = insert_transactions(
+        insert_outcome = insert_transactions_outcome(
             doc_id,
             year,
             member,
@@ -1986,14 +2179,27 @@ def main():
             artifact_sha256=artifact_metadata.sha256,
             ingestion_generation=ingestion_generation,
         )
-        total_inserted += inserted
-        mark_progress(progress, doc_id, "success" if inserted else "errors")
+        total_inserted += insert_outcome.inserted
+        # Partial or rejected output is never "complete": mark errors so the
+        # operator sees it, mirroring the dual path.
+        mark_progress(
+            progress,
+            doc_id,
+            "success" if insert_outcome.complete else "errors",
+        )
         save_progress(progress)
         print(f"  Member: {member}", flush=True)
         print(
-            f"  Inserted: {inserted}/{len(transactions)} transactions (total: {total_inserted})",
+            f"  Inserted: {insert_outcome.inserted}/{raw_count} transactions "
+            f"(total: {total_inserted})",
             flush=True,
         )
+        if not insert_outcome.complete:
+            print(
+                f"  ERROR: insert incomplete ({insert_outcome.status}); "
+                "partial output is not marked complete",
+                flush=True,
+            )
         for tx in transactions[:3]:
             print(
                 f"    {tx['asset']} | {tx['type']} | {tx['date']} | {tx['amount_letter']}",
@@ -2004,12 +2210,89 @@ def main():
     print(f"Total inserted: {total_inserted}")
 
 
+def _run_visionb_staging(remaining, vision_b_config) -> None:
+    """GLM-primary drain: write STAGING records, never canonical rows.
+
+    Engine A is never contacted and the canonical DB is never opened here:
+    every reading lands as a JSON staging record under
+    ``data/staging/glm-backlog`` (via ``scripts.glm_stage``'s staging
+    functions), and canonical ingestion happens ONLY through
+    ``glm_stage promote`` after the pixel audit. Already-staged docs are
+    skipped; quota exhaustion stops the batch cleanly; auth/config defects
+    alert and stop (every remaining doc would fail the same way).
+    """
+    from scripts import glm_stage
+
+    data_dir = os.path.dirname(DB_PATH) or "."
+    for i, (doc_id, year, path) in enumerate(remaining):
+        idx = i + 1
+        print(f"\n[{idx}/{len(remaining)}] {doc_id} ({year})...", flush=True)
+        if glm_stage.load_staging_record(data_dir, year, doc_id) is not None:
+            print(
+                "  already staged; skipping (canonical ingestion happens "
+                "only via glm_stage promote)",
+                flush=True,
+            )
+            continue
+        time.sleep(COOLDOWN)
+        record = glm_stage.build_staging_record(doc_id, year, path, vision_b_config)
+        error = record.get("error") or ""
+        if record["parse_status"] == "error" and (
+            record.get("error_kind") == "quota" or is_quota_error(error)
+        ):
+            print("  Quota exhausted; stopping batch", flush=True)
+            return
+        if record["parse_status"] == "error" and record.get("error_kind") in (
+            "auth",
+            "config",
+        ):
+            print(
+                f"ALERT: visionb {record.get('error_kind')} defect: {error}; "
+                "stopping batch",
+                flush=True,
+            )
+            return
+        glm_stage.write_staging_record(data_dir, record)
+        if record["parse_status"] == "error":
+            print(
+                f"  ERROR: {error} (staged as error record; canonical "
+                "ingestion happens only via glm_stage promote)",
+                flush=True,
+            )
+            continue
+        print(
+            f"  STAGED {record['parse_status']} rows={len(record['rows'])} "
+            "(canonical ingestion happens only via glm_stage promote)",
+            flush=True,
+        )
+
+
 def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = False):
     """Process unresolved deterministic OCR candidates for one year."""
     db_path = os.path.join(data_dir, "congress.duckdb")
     progress_path = Path(data_dir) / "ocr_progress_gemini_manual.json"
     remaining = get_ocr_work_items(db_path=db_path, data_dir=data_dir, year=year)
     print(f"Current unresolved OCR work for {year}: {len(remaining)}")
+    if dual_read_enabled():
+        # Same contract as main()'s dual mode: a dual run without a usable
+        # engine B is unresolved for every doc — alert the config defect and
+        # stop rather than draining A-only.
+        try:
+            dual_config = VisionBConfig.from_env()
+        except VisionBUnavailable as exc:
+            print(
+                f"ALERT: dual read requested but engine B is unusable: {exc}; "
+                "stopping batch",
+                flush=True,
+            )
+            return 0
+        if dual_config is None:
+            print(
+                "ALERT: dual read requested but VISION_B_BASE_URL/"
+                "VISION_B_MODEL are not configured; stopping batch",
+                flush=True,
+            )
+            return 0
     progress = load_progress(progress_path)
 
     total_inserted = 0
@@ -2019,8 +2302,9 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
         if dual_read_enabled():
             # Opt-in dual vision read (DUAL_READ=1): engine A (Gemini) is
             # gated against engine B per doc. AGREE/DISAGREE are persisted or
-            # quarantined by the orchestrator; engine-B absence falls through
-            # to the unchanged single-engine path below with A's result.
+            # quarantined by the orchestrator; engine-B absence is UNRESOLVED
+            # — quota stops the batch, other outages land an error run and
+            # are retried next time. Nothing persists A-only.
             outcome = run_dual_read_for_doc(
                 DualReadDoc(str(doc_id), yr, path, data_dir=data_dir, db_path=db_path),
                 refresh=refresh,
@@ -2034,6 +2318,10 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
                     flush=True,
                 )
                 continue
+            if outcome.decision.status == UNRESOLVED:
+                # Engine-B quota stop (unhandled == nothing persisted).
+                print("  Engine B quota exhausted; stopping batch", flush=True)
+                break
             output, error, artifact_metadata = (
                 outcome.output,
                 outcome.error,
@@ -2047,7 +2335,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
                 cache_dir=os.path.join(data_dir, "gemini_cache"),
                 parser_version=GEMINI_PARSER_VERSION,
             )
-        # A_ONLY passthrough carries error=None (engine A succeeded).
+        # A_ERROR passthrough carries error=None (engine A succeeded).
         if is_quota_error(error or ""):
             print("  Quota exhausted; stopping batch", flush=True)
             break
@@ -2085,7 +2373,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
         assert parsed is not None, "successful Gemini response requires validated output"
         member, transactions = parsed.member, parsed.transactions
         if not transactions:
-            insert_transactions(
+            no_tx_outcome = insert_transactions_outcome(
                 doc_id,
                 yr,
                 member,
@@ -2096,13 +2384,22 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
                 artifact_sha256=artifact_metadata.sha256,
                 ingestion_generation=ingestion_generation,
             )
-            mark_progress(progress, doc_id, "no_txs")
-            save_progress(progress, progress_path)
-            print("  No transactions found", flush=True)
+            if no_tx_outcome.complete:
+                mark_progress(progress, doc_id, "no_txs")
+                save_progress(progress, progress_path)
+                print("  No transactions found", flush=True)
+            else:
+                mark_progress(progress, doc_id, "errors")
+                save_progress(progress, progress_path)
+                print(
+                    "  ERROR: no-transaction run not committed "
+                    f"({no_tx_outcome.status})",
+                    flush=True,
+                )
             continue
 
         raw_count = len(transactions)
-        inserted = insert_transactions(
+        insert_outcome = insert_transactions_outcome(
             doc_id,
             yr,
             member,
@@ -2113,15 +2410,20 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             artifact_sha256=artifact_metadata.sha256,
             ingestion_generation=ingestion_generation,
         )
-        if inserted <= 0:
+        if not insert_outcome.complete:
+            # Rejected or partial: never call the output complete.
             mark_progress(progress, doc_id, "errors")
             save_progress(progress, progress_path)
-            print("  ERROR: validated rows were not inserted", flush=True)
+            print(
+                f"  ERROR: insert incomplete ({insert_outcome.status}); "
+                f"inserted={insert_outcome.inserted}/{raw_count}",
+                flush=True,
+            )
             continue
-        total_inserted += inserted
+        total_inserted += insert_outcome.inserted
         mark_progress(progress, doc_id, "success")
         save_progress(progress, progress_path)
-        print(f"  Inserted: {inserted}/{len(transactions)}", flush=True)
+        print(f"  Inserted: {insert_outcome.inserted}/{raw_count}", flush=True)
 
     return total_inserted
 

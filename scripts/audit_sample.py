@@ -9,10 +9,10 @@ owner-approved budget (illustrative <1% at 95% confidence).
 
 Finding 9 fail-closed semantics (report can never manufacture acceptance):
 
-* Every sampled doc requires an explicit verdict. Missing/invalid/None
-  verdicts make the doc UNRESOLVED; with any unresolved sampled doc the
-  report state is ``incomplete`` and ``budget_met`` is ``None`` (it can
-  never default to clean).
+* Every sampled doc requires an explicit verdict. For a doc without a
+  sticky failure, missing/invalid/None verdicts make it UNRESOLVED; with any
+  unresolved sampled doc the report state is ``incomplete`` and
+  ``budget_met`` is ``None`` (it can never default to clean).
 * A ``fail`` is STICKY for the population assessment: verdict records
   APPEND to ``audit-results.json`` (history) and the report uses the
   WORST verdict per doc. A later pass marks the doc repaired
@@ -21,16 +21,30 @@ Finding 9 fail-closed semantics (report can never manufacture acceptance):
 * The report is computed over a FROZEN sample lot: ``sample`` records
   doc_ids + per-doc staged-record sha256 + model + prompt_sha256 +
   parser_version in ``audit-sample-<seed>.json`` at sample time. The
-  report verifies each doc's CURRENT staged-record sha against the
-  frozen sha; mismatch -> UNRESOLVED ("recipe/staged-record changed
-  after sampling"). The sha excludes audit-mutable fields so that
+  report verifies each pass-only doc's CURRENT staged-record sha against
+  the frozen sha; mismatch -> UNRESOLVED ("recipe/staged-record changed
+  after sampling"). Sticky failures remain resolved regardless of later
+  staged-record drift. The sha excludes audit-mutable fields so that
   stamping a verdict never looks like drift.
-* Omission detection compares row MULTISETS of normalized
-  (asset, type, tx_date, notif_date, amount) tuples -- not counts --
-  and only when the ground-truth file exists; a pass-verdict doc
-  without ground truth is UNRESOLVED, never clean. Promotion consumes
-  staged rows, so omission checking must happen BEFORE ``promote``;
-  a promoted doc whose staging record is gone is UNRESOLVED.
+* Omission detection is optional. When ``--ground-truth-dir`` is supplied,
+  each passing doc needs a ground-truth file and its normalized row
+  MULTISET (asset, type, tx_date, notif_date, amount) must match the staged
+  rows; otherwise that doc is UNRESOLVED or a critical failure. Without the
+  option the report explicitly certifies pixels only, not row completeness.
+  Promotion consumes staged rows, so any requested omission check must run
+  BEFORE ``promote``; a passing doc whose staging record is gone is
+  UNRESOLVED.
+* Completion is distinct from budget acceptance. A report is ``complete``
+  only when a valid, non-empty frozen lot is available, every lot doc has a
+  resolving verdict, and every passing doc has current frozen-record
+  evidence (plus row-multiset evidence when ground truth was requested).
+  A sticky fail is resolved evidence even if it was later re-recorded; a
+  later pass does not erase it. Verdicts outside the frozen lot do not block
+  completion or enter the current-lot binomial bound, but their sticky
+  failures remain in a separate all-history population tally. ``budget_met``
+  is always a boolean for a complete report and means the critical-only
+  current-lot exact upper bound is <= ``--max-rate``; it is ``None`` only
+  for an incomplete report.
 * Stratification is reported honestly: per-stratum counts/rates plus a
   pooled rate weighted by staged population counts per year (frozen at
   sample time). Without population weights the pooled rate falls back
@@ -67,12 +81,14 @@ Subcommands:
 * ``report  [--max-rate 0.01] [--ground-truth-dir DIR] [--sample-file P]``
     Material-error accounting over the frozen lot with the one-sided
     exact 95% binomial upper bound. Exit codes: 0 complete + budget met,
-    1 complete + budget NOT met, 2 INCOMPLETE audit (refuses: budget
-    cannot be computed). Writes ``audit-report-state.json`` next to the
+    1 complete + budget NOT met, 2 INCOMPLETE audit (refuses: the full-lot
+    budget cannot be certified). Writes ``audit-report-state.json`` next to the
     results file with ``state`` in {"complete", "incomplete"} and
     ``budget_met`` in {true, false, null} -- the loose file contract
-    ``promote --require-audit-pass`` should consult and refuse on when
-    ``state != "complete"`` or ``budget_met is not True``.
+    ``promote --require-audit-pass`` should consult and refuse when
+    ``state != "complete"`` or ``budget_met is not True``. A complete report
+    may still miss the owner budget; that is a completed measurement, not an
+    incomplete audit.
 
 Every report begins with the ruling caveat:
 
@@ -128,8 +144,8 @@ CAVEAT = (
     "pixel verification"
 )
 PROMOTE_ORDER_NOTE = (
-    "NOTE: promotion consumes staged rows; run this report's omission "
-    "checks BEFORE `promote`."
+    "NOTE: Promotion consumes staged rows; if you request omission checks, "
+    "run this report BEFORE `promote`."
 )
 
 
@@ -761,6 +777,35 @@ def _weighted_pooled_rate(
     )
 
 
+def _completion_guidance(reason: str) -> str:
+    """One actionable repair for each condition that prevents completion."""
+    reason = reason.lower()
+    if "no verdict recorded" in reason or "invalid/missing verdict" in reason:
+        return (
+            "record an explicit verdict with audit_sample.py record --doc-id "
+            "<id> --verdict pass|fail"
+        )
+    if "recipe/staged-record changed" in reason:
+        return "restore the sampled record or re-freeze and re-audit the changed record"
+    if "staging record missing" in reason:
+        return "run report before promote; restore/re-stage this record and re-audit it"
+    if "no ground-truth file" in reason:
+        return (
+            "add <ground-truth-dir>/<id>.json, or omit --ground-truth-dir for an "
+            "explicit pixel-only certification"
+        )
+    if "staged rows unavailable" in reason:
+        return (
+            "restore staged rows and report before promote, or omit "
+            "--ground-truth-dir for pixel-only certification"
+        )
+    if "current staged records not supplied" in reason:
+        return "rerun report with the live staged records available"
+    if "frozen sample lot" in reason or "frozen lot" in reason or "sample file" in reason:
+        return "create/replace the lot with audit_sample.py sample --per-year N --seed S"
+    return "resolve this condition, then rerun audit_sample.py report; do not promote"
+
+
 def build_report(
     results: list[dict],
     staged_rows_by_doc: dict[str, list],
@@ -778,15 +823,15 @@ def build_report(
     Verdict semantics (finding 9): the audit history is append-only and
     the WORST verdict per doc wins. Any recorded ``fail`` is STICKY — a
     later pass marks the doc repaired (``repaired_count``) but the
-    failure stays in numerator and denominator; missing/invalid/None
-    verdicts make the doc UNRESOLVED. With a frozen ``lot``, docs whose
-    current staged-record sha256 no longer matches the frozen sha are
-    UNRESOLVED ("recipe/staged-record changed after sampling"), as are
-    lot docs without any recorded verdict. A pass-verdict doc is only
-    CLEAN when (ground truth supplied) its ground-truth row MULTISET
-    (normalized (asset, type, tx_date, notif_date, amount) tuples) equals
-    the staged multiset and it has been promoted; a missing ground-truth
-    file is UNRESOLVED, never clean.
+    failure stays in numerator and denominator; a sticky fail is resolved
+    evidence. Missing/invalid/None verdicts make a doc UNRESOLVED. A
+    pass-only doc with a frozen lot must still have a current staged record
+    whose sha matches the frozen sha. If ``ground_truth_dir`` is supplied,
+    the ground-truth file and staged rows must also be available and their
+    normalized row MULTISETS (asset, type, tx_date, notif_date, amount)
+    equal. Ground truth is optional: without it, passes are pixel-only.
+    Promotion is not required for a pass to resolve, but a promoted doc
+    whose staging record is gone is UNRESOLVED.
 
     Owner-approved error budget: ``budget_met``, ``rate`` and
     ``upper_bound`` are computed over CRITICAL fails only
@@ -802,22 +847,56 @@ def build_report(
     operator can re-record them. Critical dominates: an explicit
     critical fail is never downgraded by a later cosmetic re-record.
 
-    ``state`` is "incomplete" (and ``budget_met`` None — the budget can
-    not be computed, the report refuses) whenever any sampled doc is
-    unresolved or verdicts exist outside the frozen lot.
+    Completion contract: with a frozen lot, ``state`` is "complete" iff the
+    lot is non-empty and every lot doc resolves. A sticky fail resolves a
+    doc without further evidence checks. A pass-only doc resolves only when
+    its current staging record matches the frozen sha; if ground truth was
+    requested, its ground-truth file and staged rows must also be available
+    and their normalized row multisets must match. Missing/invalid verdicts,
+    missing staged records, sha drift, requested-but-missing ground truth,
+    unavailable row data, malformed/empty lots all make the state
+    "incomplete" and are named in ``completion_reasons``. Passed-but-
+    unpromoted docs are resolved; the report is intended to run before
+    promotion. Verdicts outside the lot do not block completion and are
+    excluded from the current-lot rate/bound, but sticky outside-lot fails
+    remain visible in the additive all-history ``population_*`` tally.
+    The statistical budget is intentionally per frozen lot: mixing prior
+    out-of-sample failures into this lot's numerator while retaining its
+    denominator would not be a valid bound for the frozen-lot estimand.
+
+    ``budget_met`` is None only when incomplete; for every complete report
+    it is a real bool, ``upper_bound <= max_rate`` (or False when there are
+    no resolved docs to measure).
     """
     history: dict[str, list[dict]] = {}
     for entry in results or []:
         if isinstance(entry, dict) and "doc_id" in entry:
             history.setdefault(str(entry["doc_id"]), []).append(entry)
 
+    lot_issues: list[str] = []
     if lot is not None:
-        lot_by_id = {
-            str(item["doc_id"]): item
-            for item in lot
-            if isinstance(item, dict) and "doc_id" in item
-        }
+        lot_by_id = {}
+        for index, item in enumerate(lot):
+            if not isinstance(item, dict) or not str(item.get("doc_id") or "").strip():
+                lot_issues.append(
+                    f"malformed frozen lot entry at index {index} (missing doc_id)"
+                )
+                continue
+            doc_id = str(item["doc_id"])
+            if doc_id in lot_by_id:
+                lot_issues.append(f"duplicate doc_id {doc_id} in frozen lot")
+                continue
+            try:
+                int(item["year"])
+            except (KeyError, TypeError, ValueError):
+                lot_issues.append(
+                    f"malformed frozen lot entry for {doc_id} (invalid year)"
+                )
+                item = {**item, "year": 0}
+            lot_by_id[doc_id] = item
         population = sorted(lot_by_id)
+        if not population:
+            lot_issues.append("frozen sample lot contains no valid documents")
     else:
         lot_by_id = {}
         population = sorted(history)
@@ -937,6 +1016,31 @@ def build_report(
     cosmetic_failures = [
         (doc_id, reason) for doc_id, reason, s in failure_records if s == "cosmetic"
     ]
+    outside_lot_critical_failures: list[tuple[str, str]] = []
+    outside_lot_cosmetic_failures: list[tuple[str, str]] = []
+    outside_lot_passes: list[str] = []
+    outside_lot_unresolved: list[str] = []
+    for doc_id in outside_lot:
+        entries = history[doc_id]
+        verdicts = [_verdict_of(entry) for entry in entries]
+        if "fail" in verdicts:
+            fail_entries = [
+                entry for entry, verdict in zip(entries, verdicts) if verdict == "fail"
+            ]
+            severity, _ = _doc_fail_severity(fail_entries)
+            target = (
+                outside_lot_critical_failures
+                if severity == "critical"
+                else outside_lot_cosmetic_failures
+            )
+            target.append((doc_id, "verdict:fail"))
+        elif verdicts and all(verdict == "pass" for verdict in verdicts):
+            outside_lot_passes.append(doc_id)
+        else:
+            outside_lot_unresolved.append(doc_id)
+    population_critical_failures = critical_failures + outside_lot_critical_failures
+    population_cosmetic_failures = cosmetic_failures + outside_lot_cosmetic_failures
+    population_failures = population_critical_failures + population_cosmetic_failures
     failed_ids = {doc_id for doc_id, _ in failures}
     critical_ids = {doc_id for doc_id, _ in critical_failures}
     unresolved_ids = {doc_id for doc_id, _ in unresolved}
@@ -950,7 +1054,11 @@ def build_report(
         else float("nan")
     )
 
-    complete = not unresolved and not outside_lot
+    completion_reasons = list(lot_issues)
+    completion_reasons.extend(
+        f"{doc_id}: {reason}" for doc_id, reason in unresolved
+    )
+    complete = not completion_reasons
     if not complete:
         budget_met = None
     elif audited:
@@ -1014,6 +1122,10 @@ def build_report(
 
     return {
         "state": "complete" if complete else "incomplete",
+        "completion_reasons": completion_reasons,
+        "completion_guidance": [
+            _completion_guidance(reason) for reason in completion_reasons
+        ],
         "caveat": CAVEAT,
         "lot_size": len(population),
         "audited": audited,
@@ -1023,6 +1135,12 @@ def build_report(
         "critical_failure_count": critical_failure_count,
         "cosmetic_failures": cosmetic_failures,
         "cosmetic_failure_count": len(cosmetic_failures),
+        "population_failures": population_failures,
+        "population_failure_count": len(population_failures),
+        "population_critical_failures": population_critical_failures,
+        "population_critical_failure_count": len(population_critical_failures),
+        "population_cosmetic_failures": population_cosmetic_failures,
+        "population_cosmetic_failure_count": len(population_cosmetic_failures),
         "legacy_unclassified_failures": legacy_unclassified,
         "clean": clean,
         "passed_unpromoted": passed_unpromoted,
@@ -1032,6 +1150,15 @@ def build_report(
         "repaired": repaired,
         "repaired_count": len(repaired),
         "outside_lot": outside_lot,
+        "outside_lot_critical_failures": outside_lot_critical_failures,
+        "outside_lot_critical_failure_count": len(outside_lot_critical_failures),
+        "outside_lot_cosmetic_failures": outside_lot_cosmetic_failures,
+        "outside_lot_cosmetic_failure_count": len(outside_lot_cosmetic_failures),
+        "outside_lot_passes": outside_lot_passes,
+        "outside_lot_unresolved": outside_lot_unresolved,
+        "omission_check_status": (
+            "configured" if ground_truth_dir is not None else "not_run"
+        ),
         "omission_details": omission_details,
         "rate": rate,
         "upper_bound": upper,
@@ -1056,11 +1183,19 @@ def _num_or_none(value: float) -> float | None:
     return value
 
 
-def _incomplete_state_payload(reason: str, *, max_rate: float, sample_file: str | None) -> dict:
+def _incomplete_state_payload(
+    reason: str,
+    *,
+    max_rate: float,
+    sample_file: str | None,
+    omission_check_status: str = "not_run",
+) -> dict:
     return {
         "schema": REPORT_STATE_SCHEMA,
         "state": "incomplete",
         "reason": reason,
+        "completion_reasons": [reason],
+        "completion_guidance": [_completion_guidance(reason)],
         "budget_met": None,
         "lot_size": 0,
         "audited": 0,
@@ -1069,6 +1204,11 @@ def _incomplete_state_payload(reason: str, *, max_rate: float, sample_file: str 
         "critical_failure_count": 0,
         "cosmetic_failures": [],
         "cosmetic_failure_count": 0,
+        "population_critical_failures": [],
+        "population_critical_failure_count": 0,
+        "population_cosmetic_failures": [],
+        "population_cosmetic_failure_count": 0,
+        "population_failure_count": 0,
         "unresolved_count": 0,
         "unresolved": [],
         "repaired_count": 0,
@@ -1079,6 +1219,14 @@ def _incomplete_state_payload(reason: str, *, max_rate: float, sample_file: str 
         "pooled_rate": None,
         "pooling_method": None,
         "sample_file": sample_file,
+        "outside_lot": [],
+        "outside_lot_critical_failures": [],
+        "outside_lot_critical_failure_count": 0,
+        "outside_lot_cosmetic_failures": [],
+        "outside_lot_cosmetic_failure_count": 0,
+        "outside_lot_passes": [],
+        "outside_lot_unresolved": [],
+        "omission_check_status": omission_check_status,
         "caveat": CAVEAT,
         "generated_at_utc": utc_now_iso(),
     }
@@ -1090,11 +1238,17 @@ def cmd_report(args) -> int:
 
     if envelope is None:
         state_payload = _incomplete_state_payload(
-            lot_error, max_rate=args.max_rate, sample_file=None
+            lot_error,
+            max_rate=args.max_rate,
+            sample_file=None,
+            omission_check_status=(
+                "configured" if args.ground_truth_dir is not None else "not_run"
+            ),
         )
         _atomic_write_json(root / REPORT_STATE_NAME, state_payload)
         print(CAVEAT)
         print(f"INCOMPLETE AUDIT: {lot_error}")
+        print(f"HOW TO FIX: {_completion_guidance(lot_error)}")
         print("budget_met cannot be computed; canonical promotion must not proceed.")
         return 2
 
@@ -1130,8 +1284,9 @@ def cmd_report(args) -> int:
     print(PROMOTE_ORDER_NOTE)
     if args.ground_truth_dir is None:
         print(
-            "Omission checking DISABLED (--ground-truth-dir not provided); "
-            "pass-verdict docs are only pixel-checked, not row-checked."
+            "Omission check not run (--ground-truth-dir not provided); "
+            "this is a pixel-only certification, not a row-completeness check. "
+            "Use --ground-truth-dir to add row-multiset omission/invention checking."
         )
     print(f"Audited (resolved) docs:   {report['audited']} of lot {report['lot_size']}")
     rate_text = pct(report["rate"]) if report["audited"] else "n/a"
@@ -1172,20 +1327,53 @@ def cmd_report(args) -> int:
             print(f"  LEGACY-UNCLASSIFIED {doc_id}")
     print(f"Clean (pass+promoted):     {len(report['clean'])}")
     print(f"Passed but not promoted:   {len(report['passed_unpromoted'])}")
-    if report["unresolved"]:
-        print(
-            f"INCOMPLETE AUDIT: {report['unresolved_count']} unresolved — "
-            "budget_met cannot be computed (fail-closed, never clean)"
+    if report["state"] != "complete":
+        reason_text = "; ".join(report["completion_reasons"])
+        prefix = (
+            f"{report['unresolved_count']} unresolved sampled docs"
+            if report["unresolved_count"]
+            else reason_text
         )
+        print(
+            f"INCOMPLETE AUDIT: {prefix}; budget_met cannot be computed and "
+            "the full-lot budget cannot be certified "
+            "(fail-closed, never clean)"
+        )
+        for reason, guidance in zip(
+            report["completion_reasons"], report["completion_guidance"]
+        ):
+            print(f"  INCOMPLETE-REASON {reason}; HOW TO FIX: {guidance}")
+    if report["unresolved"]:
         for doc_id, reason in report["unresolved"]:
             print(f"  UNRESOLVED {doc_id}: {reason}")
     if report["outside_lot"]:
         print(
-            f"WARNING: {len(report['outside_lot'])} verdict(s) recorded outside "
-            "the frozen sample lot; re-freeze the lot or investigate."
+            f"WARN: {len(report['outside_lot'])} OUTSIDE-LOT doc(s) have historical "
+            "verdicts; they do not block current-lot completion. Population sticky "
+            f"tally: {report['population_critical_failure_count']} critical and "
+            f"{report['population_cosmetic_failure_count']} cosmetic failure(s) "
+            "across history, including the outside-lot contribution of "
+            f"{report['outside_lot_critical_failure_count']} critical and "
+            f"{report['outside_lot_cosmetic_failure_count']} cosmetic. Current-lot "
+            f"rate/bound use n={report['audited']} and exclude outside-lot docs."
         )
+        outside_critical = {
+            doc_id for doc_id, _ in report["outside_lot_critical_failures"]
+        }
+        outside_cosmetic = {
+            doc_id for doc_id, _ in report["outside_lot_cosmetic_failures"]
+        }
+        outside_passes = set(report["outside_lot_passes"])
         for doc_id in report["outside_lot"]:
-            print(f"  OUTSIDE-LOT {doc_id}")
+            if doc_id in outside_critical:
+                status = "fail (critical; remains in population tally)"
+            elif doc_id in outside_cosmetic:
+                status = "fail (cosmetic; remains in population tally)"
+            elif doc_id in outside_passes:
+                status = "pass-only"
+            else:
+                status = "unresolved/invalid history (outside this lot)"
+            print(f"  OUTSIDE-LOT {doc_id}: {status}")
     for stratum in report["strata"]:
         rate_text = (
             pct(stratum["rate"]) if stratum["rate"] is not None else "n/a"
@@ -1208,8 +1396,8 @@ def cmd_report(args) -> int:
         )
         met = report["budget_met"]
         print(
-            f"Owner budget (critical-error rate < {pct(report['max_rate'])} "
-            f"at {report['confidence']:.0%} confidence): "
+            f"Owner budget (critical-only exact upper bound <= "
+            f"{pct(report['max_rate'])} at {report['confidence']:.0%} confidence): "
             f"{'MET' if met else 'NOT MET'}"
         )
         if met and report["cosmetic_failure_count"]:
@@ -1227,15 +1415,13 @@ def cmd_report(args) -> int:
         print("No audit results yet; record verdicts first.")
 
     if report["state"] != "complete":
-        reason = f"{report['unresolved_count']} unresolved sampled docs"
-        if report["outside_lot"]:
-            reason += (
-                f"; {len(report['outside_lot'])} verdict(s) outside the frozen lot"
-            )
+        reason = "; ".join(report["completion_reasons"])
         state_payload = {
             "schema": REPORT_STATE_SCHEMA,
             "state": "incomplete",
             "reason": reason,
+            "completion_reasons": report["completion_reasons"],
+            "completion_guidance": report["completion_guidance"],
             "budget_met": None,
             "lot_size": report["lot_size"],
             "audited": report["audited"],
@@ -1248,6 +1434,19 @@ def cmd_report(args) -> int:
                 [d, r] for d, r in report["cosmetic_failures"]
             ],
             "cosmetic_failure_count": report["cosmetic_failure_count"],
+            "population_critical_failures": [
+                [d, r] for d, r in report["population_critical_failures"]
+            ],
+            "population_critical_failure_count": report[
+                "population_critical_failure_count"
+            ],
+            "population_cosmetic_failures": [
+                [d, r] for d, r in report["population_cosmetic_failures"]
+            ],
+            "population_cosmetic_failure_count": report[
+                "population_cosmetic_failure_count"
+            ],
+            "population_failure_count": report["population_failure_count"],
             "unresolved_count": report["unresolved_count"],
             "unresolved": [[d, r] for d, r in report["unresolved"]],
             "repaired_count": report["repaired_count"],
@@ -1258,6 +1457,22 @@ def cmd_report(args) -> int:
             "pooled_rate": _num_or_none(report["pooled_rate"]),
             "pooling_method": report["pooling_method"],
             "sample_file": sample_file_name,
+            "outside_lot": report["outside_lot"],
+            "outside_lot_critical_failures": [
+                [d, r] for d, r in report["outside_lot_critical_failures"]
+            ],
+            "outside_lot_critical_failure_count": report[
+                "outside_lot_critical_failure_count"
+            ],
+            "outside_lot_cosmetic_failures": [
+                [d, r] for d, r in report["outside_lot_cosmetic_failures"]
+            ],
+            "outside_lot_cosmetic_failure_count": report[
+                "outside_lot_cosmetic_failure_count"
+            ],
+            "outside_lot_passes": report["outside_lot_passes"],
+            "outside_lot_unresolved": report["outside_lot_unresolved"],
+            "omission_check_status": report["omission_check_status"],
             "caveat": CAVEAT,
             "generated_at_utc": utc_now_iso(),
         }
@@ -1266,6 +1481,8 @@ def cmd_report(args) -> int:
             "schema": REPORT_STATE_SCHEMA,
             "state": "complete",
             "reason": None,
+            "completion_reasons": [],
+            "completion_guidance": [],
             "budget_met": report["budget_met"],
             "lot_size": report["lot_size"],
             "audited": report["audited"],
@@ -1278,6 +1495,19 @@ def cmd_report(args) -> int:
                 [d, r] for d, r in report["cosmetic_failures"]
             ],
             "cosmetic_failure_count": report["cosmetic_failure_count"],
+            "population_critical_failures": [
+                [d, r] for d, r in report["population_critical_failures"]
+            ],
+            "population_critical_failure_count": report[
+                "population_critical_failure_count"
+            ],
+            "population_cosmetic_failures": [
+                [d, r] for d, r in report["population_cosmetic_failures"]
+            ],
+            "population_cosmetic_failure_count": report[
+                "population_cosmetic_failure_count"
+            ],
+            "population_failure_count": report["population_failure_count"],
             "unresolved_count": 0,
             "unresolved": [],
             "repaired_count": report["repaired_count"],
@@ -1288,6 +1518,22 @@ def cmd_report(args) -> int:
             "pooled_rate": _num_or_none(report["pooled_rate"]),
             "pooling_method": report["pooling_method"],
             "sample_file": sample_file_name,
+            "outside_lot": report["outside_lot"],
+            "outside_lot_critical_failures": [
+                [d, r] for d, r in report["outside_lot_critical_failures"]
+            ],
+            "outside_lot_critical_failure_count": report[
+                "outside_lot_critical_failure_count"
+            ],
+            "outside_lot_cosmetic_failures": [
+                [d, r] for d, r in report["outside_lot_cosmetic_failures"]
+            ],
+            "outside_lot_cosmetic_failure_count": report[
+                "outside_lot_cosmetic_failure_count"
+            ],
+            "outside_lot_passes": report["outside_lot_passes"],
+            "outside_lot_unresolved": report["outside_lot_unresolved"],
+            "omission_check_status": report["omission_check_status"],
             "caveat": CAVEAT,
             "generated_at_utc": utc_now_iso(),
         }

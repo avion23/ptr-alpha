@@ -441,11 +441,29 @@ def write_report_state(data_dir, *, state="complete", budget_met=True, schema="a
     if raw is not None:
         (root / "audit-report-state.json").write_text(raw, encoding="utf-8")
         return
+    lot_size = 299 if state == "complete" and budget_met is True else 30
+    audited = lot_size if state == "complete" else lot_size - 1
     payload = {
         "schema": schema,
         "state": state,
         "reason": None if state == "complete" else "unresolved sampled docs",
+        "completion_reasons": [] if state == "complete" else ["fixture: no verdict recorded"],
+        "completion_guidance": [] if state == "complete" else ["record an explicit verdict"],
         "budget_met": budget_met,
+        "lot_size": lot_size,
+        "audited": audited,
+        "critical_failures": [],
+        "critical_failure_count": 0,
+        "cosmetic_failures": [],
+        "cosmetic_failure_count": 0,
+        "unresolved_count": 0 if state == "complete" else 1,
+        "unresolved": [] if state == "complete" else [["fixture", "no verdict recorded"]],
+        "rate": 0.0,
+        "upper_bound": audit_sample.binomial_upper_bound(0, audited),
+        "confidence": 0.95,
+        "max_rate": 0.01,
+        "population_critical_failure_count": 0,
+        "omission_check_status": "not_run",
     }
     (root / "audit-report-state.json").write_text(
         json.dumps(payload), encoding="utf-8"
@@ -541,6 +559,11 @@ def test_promote_audit_approval_is_mandatory(data_dir, fake_insert, capsys):
     write_report_state(data_dir, state="incomplete", budget_met=None)
     incomplete = glm_stage.promote_docs(2024, ["2003"], data_dir=data_dir)
     assert incomplete["refused"] == 1 and incomplete["promoted"] == 0
+    incomplete_out = capsys.readouterr().out
+    assert "state incomplete because fixture: no verdict recorded" in incomplete_out
+    assert "how to fix: record an explicit verdict" in incomplete_out
+    assert "resolved-only diagnostics: 0/29 resolved (lot n=30)" in incomplete_out
+    assert "95% upper bound" in incomplete_out and "max_rate 1%" in incomplete_out
     write_report_state(data_dir, state="complete", budget_met=False)
     budget_blown = glm_stage.promote_docs(2024, ["2003"], data_dir=data_dir)
     assert budget_blown["refused"] == 1 and budget_blown["promoted"] == 0
@@ -573,6 +596,22 @@ def test_promote_refuses_malformed_or_foreign_report_state(data_dir, fake_insert
     assert result["refused"] == 1 and result["promoted"] == 0
     assert fake_insert == []
     assert "audit report state missing" in capsys.readouterr().out
+    # A complete/true stamp without supporting lot/bound metrics is ambiguous.
+    write_report_state(
+        data_dir,
+        raw=json.dumps(
+            {
+                "schema": "audit-report-state-v2",
+                "state": "complete",
+                "budget_met": True,
+            }
+        ),
+    )
+    result = glm_stage.promote_docs(2024, ["2007"], data_dir=data_dir)
+    assert result["refused"] == 1 and result["promoted"] == 0
+    out = capsys.readouterr().out
+    assert "required gate metrics are missing or invalid" in out
+    assert "lot_size" in out and "upper_bound" in out
     # A foreign schema version is equally untrusted.
     write_report_state(data_dir, schema="audit-report-state-v1")
     result = glm_stage.promote_docs(2024, ["2007"], data_dir=data_dir)
@@ -973,6 +1012,95 @@ def test_report_budget_met_for_clean_299_sample():
     assert len(report["clean"]) == 299
     assert report["budget_met"] is True
     assert report["upper_bound"] <= 0.01
+
+
+def test_live_30_doc_report_refusal_names_budget_math(
+    data_dir, fake_insert, capsys
+):
+    doc_ids = [
+        "20005631", "20006505", "20006545", "20006739", "20006747",
+        "20006751", "20006839", "20006944", "20006996", "20007206",
+        "20007208", "20007359", "20007420", "20007551", "20007588",
+        "20007592", "20007596", "20007702", "20007716", "20007829",
+        "20007899", "20007964", "20007971", "20008047", "20008135",
+        "20008194", "20008277", "20008431", "20008488", "20008556",
+    ]
+    write_staged_records(data_dir, {2017: doc_ids})
+    records = audit_sample.load_staging_records(data_dir)
+    sample = [
+        {"doc_id": record["doc_id"], "year": year}
+        for year, record in records
+    ]
+    root = glm_stage.staging_root(data_dir)
+    audit_sample.write_sample_file(
+        records,
+        sample,
+        seed=20261019,
+        per_year=30,
+        out_path=root / "audit-sample-20261019.json",
+    )
+    cosmetic_doc = "20006747"
+    for doc_id in doc_ids:
+        if doc_id == cosmetic_doc:
+            continue
+        audit_sample.record_verdict(data_dir, doc_id, "pass", "pixel match")
+    # Re-recorded cosmetic failure remains resolved but does not count as critical.
+    audit_sample.record_verdict(
+        data_dir, cosmetic_doc, "fail", "asset text only", severity="cosmetic"
+    )
+    audit_sample.record_verdict(
+        data_dir, cosmetic_doc, "fail", "reconfirmed text-only", severity="cosmetic"
+    )
+    # The real eight prior-lot verdicts must remain in the population tally.
+    for doc_id in ("20006438", "20006516"):
+        audit_sample.record_verdict(
+            data_dir, doc_id, "fail", "reclassified text-only", severity="cosmetic"
+        )
+    audit_sample.record_verdict(
+        data_dir,
+        "20006575",
+        "fail",
+        "transaction_type Sale-vs-Purchase",
+        severity="critical",
+    )
+    audit_sample.record_verdict(
+        data_dir, "20006575", "pass", "later re-check; sticky fail remains"
+    )
+    for doc_id in ("20006470", "20006657", "20006682", "20006694", "20006832"):
+        audit_sample.record_verdict(data_dir, doc_id, "pass", "historical pass")
+
+    report_rc = audit_sample.main(
+        ["--data-dir", str(data_dir), "report", "--max-rate", "0.01"]
+    )
+    report_state = glm_stage.audit_report_state(data_dir)
+    assert report_rc == 1
+    assert report_state["state"] == "complete"
+    assert report_state["budget_met"] is False
+    assert report_state["critical_failure_count"] == 0
+    assert report_state["audited"] == 30
+    assert report_state["upper_bound"] == pytest.approx(0.09503385285530411)
+    assert report_state["outside_lot"] == sorted(
+        [
+            "20006438", "20006470", "20006516", "20006575", "20006657",
+            "20006682", "20006694", "20006832",
+        ]
+    )
+    assert report_state["population_critical_failure_count"] == 1
+    capsys.readouterr()
+
+    result = glm_stage.promote_docs(2017, [doc_ids[0]], data_dir=data_dir)
+    out = capsys.readouterr().out
+    assert result == {"year": 2017, "promoted": 0, "refused": 1, "failed": 0}
+    assert fake_insert == []
+    assert "complete but the critical error budget is not met" in out
+    assert "critical 0/30 resolved (lot n=30)" in out
+    assert "rate 0%" in out
+    assert "95% one-sided upper bound 9.503%" in out
+    assert "max_rate 1%" in out
+    assert "budget_met=False" in out
+    assert "population sticky critical-failure tally 1 across audit history" in out
+    assert "outside-lot failures remain visible, excluded from the current-lot bound" in out
+    assert "omission check not run" in out
 
 
 # --------------------------------------------------------------------------

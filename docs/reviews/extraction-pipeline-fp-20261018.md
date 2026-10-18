@@ -112,6 +112,24 @@ sourced by `cron/backlog_ocr.sh` — never committed). The MLX/Mac endpoint
 spec (`mlx-vision-endpoint-spec-20261018.md`) becomes a third reader /
 fallback for a future GPU-less-Mac scenario, not a requirement.
 
+## Owner decision recorded (2026-10-18): the error budget
+
+The owner set the promotion standard: **transaction-critical fields —
+transaction_type, transaction_date, ticker/asset-identity, amount_letter —
+must be error-free. Asset-description TEXT normalization differences (the
+observed GLM failure mode: repeated issuer wording dropped, minor character
+mangling) are COSMETIC: flagged, tracked, not blocking.**
+
+Evidence basis: 246 audited rows across 30 docs — transaction-critical
+fields 100% clean; the single population FAIL and the three 150-DPI quarantine
+fails were all asset-text-only except one type inversion, which the dual-read
+gate and the pixel audit both catch.
+
+Implementation: audit verdicts gain severity (critical/cosmetic); the
+promotion budget counts critical fails only; cosmetic fails are reported and
+listed. The promote gate requires a complete audit-report state with
+budget_met on the critical rate.
+
 ## Decision update (2026-10-18, post-ParseBench)
 
 ParseBench (parsebench.ai, 147 methods) changes decision 2: the operator

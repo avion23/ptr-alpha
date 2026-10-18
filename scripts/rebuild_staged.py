@@ -2459,6 +2459,7 @@ def repair_audit_gaps(args) -> None:
                           OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
                           OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
                           OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini+%'
+                          OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'visionb%'
                         THEN 'gemini_ocr'
                         ELSE 'house_pdf'
                     END
@@ -2481,6 +2482,7 @@ def repair_audit_gaps(args) -> None:
                         OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
                         OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
                         OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini+%'
+                        OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'visionb%'
                       THEN 'gemini_ocr'
                       ELSE 'house_pdf'
                   END
@@ -2509,6 +2511,7 @@ def repair_audit_gaps(args) -> None:
                         OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'openrouter/%'
                         OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gpt-%'
                         OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'gemini+%'
+                        OR LOWER(COALESCE(p.engines_attempted, '')) LIKE 'visionb%'
                       THEN 'gemini_ocr'
                       ELSE 'house_pdf'
                   END

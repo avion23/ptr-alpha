@@ -188,6 +188,42 @@ def read_document_with_vision_b(
     return text
 
 
+def read_document_with_engine_b(
+    doc: DualReadDoc,
+    *,
+    config: VisionBConfig | None = None,
+    env: Mapping[str, str] | None = None,
+    page_images: Callable[[str, int], list[str]] | None = None,
+    page_count: int | None = None,
+) -> str:
+    """Read one whole document with engine B alone and return the raw output.
+
+    Engine-B-primary single-engine mode (OCR_ENGINE=visionb): rasterize the
+    document and ask engine B in one request with the shared extraction
+    prompt. Unlike the dual-read gate there is NO engine-A fallback here —
+    any transport/configuration problem raises ``VisionBUnavailable`` so the
+    caller records a failed attempt instead of silently spending engine A
+    (the scarce Gemini quota this mode exists to conserve). When
+    ``page_count`` is not supplied it is derived from the PDF itself.
+    """
+    if config is None:
+        try:
+            config = VisionBConfig.from_env(env)
+        except VisionBUnavailable:
+            config = None
+    if config is None:
+        raise VisionBUnavailable(
+            "visionb is not configured: set VISION_B_BASE_URL and VISION_B_MODEL"
+        )
+    if page_count is None:
+        try:
+            page_count = _gemini_common().pdf_page_count(doc.pdf_path)
+        except OSError as exc:
+            raise VisionBUnavailable(f"visionb page count failed: {exc}") from exc
+    images = (page_images or _default_page_data_urls)(doc.pdf_path, page_count)
+    return read_document_with_vision_b(images, config)
+
+
 def _default_page_data_urls(pdf_path: str, page_count: int) -> list[str]:
     """Rasterize every PDF page to a base64 PNG data URL (engine-B input)."""
     try:

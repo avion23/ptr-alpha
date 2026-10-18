@@ -487,7 +487,19 @@ def write_cached_response(
 
 
 def is_quota_error(error: str) -> bool:
-    return bool(re.search(r"\b429\b|RESOURCE_EXHAUSTED|quota exceeded|rate limit", error, re.I))
+    """Quota/rate-limit stop detection across engines.
+
+    Covers Gemini's RESOURCE_EXHAUSTED phrasing and Z.AI's shapes: HTTP 429
+    and body error code 1302 ("Rate limit reached for requests", per
+    docs.z.ai/api-reference/api-code), plus generic quota/throttle wording.
+    """
+    return bool(
+        re.search(
+            r"\b429\b|RESOURCE_EXHAUSTED|quota|rate limit|throttl|\b1302\b",
+            error,
+            re.I,
+        )
+    )
 
 
 def call_gemini(

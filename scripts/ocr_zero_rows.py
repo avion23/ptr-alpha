@@ -3,6 +3,11 @@
 
 Uses `llm -a` with Gemini 3.1 Flash Lite to extract transactions.
 Gemini auto-rotates PDFs and handles checkbox detection.
+
+Engine modes: DUAL_READ=1 forces the dual-read gate (Gemini gated against
+engine B); otherwise OCR_ENGINE selects — unset/'gemini' (single-engine
+Gemini, the default), 'visionb' (GLM-primary single engine, engine A never
+contacted), or 'dual' (alias of DUAL_READ=1).
 """
 
 import argparse
@@ -11,6 +16,7 @@ import json
 import os
 import re
 import time
+from dataclasses import replace
 
 import duckdb
 from pathlib import Path
@@ -22,10 +28,12 @@ from analyzer.vision_engines import (
     VisionBConfig,
     VisionBUnavailable,
     dual_read_enabled,
+    read_document_with_engine_b,
     run_dual_read_for_doc,
 )
 from scripts.gemini_ocr_common import (
     apply_verified_house_corrections,
+    ArtifactMetadata,
     GEMINI_PARSER_VERSION,
     MODEL,
     GeminiOutputError as GeminiOutputError,
@@ -33,12 +41,20 @@ from scripts.gemini_ocr_common import (
     inspect_cached_response,
     is_quota_error,
     parse_gemini_output,
+    snapshot_pdf,
     validate_transactions,
 )
 
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress_gemini_manual.json"
 COOLDOWN = 3  # seconds between requests (Lite model allows rapid fire)
+# Engine-B-primary single-engine drain (OCR_ENGINE=visionb): GLM reads the
+# backlog alone — engine A (Gemini) is never contacted, conserving its free
+# quota for current-era docs. Rows persist through the same gemini_ocr
+# source family, insert path, and validation as the Gemini drain.
+GLM_PARSER_VERSION = "v1-glm53-vision"
+GLM_ENGINES_ATTEMPTED = "visionb"
+OCR_ENGINE_ENV = "OCR_ENGINE"
 REQUIRED_OCR_SCHEMA_COLUMNS = {
     "chamber",
     "source_record_id",
@@ -236,6 +252,10 @@ def get_ocr_work_items(
             -- 'gemini+%') intentionally count as deterministic recency here:
             -- after an AGREE (success) or DISAGREE (invalid) decision the doc
             -- must leave the OCR work list instead of being re-read nightly.
+            -- Engine-B-primary runs (parser_version v1-glm53-vision, engines
+            -- 'visionb') count the same way: a GLM success/no_txs run is done
+            -- and must leave the work list; only an 'error' run keeps the doc
+            -- in work for the next nightly retry.
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY doc_id ORDER BY parsed_at DESC
             ) AS rn
@@ -1590,7 +1610,8 @@ def insert_transactions(
                           "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini/%' "
                           "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'openrouter/%' "
                           "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%' "
-                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini+%') "
+                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini+%' "
+                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'visionb%') "
                           "AND status IN ('success', 'no_txs')",
                           [str(doc_id), ingestion_generation, artifact_sha256])
             conn.execute(
@@ -1620,6 +1641,7 @@ def insert_transactions(
                       OR LOWER(COALESCE(engines_attempted, '')) LIKE 'openrouter/%'
                       OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%'
                       OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini+%'
+                      OR LOWER(COALESCE(engines_attempted, '')) LIKE 'visionb%'
                   )
                   AND status IN ('success', 'no_txs')
                 """,
@@ -1731,6 +1753,78 @@ def _engine_b_configured() -> bool:
         return False
 
 
+def _ocr_engine_mode(env=None) -> str:
+    """Resolve the nightly drain's engine mode: 'dual', 'visionb', 'gemini'.
+
+    Precedence: DUAL_READ=1 forces dual regardless of OCR_ENGINE; otherwise
+    OCR_ENGINE selects — 'visionb' (GLM-primary single engine), 'dual'
+    (alias of DUAL_READ=1), or unset/'gemini' (the historical Gemini-only
+    drain, the default). Anything else is a typo and must fail loudly rather
+    than silently drain the backlog with the wrong engine's quota.
+    """
+    source = os.environ if env is None else env
+    if dual_read_enabled(source):
+        return "dual"
+    engine = str(source.get(OCR_ENGINE_ENV) or "").strip().lower()
+    if engine in ("", "gemini"):
+        return "gemini"
+    if engine in ("visionb", "dual"):
+        return engine
+    raise ValueError(
+        f"unsupported {OCR_ENGINE_ENV}: {engine!r} "
+        "(expected 'gemini', 'visionb', or 'dual')"
+    )
+
+
+def call_vision_b(
+    pdf_path: str,
+    doc_id: str | None = None,
+    *,
+    config: VisionBConfig | None = None,
+    page_images=None,
+) -> tuple[str | None, str, ArtifactMetadata | None]:
+    """Engine-B-primary read with the call_gemini contract.
+
+    Hashes and page-counts the same immutable snapshot bytes the artifact
+    binding is checked against, asks engine B once with the shared extraction
+    prompt, and validates the completion with the shared parser. No response
+    cache: a persisted success/no_txs parse run is the resume point (the doc
+    leaves the OCR work list), so --refresh is meaningless here. Transport,
+    configuration, and schema failures return (None, error, metadata) — the
+    batch-level quota stop is the caller's is_quota_error check.
+    """
+    metadata = None
+    try:
+        with snapshot_pdf(pdf_path) as snapshot:
+            metadata = ArtifactMetadata(
+                snapshot.sha256,
+                snapshot.page_count,
+                snapshot.byte_count,
+                str(Path(pdf_path)),
+            )
+            doc = DualReadDoc(
+                str(doc_id or Path(pdf_path).stem), 0, str(snapshot.path)
+            )
+            try:
+                output = read_document_with_engine_b(
+                    doc,
+                    config=config,
+                    page_images=page_images,
+                    page_count=snapshot.page_count,
+                )
+            except VisionBUnavailable as exc:
+                return None, str(exc), metadata
+            try:
+                parsed = parse_gemini_output(
+                    output, expected_page_count=snapshot.page_count
+                )
+            except GeminiOutputError as exc:
+                return None, f"invalid_response: {exc}", metadata
+            return output, "", replace(metadata, parsed=parsed)
+    except Exception as exc:
+        return None, str(exc), metadata
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="OCR zero-row House PTR PDFs with Gemini"
@@ -1739,6 +1833,27 @@ def main():
         "--refresh", action="store_true", help="Ignore cached Gemini responses"
     )
     args = parser.parse_args()
+
+    mode = _ocr_engine_mode()
+    vision_b_config = None
+    parser_version, engine_model = GEMINI_PARSER_VERSION, MODEL
+    if mode == "visionb":
+        # GLM-primary mode must fail closed on an unusable engine-B setup:
+        # silently draining with engine A would spend the scarce Gemini
+        # quota this mode exists to conserve.
+        parser_version, engine_model = GLM_PARSER_VERSION, GLM_ENGINES_ATTEMPTED
+        try:
+            vision_b_config = VisionBConfig.from_env()
+        except VisionBUnavailable as exc:
+            print(f"  visionb unusable: {exc}; stopping batch", flush=True)
+            return
+        if vision_b_config is None:
+            print(
+                "  visionb requires VISION_B_BASE_URL and VISION_B_MODEL; "
+                "stopping batch",
+                flush=True,
+            )
+            return
 
     pdfs = get_zero_row_pdfs()
     progress = load_progress()
@@ -1752,7 +1867,7 @@ def main():
 
         time.sleep(COOLDOWN)
 
-        if dual_read_enabled() and _engine_b_configured():
+        if mode == "dual" and _engine_b_configured():
             # Opt-in dual vision read (DUAL_READ=1 + engine B configured):
             # engine A (Gemini) is gated against engine B per doc. AGREE and
             # DISAGREE are persisted or quarantined by the orchestrator
@@ -1791,6 +1906,11 @@ def main():
                 outcome.error,
                 outcome.metadata,
             )
+        elif mode == "visionb":
+            # GLM-primary single-engine read: engine A is never contacted.
+            output, error, artifact_metadata = call_vision_b(
+                path, doc_id=doc_id, config=vision_b_config
+            )
         else:
             output, error, artifact_metadata = call_gemini(
                 path, doc_id=doc_id, refresh=args.refresh
@@ -1817,6 +1937,8 @@ def main():
                     year,
                     0,
                     error,
+                    parser_version=parser_version,
+                    engine_model=engine_model,
                     artifact_sha256=(
                         artifact_metadata.sha256 if artifact_metadata else None
                     ),
@@ -1841,6 +1963,8 @@ def main():
                 [],
                 db_path=DB_PATH,
                 raw_count=0,
+                parser_version=parser_version,
+                engine_model=engine_model,
                 artifact_sha256=artifact_metadata.sha256,
                 ingestion_generation=ingestion_generation,
             )
@@ -1857,6 +1981,8 @@ def main():
             transactions,
             db_path=DB_PATH,
             raw_count=raw_count,
+            parser_version=parser_version,
+            engine_model=engine_model,
             artifact_sha256=artifact_metadata.sha256,
             ingestion_generation=ingestion_generation,
         )

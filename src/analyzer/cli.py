@@ -24,7 +24,7 @@ from analyzer.member_ranking.buyer_scoring import (
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
-from analyzer.freshness import FreshnessCheck, end_to_end_checks
+from analyzer.freshness import FreshnessCheck, monitoring_checks
 from analyzer.models import AnalysisMode
 from analyzer.pipeline import (
     AnalysisParams,
@@ -255,7 +255,11 @@ def end_to_end_freshness(app_ctx: AppContext, data_dir: str) -> list[FreshnessCh
             )
         ]
     receipts = Path(data_dir) / "recommendations" / "receipts.log"
-    return end_to_end_checks(conn, receipts_path=receipts)
+    return monitoring_checks(
+        conn,
+        receipts_path=receipts,
+        staging_root=Path(data_dir) / "staging" / "glm-backlog",
+    )
 
 
 def _print_end_to_end_freshness(freshness: list[FreshnessCheck]) -> None:
@@ -279,7 +283,8 @@ def health(
         False,
         "--strict-freshness",
         help="Fail (exit 1) when canonical end products (prices/dividends/"
-        "form4/receipts) are stale, not just when a chamber is out of window",
+        "form4/receipts/house-ingestion/ocr-staging) are stale, not just "
+        "when a chamber is out of window",
     ),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):

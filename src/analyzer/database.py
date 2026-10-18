@@ -609,7 +609,17 @@ class Database:
                                           OR TRIM(tx_invalid.source_record_id) = ''
                                           OR tx_invalid.source_row_id IS NULL
                                           OR TRIM(tx_invalid.source_row_id) = ''
-                                          OR tx_invalid.official_filing_date IS NULL
+                                          -- Deterministic house rows are backfilled
+                                          -- with official_filing_date =
+                                          -- disclosure_date at write time and the
+                                          -- parse-time gate never required the
+                                          -- field, so a preserved legacy rowset can
+                                          -- legitimately lack it. Only OCR rowsets
+                                          -- (the untrusted family) must be fully
+                                          -- field-valid to be admitted.
+                                          OR (t.source = 'gemini_ocr'
+                                              AND tx_invalid.official_filing_date
+                                                  IS NULL)
                                       )
                               )
                         )
@@ -705,7 +715,11 @@ class Database:
                                            OR invalid_row.chamber IS NULL OR TRIM(invalid_row.chamber) = ''
                                            OR invalid_row.source_record_id IS NULL OR TRIM(invalid_row.source_record_id) = ''
                                            OR invalid_row.source_row_id IS NULL OR TRIM(invalid_row.source_row_id) = ''
-                                           OR invalid_row.official_filing_date IS NULL)))
+                                           -- Family-scoped like the live binding: preserved deterministic
+                                            -- house rows may lack official_filing_date;
+                                            -- OCR rowsets must be fully field-valid.
+                                            OR (t.source = 'gemini_ocr'
+                                                AND invalid_row.official_filing_date IS NULL))))
                    )
             """
             body += row_acceptance

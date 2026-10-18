@@ -545,6 +545,7 @@ class Database:
                     OR (
                     t.source IN ('house_pdf', 'gemini_ocr')
                     AND (
+                        (
                         EXISTS (
                             SELECT 1
                             FROM latest_accepted_house_docs accepted
@@ -552,6 +553,66 @@ class Database:
                               AND accepted.generation_id = t.ingestion_generation
                               AND accepted.artifact_sha256
                                   IS NOT DISTINCT FROM t.artifact_sha256
+                        )
+                        -- Rowset admission binding: accepting the ARTIFACT via
+                        -- one source's parse run does not bless every House/OCR
+                        -- row for that artifact. Each admitted row must belong
+                        -- to an accepted (source, artifact, generation,
+                        -- parse_run) rowset identity: an accepted parse run of
+                        -- the row's own source family whose transaction_count
+                        -- matches exactly the family's live rowset, with every
+                        -- family row valid. Rows from unaccepted or superseded
+                        -- runs stay in transactions/transaction_versions and
+                        -- the parse-run records (audit surfaces) but are never
+                        -- canonical -- regardless of their engines_attempted
+                        -- family.
+                        AND EXISTS (
+                            SELECT 1
+                            FROM pdf_parse_runs parse_run
+                            WHERE parse_run.doc_id = t.doc_id
+                              AND parse_run.ingestion_generation
+                                  = t.ingestion_generation
+                              AND parse_run.artifact_sha256
+                                  IS NOT DISTINCT FROM t.artifact_sha256
+                              AND parse_run.status = 'success'
+                              AND t.source = {_HOUSE_PARSE_SOURCE}
+                              AND COALESCE(parse_run.transaction_count, 0) = (
+                                    SELECT COUNT(*)
+                                    FROM transactions tx_count
+                                    WHERE tx_count.doc_id = t.doc_id
+                                      AND tx_count.artifact_sha256
+                                          IS NOT DISTINCT FROM t.artifact_sha256
+                                      AND tx_count.ingestion_generation
+                                          = t.ingestion_generation
+                                      AND tx_count.source = t.source
+                              )
+                              AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM transactions tx_invalid
+                                    WHERE tx_invalid.doc_id = t.doc_id
+                                      AND tx_invalid.artifact_sha256
+                                          IS NOT DISTINCT FROM t.artifact_sha256
+                                      AND tx_invalid.ingestion_generation
+                                          = t.ingestion_generation
+                                      AND tx_invalid.source = t.source
+                                      AND (
+                                          tx_invalid.transaction_date IS NULL
+                                          OR tx_invalid.disclosure_date IS NULL
+                                          OR tx_invalid.transaction_date > tx_invalid.disclosure_date
+                                          OR (
+                                              tx_invalid.notification_date IS NOT NULL
+                                              AND tx_invalid.notification_date < tx_invalid.transaction_date
+                                          )
+                                          OR tx_invalid.chamber IS NULL
+                                          OR TRIM(tx_invalid.chamber) = ''
+                                          OR tx_invalid.source_record_id IS NULL
+                                          OR TRIM(tx_invalid.source_record_id) = ''
+                                          OR tx_invalid.source_row_id IS NULL
+                                          OR TRIM(tx_invalid.source_row_id) = ''
+                                          OR tx_invalid.official_filing_date IS NULL
+                                      )
+                              )
+                        )
                         )
                         OR (
                             t.ingestion_generation IS NOT NULL

@@ -152,5 +152,14 @@ decorator makes the new test fail ("0 INSM, 1 LATE"). **PASS post-fix.**
 - Whether A or B has better forward returns: R7 is FAIL at current power, so
   the choice cannot be settled by the existing backtest — needs C.
 - 15 accepted holdings rows have no same-actor event close (cannot be
-  re-anchored); 79 excluded docs await the Gemini OCR pass; committee claim
-  for Taylor remains UNVERIFIED.
+  re-anchored); 79 excluded docs await the Gemini OCR pass.
+- ~~Committee claim for Taylor remains UNVERIFIED~~ — **VERIFIED 2026-10-18**:
+  David James Taylor (R, OH-2, 119th Congress) sits on the House Committee
+  on Transportation and Infrastructure — Vice Chair, Subcommittee on Water
+  Resources and Environment; also Highways & Transit and Railroads,
+  Pipelines & Hazardous Materials subcommittees; plus Committee on
+  Agriculture (Commodity Markets, Digital Assets & Rural Development).
+  Sources: Wikipedia (citing the T&I committee's Feb 26 2025 subcommittee
+  vice-chair announcement and taylor.house.gov) and
+  bioguide.congress.gov T000490. RPM International is Ohio-based — the
+  committee-proximity premise for the RPM setup is fully sourced.

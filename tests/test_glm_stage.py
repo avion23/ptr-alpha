@@ -8,6 +8,7 @@ is monkeypatched for promotion tests. No model calls are made.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -25,6 +26,10 @@ GLM_OUTPUT_ONE_ROW = (
     "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
 )
 GLM_OUTPUT_NO_TXS = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS\n"
+GLM_OUTPUT_PAGE2 = (
+    "MEMBER: Jane Doe\nPAGES: 2\nPAGE: 1\nNO_TRANSACTIONS\nPAGE: 2\n"
+    "Microsoft Corp (MSFT) | Sale | 02/02/24 | 02/05/24 | B\n"
+)
 
 
 def make_pdf(path: Path, pages: int = 1) -> Path:
@@ -132,6 +137,11 @@ def fake_insert(monkeypatch):
 
 # --------------------------------------------------------------------------
 # stage: record format + round trip
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# finding 6: provenance (render_dpi, row_pages, raw_output evidence, snapshot)
 # --------------------------------------------------------------------------
 
 
@@ -998,3 +1008,320 @@ def test_cli_stage_without_endpoint_config_fails_cleanly(
     assert rc == 1
     assert "not configured" in capsys.readouterr().err
     assert list((data_dir / "staging").rglob("*.json")) == []
+
+
+# --------------------------------------------------------------------------
+# finding 6: staging provenance + verdict binding
+# --------------------------------------------------------------------------
+
+
+def test_staging_records_carry_render_dpi_and_row_pages(data_dir):
+    make_pdf(data_dir / "2024" / "pdfs" / "pg1.pdf", pages=2)
+    record = glm_stage.build_staging_record(
+        "pg1",
+        2024,
+        glm_stage.default_pdf_path(data_dir, 2024, "pg1"),
+        None,
+        read_fn=lambda *a: GLM_OUTPUT_PAGE2,
+    )
+    assert record["parse_status"] == "success"
+    assert record["render_dpi"] == glm_stage.RENDER_DPI == 150
+    # Per-row page attribution, aligned with rows: the row was read on page 2.
+    assert record["row_pages"] == [2]
+    assert len(record["rows"]) == len(record["row_pages"]) == 1
+    assert record["rows"][0][0] == "Microsoft Corp (MSFT)"
+
+
+def test_error_records_retain_raw_output_as_evidence(data_dir):
+    seed_year(data_dir, 2024, ["evid1"])
+    invalid = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\ngarbage line\n"
+    record = glm_stage.build_staging_record(
+        "evid1",
+        2024,
+        glm_stage.default_pdf_path(data_dir, 2024, "evid1"),
+        None,
+        read_fn=lambda *a: invalid,
+    )
+    assert record["parse_status"] == "error"
+    assert record["error_kind"] == "parse"
+    # The invalid response text is retained: it is evidence for the audit.
+    assert record["raw_output"] == invalid
+
+
+def test_record_binds_sha256_to_the_exact_bytes_the_render_saw(
+    data_dir, monkeypatch
+):
+    seed_year(data_dir, 2024, ["snap1"])
+    rendered = {}
+
+    def fake_rasterize(pdf_path, dpi=glm_stage.RENDER_DPI):
+        data = Path(pdf_path).read_bytes()
+        rendered["sha"] = hashlib.sha256(data).hexdigest()
+        rendered["dpi"] = dpi
+        return ["data:image/png;base64,QUJD"]
+
+    monkeypatch.setattr(glm_stage, "rasterize_page_data_urls", fake_rasterize)
+    monkeypatch.setattr(
+        glm_stage, "read_document_with_vision_b", lambda *a, **k: GLM_OUTPUT_ONE_ROW
+    )
+    config = VisionBConfig(base_url="http://127.0.0.1:1", model="stub")
+    record = glm_stage.build_staging_record(
+        "snap1", 2024, glm_stage.default_pdf_path(data_dir, 2024, "snap1"), config
+    )
+    assert record["parse_status"] == "success"
+    # The hashed artifact IS the artifact the model rendered from — one
+    # snapshot, not a hash of the live path read separately from the render.
+    assert rendered["sha"] == record["pdf_sha256"]
+    assert rendered["dpi"] == record["render_dpi"] == 150
+    assert record["pdf_sha256"] == glm_stage.pdf_sha256(
+        data_dir / "2024" / "pdfs" / "snap1.pdf"
+    )
+
+
+def test_archived_attempts_are_not_live_records(data_dir):
+    write_staged_records(data_dir, {2024: ["iso1"]})
+    glm_stage.archive_current_attempt(data_dir, 2024, "iso1")
+    write_staged_records(data_dir, {2024: ["iso1"]})  # recreated live record
+    glm_stage.archive_current_attempt(data_dir, 2024, "iso1")
+    assert glm_stage.load_staging_record(data_dir, 2024, "iso1") is None
+    assert [n for n, _ in glm_stage.archived_attempts(data_dir, 2024, "iso1")] == [0, 1]
+    # Historical attempts must never leak into live-record readers (status,
+    # promote-by-year, the audit sampling frame).
+    assert glm_stage.iter_staging_records(data_dir) == []
+    assert audit_sample.load_staging_records(data_dir) == []
+    assert glm_stage.staging_status(data_dir) == []
+
+
+def test_restage_archives_versioned_attempts_with_cap(data_dir):
+    seed_year(data_dir, 2024, ["cap1"])
+    manifest = [{"doc_id": "cap1", "year": 2024}]
+    counter = {"n": 0}
+
+    def failing_read(pdf_path, page_count):
+        counter["n"] += 1
+        raise ValueError(f"boom {counter['n']}")
+
+    # Six manifest-mode re-stages of the still-unresolved doc: every write
+    # archives the previous attempt instead of overwriting it; only the
+    # newest MAX_RETAINED_ATTEMPTS archives survive (oldest deleted).
+    for _ in range(6):
+        result = glm_stage.stage_batch(
+            2024, 5, data_dir=data_dir, read_fn=failing_read,
+            manifest=manifest, cooldown=0,
+        )
+        assert result["errors"] == 1
+    live = glm_stage.load_staging_record(data_dir, 2024, "cap1")
+    assert live["parse_status"] == "error"
+    assert live["error"] == "boom 6"  # newest attempt keeps the canonical name
+    archives = glm_stage.archived_attempts(data_dir, 2024, "cap1")
+    assert [n for n, _ in archives] == [2, 3, 4]
+    contents = [json.loads(path.read_text()) for _, path in archives]
+    assert [record["error"] for record in contents] == ["boom 3", "boom 4", "boom 5"]
+
+
+def test_dir_scan_mode_does_not_retry_error_records(data_dir):
+    seed_year(data_dir, 2024, ["scanerr"])
+    manifest = [{"doc_id": "scanerr", "year": 2024}]
+
+    def failing_read(pdf_path, page_count):
+        raise ValueError("boom")
+
+    glm_stage.stage_batch(
+        2024, 5, data_dir=data_dir, read_fn=failing_read,
+        manifest=manifest, cooldown=0,
+    )
+    # Manual dir-scan mode keeps legacy semantics: staged docs (errors
+    # included) are skipped. Only the authoritative manifest queue retries.
+    again = glm_stage.stage_batch(
+        2024, 5, data_dir=data_dir, read_fn=failing_read, cooldown=0
+    )
+    assert again["candidates"] == 0
+
+
+def test_manifest_mode_drains_authoritative_queue_and_notes_missing_pdfs(
+    data_dir, capsys
+):
+    seed_year(data_dir, 2024, ["1001", "1002"])
+    outputs = {"1001": GLM_OUTPUT_ONE_ROW, "1002": GLM_OUTPUT_NO_TXS}
+    read_fn = read_fn_from_outputs(outputs)
+    # 1002 is already staged (staged docs await the audit; re-reading them
+    # would burn quota), yet a manifest generated before that staging still
+    # lists it: the live-record skip wins.
+    record = glm_stage.build_staging_record(
+        "1002", 2024, glm_stage.default_pdf_path(data_dir, 2024, "1002"),
+        None, read_fn=read_fn,
+    )
+    glm_stage.write_staging_record(data_dir, record)
+
+    manifest = [
+        {"doc_id": "1001", "year": 2024},
+        {"doc_id": "1002", "year": 2024},  # already staged -> skipped
+        {"doc_id": "zz", "year": 2024},  # no local PDF -> note, never silent
+        {"doc_id": "2019-doc", "year": 2019},  # other year -> ignored
+    ]
+    result = glm_stage.stage_batch(
+        2024, 10, data_dir=data_dir, read_fn=read_fn,
+        manifest=manifest, cooldown=0,
+    )
+    assert result["candidates"] == 1
+    assert result["staged"] == 1
+    assert result["missing_pdfs"] == 1
+    staged_record = glm_stage.load_staging_record(data_dir, 2024, "1001")
+    assert staged_record["parse_status"] == "success"
+    assert glm_stage.load_staging_record(data_dir, 2024, "zz") is None
+    out = capsys.readouterr().out
+    assert "[zz] manifest entry has no local PDF" in out
+
+
+def test_load_work_manifest_items_fail_closed(data_dir):
+    root = glm_stage.staging_root(data_dir)
+    items, error = glm_stage.load_work_manifest_items(root / "work-manifest.json")
+    assert items == [] and error and "unreadable" in error
+
+    root.mkdir(parents=True, exist_ok=True)
+    foreign = root / "wm.json"
+    foreign.write_text(json.dumps({"schema": "other-v1", "items": []}))
+    items, error = glm_stage.load_work_manifest_items(foreign)
+    assert items == [] and "not a glm-work-manifest-v1" in error
+
+    foreign.write_text(
+        json.dumps({"schema": glm_stage.WORK_MANIFEST_SCHEMA, "items": [{"doc_id": "a"}]})
+    )
+    items, error = glm_stage.load_work_manifest_items(foreign)
+    assert items == [] and "malformed manifest item" in error
+
+    foreign.write_text(
+        json.dumps(
+            {"schema": glm_stage.WORK_MANIFEST_SCHEMA, "items": [{"doc_id": "a", "year": 2024}]}
+        )
+    )
+    items, error = glm_stage.load_work_manifest_items(foreign)
+    assert error is None
+    assert items == [{"doc_id": "a", "year": 2024}]
+
+
+def test_cli_stage_from_manifest_refuses_unusable_manifest(data_dir, capsys):
+    seed_year(data_dir, 2024, ["x1"])
+    rc = glm_stage.main(
+        [
+            "--data-dir", str(data_dir), "stage", "--year", "2024",
+            "--from-manifest", str(data_dir / "nope.json"),
+        ]
+    )
+    assert rc == 2
+    assert "work manifest" in capsys.readouterr().err
+
+
+def test_staged_row_to_tx_page_number_optional():
+    tx = glm_stage.staged_row_to_tx(["X", "Purchase", "01/15/24", None, "A"])
+    assert tx["page_number"] is None  # records without row_pages stay valid
+    assert (
+        glm_stage.staged_row_to_tx(
+            ["X", "Purchase", "01/15/24", None, "A"], page_number=3
+        )["page_number"]
+        == 3
+    )
+
+
+def test_promote_threads_stage_time_page_numbers(data_dir, fake_insert):
+    make_pdf(data_dir / "2024" / "pdfs" / "pgn.pdf", pages=2)
+    record = glm_stage.build_staging_record(
+        "pgn", 2024, glm_stage.default_pdf_path(data_dir, 2024, "pgn"),
+        None, read_fn=lambda *a: GLM_OUTPUT_PAGE2,
+    )
+    glm_stage.write_staging_record(data_dir, record)
+    audit_sample.record_verdict(data_dir, "pgn", "pass", "ok")
+    write_report_state(data_dir)
+    result = glm_stage.promote_docs(2024, ["pgn"], data_dir=data_dir)
+    assert result["promoted"] == 1
+    (tx,) = fake_insert[0]["transactions"]
+    assert tx["page_number"] == 2  # page-bound source_row_id, Gemini-path parity
+
+
+def test_promote_requires_verdict_bound_to_record_identity(
+    data_dir, fake_insert, capsys
+):
+    # An audit stamp with NO bound pass entry in the audit history is
+    # refused: the stamp alone says nothing (fail-closed).
+    stage_one(data_dir, 2024, "bnd1", GLM_OUTPUT_ONE_ROW)
+    record = glm_stage.load_staging_record(data_dir, 2024, "bnd1")
+    record["audit"] = "pass"
+    glm_stage.write_staging_record(data_dir, record)
+    write_report_state(data_dir)
+    result = glm_stage.promote_docs(2024, ["bnd1"], data_dir=data_dir)
+    assert result["refused"] == 1 and result["promoted"] == 0
+    assert fake_insert == []
+    assert "no pass verdict in the audit results history" in capsys.readouterr().out
+
+    # record_verdict stores the record identity; the bound pass promotes.
+    audit_sample.record_verdict(data_dir, "bnd1", "pass", "matches pixels")
+    result = glm_stage.promote_docs(2024, ["bnd1"], data_dir=data_dir)
+    assert result["promoted"] == 1
+    assert len(fake_insert) == 1
+
+
+def test_promote_refuses_legacy_and_restaged_verdicts(data_dir, fake_insert, capsys):
+    stage_one(data_dir, 2024, "bnd2", GLM_OUTPUT_ONE_ROW)
+    root = glm_stage.staging_root(data_dir)
+    record = glm_stage.load_staging_record(data_dir, 2024, "bnd2")
+    record["audit"] = "pass"
+    glm_stage.write_staging_record(data_dir, record)
+    write_report_state(data_dir)
+
+    # Legacy entry (pre-identity-binding): a pass with no identity fields
+    # can never satisfy the binding check.
+    (root / "audit-results.json").write_text(
+        json.dumps(
+            [{"doc_id": "bnd2", "verdict": "pass", "notes": "", "audited_at_utc": "t"}]
+        )
+    )
+    result = glm_stage.promote_docs(2024, ["bnd2"], data_dir=data_dir)
+    assert result["refused"] == 1 and fake_insert == []
+    assert "not bound to this record's identity" in capsys.readouterr().out
+
+    # A record re-staged after its audit (identity triple changed while the
+    # stamp was carried over) no longer matches the audited identity.
+    audit_sample.record_verdict(data_dir, "bnd2", "pass", "matches")
+    record = glm_stage.load_staging_record(data_dir, 2024, "bnd2")
+    record["parsed_at_utc"] = "2026-10-19T00:00:00Z"
+    glm_stage.write_staging_record(data_dir, record)
+    result = glm_stage.promote_docs(2024, ["bnd2"], data_dir=data_dir)
+    assert result["refused"] == 1 and fake_insert == []
+    out = capsys.readouterr().out
+    assert "re-staged after the audit" in out and "re-audit" in out
+    assert glm_stage.load_staging_record(data_dir, 2024, "bnd2") is not None
+
+
+# --------------------------------------------------------------------------
+# finding 11: workers cap (Z.AI allows 2 streams; overrides are refused)
+# --------------------------------------------------------------------------
+
+
+def test_workers_above_two_stream_budget_refused(data_dir):
+    seed_year(data_dir, 2024, ["w1"])
+    outputs = {"w1": GLM_OUTPUT_ONE_ROW}
+    with pytest.raises(ValueError, match="2 concurrent vision streams"):
+        glm_stage.stage_batch(
+            2024, 5, data_dir=data_dir,
+            read_fn=read_fn_from_outputs(outputs), workers=3,
+        )
+    with pytest.raises(ValueError):
+        glm_stage.stage_batch(
+            2024, 5, data_dir=data_dir,
+            read_fn=read_fn_from_outputs(outputs), workers=0,
+        )
+    # workers=2 is exactly the budget and must be accepted.
+    result = glm_stage.stage_batch(
+        2024, 5, data_dir=data_dir,
+        read_fn=read_fn_from_outputs(outputs), workers=2, cooldown=0,
+    )
+    assert result["staged"] == 1
+
+
+def test_cli_stage_workers_override_refused(data_dir, capsys):
+    seed_year(data_dir, 2024, ["w2"])
+    rc = glm_stage.main(
+        ["--data-dir", str(data_dir), "stage", "--year", "2024", "--workers", "8"]
+    )
+    assert rc == 2
+    assert "workers=8 refused" in capsys.readouterr().err

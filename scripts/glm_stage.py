@@ -13,7 +13,7 @@ and never inserts.
 
 Subcommands:
 
-* ``stage   --year Y [--limit N] [--check-canonical]``
+* ``stage   --year Y [--limit N] [--check-canonical] [--from-manifest PATH]``
     Rasterize unread PDFs (pdftoppm -r 150 -png), read them with the GLM
     vision endpoint through the existing ``analyzer.vision_engines`` client
     (shared PROMPT, never forked), parse with ``parse_gemini_output``, and
@@ -23,6 +23,14 @@ Subcommands:
     exhaustion stops the batch cleanly with exit 0; auth/config defects
     alert and stop the batch with exit 1; per-doc failures never kill the
     batch.
+
+    Population (FP review finding 8): ``--from-manifest PATH`` drains the
+    AUTHORITATIVE unresolved-work selection exported by
+    ``ocr_zero_rows.py --export-work-manifest`` (``get_ocr_work_items``)
+    instead of scanning PDF directories — text-born docs cannot leak in and
+    promoted docs cannot re-admit. Entries without a local PDF are skipped
+    with a note; entries whose live record is an error record are retried
+    (the failed record is archived, never overwritten).
 * ``promote --year Y [--doc-id ID ...] [--force-unaudited]``
     Insert AUDITED staged rows into canonical through the EXISTING
     ``ocr_zero_rows.insert_transactions`` path (parser_version
@@ -30,13 +38,37 @@ Subcommands:
     bookkeeping, and delete the staging JSON (promotion = consumed) only
     when the FULL staged row set is confirmed committed — a partial or
     rejected insert keeps the record and stamps the rejection details on
-    it.
+    it. A promoted doc lands a success/no_txs ``v1-glm53-vision`` parse
+    run, which is exactly what removes it from ``get_ocr_work_items`` —
+    the disposition record IS the queue exclusion.
 * ``status``
     Per-year staged / promoted / error counts (staged counts need no DB).
 
 Canonical (``data/congress.duckdb``) is only opened by ``promote`` (which
 needs the write lock) and by ``stage --check-canonical`` (read-only, opt-in
 because a refresh holds the DB).
+
+Provenance and verdict binding (FP review finding 6): each record stores
+``render_dpi`` and per-row page attribution (``row_pages``, aligned with
+``rows``); ``raw_output`` is retained even for error records (invalid
+responses are evidence); the sha256/page-count/render all read ONE
+snapshot of the artifact bytes, not the live file three times. Re-staging
+a doc that already has a live record archives the previous record as
+``<year>/attempts/<doc_id>.attempt-<n>.json`` (n = prior attempt count,
+newest live record keeps the canonical name, at most MAX_RETAINED_ATTEMPTS
+retained — the attempted archive subdirectory keeps it out of the
+record-counting globs in doctor.py/audit_sample.py). ``audit record``
+stores the record identity (``pdf_sha256 + prompt_sha256 +
+parsed_at_utc``) in its audit-results entry, and ``promote`` refuses any
+audit-pass record whose live identity no longer matches the audited
+identity (recipe changed after audit → re-audit).
+
+Concurrency (FP review finding 11): ``--workers`` is capped at
+MAX_WORKERS (2 — the Z.AI subscription allows two concurrent vision
+streams; larger values raise ValueError instead of being clamped).
+Cross-process exclusion is the cron wrapper's single-instance flock
+(``cron/backlog_ocr.sh`` holds ``data/logs/ocr-backlog-cron/drain.lock``
+via ``flock -n``); no in-process lock is taken.
 """
 
 from __future__ import annotations
@@ -44,6 +76,8 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import glob as glob_module
+import hashlib
 import json
 import os
 import random
@@ -78,6 +112,7 @@ from analyzer.vision_engines import (  # noqa: E402
 from scripts.audit_sample import (  # noqa: E402
     REPORT_STATE_NAME as AUDIT_REPORT_STATE_NAME,
     REPORT_STATE_SCHEMA as AUDIT_REPORT_STATE_SCHEMA,
+    load_audit_results as load_audit_results,
 )
 
 GLM_PARSER_VERSION = "v1-glm53-vision"
@@ -86,9 +121,15 @@ STAGING_SUBDIR = Path("staging") / "glm-backlog"
 AUDIT_RESULTS_NAME = "audit-results.json"
 PROMOTED_JOURNAL_NAME = "promoted.jsonl"
 RENDER_DPI = 150
-CLI_COOLDOWN = 3.0  # seconds between endpoint requests (mirrors ocr_zero_rows)
 MAX_READ_RETRIES = 2  # bounded in-process retries for transient failures
 BACKOFF_BASE_SECONDS = 2.0  # jittered exponential backoff base
+MAX_WORKERS = 2  # Z.AI subscription allows 2 concurrent vision streams
+CLI_COOLDOWN = 3.0  # seconds between endpoint requests (mirrors ocr_zero_rows)
+MAX_RETAINED_ATTEMPTS = 3  # archived re-stage attempts kept per doc
+WORK_MANIFEST_SCHEMA = "glm-work-manifest-v1"
+# The record identity a verdict is bound to (finding 6): if any of these
+# no longer match the live record, the audited attempt is not the live one.
+AUDIT_IDENTITY_FIELDS = ("pdf_sha256", "prompt_sha256", "parsed_at_utc")
 
 
 def staging_root(data_dir: str | Path = "data") -> Path:
@@ -129,6 +170,57 @@ def _atomic_write_json(path: Path, payload) -> None:
 
 def staging_record_path(data_dir: str | Path, year: int, doc_id: str) -> Path:
     return staging_root(data_dir) / str(year) / f"{doc_id}.json"
+
+
+def attempts_dir(data_dir: str | Path, year: int) -> Path:
+    """Archived (superseded) staging attempts for a year.
+
+    A subdirectory rather than the year directory itself: doctor.py and
+    audit_sample.py count ``<year>/*.json`` as LIVE records; archived
+    attempts are historical evidence and must not inflate those counts.
+    """
+    return staging_root(data_dir) / str(year) / "attempts"
+
+
+def archived_attempts(data_dir: str | Path, year: int, doc_id: str) -> list[tuple[int, Path]]:
+    """(attempt_number, path) for a doc's archived attempts, oldest first."""
+    directory = attempts_dir(data_dir, year)
+    if not directory.exists():
+        return []
+    pairs = []
+    prefix = f"{glob_module.escape(doc_id)}.attempt-"
+    for path in directory.glob(f"{prefix}*.json"):
+        suffix = path.name[len(doc_id) + len(".attempt-") : -len(".json")]
+        if suffix.isdigit():
+            pairs.append((int(suffix), path))
+    return sorted(pairs)
+
+
+def archive_current_attempt(data_dir: str | Path, year: int, doc_id: str) -> Path | None:
+    """Versioned re-stage (finding 6): archive the live record, never overwrite.
+
+    Renames the existing ``<doc_id>.json`` to
+    ``attempts/<doc_id>.attempt-<n>.json`` so the newly written record keeps
+    the canonical name and the superseded reading remains inspectable
+    evidence. n is the prior attempt count (max existing archive number + 1,
+    which equals the prior attempt count until the retention cap prunes the
+    oldest — after pruning the numbering keeps growing instead of colliding
+    with a retained archive). At most MAX_RETAINED_ATTEMPTS archives are
+    retained (oldest deleted). Returns the archive path, or None when no
+    live record existed.
+    """
+    live = staging_record_path(data_dir, year, doc_id)
+    if not live.exists():
+        return None
+    prior = archived_attempts(data_dir, year, doc_id)
+    next_number = (prior[-1][0] + 1) if prior else 0
+    target = attempts_dir(data_dir, year) / f"{doc_id}.attempt-{next_number}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(live, target)
+    retained = archived_attempts(data_dir, year, doc_id)
+    for _, stale in retained[: max(len(retained) - MAX_RETAINED_ATTEMPTS, 0)]:
+        stale.unlink(missing_ok=True)
+    return target
 
 
 def write_staging_record(data_dir: str | Path, record: dict) -> Path:
@@ -269,10 +361,20 @@ def build_staging_record(
 ) -> dict:
     """Read one document and build its staging record. Never raises.
 
+    Provenance (finding 6): the artifact bytes are snapshotted ONCE —
+    ``pdf_sha256``, the page count, and the render all read the same bytes,
+    so the record can never bind rows to a hash of a file the render never
+    saw. ``render_dpi`` and per-row page attribution (``row_pages``,
+    aligned with ``rows``) are recorded at stage time, and ``raw_output``
+    is retained even for error records: an invalid response is evidence.
+
     Parse/validation failures become ``parse_status: "error"`` records with
     ``error_kind`` carrying the classified failure (quota/auth/config/
     truncated/transient/permanent/parse) so the batch loop can distinguish
-    a per-doc defect from a batch-wide stop.
+    a per-doc defect from a batch-wide stop. The W3 correction to finding 6
+    stands: historical "not configured" records were real config-missing
+    (``model: null``) — an unconfigured endpoint is an error record, never
+    a silent skip.
     """
     record = {
         "doc_id": str(doc_id),
@@ -282,26 +384,33 @@ def build_staging_record(
         "prompt_sha256": PROMPT_SHA256,
         "parser_version": GLM_PARSER_VERSION,
         "parsed_at_utc": utc_now_iso(),
+        "render_dpi": RENDER_DPI,
         "pages": None,
         "member": None,
         "rows": [],
+        "row_pages": [],
         "raw_output": None,
         "parse_status": "error",
         "error": None,
         "error_kind": None,
         "audit": None,
     }
+    raw_output = None
     try:
-        sha = pdf_sha256(pdf_path)
-        page_count = pdf_page_count(pdf_path)
-        record["pdf_sha256"] = sha
-        record["pages"] = page_count
-        if config is None and read_fn is None:
-            raise RuntimeError("GLM vision endpoint is not configured")
-        raw_output = read_document(
-            pdf_path, config, read_fn=read_fn, page_count=page_count
-        )
-        parsed = parse_gemini_output(raw_output, expected_page_count=page_count)
+        # One artifact snapshot feeds sha256, page count, and the render.
+        pdf_bytes = Path(pdf_path).read_bytes()
+        record["pdf_sha256"] = hashlib.sha256(pdf_bytes).hexdigest()
+        with tempfile.TemporaryDirectory(prefix="glm_stage_snapshot_") as snapshot_dir:
+            snapshot = Path(snapshot_dir) / f"{Path(pdf_path).stem}.pdf"
+            snapshot.write_bytes(pdf_bytes)
+            page_count = pdf_page_count(snapshot)
+            record["pages"] = page_count
+            if config is None and read_fn is None:
+                raise RuntimeError("GLM vision endpoint is not configured")
+            raw_output = read_document(
+                snapshot, config, read_fn=read_fn, page_count=page_count
+            )
+            parsed = parse_gemini_output(raw_output, expected_page_count=page_count)
         record.update(
             member=parsed.member,
             rows=[
@@ -314,6 +423,7 @@ def build_staging_record(
                 ]
                 for tx in parsed.transactions
             ],
+            row_pages=[tx.get("page_number") for tx in parsed.transactions],
             raw_output=raw_output,
             parse_status="success" if parsed.transactions else "no_txs",
             error=None,
@@ -323,6 +433,10 @@ def build_staging_record(
         record["parse_status"] = "error"
         record["error"] = str(exc) or type(exc).__name__
         record["error_kind"] = classify_visionb_error(exc)
+        if raw_output is not None:
+            # The response text exists but failed the schema/transport gate:
+            # retain it. Invalid responses are evidence, not noise.
+            record["raw_output"] = raw_output
     return record
 
 
@@ -352,7 +466,12 @@ def select_candidates(
     check_canonical: bool = False,
     db_path: str | Path | None = None,
 ) -> list[str]:
-    """PDFs in data/<year>/pdfs with no staging record yet (sorted)."""
+    """PDFs in data/<year>/pdfs with no staging record yet (sorted).
+
+    Legacy manual-mode selection (``stage --year``). The nightly drain
+    uses ``--from-manifest`` instead: this directory scan includes
+    text-born docs and cannot see canonical dispositions (finding 8).
+    """
     root = staging_root(data_dir)
     already_staged = {
         path.stem for path in (root / str(year)).glob("*.json")
@@ -367,6 +486,96 @@ def select_candidates(
     return candidates[: max(limit, 0)]
 
 
+def load_work_manifest_items(path: str | Path) -> tuple[list[dict], str | None]:
+    """(items, error) from an ``ocr_zero_rows --export-work-manifest`` file.
+
+    Fail-closed: an absent, unreadable, malformed, or foreign-schema
+    manifest is an error, never an empty queue (draining nothing must be a
+    loud operator decision, not a silent no-op).
+    """
+    manifest_path = Path(path)
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], f"unreadable work manifest {manifest_path}: {exc}"
+    if not (
+        isinstance(payload, dict)
+        and payload.get("schema") == WORK_MANIFEST_SCHEMA
+        and isinstance(payload.get("items"), list)
+    ):
+        return [], (
+            f"{manifest_path} is not a {WORK_MANIFEST_SCHEMA} work manifest "
+            "(regenerate it: ocr_zero_rows.py --export-work-manifest)"
+        )
+    for index, item in enumerate(payload["items"]):
+        if not isinstance(item, dict) or "doc_id" not in item or "year" not in item:
+            return [], f"{manifest_path}: malformed manifest item at index {index}"
+    return payload["items"], None
+
+
+def select_candidates_from_manifest(
+    items: list[dict],
+    year: int,
+    limit: int,
+    data_dir: str | Path = "data",
+    *,
+    check_canonical: bool = False,
+    db_path: str | Path | None = None,
+) -> tuple[list[str], list[str]]:
+    """Authoritative-queue candidate selection (finding 8).
+
+    The manifest IS the unresolved queue; PDF directories are not scanned,
+    so text-born docs cannot leak into the pixel pipeline. Returns
+    ``(doc_ids, notes)``: entries for other years are ignored; an entry
+    without a local PDF is skipped WITH A NOTE (the artifact vanished after
+    export — never silently); an entry whose live staging record is
+    success/no_txs is skipped (it is staged and awaiting the audit; re-
+    reading it nightly would burn quota); an entry whose live record is an
+    ERROR record IS retried — the authoritative queue still lists the doc
+    as unresolved, and the re-stage archives the failed attempt as
+    versioned evidence instead of overwriting it.
+    """
+    skip: set[str] = set()
+    year_dir = staging_root(data_dir) / str(year)
+    if year_dir.exists():
+        for path in year_dir.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            doc_id = str(record.get("doc_id") or path.stem)
+            if record.get("parse_status") == "error":
+                continue  # retryable: the queue still wants this doc
+            skip.add(doc_id)
+    if check_canonical:
+        skip |= canonical_parsed_doc_ids(db_path or default_db_path(data_dir))
+    candidates: list[str] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        try:
+            item_year = int(item["year"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if item_year != int(year):
+            continue
+        doc_id = str(item["doc_id"])
+        if doc_id in seen or doc_id in skip:
+            continue
+        seen.add(doc_id)
+        pdf_path = default_pdf_path(data_dir, year, doc_id)
+        if not pdf_path.exists():
+            notes.append(
+                f"[{doc_id}] manifest entry has no local PDF "
+                f"({pdf_path}); skipped"
+            )
+            continue
+        candidates.append(doc_id)
+    return candidates[: max(limit, 0)], notes
+
+
 def stage_batch(
     year: int,
     limit: int,
@@ -378,6 +587,7 @@ def stage_batch(
     read_fn=None,
     cooldown: float = 0.0,
     workers: int = 1,
+    manifest: list[dict] | None = None,
 ) -> dict:
     """Stage up to ``limit`` docs for ``year``. Never raises for endpoint states.
 
@@ -386,11 +596,32 @@ def stage_batch(
     (``fatal_stop``, alerted — every remaining doc would fail the same way).
     Per-doc failures never kill the batch.
 
-    ``workers > 1`` reads docs concurrently (the GLM call is I/O-bound, so
+    ``workers`` reads docs concurrently (the GLM call is I/O-bound, so
     threads overlap network latency); a batch-wide stop halts new
     submissions and lets in-flight docs finish. Records are per-doc files,
     so no ordering or locking beyond the counters is needed.
+
+    Concurrency caps (finding 11): ``workers`` above MAX_WORKERS (2) raises
+    ValueError — the Z.AI subscription allows two concurrent vision
+    streams, and an operator override above that is a quota-budget
+    violation, not a tuning knob. Cross-process exclusion is the cron
+    wrapper's single-instance flock (``cron/backlog_ocr.sh`` holds
+    ``data/logs/ocr-backlog-cron/drain.lock``); no in-process lock is
+    taken because a single process is bounded by ``workers`` and overlaps
+    across processes are excluded by the wrapper.
+
+    ``manifest`` (``ocr_zero_rows.export_work_manifest`` items) replaces
+    the PDF-directory scan with the authoritative unresolved selection
+    (finding 8): see ``select_candidates_from_manifest``. A doc whose live
+    record is an error record is re-staged; the superseded record is
+    archived (``archive_current_attempt``) before the new one is written.
     """
+    if not 1 <= int(workers) <= MAX_WORKERS:
+        raise ValueError(
+            f"workers={workers} refused: the Z.AI subscription allows "
+            f"{MAX_WORKERS} concurrent vision streams; values above "
+            f"{MAX_WORKERS} violate the quota budget and are not accepted"
+        )
     if config is None and read_fn is None:
         config = VisionBConfig.from_env()
         if config is None:
@@ -398,9 +629,23 @@ def stage_batch(
                 "GLM vision endpoint is not configured: set VISION_B_BASE_URL, "
                 "VISION_B_MODEL (and VISION_B_API_KEY / VISION_B_TIMEOUT)"
             )
-    candidates = select_candidates(
-        year, limit, data_dir, check_canonical=check_canonical, db_path=db_path
-    )
+    if manifest is None:
+        candidates = select_candidates(
+            year, limit, data_dir, check_canonical=check_canonical, db_path=db_path
+        )
+        missing_pdfs = 0
+    else:
+        candidates, notes = select_candidates_from_manifest(
+            manifest,
+            year,
+            limit,
+            data_dir,
+            check_canonical=check_canonical,
+            db_path=db_path,
+        )
+        missing_pdfs = len(notes)
+        for note in notes:
+            print(f"  {note}", flush=True)
     staged = errors = 0
     quota_stop = False
     fatal_stop = False
@@ -433,6 +678,13 @@ def stage_batch(
                 flush=True,
             )
             return "fatal"
+        archived = archive_current_attempt(data_dir, year, doc_id)
+        if archived is not None:
+            print(
+                f"  [{doc_id}] prior staging record archived: "
+                f"attempts/{archived.name}",
+                flush=True,
+            )
         write_staging_record(data_dir, record)
         if record["parse_status"] == "error":
             print(f"  [{doc_id}] ERROR: {error}", flush=True)
@@ -468,6 +720,7 @@ def stage_batch(
             "quota_stop": quota_stop,
             "fatal_stop": fatal_stop,
             "remaining": remaining,
+            "missing_pdfs": missing_pdfs,
         }
 
     import threading
@@ -533,6 +786,7 @@ def stage_batch(
         "quota_stop": quota_stop,
         "fatal_stop": fatal_stop,
         "remaining": remaining,
+        "missing_pdfs": missing_pdfs,
     }
 
 
@@ -541,9 +795,14 @@ def stage_batch(
 # --------------------------------------------------------------------------
 
 
-def staged_row_to_tx(row) -> dict:
+def staged_row_to_tx(row, page_number=None) -> dict:
     """Convert a staged row [asset, type, tx_date, notif_date, amount_letter]
-    into the transaction dict ``insert_transactions``/validation expects."""
+    into the transaction dict ``insert_transactions``/validation expects.
+
+    ``page_number`` comes from the record's ``row_pages`` (per-row page
+    attribution recorded at stage time, finding 6) so the canonical
+    ``source_row_id`` identity is page-bound exactly like the Gemini path.
+    """
     values = list(row)
     if len(values) != 5:
         raise ValueError(f"staged row must have 5 fields, got {len(values)}")
@@ -558,7 +817,7 @@ def staged_row_to_tx(row) -> dict:
         "notif_date": notif_date,
         "amount_letter": letter,
         "amount_midpoint": AMOUNT_MIDPOINTS[letter],
-        "page_number": None,
+        "page_number": page_number,
     }
 
 
@@ -588,6 +847,53 @@ def audit_report_gate_open(state: dict | None) -> bool:
         state is not None
         and state.get("state") == "complete"
         and state.get("budget_met") is True
+    )
+
+
+def record_identity(record: dict) -> dict:
+    """The (pdf_sha256, prompt_sha256, parsed_at_utc) triple a verdict is
+    bound to (finding 6): it changes iff the artifact, extraction recipe, or
+    staging attempt changed."""
+    return {field: record.get(field) for field in AUDIT_IDENTITY_FIELDS}
+
+
+def verdict_binding(
+    data_dir: str | Path, doc_id: str, record: dict
+) -> tuple[bool, str | None]:
+    """(bound, refusal_reason) between the audit history and THIS record.
+
+    ``audit_sample.record_verdict`` stores the audited record's identity in
+    its audit-results entry; promotion requires a pass entry whose identity
+    equals the live record's. A mismatch means the record was re-staged (or
+    the recipe/artifact changed) after the audit — the pass verdict says
+    nothing about the live attempt, so promotion is refused (re-audit).
+    Entries written before identity binding existed carry no identity and
+    can never satisfy the check: fail-closed.
+    """
+    passes = [
+        entry
+        for entry in load_audit_results(data_dir)
+        if isinstance(entry, dict)
+        and str(entry.get("doc_id")) == str(doc_id)
+        and entry.get("verdict") == "pass"
+    ]
+    if not passes:
+        return False, (
+            "no pass verdict in the audit results history; run "
+            "audit_sample.py record"
+        )
+    identity = record_identity(record)
+    for entry in passes:
+        entry_identity = {field: entry.get(field) for field in AUDIT_IDENTITY_FIELDS}
+        if entry_identity == identity and all(
+            value is not None for value in entry_identity.values()
+        ):
+            return True, None
+    return False, (
+        "refused: the audit pass verdict is not bound to this record's "
+        "identity (pdf_sha256/prompt_sha256/parsed_at_utc) — the record "
+        "was re-staged after the audit or the verdict predates identity "
+        "binding; re-audit the current attempt"
     )
 
 
@@ -637,6 +943,12 @@ def promote_docs(
     (outcome complete: committed, no rejections, count matches). A partial
     or rejected insert keeps the record and stamps the rejection details on
     it; a member rejection is never mistaken for a no_txs.
+
+    Verdict binding (finding 6): an ``audit: pass`` stamp is only accepted
+    when the audit-results history contains a pass entry bound to THIS
+    record's identity (pdf_sha256 + prompt_sha256 + parsed_at_utc). A
+    record re-staged after its audit (or a verdict predating identity
+    binding) is refused — the audited attempt is not the live one.
     """
     if not require_audit_pass:
         raise ValueError(
@@ -716,6 +1028,12 @@ def promote_docs(
             )
             refused += 1
             continue
+        if not force_unaudited:
+            bound, reason = verdict_binding(data_dir, doc_id, record)
+            if not bound:
+                print(f"  [{doc_id}] {reason}", flush=True)
+                refused += 1
+                continue
         pdf_path = default_pdf_path(data_dir, year, doc_id)
         try:
             current_sha = pdf_sha256(pdf_path)
@@ -732,7 +1050,17 @@ def promote_docs(
             refused += 1
             continue
         try:
-            transactions = [staged_row_to_tx(row) for row in record.get("rows", [])]
+            rows = record.get("rows", [])
+            row_pages = record.get("row_pages") or []
+            transactions = [
+                staged_row_to_tx(
+                    row,
+                    page_number=(
+                        row_pages[index] if index < len(row_pages) else None
+                    ),
+                )
+                for index, row in enumerate(rows)
+            ]
             ingestion_generation = ocr.resolve_ingestion_generation(
                 db_path, doc_id, year, record["pdf_sha256"]
             )
@@ -876,6 +1204,17 @@ def main(argv: list[str] | None = None) -> int:
     p_stage.add_argument("--year", type=int, required=True)
     p_stage.add_argument("--limit", type=int, default=25, help="max docs this batch")
     p_stage.add_argument(
+        "--from-manifest",
+        default=None,
+        metavar="PATH",
+        help=(
+            "drain the AUTHORITATIVE unresolved-work manifest exported by "
+            "ocr_zero_rows.py --export-work-manifest (finding 8) instead of "
+            "scanning data/<year>/pdfs; entries without a local PDF are "
+            "skipped with a note. --year filters the manifest"
+        ),
+    )
+    p_stage.add_argument(
         "--check-canonical",
         action="store_true",
         help=(
@@ -890,8 +1229,12 @@ def main(argv: list[str] | None = None) -> int:
     p_stage.add_argument(
         "--workers",
         type=int,
-        default=2,
-        help="concurrent vision reads (Z.AI subscription allows 2 streams)",
+        default=MAX_WORKERS,
+        help=(
+            "concurrent vision reads; the Z.AI subscription allows "
+            f"{MAX_WORKERS} streams and larger values are REFUSED "
+            "(ValueError), not clamped"
+        ),
     )
 
     p_promote = subparsers.add_parser(
@@ -937,6 +1280,14 @@ def main(argv: list[str] | None = None) -> int:
     data_dir = args.data_dir
 
     if args.command == "stage":
+        manifest_items = None
+        if args.from_manifest:
+            manifest_items, manifest_error = load_work_manifest_items(
+                args.from_manifest
+            )
+            if manifest_error:
+                print(f"ERROR: {manifest_error}", file=sys.stderr)
+                return 2
         try:
             result = stage_batch(
                 args.year,
@@ -944,8 +1295,14 @@ def main(argv: list[str] | None = None) -> int:
                 data_dir=data_dir,
                 check_canonical=args.check_canonical,
                 cooldown=args.cooldown,
-                workers=max(1, args.workers),
+                workers=args.workers,
+                manifest=manifest_items,
             )
+        except ValueError as exc:
+            # Finding 11: a workers override above the 2-stream budget is a
+            # hard refusal, not a clamp.
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         except RuntimeError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1

@@ -426,7 +426,11 @@ def record_verdict(
     The results file is an append-only history: a later pass never erases
     an earlier fail (the report takes the WORST verdict per doc). The
     entry binds the verdict to the current staged record's frozen sha so
-    drift introduced after the review is detectable.
+    drift introduced after the review is detectable, AND to the record's
+    extraction identity (``pdf_sha256 + prompt_sha256 + parsed_at_utc``,
+    finding 6): ``glm_stage promote`` requires a pass entry whose identity
+    still matches the live record, so a re-stage after the audit forces a
+    re-audit instead of inheriting the stale verdict.
     """
     if verdict not in ("pass", "fail"):
         raise ValueError("verdict must be 'pass' or 'fail'")
@@ -434,11 +438,17 @@ def record_verdict(
 
     found_year = None
     stable_sha = None
+    identity = {field: None for field in ("pdf_sha256", "prompt_sha256", "parsed_at_utc")}
     for year_dir in sorted(root.glob("[0-9]" * 4)):
         path = year_dir / f"{doc_id}.json"
         if path.exists():
             record = json.loads(path.read_text(encoding="utf-8"))
             stable_sha = staged_record_sha256(record)
+            identity = {
+                "pdf_sha256": record.get("pdf_sha256"),
+                "prompt_sha256": record.get("prompt_sha256"),
+                "parsed_at_utc": record.get("parsed_at_utc"),
+            }
             record["audit"] = verdict
             record["audit_notes"] = notes
             _atomic_write_json(path, record)
@@ -451,6 +461,9 @@ def record_verdict(
         "notes": notes,
         "audited_at_utc": audited_at,
         "staged_record_sha256": stable_sha,
+        "pdf_sha256": identity["pdf_sha256"],
+        "prompt_sha256": identity["prompt_sha256"],
+        "parsed_at_utc": identity["parsed_at_utc"],
     }
     results_path = root / AUDIT_RESULTS_NAME
     results = []

@@ -587,3 +587,51 @@ def test_cli_report_sha_drift_refuses(data_dir, capsys):
     assert state["state"] == "incomplete"
     assert state["budget_met"] is None
     assert state["unresolved_count"] == 1
+
+
+# --------------------------------------------------------------------------
+# finding 6: verdicts bind to the audited record's extraction identity
+# --------------------------------------------------------------------------
+
+
+def test_record_verdict_binds_record_identity(data_dir):
+    record = make_record("id1", rows=[["X", "Purchase", "01/15/24", None, "A"]])
+    write_record(data_dir, record)
+    audit_sample.record_verdict(data_dir, "id1", "pass", "matches pixels")
+    (entry,) = json.loads(
+        (audit_sample.staging_root(data_dir) / "audit-results.json").read_text()
+    )
+    # glm_stage.promote requires this triple to still match the live record.
+    assert entry["pdf_sha256"] == record["pdf_sha256"]
+    assert entry["prompt_sha256"] == record["prompt_sha256"]
+    assert entry["parsed_at_utc"] == record["parsed_at_utc"]
+
+
+def test_verdict_without_record_leaves_identity_unbound(data_dir):
+    entry = audit_sample.record_verdict(data_dir, "ghost", "fail", "no record")[
+        "entry"
+    ]
+    assert entry["staged_record_sha256"] is None
+    assert entry["pdf_sha256"] is None
+    assert entry["prompt_sha256"] is None
+    assert entry["parsed_at_utc"] is None
+
+
+def test_identity_bound_entries_keep_report_state_semantics(data_dir):
+    """The finding-9 contract must keep passing with identity-bound entries."""
+    record = make_record("id2", rows=[["X", "Purchase", "01/15/24", None, "A"]])
+    write_record(data_dir, record)
+    records = audit_sample.load_staging_records(data_dir)
+    lot = audit_sample.freeze_lot(records, [{"doc_id": "id2", "year": 2024}])
+    audit_sample.record_verdict(data_dir, "id2", "pass", "ok")
+    records_after = audit_sample.load_staging_records(data_dir)
+    report = audit_sample.build_report(
+        audit_sample.load_audit_results(data_dir),
+        {r["doc_id"]: r.get("rows", []) for _, r in records_after},
+        {"id2"},
+        lot=lot,
+        staged_records_by_doc={r["doc_id"]: r for _, r in records_after},
+    )
+    assert report["state"] == "complete"
+    assert report["clean"] == ["id2"]
+    assert report["unresolved_count"] == 0

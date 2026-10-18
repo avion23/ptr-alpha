@@ -45,6 +45,7 @@ from scripts.gemini_ocr_common import (
     inspect_cached_response,
     is_quota_error,
     parse_gemini_output,
+    pdf_sha256,
     snapshot_pdf,
     validate_transactions,
 )
@@ -52,6 +53,13 @@ from scripts.gemini_ocr_common import (
 DB_PATH = "data/congress.duckdb"
 PROGRESS_PATH = "data/ocr_progress_gemini_manual.json"
 COOLDOWN = 3  # seconds between requests (Lite model allows rapid fire)
+# Authoritative unresolved-work manifest (FP review finding 8):
+# ``get_ocr_work_items`` is the single source of truth for what still needs
+# an OCR reading; --export-work-manifest freezes that selection to a JSON
+# file the staging drain (glm_stage stage --from-manifest) consumes, so the
+# pixel pipeline drains the real queue instead of re-scanning PDF dirs.
+WORK_MANIFEST_SCHEMA = "glm-work-manifest-v1"
+WORK_MANIFEST_DEFAULT_PATH = "data/staging/glm-backlog/work-manifest.json"
 # Engine-B-primary single-engine drain (OCR_ENGINE=visionb): GLM reads the
 # backlog alone — engine A (Gemini) is never contacted, conserving its free
 # quota for current-era docs. Readings land as STAGING records
@@ -435,6 +443,82 @@ def get_ocr_work_items(
 def get_zero_row_pdfs():
     """Backward-compatible all-year work selection from current DB state."""
     return get_ocr_work_items()
+
+
+def build_work_manifest(
+    *,
+    db_path: str = DB_PATH,
+    data_dir: str | Path | None = None,
+    year: int | None = None,
+) -> dict:
+    """The authoritative unresolved OCR queue as an artifact-bound manifest.
+
+    Exports exactly ``get_ocr_work_items`` — the same selection every drain
+    mode resolves against — binding each entry to the LOCAL artifact's
+    sha256 and its House ingestion generation at export time (both are
+    None when the artifact is missing from disk or not bound to the
+    current generation: the doc is unresolved precisely because that
+    binding is absent or unconfirmed, and the record stays honest instead
+    of guessing). ``glm_stage stage --from-manifest`` consumes the frozen
+    file so cron drains an inspectable queue rather than a directory scan
+    that includes text-born docs and re-admits promoted docs.
+    """
+    base = Path(data_dir) if data_dir is not None else Path(db_path).parent
+    items = []
+    for doc_id, doc_year, pdf_path in get_ocr_work_items(
+        db_path=db_path, data_dir=base, year=year
+    ):
+        entry = {
+            "doc_id": str(doc_id),
+            "year": int(doc_year),
+            "artifact_sha256": None,
+            "ingestion_generation": None,
+        }
+        local_pdf = Path(pdf_path)
+        if local_pdf.exists():
+            entry["artifact_sha256"] = pdf_sha256(local_pdf)
+        items.append(entry)
+    if items:
+        conn = duckdb.connect(db_path, read_only=True)
+        try:
+            for entry in items:
+                if entry["artifact_sha256"] is None:
+                    continue
+                try:
+                    entry["ingestion_generation"] = _resolve_ingestion_generation(
+                        conn, entry["doc_id"], entry["year"], entry["artifact_sha256"]
+                    )
+                except RuntimeError:
+                    entry["ingestion_generation"] = None
+        finally:
+            conn.close()
+    return {
+        "schema": WORK_MANIFEST_SCHEMA,
+        "generated_at_utc": (
+            datetime.datetime.now(datetime.timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        ),
+        "db_path": str(db_path),
+        "year": int(year) if year is not None else None,
+        "item_count": len(items),
+        "items": items,
+    }
+
+
+def export_work_manifest(
+    path: str | Path = WORK_MANIFEST_DEFAULT_PATH, **kwargs
+) -> dict:
+    """Atomically write ``build_work_manifest`` to ``path``; returns it."""
+    envelope = build_work_manifest(**kwargs)
+    manifest_path = Path(path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = manifest_path.with_name(manifest_path.name + ".tmp")
+    tmp_path.write_text(
+        json.dumps(envelope, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    os.replace(tmp_path, manifest_path)
+    return envelope
 
 
 def load_progress(path: str | Path = PROGRESS_PATH):
@@ -1993,7 +2077,35 @@ def main():
     parser.add_argument(
         "--refresh", action="store_true", help="Ignore cached Gemini responses"
     )
+    parser.add_argument(
+        "--export-work-manifest",
+        nargs="?",
+        const=WORK_MANIFEST_DEFAULT_PATH,
+        default=None,
+        metavar="PATH",
+        help=(
+            "export get_ocr_work_items (the authoritative unresolved queue) "
+            "as an artifact-bound JSON manifest and exit, without draining "
+            f"(default path: {WORK_MANIFEST_DEFAULT_PATH}; consumed by "
+            "glm_stage.py stage --from-manifest)"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.export_work_manifest:
+        # Mode-independent: exporting the queue must work even when the
+        # engine-B env is unusable (the cron wrapper exports BEFORE the
+        # drain; a failure there means canonical is unavailable).
+        envelope = export_work_manifest(
+            args.export_work_manifest,
+            db_path=DB_PATH,
+            data_dir=os.path.dirname(DB_PATH) or ".",
+        )
+        print(
+            f"work manifest {envelope['schema']}: {envelope['item_count']} "
+            f"unresolved docs -> {args.export_work_manifest}"
+        )
+        return
 
     mode = _ocr_engine_mode()
     vision_b_config = None

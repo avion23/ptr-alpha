@@ -167,5 +167,93 @@ class TestOcrZeroRows(unittest.TestCase):
         self.assertIsNone(ocr_zero_rows.resolve_ticker(None))
 
 
+# --------------------------------------------------------------------------
+# finding 8: the authoritative unresolved queue as an exportable manifest
+# --------------------------------------------------------------------------
+
+
+def test_export_work_manifest_binds_artifacts_and_generations(tmp_path, monkeypatch):
+    import json
+
+    import duckdb
+
+    from scripts import ocr_zero_rows
+
+    pdf = tmp_path / "2024" / "pdfs" / "m1.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF-1.4 manifest-test")
+    missing = tmp_path / "2023" / "pdfs" / "gone.pdf"
+    monkeypatch.setattr(
+        ocr_zero_rows,
+        "get_ocr_work_items",
+        lambda **kwargs: [("m1", 2024, str(pdf)), ("gone", 2023, str(missing))],
+    )
+    monkeypatch.setattr(
+        ocr_zero_rows,
+        "_resolve_ingestion_generation",
+        lambda conn, doc_id, year, sha: "gen-7",
+    )
+    db_path = tmp_path / "c.duckdb"
+    duckdb.connect(str(db_path)).close()
+
+    out = tmp_path / "staging" / "glm-backlog" / "work-manifest.json"
+    envelope = ocr_zero_rows.export_work_manifest(
+        out, db_path=str(db_path), data_dir=tmp_path
+    )
+    assert envelope["schema"] == ocr_zero_rows.WORK_MANIFEST_SCHEMA
+    assert envelope["item_count"] == 2
+    by_id = {item["doc_id"]: item for item in envelope["items"]}
+    # The local artifact is bound at export time (present doc)...
+    assert by_id["m1"]["artifact_sha256"] == ocr_zero_rows.pdf_sha256(pdf)
+    assert by_id["m1"]["ingestion_generation"] == "gen-7"
+    # ...and absence stays honest (missing PDF -> no invented binding).
+    assert by_id["gone"]["artifact_sha256"] is None
+    assert by_id["gone"]["ingestion_generation"] is None
+    assert json.loads(out.read_text()) == envelope
+
+
+def test_cli_export_work_manifest_writes_and_exits(tmp_path, monkeypatch, capsys):
+    import json
+    import sys
+
+    import duckdb
+
+    from scripts import ocr_zero_rows
+
+    db_path = tmp_path / "c.duckdb"
+    duckdb.connect(str(db_path)).close()
+    monkeypatch.setattr(ocr_zero_rows, "DB_PATH", str(db_path))
+    monkeypatch.setattr(ocr_zero_rows, "get_ocr_work_items", lambda **kwargs: [])
+    manifest = tmp_path / "custom" / "work-manifest.json"
+    monkeypatch.setattr(
+        sys, "argv", ["ocr_zero_rows.py", "--export-work-manifest", str(manifest)]
+    )
+
+    ocr_zero_rows.main()  # exports and exits before any engine-mode setup
+
+    assert "0 unresolved docs" in capsys.readouterr().out
+    envelope = json.loads(manifest.read_text())
+    assert envelope["schema"] == ocr_zero_rows.WORK_MANIFEST_SCHEMA
+    assert envelope["items"] == []
+
+
+def test_export_work_manifest_default_path_is_the_staging_root(tmp_path, monkeypatch):
+    from scripts import ocr_zero_rows
+
+    db_path = tmp_path / "c.duckdb"
+    import duckdb
+
+    duckdb.connect(str(db_path)).close()
+    monkeypatch.setattr(ocr_zero_rows, "DB_PATH", str(db_path))
+    monkeypatch.setattr(ocr_zero_rows, "get_ocr_work_items", lambda **kwargs: [])
+    monkeypatch.chdir(tmp_path)
+
+    envelope = ocr_zero_rows.export_work_manifest()
+    assert envelope["items"] == []
+    assert (
+        tmp_path / "data" / "staging" / "glm-backlog" / "work-manifest.json"
+    ).exists()
+
+
 if __name__ == "__main__":
     unittest.main()

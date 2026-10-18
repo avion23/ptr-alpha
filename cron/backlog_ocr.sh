@@ -84,6 +84,20 @@ for year in 2017 2016 2015 2014 2013 2018; do
     fi
 done
 
+# Durability: snapshot the staging corpus so a disk failure can never return
+# the backlog to nirvana (cheap: JSON records, a few MB).
+if [ -d "$repo/data/staging/glm-backlog" ]; then
+    backup_root="$repo/data/backups/glm-backlog"
+    mkdir -p "$backup_root"
+    if tar -czf "$backup_root/glm-backlog-$run_date.tar.gz" \
+        -C "$repo/data/staging" glm-backlog 2>/dev/null; then
+        printf '%s\n' "staging backup: $backup_root/glm-backlog-$run_date.tar.gz"
+    else
+        printf '%s\n' "WARNING: staging backup failed"
+    fi
+    find "$backup_root" -name 'glm-backlog-*.tar.gz' | sort -r | tail -n +15 | xargs -r rm -f --
+fi
+
 # Consumption/verification step: canonical health after the drain.
 python3 scripts/doctor.py
 doctor_rc=$?

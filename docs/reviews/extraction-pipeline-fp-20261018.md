@@ -94,6 +94,24 @@ this workload, dual-read agreement rate. Pre-registered pilot: 30 backlog
 docs dual-read (A/B models) + the 13-doc text A/B re-run through vLLM;
 adopt if agreement ≥95% on text-born and backlog throughput ≥500 docs/day.
 
+## Decision update 2 (2026-10-18 evening): engine B is LIVE via the Z.AI
+## subscription — dual-read pilot passed at 100%
+
+The operator's existing Z.AI subscription exposed `glm-5.3-flash` with
+vision (ParseBench Tables 89.2 — better than engine A's 85.5) at $0
+incremental. Compare-only dual-read pilot on 11 scanned backlog docs
+(2016–2017 scans): **AGREE 10, DISAGREE 0, A_ONLY 1** (B returned nothing
+for one doc; fell back exactly as designed) — **agreement 100%**, bar ≥95%.
+Zero errors. The gate is no longer hypothetical: both engines read real
+rotten scans and normalized to identical transaction multisets.
+
+Wiring in progress: `main()` (the nightly backlog cron path) routes through
+the dual-read orchestrator when `DUAL_READ=1` + engine-B env are present;
+credentials live outside the repo (`~/.config/ptr-backlog/env`, 0600,
+sourced by `cron/backlog_ocr.sh` — never committed). The MLX/Mac endpoint
+spec (`mlx-vision-endpoint-spec-20261018.md`) becomes a third reader /
+fallback for a future GPU-less-Mac scenario, not a requirement.
+
 ## Decision update (2026-10-18, post-ParseBench)
 
 ParseBench (parsebench.ai, 147 methods) changes decision 2: the operator

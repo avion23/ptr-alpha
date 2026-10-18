@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Daily bounded Gemini OCR drain of the zero-row PDF backlog, writing
-# directly into canonical (scripts/ocr_zero_rows.py inserts per doc; the
-# batch stops itself cleanly when the Gemini quota is exhausted — a normal,
-# expected outcome, not a failure). Verification step: scripts/doctor.py at
-# the end (canonical consumption/verification per the cron contract).
+# Nightly bounded GLM OCR drain of the zero-row PDF backlog into STAGING
+# (scripts/glm_stage.py — GLM-only rows are staged, excluded from canonical
+# until the pixel audit passes; see docs/reviews/glm-engine-fp-review-20261018.md).
+# Verification step: scripts/doctor.py at the end (cron contract).
 set -u
 
 readonly repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,29 +16,24 @@ mkdir -p "$run_dir"
 exec >>"$run_dir/run.log" 2>&1
 printf 'ocr backlog start: %s UTC (repo %s @ %s)\n' \
     "$(date -u --iso-8601=seconds)" "$repo" "$git_sha"
-cd "$repo"
 
-# Engine-B dual-read credentials live outside the repo (0600, operator-
-# managed). Missing file means a plain single-engine drain, exactly as
-# before — not an error.
+# Engine-B credentials + mode (outside the repo; missing file = no-op drain)
 if [ -f "${HOME}/.config/ptr-backlog/env" ]; then
-    # shellcheck disable=SC1091  # machine-local operator file
     . "${HOME}/.config/ptr-backlog/env"
 fi
-# Mark the (possibly non-exporting) operator file for the child interpreter.
-export DUAL_READ VISION_B_BASE_URL VISION_B_MODEL VISION_B_TIMEOUT VISION_B_API_KEY
-engine_b="no"
-if [ -n "${VISION_B_BASE_URL:-}" ] && [ -n "${VISION_B_MODEL:-}" ]; then
-    engine_b="yes"
-fi
+export DUAL_READ VISION_B_BASE_URL VISION_B_MODEL VISION_B_API_KEY VISION_B_TIMEOUT
 printf 'dual-read: DUAL_READ=%s engine_b_configured=%s\n' \
-    "${DUAL_READ:-}" "$engine_b"
+    "${DUAL_READ:-<unset>}" "$([ -n "${VISION_B_API_KEY:-}" ] && echo yes || echo no)"
+cd "$repo"
 
-timeout 21600 python3 scripts/ocr_zero_rows.py
-ocr_rc=$?
-printf 'ocr backlog done: exit=%d\n' "$ocr_rc"
+# Drain year-by-year into staging; quota exhaustion stops each year cleanly.
+for year in 2017 2016 2015 2014 2013 2018; do
+    printf '--- staging year %s ---\n' "$year"
+    timeout 10000 python3 scripts/glm_stage.py stage --year "$year" --limit 1500 \
+        || printf 'year %s stage exit=%d (quota/timeout tolerated)\n' "$year" "$?"
+done
 
-# Consumption/verification step: canonical health after the inserts.
+# Consumption/verification step: canonical health after the drain.
 python3 scripts/doctor.py
 doctor_rc=$?
 printf 'doctor exit=%d\n' "$doctor_rc"

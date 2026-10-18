@@ -55,8 +55,8 @@ _TX_WITH_OWNER = re.compile(
     r"(SP|DC|JT|J|S)\s+"  # House owner code
     r"(.+?)\s+"  # asset name
     rf"({_TX_TYPE})\s+"  # type
-    r"(\d{2}/\d{2}/\d{4})\s+"  # tx date
-    r"(\d{2}/\d{2}/\d{4})\s+"  # notif date
+    r"(\d{1,2}/\d{1,2}/\d{4})\s+"  # tx date (single-digit months/days occur)
+    r"(\d{1,2}/\d{1,2}/\d{4})\s+"  # notif date
     rf"({_AMOUNT})"  # amount
 )
 
@@ -64,8 +64,8 @@ _TX_NO_OWNER = re.compile(
     r"^\s{0,30}"
     r"(.+?)\s+"  # asset name
     rf"({_TX_TYPE})\s+"  # type
-    r"(\d{2}/\d{2}/\d{4})\s+"  # tx date
-    r"(\d{2}/\d{2}/\d{4})\s+"  # notif date
+    r"(\d{1,2}/\d{1,2}/\d{4})\s+"  # tx date (single-digit months/days occur)
+    r"(\d{1,2}/\d{1,2}/\d{4})\s+"  # notif date
     rf"({_AMOUNT})"  # amount
 )
 
@@ -74,6 +74,12 @@ _OWNER_TX_HEAD = re.compile(r"^[A-Z]{1,4}\s+\S")
 _OWNER_PREFIX = re.compile(r"^[A-Z]{1,4}\s+\S")
 _AMOUNT_CONTINUATION = re.compile(r"\$[\d,]+\s*$")
 _SOURCE_ACCOUNT = re.compile(r"^S\s+O\s*:\s*(.+)$")
+
+# Filing metadata labels are printed in upper case by the House layout
+# ("FILING STATUS: New"); the title-case "Filing" skip prefix above never
+# matched them, so the line was folded into the preceding asset name and
+# its "STATUS:" word was later extracted as a ticker (20006438).
+_FILING_LABEL_LINE = re.compile(r"^(?:FILING\s+STATUS)\s*:", re.IGNORECASE)
 
 
 def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
@@ -163,6 +169,8 @@ def _parse_pdftotext_lines(
 
 def _is_skip_line(line: str) -> bool:
     stripped = line.strip()
+    if _FILING_LABEL_LINE.match(stripped):
+        return True
     if re.fullmatch(r"\([A-Z][A-Z0-9.\-/]{0,9}\)|\[[A-Z]{2}\]", stripped):
         return False
     if not stripped or len(stripped) <= _MAX_SINGLE_LETTER_LEN:

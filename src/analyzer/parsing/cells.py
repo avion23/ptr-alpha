@@ -11,6 +11,16 @@ from analyzer.models import TransactionType
 
 _PARENTHETICAL_TICKER = r"\(([A-Za-z][A-Za-z0-9.\-]{0,5})\)"
 
+# Filing metadata labels that leak into asset cells (row folding, camelot
+# one-cell collapses, cached tables). Their trailing word must never be
+# extracted as a ticker: "…MUNI BOND FILING STATUS: New" produced ticker
+# "STATUS" (document 20006438).
+_FILING_METADATA_LABEL = re.compile(
+    r"\b(?:FILING\s+STATUS|F\s+S|SOURCE\s+OF|S\s+O|SUB\s*HOLDING\s+OF|"
+    r"DESCRIPTION|LOCATION)\s*:",
+    re.IGNORECASE,
+)
+
 _TICKER_BLACKLIST = {
     # Transaction type letters accidentally captured
     "P",
@@ -63,18 +73,21 @@ def clean_text(text: str | None) -> str:
 def _extract_ticker(asset_cell: str | None) -> str | None:
     if not asset_cell:
         return None
-    ticker_match = re.search(_PARENTHETICAL_TICKER, asset_cell)
+    # Search on a copy with metadata labels removed so a label's trailing
+    # word ("STATUS:", "OF:") can never satisfy the ticker patterns below.
+    searchable = _FILING_METADATA_LABEL.sub(" ", asset_cell)
+    ticker_match = re.search(_PARENTHETICAL_TICKER, searchable)
     if ticker_match:
         candidate = ticker_match.group(1).upper()
         if candidate not in _TICKER_BLACKLIST:
             return candidate
     # Also match $TICKER and TICKER: formats
-    dollar_match = re.search(r"\$([A-Za-z][A-Za-z0-9.\-]{0,5})", asset_cell)
+    dollar_match = re.search(r"\$([A-Za-z][A-Za-z0-9.\-]{0,5})", searchable)
     if dollar_match:
         candidate = dollar_match.group(1).upper()
         if candidate not in _TICKER_BLACKLIST:
             return candidate
-    colon_match = re.search(r"\b([A-Za-z][A-Za-z0-9.\-]{0,5}):", asset_cell)
+    colon_match = re.search(r"\b([A-Za-z][A-Za-z0-9.\-]{0,5}):", searchable)
     if colon_match:
         candidate = colon_match.group(1).upper()
         if candidate not in _TICKER_BLACKLIST:

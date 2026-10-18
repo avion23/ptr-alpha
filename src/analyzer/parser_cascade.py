@@ -100,6 +100,77 @@ def _multiset_subset(left: dict, right: dict) -> bool:
     return all(count <= right.get(identity, 0) for identity, count in left.items())
 
 
+def _row_coordinate(transaction: dict) -> tuple[str, str] | None:
+    """Split one source_row_id into (coordinate system, position).
+
+    ``pdftotext:l47`` -> ("pdftotext:l", "47"); ``pdfplumber:p2:t0:r9`` ->
+    ("pdfplumber:p2:t0:r", "9"). Rows from different systems describe the same
+    document through different extraction passes, so identical content at two
+    such coordinates cannot prove two distinct visual rows.
+    """
+    source_row_id = str(transaction.get("source_row_id") or "")
+    match = re.fullmatch(r"(?P<system>.+?)(?P<position>\d+)", source_row_id)
+    if not match:
+        return None
+    return match.group("system"), match.group("position")
+
+
+def _coordinate_distinct_copies(copies: list[dict]) -> bool:
+    """Whether repeated identical rows are genuinely distinct source lots.
+
+    Copies that all live in ONE coordinate system are a parser reporting that
+    many source rows -- identical lots are legitimate and preserved. Copies
+    spread across DIFFERENT coordinate systems of the same engine (pdfplumber's
+    table grid versus its text layout) are the merge-artifact signature of one
+    visual row read twice (document 20006438): they cannot be coordinate-
+    distinct and must escalate instead. Unverifiable rows escalate too.
+    """
+    if len(copies) < 2:
+        return False
+    coordinates = [_row_coordinate(transaction) for transaction in copies]
+    if any(coordinate is None for coordinate in coordinates):
+        return False
+    return len({system for system, _ in coordinates}) == 1
+
+
+def _multiplicity_expansion_is_genuine(
+    candidate_rows: list[dict],
+    candidate_counts: dict,
+    observer_counts: list[dict],
+) -> bool:
+    """Whether a superset reading is justified beyond every observer's rows.
+
+    A strict subset relationship alone cannot prove the superset complete:
+    the extra observations must each be explained. Two explanations count:
+
+    1. Another engine observed the same identity at least as often, so the
+       row is corroborated (the count never exceeds the best observer).
+    2. The extra copies of an identity the observers did see all live in one
+       coordinate system of the winning engine -- genuine identical lots.
+       Copies spread across that engine's different extraction passes (table
+       grid vs text layout) are merge artifacts and escalate instead.
+
+    Rows NO observer saw (new identities) are unexplained disagreement and
+    must escalate instead of being silently accepted.
+    """
+    for identity, count in candidate_counts.items():
+        max_observed = max(
+            (counts.get(identity, 0) for counts in observer_counts), default=0
+        )
+        if count <= max_observed:
+            continue
+        if max_observed == 0:
+            return False
+        copies = [
+            transaction
+            for transaction in candidate_rows
+            if _transaction_identity(transaction) == identity
+        ]
+        if not _coordinate_distinct_copies(copies):
+            return False
+    return True
+
+
 def _pop_exact_identity(remaining: list[dict], identity: tuple) -> dict | None:
     for index, row in enumerate(remaining):
         if _transaction_identity(row) == identity:
@@ -326,8 +397,10 @@ def _run_text_engines(
 
     reconciled_text = _reconcile_candidates(text_candidates, engines_attempted)
     trusted = {name: rows for name, rows in text_candidates}
-    pdfplumber_counts = _candidate_counts(trusted.get("pdfplumber", []))[0]
-    pdftotext_counts = _candidate_counts(trusted.get("pdftotext", []))[0]
+    pdfplumber_rows = trusted.get("pdfplumber", [])
+    pdftotext_rows = trusted.get("pdftotext", [])
+    pdfplumber_counts = _candidate_counts(pdfplumber_rows)[0]
+    pdftotext_counts = _candidate_counts(pdftotext_rows)[0]
     pdfplumber_subset = bool(pdfplumber_counts) and _multiset_subset(
         pdfplumber_counts, pdftotext_counts
     )
@@ -349,20 +422,49 @@ def _run_text_engines(
         if not covered:
             engines_attempted.append("text_page_coverage_unconfirmed")
             return None, text_candidates, reconciled_text, engines_attempted, errors
-    if pdfplumber_subset and _candidate_covers_all(
-        trusted["pdftotext"], text_candidates
-    ):
-        engines_attempted.append("trusted:pdfplumber_subset_pdftotext")
-        engines_attempted.append("won:pdftotext")
-        result = pdf_path, trusted["pdftotext"], engines_attempted
+
+    # A strict subset relationship is disagreement, not proof of completeness:
+    # one engine silently dropped visible rows, so the surviving reading may
+    # carry artifacts the dropped rows once exposed. Trust a superset only
+    # when every row beyond the other engines' multiplicities is genuine
+    # (corroborated, or coordinate-distinct identical lots); otherwise the
+    # document escalates to the OCR rung (fail closed).
+    trust_attempts = [
+        (
+            pdfplumber_subset,
+            pdftotext_rows,
+            pdftotext_counts,
+            "trusted:pdfplumber_subset_pdftotext",
+            "won:pdftotext",
+        ),
+        (
+            pdftotext_subset,
+            pdfplumber_rows,
+            pdfplumber_counts,
+            "trusted:pdftotext_subset_pdfplumber",
+            "won:pdfplumber",
+        ),
+    ]
+    for is_subset, rows, counts, trusted_tag, won_tag in trust_attempts:
+        if not is_subset:
+            continue
+        observer_counts = [
+            _candidate_counts(observer_rows)[0]
+            for observer_name, observer_rows in text_candidates
+            if observer_rows is not rows
+        ]
+        if not _multiplicity_expansion_is_genuine(rows, counts, observer_counts):
+            engines_attempted.append(f"subset_expansion_unverified:{won_tag[4:]}")
+            continue
+        if not _candidate_covers_all(rows, text_candidates):
+            engines_attempted.append(f"text_engines_miss_observed_rows:{won_tag[4:]}")
+            continue
+        engines_attempted.append(trusted_tag)
+        engines_attempted.append(won_tag)
+        result = pdf_path, rows, engines_attempted
         return result, text_candidates, reconciled_text, engines_attempted, errors
-    if pdftotext_subset and _candidate_covers_all(
-        trusted["pdfplumber"], text_candidates
-    ):
-        engines_attempted.append("trusted:pdftotext_subset_pdfplumber")
-        engines_attempted.append("won:pdfplumber")
-        result = pdf_path, trusted["pdfplumber"], engines_attempted
-        return result, text_candidates, reconciled_text, engines_attempted, errors
+    if text_candidates:
+        engines_attempted.append("text_row_disagreement_unresolved")
     return None, text_candidates, reconciled_text, engines_attempted, errors
 
 

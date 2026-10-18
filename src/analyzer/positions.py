@@ -19,6 +19,7 @@ import re
 from datetime import date
 from functools import lru_cache
 
+import numpy as np
 import pandas as pd
 
 from analyzer.canonical_scope import canonical_decision
@@ -88,25 +89,9 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
     return gated
 
 
-def _is_option_row(row, has_instrument: bool) -> bool:
-    """Positive option evidence only; NULL/unknown instruments stay equity.
-
-    House filings also mark options inline as ``[OP]`` while leaving
-    instrument_type NULL on some rows; those must not count as shares.
-    ``[ST]`` (stock) is authoritative and never an option.
-    """
-    description = ""
-    value = getattr(row, "asset_description", None)
-    if value is not None and not pd.isna(value):
-        description = str(value)
-    if re.search(r"\[op\]", description, re.IGNORECASE):
-        return True
-    if has_instrument:
-        instrument = row.instrument_type
-        if instrument is not None and not pd.isna(instrument):
-            if str(instrument).strip().lower() in _OPTION_MARKERS:
-                return True
-    return False
+def _is_option_row(description, instrument) -> bool:
+    """Memoized option-evidence decision (see `_option_row`)."""
+    return _option_row(description, instrument)
 
 
 def entry_close(
@@ -147,15 +132,20 @@ class _EntryCloseLookup:
     non-datetime, NaT-bearing index) falls back to `entry_close` itself.
     """
 
-    __slots__ = ("_histories", "_as_of", "_prepared", "_cache", "_stamps", "_current")
+    __slots__ = ("_histories", "_as_of", "_prepared", "_cache",
+                 "_current", "_shared_prepared", "_windows")
 
-    def __init__(self, histories: dict[str, pd.DataFrame], as_of):
+    def __init__(
+        self, histories: dict[str, pd.DataFrame], as_of,
+        prepared: dict[str, tuple] | None = None,
+    ):
         self._histories = histories
         self._as_of = None if as_of is None else pd.Timestamp(as_of)
         self._prepared: dict[str, tuple | None] = {}
+        self._shared_prepared: dict[str, tuple] = prepared or {}
         self._cache: dict[tuple[str, date], float | None] = {}
-        self._stamps: dict[date, pd.Timestamp] = {}
         self._current: dict[str, float | None] = {}
+        self._windows: dict[date, tuple[pd.Timestamp, pd.Timestamp]] = {}
 
     def close(self, ticker: str, day: date) -> float | None:
         key = (ticker, day)
@@ -170,6 +160,13 @@ class _EntryCloseLookup:
     def _prepared_frame(self, ticker: str):
         if ticker in self._prepared:
             return self._prepared[ticker]
+        if ticker in self._shared_prepared:
+            # Pre-cut by the loader under the same guarantees this method
+            # enforces when preparing from a frame (datetime index, no NaT,
+            # date-ordered, numeric closes, truncated at as_of).
+            prepared = self._shared_prepared[ticker]
+            self._prepared[ticker] = prepared
+            return prepared
         history = self._histories.get(ticker)
         prepared = None
         if (
@@ -194,27 +191,31 @@ class _EntryCloseLookup:
         if prepared is None:
             return entry_close(self._histories.get(ticker), day, self._as_of)
         index, values = prepared
-        day_ts = self._stamp(day)
+        day_ts, window_end = self._window(day)
         position = index.searchsorted(day_ts, side="left")
-        # Monotonic dates: the first bar past the 7-day gap cap can never
-        # price the entry, matching entry_close's bar-day check.
-        while position < len(index):
-            bar_day = index[position].date()
-            if (bar_day - day).days > 7:
-                return None
-            value = values[position]
+        if position >= len(index):
+            return None
+        # Monotonic dates: the 7-day gap cap is a pure date bound, so one
+        # upper searchsorted replaces the per-bar Timestamp .date() walk.
+        # Bars in [position, window_end) are exactly those with
+        # (bar_day - day).days <= 7; the first non-NaN close among them is
+        # the one entry_close's notna+iloc[0] prices.
+        hi = index.searchsorted(window_end, side="left")
+        for k in range(position, hi):
+            value = values[k]
             if value == value:  # skip NaN closes exactly like closes.notna()
                 price = float(value)
                 return price if math.isfinite(price) and price > 0 else None
-            position += 1
         return None
 
-    def _stamp(self, day: date) -> pd.Timestamp:
-        stamp = self._stamps.get(day)
-        if stamp is None:
+    def _window(self, day: date) -> tuple[pd.Timestamp, pd.Timestamp]:
+        """Cached (day, day+8d) pair bounding the 7-day entry-gap cap."""
+        cached = self._windows.get(day)
+        if cached is None:
             stamp = pd.Timestamp(day)
-            self._stamps[day] = stamp
-        return stamp
+            cached = (stamp, stamp + pd.Timedelta(days=8))
+            self._windows[day] = cached
+        return cached
 
     def current(self, ticker: str) -> float | None:
         """Memoized twin of `_current_close` for the fixed as_of."""
@@ -253,6 +254,74 @@ def _current_close(prices: pd.DataFrame, as_of: date) -> float | None:
     return price if price > 0 else None
 
 
+def _split_price_history(history: pd.DataFrame, as_of=None):
+    """Per-ticker close frames, plus optional pre-prepared lookup arrays.
+
+    The loaders fetch prices ``ORDER BY ticker, date``, so each ticker's
+    rows arrive contiguous and date-ordered; numpy boundary detection then
+    replaces the per-group ``groupby`` + ``set_index`` construction (which
+    copies every group and deletes its date column separately). Any
+    violated assumption (non-contiguous tickers, non-monotone or NaT
+    dates) falls back to the original groupby construction verbatim.
+
+    Returns ``(frames, prepared)`` where ``prepared`` maps ticker ->
+    ``(truncated DatetimeIndex, close values)`` for ``_EntryCloseLookup``
+    when ``as_of`` is given and closes are numeric, else ``None``.
+    """
+    frames: dict[str, pd.DataFrame] = {}
+    if history.empty:
+        return frames, None
+    date_values = pd.to_datetime(history["date"]).to_numpy()
+    close_values = history["close"].to_numpy()
+    codes, uniques = pd.factorize(history["ticker"], sort=False)
+    codes = np.asarray(codes)
+    # Ticker groups must be contiguous (codes non-decreasing under
+    # appearance-order factorization). Dates restart at every new ticker,
+    # so a date decrease is valid only exactly at a group start; inside a
+    # group the loader's date ordering must hold. Any NaT date falls back.
+    group_start = codes.size == 0 or np.concatenate(
+        ([True], codes[1:] != codes[:-1])
+    )
+    contiguous = bool(codes.size == 0) or (
+        not np.any(codes[1:] < codes[:-1])
+        and not np.any(
+            (date_values[1:] < date_values[:-1]) & ~group_start[1:]
+        )
+        and not np.isnat(date_values).any()
+    )
+    if not contiguous:
+        grouped = history.copy()
+        grouped["date"] = pd.to_datetime(grouped["date"])
+        for symbol, frame in grouped.groupby("ticker", sort=False):
+            frames[str(symbol)] = frame.set_index("date")
+        return frames, None
+
+    boundaries = np.flatnonzero(
+        np.concatenate(([True], codes[1:] != codes[:-1]))
+    )
+    ends = np.append(boundaries[1:], codes.size)
+    index_name = history["date"].name or "date"
+    # One shared DatetimeIndex: per-ticker frames and the prepared lookup
+    # arrays all slice it (slicing wraps memory instead of re-validating),
+    # and the two-arg ndarray frame constructor skips the per-column
+    # sanitization the dict constructor pays.
+    base_index = pd.DatetimeIndex(date_values, name=index_name)
+    usable = as_of is not None and close_values.dtype.kind in "fiu"
+    prepared: dict[str, tuple] | None = {} if usable else None
+    as_of_ts = pd.Timestamp(as_of) if usable else None
+    for position, symbol in enumerate(uniques):
+        start, stop = int(boundaries[position]), int(ends[position])
+        index = base_index[start:stop]
+        frames[str(symbol)] = pd.DataFrame(
+            close_values[start:stop], index=index, columns=["close"]
+        )
+        if prepared is not None:
+            cut = int(index.searchsorted(as_of_ts, side="right"))
+            prepared[str(symbol)] = (base_index[start:start + cut],
+                                     close_values[start:start + cut])
+    return frames, prepared
+
+
 def _is_full_sale(kind: str, subtype) -> bool:
     for value in (kind, subtype):
         if value is None or pd.isna(value):
@@ -286,6 +355,36 @@ def _owner_account(value) -> str | None:
     if account in {"J", "JT"}:
         return "JT"
     return account or None
+
+
+# Pure string normalizations over a tiny value space; memoization keeps the
+# per-row FIFO loop off the repeated str/re work without changing results.
+_owner_account = lru_cache(maxsize=4096)(_owner_account)
+
+
+@lru_cache(maxsize=4096)
+def _transaction_kind(value) -> str:
+    return str(value or "").strip().lower()
+
+
+@lru_cache(maxsize=8192)
+def _option_row(description, instrument) -> bool:
+    """Positive option evidence only; NULL/unknown instruments stay equity.
+
+    House filings also mark options inline as ``[OP]`` while leaving
+    instrument_type NULL on some rows; those must not count as shares.
+    ``[ST]`` (stock) is authoritative and never an option. Cells are passed
+    directly (None when the column is absent).
+    """
+    desc = ""
+    if description is not None and not pd.isna(description):
+        desc = str(description)
+    if re.search(r"\[op\]", desc, re.IGNORECASE):
+        return True
+    if instrument is not None and not pd.isna(instrument):
+        if str(instrument).strip().lower() in _OPTION_MARKERS:
+            return True
+    return False
 
 
 def build_positions(
@@ -325,7 +424,7 @@ def build_positions(
     if entry_lookup is None:
         entry_lookup = _EntryCloseLookup(price_history, as_of)
 
-    def _filing_ref(row, source) -> dict:
+    def _filing_ref(record_cell, row_cell, source) -> dict:
         """Canonical filing identity of one contributing lot row.
 
         Lots keep the source_row identity that opened them so a position can
@@ -333,19 +432,16 @@ def build_positions(
         NULL explicitly; nothing is invented.
         """
 
-        def _id(name):
-            if name not in trades.columns:
+        def _id(cell):
+            if cell is None or pd.isna(cell):
                 return None
-            value = getattr(row, name, None)
-            if value is None or pd.isna(value):
-                return None
-            text = str(value).strip()
+            text = str(cell).strip()
             return text or None
 
         return {
             "source": source if isinstance(source, str) and source else None,
-            "source_record_id": _id("source_record_id"),
-            "source_row_id": _id("source_row_id"),
+            "source_record_id": _id(record_cell) if has_record_id else None,
+            "source_row_id": _id(row_cell) if has_row_id else None,
         }
 
     floor_sized: dict[tuple[str, str], int] = {}
@@ -362,16 +458,14 @@ def build_positions(
         r"([\d,.]+)\s+shares?\s+@\s*\$?([\d,.]+)", re.IGNORECASE
     )
 
-    def _filed_lot(row) -> tuple[float, float] | None:
+    def _filed_lot(description) -> tuple[float, float] | None:
         """Exact (shares, price) from filed descriptions like '100 shares @ $100'.
 
         Form 4 rows state both; using them keeps buy-sell arithmetic exact
         instead of dividing band dollars by market closes (which leaves
-        phantom shares when prices differ).
+        phantom shares when prices differ). None when the description cell
+        is absent (no asset_description column) or unparseable.
         """
-        if "asset_description" not in trades.columns:
-            return None
-        description = row.asset_description
         if description is None or pd.isna(description):
             return None
         match = _FILED_SHARES_RE.search(str(description))
@@ -386,16 +480,14 @@ def build_positions(
             return None
         return shares, price
 
-    def _size(row) -> tuple[float | None, bool]:
+    def _size(midpoint, raw) -> tuple[float | None, bool]:
         """Dollar size with floor fallback for open-ended bands.
 
         Returns (size, sized_by_floor). A '$100,001 -' band parses to its
         $100,001 floor: a conservative lower bound, flagged as such.
         """
-        midpoint = row.amount_midpoint if has_midpoint else None
         if midpoint is not None and not pd.isna(midpoint) and float(midpoint) > 0:
             return float(midpoint), False
-        raw = row.amount_raw if has_raw else None
         if raw is None or pd.isna(raw):
             return None, False
         _, floor = _extract_amount_midpoint(str(raw))
@@ -448,11 +540,46 @@ def build_positions(
         if dropped:
             logger.info("Dropping %d rows superseded by amendments", dropped)
             ordered = ordered.loc[~mask].copy()
-    for row in ordered.itertuples():
-        if pd.isna(row.member) or pd.isna(row.ticker):
+    has_record_id = "source_record_id" in trades.columns
+    has_row_id = "source_row_id" in trades.columns
+    has_description = "asset_description" in trades.columns
+    has_owner = "owner_code" in trades.columns
+    has_source = "source" in trades.columns
+
+    # Column-major extraction: the FIFO decisions below are unchanged, but
+    # they now index prebuilt cell lists instead of walking itertuples
+    # namedtuples (per-row Series-free, per-cell extension-scalar unpack).
+    # Same values, same order, same per-row decisions.
+    def _column(name):
+        return ordered[name].tolist()
+
+    member_cells = _column("member")
+    ticker_cells = _column("ticker")
+    type_cells = _column("transaction_type")
+    day_cells = _column("transaction_date")
+    subtype_cells = _column("raw_transaction_subtype") if has_subtype else None
+    midpoint_cells = _column("amount_midpoint") if has_midpoint else None
+    raw_cells = _column("amount_raw") if has_raw else None
+    owner_cells = _column("owner_code") if has_owner else None
+    source_cells = _column("source") if has_source else None
+    disclosure_cells = _column("disclosure_date") if has_disclosure else None
+    instrument_cells = _column("instrument_type") if has_instrument else None
+    description_cells = _column("asset_description") if has_description else None
+    record_id_cells = _column("source_record_id") if has_record_id else None
+    row_id_cells = _column("source_row_id") if has_row_id else None
+
+    # Pure per-row derivations repeat across rows; cache them per call.
+    _DAY_MISS = object()
+    day_cache: dict = {}
+    disclosure_day_cache: dict = {}
+
+    for i in range(len(ordered)):
+        member_value = member_cells[i]
+        ticker_value = ticker_cells[i]
+        if pd.isna(member_value) or pd.isna(ticker_value):
             skipped += 1
             continue
-        member = str(row.member)
+        member = str(member_value)
         canonical = canonical_member_key(member)
         member_key = member_keys.get(canonical)
         if member_key is None:
@@ -471,47 +598,58 @@ def build_positions(
             member_keys[canonical] = member_key
             member_identities.setdefault(member_key, []).append(canonical)
             member_labels.setdefault(member_key, member)
-        key = (member_key, str(row.ticker))
-        day = pd.Timestamp(row.transaction_date).date()
-        kind = str(row.transaction_type or "").strip().lower()
-        full_sale = _is_full_sale(
-            kind, row.raw_transaction_subtype if has_subtype else None
-        )
-        partial_sale = _is_partial_sale(
-            kind, row.raw_transaction_subtype if has_subtype else None
-        )
-        account = _owner_account(
-            row.owner_code if "owner_code" in trades.columns else None
-        )
+        ticker = str(ticker_value)
+        key = (member_key, ticker)
+        day_cell = day_cells[i]
+        day = day_cache.get(day_cell, _DAY_MISS)
+        if day is _DAY_MISS:
+            day = pd.Timestamp(day_cell).date()
+            day_cache[day_cell] = day
+        kind = _transaction_kind(type_cells[i])
+        subtype_cell = subtype_cells[i] if has_subtype else None
+        full_sale = _is_full_sale(kind, subtype_cell)
+        partial_sale = _is_partial_sale(kind, subtype_cell)
+        account = _owner_account(owner_cells[i] if has_owner else None)
         estimate_key = (key, account)
-        source = row.source if "source" in trades.columns else None
+        source = source_cells[i] if has_source else None
         congress_estimate = isinstance(source, str) and source in _CONGRESS_SOURCES
-        if _is_option_row(row, has_instrument):
+        if _is_option_row(
+            description_cells[i] if has_description else None,
+            instrument_cells[i] if has_instrument else None,
+        ):
             skipped_options += 1
             continue
-        disclosed = row.disclosure_date if has_disclosure else None
+        disclosed = disclosure_cells[i] if has_disclosure else None
         disclosure_day = (
-            pd.Timestamp(disclosed).date()
+            disclosure_day_cache.get(disclosed, _DAY_MISS)
             if disclosed is not None and not pd.isna(disclosed)
             else day
         )
+        if disclosure_day is _DAY_MISS:
+            disclosure_day = pd.Timestamp(disclosed).date()
+            disclosure_day_cache[disclosed] = disclosure_day
         last_activity[key] = day
 
-        history = price_history.get(str(row.ticker))
+        history = price_history.get(ticker)
         if history is None or history.empty:
             skipped += 1
             continue
 
         if kind in _BUY_TYPES:
-            filed = _filed_lot(row)
+            filed = _filed_lot(
+                description_cells[i] if has_description else None
+            )
             if filed is not None:
                 shares, filed_price = filed
                 size, by_floor = shares * filed_price, False
                 if congress_estimate:
                     ineligible_for_band_tolerance.add(estimate_key)
             else:
-                entry = entry_lookup.close(str(row.ticker), day)
-                size, by_floor = _size(row)
+                entry = entry_lookup.close(ticker, day)
+                size, by_floor = _size(
+                    midpoint_cells[i] if has_midpoint else None,
+                    raw_cells[i] if has_raw else None,
+                )
                 if entry is None or size is None:
                     skipped += 1
                     continue
@@ -532,7 +670,11 @@ def build_positions(
                         estimate["bought_shares"] += shares
             lots.setdefault(key, []).append(
                 [shares, size, disclosure_day, source, account, day,
-                 _filing_ref(row, source)]
+                 _filing_ref(
+                     record_id_cells[i] if has_record_id else None,
+                     row_id_cells[i] if has_row_id else None,
+                     source,
+                 )]
             )
             if by_floor:
                 floor_sized[key] = floor_sized.get(key, 0) + 1
@@ -566,14 +708,19 @@ def build_positions(
                 continue
             sale_estimate_value = None
             sale_band_ineligible = False
-            filed = _filed_lot(row)
+            filed = _filed_lot(
+                description_cells[i] if has_description else None
+            )
             if filed is not None:
                 to_relieve = filed[0]
                 if congress_estimate:
                     sale_band_ineligible = True
             else:
-                entry = entry_lookup.close(str(row.ticker), day)
-                size, by_floor = _size(row)
+                entry = entry_lookup.close(ticker, day)
+                size, by_floor = _size(
+                    midpoint_cells[i] if has_midpoint else None,
+                    raw_cells[i] if has_raw else None,
+                )
                 if entry is None or size is None:
                     skipped += 1
                     continue
@@ -875,6 +1022,7 @@ def holdings_candidates_batch(
         [universe],
     ).fetchdf()
     by_member: dict[str, pd.DataFrame] = {}
+    kind_by_member: dict[str, pd.Series | None] = {}
     if not canonical.empty:
         # One stable sort by build_positions' full tie-key order for the whole
         # shared frame; every per-member partition inherits it, so the
@@ -887,9 +1035,38 @@ def holdings_candidates_batch(
             [column for column in _tie_columns if column in canonical],
             kind="mergesort", na_position="first",
         )
+        # One positional pass groups rows by raw filed name; each member's
+        # partition is the ordered union of its variants' row positions.
+        # Identical rows in identical order to the previous per-member
+        # boolean masks, without M full-frame scans: boolean indexing walks
+        # positions in frame order, and so does a sorted position union.
+        # NaN/absent members never match a variant list, exactly like isin.
+        name_groups = canonical.groupby("member", sort=False).indices
+        kind_series = (
+            canonical["source"].map(source_kinds)
+            if "source" in canonical.columns
+            else None
+        )
+        empty_kind = (
+            pd.Series(np.nan, index=canonical.index[:0], dtype="object")
+            if kind_series is not None
+            else None
+        )
         for member in members:
-            mine = canonical.loc[canonical["member"].isin(variants[member])].copy()
-            by_member[member] = mine
+            found = [
+                name_groups[variant]
+                for variant in variants[member]
+                if variant in name_groups
+            ]
+            if found:
+                positions = np.sort(np.concatenate(found))
+                by_member[member] = canonical.take(positions)
+                if kind_series is not None:
+                    kind_by_member[member] = kind_series.take(positions)
+            else:
+                by_member[member] = canonical.iloc[0:0]
+                if kind_series is not None:
+                    kind_by_member[member] = empty_kind
     else:
         by_member = {member: canonical for member in members}
 
@@ -927,6 +1104,9 @@ def holdings_candidates_batch(
                 by_member[member] = combined.sort_values(
                     "transaction_date", kind="mergesort"
                 )
+                # The shared kind column no longer aligns with the combined
+                # frame; let the record builder recompute it for this member.
+                kind_by_member[member] = None
 
     tickers = sorted(
         {
@@ -937,6 +1117,7 @@ def holdings_candidates_batch(
         }
     )
     histories: dict[str, pd.DataFrame] = {}
+    prepared: dict[str, tuple] | None = None
     if tickers:
         history = db.conn.execute(
             "SELECT ticker, date, close FROM prices WHERE ticker = ANY(?) "
@@ -944,43 +1125,47 @@ def holdings_candidates_batch(
             [tickers],
         ).fetchdf()
         if not history.empty:
-            history["date"] = pd.to_datetime(history["date"])
-            # The query's ORDER BY ticker, date leaves every group already in
-            # date order; set_index preserves it, so no per-ticker sort.
-            for symbol, frame in history.groupby("ticker", sort=False):
-                histories[str(symbol)] = frame.set_index("date")
+            # ORDER BY ticker, date: contiguous, date-ordered groups let the
+            # splitter build every frame with numpy slices (no per-group
+            # groupby/set_index) and pre-cut the lookup's close arrays.
+            histories, prepared = _split_price_history(history, as_of)
     for ticker in tickers:
         histories.setdefault(ticker, pd.DataFrame())
 
-    entry_lookup = _EntryCloseLookup(histories, as_of)
+    entry_lookup = _EntryCloseLookup(histories, as_of, prepared=prepared)
     out: dict[str, pd.DataFrame] = {}
     for member in members:
         trades = by_member[member]
         if trades.empty:
             out[member] = pd.DataFrame(columns=columns)
             continue
-        trades = trades.loc[trades["source"].isin(source_kinds)].copy()
-        if trades.empty:
-            out[member] = pd.DataFrame(columns=columns)
-            continue
+        # The per-member source-kind column was computed once for the whole
+        # shared canonical frame; the map here covers callers that bring
+        # their own frame (and the concat-with-raw unpromoted path). Rows
+        # with an unmapped source land in no actor-kind mask, exactly like
+        # the previous source-isin prefilter.
         out[member] = _holdings_records(
             member, trades, histories, as_of, _actor_id, columns, source_kinds,
             entry_lookup=entry_lookup,
             presorted=not include_unpromoted,
+            kind_cells=kind_by_member.get(member),
         )
     return out
 
 
 def _holdings_records(
     member, trades: pd.DataFrame, histories: dict, as_of, _actor_id, columns, source_kinds,
-    entry_lookup=None, presorted: bool = False,
+    entry_lookup=None, presorted: bool = False, kind_cells: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Shared per-member record builder over preloaded trades+histories."""
     records = []
+    kinds_local = (
+        kind_cells
+        if kind_cells is not None
+        else trades["source"].map(source_kinds)
+    )
     for actor_kind in ("congress", "officer", "manager"):
-        kind_trades = trades.loc[
-            trades["source"].map(source_kinds).eq(actor_kind)
-        ]
+        kind_trades = trades.loc[kinds_local.eq(actor_kind)]
         if kind_trades.empty:
             continue
         positions = build_positions(
@@ -1213,6 +1398,12 @@ def _member_variants(db, member: str) -> list[str]:
     return _variants_for(member, wanted, all_names)
 
 
+@lru_cache(maxsize=65536)
+def _matches_wanted(key: str, wanted: str) -> bool:
+    """Memoized exact-key-or-filed-variant match (pure string decision)."""
+    return key == wanted or _same_member_variant(key, wanted)
+
+
 def _variants_for(member: str, wanted: str, all_names: list) -> list[str]:
     """Match variants against an already-loaded distinct-name list."""
     seen = []
@@ -1220,9 +1411,7 @@ def _variants_for(member: str, wanted: str, all_names: list) -> list[str]:
         if name in seen:
             continue
         key = canonical_member_key(name)
-        if key == wanted:
-            seen.append(name)
-        elif _same_member_variant(key, wanted):
+        if _matches_wanted(key, wanted):
             seen.append(name)
     return seen or [member]
 

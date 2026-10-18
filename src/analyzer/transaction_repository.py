@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime
+from functools import lru_cache
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 
@@ -175,6 +177,59 @@ def _normalize_amount(row) -> float | None:
     return float(midpoint)
 
 
+# Sentinel: the raw band itself forces None (open band / floor-band), so the
+# midpoint must not be consulted. Distinct from "no band, use midpoint".
+_BAND_FORCES_NONE = object()
+
+
+@lru_cache(maxsize=8192)
+def _band_or_forced_none(raw_text: str):
+    """Memoized band-only half of `_normalize_amount` over stripped text.
+
+    Returns a band midpoint float, ``_BAND_FORCES_NONE`` (result is None
+    regardless of midpoint), or None (no decisive band; fall through to the
+    midpoint). The value space of filed dollar bands is tiny, so the cache
+    collapses the per-row regex work.
+    """
+    if raw_text.endswith("-"):
+        return _BAND_FORCES_NONE
+    values = [
+        float(value.replace(",", ""))
+        for value in re.findall(r"\$([0-9][0-9,]*)", raw_text)
+    ]
+    if len(values) >= 2:
+        return sum(values[:2]) / 2
+    if len(values) == 1 and int(values[0]) % 1000 == 1:
+        return _BAND_FORCES_NONE
+    return None
+
+
+def _normalize_amount_column(amount_raw: pd.Series, midpoint: pd.Series) -> pd.Series:
+    """Columnwise exact twin of ``df.apply(_normalize_amount, axis=1)``.
+
+    Same per-row decision, same order: band midpoint when the (stripped)
+    raw text has one, None where a band forces it, otherwise the midpoint
+    (None when missing/NaN). Result is float64 with NaN where the row
+    result was None — the same frame column the apply produced.
+    """
+    raw_cells = amount_raw.tolist()
+    midpoint_cells = midpoint.tolist()
+    out = np.empty(len(raw_cells), dtype="float64")
+    for index, cell in enumerate(raw_cells):
+        text = "" if pd.isna(cell) else str(cell).strip()
+        band = _band_or_forced_none(text)
+        if band is _BAND_FORCES_NONE:
+            out[index] = np.nan
+        elif band is not None:
+            out[index] = band
+        else:
+            value = midpoint_cells[index]
+            out[index] = (
+                np.nan if value is None or pd.isna(value) else float(value)
+            )
+    return pd.Series(out, index=amount_raw.index, name=amount_raw.name)
+
+
 def _normalize_frame(df: pd.DataFrame, *, deduplicate: bool) -> pd.DataFrame:
     if df.empty:
         return df
@@ -191,7 +246,9 @@ def _normalize_frame(df: pd.DataFrame, *, deduplicate: bool) -> pd.DataFrame:
     if "instrument_type" in df.columns:
         df["instrument_type"] = df["instrument_type"].map(_normalize_instrument)
     if "amount_raw" in df.columns and "amount_midpoint" in df.columns:
-        df["amount_midpoint"] = df.apply(_normalize_amount, axis=1)
+        df["amount_midpoint"] = _normalize_amount_column(
+            df["amount_raw"], df["amount_midpoint"]
+        )
     if deduplicate and set(_ARTIFACT_IDENTITY_COLUMNS).issubset(df.columns):
         identified = pd.Series(True, index=df.index)
         for column in _ARTIFACT_IDENTITY_COLUMNS:

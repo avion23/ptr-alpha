@@ -28,7 +28,7 @@ from analyzer.member_ranking.buyer_scoring import (
     _resolve_consensus_ticker,
 )
 from analyzer.models import AnalysisMode, SourceCoverageState
-from analyzer.positions import entry_close, _EntryCloseLookup
+from analyzer.positions import entry_close, _EntryCloseLookup, _split_price_history
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
 from analyzer.ticker_resolver import TickerResolver
@@ -377,6 +377,7 @@ def eligible_events(
         "13f": "manager",
     }
     closes: dict[str, pd.DataFrame] = {}
+    prepared: dict[str, tuple] | None = None
     try:
         symbols = sorted(
             {str(value) for value in purchases["_resolved_symbol"].dropna().unique()}
@@ -389,15 +390,21 @@ def eligible_events(
                 [symbols],
             ).fetchdf()
             if set(history.columns) >= {"ticker", "date", "close"}:
-                history["date"] = pd.to_datetime(history["date"])
-                # The query's ORDER BY ticker, date leaves every group already
-                # in date order; set_index preserves it, so no per-ticker sort.
-                for symbol, frame in history.groupby("ticker", sort=False):
-                    closes[str(symbol)] = frame.set_index("date")
+                # Same numpy splitter as the batched holdings loader; the
+                # fallback inside preserves the groupby construction.
+                closes, prepared = _split_price_history(
+                    history, decision_date.date()
+                )
     except Exception:
         closes = {}
 
-    entry_lookup = _EntryCloseLookup(closes, decision_date.date())
+    entry_lookup = _EntryCloseLookup(
+        closes, decision_date.date(), prepared=prepared
+    )
+
+    # Pure per-row date conversion repeats across rows; memoize per call.
+    entry_day_cache: dict = {}
+    _ENTRY_DAY_MISS = object()
 
     def _congress_entry(symbol: str, day) -> float | None:
         # Point-in-time: only closes known by the decision date may price
@@ -406,8 +413,12 @@ def eligible_events(
         frame = closes.get(str(symbol))
         if frame is None or frame.empty:
             return None
+        day_key = entry_day_cache.get(day, _ENTRY_DAY_MISS)
+        if day_key is _ENTRY_DAY_MISS:
+            day_key = pd.Timestamp(day).date()
+            entry_day_cache[day] = day_key
         try:
-            return entry_lookup.close(str(symbol), pd.Timestamp(day).date())
+            return entry_lookup.close(str(symbol), day_key)
         except (TypeError, ValueError):
             return None
 

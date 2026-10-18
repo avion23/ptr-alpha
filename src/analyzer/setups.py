@@ -78,6 +78,23 @@ def score(
             row
         )
 
+    # Memoization-only edit (scoring math untouched): decision dates repeat
+    # across candidate rows, so cache successful date conversions per score
+    # call. Same parse, same errors, same values.
+    date_cache: dict = {}
+
+    def _as_date_memo(value):
+        try:
+            return date_cache[value]
+        except (KeyError, TypeError):
+            pass
+        parsed = _as_date(value)
+        try:
+            date_cache[value] = parsed
+        except TypeError:
+            pass
+        return parsed
+
     ranked_rows = []
     blocked_rows = []
     for ticker in sorted(grouped):
@@ -90,7 +107,7 @@ def score(
             else:
                 current, raw_quote_date = quote
                 try:
-                    quote_date = _as_date(raw_quote_date)
+                    quote_date = _as_date_memo(raw_quote_date)
                 except (TypeError, ValueError):
                     stale_quote = True
         else:
@@ -104,7 +121,7 @@ def score(
 
         actor_rows = grouped[ticker]
         decision_dates = [
-            _as_date(row["as_of"])
+            _as_date_memo(row["as_of"])
             for rows in actor_rows.values()
             for row in rows["initiators"]
         ]
@@ -129,8 +146,8 @@ def score(
             if f"manager:{normalize_manager_name(actor_name)}" not in watchlist:
                 return False
             try:
-                disclosed = _as_date(row["disclosure_date"])
-                decided = _as_date(row["as_of"])
+                disclosed = _as_date_memo(row["disclosure_date"])
+                decided = _as_date_memo(row["as_of"])
             except (TypeError, ValueError):
                 return False
             if row.get("blocked_reason") == "no open position at as_of":
@@ -155,7 +172,7 @@ def score(
             ex_dates = []
             for raw in ex_dividends.get(ticker, []) or []:
                 try:
-                    ex_dates.append(_as_date(raw))
+                    ex_dates.append(_as_date_memo(raw))
                 except (TypeError, ValueError):
                     continue
             hits = sorted({d for d in ex_dates if window_start < d <= window_end})
@@ -206,8 +223,8 @@ def score(
                 if current is None or current > entry_tol * entry_ref:
                     continue
 
-                as_of = _as_date(row["as_of"])
-                disclosure_date = _as_date(row["disclosure_date"])
+                as_of = _as_date_memo(row["as_of"])
+                disclosure_date = _as_date_memo(row["disclosure_date"])
                 if disclosure_date > as_of:
                     raise ValueError("disclosure_date must not be after as_of")
                 days_since_disclosure = (as_of - disclosure_date).days

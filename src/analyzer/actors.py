@@ -111,11 +111,9 @@ def compute_skill_table(
     disclosure_dates = pd.to_datetime(disclosures["disclosure_date"], errors="coerce")
     episodes: list[tuple[str, str, pd.Timestamp, pd.Timestamp]] = []
     seen: set[tuple[str, str, pd.Timestamp]] = set()
-    identity_columns = disclosures[["actor_id", "ticker", "source"]]
+    identity_cells = disclosures[["actor_id", "ticker", "source"]].to_numpy().tolist()
     windows_by_disclosure: dict[pd.Timestamp, tuple[pd.Timestamp, pd.Timestamp]] = {}
-    for identity_row, disclosed in zip(
-        identity_columns.itertuples(index=False, name=None), disclosure_dates
-    ):
+    for identity_row, disclosed in zip(identity_cells, disclosure_dates.tolist()):
         actor = str(identity_row[0]).strip()
         ticker = str(identity_row[1]).strip().upper()
         source = str(identity_row[2]).strip().lower()
@@ -149,29 +147,57 @@ def compute_skill_table(
         needed.add(("SPY", entry))
         needed.add(("SPY", exit_date))
 
-    # Pass 2: price dict holds only consulted pairs. Rows are applied in the
-    # same order as the previous full build, so duplicate ticker/date rows
-    # keep the same last-write-wins value; unconsulted pairs are never read.
-    ticker_key_of: dict[object, str] = {}
-    key_cells = eligible_prices["ticker"].to_numpy()
-    day_cells = pd.DatetimeIndex(eligible_prices["_date"])
-    close_cells = eligible_prices["_close"].to_numpy()
-    closes: dict[tuple[str, pd.Timestamp], float] = {}
-    for raw_ticker, day, close in zip(key_cells, day_cells, close_cells):
-        ticker_key = ticker_key_of.get(raw_ticker)
-        if ticker_key is None:
-            ticker_key = str(raw_ticker).strip().upper()
-            ticker_key_of[raw_ticker] = ticker_key
-        pair = (ticker_key, day)
-        if pair in needed:
-            closes[pair] = float(close)
+    # Pass 2: price dict holds only consulted pairs, selected by a hash
+    # join instead of a per-row Python scan. Rows are applied in the same
+    # order as the previous full build (price-row order within a pair), so
+    # duplicate ticker/date rows keep the same last-write-wins value;
+    # unconsulted pairs are never read.
+    ticker_codes, unique_tickers = pd.factorize(eligible_prices["ticker"], sort=False)
+    ticker_keys = np.array(
+        [str(ticker).strip().upper() for ticker in unique_tickers], dtype=object
+    )
+    code_of = {ticker: code for code, ticker in enumerate(ticker_keys)}
+    day_ints = (
+        pd.DatetimeIndex(eligible_prices["_date"])
+        .to_numpy(dtype="datetime64[ns]")
+        .view("int64")
+    )
+    # Needed pairs whose ticker never appears in the price rows cannot
+    # match anything; they are dropped here exactly as the previous scan
+    # never matched them (the episode then sees None and is skipped).
+    known_pairs = [
+        (code_of[ticker], day)
+        for ticker, day in needed
+        if ticker in code_of
+    ]
+    needed_codes = np.fromiter(
+        (code for code, _ in known_pairs), dtype="int64", count=len(known_pairs)
+    )
+    needed_days = np.fromiter(
+        (day.value for _, day in known_pairs), dtype="int64", count=len(known_pairs)
+    )
+    wanted = pd.DataFrame(
+        {"_code": needed_codes, "_day": needed_days}
+    ).drop_duplicates()
+    matched = pd.DataFrame(
+        {"_code": np.asarray(ticker_codes), "_day": day_ints,
+         "_close": eligible_prices["_close"].to_numpy()}
+    ).merge(wanted, on=["_code", "_day"], how="inner")
+    matched = matched.drop_duplicates(["_code", "_day"], keep="last")
+    closes: dict[tuple[str, int], float] = {}
+    for code, day_int, close in zip(
+        matched["_code"].tolist(),
+        matched["_day"].tolist(),
+        matched["_close"].tolist(),
+    ):
+        closes[(ticker_keys[code], day_int)] = float(close)
 
     by_actor: dict[str, list[float]] = {}
     for actor, ticker, entry, exit_date in episodes:
-        security_entry = closes.get((ticker, entry))
-        security_exit = closes.get((ticker, exit_date))
-        spy_entry = closes.get(("SPY", entry))
-        spy_exit = closes.get(("SPY", exit_date))
+        security_entry = closes.get((ticker, entry.value))
+        security_exit = closes.get((ticker, exit_date.value))
+        spy_entry = closes.get(("SPY", entry.value))
+        spy_exit = closes.get(("SPY", exit_date.value))
         if None in (security_entry, security_exit, spy_entry, spy_exit):
             continue
         excess = (

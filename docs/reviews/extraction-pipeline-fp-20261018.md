@@ -94,15 +94,22 @@ this workload, dual-read agreement rate. Pre-registered pilot: 30 backlog
 docs dual-read (A/B models) + the 13-doc text A/B re-run through vLLM;
 adopt if agreement ≥95% on text-born and backlog throughput ≥500 docs/day.
 
-## Decision
+## Decision update (2026-10-18, post-ParseBench)
 
-1. **Adopt LangExtract for the LLM path** — as grounding gate + second
-   opinion + review surface. Landed as a decision; wiring is the next change.
-2. **Accept the vLLM offer** — it removes the only quota ceiling and enables
-   the independent-second-read design that actually verifies the vision
-   stage. Needed from the operator: endpoint URL (OpenAI-compatible), model
-   id, and whether it serves a vision model (Qwen2.5-VL-7B recommended) or
-   text-only; a text-only endpoint still unbreaks extraction quota but not
-   the vision stage.
-3. Grounding gate becomes mandatory for any LLM-path row; ungrounded →
-   quarantine.
+ParseBench (parsebench.ai, 147 methods) changes decision 2: the operator
+declined paid tiers, and the free-optimum analysis shows the current engine
+(Gemini 3.1 Flash Lite, Tables 85.5, 0.3¢/page) is already top-quartile —
+within ~4 points of the paid table leaders (LlamaParse Agentic Plus 93.4 at
+$450/backlog, Opus 5.5 94.3 at ~$490), and AHEAD of every CPU-viable open
+model (PaddleOCR-VL 67.8, GLM-OCR 66.1) and of LlamaParse's free-tier mode
+(Cost Effective, 84.2, which also drains slower than the existing Gemini
+nightly quota). PTR filings are the easy end of the benchmark (simple
+columns; the separating hard cases — merged cells, cross-page tables,
+charts — do not occur in them).
+
+**Final: keep the existing nightly Gemini drain as the scanned-backlog
+engine. No spend, no new machinery.** Decision 1 (LangExtract grounding
+gate on the LLM path) stands unchanged. The vLLM/MLX second-reader spec
+(mlx-vision-endpoint-spec-20261018.md) stays on the shelf for a future GPU
+box; the dual-read client built for it is engine-agnostic and costs nothing
+to keep.

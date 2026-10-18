@@ -135,6 +135,7 @@ def test_lot_without_verdicts_refuses_report():
     assert report["unresolved_count"] == 299
     assert report["budget_met"] is None
     assert {reason for _, reason in report["unresolved"]} == {"no verdict recorded"}
+    assert report["completion_reasons"][0] == "d0: no verdict recorded"
 
 
 def test_invalid_verdict_string_refuses():
@@ -373,6 +374,9 @@ def test_pass_without_ground_truth_is_unresolved_not_clean():
     assert report["state"] == "incomplete"
     assert report["unresolved"] == [("m5", "no ground-truth file for omission check")]
     assert report["budget_met"] is None
+    assert report["completion_reasons"] == [
+        "m5: no ground-truth file for omission check"
+    ]
 
 
 def test_fail_verdict_with_no_ground_truth_stays_failure():
@@ -449,17 +453,19 @@ def test_unweighted_fallback_is_labelled():
 # --------------------------------------------------------------------------
 
 
-def test_verdict_outside_frozen_lot_refuses():
-    lot = [{"doc_id": "a", "year": 2024, "staged_record_sha256": "x"}]
+def test_verdict_outside_frozen_lot_does_not_block_current_lot():
+    record = make_record("a")
+    lot = audit_sample.freeze_lot([(2024, record)], [{"doc_id": "a", "year": 2024}])
     report = audit_sample.build_report(
         [pass_entry("a"), fail_entry("z")],
         {}, set(),
         lot=lot,
-        staged_records_by_doc={"a": make_record("a")},
+        staged_records_by_doc={"a": record},
     )
-    assert report["state"] == "incomplete"
+    assert report["state"] == "complete"
     assert report["outside_lot"] == ["z"]
-    assert report["budget_met"] is None
+    assert report["completion_reasons"] == []
+    assert report["budget_met"] is False
 
 
 def test_load_sample_lot_refuses_legacy_bare_list(data_dir):
@@ -635,6 +641,9 @@ def test_cli_report_sha_drift_refuses(data_dir, capsys):
     assert state["state"] == "incomplete"
     assert state["budget_met"] is None
     assert state["unresolved_count"] == 1
+    assert state["completion_reasons"] == [
+        "p9: recipe/staged-record changed after sampling"
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -913,6 +922,100 @@ def test_state_file_gains_critical_failures_and_keeps_v2_contract(data_dir, caps
     assert state["critical_failure_count"] == 0
     assert state["cosmetic_failures"] == [["S1", "verdict:fail"]]
     assert state["cosmetic_failure_count"] == 1
+    assert state["completion_reasons"] == []
+    assert state["omission_check_status"] == "not_run"
+
+
+def test_live_30_doc_lot_completes_despite_historical_outside_lot_verdicts(
+    data_dir, capsys
+):
+    """Seed 20261019: resolved 2017 lot, one cosmetic fail, older extras."""
+    doc_ids = [
+        "20005631", "20006505", "20006545", "20006739", "20006747",
+        "20006751", "20006839", "20006944", "20006996", "20007206",
+        "20007208", "20007359", "20007420", "20007551", "20007588",
+        "20007592", "20007596", "20007702", "20007716", "20007829",
+        "20007899", "20007964", "20007971", "20008047", "20008135",
+        "20008194", "20008277", "20008431", "20008488", "20008556",
+    ]
+    for doc_id in doc_ids:
+        write_record(data_dir, make_record(doc_id, year=2017))
+    write_envelope(data_dir, seed=20261019, frame_counts={"2017": 30})
+    root = audit_sample.staging_root(data_dir)
+    cosmetic_doc = "20006747"
+    results = [pass_entry(doc_id) for doc_id in doc_ids if doc_id != cosmetic_doc]
+    # Re-recording a cosmetic fail stays one resolved cosmetic failure.
+    results.extend(
+        [
+            fail_entry(cosmetic_doc, severity="cosmetic"),
+            fail_entry(cosmetic_doc, at="t2", severity="cosmetic"),
+        ]
+    )
+    cosmetic_outside = ["20006438", "20006516"]
+    critical_outside = "20006575"
+    pass_outside = ["20006470", "20006657", "20006682", "20006694", "20006832"]
+    results.extend(fail_entry(doc_id, severity="cosmetic") for doc_id in cosmetic_outside)
+    results.extend(
+        [
+            fail_entry(critical_outside, severity="critical"),
+            pass_entry(critical_outside, at="later-pass"),
+        ]
+    )  # later pass cannot launder a sticky outside-lot critical failure
+    results.extend(pass_entry(doc_id) for doc_id in pass_outside)
+    (root / "audit-results.json").write_text(json.dumps(results))
+
+    rc = audit_sample.main(
+        ["--data-dir", str(data_dir), "report", "--max-rate", "0.01"]
+    )
+    out = capsys.readouterr().out
+    state = json.loads((root / "audit-report-state.json").read_text())
+
+    assert rc == 1  # complete measurement; the 30-doc bound misses 1%
+    assert state["state"] == "complete"
+    assert state["budget_met"] is False
+    assert state["lot_size"] == state["audited"] == 30
+    assert state["critical_failure_count"] == 0
+    assert state["cosmetic_failure_count"] == 1
+    assert state["rate"] == 0.0
+    assert state["upper_bound"] == pytest.approx(0.09503385285530411)
+    assert state["outside_lot"] == sorted(
+        cosmetic_outside + [critical_outside] + pass_outside
+    )
+    assert state["outside_lot_critical_failure_count"] == 1
+    assert state["outside_lot_cosmetic_failure_count"] == 2
+    assert state["outside_lot_passes"] == sorted(pass_outside)
+    assert state["population_critical_failure_count"] == 1
+    assert state["population_cosmetic_failure_count"] == 3
+    assert state["completion_reasons"] == []
+    assert "Omission check not run" in out and "pixel-only certification" in out
+    assert "One-sided exact 95% upper bound (critical): 9.503%" in out
+    assert "Owner budget (critical-only exact upper bound <= 1%" in out
+    assert "NOT MET" in out
+    assert "8 OUTSIDE-LOT doc(s)" in out
+    assert "outside-lot contribution of 1 critical and 2 cosmetic" in out
+    assert "OUTSIDE-LOT 20006575: fail (critical; remains in population tally)" in out
+    assert "OUTSIDE-LOT 20006470: pass-only" in out
+
+
+def test_incomplete_report_state_names_completion_reason(data_dir, capsys):
+    write_record(data_dir, make_record("needs-verdict"))
+    write_envelope(data_dir, seed=19)
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])
+    out = capsys.readouterr().out
+    state = json.loads(
+        (audit_sample.staging_root(data_dir) / "audit-report-state.json").read_text()
+    )
+    assert rc == 2
+    assert "INCOMPLETE-REASON needs-verdict: no verdict recorded" in out
+    assert "HOW TO FIX: record an explicit verdict" in out
+    assert state["state"] == "incomplete"
+    assert state["budget_met"] is None
+    assert state["reason"] == "needs-verdict: no verdict recorded"
+    assert state["completion_reasons"] == ["needs-verdict: no verdict recorded"]
+    assert state["completion_guidance"] == [
+        "record an explicit verdict with audit_sample.py record --doc-id "
+        "<id> --verdict pass|fail"
+    ]
 
 
 def test_incomplete_state_payload_carries_severity_keys(data_dir, capsys):
@@ -927,6 +1030,25 @@ def test_incomplete_state_payload_carries_severity_keys(data_dir, capsys):
     assert state["cosmetic_failures"] == []
     assert state["cosmetic_failure_count"] == 0
     assert state["budget_met"] is None
+    assert "no frozen sample lot" in state["reason"]
+    assert state["completion_reasons"] == [state["reason"]]
+
+
+@pytest.mark.parametrize(
+    ("lot", "reason"),
+    [
+        ([], "frozen sample lot contains no valid documents"),
+        ([{}], "malformed frozen lot entry at index 0 (missing doc_id)"),
+        ([{"doc_id": "bad-year", "year": "unknown"}], "invalid year"),
+    ],
+)
+def test_empty_or_malformed_frozen_lot_is_named_incomplete(lot, reason):
+    report = audit_sample.build_report(
+        [], {}, set(), lot=lot, staged_records_by_doc={}
+    )
+    assert report["state"] == "incomplete"
+    assert report["budget_met"] is None
+    assert any(reason in item for item in report["completion_reasons"])
 
 
 def test_cli_record_accepts_severity_flag(data_dir, capsys):

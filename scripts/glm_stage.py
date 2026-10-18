@@ -79,6 +79,7 @@ import datetime
 import glob as glob_module
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -910,12 +911,169 @@ def audit_report_state(data_dir: str | Path = "data") -> dict | None:
     return payload
 
 
+def _audit_report_gate_issue(state: dict | None) -> str | None:
+    """Reason the landed report does not prove the promotion preconditions."""
+    if state is None:
+        return "audit report state is missing or untrusted"
+    if state.get("state") != "complete":
+        return f"state is {state.get('state')!r}, not 'complete'"
+    if state.get("budget_met") is not True:
+        return f"budget_met is {state.get('budget_met')!r}, not boolean true"
+
+    required_counts = ("lot_size", "audited", "critical_failure_count", "unresolved_count")
+    required_rates = ("rate", "upper_bound", "confidence", "max_rate")
+    invalid = [
+        key
+        for key in required_counts
+        if not isinstance(state.get(key), int) or isinstance(state.get(key), bool)
+    ]
+    invalid.extend(
+        key
+        for key in required_rates
+        if not isinstance(state.get(key), (int, float))
+        or isinstance(state.get(key), bool)
+        or not math.isfinite(state[key])
+    )
+    critical_failures = state.get("critical_failures")
+    if not isinstance(critical_failures, list) or (
+        "critical_failure_count" not in invalid
+        and len(critical_failures) != state["critical_failure_count"]
+    ):
+        invalid.append("critical_failures")
+    if invalid:
+        return "required gate metrics are missing or invalid: " + ", ".join(invalid)
+
+    lot_size = state["lot_size"]
+    audited = state["audited"]
+    critical_count = state["critical_failure_count"]
+    unresolved = state.get("unresolved")
+    if (
+        lot_size <= 0
+        or audited != lot_size
+        or critical_count < 0
+        or critical_count > audited
+        or state["unresolved_count"] != 0
+        or unresolved != []
+    ):
+        return (
+            "complete-state counts are inconsistent (require non-empty lot, "
+            "audited == lot_size, no unresolved docs, and valid critical count)"
+        )
+    if state.get("reason") is not None or (
+        "completion_reasons" in state and state.get("completion_reasons") != []
+    ):
+        return "complete report carries an incomplete-state reason"
+    if not math.isclose(state["rate"], critical_count / audited, rel_tol=1e-9, abs_tol=1e-12):
+        return "reported critical rate does not match critical_failure_count / audited"
+    if not (0 < state["confidence"] < 1 and 0 <= state["max_rate"] <= 1):
+        return "confidence or max_rate is outside its valid probability range"
+    if not (0 <= state["upper_bound"] <= 1) or state["upper_bound"] > state["max_rate"]:
+        return "upper_bound is invalid or exceeds max_rate despite budget_met=true"
+    return None
+
+
 def audit_report_gate_open(state: dict | None) -> bool:
-    """True only for a COMPLETE report whose material-error budget is met."""
+    """True only when a complete report proves a met budget with valid metrics."""
+    return _audit_report_gate_issue(state) is None
+
+
+def _audit_report_refusal(state: dict | None, data_dir: str | Path) -> str:
+    """Explain the report-level promotion refusal, including available math."""
+    if state is None:
+        return (
+            "REFUSED: audit report state missing — run audit_sample.py report "
+            f"({staging_root(data_dir) / AUDIT_REPORT_STATE_NAME}); an unreadable, "
+            "malformed, or foreign-schema report is treated as missing; state and "
+            "critical rate/bound/n vs budget are unavailable; canonical "
+            "promotion must not proceed"
+        )
+
+    report_state = state.get("state")
+    if report_state == "incomplete":
+        reasons = state.get("completion_reasons")
+        reason = (
+            "; ".join(str(value) for value in reasons)
+            if isinstance(reasons, list) and reasons
+            else state.get("reason") or "the report did not record a completion reason"
+        )
+        guidance = state.get("completion_guidance")
+        fix = (
+            "; how to fix: " + "; ".join(str(value) for value in guidance)
+            if isinstance(guidance, list) and guidance
+            else ""
+        )
+        prefix = f"audit report state incomplete because {reason}{fix}"
+    elif report_state == "complete":
+        if state.get("budget_met") is False:
+            prefix = "audit report is complete but the critical error budget is not met"
+        else:
+            prefix = "audit report state is complete but " + str(
+                _audit_report_gate_issue(state)
+            )
+    else:
+        prefix = f"audit report state {report_state!r} is not recognized"
+
+    def number(value) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    def percent(value) -> str:
+        parsed = number(value)
+        return f"{parsed * 100:.4g}%" if parsed is not None else "unknown"
+
+    audited = number(state.get("audited"))
+    lot_size = number(state.get("lot_size"))
+    critical_count = number(state.get("critical_failure_count"))
+    if critical_count is None:
+        failures = state.get("critical_failures")
+        critical_count = float(len(failures)) if isinstance(failures, list) else None
+    rate = number(state.get("rate"))
+    if rate is None and critical_count is not None and audited:
+        rate = critical_count / audited
+    upper = number(state.get("upper_bound"))
+    max_rate = number(state.get("max_rate"))
+    confidence = number(state.get("confidence"))
+    population_critical = number(state.get("population_critical_failure_count"))
+    population_text = (
+        f"population sticky critical-failure tally {population_critical:g} "
+        "across audit history (outside-lot failures remain visible, excluded "
+        "from the current-lot bound)"
+        if population_critical is not None
+        else "population sticky critical-failure tally unavailable"
+    )
+    confidence_text = (
+        f"{confidence * 100:.4g}%" if confidence is not None else "unknown"
+    )
+    count_text = (
+        f"{critical_count:g}/{audited:g} resolved"
+        if critical_count is not None and audited is not None
+        else "unknown critical failures / n"
+    )
+    lot_text = f"lot n={lot_size:g}" if lot_size is not None else "lot n=unknown"
+    if report_state == "incomplete":
+        metric_text = (
+            f"resolved-only diagnostics: {count_text} ({lot_text}), "
+            f"critical rate {percent(rate)}, {confidence_text} upper bound "
+            f"{percent(upper)}, max_rate {percent(max_rate)}; full-lot "
+            "budget is not certified"
+        )
+    else:
+        metric_text = (
+            f"critical {count_text} ({lot_text}), rate {percent(rate)}, "
+            f"{confidence_text} one-sided upper bound {percent(upper)}, "
+            f"max_rate {percent(max_rate)}"
+        )
+    omission = (
+        "; omission check not run — this is a pixel-only certification"
+        if state.get("omission_check_status") == "not_run"
+        else ""
+    )
     return (
-        state is not None
-        and state.get("state") == "complete"
-        and state.get("budget_met") is True
+        f"REFUSED: {prefix}; {metric_text}; {population_text}; budget_met="
+        f"{state.get('budget_met')!r}{omission}; canonical promotion must not proceed"
     )
 
 
@@ -1055,21 +1213,7 @@ def promote_docs(
         state = audit_report_state(data_dir)
         if not audit_report_gate_open(state):
             if doc_ids:
-                if state is None:
-                    print(
-                        "REFUSED: audit report state missing — run "
-                        "audit_sample.py report "
-                        f"({staging_root(data_dir) / AUDIT_REPORT_STATE_NAME})",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        "REFUSED: audit report state is "
-                        f"{state.get('state')!r} with budget_met="
-                        f"{state.get('budget_met')!r}; canonical promotion "
-                        "must not proceed",
-                        flush=True,
-                    )
+                print(_audit_report_refusal(state, data_dir), flush=True)
                 return {
                     "year": int(year),
                     "promoted": 0,

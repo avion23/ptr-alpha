@@ -24,6 +24,7 @@ from analyzer.member_ranking.buyer_scoring import (
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
+from analyzer.freshness import FreshnessCheck, end_to_end_checks
 from analyzer.models import AnalysisMode
 from analyzer.pipeline import (
     AnalysisParams,
@@ -238,6 +239,31 @@ def _warn_live_ticker_coverage(app_ctx: AppContext, days_back: int) -> None:
         )
 
 
+def end_to_end_freshness(app_ctx: AppContext, data_dir: str) -> list[FreshnessCheck]:
+    """End-product freshness for the operator's monitoring command.
+
+    Never raises: on an unusable context it returns one FAILED row so a
+    broken monitor surfaces as data instead of a traceback. Module-level so
+    tests can patch it independently of get_context.
+    """
+    try:
+        conn = app_ctx.transaction_source.db.conn
+    except Exception as exc:
+        return [
+            FreshnessCheck(
+                "end_to_end", f"unavailable: {type(exc).__name__}: {exc}", False
+            )
+        ]
+    receipts = Path(data_dir) / "recommendations" / "receipts.log"
+    return end_to_end_checks(conn, receipts_path=receipts)
+
+
+def _print_end_to_end_freshness(freshness: list[FreshnessCheck]) -> None:
+    print("end-to-end freshness (canonical end products; strict via --strict-freshness):")
+    for check in freshness:
+        print(f"  [{check.mark}] {check.name}: {check.detail}")
+
+
 @app.command()
 def health(
     ctx: typer.Context,
@@ -249,6 +275,12 @@ def health(
         "--window-days",
         help="Candidate-window length used by the coverage metric",
     ),
+    strict_freshness: bool = typer.Option(
+        False,
+        "--strict-freshness",
+        help="Fail (exit 1) when canonical end products (prices/dividends/"
+        "form4/receipts) are stale, not just when a chamber is out of window",
+    ),
     data_dir: str = typer.Option("data", help="Data directory"),
 ):
     """Report House/Senate candidate-window coverage for monitoring.
@@ -256,6 +288,9 @@ def health(
     This command does not change or authorize BUY signals. A nonzero exit means
     at least one chamber is missing or has no disclosure inside the requested
     window, which should trigger a refresh/investigation in operations.
+    End-product freshness is always printed; pass --strict-freshness to make
+    its failures part of the exit code (the daily doctor cron is strict by
+    default).
     """
     if window_days < 1:
         _cli_exit(1, "Error: --window-days must be greater than zero")
@@ -277,7 +312,17 @@ def health(
         )
 
     print(metrics.to_string(index=False))
-    healthy = bool((metrics["coverage_state"] == "in_window").all())
+    freshness = end_to_end_freshness(app_ctx, data_dir)
+    _print_end_to_end_freshness(freshness)
+    freshness_failed = any(not check.ok for check in freshness)
+    if freshness_failed:
+        print(
+            "WARNING: canonical end-product freshness failed; "
+            "run scripts/doctor.py for the full audit.",
+            file=sys.stderr,
+        )
+    coverage_healthy = bool((metrics["coverage_state"] == "in_window").all())
+    healthy = coverage_healthy and not (strict_freshness and freshness_failed)
     _cli_exit(0 if healthy else 1)
 
 

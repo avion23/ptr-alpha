@@ -1,0 +1,17 @@
+# Source of truth for this repo's cron jobs (insider-trading).
+# Install / update with:  bash cron/install.sh        (dry run, shows diff)
+#                         bash cron/install.sh -y     (apply, backs up first)
+# cron/install.sh substitutes @REPO@ with the checkout root when installing.
+# The live crontab is verified against this file daily by scripts/doctor.py
+# (check: crontab.contract) — editing the live crontab by hand will be
+# reported as drift within one day.
+CRON_TZ=UTC
+# BEGIN insider-trading (managed block; rewritten by cron/install.sh)
+0 2 * * 1 @REPO@/cron/weekly_prices.sh
+0 5 * * * @REPO@/cron/daily_doctor.sh
+# END insider-trading
+
+# DISABLED 2026-10-18: staging Gemini cron wrote year DBs nothing ever merged
+# into canonical (the temp->canonical merge gap). Canonical-side OCR lives in
+# `refresh --gemini-ocr`; disposition in docs/reviews/merge-gap-20261018.md.
+## 0 4 * * * @REPO@/data/logs/gemini-cron/daily.sh

@@ -438,9 +438,9 @@ def merge_temp_into_canonical(
     canon = Database(canonical_db, read_only=dry_run)
     try:
         con = canon.conn
-        con.execute(
-            "ATTACH ? AS merge_src (READ_ONLY)", [str(Path(temp_db).resolve())]
-        )
+        # duckdb 1.5.x cannot bind ATTACH paths as parameters.
+        attach_path = str(Path(temp_db).resolve()).replace("'", "''")
+        con.execute(f"ATTACH '{attach_path}' AS merge_src (READ_ONLY)")
         try:
             con.execute("CREATE TEMP TABLE _merge_eligible (ticker VARCHAR)")
             con.executemany(
@@ -536,6 +536,66 @@ def merge_temp_into_canonical(
         canon.close()
 
 
+def verify_consumption(
+    temp_db: Path, canonical_db: Path, eligible: list[str]
+) -> int:
+    """Re-read canonical after a merge; count refreshed keys it still lacks.
+
+    The incident this closes: a writer exits 0 believing its step done while
+    canonical never received the rows. Re-reading the end product from a
+    fresh read-only connection makes "the merge happened" a checked fact
+    instead of an assumption; any nonzero return fails the writer.
+    """
+    canon = Database(canonical_db, read_only=True)
+    try:
+        con = canon.conn
+        # duckdb 1.5.x cannot bind ATTACH paths as parameters.
+        attach_path = str(Path(temp_db).resolve()).replace("'", "''")
+        con.execute(f"ATTACH '{attach_path}' AS verify_src (READ_ONLY)")
+        try:
+            con.execute("CREATE TEMP TABLE _verify_eligible (ticker VARCHAR)")
+            con.executemany(
+                "INSERT INTO _verify_eligible VALUES (?)",
+                [(t,) for t in sorted({str(t).strip().upper() for t in eligible})],
+            )
+            missing = int(
+                con.execute(
+                    """
+                    SELECT COUNT(*) FROM verify_src.prices s
+                    JOIN _verify_eligible e USING (ticker)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM prices p
+                        WHERE p.ticker = s.ticker AND p.date = s.date
+                    )
+                    """
+                ).fetchone()[0]
+            )
+            has_div = con.execute(
+                "SELECT COUNT(*) FROM duckdb_tables() "
+                "WHERE database_name='verify_src' AND table_name='dividends'"
+            ).fetchone()[0]
+            if has_div:
+                missing += int(
+                    con.execute(
+                        """
+                        SELECT COUNT(*) FROM (
+                            SELECT DISTINCT ticker, ex_date FROM verify_src.dividends
+                        ) s
+                        JOIN _verify_eligible e USING (ticker)
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM dividends d
+                            WHERE d.ticker = s.ticker AND d.ex_date = s.ex_date
+                        )
+                        """
+                    ).fetchone()[0]
+                )
+            return missing
+        finally:
+            con.execute("DETACH verify_src")
+    finally:
+        canon.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Refresh eligible asset prices into a throwaway temp database"
@@ -602,6 +662,18 @@ def main(argv: list[str] | None = None) -> int:
                 report.eligible_assets,
                 dry_run=args.merge_dry_run,
             )
+            if not args.merge_dry_run:
+                missing = verify_consumption(
+                    args.db, args.merge_into, report.eligible_assets
+                )
+                if missing:
+                    print(
+                        f"consumption verification FAILED: {missing} refreshed "
+                        f"keys are absent from {args.merge_into}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(f"verified: 0 missing keys in {args.merge_into}")
     except (ValueError, FileNotFoundError, FileExistsError) as exc:
         print(f"refresh failed: {exc}", file=sys.stderr)
         return 1

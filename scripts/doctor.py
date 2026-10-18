@@ -1,105 +1,52 @@
 """Fail-loud freshness doctor for the canonical database and cron artifacts.
 
 Exits nonzero when the pipeline has silently stopped feeding canonical:
-stale prices, empty dividends, dead form4/receipt feeds, or cron artifacts
-(staging/temp databases) older than the grace window — the signature of a
-writer that stops one step short of canonical. Read-only on every database
-it opens; safe to run any time, designed for a daily cron.
+stale prices, empty dividends, dead form4/receipt feeds, cron artifacts
+(staging/temp databases) older than the grace window, a dead daily-doctor
+heartbeat, or a live crontab that drifted from the tracked contract
+(cron/crontab.txt). Read-only on every database it opens and on the
+crontab; safe to run any time, designed for a daily cron.
+
+End-product freshness lives in src/analyzer/freshness.py so the operator's
+``health`` command and this cron share one implementation.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 from datetime import date
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
-from scripts.refresh_prices import refresh_end_date  # noqa: E402
+from analyzer.freshness import end_to_end_checks  # noqa: E402
 
 CANONICAL = Path(os.environ.get("DOCTOR_CANONICAL", str(REPO / "data" / "congress.duckdb")))
 RECEIPTS = REPO / "data" / "recommendations" / "receipts.log"
 PRICES_CRON = REPO / "data" / "logs" / "prices-cron"
 GEMINI_STAGING = REPO / "data" / ".staging" / "rescrape"
+HEARTBEAT = Path(
+    os.environ.get("DOCTOR_HEARTBEAT", str(REPO / "data" / "alerts" / "doctor-last-run"))
+)
+CRONTAB_CONTRACT = REPO / "cron" / "crontab.txt"
 
 # Weekly prices cadence: tolerate one missed week before failing.
 MAX_PRICE_LAG_SESSIONS = 8
-FORM4_MAX_AGE_DAYS = 7
-RECEIPTS_MAX_AGE_DAYS = 8
 ARTIFACT_MAX_AGE_DAYS = 10
-
-
-def cast_date(value) -> date:
-    return value.date() if hasattr(value, "date") else value
+# Daily doctor cadence plus slack before "the monitor itself is dead".
+HEARTBEAT_MAX_AGE_HOURS = 36
 
 
 def check(canonical) -> list[tuple[str, str, bool]]:
-    results: list[tuple[str, str, bool]] = []
-
-    def record(name: str, detail: str, ok: bool) -> None:
-        results.append((name, detail, ok))
-
-    # 1. Price freshness vs the last completed NYSE session.
-    today = date.today()
-    expected = refresh_end_date(today)
-    max_price = canonical.execute("SELECT MAX(date) FROM prices").fetchone()[0]
-    max_price = cast_date(max_price)
-    lag_sessions = len(
-        __import__("pandas").bdate_range(max_price, expected)
-    ) - 1
-    record(
-        "prices.freshness",
-        f"canonical max {max_price}, last completed session {expected} "
-        f"({lag_sessions} sessions back, limit {MAX_PRICE_LAG_SESSIONS})",
-        lag_sessions <= MAX_PRICE_LAG_SESSIONS,
-    )
-
-    # 2. Dividends populated (ex-div gate is starved while this is 0).
-    has_div = canonical.execute(
-        "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = 'dividends'"
-    ).fetchone()[0]
-    div_rows = (
-        canonical.execute("SELECT COUNT(*) FROM dividends").fetchone()[0]
-        if has_div
-        else 0
-    )
-    record(
-        "dividends.populated",
-        f"dividends rows: {div_rows}" + ("" if has_div else " (table absent)"),
-        div_rows > 0,
-    )
-
-    # 3. Form4 feed alive.
-    newest_f4 = canonical.execute(
-        "SELECT MAX(disclosure_date) FROM canonical_transactions "
-        "WHERE source = 'form4'"
-    ).fetchone()[0]
-    newest_f4 = cast_date(newest_f4) if newest_f4 else None
-    f4_age = (today - newest_f4).days if newest_f4 else 10_000
-    record(
-        "form4.freshness",
-        f"newest form4 disclosure {newest_f4} ({f4_age}d old, "
-        f"limit {FORM4_MAX_AGE_DAYS}d)",
-        f4_age <= FORM4_MAX_AGE_DAYS,
-    )
-
-    # 4. Receipt ledger alive.
-    receipt_age = 10_000
-    if RECEIPTS.exists():
-        last_line = RECEIPTS.read_text().strip().splitlines()[-1]
-        published = __import__("json").loads(last_line).get("published_at", "")
-        if published:
-            receipt_age = int(time.time() - __import__("datetime").datetime
-                              .fromisoformat(published.replace("Z", "+00:00"))
-                              .timestamp()) // 86_400
-    record(
-        "receipts.freshness",
-        f"newest receipt {receipt_age}d old (limit {RECEIPTS_MAX_AGE_DAYS}d)",
-        receipt_age <= RECEIPTS_MAX_AGE_DAYS,
-    )
+    results: list[tuple[str, str, bool]] = [
+        (c.name, c.detail, c.ok)
+        for c in end_to_end_checks(canonical, receipts_path=RECEIPTS)
+    ]
 
     # 5. No unconsumed cron artifacts older than the grace window.
     stale_artifacts: list[str] = []
@@ -112,18 +59,92 @@ def check(canonical) -> list[tuple[str, str, bool]]:
         for db in GEMINI_STAGING.glob("*/years/*/congress.duckdb"):
             if db.stat().st_mtime < cutoff:
                 stale_artifacts.append(str(db.relative_to(REPO)) + " (staging)")
-    record(
-        "artifacts.consumed",
+    results.append(
         (
-            f"{len(stale_artifacts)} unconsumed artifacts older than "
-            f"{ARTIFACT_MAX_AGE_DAYS}d" + (": " + ", ".join(stale_artifacts[:4]))
-            if stale_artifacts
-            else "no stale cron artifacts"
-        ),
-        not stale_artifacts,
+            "artifacts.consumed",
+            (
+                f"{len(stale_artifacts)} unconsumed artifacts older than "
+                f"{ARTIFACT_MAX_AGE_DAYS}d" + (": " + ", ".join(stale_artifacts[:4]))
+                if stale_artifacts
+                else "no stale cron artifacts"
+            ),
+            not stale_artifacts,
+        )
     )
 
+    # 6. Dead-man switch: the daily doctor cron must be beating. Catches a
+    # broken/edited-away wrapper while doctor itself still runs.
+    if HEARTBEAT.exists():
+        age_h = (time.time() - HEARTBEAT.stat().st_mtime) / 3600
+        results.append(
+            (
+                "doctor.alive",
+                f"heartbeat {age_h:.1f}h old (limit {HEARTBEAT_MAX_AGE_HOURS}h)",
+                age_h <= HEARTBEAT_MAX_AGE_HOURS,
+            )
+        )
+    else:
+        try:
+            shown = HEARTBEAT.relative_to(REPO)
+        except ValueError:
+            shown = HEARTBEAT
+        results.append(
+            (
+                "doctor.alive",
+                f"no heartbeat at {shown}: the daily "
+                "doctor cron has never fired here",
+                False,
+            )
+        )
+
+    # 7. Deployment drift: the live crontab must match the tracked contract.
+    results.append(_crontab_contract())
     return results
+
+
+def _active_repo_crontab_lines(text: str, repo_prefix: str) -> list[str]:
+    lines = []
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        if not line or line.startswith("#"):
+            continue
+        if repo_prefix in line:
+            lines.append(line)
+    return sorted(lines)
+
+
+def _crontab_contract() -> tuple[str, str, bool]:
+    expected = _active_repo_crontab_lines(
+        CRONTAB_CONTRACT.read_text().replace("@REPO@", str(REPO)), str(REPO)
+    ) if CRONTAB_CONTRACT.exists() else None
+    if expected is None:
+        return ("crontab.contract", f"missing {CRONTAB_CONTRACT.relative_to(REPO)}", False)
+    try:
+        probe = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=15, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return (
+            "crontab.contract",
+            f"live crontab unavailable ({type(exc).__name__}); deployment not verified",
+            True,
+        )
+    if probe.returncode != 0:
+        return (
+            "crontab.contract",
+            f"live crontab unavailable ({probe.stderr.strip()}); deployment not verified",
+            True,
+        )
+    live = _active_repo_crontab_lines(probe.stdout, str(REPO))
+    if live == expected:
+        return ("crontab.contract", f"{len(live)} repo cron lines match cron/crontab.txt", True)
+    missing = [line for line in expected if line not in live]
+    extra = [line for line in live if line not in expected]
+    return (
+        "crontab.contract",
+        f"live crontab drifted from cron/crontab.txt; missing={missing} extra={extra}",
+        False,
+    )
 
 
 def main() -> int:

@@ -502,3 +502,77 @@ def test_reconcile_blotter_reads_only_canonical_scope(monkeypatch):
         query = connection.execute.call_args.args[0]
         assert "canonical_transactions" in query
         connection.close.assert_called_once()
+
+
+class TestHealthEndToEndFreshness(unittest.TestCase):
+    """health must surface the canonical end-product surface (prices,
+    dividends, form4, receipts) — the surface the 2026-10-18 incident showed
+    was measured nowhere. Coverage stays the default exit-code driver;
+    --strict-freshness folds end-product failures into the exit code."""
+
+    def setUp(self):
+        self.runner = CliRunner()
+        self.metrics = pd.DataFrame(
+            [
+                {
+                    "chamber": "House",
+                    "latest_disclosure_date": date(2026, 9, 10),
+                    "latest_disclosure_age_days": 1,
+                    "candidate_window_days": 28,
+                    "recent_disclosures": 4,
+                    "coverage_state": "in_window",
+                },
+                {
+                    "chamber": "Senate",
+                    "latest_disclosure_date": date(2026, 9, 9),
+                    "latest_disclosure_age_days": 2,
+                    "candidate_window_days": 28,
+                    "recent_disclosures": 3,
+                    "coverage_state": "in_window",
+                },
+            ]
+        )
+
+    def _invoke(self, *extra, freshness):
+        with (
+            patch("analyzer.cli.get_context", return_value=MagicMock()),
+            patch("analyzer.cli.source_freshness_metrics", return_value=self.metrics),
+            patch("analyzer.cli.end_to_end_freshness", return_value=freshness),
+        ):
+            return self.runner.invoke(
+                app, ["health", "--as-of", "2026-09-11", *extra]
+            )
+
+    def test_freshness_table_printed_by_default_without_gating_exit(self):
+        from analyzer.freshness import FreshnessCheck
+
+        failing = [
+            FreshnessCheck("dividends.populated", "dividends rows: 0", False),
+            FreshnessCheck("prices.freshness", "1 sessions back", True),
+        ]
+        result = self._invoke(freshness=failing)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("end-to-end freshness", result.output)
+        self.assertIn("[FAIL] dividends.populated", result.output)
+
+    def test_strict_freshness_fails_the_command(self):
+        from analyzer.freshness import FreshnessCheck
+
+        failing = [FreshnessCheck("dividends.populated", "dividends rows: 0", False)]
+        result = self._invoke("--strict-freshness", freshness=failing)
+        self.assertEqual(result.exit_code, 1, result.output)
+
+    def test_strict_freshness_passes_when_all_checks_ok(self):
+        from analyzer.freshness import FreshnessCheck
+
+        passing = [FreshnessCheck("prices.freshness", "0 sessions back", True)]
+        result = self._invoke("--strict-freshness", freshness=passing)
+        self.assertEqual(result.exit_code, 0, result.output)
+
+    def test_freshness_breakage_surfaces_as_data_not_crash(self):
+        from analyzer.freshness import FreshnessCheck
+
+        broken = [FreshnessCheck("end_to_end", "unavailable: BoomError: x", False)]
+        result = self._invoke(freshness=broken)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("unavailable", result.output)

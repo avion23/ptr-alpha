@@ -77,6 +77,7 @@ EXEMPT = {
     "src/analyzer/download.py:preserve_existing_fields": 1,  # Reparse repair preserves existing fields.
     "src/analyzer/form13f.py:ThirteenFSource.get_transactions": 1,  # Caller-owned source forwarding.
     "src/analyzer/form4.py:Form4Source.get_transactions": 1,  # Caller-owned source forwarding.
+    "src/analyzer/freshness.py:form4_freshness": 1,  # Monitoring aggregate: newest form4 disclosure date, not decision selection.
     "src/analyzer/parse_run_repository.py:ParseRunRepository.upsert": 1,  # Ingestion timestamp provenance.
     "src/analyzer/pipeline.py:_analysis_transactions": 1,  # Caller-owned: scoped prepare_analysis_data.
     "src/analyzer/positions.py:_member_variants": 2,  # Caller-owned identity expansion; name monitored.

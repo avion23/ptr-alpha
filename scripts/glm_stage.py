@@ -81,6 +81,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -127,6 +128,15 @@ MAX_WORKERS = 2  # Z.AI subscription allows 2 concurrent vision streams
 CLI_COOLDOWN = 3.0  # seconds between endpoint requests (mirrors ocr_zero_rows)
 MAX_RETAINED_ATTEMPTS = 3  # archived re-stage attempts kept per doc
 WORK_MANIFEST_SCHEMA = "glm-work-manifest-v1"
+# Asset-normalization review flag (interface audit item 3): GLM sometimes
+# damages asset text during normalization — drops repeated issuer wording
+# ("Energy Transfer Equity, L.P. Energy Transfer Equity, L.P." extracted
+# once) or mangles a ticker ("PARNTERS") — observed at ~3-4% doc-level with
+# transaction-critical fields 100% clean. The flag is the MITIGATION, not a
+# fix: flagged staging records get ``asset_review: true`` so the audit
+# sampler oversamples them.
+ASSET_TICKER_PATTERN = re.compile(r"\([A-Za-z0-9][A-Za-z0-9.\-]{0,15}\)")
+ASSET_TICKER_CONTEXT_SHARE = 0.8  # >80% of the OTHER rows carry a ticker
 # The record identity a verdict is bound to (finding 6): if any of these
 # no longer match the live record, the audited attempt is not the live one.
 AUDIT_IDENTITY_FIELDS = ("pdf_sha256", "prompt_sha256", "parsed_at_utc")
@@ -351,6 +361,53 @@ def read_document(
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
+def detect_asset_review_reasons(transactions: list[dict]) -> list[str]:
+    """Cheap doc-level heuristics for likely GLM asset-text damage.
+
+    Flags (does not reject) a staging record when, per the audit owner's
+    contract:
+
+    * a row's asset lacks a parenthesized ticker while >80% of the doc's
+      OTHER rows have one (the "PARNTERS"/dropped-ticker failure mode), or
+    * a row's asset text is a strict substring of another row's asset
+      (the dropped-repeated-issuer-wording failure mode: the true cell is
+      the doubled issuer name and GLM emitted it once — the doubled form
+      often appears on a sibling row extracted correctly).
+
+    Returns machine-readable reason strings; empty means not flagged. Both
+    checks are cheap (O(rows^2) string ops, rows <= a few hundred) and
+    deliberately conservative: a single-row doc can never trip the ticker
+    rule, and a doc where NO row carries tickers (legit untickered assets)
+    cannot either.
+    """
+    assets = [
+        str(tx.get("asset") or "").strip()
+        for tx in transactions
+        if isinstance(tx, dict)
+    ]
+    count = len(assets)
+    if count < 2:
+        return []
+    reasons: list[str] = []
+    has_ticker = [bool(ASSET_TICKER_PATTERN.search(asset)) for asset in assets]
+    tickered = sum(has_ticker)
+    for index, asset in enumerate(assets):
+        if has_ticker[index] or not asset:
+            continue
+        others = count - 1
+        if tickered / others > ASSET_TICKER_CONTEXT_SHARE:
+            reasons.append(f"missing_ticker_context:row{index + 1}")
+    folded = [" ".join(asset.split()).casefold() for asset in assets]
+    for i in range(count):
+        if not folded[i]:
+            continue
+        for j in range(count):
+            if i != j and folded[i] != folded[j] and folded[i] in folded[j]:
+                reasons.append(f"asset_substring:row{i + 1}<row{j + 1}")
+                break  # one witness per row keeps the reason list bounded
+    return reasons
+
+
 def build_staging_record(
     doc_id: str,
     year: int,
@@ -375,6 +432,13 @@ def build_staging_record(
     stands: historical "not configured" records were real config-missing
     (``model: null``) — an unconfigured endpoint is an error record, never
     a silent skip.
+
+    Successful records additionally carry the additive
+    ``asset_review``/``asset_review_reasons`` flag (interface audit item 3):
+    a cheap post-parse heuristic for GLM's known asset-text normalization
+    damage (dropped repeated issuer wording, mangled tickers). The flag
+    never rejects a row; it marks the record so the audit sampler
+    oversamples it.
     """
     record = {
         "doc_id": str(doc_id),
@@ -393,6 +457,8 @@ def build_staging_record(
         "parse_status": "error",
         "error": None,
         "error_kind": None,
+        "asset_review": False,
+        "asset_review_reasons": [],
         "audit": None,
     }
     raw_output = None
@@ -411,6 +477,7 @@ def build_staging_record(
                 snapshot, config, read_fn=read_fn, page_count=page_count
             )
             parsed = parse_gemini_output(raw_output, expected_page_count=page_count)
+        review_reasons = detect_asset_review_reasons(parsed.transactions)
         record.update(
             member=parsed.member,
             rows=[
@@ -428,6 +495,8 @@ def build_staging_record(
             parse_status="success" if parsed.transactions else "no_txs",
             error=None,
             error_kind=None,
+            asset_review=bool(review_reasons),
+            asset_review_reasons=review_reasons,
         )
     except Exception as exc:  # one bad doc must never kill the batch
         record["parse_status"] = "error"

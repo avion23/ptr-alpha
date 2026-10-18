@@ -441,6 +441,204 @@ def test_vision_b_unavailable_on_malformed_envelope(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Interface hardening (2026-10-18 audit): output budget, per-page timeout,
+# documented Z.AI error taxonomy, finish-reason gate, request shape
+# ---------------------------------------------------------------------------
+
+
+def test_request_max_tokens_scales_with_pages_within_documented_ceiling():
+    from analyzer import vision_engines as ve
+
+    # Documented request-schema maximum (docs.z.ai chat-completion):
+    # glm-5.3-flash vision max_tokens min 1 / max 131072.
+    assert ve.ZAI_MAX_TOKENS_CEILING == 131072
+    # The floor covers the owner's flat-8192 bound with always-on reasoning
+    # headroom (reasoning tokens share the output budget on glm-5.3-flash).
+    assert ve.request_max_tokens(1) == 16384
+    assert ve.request_max_tokens(None) == ve.request_max_tokens(1)
+    # ...and scales past the floor for heavy filings (68-row docs are real:
+    # 68 rows x 60 tokens ~ 4K answer tokens; 1500/page bounds 20 rows/page).
+    assert ve.request_max_tokens(9) == 4096 + 1500 * 9
+    assert (
+        ve.request_max_tokens(9)
+        > ve.request_max_tokens(3)
+        >= ve.request_max_tokens(1)
+    )
+    assert ve.request_max_tokens(1000) == 131072  # capped at the schema max
+
+
+def test_request_timeout_math_is_per_page():
+    from analyzer import vision_engines as ve
+
+    assert ve.request_timeout(1) == 180.0  # equals the old flat budget
+    assert ve.request_timeout(2) == 240.0
+    assert ve.request_timeout(3) == 300.0  # tonight's heavy-doc failure case
+    assert ve.request_timeout(5) == 420.0
+    assert ve.request_timeout(None) == ve.request_timeout(1)
+    # An operator-pinned VISION_B_TIMEOUT always wins verbatim (auto == None).
+    assert ve.request_timeout(3, configured=600.0) == 600.0
+    assert ve.request_timeout(3, configured=0.2) == 0.2
+
+
+def test_client_sends_max_tokens_and_per_page_timeout(monkeypatch):
+    from analyzer import vision_engines as ve
+
+    captured = {}
+
+    class _OKResponse:
+        status_code = 200
+        text = "ok"
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS\n"
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(url, *, json=None, headers=None, timeout=None):
+        captured["payload"] = json
+        captured["timeout"] = timeout
+        return _OKResponse()
+
+    monkeypatch.setattr(ve.requests, "post", fake_post)
+    pages = [DATA_URL] * 4
+    read_document_with_vision_b(
+        pages, VisionBConfig(base_url="http://visionb.invalid", model="stub")
+    )
+    assert captured["payload"]["max_tokens"] == ve.request_max_tokens(4)
+    assert captured["timeout"] == ve.request_timeout(4)  # auto: 120s + 60s/page
+    read_document_with_vision_b(
+        pages,
+        VisionBConfig(
+            base_url="http://visionb.invalid", model="stub", timeout=0.5
+        ),
+    )
+    assert captured["timeout"] == 0.5  # an operator pin is honored verbatim
+
+
+def test_finish_reason_fail_closed_taxonomy(monkeypatch):
+    from analyzer import vision_engines as ve
+
+    payload = (
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
+    )
+
+    def respond_with(finish_reason):
+        class _Response:
+            status_code = 200
+            text = "ok"
+
+            @staticmethod
+            def json():
+                return {
+                    "choices": [
+                        {
+                            "message": {"content": payload},
+                            "finish_reason": finish_reason,
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(
+            ve.requests, "post", lambda *args, **kwargs: _Response()
+        )
+
+    config = VisionBConfig(base_url="http://visionb.invalid", model="stub")
+    # A documented abnormal termination with a plausible body is NOT a
+    # reading: parsing it would let a filtered/window-exceeded cut masquerade
+    # as a (possibly partial) extraction.
+    respond_with("sensitive")
+    with pytest.raises(VisionBPermanentError, match="finish_reason=sensitive"):
+        read_document_with_vision_b([DATA_URL], config)
+    respond_with("model_context_window_exceeded")
+    with pytest.raises(VisionBPermanentError, match="context_window"):
+        read_document_with_vision_b([DATA_URL], config)
+    # Transport-shaped abnormal terminations stay retriable.
+    respond_with("network_error")
+    with pytest.raises(
+        TransientVisionBError, match="finish_reason=network_error"
+    ):
+        read_document_with_vision_b([DATA_URL], config)
+    # "stop" — and no finish_reason at all — remain readings.
+    respond_with("stop")
+    assert read_document_with_vision_b([DATA_URL], config) == payload
+    respond_with(None)
+    assert read_document_with_vision_b([DATA_URL], config) == payload
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "kind"),
+    [
+        # "-"-code / 500 "Internal Error" (seen live tonight): transient.
+        (500, "Internal Error", "transient"),
+        (500, '{"error":{"code":"1200","message":"API Call Error"}}', "transient"),
+        (500, '{"error":{"code":"1230","message":"API call process error"}}', "transient"),
+        # 1302 quota, under its documented status and under a foreign status.
+        (429, "Rate limit reached for requests", "quota"),
+        (503, '{"error":{"code":"1302","message":"Rate limit reached for requests"}}', "quota"),
+        # 1113 "Insufficient balance or no resource package" is quota/balance.
+        (429, '{"error":{"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}}', "quota"),
+        (402, '{"error":{"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}}', "quota"),
+        # 1305 is a TRANSIENT overload, not a quota stop.
+        (429, '{"error":{"code":"1305","message":"The service may be temporarily overloaded, please try again later"}}', "transient"),
+        # 1309/1311 never self-heal: fatal, alert-shaped (auth bucket).
+        (429, '{"error":{"code":"1309","message":"Your GLM Coding Plan package has expired and is temporarily unavailable."}}', "auth"),
+        (429, '{"error":{"code":"1311","message":"Your current subscription plan does not yet include access to glm-5.3-flash"}}', "auth"),
+        # 1000-1005 auth failures, 1220 permission.
+        (401, '{"error":{"code":"1002","message":"Invalid API key"}}', "auth"),
+        (401, '{"error":{"code":"1000","message":"Authentication Failed"}}', "auth"),
+        (403, '{"error":{"code":"1220","message":"You do not have permission to access this API"}}', "auth"),
+        # 1211/1261/1301 are permanent request defects (400).
+        (400, '{"error":{"code":"1261","message":"Prompt too long"}}', "permanent"),
+        (400, '{"error":{"code":"1211","message":"Unknown Model"}}', "permanent"),
+        (400, '{"error":{"code":"1301","message":"sensitive content detected"}}', "permanent"),
+    ],
+)
+def test_documented_zai_error_codes_classify(status, body, kind):
+    from analyzer import vision_engines as ve
+
+    exc = ve._classify_http_error(status, body)
+    assert ve.classify_visionb_error(exc) == kind
+
+
+def test_multi_page_images_travel_in_order_in_the_documented_shape(
+    vision_b_server,
+):
+    server = vision_b_server(A_OUTPUT)
+    config = VisionBConfig.from_env(_env(server))
+    page_urls = [
+        "data:image/png;base64,UEEx",
+        "data:image/png;base64,UEEy",
+        "data:image/png;base64,UEEz",
+    ]
+    read_document_with_vision_b(page_urls, config)
+    content = server.requests[0]["messages"][0]["content"]
+    images = [part for part in content if part.get("type") == "image_url"]
+    # Pages stay in order, images first, prompt last — Z.AI's documented
+    # multi-image form is repeated image_url content blocks.
+    assert [part["image_url"]["url"] for part in images] == page_urls
+    assert content[-1]["type"] == "text"
+
+
+def test_render_dpis_stay_inside_documented_zai_image_caps():
+    # Documented per-image caps (vision schema): <5MB and <= 6000x6000 px.
+    # 300 DPI on letter is 2550x3300 — inside; 600 DPI would NOT be.
+    from analyzer import vision_engines
+    from scripts import glm_stage
+
+    for dpi in (glm_stage.RENDER_DPI, vision_engines.PAGE_RENDER_DPI, 300):
+        assert 8.5 * dpi <= 6000
+        assert 11.0 * dpi <= 6000
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator: dual_read decisions
 # ---------------------------------------------------------------------------
 

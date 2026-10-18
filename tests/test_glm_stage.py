@@ -867,6 +867,8 @@ def test_poppler_glue_renders_pages(data_dir):
     for url in urls:
         assert url.startswith("data:image/png;base64,")
         base64.b64decode(url.split(",", 1)[1])
+        # Z.AI vision request schema: every image must stay under 5MB.
+        assert len(url) < 5_000_000
 
     bundle_dir = data_dir / "bundle" / "7001"
     pages = audit_sample.render_pdf_pages(pdf, bundle_dir)
@@ -1325,3 +1327,108 @@ def test_cli_stage_workers_override_refused(data_dir, capsys):
     )
     assert rc == 2
     assert "workers=8 refused" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# interface audit item 3: asset_review flag (GLM asset-normalization damage)
+# --------------------------------------------------------------------------
+
+ASSET_DAMAGE_OUTPUT = (
+    "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+    + "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n" * 8
+    + "Apple Inc. | Purchase | 01/15/24 | 01/20/24 | A\n"
+    + "Apple Inc. Apple Inc. | Purchase | 01/15/24 | 01/20/24 | A\n"
+)
+
+
+def test_asset_review_flags_missing_ticker_context():
+    # The live failure mode: one row's ticker mangled/dropped ("PARNTERS")
+    # while >80% of the doc's other rows carry a parenthesized ticker.
+    reasons = glm_stage.detect_asset_review_reasons(
+        [
+            {"asset": "Apple Inc. (AAPL)"},
+            {"asset": "Apple Inc. (AAPL)"},
+            {"asset": "Apple Inc. (AAPL)"},
+            {"asset": "Apple Inc. PARNTERS"},
+        ]
+    )
+    assert reasons == ["missing_ticker_context:row4"]
+
+
+def test_asset_review_flags_dropped_repeated_issuer_wording():
+    # The live failure mode: "Energy Transfer Equity, L.P. Energy Transfer
+    # Equity, L.P." in the PDF, GLM emitted it once on one row while the
+    # doubled form survived on a sibling row -> strict substring.
+    reasons = glm_stage.detect_asset_review_reasons(
+        [
+            {"asset": "Energy Transfer Equity, L.P."},
+            {"asset": "Energy Transfer Equity, L.P. Energy Transfer Equity, L.P."},
+        ]
+    )
+    assert reasons == ["asset_substring:row1<row2"]
+
+
+def test_asset_review_ticker_rule_threshold_is_strictly_over_80_percent():
+    rows = [{"asset": f"Thing {i} (T{i})"} for i in range(4)] + [
+        {"asset": "Untickered Energy Partners LP"},
+        {"asset": "Utica Municipal Bond Fund"},
+    ]
+    # Exactly 4/5 = 80% of each untickered row's others tickered: at the
+    # threshold, NOT over it.
+    assert glm_stage.detect_asset_review_reasons(rows) == []
+    rows.insert(0, {"asset": "Another Fund (AF)"})  # 5/6 > 80% -> flag both
+    reasons = glm_stage.detect_asset_review_reasons(rows)
+    assert reasons == [
+        "missing_ticker_context:row6",
+        "missing_ticker_context:row7",
+    ]
+
+
+def test_asset_review_stays_silent_on_clean_and_untickered_docs():
+    clean = [{"asset": f"Fund {i} Institutional Shares (F{i})"} for i in range(5)]
+    assert glm_stage.detect_asset_review_reasons(clean) == []
+    # A doc where NO row carries a ticker (legit untickered assets) is clean.
+    untickered = [{"asset": "First Republic Residential Mortgage Trust"}] * 3
+    assert glm_stage.detect_asset_review_reasons(untickered) == []
+    # Single-row docs can never establish ticker context.
+    assert glm_stage.detect_asset_review_reasons([{"asset": "Apple Inc."}]) == []
+
+
+def test_staged_records_carry_the_asset_review_flag(data_dir):
+    seed_year(data_dir, 2024, ["flag1", "clean1"])
+    outputs = {
+        "flag1": ASSET_DAMAGE_OUTPUT,
+        "clean1": GLM_OUTPUT_ONE_ROW,  # one fully tickered row
+    }
+    result = glm_stage.stage_batch(
+        2024, 5, data_dir=data_dir, read_fn=read_fn_from_outputs(outputs)
+    )
+    assert result["staged"] == 2
+    flagged = glm_stage.load_staging_record(data_dir, 2024, "flag1")
+    assert flagged["parse_status"] == "success"
+    assert flagged["asset_review"] is True
+    assert set(flagged["asset_review_reasons"]) >= {
+        "missing_ticker_context:row9",
+        "asset_substring:row9<row1",
+    }
+    clean = glm_stage.load_staging_record(data_dir, 2024, "clean1")
+    assert clean["asset_review"] is False
+    assert clean["asset_review_reasons"] == []
+
+
+def test_error_records_are_never_asset_review_flagged(data_dir):
+    seed_year(data_dir, 2024, ["err1"])
+
+    def broken(pdf_path, page_count):
+        raise ValueError("boom")
+
+    record = glm_stage.build_staging_record(
+        "err1",
+        2024,
+        glm_stage.default_pdf_path(data_dir, 2024, "err1"),
+        None,
+        read_fn=broken,
+    )
+    assert record["parse_status"] == "error"
+    assert record["asset_review"] is False
+    assert record["asset_review_reasons"] == []

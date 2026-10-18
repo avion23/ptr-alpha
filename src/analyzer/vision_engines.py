@@ -8,7 +8,8 @@ entirely through the environment:
 * ``VISION_B_BASE_URL``   — e.g. ``http://gpu-host:8000/v1`` (required)
 * ``VISION_B_MODEL``      — served model id (required)
 * ``VISION_B_API_KEY``    — optional bearer token
-* ``VISION_B_TIMEOUT``    — optional seconds (default 180)
+* ``VISION_B_TIMEOUT``    — optional seconds; when unset the read timeout
+                            auto-scales 120s + 60s/page (1 page = 180s)
 
 Per repo policy the endpoint must not serve OpenAI-operated GPT models; the
 point of engine B is an *independent model family*, and no default points at
@@ -88,9 +89,38 @@ VISION_B_BASE_URL_ENV = "VISION_B_BASE_URL"
 VISION_B_MODEL_ENV = "VISION_B_MODEL"
 VISION_B_API_KEY_ENV = "VISION_B_API_KEY"
 VISION_B_TIMEOUT_ENV = "VISION_B_TIMEOUT"
-DEFAULT_VISION_B_TIMEOUT = 180.0
+DEFAULT_VISION_B_TIMEOUT = 180.0  # legacy flat budget == the 1-page auto budget
 PAGE_RENDER_DPI = 200
 SNIPPET_LIMIT = 300  # bounded non-200/partial body retained in exceptions
+
+# Output-budget sizing (interface audit 2026-10-18, verified against
+# docs.z.ai/api-reference/llm/chat-completion: max_tokens min 1 / max 131072
+# for the vision request schema; largest real filing tonight was 68 rows,
+# ~30-60 output tokens per row; glm-5.3-flash reasoning is always on and
+# reasoning tokens draw on the same output budget, so the floor keeps 2x
+# headroom over the largest observed answer rather than the bare 8192).
+MAX_TOKENS_FLOOR = 16384  # flat budget for small docs (owner bound: >= 8192)
+MAX_TOKENS_BASE = 4096  # MEMBER/PAGES header + reasoning headroom
+MAX_TOKENS_PER_PAGE = 1500  # ~20 rows/page x ~60 tokens/row + PAGE headers
+ZAI_MAX_TOKENS_CEILING = 131072  # documented request schema maximum
+
+# Read-timeout budget (interface audit 2026-10-18): tonight's flat 180s was
+# exhausted by heavy multi-page docs (long always-on reasoning before the
+# first body byte — requests' read timeout is an idle timeout). The 1-page
+# budget equals the old flat 180s; heavier docs scale.
+TIMEOUT_BASE_SECONDS = 120.0
+TIMEOUT_PER_PAGE_SECONDS = 60.0
+
+# Documented finish_reason values (docs.z.ai chat-completion response
+# schema): stop | tool_calls | length | sensitive |
+# model_context_window_exceeded | network_error. Only a complete "stop"
+# answer is a reading; everything else is fail-closed.
+_FINISH_REASON_OK = ("", "stop")
+_FINISH_REASON_PERMANENT = (
+    "model_context_window_exceeded",
+    "sensitive",
+    "content_filter",
+)
 
 ReasonSchemaInvalid = "visionb_schema_invalid"
 ReasonRowMismatch = "row_mismatch"
@@ -160,14 +190,51 @@ def _snippet(text: str, limit: int = SNIPPET_LIMIT) -> str:
     return collapsed[: limit - 3] + "..."
 
 
+def request_max_tokens(page_count: int | None) -> int:
+    """Explicit output budget for one document read (interface audit item 1).
+
+    The client used to omit ``max_tokens`` and ride the server default; the
+    vision request schema documents no default (only ``example: 1024``, which
+    WOULD truncate a 68-row filing), so the budget is now always sent:
+    ``max(16384, 4096 + 1500 x pages)`` capped at the documented 131072
+    ceiling. 1500/page covers ~20 rows x ~60 tokens plus PAGE headers — far
+    above anything a PTR page holds — and the floor leaves headroom for
+    always-on reasoning tokens, which share the output budget.
+    """
+    pages = max(int(page_count or 1), 1)
+    budget = MAX_TOKENS_BASE + MAX_TOKENS_PER_PAGE * pages
+    return min(max(budget, MAX_TOKENS_FLOOR), ZAI_MAX_TOKENS_CEILING)
+
+
+def request_timeout(
+    page_count: int | None, configured: float | None = None
+) -> float:
+    """Per-page-count read-timeout budget (interface audit item 4).
+
+    ``120s + 60s/page``: the 1-page budget equals the old flat 180s, and
+    heavy multi-page docs (which exhausted 180s tonight mid-generation) get
+    proportionally more idle-read slack. An operator-pinned
+    ``VISION_B_TIMEOUT`` (``VisionBConfig.timeout`` not None) always wins
+    unchanged; the scaling applies only when the timeout is on auto (None).
+    """
+    pages = max(int(page_count or 1), 1)
+    computed = TIMEOUT_BASE_SECONDS + TIMEOUT_PER_PAGE_SECONDS * pages
+    return float(computed) if configured is None else float(configured)
+
+
 @dataclass(frozen=True)
 class VisionBConfig:
-    """Connection settings for the OpenAI-compatible vision endpoint."""
+    """Connection settings for the OpenAI-compatible vision endpoint.
+
+    ``timeout=None`` means AUTO: the client budgets ``120s + 60s/page`` per
+    read (``request_timeout``). An explicit value (``VISION_B_TIMEOUT``)
+    pins the budget exactly as given.
+    """
 
     base_url: str
     model: str
     api_key: str | None = None
-    timeout: float = DEFAULT_VISION_B_TIMEOUT
+    timeout: float | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> VisionBConfig | None:
@@ -177,7 +244,7 @@ class VisionBConfig:
         model = str(source.get(VISION_B_MODEL_ENV) or "").strip()
         if not base_url or not model:
             return None
-        timeout = DEFAULT_VISION_B_TIMEOUT
+        timeout: float | None = None  # auto: per-page budget at request time
         raw_timeout = str(source.get(VISION_B_TIMEOUT_ENV) or "").strip()
         if raw_timeout:
             try:
@@ -216,12 +283,17 @@ def read_document_with_vision_b(
 
     The prompt is the SAME transaction-extraction prompt the Gemini path uses
     (imported, never forked). All pages travel in one chat-completions request
-    so engine B answers for the whole document in the shared schema. Failures
+    in the documented Z.AI vision shape (content array of ``image_url`` parts
+    in page order, text prompt last) with an explicit page-scaled
+    ``max_tokens`` budget and a ``120s + 60s/page`` read-timeout (auto unless
+    ``VISION_B_TIMEOUT`` pins it). Failures
     raise a classified ``VisionBUnavailable`` subclass: transport/timeout and
     5xx are ``TransientVisionBError``; 429/1302/quota is
     ``VisionBQuotaError``; 401/403 is ``VisionBAuthError``; other 4xx is
-    ``VisionBPermanentError``; ``finish_reason="length"`` is rejected as
-    ``TruncatedCompletion``. Non-200 bodies travel (bounded to
+    ``VisionBPermanentError``; non-``stop`` finish reasons are rejected
+    (``length`` as ``TruncatedCompletion``, ``sensitive`` /
+    ``model_context_window_exceeded`` as permanent, others transient).
+    Non-200 bodies travel (bounded to
     ``SNIPPET_LIMIT`` chars) inside the exception so classification survives.
     """
     if not page_data_urls:
@@ -232,6 +304,11 @@ def read_document_with_vision_b(
     payload = {
         "model": config.model,
         "temperature": 0,
+        # Explicit per-document output budget (interface audit item 1): the
+        # documented vision-schema default is unspecified, and an
+        # finish_reason="length" truncation is a rejected reading — size for
+        # the heaviest real filing instead of riding an undocumented default.
+        "max_tokens": request_max_tokens(len(page_data_urls)),
         "messages": [
             {
                 "role": "user",
@@ -249,9 +326,16 @@ def read_document_with_vision_b(
     if config.api_key:
         headers["Authorization"] = f"Bearer {config.api_key}"
     url = f"{config.base_url.rstrip('/')}/chat/completions"
+    # One image per page: the page count IS the content-array length, so the
+    # read-timeout budget scales with the document (audit item 4). Pages stay
+    # in order in the documented vision shape (content array of image_url
+    # parts, text last) — Z.AI documents multi-image via repeated image_url
+    # blocks, capped at 5MB and 6000x6000 pixels per image (150/300-DPI
+    # letter renders are far inside both).
+    timeout = request_timeout(len(page_data_urls), configured=config.timeout)
     try:
         response = requests.post(
-            url, json=payload, headers=headers, timeout=config.timeout
+            url, json=payload, headers=headers, timeout=timeout
         )
     except requests.RequestException as exc:
         raise TransientVisionBError(
@@ -274,12 +358,37 @@ def read_document_with_vision_b(
     finish_reason = (
         choice.get("finish_reason") if isinstance(choice, dict) else None
     )
-    if str(finish_reason or "").strip().lower() == "length":
-        raise TruncatedCompletion(
+    rejection = _finish_reason_rejection(finish_reason, text)
+    if rejection is not None:
+        raise rejection
+    return text
+
+
+def _finish_reason_rejection(finish_reason: object, text: str):
+    """Reject any completion that is not a complete ``stop`` answer.
+
+    Z.AI documents finish_reason stop | tool_calls | length | sensitive |
+    model_context_window_exceeded | network_error. A non-stop reason with a
+    non-empty body is a PARTIAL answer — accepting it would let a truncated
+    row set masquerade as a reading (audit item 5/6, fail-closed).
+    """
+    reason = str(finish_reason or "").strip().lower()
+    if reason in _FINISH_REASON_OK:
+        return None
+    if reason == "length":
+        return TruncatedCompletion(
             "visionb truncated completion (finish_reason=length; rejecting "
             f"incomplete output): {_snippet(text)}"
         )
-    return text
+    if reason in _FINISH_REASON_PERMANENT:
+        return VisionBPermanentError(
+            f"visionb rejected completion (finish_reason={reason}): "
+            f"{_snippet(text)}"
+        )
+    return TransientVisionBError(
+        f"visionb abnormal completion (finish_reason={reason or 'missing'}): "
+        f"{_snippet(text)}"
+    )
 
 
 def _response_body(response) -> str:
@@ -292,12 +401,37 @@ def _response_body(response) -> str:
 def _classify_http_error(status_code: int, snippet: str) -> VisionBUnavailable:
     """Map an HTTP failure onto the transient/stop/alert classification.
 
-    Z.AI signals quota exhaustion with HTTP 429 (optionally body error code
-    1302, "Rate limit reached for requests" per docs.z.ai/api-reference/
-    api-code); 401/403 are credential defects; other 4xx are request
-    defects; 5xx is transient overload.
+    Against docs.z.ai/api-reference/api-code (verified 2026-10-18):
+
+    * 1302 (429, "Rate limit reached for requests"), 1308/1310/1313/1316-1321
+      (429, usage/fair-use limits) and 1113 (429, "Insufficient balance or no
+      resource package") are quota — HTTP 429 or the body wording classifies
+      there regardless of status.
+    * 1305 (429, "The service may be temporarily overloaded, please try again
+      later") is TRANSIENT, not quota: retrying per-doc is correct; stopping
+      the whole batch on an overload blip would stall the drain.
+    * 1309/1311/1314 (429, "package has expired" / plan does not include the
+      model) never self-heal — classified as auth-shaped fatal defects so
+      callers ALERT and stop instead of silently quota-stopping every night.
+    * 1000-1005 (401) and 1220 (403) are credential defects; 1211/1261/1301
+      (400) are request defects; 500/1200/1230/1234 (5xx) are transient.
     """
     lowered = snippet.lower()
+    if "1305" in lowered or "temporarily overloaded" in lowered:
+        return TransientVisionBError(
+            f"visionb transient overload (http {status_code}): {snippet}"
+        )
+    if (
+        status_code == 429
+        and (
+            "package has expired" in lowered
+            or "does not yet include access" in lowered
+        )
+    ):
+        # Subscription defect: alert + stop the batch (same handling as auth).
+        return VisionBAuthError(
+            f"visionb subscription defect (http {status_code}): {snippet}"
+        )
     quota_hit = status_code == 429 or "1302" in lowered or (
         "quota" in lowered
         or "rate limit" in lowered

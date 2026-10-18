@@ -7,28 +7,69 @@ rendered back to pixels for independent owner review, and an exact
 one-sided binomial bound on the material-error rate against an
 owner-approved budget (illustrative <1% at 95% confidence).
 
+Finding 9 fail-closed semantics (report can never manufacture acceptance):
+
+* Every sampled doc requires an explicit verdict. Missing/invalid/None
+  verdicts make the doc UNRESOLVED; with any unresolved sampled doc the
+  report state is ``incomplete`` and ``budget_met`` is ``None`` (it can
+  never default to clean).
+* A ``fail`` is STICKY for the population assessment: verdict records
+  APPEND to ``audit-results.json`` (history) and the report uses the
+  WORST verdict per doc. A later pass marks the doc repaired
+  (``repaired_count``) but the original failure stays counted in both
+  numerator and denominator.
+* The report is computed over a FROZEN sample lot: ``sample`` records
+  doc_ids + per-doc staged-record sha256 + model + prompt_sha256 +
+  parser_version in ``audit-sample-<seed>.json`` at sample time. The
+  report verifies each doc's CURRENT staged-record sha against the
+  frozen sha; mismatch -> UNRESOLVED ("recipe/staged-record changed
+  after sampling"). The sha excludes audit-mutable fields so that
+  stamping a verdict never looks like drift.
+* Omission detection compares row MULTISETS of normalized
+  (asset, type, tx_date, notif_date, amount) tuples -- not counts --
+  and only when the ground-truth file exists; a pass-verdict doc
+  without ground truth is UNRESOLVED, never clean. Promotion consumes
+  staged rows, so omission checking must happen BEFORE ``promote``;
+  a promoted doc whose staging record is gone is UNRESOLVED.
+* Stratification is reported honestly: per-stratum counts/rates plus a
+  pooled rate weighted by staged population counts per year (frozen at
+  sample time). Without population weights the pooled rate falls back
+  to an explicitly-labelled unweighted-stratum mean.
+
 Subcommands:
 
 * ``sample  --per-year N --seed S``
     Stratified random sample (``random.Random(S)``) of staged successfully
-    parsed records -> ``audit-sample-<seed>.json`` plus a review bundle
-    ``audit-review/`` holding the rendered page PNGs and a copy of each
-    staging JSON. Deterministic given the seed and staging population.
+    parsed records -> frozen-lot file ``audit-sample-<seed>.json`` plus a
+    review bundle ``audit-review/`` holding the rendered page PNGs and a
+    copy of each staging JSON. Deterministic given the seed and staging
+    population.
 * ``record  --doc-id ID --verdict pass|fail --notes "..."`
-    Append to ``audit-results.json`` and stamp the staging record's
-    ``audit`` field (the field ``glm_stage.py promote
-    --require-audit-pass`` gates on).
-* ``report  [--max-rate 0.01] [--ground-truth-dir DIR]``
-    Material-error rate (fails/audited; omissions — ground-truth rows >
-    staged rows — count as failures) with the one-sided exact 95% binomial
-    upper bound, and whether the owner budget is met. Only pass-verdict,
-    promoted, omission-free docs count as clean.
+    APPEND to the ``audit-results.json`` history and stamp the staging
+    record's ``audit`` field (the field ``glm_stage.py promote
+    --require-audit-pass`` gates on). A later pass never erases an
+    earlier fail from the population assessment.
+* ``report  [--max-rate 0.01] [--ground-truth-dir DIR] [--sample-file P]``
+    Material-error accounting over the frozen lot with the one-sided
+    exact 95% binomial upper bound. Exit codes: 0 complete + budget met,
+    1 complete + budget NOT met, 2 INCOMPLETE audit (refuses: budget
+    cannot be computed). Writes ``audit-report-state.json`` next to the
+    results file with ``state`` in {"complete", "incomplete"} and
+    ``budget_met`` in {true, false, null} -- the loose file contract
+    ``promote --require-audit-pass`` should consult and refuse on when
+    ``state != "complete"`` or ``budget_met is not True``.
+
+Every report begins with the ruling caveat:
+
+    LLM-assisted audit — silver standard; not a substitute for human
+    pixel verification
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import math
 import random
@@ -36,6 +77,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -43,12 +85,29 @@ for _path in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from scripts.gemini_ocr_common import pdf_sha256  # noqa: E402
+from scripts.gemini_ocr_common import pdf_sha256  # noqa: E402,F401  (re-exported)
 
 AUDIT_RESULTS_NAME = "audit-results.json"
+REPORT_STATE_NAME = "audit-report-state.json"
+REPORT_STATE_SCHEMA = "audit-report-state-v2"
+SAMPLE_SCHEMA = "audit-sample-lot-v2"
 RENDER_DPI = 150
 DEFAULT_MAX_RATE = 0.01
 DEFAULT_CONFIDENCE = 0.95
+
+# Fields the audit workflow itself writes into a staging record. They are
+# excluded from the frozen staged-record sha so that recording a verdict is
+# never misread as recipe drift.
+AUDIT_MUTABLE_FIELDS = frozenset({"audit", "audit_notes", "audited_at_utc"})
+
+CAVEAT = (
+    "LLM-assisted audit — silver standard; not a substitute for human "
+    "pixel verification"
+)
+PROMOTE_ORDER_NOTE = (
+    "NOTE: promotion consumes staged rows; run this report's omission "
+    "checks BEFORE `promote`."
+)
 
 
 def staging_root(data_dir: str | Path = "data") -> Path:
@@ -131,6 +190,31 @@ def binomial_upper_bound(f: int, n: int, confidence: float = DEFAULT_CONFIDENCE)
 
 
 # --------------------------------------------------------------------------
+# frozen-lot hashing
+# --------------------------------------------------------------------------
+
+
+def stable_record_view(record: dict) -> dict:
+    """Record content minus audit-mutable fields (the frozen evidence)."""
+    return {
+        key: value
+        for key, value in record.items()
+        if key not in AUDIT_MUTABLE_FIELDS
+    }
+
+
+def staged_record_sha256(record: dict) -> str:
+    """sha256 of the canonical JSON of the audit-stable record view."""
+    canonical = json.dumps(
+        stable_record_view(record),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------
 # sample
 # --------------------------------------------------------------------------
 
@@ -149,6 +233,16 @@ def load_staging_records(data_dir: str | Path = "data") -> list[tuple[int, dict]
     return records
 
 
+def _sampling_frame(records: list[tuple[int, dict]]) -> dict[int, list[str]]:
+    """doc_ids per year eligible for sampling (parsed success or no_txs)."""
+    by_year: dict[int, list[str]] = {}
+    for year, record in records:
+        if record.get("parse_status") not in ("success", "no_txs"):
+            continue
+        by_year.setdefault(year, []).append(str(record["doc_id"]))
+    return by_year
+
+
 def build_sample(
     records: list[tuple[int, dict]], per_year: int, seed: int
 ) -> list[dict]:
@@ -157,11 +251,7 @@ def build_sample(
     Deterministic: fresh ``random.Random(seed)``, doc ids sorted within each
     year, years visited in ascending order.
     """
-    by_year: dict[int, list[str]] = {}
-    for year, record in records:
-        if record.get("parse_status") not in ("success", "no_txs"):
-            continue
-        by_year.setdefault(year, []).append(str(record["doc_id"]))
+    by_year = _sampling_frame(records)
     rng = random.Random(seed)
     sample = []
     for year in sorted(by_year):
@@ -169,6 +259,73 @@ def build_sample(
         chosen = rng.sample(doc_ids, min(per_year, len(doc_ids)))
         sample.extend({"doc_id": doc_id, "year": year} for doc_id in sorted(chosen))
     return sample
+
+
+def freeze_lot(
+    records: list[tuple[int, dict]], sample: list[dict]
+) -> list[dict]:
+    """Freeze per-doc evidence at sample time (FP review finding 9, item 3).
+
+    Each lot entry records the doc_id, its year, the staged-record sha256
+    (over the audit-stable record view), and the extraction recipe fields
+    (model, prompt_sha256, parser_version). The report later refuses docs
+    whose current staged record no longer matches this fingerprint.
+    """
+    record_by_id: dict[str, tuple[int, dict]] = {}
+    for year, record in records:
+        record_by_id.setdefault(str(record["doc_id"]), (year, record))
+    lot = []
+    for item in sample:
+        doc_id = str(item["doc_id"])
+        found = record_by_id.get(doc_id)
+        if found is None:
+            lot.append(
+                {
+                    "doc_id": doc_id,
+                    "year": int(item["year"]),
+                    "staged_record_sha256": None,
+                    "model": None,
+                    "prompt_sha256": None,
+                    "parser_version": None,
+                }
+            )
+            continue
+        _, record = found
+        lot.append(
+            {
+                "doc_id": doc_id,
+                "year": int(item["year"]),
+                "staged_record_sha256": staged_record_sha256(record),
+                "model": record.get("model"),
+                "prompt_sha256": record.get("prompt_sha256"),
+                "parser_version": record.get("parser_version"),
+            }
+        )
+    return lot
+
+
+def write_sample_file(
+    records: list[tuple[int, dict]],
+    sample: list[dict],
+    *,
+    seed: int,
+    per_year: int,
+    out_path: Path,
+) -> dict:
+    """Write the frozen-lot sample file (schema audit-sample-lot-v2)."""
+    frame_counts = Counter(year for year in _sampling_frame(records))
+    envelope = {
+        "schema": SAMPLE_SCHEMA,
+        "seed": int(seed),
+        "per_year": int(per_year),
+        "created_at_utc": utc_now_iso(),
+        "frame_counts_by_year": {
+            str(year): frame_counts[year] for year in sorted(frame_counts)
+        },
+        "lot": freeze_lot(records, sample),
+    }
+    _atomic_write_json(out_path, envelope)
+    return envelope
 
 
 def render_pdf_pages(pdf_path: str | Path, out_dir: Path, dpi: int = RENDER_DPI) -> list[Path]:
@@ -229,15 +386,25 @@ def cmd_sample(args) -> int:
     sample = build_sample(records, args.per_year, args.seed)
     root = staging_root(args.data_dir)
     out_path = root / f"audit-sample-{args.seed}.json"
-    _atomic_write_json(out_path, sample)
+    envelope = write_sample_file(
+        records,
+        sample,
+        seed=args.seed,
+        per_year=args.per_year,
+        out_path=out_path,
+    )
     problems = (
         emit_review_bundle(sample, args.data_dir)
         if not args.no_bundle
         else []
     )
-    print(f"Sampled {len(sample)} docs -> {out_path}")
-    for item in sample:
-        print(f"  {item['year']}/{item['doc_id']}")
+    print(
+        f"Sampled {len(sample)} docs -> {out_path} "
+        f"(frozen lot: staged-record sha256 + model/prompt/parser at sample "
+        f"time; the report refuses docs whose record changed after sampling)"
+    )
+    for item in envelope["lot"]:
+        print(f"  {item['year']}/{item['doc_id']} sha={item['staged_record_sha256'][:12]}")
     for problem in problems:
         print(f"  bundle problem: {problem}", file=sys.stderr)
     return 0
@@ -254,15 +421,36 @@ def record_verdict(
     verdict: str,
     notes: str = "",
 ) -> dict:
-    """Append an audit result and stamp the staging record's audit field."""
+    """APPEND an audit result to the history and stamp the staging record.
+
+    The results file is an append-only history: a later pass never erases
+    an earlier fail (the report takes the WORST verdict per doc). The
+    entry binds the verdict to the current staged record's frozen sha so
+    drift introduced after the review is detectable.
+    """
     if verdict not in ("pass", "fail"):
         raise ValueError("verdict must be 'pass' or 'fail'")
     root = staging_root(data_dir)
+
+    found_year = None
+    stable_sha = None
+    for year_dir in sorted(root.glob("[0-9]" * 4)):
+        path = year_dir / f"{doc_id}.json"
+        if path.exists():
+            record = json.loads(path.read_text(encoding="utf-8"))
+            stable_sha = staged_record_sha256(record)
+            record["audit"] = verdict
+            record["audit_notes"] = notes
+            _atomic_write_json(path, record)
+            found_year = int(year_dir.name)
+            break
+    audited_at = utc_now_iso()
     entry = {
         "doc_id": str(doc_id),
         "verdict": verdict,
         "notes": notes,
-        "audited_at_utc": utc_now_iso(),
+        "audited_at_utc": audited_at,
+        "staged_record_sha256": stable_sha,
     }
     results_path = root / AUDIT_RESULTS_NAME
     results = []
@@ -276,18 +464,7 @@ def record_verdict(
     results.append(entry)
     _atomic_write_json(results_path, results)
 
-    found = None
-    for year_dir in sorted(root.glob("[0-9]" * 4)):
-        path = year_dir / f"{doc_id}.json"
-        if path.exists():
-            record = json.loads(path.read_text(encoding="utf-8"))
-            record["audit"] = verdict
-            record["audit_notes"] = notes
-            record["audited_at_utc"] = entry["audited_at_utc"]
-            _atomic_write_json(path, record)
-            found = int(year_dir.name)
-            break
-    return {"entry": entry, "staging_year": found}
+    return {"entry": entry, "staging_year": found_year}
 
 
 def cmd_record(args) -> int:
@@ -303,6 +480,10 @@ def cmd_record(args) -> int:
         else "no staging record found (results file updated only)"
     )
     print(f"Recorded {entry['verdict']} for {entry['doc_id']} ({where})")
+    print(
+        "History is append-only: an earlier fail remains counted for the "
+        "population even after a later pass (doc marked repaired)."
+    )
     return 0
 
 
@@ -320,6 +501,38 @@ def load_audit_results(data_dir: str | Path = "data") -> list[dict]:
     except (OSError, json.JSONDecodeError):
         return []
     return loaded if isinstance(loaded, list) else []
+
+
+def load_sample_lot(
+    data_dir: str | Path = "data", path: str | Path | None = None
+) -> tuple[dict | None, str | None]:
+    """Load the frozen sample lot (newest audit-sample-*.json by default).
+
+    Returns (envelope, None) or (None, refusal reason).
+    """
+    root = staging_root(data_dir)
+    if path is None:
+        candidates = sorted(root.glob("audit-sample-*.json"))
+        if not candidates:
+            return None, "no frozen sample lot (run `sample` first)"
+        path = candidates[-1]
+    path = Path(path)
+    if not path.exists():
+        return None, f"sample file not found: {path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"unreadable sample file {path}: {exc}"
+    if not (
+        isinstance(payload, dict)
+        and payload.get("schema") == SAMPLE_SCHEMA
+        and isinstance(payload.get("lot"), list)
+    ):
+        return None, (
+            f"{path.name} predates frozen-lot format ({SAMPLE_SCHEMA}); "
+            "re-run `sample`"
+        )
+    return payload, None
 
 
 def load_promoted_doc_ids(data_dir: str | Path = "data") -> set[str]:
@@ -348,6 +561,69 @@ def load_ground_truth_rows(ground_truth_dir: str | Path, doc_id: str) -> list | 
     raise ValueError(f"unsupported ground-truth format in {path}")
 
 
+def _normalize_row(row) -> tuple[str, str, str, str, str]:
+    """Normalized (asset, type, tx_date, notif_date, amount) tuple."""
+    if isinstance(row, dict):
+        values = [
+            row.get("asset"),
+            row.get("type"),
+            row.get("tx_date", row.get("date")),
+            row.get("notif_date"),
+            row.get("amount", row.get("amount_letter")),
+        ]
+    elif isinstance(row, (list, tuple)):
+        padded = list(row) + [None] * (5 - len(row))
+        values = padded[:5]
+    else:
+        values = [row, None, None, None, None]
+    return tuple(
+        "" if value is None else str(value).strip().casefold() for value in values
+    )
+
+
+def _verdict_of(entry) -> str | None:
+    """Explicit 'pass'/'fail' verdict, else None (missing/invalid/None)."""
+    if not isinstance(entry, dict):
+        return None
+    verdict = entry.get("verdict")
+    if isinstance(verdict, str) and verdict.lower() in ("pass", "fail"):
+        return verdict.lower()
+    return None
+
+
+def _weighted_pooled_rate(strata: list[dict], frame_counts: dict) -> tuple[float, str]:
+    """Population-weighted pooled rate; weights = staged counts per year."""
+    weights = {}
+    for key, count in frame_counts.items():
+        try:
+            weights[int(key)] = float(count)
+        except (TypeError, ValueError):
+            continue
+    numerator = 0.0
+    denominator = 0.0
+    for stratum in strata:
+        if stratum["rate"] is None:
+            continue
+        weight = weights.get(int(stratum["year"]))
+        if weight is None:
+            continue
+        numerator += weight * stratum["rate"]
+        denominator += weight
+    if denominator <= 0.0:
+        rates = [s["rate"] for s in strata if s["rate"] is not None]
+        if not rates:
+            return float("nan"), (
+                "unavailable (no resolved strata and no population weights)"
+            )
+        return sum(rates) / len(rates), (
+            "unweighted-stratum mean (population weights unavailable)"
+        )
+    return numerator / denominator, (
+        "population-weighted (stratum weights = staged counts per year, "
+        "frozen at sample time)"
+    )
+
+
 def build_report(
     results: list[dict],
     staged_rows_by_doc: dict[str, list],
@@ -356,86 +632,358 @@ def build_report(
     ground_truth_dir: str | Path | None = None,
     max_rate: float = DEFAULT_MAX_RATE,
     confidence: float = DEFAULT_CONFIDENCE,
+    lot: list[dict] | None = None,
+    staged_records_by_doc: dict[str, dict] | None = None,
+    frame_counts_by_year: dict | None = None,
 ) -> dict:
-    """Material-error accounting over audit results (latest verdict per doc).
+    """Fail-closed material-error accounting over the audit history.
 
-    A doc is a material failure when its verdict is ``fail`` OR (ground
-    truth supplied) its ground-truth row count exceeds the staged row count
-    (an omission). Only pass-verdict, promoted, omission-free docs count as
-    clean; the denominator is every audited doc.
+    Verdict semantics (finding 9): the audit history is append-only and
+    the WORST verdict per doc wins. Any recorded ``fail`` is STICKY — a
+    later pass marks the doc repaired (``repaired_count``) but the
+    failure stays in numerator and denominator; missing/invalid/None
+    verdicts make the doc UNRESOLVED. With a frozen ``lot``, docs whose
+    current staged-record sha256 no longer matches the frozen sha are
+    UNRESOLVED ("recipe/staged-record changed after sampling"), as are
+    lot docs without any recorded verdict. A pass-verdict doc is only
+    CLEAN when (ground truth supplied) its ground-truth row MULTISET
+    (normalized (asset, type, tx_date, notif_date, amount) tuples) equals
+    the staged multiset and it has been promoted; a missing ground-truth
+    file is UNRESOLVED, never clean.
+
+    ``state`` is "incomplete" (and ``budget_met`` None — the budget can
+    not be computed, the report refuses) whenever any sampled doc is
+    unresolved or verdicts exist outside the frozen lot.
     """
-    latest: dict[str, dict] = {}
-    for entry in results:
-        if not isinstance(entry, dict) or "doc_id" not in entry:
-            continue
-        latest[str(entry["doc_id"])] = entry  # last entry wins
+    history: dict[str, list[dict]] = {}
+    for entry in results or []:
+        if isinstance(entry, dict) and "doc_id" in entry:
+            history.setdefault(str(entry["doc_id"]), []).append(entry)
 
-    failures = []  # (doc_id, reason)
-    clean = []
-    passed_unpromoted = []
-    for doc_id in sorted(latest):
-        entry = latest[doc_id]
-        verdict = str(entry.get("verdict", "")).lower()
-        if verdict == "fail":
+    if lot is not None:
+        lot_by_id = {
+            str(item["doc_id"]): item
+            for item in lot
+            if isinstance(item, dict) and "doc_id" in item
+        }
+        population = sorted(lot_by_id)
+    else:
+        lot_by_id = {}
+        population = sorted(history)
+    outside_lot = sorted(set(history) - set(lot_by_id)) if lot is not None else []
+
+    failures: list[tuple[str, str]] = []
+    unresolved: list[tuple[str, str]] = []
+    clean: list[str] = []
+    passed_unpromoted: list[str] = []
+    repaired: list[str] = []
+    omission_details: dict[str, dict] = {}
+    unresolved_attempts = 0
+
+    for doc_id in population:
+        entries = history.get(doc_id, [])
+        verdicts = [_verdict_of(entry) for entry in entries]
+        unresolved_attempts += sum(1 for verdict in verdicts if verdict is None)
+
+        # 1) STICKY failures first: once recorded, a fail is never erased
+        #    (neither by a later pass nor by record drift afterwards).
+        if "fail" in verdicts:
             failures.append((doc_id, "verdict:fail"))
+            last_fail = max(i for i, v in enumerate(verdicts) if v == "fail")
+            if any(v == "pass" for v in verdicts[last_fail + 1 :]):
+                repaired.append(doc_id)
             continue
+        # 2) explicit-verdict requirement.
+        if not entries:
+            unresolved.append((doc_id, "no verdict recorded"))
+            continue
+        if any(verdict is None for verdict in verdicts):
+            unresolved.append((doc_id, "invalid/missing verdict in audit history"))
+            continue
+        # 3) frozen-lot evidence binding (only still relevant for docs that
+        #    have not already failed).
+        if lot_by_id:
+            current = (staged_records_by_doc or {}).get(doc_id)
+            frozen_sha = lot_by_id[doc_id].get("staged_record_sha256")
+            if staged_records_by_doc is None:
+                unresolved.append(
+                    (doc_id, "current staged records not supplied for frozen-sha check")
+                )
+                continue
+            if current is None:
+                unresolved.append(
+                    (
+                        doc_id,
+                        "staging record missing after sampling (promotion consumes "
+                        "staged rows; omission checks must run BEFORE promote)",
+                    )
+                )
+                continue
+            if frozen_sha != staged_record_sha256(current):
+                unresolved.append(
+                    (doc_id, "recipe/staged-record changed after sampling")
+                )
+                continue
+        # 4) omission detection: row MULTISETS, only with ground truth.
         if ground_truth_dir is not None:
             gt_rows = load_ground_truth_rows(ground_truth_dir, doc_id)
             staged_rows = staged_rows_by_doc.get(doc_id)
-            if gt_rows is not None and staged_rows is not None:
-                if len(gt_rows) > len(staged_rows):
-                    failures.append(
-                        (
-                            doc_id,
-                            f"omission: ground-truth rows {len(gt_rows)} > "
-                            f"staged rows {len(staged_rows)}",
-                        )
+            if gt_rows is None:
+                unresolved.append((doc_id, "no ground-truth file for omission check"))
+                continue
+            if staged_rows is None:
+                unresolved.append((doc_id, "staged rows unavailable for omission check"))
+                continue
+            gt_counts = Counter(_normalize_row(row) for row in gt_rows)
+            staged_counts = Counter(_normalize_row(row) for row in staged_rows)
+            missing = gt_counts - staged_counts
+            invented = staged_counts - gt_counts
+            if missing or invented:
+                detail = {
+                    "missing": [list(t) for t in sorted(missing.elements())],
+                    "invented": [list(t) for t in sorted(invented.elements())],
+                }
+                omission_details[doc_id] = detail
+                if missing and len(gt_rows) > len(staged_rows):
+                    reason = (
+                        f"omission: ground-truth rows {len(gt_rows)} > "
+                        f"staged rows {len(staged_rows)}"
                     )
-                    continue
+                elif missing:
+                    reason = (
+                        "omission: staged rows missing ground-truth rows "
+                        f"{detail['missing']}"
+                    )
+                else:
+                    reason = (
+                        "invention: staged rows absent from ground truth "
+                        f"{detail['invented']}"
+                    )
+                failures.append((doc_id, reason))
+                continue
         if doc_id in promoted_doc_ids:
             clean.append(doc_id)
         else:
             passed_unpromoted.append(doc_id)
 
-    n = len(latest)
-    f = len(failures)
-    upper = binomial_upper_bound(f, n, confidence) if n else float("nan")
+    failed_ids = {doc_id for doc_id, _ in failures}
+    unresolved_ids = {doc_id for doc_id, _ in unresolved}
+    audited = len(failures) + len(clean) + len(passed_unpromoted)
+    failure_count = len(failures)
+    rate = (failure_count / audited) if audited else float("nan")
+    upper = (
+        binomial_upper_bound(failure_count, audited, confidence)
+        if audited
+        else float("nan")
+    )
+
+    complete = not unresolved and not outside_lot
+    if not complete:
+        budget_met = None
+    elif audited:
+        budget_met = bool(upper <= max_rate)
+    else:
+        budget_met = False
+
+    # Stratification honesty: per-stratum accounting + population-weighted
+    # pooling (weights = staged counts per year, frozen at sample time).
+    strata: list[dict] = []
+    pooled_rate = float("nan")
+    pooling_method = None
+    if lot is not None:
+        per_year: dict[int, list[str]] = {}
+        for doc_id in population:
+            per_year.setdefault(int(lot_by_id[doc_id].get("year") or 0), []).append(doc_id)
+        for year in sorted(per_year):
+            docs = per_year[year]
+            stratum_failures = sum(1 for d in docs if d in failed_ids)
+            stratum_unresolved = sum(1 for d in docs if d in unresolved_ids)
+            stratum_clean = sum(1 for d in docs if d in clean)
+            stratum_unpromoted = sum(1 for d in docs if d in passed_unpromoted)
+            stratum_resolved = stratum_failures + stratum_clean + stratum_unpromoted
+            strata.append(
+                {
+                    "year": year,
+                    "docs": len(docs),
+                    "resolved": stratum_resolved,
+                    "failures": stratum_failures,
+                    "unresolved": stratum_unresolved,
+                    "clean": stratum_clean,
+                    "passed_unpromoted": stratum_unpromoted,
+                    "rate": (
+                        (stratum_failures / stratum_resolved)
+                        if stratum_resolved
+                        else None
+                    ),
+                }
+            )
+        if strata:
+            if frame_counts_by_year:
+                pooled_rate, pooling_method = _weighted_pooled_rate(
+                    strata, frame_counts_by_year
+                )
+            else:
+                rates = [s["rate"] for s in strata if s["rate"] is not None]
+                if rates:
+                    pooled_rate = sum(rates) / len(rates)
+                pooling_method = (
+                    "unweighted-stratum mean (population weights unavailable)"
+                )
+
     return {
-        "audited": n,
+        "state": "complete" if complete else "incomplete",
+        "caveat": CAVEAT,
+        "lot_size": len(population),
+        "audited": audited,
         "failures": failures,
-        "failure_count": f,
+        "failure_count": failure_count,
         "clean": clean,
         "passed_unpromoted": passed_unpromoted,
-        "rate": (f / n) if n else float("nan"),
+        "unresolved": unresolved,
+        "unresolved_count": len(unresolved),
+        "unresolved_attempts": unresolved_attempts,
+        "repaired": repaired,
+        "repaired_count": len(repaired),
+        "outside_lot": outside_lot,
+        "omission_details": omission_details,
+        "rate": rate,
         "upper_bound": upper,
         "confidence": confidence,
         "max_rate": max_rate,
-        "budget_met": bool(n) and upper <= max_rate,
+        "budget_met": budget_met,
+        "strata": strata,
+        "pooled_rate": pooled_rate,
+        "pooling_method": pooling_method,
+    }
+
+
+def _num_or_none(value: float) -> float | None:
+    """JSON-safe number (NaN/inf -> None)."""
+    if value is None:
+        return None
+    try:
+        if math.isnan(value) or math.isinf(value):
+            return None
+    except TypeError:
+        return None
+    return value
+
+
+def _incomplete_state_payload(reason: str, *, max_rate: float, sample_file: str | None) -> dict:
+    return {
+        "schema": REPORT_STATE_SCHEMA,
+        "state": "incomplete",
+        "reason": reason,
+        "budget_met": None,
+        "lot_size": 0,
+        "audited": 0,
+        "failure_count": 0,
+        "unresolved_count": 0,
+        "unresolved": [],
+        "repaired_count": 0,
+        "rate": None,
+        "upper_bound": None,
+        "confidence": DEFAULT_CONFIDENCE,
+        "max_rate": max_rate,
+        "pooled_rate": None,
+        "pooling_method": None,
+        "sample_file": sample_file,
+        "caveat": CAVEAT,
+        "generated_at_utc": utc_now_iso(),
     }
 
 
 def cmd_report(args) -> int:
-    results = load_audit_results(args.data_dir)
+    root = staging_root(args.data_dir)
+    envelope, lot_error = load_sample_lot(args.data_dir, args.sample_file)
+
+    if envelope is None:
+        state_payload = _incomplete_state_payload(
+            lot_error, max_rate=args.max_rate, sample_file=None
+        )
+        _atomic_write_json(root / REPORT_STATE_NAME, state_payload)
+        print(CAVEAT)
+        print(f"INCOMPLETE AUDIT: {lot_error}")
+        print("budget_met cannot be computed; canonical promotion must not proceed.")
+        return 2
+
+    sample_file_name = Path(args.sample_file).name if args.sample_file else (
+        sorted((root).glob("audit-sample-*.json"))[-1].name
+    )
+    records = load_staging_records(args.data_dir)
+    staged_records_by_doc = {str(record["doc_id"]): record for _, record in records}
     staged_rows_by_doc = {
-        str(record["doc_id"]): list(record.get("rows", []))
-        for _, record in load_staging_records(args.data_dir)
+        doc_id: list(record.get("rows") or [])
+        for doc_id, record in staged_records_by_doc.items()
     }
     promoted = load_promoted_doc_ids(args.data_dir)
     report = build_report(
-        results,
+        load_audit_results(args.data_dir),
         staged_rows_by_doc,
         promoted,
         ground_truth_dir=args.ground_truth_dir,
         max_rate=args.max_rate,
+        lot=envelope["lot"],
+        staged_records_by_doc=staged_records_by_doc,
+        frame_counts_by_year=envelope.get("frame_counts_by_year"),
     )
+
     pct = lambda value: f"{value * 100:.4g}%"  # noqa: E731
-    print(f"Audited docs:              {report['audited']}")
-    print(f"Material failures:         {report['failure_count']}")
+
+    print(report["caveat"])
+    print(
+        f"Sample lot: {sample_file_name} "
+        f"(seed {envelope.get('seed')}, {report['lot_size']} docs, frozen at "
+        f"{envelope.get('created_at_utc')})"
+    )
+    print(PROMOTE_ORDER_NOTE)
+    if args.ground_truth_dir is None:
+        print(
+            "Omission checking DISABLED (--ground-truth-dir not provided); "
+            "pass-verdict docs are only pixel-checked, not row-checked."
+        )
+    print(f"Audited (resolved) docs:   {report['audited']} of lot {report['lot_size']}")
+    print(
+        f"Material failures:         {report['failure_count']} "
+        f"(sticky; repaired after fail: {report['repaired_count']})"
+    )
     for doc_id, reason in report["failures"]:
         print(f"  FAIL {doc_id}: {reason}")
+        if doc_id in report["repaired"]:
+            print(
+                f"       {doc_id}: a later pass was recorded (doc repaired) but "
+                "the original failure remains counted"
+            )
     print(f"Clean (pass+promoted):     {len(report['clean'])}")
     print(f"Passed but not promoted:   {len(report['passed_unpromoted'])}")
-    if report["audited"]:
+    if report["unresolved"]:
+        print(
+            f"INCOMPLETE AUDIT: {report['unresolved_count']} unresolved — "
+            "budget_met cannot be computed (fail-closed, never clean)"
+        )
+        for doc_id, reason in report["unresolved"]:
+            print(f"  UNRESOLVED {doc_id}: {reason}")
+    if report["outside_lot"]:
+        print(
+            f"WARNING: {len(report['outside_lot'])} verdict(s) recorded outside "
+            "the frozen sample lot; re-freeze the lot or investigate."
+        )
+        for doc_id in report["outside_lot"]:
+            print(f"  OUTSIDE-LOT {doc_id}")
+    for stratum in report["strata"]:
+        rate_text = (
+            pct(stratum["rate"]) if stratum["rate"] is not None else "n/a"
+        )
+        print(
+            f"  stratum {stratum['year']}: docs {stratum['docs']} "
+            f"resolved {stratum['resolved']} failures {stratum['failures']} "
+            f"unresolved {stratum['unresolved']} rate {rate_text}"
+        )
+    if report["strata"]:
+        pooled = report["pooled_rate"]
+        pooled_text = pct(pooled) if not math.isnan(pooled) else "n/a"
+        print(f"Pooled rate [{report['pooling_method']}]: {pooled_text}")
+    if report["state"] == "complete" and report["audited"]:
         print(f"Material-error rate:       {pct(report['rate'])}")
         print(
             f"One-sided exact {report['confidence']:.0%} upper bound: "
@@ -453,9 +1001,63 @@ def cmd_report(args) -> int:
                 "justified by this audit; sample more documents or fix "
                 "failures before promoting."
             )
-    else:
+    elif report["state"] == "complete":
         print("No audit results yet; record verdicts first.")
-    return 0
+
+    if report["state"] != "complete":
+        reason = f"{report['unresolved_count']} unresolved sampled docs"
+        if report["outside_lot"]:
+            reason += (
+                f"; {len(report['outside_lot'])} verdict(s) outside the frozen lot"
+            )
+        state_payload = {
+            "schema": REPORT_STATE_SCHEMA,
+            "state": "incomplete",
+            "reason": reason,
+            "budget_met": None,
+            "lot_size": report["lot_size"],
+            "audited": report["audited"],
+            "failure_count": report["failure_count"],
+            "unresolved_count": report["unresolved_count"],
+            "unresolved": [[d, r] for d, r in report["unresolved"]],
+            "repaired_count": report["repaired_count"],
+            "rate": _num_or_none(report["rate"]),
+            "upper_bound": _num_or_none(report["upper_bound"]),
+            "confidence": report["confidence"],
+            "max_rate": report["max_rate"],
+            "pooled_rate": _num_or_none(report["pooled_rate"]),
+            "pooling_method": report["pooling_method"],
+            "sample_file": sample_file_name,
+            "caveat": CAVEAT,
+            "generated_at_utc": utc_now_iso(),
+        }
+    else:
+        state_payload = {
+            "schema": REPORT_STATE_SCHEMA,
+            "state": "complete",
+            "reason": None,
+            "budget_met": report["budget_met"],
+            "lot_size": report["lot_size"],
+            "audited": report["audited"],
+            "failure_count": report["failure_count"],
+            "unresolved_count": 0,
+            "unresolved": [],
+            "repaired_count": report["repaired_count"],
+            "rate": _num_or_none(report["rate"]),
+            "upper_bound": _num_or_none(report["upper_bound"]),
+            "confidence": report["confidence"],
+            "max_rate": report["max_rate"],
+            "pooled_rate": _num_or_none(report["pooled_rate"]),
+            "pooling_method": report["pooling_method"],
+            "sample_file": sample_file_name,
+            "caveat": CAVEAT,
+            "generated_at_utc": utc_now_iso(),
+        }
+    _atomic_write_json(root / REPORT_STATE_NAME, state_payload)
+
+    if report["state"] != "complete":
+        return 2
+    return 0 if report["budget_met"] else 1
 
 
 # --------------------------------------------------------------------------
@@ -467,16 +1069,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="audit_sample.py",
         description=(
-            "Pixel audit for staged GLM OCR records: stratified sampling, "
-            "review bundle, verdict recording, and the exact binomial "
-            "material-error budget check (FP review 2026-10-18)."
+            "Pixel audit for staged GLM OCR records: frozen stratified "
+            "sampling, review bundle, append-only verdict history, and the "
+            "fail-closed exact binomial material-error budget check (FP "
+            "review 2026-10-18, finding 9)."
         ),
     )
     parser.add_argument("--data-dir", default="data", help="data directory (default: data)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     p_sample = subparsers.add_parser(
-        "sample", help="stratified random sample + pixel review bundle"
+        "sample", help="stratified random sample + frozen lot + pixel review bundle"
     )
     p_sample.add_argument("--per-year", type=int, default=25)
     p_sample.add_argument("--seed", type=int, default=20261018)
@@ -490,7 +1093,7 @@ def main(argv: list[str] | None = None) -> int:
     p_record.add_argument("--notes", default="")
 
     p_report = subparsers.add_parser(
-        "report", help="material-error rate + binomial budget check"
+        "report", help="material-error rate + binomial budget check (fail-closed)"
     )
     p_report.add_argument(
         "--max-rate",
@@ -501,8 +1104,14 @@ def main(argv: list[str] | None = None) -> int:
     p_report.add_argument(
         "--ground-truth-dir",
         default=None,
-        help="dir of <doc_id>.json ground-truth row files; omissions (more "
-        "ground-truth rows than staged rows) count as failures",
+        help="dir of <doc_id>.json ground-truth row files; omissions/inventions "
+        "(row-multiset differences) count as failures; pass-verdict docs "
+        "without ground truth count as UNRESOLVED",
+    )
+    p_report.add_argument(
+        "--sample-file",
+        default=None,
+        help="frozen-lot sample file (default: newest audit-sample-*.json)",
     )
 
     args = parser.parse_args(argv)

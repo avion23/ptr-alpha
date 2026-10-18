@@ -98,6 +98,7 @@ EXEMPT = {
     "src/analyzer/transaction_repository.py:TransactionRepository.replace_source_refresh": 3,  # Persistence/deduplication.
     "src/analyzer/transaction_repository.py:TransactionRepository.upsert": 4,  # Persistence/deduplication.
     "src/analyzer/transaction_repository.py:drop_already_stored": 1,  # Ingestion deduplication.
+    "src/analyzer/vision_engines.py:record_disagreement": 1,  # Ingestion retirement of disagreed dual-read rows.
 }
 
 

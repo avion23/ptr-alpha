@@ -16,6 +16,11 @@ import duckdb
 from pathlib import Path
 
 from analyzer.database import Database
+from analyzer.vision_engines import (
+    DualReadDoc,
+    dual_read_enabled,
+    run_dual_read_for_doc,
+)
 from scripts.gemini_ocr_common import (
     apply_verified_house_corrections,
     GEMINI_PARSER_VERSION,
@@ -224,6 +229,10 @@ def get_ocr_work_items(
     rows = conn.execute(
         """
         WITH deterministic AS (
+            -- Dual-read runs (parser_version v6-dual-validated, engines
+            -- 'gemini+%') intentionally count as deterministic recency here:
+            -- after an AGREE (success) or DISAGREE (invalid) decision the doc
+            -- must leave the OCR work list instead of being re-read nightly.
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY doc_id ORDER BY parsed_at DESC
             ) AS rn
@@ -1577,7 +1586,8 @@ def insert_transactions(
                           "OR LOWER(COALESCE(parser_version, '')) LIKE '%openrouter%' "
                           "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini/%' "
                           "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'openrouter/%' "
-                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%') "
+                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%' "
+                          "OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini+%') "
                           "AND status IN ('success', 'no_txs')",
                           [str(doc_id), ingestion_generation, artifact_sha256])
             conn.execute(
@@ -1606,6 +1616,7 @@ def insert_transactions(
                       OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini/%'
                       OR LOWER(COALESCE(engines_attempted, '')) LIKE 'openrouter/%'
                       OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gpt-%'
+                      OR LOWER(COALESCE(engines_attempted, '')) LIKE 'gemini+%'
                   )
                   AND status IN ('success', 'no_txs')
                 """,
@@ -1821,13 +1832,37 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
     for i, (doc_id, yr, path) in enumerate(remaining):
         print(f"\n[{i + 1}/{len(remaining)}] {doc_id} ({yr})...", flush=True)
         time.sleep(COOLDOWN)
-        output, error, artifact_metadata = call_gemini(
-            path,
-            doc_id=doc_id,
-            refresh=refresh,
-            cache_dir=os.path.join(data_dir, "gemini_cache"),
-            parser_version=GEMINI_PARSER_VERSION,
-        )
+        if dual_read_enabled():
+            # Opt-in dual vision read (DUAL_READ=1): engine A (Gemini) is
+            # gated against engine B per doc. AGREE/DISAGREE are persisted or
+            # quarantined by the orchestrator; engine-B absence falls through
+            # to the unchanged single-engine path below with A's result.
+            outcome = run_dual_read_for_doc(
+                DualReadDoc(str(doc_id), yr, path, data_dir=data_dir, db_path=db_path),
+                refresh=refresh,
+            )
+            total_inserted += outcome.inserted
+            if outcome.handled:
+                mark_progress(progress, doc_id, outcome.progress_key)
+                save_progress(progress, progress_path)
+                print(
+                    f"  DUAL {outcome.decision.status}: inserted={outcome.inserted}",
+                    flush=True,
+                )
+                continue
+            output, error, artifact_metadata = (
+                outcome.output,
+                outcome.error,
+                outcome.metadata,
+            )
+        else:
+            output, error, artifact_metadata = call_gemini(
+                path,
+                doc_id=doc_id,
+                refresh=refresh,
+                cache_dir=os.path.join(data_dir, "gemini_cache"),
+                parser_version=GEMINI_PARSER_VERSION,
+            )
         if is_quota_error(error):
             print("  Quota exhausted; stopping batch", flush=True)
             break

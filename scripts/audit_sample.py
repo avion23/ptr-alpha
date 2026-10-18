@@ -273,14 +273,37 @@ def build_sample(
 
     Deterministic: fresh ``random.Random(seed)``, doc ids sorted within each
     year, years visited in ascending order.
+
+    Asset-review oversampling (interface-audit item 3): records stamped
+    ``asset_review: true`` by the staging client (likely asset-text
+    normalization damage: missing-ticker, substring patterns) are drawn
+    FIRST within their stratum — all of them when they fit the quota,
+    ``rng.sample`` when they overflow it — and only the leftover slots are
+    filled from the unflagged docs. The lot stays stratified and
+    seed-deterministic; flagged docs get guaranteed representation so the
+    audit sees the risky docs instead of hoping to.
     """
     by_year = _sampling_frame(records)
+    flagged = {
+        str(record["doc_id"])
+        for _, record in records
+        if record.get("asset_review")
+    }
     rng = random.Random(seed)
     sample = []
     for year in sorted(by_year):
         doc_ids = sorted(set(by_year[year]))
-        chosen = rng.sample(doc_ids, min(per_year, len(doc_ids)))
-        sample.extend({"doc_id": doc_id, "year": year} for doc_id in sorted(chosen))
+        flag_here = [d for d in doc_ids if d in flagged]
+        plain = [d for d in doc_ids if d not in flagged]
+        chosen: list[str] = []
+        if flag_here:
+            chosen.extend(rng.sample(flag_here, min(per_year, len(flag_here))))
+        slots = per_year - len(chosen)
+        if slots > 0 and plain:
+            chosen.extend(rng.sample(plain, min(slots, len(plain))))
+        sample.extend(
+            {"doc_id": doc_id, "year": year} for doc_id in sorted(chosen)
+        )
     return sample
 
 
@@ -310,6 +333,7 @@ def freeze_lot(
                     "model": None,
                     "prompt_sha256": None,
                     "parser_version": None,
+                    "asset_review": None,
                 }
             )
             continue
@@ -322,6 +346,7 @@ def freeze_lot(
                 "model": record.get("model"),
                 "prompt_sha256": record.get("prompt_sha256"),
                 "parser_version": record.get("parser_version"),
+                "asset_review": bool(record.get("asset_review")),
             }
         )
     return lot
@@ -421,11 +446,21 @@ def cmd_sample(args) -> int:
         if not args.no_bundle
         else []
     )
+    flagged_in_lot = sum(
+        1
+        for item in envelope["lot"]
+        if item.get("asset_review")
+    )
     print(
         f"Sampled {len(sample)} docs -> {out_path} "
         f"(frozen lot: staged-record sha256 + model/prompt/parser at sample "
         f"time; the report refuses docs whose record changed after sampling)"
     )
+    if flagged_in_lot:
+        print(
+            f"  asset_review docs drawn first: {flagged_in_lot} "
+            "(flagged at staging: likely asset-text normalization damage)"
+        )
     for item in envelope["lot"]:
         print(f"  {item['year']}/{item['doc_id']} sha={item['staged_record_sha256'][:12]}")
     for problem in problems:

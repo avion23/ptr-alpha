@@ -511,6 +511,47 @@ def test_freeze_lot_is_deterministic(data_dir):
     )
 
 
+def test_sample_draws_asset_review_docs_first(data_dir):
+    """Flagged docs get guaranteed representation; plain fill the rest."""
+    for i in range(6):
+        rec = make_record(f"r{i}", year=2017)
+        rec["asset_review"] = i in (2, 5)  # exactly two flagged
+        write_record(data_dir, rec)
+    records = audit_sample.load_staging_records(data_dir)
+    sample = audit_sample.build_sample(records, per_year=3, seed=11)
+    chosen = {item["doc_id"] for item in sample}
+    assert {"r2", "r5"} <= chosen          # both flagged drawn first
+    assert len(chosen & {"r0", "r1", "r3", "r4"}) == 1  # one plain slot
+    # Same seed reproduces exactly (stays seed-deterministic).
+    again = audit_sample.build_sample(records, per_year=3, seed=11)
+    assert [i["doc_id"] for i in again] == [i["doc_id"] for i in sample]
+
+
+def test_sample_flagged_overflow_fills_quota_from_flagged(data_dir):
+    """More flagged than slots: the whole quota comes from flagged docs."""
+    for i in range(5):
+        rec = make_record(f"f{i}", year=2017)
+        rec["asset_review"] = i >= 1  # four flagged of five
+        write_record(data_dir, rec)
+    records = audit_sample.load_staging_records(data_dir)
+    sample = audit_sample.build_sample(records, per_year=2, seed=3)
+    chosen = {item["doc_id"] for item in sample}
+    assert len(chosen) == 2
+    assert chosen <= {"f1", "f2", "f3", "f4"}  # never the unflagged doc
+
+
+def test_freeze_lot_carries_asset_review_flag(data_dir):
+    flagged = make_record("flg", year=2017)
+    flagged["asset_review"] = True
+    write_record(data_dir, flagged)
+    write_record(data_dir, make_record("ok", year=2017))
+    records = audit_sample.load_staging_records(data_dir)
+    sample = audit_sample.build_sample(records, per_year=2, seed=5)
+    lot = audit_sample.freeze_lot(records, sample)
+    flags = {entry["doc_id"]: entry["asset_review"] for entry in lot}
+    assert flags == {"flg": True, "ok": False}
+
+
 # --------------------------------------------------------------------------
 # CLI: refusal exit codes + audit-report-state.json contract
 # --------------------------------------------------------------------------

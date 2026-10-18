@@ -29,7 +29,8 @@ from analyzer.freshness import end_to_end_checks  # noqa: E402
 CANONICAL = Path(os.environ.get("DOCTOR_CANONICAL", str(REPO / "data" / "congress.duckdb")))
 RECEIPTS = REPO / "data" / "recommendations" / "receipts.log"
 PRICES_CRON = REPO / "data" / "logs" / "prices-cron"
-GEMINI_STAGING = REPO / "data" / ".staging" / "rescrape"
+GEMINI_STAGING = REPO / "data" / ".staging" / "rescrape"  # active staging only
+GEMINI_ARCHIVE = REPO / "data" / "archive"  # retired roots: kept, never flagged
 HEARTBEAT = Path(
     os.environ.get("DOCTOR_HEARTBEAT", str(REPO / "data" / "alerts" / "doctor-last-run"))
 )

@@ -412,6 +412,130 @@ def refresh_prices(
     )
 
 
+def merge_temp_into_canonical(
+    temp_db: Path,
+    canonical_db: Path,
+    eligible: list[str],
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """Additively promote refreshed prices/dividends into the canonical DB.
+
+    Only rows for tickers eligible in THIS refresh are considered, and only
+    (ticker, date) / (ticker, ex_date) keys absent from canonical are
+    inserted: the merge can add coverage but never overwrites or deletes a
+    canonical row. Idempotent — merging the same temp database twice changes
+    nothing (the second run inserts zero rows).
+    """
+    from analyzer.database import Database
+
+    canonical_db = Path(canonical_db)
+    if not canonical_db.exists():
+        raise FileNotFoundError(f"canonical database not found: {canonical_db}")
+    if canonical_db.resolve() == Path(temp_db).resolve():
+        raise ValueError("merge source and target must be different files")
+
+    canon = Database(canonical_db, read_only=dry_run)
+    try:
+        con = canon.conn
+        con.execute(
+            "ATTACH ? AS merge_src (READ_ONLY)", [str(Path(temp_db).resolve())]
+        )
+        try:
+            con.execute("CREATE TEMP TABLE _merge_eligible (ticker VARCHAR)")
+            con.executemany(
+                "INSERT INTO _merge_eligible VALUES (?)",
+                [(t,) for t in sorted({str(t).strip().upper() for t in eligible})],
+            )
+            stats: dict = {}
+            con.execute("BEGIN TRANSACTION")
+            try:
+                stats["price_candidates"] = int(
+                    con.execute(
+                        """
+                        SELECT COUNT(*) FROM merge_src.prices s
+                        JOIN _merge_eligible e USING (ticker)
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM prices p
+                            WHERE p.ticker = s.ticker AND p.date = s.date
+                        )
+                        """
+                    ).fetchone()[0]
+                )
+                if not dry_run and stats["price_candidates"]:
+                    con.execute(
+                        """
+                        INSERT INTO prices (ticker, date, close)
+                        SELECT s.ticker, s.date, s.close
+                        FROM merge_src.prices s
+                        JOIN _merge_eligible e USING (ticker)
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM prices p
+                            WHERE p.ticker = s.ticker AND p.date = s.date
+                        )
+                        """
+                    )
+                has_div = con.execute(
+                    "SELECT COUNT(*) FROM duckdb_tables() "
+                    "WHERE database_name='merge_src' AND table_name='dividends'"
+                ).fetchone()[0]
+                stats["dividend_candidates"] = 0
+                if has_div:
+                    stats["dividend_candidates"] = int(
+                        con.execute(
+                            """
+                            SELECT COUNT(*) FROM (
+                                SELECT DISTINCT ticker, ex_date
+                                FROM merge_src.dividends
+                            ) s
+                            JOIN _merge_eligible e USING (ticker)
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM dividends d
+                                WHERE d.ticker = s.ticker AND d.ex_date = s.ex_date
+                            )
+                            """
+                        ).fetchone()[0]
+                    )
+                    if not dry_run and stats["dividend_candidates"]:
+                        con.execute(
+                            """
+                            INSERT INTO dividends (ticker, ex_date, cash_amount)
+                            SELECT s.ticker, s.ex_date, s.cash_amount
+                            FROM (
+                                SELECT ticker, ex_date,
+                                       MAX(cash_amount) AS cash_amount
+                                FROM merge_src.dividends
+                                GROUP BY ticker, ex_date
+                            ) s
+                            JOIN _merge_eligible e USING (ticker)
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM dividends d
+                                WHERE d.ticker = s.ticker AND d.ex_date = s.ex_date
+                            )
+                            """
+                        )
+                if dry_run:
+                    con.execute("ROLLBACK")
+                else:
+                    con.execute("COMMIT")
+            except Exception:
+                if not dry_run:
+                    con.execute("ROLLBACK")
+                raise
+            stats["prices_added"] = (
+                0 if dry_run else int(stats["price_candidates"])
+            )
+            stats["dividends_added"] = (
+                0 if dry_run else int(stats["dividend_candidates"])
+            )
+            stats["dry_run"] = bool(dry_run)
+            return stats
+        finally:
+            con.execute("DETACH merge_src")
+    finally:
+        canon.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Refresh eligible asset prices into a throwaway temp database"
@@ -443,8 +567,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip ex-div enrichment (e.g. when the provider throttles)",
     )
+    parser.add_argument(
+        "--merge-into",
+        type=Path,
+        default=None,
+        help=(
+            "after the refresh, additively promote the temp DB's prices and "
+            "dividends for the eligible universe into this canonical DB "
+            "(missing keys only; never overwrites or deletes)"
+        ),
+    )
+    parser.add_argument(
+        "--merge-dry-run",
+        action="store_true",
+        help="report what --merge-into would insert without writing",
+    )
     args = parser.parse_args(argv)
 
+    merge_stats: dict | None = None
     try:
         report = refresh_prices(
             args.source_db,
@@ -455,6 +595,13 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
             skip_dividends=args.skip_dividends,
         )
+        if args.merge_into is not None:
+            merge_stats = merge_temp_into_canonical(
+                args.db,
+                args.merge_into,
+                report.eligible_assets,
+                dry_run=args.merge_dry_run,
+            )
     except (ValueError, FileNotFoundError, FileExistsError) as exc:
         print(f"refresh failed: {exc}", file=sys.stderr)
         return 1
@@ -483,9 +630,20 @@ def main(argv: list[str] | None = None) -> int:
             + ", ".join(report.stale_tickers[:20])
             + ("..." if len(report.stale_tickers) > 20 else "")
         )
+    if merge_stats is not None:
+        verb = "would add" if merge_stats.get("dry_run") else "added"
+        print(
+            f"merge: {verb} prices={merge_stats['prices_added']} "
+            f"dividends={merge_stats['dividends_added']} "
+            f"(candidates {merge_stats['price_candidates']}/"
+            f"{merge_stats['dividend_candidates']}) into {args.merge_into}"
+        )
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(report.to_dict(), indent=2))
+        payload = report.to_dict()
+        if merge_stats is not None:
+            payload["merge"] = merge_stats
+        args.report.write_text(json.dumps(payload, indent=2))
         print(f"report: {args.report}")
     return 0
 

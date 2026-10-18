@@ -27,9 +27,10 @@ printf 'dual-read: DUAL_READ=%s engine_b_configured=%s\n' \
 cd "$repo"
 
 # Drain year-by-year into staging; quota exhaustion stops each year cleanly.
+# Z.AI subscription allows 2 concurrent vision streams.
 for year in 2017 2016 2015 2014 2013 2018; do
     printf '--- staging year %s ---\n' "$year"
-    timeout 10000 python3 scripts/glm_stage.py stage --year "$year" --limit 1500 \
+    timeout 10000 python3 scripts/glm_stage.py stage --year "$year" --limit 1500 --workers 2 \
         || printf 'year %s stage exit=%d (quota/timeout tolerated)\n' "$year" "$?"
 done
 

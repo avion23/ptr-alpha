@@ -314,8 +314,15 @@ def stage_batch(
     config: VisionBConfig | None = None,
     read_fn=None,
     cooldown: float = 0.0,
+    workers: int = 1,
 ) -> dict:
-    """Stage up to ``limit`` docs for ``year``. Quota stop is clean (no raise)."""
+    """Stage up to ``limit`` docs for ``year``. Quota stop is clean (no raise).
+
+    ``workers > 1`` reads docs concurrently (the GLM call is I/O-bound, so
+    threads overlap network latency); quota stop halts new submissions and
+    lets in-flight docs finish. Records are per-doc files, so no ordering or
+    locking beyond the counters is needed.
+    """
     if config is None and read_fn is None:
         config = VisionBConfig.from_env()
         if config is None:
@@ -329,9 +336,8 @@ def stage_batch(
     staged = errors = 0
     quota_stop = False
     remaining = 0
-    for index, doc_id in enumerate(candidates):
-        if cooldown and index:
-            time.sleep(cooldown)
+
+    def _stage_one(doc_id: str) -> str:
         record = build_staging_record(
             doc_id,
             year,
@@ -342,19 +348,91 @@ def stage_batch(
         if record["parse_status"] == "error" and is_quota_error(record["error"] or ""):
             # Quota exhaustion: not a doc defect. Write nothing, stop the
             # batch cleanly; the doc stays unstaged for the next run.
-            quota_stop = True
-            remaining = len(candidates) - index
-            break
+            return "quota"
         write_staging_record(data_dir, record)
         if record["parse_status"] == "error":
-            errors += 1
             print(f"  [{doc_id}] ERROR: {record['error']}", flush=True)
-        else:
-            staged += 1
-            print(
-                f"  [{doc_id}] {record['parse_status']} rows={len(record['rows'])}",
-                flush=True,
-            )
+            return "error"
+        print(
+            f"  [{doc_id}] {record['parse_status']} rows={len(record['rows'])}",
+            flush=True,
+        )
+        return "staged"
+
+    if workers <= 1:
+        for index, doc_id in enumerate(candidates):
+            if cooldown and index:
+                time.sleep(cooldown)
+            outcome = _stage_one(doc_id)
+            if outcome == "quota":
+                quota_stop = True
+                remaining = len(candidates) - index
+                break
+            if outcome == "error":
+                errors += 1
+            else:
+                staged += 1
+        return {
+            "year": year,
+            "candidates": len(candidates),
+            "staged": staged,
+            "errors": errors,
+            "quota_stop": quota_stop,
+            "remaining": remaining,
+        }
+
+    import threading
+    from concurrent.futures import (
+        FIRST_COMPLETED,
+        ThreadPoolExecutor,
+        wait as futures_wait,
+    )
+
+    lock = threading.Lock()
+    stop = threading.Event()
+    processed = 0
+
+    def _worker(doc_id: str, index: int) -> str:
+        if stop.is_set():
+            return "skipped"
+        if cooldown and index:
+            time.sleep(cooldown)
+        outcome = _stage_one(doc_id)
+        if outcome == "quota":
+            stop.set()
+        return outcome
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_worker, doc_id, index): index
+            for index, doc_id in enumerate(candidates)
+        }
+        pending = set(futures)
+        while pending:
+            done, pending = futures_wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                index = futures[fut]
+                try:
+                    outcome = fut.result()
+                except Exception as exc:  # a worker crash must not kill the batch
+                    outcome = "error"
+                    print(f"  worker crash at index {index}: {exc}", flush=True)
+                with lock:
+                    processed += 1
+                    if outcome == "error":
+                        errors += 1
+                    elif outcome == "staged":
+                        staged += 1
+                if outcome == "quota":
+                    quota_stop = True
+                    with lock:
+                        remaining = len(candidates) - processed
+                    for other in pending:
+                        other.cancel()
+                    pending = {f for f in pending if not f.cancelled()}
+        if quota_stop:
+            with lock:
+                remaining = max(remaining, len(candidates) - processed)
     return {
         "year": year,
         "candidates": len(candidates),
@@ -610,6 +688,12 @@ def main(argv: list[str] | None = None) -> int:
     p_stage.add_argument(
         "--cooldown", type=float, default=CLI_COOLDOWN, help="seconds between docs"
     )
+    p_stage.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="concurrent vision reads (Z.AI subscription allows 2 streams)",
+    )
 
     p_promote = subparsers.add_parser(
         "promote", help="insert staged rows into canonical (consumes the record)"
@@ -643,6 +727,7 @@ def main(argv: list[str] | None = None) -> int:
                 data_dir=data_dir,
                 check_canonical=args.check_canonical,
                 cooldown=args.cooldown,
+                workers=max(1, args.workers),
             )
         except RuntimeError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

@@ -43,9 +43,9 @@ hallucination risk): it is fail-closed into the DISAGREE review inventory.
 Engine-B client failures are classified (FP review 2026-10-18 finding 7):
 
 * ``TransientVisionBError`` — 5xx, timeout/transport, malformed envelope,
-  and truncated completions (``finish_reason="length"``, rejected as
-  ``TruncatedCompletion``): retriable; ``scripts/glm_stage`` bounds the
-  retries (2, jittered backoff, cached page renders).
+  truncated completions (``finish_reason="length"``, rejected as
+  ``TruncatedCompletion``), and Google's rate-shaped HTTP 429s: retriable;
+  ``scripts/glm_stage`` bounds retries (2, jittered backoff, cached renders).
 * ``VisionBQuotaError`` — HTTP 429 / Z.AI error code 1302 / quota wording:
   never retried per-doc; callers stop the batch.
 * ``VisionBAuthError`` (401/403) and other ``VisionBPermanentError`` (400…)
@@ -68,6 +68,7 @@ import io
 import os
 from dataclasses import dataclass
 from typing import Callable, Mapping
+from urllib.parse import urlsplit
 
 import requests
 
@@ -140,6 +141,10 @@ class TransientVisionBError(VisionBUnavailable):
     envelope, or a truncated completion. ``scripts/glm_stage`` bounds the
     retries (2, jittered backoff, cached page renders) before recording an
     error; a later run may safely retry the document."""
+
+
+class GoogleVisionBRateLimitError(TransientVisionBError):
+    """Google's burst-shaped HTTP 429, retried with rate-limit backoff."""
 
 
 class TruncatedCompletion(TransientVisionBError):
@@ -288,10 +293,11 @@ def read_document_with_vision_b(
     ``max_tokens`` budget and a ``120s + 60s/page`` read-timeout (auto unless
     ``VISION_B_TIMEOUT`` pins it). Failures
     raise a classified ``VisionBUnavailable`` subclass: transport/timeout and
-    5xx are ``TransientVisionBError``; 429/1302/quota is
-    ``VisionBQuotaError``; 401/403 is ``VisionBAuthError``; other 4xx is
-    ``VisionBPermanentError``; non-``stop`` finish reasons are rejected
-    (``length`` as ``TruncatedCompletion``, ``sensitive`` /
+    5xx are ``TransientVisionBError``; Google rate-shaped 429s are transient
+    while other 429/1302/quota is ``VisionBQuotaError``; 401/403 is
+    ``VisionBAuthError``; other 4xx is ``VisionBPermanentError``;
+    non-``stop`` finish reasons are rejected (``length`` as
+    ``TruncatedCompletion``, ``sensitive`` /
     ``model_context_window_exceeded`` as permanent, others transient).
     Non-200 bodies travel (bounded to
     ``SNIPPET_LIMIT`` chars) inside the exception so classification survives.
@@ -343,7 +349,9 @@ def read_document_with_vision_b(
         ) from exc
     if response.status_code != 200:
         raise _classify_http_error(
-            response.status_code, _snippet(_response_body(response))
+            response.status_code,
+            _snippet(_response_body(response)),
+            base_url=config.base_url,
         )
     try:
         body = response.json()
@@ -398,7 +406,17 @@ def _response_body(response) -> str:
         return ""
 
 
-def _classify_http_error(status_code: int, snippet: str) -> VisionBUnavailable:
+def is_google_api_host(base_url: str | None) -> bool:
+    try:
+        host = (urlsplit(str(base_url or "")).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "googleapis.com" or host.endswith(".googleapis.com")
+
+
+def _classify_http_error(
+    status_code: int, snippet: str, *, base_url: str | None = None
+) -> VisionBUnavailable:
     """Map an HTTP failure onto the transient/stop/alert classification.
 
     Against docs.z.ai/api-reference/api-code (verified 2026-10-18):
@@ -413,6 +431,9 @@ def _classify_http_error(status_code: int, snippet: str) -> VisionBUnavailable:
     * 1309/1311/1314 (429, "package has expired" / plan does not include the
       model) never self-heal — classified as auth-shaped fatal defects so
       callers ALERT and stop instead of silently quota-stopping every night.
+    * Google-host 429s with rate/resource-exhaustion/quota-metric wording are
+      transient bursts; ``glm_stage`` applies minute backoff and a session
+      stop after repeated failures. Other hosts keep the quota-stop policy.
     * 1000-1005 (401) and 1220 (403) are credential defects; 1211/1261/1301
       (400) are request defects; 500/1200/1230/1234 (5xx) are transient.
     """
@@ -431,6 +452,22 @@ def _classify_http_error(status_code: int, snippet: str) -> VisionBUnavailable:
         # Subscription defect: alert + stop the batch (same handling as auth).
         return VisionBAuthError(
             f"visionb subscription defect (http {status_code}): {snippet}"
+        )
+    google_rate_shaped = any(
+        marker in lowered
+        for marker in (
+            "rate",
+            "per minute",
+            "per-minute",
+            "perday",
+            "per day",
+            "resource_exhausted",
+            "quota exceeded for quota metric",
+        )
+    )
+    if status_code == 429 and is_google_api_host(base_url) and google_rate_shaped:
+        return GoogleVisionBRateLimitError(
+            f"visionb Google rate limit transient (http 429): {snippet}"
         )
     quota_hit = status_code == 429 or "1302" in lowered or (
         "quota" in lowered
@@ -540,6 +577,7 @@ class DualDecision:
     output: str | None = None
     error: str | None = None
     metadata: object | None = None
+    error_kind: str | None = None  # stable classify_visionb_error() contract
 
 
 def dual_read(
@@ -625,6 +663,7 @@ def dual_read(
                 raw_row_count=raw_row_count,
                 diff_summary=str(exc),
                 metadata=metadata,
+                error_kind=classify_visionb_error(exc),
             ),
             [],
         )
@@ -751,7 +790,12 @@ def run_dual_read_for_doc(
         page_images=page_images,
     )
     if decision.status == UNRESOLVED:
-        if _gemini_common().is_quota_error(decision.diff_summary or ""):
+        quota_error = (
+            decision.error_kind == "quota"
+            if decision.error_kind is not None
+            else _gemini_common().is_quota_error(decision.diff_summary or "")
+        )
+        if quota_error:
             # Engine-B quota stop must end the caller's batch cleanly and
             # persist nothing: continuing would either drain ungated or
             # hammer a dead quota for every remaining doc.

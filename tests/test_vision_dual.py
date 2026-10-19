@@ -32,6 +32,7 @@ from analyzer.vision_engines import (
     DUAL_PARSER_VERSION,
     A_ERROR,
     GoogleVisionBRateLimitError,
+    GoogleVisionBServiceUnavailableError,
     UNRESOLVED,
     DualReadDoc,
     TransientVisionBError,
@@ -392,12 +393,40 @@ def test_google_rate_shaped_429_is_transient_not_a_quota_stop(monkeypatch):
     assert ve.classify_visionb_error(excinfo.value) == "transient"
 
 
+def test_google_503_is_transient_endpoint_saturation(monkeypatch):
+    from analyzer import vision_engines as ve
+
+    _mock_http_response(
+        monkeypatch, 503, "UNAVAILABLE: model currently experiencing high demand"
+    )
+    config = VisionBConfig(
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        model="gemini-3.1-flash-lite",
+    )
+
+    with pytest.raises(GoogleVisionBServiceUnavailableError) as excinfo:
+        read_document_with_vision_b([DATA_URL], config)
+
+    assert isinstance(excinfo.value, TransientVisionBError)
+    assert ve.classify_visionb_error(excinfo.value) == "transient"
+
+
 def test_zai_host_429_remains_a_quota_stop(monkeypatch):
     _mock_http_response(monkeypatch, 429, "Rate limit reached for requests")
     config = VisionBConfig(base_url="https://api.z.ai/v1", model="glm-5.3-flash")
 
     with pytest.raises(VisionBQuotaError):
         read_document_with_vision_b([DATA_URL], config)
+
+
+def test_zai_host_503_keeps_generic_transient_classification(monkeypatch):
+    _mock_http_response(monkeypatch, 503, "UNAVAILABLE: upstream busy")
+    config = VisionBConfig(base_url="https://api.z.ai/v1", model="glm-5.3-flash")
+
+    with pytest.raises(TransientVisionBError) as excinfo:
+        read_document_with_vision_b([DATA_URL], config)
+
+    assert type(excinfo.value) is TransientVisionBError
 
 
 @pytest.mark.parametrize(

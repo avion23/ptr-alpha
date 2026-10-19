@@ -44,7 +44,8 @@ Engine-B client failures are classified (FP review 2026-10-18 finding 7):
 
 * ``TransientVisionBError`` — 5xx, timeout/transport, malformed envelope,
   truncated completions (``finish_reason="length"``, rejected as
-  ``TruncatedCompletion``), and Google's rate-shaped HTTP 429s: retriable;
+  ``TruncatedCompletion``), and Google's rate-shaped HTTP 429s / HTTP 503s:
+  retriable;
   ``scripts/glm_stage`` bounds retries (2, jittered backoff, cached renders).
 * ``VisionBQuotaError`` — HTTP 429 / Z.AI error code 1302 / quota wording:
   never retried per-doc; callers stop the batch.
@@ -145,6 +146,10 @@ class TransientVisionBError(VisionBUnavailable):
 
 class GoogleVisionBRateLimitError(TransientVisionBError):
     """Google's burst-shaped HTTP 429, retried with rate-limit backoff."""
+
+
+class GoogleVisionBServiceUnavailableError(TransientVisionBError):
+    """Google-host HTTP 503, retried with endpoint-saturation backoff."""
 
 
 class TruncatedCompletion(TransientVisionBError):
@@ -293,9 +298,9 @@ def read_document_with_vision_b(
     ``max_tokens`` budget and a ``120s + 60s/page`` read-timeout (auto unless
     ``VISION_B_TIMEOUT`` pins it). Failures
     raise a classified ``VisionBUnavailable`` subclass: transport/timeout and
-    5xx are ``TransientVisionBError``; Google rate-shaped 429s are transient
-    while other 429/1302/quota is ``VisionBQuotaError``; 401/403 is
-    ``VisionBAuthError``; other 4xx is ``VisionBPermanentError``;
+    5xx are ``TransientVisionBError``; Google rate-shaped 429s and Google
+    503s are transient while other 429/1302/quota is ``VisionBQuotaError``;
+    401/403 is ``VisionBAuthError``; other 4xx is ``VisionBPermanentError``;
     non-``stop`` finish reasons are rejected (``length`` as
     ``TruncatedCompletion``, ``sensitive`` /
     ``model_context_window_exceeded`` as permanent, others transient).
@@ -431,14 +436,20 @@ def _classify_http_error(
     * 1309/1311/1314 (429, "package has expired" / plan does not include the
       model) never self-heal — classified as auth-shaped fatal defects so
       callers ALERT and stop instead of silently quota-stopping every night.
-    * Google-host 429s with rate/resource-exhaustion/quota-metric wording are
-      transient bursts; ``glm_stage`` applies minute backoff and a session
-      stop after repeated failures. Other hosts keep the quota-stop policy.
+    * Google-host 429s with rate/resource-exhaustion/quota-metric wording and
+      Google-host 503s are transient; ``glm_stage`` applies minute backoff and
+      a session stop after repeated failures. Other hosts keep their existing
+      classification and backoff behavior.
     * 1000-1005 (401) and 1220 (403) are credential defects; 1211/1261/1301
       (400) are request defects; 500/1200/1230/1234 (5xx) are transient.
     """
     lowered = snippet.lower()
     if "1305" in lowered or "temporarily overloaded" in lowered:
+        if status_code == 503 and is_google_api_host(base_url):
+            return GoogleVisionBServiceUnavailableError(
+                "visionb Google endpoint unavailable transient (http 503): "
+                f"{snippet}"
+            )
         return TransientVisionBError(
             f"visionb transient overload (http {status_code}): {snippet}"
         )
@@ -479,6 +490,11 @@ def _classify_http_error(
     if quota_hit:
         return VisionBQuotaError(
             f"visionb quota/rate-limit exhausted (http {status_code}): {snippet}"
+        )
+    if status_code == 503 and is_google_api_host(base_url):
+        return GoogleVisionBServiceUnavailableError(
+            "visionb Google endpoint unavailable transient (http 503): "
+            f"{snippet}"
         )
     if status_code in (401, 403):
         return VisionBAuthError(

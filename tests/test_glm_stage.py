@@ -18,6 +18,7 @@ import pytest
 
 from analyzer.vision_engines import (
     GoogleVisionBRateLimitError,
+    GoogleVisionBServiceUnavailableError,
     VisionBConfig,
     VisionBUnavailable,
 )
@@ -300,6 +301,71 @@ def test_google_429_retry_waits_at_least_one_minute(data_dir, monkeypatch):
     assert all(60 <= delay <= 90 for delay in sleeps)
 
 
+def test_google_503_uses_long_backoff_without_expanding_retry_budget(
+    data_dir, monkeypatch
+):
+    from analyzer import vision_engines as ve
+
+    seed_year(data_dir, 2024, ["busy"])
+    monkeypatch.setattr(glm_stage, "rasterize_page_data_urls", lambda *a: ["page"])
+
+    class _UnavailableResponse:
+        status_code = 503
+        text = "UNAVAILABLE: model currently experiencing high demand"
+
+    attempts = []
+    monkeypatch.setattr(
+        ve.requests,
+        "post",
+        lambda *args, **kwargs: (attempts.append(1) or _UnavailableResponse()),
+    )
+    sleeps = []
+    with pytest.raises(GoogleVisionBServiceUnavailableError):
+        glm_stage.read_document(
+            data_dir / "2024" / "pdfs" / "busy.pdf",
+            VisionBConfig(
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                model="gemini-3.1-flash-lite",
+            ),
+            sleep_fn=sleeps.append,
+            jitter_fn=lambda low, high: high,
+        )
+
+    assert len(attempts) == glm_stage.MAX_READ_RETRIES + 1 == 3
+    assert sleeps == [90.0, 90.0]
+
+
+def test_zai_503_keeps_short_transient_backoff(data_dir, monkeypatch):
+    from analyzer import vision_engines as ve
+    from analyzer.vision_engines import TransientVisionBError
+
+    seed_year(data_dir, 2024, ["zai-busy"])
+    monkeypatch.setattr(glm_stage, "rasterize_page_data_urls", lambda *a: ["page"])
+
+    class _UnavailableResponse:
+        status_code = 503
+        text = "UNAVAILABLE: upstream busy"
+
+    attempts = []
+    monkeypatch.setattr(
+        ve.requests,
+        "post",
+        lambda *args, **kwargs: (attempts.append(1) or _UnavailableResponse()),
+    )
+    sleeps = []
+    with pytest.raises(TransientVisionBError) as excinfo:
+        glm_stage.read_document(
+            data_dir / "2024" / "pdfs" / "zai-busy.pdf",
+            VisionBConfig(base_url="https://api.z.ai/v1", model="glm-5.3-flash"),
+            sleep_fn=sleeps.append,
+            jitter_fn=lambda low, high: 0.5,
+        )
+
+    assert type(excinfo.value) is TransientVisionBError
+    assert len(attempts) == glm_stage.MAX_READ_RETRIES + 1 == 3
+    assert sleeps == [2.5, 4.5]
+
+
 def test_google_429_streak_degrades_to_batch_stop(data_dir, monkeypatch, capsys):
     from analyzer import vision_engines as ve
 
@@ -344,6 +410,58 @@ def test_google_429_streak_degrades_to_batch_stop(data_dir, monkeypatch, capsys)
     monkeypatch.setattr(glm_stage, "stage_batch", lambda *a, **k: result)
     assert glm_stage.main(["--data-dir", str(data_dir), "stage", "--year", "2024"]) == 0
     assert "Google quota dead for the session" in capsys.readouterr().out
+
+
+def test_google_503_streak_stops_with_saturation_message(
+    data_dir, monkeypatch, capsys
+):
+    from analyzer import vision_engines as ve
+
+    doc_ids = [f"busy-{index}" for index in range(7)]
+    seed_year(data_dir, 2024, doc_ids)
+    monkeypatch.setattr(glm_stage, "rasterize_page_data_urls", lambda *a: ["page"])
+    monkeypatch.setattr(glm_stage, "time", SimpleNamespace(sleep=lambda _: None))
+
+    class _UnavailableResponse:
+        status_code = 503
+        text = "UNAVAILABLE: model currently experiencing high demand"
+
+    requests = []
+
+    def unavailable_post(*args, **kwargs):
+        requests.append(1)
+        return _UnavailableResponse()
+
+    monkeypatch.setattr(ve.requests, "post", unavailable_post)
+    config = VisionBConfig(
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        model="gemini-3.1-flash-lite",
+    )
+
+    result = glm_stage.stage_batch(2024, 10, data_dir=data_dir, config=config)
+
+    assert glm_stage.GOOGLE_503_CONSECUTIVE_STOP_THRESHOLD == 5
+    assert result["quota_stop"] is True
+    assert result["google_endpoint_saturated"] is True
+    assert result["google_quota_dead"] is False
+    assert result["remaining"] == 3
+    assert result["errors"] == 4
+    assert len(requests) == 5 * (glm_stage.MAX_READ_RETRIES + 1)
+    staged_dir = data_dir / "staging" / "glm-backlog" / "2024"
+    records = sorted(staged_dir.glob("*.json"))
+    assert [record.stem for record in records] == doc_ids[:4]
+    assert all(
+        glm_stage.load_staging_record(data_dir, 2024, doc_id)["error_kind"]
+        == "transient"
+        for doc_id in doc_ids[:4]
+    )
+
+    monkeypatch.setattr(glm_stage, "stage_batch", lambda *a, **k: result)
+    assert glm_stage.main(["--data-dir", str(data_dir), "stage", "--year", "2024"]) == 0
+    assert (
+        "google endpoint saturated — stopping cleanly; error records retry nightly"
+        in capsys.readouterr().out.lower()
+    )
 
 
 def test_transient_retries_exhaust_into_error_record_and_batch_continues(

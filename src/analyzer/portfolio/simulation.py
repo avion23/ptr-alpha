@@ -20,6 +20,7 @@ from analyzer.portfolio.kelly import (
     KellyConfig,
     build_kelly_portfolio,
 )
+from analyzer.price_repository import next_nyse_session, previous_nyse_session
 
 
 @dataclass(slots=True)
@@ -277,7 +278,12 @@ def simulate_portfolio_returns(
                 ticker=ticker,
                 shares=shares,
                 entry_date=current,
-                exit_target=current + pd.Timedelta(days=horizon),
+                # The holding-period exit is the last NYSE session on or before
+                # the calendar target, matching PortfolioSimulator. This date
+                # is fixed at entry, so its close is a planned same-session fill.
+                exit_target=previous_nyse_session(
+                    current + pd.Timedelta(days=horizon)
+                ),
                 raw_entry_price=raw_entry,
                 execution_cost=target,
             )
@@ -393,7 +399,8 @@ def _entry_schedule(
             continue
         series = prices[ticker].dropna()
         series = series[np.isfinite(series) & series.gt(0)]
-        eligible = series[series.index >= row["as_of_date"]]
+        expected_entry = next_nyse_session(row["as_of_date"])
+        eligible = series[series.index >= expected_entry]
         if eligible.empty:
             skipped += 1
             continue

@@ -18,11 +18,12 @@ Subcommands:
     vision endpoint through the existing ``analyzer.vision_engines`` client
     (shared PROMPT, never forked), parse with ``parse_gemini_output``, and
     write staging records. Transient endpoint failures (5xx, timeout,
-    transport, truncation) are retried in-process (2 retries, jittered
-    backoff, cached page renders) before an error record is written; quota
-    exhaustion stops the batch cleanly with exit 0; auth/config defects
-    alert and stop the batch with exit 1; per-doc failures never kill the
-    batch.
+    transport, truncation, Google rate-shaped 429s) are retried in-process
+    with cached page renders; Google 429s wait 60–90s between attempts.
+    Five consecutive rate-limited Google docs with no success degrade to a
+    clean batch stop so a dead daily quota cannot fill the manifest with
+    errors. Other quota exhaustion stops cleanly too; auth/config defects
+    alert and stop the batch with exit 1; per-doc failures never kill it.
 
     Population (FP review finding 8): ``--from-manifest PATH`` drains the
     AUTHORITATIVE unresolved-work selection exported by
@@ -86,6 +87,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -105,10 +107,12 @@ from scripts.gemini_ocr_common import (  # noqa: E402
     pdf_sha256,
 )
 from analyzer.vision_engines import (  # noqa: E402
+    GoogleVisionBRateLimitError,
     TransientVisionBError,
     VisionBConfig,
     VisionBUnavailable,
     classify_visionb_error,
+    is_google_api_host,
     read_document_with_vision_b,
 )
 from scripts.audit_sample import (  # noqa: E402
@@ -125,6 +129,11 @@ PROMOTED_JOURNAL_NAME = "promoted.jsonl"
 RENDER_DPI = 150
 MAX_READ_RETRIES = 2  # bounded in-process retries for transient failures
 BACKOFF_BASE_SECONDS = 2.0  # jittered exponential backoff base
+GOOGLE_429_RETRY_MIN_SECONDS = 60.0
+GOOGLE_429_RETRY_MAX_SECONDS = 90.0
+GOOGLE_429_CONSECUTIVE_STOP_THRESHOLD = 5
+# Five failed docs tolerate short bursts while stopping before likely daily
+# exhaustion can write transient error records across the rest of a manifest.
 MAX_WORKERS = 2  # Z.AI subscription allows 2 concurrent vision streams
 CLI_COOLDOWN = 3.0  # seconds between endpoint requests (mirrors ocr_zero_rows)
 MAX_RETAINED_ATTEMPTS = 3  # archived re-stage attempts kept per doc
@@ -328,9 +337,10 @@ def read_document(
     forked). Transient engine failures (``TransientVisionBError``: 5xx,
     timeout/transport, malformed envelope, truncated completion) are
     retried up to ``max_retries`` times with jittered exponential backoff,
-    reusing the SAME rendered page images. Quota errors stop immediately
-    (the batch stops); auth/config/permanent failures are raised untouched
-    (no retry — the same request would fail again).
+    reusing the SAME rendered page images. Google's rate-shaped 429s use a
+    60–90s jittered delay; other transient failures keep the shorter backoff.
+    Quota errors stop immediately; auth/config/permanent failures are raised
+    untouched (no retry — the same request would fail again).
 
     ``read_fn(pdf_path, page_count)`` replaces the render+read pair (tests,
     alternate engines); it gets the same bounded retries.
@@ -355,10 +365,22 @@ def read_document(
     for attempt in range(max_retries + 1):
         try:
             return _attempt()
-        except TransientVisionBError:
+        except TransientVisionBError as exc:
             if attempt >= max_retries:
                 raise
-            sleep_fn(backoff_seconds * (2 ** attempt) + jitter_fn(0.0, 1.0))
+            if isinstance(exc, GoogleVisionBRateLimitError):
+                delay = GOOGLE_429_RETRY_MIN_SECONDS + jitter_fn(
+                    0.0,
+                    GOOGLE_429_RETRY_MAX_SECONDS - GOOGLE_429_RETRY_MIN_SECONDS,
+                )
+                sleep_fn(
+                    min(
+                        max(delay, GOOGLE_429_RETRY_MIN_SECONDS),
+                        GOOGLE_429_RETRY_MAX_SECONDS,
+                    )
+                )
+            else:
+                sleep_fn(backoff_seconds * (2 ** attempt) + jitter_fn(0.0, 1.0))
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
@@ -661,10 +683,11 @@ def stage_batch(
 ) -> dict:
     """Stage up to ``limit`` docs for ``year``. Never raises for endpoint states.
 
-    Batch-wide stops: quota exhaustion (``quota_stop``, clean, exit 0 — the
-    doc stays unstaged for the next run) and auth/config defects
-    (``fatal_stop``, alerted — every remaining doc would fail the same way).
-    Per-doc failures never kill the batch.
+    Batch-wide stops: non-Google quota exhaustion and five consecutive
+    Google rate-shaped 429 docs (``quota_stop``, clean, exit 0 — the current
+    doc stays unstaged), and auth/config defects (``fatal_stop``, alerted —
+    every remaining doc would fail the same way). A successful/no_txs doc
+    resets the Google streak; ordinary per-doc failures do not.
 
     ``workers`` reads docs concurrently (the GLM call is I/O-bound, so
     threads overlap network latency); a batch-wide stop halts new
@@ -718,10 +741,17 @@ def stage_batch(
             print(f"  {note}", flush=True)
     staged = errors = 0
     quota_stop = False
+    google_quota_dead = False
     fatal_stop = False
     remaining = 0
+    consecutive_google_429s = 0
+    batch_state_lock = threading.Lock()
+    stop = threading.Event()
 
     def _stage_one(doc_id: str) -> str:
+        nonlocal consecutive_google_429s, google_quota_dead
+        if stop.is_set():
+            return "skipped"
         record = build_staging_record(
             doc_id,
             year,
@@ -730,8 +760,15 @@ def stage_batch(
             read_fn=read_fn,
         )
         error = record.get("error") or ""
+        google_rate_limited = bool(
+            config is not None
+            and is_google_api_host(config.base_url)
+            and record.get("error_kind") == "transient"
+            and "google rate limit transient (http 429)" in error.lower()
+        )
         if record["parse_status"] == "error" and (
-            record.get("error_kind") == "quota" or is_quota_error(error)
+            record.get("error_kind") == "quota"
+            or (is_quota_error(error) and not google_rate_limited)
         ):
             # Quota exhaustion: not a doc defect. Write nothing, stop the
             # batch cleanly; the doc stays unstaged for the next run.
@@ -748,6 +785,19 @@ def stage_batch(
                 flush=True,
             )
             return "fatal"
+        with batch_state_lock:
+            if stop.is_set():
+                return "skipped"
+            if google_rate_limited:
+                consecutive_google_429s += 1
+                if consecutive_google_429s >= GOOGLE_429_CONSECUTIVE_STOP_THRESHOLD:
+                    # Five consecutive 429 docs exceed a short burst; stop
+                    # before daily-quota errors can fill the manifest.
+                    google_quota_dead = True
+                    stop.set()
+                    return "google_quota_dead"
+            elif record["parse_status"] in ("success", "no_txs"):
+                consecutive_google_429s = 0
         archived = archive_current_attempt(data_dir, year, doc_id)
         if archived is not None:
             print(
@@ -770,7 +820,7 @@ def stage_batch(
             if cooldown and index:
                 time.sleep(cooldown)
             outcome = _stage_one(doc_id)
-            if outcome == "quota":
+            if outcome in ("quota", "google_quota_dead"):
                 quota_stop = True
                 remaining = len(candidates) - index
                 break
@@ -788,12 +838,12 @@ def stage_batch(
             "staged": staged,
             "errors": errors,
             "quota_stop": quota_stop,
+            "google_quota_dead": google_quota_dead,
             "fatal_stop": fatal_stop,
             "remaining": remaining,
             "missing_pdfs": missing_pdfs,
         }
 
-    import threading
     from concurrent.futures import (
         FIRST_COMPLETED,
         ThreadPoolExecutor,
@@ -801,7 +851,6 @@ def stage_batch(
     )
 
     lock = threading.Lock()
-    stop = threading.Event()
     processed = 0
 
     def _worker(doc_id: str, index: int) -> str:
@@ -810,7 +859,7 @@ def stage_batch(
         if cooldown and index:
             time.sleep(cooldown)
         outcome = _stage_one(doc_id)
-        if outcome in ("quota", "fatal"):
+        if outcome in ("quota", "google_quota_dead", "fatal"):
             stop.set()
         return outcome
 
@@ -835,11 +884,13 @@ def stage_batch(
                         errors += 1
                     elif outcome == "staged":
                         staged += 1
-                if outcome in ("quota", "fatal"):
+                if outcome in ("quota", "google_quota_dead", "fatal"):
                     with lock:
                         remaining = len(candidates) - processed
-                        if outcome == "quota":
+                        if outcome in ("quota", "google_quota_dead"):
                             quota_stop = True
+                            if outcome == "google_quota_dead":
+                                google_quota_dead = True
                         else:
                             fatal_stop = True
                     for other in pending:
@@ -854,6 +905,7 @@ def stage_batch(
         "staged": staged,
         "errors": errors,
         "quota_stop": quota_stop,
+        "google_quota_dead": google_quota_dead,
         "fatal_stop": fatal_stop,
         "remaining": remaining,
         "missing_pdfs": missing_pdfs,
@@ -1525,10 +1577,16 @@ def main(argv: list[str] | None = None) -> int:
             f"errors={result['errors']} ==="
         )
         if result["quota_stop"]:
-            print(
-                f"Quota exhausted; stopping batch cleanly. "
-                f"Remaining unstaged candidates: {result['remaining']}"
-            )
+            if result.get("google_quota_dead"):
+                print(
+                    "Google quota dead for the session; stopping batch cleanly. "
+                    f"Remaining unstaged candidates: {result['remaining']}"
+                )
+            else:
+                print(
+                    f"Quota exhausted; stopping batch cleanly. "
+                    f"Remaining unstaged candidates: {result['remaining']}"
+                )
         if result.get("fatal_stop"):
             print(
                 "ALERT: auth/config defect stopped the batch; fix the GLM "

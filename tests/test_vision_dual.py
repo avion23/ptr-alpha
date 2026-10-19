@@ -31,6 +31,7 @@ from analyzer.vision_engines import (
     DUAL_ENGINES_ATTEMPTED,
     DUAL_PARSER_VERSION,
     A_ERROR,
+    GoogleVisionBRateLimitError,
     UNRESOLVED,
     DualReadDoc,
     TransientVisionBError,
@@ -212,6 +213,18 @@ def _env(server, timeout=None):
     return env
 
 
+def _mock_http_response(monkeypatch, status, body):
+    from analyzer import vision_engines
+
+    class _Response:
+        status_code = status
+        text = body
+
+    monkeypatch.setattr(
+        vision_engines.requests, "post", lambda *args, **kwargs: _Response()
+    )
+
+
 def _dead_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -355,6 +368,64 @@ def test_vision_b_http_429_and_zai_1302_are_quota_stops(vision_b_server):
         read_document_with_vision_b(
             [DATA_URL], VisionBConfig.from_env(_env(server1302))
         )
+
+
+def test_google_rate_shaped_429_is_transient_not_a_quota_stop(monkeypatch):
+    from analyzer import vision_engines as ve
+
+    _mock_http_response(
+        monkeypatch,
+        429,
+        '{"error":{"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded '
+        'for quota metric GenerateContentRequestsPerDay; per minute limit"}}',
+    )
+    config = VisionBConfig(
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        model="gemini-3-flash-preview",
+    )
+
+    with pytest.raises(GoogleVisionBRateLimitError) as excinfo:
+        read_document_with_vision_b([DATA_URL], config)
+
+    assert isinstance(excinfo.value, TransientVisionBError)
+    assert not isinstance(excinfo.value, VisionBQuotaError)
+    assert ve.classify_visionb_error(excinfo.value) == "transient"
+
+
+def test_zai_host_429_remains_a_quota_stop(monkeypatch):
+    _mock_http_response(monkeypatch, 429, "Rate limit reached for requests")
+    config = VisionBConfig(base_url="https://api.z.ai/v1", model="glm-5.3-flash")
+
+    with pytest.raises(VisionBQuotaError):
+        read_document_with_vision_b([DATA_URL], config)
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "exception"),
+    [
+        (401, "invalid API key", VisionBAuthError),
+        (403, "permission denied", VisionBAuthError),
+        (500, "Internal Server Error", TransientVisionBError),
+    ],
+)
+def test_google_non_429_http_classification_is_unchanged(
+    monkeypatch, status, body, exception
+):
+    from analyzer import vision_engines as ve
+
+    _mock_http_response(monkeypatch, status, body)
+    config = VisionBConfig(
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        model="gemini-3-flash-preview",
+    )
+
+    with pytest.raises(exception) as excinfo:
+        read_document_with_vision_b([DATA_URL], config)
+
+    assert ve.classify_visionb_error(excinfo.value) in {
+        "auth",
+        "transient",
+    }
 
 
 def test_vision_b_http_401_is_auth_and_400_is_permanent(vision_b_server):
@@ -977,6 +1048,33 @@ def test_dual_read_engine_b_quota_stops_without_persisting(tmp_path):
         assert conn.execute(
             "SELECT COUNT(*) FROM pdf_parse_runs WHERE doc_id = 'dual-doc'"
         ).fetchone()[0] == 0
+
+
+def test_dual_read_google_rate_limit_lands_retry_state(tmp_path):
+    _seed_db(tmp_path)
+
+    def rate_limited_read_b(images):
+        raise GoogleVisionBRateLimitError(
+            "visionb Google rate limit transient (http 429): "
+            "RESOURCE_EXHAUSTED quota exceeded for quota metric"
+        )
+
+    outcome = run_dual_read_for_doc(
+        _doc(tmp_path),
+        env={},
+        read_a=_read_a(),
+        read_b=rate_limited_read_b,
+        page_images=_pages,
+    )
+
+    assert outcome.handled
+    assert outcome.decision.error_kind == "transient"
+    with duckdb.connect(str(Path(tmp_path) / "congress.duckdb")) as conn:
+        row = conn.execute(
+            "SELECT status, error_message FROM pdf_parse_runs WHERE doc_id = 'dual-doc'"
+        ).fetchone()
+    assert row[0] == "error"
+    assert "RESOURCE_EXHAUSTED" in row[1]
 
 
 def test_dual_run_classifies_as_gemini_ocr_source_family(tmp_path):

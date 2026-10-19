@@ -464,6 +464,12 @@ def test_eligible_events_maps_official_actor_sources_and_entry_reference():
         "source_record_id",
         "source_row_id",
         "entry_ref",
+        "filed_entry_ref",
+        "normalized_entry_ref",
+        "price_generation_id",
+        "comparability_status",
+        "comparability_reason",
+        "blocked_reason",
         "event_date",
         "disclosure_date",
         "corroboration",
@@ -475,7 +481,11 @@ def test_eligible_events_maps_official_actor_sources_and_entry_reference():
         "manager:EXAMPLE MANAGER",
         "congress:JANE DOE",
     ]
-    assert events["entry_ref"].iloc[0] == 150.0
+    assert pd.isna(events["entry_ref"].iloc[0])
+    assert events["filed_entry_ref"].iloc[0] == 150.0
+    assert pd.isna(events["normalized_entry_ref"].iloc[0])
+    assert events["comparability_status"].iloc[0] == "unknown"
+    assert events["blocked_reason"].iloc[0] == "price comparability unknown: filed price has no known adjusted-close factor for its generation"
     assert pd.isna(events["entry_ref"].iloc[1])
     assert events["corroboration"].tolist() == [False, True, False]
     assert events["as_of"].eq(as_of).all()

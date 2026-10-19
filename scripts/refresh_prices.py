@@ -45,6 +45,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import pandas as pd
+import numpy as np
 
 from analyzer.database import Database
 from analyzer.exceptions import DataSourceError
@@ -428,6 +429,15 @@ def merge_temp_into_canonical(
     nothing (the second run inserts zero rows).
     """
     from analyzer.database import Database
+    from analyzer.price_source import (
+        _set_generation_state,
+        _store_generation,
+        canonical_price_hash,
+        ensure_price_generation_schema,
+        price_generation_state,
+        price_generation_basis,
+        _all_ticker_values,
+    )
 
     canonical_db = Path(canonical_db)
     if not canonical_db.exists():
@@ -442,6 +452,8 @@ def merge_temp_into_canonical(
         attach_path = str(Path(temp_db).resolve()).replace("'", "''")
         con.execute(f"ATTACH '{attach_path}' AS merge_src (READ_ONLY)")
         try:
+            if not dry_run:
+                ensure_price_generation_schema(canon)
             con.execute("CREATE TEMP TABLE _merge_eligible (ticker VARCHAR)")
             con.executemany(
                 "INSERT INTO _merge_eligible VALUES (?)",
@@ -450,12 +462,112 @@ def merge_temp_into_canonical(
             stats: dict = {}
             con.execute("BEGIN TRANSACTION")
             try:
+                source_prices = con.execute(
+                    "SELECT s.ticker, s.date, s.close FROM merge_src.prices s "
+                    "JOIN _merge_eligible e USING (ticker) ORDER BY s.ticker,s.date"
+                ).fetchdf()
+                canonical_prices = con.execute(
+                    "SELECT p.ticker, p.date, p.close FROM prices p "
+                    "JOIN _merge_eligible e USING (ticker) ORDER BY p.ticker,p.date"
+                ).fetchdf()
+                source_has_state = int(con.execute(
+                    "SELECT COUNT(*) FROM duckdb_tables() "
+                    "WHERE database_name='merge_src' AND table_name='price_generation_state'"
+                ).fetchone()[0]) > 0
+                source_has_values = int(con.execute(
+                    "SELECT COUNT(*) FROM duckdb_tables() "
+                    "WHERE database_name='merge_src' AND table_name='price_generation_values'"
+                ).fetchone()[0]) > 0
+                source_states = {}
+                if source_has_state:
+                    source_states = {
+                        str(t): (str(g), str(status), reason)
+                        for t, g, status, reason in con.execute(
+                            "SELECT ticker,served_generation,comparability,reason "
+                            "FROM merge_src.price_generation_state"
+                        ).fetchall()
+                    }
+                conflicts = {}
+                unresolved = {}
+                old_series = {}
+                old_factors = {}
+                source_series = {}
+                source_factors = {}
+                source_generations = {}
+                tickers = sorted(source_prices.ticker.unique()) if not source_prices.empty else []
+                for ticker in tickers:
+                    new_rows = source_prices[source_prices.ticker == ticker]
+                    new = pd.Series(
+                        new_rows.close.to_numpy(dtype=float),
+                        index=pd.to_datetime(new_rows.date),
+                    )
+                    old_rows = canonical_prices[canonical_prices.ticker == ticker]
+                    old = pd.Series(
+                        old_rows.close.to_numpy(dtype=float),
+                        index=pd.to_datetime(old_rows.date),
+                    )
+                    old_series[ticker] = old
+                    old_state = price_generation_state(canon, ticker)
+                    old_factors[ticker] = _all_ticker_values(canon, ticker)[1]
+                    overlap = old.index.intersection(new.index)
+                    rel = (old.reindex(overlap) - new.reindex(overlap)).abs() / new.reindex(overlap).abs().replace(0, float("nan"))
+                    bad = rel > 0.001
+                    source_state = source_states.get(ticker)
+                    source_generation = source_state[0] if source_state else None
+                    source_status = source_state[1] if source_state else "comparable"
+                    if source_has_values and source_generation:
+                        action_rows = con.execute(
+                            "SELECT date,adjustment_factor FROM merge_src.price_generation_values "
+                            "WHERE ticker=? AND generation=?", [ticker, source_generation]
+                        ).fetchdf()
+                        factors = pd.Series(np.nan, index=new.index, dtype=float)
+                        if not action_rows.empty:
+                            action_rows.index = pd.to_datetime(action_rows.date)
+                            factors = pd.to_numeric(action_rows.adjustment_factor, errors="coerce").reindex(new.index)
+                    else:
+                        factors = pd.Series(np.nan, index=new.index, dtype=float)
+                    if source_generation is None:
+                        seed = canonical_price_hash(ticker, new, "refresh-unverified", "refresh")
+                        source_generation = f"refresh:{seed[:24]}"
+                    source_series[ticker] = new
+                    source_factors[ticker] = factors
+                    source_generations[ticker] = source_generation
+                    if source_status != "comparable":
+                        unresolved[ticker] = source_state[2] or "price comparability unknown: source generation is mixed"
+                    elif len(overlap) and bad.any():
+                        conflicts[ticker] = {
+                            "rows": int(bad.sum()),
+                            "max": float(rel.max()),
+                            "generation": source_generation,
+                            "base_generation": old_state.get("generation_id"),
+                            "base_reason": old_state.get("reason"),
+                        }
+                    elif not old.empty and not len(overlap):
+                        unresolved[ticker] = "price comparability unknown: no overlapping prices"
+                    elif old_state.get("alternate_generation"):
+                        unresolved[ticker] = old_state.get("reason") or "price comparability unknown: unresolved generations"
+                skip_tickers = sorted(set(conflicts) | set(unresolved))
+                con.execute("CREATE TEMP TABLE _merge_price_skip (ticker VARCHAR)")
+                if skip_tickers:
+                    con.executemany(
+                        "INSERT INTO _merge_price_skip VALUES (?)",
+                        [(t,) for t in skip_tickers],
+                    )
+                stats["price_conflict_tickers"] = len(conflicts)
+                stats["price_conflict_rows"] = sum(v["rows"] for v in conflicts.values())
+                stats["price_unknown_tickers"] = len(unresolved)
+                stats["max_relative_divergence"] = max(
+                    (v["max"] for v in conflicts.values()), default=0.0
+                )
                 stats["price_candidates"] = int(
                     con.execute(
                         """
                         SELECT COUNT(*) FROM merge_src.prices s
                         JOIN _merge_eligible e USING (ticker)
                         WHERE NOT EXISTS (
+                            SELECT 1 FROM _merge_price_skip x WHERE x.ticker=s.ticker
+                        )
+                        AND NOT EXISTS (
                             SELECT 1 FROM prices p
                             WHERE p.ticker = s.ticker AND p.date = s.date
                         )
@@ -470,11 +582,51 @@ def merge_temp_into_canonical(
                         FROM merge_src.prices s
                         JOIN _merge_eligible e USING (ticker)
                         WHERE NOT EXISTS (
+                            SELECT 1 FROM _merge_price_skip x WHERE x.ticker=s.ticker
+                        )
+                          AND NOT EXISTS (
                             SELECT 1 FROM prices p
                             WHERE p.ticker = s.ticker AND p.date = s.date
                         )
                         """
                     )
+                if not dry_run:
+                    for ticker in tickers:
+                        incoming = source_series[ticker]
+                        generation = source_generations[ticker]
+                        if ticker in conflicts or ticker in unresolved:
+                            old = old_series[ticker]
+                            base_generation = (
+                                conflicts.get(ticker, {}).get("base_generation")
+                                or price_generation_state(canon, ticker).get("generation_id")
+                            )
+                            if not old.empty and base_generation:
+                                _store_generation(
+                                    canon, ticker, base_generation, old,
+                                    old_factors[ticker],
+                                    price_generation_basis(canon, ticker, base_generation),
+                                )
+                            _store_generation(
+                                canon, ticker, generation, incoming,
+                                source_factors[ticker], "yfinance-adjusted-close-v1",
+                            )
+                            why = (
+                                f"price comparability unknown: {conflicts[ticker]['rows']} "
+                                f"overlaps exceed 0.1% (max {conflicts[ticker]['max']:.5%})"
+                                if ticker in conflicts else unresolved[ticker]
+                            )
+                            _set_generation_state(
+                                canon, ticker, base_generation, "unknown", generation, why
+                            )
+                            continue
+                        merged, factors = _all_ticker_values(canon, ticker)
+                        factors = factors.reindex(merged.index)
+                        factors.update(source_factors[ticker])
+                        _store_generation(
+                            canon, ticker, generation, merged, factors,
+                            "yfinance-adjusted-close-v1",
+                        )
+                        _set_generation_state(canon, ticker, generation, "comparable")
                 has_div = con.execute(
                     "SELECT COUNT(*) FROM duckdb_tables() "
                     "WHERE database_name='merge_src' AND table_name='dividends'"
@@ -558,15 +710,24 @@ def verify_consumption(
                 "INSERT INTO _verify_eligible VALUES (?)",
                 [(t,) for t in sorted({str(t).strip().upper() for t in eligible})],
             )
+            has_generation_state = int(con.execute(
+                "SELECT COUNT(*) FROM duckdb_tables() "
+                "WHERE table_name='price_generation_state'"
+            ).fetchone()[0]) > 0
+            unknown_exclusion = (
+                " AND NOT EXISTS (SELECT 1 FROM price_generation_state g "
+                "WHERE g.ticker=s.ticker AND g.comparability='unknown')"
+                if has_generation_state else ""
+            )
             missing = int(
                 con.execute(
-                    """
+                    f"""
                     SELECT COUNT(*) FROM verify_src.prices s
                     JOIN _verify_eligible e USING (ticker)
                     WHERE NOT EXISTS (
                         SELECT 1 FROM prices p
                         WHERE p.ticker = s.ticker AND p.date = s.date
-                    )
+                    ){unknown_exclusion}
                     """
                 ).fetchone()[0]
             )
@@ -708,7 +869,11 @@ def main(argv: list[str] | None = None) -> int:
             f"merge: {verb} prices={merge_stats['prices_added']} "
             f"dividends={merge_stats['dividends_added']} "
             f"(candidates {merge_stats['price_candidates']}/"
-            f"{merge_stats['dividend_candidates']}) into {args.merge_into}"
+            f"{merge_stats['dividend_candidates']}) into {args.merge_into}; "
+            f"price conflicts={merge_stats['price_conflict_tickers']} tickers/"
+            f"{merge_stats['price_conflict_rows']} rows, "
+            f"unknown={merge_stats['price_unknown_tickers']}, "
+            f"max divergence={merge_stats['max_relative_divergence']:.5%}"
         )
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)

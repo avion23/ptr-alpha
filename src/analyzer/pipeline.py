@@ -31,6 +31,7 @@ from analyzer.models import AnalysisMode, SourceCoverageState
 from analyzer.positions import entry_close, _EntryCloseLookup, _split_price_history
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
+from analyzer.price_source import price_adjustment_factor, price_generation_state
 from analyzer.ticker_resolver import TickerResolver
 
 logger = logging.getLogger(__name__)
@@ -318,6 +319,12 @@ def eligible_events(
         "source_record_id",
         "source_row_id",
         "entry_ref",
+        "filed_entry_ref",
+        "normalized_entry_ref",
+        "price_generation_id",
+        "comparability_status",
+        "comparability_reason",
+        "blocked_reason",
         "event_date",
         "disclosure_date",
         "corroboration",
@@ -378,10 +385,10 @@ def eligible_events(
     }
     closes: dict[str, pd.DataFrame] = {}
     prepared: dict[str, tuple] | None = None
+    symbols = sorted(
+        {str(value) for value in purchases["_resolved_symbol"].dropna().unique()}
+    )
     try:
-        symbols = sorted(
-            {str(value) for value in purchases["_resolved_symbol"].dropna().unique()}
-        )
         connection = getattr(db, "conn", None)
         if symbols and connection is not None:
             history = connection.execute(
@@ -401,6 +408,9 @@ def eligible_events(
     entry_lookup = _EntryCloseLookup(
         closes, decision_date.date(), prepared=prepared
     )
+    generation_states = {
+        symbol: price_generation_state(db, symbol) for symbol in symbols
+    }
 
     # Pure per-row date conversion repeats across rows; memoize per call.
     entry_day_cache: dict = {}
@@ -463,6 +473,12 @@ def eligible_events(
                 continue
 
             entry_ref = None
+            filed_entry_ref = None
+            normalized_entry_ref = None
+            generation = generation_states.get(str(symbol), {})
+            generation_id = generation.get("generation_id")
+            comparability_status = generation.get("comparability_status", "unknown")
+            comparability_reason = generation.get("reason")
             if source == "form4":
                 amount = pd.to_numeric(amount_cell, errors="coerce")
                 shares_match = (
@@ -473,9 +489,30 @@ def eligible_events(
                 if shares_match and pd.notna(amount):
                     shares = float(shares_match.group(1).replace(",", ""))
                     if shares > 0 and np.isfinite(amount):
-                        entry_ref = float(amount) / shares
+                        filed_entry_ref = float(amount) / shares
+                        factor = price_adjustment_factor(
+                            db, str(symbol), transaction_day, generation_id
+                        )
+                        if comparability_status == "comparable" and factor is not None:
+                            normalized_entry_ref = filed_entry_ref * factor
+                            entry_ref = normalized_entry_ref
+                        else:
+                            comparability_status = "unknown"
+                            comparability_reason = (
+                                "price comparability unknown: filed price has no "
+                                "known adjusted-close factor for its generation"
+                            )
             elif kind == "congress":
                 entry_ref = _congress_entry(symbol, transaction_day)
+                normalized_entry_ref = entry_ref
+                if comparability_status != "comparable":
+                    filed_entry_ref = entry_ref
+                    entry_ref = None
+                    normalized_entry_ref = None
+                    comparability_status = "unknown"
+                    comparability_reason = comparability_reason or (
+                        "price comparability unknown: price generation is not verified"
+                    )
 
             rows.append(
                 {
@@ -490,6 +527,16 @@ def eligible_events(
                     "source_record_id": _row_identity(record_id),
                     "source_row_id": _row_identity(row_id),
                     "entry_ref": entry_ref,
+                    "filed_entry_ref": filed_entry_ref,
+                    "normalized_entry_ref": normalized_entry_ref,
+                    "price_generation_id": generation_id,
+                    "comparability_status": comparability_status,
+                    "comparability_reason": comparability_reason,
+                    "blocked_reason": (
+                        comparability_reason
+                        if comparability_status != "comparable"
+                        else None
+                    ),
                     "event_date": pd.Timestamp(transaction_day).normalize(),
                     "disclosure_date": pd.Timestamp(disclosure_day).normalize(),
                     "corroboration": source == "13f",

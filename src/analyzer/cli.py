@@ -349,9 +349,9 @@ def _consensus_score_display(score: pd.DataFrame) -> pd.DataFrame:
 def _receipt_data_dir(app_ctx):
     """Data directory for decision receipts, or None when unresolvable.
 
-    Recording must never invent a write target: when the context carries no
-    real path (mocked smoke contexts), skip recording instead of scattering
-    files relative to the working directory.
+    Recording must never invent a write target. Callers treat an unresolvable
+    path as a terminal receipt-publication error instead of scattering files
+    relative to the working directory.
     """
     data = getattr(getattr(app_ctx, "settings", None), "data", None)
     data_dir = getattr(data, "data_dir", None)
@@ -396,10 +396,10 @@ def _run_ticker_mode(
         as_of_date = pd.Timestamp(
             params.as_of_date or min(date.today(), date(params.year, 12, 31))
         ).normalize().date()
-        # Same receipt writer as every other production decision boundary;
-        # failures are logged, never raised (never break trading).
         receipt_dir = _receipt_data_dir(app_ctx)
-        if receipt_dir is not None:
+        if receipt_dir is None:
+            _cli_exit(1, "Error: decision receipt data directory is unavailable")
+        try:
             record_ticker_decision_safely(
                 receipt_dir,
                 as_of_date,
@@ -416,6 +416,8 @@ def _run_ticker_mode(
                     "min_buyers": params.min_buyers,
                 },
             )
+        except Exception as exc:
+            _cli_exit(1, f"Error: decision receipt failed: {exc}")
         print(f"\n=== Buyers of {result.data['ticker']} ===")
         print(result.data["buyers"].to_string(index=False))
         print("\n=== Signal Score ===")
@@ -453,10 +455,10 @@ def _run_tickers_mode(
     if result.success and hasattr(result, "data") and result.data:
         from analyzer.decision_snapshot import record_ticker_decision_safely
 
-        # Same receipt writer as every other production decision boundary;
-        # failures are logged, never raised (never break trading).
         receipt_dir = _receipt_data_dir(app_ctx)
-        if receipt_dir is not None:
+        if receipt_dir is None:
+            _cli_exit(1, "Error: decision receipt data directory is unavailable")
+        try:
             record_ticker_decision_safely(
                 receipt_dir,
                 result.data["as_of_date"],
@@ -468,6 +470,8 @@ def _run_tickers_mode(
                 outputs={"result": result.data["result"]},
                 scope={"mode": "tickers", "year": params.year},
             )
+        except Exception as exc:
+            _cli_exit(1, f"Error: decision receipt failed: {exc}")
         data = result.data
         if not data["result"].empty:
             print(
@@ -1680,12 +1684,12 @@ def follow_member(
 def _ex_div_map(db, symbols: list[str], as_of_date) -> dict | None:
     """Known ex-dates per ticker inside the 7-day contamination window.
 
-    Returns None when the dividends table is absent (older databases):
-    missing rows mean unknown, never clean, and without the map the gate
-    stays off exactly as before.
+    An unavailable dividends table is represented as None, distinct from an
+    available table with no matching ex-dates; receipts record that source
+    state explicitly.
     """
     if not symbols:
-        return None
+        return {}
     try:
         rows = db.conn.execute(
             "SELECT ticker, ex_date FROM dividends "
@@ -1845,7 +1849,9 @@ def setups(
         if not candidate_frames:
             if record:
                 record_decision_safely(data_dir, as_of_date, pd.DataFrame(), {}, {},
-                                       watchlist_actor_ids(), scope=decision_scope)
+                                       watchlist_actor_ids(), scope=decision_scope,
+                                       ex_dividends={},
+                                       dividend_source="canonical_database.dividends")
             print("No candidates.")
             _cli_exit(0)
         candidates = pd.concat(candidate_frames, ignore_index=True)
@@ -1858,7 +1864,9 @@ def setups(
         if candidates.empty:
             if record:
                 record_decision_safely(data_dir, as_of_date, candidates, {}, {},
-                                       watchlist_actor_ids(), scope=decision_scope)
+                                       watchlist_actor_ids(), scope=decision_scope,
+                                       ex_dividends={},
+                                       dividend_source="canonical_database.dividends")
             print("No candidates.")
             _cli_exit(0)
 
@@ -1891,17 +1899,25 @@ def setups(
 
         weights = weights_for_candidates(db, candidates, as_of_date)
         decision_watchlist = watchlist_actor_ids()
+        ex_dividends = _ex_div_map(db, symbols, as_of_date)
         ranked, blocked = score_setups(
             candidates,
             weights,
             current_prices,
             watchlist=decision_watchlist,
-            ex_dividends=_ex_div_map(db, symbols, as_of_date),
+            ex_dividends=ex_dividends,
         )
         if record:
+            dividend_source = (
+                "canonical_database.dividends"
+                if ex_dividends is not None
+                else "canonical_database.dividends.unavailable"
+            )
             record_decision_safely(
                 data_dir, as_of_date, candidates, weights, current_prices,
                 decision_watchlist, ranked, blocked, scope=decision_scope,
+                ex_dividends=ex_dividends,
+                dividend_source=dividend_source,
             )
     except typer.Exit:
         raise

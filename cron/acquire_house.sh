@@ -33,7 +33,16 @@ timeout 10000 python3 -m analyzer.cli refresh --year "$year" --gemini-ocr
 rc=$?
 printf 'acquire-house done: exit=%d\n' "$rc"
 
+# Consumption/verification step: canonical health after the write
+# (house.ingestion.freshness watches exactly what this wrapper feeds).
+python3 scripts/doctor.py
+doctor_rc=$?
+printf 'doctor exit=%d\n' "$doctor_rc"
+
 # Prune to the last 7 run dirs.
 find "$log_root" -mindepth 1 -maxdepth 1 -type d -name '????????' |
     sort -r | tail -n +8 | xargs -r rm -rf --
-exit "$rc"
+if [ "$rc" -ne 0 ]; then
+    exit "$rc"
+fi
+exit "$doctor_rc"

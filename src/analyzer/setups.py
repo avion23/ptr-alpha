@@ -101,6 +101,7 @@ def score(
         quote = current_prices.get(ticker)
         quote_date = None
         stale_quote = False
+        future_quote = False
         if isinstance(quote, tuple):
             if len(quote) != 2:
                 current, stale_quote = None, True
@@ -131,6 +132,10 @@ def score(
             and max(decision_dates) - quote_date > timedelta(days=5)
         ):
             stale_quote = True
+        if quote_date is not None and any(
+            quote_date > decision_date for decision_date in decision_dates
+        ):
+            future_quote = True
         initiator_ids = {
             actor for actor, rows in actor_rows.items() if rows["initiators"]
         }
@@ -201,9 +206,13 @@ def score(
                     }
                 )
                 continue
-            if stale_quote:
+            if future_quote or stale_quote:
                 blocked_rows.append(
-                    {"ticker": ticker, "actor_id": actor_id, "reason": "stale quote"}
+                    {
+                        "ticker": ticker,
+                        "actor_id": actor_id,
+                        "reason": "future quote" if future_quote else "stale quote",
+                    }
                 )
                 continue
 
@@ -311,6 +320,7 @@ def score(
                 quote_date=str(quote_date) if quote_date else None,
                 quote_value=current,
                 stale_quote=stale_quote,
+                future_quote=future_quote,
                 ranking_gate=is_ranked(score_value, len(accepted), corroborated),
             )
         if accepted and not is_ranked(score_value, len(accepted), corroborated):

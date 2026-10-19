@@ -4,18 +4,22 @@ Phase 1 (skill): label members using only pre-2023 disclosures whose 90-day
 outcomes matured before each decision date. Skilled = mean excess > +3pp with
 >=5 unique episodes. Hyperactive = point-in-time breadth > 150.
 
-Phase 2 (cohorts): for each decision date, score every candidate-rich ticker
-with the production pipeline (eligible_events + holdings + score), enter at
-the NEXT NYSE session close after the decision date (executable, not the
-decision close), and measure 90d forward excess vs SPY from the same entry.
+Phase 2 (cohorts): score from point-in-time inputs and the last quote on or
+  before each decision date. Subsequent executable fills and forward outcomes
+  live in separate artifacts and never enter the scored snapshot.
 
 Usage:
   python3 scripts/backtest_assumptions.py skill --frame {disclosure,ingestion}
   python3 scripts/backtest_assumptions.py run 2023-01-15 --frame ingestion
+  python3 scripts/backtest_assumptions.py capture 2027-01-15 --frame ingestion
+  python3 scripts/backtest_assumptions.py attach-outcomes 2027-01-15 --frame ingestion
+  python3 scripts/backtest_assumptions.py analyze-capture 2027-01-15 --frame ingestion
   python3 scripts/backtest_assumptions.py analyze --frame disclosure
   python3 scripts/backtest_assumptions.py sweep --frame disclosure
   python3 scripts/backtest_assumptions.py full --frame ingestion
-run refuses sealed walk-forward block dates (unseal >= 2028-11-01) and degenerate frames (<50 events or <20 candidate tickers).
+run never rescores frozen walk-forward dates; capture is D+1 and outcomes/analysis
+remain sealed until 2028-11-01. Historical run refuses degenerate frames (<50
+events or <20 candidate tickers).
 --frame has no default anywhere: the frame is never implicit again. Ingestion
 replays the live canonical_as_of(decision) scope; disclosure replays today's
 complete database filtered by disclosure_date <= decision. Every artifact
@@ -99,6 +103,30 @@ def check_sealed(decision: date, today: date | None = None):
         )
 
 
+def check_capture_date(decision: date, today: date | None = None):
+    """Allow only a D+1, label-free capture for preregistered dates."""
+    if today is None:
+        today = date.today()
+    if decision not in WALK_FORWARD_BLOCK:
+        raise SystemExit(f"NOT A FROZEN DATE: {decision} is not in the walk-forward block")
+    if today != decision + timedelta(days=1):
+        raise SystemExit(
+            f"CAPTURE WINDOW: {decision} inputs must be captured on "
+            f"{decision + timedelta(days=1)} (today is {today})"
+        )
+
+
+def check_unsealed(today: date | None = None):
+    """Keep frozen outcomes and analysis sealed until the charter date."""
+    if today is None:
+        today = date.today()
+    if today < UNSEAL_AFTER:
+        raise SystemExit(
+            f"SEALED ANALYSIS: frozen outcomes remain sealed until "
+            f"{UNSEAL_AFTER}; analysis is not permitted before then"
+        )
+
+
 def check_frame(
     events_count: int,
     tickers_count: int,
@@ -149,14 +177,32 @@ def next_session_close(db, ticker: str, after: date):
     return (row[0], price)
 
 
+def decision_close(db, ticker: str, decision: date):
+    """Last usable close on or before the decision cutoff."""
+    row = db.conn.execute(
+        "SELECT date, close FROM prices WHERE ticker = ? AND date <= ?"
+        " AND close IS NOT NULL ORDER BY date DESC LIMIT 1",
+        [ticker, decision],
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        price = float(row[1])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return (row[0], price)
+
+
 def outcome_exit_date(entry_date: date) -> date:
     return previous_nyse_session(entry_date + timedelta(days=HORIZON)).date()
 
 
-def fwd_excess(db, ticker: str, entry_date: date, entry_px: float):
+def fwd_excess_with_reason(db, ticker: str, entry_date: date, entry_px: float):
     end = outcome_exit_date(entry_date)
     if end <= entry_date:
-        return None, None, None
+        return None, None, None, "invalid_outcome_window"
     out = db.conn.execute(
         "SELECT close FROM prices WHERE ticker = ? AND date = ?",
         [ticker, end],
@@ -170,21 +216,26 @@ def fwd_excess(db, ticker: str, entry_date: date, entry_px: float):
         "SELECT close FROM prices WHERE ticker = 'SPY' AND date = ?", [end]
     ).fetchone()
     if not out or not spy_in or not spy_out:
-        return None, None, None
+        return None, None, None, "outcome_price_unavailable"
     try:
         out_px, spy_in_px, spy_out_px = map(
             float, (out[0], spy_in[0], spy_out[0])
         )
     except (TypeError, ValueError):
-        return None, None, None
+        return None, None, None, "outcome_price_unavailable"
     if any(
         not math.isfinite(price) or price <= 0
         for price in (entry_px, out_px, spy_in_px, spy_out_px)
     ):
-        return None, None, None
+        return None, None, None, "invalid_outcome_price"
     ret = (out_px / entry_px - 1) * 100
     spy = (spy_out_px / spy_in_px - 1) * 100
-    return ret, spy, ret - spy
+    return ret, spy, ret - spy, None
+
+
+def fwd_excess(db, ticker: str, entry_date: date, entry_px: float):
+    ret, spy, excess, _ = fwd_excess_with_reason(db, ticker, entry_date, entry_px)
+    return ret, spy, excess
 
 
 def breadth_by_actor(
@@ -302,15 +353,23 @@ def cmd_skill(*, frame: str):
                 "breadth": breadth,
             }
         with (OUT_DIR / "skill.json").open("w") as output:
-            json.dump({"by_decision": by_decision}, output)
+            json.dump({"frame": frame, "by_decision": by_decision}, output)
         for decision, values in by_decision.items():
             print(decision, "skilled members:", len(values["labels"]), flush=True)
     finally:
         db.close()
 
 
-def cmd_run(decision: date, db=None, *, frame: str):
-    check_sealed(decision)
+def cmd_run(decision: date, db=None, *, frame: str, capture_only: bool = False):
+    if capture_only:
+        check_capture_date(decision)
+    else:
+        check_sealed(decision)
+        if decision in WALK_FORWARD_BLOCK:
+            raise SystemExit(
+                f"FROZEN INPUTS: {decision} must not be rescored; capture at D+1 "
+                "and attach outcomes only with attach-outcomes after unseal"
+            )
     if frame not in FRAMES:
         raise SystemExit(
             f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}"
@@ -319,43 +378,44 @@ def cmd_run(decision: date, db=None, *, frame: str):
     owns_db = db is None
     if owns_db:
         db = Database(DB_PATH, read_only=True)
-    # Ingestion frame: the live pipeline's view at end of the decision date.
-    # Disclosure frame: today's complete database, rows filtered by
-    # disclosure <= decision. Both go through the canonical as-of scope;
-    # eligible_events' inner scope must obey the same frame (frame_scope).
     scoped_as_of = date.today() if frame == "disclosure" else decision
     with closing(db) if owns_db else nullcontext(), db.canonical_as_of(scoped_as_of):
-        skill = json.loads((OUT_DIR / "skill.json").read_text())
-        point_in_time = skill["by_decision"][str(decision)]
-        skilled = set(point_in_time["labels"])
-        breadth = point_in_time["breadth"]
-        hyper = {actor for actor, count in breadth.items() if count > 150}
+        if capture_only:
+            skilled, hyper = set(), set()
+        else:
+            skill = json.loads((OUT_DIR / "skill.json").read_text())
+            if skill.get("frame") != frame:
+                raise SystemExit(
+                    f"skill.json frame {skill.get('frame')!r} does not match "
+                    f"requested frame {frame!r}; regenerate with skill --frame {frame}"
+                )
+            point_in_time = skill["by_decision"][str(decision)]
+            skilled = set(point_in_time["labels"])
+            hyper = {
+                actor for actor, count in point_in_time["breadth"].items()
+                if count > 150
+            }
         events_all = eligible_events(db, decision, frame_scope=scoped_as_of)
-        tickers = sorted(
-            events_all["ticker"].astype("string").str.upper().unique()
-        )
-        # Candidate-rich universe: >=2 distinct buyer events ever disclosed.
+        tickers = sorted(events_all["ticker"].astype("string").str.upper().unique())
         keep = []
-        for t in tickers:
+        for ticker in tickers:
             sub = events_all.loc[
-                events_all["ticker"].astype("string").str.upper() == t
+                events_all["ticker"].astype("string").str.upper() == ticker
             ]
             if sub["actor_id"].nunique() >= 2:
-                keep.append(t)
-        check_frame(len(events_all), len(keep), decision, frame)
+                keep.append(ticker)
+        if not capture_only:
+            check_frame(len(events_all), len(keep), decision, frame)
         print(decision, "tickers:", len(keep), flush=True)
         holdings_cache: dict = {}
 
         def holdings_for(member: str):
             if member not in holdings_cache:
-                holdings_cache[member] = holdings_candidates(
-                    db, member, decision
-                )
+                holdings_cache[member] = holdings_candidates(db, member, decision)
             return holdings_cache[member]
 
         watchlist = watchlist_actor_ids()
-        rows = []
-        actor_rows = []
+        rows, actor_rows, outcomes = [], [], []
         for i, symbol in enumerate(keep):
             events = events_all.loc[
                 events_all["ticker"].astype("string").str.upper() == symbol
@@ -363,14 +423,13 @@ def cmd_run(decision: date, db=None, *, frame: str):
             kinds: dict[str, str] = {}
             for actor_id in events["actor_id"].dropna():
                 text = str(actor_id)
-                if ":" not in text:
-                    continue
-                kind, _, name = text.partition(":")
-                if name:
-                    kinds.setdefault(name, kind)
+                if ":" in text:
+                    kind, _, name = text.partition(":")
+                    if name:
+                        kinds.setdefault(name, kind)
             frames, congress_frames = [], []
-            for m in dedupe_member_names(sorted(kinds)):
-                lots = holdings_for(m)
+            for member in dedupe_member_names(sorted(kinds)):
+                lots = holdings_for(member)
                 if lots.empty:
                     continue
                 lots = lots.loc[
@@ -378,121 +437,180 @@ def cmd_run(decision: date, db=None, *, frame: str):
                 ].copy()
                 if not lots.empty:
                     frames.append(lots)
-                    congress_frames.append(
-                        lots.loc[lots["kind"] == "congress"].copy()
-                    )
-            pos = (
-                pd.concat(frames, ignore_index=True)
-                if frames
-                else pd.DataFrame()
+                    congress_frames.append(lots.loc[lots["kind"] == "congress"].copy())
+            positions_frame = (
+                pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             )
-            events = coalesce_actor_variants(events, pos)
-            events = gate_closed_events(events, pos)
-            cands = pd.concat(
-                [f for f in congress_frames + [events] if not f.empty],
+            events = coalesce_actor_variants(events, positions_frame)
+            events = gate_closed_events(events, positions_frame)
+            candidates = pd.concat(
+                [part for part in congress_frames + [events] if not part.empty],
                 ignore_index=True,
             )
-            if cands.empty:
-                continue
-            q = next_session_close(db, symbol, decision)
-            if not q:
-                continue
-            entry_date, entry_px = q
-            weights = {
-                str(r.actor_id): compute_weight(
-                    str(r.kind), 0, 0.0, str(r.source)
+            quote = decision_close(db, symbol, decision)
+            quote_date, quote_px = quote if quote else (None, None)
+            if candidates.empty:
+                ranked = pd.DataFrame()
+                blocked = pd.DataFrame(columns=["ticker", "actor_id", "reason"])
+                score_reason = "no eligible candidates"
+            else:
+                weights = {
+                    str(row.actor_id): compute_weight(
+                        str(row.kind), 0, 0.0, str(row.source)
+                    )
+                    for row in candidates.itertuples()
+                }
+                ranked, blocked = score_setups(
+                    candidates,
+                    weights,
+                    {symbol: (quote_px, quote_date) if quote else None},
+                    watchlist=watchlist,
                 )
-                for r in cands.itertuples()
-            }
-            ranked, blocked = score_setups(
-                cands, weights, {symbol: (entry_px, entry_date)},
-                watchlist=watchlist,
+                score_reason = None if not ranked.empty else "; ".join(
+                    sorted(set(blocked.loc[blocked["ticker"] == symbol, "reason"].astype(str)))
+                ) or "not ranked"
+
+            refs = (
+                pd.to_numeric(candidates["entry_ref"], errors="coerce")
+                if not candidates.empty else pd.Series(dtype=float)
             )
-            ret, spy, exc = fwd_excess(db, symbol, entry_date, entry_px)
-            if exc is None:
-                continue
-            refs = pd.to_numeric(cands["entry_ref"], errors="coerce")
             valid_refs = refs.notna() & np.isfinite(refs) & (refs > 0)
-            init = cands.loc[valid_refs].copy()
-            actor_ids = set(init["actor_id"].astype(str))
-            kinds_hit = set(init["kind"].astype(str))
-            has_13f = bool((cands["source"] == "13f").any())
+            init = candidates.loc[valid_refs].copy() if not candidates.empty else candidates
+            actor_ids = set(init["actor_id"].astype(str)) if not init.empty else set()
+            kinds_hit = set(init["kind"].astype(str)) if not init.empty else set()
+            has_13f = bool(not candidates.empty and (candidates["source"] == "13f").any())
             lags = (
-                pd.to_datetime(decision)
-                - pd.to_datetime(init["disclosure_date"])
-            ).dt.days.dropna()
+                pd.to_datetime(decision) - pd.to_datetime(init["disclosure_date"])
+            ).dt.days.dropna() if not init.empty else pd.Series(dtype=float)
             fresh_frame = init.loc[lags.between(0, 30)] if not lags.empty else init.iloc[0:0]
             fresh_actors = set(fresh_frame["actor_id"].astype(str))
-            max_valid_ref = float(refs.loc[valid_refs].max())
-            for actor, actor_candidates in init.groupby("actor_id", sort=True):
+            max_valid_ref = float(refs.loc[valid_refs].max()) if valid_refs.any() else None
+            for actor, actor_candidates in candidates.groupby("actor_id", sort=True):
                 actor_refs = pd.to_numeric(actor_candidates["entry_ref"], errors="coerce")
-                actor_reference = actor_candidates.loc[
-                    actor_refs.idxmax()
-                ]
+                actor_valid = actor_refs.notna() & np.isfinite(actor_refs) & (actor_refs > 0)
+                actor_reference = (
+                    actor_candidates.loc[actor_refs.loc[actor_valid].idxmax()]
+                    if actor_valid.any() else actor_candidates.iloc[0]
+                )
                 actor_lags = (
                     pd.to_datetime(decision)
                     - pd.to_datetime(actor_candidates["disclosure_date"])
                 ).dt.days.dropna()
-                actor_rows.append(
+                blocked_for_actor = (
+                    blocked.loc[
+                        (blocked["ticker"] == symbol)
+                        & (blocked["actor_id"].astype(str) == str(actor)),
+                        "reason",
+                    ]
+                    if not blocked.empty else pd.Series(dtype=object)
+                )
+                actor_row = {
+                    "as_of": str(decision),
+                    "ticker": symbol,
+                    "actor_id": str(actor),
+                    "kind": str(actor_reference["kind"]),
+                    "entry_ref": (
+                        float(actor_reference["entry_ref"]) if actor_valid.any() else None
+                    ),
+                    "lag_days": int(actor_lags.min()) if not actor_lags.empty else None,
+                    "entry_reference_status": "valid" if actor_valid.any() else "missing",
+                    "score_block_reason": "; ".join(
+                        sorted(set(blocked_for_actor.dropna().astype(str)))
+                    ) or None,
+                }
+                if not capture_only:
+                    actor_row.update(skilled=str(actor) in skilled, hyper=str(actor) in hyper)
+                actor_rows.append(actor_row)
+
+            row = {
+                "ticker": symbol,
+                "as_of": str(decision),
+                "decision_quote_date": str(quote_date) if quote_date else None,
+                "decision_quote_px": quote_px,
+                "ranked": bool(not ranked.empty),
+                "score": float(ranked["score"].max()) if not ranked.empty else None,
+                "score_exclusion_reason": score_reason,
+                "n_actors": len(actor_ids),
+                "has_officer": "officer" in kinds_hit,
+                "has_13f": has_13f,
+                "fresh": bool(fresh_actors),
+                "min_lag": int(lags.min()) if not lags.empty else None,
+                "max_valid_ref": max_valid_ref,
+            }
+            if not capture_only:
+                row.update(
+                    fresh_skilled=bool(fresh_actors & skilled),
+                    skilled_present=bool(actor_ids & skilled),
+                    hyper_present=bool(actor_ids & hyper),
+                    hyper_only=bool(actor_ids and actor_ids <= hyper),
+                )
+                entry = next_session_close(db, symbol, decision)
+                if not entry:
+                    fill_date, fill_px, ret, spy, excess = None, None, None, None, None
+                    exclusion = "fill_unavailable"
+                else:
+                    fill_date, fill_px = entry
+                    ret, spy, excess, exclusion = fwd_excess_with_reason(
+                        db, symbol, fill_date, fill_px
+                    )
+                eligible_fill = (
+                    bool(fill_px <= 1.05 * refs.loc[valid_refs].max())
+                    if fill_px is not None and valid_refs.any() else None
+                )
+                outcomes.append(
                     {
-                        "as_of": str(decision),
                         "ticker": symbol,
-                        "actor_id": str(actor),
-                        "kind": str(actor_reference["kind"]),
-                        "entry_ref": float(actor_reference["entry_ref"]),
-                        "lag_days": int(actor_lags.min()) if not actor_lags.empty else None,
-                        "skilled": str(actor) in skilled,
-                        "hyper": str(actor) in hyper,
-                        "excess": exc,
+                        "as_of": str(decision),
+                        "fill_date": str(fill_date) if fill_date else None,
+                        "fill_px": fill_px,
+                        "entry_eligibility": (
+                            "eligible" if eligible_fill else "ineligible"
+                        ) if eligible_fill is not None else "excluded: no fill or valid reference",
+                        "entry_eligible": eligible_fill,
+                        "fwd": ret,
+                        "spy": spy,
+                        "excess": excess,
+                        "outcome_status": "available" if excess is not None else "excluded",
+                        "exclusion_reason": exclusion or (
+                            "no_valid_entry_reference" if eligible_fill is None else None
+                        ),
+                        "frame": frame,
                     }
                 )
-            entry_eligible = bool((entry_px <= 1.05 * refs.loc[valid_refs]).any())
-            rows.append(
-                {
-                    "ticker": symbol,
-                    "as_of": str(decision),
-                    "ranked": bool(not ranked.empty),
-                    "score": float(ranked["score"].max())
-                    if not ranked.empty
-                    else 0.0,
-                    "n_actors": len(actor_ids),
-                    "has_officer": "officer" in kinds_hit,
-                    "has_13f": has_13f,
-                    "fresh": bool(fresh_actors),
-                    "fresh_skilled": bool(fresh_actors & skilled),
-                    "min_lag": int(lags.min()) if not lags.empty else None,
-                    "entry_px": entry_px,
-                    "max_valid_ref": max_valid_ref,
-                    "entry_eligibility": "eligible" if entry_eligible else "ineligible",
-                    "entry_eligible": entry_eligible,
-                    "fwd": ret,
-                    "spy": spy,
-                    "excess": exc,
-                    "skilled_present": bool(actor_ids & skilled),
-                    "hyper_present": bool(actor_ids & hyper),
-                    "hyper_only": bool(
-                        actor_ids and actor_ids <= hyper
-                    ),
-                }
-            )
+            rows.append(row)
             if (i + 1) % 50 == 0:
                 print(f"  ... {i + 1}/{len(keep)}", flush=True)
-        # frame is a constant column appended LAST: earlier column order is
-        # preserved for diffing against artifacts published before the flag.
-        cohort_frame = pd.DataFrame(rows)
+
+        cohort_columns = [
+            "ticker", "as_of", "decision_quote_date", "decision_quote_px",
+            "ranked", "score", "score_exclusion_reason", "n_actors",
+            "has_officer", "has_13f", "fresh", "min_lag", "max_valid_ref",
+        ]
+        if not capture_only:
+            cohort_columns += [
+                "fresh_skilled", "skilled_present", "hyper_present", "hyper_only",
+            ]
+        cohort_frame = pd.DataFrame(rows, columns=cohort_columns)
         cohort_frame["frame"] = frame
         cohort_frame.to_csv(OUT_DIR / f"cohorts_{decision}.csv", index=False)
-        actor_frame = pd.DataFrame(
-            actor_rows,
-            columns=[
-                "as_of", "ticker", "actor_id", "kind", "entry_ref", "lag_days",
-                "skilled", "hyper", "excess",
-            ],
-        )
+        actor_columns = [
+            "as_of", "ticker", "actor_id", "kind", "entry_ref", "lag_days",
+            "entry_reference_status", "score_block_reason",
+        ]
+        if not capture_only:
+            actor_columns += ["skilled", "hyper"]
+        actor_frame = pd.DataFrame(actor_rows, columns=actor_columns)
         actor_frame["frame"] = frame
         actor_frame.to_csv(OUT_DIR / f"actors_{decision}.csv", index=False)
-        # Self-describing provenance; NO wall-clock field (determinism I1):
-        # two runs on unchanged inputs must be byte-identical.
+        if not capture_only:
+            pd.DataFrame(
+                outcomes,
+                columns=[
+                    "ticker", "as_of", "fill_date", "fill_px", "entry_eligibility",
+                    "entry_eligible", "fwd", "spy", "excess", "outcome_status",
+                    "exclusion_reason", "frame",
+                ],
+            ).to_csv(OUT_DIR / f"outcomes_{decision}.csv", index=False)
         manifest = {
             "decision": str(decision),
             "frame": frame,
@@ -504,10 +622,114 @@ def cmd_run(decision: date, db=None, *, frame: str):
             "db_sha256": sha256_file(db.db_path),
             "git_sha": git_sha(),
         }
+        if capture_only:
+            manifest["capture_only"] = True
         (OUT_DIR / f"manifest_{decision}.json").write_text(
             json.dumps(manifest, indent=2) + "\n"
         )
         print("wrote", len(rows), "rows", flush=True)
+
+
+def cmd_capture(decision: date, db=None, *, frame: str):
+    """Write the frozen decision snapshot once, without labels or outcomes."""
+    check_capture_date(decision)
+    targets = [
+        OUT_DIR / f"cohorts_{decision}.csv",
+        OUT_DIR / f"actors_{decision}.csv",
+        OUT_DIR / f"outcomes_{decision}.csv",
+        OUT_DIR / f"manifest_{decision}.json",
+    ]
+    existing = [path.name for path in targets if path.exists()]
+    if existing:
+        raise SystemExit(
+            f"CAPTURE OVERWRITE: {decision} artifacts already exist: "
+            + ", ".join(existing)
+        )
+    cmd_run(decision, db, frame=frame, capture_only=True)
+
+
+def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
+    """Attach labels after unseal without reloading or rescoring decisions."""
+    check_unsealed()
+    if decision not in WALK_FORWARD_BLOCK:
+        raise SystemExit(f"NOT A FROZEN DATE: {decision} is not in the walk-forward block")
+    if frame not in FRAMES:
+        raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
+    cohort_path = OUT_DIR / f"cohorts_{decision}.csv"
+    manifest_path = OUT_DIR / f"manifest_{decision}.json"
+    outcome_path = OUT_DIR / f"outcomes_{decision}.csv"
+    if outcome_path.exists():
+        raise SystemExit(f"OUTCOME OVERWRITE: {outcome_path.name} already exists")
+    if not cohort_path.exists() or not manifest_path.exists():
+        raise SystemExit(f"MISSING CAPTURE: no frozen input snapshot for {decision}")
+    manifest = json.loads(manifest_path.read_text())
+    if not manifest.get("capture_only") or manifest.get("frame") != frame:
+        raise SystemExit(f"INVALID CAPTURE: {decision} does not match frame {frame}")
+    owns_db = db is None
+    if owns_db:
+        db = Database(DB_PATH, read_only=True)
+    try:
+        outcomes = []
+        captured = pd.read_csv(cohort_path)
+        for row in captured.itertuples(index=False):
+            symbol = str(row.ticker)
+            decision_date = date.fromisoformat(str(row.as_of))
+            entry = next_session_close(db, symbol, decision_date)
+            if not entry:
+                fill_date, fill_px, ret, spy, excess = None, None, None, None, None
+                exclusion = "fill_unavailable"
+            else:
+                fill_date, fill_px = entry
+                ret, spy, excess, exclusion = fwd_excess_with_reason(
+                    db, symbol, fill_date, fill_px
+                )
+            ref = pd.to_numeric(pd.Series([row.max_valid_ref]), errors="coerce").iloc[0]
+            eligible_fill = (
+                bool(fill_px <= 1.05 * ref)
+                if fill_px is not None and pd.notna(ref) and ref > 0 else None
+            )
+            outcomes.append(
+                {
+                    "ticker": symbol,
+                    "as_of": str(decision_date),
+                    "fill_date": str(fill_date) if fill_date else None,
+                    "fill_px": fill_px,
+                    "entry_eligibility": (
+                        "eligible" if eligible_fill else "ineligible"
+                    ) if eligible_fill is not None else "excluded: no fill or valid reference",
+                    "entry_eligible": eligible_fill,
+                    "fwd": ret,
+                    "spy": spy,
+                    "excess": excess,
+                    "outcome_status": "available" if excess is not None else "excluded",
+                    "exclusion_reason": exclusion or (
+                        "no_valid_entry_reference" if eligible_fill is None else None
+                    ),
+                    "frame": frame,
+                }
+            )
+        pd.DataFrame(outcomes).to_csv(outcome_path, index=False)
+    finally:
+        if owns_db:
+            db.close()
+
+
+def cmd_analyze_capture(decision: date, *, frame: str) -> pd.DataFrame:
+    """Join a frozen input snapshot to outcomes only after the formal unseal."""
+    check_unsealed()
+    cohort_path = OUT_DIR / f"cohorts_{decision}.csv"
+    outcome_path = OUT_DIR / f"outcomes_{decision}.csv"
+    manifest_path = OUT_DIR / f"manifest_{decision}.json"
+    if not all(path.exists() for path in (cohort_path, outcome_path, manifest_path)):
+        raise SystemExit(f"MISSING FROZEN DATA: capture and attach outcomes for {decision}")
+    manifest = json.loads(manifest_path.read_text())
+    if not manifest.get("capture_only") or manifest.get("frame") != frame:
+        raise SystemExit(f"INVALID CAPTURE: {decision} does not match frame {frame}")
+    cohorts, _ = read_panel_csv(cohort_path, "cohort", frame=frame)
+    outcomes, _ = read_panel_csv(outcome_path, "outcome", frame=frame)
+    result = join_outcomes(cohorts, outcomes, "frozen cohort")
+    print(result.to_string(index=False), flush=True)
+    return result
 
 
 def clustered_t(frame: pd.DataFrame, group: str) -> float | None:
@@ -560,14 +782,27 @@ def compare_groups(
     }
 
 
-def read_panel_csv(path: Path, kind: str) -> tuple[pd.DataFrame, list[str]]:
-    """Read a frame-tagged panel CSV; refuse legacy frame-less artifacts."""
+def read_panel_csv(
+    path: Path, kind: str, *, frame: str | None = None
+) -> tuple[pd.DataFrame, list[str]]:
+    """Read a panel under an explicit frame, including asserted legacy files."""
     panel = pd.read_csv(path)
     if "frame" not in panel.columns:
+        if frame not in FRAMES:
+            raise SystemExit(
+                f"{kind} CSV {path.name} has no frame column; provide an explicit "
+                "--frame assertion or regenerate with --frame"
+            )
+        # The required CLI --frame is the operator's explicit provenance
+        # assertion for pre-frame artifacts; never infer or pool it silently.
+        panel["frame"] = frame
+        return panel, [frame]
+    values = sorted(set(panel["frame"].dropna().astype(str)))
+    if frame is not None and values and values != [frame]:
         raise SystemExit(
-            f"{kind} CSV {path.name} has no frame column; regenerate with --frame"
+            f"{kind} CSV {path.name} frame {values} does not match requested {frame}"
         )
-    return panel, sorted(set(panel["frame"].dropna().astype(str)))
+    return panel, values or ([frame] if frame in FRAMES else [])
 
 
 def refuse_mixed_frames(frame_values: dict[str, list[str]]) -> None:
@@ -580,20 +815,58 @@ def refuse_mixed_frames(frame_values: dict[str, list[str]]) -> None:
         raise SystemExit(f"mixed frames in panel: {detail}")
 
 
-def cmd_analyze():
+def join_outcomes(inputs: pd.DataFrame, outcomes: pd.DataFrame, kind: str) -> pd.DataFrame:
+    """Require exact input/outcome coverage; unavailable labels stay as rows."""
+    merged = inputs.merge(
+        outcomes,
+        on=["as_of", "ticker", "frame"],
+        how="outer",
+        validate="one_to_one",
+        indicator=True,
+        suffixes=("", "_outcome"),
+    )
+    unmatched = merged.loc[merged["_merge"] != "both", ["as_of", "ticker", "_merge"]]
+    if not unmatched.empty:
+        raise SystemExit(
+            f"{kind} inputs/outcomes do not match; "
+            f"{len(unmatched)} rows are missing from one side"
+        )
+    return merged.drop(columns="_merge")
+
+
+def cmd_analyze(*, frame: str):
+    if frame not in FRAMES:
+        raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
+    for decision in WALK_FORWARD_BLOCK:
+        path = OUT_DIR / f"manifest_{decision}.json"
+        if path.exists() and json.loads(path.read_text()).get("capture_only"):
+            check_unsealed()
     files = [OUT_DIR / f"cohorts_{decision}.csv" for decision in DECISIONS]
-    frames = []
+    outcome_files = [OUT_DIR / f"outcomes_{decision}.csv" for decision in DECISIONS]
+    missing_outcomes = [path.name for path in outcome_files if not path.exists()]
+    if missing_outcomes:
+        raise SystemExit("missing outcome CSVs: " + ", ".join(missing_outcomes))
+    frames, outcomes = [], []
     frame_values: dict[str, list[str]] = {}
     for path in (path for path in files if path.exists()):
-        panel, values = read_panel_csv(path, "cohort")
+        panel, values = read_panel_csv(path, "cohort", frame=frame)
         for value in values:
             frame_values.setdefault(value, []).append(path.name)
         frames.append(panel)
+    for path in outcome_files:
+        panel, values = read_panel_csv(path, "outcome", frame=frame)
+        for value in values:
+            frame_values.setdefault(value, []).append(path.name)
+        outcomes.append(panel)
     if len(frames) != len(DECISIONS):
         raise SystemExit("missing cohort CSVs; run all decision dates first")
     refuse_mixed_frames(frame_values)
     observations = pd.concat(frames, ignore_index=True)
-    eligible = observations.loc[observations["entry_eligible"]]
+    outcome_panel = pd.concat(outcomes, ignore_index=True)
+    observations = join_outcomes(observations, outcome_panel, "cohort")
+    eligible = observations.loc[
+        observations["entry_eligible"].fillna(False).astype(bool)
+    ]
     comparisons = [
         compare_groups(
             observations, "skilled vs not", "skilled_present", "skilled", "not skilled"
@@ -621,6 +894,7 @@ def cmd_analyze():
         ),
     ]
     summary = pd.DataFrame(comparisons)
+    summary["frame"] = frame
     summary.to_csv(OUT_DIR / "summary.csv", index=False)
     print(summary.to_string(index=False), flush=True)
 
@@ -648,53 +922,80 @@ def sweep_comparison(frame: pd.DataFrame, group: str, outcome: str) -> dict:
     }
 
 
-def cmd_sweep():
+def cmd_sweep(*, frame: str):
+    if frame not in FRAMES:
+        raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
+    for decision in WALK_FORWARD_BLOCK:
+        path = OUT_DIR / f"manifest_{decision}.json"
+        if path.exists() and json.loads(path.read_text()).get("capture_only"):
+            check_unsealed()
     cohort_files = [OUT_DIR / f"cohorts_{decision}.csv" for decision in DECISIONS]
     actor_files = [OUT_DIR / f"actors_{decision}.csv" for decision in DECISIONS]
-    missing = [path.name for path in cohort_files + actor_files if not path.exists()]
+    outcome_files = [OUT_DIR / f"outcomes_{decision}.csv" for decision in DECISIONS]
+    missing = [
+        path.name for path in cohort_files + actor_files + outcome_files if not path.exists()
+    ]
     if missing:
         raise SystemExit(
-            "missing cohort or actor CSVs; run all decision dates first: "
+            "missing cohort, actor, or outcome CSVs; run all decision dates first: "
             + ", ".join(missing)
         )
 
     frame_values: dict[str, list[str]] = {}
-    cohort_frames, actor_frames = [], []
+    cohort_frames, actor_frames, outcome_frames = [], [], []
     for kind, files, sink in (
         ("cohort", cohort_files, cohort_frames),
         ("actor", actor_files, actor_frames),
+        ("outcome", outcome_files, outcome_frames),
     ):
         for path in files:
-            panel, values = read_panel_csv(path, kind)
+            panel, values = read_panel_csv(path, kind, frame=frame)
             for value in values:
                 frame_values.setdefault(value, []).append(path.name)
             sink.append(panel)
     refuse_mixed_frames(frame_values)
     cohorts = pd.concat(cohort_frames, ignore_index=True)
     actors = pd.concat(actor_frames, ignore_index=True)
+    outcomes = pd.concat(outcome_frames, ignore_index=True)
+    cohorts = join_outcomes(cohorts, outcomes, "cohort")
     if actors.duplicated(["as_of", "ticker", "actor_id"]).any():
         raise SystemExit("actor CSVs contain duplicate decision+ticker+actor rows")
+    actor_refs = pd.to_numeric(actors["entry_ref"], errors="coerce")
+    actors = actors.loc[
+        actor_refs.notna() & np.isfinite(actor_refs) & (actor_refs > 0)
+    ].copy()
+    actors = actors.merge(
+        outcomes[["as_of", "ticker", "excess"]],
+        on=["as_of", "ticker"],
+        how="left",
+        validate="many_to_one",
+        indicator=True,
+    )
+    if actors["_merge"].ne("both").any():
+        raise SystemExit("actor rows have no matching cohort outcome")
+    actors = actors.drop(columns="_merge")
     actor_means = actors.groupby("actor_id", as_index=False)["excess"].mean()
     actor_means = actor_means.rename(columns={"excess": "actor_mean"})
     actors = actors.merge(actor_means, on="actor_id", validate="many_to_one")
     demeaned = actors.groupby(["as_of", "ticker"], as_index=False).agg(
-        actor_excess=("excess", "first"), actor_mean=("actor_mean", "mean")
+        actor_excess=("excess", "first"), actor_mean=("actor_mean", "mean"),
+        actor_rows=("actor_id", "size"),
     )
     if actors.groupby(["as_of", "ticker"])["excess"].nunique().gt(1).any():
         raise SystemExit("actor rows do not share one ticker-level excess")
     demeaned["y_demeaned"] = demeaned["actor_excess"] - demeaned["actor_mean"]
     cohorts["max_valid_ref"] = pd.to_numeric(cohorts["max_valid_ref"], errors="coerce")
     cohorts = cohorts.merge(
-        demeaned[["as_of", "ticker", "actor_excess", "y_demeaned"]],
+        demeaned[["as_of", "ticker", "actor_excess", "y_demeaned", "actor_rows"]],
         on=["as_of", "ticker"],
         how="left",
         validate="one_to_one",
     )
     valid_ref = np.isfinite(cohorts["max_valid_ref"]) & (cohorts["max_valid_ref"] > 0)
-    has_actor_rows = cohorts["actor_excess"].notna()
+    has_actor_rows = cohorts["actor_rows"].notna()
     if not np.array_equal(valid_ref.to_numpy(), has_actor_rows.to_numpy()):
         raise SystemExit("actor CSVs do not cover every cohort with a valid reference")
-    if cohorts.loc[valid_ref, "y_demeaned"].isna().any():
+    if cohorts.loc[valid_ref & cohorts["excess"].notna(), "y_demeaned"].isna().any():
         raise SystemExit("actor rows do not support within-actor demeaning")
     if not np.allclose(
         cohorts.loc[has_actor_rows, "excess"],
@@ -702,13 +1003,13 @@ def cmd_sweep():
         equal_nan=True,
     ):
         raise SystemExit("actor and cohort excess values differ")
-    cohorts = cohorts.drop(columns="actor_excess")
-    cohorts["entry_px"] = pd.to_numeric(cohorts["entry_px"], errors="coerce")
+    cohorts = cohorts.drop(columns=["actor_excess", "actor_rows"])
+    cohorts["fill_px"] = pd.to_numeric(cohorts["fill_px"], errors="coerce")
     ranked = cohorts["ranked"].astype(str).str.lower().eq("true")
     at_105 = (
         valid_ref
-        & np.isfinite(cohorts["entry_px"])
-        & (cohorts["entry_px"] <= 1.05 * cohorts["max_valid_ref"])
+        & np.isfinite(cohorts["fill_px"])
+        & (cohorts["fill_px"] <= 1.05 * cohorts["max_valid_ref"])
     )
     if not np.array_equal(
         at_105.to_numpy(),
@@ -719,8 +1020,8 @@ def cmd_sweep():
     for tolerance in TOLERANCES:
         cohorts["eligible"] = (
             valid_ref
-            & np.isfinite(cohorts["entry_px"])
-            & (cohorts["entry_px"] <= tolerance * cohorts["max_valid_ref"])
+            & np.isfinite(cohorts["fill_px"])
+            & (cohorts["fill_px"] <= tolerance * cohorts["max_valid_ref"])
         )
         for sample, selected in (("all", cohorts), ("ranked", cohorts.loc[ranked])):
             for variant, outcome in (
@@ -736,6 +1037,7 @@ def cmd_sweep():
                     }
                 )
     summary = pd.DataFrame(rows)
+    summary["frame"] = frame
     summary.to_csv(OUT_DIR / "sweep.csv", index=False)
     print(summary.to_string(index=False), flush=True)
 
@@ -750,7 +1052,7 @@ def cmd_full(*, frame: str):
                 cmd_run(decision, db, frame=frame)
     finally:
         db.close()
-    cmd_analyze()
+    cmd_analyze(frame=frame)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -764,6 +1066,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("decision", type=date.fromisoformat)
     _add_frame_flag(run_parser)
+    for name in ("capture", "attach-outcomes", "analyze-capture"):
+        child = subparsers.add_parser(name)
+        child.add_argument("decision", type=date.fromisoformat)
+        _add_frame_flag(child)
     _add_frame_flag(subparsers.add_parser("full"))
     return parser
 
@@ -785,8 +1091,14 @@ if __name__ == "__main__":
         with cached_position_inputs():
             cmd_run(args.decision, frame=args.frame)
     elif args.mode == "analyze":
-        cmd_analyze()
+        cmd_analyze(frame=args.frame)
     elif args.mode == "sweep":
-        cmd_sweep()
+        cmd_sweep(frame=args.frame)
+    elif args.mode == "capture":
+        cmd_capture(args.decision, frame=args.frame)
+    elif args.mode == "attach-outcomes":
+        cmd_attach_outcomes(args.decision, frame=args.frame)
+    elif args.mode == "analyze-capture":
+        cmd_analyze_capture(args.decision, frame=args.frame)
     elif args.mode == "full":
         cmd_full(frame=args.frame)

@@ -78,16 +78,21 @@ def test_replay_schema_and_missing_outcome_is_none(monkeypatch):
         "ticker",
         "as_of",
         "score",
+        "score_exclusion_reason",
+        "decision_quote_date",
+        "decision_quote_price",
         "n_actors",
         "fwd_return_pct",
         "spy_return_pct",
         "excess_pct",
+        "outcome_exclusion_reason",
         "blocked",
     ]
     assert result.loc[0, "score"] == 2.5
     assert result.loc[0, "n_actors"] == 1
     assert result.loc[0, "fwd_return_pct"] is None
     assert result.loc[0, "excess_pct"] is None
+    assert result.loc[0, "outcome_exclusion_reason"] == "outcome_price_unavailable"
 
 
 def test_future_disclosure_never_reaches_scoring(monkeypatch):
@@ -129,15 +134,16 @@ def test_replay_blocks_a_stale_last_quote():
     )
 
     try:
-        score, blocked, actor_count = replay_module._score(
+        score, blocked, actor_count, reason = replay_module._score(
             db, "ABC", decision_date, candidates, actors, setups
         )
     finally:
         db.close()
 
-    assert score == 0.0
+    assert score is None
     assert blocked
     assert actor_count == 1
+    assert reason == "stale quote"
 
 
 def test_immature_horizon_reports_no_outcome(monkeypatch):

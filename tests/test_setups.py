@@ -229,6 +229,22 @@ def test_quote_older_than_five_calendar_days_is_blocked():
     assert fresh_ranked.iloc[0]["score"] == pytest.approx(1.0)
 
 
+def test_future_quote_is_blocked_with_explicit_reason():
+    audit = {}
+    ranked, blocked = score(
+        pd.DataFrame([_row(position_evidence=True)]),
+        {"congress:PELOSI": 1.0},
+        {"AAPL": (100.0, date(2024, 6, 2))},
+        audit=audit,
+    )
+
+    assert ranked.empty
+    assert blocked.to_dict("records") == [
+        {"ticker": "AAPL", "actor_id": "congress:PELOSI", "reason": "future quote"}
+    ]
+    assert audit["AAPL"]["future_quote"] is True
+
+
 def test_missing_entry_reference_is_blocked():
     ranked, blocked = score(
         pd.DataFrame([_row(entry_ref=None)]),

@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import patch
 
 import duckdb
 
@@ -57,6 +59,8 @@ def _write_record(
     age_days: float = 0.0,
     error: str | None = None,
     epoch: float = NOW,
+    asset_review: bool = False,
+    audit_severity: str | None = None,
 ) -> Path:
     stamp = datetime.fromtimestamp(
         epoch - age_days * 86_400, tz=timezone.utc
@@ -70,6 +74,10 @@ def _write_record(
     }
     if error is not None:
         record["error"] = error
+    if asset_review:
+        record["asset_review"] = True
+    if audit_severity is not None:
+        record["audit_severity"] = audit_severity
     path = root / str(year) / f"{doc_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record), encoding="utf-8")
@@ -196,7 +204,9 @@ class OcrStagingCheckTest(TestCase):
         check = doctor_mod._ocr_staging_check(root, now=NOW)
         self.assertTrue(check.ok, check.detail)
         self.assertIn("2 success / 1 no_txs / 0 error", check.detail)
-        self.assertIn("audit pass/fail/unaudited 1/1/1", check.detail)
+        self.assertIn(
+            "audit pass/critical-fail/cosmetic-fail/unaudited 1/1/0/1", check.detail
+        )
 
     def test_retry_starvation_fails_and_names_the_artifact(self):
         root = Path(tempfile.mkdtemp())
@@ -263,6 +273,84 @@ class OcrStagingCheckTest(TestCase):
         self.assertIn("promoted-consumed-absent 1", check.detail)
 
 
+def test_staging_audit_severity_split_uses_sticky_worst_and_legacy_default(tmp_path):
+    root = tmp_path / "staging"
+    _write_record(root, 2024, "pass", audit="pass")
+    _write_record(root, 2024, "critical", audit="fail", audit_severity="cosmetic")
+    _write_record(root, 2024, "cosmetic", audit="fail", audit_severity="cosmetic")
+    _write_record(root, 2024, "legacy", audit="fail")
+    _write_record(root, 2024, "unaudited")
+    (root / "audit-results.json").write_text(
+        json.dumps(
+            [
+                {"doc_id": "critical", "verdict": "fail", "severity": "cosmetic"},
+                {"doc_id": "critical", "verdict": "fail", "severity": "critical"},
+                {"doc_id": "cosmetic", "verdict": "fail", "severity": "cosmetic"},
+                {"doc_id": "legacy", "verdict": "fail"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    check = doctor_mod._ocr_staging_check(root, now=NOW)
+
+    assert check.ok, check.detail  # cosmetic fails are visible, not blocking
+    assert "audit pass/critical-fail/cosmetic-fail/unaudited 1/2/1/1" in check.detail
+    assert "cosmetic fails are tracked, not blocking" in check.detail
+
+
+def test_asset_review_info_counts_only_successful_unaudited_records(tmp_path):
+    root = tmp_path / "staging"
+    _write_record(root, 2024, "flagged-unreviewed", asset_review=True)
+    _write_record(root, 2024, "flagged-audited", audit="pass", asset_review=True)
+    _write_record(root, 2024, "flagged-history", asset_review=True)
+    _write_record(root, 2024, "flagged-error", status="error", asset_review=True)
+    _write_record(root, 2024, "plain-unreviewed")
+    (root / "audit-results.json").write_text(
+        json.dumps([{"doc_id": "flagged-history", "verdict": "fail"}]),
+        encoding="utf-8",
+    )
+
+    check = doctor_mod._ocr_staging_check(root, now=NOW)
+
+    assert (
+        "INFO: asset_review flagged, unaudited: 1 (audit sampler draws these first)"
+        in check.detail
+    )
+
+
+def test_staging_backup_freshness_missing_empty_stale_and_fresh(tmp_path):
+    fix = "run bash cron/backlog_ocr.sh manually or wait for the 03:30 UTC cron; the wrapper snapshots after staging"
+    missing = doctor_mod._staging_backup_check(tmp_path / "missing", now=NOW)
+    assert missing.mark == "FAIL"
+    assert fix in missing.detail
+
+    empty_root = tmp_path / "empty"
+    empty_root.mkdir()
+    empty = doctor_mod._staging_backup_check(empty_root, now=NOW)
+    assert empty.mark == "FAIL"
+    assert fix in empty.detail
+
+    stale_root = tmp_path / "stale"
+    stale_root.mkdir()
+    stale_tar = stale_root / "glm-backlog-old.tar.gz"
+    stale_tar.write_bytes(b"snapshot")
+    os.utime(stale_tar, (NOW - 8.1 * 86_400, NOW - 8.1 * 86_400))
+    stale = doctor_mod._staging_backup_check(stale_root, now=NOW)
+    assert stale.mark == "FAIL"
+    assert "8.1d old" in stale.detail
+    assert fix in stale.detail
+
+    fresh_root = tmp_path / "fresh"
+    fresh_root.mkdir()
+    fresh_tar = fresh_root / "glm-backlog-new.tar.gz"
+    fresh_tar.write_bytes(b"snapshot")
+    os.utime(fresh_tar, (NOW - 8 * 86_400, NOW - 8 * 86_400))
+    fresh = doctor_mod._staging_backup_check(fresh_root, now=NOW)
+    assert fresh.mark == "PASS", fresh.detail
+    assert "limit 8d" in fresh.detail
+
+
 class OcrCronEngagementTest(TestCase):
     def test_fresh_completed_run_passes(self):
         log_root = Path(tempfile.mkdtemp())
@@ -271,13 +359,37 @@ class OcrCronEngagementTest(TestCase):
         self.assertTrue(check.ok, check.detail)
         self.assertIn("doctor exit=0", check.detail)
 
-    def test_never_fired_fails_with_install_command(self):
-        check = doctor_mod._ocr_cron_check(
-            Path(tempfile.mkdtemp()) / "absent", today=TODAY
-        )
+    def test_never_fired_fails_with_install_command_when_cron_line_absent(self):
+        with patch.object(
+            doctor_mod.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout="0 2 * * * prices\n"),
+        ):
+            check = doctor_mod._ocr_cron_check(
+                Path(tempfile.mkdtemp()) / "absent", today=TODAY
+            )
         self.assertFalse(check.ok)
         self.assertIn("never fired", check.detail)
         self.assertIn("cron/install.sh", check.detail)
+
+    def test_never_fired_says_awaiting_schedule_when_cron_line_present(self):
+        with patch.object(
+            doctor_mod.subprocess,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="30 3 * * * /srv/insider-trading/cron/backlog_ocr.sh\n",
+            ),
+        ):
+            check = doctor_mod._ocr_cron_check(
+                Path(tempfile.mkdtemp()) / "absent", today=TODAY
+            )
+        self.assertFalse(check.ok)
+        self.assertIn(
+            "installed in crontab; awaiting first scheduled firing at 03:30 UTC",
+            check.detail,
+        )
+        self.assertNotIn("cron/install.sh", check.detail)
 
     def test_run_dir_boundary_2d_passes_3d_is_dead(self):
         log_root = Path(tempfile.mkdtemp())
@@ -294,17 +406,36 @@ class OcrCronEngagementTest(TestCase):
         log_root = Path(tempfile.mkdtemp())
         _write_run_dir(log_root, "20261101", make_log=False)
         check = doctor_mod._ocr_cron_check(log_root, today=TODAY)
-        self.assertFalse(check.ok)
-        self.assertIn("truncated run", check.detail)
+        self.assertTrue(check.ok, check.detail)
+        self.assertIn("in progress", check.detail)
 
-    def test_log_without_doctor_exit_line_fails(self):
+    def test_recent_run_without_doctor_exit_is_in_progress(self):
         log_root = Path(tempfile.mkdtemp())
-        _write_run_dir(
-            log_root, "20261101", log_text="ocr backlog start\n--- staging year 2017 ---\n"
+        run_dir = _write_run_dir(
+            log_root,
+            "20261101",
+            log_text="ocr backlog start\n--- staging year 2017 ---\n",
         )
-        check = doctor_mod._ocr_cron_check(log_root, today=TODAY)
+        started = NOW - 2 * 3600
+        os.utime(run_dir, (started, started))
+        check = doctor_mod._ocr_cron_check(log_root, today=TODAY, now=NOW)
+        self.assertTrue(check.ok, check.detail)
+        self.assertIn("in progress", check.detail)
+        self.assertIn("2.0h old", check.detail)
+
+    def test_old_run_without_doctor_exit_fails_as_truncated(self):
+        log_root = Path(tempfile.mkdtemp())
+        run_dir = _write_run_dir(
+            log_root,
+            "20261101",
+            log_text="ocr backlog start\n--- staging year 2017 ---\n",
+        )
+        started = NOW - 8 * 3600
+        os.utime(run_dir, (started, started))
+        check = doctor_mod._ocr_cron_check(log_root, today=TODAY, now=NOW)
         self.assertFalse(check.ok)
         self.assertIn("no 'doctor exit=' line", check.detail)
+        self.assertIn("truncated", check.detail)
 
     def test_nonzero_doctor_exit_in_log_fails(self):
         log_root = Path(tempfile.mkdtemp())

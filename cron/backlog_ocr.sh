@@ -50,6 +50,35 @@ printf 'dual-read: DUAL_READ=%s engine_b_configured=%s\n' \
     "${DUAL_READ:-<unset>}" "$([ -n "${VISION_B_API_KEY:-}" ] && echo yes || echo no)"
 cd "$repo"
 
+# Freeze the authoritative unresolved-work queue. Missing or malformed
+# manifests stop this job; scheduled runs never fall back to a directory scan.
+readonly work_manifest="$repo/data/staging/glm-backlog/work-manifest.json"
+if ! python3 scripts/ocr_zero_rows.py --export-work-manifest "$work_manifest"; then
+    printf '%s\n' "ERROR: failed to export the authoritative OCR work manifest; refusing directory-scan fallback"
+    exit 1
+fi
+if ! backlog_years="$(python3 - "$work_manifest" <<'PY'
+import sys
+from scripts.glm_stage import load_work_manifest_items, manifest_years
+
+items, error = load_work_manifest_items(sys.argv[1])
+if error:
+    print(error, file=sys.stderr)
+    raise SystemExit(1)
+years, error = manifest_years(items)
+if error:
+    print(error, file=sys.stderr)
+    raise SystemExit(1)
+print("\n".join(str(year) for year in years))
+PY
+)"; then
+    printf '%s\n' "ERROR: cannot derive backlog years from the work manifest; refusing directory-scan fallback"
+    exit 1
+fi
+if [ -z "$backlog_years" ]; then
+    printf '%s\n' "work manifest contains no unresolved docs; no staging years to drain"
+fi
+
 # Drain year-by-year into staging. Each year's timeout is
 # min(year_budget_cap, remaining run budget); when the run budget is nearly
 # spent the loop stops instead of starting another year. glm_stage.py stops a
@@ -57,7 +86,7 @@ cd "$repo"
 # its "Remaining unstaged candidates: N" output — N>0 means the quota is dead
 # and every later year would fast-fail, so propagate and stop the whole loop.
 # Z.AI subscription allows 2 concurrent vision streams.
-for year in 2017 2016 2015 2014 2013 2018; do
+for year in $backlog_years; do
     now_epoch="$(date -u +%s)"
     remaining_seconds=$(( deadline_epoch - now_epoch ))
     if [ "$remaining_seconds" -le "$tail_reserve_seconds" ]; then
@@ -70,12 +99,13 @@ for year in 2017 2016 2015 2014 2013 2018; do
     fi
     printf '%s\n' "--- staging year $year (timeout=${year_budget}s, run remaining=${remaining_seconds}s) ---"
     year_log="$run_dir/stage-$year.log"
-    timeout "$year_budget" python3 scripts/glm_stage.py stage --year "$year" --limit 1500 --workers 2 \
+    timeout "$year_budget" python3 scripts/glm_stage.py stage --year "$year" \
+        --from-manifest "$work_manifest" --check-canonical --limit 1500 --workers 2 \
         >"$year_log" 2>&1
     stage_rc=$?
     cat "$year_log"
     if [ "$stage_rc" -ne 0 ]; then
-        printf 'year %s stage exit=%d (quota/timeout tolerated)\n' "$year" "$stage_rc"
+        printf 'year %s stage exit=%d (see explicit skip/failure details above)\n' "$year" "$stage_rc"
     fi
     remaining_candidates="$(grep -oE '(remaining=|Remaining unstaged candidates: )[0-9]+' "$year_log" | grep -oE '[0-9]+' | tail -n 1 || true)"
     if [ -n "$remaining_candidates" ] && [ "$remaining_candidates" -gt 0 ]; then

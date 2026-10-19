@@ -63,18 +63,29 @@ def write_record(data_dir: Path, record: dict) -> Path:
     return path
 
 
-def write_envelope(data_dir: Path, seed: int = 1, frame_counts: dict | None = None) -> dict:
+def write_envelope(
+    data_dir: Path,
+    seed: int = 1,
+    frame_counts: dict | None = None,
+    frame_counts_by_stratum: dict | None = None,
+) -> dict:
     records = audit_sample.load_staging_records(data_dir)
     sample = [
         {"doc_id": str(record["doc_id"]), "year": int(record["year"])}
         for _, record in records
     ]
+    actual_frame, actual_strata = audit_sample._sampling_design_frame(records)
     envelope = {
         "schema": audit_sample.SAMPLE_SCHEMA,
         "seed": seed,
         "per_year": len(sample),
         "created_at_utc": "2026-10-18T00:00:00Z",
-        "frame_counts_by_year": frame_counts or {},
+        "frame_counts_by_year": frame_counts if frame_counts is not None else actual_frame,
+        "frame_counts_by_stratum": (
+            frame_counts_by_stratum
+            if frame_counts_by_stratum is not None
+            else actual_strata
+        ),
         "lot": audit_sample.freeze_lot(records, sample),
     }
     out = audit_sample.staging_root(data_dir) / f"audit-sample-{seed}.json"
@@ -431,6 +442,71 @@ def test_population_weighted_pooling_known_case():
     assert "staged counts per year" in report["pooling_method"]
 
 
+def test_stratified_bound_weights_flagged_and_unflagged_cells():
+    """Worked 2-cell example: census flagged docs, random sample of plain docs."""
+    records = []
+    results = []
+    sample = []
+    for i in range(5):
+        record = make_record(f"flag{i}")
+        record["asset_review"] = True
+        records.append((2024, record))
+        sample.append({"doc_id": record["doc_id"], "year": 2024})
+        results.append(
+            fail_entry(record["doc_id"], severity="critical")
+            if i == 0
+            else pass_entry(record["doc_id"])
+        )
+    for i in range(5):
+        record = make_record(f"plain{i}")
+        records.append((2024, record))
+        sample.append({"doc_id": record["doc_id"], "year": 2024})
+        results.append(pass_entry(record["doc_id"]))
+    lot = audit_sample.freeze_lot(records, sample)
+    staged = {record["doc_id"]: record for _, record in records}
+    report = audit_sample.build_report(
+        results,
+        {doc_id: [] for doc_id in staged},
+        set(staged),
+        lot=lot,
+        staged_records_by_doc=staged,
+        frame_counts_by_year={"2024": 100},
+        frame_counts_by_stratum={
+            "2024": {"flagged": 5, "unflagged": 95}
+        },
+    )
+    # K_flagged=1 exactly (5/5 census); no plain docs were observed because
+    # all five remaining quota slots were not available in this drawn lot.
+    # In this worked sample, 5 plain docs are observed; the other 90 are not,
+    # so they conservatively contribute 90 possible critical failures.
+    assert report["upper_bound_method"].startswith("simultaneous exact hypergeometric")
+    assert report["upper_bound_strata"] == [
+        {
+            "year": 2024,
+            "asset_review": "flagged",
+            "population": 5,
+            "audited": 5,
+            "critical_failures": 1,
+            "upper_critical_failures": 1,
+            "upper_rate": 0.2,
+        },
+        {
+            "year": 2024,
+            "asset_review": "unflagged",
+            "population": 95,
+            "audited": 5,
+            "critical_failures": 0,
+            "upper_critical_failures": report["upper_bound_strata"][1]["upper_critical_failures"],
+            "upper_rate": report["upper_bound_strata"][1]["upper_rate"],
+        },
+    ]
+    assert report["upper_bound"] == pytest.approx(
+        sum(cell["upper_critical_failures"] for cell in report["upper_bound_strata"]) / 100
+    )
+    assert report["upper_bound"] >= report["pooled_binomial_upper_bound"]
+    assert report["critical_failure_count"] == 1
+
+
 def test_unweighted_fallback_is_labelled():
     records, results, promoted = _pooling_fixture()
     lot = audit_sample.freeze_lot(records, [
@@ -566,7 +642,14 @@ def test_freeze_lot_carries_asset_review_flag(data_dir):
 def test_cli_report_first_line_is_caveat_and_budget_not_met_exits_1(data_dir, capsys):
     record = make_record("p1", rows=[["X", "Purchase", "01/15/24", None, "A"]])
     write_record(data_dir, record)
-    write_envelope(data_dir, seed=3)
+    # Explicit population frame: the lot is 1 doc of a 100-doc population, so
+    # the design-based bound cannot certify <1% (census would trivially pass).
+    write_envelope(
+        data_dir,
+        seed=3,
+        frame_counts={"2024": 100},
+        frame_counts_by_stratum={"2024": {"flagged": 0, "unflagged": 100}},
+    )
     root = audit_sample.staging_root(data_dir)
     (root / "promoted.jsonl").write_text('{"doc_id": "p1", "inserted": 1}\n')
     gt = data_dir / "gt"
@@ -743,7 +826,22 @@ def test_cosmetic_only_fail_meets_budget_with_zero_critical_rate():
     results = [fail_entry("c1", severity="cosmetic")]
     results += [pass_entry(f"p{i}") for i in range(298)]
     promoted = {f"p{i}" for i in range(298)}
-    report = audit_sample.build_report(results, {}, promoted)
+    ids = ["c1"] + [f"p{i}" for i in range(298)]
+    records = [(2024, make_record(doc_id)) for doc_id in ids]
+    lot = audit_sample.freeze_lot(
+        records,
+        [{"doc_id": record["doc_id"], "year": year} for year, record in records],
+    )
+    staged = {record["doc_id"]: record for _, record in records}
+    report = audit_sample.build_report(
+        results,
+        {},
+        promoted,
+        lot=lot,
+        staged_records_by_doc=staged,
+        frame_counts_by_year={"2024": 100000},
+        frame_counts_by_stratum={"2024": {"flagged": 0, "unflagged": 100000}},
+    )
     assert report["state"] == "complete"
     assert report["failure_count"] == 1  # still a recorded (sticky) failure
     assert ("c1", "verdict:fail") in report["failures"]
@@ -761,23 +859,41 @@ def test_mixed_severities_budget_reflects_critical_only():
     def cohort(severity):
         results = [fail_entry("x1", severity=severity)]
         results += [pass_entry(f"p{i}") for i in range(399)]
-        return results, {f"p{i}" for i in range(399)}
+        promoted = {f"p{i}" for i in range(399)}
+        ids = ["x1"] + [f"p{i}" for i in range(399)]
+        records = [(2024, make_record(doc_id)) for doc_id in ids]
+        lot = audit_sample.freeze_lot(
+            records,
+            [{"doc_id": record["doc_id"], "year": year} for year, record in records],
+        )
+        staged = {record["doc_id"]: record for _, record in records}
+        return results, promoted, lot, staged
 
-    results, promoted = cohort("critical")
-    critical_report = audit_sample.build_report(results, {}, promoted)
+    frame_counts = {"2024": 100000}
+    frame_strata = {"2024": {"flagged": 0, "unflagged": 100000}}
+    results, promoted, lot, staged = cohort("critical")
+    kwargs = dict(
+        lot=lot,
+        staged_records_by_doc=staged,
+        frame_counts_by_year=frame_counts,
+        frame_counts_by_stratum=frame_strata,
+    )
+    critical_report = audit_sample.build_report(results, {}, promoted, **kwargs)
     assert critical_report["failure_count"] == 1
     assert critical_report["critical_failure_count"] == 1
     assert critical_report["cosmetic_failure_count"] == 0
     assert critical_report["rate"] == pytest.approx(1 / 400)
     assert critical_report["budget_met"] is False  # bound(1, 400) ~ 1.3% > 1%
 
-    results, promoted = cohort("cosmetic")
-    cosmetic_report = audit_sample.build_report(results, {}, promoted)
+    results, promoted, lot, staged = cohort("cosmetic")
+    kwargs["lot"] = lot
+    kwargs["staged_records_by_doc"] = staged
+    cosmetic_report = audit_sample.build_report(results, {}, promoted, **kwargs)
     assert cosmetic_report["failure_count"] == 1  # total unchanged
     assert cosmetic_report["critical_failure_count"] == 0
     assert cosmetic_report["cosmetic_failure_count"] == 1
     assert cosmetic_report["rate"] == 0.0
-    assert cosmetic_report["budget_met"] is True  # bound(0, 400) ~ 0.75% <= 1%
+    assert cosmetic_report["budget_met"] is True  # cosmetic fails do NOT block
 
 
 def test_legacy_fail_without_severity_counts_critical_conservatively():
@@ -893,7 +1009,14 @@ def test_cli_report_legacy_fail_prints_reclassify_note_and_counts_critical(data_
 
 def test_state_file_gains_critical_failures_and_keeps_v2_contract(data_dir, capsys):
     write_record(data_dir, make_record("S1"))
-    write_envelope(data_dir, seed=11)
+    # Explicit population frame (1 audited of 100): 0 critical in 1 must not
+    # certify a <1% bound for the population.
+    write_envelope(
+        data_dir,
+        seed=11,
+        frame_counts={"2024": 100},
+        frame_counts_by_stratum={"2024": {"flagged": 0, "unflagged": 100}},
+    )
     audit_sample.record_verdict(
         data_dir, "S1", "fail", "asset description spacing", severity="cosmetic"
     )
@@ -940,7 +1063,14 @@ def test_live_30_doc_lot_completes_despite_historical_outside_lot_verdicts(
     ]
     for doc_id in doc_ids:
         write_record(data_dir, make_record(doc_id, year=2017))
-    write_envelope(data_dir, seed=20261019, frame_counts={"2017": 30})
+    write_envelope(
+        data_dir,
+        seed=20261019,
+        frame_counts={"2017": 584},
+        frame_counts_by_stratum={
+            "2017": {"flagged": 0, "unflagged": 584}
+        },
+    )
     root = audit_sample.staging_root(data_dir)
     cosmetic_doc = "20006747"
     results = [pass_entry(doc_id) for doc_id in doc_ids if doc_id != cosmetic_doc]
@@ -977,7 +1107,8 @@ def test_live_30_doc_lot_completes_despite_historical_outside_lot_verdicts(
     assert state["critical_failure_count"] == 0
     assert state["cosmetic_failure_count"] == 1
     assert state["rate"] == 0.0
-    assert state["upper_bound"] == pytest.approx(0.09503385285530411)
+    assert state["upper_bound"] < state["pooled_binomial_upper_bound"]
+    assert state["upper_bound_method"].startswith("simultaneous exact hypergeometric")
     assert state["outside_lot"] == sorted(
         cosmetic_outside + [critical_outside] + pass_outside
     )
@@ -988,8 +1119,9 @@ def test_live_30_doc_lot_completes_despite_historical_outside_lot_verdicts(
     assert state["population_cosmetic_failure_count"] == 3
     assert state["completion_reasons"] == []
     assert "Omission check not run" in out and "pixel-only certification" in out
-    assert "One-sided exact 95% upper bound (critical): 9.503%" in out
-    assert "Owner budget (critical-only exact upper bound <= 1%" in out
+    assert "One-sided exact 95% design-based upper bound (critical):" in out
+    assert "pooled unweighted-binomial reference (not acceptance bound): 9.503%" in out
+    assert "Owner budget (critical-only design-based upper bound <= 1%" in out
     assert "NOT MET" in out
     assert "8 OUTSIDE-LOT doc(s)" in out
     assert "outside-lot contribution of 1 critical and 2 cosmetic" in out

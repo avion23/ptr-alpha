@@ -36,10 +36,10 @@ Subcommands:
     Insert AUDITED staged rows into canonical through the EXISTING
     ``ocr_zero_rows.insert_transactions`` path (parser_version
     ``v1-glm53-vision``, engines ``visionb``), mirror ``main()``'s parse-run
-    bookkeeping, and delete the staging JSON (promotion = consumed) only
+    bookkeeping, and archive the staging JSON (promotion = consumed) only
     when the FULL staged row set is confirmed committed — a partial or
-    rejected insert keeps the record and stamps the rejection details on
-    it. A promoted doc lands a success/no_txs ``v1-glm53-vision`` parse
+    rejected insert keeps the live record and stamps the rejection details
+    on it. A promoted doc lands a success/no_txs ``v1-glm53-vision`` parse
     run, which is exactly what removes it from ``get_ocr_work_items`` —
     the disposition record IS the queue exclusion.
 * ``status``
@@ -57,12 +57,13 @@ snapshot of the artifact bytes, not the live file three times. Re-staging
 a doc that already has a live record archives the previous record as
 ``<year>/attempts/<doc_id>.attempt-<n>.json`` (n = prior attempt count,
 newest live record keeps the canonical name, at most MAX_RETAINED_ATTEMPTS
-retained — the attempted archive subdirectory keeps it out of the
-record-counting globs in doctor.py/audit_sample.py). ``audit record``
-stores the record identity (``pdf_sha256 + prompt_sha256 +
-parsed_at_utc``) in its audit-results entry, and ``promote`` refuses any
-audit-pass record whose live identity no longer matches the audited
-identity (recipe changed after audit → re-audit).
+unreferenced archives are retained — audit/promotion-referenced attempts
+survive pruning, and the attempts subdirectory keeps history out of
+record-counting globs in doctor.py/audit_sample.py. Each record carries a
+canonical hash of its extracted rows; verdict binding additionally checks
+the audit workflow's stable staged-record content hash and the record
+identity (``pdf_sha256 + prompt_sha256 + parsed_at_utc``). Metadata-only
+legacy verdicts remain historical but cannot authorize promotion.
 
 Concurrency (FP review finding 11): ``--workers`` is capped at
 MAX_WORKERS (2 — the Z.AI subscription allows two concurrent vision
@@ -120,6 +121,7 @@ from scripts.audit_sample import (  # noqa: E402
     REPORT_STATE_NAME as AUDIT_REPORT_STATE_NAME,
     REPORT_STATE_SCHEMA as AUDIT_REPORT_STATE_SCHEMA,
     load_audit_results as load_audit_results,
+    staged_record_sha256 as audit_staged_record_sha256,
 )
 
 GLM_PARSER_VERSION = "v1-glm53-vision"
@@ -139,7 +141,7 @@ GOOGLE_503_CONSECUTIVE_STOP_THRESHOLD = 5
 # exhaustion can write transient error records across the rest of a manifest.
 MAX_WORKERS = 2  # Z.AI subscription allows 2 concurrent vision streams
 CLI_COOLDOWN = 3.0  # seconds between endpoint requests (mirrors ocr_zero_rows)
-MAX_RETAINED_ATTEMPTS = 3  # archived re-stage attempts kept per doc
+MAX_RETAINED_ATTEMPTS = 3  # minimum cap; referenced archives are never pruned
 WORK_MANIFEST_SCHEMA = "glm-work-manifest-v1"
 # Asset-normalization review flag (interface audit item 3): GLM sometimes
 # damages asset text during normalization — drops repeated issuer wording
@@ -219,6 +221,81 @@ def archived_attempts(data_dir: str | Path, year: int, doc_id: str) -> list[tupl
     return sorted(pairs)
 
 
+def staged_rows_sha256(rows) -> str:
+    """Hash extracted rows using canonical JSON serialization."""
+    canonical = json.dumps(
+        rows, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _attempt_reference(
+    data_dir: str | Path, year: int, record: dict
+) -> tuple[bool, str | None]:
+    """Return whether audit/promotion history cites this attempt; unsafe history retains it."""
+    root = staging_root(data_dir)
+    rows_hash = staged_rows_sha256(record.get("rows", []))
+    stable_hash = audit_staged_record_sha256(record)
+    identity = record_identity(record)
+    audit_path = root / AUDIT_RESULTS_NAME
+    try:
+        audit_entries = (
+            json.loads(audit_path.read_text(encoding="utf-8"))
+            if audit_path.exists()
+            else []
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        return True, f"audit history unreadable: {exc}"
+    if not isinstance(audit_entries, list):
+        return True, "audit history is not a list"
+    for entry in audit_entries:
+        if not isinstance(entry, dict):
+            return True, "audit history contains a malformed entry"
+        if str(entry.get("doc_id")) != str(record.get("doc_id")):
+            continue
+        if (
+            entry.get("staged_rows_sha256") == rows_hash
+            or entry.get("staged_record_sha256") == stable_hash
+        ):
+            return True, None
+        if all(identity.values()) and all(
+            entry.get(key) == value for key, value in identity.items()
+        ):
+            return True, None  # legacy metadata-only verdict still references the attempt
+
+    journal_path = root / PROMOTED_JOURNAL_NAME
+    try:
+        lines = (
+            journal_path.read_text(encoding="utf-8").splitlines()
+            if journal_path.exists()
+            else []
+        )
+        promotions = [json.loads(line) for line in lines if line.strip()]
+    except (OSError, json.JSONDecodeError) as exc:
+        return True, f"promotion journal unreadable: {exc}"
+    for entry in promotions:
+        if not isinstance(entry, dict):
+            return True, "promotion journal contains a malformed entry"
+        if str(entry.get("doc_id")) != str(record.get("doc_id")):
+            continue
+        try:
+            same_year = int(entry.get("year")) == int(year)
+        except (TypeError, ValueError):
+            return True, "promotion journal contains an invalid year"
+        if not same_year:
+            continue
+        row_reference = entry.get("staged_rows_sha256")
+        record_reference = entry.get("staged_record_sha256")
+        if row_reference is None and record_reference is None:
+            return True, None  # old journal entry protects every attempt for this doc
+        if row_reference in (None, rows_hash) and record_reference in (
+            None,
+            stable_hash,
+        ):
+            return True, None
+    return False, None
+
+
 def archive_current_attempt(data_dir: str | Path, year: int, doc_id: str) -> Path | None:
     """Versioned re-stage (finding 6): archive the live record, never overwrite.
 
@@ -228,9 +305,9 @@ def archive_current_attempt(data_dir: str | Path, year: int, doc_id: str) -> Pat
     evidence. n is the prior attempt count (max existing archive number + 1,
     which equals the prior attempt count until the retention cap prunes the
     oldest — after pruning the numbering keeps growing instead of colliding
-    with a retained archive). At most MAX_RETAINED_ATTEMPTS archives are
-    retained (oldest deleted). Returns the archive path, or None when no
-    live record existed.
+    with a retained archive). Oldest unreferenced archives are pruned beyond
+    MAX_RETAINED_ATTEMPTS. Verdict- or promotion-referenced evidence remains.
+    Returns the archive path, or None when no live record existed.
     """
     live = staging_record_path(data_dir, year, doc_id)
     if not live.exists():
@@ -241,8 +318,40 @@ def archive_current_attempt(data_dir: str | Path, year: int, doc_id: str) -> Pat
     target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(live, target)
     retained = archived_attempts(data_dir, year, doc_id)
-    for _, stale in retained[: max(len(retained) - MAX_RETAINED_ATTEMPTS, 0)]:
+    excess = max(len(retained) - MAX_RETAINED_ATTEMPTS, 0)
+    removed = 0
+    for _, stale in retained:
+        if removed >= excess:
+            break
+        try:
+            raw = stale.read_bytes()
+            record = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            print(
+                f"  [{doc_id}] retaining unreadable staging attempt: {stale}",
+                flush=True,
+            )
+            continue
+        referenced, reason = _attempt_reference(data_dir, year, record)
+        if referenced:
+            print(
+                f"  [{doc_id}] retaining referenced staging attempt: {stale}"
+                + (f" ({reason})" if reason else ""),
+                flush=True,
+            )
+            continue
         stale.unlink(missing_ok=True)
+        # Recheck the append-only reference histories. Restore evidence if a
+        # verdict/promotion raced with pruning rather than leave a dangling ref.
+        referenced, reason = _attempt_reference(data_dir, year, record)
+        if referenced:
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.write_bytes(raw)
+            raise RuntimeError(
+                f"prune verification failed for {stale}: "
+                f"{reason or 'audit or promotion history now references it'}"
+            )
+        removed += 1
     return target
 
 
@@ -482,6 +591,7 @@ def build_staging_record(
         "pages": None,
         "member": None,
         "rows": [],
+        "staged_rows_sha256": None,
         "row_pages": [],
         "raw_output": None,
         "parse_status": "error",
@@ -536,6 +646,7 @@ def build_staging_record(
             # The response text exists but failed the schema/transport gate:
             # retain it. Invalid responses are evidence, not noise.
             record["raw_output"] = raw_output
+    record["staged_rows_sha256"] = staged_rows_sha256(record["rows"])
     return record
 
 
@@ -610,6 +721,21 @@ def load_work_manifest_items(path: str | Path) -> tuple[list[dict], str | None]:
         if not isinstance(item, dict) or "doc_id" not in item or "year" not in item:
             return [], f"{manifest_path}: malformed manifest item at index {index}"
     return payload["items"], None
+
+
+def manifest_years(items: list[dict]) -> tuple[list[int], str | None]:
+    """Distinct backlog years from the authoritative manifest, newest first."""
+    years = set()
+    for index, item in enumerate(items):
+        year = item.get("year") if isinstance(item, dict) else None
+        if (
+            not isinstance(year, int)
+            or isinstance(year, bool)
+            or not 1000 <= year <= 9999
+        ):
+            return [], f"malformed manifest year at item {index}: {year!r}"
+        years.add(year)
+    return sorted(years, reverse=True), None
 
 
 def select_candidates_from_manifest(
@@ -687,6 +813,7 @@ def stage_batch(
     cooldown: float = 0.0,
     workers: int = 1,
     manifest: list[dict] | None = None,
+    dry_run: bool = False,
 ) -> dict:
     """Stage up to ``limit`` docs for ``year``. Never raises for endpoint states.
 
@@ -723,18 +850,11 @@ def stage_batch(
             f"{MAX_WORKERS} concurrent vision streams; values above "
             f"{MAX_WORKERS} violate the quota budget and are not accepted"
         )
-    if config is None and read_fn is None:
-        config = VisionBConfig.from_env()
-        if config is None:
-            raise RuntimeError(
-                "GLM vision endpoint is not configured: set VISION_B_BASE_URL, "
-                "VISION_B_MODEL (and VISION_B_API_KEY / VISION_B_TIMEOUT)"
-            )
     if manifest is None:
         candidates = select_candidates(
             year, limit, data_dir, check_canonical=check_canonical, db_path=db_path
         )
-        missing_pdfs = 0
+        notes = []
     else:
         candidates, notes = select_candidates_from_manifest(
             manifest,
@@ -744,9 +864,44 @@ def stage_batch(
             check_canonical=check_canonical,
             db_path=db_path,
         )
-        missing_pdfs = len(notes)
-        for note in notes:
-            print(f"  {note}", flush=True)
+    for note in notes:
+        print(f"  {note}", flush=True)
+    missing_pdfs = len(notes)
+    pdfs_dir = Path(data_dir) / str(year) / "pdfs"
+    missing_dirs = int(not pdfs_dir.is_dir())
+    if missing_dirs:
+        print(
+            f"SKIP: missing PDF directory {pdfs_dir}; "
+            f"year {year} selection is not an empty-success (missing_dirs=1)",
+            flush=True,
+        )
+    if dry_run:
+        print(
+            f"DRY RUN year={year}: manifest_candidates={len(candidates)} "
+            f"missing_pdfs={missing_pdfs} missing_dirs={missing_dirs}",
+            flush=True,
+        )
+        return {
+            "year": year,
+            "candidates": len(candidates),
+            "staged": 0,
+            "errors": 0,
+            "quota_stop": False,
+            "google_quota_dead": False,
+            "google_endpoint_saturated": False,
+            "fatal_stop": False,
+            "remaining": 0,
+            "missing_pdfs": missing_pdfs,
+            "missing_dirs": missing_dirs,
+            "dry_run": True,
+        }
+    if config is None and read_fn is None:
+        config = VisionBConfig.from_env()
+        if config is None:
+            raise RuntimeError(
+                "GLM vision endpoint is not configured: set VISION_B_BASE_URL, "
+                "VISION_B_MODEL (and VISION_B_API_KEY / VISION_B_TIMEOUT)"
+            )
     staged = errors = 0
     quota_stop = False
     google_quota_dead = False
@@ -874,6 +1029,7 @@ def stage_batch(
             "fatal_stop": fatal_stop,
             "remaining": remaining,
             "missing_pdfs": missing_pdfs,
+            "missing_dirs": missing_dirs,
         }
 
     from concurrent.futures import (
@@ -958,6 +1114,7 @@ def stage_batch(
         "fatal_stop": fatal_stop,
         "remaining": remaining,
         "missing_pdfs": missing_pdfs,
+        "missing_dirs": missing_dirs,
     }
 
 
@@ -1190,13 +1347,11 @@ def verdict_binding(
 ) -> tuple[bool, str | None]:
     """(bound, refusal_reason) between the audit history and THIS record.
 
-    ``audit_sample.record_verdict`` stores the audited record's identity in
-    its audit-results entry; promotion requires a pass entry whose identity
-    equals the live record's. A mismatch means the record was re-staged (or
-    the recipe/artifact changed) after the audit — the pass verdict says
-    nothing about the live attempt, so promotion is refused (re-audit).
-    Entries written before identity binding existed carry no identity and
-    can never satisfy the check: fail-closed.
+    ``audit_sample.record_verdict`` stores a canonical stable-record content
+    hash plus the extraction identity in its audit-results entry. The stable
+    hash includes the staged rows and their dedicated rows hash; identity is
+    also checked for recipe/artifact/attempt drift. Metadata-only legacy
+    entries remain historical but cannot authorize promotion.
     """
     passes = [
         entry
@@ -1211,17 +1366,52 @@ def verdict_binding(
             "audit_sample.py record"
         )
     identity = record_identity(record)
+    rows_hash = staged_rows_sha256(record.get("rows", []))
+    recorded_rows_hash = record.get("staged_rows_sha256")
+    if recorded_rows_hash is not None and recorded_rows_hash != rows_hash:
+        return False, (
+            "refused: staged row content does not match staged_rows_sha256; "
+            "the staged evidence changed or its content hash is corrupt"
+        )
+    # Failed promotion details are mutable bookkeeping, not OCR evidence.
+    stable_hashes = {
+        audit_staged_record_sha256(record),
+        audit_staged_record_sha256(
+            {key: value for key, value in record.items() if key != "promotion"}
+        ),
+    }
     for entry in passes:
         entry_identity = {field: entry.get(field) for field in AUDIT_IDENTITY_FIELDS}
-        if entry_identity == identity and all(
-            value is not None for value in entry_identity.values()
+        # audit_sample's stable-record hash is a canonical content hash that
+        # includes rows (and, for newly staged records, staged_rows_sha256).
+        # Prefer it over the legacy metadata-only triple.
+        entry_content_hash = entry.get("staged_record_sha256")
+        entry_rows_hash = entry.get("staged_rows_sha256")
+        if entry_rows_hash is not None and entry_rows_hash != rows_hash:
+            continue
+        if (
+            entry_content_hash in stable_hashes
+            and (entry_rows_hash is None or entry_rows_hash == rows_hash)
         ):
             return True, None
+        # Old audit records can carry a frozen full-record hash but predate
+        # the dedicated rows field. Their original full-record binding is
+        # still meaningful and is checked above; metadata-only entries are
+        # preserved as pre-content-hash history but cannot authorize a new
+        # promotion because they cannot prove which rows were reviewed.
+        if (
+            entry_identity == identity
+            and all(value is not None for value in entry_identity.values())
+            and entry_content_hash is None
+        ):
+            continue
     return False, (
-        "refused: the audit pass verdict is not bound to this record's "
-        "identity (pdf_sha256/prompt_sha256/parsed_at_utc) — the record "
-        "was re-staged after the audit or the verdict predates identity "
-        "binding; re-audit the current attempt"
+        "refused: the audit pass verdict is not bound to this record's identity "
+        "and staged row content (canonical rows sha256); stable record content "
+        "also requires pdf_sha256/prompt_sha256/parsed_at_utc; metadata-only/"
+        "pre-content-hash verdicts are historical only and cannot authorize "
+        "promotion (the record may have been re-staged after the audit) — "
+        "re-audit the current attempt"
     )
 
 
@@ -1266,17 +1456,17 @@ def promote_docs(
 
     ``insert_transactions`` (imported from ``scripts.ocr_zero_rows``) writes
     the transactions AND the pdf_parse_runs record transactionally, exactly
-    as the OCR path does. The staging JSON is deleted — promotion consumes
-    the record — ONLY when the FULL staged row set is confirmed committed
+    as the OCR path does. The staging JSON is archived — promotion consumes
+    the live record — ONLY when the FULL staged row set is confirmed committed
     (outcome complete: committed, no rejections, count matches). A partial
     or rejected insert keeps the record and stamps the rejection details on
     it; a member rejection is never mistaken for a no_txs.
 
     Verdict binding (finding 6): an ``audit: pass`` stamp is only accepted
     when the audit-results history contains a pass entry bound to THIS
-    record's identity (pdf_sha256 + prompt_sha256 + parsed_at_utc). A
-    record re-staged after its audit (or a verdict predating identity
-    binding) is refused — the audited attempt is not the live one.
+    record's staged content hash and identity (pdf_sha256 + prompt_sha256 +
+    parsed_at_utc). A metadata-only legacy verdict cannot authorize
+    promotion; a re-staged attempt must be re-audited.
     """
     if not require_audit_pass:
         raise ValueError(
@@ -1436,7 +1626,9 @@ def promote_docs(
             )
             failed += 1
             continue
-        staging_record_path(data_dir, year, doc_id).unlink(missing_ok=True)
+        staged_hash = audit_staged_record_sha256(record)
+        rows_hash = staged_rows_sha256(rows)
+        archived = archive_current_attempt(data_dir, year, doc_id)
         append_promoted_journal(
             root,
             {
@@ -1447,6 +1639,11 @@ def promote_docs(
                 "unaudited": bool(force_unaudited),
                 "parser_version": GLM_PARSER_VERSION,
                 "promoted_at_utc": utc_now_iso(),
+                "staged_record_sha256": staged_hash,
+                "staged_rows_sha256": rows_hash,
+                "staging_attempt": (
+                    str(archived.relative_to(root)) if archived is not None else None
+                ),
             },
         )
         promoted += 1
@@ -1538,6 +1735,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_stage.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show manifest/canonical selection and skip counts without GLM calls",
+    )
+    p_stage.add_argument(
         "--cooldown", type=float, default=CLI_COOLDOWN, help="seconds between docs"
     )
     p_stage.add_argument(
@@ -1611,6 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
                 cooldown=args.cooldown,
                 workers=args.workers,
                 manifest=manifest_items,
+                dry_run=args.dry_run,
             )
         except ValueError as exc:
             # Finding 11: a workers override above the 2-stream budget is a
@@ -1621,10 +1824,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         print(
-            f"\n=== STAGE DONE year={result['year']} "
+            f"\n=== {'STAGE DRY RUN' if result.get('dry_run') else 'STAGE DONE'} "
+            f"year={result['year']} "
             f"candidates={result['candidates']} staged={result['staged']} "
-            f"errors={result['errors']} ==="
+            f"errors={result['errors']} missing_pdfs={result.get('missing_pdfs', 0)} "
+            f"missing_dirs={result.get('missing_dirs', 0)} ==="
         )
+        if result.get("missing_dirs"):
+            return 2
         if result["quota_stop"]:
             if result.get("google_endpoint_saturated"):
                 print(

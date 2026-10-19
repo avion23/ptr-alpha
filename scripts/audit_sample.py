@@ -4,7 +4,7 @@
 Implements the acceptance measurement the FP ruling requires before any
 canonical promotion: a stratified random sample of staged documents,
 rendered back to pixels for independent owner review, and an exact
-one-sided binomial bound on the material-error rate against an
+design-based upper bound on the material-error rate against an
 owner-approved budget (illustrative <1% at 95% confidence).
 
 Finding 9 fail-closed semantics (report can never manufacture acceptance):
@@ -40,10 +40,10 @@ Finding 9 fail-closed semantics (report can never manufacture acceptance):
   evidence (plus row-multiset evidence when ground truth was requested).
   A sticky fail is resolved evidence even if it was later re-recorded; a
   later pass does not erase it. Verdicts outside the frozen lot do not block
-  completion or enter the current-lot binomial bound, but their sticky
+  completion or enter the current-lot bound, but their sticky
   failures remain in a separate all-history population tally. ``budget_met``
   is always a boolean for a complete report and means the critical-only
-  current-lot exact upper bound is <= ``--max-rate``; it is ``None`` only
+  current-lot design-based upper bound is <= ``--max-rate``; it is ``None`` only
   for an incomplete report.
 * Stratification is reported honestly: per-stratum counts/rates plus a
   pooled rate weighted by staged population counts per year (frozen at
@@ -56,7 +56,7 @@ Finding 9 fail-closed semantics (report can never manufacture acceptance):
   spelling) are COSMETIC — flagged and tracked, not blocking.
   ``record --severity cosmetic`` classifies a fail as cosmetic; the
   report's ``budget_met`` counts CRITICAL fails only (the one-sided
-  binomial bound applies to the critical rate) while cosmetic fails
+  bound applies to the critical rate) while cosmetic fails
   stay visible (count + docs). Entries recorded before ``--severity``
   existed carry no severity and count CRITICAL (conservative); the
   report prints a note so the operator can re-record reclassified
@@ -80,7 +80,7 @@ Subcommands:
     separately and do not block promotion (owner-approved budget).
 * ``report  [--max-rate 0.01] [--ground-truth-dir DIR] [--sample-file P]``
     Material-error accounting over the frozen lot with the one-sided
-    exact 95% binomial upper bound. Exit codes: 0 complete + budget met,
+    exact stratified hypergeometric upper bound. Exit codes: 0 complete + budget met,
     1 complete + budget NOT met, 2 INCOMPLETE audit (refuses: the full-lot
     budget cannot be certified). Writes ``audit-report-state.json`` next to the
     results file with ``state`` in {"complete", "incomplete"} and
@@ -228,6 +228,193 @@ def binomial_upper_bound(f: int, n: int, confidence: float = DEFAULT_CONFIDENCE)
         return _exact_upper_bound(f, n, confidence)
 
 
+def _hypergeom_cdf_at_most(population: int, failures: int, draws: int, observed: int) -> float:
+    """P(X <= observed) for X ~ Hypergeometric(population, failures, draws)."""
+    if observed < 0:
+        return 0.0
+    if failures <= 0:
+        return 1.0
+    if failures >= population:
+        return 1.0 if observed >= draws else 0.0
+    try:
+        from scipy.stats import hypergeom
+
+        return float(hypergeom.cdf(observed, population, failures, draws))
+    except Exception:
+        lower = max(0, draws - (population - failures))
+        upper = min(observed, draws, failures)
+        if upper < lower:
+            return 0.0
+        log_denominator = (
+            math.lgamma(population + 1)
+            - math.lgamma(draws + 1)
+            - math.lgamma(population - draws + 1)
+        )
+        log_terms = []
+        for selected_failures in range(lower, upper + 1):
+            log_terms.append(
+                math.lgamma(failures + 1)
+                - math.lgamma(selected_failures + 1)
+                - math.lgamma(failures - selected_failures + 1)
+                + math.lgamma(population - failures + 1)
+                - math.lgamma(draws - selected_failures + 1)
+                - math.lgamma(population - failures - draws + selected_failures + 1)
+            )
+        maximum = max(log_terms)
+        return min(
+            1.0,
+            math.exp(
+                maximum
+                + math.log(sum(math.exp(value - maximum) for value in log_terms))
+                - log_denominator
+            ),
+        )
+
+
+def _hypergeometric_upper_failures(
+    observed_failures: int, draws: int, population: int, alpha: float
+) -> int:
+    """Exact one-sided upper confidence limit for finite-population failures."""
+    if draws <= 0 or observed_failures >= draws:
+        return population
+    if draws >= population:
+        return observed_failures
+    low, high = 0, population
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _hypergeom_cdf_at_most(population, middle, draws, observed_failures) >= alpha:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def _stratified_critical_upper_bound(
+    lot: list[dict] | None,
+    critical_ids: set[str],
+    resolved_ids: set[str],
+    frame_counts_by_stratum: dict | None,
+    confidence: float,
+    frame_counts_by_year: dict | None = None,
+) -> tuple[float, str, list[dict]]:
+    """Conservative, design-based bound for year x asset-review strata.
+
+    Each frozen design cell is a uniform sample without replacement (the
+    sampler either censuses flagged docs, randomly samples the flagged group,
+    then randomly fills remaining quota from unflagged docs). For cell h with
+    population N_h, audited n_h and critical failures f_h, find the exact
+    hypergeometric upper count K_h at tail alpha_h=(1-confidence)/m, where m
+    is the number of sampled, non-census cells. Bonferroni gives simultaneous
+    coverage >= confidence; the population-weighted total bound is
+    U=sum(K_h)/sum(N_h). Census cells use their observed count exactly, and
+    unobserved cells contribute N_h (no invented coverage). This assumes the
+    frozen frame counts and asset_review membership match the sampling frame;
+    missing/mismatched metadata or unresolved audit outcomes fail closed at 1.
+    Only critical failures enter f_h; cosmetic failures remain non-blocking.
+    """
+    def unavailable(reason: str) -> tuple[float, str, list[dict]]:
+        return 1.0, f"fail-closed: {reason}", []
+
+    if not lot:
+        return unavailable("frozen sample design unavailable")
+    if not frame_counts_by_stratum:
+        return unavailable("frozen year x asset_review frame counts unavailable")
+
+    try:
+        frame: dict[tuple[int, str], int] = {}
+        for year_key, counts in frame_counts_by_stratum.items():
+            year = int(year_key)
+            if not isinstance(counts, dict):
+                return unavailable("malformed frozen design counts")
+            for group in ("flagged", "unflagged"):
+                count = counts[group]
+                if isinstance(count, bool) or int(count) != count or int(count) < 0:
+                    return unavailable("invalid frozen design population count")
+                frame[(year, group)] = int(count)
+        if frame_counts_by_year is not None:
+            annual = {int(year): int(count) for year, count in frame_counts_by_year.items()}
+            for year in set(annual) | {key[0] for key in frame}:
+                if annual.get(year, 0) != sum(
+                    count for (cell_year, _), count in frame.items() if cell_year == year
+                ):
+                    return unavailable("frozen annual and design frame counts disagree")
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return unavailable("malformed frozen design counts")
+
+    sample: Counter[tuple[int, str]] = Counter()
+    sample_ids: set[str] = set()
+    for item in lot:
+        if not isinstance(item, dict) or not str(item.get("doc_id") or "").strip():
+            return unavailable("malformed frozen design lot")
+        doc_id = str(item["doc_id"])
+        if doc_id in sample_ids:
+            return unavailable("duplicate frozen design document")
+        sample_ids.add(doc_id)
+        if not isinstance(item.get("asset_review"), bool):
+            return unavailable("frozen asset_review stratum is missing")
+        try:
+            year = int(item["year"])
+        except (KeyError, TypeError, ValueError):
+            return unavailable("invalid frozen design year")
+        group = "flagged" if item["asset_review"] else "unflagged"
+        cell = (year, group)
+        if cell not in frame:
+            return unavailable("sampled design cell absent from frozen frame")
+        sample[cell] += 1
+    if sample_ids != resolved_ids:
+        return unavailable("unresolved docs prevent a design-based bound")
+
+    total_population = sum(frame.values())
+    if total_population <= 0 or len(sample_ids) > total_population:
+        return unavailable("invalid frozen sampling-frame size")
+    for cell, count in sample.items():
+        if count > frame[cell]:
+            return unavailable("sample exceeds frozen design-cell population")
+
+    uncertain = sum(
+        1 for cell, population in frame.items()
+        if population > sample.get(cell, 0) and sample.get(cell, 0) > 0
+    )
+    alpha = (1.0 - confidence) / uncertain if uncertain else 0.0
+    details = []
+    upper_total = 0
+    for cell in sorted(frame):
+        population = frame[cell]
+        if not population:
+            continue
+        draws = sample.get(cell, 0)
+        failures = sum(
+            1 for item in lot
+            if int(item["year"]) == cell[0]
+            and ("flagged" if item["asset_review"] else "unflagged") == cell[1]
+            and str(item["doc_id"]) in critical_ids
+        )
+        if draws == 0:
+            upper_failures = population
+        elif draws == population:
+            upper_failures = failures
+        else:
+            upper_failures = _hypergeometric_upper_failures(
+                failures, draws, population, alpha
+            )
+        upper_total += upper_failures
+        details.append(
+            {
+                "year": cell[0],
+                "asset_review": cell[1],
+                "population": population,
+                "audited": draws,
+                "critical_failures": failures,
+                "upper_critical_failures": upper_failures,
+                "upper_rate": upper_failures / population,
+            }
+        )
+    return min(1.0, upper_total / total_population), (
+        "simultaneous exact hypergeometric; population-weighted year x "
+        "asset_review strata (Bonferroni)"
+    ), details
+
+
 # --------------------------------------------------------------------------
 # frozen-lot hashing
 # --------------------------------------------------------------------------
@@ -280,6 +467,27 @@ def _sampling_frame(records: list[tuple[int, dict]]) -> dict[int, list[str]]:
             continue
         by_year.setdefault(year, []).append(str(record["doc_id"]))
     return by_year
+
+
+def _sampling_design_frame(records: list[tuple[int, dict]]) -> tuple[dict, dict]:
+    """Frozen frame sizes by year and the asset_review sampling group."""
+    by_year = _sampling_frame(records)
+    record_by_doc = {
+        (int(year), str(record["doc_id"])): record for year, record in records
+        if record.get("parse_status") in ("success", "no_txs")
+    }
+    annual = {}
+    by_stratum = {}
+    for year, doc_ids in sorted(by_year.items()):
+        unique_ids = set(doc_ids)
+        annual[str(year)] = len(unique_ids)
+        counts = {"flagged": 0, "unflagged": 0}
+        for doc_id in unique_ids:
+            record = record_by_doc[(year, doc_id)]
+            group = "flagged" if record.get("asset_review") else "unflagged"
+            counts[group] += 1
+        by_stratum[str(year)] = counts
+    return annual, by_stratum
 
 
 def build_sample(
@@ -377,15 +585,14 @@ def write_sample_file(
     out_path: Path,
 ) -> dict:
     """Write the frozen-lot sample file (schema audit-sample-lot-v2)."""
-    frame_counts = Counter(year for year in _sampling_frame(records))
+    frame_counts, frame_counts_by_stratum = _sampling_design_frame(records)
     envelope = {
         "schema": SAMPLE_SCHEMA,
         "seed": int(seed),
         "per_year": int(per_year),
         "created_at_utc": utc_now_iso(),
-        "frame_counts_by_year": {
-            str(year): frame_counts[year] for year in sorted(frame_counts)
-        },
+        "frame_counts_by_year": frame_counts,
+        "frame_counts_by_stratum": frame_counts_by_stratum,
         "lot": freeze_lot(records, sample),
     }
     _atomic_write_json(out_path, envelope)
@@ -817,6 +1024,7 @@ def build_report(
     lot: list[dict] | None = None,
     staged_records_by_doc: dict[str, dict] | None = None,
     frame_counts_by_year: dict | None = None,
+    frame_counts_by_stratum: dict | None = None,
 ) -> dict:
     """Fail-closed material-error accounting over the audit history.
 
@@ -832,6 +1040,21 @@ def build_report(
     equal. Ground truth is optional: without it, passes are pixel-only.
     Promotion is not required for a pass to resolve, but a promoted doc
     whose staging record is gone is UNRESOLVED.
+
+    Acceptance estimator (critical failures only): for each frozen design
+    cell h = (year, asset_review), let N_h be the frozen frame population,
+    n_h the resolved audited sample and f_h its critical failures. Its exact
+    finite-population upper count K_h is the largest K satisfying
+    P[Hypergeom(N_h, K, n_h) <= f_h] >= alpha_h, where
+    alpha_h=(1-confidence)/m and m is the number of sampled, non-census cells
+    (Bonferroni simultaneous coverage). The total bound is
+    U=sum_h(K_h)/sum_h(N_h), i.e. population-weighted by actual cell sizes;
+    census cells contribute f_h exactly and unsampled cells contribute N_h.
+    This requires frozen year-by-flag population counts, frozen membership,
+    and uniform random sampling inside each flagged/unflagged group. Missing
+    design evidence or unresolved docs yields U=1 (fail closed). This is
+    conservative without replacement and does not treat oversampled flagged
+    docs as if they had the population's inclusion probability.
 
     Owner-approved error budget: ``budget_met``, ``rate`` and
     ``upper_bound`` are computed over CRITICAL fails only
@@ -1007,8 +1230,8 @@ def build_report(
         else:
             passed_unpromoted.append(doc_id)
 
-    # Owner-approved error budget: the binomial math below counts
-    # CRITICAL fails only; cosmetic fails are tracked, not blocking.
+    # Owner-approved error budget: the design-based bound counts CRITICAL
+    # fails only; cosmetic fails are tracked, not blocking.
     failures = [(doc_id, reason) for doc_id, reason, _ in failure_records]
     critical_failures = [
         (doc_id, reason) for doc_id, reason, s in failure_records if s == "critical"
@@ -1048,11 +1271,25 @@ def build_report(
     failure_count = len(failures)
     critical_failure_count = len(critical_failures)
     rate = (critical_failure_count / audited) if audited else float("nan")
-    upper = (
+    pooled_binomial_upper = (
         binomial_upper_bound(critical_failure_count, audited, confidence)
         if audited
         else float("nan")
     )
+    resolved_ids = set(failed_ids) | set(clean) | set(passed_unpromoted)
+    if audited:
+        upper, upper_bound_method, upper_bound_strata = _stratified_critical_upper_bound(
+            lot,
+            critical_ids,
+            resolved_ids,
+            frame_counts_by_stratum,
+            confidence,
+            frame_counts_by_year,
+        )
+    else:
+        upper = float("nan")
+        upper_bound_method = "unavailable (no resolved audit docs)"
+        upper_bound_strata = []
 
     completion_reasons = list(lot_issues)
     completion_reasons.extend(
@@ -1162,6 +1399,9 @@ def build_report(
         "omission_details": omission_details,
         "rate": rate,
         "upper_bound": upper,
+        "upper_bound_method": upper_bound_method,
+        "upper_bound_strata": upper_bound_strata,
+        "pooled_binomial_upper_bound": pooled_binomial_upper,
         "confidence": confidence,
         "max_rate": max_rate,
         "budget_met": budget_met,
@@ -1214,6 +1454,9 @@ def _incomplete_state_payload(
         "repaired_count": 0,
         "rate": None,
         "upper_bound": None,
+        "upper_bound_method": "unavailable (incomplete report)",
+        "upper_bound_strata": [],
+        "pooled_binomial_upper_bound": None,
         "confidence": DEFAULT_CONFIDENCE,
         "max_rate": max_rate,
         "pooled_rate": None,
@@ -1271,6 +1514,7 @@ def cmd_report(args) -> int:
         lot=envelope["lot"],
         staged_records_by_doc=staged_records_by_doc,
         frame_counts_by_year=envelope.get("frame_counts_by_year"),
+        frame_counts_by_stratum=envelope.get("frame_counts_by_stratum"),
     )
 
     pct = lambda value: f"{value * 100:.4g}%"  # noqa: E731
@@ -1391,12 +1635,17 @@ def cmd_report(args) -> int:
     if report["state"] == "complete" and report["audited"]:
         print(f"Critical-error rate:       {pct(report['rate'])}")
         print(
-            f"One-sided exact {report['confidence']:.0%} upper bound "
-            f"(critical): {pct(report['upper_bound'])}"
+            f"One-sided exact {report['confidence']:.0%} design-based upper "
+            f"bound (critical): {pct(report['upper_bound'])}"
+        )
+        print(f"  estimator: {report['upper_bound_method']}")
+        print(
+            "  pooled unweighted-binomial reference (not acceptance bound): "
+            f"{pct(report['pooled_binomial_upper_bound'])}"
         )
         met = report["budget_met"]
         print(
-            f"Owner budget (critical-only exact upper bound <= "
+            f"Owner budget (critical-only design-based upper bound <= "
             f"{pct(report['max_rate'])} at {report['confidence']:.0%} confidence): "
             f"{'MET' if met else 'NOT MET'}"
         )
@@ -1452,6 +1701,11 @@ def cmd_report(args) -> int:
             "repaired_count": report["repaired_count"],
             "rate": _num_or_none(report["rate"]),
             "upper_bound": _num_or_none(report["upper_bound"]),
+            "upper_bound_method": report["upper_bound_method"],
+            "upper_bound_strata": report["upper_bound_strata"],
+            "pooled_binomial_upper_bound": _num_or_none(
+                report["pooled_binomial_upper_bound"]
+            ),
             "confidence": report["confidence"],
             "max_rate": report["max_rate"],
             "pooled_rate": _num_or_none(report["pooled_rate"]),
@@ -1513,6 +1767,11 @@ def cmd_report(args) -> int:
             "repaired_count": report["repaired_count"],
             "rate": _num_or_none(report["rate"]),
             "upper_bound": _num_or_none(report["upper_bound"]),
+            "upper_bound_method": report["upper_bound_method"],
+            "upper_bound_strata": report["upper_bound_strata"],
+            "pooled_binomial_upper_bound": _num_or_none(
+                report["pooled_binomial_upper_bound"]
+            ),
             "confidence": report["confidence"],
             "max_rate": report["max_rate"],
             "pooled_rate": _num_or_none(report["pooled_rate"]),
@@ -1555,7 +1814,7 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Pixel audit for staged GLM OCR records: frozen stratified "
             "sampling, review bundle, append-only verdict history, and the "
-            "fail-closed exact binomial material-error budget check (FP "
+            "fail-closed design-based material-error budget check (FP "
             "review 2026-10-18, finding 9)."
         ),
     )
@@ -1588,7 +1847,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_report = subparsers.add_parser(
         "report",
-        help="critical-error rate + binomial budget check (fail-closed; "
+        help="critical-error rate + stratified design-based budget check (fail-closed; "
         "cosmetic fails tracked, not blocking)",
     )
     p_report.add_argument(

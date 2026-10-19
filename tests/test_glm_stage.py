@@ -706,6 +706,12 @@ def test_promote_consumes_staging_record(data_dir, fake_insert):
     journal = glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir))
     assert [entry["doc_id"] for entry in journal] == ["2001"]
     assert journal[0]["inserted"] == 1
+    assert journal[0]["staged_rows_sha256"] == glm_stage.staged_rows_sha256(
+        [["Apple Inc. (AAPL)", "Purchase", "01/15/24", "01/20/24", "A"]]
+    )
+    archived = glm_stage.archived_attempts(data_dir, 2024, "2001")
+    assert len(archived) == 1 and archived[0][1].exists()
+    assert journal[0]["staging_attempt"].endswith(archived[0][1].name)
     # main()-style progress bookkeeping happened.
     progress = json.loads(
         (data_dir / "ocr_progress_gemini_manual.json").read_text()
@@ -784,6 +790,10 @@ def test_promote_force_unaudited_is_explicit_and_loud(data_dir, fake_insert, cap
     journal = glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir))
     assert journal[0]["unaudited"] is True
     assert glm_stage.load_staging_record(data_dir, 2024, "2004") is None
+    archived = glm_stage.archived_attempts(data_dir, 2024, "2004")[0][1]
+    assert glm_stage._attempt_reference(
+        data_dir, 2024, json.loads(archived.read_text())
+    ) == (True, None)  # promotion journal protects the consumed evidence
 
 
 def test_promote_refuses_malformed_or_foreign_report_state(data_dir, fake_insert, capsys):
@@ -850,7 +860,9 @@ def test_promote_partial_insert_keeps_and_marks_record(data_dir, monkeypatch, ca
     ]
     record["raw_count"] = 2
     record["audit"] = "pass"
+    record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
     glm_stage.write_staging_record(data_dir, record)
+    audit_sample.record_verdict(data_dir, "2005", "pass", "updated test fixture")
 
     def partial_insert(*args, **kwargs):
         report = kwargs.get("report")
@@ -880,6 +892,7 @@ def test_promote_partial_insert_keeps_and_marks_record(data_dir, monkeypatch, ca
     assert kept["promotion"]["outcome"]["rejections"] == {
         "impossible_chronology": 1
     }
+    assert glm_stage.verdict_binding(data_dir, "2005", kept) == (True, None)
     progress = json.loads(
         (data_dir / "ocr_progress_gemini_manual.json").read_text()
     )
@@ -893,7 +906,9 @@ def test_promote_member_rejection_is_not_no_txs(data_dir, monkeypatch, capsys):
     record["audit"] = "pass"
     record["rows"] = []
     record["parse_status"] = "no_txs"
+    record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
     glm_stage.write_staging_record(data_dir, record)
+    audit_sample.record_verdict(data_dir, "2006", "pass", "updated test fixture")
 
     def identity_reject(*args, **kwargs):
         report = kwargs.get("report")
@@ -1189,22 +1204,47 @@ def test_report_counts_omissions_and_budget():
     assert ("9003", "verdict:fail") in report["failures"]
     assert report["clean"] == ["9002"]
     assert report["budget_met"] is False
-    assert report["upper_bound"] == pytest.approx(
+    assert report["pooled_binomial_upper_bound"] == pytest.approx(
         audit_sample._exact_upper_bound(2, 3, 0.95)
     )
+    # No frozen sampling design was supplied, so the acceptance bound fails
+    # closed even though the pooled binomial diagnostic remains available.
+    assert report["upper_bound"] == 1.0
+    assert report["upper_bound_method"].startswith("fail-closed:")
 
 
-def test_report_budget_met_for_clean_299_sample():
+def test_report_budget_met_for_clean_299_sample(data_dir):
+    doc_ids = [f"d{i}" for i in range(299)]
+    write_staged_records(data_dir, {2024: doc_ids})
+    records = audit_sample.load_staging_records(data_dir)
+    staged_by_doc = {str(record["doc_id"]): record for _, record in records}
     results = [
         {"doc_id": f"d{i}", "verdict": "pass", "notes": "", "audited_at_utc": "t"}
         for i in range(299)
     ]
     report = audit_sample.build_report(
         results,
-        {},
-        promoted_doc_ids={f"d{i}" for i in range(299)},
+        {
+            doc_id: list(record.get("rows") or [])
+            for doc_id, record in staged_by_doc.items()
+        },
+        promoted_doc_ids=set(doc_ids),
         ground_truth_dir=None,
         max_rate=0.01,
+        lot=[
+            {
+                "doc_id": f"d{i}",
+                "year": 2024,
+                "asset_review": False,
+                "staged_record_sha256": audit_sample.staged_record_sha256(
+                    staged_by_doc[f"d{i}"]
+                ),
+            }
+            for i in range(299)
+        ],
+        staged_records_by_doc=staged_by_doc,
+        frame_counts_by_year={"2024": 299},
+        frame_counts_by_stratum={"2024": {"flagged": 0, "unflagged": 299}},
     )
     assert report["failure_count"] == 0
     assert len(report["clean"]) == 299
@@ -1230,13 +1270,22 @@ def test_live_30_doc_report_refusal_names_budget_math(
         for year, record in records
     ]
     root = glm_stage.staging_root(data_dir)
+    sample_path = root / "audit-sample-20261019.json"
     audit_sample.write_sample_file(
         records,
         sample,
         seed=20261019,
         per_year=30,
-        out_path=root / "audit-sample-20261019.json",
+        out_path=sample_path,
     )
+    # Model a larger frozen population than the 30-document audit sample so
+    # the finite-population upper bound remains above the 1% acceptance cap.
+    envelope = json.loads(sample_path.read_text())
+    envelope["frame_counts_by_year"] = {"2017": 300}
+    envelope["frame_counts_by_stratum"] = {
+        "2017": {"flagged": 0, "unflagged": 300}
+    }
+    sample_path.write_text(json.dumps(envelope), encoding="utf-8")
     cosmetic_doc = "20006747"
     for doc_id in doc_ids:
         if doc_id == cosmetic_doc:
@@ -1276,7 +1325,9 @@ def test_live_30_doc_report_refusal_names_budget_math(
     assert report_state["budget_met"] is False
     assert report_state["critical_failure_count"] == 0
     assert report_state["audited"] == 30
-    assert report_state["upper_bound"] == pytest.approx(0.09503385285530411)
+    assert report_state["upper_bound"] == pytest.approx(
+        audit_sample._hypergeometric_upper_failures(0, 30, 300, 0.05) / 300
+    )
     assert report_state["outside_lot"] == sorted(
         [
             "20006438", "20006470", "20006516", "20006575", "20006657",
@@ -1293,7 +1344,7 @@ def test_live_30_doc_report_refusal_names_budget_math(
     assert "complete but the critical error budget is not met" in out
     assert "critical 0/30 resolved (lot n=30)" in out
     assert "rate 0%" in out
-    assert "95% one-sided upper bound 9.503%" in out
+    assert "95% one-sided upper bound" in out
     assert "max_rate 1%" in out
     assert "budget_met=False" in out
     assert "population sticky critical-failure tally 1 across audit history" in out
@@ -1447,6 +1498,23 @@ def test_restage_archives_versioned_attempts_with_cap(data_dir):
     assert [record["error"] for record in contents] == ["boom 3", "boom 4", "boom 5"]
 
 
+def test_prune_retains_attempt_referenced_by_verdict(data_dir):
+    write_staged_records(data_dir, {2024: ["keep-audit"]})
+    audit_sample.record_verdict(data_dir, "keep-audit", "pass", "pixel match")
+    record = glm_stage.load_staging_record(data_dir, 2024, "keep-audit")
+    for index in range(4):
+        glm_stage.archive_current_attempt(data_dir, 2024, "keep-audit")
+        record["parsed_at_utc"] = f"2026-10-19T00:00:0{index}Z"
+        glm_stage.write_staging_record(data_dir, record)
+
+    archives = glm_stage.archived_attempts(data_dir, 2024, "keep-audit")
+    assert 0 in [number for number, _ in archives]  # verdict-bound attempt survives
+    assert len(archives) == glm_stage.MAX_RETAINED_ATTEMPTS
+    assert glm_stage._attempt_reference(
+        data_dir, 2024, json.loads(archives[0][1].read_text())
+    ) == (True, None)
+
+
 def test_dir_scan_mode_does_not_retry_error_records(data_dir):
     seed_year(data_dir, 2024, ["scanerr"])
     manifest = [{"doc_id": "scanerr", "year": 2024}]
@@ -1540,6 +1608,89 @@ def test_cli_stage_from_manifest_refuses_unusable_manifest(data_dir, capsys):
     assert "work manifest" in capsys.readouterr().err
 
 
+def test_manifest_years_are_data_derived_and_validated():
+    years, error = glm_stage.manifest_years(
+        [
+            {"doc_id": "a", "year": 2014},
+            {"doc_id": "b", "year": 2025},
+            {"doc_id": "c", "year": 2014},
+        ]
+    )
+    assert error is None and years == [2025, 2014]
+    years, error = glm_stage.manifest_years([{"doc_id": "bad", "year": "2014"}])
+    assert years == [] and "malformed manifest year" in error
+
+
+def test_cli_manifest_dry_run_checks_canonical_and_reports_missing_directory(
+    data_dir, monkeypatch, capsys
+):
+    seed_year(data_dir, 2024, ["queued", "staged", "canonical", "directory-only"])
+    staged = glm_stage.build_staging_record(
+        "staged",
+        2024,
+        glm_stage.default_pdf_path(data_dir, 2024, "staged"),
+        None,
+        read_fn=lambda *_: GLM_OUTPUT_ONE_ROW,
+    )
+    glm_stage.write_staging_record(data_dir, staged)
+    monkeypatch.setattr(glm_stage, "canonical_parsed_doc_ids", lambda _: {"canonical"})
+    manifest_path = data_dir / "work-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": glm_stage.WORK_MANIFEST_SCHEMA,
+                "items": [
+                    {"doc_id": "queued", "year": 2024},
+                    {"doc_id": "staged", "year": 2024},
+                    {"doc_id": "canonical", "year": 2024},
+                    {"doc_id": "missing-pdf", "year": 2024},
+                ],
+            }
+        )
+    )
+    rc = glm_stage.main(
+        [
+            "--data-dir",
+            str(data_dir),
+            "stage",
+            "--year",
+            "2024",
+            "--from-manifest",
+            str(manifest_path),
+            "--check-canonical",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "DRY RUN year=2024: manifest_candidates=1" in output
+    assert "missing_pdfs=1" in output
+    assert glm_stage.load_staging_record(data_dir, 2024, "queued") is None
+    assert glm_stage.load_staging_record(data_dir, 2024, "directory-only") is None
+
+    # A missing year directory is an explicit counted skip, not empty success.
+    empty_manifest = data_dir / "empty-manifest.json"
+    empty_manifest.write_text(
+        json.dumps({"schema": glm_stage.WORK_MANIFEST_SCHEMA, "items": []})
+    )
+    rc = glm_stage.main(
+        [
+            "--data-dir",
+            str(data_dir),
+            "stage",
+            "--year",
+            "2012",
+            "--from-manifest",
+            str(empty_manifest),
+            "--dry-run",
+        ]
+    )
+    assert rc == 2
+    output = capsys.readouterr().out
+    assert "missing PDF directory" in output
+    assert "missing_dirs=1" in output
+
+
 def test_staged_row_to_tx_page_number_optional():
     tx = glm_stage.staged_row_to_tx(["X", "Purchase", "01/15/24", None, "A"])
     assert tx["page_number"] is None  # records without row_pages stay valid
@@ -1618,6 +1769,37 @@ def test_promote_refuses_legacy_and_restaged_verdicts(data_dir, fake_insert, cap
     out = capsys.readouterr().out
     assert "re-staged after the audit" in out and "re-audit" in out
     assert glm_stage.load_staging_record(data_dir, 2024, "bnd2") is not None
+
+
+def test_verdict_binding_rejects_row_mutation_but_accepts_content_bound_record(
+    data_dir,
+):
+    stage_one(data_dir, 2024, "rowhash", GLM_OUTPUT_ONE_ROW)
+    audit_sample.record_verdict(data_dir, "rowhash", "pass", "pixel match")
+    results_path = glm_stage.staging_root(data_dir) / glm_stage.AUDIT_RESULTS_NAME
+    entry = json.loads(results_path.read_text())[0]
+    record = glm_stage.load_staging_record(data_dir, 2024, "rowhash")
+    assert entry["staged_record_sha256"] == glm_stage.audit_staged_record_sha256(record)
+    assert glm_stage.verdict_binding(data_dir, "rowhash", record) == (True, None)
+
+    # Exact old behavior: the metadata triple alone still matches after row
+    # mutation. A pre-content-hash verdict must not authorize changed rows.
+    metadata_only = {
+        key: value for key, value in entry.items() if key != "staged_record_sha256"
+    }
+    results_path.write_text(json.dumps([metadata_only]))
+    record["rows"][0][0] = "Mutated after audit"
+    record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
+    bound, reason = glm_stage.verdict_binding(data_dir, "rowhash", record)
+    assert not bound
+    assert "pre-content-hash" in reason
+
+    # Restore the reviewed content and its frozen hash: new binding verifies.
+    results_path.write_text(json.dumps([entry]))
+    record["rows"] = [["Apple Inc. (AAPL)", "Purchase", "01/15/24", "01/20/24", "A"]]
+    record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
+    bound, reason = glm_stage.verdict_binding(data_dir, "rowhash", record)
+    assert bound and reason is None
 
 
 # --------------------------------------------------------------------------

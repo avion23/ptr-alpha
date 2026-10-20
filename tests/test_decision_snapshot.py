@@ -65,8 +65,24 @@ def test_record_idempotent_and_replay(tmp_path, inputs):
     assert receipts.record_decision(tmp_path, DAY, *inputs, ranked, blocked) == path
     assert path.read_bytes() == original
     assert path.stat().st_mtime_ns == stat.st_mtime_ns
-    assert receipts.verify_decision(path) == {"agreement": True, "mismatches": []}
+    verification = receipts.verify_decision(path)
+    assert verification["agreement"]
+    assert verification["integrity"] == {"agreement": True, "mismatches": []}
+    assert verification["replay"] == {"status": "pass", "mismatches": []}
     manifest = json.loads(original)
+    assert manifest["schema_version"] == 3
+    assert manifest["recipe"]["scorer"] == {
+        "name": "analyzer.setups.score",
+        "version": "1",
+        "parameters": {"entry_tol": 1.05, "event_half_life_days": 90},
+    }
+    assert manifest["recipe"]["parser"] == {
+        "name": "analyzer.decision_snapshot",
+        "version": "1",
+    }
+    assert manifest["recipe"]["frame"]["row_count"] == len(candidates)
+    assert manifest["recipe"]["price_snapshot_id"] == manifest["price_snapshot"]["snapshot_id"]
+    assert manifest["inputs"]["ex_dividends"] is None
     winner = manifest["ranked"][0]
     assert winner["rank"] == 1 and winner["score"] == 1.5
     assert winner["members"] == [
@@ -91,6 +107,78 @@ def test_record_idempotent_and_replay(tmp_path, inputs):
     # The publication is anchored in the append-only ledger.
     index = receipts.date_index(tmp_path, DAY)
     assert index == [path.stem]
+
+
+def test_dividend_input_is_frozen_and_replayed_exactly(tmp_path, inputs):
+    candidates, weights, quotes, watchlist = inputs
+    dividends = {"AAPL": [date(2024, 5, 30)]}
+    ranked, blocked = score(
+        candidates, weights, quotes, watchlist=watchlist, ex_dividends=dividends
+    )
+    path = receipts.record_decision(
+        tmp_path,
+        DAY,
+        *inputs,
+        ranked,
+        blocked,
+        ex_dividends=dividends,
+        dividend_source="test.dividends",
+    )
+    manifest = json.loads(path.read_text())
+    assert manifest["inputs"]["ex_dividends"] == {
+        "AAPL": ["2024-05-30"]
+    }
+    assert manifest["recipe"]["dividends"] == {
+        "source": "test.dividends",
+        "input_hash": receipts._hash(manifest["inputs"]["ex_dividends"]),
+    }
+    assert manifest["ranked"] == []
+    assert manifest["blocked"]
+
+    recorded = receipts.verify_decision(path)
+    assert recorded["agreement"]
+    assert recorded["replay"]["status"] == "pass"
+    # Diagnostic replay against a mutated live dividend snapshot disagrees,
+    # while the default replay remains anchored to the published input above.
+    mutated = receipts.verify_decision(path, current_dividends={})
+    assert mutated["integrity"]["agreement"]
+    assert mutated["agreement"] is False
+    assert mutated["replay"]["status"] == "fail"
+    assert {"ranked", "blocked"}.intersection(mutated["replay"]["mismatches"])
+    assert receipts.verify_decision(path)["replay"]["status"] == "pass"
+
+
+def test_historical_receipt_is_integrity_only_and_not_rewritten(tmp_path, inputs):
+    candidates, weights, quotes, watchlist = inputs
+    frozen = receipts._freeze(
+        {
+            "candidates": receipts._frame(candidates),
+            "weights": weights,
+            "quotes": quotes,
+            "watchlist": sorted(watchlist),
+        }
+    )
+    outputs = receipts._derive(frozen)
+    if outputs["ranked"]:
+        outputs["ranked"][0]["reasons"] = ["reason text as originally published"]
+    manifest = {
+        "schema_version": 2,
+        "kind": "setups",
+        "decision_date": DAY.isoformat(),
+        "git_sha": None,
+        "scope": {},
+        "inputs": frozen,
+        "input_rows_hash": receipts._hash(frozen["candidates"]),
+        "price_snapshot": receipts._price_reference(frozen, DAY),
+        **outputs,
+    }
+    path = receipts._publish(tmp_path, manifest)
+    historical_bytes = path.read_bytes()
+    result = receipts.verify_decision(path)
+    assert result["agreement"]
+    assert result["integrity"] == {"agreement": True, "mismatches": []}
+    assert result["replay"] == {"status": "pre-recipe anchor", "mismatches": []}
+    assert path.read_bytes() == historical_bytes
 
 
 def test_same_day_distinct_decisions_both_recorded(tmp_path, inputs, caplog):
@@ -197,9 +285,8 @@ def test_ledger_chain_tamper_fails_closed_for_recording_too(
     ledger.write_text("\n".join(lines) + "\n")
 
     with caplog.at_level(logging.ERROR, logger="analyzer.decision_snapshot"):
-        assert receipts.record_decision_safely(
-            tmp_path, DAY, *inputs
-        ) is None
+        with pytest.raises(receipts.LedgerError):
+            receipts.record_decision_safely(tmp_path, DAY, *inputs)
     assert "Decision receipt was not recorded" in caplog.text
     assert len(ledger.read_text().splitlines()) == 1  # nothing appended
 
@@ -227,14 +314,14 @@ def test_receipt_files_are_read_only_after_publish(tmp_path, inputs):
     assert path.stat().st_mode & 0o777 == 0o444
 
 
-def test_cli_recording_is_byte_identical_and_failure_is_nonfatal(
+def test_cli_recording_is_byte_identical_and_failure_is_terminal(
     tmp_path, monkeypatch, inputs, caplog
 ):
     from analyzer import cli, pipeline, positions
 
     candidates, weights, quotes, watchlist = inputs
     connection = SimpleNamespace(
-        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]))
+        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]), fetchall=lambda: [])
     )
     monkeypatch.setattr(
         cli,
@@ -274,13 +361,10 @@ def test_cli_recording_is_byte_identical_and_failure_is_nonfatal(
 
         failure.setattr(receipts, "record_decision", fail)
         failed_write = CliRunner().invoke(cli.app, args)
-        assert failed_write.exit_code == 0
-        assert failed_write.output.encode() == enabled.output.encode()
+        assert failed_write.exit_code == 1
+        assert "Error: setup ranking failed: disk full" in failed_write.output
+        assert "=== Ranked setups ===" not in failed_write.output
         assert "disk full" in caplog.text
-    monkeypatch.setattr(receipts, "record_decision_safely", lambda *a, **kw: None)
-    disabled = CliRunner().invoke(cli.app, args)
-    assert disabled.exit_code == 0
-    assert enabled.output.encode() == disabled.output.encode()
 
 
 def test_unscoped_setups_keep_the_full_event_universe(
@@ -295,7 +379,7 @@ def test_unscoped_setups_keep_the_full_event_universe(
 
     candidates, weights, quotes, watchlist = inputs
     connection = SimpleNamespace(
-        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]))
+        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]), fetchall=lambda: [])
     )
     monkeypatch.setattr(
         cli,
@@ -340,7 +424,7 @@ def test_scoped_setups_with_no_holdings_return_empty_not_the_universe(
 
     candidates, weights, quotes, watchlist = inputs
     connection = SimpleNamespace(
-        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]))
+        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]), fetchall=lambda: [])
     )
     monkeypatch.setattr(
         cli,
@@ -387,7 +471,7 @@ def test_no_receipt_flag_writes_nothing_but_keeps_output(
 
     candidates, weights, quotes, watchlist = inputs
     connection = SimpleNamespace(
-        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]))
+        execute=lambda *a, **k: SimpleNamespace(fetchone=lambda: (100.0, DAY), fetchdf=lambda: pd.DataFrame([{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]), fetchall=lambda: [])
     )
     monkeypatch.setattr(
         cli,
@@ -424,15 +508,25 @@ def test_no_receipt_flag_writes_nothing_but_keeps_output(
     assert len(_receipts(tmp_path)) == 1  # nothing new written
 
 
-def test_write_failure_logged_without_raising(tmp_path, inputs, monkeypatch, caplog):
+def test_write_failure_logged_and_propagated(tmp_path, inputs, monkeypatch, caplog):
     def fail(*a, **kw):
         raise OSError("disk full")
 
     monkeypatch.setattr(receipts.os, "link", fail)
-    assert receipts.record_decision_safely(tmp_path, DAY, *inputs) is None
+    with pytest.raises(OSError, match="disk full"):
+        receipts.record_decision_safely(tmp_path, DAY, *inputs)
     assert "Decision receipt was not recorded" in caplog.text
     assert "disk full" in caplog.text
     assert not list(tmp_path.rglob(".decision-*"))
+
+
+def test_decision_conflict_is_terminal_in_safe_wrapper(monkeypatch, tmp_path, inputs):
+    def conflict(*a, **kw):
+        raise receipts.DecisionConflict("receipt collision")
+
+    monkeypatch.setattr(receipts, "record_decision", conflict)
+    with pytest.raises(receipts.DecisionConflict, match="receipt collision"):
+        receipts.record_decision_safely(tmp_path, DAY, *inputs)
 
 
 def test_empty_decision_is_recorded(tmp_path):
@@ -673,7 +767,7 @@ def test_analyze_tickers_mode_records_receipt(analyze_ctx, tmp_path, monkeypatch
     assert receipts.verify_decision(written[0])["agreement"]
 
 
-def test_analyze_receipt_failure_is_nonfatal(analyze_ctx, tmp_path, monkeypatch, caplog):
+def test_analyze_receipt_failure_is_terminal(analyze_ctx, tmp_path, monkeypatch, caplog):
     from analyzer.exceptions import DataResult
 
     cli = analyze_ctx
@@ -701,7 +795,8 @@ def test_analyze_receipt_failure_is_nonfatal(analyze_ctx, tmp_path, monkeypatch,
         ["analyze", "--mode", "tickers", "--year", "2024", "--as-of",
          "2024-06-01", "--data-dir", str(tmp_path)],
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code != 0
+    assert "Recommendation:" not in result.output
     assert "disk full" in caplog.text
 
 

@@ -20,10 +20,9 @@ Every publication is anchored OUTSIDE the writer-controlled receipt file:
   (``prev_line_hash`` links to the previous line's canonical hash), written
   with O_APPEND + fsync followed by a directory fsync.
 
-``verify_decision`` recomputes the receipt's canonical hash and matches it
-against BOTH the internal ``manifest_hash`` AND the ledger entry, verifies the
-full chain linkage, and FAILS CLOSED when the receipt has no ledger entry or
-the ledger is missing/corrupt.
+``verify_decision`` reports hash-chain integrity separately from replay under
+the receipt's anchored scorer/parser recipe. Pre-recipe receipts are integrity
+checked only and are never retroactively replayed under current code.
 
 Residual risk (documented honestly in docs/decision-receipts.md): the process
 owner can rewrite both files. The ledger does not provide cryptographic
@@ -66,6 +65,11 @@ LEDGER_KEYS = (
     "published_at",
     "git_sha",
 )
+SCORER_NAME = "analyzer.setups.score"
+SCORER_VERSION = "1"
+PARSER_NAME = "analyzer.decision_snapshot"
+PARSER_VERSION = "1"
+DEFAULT_SCORE_PARAMETERS = {"entry_tol": 1.05, "event_half_life_days": 90}
 
 
 def _freeze(value):
@@ -123,18 +127,23 @@ def _frame(frame):
     return _freeze({"columns": list(frame.columns), "rows": frame.values.tolist()})
 
 
-def _derive(inputs):
+def _derive(inputs, recipe=None):
     frozen = _thaw(inputs)
     frame = frozen["candidates"]
     candidates = pd.DataFrame(frame["rows"], columns=frame["columns"], dtype=object)
     quotes = {k: tuple(v) for k, v in frozen["quotes"].items()}
     audit = {}
+    scorer = (recipe or {}).get("scorer", {})
+    parameters = {**DEFAULT_SCORE_PARAMETERS, **scorer.get("parameters", {})}
     ranked, blocked = score(
         candidates,
         frozen["weights"],
         quotes,
+        entry_tol=parameters["entry_tol"],
+        event_half_life_days=parameters["event_half_life_days"],
         watchlist=frozen["watchlist"],
         audit=audit,
+        ex_dividends=frozen.get("ex_dividends"),
     )
     rows = ranked.to_dict("records")
     for rank, row in enumerate(rows, 1):
@@ -190,8 +199,8 @@ def _load_ledger(recommendations):
 
     The whole chain is verified on every read: each line must parse, carry
     exactly the ledger keys, and link to the previous line's canonical hash.
-    A missing ledger fails closed for verification; recording raises so the
-    caller can log and continue trading without an unanchored receipt.
+    A missing ledger fails verification; publication creates the first ledger
+    entry or raises so the serving path can stop without an unanchored receipt.
     """
     path = _ledger_path(recommendations)
     entries = []
@@ -310,7 +319,7 @@ def _publish(data_dir, manifest):
         logging.getLogger(__name__).debug(
             "Decision %s already recorded; idempotent no-op", decision_id
         )
-        return path
+        return _verify_published(path)
     _append_ledger_entry(recommendations, ledger, manifest, decision_id)
     logger = logging.getLogger(__name__)
     siblings = {
@@ -329,6 +338,15 @@ def _publish(data_dir, manifest):
     else:
         logger.info(
             "Recorded decision %s for %s", decision_id, manifest["decision_date"]
+        )
+    return _verify_published(path)
+
+
+def _verify_published(path):
+    result = verify_decision(path)
+    if not result["agreement"]:
+        raise LedgerError(
+            "published receipt failed verification: " + ", ".join(result["mismatches"])
         )
     return path
 
@@ -349,6 +367,10 @@ def record_decision(
     blocked=None,
     *,
     scope=None,
+    ex_dividends=None,
+    dividend_source="caller-provided",
+    entry_tol=1.05,
+    event_half_life_days=90,
 ):
     """Record one setups decision as an immutable, self-contained receipt.
 
@@ -363,10 +385,32 @@ def record_decision(
             "weights": weights,
             "quotes": quotes,
             "watchlist": sorted(watchlist),
+            "ex_dividends": ex_dividends,
         }
     )
     _check_decision_date(inputs, as_of)
-    outputs = _derive(inputs)
+    scorer_parameters = {
+        "entry_tol": entry_tol,
+        "event_half_life_days": event_half_life_days,
+    }
+    recipe = {
+        "scorer": {
+            "name": SCORER_NAME,
+            "version": SCORER_VERSION,
+            "parameters": scorer_parameters,
+        },
+        "parser": {"name": PARSER_NAME, "version": PARSER_VERSION},
+        "dividends": {
+            "source": dividend_source,
+            "input_hash": _hash(inputs["ex_dividends"]),
+        },
+        "frame": {
+            "input_hash": _hash(inputs["candidates"]),
+            "columns": list(candidates.columns),
+            "row_count": len(candidates),
+        },
+    }
+    outputs = _derive(inputs, recipe)
     if ranked is not None and blocked is not None:
         # Verify that freezing has not altered the actual served decision.
         replay = [{k: row[k] for k in ranked.columns} for row in outputs["ranked"]]
@@ -374,15 +418,20 @@ def record_decision(
             "blocked"
         ] != _freeze(blocked.to_dict("records")):
             raise DecisionConflict("frozen inputs do not reproduce served decision")
+    price_snapshot = _price_reference(inputs, as_of)
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "setups",
         "decision_date": as_of.isoformat(),
         "git_sha": _get_git_sha(),
         "scope": scope or {},
         "inputs": inputs,
         "input_rows_hash": _hash(inputs["candidates"]),
-        "price_snapshot": _price_reference(inputs, as_of),
+        "price_snapshot": price_snapshot,
+        "recipe": {
+            **recipe,
+            "price_snapshot_id": price_snapshot["snapshot_id"],
+        },
         **outputs,
     }
     return _publish(data_dir, manifest)
@@ -406,7 +455,7 @@ def record_ticker_decision(data_dir, as_of, inputs, outputs, *, scope=None):
         for name, value in (outputs or {}).items()
     }
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "ticker_consensus",
         "decision_date": as_of.isoformat(),
         "git_sha": _get_git_sha(),
@@ -415,26 +464,37 @@ def record_ticker_decision(data_dir, as_of, inputs, outputs, *, scope=None):
         "input_rows_hash": _hash(frozen_inputs),
         "outputs": frozen_outputs,
         "output_rows_hash": _hash(frozen_outputs),
+        "recipe": {
+            "scorer": {
+                "name": "analyzer.ticker_consensus",
+                "version": "1",
+                "parameters": {"scope": scope or {}},
+            },
+            "parser": {"name": PARSER_NAME, "version": PARSER_VERSION},
+            "dividends": {"source": "not_applicable", "input_hash": _hash(None)},
+            "frame": {"input_hash": _hash(frozen_inputs)},
+            "price_snapshot_id": None,
+        },
     }
     return _publish(data_dir, manifest)
 
 
 def record_decision_safely(*args, **kwargs):
-    """Receipt failures must never change trading output or exit status."""
+    """Log publication failures and propagate them to the serving boundary."""
     try:
         return record_decision(*args, **kwargs)
     except Exception:
         logging.getLogger(__name__).exception("Decision receipt was not recorded")
-        return None
+        raise
 
 
 def record_ticker_decision_safely(*args, **kwargs):
-    """Receipt failures must never change trading output or exit status."""
+    """Log publication failures and propagate them to the serving boundary."""
     try:
         return record_ticker_decision(*args, **kwargs)
     except Exception:
         logging.getLogger(__name__).exception("Decision receipt was not recorded")
-        return None
+        raise
 
 
 def date_index(data_dir, as_of):
@@ -447,57 +507,129 @@ def date_index(data_dir, as_of):
     ]
 
 
-def verify_decision(path):
-    """Re-score frozen inputs and check the ledger anchor; fail closed.
+def verify_decision(path, *, current_dividends=None):
+    """Check hash-chain integrity separately from recorded-recipe replay.
 
-    The receipt's canonical hash must match BOTH its internal manifest_hash
-    AND a ledger entry, and the ledger chain must be intact. A receipt with
-    no ledger entry, or a missing/corrupt ledger, is a mismatch — never a
-    pass.
+    Receipts predating recipe anchors are integrity checked only and explicitly
+    reported as ``pre-recipe anchor``; their outputs are never compared with
+    today's scorer. ``current_dividends`` is an optional diagnostic override
+    for testing/replaying against a later dividend snapshot. The default always
+    replays the dividend input frozen in the receipt.
     """
+    integrity_mismatches = []
+    replay_mismatches = []
+    replay_status = "fail"
+    stage = "integrity"
     try:
         manifest = json.loads(Path(path).read_text())
         digest = manifest.pop("manifest_hash")
-        mismatches = []
         if _hash(manifest) != digest:
-            mismatches.append("manifest_hash")
+            integrity_mismatches.append("manifest_hash")
         try:
             ledger = _load_ledger(Path(path).parent.parent)
         except LedgerError as exc:
-            mismatches.append(f"ledger: {exc}")
+            integrity_mismatches.append(f"ledger: {exc}")
         else:
             entries = [
                 entry for entry, _ in ledger if entry.get("decision_id") == digest
             ]
             if not entries:
-                mismatches.append("receipt_not_in_ledger")
+                integrity_mismatches.append("receipt_not_in_ledger")
             else:
                 if any(entry.get("manifest_hash") != digest for entry in entries):
-                    mismatches.append("ledger_manifest_hash")
+                    integrity_mismatches.append("ledger_manifest_hash")
                 if not any(
                     entry.get("decision_date") == manifest.get("decision_date")
                     for entry in entries
                 ):
-                    mismatches.append("ledger_decision_date")
+                    integrity_mismatches.append("ledger_decision_date")
         if manifest.get("kind") == "ticker_consensus":
             if _hash(manifest["inputs"]) != manifest["input_rows_hash"]:
-                mismatches.append("inputs")
+                integrity_mismatches.append("inputs")
             if _hash(manifest["outputs"]) != manifest["output_rows_hash"]:
-                mismatches.append("outputs")
-        else:
-            _check_decision_date(
-                manifest["inputs"], date.fromisoformat(manifest["decision_date"])
+                integrity_mismatches.append("outputs")
+            replay_status = (
+                "snapshot-only" if "recipe" in manifest else "pre-recipe anchor"
             )
-            if _hash(manifest["inputs"]["candidates"]) != manifest["input_rows_hash"]:
-                mismatches.append("input_rows_hash")
-            expected = _derive(manifest["inputs"])
+        elif "recipe" not in manifest:
+            replay_status = "pre-recipe anchor"
+        else:
+            stage = "replay"
+            recipe = manifest["recipe"]
+            scorer = recipe.get("scorer", {})
+            parser = recipe.get("parser", {})
+            if (scorer.get("name"), scorer.get("version")) != (
+                SCORER_NAME,
+                SCORER_VERSION,
+            ):
+                replay_mismatches.append("recipe.scorer_version")
+            if (parser.get("name"), parser.get("version")) != (
+                PARSER_NAME,
+                PARSER_VERSION,
+            ):
+                replay_mismatches.append("recipe.parser_version")
+            inputs = manifest["inputs"]
+            _check_decision_date(
+                inputs, date.fromisoformat(manifest["decision_date"])
+            )
+            if _hash(inputs["candidates"]) != manifest["input_rows_hash"]:
+                replay_mismatches.append("input_rows_hash")
+            frame_anchor = recipe.get("frame", {})
+            candidate_frame = inputs["candidates"]
+            if (
+                frame_anchor.get("input_hash") != _hash(candidate_frame)
+                or frame_anchor.get("columns") != candidate_frame["columns"]
+                or frame_anchor.get("row_count") != len(candidate_frame["rows"])
+            ):
+                replay_mismatches.append("recipe.frame")
+            if recipe.get("dividends", {}).get("input_hash") != _hash(
+                inputs.get("ex_dividends")
+            ):
+                replay_mismatches.append("recipe.dividends")
+            if recipe.get("price_snapshot_id") != manifest["price_snapshot"].get(
+                "snapshot_id"
+            ):
+                replay_mismatches.append("recipe.price_snapshot_id")
+            if current_dividends is not None:
+                inputs = {**inputs, "ex_dividends": _freeze(current_dividends)}
+            expected = _derive(inputs, recipe)
             for key, value in expected.items():
                 if manifest[key] != value:
-                    mismatches.append(key)
+                    replay_mismatches.append(key)
             if manifest["price_snapshot"] != _price_reference(
                 manifest["inputs"], date.fromisoformat(manifest["decision_date"])
             ):
-                mismatches.append("price_snapshot")
-        return {"agreement": not mismatches, "mismatches": mismatches}
+                replay_mismatches.append("price_snapshot")
+            replay_status = "fail" if replay_mismatches else "pass"
+        integrity_ok = not integrity_mismatches
+        replay_ok = replay_status in {"pass", "snapshot-only", "pre-recipe anchor"}
+        mismatches = integrity_mismatches + replay_mismatches
+        return {
+            "agreement": integrity_ok and replay_ok,
+            "mismatches": mismatches,
+            "integrity": {
+                "agreement": integrity_ok,
+                "mismatches": integrity_mismatches,
+            },
+            "replay": {"status": replay_status, "mismatches": replay_mismatches},
+        }
     except Exception as exc:
-        return {"agreement": False, "mismatches": [f"invalid receipt: {exc}"]}
+        if stage == "replay":
+            replay_mismatches.append(f"replay_error: {exc}")
+            integrity_ok = not integrity_mismatches
+            return {
+                "agreement": False,
+                "mismatches": integrity_mismatches + replay_mismatches,
+                "integrity": {
+                    "agreement": integrity_ok,
+                    "mismatches": integrity_mismatches,
+                },
+                "replay": {"status": "fail", "mismatches": replay_mismatches},
+            }
+        integrity_mismatches.append(f"invalid receipt: {exc}")
+        return {
+            "agreement": False,
+            "mismatches": integrity_mismatches + replay_mismatches,
+            "integrity": {"agreement": False, "mismatches": integrity_mismatches},
+            "replay": {"status": "fail", "mismatches": replay_mismatches},
+        }

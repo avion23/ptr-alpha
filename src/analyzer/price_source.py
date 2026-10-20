@@ -1,6 +1,7 @@
 """YFinance-backed price fetcher with cache merge."""
 
 import logging
+import hashlib
 import math
 import re
 import time
@@ -21,6 +22,8 @@ from analyzer.ticker_resolver import TickerResolver
 logger = logging.getLogger(__name__)
 
 _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+_PRICE_OVERLAP_TOL = 0.001  # 0.1% relative disagreement means another generation.
+_PRICE_BASIS = "yfinance-adjusted-close-v1"
 
 
 # ── YFinancePriceSource: yfinance-backed price fetcher with cache merge ──
@@ -38,6 +41,8 @@ class YFinancePriceSource:
             if db is not None
             else Database(self.data_dir / "congress.duckdb", read_only=read_only)
         )
+        if not self.db.is_read_only:
+            ensure_price_generation_schema(self.db)
 
     def close(self) -> None:
         if self._owns_db:
@@ -133,9 +138,26 @@ class YFinancePriceSource:
                 "No price data could be fetched from yfinance. Data source may be blocked or down."
             )
 
-        new_prices = self._extract_close_prices(data, fetch_resolved)
+        raw_prices = self._extract_close_prices(data, fetch_resolved)
+        adjusted_prices = self._extract_field_prices(
+            data, "Adj Close", fetch_resolved, required=False
+        )
+        adjustment_factors = None
+        if adjusted_prices is not None:
+            adjustment_factors = adjusted_prices.divide(raw_prices).replace(
+                [np.inf, -np.inf], np.nan
+            )
+            new_prices = adjusted_prices
+        else:
+            # Legacy test doubles and provider responses without Adj Close are
+            # retained as price observations, but cannot normalize filed refs.
+            new_prices = raw_prices
+        if adjustment_factors is None:
+            adjustment_factors = pd.DataFrame(np.nan, index=raw_prices.index, columns=raw_prices.columns)
+        adjustment_factors = self._normalize_price_index(adjustment_factors)
         new_prices = self._normalize_price_index(new_prices)
         new_prices = _clip_price_window(new_prices, start, end)
+        adjustment_factors = _clip_price_window(adjustment_factors, start, end)
         new_prices = new_prices.apply(pd.to_numeric, errors="coerce")
         invalid_mask = new_prices.notna() & (
             ~np.isfinite(new_prices) | new_prices.le(0)
@@ -149,22 +171,29 @@ class YFinancePriceSource:
         new_prices = new_prices.dropna(axis=1, how="all")
         new_prices = _as_frame(new_prices)
         new_prices = self._rename_yf_columns(new_prices, raw_to_yf)
+        adjustment_factors = self._rename_yf_columns(
+            adjustment_factors, raw_to_yf
+        ).reindex(index=new_prices.index, columns=new_prices.columns)
 
+        generation_states = {}
         if self.db.is_read_only:
             logger.info(
                 f"Read-only mode: merging {len(new_prices.columns)} fetched tickers with cache"
             )
-            # ``concat`` followed by duplicate-column removal discards the
-            # fetched column entirely whenever a partial cached column exists.
-            # Prefer freshly fetched observations while retaining cached dates
-            # and tickers that were not fetched in this read-only session.
-            prices = new_prices.combine_first(cached_prices)
+            prices, generation_states = _merge_price_generation(
+                self.db, new_prices, adjustment_factors, _PRICE_BASIS,
+                persist=False, cached_prices=cached_prices,
+            )
         else:
-            self.db.upsert_prices(new_prices)
-            logger.info(f"Cached {len(new_prices.columns)} tickers to database")
-            prices = self.db.get_prices(all_tickers, start, end)
+            prices, generation_states = _merge_price_generation(
+                self.db, new_prices, adjustment_factors, _PRICE_BASIS,
+                persist=True, cached_prices=cached_prices,
+            )
+            logger.info(f"Cached {len(new_prices.columns)} ticker generations")
 
-        return _validate_and_log_prices(prices, all_tickers)
+        result = _validate_and_log_prices(prices, all_tickers)
+        result.attrs["price_generation_state"] = generation_states
+        return result
 
     def _download_yfinance(self, fetch_resolved: list[str], start, end) -> pd.DataFrame:
         max_retries = 3
@@ -179,7 +208,7 @@ class YFinancePriceSource:
                     end=download_end,
                     progress=False,
                     threads=True,
-                    auto_adjust=True,
+                    auto_adjust=False,
                 )
                 if not isinstance(data, pd.DataFrame):
                     raise DataSourceError("yfinance returned no downloadable frame")
@@ -205,18 +234,28 @@ class YFinancePriceSource:
         data: pd.DataFrame, fetch_resolved: list[str]
     ) -> pd.DataFrame:
         """Normalize yfinance Close output for one or many symbols."""
+        return YFinancePriceSource._extract_field_prices(
+            data, "Close", fetch_resolved, required=True
+        )
+
+    @staticmethod
+    def _extract_field_prices(
+        data: pd.DataFrame, field: str, fetch_resolved: list[str], *, required: bool
+    ) -> pd.DataFrame | None:
         try:
-            close = data["Close"]
+            close = data[field]
         except KeyError as exc:
+            if not required:
+                return None
             raise DataSourceError(
-                "yfinance response did not contain Close prices"
+                f"yfinance response did not contain {field} prices"
             ) from exc
         if isinstance(close, pd.Series):
             if len(fetch_resolved) != 1:
                 raise DataSourceError("yfinance returned unlabeled multi-symbol Close prices")
             return close.to_frame(fetch_resolved[0])
         if not isinstance(close, pd.DataFrame):
-            raise DataSourceError("Unsupported yfinance Close response shape")
+            raise DataSourceError(f"Unsupported yfinance {field} response shape")
         # Labeled provider symbols establish identity; never relabel an
         # unexpected security just because only one symbol was requested.
         return close.loc[:, close.columns.isin(fetch_resolved)].copy()
@@ -246,6 +285,274 @@ class YFinancePriceSource:
             if provider_symbol in new_prices.columns:
                 result[raw] = new_prices[provider_symbol]
         return result
+
+
+def ensure_price_generation_schema(db: Database) -> None:
+    """Create additive, versioned price evidence tables (never rewrite prices)."""
+    db.conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_generations (
+            ticker VARCHAR,
+            generation VARCHAR,
+            basis VARCHAR,
+            value_hash VARCHAR,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ticker, generation)
+        )
+    """)
+    db.conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_generation_values (
+            ticker VARCHAR,
+            generation VARCHAR,
+            date DATE,
+            close DOUBLE,
+            adjustment_factor DOUBLE,
+            basis VARCHAR,
+            PRIMARY KEY (ticker, generation, date)
+        )
+    """)
+    db.conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_generation_state (
+            ticker VARCHAR PRIMARY KEY,
+            served_generation VARCHAR,
+            comparability VARCHAR,
+            alternate_generation VARCHAR,
+            reason VARCHAR
+        )
+    """)
+
+
+def price_generation_schema_exists(db) -> bool:
+    try:
+        count = db.conn.execute(
+            "SELECT COUNT(*) FROM duckdb_tables() "
+            "WHERE table_name='price_generation_state'"
+        ).fetchone()[0]
+        return isinstance(count, (int, np.integer)) and count > 0
+    except Exception:
+        return False
+
+
+def canonical_price_hash(
+    ticker: str, prices: pd.Series, basis: str, generation: str
+) -> str:
+    """Hash date/close/basis/generation tuples in a canonical order."""
+    digest = hashlib.sha256()
+    for day, close in prices.dropna().sort_index().items():
+        digest.update(
+            f"{ticker}\t{pd.Timestamp(day).date().isoformat()}\t"
+            f"{float(close).hex()}\t{basis}\t{generation}\n".encode()
+        )
+    return digest.hexdigest()
+
+
+def price_generation_state(db, ticker: str) -> dict:
+    """Return explicit served-generation metadata, including legacy uncertainty."""
+    ticker = str(ticker).strip().upper()
+    if price_generation_schema_exists(db):
+        row = db.conn.execute(
+            "SELECT served_generation, comparability, alternate_generation, reason "
+            "FROM price_generation_state WHERE ticker=?", [ticker]
+        ).fetchone()
+        if isinstance(row, (tuple, list)) and len(row) == 4:
+            return {
+                "generation_id": row[0], "comparability_status": row[1],
+                "alternate_generation": row[2], "reason": row[3],
+            }
+    try:
+        values = db.conn.execute(
+            "SELECT date, close FROM prices WHERE ticker=? ORDER BY date", [ticker]
+        ).fetchdf()
+        if not isinstance(values, pd.DataFrame):
+            values = pd.DataFrame(columns=["date", "close"])
+    except Exception:
+        values = pd.DataFrame(columns=["date", "close"])
+    if values.empty:
+        return {
+            "generation_id": None, "comparability_status": "unknown",
+            "alternate_generation": None,
+            "reason": "price comparability unknown: generation metadata unavailable",
+        }
+    series = pd.Series(values.close.to_numpy(), index=pd.to_datetime(values.date))
+    legacy_seed = canonical_price_hash(ticker, series, "legacy-unverified", "legacy")
+    generation = f"legacy:{legacy_seed[:24]}"
+    return {
+        "generation_id": generation, "comparability_status": "unknown",
+        "alternate_generation": None,
+        "reason": "price comparability unknown: persisted prices predate generation metadata",
+    }
+
+
+def price_generation_basis(db, ticker: str, generation: str | None) -> str:
+    if generation and price_generation_schema_exists(db):
+        row = db.conn.execute(
+            "SELECT basis FROM price_generations WHERE ticker=? AND generation=?",
+            [str(ticker).strip().upper(), generation],
+        ).fetchone()
+        if isinstance(row, (tuple, list)) and row and row[0]:
+            return str(row[0])
+    return "legacy-unverified"
+
+
+def price_adjustment_factor(db, ticker: str, day, generation: str | None = None) -> float | None:
+    """Find the latest known adjusted/raw factor on or before a filing date."""
+    if not price_generation_schema_exists(db):
+        return None
+    if generation is None:
+        generation = price_generation_state(db, ticker).get("generation_id")
+    if not generation:
+        return None
+    row = db.conn.execute(
+        "SELECT adjustment_factor FROM price_generation_values "
+        "WHERE ticker=? AND generation=? AND date<=? "
+        "AND adjustment_factor IS NOT NULL ORDER BY date DESC LIMIT 1",
+        [str(ticker).strip().upper(), generation, pd.Timestamp(day).date()],
+    ).fetchone()
+    if not row:
+        return None
+    factor = float(row[0])
+    return factor if math.isfinite(factor) and factor > 0 else None
+
+
+def _generation_id(ticker: str, prices: pd.Series, factors: pd.Series, basis: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"{ticker}\t{basis}\n".encode())
+    for day, close in prices.dropna().sort_index().items():
+        factor = factors.get(day, np.nan)
+        factor_text = float(factor).hex() if pd.notna(factor) else "unknown"
+        digest.update(
+            f"{pd.Timestamp(day).date().isoformat()}\t{float(close).hex()}\t"
+            f"{factor_text}\n".encode()
+        )
+    return f"yahoo:{digest.hexdigest()[:24]}"
+
+
+def _store_generation(db, ticker, generation, series, factors, basis) -> str:
+    ensure_price_generation_schema(db)
+    value_hash = canonical_price_hash(ticker, series, basis, generation)
+    db.conn.execute(
+        "INSERT INTO price_generations(ticker,generation,basis,value_hash) "
+        "VALUES (?,?,?,?) ON CONFLICT(ticker,generation) DO UPDATE "
+        "SET value_hash=excluded.value_hash,basis=excluded.basis",
+        [ticker, generation, basis, value_hash],
+    )
+    rows = []
+    for day, close in series.dropna().sort_index().items():
+        factor = factors.get(day, np.nan)
+        rows.append((ticker, generation, pd.Timestamp(day).date(), float(close),
+                     float(factor) if pd.notna(factor) else None, basis))
+    if rows:
+        db.conn.executemany(
+            "INSERT INTO price_generation_values VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(ticker,generation,date) DO UPDATE SET "
+            "close=excluded.close, adjustment_factor=excluded.adjustment_factor, "
+            "basis=excluded.basis", rows,
+        )
+    return value_hash
+
+
+def _set_generation_state(db, ticker, generation, status, alternate=None, reason=None):
+    db.conn.execute(
+        "INSERT INTO price_generation_state VALUES (?,?,?,?,?) "
+        "ON CONFLICT(ticker) DO UPDATE SET served_generation=excluded.served_generation, "
+        "comparability=excluded.comparability, "
+        "alternate_generation=excluded.alternate_generation, reason=excluded.reason",
+        [ticker, generation, status, alternate, reason],
+    )
+
+
+def _all_ticker_values(db, ticker):
+    rows = db.conn.execute(
+        "SELECT date, close FROM prices WHERE ticker=? ORDER BY date", [ticker]
+    ).fetchdf()
+    if rows.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    series = pd.Series(rows.close.to_numpy(dtype=float), index=pd.to_datetime(rows.date))
+    factors = pd.Series(np.nan, index=series.index, dtype=float)
+    if price_generation_schema_exists(db):
+        state = price_generation_state(db, ticker)
+        generation = state.get("generation_id")
+        if generation:
+            known = db.conn.execute(
+                "SELECT date, adjustment_factor FROM price_generation_values "
+                "WHERE ticker=? AND generation=?", [ticker, generation]
+            ).fetchdf()
+            if not known.empty:
+                known.index = pd.to_datetime(known.date)
+                factors = pd.to_numeric(known.adjustment_factor, errors="coerce").reindex(series.index)
+    return series, factors
+
+
+def _merge_price_generation(db, new_prices, new_factors, basis, *, persist, cached_prices):
+    """Merge only numerically compatible series; divergent values stay versioned."""
+    output = (
+        cached_prices.copy()
+        if not cached_prices.empty
+        else pd.DataFrame(index=new_prices.index)
+    )
+    states = {}
+    for ticker in new_prices.columns:
+        incoming = new_prices[ticker].dropna().astype(float)
+        if incoming.empty:
+            continue
+        factors = new_factors[ticker].reindex(incoming.index) if ticker in new_factors else pd.Series(np.nan, index=incoming.index)
+        candidate_generation = _generation_id(ticker, incoming, factors, basis)
+        old_all, old_factors = _all_ticker_values(db, ticker)
+        old = old_all
+        if old.empty and ticker in cached_prices:
+            old = cached_prices[ticker].dropna().astype(float)
+            old_all = old
+            old_factors = pd.Series(np.nan, index=old.index, dtype=float)
+        overlap = old.index.intersection(incoming.index)
+        mismatch = False
+        max_relative = 0.0
+        if len(overlap):
+            denom = incoming.reindex(overlap).abs().replace(0, np.nan)
+            rel = (old.reindex(overlap) - incoming.reindex(overlap)).abs() / denom
+            max_relative = float(rel.max()) if rel.notna().any() else 0.0
+            mismatch = bool((rel > _PRICE_OVERLAP_TOL).any())
+
+        if mismatch or (not old.empty and not len(overlap)):
+            reason = (
+                f"price comparability unknown: {int((rel > _PRICE_OVERLAP_TOL).sum())} "
+                f"overlaps exceed {_PRICE_OVERLAP_TOL:.1%} (max {max_relative:.5%})"
+                if mismatch else "price comparability unknown: no overlapping prices"
+            )
+            old_generation = price_generation_state(db, ticker)
+            served = old_generation.get("generation_id")
+            if persist:
+                if not old_all.empty and served:
+                    old_basis = price_generation_basis(db, ticker, served)
+                    _store_generation(db, ticker, served, old_all, old_factors, old_basis)
+                    _store_generation(db, ticker, candidate_generation, incoming, factors, basis)
+                    _set_generation_state(db, ticker, served, "unknown", candidate_generation, reason)
+            states[ticker] = {
+                "generation_id": served, "comparability_status": "unknown",
+                "alternate_generation": candidate_generation, "reason": reason,
+                "overlap_count": len(overlap), "max_relative_divergence": max_relative,
+            }
+            continue
+
+        merged = old_all.combine_first(incoming)
+        merged.update(incoming)
+        merged_factors = old_factors.reindex(merged.index)
+        merged_factors.update(factors)
+        generation = _generation_id(ticker, merged, merged_factors, basis)
+        if persist:
+            db.upsert_prices(new_prices[[ticker]])
+            _store_generation(db, ticker, generation, merged, merged_factors, basis)
+            _set_generation_state(db, ticker, generation, "comparable")
+        if ticker not in output.columns:
+            output[ticker] = np.nan
+        # Incoming dates may extend the existing index (first merge for this
+        # ticker into a cached frame): grow the frame before .loc assignment.
+        output = output.reindex(output.index.union(incoming.index))
+        output.loc[incoming.index, ticker] = incoming
+        states[ticker] = {
+            "generation_id": generation, "comparability_status": "comparable",
+            "alternate_generation": None, "reason": None,
+            "overlap_count": len(overlap), "max_relative_divergence": max_relative,
+        }
+    return output.sort_index(), states
 
 
 # ── Helpers ──

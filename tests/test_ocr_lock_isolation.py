@@ -55,6 +55,18 @@ def _make_app_ctx(data_dir: str) -> MagicMock:
 
 
 class TestOcrLockIsolation(unittest.TestCase):
+    def test_parent_database_close_failure_propagates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_ctx = _make_app_ctx(temp_dir)
+            db = app_ctx.transaction_source.db
+            real_close = db.close
+            with (
+                patch.object(db, "close", side_effect=RuntimeError("close failed")),
+                self.assertRaisesRegex(RuntimeError, "close failed"),
+            ):
+                _release_parent_db_for_ocr(app_ctx)
+            real_close()
+
     def test_release_lets_both_crash_configs_open(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_ctx = _make_app_ctx(temp_dir)

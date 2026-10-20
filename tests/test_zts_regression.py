@@ -224,7 +224,8 @@ def test_replay_does_not_count_requested_mccaul_variant_twice():
         db.conn.close()
 
     assert event_only["n_actors"] == 1
-    assert event_only["score"] == 0.0
+    assert pd.isna(event_only["score"])
+    assert "score below ranking floor" in event_only["score_exclusion_reason"]
     assert requested_variant["n_actors"] == 1
     assert requested_variant["score"] == event_only["score"]
     assert bool(requested_variant["blocked"])
@@ -386,7 +387,8 @@ def test_zts_june_july_results_use_disclosure_dates_and_ignore_later_rows(
 
     june = after.loc[after["as_of"] == JUNE_30].iloc[0]
     assert june["n_actors"] == 1
-    assert june["score"] == 0.0
+    assert pd.isna(june["score"])
+    assert "score below ranking floor" in june["score_exclusion_reason"]
     assert bool(june["blocked"])
     june_ranked, june_blocked = ranked_by_snapshot[("after", JUNE_30)]
     assert june_ranked.empty
@@ -447,7 +449,7 @@ def test_fully_closed_holder_does_not_contribute():
             horizon_days=90,
             members=["Sell-Now Trap"],
         )
-        assert result.iloc[0]["score"] == 0.0
+        assert pd.isna(result.iloc[0]["score"])
         assert bool(result.iloc[0]["blocked"])
     finally:
         db.conn.close()
@@ -501,7 +503,7 @@ def test_cli_setups_blocks_two_fully_closed_holders(monkeypatch):
         replayed = replay.replay(
             db, ["ZTS"], [JUNE_30], horizon_days=90, members=[]
         )
-        assert replayed.iloc[0]["score"] == 0.0
+        assert pd.isna(replayed.iloc[0]["score"])
         assert replayed.iloc[0]["n_actors"] == 2
         assert bool(replayed.iloc[0]["blocked"])
     finally:

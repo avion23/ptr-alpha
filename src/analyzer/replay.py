@@ -31,10 +31,14 @@ _RESULT_COLUMNS = [
     "ticker",
     "as_of",
     "score",
+    "score_exclusion_reason",
+    "decision_quote_date",
+    "decision_quote_price",
     "n_actors",
     "fwd_return_pct",
     "spy_return_pct",
     "excess_pct",
+    "outcome_exclusion_reason",
     "blocked",
 ]
 
@@ -218,9 +222,9 @@ def _score(
     actors,
     setups,
     skill_table_cache=None,
-) -> tuple[object, bool, int]:
+) -> tuple[object, bool, int, str | None]:
     if candidates.empty:
-        return None, True, 0
+        return None, True, 0, "no candidates"
     for column in ("actor_id", "kind", "source"):
         if column not in candidates:
             raise ReplayError(f"Replay candidates have no {column} column")
@@ -232,7 +236,7 @@ def _score(
         )
     current_quote = _latest_quote(db, ticker, as_of)
     if current_quote is None:
-        return None, True, len(weights)
+        return None, True, len(weights), "decision quote unavailable"
     try:
         from analyzer.manager_watchlist import watchlist_actor_ids
 
@@ -248,13 +252,19 @@ def _score(
         ranked["ticker"].astype("string").str.upper() == ticker
     ]
     if hit.empty:
-        return 0.0, True, len(weights)
+        reasons = sorted(
+            set(
+                blocked.loc[blocked["ticker"].astype("string").str.upper() == ticker,
+                            "reason"].dropna().astype(str)
+            )
+        ) if not blocked.empty else []
+        return None, True, len(weights), "; ".join(reasons) or "not ranked"
     try:
         score_value = float(hit.iloc[0]["score"])
     except (TypeError, ValueError) as exc:
         raise ReplayError("analyzer.setups.score must return a numeric score") from exc
     if not math.isfinite(score_value):
-        return None, True, len(weights)
+        return None, True, len(weights), "non-finite score"
     n_actors = len(weights)
     try:
         n_actors = int(hit.iloc[0].get("n_actors", n_actors))
@@ -262,10 +272,12 @@ def _score(
         pass
     # Ranked membership is decided once, in setups.score via is_ranked;
     # replay only mirrors it.
-    return score_value, False, n_actors
+    return score_value, False, n_actors, None
 
 
-def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | None:
+def _price_return_with_reason(
+    db, ticker: str, as_of: date, horizon_days: int
+) -> tuple[float | None, str | None]:
     """Return from the last known close to the exact horizon-end session.
 
     Weekends and exchange holidays roll back to the expected NYSE session;
@@ -274,11 +286,11 @@ def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | No
     connection = getattr(db, "conn", db)
     current_quote = _latest_quote(db, ticker, as_of)
     if current_quote is None:
-        return None
+        return None, "decision_quote_unavailable"
     current_price, _ = current_quote
     endpoint = previous_nyse_session(as_of + timedelta(days=horizon_days)).date()
     if endpoint <= as_of:
-        return None
+        return None, "invalid_outcome_window"
     outcome = connection.execute(
         """
         SELECT date, close FROM prices
@@ -287,12 +299,16 @@ def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | No
         [ticker, endpoint],
     ).fetchall()
     if not outcome:
-        return None
+        return None, "outcome_price_unavailable"
     outcome_price = float(outcome[0][1])
     if not math.isfinite(outcome_price) or outcome_price <= 0:
-        return None
+        return None, "invalid_outcome_price"
     result = (outcome_price / current_price - 1) * 100
-    return result if math.isfinite(result) else None
+    return (result, None) if math.isfinite(result) else (None, "invalid_outcome_price")
+
+
+def _price_return(db, ticker: str, as_of: date, horizon_days: int) -> float | None:
+    return _price_return_with_reason(db, ticker, as_of, horizon_days)[0]
 
 
 def _benchmark_return(db, as_of: date, horizon_days: int) -> float | None:
@@ -303,6 +319,16 @@ def _benchmark_return(db, as_of: date, horizon_days: int) -> float | None:
     ).fetchone()
     ticker = "SPY" if spy_exists is not None else "SPYM"
     return _price_return(db, ticker, as_of, horizon_days)
+
+
+def _benchmark_return_with_reason(db, as_of: date, horizon_days: int):
+    connection = getattr(db, "conn", db)
+    spy_exists = connection.execute(
+        "SELECT 1 FROM prices WHERE ticker = 'SPY' AND date <= ? LIMIT 1",
+        [as_of],
+    ).fetchone()
+    ticker = "SPY" if spy_exists is not None else "SPYM"
+    return _price_return_with_reason(db, ticker, as_of, horizon_days)
 
 
 def replay(
@@ -336,7 +362,7 @@ def replay(
                 candidates = _ticker_candidates(
                     db, ticker, as_of, selected_members, pipeline, positions
                 )
-                score_value, blocked, n_actors = _score(
+                score_value, blocked, n_actors, score_reason = _score(
                     db,
                     ticker,
                     as_of,
@@ -345,8 +371,13 @@ def replay(
                     setups,
                     skill_table_cache,
                 )
-            fwd_return = _price_return(db, ticker, as_of, horizon_days)
-            spy_return = _benchmark_return(db, as_of, horizon_days)
+            quote = _latest_quote(db, ticker, as_of)
+            fwd_return, ticker_outcome_reason = _price_return_with_reason(
+                db, ticker, as_of, horizon_days
+            )
+            spy_return, spy_outcome_reason = _benchmark_return_with_reason(
+                db, as_of, horizon_days
+            )
             excess = (
                 fwd_return - spy_return
                 if fwd_return is not None and spy_return is not None
@@ -357,10 +388,17 @@ def replay(
                     "ticker": ticker,
                     "as_of": as_of,
                     "score": score_value,
+                    "score_exclusion_reason": score_reason,
+                    "decision_quote_date": quote[1] if quote else None,
+                    "decision_quote_price": quote[0] if quote else None,
                     "n_actors": n_actors,
                     "fwd_return_pct": fwd_return,
                     "spy_return_pct": spy_return,
                     "excess_pct": excess,
+                    "outcome_exclusion_reason": (
+                        ticker_outcome_reason or spy_outcome_reason
+                        if excess is None else None
+                    ),
                     "blocked": blocked,
                 }
             )

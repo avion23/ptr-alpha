@@ -65,7 +65,7 @@ def test_canonical_asof_preserves_live_and_restores_historical_generations(tmp_p
 
         def score(scoped_db, *_):
             assert scoped_db.get_transactions(2026)['ticker'].tolist() == ['JPM']
-            return 1.0, False, 1
+            return 1.0, False, 1, None
 
         monkeypatch.setattr(replay_module, '_load_dependencies', lambda: (None,) * 4)
         monkeypatch.setattr(replay_module, '_ticker_candidates', candidates)

@@ -78,11 +78,13 @@ def seed_frame(db, *, tickers, members=MEMBERS, promoted="2026-06-30",
     )
 
 
-def install_skill_fixture(out_dir, decision):
+def install_skill_fixture(out_dir, decision, frame="ingestion"):
     """cmd_run reads OUT_DIR/skill.json before the guard; provide a stub."""
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "skill.json").write_text(json.dumps(
-        {"by_decision": {str(decision): {"labels": [], "breadth": {}}}}
+        {"frame": frame, "by_decision": {
+            str(decision): {"labels": [], "breadth": {}}
+        }}
     ))
 
 

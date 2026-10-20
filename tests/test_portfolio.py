@@ -11,7 +11,10 @@ from analyzer.portfolio import (
     compute_portfolio_metrics,
     simulate_portfolio_returns,
 )
-from analyzer.portfolio.simulation import _attach_sizing_inputs, _prepare_sizing_inputs
+from analyzer.portfolio.simulation import (
+    _attach_sizing_inputs,
+    _prepare_sizing_inputs,
+)
 
 
 def _sizing_rows(tickers, members=None):
@@ -117,6 +120,62 @@ def test_overlapping_full_bankroll_signal_cannot_reuse_one_hundred_dollars():
     assert metrics["gross_traded_notional"] == pytest.approx(210.0)
 
 
+def test_disclosure_close_cannot_create_same_day_gain():
+    targets = pd.DataFrame(
+        {"as_of_date": ["2026-10-16"], "ticker": ["A"], "weight": [1.0]}
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0, 120.0]},
+        index=pd.to_datetime(["2026-10-16", "2026-10-19"]),
+    )
+
+    curve = simulate_portfolio_returns(
+        targets,
+        prices,
+        horizon=1,
+        entry_slippage_bps=0,
+        exit_slippage_bps=0,
+        initial_capital=1000,
+    )
+
+    # The Friday disclosure can only fill at the next NYSE session's $120 close.
+    assert curve["date"].tolist() == list(pd.to_datetime(["2026-10-16", "2026-10-19"]))
+    assert curve["executed_positions"].tolist() == [0, 1]
+    assert curve.iloc[-1]["gross_traded_notional"] == pytest.approx(1000.0)
+    assert curve.iloc[-1]["liquidation_value"] == pytest.approx(1000.0)
+    assert curve.iloc[-1]["closed_positions"] == 0
+
+
+def test_horizon_exit_on_weekend_uses_prior_nyse_session():
+    targets = pd.DataFrame(
+        {"as_of_date": ["2024-01-07"], "ticker": ["A"], "weight": [1.0]}
+    )
+    prices = pd.DataFrame(
+        {"A": [100.0, 100.0, 100.0, 100.0, 100.0, 110.0, 120.0]},
+        index=pd.to_datetime(
+            [
+                "2024-01-08", "2024-01-09", "2024-01-10", "2024-01-11",
+                "2024-01-12", "2024-01-15", "2024-01-16",
+            ]
+        ),
+    )
+
+    curve = simulate_portfolio_returns(
+        targets,
+        prices,
+        horizon=5,
+        entry_slippage_bps=0,
+        exit_slippage_bps=0,
+        initial_capital=1000,
+    )
+
+    # Jan 8 + five calendar days is Saturday Jan 13; the main simulator exits
+    # on the prior session, Friday Jan 12, rather than Monday Jan 15.
+    assert curve.iloc[-1]["date"] == pd.Timestamp("2024-01-12")
+    assert curve.iloc[-1]["closed_positions"] == 1
+    assert curve.iloc[-1]["liquidation_value"] == pytest.approx(1000.0)
+
+
 def test_open_position_reports_liquidation_cost_and_exposure():
     targets = pd.DataFrame(
         {"as_of_date": [date(2024, 1, 1)], "ticker": ["A"], "weight": [1.0]}
@@ -176,8 +235,8 @@ def test_zero_mark_is_preserved_as_total_loss():
         {"as_of_date": [date(2024, 1, 1)], "ticker": ["A"], "weight": [1.0]}
     )
     prices = pd.DataFrame(
-        {"A": [100.0, 0.0]},
-        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        {"A": [100.0, 100.0, 0.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
     )
 
     curve = simulate_portfolio_returns(
@@ -201,8 +260,10 @@ def test_stale_open_mark_makes_equity_unavailable_and_blocks_new_sizing():
         }
     )
     prices = pd.DataFrame(
-        {"A": [100.0, None], "B": [10.0, 10.0]},
-        index=pd.to_datetime(["2024-01-01", "2024-01-10"]),
+        {"A": [100.0, 100.0, None, None], "B": [10.0, 10.0, 10.0, 10.0]},
+        index=pd.to_datetime(
+            ["2024-01-01", "2024-01-02", "2024-01-10", "2024-01-11"]
+        ),
     )
 
     curve = simulate_portfolio_returns(
@@ -248,8 +309,8 @@ def test_raw_invalid_targets_count_in_requested_coverage_and_skips():
         }
     )
     prices = pd.DataFrame(
-        {"A": [100.0], "B": [100.0]},
-        index=pd.to_datetime(["2024-01-01"]),
+        {"A": [100.0, 100.0], "B": [100.0, 100.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
     )
 
     final = simulate_portfolio_returns(
@@ -273,8 +334,8 @@ def test_all_or_skip_policy_never_counts_partial_fill_as_execution():
         }
     )
     prices = pd.DataFrame(
-        {"A": [100.0], "B": [100.0]},
-        index=pd.to_datetime(["2024-01-01"]),
+        {"A": [100.0, 100.0], "B": [100.0, 100.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
     )
 
     final = simulate_portfolio_returns(

@@ -9,6 +9,7 @@ canonical consumption/verification step."""
 import os
 import shutil
 import subprocess
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import TestCase
 
@@ -44,6 +45,40 @@ class CrontabSourceOfTruthTest(TestCase):
         targets = {path.rsplit("/", 1)[-1] for _, path in jobs}
         self.assertIn("weekly_prices.sh", targets)
         self.assertIn("daily_doctor.sh", targets)
+
+    def test_price_refresh_schedule_and_quote_age_budget(self):
+        schedule = next(
+            schedule
+            for schedule, target in _job_lines()
+            if target.endswith("/weekly_prices.sh")
+        )
+        self.assertEqual("17 0 * * 2,4,6", schedule)
+
+        # Cron weekday numbers are Sunday=0; datetime uses Monday=0.
+        cron_days = {int(day) for day in schedule.split()[4].split(",")}
+        refresh_days = {(day + 6) % 7 for day in cron_days}
+
+        def last_weekday_before(day: date) -> date:
+            quote = day - timedelta(days=1)
+            while quote.weekday() >= 5:
+                quote -= timedelta(days=1)
+            return quote
+
+        # Start Monday with Friday's close from the preceding run. Measure
+        # both just before and just after each scheduled refresh for a full
+        # weekly cycle; this is pure date arithmetic, no market/API calls.
+        monday = date(2026, 10, 19)
+        quote_date = monday - timedelta(days=3)
+        ages = []
+        for offset in range(7):
+            day = monday + timedelta(days=offset)
+            ages.append((day - quote_date).days)
+            if day.weekday() in refresh_days:
+                quote_date = last_weekday_before(day)
+            ages.append((day - quote_date).days)
+
+        self.assertEqual(4, max(ages))
+        self.assertLess(max(ages), 5)
 
 
 class WrapperContractTest(TestCase):

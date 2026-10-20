@@ -41,7 +41,11 @@ Made checkable by four mechanisms, none of which rely on vigilance:
 
 - `cron/crontab.txt` — source of truth (`@REPO@` placeholder).
 - `cron/install.sh` — dry-run diff / `-y` apply with timestamped backup.
-- `cron/weekly_prices.sh` — Mondays 02:00 UTC: refresh + merge + snapshot.
+- `cron/weekly_prices.sh` — Tue/Thu/Sat 00:17 UTC: refresh + merge + snapshot.
+  The 17-minute offset keeps starts away from the 03:30 UTC OCR drain and
+  04:30 UTC Tue/Sat acquisition. With the latest completed weekday close
+  one day old at refresh, the worst pre-refresh age is four calendar days;
+  `tests/test_cron_contract.py` checks the schedule arithmetic.
 - `cron/daily_doctor.sh` — daily 05:00 UTC: doctor + escalation wiring.
 
 Historical wrappers remain under `data/logs/*` (gitignored, retired); the

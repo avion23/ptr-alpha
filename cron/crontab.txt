@@ -7,7 +7,8 @@
 # reported as drift within one day.
 CRON_TZ=UTC
 # BEGIN insider-trading (managed block; rewritten by cron/install.sh)
-0 2 * * 1 @REPO@/cron/weekly_prices.sh
+# Tue/Thu/Sat 00:17 UTC: offset from the OCR/acquisition windows.
+17 0 * * 2,4,6 @REPO@/cron/weekly_prices.sh
 30 3 * * * @REPO@/cron/backlog_ocr.sh
 30 4 * * 2,6 @REPO@/cron/acquire_house.sh
 0 5 * * * @REPO@/cron/daily_doctor.sh

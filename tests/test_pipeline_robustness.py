@@ -491,7 +491,7 @@ def test_eligible_events_maps_official_actor_sources_and_entry_reference():
     assert events["as_of"].eq(as_of).all()
 
 
-def test_cli_as_of_reaches_single_ticker_analysis_params():
+def test_cli_as_of_reaches_single_ticker_analysis_params(tmp_path):
     captured = []
 
     def fake_run(params, transaction_source):
@@ -505,8 +505,13 @@ def test_cli_as_of_reaches_single_ticker_analysis_params():
             },
         )
 
+    # Serving a decision must publish its receipt (fail-closed contract):
+    # the context needs a real receipt data dir so recording can proceed.
+    app_ctx = MagicMock()
+    app_ctx.settings.data.data_dir = str(tmp_path)
+
     with (
-        patch("analyzer.cli.get_context", return_value=MagicMock()),
+        patch("analyzer.cli.get_context", return_value=app_ctx),
         patch("analyzer.cli._warn_live_ticker_coverage"),
         patch("analyzer.cli.run_ticker_analysis", side_effect=fake_run),
     ):

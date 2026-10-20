@@ -21,6 +21,19 @@ _BASE_CANDIDATE_COLUMNS = {
 # Provenance identities recorded with the decision receipt: canonical row
 # ids for event rows, contributing lot/filing references for holdings rows.
 EVENT_IDENTITY_COLUMNS = _BASE_CANDIDATE_COLUMNS | {"source_record_id", "source_row_id"}
+# Additive price-comparability provenance (FP review price-generation P0):
+# eligible events carry the filed vs normalized entry reference and the
+# generation/comparability verdict that served the fair-price gate. Old
+# identity columns keep their meaning; these extend the contract.
+EVENT_PRICE_COMPAT_COLUMNS = {
+    "filed_entry_ref",
+    "normalized_entry_ref",
+    "price_generation_id",
+    "comparability_status",
+    "comparability_reason",
+    "blocked_reason",
+}
+EVENT_CONTRACT_COLUMNS = EVENT_IDENTITY_COLUMNS | EVENT_PRICE_COMPAT_COLUMNS
 HOLDINGS_IDENTITY_COLUMNS = _BASE_CANDIDATE_COLUMNS | {"filing_refs"}
 EXPECTED_KINDS = {"congress", "officer", "manager"}
 
@@ -208,7 +221,7 @@ def test_actor_identity_and_source_weight_contract():
             "holdings",
             HOLDINGS_IDENTITY_COLUMNS,
         ),
-        ("analyzer.pipeline", "eligible_events", "form4", EVENT_IDENTITY_COLUMNS),
+        ("analyzer.pipeline", "eligible_events", "form4", EVENT_CONTRACT_COLUMNS),
         (
             "analyzer.form4",
             "candidates_from_sweep",

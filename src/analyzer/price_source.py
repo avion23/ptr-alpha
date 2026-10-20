@@ -345,8 +345,13 @@ def canonical_price_hash(
     return digest.hexdigest()
 
 
-def price_generation_state(db, ticker: str) -> dict:
-    """Return explicit served-generation metadata, including legacy uncertainty."""
+def price_generation_state(db, ticker: str, *, as_of=None) -> dict:
+    """Return explicit served-generation metadata, including legacy uncertainty.
+
+    ``as_of`` bounds the legacy fallback hash to the decision's point-in-time
+    price history: later market data must never rewrite a historical
+    candidate's generation id (determinism under post-cutoff ingestion).
+    """
     ticker = str(ticker).strip().upper()
     if price_generation_schema_exists(db):
         row = db.conn.execute(
@@ -359,9 +364,16 @@ def price_generation_state(db, ticker: str) -> dict:
                 "alternate_generation": row[2], "reason": row[3],
             }
     try:
-        values = db.conn.execute(
-            "SELECT date, close FROM prices WHERE ticker=? ORDER BY date", [ticker]
-        ).fetchdf()
+        if as_of is None:
+            values = db.conn.execute(
+                "SELECT date, close FROM prices WHERE ticker=? ORDER BY date", [ticker]
+            ).fetchdf()
+        else:
+            values = db.conn.execute(
+                "SELECT date, close FROM prices WHERE ticker=? AND date <= ? "
+                "ORDER BY date",
+                [ticker, pd.Timestamp(as_of).date()],
+            ).fetchdf()
         if not isinstance(values, pd.DataFrame):
             values = pd.DataFrame(columns=["date", "close"])
     except Exception:

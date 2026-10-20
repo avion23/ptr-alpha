@@ -409,7 +409,8 @@ def eligible_events(
         closes, decision_date.date(), prepared=prepared
     )
     generation_states = {
-        symbol: price_generation_state(db, symbol) for symbol in symbols
+        symbol: price_generation_state(db, symbol, as_of=as_of)
+        for symbol in symbols
     }
 
     # Pure per-row date conversion repeats across rows; memoize per call.
@@ -475,6 +476,10 @@ def eligible_events(
             entry_ref = None
             filed_entry_ref = None
             normalized_entry_ref = None
+            # Whether unknown comparability BLOCKS this candidate (form4
+            # filed-price normalization needs a verified generation; congress
+            # same-series closes do not — provenance-only there).
+            comparability_blocks = False
             generation = generation_states.get(str(symbol), {})
             generation_id = generation.get("generation_id")
             comparability_status = generation.get("comparability_status", "unknown")
@@ -497,6 +502,7 @@ def eligible_events(
                             normalized_entry_ref = filed_entry_ref * factor
                             entry_ref = normalized_entry_ref
                         else:
+                            comparability_blocks = True
                             comparability_status = "unknown"
                             comparability_reason = (
                                 "price comparability unknown: filed price has no "
@@ -506,10 +512,14 @@ def eligible_events(
                 entry_ref = _congress_entry(symbol, transaction_day)
                 normalized_entry_ref = entry_ref
                 if comparability_status != "comparable":
-                    filed_entry_ref = entry_ref
-                    entry_ref = None
-                    normalized_entry_ref = None
-                    comparability_status = "unknown"
+                    # Congress references are closes from the SAME series the
+                    # gate compares against — identical basis by construction,
+                    # so cross-generation comparability cannot invalidate them.
+                    # Provenance still travels with the candidate (the legacy
+                    # generation id and unknown status are reported above);
+                    # only FORM4 filed/nominal prices need generation
+                    # normalization to be meaningful (review: block unknown).
+                    filed_entry_ref = None
                     comparability_reason = comparability_reason or (
                         "price comparability unknown: price generation is not verified"
                     )
@@ -535,6 +545,7 @@ def eligible_events(
                     "blocked_reason": (
                         comparability_reason
                         if comparability_status != "comparable"
+                        and comparability_blocks
                         else None
                     ),
                     "event_date": pd.Timestamp(transaction_day).normalize(),

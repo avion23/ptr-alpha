@@ -1077,8 +1077,44 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
         _tx(asset="Microsoft Corp. (MSFT)"),
         _tx(asset="Bad Corp. (BAD)", date="bad"),
     ]
+    # Fail-closed partial (FP review OCR-4): a batch with a rejected row does
+    # NOT commit — the existing artifact row is never deleted without a
+    # replacement, the partial result is retained as evidence, and the run
+    # records the canonical block.
     assert (
         _insert_transactions("doc-mixed", 2024, "Jane Doe", txs, db_path=str(db_path))
+        == 0
+    )
+
+    con = Database(db_path).conn
+    blocked_run = con.execute("""
+        SELECT status, raw_row_count, transaction_count, error_message
+        FROM pdf_parse_runs
+        WHERE doc_id = 'doc-mixed' AND status = 'partial'
+        ORDER BY parsed_at DESC
+        LIMIT 1
+    """).fetchone()
+    partial_retained = con.execute(
+        "SELECT COUNT(*) FROM ocr_partial_results WHERE doc_id = 'doc-mixed'"
+    ).fetchone()[0]
+    kept_rows = con.execute(
+        "SELECT ticker FROM transactions WHERE doc_id = 'doc-mixed'"
+    ).fetchall()
+    con.close()
+
+    assert blocked_run is not None
+    assert blocked_run[0:3] == ("partial", 2, 0)
+    assert "canonical commit blocked" in blocked_run[3]
+    assert "invalid_transaction_date" in blocked_run[3]
+    assert partial_retained == 1
+    assert [row[0] for row in kept_rows] == ["OLD"], "existing artifact row must survive"
+
+    # A subsequent fully-valid batch commits and retires the old artifact row.
+    assert (
+        _insert_transactions(
+            "doc-mixed", 2024, "Jane Doe", [_tx(asset="Microsoft Corp. (MSFT)")],
+            db_path=str(db_path),
+        )
         == 1
     )
 
@@ -1095,12 +1131,12 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
     """).fetchone()
     con.close()
 
-    # Partial insert: the valid row lands, the bad-date row stays out, and
-    # the success run records what was rejected.
-    assert [row[0] for row in rows] == ["MSFT"]
+    # The later full batch replaced the old artifact row (retirement) and
+    # recorded success; the blocked partial stays visible in the attempts
+    # history and ocr_partial_results evidence.
     assert latest_run[0] == "success"
-    assert latest_run[1:3] == (2, 1)
-    assert "invalid_transaction_date" in latest_run[3]
+    assert latest_run[1:3] == (1, 1)
+    assert [row[0] for row in rows] == ["MSFT"]
 
 
 def test_row_construction_failure_retires_current_artifact_rows(

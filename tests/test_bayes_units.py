@@ -80,6 +80,52 @@ def test_resolved_between_variance_does_not_warn():
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        fit = normal_normal_posteriors(outcomes, groups)
+        fit = normal_normal_posteriors(
+            outcomes, groups, independent_groups=["d1", "d2", "d1", "d2"]
+        )
 
     assert (fit["shrinkage"] < 1.0).all()
+
+
+def test_resolved_rank_report_prints_rows_and_groups():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        normal_normal_posteriors([1.0, 2.0, -1.0, 0.0], ["A", "A", "B", "B"])
+
+    assert len(caught) == 1
+    message = str(caught[0].message)
+    assert "rows/episodes=4" in message
+    assert "member_groups=2" in message
+    assert "independent_date_member_groups=UNKNOWN (not supplied)" in message
+
+
+def test_report_shows_episode_rows_and_distinct_member_date_groups():
+    fit = normal_normal_posteriors(
+        [1.0, 2.0, 3.0, -1.0, 0.0],
+        ["A", "A", "A", "B", "B"],
+        independent_groups=[
+            "2024-01-01",
+            "2024-06-01",
+            "2024-01-01",
+            "2024-01-01",
+            "2024-06-01",
+        ],
+    )
+
+    assert fit["episode_count"].to_dict() == {"A": 3, "B": 2}
+    assert fit["member_group_count"].to_dict() == {"A": 2, "B": 2}
+    assert fit["independent_group_count"].to_dict() == {"A": 2, "B": 2}
+    printed = fit.to_string()
+    assert "episode_count" in printed
+    assert "independent_group_count" in printed
+
+
+def test_unresolved_warning_marks_independent_date_member_groups_unknown():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        normal_normal_posteriors([1.0, -1.0, 1.0, -1.0], ["A", "A", "B", "B"])
+
+    message = str(caught[0].message)
+    assert "rows/episodes=4" in message
+    assert "member_groups=2" in message
+    assert "independent_date_member_groups=UNKNOWN (not supplied)" in message

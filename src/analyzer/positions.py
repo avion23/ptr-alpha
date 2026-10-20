@@ -13,8 +13,10 @@ accumulation; exchanges are ignored and reported.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import re
 from datetime import date
 from functools import lru_cache
@@ -35,13 +37,30 @@ _CONGRESS_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
 # Dollar-band / close-price share estimates can leave small FIFO dust.
 _POSITION_ESTIMATE_TOLERANCE = 0.10
 _SHARE_EPSILON = 1e-9
+_13F_SNAPSHOT_SUBTYPE = "13F_SHARE_POSITION_SNAPSHOT"
+_13F_CORROBORATION_ENV = "INSIDER_ENABLE_13F_CORROBORATION"
+
+
+def _13f_enabled(value):
+    if value is None:
+        return os.getenv(_13F_CORROBORATION_ENV, "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+    if not isinstance(value, bool):
+        raise TypeError("enable_13f_corroboration must be a bool")
+    return value
 
 
 class PositionsError(Exception):
     """Raised when positions cannot be reconstructed safely."""
 
 
-def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
+def gate_closed_events(
+    events: pd.DataFrame,
+    candidates: pd.DataFrame,
+    *,
+    enable_13f_corroboration: bool | None = None,
+) -> pd.DataFrame:
     """Remove entry references from purchase events without an open position.
 
     All kinds gate uniformly on reconstructed holdings: congress ledgers see
@@ -51,6 +70,7 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
     """
     if events.empty:
         return events.copy()
+    enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
 
     gated = events.copy()
     gated["blocked_reason"] = None
@@ -59,7 +79,18 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
         open_rows = candidates.loc[candidates["position_evidence"].eq(True)]
         for _, position in open_rows.iterrows():
             key = (str(position["ticker"]).upper(), str(position["actor_id"]))
-            open_positions[key] = position.get("event_date")
+            open_positions[key] = (
+                {
+                    "event_date": position.get("event_date"),
+                    "holding_state": position.get("holding_state"),
+                    "shares_held": position.get("shares_held"),
+                    "portfolio_pct": position.get("portfolio_pct"),
+                    "portfolio_pct_basis": position.get("portfolio_pct_basis"),
+                    "share_change": position.get("share_change"),
+                }
+                if enable_13f_corroboration and position.get("source") == "13f"
+                else position.get("event_date")
+            )
 
     # Row-major decisions without per-row Series construction: the mask and
     # the two masked assignments reproduce the iterrows loop exactly.
@@ -68,13 +99,28 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
             return gated[name].tolist()
         return [None] * len(gated)
 
-    starts = [
+    position_rows = [
         open_positions.get((str(ticker).upper(), str(actor_id)))
         for ticker, actor_id in zip(_cells("ticker"), _cells("actor_id"))
     ]
+    starts = [
+        position.get("event_date") if isinstance(position, dict) else position
+        for position in position_rows
+    ]
     event_dates = _cells("event_date")
+    event_sources = _cells("source")
     stale = []
-    for position_start, event_date in zip(starts, event_dates):
+    for position_start, event_date, position, source in zip(
+        starts, event_dates, position_rows, event_sources
+    ):
+        if enable_13f_corroboration and source == "13f":
+            held = (
+                isinstance(position, dict)
+                and position.get("holding_state") == "held"
+                and _positive_shares(position.get("shares_held"))
+            )
+            stale.append(not held)
+            continue
         stale.append(
             position_start is None
             or pd.isna(position_start)
@@ -86,7 +132,40 @@ def gate_closed_events(events: pd.DataFrame, candidates: pd.DataFrame) -> pd.Dat
         mask = pd.Series(stale, index=gated.index)
         gated.loc[mask, "entry_ref"] = None
         gated.loc[mask, "blocked_reason"] = "no open position at as_of"
+        if enable_13f_corroboration:
+            unavailable = mask & gated.get("source", pd.Series(index=gated.index)).eq("13f")
+            gated.loc[unavailable, "blocked_reason"] = (
+                "corroboration unavailable: no current 13F share snapshot"
+            )
+    if enable_13f_corroboration and "source" in gated:
+        is_13f = gated["source"].eq("13f")
+        for column in (
+            "holding_state", "shares_held", "portfolio_pct",
+            "portfolio_pct_basis", "share_change",
+        ):
+            if column not in gated:
+                gated[column] = None
+        for position_index, row_index in enumerate(gated.index):
+            if not is_13f.loc[row_index]:
+                continue
+            position = position_rows[position_index]
+            if isinstance(position, dict):
+                gated.at[row_index, "holding_state"] = position["holding_state"]
+                gated.at[row_index, "shares_held"] = position["shares_held"]
+                gated.at[row_index, "portfolio_pct"] = position["portfolio_pct"]
+                gated.at[row_index, "portfolio_pct_basis"] = position[
+                    "portfolio_pct_basis"
+                ]
+                gated.at[row_index, "share_change"] = position["share_change"]
     return gated
+
+
+def _positive_shares(value) -> bool:
+    try:
+        shares = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(shares) and shares > 0
 
 
 def _is_option_row(description, instrument) -> bool:
@@ -897,7 +976,12 @@ def _canonical_filing_refs(queue) -> list[dict]:
 
 @canonical_decision("as_of")
 def holdings_candidates(
-    db, member: str, as_of: date, *, include_unpromoted: bool = False
+    db,
+    member: str,
+    as_of: date,
+    *,
+    include_unpromoted: bool = False,
+    enable_13f_corroboration: bool | None = None,
 ) -> pd.DataFrame:
     """Return open positions as uncorroborated, unexpired setup candidates.
 
@@ -906,6 +990,7 @@ def holdings_candidates(
     on or before ``as_of``; future closes cannot enter a replay. Positions have
     no age expiry and remain candidates until sales close their lots.
     """
+    enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
     columns = [
         "ticker",
         "actor_id",
@@ -919,6 +1004,11 @@ def holdings_candidates(
         "as_of",
         "filing_refs",
     ]
+    if enable_13f_corroboration:
+        columns.extend(
+            ["holding_state", "shares_held", "portfolio_pct", "share_change",
+             "portfolio_pct_basis", "corroboration_reason"]
+        )
     source_kinds = {
         "house_pdf": "congress",
         "gemini_ocr": "congress",
@@ -953,13 +1043,19 @@ def holdings_candidates(
         for ticker in trades["ticker"].dropna().unique()
     }
     return _holdings_records(
-        member, trades, histories, as_of, _actor_id, columns, source_kinds
+        member, trades, histories, as_of, _actor_id, columns, source_kinds,
+        enable_13f_corroboration=enable_13f_corroboration,
     )
 
 
 @canonical_decision("as_of")
 def holdings_candidates_batch(
-    db, members: list[str], as_of: date, *, include_unpromoted: bool = False
+    db,
+    members: list[str],
+    as_of: date,
+    *,
+    include_unpromoted: bool = False,
+    enable_13f_corroboration: bool | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Open-position candidates for many members with O(1) DB round-trips.
 
@@ -970,6 +1066,7 @@ def holdings_candidates_batch(
     requested; the `setups` path fans out over ~300 event members, where the
     per-member form costs ~10s each.
     """
+    enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
     columns = [
         "ticker",
         "actor_id",
@@ -983,6 +1080,11 @@ def holdings_candidates_batch(
         "as_of",
         "filing_refs",
     ]
+    if enable_13f_corroboration:
+        columns.extend(
+            ["holding_state", "shares_held", "portfolio_pct", "share_change",
+             "portfolio_pct_basis", "corroboration_reason"]
+        )
     source_kinds = {
         "house_pdf": "congress",
         "gemini_ocr": "congress",
@@ -1149,6 +1251,7 @@ def holdings_candidates_batch(
             entry_lookup=entry_lookup,
             presorted=not include_unpromoted,
             kind_cells=kind_by_member.get(member),
+            enable_13f_corroboration=enable_13f_corroboration,
         )
     return out
 
@@ -1156,6 +1259,7 @@ def holdings_candidates_batch(
 def _holdings_records(
     member, trades: pd.DataFrame, histories: dict, as_of, _actor_id, columns, source_kinds,
     entry_lookup=None, presorted: bool = False, kind_cells: pd.Series | None = None,
+    enable_13f_corroboration: bool = False,
 ) -> pd.DataFrame:
     """Shared per-member record builder over preloaded trades+histories."""
     records = []
@@ -1168,6 +1272,15 @@ def _holdings_records(
         kind_trades = trades.loc[kinds_local.eq(actor_kind)]
         if kind_trades.empty:
             continue
+        if actor_kind == "manager" and enable_13f_corroboration:
+            records.extend(
+                _13f_share_state_records(
+                    member, kind_trades, as_of, _actor_id
+                )
+            )
+            kind_trades = kind_trades.loc[kind_trades["source"].ne("13f")]
+            if kind_trades.empty:
+                continue
         positions = build_positions(
             kind_trades, histories, as_of=as_of, entry_lookup=entry_lookup,
             presorted=presorted,
@@ -1197,6 +1310,18 @@ def _holdings_records(
                     "position_evidence": True,
                     "as_of": as_of,
                     "filing_refs": position.filing_refs,
+                    **(
+                        {
+                            "holding_state": "held",
+                            "shares_held": position.shares,
+                            "portfolio_pct": None,
+                            "portfolio_pct_basis": None,
+                            "share_change": None,
+                            "corroboration_reason": None,
+                        }
+                        if enable_13f_corroboration
+                        else {}
+                    ),
                 }
             )
 
@@ -1206,6 +1331,143 @@ def _holdings_records(
             [record["entry_ref"] for record in records], dtype=object
         )
     return result
+
+
+def _parse_13f_snapshot(raw, subtype):
+    if subtype != _13F_SNAPSHOT_SUBTYPE:
+        return None, "corroboration unavailable: legacy 13F row lacks a share snapshot"
+    try:
+        snapshot = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return None, "corroboration unavailable: malformed 13F share snapshot"
+    if not isinstance(snapshot, dict) or snapshot.get("format") != "13f-share-snapshot-v1":
+        return None, "corroboration unavailable: unsupported 13F share snapshot"
+    shares = snapshot.get("shares_held")
+    if isinstance(shares, bool) or not isinstance(shares, int) or shares < 0:
+        return None, "corroboration unavailable: invalid shares-held value"
+    change = snapshot.get("change_shares")
+    if isinstance(change, bool) or not isinstance(change, int):
+        return None, "corroboration unavailable: invalid 13F share change"
+    portfolio_pct = snapshot.get("portfolio_pct")
+    if portfolio_pct is not None:
+        try:
+            portfolio_pct = float(portfolio_pct)
+        except (OverflowError, TypeError, ValueError):
+            return None, "corroboration unavailable: invalid portfolio percentage"
+        if not math.isfinite(portfolio_pct) or portfolio_pct < 0:
+            return None, "corroboration unavailable: invalid portfolio percentage"
+    state = "held" if shares > 0 else "absent"
+    return {
+        "holding_state": state,
+        "shares_held": shares,
+        "portfolio_pct": portfolio_pct,
+        "portfolio_pct_basis": snapshot.get(
+            "portfolio_pct_basis",
+            "reported 13F value (all information-table entries)",
+        ),
+        "share_change": change,
+    }, None
+
+
+def _13f_share_state_records(member, trades, as_of, _actor_id):
+    transaction_dates = pd.to_datetime(trades["transaction_date"], errors="coerce")
+    disclosure_dates = (
+        pd.to_datetime(trades["disclosure_date"], errors="coerce")
+        if "disclosure_date" in trades
+        else transaction_dates
+    )
+    known = (transaction_dates <= pd.Timestamp(as_of)) & (
+        disclosure_dates <= pd.Timestamp(as_of)
+    )
+    ordered = trades.loc[known].copy()
+    if ordered.empty:
+        return []
+    ordered["_snapshot_transaction_date"] = transaction_dates.loc[known]
+    ordered["_snapshot_disclosure_date"] = disclosure_dates.loc[known]
+    sort_columns = [
+        column
+        for column in (
+            "ticker",
+            "_snapshot_transaction_date",
+            "_snapshot_disclosure_date",
+            "source_record_id",
+        )
+        if column in ordered
+    ]
+    ordered = ordered.sort_values(sort_columns, kind="mergesort")
+    records = []
+    for ticker, ticker_rows in ordered.groupby("ticker", sort=True):
+        latest_key = tuple(ticker_rows.iloc[-1][column] for column in sort_columns[1:])
+        latest_mask = pd.Series(True, index=ticker_rows.index)
+        for column, value in zip(sort_columns[1:], latest_key):
+            latest_mask &= (
+                ticker_rows[column].isna()
+                if value is None or pd.isna(value)
+                else ticker_rows[column].eq(value)
+            )
+        latest_rows = ticker_rows.loc[latest_mask].to_dict("records")
+        snapshots = [
+            _parse_13f_snapshot(
+                row.get("amount_raw"), row.get("raw_transaction_subtype")
+            )
+            for row in latest_rows
+        ]
+        snapshot_error = next((reason for snapshot, reason in snapshots if snapshot is None), None)
+        if snapshot_error:
+            snapshot = {
+                "holding_state": "unavailable",
+                "shares_held": None,
+                "portfolio_pct": None,
+                "portfolio_pct_basis": None,
+                "share_change": None,
+            }
+            reason = snapshot_error
+        else:
+            parsed = [snapshot for snapshot, _ in snapshots]
+            shares_held = sum(item["shares_held"] for item in parsed)
+            snapshot = {
+                "holding_state": "held" if shares_held > 0 else "absent",
+                "shares_held": shares_held,
+                "portfolio_pct": (
+                    sum(item["portfolio_pct"] for item in parsed)
+                    if all(item["portfolio_pct"] is not None for item in parsed)
+                    else None
+                ),
+                "portfolio_pct_basis": parsed[0]["portfolio_pct_basis"],
+                "share_change": sum(item["share_change"] for item in parsed),
+            }
+            reason = None
+        active = snapshot["holding_state"] == "held" and _positive_shares(
+            snapshot["shares_held"]
+        )
+        row = latest_rows[-1]
+        records.append(
+            {
+                "ticker": str(ticker),
+                "actor_id": _actor_id("manager", member),
+                "kind": "manager",
+                "source": "13f",
+                "entry_ref": None,
+                "event_date": row.get("transaction_date"),
+                "disclosure_date": row.get("disclosure_date"),
+                "corroboration": active,
+                "position_evidence": active,
+                "as_of": as_of,
+                "filing_refs": [
+                    {
+                        "source": "13f",
+                        "source_record_id": ref.get("source_record_id"),
+                        "source_row_id": ref.get("source_row_id"),
+                    }
+                    for ref in latest_rows
+                ],
+                **snapshot,
+                "corroboration_reason": reason or (
+                    None if active else "corroboration unavailable: 13F position absent at as_of"
+                ),
+            }
+        )
+    return records
 
 
 def discount_alerts(positions: pd.DataFrame, *, threshold_pct: float = -10.0) -> pd.DataFrame:

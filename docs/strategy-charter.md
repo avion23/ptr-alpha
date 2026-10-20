@@ -29,6 +29,18 @@ actor-count vote with adjustments — NOT a predicted return and NOT a
 validated skill estimate. Rank differences above the floor mostly order
 actor counts. Never size by score magnitude.
 
+Tie degeneracy is substantive: 77 tickers at score 0.78 are one tied score
+cluster, not 77 distinguishable ranks. Alphabetical ordering is a deterministic
+tie-break only, never evidence of a score difference.
+
+13F corroboration remains disabled by default. The explicit opt-in is
+`INSIDER_ENABLE_13F_CORROBORATION=1`, read by candidate construction, gating,
+and scoring; this reaches the existing CLI and receipt derivation without
+changing their interfaces. Opt-in receipt verification must run with the same
+environment setting; the derived audit records `13f_corroboration_enabled`.
+No dedicated CLI option or frozen receipt input for this environment setting
+is present in this change, so cross-environment receipt replay is UNKNOWN.
+
 ## Requirements table
 
 | # | Requirement | Check / threshold | Status 2026-10-16 |
@@ -94,6 +106,17 @@ published panels: ~330–440 eligible rows and ~150–215 ranked rows per date
 < 50 eligible events or < 20 candidate tickers is DEGENERATE and the
 harness refuses it.
 
+Reporting rule: show row counts beside the independent groups used for
+uncertainty (distinct decision-date × member groups, and date clusters when
+the estimator clusters by date). If the underlying grouped count is not
+available, label it UNKNOWN; episode/row counts are not independent groups.
+The member-ranking caller currently supplies member labels but not decision
+dates to the posterior estimator; its independent date×member group count is
+therefore UNKNOWN until the rank-members reporting path passes those labels.
+For this four-date block, the threshold t=2 with df=3 corresponds to a
+two-sided p=0.1393, not 95% confidence. The preregistered |t|≥2 bar is a
+decision threshold, not a 95%-confidence claim.
+
 Per decision date, the live unscoped rank MUST run with --receipt (the
 receipt is the frame anchor and the degeneracy cross-check), and the
 harness cohort run (--frame ingestion) MUST be written to
@@ -113,6 +136,12 @@ charter amendment committed before the first unsealed date.
 
 ## Known non-circular result
 
-Eligible (pass-gate) −2.56 vs ineligible −0.52 (clustered t=−4.65) validates
-the ENTRY FILTER (don't chase >5% above the print on stale quotes), not
-insider skill. It justifies keeping the gates; it does not justify the score.
+### Superseded/corrected interpretation (2026-10-20)
+
+The earlier wording that the eligible/ineligible contrast was a “loss
+reduction” or validated a loss-cutting rule is superseded.
+`data/backtest_assumptions/summary.csv:5`
+reports a difference of means: eligible mean excess = −2.55999pp and
+ineligible mean excess = −0.52216pp, so eligible minus ineligible = −2.03783pp
+(reported clustered t=−4.65). This is an observed group contrast, not a loss
+reduction and not a causal effect. It does not support an alpha or skill claim.

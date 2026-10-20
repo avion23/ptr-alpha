@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
-import math
 import os
 import xml.etree.ElementTree as ET
 from datetime import date
 from pathlib import Path
-from typing import Callable
 
 import pandas as pd
 import requests
@@ -17,7 +16,6 @@ from analyzer.asset_ticker_map import resolve_asset_ticker
 from analyzer.database import Database
 from analyzer.form4 import (
     SEC_ARCHIVES_URL,
-    SEC_SUBMISSIONS_URL,
     _SECClient,
     _accession_digits,
     _acceptance_datetime,
@@ -45,6 +43,7 @@ _OUTPUT_PROVENANCE_COLUMNS = (
 )
 _OUTPUT_COLUMNS = _BASE_WRITE_COLUMNS + _OUTPUT_PROVENANCE_COLUMNS
 _SHARE_SUBTYPE = "INFERRED_POSITION_INCREASE"
+_SNAPSHOT_SUBTYPE = "13F_SHARE_POSITION_SNAPSHOT"
 _INCREASE_COLUMNS = (
     "acceptance_datetime",
     "manager_key",
@@ -87,6 +86,9 @@ def _canonical_row(
     report_url,
     ingestion_generation,
     acceptance_datetime=None,
+    transaction_type="Purchase",
+    amount_raw=None,
+    raw_transaction_subtype=_SHARE_SUBTYPE,
 ) -> dict:
     """One canonical 13F row; shared by watchlist and discovery paths."""
     row_id = cusip
@@ -107,9 +109,9 @@ def _canonical_row(
         "transaction_date": event_date,
         "disclosure_date": disclosure_date,
         "acceptance_datetime": acceptance_datetime,
-        "transaction_type": "Purchase",
+        "transaction_type": transaction_type,
         "owner_code": None,
-        "amount_raw": f"{added_shares:,} shares",
+        "amount_raw": amount_raw or f"{added_shares:,} shares",
         "amount_midpoint": amount_midpoint,
         "instrument_type": "Common Stock",
         "strike_price": None,
@@ -122,7 +124,7 @@ def _canonical_row(
         "source_report_path": report_url,
         "raw_owner": manager_name,
         "official_filing_date": disclosure_date,
-        "raw_transaction_subtype": _SHARE_SUBTYPE,
+        "raw_transaction_subtype": raw_transaction_subtype,
         "raw_asset_description": issuer,
         "ingestion_generation": ingestion_generation,
     }
@@ -146,6 +148,8 @@ def _parse_information_table(xml_content: bytes | str) -> dict[str, dict[str, ob
         element for element in root.iter() if _local_name(element.tag) == "infoTable"
     ]
     holdings: dict[str, dict[str, object]] = {}
+    portfolio_value_total = 0
+    portfolio_value_complete = True
     for entry in entries:
         fields = {
             _local_name(child.tag): (child.text or "").strip()
@@ -156,10 +160,21 @@ def _parse_information_table(xml_content: bytes | str) -> dict[str, dict[str, ob
         cusip = fields.get("cusip", "").upper()
         shares_raw = fields.get("sshPrnamt", "")
         amount_type = fields.get("sshPrnamtType", "").upper()
+        value_raw = fields.get("value", "")
         if not issuer or not cusip or not shares_raw:
             raise ThirteenFError(
                 "13F information table has a row missing issuer, CUSIP, or shares"
             )
+        try:
+            value_thousands = int(str(value_raw).replace(",", "")) if value_raw else None
+        except ValueError as exc:
+            raise ThirteenFError(f"Invalid 13F reported value for CUSIP {cusip}") from exc
+        if value_thousands is None:
+            portfolio_value_complete = False
+        elif value_thousands < 0:
+            raise ThirteenFError(f"Negative 13F reported value for CUSIP {cusip}")
+        else:
+            portfolio_value_total += value_thousands
         if amount_type != "SH" or fields.get("putCall"):
             continue
         try:
@@ -168,12 +183,21 @@ def _parse_information_table(xml_content: bytes | str) -> dict[str, dict[str, ob
             raise ThirteenFError(f"Invalid 13F share count for CUSIP {cusip}") from exc
         if shares < 0:
             raise ThirteenFError(f"Negative 13F share count for CUSIP {cusip}")
-
         existing = holdings.get(cusip)
         if existing is None:
-            holdings[cusip] = {"issuer": issuer, "shares": shares}
+            holdings[cusip] = {
+                "issuer": issuer,
+                "shares": shares,
+                "value_thousands": value_thousands,
+            }
         elif str(existing["issuer"]).casefold() == issuer.casefold():
             existing["shares"] = int(str(existing["shares"])) + shares
+            existing["value_thousands"] = (
+                int(existing["value_thousands"]) + value_thousands
+                if existing["value_thousands"] is not None
+                and value_thousands is not None
+                else None
+            )
         else:
             raise ThirteenFError(f"Conflicting issuer names for CUSIP {cusip}")
 
@@ -181,7 +205,28 @@ def _parse_information_table(xml_content: bytes | str) -> dict[str, dict[str, ob
         raise ThirteenFError(
             "13F information table is empty or has no usable share rows"
         )
+    portfolio_total = portfolio_value_total if portfolio_value_complete else None
+    for holding in holdings.values():
+        holding["portfolio_value_thousands"] = portfolio_total
     return holdings
+
+
+def _portfolio_percentages(holdings: dict[str, dict[str, object]]) -> dict[str, float | None]:
+    """Share of the reported 13F value, or unknown if the filing is incomplete."""
+    totals = {holding.get("portfolio_value_thousands") for holding in holdings.values()}
+    total = next(iter(totals)) if len(totals) == 1 else None
+    if total is None or not holdings:
+        return {cusip: None for cusip in holdings}
+    if int(total) <= 0:
+        return {cusip: None for cusip in holdings}
+    return {
+        cusip: (
+            int(holding["value_thousands"]) / int(total) * 100.0
+            if holding.get("value_thousands") is not None
+            else None
+        )
+        for cusip, holding in holdings.items()
+    }
 
 
 def _recent_quarters(submissions: dict) -> list[dict[str, str]]:
@@ -246,7 +291,6 @@ class ThirteenFSource(TransactionSource):
         read_only: bool = False,
         db: Database | None = None,
         ingestion_generation: str | None = None,
-        price_lookup: Callable[[str, date], float | None] | None = None,
         managers: dict[str, dict[str, str]] | None = None,
         ticker_map: dict[str, str] | None = None,
     ):
@@ -285,7 +329,6 @@ class ThirteenFSource(TransactionSource):
             else Database(self.data_dir / "congress.duckdb", read_only=read_only)
         )
         self.ingestion_generation = ingestion_generation
-        self.price_lookup = price_lookup
         self.managers = WATCHLIST_MANAGERS if managers is None else managers
         if not self.managers:
             raise ThirteenFError("At least one 13F manager is required")
@@ -457,7 +500,16 @@ class ThirteenFSource(TransactionSource):
         quarter_end = date.fromisoformat(current_filing["report_date"])
         disclosure_date = date.fromisoformat(current_filing["filing_date"])
         rows = []
-        for cusip, holding in current.items():
+        previous_values = _portfolio_percentages(previous)
+        current_values = _portfolio_percentages(current)
+        previous_complete = bool(previous_values) and all(
+            value is not None for value in previous_values.values()
+        )
+        current_complete = bool(current_values) and all(
+            value is not None for value in current_values.values()
+        )
+        for cusip in sorted(set(current) | set(previous)):
+            holding = current.get(cusip) or previous[cusip]
             issuer = str(holding["issuer"])
             issuer_folded = issuer.casefold()
             matches = {
@@ -474,41 +526,60 @@ class ThirteenFSource(TransactionSource):
                 )
                 continue
 
-            shares = int(str(holding["shares"]))
-            added_shares = shares - int(str(previous.get(cusip, {}).get("shares", 0)))
-            if added_shares <= 0:
-                continue
+            shares_held = int(str(current.get(cusip, {}).get("shares", 0)))
+            previous_shares = int(str(previous.get(cusip, {}).get("shares", 0)))
+            change_shares = shares_held - previous_shares
+            state = "held" if shares_held > 0 else "absent"
+            current_pct = current_values.get(
+                cusip, 0.0 if current_complete else None
+            )
+            previous_pct = previous_values.get(
+                cusip, 0.0 if previous_complete else None
+            )
+            raw_position = json.dumps(
+                {
+                    "format": "13f-share-snapshot-v1",
+                    "shares_held": shares_held,
+                    "portfolio_pct": current_pct,
+                    "portfolio_pct_basis": "reported 13F value (all information-table entries)",
+                    "change_shares": change_shares,
+                    "change_portfolio_pct": (
+                        current_pct - previous_pct
+                        if current_pct is not None and previous_pct is not None
+                        else None
+                    ),
+                    "state": state,
+                    "dollar_valuation": {
+                        "status": "not_performed",
+                        "reason": "share snapshot; no dollar-size comparison used",
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            transaction_type = (
+                "Purchase" if change_shares > 0 else
+                "Sale" if change_shares < 0 else "Position Snapshot"
+            )
 
             ticker = matches.pop()
-            price = (
-                self.price_lookup(ticker, quarter_end) if self.price_lookup else None
-            )
-            if price is not None:
-                try:
-                    price = float(price)
-                except (TypeError, ValueError) as exc:
-                    raise ThirteenFError(
-                        f"Invalid quarter-end price for {ticker}"
-                    ) from exc
-                if not math.isfinite(price) or price < 0:
-                    raise ThirteenFError(f"Invalid quarter-end price for {ticker}")
-
             rows.append(
                 _canonical_row(
                     manager_name=manager["name"],
                     ticker=ticker,
                     event_date=quarter_end,
                     disclosure_date=disclosure_date,
-                    added_shares=added_shares,
-                    amount_midpoint=added_shares * price
-                    if price is not None
-                    else None,
+                    added_shares=change_shares,
+                    amount_midpoint=None,
                     issuer=issuer,
                     cusip=cusip,
                     accession=current_filing["accession"],
                     report_url=report_url,
                     ingestion_generation=self.ingestion_generation,
                     acceptance_datetime=current_filing.get("acceptance_datetime"),
+                    transaction_type=transaction_type,
+                    amount_raw=raw_position,
+                    raw_transaction_subtype=_SNAPSHOT_SUBTYPE,
                 )
             )
         return rows

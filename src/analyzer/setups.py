@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Collection
 from datetime import timedelta
 
@@ -25,6 +26,7 @@ _BLOCKED_COLUMNS = ["ticker", "actor_id", "reason"]
 _RANKED_FLOOR = 1.0
 _CORROBORATED_FLOOR = 0.25
 _MIN_USABLE_CONTRIBUTION = 0.05
+_13F_CORROBORATION_ENV = "INSIDER_ENABLE_13F_CORROBORATION"
 
 
 def is_ranked(score_value: float, n_actors: int, corroborated: bool = False) -> bool:
@@ -51,12 +53,15 @@ def score(
     entry_tol: float = 1.05,
     event_half_life_days: int = 90,
     watchlist: Collection[str] | None = None,
+    enable_13f_corroboration: bool | None = None,
     audit: dict | None = None,
     ex_dividends: dict[str, list] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Rank price-eligible initiating actors and report blocked actors.
 
-    13F corroboration counts only for curated watchlist managers: pass
+    13F corroboration is opt-in: set ``INSIDER_ENABLE_13F_CORROBORATION=1``
+    for CLI and receipt scoring, or pass the keyword flag. It counts only for
+    curated watchlist managers: pass
     ``manager_watchlist.watchlist_actor_ids()``. Without a watchlist no
     corroboration is recognized (fail closed). Dated current prices use
     ``(price, date)``; bare floats retain legacy behavior without freshness
@@ -65,6 +70,12 @@ def score(
     (cum-div cost basis vs ex-div quote is a contaminated comparison).
     Missing rows mean unknown, never clean: without the map the gate is off.
     """
+    if enable_13f_corroboration is None:
+        enable_13f_corroboration = os.getenv(
+            _13F_CORROBORATION_ENV, ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    elif not isinstance(enable_13f_corroboration, bool):
+        raise TypeError("enable_13f_corroboration must be a bool")
     if entry_tol <= 0 or event_half_life_days <= 0:
         raise ValueError("entry_tol and event_half_life_days must be positive")
 
@@ -139,9 +150,13 @@ def score(
         initiator_ids = {
             actor for actor, rows in actor_rows.items() if rows["initiators"]
         }
+        corroboration_unavailable = None
 
         def _valid_corroborator(row) -> bool:
+            nonlocal corroboration_unavailable
             if row.get("source") != "13f":
+                return False
+            if not enable_13f_corroboration:
                 return False
             if str(row.get("actor_id")) in initiator_ids:
                 return False
@@ -155,14 +170,33 @@ def score(
                 decided = _as_date_memo(row["as_of"])
             except (TypeError, ValueError):
                 return False
-            if row.get("blocked_reason") == "no open position at as_of":
+            blocked_reason = row.get("blocked_reason")
+            if isinstance(blocked_reason, str) and blocked_reason.strip():
+                if blocked_reason == "no open position at as_of":
+                    blocked_reason = (
+                        "corroboration unavailable: no current 13F share snapshot"
+                    )
+                corroboration_unavailable = blocked_reason
+                return False
+            if row.get("holding_state") != "held" or not _positive_shares(
+                row.get("shares_held")
+            ):
+                corroboration_unavailable = row.get("corroboration_reason") or (
+                    "corroboration unavailable: no positive 13F share state"
+                )
                 return False
             if disclosed > decided:
+                corroboration_unavailable = (
+                    "corroboration unavailable: 13F disclosure is after decision"
+                )
                 return False
             # 13F filings are quarterly snapshots, not trades. A position
             # disclosed two quarters ago says nothing about today (the fund
             # may have exited since); ancient disclosures must not promote.
             if (decided - disclosed).days > 180:
+                corroboration_unavailable = (
+                    "corroboration unavailable: 13F disclosure is over 180 days old"
+                )
                 return False
             return True
 
@@ -202,7 +236,11 @@ def score(
                     {
                         "ticker": ticker,
                         "actor_id": actor_id,
-                        "reason": "corroboration only",
+                        "reason": (
+                            corroboration_unavailable
+                            if enable_13f_corroboration and corroboration_unavailable
+                            else "corroboration only"
+                        ),
                     }
                 )
                 continue
@@ -323,6 +361,10 @@ def score(
                 future_quote=future_quote,
                 ranking_gate=is_ranked(score_value, len(accepted), corroborated),
             )
+            if enable_13f_corroboration:
+                audit[ticker]["13f_corroboration_enabled"] = True
+            if enable_13f_corroboration and not corroborated and corroboration_unavailable:
+                audit[ticker]["corroboration_unavailable"] = corroboration_unavailable
         if accepted and not is_ranked(score_value, len(accepted), corroborated):
             blocked_rows.extend(
                 {
@@ -360,6 +402,14 @@ def score(
 
 def _missing(value) -> bool:
     return value is None or bool(pd.isna(value))
+
+
+def _positive_shares(value) -> bool:
+    try:
+        shares = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(shares) and shares > 0
 
 
 def _as_date(value):

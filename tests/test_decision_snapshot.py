@@ -39,6 +39,8 @@ def inputs():
         source="13f",
         source_record_id="13f-456",
         corroboration=True,
+        holding_state="held",
+        shares_held=100,
     )
     return (
         pd.DataFrame([row, fund]),
@@ -56,8 +58,9 @@ def _receipts(tmp_path):
     return sorted(_receipt_dir(tmp_path).glob("*.json"))
 
 
-def test_record_idempotent_and_replay(tmp_path, inputs):
+def test_record_idempotent_and_replay(tmp_path, inputs, monkeypatch):
     candidates, weights, quotes, watchlist = inputs
+    monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1")
     ranked, blocked = score(candidates, weights, quotes, watchlist=watchlist)
     path = receipts.record_decision(tmp_path, DAY, *inputs, ranked, blocked)
     original, stat = path.read_bytes(), path.stat()

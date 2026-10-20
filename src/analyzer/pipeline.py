@@ -28,7 +28,7 @@ from analyzer.member_ranking.buyer_scoring import (
     _resolve_consensus_ticker,
 )
 from analyzer.models import AnalysisMode, SourceCoverageState
-from analyzer.positions import entry_close, _EntryCloseLookup, _split_price_history
+from analyzer.positions import _EntryCloseLookup, _split_price_history
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
 from analyzer.price_source import price_adjustment_factor, price_generation_state

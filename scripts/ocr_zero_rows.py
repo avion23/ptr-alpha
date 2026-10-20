@@ -181,7 +181,12 @@ def get_ocr_work_items(
     parser_version: str = GEMINI_PARSER_VERSION,
     require_schema: bool = True,
 ):
-    """Select work from current artifacts, validated cache, schema, and DB rows."""
+    """Select work from current artifacts, validated cache, schema, and DB rows.
+
+    Years are House archive years (also the canonical acquisition/insert key),
+    not filing-date years. This keeps default and year-scoped work identical
+    for late filings instead of emitting two identities for the same document.
+    """
     conn = duckdb.connect(db_path, read_only=True)
     existing_columns = {
         row[1] for row in conn.execute("PRAGMA table_info('transactions')").fetchall()
@@ -241,12 +246,12 @@ def get_ocr_work_items(
                 )
             )
             SELECT CAST(m.doc_id AS VARCHAR),
-                   CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER)
+                   COALESCE(m.archive_year, CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER))
             FROM metadata m
             JOIN deterministic d ON d.doc_id = m.doc_id AND d.rn = 1
             WHERE m.filing_type = 'P'
               AND d.status IN ('zero_rows', 'error', 'rejected', 'partial')
-              AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
+              AND (? IS NULL OR COALESCE(m.archive_year, EXTRACT(YEAR FROM m.filing_date)) = ?)
             ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
             """,
             [year, year],
@@ -306,7 +311,7 @@ def get_ocr_work_items(
             GROUP BY doc_id
         )
         SELECT CAST(m.doc_id AS VARCHAR),
-               CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER),
+               COALESCE(m.archive_year, CAST(EXTRACT(YEAR FROM m.filing_date) AS INTEGER)),
                o.status,
                o.raw_row_count,
                o.transaction_count,
@@ -318,7 +323,7 @@ def get_ocr_work_items(
         LEFT JOIN tx ON tx.doc_id = m.doc_id
         WHERE m.filing_type = 'P'
           AND d.status IN ('zero_rows', 'error', 'rejected', 'partial')
-          AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
+          AND (? IS NULL OR COALESCE(m.archive_year, EXTRACT(YEAR FROM m.filing_date)) = ?)
         ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
         """,
         [parser_version, parser_version, parser_version, year, year],
@@ -461,7 +466,9 @@ def build_work_manifest(
     binding is absent or unconfirmed, and the record stays honest instead
     of guessing). ``glm_stage stage --from-manifest`` consumes the frozen
     file so cron drains an inspectable queue rather than a directory scan
-    that includes text-born docs and re-admits promoted docs.
+    that includes text-born docs and re-admits promoted docs. New ``year``
+    groups use archive years; additive ``archive_year`` keeps artifact identity
+    explicit while old manifests may retain filing-year staging groups.
     """
     base = Path(data_dir) if data_dir is not None else Path(db_path).parent
     items = []
@@ -471,6 +478,7 @@ def build_work_manifest(
         entry = {
             "doc_id": str(doc_id),
             "year": int(doc_year),
+            "archive_year": int(doc_year),
             "artifact_sha256": None,
             "ingestion_generation": None,
         }
@@ -504,6 +512,54 @@ def build_work_manifest(
         "item_count": len(items),
         "items": items,
     }
+
+
+def local_work_artifact(conn, data_dir: str | Path, item: dict) -> tuple[Path, dict]:
+    """Resolve old/new queue identities without scanning for same-ID PDFs.
+
+    ``year`` is the staging group; metadata's archive year locates the House
+    artifact. Crossing years requires a recorded, current acquisition. Legacy
+    same-year unbound manifests remain readable, but never authorize a
+    canonical skip. Explicit hashes/generations are constraints, not hints.
+    """
+    doc_id, group_year = str(item["doc_id"]), int(item["year"])
+    archive_year = item.get("archive_year")
+    if conn is not None:
+        try:
+            row = conn.execute(
+                "SELECT archive_year FROM metadata WHERE doc_id = ?", [doc_id]
+            ).fetchone()
+        except duckdb.CatalogException:
+            row = None  # legacy synthetic/manual DB without House metadata
+        if row and row[0] is not None:
+            if archive_year is not None and archive_year != row[0]:
+                raise RuntimeError("manifest archive_year disagrees with House metadata")
+            archive_year = row[0]
+    archive_year = archive_year if archive_year is not None else group_year
+    if not isinstance(archive_year, int) or isinstance(archive_year, bool) or not 1000 <= archive_year <= 9999:
+        raise RuntimeError("invalid artifact archive_year")
+    if Path(doc_id).name != doc_id or doc_id in ("", ".", ".."):
+        raise RuntimeError("invalid artifact doc_id")
+    path = Path(data_dir) / str(archive_year) / "pdfs" / f"{doc_id}.pdf"
+    identity = {"archive_year": archive_year, "artifact_sha256": None, "ingestion_generation": None}
+    if not path.exists():
+        return path, identity
+    digest = pdf_sha256(path)
+    expected = item.get("artifact_sha256", item.get("pdf_sha256"))
+    if expected is not None and digest != expected:
+        raise RuntimeError("local artifact does not match expected SHA-256")
+    generation = None
+    if conn is not None:
+        try:
+            generation = _resolve_ingestion_generation(conn, doc_id, archive_year, digest)
+        except (RuntimeError, duckdb.CatalogException):
+            pass
+    if item.get("ingestion_generation") is not None and generation != item["ingestion_generation"]:
+        raise RuntimeError("artifact is not bound to the expected current House generation")
+    if archive_year != group_year and generation is None:
+        raise RuntimeError("cross-year artifact lacks a current recorded House acquisition")
+    identity.update(artifact_sha256=digest, ingestion_generation=generation)
+    return path, identity
 
 
 def export_work_manifest(

@@ -90,6 +90,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -554,6 +555,7 @@ def build_staging_record(
     config: VisionBConfig | None,
     *,
     read_fn=None,
+    artifact_identity: dict | None = None,
 ) -> dict:
     """Read one document and build its staging record. Never raises.
 
@@ -606,6 +608,11 @@ def build_staging_record(
         # One artifact snapshot feeds sha256, page count, and the render.
         pdf_bytes = Path(pdf_path).read_bytes()
         record["pdf_sha256"] = hashlib.sha256(pdf_bytes).hexdigest()
+        if artifact_identity is not None:
+            if record["pdf_sha256"] != artifact_identity["artifact_sha256"]:
+                raise RuntimeError("artifact changed after manifest selection")
+            record["archive_year"] = artifact_identity["archive_year"]
+            record["ingestion_generation"] = artifact_identity["ingestion_generation"]
         with tempfile.TemporaryDirectory(prefix="glm_stage_snapshot_") as snapshot_dir:
             snapshot = Path(snapshot_dir) / f"{Path(pdf_path).stem}.pdf"
             snapshot.write_bytes(pdf_bytes)
@@ -666,6 +673,43 @@ def canonical_parsed_doc_ids(db_path: str | Path) -> set[str]:
     finally:
         conn.close()
     return {row[0] for row in rows}
+
+
+def canonical_terminal_artifacts(db_path: str | Path) -> set[tuple[str, str, str]]:
+    """Current acquired PTR identities passing the existing terminal contract."""
+    from analyzer.database import Database
+
+    db = Database(db_path, read_only=True)
+    try:
+        complete = set()
+        years = db.conn.execute("SELECT DISTINCT archive_year FROM house_archive_generations").fetchall()
+        for (year,) in years:
+            generation = db.get_latest_house_generation(year)
+            unresolved = set(db.get_unresolved_house_doc_ids(year, generation))
+            rows = db.conn.execute(
+                """
+                SELECT a.doc_id, a.artifact_sha256, a.generation_id
+                FROM house_pdf_artifacts a
+                JOIN house_generation_metadata m
+                  USING (archive_year, generation_id, doc_id)
+                WHERE a.archive_year = ? AND a.generation_id = ?
+                  AND m.filing_type = 'P' AND a.artifact_sha256 IS NOT NULL
+                """, [year, generation],
+            ).fetchall()
+            complete.update(tuple(row) for row in rows if row[0] not in unresolved)
+        return complete
+    finally:
+        db.close()
+
+
+def manifest_artifact(item: dict, data_dir: str | Path, db_path: str | Path | None = None):
+    """Resolve one artifact again at a read boundary, never a directory search."""
+    import duckdb
+    from scripts.ocr_zero_rows import local_work_artifact
+
+    path = Path(db_path or default_db_path(data_dir))
+    with duckdb.connect(str(path), read_only=True) if path.exists() else nullcontext(None) as conn:
+        return local_work_artifact(conn, data_dir, item)
 
 
 def select_candidates(
@@ -758,46 +802,55 @@ def select_candidates_from_manifest(
     reading it nightly would burn quota); an entry whose live record is an
     ERROR record IS retried — the authoritative queue still lists the doc
     as unresolved, and the re-stage archives the failed attempt as
-    versioned evidence instead of overwriting it.
+    versioned evidence instead of overwriting it. Canonical skips require the
+    current artifact/generation's verified terminal disposition, not a historic
+    doc-ID success. Old filing-year groups resolve through House archive
+    metadata and recorded acquisitions; explicit hash/generation mismatches
+    are refused, never replaced with another same-ID artifact.
     """
-    skip: set[str] = set()
-    year_dir = staging_root(data_dir) / str(year)
-    if year_dir.exists():
-        for path in year_dir.glob("*.json"):
-            try:
-                record = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(record, dict):
-                continue
-            doc_id = str(record.get("doc_id") or path.stem)
-            if record.get("parse_status") == "error":
-                continue  # retryable: the queue still wants this doc
-            skip.add(doc_id)
-    if check_canonical:
-        skip |= canonical_parsed_doc_ids(db_path or default_db_path(data_dir))
+    import duckdb
+    from scripts.ocr_zero_rows import local_work_artifact
+
+    # A frozen old manifest may stage under filing year, then a new export
+    # groups the same artifact under archive year. Reuse that reading, not a
+    # second staging/canonical identity for the same document and bytes.
+    staged = {
+        (str(record["doc_id"]), record.get("pdf_sha256"))
+        for _, record in iter_staging_records(data_dir)
+        if isinstance(record, dict) and record.get("doc_id")
+        and isinstance(record.get("pdf_sha256"), str)
+        and record.get("parse_status") in ("success", "no_txs")
+    }
+    canonical = canonical_terminal_artifacts(db_path or default_db_path(data_dir)) if check_canonical else set()
     candidates: list[str] = []
     notes: list[str] = []
     seen: set[str] = set()
-    for item in items:
-        try:
-            item_year = int(item["year"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if item_year != int(year):
-            continue
-        doc_id = str(item["doc_id"])
-        if doc_id in seen or doc_id in skip:
-            continue
-        seen.add(doc_id)
-        pdf_path = default_pdf_path(data_dir, year, doc_id)
-        if not pdf_path.exists():
-            notes.append(
-                f"[{doc_id}] manifest entry has no local PDF "
-                f"({pdf_path}); skipped"
-            )
-            continue
-        candidates.append(doc_id)
+    path = Path(db_path or default_db_path(data_dir))
+    with duckdb.connect(str(path), read_only=True) if path.exists() else nullcontext(None) as conn:
+        for item in items:
+            try:
+                item_year = int(item["year"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if item_year != int(year):
+                continue
+            doc_id = str(item["doc_id"])
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            try:
+                pdf_path, identity = local_work_artifact(conn, data_dir, item)
+            except (OSError, RuntimeError) as exc:
+                notes.append(f"[{doc_id}] artifact binding refused ({exc}); skipped")
+                continue
+            if not pdf_path.exists():
+                notes.append(f"[{doc_id}] manifest entry has no local PDF ({pdf_path}); skipped")
+                continue
+            if (doc_id, identity["artifact_sha256"]) in staged:
+                continue
+            if (doc_id, identity["artifact_sha256"], identity["ingestion_generation"]) in canonical:
+                continue
+            candidates.append(doc_id)
     return candidates[: max(limit, 0)], notes
 
 
@@ -866,9 +919,11 @@ def stage_batch(
         )
     for note in notes:
         print(f"  {note}", flush=True)
-    missing_pdfs = len(notes)
+    missing_pdfs = sum("manifest entry has no local PDF" in note for note in notes)
+    blocked_artifacts = len(notes) - missing_pdfs
     pdfs_dir = Path(data_dir) / str(year) / "pdfs"
-    missing_dirs = int(not pdfs_dir.is_dir())
+    has_year_items = any(str(item.get("year")) == str(year) for item in manifest or [])
+    missing_dirs = int(not pdfs_dir.is_dir() and (not has_year_items or missing_pdfs > 0))
     if missing_dirs:
         print(
             f"SKIP: missing PDF directory {pdfs_dir}; "
@@ -878,7 +933,8 @@ def stage_batch(
     if dry_run:
         print(
             f"DRY RUN year={year}: manifest_candidates={len(candidates)} "
-            f"missing_pdfs={missing_pdfs} missing_dirs={missing_dirs}",
+            f"missing_pdfs={missing_pdfs} missing_dirs={missing_dirs} "
+            f"blocked_artifacts={blocked_artifacts}",
             flush=True,
         )
         return {
@@ -893,6 +949,7 @@ def stage_batch(
             "remaining": 0,
             "missing_pdfs": missing_pdfs,
             "missing_dirs": missing_dirs,
+            "blocked_artifacts": blocked_artifacts,
             "dry_run": True,
         }
     if config is None and read_fn is None:
@@ -918,12 +975,22 @@ def stage_batch(
         nonlocal google_quota_dead, google_endpoint_saturated
         if stop.is_set():
             return "skipped"
+        pdf_path = default_pdf_path(data_dir, year, doc_id)
+        identity = None
+        if manifest is not None:
+            item = next(item for item in manifest if str(item["doc_id"]) == doc_id and int(item["year"]) == year)
+            try:
+                pdf_path, identity = manifest_artifact(item, data_dir, db_path)
+            except (OSError, RuntimeError) as exc:
+                print(f"  [{doc_id}] artifact binding refused ({exc})", flush=True)
+                return "error"
         record = build_staging_record(
             doc_id,
             year,
-            default_pdf_path(data_dir, year, doc_id),
+            pdf_path,
             config,
             read_fn=read_fn,
+            artifact_identity=identity,
         )
         error = record.get("error") or ""
         google_rate_limited = bool(
@@ -1115,6 +1182,7 @@ def stage_batch(
         "remaining": remaining,
         "missing_pdfs": missing_pdfs,
         "missing_dirs": missing_dirs,
+        "blocked_artifacts": blocked_artifacts,
     }
 
 
@@ -1538,10 +1606,11 @@ def promote_docs(
                 print(f"  [{doc_id}] {reason}", flush=True)
                 refused += 1
                 continue
-        pdf_path = default_pdf_path(data_dir, year, doc_id)
         try:
+            pdf_path, identity = manifest_artifact(record, data_dir, db_path)
+            artifact_year = identity["archive_year"]
             current_sha = pdf_sha256(pdf_path)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             print(f"  [{doc_id}] refused: PDF unreadable ({exc})", flush=True)
             refused += 1
             continue
@@ -1566,13 +1635,15 @@ def promote_docs(
                 for index, row in enumerate(rows)
             ]
             ingestion_generation = ocr.resolve_ingestion_generation(
-                db_path, doc_id, year, record["pdf_sha256"]
+                db_path, doc_id, artifact_year, record["pdf_sha256"]
             )
+            if record.get("ingestion_generation") is not None and record["ingestion_generation"] != ingestion_generation:
+                raise RuntimeError("staged artifact generation is no longer current")
             staged_count = len(transactions)
             report: dict = {}
             ocr.insert_transactions(
                 doc_id,
-                year,
+                artifact_year,
                 record.get("member"),
                 transactions,
                 db_path=db_path,
@@ -1634,6 +1705,7 @@ def promote_docs(
             {
                 "doc_id": str(doc_id),
                 "year": int(year),
+                "archive_year": int(artifact_year),
                 "inserted": outcome.inserted,
                 "outcome_status": outcome.status,
                 "unaudited": bool(force_unaudited),
@@ -1828,9 +1900,10 @@ def main(argv: list[str] | None = None) -> int:
             f"year={result['year']} "
             f"candidates={result['candidates']} staged={result['staged']} "
             f"errors={result['errors']} missing_pdfs={result.get('missing_pdfs', 0)} "
-            f"missing_dirs={result.get('missing_dirs', 0)} ==="
+            f"missing_dirs={result.get('missing_dirs', 0)} "
+            f"blocked_artifacts={result.get('blocked_artifacts', 0)} ==="
         )
-        if result.get("missing_dirs"):
+        if result.get("missing_dirs") or result.get("blocked_artifacts"):
             return 2
         if result["quota_stop"]:
             if result.get("google_endpoint_saturated"):

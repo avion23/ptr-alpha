@@ -72,6 +72,43 @@ def seed_year(data_dir: Path, year: int, doc_ids: list[str], pages: int = 1) -> 
         make_pdf(data_dir / str(year) / "pdfs" / f"{doc_id}.pdf", pages=pages)
 
 
+def seed_house_queue(data_dir, doc_ids, *, archive_year=2024, filing_year=2024):
+    """Synthetic current House acquisitions; never opens the live database."""
+    from analyzer.database import Database
+
+    seed_year(data_dir, archive_year, doc_ids)
+    db_path = data_dir / "congress.duckdb"
+    db = Database(db_path)
+    digests = {}
+    db.conn.execute(
+        "INSERT INTO house_archive_generations (archive_year, generation_id) VALUES (?, 'current')",
+        [archive_year],
+    )
+    for doc_id in doc_ids:
+        digest = glm_stage.pdf_sha256(glm_stage.default_pdf_path(data_dir, archive_year, doc_id))
+        digests[doc_id] = digest
+        date = f"{filing_year}-02-01"
+        db.conn.execute(
+            "INSERT INTO metadata (doc_id, archive_year, filing_date, filing_type) VALUES (?, ?, ?, 'P')",
+            [doc_id, archive_year, date],
+        )
+        db.conn.execute(
+            "INSERT INTO house_generation_metadata (doc_id, archive_year, generation_id, filing_date, filing_type) VALUES (?, ?, 'current', ?, 'P')",
+            [doc_id, archive_year, date],
+        )
+        db.conn.execute(
+            "INSERT INTO house_pdf_artifacts (doc_id, archive_year, generation_id, artifact_sha256) VALUES (?, ?, 'current', ?)",
+            [doc_id, archive_year, digest],
+        )
+        ocr_zero_rows.record_parse_run(
+            db.conn, doc_id, archive_year, "error", 0, 0,
+            parser_version="deterministic", engines_attempted="pdfplumber",
+            artifact_sha256=digest, ingestion_generation="current",
+        )
+    db.close()
+    return db_path, digests
+
+
 def read_fn_from_outputs(outputs: dict[str, str]):
     def read_fn(pdf_path, page_count):
         return outputs[Path(pdf_path).stem]
@@ -1102,6 +1139,9 @@ def test_sampler_is_deterministic_and_stratified(data_dir):
 
 def test_review_bundle_copies_record_and_renders_pages(data_dir):
     write_staged_records(data_dir, {2024: ["6001"]})
+    record = glm_stage.load_staging_record(data_dir, 2024, "6001")
+    record["pdf_sha256"] = glm_stage.pdf_sha256(glm_stage.default_pdf_path(data_dir, 2024, "6001"))
+    glm_stage.write_staging_record(data_dir, record)
     sample = [{"doc_id": "6001", "year": 2024}]
     problems = audit_sample.emit_review_bundle(sample, data_dir)
     assert problems == []
@@ -1633,7 +1673,16 @@ def test_cli_manifest_dry_run_checks_canonical_and_reports_missing_directory(
         read_fn=lambda *_: GLM_OUTPUT_ONE_ROW,
     )
     glm_stage.write_staging_record(data_dir, staged)
-    monkeypatch.setattr(glm_stage, "canonical_parsed_doc_ids", lambda _: {"canonical"})
+    db_path, digests = seed_house_queue(data_dir, ["canonical"])
+    from analyzer.database import Database
+
+    db = Database(db_path)
+    ocr_zero_rows.record_parse_run(
+        db.conn, "canonical", 2024, "no_txs", 0, 0,
+        parser_version="v1-glm53-vision", engines_attempted="visionb",
+        artifact_sha256=digests["canonical"], ingestion_generation="current",
+    )
+    db.close()
     manifest_path = data_dir / "work-manifest.json"
     manifest_path.write_text(
         json.dumps(
@@ -1689,6 +1738,121 @@ def test_cli_manifest_dry_run_checks_canonical_and_reports_missing_directory(
     output = capsys.readouterr().out
     assert "missing PDF directory" in output
     assert "missing_dirs=1" in output
+
+
+def test_manifest_terminal_skip_requires_current_identity_source_count_and_provenance(data_dir):
+    from analyzer.database import Database
+
+    complete = [f"empty-{i}" for i in range(11)] + ["success", "invalid"]
+    outstanding = ["old-generation", "wrong-hash", "unbound", "wrong-source", "wrong-count", "bad-provenance", "empty-with-rows"]
+    db_path, digests = seed_house_queue(data_dir, complete + outstanding)
+    db = Database(db_path)
+    for doc_id in complete + outstanding:
+        status = "no_txs" if doc_id.startswith("empty") else "invalid" if doc_id == "invalid" else "success"
+        digest = "other" if doc_id == "wrong-hash" else None if doc_id == "unbound" else digests[doc_id]
+        generation = "old" if doc_id == "old-generation" else None if doc_id == "unbound" else "current"
+        count = 0 if status != "success" else 2 if doc_id == "wrong-count" else 1
+        ocr_zero_rows.record_parse_run(
+            db.conn, doc_id, 2024, status, count, count,
+            parser_version="v1-glm53-vision", engines_attempted="visionb",
+            artifact_sha256=digest, ingestion_generation=generation,
+        )
+        if status == "success" or doc_id == "empty-with-rows":
+            db.conn.execute(
+                """INSERT INTO transactions (
+                    doc_id, source, chamber, source_record_id, source_row_id,
+                    transaction_date, disclosure_date, official_filing_date,
+                    artifact_sha256, ingestion_generation
+                ) VALUES (?, ?, 'House', ?, ?, '2024-01-15', '2024-02-01', '2024-02-01', ?, ?)""",
+                [doc_id, "house_pdf" if doc_id == "wrong-source" else "gemini_ocr",
+                 doc_id, None if doc_id == "bad-provenance" else f"{doc_id}:row:1", digest, generation],
+            )
+    db.close()
+    items = [dict(doc_id=d, year=2024, artifact_sha256=digests[d], ingestion_generation="current") for d in complete + outstanding]
+    candidates, notes = glm_stage.select_candidates_from_manifest(items, 2024, 100, data_dir, check_canonical=True)
+    assert candidates == outstanding
+    assert notes == []
+    assert len(items) - len(candidates) == 13
+    # The legacy manual directory selector retains its documented semantics.
+    assert "old-generation" in glm_stage.canonical_parsed_doc_ids(db_path)
+
+
+def test_archive_year_queue_export_deduplicates_scoped_and_default_work(data_dir):
+    db_path, digests = seed_house_queue(data_dir, ["8216835"], archive_year=2018, filing_year=2020)
+    expected = [("8216835", 2018, str(data_dir / "2018/pdfs/8216835.pdf"))]
+    assert ocr_zero_rows.get_ocr_work_items(db_path=str(db_path), data_dir=data_dir) == expected
+    assert ocr_zero_rows.get_ocr_work_items(db_path=str(db_path), data_dir=data_dir, year=2018) == expected
+    assert ocr_zero_rows.get_ocr_work_items(db_path=str(db_path), data_dir=data_dir, year=2020) == []
+    manifest = ocr_zero_rows.build_work_manifest(db_path=str(db_path), data_dir=data_dir)
+    assert manifest["items"] == [dict(doc_id="8216835", year=2018, archive_year=2018, artifact_sha256=digests["8216835"], ingestion_generation="current")]
+
+
+def test_legacy_cross_year_manifest_stage_audit_and_promote_use_one_bound_artifact(data_dir, fake_insert, monkeypatch):
+    _, digests = seed_house_queue(data_dir, ["8216835"], archive_year=2018, filing_year=2020)
+    pdf = data_dir / "2018/pdfs/8216835.pdf"
+    snapshots = []
+
+    def read_fn(path, page_count):
+        snapshots.append((Path(path).read_bytes(), page_count))
+        return GLM_OUTPUT_ONE_ROW
+
+    # Frozen old manifest: missing filing-year artifact, null hash/generation.
+    item = dict(doc_id="8216835", year=2020, artifact_sha256=None, ingestion_generation=None)
+    result = glm_stage.stage_batch(2020, 10, data_dir=data_dir, manifest=[item], read_fn=read_fn)
+    assert result["staged"] == 1 and result["missing_pdfs"] == result["missing_dirs"] == 0
+    assert snapshots == [(pdf.read_bytes(), 1)]
+    record = glm_stage.load_staging_record(data_dir, 2020, "8216835")
+    assert record["year"] == 2020 and record["archive_year"] == 2018
+    assert record["pdf_sha256"] == digests["8216835"] and record["ingestion_generation"] == "current"
+    assert glm_stage.load_staging_record(data_dir, 2018, "8216835") is None
+    repeat = glm_stage.stage_batch(2020, 10, data_dir=data_dir, manifest=[item], dry_run=True)
+    assert repeat["candidates"] == repeat["missing_dirs"] == repeat["missing_pdfs"] == 0
+    # A new archive-year export must reuse the frozen filing-year reading.
+    regrouped = dict(item, year=2018, archive_year=2018, artifact_sha256=digests["8216835"], ingestion_generation="current")
+    assert glm_stage.select_candidates_from_manifest([regrouped], 2018, 10, data_dir) == ([], [])
+    assert audit_sample.emit_review_bundle([item], data_dir) == []
+    audit_sample.record_verdict(data_dir, "8216835", "pass", "verified")
+    write_report_state(data_dir)
+    monkeypatch.setattr(ocr_zero_rows, "resolve_ingestion_generation", lambda *args: "current")
+    promoted = glm_stage.promote_docs(2020, ["8216835"], data_dir=data_dir)
+    assert promoted["promoted"] == 1
+    assert fake_insert[0]["year"] == 2018
+    assert fake_insert[0]["artifact_sha256"] == digests["8216835"]
+    assert fake_insert[0]["ingestion_generation"] == "current"
+
+
+def test_manifest_refuses_wrong_hash_generation_and_unrecorded_cross_year(data_dir):
+    from analyzer.database import Database
+
+    db_path, digests = seed_house_queue(data_dir, ["bound"], archive_year=2018, filing_year=2020)
+    base = dict(doc_id="bound", year=2020, artifact_sha256=digests["bound"], ingestion_generation="current")
+    for field, value in [("artifact_sha256", "wrong"), ("ingestion_generation", "old"), ("archive_year", 2017)]:
+        candidates, notes = glm_stage.select_candidates_from_manifest([dict(base, **{field: value})], 2020, 10, data_dir)
+        assert candidates == [] and len(notes) == 1
+        assert "artifact binding refused" in notes[0] and "has no local PDF" not in notes[0]
+    db = Database(db_path)
+    db.conn.execute("DELETE FROM house_pdf_artifacts")
+    db.close()
+    # An unrelated same-ID PDF elsewhere must never satisfy the queue.
+    make_pdf(data_dir / "2017/pdfs/bound.pdf", pages=2)
+    candidates, notes = glm_stage.select_candidates_from_manifest([dict(doc_id="bound", year=2020)], 2020, 10, data_dir)
+    assert candidates == [] and "recorded House acquisition" in notes[0]
+    result = glm_stage.stage_batch(2020, 10, data_dir=data_dir, manifest=[dict(doc_id="bound", year=2020)], dry_run=True)
+    assert result["blocked_artifacts"] == 1 and result["missing_pdfs"] == 0
+    (data_dir / "2018/pdfs/bound.pdf").unlink()
+    candidates, notes = glm_stage.select_candidates_from_manifest([dict(doc_id="bound", year=2020)], 2020, 10, data_dir)
+    assert candidates == [] and "has no local PDF" in notes[0]
+
+
+def test_manifest_snapshot_hash_is_checked_before_model_read(data_dir):
+    pdf = make_pdf(data_dir / "2024/pdfs/changed.pdf")
+    calls = []
+    record = glm_stage.build_staging_record(
+        "changed", 2024, pdf, None, read_fn=lambda *args: calls.append(args),
+        artifact_identity=dict(archive_year=2024, artifact_sha256="not-the-snapshot", ingestion_generation="current"),
+    )
+    assert record["parse_status"] == "error" and "changed after manifest selection" in record["error"]
+    assert calls == []
 
 
 def test_staged_row_to_tx_page_number_optional():

@@ -642,10 +642,13 @@ def emit_review_bundle(
             shutil.copy2(record_path, doc_dir / "record.json")
         else:
             problems.append(f"{doc_id}: staging record missing")
-        pdf_path = Path(data_dir) / str(year) / "pdfs" / f"{doc_id}.pdf"
         if not render:
             continue
         try:
+            from scripts.glm_stage import manifest_artifact
+
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            pdf_path, _ = manifest_artifact(record, data_dir)
             render_pdf_pages(pdf_path, doc_dir / "pages")
         except Exception as exc:
             problems.append(f"{doc_id}: {exc}")

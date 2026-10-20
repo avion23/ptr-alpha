@@ -629,6 +629,7 @@ def emit_review_bundle(
     render=True,
 ) -> list[str]:
     """Write audit-review/<year>/<doc_id>/{page-*.png, record.json}."""
+    data_dir = Path(data_dir).resolve()
     problems = []
     bundle_root = staging_root(data_dir) / "audit-review"
     for item in sample:
@@ -646,10 +647,17 @@ def emit_review_bundle(
             continue
         try:
             from scripts.glm_stage import manifest_artifact
+            from scripts.ocr_zero_rows import read_work_artifact
 
             record = json.loads(record_path.read_text(encoding="utf-8"))
             pdf_path, _ = manifest_artifact(record, data_dir)
-            render_pdf_pages(pdf_path, doc_dir / "pages")
+            pdf_bytes = read_work_artifact(data_dir, pdf_path)
+            if hashlib.sha256(pdf_bytes).hexdigest() != record.get("pdf_sha256"):
+                raise RuntimeError("audit snapshot SHA-256 does not match staged artifact")
+            with tempfile.TemporaryDirectory(prefix="audit_pdf_snapshot_") as directory:
+                snapshot = Path(directory) / pdf_path.name
+                snapshot.write_bytes(pdf_bytes)
+                render_pdf_pages(snapshot, doc_dir / "pages")
         except Exception as exc:
             problems.append(f"{doc_id}: {exc}")
     return problems

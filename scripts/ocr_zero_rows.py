@@ -15,10 +15,13 @@ DUAL_READ=1).
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
+import stat
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 
 import duckdb
@@ -514,6 +517,37 @@ def build_work_manifest(
     }
 
 
+def read_work_artifact(data_dir: str | Path, path: str | Path) -> bytes:
+    """Read a regular PDF through directory FDs anchored to the approved root.
+
+    The data root itself may be a symlink (resolved once by batch callers).
+    Interior file/directory symlinks are deliberately refused, even internal
+    ones: no check/open race may substitute an external artifact for a PDF.
+    """
+    declared_root = Path(os.path.abspath(data_dir))
+    root = declared_root.resolve(strict=True)
+    candidate = Path(os.path.abspath(path))
+    try:
+        relative = candidate.relative_to(declared_root)
+    except ValueError:
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError("artifact path escapes the approved data root") from exc
+    with ExitStack() as stack:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open("/", flags)
+        stack.callback(os.close, fd)
+        for component in (*root.parts[1:], *relative.parts[:-1]):
+            fd = os.open(component, flags, dir_fd=fd)
+            stack.callback(os.close, fd)
+        artifact_fd = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(artifact_fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise RuntimeError("artifact is not a regular file")
+            return source.read()
+
+
 def local_work_artifact(conn, data_dir: str | Path, item: dict) -> tuple[Path, dict]:
     """Resolve old/new queue identities without scanning for same-ID PDFs.
 
@@ -522,6 +556,7 @@ def local_work_artifact(conn, data_dir: str | Path, item: dict) -> tuple[Path, d
     same-year unbound manifests remain readable, but never authorize a
     canonical skip. Explicit hashes/generations are constraints, not hints.
     """
+    data_dir = Path(data_dir).resolve()
     doc_id, group_year = str(item["doc_id"]), int(item["year"])
     archive_year = item.get("archive_year")
     if conn is not None:
@@ -544,7 +579,7 @@ def local_work_artifact(conn, data_dir: str | Path, item: dict) -> tuple[Path, d
     identity = {"archive_year": archive_year, "artifact_sha256": None, "ingestion_generation": None}
     if not path.exists():
         return path, identity
-    digest = pdf_sha256(path)
+    digest = hashlib.sha256(read_work_artifact(data_dir, path)).hexdigest()
     expected = item.get("artifact_sha256", item.get("pdf_sha256"))
     if expected is not None and digest != expected:
         raise RuntimeError("local artifact does not match expected SHA-256")
@@ -2536,7 +2571,7 @@ def _run_visionb_staging(remaining, vision_b_config) -> None:
             )
             continue
         time.sleep(COOLDOWN)
-        record = glm_stage.build_staging_record(doc_id, year, path, vision_b_config)
+        record = glm_stage.build_staging_record(doc_id, year, path, vision_b_config, data_dir=data_dir)
         error = record.get("error") or ""
         if record["parse_status"] == "error" and (
             record.get("error_kind") == "quota" or is_quota_error(error)

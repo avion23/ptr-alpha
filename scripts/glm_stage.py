@@ -556,6 +556,7 @@ def build_staging_record(
     *,
     read_fn=None,
     artifact_identity: dict | None = None,
+    data_dir: str | Path | None = None,
 ) -> dict:
     """Read one document and build its staging record. Never raises.
 
@@ -606,7 +607,9 @@ def build_staging_record(
     raw_output = None
     try:
         # One artifact snapshot feeds sha256, page count, and the render.
-        pdf_bytes = Path(pdf_path).read_bytes()
+        from scripts.ocr_zero_rows import read_work_artifact
+
+        pdf_bytes = read_work_artifact(data_dir, pdf_path) if data_dir is not None else Path(pdf_path).read_bytes()
         record["pdf_sha256"] = hashlib.sha256(pdf_bytes).hexdigest()
         if artifact_identity is not None:
             if record["pdf_sha256"] != artifact_identity["artifact_sha256"]:
@@ -798,7 +801,7 @@ def select_candidates_from_manifest(
     ``(doc_ids, notes)``: entries for other years are ignored; an entry
     without a local PDF is skipped WITH A NOTE (the artifact vanished after
     export — never silently); an entry whose live staging record is
-    success/no_txs is skipped (it is staged and awaiting the audit; re-
+    compatible success/no_txs is skipped (it is staged and awaiting the audit; re-
     reading it nightly would burn quota); an entry whose live record is an
     ERROR record IS retried — the authoritative queue still lists the doc
     as unresolved, and the re-stage archives the failed attempt as
@@ -814,13 +817,11 @@ def select_candidates_from_manifest(
     # A frozen old manifest may stage under filing year, then a new export
     # groups the same artifact under archive year. Reuse that reading, not a
     # second staging/canonical identity for the same document and bytes.
-    staged = {
-        (str(record["doc_id"]), record.get("pdf_sha256"))
-        for _, record in iter_staging_records(data_dir)
-        if isinstance(record, dict) and record.get("doc_id")
-        and isinstance(record.get("pdf_sha256"), str)
-        and record.get("parse_status") in ("success", "no_txs")
-    }
+    data_dir = Path(data_dir).resolve()
+    staged: dict[str, list[tuple[int, dict]]] = {}
+    for group_year, record in iter_staging_records(data_dir):
+        if isinstance(record, dict) and record.get("doc_id") and record.get("parse_status") in ("success", "no_txs"):
+            staged.setdefault(str(record["doc_id"]), []).append((group_year, record))
     canonical = canonical_terminal_artifacts(db_path or default_db_path(data_dir)) if check_canonical else set()
     candidates: list[str] = []
     notes: list[str] = []
@@ -846,9 +847,19 @@ def select_candidates_from_manifest(
             if not pdf_path.exists():
                 notes.append(f"[{doc_id}] manifest entry has no local PDF ({pdf_path}); skipped")
                 continue
-            if (doc_id, identity["artifact_sha256"]) in staged:
-                continue
             if (doc_id, identity["artifact_sha256"], identity["ingestion_generation"]) in canonical:
+                continue
+            records = staged.get(doc_id, [])
+            if any(
+                identity["ingestion_generation"] is not None
+                and record.get("pdf_sha256") == identity["artifact_sha256"]
+                and record.get("archive_year", group_year) == identity["archive_year"]
+                and record.get("ingestion_generation") == identity["ingestion_generation"]
+                for group_year, record in records
+            ):
+                continue
+            if records:
+                notes.append(f"[{doc_id}] artifact binding refused (staged identity is incompatible; evidence reconciliation required); skipped")
                 continue
             candidates.append(doc_id)
     return candidates[: max(limit, 0)], notes
@@ -897,6 +908,7 @@ def stage_batch(
     record is an error record is re-staged; the superseded record is
     archived (``archive_current_attempt``) before the new one is written.
     """
+    data_dir = Path(data_dir).resolve()
     if not 1 <= int(workers) <= MAX_WORKERS:
         raise ValueError(
             f"workers={workers} refused: the Z.AI subscription allows "
@@ -991,6 +1003,7 @@ def stage_batch(
             config,
             read_fn=read_fn,
             artifact_identity=identity,
+            data_dir=data_dir,
         )
         error = record.get("error") or ""
         google_rate_limited = bool(
@@ -1083,7 +1096,7 @@ def stage_batch(
                 break
             if outcome == "error":
                 errors += 1
-            else:
+            elif outcome == "staged":
                 staged += 1
         return {
             "year": year,
@@ -1097,6 +1110,7 @@ def stage_batch(
             "remaining": remaining,
             "missing_pdfs": missing_pdfs,
             "missing_dirs": missing_dirs,
+            "blocked_artifacts": blocked_artifacts,
         }
 
     from concurrent.futures import (

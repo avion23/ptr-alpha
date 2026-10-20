@@ -8,8 +8,11 @@ is monkeypatched for promotion tests. No model calls are made.
 from __future__ import annotations
 
 import base64
+import builtins
 import hashlib
+import io
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -119,6 +122,26 @@ def read_fn_from_outputs(outputs: dict[str, str]):
 @pytest.fixture
 def data_dir(tmp_path) -> Path:
     return tmp_path / "data"
+
+
+@pytest.fixture
+def private_read_spy(monkeypatch):
+    """Observe both path opens and fd-backed reads before asserting rejection."""
+    def install(private_root):
+        reads = []
+        private_root = private_root.resolve()
+        for owner in (builtins, io):
+            original = owner.open
+
+            def tracked(file, mode="r", *args, _open=original, **kwargs):
+                path = Path(os.readlink(f"/proc/self/fd/{file}")) if isinstance(file, int) else Path(file)
+                if "r" in mode and path.resolve().is_relative_to(private_root):
+                    reads.append(str(path))
+                return _open(file, mode, *args, **kwargs)
+
+            monkeypatch.setattr(owner, "open", tracked)
+        return reads
+    return install
 
 
 @pytest.fixture
@@ -1909,7 +1932,7 @@ def test_audit_renders_verified_snapshot_even_if_original_is_replaced(data_dir, 
     assert glm_stage.pdf_page_count(pdf) == 2
 
 
-def test_audit_refuses_change_between_resolution_and_snapshot(data_dir, monkeypatch):
+def test_audit_reuses_resolution_snapshot_when_original_changes(data_dir, monkeypatch):
     seed_year(data_dir, 2024, ["race"])
     pdf = glm_stage.default_pdf_path(data_dir, 2024, "race")
     record = glm_stage.build_staging_record("race", 2024, pdf, None, read_fn=lambda *_: GLM_OUTPUT_ONE_ROW)
@@ -1922,9 +1945,10 @@ def test_audit_refuses_change_between_resolution_and_snapshot(data_dir, monkeypa
         return result
 
     monkeypatch.setattr(glm_stage, "manifest_artifact", resolve_then_replace)
-    monkeypatch.setattr(audit_sample, "render_pdf_pages", lambda *_: pytest.fail("unverified pixels rendered"))
     problems = audit_sample.emit_review_bundle([dict(doc_id="race", year=2024)], data_dir)
-    assert len(problems) == 1 and "audit snapshot SHA-256" in problems[0]
+    assert problems == []
+    pages = glm_stage.staging_root(data_dir) / "audit-review/2024/race/pages"
+    assert [p.name for p in pages.glob("*.png")] == ["page-1.png"]
 
 
 @pytest.mark.parametrize("workers", [1, 2])
@@ -1944,7 +1968,7 @@ def test_cli_non_dry_run_reports_blocked_artifacts_for_every_worker_path(data_di
 
 
 @pytest.mark.parametrize("link_kind", ["file", "directory", "internal-file"])
-def test_manifest_symlinks_never_reach_model(data_dir, tmp_path, link_kind):
+def test_manifest_symlinks_never_reach_model(data_dir, tmp_path, link_kind, private_read_spy):
     seed_year(data_dir, 2024, ["private"])
     pdf = glm_stage.default_pdf_path(data_dir, 2024, "private")
     private = make_pdf(tmp_path / "outside/private.pdf", pages=2)
@@ -1958,8 +1982,10 @@ def test_manifest_symlinks_never_reach_model(data_dir, tmp_path, link_kind):
         pdf.unlink()
         pdf.symlink_to(private)
     calls = []
+    private_reads = private_read_spy(private.parent)
     result = glm_stage.stage_batch(2024, 10, data_dir=data_dir,
         manifest=[dict(doc_id="private", year=2024)], read_fn=lambda *a: calls.append(a))
+    assert private_reads == []
     assert result["blocked_artifacts"] == 1 and result["staged"] == 0
     assert calls == []
 
@@ -2031,6 +2057,124 @@ def test_approved_data_root_symlink_is_pinned_before_manifest_read(data_dir, tmp
     result = glm_stage.stage_batch(2024, 10, data_dir=alias,
         manifest=[dict(doc_id="safe", year=2024)], read_fn=read_fn)
     assert result["staged"] == 1 and seen == [(safe_bytes, 1)]
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_operation_root_survives_physical_rename_and_external_replacement(
+    data_dir, tmp_path, monkeypatch, private_read_spy, workers
+):
+    seed_year(data_dir, 2024, ["safe"])
+    safe_bytes = glm_stage.default_pdf_path(data_dir, 2024, "safe").read_bytes()
+    outside = tmp_path / "private"
+    make_pdf(outside / "2024/pdfs/safe.pdf", pages=2)
+    private_reads = private_read_spy(outside)
+    moved = tmp_path / "original-root"
+    select = glm_stage.select_candidates_from_manifest
+    root_fds = []
+
+    def select_then_replace(*args, **kwargs):
+        result = select(*args, **kwargs)
+        root_fds.append(args[3].fd)
+        data_dir.rename(moved)
+        data_dir.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(glm_stage, "select_candidates_from_manifest", select_then_replace)
+    seen = []
+
+    def read_fn(snapshot, pages):
+        seen.append((Path(snapshot).read_bytes(), pages))
+        return GLM_OUTPUT_ONE_ROW
+
+    result = glm_stage.stage_batch(2024, 10, data_dir=data_dir, workers=workers,
+        manifest=[dict(doc_id="safe", year=2024)], read_fn=read_fn)
+    assert private_reads == []
+    assert result["staged"] == 1 and seen == [(safe_bytes, 1)]
+    assert glm_stage.load_staging_record(moved, 2024, "safe")["pages"] == 1
+    assert not (outside / "staging").exists()
+    for fd in root_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_operation_root_fd_closes_when_selection_raises(data_dir, monkeypatch):
+    seed_year(data_dir, 2024, ["safe"])
+    fds = []
+
+    def fail(*args, **kwargs):
+        fds.append(args[3].fd)
+        raise RuntimeError("synthetic selection failure")
+
+    monkeypatch.setattr(glm_stage, "select_candidates_from_manifest", fail)
+    with pytest.raises(RuntimeError, match="synthetic selection failure"):
+        glm_stage.stage_batch(2024, 10, data_dir=data_dir,
+            manifest=[dict(doc_id="safe", year=2024)])
+    for fd in fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+@pytest.mark.parametrize("replace_pdf", [False, True])
+def test_audit_bundle_owns_one_record_attempt_during_restage(data_dir, tmp_path, monkeypatch, replace_pdf):
+    seed_year(data_dir, 2024, ["attempt"])
+    pdf = glm_stage.default_pdf_path(data_dir, 2024, "attempt")
+    old = glm_stage.build_staging_record("attempt", 2024, pdf, None, read_fn=lambda *_: GLM_OUTPUT_ONE_ROW)
+    glm_stage.write_staging_record(data_dir, old)
+    staged_path = glm_stage.staging_record_path(data_dir, 2024, "attempt")
+    old_bytes = staged_path.read_bytes()
+    replacement = make_pdf(tmp_path / "replacement/attempt.pdf", pages=2)
+    new = glm_stage.build_staging_record("attempt", 2024, replacement, None, read_fn=lambda *_: GLM_OUTPUT_PAGE2)
+    new_bytes = json.dumps(new).encode()
+    write_bytes = Path.write_bytes
+    restaged = []
+
+    def copy_then_restage(path, payload):
+        result = write_bytes(path, payload)
+        if path.name == "record.json" and "audit-review" in path.parts:
+            restaged.append(True)
+            write_bytes(staged_path, new_bytes)
+            if replace_pdf:
+                write_bytes(pdf, replacement.read_bytes())
+        return result
+
+    monkeypatch.setattr(Path, "write_bytes", copy_then_restage)
+    problems = audit_sample.emit_review_bundle([dict(doc_id="attempt", year=2024)], data_dir)
+    bundle = glm_stage.staging_root(data_dir) / "audit-review/2024/attempt"
+    assert restaged and (bundle / "record.json").read_bytes() == old_bytes
+    assert staged_path.read_bytes() == new_bytes
+    if replace_pdf:
+        assert len(problems) == 1 and "expected SHA-256" in problems[0]
+        assert not list(bundle.glob("pages/*.png"))
+    else:
+        assert problems == []
+        assert [p.name for p in bundle.glob("pages/*.png")] == ["page-1.png"]
+    with pytest.raises(ValueError, match="staged attempt changed since review bundle"):
+        audit_sample.record_verdict(data_dir, "attempt", "pass", "reviewed old pixels")
+    assert staged_path.read_bytes() == new_bytes
+
+
+def test_promotion_never_reopens_verified_pdf_path(data_dir, tmp_path, monkeypatch, fake_insert, private_read_spy):
+    stage_one(data_dir, 2024, "promote-race", GLM_OUTPUT_ONE_ROW)
+    pdf = glm_stage.default_pdf_path(data_dir, 2024, "promote-race")
+    original_hash = glm_stage.pdf_sha256(pdf)
+    audit_sample.record_verdict(data_dir, "promote-race", "pass", "verified")
+    write_report_state(data_dir)
+    private = make_pdf(tmp_path / "private/promote-race.pdf", pages=2)
+    private_reads = private_read_spy(private.parent)
+    resolve = glm_stage.manifest_artifact
+
+    def resolve_then_replace(*args, **kwargs):
+        result = resolve(*args, **kwargs)
+        pdf.unlink()
+        pdf.symlink_to(private)
+        return result
+
+    monkeypatch.setattr(glm_stage, "manifest_artifact", resolve_then_replace)
+    monkeypatch.setattr(glm_stage, "pdf_sha256", lambda *_: pytest.fail("mutable PDF path reopened"))
+    result = glm_stage.promote_docs(2024, ["promote-race"], data_dir=data_dir)
+    assert private_reads == []
+    assert result["promoted"] == 1  # synthetic insert only, using the verified old snapshot
+    assert len(fake_insert) == 1 and fake_insert[0]["artifact_sha256"] == original_hash
 
 
 def test_staged_row_to_tx_page_number_optional():

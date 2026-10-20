@@ -629,7 +629,11 @@ def emit_review_bundle(
     render=True,
 ) -> list[str]:
     """Write audit-review/<year>/<doc_id>/{page-*.png, record.json}."""
-    data_dir = Path(data_dir).resolve()
+    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, read_work_artifact
+
+    if not isinstance(data_dir, ApprovedDataRoot):
+        with approved_data_root(data_dir) as root:
+            return emit_review_bundle(sample, root, render=render)
     problems = []
     bundle_root = staging_root(data_dir) / "audit-review"
     for item in sample:
@@ -639,19 +643,18 @@ def emit_review_bundle(
         if doc_dir.exists():
             shutil.rmtree(doc_dir)
         doc_dir.mkdir(parents=True)
-        if record_path.exists():
-            shutil.copy2(record_path, doc_dir / "record.json")
-        else:
-            problems.append(f"{doc_id}: staging record missing")
-        if not render:
-            continue
         try:
             from scripts.glm_stage import manifest_artifact
-            from scripts.ocr_zero_rows import read_work_artifact
 
-            record = json.loads(record_path.read_text(encoding="utf-8"))
-            pdf_path, _ = manifest_artifact(record, data_dir)
-            pdf_bytes = read_work_artifact(data_dir, pdf_path)
+            record_bytes = read_work_artifact(data_dir, record_path)
+            (doc_dir / "record.json").write_bytes(record_bytes)
+            record = json.loads(record_bytes)
+            if str(record.get("doc_id")) != doc_id or record.get("year") != year:
+                raise RuntimeError("staging record identity does not match audit sample")
+            if not render:
+                continue
+            pdf_path, identity = manifest_artifact(record, data_dir)
+            pdf_bytes = identity["pdf_bytes"]
             if hashlib.sha256(pdf_bytes).hexdigest() != record.get("pdf_sha256"):
                 raise RuntimeError("audit snapshot SHA-256 does not match staged artifact")
             with tempfile.TemporaryDirectory(prefix="audit_pdf_snapshot_") as directory:
@@ -725,6 +728,9 @@ def record_verdict(
     still matches the live record, so a re-stage after the audit forces a
     re-audit instead of inheriting the stale verdict.
 
+    If a review bundle exists, that immutable reviewed attempt must still
+    match; a verdict on its pixels cannot authorize a newer live JSON record.
+
     ``severity`` (default ``critical``) classifies a FAIL per the
     owner-approved error budget: ``cosmetic`` = asset-description TEXT
     normalization issues only, tracked separately and NOT blocking
@@ -735,6 +741,12 @@ def record_verdict(
         raise ValueError("verdict must be 'pass' or 'fail'")
     if severity not in VALID_SEVERITIES:
         raise ValueError("severity must be 'critical' or 'cosmetic'")
+    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, read_work_artifact
+
+    if not isinstance(data_dir, ApprovedDataRoot):
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        with approved_data_root(data_dir) as approved:
+            return record_verdict(approved, doc_id, verdict, notes, severity)
     root = staging_root(data_dir)
 
     found_year = None
@@ -743,7 +755,12 @@ def record_verdict(
     for year_dir in sorted(root.glob("[0-9]" * 4)):
         path = year_dir / f"{doc_id}.json"
         if path.exists():
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(read_work_artifact(data_dir, path))
+            reviewed_path = root / "audit-review" / year_dir.name / str(doc_id) / "record.json"
+            if reviewed_path.exists():
+                reviewed = json.loads(read_work_artifact(data_dir, reviewed_path))
+                if staged_record_sha256(reviewed) != staged_record_sha256(record):
+                    raise ValueError("staged attempt changed since review bundle; regenerate review before recording a verdict")
             stable_sha = staged_record_sha256(record)
             identity = {
                 "pdf_sha256": record.get("pdf_sha256"),

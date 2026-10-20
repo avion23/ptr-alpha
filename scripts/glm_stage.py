@@ -106,7 +106,7 @@ from scripts.gemini_ocr_common import (  # noqa: E402
     is_quota_error,
     parse_gemini_output,
     pdf_page_count,
-    pdf_sha256,
+    pdf_sha256,  # noqa: F401 (re-exported for callers/tests)
 )
 from analyzer.vision_engines import (  # noqa: E402
     GoogleVisionBRateLimitError,
@@ -609,7 +609,10 @@ def build_staging_record(
         # One artifact snapshot feeds sha256, page count, and the render.
         from scripts.ocr_zero_rows import read_work_artifact
 
-        pdf_bytes = read_work_artifact(data_dir, pdf_path) if data_dir is not None else Path(pdf_path).read_bytes()
+        if artifact_identity is not None and "pdf_bytes" in artifact_identity:
+            pdf_bytes = artifact_identity["pdf_bytes"]
+        else:
+            pdf_bytes = read_work_artifact(data_dir if data_dir is not None else Path(pdf_path).parent, pdf_path)
         record["pdf_sha256"] = hashlib.sha256(pdf_bytes).hexdigest()
         if artifact_identity is not None:
             if record["pdf_sha256"] != artifact_identity["artifact_sha256"]:
@@ -706,9 +709,17 @@ def canonical_terminal_artifacts(db_path: str | Path) -> set[tuple[str, str, str
 
 
 def manifest_artifact(item: dict, data_dir: str | Path, db_path: str | Path | None = None):
-    """Resolve one artifact again at a read boundary, never a directory search."""
+    """Return a verified byte snapshot and identity; path is naming only.
+
+    Consumers use identity['pdf_bytes']/['artifact_sha256'], never reopen the
+    returned display path after verification.
+    """
     import duckdb
-    from scripts.ocr_zero_rows import local_work_artifact
+    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, local_work_artifact
+
+    if not isinstance(data_dir, ApprovedDataRoot):
+        with approved_data_root(data_dir) as root:
+            return manifest_artifact(item, root, db_path)
 
     path = Path(db_path or default_db_path(data_dir))
     with duckdb.connect(str(path), read_only=True) if path.exists() else nullcontext(None) as conn:
@@ -812,12 +823,16 @@ def select_candidates_from_manifest(
     are refused, never replaced with another same-ID artifact.
     """
     import duckdb
-    from scripts.ocr_zero_rows import local_work_artifact
+    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, local_work_artifact
+
+    if not isinstance(data_dir, ApprovedDataRoot):
+        with approved_data_root(data_dir) as root:
+            return select_candidates_from_manifest(items, year, limit, root,
+                check_canonical=check_canonical, db_path=db_path)
 
     # A frozen old manifest may stage under filing year, then a new export
     # groups the same artifact under archive year. Reuse that reading, not a
     # second staging/canonical identity for the same document and bytes.
-    data_dir = Path(data_dir).resolve()
     staged: dict[str, list[tuple[int, dict]]] = {}
     for group_year, record in iter_staging_records(data_dir):
         if isinstance(record, dict) and record.get("doc_id") and record.get("parse_status") in ("success", "no_txs"):
@@ -844,7 +859,7 @@ def select_candidates_from_manifest(
             except (OSError, RuntimeError) as exc:
                 notes.append(f"[{doc_id}] artifact binding refused ({exc}); skipped")
                 continue
-            if not pdf_path.exists():
+            if identity["artifact_sha256"] is None:
                 notes.append(f"[{doc_id}] manifest entry has no local PDF ({pdf_path}); skipped")
                 continue
             if (doc_id, identity["artifact_sha256"], identity["ingestion_generation"]) in canonical:
@@ -908,7 +923,13 @@ def stage_batch(
     record is an error record is re-staged; the superseded record is
     archived (``archive_current_attempt``) before the new one is written.
     """
-    data_dir = Path(data_dir).resolve()
+    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root
+
+    if not isinstance(data_dir, ApprovedDataRoot):
+        with approved_data_root(data_dir) as root:
+            return stage_batch(year, limit, data_dir=root, check_canonical=check_canonical,
+                db_path=db_path, config=config, read_fn=read_fn, cooldown=cooldown,
+                workers=workers, manifest=manifest, dry_run=dry_run)
     if not 1 <= int(workers) <= MAX_WORKERS:
         raise ValueError(
             f"workers={workers} refused: the Z.AI subscription allows "
@@ -1557,6 +1578,12 @@ def promote_docs(
         )
     from scripts import ocr_zero_rows as ocr  # attribute lookups stay monkeypatchable
 
+    if not isinstance(data_dir, ocr.ApprovedDataRoot):
+        with ocr.approved_data_root(data_dir) as root:
+            return promote_docs(year, doc_ids, data_dir=root, db_path=db_path,
+                require_audit_pass=require_audit_pass, force_unaudited=force_unaudited,
+                cooldown_note=cooldown_note)
+
     db_path = str(db_path or default_db_path(data_dir))
     root = staging_root(data_dir)
     progress_path = Path(data_dir) / Path(ocr.PROGRESS_PATH).name
@@ -1596,8 +1623,10 @@ def promote_docs(
 
     promoted = refused = failed = 0
     for doc_id in doc_ids:
-        record = load_staging_record(data_dir, year, doc_id)
-        if record is None:
+        try:
+            record_bytes = ocr.read_work_artifact(data_dir, staging_record_path(data_dir, year, doc_id))
+            record = json.loads(record_bytes)
+        except FileNotFoundError:
             print(f"  [{doc_id}] no staging record; skipped", flush=True)
             refused += 1
             continue
@@ -1621,9 +1650,9 @@ def promote_docs(
                 refused += 1
                 continue
         try:
-            pdf_path, identity = manifest_artifact(record, data_dir, db_path)
+            _, identity = manifest_artifact(record, data_dir, db_path)
             artifact_year = identity["archive_year"]
-            current_sha = pdf_sha256(pdf_path)
+            current_sha = identity["artifact_sha256"]
         except (OSError, RuntimeError) as exc:
             print(f"  [{doc_id}] refused: PDF unreadable ({exc})", flush=True)
             refused += 1

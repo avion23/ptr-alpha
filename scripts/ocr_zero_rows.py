@@ -21,7 +21,7 @@ import os
 import re
 import stat
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 
 import duckdb
@@ -517,29 +517,54 @@ def build_work_manifest(
     }
 
 
-def read_work_artifact(data_dir: str | Path, path: str | Path) -> bytes:
-    """Read a regular PDF through directory FDs anchored to the approved root.
+@dataclass(frozen=True)
+class ApprovedDataRoot:
+    """One operation's approved directory identity, not a re-resolvable path."""
+    path: Path
+    declared_path: Path
+    fd: int
 
-    The data root itself may be a symlink (resolved once by batch callers).
-    Interior file/directory symlinks are deliberately refused, even internal
-    ones: no check/open race may substitute an external artifact for a PDF.
-    """
-    declared_root = Path(os.path.abspath(data_dir))
-    root = declared_root.resolve(strict=True)
-    candidate = Path(os.path.abspath(path))
-    try:
-        relative = candidate.relative_to(declared_root)
-    except ValueError:
-        try:
-            relative = candidate.relative_to(root)
-        except ValueError as exc:
-            raise RuntimeError("artifact path escapes the approved data root") from exc
+    def __fspath__(self):
+        # Existing Path-based readers/writers must follow this same directory,
+        # even if its original pathname is renamed/replaced during the job.
+        # The parent PID also keeps subprocess output paths usable (CLOEXEC).
+        return f"/proc/{os.getpid()}/fd/{self.fd}"
+
+
+@contextmanager
+def approved_data_root(data_dir):
+    if isinstance(data_dir, ApprovedDataRoot):
+        yield data_dir  # nested helpers borrow; only the outer owner closes
+        return
+    declared = Path(os.path.abspath(data_dir))
+    root = declared.resolve()
     with ExitStack() as stack:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         fd = os.open("/", flags)
         stack.callback(os.close, fd)
-        for component in (*root.parts[1:], *relative.parts[:-1]):
+        for component in root.parts[1:]:
             fd = os.open(component, flags, dir_fd=fd)
+            stack.callback(os.close, fd)
+        yield ApprovedDataRoot(root, declared, fd)
+
+
+def read_work_artifact(data_dir, path: str | Path) -> bytes:
+    """Read one regular file via the operation's pinned root FD, never symlinks."""
+    with approved_data_root(data_dir) as root, ExitStack() as stack:
+        candidate = Path(os.path.abspath(path))
+        try:
+            relative = candidate.relative_to(Path(root))
+        except ValueError:
+            try:
+                relative = candidate.relative_to(root.path)
+            except ValueError as exc:
+                try:
+                    relative = candidate.relative_to(root.declared_path)
+                except ValueError:
+                    raise RuntimeError("artifact path escapes the approved data root") from exc
+        fd = root.fd
+        for component in relative.parts[:-1]:
+            fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             stack.callback(os.close, fd)
         artifact_fd = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
         with os.fdopen(artifact_fd, "rb") as source:
@@ -556,7 +581,9 @@ def local_work_artifact(conn, data_dir: str | Path, item: dict) -> tuple[Path, d
     same-year unbound manifests remain readable, but never authorize a
     canonical skip. Explicit hashes/generations are constraints, not hints.
     """
-    data_dir = Path(data_dir).resolve()
+    if not isinstance(data_dir, ApprovedDataRoot):
+        with approved_data_root(data_dir) as root:
+            return local_work_artifact(conn, root, item)
     doc_id, group_year = str(item["doc_id"]), int(item["year"])
     archive_year = item.get("archive_year")
     if conn is not None:
@@ -575,11 +602,13 @@ def local_work_artifact(conn, data_dir: str | Path, item: dict) -> tuple[Path, d
         raise RuntimeError("invalid artifact archive_year")
     if Path(doc_id).name != doc_id or doc_id in ("", ".", ".."):
         raise RuntimeError("invalid artifact doc_id")
-    path = Path(data_dir) / str(archive_year) / "pdfs" / f"{doc_id}.pdf"
+    path = data_dir.path / str(archive_year) / "pdfs" / f"{doc_id}.pdf"
     identity = {"archive_year": archive_year, "artifact_sha256": None, "ingestion_generation": None}
-    if not path.exists():
+    try:
+        pdf_bytes = read_work_artifact(data_dir, path)
+    except FileNotFoundError:
         return path, identity
-    digest = hashlib.sha256(read_work_artifact(data_dir, path)).hexdigest()
+    digest = hashlib.sha256(pdf_bytes).hexdigest()
     expected = item.get("artifact_sha256", item.get("pdf_sha256"))
     if expected is not None and digest != expected:
         raise RuntimeError("local artifact does not match expected SHA-256")
@@ -593,7 +622,7 @@ def local_work_artifact(conn, data_dir: str | Path, item: dict) -> tuple[Path, d
         raise RuntimeError("artifact is not bound to the expected current House generation")
     if archive_year != group_year and generation is None:
         raise RuntimeError("cross-year artifact lacks a current recorded House acquisition")
-    identity.update(artifact_sha256=digest, ingestion_generation=generation)
+    identity.update(artifact_sha256=digest, ingestion_generation=generation, pdf_bytes=pdf_bytes)
     return path, identity
 
 
@@ -2546,7 +2575,7 @@ def main():
     print(f"Total inserted: {total_inserted}")
 
 
-def _run_visionb_staging(remaining, vision_b_config) -> None:
+def _run_visionb_staging(remaining, vision_b_config, *, _data_root=None) -> None:
     """GLM-primary drain: write STAGING records, never canonical rows.
 
     Engine A is never contacted and the canonical DB is never opened here:
@@ -2559,7 +2588,10 @@ def _run_visionb_staging(remaining, vision_b_config) -> None:
     """
     from scripts import glm_stage
 
-    data_dir = os.path.dirname(DB_PATH) or "."
+    if _data_root is None:
+        with approved_data_root(os.path.dirname(DB_PATH) or ".") as root:
+            return _run_visionb_staging(remaining, vision_b_config, _data_root=root)
+    data_dir = _data_root
     for i, (doc_id, year, path) in enumerate(remaining):
         idx = i + 1
         print(f"\n[{idx}/{len(remaining)}] {doc_id} ({year})...", flush=True)

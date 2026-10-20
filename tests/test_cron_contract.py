@@ -118,3 +118,15 @@ class EscalationWiringTest(TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("dry run", result.stdout)
+
+
+class BacklogOcrContractTest(TestCase):
+    def test_scheduled_drain_is_manifest_and_canonical_bound(self):
+        text = (CRON_DIR / "backlog_ocr.sh").read_text()
+        self.assertIn("--export-work-manifest", text)
+        self.assertIn("load_work_manifest_items(sys.argv[1])", text)
+        self.assertIn("manifest_years(items)", text)
+        self.assertIn('--from-manifest "$work_manifest" --check-canonical', text)
+        self.assertIn("refusing directory-scan fallback", text)
+        self.assertNotIn("for year in 2013", text)
+        self.assertNotIn("for year in 2018", text)

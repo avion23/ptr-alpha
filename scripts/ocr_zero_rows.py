@@ -245,7 +245,7 @@ def get_ocr_work_items(
             FROM metadata m
             JOIN deterministic d ON d.doc_id = m.doc_id AND d.rn = 1
             WHERE m.filing_type = 'P'
-              AND d.status IN ('zero_rows', 'error', 'rejected')
+              AND d.status IN ('zero_rows', 'error', 'rejected', 'partial')
               AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
             ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
             """,
@@ -317,7 +317,7 @@ def get_ocr_work_items(
         LEFT JOIN current_ocr o ON o.doc_id = m.doc_id AND o.rn = 1
         LEFT JOIN tx ON tx.doc_id = m.doc_id
         WHERE m.filing_type = 'P'
-          AND d.status IN ('zero_rows', 'error', 'rejected')
+          AND d.status IN ('zero_rows', 'error', 'rejected', 'partial')
           AND (? IS NULL OR EXTRACT(YEAR FROM m.filing_date) = ?)
         ORDER BY EXTRACT(YEAR FROM m.filing_date), m.doc_id
         """,
@@ -1326,6 +1326,47 @@ def record_parse_run(
         )
 
 
+def _retain_partial_ocr_result(
+    conn,
+    doc_id,
+    year,
+    transactions,
+    row_rejections,
+    *,
+    parser_version,
+    artifact_sha256,
+    ingestion_generation,
+):
+    """Append rejected extraction evidence; this table is intentionally append-only."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ocr_partial_results (
+            doc_id VARCHAR,
+            year INTEGER,
+            parser_version VARCHAR,
+            artifact_sha256 VARCHAR,
+            ingestion_generation VARCHAR,
+            transactions_json JSON,
+            rejections_json JSON,
+            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO ocr_partial_results (
+            doc_id, year, parser_version, artifact_sha256,
+            ingestion_generation, transactions_json, rejections_json
+        ) VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON))
+        """,
+        [
+            str(doc_id), year, parser_version, artifact_sha256,
+            ingestion_generation, json.dumps(transactions, default=str),
+            json.dumps(row_rejections, sort_keys=True),
+        ],
+    )
+
+
 def _archive_rows(conn, table, predicate, parameters):
     """Archive exactly the rows a transactional mutation is about to retire."""
     history = {"transactions": "transaction_versions", "pdf_parse_runs": "parse_run_versions"}[table]
@@ -1473,6 +1514,7 @@ def insert_transactions(
     engine_model: str = MODEL,
     checkpoint: bool = True,
     report: dict | None = None,
+    force_partial_canonical: bool = False,
 ):
     """Insert transactions into DB. Returns count inserted.
 
@@ -1480,7 +1522,10 @@ def insert_transactions(
     the explicit committed outcome (status, committed count, rejections) so
     callers can tell a full committed insert from a partial/rejected one
     without re-deriving it. The int return value stays the committed count
-    for backward compatibility.
+    for backward compatibility. Row-level partials are retained as evidence
+    and blocked from canonical by default. ``force_partial_canonical=True``
+    is the explicit owner override; it prints a loud warning and marks the
+    parse-run detail, while the returned outcome remains non-complete.
     """
 
     def _report(outcome: InsertOutcome) -> int:
@@ -1629,12 +1674,68 @@ def insert_transactions(
                 rejections=dict(rejections),
             )
         )
+    partial_transactions = list(transactions)
     transactions = validated
     partial_note = (
         f"; row-level rejections kept out: {json.dumps(row_rejections, sort_keys=True)}"
         if row_rejections
         else ""
     )
+    if row_rejections and not force_partial_canonical:
+        detail = (
+            "canonical commit blocked: partial OCR extraction; "
+            f"{len(validated)}/{input_count} validated rows retained in "
+            f"ocr_partial_results; rejections={json.dumps(row_rejections, sort_keys=True)}"
+        )
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            _retain_partial_ocr_result(
+                conn,
+                doc_id,
+                year,
+                partial_transactions,
+                row_rejections,
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+            )
+            record_parse_run(
+                conn,
+                doc_id,
+                year,
+                "partial",
+                input_count,
+                0,
+                detail,
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+                engines_attempted=engine_model,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            conn.close()
+            raise
+        if checkpoint:
+            conn.execute("CHECKPOINT")
+        conn.close()
+        return _report(
+            InsertOutcome(
+                status="partial",
+                inserted=0,
+                expected=input_count,
+                rejections=dict(row_rejections),
+                detail=detail,
+            )
+        )
+    if row_rejections:
+        print(
+            "WARNING: --force-partial-canonical: committing a partial OCR "
+            "rowset to canonical despite row-level rejections; attempt will "
+            "remain marked incomplete.",
+            flush=True,
+        )
 
     errors = []
     rows: list[dict] = []
@@ -1786,6 +1887,17 @@ def insert_transactions(
             )
         columns = OCR_INSERT_COLUMNS
         conn.execute("BEGIN TRANSACTION")
+        if row_rejections:
+            _retain_partial_ocr_result(
+                conn,
+                doc_id,
+                year,
+                partial_transactions,
+                row_rejections,
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+            )
         invalid_house_rows = int(
             conn.execute(
                 """
@@ -1915,7 +2027,12 @@ def insert_transactions(
             "success",
             input_count,
             count,
-            f"partial insert{partial_note}" if partial_note else "",
+            (
+                "FORCED PARTIAL CANONICAL COMMIT; "
+                f"partial insert{partial_note}"
+                if row_rejections
+                else ""
+            ),
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
@@ -2078,6 +2195,14 @@ def main():
         "--refresh", action="store_true", help="Ignore cached Gemini responses"
     )
     parser.add_argument(
+        "--force-partial-canonical",
+        action="store_true",
+        help=(
+            "OWNER OVERRIDE: commit partially validated Gemini OCR rows to "
+            "canonical (prints a warning and keeps the attempt incomplete)"
+        ),
+    )
+    parser.add_argument(
         "--export-work-manifest",
         nargs="?",
         const=WORK_MANIFEST_DEFAULT_PATH,
@@ -2108,6 +2233,13 @@ def main():
         return
 
     mode = _ocr_engine_mode()
+    if args.force_partial_canonical and mode != "gemini":
+        print(
+            "ERROR: --force-partial-canonical is supported only in Gemini "
+            "single-engine mode; refusing this run.",
+            flush=True,
+        )
+        return
     vision_b_config = None
     parser_version, engine_model = GEMINI_PARSER_VERSION, MODEL
     if mode == "visionb":
@@ -2290,6 +2422,7 @@ def main():
             engine_model=engine_model,
             artifact_sha256=artifact_metadata.sha256,
             ingestion_generation=ingestion_generation,
+            force_partial_canonical=args.force_partial_canonical,
         )
         total_inserted += insert_outcome.inserted
         # Partial or rejected output is never "complete": mark errors so the
@@ -2379,8 +2512,20 @@ def _run_visionb_staging(remaining, vision_b_config) -> None:
         )
 
 
-def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = False):
+def run_gemini_ocr_for_year(
+    year: int,
+    data_dir: str = "data",
+    refresh: bool = False,
+    force_partial_canonical: bool = False,
+):
     """Process unresolved deterministic OCR candidates for one year."""
+    if force_partial_canonical and dual_read_enabled():
+        print(
+            "ERROR: force_partial_canonical is supported only in Gemini "
+            "single-engine mode; refusing this run.",
+            flush=True,
+        )
+        return 0
     db_path = os.path.join(data_dir, "congress.duckdb")
     progress_path = Path(data_dir) / "ocr_progress_gemini_manual.json"
     remaining = get_ocr_work_items(db_path=db_path, data_dir=data_dir, year=year)
@@ -2521,6 +2666,7 @@ def run_gemini_ocr_for_year(year: int, data_dir: str = "data", refresh: bool = F
             raw_count=raw_count,
             artifact_sha256=artifact_metadata.sha256,
             ingestion_generation=ingestion_generation,
+            force_partial_canonical=force_partial_canonical,
         )
         if not insert_outcome.complete:
             # Rejected or partial: never call the output complete.

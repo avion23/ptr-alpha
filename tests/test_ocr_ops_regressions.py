@@ -1,3 +1,4 @@
+import json
 import subprocess
 from datetime import date
 
@@ -57,6 +58,111 @@ def test_semantic_zero_retires_exact_artifact(stored):
     db = Database(path)
     try:
         assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def _partial_transactions():
+    parsed = common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Microsoft (MSFT) | Purchase | 01/15/24 | 01/20/24 | A\n"
+        "Bad date row (BAD) | Purchase | 02/05/24 | 02/10/24 | B"
+    )
+    return parsed.member, parsed.transactions
+
+
+def test_partial_ocr_is_retained_but_canonical_commit_is_blocked(stored):
+    path, pdf, digest = stored
+    cache_dir = str(path.parent / "gemini_cache")
+    cache_and_insert(stored)  # existing canonical row must not be deleted
+    member, transactions = _partial_transactions()
+    common.write_cached_response(
+        "1",
+        pdf,
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Microsoft (MSFT) | Purchase | 01/15/24 | 01/20/24 | A\n"
+        "Bad date row (BAD) | Purchase | 02/05/24 | 02/10/24 | B",
+        cache_dir,
+    )
+
+    outcome = ops.insert_transactions_outcome(
+        "1",
+        2024,
+        member,
+        transactions,
+        db_path=str(path),
+        raw_count=2,
+        artifact_sha256=digest,
+        ingestion_generation="g",
+    )
+
+    assert outcome.status == "partial"
+    assert outcome.inserted == 0 and outcome.expected == 2
+    assert outcome.committed is False and outcome.complete is False
+    assert outcome.rejections == {"date_out_of_window": 1}
+    db = Database(path)
+    try:
+        assert db.conn.execute(
+            "SELECT ticker FROM transactions WHERE doc_id='1' AND source='gemini_ocr'"
+        ).fetchall() == [("AAPL",)]
+        run = db.conn.execute(
+            "SELECT status, transaction_count, error_message FROM pdf_parse_runs "
+            "WHERE doc_id='1' AND parser_version=?",
+            [ops.GEMINI_PARSER_VERSION],
+        ).fetchone()
+        assert run[0:2] == ("partial", 0)
+        assert "canonical commit blocked" in run[2]
+        retained = db.conn.execute(
+            "SELECT transactions_json::VARCHAR, rejections_json::VARCHAR "
+            "FROM ocr_partial_results WHERE doc_id='1'"
+        ).fetchone()
+        assert "Microsoft (MSFT)" in retained[0] and "Bad date row" in retained[0]
+        assert json.loads(retained[1]) == {"date_out_of_window": 1}
+    finally:
+        db.close()
+
+    cached = common.inspect_cached_response("1", str(pdf), cache_dir)
+    assert cached is not None and len(cached.parsed.transactions) == 2
+    assert ops.get_ocr_work_items(db_path=str(path), data_dir=path.parent) == [
+        ("1", 2024, str(pdf))
+    ]
+
+
+def test_partial_canonical_override_is_loud_and_still_incomplete(stored, capsys):
+    path, _, digest = stored
+    member, transactions = _partial_transactions()
+    outcome = ops.insert_transactions_outcome(
+        "1",
+        2024,
+        member,
+        transactions,
+        db_path=str(path),
+        raw_count=2,
+        artifact_sha256=digest,
+        ingestion_generation="g",
+        force_partial_canonical=True,
+    )
+    assert "WARNING: --force-partial-canonical" in capsys.readouterr().out
+    assert outcome.status == "partial" and outcome.committed
+    assert not outcome.complete
+    db = Database(path)
+    try:
+        assert db.conn.execute(
+            "SELECT ticker FROM transactions WHERE doc_id='1' AND source='gemini_ocr'"
+        ).fetchall() == [("MSFT",)]
+        assert db.conn.execute(
+            "SELECT status, error_message FROM pdf_parse_runs WHERE doc_id='1' "
+            "AND parser_version=?",
+            [ops.GEMINI_PARSER_VERSION],
+        ).fetchone()[0] == "success"
+        assert "FORCED PARTIAL CANONICAL COMMIT" in db.conn.execute(
+            "SELECT error_message FROM pdf_parse_runs WHERE doc_id='1' "
+            "AND parser_version=?",
+            [ops.GEMINI_PARSER_VERSION],
+        ).fetchone()[0]
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ocr_partial_results WHERE doc_id='1'"
+        ).fetchone()[0] == 1
     finally:
         db.close()
 

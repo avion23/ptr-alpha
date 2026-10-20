@@ -119,6 +119,75 @@ def get_context(ctx, data_dir=None, read_only=False):
     return ctx.obj
 
 
+class _DatabaseContextReleaseError(RuntimeError):
+    pass
+
+
+class _HouseAcquisitionDatabase:
+    """Open a database only for each House acquisition query or promotion.
+
+    House PDF downloads can take hours. Keep no DuckDB connection open while
+    they run; the only write operation in acquisition is archive promotion.
+    """
+
+    _WRITE_METHODS = frozenset({"promote_house_archive"})
+
+    def __init__(self, data_dir: str | Path):
+        self.data_dir = data_dir
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            db = _open_database(
+                self.data_dir, read_only=name not in self._WRITE_METHODS
+            )
+            try:
+                return getattr(db, name)(*args, **kwargs)
+            except BaseException:
+                try:
+                    db.close()
+                except Exception as exc:
+                    raise _DatabaseContextReleaseError(
+                        f"Failed to close House acquisition database after {name}"
+                    ) from exc
+                raise
+            else:
+                try:
+                    db.close()
+                except Exception as exc:
+                    raise _DatabaseContextReleaseError(
+                        f"Failed to close House acquisition database after {name}"
+                    ) from exc
+
+        return call
+
+
+def _set_shared_database(app_ctx: AppContext, db) -> None:
+    for owner in (app_ctx.transaction_source, app_ctx.price_source):
+        if owner is not None:
+            owner.db = db
+
+
+def _release_shared_database(app_ctx: AppContext) -> None:
+    """Close the shared real DB handle and clear both source references."""
+    db = getattr(getattr(app_ctx, "transaction_source", None), "db", None)
+    if isinstance(db, Database):
+        db.close()
+    _set_shared_database(app_ctx, None)
+
+
+def _prepare_house_acquisition_database(app_ctx: AppContext) -> bool:
+    """Release the initial writer and install lock-free acquisition access."""
+    if not isinstance(app_ctx.transaction_source, HouseTransactionSource):
+        return False
+    db = getattr(getattr(app_ctx, "transaction_source", None), "db", None)
+    if not isinstance(db, Database):
+        return False
+    data_dir = app_ctx.settings.data.data_dir
+    db.close()
+    _set_shared_database(app_ctx, _HouseAcquisitionDatabase(data_dir))
+    return True
+
+
 def _save_results(
     table: pd.DataFrame,
     output_format: str,
@@ -714,6 +783,7 @@ def _release_parent_db_for_ocr(app_ctx: AppContext) -> Path | None:
     if not seen:
         return None
     db_path = Path(seen[0].db_path)
+    close_error = None
     for db in seen:
         try:
             db.conn.execute("CHECKPOINT")
@@ -721,8 +791,11 @@ def _release_parent_db_for_ocr(app_ctx: AppContext) -> Path | None:
             logger.debug("Pre-OCR checkpoint failed", exc_info=True)
         try:
             db.close()
-        except Exception:
-            logger.debug("Pre-OCR parent close failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001
+            if close_error is None:
+                close_error = exc
+    if close_error is not None:
+        raise close_error
     return db_path
 
 
@@ -1301,15 +1374,16 @@ def refresh(
     fail_fast = len(archive_years) == 1
 
     def reopen_shared_database() -> None:
-        try:
-            app_ctx.transaction_source.db.close()
-        except Exception:  # noqa: BLE001
-            pass
+        if isinstance(app_ctx.transaction_source.db, _HouseAcquisitionDatabase):
+            # The acquisition proxy owns no persistent connection; every DB
+            # call is already a fresh, bounded handle.
+            return
+        app_ctx.transaction_source.db.close()
         fresh_db = _open_database(app_ctx.settings.data.data_dir, False)
-        app_ctx.transaction_source.db = fresh_db
-        app_ctx.price_source.db = fresh_db
+        _set_shared_database(app_ctx, fresh_db)
 
     try:
+        database_lifecycle = _prepare_house_acquisition_database(app_ctx)
         for archive_year in archive_years:
             try:
                 summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
@@ -1321,6 +1395,8 @@ def refresh(
                     ),
                 )
             except Exception as year_exc:
+                if isinstance(year_exc, _DatabaseContextReleaseError):
+                    raise
                 if fail_fast:
                     raise
                 logger.warning(
@@ -1339,6 +1415,8 @@ def refresh(
                         ),
                     )
                 except Exception as retry_exc:
+                    if isinstance(retry_exc, _DatabaseContextReleaseError):
+                        raise
                     logger.warning(
                         "House archive %d failed twice, skipping: %s",
                         archive_year,
@@ -1374,19 +1452,28 @@ def refresh(
 
     print(f"[2/4] Parsing cached House PDF archives {label}...")
     for archive_year in archive_years:
+        if database_lifecycle:
+            # Parse-run recording gets one writer context per archive, not the
+            # acquisition handle or a lock spanning the all-years loop.
+            parse_db = _open_database(app_ctx.settings.data.data_dir, False)
+            _set_shared_database(app_ctx, parse_db)
         try:
-            # Activation belongs after optional OCR, not in the parse step.
-            parse_result = run_parse_pipeline(
-                app_ctx.transaction_source,
-                archive_year,
-                force=force_full_reparse,
-                activate_generation=False,
-            )
-            if not parse_result.success:
+            try:
+                # Activation belongs after optional OCR, not in the parse step.
+                parse_result = run_parse_pipeline(
+                    app_ctx.transaction_source,
+                    archive_year,
+                    force=force_full_reparse,
+                    activate_generation=False,
+                )
+                if not parse_result.success:
+                    failed_steps.append(f"parse:{archive_year}")
+            except Exception as exc:
                 failed_steps.append(f"parse:{archive_year}")
-        except Exception as exc:
-            failed_steps.append(f"parse:{archive_year}")
-            logger.warning("PDF parse failed for %d: %s", archive_year, exc)
+                logger.warning("PDF parse failed for %d: %s", archive_year, exc)
+        finally:
+            if database_lifecycle:
+                _release_shared_database(app_ctx)
 
     # Step 3: Third-party reconciliation is never part of official refresh.
     if skip_capitol:
@@ -1424,41 +1511,48 @@ def refresh(
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 
-    for archive_year in archive_years:
-        generation_id = app_ctx.transaction_source.db.get_latest_house_generation(
-            archive_year
-        )
-        if generation_id is None:
-            failed_steps.append(f"missing_house_generation:{archive_year}")
-            continue
-        unresolved = app_ctx.transaction_source.db.get_unresolved_house_doc_ids(
-            archive_year, generation_id
-        )
-        if not unresolved:
-            app_ctx.transaction_source.db.mark_house_generation_parse_complete(
+    if database_lifecycle:
+        # OCR owns its child-process write handle. Final generation checks and
+        # reporting get a fresh, short-lived parent context.
+        final_db = _open_database(app_ctx.settings.data.data_dir, False)
+        _set_shared_database(app_ctx, final_db)
+
+    try:
+        for archive_year in archive_years:
+            generation_id = app_ctx.transaction_source.db.get_latest_house_generation(
+                archive_year
+            )
+            if generation_id is None:
+                failed_steps.append(f"missing_house_generation:{archive_year}")
+                continue
+            unresolved = app_ctx.transaction_source.db.get_unresolved_house_doc_ids(
                 archive_year, generation_id
             )
+            if not unresolved:
+                app_ctx.transaction_source.db.mark_house_generation_parse_complete(
+                    archive_year, generation_id
+                )
+                print(
+                    f"  House {archive_year} generation={generation_id} "
+                    "status=complete (activated)"
+                )
+                continue
+            failed_steps.append(f"unresolved_house:{archive_year}")
+            preview = ", ".join(unresolved[:10])
             print(
-                f"  House {archive_year} generation={generation_id} "
-                "status=complete (activated)"
+                f"  House {archive_year} generation incomplete: "
+                f"{len(unresolved)} unresolved PDFs ({preview})"
             )
-            continue
-        failed_steps.append(f"unresolved_house:{archive_year}")
-        preview = ", ".join(unresolved[:10])
-        print(
-            f"  House {archive_year} generation incomplete: "
-            f"{len(unresolved)} unresolved PDFs ({preview})"
-        )
 
-    canonical_count_after = app_ctx.transaction_source.db.conn.execute(
-        "SELECT COUNT(*) FROM canonical_transactions"
-    ).fetchone()[0]
-    raw_count_after = app_ctx.transaction_source.db.conn.execute(
-        "SELECT COUNT(*) FROM transactions"
-    ).fetchone()[0]
-    summary_year = archive_years[-1]
-    max_date, max_disclosure_date, implausible_date_count = (
-        app_ctx.transaction_source.db.conn.execute(
+        db = app_ctx.transaction_source.db
+        canonical_count_after = db.conn.execute(
+            "SELECT COUNT(*) FROM canonical_transactions"
+        ).fetchone()[0]
+        raw_count_after = db.conn.execute(
+            "SELECT COUNT(*) FROM transactions"
+        ).fetchone()[0]
+        summary_year = archive_years[-1]
+        max_date, max_disclosure_date, implausible_date_count = db.conn.execute(
             """
             SELECT
                 MAX(transaction_date) FILTER (
@@ -1477,7 +1571,9 @@ def refresh(
             """,
             [summary_year, summary_year],
         ).fetchone()
-    )
+    finally:
+        if database_lifecycle:
+            _release_shared_database(app_ctx)
 
     canonical_added = canonical_count_after - canonical_count_before
     raw_added = raw_count_after - raw_count_before

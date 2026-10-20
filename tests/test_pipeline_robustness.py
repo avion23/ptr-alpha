@@ -1,13 +1,16 @@
+import subprocess
+import sys
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
 from typer.testing import CliRunner
 
-from analyzer.cli import app
+from analyzer.cli import _open_database, app
 from analyzer.database import Database
-from analyzer.download import HouseFetchSummary
+from analyzer.download import HouseFetchSummary, HouseTransactionSource
 from analyzer.exceptions import DataResult, DataSourceError, StepResult
 from analyzer.member_ranking.buyer_scoring import _get_consensus_candidate_tickers
 from analyzer.pipeline import (
@@ -21,6 +24,7 @@ from analyzer.pipeline import (
     run_recent_ticker_scoring,
     run_ticker_analysis,
 )
+from analyzer.settings import Settings
 
 
 def test_refresh_summary_is_scoped_to_requested_year(tmp_path):
@@ -761,6 +765,90 @@ def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
         call.kwargs["refresh_metadata"]
         for call in ctx.transaction_source.fetch_and_cache_pdfs.call_args_list
     )
+
+
+def test_refresh_releases_writer_between_acquisition_and_parse(tmp_path):
+    db_path = tmp_path / "congress.duckdb"
+    db = Database(db_path)
+    db.conn.execute("CREATE TABLE writer_probe (value INTEGER)")
+    db.conn.execute(
+        """
+        INSERT INTO house_archive_generations (
+            archive_year, generation_id, metadata_sha256,
+            metadata_count, ptr_count, parse_status
+        ) VALUES (2025, 'probe-generation', 'sha', 0, 0, 'incomplete')
+        """
+    )
+    settings = Settings(data={"data_dir": str(tmp_path), "parallel_workers": 1})
+    source = HouseTransactionSource(settings, db=db)
+    app_ctx = SimpleNamespace(
+        settings=settings,
+        transaction_source=source,
+        price_source=SimpleNamespace(db=db),
+    )
+    summary = HouseFetchSummary(
+        archive_year=2025,
+        metadata_count=0,
+        ptr_count=0,
+        valid_pdf_count=0,
+        downloaded_count=0,
+        skipped_count=0,
+        orphan_pdf_count=0,
+        generation_id="probe-generation",
+    )
+
+    probe_code = (
+        "import duckdb, sys; c=duckdb.connect(sys.argv[1]); "
+        "c.execute('BEGIN TRANSACTION'); "
+        "c.execute('INSERT INTO writer_probe VALUES (1)'); c.close()"
+    )
+
+    def writer_probe():
+        return subprocess.run(
+            [sys.executable, "-c", probe_code, str(db_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    acquisition_probe = []
+
+    def fake_fetch(archive_year, **_kwargs):
+        assert source.db.get_latest_house_generation(archive_year)
+        acquisition_probe.append(writer_probe())
+        return summary
+
+    source.fetch_and_cache_pdfs = fake_fetch
+
+    before = writer_probe()
+    assert before.returncode != 0
+    inter_phase = []
+    real_open = _open_database
+
+    def open_database(data_dir, read_only):
+        if not inter_phase and not read_only:
+            inter_phase.append(writer_probe())
+        return real_open(data_dir, read_only)
+
+    try:
+        with (
+            patch("analyzer.cli.get_context", return_value=app_ctx),
+            patch("analyzer.cli._open_database", side_effect=open_database),
+            patch(
+                "analyzer.cli.run_parse_pipeline",
+                return_value=StepResult(success=True),
+            ),
+        ):
+            result = CliRunner().invoke(
+                app, ["refresh", "--year", "2025", "--skip-capitol"]
+            )
+    finally:
+        source.close()
+
+    assert result.exit_code == 0, result.output
+    assert acquisition_probe[0].returncode == 0, acquisition_probe[0].stderr
+    assert inter_phase[0].returncode == 0, inter_phase[0].stderr
 
 
 def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):

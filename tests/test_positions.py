@@ -855,6 +855,109 @@ class TestPositions(unittest.TestCase):
         self.assertEqual(candidates.iloc[0]["kind"], "manager")
         self.assertIsNone(candidates.iloc[0]["entry_ref"])
 
+    def test_13f_share_snapshots_expose_held_and_absent_states_without_dollar_lots(self):
+        import json
+
+        from analyzer.positions import gate_closed_events
+
+        def snapshot(shares, change, state):
+            return json.dumps(
+                {
+                    "format": "13f-share-snapshot-v1",
+                    "shares_held": shares,
+                    "portfolio_pct": 12.5 if shares else 0.0,
+                    "change_shares": change,
+                    "change_portfolio_pct": None,
+                    "state": state,
+                    "dollar_valuation": {
+                        "status": "not_performed",
+                        "reason": "share snapshot; no dollar-size comparison used",
+                    },
+                }
+            )
+
+        db, conn = _holdings_db(
+            [
+                {
+                    "member": "Manager M",
+                    "ticker": "HELD",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 6, 30),
+                    "disclosure_date": date(2026, 8, 14),
+                    "amount_midpoint": None,
+                    "amount_raw": snapshot(150, 50, "held"),
+                    "raw_transaction_subtype": "13F_SHARE_POSITION_SNAPSHOT",
+                    "source": "13f",
+                    "source_record_id": "q2",
+                    "source_row_id": "cusip-held",
+                },
+                {
+                    "member": "Manager M",
+                    "ticker": "ABSENT",
+                    "transaction_type": "Sale",
+                    "transaction_date": date(2026, 9, 30),
+                    "disclosure_date": date(2026, 11, 14),
+                    "amount_midpoint": None,
+                    "amount_raw": snapshot(0, -25, "absent"),
+                    "raw_transaction_subtype": "13F_SHARE_POSITION_SNAPSHOT",
+                    "source": "13f",
+                    "source_record_id": "q3",
+                    "source_row_id": "cusip-absent",
+                },
+            ],
+            [],
+        )
+        try:
+            candidates = holdings_candidates(
+                db,
+                "Manager M",
+                date(2026, 11, 14),
+                enable_13f_corroboration=True,
+            ).set_index("ticker")
+            held = candidates.loc["HELD"]
+            absent = candidates.loc["ABSENT"]
+            self.assertEqual(held["holding_state"], "held")
+            self.assertEqual(held["shares_held"], 150)
+            self.assertEqual(held["share_change"], 50)
+            self.assertTrue(held["position_evidence"])
+            self.assertIsNone(held["entry_ref"])
+            self.assertEqual(absent["holding_state"], "absent")
+            self.assertEqual(absent["shares_held"], 0)
+            self.assertEqual(absent["share_change"], -25)
+            self.assertFalse(absent["position_evidence"])
+            self.assertIn("corroboration unavailable:", absent["corroboration_reason"])
+
+            events = pd.DataFrame(
+                [
+                    {
+                        "ticker": "HELD",
+                        "actor_id": "manager:MANAGER M",
+                        "source": "13f",
+                        "entry_ref": None,
+                        "event_date": date(2026, 3, 31),
+                    },
+                    {
+                        "ticker": "ABSENT",
+                        "actor_id": "manager:MANAGER M",
+                        "source": "13f",
+                        "entry_ref": None,
+                        "event_date": date(2026, 6, 30),
+                    },
+                ]
+            )
+            gated = gate_closed_events(
+                events,
+                candidates.reset_index(),
+                enable_13f_corroboration=True,
+            ).set_index("ticker")
+            self.assertEqual(gated.loc["HELD", "holding_state"], "held")
+            self.assertTrue(pd.isna(gated.loc["HELD", "blocked_reason"]))
+            self.assertIn(
+                "corroboration unavailable:", gated.loc["ABSENT", "blocked_reason"]
+            )
+        finally:
+            conn.close()
+
     def test_holdings_candidates_entry_reference_is_blended_basis(self):
         db, conn = _holdings_db(
             [

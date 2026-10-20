@@ -117,7 +117,6 @@ def test_emits_only_watchlist_increases_and_new_positions(tmp_path, quarter_xmls
         },
         managers={"test": {"name": "Test Manager", "cik": "1234567"}},
         ingestion_generation="test-generation",
-        price_lookup=lambda ticker, quarter_end: 10 if ticker == "VST" else None,
     )
     previous_xml, current_xml = quarter_xmls
     previous = _parse_information_table(previous_xml)
@@ -135,20 +134,92 @@ def test_emits_only_watchlist_increases_and_new_positions(tmp_path, quarter_xmls
         "https://www.sec.gov/Archives/edgar/data/1234567/000123456726000002/infotable.xml",
     )
 
-    assert [(row["ticker"], row["amount_raw"]) for row in rows] == [
-        ("VST", "50 shares"),
-        ("NOVA", "300 shares"),
+    assert [(row["ticker"], row["transaction_type"]) for row in rows] == [
+        ("VST", "Purchase"),
+        ("NOVA", "Purchase"),
     ]
+    assert all(row["amount_midpoint"] is None for row in rows)
     assert all(
-        row["raw_transaction_subtype"] == "INFERRED_POSITION_INCREASE" for row in rows
+        row["raw_transaction_subtype"] == "13F_SHARE_POSITION_SNAPSHOT"
+        for row in rows
     )
+    assert json.loads(rows[0]["amount_raw"])["change_shares"] == 50
+    assert json.loads(rows[1]["amount_raw"])["shares_held"] == 300
     assert rows[0]["transaction_date"] == date(2026, 6, 30)
     assert rows[0]["disclosure_date"] == date(2026, 8, 14)
-    assert rows[0]["amount_midpoint"] == 500
+    assert rows[0]["amount_midpoint"] is None
     assert rows[1]["amount_midpoint"] is None
+    first_position = json.loads(rows[0]["amount_raw"])
+    assert first_position["shares_held"] == 150
+    assert first_position["change_shares"] == 50
+    assert first_position["state"] == "held"
+    assert first_position["portfolio_pct"] is None
+    assert rows[0]["raw_transaction_subtype"] == "13F_SHARE_POSITION_SNAPSHOT"
     assert rows[0]["source_record_id"] == "0001234567-26-000002"
     assert rows[0]["source_row_id"] == "111111111"
     assert rows[0]["ingestion_generation"] == "test-generation"
+    source.close()
+
+
+def test_position_changes_record_reductions_and_absence_as_share_states(tmp_path):
+    source = ThirteenFSource(
+        data_dir=tmp_path / "data",
+        db=object(),
+        watchlist={"VST": {"VISTRA"}, "NOVA": {"NOVA LABS"}},
+        managers={"test": {"name": "Test Manager", "cik": "1234567"}},
+    )
+    previous = {
+        "111111111": {"issuer": "Vistra Corp", "shares": 100, "value_thousands": 1000,
+                      "portfolio_value_thousands": 2000},
+        "222222222": {"issuer": "Nova Labs", "shares": 100, "value_thousands": 1000,
+                      "portfolio_value_thousands": 2000},
+    }
+    current = {
+        "111111111": {"issuer": "Vistra Corp", "shares": 40, "value_thousands": 600,
+                      "portfolio_value_thousands": 1200},
+        "333333333": {"issuer": "Nova Labs", "shares": 25, "value_thousands": 600,
+                      "portfolio_value_thousands": 1200},
+    }
+    rows = source._position_changes(
+        {"name": "Test Manager"},
+        {"report_date": "2026-06-30", "filing_date": "2026-08-14",
+         "accession": "0001234567-26-000002"},
+        current,
+        previous,
+        "unused",
+    )
+    states = {row["ticker"]: json.loads(row["amount_raw"]) for row in rows}
+    by_ticker = {row["ticker"]: row for row in rows}
+
+    assert states["VST"]["shares_held"] == 40
+    assert states["VST"]["change_shares"] == -60
+    assert states["VST"]["portfolio_pct"] == 50.0
+    assert states["VST"]["change_portfolio_pct"] == 0.0
+    assert by_ticker["VST"]["transaction_type"] == "Sale"
+    assert by_ticker["VST"]["amount_midpoint"] is None
+    assert states["NOVA"]["shares_held"] == 25
+    assert states["NOVA"]["change_shares"] == 25
+    assert states["NOVA"]["state"] == "held"
+    assert states["NOVA"]["portfolio_pct"] == 50.0
+
+    source.watchlist["NOVA"] = {"NOVA"}
+    absent = source._position_changes(
+        {"name": "Test Manager"},
+        {"report_date": "2026-09-30", "filing_date": "2026-11-14",
+         "accession": "0001234567-26-000003"},
+        {"111111111": {"issuer": "Vistra Corp", "shares": 40, "value_thousands": 600,
+                        "portfolio_value_thousands": 600}},
+        {"222222222": {"issuer": "Nova Labs", "shares": 25, "value_thousands": 600,
+                        "portfolio_value_thousands": 600}},
+        "unused",
+    )
+    absent_row = next(row for row in absent if row["ticker"] == "NOVA")
+    absent_state = json.loads(absent_row["amount_raw"])
+    assert absent_state["state"] == "absent"
+    assert absent_state["shares_held"] == 0
+    assert absent_state["change_shares"] == -25
+    assert absent_state["portfolio_pct"] == 0.0
+    assert absent_row["transaction_type"] == "Sale"
     source.close()
 
 

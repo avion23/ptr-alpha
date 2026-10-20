@@ -8,6 +8,11 @@ not comparable across dates — actor counts vary), top-vs-bottom tercile
 mean 90d SPY-relative excess, difference with clustered SE (cluster =
 decision, 8 clusters, bar |t|>=2).
 
+Grouped sample report: 5,688 source rows (2,825 eligible rows), 8 distinct
+decision-date clusters; distinct decision-date × member groups: UNKNOWN from
+the published summary (the cohort CSVs are not present in this checkout).
+The row/episode totals are not substitutes for independent groups.
+
 ## Result: FAIL. The score does not rank-order forward excess.
 
 | decision | top n | bot n | top mean | bot mean | top−bot |
@@ -22,6 +27,8 @@ decision, 8 clusters, bar |t|>=2).
 | 2026-07-01 |  36 |  40 | −7.72 | −4.12 | −3.60 |
 
 Pooled top−bot: **−0.35pp, clustered SE 0.79, t=−0.44**, 95% CI [−1.94, +1.24].
+This is a difference of means across 8 decision dates; the 5,688 observation
+rows do not provide 5,688 independent units.
 Signs flip across decisions (positive twice early, negative thereafter) —
 no stable direction, let alone significance.
 
@@ -39,12 +46,20 @@ SPY. The filter does not clear the market.
 2. Entry is next-close, not the traded limit-fill rule (charter item 2).
    That moves levels, not rank order — it cannot manufacture ordering
    from a null contrast.
-3. 8 clusters: same power as the published nulls. The null here is
-   informative, not underpowered-muted: CI excludes anything above +1.24pp.
+3. 8 decision-date clusters: the displayed SE/CI use these clusters; distinct
+   date×member groups remain UNKNOWN. The CI excludes anything above +1.24pp
+   under this estimator and clustering scheme.
 
 ## Consequence
 
 Charter promotion rule item 1: TESTED → FAIL. Sizing stays flat $3k;
-paper remains the defensible posture. The supported claim narrows to the
-entry filter (eligible −2.56 vs ineligible −0.52, t=−4.65): a loss-cutting
-rule, not an alpha signal.
+paper remains the defensible posture.
+
+### Superseded/corrected interpretation (2026-10-20)
+
+The previous consequence sentence called the eligible/ineligible contrast a
+“loss-cutting rule.” That interpretation is withdrawn. The separate
+eligible/ineligible result is a difference of means: eligible −2.55999pp
+versus ineligible −0.52216pp (difference −2.03783pp, reported clustered
+t=−4.65; `data/backtest_assumptions/summary.csv:5`). It is not a loss
+reduction and does not establish a causal filter effect.

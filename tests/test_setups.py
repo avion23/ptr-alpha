@@ -19,6 +19,8 @@ def _row(
     corroboration=False,
     source="house",
     position_evidence=False,
+    holding_state=None,
+    shares_held=None,
 ):
     return {
         "ticker": ticker,
@@ -30,6 +32,8 @@ def _row(
         "disclosure_date": disclosure_date,
         "corroboration": corroboration,
         "position_evidence": position_evidence,
+        "holding_state": holding_state,
+        "shares_held": shares_held,
         "as_of": AS_OF,
     }
 
@@ -43,11 +47,15 @@ def test_two_actors_outscore_one_and_corroboration_is_bounded():
                 actor_id="manager:FUND A",
                 corroboration=True,
                 source="13f",
+                holding_state="held",
+                shares_held=100,
             ),
             _row(
                 actor_id="manager:FUND B",
                 corroboration=True,
                 source="13f",
+                holding_state="held",
+                shares_held=50,
             ),
             _row(
                 ticker="MSFT",
@@ -63,6 +71,7 @@ def test_two_actors_outscore_one_and_corroboration_is_bounded():
         {"officer:BURKE CEO": 1.0, "congress:PELOSI": 1.0, "congress:SMITH": 1.0},
         {"AAPL": 100.0, "MSFT": 100.0},
         watchlist={"manager:FUND A", "manager:FUND B"},
+        enable_13f_corroboration=True,
     )
 
     assert ranked.set_index("ticker").loc["AAPL", "score"] == pytest.approx(3.0)
@@ -117,7 +126,7 @@ def test_ranked_row_reports_disclosure_freshness():
     )
     assert len(ranked) == 1
     assert ranked.iloc[0]["min_disclosure_lag_days"] == 2
-    assert ranked.iloc[0]["has_fresh_evidence"] == True
+    assert ranked.iloc[0]["has_fresh_evidence"]
     ranked_stale, _ = score(
         pd.DataFrame([stale, _row(actor_id="congress:OLD2",
                                   position_evidence=True,
@@ -126,7 +135,7 @@ def test_ranked_row_reports_disclosure_freshness():
         {"AAPL": 100.0},
     )
     assert len(ranked_stale) == 1
-    assert ranked_stale.iloc[0]["has_fresh_evidence"] == False
+    assert not ranked_stale.iloc[0]["has_fresh_evidence"]
     assert ranked_stale.iloc[0]["min_disclosure_lag_days"] > 90
 
 
@@ -398,7 +407,11 @@ def test_corroborated_lone_initiator_ranks_but_uncorroborated_does_not():
                 event_date=date(2024, 3, 1),
                 position_evidence=True,
             ),
-            _row(actor_id="manager:FUND A", corroboration=True, source="13f"),
+            _row(
+                actor_id="manager:FUND A", corroboration=True, source="13f",
+                event_date=date(2024, 3, 31), disclosure_date=date(2024, 5, 15),
+                holding_state="held", shares_held=120,
+            ),
         ]
     )
     weights = {"officer:BURKE CEO": 0.6}
@@ -407,9 +420,57 @@ def test_corroborated_lone_initiator_ranks_but_uncorroborated_does_not():
     ranked_lone, _ = score(lone, weights, {"AAPL": 100.0}, watchlist=watchlist)
     assert ranked_lone.empty
 
-    ranked_backed, _ = score(backed, weights, {"AAPL": 100.0}, watchlist=watchlist)
+    audit = {}
+    ranked_backed, _ = score(
+        backed,
+        weights,
+        {"AAPL": 100.0},
+        watchlist=watchlist,
+        enable_13f_corroboration=True,
+        audit=audit,
+    )
     assert len(ranked_backed) == 1
     assert ranked_backed.iloc[0]["actors"] == ["officer:BURKE CEO"]
+    assert ranked_backed.iloc[0]["score"] == pytest.approx(0.9)
+    assert audit["AAPL"]["corroborated_13f"] is True
+
+
+def test_environment_opt_in_enables_13f_but_defaults_off(monkeypatch):
+    backed = pd.DataFrame(
+        [
+            _row(
+                actor_id="officer:PTR MEMBER",
+                source="form4",
+                entry_ref=100.0,
+                disclosure_date=AS_OF,
+            ),
+            _row(
+                actor_id="manager:FUND A",
+                source="13f",
+                corroboration=True,
+                event_date=date(2024, 3, 31),
+                disclosure_date=AS_OF,
+                holding_state="held",
+                shares_held=80,
+            ),
+        ]
+    )
+    weights = {"officer:PTR MEMBER": 0.6}
+    prices = {"AAPL": 100.0}
+    monkeypatch.delenv("INSIDER_ENABLE_13F_CORROBORATION", raising=False)
+
+    default_ranked, _ = score(
+        backed, weights, prices, watchlist={"manager:FUND A"}
+    )
+    assert default_ranked.empty
+
+    monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1")
+    audit = {}
+    opt_in_ranked, _ = score(
+        backed, weights, prices, watchlist={"manager:FUND A"}, audit=audit
+    )
+    assert opt_in_ranked.iloc[0]["score"] == pytest.approx(0.9)
+    assert audit["AAPL"]["13f_corroboration_enabled"] is True
 
 
 def test_non_watchlist_corroboration_does_not_promote():
@@ -421,7 +482,8 @@ def test_non_watchlist_corroboration_does_not_promote():
                 event_date=date(2024, 3, 1),
                 position_evidence=True,
             ),
-            _row(actor_id="manager:RANDOM FUND", corroboration=True, source="13f"),
+            _row(actor_id="manager:RANDOM FUND", corroboration=True, source="13f",
+                 holding_state="held", shares_held=100),
         ]
     )
     ranked, _ = score(
@@ -429,6 +491,7 @@ def test_non_watchlist_corroboration_does_not_promote():
         {"officer:BURKE CEO": 0.6},
         {"AAPL": 100.0},
         watchlist={"manager:FUND A"},
+        enable_13f_corroboration=True,
     )
     assert ranked.empty
 
@@ -447,6 +510,8 @@ def test_stale_corroboration_does_not_promote():
                 corroboration=True,
                 source="13f",
                 disclosure_date=date(2023, 1, 1),
+                holding_state="held",
+                shares_held=100,
             ),
         ]
     )
@@ -455,6 +520,7 @@ def test_stale_corroboration_does_not_promote():
         {"officer:BURKE CEO": 0.6},
         {"AAPL": 100.0},
         watchlist={"manager:FUND A"},
+        enable_13f_corroboration=True,
     )
     assert ranked.empty
 
@@ -468,7 +534,8 @@ def test_missing_watchlist_means_no_corroboration():
                 event_date=date(2024, 3, 1),
                 position_evidence=True,
             ),
-            _row(actor_id="manager:FUND A", corroboration=True, source="13f"),
+            _row(actor_id="manager:FUND A", corroboration=True, source="13f",
+                 holding_state="held", shares_held=100),
         ]
     )
     ranked, _ = score(backed, {"officer:BURKE CEO": 0.6}, {"AAPL": 100.0})
@@ -485,14 +552,19 @@ def test_closed_manager_does_not_corroborate_lone_officer():
         actor_id="manager:FUND A",
         corroboration=True,
         source="13f",
+        holding_state="held",
+        shares_held=100,
     )
-    manager["blocked_reason"] = "no open position at as_of"
+    manager["blocked_reason"] = (
+        "corroboration unavailable: no current 13F share snapshot"
+    )
 
     ranked, blocked = score(
         pd.DataFrame([officer, manager]),
         {"officer:BURKE CEO": 0.30},
         {"AAPL": 100.0},
         watchlist={"manager:FUND A"},
+        enable_13f_corroboration=True,
     )
 
     assert ranked.empty

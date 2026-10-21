@@ -26,6 +26,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import duckdb
+import pytest
 
 from analyzer.freshness import (
     end_to_end_checks,
@@ -452,6 +453,146 @@ class OcrCronEngagementTest(TestCase):
         check = doctor_mod._ocr_cron_check(log_root, today=TODAY)
         self.assertTrue(check.ok, check.detail)
         self.assertIn("20261101", check.detail)
+
+
+def _ocr_start(stamp: str) -> str:
+    return f"ocr backlog start: {stamp} UTC (repo /fixture @ abc123)\n"
+
+
+def _ocr_skip(log_root: Path, stamp: str = "2026-11-01T03:30:00+00:00") -> str:
+    return _ocr_start(stamp) + (
+        f"another drain is running (lock: {log_root}/drain.lock); exiting\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "winner,modified,held,expected",
+    [
+        ("doctor exit=0\n", "2026-11-01T04:28:00+00:00", False, True),
+        ("doctor exit=3\n", "2026-11-01T04:28:00+00:00", False, False),
+        ("--- staging year 2020 ---\n", "2026-11-01T04:28:00+00:00", False, False),
+        # A completion before the skipped launch does not prove overlap.
+        ("doctor exit=0\n", "2026-11-01T02:28:00+00:00", False, False),
+        # Touching the log well past the winner's run budget is not completion evidence.
+        ("doctor exit=0\n", "2026-11-01T11:28:00+00:00", False, False),
+        # A lock still held at noon cannot revive an overnight truncated winner.
+        ("--- staging year 2020 ---\n", "2026-11-01T04:28:00+00:00", True, False),
+    ],
+)
+def test_ocr_cross_midnight_lock_skip_requires_fresh_overlapping_winner(
+    tmp_path, winner, modified, held, expected
+):
+    root = tmp_path / "logs"
+    run = _write_run_dir(
+        root, "20261031",
+        log_text=_ocr_start("2026-10-31T22:33:00+00:00") + winner,
+    )
+    stamp = datetime.fromisoformat(modified).timestamp()
+    os.utime(run / "run.log", (stamp, stamp))
+    _write_run_dir(root, "20261101", log_text=_ocr_skip(root))
+    with patch.object(doctor_mod, "_ocr_drain_lock_held", return_value=held):
+        check = doctor_mod._ocr_cron_check(root, today=TODAY, now=NOW)
+    assert check.ok is expected, check.detail
+    assert "lock-skipped" in check.detail
+    if expected:
+        assert "overlapping winner 20261031 completed with doctor exit=0" in check.detail
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_ocr_lock_skip_only_never_proves_work(tmp_path, held):
+    _write_run_dir(tmp_path, "20261101", log_text=_ocr_skip(tmp_path))
+    with patch.object(doctor_mod, "_ocr_drain_lock_held", return_value=held):
+        check = doctor_mod._ocr_cron_check(tmp_path, today=TODAY, now=NOW)
+    assert not check.ok, check.detail
+
+
+@pytest.mark.parametrize("held,staging,expected", [(True, True, True), (False, True, False), (True, False, False)])
+def test_ocr_lock_skip_active_winner_needs_bounded_timestamp_staging_and_lock(
+    tmp_path, held, staging, expected
+):
+    _write_run_dir(
+        tmp_path, "20261031",
+        log_text=_ocr_start("2026-10-31T22:33:00+00:00")
+        + ("--- staging year 2020 ---\n" if staging else ""),
+    )
+    _write_run_dir(tmp_path, "20261101", log_text=_ocr_skip(tmp_path))
+    now = datetime(2026, 11, 1, 4, tzinfo=timezone.utc).timestamp()
+    with patch.object(doctor_mod, "_ocr_drain_lock_held", return_value=held):
+        check = doctor_mod._ocr_cron_check(tmp_path, today=TODAY, now=now)
+    assert check.ok is expected, check.detail
+
+
+@pytest.mark.parametrize("tail,held,expected", [
+    ("", False, False),
+    ("--- staging year 2020 ---\n", False, False),
+    ("--- staging year 2020 ---\n", True, True),
+    ("doctor exit=4\n", False, False),
+    ("doctor exit=0\n", False, True),
+    ("  [PASS] cron.ocr.engagement: old doctor exit=0\n", False, False),
+])
+def test_ocr_latest_appended_invocation_cannot_inherit_old_success(
+    tmp_path, tail, held, expected
+):
+    run = _write_run_dir(
+        tmp_path, "20261101",
+        log_text=_ocr_start("2026-11-01T01:00:00+00:00") + "doctor exit=0\n"
+        + _ocr_start("2026-11-01T11:00:00+00:00") + tail,
+    )
+    os.utime(run, (NOW, NOW))
+    with patch.object(doctor_mod, "_ocr_drain_lock_held", return_value=held):
+        check = doctor_mod._ocr_cron_check(tmp_path, today=TODAY, now=NOW)
+    assert check.ok is expected, check.detail
+
+
+@pytest.mark.parametrize("trailing", ["", "doctor exit=0\n"])
+def test_ocr_same_file_skip_does_not_retimestamp_an_earlier_completion(tmp_path, trailing):
+    _write_run_dir(
+        tmp_path, "20261101",
+        log_text=_ocr_start("2026-11-01T01:00:00+00:00") + "doctor exit=0\n"
+        + _ocr_skip(tmp_path) + trailing,
+    )
+    check = doctor_mod._ocr_cron_check(tmp_path, today=TODAY, now=NOW)
+    assert not check.ok, check.detail
+
+
+def test_ocr_stale_winner_and_repeated_skips_do_not_keep_cron_alive(tmp_path):
+    run = _write_run_dir(
+        tmp_path, "20261029",
+        log_text=_ocr_start("2026-10-29T22:33:00+00:00") + "doctor exit=0\n",
+    )
+    os.utime(run / "run.log", (NOW, NOW))
+    _write_run_dir(tmp_path, "20261031", log_text=_ocr_skip(tmp_path, "2026-10-31T03:30:00+00:00"))
+    _write_run_dir(tmp_path, "20261101", log_text=_ocr_skip(tmp_path))
+    assert not doctor_mod._ocr_cron_check(tmp_path, today=TODAY, now=NOW).ok
+
+
+def test_ocr_latest_failed_winner_is_not_hidden_by_older_success(tmp_path):
+    run = _write_run_dir(
+        tmp_path, "20261031",
+        log_text=_ocr_start("2026-10-31T12:00:00+00:00") + "doctor exit=0\n"
+        + _ocr_start("2026-10-31T22:33:00+00:00") + "doctor exit=2\n",
+    )
+    stamp = datetime(2026, 11, 1, 4, tzinfo=timezone.utc).timestamp()
+    os.utime(run / "run.log", (stamp, stamp))
+    _write_run_dir(tmp_path, "20261101", log_text=_ocr_skip(tmp_path))
+    assert not doctor_mod._ocr_cron_check(tmp_path, today=TODAY, now=NOW).ok
+
+
+def test_ocr_truncated_timestamped_run_is_not_revived_by_directory_mtime(tmp_path):
+    run = _write_run_dir(
+        tmp_path, "20261101",
+        log_text=_ocr_start("2026-11-01T01:00:00+00:00") + "--- staging year 2020 ---\n",
+    )
+    os.utime(run, (NOW, NOW))
+    with patch.object(doctor_mod, "_ocr_drain_lock_held", return_value=False):
+        check = doctor_mod._ocr_cron_check(tmp_path, today=TODAY, now=NOW)
+    assert not check.ok, check.detail
+    assert "truncated" in check.detail
+
+
+def test_ocr_skip_for_another_lock_cannot_use_recent_directory_grace(tmp_path):
+    _write_run_dir(tmp_path, "20261101", log_text=_ocr_skip(tmp_path / "other"))
+    assert not doctor_mod._ocr_cron_check(tmp_path, today=TODAY, now=NOW).ok
 
 
 class MonitoringChecksContractTest(TestCase):

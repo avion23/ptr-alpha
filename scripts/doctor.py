@@ -71,7 +71,25 @@ OCR_CRON_RUN_MAX_AGE_DAYS = 2
 OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS = 7
 STAGING_BACKUP_MAX_AGE_DAYS = 8
 
-_DOCTOR_EXIT_RE = re.compile(r"doctor exit=(\d+)")
+_DOCTOR_EXIT_RE = re.compile(r"^doctor exit=(\d+)$", re.MULTILINE)
+_OCR_START_RE = re.compile(r"^ocr backlog start[^\n]*(?:\n|$)", re.MULTILINE)
+
+
+def _ocr_run_sessions(text: str) -> list[str]:
+    """The wrapper appends invocations; an old exit cannot finish a new one."""
+    starts = [match.start() for match in _OCR_START_RE.finditer(text)]
+    if not starts:
+        return [text]  # Legacy logs without a start header.
+    return [text[a:b] for a, b in zip(starts, [*starts[1:], len(text)])]
+
+
+def _ocr_run_start(text: str) -> float | None:
+    match = re.match(r"ocr backlog start: (\S+(?:Z|[+-]\d\d:\d\d)) UTC", text)
+    return _parse_stamp(match[1]) if match else None
+
+
+def _ocr_lock_skip(text: str) -> bool:
+    return "another drain is running" in text
 
 
 def check(
@@ -381,10 +399,10 @@ def _ocr_cron_check(
 ) -> FreshnessCheck:
     """The nightly drain (cron/backlog_ocr.sh) must leave fresh evidence.
 
-    A recent run directory without its final ``doctor exit=`` line is still
-    in progress: backlog_ocr.sh writes that line after this doctor check.
-    Older incomplete runs are truncated; completed runs older than two days
-    indicate a dead cron. Log inspection is read-only.
+    Inspect the latest appended invocation, not an earlier doctor's exit.
+    A lock skip needs a fresh overlapping winner, never just a new directory.
+    Ordinary recent incomplete runs retain the bounded in-progress grace:
+    backlog_ocr.sh writes its exit after this check. Inspection is read-only.
     """
     name = "cron.ocr.engagement"
     if not ocr_log_root.exists():
@@ -428,10 +446,20 @@ def _ocr_cron_check(
             "re-run cron/backlog_ocr.sh",
             False,
         )
+    sessions = _ocr_run_sessions(text)
+    text = sessions[-1]
+    if _ocr_lock_skip(text):
+        return _ocr_lock_skip_check(ocr_log_root, run_dirs, text, today, now)
+    start = _ocr_run_start(text)
+    if start is not None:
+        run_age_hours = (now - start) / 3600
     exits = _DOCTOR_EXIT_RE.findall(text)
     if not exits:
-        if run_age_hours <= OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS:
-            lock_held = _ocr_drain_lock_held(ocr_log_root)
+        recent = 0 <= run_age_hours <= OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS
+        lock_held = recent and _ocr_drain_lock_held(ocr_log_root)
+        # A later appended launch must not inherit an old success or a fresh
+        # directory mtime. Require the lock for its in-progress exception.
+        if recent and (len(sessions) == 1 or (start is not None and lock_held)):
             progress = (
                 "in progress (lock held)"
                 if lock_held
@@ -440,7 +468,8 @@ def _ocr_cron_check(
             return FreshnessCheck(
                 name,
                 f"OCR-drain run {newest.name} {progress}; no 'doctor exit=' "
-                f"line yet (run directory {run_age_hours:.1f}h old, "
+                f"line yet ({'invocation' if start is not None else 'run directory'} "
+                f"{run_age_hours:.1f}h old, "
                 f"in-progress limit {OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS}h)",
                 True,
             )
@@ -476,6 +505,67 @@ def _ocr_cron_check(
         f"'doctor exit={last_exit}'",
         True,
     )
+
+
+def _ocr_lock_skip_check(
+    log_root: Path, run_dirs: list[Path], skipped: str, today: date, now: float
+) -> FreshnessCheck:
+    """A skipped launch is engagement only with concrete overlapping work.
+
+    Completion uses the final winner log's mtime as its upper bound. Within
+    the same file that timestamp is contaminated by the skip append, so a
+    preceding completion cannot prove overlap. Interleaved output is likewise
+    ambiguous and fails closed; no attempt to reconstruct concurrent writers.
+    """
+    name = "cron.ocr.engagement"
+    prefix = f"OCR-drain run {run_dirs[-1].name} lock-skipped; "
+    failure = "no verified fresh overlapping winner (failed, stale, truncated or ambiguous evidence)"
+    skip_start = _ocr_run_start(skipped)
+    skip_line = f"another drain is running (lock: {log_root}/drain.lock); exiting"
+    if (skip_start is None or len(skipped.splitlines()) != 2
+            or skipped.splitlines()[1] != skip_line):
+        return FreshnessCheck(name, prefix + failure, False)
+    for run_dir in reversed(run_dirs):
+        run_log = run_dir / "run.log"
+        try:
+            sessions = _ocr_run_sessions(run_log.read_text(encoding="utf-8", errors="replace"))
+            modified = run_log.stat().st_mtime
+        except OSError as exc:
+            return FreshnessCheck(name, prefix + f"cannot inspect winner {run_log}: {exc}", False)
+        for session in reversed(sessions):
+            if _ocr_lock_skip(session):
+                if len(session.splitlines()) != 2 or session.splitlines()[1] != skip_line:
+                    return FreshnessCheck(name, prefix + failure, False)
+                continue
+            start = _ocr_run_start(session)
+            exits = _DOCTOR_EXIT_RE.findall(session)
+            try:
+                age_days = (today - datetime.strptime(run_dir.name, "%Y%m%d").date()).days
+            except ValueError:
+                return FreshnessCheck(name, prefix + failure, False)
+            if (start is None or not start <= skip_start <= now
+                    or not 0 <= age_days <= OCR_CRON_RUN_MAX_AGE_DAYS):
+                return FreshnessCheck(name, prefix + failure, False)
+            if exits:
+                # Only the last non-skipped invocation may vouch for the skip.
+                # A previous success must not hide this winner's failure.
+                if (int(exits[-1]) == 0 and run_dir != run_dirs[-1]
+                        and not _ocr_lock_skip(sessions[-1])
+                        and skip_start <= modified <= now
+                        and 0 <= modified - start <= OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS * 3600):
+                    return FreshnessCheck(
+                        name, prefix + f"overlapping winner {run_dir.name} completed "
+                        "with doctor exit=0 (fresh completion evidence)", True,
+                    )
+            elif (now - start <= OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS * 3600
+                    and re.search(r"^--- staging year \d+", session, re.MULTILINE)
+                    and _ocr_drain_lock_held(log_root)):
+                return FreshnessCheck(
+                    name, prefix + f"overlapping winner {run_dir.name} in progress "
+                    "(lock held, timestamped staging within in-progress limit)", True,
+                )
+            return FreshnessCheck(name, prefix + f"winner {run_dir.name}: " + failure, False)
+    return FreshnessCheck(name, prefix + failure, False)
 
 
 def _ocr_drain_lock_held(ocr_log_root: Path) -> bool:

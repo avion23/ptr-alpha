@@ -22,11 +22,20 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 from pathlib import Path
 
 import pytest
 
 from scripts import audit_sample
+
+
+def tiny_png(color="white"):
+    from PIL import Image
+
+    output = io.BytesIO()
+    Image.new("RGB", (2, 2), color).save(output, format="PNG")
+    return output.getvalue()
 
 
 def test_attempt_bundles_preserve_old_evidence(data_dir, monkeypatch):
@@ -40,7 +49,7 @@ def test_attempt_bundles_preserve_old_evidence(data_dir, monkeypatch):
         assert snapshot.read_bytes() == pdf
         out_dir.mkdir()
         page = out_dir / "page-1.png"
-        page.write_bytes(b"\x89PNG\r\n\x1a\npixels")
+        page.write_bytes(tiny_png())
         return [page]
 
     monkeypatch.setattr(audit_sample, "render_pdf_pages", render)
@@ -92,7 +101,7 @@ def test_attempt_bundles_preserve_old_evidence(data_dir, monkeypatch):
         audit_sample.record_verdict(data_dir, "attempt", "pass", attempt_scoped=True)
     assert path.read_bytes() == before
     assert (root / audit_sample.AUDIT_RESULTS_NAME).read_bytes() == history_bytes
-    page.write_bytes(b"\x89PNG\r\n\x1a\npixels")
+    page.write_bytes(tiny_png())
     inode = second_record.stat().st_ino
     monkeypatch.setattr(audit_sample, "render_pdf_pages", lambda *a: pytest.fail("must reuse, not rerender"))
     assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True) == []
@@ -102,6 +111,8 @@ def test_attempt_bundles_preserve_old_evidence(data_dir, monkeypatch):
     assert entry["parsed_at_utc"] == record["parsed_at_utc"]
     assert entry["review_bundle_record"] == str(second_record.relative_to(data_dir))
     assert glm_stage.verdict_binding(data_dir, "attempt", json.loads(path.read_text())) == (True, None)
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True) == []
+    assert second_record.read_bytes() == original  # live audit stamp is excluded, frozen bytes are not
     assert audit_sample.load_audit_results(data_dir) == old_history + [entry]
     assert (first / "record.json").read_bytes() == first_bytes
     assert lot_path.read_bytes() == lot_bytes
@@ -197,6 +208,100 @@ def test_attempt_bundle_failed_render_does_not_publish(data_dir, monkeypatch):
         [{"year": 2024, "doc_id": "failed"}], data_dir, attempt_scoped=True,
     ) == ["failed: render failed"]
     directory = audit_sample._attempt_bundle_dir(data_dir, 2024, "failed", record)
+    assert not directory.exists()
+    assert list(directory.parent.iterdir()) == []
+
+
+@pytest.mark.parametrize("mutation", [
+    "different-png", "header-only", "truncated-png", "missing-seal", "corrupt-seal",
+    "schema", "pdf_sha256", "staged_record_sha256", "record_file_sha256",
+    "prompt_sha256", "parsed_at_utc", "doc_id", "year", "page_count", "page-order",
+    "page-size", "page-hash", "page-filename", "extra-page", "missing-page",
+    "frozen-record-bytes",
+])
+def test_attempt_bundle_seal_rejects_changed_payload_before_writes(data_dir, monkeypatch, mutation):
+    from scripts import glm_stage, gemini_ocr_common
+
+    record = make_record("sealed")
+    record["pages"] = 2
+    record["pdf_sha256"] = hashlib.sha256(b"PDF").hexdigest()
+    live = write_record(data_dir, record)
+    monkeypatch.setattr(glm_stage, "manifest_artifact", lambda *a: (Path("source.pdf"), {"pdf_bytes": b"PDF"}))
+    monkeypatch.setattr(gemini_ocr_common, "pdf_page_count", lambda *a: 2)
+
+    def render(snapshot, out_dir):
+        out_dir.mkdir()
+        for number, color in enumerate(("white", "black"), 1):
+            (out_dir / f"page-{number}.png").write_bytes(tiny_png(color))
+
+    monkeypatch.setattr(audit_sample, "render_pdf_pages", render)
+    sample = [{"year": 2024, "doc_id": "sealed"}]
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True) == []
+    directory = audit_sample._attempt_bundle_dir(data_dir, 2024, "sealed", record)
+    seal_path = directory / "bundle-seal.json"
+    seal = json.loads(seal_path.read_text())
+    assert seal["record_file_sha256"] == hashlib.sha256((directory / "record.json").read_bytes()).hexdigest()
+    assert [p["filename"] for p in seal["pages"]] == ["page-1.png", "page-2.png"]
+    monkeypatch.setattr(audit_sample, "render_pdf_pages", lambda *a: pytest.fail("must not rerender existing bundle"))
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True) == []
+    page = directory / "pages/page-1.png"
+    if mutation == "different-png":
+        page.write_bytes(tiny_png("red"))
+    elif mutation == "header-only":
+        page.write_bytes(b"\x89PNG\r\n\x1a\n")
+    elif mutation == "truncated-png":
+        page.write_bytes(tiny_png()[:-15])
+    elif mutation == "missing-seal":
+        seal_path.unlink()
+    elif mutation == "corrupt-seal":
+        seal_path.write_text("{broken")
+    elif mutation == "extra-page":
+        (directory / "pages/page-3.png").write_bytes(tiny_png())
+    elif mutation == "missing-page":
+        page.unlink()
+    elif mutation == "frozen-record-bytes":
+        with (directory / "record.json").open("ab") as handle:
+            handle.write(b"\n")  # same stable content, different sealed file bytes
+    else:
+        if mutation == "page-order":
+            seal["pages"].reverse()
+        elif mutation.startswith("page-"):
+            field = {"page-size": "size", "page-hash": "sha256", "page-filename": "filename"}[mutation]
+            seal["pages"][0][field] = "../outside.png" if field == "filename" else "wrong"
+        else:
+            seal[mutation] = "wrong"
+        seal_path.write_text(json.dumps(seal))
+    history = audit_sample.staging_root(data_dir) / audit_sample.AUDIT_RESULTS_NAME
+    history.write_text('[{"doc_id": "legacy", "verdict": "fail"}]')
+    before_live, before_history = live.read_bytes(), history.read_bytes()
+    before_bundle = {p.relative_to(directory): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True)
+    with pytest.raises(ValueError):
+        audit_sample.record_verdict(data_dir, "sealed", "pass", attempt_scoped=True)
+    assert live.read_bytes() == before_live
+    assert history.read_bytes() == before_history
+    assert {p.relative_to(directory): p.read_bytes() for p in directory.rglob("*") if p.is_file()} == before_bundle
+    assert glm_stage.verdict_binding(data_dir, "sealed", record)[0] is False
+
+
+def test_attempt_bundle_initial_truncated_png_never_published(data_dir, monkeypatch):
+    from scripts import glm_stage, gemini_ocr_common
+
+    record = make_record("truncated")
+    record["pdf_sha256"] = hashlib.sha256(b"PDF").hexdigest()
+    write_record(data_dir, record)
+    monkeypatch.setattr(glm_stage, "manifest_artifact", lambda *a: (Path("source.pdf"), {"pdf_bytes": b"PDF"}))
+    monkeypatch.setattr(gemini_ocr_common, "pdf_page_count", lambda *a: 1)
+
+    def render(snapshot, out_dir):
+        out_dir.mkdir()
+        (out_dir / "page-1.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    monkeypatch.setattr(audit_sample, "render_pdf_pages", render)
+    assert audit_sample.emit_review_bundle(
+        [{"year": 2024, "doc_id": "truncated"}], data_dir, attempt_scoped=True,
+    )
+    directory = audit_sample._attempt_bundle_dir(data_dir, 2024, "truncated", record)
     assert not directory.exists()
     assert list(directory.parent.iterdir()) == []
 

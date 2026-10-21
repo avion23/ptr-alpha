@@ -101,6 +101,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import io
 import json
 import math
 import os
@@ -633,24 +634,59 @@ def _attempt_bundle_dir(data_dir, year: int, doc_id: str, record: dict) -> Path:
             / doc_id / staged_record_sha256(record))
 
 
-def _validate_attempt_bundle(data_dir, doc_dir: Path, record: dict) -> None:
+def _attempt_bundle_seal(data_dir, doc_dir: Path, record: dict) -> dict:
+    # Pillow is already used by OCR tooling and required by pdf2image/pytesseract.
+    from PIL import Image
     from scripts.ocr_zero_rows import read_work_artifact
 
     try:
-        reviewed = json.loads(read_work_artifact(data_dir, doc_dir / "record.json"))
+        record_bytes = read_work_artifact(data_dir, doc_dir / "record.json")
+        reviewed = json.loads(record_bytes)
         if not isinstance(reviewed, dict) or staged_record_sha256(reviewed) != staged_record_sha256(record):
             raise ValueError("staged attempt changed since review bundle")
         count = record.get("pages")
         if type(count) is not int or count <= 0:
             raise ValueError("attempt bundle requires a positive staged page count")
-        pages = list((doc_dir / "pages").glob("page-*.png"))
-        if len(pages) != count or sorted(int(p.stem.rsplit("-", 1)[1]) for p in pages) != list(range(1, count + 1)):
-            raise ValueError("attempt bundle pages are incomplete")
-        for page in pages:
-            if not read_work_artifact(data_dir, page).startswith(b"\x89PNG\r\n\x1a\n"):
-                raise ValueError("attempt bundle page is not a PNG")
-    except (OSError, RuntimeError, TypeError, json.JSONDecodeError) as exc:
+        names = [f"page-{number:0{len(str(count))}d}.png" for number in range(1, count + 1)]
+        if sorted(p.name for p in (doc_dir / "pages").iterdir()) != sorted(names):
+            raise ValueError("attempt bundle pages are incomplete or unexpected")
+        pages = []
+        for name in names:
+            content = read_work_artifact(data_dir, doc_dir / "pages" / name)
+            with Image.open(io.BytesIO(content)) as image:
+                if image.format != "PNG":
+                    raise ValueError("attempt bundle page is not a PNG")
+                image.verify()
+            with Image.open(io.BytesIO(content)) as image:
+                image.load()
+            pages.append({"filename": name, "sha256": hashlib.sha256(content).hexdigest(), "size": len(content)})
+        return {
+            "schema": "audit-review-attempt-seal-v1",
+            "doc_id": record["doc_id"],
+            "year": record["year"],
+            "pdf_sha256": record.get("pdf_sha256"),
+            "prompt_sha256": record.get("prompt_sha256"),
+            "parsed_at_utc": record.get("parsed_at_utc"),
+            "staged_record_sha256": staged_record_sha256(record),
+            "record_file_sha256": hashlib.sha256(record_bytes).hexdigest(),
+            "page_count": count,
+            "pages": pages,
+        }
+    except (OSError, RuntimeError, TypeError, SyntaxError, Image.DecompressionBombError, json.JSONDecodeError) as exc:
         raise ValueError(f"unreadable attempt bundle: {exc}") from exc
+
+
+def _validate_attempt_bundle(data_dir, doc_dir: Path, record: dict) -> None:
+    """Detect changed payloads, not hostile replacement of both seal and payload."""
+    from scripts.ocr_zero_rows import read_work_artifact
+
+    try:
+        seal = json.loads(read_work_artifact(data_dir, doc_dir / "bundle-seal.json"))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"unreadable attempt bundle seal: {exc}") from exc
+    expected = _attempt_bundle_seal(data_dir, doc_dir, record)
+    if json.dumps(seal, sort_keys=True) != json.dumps(expected, sort_keys=True):
+        raise ValueError("attempt bundle seal does not match current record and frozen pixels")
 
 
 def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
@@ -689,6 +725,9 @@ def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
             (temporary / "record.json").write_bytes(record_bytes)
             # Validate through the approved root before publishing the completed directory.
             rooted_temporary = doc_dir.parent / temporary.name
+            seal = _attempt_bundle_seal(data_dir, rooted_temporary, record)
+            with (temporary / "bundle-seal.json").open("x", encoding="utf-8") as handle:
+                json.dump(seal, handle, indent=2, sort_keys=True)
             _validate_attempt_bundle(data_dir, rooted_temporary, record)
             if os.path.lexists(doc_dir):
                 raise ValueError("attempt bundle appeared during rendering; refusing to replace")

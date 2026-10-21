@@ -21,11 +21,184 @@ never opened and no model calls are made.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
 
 from scripts import audit_sample
+
+
+def test_attempt_bundles_preserve_old_evidence(data_dir, monkeypatch):
+    from scripts import glm_stage, gemini_ocr_common
+
+    pdf = b"frozen PDF snapshot"
+    monkeypatch.setattr(glm_stage, "manifest_artifact", lambda *a: (Path("source.pdf"), {"pdf_bytes": pdf}))
+    monkeypatch.setattr(gemini_ocr_common, "pdf_page_count", lambda *a: 1)
+
+    def render(snapshot, out_dir):
+        assert snapshot.read_bytes() == pdf
+        out_dir.mkdir()
+        page = out_dir / "page-1.png"
+        page.write_bytes(b"\x89PNG\r\n\x1a\npixels")
+        return [page]
+
+    monkeypatch.setattr(audit_sample, "render_pdf_pages", render)
+    record = make_record("attempt")
+    record["pdf_sha256"] = hashlib.sha256(pdf).hexdigest()
+    path = write_record(data_dir, record)
+    root = audit_sample.staging_root(data_dir)
+    sample = [{"year": 2024, "doc_id": "attempt"}]
+    envelope = write_envelope(data_dir)
+    lot_path = root / "audit-sample-1.json"
+    lot_bytes = lot_path.read_bytes()
+    assert audit_sample.emit_review_bundle(sample, data_dir) == []
+    legacy = root / "audit-review/2024/attempt"
+    legacy_bytes = {p.relative_to(legacy): p.read_bytes() for p in legacy.rglob("*") if p.is_file()}
+    audit_sample.record_verdict(data_dir, "attempt", "fail", "old pixels failed")
+    audit_sample.record_verdict(data_dir, "attempt", "pass", "old attempt rechecked")
+    old_history = audit_sample.load_audit_results(data_dir)
+
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True) == []
+    first = audit_sample._attempt_bundle_dir(data_dir, 2024, "attempt", record)
+    first_bytes = (first / "record.json").read_bytes()
+    record["parsed_at_utc"] = "2026-10-21T01:00:00Z"
+    record["rows"] = [["new", "P", "2024-01-01", "2024-01-02", "A"]]
+    write_record(data_dir, record)
+    assert glm_stage.verdict_binding(data_dir, "attempt", record)[0] is False
+    before = path.read_bytes()
+    history_bytes = (root / audit_sample.AUDIT_RESULTS_NAME).read_bytes()
+    with pytest.raises(ValueError, match="changed since review"):
+        audit_sample.record_verdict(data_dir, "attempt", "pass")
+    with pytest.raises(ValueError, match="unreadable attempt bundle"):
+        audit_sample.record_verdict(data_dir, "attempt", "pass", attempt_scoped=True)
+    assert path.read_bytes() == before
+    assert (root / audit_sample.AUDIT_RESULTS_NAME).read_bytes() == history_bytes
+
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True) == []
+    second = audit_sample._attempt_bundle_dir(data_dir, 2024, "attempt", record)
+    second_record = second / "record.json"
+    page = second / "pages/page-1.png"
+    original = second_record.read_bytes()
+    second_record.write_bytes(first_bytes)
+    with pytest.raises(ValueError, match="changed since review"):
+        audit_sample.record_verdict(data_dir, "attempt", "pass", attempt_scoped=True)
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True)
+    assert second_record.read_bytes() == first_bytes  # never repaired/replaced
+    second_record.write_bytes(original)
+    page.unlink()
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True)
+    with pytest.raises(ValueError, match="incomplete"):
+        audit_sample.record_verdict(data_dir, "attempt", "pass", attempt_scoped=True)
+    assert path.read_bytes() == before
+    assert (root / audit_sample.AUDIT_RESULTS_NAME).read_bytes() == history_bytes
+    page.write_bytes(b"\x89PNG\r\n\x1a\npixels")
+    inode = second_record.stat().st_ino
+    monkeypatch.setattr(audit_sample, "render_pdf_pages", lambda *a: pytest.fail("must reuse, not rerender"))
+    assert audit_sample.emit_review_bundle(sample, data_dir, attempt_scoped=True) == []
+    assert second_record.stat().st_ino == inode
+    entry = audit_sample.record_verdict(data_dir, "attempt", "pass", attempt_scoped=True)["entry"]
+    assert entry["staged_record_sha256"] == audit_sample.staged_record_sha256(record)
+    assert entry["parsed_at_utc"] == record["parsed_at_utc"]
+    assert entry["review_bundle_record"] == str(second_record.relative_to(data_dir))
+    assert glm_stage.verdict_binding(data_dir, "attempt", json.loads(path.read_text())) == (True, None)
+    assert audit_sample.load_audit_results(data_dir) == old_history + [entry]
+    assert (first / "record.json").read_bytes() == first_bytes
+    assert lot_path.read_bytes() == lot_bytes
+    assert {p.relative_to(legacy): p.read_bytes() for p in legacy.rglob("*") if p.is_file()} == legacy_bytes
+    report = audit_sample.build_report(
+        audit_sample.load_audit_results(data_dir), {"attempt": record["rows"]}, set(),
+        lot=envelope["lot"], staged_records_by_doc={"attempt": record},
+        frame_counts_by_year=envelope["frame_counts_by_year"],
+        frame_counts_by_stratum=envelope["frame_counts_by_stratum"],
+    )
+    assert report["critical_failure_count"] == 1
+    assert report["repaired_count"] == 1
+    assert report["budget_met"] is False
+    assert report["caveat"] == audit_sample.CAVEAT
+
+
+@pytest.mark.parametrize("payload", [b"{broken", b"{}", b"null", b"[1]", b"\xff"])
+def test_corrupt_history_refuses_before_stamping(data_dir, payload):
+    path = write_record(data_dir, make_record("history"))
+    before = path.read_bytes()
+    history = audit_sample.staging_root(data_dir) / audit_sample.AUDIT_RESULTS_NAME
+    history.write_bytes(payload)
+    with pytest.raises(ValueError):
+        audit_sample.record_verdict(data_dir, "history", "pass")
+    assert path.read_bytes() == before
+    assert history.read_bytes() == payload
+
+
+def test_unreadable_history_refuses_before_stamping(data_dir, monkeypatch):
+    from scripts import ocr_zero_rows
+
+    path = write_record(data_dir, make_record("history"))
+    before = path.read_bytes()
+    history = audit_sample.staging_root(data_dir) / audit_sample.AUDIT_RESULTS_NAME
+    history.write_text('[{"legacy": true}]')
+    history_bytes = history.read_bytes()
+    read = ocr_zero_rows.read_work_artifact
+
+    def unreadable(root, candidate):
+        if candidate.name == audit_sample.AUDIT_RESULTS_NAME:
+            raise PermissionError("unreadable history")
+        return read(root, candidate)
+
+    monkeypatch.setattr(ocr_zero_rows, "read_work_artifact", unreadable)
+    with pytest.raises(ValueError, match="unreadable audit history"):
+        audit_sample.record_verdict(data_dir, "history", "pass")
+    assert path.read_bytes() == before
+    assert history.read_bytes() == history_bytes
+
+
+def test_append_preserves_legacy_dictionaries(data_dir):
+    path = write_record(data_dir, make_record("history"))
+    history = audit_sample.staging_root(data_dir) / audit_sample.AUDIT_RESULTS_NAME
+    legacy = [{"unknown": 1}, {"doc_id": "old", "verdict": "fail"}, {}]
+    history.write_text(json.dumps(legacy))
+    audit_sample.record_verdict(data_dir, "history", "pass")
+    assert json.loads(history.read_text())[:-1] == legacy
+    assert json.loads(path.read_text())["audit"] == "pass"
+
+
+def test_attempt_bundle_refuses_symlink_parent_and_missing_live(data_dir, tmp_path):
+    record = make_record("bound")
+    write_record(data_dir, record)
+    root = audit_sample.staging_root(data_dir)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "audit-review-attempts").symlink_to(outside, target_is_directory=True)
+    assert audit_sample.emit_review_bundle(
+        [{"year": 2024, "doc_id": "bound"}], data_dir, attempt_scoped=True,
+    )
+    assert list(outside.iterdir()) == []
+    with pytest.raises(ValueError):
+        audit_sample.record_verdict(data_dir, "bound", "pass", attempt_scoped=True)
+    with pytest.raises(ValueError, match="current staging record"):
+        audit_sample.record_verdict(data_dir, "absent", "pass", attempt_scoped=True)
+    assert not (root / audit_sample.AUDIT_RESULTS_NAME).exists()
+
+
+def test_attempt_bundle_failed_render_does_not_publish(data_dir, monkeypatch):
+    from scripts import glm_stage, gemini_ocr_common
+
+    record = make_record("failed")
+    record["pdf_sha256"] = hashlib.sha256(b"PDF").hexdigest()
+    write_record(data_dir, record)
+    monkeypatch.setattr(glm_stage, "manifest_artifact", lambda *a: (Path("source.pdf"), {"pdf_bytes": b"PDF"}))
+    monkeypatch.setattr(gemini_ocr_common, "pdf_page_count", lambda *a: 1)
+
+    def fail(*args):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(audit_sample, "render_pdf_pages", fail)
+    assert audit_sample.emit_review_bundle(
+        [{"year": 2024, "doc_id": "failed"}], data_dir, attempt_scoped=True,
+    ) == ["failed: render failed"]
+    directory = audit_sample._attempt_bundle_dir(data_dir, 2024, "failed", record)
+    assert not directory.exists()
+    assert list(directory.parent.iterdir()) == []
 
 
 # --------------------------------------------------------------------------

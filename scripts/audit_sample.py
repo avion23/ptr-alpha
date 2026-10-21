@@ -103,11 +103,13 @@ import datetime
 import hashlib
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack
 from collections import Counter
 from pathlib import Path
 
@@ -622,23 +624,106 @@ def render_pdf_pages(pdf_path: str | Path, out_dir: Path, dpi: int = RENDER_DPI)
     return [png for _, png in pages]
 
 
+def _attempt_bundle_dir(data_dir, year: int, doc_id: str, record: dict) -> Path:
+    if not 1000 <= year <= 9999 or Path(doc_id).name != doc_id or doc_id in ("", ".", ".."):
+        raise ValueError("invalid attempt bundle identity")
+    if record.get("doc_id") != doc_id or record.get("year") != year:
+        raise ValueError("staging record identity does not match audit sample")
+    return (staging_root(data_dir) / "audit-review-attempts" / str(year)
+            / doc_id / staged_record_sha256(record))
+
+
+def _validate_attempt_bundle(data_dir, doc_dir: Path, record: dict) -> None:
+    from scripts.ocr_zero_rows import read_work_artifact
+
+    try:
+        reviewed = json.loads(read_work_artifact(data_dir, doc_dir / "record.json"))
+        if not isinstance(reviewed, dict) or staged_record_sha256(reviewed) != staged_record_sha256(record):
+            raise ValueError("staged attempt changed since review bundle")
+        count = record.get("pages")
+        if type(count) is not int or count <= 0:
+            raise ValueError("attempt bundle requires a positive staged page count")
+        pages = list((doc_dir / "pages").glob("page-*.png"))
+        if len(pages) != count or sorted(int(p.stem.rsplit("-", 1)[1]) for p in pages) != list(range(1, count + 1)):
+            raise ValueError("attempt bundle pages are incomplete")
+        for page in pages:
+            if not read_work_artifact(data_dir, page).startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ValueError("attempt bundle page is not a PNG")
+    except (OSError, RuntimeError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable attempt bundle: {exc}") from exc
+
+
+def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
+    from scripts.glm_stage import manifest_artifact
+    from scripts.gemini_ocr_common import pdf_page_count
+
+    if not render:
+        raise ValueError("attempt-scoped bundles require rendered pages")
+    record = json.loads(record_bytes)
+    doc_dir = _attempt_bundle_dir(data_dir, year, doc_id, record)
+    # Sole audit writer required: pin every publication parent, never follow symlinks.
+    with ExitStack() as stack:
+        fd = data_dir.fd
+        for part in doc_dir.parent.relative_to(Path(data_dir)).parts:
+            try:
+                os.mkdir(part, dir_fd=fd)
+            except FileExistsError:
+                pass
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            stack.callback(os.close, fd)
+        if os.path.lexists(doc_dir):
+            _validate_attempt_bundle(data_dir, doc_dir, record)
+            return
+        pdf_path, identity = manifest_artifact(record, data_dir)
+        pdf_bytes = identity["pdf_bytes"]
+        if hashlib.sha256(pdf_bytes).hexdigest() != record.get("pdf_sha256"):
+            raise ValueError("audit snapshot SHA-256 does not match staged artifact")
+        with tempfile.TemporaryDirectory(prefix=".audit-attempt-", dir=f"/proc/{os.getpid()}/fd/{fd}") as directory:
+            temporary = Path(directory)
+            snapshot = temporary / pdf_path.name
+            snapshot.write_bytes(pdf_bytes)
+            if pdf_page_count(snapshot) != record.get("pages"):
+                raise ValueError("staged page count does not match PDF")
+            render_pdf_pages(snapshot, temporary / "pages")
+            snapshot.unlink()
+            (temporary / "record.json").write_bytes(record_bytes)
+            # Validate through the approved root before publishing the completed directory.
+            rooted_temporary = doc_dir.parent / temporary.name
+            _validate_attempt_bundle(data_dir, rooted_temporary, record)
+            if os.path.lexists(doc_dir):
+                raise ValueError("attempt bundle appeared during rendering; refusing to replace")
+            os.rename(temporary.name, doc_dir.name, src_dir_fd=fd, dst_dir_fd=fd)
+
+
 def emit_review_bundle(
     sample: list[dict],
     data_dir: str | Path = "data",
     *,
     render=True,
+    attempt_scoped: bool = False,
 ) -> list[str]:
-    """Write audit-review/<year>/<doc_id>/{page-*.png, record.json}."""
+    """Write legacy bundles, or explicit immutable SHA-scoped attempt bundles.
+
+    Attempt bundles never replace old bundles or freeze/rebind sample lots.
+    Emit and record operations require a sole-writer maintenance window.
+    """
     from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, read_work_artifact
 
     if not isinstance(data_dir, ApprovedDataRoot):
         with approved_data_root(data_dir) as root:
-            return emit_review_bundle(sample, root, render=render)
+            return emit_review_bundle(sample, root, render=render, attempt_scoped=attempt_scoped)
     problems = []
     bundle_root = staging_root(data_dir) / "audit-review"
     for item in sample:
         year, doc_id = int(item["year"]), str(item["doc_id"])
         record_path = staging_root(data_dir) / str(year) / f"{doc_id}.json"
+        if attempt_scoped:
+            try:
+                _attempt_bundle_dir(data_dir, year, doc_id, {"doc_id": doc_id, "year": year})
+                _emit_attempt_bundle(data_dir, year, doc_id, read_work_artifact(data_dir, record_path), render=render)
+            except Exception as exc:
+                problems.append(f"{doc_id}: {exc}")
+            continue
         doc_dir = bundle_root / str(year) / doc_id
         if doc_dir.exists():
             shutil.rmtree(doc_dir)
@@ -679,7 +764,7 @@ def cmd_sample(args) -> int:
         out_path=out_path,
     )
     problems = (
-        emit_review_bundle(sample, args.data_dir)
+        emit_review_bundle(sample, args.data_dir, attempt_scoped=args.attempt_scoped)
         if not args.no_bundle
         else []
     )
@@ -702,7 +787,7 @@ def cmd_sample(args) -> int:
         print(f"  {item['year']}/{item['doc_id']} sha={item['staged_record_sha256'][:12]}")
     for problem in problems:
         print(f"  bundle problem: {problem}", file=sys.stderr)
-    return 0
+    return 2 if args.attempt_scoped and problems else 0
 
 
 # --------------------------------------------------------------------------
@@ -716,6 +801,8 @@ def record_verdict(
     verdict: str,
     notes: str = "",
     severity: str = "critical",
+    *,
+    attempt_scoped: bool = False,
 ) -> dict:
     """APPEND an audit result to the history and stamp the staging record.
 
@@ -730,6 +817,10 @@ def record_verdict(
 
     If a review bundle exists, that immutable reviewed attempt must still
     match; a verdict on its pixels cannot authorize a newer live JSON record.
+    ``attempt_scoped`` requires the current SHA-derived bundle and all its
+    pages; it never falls back to the legacy bundle. History must be a JSON
+    list of dictionaries (legacy dictionaries retain their fields/order).
+    The caller must ensure a sole-writer maintenance window.
 
     ``severity`` (default ``critical``) classifies a FAIL per the
     owner-approved error budget: ``cosmetic`` = asset-description TEXT
@@ -746,10 +837,23 @@ def record_verdict(
     if not isinstance(data_dir, ApprovedDataRoot):
         Path(data_dir).mkdir(parents=True, exist_ok=True)
         with approved_data_root(data_dir) as approved:
-            return record_verdict(approved, doc_id, verdict, notes, severity)
+            return record_verdict(approved, doc_id, verdict, notes, severity, attempt_scoped=attempt_scoped)
     root = staging_root(data_dir)
+    results_path = root / AUDIT_RESULTS_NAME
+    try:
+        results = json.loads(read_work_artifact(data_dir, results_path))
+    except FileNotFoundError:
+        results = []
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"unreadable audit history; refusing to append: {exc}") from exc
+    # Legacy dictionaries need no new fields; preserve their contents and order.
+    if not isinstance(results, list) or any(not isinstance(entry, dict) for entry in results):
+        raise ValueError("audit history must be a list of dictionaries; refusing to append")
+    if attempt_scoped and (Path(doc_id).name != doc_id or doc_id in ("", ".", "..")):
+        raise ValueError("invalid attempt bundle identity")
 
     found_year = None
+    reviewed_path = None
     stable_sha = None
     identity = {field: None for field in ("pdf_sha256", "prompt_sha256", "parsed_at_utc")}
     for year_dir in sorted(root.glob("[0-9]" * 4)):
@@ -757,7 +861,11 @@ def record_verdict(
         if path.exists():
             record = json.loads(read_work_artifact(data_dir, path))
             reviewed_path = root / "audit-review" / year_dir.name / str(doc_id) / "record.json"
-            if reviewed_path.exists():
+            if attempt_scoped:
+                doc_dir = _attempt_bundle_dir(data_dir, int(year_dir.name), doc_id, record)
+                _validate_attempt_bundle(data_dir, doc_dir, record)
+                reviewed_path = doc_dir / "record.json"
+            elif reviewed_path.exists():
                 reviewed = json.loads(read_work_artifact(data_dir, reviewed_path))
                 if staged_record_sha256(reviewed) != staged_record_sha256(record):
                     raise ValueError("staged attempt changed since review bundle; regenerate review before recording a verdict")
@@ -773,6 +881,8 @@ def record_verdict(
             _atomic_write_json(path, record)
             found_year = int(year_dir.name)
             break
+    if attempt_scoped and found_year is None:
+        raise ValueError("attempt-scoped review requires a current staging record")
     audited_at = utc_now_iso()
     entry = {
         "doc_id": str(doc_id),
@@ -785,15 +895,8 @@ def record_verdict(
         "prompt_sha256": identity["prompt_sha256"],
         "parsed_at_utc": identity["parsed_at_utc"],
     }
-    results_path = root / AUDIT_RESULTS_NAME
-    results = []
-    if results_path.exists():
-        try:
-            loaded = json.loads(results_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, list):
-                results = loaded
-        except (OSError, json.JSONDecodeError):
-            results = []
+    if attempt_scoped:
+        entry["review_bundle_record"] = str(reviewed_path.relative_to(Path(data_dir)))
     results.append(entry)
     _atomic_write_json(results_path, results)
 
@@ -803,7 +906,8 @@ def record_verdict(
 def cmd_record(args) -> int:
     try:
         result = record_verdict(
-            args.data_dir, args.doc_id, args.verdict, args.notes, args.severity
+            args.data_dir, args.doc_id, args.verdict, args.notes, args.severity,
+            attempt_scoped=args.attempt_scoped,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1855,6 +1959,10 @@ def main(argv: list[str] | None = None) -> int:
     p_sample.add_argument("--per-year", type=int, default=25)
     p_sample.add_argument("--seed", type=int, default=20261018)
     p_sample.add_argument(
+        "--attempt-scoped", action="store_true",
+        help="emit immutable audit-review-attempts/<year>/<doc>/<stable-sha> bundles",
+    )
+    p_sample.add_argument(
         "--no-bundle", action="store_true", help="skip rendering the review bundle"
     )
 
@@ -1872,6 +1980,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_record.add_argument("--notes", default="")
+    p_record.add_argument(
+        "--attempt-scoped", action="store_true",
+        help="require the complete current SHA-scoped bundle; never use legacy review",
+    )
 
     p_report = subparsers.add_parser(
         "report",

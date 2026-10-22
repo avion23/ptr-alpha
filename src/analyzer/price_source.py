@@ -453,11 +453,15 @@ def _store_generation(db, ticker, generation, series, factors, basis) -> str:
         rows.append((ticker, generation, pd.Timestamp(day).date(), float(close),
                      float(factor) if pd.notna(factor) else None, basis))
     if rows:
-        db.conn.executemany(
-            "INSERT INTO price_generation_values VALUES (?,?,?,?,?,?) "
+        # One set-based insert avoids per-row autocommits on disk-backed stores.
+        db.conn.execute(
+            "INSERT INTO price_generation_values "
+            "SELECT unnest(?::VARCHAR[]), unnest(?::VARCHAR[]), "
+            "unnest(?::DATE[]), unnest(?::DOUBLE[]), "
+            "unnest(?::DOUBLE[]), unnest(?::VARCHAR[]) "
             "ON CONFLICT(ticker,generation,date) DO UPDATE SET "
             "close=excluded.close, adjustment_factor=excluded.adjustment_factor, "
-            "basis=excluded.basis", rows,
+            "basis=excluded.basis", [list(column) for column in zip(*rows)],
         )
     return value_hash
 

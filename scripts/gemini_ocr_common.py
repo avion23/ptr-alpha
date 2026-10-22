@@ -115,7 +115,7 @@ def _normalize_tx_type(value: object) -> str | None:
     text = str(value or "").strip().lower()
     if text in {"p", "purchase"}:
         return "Purchase"
-    if text in {"s", "sale", "partial sale"}:
+    if text in {"s", "sale", "partial sale", "sale (partial)"}:
         return "Sale"
     if text in {"e", "exchange"}:
         return "Exchange"

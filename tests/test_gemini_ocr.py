@@ -511,6 +511,40 @@ def test_schema_rejects_malformed_outputs(bad_output):
         gemini_ocr_common.parse_gemini_output(bad_output)
 
 
+@pytest.mark.parametrize("sale_type", ["partial sale", "Sale (partial)", "Sale (Partial)"])
+def test_schema_accepts_explicit_partial_sale_direction(sale_type):
+    parsed = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        f"Apple (AAPL) | {sale_type} | 01/15/24 | 01/20/24 | A"
+    )
+    assert parsed.transactions == [
+        {
+            "asset": "Apple (AAPL)",
+            "type": "Sale",
+            "date": "01/15/24",
+            "notif_date": "01/20/24",
+            "amount_letter": "A",
+            "amount_midpoint": gemini_ocr_common.AMOUNT_MIDPOINTS["A"],
+            "page_number": 1,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "row,reason",
+    [
+        ("Apple | Sale (unknown) | 01/15/24 | 01/20/24 | A", "transaction type"),
+        ("Apple | Sale (partial) |  | 01/20/24 | A", "transaction date"),
+        ("Apple | Sale (partial) | 01/15/24 | 01/20/24 | $348.94", "amount range"),
+    ],
+)
+def test_partial_sale_alias_keeps_critical_fields_fail_closed(row, reason):
+    with pytest.raises(gemini_ocr_common.GeminiOutputError, match=reason):
+        gemini_ocr_common.parse_gemini_output(
+            f"MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n{row}"
+        )
+
+
 def test_schema_accepts_unpadded_but_unambiguous_dates():
     parsed = gemini_ocr_common.parse_gemini_output(
         "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"

@@ -71,7 +71,7 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
 
     header = [
         "Asset Name", "Owner", "Transaction Type", "Transaction Date",
-        "Amount", "Source Row ID",
+        "Amount", "Notification Date", "Source Row ID",
     ]
     layout_transactions = parse_pdf_table([header] + layout_rows)
     table_transactions = [tx for table in tables_out for tx in parse_pdf_table(table)]
@@ -146,6 +146,13 @@ def _expand_flattened_transaction_rows(table: list[list[str]]) -> list[list[str]
     if any(index is None for index in required):
         return table
 
+    # Flattened cells can carry a printed date even when the grid lacks its header.
+    if indexes.get("notification_date") is None:
+        width = max(len(row) for row in table)
+        table = [row + [""] * (width - len(row)) + [""] for row in table]
+        table[header_idx][-1] = "Notification Date"
+        indexes["notification_date"] = width
+
     expanded: list[list[str]] = []
     for row in table:
         populated = [cell for cell in row if cell.strip()]
@@ -161,7 +168,7 @@ def _expand_flattened_transaction_rows(table: list[list[str]]) -> list[list[str]
             expanded.append(row)
             continue
 
-        for asset, owner, tx_type, tx_date, amount in parsed:
+        for asset, owner, tx_type, tx_date, amount, notification_date in parsed:
             aligned = [""] * len(row)
             aligned[indexes["asset"]] = asset
             aligned[indexes["type"]] = tx_type
@@ -170,5 +177,7 @@ def _expand_flattened_transaction_rows(table: list[list[str]]) -> list[list[str]
                 aligned[indexes["owner"]] = owner
             if indexes.get("amount") is not None:
                 aligned[indexes["amount"]] = amount
+            if indexes.get("notification_date") is not None:
+                aligned[indexes["notification_date"]] = notification_date
             expanded.append(aligned)
     return expanded

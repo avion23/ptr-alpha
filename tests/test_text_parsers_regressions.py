@@ -83,3 +83,72 @@ def test_flattened_owner_row_and_layout_are_one_lot(monkeypatch):
     transactions = [tx for table in tables for tx in parse_pdf_table(table)]
     assert len(transactions) == 1
     assert transactions[0]["owner_code"] == "SP"
+
+
+def test_pdfplumber_layout_notification_and_safe_context(monkeypatch):
+    text = (
+        "  JT Private Foods LLC [OL] P 09/29/2026 09/30/2026 $50,001 - $100,000\n"
+        "  F S: New\n  L: Bethesda, MD, US\n"
+        "  D: Mandatorily convertible SAFE (Simple Agreement\n  for Future Equity)\n"
+    )
+    pages = [page(text)]
+    monkeypatch.setattr("pdfplumber.open", lambda _: nullcontext(SimpleNamespace(pages=pages)))
+    tx = parse_pdf_table(extract_tables_with_pdfplumber(Path("test.pdf"))[0])[0]
+    assert tx["notification_date"] == "09/30/2026"
+    assert tx["instrument_type"] == "private"
+    assert "Simple Agreement for Future Equity" in tx["asset_description"]
+
+
+def test_table_notification_and_linked_description_not_next_issuer():
+    header = HEADER + ["Notification Date"]
+    transactions = parse_pdf_table([
+        header,
+        ["Private Foods LLC [OL]", "JT", "P", "09/29/2026", "$50,001 - $100,000", "09/30/2026"],
+        ["F S: New", "", "", "", "", ""],
+        ["Location: Bethesda, MD, US", "", "", "", "", ""],
+        ["Description: Mandatorily convertible SAFE (Simple Agreement\nfor Future Equity)", "", "", "", "", ""],
+        ["Apple (AAPL) [ST]", "", "P", "10/01/2026", "$1,001 - $15,000", "10/02/2026"],
+    ])
+    assert len(transactions) == 2
+    assert transactions[0]["notification_date"] == "09/30/2026"
+    assert transactions[0]["instrument_type"] == "private"
+    assert "Simple Agreement for Future Equity" in transactions[0]["asset_description"]
+    assert transactions[1]["asset_description"] == "Apple (AAPL) [ST]"
+
+
+@pytest.mark.parametrize("asset,expected", [
+    ("Treasury Bill (6-Week, Matures 12/3/2026) [GS]", "treasury"),
+    ("Municipal Bond [MB]", "bond"),
+    ("Private LLC [OL] Description: convertible SAFE", "private"),
+    ("Private LLC [ST] Description: Simple Agreement for Future Equity", "private"),
+    ("D: convertible SAFE Apple (AAPL) [ST]", "stock"),
+    ("D: call option Apple (AAPL) [ST]", "stock"),
+    ("Apple (AAPL) [ST]", "stock"),
+    ("Fund Corporation (FUND) [ST]", "stock"),
+])
+def test_explicit_nonstock_and_stock_boundaries(asset, expected):
+    from analyzer.parsing.cells import _extract_instrument_type
+    assert _extract_instrument_type(asset) == expected
+
+
+def test_flattened_prior_description_cannot_hijack_next_stock():
+    transactions = parse_pdf_table([
+        HEADER,
+        row("Private LLC [OL]"),
+        ["D: convertible SAFE Apple (AAPL) [ST]", "", "P", "01/03/2024", "$1,001 - $15,000"],
+    ])
+    assert len(transactions) == 2
+    assert transactions[0]["asset_description"] == "Private LLC [OL]"
+    assert transactions[1]["ticker"] == "AAPL"
+    assert transactions[1]["instrument_type"] == "stock"
+
+
+def test_linked_table_description_retains_transaction_source_identity():
+    transactions = parse_pdf_table([
+        HEADER + ["Source Row ID"],
+        row("Private LLC [OL]") + ["p1:r1"],
+        ["D: Mandatorily convertible SAFE", "", "", "", "", "p1:r2"],
+    ])
+    assert len(transactions) == 1
+    assert transactions[0]["instrument_type"] == "private"
+    assert transactions[0]["source_row_id"] == "p1:r1"

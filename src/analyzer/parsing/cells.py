@@ -557,7 +557,7 @@ def _extract_owner_code(owner_cell: str | None) -> str | None:
 
 
 def _extract_instrument_type(asset_cell: str | None) -> str:
-    """Return stock, call, put, option, or unknown from one asset row.
+    """Classify explicit non-equity instruments before stock/option defaults.
 
     House ``[OP]`` identifies an option but does not establish call/put direction.
     ``[ST]`` is authoritative for the row and prevents a preceding row's wrapped
@@ -566,6 +566,17 @@ def _extract_instrument_type(asset_cell: str | None) -> str:
     if not asset_cell:
         return "unknown"
     text = asset_cell.lower()
+
+    # Ignore a preceding row's flattened note before the current stock marker.
+    identity = text
+    if re.match(r"\s*(?:description|d)\s*:", text) and "[st]" in text:
+        identity = text[text.index("[st]") :]
+    if re.search(r"\bsimple agreement for future equity\b|\bconvertible\s+safe\b", identity):
+        return "private"
+    if re.search(r"\btreasury\s+(?:bill|note|bond)s?\b", identity):
+        return "treasury"
+    if re.search(r"\[(?:CB|MB)\]|\b(?:corporate|municipal)\s+bonds?\b", identity, re.IGNORECASE):
+        return "bond"
 
     if re.search(r"\[st\]", text):
         return "stock"

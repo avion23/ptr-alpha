@@ -26,7 +26,7 @@ import pandas as pd
 
 from analyzer.canonical_scope import canonical_decision
 from analyzer.member_names import canonical_member_key
-from analyzer.parsing.cells import _extract_amount_midpoint
+from analyzer.parsing.cells import _extract_amount_midpoint, _extract_instrument_type
 
 logger = logging.getLogger(__name__)
 
@@ -692,6 +692,13 @@ def build_positions(
         estimate_key = (key, account)
         source = source_cells[i] if has_source else None
         congress_estimate = isinstance(source, str) and source in _CONGRESS_SOURCES
+        # Explicit private securities are not common-stock lots, even with a symbol.
+        instrument = instrument_cells[i] if has_instrument else None
+        description = description_cells[i] if has_description else None
+        if (
+            isinstance(instrument, str) and instrument.lower() == "private"
+        ) or _extract_instrument_type(description if isinstance(description, str) else None) == "private":
+            continue
         if _is_option_row(
             description_cells[i] if has_description else None,
             instrument_cells[i] if has_instrument else None,

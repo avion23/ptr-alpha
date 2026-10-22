@@ -179,6 +179,29 @@ def test_consensus_excludes_option_instrument_rows_before_counting():
     assert result.iloc[0]["num_buyers"] == 1
 
 
+def test_consensus_private_safe_and_existing_fund_boundary():
+    from unittest.mock import MagicMock
+    from analyzer.pipeline import eligible_events
+
+    transactions = _transactions(
+        ("Stock", "Private", "Raw SAFE", "Fund"),
+        disclosure_dates=["2024-05-10"] * 4,
+    )
+    transactions["instrument_type"] = ["stock", "private", "stock", "fund"]
+    transactions["asset_description"] = [
+        "Apple (AAPL) [ST]", "Private security", "LLC Description: convertible SAFE", "Fund",
+    ]
+    result = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=pd.Timestamp("2024-05-20"), min_buyers=1
+    )
+    assert result.iloc[0]["num_buyers"] == 1
+    transactions["source"] = "house_pdf"
+    db = MagicMock()
+    db.get_transactions_by_date_range.return_value = transactions
+    events = eligible_events(db, pd.Timestamp("2024-05-20"), days_back=None)
+    assert events["actor_id"].tolist() == ["congress:STOCK"]
+
+
 def test_consensus_rejects_misclassified_stock_option_from_raw_evidence():
     transactions = _transactions(("Stock Buyer", "Class Option", "Legacy Option"))
     transactions["instrument_type"] = ["stock", "stock", "stock"]

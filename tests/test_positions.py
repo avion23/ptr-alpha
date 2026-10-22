@@ -17,6 +17,22 @@ def _prices(days, closes):
     return pd.DataFrame({"close": closes}, index=idx)
 
 
+def test_private_safe_cannot_open_common_stock_position():
+    rows = pd.DataFrame([
+        dict(member="Private", ticker="AAPL", transaction_type="Purchase",
+             transaction_date="2026-01-02", amount_midpoint=10000,
+             instrument_type="private", asset_description="Private security"),
+        dict(member="Raw", ticker="AAPL", transaction_type="Purchase",
+             transaction_date="2026-01-02", amount_midpoint=10000,
+             instrument_type="stock", asset_description="LLC Description: convertible SAFE"),
+        dict(member="Stock", ticker="AAPL", transaction_type="Purchase",
+             transaction_date="2026-01-02", amount_midpoint=10000,
+             instrument_type="stock", asset_description="Apple (AAPL) [ST]"),
+    ])
+    result = build_positions(rows, {"AAPL": _prices(["2026-01-02"], [100])}, as_of=date(2026, 1, 3))
+    assert result["member"].tolist() == ["Stock"]
+
+
 def _holdings_db(trades, prices):
     import duckdb
     from types import SimpleNamespace

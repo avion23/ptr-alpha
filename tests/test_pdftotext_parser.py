@@ -16,6 +16,7 @@ def test_pdftotext_preserves_owner_code(monkeypatch):
     assert transactions[0]["owner_code"] == "SP"
     assert transactions[0]["amount_midpoint"] == 8000.5
     assert transactions[0]["source_row_id"] == "pdftotext:l0"
+    assert transactions[0]["notification_date"] == "01/03/2024"
 
 
 def test_pdftotext_no_owner_keeps_column_alignment(monkeypatch):
@@ -29,6 +30,42 @@ def test_pdftotext_no_owner_keeps_column_alignment(monkeypatch):
 
     assert transactions[0]["owner_code"] is None
     assert transactions[0]["ticker"] == "AAPL"
+    assert transactions[0]["notification_date"] == "01/03/2024"
+
+
+def test_wrapped_safe_description_stays_with_its_transaction(monkeypatch):
+    text = (
+        "  JT Private Foods LLC [OL] P 09/29/2026 09/30/2026 $50,001 -\n"
+        "      $100,000\n"
+        "      F S: New\n"
+        "      L: Bethesda, MD, US\n"
+        "      D: Mandatorily convertible SAFE (Simple Agreement\n"
+        "      for Future Equity)\n\n"
+        "  Apple (AAPL) [ST] P 10/01/2026 10/02/2026 $1,001 - $15,000\n"
+        "      F S: New\n\n"
+        "Description: unrelated investment vehicle\n"
+    )
+    monkeypatch.setattr("analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _: text)
+    transactions = parse_pdf_table(extract_tables_with_pdftotext(Path("test.pdf"))[0])
+    assert len(transactions) == 2
+    assert transactions[0]["asset_description"] == (
+        "Private Foods LLC [OL] Description: Mandatorily convertible SAFE "
+        "(Simple Agreement for Future Equity)"
+    )
+    assert transactions[0]["instrument_type"] == "private"
+    assert transactions[1]["asset_description"] == "Apple (AAPL) [ST]"
+    assert transactions[1]["instrument_type"] == "stock"
+
+
+def test_wrapped_treasury_maturity_is_asset_not_record_date_boundary(monkeypatch):
+    text = (
+        "Treasury Bill (6-Week, Matures P 10/20/2026 10/20/2026 $15,001 - $50,000\n"
+        "    12/3/2026) [GS]\n    F S: New\n"
+    )
+    monkeypatch.setattr("analyzer.parsing.pdftotext_parser._run_pdftotext", lambda _: text)
+    tx = parse_pdf_table(extract_tables_with_pdftotext(Path("test.pdf"))[0])[0]
+    assert tx["asset_description"] == "Treasury Bill (6-Week, Matures 12/3/2026) [GS]"
+    assert tx["instrument_type"] == "treasury"
 
 
 def test_indented_uppercase_asset_is_not_misclassified_as_owner(monkeypatch):
@@ -268,6 +305,7 @@ def test_pdfplumber_nul_source_accounts_keep_distinct_rows_through_persistence(
 
     assert inserted == 3
     assert len(stored) == 3
+    assert stored["notification_date"].eq(pd.Timestamp("2026-06-26")).all()
     assert set(stored["asset_description"]) == {
         f"NVIDIA Corporation - Common Stock (NVDA) [ST] [Account: {account}]"
         for account in accounts

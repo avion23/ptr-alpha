@@ -88,17 +88,27 @@ def _merge_complementary_row(row, candidate, indexes):
         return None
     asset = clean_text(_get_cell(row, asset_index))
     suffix = clean_text(_get_cell(candidate, asset_index))
-    if not asset or _is_filing_detail_row(suffix):
+    if not asset or _is_filing_detail_row(asset):
+        return None
+    description = re.match(r"^(?:DESCRIPTION|D)\s*:", suffix, re.IGNORECASE)
+    if description:
+        # A flattened description + independent security is not a linked note.
+        if re.search(r"\[(?:ST|OP)\]", suffix, re.IGNORECASE) or any(
+            clean_text(value) for index, value in enumerate(candidate)
+            if index != asset_index and index != indexes.get("source_row_id")
+        ):
+            return None
+    elif _is_filing_detail_row(suffix):
         return None
     # Only identifiable security suffixes may extend an asset, never another issuer.
-    if suffix and not re.fullmatch(
+    if suffix and not description and not re.fullmatch(
         r"(?:Class\s+[AB]\s*)?(?:\([A-Za-z][A-Za-z0-9.\-]{0,5}\))?(?:\s*\[(?:ST|OP)\])?",
         suffix, re.IGNORECASE,
     ):
         return None
     combined = list(row) + [""] * max(0, len(candidate) - len(row))
     for index, value in enumerate(candidate):
-        if index == asset_index:
+        if index == asset_index or index == indexes.get("source_row_id"):
             continue
         previous = clean_text(_get_cell(row, index))
         current = clean_text(value)
@@ -131,6 +141,7 @@ def _build_row_dict(
         "ticker": ticker,
         "transaction_type": tx_type,
         "transaction_date": tx_date,
+        "notification_date": _extract_date(_get_cell(source, indexes.get("notification_date"))),
         "owner_code": _extract_owner_code(_get_cell(source, indexes.get("owner"))),
         "amount_raw": amount_raw,
         "amount_midpoint": amount_midpoint,
@@ -220,6 +231,13 @@ def _process_with_continuations(
             for key in ("type", "date")
         ):
             break
+        suffix = clean_text(_get_cell(candidate, indexes.get("asset")))
+        if tx and _is_filing_detail_row(suffix) and not re.match(
+            r"^(?:DESCRIPTION|D)\s*:", suffix, re.IGNORECASE
+        ):
+            # Filing/location labels can separate the transaction from its note.
+            consumed += 1
+            continue
         merged = _merge_complementary_row(combined, candidate, indexes)
         if merged is None:
             break

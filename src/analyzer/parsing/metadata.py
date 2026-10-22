@@ -138,6 +138,7 @@ def consolidate_transactions(
                     "doc_id": doc_id,
                     "member": f"{first} {last}".strip(),
                     "transaction_date": tx["transaction_date"],
+                    "notification_date": tx.get("notification_date"),
                     "disclosure_date": member_info["FilingDate"],
                     "ticker": tx["ticker"],
                     "transaction_type": tx["transaction_type"],
@@ -156,7 +157,7 @@ def consolidate_transactions(
         return pd.DataFrame()
 
     df = pd.DataFrame(all_transactions)
-    for column in ("transaction_date", "disclosure_date"):
+    for column in ("transaction_date", "disclosure_date", "notification_date"):
         df[column] = pd.to_datetime(
             [pd.to_datetime(value, errors="coerce") for value in df[column]]
         )

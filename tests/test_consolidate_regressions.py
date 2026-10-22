@@ -18,6 +18,23 @@ def _tx(day="2021-01-02", row="r1"):
 LOOKUP = {"doc": dict(First="Jane", Last="Doe", FilingDate="2021-01-03")}
 
 
+def test_notification_survives_consolidation_and_normalization_without_fallback():
+    from analyzer.transaction_repository import _normalize_frame
+    transactions = [_tx(row="r1"), _tx(row="r2")]
+    transactions[0]["notification_date"] = "01/02/2021"
+    transactions[0]["asset_description"] = "Private LLC [OL] Description: convertible SAFE"
+    transactions[0]["instrument_type"] = "private"
+    result = _normalize_frame(
+        consolidate_transactions({Path("doc.pdf"): transactions}, LOOKUP),
+        deduplicate=False,
+    )
+    assert len(result) == 2
+    assert result.iloc[0]["notification_date"] == pd.Timestamp("2021-01-02")
+    assert pd.isna(result.iloc[1]["notification_date"])
+    assert result.iloc[0]["instrument_type"] == "private"
+    assert result.iloc[0]["asset_description"] == transactions[0]["asset_description"]
+
+
 @pytest.mark.parametrize("partial", [True, False])
 def test_dropped_rows_fail_closed(tmp_path, partial):
     source, db = _source(tmp_path)

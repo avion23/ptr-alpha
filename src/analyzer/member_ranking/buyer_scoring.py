@@ -10,6 +10,7 @@ from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
 from analyzer.models import TransactionType
+from analyzer.parsing.cells import _extract_instrument_type
 from analyzer.ticker_resolver import TickerResolver
 
 CONSENSUS_SCORER_PROVENANCE = "identity_free_distinct_buyer_count_v2"
@@ -44,6 +45,7 @@ _NON_EQUITY_INSTRUMENTS = frozenset(
         "notes",
         "option",
         "put",
+        "private",
         "stock option",
         "treasury",
     }
@@ -415,6 +417,8 @@ def _equity_transaction_fields(
         if value is not None and not pd.isna(value)
     )
     if _UNSUPPORTED_ASSET_RE.search(description):
+        return False
+    if _extract_instrument_type(description) == "private":
         return False
     if _OPTION_BRACKET_RE.search(
         description

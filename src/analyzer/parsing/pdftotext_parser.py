@@ -104,6 +104,7 @@ def extract_tables_with_pdftotext(pdf_path: Path) -> list[list[list[str]]]:
             "Transaction Type",
             "Transaction Date",
             "Amount",
+            "Notification Date",
             "Source Row ID",
         ]
     ] + transactions
@@ -145,8 +146,8 @@ def _parse_pdftotext_lines(
 
         matched = _try_match_with_owner(line, i, lines)
         if matched is not None:
-            asset, owner, tx_type, tx_date, amount, j = matched
-            row = [asset, owner, tx_type, tx_date, amount]
+            asset, owner, tx_type, tx_date, amount, notif_date, j = matched
+            row = [asset, owner, tx_type, tx_date, amount, notif_date]
             if source_prefix is not None:
                 row.append(f"{source_prefix}:l{i}")
             transactions.append(row)
@@ -155,8 +156,8 @@ def _parse_pdftotext_lines(
 
         matched = _try_match_no_owner(line, i, lines)
         if matched is not None:
-            asset, owner, tx_type, tx_date, amount, j = matched
-            row = [asset, owner, tx_type, tx_date, amount]
+            asset, owner, tx_type, tx_date, amount, notif_date, j = matched
+            row = [asset, owner, tx_type, tx_date, amount, notif_date]
             if source_prefix is not None:
                 row.append(f"{source_prefix}:l{i}")
             transactions.append(row)
@@ -188,19 +189,19 @@ def _is_skip_line(line: str) -> bool:
 
 def _try_match_with_owner(
     line: str, i: int, lines: list[str]
-) -> tuple[str, str, str, str, str, int] | None:
+) -> tuple[str, str, str, str, str, str, int] | None:
     m = _TX_WITH_OWNER.match(line)
     if not m:
         return None
     owner, asset, tx_type, tx_date, notif_date, amount = m.groups()
     asset = asset.strip()
     asset, amount, j = _collect_transaction_continuations(asset, amount, i + 1, lines)
-    return asset, owner, tx_type, tx_date, amount, j
+    return asset, owner, tx_type, tx_date, amount, notif_date, j
 
 
 def _try_match_no_owner(
     line: str, i: int, lines: list[str]
-) -> tuple[str, str, str, str, str, int] | None:
+) -> tuple[str, str, str, str, str, str, int] | None:
     m = _TX_NO_OWNER.match(line)
     if not m:
         return None
@@ -210,7 +211,7 @@ def _try_match_no_owner(
     if asset in _SKIP_EXACT:
         return None
     asset, amount, j = _collect_transaction_continuations(asset, amount, i + 1, lines)
-    return asset, "", tx_type, tx_date, amount, j
+    return asset, "", tx_type, tx_date, amount, notif_date, j
 
 
 def _collect_transaction_continuations(
@@ -235,6 +236,21 @@ def _collect_transaction_continuations(
         if _TX_WITH_OWNER.match(line) or _TX_NO_OWNER.match(line):
             break
         stripped = line.strip()
+        if not stripped or stripped.startswith("*") or (
+            _is_new_tx_header(stripped) and not _is_transaction_detail(stripped)
+        ):
+            break
+        description = re.match(r"^(?:DESCRIPTION|D)\s*:\s*(.*)$", stripped, re.IGNORECASE)
+        if description:
+            detail, j = _collect_asset_continuation(description.group(1), j + 1, lines)
+            asset = f"{asset} Description: {detail}"
+            continue
+        if (
+            len(stripped) > _MAX_SINGLE_LETTER_LEN
+            and _is_skip_line(line)
+            and not _FILING_LABEL_LINE.match(stripped)
+        ):
+            break
         if needs_upper_bound or spouse_dc_over:
             amount_match = _AMOUNT_CONTINUATION.search(stripped)
             if amount_match:
@@ -261,7 +277,11 @@ def _collect_asset_continuation(
     j = start
     while j < len(lines):
         next_line = lines[j].strip()
-        if not next_line:
+        if (
+            not next_line
+            or next_line.startswith("*")
+            or re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", next_line)
+        ):
             break
         if _TX_WITH_OWNER.match(lines[j]) or _TX_NO_OWNER.match(lines[j]):
             break
@@ -279,7 +299,7 @@ def _is_transaction_detail(line: str) -> bool:
         return True
     return bool(
         re.match(
-            r"^(?:F\s+S|S\s+O|D|L|SOURCE OF|SUBHOLDING OF)\s*:",
+            r"^(?:F\s+S|S\s+O|D|L|DESCRIPTION|LOCATION|SOURCE OF|SUBHOLDING OF)\s*:",
             line,
             re.IGNORECASE,
         )

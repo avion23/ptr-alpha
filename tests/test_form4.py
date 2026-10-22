@@ -138,6 +138,51 @@ def test_fetch_records_acceptance_without_extra_requests(tmp_path, monkeypatch, 
             source.close()
 
 
+@pytest.mark.parametrize("value", [
+    "2024-02-29", "2024-02-29Z", "2024-02-29-05:00", "2024-02-29+05:30",
+    "2024-02-29+00:00", "2024-02-29-00:00", "2024-02-29+14:00", "2024-02-29-14:00",
+])
+def test_xml_transaction_date_preserves_calendar_day(burke_form4_xml, value):
+    xml = burke_form4_xml.replace(b"<value>2026-08-31</value>", f"<value>{value}</value>".encode(), 1)
+    accepted = datetime(2026, 9, 2, 21, 45, 10)
+    rows = parse_form4_xml(
+        xml, accession="0000000001-26-000001", source_report_path="source.xml",
+        official_filing_date=date(2026, 9, 2), acceptance_datetime=accepted,
+    )
+    assert len(rows) == 3
+    assert rows.iloc[0]["transaction_date"] == date(2024, 2, 29)
+    assert rows["disclosure_date"].eq(date(2026, 9, 2)).all()
+    assert rows["acceptance_datetime"].eq(accepted).all()
+    assert rows["transaction_type"].tolist() == ["Purchase", "Sale", "Purchase"]
+    assert xml.count(value.encode()) == 1
+
+
+@pytest.mark.parametrize("value", [
+    "2026-02-29", "2026-13-01", "2026-04-31Z", "0000-01-01", "2026-00-01",
+    "2026-10-14+14:01", "2026-10-14-14:01", "2026-10-14+25:00",
+    "2026-10-14+13:60", "2026-10-14-05:", "2026-10-14+5:00",
+    "2026-10-14+0500", "2026-10-14z", "2026-10-14Zjunk", "2026-10-14-05:00junk",
+    "2026-10-14T00:00:00", "2026-W42-3", "20261014", "2026-1-14", "Wednesday",
+])
+def test_xml_transaction_date_rejects_malformed_values(burke_form4_xml, value):
+    xml = burke_form4_xml.replace(b"<value>2026-08-31</value>", f"<value>{value}</value>".encode(), 1)
+    with pytest.raises(Form4Error) as error:
+        parse_form4_xml(
+            xml, accession="0000000001-26-000001", source_report_path="source.xml",
+            official_filing_date=date(2026, 9, 2),
+        )
+    assert str(error.value) == f"Form 4 0000000001-26-000001 has invalid transaction date: {value!r}"
+
+
+def test_empty_xml_transaction_date_keeps_missing_field_error(burke_form4_xml):
+    xml = burke_form4_xml.replace(b"<value>2026-08-31</value>", b"<value></value>", 1)
+    with pytest.raises(Form4Error, match="purchase row 1 is missing transaction date"):
+        parse_form4_xml(
+            xml, accession="0000000001-26-000001", source_report_path="source.xml",
+            official_filing_date=date(2026, 9, 2),
+        )
+
+
 def parse(content):
     return parse_form4_xml(
         content,
@@ -371,8 +416,6 @@ def test_sale_rows_never_become_candidates(burke_form4_xml):
 
 
 def test_refetch_does_not_duplicate_rows(tmp_path, burke_form4_xml):
-    import duckdb
-
     from analyzer.database import Database
     from analyzer.transaction_repository import drop_already_stored
 

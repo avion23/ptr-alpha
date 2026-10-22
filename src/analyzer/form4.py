@@ -187,6 +187,18 @@ def _parse_decimal(value: str, label: str, accession: str) -> Decimal:
     return number
 
 
+def _parse_xml_date(value: str) -> date:
+    """Read an xs:date's calendar day, not a timezone-converted instant."""
+    match = re.fullmatch(
+        r"([0-9]{4}-[0-9]{2}-[0-9]{2})"
+        r"(?:Z|[+-](?:(?:0[0-9]|1[0-3]):[0-5][0-9]|14:00))?",
+        value,
+    )
+    if match is None:
+        raise ValueError(f"Invalid XML date: {value!r}")
+    return date.fromisoformat(match[1])
+
+
 def _is_10b5_1(root: ET.Element) -> bool:
     checkbox = _first_element(root, "aff10b5One")
     if checkbox is not None:
@@ -294,7 +306,7 @@ def parse_form4_xml(
                 f"row {row_number} is missing " + ", ".join(missing)
             )
         try:
-            parsed_date = date.fromisoformat(transaction_date)
+            parsed_date = _parse_xml_date(transaction_date)
         except ValueError:
             raise Form4Error(
                 f"Form 4 {accession} has invalid transaction date: "

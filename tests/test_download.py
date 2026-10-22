@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from analyzer.database import Database
-from analyzer.download import HouseTransactionSource
+from analyzer.download import HouseTransactionSource, _PARSE_VERSION
 from analyzer.exceptions import DataSourceError
 from analyzer.models import DownloadResult, DownloadStatus
 from analyzer.settings import Settings
@@ -293,7 +293,7 @@ def test_parse_persistence_records_house_provenance_and_artifact_hash(tmp_path):
     assert stored["ingestion_generation"] == "legacy-untracked-2021"
     assert stored["official_filing_date"].date() == date(2021, 1, 3)
     assert stored["artifact_sha256"] == hashlib.sha256(pdf_bytes).hexdigest()
-    assert parse_run == ("v5-deterministic", "success", 1, 1)
+    assert parse_run == ("v6-deterministic-context", "success", 1, 1)
 
 
 
@@ -342,7 +342,7 @@ def test_zero_output_parse_preserves_stale_house_and_ocr_rows(tmp_path):
             """
             SELECT status, raw_row_count, transaction_count
             FROM pdf_parse_runs
-            WHERE doc_id = 'zero' AND parser_version = 'v5-deterministic'
+            WHERE doc_id = 'zero' AND parser_version = 'v6-deterministic-context'
             """
         ).fetchone()
     finally:
@@ -531,6 +531,110 @@ def test_parse_cached_pdfs_binds_save_to_captured_generation(tmp_path, monkeypat
     assert source._save_parse_results.call_args.args[-1] == "captured-g1"
 
 
+@pytest.mark.parametrize("opt_in,force,reuse", [
+    (None, False, False),
+    ("2026", False, True),
+    ("2025", False, False),
+    ("2026", True, False),
+    ("invalid", True, False),
+])
+def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materializations(
+    tmp_path, monkeypatch, caplog, opt_in, force, reuse
+):
+    from multiprocessing.pool import ThreadPool
+
+    from analyzer.download import _validated_pdf_sha256
+    from analyzer.parsing.metadata import consolidate_transactions
+
+    monkeypatch.delenv("PTR_REUSE_LEGACY_V5_CACHE_YEAR", raising=False)
+    if opt_in is not None:
+        monkeypatch.setenv("PTR_REUSE_LEGACY_V5_CACHE_YEAR", opt_in)
+    source, db = _source(tmp_path)
+    generation = "legacy-untracked-2026"
+    docs = ("legacy", "current", "fresh", "changed", "oldgen", "failed")
+    pdf_dir = tmp_path / "2026" / "pdfs"
+    pdf_dir.mkdir(parents=True)
+    for doc in docs:
+        (pdf_dir / f"{doc}.pdf").write_bytes(b"%PDF-" + doc.encode() + b"\n%%EOF")
+    metadata = _metadata(*docs)
+    metadata["ArchiveYear"] = 2026
+    metadata["FilingDate"] = pd.Timestamp("2026-10-20")
+    source.fetch_metadata = MagicMock(return_value=metadata)
+    source.db.get_latest_house_generation = MagicMock(return_value=generation)
+    transaction = dict(
+        ticker="AAPL", transaction_type="Purchase", transaction_date="09/29/2026",
+        owner_code="JT", amount_raw="$1,001 - $15,000", amount_midpoint=8000.5,
+        asset_description="Original stock [ST]", instrument_type="stock", source_row_id="r1",
+    )
+    parsed = []
+
+    def worker(path):
+        parsed.append(path.stem)
+        return path, [{**transaction, "notification_date": "09/30/2026"}], ["pdfplumber"]
+
+    monkeypatch.setattr("analyzer.download.Pool", ThreadPool)
+    monkeypatch.setattr("analyzer.download._tolerant_parse_pdf_worker", worker)
+    lookup = {doc: dict(First="First", Last="Last", FilingDate="2026-10-20") for doc in docs}
+    try:
+        # Seed genuine legacy versions and values, never label old results as v6.
+        for doc in ("legacy", "current", "changed", "oldgen", "failed"):
+            artifact = _validated_pdf_sha256(pdf_dir / f"{doc}.pdf")
+            if doc == "changed":
+                artifact = "f" * 64
+            bound_generation = "old-generation" if doc == "oldgen" else generation
+            frame = consolidate_transactions({Path(f"{doc}.pdf"): [transaction]}, lookup)
+            frame["chamber"] = "house"
+            frame["source_record_id"] = doc
+            frame["ingestion_generation"] = bound_generation
+            frame["artifact_sha256"] = artifact
+            db.upsert_transactions(frame, source="house_pdf")
+            db.upsert_parse_run(
+                doc_id=doc, year=2026,
+                parser_version=_PARSE_VERSION if doc == "current" else "v5-deterministic",
+                status="error" if doc == "failed" else "success", engines_attempted="pdfplumber",
+                raw_row_count=1, transaction_count=1,
+                artifact_sha256=artifact, ingestion_generation=bound_generation,
+            )
+        before_rows = db.conn.execute("SELECT * FROM transactions WHERE doc_id = 'legacy'").fetchall()
+        before_runs = db.conn.execute("SELECT * FROM pdf_parse_runs WHERE doc_id = 'legacy'").fetchall()
+        cache_lookup = MagicMock(wraps=db.parse_runs.get_cached_doc_ids)
+        monkeypatch.setattr(db.parse_runs, "get_cached_doc_ids", cache_lookup)
+        with caplog.at_level("INFO", logger="analyzer.download"):
+            source.parse_cached_pdfs(2026, force=force)
+        expected = set(docs) - ({"current"} if not force else set()) - ({"legacy"} if reuse else set())
+        assert set(parsed) == expected
+        assert cache_lookup.call_count == (0 if force else 2 if reuse else 1)
+        for call in cache_lookup.call_args_list:
+            assert call.kwargs["year"] == 2026
+            assert call.kwargs["ingestion_generation"] == generation
+        if reuse:
+            assert db.conn.execute("SELECT * FROM transactions WHERE doc_id = 'legacy'").fetchall() == before_rows
+            assert db.conn.execute("SELECT * FROM pdf_parse_runs WHERE doc_id = 'legacy'").fetchall() == before_runs
+            assert "count=1 original_producer=v5-deterministic current_producer=v6-deterministic-context" in caplog.text
+            assert "not corrected or reproduced" in caplog.text
+        assert f"year=2026 producer={_PARSE_VERSION} force={force}" in caplog.text
+        assert f"PTR_REUSE_LEGACY_V5_CACHE_YEAR={opt_in} legacy_reuse={reuse}" in caplog.text
+        for doc in expected:
+            assert db.conn.execute(
+                "SELECT status FROM pdf_parse_runs WHERE doc_id = ? AND parser_version = ?",
+                [doc, "v6-deterministic-context"],
+            ).fetchall() == [("success",)]
+            stored = db.get_transactions_for_doc(doc)
+            assert stored["notification_date"].eq(pd.Timestamp("2026-09-30")).any()
+    finally:
+        source.close()
+        db.close()
+
+
+@pytest.mark.parametrize("value", ["", "1", "true", "2026,2025", "0000"])
+def test_legacy_cache_opt_in_requires_explicit_year_before_access(monkeypatch, value):
+    monkeypatch.setenv("PTR_REUSE_LEGACY_V5_CACHE_YEAR", value)
+    source = SimpleNamespace(db=MagicMock())
+    with pytest.raises(ValueError, match="must be a four-digit year"):
+        HouseTransactionSource.parse_cached_pdfs(source, 2026)
+    source.db.get_latest_house_generation.assert_not_called()
+
+
 def test_parse_cached_pdfs_persists_large_year_in_resumable_batches(
     tmp_path, monkeypatch
 ):
@@ -700,7 +804,7 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
     db.upsert_parse_run(
         doc_id="stable",
         year=2021,
-        parser_version="v5-deterministic",
+        parser_version=_PARSE_VERSION,
         status="success",
         engines_attempted="pdfplumber",
         raw_row_count=1,
@@ -750,7 +854,7 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
             SELECT status, transaction_count
             FROM pdf_parse_runs
             WHERE doc_id = 'stable'
-              AND parser_version = 'v5-deterministic'
+              AND parser_version = 'v6-deterministic-context'
               AND artifact_sha256 = ?
               AND ingestion_generation = ?
             """,

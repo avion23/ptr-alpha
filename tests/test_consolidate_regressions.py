@@ -5,7 +5,7 @@ import time
 import pandas as pd
 import pytest
 
-from analyzer.download import _validated_pdf_sha256
+from analyzer.download import _PARSE_VERSION, _validated_pdf_sha256
 from analyzer.parsing.metadata import consolidate_transactions
 from .test_download import _source, _metadata
 
@@ -52,7 +52,7 @@ def test_dropped_rows_fail_closed(tmp_path, partial):
         artifact_hash = _validated_pdf_sha256(path)
         assert artifact_hash is not None
         assert not db.parse_runs.get_cached_doc_ids(
-            year=2021, parser_version="v5-deterministic",
+            year=2021, parser_version=_PARSE_VERSION,
             artifact_hashes={"doc": artifact_hash},
             ingestion_generation="legacy-untracked-2021",
         )

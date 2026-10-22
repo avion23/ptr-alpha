@@ -37,7 +37,7 @@ from analyzer.parser_cascade import (
 )
 
 logger = logging.getLogger(__name__)
-_PARSE_VERSION = "v5-deterministic"
+_PARSE_VERSION = "v6-deterministic-context"
 
 
 def _invalid_consolidated_house_docs(df: pd.DataFrame) -> dict[str, list[str]]:
@@ -676,6 +676,20 @@ class HouseTransactionSource(TransactionSource):
         )
 
     def parse_cached_pdfs(self, year: int, *, force: bool = False) -> None:
+        legacy_year = os.environ.get("PTR_REUSE_LEGACY_V5_CACHE_YEAR")
+        if not force and legacy_year is not None and (
+            len(legacy_year) != 4
+            or not legacy_year.isascii()
+            or not legacy_year.isdecimal()
+            or int(legacy_year) == 0
+        ):
+            raise ValueError("PTR_REUSE_LEGACY_V5_CACHE_YEAR must be a four-digit year")
+        reuse_legacy = not force and legacy_year == str(year)
+        logger.info(
+            "House parser cache policy: year=%d producer=%s force=%s "
+            "PTR_REUSE_LEGACY_V5_CACHE_YEAR=%s legacy_reuse=%s",
+            year, _PARSE_VERSION, force, legacy_year, reuse_legacy,
+        )
         ingestion_generation = self.db.get_latest_house_generation(year)
         if ingestion_generation is None:
             raise DataSourceError(
@@ -704,6 +718,21 @@ class HouseTransactionSource(TransactionSource):
                 artifact_hashes=artifact_hashes,
                 ingestion_generation=ingestion_generation,
             )
+            if reuse_legacy:
+                legacy_cached = self.db.parse_runs.get_cached_doc_ids(
+                    year=year,
+                    parser_version="v5-deterministic",
+                    artifact_hashes=artifact_hashes,
+                    ingestion_generation=ingestion_generation,
+                )
+                logger.warning(
+                    "Explicit legacy cache reuse: year=%d generation=%s count=%d "
+                    "original_producer=v5-deterministic current_producer=%s; "
+                    "original versions and payloads retained, not corrected or "
+                    "reproduced under the current recipe",
+                    year, ingestion_generation, len(legacy_cached - cached), _PARSE_VERSION,
+                )
+                cached |= legacy_cached
             if cached:
                 keep_mask = (
                     existing_docs["DocID"]

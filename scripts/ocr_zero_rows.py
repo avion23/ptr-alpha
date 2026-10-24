@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """Compatibility executable for the operational OCR drain."""
 import os
+import sys
 import time
+
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if __name__ == "__main__":
+    for _entry in (str(REPO_ROOT), str(REPO_ROOT / "src")):
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
+
 from analyzer.ocr import runner
 from analyzer.ocr.common import is_quota_error
 from analyzer.ocr.ingestion import DB_PATH, COOLDOWN, approved_data_root

@@ -29,15 +29,17 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if __name__ == "__main__":
+    for _entry in (str(REPO_ROOT), str(REPO_ROOT / "src")):
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
 
 import pandas as pd
 
 from analyzer.database import Database
 from analyzer.price_repository import nyse_sessions, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot, save_snapshot
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Price pipeline code whose behavior is bound into the snapshot.
 CODE_FILES = [

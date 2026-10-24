@@ -95,9 +95,10 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-for _path in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+if __name__ == "__main__":
+    for _path in (str(REPO_ROOT), str(REPO_ROOT / "src")):
+        if _path not in sys.path:
+            sys.path.insert(0, _path)
 
 from analyzer.ocr.common import (  # noqa: E402
     AMOUNT_MIDPOINTS,

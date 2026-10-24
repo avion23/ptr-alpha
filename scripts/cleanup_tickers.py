@@ -9,7 +9,11 @@ import sys
 
 import duckdb
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if __name__ == "__main__":
+    for _entry in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
 
 from analyzer.row_history import archive_rows, accept_corrections
 

@@ -29,8 +29,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO / "src"))
-sys.path.insert(0, str(REPO))
+if __name__ == "__main__":
+    for _entry in (str(REPO), str(REPO / "src")):
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
 
 from analyzer.freshness import FreshnessCheck, monitoring_checks  # noqa: E402
 from scripts.audit_sample import _doc_fail_severity, _verdict_of  # noqa: E402

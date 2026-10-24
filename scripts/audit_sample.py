@@ -115,9 +115,10 @@ from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-for _path in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+if __name__ == "__main__":
+    for _path in (str(REPO_ROOT), str(REPO_ROOT / "src")):
+        if _path not in sys.path:
+            sys.path.insert(0, _path)
 
 from analyzer.ocr.common import pdf_sha256  # noqa: E402,F401  (re-exported)
 

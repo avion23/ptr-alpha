@@ -44,8 +44,8 @@ where = ["src"]
 include = ["analyzer*"]
 
 [tool.ruff.lint.per-file-ignores]
-# E402: standalone scripts and tests bootstrap sys.path before importing the
-# project package, so a module-level import after a sys.path.insert is intended.
+# E402: standalone scripts bootstrap checkout paths only for entrypoint runs;
+# imports after that conditional bootstrap are intentional.
 "scripts/*.py" = ["E402"]
 "tests/conftest.py" = ["E402"]
 

@@ -31,7 +31,8 @@ import duckdb
 import pandas as pd
 import yfinance as yf
 
-warnings.filterwarnings("ignore")
+if __name__ == "__main__":
+    warnings.filterwarnings("ignore")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent

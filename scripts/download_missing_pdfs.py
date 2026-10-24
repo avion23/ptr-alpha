@@ -7,18 +7,21 @@ import sys
 from datetime import date
 from pathlib import Path
 
-# Add src to path so analyzer imports work
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    for _entry in (str(REPO_ROOT), str(REPO_ROOT / "src")):
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
 
 from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.settings import Settings
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 

@@ -123,8 +123,8 @@ DEFAULT_WORKERS = int(os.environ.get("OCR2_WORKERS", "3"))  # docling ~2GB/proc;
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if __package__ in (None, ""):
-    for _entry in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
+if __name__ == "__main__":
+    for _entry in (str(REPO_ROOT), str(REPO_ROOT / "src")):
         if _entry not in sys.path:
             sys.path.insert(0, _entry)
 

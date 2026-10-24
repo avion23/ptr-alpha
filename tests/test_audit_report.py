@@ -316,6 +316,7 @@ def test_attempt_bundle_initial_truncated_png_never_published(data_dir, monkeypa
 
 
 def make_record(doc_id: str, year: int = 2024, rows: list | None = None) -> dict:
+    rows = rows if rows is not None else [["X", "Purchase", "01/15/24", None, "A"]]
     return {
         "doc_id": doc_id,
         "year": year,
@@ -326,9 +327,9 @@ def make_record(doc_id: str, year: int = 2024, rows: list | None = None) -> dict
         "parsed_at_utc": "2026-10-18T00:00:00Z",
         "pages": 1,
         "member": "Jane Doe",
-        "rows": rows if rows is not None else [],
+        "rows": rows,
         "raw_output": None,
-        "parse_status": "success",
+        "parse_status": "success" if rows else "no_txs",
         "error": None,
         "audit": None,
     }

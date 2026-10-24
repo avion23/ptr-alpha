@@ -204,7 +204,13 @@ def fake_insert(monkeypatch):
 def test_artifact_request_normalizes_only_identity_without_changing_evidence():
     legacy = {
         "doc_id": "legacy", "year": 2024, "pdf_sha256": "digest",
-        "rows": [["original evidence"]], "audit": "pass",
+        "model": "legacy-model", "prompt_sha256": PROMPT_SHA256,
+        "parsed_at_utc": "2026-10-18T00:00:00Z",
+        "parser_version": "v1-glm53-vision", "pages": 1,
+        "member": "Jane Doe",
+        "rows": [["original evidence", "Purchase", "01/15/24", None, "A"]],
+        "raw_output": None, "parse_status": "success", "error": None,
+        "audit": "pass",
     }
     raw = json.dumps(legacy)
     record = glm_stage.decode_staging_record(raw)
@@ -941,6 +947,7 @@ def test_promote_partial_insert_keeps_and_marks_record(data_dir, monkeypatch, ca
         ["Apple Inc. (AAPL)", "Purchase", "01/15/24", "01/20/24", "A"],
         ["Microsoft Corp (MSFT)", "Sale", "02/02/24", "02/05/24", "B"],
     ]
+    record["row_pages"] = [1, 1]
     record["raw_count"] = 2
     record["audit"] = "pass"
     record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
@@ -987,6 +994,7 @@ def test_promote_member_rejection_is_not_no_txs(data_dir, monkeypatch, capsys):
     record["audit"] = "pass"
     record["rows"] = []
     record["parse_status"] = "no_txs"
+    record["row_pages"] = []
     record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
     glm_stage.write_staging_record(data_dir, record)
     audit_sample.record_verdict(data_dir, "2006", "pass", "updated test fixture")
@@ -1032,7 +1040,7 @@ def test_promote_refuses_error_records_and_sha_drift(data_dir, fake_insert):
             "parsed_at_utc": "2026-10-18T00:00:00Z",
             "pages": 1,
             "member": "Jane Doe",
-            "rows": [["X", "Purchase", "01/15/24", None, "A"]],
+            "rows": [],
             "raw_output": None,
             "parse_status": "error",
             "error": "boom",
@@ -1692,6 +1700,102 @@ def test_unreadable_live_record_blocks_population_consumption(data_dir, fake_ins
     assert live.read_bytes() == live_bytes
     assert bad.read_bytes() == bad_bytes
     assert archived.read_bytes() == archived_bytes
+
+
+def test_staging_record_contract_rejects_semantic_corruption(data_dir):
+    error_record = {
+        "doc_id": "legacy-error", "year": 2024, "pdf_sha256": None,
+        "model": None, "prompt_sha256": PROMPT_SHA256,
+        "parsed_at_utc": "2026-10-18T00:00:00Z",
+        "parser_version": "v1-glm53-vision", "pages": None,
+        "member": None, "rows": [], "raw_output": "invalid response",
+        "parse_status": "error", "error": "parse failed", "audit": None,
+    }
+    # Legacy error records need neither the additive attempt metadata nor
+    # promotion-only artifact bindings; failed work remains in the population.
+    assert glm_stage.decode_staging_record(json.dumps(error_record)) == error_record
+    error_path = glm_stage.staging_record_path(data_dir, 2024, "legacy-error")
+    error_path.parent.mkdir(parents=True, exist_ok=True)
+    error_path.write_text(json.dumps(error_record), encoding="utf-8")
+    assert glm_stage.iter_staging_records(data_dir) == [(2024, error_record)]
+
+    for payload in (
+        {},
+        {**error_record, "year": True},
+        {**error_record, "parse_status": "unknown"},
+        {**error_record, "rows": {"not": "a row list"}},
+        {**error_record, "error": None},
+    ):
+        with pytest.raises(ValueError, match="staging record"):
+            glm_stage.decode_staging_record(json.dumps(payload))
+
+    # A syntactically valid JSON object is still a failed live record, not an
+    # ignored file or an empty population entry.
+    malformed_path = glm_stage.staging_root(data_dir) / "2024" / "empty.json"
+    malformed_path.parent.mkdir(parents=True, exist_ok=True)
+    malformed_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="unreadable staging record .*empty.json"):
+        glm_stage.iter_staging_records(data_dir)
+    malformed_path.write_text(json.dumps(error_record), encoding="utf-8")
+    with pytest.raises(ValueError, match="identity does not match its live path"):
+        glm_stage.iter_staging_records(data_dir)
+
+
+def test_semantically_invalid_peer_blocks_explicit_promotion(data_dir, fake_insert):
+    write_staged_records(data_dir, {2024: ["explicit-peer"]})
+    record = glm_stage.staging_record_path(data_dir, 2024, "explicit-peer")
+    record_bytes = record.read_bytes()
+    peer = glm_stage.staging_root(data_dir) / "2024" / "broken-peer.json"
+    peer.write_text("{}", encoding="utf-8")
+    peer_bytes = peer.read_bytes()
+
+    with pytest.raises(ValueError, match="missing required fields"):
+        glm_stage.promote_docs(2024, ["explicit-peer"], data_dir=data_dir)
+
+    assert fake_insert == []
+    assert record.read_bytes() == record_bytes
+    assert peer.read_bytes() == peer_bytes
+    assert glm_stage.archived_attempts(data_dir, 2024, "explicit-peer") == []
+
+
+def test_force_unaudited_does_not_skip_staged_rows_hash(data_dir, fake_insert):
+    stage_one(data_dir, 2024, "content-proof", GLM_OUTPUT_ONE_ROW)
+    record = glm_stage.load_staging_record(data_dir, 2024, "content-proof")
+    record["rows"][0][0] = "tampered after staging"
+    glm_stage.write_staging_record(data_dir, record)
+    live = glm_stage.staging_record_path(data_dir, 2024, "content-proof")
+    live_bytes = live.read_bytes()
+
+    with pytest.raises(ValueError, match="do not match staged_rows_sha256"):
+        glm_stage.promote_docs(
+            2024, ["content-proof"], data_dir=data_dir, force_unaudited=True
+        )
+
+    assert fake_insert == []
+    assert live.read_bytes() == live_bytes
+
+
+def test_report_replaces_stale_complete_state_after_invalid_population(data_dir):
+    write_staged_records(data_dir, {2024: ["report-peer"]})
+    assert audit_sample.main(
+        [
+            "--data-dir", str(data_dir), "sample", "--per-year", "1",
+            "--seed", "91", "--no-bundle",
+        ]
+    ) == 0
+    audit_sample.record_verdict(data_dir, "report-peer", "pass", "verified")
+    assert audit_sample.main(["--data-dir", str(data_dir), "report"]) == 0
+    report_path = glm_stage.staging_root(data_dir) / "audit-report-state.json"
+    assert json.loads(report_path.read_text(encoding="utf-8"))["state"] == "complete"
+
+    glm_stage.staging_record_path(data_dir, 2024, "report-peer").write_text(
+        "{}", encoding="utf-8"
+    )
+    assert audit_sample.main(["--data-dir", str(data_dir), "report"]) == 2
+    state = json.loads(report_path.read_text(encoding="utf-8"))
+    assert state["state"] == "incomplete"
+    assert state["budget_met"] is None
+    assert "missing required fields" in state["reason"]
 
 
 def test_restage_preserves_all_archived_attempt_bytes(data_dir):

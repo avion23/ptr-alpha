@@ -203,6 +203,117 @@ def decode_staging_record(raw: str | bytes) -> StagingRecord:
     record = json.loads(raw)
     if not isinstance(record, dict):
         raise ValueError("staging record must be a JSON object")
+
+    # TypedDict is only a static description; every live JSON record is a
+    # trust boundary. These fields are shared by the original and current
+    # staging writers. Additive provenance/promotion fields stay optional so
+    # valid legacy and failed attempts remain readable without fabricated
+    # defaults.
+    required = (
+        "doc_id", "year", "pdf_sha256", "model", "prompt_sha256",
+        "parsed_at_utc", "rows", "member", "parse_status", "parser_version",
+        "pages", "raw_output", "error", "audit",
+    )
+    missing = [field for field in required if field not in record]
+    if missing:
+        raise ValueError(
+            "staging record is missing required fields: " + ", ".join(missing)
+        )
+
+    doc_id = record["doc_id"]
+    if (
+        not isinstance(doc_id, str)
+        or not doc_id.strip()
+        or doc_id in (".", "..")
+        or Path(doc_id).name != doc_id
+    ):
+        raise ValueError("staging record doc_id must be a non-empty filename")
+    year = record["year"]
+    if type(year) is not int or not 1000 <= year <= 9999:
+        raise ValueError("staging record year must be an integer from 1000 to 9999")
+    status = record["parse_status"]
+    if status not in ("success", "no_txs", "error"):
+        raise ValueError(
+            "staging record parse_status must be success, no_txs, or error"
+        )
+
+    for field in ("prompt_sha256", "parsed_at_utc", "parser_version"):
+        if not isinstance(record[field], str) or not record[field].strip():
+            raise ValueError(f"staging record {field} must be a non-empty string")
+    for field in ("pdf_sha256", "model", "member", "raw_output", "error"):
+        value = record[field]
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"staging record {field} must be a string or null")
+    if record["pdf_sha256"] is not None and not record["pdf_sha256"].strip():
+        raise ValueError("staging record pdf_sha256 cannot be empty")
+    pages = record["pages"]
+    if pages is not None and (type(pages) is not int or pages <= 0):
+        raise ValueError("staging record pages must be a positive integer or null")
+    if record["audit"] not in (None, "pass", "fail"):
+        raise ValueError("staging record audit must be pass, fail, or null")
+
+    rows = record["rows"]
+    if not isinstance(rows, list) or any(
+        not isinstance(row, list)
+        or len(row) != 5
+        or any(
+            not isinstance(row[index], str) or not row[index].strip()
+            for index in (0, 1, 2, 4)
+        )
+        or (row[3] is not None and not isinstance(row[3], str))
+        for row in rows
+    ):
+        raise ValueError("staging record rows must be a list of five-field string rows")
+    if status in ("success", "no_txs"):
+        if bool(rows) != (status == "success"):
+            raise ValueError(f"{status} staging record has inconsistent rows")
+        if (
+            not isinstance(record["pdf_sha256"], str)
+            or not record["pdf_sha256"].strip()
+        ):
+            raise ValueError(f"{status} staging record must have pdf_sha256")
+        if not isinstance(record["member"], str) or not record["member"].strip():
+            raise ValueError(f"{status} staging record must have member")
+        if pages is None:
+            raise ValueError(f"{status} staging record must have a page count")
+        if record["error"] is not None:
+            raise ValueError(f"{status} staging record cannot carry an error")
+    elif rows or not isinstance(record["error"], str) or not record["error"].strip():
+        raise ValueError(
+            "error staging record must have no rows and a non-empty error"
+        )
+
+    if "row_pages" in record:
+        row_pages = record["row_pages"]
+        if (
+            not isinstance(row_pages, list)
+            or len(row_pages) != len(rows)
+            or any(
+                page is not None and (type(page) is not int or page <= 0)
+                for page in row_pages
+            )
+        ):
+            raise ValueError("staging record row_pages must align with rows")
+    for field in ("artifact_sha256", "ingestion_generation", "error_kind"):
+        if (
+            field in record
+            and record[field] is not None
+            and not isinstance(record[field], str)
+        ):
+            raise ValueError(f"staging record {field} must be a string or null")
+    if "archive_year" in record and record["archive_year"] is not None:
+        archive_year = record["archive_year"]
+        if type(archive_year) is not int or not 1000 <= archive_year <= 9999:
+            raise ValueError("staging record archive_year must be an integer year or null")
+    if "asset_review" in record and not isinstance(record["asset_review"], bool):
+        raise ValueError("staging record asset_review must be boolean")
+    if "staged_rows_sha256" in record:
+        row_hash = record["staged_rows_sha256"]
+        if row_hash is not None and not isinstance(row_hash, str):
+            raise ValueError("staging record staged_rows_sha256 must be a string or null")
+        if row_hash is not None and row_hash != staged_rows_sha256(rows):
+            raise ValueError("staging record rows do not match staged_rows_sha256")
+
     # Do not inject legacy defaults into content-bound evidence.
     return cast(StagingRecord, record)
 
@@ -433,6 +544,13 @@ def iter_staging_records(data_dir: str | Path) -> list[tuple[int, StagingRecord]
         for path in sorted(year_dir.glob("*.json")):
             try:
                 record = decode_staging_record(path.read_text(encoding="utf-8"))
+                if (
+                    record["year"] != int(year_dir.name)
+                    or record["doc_id"] != path.stem
+                ):
+                    raise ValueError(
+                        "staging record identity does not match its live path"
+                    )
             except (OSError, ValueError) as exc:
                 raise ValueError(f"unreadable staging record {path}: {exc}") from exc
             records.append((int(year_dir.name), record))

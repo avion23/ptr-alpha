@@ -1732,6 +1732,8 @@ def cmd_report(args) -> int:
         )
     except (OSError, ValueError) as exc:
         reason = str(exc)
+        # Replace any prior complete state when population evidence is bad;
+        # otherwise promotion could keep consuming a stale acceptance result.
         state_payload = _incomplete_state_payload(
             reason,
             max_rate=args.max_rate,

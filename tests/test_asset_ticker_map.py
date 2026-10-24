@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import signal
 import stat
 
 import duckdb
@@ -79,6 +81,14 @@ def test_ticker_cache_is_private_and_does_not_follow_symlinks(tmp_path, monkeypa
     assert stat.S_IMODE(cache_path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
     assert asset_ticker_map._read_sec_cache() == (("Zoetis Inc.", "ZTS"),)
+    cache_path.write_text("{", encoding="utf-8")
+    assert asset_ticker_map._read_sec_cache() is None
+    cache_path.write_text(
+        '{"0": {"title": "Zoetis Inc.", "ticker": "ZTS"}}', encoding="utf-8"
+    )
+    cache_path.chmod(0o644)
+    assert asset_ticker_map._read_sec_cache() is None
+    cache_path.chmod(0o600)
     modified = cache_path.stat().st_mtime
     monkeypatch.setattr(
         asset_ticker_map.time,
@@ -86,6 +96,60 @@ def test_ticker_cache_is_private_and_does_not_follow_symlinks(tmp_path, monkeypa
         lambda: modified + asset_ticker_map._CACHE_TTL_SECONDS,
     )
     assert asset_ticker_map._read_sec_cache() is None
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "mkfifo") or not hasattr(signal, "setitimer"),
+    reason="requires FIFO and interval-timer support",
+)
+def test_ticker_cache_fifo_does_not_block_and_closes_fds(tmp_path, monkeypatch):
+    cache_path = tmp_path / "ticker-cache" / "company_tickers.json"
+    monkeypatch.setattr(asset_ticker_map, "_SEC_CACHE", cache_path)
+    cache_path.parent.mkdir(mode=0o700)
+    os.mkfifo(cache_path, 0o600)
+
+    if not asset_ticker_map._O_NOFOLLOW or not asset_ticker_map._O_NONBLOCK:
+        assert asset_ticker_map._read_sec_cache() is None
+        return
+
+    opened_fds = []
+    original_open = os.open
+
+    def track_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        opened_fds.append(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", track_open)
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def fail_if_blocked(_signum, _frame):
+        raise AssertionError("opening FIFO cache blocked")
+
+    signal.signal(signal.SIGALRM, fail_if_blocked)
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    try:
+        assert asset_ticker_map._read_sec_cache() is None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+    assert len(opened_fds) == 2
+    for fd in opened_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+@pytest.mark.parametrize("safe_flag", ("_O_NOFOLLOW", "_O_NONBLOCK"))
+def test_ticker_cache_fails_closed_without_safe_open_flags(
+    tmp_path, monkeypatch, safe_flag
+):
+    cache_path = tmp_path / "ticker-cache" / "company_tickers.json"
+    monkeypatch.setattr(asset_ticker_map, "_SEC_CACHE", cache_path)
+    monkeypatch.setattr(asset_ticker_map, safe_flag, 0)
+
+    assert asset_ticker_map._read_sec_cache() is None
+    assert not cache_path.parent.exists()
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ _SEC_URL = "https://www.sec.gov/files/company_tickers.json"
 _SEC_CACHE = DATA_DIR / "ticker_cache" / "company_tickers.json"
 _CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 # Company-name fragments for common disclosure spellings that do not match an
 # active SEC registrant title exactly. Ambiguous names and investment products
@@ -131,7 +132,7 @@ def _normalize_company_name(value: str) -> str:
 
 
 def _open_sec_cache_dir() -> int | None:
-    if not _O_NOFOLLOW:
+    if not _O_NOFOLLOW or not _O_NONBLOCK:
         return None
     try:
         _SEC_CACHE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -160,7 +161,7 @@ def _read_sec_cache() -> tuple[tuple[str, str], ...] | None:
     try:
         fd = os.open(
             _SEC_CACHE.name,
-            os.O_RDONLY | _O_NOFOLLOW,
+            os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK,
             dir_fd=directory_fd,
         )
         metadata = os.fstat(fd)

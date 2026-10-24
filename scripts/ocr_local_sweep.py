@@ -123,30 +123,10 @@ DEFAULT_WORKERS = int(os.environ.get("OCR2_WORKERS", "3"))  # docling ~2GB/proc;
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-for _entry in (str(REPO_ROOT), str(REPO_ROOT / "src")):
-    if _entry not in sys.path:
-        sys.path.insert(0, _entry)
-
-# Tesseract segmentation-mode override for scan_ocr's extraction helpers
-# (extract_page_rows resolves module globals at call time, so replacing the
-# imported names lets siblings tune PSM without touching shared code).
-def _psm_wrapper(fn, psm):
-    def wrapped(image_path, psm_arg=None, **kwargs):
-        return fn(image_path, psm=psm, **kwargs)
-    return wrapped
-
-import scripts.scan_ocr as _scan_ocr  # noqa: E402
-
-if TESSERACT_PSM != 3 or TESSERACT_PSM_SPARSE != 11:
-    _scan_ocr.tesseract_plain_lines = _psm_wrapper(
-        _scan_ocr.tesseract_plain_lines, TESSERACT_PSM
-    )
-    _scan_ocr.tesseract_lines = _psm_wrapper(
-        _scan_ocr.tesseract_lines, TESSERACT_PSM
-    )
-    _scan_ocr.tesseract_words = _psm_wrapper(
-        _scan_ocr.tesseract_words, TESSERACT_PSM
-    )
+if __package__ in (None, ""):
+    for _entry in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
 
 from scripts.scan_ocr import (  # noqa: E402
     OcrRow,
@@ -668,12 +648,14 @@ def tesseract_page(
         primary_path = tmp / f"page_{page_number:03d}.png"
         image.save(str(primary_path), dpi=(RENDER_DPI, RENDER_DPI))
         primary = extract_page_rows(
-            str(primary_path), page_number, start_row_index
+            str(primary_path), page_number, start_row_index,
+            dense_psm=TESSERACT_PSM, sparse_psm=TESSERACT_PSM_SPARSE,
         )
         estimated_path = tmp / f"page_{page_number:03d}_est.png"
         image.save(str(estimated_path))
         secondary = extract_page_rows(
-            str(estimated_path), page_number, start_row_index
+            str(estimated_path), page_number, start_row_index,
+            dense_psm=TESSERACT_PSM, sparse_psm=TESSERACT_PSM_SPARSE,
         )
         merged = _merge_page_results(primary, secondary)
         has_usable = any(not row.date_unresolved for row in merged.rows)
@@ -686,7 +668,8 @@ def tesseract_page(
             str(prepped_path), dpi=(RENDER_DPI * PREPROCESS_SCALE,) * 2
         )
         prep_result = extract_page_rows(
-            str(prepped_path), page_number, start_row_index
+            str(prepped_path), page_number, start_row_index,
+            dense_psm=TESSERACT_PSM, sparse_psm=TESSERACT_PSM_SPARSE,
         )
         seen = {_row_key(row) for row in merged.rows}
         added = [

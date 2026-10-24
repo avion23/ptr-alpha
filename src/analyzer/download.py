@@ -953,9 +953,6 @@ def _skip_stems_from_env(raw: str | None) -> frozenset[str]:
     )
 
 
-_PTR_SKIP_DOCS = _skip_stems_from_env(os.environ.get("PTR_SKIP_DOCS"))
-
-
 def _tolerant_parse_pdf_worker(
     pdf_path: Path,
     parse_worker=None,
@@ -975,7 +972,7 @@ def _tolerant_parse_pdf_worker(
     unavailable (non-main thread, platforms without setitimer) the parse runs
     unguarded.
     """
-    if pdf_path.stem in _PTR_SKIP_DOCS:
+    if pdf_path.stem in _skip_stems_from_env(os.environ.get("PTR_SKIP_DOCS")):
         return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}skipped via PTR_SKIP_DOCS"]
 
     worker = _parse_pdf_worker if parse_worker is None else parse_worker

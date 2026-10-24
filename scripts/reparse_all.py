@@ -12,11 +12,11 @@ import sys
 import time
 from pathlib import Path
 
-# Must set env BEFORE importing analyzer (it may import OCR libs lazily)
-os.environ["PTR_SKIP_DOCLING"] = "1"
-
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if __package__ in (None, ""):
+    for _entry in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
 
 from multiprocessing import Pool
 from typing import cast
@@ -44,7 +44,15 @@ def _resilient_worker(
     those documents stay preserved because they never enter
     ``replacement_doc_ids``."""
     try:
-        pdf_path_out, txs, engines = _parse_pdf_worker(pdf_path)
+        previous = os.environ.get("PTR_SKIP_DOCLING")
+        os.environ["PTR_SKIP_DOCLING"] = "1"
+        try:
+            pdf_path_out, txs, engines = _parse_pdf_worker(pdf_path)
+        finally:
+            if previous is None:
+                os.environ.pop("PTR_SKIP_DOCLING", None)
+            else:
+                os.environ["PTR_SKIP_DOCLING"] = previous
         return pdf_path_out, txs, engines, None
     except (ParserCascadeError, OSError) as exc:
         return pdf_path, [], [], f"{type(exc).__name__}: {exc}"

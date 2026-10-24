@@ -1136,7 +1136,7 @@ def test_tolerant_parse_skips_docs_via_ptr_skip_docs(tmp_path, monkeypatch):
 
     skipped_path = tmp_path / "20004297.pdf"
     normal_path = tmp_path / "20011111.pdf"
-    monkeypatch.setattr(download_module, "_PTR_SKIP_DOCS", frozenset({"20004297"}))
+    monkeypatch.setenv("PTR_SKIP_DOCS", "20004297")
 
     def explode_if_called(_path):
         raise AssertionError("_parse_pdf_worker must not run for skipped docs")

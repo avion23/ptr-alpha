@@ -45,9 +45,6 @@ from analyzer.settings import Settings
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
 logger = logging.getLogger(__name__)
-# Bulk CLI parsing never shells out to Docling (multi-GB model workers per
-# zero-row PDF); scripts that want it opt in by unsetting this.
-os.environ.setdefault("PTR_SKIP_DOCLING", "1")
 _CURRENT_YEAR = date.today().year
 _HOUSE_PTR_FIRST_ARCHIVE_YEAR = 2015
 _HOUSE_LEGACY_FIRST_ARCHIVE_YEAR = 2008
@@ -250,6 +247,11 @@ def main_callback(
         False, "--verbose", "-v", help="Enable verbose logging"
     ),
 ):
+    # Bulk commands avoid multi-GB Docling workers unless explicitly enabled.
+    # Click closes the context on success and failure, including CliRunner use.
+    if "PTR_SKIP_DOCLING" not in os.environ:
+        os.environ["PTR_SKIP_DOCLING"] = "1"
+        ctx.call_on_close(lambda: os.environ.pop("PTR_SKIP_DOCLING", None))
     setup_logging(verbose)
 
 

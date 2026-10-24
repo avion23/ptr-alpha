@@ -19,6 +19,22 @@ if str(ROOT / "src") not in sys.path:
 from scripts import scan_ocr as so  # noqa: E402
 
 
+def test_page_psm_options_are_local(monkeypatch):
+    calls = []
+
+    def read(image_path, psm):
+        calls.append(psm)
+        return []
+
+    for name in ("tesseract_plain_lines", "tesseract_lines", "tesseract_words"):
+        monkeypatch.setattr(so, name, read)
+    so.extract_page_rows("unused.png", 1, 0, dense_psm=6, sparse_psm=12)
+    assert calls == [6, 6, 6, 12]
+    calls.clear()
+    so.extract_page_rows("unused.png", 1, 0)
+    assert calls == [3, 3, 3, 11]
+
+
 class TestDateNormalization(unittest.TestCase):
     def test_canary_dates_normalize_to_mm_dd_yy(self):
         self.assertEqual(so.normalize_date("3-31-26"), "03/31/26")

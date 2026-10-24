@@ -5,15 +5,25 @@ from types import SimpleNamespace
 import pandas as pd
 
 
+def test_worker_scopes_bulk_docling_policy(monkeypatch, tmp_path):
+    from scripts import reparse_all
+
+    monkeypatch.setenv("PTR_SKIP_DOCLING", "0")
+    path = tmp_path / "example.pdf"
+
+    def parser(pdf_path):
+        assert os.environ["PTR_SKIP_DOCLING"] == "1"
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(reparse_all, "_parse_pdf_worker", parser)
+    assert reparse_all._resilient_worker(path) == (
+        path, [], [], "OSError: unreadable"
+    )
+    assert os.environ["PTR_SKIP_DOCLING"] == "0"
+
+
 def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path):
-    previous = os.environ.get("PTR_SKIP_DOCLING")
-    try:
-        from scripts import reparse_all
-    finally:
-        if previous is None:
-            os.environ.pop("PTR_SKIP_DOCLING", None)
-        else:
-            os.environ["PTR_SKIP_DOCLING"] = previous
+    from scripts import reparse_all
 
     pdf_dir = tmp_path / "2026" / "pdfs"
     pdf_dir.mkdir(parents=True)

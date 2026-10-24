@@ -28,6 +28,28 @@ if str(ROOT / "src") not in sys.path:
 from scripts import ocr_local_sweep as ocr  # noqa: E402
 
 
+def test_sweep_passes_psm_without_mutating_extractor(monkeypatch):
+    from types import SimpleNamespace
+    from scripts import scan_ocr
+
+    shared = scan_ocr.tesseract_words
+    calls = []
+    row = SimpleNamespace(date_unresolved=False)
+    page = SimpleNamespace(rows=[row], text="local text")
+
+    def extract(*args, **kwargs):
+        calls.append(kwargs)
+        return page
+
+    monkeypatch.setattr(ocr, "extract_page_rows", extract)
+    monkeypatch.setattr(ocr, "TESSERACT_PSM", 6)
+    monkeypatch.setattr(ocr, "TESSERACT_PSM_SPARSE", 12)
+    image = SimpleNamespace(save=lambda *args, **kwargs: None)
+    assert ocr.tesseract_page(image, 1, 0) == ([row], "local text")
+    assert calls == [{"dense_psm": 6, "sparse_psm": 12}] * 2
+    assert scan_ocr.tesseract_words is shared
+
+
 class TestEnvTunables(unittest.TestCase):
     def test_env_overrides_parsed(self):
         """Constants are env-driven; defaults match the canary-validated set."""

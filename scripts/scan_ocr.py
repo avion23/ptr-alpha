@@ -45,8 +45,10 @@ from multiprocessing import Pool
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT / "src"))
+if __package__ in (None, ""):
+    for _entry in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
 
 GENERATION = "gen-live-20260809"
 SCRIPT_VERSION = "1.0.0"
@@ -472,13 +474,14 @@ def _merge_page_results(primary: PageResult, secondary: PageResult) -> PageResul
 
 
 def extract_page_rows(
-    image_path: str | Path, page_number: int, start_row_index: int
+    image_path: str | Path, page_number: int, start_row_index: int,
+    *, dense_psm: int = 3, sparse_psm: int = 11,
 ) -> PageResult:
     """OCR one rasterized page and return detected transaction rows."""
-    plain_lines = tesseract_plain_lines(image_path, psm=3)
-    tsv_lines = tesseract_lines(image_path, psm=3)
-    words = tesseract_words(image_path, psm=3)
-    sparse_words = tesseract_words(image_path, psm=11)
+    plain_lines = tesseract_plain_lines(image_path, psm=dense_psm)
+    tsv_lines = tesseract_lines(image_path, psm=dense_psm)
+    words = tesseract_words(image_path, psm=dense_psm)
+    sparse_words = tesseract_words(image_path, psm=sparse_psm)
     if not plain_lines:
         return PageResult(page_number, [], "no OCR text")
 

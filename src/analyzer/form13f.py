@@ -26,10 +26,6 @@ from analyzer.transaction_repository import _BASE_WRITE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
-SEC_USER_AGENT = os.environ.get(
-    "SEC_USER_AGENT", "InsiderTrading 13F research contact admin@example.com"
-)
-
 _OUTPUT_PROVENANCE_COLUMNS = (
     "acceptance_datetime",
     "source_record_id",
@@ -312,7 +308,8 @@ class ThirteenFSource(TransactionSource):
             raise ThirteenFError(
                 "A non-empty ticker-to-issuer-keywords watchlist is required"
             )
-        if not SEC_USER_AGENT.strip():
+        user_agent = os.environ.get("SEC_USER_AGENT", "agent-local")
+        if not user_agent.strip():
             raise ThirteenFError("SEC_USER_AGENT must be non-empty")
         if ingestion_generation is not None and not ingestion_generation.strip():
             raise ThirteenFError("ingestion_generation must be non-empty when supplied")
@@ -348,7 +345,7 @@ class ThirteenFSource(TransactionSource):
             for cusip, ticker in (ticker_map or {}).items()
         }
         self._sec = _SECClient(
-            SEC_USER_AGENT,
+            user_agent,
             {"Accept": "application/json, application/xml, text/xml"},
         )
         self.session = self._sec.session

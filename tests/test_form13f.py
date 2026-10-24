@@ -16,6 +16,24 @@ from analyzer.form13f import (
 from analyzer.pipeline import eligible_events
 
 
+def test_client_identity_read_at_construction(tmp_path, monkeypatch):
+    from analyzer.database import Database
+
+    with Database(":memory:") as db:
+        for identity in ("agent-local-one", "agent-local-two"):
+            monkeypatch.setenv("SEC_USER_AGENT", identity)
+            source = ThirteenFSource(
+                watchlist={"TEST": {"TEST"}}, data_dir=tmp_path, db=db
+            )
+            try:
+                assert source.session.headers["User-Agent"] == identity
+            finally:
+                source.close()
+        monkeypatch.setenv("SEC_USER_AGENT", " ")
+        with pytest.raises(ThirteenFError, match="SEC_USER_AGENT"):
+            ThirteenFSource(watchlist={"TEST": {"TEST"}}, data_dir=tmp_path, db=db)
+
+
 @pytest.fixture
 def sec_company_tickers(monkeypatch):
     rows = asset_ticker_map._company_rows(
@@ -428,13 +446,12 @@ def test_eligible_events_resolves_stored_null_13f_tickers(
         ]
     )
 
-    class ReadOnlyDB:
-        conn = None
+    from analyzer.database import Database
+    from unittest.mock import patch
 
-        def get_transactions_by_date_range(self, start, end):
-            return trades.copy()
-
-    events = eligible_events(ReadOnlyDB(), date(2026, 9, 3))
+    with Database(":memory:") as db:
+        with patch.object(db, "get_transactions_by_date_range", return_value=trades.copy()):
+            events = eligible_events(db, date(2026, 9, 3))
 
     assert events["ticker"].tolist() == ["MSFT", "AMZN", "SPCX", "ABT"]
     assert events["corroboration"].tolist() == [True, True, True, True]

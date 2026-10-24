@@ -1,6 +1,7 @@
 """Smoke tests for analyzer.cli module."""
 
 import unittest
+import os
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -44,6 +45,19 @@ class TestHouseAcquisitionDatabase(unittest.TestCase):
 class TestCliApp(unittest.TestCase):
     def setUp(self):
         self.runner = CliRunner()
+
+    def test_parser_policy_is_owned_and_restored_by_invocation(self):
+        for previous in (None, "0", "1"):
+            with self.subTest(previous=previous), patch.dict(os.environ):
+                os.environ.pop("PTR_SKIP_DOCLING", None)
+                if previous is not None:
+                    os.environ["PTR_SKIP_DOCLING"] = previous
+                observed = []
+                with patch("analyzer.cli.setup_logging", side_effect=lambda _: observed.append(os.environ.get("PTR_SKIP_DOCLING"))):
+                    result = self.runner.invoke(app, ["analyze", "--mode", "invalid_mode"])
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertEqual(observed, [previous if previous is not None else "1"])
+                self.assertEqual(os.environ.get("PTR_SKIP_DOCLING"), previous)
 
     def test_analyze_invalid_mode(self):
         result = self.runner.invoke(app, ["analyze", "--mode", "invalid_mode"])

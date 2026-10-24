@@ -103,6 +103,16 @@ def dividends_populated(conn) -> FreshnessCheck:
     )
 
 
+def dividends_freshness() -> FreshnessCheck:
+    """Population is not evidence that dividend coverage is current/complete."""
+    return FreshnessCheck.unknown(
+        "dividends.freshness",
+        "canonical rows prove population only; refresh reports expose aggregate "
+        "checked/event counts, while best-effort provider calls record no per-ticker "
+        "success or source-completeness evidence",
+    )
+
+
 def form4_freshness(
     conn, today: date | None = None, max_age_days: int = FORM4_MAX_AGE_DAYS
 ) -> FreshnessCheck:
@@ -238,8 +248,8 @@ def end_to_end_checks(
         try:
             return run()
         except Exception as exc:  # a broken check must stay a visible row
-            return FreshnessCheck(
-                name, f"unavailable: {type(exc).__name__}: {exc}", False
+            return FreshnessCheck.unknown(
+                name, f"unavailable: {type(exc).__name__}: {exc}"
             )
 
     return [
@@ -266,12 +276,13 @@ def monitoring_checks(
         try:
             return run()
         except Exception as exc:  # a broken check must stay a visible row
-            return FreshnessCheck(
-                name, f"unavailable: {type(exc).__name__}: {exc}", False
+            return FreshnessCheck.unknown(
+                name, f"unavailable: {type(exc).__name__}: {exc}"
             )
 
     return [
         *end_to_end_checks(conn, receipts_path=receipts_path, today=today),
+        dividends_freshness(),
         guard("house.ingestion.freshness", lambda: house_ingestion_freshness(conn, today)),
         guard("ocr.staging.freshness", lambda: ocr_backlog_freshness(staging_root)),
     ]

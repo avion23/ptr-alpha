@@ -4,13 +4,16 @@ showed was measured nowhere (writers exited 0 while canonical starved)."""
 import duckdb
 from datetime import date, datetime, timedelta, timezone
 import json
+from types import SimpleNamespace
 
 from unittest import TestCase
 
 from analyzer.freshness import (
     end_to_end_checks,
+    dividends_freshness,
     dividends_populated,
     form4_freshness,
+    monitoring_checks,
     price_freshness,
     receipts_freshness,
 )
@@ -75,6 +78,37 @@ class DividendsPopulatedTest(TestCase):
         )
         con.execute("INSERT INTO dividends VALUES ('AAPL', '2026-10-01', 0.5)")
         self.assertTrue(dividends_populated(con).ok)
+
+    def test_old_population_does_not_prove_current_coverage(self):
+        con = duckdb.connect(":memory:")
+        con.execute(
+            "CREATE TABLE dividends (ticker VARCHAR, ex_date DATE, cash_amount DOUBLE)"
+        )
+        con.execute("INSERT INTO dividends VALUES ('AAPL', '2010-01-01', 0.5)")
+
+        checks = {check.name: check for check in monitoring_checks(con)}
+        self.assertTrue(checks["dividends.populated"].ok)
+        self.assertEqual("dividends rows: 1", checks["dividends.populated"].detail)
+        self.assertEqual("UNKNOWN", checks["dividends.freshness"].mark)
+
+    def test_dividend_query_exception_is_unknown(self):
+        class BrokenDividendQuery:
+            def execute(self, query):
+                if "duckdb_tables()" in query:
+                    return SimpleNamespace(fetchone=lambda: (1,))
+                raise RuntimeError("query unavailable")
+
+        checks = end_to_end_checks(BrokenDividendQuery())
+        population = next(c for c in checks if c.name == "dividends.populated")
+        self.assertEqual("UNKNOWN", population.mark)
+        self.assertFalse(population.ok)
+        self.assertEqual(4, len(checks), "other end-product checks still run")
+
+    def test_dividends_freshness_is_unknown_without_completeness_proof(self):
+        check = dividends_freshness()
+        self.assertEqual("UNKNOWN", check.mark)
+        self.assertFalse(check.ok)
+        self.assertIn("source-completeness evidence", check.detail)
 
     def test_absent_table_fails_closed(self):
         con = duckdb.connect(":memory:")

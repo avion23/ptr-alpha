@@ -627,6 +627,27 @@ class TestHealthEndToEndFreshness(unittest.TestCase):
         result = self._invoke("--strict-freshness", freshness=failing)
         self.assertEqual(result.exit_code, 1, result.output)
 
+    def test_strict_freshness_fails_unknown_dividend_coverage(self):
+        from analyzer.freshness import FreshnessCheck
+
+        unknown = [
+            FreshnessCheck.unknown(
+                "dividends.freshness", "no completeness evidence"
+            )
+        ]
+        result = self._invoke("--strict-freshness", freshness=unknown)
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("[UNKNOWN] dividends.freshness", result.output)
+
+    def test_unavailable_monitor_context_is_unknown(self):
+        from analyzer.cli import end_to_end_freshness
+
+        checks = end_to_end_freshness(
+            SimpleNamespace(transaction_source=None), "unused"
+        )
+        self.assertEqual("UNKNOWN", checks[0].mark)
+        self.assertFalse(checks[0].ok)
+
     def test_strict_freshness_passes_when_all_checks_ok(self):
         from analyzer.freshness import FreshnessCheck
 

@@ -734,6 +734,7 @@ class MonitoringChecksContractTest(TestCase):
                 "dividends.populated",
                 "form4.freshness",
                 "receipts.freshness",
+                "dividends.freshness",
                 "house.ingestion.freshness",
                 "ocr.staging.freshness",
             ],
@@ -817,6 +818,8 @@ class DoctorIntegrationTest(TestCase):
         self.assertIn("[PASS] cron.ocr.engagement", output)
         self.assertIn("[PASS] ocr.staging.freshness", output)
         self.assertIn("[PASS] house.ingestion.freshness", output)
+        self.assertIn("[PASS] dividends.populated", output)
+        self.assertIn("[UNKNOWN] dividends.freshness", output)
 
     def test_retry_starved_staging_fails_the_whole_doctor(self):
         staging = Path(tempfile.mkdtemp(prefix="stag-"))

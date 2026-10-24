@@ -254,8 +254,8 @@ def end_to_end_freshness(app_ctx: AppContext, data_dir: str) -> list[FreshnessCh
         conn = app_ctx.transaction_source.db.conn
     except Exception as exc:
         return [
-            FreshnessCheck(
-                "end_to_end", f"unavailable: {type(exc).__name__}: {exc}", False
+            FreshnessCheck.unknown(
+                "end_to_end", f"unavailable: {type(exc).__name__}: {exc}"
             )
         ]
     receipts = Path(data_dir) / "recommendations" / "receipts.log"
@@ -287,7 +287,7 @@ def health(
         False,
         "--strict-freshness",
         help="Fail (exit 1) when canonical end products (prices/dividends/"
-        "form4/receipts/house-ingestion/ocr-staging) are stale, not just "
+        "form4/receipts/house-ingestion/ocr-staging) are stale or unknown, not just "
         "when a chamber is out of window",
     ),
     data_dir: str = typer.Option("data", help="Data directory"),
@@ -326,7 +326,7 @@ def health(
     freshness_failed = any(not check.ok for check in freshness)
     if freshness_failed:
         print(
-            "WARNING: canonical end-product freshness failed; "
+            "WARNING: canonical end-product freshness is stale or unknown; "
             "run scripts/doctor.py for the full audit.",
             file=sys.stderr,
         )

@@ -103,7 +103,13 @@ def test_cleanup_duplicate_deletion_preserves_old_rowset(tmp_path):
 
 
 @pytest.mark.parametrize("repair", ["cleanup_tickers", "backfill_tickers"])
-def test_partial_ticker_repair_preserves_complete_legacy_rowset(tmp_path, repair):
+def test_partial_ticker_repair_preserves_complete_legacy_rowset(tmp_path, repair, monkeypatch):
+    from analyzer import asset_ticker_map
+
+    monkeypatch.setattr(
+        asset_ticker_map, "_sec_company_name_index",
+        lambda: {"MICROSOFT": frozenset({"MSFT"})},
+    )
     path = tmp_path / "db.duckdb"
     original = "MICROSOFT CORPORATION" if repair == "cleanup_tickers" else None
     db = Database(path)

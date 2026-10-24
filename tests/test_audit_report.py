@@ -988,6 +988,92 @@ def test_cli_report_without_sample_lot_refuses(data_dir, capsys):
     assert state["budget_met"] is None
 
 
+def test_unreadable_live_record_blocks_sampling_and_complete_report(data_dir, capsys):
+    from scripts import glm_stage
+
+    record = make_record("population")
+    write_record(data_dir, record)
+    envelope = write_envelope(data_dir)
+    assert audit_sample.load_staging_records(data_dir) == [(2024, record)]
+    entry = audit_sample.record_verdict(data_dir, "population", "pass")["entry"]
+    assert entry["staged_record_sha256"] == audit_sample.staged_record_sha256(record)
+    assert glm_stage.verdict_binding(data_dir, "population", record) == (True, None)
+    assert audit_sample.main(["--data-dir", str(data_dir), "report"]) == 0
+    capsys.readouterr()
+
+    archived = (
+        audit_sample.staging_root(data_dir)
+        / "2024"
+        / "attempts"
+        / "population.attempt-0.json"
+    )
+    archived.parent.mkdir(parents=True)
+    archived_bytes = b'{"prior_attempt":"retained byte-for-byte"}\n'
+    archived.write_bytes(archived_bytes)
+    bad = audit_sample.staging_root(data_dir) / "2024" / "unreadable.json"
+    bad_bytes = b"{broken"
+    bad.write_bytes(bad_bytes)
+
+    sample = audit_sample.staging_root(data_dir) / "audit-sample-999.json"
+    with pytest.raises(ValueError, match="unreadable staging record .*unreadable.json"):
+        audit_sample.main(
+            ["--data-dir", str(data_dir), "sample", "--seed", "999", "--no-bundle"]
+        )
+    assert not sample.exists()
+
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])
+    out = capsys.readouterr().out
+    state = json.loads(
+        (
+            audit_sample.staging_root(data_dir) / audit_sample.REPORT_STATE_NAME
+        ).read_text()
+    )
+    assert rc == 2
+    assert "INCOMPLETE AUDIT: unreadable staging record" in out
+    assert state["state"] == "incomplete" and state["budget_met"] is None
+    assert "unreadable.json" in state["reason"]
+    assert bad.read_bytes() == bad_bytes
+    assert archived.read_bytes() == archived_bytes
+    assert glm_stage.verdict_binding(data_dir, "population", record) == (True, None)
+    assert len(envelope["lot"]) == 1
+
+
+def test_malformed_promotion_journal_cannot_complete_report(data_dir, capsys):
+    record = make_record("ledger")
+    write_record(data_dir, record)
+    write_envelope(data_dir)
+    audit_sample.record_verdict(data_dir, "ledger", "pass")
+    root = audit_sample.staging_root(data_dir)
+    journal = root / "promoted.jsonl"
+    journal.write_text('{"doc_id":"ledger"}\n{broken\n', encoding="utf-8")
+
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])
+    out = capsys.readouterr().out
+    state = json.loads((root / audit_sample.REPORT_STATE_NAME).read_text())
+    assert rc == 2
+    assert "malformed promotion journal" in out and "promoted.jsonl:2" in out
+    assert state["state"] == "incomplete" and state["budget_met"] is None
+    assert "promoted.jsonl:2" in state["reason"]
+
+
+def test_malformed_audit_history_cannot_complete_report(data_dir, capsys):
+    record = make_record("history-population")
+    write_record(data_dir, record)
+    write_envelope(data_dir)
+    root = audit_sample.staging_root(data_dir)
+    history = root / audit_sample.AUDIT_RESULTS_NAME
+    history.write_text(
+        json.dumps([pass_entry("history-population"), None]), encoding="utf-8"
+    )
+
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])
+    out = capsys.readouterr().out
+    state = json.loads((root / audit_sample.REPORT_STATE_NAME).read_text())
+    assert rc == 2
+    assert "malformed audit history" in out
+    assert state["state"] == "incomplete" and state["budget_met"] is None
+
+
 def test_cli_report_sha_drift_refuses(data_dir, capsys):
     record = make_record("p9", rows=[["X", "Purchase", "01/15/24", None, "A"]])
     write_record(data_dir, record)

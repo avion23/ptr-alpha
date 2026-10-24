@@ -370,15 +370,21 @@ def find_staging_record(data_dir: str | Path, doc_id: str) -> tuple[int, Staging
 
 
 def iter_staging_records(data_dir: str | Path) -> list[tuple[int, StagingRecord]]:
-    """All staging records, ordered (year, doc_id)."""
+    """Read live ``<year>/*.json`` records, ordered (year, doc_id).
+
+    Root-level audit metadata and ``<year>/attempts/`` history are outside
+    this population; an absent root/year is an empty population. Every JSON
+    file directly in a year directory is a live document record and must be
+    readable before callers can use population counts or promotion gates.
+    """
     records = []
     root = staging_root(data_dir)
     for year_dir in sorted(root.glob("[0-9]" * 4), key=lambda p: p.name):
         for path in sorted(year_dir.glob("*.json")):
             try:
                 record = decode_staging_record(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"unreadable staging record {path}: {exc}") from exc
             records.append((int(year_dir.name), record))
     return records
 
@@ -1517,16 +1523,32 @@ def append_promoted_journal(root: Path, entry: dict) -> None:
 
 def read_promoted_journal(root: Path) -> list[dict]:
     path = root / PROMOTED_JOURNAL_NAME
-    if not path.exists():
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
         return []
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"unreadable promotion journal {path}: {exc}") from exc
     entries = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(lines, 1):
         line = line.strip()
         if line:
             try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"malformed promotion journal {path}:{line_number}: {exc}"
+                ) from exc
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("doc_id"), str)
+                or not entry["doc_id"].strip()
+            ):
+                raise ValueError(
+                    f"malformed promotion journal {path}:{line_number}: "
+                    "expected an object with a non-empty doc_id"
+                )
+            entries.append(entry)
     return entries
 
 
@@ -1575,6 +1597,11 @@ def promote_docs(
                 require_audit_pass=require_audit_pass, force_unaudited=force_unaudited,
                 cooldown_note=cooldown_note)
 
+    # Promotion consumes a row from the audited population. Do not let an
+    # explicit doc-id or force override bypass unreadable population/history.
+    staged_records = iter_staging_records(data_dir)
+    load_audit_results(data_dir)
+    read_promoted_journal(staging_root(data_dir))
     db_path = str(db_path or default_db_path(data_dir))
     root = staging_root(data_dir)
     progress_path = Path(data_dir) / Path(ocr.PROGRESS_PATH).name
@@ -1583,7 +1610,7 @@ def promote_docs(
     if not doc_ids:
         doc_ids = [
             record["doc_id"]
-            for yr, record in iter_staging_records(data_dir)
+            for yr, record in staged_records
             if yr == int(year)
         ]
 

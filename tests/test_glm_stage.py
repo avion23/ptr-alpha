@@ -1104,6 +1104,25 @@ def test_staging_status_counts(data_dir, fake_insert):
     ]
 
 
+def test_malformed_promotion_journal_blocks_explicit_promotion(data_dir, fake_insert):
+    stage_one(data_dir, 2024, "journal", GLM_OUTPUT_ONE_ROW)
+    audit_sample.record_verdict(data_dir, "journal", "pass", "matches pixels")
+    write_report_state(data_dir)
+    live = glm_stage.staging_record_path(data_dir, 2024, "journal")
+    live_bytes = live.read_bytes()
+    journal = glm_stage.staging_root(data_dir) / glm_stage.PROMOTED_JOURNAL_NAME
+    journal.write_text('{"doc_id":"previous"}\n{broken\n', encoding="utf-8")
+    journal_bytes = journal.read_bytes()
+
+    with pytest.raises(ValueError, match="malformed promotion journal .*:2"):
+        glm_stage.promote_docs(2024, ["journal"], data_dir=data_dir)
+
+    assert fake_insert == []
+    assert live.read_bytes() == live_bytes
+    assert journal.read_bytes() == journal_bytes
+    assert glm_stage.archived_attempts(data_dir, 2024, "journal") == []
+
+
 # --------------------------------------------------------------------------
 # audit: sampler determinism, bundle, verdicts, report math
 # --------------------------------------------------------------------------
@@ -1558,6 +1577,31 @@ def test_archived_attempts_are_not_live_records(data_dir):
         path.read_bytes()
         for _, path in glm_stage.archived_attempts(data_dir, 2024, "iso1")
     ] == archived_bytes
+
+
+def test_unreadable_live_record_blocks_population_consumption(data_dir, fake_insert):
+    write_staged_records(data_dir, {2024: ["population"]})
+    archived = glm_stage.archive_current_attempt(data_dir, 2024, "population")
+    assert archived is not None
+    archived_bytes = archived.read_bytes()
+    write_staged_records(data_dir, {2024: ["population"]})
+    live = glm_stage.staging_record_path(data_dir, 2024, "population")
+    live_bytes = live.read_bytes()
+    bad = glm_stage.staging_root(data_dir) / "2024" / "unreadable.json"
+    bad_bytes = b"{broken"
+    bad.write_bytes(bad_bytes)
+
+    with pytest.raises(ValueError, match="unreadable staging record .*unreadable.json"):
+        glm_stage.iter_staging_records(data_dir)
+    with pytest.raises(ValueError, match="unreadable staging record .*unreadable.json"):
+        audit_sample.load_staging_records(data_dir)
+    with pytest.raises(ValueError, match="unreadable staging record .*unreadable.json"):
+        glm_stage.promote_docs(2024, ["population"], data_dir=data_dir)
+
+    assert fake_insert == []
+    assert live.read_bytes() == live_bytes
+    assert bad.read_bytes() == bad_bytes
+    assert archived.read_bytes() == archived_bytes
 
 
 def test_restage_preserves_all_archived_attempt_bytes(data_dir):

@@ -450,17 +450,11 @@ def staged_record_sha256(record: dict) -> str:
 
 
 def load_staging_records(data_dir: str | Path = "data") -> list[tuple[int, dict]]:
-    """(year, record) pairs for every readable staging JSON, sorted."""
-    root = staging_root(data_dir)
-    records = []
-    for year_dir in sorted(root.glob("[0-9]" * 4), key=lambda p: p.name):
-        for path in sorted(year_dir.glob("*.json")):
-            try:
-                record = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            records.append((int(year_dir.name), record))
-    return records
+    """Return the complete live-record population; never omit a bad file."""
+    # Lazy import avoids glm_stage's existing import of this audit module.
+    from scripts.glm_stage import iter_staging_records
+
+    return iter_staging_records(data_dir)
 
 
 def _sampling_frame(records: list[tuple[int, dict]]) -> dict[int, list[str]]:
@@ -981,13 +975,15 @@ def cmd_record(args) -> int:
 
 def load_audit_results(data_dir: str | Path = "data") -> list[dict]:
     path = staging_root(data_dir) / AUDIT_RESULTS_NAME
-    if not path.exists():
-        return []
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         return []
-    return loaded if isinstance(loaded, list) else []
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"unreadable audit history {path}: {exc}") from exc
+    if not isinstance(loaded, list) or any(not isinstance(item, dict) for item in loaded):
+        raise ValueError(f"malformed audit history {path}: expected a list of objects")
+    return loaded
 
 
 def load_sample_lot(
@@ -1008,7 +1004,7 @@ def load_sample_lot(
         return None, f"sample file not found: {path}"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         return None, f"unreadable sample file {path}: {exc}"
     if not (
         isinstance(payload, dict)
@@ -1023,16 +1019,12 @@ def load_sample_lot(
 
 
 def load_promoted_doc_ids(data_dir: str | Path = "data") -> set[str]:
-    path = staging_root(data_dir) / "promoted.jsonl"
-    if not path.exists():
-        return set()
-    promoted = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            promoted.add(str(json.loads(line)["doc_id"]))
-        except (json.JSONDecodeError, KeyError, TypeError):
-            continue
-    return promoted
+    # Keep status and audit accounting on the same append-only journal parser.
+    from scripts.glm_stage import read_promoted_journal
+
+    return {
+        entry["doc_id"] for entry in read_promoted_journal(staging_root(data_dir))
+    }
 
 
 def load_ground_truth_rows(ground_truth_dir: str | Path, doc_id: str) -> list | None:
@@ -1668,26 +1660,43 @@ def cmd_report(args) -> int:
         return 2
 
     sample_file_name = Path(args.sample_file).name if args.sample_file else (
-        sorted((root).glob("audit-sample-*.json"))[-1].name
+        sorted(root.glob("audit-sample-*.json"))[-1].name
     )
-    records = load_staging_records(args.data_dir)
-    staged_records_by_doc = {str(record["doc_id"]): record for _, record in records}
-    staged_rows_by_doc = {
-        doc_id: list(record.get("rows") or [])
-        for doc_id, record in staged_records_by_doc.items()
-    }
-    promoted = load_promoted_doc_ids(args.data_dir)
-    report = build_report(
-        load_audit_results(args.data_dir),
-        staged_rows_by_doc,
-        promoted,
-        ground_truth_dir=args.ground_truth_dir,
-        max_rate=args.max_rate,
-        lot=envelope["lot"],
-        staged_records_by_doc=staged_records_by_doc,
-        frame_counts_by_year=envelope.get("frame_counts_by_year"),
-        frame_counts_by_stratum=envelope.get("frame_counts_by_stratum"),
-    )
+    try:
+        records = load_staging_records(args.data_dir)
+        staged_records_by_doc = {str(record["doc_id"]): record for _, record in records}
+        staged_rows_by_doc = {
+            doc_id: list(record.get("rows") or [])
+            for doc_id, record in staged_records_by_doc.items()
+        }
+        promoted = load_promoted_doc_ids(args.data_dir)
+        report = build_report(
+            load_audit_results(args.data_dir),
+            staged_rows_by_doc,
+            promoted,
+            ground_truth_dir=args.ground_truth_dir,
+            max_rate=args.max_rate,
+            lot=envelope["lot"],
+            staged_records_by_doc=staged_records_by_doc,
+            frame_counts_by_year=envelope.get("frame_counts_by_year"),
+            frame_counts_by_stratum=envelope.get("frame_counts_by_stratum"),
+        )
+    except (OSError, ValueError) as exc:
+        reason = str(exc)
+        state_payload = _incomplete_state_payload(
+            reason,
+            max_rate=args.max_rate,
+            sample_file=sample_file_name,
+            omission_check_status=(
+                "configured" if args.ground_truth_dir is not None else "not_run"
+            ),
+        )
+        _atomic_write_json(root / REPORT_STATE_NAME, state_payload)
+        print(CAVEAT)
+        print(f"INCOMPLETE AUDIT: {reason}")
+        print(f"HOW TO FIX: {_completion_guidance(reason)}")
+        print("budget_met cannot be computed; canonical promotion must not proceed.")
+        return 2
 
     pct = lambda value: f"{value * 100:.4g}%"  # noqa: E731
 

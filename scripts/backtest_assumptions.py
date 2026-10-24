@@ -195,7 +195,13 @@ def _walkforward_dir() -> Path:
 def _capture_paths(decision: date) -> tuple[Path, Path, Path, bool]:
     """Resolve new immutable bundles, retaining read access to legacy flat files."""
     bundle = _walkforward_dir() / "captures" / str(decision)
-    if os.path.lexists(bundle):
+    bundled = os.path.lexists(bundle)
+    legacy = _legacy_capture_is_complete(decision)
+    if bundled and legacy:
+        raise SystemExit(
+            f"CAPTURE CONFLICT: {decision} has both bundle and legacy inputs"
+        )
+    if bundled:
         return (
             bundle / "cohorts.csv",
             bundle / "actors.csv",
@@ -265,7 +271,7 @@ def _validate_capture(
     *,
     verify_hashes: bool = True,
 ) -> dict:
-    """Validate the frozen input pair and its receipt before labels are read."""
+    """Validate a capture before labels; skip hashes only to preserve legacy evidence."""
     try:
         manifest = json.loads(manifest_path.read_text())
         cohorts = pd.read_csv(cohort_path)
@@ -304,6 +310,7 @@ def _validate_capture(
 
 
 def _legacy_capture_is_complete(decision: date) -> bool:
+    """Recognize complete legacy evidence for overwrite guards, not label trust."""
     cohort_path = OUT_DIR / f"cohorts_{decision}.csv"
     actor_path = OUT_DIR / f"actors_{decision}.csv"
     manifest_path = OUT_DIR / f"manifest_{decision}.json"
@@ -980,7 +987,7 @@ def cmd_capture(decision: date, db=None, *, frame: str):
         staging / "actors.csv",
         staging / "manifest.json",
     )
-    if os.path.lexists(target):
+    if os.path.lexists(target) or _legacy_capture_is_complete(decision):
         raise SystemExit(f"CAPTURE OVERWRITE: {decision} capture appeared during staging")
     try:
         os.rename(staging, target)

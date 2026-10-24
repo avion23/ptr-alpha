@@ -564,6 +564,83 @@ def test_capture_requires_complete_matching_preexisting_hash_binding(
     )["artifact_sha256"] == hashes
 
 
+def test_legacy_capture_during_staging_is_preserved_and_not_shadowed(
+    tmp_path, monkeypatch, frame_script
+):
+    decision = date(2027, 1, 15)
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(frame_script, "OUT_DIR", out_dir)
+    monkeypatch.setattr(frame_script, "date", CaptureDate)
+
+    def write_capture(directory, ticker, *, legacy):
+        directory.mkdir(parents=True, exist_ok=True)
+        if legacy:
+            cohort = directory / f"cohorts_{decision}.csv"
+            actor = directory / f"actors_{decision}.csv"
+            manifest_path = directory / f"manifest_{decision}.json"
+        else:
+            cohort = directory / "cohorts.csv"
+            actor = directory / "actors.csv"
+            manifest_path = directory / "manifest.json"
+        cohort.write_text(f"ticker,as_of,frame\n{ticker},{decision},ingestion\n")
+        actor.write_text(f"ticker,as_of,frame\n{ticker},{decision},ingestion\n")
+        manifest = {
+            "capture_only": True,
+            "decision": str(decision),
+            "frame": "ingestion",
+            "rows": 1,
+            "actor_rows": 1,
+        }
+        if not legacy:
+            manifest["artifact_sha256"] = {
+                "cohorts.csv": frame_script.sha256_file(cohort),
+                "actors.csv": frame_script.sha256_file(actor),
+            }
+        manifest_path.write_text(json.dumps(manifest))
+
+    def publish_legacy_while_staging(
+        _decision, _db, *, frame, capture_only, capture_output_dir
+    ):
+        assert frame == "ingestion" and capture_only
+        write_capture(out_dir, "OLD_LEGACY", legacy=True)
+        write_capture(capture_output_dir, "NEW_BUNDLE", legacy=False)
+
+    monkeypatch.setattr(frame_script, "cmd_run", publish_legacy_while_staging)
+    with pytest.raises(SystemExit, match="capture appeared during staging"):
+        frame_script.cmd_capture(decision, frame="ingestion")
+
+    capture_dir = out_dir / "walkforward" / "captures" / str(decision)
+    legacy_paths = (
+        out_dir / f"cohorts_{decision}.csv",
+        out_dir / f"actors_{decision}.csv",
+        out_dir / f"manifest_{decision}.json",
+    )
+    legacy_bytes = {path: path.read_bytes() for path in legacy_paths}
+    assert not capture_dir.exists()
+    cohort_path, actor_path, manifest_path, bundled = frame_script._capture_paths(
+        decision
+    )
+    assert not bundled
+    assert (cohort_path, actor_path, manifest_path) == legacy_paths
+    assert pd.read_csv(cohort_path).loc[0, "ticker"] == "OLD_LEGACY"
+
+    monkeypatch.setattr(frame_script, "date", UnsealDate)
+    with pytest.raises(SystemExit, match="UNVERIFIED CAPTURE"):
+        frame_script.cmd_attach_outcomes(decision, frame="ingestion")
+    outcome_path = out_dir / f"outcomes_{decision}.csv"
+    outcome_path.write_text("legacy evidence\n")
+    with pytest.raises(SystemExit, match="UNVERIFIED CAPTURE"):
+        frame_script.cmd_analyze_capture(decision, frame="ingestion")
+    assert {path: path.read_bytes() for path in legacy_paths} == legacy_bytes
+    assert outcome_path.read_bytes() == b"legacy evidence\n"
+
+    # If a publisher races past its final preflight, readers reject ambiguity.
+    write_capture(capture_dir, "NEW_BUNDLE", legacy=False)
+    with pytest.raises(SystemExit, match="CAPTURE CONFLICT"):
+        frame_script._capture_paths(decision)
+    assert {path: path.read_bytes() for path in legacy_paths} == legacy_bytes
+
+
 def test_outcome_failure_never_publishes_partial_target_and_retry_is_write_once(
     tmp_path, monkeypatch, frame_script
 ):

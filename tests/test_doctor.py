@@ -5,7 +5,6 @@ crashed on first real use (ATTACH parameter binding). This runs the actual
 script in a subprocess so the wired product, not a reimplementation, is what
 is verified."""
 
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -51,6 +50,14 @@ class DoctorIntegrationTest(TestCase):
         stamp = datetime.now(timezone.utc).timestamp() - heartbeat_age_s
         os.utime(heartbeat, (stamp, stamp))
         env["DOCTOR_HEARTBEAT"] = str(heartbeat)
+        # The subprocess must not depend on the operator's installed crontab.
+        bin_dir = alerts / "bin"
+        bin_dir.mkdir()
+        crontab = bin_dir / "crontab"
+        contract = (REPO / "cron" / "crontab.txt").read_text().replace("@REPO@", str(REPO))
+        crontab.write_text("#!/bin/sh\ncat <<'CRONTAB_FIXTURE'\n" + contract + "\nCRONTAB_FIXTURE\n")
+        crontab.chmod(0o700)
+        env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
         result = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "doctor.py")],
             capture_output=True,
@@ -70,6 +77,7 @@ class DoctorIntegrationTest(TestCase):
         self.assertIn("[PASS] dividends.populated", output)
         self.assertIn("[PASS] doctor.alive", output)
         self.assertIn("[PASS] crontab.contract", output)
+        self.assertIn("repo cron lines match cron/crontab.txt", output)
         self.assertNotIn("unavailable", output)  # synthetic schema is sufficient
 
     def test_starved_dividends_and_dead_heartbeat_fail(self):

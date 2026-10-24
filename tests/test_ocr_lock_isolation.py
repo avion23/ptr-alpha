@@ -119,7 +119,9 @@ class TestOcrLockIsolation(unittest.TestCase):
             patch("analyzer.cli.Path"),
         ):
             run.return_value = MagicMock(
-                returncode=0, stdout="Total inserted: 7\n", stderr=""
+                returncode=0,
+                stdout='{"schema":"ocr-year-summary-v1","inserted":7}\n',
+                stderr="",
             )
             inserted, error = _run_gemini_ocr_year_subprocess("data", 2026)
         self.assertIsNone(error)

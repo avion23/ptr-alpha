@@ -35,7 +35,7 @@ import sys
 import time
 from datetime import date
 from multiprocessing import Pool
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import duckdb
 
@@ -1483,7 +1483,7 @@ def ingest_senate_window(args) -> None:
     if not mpath.exists():
         raise SystemExit(f"window manifest not found: {mpath}")
     window_manifest = json.loads(mpath.read_text())
-    verification = _verify_artifact_files(window_manifest, window_dir)
+    verification = _verify_senate_artifact_files(window_manifest, window_dir)
     if verification["mismatches"]:
         raise SystemExit(
             f"senate window hash mismatch: {verification['mismatches']}"
@@ -1491,7 +1491,9 @@ def ingest_senate_window(args) -> None:
     _validated_senate_inventory(window_dir, window_manifest)
     db = Database(staging / "congress.duckdb", read_only=False)
     try:
-        ingest = _ingest_senate(window_dir, window_manifest, db)
+        ingest = _ingest_senate(
+            window_dir, window_manifest, db, artifact_verification=verification
+        )
         generation = window_manifest["generation"]
         record = {
             "status": "ingested",
@@ -2592,6 +2594,136 @@ def _verify_artifact_files(manifest: dict, base: Path) -> dict:
     return results
 
 
+def _verify_senate_artifact_files(manifest: dict, base: Path) -> dict:
+    """Require the Senate bundle's file-hash claims before consuming it.
+
+    The generic sibling verifier intentionally tolerates diagnostic manifests
+    without file hashes. Senate persistence is different: its inventory and
+    normalized transactions must always have source-declared byte hashes, and
+    staged paper PDFs must remain bound to their inventory rows.
+    """
+    results = {"files_checked": 0, "mismatches": []}
+    if not isinstance(manifest, dict):
+        results["mismatches"].append("Senate manifest is not an object")
+        return results
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        results["mismatches"].append("Senate manifest has no artifact claims")
+        return results
+
+    required = {"report_inventory.jsonl", "transactions.jsonl"}
+    malformed = False
+    for name in sorted(required - artifacts.keys()):
+        results["mismatches"].append(f"{name}: missing required Senate hash claim")
+        malformed = True
+    for name, meta in artifacts.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(meta, dict)
+            or meta.get("file") != name
+            or not isinstance(meta.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", meta["sha256"]) is None
+            or isinstance(meta.get("bytes"), bool)
+            or not isinstance(meta.get("bytes"), int)
+            or meta["bytes"] < 0
+        ):
+            results["mismatches"].append(
+                f"{name!r}: malformed Senate artifact hash claim"
+            )
+            malformed = True
+            continue
+        relative = PurePosixPath(name)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != name
+            or "\\" in name
+            or any(part in ("", ".", "..") for part in relative.parts)
+        ):
+            results["mismatches"].append(f"{name}: unsafe Senate artifact path")
+            malformed = True
+            continue
+        path = base.joinpath(*relative.parts)
+        current = base
+        path_invalid = False
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                results["mismatches"].append(f"{name}: symlink Senate artifact path")
+                malformed = True
+                path_invalid = True
+                break
+        if path_invalid:
+            continue
+        if path.exists() and not path.is_file():
+            results["mismatches"].append(f"{name}: Senate artifact is not a file")
+            malformed = True
+
+    if malformed:
+        return results
+
+    # Hash verification is deliberately reused; only the Senate-specific
+    # required-claim and raw-paper binding contract is stricter here.
+    results = _verify_artifact_files(manifest, base)
+    if results["mismatches"]:
+        return results
+    for name, meta in artifacts.items():
+        if (base / name).stat().st_size != meta["bytes"]:
+            results["mismatches"].append(f"{name}: byte-size mismatch")
+
+    paper_files: set[str] = set()
+    try:
+        for line in (base / "report_inventory.jsonl").read_text().splitlines():
+            if not line:
+                raise ValueError("blank report inventory line")
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError("report inventory row is not an object")
+            if row.get("outcome") != "paper_only":
+                if row.get("paper_artifact_sha256") is not None:
+                    raise ValueError("nonpaper row declares a paper artifact hash")
+                continue
+            source_record_id = row.get("source_record_id")
+            paper_sha = row.get("paper_artifact_sha256")
+            if (
+                not isinstance(source_record_id, str)
+                or not source_record_id
+                or source_record_id in (".", "..")
+                or "/" in source_record_id
+                or "\\" in source_record_id
+                or not isinstance(paper_sha, str)
+                or re.fullmatch(r"[0-9a-f]{64}", paper_sha) is None
+            ):
+                raise ValueError("paper-only row has malformed raw artifact binding")
+            name = f"papers/{source_record_id}.pdf"
+            claim = artifacts.get(name)
+            if not isinstance(claim, dict) or claim["sha256"] != paper_sha:
+                raise ValueError(f"{name}: paper hash claim does not match inventory")
+            if name in paper_files:
+                raise ValueError(f"{name}: duplicate paper inventory binding")
+            paper_files.add(name)
+    except (OSError, ValueError) as exc:
+        results["mismatches"].append(f"report_inventory.jsonl: invalid paper binding ({exc})")
+        return results
+
+    declared_papers = {name for name in artifacts if name.startswith("papers/")}
+    if declared_papers != paper_files:
+        results["mismatches"].append(
+            "Senate paper artifact claims do not match paper-only inventory rows"
+        )
+    papers_dir = base / "papers"
+    if papers_dir.is_symlink() or (papers_dir.exists() and not papers_dir.is_dir()):
+        results["mismatches"].append("papers: invalid Senate artifact directory")
+    elif papers_dir.is_dir():
+        actual_papers = {
+            path.relative_to(base).as_posix() for path in papers_dir.glob("*.pdf")
+        }
+        if actual_papers != paper_files:
+            results["mismatches"].append(
+                "staged Senate paper files do not match declared inventory bindings"
+            )
+    return results
+
+
 def _sibling_search_dirs(track: str, generation: str) -> list[Path]:
     """Locate a sibling track's artifact dir in any sibling worktree."""
     candidates = [
@@ -2674,10 +2806,25 @@ def _validated_senate_inventory(track_dir: Path, track_manifest: dict):
     return inventory
 
 
-def _ingest_senate(track_dir: Path, track_manifest: dict, db: Database) -> dict:
+def _ingest_senate(
+    track_dir: Path,
+    track_manifest: dict,
+    db: Database,
+    *,
+    artifact_verification: dict | None = None,
+) -> dict:
     """Persist a verified senate sweep via Database.persist_source_refresh."""
     import pandas as pd  # noqa: PLC0415
 
+    if artifact_verification is None:
+        artifact_verification = _verify_senate_artifact_files(
+            track_manifest, track_dir
+        )
+    if artifact_verification["mismatches"]:
+        raise ValueError(
+            f"Senate artifact verification failed: "
+            f"{artifact_verification['mismatches']}"
+        )
     inv = _validated_senate_inventory(track_dir, track_manifest)
     generation = track_manifest["generation"]
     tx = pd.read_json(track_dir / "transactions.jsonl", lines=True)
@@ -2979,7 +3126,11 @@ def consume(args) -> None:
                 print(f"consume {track}: UNVERIFIED (no manifest.json)")
                 continue
             track_manifest = json.loads(mpath.read_text())
-            verification = _verify_artifact_files(track_manifest, track_dir)
+            verification = (
+                _verify_senate_artifact_files(track_manifest, track_dir)
+                if track == "senate"
+                else _verify_artifact_files(track_manifest, track_dir)
+            )
             entry = {
                 "status": "present",
                 "path": str(track_dir),
@@ -2992,7 +3143,12 @@ def consume(args) -> None:
                 continue
             try:
                 if track == "senate":
-                    entry["ingest"] = _ingest_senate(track_dir, track_manifest, db)
+                    entry["ingest"] = _ingest_senate(
+                        track_dir,
+                        track_manifest,
+                        db,
+                        artifact_verification=verification,
+                    )
                     entry["status"] = "ingested"
                 elif track == "prices":
                     entry["ingest"] = _ingest_prices(track_dir, track_manifest, db)

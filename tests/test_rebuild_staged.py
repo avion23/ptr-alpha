@@ -1,5 +1,6 @@
 """Regression tests for the staged rebuild parser boundary."""
 
+import hashlib
 import importlib
 import json
 from datetime import date
@@ -8,6 +9,17 @@ from typing import cast
 
 import pandas as pd
 import pytest
+
+
+def _senate_test_artifacts(track_dir):
+    return {
+        name: {
+            "file": name,
+            "sha256": hashlib.sha256((track_dir / name).read_bytes()).hexdigest(),
+            "bytes": (track_dir / name).stat().st_size,
+        }
+        for name in ("report_inventory.jsonl", "transactions.jsonl")
+    }
 
 
 def test_rebuild_import_does_not_set_docling_environment(monkeypatch):
@@ -197,6 +209,7 @@ def test_senate_ingest_rejects_generation_provenance_rewrite(tmp_path):
                 "status": "complete",
                 "canary_expect": "exact",
                 "canaries": verify_canaries(inventory),
+                "artifacts": _senate_test_artifacts(tmp_path),
             },
             cast(rebuild_staged.Database, db),
         )
@@ -249,6 +262,7 @@ def test_senate_ingest_rejects_missing_or_failed_canary_contract(tmp_path, mutat
         "status": "complete",
         "canary_expect": "exact",
         "canaries": verify_canaries(inventory),
+        "artifacts": _senate_test_artifacts(tmp_path),
     }
     if mutation == "missing_mode":
         manifest.pop("canary_expect")
@@ -277,6 +291,79 @@ def test_senate_ingest_rejects_missing_or_failed_canary_contract(tmp_path, mutat
             tmp_path, manifest, cast(rebuild_staged.Database, db)
         )
     assert db.writes == 0
+
+
+@pytest.mark.parametrize("failure", ["missing", "malformed"])
+def test_senate_ingest_rejects_bad_artifact_claims_before_persistence(
+    tmp_path, failure
+):
+    from scripts import rebuild_staged
+    from scripts.senate_sweep import verify_canaries
+
+    generation = "manifest-generation"
+    inventory = [
+        {
+            "member": "Katie Britt",
+            "outcome": "parsed",
+            "accepted_row_count": 1,
+            "source_record_id": "britt-report",
+            "official_filing_date": "2026-01-01",
+            "ingestion_generation": generation,
+        },
+        {
+            "member": "Rick Scott",
+            "outcome": "parsed",
+            "accepted_row_count": 12,
+            "source_record_id": "scott-report",
+            "official_filing_date": "2026-01-02",
+            "ingestion_generation": generation,
+        },
+    ]
+    (tmp_path / "report_inventory.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in inventory)
+    )
+    (tmp_path / "transactions.jsonl").write_text(
+        json.dumps({"ingestion_generation": generation}) + "\n"
+    )
+    original_bytes = {
+        name: (tmp_path / name).read_bytes()
+        for name in ("report_inventory.jsonl", "transactions.jsonl")
+    }
+
+    class FakeDatabase:
+        writes = 0
+
+        def persist_source_refresh(self, **_kwargs):
+            self.writes += 1
+
+    db = FakeDatabase()
+    artifacts = _senate_test_artifacts(tmp_path)
+    if failure == "missing":
+        artifacts.pop("transactions.jsonl")
+        error = "missing required Senate hash claim"
+    else:
+        artifacts["transactions.jsonl"]["sha256"] = "not-a-sha256"
+        error = "malformed Senate artifact hash claim"
+    canaries = verify_canaries(
+        inventory,
+        expected={"KATIE BRITT": None, "RICK SCOTT": None},
+    )
+    with pytest.raises(ValueError, match=error):
+        rebuild_staged._ingest_senate(
+            tmp_path,
+            {
+                "generation": generation,
+                "status": "complete",
+                "canary_expect": "any",
+                "canaries": canaries,
+                "artifacts": artifacts,
+            },
+            cast(rebuild_staged.Database, db),
+        )
+    assert db.writes == 0
+    assert original_bytes == {
+        name: (tmp_path / name).read_bytes() for name in original_bytes
+    }
 
 
 def test_text_only_pass_accepts_only_text_proven_complete_coverage(monkeypatch):

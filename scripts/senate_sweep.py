@@ -593,6 +593,9 @@ def merge_window(window_dir: Path, generation: str | None = None) -> int:
         prefix=".senate-merge-", dir=window_dir.parent
     ) as temp:
         bundle_dir = Path(temp)
+        from scripts.rebuild_staged import (  # noqa: PLC0415
+            _verify_senate_artifact_files,
+        )
 
         inventory: list[dict] = []
         transactions: list[dict] = []
@@ -609,6 +612,12 @@ def merge_window(window_dir: Path, generation: str | None = None) -> int:
             if not manifest_path.is_file():
                 raise SenateSweepError(f"chunk {chunk_dir.name} missing manifest.json")
             chunk_manifest = json.loads(manifest_path.read_text())
+            verification = _verify_senate_artifact_files(chunk_manifest, chunk_dir)
+            if verification["mismatches"]:
+                raise SenateSweepError(
+                    f"chunk {chunk_dir.name} Senate artifact verification failed: "
+                    f"{verification['mismatches']}"
+                )
             chunk_generation = chunk_manifest.get("generation")
             if not isinstance(chunk_generation, str) or not chunk_generation:
                 raise SenateSweepError(

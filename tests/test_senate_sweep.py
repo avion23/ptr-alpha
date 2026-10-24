@@ -736,6 +736,14 @@ def test_merge_window_rejects_unsupported_multi_generation_without_mutation(tmp_
     source_paper = d / "chunk-2024" / "papers" / f"{paper_id}.pdf"
     source_paper.parent.mkdir()
     source_paper.write_bytes(paper_bytes)
+    child_manifest_path = d / "chunk-2024" / "manifest.json"
+    child_manifest = json.loads(child_manifest_path.read_text())
+    child_manifest["artifacts"][f"papers/{paper_id}.pdf"] = {
+        "file": f"papers/{paper_id}.pdf",
+        "sha256": hashlib.sha256(paper_bytes).hexdigest(),
+        "bytes": len(paper_bytes),
+    }
+    child_manifest_path.write_text(json.dumps(child_manifest, sort_keys=True) + "\n")
     generation = "window-merged"
     merged = tmp_path / generation
     source_bytes = _bundle_bytes(d)
@@ -743,6 +751,71 @@ def test_merge_window_rejects_unsupported_multi_generation_without_mutation(tmp_
         merge_window(d, generation)
     assert not merged.exists()
     assert _bundle_bytes(d) == source_bytes
+    assert not list(tmp_path.glob(".senate-merge-*"))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "stale_inventory_hash",
+        "stale_transactions_hash",
+        "missing_inventory_hash",
+        "missing_transactions_hash",
+        "malformed_transactions_hash",
+    ],
+)
+def test_merge_window_requires_child_artifact_claims_before_consumption(
+    tmp_path, failure
+):
+    from scripts.senate_sweep import SenateSweepError, merge_window
+
+    root = tmp_path / "unsealed-children"
+    root.mkdir()
+    generation = "shared-generation"
+    _synthetic_chunk(
+        root,
+        "chunk-a",
+        [_inventory_row(ingestion_generation=generation)],
+        [],
+        (date(2024, 1, 1), date(2024, 12, 31)),
+        generation=generation,
+    )
+    chunk = root / "chunk-a"
+    if failure == "stale_inventory_hash":
+        altered = inventory_records(
+            [
+                _inventory_row(
+                    source_record_id=SCOTT_REPORT_ID,
+                    report_path=SCOTT_REPORT_PATH,
+                    member="Rick Scott",
+                    accepted_row_count=12,
+                    ingestion_generation=generation,
+                )
+            ]
+        )[0]
+        with (chunk / "report_inventory.jsonl").open("a") as handle:
+            handle.write(json.dumps(altered, sort_keys=True) + "\n")
+    elif failure == "stale_transactions_hash":
+        (chunk / "transactions.jsonl").write_text("[]\n")
+    else:
+        manifest_path = chunk / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        if failure == "malformed_transactions_hash":
+            manifest["artifacts"]["transactions.jsonl"]["sha256"] = "malformed"
+        else:
+            artifact = (
+                "report_inventory.jsonl"
+                if failure == "missing_inventory_hash"
+                else "transactions.jsonl"
+            )
+            manifest["artifacts"].pop(artifact)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+
+    before = _bundle_bytes(root)
+    with pytest.raises(SenateSweepError, match="artifact verification"):
+        merge_window(root, generation)
+    assert not (tmp_path / generation).exists()
+    assert _bundle_bytes(root) == before
     assert not list(tmp_path.glob(".senate-merge-*"))
 
 
@@ -784,7 +857,9 @@ def test_merge_window_dedupes_and_quarantines_when_chunk_quarantined(tmp_path):
     assert manifest["quarantine"]["missing"]["unavailable"] == 1
     from scripts import rebuild_staged
 
-    assert rebuild_staged._verify_artifact_files(manifest, merged)["mismatches"] == []
+    verification = rebuild_staged._verify_senate_artifact_files(manifest, merged)
+    assert verification["mismatches"] == []
+    assert verification["files_checked"] == 2  # includes the hashed empty transactions file
 
 
 @pytest.mark.parametrize("duplicate_kind", ["report", "transaction"])

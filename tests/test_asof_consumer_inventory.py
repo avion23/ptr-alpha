@@ -25,6 +25,7 @@ LOADERS = {
     "get_transactions", "get_house_transactions", "get_transactions_by_date_range",
     "get_skill_history", "get_by_year", "get_house_by_year", "get_by_date_range",
     "load_member_trades", "_member_variants", "_load_actor_members",
+    "_unpromoted_transaction_source", "_load_unpromoted_rows",
     "_analysis_transactions", "get_entry_prices",
     "get_for_doc", "get_transactions_for_doc",
 }
@@ -88,7 +89,9 @@ EXEMPT = {
     "src/analyzer/persistence/parse_run_repository.py:ParseRunRepository.upsert": 1,  # Ingestion timestamp provenance.
     "src/analyzer/pipeline.py:_analysis_transactions": 1,  # Caller-owned: scoped prepare_analysis_data.
     "src/analyzer/positions.py:_distinct_member_names": 2,  # Caller-owned identity expansion, batched _member_variants; name monitored.
-    "src/analyzer/positions.py:load_member_trades": 4,  # Caller-owned: holdings/follow-member scope; name monitored.
+    "src/analyzer/positions.py:_unpromoted_transaction_source": 1,  # Caller-owned SQL source; only _load_unpromoted_rows uses it; cutoff selects created/retired versions, absent scope uses current rows.
+    "src/analyzer/positions.py:_load_unpromoted_rows": 2,  # Caller-owned raw loader; batch is @canonical_decision, and historical load_member_trades callers are scoped and monitored below.
+    "src/analyzer/positions.py:load_member_trades": 4,  # Caller-owned member loader; historical callers are @canonical_decision or CLI canonical_as_of; loader name remains monitored.
     "src/analyzer/persistence/price_repository.py:PriceRepository.get_entry_prices": 2,  # Caller-owned repository loader.
     "src/analyzer/row_history.py:accept_corrections": 2,  # Acceptance-history maintenance itself.
     "src/analyzer/senate_efd.py:SenateEFDSource.get_transactions": 1,  # Caller-owned source forwarding.
@@ -183,6 +186,8 @@ def test_inventory_detects_new_unscoped_readers():
         'def added(db, as_of):\n return db.get_transactions_by_date_range(None, as_of)',
         'def added(db, as_of):\n return db.transactions.get_skill_history(as_of, ())',
         'def added(db, as_of):\n return load_member_trades(db, "member")',
+        'def added(db, as_of):\n return _load_unpromoted_rows(db, ["member"])',
+        'def added(db, as_of):\n return _unpromoted_transaction_source(db)',
     ):
         sites = list(inventory(source, "synthetic.py"))
         assert sites and not any(protected for _, _, protected in sites)

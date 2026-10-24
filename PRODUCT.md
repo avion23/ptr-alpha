@@ -26,6 +26,12 @@ The product's defining mechanism is its public-time boundary: disclosure time co
 
 Live analysis, replay, and validation share one production consensus rule rather than parallel scoring authorities.
 
+The existing `setups` CLI exposes a different actor-weighted rule, documented
+in `docs/strategy-charter.md`. It is not an alternative implementation of the
+consensus contract below. Its receipts, scores and validation evidence remain
+separate; neither command availability nor receipt integrity authorizes a
+strategy for capital deployment.
+
 ## Operating Context
 
 - Official House filing acquisition and PDF parsing.

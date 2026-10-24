@@ -6,6 +6,11 @@ pre-registered rule for real money. Parameters below are the current
 operating values, not tuned optima — tuning without an objective was the
 trap this charter closes.
 
+This charter covers the actor-weighted `setups` path and its `kind: setups`
+receipts. It does not redefine the distinct-buyer consensus rule or validate
+`kind: ticker_consensus` decisions. Their scores and evaluation evidence are
+separate; the presence of a ranked setup is not a qualifying consensus signal.
+
 ## Objective (R6)
 
 Maximize 90-calendar-day SPY-relative forward excess per served decision,
@@ -19,10 +24,10 @@ hit rate (fraction of entries with excess > 0), worst-decision loss.
 - Non-goals: sizing (flat $3k always), timing within the window, dividends
   capture (avoided, currently operator-enforced — see R9).
 
-## What the score is (and is not)
+## What the weighted-setup score is (and is not)
 
 Score(T) = 1.5^C(T) · Σ w_a · d_a over accepted actors (see
-`src/analyzer/setups.py:score`). Production weights take exactly five
+`src/analyzer/setups.py:score`). Weighted-setup weights take exactly five
 values ({0.52, 0.26, 0.60, 0.30, 0}; `actors.py:compute_actor_weights`).
 The score is a ranker over entry-quality-weighted recent activity — an
 actor-count vote with adjustments — NOT a predicted return and NOT a

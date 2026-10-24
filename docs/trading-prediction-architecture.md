@@ -6,6 +6,11 @@ This document describes the current PTR Alpha decision and evaluation architectu
 
 PTR Alpha has one production decision rule: count distinct canonical congressional buyers of the same eligible public equity inside a public-disclosure lookback window. Member statistics are descriptive research and do not authorize recommendations.
 
+The existing `setups` command is a separate actor-weighted decision path,
+not another implementation of that consensus rule. Its recipe and validation
+constraints are described in [`strategy-charter.md`](strategy-charter.md).
+Neither its weighted score nor the consensus count is a return forecast.
+
 ## 1. Information boundary
 
 A congressional transaction becomes usable only when the disclosure is public.
@@ -45,7 +50,15 @@ CLI
  |     -> public disclosure window
  |     -> eligible equity identity
  |     -> distinct canonical buyers
- |     -> consensus score
+  |     -> consensus score
+  |     -> ticker_consensus receipt
+  |
+  +-- setups
+  |     -> canonical holdings + eligible events, read-only
+  |     -> actor identity and dated skill weights
+  |     -> entry references + dated quotes + ex-dividend gate
+  |     -> weighted setup score and explicit blocked rows
+  |     -> setups receipt with frozen inputs and recipe
  |
  +-- analyze --mode ranks / signals / member
  |     -> canonical transactions, read-only
@@ -69,6 +82,8 @@ The main code boundaries are:
 | Parser cascade | `src/analyzer/parser_cascade.py`, `src/analyzer/parsing/` |
 | Persistence | `src/analyzer/database.py` and repository modules |
 | Production equity/buyer rule | `src/analyzer/member_ranking/buyer_scoring.py` |
+| Separate weighted setup rule | `src/analyzer/setups.py`, `actors.py`, `positions.py` |
+| Decision receipts and ledger | `src/analyzer/decision_snapshot.py` |
 | Replay recommendation generation | `src/analyzer/backtest/recommend.py` |
 | Historical label construction | `src/analyzer/signals/`, `src/analyzer/backtest/evaluate.py` |
 | Descriptive member ranking | `src/analyzer/member_ranking/ranking.py` |
@@ -120,6 +135,22 @@ For decision date `t`:
 No member skill, price history, trade size, owner field, filing-delay penalty, recency coefficient, confidence factor, crash model, Bayesian prior, or blended quality score enters production scoring.
 
 An empty eligible window is a successful no-signal result. It is distinct from a stale/missing-data warning.
+
+### Separate weighted-setup outputs
+
+`setups` combines accepted actor contributions, holdings evidence and price
+eligibility; it does not count recent congressional buyers under the rule
+above. Its `has_fresh_evidence` flag uses 90 calendar days, not the consensus
+28-day window. Filtering its output by `min_disclosure_lag_days` does not
+recompute the score from that reporting window alone.
+
+Receipts distinguish these paths with `kind: ticker_consensus` and
+`kind: setups`. The latter freezes weights, controls, quote dates and candidate
+inputs for recipe replay. Integrity or replay agreement establishes recorded
+consistency, not source truth, profitability or authorization to trade.
+Validation evidence for the two rules must not be pooled or substituted.
+The availability of either CLI command does not resolve which strategy the
+operator authorizes for capital deployment.
 
 ## 5. Ticker identity
 

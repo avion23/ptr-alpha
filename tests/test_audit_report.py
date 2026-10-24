@@ -806,6 +806,55 @@ def test_unweighted_fallback_is_labelled():
     assert "unweighted-stratum mean" in report["pooling_method"]
 
 
+@pytest.mark.parametrize(
+    ("annual_counts", "reason"),
+    [
+        ({"2024": float("nan")}, "invalid annual frame weight"),
+        ({"2024": 0}, "disagrees with year-by-stratum population"),
+    ],
+)
+def test_invalid_annual_frame_weights_make_report_incomplete(
+    data_dir, capsys, annual_counts, reason
+):
+    record = make_record("weighted")
+    write_record(data_dir, record)
+    write_envelope(data_dir, frame_counts=annual_counts)
+    audit_sample.record_verdict(data_dir, "weighted", "pass")
+
+    rc = audit_sample.main(["--data-dir", str(data_dir), "report"])
+    out = capsys.readouterr().out
+    state = json.loads(
+        (audit_sample.staging_root(data_dir) / audit_sample.REPORT_STATE_NAME).read_text()
+    )
+    assert rc == 2
+    assert reason in out
+    assert state["state"] == "incomplete" and state["budget_met"] is None
+    assert reason in state["reason"]
+
+
+def test_zero_weight_is_valid_for_an_empty_year(data_dir):
+    record = make_record("nonempty", year=2024)
+    write_record(data_dir, record)
+    envelope = write_envelope(
+        data_dir,
+        frame_counts={"2023": 0, "2024": 1},
+        frame_counts_by_stratum={"2024": {"flagged": 0, "unflagged": 1}},
+    )
+    audit_sample.record_verdict(data_dir, "nonempty", "pass")
+    report = audit_sample.build_report(
+        audit_sample.load_audit_results(data_dir),
+        {"nonempty": record["rows"]},
+        set(),
+        lot=envelope["lot"],
+        staged_records_by_doc={"nonempty": record},
+        frame_counts_by_year=envelope["frame_counts_by_year"],
+        frame_counts_by_stratum=envelope["frame_counts_by_stratum"],
+    )
+    assert report["state"] == "complete"
+    assert report["pooled_rate"] == 0.0
+    assert report["pooling_method"].startswith("population-weighted")
+
+
 # --------------------------------------------------------------------------
 # outside-lot verdicts and sample-file contract
 # --------------------------------------------------------------------------

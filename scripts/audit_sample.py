@@ -1110,38 +1110,84 @@ def doc_fail_severity(fail_entries: list) -> tuple[str, bool]:
 
 
 def _weighted_pooled_rate(
-    strata: list[dict], frame_counts: dict, rate_key: str = "rate"
+    strata: list[dict],
+    frame_counts: dict,
+    rate_key: str = "rate",
+    frame_counts_by_stratum: dict | None = None,
 ) -> tuple[float, str]:
     """Population-weighted pooled rate; weights = staged counts per year.
 
     ``rate_key`` selects which per-stratum rate is pooled (the report
-    pools the CRITICAL rate — the budget-relevant one).
+    pools the CRITICAL rate — the budget-relevant one). A present annual
+    frame is authoritative: malformed, missing, or contradictory weights
+    must not silently shrink it. Zero is valid for a year with no population.
     """
-    weights = {}
+    if not isinstance(frame_counts, dict):
+        raise ValueError("malformed annual frame weights: expected an object")
+    weights: dict[int, float] = {}
     for key, count in frame_counts.items():
         try:
-            weights[int(key)] = float(count)
-        except (TypeError, ValueError):
-            continue
+            year = int(key)
+            weight = float(count)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"malformed annual frame weight for year {key!r}") from exc
+        if (
+            isinstance(key, bool)
+            or isinstance(count, bool)
+            or not math.isfinite(weight)
+            or weight < 0
+            or not weight.is_integer()
+            or year in weights
+        ):
+            raise ValueError(f"invalid annual frame weight for year {key!r}")
+        weights[year] = weight
+
+    if frame_counts_by_stratum is not None:
+        if not isinstance(frame_counts_by_stratum, dict):
+            raise ValueError("malformed year-by-stratum frame counts")
+        design_counts: dict[int, int] = {}
+        for year_key, counts in frame_counts_by_stratum.items():
+            try:
+                year = int(year_key)
+                if not isinstance(counts, dict):
+                    raise ValueError
+                flagged, unflagged = counts["flagged"], counts["unflagged"]
+                if any(
+                    isinstance(count, bool)
+                    or int(count) != count
+                    or int(count) < 0
+                    for count in (flagged, unflagged)
+                ):
+                    raise ValueError
+                design_counts[year] = int(flagged) + int(unflagged)
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"malformed year-by-stratum frame counts for year {year_key!r}"
+                ) from exc
+        for year in set(weights) | set(design_counts):
+            if weights.get(year, 0) != design_counts.get(year, 0):
+                raise ValueError(
+                    f"annual frame weight for year {year} disagrees with "
+                    "year-by-stratum population"
+                )
+
     numerator = 0.0
     denominator = 0.0
     for stratum in strata:
         if stratum.get(rate_key) is None:
             continue
-        weight = weights.get(int(stratum["year"]))
-        if weight is None:
-            continue
+        year = int(stratum["year"])
+        if year not in weights:
+            raise ValueError(f"missing annual frame weight for sampled year {year}")
+        weight = weights[year]
+        if weight < int(stratum.get("docs", 1)):
+            raise ValueError(
+                f"annual frame weight for year {year} is smaller than its sample"
+            )
         numerator += weight * stratum[rate_key]
         denominator += weight
     if denominator <= 0.0:
-        rates = [s[rate_key] for s in strata if s.get(rate_key) is not None]
-        if not rates:
-            return float("nan"), (
-                "unavailable (no resolved strata and no population weights)"
-            )
-        return sum(rates) / len(rates), (
-            "unweighted-stratum mean (population weights unavailable)"
-        )
+        return float("nan"), "unavailable (no resolved strata with population weights)"
     return numerator / denominator, (
         "population-weighted (stratum weights = staged counts per year, "
         "frozen at sample time)"
@@ -1507,9 +1553,12 @@ def build_report(
                 }
             )
         if strata:
-            if frame_counts_by_year:
+            if frame_counts_by_year is not None:
                 pooled_rate, pooling_method = _weighted_pooled_rate(
-                    strata, frame_counts_by_year, rate_key="critical_rate"
+                    strata,
+                    frame_counts_by_year,
+                    rate_key="critical_rate",
+                    frame_counts_by_stratum=frame_counts_by_stratum,
                 )
             else:
                 rates = [

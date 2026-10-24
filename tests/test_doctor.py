@@ -18,6 +18,19 @@ import duckdb
 REPO = Path(__file__).resolve().parents[1]
 
 
+def _install_crontab_fixture(root: Path, env: dict[str, str]) -> None:
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    crontab = bin_dir / "crontab"
+    contract = (REPO / "cron" / "crontab.txt").read_text().replace("@REPO@", str(REPO))
+    crontab.write_text(
+        "#!/bin/sh\ncat <<'CRONTAB_FIXTURE'\n" + contract + "\nCRONTAB_FIXTURE\n"
+    )
+    crontab.chmod(0o700)
+    # Keep caller-provided guard shims after this fixture.
+    env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+
+
 def _build_canonical(path: Path, *, fresh_dividends: bool) -> None:
     con = duckdb.connect(str(path))
     con.execute("CREATE TABLE prices (ticker VARCHAR, date DATE, close DOUBLE)")
@@ -50,14 +63,7 @@ class DoctorIntegrationTest(TestCase):
         stamp = datetime.now(timezone.utc).timestamp() - heartbeat_age_s
         os.utime(heartbeat, (stamp, stamp))
         env["DOCTOR_HEARTBEAT"] = str(heartbeat)
-        # The subprocess must not depend on the operator's installed crontab.
-        bin_dir = alerts / "bin"
-        bin_dir.mkdir()
-        crontab = bin_dir / "crontab"
-        contract = (REPO / "cron" / "crontab.txt").read_text().replace("@REPO@", str(REPO))
-        crontab.write_text("#!/bin/sh\ncat <<'CRONTAB_FIXTURE'\n" + contract + "\nCRONTAB_FIXTURE\n")
-        crontab.chmod(0o700)
-        env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+        _install_crontab_fixture(alerts, env)
         result = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "doctor.py")],
             capture_output=True,
@@ -97,6 +103,7 @@ class DoctorIntegrationTest(TestCase):
         env = dict(os.environ)
         env["DOCTOR_CANONICAL"] = str(canonical)
         env["DOCTOR_HEARTBEAT"] = str(tmp / "absent-heartbeat")
+        _install_crontab_fixture(tmp, env)
         result = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "doctor.py")],
             capture_output=True,

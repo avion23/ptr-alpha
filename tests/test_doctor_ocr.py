@@ -790,8 +790,18 @@ class DoctorIntegrationTest(TestCase):
         env["DOCTOR_HEARTBEAT"] = str(heartbeat)
         if staging_root is not None:
             env["DOCTOR_STAGING_ROOT"] = str(staging_root)
-        if log_root is not None:
-            env["DOCTOR_OCR_LOG_ROOT"] = str(log_root)
+        env["DOCTOR_OCR_LOG_ROOT"] = str(log_root or tmp / "ocr-logs-absent")
+        # Never inspect the operator's installed crontab from a process test.
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        crontab = bin_dir / "crontab"
+        contract = (
+            (REPO / "cron" / "crontab.txt").read_text().replace("@REPO@", str(REPO))
+        )
+        crontab.write_text("#!/bin/sh\ncat <<'CRONTAB_FIXTURE'\n" + contract + "\nCRONTAB_FIXTURE\n")
+        crontab.chmod(0o700)
+        # Keep mandatory validation PATH shims immediately after this fixture.
+        env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
         result = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "doctor.py")],
             capture_output=True,

@@ -434,6 +434,9 @@ def record_decision(
     are frozen, not just winners. Identical content is an idempotent no-op;
     different content on the same date is recorded separately and visibly.
     """
+    if (ranked is None) != (blocked is None):
+        raise ValueError("ranked and blocked must be provided together")
+
     from analyzer.positions import is_13f_corroboration_enabled
 
     enable_13f_corroboration = is_13f_corroboration_enabled(enable_13f_corroboration)

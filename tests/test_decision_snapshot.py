@@ -238,6 +238,24 @@ def test_record_rejects_frozen_outputs_from_a_different_control(inputs, tmp_path
     assert not _receipts(tmp_path)
 
 
+@pytest.mark.parametrize("provided", ["ranked", "blocked"])
+def test_record_rejects_half_output_pair_before_publication(tmp_path, inputs, provided):
+    output_pair = {"ranked": None, "blocked": None}
+    output_pair[provided] = pd.DataFrame()
+
+    with pytest.raises(ValueError, match="ranked and blocked must be provided together"):
+        receipts.record_decision(
+            tmp_path,
+            DAY,
+            *inputs,
+            output_pair["ranked"],
+            output_pair["blocked"],
+        )
+
+    assert list(tmp_path.iterdir()) == []
+    assert not (tmp_path / "recommendations" / receipts.LEDGER_NAME).exists()
+
+
 @pytest.mark.parametrize("invalid", ["missing", None, 1, "false"])
 def test_derive_requires_recipe_control_before_calling_score(
     inputs, monkeypatch, invalid

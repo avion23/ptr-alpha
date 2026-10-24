@@ -267,7 +267,14 @@ def test_completion_cannot_accept_failed_ocr_source(tmp_path, ocr_status):
         db.close()
 
 
-def test_real_ticker_backfill_preserves_pre_correction_value(tmp_path):
+def test_real_ticker_backfill_preserves_pre_correction_value(tmp_path, monkeypatch):
+    from analyzer import asset_ticker_map
+
+    # Exercise the real resolver and historical repair, not a host SEC cache.
+    monkeypatch.setattr(
+        asset_ticker_map, "_sec_company_name_index",
+        lambda: {"MICROSOFT": frozenset({"MSFT"})},
+    )
     path = tmp_path / "db.duckdb"
     db = Database(path)
     seed(db, accepted="2026-08-04", ticker=None)

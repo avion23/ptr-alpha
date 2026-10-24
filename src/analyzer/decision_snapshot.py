@@ -43,9 +43,11 @@ import logging
 import math
 import os
 import tempfile
+from collections.abc import Collection, Mapping
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -410,22 +412,22 @@ def _verify_published(path):
 
 
 def record_decision(
-    data_dir,
-    as_of,
-    candidates,
-    weights,
-    quotes,
-    watchlist,
-    ranked=None,
-    blocked=None,
+    data_dir: str | Path,
+    as_of: str | date,
+    candidates: pd.DataFrame,
+    weights: dict[str, float],
+    quotes: dict[str, tuple[float, str | date | pd.Timestamp]],
+    watchlist: Collection[str],
+    ranked: pd.DataFrame | None = None,
+    blocked: pd.DataFrame | None = None,
     *,
-    scope=None,
-    ex_dividends=None,
-    dividend_source="caller-provided",
-    entry_tol=1.05,
-    event_half_life_days=90,
+    scope: dict[str, Any] | None = None,
+    ex_dividends: dict[str, list[str | date | pd.Timestamp]] | None = None,
+    dividend_source: str = "caller-provided",
+    entry_tol: float = 1.05,
+    event_half_life_days: int = 90,
     enable_13f_corroboration: bool | None = None,
-):
+) -> Path:
     """Record one setups decision as an immutable, self-contained receipt.
 
     All input rows (including identities, flags, entry refs and corroborators)
@@ -495,7 +497,14 @@ def record_decision(
     return _publish(data_dir, manifest)
 
 
-def record_ticker_decision(data_dir, as_of, inputs, outputs, *, scope=None):
+def record_ticker_decision(
+    data_dir: str | Path,
+    as_of: str | date,
+    inputs: Mapping[str, Any] | None,
+    outputs: Mapping[str, Any] | None,
+    *,
+    scope: dict[str, Any] | None = None,
+) -> Path:
     """Record a consensus-ticker decision (analyze --ticker/--mode tickers).
 
     The served buyer/score tables are frozen as the receipt content. These
@@ -537,7 +546,7 @@ def record_ticker_decision(data_dir, as_of, inputs, outputs, *, scope=None):
     return _publish(data_dir, manifest)
 
 
-def record_decision_safely(*args, **kwargs):
+def record_decision_safely(*args: Any, **kwargs: Any) -> Path:
     """Log publication failures and propagate them to the serving boundary."""
     try:
         return record_decision(*args, **kwargs)
@@ -546,7 +555,7 @@ def record_decision_safely(*args, **kwargs):
         raise
 
 
-def record_ticker_decision_safely(*args, **kwargs):
+def record_ticker_decision_safely(*args: Any, **kwargs: Any) -> Path:
     """Log publication failures and propagate them to the serving boundary."""
     try:
         return record_ticker_decision(*args, **kwargs)
@@ -555,7 +564,7 @@ def record_ticker_decision_safely(*args, **kwargs):
         raise
 
 
-def date_index(data_dir, as_of):
+def date_index(data_dir: str | Path, as_of: str | date) -> list[str]:
     """Every decision_id recorded in the ledger for a date, in ledger order."""
     day = date.fromisoformat(str(as_of)).isoformat()
     return [
@@ -565,7 +574,11 @@ def date_index(data_dir, as_of):
     ]
 
 
-def verify_decision(path, *, current_dividends=None):
+def verify_decision(
+    path: str | Path,
+    *,
+    current_dividends: dict[str, list[str | date | pd.Timestamp]] | None = None,
+) -> dict[str, Any]:
     """Check hash-chain integrity separately from recorded-recipe replay.
 
     Receipts predating recipe anchors are integrity checked only and explicitly

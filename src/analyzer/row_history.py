@@ -2,6 +2,8 @@
 
 from contextlib import contextmanager
 
+from analyzer.sql_fragments import HOUSE_PARSE_SOURCE as _HOUSE_PARSE_SOURCE
+
 
 @contextmanager
 def preserve_repair_history(conn):
@@ -51,8 +53,6 @@ def accept_corrections(conn):
     tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
     if "pdf_parse_runs" not in tables:
         return
-    from analyzer.database import _HOUSE_PARSE_SOURCE
-
     predicate = f"""status = 'success' AND EXISTS (
         SELECT 1 FROM transaction_versions t WHERE t.doc_id = pdf_parse_runs.doc_id
           AND t.ingestion_generation = pdf_parse_runs.ingestion_generation

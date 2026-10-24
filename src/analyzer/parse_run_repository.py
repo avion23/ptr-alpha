@@ -4,6 +4,8 @@ from datetime import datetime
 
 import duckdb
 
+from analyzer.sql_fragments import HOUSE_PARSE_SOURCE as _HOUSE_PARSE_SOURCE
+
 
 _TERMINAL_STATUSES = ("success", "no_txs")
 # A deterministic ``zero_rows`` result is ambiguous: it must neither resolve
@@ -59,8 +61,6 @@ class ParseRunRepository:
         if not _in_transaction:
             self.conn.execute("BEGIN TRANSACTION")
         try:
-            from analyzer.database import _HOUSE_PARSE_SOURCE
-
             # Bind the run to the source family's actual rowset, independently
             # of whether parsed_at came from a transaction-start clock.
             # A one-row relation keeps source classification centralized.

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
+import pytest
 from typer.testing import CliRunner
 
 from analyzer.cli import _open_database, app
@@ -21,10 +22,29 @@ from analyzer.pipeline import (
     prepare_analysis_data,
     prepare_live_consensus_data,
     run_backtest_pipeline,
+    run_fetch_pipeline,
+    run_parse_pipeline,
     run_recent_ticker_scoring,
     run_ticker_analysis,
 )
 from analyzer.settings import Settings
+
+
+def test_data_pipeline_failure_shape_preserves_errors():
+    source = MagicMock()
+    failure = DataSourceError("unavailable source")
+    source.fetch_and_cache_pdfs.side_effect = failure
+    source.parse_cached_pdfs.side_effect = failure
+    for pipeline in (run_fetch_pipeline, run_parse_pipeline):
+        result = pipeline(source, 2024)
+        assert isinstance(result, DataResult)
+        assert result.success is False
+        assert result.data is None
+        assert result.error is failure
+
+    source.fetch_and_cache_pdfs.side_effect = ValueError("unexpected failure")
+    with pytest.raises(ValueError, match="unexpected failure"):
+        run_fetch_pipeline(source, 2024)
 
 
 def test_refresh_summary_is_scoped_to_requested_year(tmp_path):

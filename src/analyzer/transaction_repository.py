@@ -594,7 +594,7 @@ class TransactionRepository:
                 self.conn.execute("DROP TABLE IF EXISTS staging_transactions")
         return inserted_count
 
-    def replace_source_refresh(
+    def merge_source_refresh(
         self,
         df: pd.DataFrame,
         *,

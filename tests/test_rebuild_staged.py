@@ -604,24 +604,24 @@ def test_repair_audit_gaps_reconciles_parser_source_family_and_retires_orphan_ro
         ],
     )
     db.upsert_parse_run(
-        "gemini-good",
-        2024,
-        "v5-gemini-validated",
-        "success",
-        "gemini/model",
-        1,
-        1,
+        doc_id="gemini-good",
+        year=2024,
+        parser_version="v5-gemini-validated",
+        status="success",
+        engines_attempted="gemini/model",
+        raw_row_count=1,
+        transaction_count=1,
         artifact_sha256="a" * 64,
         ingestion_generation="house-generation",
     )
     db.upsert_parse_run(
-        "gemini-error",
-        2024,
-        "v5-gemini-validated",
-        "error",
-        "gemini/model",
-        1,
-        0,
+        doc_id="gemini-error",
+        year=2024,
+        parser_version="v5-gemini-validated",
+        status="error",
+        engines_attempted="gemini/model",
+        raw_row_count=1,
+        transaction_count=0,
         error_message="failed semantic validation",
         artifact_sha256="b" * 64,
         ingestion_generation="house-generation",
@@ -703,15 +703,18 @@ def _seed_house_inventory_database(tmp_path):
         ["b" * 64],
     )
     db.upsert_parse_run(
-        "deterministic", 2026, "v5-deterministic", "success", "pdf", 1, 1,
+        doc_id="deterministic", year=2026, parser_version="v5-deterministic",
+        status="success", engines_attempted="pdf", raw_row_count=1, transaction_count=1,
         artifact_sha256="a" * 64, ingestion_generation="house-generation",
     )
     db.upsert_parse_run(
-        "ocr", 2026, "v5-gemini-validated", "success", "ocr", 1, 1,
+        doc_id="ocr", year=2026, parser_version="v5-gemini-validated",
+        status="success", engines_attempted="ocr", raw_row_count=1, transaction_count=1,
         artifact_sha256="b" * 64, ingestion_generation="house-generation",
     )
     db.upsert_parse_run(
-        "empty", 2026, "v5-deterministic", "no_txs", "pdf", 0, 0,
+        doc_id="empty", year=2026, parser_version="v5-deterministic",
+        status="no_txs", engines_attempted="pdf", raw_row_count=0, transaction_count=0,
         artifact_sha256="c" * 64, ingestion_generation="house-generation",
     )
     return db
@@ -747,7 +750,8 @@ def test_house_inventory_rows_reject_ambiguous_terminal_runs(tmp_path):
     db = _seed_house_inventory_database(tmp_path)
     try:
         db.upsert_parse_run(
-            "ocr", 2026, "v5-gemini-alt", "success", "pdf", 1, 1,
+            doc_id="ocr", year=2026, parser_version="v5-gemini-alt",
+            status="success", engines_attempted="pdf", raw_row_count=1, transaction_count=1,
             artifact_sha256="b" * 64, ingestion_generation="house-generation",
         )
         with pytest.raises(RuntimeError, match="ambiguous terminal parse runs"):

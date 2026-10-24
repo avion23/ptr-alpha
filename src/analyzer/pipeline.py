@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, timedelta
 from functools import wraps
+from typing import Any, Callable, ParamSpec, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -15,7 +16,7 @@ from analyzer.canonical_scope import canonical_decision, decision_history
 from analyzer.asset_ticker_map import resolve_asset_ticker
 from analyzer.actors import actor_id
 from analyzer._price_index import _normalize_price_index
-from analyzer.exceptions import AnalyzerError, DataResult, DataSourceError, StepResult
+from analyzer.exceptions import AnalyzerError, DataResult, DataSourceError
 from analyzer.member_names import canonical_member_key
 from analyzer.member_ranking.buyer_scoring import (
     _OFFICIAL_SOURCES,
@@ -82,17 +83,18 @@ class BacktestParams:
     frequency_days: int = 30
 
 
-def pipeline_step(func):
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+def pipeline_step(func: Callable[P, DataResult[T]]) -> Callable[P, DataResult[T]]:
     @wraps(func)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> DataResult[T]:
         try:
-            result = func(*args, **kwargs)
-            if result is True:
-                return StepResult(success=True)
-            return result  # Already a StepResult or DataResult or similar
+            return func(*args, **kwargs)
         except AnalyzerError as exc:
             logger.error("Pipeline step %s failed: %s", func.__name__, exc)
-            return StepResult(success=False, error=exc)
+            return DataResult(success=False, error=exc)
 
     return wrapper
 
@@ -176,7 +178,7 @@ def prepare_analysis_data(
 
 
 @pipeline_step
-def run_fetch_pipeline(transaction_source, year: int) -> DataResult:
+def run_fetch_pipeline(transaction_source, year: int) -> DataResult[None]:
     transaction_source.fetch_and_cache_pdfs(year)
     logger.info("Successfully fetched PDFs for %d", year)
     return DataResult(success=True, data=None)
@@ -565,7 +567,7 @@ def run_parse_pipeline(
     *,
     force: bool = False,
     activate_generation: bool = True,
-) -> DataResult:
+) -> DataResult[None]:
     """Parse cached PDFs; defer activation when a caller has optional OCR to run."""
     transaction_source.parse_cached_pdfs(year, force=force)
     if activate_generation:
@@ -590,7 +592,7 @@ def run_parse_pipeline(
 @pipeline_step
 def run_analysis_pipeline(
     params: AnalysisParams, transaction_source, price_source
-) -> DataResult:
+) -> DataResult[dict[str, Any]]:
     trades, prices, signals = prepare_analysis_data(
         transaction_source,
         price_source,
@@ -661,7 +663,7 @@ def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
 @pipeline_step
 def run_ticker_analysis(
     params: TickerAnalysisParams, transaction_source
-) -> DataResult:
+) -> DataResult[dict[str, Any]]:
     if (
         params.days_back != CONSENSUS_LOOKBACK_DAYS
         or params.min_buyers != CONSENSUS_MIN_BUYERS
@@ -711,7 +713,7 @@ def run_ticker_analysis(
 @pipeline_step
 def run_recent_ticker_scoring(
     transaction_source, params: TickerScoringParams
-) -> DataResult:
+) -> DataResult[dict[str, Any]]:
     if (
         params.days_back != CONSENSUS_LOOKBACK_DAYS
         or params.min_buyers != CONSENSUS_MIN_BUYERS
@@ -955,7 +957,7 @@ def run_backtest_pipeline(
     params: BacktestParams,
     transaction_source,
     price_source,
-) -> DataResult:
+) -> DataResult[dict[str, Any]]:
     if (
         params.lookback_days != CONSENSUS_LOOKBACK_DAYS
         or params.min_buyers != CONSENSUS_MIN_BUYERS

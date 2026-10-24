@@ -16,6 +16,8 @@ from analyzer.metadata_repository import MetadataRepository
 from analyzer.parse_run_repository import ParseRunRepository
 from analyzer.price_repository import PriceRepository
 from analyzer.source_report_repository import SourceReportRepository
+# Compatibility export for operational callers; the leaf owns the fragment.
+from analyzer.sql_fragments import HOUSE_PARSE_SOURCE as _HOUSE_PARSE_SOURCE
 from analyzer.ticker_resolver import TickerResolver
 from analyzer.transaction_repository import (
     SOURCE_TRANSACTION_COLUMNS,
@@ -45,22 +47,6 @@ _SOURCE_REPORTS_COLUMNS = """
     accepted_row_count INTEGER NOT NULL,
     rejected_row_count INTEGER NOT NULL,
     UNIQUE (ingestion_generation, source, chamber, source_record_id)
-"""
-
-_HOUSE_PARSE_SOURCE = """
-    CASE
-        WHEN LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gemini%'
-          OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%ling%'
-          OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%gpt%'
-          OR LOWER(COALESCE(parse_run.parser_version, '')) LIKE '%openrouter%'
-          OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini/%'
-          OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'openrouter/%'
-          OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gpt-%'
-          OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'gemini+%'
-          OR LOWER(COALESCE(parse_run.engines_attempted, '')) LIKE 'visionb%'
-        THEN 'gemini_ocr'
-        ELSE 'house_pdf'
-    END
 """
 
 
@@ -1744,6 +1730,7 @@ class Database:
 
     def upsert_parse_run(
         self,
+        *,
         doc_id: str,
         year: int,
         parser_version: str,
@@ -1796,7 +1783,7 @@ class Database:
         chamber: str,
         ingestion_generation: str,
     ) -> int:
-        """Atomically replace a complete source refresh and its report inventory."""
+        """Atomically merge transaction facts and replace the report inventory."""
         self.source_reports.validate_replacement(
             ingestion_generation, source, chamber, reports
         )
@@ -1810,7 +1797,7 @@ class Database:
 
         self.conn.execute("BEGIN TRANSACTION")
         try:
-            inserted = self.transactions.replace_source_refresh(
+            inserted = self.transactions.merge_source_refresh(
                 transactions,
                 source=source,
                 chamber=chamber,

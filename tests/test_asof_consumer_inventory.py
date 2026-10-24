@@ -98,7 +98,7 @@ EXEMPT = {
     "src/analyzer/transaction_repository.py:TransactionRepository.get_house_by_year": 1,  # Caller-owned repository forwarding.
     "src/analyzer/transaction_repository.py:TransactionRepository.get_skill_history": 1,  # Caller-owned skill loader.
     "src/analyzer/transaction_repository.py:TransactionRepository.house_exists": 1,  # Current ingestion cache check.
-    "src/analyzer/transaction_repository.py:TransactionRepository.replace_source_refresh": 3,  # Persistence/deduplication.
+    "src/analyzer/transaction_repository.py:TransactionRepository.merge_source_refresh": 3,  # Persistence/deduplication.
     "src/analyzer/transaction_repository.py:TransactionRepository.upsert": 4,  # Persistence/deduplication.
     "src/analyzer/transaction_repository.py:drop_already_stored": 1,  # Ingestion deduplication.
     "src/analyzer/vision_engines.py:record_disagreement": 1,  # Ingestion retirement of disagreed dual-read rows.

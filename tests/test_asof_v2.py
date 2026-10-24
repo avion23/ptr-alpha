@@ -147,8 +147,17 @@ def test_live_bytes_equal_independent_main_implementation(tmp_path):
         tree = ast.parse(source)
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Database")
         method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_init_canonical_transactions_view")
-        constant = next(n for n in tree.body if isinstance(n, ast.Assign)
-                        and any(isinstance(t, ast.Name) and t.id == "_HOUSE_PARSE_SOURCE" for t in n.targets))
+        constant = next((n for n in tree.body if isinstance(n, ast.Assign)
+                         and any(isinstance(t, ast.Name) and t.id == "_HOUSE_PARSE_SOURCE" for t in n.targets)), None)
+        if constant is None:
+            # Main may own the same fragment in its leaf after extraction.
+            # Read that revision too, never substitute the working-tree value.
+            fragments = subprocess.check_output(
+                ["git", "show", "main:src/analyzer/sql_fragments.py"], text=True
+            )
+            constant = next(n for n in ast.parse(fragments).body if isinstance(n, ast.Assign)
+                            and any(isinstance(t, ast.Name) and t.id == "HOUSE_PARSE_SOURCE" for t in n.targets))
+            constant.targets = [ast.Name(id="_HOUSE_PARSE_SOURCE", ctx=ast.Store())]
         namespace = vars(database).copy()
         exec(compile(ast.fix_missing_locations(ast.Module(body=[constant, method], type_ignores=[])), "main-oracle", "exec"), namespace)
         namespace[method.name](db)

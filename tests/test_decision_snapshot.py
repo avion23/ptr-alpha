@@ -1128,6 +1128,9 @@ def test_empty_decision_is_recorded(tmp_path):
 
 
 def test_eligible_events_preserve_filing_identity():
+    from unittest.mock import patch
+
+    from analyzer.database import Database
     from analyzer.pipeline import eligible_events
 
     def trades(record_id):
@@ -1147,27 +1150,29 @@ def test_eligible_events_preserve_filing_identity():
                     "source_row_id": f"row-{record_id}",
                 }
             ]
-        )
-
-    db = SimpleNamespace(
-        get_transactions_by_date_range=lambda *a: trades("filing-A"),
-        conn=None,
     )
-    events = eligible_events(db, pd.Timestamp("2025-06-01"), days_back=None)
+
+    with Database(":memory:") as db:
+        with patch.object(
+            db, "get_transactions_by_date_range", return_value=trades("filing-A")
+        ):
+            events = eligible_events(db, pd.Timestamp("2025-06-01"), days_back=None)
+        with patch.object(
+            db, "get_transactions_by_date_range", return_value=trades("filing-B")
+        ):
+            events_b = eligible_events(db, pd.Timestamp("2025-06-01"), days_back=None)
+
     assert events["source_record_id"].tolist() == ["filing-A"]
     assert events["source_row_id"].tolist() == ["row-filing-A"]
-
-    db_swap = SimpleNamespace(
-        get_transactions_by_date_range=lambda *a: trades("filing-B"),
-        conn=None,
-    )
-    events_b = eligible_events(db_swap, pd.Timestamp("2025-06-01"), days_back=None)
     # Old behavior: frames byte-identical despite different filing identity.
     assert not events.equals(events_b)
     assert events_b["source_record_id"].tolist() == ["filing-B"]
 
 
 def test_legacy_producer_without_ids_records_explicit_null():
+    from unittest.mock import patch
+
+    from analyzer.database import Database
     from analyzer.pipeline import eligible_events
 
     trades = pd.DataFrame(
@@ -1183,8 +1188,9 @@ def test_legacy_producer_without_ids_records_explicit_null():
             }
         ]
     )
-    db = SimpleNamespace(get_transactions_by_date_range=lambda *a: trades, conn=None)
-    events = eligible_events(db, pd.Timestamp("2025-06-01"), days_back=None)
+    with Database(":memory:") as db:
+        with patch.object(db, "get_transactions_by_date_range", return_value=trades):
+            events = eligible_events(db, pd.Timestamp("2025-06-01"), days_back=None)
     assert events["source_record_id"].isna().all()
     assert events["source_row_id"].isna().all()
 

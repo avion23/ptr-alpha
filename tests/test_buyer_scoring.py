@@ -180,7 +180,9 @@ def test_consensus_excludes_option_instrument_rows_before_counting():
 
 
 def test_consensus_private_safe_and_existing_fund_boundary():
-    from unittest.mock import MagicMock
+    from unittest.mock import patch
+
+    from analyzer.database import Database
     from analyzer.pipeline import eligible_events
 
     transactions = _transactions(
@@ -196,9 +198,11 @@ def test_consensus_private_safe_and_existing_fund_boundary():
     )
     assert result.iloc[0]["num_buyers"] == 1
     transactions["source"] = "house_pdf"
-    db = MagicMock()
-    db.get_transactions_by_date_range.return_value = transactions
-    events = eligible_events(db, pd.Timestamp("2024-05-20"), days_back=None)
+    with Database(":memory:") as db:
+        with patch.object(
+            db, "get_transactions_by_date_range", return_value=transactions
+        ):
+            events = eligible_events(db, pd.Timestamp("2024-05-20"), days_back=None)
     assert events["actor_id"].tolist() == ["congress:STOCK"]
 
 

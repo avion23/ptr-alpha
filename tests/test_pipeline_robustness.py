@@ -27,6 +27,7 @@ from analyzer.pipeline import (
     run_recent_ticker_scoring,
     run_ticker_analysis,
 )
+from analyzer.price_source import _set_generation_state, _store_generation
 from analyzer.settings import Settings
 
 
@@ -475,10 +476,22 @@ def test_eligible_events_maps_official_actor_sources_and_entry_reference():
             },
         ]
     )
-    db = MagicMock()
-    db.get_transactions_by_date_range.return_value = trades
-
-    events = eligible_events(db, as_of, days_back=None)
+    price_history = pd.Series([150.0], index=pd.to_datetime(["2025-05-20"]))
+    with Database(":memory:") as db:
+        db.upsert_prices(price_history.to_frame("AAPL"))
+        _store_generation(
+            db,
+            "AAPL",
+            "aapl-generation",
+            price_history,
+            pd.Series([float("nan")], index=price_history.index),
+            "adjusted-close-v1",
+        )
+        _set_generation_state(
+            db, "AAPL", "aapl-generation", "unknown", reason="factor unavailable"
+        )
+        with patch.object(db, "get_transactions_by_date_range", return_value=trades):
+            events = eligible_events(db, as_of, days_back=None)
 
     assert events.columns.tolist() == [
         "ticker",
@@ -509,7 +522,10 @@ def test_eligible_events_maps_official_actor_sources_and_entry_reference():
     assert events["filed_entry_ref"].iloc[0] == 150.0
     assert pd.isna(events["normalized_entry_ref"].iloc[0])
     assert events["comparability_status"].iloc[0] == "unknown"
-    assert events["blocked_reason"].iloc[0] == "price comparability unknown: filed price has no known adjusted-close factor for its generation"
+    assert (
+        events["blocked_reason"].iloc[0]
+        == "price comparability unknown: filed price has no known adjusted-close factor for its generation"
+    )
     assert pd.isna(events["entry_ref"].iloc[1])
     assert events["corroboration"].tolist() == [False, True, False]
     assert events["as_of"].eq(as_of).all()

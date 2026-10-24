@@ -99,8 +99,6 @@ def test_audit_records_ex_div_block():
 
 
 def test_dividends_table_created_writable_only(tmp_path):
-    import duckdb
-
     from analyzer.persistence.database import Database
 
     path = tmp_path / "d.duckdb"

@@ -10,7 +10,6 @@ agreement between the two access paths.
 """
 
 import pandas as pd
-import pytest
 
 from analyzer.persistence.database import Database
 from analyzer.persistence.metadata_repository import MetadataRepository

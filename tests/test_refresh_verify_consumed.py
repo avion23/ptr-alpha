@@ -3,7 +3,6 @@ verifiably contains what was refreshed (the 2026-10-18 gap was a merge step
 that silently did not exist)."""
 
 import duckdb
-from datetime import date
 from pathlib import Path
 import sys
 from unittest import TestCase

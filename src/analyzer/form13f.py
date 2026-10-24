@@ -363,6 +363,7 @@ class ThirteenFSource(TransactionSource):
         return False
 
     def get_transactions(self, year: int) -> pd.DataFrame:
+        """Read cached SEC Form 13F canonical rows for ``year`` only."""
         return self.db.get_transactions(year, source="13f")
 
     def _get(self, url: str) -> requests.Response:

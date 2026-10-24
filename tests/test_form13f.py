@@ -34,6 +34,25 @@ def test_client_identity_read_at_construction(tmp_path, monkeypatch):
             ThirteenFSource(watchlist={"TEST": {"TEST"}}, data_dir=tmp_path, db=db)
 
 
+def test_get_transactions_returns_empty_cached_frame_without_acquisition(
+    tmp_path, monkeypatch
+):
+    from analyzer.database import Database
+
+    monkeypatch.setenv("SEC_USER_AGENT", "agent-local")
+    with Database(":memory:") as db:
+        source = ThirteenFSource(
+            watchlist={"TEST": {"TEST"}}, data_dir=tmp_path, db=db
+        )
+        try:
+            rows = source.get_transactions(2026)
+        finally:
+            source.close()
+
+    assert rows.empty
+    assert "ticker" in rows.columns
+
+
 @pytest.fixture
 def sec_company_tickers(monkeypatch):
     rows = asset_ticker_map._company_rows(

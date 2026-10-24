@@ -457,6 +457,7 @@ class Form4Source(TransactionSource):
         return False
 
     def get_transactions(self, year: int) -> pd.DataFrame:
+        """Read cached SEC Form 4 canonical rows for ``year`` only."""
         return self.db.get_transactions(year, source="form4")
 
     def _request(self, url: str) -> requests.Response:

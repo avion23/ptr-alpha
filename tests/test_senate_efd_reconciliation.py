@@ -1184,6 +1184,17 @@ def test_get_transactions_filters_cache_to_senate_source():
     assert result.iloc[0]["source"] == "senate_efd"
 
 
+def test_get_transactions_returns_empty_for_senate_cache_miss():
+    from analyzer.database import Database
+
+    with Database(":memory:") as db:
+        source = _source()
+        source.db = db
+        result = source.get_transactions(2026)
+    assert result.empty
+    assert "ticker" in result.columns
+
+
 def test_katie_and_rick_real_artifact_hashed_canaries():
     """Pin the live eFD landing artifacts for Katie Britt and Rick Scott.
 

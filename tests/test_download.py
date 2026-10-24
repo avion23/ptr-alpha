@@ -973,7 +973,7 @@ def test_house_get_transactions_includes_pdf_and_gemini_but_not_capitol(tmp_path
 
 
 
-def test_house_get_transactions_rejects_capitol_only_year(tmp_path):
+def test_house_get_transactions_returns_empty_for_capitol_only_year(tmp_path):
     source, db = _source(tmp_path)
     db.upsert_transactions(
         pd.DataFrame(
@@ -990,15 +990,16 @@ def test_house_get_transactions_rejects_capitol_only_year(tmp_path):
     )
 
     try:
-        with pytest.raises(DataSourceError, match="No cached data found for 2024"):
-            source.get_transactions(2024)
+        transactions = source.get_transactions(2024)
     finally:
         source.close()
         db.close()
+    assert transactions.empty
+    assert "ticker" in transactions.columns
 
 
 
-def test_house_get_transactions_rejects_ineligible_house_only_year(tmp_path):
+def test_house_get_transactions_returns_empty_for_ineligible_house_rows(tmp_path):
     source, db = _source(tmp_path)
     db.upsert_transactions(
         pd.DataFrame(
@@ -1015,11 +1016,12 @@ def test_house_get_transactions_rejects_ineligible_house_only_year(tmp_path):
     )
 
     try:
-        with pytest.raises(DataSourceError, match="No cached data found for 2021"):
-            source.get_transactions(2021)
+        transactions = source.get_transactions(2021)
     finally:
         source.close()
         db.close()
+    assert transactions.empty
+    assert "ticker" in transactions.columns
 
 
 def test_parse_budget_exceeded_is_runtime_error():

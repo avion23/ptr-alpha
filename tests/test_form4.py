@@ -351,6 +351,20 @@ def test_sweep_returns_empty_canonical_frame_when_index_has_no_filings(
     assert tuple(rows.columns) == _EXPECTED_COLUMNS
 
 
+def test_get_transactions_returns_empty_cached_frame_without_acquisition(tmp_path):
+    from analyzer.database import Database
+
+    with Database(":memory:") as db:
+        source = Form4Source(data_dir=tmp_path, db=db)
+        try:
+            rows = source.get_transactions(2026)
+        finally:
+            source.close()
+
+    assert rows.empty
+    assert "ticker" in rows.columns
+
+
 def test_candidates_from_sweep_uses_shared_candidate_schema(burke_form4_xml):
     rows = candidates_from_sweep(parse(burke_form4_xml))
 

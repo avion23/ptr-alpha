@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import duckdb  # noqa: E402
 
-from analyzer.database import _HOUSE_PARSE_SOURCE  # noqa: E402
+from analyzer.sql_fragments import HOUSE_PARSE_SOURCE  # noqa: E402
 
 logger = logging.getLogger("purge_unaccepted_house_rowsets")
 
@@ -50,7 +50,7 @@ ACCEPTED_RUN_EXISTS = f"""
           AND parse_run.ingestion_generation = t.ingestion_generation
           AND parse_run.artifact_sha256 IS NOT DISTINCT FROM t.artifact_sha256
           AND parse_run.status = 'success'
-          AND t.source = {_HOUSE_PARSE_SOURCE}
+          AND t.source = {HOUSE_PARSE_SOURCE}
           AND COALESCE(parse_run.transaction_count, 0) = (
                 SELECT COUNT(*)
                 FROM transactions tx_count

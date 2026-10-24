@@ -19,7 +19,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from analyzer.database import Database, _HOUSE_PARSE_SOURCE
+from analyzer.database import Database
+from analyzer.sql_fragments import HOUSE_PARSE_SOURCE
 from analyzer.vision_agreement import (
     AGREE,
     DISAGREE,
@@ -50,6 +51,7 @@ from analyzer.ocr import common as gem
 from analyzer.ocr import runner as ocr_zero_rows
 from analyzer.ocr import ingestion
 from analyzer.ocr.ingestion import get_ocr_work_items
+from scripts import purge_unaccepted_house_rowsets
 
 def _run_main():
     from scripts.ocr_zero_rows import _run_visionb_staging
@@ -1116,11 +1118,112 @@ def test_dual_run_classifies_as_gemini_ocr_source_family(tmp_path):
         """
     )
     source = db.conn.execute(
-        f"SELECT {_HOUSE_PARSE_SOURCE} FROM pdf_parse_runs AS parse_run "
+        f"SELECT {HOUSE_PARSE_SOURCE} FROM pdf_parse_runs AS parse_run "
         "WHERE doc_id = 'd1'"
     ).fetchone()[0]
     db.close()
     assert source == "gemini_ocr"
+
+
+def test_unaccepted_rowset_cleanup_is_source_bound_atomic_and_idempotent(
+    monkeypatch, tmp_path
+):
+    db_path = tmp_path / "cleanup.duckdb"
+    db = Database(db_path)
+    conn = db.conn
+    conn.execute(
+        "INSERT INTO house_archive_generations (archive_year, generation_id) "
+        "VALUES (2024, 'gen-cleanup')"
+    )
+    conn.execute(
+        "INSERT INTO house_pdf_artifacts "
+        "(archive_year, generation_id, doc_id, artifact_sha256) "
+        "VALUES (2024, 'gen-cleanup', 'shared-doc', 'same-sha')"
+    )
+    conn.execute(
+        """
+        INSERT INTO pdf_parse_runs (
+            doc_id, year, parser_version, status, engines_attempted,
+            raw_row_count, transaction_count, error_message,
+            artifact_sha256, ingestion_generation
+        ) VALUES
+            ('shared-doc', 2024, 'house-v4', 'success', 'house_pdf', 1, 1,
+             NULL, 'same-sha', 'gen-cleanup'),
+            ('shared-doc', 2024, 'gemini-ocr-v1', 'error', 'gemini/model-x',
+             1, 0, 'original OCR error', 'same-sha', 'gen-cleanup')
+        """
+    )
+    row_values = (
+        "INSERT INTO transactions (doc_id, member, ticker, transaction_date, "
+        "disclosure_date, transaction_type, owner_code, amount_raw, chamber, "
+        "source_record_id, source_row_id, official_filing_date, source, "
+        "ingestion_generation, artifact_sha256) "
+        "VALUES (?, 'Jane Doe', 'AAPL', DATE '2024-01-01', "
+        "DATE '2024-01-02', 'Purchase', 'D', '$1,001-$15,000', 'House', "
+        "?, ?, DATE '2024-01-02', ?, ?, ?)"
+    )
+    conn.executemany(
+        row_values,
+        [
+            ["shared-doc", "shared-doc", "house-row", "house_pdf", "gen-cleanup", "same-sha"],
+            ["shared-doc", "shared-doc", "gemini-row", "gemini_ocr", "gen-cleanup", "same-sha"],
+            # A legacy row is outside the accepted-artifact cleanup scope.
+            ["legacy-doc", "legacy-doc", "legacy-row", "house_pdf", None, None],
+        ],
+    )
+    db.close()
+
+    original_connect = purge_unaccepted_house_rowsets.duckdb.connect
+    monkeypatch.setattr(sys, "argv", ["purge_unaccepted_house_rowsets.py", str(db_path)])
+    assert purge_unaccepted_house_rowsets.main() == 0  # report-only default
+
+    class FailTargetDelete:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, query, *args):
+            if query.lstrip().startswith("DELETE FROM transactions WHERE id IN"):
+                raise RuntimeError("injected delete failure")
+            return self.connection.execute(query, *args)
+
+        def close(self):
+            self.connection.close()
+
+    def fail_delete_connect(*args, **kwargs):
+        return FailTargetDelete(original_connect(*args, **kwargs))
+
+    monkeypatch.setattr(purge_unaccepted_house_rowsets.duckdb, "connect", fail_delete_connect)
+    monkeypatch.setattr(
+        sys, "argv", ["purge_unaccepted_house_rowsets.py", str(db_path), "--apply"]
+    )
+    with pytest.raises(RuntimeError, match="injected delete failure"):
+        purge_unaccepted_house_rowsets.main()
+
+    with original_connect(str(db_path), read_only=True) as check:
+        assert check.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 3
+        assert check.execute("SELECT COUNT(*) FROM transaction_versions").fetchone()[0] == 0
+
+    monkeypatch.setattr(
+        purge_unaccepted_house_rowsets.duckdb, "connect", original_connect
+    )
+    assert purge_unaccepted_house_rowsets.main() == 0
+    assert purge_unaccepted_house_rowsets.main() == 0
+    with original_connect(str(db_path), read_only=True) as check:
+        remaining = check.execute(
+            "SELECT source, source_row_id FROM transactions ORDER BY source_row_id"
+        ).fetchall()
+        archived = check.execute(
+            "SELECT doc_id, source, source_row_id, ingestion_generation, "
+            "artifact_sha256 FROM transaction_versions"
+        ).fetchall()
+        assert remaining == [("house_pdf", "house-row"), ("house_pdf", "legacy-row")]
+        assert archived == [
+            ("shared-doc", "gemini_ocr", "gemini-row", "gen-cleanup", "same-sha")
+        ]
+        assert check.execute(
+            "SELECT status, error_message FROM pdf_parse_runs "
+            "WHERE parser_version = 'gemini-ocr-v1'"
+        ).fetchone() == ("error", "original OCR error")
 
 
 # ---------------------------------------------------------------------------
@@ -1542,7 +1645,7 @@ def test_visionb_run_classifies_as_gemini_ocr_source_family(tmp_path):
         [ingestion.GLM_PARSER_VERSION, ingestion.GLM_ENGINES_ATTEMPTED],
     )
     source = db.conn.execute(
-        f"SELECT {_HOUSE_PARSE_SOURCE} FROM pdf_parse_runs AS parse_run "
+        f"SELECT {HOUSE_PARSE_SOURCE} FROM pdf_parse_runs AS parse_run "
         "WHERE doc_id = 'd1'"
     ).fetchone()[0]
     db.close()

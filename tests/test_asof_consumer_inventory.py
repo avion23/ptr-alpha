@@ -47,7 +47,8 @@ EXEMPT = {
     "scripts/ocr_triage.py:load_unresolved_artifacts": 1,  # Current OCR work queue.
     "scripts/ocr_zero_rows.py:_record_failed_ocr_attempt": 1,  # Ingestion provenance.
     "scripts/ocr_zero_rows.py:get_ocr_work_items": 3,  # Current OCR work queue.
-    "scripts/ocr_zero_rows.py:insert_transactions": 6,  # Persistence/deduplication.
+    "scripts/ocr_zero_rows.py:_insert_transactions": 1,  # Ingestion retirement of a no-transactions reading.
+    "scripts/ocr_zero_rows.py:_replace_accepted_ocr_rows": 5,  # Persistence/deduplication of accepted source-bound rows.
     "scripts/ocr_zero_rows.py:record_parse_run": 1,  # Ingestion provenance.
     "scripts/purge_phantom_rows.py:<module>": 1,  # Duplicate-detection SQL constant.
     "scripts/purge_phantom_rows.py:purge_phantom_rows": 3,  # Current duplicate repair.
@@ -83,7 +84,6 @@ EXEMPT = {
     "src/analyzer/freshness.py:house_ingestion_freshness": 1,  # Monitoring aggregate: newest House disclosure date, not decision selection.
     "src/analyzer/parse_run_repository.py:ParseRunRepository.upsert": 1,  # Ingestion timestamp provenance.
     "src/analyzer/pipeline.py:_analysis_transactions": 1,  # Caller-owned: scoped prepare_analysis_data.
-    "src/analyzer/positions.py:_member_variants": 2,  # Caller-owned identity expansion; name monitored.
     "src/analyzer/positions.py:_distinct_member_names": 2,  # Caller-owned identity expansion, batched _member_variants; name monitored.
     "src/analyzer/positions.py:load_member_trades": 4,  # Caller-owned: holdings/follow-member scope; name monitored.
     "src/analyzer/price_repository.py:PriceRepository.get_entry_prices": 2,  # Caller-owned repository loader.
@@ -101,8 +101,7 @@ EXEMPT = {
     "src/analyzer/transaction_repository.py:TransactionRepository.merge_source_refresh": 3,  # Persistence/deduplication.
     "src/analyzer/transaction_repository.py:TransactionRepository.upsert": 4,  # Persistence/deduplication.
     "src/analyzer/transaction_repository.py:drop_already_stored": 1,  # Ingestion deduplication.
-    "src/analyzer/vision_engines.py:record_disagreement": 1,  # Ingestion retirement of disagreed dual-read rows.
-    "src/analyzer/vision_engines.py:record_unresolved": 1,  # Ingestion retirement of unresolved dual-read docs (engine B absent); mirrors _record_failed_ocr_attempt.
+    "src/analyzer/vision_engines.py:_record_dual_failure": 1,  # Shared source-bound ingestion retirement for disagreed or unresolved dual readings.
 }
 
 

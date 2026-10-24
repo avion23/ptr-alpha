@@ -10,6 +10,7 @@ its frame; analyze/sweep refuse frame-less or frame-mixed panels.
 import json
 import subprocess
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -417,18 +418,29 @@ def test_frozen_capture_is_label_free_write_once_and_analysis_sealed(
         )
 
         frame_script.cmd_capture(decision, db=db, frame="ingestion")
-        cohort_path = out_dir / f"cohorts_{decision}.csv"
+        capture_dir = out_dir / "walkforward" / "captures" / str(decision)
+        cohort_path = capture_dir / "cohorts.csv"
         capture = pd.read_csv(cohort_path)
-        actor_capture = pd.read_csv(out_dir / f"actors_{decision}.csv")
+        actor_capture = pd.read_csv(capture_dir / "actors.csv")
         assert len(capture) == 3
         assert not {"fwd", "spy", "excess", "fill_px", "skilled_present"} & set(capture)
         assert not {"skilled", "hyper", "excess"} & set(actor_capture)
         assert not (out_dir / "skill.json").exists()
         assert not (out_dir / f"outcomes_{decision}.csv").exists()
-        assert json.loads((out_dir / f"manifest_{decision}.json").read_text())["capture_only"]
+        manifest_path = capture_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["capture_only"]
+        assert manifest["artifact_sha256"] == {
+            "cohorts.csv": frame_script.sha256_file(cohort_path),
+            "actors.csv": frame_script.sha256_file(capture_dir / "actors.csv"),
+        }
 
         with pytest.raises(SystemExit, match="SEALED ANALYSIS"):
             frame_script.cmd_analyze_capture(decision, frame="ingestion")
+        with pytest.raises(SystemExit, match="SEALED ANALYSIS"):
+            frame_script.cmd_analyze(frame="ingestion")
+        with pytest.raises(SystemExit, match="SEALED ANALYSIS"):
+            frame_script.cmd_sweep(frame="ingestion")
         with pytest.raises(SystemExit, match="SEALED ANALYSIS"):
             frame_script.cmd_attach_outcomes(decision, db=db, frame="ingestion")
         with pytest.raises(SystemExit, match="CAPTURE OVERWRITE"):
@@ -443,6 +455,131 @@ def test_frozen_capture_is_label_free_write_once_and_analysis_sealed(
         assert len(attached) == 3
         assert attached["exclusion_reason"].eq("outcome_price_unavailable").all()
         assert cohort_path.read_bytes() == frozen_inputs
+        assert (out_dir / "walkforward" / f"outcomes_{decision}.csv").is_file()
+    finally:
+        db.close()
+
+
+def test_capture_failure_keeps_partial_attempt_private_and_allows_retry(
+    tmp_path, monkeypatch, frame_script
+):
+    decision = date(2027, 1, 15)
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(frame_script, "OUT_DIR", out_dir)
+    monkeypatch.setattr(frame_script, "date", CaptureDate)
+    db = Database(tmp_path / "capture-fault.duckdb")
+    legacy_partial = out_dir / f"cohorts_{decision}.csv"
+    legacy_partial.parent.mkdir(parents=True)
+    legacy_partial.write_bytes(b"operator-owned partial bytes\n")
+    original_to_csv = pd.DataFrame.to_csv
+    try:
+        seed_frame(db, tickers=FRAME_TICKERS[:3])
+        db.conn.execute("UPDATE transactions SET amount_midpoint = 10000.0")
+        seed_prices(db, FRAME_TICKERS[:3], start="2026-06-01", end="2027-01-30")
+
+        def fail_after_partial(self, path_or_buf=None, *args, **kwargs):
+            if Path(path_or_buf).name == "cohorts.csv":
+                Path(path_or_buf).write_bytes(b"partial staged capture\n")
+                raise OSError("injected capture serialization failure")
+            return original_to_csv(self, path_or_buf, *args, **kwargs)
+
+        monkeypatch.setattr(pd.DataFrame, "to_csv", fail_after_partial)
+        with pytest.raises(OSError, match="injected capture"):
+            frame_script.cmd_capture(decision, db=db, frame="ingestion")
+
+        capture_dir = out_dir / "walkforward" / "captures" / str(decision)
+        assert not capture_dir.exists()
+        assert legacy_partial.read_bytes() == b"operator-owned partial bytes\n"
+        attempts = list((out_dir / "walkforward" / "captures").glob(f".{decision}.*"))
+        assert len(attempts) == 1
+        assert (attempts[0] / "cohorts.csv").read_bytes() == b"partial staged capture\n"
+
+        monkeypatch.setattr(pd.DataFrame, "to_csv", original_to_csv)
+        frame_script.cmd_capture(decision, db=db, frame="ingestion")
+        assert legacy_partial.read_bytes() == b"operator-owned partial bytes\n"
+        frozen = pd.read_csv(capture_dir / "cohorts.csv")
+        assert set(frozen["ticker"].astype(str)) == set(FRAME_TICKERS[:3])
+        first_bytes = {
+            path.name: path.read_bytes() for path in capture_dir.iterdir()
+        }
+        with pytest.raises(SystemExit, match="CAPTURE OVERWRITE"):
+            frame_script.cmd_capture(decision, db=db, frame="ingestion")
+        assert first_bytes == {
+            path.name: path.read_bytes() for path in capture_dir.iterdir()
+        }
+    finally:
+        db.close()
+
+
+def test_outcome_failure_never_publishes_partial_target_and_retry_is_write_once(
+    tmp_path, monkeypatch, frame_script
+):
+    decision = date(2027, 1, 15)
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(frame_script, "OUT_DIR", out_dir)
+    monkeypatch.setattr(frame_script, "date", CaptureDate)
+    db = Database(tmp_path / "outcome-fault.duckdb")
+    original_to_csv = pd.DataFrame.to_csv
+    try:
+        seed_frame(db, tickers=FRAME_TICKERS[:3])
+        db.conn.execute("UPDATE transactions SET amount_midpoint = 10000.0")
+        seed_prices(db, FRAME_TICKERS[:3], start="2026-06-01", end="2027-01-30")
+        frame_script.cmd_capture(decision, db=db, frame="ingestion")
+        capture_dir = out_dir / "walkforward" / "captures" / str(decision)
+        for name, legacy_name in (
+            ("cohorts.csv", f"cohorts_{decision}.csv"),
+            ("actors.csv", f"actors_{decision}.csv"),
+            ("manifest.json", f"manifest_{decision}.json"),
+        ):
+            (out_dir / legacy_name).write_bytes((capture_dir / name).read_bytes())
+        legacy_capture_bytes = {
+            name: (out_dir / name).read_bytes()
+            for name in (
+                f"cohorts_{decision}.csv",
+                f"actors_{decision}.csv",
+                f"manifest_{decision}.json",
+            )
+        }
+        # Exercise the read-only legacy layout; publication uses a separate
+        # retry sidecar and does not touch an old partial canonical outcome.
+        retry_dir = out_dir / "walkforward-retry"
+        monkeypatch.setattr(frame_script, "_walkforward_dir", lambda: retry_dir)
+        with pytest.raises(SystemExit, match="CAPTURE OVERWRITE"):
+            frame_script.cmd_capture(decision, db=db, frame="ingestion")
+        assert legacy_capture_bytes == {
+            name: (out_dir / name).read_bytes() for name in legacy_capture_bytes
+        }
+        monkeypatch.setattr(frame_script, "date", UnsealDate)
+        legacy_outcome = out_dir / f"outcomes_{decision}.csv"
+        legacy_outcome.write_bytes(b"operator-owned partial outcome\n")
+        outcome_path = retry_dir / f"outcomes_{decision}.csv"
+
+        def fail_after_partial(self, path_or_buf=None, *args, **kwargs):
+            path_or_buf.write("partial outcomes\n")
+            raise OSError("injected outcome serialization failure")
+
+        monkeypatch.setattr(pd.DataFrame, "to_csv", fail_after_partial)
+        with pytest.raises(OSError, match="injected outcome"):
+            frame_script.cmd_attach_outcomes(decision, db=db, frame="ingestion")
+        assert not outcome_path.exists()
+        assert legacy_outcome.read_bytes() == b"operator-owned partial outcome\n"
+        failed_attempts = list(
+            outcome_path.parent.glob(f".{outcome_path.name}.*.tmp")
+        )
+        assert len(failed_attempts) == 1
+        assert failed_attempts[0].read_bytes() == b"partial outcomes\n"
+
+        monkeypatch.setattr(pd.DataFrame, "to_csv", original_to_csv)
+        frame_script.cmd_attach_outcomes(decision, db=db, frame="ingestion")
+        assert len(
+            frame_script.cmd_analyze_capture(decision, frame="ingestion")
+        ) == 3
+        first_bytes = outcome_path.read_bytes()
+        legacy_bytes = legacy_outcome.read_bytes()
+        with pytest.raises(SystemExit, match="OUTCOME OVERWRITE"):
+            frame_script.cmd_attach_outcomes(decision, db=db, frame="ingestion")
+        assert outcome_path.read_bytes() == first_bytes
+        assert legacy_outcome.read_bytes() == legacy_bytes
     finally:
         db.close()
 

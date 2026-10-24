@@ -30,14 +30,19 @@ replays the live canonical_as_of(decision) scope; disclosure replays today's
 complete database filtered by disclosure_date <= decision. Every artifact
 records the frame that produced it (frame column + manifest_<D>.json).
 Results land in data/backtest_assumptions/.
+Frozen D+1 inputs publish as walkforward/captures/<decision>/ bundles;
+legacy flat captures remain readable without being rewritten. Their attached
+outcomes live at walkforward/outcomes_<decision>.csv.
 """
 
 import argparse
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
+import tempfile
 from contextlib import closing, contextmanager, nullcontext
 from datetime import date, timedelta
 from pathlib import Path
@@ -181,6 +186,141 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _walkforward_dir() -> Path:
+    return OUT_DIR / "walkforward"
+
+
+def _capture_paths(decision: date) -> tuple[Path, Path, Path, bool]:
+    """Resolve new immutable bundles, retaining read access to legacy flat files."""
+    bundle = _walkforward_dir() / "captures" / str(decision)
+    if os.path.lexists(bundle):
+        return (
+            bundle / "cohorts.csv",
+            bundle / "actors.csv",
+            bundle / "manifest.json",
+            True,
+        )
+    return (
+        OUT_DIR / f"cohorts_{decision}.csv",
+        OUT_DIR / f"actors_{decision}.csv",
+        OUT_DIR / f"manifest_{decision}.json",
+        False,
+    )
+
+
+def _capture_outcome_path(decision: date, bundled: bool) -> Path:
+    sidecar = _walkforward_dir() / f"outcomes_{decision}.csv"
+    legacy = OUT_DIR / f"outcomes_{decision}.csv"
+    if bundled or os.path.lexists(sidecar):
+        return sidecar
+    return legacy
+
+
+def _legacy_outcome_is_complete(
+    path: Path, cohort_path: Path, decision: date, frame: str
+) -> bool:
+    """Distinguish a completed flat legacy output from a retryable partial file."""
+    try:
+        cohorts, _ = read_panel_csv(cohort_path, "cohort", frame=frame)
+        outcomes, _ = read_panel_csv(path, "outcome", frame=frame)
+        required = {
+            "ticker", "as_of", "fill_date", "fill_px", "entry_eligibility",
+            "entry_eligible", "fwd", "spy", "excess", "outcome_status",
+            "exclusion_reason", "frame",
+        }
+        if not required.issubset(outcomes.columns):
+            return False
+        if not outcomes["as_of"].astype(str).eq(str(decision)).all():
+            return False
+        join_outcomes(cohorts, outcomes, "legacy frozen cohort")
+        return True
+    except (OSError, ValueError, KeyError, SystemExit):
+        return False
+
+
+def _outcome_write_path(
+    decision: date, bundled: bool, cohort_path: Path, frame: str
+) -> Path:
+    sidecar = _walkforward_dir() / f"outcomes_{decision}.csv"
+    legacy = OUT_DIR / f"outcomes_{decision}.csv"
+    if bundled or os.path.lexists(sidecar):
+        return sidecar
+    if not os.path.lexists(legacy) or _legacy_outcome_is_complete(
+        legacy, cohort_path, decision, frame
+    ):
+        return legacy
+    # Preserve a partial file from the old direct writer and retry at the
+    # walkforward sidecar path instead of truncating that evidence.
+    return sidecar
+
+
+def _validate_capture(
+    decision: date,
+    frame: str,
+    cohort_path: Path,
+    actor_path: Path,
+    manifest_path: Path,
+) -> dict:
+    """Validate the frozen input pair and its receipt before labels are read."""
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        cohorts = pd.read_csv(cohort_path)
+        actors = pd.read_csv(actor_path)
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        raise SystemExit(f"INVALID CAPTURE: {decision} artifacts are unreadable") from exc
+    if (
+        not isinstance(manifest, dict)
+        or not manifest.get("capture_only")
+        or manifest.get("decision") != str(decision)
+        or manifest.get("frame") != frame
+        or not {"ticker", "as_of", "frame"}.issubset(cohorts.columns)
+        or not {"ticker", "as_of", "frame"}.issubset(actors.columns)
+        or len(cohorts) != manifest.get("rows")
+        or not cohorts["as_of"].astype(str).eq(str(decision)).all()
+        or not actors["as_of"].astype(str).eq(str(decision)).all()
+        or not cohorts["frame"].astype(str).eq(frame).all()
+        or not actors["frame"].astype(str).eq(frame).all()
+    ):
+        raise SystemExit(f"INVALID CAPTURE: {decision} does not match frame {frame}")
+    if "actor_rows" in manifest and len(actors) != manifest["actor_rows"]:
+        raise SystemExit(f"INVALID CAPTURE: {decision} actor rows do not match manifest")
+    expected_hashes = manifest.get("artifact_sha256")
+    if expected_hashes is not None:
+        for name, path in (("cohorts.csv", cohort_path), ("actors.csv", actor_path)):
+            if expected_hashes.get(name) != sha256_file(path):
+                raise SystemExit(f"INVALID CAPTURE: {decision} {name} hash mismatch")
+    return manifest
+
+
+def _legacy_capture_is_complete(decision: date) -> bool:
+    cohort_path = OUT_DIR / f"cohorts_{decision}.csv"
+    actor_path = OUT_DIR / f"actors_{decision}.csv"
+    manifest_path = OUT_DIR / f"manifest_{decision}.json"
+    if not all(path.is_file() for path in (cohort_path, actor_path, manifest_path)):
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        if not isinstance(manifest, dict):
+            return False
+        frame = manifest.get("frame")
+        if frame not in FRAMES:
+            return False
+        _validate_capture(
+            decision, frame, cohort_path, actor_path, manifest_path
+        )
+        return True
+    except (OSError, ValueError, SystemExit):
+        return False
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def git_sha() -> str:
@@ -464,7 +604,16 @@ def cmd_skill(*, frame: str):
         db.close()
 
 
-def cmd_run(decision: date, db=None, *, frame: str, capture_only: bool = False):
+def cmd_run(
+    decision: date,
+    db=None,
+    *,
+    frame: str,
+    capture_only: bool = False,
+    capture_output_dir: Path | None = None,
+):
+    if capture_only and capture_output_dir is None:
+        raise ValueError("capture-only runs require a private staging directory")
     if capture_only:
         check_capture_date(decision)
     else:
@@ -703,7 +852,12 @@ def cmd_run(decision: date, db=None, *, frame: str, capture_only: bool = False):
             ]
         cohort_frame = pd.DataFrame(rows, columns=cohort_columns)
         cohort_frame["frame"] = frame
-        cohort_frame.to_csv(OUT_DIR / f"cohorts_{decision}.csv", index=False)
+        cohort_path = (
+            capture_output_dir / "cohorts.csv"
+            if capture_only
+            else OUT_DIR / f"cohorts_{decision}.csv"
+        )
+        cohort_frame.to_csv(cohort_path, index=False)
         actor_columns = [
             "as_of", "ticker", "actor_id", "kind", "entry_ref", "lag_days",
             "entry_reference_status", "score_block_reason",
@@ -712,7 +866,12 @@ def cmd_run(decision: date, db=None, *, frame: str, capture_only: bool = False):
             actor_columns += ["skilled", "hyper"]
         actor_frame = pd.DataFrame(actor_rows, columns=actor_columns)
         actor_frame["frame"] = frame
-        actor_frame.to_csv(OUT_DIR / f"actors_{decision}.csv", index=False)
+        actor_path = (
+            capture_output_dir / "actors.csv"
+            if capture_only
+            else OUT_DIR / f"actors_{decision}.csv"
+        )
+        actor_frame.to_csv(actor_path, index=False)
         if not capture_only:
             pd.DataFrame(
                 outcomes,
@@ -735,28 +894,87 @@ def cmd_run(decision: date, db=None, *, frame: str, capture_only: bool = False):
         }
         if capture_only:
             manifest["capture_only"] = True
-        (OUT_DIR / f"manifest_{decision}.json").write_text(
+            manifest["capture_format"] = 1
+            manifest["actor_rows"] = len(actor_frame)
+            manifest["artifact_sha256"] = {
+                "cohorts.csv": sha256_file(cohort_path),
+                "actors.csv": sha256_file(actor_path),
+            }
+        manifest_path = (
+            capture_output_dir / "manifest.json"
+            if capture_only
+            else OUT_DIR / f"manifest_{decision}.json"
+        )
+        manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n"
         )
+        if capture_only:
+            for path in (cohort_path, actor_path, manifest_path):
+                with path.open("rb") as handle:
+                    os.fsync(handle.fileno())
+            _fsync_directory(capture_output_dir)
         print("wrote", len(rows), "rows", flush=True)
 
 
+def _write_csv_exclusive(frame: pd.DataFrame, path: Path) -> None:
+    """Publish a complete CSV with an exclusive same-filesystem hard link."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        frame.to_csv(handle, index=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    # link() is atomic and fails rather than replacing an existing frozen file.
+    try:
+        os.link(temporary, path)
+    except FileExistsError as exc:
+        raise SystemExit(f"OUTCOME OVERWRITE: {path.name} already exists") from exc
+    _fsync_directory(path.parent)
+    temporary.unlink()
+    _fsync_directory(path.parent)
+
+
 def cmd_capture(decision: date, db=None, *, frame: str):
-    """Write the frozen decision snapshot once, without labels or outcomes."""
+    """Stage and atomically publish one immutable, label-free capture bundle."""
     check_capture_date(decision)
-    targets = [
-        OUT_DIR / f"cohorts_{decision}.csv",
-        OUT_DIR / f"actors_{decision}.csv",
-        OUT_DIR / f"outcomes_{decision}.csv",
-        OUT_DIR / f"manifest_{decision}.json",
-    ]
-    existing = [path.name for path in targets if path.exists()]
-    if existing:
+    if frame not in FRAMES:
+        raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
+    capture_parent = _walkforward_dir() / "captures"
+    target = capture_parent / str(decision)
+    if os.path.lexists(target) or _legacy_capture_is_complete(decision):
         raise SystemExit(
-            f"CAPTURE OVERWRITE: {decision} artifacts already exist: "
-            + ", ".join(existing)
+            f"CAPTURE OVERWRITE: {decision} capture artifacts already exist"
         )
-    cmd_run(decision, db, frame=frame, capture_only=True)
+    capture_parent.mkdir(parents=True, exist_ok=True)
+    # Failed attempts remain under private, unique staging names and never
+    # occupy the canonical date path, so they cannot block a valid retry.
+    staging = Path(tempfile.mkdtemp(prefix=f".{decision}.", dir=capture_parent))
+    cmd_run(
+        decision,
+        db,
+        frame=frame,
+        capture_only=True,
+        capture_output_dir=staging,
+    )
+    _validate_capture(
+        decision,
+        frame,
+        staging / "cohorts.csv",
+        staging / "actors.csv",
+        staging / "manifest.json",
+    )
+    if os.path.lexists(target):
+        raise SystemExit(f"CAPTURE OVERWRITE: {decision} capture appeared during staging")
+    try:
+        os.rename(staging, target)
+    except OSError as exc:
+        if os.path.lexists(target):
+            raise SystemExit(f"CAPTURE OVERWRITE: {decision} capture appeared during staging") from exc
+        raise
+    _fsync_directory(capture_parent)
 
 
 def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
@@ -766,16 +984,13 @@ def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
         raise SystemExit(f"NOT A FROZEN DATE: {decision} is not in the walk-forward block")
     if frame not in FRAMES:
         raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
-    cohort_path = OUT_DIR / f"cohorts_{decision}.csv"
-    manifest_path = OUT_DIR / f"manifest_{decision}.json"
-    outcome_path = OUT_DIR / f"outcomes_{decision}.csv"
-    if outcome_path.exists():
+    cohort_path, actor_path, manifest_path, bundled = _capture_paths(decision)
+    outcome_path = _outcome_write_path(decision, bundled, cohort_path, frame)
+    if os.path.lexists(outcome_path):
         raise SystemExit(f"OUTCOME OVERWRITE: {outcome_path.name} already exists")
     if not cohort_path.exists() or not manifest_path.exists():
         raise SystemExit(f"MISSING CAPTURE: no frozen input snapshot for {decision}")
-    manifest = json.loads(manifest_path.read_text())
-    if not manifest.get("capture_only") or manifest.get("frame") != frame:
-        raise SystemExit(f"INVALID CAPTURE: {decision} does not match frame {frame}")
+    _validate_capture(decision, frame, cohort_path, actor_path, manifest_path)
     owns_db = db is None
     if owns_db:
         db = Database(DB_PATH, read_only=True)
@@ -828,7 +1043,7 @@ def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
                     "frame": frame,
                 }
             )
-        pd.DataFrame(outcomes).to_csv(outcome_path, index=False)
+        _write_csv_exclusive(pd.DataFrame(outcomes), outcome_path)
     finally:
         if owns_db:
             db.close()
@@ -837,14 +1052,11 @@ def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
 def cmd_analyze_capture(decision: date, *, frame: str) -> pd.DataFrame:
     """Join a frozen input snapshot to outcomes only after the formal unseal."""
     check_unsealed()
-    cohort_path = OUT_DIR / f"cohorts_{decision}.csv"
-    outcome_path = OUT_DIR / f"outcomes_{decision}.csv"
-    manifest_path = OUT_DIR / f"manifest_{decision}.json"
+    cohort_path, actor_path, manifest_path, bundled = _capture_paths(decision)
+    outcome_path = _capture_outcome_path(decision, bundled)
     if not all(path.exists() for path in (cohort_path, outcome_path, manifest_path)):
         raise SystemExit(f"MISSING FROZEN DATA: capture and attach outcomes for {decision}")
-    manifest = json.loads(manifest_path.read_text())
-    if not manifest.get("capture_only") or manifest.get("frame") != frame:
-        raise SystemExit(f"INVALID CAPTURE: {decision} does not match frame {frame}")
+    _validate_capture(decision, frame, cohort_path, actor_path, manifest_path)
     cohorts, _ = read_panel_csv(cohort_path, "cohort", frame=frame)
     outcomes, _ = read_panel_csv(outcome_path, "outcome", frame=frame)
     result = join_outcomes(cohorts, outcomes, "frozen cohort")
@@ -958,7 +1170,7 @@ def cmd_analyze(*, frame: str):
     if frame not in FRAMES:
         raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
     for decision in WALK_FORWARD_BLOCK:
-        path = OUT_DIR / f"manifest_{decision}.json"
+        _, _, path, _ = _capture_paths(decision)
         if path.exists() and json.loads(path.read_text()).get("capture_only"):
             check_unsealed()
     files = [OUT_DIR / f"cohorts_{decision}.csv" for decision in DECISIONS]
@@ -1046,7 +1258,7 @@ def cmd_sweep(*, frame: str):
     if frame not in FRAMES:
         raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
     for decision in WALK_FORWARD_BLOCK:
-        path = OUT_DIR / f"manifest_{decision}.json"
+        _, _, path, _ = _capture_paths(decision)
         if path.exists() and json.loads(path.read_text()).get("capture_only"):
             check_unsealed()
     cohort_files = [OUT_DIR / f"cohorts_{decision}.csv" for decision in DECISIONS]

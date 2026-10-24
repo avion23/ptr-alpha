@@ -2,8 +2,11 @@
 
 import logging
 import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -761,30 +764,120 @@ def _run_gemini_ocr_year_subprocess(
 
     Returns (inserted, failure_reason|None). The child emits a JSON summary
     on stdout and diagnostics on stderr; the parent releases its DB lock.
+    On POSIX, the child owns a new process group. Main-thread SIGTERM is
+    converted to an exit after cleanup. Python cannot install that handler
+    from non-main callers, where SIGTERM cannot be guaranteed to clean up.
     """
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "analyzer.ocr.year_cli",
-             "--year", str(int(year)), "--data-dir", str(Path(data_dir).resolve())],
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return 0, "timeout"
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout)[-500:]
-        return 0, f"exit {proc.returncode}: {detail}"
-    try:
-        import json
+    command = [
+        sys.executable,
+        "-m",
+        "analyzer.ocr.year_cli",
+        "--year",
+        str(int(year)),
+        "--data-dir",
+        str(Path(data_dir).resolve()),
+    ]
+    original_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        original_sigterm = signal.getsignal(signal.SIGTERM)
 
-        summary = json.loads(proc.stdout)
-        inserted = summary["inserted"]
-        if summary["schema"] != "ocr-year-summary-v1" or type(inserted) is not int or inserted < 0:
-            raise ValueError("invalid OCR summary")
-    except (ValueError, TypeError, KeyError):
-        return 0, f"invalid OCR JSON summary: {(proc.stdout or '')[-500:]}"
-    return inserted, None
+        def terminate_parent(signum, _frame):
+            # A second SIGTERM must not interrupt cleanup.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, terminate_parent)
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_ocr_process_tree(proc)
+            return 0, "timeout"
+        except BaseException:
+            try:
+                _terminate_ocr_process_tree(proc)
+            except Exception:
+                logger.exception("Failed to clean up Gemini OCR subprocess")
+            raise
+        if proc.returncode != 0:
+            detail = (stderr or stdout)[-500:]
+            return 0, f"exit {proc.returncode}: {detail}"
+        try:
+            import json
+
+            summary = json.loads(stdout)
+            inserted = summary["inserted"]
+            if (
+                summary["schema"] != "ocr-year-summary-v1"
+                or type(inserted) is not int
+                or inserted < 0
+            ):
+                raise ValueError("invalid OCR summary")
+        except (ValueError, TypeError, KeyError):
+            return 0, f"invalid OCR JSON summary: {(stdout or '')[-500:]}"
+        return inserted, None
+    finally:
+        if original_sigterm is not None:
+            signal.signal(signal.SIGTERM, original_sigterm)
+
+
+def _terminate_ocr_process_tree(proc: subprocess.Popen) -> None:
+    """Stop the owned process group, then force-stop and reap its leader."""
+    process_group = os.name == "posix"
+
+    def signal_tree(signum: int) -> None:
+        if process_group:
+            # Keep the direct child unreaped through the group kill, so its
+            # PID/PGID cannot be recycled and mistaken for another group.
+            if proc.returncode is not None:
+                return
+            try:
+                os.killpg(proc.pid, signum)
+            except ProcessLookupError:
+                pass
+        elif proc.poll() is None:
+            if signum == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+
+    cleanup_error = None
+    try:
+        signal_tree(signal.SIGTERM)
+        time.sleep(1)
+    except BaseException as exc:
+        cleanup_error = exc
+    finally:
+        try:
+            if process_group:
+                signal_tree(signal.SIGKILL)
+            elif proc.poll() is None:
+                proc.kill()
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            if cleanup_error is None:
+                cleanup_error = RuntimeError(
+                    "Gemini OCR subprocess was not reaped after SIGKILL"
+                )
+                cleanup_error.__cause__ = exc
+            else:
+                logger.error("Gemini OCR subprocess was not reaped after SIGKILL")
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 @app.command()

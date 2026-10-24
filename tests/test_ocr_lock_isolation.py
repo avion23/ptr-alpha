@@ -8,9 +8,11 @@ child-process lock conflict (refresh path) can fire. No network: OCR is
 mocked; temp files only.
 """
 
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -26,6 +28,27 @@ from analyzer.cli import (
 )
 from analyzer.persistence.database import Database
 from analyzer.exceptions import StepResult
+
+_REAL_POPEN = subprocess.Popen
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(") ", 1)[-1][:1] != "Z"
+
+
+def _sleeping_tree_script() -> str:
+    return (
+        "import os,subprocess,sys,time\n"
+        "grandchild=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+        "with open(sys.argv[1]+'.tmp','w') as pids:\n"
+        "    pids.write(f'{os.getpid()} {grandchild.pid}')\n"
+        "os.replace(sys.argv[1]+'.tmp',sys.argv[1])\n"
+        "time.sleep(60)\n"
+    )
 
 
 def _make_app_ctx(data_dir: str) -> MagicMock:
@@ -115,17 +138,152 @@ class TestOcrLockIsolation(unittest.TestCase):
 
     def test_subprocess_helper_reports_insert_count(self):
         with (
-            patch("analyzer.cli.subprocess.run") as run,
+            patch("analyzer.cli.subprocess.Popen") as popen,
             patch("analyzer.cli.Path"),
         ):
-            run.return_value = MagicMock(
+            popen.return_value = MagicMock(
                 returncode=0,
-                stdout='{"schema":"ocr-year-summary-v1","inserted":7}\n',
-                stderr="",
+                communicate=MagicMock(
+                    return_value=('{"schema":"ocr-year-summary-v1","inserted":7}\n', "")
+                ),
             )
             inserted, error = _run_gemini_ocr_year_subprocess("data", 2026)
         self.assertIsNone(error)
         self.assertEqual(inserted, 7)
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").exists(), "POSIX process groups required"
+    )
+    def test_timeout_kills_and_reaps_owned_process_group(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pid_file = Path(temp_dir) / "pids"
+            script = _sleeping_tree_script()
+            spawned = []
+
+            def spawn_safe_child(_command, **kwargs):
+                self.assertTrue(kwargs["start_new_session"])
+                child = _REAL_POPEN(
+                    [sys.executable, "-c", script, str(pid_file)], **kwargs
+                )
+                spawned.append(child)
+                return child
+
+            with patch("analyzer.cli.subprocess.Popen", side_effect=spawn_safe_child):
+                result = _run_gemini_ocr_year_subprocess("data", 2026, timeout=0.2)
+
+            self.assertEqual(result, (0, "timeout"))
+            self.assertEqual(len(spawned), 1)
+            self.assertIsNotNone(spawned[0].poll())
+            direct_pid, descendant_pid = map(int, pid_file.read_text().split())
+            self.assertEqual(spawned[0].pid, direct_pid)
+            deadline = time.monotonic() + 3
+            while _pid_is_running(descendant_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(_pid_is_running(descendant_pid))
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").exists(), "POSIX process groups required"
+    )
+    def test_exception_kills_and_reaps_owned_process_group(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pid_file = Path(temp_dir) / "pids"
+            spawned = []
+
+            def spawn_safe_child(_command, **kwargs):
+                child = _REAL_POPEN(
+                    [sys.executable, "-c", _sleeping_tree_script(), str(pid_file)],
+                    **kwargs,
+                )
+                communicate = child.communicate
+                failed = False
+
+                def fail_once(*args, **communicate_kwargs):
+                    nonlocal failed
+                    if not failed:
+                        failed = True
+                        deadline = time.monotonic() + 3
+                        while not pid_file.exists() and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertTrue(pid_file.exists())
+                        raise OSError("simulated communicate failure")
+                    return communicate(*args, **communicate_kwargs)
+
+                child.communicate = fail_once
+                spawned.append(child)
+                return child
+
+            with (
+                patch("analyzer.cli.subprocess.Popen", side_effect=spawn_safe_child),
+                self.assertRaisesRegex(OSError, "simulated communicate failure"),
+            ):
+                _run_gemini_ocr_year_subprocess("data", 2026)
+
+            self.assertIsNotNone(spawned[0].poll())
+            direct_pid, descendant_pid = map(int, pid_file.read_text().split())
+            self.assertEqual(spawned[0].pid, direct_pid)
+            deadline = time.monotonic() + 3
+            while _pid_is_running(descendant_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(_pid_is_running(descendant_pid))
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/proc").exists(), "POSIX process groups required"
+    )
+    def test_parent_sigterm_cleans_owned_process_group(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pid_file = Path(temp_dir) / "pids"
+            worker = r"""
+import os, signal, subprocess, sys, threading, time
+from analyzer.cli import _run_gemini_ocr_year_subprocess
+real_popen = subprocess.Popen
+pid_file = sys.argv[1]
+spawned = []
+script = %r
+def spawn_safe_child(command, **kwargs):
+    assert command[1:3] == ['-m', 'analyzer.ocr.year_cli']
+    assert kwargs['start_new_session']
+    child = real_popen([sys.executable, '-c', script, pid_file], **kwargs)
+    spawned.append(child)
+    return child
+subprocess.Popen = spawn_safe_child
+previous = signal.getsignal(signal.SIGTERM)
+def interrupt_parent():
+    deadline = time.monotonic() + 3
+    while not os.path.exists(pid_file) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    os.kill(os.getpid(), signal.SIGTERM)
+sender = threading.Thread(target=interrupt_parent)
+sender.start()
+try:
+    _run_gemini_ocr_year_subprocess('data', 2026)
+except SystemExit as exc:
+    assert exc.code == 128 + signal.SIGTERM
+else:
+    raise AssertionError('SIGTERM did not cancel the helper')
+sender.join(timeout=3)
+assert not sender.is_alive()
+assert signal.getsignal(signal.SIGTERM) == previous
+assert spawned and spawned[0].poll() is not None
+""" % _sleeping_tree_script()
+            worker_proc = _REAL_POPEN(
+                [sys.executable, "-c", worker, str(pid_file)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = worker_proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                worker_proc.kill()
+                worker_proc.communicate()
+                self.fail("SIGTERM cleanup worker did not finish")
+            self.assertEqual(worker_proc.returncode, 0, stderr or stdout)
+            direct_pid, descendant_pid = map(int, pid_file.read_text().split())
+            self.assertFalse(_pid_is_running(direct_pid))
+            deadline = time.monotonic() + 3
+            while _pid_is_running(descendant_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(_pid_is_running(descendant_pid))
 
     def test_parse_gemini_ocr_releases_parent_and_exits_zero(self):
         runner = CliRunner()

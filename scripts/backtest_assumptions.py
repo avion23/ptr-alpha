@@ -384,6 +384,21 @@ def _same_frozen_outcomes(left: pd.DataFrame, right: pd.DataFrame) -> bool:
     return True
 
 
+def _outcome_path(
+    decision: date, bundled: bool, cohort_path: Path, frame: str
+) -> Path:
+    """Resolve one immutable outcome target for both publication and reads."""
+    sidecar = _walkforward_dir() / f"outcomes_{decision}.csv"
+    legacy = OUT_DIR / f"outcomes_{decision}.csv"
+    if bundled or os.path.lexists(sidecar):
+        return sidecar
+    if os.path.lexists(legacy) and not _legacy_outcome_is_complete(
+        legacy, cohort_path, decision, frame
+    ):
+        return sidecar
+    return legacy
+
+
 def _capture_outcome_path(
     decision: date,
     bundled: bool,
@@ -394,8 +409,10 @@ def _capture_outcome_path(
 ) -> Path:
     sidecar = _walkforward_dir() / f"outcomes_{decision}.csv"
     legacy = OUT_DIR / f"outcomes_{decision}.csv"
-    if not os.path.lexists(sidecar):
-        return sidecar if bundled else legacy
+    outcome_path = _outcome_path(decision, bundled, cohort_path, frame)
+    if outcome_path != sidecar or not os.path.lexists(sidecar):
+        return outcome_path
+
     sidecar_panel = _read_bound_outcome(
         sidecar, cohort_path, decision, frame, capture
     )
@@ -411,7 +428,6 @@ def _capture_outcome_path(
             raise SystemExit(
                 f"CONFLICTING FROZEN OUTCOMES: {decision} has valid legacy and sidecar labels"
             )
-        return legacy
     return sidecar
 
 
@@ -442,17 +458,7 @@ def _legacy_outcome_is_complete(
 def _outcome_write_path(
     decision: date, bundled: bool, cohort_path: Path, frame: str
 ) -> Path:
-    sidecar = _walkforward_dir() / f"outcomes_{decision}.csv"
-    legacy = OUT_DIR / f"outcomes_{decision}.csv"
-    if os.path.lexists(legacy) and _legacy_outcome_is_complete(
-        legacy, cohort_path, decision, frame
-    ):
-        return legacy
-    if bundled or os.path.lexists(sidecar) or os.path.lexists(legacy):
-        # Preserve any partial legacy attempt; a retry is bound to the verified
-        # capture by its companion receipt and never replaces the old bytes.
-        return sidecar
-    return legacy
+    return _outcome_path(decision, bundled, cohort_path, frame)
 
 
 def _validate_capture(
@@ -1133,6 +1139,24 @@ def cmd_run(
         print("wrote", len(rows), "rows", flush=True)
 
 
+def _same_outcome_receipt(existing: object, value: dict) -> bool:
+    """Reuse a valid original timestamp only for an identical binding and CSV."""
+    if not isinstance(existing, dict) or existing.keys() != value.keys():
+        return False
+    if any(
+        existing[key] != value[key]
+        for key in value
+        if key != "labels_generated_on"
+    ):
+        return False
+    try:
+        generated_on = date.fromisoformat(str(existing["labels_generated_on"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    today = date.today()
+    return UNSEAL_AFTER <= generated_on <= today
+
+
 def _write_json_exclusive(value: dict, path: Path) -> None:
     """Create a receipt once, accepting only an identical interrupted retry."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1141,7 +1165,7 @@ def _write_json_exclusive(value: dict, path: Path) -> None:
             existing = json.loads(path.read_text())
         except (OSError, ValueError) as exc:
             raise SystemExit(f"OUTCOME BINDING: {path.name} is unreadable") from exc
-        if existing != value:
+        if not _same_outcome_receipt(existing, value):
             raise SystemExit(f"OUTCOME BINDING: {path.name} binds different bytes or capture")
         return
     fd, temporary_name = tempfile.mkstemp(
@@ -1160,7 +1184,7 @@ def _write_json_exclusive(value: dict, path: Path) -> None:
             existing = json.loads(path.read_text())
         except (OSError, ValueError):
             raise SystemExit(f"OUTCOME BINDING: {path.name} is unreadable") from exc
-        if existing != value:
+        if not _same_outcome_receipt(existing, value):
             raise SystemExit(f"OUTCOME BINDING: {path.name} binds different bytes or capture") from exc
     _fsync_directory(path.parent)
     temporary.unlink()
@@ -1368,6 +1392,14 @@ def cmd_analyze_capture(decision: date, *, frame: str) -> pd.DataFrame:
     if _capture_seal(manifest_path, current_manifest) != capture_seal:
         raise SystemExit(f"INVALID CAPTURE: {decision} changed during outcome analysis")
     result = join_outcomes(cohorts, outcomes, "frozen cohort")
+    outcome_contract = "capture-bound" if bound or has_binding else "legacy-unbound"
+    result.attrs["outcome_contract"] = outcome_contract
+    if outcome_contract == "legacy-unbound":
+        print(
+            "OUTCOME CONTRACT: legacy-unbound (no capture-byte receipt; "
+            "exact horizon checked only when exit_date is present)",
+            flush=True,
+        )
     print(result.to_string(index=False), flush=True)
     return result
 

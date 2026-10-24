@@ -64,6 +64,12 @@ class UnsealDate(date):
         return cls(2028, 11, 1)
 
 
+class NextUnsealDate(UnsealDate):
+    @classmethod
+    def today(cls):
+        return cls(2028, 11, 2)
+
+
 @pytest.fixture()
 def frame_script():
     return load_script("backtest_assumptions")
@@ -84,10 +90,15 @@ def write_synthetic_capture(out_dir, script, decision, tickers=("AAPL",)):
     out_dir.mkdir(parents=True, exist_ok=True)
     cohorts = pd.DataFrame(
         [
-            {"ticker": ticker, "as_of": str(decision), "frame": "ingestion"}
+            {
+                "ticker": ticker,
+                "as_of": str(decision),
+                "frame": "ingestion",
+                "max_valid_ref": 100.0,
+            }
             for ticker in tickers
         ],
-        columns=["ticker", "as_of", "frame"],
+        columns=["ticker", "as_of", "frame", "max_valid_ref"],
     )
     actors = pd.DataFrame(columns=["ticker", "as_of", "frame"])
     cohort_path = out_dir / f"cohorts_{decision}.csv"
@@ -115,6 +126,17 @@ def write_synthetic_capture(out_dir, script, decision, tickers=("AAPL",)):
     }
     manifest_path.write_text(json.dumps(manifest))
     return cohort_path, actor_path, manifest_path
+
+
+def write_synthetic_bundle(out_dir, script, decision, tickers=("AAPL",)):
+    capture_dir = out_dir / "walkforward" / "captures" / str(decision)
+    paths = write_synthetic_capture(capture_dir, script, decision, tickers)
+    targets = tuple(
+        capture_dir / name for name in ("cohorts.csv", "actors.csv", "manifest.json")
+    )
+    for source, target in zip(paths, targets):
+        source.rename(target)
+    return targets
 
 
 def synthetic_outcomes(script, decision, *, fill_date=None, fwd=2.0, excess=1.0):
@@ -602,6 +624,81 @@ def test_capture_analysis_rejects_conflicts_and_impossible_chronology(
         frame_script.cmd_analyze_capture(decision, frame="ingestion")
 
 
+def test_bundled_outcomes_share_sidecar_authority_and_reject_legacy_conflicts(
+    tmp_path, monkeypatch, frame_script
+):
+    decision = date(2027, 1, 15)
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(frame_script, "OUT_DIR", out_dir)
+    monkeypatch.setattr(frame_script, "date", UnsealDate)
+    capture_paths = write_synthetic_bundle(out_dir, frame_script, decision)
+    legacy = synthetic_outcomes(frame_script, decision).drop(columns=["exit_date"])
+    legacy_path = out_dir / f"outcomes_{decision}.csv"
+    legacy.to_csv(legacy_path, index=False)
+
+    sidecar_path = out_dir / "walkforward" / f"outcomes_{decision}.csv"
+    capture_path = frame_script._outcome_write_path(
+        decision, True, capture_paths[0], "ingestion"
+    )
+    reader_path = frame_script._capture_outcome_path(
+        decision,
+        True,
+        frame="ingestion",
+        cohort_path=capture_paths[0],
+        capture=frame_script._capture_seal(
+            capture_paths[2],
+            frame_script._validate_capture(
+                decision, "ingestion", *capture_paths
+            ),
+        ),
+    )
+    assert capture_path == reader_path == sidecar_path
+    assert not sidecar_path.exists()
+
+    frame_script._write_csv_exclusive(
+        synthetic_outcomes(frame_script, decision),
+        sidecar_path,
+        synthetic_outcome_binding(frame_script, decision, capture_paths),
+    )
+    assert frame_script._capture_outcome_path(
+        decision,
+        True,
+        frame="ingestion",
+        cohort_path=capture_paths[0],
+        capture=frame_script._capture_seal(
+            capture_paths[2],
+            frame_script._validate_capture(decision, "ingestion", *capture_paths),
+        ),
+    ) == sidecar_path
+    assert frame_script.cmd_analyze_capture(
+        decision, frame="ingestion"
+    )["excess"].tolist() == [1.0]
+
+    conflicting = synthetic_outcomes(
+        frame_script, decision, fwd=3.0, excess=2.0
+    ).drop(columns=["exit_date"])
+    conflicting.to_csv(legacy_path, index=False)
+    with pytest.raises(SystemExit, match="CONFLICTING FROZEN OUTCOMES"):
+        frame_script.cmd_analyze_capture(decision, frame="ingestion")
+
+
+def test_legacy_unbound_outcomes_are_explicitly_reported(
+    tmp_path, monkeypatch, frame_script, capsys
+):
+    decision = date(2027, 1, 15)
+    out_dir = tmp_path / "legacy"
+    monkeypatch.setattr(frame_script, "OUT_DIR", out_dir)
+    monkeypatch.setattr(frame_script, "date", UnsealDate)
+    write_synthetic_capture(out_dir, frame_script, decision)
+    legacy = synthetic_outcomes(frame_script, decision).drop(columns=["exit_date"])
+    legacy.to_csv(out_dir / f"outcomes_{decision}.csv", index=False)
+
+    result = frame_script.cmd_analyze_capture(decision, frame="ingestion")
+    assert result.attrs["outcome_contract"] == "legacy-unbound"
+    assert "OUTCOME CONTRACT: legacy-unbound" in capsys.readouterr().out
+    assert not (out_dir / f"outcomes_{decision}.json").exists()
+
+
 def test_empty_frozen_capture_keeps_a_valid_bound_empty_outcome(
     tmp_path, monkeypatch, frame_script
 ):
@@ -870,6 +967,68 @@ def test_outcome_failure_never_publishes_partial_target_and_retry_is_write_once(
             frame_script.cmd_attach_outcomes(decision, db=db, frame="ingestion")
         assert outcome_path.read_bytes() == first_bytes
         assert legacy_outcome.read_bytes() == legacy_bytes
+    finally:
+        db.close()
+
+
+def test_receipt_first_outcome_retry_reuses_immutable_receipt_across_days(
+    tmp_path, monkeypatch, frame_script
+):
+    decision = date(2027, 1, 15)
+    out_dir = tmp_path / "outcome-retry"
+    monkeypatch.setattr(frame_script, "OUT_DIR", out_dir)
+    monkeypatch.setattr(frame_script, "date", UnsealDate)
+    capture_paths = write_synthetic_bundle(out_dir, frame_script, decision)
+    capture_bytes = {path: path.read_bytes() for path in capture_paths}
+    outcome_path = out_dir / "walkforward" / f"outcomes_{decision}.csv"
+    receipt_path = frame_script._outcome_binding_path(outcome_path)
+    db = Database(":memory:")
+    real_link = frame_script.os.link
+
+    def fail_csv_publish(source, target, *args, **kwargs):
+        if Path(target) == outcome_path:
+            raise OSError("injected crash after receipt publication")
+        return real_link(source, target, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(frame_script.os, "link", fail_csv_publish)
+        with pytest.raises(OSError, match="after receipt publication"):
+            frame_script.cmd_attach_outcomes(decision, db=db, frame="ingestion")
+        original_receipt = receipt_path.read_bytes()
+        assert json.loads(original_receipt)["labels_generated_on"] == "2028-11-01"
+        assert not outcome_path.exists()
+        assert capture_bytes == {path: path.read_bytes() for path in capture_paths}
+
+        monkeypatch.setattr(frame_script.os, "link", real_link)
+        monkeypatch.setattr(frame_script, "date", NextUnsealDate)
+        frame_script.cmd_attach_outcomes(decision, db=db, frame="ingestion")
+        assert receipt_path.read_bytes() == original_receipt
+        assert frame_script.sha256_file(outcome_path) == json.loads(
+            original_receipt
+        )["outcome_sha256"]
+        assert capture_bytes == {path: path.read_bytes() for path in capture_paths}
+        assert len(frame_script.cmd_analyze_capture(
+            decision, frame="ingestion"
+        )) == 1
+
+        changed_binding = json.loads(original_receipt)
+        changed_binding["capture_sha256"] = {"cohorts.csv": "different"}
+        with pytest.raises(SystemExit, match="OUTCOME BINDING"):
+            frame_script._write_json_exclusive(changed_binding, receipt_path)
+        original_binding = {
+            key: value
+            for key, value in json.loads(original_receipt).items()
+            if key != "outcome_sha256"
+        }
+        original_binding["labels_generated_on"] = str(NextUnsealDate.today())
+        with pytest.raises(SystemExit, match="OUTCOME BINDING"):
+            frame_script._write_csv_exclusive(
+                pd.read_csv(outcome_path).assign(excess=123.0),
+                outcome_path,
+                original_binding,
+            )
+        assert receipt_path.read_bytes() == original_receipt
+        assert capture_bytes == {path: path.read_bytes() for path in capture_paths}
     finally:
         db.close()
 

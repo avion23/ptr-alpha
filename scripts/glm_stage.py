@@ -71,9 +71,10 @@ verdicts remain historical but cannot authorize promotion.
 Concurrency (FP review finding 11): ``--workers`` is capped at
 MAX_WORKERS (2 — the Z.AI subscription allows two concurrent vision
 streams; larger values raise ValueError instead of being clamped).
-Cross-process exclusion is the cron wrapper's single-instance flock
-(``cron/backlog_ocr.sh`` holds ``data/logs/ocr-backlog-cron/drain.lock``
-via ``flock -n``); no in-process lock is taken.
+Per-document publication locks serialize live/attempt changes across direct
+stage and promote invocations; they are held only for publication and
+promotion binding, never during vision inference. The cron wrapper retains its
+separate single-instance flock.
 """
 
 from __future__ import annotations
@@ -81,6 +82,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import fcntl
 import glob as glob_module
 import hashlib
 import json
@@ -93,7 +95,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -254,6 +256,38 @@ def staging_root(data_dir: str | Path = "data") -> Path:
     return Path(data_dir) / STAGING_SUBDIR
 
 
+_publication_lock_state = threading.local()
+
+
+@contextmanager
+def document_publication_lock(data_dir: str | Path, year: int, doc_id: str):
+    """Serialize one document's live/attempt publication across processes."""
+    root = staging_root(data_dir).resolve()
+    key = (str(root), int(year), str(doc_id))
+    held = getattr(_publication_lock_state, "held", None)
+    if held is None:
+        held = _publication_lock_state.held = {}
+    if key in held:
+        held[key][1] += 1
+        try:
+            yield
+        finally:
+            held[key][1] -= 1
+        return
+
+    lock_name = hashlib.sha256(str(doc_id).encode("utf-8")).hexdigest()
+    lock_path = root / ".publication-locks" / str(year) / f"{lock_name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        held[key] = [lock_file, 1]
+        try:
+            yield
+        finally:
+            del held[key]
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def default_db_path(data_dir: str | Path = "data") -> Path:
     return Path(data_dir) / "congress.duckdb"
 
@@ -327,28 +361,44 @@ def archive_current_attempt(
 ) -> Path | None:
     """Versioned re-stage (finding 6): archive the live record, never overwrite.
 
-    Renames the existing ``<doc_id>.json`` to
+    Moves the existing ``<doc_id>.json`` to
     ``attempts/<doc_id>.attempt-<n>.json`` so the newly written record keeps
     the canonical name and the superseded reading remains inspectable
-    evidence. n is one greater than the largest existing archive number.
+    evidence. n is one greater than the largest existing archive number. A
+    per-document lock and exclusive hard-link publication prevent a racing
+    writer from replacing an archive or moving a different live attempt.
     Attempts are never automatically pruned: reference publication can race
     with a check-and-delete, and a failed restore could destroy evidence.
     Returns the archive path, or None when no live record existed.
     """
-    live = staging_record_path(data_dir, year, doc_id)
-    if not live.exists():
-        return None
-    prior = archived_attempts(data_dir, year, doc_id)
-    next_number = (prior[-1][0] + 1) if prior else 0
-    target = attempts_dir(data_dir, year) / f"{doc_id}.attempt-{next_number}.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(live, target)
-    return target
+    with document_publication_lock(data_dir, year, doc_id):
+        live = staging_record_path(data_dir, year, doc_id)
+        if not live.exists():
+            return None
+        prior = archived_attempts(data_dir, year, doc_id)
+        next_number = (prior[-1][0] + 1) if prior else 0
+        target_dir = attempts_dir(data_dir, year)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        while True:
+            target = target_dir / f"{doc_id}.attempt-{next_number}.json"
+            try:
+                # Publish the complete old inode atomically, without replacing
+                # an existing attempt if numbering raced with another writer.
+                os.link(live, target)
+            except FileExistsError:
+                prior = archived_attempts(data_dir, year, doc_id)
+                next_number = max(
+                    next_number + 1, prior[-1][0] + 1 if prior else 0
+                )
+                continue
+            live.unlink()
+            return target
 
 
 def write_staging_record(data_dir: str | Path, record: StagingRecord) -> Path:
     path = staging_record_path(data_dir, record["year"], record["doc_id"])
-    atomic_write_json(path, record)
+    with document_publication_lock(data_dir, record["year"], record["doc_id"]):
+        atomic_write_json(path, record)
     return path
 
 
@@ -902,17 +952,17 @@ def stage_batch(
 
     ``workers`` reads docs concurrently (the GLM call is I/O-bound, so
     threads overlap network latency); a batch-wide stop halts new
-    submissions and lets in-flight docs finish. Records are per-doc files,
-    so no ordering or locking beyond the counters is needed.
+    submissions and lets in-flight docs finish. Per-document publication is
+    serialized after inference, so the vision calls remain concurrent.
 
     Concurrency caps (finding 11): ``workers`` above MAX_WORKERS (2) raises
     ValueError — the Z.AI subscription allows two concurrent vision
     streams, and an operator override above that is a quota-budget
     violation, not a tuning knob. Cross-process exclusion is the cron
     wrapper's single-instance flock (``cron/backlog_ocr.sh`` holds
-    ``data/logs/ocr-backlog-cron/drain.lock``); no in-process lock is
-    taken because a single process is bounded by ``workers`` and overlaps
-    across processes are excluded by the wrapper.
+    ``data/logs/ocr-backlog-cron/drain.lock``). A per-document publication
+    lock also protects direct invocations and serializes archive-plus-live
+    replacement without holding a lock during inference.
 
     ``manifest`` (``ocr_zero_rows.export_work_manifest`` items) replaces
     the PDF-directory scan with the authoritative unresolved selection
@@ -1078,14 +1128,15 @@ def stage_batch(
                 consecutive_google_503s = 0
             else:
                 consecutive_google_503s = 0
-        archived = archive_current_attempt(data_dir, year, doc_id)
-        if archived is not None:
-            print(
-                f"  [{doc_id}] prior staging record archived: "
-                f"attempts/{archived.name}",
-                flush=True,
-            )
-        write_staging_record(data_dir, record)
+        with document_publication_lock(data_dir, year, doc_id):
+            archived = archive_current_attempt(data_dir, year, doc_id)
+            if archived is not None:
+                print(
+                    f"  [{doc_id}] prior staging record archived: "
+                    f"attempts/{archived.name}",
+                    flush=True,
+                )
+            write_staging_record(data_dir, record)
         if record["parse_status"] == "error":
             print(f"  [{doc_id}] ERROR: {error}", flush=True)
             return "error"
@@ -1640,22 +1691,24 @@ def promote_docs(
                 }
 
     promoted = refused = failed = 0
-    for doc_id in doc_ids:
+
+    def _promote_one(doc_id: str) -> None:
+        nonlocal promoted, refused, failed
         try:
             record_bytes = ocr.read_work_artifact(data_dir, staging_record_path(data_dir, year, doc_id))
             record = decode_staging_record(record_bytes)
         except FileNotFoundError:
             print(f"  [{doc_id}] no staging record; skipped", flush=True)
             refused += 1
-            continue
+            return
         if record.get("doc_id") != str(doc_id) or record.get("year") != int(year):
             print(f"  [{doc_id}] refused: staging record identity does not match selection", flush=True)
             refused += 1
-            continue
+            return
         if record.get("parse_status") == "error":
             print(f"  [{doc_id}] refused: staging record is an error record", flush=True)
             refused += 1
-            continue
+            return
         if record.get("audit") != "pass" and not force_unaudited:
             print(
                 f"  [{doc_id}] refused: audit approval is mandatory and the "
@@ -1664,13 +1717,13 @@ def promote_docs(
                 flush=True,
             )
             refused += 1
-            continue
+            return
         if not force_unaudited:
             bound, reason = verdict_binding(data_dir, doc_id, record)
             if not bound:
                 print(f"  [{doc_id}] {reason}", flush=True)
                 refused += 1
-                continue
+                return
         try:
             _, identity = manifest_artifact(ArtifactRequest.from_record(record), data_dir, db_path)
             artifact_year = identity["archive_year"]
@@ -1678,7 +1731,7 @@ def promote_docs(
         except (OSError, RuntimeError) as exc:
             print(f"  [{doc_id}] refused: PDF unreadable ({exc})", flush=True)
             refused += 1
-            continue
+            return
         if current_sha != record.get("pdf_sha256"):
             print(
                 f"  [{doc_id}] refused: staged pdf_sha256 no longer matches "
@@ -1686,7 +1739,7 @@ def promote_docs(
                 flush=True,
             )
             refused += 1
-            continue
+            return
         try:
             rows = record["rows"]
             row_pages = record.get("row_pages") or []
@@ -1722,7 +1775,7 @@ def promote_docs(
             # naturally; the staging record is kept for a later attempt.
             print(f"  [{doc_id}] ERROR: {exc}", flush=True)
             failed += 1
-            continue
+            return
 
         if outcome.complete:
             ok, progress_key = True, (
@@ -1750,7 +1803,7 @@ def promote_docs(
                 flush=True,
             )
             failed += 1
-            continue
+            return
         staged_hash = audit_staged_record_sha256(record)
         rows_hash = staged_rows_sha256(rows)
         archived = archive_current_attempt(data_dir, year, doc_id)
@@ -1774,6 +1827,10 @@ def promote_docs(
         )
         promoted += 1
         print(f"  [{doc_id}] promoted: inserted={outcome.inserted}", flush=True)
+
+    for doc_id in doc_ids:
+        with document_publication_lock(data_dir, year, doc_id):
+            _promote_one(doc_id)
 
     return {
         "year": int(year),

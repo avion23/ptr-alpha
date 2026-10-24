@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1579,6 +1580,95 @@ def test_archived_attempts_are_not_live_records(data_dir):
     ] == archived_bytes
 
 
+def test_archive_publication_never_replaces_a_concurrent_attempt(data_dir, monkeypatch):
+    write_staged_records(data_dir, {2024: ["exclusive"]})
+    live = glm_stage.staging_record_path(data_dir, 2024, "exclusive")
+    live_bytes = live.read_bytes()
+    first_target = glm_stage.attempts_dir(data_dir, 2024) / "exclusive.attempt-0.json"
+    original_link = glm_stage.os.link
+    injected = False
+
+    def occupy_first_number(source, destination):
+        nonlocal injected
+        if Path(destination) == first_target and not injected:
+            first_target.write_bytes(b"concurrent-attempt")
+            injected = True
+        return original_link(source, destination)
+
+    monkeypatch.setattr(glm_stage.os, "link", occupy_first_number)
+    archived = glm_stage.archive_current_attempt(data_dir, 2024, "exclusive")
+    assert injected
+    assert archived == glm_stage.attempts_dir(data_dir, 2024) / "exclusive.attempt-1.json"
+    assert first_target.read_bytes() == b"concurrent-attempt"
+    assert archived.read_bytes() == live_bytes
+    assert not live.exists()
+
+
+def test_concurrent_restage_publications_preserve_every_attempt(data_dir):
+    seed_year(data_dir, 2024, ["restage-race"])
+    pdf = glm_stage.default_pdf_path(data_dir, 2024, "restage-race")
+
+    def initial_failure(*_):
+        raise ValueError("initial failure")
+
+    initial = glm_stage.build_staging_record(
+        "restage-race", 2024, pdf, None, read_fn=initial_failure
+    )
+    glm_stage.write_staging_record(data_dir, initial)
+    initial_bytes = glm_stage.staging_record_path(data_dir, 2024, "restage-race").read_bytes()
+    inference_barrier = threading.Barrier(2)
+    outputs = {
+        "restage-a": GLM_OUTPUT_ONE_ROW,
+        "restage-b": (
+            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+            "Microsoft Corp (MSFT) | Sale | 02/02/24 | 02/05/24 | B\n"
+        ),
+    }
+
+    def read_fn(*_):
+        inference_barrier.wait(timeout=5)
+        return outputs[threading.current_thread().name]
+
+    results = []
+    errors = []
+
+    def restage(name):
+        threading.current_thread().name = name
+        try:
+            results.append(
+                glm_stage.stage_batch(
+                    2024,
+                    1,
+                    data_dir=data_dir,
+                    manifest=[{"doc_id": "restage-race", "year": 2024}],
+                    read_fn=read_fn,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    workers = [
+        threading.Thread(target=restage, args=(name,))
+        for name in outputs
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=15)
+    assert not any(worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(results) == 2 and all(result["staged"] == 1 for result in results)
+
+    attempts = glm_stage.archived_attempts(data_dir, 2024, "restage-race")
+    assert [number for number, _ in attempts] == [0, 1]
+    assert attempts[0][1].read_bytes() == initial_bytes
+    published = {attempts[1][1].read_bytes(), glm_stage.staging_record_path(
+        data_dir, 2024, "restage-race"
+    ).read_bytes()}
+    assert len(published) == 2
+    assert {json.loads(raw)["raw_output"] for raw in published} == set(outputs.values())
+
+
 def test_unreadable_live_record_blocks_population_consumption(data_dir, fake_insert):
     write_staged_records(data_dir, {2024: ["population"]})
     archived = glm_stage.archive_current_attempt(data_dir, 2024, "population")
@@ -1660,10 +1750,10 @@ def test_archive_keeps_bytes_when_audit_reference_publishes_mid_archive(
     audit_path = glm_stage.staging_root(data_dir) / glm_stage.AUDIT_RESULTS_NAME
     staged_bytes = live.read_bytes()
     target = glm_stage.attempts_dir(data_dir, 2024) / "race1.attempt-4.json"
-    original_replace = glm_stage.os.replace
+    original_link = glm_stage.os.link
 
     def publish_reference_after_archive(source, destination):
-        result = original_replace(source, destination)
+        result = original_link(source, destination)
         if Path(source) == live and Path(destination) == target:
             glm_stage.atomic_write_json(
                 audit_path,
@@ -1680,7 +1770,7 @@ def test_archive_keeps_bytes_when_audit_reference_publishes_mid_archive(
 
     # Deterministically interleave reference publication after the archive
     # rename, while archive_current_attempt is still executing.
-    monkeypatch.setattr(glm_stage.os, "replace", publish_reference_after_archive)
+    monkeypatch.setattr(glm_stage.os, "link", publish_reference_after_archive)
     assert glm_stage.archive_current_attempt(data_dir, 2024, "race1") == target
     assert target.read_bytes() == staged_bytes
     assert {
@@ -2343,6 +2433,58 @@ def test_promotion_never_reopens_verified_pdf_path(data_dir, tmp_path, monkeypat
     assert private_reads == []
     assert result["promoted"] == 1  # synthetic insert only, using the verified old snapshot
     assert len(fake_insert) == 1 and fake_insert[0]["artifact_sha256"] == original_hash
+
+
+def test_promotion_journals_the_exact_locked_attempt(data_dir, monkeypatch, fake_insert):
+    record = stage_one_audited(data_dir, 2024, "attempt-bound", GLM_OUTPUT_ONE_ROW)
+    live = glm_stage.staging_record_path(data_dir, 2024, "attempt-bound")
+    validated_bytes = live.read_bytes()
+    replacement = dict(record)
+    replacement["parsed_at_utc"] = "2026-10-24T00:00:00Z"
+    lock_requested = threading.Event()
+    worker_errors = []
+    original_lock = glm_stage.document_publication_lock
+    original_insert = ocr_zero_rows.insert_transactions_outcome
+
+    def observed_lock(data_dir, year, doc_id):
+        if threading.current_thread().name == "promotion-restager":
+            lock_requested.set()
+        return original_lock(data_dir, year, doc_id)
+
+    def restage_after_promotion():
+        threading.current_thread().name = "promotion-restager"
+        try:
+            with glm_stage.document_publication_lock(data_dir, 2024, "attempt-bound"):
+                glm_stage.archive_current_attempt(data_dir, 2024, "attempt-bound")
+                glm_stage.write_staging_record(data_dir, replacement)
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=restage_after_promotion)
+
+    def insert_then_race(*args, **kwargs):
+        outcome = original_insert(*args, **kwargs)
+        worker.start()
+        assert lock_requested.wait(timeout=5)
+        return outcome
+
+    monkeypatch.setattr(glm_stage, "document_publication_lock", observed_lock)
+    monkeypatch.setattr(ocr_zero_rows, "insert_transactions_outcome", insert_then_race)
+    result = glm_stage.promote_docs(2024, ["attempt-bound"], data_dir=data_dir)
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert worker_errors == []
+    assert result["promoted"] == 1
+    (entry,) = glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir))
+    archived = glm_stage.staging_root(data_dir) / entry["staging_attempt"]
+    assert archived.read_bytes() == validated_bytes
+    assert entry["staged_record_sha256"] == glm_stage.audit_staged_record_sha256(
+        json.loads(validated_bytes)
+    )
+    assert glm_stage.load_staging_record(data_dir, 2024, "attempt-bound")[
+        "parsed_at_utc"
+    ] == replacement["parsed_at_utc"]
 
 
 def test_staged_row_to_tx_page_number_optional():

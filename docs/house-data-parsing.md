@@ -57,7 +57,7 @@ Downloads:
 
 Cached PDFs are reused only when they pass local PDF validation.
 
-### 3. Deterministic parser cascade
+### 3. Parser cascade
 
 `_parse_pdf_worker()` compares text-layer parsers first:
 
@@ -88,6 +88,18 @@ OCR is materially more expensive than text extraction:
 
 5. Docling, unless `PTR_SKIP_DOCLING=1`
 6. Tesseract
+
+Docling currently runs via unversioned `uvx --from docling`; if `uvx` is
+unavailable, the parser accepts whichever `docling` executable is on `PATH`.
+Docling is not in `uv.lock`, and conversion may fetch model artifacts. Thus
+the local Markdown parsing is deterministic, but the Docling conversion
+runtime is not pinned or guaranteed offline. CLI/help success and the
+Markdown parser fixtures do not establish end-to-end conversion compatibility.
+Treat Docling as unverified for reproducible/offline operation until an
+operator-approved, fully offline check with pre-provisioned exact package and
+model artifacts validates conversion on an approved corpus against existing
+acceptance without modifying source PDFs. `PTR_SKIP_DOCLING=1` bypasses
+Docling; the later Tesseract backend remains enabled.
 
 If Tesseract returns a candidate set, text/OCR candidates are reconciled while preserving the maximum observed multiplicity for each normalized transaction identity.
 

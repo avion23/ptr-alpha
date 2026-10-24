@@ -5,15 +5,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
+import stat
 import time
 from functools import lru_cache
-from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from analyzer.ocr.paths import DATA_DIR
+
 _SEC_URL = "https://www.sec.gov/files/company_tickers.json"
-_SEC_CACHE = Path("/tmp/ptr-alpha-company-tickers.json")
+_SEC_CACHE = DATA_DIR / "ticker_cache" / "company_tickers.json"
 _CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 # Company-name fragments for common disclosure spellings that do not match an
 # active SEC registrant title exactly. Ambiguous names and investment products
@@ -126,14 +130,96 @@ def _normalize_company_name(value: str) -> str:
         normalized = without_suffix
 
 
-def _read_sec_cache() -> tuple[tuple[str, str], ...] | None:
-    try:
-        if time.time() - _SEC_CACHE.stat().st_mtime >= _CACHE_TTL_SECONDS:
-            return None
-        payload = json.loads(_SEC_CACHE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+def _open_sec_cache_dir() -> int | None:
+    if not _O_NOFOLLOW:
         return None
+    try:
+        _SEC_CACHE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(
+            _SEC_CACHE.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _O_NOFOLLOW,
+        )
+    except OSError:
+        return None
+    metadata = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _read_sec_cache() -> tuple[tuple[str, str], ...] | None:
+    directory_fd = _open_sec_cache_dir()
+    if directory_fd is None:
+        return None
+    fd = None
+    try:
+        fd = os.open(
+            _SEC_CACHE.name,
+            os.O_RDONLY | _O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+            or time.time() - metadata.st_mtime >= _CACHE_TTL_SECONDS
+        ):
+            return None
+        with os.fdopen(fd, encoding="utf-8") as source:
+            fd = None
+            payload = json.load(source)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(directory_fd)
     return _company_rows(payload)
+
+
+def _write_sec_cache(payload: object) -> None:
+    directory_fd = _open_sec_cache_dir()
+    if directory_fd is None:
+        return
+    temp_name = f".{_SEC_CACHE.name}.{secrets.token_hex(8)}.tmp"
+    fd = None
+    try:
+        fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as destination:
+            fd = None
+            json.dump(payload, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(
+            temp_name,
+            _SEC_CACHE.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temp_name = ""
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        os.close(directory_fd)
 
 
 def _company_rows(payload: object) -> tuple[tuple[str, str], ...]:
@@ -167,10 +253,7 @@ def _load_sec_company_tickers() -> tuple[tuple[str, str], ...]:
         return ()
     rows = _company_rows(payload)
     if rows:
-        try:
-            _SEC_CACHE.write_text(json.dumps(payload), encoding="utf-8")
-        except OSError:
-            pass
+        _write_sec_cache(payload)
     return rows
 
 

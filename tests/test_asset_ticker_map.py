@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import stat
+
 import duckdb
 import pytest
 
@@ -57,6 +59,33 @@ def test_resolves_sec_name_from_fixture(sec_company_tickers):
 
 def test_resolves_curated_company_alias(sec_company_tickers):
     assert asset_ticker_map.resolve_asset_ticker("Par Petroleum Corporation") == "PARR"
+
+
+def test_ticker_cache_is_private_and_does_not_follow_symlinks(tmp_path, monkeypatch):
+    cache_path = tmp_path / "ticker-cache" / "company_tickers.json"
+    target = tmp_path / "outside.json"
+    original = '{"private": "do not overwrite"}'
+    target.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(asset_ticker_map, "_SEC_CACHE", cache_path)
+    cache_path.parent.mkdir(mode=0o700)
+    cache_path.symlink_to(target)
+
+    assert asset_ticker_map._read_sec_cache() is None
+    payload = {"0": {"title": "Zoetis Inc.", "ticker": "ZTS"}}
+    asset_ticker_map._write_sec_cache(payload)
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not cache_path.is_symlink()
+    assert stat.S_IMODE(cache_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
+    assert asset_ticker_map._read_sec_cache() == (("Zoetis Inc.", "ZTS"),)
+    modified = cache_path.stat().st_mtime
+    monkeypatch.setattr(
+        asset_ticker_map.time,
+        "time",
+        lambda: modified + asset_ticker_map._CACHE_TTL_SECONDS,
+    )
+    assert asset_ticker_map._read_sec_cache() is None
 
 
 @pytest.mark.parametrize(

@@ -455,7 +455,7 @@ def test_fully_closed_holder_does_not_contribute():
         db.conn.close()
 
 
-def test_cli_setups_blocks_two_fully_closed_holders(monkeypatch):
+def test_cli_setups_blocks_two_fully_closed_holders(monkeypatch, tmp_path):
     members = ("Closed Holder One", "Closed Holder Two")
     transactions = []
     for member, purchase_day, purchase_disclosure, source_id in (
@@ -495,7 +495,8 @@ def test_cli_setups_blocks_two_fully_closed_holders(monkeypatch):
     try:
         result = CliRunner().invoke(
             cli.app,
-            ["setups", "--ticker", "ZTS", "--as-of", "2026-06-30"],
+            ["setups", "--ticker", "ZTS", "--as-of", "2026-06-30",
+             "--data-dir", str(tmp_path)],
         )
         assert result.exit_code == 0, result.output
         assert "=== Ranked setups ===\nNone." in result.output
@@ -510,7 +511,7 @@ def test_cli_setups_blocks_two_fully_closed_holders(monkeypatch):
         db.conn.close()
 
 
-def test_cli_setups_blocks_stale_last_quote(monkeypatch):
+def test_cli_setups_blocks_stale_last_quote(monkeypatch, tmp_path):
     decision_date = JULY_31
     candidates = pd.DataFrame(
         [
@@ -548,7 +549,8 @@ def test_cli_setups_blocks_stale_last_quote(monkeypatch):
 
     result = CliRunner().invoke(
         cli.app,
-        ["setups", "--ticker", "ZTS", "--as-of", decision_date.isoformat()],
+        ["setups", "--ticker", "ZTS", "--as-of", decision_date.isoformat(),
+         "--data-dir", str(tmp_path)],
     )
 
     assert result.exit_code == 0, result.output

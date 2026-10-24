@@ -71,6 +71,21 @@ _CREDENTIALS = frozenset(
     }
 )
 
+# Explicit missing-value spellings seen at data boundaries. Keep this list
+# narrow: ordinary names must not be rejected by a heuristic.
+_MISSING_MEMBER_KEYS = frozenset(
+    {
+        "N A",
+        "NA",
+        "NONE",
+        "NAN",
+        "NULL",
+        "UNKNOWN",
+        "UNKNOWN MEMBER",
+        "NOT AVAILABLE",
+    }
+)
+
 
 @lru_cache(maxsize=65536)
 def canonical_member_key(name: str) -> str:
@@ -132,6 +147,16 @@ def canonical_member_key(name: str) -> str:
     return re.sub(r"\b(?:[A-Z] ){1,}[A-Z]\b", lambda m: m[0].replace(" ", ""), " ".join(tokens))
 
 
+def member_identity_key(name: str) -> str:
+    """Return a canonical member identity, or blank for known missing markers.
+
+    Unlike ``canonical_member_key``, this is for identity/counting decisions;
+    the lower-level canonicalizer remains unchanged for persisted actor IDs.
+    """
+    key = canonical_member_key(name)
+    return "" if key in _MISSING_MEMBER_KEYS else key
+
+
 _KINDS = frozenset({"congress", "officer", "manager"})
 _NICKNAMES = {
     "bob": "robert", "bill": "william", "jim": "james", "mike": "michael",
@@ -167,7 +192,7 @@ def _same_person(first: str, candidate: str) -> bool:
 
 
 def _same_member_variant(first: str, candidate: str) -> bool:
-    """Match filed variants without joining conflicting middle initials."""
+    """Match filed variants without joining conflicting full middle names."""
     first_tokens = first.split()
     candidate_tokens = candidate.split()
     if len(first_tokens) < 2 or len(candidate_tokens) < 2:
@@ -176,12 +201,14 @@ def _same_member_variant(first: str, candidate: str) -> bool:
         return False
     if not _same_person(first_tokens[0].lower(), candidate_tokens[0].lower()):
         return False
-    first_middle = first_tokens[1][0] if len(first_tokens) > 2 else None
-    candidate_middle = candidate_tokens[1][0] if len(candidate_tokens) > 2 else None
+    first_middle = first_tokens[1] if len(first_tokens) > 2 else None
+    candidate_middle = candidate_tokens[1] if len(candidate_tokens) > 2 else None
+    if first_middle is None or candidate_middle is None:
+        return True
     return (
-        first_middle is None
-        or candidate_middle is None
-        or first_middle == candidate_middle
+        first_middle == candidate_middle
+        or (len(first_middle) == 1 and first_middle == candidate_middle[0])
+        or (len(candidate_middle) == 1 and candidate_middle == first_middle[0])
     )
 
 
@@ -209,7 +236,7 @@ def member_identity_groups(names: Iterable[str]) -> dict[str, str]:
     canonical_names: set[str] = set()
     for name in names:
         if isinstance(name, str):
-            key = canonical_member_key(name)
+            key = member_identity_key(name)
             if key:
                 canonical_names.add(key)
     keys = sorted(canonical_names)

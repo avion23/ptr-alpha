@@ -220,6 +220,63 @@ def test_ambiguous_alias_cannot_bridge_distinct_full_names():
     ) == []
 
 
+def test_known_missing_member_marker_is_not_a_consensus_buyer():
+    transactions = _transactions(
+        ("Alice Smith", "Bob Jones", "N/A"),
+        disclosure_dates=["2024-05-10", "2024-05-12", "2024-05-14"],
+    )
+    transactions["source"] = ["house_pdf", "senate_efd", "house_pdf"]
+
+    prepared = prepare_consensus_purchases(transactions)
+    result = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=pd.Timestamp("2024-05-20"), min_buyers=3
+    ).iloc[0]
+
+    assert transactions["member"].tolist() == ["Alice Smith", "Bob Jones", "N/A"]
+    assert prepared["member"].tolist() == ["Alice Smith", "Bob Jones"]
+    assert result["num_buyers"] == 2
+    assert result["signal_score"] == 0.0
+    assert (
+        get_consensus_candidate_tickers(
+            transactions, 3, as_of_date=pd.Timestamp("2024-05-20")
+        )
+        == []
+    )
+
+
+def test_full_middle_names_remain_distinct_and_ambiguous_nickname_is_excluded():
+    transactions = _transactions(
+        (
+            "Charles James Fleischmann",
+            "Charles Joseph Fleischmann",
+            "Chuck Fleischmann",
+            "Alice Smith",
+        ),
+        disclosure_dates=["2024-05-10", "2024-05-11", "2024-05-12", "2024-05-13"],
+    )
+    transactions["source"] = ["house_pdf", "senate_efd", "house_pdf", "senate_efd"]
+    as_of = pd.Timestamp("2024-05-20")
+
+    prepared = prepare_consensus_purchases(transactions)
+    member_keys = prepared.set_index("member")["_member_canonical"]
+    original = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=as_of, min_buyers=3
+    ).iloc[0]
+    reversed_rows = score_ticker_by_buyers(
+        "AAPL",
+        transactions.iloc[::-1].reset_index(drop=True),
+        as_of_date=as_of,
+        min_buyers=3,
+    ).iloc[0]
+
+    assert member_keys["Charles James Fleischmann"] == "CHARLES JAMES FLEISCHMANN"
+    assert member_keys["Charles Joseph Fleischmann"] == "CHARLES JOSEPH FLEISCHMANN"
+    assert member_keys["Chuck Fleischmann"] == ""
+    assert original["num_buyers"] == reversed_rows["num_buyers"] == 3
+    assert original["signal_score"] == reversed_rows["signal_score"] == 3.0
+    assert original["buyers"] == reversed_rows["buyers"]
+
+
 @pytest.mark.parametrize("ticker", ["", "   ", "NOT_A_TICKER", "CASH", "BOND", "SP"])
 def test_consensus_rejects_invalid_or_non_equity_tickers(ticker):
     with pytest.raises(AnalysisError, match="ticker|Ticker"):

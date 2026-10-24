@@ -95,6 +95,9 @@ def test_cli_and_replay_use_the_same_actor_weight_path():
 
 def test_actor_id_uses_kind_specific_name_normalization():
     assert actor_id("congress", "Dr. Michael T. McCaul Jr.") == "congress:MICHAEL T MCCAUL"
+    assert actor_id("congress", "Charles James Fleischmann") != actor_id(
+        "congress", "Charles Joseph Fleischmann"
+    )
     assert actor_id("officer", "  Jane   DOE ") == "officer:JANE DOE"
     assert actor_id("manager", "  Jane   DOE ") == "manager:JANE DOE"
 

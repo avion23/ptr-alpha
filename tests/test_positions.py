@@ -796,6 +796,21 @@ class TestPositions(unittest.TestCase):
         variants = _member_variants(SimpleNamespace(conn=conn), "Mike A. Smith")
         self.assertEqual(variants, ["Mike A. Smith"])
 
+    def test_member_identity_compares_full_middle_tokens_but_accepts_initials(self):
+        from analyzer.member_names import same_member_identity
+
+        self.assertTrue(
+            same_member_identity("Chuck Fleischmann", "Charles J. Fleischmann")
+        )
+        self.assertTrue(
+            same_member_identity("Charles James Fleischmann", "Charles J. Fleischmann")
+        )
+        self.assertFalse(
+            same_member_identity(
+                "Charles James Fleischmann", "Charles Joseph Fleischmann"
+            )
+        )
+
     def test_sale_full_closes_position_across_name_variants(self):
         trades = pd.DataFrame(
             [

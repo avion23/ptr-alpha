@@ -8,7 +8,7 @@ import pandas as pd
 
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
-from analyzer.member_names import canonical_member_key, member_identity_groups
+from analyzer.member_names import member_identity_groups, member_identity_key
 from analyzer.models import TransactionType
 from analyzer.parsing.cells import extract_instrument_type
 from analyzer.ticker_resolver import TickerResolver
@@ -467,7 +467,7 @@ def _filter_equity_rows(rows: pd.DataFrame) -> pd.DataFrame:
 def _canonical_member_or_blank(value) -> str:
     if not isinstance(value, str):
         return ""
-    return canonical_member_key(value)
+    return member_identity_key(value)
 
 
 def _empty_ticker_result(ticker: str) -> pd.DataFrame:

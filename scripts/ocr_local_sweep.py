@@ -135,7 +135,7 @@ from scripts.scan_ocr import (  # noqa: E402
     pdf_page_count,
     sha256_file,
 )
-from scripts.ocr_zero_rows import extract_ticker, resolve_ticker  # noqa: E402
+from analyzer.ocr.ingestion import extract_ticker, resolve_ticker  # noqa: E402
 from analyzer.parsing import (  # noqa: E402
     _extract_amount_midpoint,
     _extract_date,

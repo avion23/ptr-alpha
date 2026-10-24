@@ -99,7 +99,7 @@ for _path in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from scripts.gemini_ocr_common import (  # noqa: E402
+from analyzer.ocr.common import (  # noqa: E402
     AMOUNT_MIDPOINTS,
     PROMPT_SHA256,
     GeminiOutputError,  # noqa: F401  (re-exported for callers/tests)
@@ -159,9 +159,9 @@ AUDIT_IDENTITY_FIELDS = ("pdf_sha256", "prompt_sha256", "parsed_at_utc")
 
 def _ocr_ingestion():
     # Single import boundary for the production OCR ownership migration.
-    from scripts import ocr_zero_rows
+    from analyzer.ocr import ingestion
 
-    return ocr_zero_rows
+    return ingestion
 
 
 class StagingRecord(TypedDict):
@@ -1646,7 +1646,7 @@ def promote_docs(
     with a loud warning). ``require_audit_pass=False`` is refused loudly —
     there is no permissive default anymore.
 
-    ``insert_transactions_outcome`` (from ``scripts.ocr_zero_rows``) writes
+    ``insert_transactions_outcome`` (from ``analyzer.ocr.ingestion``) writes
     the transactions AND the pdf_parse_runs record transactionally, exactly
     as the OCR path does. The staging JSON is archived — promotion consumes
     the live record — ONLY when the FULL staged row set is confirmed committed

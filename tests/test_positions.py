@@ -43,13 +43,13 @@ def test_member_discovery_distinguishes_missing_tables_from_failed_reads():
 def test_private_safe_cannot_open_common_stock_position():
     rows = pd.DataFrame([
         dict(member="Private", ticker="AAPL", transaction_type="Purchase",
-             transaction_date="2026-01-02", amount_midpoint=10000,
+             transaction_date="2026-01-02", disclosure_date="2026-01-02", amount_midpoint=10000,
              instrument_type="private", asset_description="Private security"),
         dict(member="Raw", ticker="AAPL", transaction_type="Purchase",
-             transaction_date="2026-01-02", amount_midpoint=10000,
+             transaction_date="2026-01-02", disclosure_date="2026-01-02", amount_midpoint=10000,
              instrument_type="stock", asset_description="LLC Description: convertible SAFE"),
         dict(member="Stock", ticker="AAPL", transaction_type="Purchase",
-             transaction_date="2026-01-02", amount_midpoint=10000,
+             transaction_date="2026-01-02", disclosure_date="2026-01-02", amount_midpoint=10000,
              instrument_type="stock", asset_description="Apple (AAPL) [ST]"),
     ])
     result = build_positions(rows, {"AAPL": _prices(["2026-01-02"], [100])}, as_of=date(2026, 1, 3))
@@ -131,6 +131,7 @@ class TestPositions(unittest.TestCase):
                             "ticker": "T",
                             "transaction_type": "Purchase",
                             "transaction_date": date(2025, 1, 10),
+                            "disclosure_date": date(2025, 1, 10),
                             "amount_midpoint": 10000.0,
                             "owner_code": purchase_owner,
                         },
@@ -140,6 +141,7 @@ class TestPositions(unittest.TestCase):
                             "transaction_type": "Sale",
                             "raw_transaction_subtype": "Sale (Full)",
                             "transaction_date": date(2025, 6, 10),
+                            "disclosure_date": date(2025, 6, 10),
                             "amount_midpoint": 100.0,
                             "owner_code": sale_owner,
                         },
@@ -158,6 +160,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                     "owner_code": "S",
@@ -167,6 +170,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 500.0,
                     "source": "house_pdf",
                     "owner_code": "SP",
@@ -176,6 +180,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                     "owner_code": "S",
@@ -203,6 +208,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                 },
@@ -211,6 +217,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 500.0,
                     "source": "house_pdf",
                     "owner_code": "SP",
@@ -221,6 +228,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                 },
@@ -247,6 +255,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                     "owner_code": "S",
@@ -256,6 +265,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                 },
@@ -412,6 +422,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 14),
+                    "disclosure_date": date(2025, 1, 14),
                     "amount_midpoint": 16911.0,
                 },
                 {
@@ -419,6 +430,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2026, 1, 16),
+                    "disclosure_date": date(2026, 1, 16),
                     "amount_midpoint": 16614.0,
                 },
             ]
@@ -447,6 +459,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 20000.0,
                 },
                 {
@@ -454,6 +467,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale Partial",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 10000.0,
                 },
             ]
@@ -479,6 +493,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                 },
                 {
@@ -486,6 +501,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale Full",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 20000.0,
                 },
             ]
@@ -504,6 +520,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "NOPE",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                 },
             ]
@@ -536,6 +553,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2026, 1, 16),
+                    "disclosure_date": date(2026, 1, 16),
                     "amount_midpoint": None,
                     "amount_raw": "$100,001 -",
                 },
@@ -557,6 +575,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2026, 1, 16),
+                    "disclosure_date": date(2026, 1, 16),
                     "amount_midpoint": None,
                     "amount_raw": "garbage",
                 },
@@ -575,6 +594,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 14),
+                    "disclosure_date": date(2025, 1, 14),
                     "amount_midpoint": 750000.5,
                     "instrument_type": "option",
                 },
@@ -595,6 +615,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 14),
+                    "disclosure_date": date(2025, 1, 14),
                     "amount_midpoint": 750000.5,
                     "instrument_type": None,
                     "asset_description": "Vistra Corp. Common Stock (T) [OP]",
@@ -627,6 +648,60 @@ class TestPositions(unittest.TestCase):
         visible = build_positions(trades, history, as_of=date(2026, 9, 21))
         self.assertEqual(len(visible), 1)
 
+    def test_unknown_disclosure_date_cannot_create_public_position_evidence(self):
+        trades = pd.DataFrame(
+            [
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 1, 2),
+                    "disclosure_date": date(2026, 1, 2),
+                    "amount_midpoint": 1000.0,
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 1, 3),
+                    "disclosure_date": None,
+                    "amount_midpoint": 10000.0,
+                },
+                {
+                    "member": "M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 1, 4),
+                    "disclosure_date": "not-a-date",
+                    "amount_midpoint": 20000.0,
+                },
+            ]
+        )
+        history = {
+            "T": _prices(
+                ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"],
+                [100.0, 100.0, 100.0, 100.0],
+            )
+        }
+        valid_only = build_positions(trades.iloc[:1], history, as_of=date(2026, 1, 5))
+
+        with self.assertLogs("analyzer.positions", level="WARNING") as logs:
+            observed = build_positions(trades, history, as_of=date(2026, 1, 5))
+
+        pd.testing.assert_frame_equal(observed, valid_only)
+        assert observed.iloc[0]["shares"] == 10.0
+        self.assertTrue(
+            any("Skipping 2 rows without a valid disclosure_date" in log for log in logs.output)
+        )
+
+        with self.assertLogs("analyzer.positions", level="WARNING"):
+            no_date_column = build_positions(
+                trades.drop(columns="disclosure_date"),
+                history,
+                as_of=date(2026, 1, 5),
+            )
+        assert no_date_column.empty
+
     def test_sale_full_clears_position(self):
         trades = pd.DataFrame(
             [
@@ -635,6 +710,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                 },
                 {
@@ -644,6 +720,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale Full",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 100.0,
                 },
             ]
@@ -661,6 +738,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                     "source_record_id": "r1",
                     "amends_source_record_id": None,
@@ -670,6 +748,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 20000.0,
                     "source_record_id": "r2",
                     "amends_source_record_id": "r1",
@@ -725,6 +804,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "ZTS",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                 },
                 {
@@ -732,6 +812,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "ZTS",
                     "transaction_type": "Sale Full",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 100.0,
                 },
             ]
@@ -898,6 +979,47 @@ class TestPositions(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates.iloc[0]["kind"], "manager")
         self.assertIsNone(candidates.iloc[0]["entry_ref"])
+
+    def test_13f_snapshot_without_disclosure_is_not_current_position_evidence(self):
+        import json
+
+        db, conn = _holdings_db(
+            [
+                {
+                    "member": "Manager M",
+                    "ticker": "T",
+                    "transaction_type": "Purchase",
+                    "transaction_date": date(2026, 1, 2),
+                    "disclosure_date": None,
+                    "amount_raw": json.dumps(
+                        {
+                            "format": "13f-share-snapshot-v1",
+                            "shares_held": 100,
+                            "change_shares": 10,
+                            "portfolio_pct": None,
+                        }
+                    ),
+                    "raw_transaction_subtype": "13F_SHARE_POSITION_SNAPSHOT",
+                    "source": "13f",
+                }
+            ],
+            [],
+        )
+        try:
+            with self.assertLogs("analyzer.positions", level="WARNING") as logs:
+                candidates = holdings_candidates(
+                    db,
+                    "Manager M",
+                    date(2026, 1, 5),
+                    enable_13f_corroboration=True,
+                )
+        finally:
+            conn.close()
+
+        assert candidates.empty
+        self.assertTrue(
+            any("13F rows without a valid disclosure_date" in log for log in logs.output)
+        )
 
     def test_13f_share_snapshots_expose_held_and_absent_states_without_dollar_lots(self):
         import json
@@ -1114,6 +1236,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2026, 8, 31),
+                    "disclosure_date": date(2026, 8, 31),
                     "amount_midpoint": 10000.0,
                     "instrument_type": "Common Stock",
                     "asset_description": "Common Stock; 100 shares @ $100.00; is_10b5_1=false",
@@ -1123,6 +1246,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale",
                     "transaction_date": date(2026, 9, 15),
+                    "disclosure_date": date(2026, 9, 15),
                     "amount_midpoint": 9000.0,
                     "instrument_type": "Common Stock",
                     "asset_description": "Common Stock; 100 shares @ $90.00; is_10b5_1=false",
@@ -1197,6 +1321,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": transaction_type,
                     "transaction_date": transaction_date,
+                    "disclosure_date": transaction_date,
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                     "owner_code": "S",
@@ -1256,6 +1381,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                     "owner_code": "S",
@@ -1268,6 +1394,7 @@ class TestPositions(unittest.TestCase):
                             "ticker": "T",
                             "transaction_type": "Purchase",
                             "transaction_date": date(2025, 1, 10),
+                            "disclosure_date": date(2025, 1, 10),
                             "amount_midpoint": 10000.0,
                             "source": "house_pdf",
                             "owner_code": "S",
@@ -1278,6 +1405,7 @@ class TestPositions(unittest.TestCase):
                             "ticker": "T",
                             "transaction_type": "Purchase",
                             "transaction_date": date(2025, 6, 11),
+                            "disclosure_date": date(2025, 6, 11),
                             "amount_midpoint": 10000.0,
                             "source": "house_pdf",
                             "owner_code": "S",
@@ -1287,6 +1415,7 @@ class TestPositions(unittest.TestCase):
                             "ticker": "T",
                             "transaction_type": "Sale",
                             "transaction_date": date(2025, 6, 12),
+                            "disclosure_date": date(2025, 6, 12),
                             "amount_midpoint": 10000.0,
                             "source": "house_pdf",
                             "owner_code": "S",
@@ -1321,6 +1450,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10.0,
                     "asset_description": "0.1 shares @ $100",
                 },
@@ -1329,6 +1459,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 11),
+                    "disclosure_date": date(2025, 1, 11),
                     "amount_midpoint": 20.0,
                     "asset_description": "0.2 shares @ $100",
                 },
@@ -1337,6 +1468,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale",
                     "transaction_date": date(2025, 1, 12),
+                    "disclosure_date": date(2025, 1, 12),
                     "amount_midpoint": 30.0,
                     "asset_description": "0.3 shares @ $100",
                 },
@@ -1361,6 +1493,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                 },
@@ -1370,6 +1503,7 @@ class TestPositions(unittest.TestCase):
                     "transaction_type": "Sale",
                     "raw_transaction_subtype": "Sale (Partial)",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 9500.0,
                     "source": "house_pdf",
                 },
@@ -1396,6 +1530,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                     "owner_code": "S",
@@ -1405,6 +1540,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                     "owner_code": "S",
@@ -1414,6 +1550,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 6, 11),
+                    "disclosure_date": date(2025, 6, 11),
                     "amount_midpoint": 10000.0,
                     "source": "house_pdf",
                     "owner_code": "S",
@@ -1444,6 +1581,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
+                    "disclosure_date": date(2025, 1, 10),
                     "amount_midpoint": 10000.0,
                 },
                 {
@@ -1451,6 +1589,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Sale Full",
                     "transaction_date": date(2025, 6, 10),
+                    "disclosure_date": date(2025, 6, 10),
                     "amount_midpoint": 10000.0,
                 },
                 {
@@ -1458,6 +1597,7 @@ class TestPositions(unittest.TestCase):
                     "ticker": "T",
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 6, 11),
+                    "disclosure_date": date(2025, 6, 11),
                     "amount_midpoint": 10000.0,
                 },
             ]
@@ -1672,6 +1812,7 @@ def test_equity_admission_precedes_fifo_lot_accounting():
                 "ticker": "AAPL",
                 "transaction_type": "Purchase",
                 "transaction_date": "2026-01-02",
+                "disclosure_date": "2026-01-02",
                 "amount_midpoint": 10000,
                 "source": "house_pdf",
                 "ticker_origin": "official",
@@ -1687,6 +1828,7 @@ def test_equity_admission_precedes_fifo_lot_accounting():
                 "ticker": "AAPL",
                 "transaction_type": "Sale",
                 "transaction_date": "2026-01-03",
+                "disclosure_date": "2026-01-03",
                 "amount_midpoint": 10000,
                 "source": "senate_efd",
                 "ticker_origin": "official",
@@ -1702,6 +1844,7 @@ def test_equity_admission_precedes_fifo_lot_accounting():
                 "ticker": "AAPL",
                 "transaction_type": "Purchase",
                 "transaction_date": "2026-01-04",
+                "disclosure_date": "2026-01-04",
                 "amount_midpoint": 10000,
                 "source": "house_pdf",
                 "ticker_origin": "official",
@@ -1716,6 +1859,7 @@ def test_equity_admission_precedes_fifo_lot_accounting():
                 "ticker": "AAPL",
                 "transaction_type": "Sale",
                 "transaction_date": "2026-01-05",
+                "disclosure_date": "2026-01-05",
                 "amount_midpoint": 2000,
                 "source": "house_pdf",
                 "ticker_origin": "official",
@@ -1782,6 +1926,7 @@ def test_equity_admission_filters_each_metadata_field_before_fifo(
         common,
         transaction_type="Purchase",
         transaction_date="2026-01-02",
+        disclosure_date="2026-01-02",
         amount_midpoint=10000,
     )
     rejected_event = dict(
@@ -1789,6 +1934,7 @@ def test_equity_admission_filters_each_metadata_field_before_fifo(
         transaction_type=event_type,
         raw_transaction_subtype=subtype,
         transaction_date="2026-01-03",
+        disclosure_date="2026-01-03",
         amount_midpoint=amount,
     )
     rejected_event[rejected_field] = rejected_value
@@ -1817,6 +1963,7 @@ def test_rejected_sale_after_last_valid_transaction_preserves_activity():
                 "ticker": "AAPL",
                 "transaction_type": "Purchase",
                 "transaction_date": "2026-01-02",
+                "disclosure_date": "2026-01-02",
                 "amount_midpoint": 10000,
                 "source": "house_pdf",
                 "ticker_origin": "official",
@@ -1831,6 +1978,7 @@ def test_rejected_sale_after_last_valid_transaction_preserves_activity():
                 "transaction_type": "Sale",
                 "raw_transaction_subtype": "Sale (Partial)",
                 "transaction_date": "2026-01-03",
+                "disclosure_date": "2026-01-03",
                 "amount_midpoint": 2000,
                 "source": "house_pdf",
                 "ticker_origin": "official",
@@ -1844,6 +1992,7 @@ def test_rejected_sale_after_last_valid_transaction_preserves_activity():
                 "ticker": "AAPL",
                 "transaction_type": "Sale",
                 "transaction_date": "2026-01-04",
+                "disclosure_date": "2026-01-04",
                 "amount_midpoint": 2000,
                 "source": "senate_efd",
                 "ticker_origin": "official",
@@ -1878,6 +2027,7 @@ def test_identical_equity_lots_keep_both_filing_row_references():
                 "ticker": "AAPL",
                 "transaction_type": "Purchase",
                 "transaction_date": "2026-01-02",
+                "disclosure_date": "2026-01-02",
                 "amount_midpoint": 10000,
                 "source": "house_pdf",
                 "ticker_origin": "official",
@@ -2010,6 +2160,7 @@ def test_equity_admission_preserves_option_skip_diagnostic(caplog):
                 "ticker": "T",
                 "transaction_type": "Purchase",
                 "transaction_date": "2026-01-02",
+                "disclosure_date": "2026-01-02",
                 "amount_midpoint": 100,
                 "instrument_type": "option",
             }

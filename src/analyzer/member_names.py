@@ -131,6 +131,132 @@ def canonical_member_key(name: str) -> str:
     return re.sub(r"\b(?:[A-Z] ){1,}[A-Z]\b", lambda m: m[0].replace(" ", ""), " ".join(tokens))
 
 
+_KINDS = frozenset({"congress", "officer", "manager"})
+_NICKNAMES = {
+    "bob": "robert", "bill": "william", "jim": "james", "mike": "michael",
+    "tom": "thomas", "dave": "david", "dan": "daniel", "steve": "steven",
+    "joe": "joseph", "matt": "matthew", "nick": "nicholas", "alex": "alexander",
+    "chris": "christopher", "pat": "patrick", "tim": "timothy",
+    "jeff": "jeffrey", "greg": "gregory", "ron": "ronald", "ken": "kenneth",
+    "larry": "lawrence", "rick": "richard", "chuck": "charles", "ro": "rohit",
+    "hal": "harold", "dick": "richard", "ned": "edward", "ted": "theodore",
+}
+
+
+def actor_id(kind: str, key: str) -> str:
+    """Return a source-independent actor ID from a name and actor kind."""
+    if kind not in _KINDS:
+        raise ValueError(f"Unsupported actor kind: {kind!r}")
+    normalized = (
+        canonical_member_key(key)
+        if kind == "congress"
+        else " ".join(key.upper().split())
+    )
+    return f"{kind}:{normalized}"
+
+
+def _same_person(first: str, candidate: str) -> bool:
+    """Last-name-gated nickname equivalence for filed name variants."""
+    if first == candidate:
+        return True
+    for short, full in _NICKNAMES.items():
+        if {first, candidate} == {short, full}:
+            return True
+    return False
+
+
+def _same_member_variant(first: str, candidate: str) -> bool:
+    """Match filed variants without joining conflicting middle initials."""
+    first_tokens = first.split()
+    candidate_tokens = candidate.split()
+    if len(first_tokens) < 2 or len(candidate_tokens) < 2:
+        return first == candidate
+    if first_tokens[-1] != candidate_tokens[-1]:
+        return False
+    if not _same_person(first_tokens[0].lower(), candidate_tokens[0].lower()):
+        return False
+    first_middle = first_tokens[1][0] if len(first_tokens) > 2 else None
+    candidate_middle = candidate_tokens[1][0] if len(candidate_tokens) > 2 else None
+    return (
+        first_middle is None
+        or candidate_middle is None
+        or first_middle == candidate_middle
+    )
+
+
+def same_member_identity(first: str, candidate: str) -> bool:
+    """Whether two filed names denote the same human.
+
+    Canonical keys retain middle names; the filed-variant rule covers
+    nicknames and optional middle names (Chuck <-> Charles J.).
+    """
+    first_key = canonical_member_key(first)
+    candidate_key = canonical_member_key(candidate)
+    return first_key == candidate_key or _same_member_variant(
+        first_key, candidate_key
+    )
+
+
+def same_actor_identity(first: str, candidate: str) -> bool:
+    """Whether two actor_ids denote the same human initiator."""
+    if first == candidate:
+        return True
+    first_kind, _, first_name = first.partition(":")
+    candidate_kind, _, candidate_name = candidate.partition(":")
+    return (
+        first_kind == candidate_kind == "congress"
+        and bool(first_name and candidate_name)
+        and _same_actor_member(first_name, candidate_name)
+    )
+
+
+def _same_actor_member(first: str, candidate: str) -> bool:
+    first_key = canonical_member_key(first)
+    candidate_key = canonical_member_key(candidate)
+    first_tokens = first_key.split()
+    candidate_tokens = candidate_key.split()
+    if first_key == candidate_key:
+        return True
+    if len(first_tokens) < 2 or len(candidate_tokens) < 2:
+        return False
+    if first_tokens[-1] != candidate_tokens[-1]:
+        return False
+    if not _same_person(first_tokens[0].lower(), candidate_tokens[0].lower()):
+        return False
+    first_middle = first_tokens[1:-1]
+    candidate_middle = candidate_tokens[1:-1]
+    return not first_middle or not candidate_middle or first_middle == candidate_middle
+
+
+def _identity_key(name: str) -> str:
+    try:
+        return canonical_member_key(name)
+    except (TypeError, ValueError):
+        return str(name).strip().upper()
+
+
+def dedupe_member_names(
+    names: list[str], exclude: list[str] | tuple[str, ...] = ()
+) -> list[str]:
+    """Drop names denoting an already-listed (or excluded) human.
+
+    Matches on canonical key first, then on filed variants. First spelling
+    wins.
+    """
+    keys = [_identity_key(name) for name in exclude]
+    kept: list[str] = []
+    for name in names:
+        key = _identity_key(name)
+        if key in keys or any(
+            _same_member_variant(key, seen) or _same_member_variant(seen, key)
+            for seen in keys
+        ):
+            continue
+        keys.append(key)
+        kept.append(name)
+    return kept
+
+
 def chamber_scoped_member_key(name: str, chamber: str) -> str:
     """Scope a lossy canonical name key to its filing chamber.
 

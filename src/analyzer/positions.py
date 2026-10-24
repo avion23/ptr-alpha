@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import re
+from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
 
@@ -25,7 +26,13 @@ import numpy as np
 import pandas as pd
 
 from analyzer.canonical_scope import canonical_decision
-from analyzer.member_names import canonical_member_key
+from analyzer.member_names import (
+    actor_id,
+    canonical_member_key,
+    dedupe_member_names as dedupe_member_names,
+    same_actor_identity,
+    same_member_identity,
+)
 from analyzer.parsing.cells import _extract_amount_midpoint, _extract_instrument_type
 
 logger = logging.getLogger(__name__)
@@ -39,6 +46,17 @@ _POSITION_ESTIMATE_TOLERANCE = 0.10
 _SHARE_EPSILON = 1e-9
 _13F_SNAPSHOT_SUBTYPE = "13F_SHARE_POSITION_SNAPSHOT"
 _13F_CORROBORATION_ENV = "INSIDER_ENABLE_13F_CORROBORATION"
+
+
+@dataclass(slots=True)
+class _Lot:
+    shares: float
+    cost: float
+    disclosure_day: date
+    source: str | None
+    account: str | None
+    day: date
+    filing_ref: dict
 
 
 def _13f_enabled(value):
@@ -508,7 +526,7 @@ def build_positions(
     if not has_midpoint and not has_raw:
         raise PositionsError("trades need amount_midpoint or amount_raw for sizing")
 
-    lots: dict[tuple[str, str], list] = {}
+    lots: dict[tuple[str, str], list[_Lot]] = {}
     last_activity: dict[tuple[str, str], date] = {}
     if entry_lookup is None:
         entry_lookup = _EntryCloseLookup(price_history, as_of)
@@ -546,6 +564,32 @@ def build_positions(
     _FILED_SHARES_RE = re.compile(
         r"([\d,.]+)\s+shares?\s+@\s*\$?([\d,.]+)", re.IGNORECASE
     )
+
+    _ALL_ACCOUNTS = object()
+
+    def _clear_account(key, account=_ALL_ACCOUNTS):
+        queue = lots.get(key)
+        if queue is not None:
+            if account is _ALL_ACCOUNTS:
+                queue.clear()
+            else:
+                queue[:] = [lot for lot in queue if lot.account != account]
+        if account is _ALL_ACCOUNTS:
+            band_estimates.pop(key, None)
+            ineligible_for_band_tolerance.difference_update(
+                {
+                    candidate
+                    for candidate in ineligible_for_band_tolerance
+                    if candidate[0] == key
+                }
+            )
+            return
+        estimates = band_estimates.get(key)
+        if estimates is not None:
+            estimates.pop(account, None)
+            if not estimates:
+                band_estimates.pop(key, None)
+        ineligible_for_band_tolerance.discard((key, account))
 
     def _filed_lot(description) -> tuple[float, float] | None:
         """Exact (shares, price) from filed descriptions like '100 shares @ $100'.
@@ -586,12 +630,22 @@ def build_positions(
 
     transaction_dates = pd.to_datetime(trades["transaction_date"], errors="coerce")
     disclosure_dates = (
-        pd.to_datetime(trades["disclosure_date"], errors="coerce").fillna(transaction_dates)
+        pd.to_datetime(trades["disclosure_date"], errors="coerce")
         if has_disclosure
-        else transaction_dates
+        else pd.Series(pd.NaT, index=trades.index, dtype="datetime64[ns]")
     )
-    known = (transaction_dates <= pd.Timestamp(as_of)) & (
-        disclosure_dates <= pd.Timestamp(as_of)
+    unknown_public_date = disclosure_dates.isna()
+    if unknown_public_date.any():
+        logger.warning(
+            "Skipping %d rows without a valid disclosure_date; transaction_date "
+            "cannot establish public availability",
+            int(unknown_public_date.sum()),
+        )
+    known = (
+        transaction_dates.notna()
+        & disclosure_dates.notna()
+        & (transaction_dates <= pd.Timestamp(as_of))
+        & (disclosure_dates <= pd.Timestamp(as_of))
     )
     skipped += int((~known).sum())
     # Filter before amendment resolution and alias grouping: future filings
@@ -718,7 +772,7 @@ def build_positions(
                     identity
                     for identity, variants in member_identities.items()
                     if all(
-                        _same_member_variant(canonical, variant)
+                        same_member_identity(canonical, variant)
                         for variant in variants
                     )
                 ),
@@ -756,11 +810,7 @@ def build_positions(
             skipped_options += 1
             continue
         disclosed = disclosure_cells[i] if has_disclosure else None
-        disclosure_day = (
-            disclosure_day_cache.get(disclosed, _DAY_MISS)
-            if disclosed is not None and not pd.isna(disclosed)
-            else day
-        )
+        disclosure_day = disclosure_day_cache.get(disclosed, _DAY_MISS)
         if disclosure_day is _DAY_MISS:
             disclosure_day = pd.Timestamp(disclosed).date()
             disclosure_day_cache[disclosed] = disclosure_day
@@ -805,12 +855,19 @@ def build_positions(
                         estimate["bought_value"] += size
                         estimate["bought_shares"] += shares
             lots.setdefault(key, []).append(
-                [shares, size, disclosure_day, source, account, day,
-                 _filing_ref(
-                     record_id_cells[i] if has_record_id else None,
-                     row_id_cells[i] if has_row_id else None,
-                     source,
-                 )]
+                _Lot(
+                    shares=shares,
+                    cost=size,
+                    disclosure_day=disclosure_day,
+                    source=source,
+                    account=account,
+                    day=day,
+                    filing_ref=_filing_ref(
+                        record_id_cells[i] if has_record_id else None,
+                        row_id_cells[i] if has_row_id else None,
+                        source,
+                    ),
+                )
             )
             if by_floor:
                 floor_sized[key] = floor_sized.get(key, 0) + 1
@@ -822,25 +879,9 @@ def build_positions(
                 # close only that account's lots; otherwise close the member's
                 # full position in this ticker.
                 if account is None:
-                    lots[key] = []
+                    _clear_account(key)
                 else:
-                    lots[key] = [lot for lot in lots.get(key, []) if lot[4] != account]
-                if account is None:
-                    band_estimates.pop(key, None)
-                    ineligible_for_band_tolerance.difference_update(
-                        {
-                            candidate
-                            for candidate in ineligible_for_band_tolerance
-                            if candidate[0] == key
-                        }
-                    )
-                else:
-                    estimates = band_estimates.get(key)
-                    if estimates is not None:
-                        estimates.pop(account, None)
-                        if not estimates:
-                            band_estimates.pop(key)
-                    ineligible_for_band_tolerance.discard(estimate_key)
+                    _clear_account(key, account)
                 continue
             sale_estimate_value = None
             sale_band_ineligible = False
@@ -872,13 +913,13 @@ def build_positions(
             index = 0
             while to_relieve > 0 and index < len(queue):
                 lot = queue[index]
-                if account is not None and lot[4] != account:
+                if account is not None and lot.account != account:
                     index += 1
                     continue
-                lot_shares, lot_cost = lot[0], lot[1]
+                lot_shares, lot_cost = lot.shares, lot.cost
                 relieved_shares = min(lot_shares, to_relieve)
-                relieved_by_account[lot[4]] = (
-                    relieved_by_account.get(lot[4], 0.0) + relieved_shares
+                relieved_by_account[lot.account] = (
+                    relieved_by_account.get(lot.account, 0.0) + relieved_shares
                 )
                 if lot_shares <= to_relieve + _SHARE_EPSILON:
                     to_relieve = max(0.0, to_relieve - lot_shares)
@@ -889,10 +930,10 @@ def build_positions(
                     if abs(remaining_shares) <= _SHARE_EPSILON:
                         queue.pop(index)
                     else:
-                        lot[0] = remaining_shares
-                        lot[1] = lot_cost * (1 - fraction)
+                        lot.shares = remaining_shares
+                        lot.cost = lot_cost * (1 - fraction)
                     to_relieve = 0
-            queue[:] = [lot for lot in queue if abs(lot[0]) > _SHARE_EPSILON]
+            queue[:] = [lot for lot in queue if abs(lot.shares) > _SHARE_EPSILON]
             if congress_estimate and sale_shares > 0:
                 for relieved_account, relieved_shares in relieved_by_account.items():
                     relieved_key = (key, relieved_account)
@@ -904,13 +945,8 @@ def build_positions(
                             estimate["sold_value"] += (
                                 sale_estimate_value * relieved_shares / sale_shares
                             )
-                    if not any(lot[4] == relieved_account for lot in queue):
-                        estimates = band_estimates.get(key)
-                        if estimates is not None:
-                            estimates.pop(relieved_account, None)
-                            if not estimates:
-                                band_estimates.pop(key)
-                        ineligible_for_band_tolerance.discard(relieved_key)
+                    if not any(lot.account == relieved_account for lot in queue):
+                        _clear_account(key, relieved_account)
             if not partial_sale:
                 for estimate_account, estimate in list(
                     band_estimates.get(key, {}).items()
@@ -919,7 +955,7 @@ def build_positions(
                     if estimate_key in ineligible_for_band_tolerance:
                         continue
                     remaining_shares = sum(
-                        lot[0] for lot in queue if lot[4] == estimate_account
+                        lot.shares for lot in queue if lot.account == estimate_account
                     )
                     if (
                         estimate["bought_value"] > 0
@@ -930,30 +966,17 @@ def build_positions(
                         <= estimate["bought_shares"]
                         * _POSITION_ESTIMATE_TOLERANCE
                     ):
-                        queue[:] = [
-                            lot for lot in queue if lot[4] != estimate_account
-                        ]
-                        band_estimates[key].pop(estimate_account)
-                        ineligible_for_band_tolerance.discard(estimate_key)
-                        if not band_estimates[key]:
-                            band_estimates.pop(key)
+                        _clear_account(key, estimate_account)
             if not queue:
-                band_estimates.pop(key, None)
-                ineligible_for_band_tolerance.difference_update(
-                    {
-                        candidate
-                        for candidate in ineligible_for_band_tolerance
-                        if candidate[0] == key
-                    }
-                )
+                _clear_account(key)
         else:
             ignored_exchanges += 1
 
     records = []
     for key, queue in lots.items():
-        queue[:] = [lot for lot in queue if abs(lot[0]) > _SHARE_EPSILON]
-        shares = sum(lot[0] for lot in queue)
-        cost = sum(lot[1] for lot in queue)
+        queue[:] = [lot for lot in queue if abs(lot.shares) > _SHARE_EPSILON]
+        shares = sum(lot.shares for lot in queue)
+        cost = sum(lot.cost for lot in queue)
         if shares <= _SHARE_EPSILON or cost <= 0:
             continue
         history = price_history[key[1]]
@@ -971,10 +994,10 @@ def build_positions(
                 "cost_basis": basis,
                 "current_price": current,
                 "discount_pct": (current / basis - 1) * 100,
-                "first_buy": min(lot[5] for lot in queue),
+                "first_buy": min(lot.day for lot in queue),
                 "last_activity": last_activity[key],
-                "disclosure_date": max(lot[2] for lot in queue),
-                "source": queue[-1][3],
+                "disclosure_date": max(lot.disclosure_day for lot in queue),
+                "source": queue[-1].source,
                 "floor_sized_lots": floor_sized.get(key, 0),
                 "filing_refs": _canonical_filing_refs(queue),
             }
@@ -1016,7 +1039,7 @@ def _canonical_filing_refs(queue) -> list[dict]:
     """
     refs: list[dict] = []
     for lot in queue:
-        ref = lot[6] if len(lot) > 6 else None
+        ref = lot.filing_ref
         if not isinstance(ref, dict):
             ref = {"source": None, "source_record_id": None, "source_row_id": None}
         if ref not in refs:
@@ -1042,10 +1065,11 @@ def holdings_candidates(
 ) -> pd.DataFrame:
     """Return open positions as uncorroborated, unexpired setup candidates.
 
-    Lots count only when their disclosure date (or transaction date when
-    missing) is no later than ``as_of``. Position valuation uses the last close
-    on or before ``as_of``; future closes cannot enter a replay. Positions have
-    no age expiry and remain candidates until sales close their lots.
+    Lots count only when their valid disclosure date is no later than
+    ``as_of``; a transaction date cannot substitute for unknown public
+    availability. Position valuation uses the last close on or before
+    ``as_of``; future closes cannot enter a replay. Positions have no age
+    expiry and remain candidates until sales close their lots.
     """
     enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
     columns = [
@@ -1074,19 +1098,6 @@ def holdings_candidates(
         "13f": "manager",
     }
 
-    try:
-        from analyzer.actors import actor_id
-    except ModuleNotFoundError as exc:
-        if exc.name != "analyzer.actors":
-            raise
-
-        # analyzer.actors is not present in older installs; keep its stable format.
-        def _actor_id(kind, key):
-            return f"{kind}:{key}"
-
-    else:
-        _actor_id = actor_id
-
     trades = load_member_trades(db, member, include_unpromoted=include_unpromoted)
     if trades.empty:
         return pd.DataFrame(columns=columns)
@@ -1100,7 +1111,7 @@ def holdings_candidates(
         for ticker in trades["ticker"].dropna().unique()
     }
     return _holdings_records(
-        member, trades, histories, as_of, _actor_id, columns, source_kinds,
+        member, trades, histories, as_of, actor_id, columns, source_kinds,
         enable_13f_corroboration=enable_13f_corroboration,
     )
 
@@ -1152,18 +1163,6 @@ def holdings_candidates_batch(
     members = [m for m in dict.fromkeys(members) if isinstance(m, str) and m.strip()]
     if not members:
         return {}
-
-    try:
-        from analyzer.actors import actor_id
-    except ModuleNotFoundError as exc:
-        if exc.name != "analyzer.actors":
-            raise
-
-        def _actor_id(kind, key):
-            return f"{kind}:{key}"
-
-    else:
-        _actor_id = actor_id
 
     all_names = _distinct_member_names(db)
     variants: dict[str, list[str]] = {}
@@ -1304,7 +1303,7 @@ def holdings_candidates_batch(
         # with an unmapped source land in no actor-kind mask, exactly like
         # the previous source-isin prefilter.
         out[member] = _holdings_records(
-            member, trades, histories, as_of, _actor_id, columns, source_kinds,
+            member, trades, histories, as_of, actor_id, columns, source_kinds,
             entry_lookup=entry_lookup,
             presorted=not include_unpromoted,
             kind_cells=kind_by_member.get(member),
@@ -1431,10 +1430,20 @@ def _13f_share_state_records(member, trades, as_of, _actor_id):
     disclosure_dates = (
         pd.to_datetime(trades["disclosure_date"], errors="coerce")
         if "disclosure_date" in trades
-        else transaction_dates
+        else pd.Series(pd.NaT, index=trades.index, dtype="datetime64[ns]")
     )
-    known = (transaction_dates <= pd.Timestamp(as_of)) & (
-        disclosure_dates <= pd.Timestamp(as_of)
+    unknown_public_date = disclosure_dates.isna()
+    if unknown_public_date.any():
+        logger.warning(
+            "Skipping %d 13F rows without a valid disclosure_date; transaction_date "
+            "cannot establish public availability",
+            int(unknown_public_date.sum()),
+        )
+    known = (
+        transaction_dates.notna()
+        & disclosure_dates.notna()
+        & (transaction_dates <= pd.Timestamp(as_of))
+        & (disclosure_dates <= pd.Timestamp(as_of))
     )
     ordered = trades.loc[known].copy()
     if ordered.empty:
@@ -1534,90 +1543,6 @@ def discount_alerts(positions: pd.DataFrame, *, threshold_pct: float = -10.0) ->
     return positions.loc[positions["discount_pct"] <= threshold_pct].copy()
 
 
-_NICKNAMES = {
-    "bob": "robert", "bill": "william", "jim": "james", "mike": "michael",
-    "tom": "thomas", "dave": "david", "dan": "daniel", "steve": "steven",
-    "joe": "joseph", "matt": "matthew", "nick": "nicholas", "alex": "alexander",
-    "chris": "christopher", "pat": "patrick", "tim": "timothy",
-    "jeff": "jeffrey", "greg": "gregory", "ron": "ronald", "ken": "kenneth",
-    "larry": "lawrence", "rick": "richard", "chuck": "charles", "ro": "rohit",
-    "hal": "harold", "dick": "richard", "ned": "edward", "ted": "theodore",
-}
-
-
-def _same_person(first: str, candidate: str) -> bool:
-    """Last-name-gated nickname equivalence for filed name variants."""
-    if first == candidate:
-        return True
-    for short, full in _NICKNAMES.items():
-        if {first, candidate} == {short, full}:
-            return True
-    return False
-
-
-def _same_member_variant(first: str, candidate: str) -> bool:
-    """Match filed variants without joining conflicting middle initials."""
-    first_tokens = first.split()
-    candidate_tokens = candidate.split()
-    if len(first_tokens) < 2 or len(candidate_tokens) < 2:
-        return first == candidate
-    if first_tokens[-1] != candidate_tokens[-1]:
-        return False
-    if not _same_person(first_tokens[0].lower(), candidate_tokens[0].lower()):
-        return False
-    first_middle = first_tokens[1][0] if len(first_tokens) > 2 else None
-    candidate_middle = candidate_tokens[1][0] if len(candidate_tokens) > 2 else None
-    return (
-        first_middle is None
-        or candidate_middle is None
-        or first_middle == candidate_middle
-    )
-
-
-def same_member_identity(first: str, candidate: str) -> bool:
-    """Whether two filed names denote the same human.
-
-    Canonical keys retain middle names; the filed-variant rule covers
-    nicknames and optional middle names (Chuck <-> Charles J.).
-    """
-    first_key = canonical_member_key(first)
-    candidate_key = canonical_member_key(candidate)
-    return first_key == candidate_key or _same_member_variant(
-        first_key, candidate_key
-    )
-
-
-def same_actor_identity(first: str, candidate: str) -> bool:
-    """Whether two actor_ids denote the same human initiator."""
-    if first == candidate:
-        return True
-    first_kind, _, first_name = first.partition(":")
-    candidate_kind, _, candidate_name = candidate.partition(":")
-    return (
-        first_kind == candidate_kind == "congress"
-        and bool(first_name and candidate_name)
-        and _same_actor_member(first_name, candidate_name)
-    )
-
-
-def _same_actor_member(first: str, candidate: str) -> bool:
-    first_key = canonical_member_key(first)
-    candidate_key = canonical_member_key(candidate)
-    first_tokens = first_key.split()
-    candidate_tokens = candidate_key.split()
-    if first_key == candidate_key:
-        return True
-    if len(first_tokens) < 2 or len(candidate_tokens) < 2:
-        return False
-    if first_tokens[-1] != candidate_tokens[-1]:
-        return False
-    if not _same_person(first_tokens[0].lower(), candidate_tokens[0].lower()):
-        return False
-    first_middle = first_tokens[1:-1]
-    candidate_middle = candidate_tokens[1:-1]
-    return not first_middle or not candidate_middle or first_middle == candidate_middle
-
-
 def coalesce_actor_variants(events: pd.DataFrame, from_positions: pd.DataFrame) -> pd.DataFrame:
     """Rewrite congress event actor_ids to their open-position identity.
 
@@ -1661,35 +1586,6 @@ def coalesce_actor_variants(events: pd.DataFrame, from_positions: pd.DataFrame) 
     return events
 
 
-def _identity_key(name: str) -> str:
-    try:
-        return canonical_member_key(name)
-    except (TypeError, ValueError):
-        return str(name).strip().upper()
-
-
-def dedupe_member_names(
-    names: list[str], exclude: list[str] | tuple[str, ...] = ()
-) -> list[str]:
-    """Drop names denoting an already-listed (or excluded) human.
-
-    Matches on canonical key first, then the filed-variant rule for
-    nicknames and optional middle names. First spelling wins.
-    """
-    keys = [_identity_key(name) for name in exclude]
-    kept: list[str] = []
-    for name in names:
-        key = _identity_key(name)
-        if key in keys or any(
-            _same_member_variant(key, seen) or _same_member_variant(seen, key)
-            for seen in keys
-        ):
-            continue
-        keys.append(key)
-        kept.append(name)
-    return kept
-
-
 def _member_variants(db, member: str) -> list[str]:
     """All filed name variants for the member.
 
@@ -1709,7 +1605,7 @@ def _member_variants(db, member: str) -> list[str]:
 @lru_cache(maxsize=65536)
 def _matches_wanted(key: str, wanted: str) -> bool:
     """Memoized exact-key-or-filed-variant match (pure string decision)."""
-    return key == wanted or _same_member_variant(key, wanted)
+    return same_member_identity(key, wanted)
 
 
 def _variants_for(member: str, wanted: str, all_names: list) -> list[str]:

@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.canonical_scope import canonical_decision
-from analyzer.member_names import canonical_member_key
+from analyzer.member_names import actor_id, same_actor_identity
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.ticker_resolver import TickerResolver
 
@@ -39,18 +39,6 @@ SKILL_HORIZON_DAYS = 90
 MIN_VALIDATED_SKILL_OBSERVATIONS = 3
 UNKNOWN_SKILL_MULTIPLIER = 0.5
 _SKILL_COLUMNS = ["actor_id", "n_matured", "mean_excess_pct"]
-
-
-def actor_id(kind: str, key: str) -> str:
-    """Return a source-independent actor ID from a name and actor kind."""
-    if kind not in _KINDS:
-        raise ValueError(f"Unsupported actor kind: {kind!r}")
-    normalized = (
-        canonical_member_key(key)
-        if kind == "congress"
-        else " ".join(key.upper().split())
-    )
-    return f"{kind}:{normalized}"
 
 
 def compute_weight(kind: str, n_matured: int, hits: float, source: str) -> float:
@@ -269,8 +257,6 @@ def _load_actor_members(
         ]
     else:
         members["actor_id"] = pd.Series(dtype="object")
-    from analyzer.positions import same_actor_identity
-
     def matches_requested(history_id: str) -> bool:
         kind, _, name = history_id.partition(":")
         tokens = name.split()
@@ -396,8 +382,6 @@ def load_skill_table(
     ).fetchdf()
     skill_table = compute_skill_table(disclosures, prices, cutoff)
     if actor_ids is not None:
-        from analyzer.positions import same_actor_identity
-
         history_ids = set(selected["actor_id"])
         requested_ids = set(map(str, actor_ids))
         exact_single_identity_ids = {

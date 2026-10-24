@@ -99,6 +99,15 @@ def test_actor_id_uses_kind_specific_name_normalization():
     assert actor_id("manager", "  Jane   DOE ") == "manager:JANE DOE"
 
 
+def test_identity_helpers_have_one_owner_with_legacy_facade_aliases():
+    from analyzer import actors, member_names, positions
+
+    assert actors.actor_id is member_names.actor_id
+    assert positions.same_actor_identity is member_names.same_actor_identity
+    assert positions.same_member_identity is member_names.same_member_identity
+    assert positions.dedupe_member_names is member_names.dedupe_member_names
+
+
 def test_mccaul_skill_matches_exact_name_variant_only(tmp_path):
     from analyzer.actors import weights_for_candidates
 

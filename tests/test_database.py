@@ -482,6 +482,51 @@ class TestTransactions(DatabaseTestCase):
         self.assertEqual(aapl["owner_code"], "DC")
         self.assertAlmostEqual(aapl["amount_midpoint"], 8000.5)
 
+    def test_dedup_read_failure_fails_before_upsert(self):
+        from analyzer.persistence.transaction_repository import drop_already_stored
+
+        existing = pd.DataFrame([{
+            "doc_id": "dedup-read-regression",
+            "member": "Regression Tester",
+            "ticker": "XYZ",
+            "transaction_date": date(2024, 1, 2),
+            "disclosure_date": date(2024, 1, 3),
+            "transaction_type": "Purchase",
+            "chamber": "house",
+            "source_record_id": "accession-1",
+            "source_row_id": "row-1",
+            "ingestion_generation": "old-generation",
+        }])
+        self.db.upsert_transactions(existing, source="form4")
+        connection = self.db.conn
+
+        # Only the lookup is fault-injected; other operations use real DuckDB.
+        class FailingDedupRead:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, query, *args, **kwargs):
+                if (
+                    "SELECT source_record_id, source_row_id FROM transactions"
+                    in query
+                ):
+                    raise duckdb.IOException("injected transaction lookup failure")
+                return self._conn.execute(query, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        self.db.conn = FailingDedupRead(connection)
+        retry = existing.assign(ingestion_generation="new-generation")
+        before = connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        with self.assertRaises(duckdb.IOException):
+            self.db.upsert_transactions(
+                drop_already_stored(self.db, retry, source="form4"),
+                source="form4",
+            )
+        after = connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        self.assertEqual(after, before)
+
     def test_transactions_exist_returns_true_when_present(self):
         df = pd.DataFrame(
             [

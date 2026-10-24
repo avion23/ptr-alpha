@@ -97,19 +97,16 @@ def drop_already_stored(db, df, *, source: str):
     keyed = keyed.drop_duplicates(subset=["_record_key", "_row_key"], keep="first")
     if keyed.empty:
         return df.iloc[0:0].copy()
-    try:
-        accessions = sorted(set(keyed["_record_key"]))
-        placeholders = ", ".join("?" for _ in accessions)
-        stored = {
-            (str(record_id).strip().lower(), str(row_id).strip().lower())
-            for record_id, row_id in conn.execute(
-                f"SELECT source_record_id, source_row_id FROM transactions "  # nosec B608
-                f"WHERE source = ? AND TRIM(LOWER(source_record_id)) IN ({placeholders})",
-                [source, *accessions],
-            ).fetchall()
-        }
-    except Exception:
-        return df
+    accessions = sorted(set(keyed["_record_key"]))
+    placeholders = ", ".join("?" for _ in accessions)
+    stored = {
+        (str(record_id).strip().lower(), str(row_id).strip().lower())
+        for record_id, row_id in conn.execute(
+            f"SELECT source_record_id, source_row_id FROM transactions "  # nosec B608
+            f"WHERE source = ? AND TRIM(LOWER(source_record_id)) IN ({placeholders})",
+            [source, *accessions],
+        ).fetchall()
+    }
     mask = pd.Series(
         [
             (record_id, row_id) not in stored

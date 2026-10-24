@@ -6,6 +6,8 @@ test proving the exact violation is reported and the process exits nonzero.
 """
 
 import hashlib
+import json
+import os
 import subprocess
 import sys
 from datetime import date, datetime
@@ -26,6 +28,31 @@ from scripts.audit_generation import (
 
 ROOT = Path(__file__).resolve().parents[1]
 AUDIT_SCRIPT = ROOT / "scripts" / "audit_generation.py"
+
+
+def _guarded_subprocess_env():
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if "API_KEY" not in key and "BASE_URL" not in key
+    }
+    env.update(
+        {
+            "PYTHONPATH": os.pathsep.join(
+                part
+                for part in (
+                    os.environ.get("PYTHONPATH", ""),
+                    str(ROOT / "src"),
+                    str(ROOT),
+                )
+                if part
+            ),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+        }
+    )
+    return env
 
 
 @pytest.mark.parametrize(
@@ -61,6 +88,21 @@ def test_c2_detects_null_identity_replays_without_changing_legacy_rows(tmp_path,
         assert db.conn.execute(
             "SELECT COUNT(*) FROM canonical_transactions"
         ).fetchone()[0] == 2
+        from scripts.audit_generation import (
+            check_duplicate_policy,
+            check_source_identity_duplicates,
+        )
+
+        assert not any(
+            "exact-identity replay not deduplicated" in violation
+            for violation in check_duplicate_policy(db.conn).violations
+        )
+        assert any(
+            "exact-identity replay not deduplicated" in violation
+            for violation in check_source_identity_duplicates(
+                db.conn, include_nulls=True, sample_limit=10
+            ).violations
+        )
         before = db.conn.execute("SELECT * FROM transactions ORDER BY id").fetchall()
     finally:
         db.close()
@@ -407,6 +449,78 @@ def test_clean_fixture_passes_all_checks(tmp_path):
         assert result.passed, (result.name, result.violations)
 
 
+def test_staged_verify_preserves_check_count_and_output(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from scripts import rebuild_staged
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    db = build_staged_db(staging / "congress.duckdb")
+    db.conn.execute(
+        "UPDATE house_archive_generations SET ptr_count = 5 "
+        "WHERE archive_year = 2026 AND generation_id = 'gen-2026-b'"
+    )
+    db.conn.execute("UPDATE transactions SET chamber = 'senate' WHERE source = 'senate_efd'")
+    db.conn.execute("UPDATE source_reports SET chamber = 'senate' WHERE source = 'senate_efd'")
+    db.conn.execute("INSERT INTO prices VALUES ('SPY', '2026-07-01', 100.0)")
+    db.close()
+
+    price_fields = {
+        "requested_tickers": 1,
+        "resolved_tickers": 1,
+        "price_rows": 1,
+        "value_hash": "a" * 64,
+    }
+    (staging / "price_snapshot.json").write_text(
+        json.dumps(
+            {
+                **price_fields,
+                "coverage_by_ticker": {"SPY": {"rows": 1}},
+                "unresolved_tickers": [],
+            }
+        )
+    )
+    manifest = {
+        "scope": {
+            "house_years": [2025, 2026],
+            "senate_start": "2024-01-01",
+            "price_start": "2014-01-01",
+        },
+        "house": {
+            "2025": {"generation_id": "gen-2025-a", "parse_status": "complete"},
+            "2026": {"generation_id": "gen-2026-b", "parse_status": "complete"},
+        },
+        "senate": {
+            "status": "persisted",
+            "generation": "senate-gen-1",
+            "summary": {
+                "found": 2,
+                "parsed": 1,
+                "paper_only": 1,
+                "unavailable": 0,
+                "failed": 0,
+            },
+        },
+        "prices": {
+            "status": "snapshotted",
+            **price_fields,
+            "unresolved_tickers": [],
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-01",
+        },
+    }
+    rebuild_staged._save_manifest(staging, manifest)
+    monkeypatch.setattr(rebuild_staged, "REQUIRED_HOUSE_YEARS", (2025, 2026))
+
+    rebuild_staged.verify(SimpleNamespace(staging=str(staging)))
+
+    assert capsys.readouterr().out == "verify: 31/31 checks passed\n"
+    verification = json.loads((staging / "manifest.json").read_text())["verify"]
+    assert verification["generation_complete"] is True
+    assert len(verification["checks"]) == 31
+
+
 def test_audit_never_modifies_the_database(tmp_path):
     db_path = tmp_path / "stage.duckdb"
     db = build_staged_db(db_path)
@@ -422,7 +536,7 @@ def test_cli_exit_zero_with_json_output(tmp_path):
     db = build_staged_db(db_path)
     db.close()
     output = tmp_path / "audit.json"
-    env = {"PYTHONPATH": str(ROOT / "src")}
+    env = _guarded_subprocess_env()
     completed = subprocess.run(
         [sys.executable, str(AUDIT_SCRIPT), str(db_path), "--json", str(output)],
         capture_output=True,
@@ -458,7 +572,7 @@ def test_audit_parser_source_recognizes_validated_non_gemini_llm_backends():
 
 
 def test_cli_missing_database_exits_two(tmp_path):
-    env = {"PYTHONPATH": str(ROOT / "src")}
+    env = _guarded_subprocess_env()
     completed = subprocess.run(
         [sys.executable, str(AUDIT_SCRIPT), str(tmp_path / "nope.duckdb")],
         capture_output=True,

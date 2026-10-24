@@ -1,5 +1,6 @@
 """Regression tests for the staged rebuild parser boundary."""
 
+import importlib
 import json
 from datetime import date
 from types import SimpleNamespace
@@ -7,6 +8,68 @@ from typing import cast
 
 import pandas as pd
 import pytest
+
+
+def test_rebuild_import_does_not_set_docling_environment(monkeypatch):
+    from scripts import rebuild_staged
+
+    monkeypatch.delenv("PTR_SKIP_DOCLING", raising=False)
+    importlib.reload(rebuild_staged)
+    assert "PTR_SKIP_DOCLING" not in rebuild_staged.os.environ
+
+
+def test_house_parse_scopes_local_ocr_default_to_operation(monkeypatch, tmp_path):
+    from scripts import rebuild_staged
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    rebuild_staged._save_manifest(
+        staging,
+        {"house": {"2026": {"parse_status": "incomplete"}}},
+    )
+    observed = []
+
+    class FakeDatabase:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(rebuild_staged, "Database", FakeDatabase)
+
+    def parse(_staging, _db, _year):
+        observed.append(rebuild_staged.os.environ.get("PTR_SKIP_DOCLING"))
+        return {"attempted": 1}
+
+    monkeypatch.setattr(rebuild_staged, "_parse_house_year_tolerant", parse)
+    monkeypatch.setattr(rebuild_staged, "_refresh_house_completion", lambda *_args: ([], 1))
+    monkeypatch.setenv("PTR_SKIP_DOCLING", "0")
+    rebuild_staged.house_parse(
+        rebuild_staged.argparse.Namespace(staging=str(staging), years=[2026], force=False)
+    )
+    assert observed == ["1"]
+    assert rebuild_staged.os.environ["PTR_SKIP_DOCLING"] == "0"
+
+
+def test_shared_verification_phase_keeps_staged_check_contract(tmp_path):
+    from analyzer.database import Database
+    from scripts import rebuild_staged
+
+    db = Database(tmp_path / "empty.duckdb")
+    try:
+        checks = {}
+        rebuild_staged._verify_shared_database_audits(db, checks)
+        assert list(checks) == [
+            "house_success_run_counts_equal_persisted_rows",
+            "source_report_reconciliation_consistent",
+            "chronology_valid",
+            "no_source_identity_duplicates",
+            "source_identity_complete",
+        ]
+        assert all(result["passed"] for result in checks.values())
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize("bad_row", ["invalid_date", "missing_metadata"])

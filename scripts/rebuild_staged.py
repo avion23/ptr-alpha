@@ -24,6 +24,7 @@ outcome counts, unresolved lists, invariant results, verdict).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -69,6 +70,12 @@ from analyzer.source_report_repository import (  # noqa: E402
     SOURCE_REPORT_INPUT_COLUMNS,
     SourceReportOutcome,
     _is_official_paper_url,
+)
+from scripts.audit_generation import (  # noqa: E402
+    check_no_transaction_after_disclosure,
+    check_parse_counts_match_persisted,
+    check_source_identity_duplicates,
+    check_source_report_equation,
 )
 
 _parse_pdf_worker = _parser_cascade._parse_pdf_worker
@@ -979,39 +986,54 @@ def _source_report_provenance_violations(
     return violations
 
 
+@contextlib.contextmanager
+def _local_ocr_only():
+    """Keep the staged House command on its accepted local-only parser path."""
+    previous = os.environ.get("PTR_SKIP_DOCLING")
+    os.environ["PTR_SKIP_DOCLING"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PTR_SKIP_DOCLING", None)
+        else:
+            os.environ["PTR_SKIP_DOCLING"] = previous
+
+
 def house_parse(args) -> None:
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
     years = [int(y) for y in args.years] if args.years else HOUSE_YEARS
-    db = Database(staging / "congress.duckdb", read_only=False)
-    try:
-        for year in years:
-            house = manifest.get("house", {}).get(str(year))
-            if house is None:
-                print(f"house-parse {year}: skipped (not fetched)")
-                continue
-            if house.get("parse_status") == "complete" and not args.force:
-                print(f"house-parse {year}: skipped (already complete)")
-                continue
-            result = _parse_house_year_tolerant(staging, db, year)
-            previous_result = house.get("parse_result") or {}
-            if result.get("attempted", 0) == 0 and previous_result:
-                # Resumable skip: keep the original outcome telemetry.
-                merged = dict(previous_result)
-                merged["skipped_cached"] = result.get("skipped_cached", 0) + previous_result.get("skipped_cached", 0)
-                result = merged
-            house["parse_result"] = result
-            unresolved, report_count = _refresh_house_completion(db, house, year)
-            if unresolved:
-                print(
-                    f"house-parse {year}: INCOMPLETE — {len(unresolved)} unresolved "
-                    f"({', '.join(unresolved[:10])}{'...' if len(unresolved) > 10 else ''})"
-                )
-            else:
-                print(f"house-parse {year}: COMPLETE — {report_count} inventory rows persisted")
-            _save_manifest(staging, manifest)
-    finally:
-        db.close()
+    with _local_ocr_only():
+        db = Database(staging / "congress.duckdb", read_only=False)
+        try:
+            for year in years:
+                house = manifest.get("house", {}).get(str(year))
+                if house is None:
+                    print(f"house-parse {year}: skipped (not fetched)")
+                    continue
+                if house.get("parse_status") == "complete" and not args.force:
+                    print(f"house-parse {year}: skipped (already complete)")
+                    continue
+                result = _parse_house_year_tolerant(staging, db, year)
+                previous_result = house.get("parse_result") or {}
+                if result.get("attempted", 0) == 0 and previous_result:
+                    # Resumable skip: keep the original outcome telemetry.
+                    merged = dict(previous_result)
+                    merged["skipped_cached"] = result.get("skipped_cached", 0) + previous_result.get("skipped_cached", 0)
+                    result = merged
+                house["parse_result"] = result
+                unresolved, report_count = _refresh_house_completion(db, house, year)
+                if unresolved:
+                    print(
+                        f"house-parse {year}: INCOMPLETE — {len(unresolved)} unresolved "
+                        f"({', '.join(unresolved[:10])}{'...' if len(unresolved) > 10 else ''})"
+                    )
+                else:
+                    print(f"house-parse {year}: COMPLETE — {report_count} inventory rows persisted")
+                _save_manifest(staging, manifest)
+        finally:
+            db.close()
 
 
 def _ingest_cached_gemini_year(
@@ -1592,6 +1614,495 @@ def _canonical_view_diff_counts(db: Database) -> tuple[int, int]:
     return int(canonical_extra), int(canonical_missing)
 
 
+def _verify_house_phase(db: Database, house_manifest, checks: dict):
+    """Verify declared House generations and their artifact report bindings."""
+    incomplete_years: list[int] = []
+    report_checks: dict = {}
+    for year in REQUIRED_HOUSE_YEARS:
+        entry = (
+            house_manifest.get(str(year))
+            if isinstance(house_manifest, dict)
+            else None
+        )
+        generation = entry.get("generation_id") if isinstance(entry, dict) else None
+        generation_ok = isinstance(generation, str) and bool(generation.strip())
+        generation_row = latest_row = None
+        artifact_count = 0
+        if generation_ok:
+            generation_row = db.conn.execute(
+                """
+                SELECT generation_id, parse_status, ptr_count
+                FROM house_archive_generations
+                WHERE archive_year = ? AND generation_id = ?
+                """,
+                [year, generation],
+            ).fetchone()
+            latest_row = db.conn.execute(
+                """
+                SELECT generation_id
+                FROM house_archive_generations
+                WHERE archive_year = ?
+                ORDER BY promoted_at DESC, generation_id DESC
+                LIMIT 1
+                """,
+                [year],
+            ).fetchone()
+        if isinstance(generation, str) and generation:
+            artifact_count = int(
+                db.conn.execute(
+                    """
+                    SELECT COUNT(*) FROM house_pdf_artifacts
+                    WHERE archive_year = ? AND generation_id = ?
+                    """,
+                    [year, generation],
+                ).fetchone()[0]
+            )
+        declared_present = generation_ok and generation_row is not None
+        latest_ok = declared_present and str(latest_row[0]) == generation
+        _check(
+            checks,
+            f"house_{year}_declared_generation_present",
+            declared_present,
+            f"generation={generation!r}",
+        )
+        _check(
+            checks,
+            f"house_{year}_declared_generation_is_latest",
+            latest_ok,
+            f"declared={generation!r} "
+            f"latest={latest_row[0] if latest_row else None!r}",
+        )
+        if not declared_present:
+            incomplete_years.append(year)
+            _check(
+                checks,
+                f"house_{year}_parse_status_complete",
+                False,
+                "declared generation is absent",
+            )
+            _check(
+                checks,
+                f"house_{year}_zero_unresolved_pdfs",
+                False,
+                "declared generation is absent",
+            )
+            _check(
+                checks,
+                f"house_{year}_artifact_scope_complete",
+                False,
+                "declared generation is absent",
+            )
+        else:
+            _, db_status, ptr_count = generation_row
+            unresolved = db.get_unresolved_house_doc_ids(year, str(generation))
+            manifest_complete = entry.get("parse_status") == "complete"
+            complete = manifest_complete and db_status == "complete"
+            _check(
+                checks,
+                f"house_{year}_parse_status_complete",
+                complete,
+                f"manifest={entry.get('parse_status')!r} database={db_status!r}",
+            )
+            _check(
+                checks,
+                f"house_{year}_zero_unresolved_pdfs",
+                not unresolved,
+                f"unresolved={unresolved[:10]}",
+            )
+            _check(
+                checks,
+                f"house_{year}_artifact_scope_complete",
+                artifact_count == int(ptr_count),
+                f"artifacts={artifact_count} ptr_count={ptr_count}",
+            )
+            if not (
+                latest_ok
+                and complete
+                and not unresolved
+                and artifact_count == int(ptr_count)
+            ):
+                incomplete_years.append(year)
+
+        # Keep report scope bound to the manifest's complete generation, even
+        # when the database generation marker itself is missing or incomplete.
+        if (
+            not isinstance(entry, dict)
+            or entry.get("parse_status") != "complete"
+            or not isinstance(generation, str)
+            or not generation
+        ):
+            continue
+        source_reconciliations = {
+            source: db.source_reports.reconcile(generation, source, "house")
+            for source in ("house_pdf", "gemini_ocr")
+        }
+        reconcile = {
+            name: sum(part[name] for part in source_reconciliations.values())
+            for name in next(iter(source_reconciliations.values()))
+        }
+        expected = (
+            reconcile["found"] == artifact_count
+            and reconcile["found"]
+            == (
+                reconcile["parsed"]
+                + reconcile["no_txs"]
+                + reconcile["paper_only"]
+                + reconcile["unavailable"]
+                + reconcile["failed"]
+            )
+            and reconcile["failed"] == 0
+            and reconcile["unavailable"] == 0
+        )
+        binding_violations = _house_source_report_binding_violations(
+            db, year, generation
+        )
+        provenance_violations = _source_report_provenance_violations(
+            db, generation
+        )
+        expected = expected and not binding_violations and not provenance_violations
+        _check(
+            report_checks,
+            f"house_{year}_source_report_reconciliation",
+            expected,
+            f"reconcile={reconcile} artifacts={artifact_count} "
+            f"bindings={binding_violations[:10]} "
+            f"provenance={provenance_violations[:10]}",
+        )
+    return incomplete_years, report_checks
+
+
+def _verify_shared_database_audits(db: Database, checks: dict) -> None:
+    """Adapt canonical persisted-source audits to staged check names."""
+    parse_counts = check_parse_counts_match_persisted(db.conn)
+    _check(
+        checks,
+        "house_success_run_counts_equal_persisted_rows",
+        parse_counts.passed,
+        f"mismatches={parse_counts.violations[:10]}",
+    )
+
+    source_reports = check_source_report_equation(db.conn)
+    source_reports_required = "source_reports table missing" not in source_reports.info
+    _check(
+        checks,
+        "source_report_reconciliation_consistent",
+        source_reports.passed and source_reports_required,
+        f"violations={source_reports.violations[:10]} info={source_reports.info}",
+    )
+
+    chronology = check_no_transaction_after_disclosure(db.conn)
+    staged_chronology = int(
+        db.conn.execute(
+            """
+            SELECT COUNT(*) FROM transactions
+            WHERE transaction_date IS NULL OR disclosure_date IS NULL
+               OR (notification_date IS NOT NULL
+                   AND notification_date < transaction_date)
+               OR (chamber ILIKE 'senate'
+                   AND notification_date IS NOT NULL
+                   AND official_filing_date IS NOT NULL
+                   AND notification_date > official_filing_date)
+            """
+        ).fetchone()[0]
+    )
+    _check(
+        checks,
+        "chronology_valid",
+        chronology.passed and staged_chronology == 0,
+        f"after_disclosure={chronology.violations[:10]} "
+        f"staged_chronology_violations={staged_chronology}",
+    )
+
+    duplicate_policy = check_source_identity_duplicates(
+        db.conn, include_nulls=True, sample_limit=10
+    )
+    _check(
+        checks,
+        "no_source_identity_duplicates",
+        duplicate_policy.passed,
+        f"dups={duplicate_policy.violations[:10]}",
+    )
+    missing_identity = db.conn.execute(
+        """
+        SELECT source, chamber, source_record_id, source_row_id,
+               ingestion_generation
+        FROM transactions
+        WHERE source IN ('house_pdf', 'gemini_ocr', 'senate_efd')
+          AND (chamber IS NULL OR TRIM(chamber) = ''
+               OR source_record_id IS NULL OR TRIM(source_record_id) = ''
+               OR source_row_id IS NULL OR TRIM(source_row_id) = ''
+               OR ingestion_generation IS NULL OR TRIM(ingestion_generation) = '')
+        LIMIT 10
+        """
+    ).fetchall()
+    _check(
+        checks,
+        "source_identity_complete",
+        not missing_identity,
+        f"missing={missing_identity[:10]}",
+    )
+
+
+def _verify_senate_phase(db: Database, manifest: dict, checks: dict) -> None:
+    """Verify Senate generation identity, report equation, and accepted rows."""
+    senate = manifest.get("senate")
+    senate_window = manifest.get("senate_window")
+    if not isinstance(senate, dict):
+        senate = {}
+    if (
+        senate.get("status") != "persisted"
+        and isinstance(senate_window, dict)
+        and senate_window.get("status") == "ingested"
+    ):
+        senate = senate_window
+    senate_status_ok = senate.get("status") in ("persisted", "ingested")
+    intended_senate_generation = senate.get("generation") or manifest.get("generation")
+    _check(
+        checks,
+        "senate_status_persisted",
+        senate_status_ok,
+        f"status={senate.get('status')!r}",
+    )
+
+    active_senate_generations = {
+        str(row[0])
+        for row in db.conn.execute(
+            """
+            SELECT DISTINCT ingestion_generation
+            FROM source_reports
+            WHERE source = 'senate_efd' AND chamber = 'senate'
+            UNION
+            SELECT DISTINCT ingestion_generation
+            FROM transactions
+            WHERE source = 'senate_efd' AND chamber = 'senate'
+            """
+        ).fetchall()
+        if row[0] is not None
+    }
+    senate_null_generation = db.conn.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT ingestion_generation FROM source_reports
+            WHERE source = 'senate_efd' AND chamber = 'senate'
+            UNION ALL
+            SELECT ingestion_generation FROM transactions
+            WHERE source = 'senate_efd' AND chamber = 'senate'
+        )
+        WHERE ingestion_generation IS NULL OR TRIM(ingestion_generation) = ''
+        """
+    ).fetchone()[0]
+    senate_identity_ok = (
+        isinstance(intended_senate_generation, str)
+        and bool(intended_senate_generation.strip())
+        and active_senate_generations == {intended_senate_generation}
+        and int(senate_null_generation) == 0
+    )
+    _check(
+        checks,
+        "senate_generation_identity_consistent",
+        senate_identity_ok,
+        f"intended={intended_senate_generation!r} "
+        f"active={sorted(active_senate_generations)} null={senate_null_generation}",
+    )
+    if isinstance(intended_senate_generation, str) and intended_senate_generation.strip():
+        senate_reconcile = db.source_reports.reconcile(
+            intended_senate_generation, "senate_efd", "senate"
+        )
+    else:
+        senate_reconcile = {
+            name: 0
+            for name in (
+                "found",
+                "parsed",
+                "no_txs",
+                "paper_only",
+                "unavailable",
+                "failed",
+            )
+        }
+    _check(
+        checks,
+        "senate_source_reports_exist",
+        senate_reconcile["found"] > 0,
+        f"generation={intended_senate_generation!r} reconcile={senate_reconcile}",
+    )
+    senate_provenance_violations = (
+        _source_report_provenance_violations(db, intended_senate_generation)
+        if isinstance(intended_senate_generation, str)
+        and intended_senate_generation.strip()
+        else []
+    )
+    _check(
+        checks,
+        "senate_report_reconciliation",
+        not senate_provenance_violations
+        and senate_reconcile["found"]
+        == (
+            senate_reconcile["parsed"]
+            + senate_reconcile["no_txs"]
+            + senate_reconcile["paper_only"]
+            + senate_reconcile["unavailable"]
+            + senate_reconcile["failed"]
+        ),
+        f"{senate_reconcile} provenance={senate_provenance_violations[:10]}",
+    )
+    _check(
+        checks,
+        "senate_zero_unavailable_failed",
+        senate_reconcile["unavailable"] == 0 and senate_reconcile["failed"] == 0,
+        str(senate_reconcile),
+    )
+    senate_count_mismatches = []
+    senate_missing_reports = []
+    if isinstance(intended_senate_generation, str) and intended_senate_generation.strip():
+        senate_count_mismatches = db.conn.execute(
+            """
+            SELECT r.source_record_id, r.accepted_row_count, COUNT(t.id) AS actual
+            FROM source_reports r
+            LEFT JOIN transactions t
+              ON t.ingestion_generation = r.ingestion_generation
+             AND t.source = r.source
+             AND t.chamber = r.chamber
+             AND t.source_record_id = r.source_record_id
+            WHERE r.ingestion_generation = ?
+              AND r.source = 'senate_efd' AND r.chamber = 'senate'
+            GROUP BY 1, 2
+            HAVING r.accepted_row_count != COUNT(t.id)
+            ORDER BY 1
+            LIMIT 10
+            """,
+            [intended_senate_generation],
+        ).fetchall()
+        senate_missing_reports = db.conn.execute(
+            """
+            SELECT t.source_record_id, COUNT(*) AS rows
+            FROM transactions t
+            LEFT JOIN source_reports r
+              ON r.ingestion_generation = t.ingestion_generation
+             AND r.source = t.source
+             AND r.chamber = t.chamber
+             AND r.source_record_id = t.source_record_id
+            WHERE t.ingestion_generation = ?
+              AND t.source = 'senate_efd' AND t.chamber = 'senate'
+              AND r.source_record_id IS NULL
+            GROUP BY 1
+            ORDER BY 1
+            LIMIT 10
+            """,
+            [intended_senate_generation],
+        ).fetchall()
+    _check(
+        checks,
+        "senate_accepted_counts_equal_persisted_rows",
+        not senate_count_mismatches,
+        f"mismatches={senate_count_mismatches[:10]}",
+    )
+    _check(
+        checks,
+        "senate_transactions_have_source_reports",
+        not senate_missing_reports,
+        f"missing={senate_missing_reports[:10]}",
+    )
+    declared_summary = senate.get("summary")
+    if isinstance(declared_summary, dict) and declared_summary:
+        # Keep no_txs in the database equation without inventing a field the
+        # Senate manifest contract does not emit.
+        summary_fields = ("found", "parsed", "paper_only", "unavailable", "failed")
+        summary_ok = all(
+            field in declared_summary
+            and declared_summary[field] == senate_reconcile[field]
+            for field in summary_fields
+        ) and senate_reconcile["no_txs"] == 0
+    else:
+        summary_ok = True
+    _check(
+        checks,
+        "senate_manifest_summary_consistent",
+        summary_ok,
+        f"manifest={declared_summary} database={senate_reconcile}",
+    )
+
+
+def _verify_price_phase(db: Database, staging: Path, manifest: dict, checks: dict) -> None:
+    """Validate the manifest-bound price snapshot and persisted price counts."""
+    price_record = manifest.get("prices")
+    if not isinstance(price_record, dict):
+        price_record = {}
+    snapshot_path = staging / "price_snapshot.json"
+    price_detail: dict = {
+        "status": price_record.get("status"),
+        "snapshot": str(snapshot_path),
+        "unresolved_tickers": price_record.get("unresolved_tickers", []),
+    }
+    price_ok = price_record.get("status") == "snapshotted" and snapshot_path.is_file()
+    try:
+        snapshot = json.loads(snapshot_path.read_text())
+        coverage = snapshot.get("coverage_by_ticker")
+        tickers = list(coverage) if isinstance(coverage, dict) else []
+        unresolved = sorted(
+            str(ticker) for ticker in snapshot.get("unresolved_tickers", [])
+        )
+        record_unresolved = sorted(
+            str(ticker) for ticker in price_record.get("unresolved_tickers", [])
+        )
+        fields_match = all(
+            price_record.get(field) == snapshot.get(field)
+            for field in (
+                "requested_tickers",
+                "resolved_tickers",
+                "price_rows",
+                "value_hash",
+            )
+        ) and unresolved == record_unresolved
+        hash_ok = bool(
+            re.fullmatch(r"[0-9a-fA-F]{64}", str(snapshot.get("value_hash", "")))
+        )
+        coverage_ok = (
+            isinstance(coverage, dict)
+            and snapshot.get("requested_tickers") == len(tickers)
+            and snapshot.get("resolved_tickers") + len(unresolved)
+            == snapshot.get("requested_tickers")
+            and set(unresolved).issubset(tickers)
+        )
+        actual_rows = actual_tickers = None
+        if price_record.get("start_date") and price_record.get("end_date") and tickers:
+            actual_rows, actual_tickers = db.conn.execute(
+                """
+                SELECT COUNT(*), COUNT(DISTINCT ticker)
+                FROM prices
+                WHERE date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                  AND ticker IN (SELECT UNNEST(?))
+                  AND close > 0 AND isfinite(close)
+                """,
+                [price_record["start_date"], price_record["end_date"], tickers],
+            ).fetchone()
+        db_counts_ok = (
+            actual_rows is not None
+            and int(actual_rows) == int(snapshot.get("price_rows", -1))
+            and int(actual_tickers) == int(snapshot.get("resolved_tickers", -1))
+        )
+        price_detail.update(
+            {
+                "requested_tickers": snapshot.get("requested_tickers"),
+                "resolved_tickers": snapshot.get("resolved_tickers"),
+                "price_rows": snapshot.get("price_rows"),
+                "coverage": coverage_ok,
+                "database_counts": db_counts_ok,
+                "hash_format": hash_ok,
+            }
+        )
+        price_ok = price_ok and fields_match and hash_ok and coverage_ok and db_counts_ok
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, duckdb.Error) as exc:
+        price_detail["error"] = f"{type(exc).__name__}: {exc}"
+        price_ok = False
+    _check(
+        checks,
+        "price_diagnostics",
+        price_ok,
+        json.dumps(price_detail, sort_keys=True, default=str),
+    )
+
+
 def verify(args) -> None:
     staging = Path(args.staging)
     manifest = _load_manifest(staging)
@@ -1638,528 +2149,14 @@ def verify(args) -> None:
             f"declared={sorted(declared_house_years)} required={list(REQUIRED_HOUSE_YEARS)}",
         )
 
-        # Current House completeness and the historical years actually consumed
-        # by production validation are bound to the declared generation and the
-        # artifact-level terminal predicate in Database.get_unresolved_house_doc_ids.
-        # Older staged archives are diagnostics only and cannot block promotion.
-        for year in REQUIRED_HOUSE_YEARS:
-            entry = (
-                house_manifest.get(str(year))
-                if isinstance(house_manifest, dict)
-                else None
-            )
-            generation = entry.get("generation_id") if isinstance(entry, dict) else None
-            generation_ok = isinstance(generation, str) and bool(generation.strip())
-            generation_row = None
-            latest_row = None
-            if generation_ok:
-                generation_row = db.conn.execute(
-                    """
-                    SELECT generation_id, parse_status, ptr_count
-                    FROM house_archive_generations
-                    WHERE archive_year = ? AND generation_id = ?
-                    """,
-                    [year, generation],
-                ).fetchone()
-                latest_row = db.conn.execute(
-                    """
-                    SELECT generation_id
-                    FROM house_archive_generations
-                    WHERE archive_year = ?
-                    ORDER BY promoted_at DESC, generation_id DESC
-                    LIMIT 1
-                    """,
-                    [year],
-                ).fetchone()
-            declared_present = generation_ok and generation_row is not None
-            latest_ok = declared_present and str(latest_row[0]) == generation
-            _check(
-                checks,
-                f"house_{year}_declared_generation_present",
-                declared_present,
-                f"generation={generation!r}",
-            )
-            _check(
-                checks,
-                f"house_{year}_declared_generation_is_latest",
-                latest_ok,
-                f"declared={generation!r} "
-                f"latest={latest_row[0] if latest_row else None!r}",
-            )
-            if not declared_present:
-                incomplete_years.append(year)
-                _check(
-                    checks,
-                    f"house_{year}_parse_status_complete",
-                    False,
-                    "declared generation is absent",
-                )
-                _check(
-                    checks,
-                    f"house_{year}_zero_unresolved_pdfs",
-                    False,
-                    "declared generation is absent",
-                )
-                _check(
-                    checks,
-                    f"house_{year}_artifact_scope_complete",
-                    False,
-                    "declared generation is absent",
-                )
-                continue
+        incomplete_years, house_report_checks = _verify_house_phase(
+            db, house_manifest, checks
+        )
+        _verify_shared_database_audits(db, checks)
+        checks.update(house_report_checks)
+        _verify_senate_phase(db, manifest, checks)
 
-            _, db_status, ptr_count = generation_row
-            unresolved = db.get_unresolved_house_doc_ids(year, str(generation))
-            artifact_count = int(
-                db.conn.execute(
-                    """
-                    SELECT COUNT(*) FROM house_pdf_artifacts
-                    WHERE archive_year = ? AND generation_id = ?
-                    """,
-                    [year, generation],
-                ).fetchone()[0]
-            )
-            manifest_complete = entry.get("parse_status") == "complete"
-            complete = manifest_complete and db_status == "complete"
-            _check(
-                checks,
-                f"house_{year}_parse_status_complete",
-                complete,
-                f"manifest={entry.get('parse_status')!r} database={db_status!r}",
-            )
-            _check(
-                checks,
-                f"house_{year}_zero_unresolved_pdfs",
-                not unresolved,
-                f"unresolved={unresolved[:10]}",
-            )
-            _check(
-                checks,
-                f"house_{year}_artifact_scope_complete",
-                artifact_count == int(ptr_count),
-                f"artifacts={artifact_count} ptr_count={ptr_count}",
-            )
-            if not (
-                latest_ok
-                and complete
-                and not unresolved
-                and artifact_count == int(ptr_count)
-            ):
-                incomplete_years.append(year)
-
-        # 1. parse counts == persisted rows per document, artifact, and
-        # generation.
-        mismatches = db.conn.execute(
-            """
-            SELECT p.doc_id, p.ingestion_generation, p.artifact_sha256,
-                   p.transaction_count,
-                   (SELECT COUNT(*) FROM transactions t
-                    WHERE t.doc_id = p.doc_id
-                      AND t.source IN ('house_pdf', 'gemini_ocr')
-                      AND t.ingestion_generation = p.ingestion_generation
-                      AND t.artifact_sha256 IS NOT DISTINCT FROM p.artifact_sha256) AS actual
-            FROM pdf_parse_runs p
-            WHERE p.status IN ('success', 'no_txs')
-              AND (
-                  COALESCE(p.transaction_count, -1) != (
-                      SELECT COUNT(*) FROM transactions t
-                      WHERE t.doc_id = p.doc_id
-                        AND t.source IN ('house_pdf', 'gemini_ocr')
-                        AND t.ingestion_generation = p.ingestion_generation
-                        AND t.artifact_sha256 IS NOT DISTINCT FROM p.artifact_sha256
-                  )
-                  OR (p.status = 'success' AND (
-                      COALESCE(p.raw_row_count, 0) <= 0
-                      OR COALESCE(p.transaction_count, 0) <= 0
-                  ))
-                  OR (p.status = 'no_txs' AND (
-                      COALESCE(p.raw_row_count, -1) != 0
-                      OR COALESCE(p.transaction_count, -1) != 0
-                  ))
-              )
-            """,
-        ).fetchall()
-        _check(
-            checks,
-            "house_success_run_counts_equal_persisted_rows",
-            not mismatches,
-            f"mismatches={mismatches[:10]}",
-        )
-
-        # Source-report inventories must reconcile their outcome equation and
-        # their accepted row counts with persisted source rows.
-        report_groups = db.conn.execute(
-            """
-            SELECT ingestion_generation, source, chamber,
-                   COUNT(*) AS found,
-                   COUNT(*) FILTER (WHERE outcome = 'parsed') AS parsed,
-                   COUNT(*) FILTER (WHERE outcome = 'no_txs') AS no_txs,
-                   COUNT(*) FILTER (WHERE outcome = 'paper_only') AS paper_only,
-                   COUNT(*) FILTER (WHERE outcome = 'unavailable') AS unavailable,
-                   COUNT(*) FILTER (WHERE outcome = 'failed') AS failed
-            FROM source_reports
-            GROUP BY 1, 2, 3
-            ORDER BY 1, 2, 3
-            """,
-        ).fetchall()
-        bad_report_groups = [
-            row for row in report_groups
-            if row[3] != row[4] + row[5] + row[6] + row[7] + row[8]
-        ]
-        bad_report_counts = db.conn.execute(
-            """
-            SELECT ingestion_generation, source, chamber, source_record_id,
-                   outcome, raw_row_count, accepted_row_count, rejected_row_count
-            FROM source_reports
-            WHERE raw_row_count IS NULL OR accepted_row_count IS NULL
-               OR rejected_row_count IS NULL
-               OR raw_row_count < 0 OR accepted_row_count < 0 OR rejected_row_count < 0
-               OR raw_row_count != accepted_row_count + rejected_row_count
-               OR (outcome = 'parsed' AND (accepted_row_count <= 0
-                                           OR raw_row_count != accepted_row_count
-                                           OR rejected_row_count != 0))
-               OR (outcome = 'no_txs' AND (raw_row_count != 0
-                                           OR accepted_row_count != 0
-                                           OR rejected_row_count != 0))
-               OR (outcome = 'paper_only' AND (raw_row_count != 0
-                                               OR accepted_row_count != 0
-                                               OR rejected_row_count != 0))
-            ORDER BY ingestion_generation, source_record_id
-            LIMIT 10
-            """,
-        ).fetchall()
-        report_row_mismatches = db.conn.execute(
-            """
-            SELECT r.ingestion_generation, r.source, r.chamber,
-                   r.source_record_id, r.accepted_row_count, COUNT(t.id) AS actual
-            FROM source_reports r
-            LEFT JOIN transactions t
-              ON t.ingestion_generation = r.ingestion_generation
-             AND t.source = r.source
-             AND LOWER(t.chamber) = LOWER(r.chamber)
-             AND t.source_record_id = r.source_record_id
-             AND t.artifact_sha256 IS NOT DISTINCT FROM r.artifact_sha256
-            GROUP BY 1, 2, 3, 4, 5
-            HAVING r.accepted_row_count != COUNT(t.id)
-            ORDER BY 1, 4
-            LIMIT 10
-            """,
-        ).fetchall()
-        _check(
-            checks,
-            "source_report_reconciliation_consistent",
-            not bad_report_groups and not bad_report_counts and not report_row_mismatches,
-            f"groups={bad_report_groups[:10]} counts={bad_report_counts[:10]} "
-            f"rows={report_row_mismatches[:10]}",
-        )
-
-        # Chronology is a blocking semantic property, not an analysis filter.
-        chronology = db.conn.execute(
-            """
-            SELECT COUNT(*) FROM transactions
-            WHERE transaction_date IS NULL OR disclosure_date IS NULL
-               OR transaction_date > disclosure_date
-               OR (notification_date IS NOT NULL
-                   AND notification_date < transaction_date)
-               OR (chamber ILIKE 'senate'
-                   AND notification_date IS NOT NULL
-                   AND official_filing_date IS NOT NULL
-                   AND notification_date > official_filing_date)
-            """
-        ).fetchone()[0]
-        _check(
-            checks,
-            "chronology_valid",
-            int(chronology) == 0,
-            f"invalid_rows={chronology}",
-        )
-
-        # 3. duplicate policy on the source identity tuple
-        duplicates = db.conn.execute(
-            """
-            SELECT source, chamber, source_record_id, source_row_id,
-                   ingestion_generation, COUNT(*) AS n
-            FROM transactions
-            GROUP BY 1, 2, 3, 4, 5 HAVING COUNT(*) > 1
-            ORDER BY 1, 2, 3, 4
-            LIMIT 10
-            """
-        ).fetchall()
-        _check(
-            checks,
-            "no_source_identity_duplicates",
-            not duplicates,
-            f"dups={duplicates[:10]}",
-        )
-        missing_identity = db.conn.execute(
-            """
-            SELECT source, chamber, source_record_id, source_row_id,
-                   ingestion_generation
-            FROM transactions
-            WHERE source IN ('house_pdf', 'gemini_ocr', 'senate_efd')
-              AND (chamber IS NULL OR TRIM(chamber) = ''
-                   OR source_record_id IS NULL OR TRIM(source_record_id) = ''
-                   OR source_row_id IS NULL OR TRIM(source_row_id) = ''
-                   OR ingestion_generation IS NULL OR TRIM(ingestion_generation) = '')
-            LIMIT 10
-            """
-        ).fetchall()
-        _check(
-            checks,
-            "source_identity_complete",
-            not missing_identity,
-            f"missing={missing_identity[:10]}",
-        )
-
-        # 5. House source reports are checked for each required complete
-        # generation; an incomplete generation cannot authorize its inventory.
-        for year in REQUIRED_HOUSE_YEARS:
-            house = (
-                house_manifest.get(str(year))
-                if isinstance(house_manifest, dict)
-                else None
-            )
-            if not isinstance(house, dict) or house.get("parse_status") != "complete":
-                continue
-            generation = house.get("generation_id")
-            if not isinstance(generation, str) or not generation:
-                continue
-            source_reconciliations = {
-                source: db.source_reports.reconcile(generation, source, "house")
-                for source in ("house_pdf", "gemini_ocr")
-            }
-            reconcile = {
-                name: sum(part[name] for part in source_reconciliations.values())
-                for name in next(iter(source_reconciliations.values()))
-            }
-            artifact_count = int(
-                db.conn.execute(
-                    """
-                    SELECT COUNT(*) FROM house_pdf_artifacts
-                    WHERE archive_year = ? AND generation_id = ?
-                    """,
-                    [year, generation],
-                ).fetchone()[0]
-            )
-            expected = (
-                reconcile["found"] == artifact_count
-                and reconcile["found"] == (
-                    reconcile["parsed"]
-                    + reconcile["no_txs"]
-                    + reconcile["paper_only"]
-                    + reconcile["unavailable"]
-                    + reconcile["failed"]
-                )
-                and reconcile["failed"] == 0
-                and reconcile["unavailable"] == 0
-            )
-            binding_violations = _house_source_report_binding_violations(
-                db, year, generation
-            )
-            provenance_violations = _source_report_provenance_violations(
-                db, generation
-            )
-            expected = expected and not binding_violations and not provenance_violations
-            _check(
-                checks,
-                f"house_{year}_source_report_reconciliation",
-                expected,
-                f"reconcile={reconcile} artifacts={artifact_count} "
-                f"bindings={binding_violations[:10]} "
-                f"provenance={provenance_violations[:10]}",
-            )
-        # 6. Senate completeness is read from the active local source state.
-        # A frozen Senate window is equivalent to a persisted refresh once its
-        # rows and report inventory have been ingested into this database.
-        senate = manifest.get("senate")
-        senate_window = manifest.get("senate_window")
-        if not isinstance(senate, dict):
-            senate = {}
-        if (
-            senate.get("status") != "persisted"
-            and isinstance(senate_window, dict)
-            and senate_window.get("status") == "ingested"
-        ):
-            senate = senate_window
-        senate_status_ok = senate.get("status") in ("persisted", "ingested")
-        intended_senate_generation = senate.get("generation") or manifest.get("generation")
-        _check(
-            checks,
-            "senate_status_persisted",
-            senate_status_ok,
-            f"status={senate.get('status')!r}",
-        )
-
-        active_senate_generations = {
-            str(row[0])
-            for row in db.conn.execute(
-                """
-                SELECT DISTINCT ingestion_generation
-                FROM source_reports
-                WHERE source = 'senate_efd' AND chamber = 'senate'
-                UNION
-                SELECT DISTINCT ingestion_generation
-                FROM transactions
-                WHERE source = 'senate_efd' AND chamber = 'senate'
-                """
-            ).fetchall()
-            if row[0] is not None
-        }
-        senate_null_generation = db.conn.execute(
-            """
-            SELECT COUNT(*) FROM (
-                SELECT ingestion_generation FROM source_reports
-                WHERE source = 'senate_efd' AND chamber = 'senate'
-                UNION ALL
-                SELECT ingestion_generation FROM transactions
-                WHERE source = 'senate_efd' AND chamber = 'senate'
-            )
-            WHERE ingestion_generation IS NULL OR TRIM(ingestion_generation) = ''
-            """
-        ).fetchone()[0]
-        senate_identity_ok = (
-            isinstance(intended_senate_generation, str)
-            and bool(intended_senate_generation.strip())
-            and active_senate_generations == {intended_senate_generation}
-            and int(senate_null_generation) == 0
-        )
-        _check(
-            checks,
-            "senate_generation_identity_consistent",
-            senate_identity_ok,
-            f"intended={intended_senate_generation!r} "
-            f"active={sorted(active_senate_generations)} null={senate_null_generation}",
-        )
-        if isinstance(intended_senate_generation, str) and intended_senate_generation.strip():
-            senate_reconcile = db.source_reports.reconcile(
-                intended_senate_generation, "senate_efd", "senate"
-            )
-        else:
-            senate_reconcile = {
-                name: 0
-                for name in (
-                    "found",
-                    "parsed",
-                    "no_txs",
-                    "paper_only",
-                    "unavailable",
-                    "failed",
-                )
-            }
-        _check(
-            checks,
-            "senate_source_reports_exist",
-            senate_reconcile["found"] > 0,
-            f"generation={intended_senate_generation!r} reconcile={senate_reconcile}",
-        )
-        senate_provenance_violations = (
-            _source_report_provenance_violations(db, intended_senate_generation)
-            if isinstance(intended_senate_generation, str)
-            and intended_senate_generation.strip()
-            else []
-        )
-        _check(
-            checks,
-            "senate_report_reconciliation",
-            not senate_provenance_violations
-            and senate_reconcile["found"] == (
-                senate_reconcile["parsed"]
-                + senate_reconcile["no_txs"]
-                + senate_reconcile["paper_only"]
-                + senate_reconcile["unavailable"]
-                + senate_reconcile["failed"]
-            ),
-            f"{senate_reconcile} provenance={senate_provenance_violations[:10]}",
-        )
-        _check(
-            checks,
-            "senate_zero_unavailable_failed",
-            senate_reconcile["unavailable"] == 0
-            and senate_reconcile["failed"] == 0,
-            str(senate_reconcile),
-        )
-        senate_count_mismatches = []
-        senate_missing_reports = []
-        if isinstance(intended_senate_generation, str) and intended_senate_generation.strip():
-            senate_count_mismatches = db.conn.execute(
-                """
-                SELECT r.source_record_id, r.accepted_row_count, COUNT(t.id) AS actual
-                FROM source_reports r
-                LEFT JOIN transactions t
-                  ON t.ingestion_generation = r.ingestion_generation
-                 AND t.source = r.source
-                 AND t.chamber = r.chamber
-                 AND t.source_record_id = r.source_record_id
-                WHERE r.ingestion_generation = ?
-                  AND r.source = 'senate_efd' AND r.chamber = 'senate'
-                GROUP BY 1, 2
-                HAVING r.accepted_row_count != COUNT(t.id)
-                ORDER BY 1
-                LIMIT 10
-                """,
-                [intended_senate_generation],
-            ).fetchall()
-            senate_missing_reports = db.conn.execute(
-                """
-                SELECT t.source_record_id, COUNT(*) AS rows
-                FROM transactions t
-                LEFT JOIN source_reports r
-                  ON r.ingestion_generation = t.ingestion_generation
-                 AND r.source = t.source
-                 AND r.chamber = t.chamber
-                 AND r.source_record_id = t.source_record_id
-                WHERE t.ingestion_generation = ?
-                  AND t.source = 'senate_efd' AND t.chamber = 'senate'
-                  AND r.source_record_id IS NULL
-                GROUP BY 1
-                ORDER BY 1
-                LIMIT 10
-                """,
-                [intended_senate_generation],
-            ).fetchall()
-        _check(
-            checks,
-            "senate_accepted_counts_equal_persisted_rows",
-            not senate_count_mismatches,
-            f"mismatches={senate_count_mismatches[:10]}",
-        )
-        _check(
-            checks,
-            "senate_transactions_have_source_reports",
-            not senate_missing_reports,
-            f"missing={senate_missing_reports[:10]}",
-        )
-        declared_summary = senate.get("summary")
-        if isinstance(declared_summary, dict) and declared_summary:
-            # Senate manifests use the Senate-specific ReportOutcome
-            # contract, which has no no_txs value. Keep no_txs in the
-            # database equation (it must remain zero) without requiring the
-            # manifest to invent a field it never emits.
-            summary_fields = (
-                "found",
-                "parsed",
-                "paper_only",
-                "unavailable",
-                "failed",
-            )
-            summary_ok = all(
-                field in declared_summary
-                and declared_summary[field] == senate_reconcile[field]
-                for field in summary_fields
-            ) and senate_reconcile["no_txs"] == 0
-        else:
-            summary_ok = True
-        _check(
-            checks,
-            "senate_manifest_summary_consistent",
-            summary_ok,
-            f"manifest={declared_summary} database={senate_reconcile}",
-        )
-
-        # 7. The canonical view must contain exactly the active Senate rows
-        # plus rows from the latest semantically accepted House generation for
-        # each year. ``get_unresolved_house_doc_ids`` is the same acceptance
-        # predicate used by Database._init_canonical_transactions_view.
+        # The view uses the same accepted-generation predicate as canonical reads.
         canonical_extra, canonical_missing = _canonical_view_diff_counts(db)
         _check(
             checks,
@@ -2167,105 +2164,7 @@ def verify(args) -> None:
             int(canonical_extra) == 0 and int(canonical_missing) == 0,
             f"canonical_extra={canonical_extra} canonical_missing={canonical_missing}",
         )
-
-        # 8. Price availability is explicit: unresolved tickers remain a
-        # diagnostic, never an implicit zero-return observation.
-        price_record = manifest.get("prices")
-        if not isinstance(price_record, dict):
-            price_record = {}
-        snapshot_path = staging / "price_snapshot.json"
-        price_detail: dict = {
-            "status": price_record.get("status"),
-            "snapshot": str(snapshot_path),
-            "unresolved_tickers": price_record.get("unresolved_tickers", []),
-        }
-        price_ok = (
-            price_record.get("status") == "snapshotted"
-            and snapshot_path.is_file()
-        )
-        try:
-            snapshot = json.loads(snapshot_path.read_text())
-            coverage = snapshot.get("coverage_by_ticker")
-            tickers = list(coverage) if isinstance(coverage, dict) else []
-            unresolved = sorted(
-                str(ticker) for ticker in snapshot.get("unresolved_tickers", [])
-            )
-            record_unresolved = sorted(
-                str(ticker)
-                for ticker in price_record.get("unresolved_tickers", [])
-            )
-            fields_match = all(
-                price_record.get(field) == snapshot.get(field)
-                for field in (
-                    "requested_tickers",
-                    "resolved_tickers",
-                    "price_rows",
-                    "value_hash",
-                )
-            ) and unresolved == record_unresolved
-            hash_ok = bool(
-                re.fullmatch(
-                    r"[0-9a-fA-F]{64}", str(snapshot.get("value_hash", ""))
-                )
-            )
-            coverage_ok = (
-                isinstance(coverage, dict)
-                and snapshot.get("requested_tickers") == len(tickers)
-                and snapshot.get("resolved_tickers") + len(unresolved)
-                == snapshot.get("requested_tickers")
-                and set(unresolved).issubset(tickers)
-            )
-            actual_rows = actual_tickers = None
-            if (
-                price_record.get("start_date")
-                and price_record.get("end_date")
-                and tickers
-            ):
-                actual_rows, actual_tickers = db.conn.execute(
-                    """
-                    SELECT COUNT(*), COUNT(DISTINCT ticker)
-                    FROM prices
-                    WHERE date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-                      AND ticker IN (SELECT UNNEST(?))
-                      AND close > 0 AND isfinite(close)
-                    """,
-                    [
-                        price_record["start_date"],
-                        price_record["end_date"],
-                        tickers,
-                    ],
-                ).fetchone()
-            db_counts_ok = (
-                actual_rows is not None
-                and int(actual_rows) == int(snapshot.get("price_rows", -1))
-                and int(actual_tickers) == int(snapshot.get("resolved_tickers", -1))
-            )
-            price_detail.update(
-                {
-                    "requested_tickers": snapshot.get("requested_tickers"),
-                    "resolved_tickers": snapshot.get("resolved_tickers"),
-                    "price_rows": snapshot.get("price_rows"),
-                    "coverage": coverage_ok,
-                    "database_counts": db_counts_ok,
-                    "hash_format": hash_ok,
-                }
-            )
-            price_ok = (
-                price_ok
-                and fields_match
-                and hash_ok
-                and coverage_ok
-                and db_counts_ok
-            )
-        except (OSError, TypeError, ValueError, json.JSONDecodeError, duckdb.Error) as exc:
-            price_detail["error"] = f"{type(exc).__name__}: {exc}"
-            price_ok = False
-        _check(
-            checks,
-            "price_diagnostics",
-            price_ok,
-            json.dumps(price_detail, sort_keys=True, default=str),
-        )
+        _verify_price_phase(db, staging, manifest, checks)
     finally:
         db.close()
 

@@ -434,27 +434,38 @@ def check_no_transaction_after_disclosure(
 
 
 # ── C4 ────────────────────────────────────────────────────────────────────────
-def check_duplicate_policy(conn: duckdb.DuckDBPyConnection) -> CheckResult:
-    from analyzer.transaction_repository import _normalize_frame
-
+def check_source_identity_duplicates(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    include_nulls: bool = False,
+    sample_limit: int = 25,
+) -> CheckResult:
     result = CheckResult(
-        "duplicate_policy",
-        "exact-identity replay is the only dedup; economic duplicates flagged",
+        "source_identity_duplicates",
+        "no transaction rows share the complete source identity tuple",
     )
     if not _table_exists(conn, "transactions"):
         result.violations.append("transactions table missing")
         return result
 
-    # (a) No exact-identity replay tuples may exist.
+    # Staged verification deliberately includes NULL-bearing tuples; the
+    # canonical duplicate-policy check retains its prior non-NULL identity
+    # scope and separate source-row-id audit.
+    identity_filter = ""
+    if not include_nulls:
+        identity_filter = (
+            f"WHERE {' AND '.join(f'{column} IS NOT NULL' for column in _IDENTITY_KEY)}"
+        )
+    sample_order = "1, 2, 3, 4" if include_nulls else "3, 4"
     duplicated = conn.execute(
         f"""
         SELECT {', '.join(_IDENTITY_KEY)}, COUNT(*) AS n
         FROM transactions
-        WHERE {' AND '.join(f'{column} IS NOT NULL' for column in _IDENTITY_KEY)}
+        {identity_filter}
         GROUP BY {', '.join(_IDENTITY_KEY)}
         HAVING COUNT(*) > 1
-        ORDER BY 3, 4
-        LIMIT 25
+        ORDER BY {sample_order}
+        LIMIT {int(sample_limit)}
         """,
     ).fetchall()
     for source, chamber, record_id, row_id, generation, n in duplicated:
@@ -469,7 +480,7 @@ def check_duplicate_policy(conn: duckdb.DuckDBPyConnection) -> CheckResult:
                 SELECT COUNT(*) FROM (
                     SELECT {', '.join(_IDENTITY_KEY)}
                     FROM transactions
-                    WHERE {' AND '.join(f'{column} IS NOT NULL' for column in _IDENTITY_KEY)}
+                    {identity_filter}
                     GROUP BY {', '.join(_IDENTITY_KEY)}
                     HAVING COUNT(*) > 1
                 )
@@ -480,6 +491,22 @@ def check_duplicate_policy(conn: duckdb.DuckDBPyConnection) -> CheckResult:
             result.violations.append(
                 f"...and {total - len(duplicated)} more duplicate identity tuple(s)"
             )
+    return result
+
+
+def check_duplicate_policy(conn: duckdb.DuckDBPyConnection) -> CheckResult:
+    from analyzer.transaction_repository import _normalize_frame
+
+    result = CheckResult(
+        "duplicate_policy",
+        "exact-identity replay is the only dedup; economic duplicates flagged",
+    )
+    if not _table_exists(conn, "transactions"):
+        result.violations.append("transactions table missing")
+        return result
+
+    # (a) Exact-identity replay is shared with staged verification.
+    result.violations.extend(check_source_identity_duplicates(conn).violations)
 
     # (b) Economic duplicates survive ingestion and are flagged exactly as the
     # production read path flags them, within each ingest batch.

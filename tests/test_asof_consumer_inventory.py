@@ -36,7 +36,8 @@ EXEMPT = {
     "scripts/purge_unaccepted_house_rowsets.py:main": 5,  # One-time contamination cleanup (--apply archives to transaction_versions before delete; FP finding 2 follow-up).
     "scripts/audit_generation.py:check_canary_counts": 1,  # Current canary inventory.
     "scripts/audit_generation.py:check_date_domain": 6,  # Validate stored date domains, not decisions.
-    "scripts/audit_generation.py:check_duplicate_policy": 3,  # Current duplicate audit.
+    "scripts/audit_generation.py:check_duplicate_policy": 1,  # Economic-duplicate audit.
+    "scripts/audit_generation.py:check_source_identity_duplicates": 2,  # Shared source-identity invariant.
     "scripts/audit_generation.py:check_house_generation_activation": 2,  # Current activation audit.
     "scripts/audit_generation.py:check_no_transaction_after_disclosure": 2,  # Stored-row invariant.
     "scripts/audit_generation.py:check_parse_counts_match_persisted": 1,  # Ingestion reconciliation.
@@ -57,7 +58,8 @@ EXEMPT = {
     "scripts/rebuild_staged.py:finalize": 2,  # Ingestion finalization counts.
     "scripts/rebuild_staged.py:prices": 1,  # Price-download universe, not decision selection.
     "scripts/rebuild_staged.py:repair_audit_gaps": 9,  # Current ingestion repair.
-    "scripts/rebuild_staged.py:verify": 9,  # Current ingestion validation.
+    "scripts/rebuild_staged.py:_verify_shared_database_audits": 2,  # Staged chronology and source identity only.
+    "scripts/rebuild_staged.py:_verify_senate_phase": 4,  # Senate generation/report reconciliation only.
     "scripts/reconcile_blotter.py:get_congressional": 1,  # Current blotter reconciliation, no as-of API.
     "scripts/reconcile_untickered.py:_canonical_rows": 1,  # Current untickered reconciliation.
     "scripts/refresh_prices.py:_source_tickers": 1,  # Download universe, not decision selection.

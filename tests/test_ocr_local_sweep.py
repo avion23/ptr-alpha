@@ -321,6 +321,94 @@ class TestNoTxsReclassification(unittest.TestCase):
                 for path, contents in before.items():
                     self.assertEqual(path.read_bytes(), contents)
 
+    def test_malformed_page_metadata_aborts_batch_before_any_write(self):
+        for corrupt in (10**100, 1.9, True, "duplicate-inventory"):
+            with (
+                self.subTest(corrupt=corrupt),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                out = Path(tmp)
+                first_path, first_rows = self._stage(
+                    out,
+                    "earlier-no-txs",
+                    status="no_txs",
+                    reasons=[
+                        "page 1: cover page (no transaction rows)",
+                        "page 2: reports no transactions",
+                    ],
+                )
+                invalid_path, _ = self._stage(
+                    out,
+                    "later-no-txs",
+                    status="no_txs",
+                    reasons=[
+                        "page 1: cover page (no transaction rows)",
+                        "page 2: reports no transactions",
+                    ],
+                )
+                invalid = json.loads(invalid_path.read_text())
+                if corrupt == "duplicate-inventory":
+                    invalid["covered_pages"] = [1, 1]
+                else:
+                    invalid["page_count"] = corrupt
+                invalid_path.write_text(json.dumps(invalid, sort_keys=True) + "\n")
+                before = {
+                    first_path: first_path.read_bytes(),
+                    invalid_path: invalid_path.read_bytes(),
+                    first_rows: first_rows.read_bytes(),
+                    out / "manifest.json": (out / "manifest.json").read_bytes(),
+                }
+
+                with self.assertRaisesRegex(ValueError, "page|inventory"):
+                    reclassify.reclassify_no_txs(out)
+
+                for path, contents in before.items():
+                    self.assertEqual(path.read_bytes(), contents)
+
+    def test_foreign_rows_path_is_rejected_without_rebinding_source_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            out = base / "staging"
+            envelope_path, rows_path = self._stage(
+                out,
+                "local-doc",
+                status="unresolved",
+                reasons=[
+                    "page 1: reports no transactions",
+                    "page 2: reports no transactions",
+                    "reclassified: prior demotion",
+                ],
+            )
+            external_rows = base / "outside.jsonl"
+            external_rows.write_bytes(b"")
+            envelope = json.loads(envelope_path.read_text())
+            envelope["doc_id"] = "../../outside"
+            envelope["rows_file"] = "rows/../../outside.jsonl"
+            envelope["rows_file_sha256"] = ocr.sha256_file(external_rows)
+            envelope_path.write_text(json.dumps(envelope, sort_keys=True) + "\n")
+            manifest_path = out / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["staged_files_sha256"][envelope["rows_file"]] = ocr.sha256_file(
+                external_rows
+            )
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+            before = {
+                envelope_path: envelope_path.read_bytes(),
+                rows_path: rows_path.read_bytes(),
+                manifest_path: manifest_path.read_bytes(),
+                external_rows: external_rows.read_bytes(),
+            }
+
+            with self.assertRaisesRegex(ValueError, "doc_id|rows_file"):
+                reclassify.reclassify_no_txs(out)
+
+            for path, contents in before.items():
+                self.assertEqual(path.read_bytes(), contents)
+            self.assertEqual(
+                json.loads(envelope_path.read_text())["artifact_sha256"],
+                "source-hash",
+            )
+
 
 class TestNormalizeIsoDate(unittest.TestCase):
     def test_slash_and_dash_separators(self):

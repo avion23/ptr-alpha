@@ -79,23 +79,77 @@ def _page_evidence(reasons: list[str]) -> tuple[dict[int, list[str]], bool]:
     return pages, malformed
 
 
+def _page_inventory(envelope: dict) -> tuple[int, list[int]]:
+    """Validate the staged page partition and return its finite page set."""
+    page_count = envelope.get("page_count")
+    covered = envelope.get("covered_pages")
+    uncovered = envelope.get("uncovered_pages")
+    if type(page_count) is not int or page_count < 1:
+        raise ValueError("page_count must be a positive integer")
+    if not isinstance(covered, list) or not isinstance(uncovered, list):
+        raise ValueError("covered_pages and uncovered_pages must be lists")
+
+    if len(covered) + len(uncovered) != page_count:
+        raise ValueError("page inventory does not cover page_count")
+    pages = set()
+    for inventory in (covered, uncovered):
+        for page in inventory:
+            if type(page) is not int or not 1 <= page <= page_count or page in pages:
+                raise ValueError(
+                    "page inventory must contain unique in-range integers"
+                )
+            pages.add(page)
+    return page_count, sorted(pages)
+
+
+def _bound_rows_path(
+    out_root: Path, envelope_path: Path, envelope: dict
+) -> Path | None:
+    """Return only this envelope's nonsymlink row file inside the staging root."""
+    doc_id = envelope.get("doc_id")
+    if (
+        not isinstance(doc_id, str)
+        or not doc_id
+        or doc_id in {".", ".."}
+        or "/" in doc_id
+        or "\\" in doc_id
+        or envelope_path.stem != doc_id
+    ):
+        return None
+    rows_file = f"rows/{doc_id}.jsonl"
+    if envelope.get("rows_file") != rows_file:
+        return None
+
+    root = out_root.resolve()
+    rows_dir = root / "rows"
+    rows_path = rows_dir / f"{doc_id}.jsonl"
+    if rows_dir.is_symlink() or rows_path.is_symlink():
+        return None
+    try:
+        if rows_dir.resolve() != rows_dir or rows_path.resolve() != rows_path:
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return rows_path
+
+
 def _row_artifact_matches(
     out_root: Path,
+    envelope_path: Path,
     envelope: dict,
     manifest_hashes: dict | None,
     *,
     empty: bool,
 ) -> bool:
     """Check recorded row hashes; for empty claims, also require zero rows."""
-    doc_id = envelope.get("doc_id")
-    rows_file = f"rows/{doc_id}.jsonl"
-    if envelope.get("rows_file") != rows_file:
+    rows_path = _bound_rows_path(out_root, envelope_path, envelope)
+    if rows_path is None:
         return False
+    rows_file = envelope["rows_file"]
     if empty and (
         type(envelope.get("row_count")) is not int or envelope["row_count"] != 0
     ):
         return False
-    rows_path = out_root / rows_file
     try:
         if not rows_path.is_file():
             return False
@@ -111,72 +165,162 @@ def _row_artifact_matches(
 
 def reclassify_no_txs(out_root: str | Path) -> dict:
     """Idempotent two-way reconciliation of the no_txs evidence rule."""
-    out_root = Path(out_root)
+    out_root = Path(out_root).resolve()
     docs_dir = out_root / "docs"
+    if docs_dir.is_symlink():
+        raise ValueError("staging docs directory must not be a symlink")
     demoted: list[str] = []
     restored: list[str] = []
     kept: list[str] = []
 
     manifest_path = out_root / "manifest.json"
+    if manifest_path.is_symlink():
+        raise ValueError("staging manifest must not be a symlink")
     manifest_hashes = None
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
+        if not isinstance(manifest, dict):
+            raise ValueError("staging manifest must be an object")
         hashes = manifest.get("staged_files_sha256")
         manifest_hashes = hashes if isinstance(hashes, dict) else {}
 
     documents = []
     for envelope_path in sorted(docs_dir.glob("*.json")):
+        if envelope_path.is_symlink() or envelope_path.resolve() != envelope_path:
+            raise ValueError(f"{envelope_path.name}: envelope escapes staging docs")
         envelope = json.loads(envelope_path.read_text())
-        reasons = envelope.get("reasons") or []
+        if not isinstance(envelope, dict):
+            raise ValueError(f"{envelope_path.name}: envelope must be an object")
+        doc_id = envelope.get("doc_id")
+        if (
+            not isinstance(doc_id, str)
+            or not doc_id
+            or envelope_path.stem != doc_id
+            or doc_id in {".", ".."}
+            or "/" in doc_id
+            or "\\" in doc_id
+        ):
+            raise ValueError(f"{envelope_path.name}: doc_id does not match envelope")
+        if _bound_rows_path(out_root, envelope_path, envelope) is None:
+            raise ValueError(f"{doc_id}: rows_file is not bound to this staged document")
+        if type(envelope.get("year")) is not int:
+            raise ValueError(f"{doc_id}: year must be an integer")
+        if type(envelope.get("row_count")) is not int or envelope["row_count"] < 0:
+            raise ValueError(f"{doc_id}: row_count must be a nonnegative integer")
+        status = envelope.get("status")
+        if not isinstance(status, str) or status not in {
+            "resolved",
+            "unresolved",
+            "no_txs",
+        }:
+            raise ValueError(f"{doc_id}: invalid staging status")
+        if not isinstance(envelope.get("covered_pages"), list) or not isinstance(
+            envelope.get("uncovered_pages"), list
+        ):
+            raise ValueError(f"{doc_id}: page inventories must be lists")
+        if "page_count" not in envelope:
+            raise ValueError(f"{doc_id}: missing page_count")
+        if not isinstance(envelope.get("reasons"), list):
+            raise ValueError(f"{doc_id}: reasons must be a list")
+        canary = envelope.get("canary")
+        if canary is not None and not isinstance(canary, dict):
+            raise ValueError(f"{doc_id}: canary must be an object or null")
+
+        reasons = envelope["reasons"]
         marker = any(
             isinstance(reason, str) and reason.startswith("reclassified:")
             for reason in reasons
         )
-        needs_empty_rows = envelope.get("status") == "no_txs" or (
-            envelope.get("status") == "unresolved" and marker
-        )
+        page_count = envelope["page_count"]
+        if page_count is None:
+            if (
+                status != "unresolved"
+                or envelope["covered_pages"]
+                or envelope["uncovered_pages"]
+            ):
+                raise ValueError(
+                    f"{doc_id}: null page_count has inconsistent status/inventory"
+                )
+            page_inventory = None
+        else:
+            page_count, page_inventory = _page_inventory(envelope)
+            if status in {"resolved", "no_txs"} and (
+                len(envelope["covered_pages"]) != page_count
+                or envelope["uncovered_pages"]
+            ):
+                raise ValueError(f"{doc_id}: {status} page inventory is inconsistent")
+            if status == "unresolved" and marker and (
+                envelope["covered_pages"]
+                or len(envelope["uncovered_pages"]) != page_count
+            ):
+                raise ValueError(f"{doc_id}: reclassified page inventory is inconsistent")
+
+        all_nothing = None
+        nothing_pages = cover_pages = 0
+        if status == "no_txs" or (status == "unresolved" and marker):
+            if page_count is None:
+                raise ValueError(f"{doc_id}: reclassification requires a page_count")
+            page_evidence, malformed_page_evidence = _page_evidence(reasons)
+            if malformed_page_evidence:
+                raise ValueError(f"{doc_id}: malformed page evidence")
+            all_nothing = len(page_evidence) == page_count and all(
+                1 <= page <= page_count and readings == [REASON_NOTHING]
+                for page, readings in page_evidence.items()
+            )
+            nothing_pages = sum(
+                readings == [REASON_NOTHING] for readings in page_evidence.values()
+            )
+            cover_pages = sum(
+                any(reading.startswith(REASON_COVER) for reading in readings)
+                for readings in page_evidence.values()
+            )
+        needs_empty_rows = status == "no_txs" or (status == "unresolved" and marker)
         if needs_empty_rows or marker:
             if not _row_artifact_matches(
-                out_root, envelope, manifest_hashes, empty=needs_empty_rows
+                out_root,
+                envelope_path,
+                envelope,
+                manifest_hashes,
+                empty=needs_empty_rows,
             ):
                 claim = "zero-row claim" if needs_empty_rows else "recorded row hashes"
                 raise ValueError(
-                    f"{envelope.get('doc_id')}: refusing reclassification; "
+                    f"{doc_id}: refusing reclassification; "
                     f"{claim} conflict with the staged row artifact or hash"
                 )
-        documents.append((envelope_path, envelope))
-
-    for envelope_path, envelope in documents:
-        doc_id = envelope["doc_id"]
-        page_count = int(envelope.get("page_count") or 0)
-        reasons = envelope.get("reasons") or []
-        page_evidence, malformed_page_evidence = _page_evidence(reasons)
-        nothing_pages = sum(
-            readings == [REASON_NOTHING] for readings in page_evidence.values()
-        )
-        cover_pages = sum(
-            any(reading.startswith(REASON_COVER) for reading in readings)
-            for readings in page_evidence.values()
-        )
-        all_nothing = (
-            page_count > 0
-            and not malformed_page_evidence
-            and set(page_evidence) == set(range(1, page_count + 1))
-            and all(
-                page_evidence[page] == [REASON_NOTHING]
-                for page in range(1, page_count + 1)
+        documents.append(
+            (
+                envelope_path,
+                envelope,
+                page_count,
+                page_inventory,
+                all_nothing,
+                marker,
+                nothing_pages,
+                cover_pages,
             )
         )
-        marker = any(
-            isinstance(reason, str) and reason.startswith("reclassified:")
-            for reason in reasons
-        )
+
+    for (
+        envelope_path,
+        envelope,
+        page_count,
+        page_inventory,
+        all_nothing,
+        marker,
+        nothing_pages,
+        cover_pages,
+    ) in documents:
+        if page_count is None or all_nothing is None:
+            continue
+        doc_id = envelope["doc_id"]
+        reasons = envelope["reasons"]
         if envelope.get("status") == "no_txs":
             if all_nothing:
                 kept.append(doc_id)
                 continue
             envelope["status"] = "unresolved"
-            envelope["uncovered_pages"] = list(range(1, page_count + 1))
+            envelope["uncovered_pages"] = page_inventory
             envelope["covered_pages"] = []
             if not marker:
                 envelope.setdefault("reasons", []).append(
@@ -192,7 +336,7 @@ def reclassify_no_txs(out_root: str | Path) -> dict:
         if envelope.get("status") == "unresolved" and marker and all_nothing:
             envelope["status"] = "no_txs"
             envelope["uncovered_pages"] = []
-            envelope["covered_pages"] = list(range(1, page_count + 1))
+            envelope["covered_pages"] = page_inventory
             envelope["reasons"] = [
                 r
                 for r in reasons

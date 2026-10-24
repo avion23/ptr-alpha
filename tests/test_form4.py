@@ -262,6 +262,70 @@ def test_purchase_without_price_fails_closed(burke_form4_xml):
         parse(xml)
 
 
+def test_finite_decimal_that_overflows_canonical_float_fails_at_parse(
+    burke_form4_xml,
+):
+    xml = burke_form4_xml.replace(
+        b"<transactionPricePerShare><value>135.99</value></transactionPricePerShare>",
+        b"<transactionPricePerShare><value>1" + b"0" * 309
+        + b"</value></transactionPricePerShare>",
+        1,
+    )
+
+    with pytest.raises(Form4Error, match="unrepresentable canonical amount"):
+        parse(xml)
+
+
+def test_large_finite_amount_remains_valid_without_an_arbitrary_cap(
+    tmp_path, burke_form4_xml
+):
+    from analyzer.persistence.database import Database
+
+    xml = burke_form4_xml.replace(
+        b"<transactionShares><value>2200</value></transactionShares>",
+        b"<transactionShares><value>1</value></transactionShares>",
+        1,
+    ).replace(
+        b"<transactionPricePerShare><value>135.99</value></transactionPricePerShare>",
+        b"<transactionPricePerShare><value>1" + b"0" * 299
+        + b"</value></transactionPricePerShare>",
+        1,
+    )
+    frame = parse(xml)
+    assert frame.iloc[0]["amount_midpoint"] == 1e299
+
+    with Database(":memory:") as db:
+        source = Form4Source(
+            data_dir=tmp_path, db=db, ingestion_generation="test-generation"
+        )
+        assert source.save_to_db(frame) == 3
+        stored = db.conn.execute(
+            "SELECT amount_midpoint FROM transactions "
+            "WHERE source_row_id = 'nonDerivativeTransaction:000001'"
+        ).fetchone()[0]
+        assert stored == 1e299
+        source.close()
+
+
+def test_save_to_db_rejects_boolean_amount_before_writing_any_rows(
+    tmp_path, burke_form4_xml
+):
+    from analyzer.persistence.database import Database
+
+    frame = parse(burke_form4_xml)
+    frame["amount_midpoint"] = frame["amount_midpoint"].astype(object)
+    frame.loc[1, "amount_midpoint"] = True
+
+    with Database(":memory:") as db:
+        source = Form4Source(
+            data_dir=tmp_path, db=db, ingestion_generation="test-generation"
+        )
+        with pytest.raises(Form4Error, match="invalid canonical amount"):
+            source.save_to_db(frame)
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+        source.close()
+
+
 def test_10b5_1_checkbox_is_detected_both_ways(burke_form4_xml):
     assert parse(burke_form4_xml)["asset_description"].str.contains(
         "is_10b5_1=false"

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from numbers import Number
 from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
 from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
+import numpy as np
 import pandas as pd
 import requests
 
@@ -106,6 +109,24 @@ def _parse_decimal(value: str, label: str, accession: str) -> Decimal:
     if not number.is_finite() or number <= 0:
         raise Form4Error(f"Form 4 {accession} has invalid {label}: {value!r}")
     return number
+
+
+def _finite_canonical_amount(value: object, accession: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (Number, Decimal)):
+        raise Form4Error(
+            f"Form 4 {accession} has invalid canonical amount: {value!r}"
+        )
+    try:
+        amount = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise Form4Error(
+            f"Form 4 {accession} has invalid canonical amount: {value!r}"
+        ) from None
+    if not math.isfinite(amount) or amount <= 0:
+        raise Form4Error(
+            f"Form 4 {accession} has unrepresentable canonical amount: {value!r}"
+        )
+    return amount
 
 
 def _parse_xml_date(value: str) -> date:
@@ -223,6 +244,7 @@ def parse_form4_xml(
         shares = _parse_decimal(shares_raw, "transaction shares", accession)
         price = _parse_decimal(price_raw, "transaction price", accession)
         amount = shares * price
+        canonical_amount = _finite_canonical_amount(amount, accession)
         security = _clean_text(_field_value(trade, "securityTitle")) or "Common Stock"
         shares_text = format(shares.normalize(), "f")
         price_text = format(price.normalize(), "f")
@@ -239,7 +261,7 @@ def parse_form4_xml(
                 "transaction_type": "Purchase" if is_purchase else "Sale",
                 "owner_code": None,
                 "amount_raw": f"${amount:,.2f}",
-                "amount_midpoint": float(amount),
+                "amount_midpoint": canonical_amount,
                 "instrument_type": "Common Stock",
                 "strike_price": None,
                 "expiry_date": None,
@@ -715,6 +737,10 @@ class Form4Source(TransactionSource):
             ]
             if df[required].isna().any().any():
                 raise Form4Error("Form 4 transaction provenance is incomplete")
+            for row in df.to_dict("records"):
+                _finite_canonical_amount(
+                    row.get("amount_midpoint"), str(row.get("source_record_id"))
+                )
         from analyzer.persistence.transaction_repository import (
             upsert_filing_transactions,
         )

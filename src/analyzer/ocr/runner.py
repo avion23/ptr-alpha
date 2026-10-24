@@ -15,7 +15,17 @@ from analyzer.vision_engines import (
     read_document_with_engine_b,
     run_dual_read_for_doc,
 )
-from analyzer.ocr.common import (ArtifactMetadata, GEMINI_PARSER_VERSION, MODEL, GeminiOutputError, call_gemini, is_quota_error, parse_gemini_output, snapshot_pdf)
+from analyzer.ocr.common import (
+    ArtifactMetadata,
+    GEMINI_PARSER_VERSION,
+    MODEL,
+    GeminiOutputError,
+    ParsedGeminiOutput,
+    call_gemini,
+    is_quota_error,
+    parse_gemini_output,
+    snapshot_pdf,
+)
 from analyzer.ocr.ingestion import (
     COOLDOWN,
     DB_PATH,
@@ -31,6 +41,18 @@ from analyzer.ocr.ingestion import (
     resolve_ingestion_generation,
     save_progress
 )
+
+
+def _require_successful_response_metadata(
+    metadata: ArtifactMetadata | None,
+) -> ParsedGeminiOutput:
+    if metadata is None:
+        raise RuntimeError("successful Gemini response requires artifact metadata")
+    parsed = metadata.parsed
+    if parsed is None:
+        raise RuntimeError("successful Gemini response requires validated output")
+    return parsed
+
 
 def _engine_b_configured() -> bool:
     """True when an engine-B endpoint is configured for dual read.
@@ -310,9 +332,7 @@ def main(*, staging_runner=None):
             print(f"  ERROR: {error}", flush=True)
             continue
 
-        assert artifact_metadata is not None, "successful Gemini response requires artifact metadata"
-        parsed = artifact_metadata.parsed
-        assert parsed is not None, "successful Gemini response requires validated output"
+        parsed = _require_successful_response_metadata(artifact_metadata)
         member, transactions = parsed.member, parsed.transactions
         insert_outcome = None
         if not transactions:
@@ -502,9 +522,7 @@ def run_gemini_ocr_for_year(
             print(f"  ERROR: {error}", flush=True)
             continue
 
-        assert artifact_metadata is not None, "successful Gemini response requires artifact metadata"
-        parsed = artifact_metadata.parsed
-        assert parsed is not None, "successful Gemini response requires validated output"
+        parsed = _require_successful_response_metadata(artifact_metadata)
         member, transactions = parsed.member, parsed.transactions
         if not transactions:
             no_tx_outcome = insert_transactions_outcome(

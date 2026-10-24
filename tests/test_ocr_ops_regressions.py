@@ -37,6 +37,18 @@ def cache_and_insert(stored, notification='01/20/24'):
     ops.insert_transactions('1', 2024, parsed.member, parsed.transactions, db_path=str(path), artifact_sha256=digest, ingestion_generation='g')
 
 
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        (None, "artifact metadata"),
+        (common.ArtifactMetadata("hash", 1, 1, "source.pdf"), "validated output"),
+    ],
+)
+def test_successful_response_metadata_invariants_are_runtime_checks(metadata, message):
+    with pytest.raises(RuntimeError, match=message):
+        runner._require_successful_response_metadata(metadata)
+
+
 def test_missing_notification_is_resolved(stored):
     cache_and_insert(stored, 'N/A')
     path, _, _ = stored

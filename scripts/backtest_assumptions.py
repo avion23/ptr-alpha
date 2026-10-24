@@ -262,6 +262,8 @@ def _validate_capture(
     cohort_path: Path,
     actor_path: Path,
     manifest_path: Path,
+    *,
+    verify_hashes: bool = True,
 ) -> dict:
     """Validate the frozen input pair and its receipt before labels are read."""
     try:
@@ -286,10 +288,17 @@ def _validate_capture(
         raise SystemExit(f"INVALID CAPTURE: {decision} does not match frame {frame}")
     if "actor_rows" in manifest and len(actors) != manifest["actor_rows"]:
         raise SystemExit(f"INVALID CAPTURE: {decision} actor rows do not match manifest")
-    expected_hashes = manifest.get("artifact_sha256")
-    if expected_hashes is not None:
-        for name, path in (("cohorts.csv", cohort_path), ("actors.csv", actor_path)):
-            if expected_hashes.get(name) != sha256_file(path):
+    if verify_hashes:
+        expected_hashes = manifest.get("artifact_sha256")
+        names = ("cohorts.csv", "actors.csv")
+        if not isinstance(expected_hashes, dict) or any(
+            not isinstance(expected_hashes.get(name), str) for name in names
+        ):
+            raise SystemExit(
+                f"UNVERIFIED CAPTURE: {decision} has no complete artifact hash binding"
+            )
+        for name, path in zip(names, (cohort_path, actor_path)):
+            if expected_hashes[name] != sha256_file(path):
                 raise SystemExit(f"INVALID CAPTURE: {decision} {name} hash mismatch")
     return manifest
 
@@ -308,7 +317,12 @@ def _legacy_capture_is_complete(decision: date) -> bool:
         if frame not in FRAMES:
             return False
         _validate_capture(
-            decision, frame, cohort_path, actor_path, manifest_path
+            decision,
+            frame,
+            cohort_path,
+            actor_path,
+            manifest_path,
+            verify_hashes=False,
         )
         return True
     except (OSError, ValueError, SystemExit):

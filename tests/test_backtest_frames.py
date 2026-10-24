@@ -511,6 +511,59 @@ def test_capture_failure_keeps_partial_attempt_private_and_allows_retry(
         db.close()
 
 
+def test_capture_requires_complete_matching_preexisting_hash_binding(
+    tmp_path, frame_script
+):
+    decision = date(2027, 1, 15)
+    cohort_path = tmp_path / "cohorts.csv"
+    actor_path = tmp_path / "actors.csv"
+    manifest_path = tmp_path / "manifest.json"
+    cohort_path.write_text(
+        f"ticker,as_of,frame\nORIGINAL,{decision},ingestion\n"
+    )
+    actor_path.write_text(
+        f"ticker,as_of,frame\nORIGINAL,{decision},ingestion\n"
+    )
+    hashes = {
+        "cohorts.csv": frame_script.sha256_file(cohort_path),
+        "actors.csv": frame_script.sha256_file(actor_path),
+    }
+    manifest = {
+        "capture_only": True,
+        "decision": str(decision),
+        "frame": "ingestion",
+        "rows": 1,
+        "actor_rows": 1,
+    }
+
+    # The old validator accepted this same-row-count mutation without a seal.
+    cohort_path.write_text(f"ticker,as_of,frame\nREPLACED,{decision},ingestion\n")
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(SystemExit, match="UNVERIFIED CAPTURE"):
+        frame_script._validate_capture(
+            decision, "ingestion", cohort_path, actor_path, manifest_path
+        )
+
+    cohort_path.write_text(f"ticker,as_of,frame\nORIGINAL,{decision},ingestion\n")
+    for binding in (
+        None,
+        {"cohorts.csv": hashes["cohorts.csv"]},
+        {**hashes, "actors.csv": "0" * 64},
+    ):
+        sealed_manifest = {**manifest, "artifact_sha256": binding} if binding else manifest
+        manifest_path.write_text(json.dumps(sealed_manifest))
+        expected = "hash mismatch" if binding and len(binding) == 2 else "UNVERIFIED CAPTURE"
+        with pytest.raises(SystemExit, match=expected):
+            frame_script._validate_capture(
+                decision, "ingestion", cohort_path, actor_path, manifest_path
+            )
+
+    manifest_path.write_text(json.dumps({**manifest, "artifact_sha256": hashes}))
+    assert frame_script._validate_capture(
+        decision, "ingestion", cohort_path, actor_path, manifest_path
+    )["artifact_sha256"] == hashes
+
+
 def test_outcome_failure_never_publishes_partial_target_and_retry_is_write_once(
     tmp_path, monkeypatch, frame_script
 ):

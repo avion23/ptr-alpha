@@ -56,7 +56,7 @@ from scripts import purge_unaccepted_house_rowsets
 def _run_main():
     from scripts.ocr_zero_rows import _run_visionb_staging
 
-    ocr_zero_rows.main(staging_runner=_run_visionb_staging)
+    return ocr_zero_rows.main(staging_runner=_run_visionb_staging)
 
 A_OUTPUT = (
     "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
@@ -1383,7 +1383,7 @@ def test_main_loop_dual_agree_persists_v6_and_marks_processed(
         outputs={"dual-doc": A_OUTPUT},
     )
 
-    _run_main()
+    assert _run_main() == 0
 
     with duckdb.connect(str(db_file)) as conn:
         run_row = conn.execute(
@@ -1419,7 +1419,7 @@ def test_main_loop_dual_disagree_marks_processed_without_persisting(
         outputs={"dual-doc": A_OUTPUT},
     )
 
-    _run_main()
+    assert _run_main() == 1
 
     with duckdb.connect(str(db_file)) as conn:
         tx_count = conn.execute(
@@ -1451,12 +1451,12 @@ def test_main_loop_engine_b_quota_stop_ends_batch_cleanly(
         monkeypatch, tmp_path, docs=_TWO_DOCS, shas=_TWO_SHAS, outputs=_TWO_OUTPUTS
     )
 
-    _run_main()  # returns cleanly: a quota stop is not a crash
+    assert _run_main() == 1
 
     assert calls == ["dual-doc-a"]  # batch ended at the first doc
     out = capsys.readouterr().out
     assert "Engine B quota exhausted; stopping batch" in out
-    assert "=== DONE ===" in out
+    assert "=== OCR RUN INCOMPLETE ===" in out
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone()[0] == 0
@@ -1479,7 +1479,7 @@ def test_main_loop_engine_a_quota_stop_still_ends_batch(
         errors={"dual-doc-a": "429 RESOURCE_EXHAUSTED: quota exceeded"},
     )
 
-    _run_main()
+    assert _run_main() == 1
 
     assert calls == ["dual-doc-a"]
     assert server.requests == []  # engine B is never called after A's quota stop
@@ -1500,7 +1500,7 @@ def test_main_loop_engine_b_transient_outage_lands_retry_state_not_a_only(
         monkeypatch, tmp_path, docs=_TWO_DOCS, shas=_TWO_SHAS, outputs=_TWO_OUTPUTS
     )
 
-    _run_main()
+    assert _run_main() == 1
 
     # The batch continues (an outage is not a crash) but NOTHING persists
     # A-only: each doc lands an error run that retries it next night.
@@ -1894,13 +1894,13 @@ def test_main_loop_visionb_quota_stop_ends_batch_cleanly(
         dual=False,
     )
 
-    _run_main()  # returns cleanly: a quota stop is not a crash
+    assert _run_main() == 1
 
     assert calls == []  # engine A never contacted
     assert len(server.requests) == 1  # first doc hit engine B and got the 429
     out = capsys.readouterr().out
     assert "Quota exhausted; stopping batch" in out
-    assert "=== DONE ===" in out
+    assert "=== OCR RUN INCOMPLETE ===" in out
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone()[0] == 0

@@ -1,5 +1,7 @@
 import json
+import runpy
 import subprocess
+import sys
 from datetime import date
 
 import pytest
@@ -421,6 +423,81 @@ def test_year_runner_validation_failure_retires_rows(stored, monkeypatch):
         assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 0
     finally:
         db.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome_status", "inserted", "expected", "exit_status"),
+    [
+        ("success", 1, 1, 0),
+        ("partial", 1, 2, 1),
+        ("rejected", 0, 1, 1),
+        ("error", 0, 1, 1),
+    ],
+)
+def test_operational_drain_exit_status_tracks_admission_outcome(
+    monkeypatch, capsys, outcome_status, inserted, expected, exit_status
+):
+    output = (
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Apple (AAPL) | Purchase | 01/15/24 | N/A | A"
+    )
+    parsed = common.parse_gemini_output(output, expected_page_count=1)
+    metadata = common.ArtifactMetadata("sha", 1, len(output), "stub.pdf", parsed)
+    monkeypatch.setattr(sys, "argv", ["ocr_zero_rows"])
+    monkeypatch.setattr(runner, "_ocr_engine_mode", lambda: "gemini")
+    monkeypatch.setattr(runner, "get_zero_row_pdfs", lambda: [("1", 2024, "stub.pdf")])
+    monkeypatch.setattr(runner, "load_progress", lambda: {})
+    monkeypatch.setattr(runner, "mark_progress", lambda *args: None)
+    monkeypatch.setattr(runner, "save_progress", lambda *args: None)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        runner, "call_gemini", lambda *args, **kwargs: (output, "", metadata)
+    )
+    monkeypatch.setattr(runner, "resolve_ingestion_generation", lambda *args: "g")
+    monkeypatch.setattr(
+        runner,
+        "insert_transactions_outcome",
+        lambda *args, **kwargs: ops.InsertOutcome(
+            outcome_status,
+            inserted=inserted,
+            expected=expected,
+            committed=True,
+        ),
+    )
+
+    assert runner.main() == exit_status
+    captured = capsys.readouterr().out
+    if exit_status:
+        assert "=== OCR RUN INCOMPLETE ===" in captured
+    else:
+        assert "=== OCR RUN FINISHED ===" in captured
+    if outcome_status == "partial":
+        assert "Total inserted: 1" in captured
+
+
+def test_operational_drain_no_available_work_is_success(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["ocr_zero_rows"])
+    monkeypatch.setattr(runner, "_ocr_engine_mode", lambda: "gemini")
+    monkeypatch.setattr(runner, "get_zero_row_pdfs", lambda: [])
+    monkeypatch.setattr(runner, "load_progress", lambda: {})
+
+    assert runner.main() == 0
+    assert "=== OCR RUN FINISHED ===" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("exit_status", [0, 1])
+def test_operational_script_maps_main_status_to_process_exit(
+    monkeypatch, exit_status
+):
+    from pathlib import Path
+
+    monkeypatch.setattr(runner, "main", lambda **kwargs: exit_status)
+    script = Path(__file__).resolve().parents[1] / "scripts" / "ocr_zero_rows.py"
+
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(script), run_name="__main__")
+
+    assert exc.value.code == exit_status
 
 
 def test_insert_rejects_unbound_generation(stored):

@@ -129,7 +129,7 @@ def call_vision_b(
         return None, str(exc), metadata
 
 
-def main(*, staging_runner=None):
+def main(*, staging_runner=None) -> int:
     parser = argparse.ArgumentParser(
         description="OCR zero-row House PTR PDFs with Gemini"
     )
@@ -172,7 +172,7 @@ def main(*, staging_runner=None):
             f"work manifest {envelope['schema']}: {envelope['item_count']} "
             f"unresolved docs -> {args.export_work_manifest}"
         )
-        return
+        return 0
 
     mode = _ocr_engine_mode()
     if args.force_partial_canonical and mode != "gemini":
@@ -181,7 +181,8 @@ def main(*, staging_runner=None):
             "single-engine mode; refusing this run.",
             flush=True,
         )
-        return
+        print("\n=== OCR RUN INCOMPLETE ===", flush=True)
+        return 1
     vision_b_config = None
     parser_version, engine_model = GEMINI_PARSER_VERSION, MODEL
     if mode == "visionb":
@@ -192,14 +193,16 @@ def main(*, staging_runner=None):
             vision_b_config = VisionBConfig.from_env()
         except VisionBUnavailable as exc:
             print(f"  visionb unusable: {exc}; stopping batch", flush=True)
-            return
+            print("\n=== OCR RUN INCOMPLETE ===", flush=True)
+            return 1
         if vision_b_config is None:
             print(
                 "  visionb requires VISION_B_BASE_URL and VISION_B_MODEL; "
                 "stopping batch",
                 flush=True,
             )
-            return
+            print("\n=== OCR RUN INCOMPLETE ===", flush=True)
+            return 1
     if mode == "dual":
         # A dual run without a usable engine B would be unresolved for every
         # doc in the batch: alert (config defect) and stop before spending
@@ -212,14 +215,16 @@ def main(*, staging_runner=None):
                 "stopping batch",
                 flush=True,
             )
-            return
+            print("\n=== OCR RUN INCOMPLETE ===", flush=True)
+            return 1
         if dual_config is None:
             print(
                 "ALERT: dual read requested but VISION_B_BASE_URL/"
                 "VISION_B_MODEL are not configured; stopping batch",
                 flush=True,
             )
-            return
+            print("\n=== OCR RUN INCOMPLETE ===", flush=True)
+            return 1
 
     pdfs = get_zero_row_pdfs()
     progress = load_progress()
@@ -228,15 +233,24 @@ def main(*, staging_runner=None):
     if mode == "visionb":
         if staging_runner is None:
             raise RuntimeError("visionb staging requires scripts/ocr_zero_rows.py; use glm_stage promote after audit")
-        staging_runner(remaining, vision_b_config, data_dir=Path(DB_PATH).parent)
-        print("\n=== DONE ===")
+        staging_failed = bool(
+            staging_runner(remaining, vision_b_config, data_dir=Path(DB_PATH).parent)
+        )
+        print(
+            "\n=== OCR RUN INCOMPLETE ==="
+            if staging_failed
+            else "\n=== OCR RUN FINISHED ===",
+            flush=True,
+        )
         print(
             "Total inserted: 0 (visionb mode stages only; canonical "
-            "ingestion of GLM rows happens via glm_stage promote)"
+            "ingestion of GLM rows happens via glm_stage promote)",
+            flush=True,
         )
-        return
+        return 1 if staging_failed else 0
 
     total_inserted = 0
+    run_failed = False
     for i, (doc_id, year, path) in enumerate(remaining):
         idx = i + 1
         print(f"\n[{idx}/{len(remaining)}] {doc_id} ({year})...", flush=True)
@@ -265,6 +279,8 @@ def main(*, staging_runner=None):
             if outcome.handled:
                 mark_progress(progress, doc_id, outcome.progress_key)
                 save_progress(progress)
+                if outcome.progress_key == "errors":
+                    run_failed = True
                 print(
                     f"  DUAL {outcome.decision.status}: inserted={outcome.inserted}",
                     flush=True,
@@ -273,6 +289,7 @@ def main(*, staging_runner=None):
             if outcome.decision.status == UNRESOLVED:
                 # Engine-B quota stop (unhandled == nothing persisted).
                 print("  Engine B quota exhausted; stopping batch", flush=True)
+                run_failed = True
                 break
             output, error, artifact_metadata = (
                 outcome.output,
@@ -287,6 +304,7 @@ def main(*, staging_runner=None):
         # succeeded; the single-engine path always has a string here.
         if is_quota_error(error or ""):
             print("  Quota exhausted; stopping batch", flush=True)
+            run_failed = True
             break
         ingestion_generation = None
         if artifact_metadata is not None:
@@ -316,6 +334,7 @@ def main(*, staging_runner=None):
                 conn.close()
             mark_progress(progress, doc_id, "errors")
             save_progress(progress)
+            run_failed = True
             print(f"  ERROR: {error}", flush=True)
             continue
 
@@ -344,6 +363,7 @@ def main(*, staging_runner=None):
             else:
                 mark_progress(progress, doc_id, "errors")
                 save_progress(progress)
+                run_failed = True
                 print(
                     "  ERROR: no-transaction run not committed "
                     f"({insert_outcome.status})",
@@ -381,6 +401,7 @@ def main(*, staging_runner=None):
             flush=True,
         )
         if not insert_outcome.complete:
+            run_failed = True
             print(
                 f"  ERROR: insert incomplete ({insert_outcome.status}); "
                 "partial output is not marked complete",
@@ -392,8 +413,14 @@ def main(*, staging_runner=None):
                 flush=True,
             )
 
-    print("\n=== DONE ===")
-    print(f"Total inserted: {total_inserted}")
+    print(
+        "\n=== OCR RUN INCOMPLETE ==="
+        if run_failed
+        else "\n=== OCR RUN FINISHED ===",
+        flush=True,
+    )
+    print(f"Total inserted: {total_inserted}", flush=True)
+    return 1 if run_failed else 0
 
 
 def run_gemini_ocr_for_year(

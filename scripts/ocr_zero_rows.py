@@ -16,7 +16,9 @@ from analyzer.ocr import runner
 from analyzer.ocr.common import is_quota_error
 from analyzer.ocr.ingestion import DB_PATH, COOLDOWN, approved_data_root
 
-def _run_visionb_staging(remaining, vision_b_config, *, data_dir=None, _data_root=None) -> None:
+def _run_visionb_staging(
+    remaining, vision_b_config, *, data_dir=None, _data_root=None
+) -> int:
     """GLM-primary drain: write STAGING records, never canonical rows.
 
     Engine A is never contacted and the canonical DB is never opened here:
@@ -36,6 +38,7 @@ def _run_visionb_staging(remaining, vision_b_config, *, data_dir=None, _data_roo
         with approved_data_root(data_dir or os.path.dirname(DB_PATH) or ".") as root:
             return _run_visionb_staging(remaining, vision_b_config, _data_root=root)
     data_dir = _data_root
+    run_failed = False
     for i, (doc_id, year, path) in enumerate(remaining):
         idx = i + 1
         print(f"\n[{idx}/{len(remaining)}] {doc_id} ({year})...", flush=True)
@@ -53,7 +56,7 @@ def _run_visionb_staging(remaining, vision_b_config, *, data_dir=None, _data_roo
             record.get("error_kind") == "quota" or is_quota_error(error)
         ):
             print("  Quota exhausted; stopping batch", flush=True)
-            return
+            return 1
         if record["parse_status"] == "error" and record.get("error_kind") in (
             "auth",
             "config",
@@ -63,7 +66,7 @@ def _run_visionb_staging(remaining, vision_b_config, *, data_dir=None, _data_roo
                 "stopping batch",
                 flush=True,
             )
-            return
+            return 1
         _, archived = glm_stage.publish_staging_record(data_dir, record)
         if archived is not None:
             print(
@@ -71,6 +74,7 @@ def _run_visionb_staging(remaining, vision_b_config, *, data_dir=None, _data_roo
                 flush=True,
             )
         if record["parse_status"] == "error":
+            run_failed = True
             print(
                 f"  ERROR: {error} (staged as error record; canonical "
                 "ingestion happens only via glm_stage promote)",
@@ -82,12 +86,13 @@ def _run_visionb_staging(remaining, vision_b_config, *, data_dir=None, _data_roo
             "(canonical ingestion happens only via glm_stage promote)",
             flush=True,
         )
+    return 1 if run_failed else 0
 
 
 
-def main():
-    runner.main(staging_runner=_run_visionb_staging)
+def main() -> int:
+    return runner.main(staging_runner=_run_visionb_staging)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

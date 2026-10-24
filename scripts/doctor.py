@@ -651,16 +651,14 @@ def _crontab_contract() -> FreshnessCheck:
             ["crontab", "-l"], capture_output=True, text=True, timeout=15, check=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return FreshnessCheck(
+        return FreshnessCheck.unknown(
             "crontab.contract",
             f"live crontab unavailable ({type(exc).__name__}); deployment not verified",
-            True,
         )
     if probe.returncode != 0:
-        return FreshnessCheck(
+        return FreshnessCheck.unknown(
             "crontab.contract",
             f"live crontab unavailable ({probe.stderr.strip()}); deployment not verified",
-            True,
         )
     live = _active_repo_crontab_lines(probe.stdout, str(REPO))
     if live == expected:

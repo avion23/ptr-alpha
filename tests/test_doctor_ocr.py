@@ -29,6 +29,7 @@ import duckdb
 import pytest
 
 from analyzer.freshness import (
+    FreshnessCheck,
     end_to_end_checks,
     house_ingestion_freshness,
     monitoring_checks,
@@ -731,3 +732,65 @@ class DoctorIntegrationTest(TestCase):
         self.assertIn("[UNKNOWN] ocr.staging.freshness", output)
         self.assertNotIn("Traceback", output)
         self.assertEqual(1, rc, "UNKNOWN is fail-loud, not green")
+
+
+class CrontabContractTest(TestCase):
+    def test_missing_crontab_command_is_unknown(self):
+        with patch.object(doctor_mod.subprocess, "run", side_effect=FileNotFoundError):
+            result = doctor_mod._crontab_contract()
+
+        self.assertEqual("UNKNOWN", result.mark)
+        self.assertFalse(result.ok)
+        self.assertIn("deployment not verified", result.detail)
+
+    def test_nonzero_crontab_result_is_unknown(self):
+        with patch.object(
+            doctor_mod.subprocess,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=1, stdout="", stderr="permission denied"
+            ),
+        ):
+            result = doctor_mod._crontab_contract()
+
+        self.assertEqual("UNKNOWN", result.mark)
+        self.assertFalse(result.ok)
+        self.assertIn("permission denied", result.detail)
+
+    def test_matching_crontab_passes(self):
+        contract = doctor_mod.CRONTAB_CONTRACT.read_text().replace(
+            "@REPO@", str(doctor_mod.REPO)
+        )
+        with patch.object(
+            doctor_mod.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout=contract, stderr=""),
+        ):
+            result = doctor_mod._crontab_contract()
+
+        self.assertEqual("PASS", result.mark)
+        self.assertTrue(result.ok)
+
+    def test_drifted_crontab_fails(self):
+        with patch.object(
+            doctor_mod.subprocess,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=0, stdout="# no repo cron jobs\n", stderr=""
+            ),
+        ):
+            result = doctor_mod._crontab_contract()
+
+        self.assertEqual("FAIL", result.mark)
+        self.assertFalse(result.ok)
+        self.assertIn("drifted", result.detail)
+
+    def test_main_exits_nonzero_when_a_check_is_unknown(self):
+        unknown = FreshnessCheck.unknown("crontab.contract", "deployment not verified")
+        connection = SimpleNamespace(close=lambda: None)
+        with (
+            patch.object(doctor_mod, "CANONICAL", SimpleNamespace(exists=lambda: True)),
+            patch("duckdb.connect", return_value=connection),
+            patch.object(doctor_mod, "check", return_value=[unknown]),
+        ):
+            self.assertEqual(1, doctor_mod.main())

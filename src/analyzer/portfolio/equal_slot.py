@@ -1,4 +1,15 @@
-"""Shared-cash portfolio simulation with causal session-aligned execution."""
+"""Equal-slot, integer-share evaluation used by the ``portfolio`` CLI.
+
+Each entry targets 1/max_positions of liquidation equity, limited by cash and
+rounded down to whole shares. Signals fill only at the exact next NYSE session;
+exits and marks require the exact expected session's positive finite quote.
+Daily snapshots cover the caller's explicit start/end dates. Slippage is a
+fraction (not basis points); PortfolioConfig preserves the CLI harness defaults.
+
+This evaluates the equal-slot recommendation policy, not Kelly sizing. The
+independent fractional-target research contract lives in portfolio.simulation;
+its delayed-fill and zero-mark sensitivities are not deployment policy here.
+"""
 
 from __future__ import annotations
 
@@ -11,11 +22,11 @@ import pandas as pd
 
 from analyzer.backtest.prices import (
     AlignedPrice,
-    _aligned_price_at_or_before_arrays,
-    _aligned_price_on_or_after_arrays,
+    aligned_price_at_or_before_arrays as _aligned_price_at_or_before_arrays,
+    aligned_price_on_or_after_arrays as _aligned_price_on_or_after_arrays,
 )
 from analyzer.price_repository import next_nyse_session, previous_nyse_session
-from analyzer.signals import _price_arrays
+from analyzer.signals.prices import price_arrays as _price_arrays
 
 logger = logging.getLogger(__name__)
 

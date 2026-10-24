@@ -5,11 +5,13 @@ import numpy as np
 import pandas as pd
 
 from analyzer.analysis import calculate_signal_potential, evaluate_backtest
-from analyzer.backtest.prices import _aligned_price_at_or_before_arrays
+from analyzer.backtest.prices import (
+    aligned_price_at_or_before_arrays as _aligned_price_at_or_before_arrays,
+)
 from analyzer.options import UnsupportedOptionPricingError, estimate_options_leverage
 from analyzer.pipeline import _entry_prices_from_matrix, _execution_price_window
 from analyzer.price_source import _validate_and_log_prices
-from analyzer.signals import _price_arrays
+from analyzer.signals.prices import price_arrays as _price_arrays
 
 
 class TestBacktestTiming(unittest.TestCase):

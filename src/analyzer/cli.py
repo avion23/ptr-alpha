@@ -1086,7 +1086,7 @@ def portfolio(
 
     app_ctx = get_context(ctx, data_dir, read_only=True)
 
-    from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
+    from analyzer.portfolio.equal_slot import PortfolioConfig, PortfolioSimulator
 
     prices, recommendations = _load_portfolio_inputs(
         app_ctx,

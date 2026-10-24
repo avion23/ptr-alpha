@@ -23,7 +23,7 @@ import pytest
 
 from analyzer import analysis
 from analyzer.database import Database
-from analyzer.portfolio_sim import PortfolioConfig, PortfolioSimulator
+from analyzer.portfolio.equal_slot import PortfolioConfig, PortfolioSimulator
 
 MEMBERS = ["ALICE", "BOB", "CAROL"]
 TICKERS = ["AAA", "BBB", "CCC"]

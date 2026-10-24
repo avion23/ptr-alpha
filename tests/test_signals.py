@@ -12,7 +12,11 @@ from analyzer.signals import (
 
 
 def test_price_arrays_use_one_absence_sentinel():
-    from analyzer.signals.prices import _price_arrays, _price_at_or_before, _price_at_or_near
+    from analyzer.signals.prices import (
+        price_arrays as _price_arrays,
+        _price_at_or_before,
+        _price_at_or_near,
+    )
 
     prices = pd.DataFrame({"EMPTY": [np.nan]}, index=pd.to_datetime(["2024-01-02"]))
     for ticker in ("MISSING", "EMPTY"):

@@ -26,7 +26,7 @@ from analyzer.ticker_resolver import TickerResolver
 
 from analyzer.signals import constants as _constants
 from analyzer.signals.assembly import assemble_result_dataframe
-from analyzer.signals.prices import _price_arrays
+from analyzer.signals.prices import price_arrays as _price_arrays
 
 logger = logging.getLogger(__name__)
 

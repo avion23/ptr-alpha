@@ -87,7 +87,7 @@ The main code boundaries are:
 | Replay recommendation generation | `src/analyzer/backtest/recommend.py` |
 | Historical label construction | `src/analyzer/signals/`, `src/analyzer/backtest/evaluate.py` |
 | Descriptive member ranking | `src/analyzer/member_ranking/ranking.py` |
-| Portfolio execution | `src/analyzer/portfolio/`, `src/analyzer/portfolio_sim.py` |
+| Portfolio execution | `src/analyzer/portfolio/equal_slot.py` (integer-share CLI evaluation); `portfolio/simulation.py` (independent fractional Kelly research) |
 | CLI | `src/analyzer/cli.py` |
 
 There is no second production optimization engine, member-scoring engine, adaptive OU holding-period engine, forecast-model framework, or exact-machine certification gate.

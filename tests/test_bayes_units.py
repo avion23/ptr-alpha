@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.member_ranking.bayes import normal_normal_posteriors
-from analyzer.signals.filters import _collapse_to_episodes
+from analyzer.signals.filters import collapse_to_episodes as _collapse_to_episodes
 
 
 def _signals(rows: list[tuple[str, str, str, float]]) -> pd.DataFrame:

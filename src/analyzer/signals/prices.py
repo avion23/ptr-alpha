@@ -40,7 +40,7 @@ def _price_index_for_df(prices_df: pd.DataFrame) -> dict:
     return by_ticker
 
 
-def _price_arrays(
+def price_arrays(
     prices_df: pd.DataFrame, ticker: str
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Return (dates_ns_int64, values_float64) for ``ticker`` in ``prices_df``,
@@ -88,7 +88,7 @@ def _price_at_or_before(
     target_date: pd.Timestamp,
     max_staleness_days: int | None = None,
 ) -> float | None:
-    arrs = _price_arrays(prices_df, ticker)
+    arrs = price_arrays(prices_df, ticker)
     if arrs is None:
         return None
     idx_ns, vals = arrs
@@ -111,7 +111,7 @@ def _price_at_or_near(
     target_date: pd.Timestamp,
     tolerance_days: int = 7,
 ) -> float | None:
-    arrs = _price_arrays(prices_df, ticker)
+    arrs = price_arrays(prices_df, ticker)
     if arrs is None:
         return None
     idx_ns, vals = arrs

@@ -2,9 +2,9 @@
 
 All helpers accept pre-extracted ``(idx_ns, vals)`` numpy arrays so callers
 can cache them once per ticker and reuse them across many lookups (avoids
-repeated `_price_arrays` calls).
+repeated ``price_arrays`` calls).
 
-`_price_arrays` is read from `analyzer.signals` (the shared price cache).
+``price_arrays`` is owned by ``analyzer.signals.prices`` (the shared price cache).
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def _valid_price_at(vals, pos: int) -> float | None:
     return price
 
 
-def _aligned_price_at_or_before_arrays(
+def aligned_price_at_or_before_arrays(
     idx_ns, vals, target_date, max_staleness_days: int | None = None
 ) -> AlignedPrice | None:
     """Return the latest valid price at/before target with its real quote date."""
@@ -51,7 +51,7 @@ def _aligned_price_at_or_before_arrays(
     return AlignedPrice(price, quote_date, staleness_days)
 
 
-def _aligned_price_on_or_after_arrays(
+def aligned_price_on_or_after_arrays(
     idx_ns,
     vals,
     target_date,

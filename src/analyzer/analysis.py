@@ -17,11 +17,13 @@ from analyzer.member_ranking.ranking import rank_members
 from analyzer.models import AnalysisMode, TransactionType
 from analyzer.sector_data import load_sector_data
 from analyzer.signals import (
-    _get_member_signals,
-    _get_top_signals,
     calculate_signal_potential,
     get_member_signals,
     get_top_signals,
+)
+from analyzer.signals.top_signals import (
+    get_member_signals as _get_member_signals,
+    get_top_signals as _get_top_signals,
 )
 
 logger = logging.getLogger(__name__)

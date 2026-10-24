@@ -5,7 +5,7 @@ from datetime import date
 
 import pandas as pd
 
-from analyzer.portfolio_sim import (
+from analyzer.portfolio.equal_slot import (
     PortfolioConfig,
     PortfolioSimulator,
 )

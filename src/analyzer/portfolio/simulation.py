@@ -1,7 +1,14 @@
-"""Kelly portfolio construction and shared-capital execution simulation.
+"""Fractional weighted-target simulation for Kelly research, not the CLI policy.
 
-Every rebalance uses the same cash account.  Positions remain open until their
-holding horizon can be executed, so overlapping signals cannot reuse bankroll.
+The caller is scripts/run_kelly_backtest.py. Targets come from dated historical
+sizing estimates, not equal slots. Each target requests a fraction of liquidation
+equity and fills all-or-skip in fractional shares against one shared cash account.
+Entries may wait within max_execution_delay_days; exits may execute after their
+planned horizon within that same delay limit. Marks may be stale within the
+explicit bound, and zero is a valid total-loss mark. Rows follow observed price
+dates through the final target horizon/delay (or earlier when all positions close).
+Slippage is in basis points. These are research sensitivities, not settings for
+the independent exact-session, integer-share CLI evaluator in equal_slot.py.
 """
 
 from __future__ import annotations

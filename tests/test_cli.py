@@ -376,7 +376,7 @@ class TestCliApp(unittest.TestCase):
                 return_value=(prices, recommendations),
             ),
             patch(
-                "analyzer.portfolio_sim.PortfolioSimulator",
+                "analyzer.portfolio.equal_slot.PortfolioSimulator",
                 return_value=simulator,
             ) as simulator_type,
         ):

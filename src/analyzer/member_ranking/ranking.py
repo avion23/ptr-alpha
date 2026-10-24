@@ -7,7 +7,10 @@ import pandas as pd
 from analyzer.exceptions import AnalysisError
 from analyzer.member_ranking.bayes import normal_normal_posteriors
 from analyzer.models import TransactionType
-from analyzer.signals.filters import _collapse_to_episodes, _get_horizon_data
+from analyzer.signals.filters import (
+    collapse_to_episodes as _collapse_to_episodes,
+    get_horizon_data as _get_horizon_data,
+)
 
 
 def rank_members(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:

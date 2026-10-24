@@ -34,7 +34,7 @@ The system must never backdate knowledge to the private transaction date.
 | `src/analyzer/member_ranking/` | Descriptive member statistics and historical diagnostic scorers |
 | `src/analyzer/signals/` | Historical forward-return label construction and signal reports |
 | `src/analyzer/backtest/` | Point-in-time recommendation replay and fixed-horizon evaluation |
-| `src/analyzer/portfolio/`, `portfolio_sim.py` | Shared-cash equal-slot portfolio simulation and Kelly research helpers |
+| `src/analyzer/portfolio/` | `equal_slot.py`: integer-share, exact-session CLI evaluation; `simulation.py`: independent fractional weighted-target Kelly research (not deployment policy) |
 | `src/analyzer/capitol_trades.py` | Capitol Trades reconciliation input; not an official canonical source |
 | `scripts/` | Audits, reparsing, OCR, staging, reconciliation, refresh, and operational tools |
 | `tests/` | Unit, integration, parser, database, replay, and CLI checks |

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 
-def _get_horizon_data(
+def get_horizon_data(
     signals_df: pd.DataFrame, horizon: int, transaction_type: str | None = None
 ) -> pd.DataFrame:
     mask = signals_df["horizon_days"] == horizon
@@ -16,7 +16,7 @@ def _get_horizon_data(
     return signals_df.loc[mask]
 
 
-def _collapse_to_episodes(signals_df: pd.DataFrame) -> pd.DataFrame:
+def collapse_to_episodes(signals_df: pd.DataFrame) -> pd.DataFrame:
     """Keep one observation per public member/ticker/disclosure event.
 
     Multiple source rows made public for the same member, ticker, date, horizon,

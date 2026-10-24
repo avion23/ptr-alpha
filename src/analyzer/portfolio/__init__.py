@@ -1,18 +1,13 @@
-"""Portfolio construction with Kelly criterion position sizing.
+"""Portfolio evaluation with two deliberately independent contracts.
 
-Public API (re-exported here so existing `from analyzer.portfolio import X`
-calls keep working after the subpackage split):
-  - KellyConfig           position-sizing parameters
-  - kelly_fraction, half_kelly, compute_payout_ratio
-  - build_kelly_portfolio  per-ticker weight assignment
-  - build_portfolios_from_backtest  per-date portfolio builder
-  - simulate_portfolio_returns  holding-period returns
-  - compute_portfolio_metrics  aggregate performance stats
+``equal_slot`` owns PortfolioConfig/PortfolioSimulator for the ``portfolio`` CLI:
+whole shares, equal slots, exact-session fills/marks, explicit daily run bounds.
 
-Package layout:
-  - kelly.py         Kelly math + build_kelly_portfolio
-  - simulation.py    build_portfolios + simulate_portfolio_returns
-  - metrics.py       compute_portfolio_metrics
+The public functions below support Kelly research (scripts/run_kelly_backtest.py):
+``kelly`` builds weights from explicit dated sizing estimates, ``simulation``
+executes fractional weighted targets, and ``metrics`` describes that curve.
+Research fill-delay/mark sensitivities do not set equal-slot deployment policy.
+The engines share the NYSE calendar, not sizing or valuation semantics.
 """
 
 from analyzer.portfolio.kelly import (

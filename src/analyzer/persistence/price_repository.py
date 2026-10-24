@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 from functools import lru_cache
+from typing import Final
 
 import duckdb
 import numpy as np
@@ -110,8 +111,8 @@ class _NYSEHolidayCalendar(AbstractHolidayCalendar):
     ]
 
 
-_NYSE_HOLIDAYS = _NYSEHolidayCalendar()
-_NYSE_BUSINESS_DAY = CustomBusinessDay(calendar=_NYSE_HOLIDAYS)
+NYSE_HOLIDAYS: Final = _NYSEHolidayCalendar()
+_NYSE_BUSINESS_DAY = CustomBusinessDay(calendar=NYSE_HOLIDAYS)
 
 
 def _normalize_session_date(value) -> pd.Timestamp:
@@ -128,7 +129,7 @@ def nyse_sessions(start, end) -> pd.DatetimeIndex:
     if end_ts < start_ts:
         return pd.DatetimeIndex([])
     weekdays = pd.bdate_range(start_ts, end_ts)
-    holidays = _NYSE_HOLIDAYS.holidays(start=start_ts, end=end_ts)
+    holidays = NYSE_HOLIDAYS.holidays(start=start_ts, end=end_ts)
     return weekdays.difference(holidays)
 
 

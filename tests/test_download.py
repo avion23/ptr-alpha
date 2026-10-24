@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from analyzer.persistence.database import Database
-from analyzer.download import HouseTransactionSource, _PARSE_VERSION
+from analyzer.download import HouseTransactionSource, PARSE_VERSION
 from analyzer.exceptions import DataSourceError
 from analyzer.models import DownloadResult, DownloadStatus
 from analyzer.settings import Settings
@@ -543,7 +543,7 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
 ):
     from multiprocessing.pool import ThreadPool
 
-    from analyzer.download import _validated_pdf_sha256
+    from analyzer.download import validated_pdf_sha256
     from analyzer.parsing.metadata import consolidate_transactions
 
     monkeypatch.delenv("PTR_REUSE_LEGACY_V5_CACHE_YEAR", raising=False)
@@ -578,7 +578,7 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
     try:
         # Seed genuine legacy versions and values, never label old results as v6.
         for doc in ("legacy", "current", "changed", "oldgen", "failed"):
-            artifact = _validated_pdf_sha256(pdf_dir / f"{doc}.pdf")
+            artifact = validated_pdf_sha256(pdf_dir / f"{doc}.pdf")
             if doc == "changed":
                 artifact = "f" * 64
             bound_generation = "old-generation" if doc == "oldgen" else generation
@@ -590,7 +590,7 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
             db.upsert_transactions(frame, source="house_pdf")
             db.upsert_parse_run(
                 doc_id=doc, year=2026,
-                parser_version=_PARSE_VERSION if doc == "current" else "v5-deterministic",
+                parser_version=PARSE_VERSION if doc == "current" else "v5-deterministic",
                 status="error" if doc == "failed" else "success", engines_attempted="pdfplumber",
                 raw_row_count=1, transaction_count=1,
                 artifact_sha256=artifact, ingestion_generation=bound_generation,
@@ -612,7 +612,7 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
             assert db.conn.execute("SELECT * FROM pdf_parse_runs WHERE doc_id = 'legacy'").fetchall() == before_runs
             assert "count=1 original_producer=v5-deterministic current_producer=v6-deterministic-context" in caplog.text
             assert "not corrected or reproduced" in caplog.text
-        assert f"year=2026 producer={_PARSE_VERSION} force={force}" in caplog.text
+        assert f"year=2026 producer={PARSE_VERSION} force={force}" in caplog.text
         assert f"PTR_REUSE_LEGACY_V5_CACHE_YEAR={opt_in} legacy_reuse={reuse}" in caplog.text
         for doc in expected:
             assert db.conn.execute(
@@ -804,7 +804,7 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
     db.upsert_parse_run(
         doc_id="stable",
         year=2021,
-        parser_version=_PARSE_VERSION,
+        parser_version=PARSE_VERSION,
         status="success",
         engines_attempted="pdfplumber",
         raw_row_count=1,
@@ -882,12 +882,12 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
 
 
 def test_engine_error_detail_only_flags_dedicated_sentinel():
-    from analyzer.download import _engine_error_detail
+    from analyzer.download import engine_error_detail
 
     transient = ["pdfplumber", "error:lattice", "won:pdftotext"]
-    assert _engine_error_detail(transient) is None
+    assert engine_error_detail(transient) is None
     sentinel = ["__parse_failed__:ParserCascadeError:boom"]
-    assert _engine_error_detail(sentinel) == "ParserCascadeError:boom"
+    assert engine_error_detail(sentinel) == "ParserCascadeError:boom"
 
 
 def test_parse_cached_pdfs_saves_docs_with_transient_engine_errors(

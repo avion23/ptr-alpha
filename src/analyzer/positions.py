@@ -59,7 +59,7 @@ class _Lot:
     filing_ref: dict
 
 
-def _13f_enabled(value):
+def is_13f_corroboration_enabled(value):
     if value is None:
         return os.getenv(_13F_CORROBORATION_ENV, "").strip().lower() in {
             "1", "true", "yes", "on"
@@ -88,7 +88,7 @@ def gate_closed_events(
     """
     if events.empty:
         return events.copy()
-    enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
+    enable_13f_corroboration = is_13f_corroboration_enabled(enable_13f_corroboration)
 
     gated = events.copy()
     if "blocked_reason" not in gated:
@@ -1071,7 +1071,7 @@ def holdings_candidates(
     ``as_of``; future closes cannot enter a replay. Positions have no age
     expiry and remain candidates until sales close their lots.
     """
-    enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
+    enable_13f_corroboration = is_13f_corroboration_enabled(enable_13f_corroboration)
     columns = [
         "ticker",
         "actor_id",
@@ -1134,7 +1134,7 @@ def holdings_candidates_batch(
     requested; the `setups` path fans out over ~300 event members, where the
     per-member form costs ~10s each.
     """
-    enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
+    enable_13f_corroboration = is_13f_corroboration_enabled(enable_13f_corroboration)
     columns = [
         "ticker",
         "actor_id",

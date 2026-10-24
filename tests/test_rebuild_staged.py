@@ -74,7 +74,7 @@ def test_shared_verification_phase_keeps_staged_check_contract(tmp_path):
 
 @pytest.mark.parametrize("bad_row", ["invalid_date", "missing_metadata"])
 def test_house_persistence_rejects_consolidation_loss_in_both_paths(tmp_path, bad_row):
-    from analyzer.download import HouseTransactionSource, _validated_pdf_sha256
+    from analyzer.download import HouseTransactionSource, validated_pdf_sha256
     from scripts import rebuild_staged
 
     pdf = tmp_path / "loss.pdf"
@@ -106,7 +106,7 @@ def test_house_persistence_rejects_consolidation_loss_in_both_paths(tmp_path, ba
     source._save_parse_results(2026, results, metadata, "generation")
     rebuild_staged._persist_house_parse_batch(
         db, year=2026, ingestion_generation="generation", member_lookup=metadata,
-        artifact_hashes={"loss": _validated_pdf_sha256(pdf)}, results=results,
+        artifact_hashes={"loss": validated_pdf_sha256(pdf)}, results=results,
     )
     assert len(captured) == 2
     for frame, kwargs in captured:
@@ -118,7 +118,7 @@ def test_house_persistence_rejects_consolidation_loss_in_both_paths(tmp_path, ba
         assert run["raw_row_count"] == 2
         assert run["transaction_count"] == 0
         assert run["error_message"] == "rows lost during consolidation"
-        assert run["artifact_sha256"] == _validated_pdf_sha256(pdf)
+        assert run["artifact_sha256"] == validated_pdf_sha256(pdf)
         assert run["ingestion_generation"] == "generation"
     assert captured[0][1] == captured[1][1]
 

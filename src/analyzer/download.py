@@ -37,7 +37,7 @@ from analyzer.parsing.cascade import (
 )
 
 logger = logging.getLogger(__name__)
-_PARSE_VERSION = "v6-deterministic-context"
+PARSE_VERSION = "v6-deterministic-context"
 
 
 def _invalid_consolidated_house_docs(df: pd.DataFrame) -> dict[str, list[str]]:
@@ -267,7 +267,7 @@ class HouseTransactionSource(TransactionSource):
         return self.db.get_metadata(archive_year)
 
     async def _download_pdf_async(self, session, doc_id, pdf_path, url):
-        existing_sha = _validated_pdf_sha256(pdf_path)
+        existing_sha = validated_pdf_sha256(pdf_path)
         if existing_sha:
             return HousePdfAcquisition(
                 doc_id=str(doc_id),
@@ -398,8 +398,8 @@ class HouseTransactionSource(TransactionSource):
                 staged = stage_pdf_dir / f"{doc_id}.pdf"
                 canonical = self.data_dir / str(archive_year) / "pdfs" / f"{doc_id}.pdf"
                 if (
-                    _validated_pdf_sha256(staged) != recorded
-                    or _validated_pdf_sha256(canonical) != recorded
+                    validated_pdf_sha256(staged) != recorded
+                    or validated_pdf_sha256(canonical) != recorded
                 ):
                     return False
             return True
@@ -472,7 +472,7 @@ class HouseTransactionSource(TransactionSource):
         for doc_id in doc_ids:
             staged_path = stage_pdf_dir / f"{doc_id}.pdf"
             canonical_path = canonical_pdf_dir / f"{doc_id}.pdf"
-            canonical_sha = _validated_pdf_sha256(canonical_path)
+            canonical_sha = validated_pdf_sha256(canonical_path)
             if (
                 not authoritative
                 and canonical_sha
@@ -514,7 +514,7 @@ class HouseTransactionSource(TransactionSource):
             missing_doc_ids = sorted(
                 doc_id
                 for doc_id in doc_ids
-                if not _validated_pdf_sha256(
+                if not validated_pdf_sha256(
                     stage_pdf_dir / f"{doc_id}.pdf"
                 )
             )
@@ -612,7 +612,7 @@ class HouseTransactionSource(TransactionSource):
                     artifacts.append(
                         {
                             "doc_id": doc_id,
-                            "artifact_sha256": _validated_pdf_sha256(
+                            "artifact_sha256": validated_pdf_sha256(
                                 canonical_path
                             ),
                             "http_status": getattr(result, "status_code", None) or None,
@@ -716,7 +716,7 @@ class HouseTransactionSource(TransactionSource):
         logger.info(
             "House parser cache policy: year=%d producer=%s force=%s "
             "PTR_REUSE_LEGACY_V5_CACHE_YEAR=%s legacy_reuse=%s",
-            year, _PARSE_VERSION, force, legacy_year, reuse_legacy,
+            year, PARSE_VERSION, force, legacy_year, reuse_legacy,
         )
         ingestion_generation = self.db.get_latest_house_generation(year)
         if ingestion_generation is None:
@@ -738,11 +738,11 @@ class HouseTransactionSource(TransactionSource):
             artifact_hashes = {
                 path.stem: sha256
                 for path in pdf_paths
-                if (sha256 := _validated_pdf_sha256(path))
+                if (sha256 := validated_pdf_sha256(path))
             }
             cached = self.db.parse_runs.get_cached_doc_ids(
                 year=year,
-                parser_version=_PARSE_VERSION,
+                parser_version=PARSE_VERSION,
                 artifact_hashes=artifact_hashes,
                 ingestion_generation=ingestion_generation,
             )
@@ -758,7 +758,7 @@ class HouseTransactionSource(TransactionSource):
                     "original_producer=v5-deterministic current_producer=%s; "
                     "original versions and payloads retained, not corrected or "
                     "reproduced under the current recipe",
-                    year, ingestion_generation, len(legacy_cached - cached), _PARSE_VERSION,
+                    year, ingestion_generation, len(legacy_cached - cached), PARSE_VERSION,
                 )
                 cached |= legacy_cached
             if cached:
@@ -798,7 +798,7 @@ class HouseTransactionSource(TransactionSource):
                 parsed = pool.imap_unordered(tolerant_parse_pdf_worker, batch_paths)
                 for pdf_path, transactions, engines_attempted in parsed:
                     result = (pdf_path, transactions, engines_attempted)
-                    error_detail = _engine_error_detail(engines_attempted)
+                    error_detail = engine_error_detail(engines_attempted)
                     if error_detail is not None:
                         logger.warning(
                             "Excluding unparseable PDF %s: %s", pdf_path.stem, error_detail
@@ -826,17 +826,17 @@ class HouseTransactionSource(TransactionSource):
         identity when this method retries a document.
         """
         for pdf_path, _transactions, engines_attempted in failed_results:
-            detail = _engine_error_detail(engines_attempted) or "parse failed"
+            detail = engine_error_detail(engines_attempted) or "parse failed"
             self.db.upsert_parse_run(
                 doc_id=pdf_path.stem,
                 year=year,
-                parser_version=_PARSE_VERSION,
+                parser_version=PARSE_VERSION,
                 status="error",
                 engines_attempted=",".join(engines_attempted),
                 raw_row_count=0,
                 transaction_count=0,
                 error_message=detail,
-                artifact_sha256=_validated_pdf_sha256(pdf_path),
+                artifact_sha256=validated_pdf_sha256(pdf_path),
                 ingestion_generation=ingestion_generation,
             )
 
@@ -857,7 +857,7 @@ class HouseTransactionSource(TransactionSource):
             parse_attempts.append((doc_id, engines_attempted))
 
         artifact_hashes = {
-            path.stem: _validated_pdf_sha256(path) for path in pdf_transactions
+            path.stem: validated_pdf_sha256(path) for path in pdf_transactions
         }
         df, invalid_docs = prepare_house_parse_batch(
             pdf_transactions, member_lookup, ingestion_generation, artifact_hashes
@@ -869,7 +869,7 @@ class HouseTransactionSource(TransactionSource):
             dict(
                 doc_id=doc_id,
                 year=year,
-                parser_version=_PARSE_VERSION,
+                parser_version=PARSE_VERSION,
                 status=(
                     "error"
                     if doc_id in invalid_docs
@@ -937,7 +937,7 @@ class HouseTransactionSource(TransactionSource):
 # ── Helpers ──
 
 
-_PARSE_FAILURE_PREFIX = "__parse_failed__:"
+PARSE_FAILURE_PREFIX = "__parse_failed__:"
 _PARSE_DOC_BUDGET_SECONDS = 300
 
 
@@ -968,7 +968,7 @@ def tolerant_parse_pdf_worker(
     unguarded.
     """
     if pdf_path.stem in _skip_stems_from_env(os.environ.get("PTR_SKIP_DOCS")):
-        return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}skipped via PTR_SKIP_DOCS"]
+        return pdf_path, [], [f"{PARSE_FAILURE_PREFIX}skipped via PTR_SKIP_DOCS"]
 
     worker = parse_pdf_worker if parse_worker is None else parse_worker
     if budget_seconds is None:
@@ -991,11 +991,11 @@ def tolerant_parse_pdf_worker(
             return worker(pdf_path)
         except ParseBudgetExceeded:
             detail = f"parse budget {budget_seconds}s exceeded"
-            return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{detail}"]
+            return pdf_path, [], [f"{PARSE_FAILURE_PREFIX}{detail}"]
         except ParserCascadeError as exc:
-            return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{exc}"]
+            return pdf_path, [], [f"{PARSE_FAILURE_PREFIX}{exc}"]
         except Exception as exc:  # noqa: BLE001 -- per-PDF quarantine boundary
-            return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}{type(exc).__name__}:{exc}"]
+            return pdf_path, [], [f"{PARSE_FAILURE_PREFIX}{type(exc).__name__}:{exc}"]
     finally:
         if use_watchdog:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -1005,11 +1005,11 @@ def tolerant_parse_pdf_worker(
             )
 
 
-def _engine_error_detail(engines_attempted: list[str]) -> str | None:
+def engine_error_detail(engines_attempted: list[str]) -> str | None:
     """Return the quarantine detail when a tolerant worker reported failure."""
     for engine in engines_attempted:
-        if engine.startswith(_PARSE_FAILURE_PREFIX):
-            return engine[len(_PARSE_FAILURE_PREFIX) :]
+        if engine.startswith(PARSE_FAILURE_PREFIX):
+            return engine[len(PARSE_FAILURE_PREFIX) :]
     return None
 
 
@@ -1017,7 +1017,7 @@ def _valid_pdf_bytes(content: bytes) -> bool:
     return content.startswith(b"%PDF-") and b"%%EOF" in content[-2048:]
 
 
-def _validated_pdf_sha256(path: Path) -> str | None:
+def validated_pdf_sha256(path: Path) -> str | None:
     if not path.exists() or not path.is_file():
         return None
     try:

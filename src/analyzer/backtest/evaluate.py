@@ -28,7 +28,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from analyzer._price_index import _normalize_price_index
+from analyzer.price_index import normalize_price_index
 from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals.prices import price_arrays as _price_arrays
 
@@ -69,7 +69,7 @@ def evaluate_backtest(
         result.attrs["n_unavailable"] = 0
         return result
 
-    prices_df = _normalize_price_index(prices_df, invalid_error=ValueError)
+    prices_df = normalize_price_index(prices_df, invalid_error=ValueError)
     as_of_date = _normalize_date(as_of_date)
     entry_mult, exit_mult = _slippage_multipliers(entry_slippage_bps, exit_slippage_bps)
 

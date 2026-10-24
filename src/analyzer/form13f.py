@@ -23,7 +23,7 @@ from analyzer.sec import (
 )
 from analyzer.interfaces import TransactionSource
 from analyzer.manager_watchlist import WATCHLIST_MANAGERS
-from analyzer.persistence.transaction_repository import _BASE_WRITE_COLUMNS
+from analyzer.persistence.transaction_repository import BASE_TRANSACTION_WRITE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ _OUTPUT_PROVENANCE_COLUMNS = (
     "raw_asset_description",
     "ingestion_generation",
 )
-_OUTPUT_COLUMNS = _BASE_WRITE_COLUMNS + _OUTPUT_PROVENANCE_COLUMNS
+_OUTPUT_COLUMNS = BASE_TRANSACTION_WRITE_COLUMNS + _OUTPUT_PROVENANCE_COLUMNS
 _SHARE_SUBTYPE = "INFERRED_POSITION_INCREASE"
 _SNAPSHOT_SUBTYPE = "13F_SHARE_POSITION_SNAPSHOT"
 _INCREASE_COLUMNS = (

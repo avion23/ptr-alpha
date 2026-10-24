@@ -2111,3 +2111,7 @@ class Database:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+def open_database(data_dir: str | Path, read_only: bool) -> Database:
+    return Database(Path(data_dir) / "congress.duckdb", read_only=read_only)

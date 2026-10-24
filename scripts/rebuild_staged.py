@@ -48,13 +48,13 @@ if __name__ == "__main__":
 from analyzer.persistence.database import Database  # noqa: E402
 from analyzer.row_history import archive_rows, preserve_repair_history  # noqa: E402
 from analyzer.download import (  # noqa: E402
-    _PARSE_FAILURE_PREFIX,
-    _PARSE_VERSION,
+    PARSE_FAILURE_PREFIX,
+    PARSE_VERSION,
     build_member_lookup,
-    _engine_error_detail,
+    engine_error_detail,
     filter_existing_pdfs,
     tolerant_parse_pdf_worker as _production_tolerant_parse_worker,
-    _validated_pdf_sha256,
+    validated_pdf_sha256,
     preserve_existing_fields,
     prepare_house_parse_batch,
 )
@@ -66,7 +66,7 @@ from analyzer.settings import DataSettings, Settings  # noqa: E402
 from analyzer.persistence.source_report_repository import (  # noqa: E402
     SOURCE_REPORT_INPUT_COLUMNS,
     SourceReportOutcome,
-    _is_official_paper_url,
+    is_official_paper_url,
 )
 from scripts.audit_generation import (  # noqa: E402
     check_no_transaction_after_disclosure,
@@ -342,14 +342,14 @@ def _persist_house_parse_batch(
         doc_id = pdf_path.stem
         pdf_transactions[pdf_path] = transactions
         raw_counts[doc_id] = len(transactions)
-        error_message = _engine_error_detail(engines_attempted)
+        error_message = engine_error_detail(engines_attempted)
         parse_attempts.append(
             (
                 doc_id,
                 [
                     engine
                     for engine in engines_attempted
-                    if not engine.startswith(_PARSE_FAILURE_PREFIX)
+                    if not engine.startswith(PARSE_FAILURE_PREFIX)
                 ],
                 error_message,
             )
@@ -379,7 +379,7 @@ def _persist_house_parse_batch(
             dict(
                 doc_id=doc_id,
                 year=year,
-                parser_version=_PARSE_VERSION,
+                parser_version=PARSE_VERSION,
                 status=status,
                 engines_attempted=",".join(engines_attempted) or "cascade-failed",
                 raw_row_count=raw_counts.get(doc_id, 0),
@@ -433,7 +433,7 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
         artifact_hashes = {
             path.stem: sha
             for path in pdf_paths
-            if (sha := _validated_pdf_sha256(path)) is not None
+            if (sha := validated_pdf_sha256(path)) is not None
         }
         unresolved_doc_ids = set(
             db.get_unresolved_house_doc_ids(year, ingestion_generation)
@@ -518,7 +518,7 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
             for result in pool.imap_unordered(
                 _tolerant_text_parse_worker, unseen_paths, chunksize=1
             ):
-                if _engine_error_detail(result[2]) is not None:
+                if engine_error_detail(result[2]) is not None:
                     deferred_paths.append(result[0])
                     continue
                 completed.append(result)
@@ -974,7 +974,7 @@ def _source_report_provenance_violations(
                 and nonpaper_hashes_valid
                 and isinstance(paper_sha, str)
                 and re.fullmatch(r"[0-9a-f]{64}", paper_sha) is not None
-                and _is_official_paper_url(paper_url)
+                and is_official_paper_url(paper_url)
             )
             if not paper_valid:
                 violations.append(
@@ -2692,7 +2692,7 @@ def _ingest_prices(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     """Upsert a value-verified price refresh into the staged DB."""
     import pandas as pd  # noqa: PLC0415
 
-    from analyzer.price_snapshot import _hash_price_values  # noqa: PLC0415
+    from analyzer.price_snapshot import hash_price_values  # noqa: PLC0415
 
     parquet_file = track_dir / "prices.parquet"
     duckdb_file = track_dir / "refresh.duckdb"
@@ -2727,7 +2727,7 @@ def _ingest_prices(track_dir: Path, track_manifest: dict, db: Database) -> dict:
             raise ValueError(f"price refresh missing column {column!r}")
     pivot = prices.pivot(index="date", columns="ticker", values="close")
     pivot.index = pd.DatetimeIndex(pd.to_datetime(pivot.index)).normalize()
-    computed_hash = _hash_price_values(pivot)
+    computed_hash = hash_price_values(pivot)
     expected_hash = track_manifest.get("value_hash") or track_manifest.get("data_hash")
     if expected_hash and computed_hash != expected_hash:
         raise ValueError(

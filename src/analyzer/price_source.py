@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from analyzer._price_index import _normalize_price_index
+from analyzer.price_index import normalize_price_index
 from analyzer.persistence.database import Database
 from analyzer.exceptions import DataSourceError
 from analyzer.settings import Settings
@@ -262,7 +262,7 @@ class YFinancePriceSource:
 
     @staticmethod
     def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:
-        return _normalize_price_index(
+        return normalize_price_index(
             prices,
             invalid_error=DataSourceError,
             duplicate_error=DataSourceError,
@@ -523,14 +523,15 @@ def _store_generation(db, ticker, generation, series, factors, basis) -> str:
     return value_hash
 
 
-def _store_generations(db, entries) -> list[str]:
+def store_generations(db, entries) -> list[str]:
     """Batched :func:`_store_generation` for many (ticker, generation) writes.
 
     Persists exactly the rows sequential per-ticker calls would: one schema
     ensure, one batch of header upserts and one set-based values insert. When
     several entries address the same (ticker, generation) identity the later
     entry wins, which is what repeating the per-ticker call would leave in the
-    tables.
+    tables. This low-level helper does not manage transactions; callers own
+    the transaction around a coordinated refresh write.
     """
     entries = list(entries)
     if not entries:
@@ -579,8 +580,12 @@ def _set_generation_state(db, ticker, generation, status, alternate=None, reason
     )
 
 
-def _set_generation_states(db, rows) -> None:
-    """Batched :func:`_set_generation_state`: one prepared statement batch."""
+def set_generation_states(db, rows) -> None:
+    """Batched :func:`_set_generation_state`: one prepared statement batch.
+
+    This low-level helper does not manage transactions; callers own the
+    transaction around a coordinated refresh write.
+    """
     rows = list(rows)
     if not rows:
         return

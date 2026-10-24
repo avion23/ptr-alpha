@@ -15,7 +15,7 @@ import weakref as _weakref
 import numpy as np
 import pandas as pd
 
-from analyzer._price_index import _normalize_price_index
+from analyzer.price_index import normalize_price_index
 from analyzer.signals.constants import _NS_PER_DAY
 
 _PRICE_INDEX_DATA: dict[int, dict] = {}
@@ -64,7 +64,7 @@ def price_arrays(
         if ticker not in prices_df.columns:
             arrs = None
         else:
-            s = _normalize_price_index(prices_df[[ticker]])[ticker].dropna()
+            s = normalize_price_index(prices_df[[ticker]])[ticker].dropna()
             if s.empty:
                 arrs = None
             else:

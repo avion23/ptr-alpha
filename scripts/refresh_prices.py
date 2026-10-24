@@ -478,8 +478,8 @@ def merge_temp_into_canonical(
     """
     from analyzer.persistence.database import Database
     from analyzer.price_source import (
-        _set_generation_states,
-        _store_generations,
+        set_generation_states,
+        store_generations,
         canonical_price_hash,
         ensure_price_generation_schema,
         legacy_price_generation_state,
@@ -774,8 +774,8 @@ def merge_temp_into_canonical(
                         state_writes.append(
                             (ticker, generation, "comparable", None, None)
                         )
-                    _store_generations(canon, generation_writes)
-                    _set_generation_states(canon, state_writes)
+                    store_generations(canon, generation_writes)
+                    set_generation_states(canon, state_writes)
                 has_div = con.execute(
                     "SELECT COUNT(*) FROM duckdb_tables() "
                     "WHERE database_name='merge_src' AND table_name='dividends'"

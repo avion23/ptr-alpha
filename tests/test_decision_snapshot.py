@@ -191,13 +191,13 @@ def test_record_resolves_omitted_control_once_and_rejects_nonbool(
     from analyzer import positions
 
     calls = []
-    original = positions._13f_enabled
+    original = positions.is_13f_corroboration_enabled
 
     def capture(value):
         calls.append(value)
         return original(value)
 
-    monkeypatch.setattr(positions, "_13f_enabled", capture)
+    monkeypatch.setattr(positions, "is_13f_corroboration_enabled", capture)
     monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1")
     path = receipts.record_decision(tmp_path, DAY, *inputs)
 
@@ -781,13 +781,13 @@ def test_cli_setups_passes_one_resolved_control_to_every_normal_path(
     candidates, weights, quotes, watchlist = inputs
     resolutions = []
     calls = []
-    resolve = positions._13f_enabled
+    resolve = positions.is_13f_corroboration_enabled
 
     def capture_resolution(value):
         resolutions.append(value)
         return resolve(value)
 
-    monkeypatch.setattr(positions, "_13f_enabled", capture_resolution)
+    monkeypatch.setattr(positions, "is_13f_corroboration_enabled", capture_resolution)
     monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1" if enabled else "0")
     connection = SimpleNamespace(
         execute=lambda *a, **k: SimpleNamespace(
@@ -872,13 +872,13 @@ def test_cli_empty_setups_paths_record_resolved_control(
 
     resolutions = []
     calls = []
-    resolve = positions._13f_enabled
+    resolve = positions.is_13f_corroboration_enabled
 
     def capture_resolution(value):
         resolutions.append(value)
         return resolve(value)
 
-    monkeypatch.setattr(positions, "_13f_enabled", capture_resolution)
+    monkeypatch.setattr(positions, "is_13f_corroboration_enabled", capture_resolution)
     monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1" if enabled else "0")
     connection = SimpleNamespace(
         execute=lambda *a, **k: SimpleNamespace(
@@ -1425,7 +1425,7 @@ def test_git_sha_resolves_executing_package_not_cwd(tmp_path, monkeypatch, input
     assert package_sha != cwd_sha
 
     monkeypatch.chdir(other_repo)
-    assert price_snapshot._get_git_sha() == package_sha
+    assert price_snapshot.get_git_sha() == package_sha
 
     candidates, weights, quotes, watchlist = inputs
     path = receipts.record_decision(tmp_path, DAY, *inputs)
@@ -1440,7 +1440,7 @@ def test_git_sha_fails_closed_or_uses_env(monkeypatch):
 
     monkeypatch.setattr(price_snapshot.subprocess, "run", unresolvable)
     monkeypatch.setenv("GIT_SHA", "abc123")
-    assert price_snapshot._get_git_sha() == "abc123"
+    assert price_snapshot.get_git_sha() == "abc123"
     monkeypatch.delenv("GIT_SHA")
     # Never a guess: unresolvable provenance is None, not a wrong value.
-    assert price_snapshot._get_git_sha() is None
+    assert price_snapshot.get_git_sha() is None

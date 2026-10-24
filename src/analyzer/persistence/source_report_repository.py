@@ -8,7 +8,7 @@ import duckdb
 import pandas as pd
 
 
-def _is_official_paper_url(value: object) -> bool:
+def is_official_paper_url(value: object) -> bool:
     if not isinstance(value, str) or not value:
         return False
     try:
@@ -373,7 +373,7 @@ class SourceReportRepository:
                 "paper_only reports require artifact=landing and paper artifact hashes"
             )
         invalid_paper_urls = paper_only & ~reports_df["paper_artifact_url"].map(
-            _is_official_paper_url
+            is_official_paper_url
         )
         if invalid_paper_urls.any():
             raise ValueError("paper_only reports require an official Senate paper URL")

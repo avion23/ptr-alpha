@@ -58,7 +58,6 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if __name__ == "__main__":
@@ -67,6 +66,7 @@ if __name__ == "__main__":
             sys.path.insert(0, _entry)
 
 import duckdb
+from analyzer.persistence.source_report_repository import is_official_paper_url
 
 # Pinned parser canaries from tests/test_parsing.py: the production cascade
 # emits exactly these row counts for these PDFs, so a faithful rebuild must
@@ -132,28 +132,6 @@ def _run_source_for_parser(
     if any(marker in provenance for marker in ("gemini", "ling", "gpt", "openrouter/")):
         return "gemini_ocr"
     return "house_pdf"
-
-
-def _is_official_paper_url(value: object) -> bool:
-    if not isinstance(value, str) or not value:
-        return False
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname == "efdsearch.senate.gov"
-        and parsed.username is None
-        and parsed.password is None
-        and port in (None, 443)
-        and not parsed.query
-        and not parsed.fragment
-        and parsed.path.startswith(
-            ("/media/", "/search/view/paper/", "/search/view/paper-filing/")
-        )
-    )
 
 
 def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
@@ -758,7 +736,7 @@ def check_source_report_equation(conn: duckdb.DuckDBPyConnection) -> CheckResult
             or not isinstance(paper_sha, str)
             or re.fullmatch(r"[0-9a-f]{64}", paper_sha) is None
         )
-        if invalid_scope or invalid_hashes or not _is_official_paper_url(paper_url):
+        if invalid_scope or invalid_hashes or not is_official_paper_url(paper_url):
             result.violations.append(
                 f"source={source} chamber={chamber} gen={generation} "
                 f"{record_id}: paper_only report has invalid Senate paper "

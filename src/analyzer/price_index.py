@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 
-def _normalize_price_index(
+def normalize_price_index(
     prices: pd.DataFrame,
     *,
     invalid_error: type[Exception] | None = None,

@@ -20,12 +20,11 @@ from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_MIN_BUYERS,
     get_consensus_price_tickers,
 )
-from analyzer.persistence.database import Database
+from analyzer.persistence.database import Database, open_database as _open_database
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
 from analyzer.freshness import FreshnessCheck, monitoring_checks
 from analyzer.house_refresh import (
-    _open_database,
     acquire_house_archives,
     complete_house_refresh,
     house_refresh_counts,
@@ -1654,7 +1653,7 @@ def setups(
     try:
         from analyzer.pipeline import eligible_events
         from analyzer.positions import (
-            _13f_enabled,
+            is_13f_corroboration_enabled,
             coalesce_actor_variants,
             dedupe_member_names,
             gate_closed_events,
@@ -1674,7 +1673,7 @@ def setups(
     except ImportError as exc:
         _cli_exit(1, f"Error: setups is unavailable ({exc})")
 
-    decision_13f = _13f_enabled(None)
+    decision_13f = is_13f_corroboration_enabled(None)
     try:
         db = _open_database(data_dir, read_only=True)
     except Exception as exc:

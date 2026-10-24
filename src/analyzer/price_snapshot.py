@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from analyzer._price_index import _normalize_price_index
+from analyzer.price_index import normalize_price_index
 
 
-def _get_git_sha() -> str | None:
+def get_git_sha() -> str | None:
     """Revision of the EXECUTING analyzer package, not the process CWD.
 
     Provenance must identify the code that produced the artifact. Resolving
@@ -96,10 +96,10 @@ def _compute_ticker_coverage(
 
     # Count expected exchange sessions, not generic weekdays. Generic business
     # days incorrectly call ordinary market holidays missing observations.
-    from analyzer.persistence.price_repository import _NYSE_HOLIDAYS
+    from analyzer.persistence.price_repository import NYSE_HOLIDAYS
 
     expected_dates = pd.bdate_range(first, last)
-    holidays = _NYSE_HOLIDAYS.holidays(start=first, end=last)
+    holidays = NYSE_HOLIDAYS.holidays(start=first, end=last)
     expected_dates = expected_dates.difference(holidays)
     actual_dates = set(pd.DatetimeIndex(series.index).normalize())
     gaps = sum(1 for d in expected_dates if d not in actual_dates)
@@ -112,7 +112,7 @@ def _compute_ticker_coverage(
     }
 
 
-def _hash_price_values(prices: pd.DataFrame) -> str:
+def hash_price_values(prices: pd.DataFrame) -> str:
     """Hash sorted ticker/date/value triples for reproducibility."""
     digest = hashlib.sha256()
     digest.update(b"ptr-alpha-price-snapshot-v1\n")
@@ -137,7 +137,7 @@ def create_snapshot(
 ) -> PriceSnapshot:
     if prices is None:
         prices = db.get_prices(tickers, start, end)
-    prices = _normalize_price_index(prices)
+    prices = normalize_price_index(prices)
     wanted = [ticker for ticker in tickers if ticker in prices.columns]
     prices = prices.loc[
         (prices.index >= pd.Timestamp(start)) & (prices.index <= pd.Timestamp(end)),
@@ -152,7 +152,7 @@ def create_snapshot(
         total_rows = 0
         first_date = ""
         last_date = ""
-        value_hash = _hash_price_values(prices)
+        value_hash = hash_price_values(prices)
     else:
         resolved_tickers_set = {
             ticker for ticker in prices.columns if prices[ticker].notna().any()
@@ -168,12 +168,12 @@ def create_snapshot(
         all_dates = prices.index
         first_date = str(all_dates.min().date())
         last_date = str(all_dates.max().date())
-        value_hash = _hash_price_values(prices)
+        value_hash = hash_price_values(prices)
 
     snapshot = PriceSnapshot(
         snapshot_id=str(uuid.uuid4()),
         created_at=datetime.now().isoformat(),
-        git_sha=_get_git_sha(),
+        git_sha=get_git_sha(),
         yfinance_version=_get_yfinance_version(),
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         requested_tickers=len(tickers),

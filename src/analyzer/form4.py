@@ -18,7 +18,7 @@ import requests
 
 from analyzer.persistence.database import Database
 from analyzer.interfaces import TransactionSource
-from analyzer.persistence.transaction_repository import _BASE_WRITE_COLUMNS
+from analyzer.persistence.transaction_repository import BASE_TRANSACTION_WRITE_COLUMNS
 from analyzer.sec import (
     SEC_ARCHIVES_URL,
     SECClient as _SECClient,
@@ -45,7 +45,7 @@ _NEGATIVE_10B5_RE = re.compile(
     re.IGNORECASE,
 )
 _TRADE_PRICE_RE = re.compile(r"\bshares\s+@\s+\$([0-9]+(?:\.[0-9]+)?)\b")
-_FORM4_COLUMNS = _BASE_WRITE_COLUMNS + (
+_FORM4_COLUMNS = BASE_TRANSACTION_WRITE_COLUMNS + (
     "acceptance_datetime",
     "source_record_id",
     "source_row_id",

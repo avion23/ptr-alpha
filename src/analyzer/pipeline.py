@@ -14,7 +14,7 @@ import pandas as pd
 from analyzer import analysis
 from analyzer.canonical_scope import canonical_decision, decision_history
 from analyzer.asset_ticker_map import resolve_asset_ticker
-from analyzer._price_index import _normalize_price_index
+from analyzer.price_index import normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataResult, DataSourceError
 from analyzer.member_names import actor_id, canonical_member_key
 from analyzer.member_ranking.buyer_scoring import (
@@ -787,7 +787,7 @@ def _entry_prices_from_matrix(
     if transactions.empty or prices.empty:
         return pd.DataFrame()
 
-    matrix = _normalize_price_index(
+    matrix = normalize_price_index(
         prices,
         duplicate_error=DataSourceError,
         duplicate_message="Price matrix contains duplicate calendar dates",

@@ -6,16 +6,12 @@ import logging
 from datetime import date
 from pathlib import Path
 
-from analyzer.persistence.database import Database
+from analyzer.persistence.database import Database, open_database as _open_database
 from analyzer.download import HouseFetchSummary, HouseTransactionSource
 from analyzer.exceptions import DataResult
 from analyzer.pipeline import run_parse_pipeline
 
 logger = logging.getLogger(__name__)
-
-
-def _open_database(data_dir: str | Path, read_only: bool) -> Database:
-    return Database(Path(data_dir) / "congress.duckdb", read_only=read_only)
 
 
 class _DatabaseContextReleaseError(RuntimeError):

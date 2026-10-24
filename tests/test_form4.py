@@ -12,9 +12,9 @@ from analyzer.form4 import (
     candidates_from_sweep,
     parse_form4_xml,
 )
-from analyzer.persistence.transaction_repository import _BASE_WRITE_COLUMNS
+from analyzer.persistence.transaction_repository import BASE_TRANSACTION_WRITE_COLUMNS
 
-_EXPECTED_COLUMNS = _BASE_WRITE_COLUMNS + (
+_EXPECTED_COLUMNS = BASE_TRANSACTION_WRITE_COLUMNS + (
     "acceptance_datetime",
     "source_record_id",
     "source_row_id",

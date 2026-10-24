@@ -51,7 +51,7 @@ from typing import Any
 
 import pandas as pd
 
-from analyzer.price_snapshot import _get_git_sha, create_snapshot
+from analyzer.price_snapshot import create_snapshot, get_git_sha
 from analyzer.setups import score
 
 
@@ -434,9 +434,9 @@ def record_decision(
     are frozen, not just winners. Identical content is an idempotent no-op;
     different content on the same date is recorded separately and visibly.
     """
-    from analyzer.positions import _13f_enabled
+    from analyzer.positions import is_13f_corroboration_enabled
 
-    enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
+    enable_13f_corroboration = is_13f_corroboration_enabled(enable_13f_corroboration)
     as_of = date.fromisoformat(str(as_of))
     inputs = _freeze(
         {
@@ -483,7 +483,7 @@ def record_decision(
         "schema_version": 3,
         "kind": "setups",
         "decision_date": as_of.isoformat(),
-        "git_sha": _get_git_sha(),
+        "git_sha": get_git_sha(),
         "scope": scope or {},
         "inputs": inputs,
         "input_rows_hash": _hash(inputs["candidates"]),
@@ -525,7 +525,7 @@ def record_ticker_decision(
         "schema_version": 3,
         "kind": "ticker_consensus",
         "decision_date": as_of.isoformat(),
-        "git_sha": _get_git_sha(),
+        "git_sha": get_git_sha(),
         "scope": scope or {},
         "inputs": frozen_inputs,
         "input_rows_hash": _hash(frozen_inputs),

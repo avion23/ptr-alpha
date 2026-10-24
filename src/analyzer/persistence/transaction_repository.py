@@ -35,7 +35,7 @@ _PROVENANCE_COLUMNS = (
     "ingestion_generation",
     "artifact_sha256",
 )
-_BASE_WRITE_COLUMNS = (
+BASE_TRANSACTION_WRITE_COLUMNS = (
     "doc_id",
     "member",
     "ticker",
@@ -464,7 +464,7 @@ class TransactionRepository:
         }
         write_columns = [
             column
-            for column in _BASE_WRITE_COLUMNS + _PROVENANCE_COLUMNS
+            for column in BASE_TRANSACTION_WRITE_COLUMNS + _PROVENANCE_COLUMNS
             if column in existing_column_types and column in df.columns
         ]
         df = df[write_columns].copy()

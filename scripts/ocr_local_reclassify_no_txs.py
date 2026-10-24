@@ -38,7 +38,12 @@ if __name__ == "__main__":
         if _entry not in sys.path:
             sys.path.insert(0, _entry)
 
-from scripts.ocr_local_sweep import sha256_file, write_manifest  # noqa: E402
+from scripts.ocr_local_sweep import (  # noqa: E402,F401
+    _staging_root_lock,
+    _write_manifest_locked,
+    sha256_file,
+    write_manifest,  # historical re-export
+)
 
 REASON_NOTHING = "reports no transactions"
 REASON_COVER = "cover page (no transaction rows)"
@@ -165,6 +170,12 @@ def _row_artifact_matches(
 
 def reclassify_no_txs(out_root: str | Path) -> dict:
     """Idempotent two-way reconciliation of the no_txs evidence rule."""
+    with _staging_root_lock(out_root) as locked_root:
+        return _reclassify_no_txs_locked(locked_root)
+
+
+def _reclassify_no_txs_locked(out_root: str | Path) -> dict:
+    """Reclassify while holding the shared staging-root publication lock."""
     out_root = Path(out_root).resolve()
     docs_dir = out_root / "docs"
     if docs_dir.is_symlink():
@@ -344,7 +355,10 @@ def reclassify_no_txs(out_root: str | Path) -> dict:
             ]
             _atomic_write_json(envelope_path, envelope)
             restored.append(doc_id)
-    write_manifest(out_root, kind="sweep", data_dir=out_root)
+    # The manifest writer is the only nested publication; use its explicit
+    # lock-held variant so the outer preflight/edit/manifest operation remains
+    # atomic with respect to stage_document and other manifest writers.
+    _write_manifest_locked(out_root, kind="sweep", data_dir=out_root)
     return {"demoted": demoted, "restored": restored, "kept": kept}
 
 

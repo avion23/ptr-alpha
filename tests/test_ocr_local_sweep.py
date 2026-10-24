@@ -14,7 +14,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -265,6 +267,131 @@ class TestNoTxsReclassification(unittest.TestCase):
             self.assertEqual(manifest["resolved_count"], 1)
             self.assertEqual(manifest["total_rows"], 1)
             self.assertEqual(manifest["no_txs_count"], 0)
+
+    def test_root_lock_serializes_same_root_without_blocking_other_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            other_out = out / "other-root"
+            doc_id = "positive-race"
+            self._stage(
+                out,
+                doc_id,
+                status="no_txs",
+                reasons=["page 1: cover page (no transaction rows)"],
+            )
+            positive = {
+                "doc_id": doc_id,
+                "year": 2015,
+                "status": "resolved",
+                "artifact_sha256": "positive-source",
+                "page_count": 2,
+                "covered_pages": [1, 2],
+                "uncovered_pages": [],
+                "row_count": 1,
+                "rows": [{"asset_description": "Positive row"}],
+                "reasons": ["positive OCR evidence"],
+                "engines": [],
+                "canary": None,
+                "elapsed_s": 0,
+            }
+            preflight_ready = threading.Event()
+            resume_reclassification = threading.Event()
+            stage_lock_requested = threading.Event()
+            stage_done = threading.Event()
+            other_done = threading.Event()
+            errors = []
+            original_write = reclassify._atomic_write_json
+            original_stage_lock = ocr._staging_root_lock
+
+            def pause_after_preflight(path, envelope):
+                if path.name == f"{doc_id}.json" and envelope["status"] == "unresolved":
+                    preflight_ready.set()
+                    if not resume_reclassification.wait(3):
+                        raise TimeoutError("timed out waiting to resume reclassification")
+                original_write(path, envelope)
+
+            def run_reclassification():
+                try:
+                    reclassify.reclassify_no_txs(out)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def publish_positive():
+                try:
+                    ocr.stage_document(out, positive)
+                    ocr.write_manifest(out, kind="sweep", data_dir=out)
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    stage_done.set()
+
+            def publish_other_root():
+                other = {**positive, "doc_id": "independent-output"}
+                try:
+                    ocr.stage_document(other_out, other)
+                    ocr.write_manifest(other_out, kind="sweep", data_dir=other_out)
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    other_done.set()
+
+            reclassify_thread = threading.Thread(
+                target=run_reclassification, daemon=True
+            )
+            stage_thread = threading.Thread(target=publish_positive, daemon=True)
+            other_thread = threading.Thread(target=publish_other_root, daemon=True)
+
+            @contextmanager
+            def observe_stage_lock(root):
+                if threading.current_thread() is stage_thread:
+                    stage_lock_requested.set()
+                with original_stage_lock(root) as locked_root:
+                    yield locked_root
+
+            blocked_during_preflight = False
+            try:
+                reclassify._atomic_write_json = pause_after_preflight
+                ocr._staging_root_lock = observe_stage_lock
+                reclassify_thread.start()
+                self.assertTrue(preflight_ready.wait(2), "reclassifier missed preflight hook")
+                stage_thread.start()
+                self.assertTrue(
+                    stage_lock_requested.wait(2), "positive publisher skipped the shared lock"
+                )
+                other_thread.start()
+                other_root_unblocked = other_done.wait(2)
+                blocked_during_preflight = not stage_done.wait(0.1)
+            finally:
+                resume_reclassification.set()
+                reclassify_thread.join(3)
+                if stage_thread.ident is not None:
+                    stage_thread.join(3)
+                if other_thread.ident is not None:
+                    other_thread.join(3)
+                reclassify._atomic_write_json = original_write
+                ocr._staging_root_lock = original_stage_lock
+
+            self.assertTrue(other_root_unblocked, "different staging roots shared a lock")
+            self.assertTrue(blocked_during_preflight, "staging bypassed the root lock")
+            self.assertFalse(reclassify_thread.is_alive(), "reclassification deadlocked")
+            self.assertFalse(stage_thread.is_alive(), "staging or manifest publication deadlocked")
+            self.assertEqual(errors, [])
+            envelope_path = out / "docs" / f"{doc_id}.json"
+            rows_path = out / "rows" / f"{doc_id}.jsonl"
+            envelope = json.loads(envelope_path.read_text())
+            rows = rows_path.read_bytes()
+            manifest = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(envelope["status"], "resolved")
+            self.assertEqual(envelope["artifact_sha256"], "positive-source")
+            self.assertEqual(envelope["row_count"], 1)
+            self.assertEqual(rows, b'{"asset_description": "Positive row"}\n')
+            self.assertEqual(envelope["rows_file_sha256"], ocr.sha256_file(rows_path))
+            self.assertEqual(manifest["resolved_count"], 1)
+            self.assertEqual(manifest["total_rows"], 1)
+            self.assertEqual(
+                manifest["staged_files_sha256"][f"docs/{doc_id}.json"],
+                ocr.sha256_file(envelope_path),
+            )
 
     def test_conflicting_empty_row_claim_aborts_without_rebinding_hashes(self):
         for corruption in (

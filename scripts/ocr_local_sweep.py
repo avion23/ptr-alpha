@@ -84,6 +84,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -93,6 +94,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import date, datetime
 from multiprocessing import Pool
 from pathlib import Path
@@ -1205,9 +1207,27 @@ def check_canary(result: dict) -> dict:
 # Staging (Gemini sweep contract)
 # --------------------------------------------------------------------------
 
+@contextmanager
+def _staging_root_lock(out_root: str | Path):
+    """Serialize staging publications that share one output root."""
+    root = Path(out_root).resolve()
+    with (root / ".ocr-local-sweep.lock").open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield root
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def stage_document(out_root: str | Path, result: dict) -> None:
     """Atomically stage one document: rows jsonl (tmp+rename) and docs envelope."""
-    out_root = Path(out_root)
+    out_root = Path(out_root).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+    with _staging_root_lock(out_root) as locked_root:
+        _stage_document_locked(locked_root, result)
+
+
+def _stage_document_locked(out_root: Path, result: dict) -> None:
     rows_dir = out_root / "rows"
     docs_dir = out_root / "docs"
     rows_dir.mkdir(parents=True, exist_ok=True)
@@ -1270,7 +1290,15 @@ def write_manifest(
     out_root: str | Path, *, kind: str, data_dir: str | Path
 ) -> Path:
     """Assemble manifest.json from staged docs/ envelopes (idempotent)."""
-    out_root = Path(out_root)
+    with _staging_root_lock(out_root) as locked_root:
+        return _write_manifest_locked(locked_root, kind=kind, data_dir=data_dir)
+
+
+def _write_manifest_locked(
+    out_root: str | Path, *, kind: str, data_dir: str | Path
+) -> Path:
+    """Assemble manifest while caller holds _staging_root_lock(out_root)."""
+    out_root = Path(out_root).resolve()
     docs_dir = out_root / "docs"
     resolved: dict[str, dict] = {}
     unresolved: dict[str, list[str]] = {}

@@ -636,7 +636,11 @@ class TestParsing(unittest.TestCase):
         )
 
     def test_real_pdf_safety_canaries(self):
-        from analyzer.parser_cascade import _parse_pdf_worker
+        import hashlib
+        import re
+
+        from analyzer.parser_cascade import ParserCascadeError, _parse_pdf_worker
+        from analyzer.parsing import extract_tables_with_pdftotext
 
         data_root = next(
             (
@@ -676,9 +680,33 @@ class TestParsing(unittest.TestCase):
                     data_root / "2026" / "pdfs" / f"{doc_id}.pdf"
                 )[1]
             ]
-            fund_rows = _parse_pdf_worker(data_root / "2025" / "pdfs" / "20030630.pdf")[
-                1
+            fund_pdf = data_root / "2025" / "pdfs" / "20030630.pdf"
+            original_sha = hashlib.sha256(fund_pdf.read_bytes()).hexdigest()
+            self.assertEqual(
+                original_sha,
+                "d5e5acfb93b1e3fc8720212a4159927526039b57155f3e5a1a23ea297a4b79b6",
+            )
+            # copy:no blocks Camelot, but other engines do read this artifact.
+            # Their conflicting fund rows and incomplete OCR cannot prove a
+            # complete rowset. Never admit the phantom layout row to get green.
+            with self.assertRaisesRegex(
+                ParserCascadeError,
+                re.escape(
+                    f"{fund_pdf}: unresolved parser completeness: "
+                    f"lattice: Text extraction is not allowed: {fund_pdf}; "
+                    f"stream: Text extraction is not allowed: {fund_pdf}"
+                ) + "$",
+            ):
+                _parse_pdf_worker(fund_pdf)
+            # Retain the original ticker-corruption check on the independent
+            # backend reading, without treating that reading as accepted.
+            fund_rows = [
+                row for table in extract_tables_with_pdftotext(fund_pdf)
+                for row in parse_pdf_table(table)
             ]
+            self.assertEqual(len(fund_rows), 2)
+            self.assertEqual([row["ticker"] for row in fund_rows], ["AVGO", None])
+            self.assertEqual(hashlib.sha256(fund_pdf.read_bytes()).hexdigest(), original_sha)
         finally:
             if previous is None:
                 os.environ.pop("PTR_SKIP_DOCLING", None)
@@ -696,24 +724,24 @@ class TestParsing(unittest.TestCase):
                 for row in option_rows
             ],
             [
-                ("GOOGL", "option", None, None),
-                ("AMZN", "option", None, None),
+                ("GOOGL", "call", 150.0, "01/16/2026"),
+                ("AMZN", "call", 150.0, "01/16/2026"),
                 ("AAPL", "stock", None, None),
                 ("NVDA", "stock", None, None),
                 ("NVDA", "stock", None, None),
                 ("NVDA", "option", None, None),
                 ("PANW", "stock", None, None),
-                ("TEM", "option", None, None),
-                ("VST", "option", None, None),
+                ("TEM", "call", 20.0, "01/16/2026"),
+                ("VST", "call", 50.0, "01/16/2026"),
             ],
         )
         self.assertEqual(
             [(row["ticker"], row["instrument_type"]) for row in nokia_rows],
             [
                 ("BAC", "stock"),
-                ("GE", "option"),
-                ("NOK", "option"),
-                ("NOK", "option"),
+                ("GE", "put"),
+                ("NOK", "put"),
+                ("NOK", "call"),
                 ("NOK", "stock"),
                 ("NOK", "stock"),
             ],

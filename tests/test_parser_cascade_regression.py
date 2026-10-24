@@ -17,6 +17,7 @@ content-duplicated lot (the two SOUTH CAROLINA lots differ by amount band).
 """
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -143,6 +144,55 @@ class TestPdftotextLayoutRepair(unittest.TestCase):
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][3], "12/28/2016")
+
+    def test_actual_pdf_metadata_and_wrapped_tickers_without_local_corpus(self):
+        # Minimal, synthetic PDF: real text extraction, no mocked backend and
+        # no dependency on gitignored disclosure artifacts or a PDF generator.
+        from analyzer.parsing import extract_tables_with_pdftotext
+
+        lines = [
+            "Energy Transfer Partners P 12/1/2016 12/2/2016 $1,001 - $15,000",
+            "TRANSFER PARTNERS (ETP)",
+            "FILING STATUS: New",
+            "SUBHOLDING OF: Example Trust",
+            "Phillips 66 Partners P 12/3/2016 12/4/2016 $1,001 - $15,000",
+            "PARTNERS (PSXP)",
+            "FILING STATUS: New",
+        ]
+        text = "BT /F1 10 Tf 40 750 Td 14 TL\n" + "\n".join(
+            "(" + line.replace("(", r"\(").replace(")", r"\)") + ") Tj T*"
+            for line in lines
+        ) + "\nET"
+        stream = text.encode("ascii")
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        ]
+        content = b"%PDF-1.4\n"
+        offsets = [0]
+        for index, obj in enumerate(objects, 1):
+            offsets.append(len(content))
+            content += f"{index} 0 obj\n".encode() + obj + b"\nendobj\n"
+        xref = len(content)
+        content += b"xref\n0 6\n0000000000 65535 f \n"
+        content += b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets[1:])
+        content += f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = Path(directory) / "metadata-layout.pdf"
+            pdf.write_bytes(content)
+            rows = [
+                row for table in extract_tables_with_pdftotext(pdf)
+                for row in parse_pdf_table(table)
+            ]
+            _, cascade_rows, _ = parser_cascade._parse_text_only_worker(pdf)
+        self.assertEqual([row["ticker"] for row in rows], ["ETP", "PSXP"])
+        self.assertEqual([row["ticker"] for row in cascade_rows], ["ETP", "PSXP"])
+        self.assertEqual(len({parser_cascade._transaction_identity(row) for row in rows}), 2)
+        self.assertTrue(all("FILING STATUS" not in row["asset_description"] for row in rows))
 
 
 class TestStrictSubsetEscalation(unittest.TestCase):

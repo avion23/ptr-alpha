@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from analyzer import parser_cascade as cascade
+from analyzer.parsing import cascade
 from analyzer.parsing.pdfplumber_parser import extract_tables_with_pdfplumber
 from analyzer.parsing.pdftotext_parser import _parse_pdftotext_lines
 from analyzer.parsing.rows import parse_pdf_table

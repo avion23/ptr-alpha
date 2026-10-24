@@ -19,7 +19,7 @@ if __name__ == "__main__":
         if _entry not in sys.path:
             sys.path.insert(0, _entry)
 
-from analyzer.parser_cascade import _is_valid_pdf, _parse_pdf_worker
+from analyzer.parsing.cascade import _is_valid_pdf, _parse_pdf_worker
 
 
 def _parse_one(path_string: str) -> dict:
@@ -31,7 +31,7 @@ def _parse_one(path_string: str) -> dict:
 
     diagnostic_stream = io.StringIO()
     handler = logging.StreamHandler(diagnostic_stream)
-    cascade_logger = logging.getLogger("analyzer.parser_cascade")
+    cascade_logger = logging.getLogger("analyzer.parsing.cascade")
     previous_level = cascade_logger.level
     cascade_logger.addHandler(handler)
     cascade_logger.setLevel(logging.DEBUG)

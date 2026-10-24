@@ -26,7 +26,7 @@ The system must never backdate knowledge to the private transaction date.
 | --- | --- |
 | `src/analyzer/download.py` | House metadata/PDF acquisition and parse orchestration |
 | `src/analyzer/senate_efd.py` | Official Senate eFD ingestion |
-| `src/analyzer/parser_cascade.py`, `src/analyzer/parsing/` | Deterministic PDF/table/OCR extraction |
+| `src/analyzer/parsing/cascade.py`, `src/analyzer/parsing/` | Deterministic PDF/table/OCR extraction |
 | `src/analyzer/database.py`, `*_repository.py` | DuckDB persistence, canonical views, generations, provenance, prices, parse reports |
 | `src/analyzer/member_ranking/buyer_scoring.py` | Shared public-equity candidate universe and distinct-buyer scorer for live analysis and replay |
 | `src/analyzer/setups.py`, `actors.py`, `positions.py` | Separate actor-weighted setup ranking with holdings, event, and price gates |

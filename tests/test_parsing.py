@@ -639,7 +639,7 @@ class TestParsing(unittest.TestCase):
         import hashlib
         import re
 
-        from analyzer.parser_cascade import ParserCascadeError, _parse_pdf_worker
+        from analyzer.parsing.cascade import ParserCascadeError, _parse_pdf_worker
         from analyzer.parsing import extract_tables_with_pdftotext
 
         data_root = next(
@@ -1172,7 +1172,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertEqual(len(raised.exception.partial_tables[0]), 3)
 
     def test_text_backends_collect_rows_from_every_table(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         tables = [["first"], ["second"]]
 
@@ -1193,7 +1193,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             )
 
     def test_cascade_compares_all_text_engines_and_prefers_complete_trusted_tie(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         def transactions(count):
             return [
@@ -1226,7 +1226,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertTrue(any(item.startswith("row_disagreement:") for item in engines))
 
     def test_trusted_text_pair_does_not_hide_camelot_complement(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         def tx(asset):
             return {
@@ -1254,7 +1254,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertIn("won:reconciled_complete_ocr", engines)
 
     def test_nonempty_but_incomplete_ocr_does_not_authorize_text_union(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         def tx(asset):
             return {
@@ -1278,7 +1278,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 parser_cascade._parse_pdf_worker(Path("incomplete-ocr.pdf"))
 
     def test_cascade_reconciles_complementary_rows_only_after_complete_ocr(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         def tx(asset):
             return {
@@ -1303,7 +1303,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertIn("won:reconciled_complete_ocr", engines)
 
     def test_disjoint_or_single_text_engine_is_unresolved_without_complete_ocr(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         def tx(asset):
             return {
@@ -1340,7 +1340,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                     parser_cascade._parse_pdf_worker(Path("uncertain.pdf"))
 
     def test_seventeen_plus_three_complements_require_complete_ocr(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         def tx(index):
             return {
@@ -1368,7 +1368,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertIn("won:reconciled_complete_ocr", engines)
 
     def test_multiplicity_expansion_requires_distinct_source_positions(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         row = {
             "ticker": "AAPL",
@@ -1394,7 +1394,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 )
 
     def test_repeated_source_coordinate_cannot_promote_extra_lots(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         row = {
             "transaction_date": "2024-01-01",
@@ -1416,7 +1416,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 parser_cascade._parse_pdf_worker(Path("repeated-coordinate.pdf"))
 
     def test_reconciliation_preserves_maximum_source_lot_multiplicity(self):
-        from analyzer import parser_cascade
+        from analyzer.parsing import cascade as parser_cascade
 
         row = {
             "transaction_date": "2024-01-01",
@@ -1506,7 +1506,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertEqual(killed, {"pgid": 4242, "sig": signal.SIGKILL})
 
     def test_known_real_pdf_hash_and_row_count_canaries(self):
-        from analyzer.parser_cascade import _parse_pdf_worker
+        from analyzer.parsing.cascade import _parse_pdf_worker
 
         data_dir_value = os.environ.get("PTR_OCR_CANARY_DATA")
         if not data_dir_value:

@@ -6,7 +6,7 @@ Second-pass resolver for House PTR PDFs that the bulk first pass
 unresolved.  Every engine is local and free; no paid API is called.
 
 Documented flow (mirrors the accepted "stragglers re-parsed with Docling"
-cascade, scripts/reparse_all.py + src/analyzer/parser_cascade.py):
+cascade, scripts/reparse_all.py + src/analyzer/parsing/cascade.py):
 
   For each unresolved doc:
     (1) image preprocessing pipeline (ocrmypdf-style): pdftoppm render at
@@ -144,7 +144,7 @@ from analyzer.parsing import (  # noqa: E402
     _parse_markdown_tables,
     parse_pdf_table,
 )
-from analyzer.parser_cascade import (  # noqa: E402
+from analyzer.parsing.cascade import (  # noqa: E402
     ParserCascadeError,
     _parse_pdf_worker,
 )

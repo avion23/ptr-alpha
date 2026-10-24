@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from analyzer import parser_cascade
+from analyzer.parsing import cascade as parser_cascade
 from analyzer.parsing.cells import _extract_ticker
 from analyzer.parsing.pdftotext_parser import _parse_pdftotext_lines
 from analyzer.parsing.rows import parse_pdf_table

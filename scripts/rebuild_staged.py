@@ -59,7 +59,7 @@ from analyzer.download import (  # noqa: E402
     prepare_house_parse_batch,
 )
 from analyzer.models import FilingType  # noqa: E402
-from analyzer import parser_cascade as _parser_cascade  # noqa: E402
+from analyzer.parsing import cascade as _parser_cascade  # noqa: E402
 from analyzer.price_repository import previous_nyse_session  # noqa: E402
 from analyzer.price_snapshot import create_snapshot, save_snapshot  # noqa: E402
 from analyzer.settings import DataSettings, Settings  # noqa: E402

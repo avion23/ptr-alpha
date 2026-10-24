@@ -63,7 +63,7 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[list[list[str]]]:
     if not layout_rows:
         return tables_out
 
-    from analyzer.parser_cascade import (
+    from analyzer.parsing.cascade import (
         _candidate_counts,
         _multiset_subset,
         _transaction_identity,

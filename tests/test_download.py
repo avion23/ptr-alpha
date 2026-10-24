@@ -688,7 +688,7 @@ def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
     import logging
 
     from analyzer import download as download_module
-    from analyzer.parser_cascade import ParserCascadeError
+    from analyzer.parsing.cascade import ParserCascadeError
 
     source, db = _source(tmp_path)
     pdf_dir = tmp_path / "2021" / "pdfs"
@@ -748,7 +748,7 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
     tmp_path, monkeypatch
 ):
     from analyzer import download as download_module
-    from analyzer.parser_cascade import ParserCascadeError
+    from analyzer.parsing.cascade import ParserCascadeError
     from scripts.audit_generation import (
         check_house_generation_activation,
         check_parse_counts_match_persisted,
@@ -1076,7 +1076,7 @@ def test_tolerant_parse_watchdog_budget_fires_and_restores_state(
 
 def test_tolerant_worker_keeps_backend_timeout_as_parse_failure(tmp_path, monkeypatch):
     from analyzer import download as download_module
-    from analyzer import parser_cascade
+    from analyzer.parsing import cascade as parser_cascade
 
     pdf_path = tmp_path / "backend-timeout.pdf"
     pdf_path.write_bytes(b"%PDF-backend-timeout\n%%EOF")

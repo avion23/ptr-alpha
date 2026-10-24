@@ -107,7 +107,6 @@ import json
 import math
 import os
 import random
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -184,11 +183,14 @@ def audit_history_sha256(results: list[dict]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _invalidate_audit_report(data_dir: str | Path) -> None:
+def _invalidate_audit_report(
+    data_dir: str | Path,
+    reason: str = "audit verdict history changed; rerun audit report",
+) -> None:
     _atomic_write_json(
         staging_root(data_dir) / REPORT_STATE_NAME,
         _incomplete_state_payload(
-            "audit verdict history changed; rerun audit report",
+            reason,
             max_rate=DEFAULT_MAX_RATE,
             sample_file=None,
         ),
@@ -631,7 +633,59 @@ def write_sample_file(
         "frame_counts_by_stratum": frame_counts_by_stratum,
         "lot": freeze_lot(records, sample),
     }
-    _atomic_write_json(out_path, envelope)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def existing_lot() -> dict | None:
+        try:
+            if out_path.is_symlink():
+                raise FileExistsError(f"refusing symlink frozen sample lot: {out_path}")
+            existing = json.loads(out_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise FileExistsError(
+                f"frozen sample lot already exists but is unreadable: {out_path}"
+            ) from exc
+
+        def identity(payload):
+            return json.dumps(
+                {key: value for key, value in payload.items() if key != "created_at_utc"},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+
+        if not isinstance(existing, dict) or identity(existing) != identity(envelope):
+            raise FileExistsError(
+                f"frozen sample lot is immutable: {out_path}; choose a new seed"
+            )
+        return existing
+
+    existing = existing_lot()
+    if existing is not None:
+        return existing
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.", dir=out_path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(envelope, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            # Same-directory hard-link publication is atomic and never replaces.
+            os.link(temporary_name, out_path)
+        except FileExistsError:
+            existing = existing_lot()
+            if existing is None:
+                raise
+            return existing
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
     return envelope
 
 
@@ -798,7 +852,11 @@ def emit_review_bundle(
             continue
         doc_dir = bundle_root / str(year) / doc_id
         if doc_dir.exists():
-            shutil.rmtree(doc_dir)
+            problems.append(
+                f"{doc_id}: legacy review bundle already exists; use --attempt-scoped "
+                "for a new immutable bundle"
+            )
+            continue
         doc_dir.mkdir(parents=True)
         try:
             from scripts.glm_stage import ArtifactRequest, manifest_artifact
@@ -824,22 +882,71 @@ def emit_review_bundle(
 
 
 def cmd_sample(args) -> int:
-    records = load_staging_records(args.data_dir)
-    sample = build_sample(records, args.per_year, args.seed)
-    root = staging_root(args.data_dir)
-    out_path = root / f"audit-sample-{args.seed}.json"
-    envelope = write_sample_file(
-        records,
-        sample,
-        seed=args.seed,
-        per_year=args.per_year,
-        out_path=out_path,
-    )
-    problems = (
-        emit_review_bundle(sample, args.data_dir, attempt_scoped=args.attempt_scoped)
-        if not args.no_bundle
-        else []
-    )
+    # Match record/report/promote lock order: audit-root first, then documents.
+    with audit_operation_lock(args.data_dir):
+        from scripts.glm_stage import document_publication_lock
+
+        discovered = load_staging_records(args.data_dir)
+        identities = sorted(
+            (int(year), str(record["doc_id"])) for year, record in discovered
+        )
+        with ExitStack() as stack:
+            for year, doc_id in identities:
+                stack.enter_context(
+                    document_publication_lock(args.data_dir, year, doc_id)
+                )
+            records = load_staging_records(args.data_dir)
+            current_identities = sorted(
+                (int(year), str(record["doc_id"])) for year, record in records
+            )
+            if current_identities != identities:
+                print(
+                    "ERROR: staging population changed while sample locks were acquired; retry",
+                    file=sys.stderr,
+                )
+                return 2
+
+            sample = build_sample(records, args.per_year, args.seed)
+            root = staging_root(args.data_dir)
+            out_path = root / f"audit-sample-{args.seed}.json"
+            lot_existed = out_path.exists()
+            if not lot_existed:
+                _invalidate_audit_report(
+                    args.data_dir, "frozen sample lot changed; rerun audit report"
+                )
+            try:
+                envelope = write_sample_file(
+                    records,
+                    sample,
+                    seed=args.seed,
+                    per_year=args.per_year,
+                    out_path=out_path,
+                )
+            except FileExistsError as exc:
+                _invalidate_audit_report(
+                    args.data_dir, "frozen sample lot changed; rerun audit report"
+                )
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 2
+
+            bundle_sample = sample
+            if lot_existed and not args.attempt_scoped:
+                bundle_root = root / "audit-review"
+                bundle_sample = [
+                    item for item in sample
+                    if not (
+                        bundle_root / str(item["year"]) / str(item["doc_id"])
+                    ).exists()
+                ]
+            problems = (
+                emit_review_bundle(
+                    bundle_sample,
+                    args.data_dir,
+                    attempt_scoped=args.attempt_scoped,
+                )
+                if not args.no_bundle
+                else []
+            )
     flagged_in_lot = sum(
         1
         for item in envelope["lot"]
@@ -1104,19 +1211,30 @@ def load_sample_lot(
 
     Returns (envelope, None) or (None, refusal reason).
     """
+    payload, error, _, _ = _read_sample_lot(data_dir, path)
+    return payload, error
+
+
+def _read_sample_lot(
+    data_dir: str | Path, path: str | Path | None
+) -> tuple[dict | None, str | None, str | None, Path | None]:
     root = staging_root(data_dir)
     if path is None:
         candidates = sorted(root.glob("audit-sample-*.json"))
         if not candidates:
-            return None, "no frozen sample lot (run `sample` first)"
+            return None, "no frozen sample lot (run `sample` first)", None, None
         path = candidates[-1]
     path = Path(path)
-    if not path.exists():
-        return None, f"sample file not found: {path}"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return None, f"unreadable sample file {path}: {exc}"
+        contents = path.read_bytes()
+    except FileNotFoundError:
+        return None, f"sample file not found: {path}", None, path
+    except OSError as exc:
+        return None, f"unreadable sample file {path}: {exc}", None, path
+    try:
+        payload = json.loads(contents)
+    except (ValueError, UnicodeDecodeError) as exc:
+        return None, f"unreadable sample file {path}: {exc}", None, path
     if not (
         isinstance(payload, dict)
         and payload.get("schema") == SAMPLE_SCHEMA
@@ -1125,8 +1243,24 @@ def load_sample_lot(
         return None, (
             f"{path.name} predates frozen-lot format ({SAMPLE_SCHEMA}); "
             "re-run `sample`"
-        )
-    return payload, None
+        ), None, path
+    return payload, None, hashlib.sha256(contents).hexdigest(), path
+
+
+def sample_lot_file_sha256(
+    data_dir: str | Path, sample_file: str | None
+) -> str | None:
+    """Hash the exact valid frozen-lot bytes referenced by report state."""
+    if (
+        not isinstance(sample_file, str)
+        or not sample_file
+        or Path(sample_file).name != sample_file
+    ):
+        return None
+    _, error, digest, _ = _read_sample_lot(
+        data_dir, staging_root(data_dir) / sample_file
+    )
+    return digest if error is None else None
 
 
 def load_promoted_doc_ids(data_dir: str | Path = "data") -> set[str]:
@@ -1754,6 +1888,7 @@ def _incomplete_state_payload(
     sample_file: str | None,
     omission_check_status: str = "not_run",
     history_sha256: str | None = None,
+    sample_sha256: str | None = None,
 ) -> dict:
     return {
         "schema": REPORT_STATE_SCHEMA,
@@ -1787,6 +1922,7 @@ def _incomplete_state_payload(
         "pooled_rate": None,
         "pooling_method": None,
         "sample_file": sample_file,
+        "sample_file_sha256": sample_sha256,
         "audit_history_sha256": history_sha256,
         "outside_lot": [],
         "outside_lot_critical_failures": [],
@@ -1808,7 +1944,9 @@ def cmd_report(args) -> int:
 
 def _cmd_report_locked(args) -> int:
     root = staging_root(args.data_dir)
-    envelope, lot_error = load_sample_lot(args.data_dir, args.sample_file)
+    envelope, lot_error, sample_sha256, sample_path = _read_sample_lot(
+        args.data_dir, args.sample_file
+    )
 
     if envelope is None:
         state_payload = _incomplete_state_payload(
@@ -1826,9 +1964,7 @@ def _cmd_report_locked(args) -> int:
         print("budget_met cannot be computed; canonical promotion must not proceed.")
         return 2
 
-    sample_file_name = Path(args.sample_file).name if args.sample_file else (
-        sorted(root.glob("audit-sample-*.json"))[-1].name
-    )
+    sample_file_name = sample_path.name if sample_path is not None else None
     history_sha256 = None
     try:
         records = load_staging_records(args.data_dir)
@@ -1863,6 +1999,7 @@ def _cmd_report_locked(args) -> int:
                 "configured" if args.ground_truth_dir is not None else "not_run"
             ),
             history_sha256=history_sha256,
+            sample_sha256=sample_sha256,
         )
         _atomic_write_json(root / REPORT_STATE_NAME, state_payload)
         print(CAVEAT)
@@ -2065,6 +2202,7 @@ def _cmd_report_locked(args) -> int:
             "pooled_rate": _num_or_none(report["pooled_rate"]),
             "pooling_method": report["pooling_method"],
             "sample_file": sample_file_name,
+            "sample_file_sha256": sample_sha256,
             "audit_history_sha256": history_sha256,
             "outside_lot": report["outside_lot"],
             "outside_lot_critical_failures": [
@@ -2132,6 +2270,7 @@ def _cmd_report_locked(args) -> int:
             "pooled_rate": _num_or_none(report["pooled_rate"]),
             "pooling_method": report["pooling_method"],
             "sample_file": sample_file_name,
+            "sample_file_sha256": sample_sha256,
             "audit_history_sha256": history_sha256,
             "outside_lot": report["outside_lot"],
             "outside_lot_critical_failures": [

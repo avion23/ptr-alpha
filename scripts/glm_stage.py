@@ -128,6 +128,7 @@ from scripts.audit_sample import (  # noqa: E402
     audit_history_sha256,
     audit_operation_lock,
     load_audit_results as load_audit_results,
+    sample_lot_file_sha256,
     staged_record_sha256 as audit_staged_record_sha256,
 )
 
@@ -1385,7 +1386,9 @@ def audit_report_state(data_dir: str | Path = "data") -> dict | None:
 
 
 def _audit_report_gate_issue(
-    state: dict | None, current_history_sha256: str | None
+    state: dict | None,
+    current_history_sha256: str | None,
+    current_sample_file_sha256: str | None = None,
 ) -> str | None:
     """Reason the landed report does not prove the promotion preconditions."""
     if state is None:
@@ -1451,18 +1454,45 @@ def _audit_report_gate_issue(
         return "complete report has no trusted audit history binding"
     if report_history_sha256 != current_history_sha256:
         return "audit history changed since report; rerun audit_sample.py report"
+    sample_file = state.get("sample_file")
+    if (
+        not isinstance(sample_file, str)
+        or not sample_file
+        or Path(sample_file).name != sample_file
+    ):
+        return "complete report has no trusted frozen sample-lot identity"
+    report_sample_sha256 = state.get("sample_file_sha256")
+    if not isinstance(report_sample_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", report_sample_sha256
+    ) is None:
+        return "complete report has no trusted frozen sample-lot binding"
+    if (
+        not isinstance(current_sample_file_sha256, str)
+        or report_sample_sha256 != current_sample_file_sha256
+    ):
+        return "frozen sample lot changed or is missing since report; rerun audit_sample.py report"
     return None
 
 
 def audit_report_gate_open(
-    state: dict | None, current_history_sha256: str | None
+    state: dict | None,
+    current_history_sha256: str | None,
+    current_sample_file_sha256: str | None = None,
 ) -> bool:
     """True only when a complete report proves a met budget with valid metrics."""
-    return _audit_report_gate_issue(state, current_history_sha256) is None
+    return (
+        _audit_report_gate_issue(
+            state, current_history_sha256, current_sample_file_sha256
+        )
+        is None
+    )
 
 
 def _audit_report_refusal(
-    state: dict | None, data_dir: str | Path, current_history_sha256: str | None
+    state: dict | None,
+    data_dir: str | Path,
+    current_history_sha256: str | None,
+    current_sample_file_sha256: str | None,
 ) -> str:
     """Explain the report-level promotion refusal, including available math."""
     if state is None:
@@ -1494,7 +1524,9 @@ def _audit_report_refusal(
             prefix = "audit report is complete but the critical error budget is not met"
         else:
             prefix = "audit report state is complete but " + str(
-                _audit_report_gate_issue(state, current_history_sha256)
+                _audit_report_gate_issue(
+                    state, current_history_sha256, current_sample_file_sha256
+                )
             )
     else:
         prefix = f"audit report state {report_state!r} is not recognized"
@@ -1791,10 +1823,20 @@ def _promote_docs_locked(
         # refuses the whole batch — the per-record audit: pass stamp alone
         # says nothing about the population.
         state = audit_report_state(data_dir)
-        if not audit_report_gate_open(state, current_history_sha256):
+        current_sample_sha256 = sample_lot_file_sha256(
+            data_dir, state.get("sample_file") if state is not None else None
+        )
+        if not audit_report_gate_open(
+            state, current_history_sha256, current_sample_sha256
+        ):
             if doc_ids:
                 print(
-                    _audit_report_refusal(state, data_dir, current_history_sha256),
+                    _audit_report_refusal(
+                        state,
+                        data_dir,
+                        current_history_sha256,
+                        current_sample_sha256,
+                    ),
                     flush=True,
                 )
                 return {

@@ -65,6 +65,10 @@ def test_attempt_bundles_preserve_old_evidence(data_dir, monkeypatch):
     assert audit_sample.emit_review_bundle(sample, data_dir) == []
     legacy = root / "audit-review/2024/attempt"
     legacy_bytes = {p.relative_to(legacy): p.read_bytes() for p in legacy.rglob("*") if p.is_file()}
+    assert audit_sample.emit_review_bundle(sample, data_dir)
+    assert legacy_bytes == {
+        p.relative_to(legacy): p.read_bytes() for p in legacy.rglob("*") if p.is_file()
+    }
     audit_sample.record_verdict(data_dir, "attempt", "fail", "old pixels failed")
     audit_sample.record_verdict(data_dir, "attempt", "pass", "old attempt rechecked")
     old_history = audit_sample.load_audit_results(data_dir)
@@ -1455,7 +1459,7 @@ def test_state_file_gains_critical_failures_and_keeps_v2_contract(data_dir, caps
     state = json.loads(
         (audit_sample.staging_root(data_dir) / "audit-report-state.json").read_text()
     )
-    # Unchanged audit-report-state-v2 contract keys:
+    # Existing audit-report-state-v2 keys remain alongside the exact lot hash:
     for key in (
         "schema", "state", "reason", "budget_met", "lot_size", "audited",
         "failure_count", "unresolved_count", "unresolved", "repaired_count",
@@ -1463,7 +1467,10 @@ def test_state_file_gains_critical_failures_and_keeps_v2_contract(data_dir, caps
         "pooling_method", "sample_file", "caveat", "generated_at_utc",
     ):
         assert key in state, key
-    assert state["schema"] == "audit-report-state-v2"  # UNCHANGED
+    assert state["schema"] == "audit-report-state-v2"
+    assert state["sample_file_sha256"] == hashlib.sha256(
+        (audit_sample.staging_root(data_dir) / state["sample_file"]).read_bytes()
+    ).hexdigest()
     assert state["state"] == "complete"
     assert state["budget_met"] is False
     assert state["rate"] == 0.0          # budget math is critical-only
@@ -1512,6 +1519,52 @@ def test_new_critical_verdict_invalidates_population_report(data_dir, capsys):
     assert fresh["upper_bound"] > 0.01
     assert fresh["audit_history_sha256"] == audit_sample.audit_history_sha256(
         audit_sample.load_audit_results(data_dir)
+    )
+
+
+def test_same_seed_sample_is_immutable_and_stale_report_must_be_rerun(
+    data_dir, capsys
+):
+    from scripts import glm_stage
+
+    doc_ids = _complete_99_doc_census(data_dir)
+    root = audit_sample.staging_root(data_dir)
+    sample_path = root / "audit-sample-1.json"
+    original_lot = sample_path.read_bytes()
+
+    # An identical retry reuses the original envelope bytes.
+    assert audit_sample.main(
+        [
+            "--data-dir", str(data_dir), "sample", "--seed", "1",
+            "--per-year", "99", "--no-bundle",
+        ]
+    ) == 0
+    assert sample_path.read_bytes() == original_lot
+
+    write_record(data_dir, make_record("new-unresolved"))
+    history_path = root / audit_sample.AUDIT_RESULTS_NAME
+    history_before = history_path.read_bytes()
+    assert audit_sample.main(
+        [
+            "--data-dir", str(data_dir), "sample", "--seed", "1",
+            "--per-year", "100", "--no-bundle",
+        ]
+    ) == 2
+    assert "immutable" in capsys.readouterr().err
+    assert sample_path.read_bytes() == original_lot
+    assert history_path.read_bytes() == history_before
+
+    # A conflicting resample invalidates the old completion; only a fresh
+    # report over the still-frozen original lot can reopen promotion.
+    blocked = glm_stage.promote_docs(2024, [doc_ids[0]], data_dir=data_dir)
+    assert blocked["refused"] == 1 and blocked["promoted"] == 0
+    assert audit_sample.main(["--data-dir", str(data_dir), "report"]) == 0
+    state = glm_stage.audit_report_state(data_dir)
+    assert state["sample_file_sha256"] == hashlib.sha256(original_lot).hexdigest()
+    assert glm_stage.audit_report_gate_open(
+        state,
+        audit_sample.audit_history_sha256(audit_sample.load_audit_results(data_dir)),
+        audit_sample.sample_lot_file_sha256(data_dir, state["sample_file"]),
     )
 
 
@@ -1676,6 +1729,7 @@ def test_incomplete_state_payload_carries_severity_keys(data_dir, capsys):
     assert state["budget_met"] is None
     assert "no frozen sample lot" in state["reason"]
     assert state["completion_reasons"] == [state["reason"]]
+    assert state["sample_file_sha256"] is None
 
 
 @pytest.mark.parametrize(

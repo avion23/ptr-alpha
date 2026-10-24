@@ -727,6 +727,31 @@ def write_report_state(data_dir, *, state="complete", budget_met=True, schema="a
         return
     lot_size = 299 if state == "complete" and budget_met is True else 30
     audited = lot_size if state == "complete" else lot_size - 1
+    sample_file = "audit-sample-promotion-fixture.json"
+    envelope = {
+        "schema": audit_sample.SAMPLE_SCHEMA,
+        "seed": 8675309,
+        "per_year": lot_size,
+        "created_at_utc": "2026-10-24T00:00:00Z",
+        "frame_counts_by_year": {"2024": lot_size},
+        "frame_counts_by_stratum": {
+            "2024": {"flagged": 0, "unflagged": lot_size}
+        },
+        "lot": [
+            {
+                "doc_id": f"fixture-{index}",
+                "year": 2024,
+                "staged_record_sha256": "0" * 64,
+                "model": "synthetic",
+                "prompt_sha256": "0" * 64,
+                "parser_version": "synthetic",
+                "asset_review": False,
+            }
+            for index in range(lot_size)
+        ],
+    }
+    sample_bytes = json.dumps(envelope, indent=2, sort_keys=True).encode("utf-8")
+    (root / sample_file).write_bytes(sample_bytes)
     payload = {
         "schema": schema,
         "state": state,
@@ -750,6 +775,8 @@ def write_report_state(data_dir, *, state="complete", budget_met=True, schema="a
         "audit_history_sha256": audit_sample.audit_history_sha256(
             audit_sample.load_audit_results(data_dir)
         ),
+        "sample_file": sample_file,
+        "sample_file_sha256": hashlib.sha256(sample_bytes).hexdigest(),
         "omission_check_status": "not_run",
     }
     (root / "audit-report-state.json").write_text(
@@ -1049,6 +1076,31 @@ def test_promote_refuses_malformed_or_foreign_report_state(data_dir, fake_insert
     assert result["promoted"] == 1
     out = capsys.readouterr().out
     assert "WARNING" in out and "WITHOUT a passing pixel audit" in out
+
+
+def test_promote_refuses_sample_lot_replaced_after_report(
+    data_dir, fake_insert, capsys
+):
+    stage_one_audited(data_dir, 2024, "lot-binding", GLM_OUTPUT_ONE_ROW)
+    state_path = glm_stage.staging_root(data_dir) / "audit-report-state.json"
+    state_bytes = state_path.read_bytes()
+    state = json.loads(state_bytes)
+    lot_path = glm_stage.staging_root(data_dir) / state["sample_file"]
+    original_lot = lot_path.read_bytes()
+    history_path = glm_stage.staging_root(data_dir) / "audit-results.json"
+    history_bytes = history_path.read_bytes()
+
+    replacement = json.loads(original_lot)
+    replacement["frame_counts_by_year"]["2024"] += 1
+    lot_path.write_text(json.dumps(replacement), encoding="utf-8")
+    result = glm_stage.promote_docs(2024, ["lot-binding"], data_dir=data_dir)
+
+    assert result["refused"] == 1 and result["promoted"] == 0
+    assert fake_insert == []
+    assert state_path.read_bytes() == state_bytes
+    assert history_path.read_bytes() == history_bytes
+    assert "frozen sample lot changed or is missing since report" in capsys.readouterr().out
+    assert state["sample_file_sha256"] == hashlib.sha256(original_lot).hexdigest()
 
 
 def test_promote_report_state_gate_refuses_whole_batch(data_dir, fake_insert, capsys):

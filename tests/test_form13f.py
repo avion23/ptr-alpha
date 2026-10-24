@@ -11,6 +11,7 @@ from analyzer.form13f import (
     ThirteenFError,
     ThirteenFSource,
     _parse_information_table,
+    _recent_quarters,
     candidates_from_increases,
 )
 from analyzer.pipeline import eligible_events
@@ -568,3 +569,66 @@ def test_fetch_all_increases_isolates_manager_failures(tmp_path, monkeypatch, ca
     with pytest.raises(ThirteenFError, match="All 13F managers failed"):
         source.fetch_all_increases()
     source.close()
+
+
+@pytest.mark.parametrize("field", ["reportDate", "filingDate"])
+def test_malformed_latest_qualifying_date_fails_manager_without_older_fallback(
+    tmp_path, monkeypatch, caplog, field
+):
+    source = ThirteenFSource(
+        data_dir=tmp_path / "data",
+        db=object(),
+        watchlist={"VST": {"VISTRA"}},
+        managers={"bad": {"name": "Bad Manager", "cik": "1234567"}},
+    )
+    recent = {
+        "form": ["13F-HR", "13F-HR", "13F-HR"],
+        "reportDate": ["2025-03-31", "2025-06-30", "2025-09-30"],
+        "filingDate": ["2025-05-15", "2025-08-14", "2025-11-14"],
+        "accessionNumber": [
+            "0001234567-25-000001",
+            "0001234567-25-000002",
+            "0001234567-25-000003",
+        ],
+    }
+    recent[field][-1] = "not-a-date"
+    monkeypatch.setattr(
+        source,
+        "_load_submissions",
+        lambda cik: {"filings": {"recent": recent}},
+    )
+    filings_loaded = []
+    monkeypatch.setattr(
+        source,
+        "_load_filing",
+        lambda cik, filing: filings_loaded.append(filing),
+    )
+
+    try:
+        with pytest.raises(
+            ThirteenFError,
+            match=f"invalid {field}.*0001234567-25-000003",
+        ):
+            _recent_quarters({"filings": {"recent": recent}})
+        with pytest.raises(ThirteenFError, match="All 13F managers failed"):
+            source.fetch_all_increases()
+        assert filings_loaded == []
+        assert "Skipping 13F manager bad" in caplog.text
+    finally:
+        source.close()
+
+
+def test_latest_qualifying_filing_without_accession_does_not_fall_back():
+    recent = {
+        "form": ["13F-HR", "13F-HR", "13F-HR"],
+        "reportDate": ["2025-03-31", "2025-06-30", "2025-09-30"],
+        "filingDate": ["2025-05-15", "2025-08-14", "2025-11-14"],
+        "accessionNumber": [
+            "0001234567-25-000001",
+            "0001234567-25-000002",
+            "",
+        ],
+    }
+
+    with pytest.raises(ThirteenFError, match="missing accession.*2025-09-30"):
+        _recent_quarters({"filings": {"recent": recent}})

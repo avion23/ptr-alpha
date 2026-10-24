@@ -246,11 +246,23 @@ def _recent_quarters(submissions: dict) -> list[dict[str, str]]:
             continue
         try:
             report_date = date.fromisoformat(report_raw)
+        except (TypeError, ValueError) as exc:
+            raise ThirteenFError(
+                "SEC submissions index has invalid reportDate for 13F filing "
+                f"{accession!r}: {report_raw!r}"
+            ) from exc
+        try:
             filing_date = date.fromisoformat(filed_raw)
-        except (TypeError, ValueError):
-            continue
-        if not accession:
-            continue
+        except (TypeError, ValueError) as exc:
+            raise ThirteenFError(
+                "SEC submissions index has invalid filingDate for 13F filing "
+                f"{accession!r}: {filed_raw!r}"
+            ) from exc
+        if not isinstance(accession, str) or not accession.strip():
+            raise ThirteenFError(
+                "SEC submissions filing index has a missing accession for 13F "
+                f"report date {report_date.isoformat()}"
+            )
         try:
             _accession_digits(accession)
         except ValueError:

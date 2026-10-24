@@ -9,6 +9,57 @@ import pandas as pd
 import pytest
 
 
+@pytest.mark.parametrize("bad_row", ["invalid_date", "missing_metadata"])
+def test_house_persistence_rejects_consolidation_loss_in_both_paths(tmp_path, bad_row):
+    from analyzer.download import HouseTransactionSource, _validated_pdf_sha256
+    from scripts import rebuild_staged
+
+    pdf = tmp_path / "loss.pdf"
+    pdf.write_bytes(b"%PDF-test\n%%EOF")
+    row = dict(
+        ticker="AAPL", transaction_type="Purchase", transaction_date="2026-01-02",
+        source_row_id="pdftotext:l1", asset_description="Apple Inc. (AAPL)",
+    )
+    rows = [row, dict(row, transaction_date="invalid", source_row_id="pdftotext:l2")]
+    metadata = {"loss": {"First": "Test", "Last": "Member", "FilingDate": "2026-01-03"}}
+    if bad_row == "missing_metadata":
+        metadata = {}
+    results = [(pdf, rows, ["won:pdftotext"])]
+    captured = []
+
+    class FakeDatabase:
+        def count_transactions_for_docs(self, _docs):
+            return {}
+
+        def replace_transactions_for_docs(self, frame, **kwargs):
+            captured.append((frame.copy(), kwargs))
+            return SimpleNamespace(
+                by_doc_total={}, by_doc_source={}, total_current_rows=0, total_raw_rows=0
+            )
+
+    db = FakeDatabase()
+    source = object.__new__(HouseTransactionSource)
+    source.db = db
+    source._save_parse_results(2026, results, metadata, "generation")
+    rebuild_staged._persist_house_parse_batch(
+        db, year=2026, ingestion_generation="generation", member_lookup=metadata,
+        artifact_hashes={"loss": _validated_pdf_sha256(pdf)}, results=results,
+    )
+    assert len(captured) == 2
+    for frame, kwargs in captured:
+        assert frame.empty
+        assert kwargs["attempted_doc_ids"] == ["loss"]
+        assert kwargs["replacement_doc_ids"] == []
+        run, = kwargs["parse_runs"]
+        assert run["status"] == "error"
+        assert run["raw_row_count"] == 2
+        assert run["transaction_count"] == 0
+        assert run["error_message"] == "rows lost during consolidation"
+        assert run["artifact_sha256"] == _validated_pdf_sha256(pdf)
+        assert run["ingestion_generation"] == "generation"
+    assert captured[0][1] == captured[1][1]
+
+
 def test_house_parse_source_recognizes_all_validated_llm_backends():
     from scripts import rebuild_staged
 
@@ -246,7 +297,8 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
         ),
     )
     monkeypatch.setattr(rebuild_staged, "_parse_pdf_worker", fake_parser)
-    monkeypatch.setattr(rebuild_staged, "consolidate_transactions", fake_consolidate)
+    from analyzer import download
+    monkeypatch.setattr(download, "consolidate_transactions", fake_consolidate)
     monkeypatch.setattr(
         rebuild_staged, "preserve_existing_fields", lambda dataframe, _db: dataframe
     )

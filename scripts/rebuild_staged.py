@@ -55,14 +55,13 @@ from analyzer.download import (  # noqa: E402
     _build_member_lookup,
     _engine_error_detail,
     _filter_existing_pdfs,
-    _invalid_consolidated_house_docs,
     _tolerant_parse_pdf_worker as _production_tolerant_parse_worker,
     _validated_pdf_sha256,
     preserve_existing_fields,
+    prepare_house_parse_batch,
 )
 from analyzer.models import FilingType  # noqa: E402
 from analyzer import parser_cascade as _parser_cascade  # noqa: E402
-from analyzer.parsing import consolidate_transactions  # noqa: E402
 from analyzer.price_repository import previous_nyse_session  # noqa: E402
 from analyzer.price_snapshot import create_snapshot, save_snapshot  # noqa: E402
 from analyzer.settings import DataSettings, Settings  # noqa: E402
@@ -352,24 +351,12 @@ def _persist_house_parse_batch(
             )
         )
 
-    df = consolidate_transactions(pdf_transactions, member_lookup)
-    invalid_docs = _invalid_consolidated_house_docs(df)
-    batch_failure = invalid_docs.pop("<batch>", None)
-    if batch_failure:
-        invalid_docs = {doc_id: batch_failure for doc_id, _, _ in parse_attempts}
-    if invalid_docs and not df.empty:
-        df = df[~df["doc_id"].astype(str).isin(invalid_docs)].copy()
+    df, invalid_docs = prepare_house_parse_batch(
+        pdf_transactions, member_lookup, ingestion_generation, artifact_hashes
+    )
     transaction_counts = (
         df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
     )
-    if not df.empty:
-        df["chamber"] = "house"
-        df["ingestion_generation"] = ingestion_generation
-        df["source_record_id"] = df["doc_id"].astype(str)
-        df["official_filing_date"] = df["disclosure_date"]
-        df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
-        if "asset_description" in df.columns:
-            df["raw_asset_description"] = df["asset_description"]
     df = preserve_existing_fields(df, db)
 
     parse_runs = []

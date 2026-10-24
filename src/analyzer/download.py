@@ -73,6 +73,39 @@ def _invalid_consolidated_house_docs(df: pd.DataFrame) -> dict[str, list[str]]:
     return {doc_id: sorted(reasons) for doc_id, reasons in failures.items()}
 
 
+def prepare_house_parse_batch(
+    pdf_transactions: dict[Path, list[dict]],
+    member_lookup: dict,
+    ingestion_generation: str,
+    artifact_hashes: dict[str, str | None],
+) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """Prepare complete document rowsets and their immutable source bindings.
+
+    Consolidation can discard dates or documents without metadata. Such loss
+    invalidates the whole document, never just the discarded rows.
+    """
+    df = consolidate_transactions(pdf_transactions, member_lookup)
+    invalid_docs = _invalid_consolidated_house_docs(df)
+    batch_failure = invalid_docs.pop("<batch>", None)
+    if batch_failure:
+        invalid_docs = {path.stem: list(batch_failure) for path in pdf_transactions}
+    counts = df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
+    for path, rows in pdf_transactions.items():
+        if counts.get(path.stem, 0) < len(rows):
+            invalid_docs.setdefault(path.stem, []).append("rows lost during consolidation")
+    if invalid_docs and not df.empty:
+        df = df[~df["doc_id"].astype(str).isin(invalid_docs)].copy()
+    if not df.empty:
+        df["chamber"] = "house"
+        df["ingestion_generation"] = ingestion_generation
+        df["source_record_id"] = df["doc_id"].astype(str)
+        df["official_filing_date"] = df["disclosure_date"]
+        df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
+        if "asset_description" in df.columns:
+            df["raw_asset_description"] = df["asset_description"]
+    return df, invalid_docs
+
+
 @dataclass(frozen=True, slots=True)
 class HouseFetchSummary:
     archive_year: int
@@ -828,36 +861,15 @@ class HouseTransactionSource(TransactionSource):
             raw_transaction_counts[doc_id] = len(transactions)
             parse_attempts.append((doc_id, engines_attempted))
 
-        df = consolidate_transactions(pdf_transactions, member_lookup)
-        invalid_docs = _invalid_consolidated_house_docs(df)
-        batch_failure = invalid_docs.pop("<batch>", None)
-        if batch_failure:
-            invalid_docs = {
-                doc_id: batch_failure
-                for doc_id, _engines in parse_attempts
-            }
-        consolidated_counts = (
-            df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
-        )
-        for doc_id, raw_count in raw_transaction_counts.items():
-            if consolidated_counts.get(doc_id, 0) < raw_count:
-                invalid_docs.setdefault(doc_id, []).append("rows lost during consolidation")
-        if invalid_docs and not df.empty:
-            df = df[~df["doc_id"].astype(str).isin(invalid_docs)].copy()
-        transaction_counts = (
-            df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
-        )
         artifact_hashes = {
             path.stem: _validated_pdf_sha256(path) for path in pdf_transactions
         }
-        if not df.empty:
-            df["chamber"] = "house"
-            df["ingestion_generation"] = ingestion_generation
-            df["source_record_id"] = df["doc_id"].astype(str)
-            df["official_filing_date"] = df["disclosure_date"]
-            df["artifact_sha256"] = df["doc_id"].astype(str).map(artifact_hashes)
-            if "asset_description" in df.columns:
-                df["raw_asset_description"] = df["asset_description"]
+        df, invalid_docs = prepare_house_parse_batch(
+            pdf_transactions, member_lookup, ingestion_generation, artifact_hashes
+        )
+        transaction_counts = (
+            df["doc_id"].astype(str).value_counts().to_dict() if not df.empty else {}
+        )
         parse_runs = [
             dict(
                 doc_id=doc_id,

@@ -19,7 +19,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -209,6 +211,7 @@ class OcrStagingCheckTest(TestCase):
         self.assertIn(
             "audit pass/critical-fail/cosmetic-fail/unaudited 1/1/0/1", check.detail
         )
+        self.assertIn("promoted-consumed-absent 0", check.detail)
 
     def test_retry_starvation_fails_and_names_the_artifact(self):
         root = Path(tempfile.mkdtemp())
@@ -267,12 +270,128 @@ class OcrStagingCheckTest(TestCase):
         root = Path(tempfile.mkdtemp())
         _write_record(root, 2017, "70001")  # still present (refused/consumed lag)
         (root / "promoted.jsonl").write_text(
-            json.dumps({"doc_id": "70002", "year": 2017}) + "\n"
-            + json.dumps({"doc_id": "70001", "year": 2017}) + "\n",
+            " \t\n"
+            + json.dumps({"doc_id": "70002", "year": 2017})
+            + "\n"
+            + "  \n"
+            + json.dumps({"doc_id": "70001", "year": 2017})
+            + "\n",
             encoding="utf-8",
         )
         check = doctor_mod._ocr_staging_check(root, now=NOW)
         self.assertIn("promoted-consumed-absent 1", check.detail)
+
+    def test_malformed_promoted_journal_is_unknown_not_zero(self):
+        for bad_entry in ('{"doc_id":', "{}", "[]"):
+            with self.subTest(bad_entry=bad_entry):
+                root = Path(tempfile.mkdtemp()) / "staging"
+                journal = root / "promoted.jsonl"
+                journal.parent.mkdir(parents=True)
+                journal.write_text(
+                    json.dumps({"doc_id": "70002", "year": 2017})
+                    + "\n \t\n"
+                    + bad_entry
+                    + "\n",
+                    encoding="utf-8",
+                )
+                before = journal.read_bytes()
+
+                check = doctor_mod._ocr_staging_check(root, now=NOW)
+
+                self.assertEqual("UNKNOWN", check.mark, check.detail)
+                self.assertFalse(check.ok)
+                self.assertIn("promoted-consumed-absent UNKNOWN", check.detail)
+                self.assertIn("promoted journal evidence unavailable", check.detail)
+                self.assertNotIn("promoted-consumed-absent 0", check.detail)
+                self.assertEqual(
+                    before, journal.read_bytes(), "monitor must not rewrite the journal"
+                )
+
+    def test_unreadable_existing_promoted_journal_is_unknown(self):
+        root = Path(tempfile.mkdtemp())
+        journal = root / "promoted.jsonl"
+        journal.write_text('{"doc_id": "70002", "year": 2017}\n', encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def unreadable(path, *args, **kwargs):
+            if path == journal:
+                raise PermissionError("fixture denied")
+            return original_read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", new=unreadable):
+            check = doctor_mod._ocr_staging_check(root, now=NOW)
+
+        self.assertEqual("UNKNOWN", check.mark, check.detail)
+        self.assertFalse(check.ok)
+        self.assertIn("cannot read", check.detail)
+        self.assertNotIn("promoted-consumed-absent 0", check.detail)
+
+    def test_journal_unknown_fails_doctor_without_skipping_other_checks(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "promoted.jsonl").write_text('{"doc_id":\n', encoding="utf-8")
+        passing = FreshnessCheck("fixture.monitoring", "still checked", True)
+
+        with (
+            patch.object(doctor_mod, "monitoring_checks", return_value=[passing]),
+            patch.object(
+                doctor_mod,
+                "_stale_artifacts",
+                return_value=FreshnessCheck("artifacts.consumed", "clear", True),
+            ),
+            patch.object(
+                doctor_mod,
+                "_staging_backup_check",
+                return_value=FreshnessCheck("staging.backup.freshness", "fresh", True),
+            ),
+            patch.object(
+                doctor_mod,
+                "_ocr_cron_check",
+                return_value=FreshnessCheck("cron.ocr.engagement", "fresh", True),
+            ),
+            patch.object(
+                doctor_mod,
+                "_heartbeat",
+                return_value=FreshnessCheck("doctor.alive", "fresh", True),
+            ),
+            patch.object(
+                doctor_mod,
+                "_crontab_contract",
+                return_value=FreshnessCheck("crontab.contract", "synthetic", True),
+            ),
+        ):
+            results = doctor_mod.check(
+                SimpleNamespace(), staging_root=root, ocr_log_root=root / "logs"
+            )
+
+        self.assertEqual(
+            [
+                "fixture.monitoring",
+                "artifacts.consumed",
+                "staging.ocr.backlog",
+                "staging.backup.freshness",
+                "cron.ocr.engagement",
+                "doctor.alive",
+                "crontab.contract",
+            ],
+            [result.name for result in results],
+        )
+        self.assertEqual("UNKNOWN", results[2].mark)
+
+        output = StringIO()
+        connection = SimpleNamespace(close=lambda: None)
+        with (
+            patch.object(doctor_mod, "CANONICAL", SimpleNamespace(exists=lambda: True)),
+            patch("duckdb.connect", return_value=connection),
+            patch.object(doctor_mod, "check", return_value=results),
+            redirect_stdout(output),
+        ):
+            exit_code = doctor_mod.main()
+
+        self.assertEqual(1, exit_code, output.getvalue())
+        self.assertIn("[UNKNOWN] staging.ocr.backlog", output.getvalue())
+        self.assertIn("[PASS] fixture.monitoring", output.getvalue())
+        self.assertIn("[PASS] cron.ocr.engagement", output.getvalue())
+        self.assertIn("doctor: 1 CHECK(S) FAILED", output.getvalue())
 
 
 def test_staging_audit_severity_split_uses_sticky_worst_and_legacy_default(tmp_path):

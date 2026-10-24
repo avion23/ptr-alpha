@@ -277,7 +277,7 @@ def _ocr_staging_check(
         ):
             audit_starved.append(_rel(path))
 
-    consumed_absent = _promoted_consumed_absent(staging_root)
+    consumed_absent, promoted_journal_error = _promoted_consumed_absent(staging_root)
 
     summary = (
         f"{counts['success']} success / {counts['no_txs']} no_txs / "
@@ -286,7 +286,11 @@ def _ocr_staging_check(
         + f"; audit pass/critical-fail/cosmetic-fail/unaudited "
         f"{audit_pass}/{audit_critical_fail}/{audit_cosmetic_fail}/{audit_none}"
         + "; cosmetic fails are tracked, not blocking"
-        + f"; promoted-consumed-absent {consumed_absent}"
+        + (
+            f"; promoted-consumed-absent {consumed_absent}"
+            if consumed_absent is not None
+            else "; promoted-consumed-absent UNKNOWN"
+        )
     )
     asset_review_info = (
         f"\n    INFO: asset_review flagged, unaudited: {asset_review_unaudited} "
@@ -312,6 +316,12 @@ def _ocr_staging_check(
             f"{OCR_AUDIT_MAX_AGE_DAYS}d still audit:null — pixel-audit "
             "sampler not running (scripts/audit_sample.py sample / record): "
             + ", ".join(audit_starved[:3])
+        )
+    if promoted_journal_error is not None:
+        details = [f"promoted journal evidence unavailable: {promoted_journal_error}"]
+        details.extend(problems)
+        return FreshnessCheck.unknown(
+            name, summary + "; " + "; ".join(details) + asset_review_info
         )
     if problems:
         return FreshnessCheck(
@@ -371,29 +381,59 @@ def _staging_backup_check(
     )
 
 
-def _promoted_consumed_absent(staging_root: Path) -> int:
-    """Promoted-journal entries whose staging record is gone (consumed)."""
+def _promoted_consumed_absent(
+    staging_root: Path,
+) -> tuple[int | None, str | None]:
+    """Return consumed count, or an evidence error for an unusable journal."""
     journal = staging_root / "promoted.jsonl"
     try:
         lines = journal.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return 0
+    except FileNotFoundError:
+        try:
+            journal.lstat()
+        except FileNotFoundError:
+            # append_promoted_journal creates this optional file on the first
+            # successful promotion; before then, the contractually empty history is 0.
+            return 0, None
+        except OSError as exc:
+            return None, f"cannot inspect {_rel(journal)} ({type(exc).__name__}: {exc})"
+        return None, f"cannot read {_rel(journal)} (FileNotFoundError: broken link)"
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"cannot read {_rel(journal)} ({type(exc).__name__}: {exc})"
     consumed = 0
-    for line in lines:
+    for line_number, line in enumerate(lines, start=1):
         line = line.strip()
         if not line:
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        year = entry.get("year")
-        doc_id = entry.get("doc_id")
-        if year is None or doc_id is None:
-            continue
-        if not (staging_root / str(year) / f"{doc_id}.json").exists():
+        except json.JSONDecodeError as exc:
+            return None, (
+                f"invalid JSON in {_rel(journal)} line {line_number} ({exc.msg})"
+            )
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("year"), (int, str))
+            or isinstance(entry.get("year"), bool)
+            or not str(entry["year"]).isdecimal()
+            or not isinstance(entry.get("doc_id"), str)
+            or not entry["doc_id"].strip()
+        ):
+            return None, (
+                f"invalid promotion entry in {_rel(journal)} line {line_number} "
+                "(expected year and doc_id)"
+            )
+        staged_record = staging_root / str(entry["year"]) / f"{entry['doc_id']}.json"
+        try:
+            staged_record.lstat()
+        except FileNotFoundError:
             consumed += 1
-    return consumed
+        except OSError as exc:
+            return None, (
+                f"cannot inspect {_rel(staged_record)} "
+                f"({type(exc).__name__}: {exc})"
+            )
+    return consumed, None
 
 
 def _ocr_cron_check(

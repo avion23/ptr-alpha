@@ -41,9 +41,6 @@ import duckdb
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if __name__ == "__main__":
-    # Standalone rebuilds disable Docling before importing the parser. A module
-    # import must not change parser policy for its caller.
-    os.environ["PTR_SKIP_DOCLING"] = "1"
     for _entry in (str(_REPO_ROOT), str(_REPO_ROOT / "src")):
         if _entry not in sys.path:
             sys.path.insert(0, _entry)

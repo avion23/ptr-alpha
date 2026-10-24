@@ -47,6 +47,7 @@ from analyzer.price_snapshot import create_snapshot, save_snapshot
 # Price pipeline code whose behavior is bound into the snapshot.
 CODE_FILES = [
     "src/analyzer/price_source.py",
+    "src/analyzer/price_index.py",
     "src/analyzer/persistence/price_repository.py",
     "src/analyzer/price_snapshot.py",
     "src/analyzer/ticker_resolver.py",

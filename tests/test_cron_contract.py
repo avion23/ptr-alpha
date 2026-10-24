@@ -9,6 +9,8 @@ canonical consumption/verification step."""
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 from unittest import TestCase
@@ -91,6 +93,121 @@ class WrapperContractTest(TestCase):
         # The doctor still sees each flat per-attempt temp DB for freshness.
         doctor = (ROOT / "scripts" / "doctor.py").read_text()
         self.assertIn('PRICES_CRON.glob("*/prices.duckdb")', doctor)
+
+    def test_price_attempts_survive_faults_and_concurrent_retries(self):
+        source = (CRON_DIR / "weekly_prices.sh").read_text()
+        self.assertNotIn("prune_runs", source)
+        self.assertNotIn("rm -rf", source)
+        self.assertIn("operator-explicit GC only", source)
+
+        # Execute only a copy under a temporary repo; fake git/date/python3
+        # ensure no live refresh, database, cron, or network access occurs.
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            wrapper = repo / "cron" / "weekly_prices.sh"
+            wrapper.parent.mkdir()
+            shutil.copy2(CRON_DIR / "weekly_prices.sh", wrapper)
+            bin_dir = repo / "fake-bin"
+            bin_dir.mkdir()
+            fake_python = bin_dir / "python3"
+            fake_python.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys, time\n"
+                "from pathlib import Path\n"
+                "script = Path(sys.argv[1]).name\n"
+                "if script == 'refresh_prices.py' and os.getenv('BARRIER_DIR'):\n"
+                "    db = Path(sys.argv[sys.argv.index('--db') + 1])\n"
+                "    barrier = Path(os.environ['BARRIER_DIR'])\n"
+                "    (barrier / (db.parent.name + '.ready')).touch()\n"
+                "    deadline = time.monotonic() + 10\n"
+                "    while len(list(barrier.glob('*.ready'))) < 2:\n"
+                "        if time.monotonic() > deadline: sys.exit(98)\n"
+                "        time.sleep(0.01)\n"
+                "rc = os.getenv('REFRESH_RC' if script == 'refresh_prices.py' "
+                "else 'SNAPSHOT_RC', '0')\n"
+                "sys.exit(int(rc))\n"
+            )
+            fake_python.chmod(0o755)
+            (bin_dir / "git").write_text("#!/bin/sh\nprintf 'testsha\\n'\n")
+            (bin_dir / "date").write_text(
+                "#!/bin/sh\n"
+                'case "$*" in\n'
+                "  *+%Y%m%dT%H%M%S*) printf '20261024T120000\\n' ;;\n"
+                "  *--iso-8601=seconds*) printf '2026-10-24T12:00:00+00:00\\n' ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n"
+            )
+            (bin_dir / "git").chmod(0o755)
+            (bin_dir / "date").chmod(0o755)
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if "proxy" not in key.lower()
+            }
+            env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+            log_root = repo / "data" / "logs" / "prices-cron"
+            old_names = [
+                f"20261024T120000-{suffix}"
+                for suffix in ("aaaaaa", "bbbbbb", "cccccc", "dddddd", "eeeeee")
+            ]
+            for index, name in enumerate(old_names):
+                attempt = log_root / name
+                (attempt / "snapshot").mkdir(parents=True)
+                (attempt / "report.json").write_text(f"report-{index}")
+                (attempt / "snapshot" / "manifest.json").write_text(f"bundle-{index}")
+                (attempt / "run.log").write_text(f"evidence-{index}")
+                if index == 0:
+                    (attempt / "ACTIVE").write_text("still running")
+
+            preserved = {
+                path.relative_to(log_root): path.read_bytes()
+                for path in log_root.rglob("*")
+                if path.is_file()
+            }
+
+            fault = subprocess.run(
+                ["bash", str(wrapper)],
+                cwd=repo,
+                env={**env, "REFRESH_RC": "17"},
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(17, fault.returncode, fault.stderr)
+            snapshot_fault = subprocess.run(
+                ["bash", str(wrapper)],
+                cwd=repo,
+                env={**env, "SNAPSHOT_RC": "19"},
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(19, snapshot_fault.returncode, snapshot_fault.stderr)
+
+            barrier = repo / "barrier"
+            barrier.mkdir()
+            concurrent_env = {**env, "BARRIER_DIR": str(barrier)}
+            runs = [
+                subprocess.Popen(
+                    ["bash", str(wrapper)],
+                    cwd=repo,
+                    env=concurrent_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+            for run in runs:
+                stdout, stderr = run.communicate(timeout=20)
+                self.assertEqual(0, run.returncode, f"{stdout}\n{stderr}")
+
+            self.assertEqual(2, len(list(barrier.glob("*.ready"))))
+            for relative, contents in preserved.items():
+                self.assertEqual(contents, (log_root / relative).read_bytes())
+            self.assertEqual(9, len([p for p in log_root.iterdir() if p.is_dir()]))
 
     def test_every_declared_job_is_a_tracked_executable_wrapper(self):
         for schedule, target in _job_lines():

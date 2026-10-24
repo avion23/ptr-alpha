@@ -44,6 +44,13 @@ Made checkable by four mechanisms, none of which rely on vigilance:
   04:30 UTC Tue/Sat acquisition. With the latest completed weekday close
   one day old at refresh, the worst pre-refresh age is four calendar days;
   `tests/test_cron_contract.py` checks the schedule arithmetic.
+- Price attempts are never automatically pruned. Failed retries, same-day
+  attempts, reports, logs, and snapshot generations remain under
+  `data/logs/prices-cron`; storage therefore grows until an operator resolves
+  the ambiguous historical retention policy. No automatic or repository
+  cleanup command is provided. Any future GC requires explicit operator
+  authorization and must preserve original attempt/evidence and avoid active
+  attempts or artifact-bound generations.
 - `cron/daily_doctor.sh` — daily 05:00 UTC: doctor + escalation wiring.
 
 Historical wrappers remain under `data/logs/*` (gitignored, retired).

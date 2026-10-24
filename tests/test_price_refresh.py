@@ -520,6 +520,34 @@ class SnapshotManifestTests(unittest.TestCase):
         finally:
             mod.REPO_ROOT = original_root
 
+    def test_default_code_hash_tracks_price_index_normalization(self):
+        self._seed()
+        self._close_db()
+        code_root = self.tmp / "repo"
+        normalization_owner = "src/analyzer/price_index.py"
+        self.assertIn(normalization_owner, snapshot_prices.CODE_FILES)
+        for rel in snapshot_prices.CODE_FILES + snapshot_prices.CONFIG_FILES:
+            path = code_root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("before")
+
+        with patch.object(snapshot_prices, "REPO_ROOT", code_root):
+            first = self._manifest(out_dir=self.tmp / "normalization-v1")
+            owner_path = code_root / normalization_owner
+            self.assertEqual(
+                first["code_files"][normalization_owner],
+                hashlib.sha256(owner_path.read_bytes()).hexdigest(),
+            )
+            owner_path.write_text("normalization semantic change")
+            second = self._manifest(
+                generation="gen-test-20240105-r2",
+                out_dir=self.tmp / "normalization-v2",
+            )
+
+        self.assertNotEqual(first["code_hash"], second["code_hash"])
+        self.assertEqual(first["data_hash"], second["data_hash"])
+        self.assertEqual(first["value_hash"], second["value_hash"])
+
     def test_snapshot_opens_db_read_only(self):
         self._seed()
         self._close_db()

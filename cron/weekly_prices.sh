@@ -21,25 +21,7 @@ exec >>"$run_dir/run.log" 2>&1
 printf 'prices cron start: %s UTC (repo %s @ %s)\n' \
     "$(date -u --iso-8601=seconds)" "$repo" "$git_sha"
 cd "$repo"
-
-prune_runs() {
-    local -a run_names=()
-    local run_name kept=0
-
-    mapfile -t run_names < <(
-        find "$log_root" -mindepth 1 -maxdepth 1 -type d \
-            \( -name '????????' -o -name '????????T??????-??????' \) -printf '%f\n' |
-            sort -r
-    )
-    for run_name in "${run_names[@]}"; do
-        [[ "$run_name" =~ ^([0-9]{8}|[0-9]{8}T[0-9]{6}-[A-Za-z0-9]{6})$ ]] || continue
-        ((kept += 1))
-        if (( kept > 4 )); then
-            printf 'prune: %s\n' "$log_root/$run_name"
-            rm -rf -- "${log_root:?}/$run_name"
-        fi
-    done
-}
+printf 'attempt retention: automatic pruning disabled; operator-explicit GC only\n'
 
 # --merge-into is the consumption step: the refresh is only successful when
 # its prices and dividends are verifiably present in canonical afterwards
@@ -53,7 +35,6 @@ if python3 scripts/refresh_prices.py \
 else
     refresh_rc=$?
     printf 'refresh failed: exit=%d; snapshot skipped\n' "$refresh_rc"
-    prune_runs
     exit "$refresh_rc"
 fi
 
@@ -65,9 +46,7 @@ if python3 scripts/snapshot_prices.py \
 else
     snapshot_rc=$?
     printf 'snapshot failed: exit=%d\n' "$snapshot_rc"
-    prune_runs
     exit "$snapshot_rc"
 fi
 
-prune_runs
 printf 'prices cron complete: %s UTC\n' "$(date -u --iso-8601=seconds)"

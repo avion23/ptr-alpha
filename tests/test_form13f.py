@@ -125,6 +125,7 @@ def test_fetch_records_acceptance(tmp_path, monkeypatch, quarter_xmls, discovery
             return SimpleNamespace(content=quarter_xmls[int(record["accessionNumber"].replace("-", "") in url)].encode())
         monkeypatch.setattr(source, "_load_submissions", submissions)
         monkeypatch.setattr(source, "_get", get)
+        monkeypatch.setattr("analyzer.form13f.resolve_asset_ticker", lambda _issuer: "VST")
         try:
             if discovery:
                 rows = source._manager_increases("test", source.managers["test"])
@@ -267,8 +268,19 @@ def test_empty_information_table_fails_closed():
         )
 
 
+def test_information_table_rejects_dtd_and_entities():
+    hostile = (
+        '<!DOCTYPE informationTable [<!ENTITY issuer "Vistra Corp">]>'
+        '<informationTable><infoTable><nameOfIssuer>&issuer;</nameOfIssuer>'
+        "<cusip>111111111</cusip><sshPrnamt>1</sshPrnamt>"
+        "</infoTable></informationTable>"
+    )
+    with pytest.raises(ThirteenFError, match="Unparseable 13F information table"):
+        _parse_information_table(hostile)
+
+
 @pytest.mark.parametrize(
-    "case", ["numeric", "ambiguous", "no_table", "malformed", "too_many"]
+    "case", ["numeric", "ambiguous", "no_table", "malformed", "malicious", "too_many"]
 )
 def test_load_filing_identifies_schema_not_filename(
     tmp_path, quarter_xmls, monkeypatch, case
@@ -288,6 +300,11 @@ def test_load_filing_identifies_schema_not_filename(
         contents["53405.xml"] = b"<unrelated><infoTable /></unrelated>"
     elif case == "malformed":
         contents["primary_doc.xml"] = b"<broken"
+    elif case == "malicious":
+        contents["primary_doc.xml"] = (
+            b'<!DOCTYPE submission [<!ENTITY x "unsafe">]>'
+            b'<edgarSubmission>&x;</edgarSubmission>'
+        )
     elif case == "too_many":
         index["directory"]["item"].extend({"name": f"{n}.xml"} for n in range(7))
     calls = []
@@ -312,6 +329,7 @@ def test_load_filing_identifies_schema_not_filename(
                 "ambiguous": "2 information-table",
                 "no_table": "0 information-table",
                 "malformed": "Unparseable SEC filing XML",
+                "malicious": "Unparseable SEC filing XML",
                 "too_many": "Too many XML files",
             }[case]
             with pytest.raises(ThirteenFError, match=match):

@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import xml.etree.ElementTree as ET
 from datetime import date
 from pathlib import Path
 
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 import pandas as pd
 import requests
 
@@ -136,8 +137,8 @@ def _local_name(tag: str) -> str:
 
 def _parse_information_table(xml_content: bytes | str) -> dict[str, dict[str, object]]:
     try:
-        root = ET.fromstring(xml_content)
-    except (ET.ParseError, TypeError, ValueError) as exc:
+        root = ET.fromstring(xml_content, forbid_dtd=True)
+    except (ET.ParseError, DefusedXmlException, TypeError, ValueError) as exc:
         raise ThirteenFError(f"Unparseable 13F information table: {exc}") from exc
 
     entries = [
@@ -404,8 +405,8 @@ class ThirteenFSource(TransactionSource):
             report_url = f"{directory_url}/{name}"
             content = self._get(report_url).content
             try:
-                root = ET.fromstring(content)
-            except (ET.ParseError, TypeError, ValueError) as exc:
+                root = ET.fromstring(content, forbid_dtd=True)
+            except (ET.ParseError, DefusedXmlException, TypeError, ValueError) as exc:
                 raise ThirteenFError(f"Unparseable SEC filing XML: {report_url}") from exc
             if root.tag == (
                 "{http://www.sec.gov/edgar/document/thirteenf/informationtable}"

@@ -8,6 +8,7 @@ import pytest
 from analyzer.form4 import (
     Form4Error,
     Form4Source,
+    _is_officer_filing,
     candidates_from_sweep,
     parse_form4_xml,
 )
@@ -181,6 +182,22 @@ def test_empty_xml_transaction_date_keeps_missing_field_error(burke_form4_xml):
             xml, accession="0000000001-26-000001", source_report_path="source.xml",
             official_filing_date=date(2026, 9, 2),
         )
+
+
+def test_form4_parsers_reject_dtd_and_entities(burke_form4_xml):
+    hostile = burke_form4_xml.replace(
+        b'?>', b'?>\n<!DOCTYPE ownershipDocument [<!ENTITY x "James Burke">]>', 1
+    ).replace(b"<rptOwnerName>James Burke", b"<rptOwnerName>&x;")
+
+    with pytest.raises(Form4Error, match="not valid XML"):
+        parse_form4_xml(
+            hostile,
+            accession="0000000001-26-000001",
+            source_report_path="source.xml",
+            official_filing_date=date(2026, 9, 2),
+        )
+    with pytest.raises(Form4Error, match="not valid XML"):
+        _is_officer_filing(hostile)
 
 
 def parse(content):

@@ -6,13 +6,14 @@ import logging
 import os
 import re
 import time
-import xml.etree.ElementTree as ET
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 import pandas as pd
 import requests
 
@@ -247,8 +248,8 @@ def parse_form4_xml(
     only purchases initiate setups downstream.
     """
     try:
-        root = ET.fromstring(content)
-    except ET.ParseError as exc:
+        root = ET.fromstring(content, forbid_dtd=True)
+    except (ET.ParseError, DefusedXmlException) as exc:
         raise Form4Error(f"Form 4 {accession} is not valid XML: {exc}") from exc
     if _local_name(root.tag) != "ownershipDocument":
         raise Form4Error(f"SEC filing {accession} is not an ownership document")
@@ -366,8 +367,8 @@ def _ownership_xml(content: bytes) -> bytes:
 
 def _is_officer_filing(content: bytes) -> bool:
     try:
-        root = ET.fromstring(content)
-    except ET.ParseError as exc:
+        root = ET.fromstring(content, forbid_dtd=True)
+    except (ET.ParseError, DefusedXmlException) as exc:
         raise Form4Error(f"SEC filing is not valid XML: {exc}") from exc
     if _local_name(root.tag) != "ownershipDocument":
         raise Form4Error("SEC filing is not an ownership document")

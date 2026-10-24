@@ -148,8 +148,7 @@ def private_read_spy(monkeypatch):
 def fake_insert(monkeypatch):
     """Monkeypatch the canonical insert path + generation resolution.
 
-    The fake mirrors the real contract: it fills ``report["outcome"]`` with
-    the explicit committed outcome and returns the committed count.
+    The fake returns the canonical structured outcome directly.
     """
     calls = []
 
@@ -166,7 +165,6 @@ def fake_insert(monkeypatch):
         ingestion_generation,
         engine_model,
         checkpoint=True,
-        report=None,
     ):
         calls.append(
             {
@@ -182,22 +180,44 @@ def fake_insert(monkeypatch):
                 "engine_model": engine_model,
             }
         )
-        if report is not None:
-            report["outcome"] = ocr_zero_rows.InsertOutcome(
-                status="no_txs" if not transactions else "success",
-                inserted=len(transactions),
-                expected=raw_count if raw_count is not None else len(transactions),
-                committed=True,
-            )
-        return len(transactions)
+        return ocr_zero_rows.InsertOutcome(
+            status="no_txs" if not transactions else "success",
+            inserted=len(transactions),
+            expected=raw_count if raw_count is not None else len(transactions),
+            committed=True,
+        )
 
-    monkeypatch.setattr(ocr_zero_rows, "insert_transactions", _insert)
+    monkeypatch.setattr(ocr_zero_rows, "insert_transactions_outcome", _insert)
+    monkeypatch.setattr(
+        ocr_zero_rows, "insert_transactions",
+        lambda *a, **kw: pytest.fail("promotion called the integer compatibility adapter"),
+    )
     monkeypatch.setattr(
         ocr_zero_rows,
         "resolve_ingestion_generation",
         lambda db_path, doc_id, year, sha: "gen-1",
     )
     return calls
+
+
+def test_artifact_request_normalizes_only_identity_without_changing_evidence():
+    legacy = {
+        "doc_id": "legacy", "year": 2024, "pdf_sha256": "digest",
+        "rows": [["original evidence"]], "audit": "pass",
+    }
+    raw = json.dumps(legacy)
+    record = glm_stage.decode_staging_record(raw)
+    request = glm_stage.ArtifactRequest.from_record(record)
+    assert request.resolver_fields() == {
+        "doc_id": "legacy", "year": 2024, "archive_year": None,
+        "artifact_sha256": "digest", "ingestion_generation": None,
+    }
+    assert json.dumps(record) == raw  # no defaults added to content-bound JSON
+    record["artifact_sha256"] = "different"
+    with pytest.raises(RuntimeError, match="conflicting"):
+        glm_stage.ArtifactRequest.from_record(record)
+    with pytest.raises(RuntimeError, match="conflicting"):
+        glm_stage.ArtifactRequest.from_manifest(record)
 
 
 # --------------------------------------------------------------------------
@@ -605,7 +625,6 @@ def test_error_records_carry_the_classified_kind(data_dir):
     from analyzer.vision_engines import (
         TransientVisionBError,
         TruncatedCompletion,
-        VisionBConfigError,
         VisionBPermanentError,
         VisionBQuotaError,
     )
@@ -925,18 +944,16 @@ def test_promote_partial_insert_keeps_and_marks_record(data_dir, monkeypatch, ca
     audit_sample.record_verdict(data_dir, "2005", "pass", "updated test fixture")
 
     def partial_insert(*args, **kwargs):
-        report = kwargs.get("report")
-        if report is not None:
-            report["outcome"] = ocr_zero_rows.InsertOutcome(
-                status="partial",
-                inserted=1,
-                expected=2,
-                committed=True,
-                rejections={"impossible_chronology": 1},
-            )
-        return 1
+        assert "report" not in kwargs
+        return ocr_zero_rows.InsertOutcome(
+            status="partial",
+            inserted=1,
+            expected=2,
+            committed=True,
+            rejections={"impossible_chronology": 1},
+        )
 
-    monkeypatch.setattr(ocr_zero_rows, "insert_transactions", partial_insert)
+    monkeypatch.setattr(ocr_zero_rows, "insert_transactions_outcome", partial_insert)
     monkeypatch.setattr(
         ocr_zero_rows,
         "resolve_ingestion_generation",
@@ -971,17 +988,14 @@ def test_promote_member_rejection_is_not_no_txs(data_dir, monkeypatch, capsys):
     audit_sample.record_verdict(data_dir, "2006", "pass", "updated test fixture")
 
     def identity_reject(*args, **kwargs):
-        report = kwargs.get("report")
-        if report is not None:
-            report["outcome"] = ocr_zero_rows.InsertOutcome(
-                status="rejected",
-                inserted=0,
-                expected=0,
-                rejections={"member_mismatch": 1},
-            )
-        return 0
+        return ocr_zero_rows.InsertOutcome(
+            status="rejected",
+            inserted=0,
+            expected=0,
+            rejections={"member_mismatch": 1},
+        )
 
-    monkeypatch.setattr(ocr_zero_rows, "insert_transactions", identity_reject)
+    monkeypatch.setattr(ocr_zero_rows, "insert_transactions_outcome", identity_reject)
     monkeypatch.setattr(
         ocr_zero_rows,
         "resolve_ingestion_generation",
@@ -1040,9 +1054,9 @@ def test_promote_keeps_record_when_insert_rejects(data_dir, monkeypatch):
     stage_one_audited(data_dir, 2024, "4001", GLM_OUTPUT_ONE_ROW)
 
     def zero_insert(*args, **kwargs):
-        return 0
+        return ocr_zero_rows.InsertOutcome(status="rejected", inserted=0, expected=1)
 
-    monkeypatch.setattr(ocr_zero_rows, "insert_transactions", zero_insert)
+    monkeypatch.setattr(ocr_zero_rows, "insert_transactions_outcome", zero_insert)
     monkeypatch.setattr(
         ocr_zero_rows,
         "resolve_ingestion_generation",

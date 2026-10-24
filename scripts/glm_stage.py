@@ -90,7 +90,9 @@ import tempfile
 import threading
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NotRequired, TypedDict, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 for _path in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
@@ -99,7 +101,6 @@ for _path in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
 
 from scripts.gemini_ocr_common import (  # noqa: E402
     AMOUNT_MIDPOINTS,
-    PROMPT,
     PROMPT_SHA256,
     GeminiOutputError,  # noqa: F401  (re-exported for callers/tests)
     is_quota_error,
@@ -112,7 +113,6 @@ from analyzer.vision_engines import (  # noqa: E402
     GoogleVisionBServiceUnavailableError,
     TransientVisionBError,
     VisionBConfig,
-    VisionBUnavailable,
     classify_visionb_error,
     is_google_api_host,
     read_document_with_vision_b,
@@ -155,6 +155,95 @@ ASSET_TICKER_CONTEXT_SHARE = 0.8  # >80% of the OTHER rows carry a ticker
 # The record identity a verdict is bound to (finding 6): if any of these
 # no longer match the live record, the audited attempt is not the live one.
 AUDIT_IDENTITY_FIELDS = ("pdf_sha256", "prompt_sha256", "parsed_at_utc")
+
+
+def _ocr_ingestion():
+    # Single import boundary for the production OCR ownership migration.
+    from scripts import ocr_zero_rows
+
+    return ocr_zero_rows
+
+
+class StagingRecord(TypedDict):
+    """JSON evidence, retained verbatim so historical content hashes stay valid."""
+
+    doc_id: str
+    year: int
+    pdf_sha256: str | None
+    prompt_sha256: str
+    parsed_at_utc: str
+    rows: list[list]
+    member: str | None
+    parse_status: str
+    model: str | None
+    parser_version: str
+    pages: int | None
+    raw_output: str | None
+    error: str | None
+    audit: str | None
+    archive_year: NotRequired[int]
+    artifact_sha256: NotRequired[str | None]  # legacy alias, never overrides pdf_sha256
+    ingestion_generation: NotRequired[str | None]
+    render_dpi: NotRequired[int]
+    row_pages: NotRequired[list[int | None]]
+    staged_rows_sha256: NotRequired[str | None]
+    error_kind: NotRequired[str | None]
+    asset_review: NotRequired[bool]
+    asset_review_reasons: NotRequired[list[str]]
+    promotion: NotRequired[dict]
+
+
+def decode_staging_record(raw: str | bytes) -> StagingRecord:
+    record = json.loads(raw)
+    if not isinstance(record, dict):
+        raise ValueError("staging record must be a JSON object")
+    # Do not inject legacy defaults into content-bound evidence.
+    return cast(StagingRecord, record)
+
+
+@dataclass(frozen=True)
+class ArtifactRequest:
+    """Only the identity constraints understood by the artifact resolver."""
+
+    doc_id: str
+    year: int
+    archive_year: int | None = None
+    artifact_sha256: str | None = None
+    ingestion_generation: str | None = None
+
+    @classmethod
+    def from_manifest(cls, item: dict) -> ArtifactRequest:
+        artifact_hash = item.get("artifact_sha256")
+        pdf_hash = item.get("pdf_sha256")
+        if artifact_hash is not None and pdf_hash is not None and artifact_hash != pdf_hash:
+            raise RuntimeError("conflicting artifact_sha256 and pdf_sha256")
+        return cls(
+            doc_id=str(item["doc_id"]), year=int(item["year"]),
+            archive_year=item.get("archive_year"),
+            artifact_sha256=artifact_hash if artifact_hash is not None else pdf_hash,
+            ingestion_generation=item.get("ingestion_generation"),
+        )
+
+    @classmethod
+    def from_record(cls, record: StagingRecord) -> ArtifactRequest:
+        legacy_hash = record.get("artifact_sha256")
+        if legacy_hash is not None and legacy_hash != record["pdf_sha256"]:
+            raise RuntimeError("conflicting artifact_sha256 and pdf_sha256")
+        return cls(
+            doc_id=record["doc_id"], year=record["year"],
+            archive_year=record.get("archive_year"),
+            artifact_sha256=record["pdf_sha256"],
+            ingestion_generation=record.get("ingestion_generation"),
+        )
+
+    def resolver_fields(self) -> dict:
+        # Narrow adapter to the current OCR API; never forward record metadata.
+        return {
+            "doc_id": self.doc_id, "year": self.year,
+            "archive_year": self.archive_year,
+            "artifact_sha256": self.artifact_sha256,
+            "ingestion_generation": self.ingestion_generation,
+        }
 
 
 def staging_root(data_dir: str | Path = "data") -> Path:
@@ -355,38 +444,38 @@ def archive_current_attempt(data_dir: str | Path, year: int, doc_id: str) -> Pat
     return target
 
 
-def write_staging_record(data_dir: str | Path, record: dict) -> Path:
+def write_staging_record(data_dir: str | Path, record: StagingRecord) -> Path:
     path = staging_record_path(data_dir, record["year"], record["doc_id"])
     _atomic_write_json(path, record)
     return path
 
 
-def load_staging_record(data_dir: str | Path, year: int, doc_id: str) -> dict | None:
+def load_staging_record(data_dir: str | Path, year: int, doc_id: str) -> StagingRecord | None:
     path = staging_record_path(data_dir, year, doc_id)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    return decode_staging_record(path.read_text(encoding="utf-8"))
 
 
-def find_staging_record(data_dir: str | Path, doc_id: str) -> tuple[int, dict] | None:
+def find_staging_record(data_dir: str | Path, doc_id: str) -> tuple[int, StagingRecord] | None:
     """Locate a staging record across year directories (audit tooling)."""
     root = staging_root(data_dir)
     for year_dir in sorted(root.glob("[0-9]" * 4)):
         path = year_dir / f"{doc_id}.json"
         if path.exists():
-            return int(year_dir.name), json.loads(path.read_text(encoding="utf-8"))
+            return int(year_dir.name), decode_staging_record(path.read_text(encoding="utf-8"))
     return None
 
 
-def iter_staging_records(data_dir: str | Path) -> list[tuple[int, dict]]:
+def iter_staging_records(data_dir: str | Path) -> list[tuple[int, StagingRecord]]:
     """All staging records, ordered (year, doc_id)."""
     records = []
     root = staging_root(data_dir)
     for year_dir in sorted(root.glob("[0-9]" * 4), key=lambda p: p.name):
         for path in sorted(year_dir.glob("*.json")):
             try:
-                record = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                record = decode_staging_record(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
                 continue
             records.append((int(year_dir.name), record))
     return records
@@ -556,7 +645,7 @@ def build_staging_record(
     read_fn=None,
     artifact_identity: dict | None = None,
     data_dir: str | Path | None = None,
-) -> dict:
+) -> StagingRecord:
     """Read one document and build its staging record. Never raises.
 
     Provenance (finding 6): the artifact bytes are snapshotted ONCE —
@@ -581,7 +670,7 @@ def build_staging_record(
     never rejects a row; it marks the record so the audit sampler
     oversamples it.
     """
-    record = {
+    record: StagingRecord = {
         "doc_id": str(doc_id),
         "year": int(year),
         "pdf_sha256": None,
@@ -606,12 +695,12 @@ def build_staging_record(
     raw_output = None
     try:
         # One artifact snapshot feeds sha256, page count, and the render.
-        from scripts.ocr_zero_rows import read_work_artifact
+        ocr = _ocr_ingestion()
 
         if artifact_identity is not None and "pdf_bytes" in artifact_identity:
             pdf_bytes = artifact_identity["pdf_bytes"]
         else:
-            pdf_bytes = read_work_artifact(data_dir if data_dir is not None else Path(pdf_path).parent, pdf_path)
+            pdf_bytes = ocr.read_work_artifact(data_dir if data_dir is not None else Path(pdf_path).parent, pdf_path)
         record["pdf_sha256"] = hashlib.sha256(pdf_bytes).hexdigest()
         if artifact_identity is not None:
             if record["pdf_sha256"] != artifact_identity["artifact_sha256"]:
@@ -707,22 +796,22 @@ def canonical_terminal_artifacts(db_path: str | Path) -> set[tuple[str, str, str
         db.close()
 
 
-def manifest_artifact(item: dict, data_dir: str | Path, db_path: str | Path | None = None):
+def manifest_artifact(request: ArtifactRequest, data_dir: str | Path, db_path: str | Path | None = None):
     """Return a verified byte snapshot and identity; path is naming only.
 
     Consumers use identity['pdf_bytes']/['artifact_sha256'], never reopen the
     returned display path after verification.
     """
     import duckdb
-    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, local_work_artifact
+    ocr = _ocr_ingestion()
 
-    if not isinstance(data_dir, ApprovedDataRoot):
-        with approved_data_root(data_dir) as root:
-            return manifest_artifact(item, root, db_path)
+    if not isinstance(data_dir, ocr.ApprovedDataRoot):
+        with ocr.approved_data_root(data_dir) as root:
+            return manifest_artifact(request, root, db_path)
 
     path = Path(db_path or default_db_path(data_dir))
     with duckdb.connect(str(path), read_only=True) if path.exists() else nullcontext(None) as conn:
-        return local_work_artifact(conn, data_dir, item)
+        return ocr.local_work_artifact(conn, data_dir, request.resolver_fields())
 
 
 def select_candidates(
@@ -822,10 +911,10 @@ def select_candidates_from_manifest(
     are refused, never replaced with another same-ID artifact.
     """
     import duckdb
-    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, local_work_artifact
+    ocr = _ocr_ingestion()
 
-    if not isinstance(data_dir, ApprovedDataRoot):
-        with approved_data_root(data_dir) as root:
+    if not isinstance(data_dir, ocr.ApprovedDataRoot):
+        with ocr.approved_data_root(data_dir) as root:
             return select_candidates_from_manifest(items, year, limit, root,
                 check_canonical=check_canonical, db_path=db_path)
 
@@ -854,7 +943,8 @@ def select_candidates_from_manifest(
                 continue
             seen.add(doc_id)
             try:
-                pdf_path, identity = local_work_artifact(conn, data_dir, item)
+                request = ArtifactRequest.from_manifest(item)
+                pdf_path, identity = ocr.local_work_artifact(conn, data_dir, request.resolver_fields())
             except (OSError, RuntimeError) as exc:
                 notes.append(f"[{doc_id}] artifact binding refused ({exc}); skipped")
                 continue
@@ -922,10 +1012,10 @@ def stage_batch(
     record is an error record is re-staged; the superseded record is
     archived (``archive_current_attempt``) before the new one is written.
     """
-    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root
+    ocr = _ocr_ingestion()
 
-    if not isinstance(data_dir, ApprovedDataRoot):
-        with approved_data_root(data_dir) as root:
+    if not isinstance(data_dir, ocr.ApprovedDataRoot):
+        with ocr.approved_data_root(data_dir) as root:
             return stage_batch(year, limit, data_dir=root, check_canonical=check_canonical,
                 db_path=db_path, config=config, read_fn=read_fn, cooldown=cooldown,
                 workers=workers, manifest=manifest, dry_run=dry_run)
@@ -1012,7 +1102,7 @@ def stage_batch(
         if manifest is not None:
             item = next(item for item in manifest if str(item["doc_id"]) == doc_id and int(item["year"]) == year)
             try:
-                pdf_path, identity = manifest_artifact(item, data_dir, db_path)
+                pdf_path, identity = manifest_artifact(ArtifactRequest.from_manifest(item), data_dir, db_path)
             except (OSError, RuntimeError) as exc:
                 print(f"  [{doc_id}] artifact binding refused ({exc})", flush=True)
                 return "error"
@@ -1437,7 +1527,7 @@ def _audit_report_refusal(state: dict | None, data_dir: str | Path) -> str:
     )
 
 
-def record_identity(record: dict) -> dict:
+def record_identity(record: StagingRecord) -> dict[str, str | None]:
     """The (pdf_sha256, prompt_sha256, parsed_at_utc) triple a verdict is
     bound to (finding 6): it changes iff the artifact, extraction recipe, or
     staging attempt changed."""
@@ -1445,7 +1535,7 @@ def record_identity(record: dict) -> dict:
 
 
 def verdict_binding(
-    data_dir: str | Path, doc_id: str, record: dict
+    data_dir: str | Path, doc_id: str, record: StagingRecord
 ) -> tuple[bool, str | None]:
     """(bound, refusal_reason) between the audit history and THIS record.
 
@@ -1556,7 +1646,7 @@ def promote_docs(
     with a loud warning). ``require_audit_pass=False`` is refused loudly —
     there is no permissive default anymore.
 
-    ``insert_transactions`` (imported from ``scripts.ocr_zero_rows``) writes
+    ``insert_transactions_outcome`` (from ``scripts.ocr_zero_rows``) writes
     the transactions AND the pdf_parse_runs record transactionally, exactly
     as the OCR path does. The staging JSON is archived — promotion consumes
     the live record — ONLY when the FULL staged row set is confirmed committed
@@ -1575,7 +1665,7 @@ def promote_docs(
             "audit approval is mandatory: require_audit_pass=False is no "
             "longer accepted (pass audit:'pass' records or force_unaudited)"
         )
-    from scripts import ocr_zero_rows as ocr  # attribute lookups stay monkeypatchable
+    ocr = _ocr_ingestion()
 
     if not isinstance(data_dir, ocr.ApprovedDataRoot):
         with ocr.approved_data_root(data_dir) as root:
@@ -1624,9 +1714,13 @@ def promote_docs(
     for doc_id in doc_ids:
         try:
             record_bytes = ocr.read_work_artifact(data_dir, staging_record_path(data_dir, year, doc_id))
-            record = json.loads(record_bytes)
+            record = decode_staging_record(record_bytes)
         except FileNotFoundError:
             print(f"  [{doc_id}] no staging record; skipped", flush=True)
+            refused += 1
+            continue
+        if record.get("doc_id") != str(doc_id) or record.get("year") != int(year):
+            print(f"  [{doc_id}] refused: staging record identity does not match selection", flush=True)
             refused += 1
             continue
         if record.get("parse_status") == "error":
@@ -1649,7 +1743,7 @@ def promote_docs(
                 refused += 1
                 continue
         try:
-            _, identity = manifest_artifact(record, data_dir, db_path)
+            _, identity = manifest_artifact(ArtifactRequest.from_record(record), data_dir, db_path)
             artifact_year = identity["archive_year"]
             current_sha = identity["artifact_sha256"]
         except (OSError, RuntimeError) as exc:
@@ -1665,7 +1759,7 @@ def promote_docs(
             refused += 1
             continue
         try:
-            rows = record.get("rows", [])
+            rows = record["rows"]
             row_pages = record.get("row_pages") or []
             transactions = [
                 staged_row_to_tx(
@@ -1682,11 +1776,10 @@ def promote_docs(
             if record.get("ingestion_generation") is not None and record["ingestion_generation"] != ingestion_generation:
                 raise RuntimeError("staged artifact generation is no longer current")
             staged_count = len(transactions)
-            report: dict = {}
-            ocr.insert_transactions(
+            outcome = ocr.insert_transactions_outcome(
                 doc_id,
                 artifact_year,
-                record.get("member"),
+                record["member"],
                 transactions,
                 db_path=db_path,
                 parser_version=GLM_PARSER_VERSION,
@@ -1694,16 +1787,6 @@ def promote_docs(
                 artifact_sha256=record["pdf_sha256"],
                 ingestion_generation=ingestion_generation,
                 engine_model=GLM_ENGINES_ATTEMPTED,
-                report=report,
-            )
-            outcome = ocr.insert_outcome_from_report(
-                report,
-                inserted=(
-                    report["outcome"].inserted
-                    if isinstance(report.get("outcome"), ocr.InsertOutcome)
-                    else 0
-                ),
-                expected=staged_count,
             )
         except Exception as exc:
             # duckdb write-lock and generation-binding problems surface

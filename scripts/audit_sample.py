@@ -690,7 +690,7 @@ def _validate_attempt_bundle(data_dir, doc_dir: Path, record: dict) -> None:
 
 
 def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
-    from scripts.glm_stage import manifest_artifact
+    from scripts.glm_stage import ArtifactRequest, manifest_artifact
     from scripts.gemini_ocr_common import pdf_page_count
 
     if not render:
@@ -710,7 +710,7 @@ def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
         if os.path.lexists(doc_dir):
             _validate_attempt_bundle(data_dir, doc_dir, record)
             return
-        pdf_path, identity = manifest_artifact(record, data_dir)
+        pdf_path, identity = manifest_artifact(ArtifactRequest.from_record(record), data_dir)
         pdf_bytes = identity["pdf_bytes"]
         if hashlib.sha256(pdf_bytes).hexdigest() != record.get("pdf_sha256"):
             raise ValueError("audit snapshot SHA-256 does not match staged artifact")
@@ -768,7 +768,7 @@ def emit_review_bundle(
             shutil.rmtree(doc_dir)
         doc_dir.mkdir(parents=True)
         try:
-            from scripts.glm_stage import manifest_artifact
+            from scripts.glm_stage import ArtifactRequest, manifest_artifact
 
             record_bytes = read_work_artifact(data_dir, record_path)
             (doc_dir / "record.json").write_bytes(record_bytes)
@@ -777,7 +777,7 @@ def emit_review_bundle(
                 raise RuntimeError("staging record identity does not match audit sample")
             if not render:
                 continue
-            pdf_path, identity = manifest_artifact(record, data_dir)
+            pdf_path, identity = manifest_artifact(ArtifactRequest.from_record(record), data_dir)
             pdf_bytes = identity["pdf_bytes"]
             if hashlib.sha256(pdf_bytes).hexdigest() != record.get("pdf_sha256"):
                 raise RuntimeError("audit snapshot SHA-256 does not match staged artifact")

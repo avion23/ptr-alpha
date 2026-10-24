@@ -201,14 +201,24 @@ def _same_member_variant(first: str, candidate: str) -> bool:
         return False
     if not _same_person(first_tokens[0].lower(), candidate_tokens[0].lower()):
         return False
-    first_middle = first_tokens[1] if len(first_tokens) > 2 else None
-    candidate_middle = candidate_tokens[1] if len(candidate_tokens) > 2 else None
-    if first_middle is None or candidate_middle is None:
+    first_names = (first_tokens[0].lower(), candidate_tokens[0].lower())
+    first_middle = [
+        token
+        for token in first_tokens[1:-1]
+        if not any(_same_person(name, token.lower()) for name in first_names)
+    ]
+    candidate_middle = [
+        token
+        for token in candidate_tokens[1:-1]
+        if not any(_same_person(name, token.lower()) for name in first_names)
+    ]
+    if not first_middle or not candidate_middle:
         return True
-    return (
-        first_middle == candidate_middle
-        or (len(first_middle) == 1 and first_middle == candidate_middle[0])
-        or (len(candidate_middle) == 1 and candidate_middle == first_middle[0])
+    return len(first_middle) == len(candidate_middle) and all(
+        first_token == candidate_token
+        or (len(first_token) == 1 and first_token == candidate_token[0])
+        or (len(candidate_token) == 1 and candidate_token == first_token[0])
+        for first_token, candidate_token in zip(first_middle, candidate_middle)
     )
 
 

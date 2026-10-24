@@ -810,6 +810,16 @@ class TestPositions(unittest.TestCase):
                 "Charles James Fleischmann", "Charles Joseph Fleischmann"
             )
         )
+        self.assertFalse(
+            same_member_identity(
+                "Charles James Allen Smith", "Charles James Arthur Smith"
+            )
+        )
+        self.assertTrue(
+            same_member_identity(
+                "Charles James Allen Smith", "Charles James A. Smith"
+            )
+        )
 
     def test_sale_full_closes_position_across_name_variants(self):
         trades = pd.DataFrame(

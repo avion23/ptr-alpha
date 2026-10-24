@@ -277,6 +277,37 @@ def test_full_middle_names_remain_distinct_and_ambiguous_nickname_is_excluded():
     assert original["buyers"] == reversed_rows["buyers"]
 
 
+def test_all_full_middle_names_remain_distinct_in_order_independent_groups():
+    transactions = _transactions(
+        (
+            "Charles James Allen Smith",
+            "Charles James Arthur Smith",
+            "Chuck Smith",
+            "Alice Jones",
+        ),
+        disclosure_dates=["2024-05-10", "2024-05-11", "2024-05-12", "2024-05-13"],
+    )
+    as_of = pd.Timestamp("2024-05-20")
+
+    prepared = prepare_consensus_purchases(transactions)
+    member_keys = prepared.set_index("member")["_member_canonical"]
+    original = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=as_of, min_buyers=3
+    ).iloc[0]
+    reversed_rows = score_ticker_by_buyers(
+        "AAPL",
+        transactions.iloc[::-1].reset_index(drop=True),
+        as_of_date=as_of,
+        min_buyers=3,
+    ).iloc[0]
+
+    assert member_keys["Charles James Allen Smith"] == "CHARLES JAMES ALLEN SMITH"
+    assert member_keys["Charles James Arthur Smith"] == "CHARLES JAMES ARTHUR SMITH"
+    assert member_keys["Chuck Smith"] == ""
+    assert original["num_buyers"] == reversed_rows["num_buyers"] == 3
+    assert original["buyers"] == reversed_rows["buyers"]
+
+
 @pytest.mark.parametrize("ticker", ["", "   ", "NOT_A_TICKER", "CASH", "BOND", "SP"])
 def test_consensus_rejects_invalid_or_non_equity_tickers(ticker):
     with pytest.raises(AnalysisError, match="ticker|Ticker"):

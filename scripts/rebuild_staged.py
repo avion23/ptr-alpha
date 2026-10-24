@@ -3075,28 +3075,27 @@ def _ingest_ocr_locked(track_dir: Path, track_manifest: dict, db: Database) -> d
     rows_files = [item["rows_path"] for item in inventory]
     if not inventory:
         return {"rows_files": [], "track_unresolved": track_unresolved, "ingested_docs": []}
-    parser_version = str(
-        track_manifest.get("parser_version")
-        or f"v4-{track_manifest.get('engine', 'local-ocr')}"
-    )
-    total_ingested = 0
-    ingested_docs: list[str] = []
-    skipped_already_resolved: list[str] = []
-    skipped_track_unresolved: list[str] = []
-    dropped_rows: list[dict] = []
+
+    # Bind every resolved staged rowset to its archived DB artifact before any
+    # document can be persisted. OCR producer generations are attempt metadata;
+    # the DB generation remains the persistence target; its hash is only a
+    # comparator, never a replacement for the staged proof.
+    target_metadata = {}
     for item in inventory:
-        rows_file = item["rows_path"]
-        file_doc_id = item["doc_id"]
         if item["envelope"]["status"] != "resolved":
-            skipped_track_unresolved.append(file_doc_id)
             continue
-        rows = pd.DataFrame(item["rows"])
-        if rows.empty:
-            raise ValueError(f"{file_doc_id}: resolved OCR envelope has no rows")
-        doc_id = rows["doc_id"].astype(str).iloc[0]
-        if doc_id in track_unresolved:
-            skipped_track_unresolved.append(doc_id)
-            continue
+        doc_id = item["doc_id"]
+        if not item["rows"]:
+            raise ValueError(f"{doc_id}: resolved OCR envelope has no rows")
+        staged_sha = item["envelope"].get("artifact_sha256")
+        if not isinstance(staged_sha, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", staged_sha
+        ):
+            raise ValueError(f"{doc_id}: resolved OCR envelope lacks a valid PDF hash")
+        if any(row.get("artifact_sha256") != staged_sha for row in item["rows"]):
+            raise ValueError(
+                f"{doc_id}: OCR rowset PDF hash does not match its envelope"
+            )
         meta = db.conn.execute(
             """
             SELECT m.archive_year, g.generation_id,
@@ -3120,7 +3119,41 @@ def _ingest_ocr_locked(track_dir: Path, track_manifest: dict, db: Database) -> d
         ).fetchone()
         if meta is None:
             raise RuntimeError(f"ocr ingest: no staged house metadata for {doc_id}")
-        archive_year, gen, first, last, filing_date, artifact_sha = meta
+        target_sha = meta[5]
+        if not isinstance(target_sha, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", target_sha
+        ):
+            raise ValueError(f"{doc_id}: staged database artifact lacks a valid PDF hash")
+        if staged_sha != target_sha:
+            raise ValueError(
+                f"{doc_id}: OCR PDF hash does not match staged database artifact"
+            )
+        target_metadata[doc_id] = meta[:5]
+
+    parser_version = str(
+        track_manifest.get("parser_version")
+        or f"v4-{track_manifest.get('engine', 'local-ocr')}"
+    )
+    total_ingested = 0
+    ingested_docs: list[str] = []
+    skipped_already_resolved: list[str] = []
+    skipped_track_unresolved: list[str] = []
+    dropped_rows: list[dict] = []
+    for item in inventory:
+        rows_file = item["rows_path"]
+        file_doc_id = item["doc_id"]
+        if item["envelope"]["status"] != "resolved":
+            skipped_track_unresolved.append(file_doc_id)
+            continue
+        rows = pd.DataFrame(item["rows"])
+        if rows.empty:
+            raise ValueError(f"{file_doc_id}: resolved OCR envelope has no rows")
+        doc_id = rows["doc_id"].astype(str).iloc[0]
+        if doc_id in track_unresolved:
+            skipped_track_unresolved.append(doc_id)
+            continue
+        archive_year, gen, first, last, filing_date = target_metadata[doc_id]
+        artifact_sha = item["envelope"]["artifact_sha256"]
         resolved = db.conn.execute(
             """
             SELECT COUNT(*) FROM pdf_parse_runs

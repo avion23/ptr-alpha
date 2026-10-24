@@ -1335,3 +1335,115 @@ def test_ocr_consumer_uses_only_manifest_bound_verified_current_pairs(tmp_path, 
     )
     with pytest.raises(ValueError, match="rows_file_sha256"):
         rebuild_staged._ingest_ocr(root, manifest, SimpleNamespace())
+
+
+@pytest.mark.parametrize(
+    ("staged_sha", "target_sha", "error"),
+    [
+        ("a" * 64, "b" * 64, "does not match staged database artifact"),
+        (None, "a" * 64, "lacks a valid PDF hash"),
+        ("a" * 64, None, "lacks a valid PDF hash"),
+    ],
+)
+def test_ocr_ingest_binds_whole_rowset_to_db_artifact_before_writes(
+    tmp_path, staged_sha, target_sha, error
+):
+    from scripts import ocr_local_sweep, rebuild_staged
+
+    doc_id = "ocr-proof"
+    root = tmp_path / "ocr-proof"
+    rows = [
+        {
+            "doc_id": doc_id,
+            "source_record_id": doc_id,
+            "source_row_id": f"{doc_id}:page:1:row:{index}",
+            "artifact_sha256": staged_sha,
+            "ingestion_generation": "producer-attempt-generation",
+            "asset_description": f"Asset {index}",
+            "transaction_type": "Purchase",
+            "transaction_date": f"2015-01-0{index}",
+        }
+        for index in (1, 2)
+    ]
+    ocr_local_sweep.stage_document(
+        root,
+        {
+            "doc_id": doc_id,
+            "year": 2015,
+            "status": "resolved",
+            "artifact_sha256": staged_sha,
+            "page_count": 1,
+            "covered_pages": [1],
+            "uncovered_pages": [],
+            "row_count": len(rows),
+            "rows": rows,
+            "reasons": [],
+            "engines": [],
+            "canary": None,
+        },
+    )
+    ocr_local_sweep.write_manifest(root, kind="sweep", data_dir=root)
+    manifest = json.loads((root / "manifest.json").read_text())
+    original_bytes = {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    class FakeConnection:
+        def __init__(self):
+            self.target_sha = target_sha
+
+        def execute(self, query, _params):
+            if "FROM house_generation_metadata" in query:
+                row = (
+                    2015,
+                    "archive-generation",
+                    "Test",
+                    "Member",
+                    "2015-02-01",
+                    self.target_sha,
+                )
+            else:
+                assert "FROM pdf_parse_runs" in query
+                row = (0,)
+            return SimpleNamespace(fetchone=lambda: row)
+
+    class FakeDatabase:
+        def __init__(self):
+            self.conn = FakeConnection()
+            self.writes = []
+
+        def replace_transactions_for_docs(self, frame, **kwargs):
+            self.writes.append((frame.copy(), kwargs))
+            return SimpleNamespace(by_doc_total={doc_id: len(frame)})
+
+    db = FakeDatabase()
+    with pytest.raises(ValueError, match=error):
+        rebuild_staged._ingest_ocr(root, manifest, db)
+    assert db.writes == []
+    assert original_bytes == {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    if staged_sha is not None:
+        # Matching staged and archived hashes retain the existing archive
+        # generation mapping and row count; producer attempt bytes stay intact.
+        db.conn.target_sha = staged_sha
+        result = rebuild_staged._ingest_ocr(root, manifest, db)
+        assert result["ingested_docs"] == [doc_id]
+        assert result["ingested_rows"] == 2
+        assert len(db.writes) == 1
+        frame, kwargs = db.writes[0]
+        assert len(frame) == 2
+        assert set(frame["artifact_sha256"]) == {staged_sha}
+        assert set(frame["ingestion_generation"]) == {"archive-generation"}
+        assert kwargs["parse_runs"][0]["artifact_sha256"] == staged_sha
+        assert kwargs["parse_runs"][0]["ingestion_generation"] == "archive-generation"
+        assert original_bytes == {
+            path.relative_to(root): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }

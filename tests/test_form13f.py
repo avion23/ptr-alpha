@@ -76,15 +76,15 @@ def sec_company_tickers(monkeypatch):
 def quarter_xmls():
     previous = """<?xml version="1.0"?>
     <informationTable xmlns="http://www.sec.gov/edgar/document/thirteenf/informationtable">
-      <infoTable><nameOfIssuer>Vistra Corp</nameOfIssuer><cusip>111111111</cusip><sshPrnamt>100</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
-      <infoTable><nameOfIssuer>Alpha Bio Inc</nameOfIssuer><cusip>222222222</cusip><sshPrnamt>200</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>Vistra Corp</nameOfIssuer><cusip>111111118</cusip><sshPrnamt>100</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>Alpha Bio Inc</nameOfIssuer><cusip>222222226</cusip><sshPrnamt>200</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
     </informationTable>"""
     current = """<?xml version="1.0"?>
     <informationTable xmlns="http://www.sec.gov/edgar/document/thirteenf/informationtable">
-      <infoTable><nameOfIssuer>VISTRA CORP</nameOfIssuer><cusip>111111111</cusip><sshPrnamt>150</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
-      <infoTable><nameOfIssuer>Alpha Bio Inc</nameOfIssuer><cusip>222222222</cusip><sshPrnamt>125</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
-      <infoTable><nameOfIssuer>Nova Labs</nameOfIssuer><cusip>333333333</cusip><sshPrnamt>300</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
-      <infoTable><nameOfIssuer>Orion Energy Holdings</nameOfIssuer><cusip>444444444</cusip><sshPrnamt>400</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>VISTRA CORP</nameOfIssuer><cusip>111111118</cusip><sshPrnamt>150</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>Alpha Bio Inc</nameOfIssuer><cusip>222222226</cusip><sshPrnamt>125</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>Nova Labs</nameOfIssuer><cusip>333333334</cusip><sshPrnamt>300</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>Orion Energy Holdings</nameOfIssuer><cusip>444444442</cusip><sshPrnamt>400</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
     </informationTable>"""
     return previous, current
 
@@ -111,7 +111,7 @@ def test_fetch_records_acceptance(tmp_path, monkeypatch, quarter_xmls, discovery
         source = ThirteenFSource(
             data_dir=tmp_path, db=db, watchlist={"VST": {"VISTRA"}},
             managers={"test": {"name": "Test Manager", "cik": "1234567"}},
-            ingestion_generation="test", ticker_map={"111111111": "VST"},
+            ingestion_generation="test", ticker_map={"111111118": "VST"},
         )
         calls = []
         def submissions(cik):
@@ -195,7 +195,7 @@ def test_emits_only_watchlist_increases_and_new_positions(tmp_path, quarter_xmls
     assert first_position["portfolio_pct"] is None
     assert rows[0]["raw_transaction_subtype"] == "13F_SHARE_POSITION_SNAPSHOT"
     assert rows[0]["source_record_id"] == "0001234567-26-000002"
-    assert rows[0]["source_row_id"] == "111111111"
+    assert rows[0]["source_row_id"] == "111111118"
     assert rows[0]["ingestion_generation"] == "test-generation"
     source.close()
 
@@ -208,15 +208,15 @@ def test_position_changes_record_reductions_and_absence_as_share_states(tmp_path
         managers={"test": {"name": "Test Manager", "cik": "1234567"}},
     )
     previous = {
-        "111111111": {"issuer": "Vistra Corp", "shares": 100, "value_thousands": 1000,
+        "111111118": {"issuer": "Vistra Corp", "shares": 100, "value_thousands": 1000,
                       "portfolio_value_thousands": 2000},
-        "222222222": {"issuer": "Nova Labs", "shares": 100, "value_thousands": 1000,
+        "222222226": {"issuer": "Nova Labs", "shares": 100, "value_thousands": 1000,
                       "portfolio_value_thousands": 2000},
     }
     current = {
-        "111111111": {"issuer": "Vistra Corp", "shares": 40, "value_thousands": 600,
+        "111111118": {"issuer": "Vistra Corp", "shares": 40, "value_thousands": 600,
                       "portfolio_value_thousands": 1200},
-        "333333333": {"issuer": "Nova Labs", "shares": 25, "value_thousands": 600,
+        "333333334": {"issuer": "Nova Labs", "shares": 25, "value_thousands": 600,
                       "portfolio_value_thousands": 1200},
     }
     rows = source._position_changes(
@@ -246,9 +246,9 @@ def test_position_changes_record_reductions_and_absence_as_share_states(tmp_path
         {"name": "Test Manager"},
         {"report_date": "2026-09-30", "filing_date": "2026-11-14",
          "accession": "0001234567-26-000003"},
-        {"111111111": {"issuer": "Vistra Corp", "shares": 40, "value_thousands": 600,
+        {"111111118": {"issuer": "Vistra Corp", "shares": 40, "value_thousands": 600,
                         "portfolio_value_thousands": 600}},
-        {"222222222": {"issuer": "Nova Labs", "shares": 25, "value_thousands": 600,
+        {"222222226": {"issuer": "Nova Labs", "shares": 25, "value_thousands": 600,
                         "portfolio_value_thousands": 600}},
         "unused",
     )
@@ -269,11 +269,134 @@ def test_empty_information_table_fails_closed():
         )
 
 
+def test_unknown_share_type_rejects_the_entire_information_table():
+    xml = """<informationTable>
+      <infoTable><nameOfIssuer>Vistra Corp</nameOfIssuer><cusip>111111118</cusip><sshPrnamt>100</sshPrnamt><sshPrnamtType>BAD</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>Alpha Bio Inc</nameOfIssuer><cusip>222222226</cusip><sshPrnamt>200</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+    </informationTable>"""
+
+    with pytest.raises(ThirteenFError, match="Unrecognized 13F share amount type"):
+        _parse_information_table(xml)
+
+
+def test_known_principal_and_option_rows_remain_excluded():
+    holdings = _parse_information_table("""<informationTable>
+      <infoTable><nameOfIssuer>Vistra Corp</nameOfIssuer><cusip>111111118</cusip><sshPrnamt>100</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>Alpha Bio Inc</nameOfIssuer><cusip>222222226</cusip><sshPrnamt>200</sshPrnamt><sshPrnamtType>PRN</sshPrnamtType></infoTable>
+      <infoTable><nameOfIssuer>Nova Labs</nameOfIssuer><cusip>333333334</cusip><sshPrnamt>300</sshPrnamt><sshPrnamtType>SH</sshPrnamtType><putCall>Call</putCall></infoTable>
+    </informationTable>""")
+
+    assert holdings == {
+        "111111118": {
+            "issuer": "Vistra Corp",
+            "shares": 100,
+            "value_thousands": None,
+            "portfolio_value_thousands": None,
+        }
+    }
+
+
+@pytest.mark.parametrize("cusip", ["X", "111111111", "11111111"])
+def test_information_table_rejects_invalid_cusip(cusip):
+    xml = (
+        "<informationTable><infoTable><nameOfIssuer>Vistra Corp</nameOfIssuer>"
+        f"<cusip>{cusip}</cusip><sshPrnamt>100</sshPrnamt>"
+        "<sshPrnamtType>SH</sshPrnamtType></infoTable></informationTable>"
+    )
+
+    with pytest.raises(ThirteenFError, match="Invalid 13F CUSIP"):
+        _parse_information_table(xml)
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("added_shares", None, "positive integral shares"),
+        ("added_shares", 0, "positive integral shares"),
+        ("added_shares", -5, "positive integral shares"),
+        ("added_shares", True, "positive integral shares"),
+        ("cusip", None, "Invalid 13F CUSIP"),
+        ("cusip", "X", "Invalid 13F CUSIP"),
+        ("cusip", "111111111", "Invalid 13F CUSIP"),
+    ],
+)
+def test_save_increases_preflights_all_rows_before_persisting(
+    tmp_path, field, value, error
+):
+    from analyzer.persistence.database import Database
+
+    valid = {
+        "manager_key": "test",
+        "manager": "Test Manager",
+        "ticker": "VST",
+        "event_date": date(2026, 6, 30),
+        "disclosure_date": date(2026, 8, 14),
+        "cusip": "111111118",
+        "added_shares": 50,
+        "raw_asset_description": "Vistra Corp",
+        "source": "13f",
+        "accession": "0001234567-26-000002",
+        "report_url": "unused",
+    }
+    malformed = {**valid, field: value}
+    increases = pd.DataFrame([valid, malformed])
+    if field == "added_shares":
+        increases["added_shares"] = pd.Series([50, value], dtype=object)
+
+    with Database(":memory:") as db:
+        source = ThirteenFSource(
+            data_dir=tmp_path,
+            db=db,
+            watchlist={"VST": {"VISTRA"}},
+            ingestion_generation="test-generation",
+            managers={"test": {"name": "Test Manager", "cik": "1234567"}},
+        )
+        with pytest.raises(ThirteenFError, match=error):
+            source.save_increases(increases)
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+        source.close()
+
+
+def test_save_increases_preserves_valid_integer_shares_and_cusip(tmp_path):
+    from analyzer.persistence.database import Database
+
+    increases = pd.DataFrame(
+        [
+            {
+                "manager_key": "test",
+                "manager": "Test Manager",
+                "ticker": "VST",
+                "event_date": date(2026, 6, 30),
+                "disclosure_date": date(2026, 8, 14),
+                "cusip": "111111118",
+                "added_shares": 50,
+                "raw_asset_description": "Vistra Corp",
+                "source": "13f",
+                "accession": "0001234567-26-000002",
+                "report_url": "unused",
+            }
+        ]
+    )
+    with Database(":memory:") as db:
+        source = ThirteenFSource(
+            data_dir=tmp_path,
+            db=db,
+            watchlist={"VST": {"VISTRA"}},
+            ingestion_generation="test-generation",
+            managers={"test": {"name": "Test Manager", "cik": "1234567"}},
+        )
+        assert source.save_increases(increases) == 1
+        assert db.conn.execute(
+            "SELECT transaction_type, amount_raw, source_row_id FROM transactions"
+        ).fetchall() == [("Purchase", "50 shares", "111111118")]
+        source.close()
+
+
 def test_information_table_rejects_dtd_and_entities():
     hostile = (
         '<!DOCTYPE informationTable [<!ENTITY issuer "Vistra Corp">]>'
         '<informationTable><infoTable><nameOfIssuer>&issuer;</nameOfIssuer>'
-        "<cusip>111111111</cusip><sshPrnamt>1</sshPrnamt>"
+        "<cusip>111111118</cusip><sshPrnamt>1</sshPrnamt>"
         "</infoTable></informationTable>"
     )
     with pytest.raises(ThirteenFError, match="Unparseable 13F information table"):
@@ -347,12 +470,12 @@ def test_fetch_all_increases_drops_unmatched_and_keeps_mapped_positions(
         data_dir=tmp_path / "data",
         db=object(),
         watchlist={"VST": {"VISTRA"}},
-        ticker_map={"444444444": "ORION"},
+        ticker_map={"444444442": "ORION"},
         managers={"test": {"name": "Test Manager", "cik": "1234567"}},
     )
     previous_xml, current_xml = quarter_xmls
     previous = _parse_information_table(previous_xml)
-    previous["333333333"] = {"issuer": "Nova Labs", "shares": 250}
+    previous["333333334"] = {"issuer": "Nova Labs", "shares": 250}
     current = _parse_information_table(current_xml)
     filings = {
         "filings": {
@@ -400,7 +523,7 @@ def test_increases_resolve_tickers_drop_unknown_and_dedupe_cusips(
         <infoTable><nameOfIssuer>Microsoft Corporation</nameOfIssuer><cusip>594918104</cusip><sshPrnamt>50</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
         <infoTable><nameOfIssuer>Amazon.com, Inc.</nameOfIssuer><cusip>023135106</cusip><sshPrnamt>250</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
         <infoTable><nameOfIssuer>Space Exploration Techn Corp</nameOfIssuer><cusip>84615Q103</cusip><sshPrnamt>225</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
-        <infoTable><nameOfIssuer>Private Project Holdings</nameOfIssuer><cusip>999999999</cusip><sshPrnamt>75</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
+        <infoTable><nameOfIssuer>Private Project Holdings</nameOfIssuer><cusip>999999998</cusip><sshPrnamt>75</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></infoTable>
         </informationTable>"""
     )
 
@@ -553,7 +676,7 @@ def test_fetch_all_increases_isolates_manager_failures(tmp_path, monkeypatch, ca
                 "ticker": "VST",
                 "event_date": date(2026, 6, 30),
                 "disclosure_date": date(2026, 8, 14),
-                "cusip": "111111111",
+                "cusip": "111111118",
                 "added_shares": 50,
                 "raw_asset_description": "Vistra Corp",
                 "source": "13f",

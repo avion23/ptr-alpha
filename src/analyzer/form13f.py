@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import date
+from numbers import Integral
 from pathlib import Path
 
 from defusedxml import ElementTree as ET
@@ -67,6 +69,32 @@ _CANDIDATE_COLUMNS = (
     "position_evidence",
     "as_of",
 )
+# Standard nine-character CUSIP only; no undocumented padding or legacy aliases.
+_CUSIP_RE = re.compile(r"[0-9A-Z*@#]{8}[0-9]\Z")
+
+
+def _normalize_cusip(value: object) -> str:
+    if not isinstance(value, str):
+        raise ThirteenFError(f"Invalid 13F CUSIP: {value!r}")
+    cusip = value.strip().upper()
+    if not _CUSIP_RE.fullmatch(cusip):
+        raise ThirteenFError(f"Invalid 13F CUSIP: {value!r}")
+    values = [
+        int(character)
+        if character.isdigit()
+        else ord(character) - ord("A") + 10
+        if character.isalpha()
+        else {"*": 36, "@": 37, "#": 38}[character]
+        for character in cusip[:8]
+    ]
+    checksum = sum(
+        digit
+        for value, multiplier in zip(values, (1, 2) * 4, strict=True)
+        for digit in map(int, str(value * multiplier))
+    )
+    if str((-checksum) % 10) != cusip[8]:
+        raise ThirteenFError(f"Invalid 13F CUSIP check digit: {value!r}")
+    return cusip
 
 
 def _canonical_row(
@@ -88,17 +116,7 @@ def _canonical_row(
     raw_transaction_subtype=_SHARE_SUBTYPE,
 ) -> dict:
     """One canonical 13F row; shared by watchlist and discovery paths."""
-    row_id = cusip
-    if row_id is None or (isinstance(row_id, float) and pd.isna(row_id)) or not str(
-        row_id
-    ).strip():
-        # Unmatched issuers have no CUSIP; fall back to a stable composite so
-        # re-fetches dedupe instead of duplicating (or colliding on None).
-        # Best effort: identical composites for truly identical rows dedupe
-        # correctly; near-identical review rows may need human eyes.
-        row_id = (
-            f"{issuer}|{ticker or 'NOTICKER'}|{event_date}|{added_shares}"
-        )
+    row_id = _normalize_cusip(cusip)
     return {
         "doc_id": f"13f-{accession}",
         "member": manager_name,
@@ -154,13 +172,20 @@ def _parse_information_table(xml_content: bytes | str) -> dict[str, dict[str, ob
             if child is not entry
         }
         issuer = fields.get("nameOfIssuer", "")
-        cusip = fields.get("cusip", "").upper()
+        cusip = fields.get("cusip", "")
         shares_raw = fields.get("sshPrnamt", "")
         amount_type = fields.get("sshPrnamtType", "").upper()
+        put_call = fields.get("putCall", "")
         value_raw = fields.get("value", "")
         if not issuer or not cusip or not shares_raw:
             raise ThirteenFError(
                 "13F information table has a row missing issuer, CUSIP, or shares"
+            )
+        cusip = _normalize_cusip(cusip)
+        if amount_type not in {"SH", "PRN"}:
+            raise ThirteenFError(
+                f"Unrecognized 13F share amount type for CUSIP {cusip}: "
+                f"{amount_type!r}"
             )
         try:
             value_thousands = int(str(value_raw).replace(",", "")) if value_raw else None
@@ -172,7 +197,7 @@ def _parse_information_table(xml_content: bytes | str) -> dict[str, dict[str, ob
             raise ThirteenFError(f"Negative 13F reported value for CUSIP {cusip}")
         else:
             portfolio_value_total += value_thousands
-        if amount_type != "SH" or fields.get("putCall"):
+        if amount_type == "PRN" or put_call:
             continue
         try:
             shares = int(str(shares_raw).replace(",", ""))
@@ -206,6 +231,13 @@ def _parse_information_table(xml_content: bytes | str) -> dict[str, dict[str, ob
     for holding in holdings.values():
         holding["portfolio_value_thousands"] = portfolio_total
     return holdings
+
+
+def _validate_holdings_cusips(*holdings_sets) -> None:
+    for holdings in holdings_sets:
+        for cusip in holdings:
+            if _normalize_cusip(cusip) != cusip:
+                raise ThirteenFError(f"13F holding CUSIP is not canonical: {cusip!r}")
 
 
 def _portfolio_percentages(holdings: dict[str, dict[str, object]]) -> dict[str, float | None]:
@@ -354,7 +386,7 @@ class ThirteenFSource(TransactionSource):
         ):
             raise ThirteenFError("ticker_map must map non-empty CUSIPs to tickers")
         self.ticker_map = {
-            cusip.strip().upper(): ticker.strip()
+            _normalize_cusip(cusip): ticker.strip()
             for cusip, ticker in (ticker_map or {}).items()
         }
         self._sec = _SECClient(
@@ -461,6 +493,7 @@ class ThirteenFSource(TransactionSource):
         previous: dict[str, dict[str, object]],
         report_url: str,
     ) -> list[dict]:
+        _validate_holdings_cusips(current, previous)
         quarter_end = date.fromisoformat(current_filing["report_date"])
         disclosure_date = date.fromisoformat(current_filing["filing_date"])
         rows = []
@@ -508,6 +541,7 @@ class ThirteenFSource(TransactionSource):
         previous: dict[str, dict[str, object]],
         report_url: str,
     ) -> list[dict]:
+        _validate_holdings_cusips(current, previous)
         quarter_end = date.fromisoformat(current_filing["report_date"])
         disclosure_date = date.fromisoformat(current_filing["filing_date"])
         rows = []
@@ -649,6 +683,25 @@ class ThirteenFSource(TransactionSource):
                 "ingestion_generation"
             ].eq(self.ingestion_generation).all():
                 raise ThirteenFError("13F source or ingestion generation does not match")
+            for row in transactions.to_dict("records"):
+                source_row_id = row.get("source_row_id")
+                if _normalize_cusip(source_row_id) != source_row_id:
+                    raise ThirteenFError(
+                        f"13F source row identity is not canonical: {source_row_id!r}"
+                    )
+                accession = row.get("source_record_id")
+                if not isinstance(accession, str) or not accession.strip():
+                    raise ThirteenFError("13F source record identity is missing")
+                try:
+                    _accession_digits(accession)
+                except ValueError:
+                    raise ThirteenFError(
+                        f"13F source record identity is invalid: {accession!r}"
+                    ) from None
+                if not isinstance(row.get("source_report_path"), str) or not row[
+                    "source_report_path"
+                ].strip():
+                    raise ThirteenFError("13F source report path is missing")
         from analyzer.persistence.transaction_repository import (
             upsert_filing_transactions,
         )
@@ -673,13 +726,37 @@ class ThirteenFSource(TransactionSource):
             raise ThirteenFError("ingestion_generation is required for 13F persistence")
         rows = []
         for row in increases.to_dict("records"):
+            shares = row.get("added_shares")
+            if isinstance(shares, bool) or not isinstance(shares, Integral) or shares <= 0:
+                raise ThirteenFError(
+                    f"13F increase must have positive integral shares: {shares!r}"
+                )
+            _normalize_cusip(row.get("cusip"))
+            if row.get("source") != "13f":
+                raise ThirteenFError("13F increase source does not match")
+            accession = row.get("accession")
+            if not isinstance(accession, str) or not accession.strip():
+                raise ThirteenFError("13F increase accession is missing")
+            try:
+                _accession_digits(accession)
+            except ValueError:
+                raise ThirteenFError(
+                    f"13F increase accession is invalid: {accession!r}"
+                ) from None
+            if any(
+                not isinstance(row.get(field), str) or not row[field].strip()
+                for field in ("manager", "ticker", "raw_asset_description", "report_url")
+            ):
+                raise ThirteenFError("13F increase provenance is incomplete")
+            if row.get("event_date") is None or row.get("disclosure_date") is None:
+                raise ThirteenFError("13F increase dates are incomplete")
             rows.append(
                 _canonical_row(
                     manager_name=row.get("manager"),
                     ticker=row.get("ticker"),
                     event_date=row.get("event_date"),
                     disclosure_date=row.get("disclosure_date"),
-                    added_shares=row.get("added_shares") or 0,
+                    added_shares=shares,
                     amount_midpoint=None,
                     issuer=row.get("raw_asset_description"),
                     cusip=row.get("cusip"),

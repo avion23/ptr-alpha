@@ -839,7 +839,7 @@ class TestPositions(unittest.TestCase):
         )
         self.assertIn("Charles J Fleischmann", variants)
 
-    def test_unpromoted_loader_adds_deduped_raw(self):
+    def test_unpromoted_loader_adds_house_rows_from_other_filings(self):
         import duckdb
         from types import SimpleNamespace
 
@@ -850,21 +850,21 @@ class TestPositions(unittest.TestCase):
             "CREATE TABLE canonical_transactions AS SELECT * FROM "
             "(VALUES ('M', 'T', 'Purchase', DATE '2025-01-14', DATE '2025-02-01', "
             "750000.5, '$500,001 - $1,000,000', 'house_pdf', 'g0', 'a0', 'w0', "
-            "'option', NULL)) "
+            "'option', NULL, 'old-doc')) "
             "AS v(member, ticker, "
             "transaction_type, transaction_date, disclosure_date, amount_midpoint, "
             "amount_raw, source, ingestion_generation, source_record_id, "
-            "source_row_id, instrument_type, amends_source_record_id)"
+            "source_row_id, instrument_type, amends_source_record_id, doc_id)"
         )
         conn.execute(
             "CREATE TABLE transactions AS SELECT * FROM "
             "(VALUES ('M', 'T', 'Purchase', DATE '2026-01-16', DATE '2026-01-23', "
             "175000.5, '$100,001 - $250,000', 'house_pdf', 'g9', 'a9', 'w9', "
-            "'stock', NULL)) "
+            "'stock', NULL, 'new-doc')) "
             "AS v(member, ticker, transaction_type, transaction_date, "
             "disclosure_date, amount_midpoint, amount_raw, source, "
             "ingestion_generation, source_record_id, source_row_id, "
-            "instrument_type, amends_source_record_id)"
+            "instrument_type, amends_source_record_id, doc_id)"
         )
         db = SimpleNamespace(conn=conn)
         canon_only = load_member_trades(db, "M")
@@ -874,6 +874,202 @@ class TestPositions(unittest.TestCase):
         self.assertIn(
             date(2026, 1, 16), set(pd.to_datetime(widened["transaction_date"]).dt.date)
         )
+
+    def test_unpromoted_loader_honors_canonical_rowset_and_keeps_lots(self):
+        import duckdb
+        from types import SimpleNamespace
+
+        from analyzer.positions import (
+            build_positions,
+            holdings_candidates,
+            holdings_candidates_batch,
+            load_member_trades,
+        )
+
+        def trade(
+            source, doc_id, record_id, row_id, amount, created_at,
+            *, ticker="T", generation="g1",
+        ):
+            return {
+                "member": "M",
+                "ticker": ticker,
+                "transaction_type": "Purchase",
+                "transaction_date": date(2025, 1, 14),
+                "disclosure_date": date(2025, 1, 20),
+                "amount_midpoint": amount,
+                "source": source,
+                "instrument_type": "stock",
+                "source_record_id": record_id,
+                "source_row_id": row_id,
+                "ticker_origin": "filed",
+                "raw_asset_class": "stock",
+                "doc_id": doc_id,
+                "ingestion_generation": generation,
+                "artifact_sha256": "a" * 64,
+                "created_at": pd.Timestamp(created_at).to_pydatetime(),
+            }
+
+        canonical_rows = [
+            trade("gemini_ocr", "winner-doc", "gemini-record", "gemini-row", 20000, "2025-01-21")
+        ]
+        raw_rows = [
+            # Different producer row IDs, same accepted official filing.
+            trade(
+                "house_pdf", "winner-doc", "house-record", "house-lost", 10000,
+                "2025-01-21", generation="g0",
+            ),
+            # Distinct rows from another filing share coordinates; both lots survive.
+            trade(
+                "house_pdf", "raw-doc", "raw-record", "raw-lot-1", 5000,
+                "2025-01-21", ticker="U",
+            ),
+            trade(
+                "house_pdf", "raw-doc", "raw-record", "raw-lot-2", 7000,
+                "2025-01-21", ticker="U",
+            ),
+            # Old public dates do not make a post-cutoff row causally available.
+            trade("house_pdf", "future-doc", "future-record", "future-row", 9000, "2026-01-24"),
+        ]
+        conn = duckdb.connect()
+        conn.register("canonical_fixture", pd.DataFrame(canonical_rows))
+        conn.register("raw_fixture", pd.DataFrame(raw_rows))
+        conn.execute("CREATE TABLE canonical_transactions AS SELECT * FROM canonical_fixture")
+        conn.execute("CREATE TABLE transactions AS SELECT * FROM raw_fixture")
+        conn.execute(
+            "CREATE TABLE transaction_versions AS SELECT *, "
+            "CURRENT_TIMESTAMP AS retired_at FROM transactions WHERE FALSE"
+        )
+        conn.execute(
+            "CREATE TABLE prices AS SELECT * FROM (VALUES "
+            "('T', DATE '2025-01-14', 100.0), ('T', DATE '2026-01-23', 100.0), "
+            "('U', DATE '2025-01-14', 100.0), ('U', DATE '2026-01-23', 100.0)) "
+            "AS v(ticker, date, close)"
+        )
+        db = SimpleNamespace(conn=conn, _canonical_as_of=date(2026, 1, 23))
+        try:
+            widened = load_member_trades(db, "M", include_unpromoted=True)
+            self.assertEqual(len(widened), 3)
+            self.assertEqual(widened["source"].value_counts().to_dict(), {
+                "house_pdf": 2,
+                "gemini_ocr": 1,
+            })
+            self.assertEqual(set(widened["amount_midpoint"]), {5000, 7000, 20000})
+
+            positions = build_positions(
+                widened,
+                {
+                    ticker: _prices(["2025-01-14", "2026-01-23"], [100, 100])
+                    for ticker in ("T", "U")
+                },
+                as_of=date(2026, 1, 23),
+            )
+            costs = dict(zip(positions["ticker"], positions["total_cost"]))
+            self.assertEqual(costs, {"T": 20000, "U": 12000})
+            refs_by_ticker = dict(zip(positions["ticker"], positions["filing_refs"]))
+            self.assertEqual(
+                {ref["source_row_id"] for ref in refs_by_ticker["T"]},
+                {"gemini-row"},
+            )
+            self.assertEqual(
+                {ref["source_row_id"] for ref in refs_by_ticker["U"]},
+                {"raw-lot-1", "raw-lot-2"},
+            )
+
+            candidates = holdings_candidates(
+                db, "M", date(2026, 1, 23), include_unpromoted=True
+            )
+            candidate_refs = dict(zip(candidates["ticker"], candidates["filing_refs"]))
+            self.assertEqual(
+                {ref["source_row_id"] for ref in candidate_refs["T"]}, {"gemini-row"}
+            )
+            self.assertEqual(
+                {ref["source_row_id"] for ref in candidate_refs["U"]},
+                {"raw-lot-1", "raw-lot-2"},
+            )
+            batched = holdings_candidates_batch(
+                db, ["M"], date(2026, 1, 23), include_unpromoted=True
+            )["M"]
+            batch_refs = dict(zip(batched["ticker"], batched["filing_refs"]))
+            self.assertEqual(
+                {ref["source_row_id"] for ref in batch_refs["T"]}, {"gemini-row"}
+            )
+            self.assertEqual(
+                {ref["source_row_id"] for ref in batch_refs["U"]},
+                {"raw-lot-1", "raw-lot-2"},
+            )
+        finally:
+            conn.close()
+
+    def test_empty_or_unaccepted_gemini_keeps_raw_house_fallback(self):
+        import duckdb
+        from types import SimpleNamespace
+
+        from analyzer.positions import load_member_trades
+
+        def row(source, row_id, *, doc_id="fallback-doc"):
+            return {
+                "member": "M",
+                "ticker": "T",
+                "transaction_type": "Purchase",
+                "transaction_date": date(2025, 1, 14),
+                "disclosure_date": date(2025, 1, 20),
+                "amount_midpoint": 10000,
+                "amount_raw": None,
+                "source": source,
+                "source_record_id": f"{source}-record",
+                "source_row_id": row_id,
+                "doc_id": doc_id,
+                "ingestion_generation": "g1",
+                "artifact_sha256": "b" * 64,
+            }
+
+        cases = (
+            ("empty", []),
+            ("failed-or-unaccepted", [row("gemini_ocr", "failed-gemini-row")]),
+            ("orphan", [row("gemini_ocr", "orphan-gemini-row", doc_id="orphan-doc")]),
+        )
+        for case, gemini_rows in cases:
+            with self.subTest(case=case):
+                conn = duckdb.connect()
+                conn.register(
+                    "raw_fixture",
+                    pd.DataFrame([row("house_pdf", "house-fallback"), *gemini_rows]),
+                )
+                conn.register(
+                    "canonical_fixture",
+                    pd.DataFrame([row("house_pdf", "shape")]).iloc[0:0],
+                )
+                conn.execute("CREATE TABLE canonical_transactions AS SELECT * FROM canonical_fixture")
+                conn.execute("CREATE TABLE transactions AS SELECT * FROM raw_fixture")
+                try:
+                    widened = load_member_trades(
+                        SimpleNamespace(conn=conn), "M", include_unpromoted=True
+                    )
+                    self.assertEqual(widened["source"].tolist(), ["house_pdf"])
+                    self.assertEqual(widened["source_row_id"].tolist(), ["house-fallback"])
+                finally:
+                    conn.close()
+
+        # A NULL document identity is unknown, not an equality key that may
+        # collapse a separate, identified fallback filing.
+        conn = duckdb.connect()
+        unknown = row("gemini_ocr", "unknown-gemini-row", doc_id=None)
+        unknown_frame = pd.DataFrame([unknown])
+        unknown_frame["doc_id"] = pd.Series([None], dtype="string")
+        conn.register("canonical_fixture", unknown_frame)
+        conn.register("raw_fixture", pd.DataFrame([row("house_pdf", "house-fallback")]))
+        conn.execute("CREATE TABLE canonical_transactions AS SELECT * FROM canonical_fixture")
+        conn.execute("CREATE TABLE transactions AS SELECT * FROM raw_fixture")
+        try:
+            widened = load_member_trades(
+                SimpleNamespace(conn=conn), "M", include_unpromoted=True
+            )
+            self.assertEqual(
+                set(widened["source_row_id"]),
+                {"unknown-gemini-row", "house-fallback"},
+            )
+        finally:
+            conn.close()
 
     def test_holdings_candidates_schema_and_option_filter(self):
         db, conn = _holdings_db(

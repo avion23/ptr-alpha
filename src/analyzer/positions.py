@@ -1229,31 +1229,14 @@ def holdings_candidates_batch(
         by_member = {member: canonical for member in members}
 
     if include_unpromoted:
-        raw = db.conn.execute(
-            f"""
-            SELECT {_loader_select(db, "transactions")}
-            FROM (
-                SELECT t.*,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY member, ticker, transaction_date,
-                            transaction_type, disclosure_date
-                        ORDER BY amount_midpoint DESC NULLS LAST
-                    ) AS rn
-                FROM transactions t
-                WHERE t.member = ANY(?)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM canonical_transactions c
-                      WHERE c.source IS NOT DISTINCT FROM t.source
-                        AND c.source_record_id IS NOT DISTINCT FROM t.source_record_id
-                        AND c.source_row_id IS NOT DISTINCT FROM t.source_row_id
-                        AND c.ingestion_generation IS NOT DISTINCT FROM t.ingestion_generation
-                  )
-            )
-            WHERE rn = 1
-            """,
-            [universe],
-        ).fetchdf()
+        raw = _load_unpromoted_rows(db, universe)
         if not raw.empty:
+            logger.warning(
+                "Including %d unvalidated raw House rows across %d members; "
+                "accepted canonical filing rowsets take precedence",
+                len(raw),
+                raw["member"].nunique(),
+            )
             for member in members:
                 mine_raw = raw.loc[raw["member"].isin(variants[member])].copy()
                 if mine_raw.empty:
@@ -1675,14 +1658,79 @@ def _loader_select(db, table: str) -> str:
     return ", ".join(selected) if selected else "*"
 
 
+def _unpromoted_transaction_source(db) -> tuple[str, str]:
+    """Raw transaction rows visible in the current canonical as-of scope."""
+    as_of = getattr(db, "_canonical_as_of", None)
+    if as_of is None:
+        return "transactions t", ""
+
+    boundary = f"DATE '{pd.Timestamp(as_of).date().isoformat()}' + INTERVAL 1 DAY"
+    tables = {row[0] for row in db.conn.execute("SHOW TABLES").fetchall()}
+    columns = {
+        row[1] for row in db.conn.execute("PRAGMA table_info('transactions')").fetchall()
+    }
+    if "created_at" not in columns:
+        raise PositionsError(
+            "--include-unpromoted requires transaction created_at for an as-of read"
+        )
+
+    if "transaction_versions" in tables:
+        return (
+            """(
+                SELECT * FROM (
+                    SELECT * FROM transactions
+                    UNION ALL
+                    SELECT * EXCLUDE (retired_at) FROM transaction_versions
+                    WHERE retired_at >= {boundary}
+                ) versions
+                WHERE created_at < {boundary}
+            ) t""".format(boundary=boundary),
+            "",
+        )
+    return "transactions t", f" AND t.created_at < {boundary}"
+
+
+def _load_unpromoted_rows(db, members: list[str]) -> pd.DataFrame:
+    """Load only causally visible House rows without a canonical filing winner."""
+    if not members:
+        return pd.DataFrame()
+    raw_source, temporal_filter = _unpromoted_transaction_source(db)
+    for table in ("transactions", "canonical_transactions"):
+        columns = {
+            row[1]
+            for row in db.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "doc_id" not in columns:
+            raise PositionsError(
+                "--include-unpromoted requires doc_id to select whole filing rowsets"
+            )
+
+    return db.conn.execute(
+        f"""
+        SELECT {_loader_select(db, "transactions")}
+        FROM {raw_source}
+        WHERE t.member IN (SELECT UNNEST(?))
+          AND t.source = 'house_pdf'
+          {temporal_filter}
+          AND NOT EXISTS (
+              SELECT 1 FROM canonical_transactions c
+              WHERE c.source IN ('house_pdf', 'gemini_ocr')
+                AND c.doc_id IS NOT NULL
+                AND t.doc_id IS NOT NULL
+                AND c.doc_id = t.doc_id
+          )
+        """,
+        [members],
+    ).fetchdf()
+
+
 def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> pd.DataFrame:
     """All canonical rows for one member across every year and source.
 
-    With include_unpromoted, raw filings from not-yet-promoted House
-    generations are added (deduped to one row per economic event, preferring
-    closed bands). Those rows are UNVALIDATED: same filing may parse
-    differently across generations, so amounts are approximate. Canonical
-    rows always win; the flag only widens recency, never scoring.
+    With include_unpromoted, raw House rows are added only when their filing
+    has no accepted canonical House/Gemini rowset. They remain UNVALIDATED;
+    raw producer output is not an alternate source of canonical authority.
+    The as-of scope also bounds raw rows by their recorded creation time.
     """
     canonical = db.conn.execute(
         f"""
@@ -1695,33 +1743,11 @@ def load_member_trades(db, member: str, *, include_unpromoted: bool = False) -> 
     if not include_unpromoted:
         return canonical.sort_values("transaction_date", kind="mergesort")
 
-    raw = db.conn.execute(
-        f"""
-        SELECT {_loader_select(db, "transactions")}
-        FROM (
-            SELECT t.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY member, ticker, transaction_date,
-                        transaction_type, disclosure_date
-                    ORDER BY amount_midpoint DESC NULLS LAST
-                ) AS rn
-            FROM transactions t
-            WHERE t.member IN (SELECT UNNEST(?))
-              AND NOT EXISTS (
-                  SELECT 1 FROM canonical_transactions c
-                  WHERE c.source IS NOT DISTINCT FROM t.source
-                    AND c.source_record_id IS NOT DISTINCT FROM t.source_record_id
-                    AND c.source_row_id IS NOT DISTINCT FROM t.source_row_id
-                    AND c.ingestion_generation IS NOT DISTINCT FROM t.ingestion_generation
-              )
-        )
-        WHERE rn = 1
-        """,
-        [_member_variants(db, member)],
-    ).fetchdf()
+    raw = _load_unpromoted_rows(db, _member_variants(db, member))
     combined = pd.concat([canonical, raw], ignore_index=True)
     logger.warning(
-        "Including %d unvalidated unpromoted rows for %s alongside %d canonical",
+        "Including %d unvalidated raw House rows for %s alongside %d canonical; "
+        "accepted canonical filing rowsets take precedence",
         len(raw),
         member,
         len(canonical),

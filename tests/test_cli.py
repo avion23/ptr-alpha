@@ -19,8 +19,8 @@ class TestHouseAcquisitionDatabase(unittest.TestCase):
     def test_real_connection_is_closed_after_query_or_query_error(self):
         import duckdb
 
-        from analyzer.cli import _HouseAcquisitionDatabase
         from analyzer.database import Database
+        from analyzer.house_refresh import _HouseAcquisitionDatabase
 
         with TemporaryDirectory() as directory:
             path = Path(directory) / "congress.duckdb"
@@ -30,7 +30,10 @@ class TestHouseAcquisitionDatabase(unittest.TestCase):
                 with self.subTest(archive_year=archive_year):
                     retained = Database(path, read_only=True)
                     try:
-                        with patch("analyzer.cli._open_database", return_value=retained):
+                        with patch(
+                            "analyzer.house_refresh._open_database",
+                            return_value=retained,
+                        ):
                             if archive_year == 2026:
                                 self.assertTrue(proxy.get_metadata(archive_year).empty)
                             else:
@@ -375,7 +378,7 @@ class TestCliApp(unittest.TestCase):
         with (
             patch("analyzer.cli.get_context", return_value=mock_ctx),
             patch(
-                "analyzer.cli.run_parse_pipeline",
+                "analyzer.house_refresh.run_parse_pipeline",
                 return_value=StepResult(success=True),
             ),
             patch("analyzer.capitol_trades.CapitolTradesSource") as capitol,

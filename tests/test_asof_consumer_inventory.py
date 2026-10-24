@@ -64,7 +64,6 @@ EXEMPT = {
     "scripts/refresh_prices.py:_recent_active_tickers": 1,  # Dividend-download universe, not decision selection.
     "scripts/reparse_all.py:_persisted_house_generation_counts": 1,  # Ingestion reconciliation.
     "src/analyzer/actors.py:_load_actor_members": 1,  # Caller-owned: scoped load_skill_table; name monitored.
-    "src/analyzer/cli.py:refresh": 5,  # Current refresh reporting/coverage only.
     "src/analyzer/database.py:Database._init_canonical_transactions_view": 4,  # Scope implementation itself.
     "src/analyzer/database.py:Database._init_transactions_table": 1,  # Schema/history initialization.
     "src/analyzer/database.py:Database.get_entry_prices": 1,  # Caller-owned repository forwarding.
@@ -82,6 +81,8 @@ EXEMPT = {
     "src/analyzer/form4.py:Form4Source.get_transactions": 1,  # Caller-owned source forwarding.
     "src/analyzer/freshness.py:form4_freshness": 1,  # Monitoring aggregate: newest form4 disclosure date, not decision selection.
     "src/analyzer/freshness.py:house_ingestion_freshness": 1,  # Monitoring aggregate: newest House disclosure date, not decision selection.
+    "src/analyzer/house_refresh.py:complete_house_refresh": 1,  # Refresh reporting and generation finalization, not decision selection.
+    "src/analyzer/house_refresh.py:house_refresh_counts": 2,  # Refresh before/after population counts, not decision selection.
     "src/analyzer/parse_run_repository.py:ParseRunRepository.upsert": 1,  # Ingestion timestamp provenance.
     "src/analyzer/pipeline.py:_analysis_transactions": 1,  # Caller-owned: scoped prepare_analysis_data.
     "src/analyzer/positions.py:_distinct_member_names": 2,  # Caller-owned identity expansion, batched _member_variants; name monitored.

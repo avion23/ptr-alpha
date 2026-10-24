@@ -105,7 +105,8 @@ def test_refresh_summary_is_scoped_to_requested_year(tmp_path):
         with (
             patch("analyzer.cli.get_context", return_value=ctx),
             patch(
-                "analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)
+                "analyzer.house_refresh.run_parse_pipeline",
+                return_value=StepResult(success=True),
             ),
         ):
             result = CliRunner().invoke(
@@ -661,7 +662,7 @@ def test_refresh_stops_before_parse_and_backup_when_house_fetch_is_incomplete(
     try:
         with (
             patch("analyzer.cli.get_context", return_value=ctx),
-            patch("analyzer.cli.run_parse_pipeline") as parse_pipeline,
+            patch("analyzer.house_refresh.run_parse_pipeline") as parse_pipeline,
             patch("analyzer.capitol_trades.CapitolTradesSource") as capitol_source,
         ):
             result = CliRunner().invoke(app, ["refresh", "--year", "2026"])
@@ -672,6 +673,52 @@ def test_refresh_stops_before_parse_and_backup_when_house_fetch_is_incomplete(
     assert "missing 1: 2002 (HTTP 503)" in result.output
     parse_pipeline.assert_not_called()
     capitol_source.assert_not_called()
+
+
+def test_refresh_fails_closed_for_unresolved_house_ptr(tmp_path):
+    class FakeDatabase:
+        def __init__(self):
+            self.conn = self
+            self.mark_house_generation_parse_complete = MagicMock()
+
+        def execute(self, *_args):
+            return self
+
+        def fetchone(self):
+            return (0, 0, 0)
+
+        def get_latest_house_generation(self, _year):
+            return "generation-2024"
+
+        def get_unresolved_house_doc_ids(self, _year, _generation):
+            return ["P-123"]
+
+    ctx = MagicMock()
+    ctx.transaction_source.db = FakeDatabase()
+    ctx.settings.data.data_dir = str(tmp_path)
+    ctx.transaction_source.fetch_and_cache_pdfs.return_value = HouseFetchSummary(
+        archive_year=2024,
+        metadata_count=1,
+        ptr_count=1,
+        valid_pdf_count=1,
+        downloaded_count=1,
+        skipped_count=0,
+        orphan_pdf_count=0,
+    )
+
+    with (
+        patch("analyzer.cli.get_context", return_value=ctx),
+        patch(
+            "analyzer.house_refresh.run_parse_pipeline",
+            return_value=StepResult(success=True),
+        ),
+    ):
+        result = CliRunner().invoke(app, ["refresh", "--year", "2024"])
+
+    assert result.exit_code == 1, result.output
+    assert "1 unresolved PDFs (P-123)" in result.output
+    assert "FAILED steps: unresolved_house:2024" in result.output
+    ctx.transaction_source.db.mark_house_generation_parse_complete.assert_not_called()
 
 
 def test_multi_year_refresh_reopens_after_second_fetch_failure_and_exits_incomplete(
@@ -725,9 +772,12 @@ def test_multi_year_refresh_reopens_after_second_fetch_failure_and_exits_incompl
     with (
         patch("analyzer.cli.get_context", return_value=ctx),
         patch("analyzer.cli._HOUSE_PTR_FIRST_ARCHIVE_YEAR", first_year),
-        patch("analyzer.cli._open_database", side_effect=databases[1:]) as reopen,
         patch(
-            "analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)
+            "analyzer.house_refresh._open_database", side_effect=databases[1:]
+        ) as reopen,
+        patch(
+            "analyzer.house_refresh.run_parse_pipeline",
+            return_value=StepResult(success=True),
         ) as parse_pipeline,
     ):
         result = CliRunner().invoke(app, ["refresh", "--all-years", "--skip-capitol"])
@@ -780,7 +830,8 @@ def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
         with (
             patch("analyzer.cli.get_context", return_value=ctx),
             patch(
-                "analyzer.cli.run_parse_pipeline", return_value=StepResult(success=True)
+                "analyzer.house_refresh.run_parse_pipeline",
+                return_value=StepResult(success=True),
             ) as parse_pipeline,
         ):
             result = CliRunner().invoke(
@@ -870,9 +921,9 @@ def test_refresh_releases_writer_between_acquisition_and_parse(tmp_path):
     try:
         with (
             patch("analyzer.cli.get_context", return_value=app_ctx),
-            patch("analyzer.cli._open_database", side_effect=open_database),
+            patch("analyzer.house_refresh._open_database", side_effect=open_database),
             patch(
-                "analyzer.cli.run_parse_pipeline",
+                "analyzer.house_refresh.run_parse_pipeline",
                 return_value=StepResult(success=True),
             ),
         ):

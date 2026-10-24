@@ -2,7 +2,6 @@
 
 import logging
 import os
-import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -25,6 +24,13 @@ from analyzer.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
 from analyzer.freshness import FreshnessCheck, monitoring_checks
+from analyzer.house_refresh import (
+    _open_database,
+    acquire_house_archives,
+    complete_house_refresh,
+    house_refresh_counts,
+    parse_house_archives,
+)
 from analyzer.models import AnalysisMode
 from analyzer.pipeline import (
     AnalysisParams,
@@ -66,10 +72,6 @@ def _parse_cli_date(value, error_message, default=None):
         return date.fromisoformat(value)
     except ValueError:
         _cli_exit(1, error_message)
-
-
-def _open_database(data_dir, read_only):
-    return Database(Path(data_dir) / "congress.duckdb", read_only=read_only)
 
 
 def _new_ingestion_generation():
@@ -115,76 +117,6 @@ def get_context(ctx, data_dir=None, read_only=False):
             ),
         )
     return ctx.obj
-
-
-class _DatabaseContextReleaseError(RuntimeError):
-    pass
-
-
-class _HouseAcquisitionDatabase:
-    """Open a database only for each House acquisition query or promotion.
-
-    House PDF downloads can take hours. Keep no DuckDB connection open while
-    they run; the only write operation in acquisition is archive promotion.
-    """
-
-    _WRITE_METHODS = frozenset({"promote_house_archive"})
-
-    def __init__(self, data_dir: str | Path):
-        self.data_dir = data_dir
-
-    def __getattr__(self, name):
-        def call(*args, **kwargs):
-            db = _open_database(
-                self.data_dir, read_only=name not in self._WRITE_METHODS
-            )
-            try:
-                result = getattr(db, name)(*args, **kwargs)
-            except BaseException:
-                try:
-                    db.close()
-                except Exception as exc:
-                    raise _DatabaseContextReleaseError(
-                        f"Failed to close House acquisition database after {name}"
-                    ) from exc
-                raise
-            else:
-                try:
-                    db.close()
-                except Exception as exc:
-                    raise _DatabaseContextReleaseError(
-                        f"Failed to close House acquisition database after {name}"
-                    ) from exc
-            return result
-
-        return call
-
-
-def _set_shared_database(app_ctx: AppContext, db) -> None:
-    for owner in (app_ctx.transaction_source, app_ctx.price_source):
-        if owner is not None:
-            owner.db = db
-
-
-def _release_shared_database(app_ctx: AppContext) -> None:
-    """Close the shared real DB handle and clear both source references."""
-    db = getattr(getattr(app_ctx, "transaction_source", None), "db", None)
-    if isinstance(db, Database):
-        db.close()
-    _set_shared_database(app_ctx, None)
-
-
-def _prepare_house_acquisition_database(app_ctx: AppContext) -> bool:
-    """Release the initial writer and install lock-free acquisition access."""
-    if not isinstance(app_ctx.transaction_source, HouseTransactionSource):
-        return False
-    db = getattr(getattr(app_ctx, "transaction_source", None), "db", None)
-    if not isinstance(db, Database):
-        return False
-    data_dir = app_ctx.settings.data.data_dir
-    db.close()
-    _set_shared_database(app_ctx, _HouseAcquisitionDatabase(data_dir))
-    return True
 
 
 def _save_results(
@@ -1351,12 +1283,9 @@ def refresh(
             f"({excluded_years[0]}-{excluded_years[-1]}), PDF inventory unavailable"
         )
 
-    canonical_count_before = app_ctx.transaction_source.db.conn.execute(
-        "SELECT COUNT(*) FROM canonical_transactions"
-    ).fetchone()[0]
-    raw_count_before = app_ctx.transaction_source.db.conn.execute(
-        "SELECT COUNT(*) FROM transactions"
-    ).fetchone()[0]
+    canonical_count_before, raw_count_before = house_refresh_counts(
+        app_ctx.transaction_source.db
+    )
     failed_steps: list[str] = []
 
     # Fetch every requested archive before parsing or invoking a backup source.
@@ -1367,73 +1296,26 @@ def refresh(
         else str(archive_years[0])
     )
     print(f"[1/4] Fetching and reconciling House PDF archives {label}...")
-    summaries = []
-    fetch_failed_years: list[int] = []
-    # Single-year refresh keeps fail-fast; multi-year refresh quarantines a
-    # twice-failed year and continues. DuckDB can invalidate the shared
-    # connection after an index maintenance failure, so reopen after each
-    # failed attempt before retry, the next archive, or parsing.
-    fail_fast = len(archive_years) == 1
-
-    def reopen_shared_database() -> None:
-        if isinstance(app_ctx.transaction_source.db, _HouseAcquisitionDatabase):
-            # The acquisition proxy owns no persistent connection; every DB
-            # call is already a fresh, bounded handle.
-            return
-        app_ctx.transaction_source.db.close()
-        fresh_db = _open_database(app_ctx.settings.data.data_dir, False)
-        _set_shared_database(app_ctx, fresh_db)
-
-    try:
-        database_lifecycle = _prepare_house_acquisition_database(app_ctx)
-        for archive_year in archive_years:
-            try:
-                summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
-                    archive_year,
-                    refresh_metadata=(
-                        all_years
-                        or refresh_metadata
-                        or archive_year == date.today().year
-                    ),
-                )
-            except Exception as year_exc:
-                if isinstance(year_exc, _DatabaseContextReleaseError):
-                    raise
-                if fail_fast:
-                    raise
-                logger.warning(
-                    "House archive %d fetch failed, reopening database: %s",
-                    archive_year,
-                    year_exc,
-                )
-                reopen_shared_database()
-                try:
-                    summary = app_ctx.transaction_source.fetch_and_cache_pdfs(
-                        archive_year,
-                        refresh_metadata=(
-                            all_years
-                            or refresh_metadata
-                            or archive_year == date.today().year
-                        ),
-                    )
-                except Exception as retry_exc:
-                    if isinstance(retry_exc, _DatabaseContextReleaseError):
-                        raise
-                    logger.warning(
-                        "House archive %d failed twice, skipping: %s",
-                        archive_year,
-                        retry_exc,
-                    )
-                    fetch_failed_years.append(archive_year)
-                    reopen_shared_database()
-                    continue
-            summaries.append(summary)
-            _print_house_fetch_summary(summary)
-    except Exception as exc:
-        logger.warning("House PDF fetch failed: %s", exc)
+    acquisition, database_lifecycle = acquire_house_archives(
+        app_ctx.transaction_source,
+        app_ctx.price_source,
+        archive_years,
+        app_ctx.settings.data.data_dir,
+        all_years=all_years,
+        refresh_metadata=refresh_metadata,
+    )
+    if acquisition.data is None:
+        exc = acquisition.error or DataSourceError("House acquisition failed")
         print(f"House fetch incomplete: {exc}")
         print("FAILED steps: fetch")
         _cli_exit(1)
+    summaries = acquisition.data
+    fetched_years = {summary.archive_year for summary in summaries}
+    fetch_failed_years = [
+        archive_year for archive_year in archive_years if archive_year not in fetched_years
+    ]
+    for summary in summaries:
+        _print_house_fetch_summary(summary)
 
     print(
         "  House totals: "
@@ -1453,29 +1335,17 @@ def refresh(
         )
 
     print(f"[2/4] Parsing cached House PDF archives {label}...")
-    for archive_year in archive_years:
-        if database_lifecycle:
-            # Parse-run recording gets one writer context per archive, not the
-            # acquisition handle or a lock spanning the all-years loop.
-            parse_db = _open_database(app_ctx.settings.data.data_dir, False)
-            _set_shared_database(app_ctx, parse_db)
-        try:
-            try:
-                # Activation belongs after optional OCR, not in the parse step.
-                parse_result = run_parse_pipeline(
-                    app_ctx.transaction_source,
-                    archive_year,
-                    force=force_full_reparse,
-                    activate_generation=False,
-                )
-                if not parse_result.success:
-                    failed_steps.append(f"parse:{archive_year}")
-            except Exception as exc:
-                failed_steps.append(f"parse:{archive_year}")
-                logger.warning("PDF parse failed for %d: %s", archive_year, exc)
-        finally:
-            if database_lifecycle:
-                _release_shared_database(app_ctx)
+    failed_steps.extend(
+        f"parse:{archive_year}"
+        for archive_year in parse_house_archives(
+            app_ctx.transaction_source,
+            app_ctx.price_source,
+            archive_years,
+            app_ctx.settings.data.data_dir,
+            database_lifecycle=database_lifecycle,
+            force=force_full_reparse,
+        )
+    )
 
     # Step 3: Third-party reconciliation is never part of official refresh.
     if skip_capitol:
@@ -1513,69 +1383,38 @@ def refresh(
     else:
         print("[4/4] Skipping Gemini OCR (use --gemini-ocr to enable)")
 
-    if database_lifecycle:
-        # OCR owns its child-process write handle. Final generation checks and
-        # reporting get a fresh, short-lived parent context.
-        final_db = _open_database(app_ctx.settings.data.data_dir, False)
-        _set_shared_database(app_ctx, final_db)
-
-    try:
-        for archive_year in archive_years:
-            generation_id = app_ctx.transaction_source.db.get_latest_house_generation(
-                archive_year
-            )
-            if generation_id is None:
-                failed_steps.append(f"missing_house_generation:{archive_year}")
-                continue
-            unresolved = app_ctx.transaction_source.db.get_unresolved_house_doc_ids(
-                archive_year, generation_id
-            )
-            if not unresolved:
-                app_ctx.transaction_source.db.mark_house_generation_parse_complete(
-                    archive_year, generation_id
-                )
-                print(
-                    f"  House {archive_year} generation={generation_id} "
-                    "status=complete (activated)"
-                )
-                continue
-            failed_steps.append(f"unresolved_house:{archive_year}")
-            preview = ", ".join(unresolved[:10])
+    generation_outcomes, metrics = complete_house_refresh(
+        app_ctx.transaction_source,
+        app_ctx.price_source,
+        archive_years,
+        app_ctx.settings.data.data_dir,
+        database_lifecycle=database_lifecycle,
+    )
+    for archive_year in archive_years:
+        generation_id, unresolved = generation_outcomes[archive_year]
+        if generation_id is None:
+            failed_steps.append(f"missing_house_generation:{archive_year}")
+            continue
+        if not unresolved:
             print(
-                f"  House {archive_year} generation incomplete: "
-                f"{len(unresolved)} unresolved PDFs ({preview})"
+                f"  House {archive_year} generation={generation_id} "
+                "status=complete (activated)"
             )
+            continue
+        failed_steps.append(f"unresolved_house:{archive_year}")
+        preview = ", ".join(unresolved[:10])
+        print(
+            f"  House {archive_year} generation incomplete: "
+            f"{len(unresolved)} unresolved PDFs ({preview})"
+        )
 
-        db = app_ctx.transaction_source.db
-        canonical_count_after = db.conn.execute(
-            "SELECT COUNT(*) FROM canonical_transactions"
-        ).fetchone()[0]
-        raw_count_after = db.conn.execute(
-            "SELECT COUNT(*) FROM transactions"
-        ).fetchone()[0]
-        summary_year = archive_years[-1]
-        max_date, max_disclosure_date, implausible_date_count = db.conn.execute(
-            """
-            SELECT
-                MAX(transaction_date) FILTER (
-                    WHERE transaction_date IS NULL OR transaction_date <= disclosure_date
-                ),
-                MAX(disclosure_date),
-                (
-                    SELECT COUNT(*)
-                    FROM transactions raw
-                    WHERE raw.source IN ('house_pdf', 'gemini_ocr', 'senate_efd')
-                      AND EXTRACT(YEAR FROM raw.disclosure_date) = ?
-                      AND raw.transaction_date > raw.disclosure_date
-                )
-            FROM canonical_transactions
-            WHERE EXTRACT(YEAR FROM disclosure_date) = ?
-            """,
-            [summary_year, summary_year],
-        ).fetchone()
-    finally:
-        if database_lifecycle:
-            _release_shared_database(app_ctx)
+    (
+        canonical_count_after,
+        raw_count_after,
+        max_date,
+        max_disclosure_date,
+        implausible_date_count,
+    ) = metrics
 
     canonical_added = canonical_count_after - canonical_count_before
     raw_added = raw_count_after - raw_count_before

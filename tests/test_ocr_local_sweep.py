@@ -122,7 +122,16 @@ class TestNoTxsPolicy(unittest.TestCase):
 class TestNoTxsReclassification(unittest.TestCase):
     @staticmethod
     def _stage(out, doc_id, *, status, reasons, rows=None):
-        rows = rows or []
+        rows = [
+            {
+                **row,
+                "doc_id": doc_id,
+                "source_record_id": doc_id,
+                "source_row_id": row.get("source_row_id", f"{doc_id}:test:{index}"),
+                "artifact_sha256": row.get("artifact_sha256", "source-hash"),
+            }
+            for index, row in enumerate(rows or [], 1)
+        ]
         ocr.stage_document(
             out,
             {
@@ -142,7 +151,9 @@ class TestNoTxsReclassification(unittest.TestCase):
             },
         )
         ocr.write_manifest(out, kind="sweep", data_dir=out)
-        return out / "docs" / f"{doc_id}.json", out / "rows" / f"{doc_id}.jsonl"
+        envelope_path = out / "docs" / f"{doc_id}.json"
+        envelope = json.loads(envelope_path.read_text())
+        return envelope_path, out / envelope["rows_file"]
 
     def _assert_demoted(self, reasons, doc_id):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,6 +279,27 @@ class TestNoTxsReclassification(unittest.TestCase):
             self.assertEqual(manifest["total_rows"], 1)
             self.assertEqual(manifest["no_txs_count"], 0)
 
+    def test_resolved_positive_pair_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            envelope_path, rows_path = self._stage(
+                out,
+                "resolved-pair-mismatch",
+                status="resolved",
+                reasons=["positive OCR evidence"],
+                rows=[{"asset_description": "Positive row"}],
+            )
+            rows_path.write_text('{"doc_id":"resolved-pair-mismatch"}\n')
+            before = {
+                envelope_path: envelope_path.read_bytes(),
+                rows_path: rows_path.read_bytes(),
+                out / "manifest.json": (out / "manifest.json").read_bytes(),
+            }
+            with self.assertRaisesRegex(ValueError, "rows_file/hash conflict"):
+                reclassify.reclassify_no_txs(out)
+            for path, contents in before.items():
+                self.assertEqual(path.read_bytes(), contents)
+
     def test_root_lock_serializes_same_root_without_blocking_other_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -288,7 +320,13 @@ class TestNoTxsReclassification(unittest.TestCase):
                 "covered_pages": [1, 2],
                 "uncovered_pages": [],
                 "row_count": 1,
-                "rows": [{"asset_description": "Positive row"}],
+                "rows": [{
+                    "doc_id": doc_id,
+                    "source_record_id": doc_id,
+                    "source_row_id": f"{doc_id}:page:1:row:1",
+                    "artifact_sha256": "positive-source",
+                    "asset_description": "Positive row",
+                }],
                 "reasons": ["positive OCR evidence"],
                 "engines": [],
                 "canary": None,
@@ -326,7 +364,17 @@ class TestNoTxsReclassification(unittest.TestCase):
                     stage_done.set()
 
             def publish_other_root():
-                other = {**positive, "doc_id": "independent-output"}
+                other = {
+                    **positive,
+                    "doc_id": "independent-output",
+                    "rows": [{
+                        "doc_id": "independent-output",
+                        "source_record_id": "independent-output",
+                        "source_row_id": "independent-output:page:1:row:1",
+                        "artifact_sha256": "positive-source",
+                        "asset_description": "Positive row",
+                    }],
+                }
                 try:
                     ocr.stage_document(other_out, other)
                     ocr.write_manifest(other_out, kind="sweep", data_dir=other_out)
@@ -377,14 +425,20 @@ class TestNoTxsReclassification(unittest.TestCase):
             self.assertFalse(stage_thread.is_alive(), "staging or manifest publication deadlocked")
             self.assertEqual(errors, [])
             envelope_path = out / "docs" / f"{doc_id}.json"
-            rows_path = out / "rows" / f"{doc_id}.jsonl"
             envelope = json.loads(envelope_path.read_text())
+            rows_path = out / envelope["rows_file"]
             rows = rows_path.read_bytes()
             manifest = json.loads((out / "manifest.json").read_text())
             self.assertEqual(envelope["status"], "resolved")
             self.assertEqual(envelope["artifact_sha256"], "positive-source")
             self.assertEqual(envelope["row_count"], 1)
-            self.assertEqual(rows, b'{"asset_description": "Positive row"}\n')
+            self.assertEqual(
+                rows,
+                b'{"artifact_sha256": "positive-source", '
+                b'"asset_description": "Positive row", "doc_id": "positive-race", '
+                b'"source_record_id": "positive-race", '
+                b'"source_row_id": "positive-race:page:1:row:1"}\n',
+            )
             self.assertEqual(envelope["rows_file_sha256"], ocr.sha256_file(rows_path))
             self.assertEqual(manifest["resolved_count"], 1)
             self.assertEqual(manifest["total_rows"], 1)
@@ -428,7 +482,8 @@ class TestNoTxsReclassification(unittest.TestCase):
                 else:
                     manifest_path = out / "manifest.json"
                     manifest = json.loads(manifest_path.read_text())
-                    manifest["staged_files_sha256"][f"rows/{doc_id}.jsonl"] = "stale"
+                    envelope = json.loads(envelope_path.read_text())
+                    manifest["staged_files_sha256"][envelope["rows_file"]] = "stale"
                     manifest_path.write_text(
                         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
                     )
@@ -437,12 +492,7 @@ class TestNoTxsReclassification(unittest.TestCase):
                     for path in (envelope_path, rows_path, out / "manifest.json")
                 }
 
-                expected = (
-                    "recorded row hashes conflict"
-                    if positive
-                    else "zero-row claim conflict"
-                )
-                with self.assertRaisesRegex(ValueError, expected):
+                with self.assertRaisesRegex(ValueError, "rows_file/hash conflict"):
                     reclassify.reclassify_no_txs(out)
 
                 for path, contents in before.items():
@@ -790,7 +840,18 @@ class TestStagingManifest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             for doc_id, status, rows, year in [
-                ("9115808", "resolved", [{"a": 1}], 2026),
+                (
+                    "9115808",
+                    "resolved",
+                    [{
+                        "a": 1,
+                        "doc_id": "9115808",
+                        "source_record_id": "9115808",
+                        "source_row_id": "9115808:page:1:row:1",
+                        "artifact_sha256": "sha-9115808",
+                    }],
+                    2026,
+                ),
                 ("9106064", "unresolved", [], 2015),
                 ("9110845", "no_txs", [], 2017),
             ]:
@@ -822,12 +883,221 @@ class TestStagingManifest(unittest.TestCase):
             self.assertEqual(manifest["total_rows"], 1)
             self.assertEqual(manifest["by_year"]["2026"]["resolved_count"], 1)
             self.assertEqual(manifest["by_year"]["2015"]["unresolved_count"], 1)
+            envelope = json.loads((out / "docs" / "9115808.json").read_text())
             self.assertEqual(
-                manifest["staged_files_sha256"]["rows/9115808.jsonl"],
-                ocr.sha256_file(out / "rows" / "9115808.jsonl"),
+                manifest["staged_files_sha256"][envelope["rows_file"]],
+                ocr.sha256_file(out / envelope["rows_file"]),
             )
             # rows file hash must be reproducible
             self.assertTrue((out / "docs" / "9115808.json").exists())
+
+    def test_shared_output_root_refuses_scan_ocr_without_rebinding_local_attempt(self):
+        from scripts import scan_ocr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            doc_id = "producer-owner"
+            ocr.stage_document(
+                out,
+                {
+                    "doc_id": doc_id,
+                    "year": 2015,
+                    "status": "resolved",
+                    "artifact_sha256": "local-source",
+                    "page_count": 1,
+                    "covered_pages": [1],
+                    "uncovered_pages": [],
+                    "row_count": 1,
+                    "rows": [{
+                        "doc_id": doc_id,
+                        "source_record_id": doc_id,
+                        "source_row_id": f"{doc_id}:page:1:row:1",
+                        "artifact_sha256": "local-source",
+                    }],
+                    "reasons": [],
+                    "engines": [],
+                    "canary": None,
+                },
+            )
+            ocr.write_manifest(out, kind="sweep", data_dir=out)
+            envelope_path = out / "docs" / f"{doc_id}.json"
+            envelope_before = envelope_path.read_bytes()
+            envelope = json.loads(envelope_before)
+            rows_path = out / envelope["rows_file"]
+            rows_before = rows_path.read_bytes()
+            manifest_before = (out / "manifest.json").read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "another producer"):
+                scan_ocr.write_staging(
+                    out,
+                    {},
+                    data_dir=out,
+                    year=2015,
+                )
+
+            self.assertEqual(envelope_path.read_bytes(), envelope_before)
+            self.assertEqual(rows_path.read_bytes(), rows_before)
+            self.assertEqual((out / "manifest.json").read_bytes(), manifest_before)
+
+            partial = out / "partial-first-attempt"
+            replace_bytes = ocr._atomic_replace_bytes
+
+            def fail_first_envelope(path, payload, *, prefix):
+                if path == partial / "docs" / "partial.json":
+                    raise OSError("interrupted before first envelope")
+                replace_bytes(path, payload, prefix=prefix)
+
+            ocr._atomic_replace_bytes = fail_first_envelope
+            try:
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    ocr.stage_document(
+                        partial,
+                        {
+                            "doc_id": "partial",
+                            "year": 2015,
+                            "status": "resolved",
+                            "artifact_sha256": "partial-source",
+                            "page_count": 1,
+                            "covered_pages": [1],
+                            "uncovered_pages": [],
+                            "row_count": 1,
+                            "rows": [{
+                                "doc_id": "partial",
+                                "source_record_id": "partial",
+                                "source_row_id": "partial:page:1:row:1",
+                                "artifact_sha256": "partial-source",
+                            }],
+                            "reasons": [],
+                            "engines": [],
+                            "canary": None,
+                        },
+                    )
+            finally:
+                ocr._atomic_replace_bytes = replace_bytes
+            orphan_files = list((partial / "rows").glob("*.jsonl"))
+            self.assertEqual(len(orphan_files), 1)
+            orphan_before = orphan_files[0].read_bytes()
+            with self.assertRaisesRegex(ValueError, "another producer"):
+                scan_ocr.write_staging(partial, {}, data_dir=out, year=2015)
+            self.assertEqual(orphan_files[0].read_bytes(), orphan_before)
+            self.assertFalse((partial / "docs" / "partial.json").exists())
+            self.assertFalse((partial / "manifest.json").exists())
+
+    def test_interrupted_restage_keeps_old_pair_and_manifest_bound_to_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            doc_id = "attempt-pair"
+            first = {
+                "doc_id": doc_id,
+                "year": 2015,
+                "status": "resolved",
+                "artifact_sha256": "old-source",
+                "page_count": 1,
+                "covered_pages": [1],
+                "uncovered_pages": [],
+                "row_count": 1,
+                "rows": [{
+                    "doc_id": doc_id,
+                    "source_record_id": doc_id,
+                    "source_row_id": f"{doc_id}:page:1:row:1",
+                    "artifact_sha256": "old-source",
+                }],
+                "reasons": [],
+                "engines": [],
+                "canary": None,
+                "elapsed_s": 0,
+            }
+            ocr.stage_document(out, first)
+            ocr.write_manifest(out, kind="sweep", data_dir=out)
+            envelope_path = out / "docs" / f"{doc_id}.json"
+            old_envelope_bytes = envelope_path.read_bytes()
+            old_envelope = json.loads(old_envelope_bytes)
+            old_rows_path = out / old_envelope["rows_file"]
+            old_rows_bytes = old_rows_path.read_bytes()
+
+            replace_bytes = ocr._atomic_replace_bytes
+
+            def fail_envelope(path, payload, *, prefix):
+                if path == envelope_path:
+                    raise OSError("interrupted before envelope publication")
+                replace_bytes(path, payload, prefix=prefix)
+
+            ocr._atomic_replace_bytes = fail_envelope
+            try:
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    ocr.stage_document(
+                        out,
+                        {
+                            **first,
+                            "artifact_sha256": "new-source",
+                            "rows": [
+                                {
+                                    "doc_id": doc_id,
+                                    "source_record_id": doc_id,
+                                    "source_row_id": f"{doc_id}:page:1:row:1",
+                                    "artifact_sha256": "new-source",
+                                }
+                            ],
+                        },
+                    )
+            finally:
+                ocr._atomic_replace_bytes = replace_bytes
+
+            self.assertEqual(envelope_path.read_bytes(), old_envelope_bytes)
+            self.assertEqual(old_rows_path.read_bytes(), old_rows_bytes)
+            self.assertTrue(
+                list((out / "attempts" / doc_id).glob("*.json")),
+                "the replaced envelope bytes must be archived before replacement",
+            )
+            ocr.write_manifest(out, kind="sweep", data_dir=out)
+            current = json.loads(envelope_path.read_text())
+            manifest = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(current["artifact_sha256"], "old-source")
+            self.assertEqual(current["rows_file"], old_envelope["rows_file"])
+            self.assertIn(old_envelope["rows_file"], manifest["staged_files_sha256"])
+            self.assertEqual(
+                len(manifest["staged_files_sha256"]), 2,
+                "orphaned attempt rows must not enter the accepted manifest",
+            )
+            self.assertEqual(ocr.staged_docs(out), {doc_id})
+
+    def test_manifest_and_resume_reject_mismatched_row_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            doc_id = "legacy-pair"
+            envelope_path = out / "docs" / f"{doc_id}.json"
+            ocr.stage_document(
+                out,
+                {
+                    "doc_id": doc_id,
+                    "year": 2015,
+                    "status": "resolved",
+                    "artifact_sha256": "source",
+                    "page_count": 1,
+                    "covered_pages": [1],
+                    "uncovered_pages": [],
+                    "row_count": 1,
+                    "rows": [{
+                        "doc_id": doc_id,
+                        "source_record_id": doc_id,
+                        "source_row_id": f"{doc_id}:page:1:row:1",
+                        "artifact_sha256": "source",
+                    }],
+                    "reasons": [],
+                    "engines": [],
+                    "canary": None,
+                },
+            )
+            ocr.write_manifest(out, kind="sweep", data_dir=out)
+            manifest_before = (out / "manifest.json").read_bytes()
+            envelope = json.loads(envelope_path.read_text())
+            rows_path = out / envelope["rows_file"]
+            rows_path.write_text('{"doc_id":"legacy-pair","foreign":true}\n')
+            with self.assertRaisesRegex(ValueError, "rows_file_sha256"):
+                ocr.write_manifest(out, kind="sweep", data_dir=out)
+            with self.assertRaisesRegex(ValueError, "rows_file_sha256"):
+                ocr.staged_docs(out)
+            self.assertEqual((out / "manifest.json").read_bytes(), manifest_before)
 
 
 class TestDoclingDataframeMapping(unittest.TestCase):

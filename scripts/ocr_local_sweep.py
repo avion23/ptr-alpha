@@ -33,15 +33,10 @@ Results stage under ``.staging/ocr2-local/<generation>/`` in the SAME
 contract as the Gemini sweep (scripts/ocr_gemini_sweep.py, branch
 audit/luna-ocr-sweep-20260810):
 
-  rows/<doc>.jsonl      one JSON object per transaction row; provenance
-                        matrix (ticker_origin official/unverified/
-                        not_reported), source_row_id doc:page:N:row:M,
-                        artifact_sha256, per-doc year, generation binding
-  docs/<doc>.json       per-doc envelope (status resolved/unresolved/no_txs,
-                        reasons, coverage, canary, rows SHA)
-  manifest.json         generation manifest with per-file SHAs
-                        (staged_files_sha256) + by_year summary, so
-                        luna-finalize can ingest either OCR source.
+  rows/<doc>.<sha256>.jsonl  immutable row attempt bound by its envelope
+  docs/<doc>.json            active envelope (status, coverage, row SHA/count)
+  attempts/<doc>/<sha>.json  prior envelope bytes, never part of active rows
+  manifest.json              hashes only active envelopes and their bound rows
 
 Fail-closed per document:
   * a doc is ``resolved`` only when every PDF page has transaction rows or a
@@ -1211,7 +1206,11 @@ def check_canary(result: dict) -> dict:
 def _staging_root_lock(out_root: str | Path):
     """Serialize staging publications that share one output root."""
     root = Path(out_root).resolve()
-    with (root / ".ocr-local-sweep.lock").open("a+b") as lock_file:
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".ocr-local-sweep.lock"
+    if lock_path.is_symlink():
+        raise ValueError("staging lock must not be a symlink")
+    with lock_path.open("a+b") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield root
@@ -1219,8 +1218,292 @@ def _staging_root_lock(out_root: str | Path):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def _safe_doc_id(doc_id: object) -> str:
+    if (
+        not isinstance(doc_id, str)
+        or not doc_id
+        or doc_id in {".", ".."}
+        or "/" in doc_id
+        or "\\" in doc_id
+        or "\x00" in doc_id
+    ):
+        raise ValueError(f"invalid staged doc_id: {doc_id!r}")
+    return doc_id
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _publish_immutable_bytes(path: Path, payload: bytes) -> None:
+    """Durably add an immutable attempt file without replacing prior bytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ValueError(f"immutable staged file is a symlink: {path}")
+    if path.exists():
+        if not path.is_file() or path.read_bytes() != payload:
+            raise ValueError(f"immutable staged file conflicts: {path}")
+        return
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp_name, path)
+        except FileExistsError:
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != payload:
+                raise ValueError(f"immutable staged file conflicts: {path}")
+        _sync_dir(path.parent)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_replace_bytes(path: Path, payload: bytes, *, prefix: str) -> None:
+    fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        _sync_dir(path.parent)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def _archive_envelope(out_root: Path, doc_id: str, raw: bytes) -> None:
+    digest = hashlib.sha256(raw).hexdigest()
+    archive_dir = out_root / "attempts"
+    doc_archive_dir = archive_dir / doc_id
+    if any(
+        path.is_symlink() or (path.exists() and path.resolve() != path)
+        for path in (archive_dir, doc_archive_dir)
+    ):
+        raise ValueError(f"{doc_id}: attempt archive escapes staging root")
+    _publish_immutable_bytes(doc_archive_dir / f"{digest}.json", raw)
+
+
+def _validate_staged_pair(
+    out_root: str | Path,
+    envelope: dict,
+    envelope_path: str | Path | None = None,
+    *,
+    manifest_hashes: dict | None = None,
+) -> tuple[Path, str, list[dict]]:
+    """Verify envelope-to-row path, content hash, count, and row identity."""
+    root = Path(out_root).resolve()
+    if not isinstance(envelope, dict):
+        raise ValueError("staging envelope must be an object")
+    doc_id = _safe_doc_id(envelope.get("doc_id"))
+    if envelope_path is not None:
+        doc_path = Path(envelope_path)
+        if (
+            doc_path.is_symlink()
+            or doc_path.resolve() != doc_path
+            or doc_path.parent != root / "docs"
+            or doc_path.name != f"{doc_id}.json"
+        ):
+            raise ValueError(f"{doc_id}: envelope path is not bound to doc_id")
+    if type(envelope.get("row_count")) is not int or envelope["row_count"] < 0:
+        raise ValueError(f"{doc_id}: row_count must be a nonnegative integer")
+    rows_sha = envelope.get("rows_file_sha256")
+    if not isinstance(rows_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", rows_sha):
+        raise ValueError(f"{doc_id}: invalid rows_file_sha256")
+    legacy_path = f"rows/{doc_id}.jsonl"
+    immutable_path = f"rows/{doc_id}.{rows_sha}.jsonl"
+    rows_file = envelope.get("rows_file")
+    if rows_file not in {legacy_path, immutable_path}:
+        raise ValueError(f"{doc_id}: rows_file is not bound to doc_id/hash")
+    rows_dir = root / "rows"
+    rows_path = root / rows_file
+    if (
+        rows_dir.is_symlink()
+        or rows_path.is_symlink()
+        or rows_dir.resolve() != rows_dir
+        or rows_path.resolve() != rows_path
+        or not rows_path.is_file()
+    ):
+        raise ValueError(f"{doc_id}: staged rows file is missing or escapes root")
+    payload = rows_path.read_bytes()
+    actual_sha = hashlib.sha256(payload).hexdigest()
+    if actual_sha != rows_sha:
+        raise ValueError(f"{doc_id}: rows_file_sha256 does not match staged rows")
+    if (
+        manifest_hashes is not None
+        and rows_file in manifest_hashes
+        and manifest_hashes[rows_file] != actual_sha
+    ):
+        raise ValueError(f"{doc_id}: manifest row hash does not match envelope")
+    rows = []
+    source_row_ids = set()
+    for line in payload.splitlines():
+        if not line:
+            raise ValueError(f"{doc_id}: blank line in staged JSONL")
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{doc_id}: invalid staged JSONL row") from exc
+        if not isinstance(row, dict) or row.get("doc_id") != doc_id:
+            raise ValueError(f"{doc_id}: staged row identity does not match envelope")
+        row_id = row.get("source_row_id")
+        if (
+            row.get("source_record_id") != doc_id
+            or not isinstance(row_id, str)
+            or not row_id.startswith(f"{doc_id}:")
+            or row_id in source_row_ids
+        ):
+            raise ValueError(f"{doc_id}: staged row source identity is invalid/duplicate")
+        source_row_ids.add(row_id)
+        artifact_sha = envelope.get("artifact_sha256")
+        if row.get("artifact_sha256") != artifact_sha:
+            raise ValueError(f"{doc_id}: staged row artifact identity mismatch")
+        rows.append(row)
+    if len(rows) != envelope["row_count"]:
+        raise ValueError(
+            f"{doc_id}: declared row_count {envelope['row_count']} "
+            f"does not match staged rows {len(rows)}"
+        )
+    return rows_path, actual_sha, rows
+
+
+def _assert_staging_owner_locked(out_root: Path, script: str) -> None:
+    """Refuse scan_ocr/local-sweep cross-producer reuse of one root."""
+    manifest_path = out_root / "manifest.json"
+    docs_dir = out_root / "docs"
+    rows_dir = out_root / "rows"
+    for directory in (docs_dir, rows_dir):
+        if directory.is_symlink() or (
+            directory.exists() and directory.resolve() != directory
+        ):
+            raise ValueError(f"staging {directory.name} directory escapes root")
+    if manifest_path.is_symlink():
+        raise ValueError("staging manifest must not be a symlink")
+    owner = None
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        owner = manifest.get("script") if isinstance(manifest, dict) else None
+        if owner not in {"scripts/ocr_local_sweep.py", "scripts/scan_ocr.py"}:
+            raise ValueError(f"staging root has unknown producer: {owner!r}")
+    elif docs_dir.exists():
+        for doc_path in docs_dir.glob("*.json"):
+            if doc_path.is_symlink() or doc_path.resolve() != doc_path:
+                raise ValueError(f"{doc_path.name}: envelope escapes staging docs")
+            envelope = json.loads(doc_path.read_text())
+            existing_script = (
+                "scripts/ocr_local_sweep.py"
+                if isinstance(envelope, dict) and "year" in envelope
+                else "scripts/scan_ocr.py"
+                if isinstance(envelope, dict) and "page_count" in envelope
+                else None
+            )
+            if existing_script is None:
+                raise ValueError("staging root has unknown OCR documents")
+            if owner is not None and owner != existing_script:
+                raise ValueError("staging root contains mixed OCR producers")
+            owner = existing_script
+    lock_path = out_root / ".ocr-local-sweep.lock"
+    marker = lock_path.read_text() if lock_path.exists() else ""
+    marker = marker.strip()
+    if marker and marker not in {
+        "scripts/ocr_local_sweep.py",
+        "scripts/scan_ocr.py",
+    }:
+        raise ValueError(f"staging root has unknown owner marker: {marker!r}")
+    if owner is not None and marker and marker != owner:
+        raise ValueError("staging root owner marker conflicts with manifest/documents")
+    owner = owner or marker or None
+    if owner is None:
+        has_orphans = any(rows_dir.iterdir()) if rows_dir.exists() else False
+        attempts_dir = out_root / "attempts"
+        has_orphans = has_orphans or (
+            attempts_dir.exists() and any(attempts_dir.iterdir())
+        )
+        if has_orphans:
+            raise ValueError("staging root has unowned partial OCR artifacts")
+        owner = script
+    if owner != script:
+        raise ValueError(f"staging root belongs to another producer: {owner!r}")
+    if marker != owner:
+        with lock_path.open("r+b") as handle:
+            handle.seek(0)
+            handle.truncate()
+            handle.write((owner + "\n").encode())
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _publish_document_locked(
+    out_root: Path, envelope: dict, rows: list[dict]
+) -> dict:
+    doc_id = _safe_doc_id(envelope.get("doc_id"))
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict) or row.get("doc_id") != doc_id for row in rows
+    ):
+        raise ValueError(f"{doc_id}: rows must be objects bound to this doc_id")
+    row_count = envelope.get("row_count")
+    if type(row_count) is not int or row_count != len(rows):
+        raise ValueError(f"{doc_id}: row_count does not match rows being published")
+    payload = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows).encode()
+    rows_sha = hashlib.sha256(payload).hexdigest()
+    rows_file = f"rows/{doc_id}.{rows_sha}.jsonl"
+    rows_path = out_root / rows_file
+    doc_path = out_root / "docs" / f"{doc_id}.json"
+    (out_root / "rows").mkdir(parents=True, exist_ok=True)
+    (out_root / "docs").mkdir(parents=True, exist_ok=True)
+
+    old_bytes = None
+    if doc_path.exists() or doc_path.is_symlink():
+        if doc_path.is_symlink() or doc_path.resolve() != doc_path:
+            raise ValueError(f"{doc_id}: staged envelope is a symlink")
+        old_bytes = doc_path.read_bytes()
+        old_envelope = json.loads(old_bytes)
+        _validate_staged_pair(out_root, old_envelope, doc_path)
+
+    _publish_immutable_bytes(rows_path, payload)
+    new_envelope = {**envelope, "rows_file": rows_file, "rows_file_sha256": rows_sha}
+    _validate_staged_pair(out_root, new_envelope, doc_path)
+    if old_bytes is not None:
+        _archive_envelope(out_root, doc_id, old_bytes)
+    encoded = (json.dumps(new_envelope, indent=2, sort_keys=True) + "\n").encode()
+    _atomic_replace_bytes(doc_path, encoded, prefix=f".{doc_id}.")
+    return new_envelope
+
+
+def _replace_envelope_locked(
+    out_root: str | Path, envelope_path: str | Path, envelope: dict
+) -> None:
+    """Replace classification metadata without changing the row proof."""
+    root = Path(out_root).resolve()
+    path = Path(envelope_path)
+    old_bytes = path.read_bytes()
+    old = json.loads(old_bytes)
+    old_rows_path, old_sha, _ = _validate_staged_pair(root, old, path)
+    for field in ("doc_id", "artifact_sha256", "row_count", "rows_file", "rows_file_sha256"):
+        if envelope.get(field) != old.get(field):
+            raise ValueError(f"{old.get('doc_id')}: reclassification changed {field}")
+    _archive_envelope(root, old["doc_id"], old_bytes)
+    encoded = (json.dumps(envelope, indent=2, sort_keys=True) + "\n").encode()
+    _atomic_replace_bytes(path, encoded, prefix=f".{path.stem}.")
+    new_path, new_sha, _ = _validate_staged_pair(root, envelope, path)
+    if new_path != old_rows_path or new_sha != old_sha:
+        raise ValueError(f"{old['doc_id']}: reclassification rebound row proof")
+
+
 def stage_document(out_root: str | Path, result: dict) -> None:
-    """Atomically stage one document: rows jsonl (tmp+rename) and docs envelope."""
+    """Publish a document as immutable rows plus an atomic envelope."""
     out_root = Path(out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     with _staging_root_lock(out_root) as locked_root:
@@ -1228,31 +1511,10 @@ def stage_document(out_root: str | Path, result: dict) -> None:
 
 
 def _stage_document_locked(out_root: Path, result: dict) -> None:
-    rows_dir = out_root / "rows"
-    docs_dir = out_root / "docs"
-    rows_dir.mkdir(parents=True, exist_ok=True)
-    docs_dir.mkdir(parents=True, exist_ok=True)
-    doc_id = result["doc_id"]
-
-    rows_path = rows_dir / f"{doc_id}.jsonl"
-    payload = "".join(
-        json.dumps(row, sort_keys=True) + "\n" for row in result["rows"]
-    )
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{doc_id}.", dir=str(rows_dir))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, rows_path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-
+    if result.get("status") not in {"resolved", "unresolved", "no_txs"}:
+        raise ValueError(f"invalid local OCR status: {result.get('status')!r}")
     envelope = {
-        "doc_id": doc_id,
+        "doc_id": _safe_doc_id(result["doc_id"]),
         "year": int(result["year"]),
         "status": result["status"],
         "artifact_sha256": result["artifact_sha256"],
@@ -1260,8 +1522,6 @@ def _stage_document_locked(out_root: Path, result: dict) -> None:
         "covered_pages": result["covered_pages"],
         "uncovered_pages": result["uncovered_pages"],
         "row_count": result["row_count"],
-        "rows_file": f"rows/{doc_id}.jsonl",
-        "rows_file_sha256": sha256_file(rows_path),
         "canary": result.get("canary"),
         "reasons": result["reasons"],
         "engine": ENGINE,
@@ -1270,20 +1530,8 @@ def _stage_document_locked(out_root: Path, result: dict) -> None:
         "elapsed_s": result.get("elapsed_s"),
         "extracted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
-    doc_path = docs_dir / f"{doc_id}.json"
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{doc_id}.", dir=str(docs_dir))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(envelope, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, doc_path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
+    _assert_staging_owner_locked(out_root, "scripts/ocr_local_sweep.py")
+    _publish_document_locked(out_root, envelope, result["rows"])
 
 
 def write_manifest(
@@ -1299,6 +1547,7 @@ def _write_manifest_locked(
 ) -> Path:
     """Assemble manifest while caller holds _staging_root_lock(out_root)."""
     out_root = Path(out_root).resolve()
+    _assert_staging_owner_locked(out_root, "scripts/ocr_local_sweep.py")
     docs_dir = out_root / "docs"
     resolved: dict[str, dict] = {}
     unresolved: dict[str, list[str]] = {}
@@ -1309,12 +1558,27 @@ def _write_manifest_locked(
     canaries: dict[str, dict] = {}
     doc_count = 0
     for doc_path in sorted(docs_dir.glob("*.json")):
+        if doc_path.is_symlink() or doc_path.resolve() != doc_path:
+            raise ValueError(f"{doc_path.name}: envelope escapes staging docs")
         envelope = json.loads(doc_path.read_text())
-        doc_id = envelope["doc_id"]
+        if not isinstance(envelope, dict):
+            raise ValueError(f"{doc_path.name}: envelope must be an object")
+        doc_id = _safe_doc_id(envelope.get("doc_id"))
+        if doc_path.name != f"{doc_id}.json":
+            raise ValueError(f"{doc_path.name}: envelope path does not match doc_id")
+        if type(envelope.get("year")) is not int:
+            raise ValueError(f"{doc_id}: year must be an integer")
+        if envelope.get("status") not in {"resolved", "unresolved", "no_txs"}:
+            raise ValueError(f"{doc_id}: invalid local OCR status")
+        if not isinstance(envelope.get("reasons"), list) or not isinstance(
+            envelope.get("covered_pages"), list
+        ) or not isinstance(envelope.get("uncovered_pages"), list):
+            raise ValueError(f"{doc_id}: invalid local OCR summary metadata")
         year = int(envelope["year"])
+        rows_path, rows_sha, _rows = _validate_staged_pair(
+            out_root, envelope, doc_path
+        )
         doc_count += 1
-        rows_path = out_root / envelope["rows_file"]
-        rows_sha = sha256_file(rows_path) if rows_path.exists() else None
         staged_files[envelope["rows_file"]] = rows_sha
         staged_files[f"docs/{doc_id}.json"] = sha256_file(doc_path)
         bucket = by_year.setdefault(
@@ -1367,19 +1631,10 @@ def _write_manifest_locked(
         "staged_files_sha256": staged_files,
     }
     manifest_path = out_root / "manifest.json"
-    fd, tmp_name = tempfile.mkstemp(prefix=".manifest.", dir=str(out_root))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, manifest_path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
+    if manifest_path.is_symlink():
+        raise ValueError("staging manifest must not be a symlink")
+    encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    _atomic_replace_bytes(manifest_path, encoded, prefix=".manifest.")
     staged_files["manifest.json"] = sha256_file(manifest_path)
     return out_root
 
@@ -1428,15 +1683,29 @@ def load_metadata(db_path: str | Path) -> dict[str, dict]:
 
 
 def staged_docs(out_root: str | Path) -> set[str]:
-    """doc ids already staged (resume support)."""
-    out_root = Path(out_root)
+    """Return only documents with a verified current envelope/row pair."""
+    with _staging_root_lock(out_root) as locked_root:
+        return _staged_docs_locked(locked_root)
+
+
+def _staged_docs_locked(out_root: Path) -> set[str]:
+    out_root = Path(out_root).resolve()
     docs_dir = out_root / "docs"
-    rows_dir = out_root / "rows"
+    if docs_dir.is_symlink():
+        raise ValueError("staging docs directory must not be a symlink")
+    _assert_staging_owner_locked(out_root, "scripts/ocr_local_sweep.py")
     staged: set[str] = set()
     for envelope_path in docs_dir.glob("*.json"):
-        doc_id = envelope_path.stem
-        if (rows_dir / f"{doc_id}.jsonl").exists():
-            staged.add(doc_id)
+        if envelope_path.is_symlink() or envelope_path.resolve() != envelope_path:
+            raise ValueError(f"{envelope_path.name}: envelope escapes staging docs")
+        envelope = json.loads(envelope_path.read_text())
+        doc_id = _safe_doc_id(
+            envelope.get("doc_id") if isinstance(envelope, dict) else None
+        )
+        if envelope_path.name != f"{doc_id}.json":
+            raise ValueError(f"{envelope_path.name}: envelope path does not match doc_id")
+        _validate_staged_pair(out_root, envelope, envelope_path)
+        staged.add(doc_id)
     return staged
 
 

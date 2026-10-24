@@ -1236,3 +1236,102 @@ def test_refresh_house_completion_demotes_db_generation_on_unresolved_doc(tmp_pa
         )["found"] == 0
     finally:
         db.close()
+
+
+def test_ocr_consumer_uses_only_manifest_bound_verified_current_pairs(tmp_path, monkeypatch):
+    from scripts import ocr_local_sweep, rebuild_staged, scan_ocr
+    monkeypatch.setattr(scan_ocr, "_tesseract_version", lambda: "test")
+
+    doc_id = "consumer-bound"
+    root = tmp_path / "ocr"
+    ocr_local_sweep.stage_document(
+        root,
+        {
+            "doc_id": doc_id,
+            "year": 2015,
+            "status": "resolved",
+            "artifact_sha256": "source-hash",
+            "page_count": 1,
+            "covered_pages": [1],
+            "uncovered_pages": [],
+            "row_count": 1,
+            "rows": [
+                {
+                    "doc_id": doc_id,
+                    "source_record_id": doc_id,
+                    "source_row_id": f"{doc_id}:page:1:row:1",
+                    "artifact_sha256": "source-hash",
+                    "asset_description": "Bound row",
+                }
+            ],
+            "reasons": [],
+            "engines": [],
+            "canary": None,
+        },
+    )
+    ocr_local_sweep.write_manifest(root, kind="sweep", data_dir=root)
+    manifest = json.loads((root / "manifest.json").read_text())
+    envelope = json.loads((root / "docs" / f"{doc_id}.json").read_text())
+    rows_path = root / envelope["rows_file"]
+    # A preserved prior attempt is not part of the active docs/manifest inventory.
+    (root / "rows" / f"{doc_id}.archived.jsonl").write_bytes(rows_path.read_bytes())
+
+    inventory = rebuild_staged._validated_ocr_inventory(root, manifest)
+    assert len(inventory) == 1
+    assert inventory[0]["doc_id"] == doc_id
+    assert inventory[0]["rows"][0]["asset_description"] == "Bound row"
+
+    # A legacy fixed filename is accepted only when this envelope and manifest
+    # bind it; the previous hash-addressed attempt remains inactive.
+    hashed_rows_file = envelope["rows_file"]
+    legacy_rows_path = root / "rows" / f"{doc_id}.jsonl"
+    legacy_rows_path.write_bytes(rows_path.read_bytes())
+    envelope["rows_file"] = f"rows/{doc_id}.jsonl"
+    envelope_path = root / "docs" / f"{doc_id}.json"
+    envelope_path.write_text(json.dumps(envelope, indent=2, sort_keys=True) + "\n")
+    hashes = manifest["staged_files_sha256"]
+    hashes.pop(hashed_rows_file)
+    hashes[envelope["rows_file"]] = ocr_local_sweep.sha256_file(legacy_rows_path)
+    hashes[f"docs/{doc_id}.json"] = ocr_local_sweep.sha256_file(envelope_path)
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    legacy_inventory = rebuild_staged._validated_ocr_inventory(root, manifest)
+    assert legacy_inventory[0]["rows"] == inventory[0]["rows"]
+
+    # scan_ocr uses the same publication/consumer contract and root lock.
+    scan_root = tmp_path / "scan-ocr"
+    scan_doc = "scan-consumer"
+    scan_ocr.write_staging(
+        scan_root,
+        {
+            scan_doc: {
+                "doc_id": scan_doc,
+                "artifact_sha256": "scan-source",
+                "page_count": 1,
+                "rows": [
+                    scan_ocr.OcrRow(
+                        page_number=1,
+                        row_index=1,
+                        asset_description="Scan row",
+                        transaction_type="Purchase",
+                        transaction_date_raw="3-31-26",
+                        notification_date_raw=None,
+                    )
+                ],
+                "resolved": True,
+                "status": "resolved",
+                "reasons": [],
+                "uncovered_pages": [],
+            }
+        },
+        data_dir=tmp_path,
+        year=2026,
+    )
+    scan_manifest = json.loads((scan_root / "manifest.json").read_text())
+    scan_inventory = rebuild_staged._validated_ocr_inventory(scan_root, scan_manifest)
+    assert scan_inventory[0]["rows"][0]["doc_id"] == scan_doc
+
+    legacy_rows_path.write_text(
+        '{"doc_id":"consumer-bound","asset_description":"foreign"}\n'
+    )
+    with pytest.raises(ValueError, match="rows_file_sha256"):
+        rebuild_staged._ingest_ocr(root, manifest, SimpleNamespace())

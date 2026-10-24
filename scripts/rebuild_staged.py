@@ -2956,14 +2956,124 @@ def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     (8221322 stays quarantined); any unparseable or post-filing transaction
     date rejects the whole document with exact per-doc reporting.
     """
+    from scripts.ocr_local_sweep import _staging_root_lock  # noqa: PLC0415
+
+    with _staging_root_lock(track_dir) as locked_root:
+        return _ingest_ocr_locked(locked_root, track_manifest, db)
+
+
+def _validated_ocr_inventory(track_dir: Path, track_manifest: dict) -> list[dict]:
+    """Load only manifest-bound current envelopes and their verified rowsets."""
+    from scripts.ocr_local_sweep import _validate_staged_pair  # noqa: PLC0415
+
+    script = track_manifest.get("script")
+    if script not in {"scripts/ocr_local_sweep.py", "scripts/scan_ocr.py"}:
+        raise ValueError(f"unsupported OCR producer: {script!r}")
+    docs_dir = track_dir / "docs"
+    if docs_dir.is_symlink():
+        raise ValueError("OCR docs directory must not be a symlink")
+    hashes = track_manifest.get("staged_files_sha256")
+    if not isinstance(hashes, dict):
+        raise ValueError("OCR manifest lacks staged_files_sha256")
+
+    inventory = []
+    expected_files = set()
+    statuses = {}
+    source_row_ids = set()
+    for doc_path in sorted(docs_dir.glob("*.json")):
+        if doc_path.is_symlink() or doc_path.resolve() != doc_path:
+            raise ValueError(f"{doc_path.name}: OCR envelope escapes docs")
+        envelope = json.loads(doc_path.read_text())
+        if not isinstance(envelope, dict):
+            raise ValueError(f"{doc_path.name}: OCR envelope must be an object")
+        doc_id = envelope.get("doc_id")
+        if not isinstance(doc_id, str) or not doc_id or doc_path.name != f"{doc_id}.json":
+            raise ValueError(f"{doc_path.name}: OCR doc_id does not match envelope")
+        rows_path, rows_sha, rows = _validate_staged_pair(
+            track_dir, envelope, doc_path, manifest_hashes=hashes
+        )
+        doc_rel = f"docs/{doc_id}.json"
+        doc_sha = _sha256_file(doc_path)
+        if hashes.get(doc_rel) != doc_sha:
+            raise ValueError(f"{doc_id}: manifest envelope hash does not match")
+        expected_files.update((doc_rel, envelope["rows_file"]))
+        status = envelope.get("status")
+        allowed = {"resolved", "unresolved", "no_txs"}
+        if script == "scripts/scan_ocr.py":
+            allowed.add("no_transactions")
+        if status not in allowed:
+            raise ValueError(f"{doc_id}: invalid OCR status {status!r}")
+        statuses[doc_id] = status
+        row_ids = set()
+        for row in rows:
+            if row.get("source_record_id") != doc_id:
+                raise ValueError(f"{doc_id}: row source_record_id is foreign")
+            row_id = row.get("source_row_id")
+            if not isinstance(row_id, str) or not row_id.startswith(f"{doc_id}:"):
+                raise ValueError(f"{doc_id}: row source_row_id is foreign")
+            if row_id in row_ids or row_id in source_row_ids:
+                raise ValueError(f"{doc_id}: duplicate OCR source_row_id")
+            row_ids.add(row_id)
+            source_row_ids.add(row_id)
+        inventory.append(
+            {
+                "doc_id": doc_id,
+                "envelope": envelope,
+                "rows_path": rows_path,
+                "rows": rows,
+            }
+        )
+
+    if set(hashes) != expected_files:
+        raise ValueError("OCR manifest file inventory does not match current envelopes")
+    resolved = {doc_id for doc_id, status in statuses.items() if status == "resolved"}
+    no_txs = {doc_id for doc_id, status in statuses.items() if status == "no_txs"}
+    if script == "scripts/ocr_local_sweep.py":
+        unresolved = {doc_id for doc_id, status in statuses.items() if status == "unresolved"}
+        declared_no_txs = track_manifest.get("no_txs") or {}
+    else:
+        unresolved = set(statuses) - resolved
+        declared_no_txs = {}
+    declared_resolved = track_manifest.get("resolved") or {}
+    declared_unresolved = track_manifest.get("unresolved") or {}
+    if (
+        not isinstance(declared_resolved, dict)
+        or not isinstance(declared_unresolved, dict)
+        or not isinstance(declared_no_txs, dict)
+        or set(declared_resolved) != resolved
+        or set(declared_unresolved) != unresolved
+        or set(declared_no_txs) != no_txs
+    ):
+        raise ValueError("OCR manifest status summaries do not match envelopes")
+    for item in inventory:
+        doc_id = item["doc_id"]
+        if doc_id in resolved and declared_resolved[doc_id].get("row_count") != len(item["rows"]):
+            raise ValueError(f"{doc_id}: manifest row_count does not match envelope")
+    if track_manifest.get("doc_count") != len(inventory):
+        raise ValueError("OCR manifest doc_count does not match envelopes")
+    if track_manifest.get("resolved_count") != len(resolved):
+        raise ValueError("OCR manifest resolved_count does not match envelopes")
+    if track_manifest.get("unresolved_count") != len(unresolved):
+        raise ValueError("OCR manifest unresolved_count does not match envelopes")
+    if script == "scripts/ocr_local_sweep.py" and track_manifest.get("no_txs_count") != len(no_txs):
+        raise ValueError("OCR manifest no_txs_count does not match envelopes")
+    return inventory
+
+
+def _ingest_ocr_locked(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     import pandas as pd  # noqa: PLC0415
 
     from datetime import timedelta as _timedelta  # noqa: PLC0415
+    from scripts.ocr_local_sweep import _assert_staging_owner_locked  # noqa: PLC0415
 
+    _assert_staging_owner_locked(track_dir, track_manifest.get("script"))
     today_plus = date.today() + _timedelta(days=1)
-    rows_files = sorted(track_dir.glob("rows/*.jsonl"))
-    track_unresolved = sorted((track_manifest.get("unresolved") or {}).keys())
-    if not rows_files:
+    inventory = _validated_ocr_inventory(track_dir, track_manifest)
+    track_unresolved = sorted(
+        item["doc_id"] for item in inventory if item["envelope"]["status"] != "resolved"
+    )
+    rows_files = [item["rows_path"] for item in inventory]
+    if not inventory:
         return {"rows_files": [], "track_unresolved": track_unresolved, "ingested_docs": []}
     parser_version = str(
         track_manifest.get("parser_version")
@@ -2974,13 +3084,15 @@ def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     skipped_already_resolved: list[str] = []
     skipped_track_unresolved: list[str] = []
     dropped_rows: list[dict] = []
-    for rows_file in rows_files:
-        rows = pd.read_json(rows_file, lines=True)
-        file_doc_id = rows_file.stem
-        if rows.empty:
-            if file_doc_id in track_unresolved:
-                skipped_track_unresolved.append(file_doc_id)
+    for item in inventory:
+        rows_file = item["rows_path"]
+        file_doc_id = item["doc_id"]
+        if item["envelope"]["status"] != "resolved":
+            skipped_track_unresolved.append(file_doc_id)
             continue
+        rows = pd.DataFrame(item["rows"])
+        if rows.empty:
+            raise ValueError(f"{file_doc_id}: resolved OCR envelope has no rows")
         doc_id = rows["doc_id"].astype(str).iloc[0]
         if doc_id in track_unresolved:
             skipped_track_unresolved.append(doc_id)
@@ -3001,7 +3113,10 @@ def _ingest_ocr(track_dir: Path, track_manifest: dict, db: Database) -> dict:
             WHERE m.doc_id = ? AND m.archive_year = ?
             LIMIT 1
             """,
-            [doc_id, int(track_manifest.get("year") or 2026)],
+            [
+                doc_id,
+                int(item["envelope"].get("year") or track_manifest.get("year") or 2026),
+            ],
         ).fetchone()
         if meta is None:
             raise RuntimeError(f"ocr ingest: no staged house metadata for {doc_id}")

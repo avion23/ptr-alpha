@@ -324,13 +324,19 @@ class TestStaging(unittest.TestCase):
             },
         }
         with tempfile.TemporaryDirectory() as tmp:
-            out = so.write_staging(tmp, results, data_dir="data", year=2026)
+            original_version = so._tesseract_version
+            so._tesseract_version = lambda: "test"
+            try:
+                out = so.write_staging(tmp, results, data_dir="data", year=2026)
+            finally:
+                so._tesseract_version = original_version
             manifest = json.loads((out / "manifest.json").read_text())
             self.assertEqual(manifest["generation"], so.GENERATION)
             self.assertIn("9115808", manifest["resolved"])
             self.assertIn("9116197", manifest["unresolved"])
             self.assertEqual(manifest["total_rows"], 1)
-            rows_lines = (out / "rows" / "9115808.jsonl").read_text().strip().splitlines()
+            envelope = json.loads((out / "docs" / "9115808.json").read_text())
+            rows_lines = (out / envelope["rows_file"]).read_text().strip().splitlines()
             self.assertEqual(len(rows_lines), 1)
             row = json.loads(rows_lines[0])
             self.assertEqual(row["source_row_id"], "9115808:page:1:row:1")
@@ -338,33 +344,65 @@ class TestStaging(unittest.TestCase):
             self.assertTrue((out / "docs" / "9116197.json").exists())
 
 
-@pytest.mark.parametrize("failed_file", ["rows/1.jsonl", "docs/1.json", "manifest.json"])
+@pytest.mark.parametrize("failed_file", ["rows", "docs/1.json", "manifest.json"])
 def test_staging_failed_publish_preserves_previous_complete_file(tmp_path, monkeypatch, failed_file):
     result = {
         "1": {
-            "artifact_sha256": "aa", "page_count": 1, "rows": [],
+            "doc_id": "1", "artifact_sha256": "aa", "page_count": 1, "rows": [],
             "resolved": True, "reasons": [], "uncovered_pages": [],
         }
     }
     monkeypatch.setattr(so, "_tesseract_version", lambda: "test")
     so.write_staging(tmp_path, result, data_dir=tmp_path, year=2026)
-    target = tmp_path / failed_file
+    envelope_path = tmp_path / "docs" / "1.json"
+    old_envelope = envelope_path.read_bytes()
+    old = json.loads(old_envelope)
+    old_rows_path = tmp_path / old["rows_file"]
+    old_rows = old_rows_path.read_bytes()
+    target = (
+        tmp_path / "manifest.json"
+        if failed_file == "manifest.json"
+        else envelope_path
+    )
     before = target.read_bytes()
     manifest_before = (tmp_path / "manifest.json").read_bytes()
     replace = os.replace
+    link = os.link
 
     def fail_replace(source, destination):
-        if Path(destination) == target:
+        if failed_file != "rows" and Path(destination) == target:
             raise OSError("publication failed")
         replace(source, destination)
 
+    def fail_link(source, destination):
+        if failed_file == "rows" and Path(destination).parent == tmp_path / "rows":
+            raise OSError("publication failed")
+        link(source, destination)
+
     monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(os, "link", fail_link)
     result["1"]["artifact_sha256"] = "bb"
+    result["1"]["rows"] = [
+        so.OcrRow(
+            page_number=1,
+            row_index=1,
+            asset_description="New row",
+            transaction_type="Purchase",
+            transaction_date_raw="3-31-26",
+            notification_date_raw=None,
+        )
+    ]
     with pytest.raises(OSError, match="publication failed"):
         so.write_staging(tmp_path, result, data_dir=tmp_path, year=2026)
     assert target.read_bytes() == before
     assert (tmp_path / "manifest.json").read_bytes() == manifest_before
-    assert not list(tmp_path.rglob(".*"))
+    if failed_file in {"rows", "docs/1.json"}:
+        assert envelope_path.read_bytes() == old_envelope
+        assert old_rows_path.read_bytes() == old_rows
+    assert not [
+        path for path in tmp_path.rglob(".*")
+        if path.name != ".ocr-local-sweep.lock"
+    ]
 
 
 class TestDiscovery(unittest.TestCase):

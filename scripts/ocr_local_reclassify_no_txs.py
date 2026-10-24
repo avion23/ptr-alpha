@@ -26,10 +26,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +37,10 @@ if __name__ == "__main__":
             sys.path.insert(0, _entry)
 
 from scripts.ocr_local_sweep import (  # noqa: E402,F401
+    _assert_staging_owner_locked,
+    _replace_envelope_locked,
     _staging_root_lock,
+    _validate_staged_pair,
     _write_manifest_locked,
     sha256_file,
     write_manifest,  # historical re-export
@@ -50,19 +51,7 @@ REASON_COVER = "cover page (no transaction rows)"
 
 
 def _atomic_write_json(path: Path, envelope: dict) -> None:
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}.", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(envelope, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
+    _replace_envelope_locked(path.parent.parent, path, envelope)
 
 
 def _page_evidence(reasons: list[str]) -> tuple[dict[int, list[str]], bool]:
@@ -107,67 +96,6 @@ def _page_inventory(envelope: dict) -> tuple[int, list[int]]:
     return page_count, sorted(pages)
 
 
-def _bound_rows_path(
-    out_root: Path, envelope_path: Path, envelope: dict
-) -> Path | None:
-    """Return only this envelope's nonsymlink row file inside the staging root."""
-    doc_id = envelope.get("doc_id")
-    if (
-        not isinstance(doc_id, str)
-        or not doc_id
-        or doc_id in {".", ".."}
-        or "/" in doc_id
-        or "\\" in doc_id
-        or envelope_path.stem != doc_id
-    ):
-        return None
-    rows_file = f"rows/{doc_id}.jsonl"
-    if envelope.get("rows_file") != rows_file:
-        return None
-
-    root = out_root.resolve()
-    rows_dir = root / "rows"
-    rows_path = rows_dir / f"{doc_id}.jsonl"
-    if rows_dir.is_symlink() or rows_path.is_symlink():
-        return None
-    try:
-        if rows_dir.resolve() != rows_dir or rows_path.resolve() != rows_path:
-            return None
-    except (OSError, RuntimeError):
-        return None
-    return rows_path
-
-
-def _row_artifact_matches(
-    out_root: Path,
-    envelope_path: Path,
-    envelope: dict,
-    manifest_hashes: dict | None,
-    *,
-    empty: bool,
-) -> bool:
-    """Check recorded row hashes; for empty claims, also require zero rows."""
-    rows_path = _bound_rows_path(out_root, envelope_path, envelope)
-    if rows_path is None:
-        return False
-    rows_file = envelope["rows_file"]
-    if empty and (
-        type(envelope.get("row_count")) is not int or envelope["row_count"] != 0
-    ):
-        return False
-    try:
-        if not rows_path.is_file():
-            return False
-        if empty and rows_path.stat().st_size != 0:
-            return False
-        actual_sha = sha256_file(rows_path)
-    except OSError:
-        return False
-    return envelope.get("rows_file_sha256") == actual_sha and (
-        manifest_hashes is None or manifest_hashes.get(rows_file) == actual_sha
-    )
-
-
 def reclassify_no_txs(out_root: str | Path) -> dict:
     """Idempotent two-way reconciliation of the no_txs evidence rule."""
     with _staging_root_lock(out_root) as locked_root:
@@ -177,6 +105,7 @@ def reclassify_no_txs(out_root: str | Path) -> dict:
 def _reclassify_no_txs_locked(out_root: str | Path) -> dict:
     """Reclassify while holding the shared staging-root publication lock."""
     out_root = Path(out_root).resolve()
+    _assert_staging_owner_locked(out_root, "scripts/ocr_local_sweep.py")
     docs_dir = out_root / "docs"
     if docs_dir.is_symlink():
         raise ValueError("staging docs directory must not be a symlink")
@@ -212,8 +141,17 @@ def _reclassify_no_txs_locked(out_root: str | Path) -> dict:
             or "\\" in doc_id
         ):
             raise ValueError(f"{envelope_path.name}: doc_id does not match envelope")
-        if _bound_rows_path(out_root, envelope_path, envelope) is None:
-            raise ValueError(f"{doc_id}: rows_file is not bound to this staged document")
+        try:
+            _, _, staged_rows = _validate_staged_pair(
+                out_root,
+                envelope,
+                envelope_path,
+                manifest_hashes=manifest_hashes,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{doc_id}: refusing reclassification; rows_file/hash conflict"
+            ) from exc
         if type(envelope.get("year")) is not int:
             raise ValueError(f"{doc_id}: year must be an integer")
         if type(envelope.get("row_count")) is not int or envelope["row_count"] < 0:
@@ -286,19 +224,11 @@ def _reclassify_no_txs_locked(out_root: str | Path) -> dict:
                 for readings in page_evidence.values()
             )
         needs_empty_rows = status == "no_txs" or (status == "unresolved" and marker)
-        if needs_empty_rows or marker:
-            if not _row_artifact_matches(
-                out_root,
-                envelope_path,
-                envelope,
-                manifest_hashes,
-                empty=needs_empty_rows,
-            ):
-                claim = "zero-row claim" if needs_empty_rows else "recorded row hashes"
-                raise ValueError(
-                    f"{doc_id}: refusing reclassification; "
-                    f"{claim} conflict with the staged row artifact or hash"
-                )
+        if needs_empty_rows and staged_rows:
+            raise ValueError(
+                f"{doc_id}: refusing reclassification; zero-row claim conflicts "
+                "with staged row artifact"
+            )
         documents.append(
             (
                 envelope_path,

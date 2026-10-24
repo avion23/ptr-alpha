@@ -7,10 +7,10 @@ APIs: every page is rasterized locally and read with Tesseract.
 Output is staged under ``.staging/ocr/<generation>/`` for the staged
 rebuild pipeline (luna-rebuild):
 
-  manifest.json                 generation manifest (per-doc status, rows,
-                                artifact SHAs, explicit unresolved list)
-  rows/<doc_id>.jsonl           one JSON object per OCR row
-  docs/<doc_id>.json            per-doc envelope (status, sha, coverage)
+  manifest.json                    hashes active envelopes and bound rows
+  rows/<doc_id>.<sha256>.jsonl     immutable row attempt
+  docs/<doc_id>.json               active envelope (status, SHA/count, coverage)
+  attempts/<doc_id>/<sha>.json     prior envelope bytes, never active input
 
 Row provenance: ``source_row_id`` = ``<doc_id>:page:<N>:row:<M>`` where
 ``N`` is the 1-based PDF page and ``M`` the 1-based row index across the
@@ -805,108 +805,115 @@ def write_staging(
     data_dir: str | Path,
     year: int,
 ) -> Path:
-    import os
-    import tempfile
+    # Import at call time: ocr_local_sweep imports this module's OCR helpers.
+    from scripts.ocr_local_sweep import (
+        _assert_staging_owner_locked,
+        _atomic_replace_bytes,
+        _publish_document_locked,
+        _staging_root_lock,
+        _validate_staged_pair,
+    )
 
-    from scripts.glm_stage import atomic_write_json
+    out_root = Path(out_root).resolve()
+    with _staging_root_lock(out_root) as root:
+        _assert_staging_owner_locked(root, "scripts/scan_ocr.py")
+        manifest_path = root / "manifest.json"
+        if manifest_path.exists():
+            previous = json.loads(manifest_path.read_text())
+            if previous.get("year") != year:
+                raise ValueError("scan_ocr staging root cannot mix years")
 
-    out_root = Path(out_root)
-    rows_dir = out_root / "rows"
-    docs_dir = out_root / "docs"
-    rows_dir.mkdir(parents=True, exist_ok=True)
-    docs_dir.mkdir(parents=True, exist_ok=True)
-
-    resolved: dict[str, dict] = {}
-    unresolved: dict[str, list[str]] = {}
-    total_rows = 0
-    staged_files: dict[str, str] = {}
-
-    for doc_id in sorted(doc_results):
-        result = doc_results[doc_id]
-        rows = result["rows"]
-        total_rows += len(rows)
-
-        rows_path = rows_dir / f"{doc_id}.jsonl"
-        fd, temporary_name = tempfile.mkstemp(prefix=f".{rows_path.name}.", dir=rows_dir)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                for row in rows:
-                    handle.write(
-                        json.dumps(
-                            row_to_dict(row, doc_id, result["artifact_sha256"]),
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_name, rows_path)
-        finally:
-            try:
-                os.unlink(temporary_name)
-            except FileNotFoundError:
-                pass
-        staged_files[f"rows/{doc_id}.jsonl"] = sha256_file(rows_path)
-
-        envelope = {
-            "doc_id": doc_id,
-            "status": result.get("status", "resolved" if result["resolved"] else "unresolved"),
-            "artifact_sha256": result["artifact_sha256"],
-            "page_count": result["page_count"],
-            "covered_pages": [
-                p
-                for p in range(1, result["page_count"] + 1)
-                if p not in result["uncovered_pages"]
-            ],
-            "uncovered_pages": result["uncovered_pages"],
-            "row_count": len(rows),
-            "rows_file": f"rows/{doc_id}.jsonl",
-            "rows_file_sha256": staged_files[f"rows/{doc_id}.jsonl"],
-            "canary": result.get("canary"),
-            "reasons": result["reasons"],
-            "engine": ENGINE,
-            "parser_version": SCRIPT_VERSION,
-            "extracted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        }
-        doc_path = docs_dir / f"{doc_id}.json"
-        atomic_write_json(doc_path, envelope)
-        staged_files[f"docs/{doc_id}.json"] = sha256_file(doc_path)
-
-        if result.get("status", "resolved" if result["resolved"] else "unresolved") == "resolved":
-            resolved[doc_id] = {
+        for doc_id in sorted(doc_results):
+            result = doc_results[doc_id]
+            if result.get("doc_id") != doc_id:
+                raise ValueError(f"scan OCR result identity does not match {doc_id}")
+            rows = [
+                row_to_dict(row, doc_id, result["artifact_sha256"])
+                for row in result["rows"]
+            ]
+            page_count = result["page_count"]
+            status = result.get(
+                "status", "resolved" if result["resolved"] else "unresolved"
+            )
+            if status not in {"resolved", "unresolved", "no_transactions"}:
+                raise ValueError(f"invalid scan OCR status: {status!r}")
+            envelope = {
+                "doc_id": doc_id,
+                "status": status,
+                "artifact_sha256": result["artifact_sha256"],
+                "page_count": page_count,
+                "covered_pages": [
+                    page
+                    for page in range(1, page_count + 1)
+                    if page not in result["uncovered_pages"]
+                ],
+                "uncovered_pages": result["uncovered_pages"],
                 "row_count": len(rows),
-                "pages_covered": result["page_count"] - len(result["uncovered_pages"]),
+                "canary": result.get("canary"),
+                "reasons": result["reasons"],
+                "engine": ENGINE,
+                "parser_version": SCRIPT_VERSION,
+                "extracted_at": datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                ),
             }
-        else:
-            unresolved[doc_id] = result["reasons"]
+            _publish_document_locked(root, envelope, rows)
 
-    manifest = {
-        "generation": GENERATION,
-        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "engine": ENGINE,
-        "tesseract_version": _tesseract_version(),
-        "script": "scripts/scan_ocr.py",
-        "script_version": SCRIPT_VERSION,
-        "render_dpi": RENDER_DPI,
-        "data_dir": str(data_dir),
-        "year": year,
-        "doc_count": len(doc_results),
-        "resolved_count": len(resolved),
-        "unresolved_count": len(unresolved),
-        "total_rows": total_rows,
-        "resolved": resolved,
-        "unresolved": unresolved,
-        "canary": {
-            doc_id: doc_results[doc_id].get("canary")
-            for doc_id in sorted(doc_results)
-            if doc_results[doc_id].get("canary", {}).get("expected") is not None
-        },
-        "staged_files_sha256": staged_files,
-    }
-    manifest_path = out_root / "manifest.json"
-    atomic_write_json(manifest_path, manifest)
-    staged_files["manifest.json"] = sha256_file(manifest_path)
-    return out_root
+        resolved: dict[str, dict] = {}
+        unresolved: dict[str, list[str]] = {}
+        staged_files: dict[str, str] = {}
+        total_rows = doc_count = 0
+        canary = {}
+        for doc_path in sorted((root / "docs").glob("*.json")):
+            if doc_path.is_symlink() or doc_path.resolve() != doc_path:
+                raise ValueError(f"{doc_path.name}: envelope escapes staging docs")
+            envelope = json.loads(doc_path.read_text())
+            rows_path, rows_sha, rows = _validate_staged_pair(
+                root, envelope, doc_path
+            )
+            doc_id = envelope["doc_id"]
+            if envelope.get("status") not in {
+                "resolved",
+                "unresolved",
+                "no_transactions",
+            }:
+                raise ValueError(f"{doc_id}: invalid scan OCR status")
+            doc_count += 1
+            total_rows += len(rows)
+            staged_files[envelope["rows_file"]] = rows_sha
+            staged_files[f"docs/{doc_id}.json"] = sha256_file(doc_path)
+            if envelope["status"] == "resolved":
+                resolved[doc_id] = {
+                    "row_count": len(rows),
+                    "pages_covered": len(envelope["covered_pages"]),
+                }
+            else:
+                unresolved[doc_id] = envelope["reasons"]
+            if (envelope.get("canary") or {}).get("expected") is not None:
+                canary[doc_id] = envelope["canary"]
+
+        manifest = {
+            "generation": GENERATION,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "engine": ENGINE,
+            "tesseract_version": _tesseract_version(),
+            "script": "scripts/scan_ocr.py",
+            "script_version": SCRIPT_VERSION,
+            "render_dpi": RENDER_DPI,
+            "data_dir": str(data_dir),
+            "year": year,
+            "doc_count": doc_count,
+            "resolved_count": len(resolved),
+            "unresolved_count": len(unresolved),
+            "total_rows": total_rows,
+            "resolved": resolved,
+            "unresolved": unresolved,
+            "canary": canary,
+            "staged_files_sha256": staged_files,
+        }
+        encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+        _atomic_replace_bytes(manifest_path, encoded, prefix=".manifest.")
+        return root
 
 
 def _tesseract_version() -> str:

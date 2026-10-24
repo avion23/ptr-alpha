@@ -160,23 +160,6 @@ def _normalize_instrument(value):
     return _INSTRUMENT_MAP.get(normalized, normalized)
 
 
-def _normalize_amount(row) -> float | None:
-    raw = "" if pd.isna(row.get("amount_raw")) else str(row.get("amount_raw")).strip()
-    midpoint = row.get("amount_midpoint")
-    if raw.endswith("-"):
-        return None
-    values = [
-        float(value.replace(",", "")) for value in re.findall(r"\$([0-9][0-9,]*)", raw)
-    ]
-    if len(values) >= 2:
-        return sum(values[:2]) / 2
-    if len(values) == 1 and int(values[0]) % 1000 == 1:
-        return None
-    if midpoint is None or pd.isna(midpoint):
-        return None
-    return float(midpoint)
-
-
 # Sentinel: the raw band itself forces None (open band / floor-band), so the
 # midpoint must not be consulted. Distinct from "no band, use midpoint".
 _BAND_FORCES_NONE = object()
@@ -184,7 +167,7 @@ _BAND_FORCES_NONE = object()
 
 @lru_cache(maxsize=8192)
 def _band_or_forced_none(raw_text: str):
-    """Memoized band-only half of `_normalize_amount` over stripped text.
+    """Memoized band-only half of amount normalization over stripped text.
 
     Returns a band midpoint float, ``_BAND_FORCES_NONE`` (result is None
     regardless of midpoint), or None (no decisive band; fall through to the
@@ -205,7 +188,7 @@ def _band_or_forced_none(raw_text: str):
 
 
 def _normalize_amount_column(amount_raw: pd.Series, midpoint: pd.Series) -> pd.Series:
-    """Columnwise exact twin of ``df.apply(_normalize_amount, axis=1)``.
+    """Columnwise exact twin of the former row-wise amount normalization.
 
     Same per-row decision, same order: band midpoint when the (stripped)
     raw text has one, None where a band forces it, otherwise the midpoint

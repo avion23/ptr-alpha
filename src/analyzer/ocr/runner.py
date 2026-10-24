@@ -54,19 +54,6 @@ def _require_successful_response_metadata(
     return parsed
 
 
-def _engine_b_configured() -> bool:
-    """True when an engine-B endpoint is configured for dual read.
-
-    Kept for callers that only need a cheap env check; main()'s dual mode
-    now preflights the configuration and alerts/stops on a defect instead of
-    silently degrading to the single-engine drain.
-    """
-    try:
-        return VisionBConfig.from_env() is not None
-    except VisionBUnavailable:
-        return False
-
-
 def _ocr_engine_mode(env=None) -> str:
     """Resolve the nightly drain's engine mode: 'dual', 'visionb', 'gemini'.
 

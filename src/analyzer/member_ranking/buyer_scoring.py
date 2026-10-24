@@ -8,7 +8,7 @@ import pandas as pd
 
 from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
-from analyzer.member_names import canonical_member_key
+from analyzer.member_names import canonical_member_key, member_identity_groups
 from analyzer.models import TransactionType
 from analyzer.parsing.cells import extract_instrument_type
 from analyzer.ticker_resolver import TickerResolver
@@ -103,9 +103,6 @@ def score_ticker_by_buyers(
     if ticker_trades.empty:
         return _empty_ticker_result(normalized_ticker)
 
-    ticker_trades["_member_canonical"] = ticker_trades["member"].map(
-        _canonical_member_or_blank
-    )
     ticker_trades = ticker_trades[ticker_trades["_member_canonical"].ne("")].copy()
     if ticker_trades.empty:
         return _empty_ticker_result(normalized_ticker)
@@ -190,7 +187,7 @@ def get_consensus_ticker_purchases(
 
     family_symbols = _ticker_family_symbols(ticker)
     return purchases.loc[purchases["_resolved_symbol"].isin(list(family_symbols))].drop(
-        columns=["_resolved_symbol", "_member_canonical"]
+        columns=["_resolved_symbol"]
     )
 
 
@@ -274,9 +271,25 @@ def prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
         canonical_members.append(_canonical_member_or_blank(member))
 
     purchases["_resolved_symbol"] = resolved_symbols
-    purchases["_member_canonical"] = canonical_members
+    legacy_rows = (
+        purchases["source"].isin(_LEGACY_SCORING_SOURCES).tolist()
+        if "source" in purchases.columns
+        else [True] * len(purchases)
+    )
+    member_groups = member_identity_groups(
+        member
+        for member, resolved, legacy in zip(
+            canonical_members, resolved_symbols, legacy_rows
+        )
+        if resolved is not None and member and legacy
+    )
+    purchases["_member_canonical"] = [
+        member_groups.get(member, member) if resolved is not None else ""
+        for member, resolved in zip(canonical_members, resolved_symbols)
+    ]
     return purchases.loc[
-        purchases["_resolved_symbol"].notna() & purchases["_member_canonical"].ne("")
+        purchases["_resolved_symbol"].notna()
+        & pd.Series(canonical_members, index=purchases.index).ne("")
     ].copy()
 
 
@@ -336,7 +349,10 @@ def get_consensus_candidate_tickers(
 
     candidates: set[str] = set()
     for family, family_rows in families.items():
-        if family_rows["_member_canonical"].nunique() < min_buyers:
+        member_keys = family_rows.loc[
+            family_rows["_member_canonical"].ne(""), "_member_canonical"
+        ]
+        if member_keys.nunique() < min_buyers:
             continue
         try:
             seed = next(

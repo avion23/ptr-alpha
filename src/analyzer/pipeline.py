@@ -16,7 +16,7 @@ from analyzer.canonical_scope import canonical_decision, decision_history
 from analyzer.asset_ticker_map import resolve_asset_ticker
 from analyzer.price_index import normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataResult, DataSourceError
-from analyzer.member_names import actor_id, canonical_member_key
+from analyzer.member_names import actor_id
 from analyzer.member_ranking.buyer_scoring import (
     OFFICIAL_SOURCES,
     CONSENSUS_LOOKBACK_DAYS,
@@ -639,7 +639,6 @@ def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
                 "disclosure_date",
             ]
         )
-    purchases["_member_canonical"] = purchases["member"].map(canonical_member_key)
     purchases = purchases[purchases["_member_canonical"].astype(bool)].copy()
     purchases = purchases.sort_values(
         ["_member_canonical", "member", "disclosure_date"], kind="mergesort"

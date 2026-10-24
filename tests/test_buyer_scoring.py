@@ -4,7 +4,11 @@ import pandas as pd
 import pytest
 
 from analyzer.exceptions import AnalysisError
-from analyzer.member_ranking.buyer_scoring import score_ticker_by_buyers
+from analyzer.member_ranking.buyer_scoring import (
+    get_consensus_candidate_tickers,
+    prepare_consensus_purchases,
+    score_ticker_by_buyers,
+)
 
 
 def _transactions(
@@ -128,6 +132,92 @@ def test_consensus_excludes_blank_canonical_member_identities_before_counting():
 
     assert result.iloc[0]["num_buyers"] == 1
     assert "minimum buyer threshold" in result.iloc[0]["note"]
+
+
+def test_consensus_aliases_do_not_create_a_false_three_buyer_quorum():
+    transactions = _transactions(
+        ("Chuck Fleischmann", "Charles J. Fleischmann", "Nancy Pelosi"),
+        disclosure_dates=["2024-05-10", "2024-05-12", "2024-05-14"],
+    )
+    transactions["source"] = ["house_pdf", "senate_efd", "house_pdf"]
+
+    prepared = prepare_consensus_purchases(transactions)
+    result = score_ticker_by_buyers(
+        "AAPL",
+        transactions,
+        as_of_date=pd.Timestamp("2024-05-20"),
+        min_buyers=3,
+    )
+
+    assert len(prepared) == 3
+    assert prepared["member"].tolist() == transactions["member"].tolist()
+    assert result.iloc[0]["num_buyers"] == 2
+    assert result.iloc[0]["signal_score"] == 0.0
+    assert "minimum buyer threshold" in result.iloc[0]["note"]
+    assert get_consensus_candidate_tickers(
+        transactions, 3, as_of_date=pd.Timestamp("2024-05-20")
+    ) == []
+
+    from analyzer.pipeline import _consensus_buyers_table
+
+    buyers = _consensus_buyers_table("AAPL", transactions)
+    assert len(buyers) == 2
+    assert sorted(buyers["num_purchases"].tolist()) == [1, 2]
+
+
+def test_consensus_alias_grouping_is_order_independent_and_preserves_quorum():
+    transactions = _transactions(
+        ("Chuck Fleischmann", "Charles J. Fleischmann", "Nancy Pelosi", "Alice Smith"),
+        disclosure_dates=["2024-05-10", "2024-05-12", "2024-05-14", "2024-05-16"],
+    )
+    transactions["source"] = ["house_pdf", "senate_efd", "house_pdf", "senate_efd"]
+    as_of = pd.Timestamp("2024-05-20")
+
+    original = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=as_of, min_buyers=3
+    ).iloc[0]
+    reversed_rows = score_ticker_by_buyers(
+        "AAPL", transactions.iloc[::-1].reset_index(drop=True),
+        as_of_date=as_of,
+        min_buyers=3,
+    ).iloc[0]
+
+    assert original["num_buyers"] == reversed_rows["num_buyers"] == 3
+    assert original["signal_score"] == reversed_rows["signal_score"] == 3.0
+    assert original["buyers"] == reversed_rows["buyers"]
+
+
+def test_ambiguous_alias_cannot_bridge_distinct_full_names():
+    transactions = _transactions(
+        (
+            "Charles J. Fleischmann",
+            "Chuck Fleischmann",
+            "Charles K. Fleischmann",
+        ),
+        disclosure_dates=["2024-05-10", "2024-05-11", "2024-05-12"],
+    )
+    transactions["source"] = ["house_pdf", "senate_efd", "house_pdf"]
+    prepared = prepare_consensus_purchases(transactions)
+
+    result = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=pd.Timestamp("2024-05-20"), min_buyers=3
+    )
+
+    assert len(prepared) == len(transactions) == 3
+    assert prepared["member"].tolist() == [
+        "Charles J. Fleischmann",
+        "Chuck Fleischmann",
+        "Charles K. Fleischmann",
+    ]
+    assert prepared.loc[
+        prepared["member"] == "Chuck Fleischmann", "_member_canonical"
+    ].item() == ""
+    assert result.iloc[0]["num_buyers"] == 2
+    assert result.iloc[0]["signal_score"] == 0.0
+    assert "minimum buyer threshold" in result.iloc[0]["note"]
+    assert get_consensus_candidate_tickers(
+        transactions, 3, as_of_date=pd.Timestamp("2024-05-20")
+    ) == []
 
 
 @pytest.mark.parametrize("ticker", ["", "   ", "NOT_A_TICKER", "CASH", "BOND", "SP"])

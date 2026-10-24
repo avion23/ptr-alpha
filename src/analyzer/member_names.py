@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterable
 from functools import lru_cache
 
 
@@ -195,6 +196,63 @@ def same_member_identity(first: str, candidate: str) -> bool:
     return first_key == candidate_key or _same_member_variant(
         first_key, candidate_key
     )
+
+
+def member_identity_groups(names: Iterable[str]) -> dict[str, str]:
+    """Map observed canonical names to conservative, order-independent groups.
+
+    ``same_member_identity`` is a pairwise filed-variant predicate, not a
+    transitive equivalence relation. A short variant that matches two
+    conflicting full names is therefore marked ambiguous instead of bridging
+    those identities. Its empty group key keeps it out of distinct-buyer counts.
+    """
+    canonical_names: set[str] = set()
+    for name in names:
+        if isinstance(name, str):
+            key = canonical_member_key(name)
+            if key:
+                canonical_names.add(key)
+    keys = sorted(canonical_names)
+    by_surname: dict[str, list[str]] = {}
+    for key in keys:
+        tokens = key.split()
+        if len(tokens) > 1:
+            by_surname.setdefault(tokens[-1], []).append(key)
+
+    matches = {key: {key} for key in keys}
+    for surname_keys in by_surname.values():
+        for index, first in enumerate(surname_keys):
+            for candidate in surname_keys[index + 1 :]:
+                if same_member_identity(first, candidate):
+                    matches[first].add(candidate)
+                    matches[candidate].add(first)
+
+    ambiguous: set[str] = set()
+    for key, peers in matches.items():
+        ordered_peers = sorted(peers)
+        if any(
+            not same_member_identity(first, candidate)
+            for index, first in enumerate(ordered_peers)
+            for candidate in ordered_peers[index + 1 :]
+        ):
+            ambiguous.add(key)
+    remaining = set(keys) - ambiguous
+    groups: dict[str, str] = {}
+    while remaining:
+        representative = min(remaining)
+        component = {representative}
+        pending = [representative]
+        while pending:
+            current = pending.pop()
+            for candidate in matches[current] & remaining:
+                if candidate not in component:
+                    component.add(candidate)
+                    pending.append(candidate)
+        remaining.difference_update(component)
+        for key in component:
+            groups[key] = representative
+    groups.update({key: "" for key in ambiguous})
+    return groups
 
 
 def same_actor_identity(first: str, candidate: str) -> bool:

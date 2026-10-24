@@ -649,10 +649,11 @@ class ThirteenFSource(TransactionSource):
                 "ingestion_generation"
             ].eq(self.ingestion_generation).all():
                 raise ThirteenFError("13F source or ingestion generation does not match")
-            from analyzer.persistence.transaction_repository import drop_already_stored
+        from analyzer.persistence.transaction_repository import (
+            upsert_filing_transactions,
+        )
 
-            transactions = drop_already_stored(self.db, transactions, source="13f")
-        return self.db.upsert_transactions(transactions, source="13f")
+        return upsert_filing_transactions(self.db, transactions, source="13f")
 
     def fetch_and_save_all(self) -> int:
         return self.save_to_db(self.fetch_all_trades())

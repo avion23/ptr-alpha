@@ -4,6 +4,8 @@ import logging
 import re
 from datetime import date, datetime
 from functools import lru_cache
+from pathlib import Path
+from threading import Lock
 
 import duckdb
 import numpy as np
@@ -59,6 +61,8 @@ _ARTIFACT_IDENTITY_COLUMNS = (
     "source_row_id",
     "ingestion_generation",
 )
+_FILING_SAVE_LOCKS: dict[tuple[str, str], Lock] = {}
+_FILING_SAVE_LOCKS_GUARD = Lock()
 
 
 def drop_already_stored(db, df, *, source: str):
@@ -117,6 +121,30 @@ def drop_already_stored(db, df, *, source: str):
         index=keyed.index,
     )
     return keyed.loc[mask].drop(columns=["_record_key", "_row_key"]).copy()
+
+
+def upsert_filing_transactions(db, df, *, source: str) -> int:
+    """Serialize filing identity lookup and persistence within this process.
+
+    DuckDB transactions do not lock an absent filing-identity predicate. The
+    lock is shared by Database instances resolving to the same file, so only
+    one acquisition can pass the lookup before its upsert commits.
+    """
+    db_path = getattr(db, "db_path", None)
+    lock_key = (
+        ("path", str(Path(db_path).resolve()))
+        if db_path is not None
+        else ("connection", str(id(getattr(db, "conn", db))))
+    )
+    with _FILING_SAVE_LOCKS_GUARD:
+        lock = _FILING_SAVE_LOCKS.setdefault(lock_key, Lock())
+    # ponytail: process-local per-database lock; other-process writers rely on
+    # DuckDB's writer exclusion. Use finer lock scopes only if contention matters.
+    with lock:
+        pending = drop_already_stored(db, df, source=source)
+        return db.upsert_transactions(pending, source=source)
+
+
 _TYPE_MAP = {
     "Sale Full": "Sale",
     "Sale Partial": "Sale",

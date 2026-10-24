@@ -1,5 +1,7 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
+from threading import Event
 
 import duckdb
 import pandas as pd
@@ -483,7 +485,9 @@ class TestTransactions(DatabaseTestCase):
         self.assertAlmostEqual(aapl["amount_midpoint"], 8000.5)
 
     def test_dedup_read_failure_fails_before_upsert(self):
-        from analyzer.persistence.transaction_repository import drop_already_stored
+        from analyzer.persistence.transaction_repository import (
+            upsert_filing_transactions,
+        )
 
         existing = pd.DataFrame([{
             "doc_id": "dedup-read-regression",
@@ -520,12 +524,217 @@ class TestTransactions(DatabaseTestCase):
         retry = existing.assign(ingestion_generation="new-generation")
         before = connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         with self.assertRaises(duckdb.IOException):
-            self.db.upsert_transactions(
-                drop_already_stored(self.db, retry, source="form4"),
-                source="form4",
-            )
+            upsert_filing_transactions(self.db, retry, source="form4")
         after = connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         self.assertEqual(after, before)
+
+    def test_filing_save_serializes_identity_check_across_connections(self):
+        from unittest.mock import patch
+
+        from analyzer.persistence import transaction_repository
+        from analyzer.persistence.transaction_repository import (
+            upsert_filing_transactions,
+        )
+
+        second_db = Database(self.db.db_path)
+        try:
+            base = {
+                "doc_id": "accession-original",
+                "member": "Regression Tester",
+                "ticker": "XYZ",
+                "transaction_date": date(2024, 1, 2),
+                "disclosure_date": date(2024, 1, 3),
+                "transaction_type": "Purchase",
+                "chamber": "house",
+                "source_record_id": "accession-original",
+                "source_row_id": "nonDerivativeTransaction:000001",
+            }
+            first_lookup_done = Event()
+            second_save_started = Event()
+            second_lookup_done = Event()
+            first_upsert_done = Event()
+            original_drop = transaction_repository.drop_already_stored
+
+            def controlled_drop(db, frame, *, source):
+                pending = original_drop(db, frame, source=source)
+                generation = frame["ingestion_generation"].iloc[0]
+                if generation == "gen-a":
+                    first_lookup_done.set()
+                    if not second_save_started.wait(timeout=5):
+                        raise AssertionError("second filing save did not start")
+                    second_lookup_done.wait(timeout=0.1)
+                else:
+                    second_lookup_done.set()
+                    if not first_upsert_done.wait(timeout=5):
+                        raise AssertionError("first filing upsert did not finish")
+                return pending
+
+            original_upsert = self.db.upsert_transactions
+
+            def first_upsert(df, *, source):
+                inserted = original_upsert(df, source=source)
+                first_upsert_done.set()
+                return inserted
+
+            self.db.upsert_transactions = first_upsert
+
+            def save_a():
+                return upsert_filing_transactions(
+                    self.db,
+                    pd.DataFrame([base | {"ingestion_generation": "gen-a"}]),
+                    source="form4",
+                )
+
+            def save_b():
+                if not first_lookup_done.wait(timeout=5):
+                    raise AssertionError("first filing lookup did not finish")
+                second_save_started.set()
+                return upsert_filing_transactions(
+                    second_db,
+                    pd.DataFrame([base | {"ingestion_generation": "gen-b"}]),
+                    source="form4",
+                )
+
+            try:
+                with patch.object(
+                    transaction_repository, "drop_already_stored", controlled_drop
+                ):
+                    with ThreadPoolExecutor(max_workers=2) as workers:
+                        a = workers.submit(save_a)
+                        b = workers.submit(save_b)
+                        inserted = [a.result(timeout=10), b.result(timeout=10)]
+            finally:
+                del self.db.upsert_transactions
+
+            self.assertEqual(sorted(inserted), [0, 1])
+            canonical = self.db.conn.execute(
+                """
+                SELECT source_record_id, source_row_id, ingestion_generation
+                FROM canonical_transactions WHERE source = 'form4'
+                """
+            ).fetchall()
+            self.assertEqual(len(canonical), 1)
+            self.assertEqual(
+                canonical[0][:2],
+                ("accession-original", "nonDerivativeTransaction:000001"),
+            )
+
+            amended = base | {
+                "doc_id": "accession-amended",
+                "source_record_id": "accession-amended",
+                "amends_source_record_id": "accession-original",
+                "ingestion_generation": "gen-c",
+            }
+            self.assertEqual(
+                upsert_filing_transactions(
+                    second_db, pd.DataFrame([amended]), source="form4"
+                ),
+                1,
+            )
+            canonical = self.db.conn.execute(
+                """
+                SELECT source_record_id, amends_source_record_id
+                FROM canonical_transactions WHERE source = 'form4'
+                ORDER BY source_record_id
+                """
+            ).fetchall()
+            self.assertEqual(
+                canonical,
+                [
+                    ("accession-amended", "accession-original"),
+                    ("accession-original", None),
+                ],
+            )
+
+            corrected_reading = amended | {"disclosure_date": date(2024, 1, 4)}
+            self.assertEqual(
+                self.db.upsert_transactions(
+                    pd.DataFrame([corrected_reading]), source="form4"
+                ),
+                0,
+            )
+            self.assertEqual(
+                self.db.conn.execute(
+                    """
+                    SELECT disclosure_date FROM transaction_versions
+                    WHERE source_record_id = 'accession-amended'
+                    """
+                ).fetchall(),
+                [(date(2024, 1, 3),)],
+            )
+            self.assertEqual(
+                self.db.upsert_transactions(
+                    pd.DataFrame([amended | {"ingestion_generation": "gen-d"}]),
+                    source="form4",
+                ),
+                1,
+            )
+            self.assertEqual(
+                self.db.conn.execute(
+                    """
+                    SELECT ingestion_generation FROM transactions
+                    WHERE source_record_id = 'accession-amended'
+                    ORDER BY ingestion_generation
+                    """
+                ).fetchall(),
+                [("gen-c",), ("gen-d",)],
+            )
+        finally:
+            second_db.close()
+
+    def test_filing_write_failure_rolls_back_upsert(self):
+        from analyzer.persistence.transaction_repository import (
+            AmbiguousTransactionIdentityError,
+            upsert_filing_transactions,
+        )
+
+        row = {
+            "doc_id": "write-failure-accession-a",
+            "member": "Regression Tester",
+            "ticker": "WRITEFAIL",
+            "transaction_date": date(2024, 1, 2),
+            "disclosure_date": date(2024, 1, 3),
+            "transaction_type": "Purchase",
+            "chamber": "house",
+            "source_record_id": "write-failure-accession-a",
+            "source_row_id": "nonDerivativeTransaction:000001",
+            "ingestion_generation": "write-failure-generation",
+        }
+        connection = self.db.conn
+        connection.execute(
+            "CREATE UNIQUE INDEX test_filing_write_failure ON transactions(ticker)"
+        )
+        with self.assertRaises(AmbiguousTransactionIdentityError):
+            upsert_filing_transactions(
+                self.db,
+                pd.DataFrame([
+                    row,
+                    row | {
+                        "doc_id": "write-failure-accession-b",
+                        "source_record_id": "write-failure-accession-b",
+                    },
+                ]),
+                source="form4",
+            )
+
+        self.assertEqual(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM transactions
+                WHERE source_record_id LIKE 'write-failure-accession-%'
+                """
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM transaction_versions
+                WHERE source_record_id LIKE 'write-failure-accession-%'
+                """
+            ).fetchone()[0],
+            0,
+        )
 
     def test_transactions_exist_returns_true_when_present(self):
         df = pd.DataFrame(

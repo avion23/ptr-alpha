@@ -715,10 +715,11 @@ class Form4Source(TransactionSource):
             ]
             if df[required].isna().any().any():
                 raise Form4Error("Form 4 transaction provenance is incomplete")
-            from analyzer.persistence.transaction_repository import drop_already_stored
+        from analyzer.persistence.transaction_repository import (
+            upsert_filing_transactions,
+        )
 
-            df = drop_already_stored(self.db, df, source="form4")
-        return self.db.upsert_transactions(df, source="form4")
+        return upsert_filing_transactions(self.db, df, source="form4")
 
     def fetch_and_save_ticker(self, ticker: str, year: int) -> int:
         return self.save_to_db(self.fetch_ticker_trades(ticker, year))

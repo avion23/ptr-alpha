@@ -15,11 +15,11 @@ import requests
 
 from analyzer.asset_ticker_map import resolve_asset_ticker
 from analyzer.persistence.database import Database
-from analyzer.form4 import (
+from analyzer.sec import (
     SEC_ARCHIVES_URL,
-    _SECClient,
-    _accession_digits,
-    _acceptance_datetime,
+    SECClient as _SECClient,
+    accession_digits as _accession_digits,
+    acceptance_datetime as _acceptance_datetime,
 )
 from analyzer.interfaces import TransactionSource
 from analyzer.manager_watchlist import WATCHLIST_MANAGERS

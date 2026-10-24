@@ -5,8 +5,8 @@ import pandas as pd
 import pytest
 
 from analyzer.persistence.database import Database
-from analyzer.form4 import _acceptance_datetime
 from analyzer.persistence.transaction_repository import acceptance_datetime_violations
+from analyzer.sec import acceptance_datetime
 
 
 def test_init_and_legacy_read_only_migration(tmp_path):
@@ -48,9 +48,9 @@ def test_init_and_legacy_read_only_migration(tmp_path):
 ])
 def test_captured_header_clock(accession, expected):
     header = (Path(__file__).parent / "fixtures/acceptance" / f"{accession}.txt").read_bytes()
-    assert _acceptance_datetime(content=header) == expected
-    assert _acceptance_datetime(content=header.replace(b"<ACCEPTANCE-DATETIME>", b"ACCEPTANCE-DATETIME\t")) == expected
-    assert _acceptance_datetime() is None
+    assert acceptance_datetime(content=header) == expected
+    assert acceptance_datetime(content=header.replace(b"<ACCEPTANCE-DATETIME>", b"ACCEPTANCE-DATETIME\t")) == expected
+    assert acceptance_datetime() is None
 
 
 @pytest.mark.parametrize("accepted, violates", [

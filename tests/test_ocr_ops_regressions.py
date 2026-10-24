@@ -5,8 +5,9 @@ from datetime import date
 import pytest
 
 from analyzer.member_names import canonical_member_key
-from scripts import gemini_ocr_common as common
-from scripts import ocr_zero_rows as ops
+from analyzer.ocr import common as common
+from analyzer.ocr import ingestion as ops
+from analyzer.ocr import runner
 from analyzer.database import Database
 
 
@@ -91,7 +92,7 @@ def test_insertion_preserves_primary_failure_and_always_closes(stored, monkeypat
         raise RuntimeError("record failure")
 
     monkeypatch.setattr(ops.duckdb, "connect", lambda _: FaultyConnection())
-    monkeypatch.setattr(ops, "_record_failed_ocr_attempt", failed_record)
+    monkeypatch.setattr(ops, "record_failed_ocr_attempt", failed_record)
     parsed = common.parse_gemini_output(
         "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
         "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | A"
@@ -329,8 +330,8 @@ def test_year_runner_parses_fresh_response_once(stored, monkeypatch):
     path, pdf, _ = stored
     output = 'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS'
     monkeypatch.setattr(common.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0, stdout=output, stderr=''))
-    monkeypatch.setattr(ops, 'get_ocr_work_items', lambda **kw: [('1', 2024, str(pdf))])
-    monkeypatch.setattr(ops.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(runner, 'get_ocr_work_items', lambda **kw: [('1', 2024, str(pdf))])
+    monkeypatch.setattr(common.time, 'sleep', lambda _: None)
     original = common.parse_gemini_output
     calls = []
     def parse(*args, **kwargs):
@@ -338,7 +339,7 @@ def test_year_runner_parses_fresh_response_once(stored, monkeypatch):
         return original(*args, **kwargs)
     monkeypatch.setattr(common, 'parse_gemini_output', parse)
     monkeypatch.setattr(ops, 'parse_gemini_output', parse)
-    assert ops.run_gemini_ocr_for_year(2024, str(path.parent)) == 0
+    assert runner.run_gemini_ocr_for_year(2024, str(path.parent)) == 0
     assert calls == [1]
 
 
@@ -365,7 +366,7 @@ def test_quota_retries_with_backoff(tmp_path, monkeypatch):
         calls.append(args)
         return SimpleNamespace(returncode=1, stderr='429 RESOURCE_EXHAUSTED', stdout='')
     monkeypatch.setattr(common.subprocess, 'run', run)
-    monkeypatch.setattr(ops.time, 'sleep', sleeps.append)
+    monkeypatch.setattr(common.time, 'sleep', sleeps.append)
     output, error, metadata = common.call_gemini(str(pdf))
     assert len(calls) == 3
     assert sleeps == [30, 60]
@@ -375,13 +376,13 @@ def test_quota_retries_with_backoff(tmp_path, monkeypatch):
 def test_quota_stops_year_batch(stored, monkeypatch):
     path, pdf, digest = stored
     calls = []
-    monkeypatch.setattr(ops, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf)), ('2', 2024, str(pdf))])
-    monkeypatch.setattr(ops.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(runner, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf)), ('2', 2024, str(pdf))])
+    monkeypatch.setattr(common.time, 'sleep', lambda _: None)
     def call(*args, **kwargs):
         calls.append(args)
         return None, '429 RESOURCE_EXHAUSTED', common.ArtifactMetadata(digest, 1, 3, str(pdf))
-    monkeypatch.setattr(ops, 'call_gemini', call)
-    ops.run_gemini_ocr_for_year(2024, str(path.parent))
+    monkeypatch.setattr(runner, 'call_gemini', call)
+    runner.run_gemini_ocr_for_year(2024, str(path.parent))
     assert len(calls) == 1
 
 
@@ -389,20 +390,20 @@ def test_runner_keeps_physical_page_count(stored, monkeypatch):
     path, pdf, digest = stored
     output = 'MEMBER: Jane Doe\nPAGES: 2\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
     common.parse_gemini_output(output, expected_page_count=1)
-    monkeypatch.setattr(ops, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf))])
-    monkeypatch.setattr(ops.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(ops, 'call_gemini', lambda *args, **kwargs: (output, '', common.ArtifactMetadata(digest, 1, 3, str(pdf), common.parse_gemini_output(output, expected_page_count=1))))
-    assert ops.run_gemini_ocr_for_year(2024, str(path.parent)) == 1
+    monkeypatch.setattr(runner, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf))])
+    monkeypatch.setattr(common.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(runner, 'call_gemini', lambda *args, **kwargs: (output, '', common.ArtifactMetadata(digest, 1, 3, str(pdf), common.parse_gemini_output(output, expected_page_count=1))))
+    assert runner.run_gemini_ocr_for_year(2024, str(path.parent)) == 1
 
 
 def test_year_runner_validation_failure_retires_rows(stored, monkeypatch):
     cache_and_insert(stored)
     path, pdf, digest = stored
     output = 'MEMBER: Other Person\nPAGES: 1\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
-    monkeypatch.setattr(ops, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf))])
-    monkeypatch.setattr(ops.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(ops, 'call_gemini', lambda *args, **kwargs: (output, '', common.ArtifactMetadata(digest, 1, 3, str(pdf), common.parse_gemini_output(output, expected_page_count=1))))
-    assert ops.run_gemini_ocr_for_year(2024, str(path.parent)) == 0
+    monkeypatch.setattr(runner, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf))])
+    monkeypatch.setattr(common.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(runner, 'call_gemini', lambda *args, **kwargs: (output, '', common.ArtifactMetadata(digest, 1, 3, str(pdf), common.parse_gemini_output(output, expected_page_count=1))))
+    assert runner.run_gemini_ocr_for_year(2024, str(path.parent)) == 0
     db = Database(path)
     try:
         assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 0

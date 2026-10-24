@@ -119,7 +119,7 @@ for _path in (str(REPO_ROOT / "src"), str(REPO_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from scripts.gemini_ocr_common import pdf_sha256  # noqa: E402,F401  (re-exported)
+from analyzer.ocr.common import pdf_sha256  # noqa: E402,F401  (re-exported)
 
 AUDIT_RESULTS_NAME = "audit-results.json"
 REPORT_STATE_NAME = "audit-report-state.json"
@@ -637,7 +637,7 @@ def _attempt_bundle_dir(data_dir, year: int, doc_id: str, record: dict) -> Path:
 def _attempt_bundle_seal(data_dir, doc_dir: Path, record: dict) -> dict:
     # Pillow is already used by OCR tooling and required by pdf2image/pytesseract.
     from PIL import Image
-    from scripts.ocr_zero_rows import read_work_artifact
+    from analyzer.ocr.ingestion import read_work_artifact
 
     try:
         record_bytes = read_work_artifact(data_dir, doc_dir / "record.json")
@@ -678,7 +678,7 @@ def _attempt_bundle_seal(data_dir, doc_dir: Path, record: dict) -> dict:
 
 def _validate_attempt_bundle(data_dir, doc_dir: Path, record: dict) -> None:
     """Detect changed payloads, not hostile replacement of both seal and payload."""
-    from scripts.ocr_zero_rows import read_work_artifact
+    from analyzer.ocr.ingestion import read_work_artifact
 
     try:
         seal = json.loads(read_work_artifact(data_dir, doc_dir / "bundle-seal.json"))
@@ -691,7 +691,7 @@ def _validate_attempt_bundle(data_dir, doc_dir: Path, record: dict) -> None:
 
 def _emit_attempt_bundle(data_dir, year, doc_id, record_bytes, *, render):
     from scripts.glm_stage import ArtifactRequest, manifest_artifact
-    from scripts.gemini_ocr_common import pdf_page_count
+    from analyzer.ocr.common import pdf_page_count
 
     if not render:
         raise ValueError("attempt-scoped bundles require rendered pages")
@@ -746,7 +746,7 @@ def emit_review_bundle(
     Attempt bundles never replace old bundles or freeze/rebind sample lots.
     Emit and record operations require a sole-writer maintenance window.
     """
-    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, read_work_artifact
+    from analyzer.ocr.ingestion import ApprovedDataRoot, approved_data_root, read_work_artifact
 
     if not isinstance(data_dir, ApprovedDataRoot):
         with approved_data_root(data_dir) as root:
@@ -871,7 +871,7 @@ def record_verdict(
         raise ValueError("verdict must be 'pass' or 'fail'")
     if severity not in VALID_SEVERITIES:
         raise ValueError("severity must be 'critical' or 'cosmetic'")
-    from scripts.ocr_zero_rows import ApprovedDataRoot, approved_data_root, read_work_artifact
+    from analyzer.ocr.ingestion import ApprovedDataRoot, approved_data_root, read_work_artifact
 
     if not isinstance(data_dir, ApprovedDataRoot):
         Path(data_dir).mkdir(parents=True, exist_ok=True)

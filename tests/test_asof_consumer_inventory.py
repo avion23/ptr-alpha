@@ -45,11 +45,11 @@ EXEMPT = {
     "scripts/backfill_tickers.py:backfill_tickers": 3,  # Current repair with row archival.
     "scripts/cleanup_tickers.py:main": 8,  # Current ticker repair and counts.
     "scripts/ocr_triage.py:load_unresolved_artifacts": 1,  # Current OCR work queue.
-    "scripts/ocr_zero_rows.py:_record_failed_ocr_attempt": 1,  # Ingestion provenance.
-    "scripts/ocr_zero_rows.py:get_ocr_work_items": 3,  # Current OCR work queue.
-    "scripts/ocr_zero_rows.py:_insert_transactions": 1,  # Ingestion retirement of a no-transactions reading.
-    "scripts/ocr_zero_rows.py:_replace_accepted_ocr_rows": 5,  # Persistence/deduplication of accepted source-bound rows.
-    "scripts/ocr_zero_rows.py:record_parse_run": 1,  # Ingestion provenance.
+    "src/analyzer/ocr/ingestion.py:record_failed_ocr_attempt": 1,  # Ingestion provenance.
+    "src/analyzer/ocr/ingestion.py:get_ocr_work_items": 3,  # Current OCR work queue.
+    "src/analyzer/ocr/ingestion.py:_insert_transactions": 1,  # Ingestion no-txs row retirement.
+    "src/analyzer/ocr/ingestion.py:_replace_accepted_ocr_rows": 5,  # Persistence/deduplication/history repair.
+    "src/analyzer/ocr/ingestion.py:record_parse_run": 1,  # Ingestion provenance.
     "scripts/purge_phantom_rows.py:<module>": 1,  # Duplicate-detection SQL constant.
     "scripts/purge_phantom_rows.py:purge_phantom_rows": 3,  # Current duplicate repair.
     "scripts/rebuild_staged.py:_canonical_view_diff_counts": 1,  # View-equivalence audit.

@@ -26,8 +26,8 @@ from analyzer.vision_engines import (
     VisionBUnavailable,
 )
 from scripts import audit_sample, glm_stage
-from scripts import ocr_zero_rows
-from scripts.gemini_ocr_common import PROMPT_SHA256
+from analyzer.ocr import ingestion as ocr_zero_rows
+from analyzer.ocr.common import PROMPT_SHA256
 
 GLM_OUTPUT_ONE_ROW = (
     "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"

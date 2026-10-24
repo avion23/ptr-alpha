@@ -1,6 +1,6 @@
 """Member identity and partial-insert validation for OCR rows."""
 
-from scripts.gemini_ocr_common import validate_transactions
+from analyzer.ocr.common import validate_transactions
 
 
 def _tx(asset="Vistra Corp. Common Stock (VST) [ST]", date="01/16/2026"):

@@ -41,15 +41,20 @@ from analyzer.vision_engines import (
     VisionBConfig,
     VisionBPermanentError,
     VisionBQuotaError,
-    VisionBUnavailable,
     dual_read,
     dual_read_enabled,
     read_document_with_vision_b,
     run_dual_read_for_doc,
 )
-from scripts import gemini_ocr_common as gem
-from scripts import ocr_zero_rows
-from scripts.ocr_zero_rows import get_ocr_work_items
+from analyzer.ocr import common as gem
+from analyzer.ocr import runner as ocr_zero_rows
+from analyzer.ocr import ingestion
+from analyzer.ocr.ingestion import get_ocr_work_items
+
+def _run_main():
+    from scripts.ocr_zero_rows import _run_visionb_staging
+
+    ocr_zero_rows.main(staging_runner=_run_visionb_staging)
 
 A_OUTPUT = (
     "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
@@ -875,12 +880,12 @@ def test_dual_read_partial_insert_is_never_completed(
     def partial_insert(*args, **kwargs):
         # ...but validation kept out one of two staged rows: explicit
         # partial outcome from insert_transactions_outcome.
-        return ocr_zero_rows.InsertOutcome(
+        return ingestion.InsertOutcome(
             status="partial", inserted=1, expected=2, committed=True,
             rejections={"impossible_chronology": 1},
         )
 
-    monkeypatch.setattr(ocr_zero_rows, "insert_transactions_outcome", partial_insert)
+    monkeypatch.setattr(ingestion, "insert_transactions_outcome", partial_insert)
 
     outcome = run_dual_read_for_doc(
         _doc(tmp_path), env=_env(server), read_a=_read_a(), page_images=_pages
@@ -1275,7 +1280,7 @@ def test_main_loop_dual_agree_persists_v6_and_marks_processed(
         outputs={"dual-doc": A_OUTPUT},
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     with duckdb.connect(str(db_file)) as conn:
         run_row = conn.execute(
@@ -1311,7 +1316,7 @@ def test_main_loop_dual_disagree_marks_processed_without_persisting(
         outputs={"dual-doc": A_OUTPUT},
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     with duckdb.connect(str(db_file)) as conn:
         tx_count = conn.execute(
@@ -1343,7 +1348,7 @@ def test_main_loop_engine_b_quota_stop_ends_batch_cleanly(
         monkeypatch, tmp_path, docs=_TWO_DOCS, shas=_TWO_SHAS, outputs=_TWO_OUTPUTS
     )
 
-    ocr_zero_rows.main()  # returns cleanly: a quota stop is not a crash
+    _run_main()  # returns cleanly: a quota stop is not a crash
 
     assert calls == ["dual-doc-a"]  # batch ended at the first doc
     out = capsys.readouterr().out
@@ -1371,7 +1376,7 @@ def test_main_loop_engine_a_quota_stop_still_ends_batch(
         errors={"dual-doc-a": "429 RESOURCE_EXHAUSTED: quota exceeded"},
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     assert calls == ["dual-doc-a"]
     assert server.requests == []  # engine B is never called after A's quota stop
@@ -1392,7 +1397,7 @@ def test_main_loop_engine_b_transient_outage_lands_retry_state_not_a_only(
         monkeypatch, tmp_path, docs=_TWO_DOCS, shas=_TWO_SHAS, outputs=_TWO_OUTPUTS
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     # The batch continues (an outage is not a crash) but NOTHING persists
     # A-only: each doc lands an error run that retries it next night.
@@ -1428,7 +1433,7 @@ def test_main_loop_dual_without_engine_b_config_alerts_and_stops(
         monkeypatch, tmp_path, docs=_TWO_DOCS, shas=_TWO_SHAS, outputs=_TWO_OUTPUTS
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     # A dual run without engine B is a config defect: alert and stop the
     # batch before spending engine A on readings nothing may persist.
@@ -1456,7 +1461,7 @@ def test_main_loop_without_dual_read_stays_single_engine(
         dual=False,
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     assert calls == ["dual-doc"]  # engine A read once, no gating round trip
     assert server.requests == []  # engine B never contacted
@@ -1534,7 +1539,7 @@ def test_visionb_run_classifies_as_gemini_ocr_source_family(tmp_path):
                                     transaction_count)
         VALUES ('d1', 2024, ?, 'success', ?, 3, 3)
         """,
-        [ocr_zero_rows.GLM_PARSER_VERSION, ocr_zero_rows.GLM_ENGINES_ATTEMPTED],
+        [ingestion.GLM_PARSER_VERSION, ingestion.GLM_ENGINES_ATTEMPTED],
     )
     source = db.conn.execute(
         f"SELECT {_HOUSE_PARSE_SOURCE} FROM pdf_parse_runs AS parse_run "
@@ -1574,7 +1579,7 @@ def test_visionb_runs_leave_the_ocr_work_list(tmp_path):
         "INSERT INTO pdf_parse_runs (doc_id, year, parser_version, status, "
         "engines_attempted, raw_row_count, transaction_count, parsed_at) "
         "VALUES ('wl-doc', 2024, ?, 'no_txs', ?, 0, 0, ?)",
-        [ocr_zero_rows.GLM_PARSER_VERSION, ocr_zero_rows.GLM_ENGINES_ATTEMPTED,
+        [ingestion.GLM_PARSER_VERSION, ingestion.GLM_ENGINES_ATTEMPTED,
          base + datetime.timedelta(hours=1)],
     )
     db.close()
@@ -1586,7 +1591,7 @@ def test_visionb_runs_leave_the_ocr_work_list(tmp_path):
         "INSERT INTO pdf_parse_runs (doc_id, year, parser_version, status, "
         "engines_attempted, raw_row_count, transaction_count, parsed_at) "
         "VALUES ('wl-doc', 2024, ?, 'error', ?, 0, 0, ?)",
-        [ocr_zero_rows.GLM_PARSER_VERSION, ocr_zero_rows.GLM_ENGINES_ATTEMPTED,
+        [ingestion.GLM_PARSER_VERSION, ingestion.GLM_ENGINES_ATTEMPTED,
          base + datetime.timedelta(hours=2)],
     )
     db.close()
@@ -1617,7 +1622,7 @@ def test_main_loop_visionb_mode_stages_glm_read_and_never_touches_canonical(
         dual=False,
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     assert calls == []  # engine A (Gemini) never contacted — the whole point
     assert len(server.requests) == 1  # engine B read the document
@@ -1678,9 +1683,9 @@ def test_main_loop_visionb_mode_skips_already_staged_docs(
     import scripts.glm_stage as glm_stage
 
     # First run stages the doc; second run must not re-read engine B for it.
-    ocr_zero_rows.main()
+    _run_main()
     assert len(server.requests) == 1
-    ocr_zero_rows.main()
+    _run_main()
     assert len(server.requests) == 1  # no second read: already staged
     assert glm_stage.load_staging_record(tmp_path, 2024, "dual-doc") is not None
     assert calls == []
@@ -1702,7 +1707,7 @@ def test_main_loop_ocr_engine_unset_stays_gemini_and_never_contacts_b(
         dual=False,
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     assert calls == ["dual-doc"]  # engine A read once, exactly as before
     assert server.requests == []  # engine B never contacted
@@ -1730,7 +1735,7 @@ def test_main_loop_dual_read_overrides_ocr_engine(
         dual=True,  # ...but DUAL_READ=1 wins precedence
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     assert "DUAL AGREE: inserted=1" in capsys.readouterr().out
     with duckdb.connect(str(db_file)) as conn:
@@ -1757,7 +1762,7 @@ def test_main_loop_ocr_engine_dual_alias_runs_dual(
         dual=False,  # DUAL_READ unset: the OCR_ENGINE alias selects dual
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     assert "DUAL AGREE: inserted=1" in capsys.readouterr().out
     with duckdb.connect(str(db_file)) as conn:
@@ -1786,7 +1791,7 @@ def test_main_loop_visionb_quota_stop_ends_batch_cleanly(
         dual=False,
     )
 
-    ocr_zero_rows.main()  # returns cleanly: a quota stop is not a crash
+    _run_main()  # returns cleanly: a quota stop is not a crash
 
     assert calls == []  # engine A never contacted
     assert len(server.requests) == 1  # first doc hit engine B and got the 429
@@ -1816,7 +1821,7 @@ def test_main_loop_visionb_without_engine_b_config_fails_closed(
         dual=False,
     )
 
-    ocr_zero_rows.main()
+    _run_main()
 
     assert calls == []  # engine A is not silently spent instead
     assert "stopping batch" in capsys.readouterr().out

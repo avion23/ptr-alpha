@@ -43,6 +43,27 @@ class TestHouseAcquisitionDatabase(unittest.TestCase):
 
 
 class TestCliApp(unittest.TestCase):
+    def test_ocr_child_uses_validated_json_not_human_progress(self):
+        from analyzer.cli import _run_gemini_ocr_year_subprocess
+
+        for stdout, expected in (
+            ('{"schema":"ocr-year-summary-v1","inserted":7}', (7, None)),
+            ('Total inserted: 7', None),
+            ('{"schema":"ocr-year-summary-v1","inserted":true}', None),
+            ('{"schema":"wrong","inserted":7}', None),
+        ):
+            with self.subTest(stdout=stdout), patch(
+                "analyzer.cli.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+            ) as run:
+                result = _run_gemini_ocr_year_subprocess("data", 2024)
+                self.assertEqual(run.call_args.args[0][1:3], ["-m", "analyzer.ocr.year_cli"])
+                if expected is None:
+                    self.assertEqual(result[0], 0)
+                    self.assertIn("invalid OCR JSON summary", result[1])
+                else:
+                    self.assertEqual(result, expected)
+
     def setUp(self):
         self.runner = CliRunner()
 

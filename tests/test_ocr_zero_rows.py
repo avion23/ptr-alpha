@@ -1,37 +1,38 @@
-"""Tests for scripts.ocr_zero_rows module."""
+"""Tests for the canonical OCR ingestion owner and batch entrypoint."""
 
 import unittest
+from pathlib import Path
 
 
 class TestOcrZeroRows(unittest.TestCase):
     # --- normalize_date ---
 
     def test_normalize_date_us_format(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertEqual(ocr_zero_rows.normalize_date("01/15/24"), "2024-01-15")
         self.assertEqual(ocr_zero_rows.normalize_date("12/31/99"), "1999-12-31")
 
     def test_normalize_date_full_year(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertEqual(ocr_zero_rows.normalize_date("06/15/2024"), "2024-06-15")
 
     def test_normalize_date_invalid_returns_none(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertIsNone(ocr_zero_rows.normalize_date(""))
         self.assertIsNone(ocr_zero_rows.normalize_date("not a date"))
         self.assertIsNone(ocr_zero_rows.normalize_date("2024-01-15"))  # wrong format
 
     def test_normalize_date_invalid_month_returns_none(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertIsNone(ocr_zero_rows.normalize_date("13/15/24"))
         self.assertIsNone(ocr_zero_rows.normalize_date("00/15/24"))
 
     def test_normalize_date_invalid_day_returns_none(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertIsNone(ocr_zero_rows.normalize_date("01/32/24"))
         self.assertIsNone(ocr_zero_rows.normalize_date("01/00/24"))
@@ -40,7 +41,7 @@ class TestOcrZeroRows(unittest.TestCase):
     # --- parse_output ---
 
     def test_parse_output_basic(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         output = (
             "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
@@ -55,7 +56,7 @@ class TestOcrZeroRows(unittest.TestCase):
         self.assertEqual(txs[1]["type"], "Sale")
 
     def test_parse_output_partial_sale_normalized_to_sale(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         output = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple Inc. (AAPL) | Partial Sale | 01/15/24 | 01/20/24 | A\n"
         _, txs = ocr_zero_rows.parse_output(output)
@@ -63,7 +64,7 @@ class TestOcrZeroRows(unittest.TestCase):
         self.assertEqual(txs[0]["type"], "Sale")
 
     def test_parse_output_skips_invalid_date(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         output = (
             "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
@@ -74,7 +75,7 @@ class TestOcrZeroRows(unittest.TestCase):
             ocr_zero_rows.parse_output(output)
 
     def test_parse_output_fuzzy_match_transaction_types(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         output = (
             "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
@@ -89,7 +90,7 @@ class TestOcrZeroRows(unittest.TestCase):
         self.assertEqual(txs[2]["type"], "Sale")
 
     def test_parse_output_skips_table_headers(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         output = (
             "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
@@ -101,7 +102,7 @@ class TestOcrZeroRows(unittest.TestCase):
             ocr_zero_rows.parse_output(output)
 
     def test_parse_output_amount_midpoint_mapped(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         output = "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | D\n"
         _, txs = ocr_zero_rows.parse_output(output)
@@ -110,7 +111,7 @@ class TestOcrZeroRows(unittest.TestCase):
         self.assertEqual(txs[0]["amount_midpoint"], 175000)
 
     def test_parse_output_skips_prompt_example(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         output = (
             "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
@@ -121,7 +122,7 @@ class TestOcrZeroRows(unittest.TestCase):
         self.assertEqual([tx["asset"] for tx in txs], ["Apple (AAPL)"])
 
     def test_parse_output_explicit_no_transactions(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         member, txs = ocr_zero_rows.parse_output(
             "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS"
@@ -132,14 +133,14 @@ class TestOcrZeroRows(unittest.TestCase):
     # --- extract_ticker ---
 
     def test_extract_ticker_parenthesized(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertEqual(ocr_zero_rows.extract_ticker("Apple Inc. (AAPL)"), "AAPL")
         self.assertEqual(ocr_zero_rows.extract_ticker("BRK.B"), None)  # no parens
         self.assertEqual(ocr_zero_rows.extract_ticker("Class B (BRK.B)"), "BRK.B")
 
     def test_extract_ticker_no_match(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertIsNone(ocr_zero_rows.extract_ticker("Cash"))
         self.assertIsNone(ocr_zero_rows.extract_ticker(""))
@@ -148,19 +149,19 @@ class TestOcrZeroRows(unittest.TestCase):
     # --- resolve_ticker ---
 
     def test_resolve_ticker_exact_match(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertEqual(ocr_zero_rows.resolve_ticker("Apple"), "AAPL")
         self.assertEqual(ocr_zero_rows.resolve_ticker("Microsoft Corporation"), "MSFT")
 
     def test_resolve_ticker_longest_match_preferred(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         # "berkshire hathaway" (length 19) should match before "berkshire" (length 10)
         self.assertEqual(ocr_zero_rows.resolve_ticker("Berkshire Hathaway Inc"), "BRK")
 
     def test_resolve_ticker_no_match(self):
-        from scripts import ocr_zero_rows
+        from analyzer.ocr import ingestion as ocr_zero_rows
 
         self.assertIsNone(ocr_zero_rows.resolve_ticker("Nonexistent Corp"))
         self.assertIsNone(ocr_zero_rows.resolve_ticker(""))
@@ -177,7 +178,7 @@ def test_export_work_manifest_binds_artifacts_and_generations(tmp_path, monkeypa
 
     import duckdb
 
-    from scripts import ocr_zero_rows
+    from analyzer.ocr import ingestion as ocr_zero_rows
 
     pdf = tmp_path / "2024" / "pdfs" / "m1.pdf"
     pdf.parent.mkdir(parents=True)
@@ -218,7 +219,7 @@ def test_cli_export_work_manifest_writes_and_exits(tmp_path, monkeypatch, capsys
 
     import duckdb
 
-    from scripts import ocr_zero_rows
+    from analyzer.ocr import ingestion as ocr_zero_rows
 
     db_path = tmp_path / "c.duckdb"
     duckdb.connect(str(db_path)).close()
@@ -229,7 +230,9 @@ def test_cli_export_work_manifest_writes_and_exits(tmp_path, monkeypatch, capsys
         sys, "argv", ["ocr_zero_rows.py", "--export-work-manifest", str(manifest)]
     )
 
-    ocr_zero_rows.main()  # exports and exits before any engine-mode setup
+    from analyzer.ocr import runner
+    monkeypatch.setattr(runner, "DB_PATH", str(db_path))
+    runner.main()  # exports and exits before any engine-mode setup
 
     assert "0 unresolved docs" in capsys.readouterr().out
     envelope = json.loads(manifest.read_text())
@@ -238,7 +241,7 @@ def test_cli_export_work_manifest_writes_and_exits(tmp_path, monkeypatch, capsys
 
 
 def test_export_work_manifest_default_path_is_the_staging_root(tmp_path, monkeypatch):
-    from scripts import ocr_zero_rows
+    from analyzer.ocr import ingestion as ocr_zero_rows
 
     db_path = tmp_path / "c.duckdb"
     import duckdb
@@ -248,7 +251,11 @@ def test_export_work_manifest_default_path_is_the_staging_root(tmp_path, monkeyp
     monkeypatch.setattr(ocr_zero_rows, "get_ocr_work_items", lambda **kwargs: [])
     monkeypatch.chdir(tmp_path)
 
-    envelope = ocr_zero_rows.export_work_manifest()
+    from analyzer.ocr.paths import STAGING_ROOT
+
+    assert Path(ocr_zero_rows.export_work_manifest.__defaults__[0]) == STAGING_ROOT / "work-manifest.json"
+    output = tmp_path / "data" / "staging" / "glm-backlog" / "work-manifest.json"
+    envelope = ocr_zero_rows.export_work_manifest(output)
     assert envelope["items"] == []
     assert (
         tmp_path / "data" / "staging" / "glm-backlog" / "work-manifest.json"

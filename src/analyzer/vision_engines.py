@@ -1,6 +1,6 @@
 """Dual vision read: engine B client, agreement orchestration, and persistence.
 
-Engine A is the existing Gemini path (``scripts.gemini_ocr_common``, litellm
+Engine A is the existing Gemini path (``analyzer.ocr.common``, litellm
 routing). Engine B is any OpenAI-compatible chat-completions vision endpoint —
 built for the operator's forthcoming vLLM server (Qwen2.5-VL-class) — configured
 entirely through the environment:
@@ -73,8 +73,10 @@ from urllib.parse import urlsplit
 
 import requests
 
+from analyzer.ocr import common as gemini, ingestion as ocr
+
 if TYPE_CHECKING:
-    from scripts.gemini_ocr_common import ArtifactMetadata
+    from analyzer.ocr.common import ArtifactMetadata
 
 from analyzer.vision_agreement import (
     AGREE,
@@ -274,18 +276,6 @@ class VisionBConfig:
         return cls(base_url=base_url, model=model, api_key=api_key, timeout=timeout)
 
 
-def _gemini_common():
-    from scripts import gemini_ocr_common
-
-    return gemini_ocr_common
-
-
-def _ocr_zero_rows():
-    from scripts import ocr_zero_rows
-
-    return ocr_zero_rows
-
-
 def read_document_with_vision_b(
     page_data_urls: list[str],
     config: VisionBConfig,
@@ -313,7 +303,7 @@ def read_document_with_vision_b(
     if not page_data_urls:
         raise VisionBUnavailable("visionb requires at least one page image")
     extraction_prompt = (
-        prompt if prompt is not None else _gemini_common().PROMPT
+        prompt if prompt is not None else gemini.PROMPT
     )
     payload = {
         "model": config.model,
@@ -537,7 +527,7 @@ def read_document_with_engine_b(
         )
     if page_count is None:
         try:
-            page_count = _gemini_common().pdf_page_count(doc.pdf_path)
+            page_count = gemini.pdf_page_count(doc.pdf_path)
         except OSError as exc:
             raise VisionBUnavailable(f"visionb page count failed: {exc}") from exc
     images = (page_images or _default_page_data_urls)(doc.pdf_path, page_count)
@@ -617,7 +607,6 @@ def dual_read(
     function performs no writes; persistence lives in
     ``run_dual_read_for_doc`` / the caller.
     """
-    gemini = _gemini_common()
     if read_a is None:
         read_a = _default_read_a
     output, error, metadata = read_a(doc, refresh=refresh)
@@ -754,12 +743,12 @@ def dual_read(
 
 def _default_read_a(doc: DualReadDoc, *, refresh: bool = False) -> tuple[str | None, str | None, ArtifactMetadata | None]:
     """Engine A: the existing Gemini call, including its response cache."""
-    return _gemini_common().call_gemini(
+    return gemini.call_gemini(
         doc.pdf_path,
         doc_id=doc.doc_id,
         refresh=refresh,
         cache_dir=os.path.join(doc.data_dir, "gemini_cache"),
-        parser_version=_gemini_common().GEMINI_PARSER_VERSION,
+        parser_version=gemini.GEMINI_PARSER_VERSION,
     )
 
 
@@ -812,7 +801,7 @@ def run_dual_read_for_doc(
         quota_error = (
             decision.error_kind == "quota"
             if decision.error_kind is not None
-            else _gemini_common().is_quota_error(decision.diff_summary or "")
+            else gemini.is_quota_error(decision.diff_summary or "")
         )
         if quota_error:
             # Engine-B quota stop must end the caller's batch cleanly and
@@ -823,7 +812,7 @@ def run_dual_read_for_doc(
             )
         artifact_sha256 = getattr(decision.metadata, "sha256", None)
         try:
-            ingestion_generation = _ocr_zero_rows().resolve_ingestion_generation(
+            ingestion_generation = ocr.resolve_ingestion_generation(
                 doc.resolved_db_path, doc.doc_id, doc.year, artifact_sha256
             )
         except RuntimeError:
@@ -846,7 +835,6 @@ def run_dual_read_for_doc(
             metadata=decision.metadata,
         )
 
-    ocr = _ocr_zero_rows()
     artifact_sha256 = getattr(decision.metadata, "sha256", None)
     try:
         ingestion_generation = ocr.resolve_ingestion_generation(
@@ -855,8 +843,8 @@ def run_dual_read_for_doc(
     except RuntimeError as exc:
         fallback = DualDecision(
             A_ERROR,
-            _gemini_common().GEMINI_PARSER_VERSION,
-            _gemini_common().MODEL,
+            gemini.GEMINI_PARSER_VERSION,
+            gemini.MODEL,
             error=str(exc),
             metadata=decision.metadata,
         )
@@ -962,7 +950,6 @@ def _record_dual_failure(
     """Retire only this artifact's OCR rows and persist the selected failure."""
     import duckdb
 
-    ocr = _ocr_zero_rows()
     conn = duckdb.connect(doc.resolved_db_path)
     try:
         conn.execute("BEGIN TRANSACTION")
@@ -978,7 +965,7 @@ def _record_dual_failure(
                     ingestion_generation,
                     artifact_sha256,
                 ]
-                ocr._archive_rows(conn, "transactions", predicate, parameters)
+                ocr.archive_rows(conn, "transactions", predicate, parameters)
                 conn.execute(
                     """
                     DELETE FROM transactions
@@ -1003,10 +990,10 @@ def _record_dual_failure(
             )
             conn.execute("COMMIT")
         except Exception:
-            ocr._cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
+            ocr.cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
             raise
     finally:
-        ocr._cleanup_ocr_resource(conn.close)
+        ocr.cleanup_ocr_resource(conn.close)
 
 
 def dual_read_enabled(env: Mapping[str, str] | None = None) -> bool:

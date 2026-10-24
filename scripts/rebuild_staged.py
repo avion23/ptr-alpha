@@ -1018,7 +1018,7 @@ def _ingest_cached_gemini_year(
     staging: Path, db: Database, year: int, cache_dir: Path
 ) -> dict:
     """Ingest only already-cached Gemini output bound to the exact staged PDF."""
-    from scripts.gemini_ocr_common import (  # noqa: PLC0415
+    from analyzer.ocr.common import (  # noqa: PLC0415
         CACHE_ENVELOPE_VERSION,
         OUTPUT_SCHEMA_VERSION,
         PROMPT_SHA256,
@@ -1026,7 +1026,7 @@ def _ingest_cached_gemini_year(
         pdf_page_count,
         validate_transactions,
     )
-    from scripts.ocr_zero_rows import insert_transactions  # noqa: PLC0415
+    from analyzer.ocr.ingestion import insert_transactions  # noqa: PLC0415
 
     generation = db.get_latest_house_generation(year)
     if generation is None:

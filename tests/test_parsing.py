@@ -933,7 +933,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
         )
         end = next(
             i for i, node in enumerate(method.body)
-            if isinstance(node, ast.ImportFrom) and node.module == "scripts.ocr_zero_rows"
+            if isinstance(node, ast.ImportFrom) and node.module == "analyzer.ocr.ingestion"
         )
         code = compile(
             ast.Module(body=method.body[start:end], type_ignores=[]), "scan-canary", "exec"
@@ -1615,7 +1615,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 doc_id,
             )
 
-        from scripts.ocr_zero_rows import get_ocr_work_items
+        from analyzer.ocr.ingestion import get_ocr_work_items
 
         database_path = data_dir / "congress.duckdb"
         if not database_path.exists():

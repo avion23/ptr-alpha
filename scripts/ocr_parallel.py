@@ -10,7 +10,7 @@ from pathlib import Path
 
 import duckdb
 
-from scripts.gemini_ocr_common import (
+from analyzer.ocr.common import (
     GEMINI_35_MODEL,
     GEMINI_35_PARSER_VERSION,
     GEMINI_PARSER_VERSION,
@@ -20,8 +20,8 @@ from scripts.gemini_ocr_common import (
     pdf_page_count,
     validate_transactions,
 )
-from scripts.ocr_zero_rows import (
-    _record_failed_ocr_attempt,
+from analyzer.ocr.ingestion import (
+    record_failed_ocr_attempt,
     get_ocr_work_items,
     insert_transactions,
     load_progress,
@@ -64,7 +64,7 @@ def _write_item(item):
     if item["status"] in {"error", "rejected"}:
         connection = duckdb.connect(DB_PATH)
         try:
-            _record_failed_ocr_attempt(
+            record_failed_ocr_attempt(
                 connection,
                 item["doc_id"],
                 item["year"],

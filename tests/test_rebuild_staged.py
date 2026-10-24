@@ -452,7 +452,8 @@ def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identi
     monkeypatch, tmp_path
 ):
     from analyzer.database import Database
-    from scripts import gemini_ocr_common, rebuild_staged
+    from scripts import rebuild_staged
+    from analyzer.ocr import common as gemini_ocr_common
 
     staging = tmp_path / "stage"
     pdf_dir = staging / "2024" / "pdfs"

@@ -828,21 +828,13 @@ def _run_gemini_ocr_year_subprocess(
 ) -> tuple[int, str | None]:
     """Run one year's OCR in a child interpreter without the parent lock.
 
-    Returns (inserted, failure_reason|None). The child prints
-    ``Total inserted: N`` on success, matching the standalone entrypoint
-    pattern; the parent holds no DuckDB handle while it runs.
+    Returns (inserted, failure_reason|None). The child emits a JSON summary
+    on stdout and diagnostics on stderr; the parent releases its DB lock.
     """
-    repo_root = Path(__file__).resolve().parents[2]
-    ocr_code = (
-        "import sys;"
-        f"sys.path.insert(0, {str(repo_root)!r});"
-        "from scripts.ocr_zero_rows import run_gemini_ocr_for_year;"
-        f"inserted = run_gemini_ocr_for_year({int(year)}, data_dir={str(data_dir)!r});"
-        "print(f'Total inserted: {inserted}')"
-    )
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", ocr_code],
+            [sys.executable, "-m", "analyzer.ocr.year_cli",
+             "--year", str(int(year)), "--data-dir", str(Path(data_dir).resolve())],
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -852,10 +844,16 @@ def _run_gemini_ocr_year_subprocess(
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout)[-500:]
         return 0, f"exit {proc.returncode}: {detail}"
-    match = re.search(r"Total inserted:\s*(\d+)", proc.stdout)
-    if match is None:
-        return 0, f"missing Total inserted in output: {(proc.stdout or '')[-500:]}"
-    return int(match.group(1)), None
+    try:
+        import json
+
+        summary = json.loads(proc.stdout)
+        inserted = summary["inserted"]
+        if summary["schema"] != "ocr-year-summary-v1" or type(inserted) is not int or inserted < 0:
+            raise ValueError("invalid OCR summary")
+    except (ValueError, TypeError, KeyError):
+        return 0, f"invalid OCR JSON summary: {(proc.stdout or '')[-500:]}"
+    return inserted, None
 
 
 @app.command()

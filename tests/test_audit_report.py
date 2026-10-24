@@ -39,7 +39,8 @@ def tiny_png(color="white"):
 
 
 def test_attempt_bundles_preserve_old_evidence(data_dir, monkeypatch):
-    from scripts import glm_stage, gemini_ocr_common
+    from scripts import glm_stage
+    from analyzer.ocr import common as gemini_ocr_common
 
     pdf = b"frozen PDF snapshot"
     monkeypatch.setattr(glm_stage, "manifest_artifact", lambda *a: (Path("source.pdf"), {"pdf_bytes": pdf}))
@@ -142,7 +143,7 @@ def test_corrupt_history_refuses_before_stamping(data_dir, payload):
 
 
 def test_unreadable_history_refuses_before_stamping(data_dir, monkeypatch):
-    from scripts import ocr_zero_rows
+    from analyzer.ocr import ingestion as ocr_zero_rows
 
     path = write_record(data_dir, make_record("history"))
     before = path.read_bytes()
@@ -192,7 +193,8 @@ def test_attempt_bundle_refuses_symlink_parent_and_missing_live(data_dir, tmp_pa
 
 
 def test_attempt_bundle_failed_render_does_not_publish(data_dir, monkeypatch):
-    from scripts import glm_stage, gemini_ocr_common
+    from scripts import glm_stage
+    from analyzer.ocr import common as gemini_ocr_common
 
     record = make_record("failed")
     record["pdf_sha256"] = hashlib.sha256(b"PDF").hexdigest()
@@ -220,7 +222,8 @@ def test_attempt_bundle_failed_render_does_not_publish(data_dir, monkeypatch):
     "frozen-record-bytes",
 ])
 def test_attempt_bundle_seal_rejects_changed_payload_before_writes(data_dir, monkeypatch, mutation):
-    from scripts import glm_stage, gemini_ocr_common
+    from scripts import glm_stage
+    from analyzer.ocr import common as gemini_ocr_common
 
     record = make_record("sealed")
     record["pages"] = 2
@@ -285,7 +288,8 @@ def test_attempt_bundle_seal_rejects_changed_payload_before_writes(data_dir, mon
 
 
 def test_attempt_bundle_initial_truncated_png_never_published(data_dir, monkeypatch):
-    from scripts import glm_stage, gemini_ocr_common
+    from scripts import glm_stage
+    from analyzer.ocr import common as gemini_ocr_common
 
     record = make_record("truncated")
     record["pdf_sha256"] = hashlib.sha256(b"PDF").hexdigest()

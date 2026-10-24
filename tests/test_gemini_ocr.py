@@ -8,8 +8,8 @@ import duckdb
 import pandas as pd
 
 from analyzer.database import Database
-from scripts import gemini_ocr_common
-from scripts.ocr_zero_rows import insert_transactions, normalize_date
+from analyzer.ocr import common as gemini_ocr_common
+from analyzer.ocr.ingestion import insert_transactions, normalize_date
 
 
 OCR_SCHEMA_COLUMNS = {
@@ -673,7 +673,7 @@ def test_insert_fails_clearly_before_provenance_schema_exists(tmp_path):
         pytest.skip("production provenance schema is present")
     with pytest.raises(RuntimeError, match="requires the provenance schema"):
         _insert_transactions("legacy", 2024, "Jane Doe", [_tx()], db_path=str(db_path))
-    from scripts.ocr_zero_rows import get_ocr_work_items
+    from analyzer.ocr.ingestion import get_ocr_work_items
 
     with pytest.raises(RuntimeError, match="requires the provenance schema"):
         get_ocr_work_items(db_path=str(db_path), data_dir=tmp_path)
@@ -932,7 +932,7 @@ def test_insert_transactions_plumbs_authoritative_provenance_when_schema_support
 def test_tickerless_resolver_is_unverified_candidate_not_canonical(
     monkeypatch, tmp_path
 ):
-    from scripts import ocr_zero_rows
+    from analyzer.ocr import ingestion as ocr_zero_rows
 
     db_path = tmp_path / "candidate.duckdb"
     db = Database(db_path)
@@ -971,7 +971,7 @@ def test_tickerless_resolver_is_unverified_candidate_not_canonical(
 def test_mixed_ticker_provenance_rows_use_fixed_full_staging_schema(
     monkeypatch, tmp_path
 ):
-    from scripts import ocr_zero_rows
+    from analyzer.ocr import ingestion as ocr_zero_rows
 
     db_path = tmp_path / "mixed-schema.duckdb"
     db = Database(db_path)
@@ -998,7 +998,7 @@ def test_mixed_ticker_provenance_rows_use_fixed_full_staging_schema(
 
 
 def test_ticker_provenance_matrix_rejects_inconsistent_rows():
-    from scripts.ocr_zero_rows import validate_ticker_provenance
+    from analyzer.ocr.ingestion import validate_ticker_provenance
 
     with pytest.raises(ValueError, match="unverified"):
         validate_ticker_provenance(
@@ -1176,7 +1176,7 @@ def test_insert_transactions_mixed_invalid_batch_retires_current_artifact_rows(t
 def test_row_construction_failure_retires_current_artifact_rows(
     monkeypatch, tmp_path
 ):
-    from scripts import ocr_zero_rows
+    from analyzer.ocr import ingestion as ocr_zero_rows
 
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
@@ -1412,7 +1412,7 @@ def test_failed_exact_artifact_revalidation_retires_current_ocr_rows(tmp_path):
 
 
 def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
-    from scripts.ocr_zero_rows import get_ocr_work_items
+    from analyzer.ocr.ingestion import get_ocr_work_items
 
     db_path = tmp_path / "no-txs.duckdb"
     db = Database(db_path)
@@ -1507,7 +1507,7 @@ def test_no_transactions_atomically_retires_legacy_null_ocr_rows(tmp_path):
 
 
 def test_work_selection_uses_current_db_not_progress(tmp_path):
-    from scripts.ocr_zero_rows import get_ocr_work_items
+    from analyzer.ocr.ingestion import get_ocr_work_items
 
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)

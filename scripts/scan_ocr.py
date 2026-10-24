@@ -802,6 +802,11 @@ def write_staging(
     data_dir: str | Path,
     year: int,
 ) -> Path:
+    import os
+    import tempfile
+
+    from scripts.glm_stage import _atomic_write_json
+
     out_root = Path(out_root)
     rows_dir = out_root / "rows"
     docs_dir = out_root / "docs"
@@ -819,15 +824,25 @@ def write_staging(
         total_rows += len(rows)
 
         rows_path = rows_dir / f"{doc_id}.jsonl"
-        with rows_path.open("w", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(
-                    json.dumps(
-                        row_to_dict(row, doc_id, result["artifact_sha256"]),
-                        sort_keys=True,
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{rows_path.name}.", dir=rows_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(
+                        json.dumps(
+                            row_to_dict(row, doc_id, result["artifact_sha256"]),
+                            sort_keys=True,
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, rows_path)
+        finally:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
         staged_files[f"rows/{doc_id}.jsonl"] = sha256_file(rows_path)
 
         envelope = {
@@ -851,9 +866,7 @@ def write_staging(
             "extracted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
         doc_path = docs_dir / f"{doc_id}.json"
-        doc_path.write_text(
-            json.dumps(envelope, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        _atomic_write_json(doc_path, envelope)
         staged_files[f"docs/{doc_id}.json"] = sha256_file(doc_path)
 
         if result.get("status", "resolved" if result["resolved"] else "unresolved") == "resolved":
@@ -888,9 +901,7 @@ def write_staging(
         "staged_files_sha256": staged_files,
     }
     manifest_path = out_root / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    _atomic_write_json(manifest_path, manifest)
     staged_files["manifest.json"] = sha256_file(manifest_path)
     return out_root
 

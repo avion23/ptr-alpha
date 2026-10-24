@@ -322,6 +322,35 @@ class TestStaging(unittest.TestCase):
             self.assertTrue((out / "docs" / "9116197.json").exists())
 
 
+@pytest.mark.parametrize("failed_file", ["rows/1.jsonl", "docs/1.json", "manifest.json"])
+def test_staging_failed_publish_preserves_previous_complete_file(tmp_path, monkeypatch, failed_file):
+    result = {
+        "1": {
+            "artifact_sha256": "aa", "page_count": 1, "rows": [],
+            "resolved": True, "reasons": [], "uncovered_pages": [],
+        }
+    }
+    monkeypatch.setattr(so, "_tesseract_version", lambda: "test")
+    so.write_staging(tmp_path, result, data_dir=tmp_path, year=2026)
+    target = tmp_path / failed_file
+    before = target.read_bytes()
+    manifest_before = (tmp_path / "manifest.json").read_bytes()
+    replace = os.replace
+
+    def fail_replace(source, destination):
+        if Path(destination) == target:
+            raise OSError("publication failed")
+        replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    result["1"]["artifact_sha256"] = "bb"
+    with pytest.raises(OSError, match="publication failed"):
+        so.write_staging(tmp_path, result, data_dir=tmp_path, year=2026)
+    assert target.read_bytes() == before
+    assert (tmp_path / "manifest.json").read_bytes() == manifest_before
+    assert not list(tmp_path.rglob(".*"))
+
+
 class TestDiscovery(unittest.TestCase):
     def test_is_scanned(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -464,10 +464,9 @@ class Form4Source(TransactionSource):
                 continue
             fields = line.split("|")
             if len(fields) != 5:
-                logger.warning(
-                    "Skipping malformed SEC master index line %d", line_number
+                raise Form4Error(
+                    f"SEC master index line {line_number} has an invalid field count"
                 )
-                continue
             raw_cik, _, form, raw_filing_date, filename = (
                 field.strip() for field in fields
             )
@@ -499,11 +498,10 @@ class Form4Source(TransactionSource):
                     raise ValueError
                 if not re.fullmatch(r"\d{18}", accession_digits):
                     raise ValueError
-            except ValueError:
-                logger.warning(
-                    "Skipping malformed SEC master index line %d", line_number
-                )
-                continue
+            except ValueError as exc:
+                raise Form4Error(
+                    f"SEC Form 4 master index line {line_number} is malformed"
+                ) from exc
             # The accession prefix identifies the submitter, not necessarily
             # the issuer CIK used by this index row and archive directory.
             accession = (
@@ -520,6 +518,8 @@ class Form4Source(TransactionSource):
                     ),
                 }
             )
+        if not in_records:
+            raise Form4Error("SEC master index has no record separator")
         return filings
 
     @staticmethod
@@ -546,12 +546,17 @@ class Form4Source(TransactionSource):
             try:
                 content = self._request(self._daily_index_url(filing_day)).content
             except Form4Error as exc:
-                if "HTTP 404" not in str(exc):
-                    logger.warning(
-                        "Could not fetch SEC daily index for %s: %s", filing_day, exc
-                    )
-                continue
-            filings.extend(self._parse_master_index(content))
+                if "HTTP 404" in str(exc):
+                    continue
+                raise Form4Error(
+                    f"Could not fetch SEC daily index for {filing_day}: {exc}"
+                ) from exc
+            try:
+                filings.extend(self._parse_master_index(content))
+            except Form4Error as exc:
+                raise Form4Error(
+                    f"Could not parse SEC daily index for {filing_day}: {exc}"
+                ) from exc
 
         recent = sorted(
             (
@@ -582,11 +587,15 @@ class Form4Source(TransactionSource):
                     rows.append(parsed)
             except Exception as exc:
                 logger.warning(
-                    "Skipping SEC Form 4 filing %s: %s",
+                    "Could not complete SEC Form 4 filing %s: %s",
                     filing["accession"],
                     exc,
                     exc_info=True,
                 )
+                raise Form4Error(
+                    f"Could not complete SEC Form 4 filing "
+                    f"{filing['accession']}: {exc}"
+                ) from exc
         return pd.concat(rows, ignore_index=True) if rows else empty
 
     @staticmethod

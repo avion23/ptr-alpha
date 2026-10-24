@@ -299,11 +299,10 @@ CIK|Company Name|Form Type|Date Filed|Filename
 ------------------------------------------------
 320193|Apple Inc.|4|2026-09-29|edgar/data/320193/000032019326000012.txt
 1692819|Vistra Corp.|4/A|2026-09-28|edgar/data/1692819/000169281926000007/xslF345X03/form4.xml
-malformed line
 """
 
 
-def test_master_index_parser_accepts_form4_and_skips_malformed(master_index):
+def test_master_index_parser_accepts_form4_and_form4a(master_index):
     filings = Form4Source._parse_master_index(master_index)
 
     assert [filing["accession"] for filing in filings] == [
@@ -316,7 +315,16 @@ def test_master_index_parser_accepts_form4_and_skips_malformed(master_index):
     ]
 
 
-def test_sweep_skips_malformed_filing_xml_without_aborting(
+def test_master_index_parser_rejects_malformed_record():
+    with pytest.raises(Form4Error, match="invalid field count"):
+        Form4Source._parse_master_index(
+            b"CIK|Company Name|Form Type|Date Filed|Filename\n"
+            b"------------------------------------------------\n"
+            b"malformed line\n"
+        )
+
+
+def test_sweep_fails_on_malformed_filing_instead_of_returning_partial_rows(
     tmp_path, monkeypatch, burke_form4_xml
 ):
     today = datetime.now(UTC).date()
@@ -334,17 +342,63 @@ def test_sweep_skips_malformed_filing_xml_without_aborting(
         if url.endswith(".idx"):
             return SimpleNamespace(content=index)
         if url.endswith("000169281926000012.txt"):
-            return SimpleNamespace(content=b"<XML><ownershipDocument></XML>")
-        return SimpleNamespace(content=b"<XML>" + burke_form4_xml + b"</XML>")
+            return SimpleNamespace(content=b"<XML>" + burke_form4_xml + b"</XML>")
+        return SimpleNamespace(content=b"<XML><ownershipDocument></XML>")
 
     monkeypatch.setattr(source, "_request", request)
     try:
-        rows = source.sweep_recent(days_back=1)
+        with pytest.raises(Form4Error, match="0001692819-26-000013"):
+            source.sweep_recent(days_back=1)
     finally:
         source.close()
 
-    assert len(rows) == 3
-    assert rows["ticker"].tolist() == ["VST", "VST", "VST"]
+
+def test_failed_sweep_does_not_persist_successful_prefix(
+    tmp_path, monkeypatch, burke_form4_xml
+):
+    from analyzer.persistence.database import Database
+
+    today = datetime.now(UTC).date()
+    index = (
+        "CIK|Company Name|Form Type|Date Filed|Filename\n"
+        "------------------------------------------------\n"
+        f"1692819|Vistra Corp.|4|{today}|edgar/data/1692819/"
+        "000169281926000012.txt\n"
+        f"1692819|Vistra Corp.|4/A|{today}|edgar/data/1692819/"
+        "000169281926000013.txt\n"
+    ).encode()
+    with Database(":memory:") as db:
+        source = Form4Source(
+            data_dir=tmp_path, db=db, ingestion_generation="accepted-generation"
+        )
+        prior = parse_form4_xml(
+            burke_form4_xml,
+            accession="0001268406-26-000009",
+            source_report_path="prior.xml",
+            official_filing_date=date(2026, 9, 2),
+            ingestion_generation="accepted-generation",
+        )
+        assert source.save_to_db(prior) == 3
+
+        def request(url):
+            if url.endswith(".idx"):
+                return SimpleNamespace(content=index)
+            if url.endswith("000169281926000012.txt"):
+                return SimpleNamespace(content=b"<XML>" + burke_form4_xml + b"</XML>")
+            return SimpleNamespace(content=b"<XML><ownershipDocument></XML>")
+
+        monkeypatch.setattr(source, "_request", request)
+        try:
+            with pytest.raises(Form4Error, match="0001692819-26-000013"):
+                source.fetch_and_save_sweep(days_back=1)
+            rows = db.conn.execute(
+                "SELECT DISTINCT source_record_id, ingestion_generation "
+                "FROM transactions"
+            ).fetchall()
+            assert rows == [("0001268406-26-000009", "accepted-generation")]
+            assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (3,)
+        finally:
+            source.close()
 
 
 def test_sweep_returns_empty_canonical_frame_when_index_has_no_filings(

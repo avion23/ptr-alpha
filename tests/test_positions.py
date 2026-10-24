@@ -18,6 +18,28 @@ def _prices(days, closes):
     return pd.DataFrame({"close": closes}, index=idx)
 
 
+def test_member_discovery_distinguishes_missing_tables_from_failed_reads():
+    import duckdb
+    from types import SimpleNamespace
+    from analyzer.positions import _distinct_member_names, _member_variants
+
+    conn = duckdb.connect(":memory:")
+    db = SimpleNamespace(conn=conn)
+    try:
+        assert _member_variants(db, "Mike Smith") == ["Mike Smith"]
+        conn.execute("CREATE TABLE transactions (member VARCHAR)")
+        conn.execute("INSERT INTO transactions VALUES ('Michael Smith')")
+        assert _member_variants(db, "Mike Smith") == ["Michael Smith"]
+        conn.execute("CREATE VIEW canonical_transactions AS SELECT member FROM transactions")
+        assert _distinct_member_names(db) == ["Michael Smith", "Michael Smith"]
+        conn.execute("DROP TABLE transactions")
+        for discover in (_distinct_member_names, lambda db: _member_variants(db, "Mike Smith")):
+            with pytest.raises(duckdb.Error):
+                discover(db)
+    finally:
+        conn.close()
+
+
 def test_private_safe_cannot_open_common_stock_position():
     rows = pd.DataFrame([
         dict(member="Private", ticker="AAPL", transaction_type="Purchase",

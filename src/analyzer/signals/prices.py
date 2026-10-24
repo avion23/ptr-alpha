@@ -40,7 +40,9 @@ def _price_index_for_df(prices_df: pd.DataFrame) -> dict:
     return by_ticker
 
 
-def _price_arrays(prices_df: pd.DataFrame, ticker: str):
+def _price_arrays(
+    prices_df: pd.DataFrame, ticker: str
+) -> tuple[np.ndarray, np.ndarray] | None:
     """Return (dates_ns_int64, values_float64) for ``ticker`` in ``prices_df``,
     dropping NaNs. Result cached per (prices_df identity, ticker).
 
@@ -64,7 +66,7 @@ def _price_arrays(prices_df: pd.DataFrame, ticker: str):
         else:
             s = _normalize_price_index(prices_df[[ticker]])[ticker].dropna()
             if s.empty:
-                arrs = (None, None)
+                arrs = None
             else:
                 idx = s.index
                 arrs = (
@@ -90,8 +92,6 @@ def _price_at_or_before(
     if arrs is None:
         return None
     idx_ns, vals = arrs
-    if idx_ns is None:
-        return None
     target = pd.Timestamp(target_date).value
     # Rightmost position whose date <= target
     pos = int(np.searchsorted(idx_ns, target, side="right")) - 1
@@ -115,8 +115,6 @@ def _price_at_or_near(
     if arrs is None:
         return None
     idx_ns, vals = arrs
-    if idx_ns is None:
-        return None
     target = pd.Timestamp(target_date).value
     tol_ns = tolerance_days * _NS_PER_DAY
     lo = int(np.searchsorted(idx_ns, target - tol_ns, side="left"))

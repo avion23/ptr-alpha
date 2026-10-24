@@ -11,6 +11,17 @@ from analyzer.signals import (
 )
 
 
+def test_price_arrays_use_one_absence_sentinel():
+    from analyzer.signals.prices import _price_arrays, _price_at_or_before, _price_at_or_near
+
+    prices = pd.DataFrame({"EMPTY": [np.nan]}, index=pd.to_datetime(["2024-01-02"]))
+    for ticker in ("MISSING", "EMPTY"):
+        for _ in range(2):  # Both fresh and cached lookups use the same contract.
+            assert _price_arrays(prices, ticker) is None
+        assert _price_at_or_before(prices, ticker, prices.index[0]) is None
+        assert _price_at_or_near(prices, ticker, prices.index[0]) is None
+
+
 class TestCalculateSignalPotential(unittest.TestCase):
     def setUp(self):
         np.random.seed(42)

@@ -28,7 +28,7 @@ import time
 
 import pandas as pd
 
-from analyzer.price_repository import previous_nyse_session
+from analyzer.price_repository import nyse_sessions, previous_nyse_session
 
 MAX_PRICE_LAG_SESSIONS = 8
 FORM4_MAX_AGE_DAYS = 7
@@ -80,7 +80,7 @@ def price_freshness(
         return FreshnessCheck(
             "prices.freshness", "prices table is empty", False
         )
-    lag = len(pd.bdate_range(max_price, expected)) - 1
+    lag = len(nyse_sessions(max_price + pd.Timedelta(days=1), expected))
     return FreshnessCheck(
         "prices.freshness",
         f"canonical max {max_price}, last completed session {expected} "

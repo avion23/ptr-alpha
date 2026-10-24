@@ -5,7 +5,6 @@ import duckdb
 from datetime import date, datetime, timedelta, timezone
 import json
 
-import pandas as pd
 from unittest import TestCase
 
 from analyzer.freshness import (
@@ -33,6 +32,16 @@ def _conn_with_prices(max_date) -> duckdb.DuckDBPyConnection:
 
 
 class PriceFreshnessTest(TestCase):
+    def test_good_friday_does_not_consume_session_allowance(self):
+        con = _conn_with_prices(date(2024, 3, 28))
+        try:
+            check = price_freshness(con, today=date(2024, 4, 2), max_lag=1)
+            self.assertTrue(check.ok, check.detail)
+            self.assertIn("(1 sessions back, limit 1)", check.detail)
+            self.assertFalse(price_freshness(con, today=date(2024, 4, 3), max_lag=1).ok)
+        finally:
+            con.close()
+
     def test_current_prices_pass(self):
         con = _conn_with_prices(_fresh_session())
         check = price_freshness(con)

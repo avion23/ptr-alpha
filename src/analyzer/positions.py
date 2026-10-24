@@ -1703,18 +1703,7 @@ def _member_variants(db, member: str) -> list[str]:
     if not isinstance(member, str) or not member.strip():
         return [member]
     wanted = canonical_member_key(member)
-    try:
-        names = db.conn.execute("SELECT DISTINCT member FROM transactions").fetchall()
-    except Exception:
-        names = []
-    try:
-        names += db.conn.execute(
-            "SELECT DISTINCT member FROM canonical_transactions"
-        ).fetchall()
-    except Exception:
-        pass
-    all_names = [row[0] for row in names]
-    return _variants_for(member, wanted, all_names)
+    return _variants_for(member, wanted, _distinct_member_names(db))
 
 
 @lru_cache(maxsize=65536)
@@ -1737,16 +1726,19 @@ def _variants_for(member: str, wanted: str, all_names: list) -> list[str]:
 
 def _distinct_member_names(db) -> list:
     """All filed member names, loaded once for batched variant matching."""
-    try:
-        names = db.conn.execute("SELECT DISTINCT member FROM transactions").fetchall()
-    except Exception:
-        names = []
-    try:
+    available = {
+        row[0] for row in db.conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_name IN ('transactions', 'canonical_transactions')"
+        ).fetchall()
+    }
+    names = []
+    if "transactions" in available:
+        names += db.conn.execute("SELECT DISTINCT member FROM transactions").fetchall()
+    if "canonical_transactions" in available:
         names += db.conn.execute(
             "SELECT DISTINCT member FROM canonical_transactions"
         ).fetchall()
-    except Exception:
-        pass
     return [row[0] for row in names]
 
 

@@ -377,7 +377,7 @@ def _spy_price_index(prices_df: pd.DataFrame) -> tuple:
     SPY bars, so they are taken from the aligned window in the kernel.
     """
     spy_arrs = _price_arrays(prices_df, "SPY")
-    if spy_arrs is not None and spy_arrs[0] is not None:
+    if spy_arrs is not None:
         return spy_arrs
     return None, None
 
@@ -418,7 +418,7 @@ def _compute_all_ticker_signals(
         if ticker == "SPY":
             continue
         arrs = _price_arrays(prices_df, str(ticker))
-        if arrs is None or arrs[0] is None:
+        if arrs is None:
             continue
         dates_ns, vals = arrs
 

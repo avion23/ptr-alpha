@@ -322,14 +322,11 @@ def ensure_price_generation_schema(db: Database) -> None:
 
 
 def price_generation_schema_exists(db) -> bool:
-    try:
-        count = db.conn.execute(
-            "SELECT COUNT(*) FROM duckdb_tables() "
-            "WHERE table_name='price_generation_state'"
-        ).fetchone()[0]
-        return isinstance(count, (int, np.integer)) and count > 0
-    except Exception:
-        return False
+    count = db.conn.execute(
+        "SELECT COUNT(*) FROM duckdb_tables() "
+        "WHERE table_name='price_generation_state'"
+    ).fetchone()[0]
+    return count > 0
 
 
 def canonical_price_hash(
@@ -387,21 +384,16 @@ def price_generation_state(db, ticker: str, *, as_of=None) -> dict:
                 "generation_id": row[0], "comparability_status": row[1],
                 "alternate_generation": row[2], "reason": row[3],
             }
-    try:
-        if as_of is None:
-            values = db.conn.execute(
-                "SELECT date, close FROM prices WHERE ticker=? ORDER BY date", [ticker]
-            ).fetchdf()
-        else:
-            values = db.conn.execute(
-                "SELECT date, close FROM prices WHERE ticker=? AND date <= ? "
-                "ORDER BY date",
-                [ticker, pd.Timestamp(as_of).date()],
-            ).fetchdf()
-        if not isinstance(values, pd.DataFrame):
-            values = pd.DataFrame(columns=["date", "close"])
-    except Exception:
-        values = pd.DataFrame(columns=["date", "close"])
+    if as_of is None:
+        values = db.conn.execute(
+            "SELECT date, close FROM prices WHERE ticker=? ORDER BY date", [ticker]
+        ).fetchdf()
+    else:
+        values = db.conn.execute(
+            "SELECT date, close FROM prices WHERE ticker=? AND date <= ? "
+            "ORDER BY date",
+            [ticker, pd.Timestamp(as_of).date()],
+        ).fetchdf()
     series = (
         pd.Series(values.close.to_numpy(), index=pd.to_datetime(values.date))
         if not values.empty

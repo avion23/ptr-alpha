@@ -74,9 +74,7 @@ def evaluate_backtest(
     entry_mult, exit_mult = _slippage_multipliers(entry_slippage_bps, exit_slippage_bps)
 
     spy_arrs = _price_arrays(prices_df, "SPY")
-    spy_ns, spy_vals = (
-        spy_arrs if spy_arrs and spy_arrs[0] is not None else (None, None)
-    )
+    spy_ns, spy_vals = spy_arrs if spy_arrs is not None else (None, None)
 
     tickers = recommendations["ticker"].tolist()
     ticker_horizons = [horizon] * len(tickers)
@@ -98,7 +96,7 @@ def evaluate_backtest(
         # count no-price skips separately (Bug 2: distinguish "no data" from
         # "data exists but stale/delisted").
         cached = price_cache.get(ticker)
-        if cached is None or (isinstance(cached, tuple) and cached[0] is None):
+        if cached is None:
             n_no_price += 1
             n_unavailable += 1
             expected_entry_ns = next_nyse_session(as_of_date).value

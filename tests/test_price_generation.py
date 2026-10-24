@@ -15,8 +15,27 @@ from analyzer.price_source import (
     canonical_price_hash,
     ensure_price_generation_schema,
     price_generation_state,
+    price_generation_schema_exists,
 )
 from analyzer.setups import score
+
+
+def test_generation_absence_is_not_a_failed_database_read():
+    from types import SimpleNamespace
+
+    conn = duckdb.connect(":memory:")
+    db = SimpleNamespace(conn=conn)
+    try:
+        assert not price_generation_schema_exists(db)
+        conn.execute("CREATE TABLE prices (ticker VARCHAR, date DATE, close DOUBLE)")
+        assert price_generation_state(db, "AAA")["generation_id"] is None
+        conn.execute("DROP TABLE prices")
+        with pytest.raises(duckdb.Error):
+            price_generation_state(db, "AAA")
+    finally:
+        conn.close()
+    with pytest.raises(duckdb.Error):
+        price_generation_schema_exists(db)
 
 
 def _store_generation_rowwise(db, ticker, generation, series, factors, basis):

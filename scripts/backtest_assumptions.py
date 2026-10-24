@@ -70,7 +70,7 @@ from analyzer.positions import (
     gate_closed_events,
     holdings_candidates,
 )
-from analyzer.persistence.price_repository import previous_nyse_session
+from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.setups import score as score_setups
 
 DATA_DIR = Path("data")
@@ -102,6 +102,11 @@ OUTCOME_PRICE_SLACK_DAYS = 7
 # Replay frames (docs/strategy-charter.md, "Replay frames"). Never pooled,
 # never implicit: every command and every artifact names its frame.
 FRAMES = ("disclosure", "ingestion")
+OUTCOME_COLUMNS = [
+    "ticker", "as_of", "fill_date", "exit_date", "fill_px",
+    "entry_eligibility", "entry_eligible", "fwd", "spy", "excess",
+    "outcome_status", "exclusion_reason", "frame",
+]
 
 MIN_FRAME_EVENTS = 50
 MIN_FRAME_TICKERS = 20
@@ -216,12 +221,198 @@ def _capture_paths(decision: date) -> tuple[Path, Path, Path, bool]:
     )
 
 
-def _capture_outcome_path(decision: date, bundled: bool) -> Path:
+def _capture_seal(manifest_path: Path, manifest: dict) -> dict[str, str]:
+    """Bind labels to the artifact identities returned by capture validation."""
+    hashes = manifest.get("artifact_sha256") if isinstance(manifest, dict) else None
+    names = ("cohorts.csv", "actors.csv")
+    if not isinstance(hashes, dict) or any(
+        not isinstance(hashes.get(name), str) for name in names
+    ):
+        raise SystemExit(f"INVALID CAPTURE: {manifest_path.name} has no verifiable seal")
+    return {**{name: hashes[name] for name in names}, "manifest.json": sha256_file(manifest_path)}
+
+
+def _outcome_binding_path(path: Path) -> Path:
+    return path.with_suffix(".json")
+
+
+def _validate_outcome_panel(
+    cohorts: pd.DataFrame,
+    outcomes: pd.DataFrame,
+    decision: date,
+    frame: str,
+    *,
+    require_exit_date: bool,
+) -> None:
+    required = {
+        "ticker", "as_of", "fill_date", "fill_px", "entry_eligibility",
+        "entry_eligible", "fwd", "spy", "excess", "outcome_status",
+        "exclusion_reason", "frame",
+    }
+    if require_exit_date:
+        required.add("exit_date")
+    if not required.issubset(outcomes.columns):
+        raise SystemExit(f"INVALID OUTCOME: {decision} is missing required columns")
+    if (
+        not outcomes["as_of"].astype(str).eq(str(decision)).all()
+        or not outcomes["frame"].astype(str).eq(frame).all()
+    ):
+        raise SystemExit(f"INVALID OUTCOME: {decision} decision/frame mismatch")
+    join_outcomes(cohorts, outcomes, "frozen cohort")
+
+    expected_entry = next_nyse_session(pd.Timestamp(decision)).date()
+    for row in outcomes.itertuples(index=False):
+        status = str(row.outcome_status)
+        if status not in {"available", "excluded"}:
+            raise SystemExit(f"INVALID OUTCOME: {decision} has unknown outcome status")
+        has_fill_date = pd.notna(row.fill_date)
+        has_fill_px = pd.notna(row.fill_px)
+        if has_fill_date != has_fill_px:
+            raise SystemExit(f"INVALID OUTCOME: {decision} has incomplete fill data")
+        fill_date = None
+        if has_fill_date:
+            parsed_fill = pd.to_datetime(row.fill_date, errors="coerce")
+            if pd.isna(parsed_fill) or parsed_fill.date() != expected_entry:
+                raise SystemExit(f"INVALID OUTCOME: {decision} fill is not the expected next session")
+            fill_date = parsed_fill.date()
+            try:
+                fill_px = float(row.fill_px)
+            except (TypeError, ValueError):
+                fill_px = float("nan")
+            if not math.isfinite(fill_px) or fill_px <= 0:
+                raise SystemExit(f"INVALID OUTCOME: {decision} has invalid fill price")
+
+        has_exit_date = hasattr(row, "exit_date") and pd.notna(row.exit_date)
+        if require_exit_date and status == "available" and not has_exit_date:
+            raise SystemExit(f"INVALID OUTCOME: {decision} available label has no exit date")
+        if has_exit_date:
+            if fill_date is None:
+                raise SystemExit(f"INVALID OUTCOME: {decision} exit has no fill")
+            parsed_exit = pd.to_datetime(row.exit_date, errors="coerce")
+            expected_exit = previous_nyse_session(
+                pd.Timestamp(fill_date) + pd.Timedelta(days=HORIZON)
+            ).date()
+            if pd.isna(parsed_exit) or parsed_exit.date() != expected_exit:
+                raise SystemExit(f"INVALID OUTCOME: {decision} exit violates the {HORIZON}-day horizon")
+
+        values = []
+        for field in ("fwd", "spy", "excess"):
+            try:
+                value = float(getattr(row, field))
+            except (TypeError, ValueError):
+                value = float("nan")
+            values.append(value)
+        if status == "available":
+            if fill_date is None or not all(math.isfinite(value) for value in values):
+                raise SystemExit(f"INVALID OUTCOME: {decision} available label is incomplete")
+            if not math.isclose(values[2], values[0] - values[1], abs_tol=0.02):
+                raise SystemExit(f"INVALID OUTCOME: {decision} return and excess disagree")
+        elif any(pd.notna(getattr(row, field)) for field in ("fwd", "spy", "excess")):
+            raise SystemExit(f"INVALID OUTCOME: {decision} excluded label contains returns")
+        elif pd.isna(row.exclusion_reason) or not str(row.exclusion_reason).strip():
+            raise SystemExit(f"INVALID OUTCOME: {decision} excluded label has no reason")
+
+
+def _read_bound_outcome(
+    path: Path,
+    cohort_path: Path,
+    decision: date,
+    frame: str,
+    capture: dict[str, str],
+) -> pd.DataFrame:
+    binding_path = _outcome_binding_path(path)
+    try:
+        binding = json.loads(binding_path.read_text())
+        panel, _ = read_panel_csv(path, "outcome", frame=frame)
+        cohorts, _ = read_panel_csv(cohort_path, "cohort", frame=frame)
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        raise SystemExit(f"INVALID OUTCOME: {decision} sidecar is unreadable or unbound") from exc
+    if not isinstance(binding, dict):
+        raise SystemExit(f"INVALID OUTCOME: {decision} sidecar is not bound to this capture")
+    expected = {
+        "format": 1,
+        "decision": str(decision),
+        "frame": frame,
+        "producer": "attach-outcomes",
+        "label_contract": "production_outcomes",
+        "labels_generated_on": binding.get("labels_generated_on"),
+        "capture_sha256": capture,
+        "outcome_sha256": sha256_file(path),
+    }
+    try:
+        generated_on = date.fromisoformat(str(binding["labels_generated_on"]))
+    except (KeyError, TypeError, ValueError):
+        generated_on = None
+    if (
+        binding != expected
+        or generated_on is None
+        or generated_on < UNSEAL_AFTER
+        or generated_on > date.today()
+    ):
+        raise SystemExit(f"INVALID OUTCOME: {decision} sidecar is not bound to this capture")
+    raw_columns = pd.read_csv(path, nrows=0).columns
+    if "frame" not in raw_columns:
+        raise SystemExit(f"INVALID OUTCOME: {decision} bound sidecar has no frame column")
+    _validate_outcome_panel(
+        cohorts, panel, decision, frame, require_exit_date=True
+    )
+    return panel
+
+
+def _same_frozen_outcomes(left: pd.DataFrame, right: pd.DataFrame) -> bool:
+    keys = ["as_of", "ticker", "frame"]
+    values = [
+        "fill_date", "exit_date", "fill_px", "entry_eligibility", "entry_eligible",
+        "fwd", "spy", "excess", "outcome_status", "exclusion_reason",
+    ]
+    columns = [*keys, *(column for column in values if column in left and column in right)]
+    left = left[columns].sort_values(keys).reset_index(drop=True)
+    right = right[columns].sort_values(keys).reset_index(drop=True)
+    if len(left) != len(right):
+        return False
+    numeric = {"fill_px", "entry_eligible", "fwd", "spy", "excess"}
+    for column in columns:
+        if column in numeric:
+            a = pd.to_numeric(left[column], errors="coerce").to_numpy(dtype=float)
+            b = pd.to_numeric(right[column], errors="coerce").to_numpy(dtype=float)
+            if not np.array_equal(a, b, equal_nan=True):
+                return False
+        elif not left[column].astype("string").fillna("").equals(
+            right[column].astype("string").fillna("")
+        ):
+            return False
+    return True
+
+
+def _capture_outcome_path(
+    decision: date,
+    bundled: bool,
+    *,
+    frame: str,
+    cohort_path: Path,
+    capture: dict[str, str],
+) -> Path:
     sidecar = _walkforward_dir() / f"outcomes_{decision}.csv"
     legacy = OUT_DIR / f"outcomes_{decision}.csv"
-    if bundled or os.path.lexists(sidecar):
+    if not os.path.lexists(sidecar):
+        return sidecar if bundled else legacy
+    sidecar_panel = _read_bound_outcome(
+        sidecar, cohort_path, decision, frame, capture
+    )
+    if not os.path.lexists(legacy):
         return sidecar
-    return legacy
+
+    legacy_valid = _legacy_outcome_is_complete(legacy, cohort_path, decision, frame)
+    if _outcome_binding_path(legacy).exists():
+        _read_bound_outcome(legacy, cohort_path, decision, frame, capture)
+    if legacy_valid:
+        legacy_panel, _ = read_panel_csv(legacy, "outcome", frame=frame)
+        if not _same_frozen_outcomes(legacy_panel, sidecar_panel):
+            raise SystemExit(
+                f"CONFLICTING FROZEN OUTCOMES: {decision} has valid legacy and sidecar labels"
+            )
+        return legacy
+    return sidecar
 
 
 def _legacy_outcome_is_complete(
@@ -240,7 +431,9 @@ def _legacy_outcome_is_complete(
             return False
         if not outcomes["as_of"].astype(str).eq(str(decision)).all():
             return False
-        join_outcomes(cohorts, outcomes, "legacy frozen cohort")
+        _validate_outcome_panel(
+            cohorts, outcomes, decision, frame, require_exit_date=False
+        )
         return True
     except (OSError, ValueError, KeyError, SystemExit):
         return False
@@ -251,15 +444,15 @@ def _outcome_write_path(
 ) -> Path:
     sidecar = _walkforward_dir() / f"outcomes_{decision}.csv"
     legacy = OUT_DIR / f"outcomes_{decision}.csv"
-    if bundled or os.path.lexists(sidecar):
-        return sidecar
-    if not os.path.lexists(legacy) or _legacy_outcome_is_complete(
+    if os.path.lexists(legacy) and _legacy_outcome_is_complete(
         legacy, cohort_path, decision, frame
     ):
         return legacy
-    # Preserve a partial file from the old direct writer and retry at the
-    # walkforward sidecar path instead of truncating that evidence.
-    return sidecar
+    if bundled or os.path.lexists(sidecar) or os.path.lexists(legacy):
+        # Preserve any partial legacy attempt; a retry is bound to the verified
+        # capture by its companion receipt and never replaces the old bytes.
+        return sidecar
+    return legacy
 
 
 def _validate_capture(
@@ -482,6 +675,11 @@ def production_outcomes(db, tickers, decision: date) -> dict[str, dict]:
             fwd = spy = excess = None
         labels[str(row.ticker).strip().upper()] = {
             "fill_date": fill_date,
+            "exit_date": (
+                str(row.bt_exit_date)
+                if row.bt_coverage == "complete" and row.bt_exit_date is not None
+                else None
+            ),
             "fill_px": fill_px,
             "fwd": fwd,
             "spy": spy,
@@ -495,6 +693,7 @@ def outcome_label(labels: dict[str, dict], ticker) -> dict:
     """Fetch one guaranteed label; absence would be a harness bug, not data."""
     return labels.get(str(ticker).strip().upper()) or {
         "fill_date": None,
+        "exit_date": None,
         "fill_px": None,
         "fwd": None,
         "spy": None,
@@ -843,6 +1042,7 @@ def cmd_run(
                         "ticker": symbol,
                         "as_of": str(decision),
                         "fill_date": str(fill_date) if fill_date else None,
+                        "exit_date": label["exit_date"],
                         "fill_px": fill_px,
                         "entry_eligibility": (
                             "eligible" if eligible_fill else "ineligible"
@@ -896,11 +1096,7 @@ def cmd_run(
         if not capture_only:
             pd.DataFrame(
                 outcomes,
-                columns=[
-                    "ticker", "as_of", "fill_date", "fill_px", "entry_eligibility",
-                    "entry_eligible", "fwd", "spy", "excess", "outcome_status",
-                    "exclusion_reason", "frame",
-                ],
+                columns=OUTCOME_COLUMNS,
             ).to_csv(OUT_DIR / f"outcomes_{decision}.csv", index=False)
         manifest = {
             "decision": str(decision),
@@ -937,8 +1133,44 @@ def cmd_run(
         print("wrote", len(rows), "rows", flush=True)
 
 
-def _write_csv_exclusive(frame: pd.DataFrame, path: Path) -> None:
-    """Publish a complete CSV with an exclusive same-filesystem hard link."""
+def _write_json_exclusive(value: dict, path: Path) -> None:
+    """Create a receipt once, accepting only an identical interrupted retry."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"OUTCOME BINDING: {path.name} is unreadable") from exc
+        if existing != value:
+            raise SystemExit(f"OUTCOME BINDING: {path.name} binds different bytes or capture")
+        return
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.link(temporary, path)
+    except FileExistsError as exc:
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, ValueError):
+            raise SystemExit(f"OUTCOME BINDING: {path.name} is unreadable") from exc
+        if existing != value:
+            raise SystemExit(f"OUTCOME BINDING: {path.name} binds different bytes or capture") from exc
+    _fsync_directory(path.parent)
+    temporary.unlink()
+    _fsync_directory(path.parent)
+
+
+def _write_csv_exclusive(
+    frame: pd.DataFrame, path: Path, binding: dict
+) -> None:
+    """Publish a complete CSV and a receipt bound to its capture and bytes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
@@ -948,7 +1180,11 @@ def _write_csv_exclusive(frame: pd.DataFrame, path: Path) -> None:
         frame.to_csv(handle, index=False)
         handle.flush()
         os.fsync(handle.fileno())
-    # link() is atomic and fails rather than replacing an existing frozen file.
+    receipt = {
+        **binding,
+        "outcome_sha256": sha256_file(temporary),
+    }
+    _write_json_exclusive(receipt, _outcome_binding_path(path))
     try:
         os.link(temporary, path)
     except FileExistsError as exc:
@@ -1006,12 +1242,15 @@ def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
     if frame not in FRAMES:
         raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
     cohort_path, actor_path, manifest_path, bundled = _capture_paths(decision)
+    if not cohort_path.exists() or not manifest_path.exists():
+        raise SystemExit(f"MISSING CAPTURE: no frozen input snapshot for {decision}")
+    capture_manifest = _validate_capture(
+        decision, frame, cohort_path, actor_path, manifest_path
+    )
+    capture_seal = _capture_seal(manifest_path, capture_manifest)
     outcome_path = _outcome_write_path(decision, bundled, cohort_path, frame)
     if os.path.lexists(outcome_path):
         raise SystemExit(f"OUTCOME OVERWRITE: {outcome_path.name} already exists")
-    if not cohort_path.exists() or not manifest_path.exists():
-        raise SystemExit(f"MISSING CAPTURE: no frozen input snapshot for {decision}")
-    _validate_capture(decision, frame, cohort_path, actor_path, manifest_path)
     owns_db = db is None
     if owns_db:
         db = Database(DB_PATH, read_only=True)
@@ -1049,6 +1288,7 @@ def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
                     "ticker": symbol,
                     "as_of": str(decision_date),
                     "fill_date": str(fill_date) if fill_date else None,
+                    "exit_date": label["exit_date"],
                     "fill_px": fill_px,
                     "entry_eligibility": (
                         "eligible" if eligible_fill else "ineligible"
@@ -1064,7 +1304,23 @@ def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
                     "frame": frame,
                 }
             )
-        _write_csv_exclusive(pd.DataFrame(outcomes), outcome_path)
+        binding = {
+            "format": 1,
+            "decision": str(decision),
+            "frame": frame,
+            "producer": "attach-outcomes",
+            "label_contract": "production_outcomes",
+            "labels_generated_on": str(date.today()),
+            "capture_sha256": capture_seal,
+        }
+        current_manifest = _validate_capture(
+            decision, frame, cohort_path, actor_path, manifest_path
+        )
+        if _capture_seal(manifest_path, current_manifest) != capture_seal:
+            raise SystemExit(f"INVALID CAPTURE: {decision} changed while outcomes were attached")
+        _write_csv_exclusive(
+            pd.DataFrame(outcomes, columns=OUTCOME_COLUMNS), outcome_path, binding
+        )
     finally:
         if owns_db:
             db.close()
@@ -1073,13 +1329,44 @@ def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
 def cmd_analyze_capture(decision: date, *, frame: str) -> pd.DataFrame:
     """Join a frozen input snapshot to outcomes only after the formal unseal."""
     check_unsealed()
+    if frame not in FRAMES:
+        raise SystemExit(f"unknown frame {frame!r}; expected one of {', '.join(FRAMES)}")
     cohort_path, actor_path, manifest_path, bundled = _capture_paths(decision)
-    outcome_path = _capture_outcome_path(decision, bundled)
-    if not all(path.exists() for path in (cohort_path, outcome_path, manifest_path)):
+    if not all(path.exists() for path in (cohort_path, actor_path, manifest_path)):
         raise SystemExit(f"MISSING FROZEN DATA: capture and attach outcomes for {decision}")
-    _validate_capture(decision, frame, cohort_path, actor_path, manifest_path)
+    capture_manifest = _validate_capture(
+        decision, frame, cohort_path, actor_path, manifest_path
+    )
+    capture_seal = _capture_seal(manifest_path, capture_manifest)
+    outcome_path = _capture_outcome_path(
+        decision,
+        bundled,
+        frame=frame,
+        cohort_path=cohort_path,
+        capture=capture_seal,
+    )
+    if not outcome_path.exists():
+        raise SystemExit(f"MISSING FROZEN DATA: capture and attach outcomes for {decision}")
     cohorts, _ = read_panel_csv(cohort_path, "cohort", frame=frame)
     outcomes, _ = read_panel_csv(outcome_path, "outcome", frame=frame)
+    bound = outcome_path == _walkforward_dir() / f"outcomes_{decision}.csv"
+    has_binding = _outcome_binding_path(outcome_path).exists()
+    if bound or has_binding:
+        _read_bound_outcome(
+            outcome_path, cohort_path, decision, frame, capture_seal
+        )
+    _validate_outcome_panel(
+        cohorts,
+        outcomes,
+        decision,
+        frame,
+        require_exit_date=bound or has_binding,
+    )
+    current_manifest = _validate_capture(
+        decision, frame, cohort_path, actor_path, manifest_path
+    )
+    if _capture_seal(manifest_path, current_manifest) != capture_seal:
+        raise SystemExit(f"INVALID CAPTURE: {decision} changed during outcome analysis")
     result = join_outcomes(cohorts, outcomes, "frozen cohort")
     print(result.to_string(index=False), flush=True)
     return result

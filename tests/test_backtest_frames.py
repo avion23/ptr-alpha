@@ -36,9 +36,9 @@ ACTOR_COLUMNS = [
     "skilled", "hyper", "frame",
 ]
 OUTCOME_COLUMNS = [
-    "ticker", "as_of", "fill_date", "fill_px", "entry_eligibility",
-    "entry_eligible", "fwd", "spy", "excess", "outcome_status",
-    "exclusion_reason", "frame",
+    "ticker", "as_of", "fill_date", "exit_date", "fill_px",
+    "entry_eligibility", "entry_eligible", "fwd", "spy", "excess",
+    "outcome_status", "exclusion_reason", "frame",
 ]
 MANIFEST_KEYS = {
     "decision", "frame", "scoped_as_of", "events", "keep_tickers", "rows",
@@ -78,6 +78,83 @@ def seed_prices(db, tickers, start="2026-06-01", end="2026-12-31", close=100.0):
         for session in sessions
     ]
     db.conn.executemany("INSERT INTO prices VALUES (?, ?, ?)", rows)
+
+
+def write_synthetic_capture(out_dir, script, decision, tickers=("AAPL",)):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cohorts = pd.DataFrame(
+        [
+            {"ticker": ticker, "as_of": str(decision), "frame": "ingestion"}
+            for ticker in tickers
+        ],
+        columns=["ticker", "as_of", "frame"],
+    )
+    actors = pd.DataFrame(columns=["ticker", "as_of", "frame"])
+    cohort_path = out_dir / f"cohorts_{decision}.csv"
+    actor_path = out_dir / f"actors_{decision}.csv"
+    manifest_path = out_dir / f"manifest_{decision}.json"
+    cohorts.to_csv(cohort_path, index=False)
+    actors.to_csv(actor_path, index=False)
+    manifest = {
+        "decision": str(decision),
+        "frame": "ingestion",
+        "scoped_as_of": str(decision),
+        "events": len(tickers),
+        "keep_tickers": len(tickers),
+        "rows": len(tickers),
+        "db_path": "synthetic",
+        "db_sha256": "0" * 64,
+        "git_sha": "synthetic",
+        "capture_only": True,
+        "capture_format": 1,
+        "actor_rows": 0,
+        "artifact_sha256": {
+            "cohorts.csv": script.sha256_file(cohort_path),
+            "actors.csv": script.sha256_file(actor_path),
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest))
+    return cohort_path, actor_path, manifest_path
+
+
+def synthetic_outcomes(script, decision, *, fill_date=None, fwd=2.0, excess=1.0):
+    fill_date = fill_date or script.next_nyse_session(pd.Timestamp(decision)).date()
+    exit_date = script.previous_nyse_session(
+        pd.Timestamp(fill_date) + pd.Timedelta(days=script.HORIZON)
+    ).date()
+    return pd.DataFrame(
+        [{
+            "ticker": "AAPL",
+            "as_of": str(decision),
+            "fill_date": str(fill_date),
+            "exit_date": str(exit_date),
+            "fill_px": 100.0,
+            "entry_eligibility": "eligible",
+            "entry_eligible": True,
+            "fwd": fwd,
+            "spy": 1.0,
+            "excess": excess,
+            "outcome_status": "available",
+            "exclusion_reason": None,
+            "frame": "ingestion",
+        }],
+        columns=OUTCOME_COLUMNS,
+    )
+
+
+def synthetic_outcome_binding(script, decision, capture_paths):
+    manifest = script._validate_capture(
+        decision, "ingestion", *capture_paths
+    )
+    return {
+        "format": 1,
+        "decision": str(decision),
+        "frame": "ingestion",
+        "producer": "attach-outcomes",
+        "label_contract": "production_outcomes",
+        "labels_generated_on": str(script.date.today()),
+        "capture_sha256": script._capture_seal(capture_paths[2], manifest),
+    }
 
 
 def disclosure_visible_tickers(db, decision, today):
@@ -456,6 +533,89 @@ def test_frozen_capture_is_label_free_write_once_and_analysis_sealed(
         assert attached["exclusion_reason"].eq("outcome_price_unavailable").all()
         assert cohort_path.read_bytes() == frozen_inputs
         assert (out_dir / "walkforward" / f"outcomes_{decision}.csv").is_file()
+    finally:
+        db.close()
+
+
+def test_capture_analysis_rejects_conflicts_and_impossible_chronology(
+    tmp_path, monkeypatch, frame_script
+):
+    decision = date(2027, 1, 15)
+    monkeypatch.setattr(frame_script, "date", UnsealDate)
+
+    conflict_dir = tmp_path / "conflict"
+    conflict_dir.mkdir()
+    monkeypatch.setattr(frame_script, "OUT_DIR", conflict_dir)
+    capture_paths = write_synthetic_capture(conflict_dir, frame_script, decision)
+    legacy = synthetic_outcomes(frame_script, decision)
+    legacy.to_csv(conflict_dir / f"outcomes_{decision}.csv", index=False)
+    valid = frame_script.cmd_analyze_capture(decision, frame="ingestion")
+    assert valid[["fwd", "spy", "excess"]].iloc[0].tolist() == [2.0, 1.0, 1.0]
+
+    sidecar_path = conflict_dir / "walkforward" / f"outcomes_{decision}.csv"
+    sidecar = synthetic_outcomes(frame_script, decision, fwd=3.0, excess=2.0)
+    frame_script._write_csv_exclusive(
+        sidecar,
+        sidecar_path,
+        synthetic_outcome_binding(frame_script, decision, capture_paths),
+    )
+    with pytest.raises(SystemExit, match="CONFLICTING FROZEN OUTCOMES"):
+        frame_script.cmd_analyze_capture(decision, frame="ingestion")
+
+    chronology_dir = tmp_path / "chronology"
+    chronology_dir.mkdir()
+    monkeypatch.setattr(frame_script, "OUT_DIR", chronology_dir)
+    capture_paths = write_synthetic_capture(chronology_dir, frame_script, decision)
+    synthetic_outcomes(frame_script, decision).to_csv(
+        chronology_dir / f"outcomes_{decision}.csv", index=False
+    )
+    invalid = synthetic_outcomes(
+        frame_script, decision, fill_date=decision, fwd=1000.0, excess=999.0
+    )
+    sidecar_path = chronology_dir / "walkforward" / f"outcomes_{decision}.csv"
+    frame_script._write_csv_exclusive(
+        invalid,
+        sidecar_path,
+        synthetic_outcome_binding(frame_script, decision, capture_paths),
+    )
+    with pytest.raises(SystemExit, match="fill is not the expected next session"):
+        frame_script.cmd_analyze_capture(decision, frame="ingestion")
+
+    exit_dir = tmp_path / "exit-horizon"
+    exit_dir.mkdir()
+    capture_paths = write_synthetic_capture(exit_dir, frame_script, decision)
+    synthetic_outcomes(frame_script, decision).to_csv(
+        exit_dir / f"outcomes_{decision}.csv", index=False
+    )
+    invalid_exit = synthetic_outcomes(frame_script, decision)
+    invalid_exit.loc[0, "exit_date"] = str(
+        decision + pd.Timedelta(days=frame_script.HORIZON - 1)
+    )
+    sidecar_path = exit_dir / "walkforward" / f"outcomes_{decision}.csv"
+    frame_script._write_csv_exclusive(
+        invalid_exit,
+        sidecar_path,
+        synthetic_outcome_binding(frame_script, decision, capture_paths),
+    )
+    monkeypatch.setattr(frame_script, "OUT_DIR", exit_dir)
+    with pytest.raises(SystemExit, match="exit violates the 90-day horizon"):
+        frame_script.cmd_analyze_capture(decision, frame="ingestion")
+
+
+def test_empty_frozen_capture_keeps_a_valid_bound_empty_outcome(
+    tmp_path, monkeypatch, frame_script
+):
+    decision = date(2027, 1, 15)
+    out_dir = tmp_path / "empty"
+    write_synthetic_capture(out_dir, frame_script, decision, tickers=())
+    monkeypatch.setattr(frame_script, "OUT_DIR", out_dir)
+    monkeypatch.setattr(frame_script, "date", UnsealDate)
+    db = Database(":memory:")
+    try:
+        frame_script.cmd_attach_outcomes(decision, db=db, frame="ingestion")
+        result = frame_script.cmd_analyze_capture(decision, frame="ingestion")
+        assert result.empty
+        assert pd.read_csv(out_dir / f"outcomes_{decision}.csv").columns.tolist() == OUTCOME_COLUMNS
     finally:
         db.close()
 

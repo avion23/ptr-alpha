@@ -26,6 +26,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 from scripts import ocr_local_sweep as ocr  # noqa: E402
+from scripts import ocr_local_reclassify_no_txs as reclassify  # noqa: E402
 
 
 def test_sweep_passes_psm_without_mutating_extractor(monkeypatch):
@@ -116,6 +117,209 @@ class TestNoTxsPolicy(unittest.TestCase):
             self.assertIn("x2", mf["unresolved"])
 
 
+class TestNoTxsReclassification(unittest.TestCase):
+    @staticmethod
+    def _stage(out, doc_id, *, status, reasons, rows=None):
+        rows = rows or []
+        ocr.stage_document(
+            out,
+            {
+                "doc_id": doc_id,
+                "year": 2015,
+                "status": status,
+                "artifact_sha256": "source-hash",
+                "page_count": 2,
+                "covered_pages": [] if status == "unresolved" else [1, 2],
+                "uncovered_pages": [1, 2] if status == "unresolved" else [],
+                "row_count": len(rows),
+                "rows": rows,
+                "reasons": reasons,
+                "engines": [],
+                "canary": None,
+                "elapsed_s": 0,
+            },
+        )
+        ocr.write_manifest(out, kind="sweep", data_dir=out)
+        return out / "docs" / f"{doc_id}.json", out / "rows" / f"{doc_id}.jsonl"
+
+    def _assert_demoted(self, reasons, doc_id):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            envelope_path, _ = self._stage(
+                out, doc_id, status="no_txs", reasons=reasons
+            )
+            result = reclassify.reclassify_no_txs(out)
+            envelope = json.loads(envelope_path.read_text())
+            self.assertEqual(result["demoted"], [doc_id])
+            self.assertEqual(envelope["status"], "unresolved")
+
+    def test_duplicate_page_reading_does_not_cover_missing_page(self):
+        self._assert_demoted(["page 1: reports no transactions"] * 2, "duplicate-page")
+
+    def test_missing_page_evidence_does_not_qualify(self):
+        self._assert_demoted(["page 1: reports no transactions"], "missing-page")
+
+    def test_out_of_range_page_does_not_substitute_for_missing_page(self):
+        self._assert_demoted(
+            [
+                "page 1: reports no transactions",
+                "page 3: reports no transactions",
+            ],
+            "out-of-range-page",
+        )
+
+    def test_demote_restore_and_reruns_preserve_empty_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            doc_id = "two-way"
+            envelope_path, rows_path = self._stage(
+                out,
+                doc_id,
+                status="no_txs",
+                reasons=[
+                    "page 1: cover page (no transaction rows)",
+                    "page 2: reports no transactions",
+                ],
+            )
+            row_bytes = rows_path.read_bytes()
+            result = reclassify.reclassify_no_txs(out)
+            self.assertEqual(result["demoted"], [doc_id])
+            demoted_bytes = envelope_path.read_bytes()
+            self.assertEqual(rows_path.read_bytes(), row_bytes)
+            self.assertEqual(
+                json.loads(demoted_bytes)["artifact_sha256"], "source-hash"
+            )
+            manifest = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(manifest["unresolved_count"], 1)
+            self.assertEqual(manifest["no_txs_count"], 0)
+
+            result = reclassify.reclassify_no_txs(out)
+            self.assertEqual(result["demoted"], [])
+            self.assertEqual(result["restored"], [])
+            self.assertEqual(envelope_path.read_bytes(), demoted_bytes)
+            self.assertEqual(rows_path.read_bytes(), row_bytes)
+
+            envelope = json.loads(envelope_path.read_text())
+            marker = next(
+                reason
+                for reason in envelope["reasons"]
+                if reason.startswith("reclassified:")
+            )
+            envelope["reasons"] = [
+                "page 1: reports no transactions",
+                "page 2: reports no transactions",
+                marker,
+            ]
+            envelope_path.write_text(
+                json.dumps(envelope, indent=2, sort_keys=True) + "\n"
+            )
+            result = reclassify.reclassify_no_txs(out)
+            self.assertEqual(result["restored"], [doc_id])
+            restored_bytes = envelope_path.read_bytes()
+            restored = json.loads(restored_bytes)
+            self.assertEqual(restored["status"], "no_txs")
+            self.assertEqual(restored["covered_pages"], [1, 2])
+            self.assertEqual(restored["uncovered_pages"], [])
+            self.assertFalse(
+                any(r.startswith("reclassified:") for r in restored["reasons"])
+            )
+            self.assertEqual(restored["rows_file_sha256"], ocr.sha256_file(rows_path))
+            self.assertEqual(rows_path.read_bytes(), row_bytes)
+
+            result = reclassify.reclassify_no_txs(out)
+            self.assertEqual(result["restored"], [])
+            self.assertEqual(result["kept"], [doc_id])
+            self.assertEqual(envelope_path.read_bytes(), restored_bytes)
+            self.assertEqual(rows_path.read_bytes(), row_bytes)
+            manifest = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(manifest["unresolved_count"], 0)
+            self.assertEqual(manifest["no_txs_count"], 1)
+
+    def test_resolved_positive_with_stale_marker_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            doc_id = "resolved-positive"
+            reasons = [
+                "page 1: reports no transactions",
+                "page 2: reports no transactions",
+                "reclassified: stale marker",
+            ]
+            envelope_path, rows_path = self._stage(
+                out,
+                doc_id,
+                status="resolved",
+                reasons=reasons,
+                rows=[{"asset_description": "Positive row"}],
+            )
+            envelope_bytes = envelope_path.read_bytes()
+            row_bytes = rows_path.read_bytes()
+            row_sha = ocr.sha256_file(rows_path)
+
+            result = reclassify.reclassify_no_txs(out)
+
+            self.assertEqual(result["restored"], [])
+            self.assertEqual(envelope_path.read_bytes(), envelope_bytes)
+            self.assertEqual(rows_path.read_bytes(), row_bytes)
+            self.assertEqual(ocr.sha256_file(rows_path), row_sha)
+            manifest = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(manifest["resolved_count"], 1)
+            self.assertEqual(manifest["total_rows"], 1)
+            self.assertEqual(manifest["no_txs_count"], 0)
+
+    def test_conflicting_empty_row_claim_aborts_without_rebinding_hashes(self):
+        for corruption in (
+            "populated-file",
+            "positive-row-count",
+            "stale-positive-manifest-hash",
+        ):
+            with (
+                self.subTest(corruption=corruption),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                out = Path(tmp)
+                doc_id = f"conflict-{corruption}"
+                positive = corruption == "stale-positive-manifest-hash"
+                envelope_path, rows_path = self._stage(
+                    out,
+                    doc_id,
+                    status="resolved" if positive else "unresolved",
+                    reasons=[
+                        "page 1: reports no transactions",
+                        "page 2: reports no transactions",
+                        "reclassified: prior demotion",
+                    ],
+                    rows=[{"positive": True}] if positive else None,
+                )
+                if corruption == "populated-file":
+                    rows_path.write_text('{"positive":true}\n')
+                elif corruption == "positive-row-count":
+                    envelope = json.loads(envelope_path.read_text())
+                    envelope["row_count"] = 1
+                    envelope_path.write_text(
+                        json.dumps(envelope, indent=2, sort_keys=True) + "\n"
+                    )
+                else:
+                    manifest_path = out / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text())
+                    manifest["staged_files_sha256"][f"rows/{doc_id}.jsonl"] = "stale"
+                    manifest_path.write_text(
+                        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                    )
+                before = {
+                    path: path.read_bytes()
+                    for path in (envelope_path, rows_path, out / "manifest.json")
+                }
+
+                expected = (
+                    "recorded row hashes conflict"
+                    if positive
+                    else "zero-row claim conflict"
+                )
+                with self.assertRaisesRegex(ValueError, expected):
+                    reclassify.reclassify_no_txs(out)
+
+                for path, contents in before.items():
+                    self.assertEqual(path.read_bytes(), contents)
 
 
 class TestNormalizeIsoDate(unittest.TestCase):

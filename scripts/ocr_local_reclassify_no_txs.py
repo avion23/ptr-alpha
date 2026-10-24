@@ -38,7 +38,7 @@ if __name__ == "__main__":
         if _entry not in sys.path:
             sys.path.insert(0, _entry)
 
-from scripts.ocr_local_sweep import write_manifest  # noqa: E402
+from scripts.ocr_local_sweep import sha256_file, write_manifest  # noqa: E402
 
 REASON_NOTHING = "reports no transactions"
 REASON_COVER = "cover page (no transaction rows)"
@@ -60,19 +60,53 @@ def _atomic_write_json(path: Path, envelope: dict) -> None:
             pass
 
 
-def _page_evidence(reasons: list[str]) -> tuple[int, int]:
-    """Count page-scoped nothing-to-report vs cover-page reasons."""
-    nothing = sum(
-        1
-        for r in reasons
-        if re.match(r"^page \d+: " + re.escape(REASON_NOTHING), r)
+def _page_evidence(reasons: list[str]) -> tuple[dict[int, list[str]], bool]:
+    """Collect page readings without treating repeated lines as new pages."""
+    pages: dict[int, list[str]] = {}
+    malformed = False
+    for reason in reasons:
+        if not isinstance(reason, str):
+            malformed = True
+            continue
+        if not reason.startswith("page "):
+            continue
+        match = re.fullmatch(r"page ([1-9]\d*): (.+)", reason)
+        if match is None:
+            malformed = True
+            continue
+        page, reading = match.groups()
+        pages.setdefault(int(page), []).append(reading)
+    return pages, malformed
+
+
+def _row_artifact_matches(
+    out_root: Path,
+    envelope: dict,
+    manifest_hashes: dict | None,
+    *,
+    empty: bool,
+) -> bool:
+    """Check recorded row hashes; for empty claims, also require zero rows."""
+    doc_id = envelope.get("doc_id")
+    rows_file = f"rows/{doc_id}.jsonl"
+    if envelope.get("rows_file") != rows_file:
+        return False
+    if empty and (
+        type(envelope.get("row_count")) is not int or envelope["row_count"] != 0
+    ):
+        return False
+    rows_path = out_root / rows_file
+    try:
+        if not rows_path.is_file():
+            return False
+        if empty and rows_path.stat().st_size != 0:
+            return False
+        actual_sha = sha256_file(rows_path)
+    except OSError:
+        return False
+    return envelope.get("rows_file_sha256") == actual_sha and (
+        manifest_hashes is None or manifest_hashes.get(rows_file) == actual_sha
     )
-    cover = sum(
-        1
-        for r in reasons
-        if re.match(r"^page \d+: " + re.escape(REASON_COVER), r)
-    )
-    return nothing, cover
 
 
 def reclassify_no_txs(out_root: str | Path) -> dict:
@@ -82,16 +116,61 @@ def reclassify_no_txs(out_root: str | Path) -> dict:
     demoted: list[str] = []
     restored: list[str] = []
     kept: list[str] = []
+
+    manifest_path = out_root / "manifest.json"
+    manifest_hashes = None
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        hashes = manifest.get("staged_files_sha256")
+        manifest_hashes = hashes if isinstance(hashes, dict) else {}
+
+    documents = []
     for envelope_path in sorted(docs_dir.glob("*.json")):
         envelope = json.loads(envelope_path.read_text())
+        reasons = envelope.get("reasons") or []
+        marker = any(
+            isinstance(reason, str) and reason.startswith("reclassified:")
+            for reason in reasons
+        )
+        needs_empty_rows = envelope.get("status") == "no_txs" or (
+            envelope.get("status") == "unresolved" and marker
+        )
+        if needs_empty_rows or marker:
+            if not _row_artifact_matches(
+                out_root, envelope, manifest_hashes, empty=needs_empty_rows
+            ):
+                claim = "zero-row claim" if needs_empty_rows else "recorded row hashes"
+                raise ValueError(
+                    f"{envelope.get('doc_id')}: refusing reclassification; "
+                    f"{claim} conflict with the staged row artifact or hash"
+                )
+        documents.append((envelope_path, envelope))
+
+    for envelope_path, envelope in documents:
         doc_id = envelope["doc_id"]
         page_count = int(envelope.get("page_count") or 0)
         reasons = envelope.get("reasons") or []
-        nothing_pages, cover_pages = _page_evidence(reasons)
-        all_nothing = (
-            nothing_pages == page_count and cover_pages == 0 and page_count > 0
+        page_evidence, malformed_page_evidence = _page_evidence(reasons)
+        nothing_pages = sum(
+            readings == [REASON_NOTHING] for readings in page_evidence.values()
         )
-        marker = next((r for r in reasons if r.startswith("reclassified:")), None)
+        cover_pages = sum(
+            any(reading.startswith(REASON_COVER) for reading in readings)
+            for readings in page_evidence.values()
+        )
+        all_nothing = (
+            page_count > 0
+            and not malformed_page_evidence
+            and set(page_evidence) == set(range(1, page_count + 1))
+            and all(
+                page_evidence[page] == [REASON_NOTHING]
+                for page in range(1, page_count + 1)
+            )
+        )
+        marker = any(
+            isinstance(reason, str) and reason.startswith("reclassified:")
+            for reason in reasons
+        )
         if envelope.get("status") == "no_txs":
             if all_nothing:
                 kept.append(doc_id)
@@ -99,7 +178,7 @@ def reclassify_no_txs(out_root: str | Path) -> dict:
             envelope["status"] = "unresolved"
             envelope["uncovered_pages"] = list(range(1, page_count + 1))
             envelope["covered_pages"] = []
-            if marker is None:
+            if not marker:
                 envelope.setdefault("reasons", []).append(
                     "reclassified: cover pages are not zero-transaction evidence "
                     f"(nothing-to-report {nothing_pages}/{page_count}, "
@@ -110,12 +189,14 @@ def reclassify_no_txs(out_root: str | Path) -> dict:
             continue
         # restore previously-demoted envelopes that do carry all-page
         # nothing-to-report evidence (first pass over-counted the summary)
-        if marker is not None and all_nothing:
+        if envelope.get("status") == "unresolved" and marker and all_nothing:
             envelope["status"] = "no_txs"
             envelope["uncovered_pages"] = []
             envelope["covered_pages"] = list(range(1, page_count + 1))
             envelope["reasons"] = [
-                r for r in reasons if not r.startswith("reclassified:")
+                r
+                for r in reasons
+                if not (isinstance(r, str) and r.startswith("reclassified:"))
             ]
             _atomic_write_json(envelope_path, envelope)
             restored.append(doc_id)

@@ -17,7 +17,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.price_snapshot import load_snapshot
 from analyzer.price_source import YFinancePriceSource
 
@@ -25,7 +25,7 @@ from scripts import refresh_prices, snapshot_prices
 
 
 def _nyse_dates(start: str, end: str):
-    from analyzer.price_repository import nyse_sessions
+    from analyzer.persistence.price_repository import nyse_sessions
 
     return nyse_sessions(date.fromisoformat(start), date.fromisoformat(end))
 

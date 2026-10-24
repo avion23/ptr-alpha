@@ -7,7 +7,7 @@ import pytest
 import duckdb
 import pandas as pd
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.ocr import common as gemini_ocr_common
 from analyzer.ocr.ingestion import insert_transactions, normalize_date
 

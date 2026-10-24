@@ -14,7 +14,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 
 
 def seed_accepted_deterministic(db, *, doc="20034202", ticker="JPM"):

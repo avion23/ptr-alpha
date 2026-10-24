@@ -17,9 +17,9 @@ from defusedxml.common import DefusedXmlException
 import pandas as pd
 import requests
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.interfaces import TransactionSource
-from analyzer.transaction_repository import _BASE_WRITE_COLUMNS
+from analyzer.persistence.transaction_repository import _BASE_WRITE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -800,7 +800,7 @@ class Form4Source(TransactionSource):
             ]
             if df[required].isna().any().any():
                 raise Form4Error("Form 4 transaction provenance is incomplete")
-            from analyzer.transaction_repository import drop_already_stored
+            from analyzer.persistence.transaction_repository import drop_already_stored
 
             df = drop_already_stored(self.db, df, source="form4")
         return self.db.upsert_transactions(df, source="form4")

@@ -12,7 +12,7 @@ from datetime import date
 
 import pandas as pd
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.download import preserve_existing_fields
 
 from .conftest import DatabaseTestCase

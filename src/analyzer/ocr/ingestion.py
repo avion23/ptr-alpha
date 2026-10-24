@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import duckdb
 from pathlib import Path
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.ocr.common import (
     apply_verified_house_corrections,
     GEMINI_PARSER_VERSION,

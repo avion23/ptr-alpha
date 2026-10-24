@@ -19,7 +19,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.sql_fragments import HOUSE_PARSE_SOURCE
 from analyzer.vision_agreement import (
     AGREE,

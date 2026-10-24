@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.exceptions import AnalysisError
-from analyzer.price_repository import next_nyse_session, nyse_sessions
+from analyzer.persistence.price_repository import next_nyse_session, nyse_sessions
 from analyzer.ticker_resolver import TickerResolver
 
 from analyzer.signals import constants as _constants

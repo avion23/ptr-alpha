@@ -14,7 +14,7 @@ import pandas as pd
 import yfinance as yf
 
 from analyzer._price_index import _normalize_price_index
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.exceptions import DataSourceError
 from analyzer.settings import Settings
 from analyzer.ticker_resolver import TickerResolver

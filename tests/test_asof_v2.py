@@ -8,8 +8,9 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from analyzer import actors, database, pipeline, positions
-from analyzer.database import Database
+from analyzer import actors, pipeline, positions
+from analyzer.persistence import database
+from analyzer.persistence.database import Database
 
 
 def seed(db, *, doc="delayed", promoted="2026-08-01", accepted="2026-10-01",
@@ -143,7 +144,15 @@ def test_live_bytes_equal_independent_main_implementation(tmp_path):
         seed(db, doc="unknown", promoted=None, ticker="MSFT")
         actual = db.conn.execute("SELECT * FROM canonical_transactions ORDER BY id").fetchdf().to_csv(index=False).encode()
         # Compile the ORIGINAL main implementation, not a second call to patched SQL.
-        source = subprocess.check_output(["git", "show", "main:src/analyzer/database.py"], text=True)
+        source_ref = "main:src/analyzer/persistence/database.py"
+        try:
+            source = subprocess.check_output(["git", "show", source_ref], text=True)
+        except subprocess.CalledProcessError:
+            # Before this package move, the independent main implementation
+            # lived at the analyzer root.
+            source = subprocess.check_output(
+                ["git", "show", "main:src/analyzer/database.py"], text=True
+            )
         tree = ast.parse(source)
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Database")
         method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_init_canonical_transactions_view")

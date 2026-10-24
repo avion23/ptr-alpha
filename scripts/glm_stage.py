@@ -772,7 +772,7 @@ def canonical_parsed_doc_ids(db_path: str | Path) -> set[str]:
 
 def canonical_terminal_artifacts(db_path: str | Path) -> set[tuple[str, str, str]]:
     """Current acquired PTR identities passing the existing terminal contract."""
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     db = Database(db_path, read_only=True)
     try:

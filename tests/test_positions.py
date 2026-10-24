@@ -283,7 +283,7 @@ class TestPositions(unittest.TestCase):
         self.assertTrue(positions.empty)
 
     def test_repository_normalized_full_sale_closes_only_disclosed_account(self):
-        from analyzer.transaction_repository import _normalize_frame
+        from analyzer.persistence.transaction_repository import _normalize_frame
 
         normalized = _normalize_frame(
             pd.DataFrame(
@@ -359,7 +359,7 @@ class TestPositions(unittest.TestCase):
         self.assertAlmostEqual(positions.iloc[0]["entry_ref"], 100.0)
 
     def test_repository_normalized_full_sale_without_owner_closes_all_accounts(self):
-        from analyzer.transaction_repository import _normalize_frame
+        from analyzer.persistence.transaction_repository import _normalize_frame
 
         normalized = _normalize_frame(
             pd.DataFrame(
@@ -1721,7 +1721,7 @@ def test_holdings_batch_scopes_canonical_read_to_as_of(tmp_path):
     while the per-member form excluded it. Both forms must agree exactly,
     and a post-as_of-promoted row must be excluded from both.
     """
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from analyzer.positions import holdings_candidates_batch
 
     decision = date(2026, 6, 10)

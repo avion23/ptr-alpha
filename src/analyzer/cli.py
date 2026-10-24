@@ -20,7 +20,7 @@ from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_MIN_BUYERS,
     _get_consensus_price_tickers,
 )
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.exceptions import AnalyzerError, DataSourceError
 from analyzer.freshness import FreshnessCheck, monitoring_checks
@@ -45,7 +45,7 @@ from analyzer.pipeline import (
     source_freshness_metrics,
 )
 from analyzer.price_snapshot import create_snapshot, save_snapshot
-from analyzer.price_repository import ex_dividend_map as _ex_div_map
+from analyzer.persistence.price_repository import ex_dividend_map as _ex_div_map
 from analyzer.price_source import YFinancePriceSource
 from analyzer.settings import Settings
 

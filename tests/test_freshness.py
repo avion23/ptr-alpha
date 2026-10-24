@@ -14,7 +14,7 @@ from analyzer.freshness import (
     price_freshness,
     receipts_freshness,
 )
-from analyzer.price_repository import previous_nyse_session
+from analyzer.persistence.price_repository import previous_nyse_session
 
 
 def _fresh_session() -> date:

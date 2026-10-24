@@ -12,7 +12,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
-from analyzer.database import Database  # noqa: E402
+from analyzer.persistence.database import Database  # noqa: E402
 from scripts.refresh_prices import (  # noqa: E402
     merge_temp_into_canonical,
     verify_consumption,

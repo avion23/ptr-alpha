@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.price_snapshot import (
     PriceSnapshot,
     create_snapshot,

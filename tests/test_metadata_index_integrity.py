@@ -12,8 +12,8 @@ agreement between the two access paths.
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
-from analyzer.metadata_repository import MetadataRepository
+from analyzer.persistence.database import Database
+from analyzer.persistence.metadata_repository import MetadataRepository
 
 
 def _rows(year: int, doc_ids: list[str]) -> pd.DataFrame:

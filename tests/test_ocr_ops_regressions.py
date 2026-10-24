@@ -8,7 +8,7 @@ from analyzer.member_names import canonical_member_key
 from analyzer.ocr import common as common
 from analyzer.ocr import ingestion as ops
 from analyzer.ocr import runner
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 
 
 @pytest.fixture

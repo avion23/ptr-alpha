@@ -34,7 +34,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.interfaces import TransactionSource
 from analyzer.member_names import chamber_scoped_member_key, canonical_member_key
 from analyzer.models import Chamber, ReportOutcome, TickerOrigin
@@ -43,7 +43,7 @@ from analyzer.parsing.cells import (
     _extract_owner_code,
     _extract_ticker,
 )
-from analyzer.transaction_repository import SOURCE_TRANSACTION_COLUMNS
+from analyzer.persistence.transaction_repository import SOURCE_TRANSACTION_COLUMNS
 
 logger = logging.getLogger(__name__)
 

@@ -4,10 +4,10 @@ from datetime import date, datetime
 import duckdb
 import pandas as pd
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.senate_efd import SenateEFDSource
-from analyzer.transaction_repository import (
+from analyzer.persistence.transaction_repository import (
     SOURCE_TRANSACTION_COLUMNS,
     _normalize_frame,
 )

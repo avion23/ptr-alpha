@@ -12,14 +12,14 @@ import pandas as pd
 
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
-from analyzer.metadata_repository import MetadataRepository
-from analyzer.parse_run_repository import ParseRunRepository
-from analyzer.price_repository import PriceRepository
-from analyzer.source_report_repository import SourceReportRepository
+from analyzer.persistence.metadata_repository import MetadataRepository
+from analyzer.persistence.parse_run_repository import ParseRunRepository
+from analyzer.persistence.price_repository import PriceRepository
+from analyzer.persistence.source_report_repository import SourceReportRepository
 # Compatibility export for operational callers; the leaf owns the fragment.
 from analyzer.sql_fragments import HOUSE_PARSE_SOURCE as _HOUSE_PARSE_SOURCE
 from analyzer.ticker_resolver import TickerResolver
-from analyzer.transaction_repository import (
+from analyzer.persistence.transaction_repository import (
     SOURCE_TRANSACTION_COLUMNS,
     TransactionRepository,
 )

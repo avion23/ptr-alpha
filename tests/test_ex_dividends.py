@@ -101,7 +101,7 @@ def test_audit_records_ex_div_block():
 def test_dividends_table_created_writable_only(tmp_path):
     import duckdb
 
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     path = tmp_path / "d.duckdb"
     db = Database(path, read_only=False)
@@ -119,7 +119,7 @@ def test_dividends_table_created_writable_only(tmp_path):
 
 
 def test_upsert_dividends_is_idempotent(tmp_path):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from analyzer.price_source import upsert_dividends
 
     db = Database(tmp_path / "d.duckdb", read_only=False)

@@ -172,7 +172,7 @@ def prioritize_queue(items: list[dict]) -> list[dict]:
 
 def load_unresolved_artifacts(db_path: str | Path, data_dir: str | Path) -> list[dict]:
     """Read unresolved artifacts from each year's latest House generation."""
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     db_path = Path(db_path)
     if not db_path.is_file():
@@ -311,7 +311,7 @@ def _persist_through_pipeline(
     results: list[tuple[dict, list[dict]]], db_path, data_dir
 ) -> tuple[int, list[str]]:
     """Persist locally recovered rows using the normal House save path."""
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from analyzer.download import HouseTransactionSource
     from analyzer.settings import Settings
 

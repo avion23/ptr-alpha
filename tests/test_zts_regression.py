@@ -7,7 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from analyzer import actors, cli, pipeline, positions, replay, setups
-from analyzer.transaction_repository import TransactionRepository
+from analyzer.persistence.transaction_repository import TransactionRepository
 
 JUNE_30 = date(2026, 6, 30)
 JULY_31 = date(2026, 7, 31)

@@ -4,9 +4,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.form4 import _acceptance_datetime
-from analyzer.transaction_repository import acceptance_datetime_violations
+from analyzer.persistence.transaction_repository import acceptance_datetime_violations
 
 
 def test_init_and_legacy_read_only_migration(tmp_path):

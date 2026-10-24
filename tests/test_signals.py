@@ -201,7 +201,7 @@ class TestRenameAliasPerDisclosureDateResolution(unittest.TestCase):
         )
 
     def test_fb_resolves_to_fb_before_rename_and_meta_after(self):
-        from analyzer.price_repository import (
+        from analyzer.persistence.price_repository import (
             next_nyse_session,
             previous_nyse_session,
         )

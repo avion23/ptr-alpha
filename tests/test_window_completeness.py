@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer.analysis import calculate_signal_potential
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 
 
 def test_ticker_gap_does_not_use_stale_last_price_for_incomplete_horizon():

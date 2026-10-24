@@ -55,7 +55,7 @@ from scipy import stats
 from analyzer import positions
 from analyzer.actors import actor_id, weights_for_candidates
 from analyzer.backtest.evaluate import evaluate_backtest
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.manager_watchlist import watchlist_actor_ids
 from analyzer.member_names import canonical_member_key
 from analyzer.pipeline import eligible_events
@@ -65,7 +65,7 @@ from analyzer.positions import (
     gate_closed_events,
     holdings_candidates,
 )
-from analyzer.price_repository import previous_nyse_session
+from analyzer.persistence.price_repository import previous_nyse_session
 from analyzer.setups import score as score_setups
 
 DATA_DIR = Path("data")

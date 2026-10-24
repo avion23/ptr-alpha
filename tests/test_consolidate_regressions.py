@@ -19,7 +19,7 @@ LOOKUP = {"doc": dict(First="Jane", Last="Doe", FilingDate="2021-01-03")}
 
 
 def test_notification_survives_consolidation_and_normalization_without_fallback():
-    from analyzer.transaction_repository import _normalize_frame
+    from analyzer.persistence.transaction_repository import _normalize_frame
     transactions = [_tx(row="r1"), _tx(row="r2")]
     transactions[0]["notification_date"] = "01/02/2021"
     transactions[0]["asset_description"] = "Private LLC [OL] Description: convertible SAFE"

@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from scripts import ocr_triage
 
 

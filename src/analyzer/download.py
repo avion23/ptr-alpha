@@ -20,7 +20,7 @@ import pandas as pd
 import requests
 import requests_cache
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.exceptions import DataSourceError, ParsingError
 from analyzer.interfaces import TransactionSource
 from analyzer.settings import Settings

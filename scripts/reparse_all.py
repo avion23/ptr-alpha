@@ -23,7 +23,7 @@ from typing import cast
 
 import pandas as pd
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.download import (
     HouseTransactionSource,
     _build_member_lookup,

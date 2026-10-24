@@ -11,7 +11,7 @@ if str(SRC) not in sys.path:
 
 import pandas as pd
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.models import TickerOrigin
 
 

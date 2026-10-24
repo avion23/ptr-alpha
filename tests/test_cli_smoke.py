@@ -58,7 +58,7 @@ class TestCliSmoke(unittest.TestCase):
         # suite must not flake when a background refresh holds the canonical
         # DuckDB write lock.
         with tempfile.TemporaryDirectory() as data_dir:
-            from analyzer.database import Database
+            from analyzer.persistence.database import Database
 
             Database(Path(data_dir) / "congress.duckdb").close()
             result = runner.invoke(app, ["setups", "--member", "Bogus Member",

@@ -8,7 +8,7 @@ from analyzer.settings import Settings, DataSettings
 from analyzer.pipeline import run_analysis_pipeline, AnalysisParams
 from analyzer.download import HouseTransactionSource
 from analyzer.price_source import YFinancePriceSource
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.models import AnalysisMode
 from analyzer.exceptions import DataResult, DataSourceError
 

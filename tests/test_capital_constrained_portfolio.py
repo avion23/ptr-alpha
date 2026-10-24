@@ -22,7 +22,7 @@ import pandas as pd
 import pytest
 
 from analyzer import analysis
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.portfolio.equal_slot import PortfolioConfig, PortfolioSimulator
 
 MEMBERS = ["ALICE", "BOB", "CAROL"]

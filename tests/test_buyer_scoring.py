@@ -182,7 +182,7 @@ def test_consensus_excludes_option_instrument_rows_before_counting():
 def test_consensus_private_safe_and_existing_fund_boundary():
     from unittest.mock import patch
 
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from analyzer.pipeline import eligible_events
 
     transactions = _transactions(

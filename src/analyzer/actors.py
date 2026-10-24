@@ -15,7 +15,7 @@ import pandas as pd
 
 from analyzer.canonical_scope import canonical_decision
 from analyzer.member_names import actor_id, same_actor_identity
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.ticker_resolver import TickerResolver
 
 SOURCE_PRIORS = {

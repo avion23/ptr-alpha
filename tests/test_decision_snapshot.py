@@ -1130,7 +1130,7 @@ def test_empty_decision_is_recorded(tmp_path):
 def test_eligible_events_preserve_filing_identity():
     from unittest.mock import patch
 
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from analyzer.pipeline import eligible_events
 
     def trades(record_id):
@@ -1172,7 +1172,7 @@ def test_eligible_events_preserve_filing_identity():
 def test_legacy_producer_without_ids_records_explicit_null():
     from unittest.mock import patch
 
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from analyzer.pipeline import eligible_events
 
     trades = pd.DataFrame(

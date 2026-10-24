@@ -45,7 +45,7 @@ if __name__ == "__main__":
         if _entry not in sys.path:
             sys.path.insert(0, _entry)
 
-from analyzer.database import Database  # noqa: E402
+from analyzer.persistence.database import Database  # noqa: E402
 from analyzer.row_history import archive_rows, preserve_repair_history  # noqa: E402
 from analyzer.download import (  # noqa: E402
     _PARSE_FAILURE_PREFIX,
@@ -60,10 +60,10 @@ from analyzer.download import (  # noqa: E402
 )
 from analyzer.models import FilingType  # noqa: E402
 from analyzer.parsing import cascade as _parser_cascade  # noqa: E402
-from analyzer.price_repository import previous_nyse_session  # noqa: E402
+from analyzer.persistence.price_repository import previous_nyse_session  # noqa: E402
 from analyzer.price_snapshot import create_snapshot, save_snapshot  # noqa: E402
 from analyzer.settings import DataSettings, Settings  # noqa: E402
-from analyzer.source_report_repository import (  # noqa: E402
+from analyzer.persistence.source_report_repository import (  # noqa: E402
     SOURCE_REPORT_INPUT_COLUMNS,
     SourceReportOutcome,
     _is_official_paper_url,

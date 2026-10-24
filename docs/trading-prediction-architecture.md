@@ -80,7 +80,7 @@ The main code boundaries are:
 | House ingestion | `src/analyzer/download.py` |
 | Senate ingestion | `src/analyzer/senate_efd.py` |
 | Parser cascade | `src/analyzer/parsing/cascade.py`, `src/analyzer/parsing/` |
-| Persistence | `src/analyzer/database.py` and repository modules |
+| Persistence | `src/analyzer/persistence/` |
 | Production equity/buyer rule | `src/analyzer/member_ranking/buyer_scoring.py` |
 | Separate weighted setup rule | `src/analyzer/setups.py`, `actors.py`, `positions.py` |
 | Decision receipts and ledger | `src/analyzer/decision_snapshot.py` |

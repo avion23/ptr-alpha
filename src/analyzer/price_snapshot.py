@@ -96,7 +96,7 @@ def _compute_ticker_coverage(
 
     # Count expected exchange sessions, not generic weekdays. Generic business
     # days incorrectly call ordinary market holidays missing observations.
-    from analyzer.price_repository import _NYSE_HOLIDAYS
+    from analyzer.persistence.price_repository import _NYSE_HOLIDAYS
 
     expected_dates = pd.bdate_range(first, last)
     holidays = _NYSE_HOLIDAYS.holidays(start=first, end=last)

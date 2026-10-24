@@ -6,7 +6,7 @@ import logging
 from datetime import date
 from pathlib import Path
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.download import HouseFetchSummary, HouseTransactionSource
 from analyzer.exceptions import DataResult
 from analyzer.pipeline import run_parse_pipeline

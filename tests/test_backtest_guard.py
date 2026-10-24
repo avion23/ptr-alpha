@@ -12,7 +12,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from tests.test_asof_v2 import load_script
 
 MEMBERS = ["Jane Doe", "Bob Smith", "Carol Jones"]

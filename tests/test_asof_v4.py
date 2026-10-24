@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.row_history import archive_rows
 from tests.test_asof_v2 import load_script, seed
 

@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.pipeline import eligible_events
 from analyzer import replay as replay_module
 

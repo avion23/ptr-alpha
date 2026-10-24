@@ -6,7 +6,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.pipeline import eligible_events
 from analyzer.price_source import (
     _merge_price_generation,

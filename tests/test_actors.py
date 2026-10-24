@@ -8,8 +8,8 @@ from analyzer.actors import (
     compute_skill_table,
     compute_weight,
 )
-from analyzer.database import Database
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.database import Database
+from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 
 
 @pytest.mark.parametrize(

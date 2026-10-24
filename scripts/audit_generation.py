@@ -495,7 +495,7 @@ def check_source_identity_duplicates(
 
 
 def check_duplicate_policy(conn: duckdb.DuckDBPyConnection) -> CheckResult:
-    from analyzer.transaction_repository import _normalize_frame
+    from analyzer.persistence.transaction_repository import _normalize_frame
 
     result = CheckResult(
         "duplicate_policy",

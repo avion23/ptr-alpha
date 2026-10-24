@@ -37,17 +37,17 @@ if __name__ == "__main__":
 
 import pandas as pd
 
-from analyzer.database import Database
-from analyzer.price_repository import nyse_sessions, previous_nyse_session
+from analyzer.persistence.database import Database
+from analyzer.persistence.price_repository import nyse_sessions, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 
 # Price pipeline code whose behavior is bound into the snapshot.
 CODE_FILES = [
     "src/analyzer/price_source.py",
-    "src/analyzer/price_repository.py",
+    "src/analyzer/persistence/price_repository.py",
     "src/analyzer/price_snapshot.py",
     "src/analyzer/ticker_resolver.py",
-    "src/analyzer/database.py",
+    "src/analyzer/persistence/database.py",
     "scripts/refresh_prices.py",
     "scripts/snapshot_prices.py",
 ]

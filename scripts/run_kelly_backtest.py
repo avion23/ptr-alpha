@@ -28,7 +28,7 @@ from analyzer.portfolio import (
     compute_portfolio_metrics,
     simulate_portfolio_returns,
 )
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.settings import Settings
 
 

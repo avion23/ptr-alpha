@@ -14,7 +14,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.pipeline import eligible_events
 from analyzer.positions import holdings_candidates
 from tests.test_asof_v2 import load_script, seed

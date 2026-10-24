@@ -18,7 +18,7 @@ if __name__ == "__main__":
         if _entry not in sys.path:
             sys.path.insert(0, _entry)
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.download import HouseTransactionSource
 from analyzer.settings import Settings
 

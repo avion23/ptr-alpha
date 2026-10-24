@@ -13,7 +13,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.pipeline import BacktestParams, run_backtest_pipeline
 
 

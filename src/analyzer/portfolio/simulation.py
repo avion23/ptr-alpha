@@ -27,7 +27,7 @@ from analyzer.portfolio.kelly import (
     KellyConfig,
     build_kelly_portfolio,
 )
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 
 
 @dataclass(slots=True)

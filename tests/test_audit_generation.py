@@ -17,7 +17,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 
 from scripts.audit_generation import (
     PINNED_CANARY_COUNTS,

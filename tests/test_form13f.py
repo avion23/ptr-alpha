@@ -17,7 +17,7 @@ from analyzer.pipeline import eligible_events
 
 
 def test_client_identity_read_at_construction(tmp_path, monkeypatch):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     with Database(":memory:") as db:
         for identity in ("agent-local-one", "agent-local-two"):
@@ -37,7 +37,7 @@ def test_client_identity_read_at_construction(tmp_path, monkeypatch):
 def test_get_transactions_returns_empty_cached_frame_without_acquisition(
     tmp_path, monkeypatch
 ):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     monkeypatch.setenv("SEC_USER_AGENT", "agent-local")
     with Database(":memory:") as db:
@@ -95,7 +95,7 @@ def quarter_xmls():
 ])
 def test_fetch_records_acceptance(tmp_path, monkeypatch, quarter_xmls, discovery, sample, expected):
     from datetime import datetime
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     fixtures = Path(__file__).parent / "fixtures/acceptance"
     record = json.loads((fixtures / "captured.json").read_text())[sample]["submission"]
@@ -483,7 +483,7 @@ def test_eligible_events_resolves_stored_null_13f_tickers(
         ]
     )
 
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from unittest.mock import patch
 
     with Database(":memory:") as db:

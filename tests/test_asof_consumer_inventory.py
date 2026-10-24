@@ -66,17 +66,17 @@ EXEMPT = {
     "scripts/refresh_prices.py:_recent_active_tickers": 1,  # Dividend-download universe, not decision selection.
     "scripts/reparse_all.py:_persisted_house_generation_counts": 1,  # Ingestion reconciliation.
     "src/analyzer/actors.py:_load_actor_members": 1,  # Caller-owned: scoped load_skill_table; name monitored.
-    "src/analyzer/database.py:Database._init_canonical_transactions_view": 4,  # Scope implementation itself.
-    "src/analyzer/database.py:Database._init_transactions_table": 1,  # Schema/history initialization.
-    "src/analyzer/database.py:Database.get_entry_prices": 1,  # Caller-owned repository forwarding.
-    "src/analyzer/database.py:Database.get_house_transactions": 1,  # Caller-owned repository forwarding.
-    "src/analyzer/database.py:Database.get_transactions": 1,  # Caller-owned repository forwarding.
-    "src/analyzer/database.py:Database.get_transactions_by_date_range": 1,  # Caller-owned repository forwarding.
-    "src/analyzer/database.py:Database.get_transactions_for_doc": 1,  # Current document inspection.
-    "src/analyzer/database.py:Database.get_unresolved_house_doc_ids": 1,  # Current ingestion work queue.
-    "src/analyzer/database.py:Database.mark_house_generation_parse_complete": 2,  # Ingestion reconciliation.
-    "src/analyzer/database.py:Database.promote_house_archive": 3,  # Current generation promotion.
-    "src/analyzer/database.py:Database.replace_transactions_for_docs": 7,  # Persistence/history maintenance.
+    "src/analyzer/persistence/database.py:Database._init_canonical_transactions_view": 4,  # Scope implementation itself.
+    "src/analyzer/persistence/database.py:Database._init_transactions_table": 1,  # Schema/history initialization.
+    "src/analyzer/persistence/database.py:Database.get_entry_prices": 1,  # Caller-owned repository forwarding.
+    "src/analyzer/persistence/database.py:Database.get_house_transactions": 1,  # Caller-owned repository forwarding.
+    "src/analyzer/persistence/database.py:Database.get_transactions": 1,  # Caller-owned repository forwarding.
+    "src/analyzer/persistence/database.py:Database.get_transactions_by_date_range": 1,  # Caller-owned repository forwarding.
+    "src/analyzer/persistence/database.py:Database.get_transactions_for_doc": 1,  # Current document inspection.
+    "src/analyzer/persistence/database.py:Database.get_unresolved_house_doc_ids": 1,  # Current ingestion work queue.
+    "src/analyzer/persistence/database.py:Database.mark_house_generation_parse_complete": 2,  # Ingestion reconciliation.
+    "src/analyzer/persistence/database.py:Database.promote_house_archive": 3,  # Current generation promotion.
+    "src/analyzer/persistence/database.py:Database.replace_transactions_for_docs": 7,  # Persistence/history maintenance.
     "src/analyzer/download.py:HouseTransactionSource.get_transactions": 1,  # Caller-owned source forwarding.
     "src/analyzer/download.py:preserve_existing_fields": 1,  # Reparse repair preserves existing fields.
     "src/analyzer/form13f.py:ThirteenFSource.get_transactions": 1,  # Caller-owned source forwarding.
@@ -85,25 +85,25 @@ EXEMPT = {
     "src/analyzer/freshness.py:house_ingestion_freshness": 1,  # Monitoring aggregate: newest House disclosure date, not decision selection.
     "src/analyzer/house_refresh.py:complete_house_refresh": 1,  # Refresh reporting and generation finalization, not decision selection.
     "src/analyzer/house_refresh.py:house_refresh_counts": 2,  # Refresh before/after population counts, not decision selection.
-    "src/analyzer/parse_run_repository.py:ParseRunRepository.upsert": 1,  # Ingestion timestamp provenance.
+    "src/analyzer/persistence/parse_run_repository.py:ParseRunRepository.upsert": 1,  # Ingestion timestamp provenance.
     "src/analyzer/pipeline.py:_analysis_transactions": 1,  # Caller-owned: scoped prepare_analysis_data.
     "src/analyzer/positions.py:_distinct_member_names": 2,  # Caller-owned identity expansion, batched _member_variants; name monitored.
     "src/analyzer/positions.py:load_member_trades": 4,  # Caller-owned: holdings/follow-member scope; name monitored.
-    "src/analyzer/price_repository.py:PriceRepository.get_entry_prices": 2,  # Caller-owned repository loader.
+    "src/analyzer/persistence/price_repository.py:PriceRepository.get_entry_prices": 2,  # Caller-owned repository loader.
     "src/analyzer/row_history.py:accept_corrections": 2,  # Acceptance-history maintenance itself.
     "src/analyzer/senate_efd.py:SenateEFDSource.get_transactions": 1,  # Caller-owned source forwarding.
-    "src/analyzer/transaction_repository.py:TransactionRepository.count_for_docs": 1,  # Current document audit.
-    "src/analyzer/transaction_repository.py:TransactionRepository.delete_for_doc": 2,  # Persistence/history maintenance.
-    "src/analyzer/transaction_repository.py:TransactionRepository.exists": 1,  # Current ingestion cache check.
-    "src/analyzer/transaction_repository.py:TransactionRepository.get_by_date_range": 1,  # Caller-owned repository loader.
-    "src/analyzer/transaction_repository.py:TransactionRepository.get_by_year": 1,  # Caller-owned repository loader.
-    "src/analyzer/transaction_repository.py:TransactionRepository.get_for_doc": 1,  # Current document inspection.
-    "src/analyzer/transaction_repository.py:TransactionRepository.get_house_by_year": 1,  # Caller-owned repository forwarding.
-    "src/analyzer/transaction_repository.py:TransactionRepository.get_skill_history": 1,  # Caller-owned skill loader.
-    "src/analyzer/transaction_repository.py:TransactionRepository.house_exists": 1,  # Current ingestion cache check.
-    "src/analyzer/transaction_repository.py:TransactionRepository.merge_source_refresh": 3,  # Persistence/deduplication.
-    "src/analyzer/transaction_repository.py:TransactionRepository.upsert": 4,  # Persistence/deduplication.
-    "src/analyzer/transaction_repository.py:drop_already_stored": 1,  # Ingestion deduplication.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.count_for_docs": 1,  # Current document audit.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.delete_for_doc": 2,  # Persistence/history maintenance.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.exists": 1,  # Current ingestion cache check.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.get_by_date_range": 1,  # Caller-owned repository loader.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.get_by_year": 1,  # Caller-owned repository loader.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.get_for_doc": 1,  # Current document inspection.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.get_house_by_year": 1,  # Caller-owned repository forwarding.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.get_skill_history": 1,  # Caller-owned skill loader.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.house_exists": 1,  # Current ingestion cache check.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.merge_source_refresh": 3,  # Persistence/deduplication.
+    "src/analyzer/persistence/transaction_repository.py:TransactionRepository.upsert": 4,  # Persistence/deduplication.
+    "src/analyzer/persistence/transaction_repository.py:drop_already_stored": 1,  # Ingestion deduplication.
     "src/analyzer/vision_engines.py:_record_dual_failure": 1,  # Shared source-bound ingestion retirement for disagreed or unresolved dual readings.
 }
 

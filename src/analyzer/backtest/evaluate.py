@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 from analyzer._price_index import _normalize_price_index
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals.prices import price_arrays as _price_arrays
 
 NS_PER_DAY = 86_400_000_000_000

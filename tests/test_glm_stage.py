@@ -77,7 +77,7 @@ def seed_year(data_dir: Path, year: int, doc_ids: list[str], pages: int = 1) -> 
 
 def seed_house_queue(data_dir, doc_ids, *, archive_year=2024, filing_year=2024):
     """Synthetic current House acquisitions; never opens the live database."""
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     seed_year(data_dir, archive_year, doc_ids)
     db_path = data_dir / "congress.duckdb"
@@ -1712,7 +1712,7 @@ def test_cli_manifest_dry_run_checks_canonical_and_reports_missing_directory(
     staged.update(archive_year=2024, ingestion_generation="current")
     glm_stage.write_staging_record(data_dir, staged)
     db_path, digests = seed_house_queue(data_dir, ["canonical", "staged"])
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     db = Database(db_path)
     ocr_zero_rows.record_parse_run(
@@ -1779,7 +1779,7 @@ def test_cli_manifest_dry_run_checks_canonical_and_reports_missing_directory(
 
 
 def test_manifest_terminal_skip_requires_current_identity_source_count_and_provenance(data_dir):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     complete = [f"empty-{i}" for i in range(11)] + ["success", "invalid"]
     outstanding = ["old-generation", "wrong-hash", "unbound", "wrong-source", "wrong-count", "bad-provenance", "empty-with-rows"]
@@ -1860,7 +1860,7 @@ def test_legacy_cross_year_manifest_stage_audit_and_promote_use_one_bound_artifa
 
 
 def test_manifest_refuses_wrong_hash_generation_and_unrecorded_cross_year(data_dir):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     db_path, digests = seed_house_queue(data_dir, ["bound"], archive_year=2018, filing_year=2020)
     base = dict(doc_id="bound", year=2020, artifact_sha256=digests["bound"], ingestion_generation="current")

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.download import HouseTransactionSource, _PARSE_VERSION
 from analyzer.exceptions import DataSourceError
 from analyzer.models import DownloadResult, DownloadStatus

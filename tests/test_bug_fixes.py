@@ -11,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from analyzer.price_repository import nyse_sessions
+from analyzer.persistence.price_repository import nyse_sessions
 from analyzer.price_source import YFinancePriceSource
 from analyzer.settings import Settings
 

@@ -12,7 +12,7 @@ from analyzer.form4 import (
     candidates_from_sweep,
     parse_form4_xml,
 )
-from analyzer.transaction_repository import _BASE_WRITE_COLUMNS
+from analyzer.persistence.transaction_repository import _BASE_WRITE_COLUMNS
 
 _EXPECTED_COLUMNS = _BASE_WRITE_COLUMNS + (
     "acceptance_datetime",
@@ -87,7 +87,7 @@ def burke_form4_xml():
 
 @pytest.mark.parametrize("mode", ["ticker", "accession", "sweep"])
 def test_fetch_records_acceptance_without_extra_requests(tmp_path, monkeypatch, mode):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     fixtures = Path(__file__).parent / "fixtures/acceptance"
     record = json.loads((fixtures / "captured.json").read_text())[0]["submission"]
@@ -369,7 +369,7 @@ def test_sweep_returns_empty_canonical_frame_when_index_has_no_filings(
 
 
 def test_get_transactions_returns_empty_cached_frame_without_acquisition(tmp_path):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     with Database(":memory:") as db:
         source = Form4Source(data_dir=tmp_path, db=db)
@@ -447,8 +447,8 @@ def test_sale_rows_never_become_candidates(burke_form4_xml):
 
 
 def test_refetch_does_not_duplicate_rows(tmp_path, burke_form4_xml):
-    from analyzer.database import Database
-    from analyzer.transaction_repository import drop_already_stored
+    from analyzer.persistence.database import Database
+    from analyzer.persistence.transaction_repository import drop_already_stored
 
     db_path = tmp_path / "dupes.duckdb"
     db = Database(str(db_path))

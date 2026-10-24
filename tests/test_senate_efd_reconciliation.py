@@ -1185,7 +1185,7 @@ def test_get_transactions_filters_cache_to_senate_source():
 
 
 def test_get_transactions_returns_empty_for_senate_cache_miss():
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     with Database(":memory:") as db:
         source = _source()

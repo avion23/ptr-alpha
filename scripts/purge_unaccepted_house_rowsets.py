@@ -1,7 +1,7 @@
 """One-time cleanup proposal for review finding 2 (2026-10-18, Astra).
 
 The canonical_transactions view now binds admission to the accepted parse
-run's rowset (see src/analyzer/database.py, rowset admission binding). Rows
+run's rowset (see src/analyzer/persistence/database.py, rowset admission binding). Rows
 inserted by unaccepted or superseded House/OCR runs therefore stop being
 served canonically, but they remain in the ``transactions`` table.
 

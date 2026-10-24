@@ -19,7 +19,7 @@ from importlib import import_module
 import pandas as pd
 
 from analyzer.member_names import same_member_identity
-from analyzer.price_repository import ex_dividend_map, previous_nyse_session
+from analyzer.persistence.price_repository import ex_dividend_map, previous_nyse_session
 
 _V1_MEMBERS = (
     "Nancy Pelosi",

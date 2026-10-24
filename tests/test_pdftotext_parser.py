@@ -229,7 +229,7 @@ def test_pdfplumber_nul_source_accounts_keep_distinct_rows_through_persistence(
 
     import pandas as pd
 
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from analyzer.parsing import consolidate_transactions
     from analyzer.parsing.pdfplumber_parser import extract_tables_with_pdfplumber
 

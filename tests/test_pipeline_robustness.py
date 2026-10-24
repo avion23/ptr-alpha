@@ -10,7 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from analyzer.cli import _open_database, app
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.download import HouseFetchSummary, HouseTransactionSource
 from analyzer.exceptions import DataResult, DataSourceError, StepResult
 from analyzer.member_ranking.buyer_scoring import _get_consensus_candidate_tickers

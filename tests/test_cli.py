@@ -19,7 +19,7 @@ class TestHouseAcquisitionDatabase(unittest.TestCase):
     def test_real_connection_is_closed_after_query_or_query_error(self):
         import duckdb
 
-        from analyzer.database import Database
+        from analyzer.persistence.database import Database
         from analyzer.house_refresh import _HouseAcquisitionDatabase
 
         with TemporaryDirectory() as directory:

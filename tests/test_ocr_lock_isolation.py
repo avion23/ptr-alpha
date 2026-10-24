@@ -24,7 +24,7 @@ from analyzer.cli import (
     _run_gemini_ocr_year_subprocess,
     app,
 )
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.exceptions import StepResult
 
 

@@ -51,9 +51,9 @@ if __name__ == "__main__":
 import pandas as pd
 import numpy as np
 
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.exceptions import DataSourceError
-from analyzer.price_repository import (
+from analyzer.persistence.price_repository import (
     nyse_sessions,
     previous_nyse_session,
 )
@@ -476,7 +476,7 @@ def merge_temp_into_canonical(
     canonical row. Idempotent — merging the same temp database twice changes
     nothing (the second run inserts zero rows).
     """
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from analyzer.price_source import (
         _set_generation_states,
         _store_generations,

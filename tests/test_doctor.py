@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parents[1]
 def _build_canonical(path: Path, *, fresh_dividends: bool) -> None:
     con = duckdb.connect(str(path))
     con.execute("CREATE TABLE prices (ticker VARCHAR, date DATE, close DOUBLE)")
-    from analyzer.price_repository import previous_nyse_session
+    from analyzer.persistence.price_repository import previous_nyse_session
 
     fresh = previous_nyse_session(date.today() - timedelta(days=1)).date()
     con.execute("INSERT INTO prices VALUES ('AAPL', ?, 1.0)", [fresh])

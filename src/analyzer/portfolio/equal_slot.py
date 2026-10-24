@@ -25,7 +25,7 @@ from analyzer.backtest.prices import (
     aligned_price_at_or_before_arrays as _aligned_price_at_or_before_arrays,
     aligned_price_on_or_after_arrays as _aligned_price_on_or_after_arrays,
 )
-from analyzer.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.signals.prices import price_arrays as _price_arrays
 
 logger = logging.getLogger(__name__)

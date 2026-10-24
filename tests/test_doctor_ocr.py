@@ -34,7 +34,7 @@ from analyzer.freshness import (
     monitoring_checks,
     ocr_backlog_freshness,
 )
-from analyzer.price_repository import previous_nyse_session
+from analyzer.persistence.price_repository import previous_nyse_session
 from scripts import doctor as doctor_mod
 
 REPO = Path(__file__).resolve().parents[1]

@@ -14,7 +14,7 @@ import pandas as pd
 import requests
 
 from analyzer.asset_ticker_map import resolve_asset_ticker
-from analyzer.database import Database
+from analyzer.persistence.database import Database
 from analyzer.form4 import (
     SEC_ARCHIVES_URL,
     _SECClient,
@@ -23,7 +23,7 @@ from analyzer.form4 import (
 )
 from analyzer.interfaces import TransactionSource
 from analyzer.manager_watchlist import WATCHLIST_MANAGERS
-from analyzer.transaction_repository import _BASE_WRITE_COLUMNS
+from analyzer.persistence.transaction_repository import _BASE_WRITE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
@@ -637,7 +637,7 @@ class ThirteenFSource(TransactionSource):
                 "ingestion_generation"
             ].eq(self.ingestion_generation).all():
                 raise ThirteenFError("13F source or ingestion generation does not match")
-            from analyzer.transaction_repository import drop_already_stored
+            from analyzer.persistence.transaction_repository import drop_already_stored
 
             transactions = drop_already_stored(self.db, transactions, source="13f")
         return self.db.upsert_transactions(transactions, source="13f")

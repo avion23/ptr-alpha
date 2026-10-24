@@ -53,7 +53,7 @@ def test_house_parse_scopes_local_ocr_default_to_operation(monkeypatch, tmp_path
 
 
 def test_shared_verification_phase_keeps_staged_check_contract(tmp_path):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from scripts import rebuild_staged
 
     db = Database(tmp_path / "empty.duckdb")
@@ -514,7 +514,7 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
 def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identity(
     monkeypatch, tmp_path
 ):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from scripts import rebuild_staged
     from analyzer.ocr import common as gemini_ocr_common
 
@@ -609,7 +609,7 @@ def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identi
 
 
 def test_repair_audit_gaps_reconciles_parser_source_family_and_retires_orphan_rows(tmp_path):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
     from scripts import rebuild_staged
 
     staging = tmp_path / "staging"
@@ -711,7 +711,7 @@ def test_repair_audit_gaps_reconciles_parser_source_family_and_retires_orphan_ro
 
 
 def _seed_house_inventory_database(tmp_path):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     db = Database(tmp_path / "house-inventory.duckdb")
     db.conn.execute(
@@ -895,7 +895,7 @@ def test_refresh_house_completion_replaces_each_source_inventory(tmp_path):
 
 
 def _seed_semantically_stale_generation_database(tmp_path):
-    from analyzer.database import Database
+    from analyzer.persistence.database import Database
 
     db = Database(tmp_path / "canonical-semantic.duckdb")
     generations = [

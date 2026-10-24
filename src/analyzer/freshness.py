@@ -28,7 +28,7 @@ import time
 
 import pandas as pd
 
-from analyzer.price_repository import nyse_sessions, previous_nyse_session
+from analyzer.persistence.price_repository import nyse_sessions, previous_nyse_session
 
 MAX_PRICE_LAG_SESSIONS = 8
 FORM4_MAX_AGE_DAYS = 7

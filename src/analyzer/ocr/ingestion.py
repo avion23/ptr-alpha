@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Artifact-bound House OCR work selection, validation, and persistence.
 
-Batch engine dispatch belongs to runner; operational GLM staging and audit
-promotion remain executable tooling, not dependencies of this owner.
+Batch engine dispatch belongs to runner. Operational GLM staging and audit
+policy remain executable tooling; their shared per-document file-publication
+protocol lives here so wrappers use one lock without reversing dependencies.
 """
 
 import datetime
+import fcntl
+import glob
 import hashlib
 import json
 import logging
 import os
 import re
 import stat
+import tempfile
+import threading
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
@@ -51,6 +56,7 @@ WORK_MANIFEST_DEFAULT_PATH = str(STAGING_ROOT / "work-manifest.json")
 # path, and validation.
 GLM_PARSER_VERSION = "v1-glm53-vision"
 GLM_ENGINES_ATTEMPTED = "visionb"
+GLM_STAGING_SUBDIR = Path("staging") / "glm-backlog"
 OCR_ENGINE_ENV = "OCR_ENGINE"
 REQUIRED_OCR_SCHEMA_COLUMNS = {
     "chamber",
@@ -1351,6 +1357,133 @@ def resolve_ingestion_generation(
         return _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
     finally:
         conn.close()
+
+
+# GLM staging publication is shared by the operational OCR adapter, the
+# staging command, and the pixel-audit recorder. Keep its per-document lock,
+# archive, and atomic replacement on the OCR side of the package boundary.
+_staging_publication_state = threading.local()
+
+
+def glm_staging_root(data_dir: str | Path) -> Path:
+    return Path(data_dir) / GLM_STAGING_SUBDIR
+
+
+def glm_staging_record_path(data_dir: str | Path, year: int, doc_id: str) -> Path:
+    return glm_staging_root(data_dir) / str(year) / f"{doc_id}.json"
+
+
+def glm_staging_attempts_dir(data_dir: str | Path, year: int) -> Path:
+    return glm_staging_root(data_dir) / str(year) / "attempts"
+
+
+def archived_glm_staging_attempts(
+    data_dir: str | Path, year: int, doc_id: str
+) -> list[tuple[int, Path]]:
+    directory = glm_staging_attempts_dir(data_dir, year)
+    if not directory.exists():
+        return []
+    prefix = f"{glob.escape(str(doc_id))}.attempt-"
+    attempts = []
+    for path in directory.glob(f"{prefix}*.json"):
+        suffix = path.name[len(str(doc_id)) + len(".attempt-") : -len(".json")]
+        if suffix.isdigit():
+            attempts.append((int(suffix), path))
+    return sorted(attempts)
+
+
+@contextmanager
+def staging_document_lock(data_dir: str | Path, year: int, doc_id: str):
+    """Reentrant per-document publication lock shared by all GLM writers."""
+    root = glm_staging_root(data_dir).resolve()
+    key = (str(root), int(year), str(doc_id))
+    held = getattr(_staging_publication_state, "held", None)
+    if held is None:
+        held = _staging_publication_state.held = {}
+    if key in held:
+        held[key][1] += 1
+        try:
+            yield
+        finally:
+            held[key][1] -= 1
+        return
+
+    lock_name = hashlib.sha256(str(doc_id).encode("utf-8")).hexdigest()
+    lock_path = root / ".publication-locks" / str(year) / f"{lock_name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        held[key] = [lock_file, 1]
+        try:
+            yield
+        finally:
+            del held[key]
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _archive_glm_staging_attempt_unlocked(
+    data_dir: str | Path, year: int, doc_id: str
+) -> Path | None:
+    live = glm_staging_record_path(data_dir, year, doc_id)
+    if not live.exists():
+        return None
+    prior = archived_glm_staging_attempts(data_dir, year, doc_id)
+    next_number = prior[-1][0] + 1 if prior else 0
+    target_dir = glm_staging_attempts_dir(data_dir, year)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        target = target_dir / f"{doc_id}.attempt-{next_number}.json"
+        try:
+            # Hard-link the exact old inode; never replace an existing archive.
+            os.link(live, target)
+        except FileExistsError:
+            prior = archived_glm_staging_attempts(data_dir, year, doc_id)
+            next_number = max(next_number + 1, prior[-1][0] + 1 if prior else 0)
+            continue
+        live.unlink()
+        return target
+
+
+def archive_glm_staging_attempt(
+    data_dir: str | Path, year: int, doc_id: str
+) -> Path | None:
+    with staging_document_lock(data_dir, year, doc_id):
+        return _archive_glm_staging_attempt_unlocked(data_dir, year, doc_id)
+
+
+def _atomic_write_glm_staging_json(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+def replace_glm_staging_record(data_dir: str | Path, record: dict) -> Path:
+    """Atomically replace mutable metadata while holding its document lock."""
+    year, doc_id = int(record["year"]), str(record["doc_id"])
+    path = glm_staging_record_path(data_dir, year, doc_id)
+    with staging_document_lock(data_dir, year, doc_id):
+        _atomic_write_glm_staging_json(path, record)
+    return path
+
+
+def publish_glm_staging_record(data_dir: str | Path, record: dict) -> tuple[Path, Path | None]:
+    """Archive any live attempt and atomically publish a producer record."""
+    year, doc_id = int(record["year"]), str(record["doc_id"])
+    path = glm_staging_record_path(data_dir, year, doc_id)
+    with staging_document_lock(data_dir, year, doc_id):
+        archived = _archive_glm_staging_attempt_unlocked(data_dir, year, doc_id)
+        _atomic_write_glm_staging_json(path, record)
+    return path, archived
 
 
 def record_parse_run(

@@ -82,8 +82,6 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
-import fcntl
-import glob as glob_module
 import hashlib
 import json
 import math
@@ -133,7 +131,6 @@ from scripts.audit_sample import (  # noqa: E402
 
 GLM_PARSER_VERSION = "v1-glm53-vision"
 GLM_ENGINES_ATTEMPTED = "visionb"
-STAGING_SUBDIR = Path("staging") / "glm-backlog"
 AUDIT_RESULTS_NAME = "audit-results.json"
 PROMOTED_JOURNAL_NAME = "promoted.jsonl"
 RENDER_DPI = 150
@@ -364,39 +361,14 @@ class ArtifactRequest:
 
 
 def staging_root(data_dir: str | Path = "data") -> Path:
-    return Path(data_dir) / STAGING_SUBDIR
-
-
-_publication_lock_state = threading.local()
+    return _ocr_ingestion().glm_staging_root(data_dir)
 
 
 @contextmanager
 def document_publication_lock(data_dir: str | Path, year: int, doc_id: str):
-    """Serialize one document's live/attempt publication across processes."""
-    root = staging_root(data_dir).resolve()
-    key = (str(root), int(year), str(doc_id))
-    held = getattr(_publication_lock_state, "held", None)
-    if held is None:
-        held = _publication_lock_state.held = {}
-    if key in held:
-        held[key][1] += 1
-        try:
-            yield
-        finally:
-            held[key][1] -= 1
-        return
-
-    lock_name = hashlib.sha256(str(doc_id).encode("utf-8")).hexdigest()
-    lock_path = root / ".publication-locks" / str(year) / f"{lock_name}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        held[key] = [lock_file, 1]
-        try:
-            yield
-        finally:
-            del held[key]
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    """Compatibility alias for the OCR-owned reentrant document lock."""
+    with _ocr_ingestion().staging_document_lock(data_dir, year, doc_id):
+        yield
 
 
 def default_db_path(data_dir: str | Path = "data") -> Path:
@@ -432,7 +404,7 @@ def atomic_write_json(path: Path, payload) -> None:
 
 
 def staging_record_path(data_dir: str | Path, year: int, doc_id: str) -> Path:
-    return staging_root(data_dir) / str(year) / f"{doc_id}.json"
+    return _ocr_ingestion().glm_staging_record_path(data_dir, year, doc_id)
 
 
 def attempts_dir(data_dir: str | Path, year: int) -> Path:
@@ -442,21 +414,12 @@ def attempts_dir(data_dir: str | Path, year: int) -> Path:
     audit_sample.py count ``<year>/*.json`` as LIVE records; archived
     attempts are historical evidence and must not inflate those counts.
     """
-    return staging_root(data_dir) / str(year) / "attempts"
+    return _ocr_ingestion().glm_staging_attempts_dir(data_dir, year)
 
 
 def archived_attempts(data_dir: str | Path, year: int, doc_id: str) -> list[tuple[int, Path]]:
     """(attempt_number, path) for a doc's archived attempts, oldest first."""
-    directory = attempts_dir(data_dir, year)
-    if not directory.exists():
-        return []
-    pairs = []
-    prefix = f"{glob_module.escape(doc_id)}.attempt-"
-    for path in directory.glob(f"{prefix}*.json"):
-        suffix = path.name[len(doc_id) + len(".attempt-") : -len(".json")]
-        if suffix.isdigit():
-            pairs.append((int(suffix), path))
-    return sorted(pairs)
+    return _ocr_ingestion().archived_glm_staging_attempts(data_dir, year, doc_id)
 
 
 def staged_rows_sha256(rows) -> str:
@@ -482,35 +445,18 @@ def archive_current_attempt(
     with a check-and-delete, and a failed restore could destroy evidence.
     Returns the archive path, or None when no live record existed.
     """
-    with document_publication_lock(data_dir, year, doc_id):
-        live = staging_record_path(data_dir, year, doc_id)
-        if not live.exists():
-            return None
-        prior = archived_attempts(data_dir, year, doc_id)
-        next_number = (prior[-1][0] + 1) if prior else 0
-        target_dir = attempts_dir(data_dir, year)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        while True:
-            target = target_dir / f"{doc_id}.attempt-{next_number}.json"
-            try:
-                # Publish the complete old inode atomically, without replacing
-                # an existing attempt if numbering raced with another writer.
-                os.link(live, target)
-            except FileExistsError:
-                prior = archived_attempts(data_dir, year, doc_id)
-                next_number = max(
-                    next_number + 1, prior[-1][0] + 1 if prior else 0
-                )
-                continue
-            live.unlink()
-            return target
+    return _ocr_ingestion().archive_glm_staging_attempt(data_dir, year, doc_id)
 
 
 def write_staging_record(data_dir: str | Path, record: StagingRecord) -> Path:
-    path = staging_record_path(data_dir, record["year"], record["doc_id"])
-    with document_publication_lock(data_dir, record["year"], record["doc_id"]):
-        atomic_write_json(path, record)
-    return path
+    return _ocr_ingestion().replace_glm_staging_record(data_dir, record)
+
+
+def publish_staging_record(
+    data_dir: str | Path, record: StagingRecord
+) -> tuple[Path, Path | None]:
+    """Publish a producer attempt and archive any existing live record."""
+    return _ocr_ingestion().publish_glm_staging_record(data_dir, record)
 
 
 def load_staging_record(data_dir: str | Path, year: int, doc_id: str) -> StagingRecord | None:
@@ -1246,15 +1192,13 @@ def stage_batch(
                 consecutive_google_503s = 0
             else:
                 consecutive_google_503s = 0
-        with document_publication_lock(data_dir, year, doc_id):
-            archived = archive_current_attempt(data_dir, year, doc_id)
-            if archived is not None:
-                print(
-                    f"  [{doc_id}] prior staging record archived: "
-                    f"attempts/{archived.name}",
-                    flush=True,
-                )
-            write_staging_record(data_dir, record)
+        _, archived = publish_staging_record(data_dir, record)
+        if archived is not None:
+            print(
+                f"  [{doc_id}] prior staging record archived: "
+                f"attempts/{archived.name}",
+                flush=True,
+            )
         if record["parse_status"] == "error":
             print(f"  [{doc_id}] ERROR: {error}", flush=True)
             return "error"

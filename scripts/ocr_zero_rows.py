@@ -64,7 +64,12 @@ def _run_visionb_staging(remaining, vision_b_config, *, data_dir=None, _data_roo
                 flush=True,
             )
             return
-        glm_stage.write_staging_record(data_dir, record)
+        _, archived = glm_stage.publish_staging_record(data_dir, record)
+        if archived is not None:
+            print(
+                f"  prior staging record archived: attempts/{archived.name}",
+                flush=True,
+            )
         if record["parse_status"] == "error":
             print(
                 f"  ERROR: {error} (staged as error record; canonical "

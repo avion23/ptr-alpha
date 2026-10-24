@@ -854,7 +854,9 @@ def record_verdict(
     ``attempt_scoped`` requires the current SHA-derived bundle and all its
     pages; it never falls back to the legacy bundle. History must be a JSON
     list of dictionaries (legacy dictionaries retain their fields/order).
-    The caller must ensure a sole-writer maintenance window.
+    The live-record read, hash check, metadata stamp, and history append share
+    the OCR owner's reentrant per-document publication lock. A verdict that
+    races a new producer record is rejected rather than restoring stale JSON.
 
     ``severity`` (default ``critical``) classifies a FAIL per the
     owner-approved error budget: ``cosmetic`` = asset-description TEXT
@@ -866,7 +868,12 @@ def record_verdict(
         raise ValueError("verdict must be 'pass' or 'fail'")
     if severity not in VALID_SEVERITIES:
         raise ValueError("severity must be 'critical' or 'cosmetic'")
-    from analyzer.ocr.ingestion import ApprovedDataRoot, approved_data_root, read_work_artifact
+    from analyzer.ocr.ingestion import (
+        ApprovedDataRoot,
+        approved_data_root,
+        read_work_artifact,
+        staging_document_lock,
+    )
 
     if not isinstance(data_dir, ApprovedDataRoot):
         Path(data_dir).mkdir(parents=True, exist_ok=True)
@@ -874,67 +881,109 @@ def record_verdict(
             return record_verdict(approved, doc_id, verdict, notes, severity, attempt_scoped=attempt_scoped)
     root = staging_root(data_dir)
     results_path = root / AUDIT_RESULTS_NAME
-    try:
-        results = json.loads(read_work_artifact(data_dir, results_path))
-    except FileNotFoundError:
-        results = []
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ValueError(f"unreadable audit history; refusing to append: {exc}") from exc
-    # Legacy dictionaries need no new fields; preserve their contents and order.
-    if not isinstance(results, list) or any(not isinstance(entry, dict) for entry in results):
-        raise ValueError("audit history must be a list of dictionaries; refusing to append")
+
+    def read_history() -> list[dict]:
+        try:
+            current = json.loads(read_work_artifact(data_dir, results_path))
+        except FileNotFoundError:
+            current = []
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                f"unreadable audit history; refusing to append: {exc}"
+            ) from exc
+        # Legacy dictionaries need no new fields; preserve contents and order.
+        if not isinstance(current, list) or any(
+            not isinstance(entry, dict) for entry in current
+        ):
+            raise ValueError(
+                "audit history must be a list of dictionaries; refusing to append"
+            )
+        return current
+
+    read_history()  # fail before touching a live record if history is corrupt
     if attempt_scoped and (Path(doc_id).name != doc_id or doc_id in ("", ".", "..")):
         raise ValueError("invalid attempt bundle identity")
 
-    found_year = None
     reviewed_path = None
-    stable_sha = None
-    identity = {field: None for field in ("pdf_sha256", "prompt_sha256", "parsed_at_utc")}
     for year_dir in sorted(root.glob("[0-9]" * 4)):
         path = year_dir / f"{doc_id}.json"
         if path.exists():
-            record = json.loads(read_work_artifact(data_dir, path))
+            producer_record = json.loads(read_work_artifact(data_dir, path))
+            expected_sha = staged_record_sha256(producer_record)
             reviewed_path = root / "audit-review" / year_dir.name / str(doc_id) / "record.json"
             if attempt_scoped:
-                doc_dir = _attempt_bundle_dir(data_dir, int(year_dir.name), doc_id, record)
-                _validate_attempt_bundle(data_dir, doc_dir, record)
+                doc_dir = _attempt_bundle_dir(
+                    data_dir, int(year_dir.name), doc_id, producer_record
+                )
+                _validate_attempt_bundle(data_dir, doc_dir, producer_record)
                 reviewed_path = doc_dir / "record.json"
             elif reviewed_path.exists():
                 reviewed = json.loads(read_work_artifact(data_dir, reviewed_path))
-                if staged_record_sha256(reviewed) != staged_record_sha256(record):
+                if staged_record_sha256(reviewed) != expected_sha:
                     raise ValueError("staged attempt changed since review bundle; regenerate review before recording a verdict")
-            stable_sha = staged_record_sha256(record)
-            identity = {
-                "pdf_sha256": record.get("pdf_sha256"),
-                "prompt_sha256": record.get("prompt_sha256"),
-                "parsed_at_utc": record.get("parsed_at_utc"),
-            }
-            record["audit"] = verdict
-            record["audit_severity"] = severity
-            record["audit_notes"] = notes
-            _atomic_write_json(path, record)
-            found_year = int(year_dir.name)
-            break
-    if attempt_scoped and found_year is None:
+
+            year = int(year_dir.name)
+            with staging_document_lock(data_dir, year, doc_id):
+                try:
+                    current = json.loads(read_work_artifact(data_dir, path))
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        "staging attempt changed while recording verdict; "
+                        "regenerate review before recording a verdict"
+                    ) from exc
+                if staged_record_sha256(current) != expected_sha:
+                    raise ValueError(
+                        "staging attempt changed while recording verdict; "
+                        "regenerate review before recording a verdict"
+                    )
+                # Re-read after review validation instead of writing the
+                # history snapshot captured before that potentially slow work.
+                results = read_history()
+                identity = {
+                    field: current.get(field)
+                    for field in ("pdf_sha256", "prompt_sha256", "parsed_at_utc")
+                }
+                current["audit"] = verdict
+                current["audit_severity"] = severity
+                current["audit_notes"] = notes
+                _atomic_write_json(path, current)
+                entry = {
+                    "doc_id": str(doc_id),
+                    "verdict": verdict,
+                    "severity": severity,
+                    "notes": notes,
+                    "audited_at_utc": utc_now_iso(),
+                    "staged_record_sha256": expected_sha,
+                    "pdf_sha256": identity["pdf_sha256"],
+                    "prompt_sha256": identity["prompt_sha256"],
+                    "parsed_at_utc": identity["parsed_at_utc"],
+                }
+                if attempt_scoped:
+                    entry["review_bundle_record"] = str(
+                        reviewed_path.relative_to(Path(data_dir))
+                    )
+                results.append(entry)
+                _atomic_write_json(results_path, results)
+            return {"entry": entry, "staging_year": year}
+
+    if attempt_scoped:
         raise ValueError("attempt-scoped review requires a current staging record")
-    audited_at = utc_now_iso()
     entry = {
         "doc_id": str(doc_id),
         "verdict": verdict,
         "severity": severity,
         "notes": notes,
-        "audited_at_utc": audited_at,
-        "staged_record_sha256": stable_sha,
-        "pdf_sha256": identity["pdf_sha256"],
-        "prompt_sha256": identity["prompt_sha256"],
-        "parsed_at_utc": identity["parsed_at_utc"],
+        "audited_at_utc": utc_now_iso(),
+        "staged_record_sha256": None,
+        "pdf_sha256": None,
+        "prompt_sha256": None,
+        "parsed_at_utc": None,
     }
-    if attempt_scoped:
-        entry["review_bundle_record"] = str(reviewed_path.relative_to(Path(data_dir)))
+    results = read_history()
     results.append(entry)
     _atomic_write_json(results_path, results)
 
-    return {"entry": entry, "staging_year": found_year}
+    return {"entry": entry, "staging_year": None}
 
 
 def cmd_record(args) -> int:

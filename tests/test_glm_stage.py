@@ -26,7 +26,7 @@ from analyzer.vision_engines import (
     VisionBConfig,
     VisionBUnavailable,
 )
-from scripts import audit_sample, glm_stage
+from scripts import audit_sample, glm_stage, ocr_zero_rows as operational_ocr_zero_rows
 from analyzer.ocr import ingestion as ocr_zero_rows
 from analyzer.ocr.common import PROMPT_SHA256
 
@@ -763,6 +763,87 @@ def stage_one_audited(data_dir, year, doc_id, output):
     return glm_stage.load_staging_record(data_dir, year, doc_id)
 
 
+def test_audit_verdict_refuses_stale_record_after_restage(data_dir, monkeypatch):
+    stage_one(data_dir, 2024, "audit-race", GLM_OUTPUT_ONE_ROW)
+    live = glm_stage.staging_record_path(data_dir, 2024, "audit-race")
+    original_bytes = live.read_bytes()
+    replacement = glm_stage.build_staging_record(
+        "audit-race",
+        2024,
+        glm_stage.default_pdf_path(data_dir, 2024, "audit-race"),
+        None,
+        read_fn=lambda *_: GLM_OUTPUT_NO_TXS,
+        data_dir=data_dir,
+    )
+    history_path = glm_stage.staging_root(data_dir) / "audit-results.json"
+    history_bytes = json.dumps([{"doc_id": "older", "verdict": "fail"}]).encode()
+    history_path.write_bytes(history_bytes)
+    journal_path = glm_stage.staging_root(data_dir) / glm_stage.PROMOTED_JOURNAL_NAME
+    journal_prefix = b'{"doc_id":"already-promoted"}\n'
+    journal_path.write_bytes(journal_prefix)
+
+    read_artifact = ocr_zero_rows.read_work_artifact
+    restaged = False
+
+    def read_then_restage(root, path):
+        nonlocal restaged
+        contents = read_artifact(root, path)
+        if Path(path).name == live.name and not restaged:
+            restaged = True
+            glm_stage.publish_staging_record(data_dir, replacement)
+        return contents
+
+    monkeypatch.setattr(ocr_zero_rows, "read_work_artifact", read_then_restage)
+    with pytest.raises(ValueError, match="changed while recording verdict"):
+        audit_sample.record_verdict(data_dir, "audit-race", "pass", "reviewed A")
+
+    assert restaged
+    (attempt_number, attempt_path), = glm_stage.archived_attempts(
+        data_dir, 2024, "audit-race"
+    )
+    assert attempt_number == 0 and attempt_path.read_bytes() == original_bytes
+    assert glm_stage.load_staging_record(data_dir, 2024, "audit-race")["parse_status"] == "no_txs"
+    assert history_path.read_bytes() == history_bytes
+    assert journal_path.read_bytes() == journal_prefix
+
+
+def test_operational_legacy_writer_archives_concurrent_record(data_dir, monkeypatch):
+    seed_year(data_dir, 2024, ["legacy-writer"])
+    pdf = glm_stage.default_pdf_path(data_dir, 2024, "legacy-writer")
+    original = glm_stage.build_staging_record(
+        "legacy-writer", 2024, pdf, None, read_fn=lambda *_: GLM_OUTPUT_ONE_ROW,
+        data_dir=data_dir,
+    )
+    replacement = glm_stage.build_staging_record(
+        "legacy-writer", 2024, pdf, None, read_fn=lambda *_: GLM_OUTPUT_NO_TXS,
+        data_dir=data_dir,
+    )
+    original_bytes = []
+
+    def publish_while_legacy_reads(*_args, **_kwargs):
+        glm_stage.write_staging_record(data_dir, original)
+        original_bytes.append(
+            glm_stage.staging_record_path(data_dir, 2024, "legacy-writer").read_bytes()
+        )
+        return replacement
+
+    monkeypatch.setattr(
+        operational_ocr_zero_rows.time, "sleep", lambda *_args: None
+    )
+    monkeypatch.setattr(glm_stage, "build_staging_record", publish_while_legacy_reads)
+    operational_ocr_zero_rows._run_visionb_staging(
+        [("legacy-writer", 2024, pdf)], None, data_dir=data_dir
+    )
+
+    (attempt_number, archived_path), = glm_stage.archived_attempts(
+        data_dir, 2024, "legacy-writer"
+    )
+    assert attempt_number == 0 and archived_path.read_bytes() == original_bytes[0]
+    assert glm_stage.load_staging_record(data_dir, 2024, "legacy-writer")[
+        "parse_status"
+    ] == "no_txs"
+
+
 def test_promote_consumes_staging_record(data_dir, fake_insert):
     stage_one_audited(data_dir, 2024, "2001", GLM_OUTPUT_ONE_ROW)
     sha = glm_stage.pdf_sha256(data_dir / "2024" / "pdfs" / "2001.pdf")
@@ -883,6 +964,49 @@ def test_promote_force_unaudited_is_explicit_and_loud(data_dir, fake_insert, cap
     assert journal[0]["staged_record_sha256"] == audit_sample.staged_record_sha256(
         json.loads(archived.read_bytes())
     )
+
+
+@pytest.mark.parametrize("force_unaudited", [False, True])
+def test_legacy_success_without_optional_row_hash_still_promotes(
+    data_dir, fake_insert, force_unaudited
+):
+    stage_one(data_dir, 2024, "legacy-row-hash", GLM_OUTPUT_ONE_ROW)
+    live = glm_stage.staging_record_path(data_dir, 2024, "legacy-row-hash")
+    legacy = json.loads(live.read_text(encoding="utf-8"))
+    del legacy["staged_rows_sha256"]
+    live.write_text(json.dumps(legacy), encoding="utf-8")
+
+    if not force_unaudited:
+        audit_sample.record_verdict(
+            data_dir, "legacy-row-hash", "pass", "legacy content reviewed"
+        )
+        write_report_state(data_dir)
+    result = glm_stage.promote_docs(
+        2024,
+        ["legacy-row-hash"],
+        data_dir=data_dir,
+        force_unaudited=force_unaudited,
+    )
+
+    assert result["promoted"] == 1 and len(fake_insert) == 1
+    (attempt_number, archived_path), = glm_stage.archived_attempts(
+        data_dir, 2024, "legacy-row-hash"
+    )
+    archived = json.loads(archived_path.read_text(encoding="utf-8"))
+    assert "staged_rows_sha256" not in archived  # never backfilled from live rows
+    journal = glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir))
+    assert journal[0]["unaudited"] is force_unaudited
+    assert journal[0]["staged_rows_sha256"] == glm_stage.staged_rows_sha256(
+        archived["rows"]
+    )
+    assert attempt_number == 0
+    if not force_unaudited:
+        history = json.loads(
+            (glm_stage.staging_root(data_dir) / "audit-results.json").read_text()
+        )
+        assert history[0]["staged_record_sha256"] == audit_sample.staged_record_sha256(
+            legacy
+        )
 
 
 def test_promote_refuses_malformed_or_foreign_report_state(data_dir, fake_insert, capsys):
@@ -1773,6 +1897,16 @@ def test_force_unaudited_does_not_skip_staged_rows_hash(data_dir, fake_insert):
 
     assert fake_insert == []
     assert live.read_bytes() == live_bytes
+    live.unlink()  # the deliberately corrupt peer blocks population-wide admission
+
+    stage_one(data_dir, 2024, "identity-proof", GLM_OUTPUT_ONE_ROW)
+    pdf = glm_stage.default_pdf_path(data_dir, 2024, "identity-proof")
+    make_pdf(pdf, pages=2)
+    refused = glm_stage.promote_docs(
+        2024, ["identity-proof"], data_dir=data_dir, force_unaudited=True
+    )
+    assert refused["refused"] == 1 and refused["promoted"] == 0
+    assert fake_insert == []
 
 
 def test_report_replaces_stale_complete_state_after_invalid_population(data_dir):

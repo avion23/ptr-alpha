@@ -870,9 +870,12 @@ def test_promote_force_unaudited_is_explicit_and_loud(data_dir, fake_insert, cap
     assert journal[0]["unaudited"] is True
     assert glm_stage.load_staging_record(data_dir, 2024, "2004") is None
     archived = glm_stage.archived_attempts(data_dir, 2024, "2004")[0][1]
-    assert glm_stage._attempt_reference(
-        data_dir, 2024, json.loads(archived.read_text())
-    ) == (True, None)  # promotion journal protects the consumed evidence
+    assert journal[0]["staging_attempt"] == str(
+        archived.relative_to(glm_stage.staging_root(data_dir))
+    )
+    assert journal[0]["staged_record_sha256"] == audit_sample.staged_record_sha256(
+        json.loads(archived.read_bytes())
+    )
 
 
 def test_promote_refuses_malformed_or_foreign_report_state(data_dir, fake_insert, capsys):
@@ -1546,50 +1549,157 @@ def test_archived_attempts_are_not_live_records(data_dir):
     assert glm_stage.iter_staging_records(data_dir) == []
     assert audit_sample.load_staging_records(data_dir) == []
     assert glm_stage.staging_status(data_dir) == []
+    archived_bytes = [
+        path.read_bytes()
+        for _, path in glm_stage.archived_attempts(data_dir, 2024, "iso1")
+    ]
+    assert glm_stage.archive_current_attempt(data_dir, 2024, "iso1") is None
+    assert [
+        path.read_bytes()
+        for _, path in glm_stage.archived_attempts(data_dir, 2024, "iso1")
+    ] == archived_bytes
 
 
-def test_restage_archives_versioned_attempts_with_cap(data_dir):
+def test_restage_preserves_all_archived_attempt_bytes(data_dir):
     seed_year(data_dir, 2024, ["cap1"])
     manifest = [{"doc_id": "cap1", "year": 2024}]
     counter = {"n": 0}
+    expected_archives = {}
 
     def failing_read(pdf_path, page_count):
         counter["n"] += 1
         raise ValueError(f"boom {counter['n']}")
 
     # Six manifest-mode re-stages of the still-unresolved doc: every write
-    # archives the previous attempt instead of overwriting it; only the
-    # newest MAX_RETAINED_ATTEMPTS archives survive (oldest deleted).
+    # archives the previous attempt instead of overwriting it.
     for _ in range(6):
+        live = glm_stage.staging_record_path(data_dir, 2024, "cap1")
+        if live.exists():
+            expected_archives[len(expected_archives)] = live.read_bytes()
         result = glm_stage.stage_batch(
-            2024, 5, data_dir=data_dir, read_fn=failing_read,
-            manifest=manifest, cooldown=0,
+            2024,
+            5,
+            data_dir=data_dir,
+            read_fn=failing_read,
+            manifest=manifest,
+            cooldown=0,
         )
         assert result["errors"] == 1
     live = glm_stage.load_staging_record(data_dir, 2024, "cap1")
     assert live["parse_status"] == "error"
     assert live["error"] == "boom 6"  # newest attempt keeps the canonical name
     archives = glm_stage.archived_attempts(data_dir, 2024, "cap1")
-    assert [n for n, _ in archives] == [2, 3, 4]
+    assert [n for n, _ in archives] == list(range(5))
+    assert [path.read_bytes() for _, path in archives] == [
+        expected_archives[number] for number, _ in archives
+    ]
+    assert [hashlib.sha256(path.read_bytes()).hexdigest() for _, path in archives] == [
+        hashlib.sha256(expected_archives[number]).hexdigest() for number, _ in archives
+    ]
     contents = [json.loads(path.read_text()) for _, path in archives]
-    assert [record["error"] for record in contents] == ["boom 3", "boom 4", "boom 5"]
+    assert [record["error"] for record in contents] == [
+        f"boom {attempt}" for attempt in range(1, 6)
+    ]
 
 
-def test_prune_retains_attempt_referenced_by_verdict(data_dir):
-    write_staged_records(data_dir, {2024: ["keep-audit"]})
-    audit_sample.record_verdict(data_dir, "keep-audit", "pass", "pixel match")
-    record = glm_stage.load_staging_record(data_dir, 2024, "keep-audit")
-    for index in range(4):
-        glm_stage.archive_current_attempt(data_dir, 2024, "keep-audit")
-        record["parsed_at_utc"] = f"2026-10-19T00:00:0{index}Z"
-        glm_stage.write_staging_record(data_dir, record)
+def test_archive_keeps_bytes_when_audit_reference_publishes_mid_archive(
+    data_dir, monkeypatch
+):
+    write_staged_records(data_dir, {2024: ["race1"]})
+    live = glm_stage.staging_record_path(data_dir, 2024, "race1")
+    for _ in range(4):
+        glm_stage.archive_current_attempt(data_dir, 2024, "race1")
+        write_staged_records(data_dir, {2024: ["race1"]})
+    old_archives = glm_stage.archived_attempts(data_dir, 2024, "race1")
+    old_bytes = {number: path.read_bytes() for number, path in old_archives}
 
-    archives = glm_stage.archived_attempts(data_dir, 2024, "keep-audit")
-    assert 0 in [number for number, _ in archives]  # verdict-bound attempt survives
-    assert len(archives) == glm_stage.MAX_RETAINED_ATTEMPTS
-    assert glm_stage._attempt_reference(
-        data_dir, 2024, json.loads(archives[0][1].read_text())
-    ) == (True, None)
+    audit_path = glm_stage.staging_root(data_dir) / glm_stage.AUDIT_RESULTS_NAME
+    staged_bytes = live.read_bytes()
+    target = glm_stage.attempts_dir(data_dir, 2024) / "race1.attempt-4.json"
+    original_replace = glm_stage.os.replace
+
+    def publish_reference_after_archive(source, destination):
+        result = original_replace(source, destination)
+        if Path(source) == live and Path(destination) == target:
+            glm_stage.atomic_write_json(
+                audit_path,
+                [
+                    {
+                        "doc_id": "race1",
+                        "staged_record_sha256": audit_sample.staged_record_sha256(
+                            json.loads(old_bytes[0])
+                        ),
+                    }
+                ],
+            )
+        return result
+
+    # Deterministically interleave reference publication after the archive
+    # rename, while archive_current_attempt is still executing.
+    monkeypatch.setattr(glm_stage.os, "replace", publish_reference_after_archive)
+    assert glm_stage.archive_current_attempt(data_dir, 2024, "race1") == target
+    assert target.read_bytes() == staged_bytes
+    assert {
+        number: path.read_bytes()
+        for number, path in glm_stage.archived_attempts(data_dir, 2024, "race1")
+        if number < 4
+    } == old_bytes
+    verdict = json.loads(audit_path.read_text(encoding="utf-8"))[0]
+    assert verdict["staged_record_sha256"] == audit_sample.staged_record_sha256(
+        json.loads(old_bytes[0])
+    )
+
+
+def test_archive_never_needs_a_lossy_restore_after_reference_race(
+    data_dir, monkeypatch
+):
+    write_staged_records(data_dir, {2024: ["race2"]})
+    for _ in range(4):
+        glm_stage.archive_current_attempt(data_dir, 2024, "race2")
+        write_staged_records(data_dir, {2024: ["race2"]})
+    archives = glm_stage.archived_attempts(data_dir, 2024, "race2")
+    original_bytes = {number: path.read_bytes() for number, path in archives}
+    oldest = archives[0][1]
+    record = json.loads(oldest.read_bytes())
+    live = glm_stage.staging_record_path(data_dir, 2024, "race2")
+    live_bytes = live.read_bytes()
+    audit_path = glm_stage.staging_root(data_dir) / glm_stage.AUDIT_RESULTS_NAME
+    original_unlink = Path.unlink
+
+    def publish_after_unlink(path, *args, **kwargs):
+        result = original_unlink(path, *args, **kwargs)
+        if path == oldest:
+            glm_stage.atomic_write_json(
+                audit_path,
+                [
+                    {
+                        "doc_id": "race2",
+                        "staged_record_sha256": audit_sample.staged_record_sha256(
+                            record
+                        ),
+                    }
+                ],
+            )
+        return result
+
+    def fail_restore(path, data):
+        if path == oldest:
+            raise OSError("simulated crash during attempt restoration")
+        return original_write_bytes(path, data)
+
+    original_write_bytes = Path.write_bytes
+    monkeypatch.setattr(Path, "unlink", publish_after_unlink)
+    monkeypatch.setattr(Path, "write_bytes", fail_restore)
+
+    target = glm_stage.archive_current_attempt(data_dir, 2024, "race2")
+    assert target is not None and target.exists()
+    assert target.read_bytes() == live_bytes
+    assert {
+        number: path.read_bytes()
+        for number, path in glm_stage.archived_attempts(data_dir, 2024, "race2")
+        if number < 4
+    } == original_bytes
+    assert oldest.read_bytes() == original_bytes[0]
 
 
 def test_dir_scan_mode_does_not_retry_error_records(data_dir):

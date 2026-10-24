@@ -55,14 +55,18 @@ responses are evidence); the sha256/page-count/render all read ONE
 snapshot of the artifact bytes, not the live file three times. Re-staging
 a doc that already has a live record archives the previous record as
 ``<year>/attempts/<doc_id>.attempt-<n>.json`` (n = prior attempt count,
-newest live record keeps the canonical name, at most MAX_RETAINED_ATTEMPTS
-unreferenced archives are retained — audit/promotion-referenced attempts
-survive pruning, and the attempts subdirectory keeps history out of
-record-counting globs in doctor.py/audit_sample.py. Each record carries a
-canonical hash of its extracted rows; verdict binding additionally checks
-the audit workflow's stable staged-record content hash and the record
-identity (``pdf_sha256 + prompt_sha256 + parsed_at_utc``). Metadata-only
-legacy verdicts remain historical but cannot authorize promotion.
+newest live record keeps the canonical name. Superseded attempts are never
+automatically pruned: audit and promotion references can be published
+concurrently, so a check-then-delete/restore sequence cannot protect their
+original bytes from a crash. Storage grows with the number and size of
+restages; any future garbage collection must be explicit and operator-approved
+after checking audit, promotion, and receipt dependencies. The attempts
+subdirectory keeps history out of record-counting globs in doctor.py and
+audit_sample.py. Each record carries a canonical hash of its extracted rows;
+verdict binding additionally checks the audit workflow's stable staged-record
+content hash and the record identity
+(``pdf_sha256 + prompt_sha256 + parsed_at_utc``). Metadata-only legacy
+verdicts remain historical but cannot authorize promotion.
 
 Concurrency (FP review finding 11): ``--workers`` is capped at
 MAX_WORKERS (2 — the Z.AI subscription allows two concurrent vision
@@ -142,7 +146,6 @@ GOOGLE_503_CONSECUTIVE_STOP_THRESHOLD = 5
 # exhaustion can write transient error records across the rest of a manifest.
 MAX_WORKERS = 2  # Z.AI subscription allows 2 concurrent vision streams
 CLI_COOLDOWN = 3.0  # seconds between endpoint requests (mirrors ocr_zero_rows)
-MAX_RETAINED_ATTEMPTS = 3  # minimum cap; referenced archives are never pruned
 WORK_MANIFEST_SCHEMA = "glm-work-manifest-v1"
 # Asset-normalization review flag (interface audit item 3): GLM sometimes
 # damages asset text during normalization — drops repeated issuer wording
@@ -319,84 +322,17 @@ def staged_rows_sha256(rows) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _attempt_reference(
-    data_dir: str | Path, year: int, record: dict
-) -> tuple[bool, str | None]:
-    """Return whether audit/promotion history cites this attempt; unsafe history retains it."""
-    root = staging_root(data_dir)
-    rows_hash = staged_rows_sha256(record.get("rows", []))
-    stable_hash = audit_staged_record_sha256(record)
-    identity = record_identity(record)
-    audit_path = root / AUDIT_RESULTS_NAME
-    try:
-        audit_entries = (
-            json.loads(audit_path.read_text(encoding="utf-8"))
-            if audit_path.exists()
-            else []
-        )
-    except (OSError, json.JSONDecodeError) as exc:
-        return True, f"audit history unreadable: {exc}"
-    if not isinstance(audit_entries, list):
-        return True, "audit history is not a list"
-    for entry in audit_entries:
-        if not isinstance(entry, dict):
-            return True, "audit history contains a malformed entry"
-        if str(entry.get("doc_id")) != str(record.get("doc_id")):
-            continue
-        if (
-            entry.get("staged_rows_sha256") == rows_hash
-            or entry.get("staged_record_sha256") == stable_hash
-        ):
-            return True, None
-        if all(identity.values()) and all(
-            entry.get(key) == value for key, value in identity.items()
-        ):
-            return True, None  # legacy metadata-only verdict still references the attempt
-
-    journal_path = root / PROMOTED_JOURNAL_NAME
-    try:
-        lines = (
-            journal_path.read_text(encoding="utf-8").splitlines()
-            if journal_path.exists()
-            else []
-        )
-        promotions = [json.loads(line) for line in lines if line.strip()]
-    except (OSError, json.JSONDecodeError) as exc:
-        return True, f"promotion journal unreadable: {exc}"
-    for entry in promotions:
-        if not isinstance(entry, dict):
-            return True, "promotion journal contains a malformed entry"
-        if str(entry.get("doc_id")) != str(record.get("doc_id")):
-            continue
-        try:
-            same_year = int(entry.get("year")) == int(year)
-        except (TypeError, ValueError):
-            return True, "promotion journal contains an invalid year"
-        if not same_year:
-            continue
-        row_reference = entry.get("staged_rows_sha256")
-        record_reference = entry.get("staged_record_sha256")
-        if row_reference is None and record_reference is None:
-            return True, None  # old journal entry protects every attempt for this doc
-        if row_reference in (None, rows_hash) and record_reference in (
-            None,
-            stable_hash,
-        ):
-            return True, None
-    return False, None
-
-
-def archive_current_attempt(data_dir: str | Path, year: int, doc_id: str) -> Path | None:
+def archive_current_attempt(
+    data_dir: str | Path, year: int, doc_id: str
+) -> Path | None:
     """Versioned re-stage (finding 6): archive the live record, never overwrite.
 
     Renames the existing ``<doc_id>.json`` to
     ``attempts/<doc_id>.attempt-<n>.json`` so the newly written record keeps
     the canonical name and the superseded reading remains inspectable
-    evidence. n is the prior attempt count (max existing archive number + 1,
-    which equals the prior attempt count until the retention cap prunes the
-    oldest — after pruning the numbering keeps growing instead of colliding
-    with a retained archive). Oldest unreferenced archives are pruned beyond
-    MAX_RETAINED_ATTEMPTS. Verdict- or promotion-referenced evidence remains.
+    evidence. n is one greater than the largest existing archive number.
+    Attempts are never automatically pruned: reference publication can race
+    with a check-and-delete, and a failed restore could destroy evidence.
     Returns the archive path, or None when no live record existed.
     """
     live = staging_record_path(data_dir, year, doc_id)
@@ -407,41 +343,6 @@ def archive_current_attempt(data_dir: str | Path, year: int, doc_id: str) -> Pat
     target = attempts_dir(data_dir, year) / f"{doc_id}.attempt-{next_number}.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(live, target)
-    retained = archived_attempts(data_dir, year, doc_id)
-    excess = max(len(retained) - MAX_RETAINED_ATTEMPTS, 0)
-    removed = 0
-    for _, stale in retained:
-        if removed >= excess:
-            break
-        try:
-            raw = stale.read_bytes()
-            record = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
-            print(
-                f"  [{doc_id}] retaining unreadable staging attempt: {stale}",
-                flush=True,
-            )
-            continue
-        referenced, reason = _attempt_reference(data_dir, year, record)
-        if referenced:
-            print(
-                f"  [{doc_id}] retaining referenced staging attempt: {stale}"
-                + (f" ({reason})" if reason else ""),
-                flush=True,
-            )
-            continue
-        stale.unlink(missing_ok=True)
-        # Recheck the append-only reference histories. Restore evidence if a
-        # verdict/promotion raced with pruning rather than leave a dangling ref.
-        referenced, reason = _attempt_reference(data_dir, year, record)
-        if referenced:
-            stale.parent.mkdir(parents=True, exist_ok=True)
-            stale.write_bytes(raw)
-            raise RuntimeError(
-                f"prune verification failed for {stale}: "
-                f"{reason or 'audit or promotion history now references it'}"
-            )
-        removed += 1
     return target
 
 

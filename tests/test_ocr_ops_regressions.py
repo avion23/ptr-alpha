@@ -62,6 +62,49 @@ def test_semantic_zero_retires_exact_artifact(stored):
         db.close()
 
 
+@pytest.mark.parametrize("insert_fails", [True, False])
+def test_insertion_preserves_primary_failure_and_always_closes(stored, monkeypatch, insert_fails):
+    path, _, digest = stored
+    connect = ops.duckdb.connect
+    closed = []
+    drops = []
+
+    class FaultyConnection:
+        def __init__(self):
+            self.conn = connect(str(path))
+
+        def execute(self, sql, *args):
+            if sql.startswith("INSERT INTO staging_gemini_ocr_transactions") and insert_fails:
+                raise ValueError("primary insert failure")
+            if sql.startswith("DROP TABLE IF EXISTS staging_gemini_ocr_transactions"):
+                drops.append(sql)
+                if len(drops) > 1:
+                    raise RuntimeError("drop failure")
+            return self.conn.execute(sql, *args)
+
+        def close(self):
+            closed.append(True)
+            self.conn.close()
+            raise RuntimeError("close failure")
+
+    def failed_record(*args, **kwargs):
+        raise RuntimeError("record failure")
+
+    monkeypatch.setattr(ops.duckdb, "connect", lambda _: FaultyConnection())
+    monkeypatch.setattr(ops, "_record_failed_ocr_attempt", failed_record)
+    parsed = common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
+        "Apple (AAPL) | Purchase | 01/15/24 | 01/20/24 | A"
+    )
+    error, message = (ValueError, "primary insert failure") if insert_fails else (RuntimeError, "drop failure")
+    with pytest.raises(error, match=message):
+        ops.insert_transactions_outcome(
+            "1", 2024, parsed.member, parsed.transactions,
+            db_path=str(path), artifact_sha256=digest, ingestion_generation="g",
+        )
+    assert closed == [True]
+
+
 def _partial_transactions():
     parsed = common.parse_gemini_output(
         "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"

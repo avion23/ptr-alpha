@@ -17,6 +17,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -1545,7 +1546,7 @@ def _record_failed_ocr_attempt(
         )
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        _cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
         raise
 
 
@@ -1620,104 +1621,80 @@ def insert_outcome_from_report(
     )
 
 
-def insert_transactions(
+def _cleanup_ocr_resource(cleanup) -> None:
+    """Surface cleanup failures unless another exception already owns the failure."""
+    import sys
+
+    active_error = sys.exc_info()[1]
+    try:
+        cleanup()
+    except Exception:
+        if active_error is None:
+            raise
+        logging.getLogger(__name__).exception("Secondary OCR cleanup failure")
+
+
+def _insert_transactions(
+    conn,
     doc_id,
     year,
     member,
     transactions,
     *,
-    db_path: str,
     parser_version: str = GEMINI_PARSER_VERSION,
     raw_count: int | None = None,
     artifact_sha256: str | None = None,
     ingestion_generation: str | None = None,
     engine_model: str = MODEL,
     checkpoint: bool = True,
-    report: dict | None = None,
     force_partial_canonical: bool = False,
-):
-    """Insert transactions into DB. Returns count inserted.
+) -> InsertOutcome:
+    """Validate and dispatch a generation-bound rowset; partials stay blocked."""
 
-    ``report`` (optional) receives ``report["outcome"] = InsertOutcome`` —
-    the explicit committed outcome (status, committed count, rejections) so
-    callers can tell a full committed insert from a partial/rejected one
-    without re-deriving it. The int return value stays the committed count
-    for backward compatibility. Row-level partials are retained as evidence
-    and blocked from canonical by default. ``force_partial_canonical=True``
-    is the explicit owner override; it prints a loud warning and marks the
-    parse-run detail, while the returned outcome remains non-complete.
-    """
-
-    def _report(outcome: InsertOutcome) -> int:
-        if report is not None:
-            report["outcome"] = outcome
-        return outcome.inserted
-
-    conn = duckdb.connect(db_path)
     require_ocr_schema(conn)
     if not artifact_sha256 or not ingestion_generation:
-        conn.close()
         raise RuntimeError(
             "OCR insertion requires artifact_sha256 and ingestion_generation"
         )
     input_expected = raw_count if raw_count is not None else len(transactions)
-    try:
-        bound_generation = _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
-        if bound_generation != ingestion_generation:
-            raise RuntimeError("OCR insertion generation does not match the current artifact")
-        metadata = conn.execute(
-            "SELECT filing_date, first_name, last_name FROM house_generation_metadata "
-            "WHERE archive_year = ? AND generation_id = ? AND doc_id = ? AND filing_type = 'P'",
-            [year, ingestion_generation, str(doc_id)],
-        ).fetchone()
-        if metadata is None:
-            raise RuntimeError("OCR insertion requires generation-bound filing metadata")
-        filing_date = metadata[0]
-        expected_member = " ".join(part for part in metadata[1:] if part).strip()
-    except Exception:
-        conn.close()
-        raise
+    bound_generation = _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
+    if bound_generation != ingestion_generation:
+        raise RuntimeError("OCR insertion generation does not match the current artifact")
+    metadata = conn.execute(
+        "SELECT filing_date, first_name, last_name FROM house_generation_metadata "
+        "WHERE archive_year = ? AND generation_id = ? AND doc_id = ? AND filing_type = 'P'",
+        [year, ingestion_generation, str(doc_id)],
+    ).fetchone()
+    if metadata is None:
+        raise RuntimeError("OCR insertion requires generation-bound filing metadata")
+    filing_date = metadata[0]
+    expected_member = " ".join(part for part in metadata[1:] if part).strip()
     _, identity_rejections = validate_transactions(doc_id, member, [], filing_date, expected_member)
     if identity_rejections:
-        try:
-            _record_failed_ocr_attempt(
-                conn, doc_id, year, raw_count or len(transactions),
-                json.dumps(identity_rejections, sort_keys=True),
-                parser_version=parser_version, artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation, engine_model=engine_model,
-            )
-        finally:
-            conn.close()
+        _record_failed_ocr_attempt(
+            conn, doc_id, year, raw_count or len(transactions),
+            json.dumps(identity_rejections, sort_keys=True),
+            parser_version=parser_version, artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation, engine_model=engine_model,
+        )
         # Member-level rejection: a no_txs-looking zero is NOT a no_txs.
-        return _report(
-            InsertOutcome(
-                status="rejected",
-                inserted=0,
-                expected=input_expected,
-                rejections=dict(identity_rejections),
-            )
+        return InsertOutcome(
+            status="rejected", inserted=0, expected=input_expected,
+            rejections=dict(identity_rejections),
         )
     if not transactions:
         status = "error" if raw_count else "no_txs"
         message = "semantic_zero_after_raw_rows" if raw_count else ""
         if raw_count:
-            try:
-                _record_failed_ocr_attempt(
-                    conn, doc_id, year, raw_count, message,
-                    parser_version=parser_version,
-                    artifact_sha256=artifact_sha256,
-                    ingestion_generation=ingestion_generation,
-                    engine_model=engine_model,
-                )
-            finally:
-                conn.close()
-            return _report(
-                InsertOutcome(
-                    status="rejected",
-                    inserted=0,
-                    expected=input_expected,
-                    detail=message,
-                )
+            _record_failed_ocr_attempt(
+                conn, doc_id, year, raw_count, message,
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+                engine_model=engine_model,
+            )
+            return InsertOutcome(
+                status="rejected", inserted=0, expected=input_expected, detail=message,
             )
         conn.execute("BEGIN TRANSACTION")
         try:
@@ -1745,14 +1722,10 @@ def insert_transactions(
             )
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            _cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
             raise
-        finally:
-            conn.close()
-        return _report(
-            InsertOutcome(
-                status="no_txs", inserted=0, expected=0, committed=True
-            )
+        return InsertOutcome(
+            status="no_txs", inserted=0, expected=0, committed=True
         )
 
     input_count = raw_count if raw_count is not None else len(transactions)
@@ -1785,14 +1758,9 @@ def insert_transactions(
             ingestion_generation=ingestion_generation,
             engine_model=engine_model,
         )
-        conn.close()
-        return _report(
-            InsertOutcome(
-                status="rejected",
-                inserted=0,
-                expected=input_count,
-                rejections=dict(rejections),
-            )
+        return InsertOutcome(
+            status="rejected", inserted=0, expected=input_count,
+            rejections=dict(rejections),
         )
     partial_transactions = list(transactions)
     transactions = validated
@@ -1834,20 +1802,13 @@ def insert_transactions(
             )
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
-            conn.close()
+            _cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
             raise
         if checkpoint:
             conn.execute("CHECKPOINT")
-        conn.close()
-        return _report(
-            InsertOutcome(
-                status="partial",
-                inserted=0,
-                expected=input_count,
-                rejections=dict(row_rejections),
-                detail=detail,
-            )
+        return InsertOutcome(
+            status="partial", inserted=0, expected=input_count,
+            rejections=dict(row_rejections), detail=detail,
         )
     if row_rejections:
         print(
@@ -1857,6 +1818,77 @@ def insert_transactions(
             flush=True,
         )
 
+    rows, errors = _normalize_ocr_rows(
+        doc_id, member, transactions, filing_date,
+        artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
+    )
+    if errors:
+        message = "; ".join(errors)
+        _record_failed_ocr_attempt(
+            conn,
+            doc_id,
+            year,
+            input_count,
+            message,
+            parser_version=parser_version,
+            artifact_sha256=artifact_sha256,
+            ingestion_generation=ingestion_generation,
+            engine_model=engine_model,
+        )
+        return InsertOutcome(
+            status="error", inserted=0, expected=input_count, detail=message,
+        )
+    if not rows:
+        # If transactions were provided but all failed validation, record as
+        # "error" so get_zero_row_pdfs() will retry them; only use "no_txs"
+        # when the caller passed an empty list (nothing to retry).
+        input_count = raw_count if raw_count is not None else len(transactions)
+        if input_count:
+            _record_failed_ocr_attempt(
+                conn,
+                doc_id,
+                year,
+                input_count,
+                "; ".join(errors),
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+                engine_model=engine_model,
+            )
+        else:
+            record_parse_run(
+                conn,
+                doc_id,
+                year,
+                "no_txs",
+                0,
+                0,
+                "",
+                parser_version=parser_version,
+                artifact_sha256=artifact_sha256,
+                ingestion_generation=ingestion_generation,
+                engines_attempted=engine_model,
+            )
+        if checkpoint:
+            conn.execute("CHECKPOINT")
+        return InsertOutcome(
+            status="no_txs" if not input_count else "error",
+            inserted=0, expected=input_count, committed=not input_count,
+        )
+
+    return _replace_accepted_ocr_rows(
+        conn, doc_id, year, rows, input_count,
+        row_rejections=row_rejections, partial_transactions=partial_transactions,
+        partial_note=partial_note, parser_version=parser_version,
+        artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
+        engine_model=engine_model, checkpoint=checkpoint,
+    )
+
+
+def _normalize_ocr_rows(
+    doc_id, member, transactions, filing_date, *, artifact_sha256, ingestion_generation,
+) -> tuple[list[dict], list[str]]:
+    """Build persistence rows without making acceptance or database decisions."""
     errors = []
     rows: list[dict] = []
     for source_row_number, tx in enumerate(transactions, start=1):
@@ -1923,71 +1955,15 @@ def insert_transactions(
             rows.append(row)
         except Exception as exc:
             errors.append(f"{tx.get('asset', '?')}: {exc}")
-    if errors:
-        message = "; ".join(errors)
-        _record_failed_ocr_attempt(
-            conn,
-            doc_id,
-            year,
-            input_count,
-            message,
-            parser_version=parser_version,
-            artifact_sha256=artifact_sha256,
-            ingestion_generation=ingestion_generation,
-            engine_model=engine_model,
-        )
-        conn.close()
-        return _report(
-            InsertOutcome(
-                status="error",
-                inserted=0,
-                expected=input_count,
-                detail=message,
-            )
-        )
-    if not rows:
-        # If transactions were provided but all failed validation, record as
-        # "error" so get_zero_row_pdfs() will retry them; only use "no_txs"
-        # when the caller passed an empty list (nothing to retry).
-        input_count = raw_count if raw_count is not None else len(transactions)
-        if input_count:
-            _record_failed_ocr_attempt(
-                conn,
-                doc_id,
-                year,
-                input_count,
-                "; ".join(errors),
-                parser_version=parser_version,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-                engine_model=engine_model,
-            )
-        else:
-            record_parse_run(
-                conn,
-                doc_id,
-                year,
-                "no_txs",
-                0,
-                0,
-                "",
-                parser_version=parser_version,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-                engines_attempted=engine_model,
-            )
-        if checkpoint:
-            conn.execute("CHECKPOINT")
-        conn.close()
-        return _report(
-            InsertOutcome(
-                status="no_txs" if not input_count else "error",
-                inserted=0,
-                expected=input_count,
-                committed=not input_count,
-            )
-        )
+    return rows, errors
 
+
+def _replace_accepted_ocr_rows(
+    conn, doc_id, year, rows, input_count, *, row_rejections, partial_transactions,
+    partial_note, parser_version, artifact_sha256, ingestion_generation,
+    engine_model, checkpoint,
+) -> InsertOutcome:
+    """Own accepted-rowset replacement and historical repair in one transaction."""
     count = 0
     committed = False
     staging_table = "staging_gemini_ocr_transactions"
@@ -2162,53 +2138,63 @@ def insert_transactions(
         committed = True
         if checkpoint:
             conn.execute("CHECKPOINT")
-        return _report(
-            InsertOutcome(
-                status="partial" if row_rejections else "success",
-                inserted=count,
-                expected=input_count,
-                committed=True,
-                rejections=dict(row_rejections) if row_rejections else None,
-                detail=partial_note.lstrip("; ") or None,
-            )
+        return InsertOutcome(
+            status="partial" if row_rejections else "success",
+            inserted=count,
+            expected=input_count,
+            committed=True,
+            rejections=dict(row_rejections) if row_rejections else None,
+            detail=partial_note.lstrip("; ") or None,
         )
     except Exception as exc:
         if not committed:
+            _cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
             try:
-                conn.execute("ROLLBACK")
+                _record_failed_ocr_attempt(
+                    conn, doc_id, year, input_count, str(exc),
+                    parser_version=parser_version,
+                    artifact_sha256=artifact_sha256,
+                    ingestion_generation=ingestion_generation,
+                    engine_model=engine_model,
+                )
             except Exception:
-                pass
-            _record_failed_ocr_attempt(
-                conn,
-                doc_id,
-                year,
-                input_count,
-                str(exc),
-                parser_version=parser_version,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-                engine_model=engine_model,
-            )
+                logging.getLogger(__name__).exception("Failed to record OCR insertion failure")
         raise
     finally:
-        conn.execute(f"DROP TABLE IF EXISTS {staging_table}")
-        conn.close()
+        _cleanup_ocr_resource(lambda: conn.execute(f"DROP TABLE IF EXISTS {staging_table}"))
 
 
-def insert_transactions_outcome(doc_id, year, member, transactions, **kwargs):
-    """insert_transactions, returning the explicit committed outcome.
+def insert_transactions_outcome(
+    doc_id, year, member, transactions, *, db_path: str,
+    parser_version: str = GEMINI_PARSER_VERSION, raw_count: int | None = None,
+    artifact_sha256: str | None = None, ingestion_generation: str | None = None,
+    engine_model: str = MODEL, checkpoint: bool = True,
+    force_partial_canonical: bool = False,
+) -> InsertOutcome:
+    """Return the committed outcome; partials are evidence-only unless forced.
 
-    Same insert path and arguments; the int return value is replaced by the
-    ``InsertOutcome`` so callers never have to guess whether a positive
-    count was the full row set or a partial insert.
+    The explicit force override retains an incomplete outcome and warning.
+    Every branch shares this connection lifetime, including schema failures.
     """
-    report: dict = {}
-    inserted = insert_transactions(
-        doc_id, year, member, transactions, report=report, **kwargs
-    )
-    return insert_outcome_from_report(
-        report, inserted=inserted, expected=kwargs.get("raw_count") if kwargs.get("raw_count") is not None else len(transactions)
-    )
+    conn = duckdb.connect(db_path)
+    try:
+        return _insert_transactions(
+            conn, doc_id, year, member, transactions,
+            parser_version=parser_version, raw_count=raw_count,
+            artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
+            engine_model=engine_model, checkpoint=checkpoint,
+            force_partial_canonical=force_partial_canonical,
+        )
+    finally:
+        _cleanup_ocr_resource(conn.close)
+
+
+def insert_transactions(doc_id, year, member, transactions, *, report=None, **kwargs):
+    """Legacy integer/report adapter; new callers use insert_transactions_outcome."""
+    outcome = insert_transactions_outcome(doc_id, year, member, transactions, **kwargs)
+    if report is not None:
+        report["outcome"] = outcome
+    return outcome.inserted
 
 
 def validate_for_insert(conn, doc_id, member, transactions):

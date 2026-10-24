@@ -874,19 +874,13 @@ def test_dual_read_partial_insert_is_never_completed(
 
     def partial_insert(*args, **kwargs):
         # ...but validation kept out one of two staged rows: explicit
-        # partial outcome from insert_transactions.
-        report = kwargs.get("report")
-        if report is not None:
-            report["outcome"] = ocr_zero_rows.InsertOutcome(
-                status="partial",
-                inserted=1,
-                expected=2,
-                committed=True,
-                rejections={"impossible_chronology": 1},
-            )
-        return 1
+        # partial outcome from insert_transactions_outcome.
+        return ocr_zero_rows.InsertOutcome(
+            status="partial", inserted=1, expected=2, committed=True,
+            rejections={"impossible_chronology": 1},
+        )
 
-    monkeypatch.setattr(ocr_zero_rows, "insert_transactions", partial_insert)
+    monkeypatch.setattr(ocr_zero_rows, "insert_transactions_outcome", partial_insert)
 
     outcome = run_dual_read_for_doc(
         _doc(tmp_path), env=_env(server), read_a=_read_a(), page_images=_pages

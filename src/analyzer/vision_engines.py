@@ -68,10 +68,13 @@ import base64
 import io
 import os
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping
 from urllib.parse import urlsplit
 
 import requests
+
+if TYPE_CHECKING:
+    from scripts.gemini_ocr_common import ArtifactMetadata
 
 from analyzer.vision_agreement import (
     AGREE,
@@ -592,7 +595,7 @@ class DualDecision:
     # A-only reading by accident):
     output: str | None = None
     error: str | None = None
-    metadata: object | None = None
+    metadata: ArtifactMetadata | None = None
     error_kind: str | None = None  # stable classify_visionb_error() contract
 
 
@@ -601,7 +604,7 @@ def dual_read(
     *,
     refresh: bool = False,
     env: Mapping[str, str] | None = None,
-    read_a: Callable[..., tuple] | None = None,
+    read_a: Callable[..., tuple[str | None, str | None, ArtifactMetadata | None]] | None = None,
     read_b: Callable[[list[str]], str] | None = None,
     page_images: Callable[[str, int], list[str]] | None = None,
     config: VisionBConfig | None = None,
@@ -618,7 +621,7 @@ def dual_read(
     if read_a is None:
         read_a = _default_read_a
     output, error, metadata = read_a(doc, refresh=refresh)
-    parsed = getattr(metadata, "parsed", None)
+    parsed = metadata.parsed if metadata is not None else None
     if output is None or error or metadata is None or parsed is None:
         return (
             DualDecision(
@@ -749,7 +752,7 @@ def dual_read(
     )
 
 
-def _default_read_a(doc: DualReadDoc, *, refresh: bool = False) -> tuple:
+def _default_read_a(doc: DualReadDoc, *, refresh: bool = False) -> tuple[str | None, str | None, ArtifactMetadata | None]:
     """Engine A: the existing Gemini call, including its response cache."""
     return _gemini_common().call_gemini(
         doc.pdf_path,
@@ -771,7 +774,7 @@ class DualLoopOutcome:
     member: str | None = None
     output: str | None = None
     error: str | None = None
-    metadata: object | None = None
+    metadata: ArtifactMetadata | None = None
 
 
 def run_dual_read_for_doc(
@@ -779,7 +782,7 @@ def run_dual_read_for_doc(
     *,
     refresh: bool = False,
     env: Mapping[str, str] | None = None,
-    read_a: Callable[..., tuple] | None = None,
+    read_a: Callable[..., tuple[str | None, str | None, ArtifactMetadata | None]] | None = None,
     read_b: Callable[[list[str]], str] | None = None,
     page_images: Callable[[str, int], list[str]] | None = None,
 ) -> DualLoopOutcome:
@@ -872,9 +875,11 @@ def run_dual_read_for_doc(
             True, decision, 0, "errors", metadata=decision.metadata
         )
 
-    member = getattr(decision.metadata.parsed, "member", None)
-    report: dict = {}
-    inserted = ocr.insert_transactions(
+    metadata = decision.metadata
+    if metadata is None or metadata.parsed is None:
+        raise RuntimeError("Agreed dual read requires validated engine-A metadata")
+    member = metadata.parsed.member
+    outcome = ocr.insert_transactions_outcome(
         doc.doc_id,
         doc.year,
         member,
@@ -885,11 +890,8 @@ def run_dual_read_for_doc(
         ingestion_generation=ingestion_generation,
         parser_version=DUAL_PARSER_VERSION,
         engine_model=DUAL_ENGINES_ATTEMPTED,
-        report=report,
     )
-    outcome = ocr.insert_outcome_from_report(
-        report, inserted=inserted, expected=len(rows)
-    )
+    inserted = outcome.inserted
     # Never call a partial or rejected output complete: only a full committed
     # row set counts as completed progress, and a committed no_txs run is
     # reported as no_txs — never folded into "completed".
@@ -924,54 +926,11 @@ def record_unresolved(
     non-terminal state that keeps the doc on the OCR work list so the next
     run retries it once engine B is back.
     """
-    import duckdb
-
-    ocr = _ocr_zero_rows()
-    conn = duckdb.connect(doc.resolved_db_path)
-    try:
-        conn.execute("BEGIN TRANSACTION")
-        try:
-            if artifact_sha256 and ingestion_generation:
-                predicate = (
-                    "source = 'gemini_ocr' AND doc_id = ? "
-                    "AND (chamber = 'House' OR chamber IS NULL) "
-                    "AND ingestion_generation = ? AND artifact_sha256 = ?"
-                )
-                parameters = [
-                    str(doc.doc_id),
-                    ingestion_generation,
-                    artifact_sha256,
-                ]
-                ocr._archive_rows(conn, "transactions", predicate, parameters)
-                conn.execute(
-                    """
-                    DELETE FROM transactions
-                    WHERE source = 'gemini_ocr' AND doc_id = ?
-                      AND (chamber = 'House' OR chamber IS NULL)
-                      AND ingestion_generation = ? AND artifact_sha256 = ?
-                    """,
-                    parameters,
-                )
-            ocr.record_parse_run(
-                conn,
-                doc.doc_id,
-                doc.year,
-                "error",
-                decision.raw_row_count,
-                0,
-                f"dual-read unresolved: {decision.diff_summary}"
-                or "dual-read unresolved",
-                parser_version=DUAL_PARSER_VERSION,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-                engines_attempted=DUAL_ENGINES_ATTEMPTED,
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-    finally:
-        conn.close()
+    _record_dual_failure(
+        doc, raw_row_count=decision.raw_row_count, status="error",
+        diagnostic=f"dual-read unresolved: {decision.diff_summary}",
+        artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
+    )
 
 
 def record_disagreement(
@@ -989,6 +948,18 @@ def record_disagreement(
     state the generation-acceptance predicates already recognize — carrying
     both readings as JSON in ``error_message``.
     """
+    _record_dual_failure(
+        doc, raw_row_count=decision.raw_row_count, status="invalid",
+        diagnostic=decision.notes_json or decision.diff_summary or "dual-read disagreement",
+        artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
+    )
+
+
+def _record_dual_failure(
+    doc: DualReadDoc, *, raw_row_count: int, status: str, diagnostic: str,
+    artifact_sha256: str | None, ingestion_generation: str | None,
+) -> None:
+    """Retire only this artifact's OCR rows and persist the selected failure."""
     import duckdb
 
     ocr = _ocr_zero_rows()
@@ -1021,12 +992,10 @@ def record_disagreement(
                 conn,
                 doc.doc_id,
                 doc.year,
-                "invalid",
-                decision.raw_row_count,
+                status,
+                raw_row_count,
                 0,
-                decision.notes_json
-                or decision.diff_summary
-                or "dual-read disagreement",
+                diagnostic,
                 parser_version=DUAL_PARSER_VERSION,
                 artifact_sha256=artifact_sha256,
                 ingestion_generation=ingestion_generation,
@@ -1034,10 +1003,10 @@ def record_disagreement(
             )
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            ocr._cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
             raise
     finally:
-        conn.close()
+        ocr._cleanup_ocr_resource(conn.close)
 
 
 def dual_read_enabled(env: Mapping[str, str] | None = None) -> bool:

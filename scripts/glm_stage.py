@@ -125,6 +125,8 @@ from analyzer.vision_engines import (  # noqa: E402
 from scripts.audit_sample import (  # noqa: E402
     REPORT_STATE_NAME as AUDIT_REPORT_STATE_NAME,
     REPORT_STATE_SCHEMA as AUDIT_REPORT_STATE_SCHEMA,
+    audit_history_sha256,
+    audit_operation_lock,
     load_audit_results as load_audit_results,
     staged_record_sha256 as audit_staged_record_sha256,
 )
@@ -1382,7 +1384,9 @@ def audit_report_state(data_dir: str | Path = "data") -> dict | None:
     return payload
 
 
-def _audit_report_gate_issue(state: dict | None) -> str | None:
+def _audit_report_gate_issue(
+    state: dict | None, current_history_sha256: str | None
+) -> str | None:
     """Reason the landed report does not prove the promotion preconditions."""
     if state is None:
         return "audit report state is missing or untrusted"
@@ -1440,15 +1444,26 @@ def _audit_report_gate_issue(state: dict | None) -> str | None:
         return "confidence or max_rate is outside its valid probability range"
     if not (0 <= state["upper_bound"] <= 1) or state["upper_bound"] > state["max_rate"]:
         return "upper_bound is invalid or exceeds max_rate despite budget_met=true"
+    report_history_sha256 = state.get("audit_history_sha256")
+    if not isinstance(report_history_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", report_history_sha256
+    ) is None:
+        return "complete report has no trusted audit history binding"
+    if report_history_sha256 != current_history_sha256:
+        return "audit history changed since report; rerun audit_sample.py report"
     return None
 
 
-def audit_report_gate_open(state: dict | None) -> bool:
+def audit_report_gate_open(
+    state: dict | None, current_history_sha256: str | None
+) -> bool:
     """True only when a complete report proves a met budget with valid metrics."""
-    return _audit_report_gate_issue(state) is None
+    return _audit_report_gate_issue(state, current_history_sha256) is None
 
 
-def _audit_report_refusal(state: dict | None, data_dir: str | Path) -> str:
+def _audit_report_refusal(
+    state: dict | None, data_dir: str | Path, current_history_sha256: str | None
+) -> str:
     """Explain the report-level promotion refusal, including available math."""
     if state is None:
         return (
@@ -1479,7 +1494,7 @@ def _audit_report_refusal(state: dict | None, data_dir: str | Path) -> str:
             prefix = "audit report is complete but the critical error budget is not met"
         else:
             prefix = "audit report state is complete but " + str(
-                _audit_report_gate_issue(state)
+                _audit_report_gate_issue(state, current_history_sha256)
             )
     else:
         prefix = f"audit report state {report_state!r} is not recognized"
@@ -1675,6 +1690,39 @@ def promote_docs(
     force_unaudited: bool = False,
     cooldown_note: str | None = None,
 ) -> dict:
+    """Promote under the shared audit-root lock and require a fresh report."""
+    if not require_audit_pass:
+        raise ValueError(
+            "audit approval is mandatory: require_audit_pass=False is no "
+            "longer accepted (pass audit:'pass' records or force_unaudited)"
+        )
+    ocr = _ocr_ingestion()
+    if not isinstance(data_dir, ocr.ApprovedDataRoot):
+        with ocr.approved_data_root(data_dir) as root:
+            return promote_docs(
+                year, doc_ids, data_dir=root, db_path=db_path,
+                require_audit_pass=require_audit_pass,
+                force_unaudited=force_unaudited, cooldown_note=cooldown_note,
+            )
+    # Root audit lock precedes every per-document publication lock.
+    with audit_operation_lock(data_dir):
+        return _promote_docs_locked(
+            year, doc_ids, data_dir=data_dir, db_path=db_path,
+            require_audit_pass=require_audit_pass,
+            force_unaudited=force_unaudited, cooldown_note=cooldown_note,
+        )
+
+
+def _promote_docs_locked(
+    year: int,
+    doc_ids: list[str] | None = None,
+    *,
+    data_dir: str | Path = "data",
+    db_path: str | Path | None = None,
+    require_audit_pass: bool = True,
+    force_unaudited: bool = False,
+    cooldown_note: str | None = None,
+) -> dict:
     """Promote AUDITED staged records into canonical via the insert path.
 
     Audit approval is MANDATORY at this boundary (FP review finding 1): a
@@ -1713,7 +1761,8 @@ def promote_docs(
     # Promotion consumes a row from the audited population. Do not let an
     # explicit doc-id or force override bypass unreadable population/history.
     staged_records = iter_staging_records(data_dir)
-    load_audit_results(data_dir)
+    audit_results = load_audit_results(data_dir)
+    current_history_sha256 = audit_history_sha256(audit_results)
     read_promoted_journal(staging_root(data_dir))
     db_path = str(db_path or default_db_path(data_dir))
     root = staging_root(data_dir)
@@ -1742,9 +1791,12 @@ def promote_docs(
         # refuses the whole batch — the per-record audit: pass stamp alone
         # says nothing about the population.
         state = audit_report_state(data_dir)
-        if not audit_report_gate_open(state):
+        if not audit_report_gate_open(state, current_history_sha256):
             if doc_ids:
-                print(_audit_report_refusal(state, data_dir), flush=True)
+                print(
+                    _audit_report_refusal(state, data_dir, current_history_sha256),
+                    flush=True,
+                )
                 return {
                     "year": int(year),
                     "promoted": 0,

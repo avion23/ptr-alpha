@@ -394,6 +394,17 @@ def data_dir(tmp_path) -> Path:
     return tmp_path / "data"
 
 
+def _complete_99_doc_census(data_dir: Path) -> list[str]:
+    doc_ids = [f"census-{i:02d}" for i in range(99)]
+    for doc_id in doc_ids:
+        write_record(data_dir, make_record(doc_id))
+    write_envelope(data_dir)
+    for doc_id in doc_ids:
+        audit_sample.record_verdict(data_dir, doc_id, "pass", "matches pixels")
+    assert audit_sample.main(["--data-dir", str(data_dir), "report"]) == 0
+    return doc_ids
+
+
 # --------------------------------------------------------------------------
 # Astra probe 1: null/missing verdicts must refuse, never count as clean
 # --------------------------------------------------------------------------
@@ -1465,6 +1476,89 @@ def test_state_file_gains_critical_failures_and_keeps_v2_contract(data_dir, caps
     assert state["cosmetic_failure_count"] == 1
     assert state["completion_reasons"] == []
     assert state["omission_check_status"] == "not_run"
+
+
+def test_new_critical_verdict_invalidates_population_report(data_dir, capsys):
+    from scripts import glm_stage
+
+    doc_ids = _complete_99_doc_census(data_dir)
+    report_path = audit_sample.staging_root(data_dir) / audit_sample.REPORT_STATE_NAME
+    fresh_state = report_path.read_bytes()
+    initial = json.loads(fresh_state)
+    assert initial["budget_met"] is True
+    assert initial["audit_history_sha256"] == audit_sample.audit_history_sha256(
+        audit_sample.load_audit_results(data_dir)
+    )
+
+    audit_sample.record_verdict(data_dir, doc_ids[0], "fail", "critical field mismatch")
+    invalidated = json.loads(report_path.read_text())
+    assert invalidated["state"] == "incomplete" and invalidated["budget_met"] is None
+    blocked = glm_stage.promote_docs(2024, [doc_ids[1]], data_dir=data_dir)
+    assert blocked["refused"] == 1 and blocked["promoted"] == 0
+    assert "verdict history changed" in capsys.readouterr().out
+
+    # Even if a stale complete file survives a concurrent/legacy publication,
+    # its explicit binding cannot authorize promotion against changed history.
+    report_path.write_bytes(fresh_state)
+    blocked = glm_stage.promote_docs(2024, [doc_ids[1]], data_dir=data_dir)
+    assert blocked["refused"] == 1 and blocked["promoted"] == 0
+    assert "audit history changed since report" in capsys.readouterr().out
+
+    assert audit_sample.main(["--data-dir", str(data_dir), "report"]) == 1
+    fresh = json.loads(report_path.read_text())
+    assert fresh["state"] == "complete" and fresh["budget_met"] is False
+    assert fresh["critical_failure_count"] == 1
+    assert fresh["rate"] == pytest.approx(1 / 99)
+    assert fresh["upper_bound"] > 0.01
+    assert fresh["audit_history_sha256"] == audit_sample.audit_history_sha256(
+        audit_sample.load_audit_results(data_dir)
+    )
+
+
+def test_report_invalidation_and_history_write_failures_fail_closed(
+    data_dir, monkeypatch, capsys
+):
+    from scripts import glm_stage
+
+    doc_ids = _complete_99_doc_census(data_dir)
+    root = audit_sample.staging_root(data_dir)
+    report_path = root / audit_sample.REPORT_STATE_NAME
+    history_path = root / audit_sample.AUDIT_RESULTS_NAME
+    record_path = root / "2024" / f"{doc_ids[0]}.json"
+    original_state = report_path.read_bytes()
+    original_history = history_path.read_bytes()
+    original_record = record_path.read_bytes()
+    real_atomic_write = audit_sample._atomic_write_json
+
+    def fail_invalidation(path, payload):
+        if Path(path).name == report_path.name:
+            raise OSError("injected report-state write failure")
+        return real_atomic_write(path, payload)
+
+    monkeypatch.setattr(audit_sample, "_atomic_write_json", fail_invalidation)
+    with pytest.raises(OSError, match="report-state write failure"):
+        audit_sample.record_verdict(data_dir, doc_ids[0], "fail", "critical mismatch")
+    assert report_path.read_bytes() == original_state
+    assert history_path.read_bytes() == original_history
+    assert record_path.read_bytes() == original_record
+
+    def fail_history_append(path, payload):
+        if Path(path).name == history_path.name:
+            state = json.loads(report_path.read_text())
+            assert state["state"] == "incomplete" and state["budget_met"] is None
+            raise OSError("injected history append failure")
+        return real_atomic_write(path, payload)
+
+    monkeypatch.setattr(audit_sample, "_atomic_write_json", fail_history_append)
+    with pytest.raises(OSError, match="history append failure"):
+        audit_sample.record_verdict(data_dir, doc_ids[0], "fail", "critical mismatch")
+    assert history_path.read_bytes() == original_history
+    assert json.loads(record_path.read_text())["audit"] == "fail"
+    invalidated = json.loads(report_path.read_text())
+    assert invalidated["state"] == "incomplete" and invalidated["budget_met"] is None
+    blocked = glm_stage.promote_docs(2024, [doc_ids[1]], data_dir=data_dir)
+    assert blocked["refused"] == 1 and blocked["promoted"] == 0
+    assert "verdict history changed" in capsys.readouterr().out
 
 
 def test_live_30_doc_lot_completes_despite_historical_outside_lot_verdicts(

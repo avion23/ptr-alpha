@@ -100,6 +100,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import fcntl
 import hashlib
 import io
 import json
@@ -110,7 +111,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from collections import Counter
 from pathlib import Path
 
@@ -155,6 +156,43 @@ PROMOTE_ORDER_NOTE = (
 
 def staging_root(data_dir: str | Path = "data") -> Path:
     return Path(data_dir) / "staging" / "glm-backlog"
+
+
+@contextmanager
+def audit_operation_lock(data_dir: str | Path):
+    """Serialize verdict, report, and promotion decisions for one staging root.
+
+    Callers take this root lock before any per-document publication lock.
+    """
+    # ponytail: one root lock favors correctness; split by population only if
+    # measured promotion throughput makes this serialization a bottleneck.
+    root = staging_root(data_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".audit-operation.lock").open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def audit_history_sha256(results: list[dict]) -> str:
+    """Fingerprint the parsed append-only history used to build a report."""
+    encoded = json.dumps(
+        results, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _invalidate_audit_report(data_dir: str | Path) -> None:
+    _atomic_write_json(
+        staging_root(data_dir) / REPORT_STATE_NAME,
+        _incomplete_state_payload(
+            "audit verdict history changed; rerun audit report",
+            max_rate=DEFAULT_MAX_RATE,
+            sample_file=None,
+        ),
+    )
 
 
 def utc_now_iso() -> str:
@@ -838,6 +876,37 @@ def record_verdict(
     *,
     attempt_scoped: bool = False,
 ) -> dict:
+    """Append a verdict after fail-closing any previously complete report."""
+    if verdict not in ("pass", "fail"):
+        raise ValueError("verdict must be 'pass' or 'fail'")
+    if severity not in VALID_SEVERITIES:
+        raise ValueError("severity must be 'critical' or 'cosmetic'")
+    from analyzer.ocr.ingestion import ApprovedDataRoot, approved_data_root
+
+    if not isinstance(data_dir, ApprovedDataRoot):
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        with approved_data_root(data_dir) as approved:
+            return record_verdict(
+                approved, doc_id, verdict, notes, severity,
+                attempt_scoped=attempt_scoped,
+            )
+    # Lock order is audit-root then per-document publication lock.
+    with audit_operation_lock(data_dir):
+        return _record_verdict_locked(
+            data_dir, doc_id, verdict, notes, severity,
+            attempt_scoped=attempt_scoped,
+        )
+
+
+def _record_verdict_locked(
+    data_dir: str | Path,
+    doc_id: str,
+    verdict: str,
+    notes: str = "",
+    severity: str = "critical",
+    *,
+    attempt_scoped: bool = False,
+) -> dict:
     """APPEND an audit result to the history and stamp the staging record.
 
     The results file is an append-only history: a later pass never erases
@@ -868,17 +937,8 @@ def record_verdict(
         raise ValueError("verdict must be 'pass' or 'fail'")
     if severity not in VALID_SEVERITIES:
         raise ValueError("severity must be 'critical' or 'cosmetic'")
-    from analyzer.ocr.ingestion import (
-        ApprovedDataRoot,
-        approved_data_root,
-        read_work_artifact,
-        staging_document_lock,
-    )
+    from analyzer.ocr.ingestion import read_work_artifact, staging_document_lock
 
-    if not isinstance(data_dir, ApprovedDataRoot):
-        Path(data_dir).mkdir(parents=True, exist_ok=True)
-        with approved_data_root(data_dir) as approved:
-            return record_verdict(approved, doc_id, verdict, notes, severity, attempt_scoped=attempt_scoped)
     root = staging_root(data_dir)
     results_path = root / AUDIT_RESULTS_NAME
 
@@ -946,6 +1006,7 @@ def record_verdict(
                 current["audit"] = verdict
                 current["audit_severity"] = severity
                 current["audit_notes"] = notes
+                _invalidate_audit_report(data_dir)
                 _atomic_write_json(path, current)
                 entry = {
                     "doc_id": str(doc_id),
@@ -981,6 +1042,7 @@ def record_verdict(
     }
     results = read_history()
     results.append(entry)
+    _invalidate_audit_report(data_dir)
     _atomic_write_json(results_path, results)
 
     return {"entry": entry, "staging_year": None}
@@ -1691,6 +1753,7 @@ def _incomplete_state_payload(
     max_rate: float,
     sample_file: str | None,
     omission_check_status: str = "not_run",
+    history_sha256: str | None = None,
 ) -> dict:
     return {
         "schema": REPORT_STATE_SCHEMA,
@@ -1724,6 +1787,7 @@ def _incomplete_state_payload(
         "pooled_rate": None,
         "pooling_method": None,
         "sample_file": sample_file,
+        "audit_history_sha256": history_sha256,
         "outside_lot": [],
         "outside_lot_critical_failures": [],
         "outside_lot_critical_failure_count": 0,
@@ -1738,6 +1802,11 @@ def _incomplete_state_payload(
 
 
 def cmd_report(args) -> int:
+    with audit_operation_lock(args.data_dir):
+        return _cmd_report_locked(args)
+
+
+def _cmd_report_locked(args) -> int:
     root = staging_root(args.data_dir)
     envelope, lot_error = load_sample_lot(args.data_dir, args.sample_file)
 
@@ -1760,8 +1829,11 @@ def cmd_report(args) -> int:
     sample_file_name = Path(args.sample_file).name if args.sample_file else (
         sorted(root.glob("audit-sample-*.json"))[-1].name
     )
+    history_sha256 = None
     try:
         records = load_staging_records(args.data_dir)
+        audit_results = load_audit_results(args.data_dir)
+        history_sha256 = audit_history_sha256(audit_results)
         staged_records_by_doc = {str(record["doc_id"]): record for _, record in records}
         staged_rows_by_doc = {
             doc_id: list(record.get("rows") or [])
@@ -1769,7 +1841,7 @@ def cmd_report(args) -> int:
         }
         promoted = load_promoted_doc_ids(args.data_dir)
         report = build_report(
-            load_audit_results(args.data_dir),
+            audit_results,
             staged_rows_by_doc,
             promoted,
             ground_truth_dir=args.ground_truth_dir,
@@ -1790,6 +1862,7 @@ def cmd_report(args) -> int:
             omission_check_status=(
                 "configured" if args.ground_truth_dir is not None else "not_run"
             ),
+            history_sha256=history_sha256,
         )
         _atomic_write_json(root / REPORT_STATE_NAME, state_payload)
         print(CAVEAT)
@@ -1992,6 +2065,7 @@ def cmd_report(args) -> int:
             "pooled_rate": _num_or_none(report["pooled_rate"]),
             "pooling_method": report["pooling_method"],
             "sample_file": sample_file_name,
+            "audit_history_sha256": history_sha256,
             "outside_lot": report["outside_lot"],
             "outside_lot_critical_failures": [
                 [d, r] for d, r in report["outside_lot_critical_failures"]
@@ -2058,6 +2132,7 @@ def cmd_report(args) -> int:
             "pooled_rate": _num_or_none(report["pooled_rate"]),
             "pooling_method": report["pooling_method"],
             "sample_file": sample_file_name,
+            "audit_history_sha256": history_sha256,
             "outside_lot": report["outside_lot"],
             "outside_lot_critical_failures": [
                 [d, r] for d, r in report["outside_lot_critical_failures"]

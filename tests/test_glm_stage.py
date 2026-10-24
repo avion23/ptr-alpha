@@ -747,6 +747,9 @@ def write_report_state(data_dir, *, state="complete", budget_met=True, schema="a
         "confidence": 0.95,
         "max_rate": 0.01,
         "population_critical_failure_count": 0,
+        "audit_history_sha256": audit_sample.audit_history_sha256(
+            audit_sample.load_audit_results(data_dir)
+        ),
         "omission_check_status": "not_run",
     }
     (root / "audit-report-state.json").write_text(
@@ -1077,6 +1080,7 @@ def test_promote_partial_insert_keeps_and_marks_record(data_dir, monkeypatch, ca
     record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
     glm_stage.write_staging_record(data_dir, record)
     audit_sample.record_verdict(data_dir, "2005", "pass", "updated test fixture")
+    write_report_state(data_dir)
 
     def partial_insert(*args, **kwargs):
         assert "report" not in kwargs
@@ -1122,6 +1126,7 @@ def test_promote_member_rejection_is_not_no_txs(data_dir, monkeypatch, capsys):
     record["staged_rows_sha256"] = glm_stage.staged_rows_sha256(record["rows"])
     glm_stage.write_staging_record(data_dir, record)
     audit_sample.record_verdict(data_dir, "2006", "pass", "updated test fixture")
+    write_report_state(data_dir)
 
     def identity_reject(*args, **kwargs):
         return ocr_zero_rows.InsertOutcome(
@@ -2768,6 +2773,7 @@ def test_promote_requires_verdict_bound_to_record_identity(
 
     # record_verdict stores the record identity; the bound pass promotes.
     audit_sample.record_verdict(data_dir, "bnd1", "pass", "matches pixels")
+    write_report_state(data_dir)
     result = glm_stage.promote_docs(2024, ["bnd1"], data_dir=data_dir)
     assert result["promoted"] == 1
     assert len(fake_insert) == 1
@@ -2788,6 +2794,7 @@ def test_promote_refuses_legacy_and_restaged_verdicts(data_dir, fake_insert, cap
             [{"doc_id": "bnd2", "verdict": "pass", "notes": "", "audited_at_utc": "t"}]
         )
     )
+    write_report_state(data_dir)
     result = glm_stage.promote_docs(2024, ["bnd2"], data_dir=data_dir)
     assert result["refused"] == 1 and fake_insert == []
     assert "not bound to this record's identity" in capsys.readouterr().out
@@ -2795,6 +2802,7 @@ def test_promote_refuses_legacy_and_restaged_verdicts(data_dir, fake_insert, cap
     # A record re-staged after its audit (identity triple changed while the
     # stamp was carried over) no longer matches the audited identity.
     audit_sample.record_verdict(data_dir, "bnd2", "pass", "matches")
+    write_report_state(data_dir)
     record = glm_stage.load_staging_record(data_dir, 2024, "bnd2")
     record["parsed_at_utc"] = "2026-10-19T00:00:00Z"
     glm_stage.write_staging_record(data_dir, record)

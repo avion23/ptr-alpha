@@ -19,7 +19,7 @@ if __name__ == "__main__":
         if _entry not in sys.path:
             sys.path.insert(0, _entry)
 
-from analyzer.parsing.cascade import _is_valid_pdf, _parse_pdf_worker
+from analyzer.parsing.cascade import is_valid_pdf, parse_pdf_worker
 
 
 def _parse_one(path_string: str) -> dict:
@@ -38,7 +38,7 @@ def _parse_one(path_string: str) -> dict:
     try:
         with warnings.catch_warnings(record=True) as caught_warnings:
             warnings.simplefilter("always")
-            parsed_path, transactions, engines = _parse_pdf_worker(path)
+            parsed_path, transactions, engines = parse_pdf_worker(path)
         return {
             "path": str(parsed_path),
             "transactions": len(transactions),
@@ -84,7 +84,7 @@ def main() -> int:
         os.environ["PTR_SKIP_DOCLING"] = "1"
 
     paths = sorted(data_dir.glob("*/pdfs/*.pdf"))
-    invalid = [path for path in paths if not _is_valid_pdf(path)]
+    invalid = [path for path in paths if not is_valid_pdf(path)]
     invalid_set = set(invalid)
     parse_paths = [path for path in paths if path not in invalid_set]
     started = time.time()

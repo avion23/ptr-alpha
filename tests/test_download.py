@@ -573,7 +573,7 @@ def test_parser_recipe_cache_policy_retains_only_explicit_legacy_materialization
         return path, [{**transaction, "notification_date": "09/30/2026"}], ["pdfplumber"]
 
     monkeypatch.setattr("analyzer.download.Pool", ThreadPool)
-    monkeypatch.setattr("analyzer.download._tolerant_parse_pdf_worker", worker)
+    monkeypatch.setattr("analyzer.download.tolerant_parse_pdf_worker", worker)
     lookup = {doc: dict(First="First", Last="Last", FilingDate="2026-10-20") for doc in docs}
     try:
         # Seed genuine legacy versions and values, never label old results as v6.
@@ -704,7 +704,7 @@ def test_parse_cached_pdfs_isolates_per_pdf_cascade_failures(
             raise ParserCascadeError(f"{path}: unresolved parser completeness: boom")
         return path, [], ["pdfplumber", "won:pdfplumber"]
 
-    monkeypatch.setattr(download_module, "_parse_pdf_worker", fake_worker)
+    monkeypatch.setattr(download_module, "parse_pdf_worker", fake_worker)
 
     class FakePool:
         def __init__(self, _workers):
@@ -828,7 +828,7 @@ def test_failed_reparse_preserves_terminal_run_rows_and_generation_audit(
     def failed_worker(path):
         raise ParserCascadeError(f"{path}: unresolved parser completeness: boom")
 
-    monkeypatch.setattr(download_module, "_parse_pdf_worker", failed_worker)
+    monkeypatch.setattr(download_module, "parse_pdf_worker", failed_worker)
 
     class FakePool:
         def __init__(self, _workers):
@@ -908,7 +908,7 @@ def test_parse_cached_pdfs_saves_docs_with_transient_engine_errors(
     def fake_worker(path):
         return path, [], ["lattice", "error:lattice", "won:pdftotext"]
 
-    monkeypatch.setattr(download_module, "_parse_pdf_worker", fake_worker)
+    monkeypatch.setattr(download_module, "parse_pdf_worker", fake_worker)
 
     class FakePool:
         def __init__(self, _workers):
@@ -1056,10 +1056,10 @@ def test_tolerant_parse_watchdog_budget_fires_and_restores_state(
         time_module.sleep(0.5)
         return _path, [], ["pdfplumber"]
 
-    monkeypatch.setattr(download_module, "_parse_pdf_worker", slow_worker)
+    monkeypatch.setattr(download_module, "parse_pdf_worker", slow_worker)
 
     start = time_module.monotonic()
-    result = download_module._tolerant_parse_pdf_worker(pdf_path)
+    result = download_module.tolerant_parse_pdf_worker(pdf_path)
     elapsed = time_module.monotonic() - start
 
     out_path, transactions, engines = result
@@ -1088,7 +1088,7 @@ def test_tolerant_worker_keeps_backend_timeout_as_parse_failure(tmp_path, monkey
         parser_cascade, "extract_tables_with_pdfplumber", raise_timeout
     )
 
-    out_path, transactions, engines = download_module._tolerant_parse_pdf_worker(
+    out_path, transactions, engines = download_module.tolerant_parse_pdf_worker(
         pdf_path
     )
 
@@ -1115,10 +1115,10 @@ def test_tolerant_parse_watchdog_absent_outside_main_thread(tmp_path, monkeypatc
         time_module.sleep(0.1)
         return path, [], ["pdfplumber", "won:pdfplumber"]
 
-    monkeypatch.setattr(download_module, "_parse_pdf_worker", slow_worker)
+    monkeypatch.setattr(download_module, "parse_pdf_worker", slow_worker)
 
     def run():
-        outcome["result"] = download_module._tolerant_parse_pdf_worker(pdf_path)
+        outcome["result"] = download_module.tolerant_parse_pdf_worker(pdf_path)
         outcome["handler"] = signal.getsignal(signal.SIGALRM)
 
     thread = threading.Thread(target=run)
@@ -1141,11 +1141,11 @@ def test_tolerant_parse_skips_docs_via_ptr_skip_docs(tmp_path, monkeypatch):
     monkeypatch.setenv("PTR_SKIP_DOCS", "20004297")
 
     def explode_if_called(_path):
-        raise AssertionError("_parse_pdf_worker must not run for skipped docs")
+        raise AssertionError("parse_pdf_worker must not run for skipped docs")
 
-    monkeypatch.setattr(download_module, "_parse_pdf_worker", explode_if_called)
+    monkeypatch.setattr(download_module, "parse_pdf_worker", explode_if_called)
 
-    out_path, transactions, engines = download_module._tolerant_parse_pdf_worker(
+    out_path, transactions, engines = download_module.tolerant_parse_pdf_worker(
         skipped_path
     )
     assert out_path == skipped_path
@@ -1154,10 +1154,10 @@ def test_tolerant_parse_skips_docs_via_ptr_skip_docs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         download_module,
-        "_parse_pdf_worker",
+        "parse_pdf_worker",
         lambda path: (path, [], ["won:pdfplumber"]),
     )
-    out_path, transactions, engines = download_module._tolerant_parse_pdf_worker(
+    out_path, transactions, engines = download_module.tolerant_parse_pdf_worker(
         normal_path
     )
     assert engines == ["won:pdfplumber"]

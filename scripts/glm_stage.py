@@ -267,7 +267,7 @@ def utc_now_iso() -> str:
     )
 
 
-def _atomic_write_json(path: Path, payload) -> None:
+def atomic_write_json(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -447,7 +447,7 @@ def archive_current_attempt(data_dir: str | Path, year: int, doc_id: str) -> Pat
 
 def write_staging_record(data_dir: str | Path, record: StagingRecord) -> Path:
     path = staging_record_path(data_dir, record["year"], record["doc_id"])
-    _atomic_write_json(path, record)
+    atomic_write_json(path, record)
     return path
 
 

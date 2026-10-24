@@ -4,7 +4,7 @@ Docling (IBM TableFormer + RapidOCR) is the benchmark winner for scanned
 image-only PTR PDFs that pdfplumber cannot touch. Runs in an isolated
 `uvx` subprocess so its ~500MB ML dependencies don't pollute the project
 venv. Emits markdown that we convert back to 2D string grids via the
-list-style (`_parse_docling_markdown`) or pipe-table (`_parse_markdown_tables`)
+list-style (`parse_docling_markdown`) or pipe-table (`parse_markdown_tables`)
 parsers below.
 """
 
@@ -51,7 +51,7 @@ def extract_tables_with_docling(
             "" if line.lstrip().startswith("|") else line
             for line in text.splitlines()
         )
-        return _parse_docling_markdown(list_text) + _parse_markdown_tables(text)
+        return parse_docling_markdown(list_text) + parse_markdown_tables(text)
 
 
 def _build_docling_cmd(pdf_path: Path) -> list[str] | None:
@@ -130,7 +130,7 @@ def _kill_process_group(pid: int) -> None:
         logger.debug(f"could not kill process group of pid {pid}: {e}")
 
 
-def _parse_markdown_tables(text: str) -> list[list[list[str]]]:
+def parse_markdown_tables(text: str) -> list[list[list[str]]]:
     """Parse GitHub-flavored markdown tables into 2D string grids.
 
     Docling and Marker emit standard markdown pipe tables; this converts them
@@ -163,7 +163,7 @@ def _parse_markdown_tables(text: str) -> list[list[list[str]]]:
     return [t for t in tables if len(t) >= 2 and len(t[0]) >= 3]
 
 
-def _parse_docling_markdown(text: str) -> list[list[list[str]]]:
+def parse_docling_markdown(text: str) -> list[list[list[str]]]:
     """Parse Docling's list-style markdown OCR output into transaction tables.
 
     Docling renders scanned PTR PDFs as markdown lists where each transaction

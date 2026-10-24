@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from analyzer.parsing import cascade as parser_cascade
-from analyzer.parsing.cells import _extract_ticker
+from analyzer.parsing.cells import extract_ticker
 from analyzer.parsing.pdftotext_parser import _parse_pdftotext_lines
 from analyzer.parsing.rows import parse_pdf_table
 
@@ -81,14 +81,14 @@ class TestTickerMetadataContamination(unittest.TestCase):
             "PENNFIELD MICH SCHS DIST Go 4% 05/01/22 MN - MUNI BoND "
             "FILING STATUS: New SUBHoLDING oF: Appendix A (100% interest)"
         )
-        self.assertIsNone(_extract_ticker(asset))
+        self.assertIsNone(extract_ticker(asset))
 
     def test_ticker_before_the_label_is_still_resolved(self):
         asset = (
             "EQT Midstream Partners, LP Common Units representing Limited "
             "Partner Interests (EQM) FILING STATUS: New SUBHoLDING oF: Trust"
         )
-        self.assertEqual(_extract_ticker(asset), "EQM")
+        self.assertEqual(extract_ticker(asset), "EQM")
 
     def test_short_label_variants_do_not_become_tickers(self):
         for asset in (
@@ -97,13 +97,13 @@ class TestTickerMetadataContamination(unittest.TestCase):
             "Foo Bar [ST] SOURCE OF: Pension",
         ):
             with self.subTest(asset=asset):
-                self.assertNotEqual(_extract_ticker(asset), "STATUS")
-                self.assertNotEqual(_extract_ticker(asset), "S")
-                self.assertNotEqual(_extract_ticker(asset), "OF")
+                self.assertNotEqual(extract_ticker(asset), "STATUS")
+                self.assertNotEqual(extract_ticker(asset), "S")
+                self.assertNotEqual(extract_ticker(asset), "OF")
 
     def test_colon_and_dollar_tickers_still_work_without_labels(self):
-        self.assertEqual(_extract_ticker("Pay to ACME: settled"), "ACME")
-        self.assertEqual(_extract_ticker("Holdings $BRK.B"), "BRK.B")
+        self.assertEqual(extract_ticker("Pay to ACME: settled"), "ACME")
+        self.assertEqual(extract_ticker("Holdings $BRK.B"), "BRK.B")
 
 
 class TestPdftotextLayoutRepair(unittest.TestCase):

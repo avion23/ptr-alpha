@@ -13,7 +13,7 @@ from analyzer.cli import _open_database, app
 from analyzer.persistence.database import Database
 from analyzer.download import HouseFetchSummary, HouseTransactionSource
 from analyzer.exceptions import DataResult, DataSourceError, StepResult
-from analyzer.member_ranking.buyer_scoring import _get_consensus_candidate_tickers
+from analyzer.member_ranking.buyer_scoring import get_consensus_candidate_tickers
 from analyzer.pipeline import (
     BacktestParams,
     TickerAnalysisParams,
@@ -409,7 +409,7 @@ def test_single_officer_purchase_reaches_scoring_candidate():
         }
     )
     assert (
-        _get_consensus_candidate_tickers(
+        get_consensus_candidate_tickers(
             purchase, min_buyers=1, as_of_date=pd.Timestamp(as_of)
         )
         == []
@@ -417,7 +417,7 @@ def test_single_officer_purchase_reaches_scoring_candidate():
 
     congressional = purchase.copy()
     congressional["source"] = "house_pdf"
-    assert _get_consensus_candidate_tickers(
+    assert get_consensus_candidate_tickers(
         congressional, min_buyers=1, as_of_date=pd.Timestamp(as_of)
     ) == ["AAPL"]
 

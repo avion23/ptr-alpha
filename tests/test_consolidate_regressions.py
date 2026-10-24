@@ -19,12 +19,12 @@ LOOKUP = {"doc": dict(First="Jane", Last="Doe", FilingDate="2021-01-03")}
 
 
 def test_notification_survives_consolidation_and_normalization_without_fallback():
-    from analyzer.persistence.transaction_repository import _normalize_frame
+    from analyzer.persistence.transaction_repository import normalize_frame
     transactions = [_tx(row="r1"), _tx(row="r2")]
     transactions[0]["notification_date"] = "01/02/2021"
     transactions[0]["asset_description"] = "Private LLC [OL] Description: convertible SAFE"
     transactions[0]["instrument_type"] = "private"
-    result = _normalize_frame(
+    result = normalize_frame(
         consolidate_transactions({Path("doc.pdf"): transactions}, LOOKUP),
         deduplicate=False,
     )
@@ -87,7 +87,7 @@ def test_completed_pdf_checkpoint_precedes_stalled_batch(tmp_path, monkeypatch):
             raise RuntimeError("interrupted batch")
         return path, [_tx()], ["pdfplumber"]
 
-    monkeypatch.setattr("analyzer.download._tolerant_parse_pdf_worker", worker)
+    monkeypatch.setattr("analyzer.download.tolerant_parse_pdf_worker", worker)
     try:
         with pytest.raises(RuntimeError, match="interrupted batch"):
             source.parse_cached_pdfs(2021, force=True)

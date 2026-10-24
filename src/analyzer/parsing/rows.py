@@ -8,13 +8,13 @@ table row using the column index map from `columns.py`.
 import re
 
 from analyzer.parsing.cells import (
-    _extract_amount_midpoint,
-    _extract_date,
-    _extract_instrument_type,
+    extract_amount_midpoint,
+    extract_date,
+    extract_instrument_type,
     _extract_option_details,
-    _extract_owner_code,
-    _extract_ticker,
-    _extract_transaction_type,
+    extract_owner_code,
+    extract_ticker,
+    extract_transaction_type,
     clean_text,
 )
 from analyzer.parsing.columns import (
@@ -36,9 +36,9 @@ def _process_row(
         tx_type_cell = _get_cell(row, indexes.get("type"))
         date_cell = _get_cell(row, indexes.get("date"))
 
-        ticker = _extract_ticker(asset_cell)
-        tx_type = _extract_transaction_type(tx_type_cell)
-        tx_date = _extract_date(date_cell)
+        ticker = extract_ticker(asset_cell)
+        tx_type = extract_transaction_type(tx_type_cell)
+        tx_date = extract_date(date_cell)
 
         if (not tx_type or not tx_date) and next_row:
             combined = _merge_complementary_row(row, next_row, indexes)
@@ -69,7 +69,7 @@ def _try_merge_continuation(row, next_row, indexes, asset_cell):
     if combined is None:
         return None, asset_cell, None, None, None, None
     asset_cell = _get_cell(combined, indexes.get("asset"))
-    ticker = _extract_ticker(asset_cell)
+    ticker = extract_ticker(asset_cell)
     tx_type_cell = _get_cell(combined, indexes.get("type"))
     date_cell = _get_cell(combined, indexes.get("date"))
     return (
@@ -77,8 +77,8 @@ def _try_merge_continuation(row, next_row, indexes, asset_cell):
         asset_cell,
         tx_type_cell,
         date_cell,
-        _extract_transaction_type(tx_type_cell),
-        _extract_date(date_cell),
+        extract_transaction_type(tx_type_cell),
+        extract_date(date_cell),
     )
 
 
@@ -132,8 +132,8 @@ def _build_row_dict(
         amount_cell = _find_amount_in_row(
             [cell for index, cell in enumerate(source) if index not in indexes.values()]
         )
-    amount_raw, amount_midpoint = _extract_amount_midpoint(amount_cell)
-    instrument_type = _extract_instrument_type(asset_cell)
+    amount_raw, amount_midpoint = extract_amount_midpoint(amount_cell)
+    instrument_type = extract_instrument_type(asset_cell)
     option_details = (
         _extract_option_details(asset_cell) if instrument_type != "stock" else {}
     )
@@ -141,8 +141,8 @@ def _build_row_dict(
         "ticker": ticker,
         "transaction_type": tx_type,
         "transaction_date": tx_date,
-        "notification_date": _extract_date(_get_cell(source, indexes.get("notification_date"))),
-        "owner_code": _extract_owner_code(_get_cell(source, indexes.get("owner"))),
+        "notification_date": extract_date(_get_cell(source, indexes.get("notification_date"))),
+        "owner_code": extract_owner_code(_get_cell(source, indexes.get("owner"))),
         "amount_raw": amount_raw,
         "amount_midpoint": amount_midpoint,
         "instrument_type": instrument_type,

@@ -14,8 +14,8 @@ from analyzer.parsing import (
     extract_tables_with_pdfplumber,
     extract_tables_with_pdftotext,
     parse_pdf_table,
-    _parse_ocr_text_to_rows,
 )
+from analyzer.parsing.ocr_parser import _parse_ocr_text_to_rows
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class ParserCascadeError(RuntimeError):
 # ── Per-PDF worker: cascades 5 PDF engines until transactions are found ─
 
 
-def _is_valid_pdf(path: Path) -> bool:
+def is_valid_pdf(path: Path) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
     with open(path, "rb") as f:
@@ -480,7 +480,7 @@ def _parse_text_only_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]
     raise ParserCascadeError(f"{pdf_path}: text engines did not prove complete coverage")
 
 
-def _parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
+def parse_pdf_worker(pdf_path: Path) -> tuple[Path, list[dict], list[str]]:
     """Compare text engines; require complete Tesseract coverage when uncertain."""
     skip_docling = os.environ.get("PTR_SKIP_DOCLING") == "1"
     (

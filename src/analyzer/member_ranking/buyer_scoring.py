@@ -10,7 +10,7 @@ from analyzer._memo import df_memoize
 from analyzer.exceptions import AnalysisError
 from analyzer.member_names import canonical_member_key
 from analyzer.models import TransactionType
-from analyzer.parsing.cells import _extract_instrument_type
+from analyzer.parsing.cells import extract_instrument_type
 from analyzer.ticker_resolver import TickerResolver
 
 CONSENSUS_SCORER_PROVENANCE = "identity_free_distinct_buyer_count_v2"
@@ -52,7 +52,7 @@ _NON_EQUITY_INSTRUMENTS = frozenset(
 )
 _REJECTED_TICKER_ORIGINS = frozenset({"invalid", "missing", "non_equity"})
 _CACHE_MISS = object()
-_OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd", "form4", "13f"})
+OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd", "form4", "13f"})
 _LEGACY_SCORING_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
 
 
@@ -91,7 +91,7 @@ def score_ticker_by_buyers(
         raise AnalysisError("consensus as_of_date must be a valid timestamp")
 
     normalized_ticker = _validate_ticker(ticker)
-    ticker_trades = _get_consensus_ticker_purchases(normalized_ticker, transactions_df)
+    ticker_trades = get_consensus_ticker_purchases(normalized_ticker, transactions_df)
     if ticker_trades.empty:
         return _empty_ticker_result(normalized_ticker)
 
@@ -174,7 +174,7 @@ def _ticker_family_symbols(ticker: str) -> set[str]:
     return symbols
 
 
-def _get_consensus_ticker_purchases(
+def get_consensus_ticker_purchases(
     ticker: str, transactions_df: pd.DataFrame
 ) -> pd.DataFrame:
     """Select purchases for a resolver-normalized equity identity.
@@ -184,7 +184,7 @@ def _get_consensus_ticker_purchases(
     their existing exact-ticker lookup because their member effects are only
     descriptive.
     """
-    purchases = _prepare_consensus_purchases(transactions_df)
+    purchases = prepare_consensus_purchases(transactions_df)
     if purchases.empty:
         return purchases
 
@@ -194,7 +194,7 @@ def _get_consensus_ticker_purchases(
     )
 
 
-def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
+def prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
     """Return valid purchase rows with resolver and member identities attached."""
     required = {"transaction_type", "transaction_date", "disclosure_date"}
     if transactions_df.empty or not required.issubset(transactions_df.columns):
@@ -250,7 +250,7 @@ def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
         _column("transaction_date"),
         _column("disclosure_date"),
     ):
-        if not _equity_transaction_fields(
+        if not equity_transaction_fields(
             ticker_origin,
             row_source,
             raw_asset_class,
@@ -280,7 +280,7 @@ def _prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
     ].copy()
 
 
-def _resolve_consensus_ticker(ticker: str, as_of_date: pd.Timestamp) -> str:
+def resolve_consensus_ticker(ticker: str, as_of_date: pd.Timestamp) -> str:
     """Return the tradable symbol for one equity identity at decision time."""
     normalized = _validate_ticker(ticker)
     decision_date = _transaction_date(as_of_date)
@@ -315,14 +315,14 @@ def _resolve_consensus_ticker(ticker: str, as_of_date: pd.Timestamp) -> str:
     return resolution.price_symbol
 
 
-def _get_consensus_candidate_tickers(
+def get_consensus_candidate_tickers(
     transactions_df: pd.DataFrame,
     min_buyers: int = 1,
     *,
     as_of_date: pd.Timestamp,
 ) -> list[str]:
     """Return decision-time symbols with eligible purchases for scoring."""
-    purchases = _legacy_scoring_rows(_prepare_consensus_purchases(transactions_df))
+    purchases = _legacy_scoring_rows(prepare_consensus_purchases(transactions_df))
     if purchases.empty:
         return []
 
@@ -345,20 +345,20 @@ def _get_consensus_candidate_tickers(
         except StopIteration:
             seed = sorted(family)[0]
         try:
-            candidates.add(_resolve_consensus_ticker(seed, as_of_date))
+            candidates.add(resolve_consensus_ticker(seed, as_of_date))
         except AnalysisError:
             continue
     return sorted(candidates)
 
 
-def _get_consensus_price_tickers(transactions_df: pd.DataFrame) -> list[str]:
+def get_consensus_price_tickers(transactions_df: pd.DataFrame) -> list[str]:
     """Return the price symbols needed to evaluate eligible purchases.
 
     Class-share and pseudo-ticker spellings collapse to their resolved price
     symbol. Rename aliases retain both temporal symbols because a disclosure
     can arrive after the rename for a transaction executed before it.
     """
-    purchases = _prepare_consensus_purchases(transactions_df)
+    purchases = prepare_consensus_purchases(transactions_df)
     if purchases.empty:
         return []
     symbols = set(purchases["_resolved_symbol"].dropna().astype(str))
@@ -394,7 +394,7 @@ def _transaction_date(value):
     return pd.Timestamp(parsed).date()
 
 
-def _equity_transaction_fields(
+def equity_transaction_fields(
     ticker_origin, source, raw_asset_class, asset_description,
     raw_asset_description, instrument_type,
 ) -> bool:
@@ -404,7 +404,7 @@ def _equity_transaction_fields(
         return False
 
     source_text = _normalize_ticker_text(source)
-    if source_text is not None and source_text.lower() not in _OFFICIAL_SOURCES:
+    if source_text is not None and source_text.lower() not in OFFICIAL_SOURCES:
         return False
 
     description = " ".join(
@@ -418,7 +418,7 @@ def _equity_transaction_fields(
     )
     if _UNSUPPORTED_ASSET_RE.search(description):
         return False
-    if _extract_instrument_type(description) == "private":
+    if extract_instrument_type(description) == "private":
         return False
     if _OPTION_BRACKET_RE.search(
         description
@@ -430,7 +430,7 @@ def _equity_transaction_fields(
 
 
 def _equity_transaction_row(row: pd.Series) -> bool:
-    return _equity_transaction_fields(
+    return equity_transaction_fields(
         row.get("ticker_origin"),
         row.get("source"),
         row.get("raw_asset_class"),

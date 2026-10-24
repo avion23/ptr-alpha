@@ -7,7 +7,7 @@ import pandas as pd
 from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_LOOKBACK_DAYS,
     CONSENSUS_MIN_BUYERS,
-    _get_consensus_candidate_tickers,
+    get_consensus_candidate_tickers,
     score_ticker_by_buyers,
 )
 from analyzer.models import TransactionType
@@ -38,7 +38,7 @@ def backtest_recommendations(
     if recent_trades.empty:
         return pd.DataFrame()
 
-    candidates = _get_consensus_candidate_tickers(
+    candidates = get_consensus_candidate_tickers(
         recent_trades,
         min_buyers,
         as_of_date=as_of,

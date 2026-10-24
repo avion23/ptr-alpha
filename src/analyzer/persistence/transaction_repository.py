@@ -230,7 +230,7 @@ def _normalize_amount_column(amount_raw: pd.Series, midpoint: pd.Series) -> pd.S
     return pd.Series(out, index=amount_raw.index, name=amount_raw.name)
 
 
-def _normalize_frame(df: pd.DataFrame, *, deduplicate: bool) -> pd.DataFrame:
+def normalize_frame(df: pd.DataFrame, *, deduplicate: bool) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
@@ -374,7 +374,7 @@ class TransactionRepository:
             """,  # nosec B608
             params,
         ).fetchdf()
-        return _normalize_frame(result, deduplicate=True)
+        return normalize_frame(result, deduplicate=True)
 
     def get_house_by_year(self, year: int) -> pd.DataFrame:
         return self.get_by_year(
@@ -406,7 +406,7 @@ class TransactionRepository:
             """,  # nosec B608
             params,
         ).fetchdf()
-        return _normalize_frame(result, deduplicate=True)
+        return normalize_frame(result, deduplicate=True)
 
     def get_skill_history(
         self, before_date: date, source_members: tuple[tuple[str, str], ...]
@@ -427,7 +427,7 @@ class TransactionRepository:
             """,  # nosec B608
             params,
         ).fetchdf()
-        return _normalize_frame(result, deduplicate=True)
+        return normalize_frame(result, deduplicate=True)
 
     def upsert(
         self, df: pd.DataFrame, *, source: str, _in_transaction: bool = False
@@ -462,7 +462,7 @@ class TransactionRepository:
         df["amount_raw"] = df["amount_raw"].fillna("").astype(str).replace("None", "")
         df["created_at"] = datetime.now()
         df["source"] = source
-        df = _normalize_frame(df, deduplicate=True)
+        df = normalize_frame(df, deduplicate=True)
         violations = acceptance_datetime_violations(df)
         if violations.any():
             logging.getLogger(__name__).warning(
@@ -688,7 +688,7 @@ class TransactionRepository:
             """,
             [doc_id],
         ).fetchdf()
-        return _normalize_frame(result, deduplicate=True)
+        return normalize_frame(result, deduplicate=True)
 
     def delete_for_doc(self, doc_id: str) -> None:
         self.conn.execute("INSERT INTO transaction_versions SELECT *, CURRENT_TIMESTAMP FROM transactions WHERE doc_id = ?", [doc_id])

@@ -26,7 +26,7 @@ cascade, scripts/reparse_all.py + src/analyzer/parsing/cascade.py):
         the variants the pinned 2026 canaries were derived from), then the
         preprocessed image as a tertiary fill;
     (4) deterministic text-layer retry with the accepted production cascade
-        (_parse_pdf_worker) when the PDF has an extractable text layer and
+        (parse_pdf_worker) when the PDF has an extractable text layer and
         steps (2)-(3) did not resolve it.
 
 Results stage under ``.staging/ocr2-local/<generation>/`` in the SAME
@@ -130,23 +130,25 @@ if __name__ == "__main__":
 
 from scripts.scan_ocr import (  # noqa: E402
     OcrRow,
-    _merge_page_results,
+    merge_page_results,
     extract_page_rows,
     pdf_page_count,
     sha256_file,
 )
 from analyzer.ocr.ingestion import extract_ticker, resolve_ticker  # noqa: E402
-from analyzer.parsing import (  # noqa: E402
-    _extract_amount_midpoint,
-    _extract_date,
-    _extract_transaction_type,
-    _parse_docling_markdown,
-    _parse_markdown_tables,
-    parse_pdf_table,
+from analyzer.parsing.cells import (  # noqa: E402
+    extract_amount_midpoint,
+    extract_date,
+    extract_transaction_type,
+)
+from analyzer.parsing import parse_pdf_table  # noqa: E402
+from analyzer.parsing.docling_parser import (  # noqa: E402
+    parse_docling_markdown,
+    parse_markdown_tables,
 )
 from analyzer.parsing.cascade import (  # noqa: E402
     ParserCascadeError,
-    _parse_pdf_worker,
+    parse_pdf_worker,
 )
 
 PINNED_CANARIES = {
@@ -230,13 +232,13 @@ def _extract_tx_type_cell(cell: str | None) -> str | None:
     """Transaction type from a type cell, tolerating the merged account
     residue of the old forms ("P aCCoUNTS", "S INVESTMENT aCCoUNTS"): the
     leading P/S/E letter is the type and the account text is discarded."""
-    tx_type = _extract_transaction_type(cell)
+    tx_type = extract_transaction_type(cell)
     if tx_type:
         return tx_type
     raw = str(cell or "").strip()
     first_token = raw.split(" ", 1)[0]
     if first_token and first_token != raw:
-        return _extract_transaction_type(first_token)
+        return extract_transaction_type(first_token)
     return None
 
 
@@ -432,7 +434,7 @@ def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
         if not tx_type:
             letter = _TYPE_LETTER_CELL_RE.search(type_raw)
             if letter:
-                tx_type = _extract_transaction_type(letter.group(0))
+                tx_type = extract_transaction_type(letter.group(0))
         row_ticker = bool(_TICKER_CELL_RE.search(asset))
         row_date = bool(
             _STRICT_DATE_CELL_RE.search(
@@ -449,7 +451,7 @@ def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
             if not asset:
                 continue
         asset = re.sub(r"\s+", " ", asset).strip()[:500]
-        amount_raw, amount_midpoint = _extract_amount_midpoint(
+        amount_raw, amount_midpoint = extract_amount_midpoint(
             str(dataframe.iat[row_index, amount_col] or "")
         )
         notif_raw = (
@@ -460,10 +462,10 @@ def _dataframe_rows(dataframe, page_number: int) -> list[dict]:
         rows.append({
             "asset_description": asset,
             "transaction_type": tx_type,
-            "transaction_date": _extract_date(
+            "transaction_date": extract_date(
                 str(dataframe.iat[row_index, date_col] or "")
             ),
-            "notification_date": _extract_date(notif_raw),
+            "notification_date": extract_date(notif_raw),
             "notification_date_raw": notif_raw,
             "owner_code": None,
             "amount_raw": amount_raw,
@@ -589,7 +591,7 @@ def docling_pages(pdf_path: str | Path) -> tuple[list[dict], str | None]:
                     rows.append(tx)
         else:
             # Docling reports no table on this page -> markdown text path.
-            tables = _parse_docling_markdown(segment) or _parse_markdown_tables(segment)
+            tables = parse_docling_markdown(segment) or parse_markdown_tables(segment)
             for table in tables:
                 for tx in parse_pdf_table(table):
                     asset = _strip_filing_residue(
@@ -657,7 +659,7 @@ def tesseract_page(
             str(estimated_path), page_number, start_row_index,
             dense_psm=TESSERACT_PSM, sparse_psm=TESSERACT_PSM_SPARSE,
         )
-        merged = _merge_page_results(primary, secondary)
+        merged = merge_page_results(primary, secondary)
         has_usable = any(not row.date_unresolved for row in merged.rows)
         if has_usable:
             return merged.rows, merged.text or secondary.text or ""
@@ -1017,7 +1019,7 @@ def process_document(
     if uncovered and text_layer.strip() and CASCADE_ENABLED:
         result["engines"].append("cascade")
         try:
-            _, cascade_rows, _ = _parse_pdf_worker(pdf_path)
+            _, cascade_rows, _ = parse_pdf_worker(pdf_path)
         except ParserCascadeError as exc:
             result["reasons"].append(f"cascade:{exc}")
         except Exception as exc:  # noqa: BLE001 -- fail-closed boundary

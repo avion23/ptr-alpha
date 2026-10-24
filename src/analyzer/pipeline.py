@@ -14,22 +14,21 @@ import pandas as pd
 from analyzer import analysis
 from analyzer.canonical_scope import canonical_decision, decision_history
 from analyzer.asset_ticker_map import resolve_asset_ticker
-from analyzer.actors import actor_id
 from analyzer._price_index import _normalize_price_index
 from analyzer.exceptions import AnalyzerError, DataResult, DataSourceError
-from analyzer.member_names import canonical_member_key
+from analyzer.member_names import actor_id, canonical_member_key
 from analyzer.member_ranking.buyer_scoring import (
-    _OFFICIAL_SOURCES,
+    OFFICIAL_SOURCES,
     CONSENSUS_LOOKBACK_DAYS,
     CONSENSUS_MIN_BUYERS,
-    _get_consensus_candidate_tickers,
-    _get_consensus_price_tickers,
-    _get_consensus_ticker_purchases,
-    _prepare_consensus_purchases,
-    _resolve_consensus_ticker,
+    get_consensus_candidate_tickers,
+    get_consensus_price_tickers,
+    get_consensus_ticker_purchases,
+    prepare_consensus_purchases,
+    resolve_consensus_ticker,
 )
 from analyzer.models import AnalysisMode, SourceCoverageState
-from analyzer.positions import _EntryCloseLookup, _split_price_history
+from analyzer.positions import EntryCloseLookup, split_price_history
 from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
 from analyzer.price_snapshot import create_snapshot
 from analyzer.price_source import price_adjustment_factor, price_generation_state
@@ -367,14 +366,14 @@ def eligible_events(
         ].map(resolved)
 
     eligible = (
-        trades["source"].isin(_OFFICIAL_SOURCES)
+        trades["source"].isin(OFFICIAL_SOURCES)
         & trades["ticker"].notna()
         & disclosure_dates.notna()
         & (disclosure_dates <= decision_date)
     )
     if days_back is not None:
         eligible &= disclosure_dates >= history_start
-    purchases = _prepare_consensus_purchases(trades.loc[eligible].copy())
+    purchases = prepare_consensus_purchases(trades.loc[eligible].copy())
     if purchases.empty:
         return pd.DataFrame(columns=columns)
 
@@ -401,13 +400,13 @@ def eligible_events(
             if set(history.columns) >= {"ticker", "date", "close"}:
                 # Same numpy splitter as the batched holdings loader; the
                 # fallback inside preserves the groupby construction.
-                closes, prepared = _split_price_history(
+                closes, prepared = split_price_history(
                     history, decision_date.date()
                 )
     except Exception:
         closes = {}
 
-    entry_lookup = _EntryCloseLookup(
+    entry_lookup = EntryCloseLookup(
         closes, decision_date.date(), prepared=prepared
     )
     generation_states = {
@@ -628,7 +627,7 @@ def run_analysis_pipeline(
 
 def _consensus_buyers_table(ticker: str, trades: pd.DataFrame) -> pd.DataFrame:
     """Display one row per canonical buyer consumed by consensus scoring."""
-    purchases = _get_consensus_ticker_purchases(ticker, trades)
+    purchases = get_consensus_ticker_purchases(ticker, trades)
     if "member" in purchases.columns:
         purchases = purchases[purchases["member"].notna()].copy()
     if purchases.empty:
@@ -682,7 +681,7 @@ def run_ticker_analysis(
     )
 
     try:
-        resolved_ticker = _resolve_consensus_ticker(params.ticker, analysis_as_of)
+        resolved_ticker = resolve_consensus_ticker(params.ticker, analysis_as_of)
     except AnalyzerError:
         resolution = TickerResolver().resolve(params.ticker, analysis_as_of.date())
         if resolution.status != "pre_listing":
@@ -735,7 +734,7 @@ def run_recent_ticker_scoring(
         params.days_back,
     )
 
-    tickers = _get_consensus_candidate_tickers(
+    tickers = get_consensus_candidate_tickers(
         recent_trades,
         1,
         as_of_date=as_of_date,
@@ -982,7 +981,7 @@ def run_backtest_pipeline(
         params.horizon,
     )
     all_tickers = sorted({"SPY"}.union(*(
-        _get_consensus_price_tickers(frame) for frame in decision_frames
+        get_consensus_price_tickers(frame) for frame in decision_frames
     )))
 
     prices = price_source.get_prices(all_tickers, price_start, price_end)

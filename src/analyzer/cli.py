@@ -18,7 +18,7 @@ from analyzer.canonical_scope import decision_history
 from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_LOOKBACK_DAYS,
     CONSENSUS_MIN_BUYERS,
-    _get_consensus_price_tickers,
+    get_consensus_price_tickers,
 )
 from analyzer.persistence.database import Database
 from analyzer.download import HouseTransactionSource
@@ -1083,7 +1083,7 @@ def _load_portfolio_inputs(
         lookback_days=lookback_days,
     )
     all_tickers = sorted({"SPY"}.union(*(
-        _get_consensus_price_tickers(frame) for frame in decision_frames
+        get_consensus_price_tickers(frame) for frame in decision_frames
     )))
     prices = app_ctx.transaction_source.db.get_prices(
         all_tickers, start_date, end_date

@@ -70,7 +70,7 @@ def clean_text(text: str | None) -> str:
     return re.sub(r"\s+", " ", str(text)).strip()
 
 
-def _extract_ticker(asset_cell: str | None) -> str | None:
+def extract_ticker(asset_cell: str | None) -> str | None:
     if not asset_cell:
         return None
     # Search on a copy with metadata labels removed so a label's trailing
@@ -480,7 +480,7 @@ def _resolve_company_name_ticker(asset_cell: str) -> str | None:
     return best_ticker
 
 
-def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
+def extract_transaction_type(tx_type_cell: str | None) -> str | None:
     if not tx_type_cell:
         return None
     raw = tx_type_cell.strip()
@@ -521,7 +521,7 @@ def _extract_transaction_type(tx_type_cell: str | None) -> str | None:
     return None
 
 
-def _extract_date(date_cell: str | None) -> str | None:
+def extract_date(date_cell: str | None) -> str | None:
     if not date_cell:
         return None
     # Support MM/DD/YYYY, YYYY-MM-DD, and MM/DD/YY formats
@@ -539,7 +539,7 @@ def _extract_date(date_cell: str | None) -> str | None:
     return None
 
 
-def _extract_owner_code(owner_cell: str | None) -> str | None:
+def extract_owner_code(owner_cell: str | None) -> str | None:
     owner = clean_text(owner_cell).upper()
     if not owner:
         return None
@@ -556,7 +556,7 @@ def _extract_owner_code(owner_cell: str | None) -> str | None:
     return None
 
 
-def _extract_instrument_type(asset_cell: str | None) -> str:
+def extract_instrument_type(asset_cell: str | None) -> str:
     """Classify explicit non-equity instruments before stock/option defaults.
 
     House ``[OP]`` identifies an option but does not establish call/put direction.
@@ -653,7 +653,7 @@ def _extract_option_details(asset_cell: str | None) -> dict:
     return details
 
 
-def _extract_amount_midpoint(
+def extract_amount_midpoint(
     amount_cell: str | None,
 ) -> tuple[str | None, float | None]:
     amount = clean_text(amount_cell)

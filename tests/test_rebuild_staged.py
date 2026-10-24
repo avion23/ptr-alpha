@@ -335,13 +335,13 @@ def test_house_parse_keeps_winning_fallback_rows_and_quarantines_total_failure(
     monkeypatch.setattr(rebuild_staged, "_house_source", lambda _staging: FakeSource())
     monkeypatch.setattr(
         rebuild_staged,
-        "_filter_existing_pdfs",
+        "filter_existing_pdfs",
         lambda _ptrs, _pdf_dir: (
             [failed_path, fallback_path],
             pd.DataFrame({"DocID": ["failed", "fallback"]}),
         ),
     )
-    monkeypatch.setattr(rebuild_staged, "_build_member_lookup", lambda _docs: {})
+    monkeypatch.setattr(rebuild_staged, "build_member_lookup", lambda _docs: {})
     monkeypatch.setattr(
         rebuild_staged,
         "_settings_for",
@@ -473,10 +473,10 @@ def test_house_parse_streams_text_results_before_ocr_tail_and_persists_tail_imme
     monkeypatch.setattr(rebuild_staged, "_house_source", lambda _staging: source)
     monkeypatch.setattr(
         rebuild_staged,
-        "_filter_existing_pdfs",
+        "filter_existing_pdfs",
         lambda _ptrs, _pdf_dir: (paths, existing_docs),
     )
-    monkeypatch.setattr(rebuild_staged, "_build_member_lookup", lambda _docs: {})
+    monkeypatch.setattr(rebuild_staged, "build_member_lookup", lambda _docs: {})
     monkeypatch.setattr(
         rebuild_staged,
         "_settings_for",

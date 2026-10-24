@@ -15,7 +15,7 @@ def test_worker_scopes_bulk_docling_policy(monkeypatch, tmp_path):
         assert os.environ["PTR_SKIP_DOCLING"] == "1"
         raise OSError("unreadable")
 
-    monkeypatch.setattr(reparse_all, "_parse_pdf_worker", parser)
+    monkeypatch.setattr(reparse_all, "parse_pdf_worker", parser)
     assert reparse_all._resilient_worker(path) == (
         path, [], [], "OSError: unreadable"
     )
@@ -116,7 +116,7 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     monkeypatch.setattr(reparse_all, "HouseTransactionSource", FakeSource)
     monkeypatch.setattr(
         reparse_all,
-        "_filter_existing_pdfs",
+        "filter_existing_pdfs",
         lambda _ptrs, _pdf_dir: (
             [success_path, zero_path, shortfall_path],
             pd.DataFrame(),
@@ -124,7 +124,7 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(
         reparse_all,
-        "_build_member_lookup",
+        "build_member_lookup",
         lambda _docs: {
             "success": {
                 "First": "Cleo",

@@ -39,9 +39,9 @@ from analyzer.interfaces import TransactionSource
 from analyzer.member_names import chamber_scoped_member_key, canonical_member_key
 from analyzer.models import Chamber, ReportOutcome, TickerOrigin
 from analyzer.parsing.cells import (
-    _extract_amount_midpoint,
-    _extract_owner_code,
-    _extract_ticker,
+    extract_amount_midpoint,
+    extract_owner_code,
+    extract_ticker,
 )
 from analyzer.persistence.transaction_repository import SOURCE_TRANSACTION_COLUMNS
 
@@ -503,7 +503,7 @@ class SenateEFDSource(TransactionSource):
         if cls._is_non_equity_asset(asset_name, asset_type):
             return None, None, TickerOrigin.NON_EQUITY
 
-        inferred = _extract_ticker(asset_name)
+        inferred = extract_ticker(asset_name)
         if not inferred:
             return None, None, TickerOrigin.MISSING
         inferred = inferred.strip().upper()
@@ -715,7 +715,7 @@ class SenateEFDSource(TransactionSource):
                     "ticker_origin": ticker_origin.value,
                     "asset_name": asset_name,
                     "asset_type": asset_type,
-                    "owner": _extract_owner_code(owner_raw),
+                    "owner": extract_owner_code(owner_raw),
                     "owner_raw": owner_raw or None,
                     "type": tx_subtype_raw,
                     "transaction_subtype_raw": tx_subtype_raw or None,
@@ -935,7 +935,7 @@ class SenateEFDSource(TransactionSource):
         rows = []
         rejected = 0
         for transaction in trades:
-            amount_raw, midpoint = _extract_amount_midpoint(
+            amount_raw, midpoint = extract_amount_midpoint(
                 transaction.get("amount_range")
             )
             member = transaction.get("senator")
@@ -1578,14 +1578,14 @@ class SenateEFDSource(TransactionSource):
                 raise SenateEFDError(
                     f"Senate transaction subtype binding mismatch: {source_record_id}"
                 )
-            expected_owner = _extract_owner_code(
+            expected_owner = extract_owner_code(
                 self._provenance_text(row.raw_owner) or ""
             )
             if expected_owner != row.owner_code:
                 raise SenateEFDError(
                     f"Senate transaction owner binding mismatch: {source_record_id}"
                 )
-            rebound_amount, rebound_midpoint = _extract_amount_midpoint(row.amount_raw)
+            rebound_amount, rebound_midpoint = extract_amount_midpoint(row.amount_raw)
             midpoint_matches = (
                 pd.isna(rebound_midpoint) and pd.isna(row.amount_midpoint)
             ) or rebound_midpoint == row.amount_midpoint

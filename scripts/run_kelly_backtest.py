@@ -20,7 +20,7 @@ from analyzer.download import HouseTransactionSource
 from analyzer.member_ranking.buyer_scoring import (
     CONSENSUS_LOOKBACK_DAYS,
     CONSENSUS_MIN_BUYERS,
-    _get_consensus_price_tickers,
+    get_consensus_price_tickers,
 )
 from analyzer.portfolio import (
     KellyConfig,
@@ -86,7 +86,7 @@ def _run(tx_source, sizing_inputs: pd.DataFrame) -> int:
     print(f"  {sum(len(frame) for frame in decision_frames)} decision-window transactions")
 
     tickers = sorted({"SPY"}.union(*(
-        _get_consensus_price_tickers(frame) for frame in decision_frames
+        get_consensus_price_tickers(frame) for frame in decision_frames
     )))
     price_start = next_nyse_session(start_date)
     prices = tx_source.db.get_prices(tickers, price_start, outcome_boundary)

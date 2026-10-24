@@ -9,7 +9,7 @@ excluded legacy 2008-2014 range.
 
 This is an audit only: the script never writes to ``data/`` or the database,
 and the only network traffic is read-only GET of the public archives. Metadata
-parsing reuses the production ``analyzer.download._read_first_text_from_zip``
+parsing reuses the production ``analyzer.download.read_first_text_from_zip``
 and ``analyzer.parsing.metadata.normalize_house_metadata`` so the audit
 measures exactly what production ingestion would consume.
 
@@ -40,7 +40,7 @@ if __name__ == "__main__":
 
 import requests
 
-from analyzer.download import _read_first_text_from_zip
+from analyzer.download import read_first_text_from_zip
 from analyzer.models import FilingType
 from analyzer.parsing.metadata import normalize_house_metadata
 
@@ -69,7 +69,7 @@ def fetch_metadata_archive(
 
 def parse_metadata(zip_bytes: bytes, year: int) -> Any:
     """Return the normalized metadata table for one archive year."""
-    return normalize_house_metadata(_read_first_text_from_zip(zip_bytes, year))
+    return normalize_house_metadata(read_first_text_from_zip(zip_bytes, year))
 
 
 def scan_local_inventory(local_dir: Path) -> dict[int, set[str]]:

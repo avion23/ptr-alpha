@@ -1,8 +1,8 @@
 import pytest
 
 from analyzer.parsing.cells import (
-    _extract_amount_midpoint, _extract_option_details, _extract_ticker,
-    _extract_transaction_type,
+    extract_amount_midpoint, _extract_option_details, extract_ticker,
+    extract_transaction_type,
 )
 from analyzer.parsing.columns import _indexes_from_headers
 from analyzer.parsing.rows import parse_pdf_table
@@ -25,9 +25,9 @@ def test_finding_2_notification_is_not_transaction_date():
 
 
 def test_finding_3_generic_description_is_not_issuer():
-    assert _extract_ticker("Target date fund 2045") is None
-    assert _extract_ticker("Target Corporation") == "TGT"
-    assert _extract_ticker("Apple Inc. Common Stock") == "AAPL"
+    assert extract_ticker("Target date fund 2045") is None
+    assert extract_ticker("Target Corporation") == "TGT"
+    assert extract_ticker("Apple Inc. Common Stock") == "AAPL"
 
 
 def test_finding_4_contract_money_is_not_transaction_amount():
@@ -48,18 +48,18 @@ def test_finding_6_grouped_strike():
 
 
 def test_finding_6_amount_cents():
-    assert _extract_amount_midpoint("$1,000.50 - $2,000.50")[1] == 1500.5
+    assert extract_amount_midpoint("$1,000.50 - $2,000.50")[1] == 1500.5
 
 
 @pytest.mark.parametrize("token", ["$1,20", "$1.200,50", "$100.123"])
 def test_finding_6_reject_unsupported_currency(token):
-    assert _extract_amount_midpoint(token)[1] is None
+    assert extract_amount_midpoint(token)[1] is None
     assert _extract_option_details(f"call option strike {token}").get("strike_price") is None
 
 
 @pytest.mark.parametrize("label", ["Sale / Purchase", "P / S", "Exchange / Buy"])
 def test_finding_7_conflicting_directions(label):
-    assert _extract_transaction_type(label) is None
+    assert extract_transaction_type(label) is None
 
 
 def test_finding_8_complementary_fields_and_conflicts():

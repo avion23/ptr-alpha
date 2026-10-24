@@ -26,13 +26,13 @@ import pandas as pd
 from analyzer.persistence.database import Database
 from analyzer.download import (
     HouseTransactionSource,
-    _build_member_lookup,
-    _filter_existing_pdfs,
+    build_member_lookup,
+    filter_existing_pdfs,
     preserve_existing_fields,
 )
 from analyzer.models import FilingType
 from analyzer.parsing import consolidate_transactions
-from analyzer.parsing.cascade import ParserCascadeError, _parse_pdf_worker
+from analyzer.parsing.cascade import ParserCascadeError, parse_pdf_worker
 from analyzer.settings import Settings
 
 
@@ -47,7 +47,7 @@ def _resilient_worker(
         previous = os.environ.get("PTR_SKIP_DOCLING")
         os.environ["PTR_SKIP_DOCLING"] = "1"
         try:
-            pdf_path_out, txs, engines = _parse_pdf_worker(pdf_path)
+            pdf_path_out, txs, engines = parse_pdf_worker(pdf_path)
         finally:
             if previous is None:
                 os.environ.pop("PTR_SKIP_DOCLING", None)
@@ -71,12 +71,12 @@ def parse_year(year: int, db: Database, settings: Settings):
     src.close()
 
     ptrs = cast(pd.DataFrame, metadata[metadata["FilingType"] == FilingType.PTR.value])
-    pdf_paths, existing_docs = _filter_existing_pdfs(ptrs, pdf_dir)
+    pdf_paths, existing_docs = filter_existing_pdfs(ptrs, pdf_dir)
     if not pdf_paths:
         print(f"  {year}: no PDFs found")
         return 0
 
-    member_lookup = _build_member_lookup(existing_docs)
+    member_lookup = build_member_lookup(existing_docs)
     print(
         f"  {year}: parsing {len(pdf_paths)} PDFs with {settings.data.get_workers()} workers..."
     )

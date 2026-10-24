@@ -495,7 +495,7 @@ def check_source_identity_duplicates(
 
 
 def check_duplicate_policy(conn: duckdb.DuckDBPyConnection) -> CheckResult:
-    from analyzer.persistence.transaction_repository import _normalize_frame
+    from analyzer.persistence.transaction_repository import normalize_frame
 
     result = CheckResult(
         "duplicate_policy",
@@ -547,10 +547,10 @@ def check_duplicate_policy(conn: duckdb.DuckDBPyConnection) -> CheckResult:
         if replay_scope.empty:
             continue
         try:
-            normalized = _normalize_frame(replay_scope, deduplicate=True)
+            normalized = normalize_frame(replay_scope, deduplicate=True)
         except Exception as exc:  # noqa: BLE001 - audit must fail closed
             result.violations.append(
-                f"batch {batch}: _normalize_frame failed: {type(exc).__name__}: {exc}"
+                f"batch {batch}: normalize_frame failed: {type(exc).__name__}: {exc}"
             )
             continue
         if len(normalized) != len(replay_scope):

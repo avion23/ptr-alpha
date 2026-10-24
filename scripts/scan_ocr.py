@@ -435,7 +435,7 @@ def _row_key(row: OcrRow) -> tuple:
     )
 
 
-def _merge_page_results(primary: PageResult, secondary: PageResult) -> PageResult:
+def merge_page_results(primary: PageResult, secondary: PageResult) -> PageResult:
     """Use the resolution-estimated variant only when the dpi-pinned variant
     produced no usable rows.
 
@@ -551,7 +551,7 @@ def sweep_document(pdf_path: str | Path) -> dict:
             secondary = extract_page_rows(
                 estimated_path, page_number, start_row_index=len(rows) + 1
             )
-            result = _merge_page_results(result, secondary)
+            result = merge_page_results(result, secondary)
             rows.extend(result.rows)
             page_text = result.text or secondary.text or ""
             if not result.rows:
@@ -808,7 +808,7 @@ def write_staging(
     import os
     import tempfile
 
-    from scripts.glm_stage import _atomic_write_json
+    from scripts.glm_stage import atomic_write_json
 
     out_root = Path(out_root)
     rows_dir = out_root / "rows"
@@ -869,7 +869,7 @@ def write_staging(
             "extracted_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
         doc_path = docs_dir / f"{doc_id}.json"
-        _atomic_write_json(doc_path, envelope)
+        atomic_write_json(doc_path, envelope)
         staged_files[f"docs/{doc_id}.json"] = sha256_file(doc_path)
 
         if result.get("status", "resolved" if result["resolved"] else "unresolved") == "resolved":
@@ -904,7 +904,7 @@ def write_staging(
         "staged_files_sha256": staged_files,
     }
     manifest_path = out_root / "manifest.json"
-    _atomic_write_json(manifest_path, manifest)
+    atomic_write_json(manifest_path, manifest)
     staged_files["manifest.json"] = sha256_file(manifest_path)
     return out_root
 

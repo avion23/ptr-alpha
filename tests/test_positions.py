@@ -283,9 +283,9 @@ class TestPositions(unittest.TestCase):
         self.assertTrue(positions.empty)
 
     def test_repository_normalized_full_sale_closes_only_disclosed_account(self):
-        from analyzer.persistence.transaction_repository import _normalize_frame
+        from analyzer.persistence.transaction_repository import normalize_frame
 
-        normalized = _normalize_frame(
+        normalized = normalize_frame(
             pd.DataFrame(
                 [
                     {
@@ -359,9 +359,9 @@ class TestPositions(unittest.TestCase):
         self.assertAlmostEqual(positions.iloc[0]["entry_ref"], 100.0)
 
     def test_repository_normalized_full_sale_without_owner_closes_all_accounts(self):
-        from analyzer.persistence.transaction_repository import _normalize_frame
+        from analyzer.persistence.transaction_repository import normalize_frame
 
-        normalized = _normalize_frame(
+        normalized = normalize_frame(
             pd.DataFrame(
                 [
                     {

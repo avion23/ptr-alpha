@@ -1068,7 +1068,7 @@ def _normalize_row(row) -> tuple[str, str, str, str, str]:
     )
 
 
-def _verdict_of(entry) -> str | None:
+def verdict_of(entry) -> str | None:
     """Explicit 'pass'/'fail' verdict, else None (missing/invalid/None)."""
     if not isinstance(entry, dict):
         return None
@@ -1083,7 +1083,7 @@ def _severity_of(entry) -> str | None:
 
     Entries recorded before ``record --severity`` existed carry no
     severity field; they resolve conservatively (critical) in
-    :func:`_doc_fail_severity` unless a later explicit classification
+    :func:`doc_fail_severity` unless a later explicit classification
     exists for the doc.
     """
     if not isinstance(entry, dict):
@@ -1094,7 +1094,7 @@ def _severity_of(entry) -> str | None:
     return None
 
 
-def _doc_fail_severity(fail_entries: list) -> tuple[str, bool]:
+def doc_fail_severity(fail_entries: list) -> tuple[str, bool]:
     """(worst severity, legacy-unclassified?) across a doc's fail entries.
 
     Owner-approved error budget: critical dominates — a doc with any
@@ -1309,7 +1309,7 @@ def build_report(
 
     for doc_id in population:
         entries = history.get(doc_id, [])
-        verdicts = [_verdict_of(entry) for entry in entries]
+        verdicts = [verdict_of(entry) for entry in entries]
         unresolved_attempts += sum(1 for verdict in verdicts if verdict is None)
 
         # 1) STICKY failures first: once recorded, a fail is never erased
@@ -1318,7 +1318,7 @@ def build_report(
             fail_entries = [
                 entry for entry, verdict in zip(entries, verdicts) if verdict == "fail"
             ]
-            severity, legacy = _doc_fail_severity(fail_entries)
+            severity, legacy = doc_fail_severity(fail_entries)
             failure_records.append((doc_id, "verdict:fail", severity))
             if legacy:
                 legacy_unclassified.append(doc_id)
@@ -1417,12 +1417,12 @@ def build_report(
     outside_lot_unresolved: list[str] = []
     for doc_id in outside_lot:
         entries = history[doc_id]
-        verdicts = [_verdict_of(entry) for entry in entries]
+        verdicts = [verdict_of(entry) for entry in entries]
         if "fail" in verdicts:
             fail_entries = [
                 entry for entry, verdict in zip(entries, verdicts) if verdict == "fail"
             ]
-            severity, _ = _doc_fail_severity(fail_entries)
+            severity, _ = doc_fail_severity(fail_entries)
             target = (
                 outside_lot_critical_failures
                 if severity == "critical"

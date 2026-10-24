@@ -188,7 +188,7 @@ class TestMergeVariants(unittest.TestCase):
             ],
             text="garbage",
         )
-        merged = so._merge_page_results(primary, secondary)
+        merged = so.merge_page_results(primary, secondary)
         self.assertEqual(len(merged.rows), 1)
         self.assertEqual(merged.rows[0].asset_description, "A")
         self.assertEqual(merged.text, "periodic transaction report")
@@ -208,7 +208,7 @@ class TestMergeVariants(unittest.TestCase):
             ],
             text="periodic transaction report",
         )
-        merged = so._merge_page_results(primary, secondary)
+        merged = so.merge_page_results(primary, secondary)
         # Primary rows are kept; strict-dated secondary rows are appended.
         self.assertEqual(len(merged.rows), 2)
         self.assertTrue(

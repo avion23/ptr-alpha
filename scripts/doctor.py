@@ -35,7 +35,7 @@ if __name__ == "__main__":
             sys.path.insert(0, _entry)
 
 from analyzer.freshness import FreshnessCheck, monitoring_checks  # noqa: E402
-from scripts.audit_sample import _doc_fail_severity, _verdict_of  # noqa: E402
+from scripts.audit_sample import doc_fail_severity, verdict_of  # noqa: E402
 
 CANONICAL = Path(os.environ.get("DOCTOR_CANONICAL", str(REPO / "data" / "congress.duckdb")))
 RECEIPTS = REPO / "data" / "recommendations" / "receipts.log"
@@ -215,7 +215,7 @@ def _ocr_staging_check(
             if (
                 isinstance(entry, dict)
                 and "doc_id" in entry
-                and _verdict_of(entry) in ("pass", "fail")
+                and verdict_of(entry) in ("pass", "fail")
             ):
                 audit_entries_by_doc.setdefault(str(entry["doc_id"]), []).append(entry)
 
@@ -236,7 +236,7 @@ def _ocr_staging_check(
             audit_entries_by_doc.get(str(doc_id), []) if doc_id is not None else []
         )
         fail_entries = [
-            entry for entry in audit_entries if _verdict_of(entry) == "fail"
+            entry for entry in audit_entries if verdict_of(entry) == "fail"
         ]
         if (
             status == "success"
@@ -246,7 +246,7 @@ def _ocr_staging_check(
         ):
             asset_review_unaudited += 1
         if fail_entries:
-            severity, _ = _doc_fail_severity(fail_entries)
+            severity, _ = doc_fail_severity(fail_entries)
             if severity == "cosmetic":
                 audit_cosmetic_fail += 1
             else:
@@ -255,7 +255,7 @@ def _ocr_staging_check(
             # Staging is stamped before the results history is appended. If a
             # process stopped between those writes, honor the staged verdict;
             # absent/invalid severity remains critical like a legacy result.
-            severity, _ = _doc_fail_severity(
+            severity, _ = doc_fail_severity(
                 [{"verdict": "fail", "severity": record.get("audit_severity")}]
             )
             if severity == "cosmetic":
@@ -263,7 +263,7 @@ def _ocr_staging_check(
             else:
                 audit_critical_fail += 1
         elif audit == "pass" or any(
-            _verdict_of(entry) == "pass" for entry in audit_entries
+            verdict_of(entry) == "pass" for entry in audit_entries
         ):
             audit_pass += 1
         else:

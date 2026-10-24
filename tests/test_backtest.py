@@ -12,8 +12,8 @@ from analyzer.analysis import (
 )
 from analyzer.member_ranking.buyer_scoring import (
     _filter_equity_rows,
-    _get_consensus_candidate_tickers,
-    _get_consensus_price_tickers,
+    get_consensus_candidate_tickers,
+    get_consensus_price_tickers,
 )
 
 from .conftest import DatabaseTestCase
@@ -694,7 +694,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
                 ],
             }
         )
-        candidates = _get_consensus_candidate_tickers(
+        candidates = get_consensus_candidate_tickers(
             rows, 1, as_of_date=pd.Timestamp("2025-01-14")
         )
         self.assertEqual(set(candidates), {"ARLP", "AAPL"})
@@ -711,7 +711,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
             }
         )
         self.assertEqual(
-            _get_consensus_candidate_tickers(
+            get_consensus_candidate_tickers(
                 stale, 1, as_of_date=pd.Timestamp("2026-03-02")
             ),
             ["AAPL"],
@@ -747,7 +747,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
             }
         )
         self.assertEqual(
-            _get_consensus_candidate_tickers(
+            get_consensus_candidate_tickers(
                 rows, 1, as_of_date=pd.Timestamp("2026-07-02")
             ),
             ["AAPL"],
@@ -767,10 +767,10 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
         )
         as_of = pd.Timestamp("2026-06-12")
         self.assertEqual(
-            _get_consensus_candidate_tickers(rows, 2, as_of_date=as_of), []
+            get_consensus_candidate_tickers(rows, 2, as_of_date=as_of), []
         )
         self.assertEqual(
-            _get_consensus_candidate_tickers(rows, 1, as_of_date=as_of), ["SPCX"]
+            get_consensus_candidate_tickers(rows, 1, as_of_date=as_of), ["SPCX"]
         )
 
     def test_rename_alias_resolves_to_symbol_tradable_at_decision_time(self):
@@ -787,13 +787,13 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
             }
         )
         self.assertEqual(
-            _get_consensus_candidate_tickers(
+            get_consensus_candidate_tickers(
                 rows, 1, as_of_date=pd.Timestamp("2022-06-08")
             ),
             ["FB"],
         )
         self.assertEqual(
-            _get_consensus_candidate_tickers(
+            get_consensus_candidate_tickers(
                 rows, 1, as_of_date=pd.Timestamp("2022-06-10")
             ),
             ["META"],
@@ -817,7 +817,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
         )
 
         self.assertEqual(
-            _get_consensus_price_tickers(rows),
+            get_consensus_price_tickers(rows),
             ["BRK-B", "FB", "META"],
         )
 
@@ -834,7 +834,7 @@ class TestEquityEligibilityCanaries(unittest.TestCase):
             }
         )
         self.assertEqual(
-            _get_consensus_candidate_tickers(
+            get_consensus_candidate_tickers(
                 rows, 2, as_of_date=pd.Timestamp("2025-01-05")
             ),
             ["BRK-B"],

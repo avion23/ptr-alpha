@@ -612,7 +612,7 @@ class TestDoclingMarkdownParsing(unittest.TestCase):
             "| | | Community Bank of Broward | E | 02/9/2015 | | "
             "$1,001 - $15,000 |\n"
         )
-        tables = ocr._parse_markdown_tables(md)
+        tables = ocr.parse_markdown_tables(md)
         self.assertEqual(len(tables), 1)
         rows = ocr.parse_pdf_table(tables[0])
         self.assertEqual(len(rows), 2)
@@ -707,7 +707,7 @@ class TestOldFormDoclingDataframe(unittest.TestCase):
     Real 20002501.pdf (2015 House PTR, scans/old form) has 7 transactions
     on page 1 that the markdown text path cannot read (0 rows pre-fix:
     the merged account text in the Transaction Type cell defeats
-    _extract_transaction_type).  Docling's structured table maps them with
+    extract_transaction_type).  Docling's structured table maps them with
     ticker from the Asset parenthetical, type, dates and amount range; the
     page must yield >=5 rows carrying ticker + transaction date + amount.
     """

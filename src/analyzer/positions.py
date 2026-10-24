@@ -33,7 +33,7 @@ from analyzer.member_names import (
     same_actor_identity,
     same_member_identity,
 )
-from analyzer.parsing.cells import _extract_amount_midpoint, _extract_instrument_type
+from analyzer.parsing.cells import extract_amount_midpoint, extract_instrument_type
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +227,7 @@ def entry_close(
 _CURRENT_MISS = object()
 
 
-class _EntryCloseLookup:
+class EntryCloseLookup:
     """Memoized searchsorted twin of `entry_close` for one fixed as_of.
 
     Price-history frames are immutable for the lifetime of one positions
@@ -359,7 +359,7 @@ def _current_close(prices: pd.DataFrame, as_of: date) -> float | None:
     return price if price > 0 else None
 
 
-def _split_price_history(history: pd.DataFrame, as_of=None):
+def split_price_history(history: pd.DataFrame, as_of=None):
     """Per-ticker close frames, plus optional pre-prepared lookup arrays.
 
     The loaders fetch prices ``ORDER BY ticker, date``, so each ticker's
@@ -370,7 +370,7 @@ def _split_price_history(history: pd.DataFrame, as_of=None):
     dates) falls back to the original groupby construction verbatim.
 
     Returns ``(frames, prepared)`` where ``prepared`` maps ticker ->
-    ``(truncated DatetimeIndex, close values)`` for ``_EntryCloseLookup``
+    ``(truncated DatetimeIndex, close values)`` for ``EntryCloseLookup``
     when ``as_of`` is given and closes are numeric, else ``None``.
     """
     frames: dict[str, pd.DataFrame] = {}
@@ -497,7 +497,7 @@ def build_positions(
     price_history: dict[str, pd.DataFrame],
     *,
     as_of: date,
-    entry_lookup: "_EntryCloseLookup | None" = None,
+    entry_lookup: "EntryCloseLookup | None" = None,
     presorted: bool = False,
 ) -> pd.DataFrame:
     """Reconstruct open lots per (member, ticker) with FIFO sale relief.
@@ -507,7 +507,7 @@ def build_positions(
     with a close column. Returns one row per open position with cost basis,
     current price, and discount_pct (negative = below member cost).
     """
-    from analyzer.member_ranking.buyer_scoring import _equity_transaction_fields
+    from analyzer.member_ranking.buyer_scoring import equity_transaction_fields
 
     required = {
         "member",
@@ -529,7 +529,7 @@ def build_positions(
     lots: dict[tuple[str, str], list[_Lot]] = {}
     last_activity: dict[tuple[str, str], date] = {}
     if entry_lookup is None:
-        entry_lookup = _EntryCloseLookup(price_history, as_of)
+        entry_lookup = EntryCloseLookup(price_history, as_of)
 
     def _filing_ref(record_cell, row_cell, source) -> dict:
         """Canonical filing identity of one contributing lot row.
@@ -623,7 +623,7 @@ def build_positions(
             return float(midpoint), False
         if raw is None or pd.isna(raw):
             return None, False
-        _, floor = _extract_amount_midpoint(str(raw))
+        _, floor = extract_amount_midpoint(str(raw))
         if floor is None or floor <= 0:
             return None, False
         return float(floor), True
@@ -724,7 +724,7 @@ def build_positions(
     disclosure_day_cache: dict = {}
 
     for i in range(len(ordered)):
-        if not _equity_transaction_fields(
+        if not equity_transaction_fields(
             origin_cells[i] if origin_cells is not None else None,
             source_cells[i] if source_cells is not None else None,
             raw_class_cells[i] if raw_class_cells is not None else None,
@@ -747,7 +747,7 @@ def build_positions(
                     isinstance(option_instrument, str)
                     and option_instrument.lower() == "private"
                 )
-                and _extract_instrument_type(
+                and extract_instrument_type(
                     option_description
                     if isinstance(option_description, str)
                     else None
@@ -801,7 +801,7 @@ def build_positions(
         description = description_cells[i] if has_description else None
         if (
             isinstance(instrument, str) and instrument.lower() == "private"
-        ) or _extract_instrument_type(description if isinstance(description, str) else None) == "private":
+        ) or extract_instrument_type(description if isinstance(description, str) else None) == "private":
             continue
         if _is_option_row(
             description_cells[i] if has_description else None,
@@ -1286,11 +1286,11 @@ def holdings_candidates_batch(
             # ORDER BY ticker, date: contiguous, date-ordered groups let the
             # splitter build every frame with numpy slices (no per-group
             # groupby/set_index) and pre-cut the lookup's close arrays.
-            histories, prepared = _split_price_history(history, as_of)
+            histories, prepared = split_price_history(history, as_of)
     for ticker in tickers:
         histories.setdefault(ticker, pd.DataFrame())
 
-    entry_lookup = _EntryCloseLookup(histories, as_of, prepared=prepared)
+    entry_lookup = EntryCloseLookup(histories, as_of, prepared=prepared)
     out: dict[str, pd.DataFrame] = {}
     for member in members:
         trades = by_member[member]

@@ -50,10 +50,10 @@ from analyzer.row_history import archive_rows, preserve_repair_history  # noqa: 
 from analyzer.download import (  # noqa: E402
     _PARSE_FAILURE_PREFIX,
     _PARSE_VERSION,
-    _build_member_lookup,
+    build_member_lookup,
     _engine_error_detail,
-    _filter_existing_pdfs,
-    _tolerant_parse_pdf_worker as _production_tolerant_parse_worker,
+    filter_existing_pdfs,
+    tolerant_parse_pdf_worker as _production_tolerant_parse_worker,
     _validated_pdf_sha256,
     preserve_existing_fields,
     prepare_house_parse_batch,
@@ -75,7 +75,7 @@ from scripts.audit_generation import (  # noqa: E402
     check_source_report_equation,
 )
 
-_parse_pdf_worker = _parser_cascade._parse_pdf_worker
+_parse_pdf_worker = _parser_cascade.parse_pdf_worker
 ParserCascadeError = _parser_cascade.ParserCascadeError
 
 HOUSE_YEARS = list(range(2015, date.today().year + 1))
@@ -422,7 +422,7 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
         metadata = src.fetch_metadata(year)
         ptrs = metadata[metadata["FilingType"] == FilingType.PTR.value]
         pdf_dir = staging / str(year) / "pdfs"
-        pdf_paths, existing_docs = _filter_existing_pdfs(ptrs, pdf_dir)
+        pdf_paths, existing_docs = filter_existing_pdfs(ptrs, pdf_dir)
         if not pdf_paths:
             raise RuntimeError(f"house-parse {year}: no PDF files found in {pdf_dir}")
 
@@ -480,7 +480,7 @@ def _parse_house_year_tolerant(staging: Path, db: Database, year: int) -> dict:
         )
         pdf_paths = [pdf_paths[index] for index in order]
         existing_docs = existing_docs.iloc[order].reset_index(drop=True)
-        member_lookup = _build_member_lookup(existing_docs)
+        member_lookup = build_member_lookup(existing_docs)
         unseen_paths = [
             path for path in pdf_paths if path.stem not in previously_attempted
         ]

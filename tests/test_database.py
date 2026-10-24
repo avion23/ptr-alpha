@@ -9,7 +9,7 @@ from analyzer.download import HouseTransactionSource
 from analyzer.senate_efd import SenateEFDSource
 from analyzer.persistence.transaction_repository import (
     SOURCE_TRANSACTION_COLUMNS,
-    _normalize_frame,
+    normalize_frame,
 )
 
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
@@ -2009,7 +2009,7 @@ class TestParseRunsTable(DatabaseTestCase):
 
 class TestTransactionNormalization(DatabaseTestCase):
     def test_raw_sale_subtype_is_preserved(self):
-        normalized = _normalize_frame(
+        normalized = normalize_frame(
             pd.DataFrame(
                 [
                     {
@@ -2037,7 +2037,7 @@ class TestTransactionNormalization(DatabaseTestCase):
             "amount_raw": "$1,001 - $15,000",
             "amount_midpoint": 8000.5,
         }
-        normalized = _normalize_frame(
+        normalized = normalize_frame(
             pd.DataFrame(
                 [
                     base | {"source_row_id": "page-1:row-1"},

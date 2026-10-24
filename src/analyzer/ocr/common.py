@@ -16,8 +16,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 
-from analyzer.member_names import canonical_member_key
-from analyzer.positions import same_member_identity
+from analyzer.member_names import canonical_member_key, same_member_identity
 from analyzer.ocr.paths import DATA_DIR
 
 MODEL = "gemini/gemini-3.1-flash-lite"

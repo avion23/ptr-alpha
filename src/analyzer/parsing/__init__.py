@@ -37,35 +37,21 @@ working after the split.
 # Cell-level helpers
 from analyzer.parsing.cells import (
     clean_text,
-    _extract_amount_midpoint,
-    _extract_date,
-    _extract_instrument_type,
-    _extract_option_details,
-    _extract_owner_code,
-    _extract_ticker,
-    _extract_transaction_type,
+    extract_amount_midpoint,
+    extract_date,
+    extract_instrument_type,
+    extract_owner_code,
+    extract_ticker,
+    extract_transaction_type,
 )
 
 # Column mapping
 from analyzer.parsing.columns import (
     KNOWN_HEADERS,
-    _column_index,
-    _column_index_substring,
-    _column_indexes,
-    _find_amount_in_row,
-    _find_header_row,
-    _get_cell,
-    _merge_two_row_headers,
-    _normalize_header,
 )
 
 # Row processing
 from analyzer.parsing.rows import (
-    _build_row_dict,
-    _data_start_offset,
-    _extract_transactions,
-    _process_row,
-    _try_merge_continuation,
     parse_pdf_table,
 )
 
@@ -78,47 +64,29 @@ from analyzer.parsing.metadata import (
 # Backends
 from analyzer.parsing.pdfplumber_parser import extract_tables_with_pdfplumber
 from analyzer.parsing.docling_parser import (
-    _parse_docling_markdown,
-    _parse_markdown_tables,
+    parse_docling_markdown,
+    parse_markdown_tables,
     extract_tables_with_docling,
 )
 from analyzer.parsing.pdftotext_parser import extract_tables_with_pdftotext
-from analyzer.parsing.ocr_parser import (
-    _parse_ocr_text_to_rows,
-    extract_tables_with_ocr,
-)
+from analyzer.parsing.ocr_parser import extract_tables_with_ocr
 
 __all__ = [
     "clean_text",
-    "_extract_amount_midpoint",
-    "_extract_date",
-    "_extract_instrument_type",
-    "_extract_option_details",
-    "_extract_owner_code",
-    "_extract_ticker",
-    "_extract_transaction_type",
+    "extract_amount_midpoint",
+    "extract_date",
+    "extract_instrument_type",
+    "extract_owner_code",
+    "extract_ticker",
+    "extract_transaction_type",
     "KNOWN_HEADERS",
-    "_column_index",
-    "_column_index_substring",
-    "_column_indexes",
-    "_find_amount_in_row",
-    "_find_header_row",
-    "_get_cell",
-    "_merge_two_row_headers",
-    "_normalize_header",
-    "_build_row_dict",
-    "_data_start_offset",
-    "_extract_transactions",
-    "_process_row",
-    "_try_merge_continuation",
     "parse_pdf_table",
     "consolidate_transactions",
     "normalize_house_metadata",
     "extract_tables_with_pdfplumber",
-    "_parse_docling_markdown",
-    "_parse_markdown_tables",
+    "parse_docling_markdown",
+    "parse_markdown_tables",
     "extract_tables_with_docling",
     "extract_tables_with_pdftotext",
-    "_parse_ocr_text_to_rows",
     "extract_tables_with_ocr",
 ]

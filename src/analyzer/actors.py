@@ -285,7 +285,7 @@ def load_skill_table(
     merge. A requested ID is validated only when that history set is exactly
     the requested ID; compatible variants fail closed.
     """
-    from analyzer.member_ranking.buyer_scoring import _prepare_consensus_purchases
+    from analyzer.member_ranking.buyer_scoring import prepare_consensus_purchases
 
     cutoff = pd.Timestamp(as_of).normalize()
     if cutoff.date() <= date.min:
@@ -310,7 +310,7 @@ def load_skill_table(
     if trades.empty:
         return pd.DataFrame(columns=_SKILL_COLUMNS)
 
-    purchases = _prepare_consensus_purchases(trades)
+    purchases = prepare_consensus_purchases(trades)
     if purchases.empty:
         return pd.DataFrame(columns=_SKILL_COLUMNS)
     disclosure_dates = pd.to_datetime(purchases["disclosure_date"], errors="coerce")

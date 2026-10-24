@@ -32,8 +32,8 @@ from analyzer.parsing import (
 from analyzer.parsing.cascade import (
     ParseBudgetExceeded,
     ParserCascadeError,
-    _is_valid_pdf,
-    _parse_pdf_worker,
+    is_valid_pdf,
+    parse_pdf_worker,
 )
 
 logger = logging.getLogger(__name__)
@@ -221,7 +221,7 @@ class HouseTransactionSource(TransactionSource):
                 f"status: {response.status_code}"
             )
 
-        content = _read_first_text_from_zip(response.content, archive_year)
+        content = read_first_text_from_zip(response.content, archive_year)
         df = normalize_house_metadata(content)
         if "FilingType" not in df.columns:
             raise ParsingError("Missing required metadata column: FilingType")
@@ -730,7 +730,7 @@ class HouseTransactionSource(TransactionSource):
         if not pdf_dir.exists():
             raise DataSourceError(f"PDF directory not found: {pdf_dir}")
 
-        pdf_paths, existing_docs = _filter_existing_pdfs(ptrs, pdf_dir)
+        pdf_paths, existing_docs = filter_existing_pdfs(ptrs, pdf_dir)
         if not pdf_paths:
             raise DataSourceError(f"No PDF files found in {pdf_dir}")
 
@@ -786,7 +786,7 @@ class HouseTransactionSource(TransactionSource):
             logger.info("All PDFs for %d already parsed; nothing to do", year)
             return
 
-        member_lookup = _build_member_lookup(existing_docs)
+        member_lookup = build_member_lookup(existing_docs)
         logger.info(f"Parsing {len(pdf_paths)} PDFs for {year}")
 
         # Submit bounded batches and checkpoint completions without waiting for
@@ -795,7 +795,7 @@ class HouseTransactionSource(TransactionSource):
         with Pool(self.parallel_workers) as pool:
             for offset in range(0, len(pdf_paths), batch_size):
                 batch_paths = pdf_paths[offset : offset + batch_size]
-                parsed = pool.imap_unordered(_tolerant_parse_pdf_worker, batch_paths)
+                parsed = pool.imap_unordered(tolerant_parse_pdf_worker, batch_paths)
                 for pdf_path, transactions, engines_attempted in parsed:
                     result = (pdf_path, transactions, engines_attempted)
                     error_detail = _engine_error_detail(engines_attempted)
@@ -948,7 +948,7 @@ def _skip_stems_from_env(raw: str | None) -> frozenset[str]:
     )
 
 
-def _tolerant_parse_pdf_worker(
+def tolerant_parse_pdf_worker(
     pdf_path: Path,
     parse_worker=None,
     *,
@@ -970,7 +970,7 @@ def _tolerant_parse_pdf_worker(
     if pdf_path.stem in _skip_stems_from_env(os.environ.get("PTR_SKIP_DOCS")):
         return pdf_path, [], [f"{_PARSE_FAILURE_PREFIX}skipped via PTR_SKIP_DOCS"]
 
-    worker = _parse_pdf_worker if parse_worker is None else parse_worker
+    worker = parse_pdf_worker if parse_worker is None else parse_worker
     if budget_seconds is None:
         budget_seconds = _PARSE_DOC_BUDGET_SECONDS
     use_watchdog = (
@@ -1139,7 +1139,7 @@ def preserve_existing_fields(df: pd.DataFrame, db) -> pd.DataFrame:
     return df
 
 
-def _read_first_text_from_zip(zip_bytes: bytes, year: int) -> str:
+def read_first_text_from_zip(zip_bytes: bytes, year: int) -> str:
     """Open the metadata ZIP and return its unambiguous metadata text member."""
     with zipfile.ZipFile(BytesIO(zip_bytes)) as z:
         text_files = [
@@ -1182,19 +1182,19 @@ def _read_first_text_from_zip(zip_bytes: bytes, year: int) -> str:
         return decoded[candidates[0]]
 
 
-def _filter_existing_pdfs(
+def filter_existing_pdfs(
     ptrs: pd.DataFrame, pdf_dir: Path
 ) -> tuple[list[Path], pd.DataFrame]:
     """Return (existing PDF paths, the subset of `ptrs` whose PDFs are on disk)."""
     doc_ids = ptrs["DocID"].values
     all_pdf_paths = [pdf_dir / f"{doc_id}.pdf" for doc_id in doc_ids]
-    exists_mask = [_is_valid_pdf(p) for p in all_pdf_paths]
+    exists_mask = [is_valid_pdf(p) for p in all_pdf_paths]
     pdf_paths = [p for p, e in zip(all_pdf_paths, exists_mask) if e]
     existing_docs = ptrs[exists_mask]
     return pdf_paths, existing_docs
 
 
-def _build_member_lookup(existing_docs: pd.DataFrame) -> dict:
+def build_member_lookup(existing_docs: pd.DataFrame) -> dict:
     """Map doc_id -> {First, Last, FilingDate} for downstream transaction join."""
     identity_columns = ["DocID", "First", "Last", "FilingDate"]
     distinct = existing_docs[identity_columns].drop_duplicates()

@@ -70,7 +70,7 @@ def test_text_agreement_on_partial_document_requires_ocr(monkeypatch):
         monkeypatch.setattr(cascade, name, lambda _: [])
     monkeypatch.setenv("PTR_SKIP_DOCLING", "1")
     monkeypatch.setattr(cascade, "_try_tesseract", lambda _: all_rows)
-    _, transactions, engines = cascade._parse_pdf_worker(Path("mixed.pdf"))
+    _, transactions, engines = cascade.parse_pdf_worker(Path("mixed.pdf"))
     assert "ocr" in engines
     assert len(transactions) == 2
 
@@ -127,8 +127,8 @@ def test_table_notification_and_linked_description_not_next_issuer():
     ("Fund Corporation (FUND) [ST]", "stock"),
 ])
 def test_explicit_nonstock_and_stock_boundaries(asset, expected):
-    from analyzer.parsing.cells import _extract_instrument_type
-    assert _extract_instrument_type(asset) == expected
+    from analyzer.parsing.cells import extract_instrument_type
+    assert extract_instrument_type(asset) == expected
 
 
 def test_flattened_prior_description_cannot_hijack_next_stock():

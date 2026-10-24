@@ -22,7 +22,7 @@ import pandas as pd
 import requests
 
 from analyzer.interfaces import TransactionSource
-from analyzer.parsing.cells import _extract_amount_midpoint as _parse_amount_midpoint
+from analyzer.parsing.cells import extract_amount_midpoint
 
 logger = logging.getLogger(__name__)
 
@@ -635,7 +635,7 @@ class CapitolTradesSource(TransactionSource):
             amount_max = trade.get("amount_max")
             midpoint = self._compute_midpoint(amount_min, amount_max)
             if midpoint is None and trade.get("amount_text"):
-                _, midpoint = _parse_amount_midpoint(trade["amount_text"])
+                _, midpoint = extract_amount_midpoint(trade["amount_text"])
 
             raw_tx_type = self._normalize_model_text(trade["transaction_type"])
             if raw_tx_type is None:

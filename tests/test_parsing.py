@@ -639,7 +639,7 @@ class TestParsing(unittest.TestCase):
         import hashlib
         import re
 
-        from analyzer.parsing.cascade import ParserCascadeError, _parse_pdf_worker
+        from analyzer.parsing.cascade import ParserCascadeError, parse_pdf_worker
         from analyzer.parsing import extract_tables_with_pdftotext
 
         data_root = next(
@@ -664,19 +664,19 @@ class TestParsing(unittest.TestCase):
         previous = os.environ.get("PTR_SKIP_DOCLING")
         os.environ["PTR_SKIP_DOCLING"] = "1"
         try:
-            option_rows = _parse_pdf_worker(
+            option_rows = parse_pdf_worker(
                 data_root / "2025" / "pdfs" / "20026590.pdf"
             )[1]
-            nokia_rows = _parse_pdf_worker(
+            nokia_rows = parse_pdf_worker(
                 data_root / "2026" / "pdfs" / "20034694.pdf"
             )[1]
-            berkshire_rows = _parse_pdf_worker(
+            berkshire_rows = parse_pdf_worker(
                 data_root / "2026" / "pdfs" / "20034348.pdf"
             )[1]
             arlp_rows = [
                 row
                 for doc_id in ("20034095", "20034670")
-                for row in _parse_pdf_worker(
+                for row in parse_pdf_worker(
                     data_root / "2026" / "pdfs" / f"{doc_id}.pdf"
                 )[1]
             ]
@@ -697,7 +697,7 @@ class TestParsing(unittest.TestCase):
                     f"stream: Text extraction is not allowed: {fund_pdf}"
                 ) + "$",
             ):
-                _parse_pdf_worker(fund_pdf)
+                parse_pdf_worker(fund_pdf)
             # Retain the original ticker-corruption check on the independent
             # backend reading, without treating that reading as accepted.
             fund_rows = [
@@ -886,10 +886,10 @@ class TestLocalOcrCanaries(unittest.TestCase):
             image.close.assert_called_once_with()
 
     def test_regression_7_tickerless_asset_stops_docling_lookahead(self):
-        from analyzer.parsing.docling_parser import _parse_docling_markdown
+        from analyzer.parsing.docling_parser import parse_docling_markdown
 
         for asset in ("- Private Fund [ST]", "- Private Fund", "Private Fund"):
-            self.assertEqual(_parse_docling_markdown(
+            self.assertEqual(parse_docling_markdown(
                 f"- Apple (AAPL) [ST]\n{asset}\nP\n01/15/2024 $1-$2"
             ), [])
 
@@ -1219,7 +1219,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 parser_cascade, "_try_pdftotext", return_value=transactions(4)
             ),
         ):
-            _, result, engines = parser_cascade._parse_pdf_worker(Path("canary.pdf"))
+            _, result, engines = parser_cascade.parse_pdf_worker(Path("canary.pdf"))
 
         self.assertEqual(len(result), 4)
         self.assertIn("won:pdftotext", engines)
@@ -1248,7 +1248,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 parser_cascade, "_try_tesseract", return_value=[tx("A"), tx("B")]
             ),
         ):
-            _, rows, engines = parser_cascade._parse_pdf_worker(Path("complement.pdf"))
+            _, rows, engines = parser_cascade.parse_pdf_worker(Path("complement.pdf"))
 
         self.assertEqual({row["asset_description"] for row in rows}, {"A", "B"})
         self.assertIn("won:reconciled_complete_ocr", engines)
@@ -1275,7 +1275,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             patch.object(parser_cascade, "_try_tesseract", return_value=[tx("A")]),
         ):
             with self.assertRaises(parser_cascade.ParserCascadeError):
-                parser_cascade._parse_pdf_worker(Path("incomplete-ocr.pdf"))
+                parser_cascade.parse_pdf_worker(Path("incomplete-ocr.pdf"))
 
     def test_cascade_reconciles_complementary_rows_only_after_complete_ocr(self):
         from analyzer.parsing import cascade as parser_cascade
@@ -1298,7 +1298,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 parser_cascade, "_try_tesseract", return_value=[tx("A"), tx("B")]
             ),
         ):
-            _, rows, engines = parser_cascade._parse_pdf_worker(Path("complement.pdf"))
+            _, rows, engines = parser_cascade.parse_pdf_worker(Path("complement.pdf"))
         self.assertEqual({row["asset_description"] for row in rows}, {"A", "B"})
         self.assertIn("won:reconciled_complete_ocr", engines)
 
@@ -1337,7 +1337,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 ),
             ):
                 with self.assertRaises(parser_cascade.ParserCascadeError):
-                    parser_cascade._parse_pdf_worker(Path("uncertain.pdf"))
+                    parser_cascade.parse_pdf_worker(Path("uncertain.pdf"))
 
     def test_seventeen_plus_three_complements_require_complete_ocr(self):
         from analyzer.parsing import cascade as parser_cascade
@@ -1363,7 +1363,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             patch.object(parser_cascade, "_try_docling", return_value=[]),
             patch.object(parser_cascade, "_try_tesseract", return_value=corroborated),
         ):
-            _, rows, engines = parser_cascade._parse_pdf_worker(Path("17-plus-3.pdf"))
+            _, rows, engines = parser_cascade.parse_pdf_worker(Path("17-plus-3.pdf"))
         self.assertEqual(len(rows), 23)
         self.assertIn("won:reconciled_complete_ocr", engines)
 
@@ -1413,7 +1413,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             patch.object(parser_cascade, "_try_tesseract", return_value=[row.copy()]),
         ):
             with self.assertRaises(parser_cascade.ParserCascadeError):
-                parser_cascade._parse_pdf_worker(Path("repeated-coordinate.pdf"))
+                parser_cascade.parse_pdf_worker(Path("repeated-coordinate.pdf"))
 
     def test_reconciliation_preserves_maximum_source_lot_multiplicity(self):
         from analyzer.parsing import cascade as parser_cascade
@@ -1437,7 +1437,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
             patch.object(parser_cascade, "_try_docling", return_value=[]),
             patch.object(parser_cascade, "_try_tesseract", return_value=[row.copy()]),
         ):
-            _, rows, _ = parser_cascade._parse_pdf_worker(Path("duplicates.pdf"))
+            _, rows, _ = parser_cascade.parse_pdf_worker(Path("duplicates.pdf"))
         self.assertEqual(rows, source_lots)
 
     def test_ocr_rasterizer_timeout_maps_to_backend_error(self):
@@ -1506,7 +1506,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertEqual(killed, {"pgid": 4242, "sig": signal.SIGKILL})
 
     def test_known_real_pdf_hash_and_row_count_canaries(self):
-        from analyzer.parsing.cascade import _parse_pdf_worker
+        from analyzer.parsing.cascade import parse_pdf_worker
 
         data_dir_value = os.environ.get("PTR_OCR_CANARY_DATA")
         if not data_dir_value:
@@ -1545,7 +1545,7 @@ class TestLocalOcrCanaries(unittest.TestCase):
                 hashlib.sha256(pdf.read_bytes()).hexdigest(), expected_hash
             )
             with patch.dict(os.environ, {"PTR_SKIP_DOCLING": "1"}):
-                _, rows, engines = _parse_pdf_worker(pdf)
+                _, rows, engines = parse_pdf_worker(pdf)
             self.assertEqual(len(rows), expected_count, (doc_id, engines))
             self.assertIn("won:pdftotext", engines)
             parsed_rows[doc_id] = rows

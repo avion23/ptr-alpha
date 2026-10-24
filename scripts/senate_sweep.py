@@ -354,6 +354,7 @@ def write_manifest(
     papers: list[dict],
     canaries: dict,
     quarantine: dict | None,
+    canary_expect: str = "exact",
 ) -> Path:
     def artifact(path: Path) -> dict:
         sha, size = sha256_file(path)
@@ -394,7 +395,14 @@ def write_manifest(
         "summary": summary,
         "artifacts": artifacts,
         "canaries": canaries,
-        "status": "complete" if quarantine is None else "quarantined",
+        "canary_expect": canary_expect,
+        "status": (
+            "quarantined"
+            if quarantine is not None
+            else "canary_failed"
+            if canary_expect != "none" and canaries.get("passed") is not True
+            else "complete"
+        ),
         "quarantine": quarantine,
     }
     manifest_path = generation_dir / "manifest.json"
@@ -519,6 +527,7 @@ def run_sweep(
             transactions_file=transactions_file,
             papers=papers,
             canaries=canaries,
+            canary_expect=canary_expect,
             quarantine=quarantine,
         )
 
@@ -532,7 +541,7 @@ def run_sweep(
             completion = "sweep COMPLETE — canary results recorded (no gate)"
         elif not canaries["passed"]:
             exit_code = 2
-            completion = "sweep COMPLETE but canary verification FAILED:"
+            completion = "sweep INCOMPLETE — canary verification FAILED:"
         else:
             exit_code = 0
             completion = "sweep COMPLETE — all canaries passed"
@@ -589,8 +598,9 @@ def merge_window(window_dir: Path, generation: str | None = None) -> int:
         transactions: list[dict] = []
         papers: list[dict] = []
         quarantines: list[dict] = []
-        seen_paths: set[str] = set()
-        seen_rows: set[tuple] = set()
+        seen_paths: dict[str, dict] = {}
+        seen_rows: dict[tuple, dict] = {}
+        chunk_generations: set[str] = set()
         window_start: date | None = None
         window_end: date | None = None
 
@@ -599,6 +609,12 @@ def merge_window(window_dir: Path, generation: str | None = None) -> int:
             if not manifest_path.is_file():
                 raise SenateSweepError(f"chunk {chunk_dir.name} missing manifest.json")
             chunk_manifest = json.loads(manifest_path.read_text())
+            chunk_generation = chunk_manifest.get("generation")
+            if not isinstance(chunk_generation, str) or not chunk_generation:
+                raise SenateSweepError(
+                    f"chunk {chunk_dir.name} missing generation provenance"
+                )
+            chunk_generations.add(chunk_generation)
             chunk_start = date.fromisoformat(chunk_manifest["window"]["start_date"])
             chunk_end = date.fromisoformat(chunk_manifest["window"]["end_date"])
             window_start = (
@@ -622,18 +638,42 @@ def merge_window(window_dir: Path, generation: str | None = None) -> int:
             inv_path = chunk_dir / "report_inventory.jsonl"
             for line in inv_path.read_text().splitlines():
                 row = json.loads(line)
-                if row["report_path"] in seen_paths:
+                if row.get("ingestion_generation") != chunk_generation:
+                    raise SenateSweepError(
+                        f"unsupported multi-generation Senate aggregate: chunk "
+                        f"{chunk_dir.name} report generation "
+                        f"{row.get('ingestion_generation')!r} does not match "
+                        f"chunk manifest {chunk_generation!r}"
+                    )
+                report_path = row["report_path"]
+                if report_path in seen_paths:
+                    if seen_paths[report_path] != row:
+                        raise SenateSweepError(
+                            f"conflicting duplicate Senate report_path {report_path!r}"
+                        )
                     continue
-                seen_paths.add(row["report_path"])
+                seen_paths[report_path] = row
                 inventory.append(row)
 
             tx_path = chunk_dir / "transactions.jsonl"
             for line in tx_path.read_text().splitlines():
                 row = json.loads(line)
+                if row.get("ingestion_generation") != chunk_generation:
+                    raise SenateSweepError(
+                        f"unsupported multi-generation Senate aggregate: chunk "
+                        f"{chunk_dir.name} transaction generation "
+                        f"{row.get('ingestion_generation')!r} does not match "
+                        f"chunk manifest {chunk_generation!r}"
+                    )
                 key = (row["source_record_id"], row["source_row_id"])
                 if key in seen_rows:
+                    if seen_rows[key] != row:
+                        raise SenateSweepError(
+                            "conflicting duplicate Senate transaction key "
+                            f"{key!r}"
+                        )
                     continue
-                seen_rows.add(key)
+                seen_rows[key] = row
                 transactions.append(row)
 
             papers_dir = chunk_dir / "papers"
@@ -656,6 +696,13 @@ def merge_window(window_dir: Path, generation: str | None = None) -> int:
                             "bytes": len(content),
                         }
                     )
+
+        if chunk_generations != {generation}:
+            raise SenateSweepError(
+                "unsupported multi-generation Senate aggregate: child chunk "
+                f"generations={sorted(chunk_generations)!r} output={generation!r}; "
+                "no sealed aggregate authority exists"
+            )
 
         inventory.sort(key=lambda r: str(r.get("official_filing_date", "")))
         transactions.sort(
@@ -722,6 +769,7 @@ def merge_window(window_dir: Path, generation: str | None = None) -> int:
             transactions_file=tx_file,
             papers=papers,
             canaries=canaries,
+            canary_expect="any",
             quarantine=quarantine,
         )
         _publish_bundle(bundle_dir, output_dir)
@@ -738,7 +786,7 @@ def merge_window(window_dir: Path, generation: str | None = None) -> int:
         print("window QUARANTINED — see manifest quarantine for exact missing counts")
         return 2
     if not canaries["passed"]:
-        print("merge COMPLETE but canary verification FAILED:")
+        print("merge INCOMPLETE — canary verification FAILED:")
         for failure in canaries["failures"]:
             print(f"  {failure}")
         return 2

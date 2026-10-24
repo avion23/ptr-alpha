@@ -1488,6 +1488,7 @@ def ingest_senate_window(args) -> None:
         raise SystemExit(
             f"senate window hash mismatch: {verification['mismatches']}"
         )
+    _validated_senate_inventory(window_dir, window_manifest)
     db = Database(staging / "congress.duckdb", read_only=False)
     try:
         ingest = _ingest_senate(window_dir, window_manifest, db)
@@ -2631,13 +2632,55 @@ def _coerce_sibling_frame(frame, *, count_columns, date_columns, text_columns):
     return frame
 
 
+def _validated_senate_inventory(track_dir: Path, track_manifest: dict):
+    """Require the declared Senate canary contract to match its inventory."""
+    import pandas as pd  # noqa: PLC0415
+
+    if track_manifest.get("status") != "complete":
+        raise ValueError(
+            f"senate bundle status is not complete: {track_manifest.get('status')!r}"
+        )
+    expectation = track_manifest.get("canary_expect")
+    if expectation not in ("exact", "any"):
+        raise ValueError(
+            f"senate bundle has no ingestible canary contract: {expectation!r}"
+        )
+    declared = track_manifest.get("canaries")
+    if not isinstance(declared, dict) or declared.get("passed") is not True:
+        raise ValueError("senate canary evidence is missing or failed")
+
+    from scripts.senate_sweep import (  # noqa: PLC0415
+        _CANARY_EXPECTED,
+        _CANARY_EXPECTED_ANY,
+        verify_canaries,
+    )
+
+    inventory = pd.read_json(track_dir / "report_inventory.jsonl", lines=True)
+    expected = _CANARY_EXPECTED if expectation == "exact" else _CANARY_EXPECTED_ANY
+    actual = verify_canaries(inventory.to_dict(orient="records"), expected=expected)
+    if (
+        not actual["passed"]
+        or declared.get("failures") != actual["failures"]
+        or declared.get("results") != actual["results"]
+    ):
+        raise ValueError(
+            "senate canary evidence is missing, failed, or does not match "
+            "report_inventory.jsonl"
+        )
+    if not isinstance(track_manifest.get("generation"), str) or not track_manifest[
+        "generation"
+    ]:
+        raise ValueError("senate manifest lacks generation provenance")
+    return inventory
+
+
 def _ingest_senate(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     """Persist a verified senate sweep via Database.persist_source_refresh."""
     import pandas as pd  # noqa: PLC0415
 
+    inv = _validated_senate_inventory(track_dir, track_manifest)
     generation = track_manifest["generation"]
     tx = pd.read_json(track_dir / "transactions.jsonl", lines=True)
-    inv = pd.read_json(track_dir / "report_inventory.jsonl", lines=True)
     count_cols = ["raw_row_count", "accepted_row_count", "rejected_row_count"]
     date_cols = ["official_filing_date", "available_date", "disclosure_date",
                  "transaction_date", "notification_date", "filing_date"]
@@ -2654,6 +2697,14 @@ def _ingest_senate(track_dir: Path, track_manifest: dict, db: Database) -> dict:
     ]
     tx = _coerce_sibling_frame(tx, count_columns=[], date_columns=date_cols, text_columns=text_cols)
     inv = _coerce_sibling_frame(inv, count_columns=count_cols, date_columns=date_cols, text_columns=text_cols)
+    row_generations = {
+        str(value).strip()
+        for frame in (tx, inv)
+        if "ingestion_generation" in frame.columns
+        for value in frame["ingestion_generation"].dropna().tolist()
+        if str(value).strip()
+    }
+    aggregate = len(row_generations) > 1 or (track_dir / "chunks.json").is_file()
     for label, frame in (("transactions", tx), ("report inventory", inv)):
         if "ingestion_generation" not in frame.columns:
             raise ValueError(f"senate {label} lacks ingestion_generation provenance")
@@ -2666,6 +2717,12 @@ def _ingest_senate(track_dir: Path, track_manifest: dict, db: Database) -> dict:
         if len(frame) and (
             generations != {generation} or null_generation_rows != 0
         ):
+            if aggregate:
+                raise ValueError(
+                    "unsupported multi-generation Senate aggregate: "
+                    f"{label} rows={sorted(generations)!r}; no sealed aggregate "
+                    "authority exists"
+                )
             raise ValueError(
                 f"senate {label} generation provenance mismatch: "
                 f"manifest={generation!r} rows={sorted(generations)!r} "

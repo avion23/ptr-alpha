@@ -414,41 +414,52 @@ def test_stage_paper_artifacts_fails_closed_on_sha_mismatch(tmp_path):
         stage_paper_artifacts(FakeSource(), inventory, tmp_path / "papers")
 
 
-def _install_fake_sweep_source(monkeypatch, *, ticker="JPM"):
+def _install_fake_sweep_source(monkeypatch, *, ticker="JPM", canaries_pass=True):
     from scripts import senate_sweep
 
-    paper_bytes = b"%PDF-1.4\nfake paper filing\n%%EOF"
-    paper_url = "https://efdsearch.senate.gov/media/fake.pdf"
     instances = []
 
     class FakeSource:
         def __init__(self, *, ingestion_generation, **_kwargs):
             instances.append(ingestion_generation)
             self.ingestion_generation = ingestion_generation
+            scott_count = 12 if canaries_pass else 11
             self.report_inventory = [
                 _inventory_row(ingestion_generation=ingestion_generation),
                 _inventory_row(
                     source_record_id=SCOTT_REPORT_ID,
                     report_path=SCOTT_REPORT_PATH,
                     member="Rick Scott",
-                    outcome=ReportOutcome.PAPER_ONLY.value,
-                    accepted_row_count=0,
+                    raw_row_count=scott_count,
+                    accepted_row_count=scott_count,
                     ingestion_generation=ingestion_generation,
-                    paper_artifact_sha256=hashlib.sha256(paper_bytes).hexdigest(),
-                    paper_artifact_url=paper_url,
                 ),
             ]
-            self.paper_bytes = {paper_url: paper_bytes}
+            self.paper_bytes = {}
             self.last_refresh_summary = SimpleNamespace(
-                found=2, parsed=1, paper_only=1, unavailable=0, failed=0
+                found=2, parsed=2, paper_only=0, unavailable=0, failed=0
             )
             self.staged_results = {}
 
         def fetch_all_trades(self, *_args):
             accepted = object.__new__(SenateEFDSource)
             accepted.ingestion_generation = self.ingestion_generation
+            trades = [make_raw_trade(self.ingestion_generation, ticker=ticker)]
+            scott_count = 12 if canaries_pass else 11
+            trades.extend(
+                make_raw_trade(
+                    self.ingestion_generation,
+                    ticker=ticker,
+                    doc_id=SCOTT_REPORT_ID,
+                    source_record_id=SCOTT_REPORT_ID,
+                    source_row_id=f"official:{row_id}",
+                    source_report_path=SCOTT_REPORT_PATH,
+                    senator="Rick Scott",
+                )
+                for row_id in range(1, scott_count + 1)
+            )
             return accepted._normalize(
-                [make_raw_trade(self.ingestion_generation, ticker=ticker)]
+                trades
             )
 
         def close(self):
@@ -475,14 +486,16 @@ def test_sweep_publishes_fresh_immutable_bundle_and_consumer_accepts_hashes(
     initial_calls = _install_fake_sweep_source(monkeypatch)
     root = tmp_path / "senate"
     old_id = "gen-old"
-    assert run_sweep(old_id, root, date(2026, 1, 1), date(2026, 1, 31), "none") == 0
+    assert run_sweep(old_id, root, date(2026, 1, 1), date(2026, 1, 31), "exact") == 0
     assert initial_calls == [old_id]
     old_bundle = root / old_id
     original_bytes = _bundle_bytes(old_bundle)
     manifest = json.loads((old_bundle / "manifest.json").read_text())
     assert manifest["generation"] == old_id
     assert ".senate-sweep-" not in json.dumps(manifest)
-    transaction = json.loads((old_bundle / "transactions.jsonl").read_text())
+    transaction = json.loads(
+        (old_bundle / "transactions.jsonl").read_text().splitlines()[0]
+    )
     assert transaction["ingestion_generation"] == old_id
     inventory = json.loads(
         (old_bundle / "report_inventory.jsonl").read_text().splitlines()[0]
@@ -490,7 +503,7 @@ def test_sweep_publishes_fresh_immutable_bundle_and_consumer_accepts_hashes(
     assert inventory["ingestion_generation"] == old_id
     verification = rebuild_staged._verify_artifact_files(manifest, old_bundle)
     assert verification["mismatches"] == []
-    assert verification["files_checked"] == 3
+    assert verification["files_checked"] == 2
 
     class FakeDatabase:
         def persist_source_refresh(self, **kwargs):
@@ -499,7 +512,7 @@ def test_sweep_publishes_fresh_immutable_bundle_and_consumer_accepts_hashes(
 
     db = FakeDatabase()
     ingested = rebuild_staged._ingest_senate(old_bundle, manifest, db)
-    assert ingested["inserted_transactions"] == 1
+    assert ingested["inserted_transactions"] == 13
     assert db.kwargs["ingestion_generation"] == old_id
 
     # A changed producer cannot rebind the completed ID; refusal occurs before
@@ -530,7 +543,7 @@ def test_sweep_publishes_fresh_immutable_bundle_and_consumer_accepts_hashes(
         lambda *_args: (_ for _ in ()).throw(OSError("injected staging failure")),
     )
     with pytest.raises(OSError, match="injected staging failure"):
-        run_sweep("gen-failed", root, date(2026, 1, 1), date(2026, 1, 31), "none")
+        run_sweep("gen-failed", root, date(2026, 1, 1), date(2026, 1, 31), "exact")
     assert not (root / "gen-failed").exists()
     assert _bundle_bytes(old_bundle) == original_bytes
 
@@ -538,13 +551,15 @@ def test_sweep_publishes_fresh_immutable_bundle_and_consumer_accepts_hashes(
     monkeypatch.undo()
     fresh_calls = _install_fake_sweep_source(monkeypatch, ticker="ABC")
     new_id = "gen-new"
-    assert run_sweep(new_id, root, date(2026, 1, 1), date(2026, 1, 31), "none") == 0
+    assert run_sweep(new_id, root, date(2026, 1, 1), date(2026, 1, 31), "exact") == 0
     assert fresh_calls == [new_id]
     new_bundle = root / new_id
     new_manifest = json.loads((new_bundle / "manifest.json").read_text())
     assert new_manifest["generation"] == new_id
     assert (
-        json.loads((new_bundle / "transactions.jsonl").read_text())["ticker"]
+        json.loads(
+            (new_bundle / "transactions.jsonl").read_text().splitlines()[0]
+        )["ticker"]
         == "ABC"
     )
     assert (
@@ -553,6 +568,33 @@ def test_sweep_publishes_fresh_immutable_bundle_and_consumer_accepts_hashes(
     )
     assert _bundle_bytes(old_bundle) == original_bytes
     assert not list(root.glob(".senate-sweep-*"))
+
+
+def test_failed_canary_bundle_never_reaches_persistence(tmp_path, monkeypatch):
+    from scripts import rebuild_staged
+
+    _install_fake_sweep_source(monkeypatch, canaries_pass=False)
+    root = tmp_path / "senate"
+    generation = "gen-failed-canary"
+    assert run_sweep(
+        generation, root, date(2026, 1, 1), date(2026, 1, 31), "exact"
+    ) == 2
+    bundle = root / generation
+    bundle_manifest = json.loads((bundle / "manifest.json").read_text())
+    assert bundle_manifest["status"] == "canary_failed"
+    assert bundle_manifest["canary_expect"] == "exact"
+    assert bundle_manifest["canaries"]["passed"] is False
+
+    class FakeDatabase:
+        writes = 0
+
+        def persist_source_refresh(self, **_kwargs):
+            self.writes += 1
+
+    db = FakeDatabase()
+    with pytest.raises(ValueError, match="status is not complete"):
+        rebuild_staged._ingest_senate(bundle, bundle_manifest, db)
+    assert db.writes == 0
 
 
 def test_cli_default_generation_is_a_current_attempt_id(tmp_path, monkeypatch):
@@ -608,7 +650,9 @@ def test_verify_canaries_any_fails_when_member_missing():
     assert any("RICK SCOTT" in failure for failure in result["failures"])
 
 
-def _synthetic_chunk(tmp_path, name, rows, tx_rows, window, quarantine=None):
+def _synthetic_chunk(
+    tmp_path, name, rows, tx_rows, window, quarantine=None, generation=None
+):
     chunk = tmp_path / name
     chunk.mkdir(parents=True)
     from scripts.senate_sweep import write_inventory_jsonl, write_manifest
@@ -618,7 +662,7 @@ def _synthetic_chunk(tmp_path, name, rows, tx_rows, window, quarantine=None):
     tx_file.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in tx_rows))
     write_manifest(
         chunk,
-        generation=name,
+        generation=generation or name,
         start_date=window[0],
         end_date=window[1],
         inventory=rows,
@@ -637,18 +681,19 @@ def _synthetic_chunk(tmp_path, name, rows, tx_rows, window, quarantine=None):
     return chunk
 
 
-def test_merge_window_combines_chunks_and_verifies_canaries(tmp_path):
-    from scripts.senate_sweep import merge_window
+def test_merge_window_rejects_unsupported_multi_generation_without_mutation(tmp_path):
+    from scripts.senate_sweep import SenateSweepError, merge_window
 
     d = tmp_path / "window-input"
     d.mkdir()
-    row1 = _inventory_row()  # Britt parsed, 1 tx
+    row1 = _inventory_row(ingestion_generation="chunk-2024")
     row2 = _inventory_row(
         source_record_id=SCOTT_REPORT_ID,
         report_path=SCOTT_REPORT_PATH,
         member="Rick Scott",
         accepted_row_count=12,
         official_filing_date=pd.Timestamp("2024-03-15"),
+        ingestion_generation="chunk-2024",
     )
     row3 = _inventory_row(
         source_record_id="ffffffff-1111-2222-3333-444444444444",
@@ -656,6 +701,7 @@ def test_merge_window_combines_chunks_and_verifies_canaries(tmp_path):
         member="Thomas Tuberville",
         accepted_row_count=3,
         official_filing_date=pd.Timestamp("2023-06-01"),
+        ingestion_generation="chunk-2023",
     )
     paper_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
     paper_bytes = b"%PDF-1.4\nsynthetic merged paper\n%%EOF"
@@ -669,6 +715,7 @@ def test_merge_window_combines_chunks_and_verifies_canaries(tmp_path):
         official_filing_date=pd.Timestamp("2024-06-01"),
         paper_artifact_sha256=hashlib.sha256(paper_bytes).hexdigest(),
         paper_artifact_url=paper_url,
+        ingestion_generation="chunk-2024",
     )
     _synthetic_chunk(
         d, "chunk-2023", [row3], [], (date(2023, 1, 1), date(2023, 12, 31))
@@ -690,45 +737,13 @@ def test_merge_window_combines_chunks_and_verifies_canaries(tmp_path):
     source_paper.parent.mkdir()
     source_paper.write_bytes(paper_bytes)
     generation = "window-merged"
-    exit_code = merge_window(d, generation)
     merged = tmp_path / generation
     source_bytes = _bundle_bytes(d)
-    merged_bytes = _bundle_bytes(merged)
-    assert exit_code == 0
-    manifest = json.loads((merged / "manifest.json").read_text())
-    assert manifest["generation"] == generation
-    assert manifest["status"] == "complete"
-    assert manifest["summary"]["found"] == 4
-    assert manifest["summary"]["parsed"] == 3
-    assert manifest["summary"]["paper_only"] == 1
-    assert manifest["window"] == {
-        "start_date": "2023-01-01",
-        "end_date": "2024-12-31",
-    }
-    assert manifest["canaries"]["passed"] is True
-    merged_inv = [
-        json.loads(line)
-        for line in (merged / "report_inventory.jsonl").read_text().splitlines()
-    ]
-    assert len(merged_inv) == 4
-    assert "chunk-2023" in json.loads((merged / "chunks.json").read_text())["chunks"]
-    assert (merged / "papers" / f"{paper_id}.pdf").read_bytes() == paper_bytes
-    assert json.loads((merged / "transactions.jsonl").read_text())[
-        "ingestion_generation"
-    ] == "chunk-2024"
-    assert not (d / "manifest.json").exists()
-    from scripts import rebuild_staged
-
-    assert rebuild_staged._verify_artifact_files(manifest, merged)["mismatches"] == []
-    assert ".senate-merge-" not in json.dumps(manifest)
-    assert ".senate-merge-" not in (merged / "chunks.json").read_text()
-    assert ".senate-merge-" not in json.dumps(manifest)
-    from scripts.senate_sweep import SenateSweepError
-
-    with pytest.raises(SenateSweepError, match="already exists.*fresh --generation"):
+    with pytest.raises(SenateSweepError, match="unsupported multi-generation"):
         merge_window(d, generation)
+    assert not merged.exists()
     assert _bundle_bytes(d) == source_bytes
-    assert _bundle_bytes(merged) == merged_bytes
+    assert not list(tmp_path.glob(".senate-merge-*"))
 
 
 def test_merge_window_dedupes_and_quarantines_when_chunk_quarantined(tmp_path):
@@ -738,12 +753,14 @@ def test_merge_window_dedupes_and_quarantines_when_chunk_quarantined(tmp_path):
     d.mkdir()
     dup = _inventory_row()
     dup["official_filing_date"] = pd.Timestamp("2024-01-05")
+    dup["ingestion_generation"] = "window-quarantined"
     _synthetic_chunk(
         d,
         "chunk-2024a",
         [dup],
         [],
         (date(2024, 1, 1), date(2024, 12, 31)),
+        generation="window-quarantined",
     )
     _synthetic_chunk(
         d,
@@ -755,6 +772,7 @@ def test_merge_window_dedupes_and_quarantines_when_chunk_quarantined(tmp_path):
             "error": "Senate refresh incomplete",
             "missing": {"unavailable": 1, "failed": 0},
         },
+        generation="window-quarantined",
     )
     generation = "window-quarantined"
     exit_code = merge_window(d, generation)
@@ -767,3 +785,49 @@ def test_merge_window_dedupes_and_quarantines_when_chunk_quarantined(tmp_path):
     from scripts import rebuild_staged
 
     assert rebuild_staged._verify_artifact_files(manifest, merged)["mismatches"] == []
+
+
+@pytest.mark.parametrize("duplicate_kind", ["report", "transaction"])
+def test_merge_window_rejects_conflicting_duplicates_without_mutation(
+    tmp_path, duplicate_kind
+):
+    from scripts.senate_sweep import SenateSweepError, merge_window
+
+    root = tmp_path / "conflicts"
+    root.mkdir()
+    generation = "shared-generation"
+    row = _inventory_row(ingestion_generation=generation)
+    changed = dict(row, accepted_row_count=2)
+    first_tx = {
+        "source_record_id": KATIE_REPORT_ID,
+        "source_row_id": "official:1",
+        "ingestion_generation": generation,
+        "ticker": "JPM",
+    }
+    second_tx = dict(first_tx, ticker="ABC")
+    _synthetic_chunk(
+        root,
+        "chunk-a",
+        [row],
+        [first_tx] if duplicate_kind == "transaction" else [],
+        (date(2024, 1, 1), date(2024, 12, 31)),
+        generation=generation,
+    )
+    _synthetic_chunk(
+        root,
+        "chunk-b",
+        [changed if duplicate_kind == "report" else dict(row)],
+        [second_tx] if duplicate_kind == "transaction" else [],
+        (date(2024, 1, 1), date(2024, 12, 31)),
+        generation=generation,
+    )
+    before = _bundle_bytes(root)
+    message = (
+        "conflicting duplicate Senate report_path"
+        if duplicate_kind == "report"
+        else "conflicting duplicate Senate transaction key"
+    )
+    with pytest.raises(SenateSweepError, match=message):
+        merge_window(root, generation)
+    assert not (tmp_path / generation).exists()
+    assert _bundle_bytes(root) == before

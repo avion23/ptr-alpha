@@ -150,32 +150,133 @@ def test_required_house_scope_matches_production_inputs_not_full_archive():
 
 def test_senate_ingest_rejects_generation_provenance_rewrite(tmp_path):
     from scripts import rebuild_staged
+    from scripts.senate_sweep import verify_canaries
 
+    generation = "manifest-generation"
+    inventory = [
+        {
+            "member": "Katie Britt",
+            "outcome": "parsed",
+            "accepted_row_count": 1,
+            "source_record_id": "britt-report",
+            "official_filing_date": "2026-01-01",
+            "ingestion_generation": generation,
+        },
+        {
+            "member": "Rick Scott",
+            "outcome": "parsed",
+            "accepted_row_count": 12,
+            "source_record_id": "scott-report",
+            "official_filing_date": "2026-01-02",
+            "ingestion_generation": generation,
+        },
+    ]
     (tmp_path / "transactions.jsonl").write_text(
-        json.dumps({"ingestion_generation": "wrong-generation"}) + "\n"
+        "".join(
+            json.dumps({"ingestion_generation": child}) + "\n"
+            for child in ("child-a", "child-b")
+        )
     )
     (tmp_path / "report_inventory.jsonl").write_text(
-        json.dumps(
-            {
-                "ingestion_generation": "manifest-generation",
-                "raw_row_count": 0,
-                "accepted_row_count": 0,
-                "rejected_row_count": 0,
-            }
-        )
-        + "\n"
+        "".join(json.dumps(row) + "\n" for row in inventory)
     )
+    (tmp_path / "chunks.json").write_text("{}\n")
 
     class FakeDatabase:
-        def persist_source_refresh(self, **_kwargs):
-            raise AssertionError("mismatched provenance must fail before persistence")
+        writes = 0
 
-    with pytest.raises(ValueError, match="generation provenance mismatch"):
+        def persist_source_refresh(self, **_kwargs):
+            self.writes += 1
+
+    db = FakeDatabase()
+    with pytest.raises(ValueError, match="unsupported multi-generation"):
         rebuild_staged._ingest_senate(
             tmp_path,
-            {"generation": "manifest-generation"},
-            cast(rebuild_staged.Database, FakeDatabase()),
+            {
+                "generation": generation,
+                "status": "complete",
+                "canary_expect": "exact",
+                "canaries": verify_canaries(inventory),
+            },
+            cast(rebuild_staged.Database, db),
         )
+    assert db.writes == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_mode",
+        "no_gate",
+        "missing_canaries",
+        "missing_passed",
+        "missing_failures",
+        "failed",
+        "fake_pass",
+    ],
+)
+def test_senate_ingest_rejects_missing_or_failed_canary_contract(tmp_path, mutation):
+    from scripts import rebuild_staged
+    from scripts.senate_sweep import verify_canaries
+
+    generation = "manifest-generation"
+    inventory = [
+        {
+            "member": "Katie Britt",
+            "outcome": "parsed",
+            "accepted_row_count": 1,
+            "source_record_id": "britt-report",
+            "official_filing_date": "2026-01-01",
+            "ingestion_generation": generation,
+        },
+        {
+            "member": "Rick Scott",
+            "outcome": "parsed",
+            "accepted_row_count": 12,
+            "source_record_id": "scott-report",
+            "official_filing_date": "2026-01-02",
+            "ingestion_generation": generation,
+        },
+    ]
+    (tmp_path / "report_inventory.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in inventory)
+    )
+    (tmp_path / "transactions.jsonl").write_text(
+        json.dumps({"ingestion_generation": generation}) + "\n"
+    )
+    manifest = {
+        "generation": generation,
+        "status": "complete",
+        "canary_expect": "exact",
+        "canaries": verify_canaries(inventory),
+    }
+    if mutation == "missing_mode":
+        manifest.pop("canary_expect")
+    elif mutation == "no_gate":
+        manifest["canary_expect"] = "none"
+    elif mutation == "missing_canaries":
+        manifest.pop("canaries")
+    elif mutation == "missing_passed":
+        manifest["canaries"].pop("passed")
+    elif mutation == "missing_failures":
+        manifest["canaries"].pop("failures")
+    elif mutation == "failed":
+        manifest["canaries"]["passed"] = False
+    else:
+        manifest["canaries"]["results"] = {}
+
+    class FakeDatabase:
+        writes = 0
+
+        def persist_source_refresh(self, **_kwargs):
+            self.writes += 1
+
+    db = FakeDatabase()
+    with pytest.raises(ValueError, match="canary"):
+        rebuild_staged._ingest_senate(
+            tmp_path, manifest, cast(rebuild_staged.Database, db)
+        )
+    assert db.writes == 0
 
 
 def test_text_only_pass_accepts_only_text_proven_complete_coverage(monkeypatch):

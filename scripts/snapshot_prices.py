@@ -25,7 +25,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shutil
 import sys
+import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -129,7 +132,13 @@ def build_manifest(
     code_files: list[str] | None = None,
     config_files: list[str] | None = None,
 ) -> dict:
-    """Build and persist the staged snapshot artifacts; return the manifest."""
+    """Build and publish one immutable snapshot bundle; return its manifest."""
+    out_dir = Path(out_dir)
+    if os.path.lexists(out_dir):
+        raise FileExistsError(
+            f"snapshot bundle already exists at {out_dir}; completed bundles are "
+            "immutable, so choose a fresh output directory and generation id"
+        )
     end = _snapshot_end_date(end)
     if end < start:
         raise ValueError(f"snapshot end {end} precedes start {start}")
@@ -167,15 +176,6 @@ def build_manifest(
     finally:
         db.close()
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_path = out_dir / "snapshot.json"
-    if rows.empty:
-        prices_long = pd.DataFrame(columns=["ticker", "date", "close"])
-    else:
-        prices_long = rows
-    _write_prices_parquet(prices_long, out_dir / "prices.parquet")
-    save_snapshot(snapshot, snapshot_path)
-
     code_digests, code_hash = hash_files(code_files or CODE_FILES)
     config_digests, config_hash = hash_files(config_files or CONFIG_FILES)
 
@@ -208,8 +208,40 @@ def build_manifest(
             "prices": "prices.parquet",
         },
     }
-    manifest_path = out_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.", dir=out_dir.parent))
+    try:
+        snapshot_path = staging_dir / "snapshot.json"
+        prices_path = staging_dir / "prices.parquet"
+        manifest_path = staging_dir / "manifest.json"
+        if rows.empty:
+            prices_long = pd.DataFrame(columns=["ticker", "date", "close"])
+        else:
+            prices_long = rows
+        _write_prices_parquet(prices_long, prices_path)
+        save_snapshot(snapshot, snapshot_path)
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+
+        # Same-parent rename publishes the complete directory in one step;
+        # competing builders cannot replace the non-empty completed bundle.
+        if os.path.lexists(out_dir):
+            raise FileExistsError(
+                f"snapshot bundle already exists at {out_dir}; completed bundles "
+                "are immutable, so choose a fresh output directory and generation id"
+            )
+        try:
+            os.rename(staging_dir, out_dir)
+        except OSError as exc:
+            if os.path.lexists(out_dir):
+                raise FileExistsError(
+                    f"snapshot bundle already exists at {out_dir}; completed bundles "
+                    "are immutable, so choose a fresh output directory and generation id"
+                ) from exc
+            raise
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
     return manifest
 
 
@@ -234,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=args.out,
             max_staleness_days=args.max_staleness_days,
         )
-    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+    except (ValueError, FileNotFoundError, FileExistsError, RuntimeError) as exc:
         print(f"snapshot failed: {exc}", file=sys.stderr)
         return 1
 

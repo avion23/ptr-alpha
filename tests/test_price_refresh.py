@@ -441,17 +441,44 @@ class SnapshotManifestTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "pyarrow Parquet engine"):
                 self._manifest()
-        self.assertFalse((self.out / "snapshot.json").exists())
+        self.assertFalse(self.out.exists())
+        retry = self._manifest()
+        self.assertEqual(retry["generation"], "gen-test-20240105")
+        self.assertTrue((self.out / "manifest.json").is_file())
 
     def test_data_hash_changes_when_prices_change(self):
         first = self._manifest()
         self._seed(values=[100.0, 101.0, 999.0, 103.0])
-        second = self._manifest()
+        second = self._manifest(
+            generation="gen-test-20240105-r2", out_dir=self.tmp / "staged-r2"
+        )
         self.assertNotEqual(first["data_hash"], second["data_hash"])
 
-    def test_data_hash_is_deterministic(self):
+    def test_completed_bundle_is_immutable_and_retry_uses_new_identity(self):
         first = self._manifest()
-        second = self._manifest()
+        names = ("prices.parquet", "snapshot.json", "manifest.json")
+        original = {name: (self.out / name).read_bytes() for name in names}
+
+        self._seed(values=[100.0, 101.0, 999.0, 103.0])
+        with self.assertRaisesRegex(
+            FileExistsError, "fresh output directory and generation id"
+        ):
+            self._manifest(generation="gen-test-20240105-r2")
+        self.assertEqual(
+            original, {name: (self.out / name).read_bytes() for name in names}
+        )
+
+        retry = self._manifest(
+            generation="gen-test-20240105-r2", out_dir=self.tmp / "staged-r2"
+        )
+        self.assertNotEqual(first["value_hash"], retry["value_hash"])
+        self.assertEqual(
+            original, {name: (self.out / name).read_bytes() for name in names}
+        )
+
+    def test_data_hash_is_deterministic(self):
+        first = self._manifest(out_dir=self.tmp / "same-values-1")
+        second = self._manifest(out_dir=self.tmp / "same-values-2")
         self.assertEqual(first["data_hash"], second["data_hash"])
 
     def test_code_hash_tracks_pipeline_code(self, monkeypatch=None):
@@ -472,8 +499,8 @@ class SnapshotManifestTests(unittest.TestCase):
                 self.db_path,
                 start=date(2024, 1, 2),
                 end=date(2024, 1, 5),
-                generation="g",
-                out_dir=self.out,
+                generation="g-next",
+                out_dir=self.tmp / "code-changed",
                 code_files=["price_source.py", "price_repository.py"],
                 config_files=["pyproject.toml"],
             )
@@ -563,6 +590,16 @@ class SnapshotManifestTests(unittest.TestCase):
             ]
         )
         self.assertEqual(rc, 0)
+        rc_existing = snapshot_prices.main(
+            [
+                "--db", str(self.db_path),
+                "--start", "2024-01-02",
+                "--end", "2024-01-05",
+                "--generation", "gen-test-20240105-retry",
+                "--out", str(self.out),
+            ]
+        )
+        self.assertEqual(rc_existing, 1)
         rc_bad = snapshot_prices.main(
             [
                 "--db", str(self.db_path),
@@ -669,6 +706,10 @@ class DeterminismCanaryTests(unittest.TestCase):
         )
         self.assertEqual(first["data_hash"], second["data_hash"])
         self.assertEqual(first["value_hash"], second["value_hash"])
+        self.assertEqual(
+            (self.tmp / "out1" / "prices.parquet").read_bytes(),
+            (self.tmp / "out2" / "prices.parquet").read_bytes(),
+        )
 
 
 if __name__ == "__main__":

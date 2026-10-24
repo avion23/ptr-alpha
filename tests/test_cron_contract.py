@@ -82,6 +82,16 @@ class CrontabSourceOfTruthTest(TestCase):
 
 
 class WrapperContractTest(TestCase):
+    def test_price_retries_get_unique_refresh_and_snapshot_paths(self):
+        text = (CRON_DIR / "weekly_prices.sh").read_text()
+        self.assertIn('mktemp -d "$log_root/$(date -u +%Y%m%dT%H%M%S)-XXXXXX"', text)
+        self.assertIn('--db "$temp_db"', text)
+        self.assertIn('--generation "prices-cron-$run_id"', text)
+        self.assertIn('--out "$snapshot_dir"', text)
+        # The doctor still sees each flat per-attempt temp DB for freshness.
+        doctor = (ROOT / "scripts" / "doctor.py").read_text()
+        self.assertIn('PRICES_CRON.glob("*/prices.duckdb")', doctor)
+
     def test_every_declared_job_is_a_tracked_executable_wrapper(self):
         for schedule, target in _job_lines():
             with self.subTest(target=target):

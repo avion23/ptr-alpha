@@ -8,15 +8,14 @@ set -Eeuo pipefail
 
 readonly repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly log_root="$repo/data/logs/prices-cron"
-run_date="$(date -u +%Y%m%d)"
-readonly run_date
-readonly run_dir="$log_root/$run_date"
+mkdir -p "$log_root"
+readonly run_dir="$(mktemp -d "$log_root/$(date -u +%Y%m%dT%H%M%S)-XXXXXX")"
+readonly run_id="${run_dir##*/}"
 readonly temp_db="$run_dir/prices.duckdb"
 readonly report="$run_dir/report.json"
 readonly snapshot_dir="$run_dir/snapshot"
 readonly git_sha="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-mkdir -p "$run_dir"
 exec >>"$run_dir/run.log" 2>&1
 
 printf 'prices cron start: %s UTC (repo %s @ %s)\n' \
@@ -28,11 +27,12 @@ prune_runs() {
     local run_name kept=0
 
     mapfile -t run_names < <(
-        find "$log_root" -mindepth 1 -maxdepth 1 -type d -name '????????' -printf '%f\n' |
+        find "$log_root" -mindepth 1 -maxdepth 1 -type d \
+            \( -name '????????' -o -name '????????T??????-??????' \) -printf '%f\n' |
             sort -r
     )
     for run_name in "${run_names[@]}"; do
-        [[ "$run_name" =~ ^[0-9]{8}$ ]] || continue
+        [[ "$run_name" =~ ^([0-9]{8}|[0-9]{8}T[0-9]{6}-[A-Za-z0-9]{6})$ ]] || continue
         ((kept += 1))
         if (( kept > 4 )); then
             printf 'prune: %s\n' "$log_root/$run_name"
@@ -59,7 +59,7 @@ fi
 
 if python3 scripts/snapshot_prices.py \
     --db "$temp_db" \
-    --generation "prices-cron-$run_date" \
+    --generation "prices-cron-$run_id" \
     --out "$snapshot_dir"; then
     printf 'snapshot completed\n'
 else

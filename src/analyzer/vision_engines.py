@@ -15,7 +15,7 @@ Per repo policy the endpoint must not serve OpenAI-operated GPT models; the
 point of engine B is an *independent model family*, and no default points at
 any hosted endpoint.
 
-Decisions, per document (``docs/reviews/extraction-pipeline-fp-20261018.md``):
+Per-document outcomes:
 
 * ``AGREE``  — normalized row multisets identical: rows persist exactly as
   today (Gemini reading, same validation/insert path) under parser_version

@@ -14,6 +14,16 @@ def normal_normal_posteriors(outcomes, groups, *, independent_groups=None) -> pd
     ``groups`` still defines estimator groups (members). Optional
     ``independent_groups`` labels independent date/member units for reporting
     only; they do not alter the estimator or prior.
+
+    Identification: the within-member variance sigma^2 and the between-member
+    variance tau^2 are estimated only from groups carrying more than one
+    observation. When every group is a singleton the rows identify just
+    sigma^2 + tau^2, so this function does not co-fit the split: it warns that
+    the decomposition is UNIDENTIFIED, reports ``within_var``, ``between_var``
+    and ``posterior_std`` as NaN (never a numerical-precision SD presented as
+    uncertainty) and returns the declared full-pooling point estimate
+    (``shrinkage`` 1, ``posterior_mean`` the global mean), which ties every
+    rank.
     """
     values = np.asarray(outcomes, dtype=float)
     labels = np.asarray(groups, dtype=object)
@@ -51,65 +61,89 @@ def normal_normal_posteriors(outcomes, groups, *, independent_groups=None) -> pd
     means = grouped.mean().astype(float)
     global_mean = float(means.mean())
 
-    residuals = frame["outcome"] - frame["group"].map(means)
+    # within_dof == 0 exactly when every member group carries a single
+    # observation. With one draw per group the rows identify only the total
+    # variance sigma^2 + tau^2: every split with that sum has the same
+    # likelihood (and a different conditional posterior), so the two components
+    # must not be co-fitted from these observations. Report them, and the
+    # posterior SD they would produce, as UNIDENTIFIED instead.
     within_dof = len(frame) - len(means)
-    if within_dof > 0:
+    identified = within_dof > 0
+
+    if identified:
+        residuals = frame["outcome"] - frame["group"].map(means)
         within_var = float(np.dot(residuals, residuals) / within_dof)
-    elif len(values) > 1:
-        within_var = float(np.var(values, ddof=1))
+
+        magnitude = max(
+            float(np.max(np.abs(values))),
+            float(np.ptp(values)),
+            np.sqrt(np.finfo(float).tiny),
+        )
+        variance_floor = max(
+            (np.finfo(float).eps * magnitude) ** 2,
+            1.0 / np.finfo(float).max,
+        )
+        within_var = max(within_var, variance_floor)
+
+        observed_between = (
+            float(np.var(means.to_numpy(dtype=float), ddof=1)) if len(means) > 1 else 0.0
+        )
+        mean_sampling_var = float((within_var / counts).mean())
+        moment_between_var = observed_between - mean_sampling_var
+        if moment_between_var <= 0:
+            # The observed spread of group means is fully explained by sampling
+            # noise, so the method-of-moments population variance truncates to the
+            # representability floor and every posterior collapses to the global
+            # mean (shrinkage identically 1). Warn so a downstream ranks table is
+            # read as alphabetical ties, not signal.
+            warnings.warn(
+                "Member between-variance is unresolved: observed spread of member "
+                f"means ({observed_between:.6g}) does not exceed mean sampling "
+                f"noise ({mean_sampling_var:.6g}), so empirical pooling collapses "
+                f"every member to the global mean ({global_mean:.6g}); shrunk "
+                f"ranks tie and fall back to alphabetical order "
+                f"(rows/episodes={len(values)}, member_groups={len(means)}, "
+                f"independent_date_member_groups="
+                f"{_independent_group_count(labels, independent)}).",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif independent is None:
+            # rank_members currently supplies member labels only, so this runtime
+            # report makes its missing independent date/member unit explicit.
+            warnings.warn(
+                "Member posterior report: rows/episodes="
+                f"{len(values)}, member_groups={len(means)}, "
+                "independent_date_member_groups=UNKNOWN (not supplied).",
+                UserWarning,
+                stacklevel=2,
+            )
+        between_var = max(moment_between_var, variance_floor)
+
+        denominator = counts * between_var + within_var
+        shrinkage = within_var / denominator
+        posterior_mean = (1.0 - shrinkage) * means + shrinkage * global_mean
+        posterior_var = shrinkage * between_var
     else:
-        within_var = 0.0
-
-    magnitude = max(
-        float(np.max(np.abs(values))),
-        float(np.ptp(values)),
-        np.sqrt(np.finfo(float).tiny),
-    )
-    variance_floor = max(
-        (np.finfo(float).eps * magnitude) ** 2,
-        1.0 / np.finfo(float).max,
-    )
-    within_var = max(within_var, variance_floor)
-
-    observed_between = (
-        float(np.var(means.to_numpy(dtype=float), ddof=1)) if len(means) > 1 else 0.0
-    )
-    mean_sampling_var = float((within_var / counts).mean())
-    moment_between_var = observed_between - mean_sampling_var
-    if moment_between_var <= 0:
-        # The observed spread of group means is fully explained by sampling
-        # noise, so the method-of-moments population variance truncates to the
-        # representability floor and every posterior collapses to the global
-        # mean (shrinkage identically 1). Warn so a downstream ranks table is
-        # read as alphabetical ties, not signal.
         warnings.warn(
-            "Member between-variance is unresolved: observed spread of member "
-            f"means ({observed_between:.6g}) does not exceed mean sampling "
-            f"noise ({mean_sampling_var:.6g}), so empirical pooling collapses "
-            f"every member to the global mean ({global_mean:.6g}); shrunk "
-            f"ranks tie and fall back to alphabetical order "
-            f"(rows/episodes={len(values)}, member_groups={len(means)}, "
-            f"independent_date_member_groups="
-            f"{_independent_group_count(labels, independent)}).",
+            "Member variance decomposition UNIDENTIFIED: every member group has "
+            f"a single observation (rows/episodes={len(values)}, "
+            f"member_groups={len(means)}, independent_date_member_groups="
+            f"{_independent_group_count(labels, independent)}), so only the "
+            "total variance (sigma^2+tau^2) is identified and the within/between "
+            "split is not co-fitted here: within_var, between_var and "
+            "posterior_std are reported as NaN rather than numerical precision. "
+            f"The point estimate is the declared full-pooling default "
+            f"(shrinkage=1, global_mean={global_mean:.6g}), so shrunk ranks tie "
+            "and fall back to alphabetical order.",
             UserWarning,
             stacklevel=2,
         )
-    elif independent is None:
-        # rank_members currently supplies member labels only, so this runtime
-        # report makes its missing independent date/member unit explicit.
-        warnings.warn(
-            "Member posterior report: rows/episodes="
-            f"{len(values)}, member_groups={len(means)}, "
-            "independent_date_member_groups=UNKNOWN (not supplied).",
-            UserWarning,
-            stacklevel=2,
-        )
-    between_var = max(moment_between_var, variance_floor)
-
-    denominator = counts * between_var + within_var
-    shrinkage = within_var / denominator
-    posterior_mean = (1.0 - shrinkage) * means + shrinkage * global_mean
-    posterior_var = shrinkage * between_var
+        within_var = float("nan")
+        between_var = float("nan")
+        shrinkage = 1.0
+        posterior_mean = global_mean
+        posterior_var = float("nan")
 
     result = pd.DataFrame(
         {

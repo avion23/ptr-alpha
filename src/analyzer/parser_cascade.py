@@ -118,11 +118,12 @@ def _row_coordinate(transaction: dict) -> tuple[str, str] | None:
 def _coordinate_distinct_copies(copies: list[dict]) -> bool:
     """Whether repeated identical rows are genuinely distinct source lots.
 
-    Copies that all live in ONE coordinate system are a parser reporting that
-    many source rows -- identical lots are legitimate and preserved. Copies
-    spread across DIFFERENT coordinate systems of the same engine (pdfplumber's
-    table grid versus its text layout) are the merge-artifact signature of one
-    visual row read twice (document 20006438): they cannot be coordinate-
+    Copies at distinct positions in ONE coordinate system are a parser
+    reporting that many source rows -- identical lots are legitimate and
+    preserved. Copies spread across DIFFERENT coordinate systems of the same
+    engine (pdfplumber's table grid versus its text layout) are the merge-
+    artifact signature of one visual row read twice (document 20006438):
+    they cannot be coordinate-
     distinct and must escalate instead. Unverifiable rows escalate too.
     """
     if len(copies) < 2:
@@ -130,7 +131,10 @@ def _coordinate_distinct_copies(copies: list[dict]) -> bool:
     coordinates = [_row_coordinate(transaction) for transaction in copies]
     if any(coordinate is None for coordinate in coordinates):
         return False
-    return len({system for system, _ in coordinates}) == 1
+    return (
+        len({system for system, _ in coordinates}) == 1
+        and len(set(coordinates)) == len(coordinates)
+    )
 
 
 def _multiplicity_expansion_is_genuine(

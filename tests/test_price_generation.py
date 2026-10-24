@@ -258,3 +258,133 @@ def test_missing_action_factor_blocks_with_explicit_unknown_reason(tmp_path: Pat
         assert blocked.iloc[0].reason == event.blocked_reason
     finally:
         db.close()
+
+
+def test_batched_generation_evidence_preserves_exact_stored_identity(tmp_path):
+    from analyzer.price_source import price_generation_basis_map, price_generation_states
+
+    db = Database(tmp_path / "case-identity.duckdb")
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    old = pd.Series([100.0, 101.0], index=dates)
+    factors = pd.Series(0.5, index=dates)
+    try:
+        db.upsert_prices(pd.DataFrame({"AAA": old}))
+        _store_generation(db, "AAA", "old-AAA", old, factors, "old-basis")
+        _set_generation_state(db, "AAA", "old-AAA", "comparable")
+        # SQL identities are case/whitespace sensitive, even on legacy schemas.
+        for ticker in ("aaa", " AAA "):
+            _store_generation(db, ticker, "old-AAA", old, factors, "wrong-basis")
+            _set_generation_state(db, ticker, "wrong-generation", "unknown")
+        assert set(price_generation_states(db)) == {"AAA", "aaa", " AAA "}
+        assert price_generation_basis_map(db)[("AAA", "old-AAA")] == "old-basis"
+        _, states = _merge_price_generation(
+            db, pd.DataFrame({"AAA": [50.0, 51.0]}, index=dates),
+            pd.DataFrame(), "new-basis", persist=True, cached_prices=pd.DataFrame(),
+        )
+        assert states["AAA"]["generation_id"] == "old-AAA"
+        assert price_generation_state(db, " aaa ")["generation_id"] == "old-AAA"
+        assert db.conn.execute(
+            "SELECT basis FROM price_generations WHERE ticker='AAA' AND generation='old-AAA'"
+        ).fetchone() == ("old-basis",)
+        assert db.conn.execute(
+            "SELECT count(*) FROM price_generations WHERE ticker='AAA' AND generation='wrong-generation'"
+        ).fetchone() == (0,)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("outer_transaction", [False, True])
+def test_merge_generation_failure_retains_per_ticker_write_order(tmp_path, outer_transaction):
+    db = Database(tmp_path / "failure-order.duckdb")
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    try:
+        old = pd.DataFrame({"AAA": [100.0, 101.0], "BBB": [200.0, 201.0]}, index=dates)
+        db.upsert_prices(old)
+        ensure_price_generation_schema(db)
+        db.conn.execute("DROP TABLE price_generation_values")
+        db.conn.execute(
+            "CREATE TABLE price_generation_values (ticker VARCHAR, generation VARCHAR, "
+            "date DATE, close DOUBLE, adjustment_factor DOUBLE CHECK (adjustment_factor <= 1), "
+            "basis VARCHAR, PRIMARY KEY(ticker,generation,date))"
+        )
+        for ticker in old:
+            _set_generation_state(db, ticker, "old-" + ticker, "comparable")
+        if outer_transaction:
+            db.conn.execute("BEGIN")
+        incoming_dates = pd.to_datetime(["2024-01-03", "2024-01-04"])
+        with pytest.raises(duckdb.ConstraintException):
+            _merge_price_generation(
+                db, pd.DataFrame({"AAA": [101.0, 102.0], "BBB": [201.0, 202.0],
+                                  "CCC": [50.0, 51.0]}, index=incoming_dates),
+                pd.DataFrame({"AAA": [0.5, 0.5], "BBB": [2.0, 2.0],
+                              "CCC": [0.5, 0.5]}, index=incoming_dates),
+                "new-basis", persist=True, cached_prices=pd.DataFrame(),
+            )
+        if outer_transaction:
+            db.conn.execute("ROLLBACK")
+            assert db.conn.execute("SELECT count(*) FROM prices").fetchone() == (4,)
+            assert db.conn.execute("SELECT count(*) FROM price_generations").fetchone() == (0,)
+            assert db.conn.execute(
+                "SELECT served_generation FROM price_generation_state WHERE ticker='AAA'"
+            ).fetchone() == ("old-AAA",)
+        else:
+            assert db.conn.execute(
+                "SELECT ticker, close FROM prices WHERE date='2024-01-04' ORDER BY ticker"
+            ).fetchall() == [("AAA", 102.0), ("BBB", 202.0)]
+            assert db.conn.execute(
+                "SELECT DISTINCT ticker FROM price_generation_values ORDER BY ticker"
+            ).fetchall() == [("AAA",)]
+            states = dict(db.conn.execute(
+                "SELECT ticker, served_generation FROM price_generation_state"
+            ).fetchall())
+            assert states["AAA"].startswith("yahoo:")
+            assert states["BBB"] == "old-BBB"
+            assert db.conn.execute(
+                "SELECT ticker FROM price_generations ORDER BY ticker"
+            ).fetchall() == [("AAA",), ("BBB",)]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_canonical_merge_coerces_legacy_text_factors(tmp_path, conflict):
+    from analyzer.price_source import price_generation_factors
+    from scripts.refresh_prices import merge_temp_into_canonical
+
+    canonical = tmp_path / "text-factors.duckdb"
+    source = tmp_path / "source.duckdb"
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    db = Database(canonical)
+    try:
+        old = pd.Series([100.0, 101.0], index=dates)
+        db.upsert_prices(pd.DataFrame({"AAA": old}))
+        _store_generation(db, "AAA", "old-AAA", old, old * 0.005, "old-basis")
+        _set_generation_state(db, "AAA", "old-AAA", "comparable")
+        db.conn.execute("ALTER TABLE price_generation_values ALTER adjustment_factor TYPE VARCHAR")
+        db.conn.execute("UPDATE price_generation_values SET adjustment_factor='unknown'")
+        assert price_generation_factors(db, {"AAA": "old-AAA"})["AAA"].isna().all()
+    finally:
+        db.close()
+    db = Database(source)
+    try:
+        db.upsert_prices(pd.DataFrame(
+            {"AAA": [50.0 if conflict else 101.0, 102.0]},
+            index=pd.to_datetime(["2024-01-03", "2024-01-04"]),
+        ))
+    finally:
+        db.close()
+    stats = merge_temp_into_canonical(source, canonical, ["AAA"])
+    assert stats["prices_added"] == (0 if conflict else 1)
+    db = Database(canonical, read_only=True)
+    try:
+        state = price_generation_state(db, "AAA")
+        assert state["comparability_status"] == ("unknown" if conflict else "comparable")
+        if conflict:
+            assert state["generation_id"] == "old-AAA"
+        assert db.conn.execute(
+            "SELECT adjustment_factor FROM price_generation_values "
+            "WHERE ticker='AAA' AND generation=? AND date='2024-01-02'",
+            [state["generation_id"]],
+        ).fetchone() == (None,)
+    finally:
+        db.close()

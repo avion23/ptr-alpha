@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from functools import lru_cache
 
 import duckdb
@@ -24,6 +24,30 @@ from analyzer.ticker_resolver import TickerResolver
 
 
 logger = logging.getLogger(__name__)
+
+
+def ex_dividend_map(db, symbols: list[str], as_of_date) -> dict | None:
+    """Known ex-dates per ticker inside the 7-day contamination window.
+
+    Accept a database wrapper or connection. An unavailable dividends table
+    is None, distinct from an available table with no matching ex-dates;
+    receipts record that source state explicitly.
+    """
+    if not symbols:
+        return {}
+    try:
+        connection = getattr(db, "conn", db)
+        rows = connection.execute(
+            "SELECT ticker, ex_date FROM dividends "
+            "WHERE ticker = ANY(?) AND ex_date > ? AND ex_date <= ?",
+            [symbols, as_of_date - timedelta(days=7), as_of_date],
+        ).fetchall()
+    except Exception:
+        return None
+    out: dict[str, list] = {}
+    for ticker, ex_date in rows:
+        out.setdefault(str(ticker).strip().upper(), []).append(ex_date)
+    return out
 
 
 def _nyse_new_year_observance(day: pd.Timestamp) -> pd.Timestamp | None:

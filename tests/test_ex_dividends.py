@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 from analyzer.setups import score
 
@@ -186,5 +187,51 @@ def test_cli_ex_div_map_returns_window_only():
     try:
         mapping = _ex_div_map(db, ["AAPL", "MSFT"], date(2024, 6, 1))
         assert mapping == {"AAPL": [date(2024, 5, 28)]}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("source_state", ["in_window", "outside_window", "empty", "unavailable"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_replay_and_live_ex_div_gate_match_real_database(source_state, wrapped):
+    import duckdb
+
+    from analyzer import replay, setups
+    from analyzer.cli import _ex_div_map
+
+    conn = duckdb.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE prices (ticker VARCHAR, date DATE, close DOUBLE)")
+        conn.execute("INSERT INTO prices VALUES ('AAPL', ?, 100.0)", [AS_OF])
+        if source_state != "unavailable":
+            conn.execute("CREATE TABLE dividends (ticker VARCHAR, ex_date DATE, cash_amount DOUBLE)")
+            if source_state in {"in_window", "outside_window"}:
+                ex_date = date(2024, 5, 28) if source_state == "in_window" else date(2024, 5, 25)
+                conn.execute("INSERT INTO dividends VALUES ('AAPL', ?, 0.24)", [ex_date])
+            # A future event must never contaminate this historical decision.
+            conn.execute("INSERT INTO dividends VALUES ('AAPL', '2024-06-02', 0.24)")
+        db = SimpleNamespace(conn=conn) if wrapped else conn
+        candidates = pd.DataFrame([_row()])
+        weights = {"congress:PELOSI": 1.0}
+        actors = SimpleNamespace(weights_for_candidates=lambda *_: weights)
+        mapping = _ex_div_map(SimpleNamespace(conn=conn), ["AAPL"], AS_OF)
+        assert mapping == (
+            None if source_state == "unavailable" else
+            {"AAPL": [date(2024, 5, 28)]} if source_state == "in_window" else {}
+        )
+        live_ranked, live_blocked = setups.score(
+            candidates, weights, {"AAPL": (100.0, AS_OF)}, ex_dividends=mapping
+        )
+        value, blocked, actor_count, reason = replay._score(
+            db, "AAPL", AS_OF, candidates, actors, setups
+        )
+        assert actor_count == 1
+        assert blocked == live_ranked.empty
+        if source_state == "in_window":
+            assert value is None
+            assert reason == live_blocked.iloc[0]["reason"] == "ex-div window (ex 2024-05-28)"
+        else:
+            assert value == live_ranked.iloc[0]["score"]
+            assert reason is None
     finally:
         conn.close()

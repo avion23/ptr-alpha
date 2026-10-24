@@ -3,7 +3,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from analyzer.setups import score
+from analyzer.setups import is_ranked, score
 
 
 AS_OF = date(2024, 6, 1)
@@ -36,6 +36,27 @@ def _row(
         "shares_held": shares_held,
         "as_of": AS_OF,
     }
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_score_never_ranks(value):
+    assert not is_ranked(value, 1)
+    assert not is_ranked(value, 2, corroborated=True)
+
+
+def test_finite_contributions_overflowing_the_sum_do_not_rank():
+    candidates = pd.DataFrame(
+        [_row(actor_id=actor, position_evidence=True) for actor in ("congress:A", "congress:B")]
+    )
+    ranked, blocked = score(
+        candidates,
+        {"congress:A": 1e308, "congress:B": 1e308},
+        {"AAPL": (100.0, AS_OF)},
+        enable_13f_corroboration=False,
+    )
+
+    assert ranked.empty
+    assert blocked["reason"].tolist() == ["non-finite setup score"] * 2
 
 
 def test_two_actors_outscore_one_and_corroboration_is_bounded():
@@ -144,6 +165,132 @@ def test_missing_weight_defaults_to_zero():
 
     assert ranked.empty
     assert blocked.iloc[0]["reason"] == "no actor weight"
+
+
+def test_preblocked_positive_entry_does_not_initiate_or_contaminate_other_rows():
+    blocked_a = _row(
+        actor_id="congress:A",
+        ticker="AAPL",
+        entry_ref=100.0,
+        position_evidence=True,
+    )
+    blocked_a["blocked_reason"] = "upstream row restriction"
+    usable_a = _row(
+        actor_id="congress:A",
+        ticker="AAPL",
+        entry_ref=120.0,
+        position_evidence=True,
+    )
+    usable_b = _row(
+        actor_id="congress:B",
+        ticker="AAPL",
+        entry_ref=100.0,
+        position_evidence=True,
+    )
+    blocked_msft = _row(
+        actor_id="congress:C",
+        ticker="MSFT",
+        entry_ref=100.0,
+        position_evidence=True,
+    )
+    blocked_msft["blocked_reason"] = "MSFT source restriction"
+    audit = {}
+
+    ranked, blocked = score(
+        pd.DataFrame([blocked_a, usable_a, usable_b, blocked_msft]),
+        {"congress:A": 0.6, "congress:B": 0.6, "congress:C": 1.0},
+        {"AAPL": 100.0, "MSFT": None},
+        audit=audit,
+    )
+
+    assert ranked["ticker"].tolist() == ["AAPL"]
+    row = ranked.iloc[0]
+    assert row["score"] == pytest.approx(1.2)
+    assert row["actors"] == ["congress:A", "congress:B"]
+    assert audit["AAPL"]["members"] == [
+        {
+            "member": "congress:A",
+            "entry_ref": 120.0,
+            "weight": 0.6,
+            "contribution": 0.6,
+        },
+        {
+            "member": "congress:B",
+            "entry_ref": 100.0,
+            "weight": 0.6,
+            "contribution": 0.6,
+        },
+    ]
+    assert blocked.set_index("ticker").loc["MSFT", "reason"] == (
+        "MSFT source restriction"
+    )
+
+
+def test_preblocked_fresh_entry_does_not_refresh_usable_evidence_freshness():
+    stale = _row(
+        actor_id="congress:A",
+        disclosure_date=date(2024, 1, 1),
+        position_evidence=True,
+    )
+    fresh_blocked = _row(
+        actor_id="congress:A",
+        disclosure_date=date(2024, 5, 30),
+        position_evidence=False,
+    )
+    fresh_blocked["blocked_reason"] = "upstream row restriction"
+
+    ranked, _ = score(
+        pd.DataFrame([stale, fresh_blocked]),
+        {"congress:A": 1.0},
+        {"AAPL": (100.0, AS_OF)},
+    )
+
+    assert len(ranked) == 1
+    assert ranked.iloc[0]["min_disclosure_lag_days"] == 152
+    assert not ranked.iloc[0]["has_fresh_evidence"]
+
+
+@pytest.mark.parametrize("reason", [None, float("nan"), "", "   "])
+def test_empty_block_reason_does_not_block_a_usable_entry(reason):
+    candidate = _row(position_evidence=True)
+    candidate["blocked_reason"] = reason
+
+    ranked, blocked = score(
+        pd.DataFrame([candidate]), {"congress:PELOSI": 1.0}, {"AAPL": 100.0}
+    )
+
+    assert ranked["ticker"].tolist() == ["AAPL"]
+    assert blocked.empty
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_preblocked_positive_held_13f_never_corroborates(enabled):
+    officer = _row(
+        actor_id="officer:CEO",
+        source="form4",
+        position_evidence=True,
+    )
+    manager = _row(
+        actor_id="manager:FUND A",
+        source="13f",
+        corroboration=True,
+        holding_state="held",
+        shares_held=100,
+    )
+    manager["blocked_reason"] = "upstream 13F restriction"
+
+    ranked, blocked = score(
+        pd.DataFrame([officer, manager]),
+        {"officer:CEO": 0.6},
+        {"AAPL": 100.0},
+        watchlist={"manager:FUND A"},
+        enable_13f_corroboration=enabled,
+    )
+
+    assert ranked.empty
+    assert blocked.set_index("actor_id").loc[
+        "officer:CEO", "reason"
+    ] == "score below ranking floor (1.00)"
 
 
 def test_zero_weight_actor_does_not_corroborate_or_count():

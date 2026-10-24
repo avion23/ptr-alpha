@@ -73,7 +73,12 @@ def gate_closed_events(
     enable_13f_corroboration = _13f_enabled(enable_13f_corroboration)
 
     gated = events.copy()
-    gated["blocked_reason"] = None
+    if "blocked_reason" not in gated:
+        gated["blocked_reason"] = None
+    gated["blocked_reason"] = gated["blocked_reason"].astype(object)
+    missing_reason = gated["blocked_reason"].map(
+        lambda value: not isinstance(value, str) or not value.strip()
+    )
     open_positions = {}
     if {"ticker", "actor_id", "position_evidence"}.issubset(candidates.columns):
         open_rows = candidates.loc[candidates["position_evidence"].eq(True)]
@@ -131,10 +136,13 @@ def gate_closed_events(
     if any(stale):
         mask = pd.Series(stale, index=gated.index)
         gated.loc[mask, "entry_ref"] = None
-        gated.loc[mask, "blocked_reason"] = "no open position at as_of"
+        fill_reason = mask & missing_reason
+        gated.loc[fill_reason, "blocked_reason"] = (
+            "no open position at as_of"
+        )
         if enable_13f_corroboration:
             unavailable = mask & gated.get("source", pd.Series(index=gated.index)).eq("13f")
-            gated.loc[unavailable, "blocked_reason"] = (
+            gated.loc[unavailable & missing_reason, "blocked_reason"] = (
                 "corroboration unavailable: no current 13F share snapshot"
             )
     if enable_13f_corroboration and "source" in gated:
@@ -481,6 +489,8 @@ def build_positions(
     with a close column. Returns one row per open position with cost basis,
     current price, and discount_pct (negative = below member cost).
     """
+    from analyzer.member_ranking.buyer_scoring import _equity_transaction_fields
+
     required = {
         "member",
         "ticker",
@@ -596,7 +606,7 @@ def build_positions(
     # identity, so skipping it cannot reorder anything.
     tie_columns = dict.fromkeys(
         ("transaction_date", "disclosure_date", "source", "source_record_id",
-         "source_row_id", "owner_code", *_LOADER_COLUMNS)
+         "source_row_id", "owner_code", *_FIFO_LOADER_COLUMNS)
     )
     if presorted:
         ordered = trades.loc[known]
@@ -646,6 +656,13 @@ def build_positions(
     description_cells = _column("asset_description") if has_description else None
     record_id_cells = _column("source_record_id") if has_record_id else None
     row_id_cells = _column("source_row_id") if has_row_id else None
+    origin_cells = _column("ticker_origin") if "ticker_origin" in ordered else None
+    raw_class_cells = _column("raw_asset_class") if "raw_asset_class" in ordered else None
+    raw_description_cells = (
+        _column("raw_asset_description")
+        if "raw_asset_description" in ordered
+        else None
+    )
 
     # Pure per-row derivations repeat across rows; cache them per call.
     _DAY_MISS = object()
@@ -653,6 +670,39 @@ def build_positions(
     disclosure_day_cache: dict = {}
 
     for i in range(len(ordered)):
+        if not _equity_transaction_fields(
+            origin_cells[i] if origin_cells is not None else None,
+            source_cells[i] if source_cells is not None else None,
+            raw_class_cells[i] if raw_class_cells is not None else None,
+            description_cells[i] if description_cells is not None else None,
+            raw_description_cells[i] if raw_description_cells is not None else None,
+            instrument_cells[i] if instrument_cells is not None else None,
+        ):
+            # Keep the existing option diagnostic even though the shared
+            # equity guard now rejects those rows before the FIFO checks.
+            option_instrument = (
+                instrument_cells[i] if instrument_cells is not None else None
+            )
+            option_description = (
+                description_cells[i] if description_cells is not None else None
+            )
+            if (
+                not pd.isna(member_cells[i])
+                and not pd.isna(ticker_cells[i])
+                and not (
+                    isinstance(option_instrument, str)
+                    and option_instrument.lower() == "private"
+                )
+                and _extract_instrument_type(
+                    option_description
+                    if isinstance(option_description, str)
+                    else None
+                )
+                != "private"
+                and _is_option_row(option_description, option_instrument)
+            ):
+                skipped_options += 1
+            continue
         member_value = member_cells[i]
         ticker_value = ticker_cells[i]
         if pd.isna(member_value) or pd.isna(ticker_value):
@@ -1138,7 +1188,7 @@ def holdings_candidates_batch(
         # per-member re-sorts become identities and are skipped.
         _tie_columns = dict.fromkeys(
             ("transaction_date", "disclosure_date", "source", "source_record_id",
-             "source_row_id", "owner_code", *_LOADER_COLUMNS)
+             "source_row_id", "owner_code", *_FIFO_LOADER_COLUMNS)
         )
         canonical = canonical.sort_values(
             [column for column in _tie_columns if column in canonical],
@@ -1700,7 +1750,7 @@ def _distinct_member_names(db) -> list:
     return [row[0] for row in names]
 
 
-_LOADER_COLUMNS = (
+_FIFO_LOADER_COLUMNS = (
     "member",
     "ticker",
     "transaction_type",
@@ -1717,6 +1767,12 @@ _LOADER_COLUMNS = (
     "source_row_id",
     "amends_source_record_id",
 )
+_EQUITY_CLASS_COLUMNS = (
+    "ticker_origin",
+    "raw_asset_class",
+    "raw_asset_description",
+)
+_LOADER_COLUMNS = (*_FIFO_LOADER_COLUMNS, *_EQUITY_CLASS_COLUMNS)
 
 
 def _loader_select(db, table: str) -> str:

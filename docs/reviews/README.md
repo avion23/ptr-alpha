@@ -1,8 +1,8 @@
-# Archived adversarial reviews
+# Raw review artifacts
 
-Files in this directory are **historical review evidence**, not current product documentation.
+Raw artifacts in this directory are **historical review evidence**, not current product documentation. Narrative review/report documents are not retained or committed.
 
-They preserve prompts, model responses, verification notes, and byte-exact artifacts from earlier review runs. Their code excerpts, test counts, line numbers, and recommendations may be obsolete.
+They preserve prompts, model responses, test outputs, and byte-exact artifacts from earlier review runs. Their code excerpts, test counts, line numbers, and recommendations may be obsolete. Endpoint specifications are retained separately from narrative reports.
 
 For current behavior use, in order:
 

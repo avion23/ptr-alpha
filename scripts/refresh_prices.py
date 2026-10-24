@@ -413,6 +413,50 @@ def refresh_prices(
     )
 
 
+def _price_series(rows: pd.DataFrame) -> pd.Series:
+    """One ticker's close series from its (ticker, date)-ordered rows."""
+    return pd.Series(
+        rows.close.to_numpy(dtype=float), index=pd.to_datetime(rows.date)
+    )
+
+
+_NO_PRICE_ROWS = pd.DataFrame(
+    {
+        "ticker": pd.Series(dtype=object),
+        "date": pd.Series(dtype="datetime64[ns]"),
+        "close": pd.Series(dtype=float),
+    }
+)
+
+
+def _merged_prices(old: pd.Series, new: pd.Series) -> pd.Series:
+    """Canonical history once this ticker's missing source rows are inserted.
+
+    The merge only inserts source rows whose (ticker, date) key is absent from
+    canonical, so the post-insert history is exactly the canonical series plus
+    the source dates it lacks. Computed from the already-loaded frames instead
+    of re-reading the table per ticker.
+    """
+    added = new[~new.index.isin(old.index)]
+    if added.empty:
+        return old
+    return pd.concat([old, added]).sort_index()
+
+
+def _source_factor_series(rows: pd.DataFrame | None, index) -> pd.Series:
+    """Source adjustment factors aligned onto one ticker's price index.
+
+    Mirrors the per-ticker read: stored rows reindexed onto the index, or an
+    all-NaN series when the ticker has no (ticker, generation) factor rows.
+    """
+    if rows is None or rows.empty:
+        return pd.Series(np.nan, index=index, dtype=float)
+    known = pd.Series(
+        rows.adjustment_factor.to_numpy(), index=pd.to_datetime(rows.date)
+    )
+    return pd.to_numeric(known, errors="coerce").reindex(index)
+
+
 def merge_temp_into_canonical(
     temp_db: Path,
     canonical_db: Path,
@@ -430,13 +474,15 @@ def merge_temp_into_canonical(
     """
     from analyzer.database import Database
     from analyzer.price_source import (
-        _set_generation_state,
-        _store_generation,
+        _set_generation_states,
+        _store_generations,
         canonical_price_hash,
         ensure_price_generation_schema,
-        price_generation_state,
-        price_generation_basis,
-        _all_ticker_values,
+        legacy_price_generation_state,
+        price_generation_basis_map,
+        price_generation_factors,
+        price_generation_schema_exists,
+        price_generation_states,
     )
 
     canonical_db = Path(canonical_db)
@@ -490,47 +536,53 @@ def merge_temp_into_canonical(
                 conflicts = {}
                 unresolved = {}
                 old_series = {}
-                old_factors = {}
                 source_series = {}
-                source_factors = {}
                 source_generations = {}
                 tickers = sorted(source_prices.ticker.unique()) if not source_prices.empty else []
+                # Partition once: both frames arrive ticker/date ordered, so a
+                # single groupby yields every ticker's contiguous rows. The
+                # previous per-ticker masks re-scanned both complete frames for
+                # every ticker (O(T*N) work over data already loaded).
+                source_groups = {
+                    k: g for k, g in source_prices.groupby("ticker", sort=False)
+                }
+                canonical_groups = {
+                    k: g for k, g in canonical_prices.groupby("ticker", sort=False)
+                }
+                source_series = {t: _price_series(source_groups[t]) for t in tickers}
+                old_series = {
+                    t: _price_series(canonical_groups.get(t, _NO_PRICE_ROWS))
+                    for t in tickers
+                }
+                # Generation evidence for the whole batch: one schema check and
+                # one state query instead of per-ticker state lookups and
+                # canonical-history reloads.
+                schema_ready = price_generation_schema_exists(canon)
+                state_rows = price_generation_states(canon, schema_exists=schema_ready)
+                old_states = {}
+                legacy_tickers = set()
                 for ticker in tickers:
-                    new_rows = source_prices[source_prices.ticker == ticker]
-                    new = pd.Series(
-                        new_rows.close.to_numpy(dtype=float),
-                        index=pd.to_datetime(new_rows.date),
-                    )
-                    old_rows = canonical_prices[canonical_prices.ticker == ticker]
-                    old = pd.Series(
-                        old_rows.close.to_numpy(dtype=float),
-                        index=pd.to_datetime(old_rows.date),
-                    )
-                    old_series[ticker] = old
-                    old_state = price_generation_state(canon, ticker)
-                    old_factors[ticker] = _all_ticker_values(canon, ticker)[1]
+                    state = state_rows.get(str(ticker).strip().upper())
+                    if state is None:
+                        legacy_tickers.add(ticker)
+                        state = legacy_price_generation_state(
+                            ticker, old_series[ticker]
+                        )
+                    old_states[ticker] = state
+
+                for ticker in tickers:
+                    new = source_series[ticker]
+                    old = old_series[ticker]
+                    old_state = old_states[ticker]
                     overlap = old.index.intersection(new.index)
                     rel = (old.reindex(overlap) - new.reindex(overlap)).abs() / new.reindex(overlap).abs().replace(0, float("nan"))
                     bad = rel > 0.001
                     source_state = source_states.get(ticker)
                     source_generation = source_state[0] if source_state else None
                     source_status = source_state[1] if source_state else "comparable"
-                    if source_has_values and source_generation:
-                        action_rows = con.execute(
-                            "SELECT date,adjustment_factor FROM merge_src.price_generation_values "
-                            "WHERE ticker=? AND generation=?", [ticker, source_generation]
-                        ).fetchdf()
-                        factors = pd.Series(np.nan, index=new.index, dtype=float)
-                        if not action_rows.empty:
-                            action_rows.index = pd.to_datetime(action_rows.date)
-                            factors = pd.to_numeric(action_rows.adjustment_factor, errors="coerce").reindex(new.index)
-                    else:
-                        factors = pd.Series(np.nan, index=new.index, dtype=float)
                     if source_generation is None:
                         seed = canonical_price_hash(ticker, new, "refresh-unverified", "refresh")
                         source_generation = f"refresh:{seed[:24]}"
-                    source_series[ticker] = new
-                    source_factors[ticker] = factors
                     source_generations[ticker] = source_generation
                     if source_status != "comparable":
                         unresolved[ticker] = source_state[2] or "price comparability unknown: source generation is mixed"
@@ -591,6 +643,82 @@ def merge_temp_into_canonical(
                         """
                     )
                 if not dry_run:
+                    # Factors feed only these writes, so they are batched here
+                    # instead of read per ticker: skip tickers keep the
+                    # pre-insert generation, merged tickers need the generation
+                    # their post-insert history would be read under.
+                    skip_set = set(skip_tickers)
+                    wanted_factors = {}
+                    merged_series = {}
+                    for ticker in tickers:
+                        generation = old_states[ticker].get("generation_id")
+                        if ticker not in skip_set:
+                            merged = _merged_prices(
+                                old_series[ticker], source_series[ticker]
+                            )
+                            merged_series[ticker] = merged
+                            if ticker in legacy_tickers:
+                                generation = legacy_price_generation_state(
+                                    ticker, merged
+                                ).get("generation_id")
+                        if generation:
+                            wanted_factors[ticker] = generation
+                    old_factors = {t: pd.Series(dtype=float) for t in tickers}
+                    old_factors.update(
+                        price_generation_factors(
+                            canon, wanted_factors, schema_exists=schema_ready
+                        )
+                    )
+                    source_wanted = {
+                        t: source_states[t][0]
+                        for t in tickers
+                        if source_has_values
+                        and source_states.get(t)
+                        and source_states[t][0]
+                    }
+                    source_factor_rows = None
+                    if source_wanted:
+                        # One batched read for every (ticker, generation) pair
+                        # the per-ticker loop used to query individually.
+                        con.execute(
+                            "CREATE OR REPLACE TEMP TABLE _merge_want_values "
+                            "(ticker VARCHAR, generation VARCHAR)"
+                        )
+                        con.executemany(
+                            "INSERT INTO _merge_want_values VALUES (?,?)",
+                            sorted(source_wanted.items()),
+                        )
+                        source_factor_rows = con.execute(
+                            "SELECT v.ticker, v.date, v.adjustment_factor "
+                            "FROM merge_src.price_generation_values v "
+                            "JOIN _merge_want_values w "
+                            "ON w.ticker = v.ticker AND w.generation = v.generation"
+                        ).fetchdf()
+                    source_factor_groups = (
+                        {
+                            k: g
+                            for k, g in source_factor_rows.groupby(
+                                "ticker", sort=False
+                            )
+                        }
+                        if source_factor_rows is not None
+                        and not source_factor_rows.empty
+                        else {}
+                    )
+                    source_factors = {
+                        t: _source_factor_series(
+                            source_factor_groups.get(t), source_series[t].index
+                        )
+                        for t in tickers
+                    }
+                    bases = price_generation_basis_map(
+                        canon, schema_exists=schema_ready
+                    )
+                    # The same writes the per-ticker calls performed, collected
+                    # in loop order and flushed once: identical rows, a
+                    # constant number of statements instead of O(T).
+                    generation_writes = []
+                    state_writes = []
                     for ticker in tickers:
                         incoming = source_series[ticker]
                         generation = source_generations[ticker]
@@ -598,35 +726,52 @@ def merge_temp_into_canonical(
                             old = old_series[ticker]
                             base_generation = (
                                 conflicts.get(ticker, {}).get("base_generation")
-                                or price_generation_state(canon, ticker).get("generation_id")
+                                or old_states[ticker].get("generation_id")
                             )
                             if not old.empty and base_generation:
-                                _store_generation(
-                                    canon, ticker, base_generation, old,
-                                    old_factors[ticker],
-                                    price_generation_basis(canon, ticker, base_generation),
+                                generation_writes.append(
+                                    (
+                                        ticker, base_generation, old,
+                                        old_factors[ticker],
+                                        bases.get(
+                                            (
+                                                str(ticker).strip().upper(),
+                                                str(base_generation),
+                                            ),
+                                            "legacy-unverified",
+                                        ),
+                                    )
                                 )
-                            _store_generation(
-                                canon, ticker, generation, incoming,
-                                source_factors[ticker], "yfinance-adjusted-close-v1",
+                            generation_writes.append(
+                                (
+                                    ticker, generation, incoming,
+                                    source_factors[ticker],
+                                    "yfinance-adjusted-close-v1",
+                                )
                             )
                             why = (
                                 f"price comparability unknown: {conflicts[ticker]['rows']} "
                                 f"overlaps exceed 0.1% (max {conflicts[ticker]['max']:.5%})"
                                 if ticker in conflicts else unresolved[ticker]
                             )
-                            _set_generation_state(
-                                canon, ticker, base_generation, "unknown", generation, why
+                            state_writes.append(
+                                (ticker, base_generation, "unknown", generation, why)
                             )
                             continue
-                        merged, factors = _all_ticker_values(canon, ticker)
-                        factors = factors.reindex(merged.index)
+                        merged = merged_series[ticker]
+                        factors = old_factors[ticker].reindex(merged.index)
                         factors.update(source_factors[ticker])
-                        _store_generation(
-                            canon, ticker, generation, merged, factors,
-                            "yfinance-adjusted-close-v1",
+                        generation_writes.append(
+                            (
+                                ticker, generation, merged, factors,
+                                "yfinance-adjusted-close-v1",
+                            )
                         )
-                        _set_generation_state(canon, ticker, generation, "comparable")
+                        state_writes.append(
+                            (ticker, generation, "comparable", None, None)
+                        )
+                    _store_generations(canon, generation_writes)
+                    _set_generation_states(canon, state_writes)
                 has_div = con.execute(
                     "SELECT COUNT(*) FROM duckdb_tables() "
                     "WHERE database_name='merge_src' AND table_name='dividends'"

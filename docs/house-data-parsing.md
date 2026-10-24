@@ -128,6 +128,20 @@ For reparses, `preserve_existing_fields()` can carry forward an existing ticker 
 
 `raw_row_count` is the number of parser candidates before consolidation. It is no longer a hard-coded zero.
 
+### Canonical producer priority
+
+After existing artifact selection and source-family admission checks, an
+accepted Gemini transaction rowset takes priority over House rows for the same
+known document, artifact hash, and generation. Its complete rowset is selected;
+the two producers are not merged, and repeated Gemini occurrences are retained.
+Raw observations and parse history remain stored. Failed, unaccepted, empty, or
+unbound Gemini results do not gain priority. This rule does not relax OCR gates
+or establish that Gemini extracted every transaction correctly.
+
+Past-date recomputations apply this current preference with the existing
+availability cutoffs. They are counterfactuals, not replacements for published
+historical receipts.
+
 ## Cheap parsing vs expensive parsing
 
 The useful operational distinction is cost, not parser prestige.
@@ -210,4 +224,4 @@ ORDER BY disclosure_date, doc_id;
 
 A parser success means the accepted cascade produced rows that survived normalization and were persisted consistently. It does **not** prove that the filing had no omitted rows or that every ticker/amount/owner field is semantically correct.
 
-The canonical risk register is [`house-ingestion-error-catalog.md`](house-ingestion-error-catalog.md). The dated [`HOUSE_PARSER_AUDIT.md`](HOUSE_PARSER_AUDIT.md) is historical corpus evidence and should not be read as the current parser architecture.
+The canonical risk register is [`house-ingestion-error-catalog.md`](house-ingestion-error-catalog.md).

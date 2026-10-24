@@ -543,7 +543,7 @@ def test_cli_setups_blocks_stale_last_quote(monkeypatch):
         positions, "coalesce_actor_variants", lambda events, _positions: events
     )
     monkeypatch.setattr(
-        positions, "gate_closed_events", lambda events, _positions: events
+        positions, "gate_closed_events", lambda events, _positions, **kwargs: events
     )
 
     result = CliRunner().invoke(

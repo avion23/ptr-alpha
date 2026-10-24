@@ -47,6 +47,14 @@ def _price_arrays(prices_df: pd.DataFrame, ticker: str):
     Returns None if the ticker has no column or no non-NaN values. Dates are
     sorted and normalized to timezone-naive calendar dates in nanoseconds so
     binary searches compare directly against ``pd.Timestamp.value``.
+
+    Availability note: dropping NaNs makes each ticker's array its own
+    partition of the calendar. Exact-date lookups (endpoint prices) are
+    therefore safe as-is, but any series-to-series increment comparison must
+    first restrict both arrays to the intervals they share (see
+    signals.core._compute_ticker_signals); differencing independently dropped
+    arrays would average differently-partitioned increments and manufacture
+    alpha out of a missing observation.
     """
     by_ticker = _price_index_for_df(prices_df)
     arrs = by_ticker.get(ticker, False)  # False = "not computed yet"

@@ -34,12 +34,13 @@ cluster, not 77 distinguishable ranks. Alphabetical ordering is a deterministic
 tie-break only, never evidence of a score difference.
 
 13F corroboration remains disabled by default. The explicit opt-in is
-`INSIDER_ENABLE_13F_CORROBORATION=1`, read by candidate construction, gating,
-and scoring; this reaches the existing CLI and receipt derivation without
-changing their interfaces. Opt-in receipt verification must run with the same
-environment setting; the derived audit records `13f_corroboration_enabled`.
-No dedicated CLI option or frozen receipt input for this environment setting
-is present in this change, so cross-environment receipt replay is UNKNOWN.
+`INSIDER_ENABLE_13F_CORROBORATION=1`. The setups CLI resolves it once and passes
+the same Boolean through candidate construction, gating, scoring, and receipt
+recording. Scorer-version-3 receipts freeze `enable_13f_corroboration` in their
+recipe; verification requires that explicit Boolean and never resolves it
+from the current environment. Version-1 and version-2 receipts retain integrity
+checks but cannot replay through the corrected version-3 scorer. They are not
+rewritten or silently migrated; pre-recipe receipts remain integrity-only.
 
 ## Requirements table
 
@@ -60,7 +61,7 @@ is present in this change, so cross-environment receipt replay is UNKNOWN.
 No position size above flat $3k unless ALL hold on a frozen harness:
 1. Among-eligible top-vs-bottom score-tercile forward excess > 0,
    net of spread + fees at modeled fill rate — TESTED 2026-10-16: FAIL
-   (top−bot −0.35pp, t=−0.44; see `docs/reviews/rank-order-20261016.md`);
+   (top−bot −0.35pp, t=−0.44);
 2. clustered (by month) |t| ≥ 2;
 3. limit-fill rate for the ≤1.05× rule reported (fills, not assumptions);
 4. result replicated on the frozen walk-forward block (below) — ingestion-time frame, defined 2026-10-17, unrun.
@@ -73,8 +74,7 @@ Two frames exist. They answer different questions and are never pooled.
 
 - **Disclosure-time frame** (research lane): today's complete database,
   rows filtered by `disclosure_date <= decision date`. Backs every
-  historical signal-research claim (rank-order-20261016.md,
-  decay-variants-20261017.md, and any future historical panel). Known
+  historical signal-research panel. Known
   bias: hindsight completeness — it sees filings the live pipeline had
   not yet ingested. This is completeness bias, not price look-ahead:
   all added filings were public at disclosure, and entry/exit prices are
@@ -126,7 +126,8 @@ analysis of block cohorts is permitted; the artifacts are sealed.
 Unseal: no earlier than 2028-11-01 (last entry 2028-07-15 + 90d
 maturity + session adjustment). The operator (single-operator repo; integrity via
 the receipts hash chain + git) runs the harness on the block, records in
-one docs/reviews/walkforward-unseal-<date>.md: DB sha256, git sha,
+one gitignored data/backtest_assumptions/walkforward/unseal-<date>.json artifact
+(not a committed narrative report): DB sha256, git sha,
 verify_decision output (fail-closed) for each block receipt, per-date
 cohort counts + guard results, and the full estimator table. At unseal,
 promotion-rule items 1–4 are evaluated ON THE BLOCK cohorts. A block FAIL

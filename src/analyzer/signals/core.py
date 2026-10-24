@@ -8,8 +8,9 @@ returns a tidy DataFrame of signals with metadata columns.
 
 The data-oriented redesign replaces the merge-then-filter pattern
 (75M+ intermediate rows → 3M filtered) with per-ticker searchsorted
-lookups via the `_price_arrays` index. SPY log returns are pre-computed
-once on the full Series instead of per-signal groupby shifts.
+lookups via the `_price_arrays` index. Endpoint labels compare the two
+exact executable sessions; path diagnostics average log increments only
+over calendar intervals that both the security and SPY observed.
 """
 
 from __future__ import annotations
@@ -39,7 +40,6 @@ def _compute_ticker_signals(
     vals: np.ndarray,
     spy_dates_ns: np.ndarray | None,
     spy_vals: np.ndarray | None,
-    spy_log_ret: np.ndarray | None,
     decay_lambda: float,
     r_peak: np.ndarray,
     r_trough: np.ndarray,
@@ -63,7 +63,6 @@ def _compute_ticker_signals(
     has_benchmark = (
         spy_dates_ns is not None
         and spy_vals is not None
-        and spy_log_ret is not None
         and len(spy_dates_ns) > 0
     )
 
@@ -138,87 +137,46 @@ def _compute_ticker_signals(
 
         r_window_complete[idx] = True
         w_dates = dates_ns[entry_pos : exit_pos + 1]
-        n_w = len(w_vals)
+        sw_dates = spy_dates_ns[spy_entry_pos : spy_exit_pos + 1]
 
+        # Endpoint metrics compare the two exact executable sessions validated
+        # above; they need no common interval support.
         r_disc_baseline[idx] = w_vals[0]
         r_last_price[idx] = w_vals[-1]
         r_peak[idx] = w_vals.max()
         r_trough[idx] = w_vals.min()
+        r_spy_first[idx] = spy_entry_value
+        r_spy_last[idx] = spy_exit_value
 
-        days = ((w_dates - entry_date_ns) // _constants._NS_PER_DAY).astype(
-            np.float64
-        )
-        log_ret = np.zeros(n_w, dtype=np.float64)
-        if n_w > 1:
-            log_ret[1:] = np.log(w_vals[1:] / w_vals[:-1])
-
-        prev_days = np.empty(n_w, dtype=np.float64)
-        prev_days[0] = 0.0
-        prev_days[1:] = days[:-1]
-        mid_d = np.exp(-decay_lambda * (days + prev_days) * 0.5)
-        w_sum = mid_d.sum()
-        if w_sum > 0:
-            r_decayed_ret[idx] = (log_ret * mid_d).sum() / w_sum
-
-        if has_benchmark:
-            _populate_spy_arrays(
-                idx,
-                entry_date_ns,
-                exit_date_ns,
-                spy_dates_ns,
-                spy_vals,
-                spy_log_ret,
-                decay_lambda,
-                r_spy_cum,
-                r_spy_wsum,
-                r_spy_first,
-                r_spy_last,
+        # Path metrics average log increments. Each series drops missing bars
+        # independently (see prices._price_arrays), so the two raw windows can
+        # partition the same holding period differently; averaging
+        # differently-partitioned increments manufactures alpha out of a
+        # missing observation. Restrict both series to the calendar intervals
+        # each of them observed and give those shared intervals identical
+        # decay weights, so identical shared paths have identical path means.
+        common_dates = np.intersect1d(w_dates, sw_dates, assume_unique=True)
+        if len(common_dates) >= 2:
+            # Interval i spans common_dates[i-1]..common_dates[i] and is
+            # weighted by the decay at the interval midpoint. There is no
+            # zero-return "interval" at i = 0, so no phantom weight enters the
+            # denominator. The result is a mean log increment over observed
+            # intervals (a rate-like diagnostic), not a holding-period return.
+            days = ((common_dates - entry_date_ns) // _constants._NS_PER_DAY).astype(
+                np.float64
             )
-
-
-def _populate_spy_arrays(
-    idx,
-    disc,
-    end_ns,
-    spy_dates_ns,
-    spy_vals,
-    spy_log_ret,
-    decay_lambda,
-    r_spy_cum,
-    r_spy_wsum,
-    r_spy_first,
-    r_spy_last,
-) -> None:
-    spy_lo = int(np.searchsorted(spy_dates_ns, disc, side="left"))
-    spy_hi_end = int(np.searchsorted(spy_dates_ns, end_ns, side="right"))
-    if spy_lo >= spy_hi_end:
-        return
-
-    sw_vals = spy_vals[spy_lo:spy_hi_end]
-    sw_dates = spy_dates_ns[spy_lo:spy_hi_end]
-    n_sw = len(sw_vals)
-
-    r_spy_first[idx] = sw_vals[0]
-    r_spy_last[idx] = sw_vals[-1]
-
-    # Reuse pre-computed SPY log returns via index mapping
-    spy_lr = np.zeros(n_sw, dtype=np.float64)
-    if n_sw > 1:
-        # Map window positions back to full SPY array indices
-        spy_full_lo = spy_lo
-        spy_lr[1:] = spy_log_ret[spy_full_lo + 1 : spy_full_lo + n_sw]
-
-    s_days = ((sw_dates - disc) // _constants._NS_PER_DAY).astype(np.float64)
-    s_prev = np.empty(n_sw, dtype=np.float64)
-    s_prev[0] = 0.0
-    s_prev[1:] = s_days[:-1]
-    s_mid = np.exp(-decay_lambda * (s_days + s_prev) * 0.5)
-
-    s_wr = spy_lr * s_mid
-    s_ws = s_mid.sum()
-    if s_ws > 0:
-        r_spy_cum[idx] = s_wr.sum() / s_ws
-        r_spy_wsum[idx] = s_ws
+            mid = np.exp(-decay_lambda * (days[1:] + days[:-1]) * 0.5)
+            w_sum = float(mid.sum())
+            if w_sum > 0:
+                w_aligned = w_vals[np.searchsorted(w_dates, common_dates)]
+                s_aligned = spy_window[np.searchsorted(sw_dates, common_dates)]
+                r_decayed_ret[idx] = float(
+                    np.dot(np.log(w_aligned[1:] / w_aligned[:-1]), mid) / w_sum
+                )
+                r_spy_cum[idx] = float(
+                    np.dot(np.log(s_aligned[1:] / s_aligned[:-1]), mid) / w_sum
+                )
+                r_spy_wsum[idx] = w_sum
 
 
 def calculate_signal_potential(
@@ -230,12 +188,18 @@ def calculate_signal_potential(
     """Compute per-(transaction, horizon) signal potential metrics.
 
     Output columns:
-      - peak_potential_pct   max upside from disclosure price
-      - decayed_return_pct   midpoint-weighted log return
-      - spy_alpha_pct       decayed_return - decayed_spy_return (× 100)
+      - peak_potential_pct   purchase: max upside over entry (peak/entry - 1);
+                             sale: avoided loss on entry capital
+                             (1 - trough/entry), × 100
+      - decayed_return_pct   midpoint-weighted MEAN LOG INCREMENT over the
+                             intervals the security and SPY both observed
+                             (× 100). A rate-like diagnostic, not a
+                             holding-period return.
+      - spy_alpha_pct        decayed_return - decayed_spy_return (× 100), both
+                             means taken on the same interval support
       - total_return_pct    last_price / disc_price - 1 (× 100)
       - total_spy_alpha_pct total_return - actual_spy_return (× 100)
-      - decayed_spy_return_pct  SPY return on the same window
+      - decayed_spy_return_pct  SPY mean log increment on the same intervals
     """
     # Resolve at call time so a changed application default is observed. Sweeps
     # pass this argument explicitly and do not mutate shared module state.
@@ -254,7 +218,7 @@ def calculate_signal_potential(
 
     metadata = _extract_metadata_arrays(signals)
     session_ns = _label_session_array(metadata)
-    spy_dates_ns, spy_vals, spy_log_ret = _precompute_spy_log_returns(prices_df)
+    spy_dates_ns, spy_vals = _spy_price_index(prices_df)
     result_arrays = _allocate_result_arrays(n)
 
     _compute_all_ticker_signals(
@@ -265,7 +229,6 @@ def calculate_signal_potential(
         session_ns,
         spy_dates_ns,
         spy_vals,
-        spy_log_ret,
         result_arrays,
     )
 
@@ -406,21 +369,17 @@ def _label_session_array(metadata: dict) -> np.ndarray:
     return nyse_sessions(start, end).as_unit("ns").asi8
 
 
-def _precompute_spy_log_returns(prices_df: pd.DataFrame) -> tuple:
-    """Pre-compute SPY data once (vectorized log returns)."""
+def _spy_price_index(prices_df: pd.DataFrame) -> tuple:
+    """Return (dates_ns, values) for SPY, or (None, None) when SPY is absent.
+
+    SPY log returns are not precomputed: path diagnostics need increments over
+    the intervals the security and SPY both observed, which can span several
+    SPY bars, so they are taken from the aligned window in the kernel.
+    """
     spy_arrs = _price_arrays(prices_df, "SPY")
-    spy_dates_ns = None
-    spy_vals = None
-    spy_log_ret = None
     if spy_arrs is not None and spy_arrs[0] is not None:
-        spy_dates_ns, spy_vals = spy_arrs
-        spy_log_ret = np.zeros(len(spy_vals), dtype=np.float64)
-        if len(spy_vals) > 1:
-            valid_spy = spy_vals[:-1] > 0
-            spy_log_ret[1:][valid_spy] = np.log(
-                spy_vals[1:][valid_spy] / spy_vals[:-1][valid_spy]
-            )
-    return spy_dates_ns, spy_vals, spy_log_ret
+        return spy_arrs
+    return None, None
 
 
 def _allocate_result_arrays(n: int) -> dict:
@@ -451,7 +410,6 @@ def _compute_all_ticker_signals(
     session_ns,
     spy_dates_ns,
     spy_vals,
-    spy_log_ret,
     result_arrays,
 ) -> None:
     """Process per-ticker (avoids 75M+ row merge)."""
@@ -478,7 +436,6 @@ def _compute_all_ticker_signals(
             vals,
             spy_dates_ns,
             spy_vals,
-            spy_log_ret,
             decay_lambda,
             result_arrays["r_peak"],
             result_arrays["r_trough"],

@@ -2,8 +2,6 @@
 
 The 2026-10-18 incident: two cron wrappers living under gitignored `data/`
 produced artifacts no process ever consumed, for weeks, with exit code 0.
-Root causes and fixes: `docs/reviews/cron-contract-20261018.md` (analysis)
-and `docs/reviews/merge-gap-20261018.md` (symptom disposition).
 
 ## The contract
 
@@ -48,9 +46,7 @@ Made checkable by four mechanisms, none of which rely on vigilance:
   `tests/test_cron_contract.py` checks the schedule arithmetic.
 - `cron/daily_doctor.sh` — daily 05:00 UTC: doctor + escalation wiring.
 
-Historical wrappers remain under `data/logs/*` (gitignored, retired); the
-disabled Gemini staging cron's disposition is in
-`docs/reviews/merge-gap-20261018.md`.
+Historical wrappers remain under `data/logs/*` (gitignored, retired).
 
 ## Residual limits
 

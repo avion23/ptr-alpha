@@ -93,8 +93,8 @@ def _compute_derived_arrays(metadata: dict, result_arrays: dict) -> dict:
     actual_spy_return = np.full(n, np.nan, dtype=np.float64)
     actual_spy_return[valid_spy] = r_spy_last[valid_spy] / r_spy_first[valid_spy] - 1
 
-    # Bug #1: _populate_spy_arrays already stores the decay-weighted mean
-    # (s_wr.sum() / s_ws) in r_spy_cum.  Dividing again by r_spy_wsum is a
+    # Bug #1: _compute_ticker_signals stores the decay-weighted mean log
+    # increment (dot / w_sum) in r_spy_cum.  Dividing again by r_spy_wsum is a
     # double-division bug.  Use r_spy_cum directly.
     # Bug #6: missing SPY windows produce NaN instead of 0.0.
     spy_cum = np.where(r_spy_wsum > 0, r_spy_cum, np.nan)
@@ -107,10 +107,20 @@ def _compute_derived_arrays(metadata: dict, result_arrays: dict) -> dict:
 
 
 def _compute_peak_potential(metadata: dict, result_arrays: dict) -> np.ndarray:
-    """Peak potential % = (peak/trough - entry) * 100, per transaction type.
+    """Peak potential % = upside / avoided loss measured on the entry capital.
 
-    Purchases use the executable next-session price and max price as upside.
-    Sales use the same next-session price and min trough as avoided loss.
+    Purchases: (peak/entry - 1) * 100 — max gain reachable from the executable
+    next-session entry.
+    Sales: (1 - trough/entry) * 100 — loss avoided on that same initial
+    capital if the trough is hit. Both use the executable entry as the
+    denominator, both are bounded below by 0 (the entry itself is in the
+    window, so peak >= entry >= trough), and the sale term approaches 100%
+    as the trough goes to zero.
+
+    The former (entry/trough - 1) form measured the rebound required to get
+    back to entry from the trough: it diverges (9900% for a 99% drawdown)
+    instead of saturating at 100%, and it used a different denominator from
+    the purchase branch.
     """
     n = len(metadata["disc_ns"])
     r_disc_baseline = result_arrays["r_disc_baseline"]
@@ -133,7 +143,7 @@ def _compute_peak_potential(metadata: dict, result_arrays: dict) -> np.ndarray:
         r_peak[purchase_mask] / r_disc_baseline[purchase_mask] - 1
     ) * 100
     peak_potential[sale_mask] = (
-        r_disc_baseline[sale_mask] / r_trough[sale_mask] - 1
+        1.0 - r_trough[sale_mask] / r_disc_baseline[sale_mask]
     ) * 100
     return peak_potential
 

@@ -1,8 +1,8 @@
 # MLX vision endpoint spec: independent second reader (Model B)
 
 2026-10-18. Adaptation spec for the operator's Apple Silicon (`statement2csv`,
-MLX) box serving an independent second vision read of scanned PTR filings,
-per `docs/reviews/extraction-pipeline-fp-20261018.md`. Phase 1 requires **zero
+MLX) box serving an independent second vision read of scanned PTR filings.
+Phase 1 requires **zero
 statement2csv code**: `mlx-vlm` already ships an OpenAI-compatible FastAPI
 vision server (`/v1/chat/completions` with base64 `image_url` parts, JSON
 schema structured outputs, bearer auth, `/health`, `/v1/metrics`).

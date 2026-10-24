@@ -18,7 +18,7 @@ from importlib import import_module
 
 import pandas as pd
 
-from analyzer.price_repository import previous_nyse_session
+from analyzer.price_repository import ex_dividend_map, previous_nyse_session
 
 _V1_MEMBERS = (
     "Nancy Pelosi",
@@ -245,6 +245,7 @@ def _score(
             weights,
             {ticker: current_quote},
             watchlist=watchlist_actor_ids(),
+            ex_dividends=ex_dividend_map(db, [ticker], as_of),
         )
     except (KeyError, TypeError, IndexError, ValueError) as exc:
         raise ReplayError("analyzer.setups.score violated its return contract") from exc

@@ -5,8 +5,13 @@ outcomes matured before each decision date. Skilled = mean excess > +3pp with
 >=5 unique episodes. Hyperactive = point-in-time breadth > 150.
 
 Phase 2 (cohorts): score from point-in-time inputs and the last quote on or
-  before each decision date. Subsequent executable fills and forward outcomes
-  live in separate artifacts and never enter the scored snapshot.
+  before each decision date, through the production actor-weight path
+  (weights_for_candidates), so research weights are live weights. Subsequent
+  executable fills and forward outcomes live in separate artifacts and never
+  enter the scored snapshot; they are produced by the production evaluator
+  (evaluate_backtest) with declared costs at exact NYSE endpoints. A missing
+  expected entry, exit, or same-session SPY quote stays unavailable — a
+  nearby session is never substituted.
 
 Usage:
   python3 scripts/backtest_assumptions.py skill --frame {disclosure,ingestion}
@@ -44,7 +49,8 @@ import pandas as pd
 from scipy import stats
 
 from analyzer import positions
-from analyzer.actors import actor_id, compute_weight
+from analyzer.actors import actor_id, weights_for_candidates
+from analyzer.backtest.evaluate import evaluate_backtest
 from analyzer.database import Database
 from analyzer.manager_watchlist import watchlist_actor_ids
 from analyzer.member_names import canonical_member_key
@@ -64,6 +70,25 @@ DB_PATH = Path("/home/ubuntu/insider-trading/data/congress.duckdb")
 HORIZON = 90
 MAX_ENTRY_GAP_DAYS = 4
 TOLERANCES = [1.00, 1.03, 1.05, 1.10, 1.30, 1.50, 2.00, math.inf]
+
+# Frozen live-scoring controls (docs/strategy-charter.md). Passed explicitly
+# so replay scoring can never drift from live scoring, and so a stray
+# INSIDER_ENABLE_13F_CORROBORATION environment variable can never flip a
+# research run: in replay, 13F corroboration stays off (fail closed).
+SCORING_ENTRY_TOL = 1.05
+SCORING_EVENT_HALF_LIFE_DAYS = 90
+SCORING_13F_CORROBORATION = False
+
+# Explicitly declared execution costs for research outcome labels: the
+# production evaluator's defaults (analyzer.backtest.evaluate), stated here
+# so an upstream default change is a visible diff in this file too.
+ENTRY_SLIPPAGE_BPS = 10.0
+EXIT_SLIPPAGE_BPS = 10.0
+
+# Calendar-day slack around decision + HORIZON when fetching the label price
+# window. The evaluator still requires exact NYSE endpoints inside it; the
+# slack only bounds the query, never a substituted fill.
+OUTCOME_PRICE_SLACK_DAYS = 7
 
 # Replay frames (docs/strategy-charter.md, "Replay frames"). Never pooled,
 # never implicit: every command and every artifact names its frame.
@@ -199,10 +224,16 @@ def outcome_exit_date(entry_date: date) -> date:
     return previous_nyse_session(entry_date + timedelta(days=HORIZON)).date()
 
 
-def fwd_excess_with_reason(db, ticker: str, entry_date: date, entry_px: float):
+def fwd_excess(db, ticker: str, entry_date: date, entry_px: float):
+    """Phase-1 skill-episode metric: 90-day close-to-close excess vs SPY.
+
+    Skill episodes keep their documented historical definition (first close
+    after disclosure, SPY on or before entry). Phase-2 research outcome
+    labels do not flow through here: they come from production_outcomes().
+    """
     end = outcome_exit_date(entry_date)
     if end <= entry_date:
-        return None, None, None, "invalid_outcome_window"
+        return None, None, None
     out = db.conn.execute(
         "SELECT close FROM prices WHERE ticker = ? AND date = ?",
         [ticker, end],
@@ -216,26 +247,95 @@ def fwd_excess_with_reason(db, ticker: str, entry_date: date, entry_px: float):
         "SELECT close FROM prices WHERE ticker = 'SPY' AND date = ?", [end]
     ).fetchone()
     if not out or not spy_in or not spy_out:
-        return None, None, None, "outcome_price_unavailable"
+        return None, None, None
     try:
         out_px, spy_in_px, spy_out_px = map(
             float, (out[0], spy_in[0], spy_out[0])
         )
     except (TypeError, ValueError):
-        return None, None, None, "outcome_price_unavailable"
+        return None, None, None
     if any(
         not math.isfinite(price) or price <= 0
         for price in (entry_px, out_px, spy_in_px, spy_out_px)
     ):
-        return None, None, None, "invalid_outcome_price"
+        return None, None, None
     ret = (out_px / entry_px - 1) * 100
     spy = (spy_out_px / spy_in_px - 1) * 100
-    return ret, spy, ret - spy, None
+    return ret, spy, ret - spy
 
 
-def fwd_excess(db, ticker: str, entry_date: date, entry_px: float):
-    ret, spy, excess, _ = fwd_excess_with_reason(db, ticker, entry_date, entry_px)
-    return ret, spy, excess
+def production_outcomes(db, tickers, decision: date) -> dict[str, dict]:
+    """Label decision -> HORIZON outcomes with the production evaluator.
+
+    Research labels are production labels (backtest/evaluate.py): the exact
+    expected next NYSE session for entry, the exact expected exit session,
+    and the exact same-session SPY quotes at both endpoints, with the
+    declared costs above. A missing quote stays unavailable — no nearby
+    session is ever substituted. The harness keeps its declared vocabulary:
+    no resolved fill -> "fill_unavailable"; a resolved fill whose exit or
+    benchmark quote is missing -> "outcome_price_unavailable".
+    """
+    labels: dict[str, dict] = {}
+    symbols = sorted({str(ticker).strip().upper() for ticker in tickers if ticker})
+    if not symbols:
+        return labels
+    window_end = decision + timedelta(days=HORIZON + OUTCOME_PRICE_SLACK_DAYS)
+    prices = db.get_prices([*symbols, "SPY"], decision, window_end)
+    recommendations = pd.DataFrame(
+        {"ticker": symbols, "instrument_type": "stock"}
+    )
+    evaluated = evaluate_backtest(
+        recommendations,
+        prices,
+        pd.Timestamp(decision),
+        HORIZON,
+        entry_slippage_bps=ENTRY_SLIPPAGE_BPS,
+        exit_slippage_bps=EXIT_SLIPPAGE_BPS,
+    )
+    for row in evaluated.itertuples(index=False):
+        entry_date = row.bt_entry_date
+        entry_price = row.bt_entry_price
+        resolved_fill = (
+            entry_date is not None
+            and entry_price is not None
+            and not pd.isna(entry_price)
+        )
+        if row.bt_coverage == "complete":
+            fill_date: str | None = str(entry_date)
+            fill_px: float | None = float(entry_price)
+            fwd = float(row.bt_return_pct)
+            spy = float(row.bt_spy_return_pct)
+            excess = float(row.bt_alpha_pct)
+            exclusion = None
+        else:
+            if resolved_fill:
+                fill_date, fill_px = str(entry_date), float(entry_price)
+                exclusion = "outcome_price_unavailable"
+            else:
+                fill_date, fill_px = None, None
+                exclusion = "fill_unavailable"
+            fwd = spy = excess = None
+        labels[str(row.ticker).strip().upper()] = {
+            "fill_date": fill_date,
+            "fill_px": fill_px,
+            "fwd": fwd,
+            "spy": spy,
+            "excess": excess,
+            "exclusion": exclusion,
+        }
+    return labels
+
+
+def outcome_label(labels: dict[str, dict], ticker) -> dict:
+    """Fetch one guaranteed label; absence would be a harness bug, not data."""
+    return labels.get(str(ticker).strip().upper()) or {
+        "fill_date": None,
+        "fill_px": None,
+        "fwd": None,
+        "spy": None,
+        "excess": None,
+        "exclusion": "fill_unavailable",
+    }
 
 
 def breadth_by_actor(
@@ -408,6 +508,15 @@ def cmd_run(decision: date, db=None, *, frame: str, capture_only: bool = False):
             check_frame(len(events_all), len(keep), decision, frame)
         print(decision, "tickers:", len(keep), flush=True)
         holdings_cache: dict = {}
+        # Production weight path caches its point-in-time skill table per
+        # (cutoff, actor set); the cache lives for one replay decision only.
+        skill_cache: dict = {}
+        # One production evaluation for the whole frame: exact next-session
+        # entries, exact exits, exact same-session SPY quotes. Captures stay
+        # label-free (outcomes attach later through the same evaluator).
+        outcome_labels = (
+            production_outcomes(db, keep, decision) if not capture_only else {}
+        )
 
         def holdings_for(member: str):
             if member not in holdings_cache:
@@ -454,17 +563,17 @@ def cmd_run(decision: date, db=None, *, frame: str, capture_only: bool = False):
                 blocked = pd.DataFrame(columns=["ticker", "actor_id", "reason"])
                 score_reason = "no eligible candidates"
             else:
-                weights = {
-                    str(row.actor_id): compute_weight(
-                        str(row.kind), 0, 0.0, str(row.source)
-                    )
-                    for row in candidates.itertuples()
-                }
+                weights = weights_for_candidates(
+                    db, candidates, decision, skill_table_cache=skill_cache
+                )
                 ranked, blocked = score_setups(
                     candidates,
                     weights,
                     {symbol: (quote_px, quote_date) if quote else None},
+                    entry_tol=SCORING_ENTRY_TOL,
+                    event_half_life_days=SCORING_EVENT_HALF_LIFE_DAYS,
                     watchlist=watchlist,
+                    enable_13f_corroboration=SCORING_13F_CORROBORATION,
                 )
                 score_reason = None if not ranked.empty else "; ".join(
                     sorted(set(blocked.loc[blocked["ticker"] == symbol, "reason"].astype(str)))
@@ -544,17 +653,15 @@ def cmd_run(decision: date, db=None, *, frame: str, capture_only: bool = False):
                     hyper_present=bool(actor_ids & hyper),
                     hyper_only=bool(actor_ids and actor_ids <= hyper),
                 )
-                entry = next_session_close(db, symbol, decision)
-                if not entry:
-                    fill_date, fill_px, ret, spy, excess = None, None, None, None, None
-                    exclusion = "fill_unavailable"
-                else:
-                    fill_date, fill_px = entry
-                    ret, spy, excess, exclusion = fwd_excess_with_reason(
-                        db, symbol, fill_date, fill_px
-                    )
+                label = outcome_label(outcome_labels, symbol)
+                fill_date = label["fill_date"]
+                fill_px = label["fill_px"]
+                ret = label["fwd"]
+                spy = label["spy"]
+                excess = label["excess"]
+                exclusion = label["exclusion"]
                 eligible_fill = (
-                    bool(fill_px <= 1.05 * refs.loc[valid_refs].max())
+                    bool(fill_px <= SCORING_ENTRY_TOL * refs.loc[valid_refs].max())
                     if fill_px is not None and valid_refs.any() else None
                 )
                 outcomes.append(
@@ -671,21 +778,30 @@ def cmd_attach_outcomes(decision: date, db=None, *, frame: str):
     try:
         outcomes = []
         captured = pd.read_csv(cohort_path)
+        tickers_by_decision: dict[date, set[str]] = {}
+        for row in captured.itertuples(index=False):
+            tickers_by_decision.setdefault(
+                date.fromisoformat(str(row.as_of)), set()
+            ).add(str(row.ticker))
+        labels_by_decision = {
+            decision_date: production_outcomes(
+                db, sorted(tickers), decision_date
+            )
+            for decision_date, tickers in sorted(tickers_by_decision.items())
+        }
         for row in captured.itertuples(index=False):
             symbol = str(row.ticker)
             decision_date = date.fromisoformat(str(row.as_of))
-            entry = next_session_close(db, symbol, decision_date)
-            if not entry:
-                fill_date, fill_px, ret, spy, excess = None, None, None, None, None
-                exclusion = "fill_unavailable"
-            else:
-                fill_date, fill_px = entry
-                ret, spy, excess, exclusion = fwd_excess_with_reason(
-                    db, symbol, fill_date, fill_px
-                )
+            label = outcome_label(labels_by_decision[decision_date], symbol)
+            fill_date = label["fill_date"]
+            fill_px = label["fill_px"]
+            ret = label["fwd"]
+            spy = label["spy"]
+            excess = label["excess"]
+            exclusion = label["exclusion"]
             ref = pd.to_numeric(pd.Series([row.max_valid_ref]), errors="coerce").iloc[0]
             eligible_fill = (
-                bool(fill_px <= 1.05 * ref)
+                bool(fill_px <= SCORING_ENTRY_TOL * ref)
                 if fill_px is not None and pd.notna(ref) and ref > 0 else None
             )
             outcomes.append(

@@ -1339,6 +1339,54 @@ class TestLocalOcrCanaries(unittest.TestCase):
         self.assertEqual(len(rows), 23)
         self.assertIn("won:reconciled_complete_ocr", engines)
 
+    def test_multiplicity_expansion_requires_distinct_source_positions(self):
+        from analyzer import parser_cascade
+
+        row = {
+            "ticker": "AAPL",
+            "transaction_date": "2024-01-01",
+            "transaction_type": "Purchase",
+            "amount_midpoint": 8000,
+            "asset_description": "Apple (AAPL)",
+        }
+        identity = parser_cascade._transaction_identity(row)
+        scenarios = [
+            (("pdftotext:l47", "pdftotext:l47"), False),
+            (("pdftotext:l47", "pdftotext:l48"), True),
+            (("pdftotext:l47", "pdfplumber:p1:t0:r48"), False),
+        ]
+        for coordinates, expected in scenarios:
+            copies = [dict(row, source_row_id=value) for value in coordinates]
+            with self.subTest(coordinates=coordinates):
+                self.assertEqual(
+                    parser_cascade._multiplicity_expansion_is_genuine(
+                        copies, {identity: 2}, [{identity: 1}]
+                    ),
+                    expected,
+                )
+
+    def test_repeated_source_coordinate_cannot_promote_extra_lots(self):
+        from analyzer import parser_cascade
+
+        row = {
+            "transaction_date": "2024-01-01",
+            "transaction_type": "Purchase",
+            "amount_midpoint": 8000,
+            "asset_description": "A",
+        }
+        copies = [dict(row, source_row_id="pdftotext:l47") for _ in range(2)]
+        with (
+            patch.object(parser_cascade, "_has_document_text_coverage", return_value=True),
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=[]),
+            patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
+            patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=copies),
+            patch.object(parser_cascade, "_try_docling", return_value=[]),
+            patch.object(parser_cascade, "_try_tesseract", return_value=[row.copy()]),
+        ):
+            with self.assertRaises(parser_cascade.ParserCascadeError):
+                parser_cascade._parse_pdf_worker(Path("repeated-coordinate.pdf"))
+
     def test_reconciliation_preserves_maximum_source_lot_multiplicity(self):
         from analyzer import parser_cascade
 
@@ -1348,17 +1396,21 @@ class TestLocalOcrCanaries(unittest.TestCase):
             "amount_midpoint": 8000,
             "asset_description": "A",
         }
+        source_lots = [
+            dict(row, source_row_id=f"pdfplumber:p1:t0:r{index}")
+            for index in range(5)
+        ]
         with (
             patch.object(parser_cascade, "_has_document_text_coverage", return_value=True),
-            patch.object(parser_cascade, "_try_pdfplumber", return_value=[row] * 5),
+            patch.object(parser_cascade, "_try_pdfplumber", return_value=source_lots),
             patch.object(parser_cascade, "_try_camelot_lattice", return_value=[]),
             patch.object(parser_cascade, "_try_camelot_stream", return_value=[]),
-            patch.object(parser_cascade, "_try_pdftotext", return_value=[row]),
+            patch.object(parser_cascade, "_try_pdftotext", return_value=[row.copy()]),
             patch.object(parser_cascade, "_try_docling", return_value=[]),
-            patch.object(parser_cascade, "_try_tesseract", return_value=[row]),
+            patch.object(parser_cascade, "_try_tesseract", return_value=[row.copy()]),
         ):
             _, rows, _ = parser_cascade._parse_pdf_worker(Path("duplicates.pdf"))
-        self.assertEqual(rows, [row] * 5)
+        self.assertEqual(rows, source_lots)
 
     def test_ocr_rasterizer_timeout_maps_to_backend_error(self):
         from pdf2image.exceptions import PDFPopplerTimeoutError

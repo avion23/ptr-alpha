@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -39,6 +39,7 @@ from analyzer.pipeline import (
     source_freshness_metrics,
 )
 from analyzer.price_snapshot import create_snapshot, save_snapshot
+from analyzer.price_repository import ex_dividend_map as _ex_div_map
 from analyzer.price_source import YFinancePriceSource
 from analyzer.settings import Settings
 
@@ -141,7 +142,7 @@ class _HouseAcquisitionDatabase:
                 self.data_dir, read_only=name not in self._WRITE_METHODS
             )
             try:
-                return getattr(db, name)(*args, **kwargs)
+                result = getattr(db, name)(*args, **kwargs)
             except BaseException:
                 try:
                     db.close()
@@ -157,6 +158,7 @@ class _HouseAcquisitionDatabase:
                     raise _DatabaseContextReleaseError(
                         f"Failed to close House acquisition database after {name}"
                     ) from exc
+            return result
 
         return call
 
@@ -1777,29 +1779,6 @@ def follow_member(
     _cli_exit(0)
 
 
-def _ex_div_map(db, symbols: list[str], as_of_date) -> dict | None:
-    """Known ex-dates per ticker inside the 7-day contamination window.
-
-    An unavailable dividends table is represented as None, distinct from an
-    available table with no matching ex-dates; receipts record that source
-    state explicitly.
-    """
-    if not symbols:
-        return {}
-    try:
-        rows = db.conn.execute(
-            "SELECT ticker, ex_date FROM dividends "
-            "WHERE ticker = ANY(?) AND ex_date > ? AND ex_date <= ?",
-            [symbols, as_of_date - timedelta(days=7), as_of_date],
-        ).fetchall()
-    except Exception:
-        return None
-    out: dict[str, list] = {}
-    for ticker, ex_date in rows:
-        out.setdefault(str(ticker).strip().upper(), []).append(ex_date)
-    return out
-
-
 @app.command()
 def setups(
     ctx: typer.Context,
@@ -1836,6 +1815,7 @@ def setups(
     try:
         from analyzer.pipeline import eligible_events
         from analyzer.positions import (
+            _13f_enabled,
             coalesce_actor_variants,
             dedupe_member_names,
             gate_closed_events,
@@ -1855,6 +1835,7 @@ def setups(
     except ImportError as exc:
         _cli_exit(1, f"Error: setups is unavailable ({exc})")
 
+    decision_13f = _13f_enabled(None)
     try:
         db = _open_database(data_dir, read_only=True)
     except Exception as exc:
@@ -1875,6 +1856,7 @@ def setups(
                 selected_member,
                 as_of_date,
                 include_unpromoted=include_unpromoted,
+                enable_13f_corroboration=decision_13f,
             )
             if not frame.empty:
                 frames.append(frame)
@@ -1920,6 +1902,7 @@ def setups(
                     event_members,
                     as_of_date,
                     include_unpromoted=include_unpromoted,
+                    enable_13f_corroboration=decision_13f,
                 )
                 for event_member in event_members:
                     frame = batched.get(event_member)
@@ -1938,7 +1921,11 @@ def setups(
                     pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
                 )
                 events = coalesce_actor_variants(events, position_candidates)
-                events = gate_closed_events(events, position_candidates)
+                events = gate_closed_events(
+                    events,
+                    position_candidates,
+                    enable_13f_corroboration=decision_13f,
+                )
                 frames.append(events)
                 candidate_frames.append(events)
         candidate_frames = [frame for frame in candidate_frames if not frame.empty]
@@ -1947,7 +1934,8 @@ def setups(
                 record_decision_safely(data_dir, as_of_date, pd.DataFrame(), {}, {},
                                        watchlist_actor_ids(), scope=decision_scope,
                                        ex_dividends={},
-                                       dividend_source="canonical_database.dividends")
+                                       dividend_source="canonical_database.dividends",
+                                       enable_13f_corroboration=decision_13f)
             print("No candidates.")
             _cli_exit(0)
         candidates = pd.concat(candidate_frames, ignore_index=True)
@@ -1962,7 +1950,8 @@ def setups(
                 record_decision_safely(data_dir, as_of_date, candidates, {}, {},
                                        watchlist_actor_ids(), scope=decision_scope,
                                        ex_dividends={},
-                                       dividend_source="canonical_database.dividends")
+                                       dividend_source="canonical_database.dividends",
+                                       enable_13f_corroboration=decision_13f)
             print("No candidates.")
             _cli_exit(0)
 
@@ -2002,6 +1991,7 @@ def setups(
             current_prices,
             watchlist=decision_watchlist,
             ex_dividends=ex_dividends,
+            enable_13f_corroboration=decision_13f,
         )
         if record:
             dividend_source = (
@@ -2014,6 +2004,7 @@ def setups(
                 decision_watchlist, ranked, blocked, scope=decision_scope,
                 ex_dividends=ex_dividends,
                 dividend_source=dividend_source,
+                enable_13f_corroboration=decision_13f,
             )
     except typer.Exit:
         raise

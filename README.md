@@ -29,6 +29,8 @@ The system must never backdate knowledge to the private transaction date.
 | `src/analyzer/parser_cascade.py`, `src/analyzer/parsing/` | Deterministic PDF/table/OCR extraction |
 | `src/analyzer/database.py`, `*_repository.py` | DuckDB persistence, canonical views, generations, provenance, prices, parse reports |
 | `src/analyzer/member_ranking/buyer_scoring.py` | Shared public-equity candidate universe and distinct-buyer scorer for live analysis and replay |
+| `src/analyzer/setups.py`, `actors.py`, `positions.py` | Separate actor-weighted setup ranking with holdings, event, and price gates |
+| `src/analyzer/decision_snapshot.py` | Content-addressed decision receipts and append-only publication ledger |
 | `src/analyzer/member_ranking/` | Descriptive member statistics and historical diagnostic scorers |
 | `src/analyzer/signals/` | Historical forward-return label construction and signal reports |
 | `src/analyzer/backtest/` | Point-in-time recommendation replay and fixed-horizon evaluation |
@@ -191,6 +193,7 @@ Common commands:
 | `ptr-alpha fetch-senate-efd ...` | Fetch official Senate eFD records |
 | `ptr-alpha fetch-capitol --all --output capitol.json --generation run-id` | Write Capitol Trades reconciliation artifact only |
 | `ptr-alpha analyze --year 2026 --mode tickers` | Current multi-buyer candidates |
+| `ptr-alpha setups --as-of 2026-10-23` | Separate weighted setups; records a decision receipt by default |
 | `ptr-alpha analyze --year 2026 --ticker SPCX` | One ticker using the same `--days-back`/`--min-buyers` live rule |
 | `ptr-alpha analyze --year 2025 --mode ranks` | Descriptive member rankings |
 | `ptr-alpha analyze --year 2025 --mode signals` | Historical purchase outcomes ranked by endpoint SPY alpha |
@@ -199,6 +202,14 @@ Common commands:
 | `ptr-alpha snapshot` | Explicitly write a reproducible price snapshot |
 
 `analyze`, `backtest`, `portfolio`, and `snapshot` open the canonical database read-only. Fetch/parse/refresh are the mutating paths.
+
+`setups` also reads the canonical database without changing it, but publishes
+receipts under `data/recommendations/` unless `--no-receipt` is specified.
+Its weighted `score` is not the consensus `signal_score` or a return forecast.
+Its `has_fresh_evidence` flag means accepted evidence within **90 calendar
+days**, not the consensus window of 28 days; use `min_disclosure_lag_days`
+for a different reporting window. These output filters do not recompute the
+score using only evidence inside that window.
 
 ## Validation status
 
@@ -211,9 +222,8 @@ Descriptive member ranking is separate from recommendation generation. Older par
 - [`docs/trading-prediction-architecture.md`](docs/trading-prediction-architecture.md): first-principles prediction/evaluation architecture and remaining research roadmap.
 - [`docs/house-data-parsing.md`](docs/house-data-parsing.md): current House parser and persistence behavior.
 - [`docs/house-ingestion-error-catalog.md`](docs/house-ingestion-error-catalog.md): current ingestion risk register.
-- [`docs/HOUSE_PARSER_AUDIT.md`](docs/HOUSE_PARSER_AUDIT.md): dated historical corpus audit; evidence, not current architecture.
 - [`docs/adr/001-refactoring.md`](docs/adr/001-refactoring.md): historical refactoring decision record.
-- `docs/reviews/`: archived adversarial-review evidence. It is not current product documentation; current behavior is defined by code, tests, README, and the three current docs above.
+- `docs/reviews/`: retained raw review artifacts, prompts, and endpoint specifications; narrative reports are not kept here. Current behavior is defined by code, tests, README, and the three current docs above.
 
 ## Tests
 

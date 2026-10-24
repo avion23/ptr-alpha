@@ -64,7 +64,7 @@ The product name is PTR Alpha. User-facing copy and engineering interfaces shoul
 - Current production scorer in `src/analyzer/member_ranking/buyer_scoring.py`.
 - Replay in `src/analyzer/backtest/`.
 - Parser behavior documented in `docs/house-data-parsing.md`.
-- Historical audit evidence under `docs/HOUSE_PARSER_AUDIT.md` and `docs/reviews/`; those are evidence, not current authority.
+- Raw historical review artifacts under `docs/reviews/`; those are evidence, not current authority.
 - Automated regression and integration tests under `tests/`.
 
 ## Product Principles

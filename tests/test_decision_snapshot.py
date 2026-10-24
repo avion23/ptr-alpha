@@ -1,8 +1,10 @@
 import json
 import logging
+import multiprocessing
 import os
 import subprocess
 import tempfile
+import time
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +18,19 @@ from analyzer.setups import score
 
 
 DAY = date(2024, 6, 1)
+_CONTROL = "enable_13f_corroboration"
+
+
+def _derive_recipe(enabled=False):
+    return {
+        "scorer": {
+            "parameters": {
+                "entry_tol": 1.05,
+                "event_half_life_days": 90,
+                _CONTROL: enabled,
+            }
+        }
+    }
 
 
 @pytest.fixture
@@ -58,6 +73,21 @@ def _receipts(tmp_path):
     return sorted(_receipt_dir(tmp_path).glob("*.json"))
 
 
+def _publish_mutated_receipt(tmp_path, inputs, monkeypatch, mutate, *, enabled=False):
+    path = receipts.record_decision(
+        tmp_path,
+        DAY,
+        *inputs,
+        enable_13f_corroboration=enabled,
+    )
+    manifest = json.loads(path.read_text())
+    manifest.pop("manifest_hash")
+    mutate(manifest)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(receipts, "_verify_published", lambda receipt: receipt)
+        return receipts._publish(tmp_path, manifest)
+
+
 def test_record_idempotent_and_replay(tmp_path, inputs, monkeypatch):
     candidates, weights, quotes, watchlist = inputs
     monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1")
@@ -76,8 +106,12 @@ def test_record_idempotent_and_replay(tmp_path, inputs, monkeypatch):
     assert manifest["schema_version"] == 3
     assert manifest["recipe"]["scorer"] == {
         "name": "analyzer.setups.score",
-        "version": "1",
-        "parameters": {"entry_tol": 1.05, "event_half_life_days": 90},
+        "version": "3",
+        "parameters": {
+            "entry_tol": 1.05,
+            "event_half_life_days": 90,
+            _CONTROL: True,
+        },
     }
     assert manifest["recipe"]["parser"] == {
         "name": "analyzer.decision_snapshot",
@@ -110,6 +144,122 @@ def test_record_idempotent_and_replay(tmp_path, inputs, monkeypatch):
     # The publication is anchored in the append-only ledger.
     index = receipts.date_index(tmp_path, DAY)
     assert index == [path.stem]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_v3_control_is_explicit_and_environment_independent(
+    tmp_path, inputs, monkeypatch, enabled
+):
+    candidates, weights, quotes, watchlist = inputs
+    results = []
+    for environment in ("0" if enabled else "1", "1" if enabled else "0"):
+        monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", environment)
+        audit = {}
+        ranked, blocked = score(
+            candidates,
+            weights,
+            quotes,
+            watchlist=watchlist,
+            enable_13f_corroboration=enabled,
+            audit=audit,
+        )
+        path = receipts.record_decision(
+            tmp_path,
+            DAY,
+            *inputs,
+            ranked,
+            blocked,
+            enable_13f_corroboration=enabled,
+        )
+        results.append(
+            (
+                ranked.to_dict("records"),
+                blocked.to_dict("records"),
+                audit,
+                path.read_bytes(),
+                (tmp_path / "recommendations" / receipts.LEDGER_NAME).read_bytes(),
+            )
+        )
+    assert results[0] == results[1]
+    manifest = json.loads(_receipts(tmp_path)[0].read_text())
+    assert manifest["recipe"]["scorer"]["parameters"][_CONTROL] is enabled
+
+
+def test_record_resolves_omitted_control_once_and_rejects_nonbool(
+    tmp_path, inputs, monkeypatch
+):
+    from analyzer import positions
+
+    calls = []
+    original = positions._13f_enabled
+
+    def capture(value):
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(positions, "_13f_enabled", capture)
+    monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1")
+    path = receipts.record_decision(tmp_path, DAY, *inputs)
+
+    assert calls == [None]
+    assert json.loads(path.read_text())["recipe"]["scorer"]["parameters"][
+        _CONTROL
+    ] is True
+    with pytest.raises(TypeError, match="must be a bool"):
+        receipts.record_decision(
+            tmp_path,
+            DAY,
+            *inputs,
+            enable_13f_corroboration=1,
+        )
+    assert calls == [None, 1]
+    assert len(_receipts(tmp_path)) == 1
+
+
+def test_record_rejects_frozen_outputs_from_a_different_control(inputs, tmp_path):
+    candidates, weights, quotes, watchlist = inputs
+    ranked, blocked = score(
+        candidates,
+        weights,
+        quotes,
+        watchlist=watchlist,
+        enable_13f_corroboration=False,
+    )
+
+    with pytest.raises(receipts.DecisionConflict, match="do not reproduce"):
+        receipts.record_decision(
+            tmp_path,
+            DAY,
+            *inputs,
+            ranked,
+            blocked,
+            enable_13f_corroboration=True,
+        )
+    assert not _receipts(tmp_path)
+
+
+@pytest.mark.parametrize("invalid", ["missing", None, 1, "false"])
+def test_derive_requires_recipe_control_before_calling_score(
+    inputs, monkeypatch, invalid
+):
+    candidates, weights, quotes, watchlist = inputs
+    frozen = receipts._freeze(
+        {
+            "candidates": receipts._frame(candidates),
+            "weights": weights,
+            "quotes": quotes,
+            "watchlist": sorted(watchlist),
+        }
+    )
+    recipe = _derive_recipe()
+    if invalid == "missing":
+        recipe["scorer"]["parameters"].pop(_CONTROL)
+    else:
+        recipe["scorer"]["parameters"][_CONTROL] = invalid
+    monkeypatch.setattr(receipts, "score", lambda *a, **k: pytest.fail("score called"))
+
+    with pytest.raises(ValueError, match=_CONTROL):
+        receipts._derive(frozen, recipe)
 
 
 def test_dividend_input_is_frozen_and_replayed_exactly(tmp_path, inputs):
@@ -161,7 +311,7 @@ def test_historical_receipt_is_integrity_only_and_not_rewritten(tmp_path, inputs
             "watchlist": sorted(watchlist),
         }
     )
-    outputs = receipts._derive(frozen)
+    outputs = receipts._derive(frozen, _derive_recipe())
     if outputs["ranked"]:
         outputs["ranked"][0]["reasons"] = ["reason text as originally published"]
     manifest = {
@@ -208,10 +358,258 @@ def test_same_day_distinct_decisions_both_recorded(tmp_path, inputs, caplog):
     assert "distinct decisions now recorded" in caplog.text
 
 
+# ---------------------------------------------------------------------------
+# Reviewer reproduction: concurrent writers must not read the same ledger tail
+# ---------------------------------------------------------------------------
+
+
+def _concurrent_publisher(data_dir, start, result_path, writer):
+    """Child body: publish one distinct decision once both writers are ready."""
+    try:
+        start.wait(timeout=30)
+        receipts.record_ticker_decision(
+            data_dir,
+            DAY,
+            {"writer": writer},
+            {"verdict": writer},
+            scope={"writer": writer},
+        )
+    except Exception as exc:
+        Path(result_path).write_text(f"{type(exc).__name__}: {exc}")
+    else:
+        Path(result_path).write_text("published")
+
+
+def test_concurrent_publications_serialize_the_ledger(tmp_path, monkeypatch):
+    """Two writers racing one ledger must not both append to the same tail.
+
+    O_APPEND serializes byte placement, not predecessor selection: without the
+    interprocess lock both children read the same tail, both link to it, and
+    one publication fails verification on a broken chain. The ledger load is
+    slowed here so the overlap the unlocked read-append cycle lost to luck
+    becomes deterministic.
+    """
+    original_load = receipts._load_ledger
+
+    def slow_load(recommendations):
+        time.sleep(0.3)
+        return original_load(recommendations)
+
+    context = multiprocessing.get_context("fork")
+    start = context.Barrier(2, timeout=30)
+    processes = [
+        context.Process(
+            target=_concurrent_publisher,
+            args=(tmp_path, start, str(tmp_path / f"writer-{i}.txt"), writer),
+        )
+        for i, writer in enumerate(("alpha", "beta"))
+    ]
+    with monkeypatch.context() as patcher:
+        patcher.setattr(receipts, "_load_ledger", slow_load)
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=120)
+    assert [process.exitcode for process in processes] == [0, 0]
+    outcomes = sorted(
+        (tmp_path / f"writer-{i}.txt").read_text() for i in range(len(processes))
+    )
+    # Neither publication failed: the race that broke the chain is gone.
+    assert outcomes == ["published", "published"]
+
+    recommendations = tmp_path / "recommendations"
+    assert receipts._ledger_lock_path(recommendations).exists()
+    paths = _receipts(tmp_path)
+    assert len(paths) == 2
+    for path in paths:
+        assert receipts.verify_decision(path)["agreement"], path
+    lines = (recommendations / receipts.LEDGER_NAME).read_text().splitlines()
+    assert len(lines) == 2
+    entries = [json.loads(line) for line in lines]
+    assert entries[0]["prev_line_hash"] == receipts.GENESIS_HASH
+    assert entries[1]["prev_line_hash"] == receipts._line_hash(entries[0])
+    # Every receipt is anchored by exactly its own ledger line.
+    assert {entry["decision_id"] for entry in entries} == {
+        path.stem for path in paths
+    }
+    # The lock is released, so a later sequential publication still works.
+    third = receipts.record_ticker_decision(
+        tmp_path,
+        DAY,
+        {"writer": "gamma"},
+        {"verdict": "gamma"},
+        scope={"writer": "gamma"},
+    )
+    assert receipts.verify_decision(third)["agreement"]
+    assert len((recommendations / receipts.LEDGER_NAME).read_text().splitlines()) == 3
+
+
 def _attacker_write(path, text):
     """An owner can chmod the 0444 receipt back to writable, then edit it."""
     os.chmod(path, 0o644)
     path.write_text(text)
+
+
+@pytest.mark.parametrize("version", ["1", "2"])
+@pytest.mark.parametrize(
+    ("control_state", "base_enabled"),
+    [
+        ("absent", False),
+        ("null", False),
+        ("nonboolean", False),
+        ("explicit-false", False),
+        ("contradictory", True),
+    ],
+)
+@pytest.mark.parametrize("environment", ["0", "1"])
+def test_v1_v2_control_metadata_is_unsupported_without_derive(
+    tmp_path, inputs, monkeypatch, version, control_state, base_enabled, environment
+):
+    def mutate(manifest):
+        scorer = manifest["recipe"]["scorer"]
+        scorer["version"] = version
+        parameters = scorer["parameters"]
+        if control_state == "absent":
+            parameters.pop(_CONTROL)
+        elif control_state == "null":
+            parameters[_CONTROL] = None
+        elif control_state == "nonboolean":
+            parameters[_CONTROL] = "true"
+        elif control_state == "contradictory":
+            parameters[_CONTROL] = False
+
+    path = _publish_mutated_receipt(
+        tmp_path, inputs, monkeypatch, mutate, enabled=base_enabled
+    )
+    monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", environment)
+    monkeypatch.setattr(
+        receipts, "_derive", lambda *a, **k: pytest.fail("legacy derive called")
+    )
+
+    result = receipts.verify_decision(path)
+
+    assert result["integrity"] == {"agreement": True, "mismatches": []}
+    assert result["agreement"] is False
+    assert result["replay"]["status"] == "unsupported-version"
+    assert "recipe.scorer_version" in result["replay"]["mismatches"]
+
+
+@pytest.mark.parametrize("version", ["1", "2"])
+@pytest.mark.parametrize("audit_state", ["missing", "malformed", "conflicting"])
+def test_v1_v2_audit_variants_are_unsupported_without_derive(
+    tmp_path, inputs, monkeypatch, version, audit_state
+):
+    def mutate(manifest):
+        manifest["recipe"]["scorer"]["version"] = version
+        if audit_state == "missing":
+            manifest.pop("eligibility")
+        elif audit_state == "malformed":
+            manifest["eligibility"] = "not-an-audit-map"
+        else:
+            manifest["eligibility"] = {
+                "AAPL": {"corroborated_13f": True, "ranking_gate": False}
+            }
+
+    path = _publish_mutated_receipt(tmp_path, inputs, monkeypatch, mutate)
+    monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1")
+    monkeypatch.setattr(
+        receipts, "_derive", lambda *a, **k: pytest.fail("legacy derive called")
+    )
+
+    result = receipts.verify_decision(path)
+
+    assert result["integrity"]["agreement"] is True
+    assert result["replay"]["status"] == "unsupported-version"
+    assert "recipe.scorer_version" in result["replay"]["mismatches"]
+
+
+@pytest.mark.parametrize(
+    ("component", "field", "value", "mismatch"),
+    [
+        ("scorer", "name", "other.scorer", "recipe.scorer_version"),
+        ("scorer", "version", "2", "recipe.scorer_version"),
+        ("scorer", "version", ["3"], "recipe.scorer_version"),
+        ("parser", "name", "other.parser", "recipe.parser_version"),
+        ("parser", "version", "2", "recipe.parser_version"),
+    ],
+)
+def test_unsupported_recipe_identity_stops_before_derive(
+    tmp_path, inputs, monkeypatch, component, field, value, mismatch
+):
+    def mutate(manifest):
+        manifest["recipe"][component][field] = value
+
+    path = _publish_mutated_receipt(tmp_path, inputs, monkeypatch, mutate)
+    monkeypatch.setattr(
+        receipts, "_derive", lambda *a, **k: pytest.fail("unsupported derive called")
+    )
+
+    result = receipts.verify_decision(path)
+
+    assert result["integrity"]["agreement"] is True
+    assert result["replay"]["status"] == "unsupported-version"
+    assert mismatch in result["replay"]["mismatches"]
+
+
+@pytest.mark.parametrize("bad_control", ["missing", None, 1, "false"])
+@pytest.mark.parametrize("environment", ["0", "1"])
+def test_v3_malformed_control_fails_before_score(
+    tmp_path, inputs, monkeypatch, bad_control, environment
+):
+    def mutate(manifest):
+        parameters = manifest["recipe"]["scorer"]["parameters"]
+        if bad_control == "missing":
+            parameters.pop(_CONTROL)
+        else:
+            parameters[_CONTROL] = bad_control
+
+    path = _publish_mutated_receipt(tmp_path, inputs, monkeypatch, mutate)
+    monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", environment)
+    monkeypatch.setattr(receipts, "score", lambda *a, **k: pytest.fail("score called"))
+
+    result = receipts.verify_decision(path)
+
+    assert result["integrity"]["agreement"] is True
+    assert result["agreement"] is False
+    assert result["replay"]["status"] == "fail"
+    assert any(_CONTROL in item for item in result["replay"]["mismatches"])
+
+
+def test_integrity_failure_precedes_unsupported_recipe_and_skips_derive(
+    tmp_path, inputs, monkeypatch
+):
+    path = receipts.record_decision(
+        tmp_path, DAY, *inputs, enable_13f_corroboration=False
+    )
+    manifest = json.loads(path.read_text())
+    manifest["recipe"]["scorer"]["version"] = "1"
+    _attacker_write(path, json.dumps(manifest))
+    monkeypatch.setattr(
+        receipts, "_derive", lambda *a, **k: pytest.fail("integrity-invalid derive called")
+    )
+
+    result = receipts.verify_decision(path)
+
+    assert result["integrity"]["agreement"] is False
+    assert "manifest_hash" in result["integrity"]["mismatches"]
+    assert result["replay"]["status"] == "not-run"
+    assert "recipe.scorer_version" not in result["replay"]["mismatches"]
+
+
+def test_frozen_anchor_failure_stops_before_derive(tmp_path, inputs, monkeypatch):
+    def mutate(manifest):
+        manifest["recipe"]["frame"]["input_hash"] = "0" * 64
+
+    path = _publish_mutated_receipt(tmp_path, inputs, monkeypatch, mutate)
+    monkeypatch.setattr(
+        receipts, "_derive", lambda *a, **k: pytest.fail("bad-anchor derive called")
+    )
+
+    result = receipts.verify_decision(path)
+
+    assert result["integrity"]["agreement"] is True
+    assert result["replay"]["status"] == "fail"
+    assert "recipe.frame" in result["replay"]["mismatches"]
 
 
 def test_coherent_replacement_attack_is_rejected(tmp_path, inputs):
@@ -232,7 +630,7 @@ def test_coherent_replacement_attack_is_rejected(tmp_path, inputs):
     manifest["price_snapshot"] = receipts._price_reference(
         manifest["inputs"], date.fromisoformat(manifest["decision_date"])
     )
-    manifest.update(receipts._derive(manifest["inputs"]))
+    manifest.update(receipts._derive(manifest["inputs"], manifest["recipe"]))
     manifest.pop("manifest_hash")
     manifest["manifest_hash"] = receipts._hash(manifest)
     forged = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -300,16 +698,18 @@ def test_tampering_is_detected_even_with_recomputed_hash(tmp_path, inputs):
     manifest["ranked"][0]["score"] += 1
     _attacker_write(path, json.dumps(manifest))
     # The stale digest still matches its ledger entry, but not the content.
-    assert set(receipts.verify_decision(path)["mismatches"]) == {
-        "manifest_hash",
-        "ranked",
-    }
+    stale = receipts.verify_decision(path)
+    assert stale["agreement"] is False
+    assert stale["integrity"]["mismatches"] == ["manifest_hash"]
+    assert stale["replay"]["status"] == "not-run"
     manifest.pop("manifest_hash")
     manifest["manifest_hash"] = receipts._hash(manifest)
     _attacker_write(path, json.dumps(manifest))
     # The recomputed digest matches no ledger entry: fail closed.
-    mismatches = receipts.verify_decision(path)["mismatches"]
-    assert "ranked" in mismatches and "receipt_not_in_ledger" in mismatches
+    unanchored = receipts.verify_decision(path)
+    assert unanchored["agreement"] is False
+    assert "receipt_not_in_ledger" in unanchored["integrity"]["mismatches"]
+    assert unanchored["replay"]["status"] == "not-run"
 
 
 def test_receipt_files_are_read_only_after_publish(tmp_path, inputs):
@@ -339,7 +739,9 @@ def test_cli_recording_is_byte_identical_and_failure_is_terminal(
         positions, "holdings_candidates_batch", lambda *a, **kw: {}
     )
     monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
-    monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
+    monkeypatch.setattr(
+        positions, "gate_closed_events", lambda events, _, **kwargs: events
+    )
     monkeypatch.setattr(cli, "weights_for_candidates", lambda *a: weights)
     from analyzer import manager_watchlist
 
@@ -370,6 +772,182 @@ def test_cli_recording_is_byte_identical_and_failure_is_terminal(
         assert "disk full" in caplog.text
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cli_setups_passes_one_resolved_control_to_every_normal_path(
+    tmp_path, monkeypatch, inputs, enabled
+):
+    from analyzer import cli, manager_watchlist, pipeline, positions, setups
+
+    candidates, weights, quotes, watchlist = inputs
+    resolutions = []
+    calls = []
+    resolve = positions._13f_enabled
+
+    def capture_resolution(value):
+        resolutions.append(value)
+        return resolve(value)
+
+    monkeypatch.setattr(positions, "_13f_enabled", capture_resolution)
+    monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1" if enabled else "0")
+    connection = SimpleNamespace(
+        execute=lambda *a, **k: SimpleNamespace(
+            fetchone=lambda: (100.0, DAY),
+            fetchdf=lambda: pd.DataFrame(
+                [{"ticker": "AAPL", "close": 100.0, "date": pd.Timestamp(DAY)}]
+            ),
+            fetchall=lambda: [],
+        )
+    )
+    monkeypatch.setattr(
+        cli,
+        "_open_database",
+        lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
+    )
+    monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates.copy())
+
+    def selected(*args, **kwargs):
+        calls.append(("selected", kwargs["enable_13f_corroboration"]))
+        return pd.DataFrame()
+
+    def batched(*args, **kwargs):
+        calls.append(("batched", kwargs["enable_13f_corroboration"]))
+        return {}
+
+    gate = positions.gate_closed_events
+
+    def gated(*args, **kwargs):
+        calls.append(("gate", kwargs["enable_13f_corroboration"]))
+        return gate(*args, **kwargs)
+
+    scorer = setups.score
+
+    def scored(*args, **kwargs):
+        calls.append(("score", kwargs["enable_13f_corroboration"]))
+        return scorer(*args, **kwargs)
+
+    recorder = receipts.record_decision_safely
+
+    def recorded(*args, **kwargs):
+        calls.append(("receipt", kwargs["enable_13f_corroboration"]))
+        return recorder(*args, **kwargs)
+
+    monkeypatch.setattr(positions, "holdings_candidates", selected)
+    monkeypatch.setattr(positions, "holdings_candidates_batch", batched)
+    monkeypatch.setattr(positions, "gate_closed_events", gated)
+    monkeypatch.setattr(setups, "score", scored)
+    monkeypatch.setattr(receipts, "record_decision_safely", recorded)
+    monkeypatch.setattr(manager_watchlist, "watchlist_actor_ids", lambda: watchlist)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "setups",
+            "--member",
+            "Alice",
+            "--ticker",
+            "AAPL",
+            "--as-of",
+            DAY.isoformat(),
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(name, enabled) for name in (
+        "selected", "batched", "gate", "score", "receipt"
+    )]
+    assert resolutions.count(None) == 1
+    assert resolutions == [None, enabled, enabled]
+    manifest = json.loads(_receipts(tmp_path)[0].read_text())
+    assert manifest["recipe"]["scorer"]["parameters"][_CONTROL] is enabled
+
+
+@pytest.mark.parametrize("branch", ["no-frames", "filtered-empty"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cli_empty_setups_paths_record_resolved_control(
+    tmp_path, monkeypatch, branch, enabled
+):
+    from analyzer import cli, manager_watchlist, pipeline, positions
+
+    resolutions = []
+    calls = []
+    resolve = positions._13f_enabled
+
+    def capture_resolution(value):
+        resolutions.append(value)
+        return resolve(value)
+
+    monkeypatch.setattr(positions, "_13f_enabled", capture_resolution)
+    monkeypatch.setenv("INSIDER_ENABLE_13F_CORROBORATION", "1" if enabled else "0")
+    connection = SimpleNamespace(
+        execute=lambda *a, **k: SimpleNamespace(
+            fetchone=lambda: (100.0, DAY),
+            fetchdf=lambda: pd.DataFrame(),
+            fetchall=lambda: [],
+        )
+    )
+    monkeypatch.setattr(
+        cli,
+        "_open_database",
+        lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
+    )
+    monkeypatch.setattr(pipeline, "eligible_events", lambda *a: pd.DataFrame())
+
+    candidate = pd.DataFrame(
+        [
+            {
+                "ticker": "MSFT",
+                "actor_id": "congress:ALICE",
+                "kind": "congress",
+                "source": "house_pdf",
+                "entry_ref": 100.0,
+                "event_date": DAY,
+                "disclosure_date": DAY,
+                "corroboration": False,
+                "position_evidence": True,
+                "as_of": DAY,
+                "filing_refs": [],
+            }
+        ]
+    )
+
+    def selected(*args, **kwargs):
+        calls.append(("selected", kwargs["enable_13f_corroboration"]))
+        return candidate if branch == "filtered-empty" else pd.DataFrame()
+
+    recorder = receipts.record_decision_safely
+
+    def recorded(*args, **kwargs):
+        calls.append(("receipt", kwargs["enable_13f_corroboration"]))
+        return recorder(*args, **kwargs)
+
+    monkeypatch.setattr(positions, "holdings_candidates", selected)
+    monkeypatch.setattr(receipts, "record_decision_safely", recorded)
+    monkeypatch.setattr(manager_watchlist, "watchlist_actor_ids", lambda: set())
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "setups",
+            "--member",
+            "Alice",
+            "--ticker",
+            "AAPL",
+            "--as-of",
+            DAY.isoformat(),
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("selected", enabled), ("receipt", enabled)]
+    assert resolutions == [None, enabled]
+    manifest = json.loads(_receipts(tmp_path)[0].read_text())
+    assert manifest["recipe"]["scorer"]["parameters"][_CONTROL] is enabled
+
+
 def test_unscoped_setups_keep_the_full_event_universe(
     tmp_path, monkeypatch, inputs
 ):
@@ -397,7 +975,9 @@ def test_unscoped_setups_keep_the_full_event_universe(
         positions, "holdings_candidates_batch", lambda *a, **kw: {}
     )
     monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
-    monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
+    monkeypatch.setattr(
+        positions, "gate_closed_events", lambda events, _, **kwargs: events
+    )
     monkeypatch.setattr(cli, "weights_for_candidates", lambda *a: weights)
     monkeypatch.setattr(manager_watchlist, "watchlist_actor_ids", lambda: watchlist)
 
@@ -442,7 +1022,9 @@ def test_scoped_setups_with_no_holdings_return_empty_not_the_universe(
         positions, "holdings_candidates_batch", lambda *a, **kw: {}
     )
     monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
-    monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
+    monkeypatch.setattr(
+        positions, "gate_closed_events", lambda events, _, **kwargs: events
+    )
     monkeypatch.setattr(cli, "weights_for_candidates", lambda *a: weights)
     monkeypatch.setattr(manager_watchlist, "watchlist_actor_ids", lambda: watchlist)
 
@@ -489,7 +1071,9 @@ def test_no_receipt_flag_writes_nothing_but_keeps_output(
         positions, "holdings_candidates_batch", lambda *a, **kw: {}
     )
     monkeypatch.setattr(positions, "coalesce_actor_variants", lambda events, _: events)
-    monkeypatch.setattr(positions, "gate_closed_events", lambda events, _: events)
+    monkeypatch.setattr(
+        positions, "gate_closed_events", lambda events, _, **kwargs: events
+    )
     monkeypatch.setattr(cli, "weights_for_candidates", lambda *a: weights)
     monkeypatch.setattr(manager_watchlist, "watchlist_actor_ids", lambda: watchlist)
 

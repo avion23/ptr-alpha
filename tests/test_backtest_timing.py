@@ -264,7 +264,9 @@ class TestBacktestTiming(unittest.TestCase):
         row = calculate_signal_potential(entries, prices, [2]).iloc[0]
 
         self.assertEqual(row["label_entry_date"], pd.Timestamp("2024-01-09"))
-        self.assertAlmostEqual(row["peak_potential_pct"], (200 / 150 - 1) * 100)
+        # Sales: avoided loss on the executable entry capital (1 - trough/entry),
+        # not the rebound required from the trough (entry/trough - 1).
+        self.assertAlmostEqual(row["peak_potential_pct"], (1 - 150 / 200) * 100)
 
     def test_execution_price_window_uses_exact_session_rule(self):
         start, end = _execution_price_window(

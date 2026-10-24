@@ -345,6 +345,30 @@ def canonical_price_hash(
     return digest.hexdigest()
 
 
+def legacy_price_generation_state(ticker: str, prices: pd.Series) -> dict:
+    """Legacy (pre-metadata) state for one ticker from its loaded prices.
+
+    This is the fallback half of :func:`price_generation_state`: when no state
+    row exists, the served generation is the hash of the ticker's full price
+    history under the legacy basis. ``prices`` must be the same rows the
+    per-ticker helper would read (ticker's history, date-ordered).
+    """
+    ticker = str(ticker).strip().upper()
+    if prices.empty:
+        return {
+            "generation_id": None, "comparability_status": "unknown",
+            "alternate_generation": None,
+            "reason": "price comparability unknown: generation metadata unavailable",
+        }
+    legacy_seed = canonical_price_hash(ticker, prices, "legacy-unverified", "legacy")
+    return {
+        "generation_id": f"legacy:{legacy_seed[:24]}",
+        "comparability_status": "unknown",
+        "alternate_generation": None,
+        "reason": "price comparability unknown: persisted prices predate generation metadata",
+    }
+
+
 def price_generation_state(db, ticker: str, *, as_of=None) -> dict:
     """Return explicit served-generation metadata, including legacy uncertainty.
 
@@ -378,19 +402,37 @@ def price_generation_state(db, ticker: str, *, as_of=None) -> dict:
             values = pd.DataFrame(columns=["date", "close"])
     except Exception:
         values = pd.DataFrame(columns=["date", "close"])
-    if values.empty:
-        return {
-            "generation_id": None, "comparability_status": "unknown",
-            "alternate_generation": None,
-            "reason": "price comparability unknown: generation metadata unavailable",
-        }
-    series = pd.Series(values.close.to_numpy(), index=pd.to_datetime(values.date))
-    legacy_seed = canonical_price_hash(ticker, series, "legacy-unverified", "legacy")
-    generation = f"legacy:{legacy_seed[:24]}"
+    series = (
+        pd.Series(values.close.to_numpy(), index=pd.to_datetime(values.date))
+        if not values.empty
+        else pd.Series(dtype=float)
+    )
+    return legacy_price_generation_state(ticker, series)
+
+
+def price_generation_states(db, *, schema_exists: bool | None = None) -> dict[str, dict]:
+    """Every persisted served-generation state, keyed by exact stored ticker.
+
+    Batched :func:`price_generation_state`: one schema check and one query for
+    the whole batch instead of a per-ticker round trip. Tickers without a state
+    row are absent — callers pair this with :func:`legacy_price_generation_state`
+    for exactly the fallback the per-ticker helper performs. Normalize lookup
+    arguments, not stored keys: distinct SQL identities must remain distinct.
+    """
+    if schema_exists is None:
+        schema_exists = price_generation_schema_exists(db)
+    if not schema_exists:
+        return {}
+    rows = db.conn.execute(
+        "SELECT ticker, served_generation, comparability, "
+        "alternate_generation, reason FROM price_generation_state"
+    ).fetchall()
     return {
-        "generation_id": generation, "comparability_status": "unknown",
-        "alternate_generation": None,
-        "reason": "price comparability unknown: persisted prices predate generation metadata",
+        ticker: {
+            "generation_id": served, "comparability_status": comparability,
+            "alternate_generation": alternate, "reason": reason,
+        }
+        for ticker, served, comparability, alternate, reason in rows
     }
 
 
@@ -403,6 +445,29 @@ def price_generation_basis(db, ticker: str, generation: str | None) -> str:
         if isinstance(row, (tuple, list)) and row and row[0]:
             return str(row[0])
     return "legacy-unverified"
+
+
+def price_generation_basis_map(
+    db, *, schema_exists: bool | None = None
+) -> dict[tuple[str, str], str]:
+    """Every stored generation basis, keyed ``(ticker, generation)``.
+
+    Batched :func:`price_generation_basis`: one query for the whole batch.
+    Pairs absent from the map resolve to ``legacy-unverified``, which is
+    exactly the per-ticker helper's fallback for a missing header row.
+    """
+    if schema_exists is None:
+        schema_exists = price_generation_schema_exists(db)
+    if not schema_exists:
+        return {}
+    rows = db.conn.execute(
+        "SELECT ticker, generation, basis FROM price_generations"
+    ).fetchall()
+    return {
+        (ticker, generation): str(basis)
+        for ticker, generation, basis in rows
+        if basis
+    }
 
 
 def price_adjustment_factor(db, ticker: str, day, generation: str | None = None) -> float | None:
@@ -466,6 +531,52 @@ def _store_generation(db, ticker, generation, series, factors, basis) -> str:
     return value_hash
 
 
+def _store_generations(db, entries) -> list[str]:
+    """Batched :func:`_store_generation` for many (ticker, generation) writes.
+
+    Persists exactly the rows sequential per-ticker calls would: one schema
+    ensure, one batch of header upserts and one set-based values insert. When
+    several entries address the same (ticker, generation) identity the later
+    entry wins, which is what repeating the per-ticker call would leave in the
+    tables.
+    """
+    entries = list(entries)
+    if not entries:
+        return []
+    headers: dict = {}
+    values: dict = {}
+    for ticker, generation, series, factors, basis in entries:
+        value_hash = canonical_price_hash(ticker, series, basis, generation)
+        headers[(str(ticker), str(generation))] = (
+            ticker, generation, basis, value_hash
+        )
+        for day, close in series.dropna().sort_index().items():
+            factor = factors.get(day, np.nan)
+            values[(str(ticker), str(generation), pd.Timestamp(day).date())] = (
+                ticker, generation, pd.Timestamp(day).date(), float(close),
+                float(factor) if pd.notna(factor) else None, basis,
+            )
+    ensure_price_generation_schema(db)
+    if headers:
+        db.conn.executemany(
+            "INSERT INTO price_generations(ticker,generation,basis,value_hash) "
+            "VALUES (?,?,?,?) ON CONFLICT(ticker,generation) DO UPDATE "
+            "SET value_hash=excluded.value_hash,basis=excluded.basis",
+            list(headers.values()),
+        )
+    if values:
+        db.conn.execute(
+            "INSERT INTO price_generation_values "
+            "SELECT unnest(?::VARCHAR[]), unnest(?::VARCHAR[]), "
+            "unnest(?::DATE[]), unnest(?::DOUBLE[]), "
+            "unnest(?::DOUBLE[]), unnest(?::VARCHAR[]) "
+            "ON CONFLICT(ticker,generation,date) DO UPDATE SET "
+            "close=excluded.close, adjustment_factor=excluded.adjustment_factor, "
+            "basis=excluded.basis", [list(column) for column in zip(*values.values())],
+        )
+    return [header[3] for header in headers.values()]
+
+
 def _set_generation_state(db, ticker, generation, status, alternate=None, reason=None):
     db.conn.execute(
         "INSERT INTO price_generation_state VALUES (?,?,?,?,?) "
@@ -473,6 +584,20 @@ def _set_generation_state(db, ticker, generation, status, alternate=None, reason
         "comparability=excluded.comparability, "
         "alternate_generation=excluded.alternate_generation, reason=excluded.reason",
         [ticker, generation, status, alternate, reason],
+    )
+
+
+def _set_generation_states(db, rows) -> None:
+    """Batched :func:`_set_generation_state`: one prepared statement batch."""
+    rows = list(rows)
+    if not rows:
+        return
+    db.conn.executemany(
+        "INSERT INTO price_generation_state VALUES (?,?,?,?,?) "
+        "ON CONFLICT(ticker) DO UPDATE SET served_generation=excluded.served_generation, "
+        "comparability=excluded.comparability, "
+        "alternate_generation=excluded.alternate_generation, reason=excluded.reason",
+        rows,
     )
 
 
@@ -498,21 +623,144 @@ def _all_ticker_values(db, ticker):
     return series, factors
 
 
+def _all_ticker_values_batch(db, tickers, states, *, schema_exists=None):
+    """Batched :func:`_all_ticker_values` for many tickers in O(1) queries.
+
+    One history query and one batched factor read replace the per-ticker
+    round trips (schema check, state lookup, history reload, factor reload).
+    ``states`` is a pre-read :func:`price_generation_states` mapping keyed by
+    stored ticker; lookup arguments are normalized like the SQL reader.
+    Tickers absent from it fall back to
+    :func:`legacy_price_generation_state` over exactly the table rows the
+    per-ticker helper would re-read, so every generation id is unchanged.
+    """
+    tickers = [str(ticker) for ticker in tickers]
+    result = {
+        ticker: (pd.Series(dtype=float), pd.Series(dtype=float))
+        for ticker in tickers
+    }
+    if not result:
+        return result
+    if schema_exists is None:
+        schema_exists = price_generation_schema_exists(db)
+    rows = db.conn.execute(
+        "SELECT ticker, date, close FROM prices "
+        "WHERE ticker IN (SELECT UNNEST(?)) ORDER BY ticker, date",
+        [tickers],
+    ).fetchdf()
+    series_map = {}
+    if not rows.empty:
+        for ticker, frame in rows.groupby("ticker", sort=False):
+            series_map[str(ticker)] = pd.Series(
+                frame.close.to_numpy(dtype=float), index=pd.to_datetime(frame.date)
+            )
+    wanted_factors = {}
+    for ticker in tickers:
+        series = series_map.get(ticker, pd.Series(dtype=float))
+        state = states.get(str(ticker).strip().upper()) or legacy_price_generation_state(ticker, series)
+        result[ticker] = (series, pd.Series(np.nan, index=series.index, dtype=float))
+        generation = state.get("generation_id")
+        if generation:
+            wanted_factors[ticker] = generation
+    known = price_generation_factors(db, wanted_factors, schema_exists=schema_exists)
+    for ticker in tickers:
+        raw = known.get(ticker)
+        if raw is None or raw.empty:
+            continue
+        series, _ = result[ticker]
+        result[ticker] = (
+            series,
+            pd.to_numeric(raw, errors="coerce").reindex(series.index),
+        )
+    return result
+
+
+def price_generation_factors(
+    db, wanted: dict[str, str], *, schema_exists: bool | None = None
+) -> dict[str, pd.Series]:
+    """Numeric adjustment factors for the given ``(ticker, generation)`` pairs.
+
+    Batched replacement for the per-ticker reload inside
+    :func:`_all_ticker_values`: one schema check and one query for the whole
+    batch. Returned series are indexed by date but deliberately NOT reindexed
+    onto a price index, so the caller can align them onto whichever history it
+    holds (pre- or post-insert). Non-numeric legacy values coerce to NaN, as in
+    the per-ticker reader. Tickers with no wanted generation or no stored
+    rows get an empty series — reindexing or ``.get`` on it yields the same
+    all-NaN factors the per-ticker read produces.
+    """
+    factors = {str(ticker): pd.Series(dtype=float) for ticker in wanted}
+    if schema_exists is None:
+        schema_exists = price_generation_schema_exists(db)
+    if not wanted or not schema_exists:
+        return factors
+    con = db.conn
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE _price_gen_want "
+        "(ticker VARCHAR, generation VARCHAR)"
+    )
+    con.executemany(
+        "INSERT INTO _price_gen_want VALUES (?,?)",
+        sorted((str(ticker), str(generation)) for ticker, generation in wanted.items()),
+    )
+    rows = con.execute(
+        "SELECT v.ticker, v.date, v.adjustment_factor "
+        "FROM price_generation_values v "
+        "JOIN _price_gen_want w ON w.ticker = v.ticker AND w.generation = v.generation"
+    ).fetchdf()
+    if rows.empty:
+        return factors
+    for ticker, frame in rows.groupby("ticker", sort=False):
+        factors[str(ticker)] = pd.Series(
+            pd.to_numeric(frame.adjustment_factor, errors="coerce").to_numpy(),
+            index=pd.to_datetime(frame.date),
+            name="adjustment_factor",
+        )
+    return factors
+
+
 def _merge_price_generation(db, new_prices, new_factors, basis, *, persist, cached_prices):
-    """Merge only numerically compatible series; divergent values stay versioned."""
+    """Merge only numerically compatible series; divergent values stay versioned.
+
+    Canonical evidence is gathered in a constant number of batched reads (one
+    schema check, one state read, one history read, one factor read) before
+    any decision; the per-ticker comparison logic and every persisted row are
+    unchanged relative to the per-ticker reads this replaces. Writes retain
+    their original per-ticker order, including partial persistence on failure
+    when the caller does not own a transaction.
+    """
     output = (
         cached_prices.copy()
         if not cached_prices.empty
         else pd.DataFrame(index=new_prices.index)
     )
     states = {}
+    incoming_map = {}
+    incoming_factor_map = {}
     for ticker in new_prices.columns:
         incoming = new_prices[ticker].dropna().astype(float)
         if incoming.empty:
             continue
-        factors = new_factors[ticker].reindex(incoming.index) if ticker in new_factors else pd.Series(np.nan, index=incoming.index)
+        incoming_map[ticker] = incoming
+        incoming_factor_map[ticker] = (
+            new_factors[ticker].reindex(incoming.index) if ticker in new_factors else pd.Series(np.nan, index=incoming.index)
+        )
+    # Batched evidence: O(1) queries for the whole batch instead of O(T)
+    # round trips through _all_ticker_values and price_generation_state.
+    schema_ready = price_generation_schema_exists(db)
+    state_map = price_generation_states(db, schema_exists=schema_ready)
+    old_values = _all_ticker_values_batch(
+        db, incoming_map.keys(), state_map, schema_exists=schema_ready
+    )
+    basis_map = None
+    for ticker in incoming_map:
+        incoming = incoming_map[ticker]
+        factors = incoming_factor_map[ticker]
         candidate_generation = _generation_id(ticker, incoming, factors, basis)
-        old_all, old_factors = _all_ticker_values(db, ticker)
+        table_series, old_factors = old_values.get(
+            ticker, (pd.Series(dtype=float), pd.Series(dtype=float))
+        )
+        old_all = table_series
         old = old_all
         if old.empty and ticker in cached_prices:
             old = cached_prices[ticker].dropna().astype(float)
@@ -521,6 +769,7 @@ def _merge_price_generation(db, new_prices, new_factors, basis, *, persist, cach
         overlap = old.index.intersection(incoming.index)
         mismatch = False
         max_relative = 0.0
+        rel = None
         if len(overlap):
             denom = incoming.reindex(overlap).abs().replace(0, np.nan)
             rel = (old.reindex(overlap) - incoming.reindex(overlap)).abs() / denom
@@ -533,11 +782,23 @@ def _merge_price_generation(db, new_prices, new_factors, basis, *, persist, cach
                 f"overlaps exceed {_PRICE_OVERLAP_TOL:.1%} (max {max_relative:.5%})"
                 if mismatch else "price comparability unknown: no overlapping prices"
             )
-            old_generation = price_generation_state(db, ticker)
-            served = old_generation.get("generation_id")
+            # The batched state snapshot equals the per-ticker re-read this
+            # branch used to issue: nothing has written this ticker's state or
+            # price history between the batch read and here.
+            served = (
+                state_map.get(str(ticker).strip().upper())
+                or legacy_price_generation_state(ticker, table_series)
+            ).get("generation_id")
             if persist:
                 if not old_all.empty and served:
-                    old_basis = price_generation_basis(db, ticker, served)
+                    if basis_map is None:
+                        basis_map = price_generation_basis_map(
+                            db, schema_exists=schema_ready
+                        )
+                    old_basis = basis_map.get(
+                        (str(ticker).strip().upper(), str(served)),
+                        "legacy-unverified",
+                    )
                     _store_generation(db, ticker, served, old_all, old_factors, old_basis)
                     _store_generation(db, ticker, candidate_generation, incoming, factors, basis)
                     _set_generation_state(db, ticker, served, "unknown", candidate_generation, reason)

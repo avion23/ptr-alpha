@@ -2,6 +2,7 @@ import unittest
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from analyzer.positions import (
     PositionsError,
@@ -50,8 +51,13 @@ def _holdings_db(trades, prices):
         "source",
         "owner_code",
         "instrument_type",
+        "asset_description",
         "source_record_id",
+        "source_row_id",
         "amends_source_record_id",
+        "ticker_origin",
+        "raw_asset_class",
+        "raw_asset_description",
     ]
     trade_frame = pd.DataFrame(
         [
@@ -1634,6 +1640,565 @@ def test_holdings_batch_query_count_is_constant_in_members():
         assert many <= 6, many
     finally:
         conn.close()
+
+
+def test_equity_admission_precedes_fifo_lot_accounting():
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "Member",
+                "ticker": "AAPL",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-01-02",
+                "amount_midpoint": 10000,
+                "source": "house_pdf",
+                "ticker_origin": "official",
+                "raw_asset_class": "Stock",
+                "raw_asset_description": "Apple Inc.",
+                "instrument_type": "stock",
+                "asset_description": "100 shares @ $100 Apple Inc [ST]",
+                "source_record_id": "good-buy",
+                "source_row_id": "row-1",
+            },
+            {
+                "member": "Member",
+                "ticker": "AAPL",
+                "transaction_type": "Sale",
+                "transaction_date": "2026-01-03",
+                "amount_midpoint": 10000,
+                "source": "senate_efd",
+                "ticker_origin": "official",
+                "raw_asset_class": "Corporate Bond",
+                "raw_asset_description": "Apple Inc Corporate Bond",
+                "instrument_type": "stock",
+                "asset_description": "Apple Inc Corporate Bond",
+                "source_record_id": "bond-sale",
+                "source_row_id": "row-2",
+            },
+            {
+                "member": "Phantom",
+                "ticker": "AAPL",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-01-04",
+                "amount_midpoint": 10000,
+                "source": "house_pdf",
+                "ticker_origin": "official",
+                "instrument_type": "stock",
+                "asset_description": "U.S. Treasury Note [GS]",
+                "raw_asset_description": "Treasury Note",
+                "source_record_id": "treasury-buy",
+                "source_row_id": "row-3",
+            },
+            {
+                "member": "Member",
+                "ticker": "AAPL",
+                "transaction_type": "Sale",
+                "transaction_date": "2026-01-05",
+                "amount_midpoint": 2000,
+                "source": "house_pdf",
+                "ticker_origin": "official",
+                "raw_asset_class": "Stock",
+                "raw_asset_description": "Apple Inc.",
+                "instrument_type": "stock",
+                "asset_description": "20 shares @ $100 Apple Inc [ST]",
+                "source_record_id": "good-sale",
+                "source_row_id": "row-4",
+            },
+        ]
+    )
+    history = {
+        "AAPL": _prices(
+            ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"],
+            [100, 100, 100, 100],
+        )
+    }
+
+    positions = build_positions(trades, history, as_of=date(2026, 1, 6))
+
+    assert len(positions) == 1
+    position = positions.iloc[0]
+    assert position["member"] == "Member"
+    assert position["shares"] == 80
+    assert position["total_cost"] == 8000
+    assert position["cost_basis"] == 100
+    assert position["first_buy"] == date(2026, 1, 2)
+    assert position["last_activity"] == date(2026, 1, 5)
+
+
+@pytest.mark.parametrize(
+    ("rejected_field", "rejected_value"),
+    [
+        pytest.param("ticker_origin", "non_equity", id="ticker-origin"),
+        pytest.param("raw_asset_class", "Corporate Bond", id="raw-asset-class"),
+        pytest.param(
+            "raw_asset_description", "U.S. Treasury Note", id="raw-asset-description"
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("event_type", "amount", "subtype"),
+    [
+        pytest.param("Purchase", 5000, None, id="purchase"),
+        pytest.param("Sale", 2000, "Sale (Partial)", id="partial-sale"),
+        pytest.param("Sale", 2000, "Sale (Full)", id="full-sale"),
+    ],
+)
+def test_equity_admission_filters_each_metadata_field_before_fifo(
+    rejected_field, rejected_value, event_type, amount, subtype
+):
+    common = {
+        "member": "Member",
+        "ticker": "AAPL",
+        "source": "house_pdf",
+        "ticker_origin": "official",
+        "raw_asset_class": "Stock",
+        "raw_asset_description": "Apple Inc.",
+        "instrument_type": "stock",
+        "asset_description": "Apple Inc [ST]",
+    }
+    valid_buy = dict(
+        common,
+        transaction_type="Purchase",
+        transaction_date="2026-01-02",
+        amount_midpoint=10000,
+    )
+    rejected_event = dict(
+        common,
+        transaction_type=event_type,
+        raw_transaction_subtype=subtype,
+        transaction_date="2026-01-03",
+        amount_midpoint=amount,
+    )
+    rejected_event[rejected_field] = rejected_value
+    history = {"AAPL": _prices(["2026-01-02", "2026-01-03"], [100, 100])}
+
+    positions = build_positions(
+        pd.DataFrame([valid_buy, rejected_event]),
+        history,
+        as_of=date(2026, 1, 4),
+    )
+
+    assert len(positions) == 1
+    position = positions.iloc[0]
+    assert position["shares"] == 100
+    assert position["total_cost"] == 10000
+    assert position["cost_basis"] == 100
+    assert position["first_buy"] == date(2026, 1, 2)
+    assert position["last_activity"] == date(2026, 1, 2)
+
+
+def test_rejected_sale_after_last_valid_transaction_preserves_activity():
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "Member",
+                "ticker": "AAPL",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-01-02",
+                "amount_midpoint": 10000,
+                "source": "house_pdf",
+                "ticker_origin": "official",
+                "raw_asset_class": "Stock",
+                "raw_asset_description": "Apple Inc.",
+                "instrument_type": "stock",
+                "asset_description": "Apple Inc [ST]",
+            },
+            {
+                "member": "Member",
+                "ticker": "AAPL",
+                "transaction_type": "Sale",
+                "raw_transaction_subtype": "Sale (Partial)",
+                "transaction_date": "2026-01-03",
+                "amount_midpoint": 2000,
+                "source": "house_pdf",
+                "ticker_origin": "official",
+                "raw_asset_class": "Stock",
+                "raw_asset_description": "Apple Inc.",
+                "instrument_type": "stock",
+                "asset_description": "Apple Inc [ST]",
+            },
+            {
+                "member": "Member",
+                "ticker": "AAPL",
+                "transaction_type": "Sale",
+                "transaction_date": "2026-01-04",
+                "amount_midpoint": 2000,
+                "source": "senate_efd",
+                "ticker_origin": "official",
+                "raw_asset_class": "Corporate Bond",
+                "raw_asset_description": "Apple Inc Corporate Bond",
+                "instrument_type": "stock",
+                "asset_description": "Apple Inc [ST]",
+            },
+        ]
+    )
+    history = {
+        "AAPL": _prices(
+            ["2026-01-02", "2026-01-03", "2026-01-04"], [100, 100, 100]
+        )
+    }
+
+    positions = build_positions(trades, history, as_of=date(2026, 1, 5))
+
+    assert len(positions) == 1
+    position = positions.iloc[0]
+    assert position["shares"] == 80
+    assert position["total_cost"] == 8000
+    assert position["cost_basis"] == 100
+    assert position["last_activity"] == date(2026, 1, 3)
+
+
+def test_identical_equity_lots_keep_both_filing_row_references():
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "Member",
+                "ticker": "AAPL",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-01-02",
+                "amount_midpoint": 10000,
+                "source": "house_pdf",
+                "ticker_origin": "official",
+                "raw_asset_class": "Stock",
+                "raw_asset_description": "Apple Inc.",
+                "instrument_type": "stock",
+                "asset_description": "100 shares @ $100 Apple Inc [ST]",
+                "source_record_id": "document-1",
+                "source_row_id": row_id,
+            }
+            for row_id in ("official:1", "official:2")
+        ]
+    )
+    history = {"AAPL": _prices(["2026-01-02", "2026-01-03"], [100, 100])}
+
+    positions = build_positions(trades, history, as_of=date(2026, 1, 3))
+
+    assert len(positions) == 1
+    position = positions.iloc[0]
+    assert position["shares"] == 200
+    assert position["total_cost"] == 20000
+    assert position["cost_basis"] == 100
+    assert {ref["source_row_id"] for ref in position["filing_refs"]} == {
+        "official:1",
+        "official:2",
+    }
+
+
+@pytest.mark.parametrize(
+    ("rejected_field", "rejected_value", "accepted_value", "tie_values"),
+    [
+        pytest.param(
+            "ticker_origin",
+            "non_equity",
+            "official",
+            ["official", "non_equity"],
+            id="ticker-origin",
+        ),
+        pytest.param(
+            "raw_asset_class",
+            "Treasury",
+            "Stock",
+            ["Treasury", "Stock"],
+            id="raw-asset-class",
+        ),
+        pytest.param(
+            "raw_asset_description",
+            "U.S. Treasury Note",
+            "Apple Inc.",
+            ["U.S. Treasury Note", "Apple Inc."],
+            id="raw-asset-description",
+        ),
+    ],
+)
+def test_equity_provenance_loaders_filter_and_preserve_presorted_ties(
+    rejected_field, rejected_value, accepted_value, tie_values
+):
+    from unittest.mock import patch
+
+    import analyzer.positions as positions_module
+    from analyzer.positions import holdings_candidates_batch
+
+    base = {
+        "member": "M",
+        "ticker": "AAPL",
+        "transaction_type": "Purchase",
+        "transaction_date": date(2026, 1, 2),
+        "disclosure_date": date(2026, 1, 2),
+        "amount_midpoint": 10000,
+        "source": "house_pdf",
+        "owner_code": None,
+        "instrument_type": "stock",
+        "asset_description": "Apple Inc [ST]",
+        "source_record_id": "same-document",
+        "source_row_id": "same-row",
+        "amends_source_record_id": None,
+        "ticker_origin": "official",
+        "raw_asset_class": "Stock",
+        "raw_asset_description": "Apple Inc.",
+    }
+    rejected = dict(base)
+    accepted = dict(base)
+    rejected[rejected_field] = rejected_value
+    accepted[rejected_field] = accepted_value
+    trades = (
+        [accepted, rejected]
+        if rejected_field == "ticker_origin"
+        else [rejected, accepted]
+    )
+    db, conn = _holdings_db(
+        trades,
+        [("AAPL", date(2026, 1, 2), 100.0), ("AAPL", date(2026, 1, 3), 100.0)],
+    )
+    captured = []
+    original_build_positions = positions_module.build_positions
+
+    def capture_build_positions(frame, *args, **kwargs):
+        result = original_build_positions(frame, *args, **kwargs)
+        captured.append(
+            (
+                frame[rejected_field].tolist(),
+                result["shares"].sum(),
+                kwargs.get("presorted", False),
+            )
+        )
+        return result
+
+    try:
+        with patch.object(
+            positions_module, "build_positions", side_effect=capture_build_positions
+        ):
+            single = holdings_candidates(db, "M", date(2026, 1, 3))
+            batch = holdings_candidates_batch(db, ["M"], date(2026, 1, 3))["M"]
+    finally:
+        conn.close()
+
+    assert single.equals(batch)
+    assert single["ticker"].tolist() == ["AAPL"]
+    assert captured == [
+        (tie_values, 100, False),
+        (tie_values, 100, True),
+    ]
+
+
+def test_equity_admission_preserves_option_skip_diagnostic(caplog):
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "M",
+                "ticker": "T",
+                "transaction_type": "Purchase",
+                "transaction_date": "2026-01-02",
+                "amount_midpoint": 100,
+                "instrument_type": "option",
+            }
+        ]
+    )
+    history = {"T": _prices(["2026-01-02"], [10])}
+
+    with caplog.at_level("INFO", logger="analyzer.positions"):
+        positions = build_positions(trades, history, as_of=date(2026, 1, 3))
+
+    assert positions.empty
+    assert "1 option rows" in caplog.text
+
+
+def test_gate_preserves_existing_block_reasons_on_open_and_closed_rows():
+    from analyzer.positions import gate_closed_events
+
+    events = pd.DataFrame(
+        [
+            {
+                "ticker": "OPEN",
+                "actor_id": "congress:OPEN",
+                "entry_ref": 100.0,
+                "event_date": date(2026, 1, 2),
+                "blocked_reason": "upstream open-row hold",
+            },
+            {
+                "ticker": "CLOSED",
+                "actor_id": "congress:CLOSED",
+                "entry_ref": 100.0,
+                "event_date": date(2026, 1, 2),
+                "blocked_reason": "upstream closed-row hold",
+            },
+        ]
+    )
+    original = events.copy(deep=True)
+    candidates = pd.DataFrame(
+        [
+            {
+                "ticker": "OPEN",
+                "actor_id": "congress:OPEN",
+                "position_evidence": True,
+                "event_date": date(2026, 1, 1),
+            }
+        ]
+    )
+
+    gated = gate_closed_events(events, candidates).set_index("ticker")
+
+    assert gated.loc["OPEN", "entry_ref"] == 100
+    assert gated.loc["OPEN", "blocked_reason"] == "upstream open-row hold"
+    assert pd.isna(gated.loc["CLOSED", "entry_ref"])
+    assert gated.loc["CLOSED", "blocked_reason"] == "upstream closed-row hold"
+    assert events.equals(original)
+
+
+@pytest.mark.parametrize("reason", [None, float("nan"), "", "   "])
+def test_gate_fills_missing_block_reason_on_closure(reason):
+    from analyzer.positions import gate_closed_events
+
+    events = pd.DataFrame(
+        [
+            {
+                "ticker": "CLOSED",
+                "actor_id": "congress:CLOSED",
+                "entry_ref": 100.0,
+                "event_date": date(2026, 1, 2),
+                "blocked_reason": reason,
+            }
+        ]
+    )
+    original = events.copy(deep=True)
+
+    gated = gate_closed_events(events, pd.DataFrame())
+
+    assert pd.isna(gated.iloc[0]["entry_ref"])
+    assert gated.iloc[0]["blocked_reason"] == "no open position at as_of"
+    assert events.equals(original)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_gate_preserves_preblocked_held_13f_row(enabled):
+    from analyzer.positions import gate_closed_events
+
+    events = pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "actor_id": "manager:FUND A",
+                "source": "13f",
+                "entry_ref": 100.0,
+                "event_date": date(2026, 1, 2),
+                "blocked_reason": "upstream 13F restriction",
+            }
+        ]
+    )
+    candidates = pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "actor_id": "manager:FUND A",
+                "source": "13f",
+                "position_evidence": True,
+                "event_date": date(2026, 1, 1),
+                "holding_state": "held",
+                "shares_held": 100,
+                "portfolio_pct": 5.0,
+                "portfolio_pct_basis": "reported 13F value",
+                "share_change": 10,
+            }
+        ]
+    )
+
+    gated = gate_closed_events(
+        events, candidates, enable_13f_corroboration=enabled
+    )
+
+    assert gated.iloc[0]["entry_ref"] == 100
+    assert gated.iloc[0]["blocked_reason"] == "upstream 13F restriction"
+    if enabled:
+        assert gated.iloc[0]["holding_state"] == "held"
+        assert gated.iloc[0]["shares_held"] == 100
+
+
+def test_gate_preserves_categorical_reason_on_stale_row():
+    from analyzer.positions import gate_closed_events
+
+    events = pd.DataFrame(
+        {
+            "ticker": ["CLOSED"],
+            "actor_id": ["congress:CLOSED"],
+            "entry_ref": [100.0],
+            "event_date": [date(2026, 1, 2)],
+            "blocked_reason": pd.Categorical(["upstream restriction"]),
+        }
+    )
+    original = events.copy(deep=True)
+
+    gated = gate_closed_events(events, pd.DataFrame())
+
+    assert pd.isna(gated.iloc[0]["entry_ref"])
+    assert gated.iloc[0]["blocked_reason"] == "upstream restriction"
+    assert events.equals(original)
+
+
+@pytest.mark.parametrize(
+    ("source", "enabled", "expected_reason"),
+    [
+        ("house_pdf", False, "no open position at as_of"),
+        (
+            "13f",
+            True,
+            "corroboration unavailable: no current 13F share snapshot",
+        ),
+    ],
+)
+def test_gate_fills_categorical_missing_reason_only_for_stale_row(
+    source, enabled, expected_reason
+):
+    from analyzer.positions import gate_closed_events
+
+    events = pd.DataFrame(
+        {
+            "ticker": ["CLOSED"],
+            "actor_id": ["manager:FUND A" if source == "13f" else "congress:CLOSED"],
+            "source": [source],
+            "entry_ref": [100.0],
+            "event_date": [date(2026, 1, 2)],
+            "blocked_reason": pd.Categorical([None], categories=["upstream restriction"]),
+        }
+    )
+    original = events.copy(deep=True)
+
+    gated = gate_closed_events(
+        events, pd.DataFrame(), enable_13f_corroboration=enabled
+    )
+
+    assert pd.isna(gated.iloc[0]["entry_ref"])
+    assert gated.iloc[0]["blocked_reason"] == expected_reason
+    assert events.equals(original)
+
+
+def test_gate_keeps_categorical_reason_on_open_row():
+    from analyzer.positions import gate_closed_events
+
+    events = pd.DataFrame(
+        {
+            "ticker": ["OPEN"],
+            "actor_id": ["congress:OPEN"],
+            "entry_ref": [100.0],
+            "event_date": [date(2026, 1, 2)],
+            "blocked_reason": pd.Categorical(["upstream restriction"]),
+        }
+    )
+    original = events.copy(deep=True)
+    candidates = pd.DataFrame(
+        [
+            {
+                "ticker": "OPEN",
+                "actor_id": "congress:OPEN",
+                "position_evidence": True,
+                "event_date": date(2026, 1, 1),
+            }
+        ]
+    )
+
+    gated = gate_closed_events(events, candidates)
+
+    assert gated.iloc[0]["entry_ref"] == 100
+    assert gated.iloc[0]["blocked_reason"] == "upstream restriction"
+    assert events.equals(original)
 
 
 if __name__ == "__main__":

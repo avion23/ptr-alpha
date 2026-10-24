@@ -50,12 +50,18 @@ mechanism, the guarantees, and — honestly — the residual risk.
 
 `verify_decision(path)` fails closed. It recomputes the receipt's canonical
 hash and matches it against BOTH the internal `manifest_hash` AND the ledger
-entry; verifies the full chain linkage of `receipts.log`; re-scores the frozen
-setups inputs and compares ranked/blocked/eligibility and the price
-reference. A receipt with no ledger entry, or a missing/corrupt ledger, is a
-mismatch — never a pass. Publication shares one code path for all boundaries
-(`_publish`); a receipt write failure is logged and never raised, so trading
-output and exit status are unaffected.
+entry; and verifies the full chain linkage of `receipts.log`. Supported setups
+recipes re-score frozen inputs and compare ranked/blocked/eligibility and the
+price reference. Scorer version 3 requires a frozen Boolean
+`enable_13f_corroboration`; verification never supplies it from the environment.
+Versions 1 and 2 report `unsupported-version` without invoking the corrected
+scorer, even when their integrity passes. Pre-recipe receipts are explicitly
+integrity-only, and consensus receipts are snapshot-only. Verification does not
+rewrite receipts or migrate recipes.
+
+A receipt with no ledger entry, or a missing/corrupt ledger, is a mismatch —
+never a pass. Publication shares one code path for all boundaries (`_publish`);
+a receipt write failure is logged and propagated so serving fails closed.
 
 ## Residual risk (read this before claiming immutability)
 

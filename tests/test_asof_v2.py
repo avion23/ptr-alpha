@@ -129,7 +129,9 @@ def test_one_parser_cannot_accept_another_parsers_delayed_rowset(tmp_path):
         with db.canonical_as_of(date(2026, 9, 21)):
             assert db.get_transactions(2026).ticker.tolist() == ["JPM"]
         with db.canonical_as_of(date(2026, 10, 1)):
-            assert set(db.get_transactions(2026).ticker) == {"JPM", "MSFT"}
+            frame = db.get_transactions(2026)
+            assert frame.ticker.tolist() == ["MSFT"]
+            assert frame.source.tolist() == ["gemini_ocr"]
     finally:
         db.close()
 

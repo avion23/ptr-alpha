@@ -213,7 +213,7 @@ class TestStrictSubsetEscalation(unittest.TestCase):
         # two rows of its own coordinate system. The superset reading that saw
         # both lots wins and every lot is preserved.
         lot_one = tx("Identical Trust Lot", source_row_id="pdftotext:l17")
-        lot_two = tx("Identical Trust Lot", source_row_id="pdftotext:l17")
+        lot_two = tx("Identical Trust Lot", source_row_id="pdftotext:l18")
         lot_three = tx("Other Trust Lot", source_row_id="pdftotext:l39")
         result, _, _, engines, _ = self._run_text_rung(
             [lot_one, lot_two, lot_three], [lot_one, lot_three]
@@ -221,6 +221,16 @@ class TestStrictSubsetEscalation(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("won:pdfplumber", engines)
         self.assertEqual(len(result[1]), 3)
+
+    def test_same_source_position_cannot_prove_identical_lots(self):
+        lot_one = tx("Identical Trust Lot", source_row_id="pdftotext:l17")
+        duplicate = tx("Identical Trust Lot", source_row_id="pdftotext:l17")
+        other = tx("Other Trust Lot", source_row_id="pdftotext:l39")
+        result, _, _, engines, _ = self._run_text_rung(
+            [lot_one, duplicate, other], [lot_one, other]
+        )
+        self.assertIsNone(result)
+        self.assertIn("text_row_disagreement_unresolved", engines)
 
     def test_equal_text_engines_stay_trusted(self):
         shared = tx("Apple Inc. (AAPL)", source_row_id="pdftotext:l5")

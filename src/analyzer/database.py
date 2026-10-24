@@ -322,7 +322,9 @@ class Database:
         """Select rowsets promoted AND accepted by the end of this day.
 
         Connection-local, nestable, and restored even on failure. Do not share
-        this connection between concurrent historical analyses.
+        this connection between concurrent historical analyses. Past cutoffs
+        use the current row-selection policy; after a policy change, their
+        recomputation is counterfactual, not a rewritten historical receipt.
         """
         previous = getattr(self, "_canonical_as_of", None)
         cutoff = pd.Timestamp(as_of).date()
@@ -724,6 +726,38 @@ class Database:
             """
             body += row_acceptance
             sql = head + "accepted_house_artifacts AS (" + body
+
+        # Apply producer preference after all canonical admission predicates.
+        marker = "\n            SELECT t.* FROM "
+        if sql.count(marker) != 1:
+            raise DatabaseError("Canonical admission SQL shape changed")
+        prefix_sql, admitted_sql = sql.split(marker, 1)
+        sql = prefix_sql + """,
+            priority_admitted AS MATERIALIZED (
+                SELECT t.* FROM """ + admitted_sql + """
+            )
+            SELECT t.*
+            FROM priority_admitted t
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM priority_admitted g
+                JOIN latest_accepted_house_docs a
+                  ON a.doc_id = g.doc_id
+                 AND a.generation_id = g.ingestion_generation
+                 AND a.artifact_sha256 IS NOT DISTINCT FROM g.artifact_sha256
+                WHERE t.source = 'house_pdf'
+                  AND g.source = 'gemini_ocr'
+                  AND t.doc_id IS NOT NULL
+                  AND t.ingestion_generation IS NOT NULL
+                  AND t.artifact_sha256 IS NOT NULL
+                  AND g.doc_id IS NOT NULL
+                  AND g.ingestion_generation IS NOT NULL
+                  AND g.artifact_sha256 IS NOT NULL
+                  AND g.doc_id = t.doc_id
+                  AND g.ingestion_generation = t.ingestion_generation
+                  AND g.artifact_sha256 IS NOT DISTINCT FROM t.artifact_sha256
+            )
+        """
         self.conn.execute(sql)
 
     def _init_prices_table(self) -> None:

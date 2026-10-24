@@ -129,3 +129,14 @@ def test_unresolved_warning_marks_independent_date_member_groups_unknown():
     assert "rows/episodes=4" in message
     assert "member_groups=2" in message
     assert "independent_date_member_groups=UNKNOWN (not supplied)" in message
+
+
+def test_singleton_groups_do_not_claim_identified_variance_or_precision():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fit = normal_normal_posteriors([-10.0, 10.0], ["A", "B"])
+
+    assert any("UNIDENTIFIED" in str(item.message) for item in caught)
+    assert fit[["within_var", "between_var", "posterior_std"]].isna().all().all()
+    np.testing.assert_array_equal(fit["posterior_mean"], [0.0, 0.0])
+    np.testing.assert_array_equal(fit["shrinkage"], [1.0, 1.0])

@@ -20,21 +20,23 @@ import pandas as pd
 
 class TestSpyDoubleDivision(unittest.TestCase):
     """
-    _populate_spy_arrays stores the decay-weighted mean (s_wr.sum() / s_ws) in
-    r_spy_cum.  Prior to the fix, assembly._compute_derived_arrays divided by
-    r_spy_wsum a second time, halving (or more) the reported SPY return.
+    _compute_ticker_signals stores the decay-weighted mean log increment
+    (dot / w_sum) in r_spy_cum.  Prior to the fix, assembly
+    ._compute_derived_arrays divided by r_spy_wsum a second time, halving
+    (or more) the reported SPY return.
 
-    Numeric probe: SPY 100→110 over 1 trading day, decay_lambda=0.
-      Window: prices=[100, 110], n=2
-      spy_lr = [0, log(110/100)] ≈ [0, 0.09531]
-      weights (decay_lambda=0) = [1, 1] → s_ws = 2
+    Numeric probe: SPY 100→110 over the first of two window intervals,
+    decay_lambda=0.
+      Window: prices=[100, 110, 110] on the three executable sessions
+      log increments = [log(110/100), 0] ≈ [0.09531, 0]
+      interval weights (decay_lambda=0) = [1, 1] → w_sum = 2
       weighted mean  = 0.09531 / 2 ≈ 0.04765
       decayed_spy_return_pct = 0.04765 * 100 ≈ 4.77%   ← correct
       double-division gave     0.04765 / 2 * 100 ≈ 2.38% ← buggy
     """
 
     def setUp(self):
-        # Disclosure on day 0; executable window is day 1 through day 2.
+        # Disclosure on day 0; executable window is day 1 through day 3.
         self.entry_prices = pd.DataFrame(
             {
                 "member": ["Alice"],
@@ -46,22 +48,22 @@ class TestSpyDoubleDivision(unittest.TestCase):
         )
         self.prices = pd.DataFrame(
             {
-                "TICK": [99.0, 100.0, 100.0],  # flat over executable window
-                "SPY": [99.0, 100.0, 110.0],  # SPY rises 10% after entry
+                "TICK": [99.0, 100.0, 100.0, 100.0],  # flat over window
+                "SPY": [99.0, 100.0, 110.0, 110.0],  # +10% over first interval
             },
-            index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+            index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]),
         )
 
     def test_spy_return_not_double_divided(self):
         from analyzer.signals.core import calculate_signal_potential
 
         signals = calculate_signal_potential(
-            self.entry_prices, self.prices, [1], decay_lambda=0.0
+            self.entry_prices, self.prices, [2], decay_lambda=0.0
         )
         self.assertEqual(len(signals), 1)
         dsr = signals.iloc[0]["decayed_spy_return_pct"]
         # Correct value ≈ 4.77%; buggy value was ≈ 2.38%.
-        # log(110/100) ≈ 0.09531; two weights (1,1) → mean = 0.04765
+        # log(110/100) ≈ 0.09531; two interval weights (1,1) → mean = 0.04765
         expected = math.log(110.0 / 100.0) / 2.0 * 100  # ≈ 4.77
         self.assertAlmostEqual(
             dsr,
@@ -70,6 +72,24 @@ class TestSpyDoubleDivision(unittest.TestCase):
             msg=f"decayed_spy_return_pct={dsr:.4f} expected≈{expected:.4f}; "
             "double-division bug may not be fixed",
         )
+
+    def test_missing_interior_bar_does_not_manufacture_path_alpha(self):
+        from analyzer.signals.core import calculate_signal_potential
+
+        prices = self.prices.copy()
+        prices["TICK"] = prices["SPY"]
+        prices.loc[pd.Timestamp("2024-01-03"), "TICK"] = float("nan")
+        row = calculate_signal_potential(
+            self.entry_prices, prices, [2], decay_lambda=0.005
+        ).iloc[0]
+
+        # Both observed paths go 100 -> 110 on the shared interval. Dropping
+        # a stock-only interior bar must not create a stock/SPY difference.
+        expected = math.log(1.1) * 100
+        self.assertAlmostEqual(row["decayed_return_pct"], expected)
+        self.assertAlmostEqual(row["decayed_spy_return_pct"], expected)
+        self.assertAlmostEqual(row["spy_alpha_pct"], 0.0)
+        self.assertAlmostEqual(row["total_spy_alpha_pct"], 0.0)
 
 
 # ── Kelly outcome coverage ───────────────────────────────────────────────────

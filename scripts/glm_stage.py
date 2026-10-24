@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Staged GLM OCR ingestion for the backlog drain (FP review 2026-10-18).
+"""Staged GLM OCR ingestion for the backlog drain.
 
-Per ``docs/reviews/glm-engine-fp-review-20261018.md`` §5, GLM-only backlog
-candidates are STAGED: written as one JSON record per document under
+GLM-only backlog candidates are STAGED: written as one JSON record per document under
 ``data/staging/glm-backlog/<year>/<doc_id>.json`` and explicitly excluded
 from canonical/backtests until an owner-approved pixel audit passes
 (``audit_sample.py``). Audit approval is MANDATORY at the promotion

@@ -344,7 +344,13 @@ def test_missing_outcomes_are_retained_and_unranked_scores_are_null(
     install_skill_fixture(out_dir, DECISION, frame="disclosure")
     monkeypatch.setattr(frame_script, "OUT_DIR", out_dir)
     monkeypatch.setattr(frame_script, "date", FrozenDate)
-    monkeypatch.setattr(frame_script, "compute_weight", lambda *args: 0.01)
+    monkeypatch.setattr(
+        frame_script,
+        "weights_for_candidates",
+        lambda db, candidates, as_of, *, skill_table_cache=None: {
+            str(actor): 0.01 for actor in candidates["actor_id"]
+        },
+    )
     db = Database(tmp_path / "frame.duckdb")
     try:
         seed_frame(db, tickers=FRAME_TICKERS)
@@ -362,6 +368,37 @@ def test_missing_outcomes_are_retained_and_unranked_scores_are_null(
     assert len(outcomes) == len(FRAME_TICKERS)
     assert outcomes["excess"].isna().all()
     assert outcomes["exclusion_reason"].eq("outcome_price_unavailable").all()
+
+
+@pytest.mark.parametrize(
+    "missing_ticker, exclusion",
+    [("AAPL", "fill_unavailable"), ("SPY", "outcome_price_unavailable")],
+)
+def test_production_outcomes_do_not_substitute_later_entry_or_benchmark_quotes(
+    frame_script, missing_ticker, exclusion
+):
+    db = Database(":memory:")
+    try:
+        seed_prices(db, ["AAPL"])
+        complete = frame_script.production_outcomes(db, ["AAPL"], DECISION)["AAPL"]
+        assert complete["fill_date"] == "2026-06-22"
+        assert complete["excess"] is not None
+        db.conn.execute(
+            "DELETE FROM prices WHERE ticker = ? AND date = ?",
+            [missing_ticker, date(2026, 6, 22)],
+        )
+        # June 23 and all later quotes remain available, but cannot replace
+        # the production evaluator's exact June 22 entry endpoint.
+        label = frame_script.production_outcomes(db, ["AAPL"], DECISION)["AAPL"]
+        assert label["exclusion"] == exclusion
+        assert label["fwd"] is label["spy"] is label["excess"] is None
+        if missing_ticker == "AAPL":
+            assert label["fill_date"] is label["fill_px"] is None
+        else:
+            assert label["fill_date"] == complete["fill_date"]
+            assert label["fill_px"] == complete["fill_px"]
+    finally:
+        db.close()
 
 
 def test_frozen_capture_is_label_free_write_once_and_analysis_sealed(

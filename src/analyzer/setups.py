@@ -38,6 +38,8 @@ def is_ranked(score_value: float, n_actors: int, corroborated: bool = False) -> 
     watchlist-13F corroboration (officer + skilled fund). Single weak
     actors (June-ZTS style) stay visible in blocked, never in ranked.
     """
+    if not math.isfinite(score_value):
+        return False
     if score_value >= _RANKED_FLOOR:
         return True
     if score_value <= _CORROBORATED_FLOOR:
@@ -258,6 +260,9 @@ def score(
             seen_reference = False
             usable_lag = None
             for row in initiators:
+                blocked_reason = row.get("blocked_reason")
+                if isinstance(blocked_reason, str) and blocked_reason.strip():
+                    continue
                 if _missing(row["entry_ref"]):
                     continue
                 seen_reference = True
@@ -370,7 +375,11 @@ def score(
                 {
                     "ticker": ticker,
                     "actor_id": actor_id,
-                    "reason": "score below ranking floor (1.00)",
+                    "reason": (
+                        "non-finite setup score"
+                        if not math.isfinite(score_value)
+                        else "score below ranking floor (1.00)"
+                    ),
                 }
                 for actor_id, _, _, _ in accepted
             )

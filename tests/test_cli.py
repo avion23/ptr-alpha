@@ -14,6 +14,33 @@ from analyzer.cli import _CURRENT_YEAR, _warn_live_ticker_coverage, app
 from analyzer.exceptions import StepResult
 
 
+class TestHouseAcquisitionDatabase(unittest.TestCase):
+    def test_real_connection_is_closed_after_query_or_query_error(self):
+        import duckdb
+
+        from analyzer.cli import _HouseAcquisitionDatabase
+        from analyzer.database import Database
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "congress.duckdb"
+            Database(path, read_only=False).close()
+            proxy = _HouseAcquisitionDatabase(directory)
+            for archive_year in (2026, object()):
+                with self.subTest(archive_year=archive_year):
+                    retained = Database(path, read_only=True)
+                    try:
+                        with patch("analyzer.cli._open_database", return_value=retained):
+                            if archive_year == 2026:
+                                self.assertTrue(proxy.get_metadata(archive_year).empty)
+                            else:
+                                with self.assertRaises(duckdb.NotImplementedException):
+                                    proxy.get_metadata(archive_year)
+                        with self.assertRaises(duckdb.ConnectionException):
+                            retained.conn.execute("SELECT 1")
+                    finally:
+                        retained.close()
+
+
 class TestCliApp(unittest.TestCase):
     def setUp(self):
         self.runner = CliRunner()

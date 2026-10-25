@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 
 import pandas as pd
@@ -54,6 +55,28 @@ _REJECTED_TICKER_ORIGINS = frozenset({"invalid", "missing", "non_equity"})
 _CACHE_MISS = object()
 OFFICIAL_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd", "form4", "13f"})
 _LEGACY_SCORING_SOURCES = frozenset({"house_pdf", "gemini_ocr", "senate_efd"})
+# House PTR reports are required only above $1,000, so $1,001 is the
+# disclosure floor; operator fix-all directive 2026-10-25.
+PTR_PURCHASE_DISCLOSURE_FLOOR = 1001.0
+PTR_PURCHASE_BELOW_FLOOR_REASON = "purchase below PTR disclosure floor ($1,001)"
+
+
+def purchase_below_ptr_floor_reason(source, transaction_type, amount_midpoint):
+    """Explain when a parsed congressional purchase is below the PTR floor."""
+    if (
+        not isinstance(source, str)
+        or source.strip().lower() not in _LEGACY_SCORING_SOURCES
+        or not isinstance(transaction_type, str)
+        or transaction_type.strip().lower() != TransactionType.PURCHASE.value.lower()
+    ):
+        return None
+    try:
+        amount = float(amount_midpoint)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if math.isfinite(amount) and 0 < amount < PTR_PURCHASE_DISCLOSURE_FLOOR:
+        return PTR_PURCHASE_BELOW_FLOOR_REASON
+    return None
 
 
 def _legacy_scoring_rows(rows: pd.DataFrame) -> pd.DataFrame:
@@ -209,7 +232,9 @@ def get_consensus_ticker_purchases(
     )
 
 
-def prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
+def prepare_consensus_purchases(
+    transactions_df: pd.DataFrame, *, include_below_floor: bool = False
+) -> pd.DataFrame:
     """Return valid purchase rows with resolver and member identities attached."""
     required = {"transaction_type", "transaction_date", "disclosure_date"}
     if transactions_df.empty or not required.issubset(transactions_df.columns):
@@ -217,6 +242,30 @@ def prepare_consensus_purchases(transactions_df: pd.DataFrame) -> pd.DataFrame:
     purchases = transactions_df[
         transactions_df["transaction_type"] == TransactionType.PURCHASE.value
     ].copy()
+    if purchases.empty:
+        return purchases
+
+    sources = (
+        purchases["source"].tolist()
+        if "source" in purchases
+        else [None] * len(purchases)
+    )
+    amounts = (
+        purchases["amount_midpoint"].tolist()
+        if "amount_midpoint" in purchases
+        else [None] * len(purchases)
+    )
+    floor_reasons = [
+        purchase_below_ptr_floor_reason(source, TransactionType.PURCHASE.value, amount)
+        for source, amount in zip(sources, amounts)
+    ]
+    below_floor = pd.Series(
+        [reason is not None for reason in floor_reasons], index=purchases.index
+    )
+    if include_below_floor:
+        purchases["_ptr_floor_blocked_reason"] = floor_reasons
+    elif below_floor.any():
+        purchases = purchases.loc[~below_floor].copy()
     if purchases.empty:
         return purchases
 

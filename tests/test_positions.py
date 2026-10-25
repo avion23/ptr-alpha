@@ -171,7 +171,7 @@ class TestPositions(unittest.TestCase):
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
                     "disclosure_date": date(2025, 1, 10),
-                    "amount_midpoint": 500.0,
+                    "amount_midpoint": 1001.0,
                     "source": "house_pdf",
                     "owner_code": "SP",
                 },
@@ -197,8 +197,8 @@ class TestPositions(unittest.TestCase):
         positions = build_positions(trades, history, as_of=date(2025, 6, 11))
 
         self.assertEqual(len(positions), 1)
-        self.assertAlmostEqual(positions.iloc[0]["shares"], 5.0)
-        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 500.0)
+        self.assertAlmostEqual(positions.iloc[0]["shares"], 10.01)
+        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 1001.0)
 
     def test_ownerless_band_cleanup_preserves_named_exact_lot(self):
         trades = pd.DataFrame(
@@ -218,10 +218,10 @@ class TestPositions(unittest.TestCase):
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 10),
                     "disclosure_date": date(2025, 1, 10),
-                    "amount_midpoint": 500.0,
+                    "amount_midpoint": 1100.0,
                     "source": "house_pdf",
                     "owner_code": "SP",
-                    "asset_description": "5 shares @ $100",
+                    "asset_description": "11 shares @ $100",
                 },
                 {
                     "member": "M",
@@ -244,8 +244,8 @@ class TestPositions(unittest.TestCase):
         positions = build_positions(trades, history, as_of=date(2025, 6, 11))
 
         self.assertEqual(len(positions), 1)
-        self.assertAlmostEqual(positions.iloc[0]["shares"], 5.0)
-        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 500.0)
+        self.assertAlmostEqual(positions.iloc[0]["shares"], 11.0)
+        self.assertAlmostEqual(positions.iloc[0]["total_cost"], 1100.0)
 
     def test_ownerless_band_sale_is_attributed_to_relieved_owner(self):
         trades = pd.DataFrame(
@@ -1105,7 +1105,7 @@ class TestPositions(unittest.TestCase):
                     "transaction_type": "Purchase",
                     "transaction_date": date(2025, 1, 14),
                     "disclosure_date": date(2025, 1, 20),
-                    "amount_midpoint": 1000.0,
+                    "amount_midpoint": 1001.0,
                     "source": "house_pdf",
                     "instrument_type": "stock",
                 },
@@ -1159,7 +1159,7 @@ class TestPositions(unittest.TestCase):
                     "transaction_type": "Purchase",
                     "transaction_date": date(2026, 1, 16),
                     "disclosure_date": date(2026, 1, 23),
-                    "amount_midpoint": 1000.0,
+                    "amount_midpoint": 1001.0,
                     "source": "house_pdf",
                     "instrument_type": "stock",
                 }

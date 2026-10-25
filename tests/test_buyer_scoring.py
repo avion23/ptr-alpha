@@ -7,8 +7,10 @@ from analyzer.exceptions import AnalysisError
 from analyzer.member_ranking.buyer_scoring import (
     _UNSUPPORTED_ASSET_RE,
     _equity_transaction_row,
+    PTR_PURCHASE_BELOW_FLOOR_REASON,
     get_consensus_candidate_tickers,
     prepare_consensus_purchases,
+    purchase_below_ptr_floor_reason,
     score_ticker_by_buyers,
 )
 
@@ -436,6 +438,55 @@ def test_consensus_excludes_sales_before_counting_buyers():
     assert result.iloc[0]["num_buyers"] == 2
     assert "total_buyer_trades" not in result.columns
     assert "BOB" not in result.iloc[0]["buyers"]
+
+
+def test_ptr_purchase_floor_only_blocks_positive_subfloor_congressional_purchases():
+    transactions = _transactions(
+        ("Exact Dollar", "Band A", "Unknown Amount", "Boundary", "Small Sale"),
+        disclosure_dates=[
+            "2024-05-10",
+            "2024-05-11",
+            "2024-05-12",
+            "2024-05-13",
+            "2024-05-14",
+        ],
+    )
+    transactions["source"] = [
+        "house_pdf",
+        "gemini_ocr",
+        "senate_efd",
+        "house_pdf",
+        "senate_efd",
+    ]
+    transactions["amount_midpoint"] = [898.16, 8000.50, None, 1001.0, 898.16]
+    transactions.loc[4, "transaction_type"] = "Sale"
+
+    prepared = prepare_consensus_purchases(transactions)
+    prepared_with_blocked = prepare_consensus_purchases(
+        transactions, include_below_floor=True
+    )
+    result = score_ticker_by_buyers(
+        "AAPL", transactions, as_of_date=pd.Timestamp("2024-05-20"), min_buyers=3
+    )
+
+    assert prepared["member"].tolist() == ["Band A", "Unknown Amount", "Boundary"]
+    assert (
+        prepared_with_blocked.set_index("member").loc[
+            "Exact Dollar", "_ptr_floor_blocked_reason"
+        ]
+        == PTR_PURCHASE_BELOW_FLOOR_REASON
+    )
+    assert pd.isna(
+        prepared_with_blocked.set_index("member").loc[
+            "Band A", "_ptr_floor_blocked_reason"
+        ]
+    )
+    assert purchase_below_ptr_floor_reason("senate_efd", "Sale", 898.16) is None
+    assert purchase_below_ptr_floor_reason("form4", "Purchase", 898.16) is None
+    assert result.iloc[0]["num_buyers"] == 3
+    assert get_consensus_candidate_tickers(
+        transactions, 3, as_of_date=pd.Timestamp("2024-05-20")
+    ) == ["AAPL"]
 
 
 def test_consensus_excludes_non_equity_provenance_rows_before_counting():

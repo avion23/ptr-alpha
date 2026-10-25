@@ -1,10 +1,12 @@
 from datetime import date
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
 
-from analyzer.setups import is_ranked, score
+from analyzer.persistence.database import Database
 from analyzer.positions import build_positions
+from analyzer.setups import is_ranked, score
 
 
 AS_OF = date(2024, 6, 1)
@@ -64,7 +66,7 @@ def test_non_equity_markers_neither_rank_nor_contaminate_stock_basis():
     trades = pd.DataFrame(
         [
             {
-                "member": "Nancy Pelosi",
+                "member": "Synthetic Member",
                 "ticker": ticker,
                 "transaction_type": "Purchase",
                 "transaction_date": day,
@@ -110,6 +112,109 @@ def test_non_equity_markers_neither_rank_nor_contaminate_stock_basis():
         enable_13f_corroboration=False,
     )
     assert set(ranked["ticker"]) == {"SPCX", "AAPL"}
+
+
+def test_subfloor_purchase_cannot_back_a_ranked_setup_or_open_holding(monkeypatch):
+    from analyzer import pipeline
+
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "Synthetic Member",
+                "ticker": "ADBE",
+                "transaction_type": "Purchase",
+                "transaction_date": "2024-05-30",
+                "disclosure_date": "2024-06-01",
+                "amount_midpoint": 898.16,
+                "source": "house_pdf",
+                "instrument_type": "stock",
+                "asset_description": "Adobe Inc Common Stock",
+                "source_record_id": "20018475",
+            }
+        ]
+    )
+    prices = pd.DataFrame({"ADBE": [100.0]}, index=pd.to_datetime(["2024-05-30"]))
+    monkeypatch.setattr(
+        pipeline,
+        "price_generation_state",
+        lambda *_args, **_kwargs: {
+            "generation_id": "synthetic",
+            "comparability_status": "comparable",
+        },
+    )
+
+    with Database(":memory:") as db, patch.object(
+        db, "get_transactions_by_date_range", return_value=trades
+    ):
+        db.upsert_prices(prices)
+        events = pipeline.eligible_events(db, AS_OF, days_back=None)
+
+    blocked = events.iloc[0]
+    assert blocked["source_record_id"] == "20018475"
+    assert blocked["entry_ref"] is None
+    assert blocked["blocked_reason"] == "purchase below PTR disclosure floor ($1,001)"
+
+    # Before the floor gate, the same event had a current entry reference and ranked.
+    previously_eligible = events.assign(entry_ref=100.0, blocked_reason=None)
+    actor = events.iloc[0]["actor_id"]
+    ranked_before, _ = score(
+        previously_eligible,
+        {actor: 1.0},
+        {"ADBE": (100.0, AS_OF)},
+        enable_13f_corroboration=False,
+    )
+    ranked_after, surfaced = score(
+        events,
+        {actor: 1.0},
+        {"ADBE": (100.0, AS_OF)},
+        enable_13f_corroboration=False,
+    )
+    assert ranked_before["ticker"].tolist() == ["ADBE"]
+    assert ranked_after.empty
+    assert surfaced["reason"].tolist() == [
+        "purchase below PTR disclosure floor ($1,001)"
+    ]
+
+    history = {
+        "ADBE": pd.DataFrame({"close": [100.0]}, index=pd.to_datetime(["2024-05-30"]))
+    }
+    no_position = build_positions(trades, history, as_of=AS_OF)
+    assert no_position.empty
+
+
+def test_subfloor_sales_still_relieve_congressional_holdings():
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "Nancy Pelosi",
+                "ticker": "ADBE",
+                "transaction_type": "Purchase",
+                "transaction_date": "2024-05-28",
+                "disclosure_date": "2024-05-29",
+                "amount_midpoint": 1500.0,
+                "source": "house_pdf",
+            },
+            {
+                "member": "Nancy Pelosi",
+                "ticker": "ADBE",
+                "transaction_type": "Sale",
+                "transaction_date": "2024-05-30",
+                "disclosure_date": "2024-05-31",
+                "amount_midpoint": 898.16,
+                "source": "house_pdf",
+            },
+        ]
+    )
+    history = {
+        "ADBE": pd.DataFrame(
+            {"close": [100.0, 100.0, 100.0]},
+            index=pd.to_datetime(["2024-05-28", "2024-05-30", "2024-06-01"]),
+        )
+    }
+
+    positions = build_positions(trades, history, as_of=AS_OF)
+
+    assert positions.iloc[0]["shares"] == pytest.approx(6.0184)
 
 
 def test_finite_contributions_overflowing_the_sum_do_not_rank():

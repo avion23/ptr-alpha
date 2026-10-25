@@ -386,7 +386,9 @@ def eligible_events(
     )
     if days_back is not None:
         eligible &= disclosure_dates >= history_start
-    purchases = prepare_consensus_purchases(trades.loc[eligible].copy())
+    purchases = prepare_consensus_purchases(
+        trades.loc[eligible].copy(), include_below_floor=True
+    )
     if purchases.empty:
         return pd.DataFrame(columns=columns)
 
@@ -399,8 +401,9 @@ def eligible_events(
     }
     closes: dict[str, pd.DataFrame] = {}
     prepared: dict[str, tuple] | None = None
+    priced_purchases = purchases.loc[purchases["_ptr_floor_blocked_reason"].isna()]
     symbols = sorted(
-        {str(value) for value in purchases["_resolved_symbol"].dropna().unique()}
+        {str(value) for value in priced_purchases["_resolved_symbol"].dropna().unique()}
     )
     try:
         connection = getattr(db, "conn", None)
@@ -468,6 +471,7 @@ def eligible_events(
             amount_cell,
             description,
             senate_efd_blocked_reason,
+            floor_blocked_reason,
         ) in zip(
             _cell("source"),
             _cell("member"),
@@ -479,7 +483,11 @@ def eligible_events(
             _cell("amount_midpoint"),
             _cell("asset_description"),
             _cell("_senate_efd_blocked_reason"),
+            _cell("_ptr_floor_blocked_reason"),
         ):
+            is_floor_blocked = isinstance(floor_blocked_reason, str) and bool(
+                floor_blocked_reason
+            )
             kind = kinds.get(source)
             if kind is None:
                 continue
@@ -496,11 +504,13 @@ def eligible_events(
             # filed-price normalization needs a verified generation; congress
             # same-series closes do not — provenance-only there).
             comparability_blocks = False
-            generation = generation_states.get(str(symbol), {})
+            generation = {} if is_floor_blocked else generation_states.get(str(symbol), {})
             generation_id = generation.get("generation_id")
             comparability_status = generation.get("comparability_status", "unknown")
             comparability_reason = generation.get("reason")
-            if source == "form4":
+            if is_floor_blocked:
+                comparability_reason = None
+            elif source == "form4":
                 amount = pd.to_numeric(amount_cell, errors="coerce")
                 shares_match = (
                     re.search(r"([\d,.]+)\s+shares?\s+@", description, re.IGNORECASE)
@@ -561,10 +571,14 @@ def eligible_events(
                     "blocked_reason": (
                         senate_efd_blocked_reason
                         or (
-                            comparability_reason
-                            if comparability_status != "comparable"
-                            and comparability_blocks
-                            else None
+                            floor_blocked_reason
+                            if is_floor_blocked
+                            else (
+                                comparability_reason
+                                if comparability_status != "comparable"
+                                and comparability_blocks
+                                else None
+                            )
                         )
                     ),
                     "event_date": pd.Timestamp(transaction_day).normalize(),

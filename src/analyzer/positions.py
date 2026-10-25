@@ -510,7 +510,10 @@ def build_positions(
     with a close column. Returns one row per open position with cost basis,
     current price, and discount_pct (negative = below member cost).
     """
-    from analyzer.member_ranking.buyer_scoring import equity_transaction_fields
+    from analyzer.member_ranking.buyer_scoring import (
+        equity_transaction_fields,
+        purchase_below_ptr_floor_reason,
+    )
 
     required = {
         "member",
@@ -792,6 +795,12 @@ def build_positions(
             day = pd.Timestamp(day_cell).date()
             day_cache[day_cell] = day
         kind = _transaction_kind(type_cells[i])
+        if purchase_below_ptr_floor_reason(
+            source_cells[i] if has_source else None,
+            type_cells[i],
+            midpoint_cells[i] if has_midpoint else None,
+        ):
+            continue
         subtype_cell = subtype_cells[i] if has_subtype else None
         full_sale = _is_full_sale(kind, subtype_cell)
         partial_sale = _is_partial_sale(kind, subtype_cell)

@@ -27,6 +27,9 @@ _RANKED_FLOOR = 1.0
 _CORROBORATED_FLOOR = 0.25
 _MIN_USABLE_CONTRIBUTION = 0.05
 _13F_CORROBORATION_ENV = "INSIDER_ENABLE_13F_CORROBORATION"
+# Operator decision (2026-10-25): disclosures older than two calendar months
+# cannot contribute to a ranked setup.
+EVIDENCE_MAX_AGE_MONTHS = 2
 
 
 def is_ranked(score_value: float, n_actors: int, corroborated: bool = False) -> bool:
@@ -258,10 +261,21 @@ def score(
 
             usable = []
             seen_reference = False
+            saw_old_evidence = False
             usable_lag = None
             for row in initiators:
                 blocked_reason = row.get("blocked_reason")
                 if isinstance(blocked_reason, str) and blocked_reason.strip():
+                    continue
+                as_of = _as_date_memo(row["as_of"])
+                disclosure_date = _as_date_memo(row["disclosure_date"])
+                if disclosure_date > as_of:
+                    raise ValueError("disclosure_date must not be after as_of")
+                cutoff = (
+                    pd.Timestamp(as_of) - pd.DateOffset(months=EVIDENCE_MAX_AGE_MONTHS)
+                ).date()
+                if disclosure_date < cutoff:
+                    saw_old_evidence = True
                     continue
                 if _missing(row["entry_ref"]):
                     continue
@@ -275,14 +289,9 @@ def score(
                 if current is None or current > entry_tol * entry_ref:
                     continue
 
-                as_of = _as_date_memo(row["as_of"])
-                disclosure_date = _as_date_memo(row["disclosure_date"])
-                if disclosure_date > as_of:
-                    raise ValueError("disclosure_date must not be after as_of")
                 days_since_disclosure = (as_of - disclosure_date).days
-                # Position evidence persists at full weight; event-only
-                # evidence decays continuously. No cliff: the flag, not an
-                # age threshold, separates the two.
+                # Both evidence types share the age cutoff; event evidence
+                # retains its continuous half-life decay inside that window.
                 position_evidence = bool(row.get("position_evidence", False))
                 decay = (
                     1.0
@@ -314,6 +323,8 @@ def score(
                 )
                 if blocked_reason:
                     reason = blocked_reason
+                elif saw_old_evidence:
+                    reason = f"evidence older than {EVIDENCE_MAX_AGE_MONTHS} months"
                 elif not seen_reference:
                     reason = "no entry reference"
                 elif current is None:

@@ -197,7 +197,7 @@ def test_over_tolerance_actor_is_blocked_and_not_counted():
     assert blocked.iloc[0]["reason"] == "above entry tolerance"
 
 
-def test_ranked_row_reports_disclosure_freshness():
+def test_old_position_evidence_is_blocked_not_merely_descriptive():
     stale = _row(
         actor_id="congress:OLD",
         position_evidence=True,
@@ -210,22 +210,24 @@ def test_ranked_row_reports_disclosure_freshness():
     )
     ranked, _ = score(
         pd.DataFrame([stale, fresh]),
-        {"congress:OLD": 0.52, "congress:NEW": 0.52},
+        {"congress:OLD": 1.0, "congress:NEW": 1.0},
         {"AAPL": 100.0},
     )
     assert len(ranked) == 1
-    assert ranked.iloc[0]["min_disclosure_lag_days"] == 2
+    assert ranked.iloc[0]["actors"] == ["congress:NEW"]
     assert ranked.iloc[0]["has_fresh_evidence"]
-    ranked_stale, _ = score(
+    ranked_stale, blocked_stale = score(
         pd.DataFrame([stale, _row(actor_id="congress:OLD2",
                                   position_evidence=True,
                                   disclosure_date=date(2020, 6, 1))]),
-        {"congress:OLD": 0.52, "congress:OLD2": 0.52},
+        {"congress:OLD": 1.0, "congress:OLD2": 1.0},
         {"AAPL": 100.0},
     )
-    assert len(ranked_stale) == 1
-    assert not ranked_stale.iloc[0]["has_fresh_evidence"]
-    assert ranked_stale.iloc[0]["min_disclosure_lag_days"] > 90
+    assert ranked_stale.empty
+    assert blocked_stale["reason"].tolist() == [
+        "evidence older than 2 months",
+        "evidence older than 2 months",
+    ]
 
 
 def test_missing_weight_defaults_to_zero():
@@ -294,7 +296,7 @@ def test_preblocked_positive_entry_does_not_initiate_or_contaminate_other_rows()
     )
 
 
-def test_preblocked_fresh_entry_does_not_refresh_usable_evidence_freshness():
+def test_preblocked_fresh_entry_does_not_refresh_old_position_evidence():
     stale = _row(
         actor_id="congress:A",
         disclosure_date=date(2024, 1, 1),
@@ -307,15 +309,20 @@ def test_preblocked_fresh_entry_does_not_refresh_usable_evidence_freshness():
     )
     fresh_blocked["blocked_reason"] = "upstream row restriction"
 
-    ranked, _ = score(
+    ranked, blocked = score(
         pd.DataFrame([stale, fresh_blocked]),
         {"congress:A": 1.0},
         {"AAPL": (100.0, AS_OF)},
     )
 
-    assert len(ranked) == 1
-    assert ranked.iloc[0]["min_disclosure_lag_days"] == 152
-    assert not ranked.iloc[0]["has_fresh_evidence"]
+    assert ranked.empty
+    assert blocked.to_dict("records") == [
+        {
+            "ticker": "AAPL",
+            "actor_id": "congress:A",
+            "reason": "upstream row restriction",
+        }
+    ]
 
 
 @pytest.mark.parametrize("reason", [None, float("nan"), "", "   "])
@@ -488,7 +495,7 @@ def test_reasons_and_decay_are_deterministic():
                 actor_id="congress:PELOSI",
                 entry_ref=169.11,
                 event_date=date(2024, 3, 1),
-                disclosure_date=date(2024, 3, 1),
+                disclosure_date=date(2024, 4, 1),
                 position_evidence=True,
             ),
         ]
@@ -532,18 +539,8 @@ def test_fresh_initiation_decays_from_disclosure_date():
     assert ranked.iloc[0]["score"] == pytest.approx(2 * 0.5 ** (1 / 90))
 
 
-def test_no_decay_cliff_between_day_60_and_61():
-    old = pd.DataFrame(
-        [
-            _row(event_date=date(2024, 3, 31), disclosure_date=date(2024, 3, 31)),
-            _row(
-                actor_id="congress:CRUZ",
-                event_date=date(2024, 3, 31),
-                disclosure_date=date(2024, 3, 31),
-            ),
-        ]
-    )
-    new = pd.DataFrame(
+def test_within_window_event_decay_is_continuous_near_cutoff():
+    day_61 = pd.DataFrame(
         [
             _row(event_date=date(2024, 4, 1), disclosure_date=date(2024, 4, 1)),
             _row(
@@ -553,21 +550,108 @@ def test_no_decay_cliff_between_day_60_and_61():
             ),
         ]
     )
-    # as_of 2024-06-01: disclosures 62 vs 61 days old; continuous decay
-    # must not jump the way a 60-day position-evidence switch did.
+    day_60 = pd.DataFrame(
+        [
+            _row(event_date=date(2024, 4, 2), disclosure_date=date(2024, 4, 2)),
+            _row(
+                actor_id="congress:CRUZ",
+                event_date=date(2024, 4, 2),
+                disclosure_date=date(2024, 4, 2),
+            ),
+        ]
+    )
+    # Both disclosures are within the calendar-month window ending 2024-06-01.
     weights = {"congress:PELOSI": 1.0, "congress:CRUZ": 1.0}
-    s_old, _ = score(old, weights, {"AAPL": 100.0})
-    s_new, _ = score(new, weights, {"AAPL": 100.0})
-    assert abs(s_old.iloc[0]["score"] - s_new.iloc[0]["score"]) < 0.1
+    s_61, _ = score(day_61, weights, {"AAPL": 100.0})
+    s_60, _ = score(day_60, weights, {"AAPL": 100.0})
+    assert abs(s_61.iloc[0]["score"] - s_60.iloc[0]["score"]) < 0.1
 
 
 def test_position_evidence_holds_full_weight():
-    row = _row(event_date=date(2023, 1, 1), disclosure_date=date(2023, 1, 5))
+    row = _row(event_date=date(2023, 1, 1), disclosure_date=date(2024, 4, 1))
     row["position_evidence"] = True
     ranked, _ = score(
         pd.DataFrame([row]), {"congress:PELOSI": 1.0}, {"AAPL": 100.0}
     )
     assert ranked.iloc[0]["score"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("position_evidence", [False, True])
+@pytest.mark.parametrize(
+    ("disclosure_date", "eligible"),
+    [(date(2024, 4, 1), True), (date(2024, 3, 31), False)],
+)
+def test_calendar_month_cutoff_gates_position_and_event_evidence(
+    position_evidence, disclosure_date, eligible
+):
+    candidates = pd.DataFrame(
+        [
+            _row(
+                actor_id="officer:A",
+                disclosure_date=disclosure_date,
+                position_evidence=position_evidence,
+            )
+        ]
+    )
+    ranked, blocked = score(candidates, {"officer:A": 2.0}, {"AAPL": 100.0})
+
+    if eligible:
+        assert ranked.iloc[0]["score"] == pytest.approx(
+            2.0 if position_evidence else 2.0 * 0.5 ** (61 / 90)
+        )
+        assert blocked.empty
+    else:
+        assert ranked.empty
+        assert blocked.to_dict("records") == [
+            {
+                "ticker": "AAPL",
+                "actor_id": "officer:A",
+                "reason": "evidence older than 2 months",
+            }
+        ]
+
+
+def test_evidence_cutoff_uses_historical_as_of_date():
+    row = _row(
+        actor_id="officer:HISTORICAL",
+        disclosure_date=date(2026, 1, 9),
+        position_evidence=True,
+    )
+    row["as_of"] = date(2026, 3, 10)
+    ranked, blocked = score(
+        pd.DataFrame([row]),
+        {"officer:HISTORICAL": 1.0},
+        {"AAPL": (100.0, date(2026, 3, 10))},
+    )
+    assert ranked.empty
+    assert blocked.iloc[0]["reason"] == "evidence older than 2 months"
+
+    row["disclosure_date"] = date(2026, 1, 10)
+    ranked, blocked = score(
+        pd.DataFrame([row]),
+        {"officer:HISTORICAL": 1.0},
+        {"AAPL": (100.0, date(2026, 3, 10))},
+    )
+    assert ranked.iloc[0]["score"] == pytest.approx(1.0)
+    assert blocked.empty
+
+
+def test_recent_event_evidence_keeps_90_day_half_life_inside_window():
+    disclosure_date = date(2024, 4, 2)  # 60 days before AS_OF; cutoff is Apr 1.
+    candidates = pd.DataFrame(
+        [
+            _row(actor_id=actor, disclosure_date=disclosure_date)
+            for actor in ("officer:A", "officer:B")
+        ]
+    )
+    ranked, blocked = score(
+        candidates,
+        {"officer:A": 1.0, "officer:B": 1.0},
+        {"AAPL": 100.0},
+    )
+    assert ranked.iloc[0]["score"] == pytest.approx(2 * 0.5 ** (60 / 90))
+    assert ranked.iloc[0]["actors"] == ["officer:A", "officer:B"]
+    assert blocked.empty
 
 
 def test_reason_verb_labels_basis_for_positions_and_buy_for_events():

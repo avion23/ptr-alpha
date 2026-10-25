@@ -1,6 +1,6 @@
 import subprocess
 import sys
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +10,9 @@ import pytest
 from typer.testing import CliRunner
 
 from analyzer.cli import _open_database, app
+from analyzer.canonical_scope import decision_history
 from analyzer.persistence.database import Database
+from analyzer.persistence.source_report_repository import SOURCE_REPORT_INPUT_COLUMNS
 from analyzer.download import HouseFetchSummary, HouseTransactionSource
 from analyzer.exceptions import DataResult, DataSourceError, StepResult
 from analyzer.member_ranking.buyer_scoring import get_consensus_candidate_tickers
@@ -28,6 +30,8 @@ from analyzer.pipeline import (
     run_ticker_analysis,
 )
 from analyzer.price_source import _set_generation_state, _store_generation
+from analyzer.positions import holdings_candidates, holdings_candidates_batch
+from analyzer.setups import score
 from analyzer.settings import Settings
 
 
@@ -439,6 +443,136 @@ def test_prepare_live_consensus_data_none_loads_history_outside_default_window()
     source.db.get_transactions_by_date_range.assert_called_once_with(
         date.min, as_of
     )
+
+
+def test_senate_efd_report_row_count_quarantine_is_candidate_only(tmp_path):
+    as_of = date.today()
+    trade_date = as_of - timedelta(days=10)
+    reports = []
+    transactions = []
+    price_rows = []
+    cases = [(703, "AAPL"), (94, "MSFT"), (142, "GOOG"), (143, "NVDA")]
+    generation = "synthetic-senate-generation"
+    for index, (accepted_count, ticker) in enumerate(cases, start=1):
+        record_id = f"synthetic-report-{accepted_count}"
+        digest = f"{index:064x}"
+        member = f"Synthetic Member {accepted_count}"
+        reports.append(
+            {
+                "ingestion_generation": generation,
+                "chamber": "senate",
+                "source_record_id": record_id,
+                "report_path": f"{record_id}.html",
+                "member": member,
+                "official_filing_date": as_of,
+                "outcome": "parsed",
+                "artifact_sha256": digest,
+                "landing_sha256": digest,
+                "paper_artifact_url": None,
+                "paper_artifact_sha256": None,
+                "error_message": None,
+                "raw_row_count": accepted_count,
+                "accepted_row_count": accepted_count,
+                "rejected_row_count": 0,
+            }
+        )
+        transactions.append(
+            {
+                "doc_id": record_id,
+                "member": member,
+                "ticker": ticker,
+                "ticker_origin": "official",
+                "transaction_date": trade_date,
+                "disclosure_date": as_of,
+                "official_filing_date": as_of,
+                "transaction_type": "Purchase",
+                "amount_midpoint": 10000.0,
+                "instrument_type": "stock",
+                "raw_asset_class": "ST",
+                "asset_description": "Common Stock",
+                "chamber": "senate",
+                "source_record_id": record_id,
+                "source_row_id": "table:000001",
+                "ingestion_generation": generation,
+                "artifact_sha256": digest,
+            }
+        )
+        price_rows.extend([(ticker, trade_date, 100.0), (ticker, as_of, 100.0)])
+
+    db = Database(tmp_path / "senate-row-count-quarantine.duckdb")
+    try:
+        db.upsert_transactions(pd.DataFrame(transactions), source="senate_efd")
+        db.replace_source_reports(
+            generation,
+            "senate_efd",
+            "senate",
+            pd.DataFrame(reports, columns=SOURCE_REPORT_INPUT_COLUMNS),
+        )
+        db.conn.executemany("INSERT INTO prices VALUES (?, ?, ?)", price_rows)
+
+        # The report inventory and canonical transactions remain available to
+        # audit/display callers; quarantine is only at evidence assembly.
+        assert len(db.get_transactions_by_date_range(trade_date, as_of)) == len(cases)
+        stored_reports = db.get_source_reports(generation, "senate_efd", "senate")
+        assert dict(
+            zip(
+                stored_reports["source_record_id"],
+                stored_reports["accepted_row_count"],
+            )
+        ) == {
+            "synthetic-report-703": 703,
+            "synthetic-report-94": 94,
+            "synthetic-report-142": 142,
+            "synthetic-report-143": 143,
+        }
+
+        events = eligible_events(db, as_of, days_back=None)
+        assert len(events) == len(cases)
+        blocked_reason = events.set_index("source_record_id")["blocked_reason"]
+        assert blocked_reason["synthetic-report-703"] == (
+            "senate eFD report row-count anomaly (703 > 142)"
+        )
+        assert blocked_reason["synthetic-report-143"] == (
+            "senate eFD report row-count anomaly (143 > 142)"
+        )
+        assert pd.isna(blocked_reason["synthetic-report-94"])
+        assert pd.isna(blocked_reason["synthetic-report-142"])
+
+        ranked, blocked = score(
+            events,
+            {actor: 1.0 for actor in events["actor_id"]},
+            {ticker: (100.0, as_of) for _, ticker in cases},
+            enable_13f_corroboration=False,
+        )
+        assert set(ranked["ticker"]) == {"MSFT", "GOOG"}
+        assert set(blocked["reason"]) == {
+            "senate eFD report row-count anomaly (703 > 142)",
+            "senate eFD report row-count anomaly (143 > 142)",
+        }
+
+        live = prepare_live_consensus_data(
+            SimpleNamespace(db=db), pd.Timestamp(as_of), days_back=None
+        )
+        assert set(live["source_record_id"]) == {
+            "synthetic-report-94",
+            "synthetic-report-142",
+        }
+        replay = decision_history(db, trade_date, [pd.Timestamp(as_of)])[0]
+        assert set(replay["source_record_id"]) == {
+            "synthetic-report-94",
+            "synthetic-report-142",
+        }
+
+        members = [f"Synthetic Member {count}" for count, _ in cases]
+        batch = holdings_candidates_batch(db, members, as_of)
+        assert batch[members[0]].empty
+        assert batch[members[1]]["ticker"].tolist() == ["MSFT"]
+        assert batch[members[2]]["ticker"].tolist() == ["GOOG"]
+        assert batch[members[3]].empty
+        assert holdings_candidates(db, members[0], as_of).empty
+        assert holdings_candidates(db, members[1], as_of)["ticker"].tolist() == ["MSFT"]
+    finally:
+        db.close()
 
 
 def test_eligible_events_maps_official_actor_sources_and_entry_reference():

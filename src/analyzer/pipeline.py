@@ -30,6 +30,9 @@ from analyzer.member_ranking.buyer_scoring import (
 from analyzer.models import AnalysisMode, SourceCoverageState
 from analyzer.positions import EntryCloseLookup, split_price_history
 from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.source_report_repository import (
+    senate_efd_row_count_anomaly_reasons,
+)
 from analyzer.price_snapshot import create_snapshot
 from analyzer.price_source import price_adjustment_factor, price_generation_state
 from analyzer.ticker_resolver import TickerResolver
@@ -276,6 +279,12 @@ def prepare_live_consensus_data(
     if trades.empty:
         return trades.copy()
 
+    anomaly_reasons = senate_efd_row_count_anomaly_reasons(
+        transaction_source.db.conn, trades
+    )
+    if anomaly_reasons.notna().any():
+        trades = trades.loc[anomaly_reasons.isna().to_numpy()].copy()
+
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
     eligible = trades["ticker"].notna() & disclosure_dates.notna()
     if days_back is not None:
@@ -350,6 +359,10 @@ def eligible_events(
         trades.columns
     ):
         return pd.DataFrame(columns=columns)
+
+    anomaly_reasons = senate_efd_row_count_anomaly_reasons(db.conn, trades)
+    trades = trades.copy()
+    trades["_senate_efd_blocked_reason"] = anomaly_reasons.to_numpy()
 
     disclosure_dates = pd.to_datetime(trades["disclosure_date"], errors="coerce")
     unresolved_13f = trades["source"].eq("13f") & trades["ticker"].isna()
@@ -454,6 +467,7 @@ def eligible_events(
             row_id,
             amount_cell,
             description,
+            senate_efd_blocked_reason,
         ) in zip(
             _cell("source"),
             _cell("member"),
@@ -464,6 +478,7 @@ def eligible_events(
             _cell("source_row_id"),
             _cell("amount_midpoint"),
             _cell("asset_description"),
+            _cell("_senate_efd_blocked_reason"),
         ):
             kind = kinds.get(source)
             if kind is None:
@@ -544,10 +559,13 @@ def eligible_events(
                     "comparability_status": comparability_status,
                     "comparability_reason": comparability_reason,
                     "blocked_reason": (
-                        comparability_reason
-                        if comparability_status != "comparable"
-                        and comparability_blocks
-                        else None
+                        senate_efd_blocked_reason
+                        or (
+                            comparability_reason
+                            if comparability_status != "comparable"
+                            and comparability_blocks
+                            else None
+                        )
                     ),
                     "event_date": pd.Timestamp(transaction_day).normalize(),
                     "disclosure_date": pd.Timestamp(disclosure_day).normalize(),

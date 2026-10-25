@@ -34,6 +34,9 @@ from analyzer.member_names import (
     same_member_identity,
 )
 from analyzer.parsing.cells import extract_amount_midpoint, extract_instrument_type
+from analyzer.persistence.source_report_repository import (
+    senate_efd_row_count_anomaly_reasons,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1101,6 +1104,11 @@ def holdings_candidates(
     trades = load_member_trades(db, member, include_unpromoted=include_unpromoted)
     if trades.empty:
         return pd.DataFrame(columns=columns)
+    anomaly_reasons = senate_efd_row_count_anomaly_reasons(db.conn, trades)
+    if anomaly_reasons.notna().any():
+        trades = trades.loc[anomaly_reasons.isna().to_numpy()].copy()
+        if trades.empty:
+            return pd.DataFrame(columns=columns)
 
     trades = trades.loc[trades["source"].isin(source_kinds)].copy()
     if trades.empty:
@@ -1179,6 +1187,10 @@ def holdings_candidates_batch(
         """,
         [universe],
     ).fetchdf()
+    if not canonical.empty:
+        anomaly_reasons = senate_efd_row_count_anomaly_reasons(db.conn, canonical)
+        if anomaly_reasons.notna().any():
+            canonical = canonical.loc[anomaly_reasons.isna().to_numpy()].copy()
     by_member: dict[str, pd.DataFrame] = {}
     kind_by_member: dict[str, pd.Series | None] = {}
     if not canonical.empty:
@@ -1643,7 +1655,11 @@ _EQUITY_CLASS_COLUMNS = (
     "raw_asset_class",
     "raw_asset_description",
 )
-_LOADER_COLUMNS = (*_FIFO_LOADER_COLUMNS, *_EQUITY_CLASS_COLUMNS)
+_LOADER_COLUMNS = (
+    *_FIFO_LOADER_COLUMNS,
+    *_EQUITY_CLASS_COLUMNS,
+    "ingestion_generation",
+)
 
 
 def _loader_select(db, table: str) -> str:

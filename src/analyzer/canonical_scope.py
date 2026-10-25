@@ -5,16 +5,32 @@ from inspect import signature
 from datetime import timedelta
 import pandas as pd
 
+from analyzer.persistence.source_report_repository import (
+    senate_efd_row_count_anomaly_reasons,
+)
+
 
 def decision_history(db, start, decisions, *, lookback_days=28):
     frames = []
     for decision in decisions:
         scope_date = getattr(db, "_canonical_as_of", None) or decision
-        scope = db.canonical_as_of(scope_date) if hasattr(db, "canonical_as_of") else nullcontext()
+        scope = (
+            db.canonical_as_of(scope_date)
+            if hasattr(db, "canonical_as_of")
+            else nullcontext()
+        )
         with scope:
-            frames.append(db.get_transactions_by_date_range(
-                max(pd.Timestamp(start), pd.Timestamp(decision) - timedelta(days=lookback_days)), decision
-            ))
+            frame = db.get_transactions_by_date_range(
+                max(
+                    pd.Timestamp(start),
+                    pd.Timestamp(decision) - timedelta(days=lookback_days),
+                ),
+                decision,
+            )
+        anomaly_reasons = senate_efd_row_count_anomaly_reasons(db.conn, frame)
+        if anomaly_reasons.notna().any():
+            frame = frame.loc[anomaly_reasons.isna().to_numpy()].copy()
+        frames.append(frame)
     return frames
 
 

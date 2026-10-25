@@ -63,6 +63,55 @@ SOURCE_REPORT_INPUT_COLUMNS = [
     column for column in SOURCE_REPORT_COLUMNS if column != "source"
 ]
 
+# Senate eFD counts are heavy-right-skewed (n=156; p50=4, p90=17.5, p99=70.9).
+# Use 2x p99 as a robust tail fence, not a fit to the 703-row report:
+# ceil(2 x p99) = ceil(141.8) = 142. The next-largest is 94, so only 703
+# crosses it. The report shape, not member identity, determines quarantine.
+SENATE_EFD_MAX_ACCEPTED_ROW_COUNT = 142
+
+
+def senate_efd_row_count_anomaly_reasons(conn, transactions: pd.DataFrame) -> pd.Series:
+    """Return report-shape quarantine reasons aligned to transaction rows."""
+    reasons = [None] * len(transactions)
+    required = {"source", "ingestion_generation", "source_record_id"}
+    if transactions.empty or not required.issubset(transactions.columns):
+        return pd.Series(reasons, index=transactions.index, dtype=object)
+
+    sources = transactions["source"].tolist()
+    if not any(source == "senate_efd" for source in sources if isinstance(source, str)):
+        return pd.Series(reasons, index=transactions.index, dtype=object)
+
+    oversized = conn.execute(
+        """
+        SELECT ingestion_generation, source_record_id, accepted_row_count
+        FROM source_reports
+        WHERE source = 'senate_efd' AND accepted_row_count > ?
+        """,
+        [SENATE_EFD_MAX_ACCEPTED_ROW_COUNT],
+    ).fetchall()
+    counts = {
+        (generation, record_id): int(row_count)
+        for generation, record_id, row_count in oversized
+    }
+    for position, (source, generation, record_id) in enumerate(
+        zip(
+            sources,
+            transactions["ingestion_generation"].tolist(),
+            transactions["source_record_id"].tolist(),
+        )
+    ):
+        if not isinstance(source, str) or source != "senate_efd":
+            continue
+        if not isinstance(generation, str) or not isinstance(record_id, str):
+            continue
+        count = counts.get((generation, record_id))
+        if count is not None:
+            reasons[position] = (
+                f"senate eFD report row-count anomaly "
+                f"({count} > {SENATE_EFD_MAX_ACCEPTED_ROW_COUNT})"
+            )
+    return pd.Series(reasons, index=transactions.index, dtype=object)
+
 
 class SourceReportRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection) -> None:

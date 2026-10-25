@@ -7,6 +7,7 @@ and prevents false skill attribution.
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import date
 
@@ -15,8 +16,14 @@ import pandas as pd
 
 from analyzer.canonical_scope import canonical_decision
 from analyzer.member_names import actor_id, same_actor_identity
-from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.price_repository import (
+    next_nyse_session,
+    previous_nyse_session,
+)
+from analyzer.price_source import price_generation_states
 from analyzer.ticker_resolver import TickerResolver
+
+logger = logging.getLogger(__name__)
 
 SOURCE_PRIORS = {
     "house_pdf": 0.52,
@@ -72,7 +79,9 @@ def compute_skill_table(
     The entry is the first NYSE close after disclosure. The exit is the last
     NYSE close on or before disclosure + 90 calendar days. Both the disclosure
     and exit must be strictly before ``as_of``. Price rows on or after the
-    cutoff are ignored, even when callers provide them.
+    cutoff are ignored, even when callers provide them. Every endpoint must
+    also have known-comparable price-generation provenance, and a ticker's
+    entry and exit must use the same generation.
     """
     if disclosures.empty:
         return pd.DataFrame(columns=_SKILL_COLUMNS)
@@ -94,6 +103,17 @@ def compute_skill_table(
     ].copy()
     eligible_prices["_date"] = price_dates.loc[eligible_prices.index].dt.normalize()
     eligible_prices["_close"] = price_values.loc[eligible_prices.index]
+    if {"price_generation_id", "comparability_status"}.issubset(prices.columns):
+        eligible_prices["_generation_id"] = prices.loc[
+            eligible_prices.index, "price_generation_id"
+        ]
+        eligible_prices["_comparability_status"] = prices.loc[
+            eligible_prices.index, "comparability_status"
+        ]
+    else:
+        # Missing provenance is uncertainty, not evidence of comparability.
+        eligible_prices["_generation_id"] = None
+        eligible_prices["_comparability_status"] = "unknown"
 
     # Pass 1: resolve episodes and the exact price keys they will consult.
     disclosure_dates = pd.to_datetime(disclosures["disclosure_date"], errors="coerce")
@@ -169,24 +189,61 @@ def compute_skill_table(
     ).drop_duplicates()
     matched = pd.DataFrame(
         {"_code": np.asarray(ticker_codes), "_day": day_ints,
-         "_close": eligible_prices["_close"].to_numpy()}
+         "_close": eligible_prices["_close"].to_numpy(),
+         "_generation_id": eligible_prices["_generation_id"].to_numpy(),
+         "_comparability_status": eligible_prices["_comparability_status"].to_numpy()}
     ).merge(wanted, on=["_code", "_day"], how="inner")
     matched = matched.drop_duplicates(["_code", "_day"], keep="last")
     closes: dict[tuple[str, int], float] = {}
-    for code, day_int, close in zip(
+    generation_states: dict[tuple[str, int], tuple[object, object]] = {}
+    for code, day_int, close, generation_id, comparability_status in zip(
         matched["_code"].tolist(),
         matched["_day"].tolist(),
         matched["_close"].tolist(),
+        matched["_generation_id"].tolist(),
+        matched["_comparability_status"].tolist(),
     ):
-        closes[(ticker_keys[code], day_int)] = float(close)
+        key = (ticker_keys[code], day_int)
+        closes[key] = float(close)
+        generation_states[key] = (generation_id, comparability_status)
 
     by_actor: dict[str, list[float]] = {}
+    noncomparable_drops = 0
     for actor, ticker, entry, exit_date in episodes:
-        security_entry = closes.get((ticker, entry.value))
-        security_exit = closes.get((ticker, exit_date.value))
-        spy_entry = closes.get(("SPY", entry.value))
-        spy_exit = closes.get(("SPY", exit_date.value))
+        keys = [
+            (ticker, entry.value),
+            (ticker, exit_date.value),
+            ("SPY", entry.value),
+            ("SPY", exit_date.value),
+        ]
+        security_entry, security_exit, spy_entry, spy_exit = (
+            closes.get(key) for key in keys
+        )
         if None in (security_entry, security_exit, spy_entry, spy_exit):
+            continue
+        endpoint_states = [generation_states.get(key) for key in keys]
+        generation_ids = []
+        valid_states = True
+        for state in endpoint_states:
+            if state is None:
+                valid_states = False
+                break
+            generation_id, comparability_status = state
+            if (
+                comparability_status != "comparable"
+                or generation_id is None
+                or pd.isna(generation_id)
+                or not str(generation_id).strip()
+            ):
+                valid_states = False
+                break
+            generation_ids.append(str(generation_id))
+        if (
+            not valid_states
+            or generation_ids[0] != generation_ids[1]
+            or generation_ids[2] != generation_ids[3]
+        ):
+            noncomparable_drops += 1
             continue
         excess = (
             (security_exit / security_entry - 1.0)
@@ -194,6 +251,12 @@ def compute_skill_table(
         ) * 100.0
         if math.isfinite(excess):
             by_actor.setdefault(actor, []).append(excess)
+
+    if noncomparable_drops:
+        logger.warning(
+            "Dropped %d matured skill episodes without comparable, consistent price generations",
+            noncomparable_drops,
+        )
 
     return pd.DataFrame(
         [
@@ -380,6 +443,17 @@ def load_skill_table(
         "WHERE ticker = ANY(?) AND date >= ? AND date < ?",
         [price_tickers, min_date, cutoff.date()],
     ).fetchdf()
+    states = price_generation_states(db)
+    prices["price_generation_id"] = prices["ticker"].map(
+        lambda ticker: (states.get(str(ticker).strip().upper()) or {}).get(
+            "generation_id"
+        )
+    )
+    prices["comparability_status"] = prices["ticker"].map(
+        lambda ticker: (states.get(str(ticker).strip().upper()) or {}).get(
+            "comparability_status", "unknown"
+        )
+    )
     skill_table = compute_skill_table(disclosures, prices, cutoff)
     if actor_ids is not None:
         history_ids = set(selected["actor_id"])

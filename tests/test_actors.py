@@ -1,5 +1,5 @@
-import pytest
 import pandas as pd
+import pytest
 
 from analyzer.actors import (
     SOURCE_PRIORS,
@@ -9,7 +9,30 @@ from analyzer.actors import (
     compute_weight,
 )
 from analyzer.persistence.database import Database
-from analyzer.persistence.price_repository import next_nyse_session, previous_nyse_session
+from analyzer.persistence.price_repository import (
+    next_nyse_session,
+    previous_nyse_session,
+)
+from analyzer.price_source import (
+    _set_generation_state,
+    ensure_price_generation_schema,
+)
+
+
+def _with_comparable_generations(prices):
+    prices = prices.copy()
+    prices["price_generation_id"] = prices["ticker"].map(
+        lambda ticker: f"test-generation:{str(ticker).strip().upper()}"
+    )
+    prices["comparability_status"] = "comparable"
+    return prices
+
+
+def _set_comparable_states(db, tickers):
+    ensure_price_generation_schema(db)
+    for ticker in sorted(set(tickers)):
+        ticker = str(ticker).strip().upper()
+        _set_generation_state(db, ticker, f"test-generation:{ticker}", "comparable")
 
 
 @pytest.mark.parametrize(
@@ -78,10 +101,138 @@ def test_skill_table_excludes_future_disclosures_and_unmatured_outcomes():
         columns=["ticker", "date", "close"],
     )
 
-    skill_table = compute_skill_table(disclosures, prices, as_of)
+    skill_table = compute_skill_table(
+        disclosures, _with_comparable_generations(prices), as_of
+    )
 
     assert skill_table.to_dict("records") == [
         {"actor_id": "congress:ALICE", "n_matured": 2, "mean_excess_pct": pytest.approx(5.0)}
+    ]
+
+
+def test_skill_outcomes_require_comparable_consistent_price_generations(caplog):
+    disclosures = pd.DataFrame(
+        [
+            {
+                "actor_id": "congress:SPLIT",
+                "ticker": "SPLT",
+                "source": "house_pdf",
+                "disclosure_date": "2023-01-03",
+            },
+            *[
+                {
+                    "actor_id": "congress:COMPARABLE",
+                    "ticker": ticker,
+                    "source": "house_pdf",
+                    "disclosure_date": pd.Timestamp("2023-01-04")
+                    + pd.Timedelta(days=index),
+                }
+                for index, ticker in enumerate(("GOOD1", "GOOD2", "GOOD3"))
+            ],
+            {
+                "actor_id": "congress:MIXED",
+                "ticker": "MIXD",
+                "source": "house_pdf",
+                "disclosure_date": "2023-01-08",
+            },
+        ]
+    )
+    rows = []
+
+    def add_pair(
+        ticker, disclosed, entry_close, exit_close, entry_gen, exit_gen, status="comparable"
+    ):
+        entry = next_nyse_session(pd.Timestamp(disclosed)).normalize()
+        exit_date = previous_nyse_session(
+            pd.Timestamp(disclosed) + pd.Timedelta(days=90)
+        ).normalize()
+        rows.extend(
+            [
+                (ticker, entry, entry_close, entry_gen, status),
+                (ticker, exit_date, exit_close, exit_gen, status),
+                ("SPY", entry, 100.0, "spy-generation", "comparable"),
+                ("SPY", exit_date, 100.0, "spy-generation", "comparable"),
+            ]
+        )
+
+    add_pair(
+        "SPLT", "2023-01-03", 100.0, 10.0,
+        "split-generation", "split-generation", "unknown",
+    )
+    for index, ticker in enumerate(("GOOD1", "GOOD2", "GOOD3")):
+        disclosed = pd.Timestamp("2023-01-04") + pd.Timedelta(days=index)
+        add_pair(
+            ticker, disclosed, 100.0, 110.0,
+            f"generation:{ticker}", f"generation:{ticker}",
+        )
+    add_pair(
+        "MIXD", "2023-01-08", 100.0, 110.0,
+        "entry-generation", "exit-generation",
+    )
+    prices = pd.DataFrame(
+        rows,
+        columns=[
+            "ticker", "date", "close", "price_generation_id",
+            "comparability_status",
+        ],
+    )
+
+    with caplog.at_level("WARNING", logger="analyzer.actors"):
+        skill_table = compute_skill_table(
+            disclosures, prices, pd.Timestamp("2023-06-01")
+        )
+
+    assert skill_table.to_dict("records") == [
+        {
+            "actor_id": "congress:COMPARABLE",
+            "n_matured": 3,
+            "mean_excess_pct": pytest.approx(10.0),
+        }
+    ]
+    assert "Dropped 2 matured skill episodes" in caplog.text
+
+
+def test_load_skill_table_uses_persisted_comparable_generation_state(tmp_path):
+    from analyzer.actors import load_skill_table
+
+    db = Database(tmp_path / "skill-price-generations.duckdb")
+    _insert_positive_skill_history(
+        db, "Comparable Member", "house_pdf", ("AAA", "BBB", "CCC")
+    )
+    disclosed = pd.Timestamp("2023-01-05")
+    entry = next_nyse_session(disclosed).date()
+    exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).date()
+    db.conn.execute(
+        "INSERT INTO transactions (doc_id, member, ticker, transaction_date, "
+        "disclosure_date, transaction_type, owner_code, amount_raw, amount_midpoint, "
+        "source, created_at) VALUES ('split-member', 'Split Member', 'SPLT', ?, ?, "
+        "'Purchase', '', '$1,001 - $15,000', 8000, 'house_pdf', '2023-01-01')",
+        [disclosed.date(), disclosed.date()],
+    )
+    db.conn.executemany(
+        "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+        [("SPLT", entry, 100.0), ("SPLT", exit_date, 10.0)],
+    )
+    _set_generation_state(
+        db, "SPLT", "split-unadjusted-generation", "unknown",
+        "split-adjusted-generation", "split overlap diverges",
+    )
+
+    try:
+        skill_table = load_skill_table(
+            db,
+            pd.Timestamp("2023-05-01"),
+            {"congress:COMPARABLE MEMBER", "congress:SPLIT MEMBER"},
+        )
+    finally:
+        db.close()
+
+    assert skill_table.to_dict("records") == [
+        {
+            "actor_id": "congress:COMPARABLE MEMBER",
+            "n_matured": 3,
+            "mean_excess_pct": pytest.approx(10.0),
+        }
     ]
 
 
@@ -140,6 +291,7 @@ def test_mccaul_skill_matches_exact_name_variant_only(tmp_path):
         "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
         [(ticker, day, close) for (ticker, day), close in prices.items()],
     )
+    _set_comparable_states(db, [ticker for ticker, _ in prices])
     candidates = pd.DataFrame(
         [
             {
@@ -198,6 +350,7 @@ def test_accented_surname_skill_history_is_found(tmp_path):
         "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
         [(ticker, day, close) for (ticker, day), close in prices.items()],
     )
+    _set_comparable_states(db, [ticker for ticker, _ in prices])
     candidates = pd.DataFrame(
         [
             {
@@ -319,6 +472,7 @@ def _insert_positive_skill_history(db, member, source, tickers):
         "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
         [(ticker, day, close) for (ticker, day), close in prices.items()],
     )
+    _set_comparable_states(db, [ticker for ticker, _ in prices])
 
 
 def test_single_actor_skill_history_query_returns_only_matching_rows(tmp_path, monkeypatch):
@@ -460,6 +614,7 @@ def test_ligature_name_history_uses_full_python_normalized_history(tmp_path):
         "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
         [(ticker, day, close) for (ticker, day), close in prices.items()],
     )
+    _set_comparable_states(db, [ticker for ticker, _ in prices])
     requested_id = actor_id("congress", "John Flower")
     candidates = pd.DataFrame(
         [{"actor_id": requested_id, "kind": "congress", "source": "house_pdf"}]
@@ -518,7 +673,9 @@ def test_float_residue_zero_mean_does_not_validate_skill():
         )
     skill_table = compute_skill_table(
         disclosures,
-        pd.DataFrame(prices, columns=["ticker", "date", "close"]),
+        _with_comparable_generations(
+            pd.DataFrame(prices, columns=["ticker", "date", "close"])
+        ),
         pd.Timestamp("2024-05-01"),
     )
     candidates = pd.DataFrame(
@@ -563,7 +720,9 @@ def test_infinite_benchmark_price_is_excluded_from_skill():
         )
     skill_table = compute_skill_table(
         disclosures,
-        pd.DataFrame(prices, columns=["ticker", "date", "close"]),
+        _with_comparable_generations(
+            pd.DataFrame(prices, columns=["ticker", "date", "close"])
+        ),
         pd.Timestamp("2024-05-01"),
     )
     candidates = pd.DataFrame(

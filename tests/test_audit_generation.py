@@ -26,6 +26,8 @@ from scripts.audit_generation import (
     check_source_row_ids,
 )
 
+pytestmark = pytest.mark.slow
+
 ROOT = Path(__file__).resolve().parents[1]
 AUDIT_SCRIPT = ROOT / "scripts" / "audit_generation.py"
 

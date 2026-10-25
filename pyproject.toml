@@ -55,6 +55,12 @@ exclude_dirs = ["tests", "scripts", "data"]
 skips = ["B404", "B603", "B607"]
 
 [tool.pytest.ini_options]
+# Default run is the fast tier. The full suite (replay + integration tiers)
+# is: pytest -m "slow or not slow"
+addopts = ['-m', 'not slow']
+markers = [
+    "slow: replay/integration tier excluded from the default fast run",
+]
 filterwarnings = [
     "ignore::cryptography.utils.CryptographyDeprecationWarning",
 ]

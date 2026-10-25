@@ -12,6 +12,8 @@ from analyzer import actors, pipeline, positions
 from analyzer.persistence import database
 from analyzer.persistence.database import Database
 
+pytestmark = pytest.mark.slow
+
 
 def seed(db, *, doc="delayed", promoted="2026-08-01", accepted="2026-10-01",
          created="2026-08-02", disclosure="2026-08-03", ticker="JPM"):

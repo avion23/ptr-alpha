@@ -18,6 +18,8 @@ from analyzer.exceptions import DataSourceError
 from analyzer.models import DownloadResult, DownloadStatus
 from analyzer.settings import Settings
 
+pytestmark = pytest.mark.slow
+
 
 def _source(tmp_path):
     settings = Settings()

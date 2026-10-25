@@ -16,6 +16,9 @@ from analyzer.persistence.transaction_repository import (
 
 from scripts.purge_phantom_rows import count_phantom_rows, purge_phantom_rows
 from .conftest import DatabaseTestCase
+import pytest
+
+pytestmark = pytest.mark.slow
 
 
 

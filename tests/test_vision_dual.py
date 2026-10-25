@@ -53,6 +53,8 @@ from analyzer.ocr import ingestion
 from analyzer.ocr.ingestion import get_ocr_work_items
 from scripts import purge_unaccepted_house_rowsets
 
+pytestmark = pytest.mark.slow
+
 def _run_main():
     from scripts.ocr_zero_rows import _run_visionb_staging
 

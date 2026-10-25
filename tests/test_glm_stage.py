@@ -30,6 +30,8 @@ from scripts import audit_sample, glm_stage, ocr_zero_rows as operational_ocr_ze
 from analyzer.ocr import ingestion as ocr_zero_rows
 from analyzer.ocr.common import PROMPT_SHA256
 
+pytestmark = pytest.mark.slow
+
 GLM_OUTPUT_ONE_ROW = (
     "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
     "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"

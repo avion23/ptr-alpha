@@ -21,6 +21,8 @@ from analyzer.positions import holdings_candidates
 from tests.test_asof_v2 import load_script, seed
 from tests.test_backtest_guard import FRAME_TICKERS, install_skill_fixture, seed_frame
 
+pytestmark = pytest.mark.slow
+
 DECISION = date(2026, 6, 20)
 FROZEN_TODAY = date(2026, 10, 17)
 

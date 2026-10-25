@@ -73,11 +73,21 @@ _LEGACY_UNSUPPORTED_ASSET_RE = re.compile(
     re.IGNORECASE,
 )
 _UNSUPPORTED_ASSET_RE = re.compile(
-    r"\[(?:CT|GS|OT)\]|\b(?:mutual fund|index fund|exchange-traded fund|etf|"
+    r"\[(?:CT|CS|GS|OT)\]|\b(?:mutual fund|index fund|exchange-traded fund|etf|"
     r"money market|treasury|government securit|corporate bond|municipal bond|"
     r"real estate|cryptocurrency|bitcoin|btc|ethereum|litecoin|solana|ripple|"
     r"xrp|usdc|ski\s+mask\s+dog|the\s+graph|sui|private equity|"
     r"limited partnership|stock\s*option|option\s*type)\b",
+    re.IGNORECASE,
+)
+# Only descriptions naming crypto trusts/ETFs or a known product symbol qualify;
+# the transaction ticker column is intentionally not consulted here.
+_ST_CRYPTO_VEHICLE_RE = re.compile(
+    r"(?:\b(?:bitcoin|btc|ethereum|ether|crypto(?:currency)?)\b.{0,48}"
+    r"\b(?:trust|etf|exchange[- ]traded fund)\b|"
+    r"\b(?:trust|etf|exchange[- ]traded fund)\b.{0,48}"
+    r"\b(?:bitcoin|btc|ethereum|ether|crypto(?:currency)?)\b|"
+    r"\b(?:ibit|fbtc|ethe|gbtc)\b)",
     re.IGNORECASE,
 )
 # House [OP] marks an option inline; [ST] is authoritative stock and wins.
@@ -440,6 +450,13 @@ def equity_transaction_fields(
         )
         if value is not None and not pd.isna(value)
     )
+    # Operator directive (2026-10-25 fix-all): [ST] normally wins, but a
+    # crypto trust/ETF is a commodity vehicle, not an operating-equity claim.
+    if (
+        _STOCK_BRACKET_RE.search(description)
+        and _ST_CRYPTO_VEHICLE_RE.search(description)
+    ):
+        return False
     if _UNSUPPORTED_ASSET_RE.search(description):
         # Keep today's [ST] rows eligible when a flattened trailing note adds
         # one of the new markers/tokens, without relaxing any old exclusion.

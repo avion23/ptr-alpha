@@ -588,6 +588,8 @@ def extract_instrument_type(asset_cell: str | None) -> str:
         return "other"
     if re.search(r"\[gs\]", text):
         return "Government Securities"
+    if re.search(r"\[cs\]", text):
+        return "bond"
     if re.search(r"\[ot\]", text):
         return "other"
 

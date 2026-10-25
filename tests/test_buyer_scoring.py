@@ -102,6 +102,53 @@ def test_equity_guard_unsupported_tokens_are_case_insensitive_and_word_bounded()
     assert _equity_transaction_row(accepted)
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Alphabet Inc Note Coupon 4.80000% Mat 2/15/2036 [CS] Description: Corporate Note",
+        "JPMorgan Chase BK N A INSTL CTF DEP ... [CS] Description: Corporate Bond",
+        "Pacific Co B1 Bond [CS] ... Real estate bond",
+        "FEDERAL NATIONAL MORTGAGE ASSOCIATION POOL ... [CS]",
+        "Lord Abbett Short Duration High Yield I (LSYIX) bond fund [CS]",
+    ],
+)
+def test_equity_guard_rejects_corporate_securities_marker(description):
+    row = pd.Series(
+        {
+            "ticker": "X",
+            "source": "house_pdf",
+            "asset_description": description,
+            "instrument_type": "stock",  # stale canonical classification
+        }
+    )
+    assert not _equity_transaction_row(row)
+
+
+@pytest.mark.parametrize(
+    "ticker,description,eligible",
+    [
+        ("IBIT", "iShares Bitcoin Trust ETF (IBIT) [ST]", False),
+        ("ETHE", "Grayscale Ethereum Trust ETF (ETHE) [ST]", False),
+        ("FBTC", "Fidelity Wise Origin Bitcoin Fund (FBTC) [ST]", False),
+        ("SPCX", "SpaceX Class A Common Stock [ST]", True),
+        ("IBIT", "Apple Inc. Class A Common Stock [ST]", True),
+        ("BTCM", "Bitcoin Mining Co Class A Common Stock [ST]", True),
+    ],
+)
+def test_crypto_vehicle_is_the_narrow_exception_to_authoritative_stock_marker(
+    ticker, description, eligible
+):
+    row = pd.Series(
+        {
+            "ticker": ticker,
+            "source": "house_pdf",
+            "asset_description": description,
+            "instrument_type": "stock",
+        }
+    )
+    assert _equity_transaction_row(row) is eligible
+
+
 def test_non_equity_marker_regex_does_not_match_stock_or_option_markers():
     assert _UNSUPPORTED_ASSET_RE.search("Common Stock [ST]") is None
     assert _UNSUPPORTED_ASSET_RE.search("Call Option [OP]") is None

@@ -52,10 +52,11 @@ def test_non_equity_markers_neither_rank_nor_contaminate_stock_basis():
         ("BILL", "US Treas Bill [GS]", "2024-05-29", 10000.0),
         ("UNIT", "UNITED STATES TREAS ... [GS]", "2024-05-29", 10000.0),
         ("ALGN", "GO Bonds [GS]", "2024-05-29", 10000.0),
+        ("FNMA", "FEDERAL NATIONAL MORTGAGE ASSOCIATION POOL ... [CS]", "2024-05-29", 10000.0),
         ("TZA", "TZA ETF [OT]", "2024-05-29", 10000.0),
-        # A wrongly rebound BTC row must not blend into Gill's legitimate IBIT lot.
+        # Neither a misbound BTC token nor a [ST]-marked crypto trust is equity.
         ("IBIT", "BTC [CT]", "2024-05-28", 10000.0),
-        ("IBIT", "iShares Bitcoin Trust [ST]", "2024-05-29", 10000.0),
+        ("IBIT", "iShares Bitcoin Trust ETF (IBIT) [ST]", "2024-05-29", 10000.0),
         ("SPCX", "SpaceX pre-IPO purchase [OT]", "2024-05-29", 10000.0),
         ("SPCX", "SpaceX Class A Common Stock [ST]", "2024-05-29", 10000.0),
         ("AAPL", "Apple Common Stock", "2024-05-29", 10000.0),
@@ -87,8 +88,7 @@ def test_non_equity_markers_neither_rank_nor_contaminate_stock_basis():
     }
 
     positions = build_positions(trades, histories, as_of=AS_OF).set_index("ticker")
-    assert set(positions.index) == {"IBIT", "SPCX", "AAPL"}
-    assert positions.loc["IBIT", "cost_basis"] == pytest.approx(100.0)
+    assert set(positions.index) == {"SPCX", "AAPL"}
 
     candidates = pd.DataFrame(
         [
@@ -109,7 +109,7 @@ def test_non_equity_markers_neither_rank_nor_contaminate_stock_basis():
         {ticker: 100.0 for ticker in positions.index},
         enable_13f_corroboration=False,
     )
-    assert set(ranked["ticker"]) == {"IBIT", "SPCX", "AAPL"}
+    assert set(ranked["ticker"]) == {"SPCX", "AAPL"}
 
 
 def test_finite_contributions_overflowing_the_sum_do_not_rank():

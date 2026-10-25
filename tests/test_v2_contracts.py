@@ -198,10 +198,10 @@ def test_actor_identity_and_source_weight_contract():
 
     assert actors.actor_id("congress", "NANCY PELOSI") == "congress:NANCY PELOSI"
     assert actors.actor_id("officer", "Burke James A") == "officer:BURKE JAMES A"
-    assert actors.SOURCE_PRIORS["form4"] == 0.60
+    assert actors.SOURCE_PRIORS["form4"] == pytest.approx(4846 / 10530)
     assert actors.SOURCE_PRIORS["13f"] is None
 
-    for source, prior in (("form4", 0.60), ("13f", 0.0)):
+    for source, prior in (("form4", 4846 / 10530), ("13f", 0.0)):
         initial = actors.compute_weight("congress", 0, 0, source)
         assert 0.0 <= initial <= 1.0
         assert initial == prior
@@ -209,7 +209,7 @@ def test_actor_identity_and_source_weight_contract():
     assert actors.compute_weight("congress", 200, 200, "13f") == 0.0
     empirical = actors.compute_weight("congress", 200, 200, "form4")
     assert 0.0 <= empirical <= 1.0
-    assert abs(empirical - 1.0) < abs(0.60 - 1.0)
+    assert abs(empirical - 1.0) < abs((4846 / 10530) - 1.0)
 
 
 @pytest.mark.parametrize(

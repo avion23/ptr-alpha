@@ -60,6 +60,13 @@ def test_unknown_actor_gets_source_prior(source, prior):
 
 def test_13f_never_initiates_even_with_matured_hits():
     assert compute_weight("manager", 10, 10.0, "13f") == 0.0
+    candidates = pd.DataFrame(
+        [{"actor_id": "manager:FUND", "kind": "manager", "source": "13f"}]
+    )
+    skill = pd.DataFrame(
+        [{"actor_id": "manager:FUND", "n_matured": 10, "hits": 10}]
+    )
+    assert compute_actor_weights(candidates, skill)["manager:FUND"] == 0.0
 
 
 def test_weight_shrinks_toward_prior_more_at_low_sample_size():
@@ -71,7 +78,90 @@ def test_weight_shrinks_toward_prior_more_at_low_sample_size():
     assert abs(high_n - 1.0) < abs(low_n - 1.0)
 
 
-def test_unknown_actor_is_discounted_and_validated_positive_skill_keeps_prior():
+def test_beta_binomial_uses_hand_computed_posterior_and_n_zero_is_exact_prior():
+    prior = SOURCE_PRIORS["house_pdf"]
+
+    assert compute_weight("congress", 0, 0, "house_pdf") == prior
+    assert compute_weight("congress", 3, 2, "house_pdf") == pytest.approx(
+        (2 + 20 * prior) / 23
+    )
+    assert compute_weight("congress", 5, 0, "house_pdf") == pytest.approx(
+        (20 * prior) / 25
+    )
+    assert compute_weight("congress", 4, 4, "house_pdf") == pytest.approx(
+        (4 + 20 * prior) / 24
+    )
+
+
+def test_measured_prior_constants_match_the_documented_derivation():
+    import inspect
+
+    import analyzer.actors as actors
+
+    assert "4,846/10,530" in inspect.getsource(actors)
+    assert actors.SOURCE_PRIORS["house_pdf"] == pytest.approx(4846 / 10530)
+    assert actors.SOURCE_PRIORS["gemini_ocr"] == actors.SOURCE_PRIORS["house_pdf"]
+    assert actors.SOURCE_PRIORS["senate_efd"] == actors.SOURCE_PRIORS["house_pdf"]
+    assert actors.SOURCE_PRIORS["form4"] == actors.SOURCE_PRIORS["house_pdf"]
+    assert actors.SOURCE_PRIORS["13f"] is None
+
+
+def test_measured_today_scale_regression_keeps_rank_order_and_floor():
+    from analyzer.setups import score
+
+    as_of = pd.Timestamp("2026-10-25").date()
+    candidates = pd.DataFrame(
+        [
+            {
+                "ticker": ticker,
+                "actor_id": actor,
+                "kind": actor.partition(":")[0],
+                "source": source,
+                "entry_ref": 100.0,
+                "disclosure_date": disclosure,
+                "as_of": as_of,
+                "corroboration": False,
+                "position_evidence": position_evidence,
+            }
+            for ticker, actor, source, disclosure, position_evidence in [
+                ("NFLX", "congress:BYRON DONALDS", "house_pdf", as_of, True),
+                ("NFLX", "congress:CLEO FIELDS", "house_pdf", as_of, True),
+                ("SNOW", "congress:GILBERT CISNEROS", "house_pdf", as_of, True),
+                ("SNOW", "congress:MARIA ELVIRA SALAZAR", "house_pdf", as_of, True),
+                ("KWY", "officer:FITZGERALD JOHN TAYLOR MALONEY", "form4", pd.Timestamp(as_of) - pd.Timedelta(days=9), False),
+                ("KWY", "officer:HANSEN KENT A", "form4", pd.Timestamp(as_of) - pd.Timedelta(days=9), False),
+                ("FOURTH", "congress:UNRANKED SINGLE", "house_pdf", as_of, True),
+            ]
+        ]
+    )
+    skill_table = pd.DataFrame(
+        [
+            {"actor_id": "congress:BYRON DONALDS", "n_matured": 91, "hits": 33},
+            {"actor_id": "congress:CLEO FIELDS", "n_matured": 75, "hits": 50},
+            {"actor_id": "congress:GILBERT CISNEROS", "n_matured": 631, "hits": 265},
+            {"actor_id": "congress:MARIA ELVIRA SALAZAR", "n_matured": 30, "hits": 18},
+        ]
+    )
+    weights = compute_actor_weights(candidates, skill_table)
+    ranked, blocked = score(
+        candidates,
+        weights,
+        {ticker: (100.0, as_of) for ticker in ("NFLX", "SNOW", "KWY", "FOURTH")},
+    )
+
+    assert ranked["ticker"].tolist() == ["NFLX", "SNOW", "KWY"]
+    assert ranked["score"].tolist() == pytest.approx(
+        [
+            (33 + 20 * 4846 / 10530) / 111 + (50 + 20 * 4846 / 10530) / 95,
+            (265 + 20 * 4846 / 10530) / 651 + (18 + 20 * 4846 / 10530) / 50,
+            2 * (4846 / 10530) * 0.5 ** (9 / 90),
+        ]
+    )
+    assert blocked["ticker"].tolist() == ["FOURTH"]
+    assert weights["congress:UNRANKED SINGLE"] == SOURCE_PRIORS["house_pdf"]
+
+
+def test_unknown_actor_keeps_prior_and_actor_posterior_uses_matured_hits():
     candidates = pd.DataFrame(
         [
             {"actor_id": "congress:UNKNOWN", "kind": "congress", "source": "house_pdf"},
@@ -80,14 +170,15 @@ def test_unknown_actor_is_discounted_and_validated_positive_skill_keeps_prior():
         ]
     )
     skill_table = pd.DataFrame(
-        [{"actor_id": "congress:SKILLED", "n_matured": 3, "mean_excess_pct": 1.2}]
+        [{"actor_id": "congress:SKILLED", "n_matured": 3, "hits": 2, "mean_excess_pct": 1.2}]
     )
 
     weights = compute_actor_weights(candidates, skill_table)
 
-    assert weights["congress:UNKNOWN"] == pytest.approx(0.52 * 0.5)
-    assert weights["congress:SKILLED"] == SOURCE_PRIORS["house_pdf"]
-    assert weights["officer:UNKNOWN"] == pytest.approx(0.60 * 0.5)
+    prior = SOURCE_PRIORS["house_pdf"]
+    assert weights["congress:UNKNOWN"] == prior
+    assert weights["congress:SKILLED"] == pytest.approx((2 + 20 * prior) / 23)
+    assert weights["officer:UNKNOWN"] == prior
 
 
 def test_skill_table_excludes_future_disclosures_and_unmatured_outcomes():
@@ -120,7 +211,7 @@ def test_skill_table_excludes_future_disclosures_and_unmatured_outcomes():
     )
 
     assert skill_table.to_dict("records") == [
-        {"actor_id": "congress:ALICE", "n_matured": 2, "mean_excess_pct": pytest.approx(5.0)}
+        {"actor_id": "congress:ALICE", "n_matured": 2, "hits": 2, "mean_excess_pct": pytest.approx(5.0)}
     ]
 
 
@@ -206,6 +297,7 @@ def test_skill_outcomes_require_comparable_consistent_price_generations(caplog):
         {
             "actor_id": "congress:COMPARABLE",
             "n_matured": 3,
+            "hits": 3,
             "mean_excess_pct": pytest.approx(10.0),
         }
     ]
@@ -244,6 +336,7 @@ def test_skill_outcome_uses_adjusted_total_return_closes_for_stock_and_spy():
     assert result.to_dict("records") == [{
         "actor_id": "congress:DIVIDEND",
         "n_matured": 1,
+        "hits": 1,
         "mean_excess_pct": pytest.approx(5.0),
     }]
 
@@ -293,6 +386,7 @@ def test_load_skill_table_uses_persisted_comparable_generation_state(tmp_path):
         {
             "actor_id": "congress:COMPARABLE MEMBER",
             "n_matured": 3,
+            "hits": 3,
             "mean_excess_pct": pytest.approx(10.0),
         }
     ]
@@ -438,8 +532,10 @@ def test_mccaul_skill_matches_exact_name_variant_only(tmp_path):
         db.close()
 
     assert weights == {
-        "congress:MICHAEL MCCAUL": pytest.approx(0.26),
-        "congress:MICHAEL T MCCAUL": SOURCE_PRIORS["house_pdf"],
+        "congress:MICHAEL MCCAUL": SOURCE_PRIORS["house_pdf"],
+        "congress:MICHAEL T MCCAUL": pytest.approx(
+            (3 + 20 * SOURCE_PRIORS["house_pdf"]) / 23
+        ),
     }
 
 
@@ -491,7 +587,9 @@ def test_accented_surname_skill_history_is_found(tmp_path):
     finally:
         db.close()
 
-    assert weights["congress:NYDIA VELAZQUEZ"] == SOURCE_PRIORS["house_pdf"]
+    assert weights["congress:NYDIA VELAZQUEZ"] == pytest.approx(
+        (3 + 20 * SOURCE_PRIORS["house_pdf"]) / 23
+    )
 
 
 @pytest.mark.parametrize(
@@ -514,7 +612,9 @@ def test_unicode_actor_id_normalization_matches_history_prefilter(
     finally:
         db.close()
 
-    assert weights[actor_id(kind, member)] == SOURCE_PRIORS[source]
+    assert weights[actor_id(kind, member)] == pytest.approx(
+        (3 + 20 * SOURCE_PRIORS[source]) / 23
+    )
 
 
 def test_coalesced_john_andrew_zts_event_does_not_inherit_john_alan_skill(tmp_path):
@@ -557,7 +657,7 @@ def test_coalesced_john_andrew_zts_event_does_not_inherit_john_alan_skill(tmp_pa
 
     assert (
         coalesced.iloc[0]["actor_id"] == actor_id("congress", "John Andrew Smith")
-        and weights[actor_id("congress", "John Andrew Smith")] == pytest.approx(0.26)
+        and weights[actor_id("congress", "John Andrew Smith")] == SOURCE_PRIORS["house_pdf"]
     )
 
 
@@ -598,6 +698,60 @@ def _insert_positive_skill_history(db, member, source, tickers):
         [(ticker, day, close) for (ticker, day), close in prices.items()],
     )
     _set_comparable_states(db, [ticker for ticker, _ in prices])
+
+
+def test_weight_lookup_excludes_an_immature_future_episode(tmp_path):
+    from analyzer.actors import weights_for_candidates
+
+    db = Database(tmp_path / "point-in-time-weights.duckdb")
+    disclosures = [
+        pd.Timestamp("2024-01-03") + pd.Timedelta(days=index)
+        for index in range(3)
+    ] + [pd.Timestamp("2024-04-01")]
+    tickers = ("AAA", "BBB", "CCC", "FUTURE")
+    db.conn.executemany(
+        """
+        INSERT INTO transactions (
+            doc_id, member, ticker, transaction_date, disclosure_date,
+            transaction_type, owner_code, amount_raw, amount_midpoint, source, created_at
+        ) VALUES (?, 'Future Proof', ?, ?, ?, 'Purchase', '', '$1,001 - $15,000', 8000,
+                  'house_pdf', '2024-01-01')
+        """,
+        [
+            (f"point-in-time-{ticker}", ticker, day.date(), day.date())
+            for ticker, day in zip(tickers, disclosures)
+        ],
+    )
+    prices = {}
+    for ticker, disclosed in zip(tickers, disclosures):
+        entry = next_nyse_session(disclosed).date()
+        exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).date()
+        prices[(ticker, entry)] = 100.0
+        prices[(ticker, exit_date)] = 120.0
+        prices[("SPY", entry)] = 100.0
+        prices[("SPY", exit_date)] = 100.0
+    db.conn.executemany(
+        "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
+        [(ticker, day, close) for (ticker, day), close in prices.items()],
+    )
+    _set_comparable_states(db, [ticker for ticker, _ in prices])
+    candidates = pd.DataFrame(
+        [{
+            "actor_id": "congress:FUTURE PROOF",
+            "kind": "congress",
+            "source": "house_pdf",
+        }]
+    )
+
+    try:
+        weights = weights_for_candidates(db, candidates, pd.Timestamp("2024-05-01"))
+    finally:
+        db.close()
+
+    # Jan outcomes are matured; the Apr disclosure's Jun outcome is not.
+    assert weights["congress:FUTURE PROOF"] == pytest.approx(
+        (3 + 20 * SOURCE_PRIORS["house_pdf"]) / 23
+    )
 
 
 def test_single_actor_skill_history_query_returns_only_matching_rows(tmp_path, monkeypatch):
@@ -651,7 +805,7 @@ def test_weight_lookup_cache_reuses_skill_table(monkeypatch):
         actors,
         "load_skill_table",
         lambda db, as_of, actor_ids, **_kwargs: calls.append((as_of, actor_ids))
-        or pd.DataFrame(columns=["actor_id", "n_matured", "mean_excess_pct"]),
+        or pd.DataFrame(columns=["actor_id", "n_matured", "hits", "mean_excess_pct"]),
     )
     candidates = pd.DataFrame(
         [{"actor_id": "congress:ALICE", "kind": "congress", "source": "house_pdf"}]
@@ -670,7 +824,7 @@ def test_filtered_candidates_with_nonconsecutive_index_do_not_crash(monkeypatch)
     monkeypatch.setattr(
         actors,
         "load_skill_table",
-        lambda *_args: pd.DataFrame(columns=["actor_id", "n_matured", "mean_excess_pct"]),
+        lambda *_args: pd.DataFrame(columns=["actor_id", "n_matured", "hits", "mean_excess_pct"]),
     )
     candidates = pd.DataFrame(
         [
@@ -682,7 +836,7 @@ def test_filtered_candidates_with_nonconsecutive_index_do_not_crash(monkeypatch)
 
     assert actors.weights_for_candidates(None, candidates, pd.Timestamp("2024-01-01")) == {
         "manager:ALICE": 0.0,
-        "congress:BOB": pytest.approx(0.26),
+        "congress:BOB": SOURCE_PRIORS["house_pdf"],
     }
 
 
@@ -756,15 +910,16 @@ def test_ligature_name_history_uses_full_python_normalized_history(tmp_path):
         {
             "actor_id": requested_id,
             "n_matured": 6,
+            "hits": 3,
             "mean_excess_pct": pytest.approx(-5.0),
         }
     ]
     assert compute_actor_weights(candidates, skill_table)[requested_id] == pytest.approx(
-        0.26
+        (3 + 20 * SOURCE_PRIORS["house_pdf"]) / 26
     )
 
 
-def test_float_residue_zero_mean_does_not_validate_skill():
+def test_zero_mean_uses_actual_positive_episode_count():
     from analyzer.actors import compute_actor_weights
 
     disclosures = pd.DataFrame(
@@ -808,8 +963,9 @@ def test_float_residue_zero_mean_does_not_validate_skill():
     )
 
     assert abs(skill_table.iloc[0]["mean_excess_pct"]) < 1e-9
+    assert skill_table.iloc[0]["hits"] == 1
     assert compute_actor_weights(candidates, skill_table)["congress:ALICE"] == pytest.approx(
-        0.26
+        (1 + 20 * SOURCE_PRIORS["house_pdf"]) / 23
     )
 
 
@@ -855,8 +1011,8 @@ def test_infinite_benchmark_price_is_excluded_from_skill():
     )
 
     assert skill_table.to_dict("records") == [
-        {"actor_id": "congress:ALICE", "n_matured": 3, "mean_excess_pct": 0.0}
+        {"actor_id": "congress:ALICE", "n_matured": 3, "hits": 0, "mean_excess_pct": 0.0}
     ]
     assert compute_actor_weights(candidates, skill_table)["congress:ALICE"] == pytest.approx(
-        0.26
+        (20 * SOURCE_PRIORS["house_pdf"]) / 23
     )

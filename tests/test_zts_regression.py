@@ -398,10 +398,13 @@ def test_zts_june_july_results_use_disclosure_dates_and_ignore_later_rows(
 
     july = after.loc[after["as_of"] == JULY_31].iloc[0]
     assert july["n_actors"] == 4
-    assert july["score"] == pytest.approx(1.04)
+    # No certified history is available in this fixture, so n=0 keeps each
+    # actor at the measured prior instead of the former half-prior tier.
+    expected_july_score = 4 * actors.SOURCE_PRIORS["house_pdf"]
+    assert july["score"] == pytest.approx(expected_july_score)
     assert not bool(july["blocked"])
     july_ranked, july_blocked = ranked_by_snapshot[("after", JULY_31)]
-    assert july_ranked.iloc[0]["score"] == pytest.approx(1.04)
+    assert july_ranked.iloc[0]["score"] == pytest.approx(expected_july_score)
     assert july_blocked.empty
 
 

@@ -14,7 +14,9 @@ from analyzer.persistence.price_repository import (
     previous_nyse_session,
 )
 from analyzer.price_source import (
+    _PRICE_BASIS,
     _set_generation_state,
+    _store_generation,
     ensure_price_generation_schema,
 )
 
@@ -25,6 +27,7 @@ def _with_comparable_generations(prices):
         lambda ticker: f"test-generation:{str(ticker).strip().upper()}"
     )
     prices["comparability_status"] = "comparable"
+    prices["price_generation_basis"] = _PRICE_BASIS
     return prices
 
 
@@ -32,7 +35,18 @@ def _set_comparable_states(db, tickers):
     ensure_price_generation_schema(db)
     for ticker in sorted(set(tickers)):
         ticker = str(ticker).strip().upper()
-        _set_generation_state(db, ticker, f"test-generation:{ticker}", "comparable")
+        generation = f"test-generation:{ticker}"
+        rows = db.conn.execute(
+            "SELECT date, close FROM prices WHERE ticker=? ORDER BY date", [ticker]
+        ).fetchdf()
+        series = pd.Series(
+            rows.close.to_numpy(dtype="float64"), index=pd.to_datetime(rows.date)
+        )
+        _store_generation(
+            db, ticker, generation, series, pd.Series(1.0, index=series.index),
+            _PRICE_BASIS,
+        )
+        _set_generation_state(db, ticker, generation, "comparable")
 
 
 @pytest.mark.parametrize(
@@ -135,6 +149,12 @@ def test_skill_outcomes_require_comparable_consistent_price_generations(caplog):
                 "source": "house_pdf",
                 "disclosure_date": "2023-01-08",
             },
+            {
+                "actor_id": "congress:MISSING",
+                "ticker": "MISS",
+                "source": "house_pdf",
+                "disclosure_date": "2023-01-09",
+            },
         ]
     )
     rows = []
@@ -148,10 +168,10 @@ def test_skill_outcomes_require_comparable_consistent_price_generations(caplog):
         ).normalize()
         rows.extend(
             [
-                (ticker, entry, entry_close, entry_gen, status),
-                (ticker, exit_date, exit_close, exit_gen, status),
-                ("SPY", entry, 100.0, "spy-generation", "comparable"),
-                ("SPY", exit_date, 100.0, "spy-generation", "comparable"),
+            (ticker, entry, entry_close, entry_gen, status, _PRICE_BASIS),
+            (ticker, exit_date, exit_close, exit_gen, status, _PRICE_BASIS),
+            ("SPY", entry, 100.0, "spy-generation", "comparable", _PRICE_BASIS),
+            ("SPY", exit_date, 100.0, "spy-generation", "comparable", _PRICE_BASIS),
             ]
         )
 
@@ -173,7 +193,7 @@ def test_skill_outcomes_require_comparable_consistent_price_generations(caplog):
         rows,
         columns=[
             "ticker", "date", "close", "price_generation_id",
-            "comparability_status",
+            "comparability_status", "price_generation_basis",
         ],
     )
 
@@ -190,6 +210,42 @@ def test_skill_outcomes_require_comparable_consistent_price_generations(caplog):
         }
     ]
     assert "Dropped 2 matured skill episodes" in caplog.text
+    assert "Dropped 1 matured skill episodes with missing total-return endpoint prices" in caplog.text
+
+
+def test_skill_outcome_uses_adjusted_total_return_closes_for_stock_and_spy():
+    disclosed = pd.Timestamp("2023-01-03")
+    entry = next_nyse_session(disclosed).normalize()
+    exit_date = previous_nyse_session(disclosed + pd.Timedelta(days=90)).normalize()
+    # A $1 dividend takes the raw stock from $100 to $99 on the ex-date;
+    # Yahoo's adjusted entry close is $99 and the later $108.90 is a 10% total
+    # return. SPY's adjusted closes are a 5% total return, so excess is 5 pp.
+    disclosures = pd.DataFrame([{
+        "actor_id": "congress:DIVIDEND",
+        "ticker": "DIV",
+        "source": "house_pdf",
+        "disclosure_date": disclosed,
+    }])
+    prices = pd.DataFrame(
+        [
+            ("DIV", entry, 99.0, "div-generation", "comparable", _PRICE_BASIS),
+            ("DIV", exit_date, 108.9, "div-generation", "comparable", _PRICE_BASIS),
+            ("SPY", entry, 200.0, "spy-generation", "comparable", _PRICE_BASIS),
+            ("SPY", exit_date, 210.0, "spy-generation", "comparable", _PRICE_BASIS),
+        ],
+        columns=[
+            "ticker", "date", "close", "price_generation_id",
+            "comparability_status", "price_generation_basis",
+        ],
+    )
+
+    result = compute_skill_table(disclosures, prices, pd.Timestamp("2023-06-01"))
+
+    assert result.to_dict("records") == [{
+        "actor_id": "congress:DIVIDEND",
+        "n_matured": 1,
+        "mean_excess_pct": pytest.approx(5.0),
+    }]
 
 
 def test_load_skill_table_uses_persisted_comparable_generation_state(tmp_path):
@@ -212,6 +268,12 @@ def test_load_skill_table_uses_persisted_comparable_generation_state(tmp_path):
     db.conn.executemany(
         "INSERT INTO prices (ticker, date, close) VALUES (?, ?, ?)",
         [("SPLT", entry, 100.0), ("SPLT", exit_date, 10.0)],
+    )
+    split_dates = pd.to_datetime([entry, exit_date])
+    _store_generation(
+        db, "SPLT", "split-unadjusted-generation",
+        pd.Series([100.0, 10.0], index=split_dates),
+        pd.Series([1.0, 1.0], index=split_dates), _PRICE_BASIS,
     )
     _set_generation_state(
         db, "SPLT", "split-unadjusted-generation", "unknown",

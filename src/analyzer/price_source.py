@@ -7,6 +7,7 @@ import re
 import time
 from collections import Counter
 from datetime import date, timedelta
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 _PRICE_OVERLAP_TOL = 0.001  # 0.1% relative disagreement means another generation.
 _PRICE_BASIS = "yfinance-adjusted-close-v1"
+# Across 6,776 independent-fetch pairs, the maximum per-date normalized adjusted
+# close disagreement is 8.59014e-7 for SPY; round up to 1 ppm. The maximum
+# normalized factor disagreement is 1.9797463e-6; round up to 2 ppm for local
+# adjustment-factor checks (also above AAPL's measured ~1.59 ppm daily factor noise).
+_PRICE_CERTIFICATION_REL_TOL = 1e-6
+_PRICE_FACTOR_CERTIFICATION_REL_TOL = 2e-6
 
 
 # ── YFinancePriceSource: yfinance-backed price fetcher with cache merge ──
@@ -578,6 +585,281 @@ def _set_generation_state(db, ticker, generation, status, alternate=None, reason
         "alternate_generation=excluded.alternate_generation, reason=excluded.reason",
         [ticker, generation, status, alternate, reason],
     )
+
+
+def certify_adjusted_price_generations(
+    generations: dict[str, pd.DataFrame], dividends: pd.DataFrame
+) -> dict:
+    """Certify independently fetched adjusted series against each other/actions.
+
+    A price generation is scale-free for return labels: multiplying every close
+    in a generation by one constant changes no return. Fetch comparisons
+    therefore normalize on their latest shared session and compare all shared
+    total-return ratios. Two shared dates are the mathematical minimum needed
+    to compare one return interval.
+
+    For dividend event d, Yahoo's adjustment is
+    ``factor[t] = prod(1 - cash_d / raw_close_before_ex_date_d)`` for d > t.
+    The prior session close is used because the cash distribution is removed
+    from the pre-ex-date share price. ``raw = adjusted_close / adjustment_factor``
+    recovers the raw close associated with that generation. A non-dividend
+    factor step is accepted only when it is a rational split ratio and it
+    cancels a raw split-like move without leaving a split-sized adjusted move.
+    """
+    if len(generations) < 2:
+        return {
+            "certified": False,
+            "generation_id": max(generations, default=None),
+            "reason": f"only {len(generations)} independent adjusted fetches; at least 2 required",
+            "stats": {"fetch_count": len(generations)},
+        }
+
+    normalized: dict[str, pd.DataFrame] = {}
+    for generation, source in generations.items():
+        if not {"date", "close", "adjustment_factor"}.issubset(source.columns):
+            return {
+                "certified": False, "generation_id": None,
+                "reason": f"{generation}: missing date/close/adjustment_factor evidence",
+                "stats": {"fetch_count": len(generations)},
+            }
+        frame = source[["date", "close", "adjustment_factor"]].copy()
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+        frame["adjustment_factor"] = pd.to_numeric(
+            frame["adjustment_factor"], errors="coerce"
+        )
+        frame = frame.dropna(subset=["date"]).set_index("date").sort_index()
+        if (
+            frame.empty
+            or frame.index.has_duplicates
+            or not np.isfinite(frame[["close", "adjustment_factor"]].to_numpy()).all()
+            or (frame[["close", "adjustment_factor"]] <= 0).any().any()
+        ):
+            return {
+                "certified": False, "generation_id": None,
+                "reason": f"{generation}: duplicate dates or invalid close/adjustment factor",
+                "stats": {"fetch_count": len(generations)},
+            }
+        normalized[str(generation)] = frame
+
+    selected = max(
+        normalized,
+        key=lambda generation: (
+            normalized[generation].index[-1],
+            len(normalized[generation]),
+            generation,
+        ),
+    )
+    pair_overlaps: list[int] = []
+    max_fetch_error = 0.0
+    max_factor_fetch_error = 0.0
+    for index, generation_a in enumerate(sorted(normalized)):
+        for generation_b in sorted(normalized)[index + 1:]:
+            a, b = normalized[generation_a], normalized[generation_b]
+            overlap = a.index.intersection(b.index)
+            pair_overlaps.append(len(overlap))
+            if len(overlap) < 2:
+                return {
+                    "certified": False, "generation_id": selected,
+                    "reason": (
+                        f"independent fetches {generation_a} and {generation_b} share "
+                        f"{len(overlap)} dates; at least 2 required to compare returns"
+                    ),
+                    "stats": {"fetch_count": len(normalized), "min_pair_overlap": min(pair_overlaps)},
+                }
+            a_ratio = a.loc[overlap, "close"] / a.loc[overlap[-1], "close"]
+            b_ratio = b.loc[overlap, "close"] / b.loc[overlap[-1], "close"]
+            error = float(((a_ratio / b_ratio) - 1.0).abs().max())
+            max_fetch_error = max(max_fetch_error, error)
+            if error > _PRICE_CERTIFICATION_REL_TOL:
+                return {
+                    "certified": False, "generation_id": selected,
+                    "reason": (
+                        f"independent fetches disagree: {generation_a}/{generation_b} "
+                        f"max normalized relative difference {error:.8g} exceeds "
+                        f"{_PRICE_CERTIFICATION_REL_TOL:.1g}"
+                    ),
+                    "stats": {
+                        "fetch_count": len(normalized),
+                        "min_pair_overlap": min(pair_overlaps),
+                        "max_normalized_fetch_error": max_fetch_error,
+                        "max_normalized_factor_error": max_factor_fetch_error,
+                    },
+                }
+            a_factor = (
+                a.loc[overlap, "adjustment_factor"]
+                / a.loc[overlap[-1], "adjustment_factor"]
+            )
+            b_factor = (
+                b.loc[overlap, "adjustment_factor"]
+                / b.loc[overlap[-1], "adjustment_factor"]
+            )
+            factor_error = float(((a_factor / b_factor) - 1.0).abs().max())
+            max_factor_fetch_error = max(max_factor_fetch_error, factor_error)
+            if factor_error > _PRICE_FACTOR_CERTIFICATION_REL_TOL:
+                return {
+                    "certified": False, "generation_id": selected,
+                    "reason": (
+                        f"independent adjustment factors disagree: {generation_a}/{generation_b} "
+                        f"max normalized relative difference {factor_error:.8g} exceeds "
+                        f"{_PRICE_FACTOR_CERTIFICATION_REL_TOL:.1g}"
+                    ),
+                    "stats": {
+                        "fetch_count": len(normalized),
+                        "min_pair_overlap": min(pair_overlaps),
+                        "max_normalized_fetch_error": max_fetch_error,
+                        "max_normalized_factor_error": max_factor_fetch_error,
+                    },
+                }
+
+    actions = dividends.copy()
+    if not {"ex_date", "cash_amount"}.issubset(actions.columns):
+        return {
+            "certified": False, "generation_id": selected,
+            "reason": "dividend evidence is missing ex_date/cash_amount",
+            "stats": {"fetch_count": len(normalized), "min_pair_overlap": min(pair_overlaps)},
+        }
+    actions["ex_date"] = pd.to_datetime(actions["ex_date"], errors="coerce").dt.normalize()
+    actions["cash_amount"] = pd.to_numeric(actions["cash_amount"], errors="coerce")
+    if actions["ex_date"].duplicated().any():
+        return {
+            "certified": False, "generation_id": selected,
+            "reason": "dividend evidence has duplicate ex-dates",
+            "stats": {"fetch_count": len(normalized), "min_pair_overlap": min(pair_overlaps)},
+        }
+    max_dividend_error = 0.0
+    explained_splits = 0
+    for generation, frame in normalized.items():
+        dates = frame.index
+        close = frame["close"].to_numpy(dtype="float64")
+        factors = frame["adjustment_factor"].to_numpy(dtype="float64")
+        raw = close / factors
+        in_range = actions.loc[
+            actions["ex_date"].between(dates[0], dates[-1], inclusive="both")
+        ].sort_values("ex_date")
+        expected_dividend_step = np.ones(len(frame), dtype="float64")
+        for action in in_range.itertuples(index=False):
+            position = dates.get_indexer([action.ex_date])[0]
+            if position <= 0:
+                return {
+                    "certified": False, "generation_id": selected,
+                    "reason": f"{generation}: dividend {action.ex_date.date()} lacks ex-date/prior-session prices",
+                    "stats": {
+                        "fetch_count": len(normalized),
+                        "min_pair_overlap": min(pair_overlaps),
+                        "max_normalized_fetch_error": max_fetch_error,
+                        "max_normalized_factor_error": max_factor_fetch_error,
+                    },
+                }
+            amount = float(action.cash_amount)
+            event_factor = 1.0 - amount / raw[position - 1]
+            if not math.isfinite(event_factor) or event_factor <= 0:
+                return {
+                    "certified": False, "generation_id": selected,
+                    "reason": f"{generation}: invalid dividend reconstruction on {action.ex_date.date()}",
+                    "stats": {"fetch_count": len(normalized), "min_pair_overlap": min(pair_overlaps)},
+                }
+            # Adj Close's factor rises on the ex-date by the inverse of the
+            # dividend haircut applied to the previous session's raw close.
+            expected_dividend_step[position] = 1.0 / event_factor
+
+        # Verify each closed-session transition locally. This avoids summing
+        # tiny cash-amount/quote-rounding differences over years: on a dividend
+        # date compare factor[d]/factor[prev] with 1/(1-D/raw_prev); otherwise
+        # the factor ratio must be 1 unless a split is independently explained.
+        factor_changes = factors[1:] / factors[:-1]
+        raw_changes = raw[1:] / raw[:-1]
+        close_changes = close[1:] / close[:-1]
+        split_positions: set[int] = set()
+        for offset, observed_factor_change in enumerate(factor_changes):
+            transition = offset + 1
+            component_change = (
+                observed_factor_change / expected_dividend_step[transition]
+            )
+            local_error = abs(float(component_change) - 1.0)
+            if local_error <= _PRICE_FACTOR_CERTIFICATION_REL_TOL:
+                max_dividend_error = max(max_dividend_error, local_error)
+                continue
+            split_ratio = Fraction(float(component_change)).limit_denominator(100)
+            rational_ratio = float(split_ratio)
+            if (
+                split_ratio.numerator == split_ratio.denominator
+                or abs(rational_ratio / component_change - 1.0)
+                > _PRICE_FACTOR_CERTIFICATION_REL_TOL
+                or not 0.5 <= raw_changes[offset] * component_change <= 2.0
+                or not 0.5 <= close_changes[offset] <= 2.0
+            ):
+                return {
+                    "certified": False, "generation_id": selected,
+                    "reason": f"{generation}: unexplained adjustment-factor step on {dates[transition].date()}",
+                    "stats": {
+                        "fetch_count": len(normalized),
+                        "min_pair_overlap": min(pair_overlaps),
+                        "max_normalized_fetch_error": max_fetch_error,
+                        "max_normalized_factor_error": max_factor_fetch_error,
+                    },
+                }
+            explained_splits += 1
+            split_positions.add(transition)
+
+        # A raw split-sized jump without a corresponding accepted factor step
+        # is not explained by the served total-return series.
+        for offset, raw_change in enumerate(raw_changes):
+            if (raw_change <= 0.5 or raw_change >= 2.0) and (offset + 1) not in split_positions:
+                return {
+                    "certified": False, "generation_id": selected,
+                    "reason": f"{generation}: raw split-like jump lacks factor evidence on {dates[offset + 1].date()}",
+                    "stats": {
+                        "fetch_count": len(normalized),
+                        "min_pair_overlap": min(pair_overlaps),
+                        "max_normalized_fetch_error": max_fetch_error,
+                        "max_normalized_factor_error": max_factor_fetch_error,
+                        "max_dividend_reconstruction_error": max_dividend_error,
+                    },
+                }
+
+    stats = {
+        "fetch_count": len(normalized),
+        "min_pair_overlap": min(pair_overlaps),
+        "max_normalized_fetch_error": max_fetch_error,
+        "max_normalized_factor_error": max_factor_fetch_error,
+        "max_dividend_reconstruction_error": max_dividend_error,
+        "explained_split_steps": explained_splits,
+    }
+    reason = (
+        "certified yfinance-adjusted-close-v1: "
+        f"{stats['fetch_count']} independent fetches, min shared dates "
+        f"{stats['min_pair_overlap']}, max normalized fetch error "
+        f"{max_fetch_error:.8g}, factor fetch error {max_factor_fetch_error:.8g}, "
+        f"local dividend residual {max_dividend_error:.8g}, "
+        f"explained split steps {explained_splits}"
+    )
+    return {"certified": True, "generation_id": selected, "reason": reason, "stats": stats}
+
+
+def publish_price_generation_certification(db, ticker: str, certification: dict, old_state: dict):
+    """Publish certification via the same persisted generation-state owner."""
+    if certification.get("certified"):
+        generation = certification["generation_id"]
+        _set_generation_state(
+            db, ticker, generation, "comparable", None, certification["reason"]
+        )
+        return {
+            "generation_id": generation,
+            "comparability_status": "comparable",
+            "alternate_generation": None,
+            "reason": certification["reason"],
+        }
+    served = old_state.get("generation_id")
+    alternate = certification.get("generation_id")
+    reason = f"price comparability unknown: adjusted-generation certification failed: {certification.get('reason', 'no evidence')}"
+    _set_generation_state(db, ticker, served, "unknown", alternate, reason)
+    return {
+        "generation_id": served,
+        "comparability_status": "unknown",
+        "alternate_generation": alternate,
+        "reason": reason,
+    }
 
 
 def set_generation_states(db, rows) -> None:

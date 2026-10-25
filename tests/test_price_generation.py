@@ -13,9 +13,11 @@ from analyzer.price_source import (
     _set_generation_state,
     _store_generation,
     canonical_price_hash,
+    certify_adjusted_price_generations,
     ensure_price_generation_schema,
     price_generation_state,
     price_generation_schema_exists,
+    publish_price_generation_certification,
 )
 from analyzer.setups import score
 
@@ -36,6 +38,102 @@ def test_generation_absence_is_not_a_failed_database_read():
         conn.close()
     with pytest.raises(duckdb.Error):
         price_generation_schema_exists(db)
+
+
+def _certification_fetch(closes, factors=None):
+    dates = pd.date_range("2024-01-02", periods=len(closes), freq="B")
+    if factors is None:
+        factors = [1.0] * len(closes)
+    return pd.DataFrame({
+        "date": dates,
+        "close": closes,
+        "adjustment_factor": factors,
+    })
+
+
+def test_independent_adjusted_fetches_must_agree_after_scale_normalization():
+    identical = _certification_fetch([100.0, 101.0, 102.0])
+    result = certify_adjusted_price_generations(
+        {"fetch-a": identical, "fetch-b": identical.copy()},
+        pd.DataFrame(columns=["ex_date", "cash_amount"]),
+    )
+    assert result["certified"]
+    assert result["stats"]["max_normalized_fetch_error"] == 0.0
+
+    divergent = _certification_fetch([100.0, 101.0, 103.0])
+    result = certify_adjusted_price_generations(
+        {"fetch-a": identical, "fetch-b": divergent},
+        pd.DataFrame(columns=["ex_date", "cash_amount"]),
+    )
+    assert not result["certified"]
+    assert "independent fetches disagree" in result["reason"]
+
+
+def test_dividend_reconstruction_uses_prior_session_raw_close():
+    # $1 distribution from a $100 pre-ex-date close creates a 0.99 backward
+    # factor; after the ex-date the factor is 1 and adjusted closes are flat.
+    fetch = _certification_fetch([99.0, 99.0, 99.0], [0.99, 1.0, 1.0])
+    events = pd.DataFrame({
+        "ex_date": [pd.Timestamp("2024-01-03")],
+        "cash_amount": [1.0],
+    })
+    result = certify_adjusted_price_generations(
+        {"fetch-a": fetch, "fetch-b": fetch.copy()}, events
+    )
+    assert result["certified"]
+    assert result["stats"]["max_dividend_reconstruction_error"] == 0.0
+
+
+def test_split_factor_must_explain_raw_split_like_jump():
+    # A 2:1 split halves raw close while factor doubles, leaving adjusted close
+    # continuous; no dividend table action is needed for this split-free check.
+    explained = _certification_fetch([50.0, 50.0, 51.0], [0.5, 1.0, 1.0])
+    result = certify_adjusted_price_generations(
+        {"fetch-a": explained, "fetch-b": explained.copy()},
+        pd.DataFrame(columns=["ex_date", "cash_amount"]),
+    )
+    assert result["certified"]
+    assert result["stats"]["explained_split_steps"] == 2
+
+    unexplained = _certification_fetch([100.0, 50.0, 51.0], [1.0, 1.0, 1.0])
+    result = certify_adjusted_price_generations(
+        {"fetch-a": unexplained, "fetch-b": unexplained.copy()},
+        pd.DataFrame(columns=["ex_date", "cash_amount"]),
+    )
+    assert not result["certified"]
+    assert "raw split-like jump lacks factor evidence" in result["reason"]
+
+
+def test_certified_spy_generation_is_published_through_state_machinery(tmp_path):
+    db = Database(tmp_path / "certified-spy.duckdb")
+    dates = pd.date_range("2024-01-02", periods=3, freq="B")
+    values = pd.Series([100.0, 101.0, 102.0], index=dates)
+    factors = pd.Series(1.0, index=dates)
+    try:
+        ensure_price_generation_schema(db)
+        _store_generation(db, "SPY", "fetch-a", values, factors, "yfinance-adjusted-close-v1")
+        _store_generation(db, "SPY", "fetch-b", values, factors, "yfinance-adjusted-close-v1")
+        _set_generation_state(db, "SPY", "legacy-spy", "unknown", "fetch-a", "legacy raw")
+        old = price_generation_state(db, "SPY")
+        fetch = pd.DataFrame({
+            "date": dates,
+            "close": values.to_numpy(),
+            "adjustment_factor": factors.to_numpy(),
+        })
+        certification = certify_adjusted_price_generations(
+            {"fetch-a": fetch, "fetch-b": fetch.copy()},
+            pd.DataFrame(columns=["ex_date", "cash_amount"]),
+        )
+        assert certification["certified"]
+
+        published = publish_price_generation_certification(db, "SPY", certification, old)
+
+        assert published["generation_id"] == "fetch-b"
+        assert price_generation_state(db, "SPY")["generation_id"] == "fetch-b"
+        assert price_generation_state(db, "SPY")["comparability_status"] == "comparable"
+        assert "certified yfinance-adjusted-close-v1" in price_generation_state(db, "SPY")["reason"]
+    finally:
+        db.close()
 
 
 def _store_generation_rowwise(db, ticker, generation, series, factors, basis):

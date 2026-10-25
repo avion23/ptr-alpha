@@ -20,7 +20,7 @@ from analyzer.persistence.price_repository import (
     next_nyse_session,
     previous_nyse_session,
 )
-from analyzer.price_source import price_generation_states
+from analyzer.price_source import _PRICE_BASIS, price_generation_schema_exists
 from analyzer.ticker_resolver import TickerResolver
 
 logger = logging.getLogger(__name__)
@@ -74,14 +74,16 @@ def compute_weight(kind: str, n_matured: int, hits: float, source: str) -> float
 def compute_skill_table(
     disclosures: pd.DataFrame, prices: pd.DataFrame, as_of: date | pd.Timestamp
 ) -> pd.DataFrame:
-    """Summarize matured 90-day forward excess by actor at a strict cutoff.
+    """Summarize matured 90-day total-return excess by actor at a strict cutoff.
 
     The entry is the first NYSE close after disclosure. The exit is the last
     NYSE close on or before disclosure + 90 calendar days. Both the disclosure
     and exit must be strictly before ``as_of``. Price rows on or after the
     cutoff are ignored, even when callers provide them. Every endpoint must
-    also have known-comparable price-generation provenance, and a ticker's
-    entry and exit must use the same generation.
+    also have known-comparable, adjusted-close generation provenance, and a
+    ticker's entry and exit must use the same generation. Adjusted closes encode
+    reinvested dividends and splits, so the same compounded-return equation on
+    both security and SPY is total-return excess.
     """
     if disclosures.empty:
         return pd.DataFrame(columns=_SKILL_COLUMNS)
@@ -114,6 +116,12 @@ def compute_skill_table(
         # Missing provenance is uncertainty, not evidence of comparability.
         eligible_prices["_generation_id"] = None
         eligible_prices["_comparability_status"] = "unknown"
+    if "price_generation_basis" in prices.columns:
+        eligible_prices["_generation_basis"] = prices.loc[
+            eligible_prices.index, "price_generation_basis"
+        ]
+    else:
+        eligible_prices["_generation_basis"] = None
 
     # Pass 1: resolve episodes and the exact price keys they will consult.
     disclosure_dates = pd.to_datetime(disclosures["disclosure_date"], errors="coerce")
@@ -189,26 +197,31 @@ def compute_skill_table(
     ).drop_duplicates()
     matched = pd.DataFrame(
         {"_code": np.asarray(ticker_codes), "_day": day_ints,
-         "_close": eligible_prices["_close"].to_numpy(),
-         "_generation_id": eligible_prices["_generation_id"].to_numpy(),
-         "_comparability_status": eligible_prices["_comparability_status"].to_numpy()}
+          "_close": eligible_prices["_close"].to_numpy(),
+          "_generation_id": eligible_prices["_generation_id"].to_numpy(),
+          "_comparability_status": eligible_prices["_comparability_status"].to_numpy(),
+          "_generation_basis": eligible_prices["_generation_basis"].to_numpy()}
     ).merge(wanted, on=["_code", "_day"], how="inner")
     matched = matched.drop_duplicates(["_code", "_day"], keep="last")
     closes: dict[tuple[str, int], float] = {}
-    generation_states: dict[tuple[str, int], tuple[object, object]] = {}
-    for code, day_int, close, generation_id, comparability_status in zip(
+    generation_states: dict[tuple[str, int], tuple[object, object, object]] = {}
+    for code, day_int, close, generation_id, comparability_status, generation_basis in zip(
         matched["_code"].tolist(),
         matched["_day"].tolist(),
         matched["_close"].tolist(),
         matched["_generation_id"].tolist(),
         matched["_comparability_status"].tolist(),
+        matched["_generation_basis"].tolist(),
     ):
         key = (ticker_keys[code], day_int)
         closes[key] = float(close)
-        generation_states[key] = (generation_id, comparability_status)
+        generation_states[key] = (
+            generation_id, comparability_status, generation_basis
+        )
 
     by_actor: dict[str, list[float]] = {}
     noncomparable_drops = 0
+    missing_price_drops = 0
     for actor, ticker, entry, exit_date in episodes:
         keys = [
             (ticker, entry.value),
@@ -220,6 +233,7 @@ def compute_skill_table(
             closes.get(key) for key in keys
         )
         if None in (security_entry, security_exit, spy_entry, spy_exit):
+            missing_price_drops += 1
             continue
         endpoint_states = [generation_states.get(key) for key in keys]
         generation_ids = []
@@ -228,9 +242,10 @@ def compute_skill_table(
             if state is None:
                 valid_states = False
                 break
-            generation_id, comparability_status = state
+            generation_id, comparability_status, generation_basis = state
             if (
                 comparability_status != "comparable"
+                or generation_basis != _PRICE_BASIS
                 or generation_id is None
                 or pd.isna(generation_id)
                 or not str(generation_id).strip()
@@ -254,8 +269,13 @@ def compute_skill_table(
 
     if noncomparable_drops:
         logger.warning(
-            "Dropped %d matured skill episodes without comparable, consistent price generations",
+            "Dropped %d matured skill episodes without comparable, consistent total-return price generations",
             noncomparable_drops,
+        )
+    if missing_price_drops:
+        logger.warning(
+            "Dropped %d matured skill episodes with missing total-return endpoint prices",
+            missing_price_drops,
         )
 
     return pd.DataFrame(
@@ -438,22 +458,25 @@ def load_skill_table(
         next_nyse_session(day).normalize()
         for day in disclosures["disclosure_date"]
     ).date()
-    prices = db.conn.execute(
-        "SELECT ticker, date, close FROM prices "
-        "WHERE ticker = ANY(?) AND date >= ? AND date < ?",
-        [price_tickers, min_date, cutoff.date()],
-    ).fetchdf()
-    states = price_generation_states(db)
-    prices["price_generation_id"] = prices["ticker"].map(
-        lambda ticker: (states.get(str(ticker).strip().upper()) or {}).get(
-            "generation_id"
+    if price_generation_schema_exists(db):
+        prices = db.conn.execute(
+            "SELECT v.ticker, v.date, v.close, v.generation AS price_generation_id, "
+            "s.comparability AS comparability_status, g.basis AS price_generation_basis "
+            "FROM price_generation_values v "
+            "JOIN price_generation_state s ON s.ticker=v.ticker "
+            "AND s.served_generation=v.generation "
+            "JOIN price_generations g ON g.ticker=v.ticker "
+            "AND g.generation=v.generation AND g.basis=v.basis "
+            "WHERE v.ticker = ANY(?) AND v.date >= ? AND v.date < ?",
+            [price_tickers, min_date, cutoff.date()],
+        ).fetchdf()
+    else:
+        prices = pd.DataFrame(
+            columns=[
+                "ticker", "date", "close", "price_generation_id",
+                "comparability_status", "price_generation_basis",
+            ]
         )
-    )
-    prices["comparability_status"] = prices["ticker"].map(
-        lambda ticker: (states.get(str(ticker).strip().upper()) or {}).get(
-            "comparability_status", "unknown"
-        )
-    )
     skill_table = compute_skill_table(disclosures, prices, cutoff)
     if actor_ids is not None:
         history_ids = set(selected["actor_id"])

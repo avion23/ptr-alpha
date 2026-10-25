@@ -1744,6 +1744,7 @@ def setups(
     )
 
     try:
+        from analyzer.member_names import canonicalize_actor_ids
         from analyzer.pipeline import eligible_events
         from analyzer.positions import (
             is_13f_corroboration_enabled,
@@ -1876,6 +1877,14 @@ def setups(
                     requested_tickers
                 )
             ].copy()
+        aliases = (
+            candidates["_pre_coalesced_actor_id"].dropna().astype(str).tolist()
+            if "_pre_coalesced_actor_id" in candidates
+            else ()
+        )
+        candidates["actor_id"] = canonicalize_actor_ids(
+            candidates["actor_id"].astype(str).tolist(), aliases=aliases
+        )
         if candidates.empty:
             if record:
                 record_decision_safely(data_dir, as_of_date, candidates, {}, {},

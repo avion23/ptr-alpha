@@ -292,6 +292,50 @@ def member_identity_groups(names: Iterable[str]) -> dict[str, str]:
     return groups
 
 
+def canonicalize_actor_ids(
+    actor_ids: Iterable[str], *, aliases: Iterable[str] = ()
+) -> list[str]:
+    """Choose stable actor IDs from the member spellings in one candidate set.
+
+    Optional middle names are identity variants, but the exact spelling used
+    for an actor ID depends on which alias a caller happened to request. When
+    a candidate set contains multiple unambiguous spellings, prefer the most
+    informative canonical name (more tokens, then longer, then lexical order).
+    Ambiguous aliases stay separate. ``same_member_identity`` is unchanged.
+    """
+    actor_ids = list(actor_ids)
+    aliases = list(aliases)
+    keys_by_actor: dict[str, str] = {}
+    names = set()
+    for actor in [*actor_ids, *aliases]:
+        if not isinstance(actor, str):
+            continue
+        kind, separator, name = actor.partition(":")
+        if separator and kind == "congress":
+            key = canonical_member_key(name)
+            if key:
+                keys_by_actor[actor] = key
+                names.add(key)
+
+    groups = member_identity_groups(names)
+    members_by_group: dict[str, list[str]] = {}
+    for key in names:
+        group = groups.get(key) or key
+        members_by_group.setdefault(group, []).append(key)
+    representatives = {
+        group: max(names, key=lambda name: (len(name.split()), len(name), name))
+        for group, names in members_by_group.items()
+    }
+    return [
+        (
+            f"congress:{representatives[groups.get(key) or key]}"
+            if (key := keys_by_actor.get(actor)) is not None
+            else actor
+        )
+        for actor in actor_ids
+    ]
+
+
 def same_actor_identity(first: str, candidate: str) -> bool:
     """Whether two actor_ids denote the same human initiator."""
     if first == candidate:

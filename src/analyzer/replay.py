@@ -18,7 +18,7 @@ from importlib import import_module
 
 import pandas as pd
 
-from analyzer.member_names import same_member_identity
+from analyzer.member_names import canonicalize_actor_ids, same_member_identity
 from analyzer.persistence.price_repository import ex_dividend_map, previous_nyse_session
 
 _V1_MEMBERS = (
@@ -195,6 +195,15 @@ def _ticker_candidates(
         if candidate_holdings
         else pd.DataFrame(columns=["ticker", "member", "disclosure_date"])
     )
+    if "actor_id" in scored:
+        aliases = (
+            scored["_pre_coalesced_actor_id"].dropna().astype(str).tolist()
+            if "_pre_coalesced_actor_id" in scored
+            else ()
+        )
+        scored["actor_id"] = canonicalize_actor_ids(
+            scored["actor_id"].astype(str).tolist(), aliases=aliases
+        )
     return _canonicalize_provenance(scored).drop_duplicates(ignore_index=True)
 
 

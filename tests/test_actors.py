@@ -315,6 +315,69 @@ def test_actor_id_uses_kind_specific_name_normalization():
     assert actor_id("manager", "  Jane   DOE ") == "manager:JANE DOE"
 
 
+@pytest.mark.parametrize(
+    ("filed_name", "short_name"),
+    [
+        ("Michael T. McCaul", "Michael McCaul"),
+        ("John J. McGuire", "John McGuire"),
+        ("Thomas R. Suozzi", "Thomas Suozzi"),
+        ("Diana Lynn Harshbarger", "Diana Harshbarger"),
+        ("Neal Patrick Dunn MD, FACS", "Neal Patrick Dunn"),
+    ],
+)
+def test_setup_and_replay_candidate_ids_share_deterministic_name_representative(
+    filed_name, short_name
+):
+    from analyzer.member_names import canonicalize_actor_ids, same_member_identity
+
+    filed_id = actor_id("congress", filed_name)
+    short_id = actor_id("congress", short_name)
+    assert same_member_identity(filed_name, short_name)
+
+    # Production keeps its event spelling. Replay may hold the requested short
+    # spelling, while its coalesced event retains the filed ID as provenance.
+    production = pd.DataFrame(
+        {"actor_id": [filed_id], "_pre_coalesced_actor_id": [filed_id]}
+    )
+    replay = pd.DataFrame(
+        {"actor_id": [short_id, short_id], "_pre_coalesced_actor_id": [None, filed_id]}
+    )
+
+    def canonical_ids(frame):
+        aliases = frame["_pre_coalesced_actor_id"].dropna().astype(str).tolist()
+        return canonicalize_actor_ids(
+            frame["actor_id"].astype(str).tolist(), aliases=aliases
+        )
+
+    production_ids = canonical_ids(production)
+    replay_ids = canonical_ids(replay)
+    expected = filed_id
+    assert production_ids == [expected]
+    assert replay_ids == [expected, expected]
+
+    # The selected representative does not depend on row order or repeated calls.
+    forward = canonicalize_actor_ids([filed_id, short_id])
+    reverse = canonicalize_actor_ids([short_id, filed_id])[::-1]
+    assert forward == reverse
+    assert canonicalize_actor_ids([filed_id, short_id]) == forward
+
+
+def test_canonical_actor_representative_does_not_merge_distinct_full_middles():
+    from analyzer.member_names import canonicalize_actor_ids, same_member_identity
+
+    allen = actor_id("congress", "Charles James Allen Smith")
+    arthur = actor_id("congress", "Charles James Arthur Smith")
+    assert not same_member_identity(
+        "Charles James Allen Smith", "Charles James Arthur Smith"
+    )
+
+    normalized = canonicalize_actor_ids(
+        [allen, arthur], aliases=["congress:CHARLES SMITH"]
+    )
+    assert normalized == [allen, arthur]
+    assert len(set(normalized)) == 2
+
+
 def test_identity_helpers_have_one_owner_with_legacy_facade_aliases():
     from analyzer import actors, member_names, positions
 

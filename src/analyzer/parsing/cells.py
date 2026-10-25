@@ -581,6 +581,16 @@ def extract_instrument_type(asset_cell: str | None) -> str:
     if re.search(r"\[st\]", text):
         return "stock"
 
+    # House inline classes are authoritative when present. ``other`` is the
+    # existing canonical fallback for crypto and miscellaneous assets;
+    # Government Securities is an existing canonical instrument value.
+    if re.search(r"\[ct\]", text):
+        return "other"
+    if re.search(r"\[gs\]", text):
+        return "Government Securities"
+    if re.search(r"\[ot\]", text):
+        return "other"
+
     option_marker = re.search(r"\[op\]", text)
     direction_text = text[option_marker.end() :] if option_marker else text
     is_put = any(

@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from analyzer.setups import is_ranked, score
+from analyzer.positions import build_positions
 
 
 AS_OF = date(2024, 6, 1)
@@ -42,6 +43,73 @@ def _row(
 def test_nonfinite_score_never_ranks(value):
     assert not is_ranked(value, 1)
     assert not is_ranked(value, 2, corroborated=True)
+
+
+def test_non_equity_markers_neither_rank_nor_contaminate_stock_basis():
+    days = ["2024-05-28", "2024-05-29", "2024-05-30", "2024-05-31"]
+    rows = [
+        ("BTC", "Bitcoin [CT]", "2024-05-29", 10000.0),
+        ("BILL", "US Treas Bill [GS]", "2024-05-29", 10000.0),
+        ("UNIT", "UNITED STATES TREAS ... [GS]", "2024-05-29", 10000.0),
+        ("ALGN", "GO Bonds [GS]", "2024-05-29", 10000.0),
+        ("TZA", "TZA ETF [OT]", "2024-05-29", 10000.0),
+        # A wrongly rebound BTC row must not blend into Gill's legitimate IBIT lot.
+        ("IBIT", "BTC [CT]", "2024-05-28", 10000.0),
+        ("IBIT", "iShares Bitcoin Trust [ST]", "2024-05-29", 10000.0),
+        ("SPCX", "SpaceX pre-IPO purchase [OT]", "2024-05-29", 10000.0),
+        ("SPCX", "SpaceX Class A Common Stock [ST]", "2024-05-29", 10000.0),
+        ("AAPL", "Apple Common Stock", "2024-05-29", 10000.0),
+    ]
+    trades = pd.DataFrame(
+        [
+            {
+                "member": "Nancy Pelosi",
+                "ticker": ticker,
+                "transaction_type": "Purchase",
+                "transaction_date": day,
+                "disclosure_date": day,
+                "amount_midpoint": amount,
+                "source": "form4",
+                # Simulate pre-fix canonical rows, which all said stock.
+                "instrument_type": "stock",
+                "asset_description": description,
+            }
+            for ticker, description, day, amount in rows
+        ]
+    )
+    histories = {
+        ticker: pd.DataFrame(
+            {"close": [200.0 if ticker == "IBIT" and day == days[0] else 100.0
+                        for day in days]},
+            index=pd.to_datetime(days),
+        )
+        for ticker in trades["ticker"].unique()
+    }
+
+    positions = build_positions(trades, histories, as_of=AS_OF).set_index("ticker")
+    assert set(positions.index) == {"IBIT", "SPCX", "AAPL"}
+    assert positions.loc["IBIT", "cost_basis"] == pytest.approx(100.0)
+
+    candidates = pd.DataFrame(
+        [
+            _row(
+                ticker,
+                actor_id="congress:PELOSI",
+                entry_ref=position.cost_basis,
+                event_date=position.last_activity,
+                disclosure_date=position.disclosure_date,
+                position_evidence=True,
+            )
+            for ticker, position in positions.iterrows()
+        ]
+    )
+    ranked, _ = score(
+        candidates,
+        {"congress:PELOSI": 1.0},
+        {ticker: 100.0 for ticker in positions.index},
+        enable_13f_corroboration=False,
+    )
+    assert set(ranked["ticker"]) == {"IBIT", "SPCX", "AAPL"}
 
 
 def test_finite_contributions_overflowing_the_sum_do_not_rank():

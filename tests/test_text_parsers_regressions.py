@@ -118,6 +118,11 @@ def test_table_notification_and_linked_description_not_next_issuer():
 
 @pytest.mark.parametrize("asset,expected", [
     ("Treasury Bill (6-Week, Matures 12/3/2026) [GS]", "treasury"),
+    ("Bitcoin [cT]", "other"),
+    ("United States Treasury Securities [gS]", "Government Securities"),
+    ("Private startup shares [oT]", "other"),
+    ("Apple (AAPL) [sT]", "stock"),
+    ("Bitcoin [oP]", "option"),
     ("Municipal Bond [MB]", "bond"),
     ("Private LLC [OL] Description: convertible SAFE", "private"),
     ("Private LLC [ST] Description: Simple Agreement for Future Equity", "private"),

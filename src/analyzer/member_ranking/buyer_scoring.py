@@ -66,10 +66,18 @@ def _legacy_scoring_rows(rows: pd.DataFrame) -> pd.DataFrame:
     if rows.empty or "source" not in rows.columns:
         return rows
     return rows.loc[rows["source"].isin(_LEGACY_SCORING_SOURCES)].copy()
-_UNSUPPORTED_ASSET_RE = re.compile(
+_LEGACY_UNSUPPORTED_ASSET_RE = re.compile(
     r"\b(?:mutual fund|index fund|exchange-traded fund|money market|treasury|"
     r"government securit|corporate bond|municipal bond|real estate|cryptocurrency|"
     r"private equity|limited partnership|stock\s*option|option\s*type)\b",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_ASSET_RE = re.compile(
+    r"\[(?:CT|GS|OT)\]|\b(?:mutual fund|index fund|exchange-traded fund|etf|"
+    r"money market|treasury|government securit|corporate bond|municipal bond|"
+    r"real estate|cryptocurrency|bitcoin|btc|ethereum|litecoin|solana|ripple|"
+    r"xrp|usdc|ski\s+mask\s+dog|the\s+graph|sui|private equity|"
+    r"limited partnership|stock\s*option|option\s*type)\b",
     re.IGNORECASE,
 )
 # House [OP] marks an option inline; [ST] is authoritative stock and wins.
@@ -433,7 +441,13 @@ def equity_transaction_fields(
         if value is not None and not pd.isna(value)
     )
     if _UNSUPPORTED_ASSET_RE.search(description):
-        return False
+        # Keep today's [ST] rows eligible when a flattened trailing note adds
+        # one of the new markers/tokens, without relaxing any old exclusion.
+        if (
+            not _STOCK_BRACKET_RE.search(description)
+            or _LEGACY_UNSUPPORTED_ASSET_RE.search(description)
+        ):
+            return False
     if extract_instrument_type(description) == "private":
         return False
     if _OPTION_BRACKET_RE.search(

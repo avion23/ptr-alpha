@@ -5,6 +5,8 @@ import pytest
 
 from analyzer.exceptions import AnalysisError
 from analyzer.member_ranking.buyer_scoring import (
+    _UNSUPPORTED_ASSET_RE,
+    _equity_transaction_row,
     get_consensus_candidate_tickers,
     prepare_consensus_purchases,
     score_ticker_by_buyers,
@@ -49,6 +51,60 @@ def test_consensus_cold_start_needs_no_rankings_or_signal_history():
     )
 
     assert result.iloc[0]["signal_score"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "bitcoin",
+        "BTC",
+        "Ethereum",
+        "Litecoin",
+        "Solana",
+        "Ripple XRP",
+        "USDC",
+        "Ski Mask Dog",
+        "The Graph",
+        "Sui",
+        "TZA ETF",
+    ],
+)
+def test_equity_guard_rejects_crypto_names_and_etf_token(description):
+    row = pd.Series(
+        {
+            "ticker": "X",
+            "source": "house_pdf",
+            "asset_description": description,
+            "instrument_type": "stock",
+        }
+    )
+    assert not _equity_transaction_row(row)
+
+
+def test_equity_guard_unsupported_tokens_are_case_insensitive_and_word_bounded():
+    rejected = pd.Series(
+        {
+            "ticker": "X",
+            "source": "house_pdf",
+            "asset_description": "Ethereum [cT]",
+            "instrument_type": "stock",
+        }
+    )
+    accepted = pd.Series(
+        {
+            "ticker": "ETF",
+            "source": "house_pdf",
+            "asset_description": "ETFish Common Stock",
+            "instrument_type": "stock",
+        }
+    )
+    assert not _equity_transaction_row(rejected)
+    assert _equity_transaction_row(accepted)
+
+
+def test_non_equity_marker_regex_does_not_match_stock_or_option_markers():
+    assert _UNSUPPORTED_ASSET_RE.search("Common Stock [ST]") is None
+    assert _UNSUPPORTED_ASSET_RE.search("Call Option [OP]") is None
 
 
 def test_consensus_score_is_invariant_to_member_identity_shuffle():

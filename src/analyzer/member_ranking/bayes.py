@@ -109,8 +109,8 @@ def normal_normal_posteriors(outcomes, groups, *, independent_groups=None) -> pd
                 stacklevel=2,
             )
         elif independent is None:
-            # rank_members currently supplies member labels only, so this runtime
-            # report makes its missing independent date/member unit explicit.
+            # Direct callers may omit these optional reporting labels, so make
+            # the missing independent date/member unit explicit.
             warnings.warn(
                 "Member posterior report: rows/episodes="
                 f"{len(values)}, member_groups={len(means)}, "

@@ -1,4 +1,5 @@
 import unittest
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -125,6 +126,69 @@ class TestEmpiricalMemberPooling(unittest.TestCase):
 
         self.assertEqual(ranked.loc["Peer", "purchase_episodes"], 2)
         self.assertEqual(ranked.loc["Target", "purchase_episodes"], 1)
+
+    def test_resolved_between_variance_ranks_members_by_pooled_alpha(self):
+        signals = _signals(
+            [
+                ("A", "A1", "2024-01-01", 20.0),
+                ("A", "A2", "2024-02-01", 22.0),
+                ("B", "B1", "2024-01-01", -20.0),
+                ("B", "B2", "2024-02-01", -18.0),
+            ]
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            ranked = rank_members(signals)
+
+        self.assertEqual(ranked["member"].tolist(), ["A", "B"])
+        self.assertGreater(
+            ranked.iloc[0]["shrunk_alpha_pct"], ranked.iloc[1]["shrunk_alpha_pct"]
+        )
+
+    def test_unresolved_ties_keep_alphabetical_order_and_count_member_dates(self):
+        ranked_signals = _signals(
+            [
+                ("A", "A1", "2024-01-01", 0.0),
+                ("A", "A2", "2024-01-01", 0.0),
+                ("A", "A3", "2024-02-01", 0.0),
+                ("B", "B1", "2024-01-01", 0.0),
+                ("B", "B2", "2024-01-01", 0.0),
+                ("B", "B3", "2024-02-01", 0.0),
+            ]
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ranked = rank_members(ranked_signals)
+
+        self.assertEqual(ranked["member"].tolist(), ["A", "B"])
+        self.assertEqual(ranked["shrunk_alpha_pct"].nunique(), 1)
+        warning = next(
+            str(item.message)
+            for item in caught
+            if "between-variance is unresolved" in str(item.message)
+        )
+        self.assertIn("independent_date_member_groups=4", warning)
+
+    def test_single_observation_members_warn_with_true_independent_group_count(self):
+        signals = _signals(
+            [
+                ("C", "C1", "2024-01-01", 10.0),
+                ("A", "A1", "2024-01-02", -10.0),
+                ("B", "B1", "2024-01-03", 2.0),
+            ]
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ranked = rank_members(signals)
+
+        self.assertEqual(ranked["member"].tolist(), ["A", "B", "C"])
+        warning = next(
+            str(item.message) for item in caught if "UNIDENTIFIED" in str(item.message)
+        )
+        self.assertIn("independent_date_member_groups=3", warning)
 
 
 if __name__ == "__main__":

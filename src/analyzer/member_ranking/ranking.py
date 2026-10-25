@@ -53,6 +53,10 @@ def rank_members(signal_df: pd.DataFrame, horizon: int = 90) -> pd.DataFrame:
     fit = normal_normal_posteriors(
         purchases["total_spy_alpha_pct"].to_numpy(dtype=float),
         purchases["member"].to_numpy(dtype=object),
+        # The estimator group scopes these date labels to each member, so
+        # episodes for one member/date (including different tickers) share an
+        # independent reporting unit.
+        independent_groups=purchases["disclosure_date"].to_numpy(dtype=object),
     ).reindex(episode_count.index)
 
     result = pd.DataFrame(

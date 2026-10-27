@@ -48,7 +48,7 @@ from analyzer.pipeline import (
 )
 from analyzer.price_snapshot import create_snapshot, save_snapshot
 from analyzer.persistence.price_repository import ex_dividend_map as _ex_div_map
-from analyzer.price_source import YFinancePriceSource
+from analyzer.price_source import YFinancePriceSource, resolve_setup_quotes
 from analyzer.settings import Settings
 
 app = typer.Typer(help="Congressional PTR disclosure analyzer", no_args_is_help=True)
@@ -1898,29 +1898,7 @@ def setups(
         symbols = sorted(
             {str(value).strip().upper() for value in candidates["ticker"].dropna()}
         )
-        current_prices = {}
-        if symbols:
-            # (ticker, date) rows are unique in prices, so the window's
-            # row_number picks exactly the row sort_values + drop_duplicates
-            # (keep="last") kept, without materializing full histories.
-            latest = db.conn.execute(
-                "SELECT ticker, close, date FROM prices WHERE ticker = ANY(?) "
-                "AND date <= ? "
-                "QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY date DESC) = 1",
-                [symbols, as_of_date],
-            ).fetchdf()
-            if not latest.empty:
-                latest["date"] = pd.to_datetime(latest["date"])
-                for row in latest.itertuples(index=False):
-                    if row.close is not None and not (
-                        isinstance(row.close, float) and pd.isna(row.close)
-                    ):
-                        current_prices[str(row.ticker).strip().upper()] = (
-                            float(row.close),
-                            row.date.date()
-                            if hasattr(row.date, "date")
-                            else row.date,
-                        )
+        current_prices = resolve_setup_quotes(db, symbols, as_of_date)
 
         weights = weights_for_candidates(db, candidates, as_of_date)
         decision_watchlist = watchlist_actor_ids()

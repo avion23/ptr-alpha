@@ -18,6 +18,7 @@ from analyzer.price_source import (
     price_generation_state,
     price_generation_schema_exists,
     publish_price_generation_certification,
+    resolve_setup_quotes,
 )
 from analyzer.setups import score
 
@@ -38,6 +39,114 @@ def test_generation_absence_is_not_a_failed_database_read():
         conn.close()
     with pytest.raises(duckdb.Error):
         price_generation_schema_exists(db)
+
+
+def _setup_quote_candidate(ticker, as_of):
+    return {
+        "ticker": ticker,
+        "actor_id": "officer:CEO",
+        "kind": "officer",
+        "corroboration": False,
+        "entry_ref": 101.0,
+        "event_date": as_of,
+        "disclosure_date": as_of,
+        "position_evidence": True,
+        "as_of": as_of,
+    }
+
+
+def _add_served_quote(db, ticker, status, day, close):
+    dates = pd.to_datetime([day])
+    values = pd.Series([close], index=dates)
+    _store_generation(
+        db,
+        ticker,
+        "served",
+        values,
+        pd.Series(1.0, index=dates),
+        "adjusted-close-v1",
+    )
+    _set_generation_state(db, ticker, "served", status)
+
+
+def test_certified_newer_setup_quote_ranks_but_unknown_generation_stays_stale():
+    db = Database(":memory:")
+    as_of = date(2026, 10, 26)
+    base_day = pd.Timestamp("2026-10-16")
+    try:
+        ensure_price_generation_schema(db)
+        db.upsert_prices(
+            pd.DataFrame(
+                {"CERT": [100.0], "UNKNOWN": [100.0]}, index=[base_day]
+            )
+        )
+        _add_served_quote(db, "CERT", "comparable", "2026-10-23", 100.0)
+        _add_served_quote(db, "UNKNOWN", "unknown", "2026-10-23", 100.0)
+
+        quotes = resolve_setup_quotes(db, ["CERT", "UNKNOWN"], as_of)
+        assert quotes == {
+            "CERT": (100.0, date(2026, 10, 23)),
+            "UNKNOWN": (100.0, date(2026, 10, 16)),
+        }
+        candidates = pd.DataFrame([
+            _setup_quote_candidate("CERT", as_of),
+            _setup_quote_candidate("UNKNOWN", as_of),
+        ])
+        ranked, blocked = score(
+            candidates, {"officer:CEO": 1.0}, quotes, enable_13f_corroboration=False
+        )
+        assert ranked.ticker.tolist() == ["CERT"]
+        assert blocked.to_dict("records") == [
+            {"ticker": "UNKNOWN", "actor_id": "officer:CEO", "reason": "stale quote"}
+        ]
+    finally:
+        db.close()
+
+
+def test_served_setup_quote_still_obeys_future_guard():
+    db = Database(":memory:")
+    decision_date = date(2026, 10, 22)
+    try:
+        ensure_price_generation_schema(db)
+        db.upsert_prices(pd.DataFrame(
+            {"AAA": [100.0]}, index=pd.to_datetime(["2026-10-16"])
+        ))
+        _add_served_quote(db, "AAA", "comparable", "2026-10-24", 100.0)
+        quotes = resolve_setup_quotes(db, ["AAA"], date(2026, 10, 26))
+        ranked, blocked = score(
+            pd.DataFrame([_setup_quote_candidate("AAA", decision_date)]),
+            {"officer:CEO": 1.0}, quotes, enable_13f_corroboration=False,
+        )
+        assert ranked.empty
+        assert blocked.iloc[0].reason == "future quote"
+    finally:
+        db.close()
+
+
+def test_fresh_base_setup_quotes_keep_value_and_tie_ordering():
+    db = Database(":memory:")
+    as_of = date(2026, 10, 26)
+    try:
+        ensure_price_generation_schema(db)
+        db.upsert_prices(pd.DataFrame(
+            {"AAA": [100.0], "BBB": [100.0]},
+            index=pd.to_datetime(["2026-10-26"]),
+        ))
+        _add_served_quote(db, "AAA", "comparable", "2026-10-26", 200.0)
+        _add_served_quote(db, "BBB", "comparable", "2026-10-26", 200.0)
+        quotes = resolve_setup_quotes(db, ["BBB", "AAA"], as_of)
+        ranked, blocked = score(
+            pd.DataFrame([
+                _setup_quote_candidate("BBB", as_of),
+                _setup_quote_candidate("AAA", as_of),
+            ]),
+            {"officer:CEO": 1.0}, quotes, enable_13f_corroboration=False,
+        )
+        assert ranked.ticker.tolist() == ["AAA", "BBB"]
+        assert ranked.current.tolist() == [100.0, 100.0]
+        assert blocked.empty
+    finally:
+        db.close()
 
 
 def _certification_fetch(closes, factors=None):
@@ -67,6 +176,17 @@ def test_independent_adjusted_fetches_must_agree_after_scale_normalization():
     )
     assert not result["certified"]
     assert "independent fetches disagree" in result["reason"]
+
+
+def test_calibrated_fetch_tolerance_accepts_rounding_noise_not_larger_divergence():
+    baseline = _certification_fetch([100.0, 101.0, 102.0])
+    no_dividends = pd.DataFrame(columns=["ex_date", "cash_amount"])
+    for relative_error, certified in ((1.1e-6, True), (1.3e-6, False)):
+        noisy = _certification_fetch([100.0, 101.0 * (1.0 + relative_error), 102.0])
+        result = certify_adjusted_price_generations(
+            {"fetch-a": baseline, "fetch-b": noisy}, no_dividends
+        )
+        assert result["certified"] is certified
 
 
 def test_dividend_reconstruction_uses_prior_session_raw_close():

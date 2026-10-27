@@ -25,12 +25,65 @@ logger = logging.getLogger(__name__)
 _VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
 _PRICE_OVERLAP_TOL = 0.001  # 0.1% relative disagreement means another generation.
 _PRICE_BASIS = "yfinance-adjusted-close-v1"
-# Across 6,776 independent-fetch pairs, the maximum per-date normalized adjusted
-# close disagreement is 8.59014e-7 for SPY; round up to 1 ppm. The maximum
-# normalized factor disagreement is 1.9797463e-6; round up to 2 ppm for local
-# adjustment-factor checks (also above AAPL's measured ~1.59 ppm daily factor noise).
-_PRICE_CERTIFICATION_REL_TOL = 1e-6
+# Of 6,042 fetch pairs whose factors and independent dividend/split checks pass,
+# p90 max-normalized close disagreement is 1.0033 ppm. A 10% margin gives
+# 1.1036 ppm; round up to the next 0.1 ppm. The large disagreement tail remains
+# disqualifying evidence. Factor checks retain the separately measured 2 ppm.
+_PRICE_CERTIFICATION_REL_TOL = 1.2e-6
 _PRICE_FACTOR_CERTIFICATION_REL_TOL = 2e-6
+
+
+def resolve_setup_quotes(
+    db, tickers: list[str], as_of
+) -> dict[str, tuple[float, date]]:
+    """Use base quotes unless stale, then allow a newer certified served value.
+
+    The returned (price, date) pair preserves the scorer's freshness and
+    future-quote gates regardless of which table supplied the observation.
+    Missing base quotes and unknown served generations fail closed.
+    """
+    tickers = sorted({str(ticker).strip().upper() for ticker in tickers})
+    if not tickers:
+        return {}
+    cutoff = pd.Timestamp(as_of).date()
+    latest = db.conn.execute(
+        "SELECT ticker, close, date FROM prices WHERE ticker = ANY(?) "
+        "AND date <= ? "
+        "QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY date DESC) = 1",
+        [tickers, cutoff],
+    ).fetchdf()
+    quotes = {}
+    for row in latest.itertuples(index=False):
+        if row.close is not None and not pd.isna(row.close):
+            quotes[str(row.ticker).strip().upper()] = (
+                float(row.close), pd.Timestamp(row.date).date()
+            )
+
+    stale = [
+        ticker
+        for ticker, (_, quote_date) in quotes.items()
+        if (cutoff - quote_date).days > 5
+    ]
+    if not stale or not price_generation_schema_exists(db):
+        return quotes
+    states = price_generation_states(db, schema_exists=True)
+    for ticker in stale:
+        state = states.get(ticker, {})
+        generation = state.get("generation_id")
+        if state.get("comparability_status") != "comparable" or not generation:
+            continue
+        row = db.conn.execute(
+            "SELECT close, date FROM price_generation_values "
+            "WHERE ticker=? AND generation=? AND date<=? AND close IS NOT NULL "
+            "ORDER BY date DESC LIMIT 1",
+            [ticker, generation, cutoff],
+        ).fetchone()
+        if row is None:
+            continue
+        generation_date = pd.Timestamp(row[1]).date()
+        if generation_date > quotes[ticker][1]:
+            quotes[ticker] = (float(row[0]), generation_date)
+    return quotes
 
 
 # ── YFinancePriceSource: yfinance-backed price fetcher with cache merge ──

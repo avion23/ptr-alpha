@@ -372,6 +372,7 @@ class Form4Source(TransactionSource):
         self.session = self._sec.session
         self.ingestion_generation = ingestion_generation
         self._ticker_map: dict[str, int] | None = None
+        self._published_index_reachable: bool | None = None
 
     def close(self) -> None:
         self._sec.close()
@@ -552,6 +553,32 @@ class Form4Source(TransactionSource):
             f"master.{filing_day:%Y%m%d}.idx"
         )
 
+    def _published_index_reachable_now(self) -> bool:
+        """Positive control for a daily-index HTTP 403 (memoized per instance).
+
+        SEC answers HTTP 403 — not 404 — for archive paths it does not
+        publish: weekend/holiday indices and the current day's index before
+        its evening publication. A sweep must skip those, but a fair-access
+        rejection (identity without a contact) is byte-identical, so a 403 is
+        only trusted as "absent" after this session proves it can still fetch
+        a long-published index.
+        """
+        if self._published_index_reachable is not None:
+            return self._published_index_reachable
+        today = datetime.now(UTC).date()
+        for offset in range(1, 15):
+            try:
+                response = self._request(
+                    self._daily_index_url(today - timedelta(days=offset))
+                )
+                self._parse_master_index(response.content)
+            except Form4Error:
+                continue
+            self._published_index_reachable = True
+            return True
+        self._published_index_reachable = False
+        return False
+
     def sweep_recent(
         self, days_back: int = 7, *, limit_filings: int = 500
     ) -> pd.DataFrame:
@@ -569,6 +596,8 @@ class Form4Source(TransactionSource):
                 content = self._request(self._daily_index_url(filing_day)).content
             except Form4Error as exc:
                 if "HTTP 404" in str(exc):
+                    continue
+                if "HTTP 403" in str(exc) and self._published_index_reachable_now():
                     continue
                 raise Form4Error(
                     f"Could not fetch SEC daily index for {filing_day}: {exc}"

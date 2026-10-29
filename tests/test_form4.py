@@ -486,6 +486,50 @@ def test_sweep_returns_empty_canonical_frame_when_index_has_no_filings(
     assert tuple(rows.columns) == _EXPECTED_COLUMNS
 
 
+def test_sweep_skips_unpublished_index_403_when_identity_still_reaches_sec(
+    tmp_path, monkeypatch
+):
+    """SEC serves 403 (not 404) for indices it has not published yet."""
+    today = datetime.now(UTC).date()
+    published = (
+        b"CIK|Company Name|Form Type|Date Filed|Filename\n"
+        b"------------------------------------------------\n"
+    )
+    source = Form4Source(data_dir=tmp_path, db=SimpleNamespace())
+
+    def request(url):
+        if url.endswith(f"master.{today:%Y%m%d}.idx"):
+            raise Form4Error(f"SEC returned HTTP 403 for {url}")
+        return SimpleNamespace(content=published)
+
+    monkeypatch.setattr(source, "_request", request)
+    try:
+        rows = source.sweep_recent(days_back=2)
+    finally:
+        source.close()
+
+    assert rows.empty
+
+
+def test_sweep_fails_closed_when_index_403_means_identity_rejection(
+    tmp_path, monkeypatch
+):
+    """A fair-access 403 also 403s the control probe, so the sweep aborts."""
+    source = Form4Source(data_dir=tmp_path, db=SimpleNamespace())
+    monkeypatch.setattr(
+        source,
+        "_request",
+        lambda url: (_ for _ in ()).throw(
+            Form4Error(f"SEC returned HTTP 403 for {url}")
+        ),
+    )
+    try:
+        with pytest.raises(Form4Error, match="Could not fetch SEC daily index"):
+            source.sweep_recent(days_back=1)
+    finally:
+        source.close()
+
+
 def test_get_transactions_returns_empty_cached_frame_without_acquisition(tmp_path):
     from analyzer.persistence.database import Database
 

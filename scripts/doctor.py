@@ -75,6 +75,7 @@ OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS = 7
 STAGING_BACKUP_MAX_AGE_DAYS = 8
 
 _DOCTOR_EXIT_RE = re.compile(r"^doctor exit=(\d+)$", re.MULTILINE)
+_OCR_FAILED_STEP_RE = re.compile(r"^(?:coordinator|backup) exit=[1-9]\d*", re.MULTILINE)
 _OCR_START_RE = re.compile(r"^ocr backlog start[^\n]*(?:\n|$)", re.MULTILINE)
 
 
@@ -496,6 +497,14 @@ def _ocr_cron_check(
     start = _ocr_run_start(text)
     if start is not None:
         run_age_hours = (now - start) / 3600
+    failed_step = _OCR_FAILED_STEP_RE.search(text)
+    if failed_step:
+        return FreshnessCheck(
+            name,
+            f"newest OCR-drain run {newest.name} reported {failed_step.group(0)}; "
+            f"doctor success cannot override a failed drain — see {_rel(run_log)}",
+            False,
+        )
     exits = _DOCTOR_EXIT_RE.findall(text)
     if not exits:
         recent = 0 <= run_age_hours <= OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS
@@ -592,7 +601,8 @@ def _ocr_lock_skip_check(
             if exits:
                 # Only the last non-skipped invocation may vouch for the skip.
                 # A previous success must not hide this winner's failure.
-                if (int(exits[-1]) == 0 and run_dir != run_dirs[-1]
+                if (int(exits[-1]) == 0 and not _OCR_FAILED_STEP_RE.search(session)
+                        and run_dir != run_dirs[-1]
                         and not _ocr_lock_skip(sessions[-1])
                         and skip_start <= modified <= now
                         and 0 <= modified - start <= OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS * 3600):
@@ -601,7 +611,8 @@ def _ocr_lock_skip_check(
                         "with doctor exit=0 (fresh completion evidence)", True,
                     )
             elif (now - start <= OCR_CRON_IN_PROGRESS_MAX_AGE_HOURS * 3600
-                    and re.search(r"^--- staging year \d+", session, re.MULTILINE)
+                    and not _OCR_FAILED_STEP_RE.search(session)
+                    and re.search(r"^--- (?:staging year \d+|coordinator start)", session, re.MULTILINE)
                     and _ocr_drain_lock_held(log_root)):
                 return FreshnessCheck(
                     name, prefix + f"overlapping winner {run_dir.name} in progress "

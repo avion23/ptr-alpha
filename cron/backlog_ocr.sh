@@ -39,6 +39,7 @@ cd "$repo"
 
 # One coordinator inventories authoritative database work for all years. No
 # separate GLM staging loop, directory-scan fallback, or quota-output regex.
+printf '%s\n' '--- coordinator start (local=3 gemini=0 glm=2) ---'
 timeout "$((run_budget_seconds - tail_reserve_seconds))" python3 - "$repo/data" <<'PY'
 import json
 import sys
@@ -70,6 +71,7 @@ if [ -d "$repo/data/staging/glm-backlog" ]; then
         backup_rc=1
     fi
 fi
+printf 'backup exit=%d\n' "$backup_rc"
 
 remaining_seconds=$(( deadline_epoch - $(date -u +%s) ))
 if [ "$remaining_seconds" -gt 0 ]; then

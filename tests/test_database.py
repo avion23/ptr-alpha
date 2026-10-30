@@ -44,6 +44,37 @@ def test_writer_exclusive_and_readers_pin_published_snapshot(tmp_path):
         pass  # Closing the Database, not only its raw connection, releases ownership.
 
 
+def test_failed_cow_publication_preserves_old_snapshot_and_writer_lease(tmp_path, monkeypatch):
+    import subprocess
+    from analyzer.persistence.database import DatabaseError
+    from analyzer.persistence.ownership import OwnershipError, publication_state
+
+    path = tmp_path / "publication.duckdb"
+    with Database(path) as writer:
+        writer.conn.execute("CREATE TABLE probe (value INTEGER)")
+        writer.conn.execute("INSERT INTO probe VALUES (1)")
+        first = writer.publish_snapshot()
+        writer.conn.execute("INSERT INTO probe VALUES (2)")
+        calls = []
+
+        def clone_failed(command, **kwargs):
+            calls.append(command)
+            assert command[:3] == ["cp", "--reflink=always", "--"]
+            raise subprocess.CalledProcessError(1, command, stderr="clone unsupported")
+
+        monkeypatch.setattr("analyzer.persistence.database.subprocess.run", clone_failed)
+        with pytest.raises(DatabaseError, match="no full-copy fallback"):
+            writer.publish_snapshot()
+        assert len(calls) == 1
+        assert publication_state(path)["version"] == first["version"]
+        assert writer.conn.execute("SELECT value FROM probe ORDER BY value").fetchall() == [(1,), (2,)]
+        with pytest.raises(OwnershipError, match="writer owner"):
+            Database(path)
+        with Database(path, read_only=True) as reader:
+            assert reader.conn.execute("SELECT value FROM probe").fetchall() == [(1,)]
+        assert not list(path.with_suffix(".duckdb.snapshots").glob("*.tmp"))
+
+
 
 
 def test_database_keeps_legacy_archive_year_unknown_and_nonauthoritative(tmp_path):

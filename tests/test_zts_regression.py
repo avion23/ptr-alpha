@@ -494,7 +494,7 @@ def test_cli_setups_blocks_two_fully_closed_holders(monkeypatch, tmp_path):
         [("ZTS", day, close) for day, close in REAL_CLOSES.items() if day != AUGUST_3],
     )
     db.close = lambda: None
-    monkeypatch.setattr(cli, "_open_database", lambda *args, **kwargs: db)
+    monkeypatch.setattr(cli, "Database", lambda *args, **kwargs: db)
     try:
         result = CliRunner().invoke(
             cli.app,
@@ -537,7 +537,7 @@ def test_cli_setups_blocks_stale_last_quote(monkeypatch, tmp_path):
         [("ZTS", JUNE_30, REAL_CLOSES[JUNE_30])],
     )
     db.close = lambda: None
-    monkeypatch.setattr(cli, "_open_database", lambda *args, **kwargs: db)
+    monkeypatch.setattr(cli, "Database", lambda *args, **kwargs: db)
     monkeypatch.setattr(pipeline, "eligible_events", lambda *_: candidates)
     monkeypatch.setattr(positions, "dedupe_member_names", lambda names, **kw: names)
     monkeypatch.setattr(

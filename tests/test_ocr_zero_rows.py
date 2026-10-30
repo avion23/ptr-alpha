@@ -221,20 +221,19 @@ def test_cli_export_work_manifest_writes_and_exits(tmp_path, monkeypatch, capsys
 
     from analyzer.ocr import ingestion as ocr_zero_rows
 
-    db_path = tmp_path / "c.duckdb"
+    db_path = tmp_path / "congress.duckdb"
     duckdb.connect(str(db_path)).close()
     monkeypatch.setattr(ocr_zero_rows, "DB_PATH", str(db_path))
     monkeypatch.setattr(ocr_zero_rows, "get_ocr_work_items", lambda **kwargs: [])
     manifest = tmp_path / "custom" / "work-manifest.json"
     monkeypatch.setattr(
-        sys, "argv", ["ocr_zero_rows.py", "--export-work-manifest", str(manifest)]
+        sys, "argv", ["ocr_zero_rows.py", "--data-dir", str(tmp_path), "--export-work-manifest", str(manifest)]
     )
 
     from analyzer.ocr import runner
-    monkeypatch.setattr(runner, "DB_PATH", str(db_path))
     runner.main()  # exports and exits before any engine-mode setup
 
-    assert "0 unresolved docs" in capsys.readouterr().out
+    assert json.loads(capsys.readouterr().out)["item_count"] == 0
     envelope = json.loads(manifest.read_text())
     assert envelope["schema"] == ocr_zero_rows.WORK_MANIFEST_SCHEMA
     assert envelope["items"] == []
@@ -255,7 +254,7 @@ def test_export_work_manifest_default_path_is_the_staging_root(tmp_path, monkeyp
 
     assert Path(ocr_zero_rows.export_work_manifest.__defaults__[0]) == STAGING_ROOT / "work-manifest.json"
     output = tmp_path / "data" / "staging" / "glm-backlog" / "work-manifest.json"
-    envelope = ocr_zero_rows.export_work_manifest(output)
+    envelope = ocr_zero_rows.export_work_manifest(output, db_path=str(db_path), data_dir=tmp_path)
     assert envelope["items"] == []
     assert (
         tmp_path / "data" / "staging" / "glm-backlog" / "work-manifest.json"

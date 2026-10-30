@@ -34,7 +34,8 @@ LOADERS = {
 EXEMPT = {
     "scripts/audit_generation.py:_get_unresolved_house_doc_ids": 1,  # Current ingestion audit.
     "scripts/purge_unaccepted_house_rowsets.py:<module>": 2,  # One-time contamination report (report-only default; reads the leak it measures).
-    "scripts/purge_unaccepted_house_rowsets.py:main": 5,  # One-time contamination cleanup (--apply archives to transaction_versions before delete; FP finding 2 follow-up).
+    "scripts/purge_unaccepted_house_rowsets.py:main": 1,  # Read-only preview before acquiring maintenance ownership.
+    "scripts/purge_unaccepted_house_rowsets.py:_purge_owned": 4,  # Owner-held contamination cleanup with transaction_versions archival.
     "scripts/audit_generation.py:check_canary_counts": 1,  # Current canary inventory.
     "scripts/audit_generation.py:check_date_domain": 6,  # Validate stored date domains, not decisions.
     "scripts/audit_generation.py:check_duplicate_policy": 1,  # Economic-duplicate audit.
@@ -44,8 +45,8 @@ EXEMPT = {
     "scripts/audit_generation.py:check_parse_counts_match_persisted": 1,  # Ingestion reconciliation.
     "scripts/audit_generation.py:check_source_report_equation": 4,  # Ingestion reconciliation.
     "scripts/audit_generation.py:check_source_row_ids": 4,  # Stored identity audit.
-    "scripts/backfill_tickers.py:backfill_tickers": 3,  # Current repair with row archival.
-    "scripts/cleanup_tickers.py:main": 8,  # Current ticker repair and counts.
+    "scripts/backfill_tickers.py:_backfill_owned": 3,  # Owner-held current repair with row archival.
+    "scripts/cleanup_tickers.py:_cleanup_owned": 8,  # Owner-held current ticker repair and counts.
     "scripts/ocr_triage.py:load_unresolved_artifacts": 1,  # Current OCR work queue.
     "src/analyzer/ocr/ingestion.py:record_failed_ocr_attempt": 1,  # Ingestion provenance.
     "src/analyzer/ocr/ingestion.py:get_ocr_work_items": 3,  # Current OCR work queue.

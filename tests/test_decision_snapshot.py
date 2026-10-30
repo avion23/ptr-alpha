@@ -746,7 +746,7 @@ def test_cli_recording_is_byte_identical_and_failure_is_terminal(
     )
     monkeypatch.setattr(
         cli,
-        "_open_database",
+        "Database",
         lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
     )
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
@@ -818,7 +818,7 @@ def test_cli_setups_passes_one_resolved_control_to_every_normal_path(
     )
     monkeypatch.setattr(
         cli,
-        "_open_database",
+        "Database",
         lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
     )
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates.copy())
@@ -907,7 +907,7 @@ def test_cli_empty_setups_paths_record_resolved_control(
     )
     monkeypatch.setattr(
         cli,
-        "_open_database",
+        "Database",
         lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
     )
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: pd.DataFrame())
@@ -982,7 +982,7 @@ def test_unscoped_setups_keep_the_full_event_universe(
     )
     monkeypatch.setattr(
         cli,
-        "_open_database",
+        "Database",
         lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
     )
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
@@ -1029,7 +1029,7 @@ def test_scoped_setups_with_no_holdings_return_empty_not_the_universe(
     )
     monkeypatch.setattr(
         cli,
-        "_open_database",
+        "Database",
         lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
     )
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)
@@ -1078,7 +1078,7 @@ def test_no_receipt_flag_writes_nothing_but_keeps_output(
     )
     monkeypatch.setattr(
         cli,
-        "_open_database",
+        "Database",
         lambda *a, **kw: SimpleNamespace(conn=connection, close=lambda: None),
     )
     monkeypatch.setattr(pipeline, "eligible_events", lambda *a: candidates)

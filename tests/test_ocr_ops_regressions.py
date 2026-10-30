@@ -34,7 +34,7 @@ def stored(tmp_path, monkeypatch):
     digest = common.pdf_sha256(pdf)
     db = Database(path)
     db.conn.execute("INSERT INTO metadata (doc_id, first_name, last_name, filing_date, filing_type) VALUES ('1', 'Jane', 'Doe', '2024-02-01', 'P')")
-    db.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id) VALUES (2024, 'g')")
+    db.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2024, 'g', 1, 1)")
     db.conn.execute("INSERT INTO house_generation_metadata (archive_year, generation_id, doc_id, first_name, last_name, filing_date, filing_type) VALUES (2024, 'g', '1', 'Jane', 'Doe', '2024-02-01', 'P')")
     db.conn.execute("INSERT INTO house_pdf_artifacts (archive_year, generation_id, doc_id, artifact_sha256) VALUES (2024, 'g', '1', ?)", [digest])
     ops.record_parse_run(db.conn, '1', 2024, 'zero_rows', 0, 0, parser_version='deterministic', engines_attempted='pdfplumber')
@@ -51,15 +51,21 @@ def cache_and_insert(stored, notification='01/20/24'):
 
 
 @pytest.mark.parametrize(
-    ("metadata", "message"),
-    [
-        (None, "artifact metadata"),
-        (common.ArtifactMetadata("hash", 1, 1, "source.pdf"), "validated output"),
-    ],
+    "raw", [None, "not a valid source response"],
 )
-def test_successful_response_metadata_invariants_are_runtime_checks(metadata, message):
-    with pytest.raises(RuntimeError, match=message):
-        runner._require_successful_response_metadata(metadata)
+def test_success_requires_valid_source_response(stored, monkeypatch, raw):
+    path, _, _ = stored
+    monkeypatch.setattr(common, "call_gemini", lambda *args, **kwargs: (raw, "", None))
+    result = runner.run_gemini_ocr_for_year(2024, str(path.parent))
+    assert result["unresolved"] == 1
+    assert result["work"]["by_state"] in ({"needs_review": 1}, {"blocked": 1})
+    from analyzer.ocr.workers import load_result
+    from analyzer.ocr.contracts import ExtractionOutcome
+    bundle = load_result(next((path.parent / "pipeline" / "results").glob("*.json")))
+    assert bundle.outcome == ExtractionOutcome.BLOCKED
+    assert bundle.evidence["failure"]["type"] in {"ValueError", "GeminiOutputError"}
+    with Database(path) as db:
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
 
 
 def test_missing_notification_is_resolved(stored):
@@ -383,12 +389,9 @@ def test_initials(name, expected):
 
 
 def test_year_runner_parses_fresh_response_once(stored, monkeypatch):
-    from types import SimpleNamespace
     path, pdf, _ = stored
     output = 'MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nNO_TRANSACTIONS'
-    monkeypatch.setattr(common.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0, stdout=output, stderr=''))
-    monkeypatch.setattr(runner, 'get_ocr_work_items', lambda **kw: [('1', 2024, str(pdf))])
-    monkeypatch.setattr(common.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(common, 'call_gemini', lambda *a, **kw: (output, '', None))
     original = common.parse_gemini_output
     calls = []
     def parse(*args, **kwargs):
@@ -396,7 +399,9 @@ def test_year_runner_parses_fresh_response_once(stored, monkeypatch):
         return original(*args, **kwargs)
     monkeypatch.setattr(common, 'parse_gemini_output', parse)
     monkeypatch.setattr(ops, 'parse_gemini_output', parse)
-    assert runner.run_gemini_ocr_for_year(2024, str(path.parent)) == 0
+    summary = runner.run_gemini_ocr_for_year(2024, str(path.parent))
+    assert summary['unresolved'] == 1  # Model empty output is not verified absence.
+    assert summary['work']['by_state'] == {'needs_review': 1}
     assert calls == [1]
 
 
@@ -433,37 +438,40 @@ def test_quota_retries_with_backoff(tmp_path, monkeypatch):
 def test_quota_stops_year_batch(stored, monkeypatch):
     path, pdf, digest = stored
     calls = []
-    monkeypatch.setattr(runner, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf)), ('2', 2024, str(pdf))])
-    monkeypatch.setattr(common.time, 'sleep', lambda _: None)
     def call(*args, **kwargs):
         calls.append(args)
         return None, '429 RESOURCE_EXHAUSTED', common.ArtifactMetadata(digest, 1, 3, str(pdf))
-    monkeypatch.setattr(runner, 'call_gemini', call)
-    runner.run_gemini_ocr_for_year(2024, str(path.parent))
+    monkeypatch.setattr(common, 'call_gemini', call)
+    summary = runner.run_gemini_ocr_for_year(2024, str(path.parent))
+    assert summary['work']['by_state'] == {'retry_wait': 1}
+    assert summary['unresolved'] == 1
     assert len(calls) == 1
 
 
-def test_runner_keeps_physical_page_count(stored, monkeypatch):
+@pytest.mark.parametrize("reported_pages", [1, 2])
+def test_runner_admission_requires_bound_physical_page_coverage(stored, monkeypatch, reported_pages):
     path, pdf, digest = stored
-    output = 'MEMBER: Jane Doe\nPAGES: 2\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
+    output = f'MEMBER: Jane Doe\nPAGES: {reported_pages}\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
     common.parse_gemini_output(output, expected_page_count=1)
-    monkeypatch.setattr(runner, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf))])
-    monkeypatch.setattr(common.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(runner, 'call_gemini', lambda *args, **kwargs: (output, '', common.ArtifactMetadata(digest, 1, 3, str(pdf), common.parse_gemini_output(output, expected_page_count=1))))
-    assert runner.run_gemini_ocr_for_year(2024, str(path.parent)) == 1
+    monkeypatch.setattr(common, 'call_gemini', lambda *args, **kwargs: (output, '', None))
+    summary = runner.run_gemini_ocr_for_year(2024, str(path.parent))
+    assert summary['unresolved'] == (0 if reported_pages == 1 else 1)
+    assert summary['work']['by_state'] == {'accepted' if reported_pages == 1 else 'needs_review': 1}
+    from analyzer.ocr.workers import load_result
+    bundle = load_result(next((path.parent / 'pipeline' / 'results').glob('*.json')))
+    assert bundle.evidence['page_count'] == 1
 
 
-def test_year_runner_validation_failure_retires_rows(stored, monkeypatch):
+def test_year_runner_validation_failure_preserves_accepted_rows(stored, monkeypatch):
     cache_and_insert(stored)
     path, pdf, digest = stored
     output = 'MEMBER: Other Person\nPAGES: 1\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/24 | N/A | A'
-    monkeypatch.setattr(runner, 'get_ocr_work_items', lambda **kwargs: [('1', 2024, str(pdf))])
-    monkeypatch.setattr(common.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(runner, 'call_gemini', lambda *args, **kwargs: (output, '', common.ArtifactMetadata(digest, 1, 3, str(pdf), common.parse_gemini_output(output, expected_page_count=1))))
-    assert runner.run_gemini_ocr_for_year(2024, str(path.parent)) == 0
+    monkeypatch.setattr(common, 'call_gemini', lambda *args, **kwargs: (output, '', None))
+    summary = runner.run_gemini_ocr_for_year(2024, str(path.parent), refresh=True)
+    assert summary['work']['by_state'] == {'needs_review': 1}
     db = Database(path)
     try:
-        assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 0
+        assert db.conn.execute('SELECT COUNT(*) FROM transactions').fetchone()[0] == 1
     finally:
         db.close()
 
@@ -480,52 +488,35 @@ def test_year_runner_validation_failure_retires_rows(stored, monkeypatch):
 def test_operational_drain_exit_status_tracks_admission_outcome(
     monkeypatch, capsys, outcome_status, inserted, expected, exit_status
 ):
-    output = (
-        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
-        "Apple (AAPL) | Purchase | 01/15/24 | N/A | A"
-    )
-    parsed = common.parse_gemini_output(output, expected_page_count=1)
-    metadata = common.ArtifactMetadata("sha", 1, len(output), "stub.pdf", parsed)
     monkeypatch.setattr(sys, "argv", ["ocr_zero_rows"])
     monkeypatch.setattr(runner, "_ocr_engine_mode", lambda: "gemini")
-    monkeypatch.setattr(runner, "get_zero_row_pdfs", lambda: [("1", 2024, "stub.pdf")])
-    monkeypatch.setattr(runner, "load_progress", lambda: {})
-    monkeypatch.setattr(runner, "mark_progress", lambda *args: None)
-    monkeypatch.setattr(runner, "save_progress", lambda *args: None)
-    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
-    monkeypatch.setattr(
-        runner, "call_gemini", lambda *args, **kwargs: (output, "", metadata)
-    )
-    monkeypatch.setattr(runner, "resolve_ingestion_generation", lambda *args: "g")
-    monkeypatch.setattr(
-        runner,
-        "insert_transactions_outcome",
-        lambda *args, **kwargs: ops.InsertOutcome(
-            outcome_status,
-            inserted=inserted,
-            expected=expected,
-            committed=True,
-        ),
-    )
+    from analyzer.ocr import coordinator
+    summary = {"unresolved": 0 if outcome_status == "success" else 1,
+               "missing_years": [], "completed_attempts": expected,
+               "accepted_rows": inserted}
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(kwargs)
+        return summary
+
+    monkeypatch.setattr(coordinator, "run_pipeline", run)
 
     assert runner.main() == exit_status
-    captured = capsys.readouterr().out
-    if exit_status:
-        assert "=== OCR RUN INCOMPLETE ===" in captured
-    else:
-        assert "=== OCR RUN FINISHED ===" in captured
-    if outcome_status == "partial":
-        assert "Total inserted: 1" in captured
+    assert json.loads(capsys.readouterr().out) == summary
+    assert calls == [{"local_workers": 0, "gemini_workers": 1,
+                      "glm_workers": 0, "refresh_recipe": False}]
 
 
 def test_operational_drain_no_available_work_is_success(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["ocr_zero_rows"])
     monkeypatch.setattr(runner, "_ocr_engine_mode", lambda: "gemini")
-    monkeypatch.setattr(runner, "get_zero_row_pdfs", lambda: [])
-    monkeypatch.setattr(runner, "load_progress", lambda: {})
+    from analyzer.ocr import coordinator
+    summary = {"unresolved": 0, "missing_years": [], "completed_attempts": 0}
+    monkeypatch.setattr(coordinator, "run_pipeline", lambda *args, **kwargs: summary)
 
     assert runner.main() == 0
-    assert "=== OCR RUN FINISHED ===" in capsys.readouterr().out
+    assert json.loads(capsys.readouterr().out) == summary
 
 
 @pytest.mark.parametrize("exit_status", [0, 1])

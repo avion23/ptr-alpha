@@ -1,13 +1,13 @@
-from multiprocessing.pool import ThreadPool
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import time
+import threading
 
 import pandas as pd
 import pytest
 
 from analyzer.download import PARSE_VERSION, validated_pdf_sha256
 from analyzer.parsing.metadata import consolidate_transactions
-from .test_download import _source, _metadata
+from .test_download import _source
 
 
 def _tx(day="2021-01-02", row="r1"):
@@ -71,28 +71,47 @@ def test_mixed_dates_survive(dates):
 
 
 def test_completed_pdf_checkpoint_precedes_stalled_batch(tmp_path, monkeypatch):
+    from analyzer.ocr import common, coordinator, workers
+    from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
+
     source, db = _source(tmp_path)
     source.parallel_workers = 2
     pdf_dir = tmp_path / "2021" / "pdfs"
     pdf_dir.mkdir(parents=True)
     for doc in ("slow", "fast"):
         (pdf_dir / f"{doc}.pdf").write_bytes(b"%PDF-test\n%%EOF")
-    monkeypatch.setattr(source, "fetch_metadata", lambda year: _metadata("slow", "fast"))
-    monkeypatch.setattr(db, "get_latest_house_generation", lambda year: "legacy-untracked-2021")
-    monkeypatch.setattr("analyzer.download.Pool", ThreadPool)
+    db.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2021, 'g', 2, 2)")
+    for doc in ("slow", "fast"):
+        digest = validated_pdf_sha256(pdf_dir / f"{doc}.pdf")
+        db.conn.execute("INSERT INTO house_generation_metadata (archive_year, generation_id, doc_id, first_name, last_name, filing_date, filing_type) VALUES (2021, 'g', ?, 'Jane', 'Doe', '2021-01-03', 'P')", [doc])
+        db.conn.execute("INSERT INTO house_pdf_artifacts (archive_year, generation_id, doc_id, artifact_sha256) VALUES (2021, 'g', ?, ?)", [doc, digest])
+    monkeypatch.setattr(common, "pdf_page_count", lambda _: 1)
+    monkeypatch.setattr(coordinator, "ProcessPoolExecutor", lambda slots, **kwargs: ThreadPoolExecutor(slots))
+    checkpoint = threading.Event()
+    publish = db.publish_snapshot
 
-    def worker(path):
-        if path.stem == "slow":
-            time.sleep(0.5)
+    def published():
+        state = publish()
+        if db.conn.execute("SELECT COUNT(*) FROM transactions WHERE doc_id='fast'").fetchone()[0] == 1:
+            checkpoint.set()
+        return state
+
+    monkeypatch.setattr(db, "publish_snapshot", published)
+
+    def worker(work, spool):
+        if work.doc_id == "slow":
+            assert checkpoint.wait(10), "completed rowset was not checkpointed while another worker stalled"
             raise RuntimeError("interrupted batch")
-        return path, [_tx()], ["pdfplumber"]
+        return workers._publish(ResultBundle(work, ExtractionOutcome.CANDIDATE, [_tx()],
+            evidence={"artifact_verified": True, "engines": ["pdftotext"]}), spool)
 
-    monkeypatch.setattr("analyzer.download.tolerant_parse_pdf_worker", worker)
+    monkeypatch.setattr(workers, "extract_document", worker)
     try:
         with pytest.raises(RuntimeError, match="interrupted batch"):
-            source.parse_cached_pdfs(2021, force=True)
+            coordinator.run_pipeline(tmp_path, [2021], database=db, local_workers=2, publish_every=1)
         assert len(db.get_transactions_for_doc("fast")) == 1
         assert db.conn.execute("SELECT status FROM pdf_parse_runs WHERE doc_id='fast'").fetchone() == ("success",)
+        assert db.work.status()["by_state"] == {"accepted": 1, "running": 1}
     finally:
         source.close()
         db.close()

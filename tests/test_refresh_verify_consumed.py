@@ -69,9 +69,9 @@ class VerifyConsumptionTest(TestCase):
 
     def test_canonical_row_loss_is_caught_after_merge(self):
         merge_temp_into_canonical(self.temp_db, self.canonical_db, ["AAPL"])
-        con = duckdb.connect(str(self.canonical_db))
-        con.execute("DELETE FROM prices WHERE date = '2026-10-15'")
-        con.close()
+        with Database(self.canonical_db) as owner:
+            owner.conn.execute("DELETE FROM prices WHERE date = '2026-10-15'")
+            owner.publish_snapshot()
         self.assertEqual(
             1, verify_consumption(self.temp_db, self.canonical_db, ["AAPL"])
         )

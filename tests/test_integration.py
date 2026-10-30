@@ -99,7 +99,7 @@ class TestIntegration(unittest.TestCase):
     def test_end_to_end_house_analysis(self):
         self._insert_mock_data()
         transaction_source = HouseTransactionSource(self.settings)
-        price_source = YFinancePriceSource(self.settings)
+        price_source = YFinancePriceSource(self.settings, db=transaction_source.db)
         self.addCleanup(transaction_source.close)
         self.addCleanup(price_source.close)
 
@@ -122,7 +122,7 @@ class TestIntegration(unittest.TestCase):
     def test_member_specific_analysis(self):
         self._insert_mock_data()
         transaction_source = HouseTransactionSource(self.settings)
-        price_source = YFinancePriceSource(self.settings)
+        price_source = YFinancePriceSource(self.settings, db=transaction_source.db)
         self.addCleanup(transaction_source.close)
         self.addCleanup(price_source.close)
 
@@ -144,7 +144,7 @@ class TestIntegration(unittest.TestCase):
 
     def test_empty_analysis_returns_failed_data_result(self):
         transaction_source = HouseTransactionSource(self.settings)
-        price_source = YFinancePriceSource(self.settings)
+        price_source = YFinancePriceSource(self.settings, db=transaction_source.db)
         self.addCleanup(transaction_source.close)
         self.addCleanup(price_source.close)
 

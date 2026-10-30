@@ -243,7 +243,7 @@ def test_spouse_dc_over_amount_can_wrap_to_a_later_line(monkeypatch):
     assert transaction["ticker"] is None
     assert transaction["asset_description"] == "U.S. Treasury Note due 05/31/2024 [GS]"
     assert transaction["amount_raw"] == "Spouse/DC Over $1,000,000"
-    assert transaction["amount_midpoint"] == 1_000_000
+    assert transaction["amount_midpoint"] is None  # Open bounds have no known midpoint.
 
 
 def test_asset_name_starting_with_id_is_not_treated_as_header(monkeypatch):

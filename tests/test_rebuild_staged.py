@@ -132,7 +132,10 @@ def test_house_persistence_rejects_consolidation_loss_in_both_paths(tmp_path, ba
         assert run["error_message"] == "rows lost during consolidation"
         assert run["artifact_sha256"] == validated_pdf_sha256(pdf)
         assert run["ingestion_generation"] == "generation"
-    assert captured[0][1] == captured[1][1]
+    owner_options = captured[0][1].copy()
+    assert owner_options.pop("receipt") is None
+    assert owner_options.pop("include_global_counts") is True
+    assert owner_options == captured[1][1]
 
 
 def test_house_parse_source_recognizes_all_validated_llm_backends():
@@ -755,7 +758,7 @@ def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identi
     )
     envelope = {
         "cache_envelope_version": gemini_ocr_common.CACHE_ENVELOPE_VERSION,
-        "output_schema_version": gemini_ocr_common.OUTPUT_SCHEMA_VERSION,
+        "output_schema_version": 4,
         "doc_id": "cache-doc",
         "pdf_sha256": artifact_sha,
         "pdf_page_count": 1,
@@ -763,8 +766,11 @@ def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identi
         "prompt_sha256": gemini_ocr_common.PROMPT_SHA256,
         "parser_version": "v-test-gemini",
         "output": (
-            "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
-            "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/16/24 | A\n"
+            'SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nROW: '
+            + json.dumps({"asset": "Apple Inc. (AAPL)", "type": "Purchase",
+                          "date": "01/15/24", "notif_date": "01/16/24",
+                          "amount_raw": "A", "owner": None, "account": None,
+                          "instrument_type": "unknown", "raw_cells": {"Amount": "A"}})
         ),
     }
     (cache_dir / "cache-doc.json").write_text(json.dumps(envelope))
@@ -774,7 +780,7 @@ def test_cached_gemini_ingest_requires_exact_artifact_and_preserves_model_identi
         result = rebuild_staged._ingest_cached_gemini_year(
             staging, db, 2024, cache_dir
         )
-        assert [row["doc_id"] for row in result["accepted"]] == ["cache-doc"]
+        assert [row["doc_id"] for row in result["accepted"]] == ["cache-doc"], result["rejected"]
         assert result["rejected"] == []
         assert db.conn.execute(
             """

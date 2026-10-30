@@ -283,12 +283,15 @@ class EscalationWiringTest(TestCase):
 
 
 class BacklogOcrContractTest(TestCase):
-    def test_scheduled_drain_is_manifest_and_canonical_bound(self):
+    def test_scheduled_drain_uses_one_coordinator_with_explicit_lanes(self):
         text = (CRON_DIR / "backlog_ocr.sh").read_text()
-        self.assertIn("--export-work-manifest", text)
-        self.assertIn("load_work_manifest_items(sys.argv[1])", text)
-        self.assertIn("manifest_years(items)", text)
-        self.assertIn('--from-manifest "$work_manifest" --check-canonical', text)
-        self.assertIn("refusing directory-scan fallback", text)
+        self.assertIn("from analyzer.ocr.coordinator import run_pipeline", text)
+        self.assertIn("run_pipeline(sys.argv[1], local_workers=3, gemini_workers=0,", text)
+        self.assertIn("glm_workers=2)", text)
+        self.assertNotIn("glm_stage.py stage", text)
+        self.assertNotIn("--from-manifest", text)
+        self.assertIn('exit "$coordinator_rc"', text)
+        self.assertIn('exit "$backup_rc"', text)
+        self.assertIn('exit "$doctor_rc"', text)
         self.assertNotIn("for year in 2013", text)
         self.assertNotIn("for year in 2018", text)

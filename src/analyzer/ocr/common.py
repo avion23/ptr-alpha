@@ -40,20 +40,31 @@ AMOUNT_MIDPOINTS = {
     "K": 1000000,
 }
 
-PROMPT = """This is a US House Periodic Transaction Report (PTR). The first data row may be an EXAMPLE labeled "Example: Mega Corp. Common Stock"; skip it. Extract every real transaction from every page.
+PROMPT = """This is a US House Periodic Transaction Report (PTR). Skip printed demonstration/example rows and unused blank lines. Extract every real transaction from every page. Never copy values or checkbox marks from a printed example into a real row.
 
 Output format:
 SCHEMA: 4
 MEMBER: [full name of filer]
 PAGES: [total PDF page count]
 PAGE: [page number]
-ROW: {"asset": "verbatim asset", "type": "Purchase/Sale/Exchange or unknown", "date": "MM/DD/YY or unknown", "notif_date": null, "amount_raw": "verbatim amount cell", "owner": "verbatim owner cell or null", "account": "verbatim account or null", "instrument_type": "explicit instrument or unknown", "raw_cells": {"column heading": "verbatim cell"}}
+ROW: [a JSON object with the fields described below]
+
+Required ROW fields:
+- asset: verbatim asset text.
+- type: the direction selected in this real row; use unknown if unreadable.
+- date: the transaction date in this row's transaction-date column.
+- notif_date: the date in this row's notification-date column. A populated notification cell MUST produce a date string here, even when it equals the transaction date. Use JSON null only when this row genuinely reports no notification date; use unknown when unreadable. Neither the filing date nor a date in asset text establishes a notification date.
+- amount_raw: verbatim amount, or the exact printed bounds of the marked amount column.
+- owner: this row's verbatim owner cell or selected owner code; JSON null for a genuinely blank/unreported owner, never an inferred self owner.
+- account: verbatim account, JSON null if unreported.
+- instrument_type: explicitly reported instrument, otherwise unknown.
+- raw_cells: JSON object mapping every source column heading to this row's verbatim cell text or mark, preserving blank cells as empty strings or JSON null.
 
 Use one ROW JSON object per real transaction, including repeated identical lots. Preserve exact dollar amounts, ranges, and open bounds verbatim; NEVER convert them to range letters. Copy every source column in raw_cells. Null means not reported; use "unknown" for unreadable text. Do not infer ownership, account, instrument, dates, or amounts. Preserve option terms and all additional source fields as named JSON fields.
 
 For each page with no real transactions, output PAGE followed by exactly NO_TRANSACTIONS. Every PDF page must appear exactly once and must contain transactions or NO_TRANSACTIONS.
 For checkbox forms, read each row's marked box under PURCHASE, SALE, or EXCHANGE; these are separate subcolumns. Never carry the preceding row's direction or notification date forward. Rotate sideways pages before reading the column headers and marks.
-Amount ranges: A=$1K-15K, B=$15K-50K, C=$50K-100K, D=$100K-250K, E=$250K-500K, F=$500K-1M, G=$1M-5M, H=$5M-25M, I=$25M-50M, J=over $50M.
+For amount checkboxes, use the source's printed bounds exactly, not a memorized band table. Keep the actual lower bound, upper bound, and cents unchanged.
 No markdown, no tables, no explanations."""
 PROMPT_SHA256 = hashlib.sha256(PROMPT.encode()).hexdigest()
 

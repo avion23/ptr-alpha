@@ -9,8 +9,9 @@ import re
 
 from analyzer.ocr.contracts import ExtractionLane, WorkEnvelope, ResultBundle
 from analyzer.parsing.cells import extract_owner_code
+from analyzer.parsing.columns import _normalize_header
 
-NORMALIZATION_RECIPE = "house-ocr-normalization-v3"
+NORMALIZATION_RECIPE = "house-ocr-normalization-v4"
 
 
 def typed_instrument_fields(row):
@@ -76,6 +77,118 @@ def normalize_amount(value):
     return result
 
 
+def raw_cell_consistency_findings(row, occurrence):
+    """Negative internal check only: model raw_cells cannot verify source fidelity.
+
+    Exact known headings only; never search asset text or arbitrary date cells,
+    and never populate typed fields from these model-produced claims.
+    """
+    from analyzer.ocr.common import (
+        _strict_date, _normalize_tx_type, _tx_date, _tx_notification_date,
+        _tx_type, _tx_amount,
+    )
+
+    cells = row.get("raw_cells")
+    if not isinstance(cells, dict):
+        return []  # Schema validation owns missing/malformed raw_cells.
+
+    def amount_claim(value):
+        amount = normalize_amount(value)
+        if amount["amount_kind"] == "unknown":
+            return None
+        return (amount["amount_kind"], amount.get("amount_letter"),
+                *(Decimal(amount[key]) if amount[key] is not None else None
+                  for key in ("amount_lower", "amount_upper", "amount_exact")))
+
+    def owner_claim(value):
+        code = extract_owner_code(value)
+        return "J" if code == "JT" else code
+
+    typed = {
+        "transaction_date": _tx_date(row),
+        "notification_date": _tx_notification_date(row),
+        "type": _tx_type(row),
+        "owner": row.get("raw_owner", row.get("owner", row.get("owner_code"))),
+        "amount_raw": _tx_amount(row),
+    }
+    parsers = {"transaction_date": _strict_date, "notification_date": _strict_date,
+               "type": _normalize_tx_type, "owner": owner_claim,
+               "amount_raw": amount_claim}
+    headings = {
+        "transaction_date": {"date", "transactiondate", "txdate", "dateoftransaction"},
+        "notification_date": {"notifdate", "notificationdate", "datenotifiedoftransaction",
+                              "dateofnotifiedtransaction", "dateofnotifiedoftransaction"},
+        "type": {"type", "transactiontype", "txtype", "typeoftransaction"},
+        "owner": {"owner", "ownership", "ownertype", "ownercode"},
+        "amount_raw": {"amount", "amountraw", "amountletter", "transactionamount",
+                       "amountoftransaction", "transactionvalue"},
+    }
+    findings = []
+
+    def blank(value):
+        return value is None or isinstance(value, str) and not value.strip()
+
+    def report(field, source_key, reason):
+        findings.append(dict(occurrence=occurrence, field=field,
+                             source_key=source_key, reason=reason))
+
+    def compare(field, source_key, source):
+        target = typed[field]
+        if blank(source) and blank(target):
+            return
+        if blank(source):
+            report(field, source_key, "source_blank_typed_populated")
+            return
+        source_claim = parsers[field](source)
+        if source_claim is None:
+            report(field, source_key, "source_unreadable_or_ambiguous")
+        elif blank(target):
+            report(field, source_key, "typed_omission")
+        elif parsers[field](target) != source_claim:
+            report(field, source_key, "typed_source_mismatch")
+
+    # Checkbox claims are grouped: an empty Purchase column is not a denial
+    # of a marked Sale column. Multiple selections are ambiguous, not votes.
+    checkboxes = {"type": [], "owner": [], "amount_raw": []}
+    for key, value in cells.items():
+        if not isinstance(key, str):
+            continue
+        header = _normalize_header(key)
+        field = next((field for field, aliases in headings.items() if header in aliases), None)
+        if field is not None:
+            compare(field, key, value)
+            continue
+        if header in {"purchase", "sale", "exchange"}:
+            field, claim = "type", header.title()
+        elif header in {"sp", "jt", "dc"}:
+            field, claim = "owner", header.upper()
+        elif normalize_amount(key)["amount_kind"] in {"range", "open"}:
+            field, claim = "amount_raw", key
+        else:
+            continue
+        checkboxes[field].append((key, value, claim))
+
+    for field, columns in checkboxes.items():
+        if not columns:
+            continue
+        marked = []
+        for key, value, claim in columns:
+            if blank(value):
+                continue
+            if isinstance(value, str) and value.strip().casefold() in {"x", "[x]", "✓", "✔", "☑"}:
+                marked.append((key, claim))
+            else:
+                report(field, key, "source_unreadable_or_ambiguous")
+        if len(marked) > 1:
+            for key, _ in marked:
+                report(field, key, "multiple_source_selections")
+        elif marked:
+            compare(field, *marked[0])
+        elif not blank(typed[field]):
+            report(field, columns[0][0], "source_blank_typed_populated")
+    return findings
+
+
 def normalize_rows(doc_id, member, transactions, filing_date, expected_member, artifact_sha256):
     """Shared admission/cache projection, preserving order and repeated occurrences."""
     from analyzer.ocr.common import apply_verified_house_corrections, validate_transactions, _strict_date
@@ -101,6 +214,9 @@ def normalize_rows(doc_id, member, transactions, filing_date, expected_member, a
         row["raw_owner"] = owner
         row["owner_code"] = extract_owner_code(owner)
         row["occurrence"] = occurrence
+        conflicts = raw_cell_consistency_findings(row, occurrence)
+        if conflicts:
+            findings.setdefault("raw_cell_consistency", []).extend(conflicts)
     return rows, findings
 
 

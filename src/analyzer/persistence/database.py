@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-import shutil
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -119,7 +119,12 @@ class Database:
         return self._work
 
     def publish_snapshot(self) -> dict:
-        """Seal a full checkpointed copy; announce only after writer reopen."""
+        """Seal a checkpointed COW clone; announce only after writer reopen.
+
+        Requires GNU cp and same-filesystem reflink support. Never fall back to
+        full copies: retained snapshots share extents but changed blocks still
+        consume storage. Published versions remain available to pinned readers.
+        """
         if self._read_only or str(self.db_path) == ":memory:" or self._closed:
             raise DatabaseError("Publication requires an open file-backed writer")
         version = uuid4().hex
@@ -131,7 +136,17 @@ class Database:
         self.conn.execute("CHECKPOINT")
         self.conn.close()
         try:
-            shutil.copyfile(self.db_path, temporary)
+            try:
+                subprocess.run(
+                    ["cp", "--reflink=always", "--", str(self.db_path), str(temporary)],
+                    check=True, capture_output=True, text=True,
+                )
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise DatabaseError(
+                    "Snapshot publication requires a same-filesystem copy-on-write "
+                    "clone using GNU cp --reflink=always; cloning failed and no "
+                    "full-copy fallback was attempted"
+                ) from error
             with temporary.open("rb") as snapshot:
                 os.fsync(snapshot.fileno())
             temporary.chmod(0o444)

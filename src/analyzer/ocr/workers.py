@@ -162,7 +162,8 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
                 raise ValueError("bound artifact page count mismatch")
             evidence["artifact_verified"] = True
             if work.lane == ExtractionLane.LOCAL:
-                from analyzer.parsing.cascade import parse_pdf_worker
+                from analyzer.download import engine_error_detail, tolerant_parse_pdf_worker
+                from analyzer.parsing.cascade import ParserCascadeError, parse_pdf_worker
 
                 source = subprocess.run(
                     ["pdftotext", "-layout", str(snapshot.path), "-"],
@@ -172,9 +173,12 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
                 # An image-only PDF has no raw text source. Do not substitute
                 # normalized parser rows and pretend they were source text.
                 raw = source.stdout if source.stdout.strip("\f\n\r\t ") else None
-                _, rows, engines = parse_pdf_worker(snapshot.path)
+                _, rows, engines = tolerant_parse_pdf_worker(snapshot.path, parse_worker=parse_pdf_worker)
                 # Preserve the exact parser row objects (including raw extras).
                 evidence["engines"] = engines
+                failure = engine_error_detail(engines)
+                if failure is not None:
+                    raise ParserCascadeError(failure)
                 evidence["page_outcomes"] = _pages(work, "local_parser_coverage_unattributed")
                 outcome = ExtractionOutcome.CANDIDATE if rows else ExtractionOutcome.NEEDS_REVIEW
                 detail = None if rows else "local empty result has no source-policy proof"
@@ -196,7 +200,11 @@ def extract_document(work: WorkEnvelope, spool_dir: str) -> str:
                 else:
                     if raw is None:
                         raise ValueError("provider returned no source response")
-                    parsed = common.parse_gemini_output(raw, expected_page_count=work.page_count)
+                    if (_metadata is None or _metadata.parsed is None
+                            or _metadata.sha256 != work.artifact_sha256
+                            or _metadata.page_count != work.page_count):
+                        raise ValueError("provider success lacks bound validated response metadata")
+                    parsed = _metadata.parsed
                     rows = parsed.transactions
                     evidence["member"] = parsed.member
                     evidence["page_outcomes"] = _model_pages(work, parsed)

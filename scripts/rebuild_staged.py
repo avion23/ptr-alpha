@@ -1142,6 +1142,7 @@ def _ingest_cached_gemini_year(
                 parsed.member,
                 validated,
                 db_path=str(staging / "congress.duckdb"),
+                conn=db.conn,
                 parser_version=parser_version,
                 raw_count=parsed.raw_row_count,
                 artifact_sha256=artifact_sha256,

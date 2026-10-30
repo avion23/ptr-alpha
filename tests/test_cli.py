@@ -46,35 +46,25 @@ class TestHouseAcquisitionDatabase(unittest.TestCase):
 
 
 class TestCliApp(unittest.TestCase):
-    def test_ocr_child_uses_validated_json_not_human_progress(self):
-        from analyzer.cli import _run_gemini_ocr_year_subprocess
+    def test_pipeline_defaults_disable_billable_lanes_and_status_starts_no_workers(self):
+        import json
 
-        for stdout, expected in (
-            ('{"schema":"ocr-year-summary-v1","inserted":7}', (7, None)),
-            ("Total inserted: 7", None),
-            ('{"schema":"ocr-year-summary-v1","inserted":true}', None),
-            ('{"schema":"wrong","inserted":7}', None),
+        summary = {"unresolved": 0, "missing_years": [], "completed_attempts": 7}
+        with patch("analyzer.ocr.coordinator.run_pipeline", return_value=summary) as run:
+            result = self.runner.invoke(app, ["pipeline", "--data-dir", "fixture-data", "--year", "2024"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.output), summary)
+        run.assert_called_once_with("fixture-data", [2024], local_workers=3,
+                                    gemini_workers=0, glm_workers=0,
+                                    refresh_recipe=False, publish_every=100)
+        with (
+            patch("analyzer.ocr.coordinator.run_pipeline") as run,
+            patch("analyzer.ocr.coordinator.pipeline_status", return_value=summary) as status,
         ):
-            with (
-                self.subTest(stdout=stdout),
-                patch(
-                    "analyzer.cli.subprocess.Popen",
-                    return_value=SimpleNamespace(
-                        returncode=0,
-                        communicate=lambda **kwargs: (stdout, ""),
-                    ),
-                ) as popen,
-            ):
-                result = _run_gemini_ocr_year_subprocess("data", 2024)
-                self.assertEqual(
-                    popen.call_args.args[0][1:3], ["-m", "analyzer.ocr.year_cli"]
-                )
-                self.assertTrue(popen.call_args.kwargs["start_new_session"])
-                if expected is None:
-                    self.assertEqual(result[0], 0)
-                    self.assertIn("invalid OCR JSON summary", result[1])
-                else:
-                    self.assertEqual(result, expected)
+            result = self.runner.invoke(app, ["pipeline", "--status", "--data-dir", "fixture-data"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        status.assert_called_once_with("fixture-data", years=None)
+        run.assert_not_called()
 
     def setUp(self):
         self.runner = CliRunner()
@@ -374,8 +364,8 @@ class TestCliApp(unittest.TestCase):
         with (
             patch("analyzer.cli.get_context", return_value=mock_ctx),
             patch(
-                "analyzer.house_refresh.run_parse_pipeline",
-                return_value=StepResult(success=True),
+                "analyzer.ocr.coordinator.run_pipeline",
+                return_value={"unresolved": 0, "missing_years": []},
             ),
             patch("analyzer.capitol_trades.CapitolTradesSource") as capitol,
         ):
@@ -438,24 +428,22 @@ class TestCliApp(unittest.TestCase):
         self.assertEqual(config.exit_slippage_pct, 0.002)
 
 
-    def test_parse_fails_when_pipeline_fails_even_if_ocr_inserts_rows(self):
+    def test_parse_fails_when_documents_remain_even_if_other_results_committed(self):
         mock_ctx = MagicMock()
         mock_ctx.settings.data.data_dir = "data"
 
         with (
             patch("analyzer.cli.get_context", return_value=mock_ctx),
             patch(
-                "analyzer.cli.run_parse_pipeline",
-                return_value=StepResult(success=False),
-            ),
-            patch(
-                "analyzer.cli._run_gemini_ocr_year_subprocess",
-                return_value=(3, None),
-            ),
+                "analyzer.ocr.coordinator.run_pipeline",
+                return_value={"unresolved": 1, "missing_years": [], "completed_attempts": 3},
+            ) as run,
         ):
             result = self.runner.invoke(app, ["parse", "--gemini-ocr"])
 
         self.assertEqual(result.exit_code, 1, result.output)
+        self.assertEqual(run.call_args.kwargs["gemini_workers"], 1)
+        self.assertIs(run.call_args.kwargs["database"], mock_ctx.transaction_source.db)
 
 
 class TestAnalyzeParamsMapping(unittest.TestCase):

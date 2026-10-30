@@ -32,6 +32,17 @@ from analyzer.ocr.common import PROMPT_SHA256
 
 pytestmark = pytest.mark.slow
 
+
+@pytest.fixture(autouse=True)
+def forbid_network(monkeypatch):
+    import socket
+
+    def refused(*args, **kwargs):
+        raise AssertionError("GLM tests must not access the network")
+
+    monkeypatch.setattr(socket.socket, "connect", refused)
+    monkeypatch.setattr(socket, "create_connection", refused)
+
 GLM_OUTPUT_ONE_ROW = (
     "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
     "Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | A\n"
@@ -1700,6 +1711,35 @@ def test_staging_records_carry_render_dpi_and_row_pages(data_dir):
     assert record["row_pages"] == [2]
     assert len(record["rows"]) == len(record["row_pages"]) == 1
     assert record["rows"][0][0] == "Microsoft Corp (MSFT)"
+
+
+def test_schema4_staging_roundtrip_preserves_every_raw_field(data_dir):
+    seed_year(data_dir, 2024, ["lossless"])
+    row = {
+        "asset": "Apple Inc. (AAPL)", "type": "Purchase", "date": "01/15/24",
+        "notif_date": None, "amount_raw": "$12,345.67", "owner": "SP",
+        "account": "Joint account", "instrument_type": "call", "strike_price": "100",
+        "expiry_date": "2025-01-17", "option_terms": {"contracts": "3", "verbatim": "100 calls"},
+        "raw_cells": {"Amount": "$12,345.67", "Owner": "SP", "Extra": "untouched"},
+    }
+    raw = "SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nROW: " + json.dumps(row)
+    record = glm_stage.build_staging_record(
+        "lossless", 2024, glm_stage.default_pdf_path(data_dir, 2024, "lossless"),
+        None, read_fn=lambda *args: raw,
+    )
+    assert record["parse_status"] == "success", record["error"]
+    assert record["output_schema_version"] == 4
+    assert record["legacy_limited"] is False
+    assert record["rows"] == [{**row, "page_number": 1}]
+    assert record["raw_output"] == raw
+    assert record["row_pages"] == [1]
+    glm_stage.publish_staging_record(data_dir, record)
+    restored = glm_stage.load_staging_record(data_dir, 2024, "lossless")
+    assert restored == record
+    assert glm_stage.staged_rows_sha256(restored["rows"]) == record["staged_rows_sha256"]
+    changed = json.loads(json.dumps(restored["rows"]))
+    changed[0]["owner"] = "JT"
+    assert glm_stage.staged_rows_sha256(changed) != record["staged_rows_sha256"]
 
 
 def test_error_records_retain_raw_output_as_evidence(data_dir):

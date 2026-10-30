@@ -1343,7 +1343,9 @@ def test_schema4_preserves_repeated_lots_exact_amount_and_raw_columns(tmp_path):
     assert parsed.raw_row_count == 2
     assert parsed.transactions == [{**row, "page_number": 1}] * 2
     work = _bound_work(tmp_path)
-    result = ResultBundle(work, ExtractionOutcome.CANDIDATE, parsed.transactions, raw)
+    result = ResultBundle(work, ExtractionOutcome.CANDIDATE, parsed.transactions, raw,
+                          evidence={"output_schema_version": 4, "page_count": 1,
+                                    "page_outcomes": [{"page_number": 1, "outcome": "transactions"}]})
     before = result.to_dict()
     normalized = normalize_candidate(work, result)
     assert normalized["status"] == "candidate"

@@ -109,8 +109,8 @@ def test_refresh_summary_is_scoped_to_requested_year(tmp_path):
         with (
             patch("analyzer.cli.get_context", return_value=ctx),
             patch(
-                "analyzer.house_refresh.run_parse_pipeline",
-                return_value=StepResult(success=True),
+                "analyzer.ocr.coordinator.run_pipeline",
+                return_value={"unresolved": 0, "missing_years": []},
             ),
         ):
             result = CliRunner().invoke(
@@ -796,7 +796,7 @@ def test_refresh_stops_before_parse_and_backup_when_house_fetch_is_incomplete(
     try:
         with (
             patch("analyzer.cli.get_context", return_value=ctx),
-            patch("analyzer.house_refresh.run_parse_pipeline") as parse_pipeline,
+            patch("analyzer.ocr.coordinator.run_pipeline") as parse_pipeline,
             patch("analyzer.capitol_trades.CapitolTradesSource") as capitol_source,
         ):
             result = CliRunner().invoke(app, ["refresh", "--year", "2026"])
@@ -843,19 +843,19 @@ def test_refresh_fails_closed_for_unresolved_house_ptr(tmp_path):
     with (
         patch("analyzer.cli.get_context", return_value=ctx),
         patch(
-            "analyzer.house_refresh.run_parse_pipeline",
-            return_value=StepResult(success=True),
+            "analyzer.ocr.coordinator.run_pipeline",
+            return_value={"unresolved": 1, "missing_years": []},
         ),
     ):
         result = CliRunner().invoke(app, ["refresh", "--year", "2024"])
 
     assert result.exit_code == 1, result.output
     assert "1 unresolved PDFs (P-123)" in result.output
-    assert "FAILED steps: unresolved_house:2024" in result.output
+    assert "FAILED steps: parse:2024, unresolved_house:2024" in result.output
     ctx.transaction_source.db.mark_house_generation_parse_complete.assert_not_called()
 
 
-def test_multi_year_refresh_reopens_after_second_fetch_failure_and_exits_incomplete(
+def test_multi_year_refresh_retains_owner_after_fetch_failure_and_exits_incomplete(
     tmp_path,
 ):
     class FakeDatabase:
@@ -910,8 +910,8 @@ def test_multi_year_refresh_reopens_after_second_fetch_failure_and_exits_incompl
             "analyzer.house_refresh._open_database", side_effect=databases[1:]
         ) as reopen,
         patch(
-            "analyzer.house_refresh.run_parse_pipeline",
-            return_value=StepResult(success=True),
+            "analyzer.ocr.coordinator.run_pipeline",
+            return_value={"unresolved": 0, "missing_years": []},
         ) as parse_pipeline,
     ):
         result = CliRunner().invoke(app, ["refresh", "--all-years", "--skip-capitol"])
@@ -922,16 +922,13 @@ def test_multi_year_refresh_reopens_after_second_fetch_failure_and_exits_incompl
         in result.output
     )
     assert f"FAILED steps: fetch:{first_year}" in result.output
-    assert [db for _year, db in attempts] == databases
-    assert reopen.call_count == 2
-    assert databases[0].close.call_count == 1
-    assert databases[1].close.call_count == 1
-    assert ctx.transaction_source.db is databases[2]
-    assert ctx.price_source.db is databases[2]
-    assert [call.args[1] for call in parse_pipeline.call_args_list] == years
-    assert all(
-        call.args[0].db is databases[2] for call in parse_pipeline.call_args_list
-    )
+    assert [db for _year, db in attempts] == [databases[0]] * 3
+    reopen.assert_not_called()
+    databases[0].close.assert_not_called()
+    assert ctx.transaction_source.db is ctx.price_source.db is databases[0]
+    parse_pipeline.assert_called_once()
+    assert parse_pipeline.call_args.args[1] == years
+    assert parse_pipeline.call_args.kwargs["database"] is databases[0]
 
 
 def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
@@ -964,8 +961,8 @@ def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
         with (
             patch("analyzer.cli.get_context", return_value=ctx),
             patch(
-                "analyzer.house_refresh.run_parse_pipeline",
-                return_value=StepResult(success=True),
+                "analyzer.ocr.coordinator.run_pipeline",
+                return_value={"unresolved": 0, "missing_years": []},
             ) as parse_pipeline,
         ):
             result = CliRunner().invoke(
@@ -979,7 +976,8 @@ def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
         call.args[0]
         for call in ctx.transaction_source.fetch_and_cache_pdfs.call_args_list
     ]
-    parsed_years = [call.args[1] for call in parse_pipeline.call_args_list]
+    parse_pipeline.assert_called_once()
+    parsed_years = parse_pipeline.call_args.args[1]
     assert fetched_years == list(range(2015, date.today().year + 1))
     assert parsed_years == fetched_years
     assert all(
@@ -988,7 +986,7 @@ def test_full_history_refresh_fetches_every_archive_before_parse(tmp_path):
     )
 
 
-def test_refresh_releases_writer_between_acquisition_and_parse(tmp_path):
+def test_refresh_keeps_single_writer_during_acquisition_and_parse(tmp_path):
     db_path = tmp_path / "congress.duckdb"
     db = Database(db_path)
     db.conn.execute("CREATE TABLE writer_probe (value INTEGER)")
@@ -1057,8 +1055,8 @@ def test_refresh_releases_writer_between_acquisition_and_parse(tmp_path):
             patch("analyzer.cli.get_context", return_value=app_ctx),
             patch("analyzer.house_refresh._open_database", side_effect=open_database),
             patch(
-                "analyzer.house_refresh.run_parse_pipeline",
-                return_value=StepResult(success=True),
+                "analyzer.ocr.coordinator.run_pipeline",
+                return_value={"unresolved": 0, "missing_years": []},
             ),
         ):
             result = CliRunner().invoke(
@@ -1068,8 +1066,8 @@ def test_refresh_releases_writer_between_acquisition_and_parse(tmp_path):
         source.close()
 
     assert result.exit_code == 0, result.output
-    assert acquisition_probe[0].returncode == 0, acquisition_probe[0].stderr
-    assert inter_phase[0].returncode == 0, inter_phase[0].stderr
+    assert acquisition_probe[0].returncode != 0
+    assert inter_phase == []  # No owner close/reopen window between phases.
 
 
 def test_backtest_pipeline_emits_real_spy_buy_hold_row(tmp_path):

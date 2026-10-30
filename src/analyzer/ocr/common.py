@@ -661,7 +661,7 @@ def apply_verified_house_corrections(doc_id, artifact_sha256, transactions):
     return corrected
 
 
-def validate_transactions(doc_id, member, transactions, filing_date, expected_member):
+def validate_transactions(doc_id, member, transactions, filing_date, expected_member, *, as_of_date=None):
     """Validate OCR rows and return ``(valid_transactions, rejection_counts)``."""
     del doc_id
     rejections = defaultdict(int)
@@ -746,7 +746,7 @@ def validate_transactions(doc_id, member, transactions, filing_date, expected_me
         # propagate it into adjacent cells. Keep the lot, not an unverifiable
         # notification claim. Clear aliases too so revalidation is idempotent.
         if notification_date is not None and (
-            notification_date > date.today()
+            notification_date > (as_of_date if as_of_date is not None else date.today())
             or (filing is not None and notification_date > filing)
         ):
             cleaned["notif_date"] = None

@@ -48,7 +48,10 @@ def normalize_rows(doc_id, member, transactions, filing_date, expected_member, a
     from analyzer.ocr.common import apply_verified_house_corrections, validate_transactions, _strict_date
 
     raw = apply_verified_house_corrections(doc_id, artifact_sha256, deepcopy(transactions))
-    rows, findings = validate_transactions(doc_id, member, raw, filing_date, expected_member)
+    filing = _strict_date(filing_date)
+    if filing is None:
+        return [], {"invalid_filing_date": len(raw) or 1}
+    rows, findings = validate_transactions(doc_id, member, raw, filing_date, expected_member, as_of_date=filing)
     for occurrence, row in enumerate(rows, 1):
         row["transaction_date"] = _strict_date(row.get("date") or row.get("transaction_date")).isoformat()
         row["date"] = row["transaction_date"]

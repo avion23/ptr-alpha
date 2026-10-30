@@ -7,6 +7,7 @@ tracked crontab source of truth, portable, executable, and ends in a
 canonical consumption/verification step."""
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,27 @@ ROOT = Path(__file__).resolve().parents[1]
 CRON_DIR = ROOT / "cron"
 CRONTAB_SOURCE = CRON_DIR / "crontab.txt"
 CONSUMPTION_MARKERS = ("--merge-into", "scripts/doctor.py")
+
+
+def _has_consumption_or_verification_step(text: str) -> bool:
+    if any(marker in text for marker in CONSUMPTION_MARKERS):
+        return True
+    for line in text.replace("\\\n", " ").splitlines():
+        try:
+            argv = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if argv[:4] != [".venv/bin/python", "-m", "analyzer.cli", "setups"]:
+            continue
+        if any(arg.startswith("--no-receipt") for arg in argv):
+            continue
+        try:
+            as_of = argv[argv.index("--as-of") + 1]
+        except (ValueError, IndexError):
+            continue
+        if as_of and not as_of.startswith(("-", ">")):
+            return True
+    return False
 
 
 def _job_lines() -> list[tuple[str, str]]:
@@ -240,10 +262,33 @@ class WrapperContractTest(TestCase):
             text = wrapper.read_text()
             with self.subTest(target=target):
                 self.assertTrue(
-                    any(marker in text for marker in CONSUMPTION_MARKERS),
+                    _has_consumption_or_verification_step(text),
                     f"{target} writes without a canonical consumption/"
-                    "verification step; wire --merge-into or doctor",
+                    "verification step; wire --merge-into, doctor, or receipt-enabled setups",
                 )
+
+    def test_native_product_consumption_requires_an_executed_receipt_enabled_command(self):
+        command = '.venv/bin/python -m analyzer.cli setups --as-of "$(date -u +%F)"'
+        cases = [
+            (command + ' >> "$run_dir/setups.log" 2>&1', True),
+            (command + " --receipt", True),
+            (command.replace(" --as-of", " \\\n  --as-of"), True),
+            ("# " + command, False),
+            ("echo '" + command + "'", False),
+            (command + " --no-receipt", False),
+            (command + " --no-receipt; exit 0", False),
+            (".venv/bin/python -m analyzer.cli setups", False),
+            (".venv/bin/python -m analyzer.cli setups --as-of", False),
+            (".venv/bin/python -m analyzer.cli setups --as-of >> output.log", False),
+            (command.replace(" setups ", " pipeline "), False),
+            ("python3 scripts/refresh_prices.py --db temp.duckdb", False),
+            ("python3 scripts/refresh_prices.py --db temp.duckdb\n# " + command, False),
+            ("python3 scripts/refresh_prices.py --merge-into canonical.duckdb", True),
+            ("python3 scripts/doctor.py", True),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(expected, _has_consumption_or_verification_step(text))
 
     def test_wrappers_stamp_the_checked_out_git_sha(self):
         for _, target in _job_lines():

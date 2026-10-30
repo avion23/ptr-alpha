@@ -13,6 +13,17 @@ from analyzer.ocr import runner
 from analyzer.persistence.database import Database
 
 
+@pytest.fixture(autouse=True)
+def forbid_network(monkeypatch):
+    import socket
+
+    def refused(*args, **kwargs):
+        raise AssertionError("OCR tests must not access the network")
+
+    monkeypatch.setattr(socket.socket, "connect", refused)
+    monkeypatch.setattr(socket, "create_connection", refused)
+
+
 @pytest.fixture
 def stored(tmp_path, monkeypatch):
     path = tmp_path / 'congress.duckdb'

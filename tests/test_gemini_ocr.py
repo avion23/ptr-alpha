@@ -1323,6 +1323,71 @@ def test_failed_receipt_finish_remains_replayable(tmp_path):
         assert db.work.status()["by_state"] == {"running": 1}
 
 
+def test_schema4_preserves_repeated_lots_exact_amount_and_raw_columns(tmp_path):
+    from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
+    from analyzer.ocr.normalization import normalize_candidate
+
+    row = {
+        "asset": "Apple Inc. (AAPL)", "type": "Purchase", "date": "01/15/25",
+        "notif_date": None, "amount_raw": "$12,345.67", "owner": "SP",
+        "account": "Joint account", "instrument_type": "unknown",
+        "raw_cells": {"Amount": "$12,345.67", "Owner": "SP", "Unmapped": "verbatim"},
+        "extra_source_field": {"terms": ["keep", "all"]},
+    }
+    raw = "SCHEMA: 4\nMEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n" + "\n".join(
+        "ROW: " + json.dumps(row) for _ in range(2)
+    )
+    parsed = gemini_ocr_common.parse_gemini_output(raw, expected_page_count=1)
+    assert parsed.output_schema_version == 4
+    assert not parsed.legacy_limited
+    assert parsed.raw_row_count == 2
+    assert parsed.transactions == [{**row, "page_number": 1}] * 2
+    work = _bound_work(tmp_path)
+    result = ResultBundle(work, ExtractionOutcome.CANDIDATE, parsed.transactions, raw)
+    before = result.to_dict()
+    normalized = normalize_candidate(work, result)
+    assert normalized["status"] == "candidate"
+    assert not normalized["legacy_limited"]
+    assert [item["occurrence"] for item in normalized["rows"]] == [1, 2]
+    assert [item["owner_code"] for item in normalized["rows"]] == ["SP", "SP"]
+    assert [item["amount_exact"] for item in normalized["rows"]] == ["12345.67"] * 2
+    assert normalized["raw_rows"] == parsed.transactions
+    assert result.to_dict() == before
+    legacy = gemini_ocr_common.parse_gemini_output(
+        "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\nApple (AAPL) | Purchase | 01/15/25 | N/A | A"
+    )
+    assert legacy.output_schema_version == 3
+    assert legacy.legacy_limited
+
+
+def test_durable_delivery_blocks_redispatch_and_finish_replay_is_idempotent(tmp_path):
+    from analyzer.ocr.contracts import ExtractionOutcome, ResultBundle
+
+    path = tmp_path / "replay.duckdb"
+    with Database(path) as db:
+        work = _bound_work(tmp_path)
+        db.work.register(work)
+        claimed = db.work.claim(work.task_id)
+        result = ResultBundle(claimed, ExtractionOutcome.CANDIDATE, [_tx()])
+        result_id = db.work.register_result(result, "durable-result.json")
+        assert db.work.register_result(result, "durable-result.json") == result_id
+        db.conn.execute("UPDATE extraction_work SET lease_until = CURRENT_TIMESTAMP - INTERVAL '1 SECOND'")
+        assert db.work.recover_expired() == 0
+        receipt = db.work.pending_results()[0]
+    with Database(path) as recovered:
+        assert recovered.work.pending_results() == [receipt]
+        assert recovered.work.pending(claimed.lane) == []
+        assert recovered.work.validate_receipt(receipt) == claimed
+        recovered.work.finish(receipt, "needs_review", "validation refused")
+        recovered.work.finish(receipt, "accepted", "must not overwrite first disposition")
+        assert recovered.work.is_finished(receipt)
+        assert recovered.work.pending_results() == []
+        assert recovered.work.status() == {
+            "total": 1, "by_state": {"needs_review": 1}, "results": 1,
+        }
+        assert recovered.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+
+
 def test_semantic_zero_error_preserves_prior_ocr_rows(tmp_path):
     db_path = tmp_path / "error-preserves.duckdb"
     db = Database(db_path)

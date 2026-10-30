@@ -150,18 +150,19 @@ def test_pdfplumber_layout_enrichment_preserves_repeated_physical_rows(monkeypat
 
 
 def test_pdfplumber_keeps_conflicting_or_ambiguous_layout_observations(monkeypatch):
+    from analyzer.parsing import pdfplumber_parser
+
     asset = "JP Morgan callable note [CS]"
     owner_text = (
         f"  {asset} P 12/30/2025 12/30/2025 $5,000,001 - $25,000,000\n"
         "  D: Structured Note\n"
     )
     extended = [
-        "JP Morgan callable note Series A [CS]",
-        "JP Morgan callable note Series B [CS]",
+        f"{asset} Description: Series A",
+        f"{asset} Description: Series B",
     ]
     ambiguous_text = "".join(
         f"  {name} P 12/30/2025 12/30/2025 $5,000,001 - $25,000,000\n"
-        "  D: Structured Note\n"
         for name in extended
     )
     header = HEADER + ["Notification Date"]
@@ -173,11 +174,25 @@ def test_pdfplumber_keeps_conflicting_or_ambiguous_layout_observations(monkeypat
         header,
         [asset, "", "P", "12/30/2025", "$5,000,001 - $25,000,000", "12/30/2025"],
     ]
+    extension_checks = []
+    is_metadata_extension = pdfplumber_parser._has_recognized_metadata_extension
+
+    def record_metadata_extension(shorter, longer):
+        matched = is_metadata_extension(shorter, longer)
+        extension_checks.append(matched)
+        return matched
+
+    monkeypatch.setattr(
+        pdfplumber_parser,
+        "_has_recognized_metadata_extension",
+        record_metadata_extension,
+    )
 
     for table, source_text, expected_rows in (
         (conflicting_owner_table, owner_text, 2),
         (ambiguous_table, ambiguous_text, 3),
     ):
+        extension_checks.clear()
         monkeypatch.setattr(
             "pdfplumber.open",
             lambda _, table=table, source_text=source_text: nullcontext(
@@ -190,6 +205,74 @@ def test_pdfplumber_keeps_conflicting_or_ambiguous_layout_observations(monkeypat
             for tx in parse_pdf_table(extracted)
         ]
         assert len(transactions) == expected_rows
+        if expected_rows == 3:
+            assert extension_checks == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("table_asset", "layout_asset"),
+    [
+        ("Private Fund I", "Private Fund II"),
+        ("Asset A", "Asset AB"),
+        ("Asset A", "Asset A Series B"),
+    ],
+)
+def test_arbitrary_asset_prefixes_remain_unresolved_in_cascade(
+    monkeypatch, table_asset, layout_asset
+):
+    header = HEADER + ["Notification Date"]
+    amount = "$5,000,001 - $25,000,000"
+    table = [
+        header,
+        [table_asset, "", "P", "12/30/2025", amount, "12/30/2025"],
+    ]
+    text = f"  {layout_asset} P 12/30/2025 12/30/2025 {amount}\n"
+    monkeypatch.setattr(
+        "pdfplumber.open",
+        lambda _: nullcontext(SimpleNamespace(pages=[page(text, [table])])),
+    )
+    pdftotext_row = parse_pdf_table(
+        [
+            header + ["Source Row ID"],
+            [layout_asset, "", "P", "12/30/2025", amount, "12/30/2025", "pdftotext:l0"],
+        ]
+    )[0]
+    monkeypatch.setattr(cascade, "_try_camelot_lattice", lambda _: [])
+    monkeypatch.setattr(cascade, "_try_camelot_stream", lambda _: [])
+    monkeypatch.setattr(cascade, "_try_pdftotext", lambda _: [pdftotext_row])
+    monkeypatch.setattr(cascade, "_has_document_text_coverage", lambda _: True)
+    monkeypatch.setattr(cascade, "_try_tesseract", lambda _: [pdftotext_row])
+    monkeypatch.setenv("PTR_SKIP_DOCLING", "1")
+
+    with pytest.raises(cascade.ParserCascadeError):
+        cascade.parse_pdf_worker(Path("conflicting-assets.pdf"))
+
+
+def test_pdfplumber_does_not_merge_metadata_observations_across_pages(monkeypatch):
+    header = HEADER + ["Notification Date"]
+    amount = "$5,000,001 - $25,000,000"
+    asset = "Private Fund [CS]"
+    table = [
+        header,
+        [asset, "", "P", "12/30/2025", amount, "12/30/2025"],
+    ]
+    layout_text = (
+        f"  {asset} Description: Structured Note P 12/30/2025 "
+        f"12/30/2025 {amount}\n"
+    )
+    monkeypatch.setattr(
+        "pdfplumber.open",
+        lambda _: nullcontext(SimpleNamespace(pages=[page("", [table]), page(layout_text)])),
+    )
+
+    transactions = [
+        tx
+        for extracted in extract_tables_with_pdfplumber(Path("filing.pdf"))
+        for tx in parse_pdf_table(extracted)
+    ]
+
+    assert len(transactions) == 2
+    assert {tx["source_row_id"].split(":")[1] for tx in transactions} == {"p1", "p2"}
 
 
 def test_pdfplumber_layout_notification_and_safe_context(monkeypatch):

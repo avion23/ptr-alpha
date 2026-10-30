@@ -106,8 +106,8 @@ def _layout_observations_cover_table(
     """Recognize layout rows that only enrich truncated table descriptions.
 
     This is a one-to-one reconciliation: non-asset identity fields and page
-    must agree, and a table description must be a strict prefix of the layout
-    description. Unmatched or ambiguous observations remain separate evidence.
+    must agree, and the layout may only append a recognized Description or
+    Account field to the unchanged table asset. Other observations stay separate.
     """
     remaining_layout = list(layout_transactions)
     unmatched_tables = []
@@ -138,7 +138,7 @@ def _layout_observations_cover_table(
             if _same_pdfplumber_page(table_source, layout_row)
             and transaction_identity(table_row)[1:]
             == transaction_identity(layout_row)[1:]
-            and _is_strict_asset_extension(
+            and _has_recognized_metadata_extension(
                 table_asset, layout_row.get("asset_description")
             )
         ]
@@ -170,9 +170,14 @@ def _same_pdfplumber_page(source_parts: list[str], transaction: dict) -> bool:
     )
 
 
-def _is_strict_asset_extension(shorter: str, longer: str | None) -> bool:
+def _has_recognized_metadata_extension(shorter: str, longer: str | None) -> bool:
     longer = " ".join(str(longer or "").casefold().split())
-    return bool(shorter and len(shorter) < len(longer) and longer.startswith(shorter))
+    if not shorter or not longer.startswith(shorter):
+        return False
+    suffix = longer[len(shorter) :]
+    return suffix.startswith(" ") and suffix.lstrip().startswith(
+        ("description:", "[account:")
+    )
 
 
 def _clean_table(tbl: list[list[str | None]]) -> list[list[str]] | None:

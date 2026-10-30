@@ -15,12 +15,44 @@ from pathlib import Path
 import time
 from uuid import uuid4
 
+from analyzer.exceptions import DataSourceError
 from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, WorkEnvelope, task_key
 from analyzer.persistence.database import Database
 
 
 def _scope(db: Database, years: list[int] | None) -> list[dict]:
     """Official latest-generation PTR scope, including missing acquisitions."""
+    if years == []:
+        raise DataSourceError("House archive scope unknown: no archive years requested")
+    headers = db.conn.execute("""
+        WITH latest AS (
+            SELECT archive_year, generation_id, ptr_count, metadata_count
+            FROM house_archive_generations
+            QUALIFY row_number() OVER (
+                PARTITION BY archive_year ORDER BY promoted_at DESC, generation_id DESC
+            ) = 1
+        )
+        SELECT g.archive_year, g.generation_id, g.ptr_count, g.metadata_count,
+               COUNT(m.doc_id) FILTER (WHERE m.filing_type = 'P'), COUNT(m.doc_id)
+        FROM latest g LEFT JOIN house_generation_metadata m
+          ON m.archive_year = g.archive_year AND m.generation_id = g.generation_id
+        GROUP BY ALL ORDER BY g.archive_year
+    """).fetchall()
+    known_years = {row[0] for row in headers}
+    missing = sorted(set(years or []) - known_years)
+    if missing or not headers:
+        raise DataSourceError(f"House archive scope unknown: no official generation header for {missing or 'any year'}")
+    for year, generation, expected_ptr, expected_metadata, actual_ptr, actual_metadata in headers:
+        if years is not None and year not in years:
+            continue
+        if (expected_ptr is None or expected_metadata is None
+                or expected_ptr < 0 or expected_metadata < 0
+                or expected_ptr != actual_ptr or expected_metadata != actual_metadata):
+            raise DataSourceError(
+                f"House archive {year} generation {generation} scope counts mismatched or unknown: "
+                f"expected PTR={expected_ptr}, metadata={expected_metadata}; "
+                f"actual PTR={actual_ptr}, metadata={actual_metadata}"
+            )
     rows = db.conn.execute("""
         WITH latest AS (
             SELECT archive_year, generation_id FROM house_archive_generations
@@ -261,19 +293,14 @@ def run_pipeline(
         source = HouseTransactionSource(settings, db=db)
         with ExitStack() as stack:
             stack.callback(source.close)
+            # Unproven metadata scope must not replace an earlier publication
+            # or start extraction work, including when the row query is empty.
+            scope = _scope(db, years)
             # Ownership may follow price, metadata, or other maintenance writes.
             # A document-only signature cannot establish whole-database freshness.
             publication = db.publish_snapshot()
-            scope = _scope(db, years)
             scoped = {(s["archive_year"], s["generation_id"], s["doc_id"]): s for s in scope}
-            known_years = {int(r[0]) for r in db.conn.execute(
-                "SELECT DISTINCT archive_year FROM house_archive_generations").fetchall()}
-            if years is None and not known_years:
-                raise ValueError("no official House generation scope; acquire archives first or specify required years")
-            missing_years = sorted(set(years or []) - known_years)
-            for year in missing_years:
-                db.work.register_blocked(f"missing-generation:{year}", "no official PTR generation scope",
-                                         scope={"archive_year": year})
+            missing_years = []
 
             eligible = set()
             satisfied = set()

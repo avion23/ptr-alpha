@@ -1728,16 +1728,41 @@ def _finish_receipt(conn, receipt, state, detail=None):
         from analyzer.persistence.work_repository import WorkRepository
         repository = WorkRepository(conn)
         if "admission_decision" in receipt:
+            from dataclasses import replace
+            from analyzer.ocr.contracts import ExtractionOutcome
+            from analyzer.ocr.workers import _publish
+
             decision = receipt["admission_decision"]
+            detail = detail if isinstance(detail, dict) else {"reason": detail}
+            bundle = replace(
+                decision["result"],
+                outcome=ExtractionOutcome({"accepted": "candidate", "verified_empty": "verified_empty",
+                                           "needs_review": "needs_review", "blocked": "blocked"}[state]),
+                evidence={**decision["result"].evidence, "admission_decision": {
+                    "predecessor_result_id": decision["predecessor"]["result_id"],
+                    "raw_result_id": receipt["result_id"], "state": state,
+                    "detail_sha256": hashlib.sha256(json.dumps(detail, sort_keys=True).encode()).hexdigest(),
+                }},
+            )
+            path = _publish(bundle, decision["spool"])
             repository.append_admission_decision(
-                {key: receipt[key] for key in ("task_id", "attempt_id", "result_id")},
-                decision["result"], decision["path"], state,
-                detail if isinstance(detail, dict) else {"reason": detail},
+                decision["predecessor"], bundle, path, state, detail,
                 in_transaction=True,
             )
             return
         repository.finish(receipt, state, detail=json.dumps(detail, sort_keys=True)
                           if isinstance(detail, dict) else detail, in_transaction=True)
+
+
+def _refuse_rolled_back_admission(conn, receipt, reason):
+    """Record refusal only; a failed replacement must not retire baseline rows."""
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        _finish_receipt(conn, receipt, "needs_review", {"reason": reason})
+        conn.execute("COMMIT")
+    except Exception:
+        cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
+        raise
 
 
 def _receipt_replay(conn, receipt, doc_id, year, artifact_sha256, ingestion_generation, parser_version):
@@ -1841,7 +1866,8 @@ def _insert_transactions(
     replay = _receipt_replay(conn, receipt, doc_id, year, artifact_sha256, ingestion_generation, parser_version)
     if replay is not None:
         return replay
-    if admission is None or not admission.get("allowed") or not admission.get("review_binding"):
+    from analyzer.ocr.review import has_review_authority
+    if not has_review_authority(admission):
         return InsertOutcome(status="needs_review", detail="grounded API source review required")
     from analyzer.ocr.normalization import NORMALIZATION_RECIPE
     from analyzer.ocr.review import digest
@@ -1856,6 +1882,9 @@ def _insert_transactions(
             "OCR insertion requires artifact_sha256 and ingestion_generation"
         )
     input_expected = raw_count if raw_count is not None else len(transactions)
+    if (force_partial_canonical or input_expected != len(transactions)
+            or input_expected != len(admission["projection"])):
+        raise ValueError("review authorizes only the complete unchanged rowset; partial forcing is forbidden")
     bound_generation = _resolve_ingestion_generation(conn, doc_id, year, artifact_sha256)
     if bound_generation != ingestion_generation:
         raise RuntimeError("OCR insertion generation does not match the current artifact")
@@ -1933,164 +1962,18 @@ def _insert_transactions(
             detail = _verified_final_admission(conn, doc_id, admission)
             _finish_receipt(conn, receipt, "verified_empty", detail)
             conn.execute("COMMIT")
-        except Exception:
+        except Exception as exc:
             cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
+            _refuse_rolled_back_admission(conn, receipt, str(exc))
             raise
         return InsertOutcome(
             status="no_txs", inserted=0, expected=0, committed=True
         )
 
-    input_count = raw_count if raw_count is not None else len(transactions)
-    # The guarded candidate already passed the shared normalizer. Do not normalize
-    # it a second time and silently change the reviewed projection.
-    validated, rejections = transactions, {}
-    # Identity failures are whole-doc fatal (wrong human). Row-level
-    # rejections (impossible dates on individual rows, usually filer typos)
-    # keep the valid rows: one bad row must not hold the filing hostage.
-    identity_fatal = {
-        key: count
-        for key, count in rejections.items()
-        if key in ("member_mismatch", "invalid_member")
-    }
-    row_rejections = {
-        key: count for key, count in rejections.items() if key not in identity_fatal
-    }
-    if input_count != len(transactions):
-        row_rejections["raw_row_count_mismatch"] = abs(input_count - len(transactions))
-    if identity_fatal or not validated:
-        record_failed_ocr_attempt(
-            conn,
-            doc_id,
-            year,
-            input_count,
-            json.dumps(rejections, sort_keys=True),
-            parser_version=parser_version,
-            artifact_sha256=artifact_sha256,
-            ingestion_generation=ingestion_generation,
-            engine_model=engine_model,
-            receipt=receipt,
-        )
-        return InsertOutcome(
-            status="rejected", inserted=0, expected=input_count,
-            rejections=dict(rejections),
-        )
-    partial_transactions = list(transactions)
-    transactions = validated
-    partial_note = (
-        f"; row-level rejections kept out: {json.dumps(row_rejections, sort_keys=True)}"
-        if row_rejections
-        else ""
-    )
-    if row_rejections and not force_partial_canonical:
-        detail = (
-            "canonical commit blocked: partial OCR extraction; "
-            f"{len(validated)}/{input_count} validated rows retained in "
-            f"ocr_partial_results; rejections={json.dumps(row_rejections, sort_keys=True)}"
-        )
-        conn.execute("BEGIN TRANSACTION")
-        try:
-            _retain_partial_ocr_result(
-                conn,
-                doc_id,
-                year,
-                partial_transactions,
-                row_rejections,
-                parser_version=parser_version,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-            )
-            record_parse_run(
-                conn,
-                doc_id,
-                year,
-                "partial",
-                input_count,
-                0,
-                detail,
-                parser_version=parser_version,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-                engines_attempted=engine_model,
-            )
-            _finish_receipt(conn, receipt, "needs_review", detail)
-            conn.execute("COMMIT")
-        except Exception:
-            cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
-            raise
-        if checkpoint:
-            conn.execute("CHECKPOINT")
-        return InsertOutcome(
-            status="partial", inserted=0, expected=input_count,
-            rejections=dict(row_rejections), detail=detail,
-        )
-    if row_rejections:
-        print(
-            "WARNING: --force-partial-canonical: committing a partial OCR "
-            "rowset to canonical despite row-level rejections; attempt will "
-            "remain marked incomplete.",
-            flush=True,
-        )
-
-    rows, errors = admission["projection"], []
-    if errors:
-        message = "; ".join(errors)
-        record_failed_ocr_attempt(
-            conn,
-            doc_id,
-            year,
-            input_count,
-            message,
-            parser_version=parser_version,
-            artifact_sha256=artifact_sha256,
-            ingestion_generation=ingestion_generation,
-            engine_model=engine_model,
-            receipt=receipt,
-        )
-        return InsertOutcome(
-            status="error", inserted=0, expected=input_count, detail=message,
-        )
-    if not rows:
-        # If transactions were provided but all failed validation, record as
-        # "error" so get_zero_row_pdfs() will retry them; only use "no_txs"
-        # when the caller passed an empty list (nothing to retry).
-        input_count = raw_count if raw_count is not None else len(transactions)
-        if input_count:
-            record_failed_ocr_attempt(
-                conn,
-                doc_id,
-                year,
-                input_count,
-                "; ".join(errors),
-                parser_version=parser_version,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-                engine_model=engine_model,
-            )
-        else:
-            record_parse_run(
-                conn,
-                doc_id,
-                year,
-                "no_txs",
-                0,
-                0,
-                "",
-                parser_version=parser_version,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-                engines_attempted=engine_model,
-            )
-        if checkpoint:
-            conn.execute("CHECKPOINT")
-        return InsertOutcome(
-            status="no_txs" if not input_count else "error",
-            inserted=0, expected=input_count, committed=not input_count,
-        )
-
+    # Persist the exact projection already normalized under the review lock.
     return _replace_accepted_ocr_rows(
-        conn, doc_id, year, rows, input_count,
-        row_rejections=row_rejections, partial_transactions=partial_transactions,
-        partial_note=partial_note, parser_version=parser_version,
+        conn, doc_id, year, admission["projection"], input_expected,
+        parser_version=parser_version,
         artifact_sha256=artifact_sha256, ingestion_generation=ingestion_generation,
         engine_model=engine_model, checkpoint=checkpoint,
         receipt=receipt,
@@ -2247,8 +2130,8 @@ def _verified_final_admission(conn, doc_id, admission):
 
 
 def _replace_accepted_ocr_rows(
-    conn, doc_id, year, rows, input_count, *, row_rejections, partial_transactions,
-    partial_note, parser_version, artifact_sha256, ingestion_generation,
+    conn, doc_id, year, rows, input_count, *,
+    parser_version, artifact_sha256, ingestion_generation,
     engine_model, checkpoint, receipt=None, admission=None,
 ) -> InsertOutcome:
     """Own accepted-rowset replacement and historical repair in one transaction."""
@@ -2271,17 +2154,6 @@ def _replace_accepted_ocr_rows(
             )
         columns = OCR_INSERT_COLUMNS
         conn.execute("BEGIN TRANSACTION")
-        if row_rejections:
-            _retain_partial_ocr_result(
-                conn,
-                doc_id,
-                year,
-                partial_transactions,
-                row_rejections,
-                parser_version=parser_version,
-                artifact_sha256=artifact_sha256,
-                ingestion_generation=ingestion_generation,
-            )
         invalid_house_rows = int(
             conn.execute(
                 """
@@ -2411,12 +2283,7 @@ def _replace_accepted_ocr_rows(
             "success",
             input_count,
             count,
-            (
-                "FORCED PARTIAL CANONICAL COMMIT; "
-                f"partial insert{partial_note}"
-                if row_rejections
-                else ""
-            ),
+            "",
             parser_version=parser_version,
             artifact_sha256=artifact_sha256,
             ingestion_generation=ingestion_generation,
@@ -2429,27 +2296,15 @@ def _replace_accepted_ocr_rows(
         if checkpoint:
             conn.execute("CHECKPOINT")
         return InsertOutcome(
-            status="partial" if row_rejections else "success",
+            status="success",
             inserted=count,
             expected=input_count,
             committed=True,
-            rejections=dict(row_rejections) if row_rejections else None,
-            detail=partial_note.lstrip("; ") or None,
         )
     except Exception as exc:
         if not committed:
             cleanup_ocr_resource(lambda: conn.execute("ROLLBACK"))
-            try:
-                record_failed_ocr_attempt(
-                    conn, doc_id, year, input_count, str(exc),
-                    parser_version=parser_version,
-                    artifact_sha256=artifact_sha256,
-                    ingestion_generation=ingestion_generation,
-                    engine_model=engine_model,
-                    receipt=receipt,
-                )
-            except Exception:
-                logging.getLogger(__name__).exception("Failed to record OCR insertion failure")
+            _refuse_rolled_back_admission(conn, receipt, str(exc))
         raise
     finally:
         cleanup_ocr_resource(lambda: conn.execute(f"DROP TABLE IF EXISTS {staging_table}"))
@@ -2468,7 +2323,8 @@ def insert_transactions_outcome(
     The explicit force override retains an incomplete outcome and warning.
     Every branch shares this connection lifetime, including schema failures.
     """
-    if admission is None or not admission.get("allowed") or not admission.get("review_binding"):
+    from analyzer.ocr.review import has_review_authority
+    if not has_review_authority(admission):
         return InsertOutcome(status="needs_review", detail="grounded API source review required")
     with ExitStack() as resources:
         if conn is None:

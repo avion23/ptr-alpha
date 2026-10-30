@@ -307,7 +307,7 @@ def admission_guard(result: ResultBundle, data_dir):
         return
     from scripts import glm_stage
     from contextlib import nullcontext
-    from analyzer.ocr.review import review_decision_locked
+    from analyzer.ocr.review import ReviewAuthorization, review_decision_locked
     from analyzer.ocr.ingestion import approved_data_root
 
     with (
@@ -322,7 +322,11 @@ def admission_guard(result: ResultBundle, data_dir):
                 decision = {**decision, **review_decision_locked(result, root)}
             except ValueError as exc:
                 decision = {**decision, "allowed": False, "reason": str(exc)}
-        yield decision
+        authorization = ReviewAuthorization(decision)
+        try:
+            yield authorization
+        finally:
+            authorization.active = False
 
 
 def _admission_decision_locked(result: ResultBundle, data_dir) -> dict:

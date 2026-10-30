@@ -25,6 +25,19 @@ POLICY = {
 }
 
 
+class ReviewAuthorization(dict):
+    """Borrowed authority: valid only while admission_guard holds the root lock."""
+
+    def __init__(self, decision):
+        super().__init__(decision)
+        self.active = True
+
+
+def has_review_authority(admission):
+    return (isinstance(admission, ReviewAuthorization) and admission.active
+            and admission.get("allowed") is True and bool(admission.get("review_binding")))
+
+
 def encode(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
                       allow_nan=False).encode()
@@ -69,6 +82,21 @@ def bundle_record(result, material):
     }
 
 
+def review_report_template(result, material=None):
+    """Unapproved checklist for the operator; blanks/unknowns cannot pass."""
+    material = review_material(result) if material is None else material
+    return {
+        "binding": material["binding"], "policy_sha256": digest(POLICY), "evidence": "",
+        "pages": [{"page_number": number, "outcome": "unknown", "evidence": ""}
+                  for number in range(1, result.work.page_count + 1)],
+        "rows": [{"source_row_id": row["source_row_id"],
+                  "page_number": candidate.get("page_number"),
+                  "critical_fields": POLICY["critical_fields"], "evidence": ""}
+                 for row, candidate in zip(material["projection"], material["candidate"]["rows"])],
+        "omissions_checked": False,
+    }
+
+
 def bundle_directory(data_dir, material):
     binding = material["binding"]
     return (Path(data_dir) / "pipeline" / "reviews" / binding["raw_result_id"]
@@ -100,6 +128,11 @@ def prepare_review(result, data_dir):
         content = read_work_artifact(root, result.work.artifact_path)
         emit_bound_review_bundle(root, directory, encode(record), content)
         _validate_bundle(root, directory, record)
+        try:
+            with (directory / "report-template.json").open("x") as template:
+                json.dump(review_report_template(result, material), template, indent=2, sort_keys=True)
+        except FileExistsError:
+            pass  # Never overwrite an operator's draft on repeated preparation.
         return str(Path(data_dir) / directory.relative_to(Path(root)))
 
 
@@ -116,7 +149,8 @@ def _validate_report(report, result, material, verdict):
     if not isinstance(pages, list) or len(pages) != result.work.page_count:
         raise ValueError("review must cover every source page")
     for number, page in enumerate(pages, 1):
-        if (not isinstance(page, dict) or page.get("page_number") != number
+        if (not isinstance(page, dict) or type(page.get("page_number")) is not int
+                or page["page_number"] != number
                 or page.get("outcome") not in {"transactions", "verified_nontransaction"}
                 or not isinstance(page.get("evidence"), str) or not page["evidence"].strip()):
             raise ValueError("each page needs affirmative source-grounded coverage")
@@ -124,14 +158,19 @@ def _validate_report(report, result, material, verdict):
     projection = material["projection"]
     if not isinstance(rows, list) or len(rows) != len(projection):
         raise ValueError("review must cover all final row occurrences")
-    for row, expected in zip(rows, projection):
+    for row, expected, candidate in zip(rows, projection, material["candidate"]["rows"]):
         if (not isinstance(row, dict) or row.get("source_row_id") != expected["source_row_id"]
                 or row.get("critical_fields") != POLICY["critical_fields"]
                 or type(row.get("page_number")) is not int
                 or not 1 <= row["page_number"] <= result.work.page_count
+                or (candidate.get("page_number") is not None
+                    and row["page_number"] != candidate["page_number"])
                 or pages[row["page_number"] - 1]["outcome"] != "transactions"
                 or not isinstance(row.get("evidence"), str) or not row["evidence"].strip()):
             raise ValueError("every row needs page-grounded critical-field verification")
+    if {page["page_number"] for page in pages if page["outcome"] == "transactions"} != {
+            row["page_number"] for row in rows}:
+        raise ValueError("every transaction page must have reviewed rows; omissions require re-extraction")
     if report.get("omissions_checked") is not True:
         raise ValueError("affirmative all-pages omission check required")
     if not projection and any(p["outcome"] != "verified_nontransaction" for p in pages):

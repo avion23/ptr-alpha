@@ -168,21 +168,27 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
 
     work = result.work
     receipt = dict(task_id=work.task_id, attempt_id=work.attempt_id,
-                   result_id=db.work.register_result(result, str(path)))
-    if db.work.is_finished(receipt):
-        row = db.conn.execute("SELECT state FROM extraction_results WHERE result_id = ?",
-                              [receipt["result_id"]]).fetchone()
-        return row[0]  # Finished receipts are immutable; readmission appends a decision.
+                   result_id=db.work.register_result(result, str(path)), path=str(path))
+    finished = db.work.is_finished(receipt)
+    predecessor = db.work.effective_admission_decision(receipt) if finished else None
+    if finished:
+        current = db.conn.execute("SELECT attempt_id, result_id, status FROM extraction_work WHERE task_id = ?",
+                                  [work.task_id]).fetchone()
+        if (predecessor["state"] != "needs_review" or work.lane == ExtractionLane.LOCAL
+                or result.outcome not in {ExtractionOutcome.CANDIDATE, ExtractionOutcome.VERIFIED_EMPTY}
+                or current != (work.attempt_id, predecessor["result_id"], "needs_review")):
+            return predecessor["state"]
     db.work.validate_receipt(receipt)
     if not _current_binding(db, work):
-        db.work.finish(receipt, "blocked", "source generation/artifact is no longer current")
-        return "blocked"
+        if not finished:
+            db.work.finish(receipt, "blocked", "source generation/artifact is no longer current")
+        return "needs_review" if finished else "blocked"
     if result.outcome == ExtractionOutcome.RETRY_WAIT:
         delay = result.retry_after if result.retry_after is not None else 60
         db.work.finish(receipt, "retry_wait", result.detail,
                        retry_at=datetime.now() + timedelta(seconds=delay))
         return "retry_wait"
-    if work.lane == ExtractionLane.GLM and result.evidence.get("staging_record"):
+    if not finished and work.lane == ExtractionLane.GLM and result.evidence.get("staging_record"):
         from scripts import glm_stage
         record = result.evidence["staging_record"]
         existing = glm_stage.load_staging_record(data_dir, work.archive_year, work.doc_id)
@@ -207,8 +213,14 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
                          and not local_uncertain) or gate["reason"] in {
                 "extraction recipe changed", "artifact verification evidence missing"}
             disposition = "blocked" if permanent else "needs_review"
-            db.work.finish(receipt, disposition, result.detail or gate["reason"] or str(candidate["findings"] if candidate else []))
-            return disposition
+            if not finished:
+                db.work.finish(receipt, disposition, result.detail or gate["reason"] or str(candidate["findings"] if candidate else []))
+            return "needs_review" if finished else disposition
+        if finished:
+            receipt["admission_decision"] = {
+                "predecessor": predecessor, "result": result,
+                "spool": str(data_dir / "pipeline" / "admission-decisions"),
+            }
         if local_candidate:
             source._save_parse_results(
                 work.archive_year,
@@ -230,11 +242,9 @@ def _ingest(db: Database, result, path: Path, data_dir: Path, source) -> str:
                 artifact_sha256=work.artifact_sha256, ingestion_generation=work.generation_id,
                 engine_model=model, checkpoint=False,
             )
-        row = db.conn.execute("SELECT state FROM extraction_results WHERE result_id = ?",
-                              [receipt["result_id"]]).fetchone()
         if not db.work.is_finished(receipt):
             raise RuntimeError("canonical persistence did not atomically finish its result receipt")
-        return row[0]
+        return db.work.effective_admission_decision(receipt)["state"]
 
 
 def run_pipeline(
@@ -310,8 +320,10 @@ def run_pipeline(
                 if key not in scoped:
                     return
                 result_id = db.work.register_result(result, str(path))
-                prior = db.conn.execute("SELECT state FROM extraction_results WHERE result_id = ?",
-                                        [result_id]).fetchone()[0]
+                raw_receipt = dict(task_id=result.work.task_id, attempt_id=result.work.attempt_id,
+                                   result_id=result_id, path=str(path))
+                prior = (db.work.effective_admission_decision(raw_receipt)["state"]
+                         if db.work.is_finished(raw_receipt) else "extracted")
                 state = _ingest(db, result, Path(path), base, source)
                 generation = (result.work.archive_year, result.work.generation_id)
                 if state in {"accepted", "verified_empty"} and (
@@ -337,17 +349,9 @@ def run_pipeline(
                             # An orphan from a crash before receipt commit must
                             # not be imported as an inactive extraction attempt.
                             review_path = _publish(review, str(spool / "admission-reviews"))
-                            db.conn.execute("BEGIN TRANSACTION")
-                            try:
-                                db.conn.execute("UPDATE extraction_work SET status = 'running' WHERE task_id = ?",
-                                                [result.work.task_id])
-                                review_receipt = dict(task_id=result.work.task_id, attempt_id=result.work.attempt_id,
-                                                      result_id=db.work.register_result(review, review_path))
-                                db.work.finish(review_receipt, "needs_review", detail, in_transaction=True)
-                                db.conn.execute("COMMIT")
-                            except Exception:
-                                db.conn.execute("ROLLBACK")
-                                raise
+                            predecessor = db.work.effective_admission_decision(raw_receipt)
+                            db.work.append_admission_decision(
+                                predecessor, review, review_path, "needs_review", {"reason": detail})
                         state = "needs_review"
                 if state in {"accepted", "verified_empty"} and prior not in {"accepted", "verified_empty"}:
                     satisfied.add(binding(result.work))

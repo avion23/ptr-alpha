@@ -1,6 +1,7 @@
 """Grounded local review authority, immutable receipts and scoped withdrawal."""
 from copy import deepcopy
 from dataclasses import replace
+from datetime import date
 import hashlib
 import json
 from pathlib import Path
@@ -153,3 +154,89 @@ def test_frozen_source_pixels_candidate_and_seal_are_all_required(candidate, com
     target = next((directory / "pages").glob("*.png")) if component == "pages" else directory / component
     target.write_bytes(b"changed")
     assert not workers.admission_decision(result, root)["allowed"]
+
+
+@pytest.fixture
+def quarantinable(candidate):
+    from analyzer.ocr.ingestion import record_parse_run
+
+    db, result, root = candidate
+    db.conn.execute("UPDATE house_archive_generations SET promoted_at='2026-08-01'")
+    prior = {**review.review_material(result)["projection"][0],
+             "source_row_id": "previous-accepted-lot", "amount_raw": "$12,000", "amount_midpoint": 12000.0}
+    columns = list(prior)
+    db.conn.execute(f"INSERT INTO transactions ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", list(prior.values()))
+    db.conn.execute("UPDATE transactions SET created_at='2026-09-01'")
+    record_parse_run(db.conn, "review", 2025, "success", 1, 1, parser_version="gemini-baseline",
+                     artifact_sha256=result.work.artifact_sha256, ingestion_generation="g", engines_attempted="gemini/old")
+    db.conn.execute("UPDATE pdf_parse_runs SET parsed_at='2026-09-02',rowset_created_at='2026-09-01'")
+    # Deliberately unrelated data exercises scope isolation, not just row counts.
+    db.conn.execute("INSERT INTO transactions (doc_id,source,ticker,asset_description) VALUES ('unrelated','form4','MSFT','untouched')")
+    baseline_rows = db.conn.execute("SELECT * FROM canonical_transactions WHERE doc_id='review'").fetchall()
+    assert len(baseline_rows) == 1
+    baseline = Path(db.publish_snapshot()["path"])
+    review.prepare_review(result, root)
+    review.record_review(result, root, source_report(result), verdict="pass", human_reviewed=True)
+    assert ingest(db, result, root) == "accepted"
+    receipt = raw_receipt(db, result)
+    scope = [{**receipt, "lane": "gemini"}]
+    yield db, result, root, baseline, scope, baseline_rows
+
+
+def test_quarantine_restores_prior_business_rows_preserves_temporal_history_and_is_idempotent(quarantinable):
+    from scripts.quarantine_model_admissions import quarantine
+
+    db, result, root, baseline, scope, historical = quarantinable
+    raw = db.conn.execute("SELECT * FROM extraction_results WHERE result_id=?", [scope[0]["result_id"]]).fetchone()
+    unrelated = db.conn.execute("SELECT * FROM transactions WHERE doc_id='unrelated'").fetchall()
+    before = db.conn.execute("SELECT * FROM canonical_transactions WHERE doc_id='review'").fetchall()
+    assert before != historical
+    dry = quarantine(db.conn, scope, baseline, root, "operator quality withdrawal")
+    assert dry["pending"] == 1 and not dry["applied"]
+    assert db.conn.execute("SELECT * FROM canonical_transactions WHERE doc_id='review'").fetchall() == before
+    outcome = quarantine(db.conn, scope, baseline, root, "operator quality withdrawal", apply=True)
+    assert outcome["baseline_canonical_rows"] == 1
+    with Database(baseline, read_only=True) as baseline_db:
+        assert db.conn.execute("SELECT * EXCLUDE(created_at) FROM canonical_transactions WHERE doc_id='review'").fetchall() == baseline_db.conn.execute(
+            "SELECT * EXCLUDE(created_at) FROM canonical_transactions WHERE doc_id='review'").fetchall()
+    # New restoration timestamps prevent duplicated historical UNION ALL observations.
+    with db.canonical_as_of(date(2026, 10, 1)):
+        assert db.conn.execute("SELECT * FROM canonical_transactions WHERE doc_id='review'").fetchall() == historical
+    assert db.conn.execute("SELECT * FROM extraction_results WHERE result_id=?", [scope[0]["result_id"]]).fetchone() == raw
+    assert db.conn.execute("SELECT * FROM transactions WHERE doc_id='unrelated'").fetchall() == unrelated
+    assert db.work.effective_admission_decision(scope[0])["state"] == "needs_review"
+    assert db.conn.execute("SELECT status FROM pdf_parse_runs WHERE parser_version=?", [result.work.extraction_recipe]).fetchall() == []
+    restored = db.conn.execute("SELECT * FROM transactions ORDER BY id").fetchall()
+    replay = quarantine(db.conn, scope, baseline, root, "operator quality withdrawal", apply=True)
+    assert replay["already_quarantined"] == 1 and replay["pending"] == 0
+    assert db.conn.execute("SELECT * FROM transactions ORDER BY id").fetchall() == restored
+
+
+def test_quarantine_failure_rolls_back_rows_runs_and_decisions(quarantinable, monkeypatch):
+    from scripts.quarantine_model_admissions import quarantine
+    from analyzer.persistence.work_repository import WorkRepository
+
+    db, _, root, baseline, scope, _ = quarantinable
+    tables = ("transactions", "transaction_versions", "pdf_parse_runs", "parse_run_versions", "extraction_results", "extraction_work")
+    before = {table: db.conn.execute("SELECT * FROM " + table).fetchall() for table in tables}
+
+    def refuse(*args, **kwargs):
+        raise ValueError("injected append failure after row replacement")
+
+    monkeypatch.setattr(WorkRepository, "append_admission_decision", refuse)
+    with pytest.raises(ValueError, match="injected append"):
+        quarantine(db.conn, scope, baseline, root, "operator quality withdrawal", apply=True)
+    for table in tables:
+        assert db.conn.execute("SELECT * FROM " + table).fetchall() == before[table]
+
+
+def test_withdrawn_raw_result_cannot_reuse_its_old_review_to_readmit(quarantinable):
+    from scripts.quarantine_model_admissions import quarantine
+
+    db, result, root, baseline, scope, _ = quarantinable
+    quarantine(db.conn, scope, baseline, root, "operator quality withdrawal", apply=True)
+    withdrawn = db.work.effective_admission_decision(scope[0])
+    restored = db.conn.execute("SELECT * FROM canonical_transactions WHERE doc_id='review'").fetchall()
+    assert ingest(db, result, root) == "needs_review"
+    assert db.work.effective_admission_decision(scope[0]) == withdrawn
+    assert db.conn.execute("SELECT * FROM canonical_transactions WHERE doc_id='review'").fetchall() == restored

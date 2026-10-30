@@ -736,17 +736,15 @@ def parse(
 def ocr_review_prepare(
     result_path: Path = typer.Argument(..., help="Immutable pipeline result JSON"),
     data_dir: str = typer.Option("data", help="Data root containing the sealed PDF"),
+    supersedes_admission_decision: str | None = typer.Option(
+        None, "--supersedes-admission-decision", help="Retraction result ID supplied by the operator; owner validates currentness at admission"),
 ):
     """Freeze source review (no API); retractions get report-template-DECISION_ID.json."""
     from analyzer.ocr.review import prepare_review
     from analyzer.ocr.workers import load_result
 
-    from analyzer.persistence.database import Database
-
-    # Review the working decision chain: a held published snapshot deliberately
-    # predates quarantine and cannot tell us which revocation must be acknowledged.
-    with Database(Path(data_dir) / "congress.duckdb", read_only=True) as db:
-        print(prepare_review(load_result(result_path), data_dir, database=db))
+    print(prepare_review(load_result(result_path), data_dir,
+                         supersedes_admission_decision_id=supersedes_admission_decision))
 
 
 @app.command()
@@ -762,11 +760,8 @@ def ocr_review_record(
     from analyzer.ocr.review import record_review
     from analyzer.ocr.workers import load_result
 
-    from analyzer.persistence.database import Database
-
-    with Database(Path(data_dir) / "congress.duckdb", read_only=True) as db:
-        entry = record_review(load_result(result_path), data_dir, json.loads(report.read_text()),
-                              verdict=verdict, human_reviewed=human_reviewed, database=db)
+    entry = record_review(load_result(result_path), data_dir, json.loads(report.read_text()),
+                          verdict=verdict, human_reviewed=human_reviewed)
     print(json.dumps(entry, sort_keys=True))
 
 

@@ -151,11 +151,12 @@ def _validate_bundle(data_dir, directory, record):
         raise ValueError("frozen source PDF changed")
 
 
-def prepare_review(result, data_dir, *, database=None):
+def prepare_review(result, data_dir, *, database=None, supersedes_admission_decision_id=None):
     """Local command: freeze actual PDF, rendered pixels, raw and final rows."""
     from scripts.audit_sample import audit_operation_lock, emit_bound_review_bundle
     from analyzer.ocr.ingestion import approved_data_root, read_work_artifact
 
+    _validate_supersession_id(supersedes_admission_decision_id)
     with approved_data_root(data_dir) as root, audit_operation_lock(root):
         material = review_material(result)
         directory = bundle_directory(root, material)
@@ -163,8 +164,12 @@ def prepare_review(result, data_dir, *, database=None):
         content = read_work_artifact(root, result.work.artifact_path)
         emit_bound_review_bundle(root, directory, encode(record), content)
         _validate_bundle(root, directory, record)
-        required = (required_review_supersession(database.work, material["binding"]["raw_result_id"])
-                    if database is not None else None)
+        required = supersedes_admission_decision_id
+        if database is not None:
+            current = required_review_supersession(database.work, material["binding"]["raw_result_id"])
+            if required is not None and required != current:
+                raise ValueError("explicit supersession does not match the borrowed owner's current decision")
+            required = current
         # Retractions get a new unapproved checklist, never overwrite an old
         # draft and never reset sticky failures on the immutable candidate.
         name = f"report-template-{required}.json" if required else "report-template.json"
@@ -177,15 +182,18 @@ def prepare_review(result, data_dir, *, database=None):
         return str(Path(data_dir) / directory.relative_to(Path(root)))
 
 
+def _validate_supersession_id(supersedes):
+    if supersedes is not None and (not isinstance(supersedes, str) or len(supersedes) != 64
+                                   or any(char not in "0123456789abcdef" for char in supersedes)):
+        raise ValueError("supersedes_admission_decision_id must be a lowercase SHA-256 or null")
+
+
 def _validate_report(report, result, material, verdict):
     if not isinstance(report, dict) or report.get("binding") != material["binding"]:
         raise ValueError("review report must bind the exact frozen candidate")
     if report.get("policy_sha256") != digest(POLICY):
         raise ValueError("review policy identity missing or changed")
-    supersedes = report.get("supersedes_admission_decision_id")
-    if supersedes is not None and (not isinstance(supersedes, str) or len(supersedes) != 64
-                                   or any(char not in "0123456789abcdef" for char in supersedes)):
-        raise ValueError("supersedes_admission_decision_id must be a lowercase SHA-256 or null")
+    _validate_supersession_id(report.get("supersedes_admission_decision_id"))
     if not isinstance(report.get("evidence"), str) or not report["evidence"].strip():
         raise ValueError("source-grounded evidence report required")
     if verdict != "pass":
@@ -237,8 +245,9 @@ def record_review(result, data_dir, report, *, verdict, human_reviewed=False, da
         record = bundle_record(result, material)
         _validate_bundle(root, directory, record)
         _validate_report(report, result, material, verdict)
-        if verdict == "pass" and report.get("supersedes_admission_decision_id") is not None and database is None:
-            raise ValueError("recording a superseding review requires the current database; use ocr-review-record or pass database")
+        # Recording acknowledges an operator-supplied subject, not its currentness.
+        # DB-free commands may run alongside the writer. Only the owner can
+        # authorize admission against the actual latest chain under its lock/txn.
         if verdict == "pass" and database is not None:
             assert_review_supersession(database.work, material["binding"]["raw_result_id"], report)
         history_path = directory / "verdicts.json"

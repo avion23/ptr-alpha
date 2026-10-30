@@ -30,7 +30,7 @@ from analyzer.vision_engines import (
 from scripts import audit_sample, glm_stage, ocr_zero_rows as operational_ocr_zero_rows
 from analyzer.ocr import ingestion as ocr_zero_rows
 from analyzer.ocr.common import PROMPT_SHA256
-from .conftest import make_ocr_output
+from .conftest import make_ocr_output, make_text_pdf
 
 pytestmark = pytest.mark.slow
 
@@ -164,7 +164,9 @@ def private_read_spy(monkeypatch):
 def fake_insert(monkeypatch):
     """Monkeypatch the canonical insert path + generation resolution.
 
-    The fake returns the canonical structured outcome directly.
+    The fake returns the canonical structured outcome directly. These tests
+    exercise staging lifecycle only, not authorization. The real-boundary
+    source-review/audit tests below deliberately do not use this fixture.
     """
     calls = []
 
@@ -801,7 +803,7 @@ def write_report_state(data_dir, *, state="complete", budget_met=True, schema="a
 
 def stage_one_audited(data_dir, year, doc_id, output):
     """Stage one doc, stamp the mandatory audit: pass, and land a complete
-    audit report with the budget met (the fully-gated-open world)."""
+    audit report with the budget met (GLM gates only, not generic review)."""
     stage_one(data_dir, year, doc_id, output)
     audit_sample.record_verdict(data_dir, doc_id, "pass", "matches pixels")
     write_report_state(data_dir)
@@ -944,6 +946,29 @@ def test_promote_no_txs_records_and_consumes(data_dir, fake_insert):
     assert glm_stage.load_staging_record(data_dir, 2024, "2002") is None
 
 
+def test_legacy_promote_cannot_publish_with_only_glm_audit_pass(data_dir, capsys):
+    from analyzer.persistence.database import Database
+
+    path, _ = seed_house_queue(data_dir, ["legacy-review"])
+    with Database(path) as owner:
+        owner.conn.execute("UPDATE house_generation_metadata SET first_name='Jane',last_name='Doe'")
+    stage_one_audited(data_dir, 2024, "legacy-review", GLM_OUTPUT_ONE_ROW)
+    live = glm_stage.staging_record_path(data_dir, 2024, "legacy-review")
+    before = live.read_bytes()
+
+    result = glm_stage.promote_docs(2024, ["legacy-review"], data_dir=data_dir)
+
+    assert result == {"year": 2024, "promoted": 0, "refused": 1, "failed": 0}
+    assert "grounded API source review required" in capsys.readouterr().out
+    assert live.read_bytes() == before
+    assert glm_stage.archived_attempts(data_dir, 2024, "legacy-review") == []
+    assert glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir)) == []
+    assert not (data_dir / "ocr_progress_gemini_manual.json").exists()
+    with Database(path) as owner:
+        assert owner.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+        assert owner.conn.execute("SELECT status FROM pdf_parse_runs WHERE doc_id='legacy-review'").fetchone() == ("error",)
+
+
 def test_promote_audit_approval_is_mandatory(data_dir, fake_insert, capsys):
     # Per-record gate: with a passing report but no audit stamp on the
     # record, promotion is refused, the insert path never runs, and the
@@ -991,29 +1016,21 @@ def test_promote_audit_approval_is_mandatory(data_dir, fake_insert, capsys):
     assert glm_stage.load_staging_record(data_dir, 2024, "2003") is None
 
 
-def test_promote_force_unaudited_is_explicit_and_loud(data_dir, fake_insert, capsys):
+def test_promote_force_unaudited_is_rejected_without_changes(data_dir, fake_insert):
     stage_one(data_dir, 2024, "2004", GLM_OUTPUT_ONE_ROW)
-    result = glm_stage.promote_docs(
-        2024, ["2004"], data_dir=data_dir, force_unaudited=True
-    )
-    assert result["promoted"] == 1
-    out = capsys.readouterr().out
-    assert "WARNING" in out and "WITHOUT a passing pixel audit" in out
-    journal = glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir))
-    assert journal[0]["unaudited"] is True
-    assert glm_stage.load_staging_record(data_dir, 2024, "2004") is None
-    archived = glm_stage.archived_attempts(data_dir, 2024, "2004")[0][1]
-    assert journal[0]["staging_attempt"] == str(
-        archived.relative_to(glm_stage.staging_root(data_dir))
-    )
-    assert journal[0]["staged_record_sha256"] == audit_sample.staged_record_sha256(
-        json.loads(archived.read_bytes())
-    )
+    live = glm_stage.staging_record_path(data_dir, 2024, "2004")
+    before = live.read_bytes()
+    with pytest.raises(ValueError, match="overrides are forbidden"):
+        glm_stage.promote_docs(2024, ["2004"], data_dir=data_dir, force_unaudited=True)
+    assert fake_insert == []
+    assert live.read_bytes() == before
+    assert glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir)) == []
+    assert glm_stage.archived_attempts(data_dir, 2024, "2004") == []
+    assert not (data_dir / "ocr_progress_gemini_manual.json").exists()
 
 
-@pytest.mark.parametrize("force_unaudited", [False, True])
 def test_legacy_success_without_optional_row_hash_still_promotes(
-    data_dir, fake_insert, force_unaudited
+    data_dir, fake_insert
 ):
     stage_one(data_dir, 2024, "legacy-row-hash", GLM_OUTPUT_ONE_ROW)
     live = glm_stage.staging_record_path(data_dir, 2024, "legacy-row-hash")
@@ -1021,16 +1038,14 @@ def test_legacy_success_without_optional_row_hash_still_promotes(
     del legacy["staged_rows_sha256"]
     live.write_text(json.dumps(legacy), encoding="utf-8")
 
-    if not force_unaudited:
-        audit_sample.record_verdict(
-            data_dir, "legacy-row-hash", "pass", "legacy content reviewed"
-        )
-        write_report_state(data_dir)
+    audit_sample.record_verdict(
+        data_dir, "legacy-row-hash", "pass", "legacy content reviewed"
+    )
+    write_report_state(data_dir)
     result = glm_stage.promote_docs(
         2024,
         ["legacy-row-hash"],
         data_dir=data_dir,
-        force_unaudited=force_unaudited,
     )
 
     assert result["promoted"] == 1 and len(fake_insert) == 1
@@ -1040,18 +1055,15 @@ def test_legacy_success_without_optional_row_hash_still_promotes(
     archived = json.loads(archived_path.read_text(encoding="utf-8"))
     assert "staged_rows_sha256" not in archived  # never backfilled from live rows
     journal = glm_stage.read_promoted_journal(glm_stage.staging_root(data_dir))
-    assert journal[0]["unaudited"] is force_unaudited
+    assert journal[0]["unaudited"] is False
     assert journal[0]["staged_rows_sha256"] == glm_stage.staged_rows_sha256(
         archived["rows"]
     )
     assert attempt_number == 0
-    if not force_unaudited:
-        history = json.loads(
-            (glm_stage.staging_root(data_dir) / "audit-results.json").read_text()
-        )
-        assert history[0]["staged_record_sha256"] == audit_sample.staged_record_sha256(
-            legacy
-        )
+    history = json.loads(
+        (glm_stage.staging_root(data_dir) / "audit-results.json").read_text()
+    )
+    assert history[0]["staged_record_sha256"] == audit_sample.staged_record_sha256(legacy)
 
 
 def test_promote_refuses_malformed_or_foreign_report_state(data_dir, fake_insert, capsys):
@@ -1084,13 +1096,13 @@ def test_promote_refuses_malformed_or_foreign_report_state(data_dir, fake_insert
     assert result["refused"] == 1 and result["promoted"] == 0
     kept = glm_stage.load_staging_record(data_dir, 2024, "2007")
     assert kept is not None
-    # force_unaudited is the only bypass, and it stays loud.
-    result = glm_stage.promote_docs(
-        2024, ["2007"], data_dir=data_dir, force_unaudited=True
-    )
-    assert result["promoted"] == 1
-    out = capsys.readouterr().out
-    assert "WARNING" in out and "WITHOUT a passing pixel audit" in out
+    # Neither gate can be overridden, even for a previously audited record.
+    before = glm_stage.staging_record_path(data_dir, 2024, "2007").read_bytes()
+    with pytest.raises(ValueError, match="overrides are forbidden"):
+        glm_stage.promote_docs(2024, ["2007"], data_dir=data_dir, force_unaudited=True)
+    assert fake_insert == []
+    assert glm_stage.staging_record_path(data_dir, 2024, "2007").read_bytes() == before
+    assert glm_stage.archived_attempts(data_dir, 2024, "2007") == []
 
 
 def test_promote_refuses_sample_lot_replaced_after_report(
@@ -1983,7 +1995,7 @@ def test_semantically_invalid_peer_blocks_explicit_promotion(data_dir, fake_inse
     assert glm_stage.archived_attempts(data_dir, 2024, "explicit-peer") == []
 
 
-def test_force_unaudited_does_not_skip_staged_rows_hash(data_dir, fake_insert):
+def test_promote_checks_staged_rows_hash_and_artifact_identity(data_dir, fake_insert):
     stage_one(data_dir, 2024, "content-proof", GLM_OUTPUT_ONE_ROW)
     record = glm_stage.load_staging_record(data_dir, 2024, "content-proof")
     record["rows"][0][0] = "tampered after staging"
@@ -1993,18 +2005,18 @@ def test_force_unaudited_does_not_skip_staged_rows_hash(data_dir, fake_insert):
 
     with pytest.raises(ValueError, match="do not match staged_rows_sha256"):
         glm_stage.promote_docs(
-            2024, ["content-proof"], data_dir=data_dir, force_unaudited=True
+            2024, ["content-proof"], data_dir=data_dir
         )
 
     assert fake_insert == []
     assert live.read_bytes() == live_bytes
     live.unlink()  # the deliberately corrupt peer blocks population-wide admission
 
-    stage_one(data_dir, 2024, "identity-proof", GLM_OUTPUT_ONE_ROW)
+    stage_one_audited(data_dir, 2024, "identity-proof", GLM_OUTPUT_ONE_ROW)
     pdf = glm_stage.default_pdf_path(data_dir, 2024, "identity-proof")
     make_pdf(pdf, pages=2)
     refused = glm_stage.promote_docs(
-        2024, ["identity-proof"], data_dir=data_dir, force_unaudited=True
+        2024, ["identity-proof"], data_dir=data_dir
     )
     assert refused["refused"] == 1 and refused["promoted"] == 0
     assert fake_insert == []
@@ -2940,14 +2952,31 @@ def test_verdict_binding_rejects_row_mutation_but_accepts_content_bound_record(
     assert bound and reason is None
 
 
-@pytest.mark.parametrize("invalidate", ["before", "during"])
+@pytest.mark.parametrize("invalidate", [
+    "before", "during", "missing_report", "stale_report", "failed_report",
+    "missing_verdict", "failed_verdict", "wrong_policy", "tampered_artifact",
+    "missing_review",
+])
 def test_glm_audit_guard_holds_real_verdict_authorization_through_commit(data_dir, monkeypatch, invalidate):
-    from analyzer.ocr import common, coordinator, ingestion, workers
+    from analyzer.ocr import common, coordinator, ingestion, review, workers
     from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, ResultBundle, WorkEnvelope, task_key
     from analyzer.persistence.database import Database
 
     path, digests = seed_house_queue(data_dir, ["guard"])
-    record = stage_one_audited(data_dir, 2024, "guard", make_ocr_output())
+    pdf = make_text_pdf(glm_stage.default_pdf_path(data_dir, 2024, 'guard'), [
+        'HOUSE PTR - Jane Doe - Filed 02/01/2024',
+        'Asset | Direction | Trade Date | Notification Date | Amount | Owner',
+        'Apple Inc. (AAPL) | Purchase | 01/15/24 | 01/20/24 | $12,345.67 | SP',
+    ])
+    digests['guard'] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    with Database(path) as owner:
+        owner.conn.execute("UPDATE house_pdf_artifacts SET artifact_sha256=?", [digests['guard']])
+        owner.conn.execute("UPDATE house_generation_metadata SET first_name='Jane',last_name='Doe'")
+    glm_stage.stage_batch(2024, 5, data_dir=data_dir,
+                          read_fn=read_fn_from_outputs({'guard': make_ocr_output()}))
+    audit_sample.record_verdict(data_dir, 'guard', 'pass', 'synthetic source pixels checked')
+    write_report_state(data_dir)
+    record = glm_stage.load_staging_record(data_dir, 2024, 'guard')
     recipe = workers.extraction_recipe(ExtractionLane.GLM)
     work = WorkEnvelope(
         task_key("guard", 2024, "current", digests["guard"], recipe, ExtractionLane.GLM),
@@ -2977,6 +3006,42 @@ def test_glm_audit_guard_holds_real_verdict_authorization_through_commit(data_di
                               "member": "Jane Doe", "staging_record": record,
                               "page_count": 1, "output_schema_version": 4,
                               "page_outcomes": [{"page_number": 1, "outcome": "transactions"}]})
+        # Additional local source review does not replace either existing GLM gate.
+        review.prepare_review(result, data_dir)
+        report = review.review_report_template(result)
+        projected, = review.review_material(result)['projection']
+        assert (projected['ticker'], projected['transaction_type'], projected['notification_date'], projected['amount_raw']) == (
+            'AAPL', 'Purchase', '2024-01-20', '$12,345.67')
+        report['evidence'] = 'Unit oracle: entire synthetic one-page Jane Doe PTR, filed 02/01/24.'
+        report['pages'][0].update(outcome='transactions', evidence='Exactly one Apple transaction, no other rows/examples.')
+        report['rows'][0]['evidence'] = 'AAPL Purchase 01/15/24 notified 01/20/24 $12,345.67 SP; no options, account, instrument terms.'
+        report['omissions_checked'] = True
+        if invalidate != "missing_review":
+            review.record_review(result, data_dir, report, verdict='pass', human_reviewed=True)
+            # Check the actual local authorization before damaging any gate.
+            assert workers.admission_decision(result, data_dir)["allowed"] is True
+        root = glm_stage.staging_root(data_dir)
+        if invalidate == "missing_report":
+            (root / "audit-report-state.json").unlink()
+        elif invalidate == "stale_report":
+            (root / "audit-results.json").write_text("[]")
+        elif invalidate == "failed_report":
+            write_report_state(data_dir, budget_met=False)
+        elif invalidate == "missing_verdict":
+            (root / "audit-results.json").write_text("[]")
+            write_report_state(data_dir)
+        elif invalidate == "failed_verdict":
+            audit_sample.record_verdict(data_dir, "guard", "fail", "new pixel defect")
+            write_report_state(data_dir)
+        elif invalidate == "wrong_policy":
+            directory = review.bundle_directory(data_dir, review.review_material(result))
+            history_path = directory / "verdicts.json"
+            history = json.loads(history_path.read_text())
+            history[-1]["report"]["policy_sha256"] = "0" * 64
+            history_path.write_text(json.dumps(history))
+        elif invalidate == "tampered_artifact":
+            directory = review.bundle_directory(data_dir, review.review_material(result))
+            (directory / "source.pdf").write_bytes(b"tampered frozen source")
         bundle_path = workers._publish(result, str(data_dir / "pipeline"))
         real_commit = ingestion.insert_transactions_outcome
         invalidator = threading.Thread(target=revoke)
@@ -2990,6 +3055,18 @@ def test_glm_audit_guard_holds_real_verdict_authorization_through_commit(data_di
             outcome = real_commit(*args, **kwargs)
             assert owner.work.is_finished(kwargs["receipt"])
             assert owner.conn.execute("SELECT COUNT(*) FROM transactions WHERE doc_id='guard'").fetchone() == (1,)
+            proof = json.loads(owner.conn.execute('SELECT detail FROM extraction_results WHERE result_id=?',
+                                                  [kwargs['receipt']['result_id']]).fetchone()[0])
+            stored = owner.conn.execute(
+                f"SELECT {', '.join(ingestion.OCR_INSERT_COLUMNS)} FROM transactions WHERE doc_id='guard'"
+            ).fetchall()
+            actual = ingestion.canonical_ocr_projection([
+                dict(zip(ingestion.OCR_INSERT_COLUMNS, row)) for row in stored
+            ])
+            assert actual == proof['final_projection'] == [projected]
+            assert proof['final_projection_sha256'] == report['binding']['final_projection_sha256']
+            assert proof['audit_binding']['staged_record_sha256'] == glm_stage.audit_staged_record_sha256(record)
+            assert proof['review_binding']['raw_result_id'] == kwargs['receipt']['result_id']
             assert not invalidated.is_set(), "audit guard released before canonical receipt committed"
             committed.append(outcome.status)
             return outcome
@@ -3004,11 +3081,27 @@ def test_glm_audit_guard_holds_real_verdict_authorization_through_commit(data_di
                 invalidator.join(5)
         assert not invalidator.is_alive()
         assert not errors
-        assert invalidated.is_set()
+        assert invalidated.is_set() == (invalidate in {"before", "during"})
         assert committed == (["success"] if invalidate == "during" else [])
         assert state == ("accepted" if invalidate == "during" else "needs_review")
         assert owner.conn.execute("SELECT COUNT(*) FROM transactions WHERE doc_id='guard'").fetchone() == ((1,) if invalidate == "during" else (0,))
-    assert glm_stage.load_staging_record(data_dir, 2024, "guard")["audit"] == "fail"
+        if invalidate not in {"before", "during"}:
+            detail, = owner.conn.execute(
+                "SELECT detail FROM extraction_work WHERE task_id=?", [work.task_id]
+            ).fetchone()
+            reason = {
+                "missing_report": "audit report state is missing",
+                "stale_report": "audit history changed since report",
+                "failed_report": "budget",
+                "missing_verdict": "no pass verdict",
+                "failed_verdict": "staging record lacks audit pass",
+                "wrong_policy": "review policy identity missing or changed",
+                "tampered_artifact": "source",
+                "missing_review": "grounded API review required",
+            }[invalidate]
+            assert reason in detail
+    if invalidate in {"before", "during", "failed_verdict"}:
+        assert glm_stage.load_staging_record(data_dir, 2024, "guard")["audit"] == "fail"
 
 
 # --------------------------------------------------------------------------

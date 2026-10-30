@@ -55,10 +55,24 @@ from scripts import purge_unaccepted_house_rowsets
 
 pytestmark = pytest.mark.slow
 
-def _run_main():
-    from scripts.ocr_zero_rows import _run_visionb_staging
 
-    return ocr_zero_rows.main(staging_runner=_run_visionb_staging)
+@pytest.fixture(autouse=True)
+def forbid_nonlocal_network(monkeypatch):
+    """The existing HTTP-client cases may contact only their loopback stub."""
+    resolve = socket.getaddrinfo
+    connect = socket.socket.connect
+    loopback = {"127.0.0.1", "::1", "localhost"}
+
+    def local_resolve(host, *args, **kwargs):
+        assert host in loopback, "vision tests attempted external DNS/network access"
+        return resolve(host, *args, **kwargs)
+
+    def local_connect(sock, address):
+        assert address[0] in loopback, "vision tests attempted an external connection"
+        return connect(sock, address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", local_resolve)
+    monkeypatch.setattr(socket.socket, "connect", local_connect)
 
 A_OUTPUT = (
     "MEMBER: Jane Doe\nPAGES: 1\nPAGE: 1\n"
@@ -901,55 +915,25 @@ def test_dual_read_partial_insert_is_never_completed(
     assert outcome.progress_key == "errors"
 
 
-def test_run_gemini_ocr_for_year_engine_b_quota_stop_ends_batch(
-    tmp_path, monkeypatch, vision_b_server, capsys
-):
-    _seed_db_docs(tmp_path, list(_TWO_SHAS.items()))
-    server = vision_b_server("ignored", status=429)
-    _set_engine_b(monkeypatch, server.server_address[1])
+@pytest.mark.parametrize("configured", [False, True])
+def test_year_runner_rejects_retired_dual_before_spending_provider_quota(tmp_path, monkeypatch, configured):
+    from analyzer.ocr import coordinator
+
     monkeypatch.setenv("DUAL_READ", "1")
-    calls: list = []
-    _stub_loop_engines(
-        monkeypatch, outputs=_TWO_OUTPUTS, shas=_TWO_SHAS, calls=calls
-    )
-    monkeypatch.setattr(
-        ocr_zero_rows, "get_ocr_work_items", lambda **kwargs: list(_TWO_DOCS)
-    )
-    monkeypatch.setattr(ocr_zero_rows, "COOLDOWN", 0)
+    if configured:
+        monkeypatch.setenv("VISION_B_BASE_URL", "https://stub.invalid")
+        monkeypatch.setenv("VISION_B_MODEL", "stub-model")
+    else:
+        monkeypatch.delenv("VISION_B_BASE_URL", raising=False)
+        monkeypatch.delenv("VISION_B_MODEL", raising=False)
 
-    total = ocr_zero_rows.run_gemini_ocr_for_year(2024, data_dir=str(tmp_path))
+    def forbidden(*args, **kwargs):
+        pytest.fail("retired dual mode reached extraction")
 
-    # The year runner honors the B-quota batch-stop exactly like main().
-    assert total == 0
-    assert calls == ["dual-doc-a"]
-    assert "Engine B quota exhausted; stopping batch" in capsys.readouterr().out
-    with duckdb.connect(str(tmp_path / "congress.duckdb")) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone()[0] == 0
-
-
-def test_run_gemini_ocr_for_year_dual_without_b_config_stops(
-    tmp_path, monkeypatch, capsys
-):
-    _seed_db_docs(tmp_path, list(_TWO_SHAS.items()))
-    monkeypatch.setenv("DUAL_READ", "1")
-    monkeypatch.delenv("VISION_B_BASE_URL", raising=False)
-    monkeypatch.delenv("VISION_B_MODEL", raising=False)
-    calls: list = []
-    _stub_loop_engines(
-        monkeypatch, outputs=_TWO_OUTPUTS, shas=_TWO_SHAS, calls=calls
-    )
-    monkeypatch.setattr(
-        ocr_zero_rows, "get_ocr_work_items", lambda **kwargs: list(_TWO_DOCS)
-    )
-    monkeypatch.setattr(ocr_zero_rows, "COOLDOWN", 0)
-
-    total = ocr_zero_rows.run_gemini_ocr_for_year(2024, data_dir=str(tmp_path))
-
-    assert total == 0
-    assert calls == []  # engine A never spent on ungated readings
-    out = capsys.readouterr().out
-    assert "ALERT" in out and "not configured" in out
+    monkeypatch.setattr(coordinator, "run_pipeline", forbidden)
+    monkeypatch.setattr(gem, "call_gemini", forbidden)
+    with pytest.raises(ValueError, match="dual-read drain retired"):
+        ocr_zero_rows.run_gemini_ocr_for_year(2024, data_dir=str(tmp_path))
 
 
 def test_dual_read_disagreement_persists_nothing_and_records_both_readings(
@@ -1229,7 +1213,7 @@ def test_unaccepted_rowset_cleanup_is_source_bound_atomic_and_idempotent(
 
 
 # ---------------------------------------------------------------------------
-# Nightly backlog cron: main() loop dual routing (stubbed engines, tmp DuckDB)
+# Unified operational routing (mocked providers, authoritative temporary scope)
 # ---------------------------------------------------------------------------
 
 
@@ -1239,8 +1223,9 @@ def _seed_db_docs(db_path, docs):
     db = Database(db_path)
     _enable_ocr_schema(db.conn)
     db.conn.execute(
-        "INSERT INTO house_archive_generations (archive_year, generation_id) "
-        "VALUES (2024, 'gen-dual') ON CONFLICT DO NOTHING"
+        "INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) "
+        "VALUES (2024, 'gen-dual', ?, ?) ON CONFLICT DO NOTHING",
+        [len(docs), len(docs)],
     )
     for doc_id, sha in docs:
         db.conn.execute(
@@ -1281,301 +1266,31 @@ def _add_deterministic_zero_rows(db_path, doc_ids):
     db.close()
 
 
-def _stub_loop_engines(monkeypatch, *, outputs, shas, calls, errors=None):
-    """Stub engine A (per-doc output/error) and page rasterization."""
-    from analyzer import vision_engines
+@pytest.mark.parametrize("dual,mode", [("1", "gemini"), ("1", "visionb"), ("", "dual")])
+@pytest.mark.parametrize("configured", [False, True])
+def test_main_rejects_retired_dual_before_provider_or_coordinator_calls(tmp_path, monkeypatch, capsys, dual, mode, configured):
+    from analyzer.ocr import coordinator
 
-    def read_a(doc, *, refresh=False):
-        del refresh
-        calls.append(doc.doc_id)
-        error = (errors or {}).get(doc.doc_id)
-        if error is not None:
-            return None, error, None
-        output = outputs[doc.doc_id]
-        parsed = gem.parse_gemini_output(output, expected_page_count=1)
-        return (
-            output,
-            "",
-            gem.ArtifactMetadata(shas[doc.doc_id], 1, len(output), "stub.pdf", parsed),
-        )
-
-    monkeypatch.setattr(vision_engines, "_default_read_a", read_a)
-    monkeypatch.setattr(vision_engines, "_default_page_data_urls", _pages)
-
-
-def _wire_main(
-    monkeypatch,
-    tmp_path,
-    *,
-    docs,
-    shas,
-    outputs,
-    errors=None,
-    dual=True,
-):
-    """Point main() at a tmp DuckDB/progress file with stubbed engines.
-
-    Returns (db_file, progress_path, calls). Engine A is stubbed at both call
-    sites (vision_engines._default_read_a for the dual orchestrator and
-    ocr_zero_rows.call_gemini for the single-engine path) so no test here can
-    reach the network through either route.
-    """
-    calls: list = []
-    _stub_loop_engines(
-        monkeypatch, outputs=outputs, shas=shas, calls=calls, errors=errors
-    )
-
-    def fake_call_gemini(pdf_path, doc_id=None, refresh=False):
-        del pdf_path, refresh
-        calls.append(doc_id)
-        error = (errors or {}).get(doc_id)
-        if error is not None:
-            return None, error, None
-        output = outputs[doc_id]
-        parsed = gem.parse_gemini_output(output, expected_page_count=1)
-        return (
-            output,
-            "",
-            gem.ArtifactMetadata(shas[doc_id], 1, len(output), "stub.pdf", parsed),
-        )
-
-    monkeypatch.setattr(ocr_zero_rows, "call_gemini", fake_call_gemini)
-    db_file = Path(tmp_path) / "congress.duckdb"
-    progress_path = tmp_path / "progress.json"
-    monkeypatch.setattr(sys, "argv", ["ocr_zero_rows"])
-    monkeypatch.setattr(ocr_zero_rows, "DB_PATH", str(db_file))
-    monkeypatch.setattr(ocr_zero_rows, "COOLDOWN", 0)
-    monkeypatch.setattr(ocr_zero_rows, "get_zero_row_pdfs", lambda: list(docs))
-    original_load = ocr_zero_rows.load_progress
-    original_save = ocr_zero_rows.save_progress
-    monkeypatch.setattr(
-        ocr_zero_rows, "load_progress", lambda: original_load(progress_path)
-    )
-    monkeypatch.setattr(
-        ocr_zero_rows, "save_progress", lambda p: original_save(p, progress_path)
-    )
-    if dual:
-        monkeypatch.setenv("DUAL_READ", "1")
+    monkeypatch.setenv("DUAL_READ", dual)
+    monkeypatch.setenv("OCR_ENGINE", mode)
+    monkeypatch.setattr(sys, "argv", ["ocr_zero_rows", "--data-dir", str(tmp_path)])
+    if configured:
+        monkeypatch.setenv("VISION_B_BASE_URL", "https://stub.invalid")
+        monkeypatch.setenv("VISION_B_MODEL", "stub-model")
     else:
-        monkeypatch.delenv("DUAL_READ", raising=False)
-    return db_file, progress_path, calls
+        monkeypatch.delenv("VISION_B_BASE_URL", raising=False)
+        monkeypatch.delenv("VISION_B_MODEL", raising=False)
 
+    def forbidden(*args, **kwargs):
+        pytest.fail("retired dual mode reached extraction")
 
-def _set_engine_b(monkeypatch, port):
-    monkeypatch.setenv("VISION_B_BASE_URL", f"http://127.0.0.1:{port}")
-    monkeypatch.setenv("VISION_B_MODEL", "stub-qwen-vl")
-
-
-_TWO_DOCS = [("dual-doc-a", 2024, "stub.pdf"), ("dual-doc-b", 2024, "stub.pdf")]
-_TWO_SHAS = {"dual-doc-a": "dual-sha-a", "dual-doc-b": "dual-sha-b"}
-_TWO_OUTPUTS = {"dual-doc-a": A_OUTPUT, "dual-doc-b": A_OUTPUT}
-
-
-def test_main_loop_dual_agree_persists_v6_and_marks_processed(
-    tmp_path, monkeypatch, vision_b_server, capsys
-):
-    _seed_db(tmp_path)
-    server = vision_b_server(B_OUTPUT_REFORMAT)
-    _set_engine_b(monkeypatch, server.server_address[1])
-    db_file, progress_path, _ = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, "stub.pdf")],
-        shas={"dual-doc": "dual-sha-1"},
-        outputs={"dual-doc": A_OUTPUT},
-    )
-
-    assert _run_main() == 0
-
-    with duckdb.connect(str(db_file)) as conn:
-        run_row = conn.execute(
-            "SELECT parser_version, status, engines_attempted FROM pdf_parse_runs "
-            "WHERE doc_id = 'dual-doc'"
-        ).fetchone()
-        tx_count = conn.execute(
-            "SELECT COUNT(*) FROM transactions WHERE doc_id = 'dual-doc'"
-        ).fetchone()[0]
-    assert run_row == (DUAL_PARSER_VERSION, "success", DUAL_ENGINES_ATTEMPTED)
-    assert tx_count == 1
-    assert json.loads(progress_path.read_text())["completed"] == ["dual-doc"]
-    # The validated dual run counts as deterministic recency: the doc leaves
-    # the nightly work list instead of being re-read.
-    assert (
-        get_ocr_work_items(db_path=str(db_file), data_dir=str(tmp_path), year=2024)
-        == []
-    )
-    assert "DUAL AGREE: inserted=1" in capsys.readouterr().out
-
-
-def test_main_loop_dual_disagree_marks_processed_without_persisting(
-    tmp_path, monkeypatch, vision_b_server
-):
-    _seed_db(tmp_path)
-    server = vision_b_server(B_OUTPUT_DISAGREE)
-    _set_engine_b(monkeypatch, server.server_address[1])
-    db_file, progress_path, _ = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, "stub.pdf")],
-        shas={"dual-doc": "dual-sha-1"},
-        outputs={"dual-doc": A_OUTPUT},
-    )
-
-    assert _run_main() == 1
-
-    with duckdb.connect(str(db_file)) as conn:
-        tx_count = conn.execute(
-            "SELECT COUNT(*) FROM transactions WHERE doc_id = 'dual-doc'"
-        ).fetchone()[0]
-        run_row = conn.execute(
-            "SELECT status, transaction_count FROM pdf_parse_runs "
-            "WHERE doc_id = 'dual-doc'"
-        ).fetchone()
-    assert tx_count == 0  # nothing persists from either side
-    assert run_row == ("invalid", 0)
-    progress = json.loads(progress_path.read_text())
-    assert progress["errors"] == ["dual-doc"]  # marked processed, not lost
-    assert progress["completed"] == []
-    # The invalid dual run leaves the work list: no nightly retry loop.
-    assert (
-        get_ocr_work_items(db_path=str(db_file), data_dir=str(tmp_path), year=2024)
-        == []
-    )
-
-
-def test_main_loop_engine_b_quota_stop_ends_batch_cleanly(
-    tmp_path, monkeypatch, vision_b_server, capsys
-):
-    _seed_db_docs(tmp_path, list(_TWO_SHAS.items()))
-    server = vision_b_server("ignored", status=429)
-    _set_engine_b(monkeypatch, server.server_address[1])
-    db_file, progress_path, calls = _wire_main(
-        monkeypatch, tmp_path, docs=_TWO_DOCS, shas=_TWO_SHAS, outputs=_TWO_OUTPUTS
-    )
-
-    assert _run_main() == 1
-
-    assert calls == ["dual-doc-a"]  # batch ended at the first doc
-    out = capsys.readouterr().out
-    assert "Engine B quota exhausted; stopping batch" in out
-    assert "=== OCR RUN INCOMPLETE ===" in out
-    with duckdb.connect(str(db_file)) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone()[0] == 0
-    # Nothing was processed, so nothing was marked: no progress file at all.
-    assert not progress_path.exists()
-
-
-def test_main_loop_engine_a_quota_stop_still_ends_batch(
-    tmp_path, monkeypatch, vision_b_server, capsys
-):
-    _seed_db_docs(tmp_path, list(_TWO_SHAS.items()))
-    server = vision_b_server(B_OUTPUT_REFORMAT)  # B would agree, but is never asked
-    _set_engine_b(monkeypatch, server.server_address[1])
-    db_file, progress_path, calls = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=_TWO_DOCS,
-        shas=_TWO_SHAS,
-        outputs=_TWO_OUTPUTS,
-        errors={"dual-doc-a": "429 RESOURCE_EXHAUSTED: quota exceeded"},
-    )
-
-    assert _run_main() == 1
-
-    assert calls == ["dual-doc-a"]
-    assert server.requests == []  # engine B is never called after A's quota stop
-    assert "Quota exhausted; stopping batch" in capsys.readouterr().out
-    with duckdb.connect(str(db_file)) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone()[0] == 0
-    assert not progress_path.exists()  # nothing processed, nothing marked
-
-
-def test_main_loop_engine_b_transient_outage_lands_retry_state_not_a_only(
-    tmp_path, monkeypatch
-):
-    _seed_db_docs(tmp_path, list(_TWO_SHAS.items()))
-    _add_deterministic_zero_rows(tmp_path, [doc_id for doc_id, _ in _TWO_SHAS.items()])
-    _set_engine_b(monkeypatch, _dead_port())  # connection refused, not a quota stop
-    db_file, progress_path, calls = _wire_main(
-        monkeypatch, tmp_path, docs=_TWO_DOCS, shas=_TWO_SHAS, outputs=_TWO_OUTPUTS
-    )
-
-    assert _run_main() == 1
-
-    # The batch continues (an outage is not a crash) but NOTHING persists
-    # A-only: each doc lands an error run that retries it next night.
-    assert calls == ["dual-doc-a", "dual-doc-b"]
-    with duckdb.connect(str(db_file)) as conn:
-        tx_count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-        runs = conn.execute(
-            "SELECT doc_id, parser_version, engines_attempted, status "
-            "FROM pdf_parse_runs WHERE parser_version = ? ORDER BY doc_id",
-            [DUAL_PARSER_VERSION],
-        ).fetchall()
-    assert tx_count == 0  # never an A-only persistence
-    assert runs == [
-        ("dual-doc-a", DUAL_PARSER_VERSION, DUAL_ENGINES_ATTEMPTED, "error"),
-        ("dual-doc-b", DUAL_PARSER_VERSION, DUAL_ENGINES_ATTEMPTED, "error"),
-    ]
-    assert json.loads(progress_path.read_text())["errors"] == [
-        "dual-doc-a",
-        "dual-doc-b",
-    ]
-    # Both docs stay on the OCR work list for the retry.
-    work = get_ocr_work_items(db_path=str(db_file), data_dir=str(tmp_path), year=2024)
-    assert [doc_id for doc_id, _, _ in work] == ["dual-doc-a", "dual-doc-b"]
-
-
-def test_main_loop_dual_without_engine_b_config_alerts_and_stops(
-    tmp_path, monkeypatch, capsys
-):
-    _seed_db_docs(tmp_path, list(_TWO_SHAS.items()))
-    monkeypatch.delenv("VISION_B_BASE_URL", raising=False)
-    monkeypatch.delenv("VISION_B_MODEL", raising=False)
-    db_file, progress_path, calls = _wire_main(
-        monkeypatch, tmp_path, docs=_TWO_DOCS, shas=_TWO_SHAS, outputs=_TWO_OUTPUTS
-    )
-
-    _run_main()
-
-    # A dual run without engine B is a config defect: alert and stop the
-    # batch before spending engine A on readings nothing may persist.
-    assert calls == []  # engine A never contacted
-    out = capsys.readouterr().out
-    assert "ALERT" in out and "not configured" in out
-    with duckdb.connect(str(db_file)) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone()[0] == 0
-    assert not progress_path.exists()
-
-
-def test_main_loop_without_dual_read_stays_single_engine(
-    tmp_path, monkeypatch, vision_b_server
-):
-    _seed_db(tmp_path)
-    server = vision_b_server(B_OUTPUT_REFORMAT)
-    _set_engine_b(monkeypatch, server.server_address[1])  # B up, but DUAL_READ off
-    db_file, _, calls = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, "stub.pdf")],
-        shas={"dual-doc": "dual-sha-1"},
-        outputs={"dual-doc": A_OUTPUT},
-        dual=False,
-    )
-
-    _run_main()
-
-    assert calls == ["dual-doc"]  # engine A read once, no gating round trip
-    assert server.requests == []  # engine B never contacted
-    with duckdb.connect(str(db_file)) as conn:
-        run_row = conn.execute(
-            "SELECT parser_version, engines_attempted, status FROM pdf_parse_runs "
-            "WHERE doc_id = 'dual-doc'"
-        ).fetchone()
-    assert run_row == (gem.GEMINI_PARSER_VERSION, gem.MODEL, "success")
+    monkeypatch.setattr(coordinator, "run_pipeline", forbidden)
+    monkeypatch.setattr(gem, "call_gemini", forbidden)
+    with pytest.raises(SystemExit) as exit:
+        ocr_zero_rows.main()
+    assert exit.value.code == 2
+    assert "dual-read drain retired" in capsys.readouterr().err
+    assert not (tmp_path / "congress.duckdb").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1704,232 +1419,125 @@ def test_visionb_runs_leave_the_ocr_work_list(tmp_path):
     assert [doc_id for doc_id, _, _ in work] == ["wl-doc"]
 
 
-def test_main_loop_visionb_mode_stages_glm_read_and_never_touches_canonical(
-    tmp_path, monkeypatch, vision_b_server, capsys
-):
-    tiny_pdf = tmp_path / "stub.pdf"
-    _write_tiny_pdf(tiny_pdf)
-    tiny_sha = gem.pdf_sha256(str(tiny_pdf))
-    _seed_db(tmp_path, sha=tiny_sha)  # artifact binding uses the real hash
-    server = vision_b_server(A_OUTPUT)
-    _set_engine_b(monkeypatch, server.server_address[1])
+@pytest.fixture
+def coordinated_scope(tmp_path, monkeypatch):
+    docs = []
+    for doc_id in ("a", "b"):
+        pdf = tmp_path / "2024" / "pdfs" / f"{doc_id}.pdf"
+        pdf.parent.mkdir(parents=True, exist_ok=True)
+        _write_tiny_pdf(pdf)
+        docs.append((doc_id, gem.pdf_sha256(pdf)))
+    _seed_db_docs(tmp_path, docs)
+    monkeypatch.setenv("DUAL_READ", "0")
+    monkeypatch.setattr(sys, "argv", ["ocr_zero_rows", "--data-dir", str(tmp_path), "--year", "2024"])
+    return tmp_path
+
+
+def test_visionb_pipeline_stages_and_replays_without_unreviewed_admission(coordinated_scope, monkeypatch, capsys):
+    from analyzer import vision_engines
+    from scripts import glm_stage
+
+    root = coordinated_scope
     monkeypatch.setenv("OCR_ENGINE", "visionb")
-    monkeypatch.setattr(
-        "scripts.glm_stage.rasterize_page_data_urls",
-        lambda pdf_path, dpi=150: [DATA_URL],
-    )
-    db_file, progress_path, calls = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, str(tiny_pdf))],
-        shas={"dual-doc": tiny_sha},
-        outputs={"dual-doc": A_OUTPUT},
-        dual=False,
-    )
+    monkeypatch.setenv("VISION_B_BASE_URL", "https://stub.invalid")
+    monkeypatch.setenv("VISION_B_MODEL", "stub-model")
+    calls = []
 
-    _run_main()
+    def read_b(doc, **kwargs):
+        calls.append(doc.doc_id)
+        return A_OUTPUT
 
-    assert calls == []  # engine A (Gemini) never contacted — the whole point
-    assert len(server.requests) == 1  # engine B read the document
-    payload = server.requests[0]
-    assert payload["model"] == "stub-qwen-vl"
-    content = payload["messages"][0]["content"]
-    # The SAME transaction-extraction prompt as the Gemini path, never forked.
-    assert content[-1]["text"] == gem.PROMPT
-    # The reading landed as a STAGING record, not canonical state.
-    staging_record = None
-    import scripts.glm_stage as glm_stage
-
-    staging_record = glm_stage.load_staging_record(tmp_path, 2024, "dual-doc")
-    assert staging_record is not None
-    assert staging_record["parse_status"] == "success"
-    assert staging_record["rows"] == [
-        ["Apple Inc. (AAPL)", "Purchase", "01/15/24", "01/20/24", "A"]
-    ]
-    assert staging_record["member"] == "Jane Doe"
-    with duckdb.connect(str(db_file)) as conn:
-        run_row = conn.execute(
-            "SELECT COUNT(*) FROM pdf_parse_runs WHERE doc_id = 'dual-doc'"
-        ).fetchone()[0]
-        tx_count = conn.execute(
-            "SELECT COUNT(*) FROM transactions WHERE doc_id = 'dual-doc'"
-        ).fetchone()[0]
-    assert run_row == 0  # canonical ingestion of GLM rows ONLY via promote
-    assert tx_count == 0
-    assert not progress_path.exists()  # staging records are the resume state
-    out = capsys.readouterr().out
-    assert "DUAL" not in out
-    assert "STAGED success" in out and "glm_stage promote" in out
+    monkeypatch.setattr(vision_engines, "read_document_with_engine_b", read_b)
+    monkeypatch.setattr(gem, "call_gemini", lambda *a, **kw: pytest.fail("GLM mode contacted Gemini"))
+    assert ocr_zero_rows.main() == 1
+    first = json.loads(capsys.readouterr().out)
+    assert first["completed_attempts"] == 2
+    assert first["work"]["by_state"] == {"needs_review": 2}
+    assert sorted(calls) == ["a", "b"]
+    for doc in ("a", "b"):
+        record = glm_stage.load_staging_record(root, 2024, doc)
+        assert record["parse_status"] == "success"
+        assert record["raw_output"] == A_OUTPUT
+        assert record["rows"] == [["Apple Inc. (AAPL)", "Purchase", "01/15/24", "01/20/24", "A"]]
+    assert ocr_zero_rows.main() == 1
+    assert json.loads(capsys.readouterr().out)["completed_attempts"] == 0
+    assert sorted(calls) == ["a", "b"]  # Durable evidence, not progress.json, prevents another bill.
+    with Database(root / "congress.duckdb", read_only=True) as db:
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
+    assert not (root / "progress.json").exists()
 
 
-def test_main_loop_visionb_mode_skips_already_staged_docs(
-    tmp_path, monkeypatch, vision_b_server
-):
-    tiny_pdf = tmp_path / "stub.pdf"
-    _write_tiny_pdf(tiny_pdf)
-    tiny_sha = gem.pdf_sha256(str(tiny_pdf))
-    _seed_db(tmp_path, sha=tiny_sha)
-    server = vision_b_server(A_OUTPUT)
-    _set_engine_b(monkeypatch, server.server_address[1])
+@pytest.mark.parametrize("mode", [None, "gemini"])
+def test_single_engine_default_spends_only_gemini_and_replays_without_reread(coordinated_scope, monkeypatch, capsys, mode):
+    from analyzer import vision_engines
+
+    root = coordinated_scope
+    if mode is None:
+        monkeypatch.delenv("OCR_ENGINE", raising=False)
+    else:
+        monkeypatch.setenv("OCR_ENGINE", mode)
+    calls = []
+
+    def read_a(path, *, doc_id, **kwargs):
+        calls.append(doc_id)
+        parsed = gem.parse_gemini_output(A_OUTPUT, expected_page_count=1)
+        return A_OUTPUT, "", gem.ArtifactMetadata(gem.pdf_sha256(path), 1, len(Path(path).read_bytes()), str(path), parsed)
+
+    monkeypatch.setattr(gem, "call_gemini", read_a)
+    monkeypatch.setattr(vision_engines, "read_document_with_engine_b", lambda *a, **kw: pytest.fail("Gemini mode contacted GLM"))
+    assert ocr_zero_rows.main() == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["work"]["by_state"] == {"accepted": 2}
+    assert first["resolved"] == 2
+    assert sorted(calls) == ["a", "b"]
+    assert ocr_zero_rows.main() == 0
+    assert json.loads(capsys.readouterr().out)["completed_attempts"] == 0
+    assert sorted(calls) == ["a", "b"]
+
+
+def test_visionb_quota_leaves_durable_retry_and_unspent_pending_work(coordinated_scope, monkeypatch, capsys):
+    from analyzer import vision_engines
+
+    root = coordinated_scope
     monkeypatch.setenv("OCR_ENGINE", "visionb")
-    monkeypatch.setattr(
-        "scripts.glm_stage.rasterize_page_data_urls",
-        lambda pdf_path, dpi=150: [DATA_URL],
-    )
-    _, _, calls = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, str(tiny_pdf))],
-        shas={"dual-doc": tiny_sha},
-        outputs={"dual-doc": A_OUTPUT},
-        dual=False,
-    )
+    monkeypatch.setenv("VISION_B_BASE_URL", "https://stub.invalid")
+    monkeypatch.setenv("VISION_B_MODEL", "stub-model")
+    calls = []
 
-    import scripts.glm_stage as glm_stage
+    def quota(doc, **kwargs):
+        calls.append(doc.doc_id)
+        raise VisionBQuotaError("429 quota exhausted")
 
-    # First run stages the doc; second run must not re-read engine B for it.
-    _run_main()
-    assert len(server.requests) == 1
-    _run_main()
-    assert len(server.requests) == 1  # no second read: already staged
-    assert glm_stage.load_staging_record(tmp_path, 2024, "dual-doc") is not None
-    assert calls == []
+    monkeypatch.setattr(vision_engines, "read_document_with_engine_b", quota)
+    monkeypatch.setattr(gem, "call_gemini", lambda *a, **kw: pytest.fail("GLM quota fell back to Gemini"))
+    assert ocr_zero_rows.main() == 1
+    first = json.loads(capsys.readouterr().out)
+    assert first["work"]["by_state"] == {"retry_wait": 1, "pending": 1}
+    assert len(calls) == 1
+    assert ocr_zero_rows.main() == 1
+    assert json.loads(capsys.readouterr().out)["completed_attempts"] == 0
+    assert len(calls) == 1
+    with Database(root / "congress.duckdb", read_only=True) as db:
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)
 
 
-def test_main_loop_ocr_engine_unset_stays_gemini_and_never_contacts_b(
-    tmp_path, monkeypatch, vision_b_server
-):
-    _seed_db(tmp_path)
-    server = vision_b_server(A_OUTPUT)  # B would answer, but is never asked
-    _set_engine_b(monkeypatch, server.server_address[1])
-    monkeypatch.delenv("OCR_ENGINE", raising=False)
-    db_file, _, calls = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, "stub.pdf")],
-        shas={"dual-doc": "dual-sha-1"},
-        outputs={"dual-doc": A_OUTPUT},
-        dual=False,
-    )
+def test_visionb_missing_configuration_refuses_without_gemini_fallback(coordinated_scope, monkeypatch, capsys):
+    from analyzer import vision_engines
+    from scripts import glm_stage
 
-    _run_main()
-
-    assert calls == ["dual-doc"]  # engine A read once, exactly as before
-    assert server.requests == []  # engine B never contacted
-    with duckdb.connect(str(db_file)) as conn:
-        run_row = conn.execute(
-            "SELECT parser_version, engines_attempted, status FROM pdf_parse_runs "
-            "WHERE doc_id = 'dual-doc'"
-        ).fetchone()
-    assert run_row == (gem.GEMINI_PARSER_VERSION, gem.MODEL, "success")
-
-
-def test_main_loop_dual_read_overrides_ocr_engine(
-    tmp_path, monkeypatch, vision_b_server, capsys
-):
-    _seed_db(tmp_path)
-    server = vision_b_server(B_OUTPUT_REFORMAT)
-    _set_engine_b(monkeypatch, server.server_address[1])
-    monkeypatch.setenv("OCR_ENGINE", "visionb")  # would be single-engine B...
-    db_file, _, _ = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, "stub.pdf")],
-        shas={"dual-doc": "dual-sha-1"},
-        outputs={"dual-doc": A_OUTPUT},
-        dual=True,  # ...but DUAL_READ=1 wins precedence
-    )
-
-    _run_main()
-
-    assert "DUAL AGREE: inserted=1" in capsys.readouterr().out
-    with duckdb.connect(str(db_file)) as conn:
-        run_row = conn.execute(
-            "SELECT parser_version, status, engines_attempted FROM pdf_parse_runs "
-            "WHERE doc_id = 'dual-doc'"
-        ).fetchone()
-    assert run_row == (DUAL_PARSER_VERSION, "success", DUAL_ENGINES_ATTEMPTED)
-
-
-def test_main_loop_ocr_engine_dual_alias_runs_dual(
-    tmp_path, monkeypatch, vision_b_server, capsys
-):
-    _seed_db(tmp_path)
-    server = vision_b_server(B_OUTPUT_REFORMAT)
-    _set_engine_b(monkeypatch, server.server_address[1])
-    monkeypatch.setenv("OCR_ENGINE", "dual")
-    db_file, _, _ = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, "stub.pdf")],
-        shas={"dual-doc": "dual-sha-1"},
-        outputs={"dual-doc": A_OUTPUT},
-        dual=False,  # DUAL_READ unset: the OCR_ENGINE alias selects dual
-    )
-
-    _run_main()
-
-    assert "DUAL AGREE: inserted=1" in capsys.readouterr().out
-    with duckdb.connect(str(db_file)) as conn:
-        run_row = conn.execute(
-            "SELECT parser_version, status, engines_attempted FROM pdf_parse_runs "
-            "WHERE doc_id = 'dual-doc'"
-        ).fetchone()
-    assert run_row == (DUAL_PARSER_VERSION, "success", DUAL_ENGINES_ATTEMPTED)
-
-
-def test_main_loop_visionb_quota_stop_ends_batch_cleanly(
-    tmp_path, monkeypatch, vision_b_server, capsys
-):
-    tiny_pdf = tmp_path / "stub.pdf"
-    _write_tiny_pdf(tiny_pdf)
-    _seed_db_docs(tmp_path, list(_TWO_SHAS.items()))
-    server = vision_b_server("ignored", status=429)
-    _set_engine_b(monkeypatch, server.server_address[1])
+    root = coordinated_scope
     monkeypatch.setenv("OCR_ENGINE", "visionb")
-    db_file, progress_path, calls = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[(doc_id, 2024, str(tiny_pdf)) for doc_id, _ in _TWO_SHAS.items()],
-        shas=_TWO_SHAS,
-        outputs=_TWO_OUTPUTS,
-        dual=False,
-    )
-
-    assert _run_main() == 1
-
-    assert calls == []  # engine A never contacted
-    assert len(server.requests) == 1  # first doc hit engine B and got the 429
-    out = capsys.readouterr().out
-    assert "Quota exhausted; stopping batch" in out
-    assert "=== OCR RUN INCOMPLETE ===" in out
-    with duckdb.connect(str(db_file)) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone()[0] == 0
-    assert not progress_path.exists()  # nothing processed, nothing marked
-
-
-def test_main_loop_visionb_without_engine_b_config_fails_closed(
-    tmp_path, monkeypatch, capsys
-):
-    _seed_db(tmp_path)
-    monkeypatch.setenv("OCR_ENGINE", "visionb")
-    monkeypatch.delenv("DUAL_READ", raising=False)
     monkeypatch.delenv("VISION_B_BASE_URL", raising=False)
     monkeypatch.delenv("VISION_B_MODEL", raising=False)
-    db_file, progress_path, calls = _wire_main(
-        monkeypatch,
-        tmp_path,
-        docs=[("dual-doc", 2024, "stub.pdf")],
-        shas={"dual-doc": "dual-sha-1"},
-        outputs={"dual-doc": A_OUTPUT},
-        dual=False,
-    )
-
-    _run_main()
-
-    assert calls == []  # engine A is not silently spent instead
-    assert "stopping batch" in capsys.readouterr().out
-    with duckdb.connect(str(db_file)) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM pdf_parse_runs").fetchone()[0] == 0
-    assert not progress_path.exists()
+    monkeypatch.setattr(gem, "call_gemini", lambda *a, **kw: pytest.fail("unconfigured GLM fell back to Gemini"))
+    monkeypatch.setattr(vision_engines.requests, "post", lambda *a, **kw: pytest.fail("unconfigured GLM made an HTTP request"))
+    assert ocr_zero_rows.main() == 1
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["unresolved"] == 2
+    assert summary["work"]["by_state"] == {"needs_review": 2}
+    for doc in ("a", "b"):
+        record = glm_stage.load_staging_record(root, 2024, doc)
+        assert record["parse_status"] == "error"
+        assert record["error_kind"] == "config"
+    with Database(root / "congress.duckdb", read_only=True) as db:
+        assert db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (0,)

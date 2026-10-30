@@ -16,6 +16,7 @@ from uuid import uuid4
 import pytest
 
 from analyzer.ocr import coordinator, workers
+from analyzer.exceptions import DataSourceError
 from analyzer.ocr.contracts import ExtractionLane, ExtractionOutcome, ResultBundle, WorkEnvelope, task_key
 from analyzer.persistence.database import Database
 from analyzer.persistence.ownership import OwnershipError, publication_state
@@ -270,17 +271,39 @@ def test_same_binding_has_one_provider_call_and_no_duplicate_on_replay(scope, mo
         assert reader.conn.execute("SELECT COUNT(*) FROM transactions").fetchone() == (1,)
 
 
-@pytest.mark.parametrize("counts", [(2, 2), (None, None), (0, None)])
+@pytest.mark.parametrize("counts", [(2, 2), (None, None), (0, None), (-1, 0), (0, -1)])
 @pytest.mark.parametrize("operation", ["run", "status"])
 def test_incomplete_official_scope_counts_cannot_report_completion(tmp_path, counts, operation):
     with Database(tmp_path / "congress.duckdb") as owner:
         owner.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2025, 'missing-scope', ?, ?)", list(counts))
         owner.publish_snapshot()
-    with pytest.raises(ValueError):
+    with pytest.raises(DataSourceError, match="scope counts mismatched or unknown"):
         if operation == "status":
             coordinator.pipeline_status(tmp_path, years=[2025])
         else:
             coordinator.run_pipeline(tmp_path, [2025])
+
+
+def test_invalid_working_scope_cannot_replace_valid_zero_scope_publication(tmp_path, monkeypatch):
+    path = tmp_path / "congress.duckdb"
+    with Database(path) as owner:
+        owner.conn.execute("INSERT INTO house_archive_generations (archive_year, generation_id, metadata_count, ptr_count) VALUES (2025, 'empty', 0, 0)")
+        published = owner.publish_snapshot()
+        assert coordinator.pipeline_status(tmp_path, years=[2025])["scope"] == 0
+        owner.conn.execute("UPDATE house_archive_generations SET metadata_count=2, ptr_count=2")
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("invalid official scope reached worker construction")
+
+        monkeypatch.setattr(coordinator, "ProcessPoolExecutor", forbidden)
+        for operation in (coordinator.run_pipeline, coordinator.pipeline_status):
+            with pytest.raises(DataSourceError, match="expected PTR=2, metadata=2; actual PTR=0, metadata=0"):
+                operation(tmp_path, years=[2025], database=owner)
+            assert publication_state(path)["version"] == published["version"]
+            assert owner.work.status()["total"] == 0
+        # Publication readers keep the old proven-empty official scope, not
+        # a false completion claim about the invalid working generation.
+        assert coordinator.pipeline_status(tmp_path, years=[2025])["scope"] == 0
 
 
 def test_cron_module_entrypoint_runs_actual_spawn_worker_without_api(tmp_path):

@@ -36,9 +36,18 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
 
     metadata = pd.DataFrame({"FilingType": ["P", "P", "P"]})
 
+    borrowed = []
+
     class FakeSource:
-        def __init__(self, _settings):
-            pass
+        def __init__(self, _settings, *, db):
+            borrowed.append(db)
+            self.db = db
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
 
         def fetch_metadata(self, _year):
             return metadata
@@ -155,6 +164,7 @@ def test_parse_year_uses_house_generation_replacement_api(monkeypatch, tmp_path)
     )
 
     persisted = reparse_all.parse_year(2026, db, settings)  # type: ignore[arg-type]
+    assert borrowed == [db]
 
     assert persisted == 1
     assert db.replacement is not None
